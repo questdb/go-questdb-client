@@ -26,23 +26,23 @@ func main() {
 	// Make sure to close the sender on exit to release resources
 	defer sender.Close()
 	// Send a few ILP messages
-	err = sender
-		.Table("trades")
-		.Symbol("name", "test_ilp1")
-		.DoubleField("value", 12.4)
-		.AtNow(ctx)
+	err = sender.
+		Table("trades").
+		Symbol("name", "test_ilp1").
+		FloatField("value", 12.4).
+		AtNow(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = sender
-		.Table("trades")
-		.Symbol("name", "test_ilp2")
-		.DoubleField("value", 11.4)
-		.At(ctx, time.Now().UnixNano())
+	err = sender.
+		Table("trades").
+		Symbol("name", "test_ilp2").
+		FloatField("value", 11.4).
+		At(ctx, time.Now().UnixNano())
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = sender.flush(ctx)
+	err = sender.Flush(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
