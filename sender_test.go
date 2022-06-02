@@ -1,3 +1,27 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2022 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
 package questdb_test
 
 import (
@@ -8,7 +32,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	questdb "github.com/questdb/go-questdb-client"
+	qdb "github.com/questdb/go-questdb-client"
 )
 
 type questdbContainer struct {
@@ -66,10 +90,7 @@ func TestWriteAllFieldTypes(t *testing.T) {
 	}
 	defer questdbC.Terminate(ctx)
 
-	sender, err := questdb.NewLineSenderWithConfig(ctx, questdb.Config{
-		Address:   questdbC.ilpAddress,
-		BufferCap: 1024,
-	})
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +99,8 @@ func TestWriteAllFieldTypes(t *testing.T) {
 	err = sender.
 		Table("trades").
 		Symbol("name", "test_ilp1").
-		FloatField("float_col", 12.4).
+		FloatField("double_col", 12.4).
+		IntegerField("long_col", 12).
 		StringField("str_col", "foobar").
 		BooleanField("bool_col", true).
 		At(ctx, 1000)
@@ -88,7 +110,8 @@ func TestWriteAllFieldTypes(t *testing.T) {
 	err = sender.
 		Table("trades").
 		Symbol("name", "test_ilp2").
-		FloatField("float_col", 42).
+		FloatField("double_col", 11.4).
+		IntegerField("long_col", 11).
 		StringField("str_col", "barbaz").
 		BooleanField("bool_col", false).
 		AtNow(ctx)
