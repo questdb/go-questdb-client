@@ -39,7 +39,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	var d net.Dialer
 	s := &LineSender{
 		address: "127.0.0.1:9009",
-		bufCap:  1024 * 1024,
+		bufCap:  1024 * 1024, // 1MB
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -76,9 +76,9 @@ func WithAddress(address string) LineSenderOption {
 	}
 }
 
-// WithBufferCapacity sets desired buffer capacity to be used
-// when sending ILP messages. This is a soft limit, i.e. the
-// underlying buffer may grow larger than the provided value,
+// WithBufferCapacity sets desired buffer capacity in bytes to
+// be used when sending ILP messages. This is a soft limit, i.e.
+// the underlying buffer may grow larger than the provided value,
 // but will shrink once Flush is called.
 func WithBufferCapacity(capacity int) LineSenderOption {
 	return func(s *LineSender) {
@@ -140,9 +140,10 @@ func (s *LineSender) IntegerField(name string, val int64) *LineSender {
 	}
 	// TODO validate NaN and infinity values
 	s.buf.WriteString(name)
-	s.buf.WriteString("=")
+	s.buf.WriteByte('=')
 	// TODO implement proper serialization for numbers
 	s.buf.WriteString(fmt.Sprintf("%d", val))
+	s.buf.WriteByte('i')
 	s.hasFields = true
 	return s
 }
@@ -155,7 +156,7 @@ func (s *LineSender) FloatField(name string, val float64) *LineSender {
 	}
 	// TODO validate NaN and infinity values
 	s.buf.WriteString(name)
-	s.buf.WriteString("=")
+	s.buf.WriteByte('=')
 	// TODO implement proper serialization for numbers
 	s.buf.WriteString(fmt.Sprintf("%f", val))
 	s.hasFields = true
@@ -169,7 +170,7 @@ func (s *LineSender) StringField(name, val string) *LineSender {
 	}
 	// TODO validate name and value
 	s.buf.WriteString(name)
-	s.buf.WriteString("=")
+	s.buf.WriteByte('=')
 	s.buf.WriteByte('"')
 	// TODO handle quotes and special chars
 	s.buf.WriteString(val)
@@ -184,7 +185,7 @@ func (s *LineSender) BooleanField(name string, val bool) *LineSender {
 		return s
 	}
 	s.buf.WriteString(name)
-	s.buf.WriteString("=")
+	s.buf.WriteByte('=')
 	if val {
 		s.buf.WriteByte('t')
 	} else {
@@ -233,8 +234,12 @@ func (s *LineSender) At(ctx context.Context, time int64) error {
 	if err != nil {
 		return err
 	}
+	if !s.hasTable {
+		return errors.New("table name was not provided")
+	}
 
 	if time > -1 {
+		s.buf.WriteByte(' ')
 		// TODO implement proper serialization for numbers
 		s.buf.WriteString(fmt.Sprintf("%d", time))
 	}

@@ -26,14 +26,22 @@ package questdb_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	qdb "github.com/questdb/go-questdb-client"
 )
+
+const testTable = "my_test_table"
 
 type questdbContainer struct {
 	testcontainers.Container
@@ -46,6 +54,13 @@ func setupQuestDB(ctx context.Context) (*questdbContainer, error) {
 		Image:        "questdb/questdb",
 		ExposedPorts: []string{"9000/tcp", "9009/tcp"},
 		WaitingFor:   wait.ForHTTP("/").WithPort("9000"),
+		// Make sure that ingested rows are committed almost immediately.
+		Env: map[string]string{
+			"QDB_CAIRO_MAX_UNCOMMITTED_ROWS":        "1",
+			"QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL": "100",
+			"QDB_PG_ENABLED":                        "false",
+			"QDB_HTTP_MIN_ENABLED":                  "false",
+		},
 	}
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -65,14 +80,12 @@ func setupQuestDB(ctx context.Context) (*questdbContainer, error) {
 		return nil, err
 	}
 	httpAddress := fmt.Sprintf("http://%s:%s", ip, mappedPort.Port())
-	fmt.Println(httpAddress)
 
 	mappedPort, err = container.MappedPort(ctx, "9009")
 	if err != nil {
 		return nil, err
 	}
 	ilpAddress := fmt.Sprintf("%s:%s", ip, mappedPort.Port())
-	fmt.Println(ilpAddress)
 
 	return &questdbContainer{
 		Container:   container,
@@ -82,6 +95,10 @@ func setupQuestDB(ctx context.Context) (*questdbContainer, error) {
 }
 
 func TestWriteAllFieldTypes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx)
@@ -97,9 +114,9 @@ func TestWriteAllFieldTypes(t *testing.T) {
 	defer sender.Close()
 
 	err = sender.
-		Table("trades").
-		Symbol("name", "test_ilp1").
-		FloatField("double_col", 12.4).
+		Table(testTable).
+		Symbol("sym_col", "test_ilp1").
+		FloatField("double_col", 12.2).
 		IntegerField("long_col", 12).
 		StringField("str_col", "foobar").
 		BooleanField("bool_col", true).
@@ -108,13 +125,13 @@ func TestWriteAllFieldTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = sender.
-		Table("trades").
-		Symbol("name", "test_ilp2").
-		FloatField("double_col", 11.4).
+		Table(testTable).
+		Symbol("sym_col", "test_ilp2").
+		FloatField("double_col", 11.2).
 		IntegerField("long_col", 11).
 		StringField("str_col", "barbaz").
 		BooleanField("bool_col", false).
-		AtNow(ctx)
+		At(ctx, 2000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,4 +140,67 @@ func TestWriteAllFieldTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	expected := tableData{
+		Columns: []column{
+			{"sym_col", "SYMBOL"},
+			{"double_col", "DOUBLE"},
+			{"long_col", "LONG"},
+			{"str_col", "STRING"},
+			{"bool_col", "BOOLEAN"},
+			{"timestamp", "TIMESTAMP"},
+		},
+		Dataset: [][]interface{}{
+			{"test_ilp1", float64(12.2), float64(12), "foobar", true, "1970-01-01T00:00:00.000001Z"},
+			{"test_ilp2", float64(11.2), float64(11), "barbaz", false, "1970-01-01T00:00:00.000002Z"},
+		},
+		Count: 2,
+	}
+
+	assert.Eventually(t, func() bool {
+		data := queryTableData(t, questdbC.httpAddress)
+		return assert.EqualValues(t, expected, data)
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
+type tableData struct {
+	Columns []column        `json:"columns"`
+	Dataset [][]interface{} `json:"dataset"`
+	Count   int             `json:"count"`
+}
+
+type column struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+func queryTableData(t *testing.T, address string) tableData {
+	u, err := url.Parse(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u.Path += "exec"
+	params := url.Values{}
+	params.Add("query", testTable)
+	u.RawQuery = params.Encode()
+	url := fmt.Sprintf("%v", u)
+
+	res, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data := tableData{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		t.Fatal(err)
+	}
+
+	return data
 }
