@@ -73,17 +73,8 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 }
 
 func (s *LineSender) FloatField(name string, val float64) *LineSender {
-	if s.lastErr != nil {
+	if !s.prepareForField(name) {
 		return s
-	}
-	if !s.hasTable {
-		s.lastErr = errors.New("table name was not provided")
-		return s
-	}
-	if !s.hasFields {
-		s.buf.WriteByte(' ')
-	} else {
-		s.buf.WriteByte(',')
 	}
 	// TODO validate NaN and infinity values
 	s.buf.WriteString(name)
@@ -94,7 +85,55 @@ func (s *LineSender) FloatField(name string, val float64) *LineSender {
 	return s
 }
 
+func (s *LineSender) StringField(name, val string) *LineSender {
+	if !s.prepareForField(name) {
+		return s
+	}
+	// TODO validate name and value
+	s.buf.WriteString(name)
+	s.buf.WriteString("=")
+	s.buf.WriteString(val)
+	s.hasFields = true
+	return s
+}
+
+func (s *LineSender) BooleanField(name string, val bool) *LineSender {
+	if !s.prepareForField(name) {
+		return s
+	}
+	s.buf.WriteString(name)
+	s.buf.WriteString("=")
+	if val {
+		s.buf.WriteByte('t')
+	} else {
+		s.buf.WriteByte('f')
+	}
+	s.hasFields = true
+	return s
+}
+
+func (s *LineSender) prepareForField(name string) bool {
+	// TODO validate name
+	if s.lastErr != nil {
+		return false
+	}
+	if !s.hasTable {
+		s.lastErr = errors.New("table name was not provided")
+		return false
+	}
+	if !s.hasFields {
+		s.buf.WriteByte(' ')
+	} else {
+		s.buf.WriteByte(',')
+	}
+	return true
+}
+
 func (s *LineSender) AtNow(ctx context.Context) error {
+	return s.At(ctx, -1)
+}
+
+func (s *LineSender) At(ctx context.Context, time int64) error {
 	// TODO use ctx
 	err := s.lastErr
 	s.lastErr = nil
@@ -102,6 +141,10 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 		return err
 	}
 
+	if time > -1 {
+		// TODO implement proper serialization for numbers
+		s.buf.WriteString(fmt.Sprintf("%d", time))
+	}
 	s.buf.WriteByte('\n')
 
 	s.hasTable = false

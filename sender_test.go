@@ -57,7 +57,7 @@ func setupQuestDB(ctx context.Context) (*questdbContainer, error) {
 	}, nil
 }
 
-func TestBasicWrite(t *testing.T) {
+func TestWriteAllFieldTypes(t *testing.T) {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx)
@@ -78,15 +78,19 @@ func TestBasicWrite(t *testing.T) {
 	err = sender.
 		Table("trades").
 		Symbol("name", "test_ilp1").
-		FloatField("value", 12.4).
-		AtNow(ctx)
+		FloatField("float_col", 12.4).
+		StringField("str_col", "foobar").
+		BooleanField("bool_col", true).
+		At(ctx, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = sender.
 		Table("trades").
 		Symbol("name", "test_ilp2").
-		FloatField("value", 11.4).
+		FloatField("float_col", 42).
+		StringField("str_col", "barbaz").
+		BooleanField("bool_col", false).
 		AtNow(ctx)
 	if err != nil {
 		t.Fatal(err)
