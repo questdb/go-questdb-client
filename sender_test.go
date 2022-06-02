@@ -94,7 +94,7 @@ func setupQuestDB(ctx context.Context) (*questdbContainer, error) {
 	}, nil
 }
 
-func TestWriteAllFieldTypes(t *testing.T) {
+func TestAllFieldTypes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -102,15 +102,11 @@ func TestWriteAllFieldTypes(t *testing.T) {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	defer questdbC.Terminate(ctx)
 
 	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	defer sender.Close()
 
 	err = sender.
@@ -121,9 +117,8 @@ func TestWriteAllFieldTypes(t *testing.T) {
 		StringField("str_col", "foobar").
 		BooleanField("bool_col", true).
 		At(ctx, 1000)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
+
 	err = sender.
 		Table(testTable).
 		Symbol("sym_col", "test_ilp2").
@@ -132,14 +127,10 @@ func TestWriteAllFieldTypes(t *testing.T) {
 		StringField("str_col", "barbaz").
 		BooleanField("bool_col", false).
 		At(ctx, 2000)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 
 	err = sender.Flush(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 
 	expected := tableData{
 		Columns: []column{
@@ -163,6 +154,38 @@ func TestWriteAllFieldTypes(t *testing.T) {
 	}, 10*time.Second, 100*time.Millisecond)
 }
 
+func TestImplicitFlush(t *testing.T) {
+	const bufCap = 100
+
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+
+	questdbC, err := setupQuestDB(ctx)
+	assert.NoError(t, err)
+	defer questdbC.Terminate(ctx)
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress), qdb.WithBufferCapacity(bufCap))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	for i := 0; i < 10*bufCap; i++ {
+		err = sender.
+			Table(testTable).
+			BooleanField("b", true).
+			AtNow(ctx)
+		assert.NoError(t, err)
+	}
+
+	assert.Eventually(t, func() bool {
+		data := queryTableData(t, questdbC.httpAddress)
+		// We didn't call Flush, but we expect the buffer to be flushed at least once.
+		return assert.Greater(t, data.Count, bufCap)
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
 type tableData struct {
 	Columns []column        `json:"columns"`
 	Dataset [][]interface{} `json:"dataset"`
@@ -176,9 +199,7 @@ type column struct {
 
 func queryTableData(t *testing.T, address string) tableData {
 	u, err := url.Parse(address)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 
 	u.Path += "exec"
 	params := url.Values{}
@@ -187,20 +208,15 @@ func queryTableData(t *testing.T, address string) tableData {
 	url := fmt.Sprintf("%v", u)
 
 	res, err := http.Get(url)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	defer res.Body.Close()
 
 	body, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 
 	data := tableData{}
-	if err := json.Unmarshal(body, &data); err != nil {
-		t.Fatal(err)
-	}
+	err = json.Unmarshal(body, &data)
+	assert.NoError(t, err)
 
 	return data
 }
