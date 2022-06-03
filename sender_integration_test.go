@@ -95,7 +95,7 @@ func setupQuestDB(ctx context.Context) (*questdbContainer, error) {
 	}, nil
 }
 
-func TestAllFieldTypes(t *testing.T) {
+func TestAllColumnTypes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -113,20 +113,20 @@ func TestAllFieldTypes(t *testing.T) {
 	err = sender.
 		Table(testTable).
 		Symbol("sym_col", "test_ilp1").
-		FloatField("double_col", 12.2).
-		IntField("long_col", 12).
-		StringField("str_col", "foobar").
-		BoolField("bool_col", true).
+		FloatColumn("double_col", 12.2).
+		IntColumn("long_col", 12).
+		StringColumn("str_col", "foobar").
+		BoolColumn("bool_col", true).
 		At(ctx, 1000)
 	assert.NoError(t, err)
 
 	err = sender.
 		Table(testTable).
 		Symbol("sym_col", "test_ilp2").
-		FloatField("double_col", 11.2).
-		IntField("long_col", 11).
-		StringField("str_col", "barbaz").
-		BoolField("bool_col", false).
+		FloatColumn("double_col", 11.2).
+		IntColumn("long_col", 11).
+		StringColumn("str_col", "barbaz").
+		BoolColumn("bool_col", false).
 		At(ctx, 2000)
 	assert.NoError(t, err)
 
@@ -175,7 +175,7 @@ func TestImplicitFlush(t *testing.T) {
 	for i := 0; i < 10*bufCap; i++ {
 		err = sender.
 			Table(testTable).
-			BoolField("b", true).
+			BoolColumn("b", true).
 			AtNow(ctx)
 		assert.NoError(t, err)
 	}

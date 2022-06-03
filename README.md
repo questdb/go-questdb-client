@@ -29,7 +29,7 @@ func main() {
 	err = sender.
 		Table("trades").
 		Symbol("name", "test_ilp1").
-		FloatField("value", 12.4).
+		FloatColumn("value", 12.4).
 		AtNow(ctx)
 	if err != nil {
 		log.Fatal(err)
@@ -37,7 +37,7 @@ func main() {
 	err = sender.
 		Table("trades").
 		Symbol("name", "test_ilp2").
-		FloatField("value", 11.4).
+		FloatColumn("value", 11.4).
 		At(ctx, time.Now().UnixNano())
 	if err != nil {
 		log.Fatal(err)

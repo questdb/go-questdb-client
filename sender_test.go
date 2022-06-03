@@ -55,11 +55,11 @@ func TestValidWrites(t *testing.T) {
 		{
 			"single string column",
 			func(s *qdb.LineSender) error {
-				err := s.Table(testTable).StringField("a_col", "foo").AtNow(ctx)
+				err := s.Table(testTable).StringColumn("a_col", "foo").AtNow(ctx)
 				if err != nil {
 					return err
 				}
-				err = s.Table(testTable).StringField("a_col", "bar").At(ctx, 42)
+				err = s.Table(testTable).StringColumn("a_col", "bar").At(ctx, 42)
 				if err != nil {
 					return err
 				}
@@ -73,7 +73,7 @@ func TestValidWrites(t *testing.T) {
 		{
 			"escaped chars in table name",
 			func(s *qdb.LineSender) error {
-				return s.Table("test 1,2\"3\\4").IntField("a_col", 42).AtNow(ctx)
+				return s.Table("test 1,2\"3\\4").IntColumn("a_col", 42).AtNow(ctx)
 			},
 			[]string{
 				"test\\ 1\\,2\\\"3\\\\4 a_col=42i\n",
@@ -82,7 +82,7 @@ func TestValidWrites(t *testing.T) {
 		{
 			"escaped chars in column name",
 			func(s *qdb.LineSender) error {
-				return s.Table("test_table").FloatField("name 1,2\"3\\4", 42).AtNow(ctx)
+				return s.Table("test_table").FloatColumn("name 1,2\"3\\4", 42).AtNow(ctx)
 			},
 			[]string{
 				"test_table name\\ 1\\,2\\\"3\\\\4=42.000000\n",
@@ -155,27 +155,27 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 			},
 		},
 		{
-			"string field",
+			"string column",
 			func(s *qdb.LineSender) error {
-				return s.StringField("str", "abc").AtNow(ctx)
+				return s.StringColumn("str", "abc").AtNow(ctx)
 			},
 		},
 		{
-			"boolean field",
+			"boolean column",
 			func(s *qdb.LineSender) error {
-				return s.BoolField("bool", true).AtNow(ctx)
+				return s.BoolColumn("bool", true).AtNow(ctx)
 			},
 		},
 		{
-			"integer field",
+			"long column",
 			func(s *qdb.LineSender) error {
-				return s.IntField("int", 42).AtNow(ctx)
+				return s.IntColumn("int", 42).AtNow(ctx)
 			},
 		},
 		{
-			"float field",
+			"double column",
 			func(s *qdb.LineSender) error {
-				return s.FloatField("float", 4.2).AtNow(ctx)
+				return s.FloatColumn("float", 4.2).AtNow(ctx)
 			},
 		},
 	}
@@ -216,7 +216,7 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 	assert.Empty(t, sender.Messages())
 }
 
-func TestErrorOnSymbolCallAfterField(t *testing.T) {
+func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 	ctx := context.Background()
 
 	testCases := []struct {
@@ -224,27 +224,27 @@ func TestErrorOnSymbolCallAfterField(t *testing.T) {
 		writerFn writer
 	}{
 		{
-			"string field",
+			"string column",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").StringField("str", "abc").Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").StringColumn("str", "abc").Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
-			"boolean field",
+			"boolean column",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").BoolField("bool", true).Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").BoolColumn("bool", true).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
-			"integer field",
+			"integer column",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").IntField("int", 42).Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").IntColumn("int", 42).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
-			"float field",
+			"float column",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").FloatField("float", 4.2).Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").FloatColumn("float", 4.2).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 	}
@@ -259,7 +259,7 @@ func TestErrorOnSymbolCallAfterField(t *testing.T) {
 
 			err = tc.writerFn(sender)
 
-			assert.EqualError(t, err, "symbol has to be written before any field")
+			assert.EqualError(t, err, "symbols have to be written before any other column")
 			assert.Empty(t, sender.Messages())
 
 			sender.Close()
@@ -280,10 +280,10 @@ func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	defer sender.Close()
 
 	// Write a valid message.
-	err = sender.Table(testTable).StringField("foo", "bar").AtNow(ctx)
+	err = sender.Table(testTable).StringColumn("foo", "bar").AtNow(ctx)
 	assert.NoError(t, err)
 	// Then write perform an incorrect chain of calls.
-	err = sender.Table(testTable).StringField("foo", "bar").Symbol("sym", "42").AtNow(ctx)
+	err = sender.Table(testTable).StringColumn("foo", "bar").Symbol("sym", "42").AtNow(ctx)
 	assert.Error(t, err)
 
 	// The second message should be discarded.
@@ -311,7 +311,7 @@ func TestErrorOnCancelledContext(t *testing.T) {
 	defer sender.Close()
 
 	// The context is not cancelled yet, so Flush should succeed.
-	err = sender.Table(testTable).StringField("foo", "bar").AtNow(ctx)
+	err = sender.Table(testTable).StringColumn("foo", "bar").AtNow(ctx)
 	assert.NoError(t, err)
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
@@ -319,7 +319,7 @@ func TestErrorOnCancelledContext(t *testing.T) {
 	cancel()
 
 	// The context is now cancelled, so we expect an error.
-	err = sender.Table(testTable).StringField("bar", "baz").AtNow(ctx)
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 	assert.NoError(t, err)
 	err = sender.Flush(ctx)
 	assert.Error(t, err)
@@ -339,7 +339,7 @@ func TestErrorOnContextDeadline(t *testing.T) {
 
 	// Keep writing until we get an error due to the context deadline.
 	for i := 0; i < 100_000; i++ {
-		err = sender.Table(testTable).StringField("bar", "baz").AtNow(ctx)
+		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 		if err != nil {
 			return
 		}
@@ -369,10 +369,10 @@ func BenchmarkLineSender(b *testing.B) {
 			sender.
 				Table(testTable).
 				Symbol("sym_col", "test_ilp1").
-				FloatField("double_col", float64(i)+0.42).
-				IntField("long_col", int64(i)).
-				StringField("str_col", "foobar").
-				BoolField("bool_col", true).
+				FloatColumn("double_col", float64(i)+0.42).
+				IntColumn("long_col", int64(i)).
+				StringColumn("str_col", "foobar").
+				BoolColumn("bool_col", true).
 				At(ctx, int64(1000*i))
 		}
 		sender.Flush(ctx)

@@ -96,7 +96,7 @@ func (s *LineSender) Close() error {
 	return s.conn.Close()
 }
 
-// Table sets the table name for a new ILP message. Should be
+// Table sets the table name (metric) for a new ILP message. Should be
 // called before any Symbol or Field method.
 func (s *LineSender) Table(name string) *LineSender {
 	if s.lastErr != nil {
@@ -113,7 +113,7 @@ func (s *LineSender) Table(name string) *LineSender {
 	return s
 }
 
-// Symbol adds a symbol column value to the ILP message. Should be
+// Symbol adds a symbol column (tag) value to the ILP message. Should be
 // called before any Field method.
 func (s *LineSender) Symbol(name, val string) *LineSender {
 	if s.lastErr != nil {
@@ -126,7 +126,7 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 		return s
 	}
 	if s.hasFields {
-		s.lastErr = errors.New("symbol has to be written before any field")
+		s.lastErr = errors.New("symbols have to be written before any other column")
 		return s
 	}
 	s.buf.WriteByte(',')
@@ -136,9 +136,9 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 	return s
 }
 
-// IntField adds an integer (long column type) field value to
+// IntColumn adds a long column (integer field) value to
 // the ILP message.
-func (s *LineSender) IntField(name string, val int64) *LineSender {
+func (s *LineSender) IntColumn(name string, val int64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
@@ -152,9 +152,9 @@ func (s *LineSender) IntField(name string, val int64) *LineSender {
 	return s
 }
 
-// FloatField adds a float (double column type) field value to
+// FloatColumn adds a double column (float field) value to
 // the ILP message.
-func (s *LineSender) FloatField(name string, val float64) *LineSender {
+func (s *LineSender) FloatColumn(name string, val float64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
@@ -167,8 +167,8 @@ func (s *LineSender) FloatField(name string, val float64) *LineSender {
 	return s
 }
 
-// FloatField adds a string field value to the ILP message.
-func (s *LineSender) StringField(name, val string) *LineSender {
+// StringColumn adds a string column (field) value to the ILP message.
+func (s *LineSender) StringColumn(name, val string) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
@@ -181,8 +181,8 @@ func (s *LineSender) StringField(name, val string) *LineSender {
 	return s
 }
 
-// FloatField adds a boolean field value to the ILP message.
-func (s *LineSender) BoolField(name string, val bool) *LineSender {
+// BoolColumn adds a boolean column (field) value to the ILP message.
+func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
