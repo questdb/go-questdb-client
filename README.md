@@ -23,9 +23,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Make sure to close the sender on exit to release resources
+	// Make sure to close the sender on exit to release resources.
 	defer sender.Close()
-	// Send a few ILP messages
+	// Send a few ILP messages.
 	err = sender.
 		Table("trades").
 		Symbol("name", "test_ilp1").
@@ -42,6 +42,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Make sure that the messages are sent over the network.
 	err = sender.Flush(ctx)
 	if err != nil {
 		log.Fatal(err)

@@ -27,6 +27,7 @@ package questdb_test
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -69,11 +70,41 @@ func TestValidWrites(t *testing.T) {
 				"my_test_table a_col=\"bar\" 42\n",
 			},
 		},
+		{
+			"escaped chars in table name",
+			func(s *qdb.LineSender) error {
+				return s.Table("test 1,2\"3\\4").IntField("a_col", 42).AtNow(ctx)
+			},
+			[]string{
+				"test\\ 1\\,2\\\"3\\\\4 a_col=42i\n",
+			},
+		},
+		{
+			"escaped chars in column name",
+			func(s *qdb.LineSender) error {
+				return s.Table("test_table").FloatField("name 1,2\"3\\4", 42).AtNow(ctx)
+			},
+			[]string{
+				"test_table name\\ 1\\,2\\\"3\\\\4=42.000000\n",
+			},
+		},
+		{
+			"escaped chars in symbol name and value",
+			func(s *qdb.LineSender) error {
+				s.Table("test_table").Symbol("name 1,2\"3\\4", "value 1,2\"3\\4")
+				fmt.Println(s.Messages())
+				fmt.Println(">>>")
+				return s.AtNow(ctx)
+			},
+			[]string{
+				"test_table,name\\ 1\\,2\\\"3\\\\4=value\\ 1\\,2\\\"3\\\\4\n",
+			},
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(true)
+			srv, err := newTestServer(sendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -132,13 +163,13 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 		{
 			"boolean field",
 			func(s *qdb.LineSender) error {
-				return s.BooleanField("bool", true).AtNow(ctx)
+				return s.BoolField("bool", true).AtNow(ctx)
 			},
 		},
 		{
 			"integer field",
 			func(s *qdb.LineSender) error {
-				return s.IntegerField("int", 42).AtNow(ctx)
+				return s.IntField("int", 42).AtNow(ctx)
 			},
 		},
 		{
@@ -151,7 +182,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(false)
+			srv, err := newTestServer(readAndDiscard)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -171,7 +202,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 func TestErrorOnMultipleTableCalls(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(false)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -201,13 +232,13 @@ func TestErrorOnSymbolCallAfterField(t *testing.T) {
 		{
 			"boolean field",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").BooleanField("bool", true).Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").BoolField("bool", true).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"integer field",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").IntegerField("int", 42).Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").IntField("int", 42).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
@@ -220,7 +251,7 @@ func TestErrorOnSymbolCallAfterField(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(false)
+			srv, err := newTestServer(readAndDiscard)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -240,7 +271,7 @@ func TestErrorOnSymbolCallAfterField(t *testing.T) {
 func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(true)
+	srv, err := newTestServer(sendToBackChannel)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -261,10 +292,70 @@ func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	expectLines(t, srv.backCh, []string{testTable + " foo=\"bar\"\n"})
 }
 
+func TestErrorOnUnavailableServer(t *testing.T) {
+	ctx := context.Background()
+
+	_, err := qdb.NewLineSender(ctx)
+	assert.ErrorContains(t, err, "failed to connect to server")
+}
+
+func TestErrorOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	srv, err := newTestServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	// The context is not cancelled yet, so Flush should succeed.
+	err = sender.Table(testTable).StringField("foo", "bar").AtNow(ctx)
+	assert.NoError(t, err)
+	err = sender.Flush(ctx)
+	assert.NoError(t, err)
+
+	cancel()
+
+	// The context is now cancelled, so we expect an error.
+	err = sender.Table(testTable).StringField("bar", "baz").AtNow(ctx)
+	assert.NoError(t, err)
+	err = sender.Flush(ctx)
+	assert.Error(t, err)
+}
+
+func TestErrorOnContextDeadline(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
+	defer cancel()
+
+	srv, err := newTestServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	// Keep writing until we get an error due to the context deadline.
+	for i := 0; i < 100_000; i++ {
+		err = sender.Table(testTable).StringField("bar", "baz").AtNow(ctx)
+		if err != nil {
+			return
+		}
+		err = sender.Flush(ctx)
+		if err != nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fail()
+}
+
 func BenchmarkLineSender(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(false)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(b, err)
 	defer srv.close()
 
@@ -279,9 +370,9 @@ func BenchmarkLineSender(b *testing.B) {
 				Table(testTable).
 				Symbol("sym_col", "test_ilp1").
 				FloatField("double_col", float64(i)+0.42).
-				IntegerField("long_col", int64(i)).
+				IntField("long_col", int64(i)).
 				StringField("str_col", "foobar").
-				BooleanField("bool_col", true).
+				BoolField("bool_col", true).
 				At(ctx, int64(1000*i))
 		}
 		sender.Flush(ctx)
@@ -298,29 +389,36 @@ func expectLines(t *testing.T, linesCh chan string, expected []string) {
 			return false
 		}
 		return reflect.DeepEqual(expected, actual)
-	}, 10*time.Second, 100*time.Millisecond)
+	}, 3*time.Second, 100*time.Millisecond)
 }
+
+type serverType int64
+
+const (
+	sendToBackChannel serverType = 0
+	readAndDiscard    serverType = 1
+)
 
 type testServer struct {
-	addr      string
-	listener  net.Listener
-	useBackCh bool
-	backCh    chan string
-	closeCh   chan struct{}
-	wg        sync.WaitGroup
+	addr       string
+	listener   net.Listener
+	serverType serverType
+	backCh     chan string
+	closeCh    chan struct{}
+	wg         sync.WaitGroup
 }
 
-func newTestServer(useBackCh bool) (*testServer, error) {
+func newTestServer(serverType serverType) (*testServer, error) {
 	tcp, err := net.Listen("tcp", "127.0.0.1:")
 	if err != nil {
 		return nil, err
 	}
 	s := &testServer{
-		addr:      tcp.Addr().String(),
-		listener:  tcp,
-		useBackCh: useBackCh,
-		backCh:    make(chan string),
-		closeCh:   make(chan struct{}),
+		addr:       tcp.Addr().String(),
+		listener:   tcp,
+		serverType: serverType,
+		backCh:     make(chan string),
+		closeCh:    make(chan struct{}),
 	}
 	s.wg.Add(1)
 	go s.serve()
@@ -344,17 +442,20 @@ func (s *testServer) serve() {
 
 		s.wg.Add(1)
 		go func() {
-			if s.useBackCh {
-				s.handleWithBackChannel(conn)
-			} else {
-				s.handleWithDiscard(conn)
+			switch s.serverType {
+			case sendToBackChannel:
+				s.handleSendToBackChannel(conn)
+			case readAndDiscard:
+				s.handleReadAndDiscard(conn)
+			default:
+				panic(fmt.Sprintf("server type is not supported: %d", s.serverType))
 			}
 			s.wg.Done()
 		}()
 	}
 }
 
-func (s *testServer) handleWithBackChannel(conn net.Conn) {
+func (s *testServer) handleSendToBackChannel(conn net.Conn) {
 	defer conn.Close()
 
 	r := bufio.NewReader(conn)
@@ -377,7 +478,7 @@ func (s *testServer) handleWithBackChannel(conn net.Conn) {
 	}
 }
 
-func (s *testServer) handleWithDiscard(conn net.Conn) {
+func (s *testServer) handleReadAndDiscard(conn net.Conn) {
 	defer conn.Close()
 
 	for {

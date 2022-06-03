@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 )
 
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
@@ -46,7 +47,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	}
 	conn, err := d.DialContext(ctx, "tcp", s.address)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to connect to server: %v", err)
 	}
 	s.conn = conn
 	s.buf = bytes.NewBuffer(make([]byte, 0, s.bufCap))
@@ -101,12 +102,13 @@ func (s *LineSender) Table(name string) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	// TODO validate table name
+	// TODO validate table name:
+	// Table name and columns name must not contain any of the forbidden characters: ., ?,,,:,\,/,\0,),(,+,*,~,% and -.
 	if s.hasTable {
 		s.lastErr = errors.New("table name already provided")
 		return s
 	}
-	s.buf.WriteString(name)
+	s.writeString(name, false)
 	s.hasTable = true
 	return s
 }
@@ -117,7 +119,8 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	// TODO validate name and value
+	// TODO validate column name:
+	// Table name and columns name must not contain any of the forbidden characters: ., ?,,,:,\,/,\0,),(,+,*,~,% and -.
 	if !s.hasTable {
 		s.lastErr = errors.New("table name was not provided")
 		return s
@@ -127,20 +130,20 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 		return s
 	}
 	s.buf.WriteByte(',')
-	s.buf.WriteString(name)
+	s.writeString(name, false)
 	s.buf.WriteByte('=')
-	s.buf.WriteString(val)
+	s.writeString(val, false)
 	return s
 }
 
-// IntegerField adds an integer (long column type) field value to
+// IntField adds an integer (long column type) field value to
 // the ILP message.
-func (s *LineSender) IntegerField(name string, val int64) *LineSender {
+func (s *LineSender) IntField(name string, val int64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
 	// TODO validate NaN and infinity values
-	s.buf.WriteString(name)
+	s.writeString(name, false)
 	s.buf.WriteByte('=')
 	// TODO implement proper serialization for numbers
 	s.buf.WriteString(fmt.Sprintf("%d", val))
@@ -156,7 +159,7 @@ func (s *LineSender) FloatField(name string, val float64) *LineSender {
 		return s
 	}
 	// TODO validate NaN and infinity values
-	s.buf.WriteString(name)
+	s.writeString(name, false)
 	s.buf.WriteByte('=')
 	// TODO implement proper serialization for numbers
 	s.buf.WriteString(fmt.Sprintf("%f", val))
@@ -169,23 +172,21 @@ func (s *LineSender) StringField(name, val string) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	// TODO validate name and value
-	s.buf.WriteString(name)
+	s.writeString(name, false)
 	s.buf.WriteByte('=')
 	s.buf.WriteByte('"')
-	// TODO handle quotes and special chars
-	s.buf.WriteString(val)
+	s.writeString(val, true)
 	s.buf.WriteByte('"')
 	s.hasFields = true
 	return s
 }
 
 // FloatField adds a boolean field value to the ILP message.
-func (s *LineSender) BooleanField(name string, val bool) *LineSender {
+func (s *LineSender) BoolField(name string, val bool) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	s.buf.WriteString(name)
+	s.writeString(name, false)
 	s.buf.WriteByte('=')
 	if val {
 		s.buf.WriteByte('t')
@@ -197,7 +198,8 @@ func (s *LineSender) BooleanField(name string, val bool) *LineSender {
 }
 
 func (s *LineSender) prepareForField(name string) bool {
-	// TODO validate name
+	// TODO validate column name:
+	// Table name and columns name must not contain any of the forbidden characters: ., ?,,,:,\,/,\0,),(,+,*,~,% and -.
 	if s.lastErr != nil {
 		return false
 	}
@@ -211,6 +213,48 @@ func (s *LineSender) prepareForField(name string) bool {
 		s.buf.WriteByte(',')
 	}
 	return true
+}
+
+func (s *LineSender) writeString(str string, quoted bool) {
+	s.buf.Grow(len(str))
+	for _, r := range str {
+		if r < 128 {
+			writeEscapedChar(s.buf, byte(r), quoted)
+		} else {
+			s.buf.WriteRune(r)
+		}
+	}
+}
+
+func writeEscapedChar(buf *bytes.Buffer, ch byte, quoted bool) {
+	switch ch {
+	case ' ':
+		if !quoted {
+			buf.WriteByte('\\')
+		}
+	case ',':
+		if !quoted {
+			buf.WriteByte('\\')
+		}
+	case '=':
+		if !quoted {
+			buf.WriteByte('\\')
+		}
+	case '"':
+		buf.WriteByte('\\')
+	case '\\':
+		buf.WriteByte('\\')
+	// TODO return errors for new line chars
+	case '\n':
+		buf.WriteByte('\\')
+		buf.WriteByte('n')
+		return
+	case '\r':
+		buf.WriteByte('\\')
+		buf.WriteByte('r')
+		return
+	}
+	buf.WriteByte(ch)
 }
 
 // AtNow omits the timestamp and finalizes the ILP message.
@@ -266,11 +310,19 @@ func (s *LineSender) At(ctx context.Context, time int64) error {
 // each ILP message. Instead, the messages should be written in
 // batches followed by a Flush call.
 func (s *LineSender) Flush(ctx context.Context) error {
-	// TODO use ctx
 	err := s.lastErr
 	s.lastErr = nil
 	if err != nil {
 		return err
+	}
+
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		s.conn.SetWriteDeadline(deadline)
+	} else {
+		s.conn.SetWriteDeadline(time.Time{})
 	}
 
 	_, err = s.buf.WriteTo(s.conn)

@@ -114,9 +114,9 @@ func TestAllFieldTypes(t *testing.T) {
 		Table(testTable).
 		Symbol("sym_col", "test_ilp1").
 		FloatField("double_col", 12.2).
-		IntegerField("long_col", 12).
+		IntField("long_col", 12).
 		StringField("str_col", "foobar").
-		BooleanField("bool_col", true).
+		BoolField("bool_col", true).
 		At(ctx, 1000)
 	assert.NoError(t, err)
 
@@ -124,9 +124,9 @@ func TestAllFieldTypes(t *testing.T) {
 		Table(testTable).
 		Symbol("sym_col", "test_ilp2").
 		FloatField("double_col", 11.2).
-		IntegerField("long_col", 11).
+		IntField("long_col", 11).
 		StringField("str_col", "barbaz").
-		BooleanField("bool_col", false).
+		BoolField("bool_col", false).
 		At(ctx, 2000)
 	assert.NoError(t, err)
 
@@ -175,7 +175,7 @@ func TestImplicitFlush(t *testing.T) {
 	for i := 0; i < 10*bufCap; i++ {
 		err = sender.
 			Table(testTable).
-			BooleanField("b", true).
+			BoolField("b", true).
 			AtNow(ctx)
 		assert.NoError(t, err)
 	}
