@@ -25,198 +25,280 @@
 package questdb_test
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"net/http"
-	"net/url"
+	"io"
+	"log"
+	"net"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
-
 	qdb "github.com/questdb/go-questdb-client"
+	"github.com/stretchr/testify/assert"
 )
 
-const testTable = "my_test_table"
+type writer func(s *qdb.LineSender) error
 
-type questdbContainer struct {
-	testcontainers.Container
-	httpAddress string
-	ilpAddress  string
-}
-
-func setupQuestDB(ctx context.Context) (*questdbContainer, error) {
-	req := testcontainers.ContainerRequest{
-		Image:        "questdb/questdb",
-		ExposedPorts: []string{"9000/tcp", "9009/tcp"},
-		WaitingFor:   wait.ForHTTP("/").WithPort("9000"),
-		// Make sure that ingested rows are committed almost immediately.
-		Env: map[string]string{
-			"QDB_CAIRO_MAX_UNCOMMITTED_ROWS":        "1",
-			"QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL": "100",
-			"QDB_PG_ENABLED":                        "false",
-			"QDB_HTTP_MIN_ENABLED":                  "false",
-		},
-	}
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	ip, err := container.Host(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	mappedPort, err := container.MappedPort(ctx, "9000")
-	if err != nil {
-		return nil, err
-	}
-	httpAddress := fmt.Sprintf("http://%s:%s", ip, mappedPort.Port())
-
-	mappedPort, err = container.MappedPort(ctx, "9009")
-	if err != nil {
-		return nil, err
-	}
-	ilpAddress := fmt.Sprintf("%s:%s", ip, mappedPort.Port())
-
-	return &questdbContainer{
-		Container:   container,
-		httpAddress: httpAddress,
-		ilpAddress:  ilpAddress,
-	}, nil
-}
-
-func TestAllFieldTypes(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
+func TestValidWrites(t *testing.T) {
 	ctx := context.Background()
 
-	questdbC, err := setupQuestDB(ctx)
-	assert.NoError(t, err)
-	defer questdbC.Terminate(ctx)
-
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	err = sender.
-		Table(testTable).
-		Symbol("sym_col", "test_ilp1").
-		FloatField("double_col", 12.2).
-		IntegerField("long_col", 12).
-		StringField("str_col", "foobar").
-		BooleanField("bool_col", true).
-		At(ctx, 1000)
-	assert.NoError(t, err)
-
-	err = sender.
-		Table(testTable).
-		Symbol("sym_col", "test_ilp2").
-		FloatField("double_col", 11.2).
-		IntegerField("long_col", 11).
-		StringField("str_col", "barbaz").
-		BooleanField("bool_col", false).
-		At(ctx, 2000)
-	assert.NoError(t, err)
-
-	err = sender.Flush(ctx)
-	assert.NoError(t, err)
-
-	expected := tableData{
-		Columns: []column{
-			{"sym_col", "SYMBOL"},
-			{"double_col", "DOUBLE"},
-			{"long_col", "LONG"},
-			{"str_col", "STRING"},
-			{"bool_col", "BOOLEAN"},
-			{"timestamp", "TIMESTAMP"},
+	testCases := []struct {
+		name          string
+		writerFn      writer
+		expectedLines []string
+	}{
+		{
+			"single string column",
+			func(s *qdb.LineSender) error {
+				err := s.Table(testTable).StringField("a_col", "foo").AtNow(ctx)
+				if err != nil {
+					return err
+				}
+				err = s.Table(testTable).StringField("a_col", "bar").At(ctx, 42)
+				if err != nil {
+					return err
+				}
+				return nil
+			},
+			[]string{
+				"my_test_table a_col=\"foo\"\n",
+				"my_test_table a_col=\"bar\" 42\n",
+			},
 		},
-		Dataset: [][]interface{}{
-			{"test_ilp1", float64(12.2), float64(12), "foobar", true, "1970-01-01T00:00:00.000001Z"},
-			{"test_ilp2", float64(11.2), float64(11), "barbaz", false, "1970-01-01T00:00:00.000002Z"},
-		},
-		Count: 2,
 	}
 
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer()
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
+
+			err = tc.writerFn(sender)
+			assert.NoError(t, err)
+
+			err = sender.Flush(ctx)
+			assert.NoError(t, err)
+
+			sender.Close()
+
+			expectLines(t, srv.linesCh, tc.expectedLines)
+
+			srv.close()
+		})
+	}
+}
+
+func TestErrorOnMissingTableCall(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name     string
+		writerFn writer
+	}{
+		{
+			"AtNow",
+			func(s *qdb.LineSender) error {
+				return s.Symbol("sym", "abc").AtNow(ctx)
+			},
+		},
+		{
+			"At",
+			func(s *qdb.LineSender) error {
+				return s.Symbol("sym", "abc").At(ctx, 0)
+			},
+		},
+		{
+			"symbol",
+			func(s *qdb.LineSender) error {
+				return s.Symbol("sym", "abc").AtNow(ctx)
+			},
+		},
+		{
+			"string field",
+			func(s *qdb.LineSender) error {
+				return s.StringField("str", "abc").AtNow(ctx)
+			},
+		},
+		{
+			"boolean field",
+			func(s *qdb.LineSender) error {
+				return s.BooleanField("bool", true).AtNow(ctx)
+			},
+		},
+		{
+			"integer field",
+			func(s *qdb.LineSender) error {
+				return s.IntegerField("int", 42).AtNow(ctx)
+			},
+		},
+		{
+			"float field",
+			func(s *qdb.LineSender) error {
+				return s.FloatField("float", 4.2).AtNow(ctx)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer()
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
+
+			err = tc.writerFn(sender)
+
+			assert.EqualError(t, err, "table name was not provided")
+			assert.Empty(t, sender.Messages())
+
+			sender.Close()
+			srv.close()
+		})
+	}
+}
+
+func TestErrorOnSymbolCallAfterField(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name     string
+		writerFn writer
+	}{
+		{
+			"string field",
+			func(s *qdb.LineSender) error {
+				return s.Table("awesome_table").StringField("str", "abc").Symbol("sym", "abc").AtNow(ctx)
+			},
+		},
+		{
+			"boolean field",
+			func(s *qdb.LineSender) error {
+				return s.Table("awesome_table").BooleanField("bool", true).Symbol("sym", "abc").AtNow(ctx)
+			},
+		},
+		{
+			"integer field",
+			func(s *qdb.LineSender) error {
+				return s.Table("awesome_table").IntegerField("int", 42).Symbol("sym", "abc").AtNow(ctx)
+			},
+		},
+		{
+			"float field",
+			func(s *qdb.LineSender) error {
+				return s.Table("awesome_table").FloatField("float", 4.2).Symbol("sym", "abc").AtNow(ctx)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer()
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
+
+			err = tc.writerFn(sender)
+
+			assert.EqualError(t, err, "symbol has to be written before any field")
+			assert.Empty(t, sender.Messages())
+
+			sender.Close()
+			srv.close()
+		})
+	}
+}
+
+func expectLines(t *testing.T, linesCh chan string, expected []string) {
+	actual := make([]string, 0)
 	assert.Eventually(t, func() bool {
-		data := queryTableData(t, questdbC.httpAddress)
-		return assert.EqualValues(t, expected, data)
+		select {
+		case l := <-linesCh:
+			actual = append(actual, l)
+		default:
+			return false
+		}
+		return reflect.DeepEqual(expected, actual)
 	}, 10*time.Second, 100*time.Millisecond)
 }
 
-func TestImplicitFlush(t *testing.T) {
-	const bufCap = 100
+type testServer struct {
+	addr     string
+	listener net.Listener
+	linesCh  chan string
+	closeCh  chan struct{}
+	wg       sync.WaitGroup
+}
 
-	if testing.Short() {
-		t.Skip("skipping integration test")
+func newTestServer() (*testServer, error) {
+	tcp, err := net.Listen("tcp", "127.0.0.1:")
+	if err != nil {
+		return nil, err
 	}
-
-	ctx := context.Background()
-
-	questdbC, err := setupQuestDB(ctx)
-	assert.NoError(t, err)
-	defer questdbC.Terminate(ctx)
-
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress), qdb.WithBufferCapacity(bufCap))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	for i := 0; i < 10*bufCap; i++ {
-		err = sender.
-			Table(testTable).
-			BooleanField("b", true).
-			AtNow(ctx)
-		assert.NoError(t, err)
+	s := &testServer{
+		addr:     tcp.Addr().String(),
+		listener: tcp,
+		linesCh:  make(chan string),
+		closeCh:  make(chan struct{}),
 	}
-
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, questdbC.httpAddress)
-		// We didn't call Flush, but we expect the buffer to be flushed at least once.
-		return assert.Greater(t, data.Count, bufCap)
-	}, 10*time.Second, 100*time.Millisecond)
+	s.wg.Add(1)
+	go s.serve()
+	return s, nil
 }
 
-type tableData struct {
-	Columns []column        `json:"columns"`
-	Dataset [][]interface{} `json:"dataset"`
-	Count   int             `json:"count"`
+func (s *testServer) serve() {
+	defer s.wg.Done()
+
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			select {
+			case <-s.closeCh:
+				return
+			default:
+				log.Println("could not accept", err)
+			}
+			continue
+		}
+
+		s.wg.Add(1)
+		go func() {
+			s.handle(conn)
+			s.wg.Done()
+		}()
+	}
 }
 
-type column struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+func (s *testServer) handle(conn net.Conn) {
+	defer conn.Close()
+
+	r := bufio.NewReader(conn)
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		default:
+			l, err := r.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					continue
+				} else {
+					log.Println("could not read", err)
+					return
+				}
+			}
+			s.linesCh <- l
+		}
+	}
 }
 
-func queryTableData(t *testing.T, address string) tableData {
-	u, err := url.Parse(address)
-	assert.NoError(t, err)
-
-	u.Path += "exec"
-	params := url.Values{}
-	params.Add("query", testTable)
-	u.RawQuery = params.Encode()
-	url := fmt.Sprintf("%v", u)
-
-	res, err := http.Get(url)
-	assert.NoError(t, err)
-	defer res.Body.Close()
-
-	body, err := ioutil.ReadAll(res.Body)
-	assert.NoError(t, err)
-
-	data := tableData{}
-	err = json.Unmarshal(body, &data)
-	assert.NoError(t, err)
-
-	return data
+func (s *testServer) close() {
+	close(s.closeCh)
+	s.listener.Close()
+	s.wg.Wait()
 }

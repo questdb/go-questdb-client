@@ -39,7 +39,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	var d net.Dialer
 	s := &LineSender{
 		address: "127.0.0.1:9009",
-		bufCap:  1024 * 1024, // 1MB
+		bufCap:  32 * 1024,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -49,19 +49,21 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		return nil, err
 	}
 	s.conn = conn
+	s.buf = bytes.NewBuffer(make([]byte, 0, s.bufCap))
 	return s, nil
 }
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
 // messages.
 type LineSender struct {
-	address   string
-	bufCap    int
-	conn      net.Conn
-	buf       bytes.Buffer
-	lastErr   error
-	hasTable  bool
-	hasFields bool
+	address    string
+	bufCap     int
+	conn       net.Conn
+	buf        *bytes.Buffer
+	lastMsgPos int
+	lastErr    error
+	hasTable   bool
+	hasFields  bool
 	// TODO track last line position to move back on validation errors
 }
 
@@ -232,6 +234,8 @@ func (s *LineSender) At(ctx context.Context, time int64) error {
 	err := s.lastErr
 	s.lastErr = nil
 	if err != nil {
+		// Discard the partially written message.
+		s.buf.Truncate(s.lastMsgPos)
 		return err
 	}
 	if !s.hasTable {
@@ -245,6 +249,7 @@ func (s *LineSender) At(ctx context.Context, time int64) error {
 	}
 	s.buf.WriteByte('\n')
 
+	s.lastMsgPos = s.buf.Len()
 	s.hasTable = false
 	s.hasFields = false
 
@@ -275,9 +280,10 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	}
 
 	if s.buf.Cap() > s.bufCap {
-		// TODO double check whether it's the right way to shrink buffer
-		s.buf.Grow(s.bufCap)
+		// Shrink the buffer back to desired capacity.
+		s.buf = bytes.NewBuffer(make([]byte, 0, s.bufCap))
 	}
+	s.lastMsgPos = 0
 
 	return nil
 }
