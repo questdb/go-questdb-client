@@ -64,7 +64,6 @@ type LineSender struct {
 	lastErr    error
 	hasTable   bool
 	hasFields  bool
-	// TODO track last line position to move back on validation errors
 }
 
 // LineSenderOption defines line sender option.

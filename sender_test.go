@@ -28,9 +28,11 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -71,7 +73,7 @@ func TestValidWrites(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer()
+			srv, err := newTestServer(true)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -80,12 +82,16 @@ func TestValidWrites(t *testing.T) {
 			err = tc.writerFn(sender)
 			assert.NoError(t, err)
 
+			// Check the buffer before flushing it.
+			assert.Equal(t, strings.Join(tc.expectedLines, ""), sender.Messages())
+
 			err = sender.Flush(ctx)
 			assert.NoError(t, err)
 
 			sender.Close()
 
-			expectLines(t, srv.linesCh, tc.expectedLines)
+			// Now check what was received by the server.
+			expectLines(t, srv.backCh, tc.expectedLines)
 
 			srv.close()
 		})
@@ -145,7 +151,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer()
+			srv, err := newTestServer(false)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -160,6 +166,23 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 			srv.close()
 		})
 	}
+}
+
+func TestErrorOnMultipleTableCalls(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServer(false)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	err = sender.Table(testTable).Table(testTable).AtNow(ctx)
+
+	assert.EqualError(t, err, "table name already provided")
+	assert.Empty(t, sender.Messages())
 }
 
 func TestErrorOnSymbolCallAfterField(t *testing.T) {
@@ -197,7 +220,7 @@ func TestErrorOnSymbolCallAfterField(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer()
+			srv, err := newTestServer(false)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -211,6 +234,57 @@ func TestErrorOnSymbolCallAfterField(t *testing.T) {
 			sender.Close()
 			srv.close()
 		})
+	}
+}
+
+func TestInvalidMessageGetsDiscarded(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServer(true)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	// Write a valid message.
+	err = sender.Table(testTable).StringField("foo", "bar").AtNow(ctx)
+	assert.NoError(t, err)
+	// Then write perform an incorrect chain of calls.
+	err = sender.Table(testTable).StringField("foo", "bar").Symbol("sym", "42").AtNow(ctx)
+	assert.Error(t, err)
+
+	// The second message should be discarded.
+	err = sender.Flush(ctx)
+	assert.NoError(t, err)
+	expectLines(t, srv.backCh, []string{testTable + " foo=\"bar\"\n"})
+}
+
+func BenchmarkLineSender(b *testing.B) {
+	ctx := context.Background()
+
+	srv, err := newTestServer(false)
+	assert.NoError(b, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(b, err)
+	defer sender.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 1000; j++ {
+			sender.
+				Table(testTable).
+				Symbol("sym_col", "test_ilp1").
+				FloatField("double_col", float64(i)+0.42).
+				IntegerField("long_col", int64(i)).
+				StringField("str_col", "foobar").
+				BooleanField("bool_col", true).
+				At(ctx, int64(1000*i))
+		}
+		sender.Flush(ctx)
 	}
 }
 
@@ -228,23 +302,25 @@ func expectLines(t *testing.T, linesCh chan string, expected []string) {
 }
 
 type testServer struct {
-	addr     string
-	listener net.Listener
-	linesCh  chan string
-	closeCh  chan struct{}
-	wg       sync.WaitGroup
+	addr      string
+	listener  net.Listener
+	useBackCh bool
+	backCh    chan string
+	closeCh   chan struct{}
+	wg        sync.WaitGroup
 }
 
-func newTestServer() (*testServer, error) {
+func newTestServer(useBackCh bool) (*testServer, error) {
 	tcp, err := net.Listen("tcp", "127.0.0.1:")
 	if err != nil {
 		return nil, err
 	}
 	s := &testServer{
-		addr:     tcp.Addr().String(),
-		listener: tcp,
-		linesCh:  make(chan string),
-		closeCh:  make(chan struct{}),
+		addr:      tcp.Addr().String(),
+		listener:  tcp,
+		useBackCh: useBackCh,
+		backCh:    make(chan string),
+		closeCh:   make(chan struct{}),
 	}
 	s.wg.Add(1)
 	go s.serve()
@@ -268,13 +344,17 @@ func (s *testServer) serve() {
 
 		s.wg.Add(1)
 		go func() {
-			s.handle(conn)
+			if s.useBackCh {
+				s.handleWithBackChannel(conn)
+			} else {
+				s.handleWithDiscard(conn)
+			}
 			s.wg.Done()
 		}()
 	}
 }
 
-func (s *testServer) handle(conn net.Conn) {
+func (s *testServer) handleWithBackChannel(conn net.Conn) {
 	defer conn.Close()
 
 	r := bufio.NewReader(conn)
@@ -292,7 +372,28 @@ func (s *testServer) handle(conn net.Conn) {
 					return
 				}
 			}
-			s.linesCh <- l
+			s.backCh <- l
+		}
+	}
+}
+
+func (s *testServer) handleWithDiscard(conn net.Conn) {
+	defer conn.Close()
+
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		default:
+			_, err := io.Copy(ioutil.Discard, conn)
+			if err != nil {
+				if err == io.EOF {
+					continue
+				} else {
+					log.Println("could not read", err)
+					return
+				}
+			}
 		}
 	}
 }
