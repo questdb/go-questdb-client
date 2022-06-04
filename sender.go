@@ -108,7 +108,10 @@ func (s *LineSender) Table(name string) *LineSender {
 		s.lastErr = errors.New("table name already provided")
 		return s
 	}
-	s.writeString(name, false)
+	s.lastErr = s.writeStrName(name)
+	if s.lastErr != nil {
+		return s
+	}
 	s.hasTable = true
 	return s
 }
@@ -130,9 +133,15 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 		return s
 	}
 	s.buf.WriteByte(',')
-	s.writeString(name, false)
+	s.lastErr = s.writeStrName(name)
+	if s.lastErr != nil {
+		return s
+	}
 	s.buf.WriteByte('=')
-	s.writeString(val, false)
+	s.lastErr = s.writeStrValue(val, false)
+	if s.lastErr != nil {
+		return s
+	}
 	return s
 }
 
@@ -143,7 +152,10 @@ func (s *LineSender) IntColumn(name string, val int64) *LineSender {
 		return s
 	}
 	// TODO validate NaN and infinity values
-	s.writeString(name, false)
+	s.lastErr = s.writeStrName(name)
+	if s.lastErr != nil {
+		return s
+	}
 	s.buf.WriteByte('=')
 	// TODO implement proper serialization for numbers
 	s.buf.WriteString(fmt.Sprintf("%d", val))
@@ -159,7 +171,10 @@ func (s *LineSender) FloatColumn(name string, val float64) *LineSender {
 		return s
 	}
 	// TODO validate NaN and infinity values
-	s.writeString(name, false)
+	s.lastErr = s.writeStrName(name)
+	if s.lastErr != nil {
+		return s
+	}
 	s.buf.WriteByte('=')
 	// TODO implement proper serialization for numbers
 	s.buf.WriteString(fmt.Sprintf("%f", val))
@@ -172,10 +187,16 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	s.writeString(name, false)
+	s.lastErr = s.writeStrName(name)
+	if s.lastErr != nil {
+		return s
+	}
 	s.buf.WriteByte('=')
 	s.buf.WriteByte('"')
-	s.writeString(val, true)
+	s.lastErr = s.writeStrValue(val, true)
+	if s.lastErr != nil {
+		return s
+	}
 	s.buf.WriteByte('"')
 	s.hasFields = true
 	return s
@@ -186,7 +207,10 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	s.writeString(name, false)
+	s.lastErr = s.writeStrName(name)
+	if s.lastErr != nil {
+		return s
+	}
 	s.buf.WriteByte('=')
 	if val {
 		s.buf.WriteByte('t')
@@ -197,9 +221,101 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	return s
 }
 
+// TODO introduce ErrInvalidMsg
+
+func (s *LineSender) writeStrName(str string) error {
+	// Since we're interested in ASCII chars, it's fine to iterate
+	// through bytes instead of runes.
+	for i := 0; i < len(str); i++ {
+		b := str[i]
+		switch b {
+		case ' ':
+			s.buf.WriteByte('\\')
+		case '=':
+			s.buf.WriteByte('\\')
+		case '"':
+			s.buf.WriteByte('\\')
+		case '\n':
+			return fmt.Errorf("new line chars are not allowed in string values: %s", str)
+		case '\r':
+			return fmt.Errorf("carriage return chars are not allowed in string values: %s", str)
+		default:
+			if illegalNameChar(b) {
+				return fmt.Errorf("table or column name contains one of illegal chars: '.', '?', ',', ':', '\\', '/', '\\0', ')', '(', '+', '*', '~', '%%', '-': %s", str)
+			}
+		}
+		s.buf.WriteByte(b)
+	}
+	return nil
+}
+
+func illegalNameChar(ch byte) bool {
+	switch ch {
+	case '.':
+		return true
+	case '?':
+		return true
+	case ',':
+		return true
+	case ':':
+		return true
+	case '\\':
+		return true
+	case '/':
+		return true
+	case ')':
+		return true
+	case '(':
+		return true
+	case '+':
+		return true
+	case '*':
+		return true
+	case '~':
+		return true
+	case '%':
+		return true
+	case '-':
+		return true
+	case '\x00':
+		return true
+	}
+	return false
+}
+
+func (s *LineSender) writeStrValue(str string, quoted bool) error {
+	// Since we're interested in ASCII chars, it's fine to iterate
+	// through bytes instead of runes.
+	for i := 0; i < len(str); i++ {
+		b := str[i]
+		switch b {
+		case ' ':
+			if !quoted {
+				s.buf.WriteByte('\\')
+			}
+		case ',':
+			if !quoted {
+				s.buf.WriteByte('\\')
+			}
+		case '=':
+			if !quoted {
+				s.buf.WriteByte('\\')
+			}
+		case '"':
+			s.buf.WriteByte('\\')
+		case '\\':
+			s.buf.WriteByte('\\')
+		case '\n':
+			return fmt.Errorf("new line chars are not allowed in string values: %s", str)
+		case '\r':
+			return fmt.Errorf("carriage return chars are not allowed in string values: %s", str)
+		}
+		s.buf.WriteByte(b)
+	}
+	return nil
+}
+
 func (s *LineSender) prepareForField(name string) bool {
-	// TODO validate column name:
-	// Table name and columns name must not contain any of the forbidden characters: ., ?,,,:,\,/,\0,),(,+,*,~,% and -.
 	if s.lastErr != nil {
 		return false
 	}
@@ -215,48 +331,6 @@ func (s *LineSender) prepareForField(name string) bool {
 	return true
 }
 
-func (s *LineSender) writeString(str string, quoted bool) {
-	s.buf.Grow(len(str))
-	for _, r := range str {
-		if r < 128 {
-			writeEscapedChar(s.buf, byte(r), quoted)
-		} else {
-			s.buf.WriteRune(r)
-		}
-	}
-}
-
-func writeEscapedChar(buf *bytes.Buffer, ch byte, quoted bool) {
-	switch ch {
-	case ' ':
-		if !quoted {
-			buf.WriteByte('\\')
-		}
-	case ',':
-		if !quoted {
-			buf.WriteByte('\\')
-		}
-	case '=':
-		if !quoted {
-			buf.WriteByte('\\')
-		}
-	case '"':
-		buf.WriteByte('\\')
-	case '\\':
-		buf.WriteByte('\\')
-	// TODO return errors for new line chars
-	case '\n':
-		buf.WriteByte('\\')
-		buf.WriteByte('n')
-		return
-	case '\r':
-		buf.WriteByte('\\')
-		buf.WriteByte('r')
-		return
-	}
-	buf.WriteByte(ch)
-}
-
 // AtNow omits the timestamp and finalizes the ILP message.
 // The server will insert each message using the system clock
 // as the row timestamp.
@@ -268,12 +342,12 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 }
 
 // At sets the timestamp in Epoch nanoseconds and finalizes
-// the ILP message.
+// the ILP message. A negative ts value gets ignored making
+// this call behave in the same way as AtNow.
 //
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
-func (s *LineSender) At(ctx context.Context, time int64) error {
-	// TODO use ctx
+func (s *LineSender) At(ctx context.Context, ts int64) error {
 	err := s.lastErr
 	s.lastErr = nil
 	if err != nil {
@@ -285,10 +359,10 @@ func (s *LineSender) At(ctx context.Context, time int64) error {
 		return errors.New("table name was not provided")
 	}
 
-	if time > -1 {
+	if ts > -1 {
 		s.buf.WriteByte(' ')
 		// TODO implement proper serialization for numbers
-		s.buf.WriteString(fmt.Sprintf("%d", time))
+		s.buf.WriteString(fmt.Sprintf("%d", ts))
 	}
 	s.buf.WriteByte('\n')
 
@@ -325,8 +399,9 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		s.conn.SetWriteDeadline(time.Time{})
 	}
 
-	_, err = s.buf.WriteTo(s.conn)
+	n, err := s.buf.WriteTo(s.conn)
 	if err != nil {
+		s.lastMsgPos -= int(n)
 		return err
 	}
 

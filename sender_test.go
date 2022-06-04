@@ -73,31 +73,28 @@ func TestValidWrites(t *testing.T) {
 		{
 			"escaped chars in table name",
 			func(s *qdb.LineSender) error {
-				return s.Table("test 1,2\"3\\4").IntColumn("a_col", 42).AtNow(ctx)
+				return s.Table("test 1\"2=3").IntColumn("a_col", 42).AtNow(ctx)
 			},
 			[]string{
-				"test\\ 1\\,2\\\"3\\\\4 a_col=42i\n",
+				"test\\ 1\\\"2\\=3 a_col=42i\n",
 			},
 		},
 		{
-			"escaped chars in column name",
+			"escaped chars in string column",
 			func(s *qdb.LineSender) error {
-				return s.Table("test_table").FloatColumn("name 1,2\"3\\4", 42).AtNow(ctx)
+				return s.Table("test_table").StringColumn("name 1\"2=3", "value 1,2\"3\\4=5").AtNow(ctx)
 			},
 			[]string{
-				"test_table name\\ 1\\,2\\\"3\\\\4=42.000000\n",
+				"test_table name\\ 1\\\"2\\=3=\"value 1,2\\\"3\\\\4=5\"\n",
 			},
 		},
 		{
-			"escaped chars in symbol name and value",
+			"escaped chars in symbol",
 			func(s *qdb.LineSender) error {
-				s.Table("test_table").Symbol("name 1,2\"3\\4", "value 1,2\"3\\4")
-				fmt.Println(s.Messages())
-				fmt.Println(">>>")
-				return s.AtNow(ctx)
+				return s.Table("test_table").Symbol("name 1\"2=3", "value 1,2\"3\\4=5").AtNow(ctx)
 			},
 			[]string{
-				"test_table,name\\ 1\\,2\\\"3\\\\4=value\\ 1\\,2\\\"3\\\\4\n",
+				"test_table,name\\ 1\\\"2\\=3=value\\ 1\\,2\\\"3\\\\4\\=5\n",
 			},
 		},
 	}
@@ -371,7 +368,7 @@ func BenchmarkLineSender(b *testing.B) {
 				Symbol("sym_col", "test_ilp1").
 				FloatColumn("double_col", float64(i)+0.42).
 				IntColumn("long_col", int64(i)).
-				StringColumn("str_col", "foobar").
+				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 				BoolColumn("bool_col", true).
 				At(ctx, int64(1000*i))
 		}
