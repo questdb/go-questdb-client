@@ -236,9 +236,9 @@ func (s *LineSender) writeStrName(str string) error {
 		case '"':
 			s.buf.WriteByte('\\')
 		case '\n':
-			return fmt.Errorf("new line chars are not allowed in string values: %s", str)
+			return fmt.Errorf("table or column name contains a new line char: %s", str)
 		case '\r':
-			return fmt.Errorf("carriage return chars are not allowed in string values: %s", str)
+			return fmt.Errorf("table or column name contains a carriage return char: %s", str)
 		default:
 			if illegalNameChar(b) {
 				return fmt.Errorf("table or column name contains one of illegal chars: '.', '?', ',', ':', '\\', '/', '\\0', ')', '(', '+', '*', '~', '%%', '-': %s", str)
@@ -306,9 +306,9 @@ func (s *LineSender) writeStrValue(str string, quoted bool) error {
 		case '\\':
 			s.buf.WriteByte('\\')
 		case '\n':
-			return fmt.Errorf("new line chars are not allowed in string values: %s", str)
+			return fmt.Errorf("symbol or string column value contains a new line char: %s", str)
 		case '\r':
-			return fmt.Errorf("carriage return chars are not allowed in string values: %s", str)
+			return fmt.Errorf("symbol or string column value contains a carriage return char: %s", str)
 		}
 		s.buf.WriteByte(b)
 	}
