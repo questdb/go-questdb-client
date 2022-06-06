@@ -155,6 +155,62 @@ func TestAllColumnTypes(t *testing.T) {
 	}, 10*time.Second, 100*time.Millisecond)
 }
 
+func TestWriteInBatches(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	const (
+		n      = 100
+		nBatch = 100
+	)
+
+	ctx := context.Background()
+
+	questdbC, err := setupQuestDB(ctx)
+	assert.NoError(t, err)
+	defer questdbC.Terminate(ctx)
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	for i := 0; i < n; i++ {
+		for j := 0; j < nBatch; j++ {
+			err = sender.
+				Table(testTable).
+				IntColumn("long_col", int64(j)).
+				At(ctx, 1000*int64(i*nBatch+j))
+			assert.NoError(t, err)
+		}
+		err = sender.Flush(ctx)
+		assert.NoError(t, err)
+	}
+
+	expected := tableData{
+		Columns: []column{
+			{"long_col", "LONG"},
+			{"timestamp", "TIMESTAMP"},
+		},
+		Dataset: [][]interface{}{},
+		Count:   n * nBatch,
+	}
+
+	for i := 0; i < n; i++ {
+		for j := 0; j < nBatch; j++ {
+			expected.Dataset = append(
+				expected.Dataset,
+				[]interface{}{float64(j), "1970-01-01T00:00:00." + fmt.Sprintf("%06d", i*nBatch+j) + "Z"},
+			)
+		}
+	}
+
+	assert.Eventually(t, func() bool {
+		data := queryTableData(t, questdbC.httpAddress)
+		return reflect.DeepEqual(expected, data)
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
 func TestImplicitFlush(t *testing.T) {
 	const bufCap = 100
 

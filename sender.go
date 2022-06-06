@@ -35,6 +35,11 @@ import (
 	"time"
 )
 
+// ErrInvalidMsg indicates a failed attempt to construct an ILP
+// message, e.g. duplicate calls to Table method or illegal
+// chars found in table or column name.
+var ErrInvalidMsg = errors.New("invalid message")
+
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single TCP connection. Sender should
 // not be called concurrently by multiple goroutines.
@@ -105,7 +110,7 @@ func (s *LineSender) Table(name string) *LineSender {
 		return s
 	}
 	if s.hasTable {
-		s.lastErr = errors.New("table name already provided")
+		s.lastErr = fmt.Errorf("table name already provided: %w", ErrInvalidMsg)
 		return s
 	}
 	s.lastErr = s.writeStrName(name)
@@ -123,11 +128,11 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 		return s
 	}
 	if !s.hasTable {
-		s.lastErr = errors.New("table name was not provided")
+		s.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
 		return s
 	}
 	if s.hasFields {
-		s.lastErr = errors.New("symbols have to be written before any other column")
+		s.lastErr = fmt.Errorf("symbols have to be written before any other column: %w", ErrInvalidMsg)
 		return s
 	}
 	s.buf.WriteByte(',')
@@ -213,8 +218,6 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	return s
 }
 
-// TODO introduce ErrInvalidMsg
-
 func (s *LineSender) writeStrName(str string) error {
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
@@ -228,12 +231,14 @@ func (s *LineSender) writeStrName(str string) error {
 		case '"':
 			s.buf.WriteByte('\\')
 		case '\n':
-			return fmt.Errorf("table or column name contains a new line char: %s", str)
+			return fmt.Errorf("table or column name contains a new line char: %s: %w", str, ErrInvalidMsg)
 		case '\r':
-			return fmt.Errorf("table or column name contains a carriage return char: %s", str)
+			return fmt.Errorf("table or column name contains a carriage return char: %s: %w", str, ErrInvalidMsg)
 		default:
 			if illegalNameChar(b) {
-				return fmt.Errorf("table or column name contains one of illegal chars: '.', '?', ',', ':', '\\', '/', '\\0', ')', '(', '+', '*', '~', '%%', '-': %s", str)
+				return fmt.Errorf("table or column name contains one of illegal chars: "+
+					"'.', '?', ',', ':', '\\', '/', '\\0', ')', '(', '+', '*', '~', '%%', '-': %s: %w",
+					str, ErrInvalidMsg)
 			}
 		}
 		s.buf.WriteByte(b)
@@ -298,9 +303,9 @@ func (s *LineSender) writeStrValue(str string, quoted bool) error {
 		case '\\':
 			s.buf.WriteByte('\\')
 		case '\n':
-			return fmt.Errorf("symbol or string column value contains a new line char: %s", str)
+			return fmt.Errorf("symbol or string column value contains a new line char: %s: %w", str, ErrInvalidMsg)
 		case '\r':
-			return fmt.Errorf("symbol or string column value contains a carriage return char: %s", str)
+			return fmt.Errorf("symbol or string column value contains a carriage return char: %s: %w", str, ErrInvalidMsg)
 		}
 		s.buf.WriteByte(b)
 	}
@@ -312,7 +317,7 @@ func (s *LineSender) prepareForField(name string) bool {
 		return false
 	}
 	if !s.hasTable {
-		s.lastErr = errors.New("table name was not provided")
+		s.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
 		return false
 	}
 	if !s.hasFields {
@@ -348,7 +353,7 @@ func (s *LineSender) At(ctx context.Context, ts int64) error {
 		return err
 	}
 	if !s.hasTable {
-		return errors.New("table name was not provided")
+		return fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
 	}
 
 	if ts > -1 {

@@ -544,7 +544,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 
 			err = tc.writerFn(sender)
 
-			assert.EqualError(t, err, "table name was not provided")
+			assert.ErrorContains(t, err, "table name was not provided")
 			assert.Empty(t, sender.Messages())
 
 			sender.Close()
@@ -566,7 +566,7 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 
 	err = sender.Table(testTable).Table(testTable).AtNow(ctx)
 
-	assert.EqualError(t, err, "table name already provided")
+	assert.ErrorContains(t, err, "table name already provided")
 	assert.Empty(t, sender.Messages())
 }
 
@@ -613,7 +613,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 
 			err = tc.writerFn(sender)
 
-			assert.EqualError(t, err, "symbols have to be written before any other column")
+			assert.ErrorContains(t, err, "symbols have to be written before any other column")
 			assert.Empty(t, sender.Messages())
 
 			sender.Close()
