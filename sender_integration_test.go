@@ -183,7 +183,7 @@ func TestImplicitFlush(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		data := queryTableData(t, questdbC.httpAddress)
 		// We didn't call Flush, but we expect the buffer to be flushed at least once.
-		return assert.Greater(t, data.Count, bufCap)
+		return data.Count > 0
 	}, 10*time.Second, 100*time.Millisecond)
 }
 
