@@ -315,7 +315,7 @@ func TestSuccessfulAuth(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		data := queryTableData(t, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
-	}, 10*time.Second, 100*time.Millisecond)
+	}, 20*time.Second, 100*time.Millisecond)
 }
 
 func TestFailedAuth(t *testing.T) {
