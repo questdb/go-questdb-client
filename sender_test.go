@@ -31,8 +31,10 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"net"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -53,21 +55,21 @@ func TestValidWrites(t *testing.T) {
 		expectedLines []string
 	}{
 		{
-			"single string column",
+			"multiple rows",
 			func(s *qdb.LineSender) error {
-				err := s.Table(testTable).StringColumn("a_col", "foo").AtNow(ctx)
+				err := s.Table(testTable).StringColumn("str_col", "foo").IntColumn("long_col", 42).AtNow(ctx)
 				if err != nil {
 					return err
 				}
-				err = s.Table(testTable).StringColumn("a_col", "bar").At(ctx, 42)
+				err = s.Table(testTable).StringColumn("str_col", "bar").IntColumn("long_col", -42).At(ctx, 42)
 				if err != nil {
 					return err
 				}
 				return nil
 			},
 			[]string{
-				"my_test_table a_col=\"foo\"\n",
-				"my_test_table a_col=\"bar\" 42\n",
+				"my_test_table str_col=\"foo\",long_col=42i\n",
+				"my_test_table str_col=\"bar\",long_col=-42i 42\n",
 			},
 		},
 		{
@@ -129,6 +131,87 @@ func TestValidWrites(t *testing.T) {
 
 			// Now check what was received by the server.
 			expectLines(t, srv.backCh, tc.expectedLines)
+
+			srv.close()
+		})
+	}
+}
+
+func TestIntSerialization(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name string
+		val  int64
+	}{
+		{"min value", math.MinInt64},
+		{"max value", math.MaxInt64},
+		{"zero", 0},
+		{"small negative value", -10},
+		{"small positive value", 10},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer(sendToBackChannel)
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
+
+			err = sender.Table(testTable).IntColumn("a_col", tc.val).AtNow(ctx)
+			assert.NoError(t, err)
+
+			err = sender.Flush(ctx)
+			assert.NoError(t, err)
+
+			sender.Close()
+
+			// Now check what was received by the server.
+			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i\n"})
+
+			srv.close()
+		})
+	}
+}
+
+func TestFloatSerialization(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name     string
+		val      float64
+		expected string
+	}{
+		{"NaN", math.NaN(), "NaN"},
+		{"positive infinity", math.Inf(1), "Infinity"},
+		{"negative infinity", math.Inf(-1), "-Infinity"},
+		{"negative infinity", math.Inf(-1), "-Infinity"},
+		{"positive number", 42.3, "42.3"},
+		{"negative number", -42.3, "-42.3"},
+		{"smallest value", math.SmallestNonzeroFloat64, "5e-324"},
+		{"max value", math.MaxFloat64, "1.7976931348623157e+308"},
+		{"negative with exponent", -4.2e-99, "-4.2e-99"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer(sendToBackChannel)
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
+
+			err = sender.Table(testTable).FloatColumn("a_col", tc.val).AtNow(ctx)
+			assert.NoError(t, err)
+
+			err = sender.Flush(ctx)
+			assert.NoError(t, err)
+
+			sender.Close()
+
+			// Now check what was received by the server.
+			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + tc.expected + "\n"})
 
 			srv.close()
 		})

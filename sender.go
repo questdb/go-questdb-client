@@ -29,7 +29,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -40,7 +42,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	var d net.Dialer
 	s := &LineSender{
 		address: "127.0.0.1:9009",
-		bufCap:  32 * 1024,
+		bufCap:  256 * 1024,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -50,7 +52,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		return nil, fmt.Errorf("failed to connect to server: %v", err)
 	}
 	s.conn = conn
-	s.buf = bytes.NewBuffer(make([]byte, 0, s.bufCap))
+	s.buf = newBuffer(s.bufCap)
 	return s, nil
 }
 
@@ -60,7 +62,7 @@ type LineSender struct {
 	address    string
 	bufCap     int
 	conn       net.Conn
-	buf        *bytes.Buffer
+	buf        *buffer
 	lastMsgPos int
 	lastErr    error
 	hasTable   bool
@@ -97,13 +99,11 @@ func (s *LineSender) Close() error {
 }
 
 // Table sets the table name (metric) for a new ILP message. Should be
-// called before any Symbol or Field method.
+// called before any Symbol or Column method.
 func (s *LineSender) Table(name string) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	// TODO validate table name:
-	// Table name and columns name must not contain any of the forbidden characters: ., ?,,,:,\,/,\0,),(,+,*,~,% and -.
 	if s.hasTable {
 		s.lastErr = errors.New("table name already provided")
 		return s
@@ -117,13 +117,11 @@ func (s *LineSender) Table(name string) *LineSender {
 }
 
 // Symbol adds a symbol column (tag) value to the ILP message. Should be
-// called before any Field method.
+// called before any Column method.
 func (s *LineSender) Symbol(name, val string) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	// TODO validate column name:
-	// Table name and columns name must not contain any of the forbidden characters: ., ?,,,:,\,/,\0,),(,+,*,~,% and -.
 	if !s.hasTable {
 		s.lastErr = errors.New("table name was not provided")
 		return s
@@ -145,44 +143,38 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 	return s
 }
 
-// IntColumn adds a long column (integer field) value to
-// the ILP message.
+// IntColumn adds a 64-bit integer column value to the ILP message.
 func (s *LineSender) IntColumn(name string, val int64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	// TODO validate NaN and infinity values
 	s.lastErr = s.writeStrName(name)
 	if s.lastErr != nil {
 		return s
 	}
 	s.buf.WriteByte('=')
-	// TODO implement proper serialization for numbers
-	s.buf.WriteString(fmt.Sprintf("%d", val))
+	s.buf.WriteInt(val)
 	s.buf.WriteByte('i')
 	s.hasFields = true
 	return s
 }
 
-// FloatColumn adds a double column (float field) value to
-// the ILP message.
+// FloatColumn adds a 64-bit float column value to the ILP message.
 func (s *LineSender) FloatColumn(name string, val float64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	// TODO validate NaN and infinity values
 	s.lastErr = s.writeStrName(name)
 	if s.lastErr != nil {
 		return s
 	}
 	s.buf.WriteByte('=')
-	// TODO implement proper serialization for numbers
-	s.buf.WriteString(fmt.Sprintf("%f", val))
+	s.buf.WriteFloat(val)
 	s.hasFields = true
 	return s
 }
 
-// StringColumn adds a string column (field) value to the ILP message.
+// StringColumn adds a string column value to the ILP message.
 func (s *LineSender) StringColumn(name, val string) *LineSender {
 	if !s.prepareForField(name) {
 		return s
@@ -202,7 +194,7 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 	return s
 }
 
-// BoolColumn adds a boolean column (field) value to the ILP message.
+// BoolColumn adds a boolean column value to the ILP message.
 func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	if !s.prepareForField(name) {
 		return s
@@ -361,8 +353,7 @@ func (s *LineSender) At(ctx context.Context, ts int64) error {
 
 	if ts > -1 {
 		s.buf.WriteByte(' ')
-		// TODO implement proper serialization for numbers
-		s.buf.WriteString(fmt.Sprintf("%d", ts))
+		s.buf.WriteInt(ts)
 	}
 	s.buf.WriteByte('\n')
 
@@ -407,7 +398,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 	if s.buf.Cap() > s.bufCap {
 		// Shrink the buffer back to desired capacity.
-		s.buf = bytes.NewBuffer(make([]byte, 0, s.bufCap))
+		s.buf = newBuffer(s.bufCap)
 	}
 	s.lastMsgPos = 0
 
@@ -418,4 +409,39 @@ func (s *LineSender) Flush(ctx context.Context) error {
 // flushed to the TCP connection yet. Useful for debugging purposes.
 func (s *LineSender) Messages() string {
 	return s.buf.String()
+}
+
+// buffer is a wrapper on top of bytes.buffer. It extends the
+// original struct with methods for writing int64 and float64
+// numbers without unnecessary allocations.
+type buffer struct {
+	bytes.Buffer
+}
+
+func newBuffer(cap int) *buffer {
+	return &buffer{*bytes.NewBuffer(make([]byte, 0, cap))}
+}
+
+func (b *buffer) WriteInt(i int64) {
+	// We need up to 20 bytes to fit an int64, including a sign.
+	var a [20]byte
+	s := strconv.AppendInt(a[0:0], i, 10)
+	b.Write(s)
+}
+
+func (b *buffer) WriteFloat(f float64) {
+	if math.IsNaN(f) {
+		b.WriteString("NaN")
+		return
+	} else if math.IsInf(f, -1) {
+		b.WriteString("-Infinity")
+		return
+	} else if math.IsInf(f, 1) {
+		b.WriteString("Infinity")
+		return
+	}
+	// We need up to 24 bytes to fit a float64, including a sign.
+	var a [24]byte
+	s := strconv.AppendFloat(a[0:0], f, 'g', -1, 64)
+	b.Write(s)
 }
