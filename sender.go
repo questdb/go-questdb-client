@@ -25,11 +25,18 @@
 package questdb
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net"
 	"strconv"
 	"time"
@@ -40,31 +47,12 @@ import (
 // chars found in table or column name.
 var ErrInvalidMsg = errors.New("invalid message")
 
-// NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
-// sender corresponds to a single TCP connection. Sender should
-// not be called concurrently by multiple goroutines.
-func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, error) {
-	var d net.Dialer
-	s := &LineSender{
-		address: "127.0.0.1:9009",
-		bufCap:  256 * 1024,
-	}
-	for _, opt := range opts {
-		opt(s)
-	}
-	conn, err := d.DialContext(ctx, "tcp", s.address)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to server: %v", err)
-	}
-	s.conn = conn
-	s.buf = newBuffer(s.bufCap)
-	return s, nil
-}
-
 // LineSender allows you to insert rows into QuestDB by sending ILP
 // messages.
 type LineSender struct {
 	address    string
+	keyId      string // Erased once auth is done.
+	token      string // Erased once auth is done.
 	bufCap     int
 	conn       net.Conn
 	buf        *buffer
@@ -85,6 +73,14 @@ func WithAddress(address string) LineSenderOption {
 	}
 }
 
+// WithAuthKey sets key used for ILP authentication.
+func WithEnabledAuth(keyId, token string) LineSenderOption {
+	return func(s *LineSender) {
+		s.keyId = keyId
+		s.token = token
+	}
+}
+
 // WithBufferCapacity sets desired buffer capacity in bytes to
 // be used when sending ILP messages. This is a soft limit, i.e.
 // the underlying buffer may grow larger than the provided value,
@@ -95,6 +91,88 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 			s.bufCap = capacity
 		}
 	}
+}
+
+// NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
+// sender corresponds to a single TCP connection. Sender should
+// not be called concurrently by multiple goroutines.
+func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, error) {
+	var (
+		d   net.Dialer
+		key *ecdsa.PrivateKey
+	)
+
+	s := &LineSender{
+		address: "127.0.0.1:9009",
+		bufCap:  256 * 1024,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	if s.token != "" {
+		keyRaw, err := base64.RawURLEncoding.DecodeString(s.token)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode auth key: %v", err)
+		}
+		key = new(ecdsa.PrivateKey)
+		key.PublicKey.Curve = elliptic.P256()
+		key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(keyRaw)
+		key.D = new(big.Int).SetBytes(keyRaw)
+	}
+
+	conn, err := d.DialContext(ctx, "tcp", s.address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to server: %v", err)
+	}
+
+	if key != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			conn.SetDeadline(deadline)
+		}
+
+		_, err = conn.Write([]byte(s.keyId + "\n"))
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to write key id: %v", err)
+		}
+
+		reader := bufio.NewReader(conn)
+		raw, err := reader.ReadBytes('\n')
+		// Remove the `\n` in the last position.
+		raw = raw[:len(raw)-1]
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to read response from server: %v", err)
+		}
+
+		// Hash the challenge with sha256.
+		hash := crypto.SHA256.New()
+		hash.Write(raw)
+		hashed := hash.Sum(nil)
+
+		a, b, err := ecdsa.Sign(rand.Reader, key, hashed)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to sign challenge using auth key: %v", err)
+		}
+		stdSig := append(a.Bytes(), b.Bytes()...)
+		_, err = conn.Write([]byte(base64.StdEncoding.EncodeToString(stdSig) + "\n"))
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to write signed challenge: %v", err)
+		}
+
+		// Reset the deadline.
+		conn.SetDeadline(time.Time{})
+		// Erase the key values since we don't need them anymore.
+		s.token = ""
+		s.keyId = ""
+	}
+
+	s.conn = conn
+	s.buf = newBuffer(s.bufCap)
+	return s, nil
 }
 
 // Close closes the underlying TCP connection. Does not flush

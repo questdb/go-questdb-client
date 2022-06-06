@@ -31,6 +31,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -50,18 +51,40 @@ type questdbContainer struct {
 	ilpAddress  string
 }
 
-func setupQuestDB(ctx context.Context) (*questdbContainer, error) {
+type ilpAuthType int64
+
+const (
+	noAuth      ilpAuthType = 0
+	authEnabled ilpAuthType = 1
+)
+
+func setupQuestDB(ctx context.Context, auth ilpAuthType) (*questdbContainer, error) {
+	// Make sure that ingested rows are committed almost immediately.
+	env := map[string]string{
+		"QDB_CAIRO_MAX_UNCOMMITTED_ROWS":        "1",
+		"QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL": "100",
+		"QDB_PG_ENABLED":                        "false",
+		"QDB_HTTP_MIN_ENABLED":                  "false",
+	}
+	if auth == authEnabled {
+		env["QDB_LINE_TCP_AUTH_DB_PATH"] = "/auth/auth.txt"
+	}
+
+	path, err := filepath.Abs("./test")
+	if err != nil {
+		panic(err)
+	}
 	req := testcontainers.ContainerRequest{
 		Image:        "questdb/questdb",
 		ExposedPorts: []string{"9000/tcp", "9009/tcp"},
 		WaitingFor:   wait.ForHTTP("/").WithPort("9000"),
-		// Make sure that ingested rows are committed almost immediately.
-		Env: map[string]string{
-			"QDB_CAIRO_MAX_UNCOMMITTED_ROWS":        "1",
-			"QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL": "100",
-			"QDB_PG_ENABLED":                        "false",
-			"QDB_HTTP_MIN_ENABLED":                  "false",
-		},
+		Env:          env,
+		Mounts: testcontainers.Mounts(testcontainers.ContainerMount{
+			Source: testcontainers.GenericBindMountSource{
+				HostPath: path,
+			},
+			Target: testcontainers.ContainerMountTarget("/root/.questdb/auth"),
+		}),
 	}
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -102,7 +125,7 @@ func TestAllColumnTypes(t *testing.T) {
 
 	ctx := context.Background()
 
-	questdbC, err := setupQuestDB(ctx)
+	questdbC, err := setupQuestDB(ctx, noAuth)
 	assert.NoError(t, err)
 	defer questdbC.Terminate(ctx)
 
@@ -167,7 +190,7 @@ func TestWriteInBatches(t *testing.T) {
 
 	ctx := context.Background()
 
-	questdbC, err := setupQuestDB(ctx)
+	questdbC, err := setupQuestDB(ctx, noAuth)
 	assert.NoError(t, err)
 	defer questdbC.Terminate(ctx)
 
@@ -220,7 +243,7 @@ func TestImplicitFlush(t *testing.T) {
 
 	ctx := context.Background()
 
-	questdbC, err := setupQuestDB(ctx)
+	questdbC, err := setupQuestDB(ctx, noAuth)
 	assert.NoError(t, err)
 	defer questdbC.Terminate(ctx)
 
@@ -241,6 +264,105 @@ func TestImplicitFlush(t *testing.T) {
 		// We didn't call Flush, but we expect the buffer to be flushed at least once.
 		return data.Count > 0
 	}, 10*time.Second, 100*time.Millisecond)
+}
+
+func TestSuccessfulAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+
+	questdbC, err := setupQuestDB(ctx, authEnabled)
+	assert.NoError(t, err)
+	defer questdbC.Terminate(ctx)
+
+	sender, err := qdb.NewLineSender(
+		ctx,
+		qdb.WithAddress(questdbC.ilpAddress),
+		qdb.WithEnabledAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
+	)
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	err = sender.
+		Table(testTable).
+		StringColumn("str_col", "foobar").
+		At(ctx, 1000)
+	assert.NoError(t, err)
+
+	err = sender.
+		Table(testTable).
+		StringColumn("str_col", "barbaz").
+		At(ctx, 2000)
+	assert.NoError(t, err)
+
+	err = sender.Flush(ctx)
+	assert.NoError(t, err)
+
+	expected := tableData{
+		Columns: []column{
+			{"str_col", "STRING"},
+			{"timestamp", "TIMESTAMP"},
+		},
+		Dataset: [][]interface{}{
+			{"foobar", "1970-01-01T00:00:00.000001Z"},
+			{"barbaz", "1970-01-01T00:00:00.000002Z"},
+		},
+		Count: 2,
+	}
+
+	assert.Eventually(t, func() bool {
+		data := queryTableData(t, questdbC.httpAddress)
+		return reflect.DeepEqual(expected, data)
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
+func TestFailedAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+
+	questdbC, err := setupQuestDB(ctx, authEnabled)
+	assert.NoError(t, err)
+	defer questdbC.Terminate(ctx)
+
+	sender, err := qdb.NewLineSender(
+		ctx,
+		qdb.WithAddress(questdbC.ilpAddress),
+		qdb.WithEnabledAuth("wrongKeyId", "1234567890"),
+	)
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	err = sender.
+		Table(testTable).
+		StringColumn("str_col", "foobar").
+		At(ctx, 1000)
+	// If we get an error here or later, it means that the server closed connection.
+	if err != nil {
+		return
+	}
+
+	err = sender.
+		Table(testTable).
+		StringColumn("str_col", "barbaz").
+		At(ctx, 2000)
+	if err != nil {
+		return
+	}
+
+	err = sender.Flush(ctx)
+	if err != nil {
+		return
+	}
+
+	// Our writes should not get applied.
+	time.Sleep(2 * time.Second)
+	data := queryTableData(t, questdbC.httpAddress)
+	assert.Equal(t, 0, data.Count)
 }
 
 type tableData struct {
