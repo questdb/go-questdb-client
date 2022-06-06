@@ -1,8 +1,8 @@
 # go-questdb-client
 
-Golang client for QuestDB InfluxDB Line Protocol over TCP
+Golang client for QuestDB InfluxDB Line Protocol over TCP.
 
-**Work in progress**
+## Usage
 
 ```go
 package main
