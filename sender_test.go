@@ -57,11 +57,11 @@ func TestValidWrites(t *testing.T) {
 		{
 			"multiple rows",
 			func(s *qdb.LineSender) error {
-				err := s.Table(testTable).StringColumn("str_col", "foo").IntColumn("long_col", 42).AtNow(ctx)
+				err := s.Table(testTable).StringColumn("str_col", "foo").Int64Column("long_col", 42).AtNow(ctx)
 				if err != nil {
 					return err
 				}
-				err = s.Table(testTable).StringColumn("str_col", "bar").IntColumn("long_col", -42).At(ctx, 42)
+				err = s.Table(testTable).StringColumn("str_col", "bar").Int64Column("long_col", -42).At(ctx, 42)
 				if err != nil {
 					return err
 				}
@@ -75,7 +75,7 @@ func TestValidWrites(t *testing.T) {
 		{
 			"escaped chars in table name",
 			func(s *qdb.LineSender) error {
-				return s.Table("test 1\"2=3").IntColumn("a_col", 42).AtNow(ctx)
+				return s.Table("test 1\"2=3").Int64Column("a_col", 42).AtNow(ctx)
 			},
 			[]string{
 				"test\\ 1\\\"2\\=3 a_col=42i\n",
@@ -159,7 +159,7 @@ func TestIntSerialization(t *testing.T) {
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
 			assert.NoError(t, err)
 
-			err = sender.Table(testTable).IntColumn("a_col", tc.val).AtNow(ctx)
+			err = sender.Table(testTable).Int64Column("a_col", tc.val).AtNow(ctx)
 			assert.NoError(t, err)
 
 			err = sender.Flush(ctx)
@@ -202,7 +202,7 @@ func TestFloatSerialization(t *testing.T) {
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
 			assert.NoError(t, err)
 
-			err = sender.Table(testTable).FloatColumn("a_col", tc.val).AtNow(ctx)
+			err = sender.Table(testTable).Float64Column("a_col", tc.val).AtNow(ctx)
 			assert.NoError(t, err)
 
 			err = sender.Flush(ctx)
@@ -523,13 +523,13 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 		{
 			"long column",
 			func(s *qdb.LineSender) error {
-				return s.IntColumn("int", 42).AtNow(ctx)
+				return s.Int64Column("int", 42).AtNow(ctx)
 			},
 		},
 		{
 			"double column",
 			func(s *qdb.LineSender) error {
-				return s.FloatColumn("float", 4.2).AtNow(ctx)
+				return s.Float64Column("float", 4.2).AtNow(ctx)
 			},
 		},
 	}
@@ -592,13 +592,13 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 		{
 			"integer column",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").IntColumn("int", 42).Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").Int64Column("int", 42).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"float column",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").FloatColumn("float", 4.2).Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").Float64Column("float", 4.2).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 	}
@@ -723,8 +723,8 @@ func BenchmarkLineSender(b *testing.B) {
 			sender.
 				Table(testTable).
 				Symbol("sym_col", "test_ilp1").
-				FloatColumn("double_col", float64(i)+0.42).
-				IntColumn("long_col", int64(i)).
+				Float64Column("double_col", float64(i)+0.42).
+				Int64Column("long_col", int64(i)).
 				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 				BoolColumn("bool_col", true).
 				At(ctx, int64(1000*i))

@@ -232,8 +232,8 @@ func TestAllColumnTypes(t *testing.T) {
 	err = sender.
 		Table(testTable).
 		Symbol("sym_col", "test_ilp1").
-		FloatColumn("double_col", 12.2).
-		IntColumn("long_col", 12).
+		Float64Column("double_col", 12.2).
+		Int64Column("long_col", 12).
 		StringColumn("str_col", "foobar").
 		BoolColumn("bool_col", true).
 		At(ctx, 1000)
@@ -242,8 +242,8 @@ func TestAllColumnTypes(t *testing.T) {
 	err = sender.
 		Table(testTable).
 		Symbol("sym_col", "test_ilp2").
-		FloatColumn("double_col", 11.2).
-		IntColumn("long_col", 11).
+		Float64Column("double_col", 11.2).
+		Int64Column("long_col", 11).
 		StringColumn("str_col", "barbaz").
 		BoolColumn("bool_col", false).
 		At(ctx, 2000)
@@ -298,7 +298,7 @@ func TestWriteInBatches(t *testing.T) {
 		for j := 0; j < nBatch; j++ {
 			err = sender.
 				Table(testTable).
-				IntColumn("long_col", int64(j)).
+				Int64Column("long_col", int64(j)).
 				At(ctx, 1000*int64(i*nBatch+j))
 			assert.NoError(t, err)
 		}

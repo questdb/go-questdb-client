@@ -248,8 +248,8 @@ func (s *LineSender) Table(name string) *LineSender {
 	return s
 }
 
-// Symbol adds a symbol column (tag) value to the ILP message. Should be
-// called before any Column method.
+// Symbol adds a symbol column value to the ILP message. Should be called
+// before any Column method.
 //
 // Symbol name cannot contain any of the following characters:
 // '\n', '\r', '.', '?', ',', ':', '\\', '/', '\\0', ')', '(', '+', '*',
@@ -282,12 +282,13 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 	return s
 }
 
-// IntColumn adds a 64-bit integer column value to the ILP message.
+// Int64Column adds a 64-bit integer (long) column value to the ILP
+// message.
 //
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '.', '?', ',', ':', '\\', '/', '\\0', ')', '(', '+', '*',
 // '~', '%%', '-'.
-func (s *LineSender) IntColumn(name string, val int64) *LineSender {
+func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
@@ -302,12 +303,13 @@ func (s *LineSender) IntColumn(name string, val int64) *LineSender {
 	return s
 }
 
-// FloatColumn adds a 64-bit float column value to the ILP message.
+// Float64Column adds a 64-bit float (double) column value to the ILP
+// message.
 //
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '.', '?', ',', ':', '\\', '/', '\\0', ')', '(', '+', '*',
 // '~', '%%', '-'.
-func (s *LineSender) FloatColumn(name string, val float64) *LineSender {
+func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
