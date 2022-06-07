@@ -32,6 +32,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -47,10 +48,19 @@ import (
 // chars found in table or column name.
 var ErrInvalidMsg = errors.New("invalid message")
 
+type tlsMode int64
+
+const (
+	noTls                 tlsMode = 0
+	tlsEnabled            tlsMode = 1
+	tlsInsecureSkipVerify tlsMode = 2
+)
+
 // LineSender allows you to insert rows into QuestDB by sending ILP
 // messages.
 type LineSender struct {
 	address    string
+	tlsMode    tlsMode
 	keyId      string // Erased once auth is done.
 	token      string // Erased once auth is done.
 	bufCap     int
@@ -73,11 +83,28 @@ func WithAddress(address string) LineSenderOption {
 	}
 }
 
-// WithAuthKey sets key used for ILP authentication.
-func WithEnabledAuth(keyId, token string) LineSenderOption {
+// WithAuth sets token (private key) used for ILP authentication.
+func WithAuth(tokenId, token string) LineSenderOption {
 	return func(s *LineSender) {
-		s.keyId = keyId
+		s.keyId = tokenId
 		s.token = token
+	}
+}
+
+// WithTls enables TLS connection encryption.
+func WithTls() LineSenderOption {
+	return func(s *LineSender) {
+		s.tlsMode = tlsEnabled
+	}
+}
+
+// WithTls enables TLS connection encryption, but skips server
+// cerfiticate verification. Useful in test environments with
+// self-signed certificates. Do not use in production
+// environments.
+func WithTlsInsecureSkipVerify() LineSenderOption {
+	return func(s *LineSender) {
+		s.tlsMode = tlsInsecureSkipVerify
 	}
 }
 
@@ -98,13 +125,16 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 // not be called concurrently by multiple goroutines.
 func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, error) {
 	var (
-		d   net.Dialer
-		key *ecdsa.PrivateKey
+		d    net.Dialer
+		key  *ecdsa.PrivateKey
+		conn net.Conn
+		err  error
 	)
 
 	s := &LineSender{
 		address: "127.0.0.1:9009",
 		bufCap:  256 * 1024,
+		tlsMode: noTls,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -121,7 +151,15 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		key.D = new(big.Int).SetBytes(keyRaw)
 	}
 
-	conn, err := d.DialContext(ctx, "tcp", s.address)
+	if s.tlsMode == noTls {
+		conn, err = d.DialContext(ctx, "tcp", s.address)
+	} else {
+		config := &tls.Config{}
+		if s.tlsMode == tlsInsecureSkipVerify {
+			config.InsecureSkipVerify = true
+		}
+		conn, err = tls.Dial("tcp", s.address, config)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to server: %v", err)
 	}
@@ -139,11 +177,15 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 
 		reader := bufio.NewReader(conn)
 		raw, err := reader.ReadBytes('\n')
+		if len(raw) < 2 {
+			conn.Close()
+			return nil, fmt.Errorf("empty challenge response from server: %v", err)
+		}
 		// Remove the `\n` in the last position.
 		raw = raw[:len(raw)-1]
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to read response from server: %v", err)
+			return nil, fmt.Errorf("failed to read challenge response from server: %v", err)
 		}
 
 		// Hash the challenge with sha256.
