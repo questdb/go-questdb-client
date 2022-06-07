@@ -65,7 +65,7 @@ type LineSender struct {
 	address    string
 	tlsMode    tlsMode
 	keyId      string // Erased once auth is done.
-	token      string // Erased once auth is done.
+	key        string // Erased once auth is done.
 	bufCap     int
 	conn       net.Conn
 	buf        *buffer
@@ -90,7 +90,7 @@ func WithAddress(address string) LineSenderOption {
 func WithAuth(tokenId, token string) LineSenderOption {
 	return func(s *LineSender) {
 		s.keyId = tokenId
-		s.token = token
+		s.key = token
 	}
 }
 
@@ -143,8 +143,8 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		opt(s)
 	}
 
-	if s.token != "" {
-		keyRaw, err := base64.RawURLEncoding.DecodeString(s.token)
+	if s.key != "" {
+		keyRaw, err := base64.RawURLEncoding.DecodeString(s.key)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode auth key: %v", err)
 		}
@@ -211,7 +211,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		// Reset the deadline.
 		conn.SetDeadline(time.Time{})
 		// Erase the key values since we don't need them anymore.
-		s.token = ""
+		s.key = ""
 		s.keyId = ""
 	}
 
