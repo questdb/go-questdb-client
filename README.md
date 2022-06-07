@@ -2,7 +2,11 @@
 
 Golang client for QuestDB's Influx Line Protocol over TCP.
 
-Tested against QuestDB 6.4 and newer versions.
+Features:
+* Context-aware API.
+* Optimized for batch writes.
+* Supports TLS encryption and [ILP authentication](https://questdb.io/docs/reference/api/ilp/authenticate).
+* Tested against QuestDB 6.4 and newer versions.
 
 ## Usage
 

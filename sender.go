@@ -58,6 +58,9 @@ const (
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
 // messages.
+//
+// Each sender corresponds to a single TCP connection. A sender
+// should not be called concurrently by multiple goroutines.
 type LineSender struct {
 	address    string
 	tlsMode    tlsMode
