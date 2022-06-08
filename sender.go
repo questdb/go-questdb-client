@@ -276,9 +276,6 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 	}
 	s.buf.WriteByte('=')
 	s.lastErr = s.writeStrValue(val, false)
-	if s.lastErr != nil {
-		return s
-	}
 	return s
 }
 
