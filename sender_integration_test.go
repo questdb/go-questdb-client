@@ -482,6 +482,7 @@ func TestWritesWithTlsProxy(t *testing.T) {
 		qdb.WithTlsInsecureSkipVerify(),
 	)
 	assert.NoError(t, err)
+	defer sender.Close()
 
 	err = sender.
 		Table(testTable).
@@ -497,11 +498,6 @@ func TestWritesWithTlsProxy(t *testing.T) {
 
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
-
-	// Close the connection to make sure that ILP messages are written. That's because
-	// the server may not write messages that are received immediately after the signed
-	// challenge until the connection is closed or more data is received.
-	sender.Close()
 
 	expected := tableData{
 		Columns: []column{
@@ -539,7 +535,6 @@ func TestSuccessfulAuthWithTlsProxy(t *testing.T) {
 		qdb.WithTlsInsecureSkipVerify(),
 	)
 	assert.NoError(t, err)
-	defer sender.Close()
 
 	err = sender.
 		Table(testTable).
@@ -555,6 +550,11 @@ func TestSuccessfulAuthWithTlsProxy(t *testing.T) {
 
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
+
+	// Close the connection to make sure that ILP messages are written. That's because
+	// the server may not write messages that are received immediately after the signed
+	// challenge until the connection is closed or more data is received.
+	sender.Close()
 
 	expected := tableData{
 		Columns: []column{
