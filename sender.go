@@ -112,9 +112,11 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 }
 
 // WithBufferCapacity sets desired buffer capacity in bytes to
-// be used when sending ILP messages. This is a soft limit, i.e.
-// the underlying buffer may grow larger than the provided value,
-// but will shrink once Flush is called.
+// be used when sending ILP messages. Defaults to 128KB.
+//
+// This setting is a soft limit, i.e. the underlying buffer may
+// grow larger than the provided value, but will shrink on a
+// At, AtNow, or Flush call.
 func WithBufferCapacity(capacity int) LineSenderOption {
 	return func(s *LineSender) {
 		if capacity > 0 {
@@ -136,7 +138,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 
 	s := &LineSender{
 		address: "127.0.0.1:9009",
-		bufCap:  256 * 1024,
+		bufCap:  128 * 1024,
 		tlsMode: noTls,
 	}
 	for _, opt := range opts {
@@ -371,6 +373,9 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 }
 
 func (s *LineSender) writeStrName(str string) error {
+	if str == "" {
+		return fmt.Errorf("table or column name cannot be empty: %w", ErrInvalidMsg)
+	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
 	for i := 0; i < len(str); i++ {
@@ -530,7 +535,9 @@ func (s *LineSender) At(ctx context.Context, ts int64) error {
 //
 // For optimal performance, this method should not be called after
 // each ILP message. Instead, the messages should be written in
-// batches followed by a Flush call.
+// batches followed by a Flush call. Optimal batch size may vary
+// from 100 to 1,000 messages depending on the message size and
+// configured buffer capacity.
 func (s *LineSender) Flush(ctx context.Context) error {
 	err := s.lastErr
 	s.lastErr = nil
@@ -553,7 +560,8 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		return err
 	}
 
-	if s.buf.Cap() > s.bufCap {
+	// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
+	if s.buf.Cap() > 3*s.bufCap {
 		// Shrink the buffer back to desired capacity.
 		s.buf = newBuffer(s.bufCap)
 	}

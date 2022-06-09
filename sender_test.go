@@ -414,7 +414,7 @@ func TestErrorOnContextDeadline(t *testing.T) {
 	t.Fail()
 }
 
-func BenchmarkLineSender(b *testing.B) {
+func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
 	srv, err := newTestServer(readAndDiscard)
@@ -438,6 +438,30 @@ func BenchmarkLineSender(b *testing.B) {
 				At(ctx, int64(1000*i))
 		}
 		sender.Flush(ctx)
+	}
+}
+
+func BenchmarkLineSenderNoFlush(b *testing.B) {
+	ctx := context.Background()
+
+	srv, err := newTestServer(readAndDiscard)
+	assert.NoError(b, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(b, err)
+	defer sender.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sender.
+			Table(testTable).
+			Symbol("sym_col", "test_ilp1").
+			Float64Column("double_col", float64(i)+0.42).
+			Int64Column("long_col", int64(i)).
+			StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
+			BoolColumn("bool_col", true).
+			At(ctx, int64(1000*i))
 	}
 }
 
