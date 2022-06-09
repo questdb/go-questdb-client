@@ -68,44 +68,17 @@ func TestValidWrites(t *testing.T) {
 				return nil
 			},
 			[]string{
-				"my_test_table str_col=\"foo\",long_col=42i\n",
-				"my_test_table str_col=\"bar\",long_col=-42i 42\n",
+				"my_test_table str_col=\"foo\",long_col=42i",
+				"my_test_table str_col=\"bar\",long_col=-42i 42",
 			},
 		},
 		{
-			"escaped chars in table name",
+			"UTF-8 strings",
 			func(s *qdb.LineSender) error {
-				return s.Table("test 1\"2=3").Int64Column("a_col", 42).AtNow(ctx)
+				return s.Table("таблица").StringColumn("колонка", "значение").AtNow(ctx)
 			},
 			[]string{
-				"test\\ 1\\\"2\\=3 a_col=42i\n",
-			},
-		},
-		{
-			"escaped chars in string column",
-			func(s *qdb.LineSender) error {
-				return s.Table("test_table").StringColumn("name 1\"2=3", "value 1,2\"3\\4=5").AtNow(ctx)
-			},
-			[]string{
-				"test_table name\\ 1\\\"2\\=3=\"value 1,2\\\"3\\\\4=5\"\n",
-			},
-		},
-		{
-			"escaped chars in symbol",
-			func(s *qdb.LineSender) error {
-				return s.Table("test_table").Symbol("name 1\"2=3", "value 1,2\"3\\4=5").AtNow(ctx)
-			},
-			[]string{
-				"test_table,name\\ 1\\\"2\\=3=value\\ 1\\,2\\\"3\\\\4\\=5\n",
-			},
-		},
-		{
-			"escaped chars in UTF-8 string",
-			func(s *qdb.LineSender) error {
-				return s.Table("таблица").StringColumn("имя раз\"два=три", "значение раз,два\"три\\четыре=пять").AtNow(ctx)
-			},
-			[]string{
-				"таблица имя\\ раз\\\"два\\=три=\"значение раз,два\\\"три\\\\четыре=пять\"\n",
+				"таблица колонка=\"значение\"",
 			},
 		},
 	}
@@ -122,7 +95,7 @@ func TestValidWrites(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Check the buffer before flushing it.
-			assert.Equal(t, strings.Join(tc.expectedLines, ""), sender.Messages())
+			assert.Equal(t, strings.Join(tc.expectedLines, "\n")+"\n", sender.Messages())
 
 			err = sender.Flush(ctx)
 			assert.NoError(t, err)
@@ -168,7 +141,7 @@ func TestIntSerialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i\n"})
+			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i"})
 
 			srv.close()
 		})
@@ -211,273 +184,8 @@ func TestFloatSerialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + tc.expected + "\n"})
+			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + tc.expected})
 
-			srv.close()
-		})
-	}
-}
-
-func TestIllegalChars(t *testing.T) {
-	ctx := context.Background()
-
-	testCases := []struct {
-		name     string
-		writerFn writer
-		errMsg   string
-	}{
-		{
-			"new line in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo\nbar").StringColumn("a_col", "foo").AtNow(ctx)
-			},
-			"table or column name contains a new line char",
-		},
-		{
-			"carriage return in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo\rbar").StringColumn("a_col", "foo").AtNow(ctx)
-			},
-			"table or column name contains a carriage return char",
-		},
-		{
-			"new line in column name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo\nbar", "foo").AtNow(ctx)
-			},
-			"table or column name contains a new line char",
-		},
-		{
-			"carriage return in column name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo\rbar", "foo").AtNow(ctx)
-			},
-			"table or column name contains a carriage return char",
-		},
-		{
-			"new line in column value",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("a_col", "foo\nbar").AtNow(ctx)
-			},
-			"symbol or string column value contains a new line char",
-		},
-		{
-			"carriage return in column value",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("a_col", "foo\rbar").AtNow(ctx)
-			},
-			"symbol or string column value contains a carriage return char",
-		},
-		{
-			"'.' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo.bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'?' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo?bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"',' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo,bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"':' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo:bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'\\' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo\\bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'/' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo/bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'\\0' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo\x00bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"')' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo)bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'(' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo(bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'+' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo+bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'*' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo*bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'~' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo~bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'%%' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo%%bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'-' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table("foo-bar").StringColumn("a_col", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'.' in column name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo.bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'?' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo?bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"',' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo,bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"':' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo:bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'\\' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo\\bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'/' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo/bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'\\0' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo\\0bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"')' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo)bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'(' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo(bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'+' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo+bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'*' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo*bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'~' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo~bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'%%' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo%%bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-		{
-			"'-' in table name",
-			func(s *qdb.LineSender) error {
-				return s.Table(testTable).StringColumn("foo-bar", "42").AtNow(ctx)
-			},
-			"table or column name contains one of illegal chars",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
-			assert.NoError(t, err)
-
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
-			assert.NoError(t, err)
-
-			err = tc.writerFn(sender)
-			assert.ErrorContains(t, err, tc.errMsg)
-
-			sender.Close()
 			srv.close()
 		})
 	}
@@ -643,7 +351,7 @@ func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	// The second message should be discarded.
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
-	expectLines(t, srv.backCh, []string{testTable + " foo=\"bar\"\n"})
+	expectLines(t, srv.backCh, []string{testTable + " foo=\"bar\""})
 }
 
 func TestErrorOnUnavailableServer(t *testing.T) {
@@ -827,7 +535,8 @@ func (s *testServer) handleSendToBackChannel(conn net.Conn) {
 					return
 				}
 			}
-			s.backCh <- l
+			// Remove trailing \n and send line to back channel.
+			s.backCh <- l[0 : len(l)-1]
 		}
 	}
 }
