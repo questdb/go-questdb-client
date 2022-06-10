@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"os"
+	"strings"
 	"testing"
 
 	qdb "github.com/questdb/go-questdb-client"
@@ -104,7 +105,7 @@ func TestClientInterop(t *testing.T) {
 				err = sender.Flush(ctx)
 				assert.NoError(t, err)
 
-				expectLines(t, srv.backCh, []string{tc.Result.Line})
+				expectLines(t, srv.backCh, strings.Split(tc.Result.Line, "\n"))
 			case "ERROR":
 				assert.Error(t, err)
 			default:

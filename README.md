@@ -8,7 +8,7 @@ Features:
 * Context-aware API.
 * Optimized for batch writes.
 * Supports TLS encryption and [ILP authentication](https://questdb.io/docs/reference/api/ilp/authenticate).
-* Tested against QuestDB 6.4 and newer versions.
+* Tested against QuestDB 6.4.1 and newer versions.
 
 Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client).
 

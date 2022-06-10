@@ -1,7 +1,7 @@
 [
     {
         "testName": "escaped chars in table name",
-        "table": "test 1\"2=3",
+        "table": "test 1=2",
         "symbols": [],
         "columns": [
             {
@@ -12,7 +12,23 @@
         ],
         "result": {
             "status": "SUCCESS",
-            "line": "test\\ 1\\\"2\\=3 a_col=42i"
+            "line": "test\\ 1\\=2 a_col=42i"
+        }
+    },
+    {
+        "testName": "'.' in the middle of table name",
+        "table": "foobar.csv",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "BOOLEAN",
+                "name": "a_col",
+                "value": false
+            }
+        ],
+        "result": {
+            "status": "SUCCESS",
+            "line": "foobar.csv a_col=f"
         }
     },
     {
@@ -22,13 +38,13 @@
         "columns": [
             {
                 "type": "STRING",
-                "name": "name 1\"2=3",
-                "value": "value 1,2\"3\\4=5"
+                "name": "name 1=2",
+                "value": "value 1,2=3\n4\r5\"6\\7"
             }
         ],
         "result": {
             "status": "SUCCESS",
-            "line": "test_table name\\ 1\\\"2\\=3=\"value 1,2\\\"3\\\\4=5\""
+            "line": "test_table name\\ 1\\=2=\"value 1,2=3\\\n4\\\r5\\\"6\\\\7\""
         }
     },
     {
@@ -36,41 +52,65 @@
         "table": "test_table",
         "symbols": [
             {
-                "name": "name 1\"2=3",
-                "value": "value 1,2\"3\\4=5"
+                "name": "name 1=2",
+                "value": "value 1,2=3\n4\r5\"6\\7"
             }
         ],
         "columns": [],
         "result": {
             "status": "SUCCESS",
-            "line": "test_table,name\\ 1\\\"2\\=3=value\\ 1\\,2\\\"3\\\\4\\=5"
+            "line": "test_table,name\\ 1\\=2=value\\ 1\\,2\\=3\\\n4\\\r5\"6\\\\7"
         }
     },
     {
-        "testName": "escaped chars in UTF-8 string",
+        "testName": "escaped chars mixed with UTF-8 in string column",
         "table": "таблица",
         "symbols": [],
         "columns": [
             {
                 "type": "STRING",
-                "name": "имя раз\"два=три",
-                "value": "значение раз,два\"три\\четыре=пять"
+                "name": "имя раз=два",
+                "value": "значение раз,два=три\nчетыре\rпять\"шесть\\семь"
             }
         ],
         "result": {
             "status": "SUCCESS",
-            "line": "таблица имя\\ раз\\\"два\\=три=\"значение раз,два\\\"три\\\\четыре=пять\""
+            "line": "таблица имя\\ раз\\=два=\"значение раз,два=три\\\nчетыре\\\rпять\\\"шесть\\\\семь\""
         }
     },
     {
-        "testName": "new line in table name",
-        "table": "foo\nbar",
+        "testName": "escaped chars mixed with UTF-8 in symbol",
+        "table": "таблица",
+        "symbols": [
+            {
+                "name": "имя раз=два",
+                "value": "значение раз,два=три\nчетыре\rпять\"шесть\\семь"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "SUCCESS",
+            "line": "таблица,имя\\ раз\\=два=значение\\ раз\\,два\\=три\\\nчетыре\\\rпять\"шесть\\\\семь"
+        }
+    },
+    {
+        "testName": "no symbols or columns",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "empty table name",
+        "table": "",
         "symbols": [],
         "columns": [
             {
-                "type": "STRING",
+                "type": "DOUBLE",
                 "name": "a_col",
-                "value": "foo"
+                "value": 42
             }
         ],
         "result": {
@@ -78,27 +118,12 @@
         }
     },
     {
-        "testName": "carriage return in table name",
-        "table": "foo\rbar",
-        "symbols": [],
-        "columns": [
-            {
-                "type": "STRING",
-                "name": "a_col",
-                "value": "foo"
-            }
-        ],
-        "result": {
-            "status": "ERROR"
-        }
-    },
-    {
-        "testName": "new line in symbol name",
+        "testName": "empty symbol name",
         "table": "test_table",
         "symbols": [
             {
-                "name": "foo\nbar",
-                "value": "baz"
+                "name": "",
+                "value": "foobar"
             }
         ],
         "columns": [],
@@ -107,28 +132,14 @@
         }
     },
     {
-        "testName": "carriage return in symbol name",
-        "table": "test_table",
-        "symbols": [
-            {
-                "name": "foo\rbar",
-                "value": "baz"
-            }
-        ],
-        "columns": [],
-        "result": {
-            "status": "ERROR"
-        }
-    },
-    {
-        "testName": "new line in column name",
+        "testName": "empty column name",
         "table": "test_table",
         "symbols": [],
         "columns": [
             {
-                "type": "STRING",
-                "name": "foo\nbar",
-                "value": "baz"
+                "type": "BOOLEAN",
+                "name": "",
+                "value": true
             }
         ],
         "result": {
@@ -136,53 +147,8 @@
         }
     },
     {
-        "testName": "carriage return in column name",
-        "table": "test_table",
-        "symbols": [],
-        "columns": [
-            {
-                "type": "STRING",
-                "name": "foo\rbar",
-                "value": "baz"
-            }
-        ],
-        "result": {
-            "status": "ERROR"
-        }
-    },
-    {
-        "testName": "new line in column value",
-        "table": "test_table",
-        "symbols": [],
-        "columns": [
-            {
-                "type": "STRING",
-                "name": "a_col",
-                "value": "foo\nbar"
-            }
-        ],
-        "result": {
-            "status": "ERROR"
-        }
-    },
-    {
-        "testName": "carriage return in column value",
-        "table": "test_table",
-        "symbols": [],
-        "columns": [
-            {
-                "type": "STRING",
-                "name": "a_col",
-                "value": "foo\rbar"
-            }
-        ],
-        "result": {
-            "status": "ERROR"
-        }
-    },
-    {
-        "testName": "'.' in table name",
-        "table": "foo.bar",
+        "testName": "'.' at the start of table name",
+        "table": ".foobar",
         "symbols": [],
         "columns": [
             {
@@ -196,8 +162,38 @@
         }
     },
     {
-        "testName": "',' in table name",
-        "table": "foo,bar",
+        "testName": "'.' at the end of table name",
+        "table": "foobar.",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\\n' in table name",
+        "table": "foo\nbar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\\r,' in table name",
+        "table": "foo\rbar",
         "symbols": [],
         "columns": [
             {
@@ -226,8 +222,38 @@
         }
     },
     {
-        "testName": "':' in table name",
-        "table": "foo:bar",
+        "testName": "',' in table name",
+        "table": "foo,bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "''' in table name",
+        "table": "foo'bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\"' in table name",
+        "table": "foo\"bar",
         "symbols": [],
         "columns": [
             {
@@ -271,8 +297,8 @@
         }
     },
     {
-        "testName": "'\\0' in table name",
-        "table": "foo\u0000bar",
+        "testName": "':' in table name",
+        "table": "foo:bar",
         "symbols": [],
         "columns": [
             {
@@ -316,21 +342,6 @@
         }
     },
     {
-        "testName": "'*' in table name",
-        "table": "foo*bar",
-        "symbols": [],
-        "columns": [
-            {
-                "type": "STRING",
-                "name": "a_col",
-                "value": "42"
-            }
-        ],
-        "result": {
-            "status": "ERROR"
-        }
-    },
-    {
         "testName": "'+' in table name",
         "table": "foo+bar",
         "symbols": [],
@@ -346,23 +357,8 @@
         }
     },
     {
-        "testName": "'-' in table name",
-        "table": "foo-bar",
-        "symbols": [],
-        "columns": [
-            {
-                "type": "STRING",
-                "name": "a_col",
-                "value": "42"
-            }
-        ],
-        "result": {
-            "status": "ERROR"
-        }
-    },
-    {
-        "testName": "'~' in table name",
-        "table": "foo~bar",
+        "testName": "'*' in table name",
+        "table": "foo*bar",
         "symbols": [],
         "columns": [
             {
@@ -391,13 +387,13 @@
         }
     },
     {
-        "testName": "'.' in column name",
-        "table": "test_table",
+        "testName": "'~' in table name",
+        "table": "foo~bar",
         "symbols": [],
         "columns": [
             {
                 "type": "STRING",
-                "name": "foo.bar",
+                "name": "a_col",
                 "value": "42"
             }
         ],
@@ -406,13 +402,701 @@
         }
     },
     {
-        "testName": "',' in column name",
+        "testName": "'u0000' in table name",
+        "table": "foo\u0000bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0001' in table name",
+        "table": "foo\u0001bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0002' in table name",
+        "table": "foo\u0002bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0003' in table name",
+        "table": "foo\u0003bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0004' in table name",
+        "table": "foo\u0004bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0005' in table name",
+        "table": "foo\u0005bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0006' in table name",
+        "table": "foo\u0006bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0007' in table name",
+        "table": "foo\u0007bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0008' in table name",
+        "table": "foo\u0008bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0009' in table name",
+        "table": "foo\u0009bar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000b' in table name",
+        "table": "foo\u000bbar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000c' in table name",
+        "table": "foo\u000cbar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000e' in table name",
+        "table": "foo\u000ebar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000f' in table name",
+        "table": "foo\u000fbar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u007f' in table name",
+        "table": "foo\u007fbar",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "a_col",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\\n' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\nbar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\\r,' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\rbar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'?' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo?bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'.' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foobar.",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "',' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo,bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "''' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo'bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\"' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\"bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\\' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\\bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'/' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo/bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "':' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo:bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "')' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo)bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'(' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo(bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'+' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo+bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'-' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo-bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'*' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo*bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'%' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo%bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'~' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo~bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0000' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0000bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0001' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0001bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0002' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0002bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0003' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0003bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0004' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0004bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0005' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0005bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0006' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0006bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0007' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0007bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0008' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0008bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0009' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u0009bar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000b' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u000bbar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000c' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u000cbar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000e' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u000ebar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000f' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u000fbar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u007f' in symbol name",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "foo\u007fbar",
+                "value": "42"
+            }
+        ],
+        "columns": [],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\\n' in column name",
         "table": "test_table",
         "symbols": [],
         "columns": [
             {
                 "type": "STRING",
-                "name": "foo,bar",
+                "name": "foo\nbar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\\r,' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\rbar",
                 "value": "42"
             }
         ],
@@ -436,13 +1120,58 @@
         }
     },
     {
-        "testName": "':' in column name",
+        "testName": "'.' in column name",
         "table": "test_table",
         "symbols": [],
         "columns": [
             {
                 "type": "STRING",
-                "name": "foo:bar",
+                "name": "foobar.",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "',' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo,bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "''' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo'bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'\"' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\"bar",
                 "value": "42"
             }
         ],
@@ -481,13 +1210,13 @@
         }
     },
     {
-        "testName": "'\\0' in column name",
+        "testName": "':' in column name",
         "table": "test_table",
         "symbols": [],
         "columns": [
             {
                 "type": "STRING",
-                "name": "foo\u0000bar",
+                "name": "foo:bar",
                 "value": "42"
             }
         ],
@@ -526,21 +1255,6 @@
         }
     },
     {
-        "testName": "'*' in column name",
-        "table": "test_table",
-        "symbols": [],
-        "columns": [
-            {
-                "type": "STRING",
-                "name": "foo*bar",
-                "value": "42"
-            }
-        ],
-        "result": {
-            "status": "ERROR"
-        }
-    },
-    {
         "testName": "'+' in column name",
         "table": "test_table",
         "symbols": [],
@@ -571,13 +1285,13 @@
         }
     },
     {
-        "testName": "'~' in column name",
+        "testName": "'*' in column name",
         "table": "test_table",
         "symbols": [],
         "columns": [
             {
                 "type": "STRING",
-                "name": "foo~bar",
+                "name": "foo*bar",
                 "value": "42"
             }
         ],
@@ -593,6 +1307,246 @@
             {
                 "type": "STRING",
                 "name": "foo%bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'~' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo~bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0000' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0000bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0001' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0001bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0002' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0002bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0003' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0003bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0004' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0004bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0005' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0005bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0006' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0006bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0007' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0007bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0008' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0008bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u0009' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u0009bar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000b' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u000bbar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000c' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u000cbar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000e' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u000ebar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u000f' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u000fbar",
+                "value": "42"
+            }
+        ],
+        "result": {
+            "status": "ERROR"
+        }
+    },
+    {
+        "testName": "'u007f' in column name",
+        "table": "test_table",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "foo\u007fbar",
                 "value": "42"
             }
         ],

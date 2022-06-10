@@ -44,14 +44,14 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type writer func(s *qdb.LineSender) error
+type writerFn func(s *qdb.LineSender) error
 
 func TestValidWrites(t *testing.T) {
 	ctx := context.Background()
 
 	testCases := []struct {
 		name          string
-		writerFn      writer
+		writerFn      writerFn
 		expectedLines []string
 	}{
 		{
@@ -196,7 +196,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 
 	testCases := []struct {
 		name     string
-		writerFn writer
+		writerFn writerFn
 	}{
 		{
 			"AtNow",
@@ -283,7 +283,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 
 	testCases := []struct {
 		name     string
-		writerFn writer
+		writerFn writerFn
 	}{
 		{
 			"string column",
@@ -463,6 +463,7 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 			BoolColumn("bool_col", true).
 			At(ctx, int64(1000*i))
 	}
+	sender.Flush(ctx)
 }
 
 func expectLines(t *testing.T, linesCh chan string, expected []string) {

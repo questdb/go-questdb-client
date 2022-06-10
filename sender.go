@@ -72,6 +72,7 @@ type LineSender struct {
 	lastMsgPos int
 	lastErr    error
 	hasTable   bool
+	hasTags    bool
 	hasFields  bool
 }
 
@@ -232,8 +233,8 @@ func (s *LineSender) Close() error {
 // called before any Symbol or Column method.
 //
 // Table name cannot contain any of the following characters:
-// '\n', '\r', '.', '?', ',', ':', '\', '/', '\0', ')', '(', '+', '*',
-// '~', '%', '-'.
+// '\n', '\r', '?', ',', ''', '"', '\', '/', ':', ')', '(', '+', '*',
+// '%', '~', starting '.', trailing '.', or a non-printable char.
 func (s *LineSender) Table(name string) *LineSender {
 	if s.lastErr != nil {
 		return s
@@ -242,7 +243,7 @@ func (s *LineSender) Table(name string) *LineSender {
 		s.lastErr = fmt.Errorf("table name already provided: %w", ErrInvalidMsg)
 		return s
 	}
-	s.lastErr = s.writeStrName(name)
+	s.lastErr = s.writeTableName(name)
 	if s.lastErr != nil {
 		return s
 	}
@@ -254,11 +255,8 @@ func (s *LineSender) Table(name string) *LineSender {
 // before any Column method.
 //
 // Symbol name cannot contain any of the following characters:
-// '\n', '\r', '.', '?', ',', ':', '\', '/', '\0', ')', '(', '+', '*',
-// '~', '%', '-'.
-//
-// Symbol values cannot contain any of the following characters:
-// '\n', '\r'.
+// '\n', '\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+',
+// '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Symbol(name, val string) *LineSender {
 	if s.lastErr != nil {
 		return s
@@ -272,12 +270,16 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 		return s
 	}
 	s.buf.WriteByte(',')
-	s.lastErr = s.writeStrName(name)
+	s.lastErr = s.writeColumnName(name)
 	if s.lastErr != nil {
 		return s
 	}
 	s.buf.WriteByte('=')
 	s.lastErr = s.writeStrValue(val, false)
+	if s.lastErr != nil {
+		return s
+	}
+	s.hasTags = true
 	return s
 }
 
@@ -285,13 +287,13 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 // message.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '.', '?', ',', ':', '\', '/', '\0', ')', '(', '+', '*',
-// '~', '%', '-'.
+// '\n', '\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+',
+// '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	s.lastErr = s.writeStrName(name)
+	s.lastErr = s.writeColumnName(name)
 	if s.lastErr != nil {
 		return s
 	}
@@ -306,13 +308,13 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // message.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '.', '?', ',', ':', '\', '/', '\0', ')', '(', '+', '*',
-// '~', '%', '-'.
+// '\n', '\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+',
+// '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	s.lastErr = s.writeStrName(name)
+	s.lastErr = s.writeColumnName(name)
 	if s.lastErr != nil {
 		return s
 	}
@@ -325,16 +327,13 @@ func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 // StringColumn adds a string column value to the ILP message.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '.', '?', ',', ':', '\\', '/', '\0', ')', '(', '+', '*',
-// '~', '%', '-'.
-//
-// Column values cannot contain any of the following characters:
-// '\n', '\r'.
+// '\n', '\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+',
+// '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) StringColumn(name, val string) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	s.lastErr = s.writeStrName(name)
+	s.lastErr = s.writeColumnName(name)
 	if s.lastErr != nil {
 		return s
 	}
@@ -352,13 +351,13 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 // BoolColumn adds a boolean column value to the ILP message.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '.', '?', ',', ':', '\', '/', '\0', ')', '(', '+', '*',
-// '~', '%', '-'.
+// '\n', '\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+',
+// '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
-	s.lastErr = s.writeStrName(name)
+	s.lastErr = s.writeColumnName(name)
 	if s.lastErr != nil {
 		return s
 	}
@@ -372,9 +371,9 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	return s
 }
 
-func (s *LineSender) writeStrName(str string) error {
+func (s *LineSender) writeTableName(str string) error {
 	if str == "" {
-		return fmt.Errorf("table or column name cannot be empty: %w", ErrInvalidMsg)
+		return fmt.Errorf("table name cannot be empty: %w", ErrInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
@@ -385,16 +384,14 @@ func (s *LineSender) writeStrName(str string) error {
 			s.buf.WriteByte('\\')
 		case '=':
 			s.buf.WriteByte('\\')
-		case '"':
-			s.buf.WriteByte('\\')
-		case '\n':
-			return fmt.Errorf("table or column name contains a new line char: %s: %w", str, ErrInvalidMsg)
-		case '\r':
-			return fmt.Errorf("table or column name contains a carriage return char: %s: %w", str, ErrInvalidMsg)
+		case '.':
+			if i == 0 || i == len(str)-1 {
+				return fmt.Errorf("table name contains '.' char at the start or end: %s: %w", str, ErrInvalidMsg)
+			}
 		default:
-			if illegalNameChar(b) {
-				return fmt.Errorf("table or column name contains one of illegal chars: "+
-					"'.', '?', ',', ':', '\\', '/', '\\0', ')', '(', '+', '*', '~', '%%', '-': %s: %w",
+			if illegalTableNameChar(b) {
+				return fmt.Errorf("table name contains an illegal char: "+
+					"'\\n', '\\r', '?', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '*' '%%', '~', or a non-printable char: %s: %w",
 					str, ErrInvalidMsg)
 			}
 		}
@@ -403,19 +400,25 @@ func (s *LineSender) writeStrName(str string) error {
 	return nil
 }
 
-func illegalNameChar(ch byte) bool {
+func illegalTableNameChar(ch byte) bool {
 	switch ch {
-	case '.':
+	case '\n':
+		return true
+	case '\r':
 		return true
 	case '?':
 		return true
 	case ',':
 		return true
-	case ':':
+	case '\'':
+		return true
+	case '"':
 		return true
 	case '\\':
 		return true
 	case '/':
+		return true
+	case ':':
 		return true
 	case ')':
 		return true
@@ -425,13 +428,134 @@ func illegalNameChar(ch byte) bool {
 		return true
 	case '*':
 		return true
+	case '%':
+		return true
 	case '~':
 		return true
-	case '%':
+	case '\u0000':
+		return true
+	case '\u0001':
+		return true
+	case '\u0002':
+		return true
+	case '\u0003':
+		return true
+	case '\u0004':
+		return true
+	case '\u0005':
+		return true
+	case '\u0006':
+		return true
+	case '\u0007':
+		return true
+	case '\u0008':
+		return true
+	case '\u0009':
+		return true
+	case '\u000b':
+		return true
+	case '\u000c':
+		return true
+	case '\u000e':
+		return true
+	case '\u000f':
+		return true
+	case '\u007f':
+		return true
+	}
+	return false
+}
+
+func (s *LineSender) writeColumnName(str string) error {
+	if str == "" {
+		return fmt.Errorf("column name cannot be empty: %w", ErrInvalidMsg)
+	}
+	// Since we're interested in ASCII chars, it's fine to iterate
+	// through bytes instead of runes.
+	for i := 0; i < len(str); i++ {
+		b := str[i]
+		switch b {
+		case ' ':
+			s.buf.WriteByte('\\')
+		case '=':
+			s.buf.WriteByte('\\')
+		default:
+			if illegalColumnNameChar(b) {
+				return fmt.Errorf("column name contains an illegal char: "+
+					"'\\n', '\\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '-', '*' '%%', '~', or a non-printable char: %s: %w",
+					str, ErrInvalidMsg)
+			}
+		}
+		s.buf.WriteByte(b)
+	}
+	return nil
+}
+
+func illegalColumnNameChar(ch byte) bool {
+	switch ch {
+	case '\n':
+		return true
+	case '\r':
+		return true
+	case '?':
+		return true
+	case '.':
+		return true
+	case ',':
+		return true
+	case '\'':
+		return true
+	case '"':
+		return true
+	case '\\':
+		return true
+	case '/':
+		return true
+	case ':':
+		return true
+	case ')':
+		return true
+	case '(':
+		return true
+	case '+':
 		return true
 	case '-':
 		return true
-	case '\x00':
+	case '*':
+		return true
+	case '%':
+		return true
+	case '~':
+		return true
+	case '\u0000':
+		return true
+	case '\u0001':
+		return true
+	case '\u0002':
+		return true
+	case '\u0003':
+		return true
+	case '\u0004':
+		return true
+	case '\u0005':
+		return true
+	case '\u0006':
+		return true
+	case '\u0007':
+		return true
+	case '\u0008':
+		return true
+	case '\u0009':
+		return true
+	case '\u000b':
+		return true
+	case '\u000c':
+		return true
+	case '\u000e':
+		return true
+	case '\u000f':
+		return true
+	case '\u007f':
 		return true
 	}
 	return false
@@ -456,13 +580,15 @@ func (s *LineSender) writeStrValue(str string, quoted bool) error {
 				s.buf.WriteByte('\\')
 			}
 		case '"':
+			if quoted {
+				s.buf.WriteByte('\\')
+			}
+		case '\n':
+			s.buf.WriteByte('\\')
+		case '\r':
 			s.buf.WriteByte('\\')
 		case '\\':
 			s.buf.WriteByte('\\')
-		case '\n':
-			return fmt.Errorf("symbol or string column value contains a new line char: %s: %w", str, ErrInvalidMsg)
-		case '\r':
-			return fmt.Errorf("symbol or string column value contains a carriage return char: %s: %w", str, ErrInvalidMsg)
 		}
 		s.buf.WriteByte(b)
 	}
@@ -512,6 +638,9 @@ func (s *LineSender) At(ctx context.Context, ts int64) error {
 	if !s.hasTable {
 		return fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
 	}
+	if !s.hasTags && !s.hasFields {
+		return fmt.Errorf("no symbols or columns were provided: %w", ErrInvalidMsg)
+	}
 
 	if ts > -1 {
 		s.buf.WriteByte(' ')
@@ -521,6 +650,7 @@ func (s *LineSender) At(ctx context.Context, ts int64) error {
 
 	s.lastMsgPos = s.buf.Len()
 	s.hasTable = false
+	s.hasTags = false
 	s.hasFields = false
 
 	if s.buf.Len() > s.bufCap {

@@ -108,7 +108,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 		return nil, err
 	}
 	req := testcontainers.ContainerRequest{
-		Image:          "questdb/questdb:6.4",
+		Image:          "questdb/questdb:6.4.1",
 		ExposedPorts:   []string{"9000/tcp", "9009/tcp"},
 		WaitingFor:     wait.ForHTTP("/").WithPort("9000"),
 		Networks:       []string{networkName},
@@ -214,67 +214,150 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	}, nil
 }
 
-func TestAllColumnTypes(t *testing.T) {
+func TestE2EValidWrites(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
 
 	ctx := context.Background()
 
-	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
+	testCases := []struct {
+		name      string
+		tableName string
+		writerFn  writerFn
+		expected  tableData
+	}{
+		{
+			"all column types",
+			testTable,
+			func(s *qdb.LineSender) error {
+				err := s.
+					Table(testTable).
+					Symbol("sym_col", "test_ilp1").
+					Float64Column("double_col", 12.2).
+					Int64Column("long_col", 12).
+					StringColumn("str_col", "foobar").
+					BoolColumn("bool_col", true).
+					At(ctx, 1000)
+				if err != nil {
+					return err
+				}
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	err = sender.
-		Table(testTable).
-		Symbol("sym_col", "test_ilp1").
-		Float64Column("double_col", 12.2).
-		Int64Column("long_col", 12).
-		StringColumn("str_col", "foobar").
-		BoolColumn("bool_col", true).
-		At(ctx, 1000)
-	assert.NoError(t, err)
-
-	err = sender.
-		Table(testTable).
-		Symbol("sym_col", "test_ilp2").
-		Float64Column("double_col", 11.2).
-		Int64Column("long_col", 11).
-		StringColumn("str_col", "barbaz").
-		BoolColumn("bool_col", false).
-		At(ctx, 2000)
-	assert.NoError(t, err)
-
-	err = sender.Flush(ctx)
-	assert.NoError(t, err)
-
-	expected := tableData{
-		Columns: []column{
-			{"sym_col", "SYMBOL"},
-			{"double_col", "DOUBLE"},
-			{"long_col", "LONG"},
-			{"str_col", "STRING"},
-			{"bool_col", "BOOLEAN"},
-			{"timestamp", "TIMESTAMP"},
+				return s.
+					Table(testTable).
+					Symbol("sym_col", "test_ilp2").
+					Float64Column("double_col", 11.2).
+					Int64Column("long_col", 11).
+					StringColumn("str_col", "barbaz").
+					BoolColumn("bool_col", false).
+					At(ctx, 2000)
+			},
+			tableData{
+				Columns: []column{
+					{"sym_col", "SYMBOL"},
+					{"double_col", "DOUBLE"},
+					{"long_col", "LONG"},
+					{"str_col", "STRING"},
+					{"bool_col", "BOOLEAN"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{"test_ilp1", float64(12.2), float64(12), "foobar", true, "1970-01-01T00:00:00.000001Z"},
+					{"test_ilp2", float64(11.2), float64(11), "barbaz", false, "1970-01-01T00:00:00.000002Z"},
+				},
+				Count: 2,
+			},
 		},
-		Dataset: [][]interface{}{
-			{"test_ilp1", float64(12.2), float64(12), "foobar", true, "1970-01-01T00:00:00.000001Z"},
-			{"test_ilp2", float64(11.2), float64(11), "barbaz", false, "1970-01-01T00:00:00.000002Z"},
+		{
+			"escaped chars",
+			"my-awesome_test 1=2.csv",
+			func(s *qdb.LineSender) error {
+				return s.
+					Table("my-awesome_test 1=2.csv").
+					Symbol("sym_name 1=2", "value 1,2=3\n4\r5\"6\\7").
+					StringColumn("str_name 1=2", "value 1,2=3\n4\r5\"6\\7").
+					At(ctx, 1000)
+			},
+			tableData{
+				Columns: []column{
+					{"sym_name 1=2", "SYMBOL"},
+					{"str_name 1=2", "STRING"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{"value 1,2=3\n4\r5\"6\\7", "value 1,2=3\n4\r5\"6\\7", "1970-01-01T00:00:00.000001Z"},
+				},
+				Count: 1,
+			},
 		},
-		Count: 2,
+		{
+			"single symbol",
+			testTable,
+			func(s *qdb.LineSender) error {
+				return s.
+					Table(testTable).
+					Symbol("foo", "bar").
+					At(ctx, 42000)
+			},
+			tableData{
+				Columns: []column{
+					{"foo", "SYMBOL"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{"bar", "1970-01-01T00:00:00.000042Z"},
+				},
+				Count: 1,
+			},
+		},
+		{
+			"single column",
+			testTable,
+			func(s *qdb.LineSender) error {
+				return s.
+					Table(testTable).
+					BoolColumn("foobar", true).
+					At(ctx, 42000)
+			},
+			tableData{
+				Columns: []column{
+					{"foobar", "BOOLEAN"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{true, "1970-01-01T00:00:00.000042Z"},
+				},
+				Count: 1,
+			},
+		},
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, questdbC.httpAddress)
-		return reflect.DeepEqual(expected, data)
-	}, eventualDataTimeout, 100*time.Millisecond)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			questdbC, err := setupQuestDB(ctx, noAuth)
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
+			assert.NoError(t, err)
+
+			err = tc.writerFn(sender)
+			assert.NoError(t, err)
+
+			err = sender.Flush(ctx)
+			assert.NoError(t, err)
+
+			assert.Eventually(t, func() bool {
+				data := queryTableData(t, tc.tableName, questdbC.httpAddress)
+				return reflect.DeepEqual(tc.expected, data)
+			}, eventualDataTimeout, 100*time.Millisecond)
+
+			sender.Close()
+			questdbC.Stop(ctx)
+		})
+	}
 }
 
-func TestWriteInBatches(t *testing.T) {
+func TestE2EWriteInBatches(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -325,12 +408,12 @@ func TestWriteInBatches(t *testing.T) {
 	}
 
 	assert.Eventually(t, func() bool {
-		data := queryTableData(t, questdbC.httpAddress)
+		data := queryTableData(t, testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
-func TestImplicitFlush(t *testing.T) {
+func TestE2EImplicitFlush(t *testing.T) {
 	const bufCap = 100
 
 	if testing.Short() {
@@ -356,13 +439,13 @@ func TestImplicitFlush(t *testing.T) {
 	}
 
 	assert.Eventually(t, func() bool {
-		data := queryTableData(t, questdbC.httpAddress)
+		data := queryTableData(t, testTable, questdbC.httpAddress)
 		// We didn't call Flush, but we expect the buffer to be flushed at least once.
 		return data.Count > 0
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
-func TestSuccessfulAuth(t *testing.T) {
+func TestE2ESuccessfulAuth(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -413,12 +496,12 @@ func TestSuccessfulAuth(t *testing.T) {
 	}
 
 	assert.Eventually(t, func() bool {
-		data := queryTableData(t, questdbC.httpAddress)
+		data := queryTableData(t, testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
-func TestFailedAuth(t *testing.T) {
+func TestE2EFailedAuth(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -461,11 +544,11 @@ func TestFailedAuth(t *testing.T) {
 
 	// Our writes should not get applied.
 	time.Sleep(2 * time.Second)
-	data := queryTableData(t, questdbC.httpAddress)
+	data := queryTableData(t, testTable, questdbC.httpAddress)
 	assert.Equal(t, 0, data.Count)
 }
 
-func TestWritesWithTlsProxy(t *testing.T) {
+func TestE2EWritesWithTlsProxy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -512,12 +595,12 @@ func TestWritesWithTlsProxy(t *testing.T) {
 	}
 
 	assert.Eventually(t, func() bool {
-		data := queryTableData(t, questdbC.httpAddress)
+		data := queryTableData(t, testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
-func TestSuccessfulAuthWithTlsProxy(t *testing.T) {
+func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -569,7 +652,7 @@ func TestSuccessfulAuthWithTlsProxy(t *testing.T) {
 	}
 
 	assert.Eventually(t, func() bool {
-		data := queryTableData(t, questdbC.httpAddress)
+		data := queryTableData(t, testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
@@ -585,13 +668,13 @@ type column struct {
 	Type string `json:"type"`
 }
 
-func queryTableData(t *testing.T, address string) tableData {
+func queryTableData(t *testing.T, tableName, address string) tableData {
 	u, err := url.Parse(address)
 	assert.NoError(t, err)
 
 	u.Path += "exec"
 	params := url.Values{}
-	params.Add("query", testTable)
+	params.Add("query", "'"+tableName+"'")
 	u.RawQuery = params.Encode()
 	url := fmt.Sprintf("%v", u)
 
