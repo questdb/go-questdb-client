@@ -316,16 +316,76 @@ func TestE2EValidWrites(t *testing.T) {
 			func(s *qdb.LineSender) error {
 				return s.
 					Table(testTable).
-					BoolColumn("foobar", true).
+					Int64Column("foobar", 1_000_042).
 					At(ctx, 42000)
 			},
 			tableData{
 				Columns: []column{
-					{"foobar", "BOOLEAN"},
+					{"foobar", "LONG"},
 					{"timestamp", "TIMESTAMP"},
 				},
 				Dataset: [][]interface{}{
-					{true, "1970-01-01T00:00:00.000042Z"},
+					{float64(1_000_042), "1970-01-01T00:00:00.000042Z"},
+				},
+				Count: 1,
+			},
+		},
+		{
+			"small double value with exponent",
+			testTable,
+			func(s *qdb.LineSender) error {
+				return s.
+					Table(testTable).
+					Float64Column("foobar", 4.2e-100).
+					At(ctx, 1000)
+			},
+			tableData{
+				Columns: []column{
+					{"foobar", "DOUBLE"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{4.2e-100, "1970-01-01T00:00:00.000001Z"},
+				},
+				Count: 1,
+			},
+		},
+		{
+			"large double value with exponent",
+			testTable,
+			func(s *qdb.LineSender) error {
+				return s.
+					Table(testTable).
+					Float64Column("foobar", 4.2e100).
+					At(ctx, 1000)
+			},
+			tableData{
+				Columns: []column{
+					{"foobar", "DOUBLE"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{4.2e100, "1970-01-01T00:00:00.000001Z"},
+				},
+				Count: 1,
+			},
+		},
+		{
+			"negative double value with exponent",
+			testTable,
+			func(s *qdb.LineSender) error {
+				return s.
+					Table(testTable).
+					Float64Column("foobar", -4.2e100).
+					At(ctx, 1000)
+			},
+			tableData{
+				Columns: []column{
+					{"foobar", "DOUBLE"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{-4.2e100, "1970-01-01T00:00:00.000001Z"},
 				},
 				Count: 1,
 			},

@@ -738,5 +738,14 @@ func (b *buffer) WriteFloat(f float64) {
 	// We need up to 24 bytes to fit a float64, including a sign.
 	var a [24]byte
 	s := strconv.AppendFloat(a[0:0], f, 'g', -1, 64)
-	b.Write(s)
+	var prev byte
+	for i := 0; i < len(s); i++ {
+		// Server doesn't support 4.2e+100 notation and expects
+		// 4.2e100 instead. So, we make sure to erase '+'.
+		if prev == 'e' && s[i] == '+' {
+			continue
+		}
+		b.WriteByte(s[i])
+		prev = s[i]
+	}
 }

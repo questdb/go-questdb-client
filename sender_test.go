@@ -163,8 +163,10 @@ func TestFloatSerialization(t *testing.T) {
 		{"positive number", 42.3, "42.3"},
 		{"negative number", -42.3, "-42.3"},
 		{"smallest value", math.SmallestNonzeroFloat64, "5e-324"},
-		{"max value", math.MaxFloat64, "1.7976931348623157e+308"},
+		{"max value", math.MaxFloat64, "1.7976931348623157e308"},
 		{"negative with exponent", -4.2e-99, "-4.2e-99"},
+		{"small with exponent", 4.2e-99, "4.2e-99"},
+		{"large with exponent", 4.2e99, "4.2e99"},
 	}
 
 	for _, tc := range testCases {
