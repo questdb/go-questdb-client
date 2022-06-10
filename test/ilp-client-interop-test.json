@@ -1,5 +1,82 @@
 [
     {
+        "testName": "all column types",
+        "table": "test_table",
+        "symbols": [
+            {
+                "name": "sym_col",
+                "value": "sym_val"
+            }
+        ],
+        "columns": [
+            {
+                "type": "STRING",
+                "name": "str_col",
+                "value": "foo bar baz"
+            },
+            {
+                "type": "LONG",
+                "name": "long_col",
+                "value": 42
+            },
+            {
+                "type": "DOUBLE",
+                "name": "double_col",
+                "value": 42.5
+            },
+            {
+                "type": "BOOLEAN",
+                "name": "bool_col",
+                "value": true
+            }
+        ],
+        "result": {
+            "status": "SUCCESS",
+            "line": "test_table,sym_col=sym_val str_col=\"foo bar baz\",long_col=42i,double_col=42.5,bool_col=t"
+        }
+    },
+    {
+        "testName": "double serialization",
+        "table": "doubles",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "DOUBLE",
+                "name": "d0",
+                "value": 0.0
+            },
+            {
+                "type": "DOUBLE",
+                "name": "dm0",
+                "value": -0.0
+            },
+            {
+                "type": "DOUBLE",
+                "name": "d1",
+                "value": 1.0
+            },
+            {
+                "type": "DOUBLE",
+                "name": "dE100",
+                "value": 1E100
+            },
+            {
+                "type": "DOUBLE",
+                "name": "d0000001",
+                "value": 0.000001
+            },
+            {
+                "type": "DOUBLE",
+                "name": "dN0000001",
+                "value": -0.000001
+            }
+        ],
+        "result": {
+            "status": "SUCCESS",
+            "line": "doubles d0=0,dm0=-0,d1=1,dE100=1E+100,d0000001=1E-06,dN0000001=-1E-06"
+        }
+    },
+    {
         "testName": "escaped chars in table name",
         "table": "test 1=2",
         "symbols": [],

@@ -331,7 +331,7 @@ func TestE2EValidWrites(t *testing.T) {
 			},
 		},
 		{
-			"small double value with exponent",
+			"double value with exponent",
 			testTable,
 			func(s *qdb.LineSender) error {
 				return s.
@@ -346,46 +346,6 @@ func TestE2EValidWrites(t *testing.T) {
 				},
 				Dataset: [][]interface{}{
 					{4.2e-100, "1970-01-01T00:00:00.000001Z"},
-				},
-				Count: 1,
-			},
-		},
-		{
-			"large double value with exponent",
-			testTable,
-			func(s *qdb.LineSender) error {
-				return s.
-					Table(testTable).
-					Float64Column("foobar", 4.2e100).
-					At(ctx, 1000)
-			},
-			tableData{
-				Columns: []column{
-					{"foobar", "DOUBLE"},
-					{"timestamp", "TIMESTAMP"},
-				},
-				Dataset: [][]interface{}{
-					{4.2e100, "1970-01-01T00:00:00.000001Z"},
-				},
-				Count: 1,
-			},
-		},
-		{
-			"negative double value with exponent",
-			testTable,
-			func(s *qdb.LineSender) error {
-				return s.
-					Table(testTable).
-					Float64Column("foobar", -4.2e100).
-					At(ctx, 1000)
-			},
-			tableData{
-				Columns: []column{
-					{"foobar", "DOUBLE"},
-					{"timestamp", "TIMESTAMP"},
-				},
-				Dataset: [][]interface{}{
-					{-4.2e100, "1970-01-01T00:00:00.000001Z"},
 				},
 				Count: 1,
 			},

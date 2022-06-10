@@ -110,7 +110,7 @@ func TestValidWrites(t *testing.T) {
 	}
 }
 
-func TestIntSerialization(t *testing.T) {
+func TestInt64Serialization(t *testing.T) {
 	ctx := context.Background()
 
 	testCases := []struct {
@@ -148,7 +148,7 @@ func TestIntSerialization(t *testing.T) {
 	}
 }
 
-func TestFloatSerialization(t *testing.T) {
+func TestFloat64Serialization(t *testing.T) {
 	ctx := context.Background()
 
 	testCases := []struct {
@@ -162,11 +162,11 @@ func TestFloatSerialization(t *testing.T) {
 		{"negative infinity", math.Inf(-1), "-Infinity"},
 		{"positive number", 42.3, "42.3"},
 		{"negative number", -42.3, "-42.3"},
-		{"smallest value", math.SmallestNonzeroFloat64, "5e-324"},
-		{"max value", math.MaxFloat64, "1.7976931348623157e308"},
-		{"negative with exponent", -4.2e-99, "-4.2e-99"},
-		{"small with exponent", 4.2e-99, "4.2e-99"},
-		{"large with exponent", 4.2e99, "4.2e99"},
+		{"smallest value", math.SmallestNonzeroFloat64, "5E-324"},
+		{"max value", math.MaxFloat64, "1.7976931348623157E+308"},
+		{"negative with exponent", -4.2e-99, "-4.2E-99"},
+		{"small with exponent", 4.2e-99, "4.2E-99"},
+		{"large with exponent", 4.2e99, "4.2E+99"},
 	}
 
 	for _, tc := range testCases {
