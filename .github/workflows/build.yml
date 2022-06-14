@@ -9,7 +9,12 @@ jobs:
         go-version: [1.17.x]
     name: Build with Go ${{ matrix.go-version }}
     steps:
-      - uses: actions/checkout@v2.3.4
+      - name: Checkout repository
+        uses: actions/checkout@v2.3.4
+
+      - name: Checkout submodules
+        run: git submodule update --init --recursive
+
       - name: Install Go
         uses: actions/setup-go@v2
         with:
