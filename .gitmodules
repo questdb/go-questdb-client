@@ -1,0 +1,3 @@
+[submodule "test/interop"]
+	path = test/interop
+	url = git@github.com:questdb/questdb-client-test.git
