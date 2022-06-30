@@ -194,9 +194,12 @@ func TestFloat64Serialization(t *testing.T) {
 }
 
 func TestErrorOnLengthyNames(t *testing.T) {
-	ctx := context.Background()
+	const nameLimit = 42
 
-	lengthyStr := strings.Repeat("a", 128)
+	var (
+		lengthyStr = strings.Repeat("a", nameLimit+1)
+		ctx        = context.Background()
+	)
 
 	testCases := []struct {
 		name           string
@@ -208,14 +211,14 @@ func TestErrorOnLengthyNames(t *testing.T) {
 			func(s *qdb.LineSender) error {
 				return s.Table(lengthyStr).StringColumn("str_col", "foo").AtNow(ctx)
 			},
-			"table name length is too large",
+			"table name length exceeds the limit",
 		},
 		{
 			"lengthy column name",
 			func(s *qdb.LineSender) error {
 				return s.Table(testTable).StringColumn(lengthyStr, "foo").AtNow(ctx)
 			},
-			"column name length is too large",
+			"column name length exceeds the limit",
 		},
 	}
 
@@ -224,7 +227,7 @@ func TestErrorOnLengthyNames(t *testing.T) {
 			srv, err := newTestServer(readAndDiscard)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr), qdb.WithFileNameLimit(nameLimit))
 			assert.NoError(t, err)
 
 			err = tc.writerFn(sender)

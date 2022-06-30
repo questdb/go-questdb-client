@@ -48,7 +48,10 @@ import (
 // chars found in table or column name.
 var ErrInvalidMsg = errors.New("invalid message")
 
-const fsFileNameLimit = 127
+const (
+	defaultBufferCapacity = 128 * 1024
+	defaultFileNameLimit  = 127
+)
 
 type tlsMode int64
 
@@ -64,18 +67,19 @@ const (
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
 type LineSender struct {
-	address    string
-	tlsMode    tlsMode
-	keyId      string // Erased once auth is done.
-	key        string // Erased once auth is done.
-	bufCap     int
-	conn       net.Conn
-	buf        *buffer
-	lastMsgPos int
-	lastErr    error
-	hasTable   bool
-	hasTags    bool
-	hasFields  bool
+	address       string
+	tlsMode       tlsMode
+	keyId         string // Erased once auth is done.
+	key           string // Erased once auth is done.
+	bufCap        int
+	fileNameLimit int
+	conn          net.Conn
+	buf           *buffer
+	lastMsgPos    int
+	lastErr       error
+	hasTable      bool
+	hasTags       bool
+	hasFields     bool
 }
 
 // LineSenderOption defines line sender option.
@@ -128,6 +132,18 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 	}
 }
 
+// WithFileNameLimit sets maximum file name length in chars
+// allowed by the server. Affects maximum table and column name
+// lengths accepted by the sender. Should be set to the same value
+// as on the server. Defaults to 127.
+func WithFileNameLimit(limit int) LineSenderOption {
+	return func(s *LineSender) {
+		if limit > 0 {
+			s.fileNameLimit = limit
+		}
+	}
+}
+
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single TCP connection. Sender should
 // not be called concurrently by multiple goroutines.
@@ -140,9 +156,10 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	)
 
 	s := &LineSender{
-		address: "127.0.0.1:9009",
-		bufCap:  128 * 1024,
-		tlsMode: noTls,
+		address:       "127.0.0.1:9009",
+		bufCap:        defaultBufferCapacity,
+		fileNameLimit: defaultFileNameLimit,
+		tlsMode:       noTls,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -379,8 +396,8 @@ func (s *LineSender) writeTableName(str string) error {
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > fsFileNameLimit {
-		return fmt.Errorf("table name length is too large: %w", ErrInvalidMsg)
+	if len(str) > s.fileNameLimit {
+		return fmt.Errorf("table name length exceeds the limit: %w", ErrInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
@@ -479,8 +496,8 @@ func (s *LineSender) writeColumnName(str string) error {
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > fsFileNameLimit {
-		return fmt.Errorf("column name length is too large: %w", ErrInvalidMsg)
+	if len(str) > s.fileNameLimit {
+		return fmt.Errorf("column name length exceeds the limit: %w", ErrInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
