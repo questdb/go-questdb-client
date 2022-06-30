@@ -48,6 +48,8 @@ import (
 // chars found in table or column name.
 var ErrInvalidMsg = errors.New("invalid message")
 
+const fsFileNameLimit = 127
+
 type tlsMode int64
 
 const (
@@ -375,6 +377,11 @@ func (s *LineSender) writeTableName(str string) error {
 	if str == "" {
 		return fmt.Errorf("table name cannot be empty: %w", ErrInvalidMsg)
 	}
+	// We use string length in bytes as an approximation. That's to
+	// avoid calculating the number of runes.
+	if len(str) > fsFileNameLimit {
+		return fmt.Errorf("table name length is too large: %w", ErrInvalidMsg)
+	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
 	for i := 0; i < len(str); i++ {
@@ -469,6 +476,11 @@ func illegalTableNameChar(ch byte) bool {
 func (s *LineSender) writeColumnName(str string) error {
 	if str == "" {
 		return fmt.Errorf("column name cannot be empty: %w", ErrInvalidMsg)
+	}
+	// We use string length in bytes as an approximation. That's to
+	// avoid calculating the number of runes.
+	if len(str) > fsFileNameLimit {
+		return fmt.Errorf("column name length is too large: %w", ErrInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
