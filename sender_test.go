@@ -193,6 +193,52 @@ func TestFloat64Serialization(t *testing.T) {
 	}
 }
 
+func TestErrorOnLengthyNames(t *testing.T) {
+	const nameLimit = 42
+
+	var (
+		lengthyStr = strings.Repeat("a", nameLimit+1)
+		ctx        = context.Background()
+	)
+
+	testCases := []struct {
+		name           string
+		writerFn       writerFn
+		expectedErrMsg string
+	}{
+		{
+			"lengthy table name",
+			func(s *qdb.LineSender) error {
+				return s.Table(lengthyStr).StringColumn("str_col", "foo").AtNow(ctx)
+			},
+			"table name length exceeds the limit",
+		},
+		{
+			"lengthy column name",
+			func(s *qdb.LineSender) error {
+				return s.Table(testTable).StringColumn(lengthyStr, "foo").AtNow(ctx)
+			},
+			"column name length exceeds the limit",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer(readAndDiscard)
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr), qdb.WithFileNameLimit(nameLimit))
+			assert.NoError(t, err)
+
+			err = tc.writerFn(sender)
+			assert.ErrorContains(t, err, tc.expectedErrMsg)
+
+			sender.Close()
+			srv.close()
+		})
+	}
+}
+
 func TestErrorOnMissingTableCall(t *testing.T) {
 	ctx := context.Background()
 
