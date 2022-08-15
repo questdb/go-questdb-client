@@ -2,13 +2,13 @@
 # substitute host/port and auth keys when auto-generating examples
 - name: ilp
   lang: go
-  path: examples/basic.go
+  path: examples/basic/main.go
   header: |-
     Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
     and [repo](https://github.com/questdb/go-questdb-client).
 - name: ilp-auth-tls
   lang: go
-  path: examples/auth_and_tls.go
+  path: examples/auth-and-tls/main.go
   header: |-
     Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
     and [repo](https://github.com/questdb/go-questdb-client).
