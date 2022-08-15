@@ -26,7 +26,7 @@ jobs:
 
       - name: Run linters
         run: |
-          go vet ./...
+          go list ./... | grep -v vendor | xargs go vet -v
           staticcheck ./...
 
       - name: Run tests
