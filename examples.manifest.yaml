@@ -2,12 +2,14 @@
   lang: go
   path: examples/basic.go
   header: |-
-    [Go client library docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
+    and [repo](https://github.com/questdb/go-questdb-client).
 - name: ilp-auth-tls
   lang: go
   path: examples/auth_and_tls.go
   header: |-
-    [Go client library docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
+    and [repo](https://github.com/questdb/go-questdb-client).
   auth:
     kid: testUser1
     d: 5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48
