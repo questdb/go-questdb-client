@@ -1,3 +1,5 @@
+# manifest file lets questdb.io find the examples and lets Cloud docs
+# substitute host/port and auth keys when auto-generating examples
 - name: ilp
   lang: go
   path: examples/basic.go
