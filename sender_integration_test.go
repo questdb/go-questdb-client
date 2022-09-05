@@ -238,6 +238,7 @@ func TestE2EValidWrites(t *testing.T) {
 					Int64Column("long_col", 12).
 					StringColumn("str_col", "foobar").
 					BoolColumn("bool_col", true).
+					TimestampColumn("timestamp_col", 42).
 					At(ctx, 1000)
 				if err != nil {
 					return err
@@ -250,6 +251,7 @@ func TestE2EValidWrites(t *testing.T) {
 					Int64Column("long_col", 11).
 					StringColumn("str_col", "barbaz").
 					BoolColumn("bool_col", false).
+					TimestampColumn("timestamp_col", 43).
 					At(ctx, 2000)
 			},
 			tableData{
@@ -259,11 +261,12 @@ func TestE2EValidWrites(t *testing.T) {
 					{"long_col", "LONG"},
 					{"str_col", "STRING"},
 					{"bool_col", "BOOLEAN"},
+					{"timestamp_col", "TIMESTAMP"},
 					{"timestamp", "TIMESTAMP"},
 				},
 				Dataset: [][]interface{}{
-					{"test_ilp1", float64(12.2), float64(12), "foobar", true, "1970-01-01T00:00:00.000001Z"},
-					{"test_ilp2", float64(11.2), float64(11), "barbaz", false, "1970-01-01T00:00:00.000002Z"},
+					{"test_ilp1", float64(12.2), float64(12), "foobar", true, "1970-01-01T00:00:00.000042Z", "1970-01-01T00:00:00.000001Z"},
+					{"test_ilp2", float64(11.2), float64(11), "barbaz", false, "1970-01-01T00:00:00.000043Z", "1970-01-01T00:00:00.000002Z"},
 				},
 				Count: 2,
 			},
