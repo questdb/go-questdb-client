@@ -274,7 +274,7 @@ func (s *LineSender) Table(name string) *LineSender {
 // before any Column method.
 //
 // Symbol name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '\"', '\\', '/', ':', ')', '(', '+',
+// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Symbol(name, val string) *LineSender {
 	if s.lastErr != nil {
@@ -306,7 +306,7 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 // message.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '\"', '\\', '/', ':', ')', '(', '+',
+// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	if !s.prepareForField(name) {
@@ -331,7 +331,7 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // At() or AtNow() calls.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '\"', '\\', '/', ':', ')', '(', '+',
+// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) TimestampColumn(name string, ts int64) *LineSender {
 	if ts < 0 {
@@ -359,7 +359,7 @@ func (s *LineSender) TimestampColumn(name string, ts int64) *LineSender {
 // message.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '\"', '\\', '/', ':', ')', '(', '+',
+// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 	if !s.prepareForField(name) {
@@ -378,7 +378,7 @@ func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 // StringColumn adds a string column value to the ILP message.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '\"', '\\', '/', ':', ')', '(', '+',
+// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) StringColumn(name, val string) *LineSender {
 	if !s.prepareForField(name) {
@@ -402,7 +402,7 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 // BoolColumn adds a boolean column value to the ILP message.
 //
 // Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '\"', '\\', '/', ':', ')', '(', '+',
+// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	if !s.prepareForField(name) {
