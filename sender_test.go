@@ -110,6 +110,42 @@ func TestValidWrites(t *testing.T) {
 	}
 }
 
+func TestTimestampSerialization(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name string
+		val  int64
+	}{
+		{"max value", math.MaxInt64},
+		{"zero", 0},
+		{"small positive value", 10},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer(sendToBackChannel)
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
+
+			err = sender.Table(testTable).TimestampColumn("a_col", tc.val).AtNow(ctx)
+			assert.NoError(t, err)
+
+			err = sender.Flush(ctx)
+			assert.NoError(t, err)
+
+			sender.Close()
+
+			// Now check what was received by the server.
+			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "t"})
+
+			srv.close()
+		})
+	}
+}
+
 func TestInt64Serialization(t *testing.T) {
 	ctx := context.Background()
 
@@ -288,6 +324,12 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 				return s.Float64Column("float", 4.2).AtNow(ctx)
 			},
 		},
+		{
+			"timestamp column",
+			func(s *qdb.LineSender) error {
+				return s.TimestampColumn("timestamp", 42).AtNow(ctx)
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -326,6 +368,23 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 	assert.Empty(t, sender.Messages())
 }
 
+func TestErrorOnNegativeTimestamp(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	err = sender.Table(testTable).TimestampColumn("timestamp_col", -42).AtNow(ctx)
+
+	assert.ErrorContains(t, err, "timestamp cannot be negative: -42")
+	assert.Empty(t, sender.Messages())
+}
+
 func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 	ctx := context.Background()
 
@@ -355,6 +414,12 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 			"float column",
 			func(s *qdb.LineSender) error {
 				return s.Table("awesome_table").Float64Column("float", 4.2).Symbol("sym", "abc").AtNow(ctx)
+			},
+		},
+		{
+			"timestamp column",
+			func(s *qdb.LineSender) error {
+				return s.Table("awesome_table").TimestampColumn("timestamp", 42).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 	}
@@ -483,6 +548,7 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 				Int64Column("long_col", int64(i)).
 				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 				BoolColumn("bool_col", true).
+				TimestampColumn("timestamp_col", 42).
 				At(ctx, int64(1000*i))
 		}
 		sender.Flush(ctx)
@@ -509,6 +575,7 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 			Int64Column("long_col", int64(i)).
 			StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 			BoolColumn("bool_col", true).
+			TimestampColumn("timestamp_col", 42).
 			At(ctx, int64(1000*i))
 	}
 	sender.Flush(ctx)
