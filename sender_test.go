@@ -32,6 +32,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"reflect"
 	"strconv"
@@ -178,6 +179,43 @@ func TestInt64Serialization(t *testing.T) {
 
 			// Now check what was received by the server.
 			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i"})
+
+			srv.close()
+		})
+	}
+}
+
+func TestLong256Column(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name string
+		val  big.Int
+		expected string
+	}{
+		{"max value", *big.NewInt(math.MaxInt64), strconv.FormatInt(math.MaxInt64, 10)},
+		{"zero", *big.NewInt(0), "0"},
+		{"positive ten", *big.NewInt(10), "10"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer(sendToBackChannel)
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
+
+			err = sender.Table(testTable).Long256Column("a_col", tc.val).AtNow(ctx)
+			assert.NoError(t, err)
+
+			err = sender.Flush(ctx)
+			assert.NoError(t, err)
+
+			sender.Close()
+
+			// Now check what was received by the server.
+			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + tc.expected + "i"})
 
 			srv.close()
 		})
