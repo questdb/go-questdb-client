@@ -323,13 +323,7 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	return s
 }
 
-// Long256Column adds a big integer (long) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Long256Column(name string, val big.Int) *LineSender {
+func (s *LineSender) Long256Column(name, val string) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
@@ -338,7 +332,11 @@ func (s *LineSender) Long256Column(name string, val big.Int) *LineSender {
 		return s
 	}
 	s.buf.WriteByte('=')
-	s.buf.WriteLong(val)
+	s.lastErr = s.writeStrValue(val, false)
+	if s.lastErr != nil {
+		return s
+	}
+	// s.buf.WriteByte('i')
 	s.hasFields = true
 	return s
 }
@@ -802,13 +800,6 @@ func (b *buffer) WriteInt(i int64) {
 	// We need up to 20 bytes to fit an int64, including a sign.
 	var a [20]byte
 	s := strconv.AppendInt(a[0:0], i, 10)
-	b.Write(s)
-}
-
-func (b *buffer) WriteLong(i big.Int) {
-	// We need up to 256 bytes to fit an big Int, including a sign.
-	var a [256]byte
-	s := i.Append(a[0:0], 10)
 	b.Write(s)
 }
 

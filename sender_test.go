@@ -32,7 +32,6 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
-	"math/big"
 	"net"
 	"reflect"
 	"strconv"
@@ -189,13 +188,15 @@ func TestLong256Column(t *testing.T) {
 	ctx := context.Background()
 
 	testCases := []struct {
-		name string
-		val  big.Int
+		name     string
+		val      string
 		expected string
 	}{
-		{"max value", *big.NewInt(math.MaxInt64), strconv.FormatInt(math.MaxInt64, 10)},
-		{"zero", *big.NewInt(0), "0"},
-		{"positive ten", *big.NewInt(10), "10"},
+		{"random ", "0x0123a4i", "0x0123a4"},
+		{"8bit max", "0xffffffffi", "0xffffffff"},
+		{"16bit max", "0xffffffffffffffffi", "0xffffffffffffffff"},
+		{"32bit max", "0xffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffff"},
+		{"64bit long", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
 	}
 
 	for _, tc := range testCases {
