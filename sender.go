@@ -323,6 +323,12 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	return s
 }
 
+// Long256Column adds a 256-bit unsigned integer(long256) column
+// value to the ILP message.
+//
+// Column name cannot contain any of the following characters:
+// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
+// '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Long256Column(name, val string) *LineSender {
 	if !s.prepareForField(name) {
 		return s

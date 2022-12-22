@@ -192,7 +192,7 @@ func TestLong256Column(t *testing.T) {
 		val      string
 		expected string
 	}{
-		{"random ", "0x0123a4i", "0x0123a4"},
+		{"random bits ", "0x0123a4i", "0x0123a4"},
 		{"8bit max", "0xffffffffi", "0xffffffff"},
 		{"16bit max", "0xffffffffffffffffi", "0xffffffffffffffff"},
 		{"32bit max", "0xffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffff"},
