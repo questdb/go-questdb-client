@@ -323,9 +323,12 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	return s
 }
 
-// Long256Column adds a 256-bit unsigned integer(long256) column
+// Long256Column adds a 256-bit unsigned integer (long256) column
 // value to the ILP message.
-//
+// 
+// val is pure unsigned hexadecimal string. Any attempt to set a string
+// which is not a hexadecimal will not be parsed and rejected by the system.
+// 
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
@@ -342,7 +345,6 @@ func (s *LineSender) Long256Column(name, val string) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	// s.buf.WriteByte('i')
 	s.hasFields = true
 	return s
 }

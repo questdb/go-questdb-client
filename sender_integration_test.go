@@ -337,7 +337,7 @@ func TestE2EValidWrites(t *testing.T) {
 			},
 		},
 		{
-			"single column long",
+			"single column long256",
 			testTable,
 			func(s *qdb.LineSender) error {
 				return s.
