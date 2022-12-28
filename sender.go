@@ -326,8 +326,9 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // Long256Column adds a 256-bit unsigned integer (long256) column
 // value to the ILP message.
 // 
-// val is pure unsigned hexadecimal string. Any attempt to set a string
-// which is not a hexadecimal will not be parsed and rejected by the system.
+// val should contain a hex encoded 256-bit unsigned integer value
+// with "0x" prefix and "i" suffix. Any attempt to set a string which is
+// not a hexadecimal will not be parsed and rejected by the database.
 // 
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
