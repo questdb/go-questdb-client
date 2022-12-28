@@ -236,6 +236,7 @@ func TestE2EValidWrites(t *testing.T) {
 					Symbol("sym_col", "test_ilp1").
 					Float64Column("double_col", 12.2).
 					Int64Column("long_col", 12).
+					Long256Column("long256_col", "0x123a4i").
 					StringColumn("str_col", "foobar").
 					BoolColumn("bool_col", true).
 					TimestampColumn("timestamp_col", 42).
@@ -249,6 +250,7 @@ func TestE2EValidWrites(t *testing.T) {
 					Symbol("sym_col", "test_ilp2").
 					Float64Column("double_col", 11.2).
 					Int64Column("long_col", 11).
+					Long256Column("long256_col", "0x123a3i").
 					StringColumn("str_col", "barbaz").
 					BoolColumn("bool_col", false).
 					TimestampColumn("timestamp_col", 43).
@@ -259,14 +261,15 @@ func TestE2EValidWrites(t *testing.T) {
 					{"sym_col", "SYMBOL"},
 					{"double_col", "DOUBLE"},
 					{"long_col", "LONG"},
+					{"long256_col", "LONG256"},
 					{"str_col", "STRING"},
 					{"bool_col", "BOOLEAN"},
 					{"timestamp_col", "TIMESTAMP"},
 					{"timestamp", "TIMESTAMP"},
 				},
 				Dataset: [][]interface{}{
-					{"test_ilp1", float64(12.2), float64(12), "foobar", true, "1970-01-01T00:00:00.000042Z", "1970-01-01T00:00:00.000001Z"},
-					{"test_ilp2", float64(11.2), float64(11), "barbaz", false, "1970-01-01T00:00:00.000043Z", "1970-01-01T00:00:00.000002Z"},
+					{"test_ilp1", float64(12.2), float64(12), "0x0123a4", "foobar", true, "1970-01-01T00:00:00.000042Z", "1970-01-01T00:00:00.000001Z"},
+					{"test_ilp2", float64(11.2), float64(11), "0x0123a3", "barbaz", false, "1970-01-01T00:00:00.000043Z", "1970-01-01T00:00:00.000002Z"},
 				},
 				Count: 2,
 			},
@@ -329,6 +332,26 @@ func TestE2EValidWrites(t *testing.T) {
 				},
 				Dataset: [][]interface{}{
 					{float64(1_000_042), "1970-01-01T00:00:00.000042Z"},
+				},
+				Count: 1,
+			},
+		},
+		{
+			"single column long256",
+			testTable,
+			func(s *qdb.LineSender) error {
+				return s.
+					Table(testTable).
+					Long256Column("foobar", "0x123a4i").
+					At(ctx, 42000)
+			},
+			tableData{
+				Columns: []column{
+					{"foobar", "LONG256"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{"0x0123a4", "1970-01-01T00:00:00.000042Z"},
 				},
 				Count: 1,
 			},

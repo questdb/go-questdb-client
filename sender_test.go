@@ -184,6 +184,45 @@ func TestInt64Serialization(t *testing.T) {
 	}
 }
 
+func TestLong256Column(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name     string
+		val      string
+		expected string
+	}{
+		{"random bits ", "0x0123a4i", "0x0123a4"},
+		{"8bit max", "0xffffffffi", "0xffffffff"},
+		{"16bit max", "0xffffffffffffffffi", "0xffffffffffffffff"},
+		{"32bit max", "0xffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffff"},
+		{"64bit long", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer(sendToBackChannel)
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
+
+			err = sender.Table(testTable).Long256Column("a_col", tc.val).AtNow(ctx)
+			assert.NoError(t, err)
+
+			err = sender.Flush(ctx)
+			assert.NoError(t, err)
+
+			sender.Close()
+
+			// Now check what was received by the server.
+			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + tc.expected + "i"})
+
+			srv.close()
+		})
+	}
+}
+
 func TestFloat64Serialization(t *testing.T) {
 	ctx := context.Background()
 

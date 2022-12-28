@@ -323,6 +323,33 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	return s
 }
 
+// Long256Column adds a 256-bit unsigned integer (long256) column
+// value to the ILP message.
+// 
+// val should contain a hex encoded 256-bit unsigned integer value
+// with "0x" prefix and "i" suffix. Any attempt to set a string which is
+// not a hexadecimal will not be parsed and rejected by the database.
+// 
+// Column name cannot contain any of the following characters:
+// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
+// '-', '*' '%%', '~', or a non-printable char.
+func (s *LineSender) Long256Column(name, val string) *LineSender {
+	if !s.prepareForField(name) {
+		return s
+	}
+	s.lastErr = s.writeColumnName(name)
+	if s.lastErr != nil {
+		return s
+	}
+	s.buf.WriteByte('=')
+	s.lastErr = s.writeStrValue(val, false)
+	if s.lastErr != nil {
+		return s
+	}
+	s.hasFields = true
+	return s
+}
+
 // TimestampColumn adds a timestamp column value to the ILP
 // message. Timestamp is Epoch microseconds.
 //
