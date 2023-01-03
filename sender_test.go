@@ -32,6 +32,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"reflect"
 	"strconv"
@@ -186,17 +187,18 @@ func TestInt64Serialization(t *testing.T) {
 
 func TestLong256Column(t *testing.T) {
 	ctx := context.Background()
-
+	
 	testCases := []struct {
 		name     string
-		val      string
+		val     *big.Int
 		expected string
 	}{
-		{"random bits ", "0x0123a4i", "0x0123a4"},
-		{"8bit max", "0xffffffffi", "0xffffffff"},
-		{"16bit max", "0xffffffffffffffffi", "0xffffffffffffffff"},
-		{"32bit max", "0xffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffff"},
-		{"64bit long", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+		{"0", big.NewInt(0).SetInt64(0), "0x00"},
+		{"1", big.NewInt(0).SetInt64(1), "0x01"},
+		{"random hex value ", big.NewInt(0).SetInt64(0x0123a4), "0x0123a4"},
+		{"random int64 value ", big.NewInt(0).SetInt64(7423093023234231), "0x1a5f4386c8d8b7"},
+		{"32bit max", big.NewInt(0).SetInt64(math.MaxInt64), "0x7fffffffffffffff"},
+		{"64bit max", big.NewInt(0).SetBytes([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}), "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
 	}
 
 	for _, tc := range testCases {

@@ -41,6 +41,7 @@ import (
 	"net"
 	"strconv"
 	"time"
+	"unicode/utf8"
 )
 
 // ErrInvalidMsg indicates a failed attempt to construct an ILP
@@ -333,7 +334,7 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Long256Column(name, val string) *LineSender {
+func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
@@ -342,7 +343,12 @@ func (s *LineSender) Long256Column(name, val string) *LineSender {
 		return s
 	}
 	s.buf.WriteByte('=')
-	s.lastErr = s.writeStrValue(val, false)
+	hexVal := "0x"
+	if utf8.RuneCountInString(val.Text(16))%2==1 {
+		hexVal += "0"
+	}
+	hexVal += val.Text(16) + "i"
+	s.lastErr = s.writeStrValue(hexVal, false)
 	if s.lastErr != nil {
 		return s
 	}
