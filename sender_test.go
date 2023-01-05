@@ -187,6 +187,7 @@ func TestInt64Serialization(t *testing.T) {
 
 func TestLong256Column(t *testing.T) {
 	ctx := context.Background()
+	
 	val, _ := big.NewInt(0).SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
 	testCases := []struct {
 		name     string
@@ -195,9 +196,9 @@ func TestLong256Column(t *testing.T) {
 	}{
 		{"zero", big.NewInt(0), "0x0"},
 		{"one", big.NewInt(1), "0x1"},
-		{"random 64",big.NewInt(7423093023234231), "0x1a5f4386c8d8b7"},
-		{"32bit max", big.NewInt(math.MaxInt32), "0x7fffffff"},
-		{"256-bit max value",val , "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+		{"32-bit max", big.NewInt(math.MaxInt32), "0x7fffffff"},
+		{"64-bitrandom",big.NewInt(7423093023234231), "0x1a5f4386c8d8b7"},
+		{"256-bit max",val , "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
 		
 	}
 
