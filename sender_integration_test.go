@@ -238,7 +238,7 @@ func TestE2EValidWrites(t *testing.T) {
 					Symbol("sym_col", "test_ilp1").
 					Float64Column("double_col", 12.2).
 					Int64Column("long_col", 12).
-					Long256Column("long256_col", big.NewInt(0).SetInt64(0x123a4)).
+					Long256Column("long256_col", big.NewInt(0x123a4)).
 					StringColumn("str_col", "foobar").
 					BoolColumn("bool_col", true).
 					TimestampColumn("timestamp_col", 42).
@@ -252,7 +252,7 @@ func TestE2EValidWrites(t *testing.T) {
 					Symbol("sym_col", "test_ilp2").
 					Float64Column("double_col", 11.2).
 					Int64Column("long_col", 11).
-					Long256Column("long256_col",  big.NewInt(0).SetInt64(7423093023234231)).
+					Long256Column("long256_col",  big.NewInt(7423093023234231)).
 					StringColumn("str_col", "barbaz").
 					BoolColumn("bool_col", false).
 					TimestampColumn("timestamp_col", 43).

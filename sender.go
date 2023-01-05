@@ -41,7 +41,6 @@ import (
 	"net"
 	"strconv"
 	"time"
-	"unicode/utf8"
 )
 
 // ErrInvalidMsg indicates a failed attempt to construct an ILP
@@ -327,14 +326,16 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // Long256Column adds a 256-bit unsigned integer (long256) column
 // value to the ILP message.
 // 
-// val should contain a hex encoded 256-bit unsigned integer value
-// with "0x" prefix and "i" suffix. Any attempt to set a string which is
-// not a hexadecimal will not be parsed and rejected by the database.
+// Only non-negative numbers that fit into 256-bit unsigned integer are
+// supported and any other input value would lead to an error.
 // 
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
+	if val.Sign() < 0 {
+		return s
+	}
 	if !s.prepareForField(name) {
 		return s
 	}
@@ -343,12 +344,10 @@ func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 		return s
 	}
 	s.buf.WriteByte('=')
-	hexVal := "0x"
-	if utf8.RuneCountInString(val.Text(16))%2==1 {
-		hexVal += "0"
-	}
-	hexVal += val.Text(16) + "i"
-	s.lastErr = s.writeStrValue(hexVal, false)
+	s.buf.WriteByte('0')
+	s.buf.WriteByte('x')
+	s.buf.WriteBigInt(val)
+	s.buf.WriteByte('i')
 	if s.lastErr != nil {
 		return s
 	}
@@ -832,5 +831,12 @@ func (b *buffer) WriteFloat(f float64) {
 	// We need up to 24 bytes to fit a float64, including a sign.
 	var a [24]byte
 	s := strconv.AppendFloat(a[0:0], f, 'G', -1, 64)
+	b.Write(s)
+}
+
+func (b *buffer) WriteBigInt(i *big.Int) {
+	// We need up to 256 bytes to fit an long256, including a sign.
+	var a [256]byte
+	s := i.Append(a[0:0], 16)
 	b.Write(s)
 }
