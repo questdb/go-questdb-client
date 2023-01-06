@@ -32,6 +32,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"reflect"
 	"strconv"
@@ -192,11 +193,11 @@ func TestLong256Column(t *testing.T) {
 		val      string
 		expected string
 	}{
-		{"random bits ", "0x0123a4i", "0x0123a4"},
-		{"8bit max", "0xffffffffi", "0xffffffff"},
-		{"16bit max", "0xffffffffffffffffi", "0xffffffffffffffff"},
-		{"32bit max", "0xffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffff"},
-		{"64bit long", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffi", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+		{"zero", "0", "0x0"},
+		{"one", "1", "0x1"},
+		{"32-bit max", strconv.FormatInt(math.MaxInt32, 16), "0x7fffffff"},
+		{"64-bit random", strconv.FormatInt(7423093023234231, 16), "0x1a5f4386c8d8b7"},
+		{"256-bit max", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
 	}
 
 	for _, tc := range testCases {
@@ -207,7 +208,8 @@ func TestLong256Column(t *testing.T) {
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
 			assert.NoError(t, err)
 
-			err = sender.Table(testTable).Long256Column("a_col", tc.val).AtNow(ctx)
+			newVal, _ := big.NewInt(0).SetString(tc.val, 16)
+			err = sender.Table(testTable).Long256Column("a_col", newVal).AtNow(ctx)
 			assert.NoError(t, err)
 
 			err = sender.Flush(ctx)
@@ -421,6 +423,41 @@ func TestErrorOnNegativeTimestamp(t *testing.T) {
 	err = sender.Table(testTable).TimestampColumn("timestamp_col", -42).AtNow(ctx)
 
 	assert.ErrorContains(t, err, "timestamp cannot be negative: -42")
+	assert.Empty(t, sender.Messages())
+}
+
+func TestErrorOnNegativeLong256(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	err = sender.Table(testTable).Long256Column("long256_col", big.NewInt(-42)).AtNow(ctx)
+
+	assert.ErrorContains(t, err, "long256 cannot be negative: -42")
+	assert.Empty(t, sender.Messages())
+}
+
+func TestErrorOnLargerLong256(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	bigVal, _ := big.NewInt(0).SetString("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+	err = sender.Table(testTable).Long256Column("long256_col", bigVal).AtNow(ctx)
+
+	assert.ErrorContains(t, err, "long256 cannot be larger than 256-bit: 260")
 	assert.Empty(t, sender.Messages())
 }
 
