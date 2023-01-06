@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"math"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -233,12 +232,13 @@ func TestE2EValidWrites(t *testing.T) {
 			"all column types",
 			testTable,
 			func(s *qdb.LineSender) error {
+				val, _ := big.NewInt(0).SetString("123a4", 16)
 				err := s.
 					Table(testTable).
 					Symbol("sym_col", "test_ilp1").
 					Float64Column("double_col", 12.2).
 					Int64Column("long_col", 12).
-					Long256Column("long256_col", big.NewInt(0x123a4)).
+					Long256Column("long256_col", val).
 					StringColumn("str_col", "foobar").
 					BoolColumn("bool_col", true).
 					TimestampColumn("timestamp_col", 42).
@@ -247,12 +247,13 @@ func TestE2EValidWrites(t *testing.T) {
 					return err
 				}
 
+				val, _ = big.NewInt(0).SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
 				return s.
 					Table(testTable).
 					Symbol("sym_col", "test_ilp2").
 					Float64Column("double_col", 11.2).
 					Int64Column("long_col", 11).
-					Long256Column("long256_col",  big.NewInt(7423093023234231)).
+					Long256Column("long256_col", val).
 					StringColumn("str_col", "barbaz").
 					BoolColumn("bool_col", false).
 					TimestampColumn("timestamp_col", 43).
@@ -271,7 +272,7 @@ func TestE2EValidWrites(t *testing.T) {
 				},
 				Dataset: [][]interface{}{
 					{"test_ilp1", float64(12.2), float64(12), "0x0123a4", "foobar", true, "1970-01-01T00:00:00.000042Z", "1970-01-01T00:00:00.000001Z"},
-					{"test_ilp2", float64(11.2), float64(11),"0x1a5f4386c8d8b7" , "barbaz", false, "1970-01-01T00:00:00.000043Z", "1970-01-01T00:00:00.000002Z"},
+					{"test_ilp2", float64(11.2), float64(11), "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "barbaz", false, "1970-01-01T00:00:00.000043Z", "1970-01-01T00:00:00.000002Z"},
 				},
 				Count: 2,
 			},
@@ -342,9 +343,10 @@ func TestE2EValidWrites(t *testing.T) {
 			"single column long256",
 			testTable,
 			func(s *qdb.LineSender) error {
+				val, _ := big.NewInt(0).SetString("7fffffffffffffff", 16)
 				return s.
 					Table(testTable).
-					Long256Column("foobar",  big.NewInt(0).SetInt64(math.MaxInt64)).
+					Long256Column("foobar", val).
 					At(ctx, 42000)
 			},
 			tableData{

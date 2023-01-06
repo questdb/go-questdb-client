@@ -325,15 +325,26 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 
 // Long256Column adds a 256-bit unsigned integer (long256) column
 // value to the ILP message.
-// 
+//
 // Only non-negative numbers that fit into 256-bit unsigned integer are
 // supported and any other input value would lead to an error.
-// 
+//
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 	if val.Sign() < 0 {
+		if s.lastErr != nil {
+			return s
+		}
+		s.lastErr = fmt.Errorf("long256 cannot be negative: %s", val.String())
+		return s
+	}
+	if val.BitLen() > 256 {
+		if s.lastErr != nil {
+			return s
+		}
+		s.lastErr = fmt.Errorf("long256 cannot be larger than 256-bit: %v", val.BitLen())
 		return s
 	}
 	if !s.prepareForField(name) {
@@ -835,8 +846,8 @@ func (b *buffer) WriteFloat(f float64) {
 }
 
 func (b *buffer) WriteBigInt(i *big.Int) {
-	// We need up to 256 bytes to fit an long256, including a sign.
-	var a [256]byte
+	// We need up to 64 bytes to fit an unsigned 256-bit number.
+	var a [64]byte
 	s := i.Append(a[0:0], 16)
 	b.Write(s)
 }
