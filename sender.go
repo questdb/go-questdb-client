@@ -810,6 +810,17 @@ func (s *LineSender) Messages() string {
 	return s.buf.String()
 }
 
+// WriteRaw directly writes bytes to the internal buffer
+// This is useful if you want to write pre-constructed
+// ILP messages to the buffer.
+//
+// WARNING: There is no error checking here! Only use
+// this method if you've pre-validated your data to avoid
+// unexpected errors.
+func (s *LineSender) WriteRaw(p []byte) (int, error) {
+	return s.buf.Write(p)
+}
+
 // buffer is a wrapper on top of bytes.buffer. It extends the
 // original struct with methods for writing int64 and float64
 // numbers without unnecessary allocations.
