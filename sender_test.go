@@ -309,6 +309,7 @@ func TestErrorOnLengthyNames(t *testing.T) {
 
 			err = tc.writerFn(sender)
 			assert.ErrorContains(t, err, tc.expectedErrMsg)
+			assert.Empty(t, sender.Messages())
 
 			sender.Close()
 			srv.close()
@@ -517,6 +518,24 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 			srv.close()
 		})
 	}
+}
+
+func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	sender.Table(testTable)
+	err = sender.Flush(ctx)
+
+	assert.ErrorContains(t, err, "pending ILP message must be finalized with At or AtNow before calling Flush")
+	assert.Empty(t, sender.Messages())
 }
 
 func TestInvalidMessageGetsDiscarded(t *testing.T) {

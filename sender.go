@@ -735,14 +735,15 @@ func (s *LineSender) At(ctx context.Context, ts int64) error {
 	err := s.lastErr
 	s.lastErr = nil
 	if err != nil {
-		// Discard the partially written message.
-		s.buf.Truncate(s.lastMsgPos)
+		s.discardPendingMsg()
 		return err
 	}
 	if !s.hasTable {
+		s.discardPendingMsg()
 		return fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
 	}
 	if !s.hasTags && !s.hasFields {
+		s.discardPendingMsg()
 		return fmt.Errorf("no symbols or columns were provided: %w", ErrInvalidMsg)
 	}
 
@@ -776,7 +777,12 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	err := s.lastErr
 	s.lastErr = nil
 	if err != nil {
+		s.discardPendingMsg()
 		return err
+	}
+	if s.hasTable {
+		s.discardPendingMsg()
+		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	}
 
 	if err = ctx.Err(); err != nil {
@@ -802,6 +808,13 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	s.lastMsgPos = 0
 
 	return nil
+}
+
+func (s *LineSender) discardPendingMsg() {
+	s.buf.Truncate(s.lastMsgPos)
+	s.hasTable = false
+	s.hasTags = false
+	s.hasFields = false
 }
 
 // Messages returns a copy of accumulated ILP messages that are not
