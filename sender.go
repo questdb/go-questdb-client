@@ -754,9 +754,7 @@ func (s *LineSender) At(ctx context.Context, ts int64) error {
 	s.buf.WriteByte('\n')
 
 	s.lastMsgPos = s.buf.Len()
-	s.hasTable = false
-	s.hasTags = false
-	s.hasFields = false
+	s.resetMsgFlags()
 
 	if s.buf.Len() > s.bufCap {
 		return s.Flush(ctx)
@@ -812,6 +810,10 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 func (s *LineSender) discardPendingMsg() {
 	s.buf.Truncate(s.lastMsgPos)
+	s.resetMsgFlags()
+}
+
+func (s *LineSender) resetMsgFlags() {
 	s.hasTable = false
 	s.hasTags = false
 	s.hasFields = false
