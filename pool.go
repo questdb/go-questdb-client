@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -38,7 +39,7 @@ func NewConnectionPool(address string, minIdleConns, maxIdleConns, maxConns int,
 		closeCh:         make(chan struct{}),
 	}
 
-	go pool.idleConnReaper()
+	go pool.Start()
 
 	return pool
 }
@@ -48,7 +49,11 @@ func (p *ConnectionPool) Get(ctx context.Context) (net.Conn, error) {
 	defer p.mu.Unlock()
 
 	if p.idleConns > 0 {
-		conn := p.conns.Remove(p.conns.Back()).(net.Conn)
+		c := p.conns.Back()
+		if c == nil {
+			return nil, errors.New("connection pool is empty but p.idleConns > 0, p.idleConns=" + strconv.Itoa(p.idleConns))
+		}
+		conn := p.conns.Remove(c).(net.Conn)
 		p.idleConns--
 		return conn, nil
 	}
@@ -62,11 +67,11 @@ func (p *ConnectionPool) Get(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 
-	p.idleConns++
+	p.maxConns++
 	return conn, nil
 }
 
-func (p *ConnectionPool) Release(conn net.Conn) error {
+func (p *ConnectionPool) Release(conn net.Conn, rwErr error) error {
 	if conn == nil {
 		return nil
 	}
@@ -74,12 +79,18 @@ func (p *ConnectionPool) Release(conn net.Conn) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if rwErr != nil {
+		p.maxConns--
+		return conn.Close()
+	}
+
 	if p.idleConns < p.maxIdleConns {
 		p.conns.PushBack(conn)
 		p.idleConns++
 		return nil
 	}
 
+	p.maxConns--
 	return conn.Close()
 }
 
@@ -97,19 +108,6 @@ func (p *ConnectionPool) Close() error {
 	p.conns.Init()
 	p.idleConns = 0
 	return retErr
-}
-
-func (p *ConnectionPool) Flush(ctx context.Context) error {
-	conn, err := p.Get(ctx)
-	if err != nil {
-		return err
-	}
-	defer p.Release(conn)
-
-	// 在这里执行写操作
-	// 使用 conn 进行写操作
-
-	return nil
 }
 
 func (p *ConnectionPool) Start() {

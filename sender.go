@@ -795,9 +795,8 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 	conn, err := s.pool.Get(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get a connection from the pool: %w", err)
 	}
-	defer s.pool.Release(conn)
 
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetWriteDeadline(deadline)
@@ -806,6 +805,8 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	}
 
 	n, err := s.buf.WriteTo(conn)
+	defer s.pool.Release(conn, err)
+
 	if err != nil {
 		s.lastMsgPos -= int(n)
 		return err
