@@ -51,6 +51,11 @@ var ErrInvalidMsg = errors.New("invalid message")
 const (
 	defaultBufferCapacity = 128 * 1024
 	defaultFileNameLimit  = 127
+
+	defaultMinIdleConns = 1
+	defaultMaxIdleConns = 5
+	defaultMaxConns     = 32
+	defaultIdleTimeout  = 5 * time.Minute
 )
 
 type tlsMode int64
@@ -81,6 +86,10 @@ type LineSender struct {
 	hasFields     bool
 	pool          *ConnectionPool
 	dialer        dialer
+
+	// conn pool config
+	minIdleConns, maxIdleConns, maxConns int
+	idleTimeout                          time.Duration
 }
 
 // LineSenderOption defines line sender option.
@@ -142,6 +151,30 @@ func WithFileNameLimit(limit int) LineSenderOption {
 		if limit > 0 {
 			s.fileNameLimit = limit
 		}
+	}
+}
+
+func WithMinIdleConns(minIdleConns int) LineSenderOption {
+	return func(s *LineSender) {
+		s.minIdleConns = minIdleConns
+	}
+}
+
+func WithMaxIdleConns(maxIdleConns int) LineSenderOption {
+	return func(s *LineSender) {
+		s.maxIdleConns = maxIdleConns
+	}
+}
+
+func WithMaxConns(maxConns int) LineSenderOption {
+	return func(s *LineSender) {
+		s.maxConns = maxConns
+	}
+}
+
+func WithIdleTimeout(idleTimeout time.Duration) LineSenderOption {
+	return func(s *LineSender) {
+		s.idleTimeout = idleTimeout
 	}
 }
 
@@ -226,6 +259,11 @@ func New(opts ...LineSenderOption) *LineSender {
 		bufCap:        defaultBufferCapacity,
 		fileNameLimit: defaultFileNameLimit,
 		tlsMode:       noTls,
+
+		minIdleConns: defaultMinIdleConns,
+		maxIdleConns: defaultMaxIdleConns,
+		maxConns:     defaultMaxConns,
+		idleTimeout:  defaultIdleTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -240,7 +278,7 @@ func New(opts ...LineSenderOption) *LineSender {
 	s.buf = newBuffer(s.bufCap)
 
 	// init conn pool
-	pool := NewConnectionPool(s.address, 1, 5, 64, time.Second*30, time.Second*60, s.dialer)
+	pool := NewConnectionPool(s.address, s.minIdleConns, s.maxIdleConns, s.maxConns, s.idleTimeout, time.Second*60, s.dialer)
 	s.pool = pool
 	return s
 }
