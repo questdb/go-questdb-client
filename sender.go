@@ -240,7 +240,7 @@ func New(opts ...LineSenderOption) *LineSender {
 	s.buf = newBuffer(s.bufCap)
 
 	// init conn pool
-	pool := NewConnectionPool(s.address, 1, 2, 5, time.Second*30, time.Second*60, s.dialer)
+	pool := NewConnectionPool(s.address, 1, 5, 64, time.Second*30, time.Second*60, s.dialer)
 	s.pool = pool
 	return s
 }
