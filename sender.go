@@ -80,6 +80,7 @@ type LineSender struct {
 	hasTable      bool
 	hasTags       bool
 	hasFields     bool
+	dialer        dialer
 }
 
 // LineSenderOption defines line sender option.
@@ -108,7 +109,7 @@ func WithTls() LineSenderOption {
 	}
 }
 
-// WithTls enables TLS connection encryption, but skips server
+// WithTlsInsecureSkipVerify enables TLS connection encryption, but skips server
 // certificate verification. Useful in test environments with
 // self-signed certificates. Do not use in production
 // environments.
@@ -144,17 +145,87 @@ func WithFileNameLimit(limit int) LineSenderOption {
 	}
 }
 
+type dialer func(ctx context.Context, address string) (net.Conn, error)
+
+func (s *LineSender) plainDialer(ctx context.Context, address string) (net.Conn, error) {
+	dialer := net.Dialer{}
+	return dialer.DialContext(ctx, "tcp", address)
+}
+
+func (s *LineSender) authDialer(ctx context.Context, address string) (net.Conn, error) {
+	var key *ecdsa.PrivateKey
+
+	if s.key == "" {
+		return nil, fmt.Errorf("missing auth key")
+	}
+
+	keyRaw, err := base64.RawURLEncoding.DecodeString(s.key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode auth key: %v", err)
+	}
+	key = new(ecdsa.PrivateKey)
+	key.PublicKey.Curve = elliptic.P256()
+	key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(keyRaw)
+	key.D = new(big.Int).SetBytes(keyRaw)
+
+	config := &tls.Config{}
+	if s.tlsMode == tlsInsecureSkipVerify {
+		config.InsecureSkipVerify = true
+	}
+	conn, err := tls.Dial("tcp", s.address, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to server: %v", err)
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	_, err = conn.Write([]byte(s.keyId + "\n"))
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to write key id: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	raw, err := reader.ReadBytes('\n')
+	if len(raw) < 2 {
+		conn.Close()
+		return nil, fmt.Errorf("empty challenge response from server: %v", err)
+	}
+	// Remove the `\n` in the last position.
+	raw = raw[:len(raw)-1]
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to read challenge response from server: %v", err)
+	}
+
+	// Hash the challenge with sha256.
+	hash := crypto.SHA256.New()
+	hash.Write(raw)
+	hashed := hash.Sum(nil)
+
+	a, b, err := ecdsa.Sign(rand.Reader, key, hashed)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to sign challenge using auth key: %v", err)
+	}
+	stdSig := append(a.Bytes(), b.Bytes()...)
+	_, err = conn.Write([]byte(base64.StdEncoding.EncodeToString(stdSig) + "\n"))
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to write signed challenge: %v", err)
+	}
+
+	// Reset the deadline.
+	conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single TCP connection. Sender should
 // not be called concurrently by multiple goroutines.
 func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, error) {
-	var (
-		d    net.Dialer
-		key  *ecdsa.PrivateKey
-		conn net.Conn
-		err  error
-	)
-
 	s := &LineSender{
 		address:       "127.0.0.1:9009",
 		bufCap:        defaultBufferCapacity,
@@ -165,80 +236,18 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		opt(s)
 	}
 
-	if s.key != "" {
-		keyRaw, err := base64.RawURLEncoding.DecodeString(s.key)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode auth key: %v", err)
-		}
-		key = new(ecdsa.PrivateKey)
-		key.PublicKey.Curve = elliptic.P256()
-		key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(keyRaw)
-		key.D = new(big.Int).SetBytes(keyRaw)
+	if s.tlsMode == noTls {
+		s.dialer = s.plainDialer
+	} else {
+		s.dialer = s.authDialer
 	}
 
-	if s.tlsMode == noTls {
-		conn, err = d.DialContext(ctx, "tcp", s.address)
-	} else {
-		config := &tls.Config{}
-		if s.tlsMode == tlsInsecureSkipVerify {
-			config.InsecureSkipVerify = true
-		}
-		conn, err = tls.Dial("tcp", s.address, config)
-	}
+	s.buf = newBuffer(s.bufCap)
+	conn, err := s.dialer(ctx, s.address)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to server: %v", err)
 	}
-
-	if key != nil {
-		if deadline, ok := ctx.Deadline(); ok {
-			conn.SetDeadline(deadline)
-		}
-
-		_, err = conn.Write([]byte(s.keyId + "\n"))
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to write key id: %v", err)
-		}
-
-		reader := bufio.NewReader(conn)
-		raw, err := reader.ReadBytes('\n')
-		if len(raw) < 2 {
-			conn.Close()
-			return nil, fmt.Errorf("empty challenge response from server: %v", err)
-		}
-		// Remove the `\n` in the last position.
-		raw = raw[:len(raw)-1]
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to read challenge response from server: %v", err)
-		}
-
-		// Hash the challenge with sha256.
-		hash := crypto.SHA256.New()
-		hash.Write(raw)
-		hashed := hash.Sum(nil)
-
-		a, b, err := ecdsa.Sign(rand.Reader, key, hashed)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to sign challenge using auth key: %v", err)
-		}
-		stdSig := append(a.Bytes(), b.Bytes()...)
-		_, err = conn.Write([]byte(base64.StdEncoding.EncodeToString(stdSig) + "\n"))
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to write signed challenge: %v", err)
-		}
-
-		// Reset the deadline.
-		conn.SetDeadline(time.Time{})
-		// Erase the key values since we don't need them anymore.
-		s.key = ""
-		s.keyId = ""
-	}
-
 	s.conn = conn
-	s.buf = newBuffer(s.bufCap)
 	return s, nil
 }
 
@@ -791,6 +800,11 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	n, err := s.buf.WriteTo(s.conn)
 	if err != nil {
 		s.lastMsgPos -= int(n)
+		conn, dialErr := s.dialer(ctx, s.address)
+		if dialErr != nil {
+			return fmt.Errorf("prev err: %w, failed to reconnect: %w", err, dialErr)
+		}
+		s.conn = conn
 		return err
 	}
 
