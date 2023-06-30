@@ -108,10 +108,10 @@ func WithTls() LineSenderOption {
 	}
 }
 
-// WithTls enables TLS connection encryption, but skips server
-// certificate verification. Useful in test environments with
-// self-signed certificates. Do not use in production
-// environments.
+// WithTlsInsecureSkipVerify enables TLS connection encryption,
+// but skips server certificate verification. Useful in test
+// environments with self-signed certificates. Do not use in
+// production environments.
 func WithTlsInsecureSkipVerify() LineSenderOption {
 	return func(s *LineSender) {
 		s.tlsMode = tlsInsecureSkipVerify
