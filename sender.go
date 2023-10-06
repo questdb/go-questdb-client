@@ -56,7 +56,7 @@ const (
 type tlsMode int64
 
 const (
-	noTls                 tlsMode = 0
+	tlsDisabled           tlsMode = 0
 	tlsEnabled            tlsMode = 1
 	tlsInsecureSkipVerify tlsMode = 2
 )
@@ -159,13 +159,13 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		address:       "127.0.0.1:9009",
 		bufCap:        defaultBufferCapacity,
 		fileNameLimit: defaultFileNameLimit,
-		tlsMode:       noTls,
+		tlsMode:       tlsDisabled,
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 
-	if s.key != "" {
+	if s.keyId != "" && s.key != "" {
 		keyRaw, err := base64.RawURLEncoding.DecodeString(s.key)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode auth key: %v", err)
@@ -176,14 +176,14 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		key.D = new(big.Int).SetBytes(keyRaw)
 	}
 
-	if s.tlsMode == noTls {
+	if s.tlsMode == tlsDisabled {
 		conn, err = d.DialContext(ctx, "tcp", s.address)
 	} else {
 		config := &tls.Config{}
 		if s.tlsMode == tlsInsecureSkipVerify {
 			config.InsecureSkipVerify = true
 		}
-		conn, err = tls.Dial("tcp", s.address, config)
+		conn, err = tls.DialWithDialer(&d, "tcp", s.address, config)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to server: %v", err)
@@ -366,23 +366,12 @@ func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 }
 
 // TimestampColumn adds a timestamp column value to the ILP
-// message. Timestamp is Epoch microseconds.
-//
-// Negative timestamp value is not allowed and any attempt to
-// set a negative value will cause an error to be returned on subsequent
-// At() or AtNow() calls.
+// message.
 //
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) TimestampColumn(name string, ts int64) *LineSender {
-	if ts < 0 {
-		if s.lastErr != nil {
-			return s
-		}
-		s.lastErr = fmt.Errorf("timestamp cannot be negative: %d", ts)
-		return s
-	}
+func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
 	if !s.prepareForField(name) {
 		return s
 	}
@@ -391,7 +380,7 @@ func (s *LineSender) TimestampColumn(name string, ts int64) *LineSender {
 		return s
 	}
 	s.buf.WriteByte('=')
-	s.buf.WriteInt(ts)
+	s.buf.WriteInt(ts.UnixMicro())
 	s.buf.WriteByte('t')
 	s.hasFields = true
 	return s
@@ -721,16 +710,19 @@ func (s *LineSender) prepareForField(name string) bool {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) AtNow(ctx context.Context) error {
-	return s.At(ctx, -1)
+	return s.at(ctx, time.Time{}, false)
 }
 
 // At sets the timestamp in Epoch nanoseconds and finalizes
-// the ILP message. A negative ts value gets ignored making
-// this call behave in the same way as AtNow.
+// the ILP message.
 //
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
-func (s *LineSender) At(ctx context.Context, ts int64) error {
+func (s *LineSender) At(ctx context.Context, ts time.Time) error {
+	return s.at(ctx, ts, true)
+}
+
+func (s *LineSender) at(ctx context.Context, ts time.Time, sendTs bool) error {
 	err := s.lastErr
 	s.lastErr = nil
 	if err != nil {
@@ -746,9 +738,9 @@ func (s *LineSender) At(ctx context.Context, ts int64) error {
 		return fmt.Errorf("no symbols or columns were provided: %w", ErrInvalidMsg)
 	}
 
-	if ts > -1 {
+	if sendTs {
 		s.buf.WriteByte(' ')
-		s.buf.WriteInt(ts)
+		s.buf.WriteInt(ts.UnixNano())
 	}
 	s.buf.WriteByte('\n')
 

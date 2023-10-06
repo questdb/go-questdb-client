@@ -62,7 +62,7 @@ func TestValidWrites(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				err = s.Table(testTable).StringColumn("str_col", "bar").Int64Column("long_col", -42).At(ctx, 42)
+				err = s.Table(testTable).StringColumn("str_col", "bar").Int64Column("long_col", -42).At(ctx, time.UnixMicro(42))
 				if err != nil {
 					return err
 				}
@@ -70,7 +70,7 @@ func TestValidWrites(t *testing.T) {
 			},
 			[]string{
 				"my_test_table str_col=\"foo\",long_col=42i",
-				"my_test_table str_col=\"bar\",long_col=-42i 42",
+				"my_test_table str_col=\"bar\",long_col=-42i 42000",
 			},
 		},
 		{
@@ -116,11 +116,11 @@ func TestTimestampSerialization(t *testing.T) {
 
 	testCases := []struct {
 		name string
-		val  int64
+		val  time.Time
 	}{
-		{"max value", math.MaxInt64},
-		{"zero", 0},
-		{"small positive value", 10},
+		{"max value", time.UnixMicro(math.MaxInt64)},
+		{"zero", time.UnixMicro(0)},
+		{"small positive value", time.UnixMicro(10)},
 	}
 
 	for _, tc := range testCases {
@@ -140,7 +140,7 @@ func TestTimestampSerialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "t"})
+			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val.UnixMicro(), 10) + "t"})
 
 			srv.close()
 		})
@@ -333,7 +333,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 		{
 			"At",
 			func(s *qdb.LineSender) error {
-				return s.Symbol("sym", "abc").At(ctx, 0)
+				return s.Symbol("sym", "abc").At(ctx, time.UnixMicro(0))
 			},
 		},
 		{
@@ -369,7 +369,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 		{
 			"timestamp column",
 			func(s *qdb.LineSender) error {
-				return s.TimestampColumn("timestamp", 42).AtNow(ctx)
+				return s.TimestampColumn("timestamp", time.UnixMicro(42)).AtNow(ctx)
 			},
 		},
 	}
@@ -407,23 +407,6 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 	err = sender.Table(testTable).Table(testTable).AtNow(ctx)
 
 	assert.ErrorContains(t, err, "table name already provided")
-	assert.Empty(t, sender.Messages())
-}
-
-func TestErrorOnNegativeTimestamp(t *testing.T) {
-	ctx := context.Background()
-
-	srv, err := newTestServer(readAndDiscard)
-	assert.NoError(t, err)
-	defer srv.close()
-
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	err = sender.Table(testTable).TimestampColumn("timestamp_col", -42).AtNow(ctx)
-
-	assert.ErrorContains(t, err, "timestamp cannot be negative: -42")
 	assert.Empty(t, sender.Messages())
 }
 
@@ -496,7 +479,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 		{
 			"timestamp column",
 			func(s *qdb.LineSender) error {
-				return s.Table("awesome_table").TimestampColumn("timestamp", 42).Symbol("sym", "abc").AtNow(ctx)
+				return s.Table("awesome_table").TimestampColumn("timestamp", time.UnixMicro(42)).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 	}
@@ -643,8 +626,8 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 				Int64Column("long_col", int64(i)).
 				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 				BoolColumn("bool_col", true).
-				TimestampColumn("timestamp_col", 42).
-				At(ctx, int64(1000*i))
+				TimestampColumn("timestamp_col", time.UnixMicro(42)).
+				At(ctx, time.UnixMicro(int64(1000*i)))
 		}
 		sender.Flush(ctx)
 	}
@@ -670,8 +653,8 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 			Int64Column("long_col", int64(i)).
 			StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 			BoolColumn("bool_col", true).
-			TimestampColumn("timestamp_col", 42).
-			At(ctx, int64(1000*i))
+			TimestampColumn("timestamp_col", time.UnixMicro(42)).
+			At(ctx, time.UnixMicro(int64(1000*i)))
 	}
 	sender.Flush(ctx)
 }

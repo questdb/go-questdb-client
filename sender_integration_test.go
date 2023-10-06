@@ -241,8 +241,8 @@ func TestE2EValidWrites(t *testing.T) {
 					Long256Column("long256_col", val).
 					StringColumn("str_col", "foobar").
 					BoolColumn("bool_col", true).
-					TimestampColumn("timestamp_col", 42).
-					At(ctx, 1000)
+					TimestampColumn("timestamp_col", time.UnixMicro(42)).
+					At(ctx, time.UnixMicro(1))
 				if err != nil {
 					return err
 				}
@@ -256,8 +256,8 @@ func TestE2EValidWrites(t *testing.T) {
 					Long256Column("long256_col", val).
 					StringColumn("str_col", "barbaz").
 					BoolColumn("bool_col", false).
-					TimestampColumn("timestamp_col", 43).
-					At(ctx, 2000)
+					TimestampColumn("timestamp_col", time.UnixMicro(43)).
+					At(ctx, time.UnixMicro(2))
 			},
 			tableData{
 				Columns: []column{
@@ -285,7 +285,7 @@ func TestE2EValidWrites(t *testing.T) {
 					Table("my-awesome_test 1=2.csv").
 					Symbol("sym_name 1=2", "value 1,2=3\n4\r5\"6\\7").
 					StringColumn("str_name 1=2", "value 1,2=3\n4\r5\"6\\7").
-					At(ctx, 1000)
+					At(ctx, time.UnixMicro(1))
 			},
 			tableData{
 				Columns: []column{
@@ -306,7 +306,7 @@ func TestE2EValidWrites(t *testing.T) {
 				return s.
 					Table(testTable).
 					Symbol("foo", "bar").
-					At(ctx, 42000)
+					At(ctx, time.UnixMicro(42))
 			},
 			tableData{
 				Columns: []column{
@@ -326,7 +326,7 @@ func TestE2EValidWrites(t *testing.T) {
 				return s.
 					Table(testTable).
 					Int64Column("foobar", 1_000_042).
-					At(ctx, 42000)
+					At(ctx, time.UnixMicro(42))
 			},
 			tableData{
 				Columns: []column{
@@ -347,7 +347,7 @@ func TestE2EValidWrites(t *testing.T) {
 				return s.
 					Table(testTable).
 					Long256Column("foobar", val).
-					At(ctx, 42000)
+					At(ctx, time.UnixMicro(42))
 			},
 			tableData{
 				Columns: []column{
@@ -367,7 +367,7 @@ func TestE2EValidWrites(t *testing.T) {
 				return s.
 					Table(testTable).
 					Float64Column("foobar", 4.2e-100).
-					At(ctx, 1000)
+					At(ctx, time.UnixMicro(1))
 			},
 			tableData{
 				Columns: []column{
@@ -432,7 +432,7 @@ func TestE2EWriteInBatches(t *testing.T) {
 			err = sender.
 				Table(testTable).
 				Int64Column("long_col", int64(j)).
-				At(ctx, 1000*int64(i*nBatch+j))
+				At(ctx, time.UnixMicro(int64(i*nBatch+j)))
 			assert.NoError(t, err)
 		}
 		err = sender.Flush(ctx)
@@ -516,13 +516,13 @@ func TestE2ESuccessfulAuth(t *testing.T) {
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
-		At(ctx, 1000)
+		At(ctx, time.UnixMicro(1))
 	assert.NoError(t, err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
-		At(ctx, 2000)
+		At(ctx, time.UnixMicro(2))
 	assert.NoError(t, err)
 
 	err = sender.Flush(ctx)
@@ -573,7 +573,7 @@ func TestE2EFailedAuth(t *testing.T) {
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
-		At(ctx, 1000)
+		At(ctx, time.UnixMicro(1))
 	// If we get an error here or later, it means that the server closed connection.
 	if err != nil {
 		return
@@ -582,7 +582,7 @@ func TestE2EFailedAuth(t *testing.T) {
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
-		At(ctx, 2000)
+		At(ctx, time.UnixMicro(2))
 	if err != nil {
 		return
 	}
@@ -620,13 +620,13 @@ func TestE2EWritesWithTlsProxy(t *testing.T) {
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
-		At(ctx, 1000)
+		At(ctx, time.UnixMicro(1))
 	assert.NoError(t, err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
-		At(ctx, 2000)
+		At(ctx, time.UnixMicro(2))
 	assert.NoError(t, err)
 
 	err = sender.Flush(ctx)
@@ -672,13 +672,13 @@ func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
-		At(ctx, 1000)
+		At(ctx, time.UnixMicro(1))
 	assert.NoError(t, err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
-		At(ctx, 2000)
+		At(ctx, time.UnixMicro(2))
 	assert.NoError(t, err)
 
 	err = sender.Flush(ctx)
