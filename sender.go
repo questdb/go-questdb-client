@@ -218,12 +218,11 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		hash.Write(raw)
 		hashed := hash.Sum(nil)
 
-		a, b, err := ecdsa.Sign(rand.Reader, key, hashed)
+		stdSig, err := ecdsa.SignASN1(rand.Reader, key, hashed)
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("failed to sign challenge using auth key: %v", err)
 		}
-		stdSig := append(a.Bytes(), b.Bytes()...)
 		_, err = conn.Write([]byte(base64.StdEncoding.EncodeToString(stdSig) + "\n"))
 		if err != nil {
 			conn.Close()
