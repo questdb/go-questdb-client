@@ -41,7 +41,7 @@ import (
 	"testing"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client"
+	qdb "github.com/questdb/go-questdb-client/v2"
 	"github.com/stretchr/testify/assert"
 )
 

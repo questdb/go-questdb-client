@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client"
+	qdb "github.com/questdb/go-questdb-client/v2"
 )
 
 func main() {

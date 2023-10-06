@@ -41,7 +41,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	qdb "github.com/questdb/go-questdb-client"
+	qdb "github.com/questdb/go-questdb-client/v2"
 )
 
 const (
