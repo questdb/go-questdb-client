@@ -1,4 +1,4 @@
-[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/questdb/go-questdb-client)
+[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
 
 # go-questdb-client
 
@@ -8,9 +8,9 @@ Features:
 * Context-aware API.
 * Optimized for batch writes.
 * Supports TLS encryption and [ILP authentication](https://questdb.io/docs/reference/api/ilp/authenticate).
-* Tested against QuestDB 6.4.1 and newer versions.
+* Tested against QuestDB 7.3.2 and newer versions.
 
-Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client).
+Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2).
 
 ## Usage
 
@@ -23,7 +23,7 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client"
+	qdb "github.com/questdb/go-questdb-client/v2"
 )
 
 func main() {

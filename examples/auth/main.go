@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client"
+	qdb "github.com/questdb/go-questdb-client/v2"
 )
 
 func main() {
@@ -14,31 +14,47 @@ func main() {
 		ctx,
 		qdb.WithAddress("localhost:9009"),
 		qdb.WithAuth(
-			"testUser1",
-			"5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
+			"testUser1", // token name here
+			"5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48", // token here
+		),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 	// Make sure to close the sender on exit to release resources.
 	defer sender.Close()
+
 	// Send a few ILP messages.
-	err = sender.
-		Table("trades").
-		Symbol("name", "test_ilp1").
-		Float64Column("value", 12.4).
-		At(ctx, time.Now().UnixNano())
+	bday, err := time.Parse(time.DateOnly, "1856-07-10")
 	if err != nil {
 		log.Fatal(err)
 	}
 	err = sender.
-		Table("trades").
-		Symbol("name", "test_ilp2").
-		Float64Column("value", 11.4).
-		At(ctx, time.Now().UnixNano())
+		Table("inventors").
+		Symbol("born", "Austrian Empire").
+		TimestampColumn("birthdate", bday). // Epoch in micros.
+		Int64Column("id", 0).
+		StringColumn("name", "Nicola Tesla").
+		At(ctx, time.Now()) // Epoch in nanos.
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	bday, err = time.Parse(time.DateOnly, "1847-02-11")
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = sender.
+		Table("inventors").
+		Symbol("born", "USA").
+		TimestampColumn("birthdate", bday).
+		Int64Column("id", 1).
+		StringColumn("name", "Thomas Alva Edison").
+		AtNow(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Make sure that the messages are sent over the network.
 	err = sender.Flush(ctx)
 	if err != nil {

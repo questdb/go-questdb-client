@@ -4,13 +4,13 @@
   lang: go
   path: examples/basic/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
     and [repo](https://github.com/questdb/go-questdb-client).
 - name: ilp-auth
   lang: go
   path: examples/auth/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
     and [repo](https://github.com/questdb/go-questdb-client).
   auth:
     kid: testUser1
@@ -22,7 +22,7 @@
   lang: go
   path: examples/auth-and-tls/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
     and [repo](https://github.com/questdb/go-questdb-client).
   auth:
     kid: testUser1
