@@ -79,6 +79,7 @@ func parseConfigString(conf string, s *LineSender) error {
 			}
 		}
 	}
+	return nil
 }
 
 func processConfigKeyValuePair(key, value string, s *LineSender) error {
@@ -140,4 +141,5 @@ func processConfigKeyValuePair(key, value string, s *LineSender) error {
 	default:
 		return NewConfigStrParseError("unsupported config key %q", key)
 	}
+	return nil
 }

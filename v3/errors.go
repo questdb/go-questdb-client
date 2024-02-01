@@ -12,6 +12,6 @@ func (e *ConfigStrParseError) Error() string {
 
 func NewConfigStrParseError(msg string, args ...interface{}) *ConfigStrParseError {
 	return &ConfigStrParseError{
-		msg: fmt.Sprintf(msg, args),
+		msg: fmt.Sprintf(msg, args...),
 	}
 }
