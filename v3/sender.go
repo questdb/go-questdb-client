@@ -39,6 +39,7 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"net/http"
 	"strconv"
 	"time"
 )
@@ -62,24 +63,41 @@ const (
 )
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
-// messages.
+// messages over HTTP(S)/TPC(S).
 //
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
 type LineSender struct {
-	address       string
-	tlsMode       tlsMode
-	keyId         string // Erased once auth is done.
-	key           string // Erased once auth is done.
+	address string
+
+	// Authentication-related fields
+	tlsMode  tlsMode
+	tlsRoots string
+
+	keyId string // Erased once auth is done.
+	key   string // Erased once auth is done.
+	user  string // Erased once auth is done.
+	pass  string // Erased once auth is done.
+	token string //Erased once auth is done.
+
 	bufCap        int
 	fileNameLimit int
-	conn          net.Conn
 	buf           *buffer
 	lastMsgPos    int
 	lastErr       error
 	hasTable      bool
 	hasTags       bool
 	hasFields     bool
+
+	minThroughputBytesPerSecond int
+	graceTimeout                time.Duration
+	retryTimeout                time.Duration
+	transactional               bool
+	initBufSizeBytes            int
+	maxBufSizeBytes             int
+
+	tcpConn    net.Conn
+	httpClient http.Client
 }
 
 // LineSenderOption defines line sender option.
@@ -141,6 +159,12 @@ func WithFileNameLimit(limit int) LineSenderOption {
 		if limit > 0 {
 			s.fileNameLimit = limit
 		}
+	}
+}
+
+func WithConf(conf string) LineSenderOption {
+	return func(s *LineSender) {
+		parseConfigString(conf, s)
 	}
 }
 
@@ -236,7 +260,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		s.keyId = ""
 	}
 
-	s.conn = conn
+	s.tcpConn = conn
 	s.buf = newBuffer(s.bufCap)
 	return s, nil
 }
@@ -244,7 +268,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 // Close closes the underlying TCP connection. Does not flush
 // in-flight messages, so make sure to call Flush first.
 func (s *LineSender) Close() error {
-	return s.conn.Close()
+	return s.tcpConn.Close()
 }
 
 // Table sets the table name (metric) for a new ILP message. Should be
@@ -778,12 +802,12 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		return err
 	}
 	if deadline, ok := ctx.Deadline(); ok {
-		s.conn.SetWriteDeadline(deadline)
+		s.tcpConn.SetWriteDeadline(deadline)
 	} else {
-		s.conn.SetWriteDeadline(time.Time{})
+		s.tcpConn.SetWriteDeadline(time.Time{})
 	}
 
-	n, err := s.buf.WriteTo(s.conn)
+	n, err := s.buf.WriteTo(s.tcpConn)
 	if err != nil {
 		s.lastMsgPos -= int(n)
 		return err
