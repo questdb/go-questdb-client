@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package questdb
+package v3
 
 import (
 	"bufio"
@@ -79,14 +79,12 @@ type LineSender struct {
 	transportProtocol transportProtocol
 
 	// Authentication-related fields
-	tlsMode  tlsMode
-	tlsRoots string
+	tlsMode tlsMode
 
 	keyId string // Erased once auth is done.
 	key   string // Erased once auth is done.
 	user  string // Erased once auth is done.
 	pass  string // Erased once auth is done.
-	token string //Erased once auth is done.
 
 	bufCap        int
 	fileNameLimit int
@@ -101,7 +99,6 @@ type LineSender struct {
 	graceTimeout                time.Duration
 	retryTimeout                time.Duration
 	initBufSizeBytes            int
-	maxBufSizeBytes             int
 
 	tcpConn    net.Conn
 	httpClient http.Client
@@ -241,80 +238,97 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		opt(s)
 	}
 
-	if s.keyId != "" && s.key != "" {
-		keyRaw, err := base64.RawURLEncoding.DecodeString(s.key)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode auth key: %v", err)
-		}
-		key = new(ecdsa.PrivateKey)
-		key.PublicKey.Curve = elliptic.P256()
-		key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(keyRaw)
-		key.D = new(big.Int).SetBytes(keyRaw)
+	// Default to tcp
+	if s.transportProtocol == "" {
+		s.transportProtocol = protocolTcp
 	}
 
-	if s.tlsMode == tlsDisabled {
-		conn, err = d.DialContext(ctx, "tcp", s.address)
-	} else {
-		config := &tls.Config{}
-		if s.tlsMode == tlsInsecureSkipVerify {
-			config.InsecureSkipVerify = true
+	// Process tcp args in the same exact way that we do in v2
+	if s.transportProtocol == protocolTcp {
+		if s.keyId != "" && s.key != "" {
+			keyRaw, err := base64.RawURLEncoding.DecodeString(s.key)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode auth key: %v", err)
+			}
+			key = new(ecdsa.PrivateKey)
+			key.PublicKey.Curve = elliptic.P256()
+			key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(keyRaw)
+			key.D = new(big.Int).SetBytes(keyRaw)
 		}
-		conn, err = tls.DialWithDialer(&d, "tcp", s.address, config)
+
+		if s.tlsMode == tlsDisabled {
+			conn, err = d.DialContext(ctx, "tcp", s.address)
+		} else {
+			config := &tls.Config{}
+			if s.tlsMode == tlsInsecureSkipVerify {
+				config.InsecureSkipVerify = true
+			}
+			conn, err = tls.DialWithDialer(&d, "tcp", s.address, config)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to server: %v", err)
+		}
+
+		if key != nil {
+			if deadline, ok := ctx.Deadline(); ok {
+				conn.SetDeadline(deadline)
+			}
+
+			_, err = conn.Write([]byte(s.keyId + "\n"))
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to write key id: %v", err)
+			}
+
+			reader := bufio.NewReader(conn)
+			raw, err := reader.ReadBytes('\n')
+			if len(raw) < 2 {
+				conn.Close()
+				return nil, fmt.Errorf("empty challenge response from server: %v", err)
+			}
+			// Remove the `\n` in the last position.
+			raw = raw[:len(raw)-1]
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to read challenge response from server: %v", err)
+			}
+
+			// Hash the challenge with sha256.
+			hash := crypto.SHA256.New()
+			hash.Write(raw)
+			hashed := hash.Sum(nil)
+
+			stdSig, err := ecdsa.SignASN1(rand.Reader, key, hashed)
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to sign challenge using auth key: %v", err)
+			}
+			_, err = conn.Write([]byte(base64.StdEncoding.EncodeToString(stdSig) + "\n"))
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to write signed challenge: %v", err)
+			}
+
+			// Reset the deadline.
+			conn.SetDeadline(time.Time{})
+			// Erase the key values since we don't need them anymore.
+			s.key = ""
+			s.keyId = ""
+		}
+
+		s.tcpConn = conn
+		s.buf = newBuffer(s.initBufSizeBytes, s.bufCap)
+		return s, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to server: %v", err)
+
+	if s.transportProtocol == protocolHttp {
+		// todo: configure client
+		s.httpClient = http.Client{}
+
 	}
 
-	if key != nil {
-		if deadline, ok := ctx.Deadline(); ok {
-			conn.SetDeadline(deadline)
-		}
+	panic("unsupported protocol " + s.transportProtocol)
 
-		_, err = conn.Write([]byte(s.keyId + "\n"))
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to write key id: %v", err)
-		}
-
-		reader := bufio.NewReader(conn)
-		raw, err := reader.ReadBytes('\n')
-		if len(raw) < 2 {
-			conn.Close()
-			return nil, fmt.Errorf("empty challenge response from server: %v", err)
-		}
-		// Remove the `\n` in the last position.
-		raw = raw[:len(raw)-1]
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to read challenge response from server: %v", err)
-		}
-
-		// Hash the challenge with sha256.
-		hash := crypto.SHA256.New()
-		hash.Write(raw)
-		hashed := hash.Sum(nil)
-
-		stdSig, err := ecdsa.SignASN1(rand.Reader, key, hashed)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to sign challenge using auth key: %v", err)
-		}
-		_, err = conn.Write([]byte(base64.StdEncoding.EncodeToString(stdSig) + "\n"))
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to write signed challenge: %v", err)
-		}
-
-		// Reset the deadline.
-		conn.SetDeadline(time.Time{})
-		// Erase the key values since we don't need them anymore.
-		s.key = ""
-		s.keyId = ""
-	}
-
-	s.tcpConn = conn
-	s.buf = newBuffer(s.bufCap)
-	return s, nil
 }
 
 // Close closes the underlying TCP connection. Does not flush
@@ -830,7 +844,7 @@ func (s *LineSender) at(ctx context.Context, ts time.Time, sendTs bool) error {
 }
 
 // Flush flushes the accumulated messages to the underlying TCP
-// connection. Should be called periodically to make sure that
+// connection or HTTP client. Should be called periodically to make sure that
 // all messages are sent to the server.
 //
 // For optimal performance, this method should not be called after
@@ -839,6 +853,17 @@ func (s *LineSender) at(ctx context.Context, ts time.Time, sendTs bool) error {
 // from 100 to 1,000 messages depending on the message size and
 // configured buffer capacity.
 func (s *LineSender) Flush(ctx context.Context) error {
+	switch s.transportProtocol {
+	case protocolTcp:
+		return s.flushTcp(ctx)
+	case protocolHttp:
+		return s.flushHttp(ctx)
+	default:
+		panic("invalid protocol " + s.transportProtocol)
+	}
+}
+
+func (s *LineSender) flushTcp(ctx context.Context) error {
 	err := s.lastErr
 	s.lastErr = nil
 	if err != nil {
@@ -868,11 +893,43 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
 	if s.buf.Cap() > 3*s.bufCap {
 		// Shrink the buffer back to desired capacity.
-		s.buf = newBuffer(s.bufCap)
+		s.buf = newBuffer(s.initBufSizeBytes, s.bufCap)
 	}
 	s.lastMsgPos = 0
 
 	return nil
+}
+
+func (s *LineSender) flushHttp(ctx context.Context) error {
+	url := string(s.transportProtocol)
+	if s.tlsMode > 0 {
+		url += "s"
+	}
+	url += fmt.Sprintf("://%s", s.address)
+
+	// timeout = ( request.len() / min_throughput ) + grace
+	// Conversion from int to time.Duration is in milliseconds
+	timeout := time.Duration((s.buf.Len()/s.minThroughputBytesPerSecond)/int(s.graceTimeout.Milliseconds())) * time.Millisecond
+	reqCtx, cancelFunc := context.WithTimeout(ctx, timeout)
+
+	req, err := http.NewRequestWithContext(
+		reqCtx,
+		http.MethodPost,
+		url,
+		s.buf,
+	)
+	if err != nil {
+		cancelFunc()
+		return err
+	}
+
+	// todo: process the response somehow?
+	_, err = s.httpClient.Do(req)
+
+	// Cancel the context to release resources?
+	cancelFunc()
+
+	return err
 }
 
 func (s *LineSender) discardPendingMsg() {
@@ -899,8 +956,8 @@ type buffer struct {
 	bytes.Buffer
 }
 
-func newBuffer(cap int) *buffer {
-	return &buffer{*bytes.NewBuffer(make([]byte, 0, cap))}
+func newBuffer(initSize, cap int) *buffer {
+	return &buffer{*bytes.NewBuffer(make([]byte, initSize, cap))}
 }
 
 func (b *buffer) WriteInt(i int64) {
