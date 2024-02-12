@@ -62,13 +62,21 @@ const (
 	tlsInsecureSkipVerify tlsMode = 2
 )
 
+type transportProtocol string
+
+const (
+	protocolHttp transportProtocol = "http"
+	protocolTcp  transportProtocol = "tcp"
+)
+
 // LineSender allows you to insert rows into QuestDB by sending ILP
 // messages over HTTP(S)/TPC(S).
 //
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
 type LineSender struct {
-	address string
+	address           string
+	transportProtocol transportProtocol
 
 	// Authentication-related fields
 	tlsMode  tlsMode
@@ -161,10 +169,55 @@ func WithFileNameLimit(limit int) LineSenderOption {
 	}
 }
 
-func FromConf(conf string) (*LineSender, error) {
-	s := &LineSender{}
-	err := parseConfigString(conf, s)
-	return s, err
+func WithGraceTimeout(timeout time.Duration) LineSenderOption {
+	return func(s *LineSender) {
+		s.graceTimeout = timeout
+	}
+}
+
+func WithMinThroughput(bytesPerSecond int) LineSenderOption {
+	return func(s *LineSender) {
+		s.minThroughputBytesPerSecond = bytesPerSecond
+	}
+}
+
+func WithInitBufferSize(sizeInBytes int) LineSenderOption {
+	return func(s *LineSender) {
+		s.initBufSizeBytes = sizeInBytes
+	}
+}
+
+func WithRetryTimeout(timeout time.Duration) LineSenderOption {
+	return func(s *LineSender) {
+		s.retryTimeout = timeout
+	}
+}
+
+func WithBasicAuth(user, pass string) LineSenderOption {
+	return func(s *LineSender) {
+		s.user = user
+		s.pass = pass
+	}
+}
+
+func WithHttp() LineSenderOption {
+	return func(s *LineSender) {
+		s.transportProtocol = protocolHttp
+	}
+}
+
+func WithTcp() LineSenderOption {
+	return func(s *LineSender) {
+		s.transportProtocol = protocolTcp
+	}
+}
+
+func FromConf(ctx context.Context, conf string) (*LineSender, error) {
+	opts, err := parseConfigString(conf)
+	if err != nil {
+		return nil, err
+	}
+	return NewLineSender(ctx, opts...)
 }
 
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
