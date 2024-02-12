@@ -229,11 +229,15 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	)
 
 	s := &LineSender{
-		address:       "127.0.0.1:9009",
-		bufCap:        defaultBufferCapacity,
-		fileNameLimit: defaultFileNameLimit,
-		tlsMode:       tlsDisabled,
+		address:                     "127.0.0.1:9009",
+		bufCap:                      defaultBufferCapacity,
+		fileNameLimit:               defaultFileNameLimit,
+		tlsMode:                     tlsDisabled,
+		minThroughputBytesPerSecond: 100 * 1024,
+		graceTimeout:                time.Second * 5,
+		retryTimeout:                time.Second * 10,
 	}
+
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -243,8 +247,14 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		s.transportProtocol = protocolTcp
 	}
 
-	// Process tcp args in the same exact way that we do in v2
-	if s.transportProtocol == protocolTcp {
+	switch s.transportProtocol {
+	case protocolTcp:
+		// If the user does not specify an address, default to port 9009
+		if s.address == "" {
+			s.address = "127.0.0.1:9009"
+		}
+
+		// Process tcp args in the same exact way that we do in v2
 		if s.keyId != "" && s.key != "" {
 			keyRaw, err := base64.RawURLEncoding.DecodeString(s.key)
 			if err != nil {
@@ -317,19 +327,21 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		}
 
 		s.tcpConn = conn
-		s.buf = newBuffer(s.initBufSizeBytes, s.bufCap)
-		return s, nil
-	}
-
-	if s.transportProtocol == protocolHttp {
-		// todo: configure client
+	case protocolHttp:
+		// Default to localhost at port 9000
+		if s.address == "" {
+			s.address = "127.0.0.1:9000"
+		}
+		// todo: configure http client
 		s.httpClient = http.Client{}
-
-		return s, nil
+	default:
+		panic("unsupported protocol " + s.transportProtocol)
 
 	}
 
-	panic("unsupported protocol " + s.transportProtocol)
+	s.buf = newBuffer(s.initBufSizeBytes, s.bufCap)
+
+	return s, nil
 
 }
 
@@ -911,11 +923,12 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	if s.tlsMode > 0 {
 		url += "s"
 	}
-	url += fmt.Sprintf("://%s", s.address)
+	url += fmt.Sprintf("://%s/write", s.address)
 
 	// timeout = ( request.len() / min_throughput ) + grace
 	// Conversion from int to time.Duration is in milliseconds
-	timeout := time.Duration((s.buf.Len()/s.minThroughputBytesPerSecond)/int(s.graceTimeout.Milliseconds())) * time.Millisecond
+	timeout := time.Duration((s.buf.Len()/s.minThroughputBytesPerSecond)+int(s.graceTimeout.Milliseconds())) * time.Millisecond
+	println(timeout)
 	reqCtx, cancelFunc := context.WithTimeout(ctx, timeout)
 
 	req, err := http.NewRequestWithContext(
