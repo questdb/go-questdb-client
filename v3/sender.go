@@ -325,6 +325,8 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		// todo: configure client
 		s.httpClient = http.Client{}
 
+		return s, nil
+
 	}
 
 	panic("unsupported protocol " + s.transportProtocol)
@@ -334,7 +336,11 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 // Close closes the underlying TCP connection. Does not flush
 // in-flight messages, so make sure to call Flush first.
 func (s *LineSender) Close() error {
-	return s.tcpConn.Close()
+	if s.transportProtocol == protocolTcp {
+		return s.tcpConn.Close()
+	}
+
+	return nil
 }
 
 // Table sets the table name (metric) for a new ILP message. Should be

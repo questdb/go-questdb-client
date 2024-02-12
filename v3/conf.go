@@ -41,20 +41,22 @@ const (
 
 func parseConfigString(conf string) ([]LineSenderOption, error) {
 	var (
-		key, value        *strings.Builder
+		key   = &strings.Builder{}
+		value = &strings.Builder{}
+		isKey = true
+
 		lastRune          rune
 		isEscaping        bool
-		isKey             bool
 		opts              []LineSenderOption
 		user, pass, token string
 	)
 
-	splitStr := strings.SplitAfterN(string(conf), "::", 1)
-	if len(splitStr) < 2 {
+	schemaStr, conf, found := strings.Cut(string(conf), "::")
+	if !found {
 		return opts, NewConfigStrParseError("no schema separator found '::'")
 	}
 
-	schema := schemaType(splitStr[0])
+	schema := schemaType(schemaStr)
 	switch schema {
 	case schemaHttp:
 		opts = append(opts, WithHttp())
@@ -68,7 +70,7 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 		return opts, NewConfigStrParseError("invalid schema %q", schema)
 	}
 
-	keyValueStr := []rune(splitStr[1])
+	keyValueStr := []rune(conf)
 	for idx, rune := range keyValueStr {
 		if idx > 0 {
 			lastRune = keyValueStr[idx-1]
@@ -179,6 +181,11 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 				value.WriteRune(rune)
 			}
 		}
+	}
+
+	// Check if value buffer is empty
+	if value.Len() > 0 {
+		return opts, NewConfigStrParseError("config string must end with a ';")
 	}
 	return opts, nil
 }
