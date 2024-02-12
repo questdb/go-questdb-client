@@ -104,7 +104,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 		env["QDB_LINE_TCP_AUTH_DB_PATH"] = "/auth/questdb.auth.txt"
 	}
 
-	path, err := filepath.Abs("./test")
+	path, err := filepath.Abs("../test")
 	if err != nil {
 		return nil, err
 	}
