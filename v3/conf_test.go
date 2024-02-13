@@ -22,66 +22,132 @@
  *
  ******************************************************************************/
 
-package v3_test
+package v3
 
 import (
-	"context"
 	"fmt"
 	"testing"
+	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 )
 
 type configTestCase struct {
-	name         string
-	config       string
-	expectedOpts []qdb.LineSenderOption
-	expectedErr  error
+	name     string
+	config   string
+	expected LineSender
 }
 
-func TestFromConf(t *testing.T) {
-	srv, err := newTestServer(readAndDiscard)
-	assert.NoError(t, err)
-	defer srv.close()
+func TestHappyCasesFromConf(t *testing.T) {
+
+	var (
+		addr           = "localhost:1111"
+		user           = "test-user"
+		pass           = "test-pass"
+		token          = "test-token"
+		min_throughput = 999
+		grace_timeout  = time.Second * 88
+		retry_timeout  = time.Second * 99
+	)
 
 	testCases := []configTestCase{
 		{
 			name:   "http and address",
-			config: fmt.Sprintf("http::addr=%s;", srv.addr),
-			expectedOpts: []qdb.LineSenderOption{
-				qdb.WithHttp(),
-				qdb.WithAddress(srv.addr),
+			config: fmt.Sprintf("http::addr=%s", addr),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
 			},
 		},
 		{
 			name:   "tcp and address",
-			config: fmt.Sprintf("tcp::addr=%s;", srv.addr),
-			expectedOpts: []qdb.LineSenderOption{
-				qdb.WithTcp(),
-				qdb.WithAddress(srv.addr),
+			config: fmt.Sprintf("tcp::addr=%s", addr),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolTcp,
+			},
+		},
+		{
+			name:   "http and username/password",
+			config: fmt.Sprintf("http::addr=%s;user=%s;pass=%s", addr, user, pass),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				user:              user,
+				pass:              pass,
+			},
+		},
+		{
+			name:   "http and token (with trailing ';')",
+			config: fmt.Sprintf("http::addr=%s;token=%s;", addr, token),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				token:             token,
+			},
+		},
+		{
+			name:   "tcp with user and key",
+			config: fmt.Sprintf("tcp::addr=%s;user=%s;token=%s", addr, user, token),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolTcp,
+				keyId:             user,
+				key:               token,
+			},
+		},
+		{
+			name:   "tcp with key and user",
+			config: fmt.Sprintf("tcp::addr=%s;token=%s;user=%s", addr, token, user),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolTcp,
+				keyId:             user,
+				key:               token,
+			},
+		},
+		{
+			name:   "https with min_throughput",
+			config: fmt.Sprintf("https::addr=%s;min_throughput=%d", addr, min_throughput),
+			expected: LineSender{
+				address:                     addr,
+				transportProtocol:           protocolHttp,
+				minThroughputBytesPerSecond: min_throughput,
+				tlsMode:                     tlsEnabled,
+			},
+		},
+		{
+			name:   "tcps with tls_verify=unsafe_off",
+			config: fmt.Sprintf("tcps::addr=%s;tls_verify=unsafe_off", addr),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolTcp,
+				tlsMode:           tlsInsecureSkipVerify,
+			},
+		},
+		{
+			name: "http with min_throughput, grace_timeout, and retry_timeout",
+			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;grace_timeout=%d;retry_timeout=%d",
+				addr, min_throughput, int(grace_timeout), int(retry_timeout)),
+			expected: LineSender{
+				address:                     addr,
+				transportProtocol:           protocolHttp,
+				minThroughputBytesPerSecond: min_throughput,
+				graceTimeout:                grace_timeout,
+				retryTimeout:                retry_timeout,
 			},
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 
-			actual, actualErr := qdb.FromConf(context.TODO(), tc.config)
-			if actualErr != nil {
-				assert.ErrorIs(t, actualErr, tc.expectedErr)
-				assert.ErrorContains(t, actualErr, tc.expectedErr.Error())
-				return
-			} else {
-				assert.NoError(t, tc.expectedErr)
+			opts, err := parseConfigString(tc.config)
+			actual := LineSender{}
+			for _, opt := range opts {
+				opt(&actual)
 			}
-
-			defer actual.Close()
-
-			expected, err := qdb.NewLineSender(context.TODO(), tc.expectedOpts...)
 			assert.NoError(t, err)
-			defer expected.Close()
-
-			assert.EqualValues(t, expected, actual)
+			assert.Equal(t, tc.expected, actual)
 
 		})
 

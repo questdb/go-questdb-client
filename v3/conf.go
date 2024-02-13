@@ -70,6 +70,11 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 		return opts, NewConfigStrParseError("invalid schema %q", schema)
 	}
 
+	// Add trailing ';'
+	if !strings.HasSuffix(conf, ";") {
+		conf = conf + ";"
+	}
+
 	keyValueStr := []rune(conf)
 	for idx, rune := range keyValueStr {
 		if idx > 0 {
@@ -78,8 +83,7 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 		switch rune {
 		case ';':
 			if isKey {
-				key.WriteRune(rune)
-				continue
+				return opts, NewConfigStrParseError("invalid key character ';'")
 			}
 
 			if isEscaping {
@@ -111,8 +115,13 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 				}
 			case "token":
 				token = value.String()
-				if token != "" && user != "" {
-					opts = append(opts, WithAuth(user, token))
+				switch schema {
+				case schemaHttp, schemaHttps:
+					opts = append(opts, WithBearerToken(token))
+				case schemaTcp, schemaTcps:
+					if token != "" && user != "" {
+						opts = append(opts, WithAuth(user, token))
+					}
 				}
 			case "auto_flush", "auto_flush_rows", "auto_flush_bytes":
 				if value.String() == "on" {
@@ -136,15 +145,15 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 				}
 
 			case "grace_timeout", "retry_timeout":
-				timeout, err := time.ParseDuration(value.String())
+				timeout, err := strconv.Atoi(value.String())
 				if err != nil {
-					return opts, NewConfigStrParseError("invalid %s value, %q is not a valid duration", key, value)
+					return opts, NewConfigStrParseError("invalid %s value, %q is not a valid int", key, value)
 				}
 				switch key.String() {
 				case "grace_timeout":
-					opts = append(opts, WithGraceTimeout(timeout))
+					opts = append(opts, WithGraceTimeout(time.Duration(timeout)))
 				case "retry_timeout":
-					opts = append(opts, WithRetryTimeout(timeout))
+					opts = append(opts, WithRetryTimeout(time.Duration(timeout)))
 				default:
 					panic("add a case for " + key.String())
 				}
@@ -183,9 +192,5 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 		}
 	}
 
-	// Check if value buffer is empty
-	if value.Len() > 0 {
-		return opts, NewConfigStrParseError("config string must end with a ';")
-	}
 	return opts, nil
 }

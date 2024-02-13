@@ -85,6 +85,7 @@ type LineSender struct {
 	key   string // Erased once auth is done.
 	user  string // Erased once auth is done.
 	pass  string // Erased once auth is done.
+	token string // Erased once auth is done.
 
 	bufCap        int
 	fileNameLimit int
@@ -206,6 +207,12 @@ func WithHttp() LineSenderOption {
 func WithTcp() LineSenderOption {
 	return func(s *LineSender) {
 		s.transportProtocol = protocolTcp
+	}
+}
+
+func WithBearerToken(token string) LineSenderOption {
+	return func(s *LineSender) {
+		s.token = token
 	}
 }
 
@@ -332,7 +339,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		if s.address == "" {
 			s.address = "127.0.0.1:9000"
 		}
-		// todo: configure http client
+		// todo: configure http client with retry logic
 		s.httpClient = http.Client{}
 	default:
 		panic("unsupported protocol " + s.transportProtocol)
@@ -926,8 +933,8 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	url += fmt.Sprintf("://%s/write", s.address)
 
 	// timeout = ( request.len() / min_throughput ) + grace
-	// Conversion from int to time.Duration is in milliseconds
-	timeout := time.Duration((s.buf.Len()/s.minThroughputBytesPerSecond)+int(s.graceTimeout.Milliseconds())) * time.Millisecond
+	// Conversion from int to time.Duration is in milliseconds and grace is in millis
+	timeout := time.Duration((s.buf.Len() / s.minThroughputBytesPerSecond) + int(s.graceTimeout.Milliseconds()))
 	println(timeout)
 	reqCtx, cancelFunc := context.WithTimeout(ctx, timeout)
 
