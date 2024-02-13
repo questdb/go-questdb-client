@@ -45,10 +45,11 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 		value = &strings.Builder{}
 		isKey = true
 
-		lastRune          rune
-		isEscaping        bool
-		opts              []LineSenderOption
-		user, pass, token string
+		nextRune             rune
+		isEscaping           bool
+		hasTrailingSemicolon bool
+		opts                 []LineSenderOption
+		user, pass, token    string
 	)
 
 	schemaStr, conf, found := strings.Cut(string(conf), "::")
@@ -70,30 +71,40 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 		return opts, NewConfigStrParseError("invalid schema %q", schema)
 	}
 
-	// Add trailing ';'
-	if !strings.HasSuffix(conf, ";") {
-		conf = conf + ";"
+	if len(conf) == 0 {
+		return opts, NewConfigStrParseError("'addr' key not found")
+	}
+
+	if strings.HasSuffix(conf, ";") {
+		hasTrailingSemicolon = true
+	} else {
+		conf = conf + ";" // add trailing semicolon
 	}
 
 	keyValueStr := []rune(conf)
 	for idx, rune := range keyValueStr {
-		if idx > 0 {
-			lastRune = keyValueStr[idx-1]
+		if idx < len(conf)-1 {
+			nextRune = keyValueStr[idx+1]
+		} else {
+			nextRune = 0
 		}
 		switch rune {
 		case ';':
 			if isKey {
+				if nextRune == 0 && !hasTrailingSemicolon {
+					return opts, NewConfigStrParseError("unexpected end of string")
+				}
 				return opts, NewConfigStrParseError("invalid key character ';'")
+			}
+
+			if !isEscaping && nextRune == ';' {
+				isEscaping = true
+				continue
 			}
 
 			if isEscaping {
 				value.WriteRune(rune)
 				isEscaping = false
-				continue
-			}
-
-			if !isEscaping && lastRune == ';' {
-				isEscaping = true
 				continue
 			}
 
@@ -190,6 +201,10 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 				value.WriteRune(rune)
 			}
 		}
+	}
+
+	if isEscaping {
+		return opts, NewConfigStrParseError("unescaped ';'")
 	}
 
 	return opts, nil

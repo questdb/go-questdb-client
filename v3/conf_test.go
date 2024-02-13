@@ -33,9 +33,10 @@ import (
 )
 
 type configTestCase struct {
-	name     string
-	config   string
-	expected LineSender
+	name                   string
+	config                 string
+	expected               LineSender
+	expectedErrMsgContains string
 }
 
 func TestHappyCasesFromConf(t *testing.T) {
@@ -137,6 +138,45 @@ func TestHappyCasesFromConf(t *testing.T) {
 				retryTimeout:                retry_timeout,
 			},
 		},
+		{
+			name:   "tcp with tls_verify=on",
+			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on", addr),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolTcp,
+				tlsMode:           tlsEnabled,
+			},
+		},
+		{
+			name:   "password with an escaped semicolon",
+			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word", addr, user),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				user:              user,
+				pass:              "pass;word",
+			},
+		},
+		{
+			name:   "password with an escaped semicolon (ending with a ';')",
+			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word;", addr, user),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				user:              user,
+				pass:              "pass;word",
+			},
+		},
+		{
+			name:   "password with a trailing semicolon",
+			config: fmt.Sprintf("http::addr=%s;user=%s;pass=password;;;", addr, user),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				user:              user,
+				pass:              "password;",
+			},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -153,4 +193,77 @@ func TestHappyCasesFromConf(t *testing.T) {
 
 	}
 
+}
+
+func TestPathologicalCasesFromConf(t *testing.T) {
+
+	testCases := []configTestCase{
+		{
+			name:                   "empty config",
+			config:                 "",
+			expectedErrMsgContains: "no schema separator found",
+		},
+		{
+			name:                   "no schema",
+			config:                 "addr=localhost:9000",
+			expectedErrMsgContains: "no schema separator found",
+		},
+		{
+			name:                   "no address",
+			config:                 "http::",
+			expectedErrMsgContains: "'addr' key not found",
+		},
+		{
+			name:                   "invalid schema",
+			config:                 "invalid::addr=localhost:9000",
+			expectedErrMsgContains: "invalid schema",
+		},
+		{
+			name:                   "auto_flush option",
+			config:                 "http::addr=localhost:9000;auto_flush=on",
+			expectedErrMsgContains: "auto_flush option not available for this client",
+		},
+		{
+			name:                   "invalid min_throughput",
+			config:                 "http::addr=localhost:9000;min_throughput=not-a-number",
+			expectedErrMsgContains: "invalid min_throughput value",
+		},
+		{
+			name:                   "invalid grace_timeout",
+			config:                 "http::addr=localhost:9000;grace_timeout=not-a-number",
+			expectedErrMsgContains: "invalid grace_timeout value",
+		},
+		{
+			name:                   "invalid retry_timeout",
+			config:                 "http::addr=localhost:9000;retry_timeout=not-a-number",
+			expectedErrMsgContains: "invalid retry_timeout value",
+		},
+		{
+			name:                   "invalid init_buf_size",
+			config:                 "http::addr=localhost:9000;init_buf_size=not-a-number",
+			expectedErrMsgContains: "invalid init_buf_size value",
+		},
+		{
+			name:                   "invalid max_buf_size",
+			config:                 "http::addr=localhost:9000;max_buf_size=not-a-number",
+			expectedErrMsgContains: "invalid max_buf_size value",
+		},
+		{
+			name:                   "unescaped semicolon in password leads to unexpected end of string",
+			config:                 "http::addr=localhost:9000;user=test;pass=pass;word",
+			expectedErrMsgContains: "unexpected end of string",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+
+			_, err := parseConfigString(tc.config)
+			var expected *ConfigStrParseError
+			assert.Error(t, err)
+			assert.ErrorAs(t, err, &expected)
+			assert.Contains(t, err.Error(), tc.expectedErrMsgContains)
+
+		})
+
+	}
 }
