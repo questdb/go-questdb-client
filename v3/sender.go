@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	mathRand "math/rand"
 	"net"
 	"net/http"
 	"strconv"
@@ -926,6 +927,13 @@ func (s *LineSender) flushTcp(ctx context.Context) error {
 }
 
 func (s *LineSender) flushHttp(ctx context.Context) error {
+	var (
+		err           error
+		req           *http.Request
+		retryInterval time.Duration
+
+		maxRetryInterval = time.Second
+	)
 	url := string(s.transportProtocol)
 	if s.tlsMode > 0 {
 		url += "s"
@@ -937,7 +945,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	timeout := time.Duration(s.buf.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
 	reqCtx, cancelFunc := context.WithTimeout(ctx, timeout)
 
-	req, err := http.NewRequestWithContext(
+	req, err = http.NewRequestWithContext(
 		reqCtx,
 		http.MethodPost,
 		url,
@@ -948,10 +956,39 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 		return err
 	}
 
-	// todo: process the response somehow?
 	_, err = s.httpClient.Do(req)
+	if err == nil {
+		cancelFunc()
+		return err
+	}
 
-	// Cancel the context to release resources?
+	// Retry logic from Java client: https://github.com/questdb/c-questdb-client/issues/51
+
+	if s.retryTimeout > 0 {
+		retryBegin := time.Now()
+		retryInterval = 10 * time.Millisecond
+		for {
+			jitter := time.Duration(mathRand.Intn(10)) * time.Millisecond
+			time.Sleep(retryInterval + jitter)
+
+			_, err = s.httpClient.Do(req)
+			if err == nil {
+				cancelFunc()
+				return err
+			}
+
+			elapsed := time.Since(retryBegin)
+			if elapsed > s.retryTimeout {
+				cancelFunc()
+				return err
+			}
+			retryInterval = retryInterval * 2
+			if retryInterval > maxRetryInterval {
+				retryInterval = maxRetryInterval
+			}
+		}
+	}
+
 	cancelFunc()
 
 	return err
