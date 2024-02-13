@@ -934,8 +934,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 
 	// timeout = ( request.len() / min_throughput ) + grace
 	// Conversion from int to time.Duration is in milliseconds and grace is in millis
-	timeout := time.Duration((s.buf.Len() / s.minThroughputBytesPerSecond) + int(s.graceTimeout.Milliseconds()))
-	println(timeout)
+	timeout := time.Duration(s.buf.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
 	reqCtx, cancelFunc := context.WithTimeout(ctx, timeout)
 
 	req, err := http.NewRequestWithContext(
