@@ -177,6 +177,17 @@ func TestHappyCasesFromConf(t *testing.T) {
 				pass:              "password;",
 			},
 		},
+		{
+			name: "ignore unknown options",
+			config: fmt.Sprintf("http::addr=%s;unknown_option=unknown_value;user=%s;pass=%s",
+				addr, user, pass),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				user:              user,
+				pass:              pass,
+			},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -221,7 +232,17 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 		{
 			name:                   "auto_flush option",
 			config:                 "http::addr=localhost:9000;auto_flush=on",
-			expectedErrMsgContains: "auto_flush option not available for this client",
+			expectedErrMsgContains: "auto_flush option is not supported",
+		},
+		{
+			name:                   "auto_flush_rows option",
+			config:                 "http::addr=localhost:9000;auto_flush_rows=100",
+			expectedErrMsgContains: "auto_flush option is not supported",
+		},
+		{
+			name:                   "auto_flush_bytes option",
+			config:                 "http::addr=localhost:9000;auto_flush_bytes=100",
+			expectedErrMsgContains: "auto_flush option is not supported",
 		},
 		{
 			name:                   "invalid min_throughput",
@@ -252,6 +273,16 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			name:                   "unescaped semicolon in password leads to unexpected end of string",
 			config:                 "http::addr=localhost:9000;user=test;pass=pass;word",
 			expectedErrMsgContains: "unexpected end of string",
+		},
+		{
+			name:                   "unescaped semicolon in password leads to invalid key character",
+			config:                 "http::addr=localhost:9000;user=test;pass=pass;word;",
+			expectedErrMsgContains: "invalid key character ';'",
+		},
+		{
+			name:                   "unsupported option",
+			config:                 "http::addr=localhost:9000;unsupported_option=unsupported_value",
+			expectedErrMsgContains: "unsupported option",
 		},
 	}
 	for _, tc := range testCases {

@@ -134,10 +134,12 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 						opts = append(opts, WithAuth(user, token))
 					}
 				}
-			case "auto_flush", "auto_flush_rows", "auto_flush_bytes":
+			case "auto_flush":
 				if value.String() == "on" {
-					return opts, NewConfigStrParseError("auto_flush option not available for this client")
+					return opts, NewConfigStrParseError("auto_flush option is not supported")
 				}
+			case "auto_flush_rows", "auto_flush_bytes":
+				return opts, NewConfigStrParseError("auto_flush option is not supported")
 			case "min_throughput", "init_buf_size", "max_buf_size":
 				parsedVal, err := strconv.Atoi(value.String())
 				if err != nil {
@@ -182,7 +184,7 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 			case "tls_roots_password":
 				return opts, NewConfigStrParseError("tls_roots_password is not available in the go client")
 			default:
-				return opts, NewConfigStrParseError("unsupported config key %q", key)
+				return opts, NewConfigStrParseError("unsupported option %q", key)
 			}
 
 			key.Reset()
