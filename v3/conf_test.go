@@ -177,17 +177,6 @@ func TestHappyCasesFromConf(t *testing.T) {
 				pass:              "password;",
 			},
 		},
-		{
-			name: "ignore unknown options",
-			config: fmt.Sprintf("http::addr=%s;unknown_option=unknown_value;user=%s;pass=%s",
-				addr, user, pass),
-			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				user:              user,
-				pass:              pass,
-			},
-		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

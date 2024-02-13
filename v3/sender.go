@@ -944,6 +944,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	// Conversion from int to time.Duration is in milliseconds and grace is in millis
 	timeout := time.Duration(s.buf.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
 	reqCtx, cancelFunc := context.WithTimeout(ctx, timeout)
+	defer cancelFunc()
 
 	req, err = http.NewRequestWithContext(
 		reqCtx,
@@ -952,13 +953,11 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 		s.buf,
 	)
 	if err != nil {
-		cancelFunc()
 		return err
 	}
 
 	_, err = s.httpClient.Do(req)
 	if err == nil {
-		cancelFunc()
 		return err
 	}
 
@@ -973,13 +972,11 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 
 			_, err = s.httpClient.Do(req)
 			if err == nil {
-				cancelFunc()
 				return err
 			}
 
 			elapsed := time.Since(retryBegin)
 			if elapsed > s.retryTimeout {
-				cancelFunc()
 				return err
 			}
 			retryInterval = retryInterval * 2
@@ -988,8 +985,6 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 			}
 		}
 	}
-
-	cancelFunc()
 
 	return err
 }
