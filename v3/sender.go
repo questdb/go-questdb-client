@@ -340,11 +340,34 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		if s.address == "" {
 			s.address = "127.0.0.1:9000"
 		}
-		// todo: configure http client with retry logic
-		s.httpClient = http.Client{}
+
+		// Transport copied from http.DefaultTransport
+		tr := &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: defaultTransportDialContext(&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}),
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+
+		switch s.tlsMode {
+		case tlsInsecureSkipVerify:
+			tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		case tlsDisabled:
+			tr.TLSClientConfig = nil
+		}
+
+		s.httpClient = http.Client{
+			Transport: tr,
+		}
+
 	default:
 		panic("unsupported protocol " + s.transportProtocol)
-
 	}
 
 	s.buf = newBuffer(s.initBufSizeBytes, s.bufCap)
@@ -961,7 +984,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	}
 
 	if s.token != "" {
-		req.Header.Add("Authentication", fmt.Sprintf("Bearer %s", s.token))
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
 	}
 
 	_, err = s.httpClient.Do(req)
@@ -969,24 +992,24 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 		return err
 	}
 
-	// Retry logic from Java client: https://github.com/questdb/c-questdb-client/issues/51
-
 	if s.retryTimeout > 0 {
-		retryBegin := time.Now()
 		retryInterval = 10 * time.Millisecond
 		for {
 			jitter := time.Duration(mathRand.Intn(10)) * time.Millisecond
 			time.Sleep(retryInterval + jitter)
 
-			_, err = s.httpClient.Do(req)
-			if err == nil {
-				return err
+			_, retryErr := s.httpClient.Do(req)
+			if err != nil {
+				if errors.Is(retryErr, context.DeadlineExceeded) {
+					return err
+				}
+				err = retryErr
 			}
 
-			elapsed := time.Since(retryBegin)
-			if elapsed > s.retryTimeout {
-				return err
+			if err == nil {
+				return nil
 			}
+
 			retryInterval = retryInterval * 2
 			if retryInterval > maxRetryInterval {
 				retryInterval = maxRetryInterval
@@ -1054,4 +1077,8 @@ func (b *buffer) WriteBigInt(i *big.Int) {
 	var a [64]byte
 	s := i.Append(a[0:0], 16)
 	b.Write(s)
+}
+
+func defaultTransportDialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return dialer.DialContext
 }
