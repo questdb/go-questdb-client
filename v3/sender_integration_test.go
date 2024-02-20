@@ -46,7 +46,7 @@ import (
 
 const (
 	testTable           = "my_test_table"
-	networkName         = "test-network"
+	networkName         = "test-network-v3"
 	eventualDataTimeout = 60 * time.Second
 )
 
