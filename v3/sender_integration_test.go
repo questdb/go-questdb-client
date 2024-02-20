@@ -170,7 +170,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	if setupProxy {
 		req = testcontainers.ContainerRequest{
 			Image:        "haproxy:2.6.0",
-			ExposedPorts: []string{"8443/tcp", "8888/tcp"},
+			ExposedPorts: []string{"8443/tcp", "8444/tcp", "8888/tcp"},
 			WaitingFor:   wait.ForHTTP("/").WithPort("8888"),
 			Networks:     []string{networkName},
 			Mounts: testcontainers.Mounts(testcontainers.ContainerMount{

@@ -118,6 +118,17 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
+			name:   "https with min_throughput, init_buf_size and tls_verify=unsafe_off",
+			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;init_buf_size=%d;tls_verify=unsafe_off", addr, min_throughput, 1024),
+			expected: LineSender{
+				address:                     addr,
+				transportProtocol:           protocolHttp,
+				minThroughputBytesPerSecond: min_throughput,
+				initBufSizeBytes:            1024,
+				tlsMode:                     tlsInsecureSkipVerify,
+			},
+		},
+		{
 			name:   "tcps with tls_verify=unsafe_off",
 			config: fmt.Sprintf("tcps::addr=%s;tls_verify=unsafe_off", addr),
 			expected: LineSender{
@@ -175,6 +186,26 @@ func TestHappyCasesFromConf(t *testing.T) {
 				transportProtocol: protocolHttp,
 				user:              user,
 				pass:              "password;",
+			},
+		},
+		{
+			name:   "equal sign in password",
+			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass=word", addr, user),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				user:              user,
+				pass:              "pass=word",
+			},
+		},
+		{
+			name:   "basic auth with password first",
+			config: fmt.Sprintf("http::addr=%s;pass=pass;user=%s", addr, user),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				user:              user,
+				pass:              "pass",
 			},
 		},
 	}
@@ -273,7 +304,23 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			config:                 "http::addr=localhost:9000;unsupported_option=unsupported_value",
 			expectedErrMsgContains: "unsupported option",
 		},
+		{
+			name:                   "invalid tls_verify value",
+			config:                 "http::addr=localhost:9000;tls_verify=invalid",
+			expectedErrMsgContains: "invalid tls_verify value",
+		},
+		{
+			name:                   "invalid tls_roots value",
+			config:                 "http::addr=localhost:9000;tls_roots=invalid",
+			expectedErrMsgContains: "tls_roots is not available",
+		},
+		{
+			name:                   "invalid tls_roots_passwore value",
+			config:                 "http::addr=localhost:9000;tls_roots_password=invalid",
+			expectedErrMsgContains: "tls_roots_password is not available",
+		},
 	}
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 

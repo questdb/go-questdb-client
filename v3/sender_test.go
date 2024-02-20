@@ -85,29 +85,42 @@ func TestValidWrites(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
-			assert.NoError(t, err)
+		for _, protocol := range []string{"http", "tcp"} {
+			t.Run(fmt.Sprintf("%s: %s", protocol, tc.name), func(t *testing.T) {
+				var (
+					sender *qdb.LineSender
+					err    error
+				)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
-			assert.NoError(t, err)
+				srv, err := newTestServerWithProtocol(sendToBackChannel, protocol)
+				assert.NoError(t, err)
 
-			err = tc.writerFn(sender)
-			assert.NoError(t, err)
+				switch protocol {
+				case "http":
+					sender, err = qdb.FromConf(ctx, "http::addr="+srv.addr+";")
+				case "tcp":
+					sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+				}
+				assert.NoError(t, err)
 
-			// Check the buffer before flushing it.
-			assert.Equal(t, strings.Join(tc.expectedLines, "\n")+"\n", sender.Messages())
+				err = tc.writerFn(sender)
+				assert.NoError(t, err)
 
-			err = sender.Flush(ctx)
-			assert.NoError(t, err)
+				// Check the buffer before flushing it.
+				assert.Equal(t, strings.Join(tc.expectedLines, "\n")+"\n", sender.Messages())
 
-			sender.Close()
+				err = sender.Flush(ctx)
+				assert.NoError(t, err)
 
-			// Now check what was received by the server.
-			expectLines(t, srv.backCh, tc.expectedLines)
+				sender.Close()
 
-			srv.close()
-		})
+				// Now check what was received by the server.
+				expectLines(t, srv.backCh, tc.expectedLines)
+
+				srv.close()
+			})
+		}
+
 	}
 }
 
@@ -612,51 +625,86 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 	assert.NoError(b, err)
 	defer srv.close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
-	assert.NoError(b, err)
-	defer sender.Close()
+	for _, protocol := range []string{"http", "tcp"} {
+		b.Run(protocol, func(b *testing.B) {
+			var (
+				sender *qdb.LineSender
+				err    error
+			)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		for j := 0; j < 1000; j++ {
-			sender.
-				Table(testTable).
-				Symbol("sym_col", "test_ilp1").
-				Float64Column("double_col", float64(i)+0.42).
-				Int64Column("long_col", int64(i)).
-				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
-				BoolColumn("bool_col", true).
-				TimestampColumn("timestamp_col", time.UnixMicro(42)).
-				At(ctx, time.UnixMicro(int64(1000*i)))
-		}
-		sender.Flush(ctx)
+			srv, err := newTestServerWithProtocol(readAndDiscard, protocol)
+			assert.NoError(b, err)
+
+			switch protocol {
+			case "http":
+				_, err = qdb.FromConf(ctx, "http::addr="+srv.addr+";")
+			case "tcp":
+				sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			}
+			assert.NoError(b, err)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for j := 0; j < 1000; j++ {
+					sender.
+						Table(testTable).
+						Symbol("sym_col", "test_ilp1").
+						Float64Column("double_col", float64(i)+0.42).
+						Int64Column("long_col", int64(i)).
+						StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
+						BoolColumn("bool_col", true).
+						TimestampColumn("timestamp_col", time.UnixMicro(42)).
+						At(ctx, time.UnixMicro(int64(1000*i)))
+				}
+				sender.Flush(ctx)
+				sender.Close()
+				srv.close()
+			}
+		})
 	}
+
 }
 
 func BenchmarkLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(readAndDiscard)
-	assert.NoError(b, err)
-	defer srv.close()
+	for _, protocol := range []string{"http", "tcp"} {
+		b.Run(protocol, func(b *testing.B) {
+			var (
+				sender *qdb.LineSender
+				err    error
+			)
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
-	assert.NoError(b, err)
-	defer sender.Close()
+			srv, err := newTestServerWithProtocol(readAndDiscard, protocol)
+			assert.NoError(b, err)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		sender.
-			Table(testTable).
-			Symbol("sym_col", "test_ilp1").
-			Float64Column("double_col", float64(i)+0.42).
-			Int64Column("long_col", int64(i)).
-			StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
-			BoolColumn("bool_col", true).
-			TimestampColumn("timestamp_col", time.UnixMicro(42)).
-			At(ctx, time.UnixMicro(int64(1000*i)))
+			switch protocol {
+			case "http":
+				sender, err = qdb.FromConf(ctx, "http::addr="+srv.addr+";")
+			case "tcp":
+				sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			}
+
+			assert.NoError(b, err)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				sender.
+					Table(testTable).
+					Symbol("sym_col", "test_ilp1").
+					Float64Column("double_col", float64(i)+0.42).
+					Int64Column("long_col", int64(i)).
+					StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
+					BoolColumn("bool_col", true).
+					TimestampColumn("timestamp_col", time.UnixMicro(42)).
+					At(ctx, time.UnixMicro(int64(1000*i)))
+			}
+			sender.Flush(ctx)
+			sender.Close()
+			srv.close()
+		})
 	}
-	sender.Flush(ctx)
+
 }
 
 func expectLines(t *testing.T, linesCh chan string, expected []string) {
