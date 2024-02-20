@@ -956,6 +956,14 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 		return err
 	}
 
+	if s.user != "" && s.pass != "" {
+		req.SetBasicAuth(s.user, s.pass)
+	}
+
+	if s.token != "" {
+		req.Header.Add("Authentication", fmt.Sprintf("Bearer %s", s.token))
+	}
+
 	_, err = s.httpClient.Do(req)
 	if err == nil {
 		return err
