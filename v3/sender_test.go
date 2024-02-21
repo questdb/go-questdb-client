@@ -592,7 +592,7 @@ func TestErrorOnCancelledContext(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestErrorOnContextDeadline(t *testing.T) {
+func TestErrorOnContextDeadlineTcp(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
 
@@ -617,6 +617,53 @@ func TestErrorOnContextDeadline(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fail()
+}
+
+func TestErrorOnContextDeadlineHttp(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
+	defer cancel()
+
+	srv, err := newTestHttpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s", srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	// Keep writing until we get an error due to the context deadline.
+	for i := 0; i < 100_000; i++ {
+		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+		if err != nil {
+			return
+		}
+		err = sender.Flush(ctx)
+		if err != nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fail()
+}
+
+func TestErrorOnInternalServerError(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestHttpServer(returningError)
+	assert.NoError(t, err)
+	defer srv.close()
+
+	sender, err := qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s;retry_timeout=100000", srv.addr))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	if err != nil {
+		return
+	}
+	err = sender.Flush(ctx)
+	assert.ErrorContains(t, err, "500")
+
 }
 
 func BenchmarkLineSenderBatch1000(b *testing.B) {
@@ -726,6 +773,7 @@ type serverType int64
 const (
 	sendToBackChannel serverType = 0
 	readAndDiscard    serverType = 1
+	returningError    serverType = 2
 )
 
 type testServer struct {
@@ -754,7 +802,6 @@ func newTestServerWithProtocol(serverType serverType, protocol string) (*testSer
 	case "tcp":
 		s.wg.Add(1)
 		go s.serveTcp()
-
 	case "http":
 		go s.serveHttp()
 	default:
@@ -766,6 +813,10 @@ func newTestServerWithProtocol(serverType serverType, protocol string) (*testSer
 
 func newTestTcpServer(serverType serverType) (*testServer, error) {
 	return newTestServerWithProtocol(serverType, "tcp")
+}
+
+func newTestHttpServer(serverType serverType) (*testServer, error) {
+	return newTestServerWithProtocol(serverType, "http")
 }
 
 func (s *testServer) serveTcp() {
@@ -874,7 +925,8 @@ func (s *testServer) serveHttp() {
 			}
 		case readAndDiscard:
 			_, err = io.Copy(ioutil.Discard, r.Body)
-
+		case returningError:
+			w.WriteHeader(http.StatusInternalServerError)
 		default:
 			panic(fmt.Sprintf("server type is not supported: %d", s.serverType))
 		}

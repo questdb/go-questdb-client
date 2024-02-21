@@ -682,7 +682,7 @@ func TestE2EFailedAuth(t *testing.T) {
 	assert.Equal(t, 0, data.Count)
 }
 
-func TestE2ESuccessfulHttpsBasicAuth(t *testing.T) {
+func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -728,7 +728,6 @@ func TestE2ESuccessfulHttpsBasicAuth(t *testing.T) {
 		data := queryTableData(t, testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
-
 }
 
 func TestE2EWritesWithTlsProxy(t *testing.T) {

@@ -987,9 +987,12 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
 	}
 
-	_, err = s.httpClient.Do(req)
+	resp, err := s.httpClient.Do(req)
+	if resp.StatusCode >= 400 {
+		err = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
+	}
 	if err == nil {
-		return err
+		return nil
 	}
 
 	if s.retryTimeout > 0 {
@@ -998,17 +1001,20 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 			jitter := time.Duration(mathRand.Intn(10)) * time.Millisecond
 			time.Sleep(retryInterval + jitter)
 
-			_, retryErr := s.httpClient.Do(req)
-			if err != nil {
-				if errors.Is(retryErr, context.DeadlineExceeded) {
-					return err
-				}
-				err = retryErr
+			resp, retryErr := s.httpClient.Do(req)
+			if resp.StatusCode >= 400 {
+				retryErr = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 			}
 
-			if err == nil {
+			if retryErr == nil {
 				return nil
 			}
+
+			if errors.Is(retryErr, context.DeadlineExceeded) {
+				return retryErr
+			}
+			panic("figure this flow out...")
+			err = retryErr
 
 			retryInterval = retryInterval * 2
 			if retryInterval > maxRetryInterval {
