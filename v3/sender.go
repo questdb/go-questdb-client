@@ -41,6 +41,7 @@ import (
 	mathRand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 )
@@ -974,11 +975,11 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 
 		maxRetryInterval = time.Second
 	)
-	url := string(s.transportProtocol)
+	uri := string(s.transportProtocol)
 	if s.tlsMode > 0 {
-		url += "s"
+		uri += "s"
 	}
-	url += fmt.Sprintf("://%s/write", s.address)
+	uri += fmt.Sprintf("://%s/write", s.address)
 
 	// timeout = ( request.len() / min_throughput ) + grace
 	// Conversion from int to time.Duration is in milliseconds and grace is in millis
@@ -989,7 +990,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	req, err = http.NewRequestWithContext(
 		reqCtx,
 		http.MethodPost,
-		url,
+		uri,
 		s.buf,
 	)
 	if err != nil {
@@ -1005,11 +1006,11 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	}
 
 	resp, err := s.httpClient.Do(req)
-	if isRetryableError(resp.StatusCode) {
-		err = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
-	}
 	if err == nil {
-		return nil
+		if !isRetryableError(resp.StatusCode) {
+			return nil
+		}
+		err = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 	}
 
 	if s.retryTimeout > 0 {
@@ -1019,17 +1020,20 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 			time.Sleep(retryInterval + jitter)
 
 			resp, retryErr := s.httpClient.Do(req)
-			if isRetryableError(resp.StatusCode) {
+			if retryErr == nil {
+				if !isRetryableError(resp.StatusCode) {
+					return nil
+				}
 				retryErr = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 			}
 
-			if retryErr == nil {
-				return nil
+			var urlErr *url.Error
+			if errors.As(retryErr, &urlErr) {
+				if urlErr.Timeout() {
+					return err
+				}
 			}
 
-			if errors.Is(retryErr, context.DeadlineExceeded) {
-				return err
-			}
 			err = retryErr
 
 			retryInterval = retryInterval * 2

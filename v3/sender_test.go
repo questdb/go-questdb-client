@@ -646,14 +646,14 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	t.Fail()
 }
 
-func TestErrorOnInternalServerError(t *testing.T) {
+func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 	ctx := context.Background()
 
 	srv, err := newTestHttpServer(returningError)
 	assert.NoError(t, err)
 	defer srv.close()
 
-	sender, err := qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s;retry_timeout=100000", srv.addr))
+	sender, err := qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s;retry_timeout=1000", srv.addr))
 	assert.NoError(t, err)
 	defer sender.Close()
 
