@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package v2_test
+package v3_test
 
 import (
 	"context"
@@ -41,22 +41,24 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	qdb "github.com/questdb/go-questdb-client/v2"
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 const (
 	testTable           = "my_test_table"
-	networkName         = "test-network-v2"
+	networkName         = "test-network-v3"
 	eventualDataTimeout = 60 * time.Second
 )
 
 type questdbContainer struct {
 	testcontainers.Container
-	proxyC          testcontainers.Container
-	network         testcontainers.Network
-	httpAddress     string
-	ilpAddress      string
-	proxyIlpAddress string
+	proxyC                       testcontainers.Container
+	network                      testcontainers.Network
+	httpAddress                  string
+	ilpAddress                   string
+	proxyIlpAddress              string
+	proxyIlpHttpAddress          string
+	proxyIlpHttpBasicAuthAddress string
 }
 
 func (c *questdbContainer) Stop(ctx context.Context) error {
@@ -80,8 +82,16 @@ func (c *questdbContainer) Stop(ctx context.Context) error {
 type ilpAuthType int64
 
 const (
-	noAuth      ilpAuthType = 0
-	authEnabled ilpAuthType = 1
+	noAuth         ilpAuthType = 0
+	authEnabled    ilpAuthType = 1
+	httpBasicAuth  ilpAuthType = 2
+	httpBearerAuth ilpAuthType = 3
+)
+
+const (
+	basicAuthUser = "joe"
+	basicAuthPass = "joespassword"
+	bearerToken   = "testToken1"
 )
 
 func setupQuestDB(ctx context.Context, auth ilpAuthType) (*questdbContainer, error) {
@@ -97,19 +107,27 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	env := map[string]string{
 		"QDB_CAIRO_MAX_UNCOMMITTED_ROWS":        "1",
 		"QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL": "100",
-		"QDB_PG_ENABLED":                        "false",
+		"QDB_PG_ENABLED":                        "true",
 		"QDB_HTTP_MIN_ENABLED":                  "false",
-	}
-	if auth == authEnabled {
-		env["QDB_LINE_TCP_AUTH_DB_PATH"] = "/auth/questdb.auth.txt"
+		"QDB_LINE_HTTP_ENABLED":                 "true",
 	}
 
-	path, err := filepath.Abs("../test")
+	switch auth {
+	case authEnabled:
+		env["QDB_LINE_TCP_AUTH_DB_PATH"] = "/auth/questdb.auth.txt"
+	case httpBasicAuth:
+		env["QDB_PG_USER"] = basicAuthUser
+		env["QDB_PG_PASSWORD"] = basicAuthPass
+	case httpBearerAuth:
+		return nil, fmt.Errorf("idk how to set up bearer auth")
+	}
+
+	path, err := filepath.Abs("./test")
 	if err != nil {
 		return nil, err
 	}
 	req := testcontainers.ContainerRequest{
-		Image:          "questdb/questdb:7.3.2",
+		Image:          "questdb/questdb:7.3.9",
 		ExposedPorts:   []string{"9000/tcp", "9009/tcp"},
 		WaitingFor:     wait.ForHTTP("/").WithPort("9000"),
 		Networks:       []string{networkName},
@@ -163,13 +181,15 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	ilpAddress := fmt.Sprintf("%s:%s", ip, mappedPort.Port())
 
 	var (
-		haProxyC     testcontainers.Container
-		proxyAddress string
+		haProxyC                  testcontainers.Container
+		proxyAddress              string
+		proxyHttpAddress          string
+		proxyHttpBasicAuthAddress string
 	)
-	if setupProxy {
+	if setupProxy || auth == httpBasicAuth || auth == httpBearerAuth {
 		req = testcontainers.ContainerRequest{
 			Image:        "haproxy:2.6.0",
-			ExposedPorts: []string{"8443/tcp", "8888/tcp"},
+			ExposedPorts: []string{"8443/tcp", "8444/tcp", "8445/tcp", "8888/tcp"},
 			WaitingFor:   wait.ForHTTP("/").WithPort("8888"),
 			Networks:     []string{networkName},
 			Mounts: testcontainers.Mounts(testcontainers.ContainerMount{
@@ -203,15 +223,33 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 			return nil, err
 		}
 		proxyAddress = fmt.Sprintf("%s:%s", ip, mappedPort.Port())
+
+		mappedPort, err = haProxyC.MappedPort(ctx, "8444")
+		if err != nil {
+			qdbC.Terminate(ctx)
+			newNetwork.Remove(ctx)
+			return nil, err
+		}
+		proxyHttpAddress = fmt.Sprintf("%s:%s", ip, mappedPort.Port())
+
+		mappedPort, err = haProxyC.MappedPort(ctx, "8445")
+		if err != nil {
+			qdbC.Terminate(ctx)
+			newNetwork.Remove(ctx)
+			return nil, err
+		}
+		proxyHttpBasicAuthAddress = fmt.Sprintf("%s:%s", ip, mappedPort.Port())
 	}
 
 	return &questdbContainer{
-		Container:       qdbC,
-		proxyC:          haProxyC,
-		network:         newNetwork,
-		httpAddress:     httpAddress,
-		ilpAddress:      ilpAddress,
-		proxyIlpAddress: proxyAddress,
+		Container:                    qdbC,
+		proxyC:                       haProxyC,
+		network:                      newNetwork,
+		httpAddress:                  httpAddress,
+		ilpAddress:                   ilpAddress,
+		proxyIlpAddress:              proxyAddress,
+		proxyIlpHttpAddress:          proxyHttpAddress,
+		proxyIlpHttpBasicAuthAddress: proxyHttpBasicAuthAddress,
 	}, nil
 }
 
@@ -383,27 +421,41 @@ func TestE2EValidWrites(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			questdbC, err := setupQuestDB(ctx, noAuth)
-			assert.NoError(t, err)
+		for _, protocol := range []string{"tcp", "http"} {
+			t.Run(fmt.Sprintf("%s: %s", protocol, tc.name), func(t *testing.T) {
+				var (
+					sender *qdb.LineSender
+					u      *url.URL
+					err    error
+				)
+				questdbC, err := setupQuestDB(ctx, noAuth)
+				assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
-			assert.NoError(t, err)
+				if protocol == "tcp" {
+					sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
+				} else {
+					u, err = url.Parse(questdbC.httpAddress)
+					assert.NoError(t, err)
+					sender, err = qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s", u.Host))
+				}
+				assert.NoError(t, err)
 
-			err = tc.writerFn(sender)
-			assert.NoError(t, err)
+				err = tc.writerFn(sender)
+				assert.NoError(t, err)
 
-			err = sender.Flush(ctx)
-			assert.NoError(t, err)
+				err = sender.Flush(ctx)
+				assert.NoError(t, err)
 
-			assert.Eventually(t, func() bool {
-				data := queryTableData(t, tc.tableName, questdbC.httpAddress)
-				return reflect.DeepEqual(tc.expected, data)
-			}, eventualDataTimeout, 100*time.Millisecond)
+				assert.Eventually(t, func() bool {
+					data := queryTableData(t, tc.tableName, questdbC.httpAddress)
+					return reflect.DeepEqual(tc.expected, data)
+				}, eventualDataTimeout, 100*time.Millisecond)
 
-			sender.Close()
-			questdbC.Stop(ctx)
-		})
+				sender.Close()
+				questdbC.Stop(ctx)
+			})
+		}
+
 	}
 }
 
@@ -418,49 +470,64 @@ func TestE2EWriteInBatches(t *testing.T) {
 	)
 
 	ctx := context.Background()
-
-	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
-
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	for i := 0; i < n; i++ {
-		for j := 0; j < nBatch; j++ {
-			err = sender.
-				Table(testTable).
-				Int64Column("long_col", int64(j)).
-				At(ctx, time.UnixMicro(int64(i*nBatch+j)))
-			assert.NoError(t, err)
-		}
-		err = sender.Flush(ctx)
-		assert.NoError(t, err)
-	}
-
-	expected := tableData{
-		Columns: []column{
-			{"long_col", "LONG"},
-			{"timestamp", "TIMESTAMP"},
-		},
-		Dataset: [][]interface{}{},
-		Count:   n * nBatch,
-	}
-
-	for i := 0; i < n; i++ {
-		for j := 0; j < nBatch; j++ {
-			expected.Dataset = append(
-				expected.Dataset,
-				[]interface{}{float64(j), "1970-01-01T00:00:00." + fmt.Sprintf("%06d", i*nBatch+j) + "Z"},
+	for _, protocol := range []string{"tcp", "http"} {
+		t.Run(protocol, func(t *testing.T) {
+			var (
+				sender *qdb.LineSender
+				u      *url.URL
+				err    error
 			)
-		}
+			questdbC, err := setupQuestDB(ctx, noAuth)
+			assert.NoError(t, err)
+			defer questdbC.Stop(ctx)
+
+			if protocol == "tcp" {
+				sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
+			} else {
+				u, err = url.Parse(questdbC.httpAddress)
+				assert.NoError(t, err)
+				sender, err = qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s", u.Host))
+			}
+			assert.NoError(t, err)
+			defer sender.Close()
+
+			for i := 0; i < n; i++ {
+				for j := 0; j < nBatch; j++ {
+					err = sender.
+						Table(testTable).
+						Int64Column("long_col", int64(j)).
+						At(ctx, time.UnixMicro(int64(i*nBatch+j)))
+					assert.NoError(t, err)
+				}
+				err = sender.Flush(ctx)
+				assert.NoError(t, err)
+			}
+
+			expected := tableData{
+				Columns: []column{
+					{"long_col", "LONG"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{},
+				Count:   n * nBatch,
+			}
+
+			for i := 0; i < n; i++ {
+				for j := 0; j < nBatch; j++ {
+					expected.Dataset = append(
+						expected.Dataset,
+						[]interface{}{float64(j), "1970-01-01T00:00:00." + fmt.Sprintf("%06d", i*nBatch+j) + "Z"},
+					)
+				}
+			}
+
+			assert.Eventually(t, func() bool {
+				data := queryTableData(t, testTable, questdbC.httpAddress)
+				return reflect.DeepEqual(expected, data)
+			}, eventualDataTimeout, 100*time.Millisecond)
+		})
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
-		return reflect.DeepEqual(expected, data)
-	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
 func TestE2EImplicitFlush(t *testing.T) {
@@ -471,28 +538,45 @@ func TestE2EImplicitFlush(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	for _, protocol := range []string{"tcp", "http"} {
+		t.Run(protocol, func(t *testing.T) {
+			var (
+				sender *qdb.LineSender
+				u      *url.URL
+				err    error
+			)
 
-	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
+			questdbC, err := setupQuestDB(ctx, noAuth)
+			assert.NoError(t, err)
+			defer questdbC.Stop(ctx)
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress), qdb.WithBufferCapacity(bufCap))
-	assert.NoError(t, err)
-	defer sender.Close()
+			if protocol == "tcp" {
+				sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress), qdb.WithBufferCapacity(bufCap))
+			} else {
+				u, err = url.Parse(questdbC.httpAddress)
+				assert.NoError(t, err)
+				sender, err = qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s;max_buf_size=%d", u.Host, bufCap))
+			}
+			assert.NoError(t, err)
+			defer sender.Close()
 
-	for i := 0; i < 10*bufCap; i++ {
-		err = sender.
-			Table(testTable).
-			BoolColumn("b", true).
-			AtNow(ctx)
-		assert.NoError(t, err)
+			for i := 0; i < 10*bufCap; i++ {
+				err = sender.
+					Table(testTable).
+					BoolColumn("b", true).
+					AtNow(ctx)
+				assert.NoError(t, err)
+			}
+
+			assert.Eventually(t, func() bool {
+				data := queryTableData(t, testTable, questdbC.httpAddress)
+				// We didn't call Flush, but we expect the buffer to be flushed at least once.
+				return data.Count > 0
+			}, eventualDataTimeout, 100*time.Millisecond)
+
+		})
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
-		// We didn't call Flush, but we expect the buffer to be flushed at least once.
-		return data.Count > 0
-	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
 func TestE2ESuccessfulAuth(t *testing.T) {
@@ -596,6 +680,54 @@ func TestE2EFailedAuth(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	data := queryTableData(t, testTable, questdbC.httpAddress)
 	assert.Equal(t, 0, data.Count)
+}
+
+func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+
+	questdbC, err := setupQuestDB(ctx, httpBasicAuth)
+	assert.NoError(t, err)
+	defer questdbC.Stop(ctx)
+
+	sender, err := qdb.FromConf(ctx, fmt.Sprintf("https::addr=%s;user=%s;pass=%s;tls_verify=unsafe_off", questdbC.proxyIlpHttpBasicAuthAddress, basicAuthUser, basicAuthPass))
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	err = sender.
+		Table(testTable).
+		StringColumn("str_col", "foobar").
+		At(ctx, time.UnixMicro(1))
+	assert.NoError(t, err)
+
+	err = sender.
+		Table(testTable).
+		StringColumn("str_col", "barbaz").
+		At(ctx, time.UnixMicro(2))
+	assert.NoError(t, err)
+
+	err = sender.Flush(ctx)
+	assert.NoError(t, err)
+
+	expected := tableData{
+		Columns: []column{
+			{"str_col", "STRING"},
+			{"timestamp", "TIMESTAMP"},
+		},
+		Dataset: [][]interface{}{
+			{"foobar", "1970-01-01T00:00:00.000001Z"},
+			{"barbaz", "1970-01-01T00:00:00.000002Z"},
+		},
+		Count: 2,
+	}
+
+	assert.Eventually(t, func() bool {
+		data := queryTableData(t, testTable, questdbC.httpAddress)
+		return reflect.DeepEqual(expected, data)
+	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
 func TestE2EWritesWithTlsProxy(t *testing.T) {

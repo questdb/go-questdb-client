@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package v2_test
+package v3_test
 
 import (
 	"context"
@@ -32,7 +32,7 @@ import (
 	"strings"
 	"testing"
 
-	qdb "github.com/questdb/go-questdb-client/v2"
+	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -72,7 +72,7 @@ func TestClientInterop(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
+			srv, err := newTestTcpServer(sendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -119,7 +119,7 @@ func TestClientInterop(t *testing.T) {
 }
 
 func readTestCases() (testCases, error) {
-	file, err := os.Open("../test/interop/ilp-client-interop-test.json")
+	file, err := os.Open("./test/interop/ilp-client-interop-test.json")
 	if err != nil {
 		return nil, err
 	}

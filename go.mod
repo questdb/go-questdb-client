@@ -1,4 +1,4 @@
-module github.com/questdb/go-questdb-client
+module github.com/questdb/go-questdb-client/v3
 
 go 1.17
 
