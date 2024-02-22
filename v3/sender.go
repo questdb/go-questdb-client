@@ -949,6 +949,23 @@ func (s *LineSender) flushTcp(ctx context.Context) error {
 	return nil
 }
 
+func isRetryableError(statusCode int) bool {
+	switch statusCode {
+	case 500, // Internal Server Error
+		503, // Service Unavailable
+		504, // Gateway Timeout
+		507, // Insufficient Storage
+		509, // Bandwidth Limit Exceeded
+		523, // Origin is Unreachable
+		524, // A Timeout Occurred
+		529, // Site is overloaded
+		599: // Network Connect Timeout Error
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *LineSender) flushHttp(ctx context.Context) error {
 	var (
 		err           error
@@ -988,7 +1005,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	}
 
 	resp, err := s.httpClient.Do(req)
-	if resp.StatusCode >= 400 {
+	if isRetryableError(resp.StatusCode) {
 		err = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 	}
 	if err == nil {
@@ -1002,7 +1019,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 			time.Sleep(retryInterval + jitter)
 
 			resp, retryErr := s.httpClient.Do(req)
-			if resp.StatusCode >= 400 {
+			if isRetryableError(resp.StatusCode) {
 				retryErr = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 			}
 
@@ -1011,9 +1028,8 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 			}
 
 			if errors.Is(retryErr, context.DeadlineExceeded) {
-				return retryErr
+				return err
 			}
-			panic("figure this flow out...")
 			err = retryErr
 
 			retryInterval = retryInterval * 2
