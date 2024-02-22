@@ -162,11 +162,14 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 				if err != nil {
 					return opts, NewConfigStrParseError("invalid %s value, %q is not a valid int", key, value)
 				}
+
+				timeoutDur := time.Duration(timeout * int(time.Millisecond))
+
 				switch key.String() {
 				case "grace_timeout":
-					opts = append(opts, WithGraceTimeout(time.Duration(timeout)))
+					opts = append(opts, WithGraceTimeout(timeoutDur))
 				case "retry_timeout":
-					opts = append(opts, WithRetryTimeout(time.Duration(timeout)))
+					opts = append(opts, WithRetryTimeout(timeoutDur))
 				default:
 					panic("add a case for " + key.String())
 				}

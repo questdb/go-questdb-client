@@ -140,7 +140,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		{
 			name: "http with min_throughput, grace_timeout, and retry_timeout",
 			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;grace_timeout=%d;retry_timeout=%d",
-				addr, min_throughput, int(grace_timeout), int(retry_timeout)),
+				addr, min_throughput, grace_timeout.Milliseconds(), retry_timeout.Milliseconds()),
 			expected: LineSender{
 				address:                     addr,
 				transportProtocol:           protocolHttp,
@@ -206,6 +206,24 @@ func TestHappyCasesFromConf(t *testing.T) {
 				transportProtocol: protocolHttp,
 				user:              user,
 				pass:              "pass",
+			},
+		},
+		{
+			name:   "grace_timeout millisecond conversion",
+			config: fmt.Sprintf("http::addr=%s;grace_timeout=88000", addr),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				graceTimeout:      grace_timeout,
+			},
+		},
+		{
+			name:   "retry_timeout millisecond conversion",
+			config: fmt.Sprintf("http::addr=%s;retry_timeout=99000", addr),
+			expected: LineSender{
+				address:           addr,
+				transportProtocol: protocolHttp,
+				retryTimeout:      retry_timeout,
 			},
 		},
 	}
