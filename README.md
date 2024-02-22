@@ -1,4 +1,4 @@
-[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
+[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
 
 # go-questdb-client
 
@@ -10,7 +10,7 @@ Features:
 * Supports TLS encryption and [ILP authentication](https://questdb.io/docs/reference/api/ilp/authenticate).
 * Tested against QuestDB 7.3.2 and newer versions.
 
-Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2).
+Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3).
 
 ## Usage
 
@@ -23,7 +23,7 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v2"
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 func main() {
