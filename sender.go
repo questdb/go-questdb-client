@@ -36,13 +36,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	mathRand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 )
 
@@ -390,18 +388,7 @@ func (s *LineSender) Close() error {
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
 func (s *LineSender) Table(name string) *LineSender {
-	if s.lastErr != nil {
-		return s
-	}
-	if s.hasTable {
-		s.lastErr = fmt.Errorf("table name already provided: %w", ErrInvalidMsg)
-		return s
-	}
-	s.lastErr = s.writeTableName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.hasTable = true
+	s.buffer.table(name)
 	return s
 }
 
@@ -412,28 +399,7 @@ func (s *LineSender) Table(name string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Symbol(name, val string) *LineSender {
-	if s.lastErr != nil {
-		return s
-	}
-	if !s.hasTable {
-		s.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
-		return s
-	}
-	if s.hasFields {
-		s.lastErr = fmt.Errorf("symbols have to be written before any other column: %w", ErrInvalidMsg)
-		return s
-	}
-	s.WriteByte(',')
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.WriteByte('=')
-	s.lastErr = s.writeStrValue(val, false)
-	if s.lastErr != nil {
-		return s
-	}
-	s.hasTags = true
+	s.buffer.symbol(name, val)
 	return s
 }
 
@@ -444,17 +410,7 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Int64Column(name string, val int64) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.WriteByte('=')
-	s.WriteInt(val)
-	s.WriteByte('i')
-	s.hasFields = true
+	s.buffer.int64Column(name, val)
 	return s
 }
 
@@ -468,36 +424,7 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
-	if val.Sign() < 0 {
-		if s.lastErr != nil {
-			return s
-		}
-		s.lastErr = fmt.Errorf("long256 cannot be negative: %s", val.String())
-		return s
-	}
-	if val.BitLen() > 256 {
-		if s.lastErr != nil {
-			return s
-		}
-		s.lastErr = fmt.Errorf("long256 cannot be larger than 256-bit: %v", val.BitLen())
-		return s
-	}
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.WriteByte('=')
-	s.WriteByte('0')
-	s.WriteByte('x')
-	s.WriteBigInt(val)
-	s.WriteByte('i')
-	if s.lastErr != nil {
-		return s
-	}
-	s.hasFields = true
+	s.buffer.long256Column(name, val)
 	return s
 }
 
@@ -508,17 +435,7 @@ func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.WriteByte('=')
-	s.WriteInt(ts.UnixMicro())
-	s.WriteByte('t')
-	s.hasFields = true
+	s.buffer.timestampColumn(name, ts)
 	return s
 }
 
@@ -529,16 +446,7 @@ func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Float64Column(name string, val float64) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.WriteByte('=')
-	s.WriteFloat(val)
-	s.hasFields = true
+	s.buffer.float64Column(name, val)
 	return s
 }
 
@@ -548,21 +456,7 @@ func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) StringColumn(name, val string) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.WriteByte('=')
-	s.WriteByte('"')
-	s.lastErr = s.writeStrValue(val, true)
-	if s.lastErr != nil {
-		return s
-	}
-	s.WriteByte('"')
-	s.hasFields = true
+	s.stringColumn(name, val)
 	return s
 }
 
@@ -572,271 +466,8 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.WriteByte('=')
-	if val {
-		s.WriteByte('t')
-	} else {
-		s.WriteByte('f')
-	}
-	s.hasFields = true
+	s.buffer.boolColumn(name, val)
 	return s
-}
-
-func (s *LineSender) writeTableName(str string) error {
-	if str == "" {
-		return fmt.Errorf("table name cannot be empty: %w", ErrInvalidMsg)
-	}
-	// We use string length in bytes as an approximation. That's to
-	// avoid calculating the number of runes.
-	if len(str) > s.fileNameLimit {
-		return fmt.Errorf("table name length exceeds the limit: %w", ErrInvalidMsg)
-	}
-	// Since we're interested in ASCII chars, it's fine to iterate
-	// through bytes instead of runes.
-	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
-		case ' ':
-			s.WriteByte('\\')
-		case '=':
-			s.WriteByte('\\')
-		case '.':
-			if i == 0 || i == len(str)-1 {
-				return fmt.Errorf("table name contains '.' char at the start or end: %s: %w", str, ErrInvalidMsg)
-			}
-		default:
-			if illegalTableNameChar(b) {
-				return fmt.Errorf("table name contains an illegal char: "+
-					"'\\n', '\\r', '?', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '*' '%%', '~', or a non-printable char: %s: %w",
-					str, ErrInvalidMsg)
-			}
-		}
-		s.WriteByte(b)
-	}
-	return nil
-}
-
-func illegalTableNameChar(ch byte) bool {
-	switch ch {
-	case '\n':
-		return true
-	case '\r':
-		return true
-	case '?':
-		return true
-	case ',':
-		return true
-	case '\'':
-		return true
-	case '"':
-		return true
-	case '\\':
-		return true
-	case '/':
-		return true
-	case ':':
-		return true
-	case ')':
-		return true
-	case '(':
-		return true
-	case '+':
-		return true
-	case '*':
-		return true
-	case '%':
-		return true
-	case '~':
-		return true
-	case '\u0000':
-		return true
-	case '\u0001':
-		return true
-	case '\u0002':
-		return true
-	case '\u0003':
-		return true
-	case '\u0004':
-		return true
-	case '\u0005':
-		return true
-	case '\u0006':
-		return true
-	case '\u0007':
-		return true
-	case '\u0008':
-		return true
-	case '\u0009':
-		return true
-	case '\u000b':
-		return true
-	case '\u000c':
-		return true
-	case '\u000e':
-		return true
-	case '\u000f':
-		return true
-	case '\u007f':
-		return true
-	}
-	return false
-}
-
-func (buf *buffer) writeColumnName(str string) error {
-	if str == "" {
-		return fmt.Errorf("column name cannot be empty: %w", ErrInvalidMsg)
-	}
-	// We use string length in bytes as an approximation. That's to
-	// avoid calculating the number of runes.
-	if len(str) > buf.fileNameLimit {
-		return fmt.Errorf("column name length exceeds the limit: %w", ErrInvalidMsg)
-	}
-	// Since we're interested in ASCII chars, it's fine to iterate
-	// through bytes instead of runes.
-	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
-		case ' ':
-			buf.WriteByte('\\')
-		case '=':
-			buf.WriteByte('\\')
-		default:
-			if illegalColumnNameChar(b) {
-				return fmt.Errorf("column name contains an illegal char: "+
-					"'\\n', '\\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '-', '*' '%%', '~', or a non-printable char: %s: %w",
-					str, ErrInvalidMsg)
-			}
-		}
-		buf.WriteByte(b)
-	}
-	return nil
-}
-
-func illegalColumnNameChar(ch byte) bool {
-	switch ch {
-	case '\n':
-		return true
-	case '\r':
-		return true
-	case '?':
-		return true
-	case '.':
-		return true
-	case ',':
-		return true
-	case '\'':
-		return true
-	case '"':
-		return true
-	case '\\':
-		return true
-	case '/':
-		return true
-	case ':':
-		return true
-	case ')':
-		return true
-	case '(':
-		return true
-	case '+':
-		return true
-	case '-':
-		return true
-	case '*':
-		return true
-	case '%':
-		return true
-	case '~':
-		return true
-	case '\u0000':
-		return true
-	case '\u0001':
-		return true
-	case '\u0002':
-		return true
-	case '\u0003':
-		return true
-	case '\u0004':
-		return true
-	case '\u0005':
-		return true
-	case '\u0006':
-		return true
-	case '\u0007':
-		return true
-	case '\u0008':
-		return true
-	case '\u0009':
-		return true
-	case '\u000b':
-		return true
-	case '\u000c':
-		return true
-	case '\u000e':
-		return true
-	case '\u000f':
-		return true
-	case '\u007f':
-		return true
-	}
-	return false
-}
-
-func (buf *buffer) writeStrValue(str string, quoted bool) error {
-	// Since we're interested in ASCII chars, it's fine to iterate
-	// through bytes instead of runes.
-	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
-		case ' ':
-			if !quoted {
-				buf.WriteByte('\\')
-			}
-		case ',':
-			if !quoted {
-				buf.WriteByte('\\')
-			}
-		case '=':
-			if !quoted {
-				buf.WriteByte('\\')
-			}
-		case '"':
-			if quoted {
-				buf.WriteByte('\\')
-			}
-		case '\n':
-			buf.WriteByte('\\')
-		case '\r':
-			buf.WriteByte('\\')
-		case '\\':
-			buf.WriteByte('\\')
-		}
-		buf.WriteByte(b)
-	}
-	return nil
-}
-
-func (b *buffer) prepareForField(name string) bool {
-	if b.lastErr != nil {
-		return false
-	}
-	if !b.hasTable {
-		b.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
-		return false
-	}
-	if !b.hasFields {
-		b.WriteByte(' ')
-	} else {
-		b.WriteByte(',')
-	}
-	return true
 }
 
 // AtNow omits the timestamp and finalizes the ILP message.
@@ -1041,69 +672,6 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	}
 
 	return err
-}
-
-func (b *buffer) discardPendingMsg() {
-	b.Truncate(b.lastMsgPos)
-	b.resetMsgFlags()
-}
-
-func (b *buffer) resetMsgFlags() {
-	b.hasTable = false
-	b.hasTags = false
-	b.hasFields = false
-}
-
-// Messages returns a copy of accumulated ILP messages that are not
-// flushed to the TCP connection yet. Useful for debugging purposes.
-func (s *LineSender) Messages() string {
-	return s.String()
-}
-
-// buffer is a wrapper on top of bytes.buffer. It extends the
-// original struct with methods for writing int64 and float64
-// numbers without unnecessary allocations.
-type buffer struct {
-	bytes.Buffer
-
-	bufCap        int
-	fileNameLimit int
-	lastMsgPos    int
-	lastErr       error
-	hasTable      bool
-	hasTags       bool
-	hasFields     bool
-}
-
-func (b *buffer) WriteInt(i int64) {
-	// We need up to 20 bytes to fit an int64, including a sign.
-	var a [20]byte
-	s := strconv.AppendInt(a[0:0], i, 10)
-	b.Write(s)
-}
-
-func (b *buffer) WriteFloat(f float64) {
-	if math.IsNaN(f) {
-		b.WriteString("NaN")
-		return
-	} else if math.IsInf(f, -1) {
-		b.WriteString("-Infinity")
-		return
-	} else if math.IsInf(f, 1) {
-		b.WriteString("Infinity")
-		return
-	}
-	// We need up to 24 bytes to fit a float64, including a sign.
-	var a [24]byte
-	s := strconv.AppendFloat(a[0:0], f, 'G', -1, 64)
-	b.Write(s)
-}
-
-func (b *buffer) WriteBigInt(i *big.Int) {
-	// We need up to 64 bytes to fit an unsigned 256-bit number.
-	var a [64]byte
-	s := i.Append(a[0:0], 16)
-	b.Write(s)
 }
 
 func defaultTransportDialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
