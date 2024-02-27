@@ -1012,6 +1012,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 		}
 		err = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 	}
+	defer resp.Body.Close()
 
 	if s.retryTimeout > 0 {
 		retryInterval = 10 * time.Millisecond
