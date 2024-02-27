@@ -227,7 +227,7 @@ func FromConf(ctx context.Context, conf string) (*LineSender, error) {
 }
 
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
-// sender corresponds to a single TCP connection. Sender should
+// sender corresponds to a single HTTP/TCP connection. Sender should
 // not be called concurrently by multiple goroutines.
 func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, error) {
 	var (
