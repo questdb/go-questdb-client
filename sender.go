@@ -789,7 +789,7 @@ func illegalColumnNameChar(ch byte) bool {
 	return false
 }
 
-func (s *LineSender) writeStrValue(str string, quoted bool) error {
+func (buf *buffer) writeStrValue(str string, quoted bool) error {
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
 	for i := 0; i < len(str); i++ {
@@ -797,44 +797,44 @@ func (s *LineSender) writeStrValue(str string, quoted bool) error {
 		switch b {
 		case ' ':
 			if !quoted {
-				s.WriteByte('\\')
+				buf.WriteByte('\\')
 			}
 		case ',':
 			if !quoted {
-				s.WriteByte('\\')
+				buf.WriteByte('\\')
 			}
 		case '=':
 			if !quoted {
-				s.WriteByte('\\')
+				buf.WriteByte('\\')
 			}
 		case '"':
 			if quoted {
-				s.WriteByte('\\')
+				buf.WriteByte('\\')
 			}
 		case '\n':
-			s.WriteByte('\\')
+			buf.WriteByte('\\')
 		case '\r':
-			s.WriteByte('\\')
+			buf.WriteByte('\\')
 		case '\\':
-			s.WriteByte('\\')
+			buf.WriteByte('\\')
 		}
-		s.WriteByte(b)
+		buf.WriteByte(b)
 	}
 	return nil
 }
 
-func (s *LineSender) prepareForField(name string) bool {
-	if s.lastErr != nil {
+func (b *buffer) prepareForField(name string) bool {
+	if b.lastErr != nil {
 		return false
 	}
-	if !s.hasTable {
-		s.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
+	if !b.hasTable {
+		b.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
 		return false
 	}
-	if !s.hasFields {
-		s.WriteByte(' ')
+	if !b.hasFields {
+		b.WriteByte(' ')
 	} else {
-		s.WriteByte(',')
+		b.WriteByte(',')
 	}
 	return true
 }
@@ -1043,15 +1043,15 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 	return err
 }
 
-func (s *LineSender) discardPendingMsg() {
-	s.Truncate(s.lastMsgPos)
-	s.resetMsgFlags()
+func (b *buffer) discardPendingMsg() {
+	b.Truncate(b.lastMsgPos)
+	b.resetMsgFlags()
 }
 
-func (s *LineSender) resetMsgFlags() {
-	s.hasTable = false
-	s.hasTags = false
-	s.hasFields = false
+func (b *buffer) resetMsgFlags() {
+	b.hasTable = false
+	b.hasTags = false
+	b.hasFields = false
 }
 
 // Messages returns a copy of accumulated ILP messages that are not
