@@ -72,7 +72,7 @@ const (
 )
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
-// messages over HTTP(S)/TPC(S).
+// messages over HTTP(S)/TCP(S).
 //
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
