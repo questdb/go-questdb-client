@@ -1,3 +1,27 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2022 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
 package questdb
 
 import (
@@ -15,13 +39,14 @@ import (
 type buffer struct {
 	bytes.Buffer
 
-	bufCap        int
-	fileNameLimit int
-	lastMsgPos    int
-	lastErr       error
-	hasTable      bool
-	hasTags       bool
-	hasFields     bool
+	bufCap           int
+	initBufSizeBytes int
+	fileNameLimit    int
+	lastMsgPos       int
+	lastErr          error
+	hasTable         bool
+	hasTags          bool
+	hasFields        bool
 }
 
 func (b *buffer) WriteInt(i int64) {
@@ -289,7 +314,7 @@ func (buf *buffer) writeStrValue(str string, quoted bool) error {
 	return nil
 }
 
-func (b *buffer) prepareForField(name string) bool {
+func (b *buffer) prepareForField() bool {
 	if b.lastErr != nil {
 		return false
 	}
@@ -383,7 +408,7 @@ func (b *buffer) symbol(name, val string) *buffer {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) int64Column(name string, val int64) *buffer {
-	if !b.prepareForField(name) {
+	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -421,7 +446,7 @@ func (b *buffer) long256Column(name string, val *big.Int) *buffer {
 		b.lastErr = fmt.Errorf("long256 cannot be larger than 256-bit: %v", val.BitLen())
 		return b
 	}
-	if !b.prepareForField(name) {
+	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -447,7 +472,7 @@ func (b *buffer) long256Column(name string, val *big.Int) *buffer {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) timestampColumn(name string, ts time.Time) *buffer {
-	if !b.prepareForField(name) {
+	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -468,7 +493,7 @@ func (b *buffer) timestampColumn(name string, ts time.Time) *buffer {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) float64Column(name string, val float64) {
-	if !b.prepareForField(name) {
+	if !b.prepareForField() {
 		return
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -486,7 +511,7 @@ func (b *buffer) float64Column(name string, val float64) {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) stringColumn(name, val string) {
-	if !b.prepareForField(name) {
+	if !b.prepareForField() {
 		return
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -504,7 +529,7 @@ func (b *buffer) stringColumn(name, val string) {
 }
 
 func (b *buffer) boolColumn(name string, val bool) *buffer {
-	if !b.prepareForField(name) {
+	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -519,4 +544,31 @@ func (b *buffer) boolColumn(name string, val bool) *buffer {
 	}
 	b.hasFields = true
 	return b
+}
+
+func (b *buffer) at(ts time.Time, sendTs bool) error {
+	err := b.lastErr
+	b.lastErr = nil
+	if err != nil {
+		b.discardPendingMsg()
+		return err
+	}
+	if !b.hasTable {
+		b.discardPendingMsg()
+		return fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
+	}
+	if !b.hasTags && !b.hasFields {
+		b.discardPendingMsg()
+		return fmt.Errorf("no symbols or columns were provided: %w", ErrInvalidMsg)
+	}
+
+	if sendTs {
+		b.WriteByte(' ')
+		b.WriteInt(ts.UnixNano())
+	}
+	b.WriteByte('\n')
+
+	b.lastMsgPos = b.Len()
+	b.resetMsgFlags()
+	return nil
 }

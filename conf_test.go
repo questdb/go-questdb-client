@@ -56,55 +56,46 @@ func TestHappyCasesFromConf(t *testing.T) {
 			name:   "http and address",
 			config: fmt.Sprintf("http::addr=%s", addr),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
+				address: addr,
 			},
 		},
 		{
 			name:   "tcp and address",
 			config: fmt.Sprintf("tcp::addr=%s", addr),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolTcp,
+				address: addr,
 			},
 		},
 		{
 			name:   "http and username/password",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=%s", addr, user, pass),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				user:              user,
-				pass:              pass,
+				address: addr,
 			},
 		},
 		{
 			name:   "http and token (with trailing ';')",
 			config: fmt.Sprintf("http::addr=%s;token=%s;", addr, token),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				token:             token,
+				address: addr,
 			},
 		},
 		{
 			name:   "tcp with user and key",
 			config: fmt.Sprintf("tcp::addr=%s;user=%s;token=%s", addr, user, token),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolTcp,
-				keyId:             user,
-				key:               token,
+				address: addr,
+				keyId:   user,
+				key:     token,
 			},
 		},
 		{
 			name:   "tcp with key and user",
 			config: fmt.Sprintf("tcp::addr=%s;token=%s;user=%s", addr, token, user),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolTcp,
-				keyId:             user,
-				key:               token,
+				address: addr,
+				keyId:   user,
+				key:     token,
 			},
 		},
 		{
@@ -112,7 +103,6 @@ func TestHappyCasesFromConf(t *testing.T) {
 			config: fmt.Sprintf("https::addr=%s;min_throughput=%d", addr, min_throughput),
 			expected: LineSender{
 				address:                     addr,
-				transportProtocol:           protocolHttp,
 				minThroughputBytesPerSecond: min_throughput,
 				tlsMode:                     tlsEnabled,
 			},
@@ -122,7 +112,6 @@ func TestHappyCasesFromConf(t *testing.T) {
 			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;init_buf_size=%d;tls_verify=unsafe_off", addr, min_throughput, 1024),
 			expected: LineSender{
 				address:                     addr,
-				transportProtocol:           protocolHttp,
 				minThroughputBytesPerSecond: min_throughput,
 				initBufSizeBytes:            1024,
 				tlsMode:                     tlsInsecureSkipVerify,
@@ -132,9 +121,8 @@ func TestHappyCasesFromConf(t *testing.T) {
 			name:   "tcps with tls_verify=unsafe_off",
 			config: fmt.Sprintf("tcps::addr=%s;tls_verify=unsafe_off", addr),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolTcp,
-				tlsMode:           tlsInsecureSkipVerify,
+				address: addr,
+				tlsMode: tlsInsecureSkipVerify,
 			},
 		},
 		{
@@ -143,7 +131,6 @@ func TestHappyCasesFromConf(t *testing.T) {
 				addr, min_throughput, grace_timeout.Milliseconds(), retry_timeout.Milliseconds()),
 			expected: LineSender{
 				address:                     addr,
-				transportProtocol:           protocolHttp,
 				minThroughputBytesPerSecond: min_throughput,
 				graceTimeout:                grace_timeout,
 				retryTimeout:                retry_timeout,
@@ -153,77 +140,59 @@ func TestHappyCasesFromConf(t *testing.T) {
 			name:   "tcp with tls_verify=on",
 			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on", addr),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolTcp,
-				tlsMode:           tlsEnabled,
+				address: addr,
+				tlsMode: tlsEnabled,
 			},
 		},
 		{
 			name:   "password with an escaped semicolon",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word", addr, user),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				user:              user,
-				pass:              "pass;word",
+				address: addr,
 			},
 		},
 		{
 			name:   "password with an escaped semicolon (ending with a ';')",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word;", addr, user),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				user:              user,
-				pass:              "pass;word",
+				address: addr,
 			},
 		},
 		{
 			name:   "password with a trailing semicolon",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=password;;;", addr, user),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				user:              user,
-				pass:              "password;",
+				address: addr,
 			},
 		},
 		{
 			name:   "equal sign in password",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass=word", addr, user),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				user:              user,
-				pass:              "pass=word",
+				address: addr,
 			},
 		},
 		{
 			name:   "basic auth with password first",
 			config: fmt.Sprintf("http::addr=%s;pass=pass;user=%s", addr, user),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				user:              user,
-				pass:              "pass",
+				address: addr,
 			},
 		},
 		{
 			name:   "grace_timeout millisecond conversion",
 			config: fmt.Sprintf("http::addr=%s;grace_timeout=88000", addr),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				graceTimeout:      grace_timeout,
+				address:      addr,
+				graceTimeout: grace_timeout,
 			},
 		},
 		{
 			name:   "retry_timeout millisecond conversion",
 			config: fmt.Sprintf("http::addr=%s;retry_timeout=99000", addr),
 			expected: LineSender{
-				address:           addr,
-				transportProtocol: protocolHttp,
-				retryTimeout:      retry_timeout,
+				address:      addr,
+				retryTimeout: retry_timeout,
 			},
 		},
 	}
