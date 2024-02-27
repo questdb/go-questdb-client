@@ -77,6 +77,8 @@ const (
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
 type LineSender struct {
+	buffer
+
 	address           string
 	transportProtocol transportProtocol
 
@@ -88,15 +90,6 @@ type LineSender struct {
 	user  string // Erased once auth is done.
 	pass  string // Erased once auth is done.
 	token string // Erased once auth is done.
-
-	bufCap        int
-	fileNameLimit int
-	buf           *buffer
-	lastMsgPos    int
-	lastErr       error
-	hasTable      bool
-	hasTags       bool
-	hasFields     bool
 
 	minThroughputBytesPerSecond int
 	graceTimeout                time.Duration
@@ -239,12 +232,15 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 
 	s := &LineSender{
 		address:                     "127.0.0.1:9009",
-		bufCap:                      defaultBufferCapacity,
-		fileNameLimit:               defaultFileNameLimit,
 		tlsMode:                     tlsDisabled,
 		minThroughputBytesPerSecond: 100 * 1024,
 		graceTimeout:                time.Second * 5,
 		retryTimeout:                time.Second * 10,
+
+		buffer: buffer{
+			bufCap:        defaultBufferCapacity,
+			fileNameLimit: defaultFileNameLimit,
+		},
 	}
 
 	for _, opt := range opts {
@@ -371,7 +367,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		panic("unsupported protocol " + s.transportProtocol)
 	}
 
-	s.buf = newBuffer(s.initBufSizeBytes, s.bufCap)
+	s.buffer.Buffer = *bytes.NewBuffer(make([]byte, s.initBufSizeBytes, s.bufCap))
 
 	return s, nil
 
@@ -427,12 +423,12 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 		s.lastErr = fmt.Errorf("symbols have to be written before any other column: %w", ErrInvalidMsg)
 		return s
 	}
-	s.buf.WriteByte(',')
+	s.WriteByte(',')
 	s.lastErr = s.writeColumnName(name)
 	if s.lastErr != nil {
 		return s
 	}
-	s.buf.WriteByte('=')
+	s.WriteByte('=')
 	s.lastErr = s.writeStrValue(val, false)
 	if s.lastErr != nil {
 		return s
@@ -455,9 +451,9 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	s.buf.WriteByte('=')
-	s.buf.WriteInt(val)
-	s.buf.WriteByte('i')
+	s.WriteByte('=')
+	s.WriteInt(val)
+	s.WriteByte('i')
 	s.hasFields = true
 	return s
 }
@@ -493,11 +489,11 @@ func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	s.buf.WriteByte('=')
-	s.buf.WriteByte('0')
-	s.buf.WriteByte('x')
-	s.buf.WriteBigInt(val)
-	s.buf.WriteByte('i')
+	s.WriteByte('=')
+	s.WriteByte('0')
+	s.WriteByte('x')
+	s.WriteBigInt(val)
+	s.WriteByte('i')
 	if s.lastErr != nil {
 		return s
 	}
@@ -519,9 +515,9 @@ func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	s.buf.WriteByte('=')
-	s.buf.WriteInt(ts.UnixMicro())
-	s.buf.WriteByte('t')
+	s.WriteByte('=')
+	s.WriteInt(ts.UnixMicro())
+	s.WriteByte('t')
 	s.hasFields = true
 	return s
 }
@@ -540,8 +536,8 @@ func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	s.buf.WriteByte('=')
-	s.buf.WriteFloat(val)
+	s.WriteByte('=')
+	s.WriteFloat(val)
 	s.hasFields = true
 	return s
 }
@@ -559,13 +555,13 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	s.buf.WriteByte('=')
-	s.buf.WriteByte('"')
+	s.WriteByte('=')
+	s.WriteByte('"')
 	s.lastErr = s.writeStrValue(val, true)
 	if s.lastErr != nil {
 		return s
 	}
-	s.buf.WriteByte('"')
+	s.WriteByte('"')
 	s.hasFields = true
 	return s
 }
@@ -583,11 +579,11 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	if s.lastErr != nil {
 		return s
 	}
-	s.buf.WriteByte('=')
+	s.WriteByte('=')
 	if val {
-		s.buf.WriteByte('t')
+		s.WriteByte('t')
 	} else {
-		s.buf.WriteByte('f')
+		s.WriteByte('f')
 	}
 	s.hasFields = true
 	return s
@@ -608,9 +604,9 @@ func (s *LineSender) writeTableName(str string) error {
 		b := str[i]
 		switch b {
 		case ' ':
-			s.buf.WriteByte('\\')
+			s.WriteByte('\\')
 		case '=':
-			s.buf.WriteByte('\\')
+			s.WriteByte('\\')
 		case '.':
 			if i == 0 || i == len(str)-1 {
 				return fmt.Errorf("table name contains '.' char at the start or end: %s: %w", str, ErrInvalidMsg)
@@ -622,7 +618,7 @@ func (s *LineSender) writeTableName(str string) error {
 					str, ErrInvalidMsg)
 			}
 		}
-		s.buf.WriteByte(b)
+		s.WriteByte(b)
 	}
 	return nil
 }
@@ -693,13 +689,13 @@ func illegalTableNameChar(ch byte) bool {
 	return false
 }
 
-func (s *LineSender) writeColumnName(str string) error {
+func (buf *buffer) writeColumnName(str string) error {
 	if str == "" {
 		return fmt.Errorf("column name cannot be empty: %w", ErrInvalidMsg)
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > s.fileNameLimit {
+	if len(str) > buf.fileNameLimit {
 		return fmt.Errorf("column name length exceeds the limit: %w", ErrInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
@@ -708,9 +704,9 @@ func (s *LineSender) writeColumnName(str string) error {
 		b := str[i]
 		switch b {
 		case ' ':
-			s.buf.WriteByte('\\')
+			buf.WriteByte('\\')
 		case '=':
-			s.buf.WriteByte('\\')
+			buf.WriteByte('\\')
 		default:
 			if illegalColumnNameChar(b) {
 				return fmt.Errorf("column name contains an illegal char: "+
@@ -718,7 +714,7 @@ func (s *LineSender) writeColumnName(str string) error {
 					str, ErrInvalidMsg)
 			}
 		}
-		s.buf.WriteByte(b)
+		buf.WriteByte(b)
 	}
 	return nil
 }
@@ -801,28 +797,28 @@ func (s *LineSender) writeStrValue(str string, quoted bool) error {
 		switch b {
 		case ' ':
 			if !quoted {
-				s.buf.WriteByte('\\')
+				s.WriteByte('\\')
 			}
 		case ',':
 			if !quoted {
-				s.buf.WriteByte('\\')
+				s.WriteByte('\\')
 			}
 		case '=':
 			if !quoted {
-				s.buf.WriteByte('\\')
+				s.WriteByte('\\')
 			}
 		case '"':
 			if quoted {
-				s.buf.WriteByte('\\')
+				s.WriteByte('\\')
 			}
 		case '\n':
-			s.buf.WriteByte('\\')
+			s.WriteByte('\\')
 		case '\r':
-			s.buf.WriteByte('\\')
+			s.WriteByte('\\')
 		case '\\':
-			s.buf.WriteByte('\\')
+			s.WriteByte('\\')
 		}
-		s.buf.WriteByte(b)
+		s.WriteByte(b)
 	}
 	return nil
 }
@@ -836,9 +832,9 @@ func (s *LineSender) prepareForField(name string) bool {
 		return false
 	}
 	if !s.hasFields {
-		s.buf.WriteByte(' ')
+		s.WriteByte(' ')
 	} else {
-		s.buf.WriteByte(',')
+		s.WriteByte(',')
 	}
 	return true
 }
@@ -879,15 +875,15 @@ func (s *LineSender) at(ctx context.Context, ts time.Time, sendTs bool) error {
 	}
 
 	if sendTs {
-		s.buf.WriteByte(' ')
-		s.buf.WriteInt(ts.UnixNano())
+		s.WriteByte(' ')
+		s.WriteInt(ts.UnixNano())
 	}
-	s.buf.WriteByte('\n')
+	s.WriteByte('\n')
 
-	s.lastMsgPos = s.buf.Len()
+	s.lastMsgPos = s.Len()
 	s.resetMsgFlags()
 
-	if s.buf.Len() > s.bufCap {
+	if s.Len() > s.bufCap {
 		return s.Flush(ctx)
 	}
 	return nil
@@ -934,16 +930,16 @@ func (s *LineSender) flushTcp(ctx context.Context) error {
 		s.tcpConn.SetWriteDeadline(time.Time{})
 	}
 
-	n, err := s.buf.WriteTo(s.tcpConn)
+	n, err := s.WriteTo(s.tcpConn)
 	if err != nil {
 		s.lastMsgPos -= int(n)
 		return err
 	}
 
 	// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
-	if s.buf.Cap() > 3*s.bufCap {
+	if s.Cap() > 3*s.bufCap {
 		// Shrink the buffer back to desired capacity.
-		s.buf = newBuffer(s.initBufSizeBytes, s.bufCap)
+		s.buffer.Buffer = *bytes.NewBuffer(make([]byte, s.initBufSizeBytes, s.bufCap))
 	}
 	s.lastMsgPos = 0
 
@@ -983,7 +979,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 
 	// timeout = ( request.len() / min_throughput ) + grace
 	// Conversion from int to time.Duration is in milliseconds and grace is in millis
-	timeout := time.Duration(s.buf.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
+	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
 	reqCtx, cancelFunc := context.WithTimeout(ctx, timeout)
 	defer cancelFunc()
 
@@ -991,7 +987,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 		reqCtx,
 		http.MethodPost,
 		uri,
-		s.buf,
+		s,
 	)
 	if err != nil {
 		return err
@@ -1048,7 +1044,7 @@ func (s *LineSender) flushHttp(ctx context.Context) error {
 }
 
 func (s *LineSender) discardPendingMsg() {
-	s.buf.Truncate(s.lastMsgPos)
+	s.Truncate(s.lastMsgPos)
 	s.resetMsgFlags()
 }
 
@@ -1061,7 +1057,7 @@ func (s *LineSender) resetMsgFlags() {
 // Messages returns a copy of accumulated ILP messages that are not
 // flushed to the TCP connection yet. Useful for debugging purposes.
 func (s *LineSender) Messages() string {
-	return s.buf.String()
+	return s.String()
 }
 
 // buffer is a wrapper on top of bytes.buffer. It extends the
@@ -1069,10 +1065,14 @@ func (s *LineSender) Messages() string {
 // numbers without unnecessary allocations.
 type buffer struct {
 	bytes.Buffer
-}
 
-func newBuffer(initSize, cap int) *buffer {
-	return &buffer{*bytes.NewBuffer(make([]byte, initSize, cap))}
+	bufCap        int
+	fileNameLimit int
+	lastMsgPos    int
+	lastErr       error
+	hasTable      bool
+	hasTags       bool
+	hasFields     bool
 }
 
 func (b *buffer) WriteInt(i int64) {
