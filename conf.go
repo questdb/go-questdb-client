@@ -52,7 +52,7 @@ func parseConfigString(conf string) ([]LineSenderOption, error) {
 		user, pass, token    string
 	)
 
-	schemaStr, conf, found := strings.Cut(string(conf), "::")
+	schemaStr, conf, found := strings.Cut(conf, "::")
 	if !found {
 		return opts, NewConfigStrParseError("no schema separator found '::'")
 	}
