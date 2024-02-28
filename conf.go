@@ -24,190 +24,94 @@
 
 package questdb
 
-type schemaType string
-
-const (
-	schemaHttp  schemaType = "http"
-	schemaHttps schemaType = "https"
-	schemaTcp   schemaType = "tcp"
-	schemaTcps  schemaType = "tcps"
+import (
+	"strings"
 )
 
-func parseConfigString(conf string) ([]LineSenderOption, error) {
-	/*
-		var (
-			key   = &strings.Builder{}
-			value = &strings.Builder{}
-			isKey = true
+type configData struct {
+	schema        string
+	keyValuePairs map[string]string
+}
 
-			nextRune             rune
-			isEscaping           bool
-			hasTrailingSemicolon bool
-			opts                 []LineSenderOption
-			user, pass, token    string
-		)
+func parseConfigString(conf string) (configData, error) {
+	var (
+		key   = &strings.Builder{}
+		value = &strings.Builder{}
+		isKey = true
 
-		schemaStr, conf, found := strings.Cut(conf, "::")
-		if !found {
-			return opts, NewConfigStrParseError("no schema separator found '::'")
-		}
+		nextRune             rune
+		isEscaping           bool
+		hasTrailingSemicolon bool
+		result               configData
+	)
 
-		schema := schemaType(schemaStr)
-		switch schema {
-		case schemaHttp:
-			opts = append(opts, WithHttp())
-		case schemaHttps:
-			opts = append(opts, WithHttp(), WithTls())
-		case schemaTcp:
-			opts = append(opts, WithTcp())
-		case schemaTcps:
-			opts = append(opts, WithTcp(), WithTls())
-		default:
-			return opts, NewConfigStrParseError("invalid schema %q", schema)
-		}
+	schemaStr, conf, found := strings.Cut(conf, "::")
+	if !found {
+		return result, NewConfigStrParseError("no schema separator found '::'")
+	}
 
-		if len(conf) == 0 {
-			return opts, NewConfigStrParseError("'addr' key not found")
-		}
+	result.schema = schemaStr
 
-		if strings.HasSuffix(conf, ";") {
-			hasTrailingSemicolon = true
+	if len(conf) == 0 {
+		return result, NewConfigStrParseError("'addr' key not found")
+	}
+
+	if strings.HasSuffix(conf, ";") {
+		hasTrailingSemicolon = true
+	} else {
+		conf = conf + ";" // add trailing semicolon if it doesn't exist
+	}
+
+	keyValueStr := []rune(conf)
+	for idx, rune := range keyValueStr {
+		if idx < len(conf)-1 {
+			nextRune = keyValueStr[idx+1]
 		} else {
-			conf = conf + ";" // add trailing semicolon
+			nextRune = 0
 		}
+		switch rune {
+		case ';':
+			if isKey {
+				if nextRune == 0 && !hasTrailingSemicolon {
+					return result, NewConfigStrParseError("unexpected end of string")
+				}
+				return result, NewConfigStrParseError("invalid key character ';'")
+			}
 
-		keyValueStr := []rune(conf)
-		for idx, rune := range keyValueStr {
-			if idx < len(conf)-1 {
-				nextRune = keyValueStr[idx+1]
+			if !isEscaping && nextRune == ';' {
+				isEscaping = true
+				continue
+			}
+
+			if isEscaping {
+				value.WriteRune(rune)
+				isEscaping = false
+				continue
+			}
+
+			result.keyValuePairs[key.String()] = value.String()
+
+			key.Reset()
+			value.Reset()
+			isKey = true
+		case '=':
+			if isKey {
+				isKey = false
 			} else {
-				nextRune = 0
+				value.WriteRune(rune)
 			}
-			switch rune {
-			case ';':
-				if isKey {
-					if nextRune == 0 && !hasTrailingSemicolon {
-						return opts, NewConfigStrParseError("unexpected end of string")
-					}
-					return opts, NewConfigStrParseError("invalid key character ';'")
-				}
-
-				if !isEscaping && nextRune == ';' {
-					isEscaping = true
-					continue
-				}
-
-				if isEscaping {
-					value.WriteRune(rune)
-					isEscaping = false
-					continue
-				}
-
-				switch strings.ToLower(key.String()) {
-				case "addr":
-					opts = append(opts, WithAddress(value.String()))
-				case "user":
-					user = value.String()
-					if user != "" && pass != "" {
-						opts = append(opts, WithBasicAuth(user, pass))
-					}
-					if token != "" && user != "" {
-						opts = append(opts, WithAuth(user, token))
-					}
-				case "pass":
-					pass = value.String()
-					if user != "" && pass != "" {
-						opts = append(opts, WithBasicAuth(user, pass))
-					}
-				case "token":
-					token = value.String()
-					switch schema {
-					case schemaHttp, schemaHttps:
-						opts = append(opts, WithBearerToken(token))
-					case schemaTcp, schemaTcps:
-						if token != "" && user != "" {
-							opts = append(opts, WithAuth(user, token))
-						}
-					}
-				case "auto_flush":
-					if value.String() == "on" {
-						return opts, NewConfigStrParseError("auto_flush option is not supported")
-					}
-				case "auto_flush_rows", "auto_flush_bytes":
-					return opts, NewConfigStrParseError("auto_flush option is not supported")
-				case "min_throughput", "init_buf_size", "max_buf_size":
-					parsedVal, err := strconv.Atoi(value.String())
-					if err != nil {
-						return opts, NewConfigStrParseError("invalid %s value, %q is not a valid int", key, value.String())
-
-					}
-					switch key.String() {
-					case "min_throughput":
-						opts = append(opts, WithMinThroughput(parsedVal))
-					case "init_buf_size":
-						opts = append(opts, WithInitBufferSize(parsedVal))
-					case "max_buf_size":
-						opts = append(opts, WithBufferCapacity(parsedVal))
-					default:
-						panic("add a case for " + key.String())
-					}
-
-				case "grace_timeout", "retry_timeout":
-					timeout, err := strconv.Atoi(value.String())
-					if err != nil {
-						return opts, NewConfigStrParseError("invalid %s value, %q is not a valid int", key, value)
-					}
-
-					timeoutDur := time.Duration(timeout * int(time.Millisecond))
-
-					switch key.String() {
-					case "grace_timeout":
-						opts = append(opts, WithGraceTimeout(timeoutDur))
-					case "retry_timeout":
-						opts = append(opts, WithRetryTimeout(timeoutDur))
-					default:
-						panic("add a case for " + key.String())
-					}
-				case "tls_verify":
-					switch value.String() {
-					case "on":
-						opts = append(opts, WithTls())
-					case "unsafe_off":
-						opts = append(opts, WithTlsInsecureSkipVerify())
-					default:
-						return opts, NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", value)
-					}
-				case "tls_roots":
-					return opts, NewConfigStrParseError("tls_roots is not available in the go client")
-				case "tls_roots_password":
-					return opts, NewConfigStrParseError("tls_roots_password is not available in the go client")
-				default:
-					return opts, NewConfigStrParseError("unsupported option %q", key)
-				}
-
-				key.Reset()
-				value.Reset()
-				isKey = true
-			case '=':
-				if isKey {
-					isKey = false
-				} else {
-					value.WriteRune(rune)
-				}
-			default:
-				if isKey {
-					key.WriteRune(rune)
-				} else {
-					value.WriteRune(rune)
-				}
+		default:
+			if isKey {
+				key.WriteRune(rune)
+			} else {
+				value.WriteRune(rune)
 			}
 		}
+	}
 
-		if isEscaping {
-			return opts, NewConfigStrParseError("unescaped ';'")
-		}
+	if isEscaping {
+		return result, NewConfigStrParseError("unescaped ';'")
+	}
 
-		return opts, nil
-	*/
-	panic("not implemented")
+	return result, nil
 }

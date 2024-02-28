@@ -436,7 +436,7 @@ func TestE2EValidWrites(t *testing.T) {
 				} else {
 					u, err = url.Parse(questdbC.httpAddress)
 					assert.NoError(t, err)
-					sender, err = qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s", u.Host))
+					sender, err = qdb.LineSenderFromConf(ctx, fmt.Sprintf("http::addr=%s", u.Host))
 				}
 				assert.NoError(t, err)
 
@@ -486,7 +486,7 @@ func TestE2EWriteInBatches(t *testing.T) {
 			} else {
 				u, err = url.Parse(questdbC.httpAddress)
 				assert.NoError(t, err)
-				sender, err = qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s", u.Host))
+				sender, err = qdb.LineSenderFromConf(ctx, fmt.Sprintf("http::addr=%s", u.Host))
 			}
 			assert.NoError(t, err)
 			defer sender.Close()
@@ -555,7 +555,7 @@ func TestE2EImplicitFlush(t *testing.T) {
 			} else {
 				u, err = url.Parse(questdbC.httpAddress)
 				assert.NoError(t, err)
-				sender, err = qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s;max_buf_size=%d", u.Host, bufCap))
+				sender, err = qdb.LineSenderFromConf(ctx, fmt.Sprintf("http::addr=%s;max_buf_size=%d", u.Host, bufCap))
 			}
 			assert.NoError(t, err)
 			defer sender.Close()
@@ -693,7 +693,7 @@ func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 	assert.NoError(t, err)
 	defer questdbC.Stop(ctx)
 
-	sender, err := qdb.FromConf(ctx, fmt.Sprintf("https::addr=%s;user=%s;pass=%s;tls_verify=unsafe_off", questdbC.proxyIlpHttpBasicAuthAddress, basicAuthUser, basicAuthPass))
+	sender, err := qdb.LineSenderFromConf(ctx, fmt.Sprintf("https::addr=%s;user=%s;pass=%s;tls_verify=unsafe_off", questdbC.proxyIlpHttpBasicAuthAddress, basicAuthUser, basicAuthPass))
 	assert.NoError(t, err)
 	defer sender.Close()
 

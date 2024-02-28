@@ -33,6 +33,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -40,10 +42,11 @@ import (
 type HttpLineSender struct {
 	buffer
 
-	address      string
-	timeout      time.Duration
-	retryTimeout time.Duration
-	tlsMode      tlsMode
+	address                     string
+	retryTimeout                time.Duration
+	tlsMode                     tlsMode
+	minThroughputBytesPerSecond int
+	graceTimeout                time.Duration
 
 	user  string
 	pass  string
@@ -56,9 +59,10 @@ type HttpLineSenderOption func(s *HttpLineSender)
 
 func NewHttpLineSender(opts ...HttpLineSenderOption) *HttpLineSender {
 	s := &HttpLineSender{
-		address:      "127.0.0.1:9000",
-		timeout:      30 * time.Second,
-		retryTimeout: 10 * time.Second,
+		address:                     "127.0.0.1:9000",
+		minThroughputBytesPerSecond: 100 * 1024,
+		graceTimeout:                5 * time.Second,
+		retryTimeout:                10 * time.Second,
 	}
 
 	for _, opt := range opts {
@@ -69,9 +73,13 @@ func NewHttpLineSender(opts ...HttpLineSenderOption) *HttpLineSender {
 		s.address = "127.0.0.1:9000"
 	}
 
+	// timeout = ( request.len() / min_throughput ) + grace
+	// Conversion from int to time.Duration is in milliseconds and grace is in millis
+	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
+
 	s.client = http.Client{
 		Transport: &globalTransport,
-		Timeout:   s.timeout,
+		Timeout:   timeout,
 	}
 
 	clientCt.Add(1)
@@ -108,9 +116,33 @@ func WithBearerToken(token string) HttpLineSenderOption {
 	}
 }
 
-func WithHttpTimeout(t time.Duration) HttpLineSenderOption {
+func WithGraceTimeout(timeout time.Duration) HttpLineSenderOption {
 	return func(s *HttpLineSender) {
-		s.timeout = t
+		s.graceTimeout = timeout
+	}
+}
+
+func WithRetryTimeout(t time.Duration) HttpLineSenderOption {
+	return func(s *HttpLineSender) {
+		s.retryTimeout = t
+	}
+}
+
+func WithMinThroughput(bytesPerSecond int) HttpLineSenderOption {
+	return func(s *HttpLineSender) {
+		s.minThroughputBytesPerSecond = bytesPerSecond
+	}
+}
+
+func WithHttpInitBufferSize(sizeInBytes int) HttpLineSenderOption {
+	return func(s *HttpLineSender) {
+		s.initBufSizeBytes = sizeInBytes
+	}
+}
+
+func WithHttpAddress(addr string) HttpLineSenderOption {
+	return func(s *HttpLineSender) {
+		s.address = addr
 	}
 }
 
@@ -121,16 +153,121 @@ func WithHttpTls() HttpLineSenderOption {
 	}
 }
 
-func WithHttpRetry(t time.Duration) HttpLineSenderOption {
+// WithTlsInsecureSkipVerify enables TLS connection encryption,
+// but skips server certificate verification. Useful in test
+// environments with self-signed certificates. Do not use in
+// production environments.
+func WithHttpTlsInsecureSkipVerify() HttpLineSenderOption {
 	return func(s *HttpLineSender) {
-		s.retryTimeout = t
+		s.tlsMode = tlsInsecureSkipVerify
 	}
 }
 
-func WithHttpInitBufferSize(sizeInBytes int) HttpLineSenderOption {
+// WithHttpBufferCapacity sets desired buffer capacity in bytes to
+// be used when sending ILP messages. Defaults to 128KB.
+//
+// This setting is a soft limit, i.e. the underlying buffer may
+// grow larger than the provided value, but will shrink on a
+// At, AtNow, or Flush call.
+func WithHttpBufferCapacity(capacity int) HttpLineSenderOption {
 	return func(s *HttpLineSender) {
-		s.initBufSizeBytes = sizeInBytes
+		if capacity > 0 {
+			s.bufCap = capacity
+		}
 	}
+}
+
+func HttpLineSenderFromConf(ctx context.Context, conf string) (*HttpLineSender, error) {
+	var (
+		user, pass, token string
+	)
+
+	data, err := parseConfigString(conf)
+	if err != nil {
+		return nil, err
+	}
+
+	if data.schema != "http" || data.schema != "https" {
+		return nil, fmt.Errorf("invalid schema: %s", data.schema)
+	}
+
+	opts := make([]HttpLineSenderOption, 0)
+	for k, v := range data.keyValuePairs {
+
+		switch strings.ToLower(k) {
+		case "addr":
+			opts = append(opts, WithHttpAddress(v))
+		case "user":
+			user = v
+			if user != "" && pass != "" {
+				opts = append(opts, WithBasicAuth(user, pass))
+			}
+		case "pass":
+			pass = v
+			if user != "" && pass != "" {
+				opts = append(opts, WithBasicAuth(user, pass))
+			}
+		case "token":
+			token = v
+			opts = append(opts, WithBearerToken(token))
+		case "auto_flush":
+			if v == "on" {
+				return nil, NewConfigStrParseError("auto_flush option is not supported")
+			}
+		case "auto_flush_rows", "auto_flush_bytes":
+			return nil, NewConfigStrParseError("auto_flush option is not supported")
+		case "min_throughput", "init_buf_size", "max_buf_size":
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+
+			}
+			switch k {
+			case "min_throughput":
+				opts = append(opts, WithMinThroughput(parsedVal))
+			case "init_buf_size":
+				opts = append(opts, WithHttpInitBufferSize(parsedVal))
+			case "max_buf_size":
+				opts = append(opts, WithHttpBufferCapacity(parsedVal))
+			default:
+				panic("add a case for " + k)
+			}
+
+		case "grace_timeout", "retry_timeout":
+			timeout, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+			}
+
+			timeoutDur := time.Duration(timeout * int(time.Millisecond))
+
+			switch k {
+			case "grace_timeout":
+				opts = append(opts, WithGraceTimeout(timeoutDur))
+			case "retry_timeout":
+				opts = append(opts, WithRetryTimeout(timeoutDur))
+			default:
+				panic("add a case for " + k)
+			}
+		case "tls_verify":
+			switch v {
+			case "on":
+				opts = append(opts, WithHttpTls())
+			case "unsafe_off":
+				opts = append(opts, WithHttpTlsInsecureSkipVerify())
+			default:
+				return nil, NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
+			}
+		case "tls_roots":
+			return nil, NewConfigStrParseError("tls_roots is not available in the go client")
+		case "tls_roots_password":
+			return nil, NewConfigStrParseError("tls_roots_password is not available in the go client")
+		default:
+			return nil, NewConfigStrParseError("unsupported option %q", k)
+		}
+
+	}
+	return NewHttpLineSender(opts...), nil
 }
 
 func (s *HttpLineSender) Flush(ctx context.Context) error {

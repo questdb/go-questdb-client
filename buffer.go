@@ -26,11 +26,22 @@ package questdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"strconv"
 	"time"
+)
+
+// ErrInvalidMsg indicates a failed attempt to construct an ILP
+// message, e.g. duplicate calls to Table method or illegal
+// chars found in table or column name.
+var ErrInvalidMsg = errors.New("invalid message")
+
+const (
+	defaultBufferCapacity = 128 * 1024
+	defaultFileNameLimit  = 127
 )
 
 // buffer is a wrapper on top of bytes.buffer. It extends the

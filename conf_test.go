@@ -201,7 +201,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 
 			opts, err := parseConfigString(tc.config)
 			actual := LineSender{}
-			for _, opt := range opts {
+			for _, opt := range opts.keyValuePairs {
 				opt(&actual)
 			}
 			assert.NoError(t, err)

@@ -98,7 +98,7 @@ func TestValidWrites(t *testing.T) {
 
 				switch protocol {
 				case "http":
-					sender, err = qdb.FromConf(ctx, "http::addr="+srv.addr+";")
+					sender, err = qdb.LineSenderFromConf(ctx, "http::addr="+srv.addr+";")
 				case "tcp":
 					sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
 				}
@@ -627,7 +627,7 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	assert.NoError(t, err)
 	defer srv.close()
 
-	sender, err := qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s", srv.addr))
+	sender, err := qdb.LineSenderFromConf(ctx, fmt.Sprintf("http::addr=%s", srv.addr))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -653,7 +653,7 @@ func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 	assert.NoError(t, err)
 	defer srv.close()
 
-	sender, err := qdb.FromConf(ctx, fmt.Sprintf("http::addr=%s;retry_timeout=1000", srv.addr))
+	sender, err := qdb.LineSenderFromConf(ctx, fmt.Sprintf("http::addr=%s;retry_timeout=1000", srv.addr))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -685,7 +685,7 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 
 			switch protocol {
 			case "http":
-				_, err = qdb.FromConf(ctx, "http::addr="+srv.addr+";")
+				_, err = qdb.LineSenderFromConf(ctx, "http::addr="+srv.addr+";")
 			case "tcp":
 				sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
 			}
@@ -728,7 +728,7 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 
 			switch protocol {
 			case "http":
-				sender, err = qdb.FromConf(ctx, "http::addr="+srv.addr+";")
+				sender, err = qdb.LineSenderFromConf(ctx, "http::addr="+srv.addr+";")
 			case "tcp":
 				sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
 			}

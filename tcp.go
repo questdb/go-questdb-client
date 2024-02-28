@@ -38,6 +38,8 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -236,6 +238,76 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 
 	return s, nil
 
+}
+
+func LineSenderFromConf(ctx context.Context, conf string) (*LineSender, error) {
+	var (
+		user, token string
+	)
+
+	data, err := parseConfigString(conf)
+	if err != nil {
+		return nil, err
+	}
+
+	if data.schema != "tcp" || data.schema != "tcps" {
+		return nil, fmt.Errorf("invalid schema: %s", data.schema)
+	}
+
+	opts := make([]LineSenderOption, 0)
+
+	for k, v := range data.keyValuePairs {
+		switch strings.ToLower(k) {
+		case "addr":
+			opts = append(opts, WithAddress(v))
+		case "user":
+			user = v
+			if token != "" && user != "" {
+				opts = append(opts, WithAuth(user, token))
+			}
+		case "token":
+			token = v
+			opts = append(opts, WithAuth(user, token))
+		case "auto_flush":
+			if v == "on" {
+				return nil, NewConfigStrParseError("auto_flush option is not supported")
+			}
+		case "auto_flush_rows", "auto_flush_bytes":
+			return nil, NewConfigStrParseError("auto_flush option is not supported")
+		case "init_buf_size", "max_buf_size":
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+
+			}
+			switch k {
+			case "init_buf_size":
+				opts = append(opts, WithInitBufferSize(parsedVal))
+			case "max_buf_size":
+				opts = append(opts, WithBufferCapacity(parsedVal))
+			default:
+				panic("add a case for " + k)
+			}
+
+		case "tls_verify":
+			switch v {
+			case "on":
+				opts = append(opts, WithTls())
+			case "unsafe_off":
+				opts = append(opts, WithTlsInsecureSkipVerify())
+			default:
+				return nil, NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
+			}
+		case "tls_roots":
+			return nil, NewConfigStrParseError("tls_roots is not available in the go client")
+		case "tls_roots_password":
+			return nil, NewConfigStrParseError("tls_roots_password is not available in the go client")
+		default:
+			return nil, NewConfigStrParseError("unsupported option %q", k)
+		}
+	}
+
+	return NewLineSender(ctx, opts...)
 }
 
 // Close closes the underlying TCP connection. Does not flush
