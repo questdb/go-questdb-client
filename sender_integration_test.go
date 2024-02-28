@@ -43,6 +43,7 @@ import (
 
 	qdb "github.com/questdb/go-questdb-client/v3"
 	qdbHttp "github.com/questdb/go-questdb-client/v3/pkg/http"
+	"github.com/questdb/go-questdb-client/v3/pkg/tcp"
 )
 
 const (
@@ -51,7 +52,7 @@ const (
 	eventualDataTimeout = 60 * time.Second
 )
 
-type writerFn func(s *qdb.LineSender) error
+type writerFn func(s *tcp.LineSender) error
 
 type questdbContainer struct {
 	testcontainers.Container
@@ -272,7 +273,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"all column types",
 			testTable,
-			func(s *qdb.LineSender) error {
+			func(s *tcp.LineSender) error {
 				val, _ := big.NewInt(0).SetString("123a4", 16)
 				err := s.
 					Table(testTable).
@@ -321,7 +322,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"escaped chars",
 			"my-awesome_test 1=2.csv",
-			func(s *qdb.LineSender) error {
+			func(s *tcp.LineSender) error {
 				return s.
 					Table("my-awesome_test 1=2.csv").
 					Symbol("sym_name 1=2", "value 1,2=3\n4\r5\"6\\7").
@@ -343,7 +344,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single symbol",
 			testTable,
-			func(s *qdb.LineSender) error {
+			func(s *tcp.LineSender) error {
 				return s.
 					Table(testTable).
 					Symbol("foo", "bar").
@@ -363,7 +364,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single column",
 			testTable,
-			func(s *qdb.LineSender) error {
+			func(s *tcp.LineSender) error {
 				return s.
 					Table(testTable).
 					Int64Column("foobar", 1_000_042).
@@ -383,7 +384,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single column long256",
 			testTable,
-			func(s *qdb.LineSender) error {
+			func(s *tcp.LineSender) error {
 				val, _ := big.NewInt(0).SetString("7fffffffffffffff", 16)
 				return s.
 					Table(testTable).
@@ -404,7 +405,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"double value with exponent",
 			testTable,
-			func(s *qdb.LineSender) error {
+			func(s *tcp.LineSender) error {
 				return s.
 					Table(testTable).
 					Float64Column("foobar", 4.2e-100).

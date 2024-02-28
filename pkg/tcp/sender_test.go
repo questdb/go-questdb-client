@@ -42,6 +42,8 @@ const (
 	networkName = "test-network-v3"
 )
 
+type writerFn func(s *LineSender) error
+
 func TestValidWrites(t *testing.T) {
 	ctx := context.Background()
 
