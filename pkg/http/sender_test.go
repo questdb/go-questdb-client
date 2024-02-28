@@ -97,8 +97,8 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
 	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
-	defer srv.Close()
 	assert.NoError(b, err)
+	defer srv.Close()
 
 	sender, err := NewHttpLineSender(WithHttpAddress(srv.Addr()))
 	assert.NoError(b, err)
