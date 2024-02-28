@@ -35,14 +35,16 @@ type configData struct {
 
 func parseConfigString(conf string) (configData, error) {
 	var (
-		key   = &strings.Builder{}
-		value = &strings.Builder{}
-		isKey = true
+		key    = &strings.Builder{}
+		value  = &strings.Builder{}
+		isKey  = true
+		result = configData{
+			keyValuePairs: map[string]string{},
+		}
 
 		nextRune             rune
 		isEscaping           bool
 		hasTrailingSemicolon bool
-		result               configData
 	)
 
 	schemaStr, conf, found := strings.Cut(conf, "::")

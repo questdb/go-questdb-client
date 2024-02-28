@@ -26,11 +26,11 @@ package questdb
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"math/big"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -57,12 +57,17 @@ type HttpLineSender struct {
 
 type HttpLineSenderOption func(s *HttpLineSender)
 
-func NewHttpLineSender(opts ...HttpLineSenderOption) *HttpLineSender {
+func NewHttpLineSender(opts ...HttpLineSenderOption) (*HttpLineSender, error) {
 	s := &HttpLineSender{
 		address:                     "127.0.0.1:9000",
 		minThroughputBytesPerSecond: 100 * 1024,
 		graceTimeout:                5 * time.Second,
 		retryTimeout:                10 * time.Second,
+
+		buffer: buffer{
+			bufCap:        defaultBufferCapacity,
+			fileNameLimit: defaultFileNameLimit,
+		},
 	}
 
 	for _, opt := range opts {
@@ -73,35 +78,39 @@ func NewHttpLineSender(opts ...HttpLineSenderOption) *HttpLineSender {
 		s.address = "127.0.0.1:9000"
 	}
 
-	// timeout = ( request.len() / min_throughput ) + grace
-	// Conversion from int to time.Duration is in milliseconds and grace is in millis
-	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
+	if s.tlsMode == tlsEnabled && tlsClientConfig.InsecureSkipVerify {
+		return nil, errors.New("once InsecureSkipVerify is used, it must be enforced for all subsequent HttpLineSenders")
+	}
+
+	if s.tlsMode == tlsInsecureSkipVerify {
+		tlsClientConfig.InsecureSkipVerify = true
+	}
 
 	s.client = http.Client{
 		Transport: &globalTransport,
-		Timeout:   timeout,
+		Timeout:   0, // todo: add a global maximum timeout?
 	}
 
 	clientCt.Add(1)
 
-	return s
+	return s, nil
 }
 
-var globalTransport http.Transport = http.Transport{
-	Proxy: http.ProxyFromEnvironment,
-	DialContext: defaultTransportDialContext(&net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}),
-	MaxConnsPerHost:       0,
-	MaxIdleConns:          100,
-	MaxIdleConnsPerHost:   100,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   10 * time.Second,
-	ExpectContinueTimeout: 1 * time.Second,
-}
+var (
+	tlsClientConfig tls.Config = tls.Config{}
+	clientCt        atomic.Int64
 
-var clientCt atomic.Int64
+	globalTransport http.Transport = http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxConnsPerHost:       0,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tlsClientConfig,
+	}
+)
 
 func WithBasicAuth(user, pass string) HttpLineSenderOption {
 	return func(s *HttpLineSender) {
@@ -187,7 +196,7 @@ func HttpLineSenderFromConf(ctx context.Context, conf string) (*HttpLineSender, 
 		return nil, err
 	}
 
-	if data.schema != "http" || data.schema != "https" {
+	if data.schema != "http" && data.schema != "https" {
 		return nil, fmt.Errorf("invalid schema: %s", data.schema)
 	}
 
@@ -267,7 +276,7 @@ func HttpLineSenderFromConf(ctx context.Context, conf string) (*HttpLineSender, 
 		}
 
 	}
-	return NewHttpLineSender(opts...), nil
+	return NewHttpLineSender(opts...)
 }
 
 func (s *HttpLineSender) Flush(ctx context.Context) error {
@@ -284,8 +293,14 @@ func (s *HttpLineSender) Flush(ctx context.Context) error {
 	}
 	uri += fmt.Sprintf("://%s/write", s.address)
 
+	// timeout = ( request.len() / min_throughput ) + grace
+	// Conversion from int to time.Duration is in milliseconds and grace is in millis
+	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	req, err = http.NewRequestWithContext(
-		ctx,
+		reqCtx,
 		http.MethodPost,
 		uri,
 		s,
@@ -304,21 +319,26 @@ func (s *HttpLineSender) Flush(ctx context.Context) error {
 
 	resp, err := s.client.Do(req)
 	if err == nil {
+		defer resp.Body.Close()
+
+		// If the requests succeeds with a non-error status code, flush has succeeded
 		if !isRetryableError(resp.StatusCode) {
 			return nil
 		}
+		// Otherwise, we will retry until the timeout
 		err = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 	}
-	defer resp.Body.Close()
 
 	if s.retryTimeout > 0 {
 		retryInterval = 10 * time.Millisecond
-		for {
+		for err != nil {
 			jitter := time.Duration(rand.Intn(10)) * time.Millisecond
 			time.Sleep(retryInterval + jitter)
 
 			resp, retryErr := s.client.Do(req)
 			if retryErr == nil {
+				defer resp.Body.Close()
+
 				if !isRetryableError(resp.StatusCode) {
 					return nil
 				}
@@ -488,8 +508,4 @@ func isRetryableError(statusCode int) bool {
 	default:
 		return false
 	}
-}
-
-func defaultTransportDialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
-	return dialer.DialContext
 }

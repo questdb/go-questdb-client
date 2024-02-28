@@ -250,7 +250,7 @@ func LineSenderFromConf(ctx context.Context, conf string) (*LineSender, error) {
 		return nil, err
 	}
 
-	if data.schema != "tcp" || data.schema != "tcps" {
+	if data.schema != "tcp" && data.schema != "tcps" {
 		return nil, fmt.Errorf("invalid schema: %s", data.schema)
 	}
 

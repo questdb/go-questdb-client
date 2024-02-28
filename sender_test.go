@@ -694,6 +694,10 @@ func newTestServer(serverType serverType) (*testServer, error) {
 	return newTestServerWithProtocol(serverType, "tcp")
 }
 
+func newTestHttpServer(serverType serverType) (*testServer, error) {
+	return newTestServerWithProtocol(serverType, "http")
+}
+
 func newTestServerWithProtocol(serverType serverType, protocol string) (*testServer, error) {
 	tcp, err := net.Listen("tcp", "127.0.0.1:")
 	if err != nil {
@@ -718,14 +722,6 @@ func newTestServerWithProtocol(serverType serverType, protocol string) (*testSer
 	}
 
 	return s, nil
-}
-
-func newTestTcpServer(serverType serverType) (*testServer, error) {
-	return newTestServerWithProtocol(serverType, "tcp")
-}
-
-func newTestHttpServer(serverType serverType) (*testServer, error) {
-	return newTestServerWithProtocol(serverType, "http")
 }
 
 func (s *testServer) serveTcp() {
