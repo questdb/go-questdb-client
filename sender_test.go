@@ -86,42 +86,29 @@ func TestValidWrites(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		for _, protocol := range []string{"http", "tcp"} {
-			t.Run(fmt.Sprintf("%s: %s", protocol, tc.name), func(t *testing.T) {
-				var (
-					sender *qdb.LineSender
-					err    error
-				)
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := newTestServer(sendToBackChannel)
+			assert.NoError(t, err)
 
-				srv, err := newTestServerWithProtocol(sendToBackChannel, protocol)
-				assert.NoError(t, err)
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			assert.NoError(t, err)
 
-				switch protocol {
-				case "http":
-					sender, err = qdb.LineSenderFromConf(ctx, "http::addr="+srv.addr+";")
-				case "tcp":
-					sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
-				}
-				assert.NoError(t, err)
+			err = tc.writerFn(sender)
+			assert.NoError(t, err)
 
-				err = tc.writerFn(sender)
-				assert.NoError(t, err)
+			// Check the buffer before flushing it.
+			assert.Equal(t, strings.Join(tc.expectedLines, "\n")+"\n", sender.Messages())
 
-				// Check the buffer before flushing it.
-				assert.Equal(t, strings.Join(tc.expectedLines, "\n")+"\n", sender.Messages())
+			err = sender.Flush(ctx)
+			assert.NoError(t, err)
 
-				err = sender.Flush(ctx)
-				assert.NoError(t, err)
+			sender.Close()
 
-				sender.Close()
+			// Now check what was received by the server.
+			expectLines(t, srv.backCh, tc.expectedLines)
 
-				// Now check what was received by the server.
-				expectLines(t, srv.backCh, tc.expectedLines)
-
-				srv.close()
-			})
-		}
-
+			srv.close()
+		})
 	}
 }
 
@@ -139,7 +126,7 @@ func TestTimestampSerialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestTcpServer(sendToBackChannel)
+			srv, err := newTestServer(sendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -177,7 +164,7 @@ func TestInt64Serialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestTcpServer(sendToBackChannel)
+			srv, err := newTestServer(sendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -216,7 +203,7 @@ func TestLong256Column(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestTcpServer(sendToBackChannel)
+			srv, err := newTestServer(sendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -262,7 +249,7 @@ func TestFloat64Serialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestTcpServer(sendToBackChannel)
+			srv, err := newTestServer(sendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -315,7 +302,7 @@ func TestErrorOnLengthyNames(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestTcpServer(readAndDiscard)
+			srv, err := newTestServer(readAndDiscard)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr), qdb.WithFileNameLimit(nameLimit))
@@ -390,7 +377,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestTcpServer(readAndDiscard)
+			srv, err := newTestServer(readAndDiscard)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -410,7 +397,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 func TestErrorOnMultipleTableCalls(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestTcpServer(readAndDiscard)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -427,7 +414,7 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 func TestErrorOnNegativeLong256(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestTcpServer(readAndDiscard)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -444,7 +431,7 @@ func TestErrorOnNegativeLong256(t *testing.T) {
 func TestErrorOnLargerLong256(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestTcpServer(readAndDiscard)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -500,7 +487,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestTcpServer(readAndDiscard)
+			srv, err := newTestServer(readAndDiscard)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
@@ -520,7 +507,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestTcpServer(readAndDiscard)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -538,7 +525,7 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestTcpServer(sendToBackChannel)
+	srv, err := newTestServer(sendToBackChannel)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -569,7 +556,7 @@ func TestErrorOnUnavailableServer(t *testing.T) {
 func TestErrorOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	srv, err := newTestTcpServer(readAndDiscard)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -592,11 +579,11 @@ func TestErrorOnCancelledContext(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestErrorOnContextDeadlineTcp(t *testing.T) {
+func TestErrorOnContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
 
-	srv, err := newTestTcpServer(readAndDiscard)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.close()
 
@@ -619,140 +606,58 @@ func TestErrorOnContextDeadlineTcp(t *testing.T) {
 	t.Fail()
 }
 
-func TestErrorOnContextDeadlineHttp(t *testing.T) {
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
-	defer cancel()
-
-	srv, err := newTestHttpServer(readAndDiscard)
-	assert.NoError(t, err)
-	defer srv.close()
-
-	sender, err := qdb.LineSenderFromConf(ctx, fmt.Sprintf("http::addr=%s", srv.addr))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	// Keep writing until we get an error due to the context deadline.
-	for i := 0; i < 100_000; i++ {
-		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
-		if err != nil {
-			return
-		}
-		err = sender.Flush(ctx)
-		if err != nil {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fail()
-}
-
-func TestErrorOnInternalServerErrorHttp(t *testing.T) {
-	ctx := context.Background()
-
-	srv, err := newTestHttpServer(returningError)
-	assert.NoError(t, err)
-	defer srv.close()
-
-	sender, err := qdb.LineSenderFromConf(ctx, fmt.Sprintf("http::addr=%s;retry_timeout=1000", srv.addr))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
-	if err != nil {
-		return
-	}
-	err = sender.Flush(ctx)
-	assert.ErrorContains(t, err, "500")
-
-}
-
 func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestTcpServer(readAndDiscard)
+	srv, err := newTestServer(readAndDiscard)
 	assert.NoError(b, err)
 	defer srv.close()
 
-	for _, protocol := range []string{"http", "tcp"} {
-		b.Run(protocol, func(b *testing.B) {
-			var (
-				sender *qdb.LineSender
-				err    error
-			)
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(b, err)
+	defer sender.Close()
 
-			srv, err := newTestServerWithProtocol(readAndDiscard, protocol)
-			assert.NoError(b, err)
-
-			switch protocol {
-			case "http":
-				_, err = qdb.LineSenderFromConf(ctx, "http::addr="+srv.addr+";")
-			case "tcp":
-				sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
-			}
-			assert.NoError(b, err)
-
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				for j := 0; j < 1000; j++ {
-					sender.
-						Table(testTable).
-						Symbol("sym_col", "test_ilp1").
-						Float64Column("double_col", float64(i)+0.42).
-						Int64Column("long_col", int64(i)).
-						StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
-						BoolColumn("bool_col", true).
-						TimestampColumn("timestamp_col", time.UnixMicro(42)).
-						At(ctx, time.UnixMicro(int64(1000*i)))
-				}
-				sender.Flush(ctx)
-				sender.Close()
-				srv.close()
-			}
-		})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 1000; j++ {
+			sender.
+				Table(testTable).
+				Symbol("sym_col", "test_ilp1").
+				Float64Column("double_col", float64(i)+0.42).
+				Int64Column("long_col", int64(i)).
+				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
+				BoolColumn("bool_col", true).
+				TimestampColumn("timestamp_col", time.UnixMicro(42)).
+				At(ctx, time.UnixMicro(int64(1000*i)))
+		}
+		sender.Flush(ctx)
 	}
-
 }
 
 func BenchmarkLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
-	for _, protocol := range []string{"http", "tcp"} {
-		b.Run(protocol, func(b *testing.B) {
-			var (
-				sender *qdb.LineSender
-				err    error
-			)
+	srv, err := newTestServer(readAndDiscard)
+	assert.NoError(b, err)
+	defer srv.close()
 
-			srv, err := newTestServerWithProtocol(readAndDiscard, protocol)
-			assert.NoError(b, err)
+	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	assert.NoError(b, err)
+	defer sender.Close()
 
-			switch protocol {
-			case "http":
-				sender, err = qdb.LineSenderFromConf(ctx, "http::addr="+srv.addr+";")
-			case "tcp":
-				sender, err = qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
-			}
-
-			assert.NoError(b, err)
-
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				sender.
-					Table(testTable).
-					Symbol("sym_col", "test_ilp1").
-					Float64Column("double_col", float64(i)+0.42).
-					Int64Column("long_col", int64(i)).
-					StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
-					BoolColumn("bool_col", true).
-					TimestampColumn("timestamp_col", time.UnixMicro(42)).
-					At(ctx, time.UnixMicro(int64(1000*i)))
-			}
-			sender.Flush(ctx)
-			sender.Close()
-			srv.close()
-		})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sender.
+			Table(testTable).
+			Symbol("sym_col", "test_ilp1").
+			Float64Column("double_col", float64(i)+0.42).
+			Int64Column("long_col", int64(i)).
+			StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
+			BoolColumn("bool_col", true).
+			TimestampColumn("timestamp_col", time.UnixMicro(42)).
+			At(ctx, time.UnixMicro(int64(1000*i)))
 	}
-
+	sender.Flush(ctx)
 }
 
 func expectLines(t *testing.T, linesCh chan string, expected []string) {
@@ -783,6 +688,10 @@ type testServer struct {
 	backCh      chan string
 	closeCh     chan struct{}
 	wg          sync.WaitGroup
+}
+
+func newTestServer(serverType serverType) (*testServer, error) {
+	return newTestServerWithProtocol(serverType, "tcp")
 }
 
 func newTestServerWithProtocol(serverType serverType, protocol string) (*testServer, error) {

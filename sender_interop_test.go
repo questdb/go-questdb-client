@@ -72,7 +72,7 @@ func TestClientInterop(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			srv, err := newTestTcpServer(sendToBackChannel)
+			srv, err := newTestServer(sendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
