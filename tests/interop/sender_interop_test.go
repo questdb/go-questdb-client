@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package questdb_test
+package interop_test
 
 import (
 	"context"
