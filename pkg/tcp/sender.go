@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package questdb
+package tcp
 
 import (
 	"bufio"
@@ -41,6 +41,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/questdb/go-questdb-client/v3/pkg/buffer"
+	"github.com/questdb/go-questdb-client/v3/pkg/conf"
+)
+
+type tlsMode int64
+
+const (
+	tlsDisabled           tlsMode = 0
+	tlsEnabled            tlsMode = 1
+	tlsInsecureSkipVerify tlsMode = 2
 )
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
@@ -49,7 +60,7 @@ import (
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
 type LineSender struct {
-	buffer
+	buffer.Buffer
 
 	address string
 
@@ -107,7 +118,7 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 func WithBufferCapacity(capacity int) LineSenderOption {
 	return func(s *LineSender) {
 		if capacity > 0 {
-			s.bufCap = capacity
+			s.BufCap = capacity
 		}
 	}
 }
@@ -119,14 +130,14 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 func WithFileNameLimit(limit int) LineSenderOption {
 	return func(s *LineSender) {
 		if limit > 0 {
-			s.fileNameLimit = limit
+			s.FileNameLimit = limit
 		}
 	}
 }
 
 func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *LineSender) {
-		s.initBufSizeBytes = sizeInBytes
+		s.InitBufSizeBytes = sizeInBytes
 	}
 }
 
@@ -145,9 +156,9 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		address: "127.0.0.1:9009",
 		tlsMode: tlsDisabled,
 
-		buffer: buffer{
-			bufCap:        defaultBufferCapacity,
-			fileNameLimit: defaultFileNameLimit,
+		Buffer: buffer.Buffer{
+			BufCap:        buffer.DefaultBufferCapacity,
+			FileNameLimit: buffer.DefaultFileNameLimit,
 		},
 	}
 
@@ -234,29 +245,29 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 
 	s.conn = conn
 
-	s.buffer.Buffer = *bytes.NewBuffer(make([]byte, s.initBufSizeBytes, s.bufCap))
+	s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
 
 	return s, nil
 
 }
 
-func LineSenderFromConf(ctx context.Context, conf string) (*LineSender, error) {
+func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
 	var (
 		user, token string
 	)
 
-	data, err := parseConfigString(conf)
+	data, err := conf.ParseConfigString(config)
 	if err != nil {
 		return nil, err
 	}
 
-	if data.schema != "tcp" && data.schema != "tcps" {
-		return nil, fmt.Errorf("invalid schema: %s", data.schema)
+	if data.Schema != "tcp" && data.Schema != "tcps" {
+		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
 	}
 
 	opts := make([]LineSenderOption, 0)
 
-	for k, v := range data.keyValuePairs {
+	for k, v := range data.KeyValuePairs {
 		switch strings.ToLower(k) {
 		case "addr":
 			opts = append(opts, WithAddress(v))
@@ -270,14 +281,14 @@ func LineSenderFromConf(ctx context.Context, conf string) (*LineSender, error) {
 			opts = append(opts, WithAuth(user, token))
 		case "auto_flush":
 			if v == "on" {
-				return nil, NewConfigStrParseError("auto_flush option is not supported")
+				return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
 			}
 		case "auto_flush_rows", "auto_flush_bytes":
-			return nil, NewConfigStrParseError("auto_flush option is not supported")
+			return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
 		case "init_buf_size", "max_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
-				return nil, NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
 
 			}
 			switch k {
@@ -296,14 +307,14 @@ func LineSenderFromConf(ctx context.Context, conf string) (*LineSender, error) {
 			case "unsafe_off":
 				opts = append(opts, WithTlsInsecureSkipVerify())
 			default:
-				return nil, NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
+				return nil, conf.NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
 			}
 		case "tls_roots":
-			return nil, NewConfigStrParseError("tls_roots is not available in the go client")
+			return nil, conf.NewConfigStrParseError("tls_roots is not available in the go client")
 		case "tls_roots_password":
-			return nil, NewConfigStrParseError("tls_roots_password is not available in the go client")
+			return nil, conf.NewConfigStrParseError("tls_roots_password is not available in the go client")
 		default:
-			return nil, NewConfigStrParseError("unsupported option %q", k)
+			return nil, conf.NewConfigStrParseError("unsupported option %q", k)
 		}
 	}
 
@@ -323,7 +334,7 @@ func (s *LineSender) Close() error {
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
 func (s *LineSender) Table(name string) *LineSender {
-	s.buffer.table(name)
+	s.Buffer.Table(name)
 	return s
 }
 
@@ -334,7 +345,7 @@ func (s *LineSender) Table(name string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Symbol(name, val string) *LineSender {
-	s.buffer.symbol(name, val)
+	s.Buffer.Symbol(name, val)
 	return s
 }
 
@@ -345,7 +356,7 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Int64Column(name string, val int64) *LineSender {
-	s.buffer.int64Column(name, val)
+	s.Buffer.Int64Column(name, val)
 	return s
 }
 
@@ -359,7 +370,7 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
-	s.buffer.long256Column(name, val)
+	s.Buffer.Long256Column(name, val)
 	return s
 }
 
@@ -370,7 +381,7 @@ func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
-	s.buffer.timestampColumn(name, ts)
+	s.Buffer.TimestampColumn(name, ts)
 	return s
 }
 
@@ -381,7 +392,7 @@ func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Float64Column(name string, val float64) *LineSender {
-	s.buffer.float64Column(name, val)
+	s.Buffer.Float64Column(name, val)
 	return s
 }
 
@@ -391,7 +402,7 @@ func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) StringColumn(name, val string) *LineSender {
-	s.stringColumn(name, val)
+	s.Buffer.StringColumn(name, val)
 	return s
 }
 
@@ -401,7 +412,7 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
-	s.buffer.boolColumn(name, val)
+	s.Buffer.BoolColumn(name, val)
 	return s
 }
 
@@ -416,14 +427,14 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 // configured buffer capacity.
 func (s *LineSender) Flush(ctx context.Context) error {
 
-	err := s.lastErr
-	s.lastErr = nil
+	err := s.LastErr()
+	s.ClearLastErr()
 	if err != nil {
-		s.discardPendingMsg()
+		s.DiscardPendingMsg()
 		return err
 	}
-	if s.hasTable {
-		s.discardPendingMsg()
+	if s.HasTable() {
+		s.DiscardPendingMsg()
 		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	}
 
@@ -436,18 +447,15 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		s.conn.SetWriteDeadline(time.Time{})
 	}
 
-	n, err := s.WriteTo(s.conn)
-	if err != nil {
-		s.lastMsgPos -= int(n)
+	if _, err := s.Buffer.WriteTo(s.conn); err != nil {
 		return err
 	}
 
 	// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
-	if s.Cap() > 3*s.bufCap {
+	if s.Cap() > 3*s.BufCap {
 		// Shrink the buffer back to desired capacity.
-		s.buffer.Buffer = *bytes.NewBuffer(make([]byte, s.initBufSizeBytes, s.bufCap))
+		s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
 	}
-	s.lastMsgPos = 0
 
 	return nil
 }
@@ -459,11 +467,11 @@ func (s *LineSender) Flush(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) AtNow(ctx context.Context) error {
-	err := s.at(time.Time{}, false)
+	err := s.Buffer.At(time.Time{}, false)
 	if err != nil {
 		return err
 	}
-	if s.Len() > s.bufCap {
+	if s.Len() > s.BufCap {
 		return s.Flush(ctx)
 	}
 	return nil
@@ -475,11 +483,11 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) At(ctx context.Context, ts time.Time) error {
-	err := s.at(ts, true)
+	err := s.Buffer.At(ts, true)
 	if err != nil {
 		return err
 	}
-	if s.Len() > s.bufCap {
+	if s.Len() > s.BufCap {
 		return s.Flush(ctx)
 	}
 	return nil

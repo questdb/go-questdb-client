@@ -1,23 +1,28 @@
-package questdb_test
+package http
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
+	"github.com/questdb/go-questdb-client/v3/pkg/test/utils"
 	"github.com/stretchr/testify/assert"
+)
+
+const (
+	testTable   = "my_test_table"
+	networkName = "test-network-v3"
 )
 
 func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.addr))
+	sender, err := NewHttpLineSender(WithHttpAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -39,13 +44,13 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(returningError)
+	srv, err := utils.NewTestHttpServer(utils.ReturningError)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewHttpLineSender(
-		qdb.WithHttpAddress(srv.addr),
-		qdb.WithGraceTimeout(10*time.Millisecond),
+	sender, err := NewHttpLineSender(
+		WithHttpAddress(srv.Addr()),
+		WithGraceTimeout(10*time.Millisecond),
 	)
 	assert.NoError(t, err)
 	defer sender.Close()
@@ -62,11 +67,11 @@ func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(b, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.addr))
+	sender, err := NewHttpLineSender(WithHttpAddress(srv.Addr()))
 	assert.NoError(b, err)
 
 	b.ResetTimer()
@@ -84,7 +89,6 @@ func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 		}
 		sender.Flush(ctx)
 		sender.Close()
-		srv.close()
 	}
 
 }
@@ -92,10 +96,11 @@ func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	defer srv.Close()
 	assert.NoError(b, err)
 
-	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.addr))
+	sender, err := NewHttpLineSender(WithHttpAddress(srv.Addr()))
 	assert.NoError(b, err)
 
 	b.ResetTimer()
@@ -112,6 +117,5 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	}
 	sender.Flush(ctx)
 	sender.Close()
-	srv.close()
 
 }

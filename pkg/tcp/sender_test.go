@@ -22,31 +22,28 @@
  *
  ******************************************************************************/
 
-package questdb_test
+package tcp
 
 import (
-	"bufio"
 	"context"
-	"fmt"
-	"io"
-	"io/ioutil"
-	"log"
 	"math"
 	"math/big"
-	"net"
-	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
+	"github.com/questdb/go-questdb-client/v3/pkg/test/utils"
 	"github.com/stretchr/testify/assert"
 )
 
-type writerFn func(s *qdb.LineSender) error
+const (
+	testTable   = "my_test_table"
+	networkName = "test-network-v3"
+)
+
+type writerFn func(s *LineSender) error
 
 func TestValidWrites(t *testing.T) {
 	ctx := context.Background()
@@ -58,7 +55,7 @@ func TestValidWrites(t *testing.T) {
 	}{
 		{
 			"multiple rows",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				err := s.Table(testTable).StringColumn("str_col", "foo").Int64Column("long_col", 42).AtNow(ctx)
 				if err != nil {
 					return err
@@ -76,7 +73,7 @@ func TestValidWrites(t *testing.T) {
 		},
 		{
 			"UTF-8 strings",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Table("таблица").StringColumn("колонка", "значение").AtNow(ctx)
 			},
 			[]string{
@@ -87,10 +84,10 @@ func TestValidWrites(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
+			srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			err = tc.writerFn(sender)
@@ -105,9 +102,9 @@ func TestValidWrites(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.backCh, tc.expectedLines)
+			expectLines(t, srv.BackCh, tc.expectedLines)
 
-			srv.close()
+			srv.Close()
 		})
 	}
 }
@@ -126,10 +123,10 @@ func TestTimestampSerialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
+			srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			err = sender.Table(testTable).TimestampColumn("a_col", tc.val).AtNow(ctx)
@@ -141,9 +138,9 @@ func TestTimestampSerialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val.UnixMicro(), 10) + "t"})
+			expectLines(t, srv.BackCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val.UnixMicro(), 10) + "t"})
 
-			srv.close()
+			srv.Close()
 		})
 	}
 }
@@ -164,10 +161,10 @@ func TestInt64Serialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
+			srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			err = sender.Table(testTable).Int64Column("a_col", tc.val).AtNow(ctx)
@@ -179,9 +176,9 @@ func TestInt64Serialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i"})
+			expectLines(t, srv.BackCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i"})
 
-			srv.close()
+			srv.Close()
 		})
 	}
 }
@@ -203,10 +200,10 @@ func TestLong256Column(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
+			srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			newVal, _ := big.NewInt(0).SetString(tc.val, 16)
@@ -219,9 +216,9 @@ func TestLong256Column(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + tc.expected + "i"})
+			expectLines(t, srv.BackCh, []string{"my_test_table a_col=" + tc.expected + "i"})
 
-			srv.close()
+			srv.Close()
 		})
 	}
 }
@@ -249,10 +246,10 @@ func TestFloat64Serialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
+			srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			err = sender.Table(testTable).Float64Column("a_col", tc.val).AtNow(ctx)
@@ -264,9 +261,9 @@ func TestFloat64Serialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.backCh, []string{"my_test_table a_col=" + tc.expected})
+			expectLines(t, srv.BackCh, []string{"my_test_table a_col=" + tc.expected})
 
-			srv.close()
+			srv.Close()
 		})
 	}
 }
@@ -286,14 +283,14 @@ func TestErrorOnLengthyNames(t *testing.T) {
 	}{
 		{
 			"lengthy table name",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Table(lengthyStr).StringColumn("str_col", "foo").AtNow(ctx)
 			},
 			"table name length exceeds the limit",
 		},
 		{
 			"lengthy column name",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Table(testTable).StringColumn(lengthyStr, "foo").AtNow(ctx)
 			},
 			"column name length exceeds the limit",
@@ -302,10 +299,10 @@ func TestErrorOnLengthyNames(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(readAndDiscard)
+			srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr), qdb.WithFileNameLimit(nameLimit))
+			sender, err := NewLineSender(ctx, WithAddress(srv.Addr()), WithFileNameLimit(nameLimit))
 			assert.NoError(t, err)
 
 			err = tc.writerFn(sender)
@@ -313,7 +310,7 @@ func TestErrorOnLengthyNames(t *testing.T) {
 			assert.Empty(t, sender.Messages())
 
 			sender.Close()
-			srv.close()
+			srv.Close()
 		})
 	}
 }
@@ -327,49 +324,49 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 	}{
 		{
 			"AtNow",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"At",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Symbol("sym", "abc").At(ctx, time.UnixMicro(0))
 			},
 		},
 		{
 			"symbol",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"string column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.StringColumn("str", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"boolean column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.BoolColumn("bool", true).AtNow(ctx)
 			},
 		},
 		{
 			"long column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Int64Column("int", 42).AtNow(ctx)
 			},
 		},
 		{
 			"double column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Float64Column("float", 4.2).AtNow(ctx)
 			},
 		},
 		{
 			"timestamp column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.TimestampColumn("timestamp", time.UnixMicro(42)).AtNow(ctx)
 			},
 		},
@@ -377,10 +374,10 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(readAndDiscard)
+			srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			err = tc.writerFn(sender)
@@ -389,7 +386,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 			assert.Empty(t, sender.Messages())
 
 			sender.Close()
-			srv.close()
+			srv.Close()
 		})
 	}
 }
@@ -397,11 +394,11 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 func TestErrorOnMultipleTableCalls(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(readAndDiscard)
+	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -414,11 +411,11 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 func TestErrorOnNegativeLong256(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(readAndDiscard)
+	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -431,11 +428,11 @@ func TestErrorOnNegativeLong256(t *testing.T) {
 func TestErrorOnLargerLong256(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(readAndDiscard)
+	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -455,31 +452,31 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 	}{
 		{
 			"string column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Table("awesome_table").StringColumn("str", "abc").Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"boolean column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Table("awesome_table").BoolColumn("bool", true).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"integer column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Table("awesome_table").Int64Column("int", 42).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"float column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Table("awesome_table").Float64Column("float", 4.2).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
 		{
 			"timestamp column",
-			func(s *qdb.LineSender) error {
+			func(s *LineSender) error {
 				return s.Table("awesome_table").TimestampColumn("timestamp", time.UnixMicro(42)).Symbol("sym", "abc").AtNow(ctx)
 			},
 		},
@@ -487,10 +484,10 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, err := newTestServer(readAndDiscard)
+			srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			err = tc.writerFn(sender)
@@ -499,7 +496,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 			assert.Empty(t, sender.Messages())
 
 			sender.Close()
-			srv.close()
+			srv.Close()
 		})
 	}
 }
@@ -507,11 +504,11 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(readAndDiscard)
+	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -525,11 +522,11 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(sendToBackChannel)
+	srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -543,24 +540,23 @@ func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	// The second message should be discarded.
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
-	expectLines(t, srv.backCh, []string{testTable + " foo=\"bar\""})
+	expectLines(t, srv.BackCh, []string{testTable + " foo=\"bar\""})
 }
 
 func TestErrorOnUnavailableServer(t *testing.T) {
 	ctx := context.Background()
 
-	_, err := qdb.NewLineSender(ctx)
+	_, err := NewLineSender(ctx)
 	assert.ErrorContains(t, err, "failed to connect to server")
 }
 
 func TestErrorOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	srv, err := newTestServer(readAndDiscard)
+	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -583,11 +579,11 @@ func TestErrorOnContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
 
-	srv, err := newTestServer(readAndDiscard)
+	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -609,11 +605,11 @@ func TestErrorOnContextDeadline(t *testing.T) {
 func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(readAndDiscard)
+	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 	assert.NoError(b, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(b, err)
 	defer sender.Close()
 
@@ -637,11 +633,11 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 func BenchmarkLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestServer(readAndDiscard)
+	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
 	assert.NoError(b, err)
-	defer srv.close()
+	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
 	assert.NoError(b, err)
 	defer sender.Close()
 
@@ -671,181 +667,4 @@ func expectLines(t *testing.T, linesCh chan string, expected []string) {
 		}
 		return reflect.DeepEqual(expected, actual)
 	}, 3*time.Second, 100*time.Millisecond)
-}
-
-type serverType int64
-
-const (
-	sendToBackChannel serverType = 0
-	readAndDiscard    serverType = 1
-	returningError    serverType = 2
-)
-
-type testServer struct {
-	addr        string
-	tcpListener net.Listener
-	serverType  serverType
-	backCh      chan string
-	closeCh     chan struct{}
-	wg          sync.WaitGroup
-}
-
-func newTestServer(serverType serverType) (*testServer, error) {
-	return newTestServerWithProtocol(serverType, "tcp")
-}
-
-func newTestHttpServer(serverType serverType) (*testServer, error) {
-	return newTestServerWithProtocol(serverType, "http")
-}
-
-func newTestServerWithProtocol(serverType serverType, protocol string) (*testServer, error) {
-	tcp, err := net.Listen("tcp", "127.0.0.1:")
-	if err != nil {
-		return nil, err
-	}
-	s := &testServer{
-		addr:        tcp.Addr().String(),
-		tcpListener: tcp,
-		serverType:  serverType,
-		backCh:      make(chan string, 5),
-		closeCh:     make(chan struct{}),
-	}
-
-	switch protocol {
-	case "tcp":
-		s.wg.Add(1)
-		go s.serveTcp()
-	case "http":
-		go s.serveHttp()
-	default:
-		return nil, fmt.Errorf("invalid protocol %q", protocol)
-	}
-
-	return s, nil
-}
-
-func (s *testServer) serveTcp() {
-	defer s.wg.Done()
-
-	for {
-		conn, err := s.tcpListener.Accept()
-		if err != nil {
-			select {
-			case <-s.closeCh:
-				return
-			default:
-				log.Println("could not accept", err)
-			}
-			continue
-		}
-
-		s.wg.Add(1)
-		go func() {
-			switch s.serverType {
-			case sendToBackChannel:
-				s.handleSendToBackChannel(conn)
-			case readAndDiscard:
-				s.handleReadAndDiscard(conn)
-			default:
-				panic(fmt.Sprintf("server type is not supported: %d", s.serverType))
-			}
-			s.wg.Done()
-		}()
-	}
-}
-
-func (s *testServer) handleSendToBackChannel(conn net.Conn) {
-	defer conn.Close()
-
-	r := bufio.NewReader(conn)
-	for {
-		select {
-		case <-s.closeCh:
-			return
-		default:
-			l, err := r.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					continue
-				} else {
-					log.Println("could not read", err)
-					return
-				}
-			}
-			// Remove trailing \n and send line to back channel.
-			s.backCh <- l[0 : len(l)-1]
-		}
-	}
-}
-
-func (s *testServer) handleReadAndDiscard(conn net.Conn) {
-	defer conn.Close()
-
-	for {
-		select {
-		case <-s.closeCh:
-			return
-		default:
-			_, err := io.Copy(ioutil.Discard, conn)
-			if err != nil {
-				if err == io.EOF {
-					continue
-				} else {
-					log.Println("could not read", err)
-					return
-				}
-			}
-		}
-	}
-}
-
-func (s *testServer) serveHttp() {
-	lineFeed := make(chan string)
-
-	go func() {
-		for {
-			select {
-			case <-s.closeCh:
-				return
-			case l := <-lineFeed:
-				s.backCh <- l
-			}
-		}
-	}()
-
-	http.Serve(s.tcpListener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var (
-			err error
-		)
-
-		switch s.serverType {
-		case sendToBackChannel:
-			r := bufio.NewReader(r.Body)
-			var l string
-			for err == nil {
-				l, err = r.ReadString('\n')
-				if err == nil && len(l) > 0 {
-					lineFeed <- l[0 : len(l)-1]
-				}
-			}
-		case readAndDiscard:
-			_, err = io.Copy(ioutil.Discard, r.Body)
-		case returningError:
-			w.WriteHeader(http.StatusInternalServerError)
-		default:
-			panic(fmt.Sprintf("server type is not supported: %d", s.serverType))
-		}
-
-		if err != nil {
-			if err != io.EOF {
-				log.Println("could not read", err)
-			}
-		}
-	}))
-}
-
-func (s *testServer) close() {
-	close(s.closeCh)
-	s.tcpListener.Close()
-	s.wg.Wait()
 }

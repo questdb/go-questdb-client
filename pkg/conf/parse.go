@@ -22,24 +22,24 @@
  *
  ******************************************************************************/
 
-package questdb
+package conf
 
 import (
 	"strings"
 )
 
-type configData struct {
-	schema        string
-	keyValuePairs map[string]string
+type ConfigData struct {
+	Schema        string
+	KeyValuePairs map[string]string
 }
 
-func parseConfigString(conf string) (configData, error) {
+func ParseConfigString(conf string) (ConfigData, error) {
 	var (
 		key    = &strings.Builder{}
 		value  = &strings.Builder{}
 		isKey  = true
-		result = configData{
-			keyValuePairs: map[string]string{},
+		result = ConfigData{
+			KeyValuePairs: map[string]string{},
 		}
 
 		nextRune             rune
@@ -52,7 +52,7 @@ func parseConfigString(conf string) (configData, error) {
 		return result, NewConfigStrParseError("no schema separator found '::'")
 	}
 
-	result.schema = schemaStr
+	result.Schema = schemaStr
 
 	if len(conf) == 0 {
 		return result, NewConfigStrParseError("'addr' key not found")
@@ -91,7 +91,7 @@ func parseConfigString(conf string) (configData, error) {
 				continue
 			}
 
-			result.keyValuePairs[key.String()] = value.String()
+			result.KeyValuePairs[key.String()] = value.String()
 
 			key.Reset()
 			value.Reset()

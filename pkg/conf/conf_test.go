@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package questdb
+package conf
 
 import (
 	"testing"
@@ -245,7 +245,7 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 
-			_, err := parseConfigString(tc.config)
+			_, err := ParseConfigString(tc.config)
 			var expected *ConfigStrParseError
 			assert.Error(t, err)
 			assert.ErrorAs(t, err, &expected)

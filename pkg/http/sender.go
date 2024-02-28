@@ -22,9 +22,10 @@
  *
  ******************************************************************************/
 
-package questdb
+package http
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -37,16 +38,27 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/questdb/go-questdb-client/v3/pkg/buffer"
+	"github.com/questdb/go-questdb-client/v3/pkg/conf"
+)
+
+type tlsMode int64
+
+const (
+	tlsDisabled           tlsMode = 0
+	tlsEnabled            tlsMode = 1
+	tlsInsecureSkipVerify tlsMode = 2
 )
 
 type HttpLineSender struct {
-	buffer
+	buffer.Buffer
 
 	address                     string
 	retryTimeout                time.Duration
-	tlsMode                     tlsMode
 	minThroughputBytesPerSecond int
 	graceTimeout                time.Duration
+	tlsMode                     tlsMode
 
 	user  string
 	pass  string
@@ -64,9 +76,9 @@ func NewHttpLineSender(opts ...HttpLineSenderOption) (*HttpLineSender, error) {
 		graceTimeout:                5 * time.Second,
 		retryTimeout:                10 * time.Second,
 
-		buffer: buffer{
-			bufCap:        defaultBufferCapacity,
-			fileNameLimit: defaultFileNameLimit,
+		Buffer: buffer.Buffer{
+			BufCap:        buffer.DefaultBufferCapacity,
+			FileNameLimit: buffer.DefaultFileNameLimit,
 		},
 	}
 
@@ -78,7 +90,7 @@ func NewHttpLineSender(opts ...HttpLineSenderOption) (*HttpLineSender, error) {
 		s.address = "127.0.0.1:9000"
 	}
 
-	if s.tlsMode == tlsEnabled && tlsClientConfig.InsecureSkipVerify {
+	if s.tlsMode != tlsInsecureSkipVerify && tlsClientConfig.InsecureSkipVerify {
 		return nil, errors.New("once InsecureSkipVerify is used, it must be enforced for all subsequent HttpLineSenders")
 	}
 
@@ -111,6 +123,13 @@ var (
 		TLSClientConfig:       &tlsClientConfig,
 	}
 )
+
+// WithHttpTls enables TLS connection encryption.
+func WithTls() HttpLineSenderOption {
+	return func(s *HttpLineSender) {
+		s.tlsMode = tlsEnabled
+	}
+}
 
 func WithBasicAuth(user, pass string) HttpLineSenderOption {
 	return func(s *HttpLineSender) {
@@ -145,7 +164,7 @@ func WithMinThroughput(bytesPerSecond int) HttpLineSenderOption {
 
 func WithHttpInitBufferSize(sizeInBytes int) HttpLineSenderOption {
 	return func(s *HttpLineSender) {
-		s.initBufSizeBytes = sizeInBytes
+		s.InitBufSizeBytes = sizeInBytes
 	}
 }
 
@@ -155,18 +174,11 @@ func WithHttpAddress(addr string) HttpLineSenderOption {
 	}
 }
 
-// WithHttpTls enables TLS connection encryption.
-func WithHttpTls() HttpLineSenderOption {
-	return func(s *HttpLineSender) {
-		s.tlsMode = tlsEnabled
-	}
-}
-
 // WithTlsInsecureSkipVerify enables TLS connection encryption,
 // but skips server certificate verification. Useful in test
 // environments with self-signed certificates. Do not use in
 // production environments.
-func WithHttpTlsInsecureSkipVerify() HttpLineSenderOption {
+func WithTlsInsecureSkipVerify() HttpLineSenderOption {
 	return func(s *HttpLineSender) {
 		s.tlsMode = tlsInsecureSkipVerify
 	}
@@ -181,27 +193,27 @@ func WithHttpTlsInsecureSkipVerify() HttpLineSenderOption {
 func WithHttpBufferCapacity(capacity int) HttpLineSenderOption {
 	return func(s *HttpLineSender) {
 		if capacity > 0 {
-			s.bufCap = capacity
+			s.BufCap = capacity
 		}
 	}
 }
 
-func HttpLineSenderFromConf(ctx context.Context, conf string) (*HttpLineSender, error) {
+func HttpLineSenderFromConf(ctx context.Context, config string) (*HttpLineSender, error) {
 	var (
 		user, pass, token string
 	)
 
-	data, err := parseConfigString(conf)
+	data, err := conf.ParseConfigString(config)
 	if err != nil {
 		return nil, err
 	}
 
-	if data.schema != "http" && data.schema != "https" {
-		return nil, fmt.Errorf("invalid schema: %s", data.schema)
+	if data.Schema != "http" && data.Schema != "https" {
+		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
 	}
 
 	opts := make([]HttpLineSenderOption, 0)
-	for k, v := range data.keyValuePairs {
+	for k, v := range data.KeyValuePairs {
 
 		switch strings.ToLower(k) {
 		case "addr":
@@ -221,14 +233,14 @@ func HttpLineSenderFromConf(ctx context.Context, conf string) (*HttpLineSender, 
 			opts = append(opts, WithBearerToken(token))
 		case "auto_flush":
 			if v == "on" {
-				return nil, NewConfigStrParseError("auto_flush option is not supported")
+				return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
 			}
 		case "auto_flush_rows", "auto_flush_bytes":
-			return nil, NewConfigStrParseError("auto_flush option is not supported")
+			return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
 		case "min_throughput", "init_buf_size", "max_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
-				return nil, NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
 
 			}
 			switch k {
@@ -245,7 +257,7 @@ func HttpLineSenderFromConf(ctx context.Context, conf string) (*HttpLineSender, 
 		case "grace_timeout", "retry_timeout":
 			timeout, err := strconv.Atoi(v)
 			if err != nil {
-				return nil, NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
 			}
 
 			timeoutDur := time.Duration(timeout * int(time.Millisecond))
@@ -261,18 +273,18 @@ func HttpLineSenderFromConf(ctx context.Context, conf string) (*HttpLineSender, 
 		case "tls_verify":
 			switch v {
 			case "on":
-				opts = append(opts, WithHttpTls())
+				opts = append(opts, WithTls())
 			case "unsafe_off":
-				opts = append(opts, WithHttpTlsInsecureSkipVerify())
+				opts = append(opts, WithTlsInsecureSkipVerify())
 			default:
-				return nil, NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
+				return nil, conf.NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
 			}
 		case "tls_roots":
-			return nil, NewConfigStrParseError("tls_roots is not available in the go client")
+			return nil, conf.NewConfigStrParseError("tls_roots is not available in the go client")
 		case "tls_roots_password":
-			return nil, NewConfigStrParseError("tls_roots_password is not available in the go client")
+			return nil, conf.NewConfigStrParseError("tls_roots_password is not available in the go client")
 		default:
-			return nil, NewConfigStrParseError("unsupported option %q", k)
+			return nil, conf.NewConfigStrParseError("unsupported option %q", k)
 		}
 
 	}
@@ -281,12 +293,23 @@ func HttpLineSenderFromConf(ctx context.Context, conf string) (*HttpLineSender, 
 
 func (s *HttpLineSender) Flush(ctx context.Context) error {
 	var (
-		err           error
 		req           *http.Request
 		retryInterval time.Duration
 
 		maxRetryInterval = time.Second
 	)
+
+	err := s.LastErr()
+	s.ClearLastErr()
+	if err != nil {
+		s.DiscardPendingMsg()
+		return err
+	}
+	if s.HasTable() {
+		s.DiscardPendingMsg()
+		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
+	}
+
 	uri := "http"
 	if s.tlsMode > 0 {
 		uri += "s"
@@ -323,6 +346,11 @@ func (s *HttpLineSender) Flush(ctx context.Context) error {
 
 		// If the requests succeeds with a non-error status code, flush has succeeded
 		if !isRetryableError(resp.StatusCode) {
+			// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
+			if s.Cap() > 3*s.BufCap {
+				// Shrink the buffer back to desired capacity.
+				s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
+			}
 			return nil
 		}
 		// Otherwise, we will retry until the timeout
@@ -340,6 +368,11 @@ func (s *HttpLineSender) Flush(ctx context.Context) error {
 				defer resp.Body.Close()
 
 				if !isRetryableError(resp.StatusCode) {
+					// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
+					if s.Cap() > 3*s.BufCap {
+						// Shrink the buffer back to desired capacity.
+						s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
+					}
 					return nil
 				}
 				retryErr = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
@@ -361,6 +394,8 @@ func (s *HttpLineSender) Flush(ctx context.Context) error {
 		}
 	}
 
+	// todo: shrink the buffer back down at some point...
+
 	return err
 }
 
@@ -371,7 +406,7 @@ func (s *HttpLineSender) Flush(ctx context.Context) error {
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
 func (s *HttpLineSender) Table(name string) *HttpLineSender {
-	s.buffer.table(name)
+	s.Buffer.Table(name)
 	return s
 }
 
@@ -382,7 +417,7 @@ func (s *HttpLineSender) Table(name string) *HttpLineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *HttpLineSender) Symbol(name, val string) *HttpLineSender {
-	s.buffer.symbol(name, val)
+	s.Buffer.Symbol(name, val)
 	return s
 }
 
@@ -393,7 +428,7 @@ func (s *HttpLineSender) Symbol(name, val string) *HttpLineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *HttpLineSender) Int64Column(name string, val int64) *HttpLineSender {
-	s.buffer.int64Column(name, val)
+	s.Buffer.Int64Column(name, val)
 	return s
 }
 
@@ -407,7 +442,7 @@ func (s *HttpLineSender) Int64Column(name string, val int64) *HttpLineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *HttpLineSender) Long256Column(name string, val *big.Int) *HttpLineSender {
-	s.buffer.long256Column(name, val)
+	s.Buffer.Long256Column(name, val)
 	return s
 }
 
@@ -418,7 +453,7 @@ func (s *HttpLineSender) Long256Column(name string, val *big.Int) *HttpLineSende
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *HttpLineSender) TimestampColumn(name string, ts time.Time) *HttpLineSender {
-	s.buffer.timestampColumn(name, ts)
+	s.Buffer.TimestampColumn(name, ts)
 	return s
 }
 
@@ -429,7 +464,7 @@ func (s *HttpLineSender) TimestampColumn(name string, ts time.Time) *HttpLineSen
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *HttpLineSender) Float64Column(name string, val float64) *HttpLineSender {
-	s.buffer.float64Column(name, val)
+	s.Buffer.Float64Column(name, val)
 	return s
 }
 
@@ -439,7 +474,7 @@ func (s *HttpLineSender) Float64Column(name string, val float64) *HttpLineSender
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *HttpLineSender) StringColumn(name, val string) *HttpLineSender {
-	s.stringColumn(name, val)
+	s.Buffer.StringColumn(name, val)
 	return s
 }
 
@@ -449,7 +484,7 @@ func (s *HttpLineSender) StringColumn(name, val string) *HttpLineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *HttpLineSender) BoolColumn(name string, val bool) *HttpLineSender {
-	s.buffer.boolColumn(name, val)
+	s.Buffer.BoolColumn(name, val)
 	return s
 }
 
@@ -467,11 +502,11 @@ func (s *HttpLineSender) Close() {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *HttpLineSender) AtNow(ctx context.Context) error {
-	err := s.at(time.Time{}, false)
+	err := s.Buffer.At(time.Time{}, false)
 	if err != nil {
 		return err
 	}
-	if s.Len() > s.bufCap {
+	if s.Len() > s.BufCap {
 		return s.Flush(ctx)
 	}
 	return nil
@@ -483,11 +518,11 @@ func (s *HttpLineSender) AtNow(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *HttpLineSender) At(ctx context.Context, ts time.Time) error {
-	err := s.at(ts, true)
+	err := s.Buffer.At(ts, true)
 	if err != nil {
 		return err
 	}
-	if s.Len() > s.bufCap {
+	if s.Len() > s.BufCap {
 		return s.Flush(ctx)
 	}
 	return nil

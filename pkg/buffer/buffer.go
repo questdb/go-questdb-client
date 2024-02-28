@@ -22,12 +22,13 @@
  *
  ******************************************************************************/
 
-package questdb
+package buffer
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"strconv"
@@ -40,19 +41,19 @@ import (
 var ErrInvalidMsg = errors.New("invalid message")
 
 const (
-	defaultBufferCapacity = 128 * 1024
-	defaultFileNameLimit  = 127
+	DefaultBufferCapacity = 128 * 1024
+	DefaultFileNameLimit  = 127
 )
 
-// buffer is a wrapper on top of bytes.buffer. It extends the
+// Buffer is a wrapper on top of bytes.Buffer. It extends the
 // original struct with methods for writing int64 and float64
 // numbers without unnecessary allocations.
-type buffer struct {
+type Buffer struct {
 	bytes.Buffer
 
-	bufCap           int
-	initBufSizeBytes int
-	fileNameLimit    int
+	BufCap           int
+	InitBufSizeBytes int
+	FileNameLimit    int
 	lastMsgPos       int
 	lastErr          error
 	hasTable         bool
@@ -60,14 +61,34 @@ type buffer struct {
 	hasFields        bool
 }
 
-func (b *buffer) WriteInt(i int64) {
+func (b *Buffer) HasTable() bool {
+	return b.hasTable
+}
+
+func (b *Buffer) HasTags() bool {
+	return b.hasTags
+}
+
+func (b *Buffer) HasFields() bool {
+	return b.hasFields
+}
+
+func (b *Buffer) LastErr() error {
+	return b.lastErr
+}
+
+func (b *Buffer) ClearLastErr() {
+	b.lastErr = nil
+}
+
+func (b *Buffer) WriteInt(i int64) {
 	// We need up to 20 bytes to fit an int64, including a sign.
 	var a [20]byte
 	s := strconv.AppendInt(a[0:0], i, 10)
 	b.Write(s)
 }
 
-func (b *buffer) WriteFloat(f float64) {
+func (b *Buffer) writeFloat(f float64) {
 	if math.IsNaN(f) {
 		b.WriteString("NaN")
 		return
@@ -84,20 +105,30 @@ func (b *buffer) WriteFloat(f float64) {
 	b.Write(s)
 }
 
-func (b *buffer) WriteBigInt(i *big.Int) {
+func (b *Buffer) WriteBigInt(i *big.Int) {
 	// We need up to 64 bytes to fit an unsigned 256-bit number.
 	var a [64]byte
 	s := i.Append(a[0:0], 16)
 	b.Write(s)
 }
 
-func (buf *buffer) writeTableName(str string) error {
+func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
+	n, err := b.Buffer.WriteTo(w)
+	if err != nil {
+		b.lastMsgPos -= int(n)
+		return n, err
+	}
+	b.lastMsgPos = 0
+	return n, nil
+}
+
+func (buf *Buffer) writeTableName(str string) error {
 	if str == "" {
 		return fmt.Errorf("table name cannot be empty: %w", ErrInvalidMsg)
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > buf.fileNameLimit {
+	if len(str) > buf.FileNameLimit {
 		return fmt.Errorf("table name length exceeds the limit: %w", ErrInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
@@ -191,13 +222,13 @@ func illegalTableNameChar(ch byte) bool {
 	return false
 }
 
-func (buf *buffer) writeColumnName(str string) error {
+func (buf *Buffer) writeColumnName(str string) error {
 	if str == "" {
 		return fmt.Errorf("column name cannot be empty: %w", ErrInvalidMsg)
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > buf.fileNameLimit {
+	if len(str) > buf.FileNameLimit {
 		return fmt.Errorf("column name length exceeds the limit: %w", ErrInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
@@ -291,7 +322,7 @@ func illegalColumnNameChar(ch byte) bool {
 	return false
 }
 
-func (buf *buffer) writeStrValue(str string, quoted bool) error {
+func (buf *Buffer) writeStrValue(str string, quoted bool) error {
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
 	for i := 0; i < len(str); i++ {
@@ -325,7 +356,7 @@ func (buf *buffer) writeStrValue(str string, quoted bool) error {
 	return nil
 }
 
-func (b *buffer) prepareForField() bool {
+func (b *Buffer) prepareForField() bool {
 	if b.lastErr != nil {
 		return false
 	}
@@ -341,12 +372,12 @@ func (b *buffer) prepareForField() bool {
 	return true
 }
 
-func (b *buffer) discardPendingMsg() {
+func (b *Buffer) DiscardPendingMsg() {
 	b.Truncate(b.lastMsgPos)
 	b.resetMsgFlags()
 }
 
-func (b *buffer) resetMsgFlags() {
+func (b *Buffer) resetMsgFlags() {
 	b.hasTable = false
 	b.hasTags = false
 	b.hasFields = false
@@ -354,7 +385,7 @@ func (b *buffer) resetMsgFlags() {
 
 // Messages returns a copy of accumulated ILP messages that are not
 // flushed to the TCP connection yet. Useful for debugging purposes.
-func (b *buffer) Messages() string {
+func (b *Buffer) Messages() string {
 	return b.String()
 }
 
@@ -364,7 +395,7 @@ func (b *buffer) Messages() string {
 // Table name cannot contain any of the following characters:
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
-func (b *buffer) table(name string) *buffer {
+func (b *Buffer) Table(name string) *Buffer {
 	if b.lastErr != nil {
 		return b
 	}
@@ -386,7 +417,7 @@ func (b *buffer) table(name string) *buffer {
 // Symbol name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *buffer) symbol(name, val string) *buffer {
+func (b *Buffer) Symbol(name, val string) *Buffer {
 	if b.lastErr != nil {
 		return b
 	}
@@ -418,7 +449,7 @@ func (b *buffer) symbol(name, val string) *buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *buffer) int64Column(name string, val int64) *buffer {
+func (b *Buffer) Int64Column(name string, val int64) *Buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -442,7 +473,7 @@ func (b *buffer) int64Column(name string, val int64) *buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *buffer) long256Column(name string, val *big.Int) *buffer {
+func (b *Buffer) Long256Column(name string, val *big.Int) *Buffer {
 	if val.Sign() < 0 {
 		if b.lastErr != nil {
 			return b
@@ -482,7 +513,7 @@ func (b *buffer) long256Column(name string, val *big.Int) *buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *buffer) timestampColumn(name string, ts time.Time) *buffer {
+func (b *Buffer) TimestampColumn(name string, ts time.Time) *Buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -503,7 +534,7 @@ func (b *buffer) timestampColumn(name string, ts time.Time) *buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *buffer) float64Column(name string, val float64) {
+func (b *Buffer) Float64Column(name string, val float64) {
 	if !b.prepareForField() {
 		return
 	}
@@ -512,7 +543,7 @@ func (b *buffer) float64Column(name string, val float64) {
 		return
 	}
 	b.WriteByte('=')
-	b.WriteFloat(val)
+	b.writeFloat(val)
 	b.hasFields = true
 }
 
@@ -521,7 +552,7 @@ func (b *buffer) float64Column(name string, val float64) {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *buffer) stringColumn(name, val string) {
+func (b *Buffer) StringColumn(name, val string) {
 	if !b.prepareForField() {
 		return
 	}
@@ -539,7 +570,7 @@ func (b *buffer) stringColumn(name, val string) {
 	b.hasFields = true
 }
 
-func (b *buffer) boolColumn(name string, val bool) *buffer {
+func (b *Buffer) BoolColumn(name string, val bool) *Buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -557,19 +588,19 @@ func (b *buffer) boolColumn(name string, val bool) *buffer {
 	return b
 }
 
-func (b *buffer) at(ts time.Time, sendTs bool) error {
+func (b *Buffer) At(ts time.Time, sendTs bool) error {
 	err := b.lastErr
 	b.lastErr = nil
 	if err != nil {
-		b.discardPendingMsg()
+		b.DiscardPendingMsg()
 		return err
 	}
 	if !b.hasTable {
-		b.discardPendingMsg()
+		b.DiscardPendingMsg()
 		return fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
 	}
 	if !b.hasTags && !b.hasFields {
-		b.discardPendingMsg()
+		b.DiscardPendingMsg()
 		return fmt.Errorf("no symbols or columns were provided: %w", ErrInvalidMsg)
 	}
 
