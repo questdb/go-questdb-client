@@ -8,7 +8,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"reflect"
 	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type ServerType int64
@@ -190,4 +195,17 @@ func (s *TestServer) Close() {
 	close(s.closeCh)
 	s.tcpListener.Close()
 	s.wg.Wait()
+}
+
+func ExpectLines(t *testing.T, linesCh chan string, expected []string) {
+	actual := make([]string, 0)
+	assert.Eventually(t, func() bool {
+		select {
+		case l := <-linesCh:
+			actual = append(actual, l)
+		default:
+			return false
+		}
+		return reflect.DeepEqual(expected, actual)
+	}, 3*time.Second, 100*time.Millisecond)
 }

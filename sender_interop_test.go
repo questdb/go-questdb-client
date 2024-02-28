@@ -33,6 +33,7 @@ import (
 	"testing"
 
 	qdb "github.com/questdb/go-questdb-client/v3"
+	"github.com/questdb/go-questdb-client/v3/pkg/test/utils"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -72,10 +73,10 @@ func TestClientInterop(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
+			srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			sender.Table(tc.Table)
@@ -105,7 +106,7 @@ func TestClientInterop(t *testing.T) {
 				err = sender.Flush(ctx)
 				assert.NoError(t, err)
 
-				expectLines(t, srv.backCh, strings.Split(tc.Result.Line, "\n"))
+				utils.ExpectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
 			case "ERROR":
 				assert.Error(t, err)
 			default:
@@ -113,7 +114,7 @@ func TestClientInterop(t *testing.T) {
 			}
 
 			sender.Close()
-			srv.close()
+			srv.Close()
 		})
 	}
 }

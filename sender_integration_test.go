@@ -42,6 +42,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	qdb "github.com/questdb/go-questdb-client/v3"
+	qdbHttp "github.com/questdb/go-questdb-client/v3/pkg/http"
 )
 
 const (
@@ -49,6 +50,8 @@ const (
 	networkName         = "test-network-v3"
 	eventualDataTimeout = 60 * time.Second
 )
+
+type writerFn func(s *qdb.LineSender) error
 
 type questdbContainer struct {
 	testcontainers.Container
@@ -791,10 +794,10 @@ func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 	assert.NoError(t, err)
 	defer questdbC.Stop(ctx)
 
-	sender, err := qdb.NewHttpLineSender(
-		qdb.WithHttpAddress(questdbC.proxyIlpHttpBasicAuthAddress),
-		qdb.WithBasicAuth(basicAuthUser, basicAuthPass),
-		qdb.WithHttpTlsInsecureSkipVerify(),
+	sender, err := qdbHttp.NewHttpLineSender(
+		qdbHttp.WithHttpAddress(questdbC.proxyIlpHttpBasicAuthAddress),
+		qdbHttp.WithBasicAuth(basicAuthUser, basicAuthPass),
+		qdbHttp.WithTlsInsecureSkipVerify(),
 	)
 	assert.NoError(t, err)
 	defer sender.Close()

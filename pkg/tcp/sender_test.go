@@ -28,7 +28,6 @@ import (
 	"context"
 	"math"
 	"math/big"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -42,8 +41,6 @@ const (
 	testTable   = "my_test_table"
 	networkName = "test-network-v3"
 )
-
-type writerFn func(s *LineSender) error
 
 func TestValidWrites(t *testing.T) {
 	ctx := context.Background()
@@ -102,7 +99,7 @@ func TestValidWrites(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.BackCh, tc.expectedLines)
+			utils.ExpectLines(t, srv.BackCh, tc.expectedLines)
 
 			srv.Close()
 		})
@@ -138,7 +135,7 @@ func TestTimestampSerialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.BackCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val.UnixMicro(), 10) + "t"})
+			utils.ExpectLines(t, srv.BackCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val.UnixMicro(), 10) + "t"})
 
 			srv.Close()
 		})
@@ -176,7 +173,7 @@ func TestInt64Serialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.BackCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i"})
+			utils.ExpectLines(t, srv.BackCh, []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i"})
 
 			srv.Close()
 		})
@@ -216,7 +213,7 @@ func TestLong256Column(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.BackCh, []string{"my_test_table a_col=" + tc.expected + "i"})
+			utils.ExpectLines(t, srv.BackCh, []string{"my_test_table a_col=" + tc.expected + "i"})
 
 			srv.Close()
 		})
@@ -261,7 +258,7 @@ func TestFloat64Serialization(t *testing.T) {
 			sender.Close()
 
 			// Now check what was received by the server.
-			expectLines(t, srv.BackCh, []string{"my_test_table a_col=" + tc.expected})
+			utils.ExpectLines(t, srv.BackCh, []string{"my_test_table a_col=" + tc.expected})
 
 			srv.Close()
 		})
@@ -540,7 +537,7 @@ func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	// The second message should be discarded.
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
-	expectLines(t, srv.BackCh, []string{testTable + " foo=\"bar\""})
+	utils.ExpectLines(t, srv.BackCh, []string{testTable + " foo=\"bar\""})
 }
 
 func TestErrorOnUnavailableServer(t *testing.T) {
@@ -654,17 +651,4 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 			At(ctx, time.UnixMicro(int64(1000*i)))
 	}
 	sender.Flush(ctx)
-}
-
-func expectLines(t *testing.T, linesCh chan string, expected []string) {
-	actual := make([]string, 0)
-	assert.Eventually(t, func() bool {
-		select {
-		case l := <-linesCh:
-			actual = append(actual, l)
-		default:
-			return false
-		}
-		return reflect.DeepEqual(expected, actual)
-	}, 3*time.Second, 100*time.Millisecond)
 }
