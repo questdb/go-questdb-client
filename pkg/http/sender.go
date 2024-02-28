@@ -51,7 +51,7 @@ const (
 	tlsInsecureSkipVerify tlsMode = 2
 )
 
-type HttpLineSender struct {
+type LineSender struct {
 	buffer.Buffer
 
 	address                     string
@@ -67,10 +67,10 @@ type HttpLineSender struct {
 	client http.Client
 }
 
-type HttpLineSenderOption func(s *HttpLineSender)
+type LineSenderOption func(s *LineSender)
 
-func NewHttpLineSender(opts ...HttpLineSenderOption) (*HttpLineSender, error) {
-	s := &HttpLineSender{
+func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
+	s := &LineSender{
 		address:                     "127.0.0.1:9000",
 		minThroughputBytesPerSecond: 100 * 1024,
 		graceTimeout:                5 * time.Second,
@@ -124,52 +124,52 @@ var (
 	}
 )
 
-// WithHttpTls enables TLS connection encryption.
-func WithTls() HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+// WithTls enables TLS connection encryption.
+func WithTls() LineSenderOption {
+	return func(s *LineSender) {
 		s.tlsMode = tlsEnabled
 	}
 }
 
-func WithBasicAuth(user, pass string) HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithBasicAuth(user, pass string) LineSenderOption {
+	return func(s *LineSender) {
 		s.user = user
 		s.pass = pass
 	}
 }
 
-func WithBearerToken(token string) HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithBearerToken(token string) LineSenderOption {
+	return func(s *LineSender) {
 		s.token = token
 	}
 }
 
-func WithGraceTimeout(timeout time.Duration) HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithGraceTimeout(timeout time.Duration) LineSenderOption {
+	return func(s *LineSender) {
 		s.graceTimeout = timeout
 	}
 }
 
-func WithRetryTimeout(t time.Duration) HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithRetryTimeout(t time.Duration) LineSenderOption {
+	return func(s *LineSender) {
 		s.retryTimeout = t
 	}
 }
 
-func WithMinThroughput(bytesPerSecond int) HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithMinThroughput(bytesPerSecond int) LineSenderOption {
+	return func(s *LineSender) {
 		s.minThroughputBytesPerSecond = bytesPerSecond
 	}
 }
 
-func WithHttpInitBufferSize(sizeInBytes int) HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithInitBufferSize(sizeInBytes int) LineSenderOption {
+	return func(s *LineSender) {
 		s.InitBufSizeBytes = sizeInBytes
 	}
 }
 
-func WithHttpAddress(addr string) HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithAddress(addr string) LineSenderOption {
+	return func(s *LineSender) {
 		s.address = addr
 	}
 }
@@ -178,27 +178,27 @@ func WithHttpAddress(addr string) HttpLineSenderOption {
 // but skips server certificate verification. Useful in test
 // environments with self-signed certificates. Do not use in
 // production environments.
-func WithTlsInsecureSkipVerify() HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithTlsInsecureSkipVerify() LineSenderOption {
+	return func(s *LineSender) {
 		s.tlsMode = tlsInsecureSkipVerify
 	}
 }
 
-// WithHttpBufferCapacity sets desired buffer capacity in bytes to
+// WithBufferCapacity sets desired buffer capacity in bytes to
 // be used when sending ILP messages. Defaults to 128KB.
 //
 // This setting is a soft limit, i.e. the underlying buffer may
 // grow larger than the provided value, but will shrink on a
 // At, AtNow, or Flush call.
-func WithHttpBufferCapacity(capacity int) HttpLineSenderOption {
-	return func(s *HttpLineSender) {
+func WithBufferCapacity(capacity int) LineSenderOption {
+	return func(s *LineSender) {
 		if capacity > 0 {
 			s.BufCap = capacity
 		}
 	}
 }
 
-func HttpLineSenderFromConf(ctx context.Context, config string) (*HttpLineSender, error) {
+func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
 	var (
 		user, pass, token string
 	)
@@ -212,12 +212,12 @@ func HttpLineSenderFromConf(ctx context.Context, config string) (*HttpLineSender
 		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
 	}
 
-	opts := make([]HttpLineSenderOption, 0)
+	opts := make([]LineSenderOption, 0)
 	for k, v := range data.KeyValuePairs {
 
 		switch strings.ToLower(k) {
 		case "addr":
-			opts = append(opts, WithHttpAddress(v))
+			opts = append(opts, WithAddress(v))
 		case "user":
 			user = v
 			if user != "" && pass != "" {
@@ -247,9 +247,9 @@ func HttpLineSenderFromConf(ctx context.Context, config string) (*HttpLineSender
 			case "min_throughput":
 				opts = append(opts, WithMinThroughput(parsedVal))
 			case "init_buf_size":
-				opts = append(opts, WithHttpInitBufferSize(parsedVal))
+				opts = append(opts, WithInitBufferSize(parsedVal))
 			case "max_buf_size":
-				opts = append(opts, WithHttpBufferCapacity(parsedVal))
+				opts = append(opts, WithBufferCapacity(parsedVal))
 			default:
 				panic("add a case for " + k)
 			}
@@ -288,10 +288,10 @@ func HttpLineSenderFromConf(ctx context.Context, config string) (*HttpLineSender
 		}
 
 	}
-	return NewHttpLineSender(opts...)
+	return NewLineSender(opts...)
 }
 
-func (s *HttpLineSender) Flush(ctx context.Context) error {
+func (s *LineSender) Flush(ctx context.Context) error {
 	var (
 		req           *http.Request
 		retryInterval time.Duration
@@ -405,7 +405,7 @@ func (s *HttpLineSender) Flush(ctx context.Context) error {
 // Table name cannot contain any of the following characters:
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
-func (s *HttpLineSender) Table(name string) *HttpLineSender {
+func (s *LineSender) Table(name string) *LineSender {
 	s.Buffer.Table(name)
 	return s
 }
@@ -416,7 +416,7 @@ func (s *HttpLineSender) Table(name string) *HttpLineSender {
 // Symbol name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *HttpLineSender) Symbol(name, val string) *HttpLineSender {
+func (s *LineSender) Symbol(name, val string) *LineSender {
 	s.Buffer.Symbol(name, val)
 	return s
 }
@@ -427,7 +427,7 @@ func (s *HttpLineSender) Symbol(name, val string) *HttpLineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *HttpLineSender) Int64Column(name string, val int64) *HttpLineSender {
+func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 	s.Buffer.Int64Column(name, val)
 	return s
 }
@@ -441,7 +441,7 @@ func (s *HttpLineSender) Int64Column(name string, val int64) *HttpLineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *HttpLineSender) Long256Column(name string, val *big.Int) *HttpLineSender {
+func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 	s.Buffer.Long256Column(name, val)
 	return s
 }
@@ -452,7 +452,7 @@ func (s *HttpLineSender) Long256Column(name string, val *big.Int) *HttpLineSende
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *HttpLineSender) TimestampColumn(name string, ts time.Time) *HttpLineSender {
+func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
 	s.Buffer.TimestampColumn(name, ts)
 	return s
 }
@@ -463,7 +463,7 @@ func (s *HttpLineSender) TimestampColumn(name string, ts time.Time) *HttpLineSen
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *HttpLineSender) Float64Column(name string, val float64) *HttpLineSender {
+func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 	s.Buffer.Float64Column(name, val)
 	return s
 }
@@ -473,7 +473,7 @@ func (s *HttpLineSender) Float64Column(name string, val float64) *HttpLineSender
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *HttpLineSender) StringColumn(name, val string) *HttpLineSender {
+func (s *LineSender) StringColumn(name, val string) *LineSender {
 	s.Buffer.StringColumn(name, val)
 	return s
 }
@@ -483,12 +483,12 @@ func (s *HttpLineSender) StringColumn(name, val string) *HttpLineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *HttpLineSender) BoolColumn(name string, val bool) *HttpLineSender {
+func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	s.Buffer.BoolColumn(name, val)
 	return s
 }
 
-func (s *HttpLineSender) Close() {
+func (s *LineSender) Close() {
 	newCt := clientCt.Add(-1)
 	if newCt == 0 {
 		globalTransport.CloseIdleConnections()
@@ -501,7 +501,7 @@ func (s *HttpLineSender) Close() {
 //
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
-func (s *HttpLineSender) AtNow(ctx context.Context) error {
+func (s *LineSender) AtNow(ctx context.Context) error {
 	err := s.Buffer.At(time.Time{}, false)
 	if err != nil {
 		return err
@@ -517,7 +517,7 @@ func (s *HttpLineSender) AtNow(ctx context.Context) error {
 //
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
-func (s *HttpLineSender) At(ctx context.Context, ts time.Time) error {
+func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 	err := s.Buffer.At(ts, true)
 	if err != nil {
 		return err

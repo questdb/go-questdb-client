@@ -22,7 +22,7 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewHttpLineSender(WithHttpAddress(srv.Addr()))
+	sender, err := NewLineSender(WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close()
 
@@ -48,8 +48,8 @@ func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewHttpLineSender(
-		WithHttpAddress(srv.Addr()),
+	sender, err := NewLineSender(
+		WithAddress(srv.Addr()),
 		WithGraceTimeout(10*time.Millisecond),
 	)
 	assert.NoError(t, err)
@@ -71,7 +71,7 @@ func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 	assert.NoError(b, err)
 	defer srv.Close()
 
-	sender, err := NewHttpLineSender(WithHttpAddress(srv.Addr()))
+	sender, err := NewLineSender(WithAddress(srv.Addr()))
 	assert.NoError(b, err)
 
 	b.ResetTimer()
@@ -100,7 +100,7 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	assert.NoError(b, err)
 	defer srv.Close()
 
-	sender, err := NewHttpLineSender(WithHttpAddress(srv.Addr()))
+	sender, err := NewLineSender(WithAddress(srv.Addr()))
 	assert.NoError(b, err)
 
 	b.ResetTimer()

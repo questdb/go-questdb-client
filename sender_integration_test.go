@@ -795,8 +795,8 @@ func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 	assert.NoError(t, err)
 	defer questdbC.Stop(ctx)
 
-	sender, err := qdbHttp.NewHttpLineSender(
-		qdbHttp.WithHttpAddress(questdbC.proxyIlpHttpBasicAuthAddress),
+	sender, err := qdbHttp.NewLineSender(
+		qdbHttp.WithAddress(questdbC.proxyIlpHttpBasicAuthAddress),
 		qdbHttp.WithBasicAuth(basicAuthUser, basicAuthPass),
 		qdbHttp.WithTlsInsecureSkipVerify(),
 	)
