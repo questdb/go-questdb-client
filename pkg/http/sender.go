@@ -432,8 +432,6 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		}
 	}
 
-	// todo: shrink the buffer back down at some point...
-
 	return err
 }
 
