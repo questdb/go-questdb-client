@@ -61,27 +61,32 @@ type Buffer struct {
 	hasFields        bool
 }
 
+// HasTable returns true if a table name was provided to the buffer
 func (b *Buffer) HasTable() bool {
 	return b.hasTable
 }
 
+// HasTags returns true if a symbol column has been written to the buffer
 func (b *Buffer) HasTags() bool {
 	return b.hasTags
 }
 
+// HasFields returns true if a non-symbol column has been written to the buffer
 func (b *Buffer) HasFields() bool {
 	return b.hasFields
 }
 
+// LastErr stores the most recent error encountered by the buffer
 func (b *Buffer) LastErr() error {
 	return b.lastErr
 }
 
+// ClearLastErr sets the internal lastErr field to nil
 func (b *Buffer) ClearLastErr() {
 	b.lastErr = nil
 }
 
-func (b *Buffer) WriteInt(i int64) {
+func (b *Buffer) writeInt(i int64) {
 	// We need up to 20 bytes to fit an int64, including a sign.
 	var a [20]byte
 	s := strconv.AppendInt(a[0:0], i, 10)
@@ -105,13 +110,17 @@ func (b *Buffer) writeFloat(f float64) {
 	b.Write(s)
 }
 
-func (b *Buffer) WriteBigInt(i *big.Int) {
+// writeBigInt writes a bigint value to the buffer
+func (b *Buffer) writeBigInt(i *big.Int) {
 	// We need up to 64 bytes to fit an unsigned 256-bit number.
 	var a [64]byte
 	s := i.Append(a[0:0], 16)
 	b.Write(s)
 }
 
+// WriteTo wraps the built-in bytes.Buffer.WriteTo method
+// and writes the contents of the buffer to the provided
+// io.Writer
 func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
 	n, err := b.Buffer.WriteTo(w)
 	if err != nil {
@@ -458,7 +467,7 @@ func (b *Buffer) Int64Column(name string, val int64) *Buffer {
 		return b
 	}
 	b.WriteByte('=')
-	b.WriteInt(val)
+	b.writeInt(val)
 	b.WriteByte('i')
 	b.hasFields = true
 	return b
@@ -498,7 +507,7 @@ func (b *Buffer) Long256Column(name string, val *big.Int) *Buffer {
 	b.WriteByte('=')
 	b.WriteByte('0')
 	b.WriteByte('x')
-	b.WriteBigInt(val)
+	b.writeBigInt(val)
 	b.WriteByte('i')
 	if b.lastErr != nil {
 		return b
@@ -522,7 +531,7 @@ func (b *Buffer) TimestampColumn(name string, ts time.Time) *Buffer {
 		return b
 	}
 	b.WriteByte('=')
-	b.WriteInt(ts.UnixMicro())
+	b.writeInt(ts.UnixMicro())
 	b.WriteByte('t')
 	b.hasFields = true
 	return b
@@ -570,6 +579,11 @@ func (b *Buffer) StringColumn(name, val string) {
 	b.hasFields = true
 }
 
+// BoolColumn adds a boolean column value to the ILP message.
+//
+// Column name cannot contain any of the following characters:
+// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
+// '-', '*' '%%', '~', or a non-printable char.
 func (b *Buffer) BoolColumn(name string, val bool) *Buffer {
 	if !b.prepareForField() {
 		return b
@@ -606,7 +620,7 @@ func (b *Buffer) At(ts time.Time, sendTs bool) error {
 
 	if sendTs {
 		b.WriteByte(' ')
-		b.WriteInt(ts.UnixNano())
+		b.writeInt(ts.UnixNano())
 	}
 	b.WriteByte('\n')
 

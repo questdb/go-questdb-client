@@ -51,6 +51,12 @@ const (
 	tlsInsecureSkipVerify tlsMode = 2
 )
 
+// LineSender allows you to insert rows into QuestDB by sending ILP
+// messages over HTTP(S).
+//
+// Each sender corresponds to a single HTTP client. All senders
+// utilize a global transport for connection pooling. A sender
+// should not be called concurrently by multiple goroutines.
 type LineSender struct {
 	buffer.Buffer
 
@@ -67,6 +73,7 @@ type LineSender struct {
 	client http.Client
 }
 
+// LineSenderOption defines line sender option.
 type LineSenderOption func(s *LineSender)
 
 func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
@@ -131,6 +138,8 @@ func WithTls() LineSenderOption {
 	}
 }
 
+// WithBasicAuth sets a Basic authentication header for
+// ILP requests over HTTP
 func WithBasicAuth(user, pass string) LineSenderOption {
 	return func(s *LineSender) {
 		s.user = user
@@ -138,36 +147,55 @@ func WithBasicAuth(user, pass string) LineSenderOption {
 	}
 }
 
+// WithBearerToken sets a Bearer token Authentication header for
+// ILP requests
 func WithBearerToken(token string) LineSenderOption {
 	return func(s *LineSender) {
 		s.token = token
 	}
 }
 
+// WithGraceTimeout is used in combination with min throughput
+// to set the timeout of an ILP request. Defaults to 5 seconds
+//
+// timeout = (request.len() / min_throughput) + grace
 func WithGraceTimeout(timeout time.Duration) LineSenderOption {
 	return func(s *LineSender) {
 		s.graceTimeout = timeout
 	}
 }
 
-func WithRetryTimeout(t time.Duration) LineSenderOption {
-	return func(s *LineSender) {
-		s.retryTimeout = t
-	}
-}
-
+// WithMinThroughput is used in combination with grace timeout
+// to set the timeout of an ILP request. Defaults to 100KiB/s
+//
+// timeout = (request.len() / min_throughput) + grace
 func WithMinThroughput(bytesPerSecond int) LineSenderOption {
 	return func(s *LineSender) {
 		s.minThroughputBytesPerSecond = bytesPerSecond
 	}
 }
 
+// WithRetryTimeout is the cumulative maximum duration spend in
+// retries. Defaults to 10 seconds.
+//
+// Only network-related errors and QuestDB-specific 5xx response
+// codes are retryable.
+func WithRetryTimeout(t time.Duration) LineSenderOption {
+	return func(s *LineSender) {
+		s.retryTimeout = t
+	}
+}
+
+// WithInitBuffer size sets the desired initial buffer capacity
+// in bytes to be used when sending ILP messages. Defaults to 0.
 func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *LineSender) {
 		s.InitBufSizeBytes = sizeInBytes
 	}
 }
 
+// WithAddress sets address to connect to. Should be in the
+// "host:port" format. Defaults to "127.0.0.1:9000".
 func WithAddress(addr string) LineSenderOption {
 	return func(s *LineSender) {
 		s.address = addr
@@ -198,6 +226,7 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 	}
 }
 
+// LineSenderFromConf creates a LineSender using the QuestDB config string format.
 func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
 	var (
 		user, pass, token string
@@ -291,6 +320,15 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 	return NewLineSender(opts...)
 }
 
+// Flush flushes the accumulated messages to the underlying HTTP
+// client. Should be called periodically to make sure that
+// all messages are sent to the server.
+//
+// For optimal performance, this method should not be called after
+// each ILP message. Instead, the messages should be written in
+// batches followed by a Flush call. Optimal batch size may vary
+// from 100 to 1,000 messages depending on the message size and
+// configured buffer capacity.
 func (s *LineSender) Flush(ctx context.Context) error {
 	var (
 		req           *http.Request
@@ -488,6 +526,8 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 	return s
 }
 
+// Close closes the underlying HTTP client. If no clients remain open,
+// the global http.Transport will close all idle connections.
 func (s *LineSender) Close() {
 	newCt := clientCt.Add(-1)
 	if newCt == 0 {

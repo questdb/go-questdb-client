@@ -55,7 +55,7 @@ const (
 )
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
-// messages over HTTP(S)/TCP(S).
+// messages over TCP(S).
 //
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
@@ -135,6 +135,8 @@ func WithFileNameLimit(limit int) LineSenderOption {
 	}
 }
 
+// WithInitBuffer size sets the desired initial buffer capacity
+// in bytes to be used when sending ILP messages. Defaults to 0.
 func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *LineSender) {
 		s.InitBufSizeBytes = sizeInBytes
@@ -321,6 +323,7 @@ func optsFromConf(config string) ([]LineSenderOption, error) {
 	return opts, nil
 }
 
+// LineSenderFromConf creates a LineSender using the QuestDB config string format.
 func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
 	opts, err := optsFromConf(config)
 	if err != nil {
@@ -425,7 +428,7 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 }
 
 // Flush flushes the accumulated messages to the underlying TCP
-// connection or HTTP client. Should be called periodically to make sure that
+// connection. Should be called periodically to make sure that
 // all messages are sent to the server.
 //
 // For optimal performance, this method should not be called after
