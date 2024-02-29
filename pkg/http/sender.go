@@ -83,10 +83,7 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 		graceTimeout:                5 * time.Second,
 		retryTimeout:                10 * time.Second,
 
-		Buffer: buffer.Buffer{
-			BufCap:        buffer.DefaultBufferCapacity,
-			FileNameLimit: buffer.DefaultFileNameLimit,
-		},
+		Buffer: *buffer.NewBuffer(),
 	}
 
 	for _, opt := range opts {

@@ -61,6 +61,14 @@ type Buffer struct {
 	hasFields        bool
 }
 
+// NewBuffer initializes a pointer to a Buffer with default values
+func NewBuffer() *Buffer {
+	return &Buffer{
+		BufCap:        DefaultBufferCapacity,
+		FileNameLimit: DefaultFileNameLimit,
+	}
+}
+
 // HasTable returns true if a table name was provided to the buffer
 func (b *Buffer) HasTable() bool {
 	return b.hasTable
@@ -543,17 +551,18 @@ func (b *Buffer) TimestampColumn(name string, ts time.Time) *Buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) Float64Column(name string, val float64) {
+func (b *Buffer) Float64Column(name string, val float64) *Buffer {
 	if !b.prepareForField() {
-		return
+		return b
 	}
 	b.lastErr = b.writeColumnName(name)
 	if b.lastErr != nil {
-		return
+		return b
 	}
 	b.WriteByte('=')
 	b.writeFloat(val)
 	b.hasFields = true
+	return b
 }
 
 // StringColumn adds a string column value to the ILP message.
@@ -561,22 +570,23 @@ func (b *Buffer) Float64Column(name string, val float64) {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) StringColumn(name, val string) {
+func (b *Buffer) StringColumn(name, val string) *Buffer {
 	if !b.prepareForField() {
-		return
+		return b
 	}
 	b.lastErr = b.writeColumnName(name)
 	if b.lastErr != nil {
-		return
+		return b
 	}
 	b.WriteByte('=')
 	b.WriteByte('"')
 	b.lastErr = b.writeStrValue(val, true)
 	if b.lastErr != nil {
-		return
+		return b
 	}
 	b.WriteByte('"')
 	b.hasFields = true
+	return b
 }
 
 // BoolColumn adds a boolean column value to the ILP message.

@@ -158,10 +158,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		address: "127.0.0.1:9009",
 		tlsMode: tlsDisabled,
 
-		Buffer: buffer.Buffer{
-			BufCap:        buffer.DefaultBufferCapacity,
-			FileNameLimit: buffer.DefaultFileNameLimit,
-		},
+		Buffer: *buffer.NewBuffer(),
 	}
 
 	for _, opt := range opts {
