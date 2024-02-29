@@ -371,3 +371,19 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 		})
 	}
 }
+
+func TestInvalidMessageGetsDiscarded(t *testing.T) {
+
+	buf := NewBuffer()
+
+	// Write a valid message.
+	err := buf.Table(testTable).StringColumn("foo", "bar").At(time.Time{}, false)
+	assert.NoError(t, err)
+	// Then write perform an incorrect chain of calls.
+	err = buf.Table(testTable).StringColumn("foo", "bar").Symbol("sym", "42").At(time.Time{}, false)
+	assert.Error(t, err)
+
+	// The second message should be discarded.
+	expectedLines := []string{testTable + " foo=\"bar\""}
+	assert.Equal(t, strings.Join(expectedLines, "\n")+"\n", buf.Messages())
+}

@@ -170,30 +170,6 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	assert.Empty(t, sender.Messages())
 }
 
-func TestInvalidMessageGetsDiscarded(t *testing.T) {
-	ctx := context.Background()
-
-	srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
-	assert.NoError(t, err)
-	defer srv.Close()
-
-	sender, err := NewLineSender(ctx, WithAddress(srv.Addr()))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	// Write a valid message.
-	err = sender.Table(testTable).StringColumn("foo", "bar").AtNow(ctx)
-	assert.NoError(t, err)
-	// Then write perform an incorrect chain of calls.
-	err = sender.Table(testTable).StringColumn("foo", "bar").Symbol("sym", "42").AtNow(ctx)
-	assert.Error(t, err)
-
-	// The second message should be discarded.
-	err = sender.Flush(ctx)
-	assert.NoError(t, err)
-	utils.ExpectLines(t, srv.BackCh, []string{testTable + " foo=\"bar\""})
-}
-
 func TestErrorOnUnavailableServer(t *testing.T) {
 	ctx := context.Background()
 
