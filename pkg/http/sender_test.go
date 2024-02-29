@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -13,6 +14,112 @@ const (
 	testTable   = "my_test_table"
 	networkName = "test-network-v3"
 )
+
+type configTestCase struct {
+	name                   string
+	config                 string
+	expectedOpts           []LineSenderOption
+	expectedErrMsgContains string
+}
+
+func TestHappyCasesFromConf(t *testing.T) {
+
+	var (
+		addr           = "localhost:1111"
+		user           = "test-user"
+		pass           = "test-pass"
+		token          = "test-token"
+		min_throughput = 999
+		grace_timeout  = time.Second * 88
+		retry_timeout  = time.Second * 99
+	)
+
+	testCases := []configTestCase{
+		{
+			name: "grace_timeout and retry_timeout milli conversion",
+			config: fmt.Sprintf("http::addr=%s;grace_timeout=%d;retry_timeout=%d",
+				addr, grace_timeout.Milliseconds(), retry_timeout.Milliseconds()),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithGraceTimeout(grace_timeout),
+				WithRetryTimeout(retry_timeout),
+			},
+		},
+		{
+			name: "pass before user",
+			config: fmt.Sprintf("http::addr=%s;pass=%s;user=%s",
+				addr, pass, user),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithBasicAuth(user, pass),
+			},
+		},
+		{
+			name: "min_throughput",
+			config: fmt.Sprintf("http::addr=%s;min_throughput=%d",
+				addr, min_throughput),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithMinThroughput(min_throughput),
+			},
+		},
+		{
+			name: "bearer token",
+			config: fmt.Sprintf("http::addr=%s;token=%s",
+				addr, token),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithBearerToken(token),
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := LineSenderFromConf(context.Background(), tc.config)
+			assert.NoError(t, err)
+
+			expected, err := NewLineSender(tc.expectedOpts...)
+			assert.NoError(t, err)
+			assert.Equal(t, expected, actual)
+
+			actual.Close()
+			expected.Close()
+		})
+	}
+}
+
+func TestPathologicalCasesFromConf(t *testing.T) {
+	testCases := []configTestCase{
+		{
+			name:                   "empty config",
+			config:                 "",
+			expectedErrMsgContains: "no schema separator found",
+		},
+		{
+			name:                   "invalid schema",
+			config:                 "tcp::addr=localhost:1111",
+			expectedErrMsgContains: "invalid schema",
+		},
+		{
+			name:                   "invalid tls_verify",
+			config:                 "http::addr=localhost:1111;tls_verify=invalid",
+			expectedErrMsgContains: "invalid tls_verify",
+		},
+		{
+			name:                   "unsupported option",
+			config:                 "http::addr=localhost:1111;unsupported_option=invalid",
+			expectedErrMsgContains: "unsupported option",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LineSenderFromConf(context.Background(), tc.config)
+			assert.ErrorContains(t, err, tc.expectedErrMsgContains)
+		})
+	}
+}
 
 func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))

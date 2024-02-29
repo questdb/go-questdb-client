@@ -25,20 +25,21 @@
 package conf
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
 type configTestCase struct {
-	name   string
-	config string
-	//expected               LineSender
+	name                   string
+	config                 string
+	expected               ConfigData
 	expectedErrMsgContains string
 }
 
-/*
-func TestHappyCasesFromConf(t *testing.T) {
+func TestParserHappyCases(t *testing.T) {
 
 	var (
 		addr           = "localhost:1111"
@@ -52,157 +53,183 @@ func TestHappyCasesFromConf(t *testing.T) {
 
 	testCases := []configTestCase{
 		{
-			name:   "http and address",
+			name:   "http and ipv4 address",
 			config: fmt.Sprintf("http::addr=%s", addr),
-			expected: LineSender{
-				address: addr,
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+				},
+			},
+		},
+		{
+			name:   "http and ipv6 address",
+			config: "http::addr=::1;",
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr": "::1",
+				},
 			},
 		},
 		{
 			name:   "tcp and address",
 			config: fmt.Sprintf("tcp::addr=%s", addr),
-			expected: LineSender{
-				address: addr,
+			expected: ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+				},
 			},
 		},
 		{
 			name:   "http and username/password",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=%s", addr, user, pass),
-			expected: LineSender{
-				address: addr,
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+					"user": user,
+					"pass": pass,
+				},
 			},
 		},
 		{
 			name:   "http and token (with trailing ';')",
 			config: fmt.Sprintf("http::addr=%s;token=%s;", addr, token),
-			expected: LineSender{
-				address: addr,
-			},
-		},
-		{
-			name:   "tcp with user and key",
-			config: fmt.Sprintf("tcp::addr=%s;user=%s;token=%s", addr, user, token),
-			expected: LineSender{
-				address: addr,
-				keyId:   user,
-				key:     token,
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr":  addr,
+					"token": token,
+				},
 			},
 		},
 		{
 			name:   "tcp with key and user",
 			config: fmt.Sprintf("tcp::addr=%s;token=%s;user=%s", addr, token, user),
-			expected: LineSender{
-				address: addr,
-				keyId:   user,
-				key:     token,
+			expected: ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  addr,
+					"user":  user,
+					"token": token,
+				},
 			},
 		},
 		{
 			name:   "https with min_throughput",
 			config: fmt.Sprintf("https::addr=%s;min_throughput=%d", addr, min_throughput),
-			expected: LineSender{
-				address:                     addr,
-				minThroughputBytesPerSecond: min_throughput,
-				tlsMode:                     tlsEnabled,
+			expected: ConfigData{
+				Schema: "https",
+				KeyValuePairs: map[string]string{
+					"addr":           addr,
+					"min_throughput": fmt.Sprintf("%d", min_throughput),
+				},
 			},
 		},
 		{
 			name:   "https with min_throughput, init_buf_size and tls_verify=unsafe_off",
 			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;init_buf_size=%d;tls_verify=unsafe_off", addr, min_throughput, 1024),
-			expected: LineSender{
-				address:                     addr,
-				minThroughputBytesPerSecond: min_throughput,
-				initBufSizeBytes:            1024,
-				tlsMode:                     tlsInsecureSkipVerify,
+			expected: ConfigData{
+				Schema: "https",
+				KeyValuePairs: map[string]string{
+					"addr":           addr,
+					"min_throughput": fmt.Sprintf("%d", min_throughput),
+					"init_buf_size":  "1024",
+					"tls_verify":     "unsafe_off",
+				},
 			},
 		},
 		{
 			name:   "tcps with tls_verify=unsafe_off",
 			config: fmt.Sprintf("tcps::addr=%s;tls_verify=unsafe_off", addr),
-			expected: LineSender{
-				address: addr,
-				tlsMode: tlsInsecureSkipVerify,
+			expected: ConfigData{
+				Schema: "tcps",
+				KeyValuePairs: map[string]string{
+					"addr":       addr,
+					"tls_verify": "unsafe_off",
+				},
 			},
 		},
 		{
 			name: "http with min_throughput, grace_timeout, and retry_timeout",
 			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;grace_timeout=%d;retry_timeout=%d",
 				addr, min_throughput, grace_timeout.Milliseconds(), retry_timeout.Milliseconds()),
-			expected: LineSender{
-				address:                     addr,
-				minThroughputBytesPerSecond: min_throughput,
-				graceTimeout:                grace_timeout,
-				retryTimeout:                retry_timeout,
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr":           addr,
+					"min_throughput": fmt.Sprintf("%d", min_throughput),
+					"grace_timeout":  fmt.Sprintf("%d", grace_timeout.Milliseconds()),
+					"retry_timeout":  fmt.Sprintf("%d", retry_timeout.Milliseconds()),
+				},
 			},
 		},
 		{
 			name:   "tcp with tls_verify=on",
 			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on", addr),
-			expected: LineSender{
-				address: addr,
-				tlsMode: tlsEnabled,
+			expected: ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":       addr,
+					"tls_verify": "on",
+				},
 			},
 		},
 		{
 			name:   "password with an escaped semicolon",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word", addr, user),
-			expected: LineSender{
-				address: addr,
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+					"user": user,
+					"pass": "pass;word",
+				},
 			},
 		},
 		{
 			name:   "password with an escaped semicolon (ending with a ';')",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word;", addr, user),
-			expected: LineSender{
-				address: addr,
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+					"user": user,
+					"pass": "pass;word",
+				},
 			},
 		},
 		{
 			name:   "password with a trailing semicolon",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=password;;;", addr, user),
-			expected: LineSender{
-				address: addr,
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+					"user": user,
+					"pass": "password;",
+				},
 			},
 		},
 		{
 			name:   "equal sign in password",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass=word", addr, user),
-			expected: LineSender{
-				address: addr,
-			},
-		},
-		{
-			name:   "basic auth with password first",
-			config: fmt.Sprintf("http::addr=%s;pass=pass;user=%s", addr, user),
-			expected: LineSender{
-				address: addr,
-			},
-		},
-		{
-			name:   "grace_timeout millisecond conversion",
-			config: fmt.Sprintf("http::addr=%s;grace_timeout=88000", addr),
-			expected: LineSender{
-				address:      addr,
-				graceTimeout: grace_timeout,
-			},
-		},
-		{
-			name:   "retry_timeout millisecond conversion",
-			config: fmt.Sprintf("http::addr=%s;retry_timeout=99000", addr),
-			expected: LineSender{
-				address:      addr,
-				retryTimeout: retry_timeout,
+			expected: ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+					"user": user,
+					"pass": "pass=word",
+				},
 			},
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 
-			opts, err := parseConfigString(tc.config)
-			actual := LineSender{}
-			for _, opt := range opts.keyValuePairs {
-				opt(&actual)
-			}
+			actual, err := ParseConfigString(tc.config)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expected, actual)
 
@@ -211,8 +238,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 	}
 
 }
-*/
-func TestPathologicalCasesFromConf(t *testing.T) {
+func TestParserPathologicalCases(t *testing.T) {
 
 	testCases := []configTestCase{
 		{

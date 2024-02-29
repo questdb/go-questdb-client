@@ -26,6 +26,7 @@ package tcp
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/big"
 	"strconv"
@@ -42,7 +43,120 @@ const (
 	networkName = "test-network-v3"
 )
 
+type configTestCase struct {
+	name                   string
+	config                 string
+	expectedOpts           []LineSenderOption
+	expectedErrMsgContains string
+}
+
 type writerFn func(s *LineSender) error
+
+func TestHappyCasesFromConf(t *testing.T) {
+
+	var (
+		user        = "test-user"
+		token       = "test-token"
+		initBufSize = 999
+		maxBufSize  = 1000
+	)
+
+	testServer, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer testServer.Close()
+
+	addr := testServer.Addr()
+
+	testCases := []configTestCase{
+		{
+			name: "user and token",
+			config: fmt.Sprintf("tcp::addr=%s;user=%s;token=%s",
+				addr, user, token),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithAuth(user, token),
+			},
+		},
+		{
+			name: "init_buf_size and max_buf_size",
+			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;max_buf_size=%d",
+				addr, initBufSize, maxBufSize),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithInitBufferSize(initBufSize),
+				WithBufferCapacity(maxBufSize),
+			},
+		},
+		{
+			name: "with tls",
+			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on",
+				addr),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithTls(),
+			},
+		},
+		{
+			name: "with tls and unsafe_off",
+			config: fmt.Sprintf("tcp::addr=%s;tls_verify=unsafe_off",
+				addr),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithTlsInsecureSkipVerify(),
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actualOpts, err := optsFromConf(tc.config)
+			assert.NoError(t, err)
+
+			actual := &LineSender{}
+			for _, opt := range actualOpts {
+				opt(actual)
+			}
+			expected := &LineSender{}
+			for _, opt := range tc.expectedOpts {
+				opt(expected)
+			}
+
+			assert.Equal(t, expected, actual)
+		})
+	}
+}
+
+func TestPathologicalCasesFromConf(t *testing.T) {
+	testCases := []configTestCase{
+		{
+			name:                   "empty config",
+			config:                 "",
+			expectedErrMsgContains: "no schema separator found",
+		},
+		{
+			name:                   "invalid schema",
+			config:                 "http::addr=localhost:1111",
+			expectedErrMsgContains: "invalid schema",
+		},
+		{
+			name:                   "invalid tls_verify",
+			config:                 "tcp::addr=localhost:1111;tls_verify=invalid",
+			expectedErrMsgContains: "invalid tls_verify",
+		},
+		{
+			name:                   "unsupported option",
+			config:                 "tcp::addr=localhost:1111;unsupported_option=invalid",
+			expectedErrMsgContains: "unsupported option",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := optsFromConf(tc.config)
+			assert.ErrorContains(t, err, tc.expectedErrMsgContains)
+		})
+	}
+}
 
 func TestValidWrites(t *testing.T) {
 	ctx := context.Background()

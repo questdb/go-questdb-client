@@ -251,7 +251,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 
 }
 
-func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
+func optsFromConf(config string) ([]LineSenderOption, error) {
 	var (
 		user, token string
 	)
@@ -318,6 +318,14 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 		}
 	}
 
+	return opts, nil
+}
+
+func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
+	opts, err := optsFromConf(config)
+	if err != nil {
+		return nil, err
+	}
 	return NewLineSender(ctx, opts...)
 }
 
