@@ -51,71 +51,9 @@ const (
 	tlsInsecureSkipVerify tlsMode = 2
 )
 
-// LineSender allows you to insert rows into QuestDB by sending ILP
-// messages over HTTP(S).
-//
-// Each sender corresponds to a single HTTP client. All senders
-// utilize a global transport for connection pooling. A sender
-// should not be called concurrently by multiple goroutines.
-type LineSender struct {
-	buffer.Buffer
-
-	address                     string
-	retryTimeout                time.Duration
-	minThroughputBytesPerSecond int
-	graceTimeout                time.Duration
-	tlsMode                     tlsMode
-
-	user  string
-	pass  string
-	token string
-
-	client http.Client
-}
-
-// LineSenderOption defines line sender option.
-type LineSenderOption func(s *LineSender)
-
-func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
-	s := &LineSender{
-		address:                     "127.0.0.1:9000",
-		minThroughputBytesPerSecond: 100 * 1024,
-		graceTimeout:                5 * time.Second,
-		retryTimeout:                10 * time.Second,
-
-		Buffer: *buffer.NewBuffer(),
-	}
-
-	for _, opt := range opts {
-		opt(s)
-	}
-
-	if s.address == "" {
-		s.address = "127.0.0.1:9000"
-	}
-
-	if s.tlsMode != tlsInsecureSkipVerify && tlsClientConfig.InsecureSkipVerify {
-		return nil, errors.New("once InsecureSkipVerify is used, it must be enforced for all subsequent HttpLineSenders")
-	}
-
-	if s.tlsMode == tlsInsecureSkipVerify {
-		tlsClientConfig.InsecureSkipVerify = true
-	}
-
-	s.client = http.Client{
-		Transport: &globalTransport,
-		Timeout:   0, // todo: add a global maximum timeout?
-	}
-
-	clientCt.Add(1)
-
-	return s, nil
-}
-
 var (
-	tlsClientConfig tls.Config = tls.Config{}
-	clientCt        atomic.Int64
-
+	// We use a shared http transport to pool connections
+	// across LineSenders
 	globalTransport http.Transport = http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxConnsPerHost:       0,
@@ -126,7 +64,46 @@ var (
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       &tlsClientConfig,
 	}
+
+	// clientCt is used to track the number of open LineSenders
+	// If the clientCt reaches 0, meaning all LineSenders have been
+	// closed, the globalTransport closes all idle connections to
+	// free up resources
+	clientCt atomic.Int64
+
+	// Since we use a global http.Transport, we also use a global
+	// tls config. By default, this is set to verify all server certs,
+	// but can be changed by the WithTlsInsecureVerify setting.
+	tlsClientConfig tls.Config = tls.Config{}
 )
+
+// LineSender allows you to insert rows into QuestDB by sending ILP
+// messages over HTTP(S).
+//
+// Each sender corresponds to a single HTTP client. All senders
+// utilize a global transport for connection pooling. A sender
+// should not be called concurrently by multiple goroutines.
+type LineSender struct {
+	buffer.Buffer
+
+	address string
+
+	// Retry/timeout-related fields
+	retryTimeout                time.Duration
+	minThroughputBytesPerSecond int
+	graceTimeout                time.Duration
+
+	// Authentication-related fields
+	user    string
+	pass    string
+	token   string
+	tlsMode tlsMode
+
+	client http.Client
+}
+
+// LineSenderOption defines line sender option.
+type LineSenderOption func(s *LineSender)
 
 // WithTls enables TLS connection encryption.
 func WithTls() LineSenderOption {
@@ -175,7 +152,7 @@ func WithMinThroughput(bytesPerSecond int) LineSenderOption {
 // WithRetryTimeout is the cumulative maximum duration spend in
 // retries. Defaults to 10 seconds.
 //
-// Only network-related errors and QuestDB-specific 5xx response
+// Only network-related errors and certain 5xx response
 // codes are retryable.
 func WithRetryTimeout(t time.Duration) LineSenderOption {
 	return func(s *LineSender) {
@@ -221,6 +198,45 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 			s.BufCap = capacity
 		}
 	}
+}
+
+// NewLineSender creates a new InfluxDB Line Protocol (ILP) sender. Each
+// sender corresponds to a single HTTP client. Sender should
+// not be called concurrently by multiple goroutines.
+func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
+	s := &LineSender{
+		address:                     "127.0.0.1:9000",
+		minThroughputBytesPerSecond: 100 * 1024,
+		graceTimeout:                5 * time.Second,
+		retryTimeout:                10 * time.Second,
+
+		Buffer: *buffer.NewBuffer(),
+	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	if s.address == "" {
+		s.address = "127.0.0.1:9000"
+	}
+
+	if s.tlsMode != tlsInsecureSkipVerify && tlsClientConfig.InsecureSkipVerify {
+		return nil, errors.New("once InsecureSkipVerify is used, it must be enforced for all subsequent HttpLineSenders")
+	}
+
+	if s.tlsMode == tlsInsecureSkipVerify {
+		tlsClientConfig.InsecureSkipVerify = true
+	}
+
+	s.client = http.Client{
+		Transport: &globalTransport,
+		Timeout:   0, // todo: add a global maximum timeout?
+	}
+
+	clientCt.Add(1)
+
+	return s, nil
 }
 
 // LineSenderFromConf creates a LineSender using the QuestDB config string format.
@@ -352,7 +368,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	uri += fmt.Sprintf("://%s/write", s.address)
 
 	// timeout = ( request.len() / min_throughput ) + grace
-	// Conversion from int to time.Duration is in milliseconds and grace is in millis
+	// Conversion from int to time.Duration is in milliseconds
 	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -372,6 +388,9 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	}
 
 	if s.token != "" {
+		if req.Header.Get("Authorization") != "" {
+			return errors.New("cannot use both Basic and Token Authorization")
+		}
 		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
 	}
 
@@ -388,7 +407,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 			}
 			return nil
 		}
-		// Otherwise, we will retry until the timeout
+		// Otherwise, we will retry sending the request until the retry timeout is breached
 		err = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 	}
 
@@ -402,6 +421,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 			if retryErr == nil {
 				defer resp.Body.Close()
 
+				// If the requests succeeds with a non-error status code, flush has succeeded
 				if !isRetryableError(resp.StatusCode) {
 					// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
 					if s.Cap() > 3*s.BufCap {
@@ -413,6 +433,8 @@ func (s *LineSender) Flush(ctx context.Context) error {
 				retryErr = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
 			}
 
+			// If the error is an http timeout (due to the context expiring),
+			// return the previously-encountered error
 			var urlErr *url.Error
 			if errors.As(retryErr, &urlErr) {
 				if urlErr.Timeout() {
@@ -422,6 +444,8 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 			err = retryErr
 
+			// If the attempt fails, retry with exponentially-increasing timeout
+			// up to a global maximum (1 second)
 			retryInterval = retryInterval * 2
 			if retryInterval > maxRetryInterval {
 				retryInterval = maxRetryInterval
