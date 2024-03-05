@@ -113,7 +113,7 @@ func WithTls() LineSenderOption {
 }
 
 // WithBasicAuth sets a Basic authentication header for
-// ILP requests over HTTP
+// ILP requests over HTTP.
 func WithBasicAuth(user, pass string) LineSenderOption {
 	return func(s *LineSender) {
 		s.user = user
@@ -122,7 +122,7 @@ func WithBasicAuth(user, pass string) LineSenderOption {
 }
 
 // WithBearerToken sets a Bearer token Authentication header for
-// ILP requests
+// ILP requests.
 func WithBearerToken(token string) LineSenderOption {
 	return func(s *LineSender) {
 		s.token = token
@@ -130,7 +130,7 @@ func WithBearerToken(token string) LineSenderOption {
 }
 
 // WithGraceTimeout is used in combination with min throughput
-// to set the timeout of an ILP request. Defaults to 5 seconds
+// to set the timeout of an ILP request. Defaults to 5 seconds.
 //
 // timeout = (request.len() / min_throughput) + grace
 func WithGraceTimeout(timeout time.Duration) LineSenderOption {
@@ -140,7 +140,7 @@ func WithGraceTimeout(timeout time.Duration) LineSenderOption {
 }
 
 // WithMinThroughput is used in combination with grace timeout
-// to set the timeout of an ILP request. Defaults to 100KiB/s
+// to set the timeout of an ILP request. Defaults to 100KiB/s.
 //
 // timeout = (request.len() / min_throughput) + grace
 func WithMinThroughput(bytesPerSecond int) LineSenderOption {
