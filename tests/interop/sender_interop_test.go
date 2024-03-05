@@ -120,7 +120,7 @@ func TestClientInterop(t *testing.T) {
 }
 
 func readTestCases() (testCases, error) {
-	file, err := os.Open("./test/interop/ilp-client-interop-test.json")
+	file, err := os.Open("./questdb-client-test/ilp-client-interop-test.json")
 	if err != nil {
 		return nil, err
 	}
