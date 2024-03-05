@@ -30,13 +30,13 @@
   addr:
     host: localhost
     port: 9009
-- name: http
+- name: ilp-http
   lang: go
   path: examples/http/basic/main.go
   header: |-
     Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
     and [repo](https://github.com/questdb/go-questdb-client).
-- name: http-auth
+- name: ilp-http-auth
   lang: go
   path: examples/http/auth/main.go
   header: |-
@@ -48,7 +48,7 @@
   addr:
     host: localhost
     port: 9000
-- name: http-auth-tls
+- name: ilp-http-auth-tls
   lang: go
   path: examples/http/auth-and-tls/main.go
   header: |-
