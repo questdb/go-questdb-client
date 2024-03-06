@@ -25,7 +25,6 @@
 package http
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -186,20 +185,6 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 	}
 }
 
-// WithBufferCapacity sets desired buffer capacity in bytes to
-// be used when sending ILP messages. Defaults to 128KB.
-//
-// This setting is a soft limit, i.e. the underlying buffer may
-// grow larger than the provided value, but will shrink on a
-// At, AtNow, or Flush call.
-func WithBufferCapacity(capacity int) LineSenderOption {
-	return func(s *LineSender) {
-		if capacity > 0 {
-			s.BufCap = capacity
-		}
-	}
-}
-
 // NewLineSender creates a new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single HTTP client. Sender should
 // not be called concurrently by multiple goroutines.
@@ -305,7 +290,7 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 			}
 		case "auto_flush_rows", "auto_flush_bytes":
 			return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
-		case "min_throughput", "init_buf_size", "max_buf_size":
+		case "min_throughput", "init_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
@@ -316,8 +301,6 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 				opts = append(opts, WithMinThroughput(parsedVal))
 			case "init_buf_size":
 				opts = append(opts, WithInitBufferSize(parsedVal))
-			case "max_buf_size":
-				opts = append(opts, WithBufferCapacity(parsedVal))
 			default:
 				panic("add a case for " + k)
 			}
@@ -426,11 +409,6 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 		// If the requests succeeds with a non-error status code, flush has succeeded
 		if !isRetryableError(resp.StatusCode) {
-			// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
-			if s.Cap() > 3*s.BufCap {
-				// Shrink the buffer back to desired capacity.
-				s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
-			}
 			return nil
 		}
 		// Otherwise, we will retry sending the request until the retry timeout is breached
@@ -449,11 +427,6 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 				// If the requests succeeds with a non-error status code, flush has succeeded
 				if !isRetryableError(resp.StatusCode) {
-					// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
-					if s.Cap() > 3*s.BufCap {
-						// Shrink the buffer back to desired capacity.
-						s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
-					}
 					return nil
 				}
 				retryErr = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
