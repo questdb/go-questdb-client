@@ -90,7 +90,12 @@ type LineSender struct {
 	// Retry/timeout-related fields
 	retryTimeout                time.Duration
 	minThroughputBytesPerSecond int
-	requestTimeout                time.Duration
+	requestTimeout              time.Duration
+
+	// Auto-flush fields
+	autoFlush     bool
+	autoFlushRows int
+	msgCount      int
 
 	// Authentication-related fields
 	user    string
@@ -185,6 +190,24 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 	}
 }
 
+// WithAutoFlushDisabled turns off auto-flushing behavior.
+// To send ILP messages, the user must call Flush().
+func WithAutoFlushDisabled() LineSenderOption {
+	return func(s *LineSender) {
+		s.autoFlush = false
+	}
+}
+
+// WithAutoFlushRows sets the number of buffered rows that
+// must be breached in order to trigger an auto-flush.
+// Defaults to 75000.
+func WithAutoFlushRows(rows int) LineSenderOption {
+	return func(s *LineSender) {
+		s.autoFlush = true
+		s.autoFlushRows = rows
+	}
+}
+
 // NewLineSender creates a new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single HTTP client. Sender should
 // not be called concurrently by multiple goroutines.
@@ -192,8 +215,10 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 	s := &LineSender{
 		address:                     "127.0.0.1:9000",
 		minThroughputBytesPerSecond: 100 * 1024,
-		requestTimeout:                10 * time.Second,
+		requestTimeout:              10 * time.Second,
 		retryTimeout:                10 * time.Second,
+		autoFlush:                   true,
+		autoFlushRows:               75000,
 
 		Buffer: *buffer.NewBuffer(),
 	}
@@ -230,7 +255,7 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 //
 // QuestDB ILP clients use a common key-value configuration string format across all
 // implementations. We opted for this config over a URL because it reduces the amount
-// of character escaping required for paths and base64-encoded param values. 
+// of character escaping required for paths and base64-encoded param values.
 //
 // The config string format is as follows:
 //
@@ -250,7 +275,6 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 // retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
 //
 // tls_verify: determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
-//
 func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
 	var (
 		user, pass, token string
@@ -409,6 +433,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 		// If the requests succeeds with a non-error status code, flush has succeeded
 		if !isRetryableError(resp.StatusCode) {
+			s.msgCount = 0
 			return nil
 		}
 		// Otherwise, we will retry sending the request until the retry timeout is breached
@@ -427,6 +452,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 				// If the requests succeeds with a non-error status code, flush has succeeded
 				if !isRetryableError(resp.StatusCode) {
+					s.msgCount = 0
 					return nil
 				}
 				retryErr = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
@@ -560,7 +586,7 @@ func (s *LineSender) Close() {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) AtNow(ctx context.Context) error {
-	return s.Buffer.At(time.Time{}, false)
+	return s.At(ctx, time.Time{})
 }
 
 // At sets the timestamp in Epoch nanoseconds and finalizes
@@ -569,7 +595,22 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) At(ctx context.Context, ts time.Time) error {
-	return s.Buffer.At(ts, true)
+	sendTs := true
+	if ts.IsZero() {
+		sendTs = false
+	}
+	err := s.Buffer.At(ts, sendTs)
+	if err != nil {
+		return err
+	}
+
+	s.msgCount++
+
+	if s.autoFlush && s.msgCount >= s.autoFlushRows {
+		return s.Flush(ctx)
+	}
+
+	return nil
 }
 
 func isRetryableError(statusCode int) bool {

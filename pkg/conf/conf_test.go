@@ -42,13 +42,13 @@ type configTestCase struct {
 func TestParserHappyCases(t *testing.T) {
 
 	var (
-		addr           = "localhost:1111"
-		user           = "test-user"
-		pass           = "test-pass"
-		token          = "test-token"
-		min_throughput = 999
-		request_timeout  = time.Second * 88
-		retry_timeout  = time.Second * 99
+		addr            = "localhost:1111"
+		user            = "test-user"
+		pass            = "test-pass"
+		token           = "test-token"
+		min_throughput  = 999
+		request_timeout = time.Second * 88
+		retry_timeout   = time.Second * 99
 	)
 
 	testCases := []configTestCase{
@@ -159,10 +159,10 @@ func TestParserHappyCases(t *testing.T) {
 			expected: ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
-					"addr":           addr,
-					"min_throughput": fmt.Sprintf("%d", min_throughput),
-					"request_timeout":  fmt.Sprintf("%d", request_timeout.Milliseconds()),
-					"retry_timeout":  fmt.Sprintf("%d", retry_timeout.Milliseconds()),
+					"addr":            addr,
+					"min_throughput":  fmt.Sprintf("%d", min_throughput),
+					"request_timeout": fmt.Sprintf("%d", request_timeout.Milliseconds()),
+					"retry_timeout":   fmt.Sprintf("%d", retry_timeout.Milliseconds()),
 				},
 			},
 		},

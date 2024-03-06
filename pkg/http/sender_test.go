@@ -49,13 +49,13 @@ type configTestCase struct {
 func TestHappyCasesFromConf(t *testing.T) {
 
 	var (
-		addr           = "localhost:1111"
-		user           = "test-user"
-		pass           = "test-pass"
-		token          = "test-token"
-		min_throughput = 999
-		request_timeout  = time.Second * 88
-		retry_timeout  = time.Second * 99
+		addr            = "localhost:1111"
+		user            = "test-user"
+		pass            = "test-pass"
+		token           = "test-token"
+		min_throughput  = 999
+		request_timeout = time.Second * 88
+		retry_timeout   = time.Second * 99
 	)
 
 	testCases := []configTestCase{
@@ -213,6 +213,62 @@ func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 
 }
 
+func TestAutoFlush(t *testing.T) {
+	ctx := context.Background()
+	autoFlushRows := 10
+
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(
+		WithAddress(srv.Addr()),
+		WithAutoFlushRows(autoFlushRows),
+	)
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	// Send autoFlushRows - 1 messages and ensure all are buffered
+	for i := 0; i < autoFlushRows-1; i++ {
+		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+		assert.NoError(t, err)
+	}
+
+	assert.Equal(t, autoFlushRows-1, sender.msgCount)
+
+	// Send one additional message and ensure that all are flushed
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 0, sender.msgCount)
+}
+
+func TestAutoFlushDisabled(t *testing.T) {
+	ctx := context.Background()
+	autoFlushRows := 10
+
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	// opts are processed sequentially, so AutoFlushDisabled will
+	// override AutoFlushRows
+	sender, err := NewLineSender(
+		WithAddress(srv.Addr()),
+		WithAutoFlushRows(autoFlushRows),
+		WithAutoFlushDisabled(),
+	)
+	assert.NoError(t, err)
+	defer sender.Close()
+
+	// Send autoFlushRows + 1 messages and ensure all are buffered
+	for i := 0; i < autoFlushRows+1; i++ {
+		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+		assert.NoError(t, err)
+	}
+
+	assert.Equal(t, autoFlushRows+1, sender.msgCount)
+}
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 

@@ -66,9 +66,13 @@ type LineSender struct {
 
 	// Authentication-related fields
 	tlsMode tlsMode
+	keyId   string // Erased once auth is done.
+	key     string // Erased once auth is done.
 
-	keyId string // Erased once auth is done.
-	key   string // Erased once auth is done.
+	// Auto-flush fields
+	autoFlush     bool
+	autoFlushRows int
+	msgCount      int
 
 	conn net.Conn
 }
@@ -140,6 +144,24 @@ func WithFileNameLimit(limit int) LineSenderOption {
 func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *LineSender) {
 		s.InitBufSizeBytes = sizeInBytes
+	}
+}
+
+// WithAutoFlushDisabled turns off auto-flushing behavior.
+// To send ILP messages, the user either must call Flush().
+func WithAutoFlushDisabled() LineSenderOption {
+	return func(s *LineSender) {
+		s.autoFlush = false
+	}
+}
+
+// WithAutoFlushRows sets the number of buffered rows that
+// must be breached in order to trigger an auto-flush.
+// Defaults to 75000.
+func WithAutoFlushRows(rows int) LineSenderOption {
+	return func(s *LineSender) {
+		s.autoFlush = true
+		s.autoFlushRows = rows
 	}
 }
 
@@ -326,7 +348,7 @@ func optsFromConf(config string) ([]LineSenderOption, error) {
 //
 // QuestDB ILP clients use a common key-value configuration string format across all
 // implementations. We opted for this config over a URL because it reduces the amount
-// of character escaping required for paths and base64-encoded param values. 
+// of character escaping required for paths and base64-encoded param values.
 //
 // The config string format is as follows:
 //
@@ -348,7 +370,6 @@ func optsFromConf(config string) ([]LineSenderOption, error) {
 // max_buf_size:   buffer growth limit in bytes. client errors if breached (default is 100MiB)
 //
 // tls_verify: determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
-//
 func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
 	opts, err := optsFromConf(config)
 	if err != nil {
@@ -493,6 +514,8 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
 	}
 
+	s.msgCount = 0
+
 	return nil
 }
 
@@ -503,14 +526,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) AtNow(ctx context.Context) error {
-	err := s.Buffer.At(time.Time{}, false)
-	if err != nil {
-		return err
-	}
-	if s.Len() > s.BufCap {
-		return s.Flush(ctx)
-	}
-	return nil
+	return s.At(ctx, time.Time{})
 }
 
 // At sets the timestamp in Epoch nanoseconds and finalizes
@@ -519,12 +535,24 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) At(ctx context.Context, ts time.Time) error {
-	err := s.Buffer.At(ts, true)
+	sendTs := true
+	if ts.IsZero() {
+		sendTs = false
+	}
+	err := s.Buffer.At(ts, sendTs)
 	if err != nil {
 		return err
 	}
+
+	s.msgCount++
+
 	if s.Len() > s.BufCap {
 		return s.Flush(ctx)
 	}
+
+	if s.autoFlush && s.msgCount >= s.autoFlushRows {
+		return s.Flush(ctx)
+	}
+
 	return nil
 }
