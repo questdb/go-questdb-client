@@ -47,7 +47,7 @@ func TestParserHappyCases(t *testing.T) {
 		pass           = "test-pass"
 		token          = "test-token"
 		min_throughput = 999
-		grace_timeout  = time.Second * 88
+		request_timeout  = time.Second * 88
 		retry_timeout  = time.Second * 99
 	)
 
@@ -153,15 +153,15 @@ func TestParserHappyCases(t *testing.T) {
 			},
 		},
 		{
-			name: "http with min_throughput, grace_timeout, and retry_timeout",
-			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;grace_timeout=%d;retry_timeout=%d",
-				addr, min_throughput, grace_timeout.Milliseconds(), retry_timeout.Milliseconds()),
+			name: "http with min_throughput, request_timeout, and retry_timeout",
+			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;request_timeout=%d;retry_timeout=%d",
+				addr, min_throughput, request_timeout.Milliseconds(), retry_timeout.Milliseconds()),
 			expected: ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr":           addr,
 					"min_throughput": fmt.Sprintf("%d", min_throughput),
-					"grace_timeout":  fmt.Sprintf("%d", grace_timeout.Milliseconds()),
+					"request_timeout":  fmt.Sprintf("%d", request_timeout.Milliseconds()),
 					"retry_timeout":  fmt.Sprintf("%d", retry_timeout.Milliseconds()),
 				},
 			},

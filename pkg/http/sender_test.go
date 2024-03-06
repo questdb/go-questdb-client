@@ -54,18 +54,18 @@ func TestHappyCasesFromConf(t *testing.T) {
 		pass           = "test-pass"
 		token          = "test-token"
 		min_throughput = 999
-		grace_timeout  = time.Second * 88
+		request_timeout  = time.Second * 88
 		retry_timeout  = time.Second * 99
 	)
 
 	testCases := []configTestCase{
 		{
-			name: "grace_timeout and retry_timeout milli conversion",
-			config: fmt.Sprintf("http::addr=%s;grace_timeout=%d;retry_timeout=%d",
-				addr, grace_timeout.Milliseconds(), retry_timeout.Milliseconds()),
+			name: "request_timeout and retry_timeout milli conversion",
+			config: fmt.Sprintf("http::addr=%s;request_timeout=%d;retry_timeout=%d",
+				addr, request_timeout.Milliseconds(), retry_timeout.Milliseconds()),
 			expectedOpts: []LineSenderOption{
 				WithAddress(addr),
-				WithGraceTimeout(grace_timeout),
+				WithRequestTimeout(request_timeout),
 				WithRetryTimeout(retry_timeout),
 			},
 		},
@@ -199,7 +199,7 @@ func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 
 	sender, err := NewLineSender(
 		WithAddress(srv.Addr()),
-		WithGraceTimeout(10*time.Millisecond),
+		WithRequestTimeout(10*time.Millisecond),
 	)
 	assert.NoError(t, err)
 	defer sender.Close()

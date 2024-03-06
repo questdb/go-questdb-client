@@ -91,7 +91,7 @@ type LineSender struct {
 	// Retry/timeout-related fields
 	retryTimeout                time.Duration
 	minThroughputBytesPerSecond int
-	graceTimeout                time.Duration
+	requestTimeout                time.Duration
 
 	// Authentication-related fields
 	user    string
@@ -129,20 +129,20 @@ func WithBearerToken(token string) LineSenderOption {
 	}
 }
 
-// WithGraceTimeout is used in combination with min throughput
+// WithRequestTimeout is used in combination with min_throughput
 // to set the timeout of an ILP request. Defaults to 5 seconds.
 //
-// timeout = (request.len() / min_throughput) + grace
-func WithGraceTimeout(timeout time.Duration) LineSenderOption {
+// timeout = (request.len() / min_throughput) + request_timeout
+func WithRequestTimeout(timeout time.Duration) LineSenderOption {
 	return func(s *LineSender) {
-		s.graceTimeout = timeout
+		s.requestTimeout = timeout
 	}
 }
 
-// WithMinThroughput is used in combination with grace timeout
+// WithMinThroughput is used in combination with request_timeout
 // to set the timeout of an ILP request. Defaults to 100KiB/s.
 //
-// timeout = (request.len() / min_throughput) + grace
+// timeout = (request.len() / min_throughput) + request_timeout
 func WithMinThroughput(bytesPerSecond int) LineSenderOption {
 	return func(s *LineSender) {
 		s.minThroughputBytesPerSecond = bytesPerSecond
@@ -207,7 +207,7 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 	s := &LineSender{
 		address:                     "127.0.0.1:9000",
 		minThroughputBytesPerSecond: 100 * 1024,
-		graceTimeout:                5 * time.Second,
+		requestTimeout:                5 * time.Second,
 		retryTimeout:                10 * time.Second,
 
 		Buffer: *buffer.NewBuffer(),
@@ -296,7 +296,7 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 				panic("add a case for " + k)
 			}
 
-		case "grace_timeout", "retry_timeout":
+		case "request_timeout", "retry_timeout":
 			timeout, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
@@ -305,8 +305,8 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 			timeoutDur := time.Duration(timeout * int(time.Millisecond))
 
 			switch k {
-			case "grace_timeout":
-				opts = append(opts, WithGraceTimeout(timeoutDur))
+			case "request_timeout":
+				opts = append(opts, WithRequestTimeout(timeoutDur))
 			case "retry_timeout":
 				opts = append(opts, WithRetryTimeout(timeoutDur))
 			default:
@@ -367,9 +367,9 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	}
 	uri += fmt.Sprintf("://%s/write", s.address)
 
-	// timeout = ( request.len() / min_throughput ) + grace
-	// Conversion from int to time.Duration is in milliseconds
-	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.graceTimeout
+	// timeout = ( request.len() / min_throughput ) + request_timeout
+	// nb: conversion from int to time.Duration is in milliseconds
+	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.requestTimeout
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
