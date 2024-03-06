@@ -180,6 +180,9 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		address: "127.0.0.1:9009",
 		tlsMode: tlsDisabled,
 
+		autoFlush:     true,
+		autoFlushRows: 75000,
+
 		Buffer: *buffer.NewBuffer(),
 	}
 
