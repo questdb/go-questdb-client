@@ -270,6 +270,9 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 // password:  for basic authentication
 // token:     bearer token auth (used instead of basic authentication)
 //
+// auto_flush:       determines if auto-flushing is enabled (values "on" or "off", defaults to "on")
+// auto_flush_rows:  auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on
+//
 // request_min_throughput: bytes per second, used to calculate each request's timeout (defaults to 100KiB/s)
 // request_timeout:        minimum request timeout in milliseconds (defaults to 10 seconds)
 // retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
@@ -583,7 +586,8 @@ func (s *LineSender) Close() {
 // The server will insert each message using the system clock
 // as the row timestamp.
 //
-// If the underlying buffer reaches configured capacity, this
+// If the underlying buffer reaches configured capacity or the
+// number of buffered messages exceeds the auto-flush trigger, this
 // method also sends the accumulated messages.
 func (s *LineSender) AtNow(ctx context.Context) error {
 	return s.At(ctx, time.Time{})
@@ -592,8 +596,11 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 // At sets the timestamp in Epoch nanoseconds and finalizes
 // the ILP message.
 //
-// If the underlying buffer reaches configured capacity, this
+// If the underlying buffer reaches configured capacity or the
+// number of buffered messages exceeds the auto-flush trigger, this
 // method also sends the accumulated messages.
+//
+// If ts.IsZero(), no timestamp is sent to the server.
 func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 	sendTs := true
 	if ts.IsZero() {
@@ -606,7 +613,7 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 
 	s.msgCount++
 
-	if s.autoFlush && s.msgCount >= s.autoFlushRows {
+	if s.autoFlush && s.msgCount > s.autoFlushRows {
 		return s.Flush(ctx)
 	}
 
