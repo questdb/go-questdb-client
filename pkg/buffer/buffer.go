@@ -612,6 +612,11 @@ func (b *Buffer) BoolColumn(name string, val bool) *Buffer {
 	return b
 }
 
+// At sets the timestamp in Epoch nanoseconds and finalizes
+// the ILP message.
+//
+// If the underlying buffer reaches configured capacity, this
+// method also sends the accumulated messages.
 func (b *Buffer) At(ts time.Time, sendTs bool) error {
 	err := b.lastErr
 	b.lastErr = nil
