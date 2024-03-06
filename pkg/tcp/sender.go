@@ -321,6 +321,34 @@ func optsFromConf(config string) ([]LineSenderOption, error) {
 }
 
 // LineSenderFromConf creates a LineSender using the QuestDB config string format.
+//
+// Example config string: "tcp::addr=localhost;username=joe;token=123;auto_flush_rows=1000;"
+//
+// QuestDB ILP clients use a common key-value configuration string format across all
+// implementations. We opted for this config over a URL because it reduces the amount
+// of character escaping required for paths and base64-encoded param values. 
+//
+// The config string format is as follows:
+//
+// schema::key1=value1;key2=value2;key3=value3;
+//
+// Schemas supported are "http", "https", "tcp", "tcps"
+//
+// Supported parameter values for tcp(s):
+//
+// addr:      hostname/port of QuestDB HTTP endpoint
+// username:  for basic authentication
+// password:  for basic authentication
+// token:     bearer token auth (used instead of basic authentication)
+//
+// auto_flush:       determines if auto-flushing is enabled (values "on" or "off", defaults to "on")
+// auto_flush_rows:  auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on
+//
+// init_buf_size:  initial growable ILP buffer size in bytes (defaults to 64KiB)
+// max_buf_size:   buffer growth limit in bytes. client errors if breached (default is 100MiB)
+//
+// tls_verify: determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
+//
 func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
 	opts, err := optsFromConf(config)
 	if err != nil {

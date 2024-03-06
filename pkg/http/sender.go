@@ -130,7 +130,7 @@ func WithBearerToken(token string) LineSenderOption {
 }
 
 // WithRequestTimeout is used in combination with min_throughput
-// to set the timeout of an ILP request. Defaults to 5 seconds.
+// to set the timeout of an ILP request. Defaults to 10 seconds.
 //
 // timeout = (request.len() / min_throughput) + request_timeout
 func WithRequestTimeout(timeout time.Duration) LineSenderOption {
@@ -207,7 +207,7 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 	s := &LineSender{
 		address:                     "127.0.0.1:9000",
 		minThroughputBytesPerSecond: 100 * 1024,
-		requestTimeout:                5 * time.Second,
+		requestTimeout:                10 * time.Second,
 		retryTimeout:                10 * time.Second,
 
 		Buffer: *buffer.NewBuffer(),
@@ -240,6 +240,32 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 }
 
 // LineSenderFromConf creates a LineSender using the QuestDB config string format.
+//
+// Example config string: "http::addr=localhost;username=joe;password=123;"
+//
+// QuestDB ILP clients use a common key-value configuration string format across all
+// implementations. We opted for this config over a URL because it reduces the amount
+// of character escaping required for paths and base64-encoded param values. 
+//
+// The config string format is as follows:
+//
+// schema::key1=value1;key2=value2;key3=value3;
+//
+// Schemas supported are "http", "https", "tcp", "tcps"
+//
+// Supported parameter values for http(s):
+//
+// addr:      hostname/port of QuestDB HTTP endpoint
+// username:  for basic authentication
+// password:  for basic authentication
+// token:     bearer token auth (used instead of basic authentication)
+//
+// request_min_throughput: bytes per second, used to calculate each request's timeout (defaults to 100KiB/s)
+// request_timeout:        minimum request timeout in milliseconds (defaults to 10 seconds)
+// retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
+//
+// tls_verify: determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
+//
 func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
 	var (
 		user, pass, token string
