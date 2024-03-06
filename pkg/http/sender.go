@@ -560,14 +560,7 @@ func (s *LineSender) Close() {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) AtNow(ctx context.Context) error {
-	err := s.Buffer.At(time.Time{}, false)
-	if err != nil {
-		return err
-	}
-	if s.Len() > s.BufCap {
-		return s.Flush(ctx)
-	}
-	return nil
+	return s.Buffer.At(time.Time{}, false)
 }
 
 // At sets the timestamp in Epoch nanoseconds and finalizes
@@ -576,14 +569,7 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
 func (s *LineSender) At(ctx context.Context, ts time.Time) error {
-	err := s.Buffer.At(ts, true)
-	if err != nil {
-		return err
-	}
-	if s.Len() > s.BufCap {
-		return s.Flush(ctx)
-	}
-	return nil
+	return s.Buffer.At(ts, true)
 }
 
 func isRetryableError(statusCode int) bool {
