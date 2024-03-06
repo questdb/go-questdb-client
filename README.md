@@ -67,6 +67,8 @@ func main() {
 
 ### HTTP
 
+Now supported in v3. For more information, please visit https://questdb.io/docs/reference/api/ilp/overview/#http-and-tcp-overview
+
 ```go
 package main
 
