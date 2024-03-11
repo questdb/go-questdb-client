@@ -104,6 +104,7 @@ type LineSender struct {
 	tlsMode tlsMode
 
 	client http.Client
+	uri    string
 }
 
 // LineSenderOption defines line sender option.
@@ -245,6 +246,12 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 	}
 
 	clientCt.Add(1)
+
+	uri := "http"
+	if s.tlsMode > 0 {
+		uri += "s"
+	}
+	uri += fmt.Sprintf("://%s/write", s.address)
 
 	return s, nil
 }
@@ -397,12 +404,6 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	}
 
-	uri := "http"
-	if s.tlsMode > 0 {
-		uri += "s"
-	}
-	uri += fmt.Sprintf("://%s/write", s.address)
-
 	// timeout = ( request.len() / min_throughput ) + request_timeout
 	// nb: conversion from int to time.Duration is in milliseconds
 	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.requestTimeout
@@ -412,7 +413,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	req, err = http.NewRequestWithContext(
 		reqCtx,
 		http.MethodPost,
-		uri,
+		s.uri,
 		s,
 	)
 	if err != nil {
