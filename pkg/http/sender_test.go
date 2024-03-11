@@ -107,8 +107,8 @@ func TestHappyCasesFromConf(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, expected, actual)
 
-			actual.Close()
-			expected.Close()
+			actual.Close(context.Background())
+			expected.Close(context.Background())
 		})
 	}
 }
@@ -148,13 +148,13 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
 	sender, err := NewLineSender(WithAddress(srv.Addr()))
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	sender.Table(testTable)
 	err = sender.Flush(ctx)
@@ -173,7 +173,7 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 
 	sender, err := NewLineSender(WithAddress(srv.Addr()))
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	// Keep writing until we get an error due to the context deadline.
 	for i := 0; i < 100_000; i++ {
@@ -202,7 +202,7 @@ func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 		WithRequestTimeout(10*time.Millisecond),
 	)
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 	if err != nil {
@@ -226,7 +226,7 @@ func TestAutoFlush(t *testing.T) {
 		WithAutoFlushRows(autoFlushRows),
 	)
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	// Send autoFlushRows - 1 messages and ensure all are buffered
 	for i := 0; i < autoFlushRows-1; i++ {
@@ -259,7 +259,7 @@ func TestAutoFlushDisabled(t *testing.T) {
 		WithAutoFlushDisabled(),
 	)
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	// Send autoFlushRows + 1 messages and ensure all are buffered
 	for i := 0; i < autoFlushRows+1; i++ {
@@ -268,6 +268,89 @@ func TestAutoFlushDisabled(t *testing.T) {
 	}
 
 	assert.Equal(t, autoFlushRows+1, sender.msgCount)
+}
+
+func TestSenderDoubleClose(t *testing.T) {
+	ctx := context.Background()
+	autoFlushRows := 10
+
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	// opts are processed sequentially, so AutoFlushDisabled will
+	// override AutoFlushRows
+	sender, err := NewLineSender(
+		WithAddress(srv.Addr()),
+		WithAutoFlushRows(autoFlushRows),
+		WithAutoFlushDisabled(),
+	)
+	assert.NoError(t, err)
+
+	err = sender.Close(ctx)
+	assert.NoError(t, err)
+
+	err = sender.Close(ctx)
+	assert.Error(t, err)
+}
+
+func TestErrorOnFlushWhenSenderIsClosed(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+	err = sender.Close(ctx)
+	assert.NoError(t, err)
+
+	sender.Table(testTable)
+	err = sender.Flush(ctx)
+
+	assert.ErrorContains(t, err, "cannot flush a closed LineSender")
+}
+
+func TestAutoFlushWhenSenderIsClosed(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+
+	err = sender.Table(testTable).Symbol("abc", "def").AtNow(ctx)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, sender.Messages())
+
+	err = sender.Close(ctx)
+	assert.NoError(t, err)
+	assert.Empty(t, sender.Messages())
+}
+
+func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(
+		WithAddress(srv.Addr()),
+		WithAutoFlushDisabled(),
+	)
+	assert.NoError(t, err)
+
+	err = sender.Table(testTable).Symbol("abc", "def").AtNow(ctx)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, sender.Messages())
+
+	err = sender.Close(ctx)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, sender.Messages())
 }
 
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
@@ -294,7 +377,7 @@ func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 				At(ctx, time.UnixMicro(int64(1000*i)))
 		}
 		sender.Flush(ctx)
-		sender.Close()
+		sender.Close(ctx)
 	}
 
 }
@@ -322,6 +405,6 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 			At(ctx, time.UnixMicro(int64(1000*i)))
 	}
 	sender.Flush(ctx)
-	sender.Close()
+	sender.Close(ctx)
 
 }

@@ -16,7 +16,12 @@ func main() {
 		log.Fatal(err)
 	}
 	// Make sure to close the sender on exit to release resources.
-	defer sender.Close()
+	defer func() {
+		err := sender.Close(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
 
 	// Send a few ILP messages.
 	bday, err := time.Parse(time.DateOnly, "1856-07-10")

@@ -104,6 +104,7 @@ type LineSender struct {
 
 	client http.Client
 	uri    string
+	closed bool
 }
 
 // LineSenderOption defines line sender option.
@@ -390,6 +391,10 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		maxRetryInterval = time.Second
 	)
 
+	if s.closed {
+		return errors.New("cannot flush a closed LineSender")
+	}
+
 	err := s.LastErr()
 	s.ClearLastErr()
 	if err != nil {
@@ -573,11 +578,26 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 
 // Close closes the underlying HTTP client. If no clients remain open,
 // the global http.Transport will close all idle connections.
-func (s *LineSender) Close() {
+func (s *LineSender) Close(ctx context.Context) error {
+	if s.closed {
+		return errors.New("cannot call Close() on a closed LineSender")
+	}
+
+	if s.autoFlushRows > 0 && s.Buffer.Len() > 0 {
+		err := s.Flush(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	s.closed = true
+
 	newCt := clientCt.Add(-1)
 	if newCt == 0 {
 		globalTransport.CloseIdleConnections()
 	}
+
+	return nil
 }
 
 // AtNow omits the timestamp and finalizes the ILP message.
@@ -600,6 +620,10 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 //
 // If ts.IsZero(), no timestamp is sent to the server.
 func (s *LineSender) At(ctx context.Context, ts time.Time) error {
+	if s.closed {
+		return errors.New("cannot queue new messages on a closed LineSender")
+	}
+
 	sendTs := true
 	if ts.IsZero() {
 		sendTs = false

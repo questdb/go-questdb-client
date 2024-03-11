@@ -801,7 +801,7 @@ func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 		qdbHttp.WithTlsInsecureSkipVerify(),
 	)
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	err = sender.
 		Table(testTable).
