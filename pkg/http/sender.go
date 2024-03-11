@@ -93,7 +93,6 @@ type LineSender struct {
 	requestTimeout              time.Duration
 
 	// Auto-flush fields
-	autoFlush     bool
 	autoFlushRows int
 	msgCount      int
 
@@ -195,7 +194,7 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 // To send ILP messages, the user must call Flush().
 func WithAutoFlushDisabled() LineSenderOption {
 	return func(s *LineSender) {
-		s.autoFlush = false
+		s.autoFlushRows = 0
 	}
 }
 
@@ -204,7 +203,6 @@ func WithAutoFlushDisabled() LineSenderOption {
 // Defaults to 75000.
 func WithAutoFlushRows(rows int) LineSenderOption {
 	return func(s *LineSender) {
-		s.autoFlush = true
 		s.autoFlushRows = rows
 	}
 }
@@ -218,7 +216,6 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 		minThroughputBytesPerSecond: 100 * 1024,
 		requestTimeout:              10 * time.Second,
 		retryTimeout:                10 * time.Second,
-		autoFlush:                   true,
 		autoFlushRows:               75000,
 
 		Buffer: *buffer.NewBuffer(),
@@ -614,7 +611,7 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 
 	s.msgCount++
 
-	if s.autoFlush && s.msgCount > s.autoFlushRows {
+	if s.autoFlushRows > 0 && s.msgCount > s.autoFlushRows {
 		return s.Flush(ctx)
 	}
 
