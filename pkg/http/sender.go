@@ -244,11 +244,11 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 
 	clientCt.Add(1)
 
-	uri := "http"
+	s.uri = "http"
 	if s.tlsMode > 0 {
-		uri += "s"
+		s.uri += "s"
 	}
-	uri += fmt.Sprintf("://%s/write", s.address)
+	s.uri += fmt.Sprintf("://%s/write", s.address)
 
 	return s, nil
 }

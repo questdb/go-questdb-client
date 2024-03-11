@@ -228,13 +228,13 @@ func TestAutoFlush(t *testing.T) {
 	assert.NoError(t, err)
 	defer sender.Close()
 
-	// Send autoFlushRows messages and ensure all are buffered
-	for i := 0; i < autoFlushRows; i++ {
+	// Send autoFlushRows - 1 messages and ensure all are buffered
+	for i := 0; i < autoFlushRows-1; i++ {
 		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 		assert.NoError(t, err)
 	}
 
-	assert.Equal(t, autoFlushRows, sender.msgCount)
+	assert.Equal(t, autoFlushRows-1, sender.msgCount)
 
 	// Send one additional message and ensure that all are flushed
 	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
