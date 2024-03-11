@@ -611,7 +611,7 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 
 	s.msgCount++
 
-	if s.autoFlushRows > 0 && s.msgCount > s.autoFlushRows {
+	if s.msgCount == s.autoFlushRows {
 		return s.Flush(ctx)
 	}
 
