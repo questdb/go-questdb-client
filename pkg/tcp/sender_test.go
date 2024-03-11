@@ -229,65 +229,6 @@ func TestErrorOnContextDeadline(t *testing.T) {
 	t.Fail()
 }
 
-func TestAutoFlush(t *testing.T) {
-	ctx := context.Background()
-	autoFlushRows := 10
-
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
-	assert.NoError(t, err)
-	defer srv.Close()
-
-	sender, err := NewLineSender(
-		ctx,
-		WithAddress(srv.Addr()),
-		WithAutoFlushRows(autoFlushRows),
-	)
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	// Send autoFlushRows messages and ensure all are buffered
-	for i := 0; i < autoFlushRows; i++ {
-		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
-		assert.NoError(t, err)
-	}
-
-	assert.Equal(t, autoFlushRows, sender.msgCount)
-
-	// Send one additional message and ensure that all are flushed
-	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
-	assert.NoError(t, err)
-
-	assert.Equal(t, 0, sender.msgCount)
-}
-
-func TestAutoFlushDisabled(t *testing.T) {
-	ctx := context.Background()
-	autoFlushRows := 10
-
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
-	assert.NoError(t, err)
-	defer srv.Close()
-
-	// opts are processed sequentially, so AutoFlushDisabled will
-	// override AutoFlushRows
-	sender, err := NewLineSender(
-		ctx,
-		WithAddress(srv.Addr()),
-		WithAutoFlushRows(autoFlushRows),
-		WithAutoFlushDisabled(),
-	)
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	// Send autoFlushRows + 1 messages and ensure all are buffered
-	for i := 0; i < autoFlushRows+1; i++ {
-		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
-		assert.NoError(t, err)
-	}
-
-	assert.Equal(t, autoFlushRows+1, sender.msgCount)
-}
-
 func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 

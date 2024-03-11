@@ -69,11 +69,6 @@ type LineSender struct {
 	keyId   string // Erased once auth is done.
 	key     string // Erased once auth is done.
 
-	// Auto-flush fields
-	autoFlush     bool
-	autoFlushRows int
-	msgCount      int
-
 	conn net.Conn
 }
 
@@ -147,24 +142,6 @@ func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	}
 }
 
-// WithAutoFlushDisabled turns off auto-flushing behavior.
-// To send ILP messages, the user either must call Flush().
-func WithAutoFlushDisabled() LineSenderOption {
-	return func(s *LineSender) {
-		s.autoFlush = false
-	}
-}
-
-// WithAutoFlushRows sets the number of buffered rows that
-// must be breached in order to trigger an auto-flush.
-// Defaults to 75000.
-func WithAutoFlushRows(rows int) LineSenderOption {
-	return func(s *LineSender) {
-		s.autoFlush = true
-		s.autoFlushRows = rows
-	}
-}
-
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single TCP connection. Sender should
 // not be called concurrently by multiple goroutines.
@@ -179,9 +156,6 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	s := &LineSender{
 		address: "127.0.0.1:9009",
 		tlsMode: tlsDisabled,
-
-		autoFlush:     true,
-		autoFlushRows: 75000,
 
 		Buffer: *buffer.NewBuffer(),
 	}
@@ -517,8 +491,6 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
 	}
 
-	s.msgCount = 0
-
 	return nil
 }
 
@@ -551,13 +523,7 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 		return err
 	}
 
-	s.msgCount++
-
 	if s.Len() > s.BufCap {
-		return s.Flush(ctx)
-	}
-
-	if s.autoFlush && s.msgCount > s.autoFlushRows {
 		return s.Flush(ctx)
 	}
 
