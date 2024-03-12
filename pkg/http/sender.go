@@ -551,6 +551,9 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 
 // Close closes the underlying HTTP client. If no clients remain open,
 // the global http.Transport will close all idle connections.
+//
+// If auto-flush is enabled, the client will flush any remaining buffered
+// messages before closing itself.
 func (s *LineSender) Close(ctx context.Context) error {
 	if s.closed {
 		return nil
