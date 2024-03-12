@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/questdb/go-questdb-client/v3/pkg/buffer"
 	"github.com/questdb/go-questdb-client/v3/pkg/test/utils"
 	"github.com/stretchr/testify/assert"
 )
@@ -106,11 +107,15 @@ func TestHappyCasesFromConf(t *testing.T) {
 			actualOpts, err := optsFromConf(tc.config)
 			assert.NoError(t, err)
 
-			actual := &LineSender{}
+			actual := &LineSender{
+				buf: buffer.NewBuffer(),
+			}
 			for _, opt := range actualOpts {
 				opt(actual)
 			}
-			expected := &LineSender{}
+			expected := &LineSender{
+				buf: buffer.NewBuffer(),
+			}
 			for _, opt := range tc.expectedOpts {
 				opt(expected)
 			}
@@ -167,7 +172,7 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	err = sender.Flush(ctx)
 
 	assert.ErrorContains(t, err, "pending ILP message must be finalized with At or AtNow before calling Flush")
-	assert.Empty(t, sender.Messages())
+	assert.Empty(t, sender.buf.Messages())
 }
 
 func TestErrorOnUnavailableServer(t *testing.T) {

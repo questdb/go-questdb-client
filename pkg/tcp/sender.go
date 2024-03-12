@@ -60,7 +60,7 @@ const (
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
 type LineSender struct {
-	buffer.Buffer
+	buf *buffer.Buffer
 
 	address string
 
@@ -117,7 +117,7 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 func WithBufferCapacity(capacity int) LineSenderOption {
 	return func(s *LineSender) {
 		if capacity > 0 {
-			s.BufCap = capacity
+			s.buf.BufCap = capacity
 		}
 	}
 }
@@ -129,7 +129,7 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 func WithFileNameLimit(limit int) LineSenderOption {
 	return func(s *LineSender) {
 		if limit > 0 {
-			s.FileNameLimit = limit
+			s.buf.FileNameLimit = limit
 		}
 	}
 }
@@ -138,7 +138,7 @@ func WithFileNameLimit(limit int) LineSenderOption {
 // in bytes to be used when sending ILP messages. Defaults to 0.
 func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *LineSender) {
-		s.InitBufSizeBytes = sizeInBytes
+		s.buf.InitBufSizeBytes = sizeInBytes
 	}
 }
 
@@ -157,7 +157,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		address: "127.0.0.1:9009",
 		tlsMode: tlsDisabled,
 
-		Buffer: *buffer.NewBuffer(),
+		buf: buffer.NewBuffer(),
 	}
 
 	for _, opt := range opts {
@@ -243,7 +243,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 
 	s.conn = conn
 
-	s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
+	s.buf.Buffer = *bytes.NewBuffer(make([]byte, s.buf.InitBufSizeBytes, s.buf.BufCap))
 
 	return s, nil
 
@@ -368,7 +368,7 @@ func (s *LineSender) Close() error {
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
 func (s *LineSender) Table(name string) *LineSender {
-	s.Buffer.Table(name)
+	s.buf.Table(name)
 	return s
 }
 
@@ -379,7 +379,7 @@ func (s *LineSender) Table(name string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Symbol(name, val string) *LineSender {
-	s.Buffer.Symbol(name, val)
+	s.buf.Symbol(name, val)
 	return s
 }
 
@@ -390,7 +390,7 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Int64Column(name string, val int64) *LineSender {
-	s.Buffer.Int64Column(name, val)
+	s.buf.Int64Column(name, val)
 	return s
 }
 
@@ -404,7 +404,7 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
-	s.Buffer.Long256Column(name, val)
+	s.buf.Long256Column(name, val)
 	return s
 }
 
@@ -415,7 +415,7 @@ func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
-	s.Buffer.TimestampColumn(name, ts)
+	s.buf.TimestampColumn(name, ts)
 	return s
 }
 
@@ -426,7 +426,7 @@ func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) Float64Column(name string, val float64) *LineSender {
-	s.Buffer.Float64Column(name, val)
+	s.buf.Float64Column(name, val)
 	return s
 }
 
@@ -436,7 +436,7 @@ func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) StringColumn(name, val string) *LineSender {
-	s.Buffer.StringColumn(name, val)
+	s.buf.StringColumn(name, val)
 	return s
 }
 
@@ -446,7 +446,7 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
 func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
-	s.Buffer.BoolColumn(name, val)
+	s.buf.BoolColumn(name, val)
 	return s
 }
 
@@ -461,14 +461,14 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 // configured buffer capacity.
 func (s *LineSender) Flush(ctx context.Context) error {
 
-	err := s.LastErr()
-	s.ClearLastErr()
+	err := s.buf.LastErr()
+	s.buf.ClearLastErr()
 	if err != nil {
-		s.DiscardPendingMsg()
+		s.buf.DiscardPendingMsg()
 		return err
 	}
-	if s.HasTable() {
-		s.DiscardPendingMsg()
+	if s.buf.HasTable() {
+		s.buf.DiscardPendingMsg()
 		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	}
 
@@ -481,14 +481,14 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		s.conn.SetWriteDeadline(time.Time{})
 	}
 
-	if _, err := s.Buffer.WriteTo(s.conn); err != nil {
+	if _, err := s.buf.WriteTo(s.conn); err != nil {
 		return err
 	}
 
 	// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
-	if s.Cap() > 3*s.BufCap {
+	if s.buf.Cap() > 3*s.buf.BufCap {
 		// Shrink the buffer back to desired capacity.
-		s.Buffer.Buffer = *bytes.NewBuffer(make([]byte, s.InitBufSizeBytes, s.BufCap))
+		s.buf.Buffer = *bytes.NewBuffer(make([]byte, s.buf.InitBufSizeBytes, s.buf.BufCap))
 	}
 
 	return nil
@@ -518,12 +518,12 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 	if ts.IsZero() {
 		sendTs = false
 	}
-	err := s.Buffer.At(ts, sendTs)
+	err := s.buf.At(ts, sendTs)
 	if err != nil {
 		return err
 	}
 
-	if s.Len() > s.BufCap {
+	if s.buf.Len() > s.buf.BufCap {
 		return s.Flush(ctx)
 	}
 

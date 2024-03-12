@@ -162,7 +162,7 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	err = sender.Flush(ctx)
 
 	assert.ErrorContains(t, err, "pending ILP message must be finalized with At or AtNow before calling Flush")
-	assert.Empty(t, sender.Messages())
+	assert.Empty(t, sender.buf.Messages())
 }
 
 func TestErrorOnContextDeadlineHttp(t *testing.T) {
@@ -291,13 +291,13 @@ func TestAutoFlush(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	assert.Equal(t, autoFlushRows-1, sender.MsgCount())
+	assert.Equal(t, autoFlushRows-1, sender.buf.MsgCount())
 
 	// Send one additional message and ensure that all are flushed
 	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 	assert.NoError(t, err)
 
-	assert.Equal(t, 0, sender.MsgCount())
+	assert.Equal(t, 0, sender.buf.MsgCount())
 }
 
 func TestAutoFlushDisabled(t *testing.T) {
@@ -324,7 +324,7 @@ func TestAutoFlushDisabled(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	assert.Equal(t, autoFlushRows+1, sender.MsgCount())
+	assert.Equal(t, autoFlushRows+1, sender.buf.MsgCount())
 }
 
 func TestSenderDoubleClose(t *testing.T) {
@@ -381,11 +381,11 @@ func TestAutoFlushWhenSenderIsClosed(t *testing.T) {
 
 	err = sender.Table(testTable).Symbol("abc", "def").AtNow(ctx)
 	assert.NoError(t, err)
-	assert.NotEmpty(t, sender.Messages())
+	assert.NotEmpty(t, sender.buf.Messages())
 
 	err = sender.Close(ctx)
 	assert.NoError(t, err)
-	assert.Empty(t, sender.Messages())
+	assert.Empty(t, sender.buf.Messages())
 }
 
 func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
@@ -403,11 +403,11 @@ func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
 
 	err = sender.Table(testTable).Symbol("abc", "def").AtNow(ctx)
 	assert.NoError(t, err)
-	assert.NotEmpty(t, sender.Messages())
+	assert.NotEmpty(t, sender.buf.Messages())
 
 	err = sender.Close(ctx)
 	assert.NoError(t, err)
-	assert.NotEmpty(t, sender.Messages())
+	assert.NotEmpty(t, sender.buf.Messages())
 }
 
 func TestBufferClearAfterFlush(t *testing.T) {
@@ -428,7 +428,7 @@ func TestBufferClearAfterFlush(t *testing.T) {
 	assert.NoError(t, err)
 
 	utils.ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,abc=def", testTable)})
-	assert.Zero(t, sender.Buffer.Len())
+	assert.Zero(t, sender.buf.Len())
 
 	err = sender.Table(testTable).Symbol("ghi", "jkl").AtNow(ctx)
 	assert.NoError(t, err)
