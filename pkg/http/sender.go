@@ -553,7 +553,7 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 // the global http.Transport will close all idle connections.
 func (s *LineSender) Close(ctx context.Context) error {
 	if s.closed {
-		return errors.New("cannot call Close() on a closed LineSender")
+		return nil
 	}
 
 	if s.autoFlushRows > 0 && s.Buffer.Len() > 0 {
