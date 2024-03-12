@@ -42,7 +42,6 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	qdb "github.com/questdb/go-questdb-client/v3"
-	qdbHttp "github.com/questdb/go-questdb-client/v3/pkg/http"
 	"github.com/questdb/go-questdb-client/v3/pkg/tcp"
 )
 
@@ -56,13 +55,12 @@ type writerFn func(s *tcp.LineSender) error
 
 type questdbContainer struct {
 	testcontainers.Container
-	proxyC                       testcontainers.Container
-	network                      testcontainers.Network
-	httpAddress                  string
-	ilpAddress                   string
-	proxyIlpAddress              string
-	proxyIlpHttpAddress          string
-	proxyIlpHttpBasicAuthAddress string
+	proxyC              testcontainers.Container
+	network             testcontainers.Network
+	httpAddress         string
+	ilpAddress          string
+	proxyIlpTcpAddress  string
+	proxyIlpHttpAddress string
 }
 
 func (c *questdbContainer) Stop(ctx context.Context) error {
@@ -131,7 +129,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 		return nil, err
 	}
 	req := testcontainers.ContainerRequest{
-		Image:          "questdb/questdb:7.3.9",
+		Image:          "questdb/questdb:nightly",
 		ExposedPorts:   []string{"9000/tcp", "9009/tcp"},
 		WaitingFor:     wait.ForHTTP("/").WithPort("9000"),
 		Networks:       []string{networkName},
@@ -175,7 +173,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 		newNetwork.Remove(ctx)
 		return nil, err
 	}
-	httpAddress := fmt.Sprintf("http://%s:%s", ip, mappedPort.Port())
+	httpAddress := fmt.Sprintf("%s:%s", ip, mappedPort.Port())
 
 	mappedPort, err = qdbC.MappedPort(ctx, "9009")
 	if err != nil {
@@ -185,10 +183,9 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	ilpAddress := fmt.Sprintf("%s:%s", ip, mappedPort.Port())
 
 	var (
-		haProxyC                  testcontainers.Container
-		proxyAddress              string
-		proxyHttpAddress          string
-		proxyHttpBasicAuthAddress string
+		haProxyC            testcontainers.Container
+		proxyIlpTcpAddress  string
+		proxyIlpHttpAddress string
 	)
 	if setupProxy || auth == httpBasicAuth || auth == httpBearerAuth {
 		req = testcontainers.ContainerRequest{
@@ -226,15 +223,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 			newNetwork.Remove(ctx)
 			return nil, err
 		}
-		proxyAddress = fmt.Sprintf("%s:%s", ip, mappedPort.Port())
-
-		mappedPort, err = haProxyC.MappedPort(ctx, "8444")
-		if err != nil {
-			qdbC.Terminate(ctx)
-			newNetwork.Remove(ctx)
-			return nil, err
-		}
-		proxyHttpAddress = fmt.Sprintf("%s:%s", ip, mappedPort.Port())
+		proxyIlpTcpAddress = fmt.Sprintf("%s:%s", ip, mappedPort.Port())
 
 		mappedPort, err = haProxyC.MappedPort(ctx, "8445")
 		if err != nil {
@@ -242,18 +231,17 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 			newNetwork.Remove(ctx)
 			return nil, err
 		}
-		proxyHttpBasicAuthAddress = fmt.Sprintf("%s:%s", ip, mappedPort.Port())
+		proxyIlpHttpAddress = fmt.Sprintf("%s:%s", ip, mappedPort.Port())
 	}
 
 	return &questdbContainer{
-		Container:                    qdbC,
-		proxyC:                       haProxyC,
-		network:                      newNetwork,
-		httpAddress:                  httpAddress,
-		ilpAddress:                   ilpAddress,
-		proxyIlpAddress:              proxyAddress,
-		proxyIlpHttpAddress:          proxyHttpAddress,
-		proxyIlpHttpBasicAuthAddress: proxyHttpBasicAuthAddress,
+		Container:           qdbC,
+		proxyC:              haProxyC,
+		network:             newNetwork,
+		httpAddress:         httpAddress,
+		ilpAddress:          ilpAddress,
+		proxyIlpTcpAddress:  proxyIlpTcpAddress,
+		proxyIlpHttpAddress: proxyIlpHttpAddress,
 	}, nil
 }
 
@@ -653,7 +641,7 @@ func TestE2EWritesWithTlsProxy(t *testing.T) {
 
 	sender, err := qdb.NewLineSender(
 		ctx,
-		qdb.WithAddress(questdbC.proxyIlpAddress), // We're sending data through proxy.
+		qdb.WithAddress(questdbC.proxyIlpTcpAddress), // We're sending data through proxy.
 		qdb.WithTlsInsecureSkipVerify(),
 	)
 	assert.NoError(t, err)
@@ -705,7 +693,7 @@ func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
 
 	sender, err := qdb.NewLineSender(
 		ctx,
-		qdb.WithAddress(questdbC.proxyIlpAddress), // We're sending data through proxy.
+		qdb.WithAddress(questdbC.proxyIlpTcpAddress), // We're sending data through proxy.
 		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 		qdb.WithTlsInsecureSkipVerify(),
 	)
@@ -761,6 +749,8 @@ type column struct {
 }
 
 func queryTableData(t *testing.T, tableName, address string) tableData {
+	// We always query data using the QuestDB container over http
+	address = "http://" + address
 	u, err := url.Parse(address)
 	assert.NoError(t, err)
 
@@ -782,56 +772,4 @@ func queryTableData(t *testing.T, tableName, address string) tableData {
 	assert.NoError(t, err)
 
 	return data
-}
-
-func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
-	ctx := context.Background()
-
-	questdbC, err := setupQuestDB(ctx, httpBasicAuth)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
-
-	sender, err := qdbHttp.NewLineSender(
-		qdbHttp.WithAddress(questdbC.proxyIlpHttpBasicAuthAddress),
-		qdbHttp.WithBasicAuth(basicAuthUser, basicAuthPass),
-		qdbHttp.WithTlsInsecureSkipVerify(),
-	)
-	assert.NoError(t, err)
-	defer sender.Close(ctx)
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "foobar").
-		At(ctx, time.UnixMicro(1))
-	assert.NoError(t, err)
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "barbaz").
-		At(ctx, time.UnixMicro(2))
-	assert.NoError(t, err)
-
-	err = sender.Flush(ctx)
-	assert.NoError(t, err)
-
-	expected := tableData{
-		Columns: []column{
-			{"str_col", "STRING"},
-			{"timestamp", "TIMESTAMP"},
-		},
-		Dataset: [][]interface{}{
-			{"foobar", "1970-01-01T00:00:00.000001Z"},
-			{"barbaz", "1970-01-01T00:00:00.000002Z"},
-		},
-		Count: 2,
-	}
-
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
-		return reflect.DeepEqual(expected, data)
-	}, eventualDataTimeout, 100*time.Millisecond)
 }

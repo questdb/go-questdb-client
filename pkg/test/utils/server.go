@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -21,7 +22,9 @@ type ServerType int64
 const (
 	SendToBackChannel ServerType = 0
 	ReadAndDiscard    ServerType = 1
-	ReturningError    ServerType = 2
+	Returning500      ServerType = 2
+	Returning403      ServerType = 3
+	Returning404      ServerType = 4
 )
 
 type TestServer struct {
@@ -177,8 +180,23 @@ func (s *TestServer) serveHttp() {
 			}
 		case ReadAndDiscard:
 			_, err = io.Copy(ioutil.Discard, r.Body)
-		case ReturningError:
+		case Returning500:
 			w.WriteHeader(http.StatusInternalServerError)
+		case Returning403:
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, "Forbidden")
+		case Returning404:
+			w.WriteHeader(http.StatusNotFound)
+			data, err := json.Marshal(map[string]interface{}{
+				"code":    "404",
+				"message": "Not Found",
+				"line":    42,
+				"errorId": "Not Found",
+			})
+			if err != nil {
+				panic(err)
+			}
+			w.Write(data)
 		default:
 			panic(fmt.Sprintf("server type is not supported: %d", s.serverType))
 		}

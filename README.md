@@ -8,7 +8,7 @@ Features:
 * Context-aware API.
 * Optimized for batch writes.
 * Supports TLS encryption and [ILP authentication](https://questdb.io/docs/reference/api/ilp/authenticate).
-* Tested against QuestDB 7.3.9 and newer versions.
+* Tested against QuestDB 7.3.11 and newer versions.
 
 New in v3:
 * Supports ILP over HTTP using the same client semantics

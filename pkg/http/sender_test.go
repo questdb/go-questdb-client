@@ -26,7 +26,9 @@ package http
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -190,16 +192,17 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	t.Fail()
 }
 
-func TestErrorOnInternalServerErrorHttp(t *testing.T) {
+func TestRetryOn500(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.ReturningError)
+	srv, err := utils.NewTestHttpServer(utils.Returning500)
 	assert.NoError(t, err)
 	defer srv.Close()
 
 	sender, err := NewLineSender(
 		WithAddress(srv.Addr()),
 		WithRequestTimeout(10*time.Millisecond),
+		WithRetryTimeout(50*time.Millisecond),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
@@ -209,8 +212,62 @@ func TestErrorOnInternalServerErrorHttp(t *testing.T) {
 		return
 	}
 	err = sender.Flush(ctx)
-	assert.ErrorContains(t, err, "500")
+	retryErr := &RetryTimeoutError{}
+	assert.ErrorAs(t, err, &retryErr)
+	assert.ErrorContains(t, retryErr.LastErr, "500")
 
+}
+
+func TestNoRetryOn400FromProxy(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := utils.NewTestHttpServer(utils.Returning403)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(
+		WithAddress(srv.Addr()),
+		WithRequestTimeout(10*time.Millisecond),
+		WithRetryTimeout(50*time.Millisecond),
+	)
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	if err != nil {
+		return
+	}
+	err = sender.Flush(ctx)
+	retryTimeoutErr := &RetryTimeoutError{}
+	assert.False(t, errors.As(err, &retryTimeoutErr))
+	assert.ErrorContains(t, err, "Forbidden")
+}
+
+func TestNoRetryOn400FromServer(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := utils.NewTestHttpServer(utils.Returning404)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(
+		WithAddress(srv.Addr()),
+		WithRequestTimeout(10*time.Millisecond),
+		WithRetryTimeout(50*time.Millisecond),
+	)
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	if err != nil {
+		return
+	}
+	err = sender.Flush(ctx)
+	httpErr := &HttpError{}
+	assert.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, http.StatusNotFound, httpErr.httpStatus)
+	assert.Equal(t, "Not Found", httpErr.Message)
+	assert.Equal(t, 42, httpErr.Line)
 }
 
 func TestAutoFlush(t *testing.T) {
@@ -234,13 +291,13 @@ func TestAutoFlush(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	assert.Equal(t, autoFlushRows-1, sender.msgCount)
+	assert.Equal(t, autoFlushRows-1, sender.MsgCount())
 
 	// Send one additional message and ensure that all are flushed
 	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 	assert.NoError(t, err)
 
-	assert.Equal(t, 0, sender.msgCount)
+	assert.Equal(t, 0, sender.MsgCount())
 }
 
 func TestAutoFlushDisabled(t *testing.T) {
@@ -267,7 +324,7 @@ func TestAutoFlushDisabled(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	assert.Equal(t, autoFlushRows+1, sender.msgCount)
+	assert.Equal(t, autoFlushRows+1, sender.MsgCount())
 }
 
 func TestSenderDoubleClose(t *testing.T) {

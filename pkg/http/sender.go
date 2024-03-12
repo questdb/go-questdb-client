@@ -27,12 +27,13 @@ package http
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -94,7 +95,6 @@ type LineSender struct {
 
 	// Auto-flush fields
 	autoFlushRows int
-	msgCount      int
 
 	// Authentication-related fields
 	user    string
@@ -406,14 +406,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	}
 
-	// timeout = ( request.len() / min_throughput ) + request_timeout
-	// nb: conversion from int to time.Duration is in milliseconds
-	timeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.requestTimeout
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	req, err = http.NewRequestWithContext(
-		reqCtx,
+	req, err = http.NewRequest(
 		http.MethodPost,
 		s.uri,
 		s,
@@ -433,49 +426,29 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
 	}
 
-	resp, err := s.client.Do(req)
-	if err == nil {
-		defer resp.Body.Close()
-
-		// If the requests succeeds with a non-error status code, flush has succeeded
-		if !isRetryableError(resp.StatusCode) {
-			s.msgCount = 0
-			return nil
-		}
-		// Otherwise, we will retry sending the request until the retry timeout is breached
-		err = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
+	retry, err := s.makeRequest(ctx, req)
+	if !retry {
+		return err
 	}
 
 	if s.retryTimeout > 0 {
+		retryStartTime := time.Now()
+
 		retryInterval = 10 * time.Millisecond
 		for err != nil {
+			if time.Since(retryStartTime) > s.retryTimeout {
+				return NewRetryTimeoutError(s.retryTimeout, err)
+			}
+
 			jitter := time.Duration(rand.Intn(10)) * time.Millisecond
 			time.Sleep(retryInterval + jitter)
 
-			resp, retryErr := s.client.Do(req)
-			if retryErr == nil {
-				defer resp.Body.Close()
-
-				// If the requests succeeds with a non-error status code, flush has succeeded
-				if !isRetryableError(resp.StatusCode) {
-					s.msgCount = 0
-					return nil
-				}
-				retryErr = fmt.Errorf("Non-OK Status Code %d: %s", resp.StatusCode, resp.Status)
+			retry, err = s.makeRequest(ctx, req)
+			if !retry {
+				return err
 			}
 
-			// If the error is an http timeout (due to the context expiring),
-			// return the previously-encountered error
-			var urlErr *url.Error
-			if errors.As(retryErr, &urlErr) {
-				if urlErr.Timeout() {
-					return err
-				}
-			}
-
-			err = retryErr
-
-			// If the attempt fails, retry with exponentially-increasing timeout
+			// Retry with exponentially-increasing timeout
 			// up to a global maximum (1 second)
 			retryInterval = retryInterval * 2
 			if retryInterval > maxRetryInterval {
@@ -633,13 +606,58 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 		return err
 	}
 
-	s.msgCount++
-
-	if s.msgCount == s.autoFlushRows {
+	if s.MsgCount() == s.autoFlushRows {
 		return s.Flush(ctx)
 	}
 
 	return nil
+}
+
+// makeRequest returns a boolean if we need to retry the request
+func (s *LineSender) makeRequest(ctx context.Context, req *http.Request) (bool, error) {
+	// reqTimeout = ( request.len() / min_throughput ) + request_timeout
+	// nb: conversion from int to time.Duration is in milliseconds
+	reqTimeout := time.Duration(s.Len()/s.minThroughputBytesPerSecond)*time.Second + s.requestTimeout
+	reqCtx, cancel := context.WithTimeout(ctx, reqTimeout)
+	defer cancel()
+
+	req = req.WithContext(reqCtx)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return true, err
+	}
+
+	defer resp.Body.Close()
+
+	// Don't retry on successful responses
+	if resp.StatusCode < 300 {
+		return false, nil
+	}
+
+	// Retry on known 500-related errors
+	if isRetryableError(resp.StatusCode) {
+		return true, fmt.Errorf("%d: %s", resp.StatusCode, resp.Status)
+	}
+
+	// For all other response codes, attempt to parse the body
+	// as a JSON error message from the QuestDB server.
+	// If this fails at any point, just return the status message
+	// and body contents (if any)
+
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("%d: %s", resp.StatusCode, resp.Status)
+	}
+	httpErr := &HttpError{
+		httpStatus: resp.StatusCode,
+	}
+	err = json.Unmarshal(buf, httpErr)
+	if err != nil {
+		return false, fmt.Errorf("%d: %s -- %s", resp.StatusCode, resp.Status, buf)
+	}
+
+	return false, httpErr
+
 }
 
 func isRetryableError(statusCode int) bool {

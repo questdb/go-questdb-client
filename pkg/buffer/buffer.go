@@ -54,11 +54,13 @@ type Buffer struct {
 	BufCap           int
 	InitBufSizeBytes int
 	FileNameLimit    int
-	lastMsgPos       int
-	lastErr          error
-	hasTable         bool
-	hasTags          bool
-	hasFields        bool
+
+	lastMsgPos int
+	lastErr    error
+	hasTable   bool
+	hasTags    bool
+	hasFields  bool
+	msgCount   int
 }
 
 // NewBuffer initializes a pointer to a Buffer with default values
@@ -92,6 +94,11 @@ func (b *Buffer) LastErr() error {
 // ClearLastErr sets the internal lastErr field to nil
 func (b *Buffer) ClearLastErr() {
 	b.lastErr = nil
+}
+
+// MsgCount returns the number of buffered messages
+func (b *Buffer) MsgCount() int {
+	return b.msgCount
 }
 
 func (b *Buffer) writeInt(i int64) {
@@ -136,6 +143,7 @@ func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
 		return n, err
 	}
 	b.lastMsgPos = 0
+	b.msgCount = 0
 	return n, nil
 }
 
@@ -640,6 +648,7 @@ func (b *Buffer) At(ts time.Time, sendTs bool) error {
 	b.WriteByte('\n')
 
 	b.lastMsgPos = b.Len()
+	b.msgCount++
 	b.resetMsgFlags()
 	return nil
 }
