@@ -26,23 +26,19 @@ package integration_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/big"
-	"net/http"
-	"net/url"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
+	qdb "github.com/questdb/go-questdb-client/v3"
+	"github.com/questdb/go-questdb-client/v3/pkg/http"
+	"github.com/questdb/go-questdb-client/v3/pkg/tcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
-
-	qdb "github.com/questdb/go-questdb-client/v3"
-	"github.com/questdb/go-questdb-client/v3/pkg/tcp"
 )
 
 const (
@@ -51,7 +47,120 @@ const (
 	eventualDataTimeout = 60 * time.Second
 )
 
-type writerFn func(s *tcp.LineSender) error
+type writerFn func(s LineSender) error
+
+type LineSender interface {
+	Table(name string) LineSender
+	Symbol(name, val string) LineSender
+	Int64Column(name string, val int64) LineSender
+	Long256Column(name string, val *big.Int) LineSender
+	TimestampColumn(name string, ts time.Time) LineSender
+	Float64Column(name string, val float64) LineSender
+	StringColumn(name, val string) LineSender
+	BoolColumn(name string, val bool) LineSender
+	Close(ctx context.Context) error
+	AtNow(ctx context.Context) error
+	At(ctx context.Context, ts time.Time) error
+	Flush(ctx context.Context) error
+}
+
+type TestTcpLineSender struct {
+	sender *tcp.LineSender
+}
+
+func (s *TestTcpLineSender) Table(name string) LineSender {
+	s.sender.Table(name)
+	return s
+}
+func (s *TestTcpLineSender) Symbol(name, val string) LineSender {
+	s.sender.Symbol(name, val)
+	return s
+}
+func (s *TestTcpLineSender) Int64Column(name string, val int64) LineSender {
+	s.sender.Int64Column(name, val)
+	return s
+}
+func (s *TestTcpLineSender) Long256Column(name string, val *big.Int) LineSender {
+	s.sender.Long256Column(name, val)
+	return s
+}
+func (s *TestTcpLineSender) TimestampColumn(name string, ts time.Time) LineSender {
+	s.sender.TimestampColumn(name, ts)
+	return s
+}
+func (s *TestTcpLineSender) Float64Column(name string, val float64) LineSender {
+	s.sender.Float64Column(name, val)
+	return s
+}
+func (s *TestTcpLineSender) StringColumn(name, val string) LineSender {
+	s.sender.StringColumn(name, val)
+	return s
+}
+func (s *TestTcpLineSender) BoolColumn(name string, val bool) LineSender {
+	s.sender.BoolColumn(name, val)
+	return s
+}
+func (s *TestTcpLineSender) Close(ctx context.Context) error {
+	return s.sender.Close()
+}
+func (s *TestTcpLineSender) AtNow(ctx context.Context) error {
+	return s.sender.AtNow(ctx)
+}
+func (s *TestTcpLineSender) At(ctx context.Context, ts time.Time) error {
+	return s.sender.At(ctx, ts)
+}
+func (s *TestTcpLineSender) Flush(ctx context.Context) error {
+	return s.sender.Flush(ctx)
+}
+
+type TestHttpLineSender struct {
+	sender *http.LineSender
+}
+
+func (s *TestHttpLineSender) Table(name string) LineSender {
+	s.sender.Table(name)
+	return s
+}
+func (s *TestHttpLineSender) Symbol(name, val string) LineSender {
+	s.sender.Symbol(name, val)
+	return s
+}
+func (s *TestHttpLineSender) Int64Column(name string, val int64) LineSender {
+	s.sender.Int64Column(name, val)
+	return s
+}
+func (s *TestHttpLineSender) Long256Column(name string, val *big.Int) LineSender {
+	s.sender.Long256Column(name, val)
+	return s
+}
+func (s *TestHttpLineSender) TimestampColumn(name string, ts time.Time) LineSender {
+	s.sender.TimestampColumn(name, ts)
+	return s
+}
+func (s *TestHttpLineSender) Float64Column(name string, val float64) LineSender {
+	s.sender.Float64Column(name, val)
+	return s
+}
+func (s *TestHttpLineSender) StringColumn(name, val string) LineSender {
+	s.sender.StringColumn(name, val)
+	return s
+}
+func (s *TestHttpLineSender) BoolColumn(name string, val bool) LineSender {
+	s.sender.BoolColumn(name, val)
+	return s
+}
+func (s *TestHttpLineSender) Close(ctx context.Context) error {
+	return s.sender.Close(ctx)
+}
+func (s *TestHttpLineSender) AtNow(ctx context.Context) error {
+	return s.sender.AtNow(ctx)
+}
+func (s *TestHttpLineSender) At(ctx context.Context, ts time.Time) error {
+	return s.sender.At(ctx, ts)
+}
+func (s *TestHttpLineSender) Flush(ctx context.Context) error {
+	return s.sender.Flush(ctx)
+}
 
 type questdbContainer struct {
 	testcontainers.Container
@@ -261,7 +370,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"all column types",
 			testTable,
-			func(s *tcp.LineSender) error {
+			func(s LineSender) error {
 				val, _ := big.NewInt(0).SetString("123a4", 16)
 				err := s.
 					Table(testTable).
@@ -310,7 +419,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"escaped chars",
 			"my-awesome_test 1=2.csv",
-			func(s *tcp.LineSender) error {
+			func(s LineSender) error {
 				return s.
 					Table("my-awesome_test 1=2.csv").
 					Symbol("sym_name 1=2", "value 1,2=3\n4\r5\"6\\7").
@@ -332,7 +441,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single symbol",
 			testTable,
-			func(s *tcp.LineSender) error {
+			func(s LineSender) error {
 				return s.
 					Table(testTable).
 					Symbol("foo", "bar").
@@ -352,7 +461,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single column",
 			testTable,
-			func(s *tcp.LineSender) error {
+			func(s LineSender) error {
 				return s.
 					Table(testTable).
 					Int64Column("foobar", 1_000_042).
@@ -372,7 +481,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single column long256",
 			testTable,
-			func(s *tcp.LineSender) error {
+			func(s LineSender) error {
 				val, _ := big.NewInt(0).SetString("7fffffffffffffff", 16)
 				return s.
 					Table(testTable).
@@ -393,7 +502,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"double value with exponent",
 			testTable,
-			func(s *tcp.LineSender) error {
+			func(s LineSender) error {
 				return s.
 					Table(testTable).
 					Float64Column("foobar", 4.2e-100).
@@ -413,363 +522,47 @@ func TestE2EValidWrites(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			questdbC, err := setupQuestDB(ctx, noAuth)
-			assert.NoError(t, err)
+		for _, protocol := range []string{"tcp", "http"} {
+			t.Run(fmt.Sprintf("%s: %s", tc.name, protocol), func(t *testing.T) {
+				var (
+					sender LineSender
+				)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
-			assert.NoError(t, err)
+				questdbC, err := setupQuestDB(ctx, noAuth)
+				assert.NoError(t, err)
 
-			err = tc.writerFn(sender)
-			assert.NoError(t, err)
+				switch protocol {
+				case "tcp":
+					tcpSender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
+					assert.NoError(t, err)
+					sender = &TestTcpLineSender{
+						sender: tcpSender,
+					}
+				case "http":
+					httpSender, err := http.NewLineSender(http.WithAddress(questdbC.httpAddress))
+					assert.NoError(t, err)
+					sender = &TestHttpLineSender{
+						sender: httpSender,
+					}
+				default:
+					panic(protocol)
+				}
 
-			err = sender.Flush(ctx)
-			assert.NoError(t, err)
+				err = tc.writerFn(sender)
+				assert.NoError(t, err)
 
-			assert.Eventually(t, func() bool {
-				data := queryTableData(t, tc.tableName, questdbC.httpAddress)
-				return reflect.DeepEqual(tc.expected, data)
-			}, eventualDataTimeout, 100*time.Millisecond)
+				err = sender.Flush(ctx)
+				assert.NoError(t, err)
 
-			sender.Close()
-			questdbC.Stop(ctx)
-		})
-	}
-}
+				assert.Eventually(t, func() bool {
+					data := queryTableData(t, tc.tableName, questdbC.httpAddress)
+					return reflect.DeepEqual(tc.expected, data)
+				}, eventualDataTimeout, 100*time.Millisecond)
 
-func TestE2EWriteInBatches(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
-	const (
-		n      = 100
-		nBatch = 100
-	)
-
-	ctx := context.Background()
-
-	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
-
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	for i := 0; i < n; i++ {
-		for j := 0; j < nBatch; j++ {
-			err = sender.
-				Table(testTable).
-				Int64Column("long_col", int64(j)).
-				At(ctx, time.UnixMicro(int64(i*nBatch+j)))
-			assert.NoError(t, err)
+				sender.Close(ctx)
+				questdbC.Stop(ctx)
+			})
 		}
-		err = sender.Flush(ctx)
-		assert.NoError(t, err)
+
 	}
-
-	expected := tableData{
-		Columns: []column{
-			{"long_col", "LONG"},
-			{"timestamp", "TIMESTAMP"},
-		},
-		Dataset: [][]interface{}{},
-		Count:   n * nBatch,
-	}
-
-	for i := 0; i < n; i++ {
-		for j := 0; j < nBatch; j++ {
-			expected.Dataset = append(
-				expected.Dataset,
-				[]interface{}{float64(j), "1970-01-01T00:00:00." + fmt.Sprintf("%06d", i*nBatch+j) + "Z"},
-			)
-		}
-	}
-
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
-		return reflect.DeepEqual(expected, data)
-	}, eventualDataTimeout, 100*time.Millisecond)
-}
-
-func TestE2EImplicitFlush(t *testing.T) {
-	const bufCap = 100
-
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
-	ctx := context.Background()
-
-	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
-
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress), qdb.WithBufferCapacity(bufCap))
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	for i := 0; i < 10*bufCap; i++ {
-		err = sender.
-			Table(testTable).
-			BoolColumn("b", true).
-			AtNow(ctx)
-		assert.NoError(t, err)
-	}
-
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
-		// We didn't call Flush, but we expect the buffer to be flushed at least once.
-		return data.Count > 0
-	}, eventualDataTimeout, 100*time.Millisecond)
-}
-
-func TestE2ESuccessfulAuth(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
-	ctx := context.Background()
-
-	questdbC, err := setupQuestDB(ctx, authEnabled)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
-
-	sender, err := qdb.NewLineSender(
-		ctx,
-		qdb.WithAddress(questdbC.ilpAddress),
-		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
-	)
-	assert.NoError(t, err)
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "foobar").
-		At(ctx, time.UnixMicro(1))
-	assert.NoError(t, err)
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "barbaz").
-		At(ctx, time.UnixMicro(2))
-	assert.NoError(t, err)
-
-	err = sender.Flush(ctx)
-	assert.NoError(t, err)
-
-	// Close the connection to make sure that ILP messages are written. That's because
-	// the server may not write messages that are received immediately after the signed
-	// challenge until the connection is closed or more data is received.
-	sender.Close()
-
-	expected := tableData{
-		Columns: []column{
-			{"str_col", "STRING"},
-			{"timestamp", "TIMESTAMP"},
-		},
-		Dataset: [][]interface{}{
-			{"foobar", "1970-01-01T00:00:00.000001Z"},
-			{"barbaz", "1970-01-01T00:00:00.000002Z"},
-		},
-		Count: 2,
-	}
-
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
-		return reflect.DeepEqual(expected, data)
-	}, eventualDataTimeout, 100*time.Millisecond)
-}
-
-func TestE2EFailedAuth(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
-	ctx := context.Background()
-
-	questdbC, err := setupQuestDB(ctx, authEnabled)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
-
-	sender, err := qdb.NewLineSender(
-		ctx,
-		qdb.WithAddress(questdbC.ilpAddress),
-		qdb.WithAuth("wrongKeyId", "1234567890"),
-	)
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "foobar").
-		At(ctx, time.UnixMicro(1))
-	// If we get an error here or later, it means that the server closed connection.
-	if err != nil {
-		return
-	}
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "barbaz").
-		At(ctx, time.UnixMicro(2))
-	if err != nil {
-		return
-	}
-
-	err = sender.Flush(ctx)
-	if err != nil {
-		return
-	}
-
-	// Our writes should not get applied.
-	time.Sleep(2 * time.Second)
-	data := queryTableData(t, testTable, questdbC.httpAddress)
-	assert.Equal(t, 0, data.Count)
-}
-
-func TestE2EWritesWithTlsProxy(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
-	ctx := context.Background()
-
-	questdbC, err := setupQuestDBWithProxy(ctx, noAuth)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
-
-	sender, err := qdb.NewLineSender(
-		ctx,
-		qdb.WithAddress(questdbC.proxyIlpTcpAddress), // We're sending data through proxy.
-		qdb.WithTlsInsecureSkipVerify(),
-	)
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "foobar").
-		At(ctx, time.UnixMicro(1))
-	assert.NoError(t, err)
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "barbaz").
-		At(ctx, time.UnixMicro(2))
-	assert.NoError(t, err)
-
-	err = sender.Flush(ctx)
-	assert.NoError(t, err)
-
-	expected := tableData{
-		Columns: []column{
-			{"str_col", "STRING"},
-			{"timestamp", "TIMESTAMP"},
-		},
-		Dataset: [][]interface{}{
-			{"foobar", "1970-01-01T00:00:00.000001Z"},
-			{"barbaz", "1970-01-01T00:00:00.000002Z"},
-		},
-		Count: 2,
-	}
-
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
-		return reflect.DeepEqual(expected, data)
-	}, eventualDataTimeout, 100*time.Millisecond)
-}
-
-func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
-	ctx := context.Background()
-
-	questdbC, err := setupQuestDBWithProxy(ctx, authEnabled)
-	assert.NoError(t, err)
-	defer questdbC.Stop(ctx)
-
-	sender, err := qdb.NewLineSender(
-		ctx,
-		qdb.WithAddress(questdbC.proxyIlpTcpAddress), // We're sending data through proxy.
-		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
-		qdb.WithTlsInsecureSkipVerify(),
-	)
-	assert.NoError(t, err)
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "foobar").
-		At(ctx, time.UnixMicro(1))
-	assert.NoError(t, err)
-
-	err = sender.
-		Table(testTable).
-		StringColumn("str_col", "barbaz").
-		At(ctx, time.UnixMicro(2))
-	assert.NoError(t, err)
-
-	err = sender.Flush(ctx)
-	assert.NoError(t, err)
-
-	// Close the connection to make sure that ILP messages are written. That's because
-	// the server may not write messages that are received immediately after the signed
-	// challenge until the connection is closed or more data is received.
-	sender.Close()
-
-	expected := tableData{
-		Columns: []column{
-			{"str_col", "STRING"},
-			{"timestamp", "TIMESTAMP"},
-		},
-		Dataset: [][]interface{}{
-			{"foobar", "1970-01-01T00:00:00.000001Z"},
-			{"barbaz", "1970-01-01T00:00:00.000002Z"},
-		},
-		Count: 2,
-	}
-
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
-		return reflect.DeepEqual(expected, data)
-	}, eventualDataTimeout, 100*time.Millisecond)
-}
-
-type tableData struct {
-	Columns []column        `json:"columns"`
-	Dataset [][]interface{} `json:"dataset"`
-	Count   int             `json:"count"`
-}
-
-type column struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
-}
-
-func queryTableData(t *testing.T, tableName, address string) tableData {
-	// We always query data using the QuestDB container over http
-	address = "http://" + address
-	u, err := url.Parse(address)
-	assert.NoError(t, err)
-
-	u.Path += "exec"
-	params := url.Values{}
-	params.Add("query", "'"+tableName+"'")
-	u.RawQuery = params.Encode()
-	url := fmt.Sprintf("%v", u)
-
-	res, err := http.Get(url)
-	assert.NoError(t, err)
-	defer res.Body.Close()
-
-	body, err := ioutil.ReadAll(res.Body)
-	assert.NoError(t, err)
-
-	data := tableData{}
-	err = json.Unmarshal(body, &data)
-	assert.NoError(t, err)
-
-	return data
 }
