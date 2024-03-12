@@ -410,6 +410,35 @@ func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
 	assert.NotEmpty(t, sender.Messages())
 }
 
+func TestBufferClearAfterFlush(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := utils.NewTestHttpServer(utils.SendToBackChannel)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	err = sender.Table(testTable).Symbol("abc", "def").AtNow(ctx)
+	assert.NoError(t, err)
+
+	err = sender.Flush(ctx)
+	assert.NoError(t, err)
+
+	utils.ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,abc=def", testTable)})
+	assert.Zero(t, sender.Buffer.Len())
+
+	err = sender.Table(testTable).Symbol("ghi", "jkl").AtNow(ctx)
+	assert.NoError(t, err)
+
+	err = sender.Flush(ctx)
+	assert.NoError(t, err)
+
+	utils.ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,ghi=jkl", testTable)})
+}
+
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
