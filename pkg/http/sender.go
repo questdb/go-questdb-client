@@ -559,11 +559,10 @@ func (s *LineSender) Close(ctx context.Context) error {
 		return nil
 	}
 
+	var err error
+
 	if s.autoFlushRows > 0 && s.buf.Len() > 0 {
-		err := s.Flush(ctx)
-		if err != nil {
-			return err
-		}
+		err = s.Flush(ctx)
 	}
 
 	s.closed = true
@@ -573,7 +572,7 @@ func (s *LineSender) Close(ctx context.Context) error {
 		globalTransport.CloseIdleConnections()
 	}
 
-	return nil
+	return err
 }
 
 // AtNow omits the timestamp and finalizes the ILP message.
