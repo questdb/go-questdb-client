@@ -62,7 +62,7 @@ var (
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig:       &tlsClientConfig,
+		TLSClientConfig:       &tls.Config{},
 	}
 
 	// clientCt is used to track the number of open LineSenders
@@ -70,11 +70,6 @@ var (
 	// closed, the globalTransport closes all idle connections to
 	// free up resources
 	clientCt atomic.Int64
-
-	// Since we use a global http.Transport, we also use a global
-	// tls config. By default, this is set to verify all server certs,
-	// but can be changed by the WithTlsInsecureVerify setting.
-	tlsClientConfig tls.Config = tls.Config{}
 )
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
@@ -102,9 +97,10 @@ type LineSender struct {
 	token   string
 	tlsMode tlsMode
 
-	client http.Client
-	uri    string
-	closed bool
+	client    http.Client
+	uri       string
+	closed    bool
+	transport *http.Transport
 }
 
 // LineSenderOption defines line sender option.
@@ -185,6 +181,12 @@ func WithAddress(addr string) LineSenderOption {
 // but skips server certificate verification. Useful in test
 // environments with self-signed certificates. Do not use in
 // production environments.
+//
+// If using the global transport (the default), once
+// WithTlsInsecureSkipVerify is used for any client,
+// all subsequent clients may not use the WithTls option.
+// To avoid this, use WithHttpTransport to add a custom
+// transport to the Sender's http client.
 func WithTlsInsecureSkipVerify() LineSenderOption {
 	return func(s *LineSender) {
 		s.tlsMode = tlsInsecureSkipVerify
@@ -205,6 +207,15 @@ func WithAutoFlushDisabled() LineSenderOption {
 func WithAutoFlushRows(rows int) LineSenderOption {
 	return func(s *LineSender) {
 		s.autoFlushRows = rows
+	}
+}
+
+// WithHttpTransport sets the client's http transport to the
+// passed pointer instead of the global transport. This can be
+// used for customizing the http transport used by the LineSender
+func WithHttpTransport(t *http.Transport) LineSenderOption {
+	return func(s *LineSender) {
+		s.transport = t
 	}
 }
 
@@ -230,20 +241,31 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 		s.address = "127.0.0.1:9000"
 	}
 
-	if s.tlsMode == tlsEnabled && tlsClientConfig.InsecureSkipVerify {
-		return nil, errors.New("once InsecureSkipVerify is used, the WithTls option may not be used by any subsequent HttpLineSenders")
+	if s.transport == nil {
+		s.transport = &globalTransport
+	}
+
+	if s.transport == &globalTransport {
+		if s.tlsMode == tlsEnabled && globalTransport.TLSClientConfig.InsecureSkipVerify {
+			return nil, errors.New("once InsecureSkipVerify is used with the default global transport, the WithTls option may not be used unless in combination with WithHttpTransport")
+		}
 	}
 
 	if s.tlsMode == tlsInsecureSkipVerify {
-		tlsClientConfig.InsecureSkipVerify = true
+		if s.transport.TLSClientConfig == nil {
+			s.transport.TLSClientConfig = &tls.Config{}
+		}
+		s.transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 
 	s.client = http.Client{
-		Transport: &globalTransport,
+		Transport: s.transport,
 		Timeout:   0, // todo: add a global maximum timeout?
 	}
 
-	clientCt.Add(1)
+	if s.transport == &globalTransport {
+		clientCt.Add(1)
+	}
 
 	s.uri = "http"
 	if s.tlsMode > 0 {
@@ -567,9 +589,12 @@ func (s *LineSender) Close(ctx context.Context) error {
 
 	s.closed = true
 
-	newCt := clientCt.Add(-1)
-	if newCt == 0 {
-		globalTransport.CloseIdleConnections()
+	if s.transport == &globalTransport {
+		newCt := clientCt.Add(-1)
+		if newCt == 0 {
+			globalTransport.CloseIdleConnections()
+		}
+
 	}
 
 	return err

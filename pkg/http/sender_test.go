@@ -439,6 +439,50 @@ func TestBufferClearAfterFlush(t *testing.T) {
 	utils.ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,ghi=jkl", testTable)})
 }
 
+func TestCustomTransportAndTlsInit(t *testing.T) {
+	ctx := context.Background()
+
+	s1, err := NewLineSender()
+	assert.NoError(t, err)
+
+	s2, err := NewLineSender(
+		WithTls(),
+	)
+	assert.NoError(t, err)
+
+	s3, err := NewLineSender(
+		WithTlsInsecureSkipVerify(),
+	)
+	assert.NoError(t, err)
+
+	_, err = NewLineSender(
+		WithTls(),
+	)
+	assert.ErrorContains(t, err, "once InsecureSkipVerify is used with the default")
+
+	transport := http.Transport{}
+	s4, err := NewLineSender(
+		WithHttpTransport(&transport),
+		WithTls(),
+	)
+	assert.NoError(t, err)
+
+	// s1, s2, and s3 all have successfully instantiated a sender
+	// using the global transport and should be registered in the
+	// global transport client count
+	assert.Equal(t, int64(3), clientCt.Load())
+
+	// Closing the client with the custom transport should not impact
+	// the global transport client count
+	s4.Close(ctx)
+
+	// Now close all remaining clients
+	s1.Close(ctx)
+	s2.Close(ctx)
+	s3.Close(ctx)
+	assert.Equal(t, int64(0), clientCt.Load())
+}
+
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 

@@ -15,9 +15,6 @@ func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 		t.Skip("skipping integration test")
 	}
 
-	// todo: either this needs to run last, all tests need to use tls, or we use a pluggable client
-	// because using tls modifies the global http context
-
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, httpBasicAuth)
