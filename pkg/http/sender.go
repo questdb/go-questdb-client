@@ -230,8 +230,8 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 		s.address = "127.0.0.1:9000"
 	}
 
-	if s.tlsMode != tlsInsecureSkipVerify && tlsClientConfig.InsecureSkipVerify {
-		return nil, errors.New("once InsecureSkipVerify is used, it must be enforced for all subsequent HttpLineSenders")
+	if s.tlsMode == tlsEnabled && tlsClientConfig.InsecureSkipVerify {
+		return nil, errors.New("once InsecureSkipVerify is used, the WithTls option may not be used by any subsequent HttpLineSenders")
 	}
 
 	if s.tlsMode == tlsInsecureSkipVerify {
