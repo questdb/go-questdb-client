@@ -10,7 +10,7 @@ type HttpError struct {
 
 	Code    string `json:"code"`
 	Message string `json:"message"`
-	Line    int    `json:"line"`
+	Line    int    `json:"line,omitempty"`
 	ErrorId string `json:"errorId"`
 }
 
