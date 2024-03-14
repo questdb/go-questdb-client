@@ -22,7 +22,6 @@ func (e *HttpError) Error() string {
 		e.Code,
 		e.Line,
 	)
-
 }
 
 type RetryTimeoutError struct {
@@ -43,5 +42,4 @@ func (e *RetryTimeoutError) Error() string {
 		msg += " " + e.LastErr.Error()
 	}
 	return msg
-
 }

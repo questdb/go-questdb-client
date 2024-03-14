@@ -212,7 +212,7 @@ func WithAutoFlushRows(rows int) LineSenderOption {
 
 // WithHttpTransport sets the client's http transport to the
 // passed pointer instead of the global transport. This can be
-// used for customizing the http transport used by the LineSender
+// used for customizing the http transport used by the LineSender.
 func WithHttpTransport(t *http.Transport) LineSenderOption {
 	return func(s *LineSender) {
 		s.transport = t
@@ -396,15 +396,15 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 	return NewLineSender(opts...)
 }
 
-// Flush flushes the accumulated messages to the underlying HTTP
-// client. Should be called periodically to make sure that
+// Flush sends the accumulated messages via the underlying HTTP
+// connection. Should be called periodically to make sure that
 // all messages are sent to the server.
 //
 // For optimal performance, this method should not be called after
 // each ILP message. Instead, the messages should be written in
 // batches followed by a Flush call. Optimal batch size may vary
-// from 100 to 1,000 messages depending on the message size and
-// configured buffer capacity.
+// from one thousand to few thousand messages depending on
+// the message size.
 func (s *LineSender) Flush(ctx context.Context) error {
 	var (
 		req           *http.Request
@@ -428,6 +428,8 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	}
 
+	// We rely on the following HTTP client behavior:
+	// s.buf implements WriteTo method which is used by the client.
 	req, err = http.NewRequest(
 		http.MethodPost,
 		s.uri,
@@ -594,7 +596,6 @@ func (s *LineSender) Close(ctx context.Context) error {
 		if newCt == 0 {
 			globalTransport.CloseIdleConnections()
 		}
-
 	}
 
 	return err
