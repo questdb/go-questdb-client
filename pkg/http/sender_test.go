@@ -165,6 +165,23 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	assert.Empty(t, sender.buf.Messages())
 }
 
+func TestNoOpOnFlushWhenNoMessagesAreWritten(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	err = sender.Flush(ctx)
+
+	assert.NoError(t, err)
+	assert.Empty(t, sender.buf.Messages())
+}
+
 func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
@@ -270,7 +287,7 @@ func TestNoRetryOn400FromServer(t *testing.T) {
 	assert.Equal(t, 42, httpErr.Line)
 }
 
-func TestAutoFlush(t *testing.T) {
+func TestRowBasedAutoFlush(t *testing.T) {
 	ctx := context.Background()
 	autoFlushRows := 10
 
@@ -300,9 +317,40 @@ func TestAutoFlush(t *testing.T) {
 	assert.Equal(t, 0, sender.buf.MsgCount())
 }
 
-func TestAutoFlushDisabled(t *testing.T) {
+func TestTimeBasedAutoFlush(t *testing.T) {
+	ctx := context.Background()
+	autoFlushInterval := 10 * time.Millisecond
+
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := NewLineSender(
+		WithAddress(srv.Addr()),
+		WithAutoFlushRows(1000),
+		WithAutoFlushInterval(autoFlushInterval),
+	)
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	// Send a message and ensure it's buffered
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, sender.buf.MsgCount())
+
+	time.Sleep(2 * autoFlushInterval)
+
+	// Send one additional message and ensure that both messages are flushed
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 0, sender.buf.MsgCount())
+}
+
+func TestNoFlushWhenAutoFlushDisabled(t *testing.T) {
 	ctx := context.Background()
 	autoFlushRows := 10
+	autoFlushInterval := time.Duration(autoFlushRows-1) * time.Millisecond
 
 	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
@@ -313,6 +361,7 @@ func TestAutoFlushDisabled(t *testing.T) {
 	sender, err := NewLineSender(
 		WithAddress(srv.Addr()),
 		WithAutoFlushRows(autoFlushRows),
+		WithAutoFlushInterval(autoFlushInterval),
 		WithAutoFlushDisabled(),
 	)
 	assert.NoError(t, err)
@@ -322,6 +371,7 @@ func TestAutoFlushDisabled(t *testing.T) {
 	for i := 0; i < autoFlushRows+1; i++ {
 		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 		assert.NoError(t, err)
+		time.Sleep(time.Millisecond)
 	}
 
 	assert.Equal(t, autoFlushRows+1, sender.buf.MsgCount())

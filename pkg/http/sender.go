@@ -57,9 +57,9 @@ var (
 	globalTransport http.Transport = http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxConnsPerHost:       0,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       &tls.Config{},
@@ -89,7 +89,9 @@ type LineSender struct {
 	requestTimeout              time.Duration
 
 	// Auto-flush fields
-	autoFlushRows int
+	autoFlushRows     int
+	autoFlushInterval time.Duration
+	flushDeadline     time.Time
 
 	// Authentication-related fields
 	user    string
@@ -198,6 +200,7 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 func WithAutoFlushDisabled() LineSenderOption {
 	return func(s *LineSender) {
 		s.autoFlushRows = 0
+		s.autoFlushInterval = 0
 	}
 }
 
@@ -207,6 +210,14 @@ func WithAutoFlushDisabled() LineSenderOption {
 func WithAutoFlushRows(rows int) LineSenderOption {
 	return func(s *LineSender) {
 		s.autoFlushRows = rows
+	}
+}
+
+// WithAutoFlushInterval the interval at which the Sender
+// automatically flushes its buffer. Defaults to 1 second.
+func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
+	return func(s *LineSender) {
+		s.autoFlushInterval = interval
 	}
 }
 
@@ -229,6 +240,7 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 		requestTimeout:              10 * time.Second,
 		retryTimeout:                10 * time.Second,
 		autoFlushRows:               75000,
+		autoFlushInterval:           time.Second,
 
 		buf: buffer.NewBuffer(),
 	}
@@ -252,6 +264,7 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 	}
 
 	if s.tlsMode == tlsInsecureSkipVerify {
+		// TODO(puzpuzpuz): this code is racy
 		if s.transport.TLSClientConfig == nil {
 			s.transport.TLSClientConfig = &tls.Config{}
 		}
@@ -321,7 +334,6 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 
 	opts := make([]LineSenderOption, 0)
 	for k, v := range data.KeyValuePairs {
-
 		switch strings.ToLower(k) {
 		case "addr":
 			opts = append(opts, WithAddress(v))
@@ -343,6 +355,7 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 				return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
 			}
 		case "auto_flush_rows", "auto_flush_bytes":
+			// TODO(puzpuzpuz): it's already supported
 			return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
 		case "min_throughput", "init_buf_size":
 			parsedVal, err := strconv.Atoi(v)
@@ -406,6 +419,10 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 // from one thousand to few thousand messages depending on
 // the message size.
 func (s *LineSender) Flush(ctx context.Context) error {
+	return s.flush0(ctx, false)
+}
+
+func (s *LineSender) flush0(ctx context.Context, closing bool) error {
 	var (
 		req           *http.Request
 		retryInterval time.Duration
@@ -428,7 +445,11 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	}
 
-	// We rely on the following HTTP client behavior:
+	if s.buf.MsgCount() == 0 {
+		return nil
+	}
+
+	// We rely on the following HTTP client implicit behavior:
 	// s.buf implements WriteTo method which is used by the client.
 	req, err = http.NewRequest(
 		http.MethodPost,
@@ -441,21 +462,17 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 	if s.user != "" && s.pass != "" {
 		req.SetBasicAuth(s.user, s.pass)
-	}
-
-	if s.token != "" {
-		if req.Header.Get("Authorization") != "" {
-			return errors.New("cannot use both Basic and Token Authorization")
-		}
+	} else if s.token != "" {
 		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
 	}
 
 	retry, err := s.makeRequest(ctx, req)
 	if !retry {
+		s.refreshFlushDeadline(err)
 		return err
 	}
 
-	if s.retryTimeout > 0 {
+	if !closing && s.retryTimeout > 0 {
 		retryStartTime := time.Now()
 
 		retryInterval = 10 * time.Millisecond
@@ -469,6 +486,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 
 			retry, err = s.makeRequest(ctx, req)
 			if !retry {
+				s.refreshFlushDeadline(err)
 				return err
 			}
 
@@ -481,7 +499,18 @@ func (s *LineSender) Flush(ctx context.Context) error {
 		}
 	}
 
+	s.refreshFlushDeadline(err)
 	return err
+}
+
+func (s *LineSender) refreshFlushDeadline(err error) {
+	if s.autoFlushInterval > 0 {
+		if err != nil {
+			s.flushDeadline = time.Time{}
+		} else {
+			s.flushDeadline = time.Now().Add(s.autoFlushInterval)
+		}
+	}
 }
 
 // Table sets the table name (metric) for a new ILP message. Should be
@@ -585,8 +614,8 @@ func (s *LineSender) Close(ctx context.Context) error {
 
 	var err error
 
-	if s.autoFlushRows > 0 && s.buf.Len() > 0 {
-		err = s.Flush(ctx)
+	if s.autoFlushRows > 0 {
+		err = s.flush0(ctx, true)
 	}
 
 	s.closed = true
@@ -634,8 +663,17 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 		return err
 	}
 
+	// Check row count-based auto flush.
 	if s.buf.MsgCount() == s.autoFlushRows {
 		return s.Flush(ctx)
+	}
+	// Check time-based auto flush.
+	if s.autoFlushInterval > 0 {
+		if s.flushDeadline.IsZero() {
+			s.flushDeadline = time.Now().Add(s.autoFlushInterval)
+		} else if time.Now().After(s.flushDeadline) {
+			return s.Flush(ctx)
+		}
 	}
 
 	return nil
