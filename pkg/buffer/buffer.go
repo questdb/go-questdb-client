@@ -51,9 +51,8 @@ const (
 type Buffer struct {
 	bytes.Buffer
 
-	BufCap           int
-	InitBufSizeBytes int
-	FileNameLimit    int
+	BufCap        int
+	FileNameLimit int
 
 	lastMsgPos int
 	lastErr    error

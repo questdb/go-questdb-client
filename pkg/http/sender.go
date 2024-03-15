@@ -25,6 +25,7 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -164,10 +165,10 @@ func WithRetryTimeout(t time.Duration) LineSenderOption {
 }
 
 // WithInitBuffer size sets the desired initial buffer capacity
-// in bytes to be used when sending ILP messages. Defaults to 0.
+// in bytes to be used when sending ILP messages. Defaults to 128KB.
 func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *LineSender) {
-		s.buf.InitBufSizeBytes = sizeInBytes
+		s.buf.BufCap = sizeInBytes
 	}
 }
 
@@ -285,6 +286,8 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 		s.uri += "s"
 	}
 	s.uri += fmt.Sprintf("://%s/write", s.address)
+
+	s.buf.Buffer = *bytes.NewBuffer(make([]byte, 0, s.buf.BufCap))
 
 	return s, nil
 }

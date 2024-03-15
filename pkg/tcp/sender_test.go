@@ -50,10 +50,9 @@ type configTestCase struct {
 func TestHappyCasesFromConf(t *testing.T) {
 
 	var (
-		user        = "test-user"
-		token       = "test-token"
-		initBufSize = 999
-		maxBufSize  = 1000
+		user       = "test-user"
+		token      = "test-token"
+		maxBufSize = 1000
 	)
 
 	testServer, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
@@ -74,11 +73,10 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "init_buf_size and max_buf_size",
-			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;max_buf_size=%d",
-				addr, initBufSize, maxBufSize),
+			config: fmt.Sprintf("tcp::addr=%s;max_buf_size=%d",
+				addr, maxBufSize),
 			expectedOpts: []LineSenderOption{
 				WithAddress(addr),
-				WithInitBufferSize(initBufSize),
 				WithBufferCapacity(maxBufSize),
 			},
 		},
@@ -232,65 +230,6 @@ func TestErrorOnContextDeadline(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fail()
-}
-
-func TestAutoFlush(t *testing.T) {
-	ctx := context.Background()
-	autoFlushRows := 10
-
-	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
-	assert.NoError(t, err)
-	defer srv.Close()
-
-	sender, err := NewLineSender(
-		ctx,
-		WithAddress(srv.Addr()),
-		WithAutoFlushRows(autoFlushRows),
-	)
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	// Send autoFlushRows - 1 messages and ensure all are buffered
-	for i := 0; i < autoFlushRows-1; i++ {
-		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
-		assert.NoError(t, err)
-	}
-
-	assert.Equal(t, autoFlushRows-1, sender.buf.MsgCount())
-
-	// Send one additional message and ensure that all are flushed
-	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
-	assert.NoError(t, err)
-
-	assert.Equal(t, 0, sender.buf.MsgCount())
-}
-
-func TestAutoFlushDisabled(t *testing.T) {
-	ctx := context.Background()
-	autoFlushRows := 10
-
-	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
-	assert.NoError(t, err)
-	defer srv.Close()
-
-	// opts are processed sequentially, so AutoFlushDisabled will
-	// override AutoFlushRows
-	sender, err := NewLineSender(
-		ctx,
-		WithAddress(srv.Addr()),
-		WithAutoFlushRows(autoFlushRows),
-		WithAutoFlushDisabled(),
-	)
-	assert.NoError(t, err)
-	defer sender.Close()
-
-	// Send autoFlushRows + 1 messages and ensure all are buffered
-	for i := 0; i < autoFlushRows+1; i++ {
-		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
-		assert.NoError(t, err)
-	}
-
-	assert.Equal(t, autoFlushRows+1, sender.buf.MsgCount())
 }
 
 func BenchmarkLineSenderBatch1000(b *testing.B) {

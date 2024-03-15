@@ -69,8 +69,6 @@ type LineSender struct {
 	keyId   string // Erased once auth is done.
 	key     string // Erased once auth is done.
 
-	autoFlushRows int
-
 	conn net.Conn
 }
 
@@ -136,32 +134,6 @@ func WithFileNameLimit(limit int) LineSenderOption {
 	}
 }
 
-// WithInitBuffer size sets the desired initial buffer capacity
-// in bytes to be used when sending ILP messages. Defaults to 0.
-func WithInitBufferSize(sizeInBytes int) LineSenderOption {
-	return func(s *LineSender) {
-		s.buf.InitBufSizeBytes = sizeInBytes
-	}
-}
-
-// WithAutoFlushDisabled turns off auto-flushing behavior.
-// To send ILP messages, the user must either call Flush() or
-// wait until the buffer capacity is exceeded (in bytes).
-func WithAutoFlushDisabled() LineSenderOption {
-	return func(s *LineSender) {
-		s.autoFlushRows = 0
-	}
-}
-
-// WithAutoFlushRows sets the number of buffered rows that
-// must be breached in order to trigger an auto-flush.
-// Defaults to 600.
-func WithAutoFlushRows(rows int) LineSenderOption {
-	return func(s *LineSender) {
-		s.autoFlushRows = rows
-	}
-}
-
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single TCP connection. Sender should
 // not be called concurrently by multiple goroutines.
@@ -177,8 +149,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		address: "127.0.0.1:9009",
 		tlsMode: tlsDisabled,
 
-		buf:           buffer.NewBuffer(),
-		autoFlushRows: 600,
+		buf: buffer.NewBuffer(),
 	}
 
 	for _, opt := range opts {
@@ -263,8 +234,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	}
 
 	s.conn = conn
-
-	s.buf.Buffer = *bytes.NewBuffer(make([]byte, s.buf.InitBufSizeBytes, s.buf.BufCap))
+	s.buf.Buffer = *bytes.NewBuffer(make([]byte, 0, s.buf.BufCap))
 
 	return s, nil
 
@@ -311,8 +281,6 @@ func optsFromConf(config string) ([]LineSenderOption, error) {
 
 			}
 			switch k {
-			case "init_buf_size":
-				opts = append(opts, WithInitBufferSize(parsedVal))
 			case "max_buf_size":
 				opts = append(opts, WithBufferCapacity(parsedVal))
 			default:
@@ -508,9 +476,8 @@ func (s *LineSender) Flush(ctx context.Context) error {
 	// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
 	if s.buf.Cap() > 3*s.buf.BufCap {
 		// Shrink the buffer back to desired capacity.
-		s.buf.Buffer = *bytes.NewBuffer(make([]byte, s.buf.InitBufSizeBytes, s.buf.BufCap))
+		s.buf.Buffer = *bytes.NewBuffer(make([]byte, 0, s.buf.BufCap))
 	}
-
 	return nil
 }
 
@@ -538,6 +505,7 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 	if ts.IsZero() {
 		sendTs = false
 	}
+
 	err := s.buf.At(ts, sendTs)
 	if err != nil {
 		return err
@@ -546,10 +514,5 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 	if s.buf.Len() > s.buf.BufCap {
 		return s.Flush(ctx)
 	}
-
-	if s.autoFlushRows > 0 && s.buf.MsgCount() == s.autoFlushRows {
-		return s.Flush(ctx)
-	}
-
 	return nil
 }

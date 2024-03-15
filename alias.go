@@ -8,7 +8,6 @@ var (
 	WithAuth                  = tcp.WithAuth
 	WithBufferCapacity        = tcp.WithBufferCapacity
 	WithFileNameLimit         = tcp.WithFileNameLimit
-	WithInitBufferSize        = tcp.WithInitBufferSize
 	WithTls                   = tcp.WithTls
 	WithTlsInsecureSkipVerify = tcp.WithTlsInsecureSkipVerify
 )
