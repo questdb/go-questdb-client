@@ -49,7 +49,6 @@ type configTestCase struct {
 }
 
 func TestHappyCasesFromConf(t *testing.T) {
-
 	var (
 		addr            = "localhost:1111"
 		user            = "test-user"
@@ -98,6 +97,16 @@ func TestHappyCasesFromConf(t *testing.T) {
 				WithBearerToken(token),
 			},
 		},
+		{
+			name: "auto flush",
+			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000",
+				addr),
+			expectedOpts: []LineSenderOption{
+				WithAddress(addr),
+				WithAutoFlushRows(100),
+				WithAutoFlushInterval(1000),
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -131,6 +140,31 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			name:                   "invalid tls_verify",
 			config:                 "http::addr=localhost:1111;tls_verify=invalid",
 			expectedErrMsgContains: "invalid tls_verify",
+		},
+		{
+			name:                   "invalid auto_flush",
+			config:                 "http::addr=localhost:1111;auto_flush=invalid",
+			expectedErrMsgContains: "invalid auto_flush",
+		},
+		{
+			name:                   "invalid auto_flush_rows (not int)",
+			config:                 "http::addr=localhost:1111;auto_flush_rows=invalid",
+			expectedErrMsgContains: "invalid auto_flush_rows",
+		},
+		{
+			name:                   "invalid auto_flush_rows (non-positive)",
+			config:                 "http::addr=localhost:1111;auto_flush_rows=-1",
+			expectedErrMsgContains: "invalid auto_flush_rows",
+		},
+		{
+			name:                   "invalid auto_flush_interval (not int)",
+			config:                 "http::addr=localhost:1111;auto_flush_interval=invalid",
+			expectedErrMsgContains: "invalid auto_flush_interval",
+		},
+		{
+			name:                   "invalid auto_flush_interval (non-positive)",
+			config:                 "http::addr=localhost:1111;auto_flush_interval=-1",
+			expectedErrMsgContains: "invalid auto_flush_interval",
 		},
 		{
 			name:                   "unsupported option",

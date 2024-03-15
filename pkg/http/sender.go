@@ -79,7 +79,7 @@ var (
 // utilize a global transport for connection pooling. A sender
 // should not be called concurrently by multiple goroutines.
 type LineSender struct {
-	buf *buffer.Buffer
+	buf buffer.Buffer
 
 	address string
 
@@ -351,17 +351,27 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 			token = v
 			opts = append(opts, WithBearerToken(token))
 		case "auto_flush":
-			if v == "on" {
-				return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
+			if v == "off" {
+				opts = append(opts, WithAutoFlushDisabled())
+			} else if v != "on" {
+				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not 'on' or 'off'", k, v)
 			}
-		case "auto_flush_rows", "auto_flush_bytes":
-			// TODO(puzpuzpuz): it's already supported
-			return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
+		case "auto_flush_rows":
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal < 1 {
+				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a positive int", k, v)
+			}
+			opts = append(opts, WithAutoFlushRows(parsedVal))
+		case "auto_flush_interval":
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal < 1 {
+				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a positive int", k, v)
+			}
+			opts = append(opts, WithAutoFlushInterval(time.Duration(parsedVal)))
 		case "min_throughput", "init_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
-
 			}
 			switch k {
 			case "min_throughput":
@@ -371,7 +381,6 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 			default:
 				panic("add a case for " + k)
 			}
-
 		case "request_timeout", "retry_timeout":
 			timeout, err := strconv.Atoi(v)
 			if err != nil {
@@ -454,7 +463,7 @@ func (s *LineSender) flush0(ctx context.Context, closing bool) error {
 	req, err = http.NewRequest(
 		http.MethodPost,
 		s.uri,
-		s.buf,
+		&s.buf,
 	)
 	if err != nil {
 		return err

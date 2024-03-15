@@ -60,7 +60,7 @@ const (
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
 type LineSender struct {
-	buf *buffer.Buffer
+	buf buffer.Buffer
 
 	address string
 
@@ -481,7 +481,6 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 // from 100 to 1,000 messages depending on the message size and
 // configured buffer capacity.
 func (s *LineSender) Flush(ctx context.Context) error {
-
 	err := s.buf.LastErr()
 	s.buf.ClearLastErr()
 	if err != nil {

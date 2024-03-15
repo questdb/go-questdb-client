@@ -63,9 +63,9 @@ type Buffer struct {
 	msgCount   int
 }
 
-// NewBuffer initializes a pointer to a Buffer with default values
-func NewBuffer() *Buffer {
-	return &Buffer{
+// NewBuffer initializes a Buffer with default values
+func NewBuffer() Buffer {
+	return Buffer{
 		BufCap:        DefaultBufferCapacity,
 		FileNameLimit: DefaultFileNameLimit,
 	}
