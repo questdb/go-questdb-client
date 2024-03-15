@@ -18,7 +18,6 @@ const (
 )
 
 func TestValidWrites(t *testing.T) {
-
 	testCases := []struct {
 		name          string
 		writerFn      writerFn
@@ -57,7 +56,7 @@ func TestValidWrites(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := NewBuffer()
 
-			err := tc.writerFn(buf)
+			err := tc.writerFn(&buf)
 			assert.NoError(t, err)
 
 			// Check the buffer
@@ -68,7 +67,6 @@ func TestValidWrites(t *testing.T) {
 }
 
 func TestTimestampSerialization(t *testing.T) {
-
 	testCases := []struct {
 		name string
 		val  time.Time
@@ -94,7 +92,6 @@ func TestTimestampSerialization(t *testing.T) {
 }
 
 func TestInt64Serialization(t *testing.T) {
-
 	testCases := []struct {
 		name string
 		val  int64
@@ -122,7 +119,6 @@ func TestInt64Serialization(t *testing.T) {
 }
 
 func TestLong256Column(t *testing.T) {
-
 	testCases := []struct {
 		name     string
 		val      string
@@ -152,7 +148,6 @@ func TestLong256Column(t *testing.T) {
 }
 
 func TestFloat64Serialization(t *testing.T) {
-
 	testCases := []struct {
 		name     string
 		val      float64
@@ -219,7 +214,7 @@ func TestErrorOnLengthyNames(t *testing.T) {
 			buf := NewBuffer()
 			buf.FileNameLimit = nameLimit
 
-			err := tc.writerFn(buf)
+			err := tc.writerFn(&buf)
 			assert.ErrorContains(t, err, tc.expectedErrMsg)
 			assert.Empty(t, buf.Messages())
 
@@ -228,7 +223,6 @@ func TestErrorOnLengthyNames(t *testing.T) {
 }
 
 func TestErrorOnMissingTableCall(t *testing.T) {
-
 	testCases := []struct {
 		name     string
 		writerFn writerFn
@@ -281,7 +275,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := NewBuffer()
 
-			err := tc.writerFn(buf)
+			err := tc.writerFn(&buf)
 
 			assert.ErrorContains(t, err, "table name was not provided")
 			assert.Empty(t, buf.Messages())
@@ -291,7 +285,6 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 }
 
 func TestErrorOnMultipleTableCalls(t *testing.T) {
-
 	buf := NewBuffer()
 
 	err := buf.Table(testTable).Table(testTable).At(time.Time{}, false)
@@ -301,7 +294,6 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 }
 
 func TestErrorOnNegativeLong256(t *testing.T) {
-
 	buf := NewBuffer()
 
 	err := buf.Table(testTable).Long256Column("long256_col", big.NewInt(-42)).At(time.Time{}, false)
@@ -311,7 +303,6 @@ func TestErrorOnNegativeLong256(t *testing.T) {
 }
 
 func TestErrorOnLargerLong256(t *testing.T) {
-
 	buf := NewBuffer()
 
 	bigVal, _ := big.NewInt(0).SetString("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
@@ -322,7 +313,6 @@ func TestErrorOnLargerLong256(t *testing.T) {
 }
 
 func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
-
 	testCases := []struct {
 		name     string
 		writerFn writerFn
@@ -363,7 +353,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := NewBuffer()
 
-			err := tc.writerFn(buf)
+			err := tc.writerFn(&buf)
 
 			assert.ErrorContains(t, err, "symbols have to be written before any other column")
 			assert.Empty(t, buf.Messages())
@@ -373,7 +363,6 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 }
 
 func TestInvalidMessageGetsDiscarded(t *testing.T) {
-
 	buf := NewBuffer()
 
 	// Write a valid message.
