@@ -35,15 +35,15 @@ import (
 	"time"
 )
 
-// ErrInvalidMsg indicates a failed attempt to construct an ILP
-// message, e.g. duplicate calls to Table method or illegal
-// chars found in table or column name.
-var ErrInvalidMsg = errors.New("invalid message")
-
 const (
 	DefaultBufferCapacity = 128 * 1024
 	DefaultFileNameLimit  = 127
 )
+
+// ErrInvalidMsg indicates a failed attempt to construct an ILP
+// message, e.g. duplicate calls to Table method or illegal
+// chars found in table or column name.
+var ErrInvalidMsg = errors.New("invalid message")
 
 // buffer is a wrapper on top of bytes.Buffer. It extends the
 // original struct with methods for writing int64 and float64
@@ -62,7 +62,6 @@ type buffer struct {
 	msgCount   int
 }
 
-// newBuffer initializes a Buffer with default values
 func newBuffer() buffer {
 	return buffer{
 		BufCap:        DefaultBufferCapacity,
@@ -70,27 +69,22 @@ func newBuffer() buffer {
 	}
 }
 
-// HasTable returns true if a table name was provided to the buffer
 func (b *buffer) HasTable() bool {
 	return b.hasTable
 }
 
-// HasTags returns true if a symbol column has been written to the buffer
 func (b *buffer) HasTags() bool {
 	return b.hasTags
 }
 
-// HasFields returns true if a non-symbol column has been written to the buffer
 func (b *buffer) HasFields() bool {
 	return b.hasFields
 }
 
-// LastErr stores the most recent error encountered by the buffer
 func (b *buffer) LastErr() error {
 	return b.lastErr
 }
 
-// ClearLastErr sets the internal lastErr field to nil
 func (b *buffer) ClearLastErr() {
 	b.lastErr = nil
 }
@@ -119,7 +113,6 @@ func (b *buffer) writeFloat(f float64) {
 	b.Write(s)
 }
 
-// writeBigInt writes a bigint value to the buffer
 func (b *buffer) writeBigInt(i *big.Int) {
 	// We need up to 64 bytes to fit an unsigned 256-bit number.
 	var a [64]byte
@@ -402,18 +395,10 @@ func (b *buffer) resetMsgFlags() {
 	b.hasFields = false
 }
 
-// Messages returns a copy of accumulated ILP messages that are not
-// flushed to the TCP connection yet. Useful for debugging purposes.
 func (b *buffer) Messages() string {
 	return b.String()
 }
 
-// Table sets the table name (metric) for a new ILP message. Should be
-// called before any Symbol or Column method.
-//
-// Table name cannot contain any of the following characters:
-// '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
-// '%', '~', starting '.', trailing '.', or a non-printable char.
 func (b *buffer) Table(name string) *buffer {
 	if b.lastErr != nil {
 		return b
@@ -430,12 +415,6 @@ func (b *buffer) Table(name string) *buffer {
 	return b
 }
 
-// Symbol adds a symbol column value to the ILP message. Should be called
-// before any Column method.
-//
-// Symbol name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) Symbol(name, val string) *buffer {
 	if b.lastErr != nil {
 		return b
@@ -462,12 +441,6 @@ func (b *buffer) Symbol(name, val string) *buffer {
 	return b
 }
 
-// Int64Column adds a 64-bit integer (long) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) Int64Column(name string, val int64) *buffer {
 	if !b.prepareForField() {
 		return b
@@ -483,15 +456,6 @@ func (b *buffer) Int64Column(name string, val int64) *buffer {
 	return b
 }
 
-// Long256Column adds a 256-bit unsigned integer (long256) column
-// value to the ILP message.
-//
-// Only non-negative numbers that fit into 256-bit unsigned integer are
-// supported and any other input value would lead to an error.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) Long256Column(name string, val *big.Int) *buffer {
 	if val.Sign() < 0 {
 		if b.lastErr != nil {
@@ -526,12 +490,6 @@ func (b *buffer) Long256Column(name string, val *big.Int) *buffer {
 	return b
 }
 
-// TimestampColumn adds a timestamp column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) TimestampColumn(name string, ts time.Time) *buffer {
 	if !b.prepareForField() {
 		return b
@@ -547,12 +505,6 @@ func (b *buffer) TimestampColumn(name string, ts time.Time) *buffer {
 	return b
 }
 
-// Float64Column adds a 64-bit float (double) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) Float64Column(name string, val float64) *buffer {
 	if !b.prepareForField() {
 		return b
@@ -567,11 +519,6 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 	return b
 }
 
-// StringColumn adds a string column value to the ILP message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) StringColumn(name, val string) *buffer {
 	if !b.prepareForField() {
 		return b
@@ -591,11 +538,6 @@ func (b *buffer) StringColumn(name, val string) *buffer {
 	return b
 }
 
-// BoolColumn adds a boolean column value to the ILP message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (b *buffer) BoolColumn(name string, val bool) *buffer {
 	if !b.prepareForField() {
 		return b
@@ -614,11 +556,6 @@ func (b *buffer) BoolColumn(name string, val bool) *buffer {
 	return b
 }
 
-// At sets the timestamp in Epoch nanoseconds and finalizes
-// the ILP message.
-//
-// If the underlying buffer reaches configured capacity, this
-// method also sends the accumulated messages.
 func (b *buffer) At(ts time.Time, sendTs bool) error {
 	err := b.lastErr
 	b.lastErr = nil

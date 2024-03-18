@@ -340,110 +340,50 @@ func TcpLineSenderFromConf(ctx context.Context, config string) (*tcpLineSender, 
 	return NewTcpLineSender(ctx, opts...)
 }
 
-// Close closes the underlying TCP connection. Does not flush
-// in-flight messages, so make sure to call Flush first.
-func (s *tcpLineSender) Close() error {
+func (s *tcpLineSender) Close(_ context.Context) error {
 	return s.conn.Close()
 }
 
-// Table sets the table name (metric) for a new ILP message. Should be
-// called before any Symbol or Column method.
-//
-// Table name cannot contain any of the following characters:
-// '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
-// '%', '~', starting '.', trailing '.', or a non-printable char.
 func (s *tcpLineSender) Table(name string) *tcpLineSender {
 	s.buf.Table(name)
 	return s
 }
 
-// Symbol adds a symbol column value to the ILP message. Should be called
-// before any Column method.
-//
-// Symbol name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *tcpLineSender) Symbol(name, val string) *tcpLineSender {
 	s.buf.Symbol(name, val)
 	return s
 }
 
-// Int64Column adds a 64-bit integer (long) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *tcpLineSender) Int64Column(name string, val int64) *tcpLineSender {
 	s.buf.Int64Column(name, val)
 	return s
 }
 
-// Long256Column adds a 256-bit unsigned integer (long256) column
-// value to the ILP message.
-//
-// Only non-negative numbers that fit into 256-bit unsigned integer are
-// supported and any other input value would lead to an error.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *tcpLineSender) Long256Column(name string, val *big.Int) *tcpLineSender {
 	s.buf.Long256Column(name, val)
 	return s
 }
 
-// TimestampColumn adds a timestamp column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *tcpLineSender) TimestampColumn(name string, ts time.Time) *tcpLineSender {
 	s.buf.TimestampColumn(name, ts)
 	return s
 }
 
-// Float64Column adds a 64-bit float (double) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *tcpLineSender) Float64Column(name string, val float64) *tcpLineSender {
 	s.buf.Float64Column(name, val)
 	return s
 }
 
-// StringColumn adds a string column value to the ILP message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *tcpLineSender) StringColumn(name, val string) *tcpLineSender {
 	s.buf.StringColumn(name, val)
 	return s
 }
 
-// BoolColumn adds a boolean column value to the ILP message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *tcpLineSender) BoolColumn(name string, val bool) *tcpLineSender {
 	s.buf.BoolColumn(name, val)
 	return s
 }
 
-// Flush flushes the accumulated messages to the underlying TCP
-// connection. Should be called periodically to make sure that
-// all messages are sent to the server.
-//
-// For optimal performance, this method should not be called after
-// each ILP message. Instead, the messages should be written in
-// batches followed by a Flush call. Optimal batch size may vary
-// from 100 to 1,000 messages depending on the message size and
-// configured buffer capacity.
 func (s *tcpLineSender) Flush(ctx context.Context) error {
 	err := s.buf.LastErr()
 	s.buf.ClearLastErr()
@@ -477,25 +417,10 @@ func (s *tcpLineSender) Flush(ctx context.Context) error {
 	return nil
 }
 
-// AtNow omits the timestamp and finalizes the ILP message.
-// The server will insert each message using the system clock
-// as the row timestamp.
-//
-// If the underlying buffer reaches configured capacity or the
-// number of buffered messages exceeds the auto-flush trigger, this
-// method also sends the accumulated messages.
 func (s *tcpLineSender) AtNow(ctx context.Context) error {
 	return s.At(ctx, time.Time{})
 }
 
-// At sets the timestamp in Epoch nanoseconds and finalizes
-// the ILP message.
-//
-// If the underlying buffer reaches configured capacity or the
-// number of buffered messages exceeds the auto-flush trigger, this
-// method also sends the accumulated messages.
-//
-// If ts.IsZero(), no timestamp is sent to the server.
 func (s *tcpLineSender) At(ctx context.Context, ts time.Time) error {
 	sendTs := true
 	if ts.IsZero() {

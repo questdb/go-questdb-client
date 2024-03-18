@@ -158,7 +158,7 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 
 	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	sender.Table(testTable)
 	err = sender.Flush(ctx)
@@ -182,7 +182,7 @@ func TestErrorOnCancelledContext(t *testing.T) {
 
 	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	// The context is not cancelled yet, so Flush should succeed.
 	err = sender.Table(testTable).StringColumn("foo", "bar").AtNow(ctx)
@@ -209,7 +209,7 @@ func TestErrorOnContextDeadline(t *testing.T) {
 
 	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	// Keep writing until we get an error due to the context deadline.
 	for i := 0; i < 100_000; i++ {
@@ -235,7 +235,7 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 
 	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
 	assert.NoError(b, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -263,7 +263,7 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 
 	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
 	assert.NoError(b, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

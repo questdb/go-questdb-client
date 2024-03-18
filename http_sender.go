@@ -410,15 +410,6 @@ func HttpLineSenderFromConf(ctx context.Context, config string) (*httpLineSender
 	return NewHttpLineSender(opts...)
 }
 
-// Flush sends the accumulated messages via the underlying HTTP
-// connection. Should be called periodically to make sure that
-// all messages are sent to the server.
-//
-// For optimal performance, this method should not be called after
-// each ILP message. Instead, the messages should be written in
-// batches followed by a Flush call. Optimal batch size may vary
-// from one thousand to few thousand messages depending on
-// the message size.
 func (s *httpLineSender) Flush(ctx context.Context) error {
 	return s.flush0(ctx, false)
 }
@@ -514,100 +505,46 @@ func (s *httpLineSender) refreshFlushDeadline(err error) {
 	}
 }
 
-// Table sets the table name (metric) for a new ILP message. Should be
-// called before any Symbol or Column method.
-//
-// Table name cannot contain any of the following characters:
-// '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
-// '%', '~', starting '.', trailing '.', or a non-printable char.
 func (s *httpLineSender) Table(name string) *httpLineSender {
 	s.buf.Table(name)
 	return s
 }
 
-// Symbol adds a symbol column value to the ILP message. Should be called
-// before any Column method.
-//
-// Symbol name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *httpLineSender) Symbol(name, val string) *httpLineSender {
 	s.buf.Symbol(name, val)
 	return s
 }
 
-// Int64Column adds a 64-bit integer (long) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *httpLineSender) Int64Column(name string, val int64) *httpLineSender {
 	s.buf.Int64Column(name, val)
 	return s
 }
 
-// Long256Column adds a 256-bit unsigned integer (long256) column
-// value to the ILP message.
-//
-// Only non-negative numbers that fit into 256-bit unsigned integer are
-// supported and any other input value would lead to an error.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *httpLineSender) Long256Column(name string, val *big.Int) *httpLineSender {
 	s.buf.Long256Column(name, val)
 	return s
 }
 
-// TimestampColumn adds a timestamp column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *httpLineSender) TimestampColumn(name string, ts time.Time) *httpLineSender {
 	s.buf.TimestampColumn(name, ts)
 	return s
 }
 
-// Float64Column adds a 64-bit float (double) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *httpLineSender) Float64Column(name string, val float64) *httpLineSender {
 	s.buf.Float64Column(name, val)
 	return s
 }
 
-// StringColumn adds a string column value to the ILP message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *httpLineSender) StringColumn(name, val string) *httpLineSender {
 	s.buf.StringColumn(name, val)
 	return s
 }
 
-// BoolColumn adds a boolean column value to the ILP message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
 func (s *httpLineSender) BoolColumn(name string, val bool) *httpLineSender {
 	s.buf.BoolColumn(name, val)
 	return s
 }
 
-// Close closes the underlying HTTP client. If no clients remain open,
-// the global http.Transport will close all idle connections.
-//
-// If auto-flush is enabled, the client will flush any remaining buffered
-// messages before closing itself.
 func (s *httpLineSender) Close(ctx context.Context) error {
 	if s.closed {
 		return nil
@@ -631,25 +568,10 @@ func (s *httpLineSender) Close(ctx context.Context) error {
 	return err
 }
 
-// AtNow omits the timestamp and finalizes the ILP message.
-// The server will insert each message using the system clock
-// as the row timestamp.
-//
-// If the underlying buffer reaches configured capacity or the
-// number of buffered messages exceeds the auto-flush trigger, this
-// method also sends the accumulated messages.
 func (s *httpLineSender) AtNow(ctx context.Context) error {
 	return s.At(ctx, time.Time{})
 }
 
-// At sets the timestamp in Epoch nanoseconds and finalizes
-// the ILP message.
-//
-// If the underlying buffer reaches configured capacity or the
-// number of buffered messages exceeds the auto-flush trigger, this
-// method also sends the accumulated messages.
-//
-// If ts.IsZero(), no timestamp is sent to the server.
 func (s *httpLineSender) At(ctx context.Context, ts time.Time) error {
 	if s.closed {
 		return errors.New("cannot queue new messages on a closed LineSender")
