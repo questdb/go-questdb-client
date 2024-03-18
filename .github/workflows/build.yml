@@ -33,3 +33,5 @@ jobs:
 
       - name: Run tests
         run: go test -v ./...
+        env:
+          TESTCONTAINERS_RYUK_RECONNECTION_TIMEOUT: 30s
