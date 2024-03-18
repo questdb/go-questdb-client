@@ -400,24 +400,30 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 //
 // Schemas supported are "http", "https", "tcp", "tcps"
 //
-// Supported parameter values for tcp(s):
+// Options:
+// http(s) and tcp(s):
+// -------------------
+// addr:           hostname/port of QuestDB endpoint
+// init_buf_size:  initial growable ILP buffer size in bytes (defaults to 64KiB)
+// tls_verify:     determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
 //
-// addr:      hostname/port of QuestDB endpoint
-// username:  for basic authentication
-// password:  for basic authentication
-// token:     bearer token auth (used instead of basic authentication)
-//
-// auto_flush:       determines if auto-flushing is enabled (values "on" or "off", defaults to "on")
-// auto_flush_rows:  auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on
-//
+// http(s)-only
+// ------------
+// username:               for basic authentication
+// password:               for basic authentication
+// token:                  bearer token auth (used instead of basic authentication)
+// auto_flush:             determines if auto-flushing is enabled (values "on" or "off", defaults to "on")
+// auto_flush_rows:        auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on
 // request_min_throughput: bytes per second, used to calculate each request's timeout (defaults to 100KiB/s)
 // request_timeout:        minimum request timeout in milliseconds (defaults to 10 seconds)
 // retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
+// max_buf_size:           buffer growth limit in bytes. client errors if breached (default is 100MiB)
 //
-// init_buf_size:  initial growable ILP buffer size in bytes (defaults to 64KiB)
-// max_buf_size:   buffer growth limit in bytes. client errors if breached (default is 100MiB)
-//
-// tls_verify: determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
+// tcp(s)-only
+// -----------
+// username:  KID (key ID) for ECDSA authentication
+// token:     Secret K (D) for ECDSA authentication
+
 func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 	c, err := confFromStr(conf)
 	if err != nil {
@@ -461,8 +467,33 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 		return err
 	}
 
-	// TODO(puzpuzpuz): validate conf here
+	// validate tcp-specific settings
+	if conf.requestTimeout != 0 {
+		return errors.New("requestTimeout setting is not available in the TCP client")
+	}
+	if conf.retryTimeout != 0 {
+		return errors.New("retryTimeout setting is not available in the TCP client")
+	}
+	if conf.minThroughput != 0 {
+		return errors.New("minThroughput setting is not available in the TCP client")
+	}
+	if conf.autoFlushRows != 0 {
+		return errors.New("autoFlushRows setting is not available in the TCP client")
+	}
+	if conf.autoFlushInterval != 0 {
+		return errors.New("autoFlushInterval setting is not available in the TCP client")
+	}
+	if conf.maxBufferSize != 0 {
+		return errors.New("maxBufferSize setting is not available in the TCP client")
+	}
+	if conf.tcpKey == "" && conf.tcpKeyId != "" {
+		return errors.New("tcpKey is empty and tcpKeyId is not. both (or none) must be provided")
+	}
+	if conf.tcpKeyId == "" && conf.tcpKey != "" {
+		return errors.New("tcpKeyId is empty and tcpKey is not. both (or none) must be provided")
+	}
 
+	// Set defaults
 	if conf.address == "" {
 		conf.address = defaultTcpAddress
 	}
@@ -482,8 +513,12 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 		return err
 	}
 
-	// TODO(puzpuzpuz): validate conf here
+	// validate http-specific settings
+	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
+		return errors.New("both basic and token authentication cannot be used")
+	}
 
+	// Set defaults
 	if conf.address == "" {
 		conf.address = defaultHttpAddress
 	}

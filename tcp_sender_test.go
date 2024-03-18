@@ -40,8 +40,9 @@ const (
 )
 
 type tcpConfigTestCase struct {
-	name   string
-	config string
+	name        string
+	config      string
+	expectedErr string
 }
 
 func TestTcpHappyCasesFromConf(t *testing.T) {
@@ -83,6 +84,53 @@ func TestTcpHappyCasesFromConf(t *testing.T) {
 	}
 }
 
+func TestTcpPathologicalCasesFromConf(t *testing.T) {
+
+	testCases := []tcpConfigTestCase{
+		{
+			name:        "request_timeout",
+			config:      "tcp::request_timeout=5",
+			expectedErr: "requestTimeout setting is not available",
+		},
+		{
+			name:        "retry_timeout",
+			config:      "tcp::retry_timeout=5",
+			expectedErr: "retryTimeout setting is not available",
+		},
+		{
+			name:        "min_throughput",
+			config:      "tcp::min_throughput=5",
+			expectedErr: "minThroughput setting is not available",
+		},
+		{
+			name:        "auto_flush_rows",
+			config:      "tcp::auto_flush_rows=5",
+			expectedErr: "autoFlushRows setting is not available",
+		},
+		{
+			name:        "auto_flush_interval",
+			config:      "tcp::auto_flush_interval=5",
+			expectedErr: "autoFlushInterval setting is not available",
+		},
+		{
+			name:        "tcp key but no id",
+			config:      "tcp::token=test_key",
+			expectedErr: "tcpKeyId is empty",
+		},
+		{
+			name:        "tcp key id but no key",
+			config:      "tcp::user=test_key_id",
+			expectedErr: "tcpKey is empty",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := qdb.LineSenderFromConf(context.Background(), tc.config)
+			assert.ErrorContains(t, err, tc.expectedErr)
+		})
+	}
+}
 func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 

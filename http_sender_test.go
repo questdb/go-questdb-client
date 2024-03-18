@@ -37,8 +37,9 @@ import (
 )
 
 type httpConfigTestCase struct {
-	name   string
-	config string
+	name        string
+	config      string
+	expectedErr string
 }
 
 func TestHttpHappyCasesFromConf(t *testing.T) {
@@ -86,6 +87,24 @@ func TestHttpHappyCasesFromConf(t *testing.T) {
 			assert.NoError(t, err)
 
 			sender.Close(context.Background())
+		})
+	}
+}
+
+func TestHttpPathologicalCasesFromConf(t *testing.T) {
+
+	testCases := []httpConfigTestCase{
+		{
+			name:        "basic_and_token_auth",
+			config:      "http::user=test_user;token=test_token",
+			expectedErr: "both basic and token",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := qdb.LineSenderFromConf(context.Background(), tc.config)
+			assert.ErrorContains(t, err, tc.expectedErr)
 		})
 	}
 }
