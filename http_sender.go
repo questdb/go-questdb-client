@@ -102,10 +102,9 @@ type httpLineSender struct {
 	flushDeadline     time.Time
 
 	// Authentication-related fields
-	user    string
-	pass    string
-	token   string
-	tlsMode tlsMode
+	user  string
+	pass  string
+	token string
 
 	client http.Client
 	uri    string
@@ -125,7 +124,6 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 		retryTimeout:                conf.retryTimeout,
 		autoFlushRows:               conf.autoFlushRows,
 		autoFlushInterval:           conf.autoFlushInterval,
-		tlsMode:                     conf.tlsMode,
 		user:                        conf.httpUser,
 		pass:                        conf.httpPass,
 		token:                       conf.httpToken,
@@ -136,7 +134,7 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 	if conf.httpTransport != nil {
 		// Use custom transport.
 		transport = conf.httpTransport
-	} else if s.tlsMode == tlsInsecureSkipVerify {
+	} else if conf.tlsMode == tlsInsecureSkipVerify {
 		// We can't use the global transport in case of skipped TLS verification.
 		// Instead, create a single-time transport with disabled keep-alives.
 		transport = newHttpTransport()
@@ -158,7 +156,7 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 	}
 
 	s.uri = "http"
-	if s.tlsMode > 0 {
+	if conf.tlsMode != tlsDisabled {
 		s.uri += "s"
 	}
 	s.uri += fmt.Sprintf("://%s/write", s.address)
