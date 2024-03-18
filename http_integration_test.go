@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package integration_test
+package questdb_test
 
 import (
 	"context"
@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/questdb/go-questdb-client/v3/pkg/http"
+	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -45,10 +45,12 @@ func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 	assert.NoError(t, err)
 	defer questdbC.Stop(ctx)
 
-	sender, err := http.NewLineSender(
-		http.WithAddress(questdbC.proxyIlpHttpAddress),
-		http.WithBasicAuth(basicAuthUser, basicAuthPass),
-		http.WithTlsInsecureSkipVerify(),
+	sender, err := qdb.NewLineSender(
+		ctx,
+		qdb.WithHttp(),
+		qdb.WithAddress(questdbC.proxyIlpHttpAddress),
+		qdb.WithBasicAuth(basicAuthUser, basicAuthPass),
+		qdb.WithTlsInsecureSkipVerify(),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)

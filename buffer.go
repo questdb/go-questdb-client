@@ -35,15 +35,10 @@ import (
 	"time"
 )
 
-const (
-	DefaultBufferCapacity = 128 * 1024
-	DefaultFileNameLimit  = 127
-)
-
-// ErrInvalidMsg indicates a failed attempt to construct an ILP
+// errInvalidMsg indicates a failed attempt to construct an ILP
 // message, e.g. duplicate calls to Table method or illegal
 // chars found in table or column name.
-var ErrInvalidMsg = errors.New("invalid message")
+var errInvalidMsg = errors.New("invalid message")
 
 // buffer is a wrapper on top of bytes.Buffer. It extends the
 // original struct with methods for writing int64 and float64
@@ -51,8 +46,8 @@ var ErrInvalidMsg = errors.New("invalid message")
 type buffer struct {
 	bytes.Buffer
 
-	BufCap        int
-	FileNameLimit int
+	initBufSize   int
+	fileNameLimit int
 
 	lastMsgPos int
 	lastErr    error
@@ -62,11 +57,16 @@ type buffer struct {
 	msgCount   int
 }
 
-func newBuffer() buffer {
-	return buffer{
-		BufCap:        DefaultBufferCapacity,
-		FileNameLimit: DefaultFileNameLimit,
-	}
+func newBuffer(initBufSize int, fileNameLimit int) buffer {
+	var b buffer
+	b.initBufSize = initBufSize
+	b.fileNameLimit = fileNameLimit
+	b.ResetSize()
+	return b
+}
+
+func (b *buffer) ResetSize() {
+	b.Buffer = *bytes.NewBuffer(make([]byte, 0, b.initBufSize))
 }
 
 func (b *buffer) HasTable() bool {
@@ -136,12 +136,12 @@ func (b *buffer) WriteTo(w io.Writer) (int64, error) {
 
 func (buf *buffer) writeTableName(str string) error {
 	if str == "" {
-		return fmt.Errorf("table name cannot be empty: %w", ErrInvalidMsg)
+		return fmt.Errorf("table name cannot be empty: %w", errInvalidMsg)
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > buf.FileNameLimit {
-		return fmt.Errorf("table name length exceeds the limit: %w", ErrInvalidMsg)
+	if len(str) > buf.fileNameLimit {
+		return fmt.Errorf("table name length exceeds the limit: %w", errInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
@@ -154,13 +154,13 @@ func (buf *buffer) writeTableName(str string) error {
 			buf.WriteByte('\\')
 		case '.':
 			if i == 0 || i == len(str)-1 {
-				return fmt.Errorf("table name contains '.' char at the start or end: %s: %w", str, ErrInvalidMsg)
+				return fmt.Errorf("table name contains '.' char at the start or end: %s: %w", str, errInvalidMsg)
 			}
 		default:
 			if illegalTableNameChar(b) {
 				return fmt.Errorf("table name contains an illegal char: "+
 					"'\\n', '\\r', '?', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '*' '%%', '~', or a non-printable char: %s: %w",
-					str, ErrInvalidMsg)
+					str, errInvalidMsg)
 			}
 		}
 		buf.WriteByte(b)
@@ -236,12 +236,12 @@ func illegalTableNameChar(ch byte) bool {
 
 func (buf *buffer) writeColumnName(str string) error {
 	if str == "" {
-		return fmt.Errorf("column name cannot be empty: %w", ErrInvalidMsg)
+		return fmt.Errorf("column name cannot be empty: %w", errInvalidMsg)
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > buf.FileNameLimit {
-		return fmt.Errorf("column name length exceeds the limit: %w", ErrInvalidMsg)
+	if len(str) > buf.fileNameLimit {
+		return fmt.Errorf("column name length exceeds the limit: %w", errInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
@@ -256,7 +256,7 @@ func (buf *buffer) writeColumnName(str string) error {
 			if illegalColumnNameChar(b) {
 				return fmt.Errorf("column name contains an illegal char: "+
 					"'\\n', '\\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '-', '*' '%%', '~', or a non-printable char: %s: %w",
-					str, ErrInvalidMsg)
+					str, errInvalidMsg)
 			}
 		}
 		buf.WriteByte(b)
@@ -373,7 +373,7 @@ func (b *buffer) prepareForField() bool {
 		return false
 	}
 	if !b.hasTable {
-		b.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
+		b.lastErr = fmt.Errorf("table name was not provided: %w", errInvalidMsg)
 		return false
 	}
 	if !b.hasFields {
@@ -404,7 +404,7 @@ func (b *buffer) Table(name string) *buffer {
 		return b
 	}
 	if b.hasTable {
-		b.lastErr = fmt.Errorf("table name already provided: %w", ErrInvalidMsg)
+		b.lastErr = fmt.Errorf("table name already provided: %w", errInvalidMsg)
 		return b
 	}
 	b.lastErr = b.writeTableName(name)
@@ -420,11 +420,11 @@ func (b *buffer) Symbol(name, val string) *buffer {
 		return b
 	}
 	if !b.hasTable {
-		b.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
+		b.lastErr = fmt.Errorf("table name was not provided: %w", errInvalidMsg)
 		return b
 	}
 	if b.hasFields {
-		b.lastErr = fmt.Errorf("symbols have to be written before any other column: %w", ErrInvalidMsg)
+		b.lastErr = fmt.Errorf("symbols have to be written before any other column: %w", errInvalidMsg)
 		return b
 	}
 	b.WriteByte(',')
@@ -565,11 +565,11 @@ func (b *buffer) At(ts time.Time, sendTs bool) error {
 	}
 	if !b.hasTable {
 		b.DiscardPendingMsg()
-		return fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
+		return fmt.Errorf("table name was not provided: %w", errInvalidMsg)
 	}
 	if !b.hasTags && !b.hasFields {
 		b.DiscardPendingMsg()
-		return fmt.Errorf("no symbols or columns were provided: %w", ErrInvalidMsg)
+		return fmt.Errorf("no symbols or columns were provided: %w", errInvalidMsg)
 	}
 
 	if sendTs {

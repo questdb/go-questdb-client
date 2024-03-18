@@ -22,13 +22,13 @@
  *
  ******************************************************************************/
 
-package integration_test
+package questdb_test
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -56,9 +56,9 @@ func TestE2EWriteInBatches(t *testing.T) {
 	assert.NoError(t, err)
 	defer questdbC.Stop(ctx)
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	for i := 0; i < n; i++ {
 		for j := 0; j < nBatch; j++ {
@@ -109,9 +109,9 @@ func TestE2EImplicitFlush(t *testing.T) {
 	assert.NoError(t, err)
 	defer questdbC.Stop(ctx)
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress), qdb.WithBufferCapacity(bufCap))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithInitBufferSize(bufCap))
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	for i := 0; i < 10*bufCap; i++ {
 		err = sender.
@@ -141,6 +141,7 @@ func TestE2ESuccessfulAuth(t *testing.T) {
 
 	sender, err := qdb.NewLineSender(
 		ctx,
+		qdb.WithTcp(),
 		qdb.WithAddress(questdbC.ilpAddress),
 		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 	)
@@ -164,7 +165,7 @@ func TestE2ESuccessfulAuth(t *testing.T) {
 	// Close the connection to make sure that ILP messages are written. That's because
 	// the server may not write messages that are received immediately after the signed
 	// challenge until the connection is closed or more data is received.
-	sender.Close()
+	sender.Close(ctx)
 
 	expected := tableData{
 		Columns: []column{
@@ -197,11 +198,12 @@ func TestE2EFailedAuth(t *testing.T) {
 
 	sender, err := qdb.NewLineSender(
 		ctx,
+		qdb.WithTcp(),
 		qdb.WithAddress(questdbC.ilpAddress),
 		qdb.WithAuth("wrongKeyId", "1234567890"),
 	)
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	err = sender.
 		Table(testTable).
@@ -244,11 +246,12 @@ func TestE2EWritesWithTlsProxy(t *testing.T) {
 
 	sender, err := qdb.NewLineSender(
 		ctx,
+		qdb.WithTcp(),
 		qdb.WithAddress(questdbC.proxyIlpTcpAddress), // We're sending data through proxy.
 		qdb.WithTlsInsecureSkipVerify(),
 	)
 	assert.NoError(t, err)
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	err = sender.
 		Table(testTable).
@@ -296,6 +299,7 @@ func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
 
 	sender, err := qdb.NewLineSender(
 		ctx,
+		qdb.WithTcp(),
 		qdb.WithAddress(questdbC.proxyIlpTcpAddress), // We're sending data through proxy.
 		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 		qdb.WithTlsInsecureSkipVerify(),
@@ -320,7 +324,7 @@ func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
 	// Close the connection to make sure that ILP messages are written. That's because
 	// the server may not write messages that are received immediately after the signed
 	// challenge until the connection is closed or more data is received.
-	sender.Close()
+	sender.Close(ctx)
 
 	expected := tableData{
 		Columns: []column{
@@ -367,7 +371,7 @@ func queryTableData(t *testing.T, tableName, address string) tableData {
 	assert.NoError(t, err)
 	defer res.Body.Close()
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	assert.NoError(t, err)
 
 	data := tableData{}

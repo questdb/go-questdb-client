@@ -5,12 +5,14 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3/pkg/http"
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 func main() {
 	ctx := context.TODO()
 	sender, err := qdb.NewLineSender(
+		ctx,
+		qdb.WithHttp(),
 		qdb.WithAddress("localhost:9000"),
 		qdb.WithBearerToken(
 			"5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48", // token here

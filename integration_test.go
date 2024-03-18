@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package integration_test
+package questdb_test
 
 import (
 	"context"
@@ -34,133 +34,18 @@ import (
 	"time"
 
 	qdb "github.com/questdb/go-questdb-client/v3"
-	"github.com/questdb/go-questdb-client/v3/pkg/http"
-	"github.com/questdb/go-questdb-client/v3/pkg/tcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// Common integration tests for ILP/HTTP and ILP/TCP.
+
 const (
-	testTable           = "my_test_table"
-	networkName         = "test-network-v3"
 	eventualDataTimeout = 60 * time.Second
 )
 
-type writerFn func(s LineSender) error
-
-type LineSender interface {
-	Table(name string) LineSender
-	Symbol(name, val string) LineSender
-	Int64Column(name string, val int64) LineSender
-	Long256Column(name string, val *big.Int) LineSender
-	TimestampColumn(name string, ts time.Time) LineSender
-	Float64Column(name string, val float64) LineSender
-	StringColumn(name, val string) LineSender
-	BoolColumn(name string, val bool) LineSender
-	Close(ctx context.Context) error
-	AtNow(ctx context.Context) error
-	At(ctx context.Context, ts time.Time) error
-	Flush(ctx context.Context) error
-}
-
-type TestTcpLineSender struct {
-	sender *tcp.LineSender
-}
-
-func (s *TestTcpLineSender) Table(name string) LineSender {
-	s.sender.Table(name)
-	return s
-}
-func (s *TestTcpLineSender) Symbol(name, val string) LineSender {
-	s.sender.Symbol(name, val)
-	return s
-}
-func (s *TestTcpLineSender) Int64Column(name string, val int64) LineSender {
-	s.sender.Int64Column(name, val)
-	return s
-}
-func (s *TestTcpLineSender) Long256Column(name string, val *big.Int) LineSender {
-	s.sender.Long256Column(name, val)
-	return s
-}
-func (s *TestTcpLineSender) TimestampColumn(name string, ts time.Time) LineSender {
-	s.sender.TimestampColumn(name, ts)
-	return s
-}
-func (s *TestTcpLineSender) Float64Column(name string, val float64) LineSender {
-	s.sender.Float64Column(name, val)
-	return s
-}
-func (s *TestTcpLineSender) StringColumn(name, val string) LineSender {
-	s.sender.StringColumn(name, val)
-	return s
-}
-func (s *TestTcpLineSender) BoolColumn(name string, val bool) LineSender {
-	s.sender.BoolColumn(name, val)
-	return s
-}
-func (s *TestTcpLineSender) Close(ctx context.Context) error {
-	return s.sender.Close()
-}
-func (s *TestTcpLineSender) AtNow(ctx context.Context) error {
-	return s.sender.AtNow(ctx)
-}
-func (s *TestTcpLineSender) At(ctx context.Context, ts time.Time) error {
-	return s.sender.At(ctx, ts)
-}
-func (s *TestTcpLineSender) Flush(ctx context.Context) error {
-	return s.sender.Flush(ctx)
-}
-
-type TestHttpLineSender struct {
-	sender *http.LineSender
-}
-
-func (s *TestHttpLineSender) Table(name string) LineSender {
-	s.sender.Table(name)
-	return s
-}
-func (s *TestHttpLineSender) Symbol(name, val string) LineSender {
-	s.sender.Symbol(name, val)
-	return s
-}
-func (s *TestHttpLineSender) Int64Column(name string, val int64) LineSender {
-	s.sender.Int64Column(name, val)
-	return s
-}
-func (s *TestHttpLineSender) Long256Column(name string, val *big.Int) LineSender {
-	s.sender.Long256Column(name, val)
-	return s
-}
-func (s *TestHttpLineSender) TimestampColumn(name string, ts time.Time) LineSender {
-	s.sender.TimestampColumn(name, ts)
-	return s
-}
-func (s *TestHttpLineSender) Float64Column(name string, val float64) LineSender {
-	s.sender.Float64Column(name, val)
-	return s
-}
-func (s *TestHttpLineSender) StringColumn(name, val string) LineSender {
-	s.sender.StringColumn(name, val)
-	return s
-}
-func (s *TestHttpLineSender) BoolColumn(name string, val bool) LineSender {
-	s.sender.BoolColumn(name, val)
-	return s
-}
-func (s *TestHttpLineSender) Close(ctx context.Context) error {
-	return s.sender.Close(ctx)
-}
-func (s *TestHttpLineSender) AtNow(ctx context.Context) error {
-	return s.sender.AtNow(ctx)
-}
-func (s *TestHttpLineSender) At(ctx context.Context, ts time.Time) error {
-	return s.sender.At(ctx, ts)
-}
-func (s *TestHttpLineSender) Flush(ctx context.Context) error {
-	return s.sender.Flush(ctx)
-}
+type writerFn func(b qdb.LineSender) error
 
 type questdbContainer struct {
 	testcontainers.Container
@@ -370,7 +255,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"all column types",
 			testTable,
-			func(s LineSender) error {
+			func(s qdb.LineSender) error {
 				val, _ := big.NewInt(0).SetString("123a4", 16)
 				err := s.
 					Table(testTable).
@@ -419,7 +304,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"escaped chars",
 			"my-awesome_test 1=2.csv",
-			func(s LineSender) error {
+			func(s qdb.LineSender) error {
 				return s.
 					Table("my-awesome_test 1=2.csv").
 					Symbol("sym_name 1=2", "value 1,2=3\n4\r5\"6\\7").
@@ -441,7 +326,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single symbol",
 			testTable,
-			func(s LineSender) error {
+			func(s qdb.LineSender) error {
 				return s.
 					Table(testTable).
 					Symbol("foo", "bar").
@@ -461,7 +346,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single column",
 			testTable,
-			func(s LineSender) error {
+			func(s qdb.LineSender) error {
 				return s.
 					Table(testTable).
 					Int64Column("foobar", 1_000_042).
@@ -481,7 +366,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"single column long256",
 			testTable,
-			func(s LineSender) error {
+			func(s qdb.LineSender) error {
 				val, _ := big.NewInt(0).SetString("7fffffffffffffff", 16)
 				return s.
 					Table(testTable).
@@ -502,7 +387,7 @@ func TestE2EValidWrites(t *testing.T) {
 		{
 			"double value with exponent",
 			testTable,
-			func(s LineSender) error {
+			func(s qdb.LineSender) error {
 				return s.
 					Table(testTable).
 					Float64Column("foobar", 4.2e-100).
@@ -525,7 +410,8 @@ func TestE2EValidWrites(t *testing.T) {
 		for _, protocol := range []string{"tcp", "http"} {
 			t.Run(fmt.Sprintf("%s: %s", tc.name, protocol), func(t *testing.T) {
 				var (
-					sender LineSender
+					sender qdb.LineSender
+					err    error
 				)
 
 				questdbC, err := setupQuestDB(ctx, noAuth)
@@ -533,17 +419,11 @@ func TestE2EValidWrites(t *testing.T) {
 
 				switch protocol {
 				case "tcp":
-					tcpSender, err := qdb.NewLineSender(ctx, qdb.WithAddress(questdbC.ilpAddress))
+					sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
 					assert.NoError(t, err)
-					sender = &TestTcpLineSender{
-						sender: tcpSender,
-					}
 				case "http":
-					httpSender, err := http.NewLineSender(http.WithAddress(questdbC.httpAddress))
+					sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
 					assert.NoError(t, err)
-					sender = &TestHttpLineSender{
-						sender: httpSender,
-					}
 				default:
 					panic(protocol)
 				}
@@ -563,6 +443,5 @@ func TestE2EValidWrites(t *testing.T) {
 				questdbC.Stop(ctx)
 			})
 		}
-
 	}
 }

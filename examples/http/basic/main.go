@@ -5,13 +5,13 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3/pkg/http"
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 func main() {
 	ctx := context.TODO()
 	// Connect to QuestDB running on 127.0.0.1:9009
-	sender, err := qdb.NewLineSender()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp())
 	if err != nil {
 		log.Fatal(err)
 	}

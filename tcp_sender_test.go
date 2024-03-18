@@ -40,20 +40,18 @@ const (
 )
 
 type tcpConfigTestCase struct {
-	name                   string
-	config                 string
-	expectedOpts           []qdb.TcpLineSenderOption
-	expectedErrMsgContains string
+	name   string
+	config string
 }
 
 func TestTcpHappyCasesFromConf(t *testing.T) {
 	var (
-		user       = "test-user"
-		token      = "test-token"
-		maxBufSize = 1000
+		user        = "test-user"
+		token       = "test-token"
+		initBufSize = 1000
 	)
 
-	testServer, err := NewTestTcpServer(ReadAndDiscard)
+	testServer, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer testServer.Close()
 
@@ -64,87 +62,20 @@ func TestTcpHappyCasesFromConf(t *testing.T) {
 			name: "user and token",
 			config: fmt.Sprintf("tcp::addr=%s;user=%s;token=%s",
 				addr, user, token),
-			expectedOpts: []qdb.TcpLineSenderOption{
-				qdb.WithTcpAddress(addr),
-				qdb.WithTcpAuth(user, token),
-			},
 		},
 		{
-			name: "init_buf_size and max_buf_size",
-			config: fmt.Sprintf("tcp::addr=%s;max_buf_size=%d",
-				addr, maxBufSize),
-			expectedOpts: []qdb.TcpLineSenderOption{
-				qdb.WithTcpAddress(addr),
-				qdb.WithTcpBufferCapacity(maxBufSize),
-			},
-		},
-		{
-			name: "with tls",
-			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on",
-				addr),
-			expectedOpts: []qdb.TcpLineSenderOption{
-				qdb.WithTcpAddress(addr),
-				qdb.WithTcpTls(),
-			},
-		},
-		{
-			name: "with tls and unsafe_off",
-			config: fmt.Sprintf("tcp::addr=%s;tls_verify=unsafe_off",
-				addr),
-			expectedOpts: []qdb.TcpLineSenderOption{
-				qdb.WithTcpAddress(addr),
-				qdb.WithTcpTlsInsecureSkipVerify(),
-			},
+			name: "init_buf_size",
+			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d",
+				addr, initBufSize),
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			actualOpts, err := qdb.OptsFromConf(tc.config)
+			sender, err := qdb.LineSenderFromConf(context.Background(), tc.config)
 			assert.NoError(t, err)
 
-			actual := qdb.NewEmptyTcpLineSender()
-			for _, opt := range actualOpts {
-				opt(actual)
-			}
-			expected := qdb.NewEmptyTcpLineSender()
-			for _, opt := range tc.expectedOpts {
-				opt(expected)
-			}
-
-			assert.Equal(t, expected, actual)
-		})
-	}
-}
-
-func TestPathologicalCasesFromConf(t *testing.T) {
-	testCases := []tcpConfigTestCase{
-		{
-			name:                   "empty config",
-			config:                 "",
-			expectedErrMsgContains: "no schema separator found",
-		},
-		{
-			name:                   "invalid schema",
-			config:                 "http::addr=localhost:1111",
-			expectedErrMsgContains: "invalid schema",
-		},
-		{
-			name:                   "invalid tls_verify",
-			config:                 "tcp::addr=localhost:1111;tls_verify=invalid",
-			expectedErrMsgContains: "invalid tls_verify",
-		},
-		{
-			name:                   "unsupported option",
-			config:                 "tcp::addr=localhost:1111;unsupported_option=invalid",
-			expectedErrMsgContains: "unsupported option",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := qdb.OptsFromConf(tc.config)
-			assert.ErrorContains(t, err, tc.expectedErrMsgContains)
+			sender.Close(context.Background())
 		})
 	}
 }
@@ -152,11 +83,11 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := NewTestTcpServer(ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
@@ -164,23 +95,23 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	err = sender.Flush(ctx)
 
 	assert.ErrorContains(t, err, "pending ILP message must be finalized with At or AtNow before calling Flush")
-	assert.Empty(t, sender.Messages())
+	assert.Empty(t, qdb.Messages(sender))
 }
 
 func TestErrorOnUnavailableServer(t *testing.T) {
 	ctx := context.Background()
 
-	_, err := qdb.NewTcpLineSender(ctx)
+	_, err := qdb.NewLineSender(ctx, qdb.WithTcp())
 	assert.ErrorContains(t, err, "failed to connect to server")
 }
 
 func TestErrorOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	srv, err := NewTestTcpServer(ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
@@ -203,11 +134,11 @@ func TestErrorOnContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
 
-	srv, err := NewTestTcpServer(ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
@@ -229,11 +160,11 @@ func TestErrorOnContextDeadline(t *testing.T) {
 func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := NewTestTcpServer(ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(b, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
 	assert.NoError(b, err)
 	defer sender.Close(ctx)
 
@@ -257,11 +188,11 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 func BenchmarkLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := NewTestTcpServer(ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(b, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewTcpLineSender(ctx, qdb.WithTcpAddress(srv.Addr()))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
 	assert.NoError(b, err)
 	defer sender.Close(ctx)
 

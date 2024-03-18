@@ -27,25 +27,54 @@ package questdb
 import "sync/atomic"
 
 type (
-	Buffer        = buffer
-	ConfigData    = configData
-	TcpLineSender = tcpLineSender
+	Buffer           = buffer
+	ConfigData       = configData
+	TcpLineSender    = tcpLineSender
+	LineSenderConfig = lineSenderConfig
 )
 
 var (
 	ClientCt *atomic.Int64 = &clientCt
 )
 
-func NewBuffer() Buffer {
-	return newBuffer()
+func NewBuffer(initBufSize int, fileNameLimit int) Buffer {
+	return newBuffer(initBufSize, fileNameLimit)
 }
 
-func OptsFromConf(config string) ([]TcpLineSenderOption, error) {
-	return optsFromConf(config)
+func ParseConfigStr(conf string) (configData, error) {
+	return parseConfigStr(conf)
 }
 
-func NewEmptyTcpLineSender() *TcpLineSender {
-	return &TcpLineSender{
-		buf: newBuffer(),
+func ConfFromStr(conf string) (*LineSenderConfig, error) {
+	return confFromStr(conf)
+}
+
+func Messages(s LineSender) string {
+	if hs, ok := s.(*httpLineSender); ok {
+		return hs.Messages()
 	}
+	if ts, ok := s.(*tcpLineSender); ok {
+		return ts.Messages()
+	}
+	panic("unexpected struct")
+}
+
+func MsgCount(s LineSender) int {
+	if hs, ok := s.(*httpLineSender); ok {
+		return hs.MsgCount()
+	}
+	if ts, ok := s.(*tcpLineSender); ok {
+		return ts.MsgCount()
+	}
+	panic("unexpected struct")
+}
+
+func BufLen(s LineSender) int {
+	if hs, ok := s.(*httpLineSender); ok {
+		return hs.BufLen()
+	}
+	if ts, ok := s.(*tcpLineSender); ok {
+		return ts.BufLen()
+	}
+	panic("unexpected struct")
 }

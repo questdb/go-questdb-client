@@ -26,6 +26,8 @@ package questdb
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"time"
@@ -139,24 +141,58 @@ type LineSender interface {
 	Close(ctx context.Context) error
 }
 
+const (
+	defaultHttpAddress = "127.0.0.1:9009"
+	defaultTcpAddress  = "127.0.0.1:9009"
+
+	defaultInitBufferSize = 128 * 1024        // 128KB
+	defaultMaxBufferSize  = 100 * 1024 * 1024 // 100MB
+	defaultFileNameLimit  = 127
+
+	defaultAutoFlushRows     = 75000
+	defaultAutoFlushInterval = time.Second
+
+	defaultMinThroughput  = 100 * 1024 // 100KB/s
+	defaultRetryTimeout   = 10 * time.Second
+	defaultRequestTimeout = 10 * time.Second
+)
+
+type senderType int64
+
+const (
+	noSenderType   senderType = 0
+	httpSenderType senderType = 1
+	tcpSenderType  senderType = 2
+)
+
+type tlsMode int64
+
+const (
+	tlsDisabled           tlsMode = 0
+	tlsEnabled            tlsMode = 1
+	tlsInsecureSkipVerify tlsMode = 2
+)
+
 type lineSenderConfig struct {
+	senderType     senderType
 	address        string
 	initBufferSize int
+	maxBufferSize  int
 	fileNameLimit  int
 	httpTransport  *http.Transport
 
 	// Retry/timeout-related fields
-	retryTimeout                time.Duration
-	minThroughputBytesPerSecond int
-	requestTimeout              time.Duration
+	retryTimeout   time.Duration
+	minThroughput  int
+	requestTimeout time.Duration
 
 	// Authentication-related fields
-	tcpTlsMode tcpTlsMode
-	tcpKeyId   string
-	tcpKey     string
-	httpUser   string
-	httpPass   string
-	httpToken  string
+	tlsMode   tlsMode
+	tcpKeyId  string
+	tcpKey    string
+	httpUser  string
+	httpPass  string
+	httpToken string
 
 	// Auto-flush fields
 	autoFlushRows     int
@@ -166,10 +202,24 @@ type lineSenderConfig struct {
 // LineSenderOption defines line sender config option.
 type LineSenderOption func(*lineSenderConfig)
 
+// WithHttp enables ingestion over HTTP protocol.
+func WithHttp() LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.senderType = httpSenderType
+	}
+}
+
+// WithTcp enables ingestion over TCP protocol.
+func WithTcp() LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.senderType = tcpSenderType
+	}
+}
+
 // WithTls enables TLS connection encryption.
 func WithTls() LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.tcpTlsMode = tlsEnabled
+		s.tlsMode = tlsEnabled
 	}
 }
 
@@ -224,7 +274,7 @@ func WithRequestTimeout(timeout time.Duration) LineSenderOption {
 // Only available for the HTTP sender.
 func WithMinThroughput(bytesPerSecond int) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.minThroughputBytesPerSecond = bytesPerSecond
+		s.minThroughput = bytesPerSecond
 	}
 }
 
@@ -249,6 +299,17 @@ func WithRetryTimeout(t time.Duration) LineSenderOption {
 func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.initBufferSize = sizeInBytes
+	}
+}
+
+// WithMaxBufferSize sets the maximum buffer capacity
+// in bytes to be used when sending ILP messages. The sender will
+// return an error if the limit is reached. Defaults to 100MB.
+//
+// Only available for the HTTP sender.
+func WithMaxBufferSize(sizeInBytes int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.maxBufferSize = sizeInBytes
 	}
 }
 
@@ -281,7 +342,7 @@ func WithAddress(addr string) LineSenderOption {
 // For the HTTP sender, use WithHttpTransport.
 func WithTlsInsecureSkipVerify() LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.tcpTlsMode = tlsInsecureSkipVerify
+		s.tlsMode = tlsInsecureSkipVerify
 	}
 }
 
@@ -326,4 +387,165 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.autoFlushInterval = interval
 	}
+}
+
+// LineSenderFromConf creates a LineSender using the QuestDB config string format.
+//
+// Example config string: "http::addr=localhost;username=joe;password=123;auto_flush_rows=1000;"
+//
+// QuestDB ILP clients use a common key-value configuration string format across all
+// implementations. We opted for this config over a URL because it reduces the amount
+// of character escaping required for paths and base64-encoded param values.
+//
+// The config string format is as follows:
+//
+// schema::key1=value1;key2=value2;key3=value3;
+//
+// Schemas supported are "http", "https", "tcp", "tcps"
+//
+// Supported parameter values for tcp(s):
+//
+// addr:      hostname/port of QuestDB endpoint
+// username:  for basic authentication
+// password:  for basic authentication
+// token:     bearer token auth (used instead of basic authentication)
+//
+// auto_flush:       determines if auto-flushing is enabled (values "on" or "off", defaults to "on")
+// auto_flush_rows:  auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on
+//
+// request_min_throughput: bytes per second, used to calculate each request's timeout (defaults to 100KiB/s)
+// request_timeout:        minimum request timeout in milliseconds (defaults to 10 seconds)
+// retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
+//
+// init_buf_size:  initial growable ILP buffer size in bytes (defaults to 64KiB)
+// max_buf_size:   buffer growth limit in bytes. client errors if breached (default is 100MiB)
+//
+// tls_verify: determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
+func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
+	c, err := confFromStr(conf)
+	if err != nil {
+		return nil, err
+	}
+	return newLineSender(ctx, c)
+}
+
+// NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
+// sender corresponds to a single client connection. LineSender should
+// not be called concurrently by multiple goroutines.
+func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, error) {
+	conf := &lineSenderConfig{}
+	for _, opt := range opts {
+		opt(conf)
+	}
+	return newLineSender(ctx, conf)
+}
+
+func newLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
+	switch conf.senderType {
+	case tcpSenderType:
+		err := sanitizeTcpConf(conf)
+		if err != nil {
+			return nil, err
+		}
+		return newTcpLineSender(ctx, conf)
+	case httpSenderType:
+		err := sanitizeHttpConf(conf)
+		if err != nil {
+			return nil, err
+		}
+		return newHttpLineSender(conf)
+	}
+	return nil, errors.New("sender type is not specified: use WithHttp or WithTcp")
+}
+
+func sanitizeTcpConf(conf *lineSenderConfig) error {
+	err := validateConf(conf)
+	if err != nil {
+		return err
+	}
+
+	// TODO(puzpuzpuz): validate conf here
+
+	if conf.address == "" {
+		conf.address = defaultTcpAddress
+	}
+	if conf.initBufferSize == 0 {
+		conf.initBufferSize = defaultInitBufferSize
+	}
+	if conf.fileNameLimit == 0 {
+		conf.fileNameLimit = defaultFileNameLimit
+	}
+
+	return nil
+}
+
+func sanitizeHttpConf(conf *lineSenderConfig) error {
+	err := validateConf(conf)
+	if err != nil {
+		return err
+	}
+
+	// TODO(puzpuzpuz): validate conf here
+
+	if conf.address == "" {
+		conf.address = defaultHttpAddress
+	}
+	if conf.requestTimeout == 0 {
+		conf.requestTimeout = defaultRequestTimeout
+	}
+	if conf.retryTimeout == 0 {
+		conf.retryTimeout = defaultRetryTimeout
+	}
+	if conf.minThroughput == 0 {
+		conf.minThroughput = defaultMinThroughput
+	}
+	if conf.autoFlushRows == 0 {
+		conf.autoFlushRows = defaultAutoFlushRows
+	}
+	if conf.autoFlushInterval == 0 {
+		conf.autoFlushInterval = defaultAutoFlushInterval
+	}
+	if conf.initBufferSize == 0 {
+		conf.initBufferSize = defaultInitBufferSize
+	}
+	if conf.maxBufferSize == 0 {
+		conf.maxBufferSize = defaultMaxBufferSize
+	}
+	if conf.fileNameLimit == 0 {
+		conf.fileNameLimit = defaultFileNameLimit
+	}
+
+	return nil
+}
+
+func validateConf(conf *lineSenderConfig) error {
+	if conf.initBufferSize < 0 {
+		return fmt.Errorf("initial buffer size is negative: %d", conf.initBufferSize)
+	}
+	if conf.maxBufferSize < 0 {
+		return fmt.Errorf("max buffer size is negative: %d", conf.maxBufferSize)
+	}
+
+	if conf.fileNameLimit < 0 {
+		return fmt.Errorf("file name limit is negative: %d", conf.fileNameLimit)
+	}
+
+	if conf.retryTimeout < 0 {
+		return fmt.Errorf("retry timeout is negative: %d", conf.retryTimeout)
+	}
+	if conf.requestTimeout < 0 {
+		return fmt.Errorf("request timeout is negative: %d", conf.requestTimeout)
+	}
+	if conf.minThroughput < 0 {
+		return fmt.Errorf("min throughput is negative: %d", conf.minThroughput)
+	}
+
+	if conf.autoFlushRows < 0 {
+		return fmt.Errorf("auto flush rows is negative: %d", conf.autoFlushRows)
+	}
+	if conf.autoFlushInterval < 0 {
+		return fmt.Errorf("auto flush interval is negative: %d", conf.autoFlushInterval)
+	}
+
+	return nil
 }
