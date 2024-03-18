@@ -336,10 +336,6 @@ func WithAddress(addr string) LineSenderOption {
 // but skips server certificate verification. Useful in test
 // environments with self-signed certificates. Do not use in
 // production environments.
-//
-// Only available for the TCP sender.
-//
-// For the HTTP sender, use WithHttpTransport.
 func WithTlsInsecureSkipVerify() LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.tlsMode = tlsInsecureSkipVerify
@@ -349,6 +345,7 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 // WithHttpTransport sets the client's http transport to the
 // passed pointer instead of the global transport. This can be
 // used for customizing the http transport used by the HttpLineSender.
+// WithTlsInsecureSkipVerify is ignored when this option is in use.
 //
 // Only available for the HTTP sender.
 func WithHttpTransport(t *http.Transport) LineSenderOption {

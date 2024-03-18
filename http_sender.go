@@ -38,20 +38,37 @@ import (
 	"time"
 )
 
+type globalHttpTransport struct {
+	transport *http.Transport
+	// clientCt is used to track the number of open httpLineSenders
+	// If the clientCt reaches 0, meaning all senders have been
+	// closed, the global transport closes all idle connections to
+	// free up resources
+	clientCt atomic.Int64
+}
+
+func (t *globalHttpTransport) ClientCount() int64 {
+	return t.clientCt.Load()
+}
+
+func (t *globalHttpTransport) RegisterClient() {
+	t.clientCt.Add(1)
+}
+
+func (t *globalHttpTransport) UnregisterClient() {
+	newCt := t.clientCt.Add(-1)
+	if newCt == 0 {
+		t.transport.CloseIdleConnections()
+	}
+}
+
 var (
 	// We use a shared http transport to pool connections
 	// across HttpLineSenders
-	// TODO(puzpuzpuz): we can't use a single global transport for both plain text and TLS
-	globalTransport *http.Transport = newHttpTransport(false)
-
-	// clientCt is used to track the number of open HttpLineSenders
-	// If the clientCt reaches 0, meaning all HttpLineSenders have been
-	// closed, the globalTransport closes all idle connections to
-	// free up resources
-	clientCt atomic.Int64
+	globalTransport *globalHttpTransport = &globalHttpTransport{transport: newHttpTransport()}
 )
 
-func newHttpTransport(disableKeepAlives bool) *http.Transport {
+func newHttpTransport() *http.Transport {
 	return &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		MaxConnsPerHost:     0,
@@ -60,7 +77,6 @@ func newHttpTransport(disableKeepAlives bool) *http.Transport {
 		IdleConnTimeout:     120 * time.Second,
 		TLSHandshakeTimeout: defaultRequestTimeout,
 		TLSClientConfig:     &tls.Config{},
-		DisableKeepAlives:   disableKeepAlives,
 	}
 }
 
@@ -91,13 +107,17 @@ type httpLineSender struct {
 	token   string
 	tlsMode tlsMode
 
-	client    http.Client
-	uri       string
-	closed    bool
-	transport *http.Transport
+	client http.Client
+	uri    string
+	closed bool
+
+	// Global transport is used unless a custom transport was provided.
+	globalTransport *globalHttpTransport
 }
 
 func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
+	var transport *http.Transport
+
 	s := &httpLineSender{
 		address:                     conf.address,
 		minThroughputBytesPerSecond: conf.minThroughput,
@@ -105,7 +125,6 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 		retryTimeout:                conf.retryTimeout,
 		autoFlushRows:               conf.autoFlushRows,
 		autoFlushInterval:           conf.autoFlushInterval,
-		transport:                   conf.httpTransport,
 		tlsMode:                     conf.tlsMode,
 		user:                        conf.httpUser,
 		pass:                        conf.httpPass,
@@ -114,23 +133,28 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 		buf: newBuffer(conf.initBufferSize, conf.fileNameLimit),
 	}
 
-	if s.transport == nil {
-		s.transport = globalTransport
-	}
-
-	if s.tlsMode == tlsInsecureSkipVerify {
-		s.transport = newHttpTransport(true) // no keep alive
-		s.transport.TLSClientConfig = &tls.Config{}
-		s.transport.TLSClientConfig.InsecureSkipVerify = true
+	if conf.httpTransport != nil {
+		// Use custom transport.
+		transport = conf.httpTransport
+	} else if s.tlsMode == tlsInsecureSkipVerify {
+		// We can't use the global transport in case of skipped TLS verification.
+		// Instead, create a single-time transport with disabled keep-alives.
+		transport = newHttpTransport()
+		transport.DisableKeepAlives = true
+		transport.TLSClientConfig.InsecureSkipVerify = true
+	} else {
+		// Otherwise, use the global transport.
+		s.globalTransport = globalTransport
+		transport = globalTransport.transport
 	}
 
 	s.client = http.Client{
-		Transport: s.transport,
+		Transport: transport,
 		Timeout:   0,
 	}
 
-	if s.transport == globalTransport {
-		clientCt.Add(1)
+	if s.globalTransport != nil {
+		s.globalTransport.RegisterClient()
 	}
 
 	s.uri = "http"
@@ -290,11 +314,8 @@ func (s *httpLineSender) Close(ctx context.Context) error {
 
 	s.closed = true
 
-	if s.transport == globalTransport {
-		newCt := clientCt.Add(-1)
-		if newCt == 0 {
-			globalTransport.CloseIdleConnections()
-		}
+	if s.globalTransport != nil {
+		s.globalTransport.UnregisterClient()
 	}
 
 	return err

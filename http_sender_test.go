@@ -471,7 +471,7 @@ func TestCustomTransportAndTlsInit(t *testing.T) {
 	// s1 and s2 have successfully instantiated a sender
 	// using the global transport and should be registered in the
 	// global transport client count
-	assert.Equal(t, int64(2), qdb.ClientCt.Load())
+	assert.Equal(t, int64(2), qdb.GlobalTransport.ClientCount())
 
 	// Closing the client with the custom transport should not impact
 	// the global transport client count
@@ -481,7 +481,7 @@ func TestCustomTransportAndTlsInit(t *testing.T) {
 	s1.Close(ctx)
 	s2.Close(ctx)
 	s3.Close(ctx)
-	assert.Equal(t, int64(0), qdb.ClientCt.Load())
+	assert.Equal(t, int64(0), qdb.GlobalTransport.ClientCount())
 }
 
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {

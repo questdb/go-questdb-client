@@ -24,8 +24,6 @@
 
 package questdb
 
-import "sync/atomic"
-
 type (
 	Buffer           = buffer
 	ConfigData       = configData
@@ -34,7 +32,7 @@ type (
 )
 
 var (
-	ClientCt *atomic.Int64 = &clientCt
+	GlobalTransport = globalTransport
 )
 
 func NewBuffer(initBufSize int, fileNameLimit int) Buffer {
