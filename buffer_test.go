@@ -1,4 +1,28 @@
-package buffer
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2022 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb_test
 
 import (
 	"math"
@@ -8,14 +32,11 @@ import (
 	"testing"
 	"time"
 
+	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 )
 
-type writerFn func(b *Buffer) error
-
-const (
-	testTable = "my_test_table"
-)
+type writerFn func(b *qdb.Buffer) error
 
 func TestValidWrites(t *testing.T) {
 	testCases := []struct {
@@ -25,7 +46,7 @@ func TestValidWrites(t *testing.T) {
 	}{
 		{
 			"multiple rows",
-			func(b *Buffer) error {
+			func(b *qdb.Buffer) error {
 				err := b.Table(testTable).StringColumn("str_col", "foo").Int64Column("long_col", 42).At(time.Time{}, false)
 				if err != nil {
 					return err
@@ -43,7 +64,7 @@ func TestValidWrites(t *testing.T) {
 		},
 		{
 			"UTF-8 strings",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Table("таблица").StringColumn("колонка", "значение").At(time.Time{}, false)
 			},
 			[]string{
@@ -54,7 +75,7 @@ func TestValidWrites(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := NewBuffer()
+			buf := qdb.NewBuffer()
 
 			err := tc.writerFn(&buf)
 			assert.NoError(t, err)
@@ -78,7 +99,7 @@ func TestTimestampSerialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := NewBuffer()
+			buf := qdb.NewBuffer()
 
 			err := buf.Table(testTable).TimestampColumn("a_col", tc.val).At(time.Time{}, false)
 			assert.NoError(t, err)
@@ -105,7 +126,7 @@ func TestInt64Serialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := NewBuffer()
+			buf := qdb.NewBuffer()
 
 			err := buf.Table(testTable).Int64Column("a_col", tc.val).At(time.Time{}, false)
 			assert.NoError(t, err)
@@ -133,7 +154,7 @@ func TestLong256Column(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := NewBuffer()
+			buf := qdb.NewBuffer()
 
 			newVal, _ := big.NewInt(0).SetString(tc.val, 16)
 			err := buf.Table(testTable).Long256Column("a_col", newVal).At(time.Time{}, false)
@@ -168,7 +189,7 @@ func TestFloat64Serialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := NewBuffer()
+			buf := qdb.NewBuffer()
 
 			err := buf.Table(testTable).Float64Column("a_col", tc.val).At(time.Time{}, false)
 			assert.NoError(t, err)
@@ -195,14 +216,14 @@ func TestErrorOnLengthyNames(t *testing.T) {
 	}{
 		{
 			"lengthy table name",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Table(lengthyStr).StringColumn("str_col", "foo").At(time.Time{}, false)
 			},
 			"table name length exceeds the limit",
 		},
 		{
 			"lengthy column name",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Table(testTable).StringColumn(lengthyStr, "foo").At(time.Time{}, false)
 			},
 			"column name length exceeds the limit",
@@ -211,7 +232,7 @@ func TestErrorOnLengthyNames(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := NewBuffer()
+			buf := qdb.NewBuffer()
 			buf.FileNameLimit = nameLimit
 
 			err := tc.writerFn(&buf)
@@ -229,43 +250,43 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 	}{
 		{
 			"At",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Symbol("sym", "abc").At(time.Time{}, false)
 			},
 		},
 		{
 			"symbol",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Symbol("sym", "abc").At(time.Time{}, false)
 			},
 		},
 		{
 			"string column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.StringColumn("str", "abc").At(time.Time{}, false)
 			},
 		},
 		{
 			"boolean column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.BoolColumn("bool", true).At(time.Time{}, false)
 			},
 		},
 		{
 			"long column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Int64Column("int", 42).At(time.Time{}, false)
 			},
 		},
 		{
 			"double column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Float64Column("float", 4.2).At(time.Time{}, false)
 			},
 		},
 		{
 			"timestamp column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.TimestampColumn("timestamp", time.UnixMicro(42)).At(time.Time{}, false)
 			},
 		},
@@ -273,7 +294,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := NewBuffer()
+			buf := qdb.NewBuffer()
 
 			err := tc.writerFn(&buf)
 
@@ -285,7 +306,7 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 }
 
 func TestErrorOnMultipleTableCalls(t *testing.T) {
-	buf := NewBuffer()
+	buf := qdb.NewBuffer()
 
 	err := buf.Table(testTable).Table(testTable).At(time.Time{}, false)
 
@@ -294,7 +315,7 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 }
 
 func TestErrorOnNegativeLong256(t *testing.T) {
-	buf := NewBuffer()
+	buf := qdb.NewBuffer()
 
 	err := buf.Table(testTable).Long256Column("long256_col", big.NewInt(-42)).At(time.Time{}, false)
 
@@ -303,7 +324,7 @@ func TestErrorOnNegativeLong256(t *testing.T) {
 }
 
 func TestErrorOnLargerLong256(t *testing.T) {
-	buf := NewBuffer()
+	buf := qdb.NewBuffer()
 
 	bigVal, _ := big.NewInt(0).SetString("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
 	err := buf.Table(testTable).Long256Column("long256_col", bigVal).At(time.Time{}, false)
@@ -319,31 +340,31 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 	}{
 		{
 			"string column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Table("awesome_table").StringColumn("str", "abc").Symbol("sym", "abc").At(time.Time{}, false)
 			},
 		},
 		{
 			"boolean column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Table("awesome_table").BoolColumn("bool", true).Symbol("sym", "abc").At(time.Time{}, false)
 			},
 		},
 		{
 			"integer column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Table("awesome_table").Int64Column("int", 42).Symbol("sym", "abc").At(time.Time{}, false)
 			},
 		},
 		{
 			"float column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Table("awesome_table").Float64Column("float", 4.2).Symbol("sym", "abc").At(time.Time{}, false)
 			},
 		},
 		{
 			"timestamp column",
-			func(s *Buffer) error {
+			func(s *qdb.Buffer) error {
 				return s.Table("awesome_table").TimestampColumn("timestamp", time.UnixMicro(42)).Symbol("sym", "abc").At(time.Time{}, false)
 			},
 		},
@@ -351,7 +372,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := NewBuffer()
+			buf := qdb.NewBuffer()
 
 			err := tc.writerFn(&buf)
 
@@ -363,7 +384,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 }
 
 func TestInvalidMessageGetsDiscarded(t *testing.T) {
-	buf := NewBuffer()
+	buf := qdb.NewBuffer()
 
 	// Write a valid message.
 	err := buf.Table(testTable).StringColumn("foo", "bar").At(time.Time{}, false)

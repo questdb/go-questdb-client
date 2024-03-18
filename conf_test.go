@@ -22,20 +22,21 @@
  *
  ******************************************************************************/
 
-package conf
+package questdb_test
 
 import (
 	"fmt"
 	"testing"
 	"time"
 
+	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 )
 
 type configTestCase struct {
 	name                   string
 	config                 string
-	expected               ConfigData
+	expected               qdb.ConfigData
 	expectedErrMsgContains string
 }
 
@@ -55,7 +56,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "http and ipv4 address",
 			config: fmt.Sprintf("http::addr=%s", addr),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr": addr,
@@ -65,7 +66,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "http and ipv6 address",
 			config: "http::addr=::1;",
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr": "::1",
@@ -75,7 +76,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "tcp and address",
 			config: fmt.Sprintf("tcp::addr=%s", addr),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "tcp",
 				KeyValuePairs: map[string]string{
 					"addr": addr,
@@ -85,7 +86,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "http and username/password",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=%s", addr, user, pass),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr": addr,
@@ -97,7 +98,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "http and token (with trailing ';')",
 			config: fmt.Sprintf("http::addr=%s;token=%s;", addr, token),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr":  addr,
@@ -108,7 +109,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "tcp with key and user",
 			config: fmt.Sprintf("tcp::addr=%s;token=%s;user=%s", addr, token, user),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "tcp",
 				KeyValuePairs: map[string]string{
 					"addr":  addr,
@@ -120,7 +121,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "https with min_throughput",
 			config: fmt.Sprintf("https::addr=%s;min_throughput=%d", addr, min_throughput),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "https",
 				KeyValuePairs: map[string]string{
 					"addr":           addr,
@@ -131,7 +132,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "https with min_throughput, init_buf_size and tls_verify=unsafe_off",
 			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;init_buf_size=%d;tls_verify=unsafe_off", addr, min_throughput, 1024),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "https",
 				KeyValuePairs: map[string]string{
 					"addr":           addr,
@@ -144,7 +145,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "tcps with tls_verify=unsafe_off",
 			config: fmt.Sprintf("tcps::addr=%s;tls_verify=unsafe_off", addr),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "tcps",
 				KeyValuePairs: map[string]string{
 					"addr":       addr,
@@ -156,7 +157,7 @@ func TestParserHappyCases(t *testing.T) {
 			name: "http with min_throughput, request_timeout, and retry_timeout",
 			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;request_timeout=%d;retry_timeout=%d",
 				addr, min_throughput, request_timeout.Milliseconds(), retry_timeout.Milliseconds()),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr":            addr,
@@ -169,7 +170,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "tcp with tls_verify=on",
 			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on", addr),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "tcp",
 				KeyValuePairs: map[string]string{
 					"addr":       addr,
@@ -180,7 +181,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "password with an escaped semicolon",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word", addr, user),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr": addr,
@@ -192,7 +193,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "password with an escaped semicolon (ending with a ';')",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word;", addr, user),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr": addr,
@@ -204,7 +205,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "password with a trailing semicolon",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=password;;;", addr, user),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr": addr,
@@ -216,7 +217,7 @@ func TestParserHappyCases(t *testing.T) {
 		{
 			name:   "equal sign in password",
 			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass=word", addr, user),
-			expected: ConfigData{
+			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
 					"addr": addr,
@@ -228,18 +229,14 @@ func TestParserHappyCases(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-
-			actual, err := ParseConfigString(tc.config)
+			actual, err := qdb.ParseConfigString(tc.config)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expected, actual)
-
 		})
-
 	}
-
 }
-func TestParserPathologicalCases(t *testing.T) {
 
+func TestParserPathologicalCases(t *testing.T) {
 	testCases := []configTestCase{
 		{
 			name:                   "empty config",
@@ -270,14 +267,11 @@ func TestParserPathologicalCases(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-
-			_, err := ParseConfigString(tc.config)
-			var expected *ConfigStrParseError
+			_, err := qdb.ParseConfigString(tc.config)
+			var expected *qdb.InvalidConfigStrError
 			assert.Error(t, err)
 			assert.ErrorAs(t, err, &expected)
 			assert.Contains(t, err.Error(), tc.expectedErrMsgContains)
-
 		})
-
 	}
 }

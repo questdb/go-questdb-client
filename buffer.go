@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package buffer
+package questdb
 
 import (
 	"bytes"
@@ -45,10 +45,10 @@ const (
 	DefaultFileNameLimit  = 127
 )
 
-// Buffer is a wrapper on top of bytes.Buffer. It extends the
+// buffer is a wrapper on top of bytes.Buffer. It extends the
 // original struct with methods for writing int64 and float64
 // numbers without unnecessary allocations.
-type Buffer struct {
+type buffer struct {
 	bytes.Buffer
 
 	BufCap        int
@@ -62,52 +62,47 @@ type Buffer struct {
 	msgCount   int
 }
 
-// NewBuffer initializes a Buffer with default values
-func NewBuffer() Buffer {
-	return Buffer{
+// newBuffer initializes a Buffer with default values
+func newBuffer() buffer {
+	return buffer{
 		BufCap:        DefaultBufferCapacity,
 		FileNameLimit: DefaultFileNameLimit,
 	}
 }
 
 // HasTable returns true if a table name was provided to the buffer
-func (b *Buffer) HasTable() bool {
+func (b *buffer) HasTable() bool {
 	return b.hasTable
 }
 
 // HasTags returns true if a symbol column has been written to the buffer
-func (b *Buffer) HasTags() bool {
+func (b *buffer) HasTags() bool {
 	return b.hasTags
 }
 
 // HasFields returns true if a non-symbol column has been written to the buffer
-func (b *Buffer) HasFields() bool {
+func (b *buffer) HasFields() bool {
 	return b.hasFields
 }
 
 // LastErr stores the most recent error encountered by the buffer
-func (b *Buffer) LastErr() error {
+func (b *buffer) LastErr() error {
 	return b.lastErr
 }
 
 // ClearLastErr sets the internal lastErr field to nil
-func (b *Buffer) ClearLastErr() {
+func (b *buffer) ClearLastErr() {
 	b.lastErr = nil
 }
 
-// MsgCount returns the number of buffered messages
-func (b *Buffer) MsgCount() int {
-	return b.msgCount
-}
-
-func (b *Buffer) writeInt(i int64) {
+func (b *buffer) writeInt(i int64) {
 	// We need up to 20 bytes to fit an int64, including a sign.
 	var a [20]byte
 	s := strconv.AppendInt(a[0:0], i, 10)
 	b.Write(s)
 }
 
-func (b *Buffer) writeFloat(f float64) {
+func (b *buffer) writeFloat(f float64) {
 	if math.IsNaN(f) {
 		b.WriteString("NaN")
 		return
@@ -125,7 +120,7 @@ func (b *Buffer) writeFloat(f float64) {
 }
 
 // writeBigInt writes a bigint value to the buffer
-func (b *Buffer) writeBigInt(i *big.Int) {
+func (b *buffer) writeBigInt(i *big.Int) {
 	// We need up to 64 bytes to fit an unsigned 256-bit number.
 	var a [64]byte
 	s := i.Append(a[0:0], 16)
@@ -135,7 +130,7 @@ func (b *Buffer) writeBigInt(i *big.Int) {
 // WriteTo wraps the built-in bytes.Buffer.WriteTo method
 // and writes the contents of the buffer to the provided
 // io.Writer
-func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
+func (b *buffer) WriteTo(w io.Writer) (int64, error) {
 	n, err := b.Buffer.WriteTo(w)
 	if err != nil {
 		b.lastMsgPos -= int(n)
@@ -146,7 +141,7 @@ func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
 	return n, nil
 }
 
-func (buf *Buffer) writeTableName(str string) error {
+func (buf *buffer) writeTableName(str string) error {
 	if str == "" {
 		return fmt.Errorf("table name cannot be empty: %w", ErrInvalidMsg)
 	}
@@ -246,7 +241,7 @@ func illegalTableNameChar(ch byte) bool {
 	return false
 }
 
-func (buf *Buffer) writeColumnName(str string) error {
+func (buf *buffer) writeColumnName(str string) error {
 	if str == "" {
 		return fmt.Errorf("column name cannot be empty: %w", ErrInvalidMsg)
 	}
@@ -346,7 +341,7 @@ func illegalColumnNameChar(ch byte) bool {
 	return false
 }
 
-func (buf *Buffer) writeStrValue(str string, quoted bool) error {
+func (buf *buffer) writeStrValue(str string, quoted bool) error {
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
 	for i := 0; i < len(str); i++ {
@@ -380,7 +375,7 @@ func (buf *Buffer) writeStrValue(str string, quoted bool) error {
 	return nil
 }
 
-func (b *Buffer) prepareForField() bool {
+func (b *buffer) prepareForField() bool {
 	if b.lastErr != nil {
 		return false
 	}
@@ -396,12 +391,12 @@ func (b *Buffer) prepareForField() bool {
 	return true
 }
 
-func (b *Buffer) DiscardPendingMsg() {
+func (b *buffer) DiscardPendingMsg() {
 	b.Truncate(b.lastMsgPos)
 	b.resetMsgFlags()
 }
 
-func (b *Buffer) resetMsgFlags() {
+func (b *buffer) resetMsgFlags() {
 	b.hasTable = false
 	b.hasTags = false
 	b.hasFields = false
@@ -409,7 +404,7 @@ func (b *Buffer) resetMsgFlags() {
 
 // Messages returns a copy of accumulated ILP messages that are not
 // flushed to the TCP connection yet. Useful for debugging purposes.
-func (b *Buffer) Messages() string {
+func (b *buffer) Messages() string {
 	return b.String()
 }
 
@@ -419,7 +414,7 @@ func (b *Buffer) Messages() string {
 // Table name cannot contain any of the following characters:
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
-func (b *Buffer) Table(name string) *Buffer {
+func (b *buffer) Table(name string) *buffer {
 	if b.lastErr != nil {
 		return b
 	}
@@ -441,7 +436,7 @@ func (b *Buffer) Table(name string) *Buffer {
 // Symbol name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) Symbol(name, val string) *Buffer {
+func (b *buffer) Symbol(name, val string) *buffer {
 	if b.lastErr != nil {
 		return b
 	}
@@ -473,7 +468,7 @@ func (b *Buffer) Symbol(name, val string) *Buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) Int64Column(name string, val int64) *Buffer {
+func (b *buffer) Int64Column(name string, val int64) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -497,7 +492,7 @@ func (b *Buffer) Int64Column(name string, val int64) *Buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) Long256Column(name string, val *big.Int) *Buffer {
+func (b *buffer) Long256Column(name string, val *big.Int) *buffer {
 	if val.Sign() < 0 {
 		if b.lastErr != nil {
 			return b
@@ -537,7 +532,7 @@ func (b *Buffer) Long256Column(name string, val *big.Int) *Buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) TimestampColumn(name string, ts time.Time) *Buffer {
+func (b *buffer) TimestampColumn(name string, ts time.Time) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -558,7 +553,7 @@ func (b *Buffer) TimestampColumn(name string, ts time.Time) *Buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) Float64Column(name string, val float64) *Buffer {
+func (b *buffer) Float64Column(name string, val float64) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -577,7 +572,7 @@ func (b *Buffer) Float64Column(name string, val float64) *Buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) StringColumn(name, val string) *Buffer {
+func (b *buffer) StringColumn(name, val string) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -601,7 +596,7 @@ func (b *Buffer) StringColumn(name, val string) *Buffer {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (b *Buffer) BoolColumn(name string, val bool) *Buffer {
+func (b *buffer) BoolColumn(name string, val bool) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -624,7 +619,7 @@ func (b *Buffer) BoolColumn(name string, val bool) *Buffer {
 //
 // If the underlying buffer reaches configured capacity, this
 // method also sends the accumulated messages.
-func (b *Buffer) At(ts time.Time, sendTs bool) error {
+func (b *buffer) At(ts time.Time, sendTs bool) error {
 	err := b.lastErr
 	b.lastErr = nil
 	if err != nil {

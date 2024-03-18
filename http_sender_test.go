@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package http
+package questdb_test
 
 import (
 	"context"
@@ -32,23 +32,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/questdb/go-questdb-client/v3/pkg/test/utils"
+	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 )
 
-const (
-	testTable   = "my_test_table"
-	networkName = "test-network-v3"
-)
-
-type configTestCase struct {
+type httpConfigTestCase struct {
 	name                   string
 	config                 string
-	expectedOpts           []LineSenderOption
+	expectedOpts           []qdb.HttpLineSenderOption
 	expectedErrMsgContains string
 }
 
-func TestHappyCasesFromConf(t *testing.T) {
+func TestHttpHappyCasesFromConf(t *testing.T) {
 	var (
 		addr            = "localhost:1111"
 		user            = "test-user"
@@ -59,62 +54,62 @@ func TestHappyCasesFromConf(t *testing.T) {
 		retry_timeout   = time.Second * 99
 	)
 
-	testCases := []configTestCase{
+	testCases := []httpConfigTestCase{
 		{
 			name: "request_timeout and retry_timeout milli conversion",
 			config: fmt.Sprintf("http::addr=%s;request_timeout=%d;retry_timeout=%d",
 				addr, request_timeout.Milliseconds(), retry_timeout.Milliseconds()),
-			expectedOpts: []LineSenderOption{
-				WithAddress(addr),
-				WithRequestTimeout(request_timeout),
-				WithRetryTimeout(retry_timeout),
+			expectedOpts: []qdb.HttpLineSenderOption{
+				qdb.WithHttpAddress(addr),
+				qdb.WithHttpRequestTimeout(request_timeout),
+				qdb.WithHttpRetryTimeout(retry_timeout),
 			},
 		},
 		{
 			name: "pass before user",
 			config: fmt.Sprintf("http::addr=%s;pass=%s;user=%s",
 				addr, pass, user),
-			expectedOpts: []LineSenderOption{
-				WithAddress(addr),
-				WithBasicAuth(user, pass),
+			expectedOpts: []qdb.HttpLineSenderOption{
+				qdb.WithHttpAddress(addr),
+				qdb.WithHttpBasicAuth(user, pass),
 			},
 		},
 		{
 			name: "min_throughput",
 			config: fmt.Sprintf("http::addr=%s;min_throughput=%d",
 				addr, min_throughput),
-			expectedOpts: []LineSenderOption{
-				WithAddress(addr),
-				WithMinThroughput(min_throughput),
+			expectedOpts: []qdb.HttpLineSenderOption{
+				qdb.WithHttpAddress(addr),
+				qdb.WithHttpMinThroughput(min_throughput),
 			},
 		},
 		{
 			name: "bearer token",
 			config: fmt.Sprintf("http::addr=%s;token=%s",
 				addr, token),
-			expectedOpts: []LineSenderOption{
-				WithAddress(addr),
-				WithBearerToken(token),
+			expectedOpts: []qdb.HttpLineSenderOption{
+				qdb.WithHttpAddress(addr),
+				qdb.WithHttpBearerToken(token),
 			},
 		},
 		{
 			name: "auto flush",
 			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000",
 				addr),
-			expectedOpts: []LineSenderOption{
-				WithAddress(addr),
-				WithAutoFlushRows(100),
-				WithAutoFlushInterval(1000),
+			expectedOpts: []qdb.HttpLineSenderOption{
+				qdb.WithHttpAddress(addr),
+				qdb.WithHttpAutoFlushRows(100),
+				qdb.WithHttpAutoFlushInterval(1000),
 			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			actual, err := LineSenderFromConf(context.Background(), tc.config)
+			actual, err := qdb.HttpLineSenderFromConf(context.Background(), tc.config)
 			assert.NoError(t, err)
 
-			expected, err := NewLineSender(tc.expectedOpts...)
+			expected, err := qdb.NewHttpLineSender(tc.expectedOpts...)
 			assert.NoError(t, err)
 			assert.Equal(t, expected, actual)
 
@@ -124,8 +119,8 @@ func TestHappyCasesFromConf(t *testing.T) {
 	}
 }
 
-func TestPathologicalCasesFromConf(t *testing.T) {
-	testCases := []configTestCase{
+func TestHttpPathologicalCasesFromConf(t *testing.T) {
+	testCases := []httpConfigTestCase{
 		{
 			name:                   "empty config",
 			config:                 "",
@@ -175,20 +170,20 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := LineSenderFromConf(context.Background(), tc.config)
+			_, err := qdb.HttpLineSenderFromConf(context.Background(), tc.config)
 			assert.ErrorContains(t, err, tc.expectedErrMsgContains)
 		})
 	}
 }
 
-func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
+func TestHttpErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
@@ -196,35 +191,35 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	err = sender.Flush(ctx)
 
 	assert.ErrorContains(t, err, "pending ILP message must be finalized with At or AtNow before calling Flush")
-	assert.Empty(t, sender.buf.Messages())
+	assert.Empty(t, sender.Messages())
 }
 
 func TestNoOpOnFlushWhenNoMessagesAreWritten(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
 	err = sender.Flush(ctx)
 
 	assert.NoError(t, err)
-	assert.Empty(t, sender.buf.Messages())
+	assert.Empty(t, sender.Messages())
 }
 
 func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
@@ -246,14 +241,14 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 func TestRetryOn500(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.Returning500)
+	srv, err := NewTestHttpServer(Returning500)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(
-		WithAddress(srv.Addr()),
-		WithRequestTimeout(10*time.Millisecond),
-		WithRetryTimeout(50*time.Millisecond),
+	sender, err := qdb.NewHttpLineSender(
+		qdb.WithHttpAddress(srv.Addr()),
+		qdb.WithHttpRequestTimeout(10*time.Millisecond),
+		qdb.WithHttpRetryTimeout(50*time.Millisecond),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
@@ -263,7 +258,7 @@ func TestRetryOn500(t *testing.T) {
 		return
 	}
 	err = sender.Flush(ctx)
-	retryErr := &RetryTimeoutError{}
+	retryErr := &qdb.RetryTimeoutError{}
 	assert.ErrorAs(t, err, &retryErr)
 	assert.ErrorContains(t, retryErr.LastErr, "500")
 
@@ -272,14 +267,14 @@ func TestRetryOn500(t *testing.T) {
 func TestNoRetryOn400FromProxy(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.Returning403)
+	srv, err := NewTestHttpServer(Returning403)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(
-		WithAddress(srv.Addr()),
-		WithRequestTimeout(10*time.Millisecond),
-		WithRetryTimeout(50*time.Millisecond),
+	sender, err := qdb.NewHttpLineSender(
+		qdb.WithHttpAddress(srv.Addr()),
+		qdb.WithHttpRequestTimeout(10*time.Millisecond),
+		qdb.WithHttpRetryTimeout(50*time.Millisecond),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
@@ -289,7 +284,7 @@ func TestNoRetryOn400FromProxy(t *testing.T) {
 		return
 	}
 	err = sender.Flush(ctx)
-	retryTimeoutErr := &RetryTimeoutError{}
+	retryTimeoutErr := &qdb.RetryTimeoutError{}
 	assert.False(t, errors.As(err, &retryTimeoutErr))
 	assert.ErrorContains(t, err, "Forbidden")
 }
@@ -297,14 +292,14 @@ func TestNoRetryOn400FromProxy(t *testing.T) {
 func TestNoRetryOn400FromServer(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.Returning404)
+	srv, err := NewTestHttpServer(Returning404)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(
-		WithAddress(srv.Addr()),
-		WithRequestTimeout(10*time.Millisecond),
-		WithRetryTimeout(50*time.Millisecond),
+	sender, err := qdb.NewHttpLineSender(
+		qdb.WithHttpAddress(srv.Addr()),
+		qdb.WithHttpRequestTimeout(10*time.Millisecond),
+		qdb.WithHttpRetryTimeout(50*time.Millisecond),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
@@ -314,9 +309,9 @@ func TestNoRetryOn400FromServer(t *testing.T) {
 		return
 	}
 	err = sender.Flush(ctx)
-	httpErr := &HttpError{}
+	httpErr := &qdb.HttpError{}
 	assert.ErrorAs(t, err, &httpErr)
-	assert.Equal(t, http.StatusNotFound, httpErr.httpStatus)
+	assert.Equal(t, http.StatusNotFound, httpErr.HttpStatus())
 	assert.Equal(t, "Not Found", httpErr.Message)
 	assert.Equal(t, 42, httpErr.Line)
 }
@@ -325,13 +320,13 @@ func TestRowBasedAutoFlush(t *testing.T) {
 	ctx := context.Background()
 	autoFlushRows := 10
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(
-		WithAddress(srv.Addr()),
-		WithAutoFlushRows(autoFlushRows),
+	sender, err := qdb.NewHttpLineSender(
+		qdb.WithHttpAddress(srv.Addr()),
+		qdb.WithHttpAutoFlushRows(autoFlushRows),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
@@ -342,27 +337,27 @@ func TestRowBasedAutoFlush(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	assert.Equal(t, autoFlushRows-1, sender.buf.MsgCount())
+	assert.Equal(t, autoFlushRows-1, sender.MsgCount())
 
 	// Send one additional message and ensure that all are flushed
 	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 	assert.NoError(t, err)
 
-	assert.Equal(t, 0, sender.buf.MsgCount())
+	assert.Equal(t, 0, sender.MsgCount())
 }
 
 func TestTimeBasedAutoFlush(t *testing.T) {
 	ctx := context.Background()
 	autoFlushInterval := 10 * time.Millisecond
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(
-		WithAddress(srv.Addr()),
-		WithAutoFlushRows(1000),
-		WithAutoFlushInterval(autoFlushInterval),
+	sender, err := qdb.NewHttpLineSender(
+		qdb.WithHttpAddress(srv.Addr()),
+		qdb.WithHttpAutoFlushRows(1000),
+		qdb.WithHttpAutoFlushInterval(autoFlushInterval),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
@@ -370,7 +365,7 @@ func TestTimeBasedAutoFlush(t *testing.T) {
 	// Send a message and ensure it's buffered
 	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 	assert.NoError(t, err)
-	assert.Equal(t, 1, sender.buf.MsgCount())
+	assert.Equal(t, 1, sender.MsgCount())
 
 	time.Sleep(2 * autoFlushInterval)
 
@@ -378,7 +373,7 @@ func TestTimeBasedAutoFlush(t *testing.T) {
 	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 	assert.NoError(t, err)
 
-	assert.Equal(t, 0, sender.buf.MsgCount())
+	assert.Equal(t, 0, sender.MsgCount())
 }
 
 func TestNoFlushWhenAutoFlushDisabled(t *testing.T) {
@@ -386,17 +381,17 @@ func TestNoFlushWhenAutoFlushDisabled(t *testing.T) {
 	autoFlushRows := 10
 	autoFlushInterval := time.Duration(autoFlushRows-1) * time.Millisecond
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
 	// opts are processed sequentially, so AutoFlushDisabled will
 	// override AutoFlushRows
-	sender, err := NewLineSender(
-		WithAddress(srv.Addr()),
-		WithAutoFlushRows(autoFlushRows),
-		WithAutoFlushInterval(autoFlushInterval),
-		WithAutoFlushDisabled(),
+	sender, err := qdb.NewHttpLineSender(
+		qdb.WithHttpAddress(srv.Addr()),
+		qdb.WithHttpAutoFlushRows(autoFlushRows),
+		qdb.WithHttpAutoFlushInterval(autoFlushInterval),
+		qdb.WithHttpAutoFlushDisabled(),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
@@ -408,23 +403,23 @@ func TestNoFlushWhenAutoFlushDisabled(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	assert.Equal(t, autoFlushRows+1, sender.buf.MsgCount())
+	assert.Equal(t, autoFlushRows+1, sender.MsgCount())
 }
 
 func TestSenderDoubleClose(t *testing.T) {
 	ctx := context.Background()
 	autoFlushRows := 10
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
 	// opts are processed sequentially, so AutoFlushDisabled will
 	// override AutoFlushRows
-	sender, err := NewLineSender(
-		WithAddress(srv.Addr()),
-		WithAutoFlushRows(autoFlushRows),
-		WithAutoFlushDisabled(),
+	sender, err := qdb.NewHttpLineSender(
+		qdb.WithHttpAddress(srv.Addr()),
+		qdb.WithHttpAutoFlushRows(autoFlushRows),
+		qdb.WithHttpAutoFlushDisabled(),
 	)
 	assert.NoError(t, err)
 
@@ -438,11 +433,11 @@ func TestSenderDoubleClose(t *testing.T) {
 func TestErrorOnFlushWhenSenderIsClosed(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.Addr()))
 	assert.NoError(t, err)
 	err = sender.Close(ctx)
 	assert.NoError(t, err)
@@ -456,52 +451,52 @@ func TestErrorOnFlushWhenSenderIsClosed(t *testing.T) {
 func TestAutoFlushWhenSenderIsClosed(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.Addr()))
 	assert.NoError(t, err)
 
 	err = sender.Table(testTable).Symbol("abc", "def").AtNow(ctx)
 	assert.NoError(t, err)
-	assert.NotEmpty(t, sender.buf.Messages())
+	assert.NotEmpty(t, sender.Messages())
 
 	err = sender.Close(ctx)
 	assert.NoError(t, err)
-	assert.Empty(t, sender.buf.Messages())
+	assert.Empty(t, sender.Messages())
 }
 
 func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(
-		WithAddress(srv.Addr()),
-		WithAutoFlushDisabled(),
+	sender, err := qdb.NewHttpLineSender(
+		qdb.WithHttpAddress(srv.Addr()),
+		qdb.WithHttpAutoFlushDisabled(),
 	)
 	assert.NoError(t, err)
 
 	err = sender.Table(testTable).Symbol("abc", "def").AtNow(ctx)
 	assert.NoError(t, err)
-	assert.NotEmpty(t, sender.buf.Messages())
+	assert.NotEmpty(t, sender.Messages())
 
 	err = sender.Close(ctx)
 	assert.NoError(t, err)
-	assert.NotEmpty(t, sender.buf.Messages())
+	assert.NotEmpty(t, sender.Messages())
 }
 
 func TestBufferClearAfterFlush(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.SendToBackChannel)
+	srv, err := NewTestHttpServer(SendToBackChannel)
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.Addr()))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
@@ -511,8 +506,8 @@ func TestBufferClearAfterFlush(t *testing.T) {
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
 
-	utils.ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,abc=def", testTable)})
-	assert.Zero(t, sender.buf.Len())
+	ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,abc=def", testTable)})
+	assert.Zero(t, sender.BufLen())
 
 	err = sender.Table(testTable).Symbol("ghi", "jkl").AtNow(ctx)
 	assert.NoError(t, err)
@@ -520,41 +515,35 @@ func TestBufferClearAfterFlush(t *testing.T) {
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
 
-	utils.ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,ghi=jkl", testTable)})
+	ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,ghi=jkl", testTable)})
 }
 
 func TestCustomTransportAndTlsInit(t *testing.T) {
 	ctx := context.Background()
 
-	s1, err := NewLineSender()
+	s1, err := qdb.NewHttpLineSender()
 	assert.NoError(t, err)
 
-	s2, err := NewLineSender(
-		WithTls(),
-	)
+	s2, err := qdb.NewHttpLineSender(qdb.WithHttpTls())
 	assert.NoError(t, err)
 
-	s3, err := NewLineSender(
-		WithTlsInsecureSkipVerify(),
-	)
+	s3, err := qdb.NewHttpLineSender(qdb.WithHttpTlsInsecureSkipVerify())
 	assert.NoError(t, err)
 
-	_, err = NewLineSender(
-		WithTls(),
-	)
+	_, err = qdb.NewHttpLineSender(qdb.WithHttpTls())
 	assert.ErrorContains(t, err, "once InsecureSkipVerify is used with the default")
 
 	transport := http.Transport{}
-	s4, err := NewLineSender(
-		WithHttpTransport(&transport),
-		WithTls(),
+	s4, err := qdb.NewHttpLineSender(
+		qdb.WithHttpTransport(&transport),
+		qdb.WithHttpTls(),
 	)
 	assert.NoError(t, err)
 
 	// s1, s2, and s3 all have successfully instantiated a sender
 	// using the global transport and should be registered in the
 	// global transport client count
-	assert.Equal(t, int64(3), clientCt.Load())
+	assert.Equal(t, int64(3), qdb.ClientCt.Load())
 
 	// Closing the client with the custom transport should not impact
 	// the global transport client count
@@ -564,17 +553,17 @@ func TestCustomTransportAndTlsInit(t *testing.T) {
 	s1.Close(ctx)
 	s2.Close(ctx)
 	s3.Close(ctx)
-	assert.Equal(t, int64(0), clientCt.Load())
+	assert.Equal(t, int64(0), qdb.ClientCt.Load())
 }
 
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(b, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.Addr()))
 	assert.NoError(b, err)
 
 	b.ResetTimer()
@@ -593,17 +582,16 @@ func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 		sender.Flush(ctx)
 		sender.Close(ctx)
 	}
-
 }
 
 func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
+	srv, err := NewTestHttpServer(ReadAndDiscard)
 	assert.NoError(b, err)
 	defer srv.Close()
 
-	sender, err := NewLineSender(WithAddress(srv.Addr()))
+	sender, err := qdb.NewHttpLineSender(qdb.WithHttpAddress(srv.Addr()))
 	assert.NoError(b, err)
 
 	b.ResetTimer()
@@ -620,5 +608,4 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	}
 	sender.Flush(ctx)
 	sender.Close(ctx)
-
 }

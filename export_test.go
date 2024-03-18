@@ -22,20 +22,30 @@
  *
  ******************************************************************************/
 
-package conf
+package questdb
 
-import "fmt"
+import "sync/atomic"
 
-type ConfigStrParseError struct {
-	msg string
+type (
+	Buffer        = buffer
+	ConfigData    = configData
+	TcpLineSender = tcpLineSender
+)
+
+var (
+	ClientCt *atomic.Int64 = &clientCt
+)
+
+func NewBuffer() Buffer {
+	return newBuffer()
 }
 
-func (e *ConfigStrParseError) Error() string {
-	return fmt.Sprintf("Error parsing config string: %q", e.msg)
+func OptsFromConf(config string) ([]TcpLineSenderOption, error) {
+	return optsFromConf(config)
 }
 
-func NewConfigStrParseError(msg string, args ...interface{}) *ConfigStrParseError {
-	return &ConfigStrParseError{
-		msg: fmt.Sprintf(msg, args...),
+func NewEmptyTcpLineSender() *TcpLineSender {
+	return &TcpLineSender{
+		buf: newBuffer(),
 	}
 }

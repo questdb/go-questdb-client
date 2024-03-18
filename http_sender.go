@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package http
+package questdb
 
 import (
 	"bytes"
@@ -39,22 +39,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/questdb/go-questdb-client/v3/pkg/buffer"
-	"github.com/questdb/go-questdb-client/v3/pkg/conf"
-)
-
-type tlsMode int64
-
-const (
-	tlsDisabled           tlsMode = 0
-	tlsEnabled            tlsMode = 1
-	tlsInsecureSkipVerify tlsMode = 2
 )
 
 var (
 	// We use a shared http transport to pool connections
-	// across LineSenders
+	// across HttpLineSenders
 	globalTransport http.Transport = http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxConnsPerHost:       0,
@@ -66,21 +55,21 @@ var (
 		TLSClientConfig:       &tls.Config{},
 	}
 
-	// clientCt is used to track the number of open LineSenders
-	// If the clientCt reaches 0, meaning all LineSenders have been
+	// clientCt is used to track the number of open HttpLineSenders
+	// If the clientCt reaches 0, meaning all HttpLineSenders have been
 	// closed, the globalTransport closes all idle connections to
 	// free up resources
 	clientCt atomic.Int64
 )
 
-// LineSender allows you to insert rows into QuestDB by sending ILP
+// HttpLineSender allows you to insert rows into QuestDB by sending ILP
 // messages over HTTP(S).
 //
 // Each sender corresponds to a single HTTP client. All senders
 // utilize a global transport for connection pooling. A sender
 // should not be called concurrently by multiple goroutines.
-type LineSender struct {
-	buf buffer.Buffer
+type httpLineSender struct {
+	buf buffer
 
 	address string
 
@@ -106,20 +95,20 @@ type LineSender struct {
 	transport *http.Transport
 }
 
-// LineSenderOption defines line sender option.
-type LineSenderOption func(s *LineSender)
+// HttpLineSenderOption defines line sender option.
+type HttpLineSenderOption func(s *httpLineSender)
 
 // WithTls enables TLS connection encryption.
-func WithTls() LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpTls() HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.tlsMode = tlsEnabled
 	}
 }
 
 // WithBasicAuth sets a Basic authentication header for
 // ILP requests over HTTP.
-func WithBasicAuth(user, pass string) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpBasicAuth(user, pass string) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.user = user
 		s.pass = pass
 	}
@@ -127,8 +116,8 @@ func WithBasicAuth(user, pass string) LineSenderOption {
 
 // WithBearerToken sets a Bearer token Authentication header for
 // ILP requests.
-func WithBearerToken(token string) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpBearerToken(token string) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.token = token
 	}
 }
@@ -137,8 +126,8 @@ func WithBearerToken(token string) LineSenderOption {
 // to set the timeout of an ILP request. Defaults to 10 seconds.
 //
 // timeout = (request.len() / min_throughput) + request_timeout
-func WithRequestTimeout(timeout time.Duration) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpRequestTimeout(timeout time.Duration) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.requestTimeout = timeout
 	}
 }
@@ -147,8 +136,8 @@ func WithRequestTimeout(timeout time.Duration) LineSenderOption {
 // to set the timeout of an ILP request. Defaults to 100KiB/s.
 //
 // timeout = (request.len() / min_throughput) + request_timeout
-func WithMinThroughput(bytesPerSecond int) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpMinThroughput(bytesPerSecond int) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.minThroughputBytesPerSecond = bytesPerSecond
 	}
 }
@@ -158,24 +147,24 @@ func WithMinThroughput(bytesPerSecond int) LineSenderOption {
 //
 // Only network-related errors and certain 5xx response
 // codes are retryable.
-func WithRetryTimeout(t time.Duration) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpRetryTimeout(t time.Duration) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.retryTimeout = t
 	}
 }
 
 // WithInitBuffer size sets the desired initial buffer capacity
 // in bytes to be used when sending ILP messages. Defaults to 128KB.
-func WithInitBufferSize(sizeInBytes int) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpInitBufferSize(sizeInBytes int) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.buf.BufCap = sizeInBytes
 	}
 }
 
 // WithAddress sets address to connect to. Should be in the
 // "host:port" format. Defaults to "127.0.0.1:9000".
-func WithAddress(addr string) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpAddress(addr string) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.address = addr
 	}
 }
@@ -190,16 +179,16 @@ func WithAddress(addr string) LineSenderOption {
 // all subsequent clients may not use the WithTls option.
 // To avoid this, use WithHttpTransport to add a custom
 // transport to the Sender's http client.
-func WithTlsInsecureSkipVerify() LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpTlsInsecureSkipVerify() HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.tlsMode = tlsInsecureSkipVerify
 	}
 }
 
 // WithAutoFlushDisabled turns off auto-flushing behavior.
 // To send ILP messages, the user must call Flush().
-func WithAutoFlushDisabled() LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpAutoFlushDisabled() HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.autoFlushRows = 0
 		s.autoFlushInterval = 0
 	}
@@ -208,34 +197,34 @@ func WithAutoFlushDisabled() LineSenderOption {
 // WithAutoFlushRows sets the number of buffered rows that
 // must be breached in order to trigger an auto-flush.
 // Defaults to 75000.
-func WithAutoFlushRows(rows int) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpAutoFlushRows(rows int) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.autoFlushRows = rows
 	}
 }
 
 // WithAutoFlushInterval the interval at which the Sender
 // automatically flushes its buffer. Defaults to 1 second.
-func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
-	return func(s *LineSender) {
+func WithHttpAutoFlushInterval(interval time.Duration) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.autoFlushInterval = interval
 	}
 }
 
 // WithHttpTransport sets the client's http transport to the
 // passed pointer instead of the global transport. This can be
-// used for customizing the http transport used by the LineSender.
-func WithHttpTransport(t *http.Transport) LineSenderOption {
-	return func(s *LineSender) {
+// used for customizing the http transport used by the HttpLineSender.
+func WithHttpTransport(t *http.Transport) HttpLineSenderOption {
+	return func(s *httpLineSender) {
 		s.transport = t
 	}
 }
 
-// NewLineSender creates a new InfluxDB Line Protocol (ILP) sender. Each
+// NewHttpLineSender creates a new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single HTTP client. Sender should
 // not be called concurrently by multiple goroutines.
-func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
-	s := &LineSender{
+func NewHttpLineSender(opts ...HttpLineSenderOption) (*httpLineSender, error) {
+	s := &httpLineSender{
 		address:                     "127.0.0.1:9000",
 		minThroughputBytesPerSecond: 100 * 1024,
 		requestTimeout:              10 * time.Second,
@@ -243,7 +232,7 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 		autoFlushRows:               75000,
 		autoFlushInterval:           time.Second,
 
-		buf: buffer.NewBuffer(),
+		buf: newBuffer(),
 	}
 
 	for _, opt := range opts {
@@ -292,7 +281,7 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 	return s, nil
 }
 
-// LineSenderFromConf creates a LineSender using the QuestDB config string format.
+// HttpLineSenderFromConf creates a HttpLineSender using the QuestDB config string format.
 //
 // Example config string: "http::addr=localhost;username=joe;password=123;"
 //
@@ -321,12 +310,12 @@ func NewLineSender(opts ...LineSenderOption) (*LineSender, error) {
 // retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
 //
 // tls_verify: determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
-func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
+func HttpLineSenderFromConf(ctx context.Context, config string) (*httpLineSender, error) {
 	var (
 		user, pass, token string
 	)
 
-	data, err := conf.ParseConfigString(config)
+	data, err := ParseConfigString(config)
 	if err != nil {
 		return nil, err
 	}
@@ -335,90 +324,90 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
 	}
 
-	opts := make([]LineSenderOption, 0)
+	opts := make([]HttpLineSenderOption, 0)
 	for k, v := range data.KeyValuePairs {
 		switch strings.ToLower(k) {
 		case "addr":
-			opts = append(opts, WithAddress(v))
+			opts = append(opts, WithHttpAddress(v))
 		case "user":
 			user = v
 			if user != "" && pass != "" {
-				opts = append(opts, WithBasicAuth(user, pass))
+				opts = append(opts, WithHttpBasicAuth(user, pass))
 			}
 		case "pass":
 			pass = v
 			if user != "" && pass != "" {
-				opts = append(opts, WithBasicAuth(user, pass))
+				opts = append(opts, WithHttpBasicAuth(user, pass))
 			}
 		case "token":
 			token = v
-			opts = append(opts, WithBearerToken(token))
+			opts = append(opts, WithHttpBearerToken(token))
 		case "auto_flush":
 			if v == "off" {
-				opts = append(opts, WithAutoFlushDisabled())
+				opts = append(opts, WithHttpAutoFlushDisabled())
 			} else if v != "on" {
-				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not 'on' or 'off'", k, v)
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not 'on' or 'off'", k, v)
 			}
 		case "auto_flush_rows":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil || parsedVal < 1 {
-				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a positive int", k, v)
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a positive int", k, v)
 			}
-			opts = append(opts, WithAutoFlushRows(parsedVal))
+			opts = append(opts, WithHttpAutoFlushRows(parsedVal))
 		case "auto_flush_interval":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil || parsedVal < 1 {
-				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a positive int", k, v)
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a positive int", k, v)
 			}
-			opts = append(opts, WithAutoFlushInterval(time.Duration(parsedVal)))
+			opts = append(opts, WithHttpAutoFlushInterval(time.Duration(parsedVal)))
 		case "min_throughput", "init_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
-				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			switch k {
 			case "min_throughput":
-				opts = append(opts, WithMinThroughput(parsedVal))
+				opts = append(opts, WithHttpMinThroughput(parsedVal))
 			case "init_buf_size":
-				opts = append(opts, WithInitBufferSize(parsedVal))
+				opts = append(opts, WithHttpInitBufferSize(parsedVal))
 			default:
 				panic("add a case for " + k)
 			}
 		case "request_timeout", "retry_timeout":
 			timeout, err := strconv.Atoi(v)
 			if err != nil {
-				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 
 			timeoutDur := time.Duration(timeout * int(time.Millisecond))
 
 			switch k {
 			case "request_timeout":
-				opts = append(opts, WithRequestTimeout(timeoutDur))
+				opts = append(opts, WithHttpRequestTimeout(timeoutDur))
 			case "retry_timeout":
-				opts = append(opts, WithRetryTimeout(timeoutDur))
+				opts = append(opts, WithHttpRetryTimeout(timeoutDur))
 			default:
 				panic("add a case for " + k)
 			}
 		case "tls_verify":
 			switch v {
 			case "on":
-				opts = append(opts, WithTls())
+				opts = append(opts, WithHttpTls())
 			case "unsafe_off":
-				opts = append(opts, WithTlsInsecureSkipVerify())
+				opts = append(opts, WithHttpTlsInsecureSkipVerify())
 			default:
-				return nil, conf.NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
+				return nil, NewInvalidConfigStrError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
 			}
 		case "tls_roots":
-			return nil, conf.NewConfigStrParseError("tls_roots is not available in the go client")
+			return nil, NewInvalidConfigStrError("tls_roots is not available in the go client")
 		case "tls_roots_password":
-			return nil, conf.NewConfigStrParseError("tls_roots_password is not available in the go client")
+			return nil, NewInvalidConfigStrError("tls_roots_password is not available in the go client")
 		default:
-			return nil, conf.NewConfigStrParseError("unsupported option %q", k)
+			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}
 
 	}
-	return NewLineSender(opts...)
+	return NewHttpLineSender(opts...)
 }
 
 // Flush sends the accumulated messages via the underlying HTTP
@@ -430,11 +419,11 @@ func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error)
 // batches followed by a Flush call. Optimal batch size may vary
 // from one thousand to few thousand messages depending on
 // the message size.
-func (s *LineSender) Flush(ctx context.Context) error {
+func (s *httpLineSender) Flush(ctx context.Context) error {
 	return s.flush0(ctx, false)
 }
 
-func (s *LineSender) flush0(ctx context.Context, closing bool) error {
+func (s *httpLineSender) flush0(ctx context.Context, closing bool) error {
 	var (
 		req           *http.Request
 		retryInterval time.Duration
@@ -457,7 +446,7 @@ func (s *LineSender) flush0(ctx context.Context, closing bool) error {
 		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	}
 
-	if s.buf.MsgCount() == 0 {
+	if s.buf.msgCount == 0 {
 		return nil
 	}
 
@@ -515,7 +504,7 @@ func (s *LineSender) flush0(ctx context.Context, closing bool) error {
 	return err
 }
 
-func (s *LineSender) refreshFlushDeadline(err error) {
+func (s *httpLineSender) refreshFlushDeadline(err error) {
 	if s.autoFlushInterval > 0 {
 		if err != nil {
 			s.flushDeadline = time.Time{}
@@ -531,7 +520,7 @@ func (s *LineSender) refreshFlushDeadline(err error) {
 // Table name cannot contain any of the following characters:
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
-func (s *LineSender) Table(name string) *LineSender {
+func (s *httpLineSender) Table(name string) *httpLineSender {
 	s.buf.Table(name)
 	return s
 }
@@ -542,7 +531,7 @@ func (s *LineSender) Table(name string) *LineSender {
 // Symbol name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Symbol(name, val string) *LineSender {
+func (s *httpLineSender) Symbol(name, val string) *httpLineSender {
 	s.buf.Symbol(name, val)
 	return s
 }
@@ -553,7 +542,7 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Int64Column(name string, val int64) *LineSender {
+func (s *httpLineSender) Int64Column(name string, val int64) *httpLineSender {
 	s.buf.Int64Column(name, val)
 	return s
 }
@@ -567,7 +556,7 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
+func (s *httpLineSender) Long256Column(name string, val *big.Int) *httpLineSender {
 	s.buf.Long256Column(name, val)
 	return s
 }
@@ -578,7 +567,7 @@ func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
+func (s *httpLineSender) TimestampColumn(name string, ts time.Time) *httpLineSender {
 	s.buf.TimestampColumn(name, ts)
 	return s
 }
@@ -589,7 +578,7 @@ func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Float64Column(name string, val float64) *LineSender {
+func (s *httpLineSender) Float64Column(name string, val float64) *httpLineSender {
 	s.buf.Float64Column(name, val)
 	return s
 }
@@ -599,7 +588,7 @@ func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) StringColumn(name, val string) *LineSender {
+func (s *httpLineSender) StringColumn(name, val string) *httpLineSender {
 	s.buf.StringColumn(name, val)
 	return s
 }
@@ -609,7 +598,7 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
+func (s *httpLineSender) BoolColumn(name string, val bool) *httpLineSender {
 	s.buf.BoolColumn(name, val)
 	return s
 }
@@ -619,7 +608,7 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 //
 // If auto-flush is enabled, the client will flush any remaining buffered
 // messages before closing itself.
-func (s *LineSender) Close(ctx context.Context) error {
+func (s *httpLineSender) Close(ctx context.Context) error {
 	if s.closed {
 		return nil
 	}
@@ -649,7 +638,7 @@ func (s *LineSender) Close(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity or the
 // number of buffered messages exceeds the auto-flush trigger, this
 // method also sends the accumulated messages.
-func (s *LineSender) AtNow(ctx context.Context) error {
+func (s *httpLineSender) AtNow(ctx context.Context) error {
 	return s.At(ctx, time.Time{})
 }
 
@@ -661,7 +650,7 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 // method also sends the accumulated messages.
 //
 // If ts.IsZero(), no timestamp is sent to the server.
-func (s *LineSender) At(ctx context.Context, ts time.Time) error {
+func (s *httpLineSender) At(ctx context.Context, ts time.Time) error {
 	if s.closed {
 		return errors.New("cannot queue new messages on a closed LineSender")
 	}
@@ -676,7 +665,7 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 	}
 
 	// Check row count-based auto flush.
-	if s.buf.MsgCount() == s.autoFlushRows {
+	if s.buf.msgCount == s.autoFlushRows {
 		return s.Flush(ctx)
 	}
 	// Check time-based auto flush.
@@ -692,7 +681,7 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 }
 
 // makeRequest returns a boolean if we need to retry the request
-func (s *LineSender) makeRequest(ctx context.Context, req *http.Request) (bool, error) {
+func (s *httpLineSender) makeRequest(ctx context.Context, req *http.Request) (bool, error) {
 	// reqTimeout = ( request.len() / min_throughput ) + request_timeout
 	// nb: conversion from int to time.Duration is in milliseconds
 	reqTimeout := time.Duration(s.buf.Len()/s.minThroughputBytesPerSecond)*time.Second + s.requestTimeout
@@ -753,4 +742,20 @@ func isRetryableError(statusCode int) bool {
 	default:
 		return false
 	}
+}
+
+// Messages returns a copy of accumulated ILP messages that are not
+// flushed to the TCP connection yet. Useful for debugging purposes.
+func (s *httpLineSender) Messages() string {
+	return s.buf.Messages()
+}
+
+// MsgCount returns the number of buffered messages
+func (s *httpLineSender) MsgCount() int {
+	return s.buf.msgCount
+}
+
+// BufLen returns the number of bytes written to the buffer.
+func (s *httpLineSender) BufLen() int {
+	return s.buf.Len()
 }

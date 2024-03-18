@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package tcp
+package questdb
 
 import (
 	"bufio"
@@ -41,9 +41,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/questdb/go-questdb-client/v3/pkg/buffer"
-	"github.com/questdb/go-questdb-client/v3/pkg/conf"
 )
 
 type tlsMode int64
@@ -54,13 +51,13 @@ const (
 	tlsInsecureSkipVerify tlsMode = 2
 )
 
-// LineSender allows you to insert rows into QuestDB by sending ILP
+// TcpLineSender allows you to insert rows into QuestDB by sending ILP
 // messages over TCP(S).
 //
 // Each sender corresponds to a single TCP connection. A sender
 // should not be called concurrently by multiple goroutines.
-type LineSender struct {
-	buf buffer.Buffer
+type tcpLineSender struct {
+	buf buffer
 
 	address string
 
@@ -73,27 +70,27 @@ type LineSender struct {
 }
 
 // LineSenderOption defines line sender option.
-type LineSenderOption func(*LineSender)
+type TcpLineSenderOption func(*tcpLineSender)
 
 // WithAddress sets address to connect to. Should be in the
 // "host:port" format. Defaults to "127.0.0.1:9009".
-func WithAddress(address string) LineSenderOption {
-	return func(s *LineSender) {
+func WithTcpAddress(address string) TcpLineSenderOption {
+	return func(s *tcpLineSender) {
 		s.address = address
 	}
 }
 
 // WithAuth sets token (private key) used for ILP authentication.
-func WithAuth(tokenId, token string) LineSenderOption {
-	return func(s *LineSender) {
+func WithTcpAuth(tokenId, token string) TcpLineSenderOption {
+	return func(s *tcpLineSender) {
 		s.keyId = tokenId
 		s.key = token
 	}
 }
 
 // WithTls enables TLS connection encryption.
-func WithTls() LineSenderOption {
-	return func(s *LineSender) {
+func WithTcpTls() TcpLineSenderOption {
+	return func(s *tcpLineSender) {
 		s.tlsMode = tlsEnabled
 	}
 }
@@ -102,8 +99,8 @@ func WithTls() LineSenderOption {
 // but skips server certificate verification. Useful in test
 // environments with self-signed certificates. Do not use in
 // production environments.
-func WithTlsInsecureSkipVerify() LineSenderOption {
-	return func(s *LineSender) {
+func WithTcpTlsInsecureSkipVerify() TcpLineSenderOption {
+	return func(s *tcpLineSender) {
 		s.tlsMode = tlsInsecureSkipVerify
 	}
 }
@@ -114,8 +111,8 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 // This setting is a soft limit, i.e. the underlying buffer may
 // grow larger than the provided value, but will shrink on a
 // At, AtNow, or Flush call.
-func WithBufferCapacity(capacity int) LineSenderOption {
-	return func(s *LineSender) {
+func WithTcpBufferCapacity(capacity int) TcpLineSenderOption {
+	return func(s *tcpLineSender) {
 		if capacity > 0 {
 			s.buf.BufCap = capacity
 		}
@@ -126,18 +123,18 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 // allowed by the server. Affects maximum table and column name
 // lengths accepted by the sender. Should be set to the same value
 // as on the server. Defaults to 127.
-func WithFileNameLimit(limit int) LineSenderOption {
-	return func(s *LineSender) {
+func WithTcpFileNameLimit(limit int) TcpLineSenderOption {
+	return func(s *tcpLineSender) {
 		if limit > 0 {
 			s.buf.FileNameLimit = limit
 		}
 	}
 }
 
-// NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
+// NewTcpLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
 // sender corresponds to a single TCP connection. Sender should
 // not be called concurrently by multiple goroutines.
-func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, error) {
+func NewTcpLineSender(ctx context.Context, opts ...TcpLineSenderOption) (*tcpLineSender, error) {
 	var (
 		d    net.Dialer
 		key  *ecdsa.PrivateKey
@@ -145,11 +142,11 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 		err  error
 	)
 
-	s := &LineSender{
+	s := &tcpLineSender{
 		address: "127.0.0.1:9009",
 		tlsMode: tlsDisabled,
 
-		buf: buffer.NewBuffer(),
+		buf: newBuffer(),
 	}
 
 	for _, opt := range opts {
@@ -237,15 +234,14 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, 
 	s.buf.Buffer = *bytes.NewBuffer(make([]byte, 0, s.buf.BufCap))
 
 	return s, nil
-
 }
 
-func optsFromConf(config string) ([]LineSenderOption, error) {
+func optsFromConf(config string) ([]TcpLineSenderOption, error) {
 	var (
 		user, token string
 	)
 
-	data, err := conf.ParseConfigString(config)
+	data, err := ParseConfigString(config)
 	if err != nil {
 		return nil, err
 	}
@@ -254,35 +250,35 @@ func optsFromConf(config string) ([]LineSenderOption, error) {
 		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
 	}
 
-	opts := make([]LineSenderOption, 0)
+	opts := make([]TcpLineSenderOption, 0)
 
 	for k, v := range data.KeyValuePairs {
 		switch strings.ToLower(k) {
 		case "addr":
-			opts = append(opts, WithAddress(v))
+			opts = append(opts, WithTcpAddress(v))
 		case "user":
 			user = v
 			if token != "" && user != "" {
-				opts = append(opts, WithAuth(user, token))
+				opts = append(opts, WithTcpAuth(user, token))
 			}
 		case "token":
 			token = v
-			opts = append(opts, WithAuth(user, token))
+			opts = append(opts, WithTcpAuth(user, token))
 		case "auto_flush":
 			if v == "on" {
-				return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
+				return nil, NewInvalidConfigStrError("auto_flush option is not supported")
 			}
 		case "auto_flush_rows", "auto_flush_bytes":
-			return nil, conf.NewConfigStrParseError("auto_flush option is not supported")
+			return nil, NewInvalidConfigStrError("auto_flush option is not supported")
 		case "init_buf_size", "max_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
-				return nil, conf.NewConfigStrParseError("invalid %s value, %q is not a valid int", k, v)
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 
 			}
 			switch k {
 			case "max_buf_size":
-				opts = append(opts, WithBufferCapacity(parsedVal))
+				opts = append(opts, WithTcpBufferCapacity(parsedVal))
 			default:
 				panic("add a case for " + k)
 			}
@@ -290,25 +286,25 @@ func optsFromConf(config string) ([]LineSenderOption, error) {
 		case "tls_verify":
 			switch v {
 			case "on":
-				opts = append(opts, WithTls())
+				opts = append(opts, WithTcpTls())
 			case "unsafe_off":
-				opts = append(opts, WithTlsInsecureSkipVerify())
+				opts = append(opts, WithTcpTlsInsecureSkipVerify())
 			default:
-				return nil, conf.NewConfigStrParseError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
+				return nil, NewInvalidConfigStrError("invalid tls_verify value, %q is not 'on' or 'unsafe_off", v)
 			}
 		case "tls_roots":
-			return nil, conf.NewConfigStrParseError("tls_roots is not available in the go client")
+			return nil, NewInvalidConfigStrError("tls_roots is not available in the go client")
 		case "tls_roots_password":
-			return nil, conf.NewConfigStrParseError("tls_roots_password is not available in the go client")
+			return nil, NewInvalidConfigStrError("tls_roots_password is not available in the go client")
 		default:
-			return nil, conf.NewConfigStrParseError("unsupported option %q", k)
+			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}
 	}
 
 	return opts, nil
 }
 
-// LineSenderFromConf creates a LineSender using the QuestDB config string format.
+// TcpLineSenderFromConf creates a TcpLineSender using the QuestDB config string format.
 //
 // Example config string: "tcp::addr=localhost;username=joe;token=123;auto_flush_rows=1000;"
 //
@@ -336,17 +332,17 @@ func optsFromConf(config string) ([]LineSenderOption, error) {
 // max_buf_size:   buffer growth limit in bytes. client errors if breached (default is 100MiB)
 //
 // tls_verify: determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
-func LineSenderFromConf(ctx context.Context, config string) (*LineSender, error) {
+func TcpLineSenderFromConf(ctx context.Context, config string) (*tcpLineSender, error) {
 	opts, err := optsFromConf(config)
 	if err != nil {
 		return nil, err
 	}
-	return NewLineSender(ctx, opts...)
+	return NewTcpLineSender(ctx, opts...)
 }
 
 // Close closes the underlying TCP connection. Does not flush
 // in-flight messages, so make sure to call Flush first.
-func (s *LineSender) Close() error {
+func (s *tcpLineSender) Close() error {
 	return s.conn.Close()
 }
 
@@ -356,7 +352,7 @@ func (s *LineSender) Close() error {
 // Table name cannot contain any of the following characters:
 // '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
 // '%', '~', starting '.', trailing '.', or a non-printable char.
-func (s *LineSender) Table(name string) *LineSender {
+func (s *tcpLineSender) Table(name string) *tcpLineSender {
 	s.buf.Table(name)
 	return s
 }
@@ -367,7 +363,7 @@ func (s *LineSender) Table(name string) *LineSender {
 // Symbol name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Symbol(name, val string) *LineSender {
+func (s *tcpLineSender) Symbol(name, val string) *tcpLineSender {
 	s.buf.Symbol(name, val)
 	return s
 }
@@ -378,7 +374,7 @@ func (s *LineSender) Symbol(name, val string) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Int64Column(name string, val int64) *LineSender {
+func (s *tcpLineSender) Int64Column(name string, val int64) *tcpLineSender {
 	s.buf.Int64Column(name, val)
 	return s
 }
@@ -392,7 +388,7 @@ func (s *LineSender) Int64Column(name string, val int64) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
+func (s *tcpLineSender) Long256Column(name string, val *big.Int) *tcpLineSender {
 	s.buf.Long256Column(name, val)
 	return s
 }
@@ -403,7 +399,7 @@ func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
+func (s *tcpLineSender) TimestampColumn(name string, ts time.Time) *tcpLineSender {
 	s.buf.TimestampColumn(name, ts)
 	return s
 }
@@ -414,7 +410,7 @@ func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Float64Column(name string, val float64) *LineSender {
+func (s *tcpLineSender) Float64Column(name string, val float64) *tcpLineSender {
 	s.buf.Float64Column(name, val)
 	return s
 }
@@ -424,7 +420,7 @@ func (s *LineSender) Float64Column(name string, val float64) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) StringColumn(name, val string) *LineSender {
+func (s *tcpLineSender) StringColumn(name, val string) *tcpLineSender {
 	s.buf.StringColumn(name, val)
 	return s
 }
@@ -434,7 +430,7 @@ func (s *LineSender) StringColumn(name, val string) *LineSender {
 // Column name cannot contain any of the following characters:
 // '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 // '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
+func (s *tcpLineSender) BoolColumn(name string, val bool) *tcpLineSender {
 	s.buf.BoolColumn(name, val)
 	return s
 }
@@ -448,7 +444,7 @@ func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
 // batches followed by a Flush call. Optimal batch size may vary
 // from 100 to 1,000 messages depending on the message size and
 // configured buffer capacity.
-func (s *LineSender) Flush(ctx context.Context) error {
+func (s *tcpLineSender) Flush(ctx context.Context) error {
 	err := s.buf.LastErr()
 	s.buf.ClearLastErr()
 	if err != nil {
@@ -488,7 +484,7 @@ func (s *LineSender) Flush(ctx context.Context) error {
 // If the underlying buffer reaches configured capacity or the
 // number of buffered messages exceeds the auto-flush trigger, this
 // method also sends the accumulated messages.
-func (s *LineSender) AtNow(ctx context.Context) error {
+func (s *tcpLineSender) AtNow(ctx context.Context) error {
 	return s.At(ctx, time.Time{})
 }
 
@@ -500,7 +496,7 @@ func (s *LineSender) AtNow(ctx context.Context) error {
 // method also sends the accumulated messages.
 //
 // If ts.IsZero(), no timestamp is sent to the server.
-func (s *LineSender) At(ctx context.Context, ts time.Time) error {
+func (s *tcpLineSender) At(ctx context.Context, ts time.Time) error {
 	sendTs := true
 	if ts.IsZero() {
 		sendTs = false
@@ -515,4 +511,15 @@ func (s *LineSender) At(ctx context.Context, ts time.Time) error {
 		return s.Flush(ctx)
 	}
 	return nil
+}
+
+// Messages returns a copy of accumulated ILP messages that are not
+// flushed to the TCP connection yet. Useful for debugging purposes.
+func (s *tcpLineSender) Messages() string {
+	return s.buf.Messages()
+}
+
+// MsgCount returns the number of buffered messages
+func (s *tcpLineSender) MsgCount() int {
+	return s.buf.msgCount
 }

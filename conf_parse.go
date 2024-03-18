@@ -22,23 +22,23 @@
  *
  ******************************************************************************/
 
-package conf
+package questdb
 
 import (
 	"strings"
 )
 
-type ConfigData struct {
+type configData struct {
 	Schema        string
 	KeyValuePairs map[string]string
 }
 
-func ParseConfigString(conf string) (ConfigData, error) {
+func ParseConfigString(conf string) (configData, error) {
 	var (
 		key    = &strings.Builder{}
 		value  = &strings.Builder{}
 		isKey  = true
-		result = ConfigData{
+		result = configData{
 			KeyValuePairs: map[string]string{},
 		}
 
@@ -49,13 +49,13 @@ func ParseConfigString(conf string) (ConfigData, error) {
 
 	schemaStr, conf, found := strings.Cut(conf, "::")
 	if !found {
-		return result, NewConfigStrParseError("no schema separator found '::'")
+		return result, NewInvalidConfigStrError("no schema separator found '::'")
 	}
 
 	result.Schema = schemaStr
 
 	if len(conf) == 0 {
-		return result, NewConfigStrParseError("'addr' key not found")
+		return result, NewInvalidConfigStrError("'addr' key not found")
 	}
 
 	if strings.HasSuffix(conf, ";") {
@@ -75,9 +75,9 @@ func ParseConfigString(conf string) (ConfigData, error) {
 		case ';':
 			if isKey {
 				if nextRune == 0 && !hasTrailingSemicolon {
-					return result, NewConfigStrParseError("unexpected end of string")
+					return result, NewInvalidConfigStrError("unexpected end of string")
 				}
-				return result, NewConfigStrParseError("invalid key character ';'")
+				return result, NewInvalidConfigStrError("invalid key character ';'")
 			}
 
 			if !isEscaping && nextRune == ';' {
@@ -112,7 +112,7 @@ func ParseConfigString(conf string) (ConfigData, error) {
 	}
 
 	if isEscaping {
-		return result, NewConfigStrParseError("unescaped ';'")
+		return result, NewInvalidConfigStrError("unescaped ';'")
 	}
 
 	return result, nil
