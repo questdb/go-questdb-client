@@ -34,15 +34,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
+func (suite *integrationTestSuite) TestE2ESuccessfulHttpBasicAuthWithTlsProxy() {
 	if testing.Short() {
-		t.Skip("skipping integration test")
+		suite.T().Skip("skipping integration test")
 	}
 
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, httpBasicAuth)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -52,23 +52,23 @@ func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 		qdb.WithBasicAuth(basicAuthUser, basicAuthPass),
 		qdb.WithTlsInsecureSkipVerify(),
 	)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
 		At(ctx, time.UnixMicro(2))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.Flush(ctx)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	expected := tableData{
 		Columns: []column{
@@ -82,8 +82,8 @@ func TestE2ESuccessfulHttpBasicAuthWithTlsProxy(t *testing.T) {
 		Count: 2,
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
+	assert.Eventually(suite.T(), func() bool {
+		data := queryTableData(suite.T(), testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }

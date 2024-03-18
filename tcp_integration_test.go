@@ -40,9 +40,9 @@ import (
 	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
-func TestE2EWriteInBatches(t *testing.T) {
+func (suite *integrationTestSuite) TestE2EWriteInBatches() {
 	if testing.Short() {
-		t.Skip("skipping integration test")
+		suite.T().Skip("skipping integration test")
 	}
 
 	const (
@@ -53,11 +53,11 @@ func TestE2EWriteInBatches(t *testing.T) {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)
 
 	for i := 0; i < n; i++ {
@@ -66,10 +66,10 @@ func TestE2EWriteInBatches(t *testing.T) {
 				Table(testTable).
 				Int64Column("long_col", int64(j)).
 				At(ctx, time.UnixMicro(int64(i*nBatch+j)))
-			assert.NoError(t, err)
+			assert.NoError(suite.T(), err)
 		}
 		err = sender.Flush(ctx)
-		assert.NoError(t, err)
+		assert.NoError(suite.T(), err)
 	}
 
 	expected := tableData{
@@ -90,27 +90,27 @@ func TestE2EWriteInBatches(t *testing.T) {
 		}
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
+	assert.Eventually(suite.T(), func() bool {
+		data := queryTableData(suite.T(), testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
-func TestE2EImplicitFlush(t *testing.T) {
+func (suite *integrationTestSuite) TestE2EImplicitFlush() {
 	const bufCap = 100
 
 	if testing.Short() {
-		t.Skip("skipping integration test")
+		suite.T().Skip("skipping integration test")
 	}
 
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithInitBufferSize(bufCap))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)
 
 	for i := 0; i < 10*bufCap; i++ {
@@ -118,25 +118,25 @@ func TestE2EImplicitFlush(t *testing.T) {
 			Table(testTable).
 			BoolColumn("b", true).
 			AtNow(ctx)
-		assert.NoError(t, err)
+		assert.NoError(suite.T(), err)
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
+	assert.Eventually(suite.T(), func() bool {
+		data := queryTableData(suite.T(), testTable, questdbC.httpAddress)
 		// We didn't call Flush, but we expect the buffer to be flushed at least once.
 		return data.Count > 0
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
-func TestE2ESuccessfulAuth(t *testing.T) {
+func (suite *integrationTestSuite) TestE2ESuccessfulAuth() {
 	if testing.Short() {
-		t.Skip("skipping integration test")
+		suite.T().Skip("skipping integration test")
 	}
 
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, authEnabled)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -145,22 +145,22 @@ func TestE2ESuccessfulAuth(t *testing.T) {
 		qdb.WithAddress(questdbC.ilpAddress),
 		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 	)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
 		At(ctx, time.UnixMicro(2))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.Flush(ctx)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	// Close the connection to make sure that ILP messages are written. That's because
 	// the server may not write messages that are received immediately after the signed
@@ -179,21 +179,21 @@ func TestE2ESuccessfulAuth(t *testing.T) {
 		Count: 2,
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
+	assert.Eventually(suite.T(), func() bool {
+		data := queryTableData(suite.T(), testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
-func TestE2EFailedAuth(t *testing.T) {
+func (suite *integrationTestSuite) TestE2EFailedAuth() {
 	if testing.Short() {
-		t.Skip("skipping integration test")
+		suite.T().Skip("skipping integration test")
 	}
 
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, authEnabled)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -202,7 +202,7 @@ func TestE2EFailedAuth(t *testing.T) {
 		qdb.WithAddress(questdbC.ilpAddress),
 		qdb.WithAuth("wrongKeyId", "1234567890"),
 	)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)
 
 	err = sender.
@@ -229,19 +229,19 @@ func TestE2EFailedAuth(t *testing.T) {
 
 	// Our writes should not get applied.
 	time.Sleep(2 * time.Second)
-	data := queryTableData(t, testTable, questdbC.httpAddress)
-	assert.Equal(t, 0, data.Count)
+	data := queryTableData(suite.T(), testTable, questdbC.httpAddress)
+	assert.Equal(suite.T(), 0, data.Count)
 }
 
-func TestE2EWritesWithTlsProxy(t *testing.T) {
+func (suite *integrationTestSuite) TestE2EWritesWithTlsProxy() {
 	if testing.Short() {
-		t.Skip("skipping integration test")
+		suite.T().Skip("skipping integration test")
 	}
 
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDBWithProxy(ctx, noAuth)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -250,23 +250,23 @@ func TestE2EWritesWithTlsProxy(t *testing.T) {
 		qdb.WithAddress(questdbC.proxyIlpTcpAddress), // We're sending data through proxy.
 		qdb.WithTlsInsecureSkipVerify(),
 	)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
 		At(ctx, time.UnixMicro(2))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.Flush(ctx)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	expected := tableData{
 		Columns: []column{
@@ -280,21 +280,21 @@ func TestE2EWritesWithTlsProxy(t *testing.T) {
 		Count: 2,
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
+	assert.Eventually(suite.T(), func() bool {
+		data := queryTableData(suite.T(), testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
 
-func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
+func (suite *integrationTestSuite) TestE2ESuccessfulAuthWithTlsProxy() {
 	if testing.Short() {
-		t.Skip("skipping integration test")
+		suite.T().Skip("skipping integration test")
 	}
 
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDBWithProxy(ctx, authEnabled)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -304,22 +304,22 @@ func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
 		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 		qdb.WithTlsInsecureSkipVerify(),
 	)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
 		At(ctx, time.UnixMicro(2))
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	err = sender.Flush(ctx)
-	assert.NoError(t, err)
+	assert.NoError(suite.T(), err)
 
 	// Close the connection to make sure that ILP messages are written. That's because
 	// the server may not write messages that are received immediately after the signed
@@ -338,8 +338,8 @@ func TestE2ESuccessfulAuthWithTlsProxy(t *testing.T) {
 		Count: 2,
 	}
 
-	assert.Eventually(t, func() bool {
-		data := queryTableData(t, testTable, questdbC.httpAddress)
+	assert.Eventually(suite.T(), func() bool {
+		data := queryTableData(suite.T(), testTable, questdbC.httpAddress)
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }

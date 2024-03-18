@@ -35,6 +35,7 @@ import (
 
 	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -44,6 +45,14 @@ import (
 const (
 	eventualDataTimeout = 60 * time.Second
 )
+
+type integrationTestSuite struct {
+	suite.Suite
+}
+
+func TestIntegrationSuite(t *testing.T) {
+	suite.Run(t, new(integrationTestSuite))
+}
 
 type writerFn func(b qdb.LineSender) error
 
@@ -239,9 +248,9 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	}, nil
 }
 
-func TestE2EValidWrites(t *testing.T) {
+func (suite *integrationTestSuite) TestE2EValidWrites() {
 	if testing.Short() {
-		t.Skip("skipping integration test")
+		suite.T().Skip("skipping integration test")
 	}
 
 	ctx := context.Background()
@@ -408,7 +417,7 @@ func TestE2EValidWrites(t *testing.T) {
 
 	for _, tc := range testCases {
 		for _, protocol := range []string{"tcp", "http"} {
-			t.Run(fmt.Sprintf("%s: %s", tc.name, protocol), func(t *testing.T) {
+			suite.T().Run(fmt.Sprintf("%s: %s", tc.name, protocol), func(t *testing.T) {
 				var (
 					sender qdb.LineSender
 					err    error
