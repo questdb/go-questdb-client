@@ -43,12 +43,12 @@ import (
 	"time"
 )
 
-type tlsMode int64
+type tcpTlsMode int64
 
 const (
-	tlsDisabled           tlsMode = 0
-	tlsEnabled            tlsMode = 1
-	tlsInsecureSkipVerify tlsMode = 2
+	tlsDisabled           tcpTlsMode = 0
+	tlsEnabled            tcpTlsMode = 1
+	tlsInsecureSkipVerify tcpTlsMode = 2
 )
 
 // TcpLineSender allows you to insert rows into QuestDB by sending ILP
@@ -62,7 +62,7 @@ type tcpLineSender struct {
 	address string
 
 	// Authentication-related fields
-	tlsMode tlsMode
+	tlsMode tcpTlsMode
 	keyId   string // Erased once auth is done.
 	key     string // Erased once auth is done.
 

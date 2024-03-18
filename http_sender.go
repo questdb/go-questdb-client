@@ -87,7 +87,7 @@ type httpLineSender struct {
 	user    string
 	pass    string
 	token   string
-	tlsMode tlsMode
+	tlsMode tcpTlsMode
 
 	client    http.Client
 	uri       string
@@ -211,10 +211,10 @@ func WithHttpAutoFlushInterval(interval time.Duration) HttpLineSenderOption {
 	}
 }
 
-// WithHttpTransport sets the client's http transport to the
+// WithTransport sets the client's http transport to the
 // passed pointer instead of the global transport. This can be
 // used for customizing the http transport used by the HttpLineSender.
-func WithHttpTransport(t *http.Transport) HttpLineSenderOption {
+func WithTransport(t *http.Transport) HttpLineSenderOption {
 	return func(s *httpLineSender) {
 		s.transport = t
 	}
