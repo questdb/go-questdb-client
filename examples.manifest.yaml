@@ -30,33 +30,10 @@
   addr:
     host: localhost
     port: 9009
-- name: ilp-http
+- name: ilp-from-conf
   lang: go
-  path: examples/http/basic/main.go
+  path: examples/http/from-conf/main.go
   header: |-
     Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
     and [repo](https://github.com/questdb/go-questdb-client).
-- name: ilp-http-auth
-  lang: go
-  path: examples/http/auth/main.go
-  header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
-    and [repo](https://github.com/questdb/go-questdb-client).
-  #auth:
-  #  kid: testUser1
-  #  d: 5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48
-  addr:
-    host: localhost
-    port: 9000
-- name: ilp-http-auth-tls
-  lang: go
-  path: examples/http/auth-and-tls/main.go
-  header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
-    and [repo](https://github.com/questdb/go-questdb-client).
-  #auth:
-  #  kid: testUser1
-  #  d: 5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48
-  addr:
-    host: localhost
-    port: 9000
+  conf: http::addr=localhost:9000;
