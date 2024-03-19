@@ -10,7 +10,7 @@ Features:
 * Context-aware API.
 * Optimized for batch writes.
 * Supports TLS encryption and ILP authentication.
-* Automatic write retries for ILP over HTTP.
+* Automatic write retries and connection reuse for ILP over HTTP.
 * Tested against QuestDB 7.3.11 and newer versions.
 
 New in v3:
