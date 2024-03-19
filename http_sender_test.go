@@ -98,6 +98,41 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			config:      "http::user=test_user;token=test_token",
 			expectedErr: "both basic and token",
 		},
+		{
+			name:        "negative init_buf_size",
+			config:      "tcp::init_buf_size=-1",
+			expectedErr: "initial buffer size is negative",
+		},
+		{
+			name:        "negative max_buf_size",
+			config:      "tcp::max_buf_size=-1",
+			expectedErr: "max buffer size is negative",
+		},
+		{
+			name:        "negative retry timeout",
+			config:      "tcp::retry_timeout=-1",
+			expectedErr: "retry timeout is negative",
+		},
+		{
+			name:        "negative request timeout",
+			config:      "tcp::request_timeout=-1",
+			expectedErr: "request timeout is negative",
+		},
+		{
+			name:        "negative min throughput",
+			config:      "tcp::min_throughput=-1",
+			expectedErr: "min throughput is negative",
+		},
+		{
+			name:        "negative auto flush rows",
+			config:      "tcp::auto_flush_rows=-1",
+			expectedErr: "auto flush rows is negative",
+		},
+		{
+			name:        "negative auto flush interval",
+			config:      "tcp::auto_flush_interval=-1",
+			expectedErr: "auto flush interval is negative",
+		},
 	}
 
 	for _, tc := range testCases {

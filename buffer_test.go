@@ -431,3 +431,19 @@ func TestInvalidMessageGetsDiscarded(t *testing.T) {
 	expectedLines := []string{testTable + " foo=\"bar\""}
 	assert.Equal(t, strings.Join(expectedLines, "\n")+"\n", buf.Messages())
 }
+
+func TestInvalidTableName(t *testing.T) {
+	buf := newTestBuffer()
+
+	err := buf.Table("invalid\ntable").StringColumn("foo", "bar").At(time.Time{}, false)
+	assert.ErrorContains(t, err, "table name contains an illegal char")
+	assert.Empty(t, buf.Messages())
+}
+
+func TestInvalidColumnName(t *testing.T) {
+	buf := newTestBuffer()
+
+	err := buf.Table(testTable).StringColumn("invalid\ncolumn", "bar").At(time.Time{}, false)
+	assert.ErrorContains(t, err, "column name contains an illegal char")
+	assert.Empty(t, buf.Messages())
+}

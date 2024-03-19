@@ -120,6 +120,11 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 			config:      "tcp::user=test_key_id;token=1234567890",
 			expectedErr: "invalid auth key",
 		},
+		{
+			name:        "max_buf_size is set",
+			config:      "tcp::max_buf_size=1000",
+			expectedErr: "maxBufferSize setting is not available",
+		},
 	}
 
 	for _, tc := range testCases {
