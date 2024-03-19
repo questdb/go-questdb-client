@@ -144,7 +144,7 @@ type LineSender interface {
 }
 
 const (
-	defaultHttpAddress = "127.0.0.1:9009"
+	defaultHttpAddress = "127.0.0.1:9000"
 	defaultTcpAddress  = "127.0.0.1:9009"
 
 	defaultInitBufferSize = 128 * 1024        // 128KB
