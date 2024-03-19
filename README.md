@@ -29,7 +29,7 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3/pkg/http"
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 func main() {
