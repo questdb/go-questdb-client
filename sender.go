@@ -174,12 +174,12 @@ const (
 )
 
 type lineSenderConfig struct {
-	senderType     senderType
-	address        string
-	initBufferSize int
-	maxBufferSize  int
-	fileNameLimit  int
-	httpTransport  *http.Transport
+	senderType    senderType
+	address       string
+	initBufSize   int
+	maxBufSize    int
+	fileNameLimit int
+	httpTransport *http.Transport
 
 	// Retry/timeout-related fields
 	retryTimeout   time.Duration
@@ -298,7 +298,7 @@ func WithRetryTimeout(t time.Duration) LineSenderOption {
 // grow larger than the provided value.
 func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.initBufferSize = sizeInBytes
+		s.initBufSize = sizeInBytes
 	}
 }
 
@@ -309,7 +309,7 @@ func WithInitBufferSize(sizeInBytes int) LineSenderOption {
 // Only available for the HTTP sender.
 func WithMaxBufferSize(sizeInBytes int) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.maxBufferSize = sizeInBytes
+		s.maxBufSize = sizeInBytes
 	}
 }
 
@@ -483,7 +483,7 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	if conf.autoFlushInterval != 0 {
 		return errors.New("autoFlushInterval setting is not available in the TCP client")
 	}
-	if conf.maxBufferSize != 0 {
+	if conf.maxBufSize != 0 {
 		return errors.New("maxBufferSize setting is not available in the TCP client")
 	}
 	if conf.tcpKey == "" && conf.tcpKeyId != "" {
@@ -497,8 +497,8 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	if conf.address == "" {
 		conf.address = defaultTcpAddress
 	}
-	if conf.initBufferSize == 0 {
-		conf.initBufferSize = defaultInitBufferSize
+	if conf.initBufSize == 0 {
+		conf.initBufSize = defaultInitBufferSize
 	}
 	if conf.fileNameLimit == 0 {
 		conf.fileNameLimit = defaultFileNameLimit
@@ -537,11 +537,11 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	if conf.autoFlushInterval == 0 {
 		conf.autoFlushInterval = defaultAutoFlushInterval
 	}
-	if conf.initBufferSize == 0 {
-		conf.initBufferSize = defaultInitBufferSize
+	if conf.initBufSize == 0 {
+		conf.initBufSize = defaultInitBufferSize
 	}
-	if conf.maxBufferSize == 0 {
-		conf.maxBufferSize = defaultMaxBufferSize
+	if conf.maxBufSize == 0 {
+		conf.maxBufSize = defaultMaxBufferSize
 	}
 	if conf.fileNameLimit == 0 {
 		conf.fileNameLimit = defaultFileNameLimit
@@ -551,11 +551,11 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 }
 
 func validateConf(conf *lineSenderConfig) error {
-	if conf.initBufferSize < 0 {
-		return fmt.Errorf("initial buffer size is negative: %d", conf.initBufferSize)
+	if conf.initBufSize < 0 {
+		return fmt.Errorf("initial buffer size is negative: %d", conf.initBufSize)
 	}
-	if conf.maxBufferSize < 0 {
-		return fmt.Errorf("max buffer size is negative: %d", conf.maxBufferSize)
+	if conf.maxBufSize < 0 {
+		return fmt.Errorf("max buffer size is negative: %d", conf.maxBufSize)
 	}
 
 	if conf.fileNameLimit < 0 {

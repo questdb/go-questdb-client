@@ -92,7 +92,6 @@ func TestHttpHappyCasesFromConf(t *testing.T) {
 }
 
 func TestHttpPathologicalCasesFromConf(t *testing.T) {
-
 	testCases := []httpConfigTestCase{
 		{
 			name:        "basic_and_token_auth",
@@ -107,6 +106,29 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			assert.ErrorContains(t, err, tc.expectedErr)
 		})
 	}
+}
+
+func TestHttpErrorWhenMaxBufferSizeIsReached(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestHttpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := qdb.NewLineSender(
+		ctx,
+		qdb.WithHttp(),
+		qdb.WithAddress(srv.Addr()),
+		qdb.WithInitBufferSize(4),
+		qdb.WithMaxBufferSize(8),
+	)
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	err = sender.Table(testTable).Symbol("sym", "foobar").AtNow(ctx)
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "buffer size exceeded maximum limit")
+	assert.Empty(t, qdb.Messages(sender))
 }
 
 func TestHttpErrorOnFlushWhenMessageIsPending(t *testing.T) {

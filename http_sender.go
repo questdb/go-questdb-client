@@ -128,7 +128,7 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 		pass:                        conf.httpPass,
 		token:                       conf.httpToken,
 
-		buf: newBuffer(conf.initBufferSize, conf.fileNameLimit),
+		buf: newBuffer(conf.initBufSize, conf.maxBufSize, conf.fileNameLimit),
 	}
 
 	if conf.httpTransport != nil {

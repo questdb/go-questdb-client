@@ -38,6 +38,10 @@ import (
 
 type bufWriterFn func(b *qdb.Buffer) error
 
+func newTestBuffer() qdb.Buffer {
+	return qdb.NewBuffer(128*1024, 1024*1024, 127)
+}
+
 func TestValidWrites(t *testing.T) {
 	testCases := []struct {
 		name          string
@@ -75,7 +79,7 @@ func TestValidWrites(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := qdb.NewBuffer(128*1024, 127)
+			buf := newTestBuffer()
 
 			err := tc.writerFn(&buf)
 			assert.NoError(t, err)
@@ -99,7 +103,7 @@ func TestTimestampSerialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := qdb.NewBuffer(128*1024, 127)
+			buf := newTestBuffer()
 
 			err := buf.Table(testTable).TimestampColumn("a_col", tc.val).At(time.Time{}, false)
 			assert.NoError(t, err)
@@ -107,7 +111,6 @@ func TestTimestampSerialization(t *testing.T) {
 			// Check the buffer
 			expectedLines := []string{"my_test_table a_col=" + strconv.FormatInt(tc.val.UnixMicro(), 10) + "t"}
 			assert.Equal(t, strings.Join(expectedLines, "\n")+"\n", buf.Messages())
-
 		})
 	}
 }
@@ -126,7 +129,7 @@ func TestInt64Serialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := qdb.NewBuffer(128*1024, 127)
+			buf := newTestBuffer()
 
 			err := buf.Table(testTable).Int64Column("a_col", tc.val).At(time.Time{}, false)
 			assert.NoError(t, err)
@@ -134,7 +137,6 @@ func TestInt64Serialization(t *testing.T) {
 			// Check the buffer
 			expectedLines := []string{"my_test_table a_col=" + strconv.FormatInt(tc.val, 10) + "i"}
 			assert.Equal(t, strings.Join(expectedLines, "\n")+"\n", buf.Messages())
-
 		})
 	}
 }
@@ -154,7 +156,7 @@ func TestLong256Column(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := qdb.NewBuffer(128*1024, 127)
+			buf := newTestBuffer()
 
 			newVal, _ := big.NewInt(0).SetString(tc.val, 16)
 			err := buf.Table(testTable).Long256Column("a_col", newVal).At(time.Time{}, false)
@@ -163,7 +165,6 @@ func TestLong256Column(t *testing.T) {
 			// Check the buffer
 			expectedLines := []string{"my_test_table a_col=" + tc.expected + "i"}
 			assert.Equal(t, strings.Join(expectedLines, "\n")+"\n", buf.Messages())
-
 		})
 	}
 }
@@ -189,7 +190,7 @@ func TestFloat64Serialization(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := qdb.NewBuffer(128*1024, 127)
+			buf := newTestBuffer()
 
 			err := buf.Table(testTable).Float64Column("a_col", tc.val).At(time.Time{}, false)
 			assert.NoError(t, err)
@@ -197,7 +198,44 @@ func TestFloat64Serialization(t *testing.T) {
 			// Check the buffer
 			expectedLines := []string{"my_test_table a_col=" + tc.expected}
 			assert.Equal(t, strings.Join(expectedLines, "\n")+"\n", buf.Messages())
+		})
+	}
+}
 
+func TestErrorOnTooLargeBuffer(t *testing.T) {
+	const initBufSize = 1
+	const maxBufSize = 4
+
+	testCases := []struct {
+		name     string
+		writerFn bufWriterFn
+	}{
+		{
+			"table name and ts",
+			func(s *qdb.Buffer) error {
+				return s.Table("foobar").At(time.Time{}, false)
+			},
+		},
+		{
+			"string column",
+			func(s *qdb.Buffer) error {
+				return s.Table("a").StringColumn("str_col", "foo").At(time.Time{}, false)
+			},
+		},
+		{
+			"long column",
+			func(s *qdb.Buffer) error {
+				return s.Table("a").Int64Column("str_col", 1000000).At(time.Time{}, false)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := qdb.NewBuffer(initBufSize, maxBufSize, 127)
+
+			err := tc.writerFn(&buf)
+			assert.ErrorContains(t, err, "buffer size exceeded maximum limit")
 		})
 	}
 }
@@ -232,12 +270,11 @@ func TestErrorOnLengthyNames(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := qdb.NewBuffer(128*1024, nameLimit)
+			buf := qdb.NewBuffer(128*1024, 1024*1024, nameLimit)
 
 			err := tc.writerFn(&buf)
 			assert.ErrorContains(t, err, tc.expectedErrMsg)
 			assert.Empty(t, buf.Messages())
-
 		})
 	}
 }
@@ -293,19 +330,18 @@ func TestErrorOnMissingTableCall(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := qdb.NewBuffer(128*1024, 127)
+			buf := newTestBuffer()
 
 			err := tc.writerFn(&buf)
 
 			assert.ErrorContains(t, err, "table name was not provided")
 			assert.Empty(t, buf.Messages())
-
 		})
 	}
 }
 
 func TestErrorOnMultipleTableCalls(t *testing.T) {
-	buf := qdb.NewBuffer(128*1024, 127)
+	buf := newTestBuffer()
 
 	err := buf.Table(testTable).Table(testTable).At(time.Time{}, false)
 
@@ -314,7 +350,7 @@ func TestErrorOnMultipleTableCalls(t *testing.T) {
 }
 
 func TestErrorOnNegativeLong256(t *testing.T) {
-	buf := qdb.NewBuffer(128*1024, 127)
+	buf := newTestBuffer()
 
 	err := buf.Table(testTable).Long256Column("long256_col", big.NewInt(-42)).At(time.Time{}, false)
 
@@ -323,7 +359,7 @@ func TestErrorOnNegativeLong256(t *testing.T) {
 }
 
 func TestErrorOnLargerLong256(t *testing.T) {
-	buf := qdb.NewBuffer(128*1024, 127)
+	buf := newTestBuffer()
 
 	bigVal, _ := big.NewInt(0).SetString("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
 	err := buf.Table(testTable).Long256Column("long256_col", bigVal).At(time.Time{}, false)
@@ -371,7 +407,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := qdb.NewBuffer(128*1024, 127)
+			buf := newTestBuffer()
 
 			err := tc.writerFn(&buf)
 
@@ -382,7 +418,7 @@ func TestErrorOnSymbolCallAfterColumn(t *testing.T) {
 }
 
 func TestInvalidMessageGetsDiscarded(t *testing.T) {
-	buf := qdb.NewBuffer(128*1024, 127)
+	buf := newTestBuffer()
 
 	// Write a valid message.
 	err := buf.Table(testTable).StringColumn("foo", "bar").At(time.Time{}, false)

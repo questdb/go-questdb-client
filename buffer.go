@@ -47,6 +47,7 @@ type buffer struct {
 	bytes.Buffer
 
 	initBufSize   int
+	maxBufSize    int
 	fileNameLimit int
 
 	lastMsgPos int
@@ -57,9 +58,10 @@ type buffer struct {
 	msgCount   int
 }
 
-func newBuffer(initBufSize int, fileNameLimit int) buffer {
+func newBuffer(initBufSize int, maxBufSize int, fileNameLimit int) buffer {
 	var b buffer
 	b.initBufSize = initBufSize
+	b.maxBufSize = maxBufSize
 	b.fileNameLimit = fileNameLimit
 	b.ResetSize()
 	return b
@@ -134,36 +136,36 @@ func (b *buffer) WriteTo(w io.Writer) (int64, error) {
 	return n, nil
 }
 
-func (buf *buffer) writeTableName(str string) error {
+func (b *buffer) writeTableName(str string) error {
 	if str == "" {
 		return fmt.Errorf("table name cannot be empty: %w", errInvalidMsg)
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > buf.fileNameLimit {
+	if len(str) > b.fileNameLimit {
 		return fmt.Errorf("table name length exceeds the limit: %w", errInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
 	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
+		ch := str[i]
+		switch ch {
 		case ' ':
-			buf.WriteByte('\\')
+			b.WriteByte('\\')
 		case '=':
-			buf.WriteByte('\\')
+			b.WriteByte('\\')
 		case '.':
 			if i == 0 || i == len(str)-1 {
 				return fmt.Errorf("table name contains '.' char at the start or end: %s: %w", str, errInvalidMsg)
 			}
 		default:
-			if illegalTableNameChar(b) {
+			if illegalTableNameChar(ch) {
 				return fmt.Errorf("table name contains an illegal char: "+
 					"'\\n', '\\r', '?', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '*' '%%', '~', or a non-printable char: %s: %w",
 					str, errInvalidMsg)
 			}
 		}
-		buf.WriteByte(b)
+		b.WriteByte(ch)
 	}
 	return nil
 }
@@ -234,32 +236,32 @@ func illegalTableNameChar(ch byte) bool {
 	return false
 }
 
-func (buf *buffer) writeColumnName(str string) error {
+func (b *buffer) writeColumnName(str string) error {
 	if str == "" {
 		return fmt.Errorf("column name cannot be empty: %w", errInvalidMsg)
 	}
 	// We use string length in bytes as an approximation. That's to
 	// avoid calculating the number of runes.
-	if len(str) > buf.fileNameLimit {
+	if len(str) > b.fileNameLimit {
 		return fmt.Errorf("column name length exceeds the limit: %w", errInvalidMsg)
 	}
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
 	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
+		ch := str[i]
+		switch ch {
 		case ' ':
-			buf.WriteByte('\\')
+			b.WriteByte('\\')
 		case '=':
-			buf.WriteByte('\\')
+			b.WriteByte('\\')
 		default:
-			if illegalColumnNameChar(b) {
+			if illegalColumnNameChar(ch) {
 				return fmt.Errorf("column name contains an illegal char: "+
 					"'\\n', '\\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '-', '*' '%%', '~', or a non-printable char: %s: %w",
 					str, errInvalidMsg)
 			}
 		}
-		buf.WriteByte(b)
+		b.WriteByte(ch)
 	}
 	return nil
 }
@@ -334,36 +336,36 @@ func illegalColumnNameChar(ch byte) bool {
 	return false
 }
 
-func (buf *buffer) writeStrValue(str string, quoted bool) error {
+func (b *buffer) writeStrValue(str string, quoted bool) error {
 	// Since we're interested in ASCII chars, it's fine to iterate
 	// through bytes instead of runes.
 	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
+		ch := str[i]
+		switch ch {
 		case ' ':
 			if !quoted {
-				buf.WriteByte('\\')
+				b.WriteByte('\\')
 			}
 		case ',':
 			if !quoted {
-				buf.WriteByte('\\')
+				b.WriteByte('\\')
 			}
 		case '=':
 			if !quoted {
-				buf.WriteByte('\\')
+				b.WriteByte('\\')
 			}
 		case '"':
 			if quoted {
-				buf.WriteByte('\\')
+				b.WriteByte('\\')
 			}
 		case '\n':
-			buf.WriteByte('\\')
+			b.WriteByte('\\')
 		case '\r':
-			buf.WriteByte('\\')
+			b.WriteByte('\\')
 		case '\\':
-			buf.WriteByte('\\')
+			b.WriteByte('\\')
 		}
-		buf.WriteByte(b)
+		b.WriteByte(ch)
 	}
 	return nil
 }
@@ -563,6 +565,16 @@ func (b *buffer) At(ts time.Time, sendTs bool) error {
 		b.DiscardPendingMsg()
 		return err
 	}
+
+	// Post-factum check for the max buffer size limit.
+	// Since we embed bytes.Buffer, it's impossible to hook into its
+	// grow() method properly to have the check before we write
+	// a value to the buffer.
+	if b.maxBufSize > 0 && b.Cap() > b.maxBufSize {
+		b.DiscardPendingMsg()
+		return fmt.Errorf("buffer size exceeded maximum limit: size=%d, limit=%d", b.Cap(), b.maxBufSize)
+	}
+
 	if !b.hasTable {
 		b.DiscardPendingMsg()
 		return fmt.Errorf("table name was not provided: %w", errInvalidMsg)

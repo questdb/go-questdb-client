@@ -115,9 +115,9 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			case "min_throughput":
 				senderConf.minThroughput = parsedVal
 			case "init_buf_size":
-				senderConf.initBufferSize = parsedVal
+				senderConf.initBufSize = parsedVal
 			case "max_buf_size":
-				senderConf.maxBufferSize = parsedVal
+				senderConf.maxBufSize = parsedVal
 			default:
 				panic("add a case for " + k)
 			}

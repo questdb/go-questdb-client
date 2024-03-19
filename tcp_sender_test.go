@@ -47,8 +47,6 @@ type tcpConfigTestCase struct {
 
 func TestTcpHappyCasesFromConf(t *testing.T) {
 	var (
-		//user        = "test-user"
-		//token       = "test-token"
 		initBufSize = 1000
 	)
 
@@ -59,14 +57,10 @@ func TestTcpHappyCasesFromConf(t *testing.T) {
 	addr := testServer.Addr()
 
 	testCases := []tcpConfigTestCase{
-		// TODO(sklarsa): test Client doesn't support tls auth handshake
-		/*
-			{
-				name: "user and token",
-				config: fmt.Sprintf("tcp::addr=%s;user=%s;token=%s",
-					addr, user, token),
-			},
-		*/
+		{
+			name:   "addr only",
+			config: fmt.Sprintf("tcp::addr=%s", addr),
+		},
 		{
 			name: "init_buf_size",
 			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d",

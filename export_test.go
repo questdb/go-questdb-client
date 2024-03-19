@@ -35,8 +35,8 @@ var (
 	GlobalTransport = globalTransport
 )
 
-func NewBuffer(initBufSize int, fileNameLimit int) Buffer {
-	return newBuffer(initBufSize, fileNameLimit)
+func NewBuffer(initBufSize int, maxBufSize int, fileNameLimit int) Buffer {
+	return newBuffer(initBufSize, maxBufSize, fileNameLimit)
 }
 
 func ParseConfigStr(conf string) (configData, error) {

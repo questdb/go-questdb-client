@@ -56,7 +56,8 @@ func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (*tcpLineSend
 
 	s := &tcpLineSender{
 		address: conf.address,
-		buf:     newBuffer(conf.initBufferSize, conf.fileNameLimit),
+		// TCP sender doesn't limit max buffer size, hence 0
+		buf: newBuffer(conf.initBufSize, 0, conf.fileNameLimit),
 	}
 
 	// Process tcp args in the same exact way that we do in v2
