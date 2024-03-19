@@ -63,7 +63,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		switch strings.ToLower(k) {
 		case "addr":
 			senderConf.address = v
-		case "user":
+		case "username":
 			switch senderConf.senderType {
 			case httpSenderType:
 				senderConf.httpUser = v
@@ -72,7 +72,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				panic("add a case for " + k)
 			}
-		case "pass":
+		case "password":
 			if senderConf.senderType != httpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for HTTP sender", k)
 			}

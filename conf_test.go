@@ -84,13 +84,13 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "http and username/password",
-			config: fmt.Sprintf("http::addr=%s;user=%s;pass=%s", addr, user, pass),
+			config: fmt.Sprintf("http::addr=%s;username=%s;password=%s", addr, user, pass),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
-					"addr": addr,
-					"user": user,
-					"pass": pass,
+					"addr":     addr,
+					"username": user,
+					"password": pass,
 				},
 			},
 		},
@@ -107,13 +107,13 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "tcp with key and user",
-			config: fmt.Sprintf("tcp::addr=%s;token=%s;user=%s", addr, token, user),
+			config: fmt.Sprintf("tcp::addr=%s;token=%s;username=%s", addr, token, user),
 			expected: qdb.ConfigData{
 				Schema: "tcp",
 				KeyValuePairs: map[string]string{
-					"addr":  addr,
-					"user":  user,
-					"token": token,
+					"addr":     addr,
+					"username": user,
+					"token":    token,
 				},
 			},
 		},
@@ -179,49 +179,49 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "password with an escaped semicolon",
-			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word", addr, user),
+			config: fmt.Sprintf("http::addr=%s;username=%s;password=pass;;word", addr, user),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
-					"addr": addr,
-					"user": user,
-					"pass": "pass;word",
+					"addr":     addr,
+					"username": user,
+					"password": "pass;word",
 				},
 			},
 		},
 		{
 			name:   "password with an escaped semicolon (ending with a ';')",
-			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass;;word;", addr, user),
+			config: fmt.Sprintf("http::addr=%s;username=%s;password=pass;;word;", addr, user),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
-					"addr": addr,
-					"user": user,
-					"pass": "pass;word",
+					"addr":     addr,
+					"username": user,
+					"password": "pass;word",
 				},
 			},
 		},
 		{
 			name:   "password with a trailing semicolon",
-			config: fmt.Sprintf("http::addr=%s;user=%s;pass=password;;;", addr, user),
+			config: fmt.Sprintf("http::addr=%s;username=%s;password=password;;;", addr, user),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
-					"addr": addr,
-					"user": user,
-					"pass": "password;",
+					"addr":     addr,
+					"username": user,
+					"password": "password;",
 				},
 			},
 		},
 		{
 			name:   "equal sign in password",
-			config: fmt.Sprintf("http::addr=%s;user=%s;pass=pass=word", addr, user),
+			config: fmt.Sprintf("http::addr=%s;username=%s;password=pass=word", addr, user),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
-					"addr": addr,
-					"user": user,
-					"pass": "pass=word",
+					"addr":     addr,
+					"username": user,
+					"password": "pass=word",
 				},
 			},
 		},
@@ -255,12 +255,12 @@ func TestParserPathologicalCases(t *testing.T) {
 		},
 		{
 			name:                   "unescaped semicolon in password leads to unexpected end of string",
-			config:                 "http::addr=localhost:9000;user=test;pass=pass;word",
+			config:                 "http::addr=localhost:9000;username=test;password=pass;word",
 			expectedErrMsgContains: "unexpected end of string",
 		},
 		{
 			name:                   "unescaped semicolon in password leads to invalid key character",
-			config:                 "http::addr=localhost:9000;user=test;pass=pass;word;",
+			config:                 "http::addr=localhost:9000;username=test;password=pass;word;",
 			expectedErrMsgContains: "invalid key character ';'",
 		},
 	}
@@ -299,7 +299,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 	testCases := []configTestCase{
 		{
 			name: "user and token",
-			config: fmt.Sprintf("tcp::addr=%s;user=%s;token=%s",
+			config: fmt.Sprintf("tcp::addr=%s;username=%s;token=%s",
 				addr, user, token),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithTcp(),
@@ -350,8 +350,8 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name: "pass before user",
-			config: fmt.Sprintf("http::addr=%s;pass=%s;user=%s",
+			name: "password before username",
+			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s",
 				addr, pass, user),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),

@@ -61,7 +61,7 @@ func TestHttpHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "pass before user",
-			config: fmt.Sprintf("http::addr=%s;pass=%s;user=%s",
+			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s",
 				addr, pass, user),
 		},
 		{
@@ -95,7 +95,7 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 	testCases := []httpConfigTestCase{
 		{
 			name:        "basic_and_token_auth",
-			config:      "http::user=test_user;token=test_token",
+			config:      "http::username=test_user;token=test_token",
 			expectedErr: "both basic and token",
 		},
 		{
