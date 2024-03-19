@@ -200,7 +200,7 @@ func (suite *integrationTestSuite) TestE2EFailedAuth() {
 		ctx,
 		qdb.WithTcp(),
 		qdb.WithAddress(questdbC.ilpAddress),
-		qdb.WithAuth("wrongKeyId", "1234567890"),
+		qdb.WithAuth("wrongKeyId", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 	)
 	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)

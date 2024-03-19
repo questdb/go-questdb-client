@@ -79,7 +79,6 @@ func TestTcpHappyCasesFromConf(t *testing.T) {
 }
 
 func TestTcpPathologicalCasesFromConf(t *testing.T) {
-
 	testCases := []tcpConfigTestCase{
 		{
 			name:        "request_timeout",
@@ -115,6 +114,11 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 			name:        "tcp key id but no key",
 			config:      "tcp::user=test_key_id",
 			expectedErr: "tcpKey is empty",
+		},
+		{
+			name:        "invalid private key size",
+			config:      "tcp::user=test_key_id;token=1234567890",
+			expectedErr: "invalid auth key",
 		},
 	}
 

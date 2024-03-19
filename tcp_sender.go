@@ -28,6 +28,7 @@ import (
 	"bufio"
 	"context"
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -62,14 +63,25 @@ func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (*tcpLineSend
 
 	// Process tcp args in the same exact way that we do in v2
 	if conf.tcpKeyId != "" && conf.tcpKey != "" {
-		keyRaw, err := base64.RawURLEncoding.DecodeString(conf.tcpKey)
+		rawKey, err := base64.RawURLEncoding.DecodeString(conf.tcpKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode auth key: %v", err)
 		}
-		key = new(ecdsa.PrivateKey)
-		key.PublicKey.Curve = elliptic.P256()
-		key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(keyRaw)
-		key.D = new(big.Int).SetBytes(keyRaw)
+		// elliptic.P256().ScalarBaseMult is deprecated, so we use ecdh key
+		// and convert it to the ecdsa one.
+		ecdhKey, err := ecdh.P256().NewPrivateKey(rawKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid auth key: %v", err)
+		}
+		ecdhPubKey := ecdhKey.PublicKey().Bytes()
+		key = &ecdsa.PrivateKey{
+			PublicKey: ecdsa.PublicKey{
+				Curve: elliptic.P256(),
+				X:     big.NewInt(0).SetBytes(ecdhPubKey[1:33]),
+				Y:     big.NewInt(0).SetBytes(ecdhPubKey[33:]),
+			},
+			D: big.NewInt(0).SetBytes(ecdhKey.Bytes()),
+		}
 	}
 
 	if conf.tlsMode == tlsDisabled {
