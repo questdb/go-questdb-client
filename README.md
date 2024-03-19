@@ -2,12 +2,15 @@
 
 # go-questdb-client
 
-Golang client for QuestDB's Influx Line Protocol over TCP and HTTP.
+Golang client for QuestDB's [Influx Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+(ILP) over HTTP and TCP. This library makes it easy to insert data into
+[QuestDB](https://questdb.io).
 
 Features:
 * Context-aware API.
 * Optimized for batch writes.
-* Supports TLS encryption and [ILP authentication](https://questdb.io/docs/reference/api/ilp/authenticate).
+* Supports TLS encryption and ILP authentication.
+* Automatic write retries for ILP over HTTP.
 * Tested against QuestDB 7.3.11 and newer versions.
 
 New in v3:
@@ -15,59 +18,7 @@ New in v3:
 
 Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3).
 
-## Usage
-
-### TCP
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"log"
-	"time"
-
-	qdb "github.com/questdb/go-questdb-client/v3"
-)
-
-func main() {
-	ctx := context.TODO()
-	// Connect to QuestDB running on 127.0.0.1:9009
-	sender, err := qdb.NewLineSender(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// Make sure to close the sender on exit to release resources.
-	defer sender.Close()
-	// Send a few ILP messages.
-	err = sender.
-		Table("trades").
-		Symbol("name", "test_ilp1").
-		Float64Column("value", 12.4).
-		AtNow(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = sender.
-		Table("trades").
-		Symbol("name", "test_ilp2").
-		Float64Column("value", 11.4).
-		At(ctx, time.Now().UnixNano())
-	if err != nil {
-		log.Fatal(err)
-	}
-	// Make sure that the messages are sent over the network.
-	err = sender.Flush(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-```
-
-### HTTP
-
-Now supported in v3. For more information, please visit https://questdb.io/docs/reference/api/ilp/overview/#http-and-tcp-overview
+## Quickstart
 
 ```go
 package main
@@ -83,8 +34,8 @@ import (
 
 func main() {
 	ctx := context.TODO()
-	// Connect to QuestDB running on 127.0.0.1:9000
-	sender, err := qdb.NewLineSender()
+	// Connect to QuestDB running locally.
+	sender, err := qdb.LineSenderFromConf(ctx, "http::addr=localhost:9000;")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -114,3 +65,17 @@ func main() {
 	}
 }
 ```
+
+To connect via TCP, set the configuration string to:
+```go
+	// ...
+	sender, err := qdb.LineSenderFromConf(ctx, "tcp::addr=localhost:9009;")
+	// ...
+```
+
+## Community
+
+If you need help, have additional questions or want to provide feedback, you
+may find us on [Slack](https://slack.questdb.io).
+You can also [sign up to our mailing list](https://questdb.io/community/)
+to get notified of new releases.

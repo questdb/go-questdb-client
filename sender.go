@@ -34,10 +34,12 @@ import (
 )
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
-// messages.
+// messages over HTTP or TCP protocol.
 //
 // Each sender corresponds to a single client-server connection.
 // A sender should not be called concurrently by multiple goroutines.
+//
+// HTTP senders also reuse connections from a global pool by default.
 type LineSender interface {
 	// Table sets the table name (metric) for a new ILP message. Should be
 	// called before any Symbol or Column method.
@@ -279,7 +281,8 @@ func WithMinThroughput(bytesPerSecond int) LineSenderOption {
 }
 
 // WithRetryTimeout is the cumulative maximum duration spend in
-// retries. Defaults to 10 seconds.
+// retries. Defaults to 10 seconds. Retries work great when
+// used in combination with server-side data deduplication.
 //
 // Only network-related errors and certain 5xx response
 // codes are retryable.
@@ -344,7 +347,7 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 
 // WithHttpTransport sets the client's http transport to the
 // passed pointer instead of the global transport. This can be
-// used for customizing the http transport used by the HttpLineSender.
+// used for customizing the http transport used by the LineSender.
 // WithTlsInsecureSkipVerify is ignored when this option is in use.
 //
 // Only available for the HTTP sender.
