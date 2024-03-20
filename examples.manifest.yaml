@@ -32,7 +32,7 @@
     port: 9009
 - name: ilp-from-conf
   lang: go
-  path: examples/http/from-conf/main.go
+  path: examples/from-conf/main.go
   header: |-
     Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
     and [repo](https://github.com/questdb/go-questdb-client).
