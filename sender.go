@@ -407,7 +407,7 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 // http(s) and tcp(s):
 // -------------------
 // addr:           hostname/port of QuestDB endpoint
-// init_buf_size:  initial growable ILP buffer size in bytes (defaults to 64KiB)
+// init_buf_size:  initial growable ILP buffer size in bytes (defaults to 128KiB)
 // tls_verify:     determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
 //
 // http(s)-only
@@ -420,13 +420,12 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 // request_min_throughput: bytes per second, used to calculate each request's timeout (defaults to 100KiB/s)
 // request_timeout:        minimum request timeout in milliseconds (defaults to 10 seconds)
 // retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
-// max_buf_size:           buffer growth limit in bytes. client errors if breached (default is 100MiB)
+// max_buf_size:           buffer growth limit in bytes. Client errors if breached (default is 100MiB)
 //
 // tcp(s)-only
 // -----------
 // username:  KID (key ID) for ECDSA authentication
 // token:     Secret K (D) for ECDSA authentication
-
 func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 	c, err := confFromStr(conf)
 	if err != nil {

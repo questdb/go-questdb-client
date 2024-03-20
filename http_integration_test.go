@@ -87,3 +87,38 @@ func (suite *integrationTestSuite) TestE2ESuccessfulHttpBasicAuthWithTlsProxy() 
 		return reflect.DeepEqual(expected, data)
 	}, eventualDataTimeout, 100*time.Millisecond)
 }
+
+func (suite *integrationTestSuite) TestServerSideError() {
+	if testing.Short() {
+		suite.T().Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+
+	var (
+		sender qdb.LineSender
+		err    error
+	)
+
+	questdbC, err := setupQuestDB(ctx, noAuth)
+	assert.NoError(suite.T(), err)
+
+	sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
+	assert.NoError(suite.T(), err)
+
+	err = sender.Table(testTable).Int64Column("long_col", 42).AtNow(ctx)
+	assert.NoError(suite.T(), err)
+	err = sender.Flush(ctx)
+	assert.NoError(suite.T(), err)
+
+	// Now, use wrong type for the long_col.
+	err = sender.Table(testTable).StringColumn("long_col", "42").AtNow(ctx)
+	assert.NoError(suite.T(), err)
+	err = sender.Flush(ctx)
+	assert.Error(suite.T(), err)
+	assert.ErrorContains(suite.T(), err, "my_test_table, column: long_col; cast error from protocol type: STRING to column type")
+	assert.ErrorContains(suite.T(), err, "line: 1")
+
+	sender.Close(ctx)
+	questdbC.Stop(ctx)
+}

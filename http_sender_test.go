@@ -143,6 +143,14 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 	}
 }
 
+func TestErrorWhenSenderTypeIsNotSpecified(t *testing.T) {
+	ctx := context.Background()
+
+	_, err := qdb.NewLineSender(ctx)
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "sender type is not specified: use WithHttp or WithTcp")
+}
+
 func TestHttpErrorWhenMaxBufferSizeIsReached(t *testing.T) {
 	ctx := context.Background()
 
