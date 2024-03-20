@@ -27,12 +27,12 @@ package questdb_test
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 	"testing"
 
-	qdb "github.com/questdb/go-questdb-client/v2"
+	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -64,7 +64,7 @@ type testResult struct {
 	Line   string `json:"line"`
 }
 
-func TestClientInterop(t *testing.T) {
+func TestTcpClientInterop(t *testing.T) {
 	ctx := context.Background()
 
 	testCases, err := readTestCases()
@@ -72,10 +72,10 @@ func TestClientInterop(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			srv, err := newTestServer(sendToBackChannel)
+			srv, err := newTestTcpServer(sendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithAddress(srv.addr))
+			sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
 			assert.NoError(t, err)
 
 			sender.Table(tc.Table)
@@ -105,27 +105,81 @@ func TestClientInterop(t *testing.T) {
 				err = sender.Flush(ctx)
 				assert.NoError(t, err)
 
-				expectLines(t, srv.backCh, strings.Split(tc.Result.Line, "\n"))
+				expectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
 			case "ERROR":
 				assert.Error(t, err)
 			default:
 				assert.Fail(t, "unexpected test status: "+tc.Result.Status)
 			}
 
-			sender.Close()
-			srv.close()
+			sender.Close(ctx)
+			srv.Close()
+		})
+	}
+}
+
+func TestHttpClientInterop(t *testing.T) {
+	ctx := context.Background()
+
+	testCases, err := readTestCases()
+	assert.NoError(t, err)
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			srv, err := newTestHttpServer(sendToBackChannel)
+			assert.NoError(t, err)
+
+			sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+			assert.NoError(t, err)
+
+			sender.Table(tc.Table)
+			for _, s := range tc.Symbols {
+				sender.Symbol(s.Name, s.Value)
+			}
+			for _, s := range tc.Columns {
+				switch s.Type {
+				case "LONG":
+					sender.Int64Column(s.Name, int64(s.Value.(float64)))
+				case "DOUBLE":
+					sender.Float64Column(s.Name, s.Value.(float64))
+				case "STRING":
+					sender.StringColumn(s.Name, s.Value.(string))
+				case "BOOLEAN":
+					sender.BoolColumn(s.Name, s.Value.(bool))
+				default:
+					assert.Fail(t, "unexpected column type: "+s.Type)
+				}
+			}
+
+			err = sender.AtNow(ctx)
+
+			switch tc.Result.Status {
+			case "SUCCESS":
+				assert.NoError(t, err)
+				err = sender.Flush(ctx)
+				assert.NoError(t, err)
+
+				expectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
+			case "ERROR":
+				assert.Error(t, err)
+			default:
+				assert.Fail(t, "unexpected test status: "+tc.Result.Status)
+			}
+
+			sender.Close(ctx)
+			srv.Close()
 		})
 	}
 }
 
 func readTestCases() (testCases, error) {
-	file, err := os.Open("./test/interop/ilp-client-interop-test.json")
+	file, err := os.Open("./test/interop/questdb-client-test/ilp-client-interop-test.json")
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	content, err := ioutil.ReadAll(file)
+	content, err := io.ReadAll(file)
 	if err != nil {
 		return nil, err
 	}

@@ -25,32 +25,146 @@
 package questdb
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
-	"net"
-	"strconv"
+	"net/http"
 	"time"
 )
 
-// ErrInvalidMsg indicates a failed attempt to construct an ILP
-// message, e.g. duplicate calls to Table method or illegal
-// chars found in table or column name.
-var ErrInvalidMsg = errors.New("invalid message")
+// LineSender allows you to insert rows into QuestDB by sending ILP
+// messages over HTTP or TCP protocol.
+//
+// Each sender corresponds to a single client-server connection.
+// A sender should not be called concurrently by multiple goroutines.
+//
+// HTTP senders also reuse connections from a global pool by default.
+type LineSender interface {
+	// Table sets the table name (metric) for a new ILP message. Should be
+	// called before any Symbol or Column method.
+	//
+	// Table name cannot contain any of the following characters:
+	// '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
+	// '%', '~', starting '.', trailing '.', or a non-printable char.
+	Table(name string) LineSender
+
+	// Symbol adds a symbol column value to the ILP message. Should be called
+	// before any Column method.
+	//
+	// Symbol name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	Symbol(name, val string) LineSender
+
+	// Int64Column adds a 64-bit integer (long) column value to the ILP
+	// message.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	Int64Column(name string, val int64) LineSender
+
+	// Long256Column adds a 256-bit unsigned integer (long256) column
+	// value to the ILP message.
+	//
+	// Only non-negative numbers that fit into 256-bit unsigned integer are
+	// supported and any other input value would lead to an error.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	Long256Column(name string, val *big.Int) LineSender
+
+	// TimestampColumn adds a timestamp column value to the ILP
+	// message.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	TimestampColumn(name string, ts time.Time) LineSender
+
+	// Float64Column adds a 64-bit float (double) column value to the ILP
+	// message.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	Float64Column(name string, val float64) LineSender
+
+	// StringColumn adds a string column value to the ILP message.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	StringColumn(name, val string) LineSender
+
+	// BoolColumn adds a boolean column value to the ILP message.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	BoolColumn(name string, val bool) LineSender
+
+	// At sets the timestamp in Epoch nanoseconds and finalizes
+	// the ILP message.
+	//
+	// If the underlying buffer reaches configured capacity or the
+	// number of buffered messages exceeds the auto-flush trigger, this
+	// method also sends the accumulated messages.
+	//
+	// If ts.IsZero(), no timestamp is sent to the server.
+	At(ctx context.Context, ts time.Time) error
+
+	// AtNow omits the timestamp and finalizes the ILP message.
+	// The server will insert each message using the system clock
+	// as the row timestamp.
+	//
+	// If the underlying buffer reaches configured capacity or the
+	// number of buffered messages exceeds the auto-flush trigger, this
+	// method also sends the accumulated messages.
+	AtNow(ctx context.Context) error
+
+	// Flush sends the accumulated messages via the underlying
+	// connection. Should be called periodically to make sure that
+	// all messages are sent to the server.
+	//
+	// For optimal performance, this method should not be called after
+	// each ILP message. Instead, the messages should be written in
+	// batches followed by a Flush call. The optimal batch size may
+	// vary from one thousand to few thousand messages depending on
+	// the message size.
+	Flush(ctx context.Context) error
+
+	// Close closes the underlying HTTP client.
+	//
+	// If auto-flush is enabled, the client will flush any remaining buffered
+	// messages before closing itself.
+	Close(ctx context.Context) error
+}
 
 const (
-	defaultBufferCapacity = 128 * 1024
+	defaultHttpAddress = "127.0.0.1:9000"
+	defaultTcpAddress  = "127.0.0.1:9009"
+
+	defaultInitBufferSize = 128 * 1024        // 128KB
+	defaultMaxBufferSize  = 100 * 1024 * 1024 // 100MB
 	defaultFileNameLimit  = 127
+
+	defaultAutoFlushRows     = 75000
+	defaultAutoFlushInterval = time.Second
+
+	defaultMinThroughput  = 100 * 1024 // 100KB/s
+	defaultRetryTimeout   = 10 * time.Second
+	defaultRequestTimeout = 10 * time.Second
+)
+
+type senderType int64
+
+const (
+	noSenderType   senderType = 0
+	httpSenderType senderType = 1
+	tcpSenderType  senderType = 2
 )
 
 type tlsMode int64
@@ -61,74 +175,144 @@ const (
 	tlsInsecureSkipVerify tlsMode = 2
 )
 
-// LineSender allows you to insert rows into QuestDB by sending ILP
-// messages.
-//
-// Each sender corresponds to a single TCP connection. A sender
-// should not be called concurrently by multiple goroutines.
-type LineSender struct {
+type lineSenderConfig struct {
+	senderType    senderType
 	address       string
-	tlsMode       tlsMode
-	keyId         string // Erased once auth is done.
-	key           string // Erased once auth is done.
-	bufCap        int
+	initBufSize   int
+	maxBufSize    int
 	fileNameLimit int
-	conn          net.Conn
-	buf           *buffer
-	lastMsgPos    int
-	lastErr       error
-	hasTable      bool
-	hasTags       bool
-	hasFields     bool
+	httpTransport *http.Transport
+
+	// Retry/timeout-related fields
+	retryTimeout   time.Duration
+	minThroughput  int
+	requestTimeout time.Duration
+
+	// Authentication-related fields
+	tlsMode   tlsMode
+	tcpKeyId  string
+	tcpKey    string
+	httpUser  string
+	httpPass  string
+	httpToken string
+
+	// Auto-flush fields
+	autoFlushRows     int
+	autoFlushInterval time.Duration
 }
 
-// LineSenderOption defines line sender option.
-type LineSenderOption func(*LineSender)
+// LineSenderOption defines line sender config option.
+type LineSenderOption func(*lineSenderConfig)
 
-// WithAddress sets address to connect to. Should be in the
-// "host:port" format. Defaults to "127.0.0.1:9009".
-func WithAddress(address string) LineSenderOption {
-	return func(s *LineSender) {
-		s.address = address
+// WithHttp enables ingestion over HTTP protocol.
+func WithHttp() LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.senderType = httpSenderType
 	}
 }
 
-// WithAuth sets token (private key) used for ILP authentication.
-func WithAuth(tokenId, token string) LineSenderOption {
-	return func(s *LineSender) {
-		s.keyId = tokenId
-		s.key = token
+// WithTcp enables ingestion over TCP protocol.
+func WithTcp() LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.senderType = tcpSenderType
 	}
 }
 
 // WithTls enables TLS connection encryption.
 func WithTls() LineSenderOption {
-	return func(s *LineSender) {
+	return func(s *lineSenderConfig) {
 		s.tlsMode = tlsEnabled
 	}
 }
 
-// WithTlsInsecureSkipVerify enables TLS connection encryption,
-// but skips server certificate verification. Useful in test
-// environments with self-signed certificates. Do not use in
-// production environments.
-func WithTlsInsecureSkipVerify() LineSenderOption {
-	return func(s *LineSender) {
-		s.tlsMode = tlsInsecureSkipVerify
+// WithAuth sets token (private key) used for ILP authentication.
+//
+// Only available for the TCP sender.
+func WithAuth(tokenId, token string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.tcpKeyId = tokenId
+		s.tcpKey = token
 	}
 }
 
-// WithBufferCapacity sets desired buffer capacity in bytes to
-// be used when sending ILP messages. Defaults to 128KB.
+// WithBasicAuth sets a Basic authentication header for
+// ILP requests over HTTP.
+//
+// Only available for the HTTP sender.
+func WithBasicAuth(user, pass string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.httpUser = user
+		s.httpPass = pass
+	}
+}
+
+// WithBearerToken sets a Bearer token Authentication header for
+// ILP requests.
+//
+// Only available for the HTTP sender.
+func WithBearerToken(token string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.httpToken = token
+	}
+}
+
+// WithRequestTimeout is used in combination with min_throughput
+// to set the timeout of an ILP request. Defaults to 10 seconds.
+//
+// timeout = (request.len() / min_throughput) + request_timeout
+//
+// Only available for the HTTP sender.
+func WithRequestTimeout(timeout time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.requestTimeout = timeout
+	}
+}
+
+// WithMinThroughput is used in combination with request_timeout
+// to set the timeout of an ILP request. Defaults to 100KiB/s.
+//
+// timeout = (request.len() / min_throughput) + request_timeout
+//
+// Only available for the HTTP sender.
+func WithMinThroughput(bytesPerSecond int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.minThroughput = bytesPerSecond
+	}
+}
+
+// WithRetryTimeout is the cumulative maximum duration spend in
+// retries. Defaults to 10 seconds. Retries work great when
+// used in combination with server-side data deduplication.
+//
+// Only network-related errors and certain 5xx response
+// codes are retryable.
+//
+// Only available for the HTTP sender.
+func WithRetryTimeout(t time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.retryTimeout = t
+	}
+}
+
+// WithInitBufferSize sets the desired initial buffer capacity
+// in bytes to be used when sending ILP messages. Defaults to 128KB.
 //
 // This setting is a soft limit, i.e. the underlying buffer may
-// grow larger than the provided value, but will shrink on a
-// At, AtNow, or Flush call.
-func WithBufferCapacity(capacity int) LineSenderOption {
-	return func(s *LineSender) {
-		if capacity > 0 {
-			s.bufCap = capacity
-		}
+// grow larger than the provided value.
+func WithInitBufferSize(sizeInBytes int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.initBufSize = sizeInBytes
+	}
+}
+
+// WithMaxBufferSize sets the maximum buffer capacity
+// in bytes to be used when sending ILP messages. The sender will
+// return an error if the limit is reached. Defaults to 100MB.
+//
+// Only available for the HTTP sender.
+func WithMaxBufferSize(sizeInBytes int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.maxBufSize = sizeInBytes
 	}
 }
 
@@ -137,723 +321,265 @@ func WithBufferCapacity(capacity int) LineSenderOption {
 // lengths accepted by the sender. Should be set to the same value
 // as on the server. Defaults to 127.
 func WithFileNameLimit(limit int) LineSenderOption {
-	return func(s *LineSender) {
-		if limit > 0 {
-			s.fileNameLimit = limit
-		}
+	return func(s *lineSenderConfig) {
+		s.fileNameLimit = limit
 	}
+}
+
+// WithAddress sets address to connect to. Should be in the
+// "host:port" format. Defaults to "127.0.0.1:9000" in case
+// of HTTP and "127.0.0.1:9009" in case of TCP.
+func WithAddress(addr string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.address = addr
+	}
+}
+
+// WithTlsInsecureSkipVerify enables TLS connection encryption,
+// but skips server certificate verification. Useful in test
+// environments with self-signed certificates. Do not use in
+// production environments.
+func WithTlsInsecureSkipVerify() LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.tlsMode = tlsInsecureSkipVerify
+	}
+}
+
+// WithHttpTransport sets the client's http transport to the
+// passed pointer instead of the global transport. This can be
+// used for customizing the http transport used by the LineSender.
+// WithTlsInsecureSkipVerify is ignored when this option is in use.
+//
+// Only available for the HTTP sender.
+func WithHttpTransport(t *http.Transport) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.httpTransport = t
+	}
+}
+
+// WithAutoFlushDisabled turns off auto-flushing behavior.
+// To send ILP messages, the user must call Flush().
+//
+// Only available for the HTTP sender.
+func WithAutoFlushDisabled() LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.autoFlushRows = 0
+		s.autoFlushInterval = 0
+	}
+}
+
+// WithAutoFlushRows sets the number of buffered rows that
+// must be breached in order to trigger an auto-flush.
+// Defaults to 75000.
+//
+// Only available for the HTTP sender.
+func WithAutoFlushRows(rows int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.autoFlushRows = rows
+	}
+}
+
+// WithAutoFlushInterval the interval at which the Sender
+// automatically flushes its buffer. Defaults to 1 second.
+//
+// Only available for the HTTP sender.
+func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.autoFlushInterval = interval
+	}
+}
+
+// LineSenderFromConf creates a LineSender using the QuestDB config string format.
+//
+// Example config string: "http::addr=localhost;username=joe;password=123;auto_flush_rows=1000;"
+//
+// QuestDB ILP clients use a common key-value configuration string format across all
+// implementations. We opted for this config over a URL because it reduces the amount
+// of character escaping required for paths and base64-encoded param values.
+//
+// The config string format is as follows:
+//
+// schema::key1=value1;key2=value2;key3=value3;
+//
+// Schemas supported are "http", "https", "tcp", "tcps"
+//
+// Options:
+// http(s) and tcp(s):
+// -------------------
+// addr:           hostname/port of QuestDB endpoint
+// init_buf_size:  initial growable ILP buffer size in bytes (defaults to 128KiB)
+// tls_verify:     determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
+//
+// http(s)-only
+// ------------
+// username:               for basic authentication
+// password:               for basic authentication
+// token:                  bearer token auth (used instead of basic authentication)
+// auto_flush:             determines if auto-flushing is enabled (values "on" or "off", defaults to "on")
+// auto_flush_rows:        auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on
+// request_min_throughput: bytes per second, used to calculate each request's timeout (defaults to 100KiB/s)
+// request_timeout:        minimum request timeout in milliseconds (defaults to 10 seconds)
+// retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
+// max_buf_size:           buffer growth limit in bytes. Client errors if breached (default is 100MiB)
+//
+// tcp(s)-only
+// -----------
+// username:  KID (key ID) for ECDSA authentication
+// token:     Secret K (D) for ECDSA authentication
+func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
+	c, err := confFromStr(conf)
+	if err != nil {
+		return nil, err
+	}
+	return newLineSender(ctx, c)
 }
 
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
-// sender corresponds to a single TCP connection. Sender should
+// sender corresponds to a single client connection. LineSender should
 // not be called concurrently by multiple goroutines.
-func NewLineSender(ctx context.Context, opts ...LineSenderOption) (*LineSender, error) {
-	var (
-		d    net.Dialer
-		key  *ecdsa.PrivateKey
-		conn net.Conn
-		err  error
-	)
-
-	s := &LineSender{
-		address:       "127.0.0.1:9009",
-		bufCap:        defaultBufferCapacity,
-		fileNameLimit: defaultFileNameLimit,
-		tlsMode:       tlsDisabled,
-	}
+func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, error) {
+	conf := &lineSenderConfig{}
 	for _, opt := range opts {
-		opt(s)
+		opt(conf)
 	}
+	return newLineSender(ctx, conf)
+}
 
-	if s.keyId != "" && s.key != "" {
-		keyRaw, err := base64.RawURLEncoding.DecodeString(s.key)
+func newLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
+	switch conf.senderType {
+	case tcpSenderType:
+		err := sanitizeTcpConf(conf)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode auth key: %v", err)
+			return nil, err
 		}
-		key = new(ecdsa.PrivateKey)
-		key.PublicKey.Curve = elliptic.P256()
-		key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(keyRaw)
-		key.D = new(big.Int).SetBytes(keyRaw)
+		return newTcpLineSender(ctx, conf)
+	case httpSenderType:
+		err := sanitizeHttpConf(conf)
+		if err != nil {
+			return nil, err
+		}
+		return newHttpLineSender(conf)
 	}
+	return nil, errors.New("sender type is not specified: use WithHttp or WithTcp")
+}
 
-	if s.tlsMode == tlsDisabled {
-		conn, err = d.DialContext(ctx, "tcp", s.address)
-	} else {
-		config := &tls.Config{}
-		if s.tlsMode == tlsInsecureSkipVerify {
-			config.InsecureSkipVerify = true
-		}
-		conn, err = tls.DialWithDialer(&d, "tcp", s.address, config)
-	}
+func sanitizeTcpConf(conf *lineSenderConfig) error {
+	err := validateConf(conf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to server: %v", err)
-	}
-
-	if key != nil {
-		if deadline, ok := ctx.Deadline(); ok {
-			conn.SetDeadline(deadline)
-		}
-
-		_, err = conn.Write([]byte(s.keyId + "\n"))
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to write key id: %v", err)
-		}
-
-		reader := bufio.NewReader(conn)
-		raw, err := reader.ReadBytes('\n')
-		if len(raw) < 2 {
-			conn.Close()
-			return nil, fmt.Errorf("empty challenge response from server: %v", err)
-		}
-		// Remove the `\n` in the last position.
-		raw = raw[:len(raw)-1]
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to read challenge response from server: %v", err)
-		}
-
-		// Hash the challenge with sha256.
-		hash := crypto.SHA256.New()
-		hash.Write(raw)
-		hashed := hash.Sum(nil)
-
-		stdSig, err := ecdsa.SignASN1(rand.Reader, key, hashed)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to sign challenge using auth key: %v", err)
-		}
-		_, err = conn.Write([]byte(base64.StdEncoding.EncodeToString(stdSig) + "\n"))
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to write signed challenge: %v", err)
-		}
-
-		// Reset the deadline.
-		conn.SetDeadline(time.Time{})
-		// Erase the key values since we don't need them anymore.
-		s.key = ""
-		s.keyId = ""
-	}
-
-	s.conn = conn
-	s.buf = newBuffer(s.bufCap)
-	return s, nil
-}
-
-// Close closes the underlying TCP connection. Does not flush
-// in-flight messages, so make sure to call Flush first.
-func (s *LineSender) Close() error {
-	return s.conn.Close()
-}
-
-// Table sets the table name (metric) for a new ILP message. Should be
-// called before any Symbol or Column method.
-//
-// Table name cannot contain any of the following characters:
-// '\n', '\r', '?', ',', ”', '"', '\', '/', ':', ')', '(', '+', '*',
-// '%', '~', starting '.', trailing '.', or a non-printable char.
-func (s *LineSender) Table(name string) *LineSender {
-	if s.lastErr != nil {
-		return s
-	}
-	if s.hasTable {
-		s.lastErr = fmt.Errorf("table name already provided: %w", ErrInvalidMsg)
-		return s
-	}
-	s.lastErr = s.writeTableName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.hasTable = true
-	return s
-}
-
-// Symbol adds a symbol column value to the ILP message. Should be called
-// before any Column method.
-//
-// Symbol name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Symbol(name, val string) *LineSender {
-	if s.lastErr != nil {
-		return s
-	}
-	if !s.hasTable {
-		s.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
-		return s
-	}
-	if s.hasFields {
-		s.lastErr = fmt.Errorf("symbols have to be written before any other column: %w", ErrInvalidMsg)
-		return s
-	}
-	s.buf.WriteByte(',')
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.buf.WriteByte('=')
-	s.lastErr = s.writeStrValue(val, false)
-	if s.lastErr != nil {
-		return s
-	}
-	s.hasTags = true
-	return s
-}
-
-// Int64Column adds a 64-bit integer (long) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Int64Column(name string, val int64) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.buf.WriteByte('=')
-	s.buf.WriteInt(val)
-	s.buf.WriteByte('i')
-	s.hasFields = true
-	return s
-}
-
-// Long256Column adds a 256-bit unsigned integer (long256) column
-// value to the ILP message.
-//
-// Only non-negative numbers that fit into 256-bit unsigned integer are
-// supported and any other input value would lead to an error.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Long256Column(name string, val *big.Int) *LineSender {
-	if val.Sign() < 0 {
-		if s.lastErr != nil {
-			return s
-		}
-		s.lastErr = fmt.Errorf("long256 cannot be negative: %s", val.String())
-		return s
-	}
-	if val.BitLen() > 256 {
-		if s.lastErr != nil {
-			return s
-		}
-		s.lastErr = fmt.Errorf("long256 cannot be larger than 256-bit: %v", val.BitLen())
-		return s
-	}
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.buf.WriteByte('=')
-	s.buf.WriteByte('0')
-	s.buf.WriteByte('x')
-	s.buf.WriteBigInt(val)
-	s.buf.WriteByte('i')
-	if s.lastErr != nil {
-		return s
-	}
-	s.hasFields = true
-	return s
-}
-
-// TimestampColumn adds a timestamp column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) TimestampColumn(name string, ts time.Time) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.buf.WriteByte('=')
-	s.buf.WriteInt(ts.UnixMicro())
-	s.buf.WriteByte('t')
-	s.hasFields = true
-	return s
-}
-
-// Float64Column adds a 64-bit float (double) column value to the ILP
-// message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) Float64Column(name string, val float64) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.buf.WriteByte('=')
-	s.buf.WriteFloat(val)
-	s.hasFields = true
-	return s
-}
-
-// StringColumn adds a string column value to the ILP message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) StringColumn(name, val string) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.buf.WriteByte('=')
-	s.buf.WriteByte('"')
-	s.lastErr = s.writeStrValue(val, true)
-	if s.lastErr != nil {
-		return s
-	}
-	s.buf.WriteByte('"')
-	s.hasFields = true
-	return s
-}
-
-// BoolColumn adds a boolean column value to the ILP message.
-//
-// Column name cannot contain any of the following characters:
-// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
-// '-', '*' '%%', '~', or a non-printable char.
-func (s *LineSender) BoolColumn(name string, val bool) *LineSender {
-	if !s.prepareForField(name) {
-		return s
-	}
-	s.lastErr = s.writeColumnName(name)
-	if s.lastErr != nil {
-		return s
-	}
-	s.buf.WriteByte('=')
-	if val {
-		s.buf.WriteByte('t')
-	} else {
-		s.buf.WriteByte('f')
-	}
-	s.hasFields = true
-	return s
-}
-
-func (s *LineSender) writeTableName(str string) error {
-	if str == "" {
-		return fmt.Errorf("table name cannot be empty: %w", ErrInvalidMsg)
-	}
-	// We use string length in bytes as an approximation. That's to
-	// avoid calculating the number of runes.
-	if len(str) > s.fileNameLimit {
-		return fmt.Errorf("table name length exceeds the limit: %w", ErrInvalidMsg)
-	}
-	// Since we're interested in ASCII chars, it's fine to iterate
-	// through bytes instead of runes.
-	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
-		case ' ':
-			s.buf.WriteByte('\\')
-		case '=':
-			s.buf.WriteByte('\\')
-		case '.':
-			if i == 0 || i == len(str)-1 {
-				return fmt.Errorf("table name contains '.' char at the start or end: %s: %w", str, ErrInvalidMsg)
-			}
-		default:
-			if illegalTableNameChar(b) {
-				return fmt.Errorf("table name contains an illegal char: "+
-					"'\\n', '\\r', '?', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '*' '%%', '~', or a non-printable char: %s: %w",
-					str, ErrInvalidMsg)
-			}
-		}
-		s.buf.WriteByte(b)
-	}
-	return nil
-}
-
-func illegalTableNameChar(ch byte) bool {
-	switch ch {
-	case '\n':
-		return true
-	case '\r':
-		return true
-	case '?':
-		return true
-	case ',':
-		return true
-	case '\'':
-		return true
-	case '"':
-		return true
-	case '\\':
-		return true
-	case '/':
-		return true
-	case ':':
-		return true
-	case ')':
-		return true
-	case '(':
-		return true
-	case '+':
-		return true
-	case '*':
-		return true
-	case '%':
-		return true
-	case '~':
-		return true
-	case '\u0000':
-		return true
-	case '\u0001':
-		return true
-	case '\u0002':
-		return true
-	case '\u0003':
-		return true
-	case '\u0004':
-		return true
-	case '\u0005':
-		return true
-	case '\u0006':
-		return true
-	case '\u0007':
-		return true
-	case '\u0008':
-		return true
-	case '\u0009':
-		return true
-	case '\u000b':
-		return true
-	case '\u000c':
-		return true
-	case '\u000e':
-		return true
-	case '\u000f':
-		return true
-	case '\u007f':
-		return true
-	}
-	return false
-}
-
-func (s *LineSender) writeColumnName(str string) error {
-	if str == "" {
-		return fmt.Errorf("column name cannot be empty: %w", ErrInvalidMsg)
-	}
-	// We use string length in bytes as an approximation. That's to
-	// avoid calculating the number of runes.
-	if len(str) > s.fileNameLimit {
-		return fmt.Errorf("column name length exceeds the limit: %w", ErrInvalidMsg)
-	}
-	// Since we're interested in ASCII chars, it's fine to iterate
-	// through bytes instead of runes.
-	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
-		case ' ':
-			s.buf.WriteByte('\\')
-		case '=':
-			s.buf.WriteByte('\\')
-		default:
-			if illegalColumnNameChar(b) {
-				return fmt.Errorf("column name contains an illegal char: "+
-					"'\\n', '\\r', '?', '.', ',', ''', '\"', '\\', '/', ':', ')', '(', '+', '-', '*' '%%', '~', or a non-printable char: %s: %w",
-					str, ErrInvalidMsg)
-			}
-		}
-		s.buf.WriteByte(b)
-	}
-	return nil
-}
-
-func illegalColumnNameChar(ch byte) bool {
-	switch ch {
-	case '\n':
-		return true
-	case '\r':
-		return true
-	case '?':
-		return true
-	case '.':
-		return true
-	case ',':
-		return true
-	case '\'':
-		return true
-	case '"':
-		return true
-	case '\\':
-		return true
-	case '/':
-		return true
-	case ':':
-		return true
-	case ')':
-		return true
-	case '(':
-		return true
-	case '+':
-		return true
-	case '-':
-		return true
-	case '*':
-		return true
-	case '%':
-		return true
-	case '~':
-		return true
-	case '\u0000':
-		return true
-	case '\u0001':
-		return true
-	case '\u0002':
-		return true
-	case '\u0003':
-		return true
-	case '\u0004':
-		return true
-	case '\u0005':
-		return true
-	case '\u0006':
-		return true
-	case '\u0007':
-		return true
-	case '\u0008':
-		return true
-	case '\u0009':
-		return true
-	case '\u000b':
-		return true
-	case '\u000c':
-		return true
-	case '\u000e':
-		return true
-	case '\u000f':
-		return true
-	case '\u007f':
-		return true
-	}
-	return false
-}
-
-func (s *LineSender) writeStrValue(str string, quoted bool) error {
-	// Since we're interested in ASCII chars, it's fine to iterate
-	// through bytes instead of runes.
-	for i := 0; i < len(str); i++ {
-		b := str[i]
-		switch b {
-		case ' ':
-			if !quoted {
-				s.buf.WriteByte('\\')
-			}
-		case ',':
-			if !quoted {
-				s.buf.WriteByte('\\')
-			}
-		case '=':
-			if !quoted {
-				s.buf.WriteByte('\\')
-			}
-		case '"':
-			if quoted {
-				s.buf.WriteByte('\\')
-			}
-		case '\n':
-			s.buf.WriteByte('\\')
-		case '\r':
-			s.buf.WriteByte('\\')
-		case '\\':
-			s.buf.WriteByte('\\')
-		}
-		s.buf.WriteByte(b)
-	}
-	return nil
-}
-
-func (s *LineSender) prepareForField(name string) bool {
-	if s.lastErr != nil {
-		return false
-	}
-	if !s.hasTable {
-		s.lastErr = fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
-		return false
-	}
-	if !s.hasFields {
-		s.buf.WriteByte(' ')
-	} else {
-		s.buf.WriteByte(',')
-	}
-	return true
-}
-
-// AtNow omits the timestamp and finalizes the ILP message.
-// The server will insert each message using the system clock
-// as the row timestamp.
-//
-// If the underlying buffer reaches configured capacity, this
-// method also sends the accumulated messages.
-func (s *LineSender) AtNow(ctx context.Context) error {
-	return s.at(ctx, time.Time{}, false)
-}
-
-// At sets the timestamp in Epoch nanoseconds and finalizes
-// the ILP message.
-//
-// If the underlying buffer reaches configured capacity, this
-// method also sends the accumulated messages.
-func (s *LineSender) At(ctx context.Context, ts time.Time) error {
-	return s.at(ctx, ts, true)
-}
-
-func (s *LineSender) at(ctx context.Context, ts time.Time, sendTs bool) error {
-	err := s.lastErr
-	s.lastErr = nil
-	if err != nil {
-		s.discardPendingMsg()
-		return err
-	}
-	if !s.hasTable {
-		s.discardPendingMsg()
-		return fmt.Errorf("table name was not provided: %w", ErrInvalidMsg)
-	}
-	if !s.hasTags && !s.hasFields {
-		s.discardPendingMsg()
-		return fmt.Errorf("no symbols or columns were provided: %w", ErrInvalidMsg)
-	}
-
-	if sendTs {
-		s.buf.WriteByte(' ')
-		s.buf.WriteInt(ts.UnixNano())
-	}
-	s.buf.WriteByte('\n')
-
-	s.lastMsgPos = s.buf.Len()
-	s.resetMsgFlags()
-
-	if s.buf.Len() > s.bufCap {
-		return s.Flush(ctx)
-	}
-	return nil
-}
-
-// Flush flushes the accumulated messages to the underlying TCP
-// connection. Should be called periodically to make sure that
-// all messages are sent to the server.
-//
-// For optimal performance, this method should not be called after
-// each ILP message. Instead, the messages should be written in
-// batches followed by a Flush call. Optimal batch size may vary
-// from 100 to 1,000 messages depending on the message size and
-// configured buffer capacity.
-func (s *LineSender) Flush(ctx context.Context) error {
-	err := s.lastErr
-	s.lastErr = nil
-	if err != nil {
-		s.discardPendingMsg()
-		return err
-	}
-	if s.hasTable {
-		s.discardPendingMsg()
-		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
-	}
-
-	if err = ctx.Err(); err != nil {
-		return err
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		s.conn.SetWriteDeadline(deadline)
-	} else {
-		s.conn.SetWriteDeadline(time.Time{})
-	}
-
-	n, err := s.buf.WriteTo(s.conn)
-	if err != nil {
-		s.lastMsgPos -= int(n)
 		return err
 	}
 
-	// bytes.Buffer grows as 2*cap+n, so we use 3x as the threshold.
-	if s.buf.Cap() > 3*s.bufCap {
-		// Shrink the buffer back to desired capacity.
-		s.buf = newBuffer(s.bufCap)
+	// validate tcp-specific settings
+	if conf.requestTimeout != 0 {
+		return errors.New("requestTimeout setting is not available in the TCP client")
 	}
-	s.lastMsgPos = 0
+	if conf.retryTimeout != 0 {
+		return errors.New("retryTimeout setting is not available in the TCP client")
+	}
+	if conf.minThroughput != 0 {
+		return errors.New("minThroughput setting is not available in the TCP client")
+	}
+	if conf.autoFlushRows != 0 {
+		return errors.New("autoFlushRows setting is not available in the TCP client")
+	}
+	if conf.autoFlushInterval != 0 {
+		return errors.New("autoFlushInterval setting is not available in the TCP client")
+	}
+	if conf.maxBufSize != 0 {
+		return errors.New("maxBufferSize setting is not available in the TCP client")
+	}
+	if conf.tcpKey == "" && conf.tcpKeyId != "" {
+		return errors.New("tcpKey is empty and tcpKeyId is not. both (or none) must be provided")
+	}
+	if conf.tcpKeyId == "" && conf.tcpKey != "" {
+		return errors.New("tcpKeyId is empty and tcpKey is not. both (or none) must be provided")
+	}
+
+	// Set defaults
+	if conf.address == "" {
+		conf.address = defaultTcpAddress
+	}
+	if conf.initBufSize == 0 {
+		conf.initBufSize = defaultInitBufferSize
+	}
+	if conf.fileNameLimit == 0 {
+		conf.fileNameLimit = defaultFileNameLimit
+	}
 
 	return nil
 }
 
-func (s *LineSender) discardPendingMsg() {
-	s.buf.Truncate(s.lastMsgPos)
-	s.resetMsgFlags()
-}
-
-func (s *LineSender) resetMsgFlags() {
-	s.hasTable = false
-	s.hasTags = false
-	s.hasFields = false
-}
-
-// Messages returns a copy of accumulated ILP messages that are not
-// flushed to the TCP connection yet. Useful for debugging purposes.
-func (s *LineSender) Messages() string {
-	return s.buf.String()
-}
-
-// buffer is a wrapper on top of bytes.buffer. It extends the
-// original struct with methods for writing int64 and float64
-// numbers without unnecessary allocations.
-type buffer struct {
-	bytes.Buffer
-}
-
-func newBuffer(cap int) *buffer {
-	return &buffer{*bytes.NewBuffer(make([]byte, 0, cap))}
-}
-
-func (b *buffer) WriteInt(i int64) {
-	// We need up to 20 bytes to fit an int64, including a sign.
-	var a [20]byte
-	s := strconv.AppendInt(a[0:0], i, 10)
-	b.Write(s)
-}
-
-func (b *buffer) WriteFloat(f float64) {
-	if math.IsNaN(f) {
-		b.WriteString("NaN")
-		return
-	} else if math.IsInf(f, -1) {
-		b.WriteString("-Infinity")
-		return
-	} else if math.IsInf(f, 1) {
-		b.WriteString("Infinity")
-		return
+func sanitizeHttpConf(conf *lineSenderConfig) error {
+	err := validateConf(conf)
+	if err != nil {
+		return err
 	}
-	// We need up to 24 bytes to fit a float64, including a sign.
-	var a [24]byte
-	s := strconv.AppendFloat(a[0:0], f, 'G', -1, 64)
-	b.Write(s)
+
+	// validate http-specific settings
+	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
+		return errors.New("both basic and token authentication cannot be used")
+	}
+
+	// Set defaults
+	if conf.address == "" {
+		conf.address = defaultHttpAddress
+	}
+	if conf.requestTimeout == 0 {
+		conf.requestTimeout = defaultRequestTimeout
+	}
+	if conf.retryTimeout == 0 {
+		conf.retryTimeout = defaultRetryTimeout
+	}
+	if conf.minThroughput == 0 {
+		conf.minThroughput = defaultMinThroughput
+	}
+	if conf.autoFlushRows == 0 {
+		conf.autoFlushRows = defaultAutoFlushRows
+	}
+	if conf.autoFlushInterval == 0 {
+		conf.autoFlushInterval = defaultAutoFlushInterval
+	}
+	if conf.initBufSize == 0 {
+		conf.initBufSize = defaultInitBufferSize
+	}
+	if conf.maxBufSize == 0 {
+		conf.maxBufSize = defaultMaxBufferSize
+	}
+	if conf.fileNameLimit == 0 {
+		conf.fileNameLimit = defaultFileNameLimit
+	}
+
+	return nil
 }
 
-func (b *buffer) WriteBigInt(i *big.Int) {
-	// We need up to 64 bytes to fit an unsigned 256-bit number.
-	var a [64]byte
-	s := i.Append(a[0:0], 16)
-	b.Write(s)
+func validateConf(conf *lineSenderConfig) error {
+	if conf.initBufSize < 0 {
+		return fmt.Errorf("initial buffer size is negative: %d", conf.initBufSize)
+	}
+	if conf.maxBufSize < 0 {
+		return fmt.Errorf("max buffer size is negative: %d", conf.maxBufSize)
+	}
+
+	if conf.fileNameLimit < 0 {
+		return fmt.Errorf("file name limit is negative: %d", conf.fileNameLimit)
+	}
+
+	if conf.retryTimeout < 0 {
+		return fmt.Errorf("retry timeout is negative: %d", conf.retryTimeout)
+	}
+	if conf.requestTimeout < 0 {
+		return fmt.Errorf("request timeout is negative: %d", conf.requestTimeout)
+	}
+	if conf.minThroughput < 0 {
+		return fmt.Errorf("min throughput is negative: %d", conf.minThroughput)
+	}
+
+	if conf.autoFlushRows < 0 {
+		return fmt.Errorf("auto flush rows is negative: %d", conf.autoFlushRows)
+	}
+	if conf.autoFlushInterval < 0 {
+		return fmt.Errorf("auto flush interval is negative: %d", conf.autoFlushInterval)
+	}
+
+	return nil
 }

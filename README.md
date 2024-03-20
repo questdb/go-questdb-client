@@ -1,18 +1,24 @@
-[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
+[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
 
 # go-questdb-client
 
-Golang client for QuestDB's Influx Line Protocol over TCP.
+Golang client for QuestDB's [Influx Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+(ILP) over HTTP and TCP. This library makes it easy to insert data into
+[QuestDB](https://questdb.io).
 
 Features:
 * Context-aware API.
 * Optimized for batch writes.
-* Supports TLS encryption and [ILP authentication](https://questdb.io/docs/reference/api/ilp/authenticate).
-* Tested against QuestDB 7.3.2 and newer versions.
+* Supports TLS encryption and ILP authentication.
+* Automatic write retries and connection reuse for ILP over HTTP.
+* Tested against QuestDB 7.3.11 and newer versions.
 
-Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2).
+New in v3:
+* Supports ILP over HTTP using the same client semantics
 
-## Usage
+Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3).
+
+## Quickstart
 
 ```go
 package main
@@ -23,13 +29,13 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v2"
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 func main() {
 	ctx := context.TODO()
-	// Connect to QuestDB running on 127.0.0.1:9009
-	sender, err := qdb.NewLineSender(ctx)
+	// Connect to QuestDB running locally.
+	sender, err := qdb.LineSenderFromConf(ctx, "http::addr=localhost:9000;")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -59,3 +65,17 @@ func main() {
 	}
 }
 ```
+
+To connect via TCP, set the configuration string to:
+```go
+	// ...
+	sender, err := qdb.LineSenderFromConf(ctx, "tcp::addr=localhost:9009;")
+	// ...
+```
+
+## Community
+
+If you need help, have additional questions or want to provide feedback, you
+may find us on [Slack](https://slack.questdb.io).
+You can also [sign up to our mailing list](https://questdb.io/community/)
+to get notified of new releases.

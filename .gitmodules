@@ -1,3 +1,3 @@
-[submodule "test/interop"]
-	path = test/interop
+[submodule "test/interop/questdb-client-test"]
+	path = test/interop/questdb-client-test
 	url = https://github.com/questdb/questdb-client-test.git

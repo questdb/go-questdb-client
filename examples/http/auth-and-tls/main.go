@@ -5,24 +5,30 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v2"
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 func main() {
 	ctx := context.TODO()
 	sender, err := qdb.NewLineSender(
 		ctx,
-		qdb.WithAddress("localhost:9009"),
-		qdb.WithAuth(
-			"testUser1", // token name here
+		qdb.WithHttp(),
+		qdb.WithAddress("localhost:9000"),
+		qdb.WithBearerToken(
 			"5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48", // token here
 		),
+		qdb.WithTls(),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 	// Make sure to close the sender on exit to release resources.
-	defer sender.Close()
+	defer func() {
+		err := sender.Close(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
 
 	// Send a few ILP messages.
 	bday, err := time.Parse(time.DateOnly, "1856-07-10")

@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v2"
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 func main() {
@@ -23,7 +23,7 @@ func main() {
 		log.Fatal(err)
 	}
 	// Make sure to close the sender on exit to release resources.
-	defer sender.Close()
+	defer sender.Close(ctx)
 
 	// Send a few ILP messages.
 	bday, err := time.Parse(time.DateOnly, "1856-07-10")

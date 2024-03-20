@@ -2,15 +2,15 @@
 # substitute host/port and auth keys when auto-generating examples
 - name: ilp
   lang: go
-  path: examples/basic/main.go
+  path: examples/tcp/basic/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
     and [repo](https://github.com/questdb/go-questdb-client).
 - name: ilp-auth
   lang: go
-  path: examples/auth/main.go
+  path: examples/tcp/auth/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
     and [repo](https://github.com/questdb/go-questdb-client).
   auth:
     kid: testUser1
@@ -20,9 +20,9 @@
     port: 9009
 - name: ilp-auth-tls
   lang: go
-  path: examples/auth-and-tls/main.go
+  path: examples/tcp/auth-and-tls/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v2)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
     and [repo](https://github.com/questdb/go-questdb-client).
   auth:
     kid: testUser1
@@ -30,3 +30,10 @@
   addr:
     host: localhost
     port: 9009
+- name: ilp-from-conf
+  lang: go
+  path: examples/http/from-conf/main.go
+  header: |-
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
+    and [repo](https://github.com/questdb/go-questdb-client).
+  conf: http::addr=localhost:9000;
