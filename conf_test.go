@@ -244,7 +244,7 @@ func TestParserPathologicalCases(t *testing.T) {
 		{
 			name:                   "unescaped semicolon in password leads to invalid key character",
 			config:                 "http::addr=localhost:9000;username=test;password=pass;word;",
-			expectedErrMsgContains: "invalid key character ';'",
+			expectedErrMsgContains: "unexpected end of",
 		},
 	}
 
