@@ -125,6 +125,11 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 			config:      "tcp::max_buf_size=1000",
 			expectedErr: "maxBufferSize setting is not available",
 		},
+		{
+			name:        "schema is case-sensitive",
+			config:      "tCp::addr=localhost:1234",
+			expectedErr: "invalid schema",
+		},
 	}
 
 	for _, tc := range testCases {
