@@ -60,7 +60,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 	}
 
 	for k, v := range data.KeyValuePairs {
-		switch strings.ToLower(k) {
+		switch k {
 		case "addr":
 			senderConf.address = v
 		case "username":

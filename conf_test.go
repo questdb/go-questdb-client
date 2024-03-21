@@ -454,6 +454,11 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			config:                 "http::addr=localhost:1111;unsupported_option=invalid",
 			expectedErrMsgContains: "unsupported option",
 		},
+		{
+			name:                   "Case-sensitive values",
+			config:                 "http::aDdr=localhost:9000;",
+			expectedErrMsgContains: "unsupported option",
+		},
 	}
 
 	for _, tc := range testCases {
