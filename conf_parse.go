@@ -166,9 +166,8 @@ func parseConfigStr(conf string) (configData, error) {
 			KeyValuePairs: map[string]string{},
 		}
 
-		nextRune             rune
-		isEscaping           bool
-		hasTrailingSemicolon bool
+		nextRune   rune
+		isEscaping bool
 	)
 
 	schemaStr, conf, found := strings.Cut(conf, "::")
@@ -182,10 +181,8 @@ func parseConfigStr(conf string) (configData, error) {
 		return result, NewInvalidConfigStrError("'addr' key not found")
 	}
 
-	if strings.HasSuffix(conf, ";") {
-		hasTrailingSemicolon = true
-	} else {
-		conf = conf + ";" // add trailing semicolon if it doesn't exist
+	if !strings.HasSuffix(conf, ";") {
+		return result, NewInvalidConfigStrError("trailing semicolon ';' required")
 	}
 
 	keyValueStr := []rune(conf)
@@ -198,7 +195,7 @@ func parseConfigStr(conf string) (configData, error) {
 		switch rune {
 		case ';':
 			if isKey {
-				if nextRune == 0 && !hasTrailingSemicolon {
+				if nextRune == 0 {
 					return result, NewInvalidConfigStrError("unexpected end of string")
 				}
 				return result, NewInvalidConfigStrError("invalid key character ';'")

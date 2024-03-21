@@ -59,11 +59,11 @@ func TestTcpHappyCasesFromConf(t *testing.T) {
 	testCases := []tcpConfigTestCase{
 		{
 			name:   "addr only",
-			config: fmt.Sprintf("tcp::addr=%s", addr),
+			config: fmt.Sprintf("tcp::addr=%s;", addr),
 		},
 		{
 			name: "init_buf_size",
-			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d",
+			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;",
 				addr, initBufSize),
 		},
 	}
@@ -82,52 +82,52 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 	testCases := []tcpConfigTestCase{
 		{
 			name:        "request_timeout",
-			config:      "tcp::request_timeout=5",
+			config:      "tcp::request_timeout=5;",
 			expectedErr: "requestTimeout setting is not available",
 		},
 		{
 			name:        "retry_timeout",
-			config:      "tcp::retry_timeout=5",
+			config:      "tcp::retry_timeout=5;",
 			expectedErr: "retryTimeout setting is not available",
 		},
 		{
 			name:        "min_throughput",
-			config:      "tcp::min_throughput=5",
+			config:      "tcp::min_throughput=5;",
 			expectedErr: "minThroughput setting is not available",
 		},
 		{
 			name:        "auto_flush_rows",
-			config:      "tcp::auto_flush_rows=5",
+			config:      "tcp::auto_flush_rows=5;",
 			expectedErr: "autoFlushRows setting is not available",
 		},
 		{
 			name:        "auto_flush_interval",
-			config:      "tcp::auto_flush_interval=5",
+			config:      "tcp::auto_flush_interval=5;",
 			expectedErr: "autoFlushInterval setting is not available",
 		},
 		{
 			name:        "tcp key but no id",
-			config:      "tcp::token=test_key",
+			config:      "tcp::token=test_key;",
 			expectedErr: "tcpKeyId is empty",
 		},
 		{
 			name:        "tcp key id but no key",
-			config:      "tcp::username=test_key_id",
+			config:      "tcp::username=test_key_id;",
 			expectedErr: "tcpKey is empty",
 		},
 		{
 			name:        "invalid private key size",
-			config:      "tcp::username=test_key_id;token=1234567890",
+			config:      "tcp::username=test_key_id;token=1234567890;",
 			expectedErr: "invalid auth key",
 		},
 		{
 			name:        "max_buf_size is set",
-			config:      "tcp::max_buf_size=1000",
+			config:      "tcp::max_buf_size=1000;",
 			expectedErr: "maxBufferSize setting is not available",
 		},
 		{
 			name:        "schema is case-sensitive",
-			config:      "tCp::addr=localhost:1234",
+			config:      "tCp::addr=localhost:1234;",
 			expectedErr: "invalid schema",
 		},
 	}

@@ -56,27 +56,27 @@ func TestHttpHappyCasesFromConf(t *testing.T) {
 	testCases := []httpConfigTestCase{
 		{
 			name: "request_timeout and retry_timeout milli conversion",
-			config: fmt.Sprintf("http::addr=%s;request_timeout=%d;retry_timeout=%d",
+			config: fmt.Sprintf("http::addr=%s;request_timeout=%d;retry_timeout=%d;",
 				addr, request_timeout.Milliseconds(), retry_timeout.Milliseconds()),
 		},
 		{
 			name: "pass before user",
-			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s",
+			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s;",
 				addr, pass, user),
 		},
 		{
 			name: "min_throughput",
-			config: fmt.Sprintf("http::addr=%s;min_throughput=%d",
+			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;",
 				addr, min_throughput),
 		},
 		{
 			name: "bearer token",
-			config: fmt.Sprintf("http::addr=%s;token=%s",
+			config: fmt.Sprintf("http::addr=%s;token=%s;",
 				addr, token),
 		},
 		{
 			name: "auto flush",
-			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000",
+			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000;",
 				addr),
 		},
 	}
@@ -95,47 +95,47 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 	testCases := []httpConfigTestCase{
 		{
 			name:        "basic_and_token_auth",
-			config:      "http::username=test_user;token=test_token",
+			config:      "http::username=test_user;token=test_token;",
 			expectedErr: "both basic and token",
 		},
 		{
 			name:        "negative init_buf_size",
-			config:      "http::init_buf_size=-1",
+			config:      "http::init_buf_size=-1;",
 			expectedErr: "initial buffer size is negative",
 		},
 		{
 			name:        "negative max_buf_size",
-			config:      "http::max_buf_size=-1",
+			config:      "http::max_buf_size=-1;",
 			expectedErr: "max buffer size is negative",
 		},
 		{
 			name:        "negative retry timeout",
-			config:      "http::retry_timeout=-1",
+			config:      "http::retry_timeout=-1;",
 			expectedErr: "retry timeout is negative",
 		},
 		{
 			name:        "negative request timeout",
-			config:      "http::request_timeout=-1",
+			config:      "http::request_timeout=-1;",
 			expectedErr: "request timeout is negative",
 		},
 		{
 			name:        "negative min throughput",
-			config:      "http::min_throughput=-1",
+			config:      "http::min_throughput=-1;",
 			expectedErr: "min throughput is negative",
 		},
 		{
 			name:        "negative auto flush rows",
-			config:      "http::auto_flush_rows=-1",
+			config:      "http::auto_flush_rows=-1;",
 			expectedErr: "auto flush rows is negative",
 		},
 		{
 			name:        "negative auto flush interval",
-			config:      "http::auto_flush_interval=-1",
+			config:      "http::auto_flush_interval=-1;",
 			expectedErr: "auto flush interval is negative",
 		},
 		{
 			name:        "schema is case-sensitive",
-			config:      "hTtp::addr=localhost:1234",
+			config:      "hTtp::addr=localhost:1234;",
 			expectedErr: "invalid schema",
 		},
 	}

@@ -54,7 +54,7 @@ func TestParserHappyCases(t *testing.T) {
 	testCases := []parseConfigTestCase{
 		{
 			name:   "http and ipv4 address",
-			config: fmt.Sprintf("http::addr=%s", addr),
+			config: fmt.Sprintf("http::addr=%s;", addr),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
@@ -74,7 +74,7 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "tcp and address",
-			config: fmt.Sprintf("tcp::addr=%s", addr),
+			config: fmt.Sprintf("tcp::addr=%s;", addr),
 			expected: qdb.ConfigData{
 				Schema: "tcp",
 				KeyValuePairs: map[string]string{
@@ -84,7 +84,7 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "http and username/password",
-			config: fmt.Sprintf("http::addr=%s;username=%s;password=%s", addr, user, pass),
+			config: fmt.Sprintf("http::addr=%s;username=%s;password=%s;", addr, user, pass),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
@@ -107,7 +107,7 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "tcp with key and user",
-			config: fmt.Sprintf("tcp::addr=%s;token=%s;username=%s", addr, token, user),
+			config: fmt.Sprintf("tcp::addr=%s;token=%s;username=%s;", addr, token, user),
 			expected: qdb.ConfigData{
 				Schema: "tcp",
 				KeyValuePairs: map[string]string{
@@ -119,7 +119,7 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "https with min_throughput",
-			config: fmt.Sprintf("https::addr=%s;min_throughput=%d", addr, min_throughput),
+			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;", addr, min_throughput),
 			expected: qdb.ConfigData{
 				Schema: "https",
 				KeyValuePairs: map[string]string{
@@ -130,7 +130,7 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "https with min_throughput, init_buf_size and tls_verify=unsafe_off",
-			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;init_buf_size=%d;tls_verify=unsafe_off", addr, min_throughput, 1024),
+			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;init_buf_size=%d;tls_verify=unsafe_off;", addr, min_throughput, 1024),
 			expected: qdb.ConfigData{
 				Schema: "https",
 				KeyValuePairs: map[string]string{
@@ -143,7 +143,7 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "tcps with tls_verify=unsafe_off",
-			config: fmt.Sprintf("tcps::addr=%s;tls_verify=unsafe_off", addr),
+			config: fmt.Sprintf("tcps::addr=%s;tls_verify=unsafe_off;", addr),
 			expected: qdb.ConfigData{
 				Schema: "tcps",
 				KeyValuePairs: map[string]string{
@@ -154,7 +154,7 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name: "http with min_throughput, request_timeout, and retry_timeout",
-			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;request_timeout=%d;retry_timeout=%d",
+			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;request_timeout=%d;retry_timeout=%d;",
 				addr, min_throughput, request_timeout.Milliseconds(), retry_timeout.Milliseconds()),
 			expected: qdb.ConfigData{
 				Schema: "http",
@@ -168,24 +168,12 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "tcp with tls_verify=on",
-			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on", addr),
+			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on;", addr),
 			expected: qdb.ConfigData{
 				Schema: "tcp",
 				KeyValuePairs: map[string]string{
 					"addr":       addr,
 					"tls_verify": "on",
-				},
-			},
-		},
-		{
-			name:   "password with an escaped semicolon",
-			config: fmt.Sprintf("http::addr=%s;username=%s;password=pass;;word", addr, user),
-			expected: qdb.ConfigData{
-				Schema: "http",
-				KeyValuePairs: map[string]string{
-					"addr":     addr,
-					"username": user,
-					"password": "pass;word",
 				},
 			},
 		},
@@ -215,7 +203,7 @@ func TestParserHappyCases(t *testing.T) {
 		},
 		{
 			name:   "equal sign in password",
-			config: fmt.Sprintf("http::addr=%s;username=%s;password=pass=word", addr, user),
+			config: fmt.Sprintf("http::addr=%s;username=%s;password=pass=word;", addr, user),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
@@ -252,11 +240,6 @@ func TestParserPathologicalCases(t *testing.T) {
 			name:                   "no address",
 			config:                 "http::",
 			expectedErrMsgContains: "'addr' key not found",
-		},
-		{
-			name:                   "unescaped semicolon in password leads to unexpected end of string",
-			config:                 "http::addr=localhost:9000;username=test;password=pass;word",
-			expectedErrMsgContains: "unexpected end of string",
 		},
 		{
 			name:                   "unescaped semicolon in password leads to invalid key character",
@@ -299,7 +282,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 	testCases := []configTestCase{
 		{
 			name: "user and token",
-			config: fmt.Sprintf("tcp::addr=%s;username=%s;token=%s",
+			config: fmt.Sprintf("tcp::addr=%s;username=%s;token=%s;",
 				addr, user, token),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithTcp(),
@@ -309,7 +292,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "init_buf_size and max_buf_size",
-			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;max_buf_size=%d",
+			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;max_buf_size=%d;",
 				addr, initBufSize, maxBufSize),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithTcp(),
@@ -320,7 +303,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "with tls",
-			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on",
+			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on;",
 				addr),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithTcp(),
@@ -330,7 +313,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "with tls and unsafe_off",
-			config: fmt.Sprintf("tcp::addr=%s;tls_verify=unsafe_off",
+			config: fmt.Sprintf("tcp::addr=%s;tls_verify=unsafe_off;",
 				addr),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithTcp(),
@@ -340,7 +323,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "request_timeout and retry_timeout milli conversion",
-			config: fmt.Sprintf("http::addr=%s;request_timeout=%d;retry_timeout=%d",
+			config: fmt.Sprintf("http::addr=%s;request_timeout=%d;retry_timeout=%d;",
 				addr, requestTimeout.Milliseconds(), retryTimeout.Milliseconds()),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),
@@ -351,7 +334,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "password before username",
-			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s",
+			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s;",
 				addr, pass, user),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),
@@ -361,7 +344,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "min_throughput",
-			config: fmt.Sprintf("http::addr=%s;min_throughput=%d",
+			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;",
 				addr, minThroughput),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),
@@ -371,7 +354,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "bearer token",
-			config: fmt.Sprintf("http::addr=%s;token=%s",
+			config: fmt.Sprintf("http::addr=%s;token=%s;",
 				addr, token),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),
@@ -381,7 +364,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "auto flush",
-			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000",
+			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000;",
 				addr),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),
@@ -416,48 +399,53 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 		},
 		{
 			name:                   "invalid schema",
-			config:                 "foobar::addr=localhost:1111",
+			config:                 "foobar::addr=localhost:1111;",
 			expectedErrMsgContains: "invalid schema",
 		},
 		{
 			name:                   "invalid tls_verify 1",
-			config:                 "tcp::addr=localhost:1111;tls_verify=invalid",
+			config:                 "tcp::addr=localhost:1111;tls_verify=invalid;",
 			expectedErrMsgContains: "invalid tls_verify",
 		},
 		{
 			name:                   "invalid tls_verify 2",
-			config:                 "http::addr=localhost:1111;tls_verify=invalid",
+			config:                 "http::addr=localhost:1111;tls_verify=invalid;",
 			expectedErrMsgContains: "invalid tls_verify",
 		},
 		{
 			name:                   "unsupported option",
-			config:                 "tcp::addr=localhost:1111;unsupported_option=invalid",
+			config:                 "tcp::addr=localhost:1111;unsupported_option=invalid;",
 			expectedErrMsgContains: "unsupported option",
 		},
 		{
 			name:                   "invalid auto_flush",
-			config:                 "http::addr=localhost:1111;auto_flush=invalid",
+			config:                 "http::addr=localhost:1111;auto_flush=invalid;",
 			expectedErrMsgContains: "invalid auto_flush",
 		},
 		{
 			name:                   "invalid auto_flush_rows",
-			config:                 "http::addr=localhost:1111;auto_flush_rows=invalid",
+			config:                 "http::addr=localhost:1111;auto_flush_rows=invalid;",
 			expectedErrMsgContains: "invalid auto_flush_rows",
 		},
 		{
 			name:                   "invalid auto_flush_interval",
-			config:                 "http::addr=localhost:1111;auto_flush_interval=invalid",
+			config:                 "http::addr=localhost:1111;auto_flush_interval=invalid;",
 			expectedErrMsgContains: "invalid auto_flush_interval",
 		},
 		{
 			name:                   "unsupported option",
-			config:                 "http::addr=localhost:1111;unsupported_option=invalid",
+			config:                 "http::addr=localhost:1111;unsupported_option=invalid;",
 			expectedErrMsgContains: "unsupported option",
 		},
 		{
-			name:                   "Case-sensitive values",
+			name:                   "case-sensitive values",
 			config:                 "http::aDdr=localhost:9000;",
 			expectedErrMsgContains: "unsupported option",
+		},
+		{
+			name:                   "trailing semicolon required",
+			config:                 "http::addr=localhost:9000",
+			expectedErrMsgContains: "trailing semicolon",
 		},
 	}
 
