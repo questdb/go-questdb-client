@@ -75,7 +75,7 @@ To connect via TCP, set the configuration string to:
 	// ...
 ```
 
-### Migration from v2
+## Migration from v2
 
 v2 code example:
 ```go
