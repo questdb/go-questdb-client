@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -203,7 +202,7 @@ func (s *testServer) serveHttp() {
 				}
 			}
 		case readAndDiscard:
-			_, err = io.Copy(ioutil.Discard, r.Body)
+			_, err = io.Copy(io.Discard, r.Body)
 		case returning500:
 			w.WriteHeader(http.StatusInternalServerError)
 		case returning403:

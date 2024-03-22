@@ -6,6 +6,8 @@ Golang client for QuestDB's [Influx Line Protocol](https://questdb.io/docs/refer
 (ILP) over HTTP and TCP. This library makes it easy to insert data into
 [QuestDB](https://questdb.io).
 
+The library requires Go 1.19 or newer.
+
 Features:
 * Context-aware API.
 * Optimized for batch writes.

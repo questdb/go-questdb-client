@@ -8,6 +8,8 @@ import (
 	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
+const dateOnly = "2006-01-02"
+
 func main() {
 	ctx := context.TODO()
 	// Connect to QuestDB running on 127.0.0.1:9009
@@ -19,7 +21,7 @@ func main() {
 	defer sender.Close(ctx)
 
 	// Send a few ILP messages.
-	bday, err := time.Parse(time.DateOnly, "1856-07-10")
+	bday, err := time.Parse(dateOnly, "1856-07-10")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -34,7 +36,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	bday, err = time.Parse(time.DateOnly, "1847-02-11")
+	bday, err = time.Parse(dateOnly, "1847-02-11")
 	if err != nil {
 		log.Fatal(err)
 	}
