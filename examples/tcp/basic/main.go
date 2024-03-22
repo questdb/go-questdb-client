@@ -11,7 +11,7 @@ import (
 func main() {
 	ctx := context.TODO()
 	// Connect to QuestDB running on 127.0.0.1:9009
-	sender, err := qdb.NewLineSender(ctx)
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp())
 	if err != nil {
 		log.Fatal(err)
 	}

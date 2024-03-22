@@ -12,6 +12,7 @@ func main() {
 	ctx := context.TODO()
 	sender, err := qdb.NewLineSender(
 		ctx,
+		qdb.WithTcp(),
 		qdb.WithAddress("localhost:9009"),
 		qdb.WithAuth(
 			"testUser1", // token name here
