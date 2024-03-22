@@ -60,7 +60,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 	}
 
 	for k, v := range data.KeyValuePairs {
-		switch strings.ToLower(k) {
+		switch k {
 		case "addr":
 			senderConf.address = v
 		case "username":
@@ -86,6 +86,10 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				panic("add a case for " + k)
 			}
+		case "token_x":
+		case "token_y":
+			// Some clients require public key.
+			// But since Go sender doesn't need it, we ignore the values.
 		case "auto_flush":
 			if v == "off" {
 				senderConf.autoFlushRows = 0
@@ -166,9 +170,8 @@ func parseConfigStr(conf string) (configData, error) {
 			KeyValuePairs: map[string]string{},
 		}
 
-		nextRune             rune
-		isEscaping           bool
-		hasTrailingSemicolon bool
+		nextRune   rune
+		isEscaping bool
 	)
 
 	schemaStr, conf, found := strings.Cut(conf, "::")
@@ -182,10 +185,8 @@ func parseConfigStr(conf string) (configData, error) {
 		return result, NewInvalidConfigStrError("'addr' key not found")
 	}
 
-	if strings.HasSuffix(conf, ";") {
-		hasTrailingSemicolon = true
-	} else {
-		conf = conf + ";" // add trailing semicolon if it doesn't exist
+	if !strings.HasSuffix(conf, ";") {
+		return result, NewInvalidConfigStrError("trailing semicolon ';' required")
 	}
 
 	keyValueStr := []rune(conf)
@@ -198,7 +199,7 @@ func parseConfigStr(conf string) (configData, error) {
 		switch rune {
 		case ';':
 			if isKey {
-				if nextRune == 0 && !hasTrailingSemicolon {
+				if nextRune == 0 {
 					return result, NewInvalidConfigStrError("unexpected end of string")
 				}
 				return result, NewInvalidConfigStrError("invalid key character ';'")
