@@ -291,6 +291,16 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
+			name: "token_x and token_y (ignored)",
+			config: fmt.Sprintf("tcp::addr=%s;username=%s;token=%s;token_x=xyz;token_y=xyz;",
+				addr, user, token),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithTcp(),
+				qdb.WithAddress(addr),
+				qdb.WithAuth(user, token),
+			},
+		},
+		{
 			name: "init_buf_size and max_buf_size",
 			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;max_buf_size=%d;",
 				addr, initBufSize, maxBufSize),
