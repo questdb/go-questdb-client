@@ -28,7 +28,6 @@ import (
 	"bufio"
 	"context"
 	"crypto"
-	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -67,21 +66,11 @@ func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (*tcpLineSend
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode auth key: %v", err)
 		}
-		// elliptic.P256().ScalarBaseMult is deprecated, so we use ecdh key
-		// and convert it to the ecdsa one.
-		ecdhKey, err := ecdh.P256().NewPrivateKey(rawKey)
-		if err != nil {
-			return nil, fmt.Errorf("invalid auth key: %v", err)
-		}
-		ecdhPubKey := ecdhKey.PublicKey().Bytes()
-		key = &ecdsa.PrivateKey{
-			PublicKey: ecdsa.PublicKey{
-				Curve: elliptic.P256(),
-				X:     big.NewInt(0).SetBytes(ecdhPubKey[1:33]),
-				Y:     big.NewInt(0).SetBytes(ecdhPubKey[33:]),
-			},
-			D: big.NewInt(0).SetBytes(ecdhKey.Bytes()),
-		}
+		// TODO(puzpuzpuz): migrate to crypto/ecdh one we don't need to support Go 1.19
+		key = new(ecdsa.PrivateKey)
+		key.PublicKey.Curve = elliptic.P256()
+		key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(rawKey)
+		key.D = new(big.Int).SetBytes(rawKey)
 	}
 
 	if conf.tlsMode == tlsDisabled {

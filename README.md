@@ -6,6 +6,8 @@ Golang client for QuestDB's [Influx Line Protocol](https://questdb.io/docs/refer
 (ILP) over HTTP and TCP. This library makes it easy to insert data into
 [QuestDB](https://questdb.io).
 
+The library requires Go 1.19 or newer.
+
 Features:
 * Context-aware API.
 * Optimized for batch writes.
@@ -72,6 +74,50 @@ To connect via TCP, set the configuration string to:
 	sender, err := qdb.LineSenderFromConf(ctx, "tcp::addr=localhost:9009;")
 	// ...
 ```
+
+## Migration from v2
+
+v2 code example:
+```go
+package main
+
+import (
+	"context"
+
+	qdb "github.com/questdb/go-questdb-client/v2"
+)
+
+func main() {
+	// Connect to QuestDB running on 127.0.0.1:9009 (ILP/TCP)
+	sender, err := qdb.NewLineSender(context.TODO())
+	// ...
+	defer sender.Close()
+	// ...
+}
+```
+
+Migrated v3 code:
+```go
+package main
+
+import (
+	"context"
+
+	qdb "github.com/questdb/go-questdb-client/v3"
+)
+
+func main() {
+	// Connect to QuestDB running on 127.0.0.1:9000 (ILP/HTTP)
+	sender, err := qdb.NewLineSender(context.TODO(), qdb.WithHTTP())
+	// Alternatively, you can use the LineSenderFromConf function:
+	// sender, err := qdb.LineSenderFromConf(ctx, "http::addr=localhost:9000;")
+	// ...
+	defer sender.Close(context.TODO())
+	// ...
+}
+```
+
+Note that the migrated code uses the HTTP sender instead of the TCP one.
 
 ## Community
 
