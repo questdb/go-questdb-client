@@ -75,6 +75,50 @@ To connect via TCP, set the configuration string to:
 	// ...
 ```
 
+### Migration from v2
+
+v2 code example:
+```go
+package main
+
+import (
+	"context"
+
+	qdb "github.com/questdb/go-questdb-client/v2"
+)
+
+func main() {
+	// Connect to QuestDB running on 127.0.0.1:9009 (ILP/TCP)
+	sender, err := qdb.NewLineSender(context.TODO())
+	// ...
+	defer sender.Close()
+	// ...
+}
+```
+
+Migrated v3 code:
+```go
+package main
+
+import (
+	"context"
+
+	qdb "github.com/questdb/go-questdb-client/v3"
+)
+
+func main() {
+	// Connect to QuestDB running on 127.0.0.1:9000 (ILP/HTTP)
+	sender, err := qdb.NewLineSender(context.TODO(), qdb.WithHTTP())
+	// Alternatively, you can use the LineSenderFromConf function:
+	// sender, err := qdb.LineSenderFromConf(ctx, "http::addr=localhost:9000;")
+	// ...
+	defer sender.Close(context.TODO())
+	// ...
+}
+```
+
+Note that the migrated code uses the HTTP sender instead of the TCP one.
+
 ## Community
 
 If you need help, have additional questions or want to provide feedback, you
