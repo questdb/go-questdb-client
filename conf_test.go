@@ -213,6 +213,16 @@ func TestParserHappyCases(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:   "no trailing semicolon",
+			config: fmt.Sprintf("http::addr=%s", addr),
+			expected: qdb.ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+				},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -232,6 +242,11 @@ func TestParserPathologicalCases(t *testing.T) {
 			expectedErrMsgContains: "no schema separator found",
 		},
 		{
+			name:                   "empty config with semicolon",
+			config:                 ";",
+			expectedErrMsgContains: "no schema separator found",
+		},
+		{
 			name:                   "no schema",
 			config:                 "addr=localhost:9000",
 			expectedErrMsgContains: "no schema separator found",
@@ -242,8 +257,13 @@ func TestParserPathologicalCases(t *testing.T) {
 			expectedErrMsgContains: "'addr' key not found",
 		},
 		{
-			name:                   "unescaped semicolon in password leads to invalid key character",
+			name:                   "unescaped semicolon in password leads to unexpected end of string (with trailing semicolon)",
 			config:                 "http::addr=localhost:9000;username=test;password=pass;word;",
+			expectedErrMsgContains: "unexpected end of",
+		},
+		{
+			name:                   "unescaped semicolon in password leads to unexpected end of string (no trailing semicolon)",
+			config:                 "http::addr=localhost:9000;username=test;password=pass;word",
 			expectedErrMsgContains: "unexpected end of",
 		},
 	}
@@ -344,7 +364,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "password before username",
-			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s;",
+			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s",
 				addr, pass, user),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),
@@ -364,7 +384,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name: "bearer token",
-			config: fmt.Sprintf("http::addr=%s;token=%s;",
+			config: fmt.Sprintf("http::addr=%s;token=%s",
 				addr, token),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),
@@ -453,9 +473,19 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			expectedErrMsgContains: "unsupported option",
 		},
 		{
-			name:                   "trailing semicolon required",
-			config:                 "http::addr=localhost:9000",
-			expectedErrMsgContains: "trailing semicolon",
+			name:                   "partial key at end",
+			config:                 "http::addr=localhost:9000;test",
+			expectedErrMsgContains: "unexpected end of string",
+		},
+		{
+			name:                   "no value at end",
+			config:                 "http::addr=localhost:9000;username=",
+			expectedErrMsgContains: "empty value for key",
+		},
+		{
+			name:                   "no value at end with semicolon",
+			config:                 "http::addr=localhost:9000;username=;",
+			expectedErrMsgContains: "empty value for key",
 		},
 	}
 

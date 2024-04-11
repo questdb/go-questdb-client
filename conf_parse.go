@@ -186,7 +186,7 @@ func parseConfigStr(conf string) (configData, error) {
 	}
 
 	if !strings.HasSuffix(conf, ";") {
-		return result, NewInvalidConfigStrError("trailing semicolon ';' required")
+		conf += ";"
 	}
 
 	keyValueStr := []rune(conf)
@@ -214,6 +214,10 @@ func parseConfigStr(conf string) (configData, error) {
 				value.WriteRune(rune)
 				isEscaping = false
 				continue
+			}
+
+			if value.Len() == 0 {
+				return result, NewInvalidConfigStrError("empty value for key %q", key)
 			}
 
 			result.KeyValuePairs[key.String()] = value.String()
