@@ -38,7 +38,7 @@ func main() {
 		log.Fatal(err)
 	}
 	err = sender.
-		Table("inventors").
+		Table("inventors_go").
 		Symbol("born", "Austrian Empire").
 		TimestampColumn("birthdate", bday). // Epoch in micros.
 		Int64Column("id", 0).
@@ -53,7 +53,7 @@ func main() {
 		log.Fatal(err)
 	}
 	err = sender.
-		Table("inventors").
+		Table("inventors_go").
 		Symbol("born", "USA").
 		TimestampColumn("birthdate", bday).
 		Int64Column("id", 1).
