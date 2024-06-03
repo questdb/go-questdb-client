@@ -30,6 +30,8 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -39,7 +41,9 @@ import (
 // Each sender corresponds to a single client-server connection.
 // A sender should not be called concurrently by multiple goroutines.
 //
-// HTTP senders also reuse connections from a global pool by default.
+// HTTP senders reuse connections from a global pool by default. You can
+// customize the HTTP transport by passing a custom http.Transport to the
+// WithHttpTransport option.
 type LineSender interface {
 	// Table sets the table name (metric) for a new ILP message. Should be
 	// called before any Symbol or Column method.
@@ -348,6 +352,7 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 // WithHttpTransport sets the client's http transport to the
 // passed pointer instead of the global transport. This can be
 // used for customizing the http transport used by the LineSender.
+// For example to set custom timeouts, TLS settings, etc.
 // WithTlsInsecureSkipVerify is ignored when this option is in use.
 //
 // Only available for the HTTP sender.
@@ -387,6 +392,22 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.autoFlushInterval = interval
 	}
+}
+
+// LineSenderFromEnv creates a LineSender with a config string defined by the QDB_CLIENT_CONF
+// environment variable. See LineSenderFromConf for the config string format.
+//
+// This is a convenience method suitable for Cloud environments.
+func LineSenderFromEnv(ctx context.Context) (LineSender, error) {
+	conf := strings.TrimSpace(os.Getenv("QDB_CLIENT_CONF"))
+	if conf == "" {
+		return nil, errors.New("QDB_CLIENT_CONF environment variable is not set")
+	}
+	c, err := confFromStr(conf)
+	if err != nil {
+		return nil, err
+	}
+	return newLineSender(ctx, c)
 }
 
 // LineSenderFromConf creates a LineSender using the QuestDB config string format.

@@ -112,6 +112,10 @@ func main() {
 	// Alternatively, you can use the LineSenderFromConf function:
 	// sender, err := qdb.LineSenderFromConf(ctx, "http::addr=localhost:9000;")
 	// ...
+	// or you can export the "http::addr=localhost:9000;" config string to
+	// the QDB_CLIENT_CONF environment variable and use the LineSenderFromEnv function:
+	// sender, err := qdb.LineSenderFromEnv(ctx)
+	// ...
 	defer sender.Close(context.TODO())
 	// ...
 }

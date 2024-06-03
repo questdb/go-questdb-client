@@ -27,6 +27,7 @@ package questdb_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -74,6 +75,72 @@ func TestTcpHappyCasesFromConf(t *testing.T) {
 			assert.NoError(t, err)
 
 			sender.Close(context.Background())
+		})
+	}
+}
+
+func TestTcpHappyCasesFromEnv(t *testing.T) {
+	var (
+		initBufSize = 4200
+	)
+
+	testServer, err := newTestTcpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer testServer.Close()
+
+	addr := testServer.Addr()
+
+	testCases := []tcpConfigTestCase{
+		{
+			name:   "addr only",
+			config: fmt.Sprintf("tcp::addr=%s;", addr),
+		},
+		{
+			name: "init_buf_size",
+			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;",
+				addr, initBufSize),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			os.Setenv("QDB_CLIENT_CONF", tc.config)
+			sender, err := qdb.LineSenderFromEnv(context.Background())
+			assert.NoError(t, err)
+
+			sender.Close(context.Background())
+			os.Unsetenv("QDB_CLIENT_CONF")
+		})
+	}
+}
+
+func TestTcpPathologicalCasesFromEnv(t *testing.T) {
+	// Test a few cases just to make sure that the config is read
+	// from the env variable.
+	testCases := []tcpConfigTestCase{
+		{
+			name:        "request_timeout",
+			config:      "tcp::request_timeout=5;",
+			expectedErr: "requestTimeout setting is not available",
+		},
+		{
+			name:        "min_throughput",
+			config:      "tcp::min_throughput=5;",
+			expectedErr: "minThroughput setting is not available",
+		},
+		{
+			name:        "auto_flush_rows",
+			config:      "tcp::auto_flush_rows=5;",
+			expectedErr: "autoFlushRows setting is not available",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			os.Setenv("QDB_CLIENT_CONF", tc.config)
+			_, err := qdb.LineSenderFromEnv(context.Background())
+			assert.ErrorContains(t, err, tc.expectedErr)
+			os.Unsetenv("QDB_CLIENT_CONF")
 		})
 	}
 }
@@ -139,6 +206,7 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 		})
 	}
 }
+
 func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 

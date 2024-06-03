@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
@@ -91,6 +92,35 @@ func TestHttpHappyCasesFromConf(t *testing.T) {
 	}
 }
 
+func TestHttpHappyCasesFromEnv(t *testing.T) {
+	var (
+		addr = "localhost:1111"
+	)
+
+	testCases := []httpConfigTestCase{
+		{
+			name:   "addr only",
+			config: fmt.Sprintf("http::addr=%s", addr),
+		},
+		{
+			name: "auto flush",
+			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000;",
+				addr),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			os.Setenv("QDB_CLIENT_CONF", tc.config)
+			sender, err := qdb.LineSenderFromEnv(context.Background())
+			assert.NoError(t, err)
+
+			sender.Close(context.Background())
+			os.Unsetenv("QDB_CLIENT_CONF")
+		})
+	}
+}
+
 func TestHttpPathologicalCasesFromConf(t *testing.T) {
 	testCases := []httpConfigTestCase{
 		{
@@ -146,6 +176,42 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			assert.ErrorContains(t, err, tc.expectedErr)
 		})
 	}
+}
+
+func TestHttpPathologicalCasesFromEnv(t *testing.T) {
+	// Test a few cases just to make sure that the config is read
+	// from the env variable.
+	testCases := []httpConfigTestCase{
+		{
+			name:        "basic_and_token_auth",
+			config:      "http::username=test_user;token=test_token;",
+			expectedErr: "both basic and token",
+		},
+		{
+			name:        "negative max_buf_size",
+			config:      "http::max_buf_size=-1;",
+			expectedErr: "max buffer size is negative",
+		},
+		{
+			name:        "schema is case-sensitive",
+			config:      "hTtp::addr=localhost:1234;",
+			expectedErr: "invalid schema",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			os.Setenv("QDB_CLIENT_CONF", tc.config)
+			_, err := qdb.LineSenderFromEnv(context.Background())
+			assert.ErrorContains(t, err, tc.expectedErr)
+			os.Unsetenv("QDB_CLIENT_CONF")
+		})
+	}
+}
+
+func TestHttpEmptyEnvVariableCaseFromEnv(t *testing.T) {
+	_, err := qdb.LineSenderFromEnv(context.Background())
+	assert.ErrorContains(t, err, "QDB_CLIENT_CONF environment variable is not set")
 }
 
 func TestErrorWhenSenderTypeIsNotSpecified(t *testing.T) {
