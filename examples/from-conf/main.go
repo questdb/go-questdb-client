@@ -8,8 +8,6 @@ import (
 	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
-const dateOnly = "2006-01-02"
-
 func main() {
 	ctx := context.TODO()
 	sender, err := qdb.LineSenderFromConf(ctx, "http::addr=localhost:9000;")
@@ -25,32 +23,34 @@ func main() {
 	}()
 
 	// Send a few ILP messages.
-	bday, err := time.Parse(dateOnly, "1856-07-10")
+	tradedTs, err := time.Parse(time.RFC3339, "2022-08-06T15:04:05.123456Z")
 	if err != nil {
 		log.Fatal(err)
 	}
 	err = sender.
-		Table("inventors_go").
-		Symbol("born", "Austrian Empire").
-		TimestampColumn("birthdate", bday). // Epoch in micros.
-		Int64Column("id", 0).
-		StringColumn("name", "Nicola Tesla").
-		At(ctx, time.Now()) // Epoch in nanos.
+		Table("trades_go").
+		Symbol("pair", "USDGBP").
+		Symbol("type", "buy").
+		Float64Column("traded_price", 0.83).
+		Float64Column("limit_price", 0.84).
+		Int64Column("qty", 100).
+		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	bday, err = time.Parse(dateOnly, "1847-02-11")
+	tradedTs, err = time.Parse(time.RFC3339, "2022-08-06T15:04:06.987654Z")
 	if err != nil {
 		log.Fatal(err)
 	}
 	err = sender.
-		Table("inventors_go").
-		Symbol("born", "USA").
-		TimestampColumn("birthdate", bday).
-		Int64Column("id", 1).
-		StringColumn("name", "Thomas Alva Edison").
-		AtNow(ctx)
+		Table("trades_go").
+		Symbol("pair", "GBPJPY").
+		Symbol("type", "sell").
+		Float64Column("traded_price", 135.97).
+		Float64Column("limit_price", 0.84).
+		Int64Column("qty", 400).
+		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)
 	}
