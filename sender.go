@@ -39,7 +39,9 @@ import (
 // Each sender corresponds to a single client-server connection.
 // A sender should not be called concurrently by multiple goroutines.
 //
-// HTTP senders also reuse connections from a global pool by default.
+// HTTP senders reuse connections from a global pool by default. You can
+// customize the HTTP transport by passing a custom http.Transport to the
+// WithHttpTransport option.
 type LineSender interface {
 	// Table sets the table name (metric) for a new ILP message. Should be
 	// called before any Symbol or Column method.
@@ -348,6 +350,7 @@ func WithTlsInsecureSkipVerify() LineSenderOption {
 // WithHttpTransport sets the client's http transport to the
 // passed pointer instead of the global transport. This can be
 // used for customizing the http transport used by the LineSender.
+// For example to set custom timeouts, TLS settings, etc.
 // WithTlsInsecureSkipVerify is ignored when this option is in use.
 //
 // Only available for the HTTP sender.
