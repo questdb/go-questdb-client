@@ -30,6 +30,8 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -390,6 +392,22 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.autoFlushInterval = interval
 	}
+}
+
+// LineSenderFromEnv creates a LineSender with a config string defined by the QDB_CLIENT_CONF
+// environment variable. See LineSenderFromConf for the config string format.
+//
+// This is a convenience method suitable for Cloud environments.
+func LineSenderFromEnv(ctx context.Context) (LineSender, error) {
+	conf := strings.TrimSpace(os.Getenv("QDB_CLIENT_CONF"))
+	if conf == "" {
+		return nil, errors.New("QDB_CLIENT_CONF environment variable is not set")
+	}
+	c, err := confFromStr(conf)
+	if err != nil {
+		return nil, err
+	}
+	return newLineSender(ctx, c)
 }
 
 // LineSenderFromConf creates a LineSender using the QuestDB config string format.
