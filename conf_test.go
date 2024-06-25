@@ -403,6 +403,28 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithAutoFlushInterval(1000),
 			},
 		},
+		{
+			name: "auto flush interval",
+			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=off;",
+				addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithHttp(),
+				qdb.WithAddress(addr),
+				qdb.WithAutoFlushRows(100),
+				qdb.WithAutoFlushInterval(0),
+			},
+		},
+		{
+			name: "auto flush rows",
+			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=off;auto_flush_interval=1000;",
+				addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithHttp(),
+				qdb.WithAddress(addr),
+				qdb.WithAutoFlushRows(0),
+				qdb.WithAutoFlushInterval(1000),
+			},
+		},
 	}
 
 	for _, tc := range testCases {

@@ -98,12 +98,20 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not 'on' or 'off'", k, v)
 			}
 		case "auto_flush_rows":
+			if v == "off" {
+				senderConf.autoFlushRows = 0
+				continue
+			}
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.autoFlushRows = parsedVal
 		case "auto_flush_interval":
+			if v == "off" {
+				senderConf.autoFlushInterval = 0
+				continue
+			}
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
