@@ -404,7 +404,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name: "auto flush interval",
+			name: "auto flush interval off",
 			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=off;",
 				addr),
 			expectedOpts: []qdb.LineSenderOption{
@@ -415,7 +415,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name: "auto flush rows",
+			name: "auto flush rows off",
 			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=off;auto_flush_interval=1000;",
 				addr),
 			expectedOpts: []qdb.LineSenderOption{

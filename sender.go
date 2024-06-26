@@ -437,7 +437,8 @@ func LineSenderFromEnv(ctx context.Context) (LineSender, error) {
 // password:               for basic authentication
 // token:                  bearer token auth (used instead of basic authentication)
 // auto_flush:             determines if auto-flushing is enabled (values "on" or "off", defaults to "on")
-// auto_flush_rows:        auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on
+// auto_flush_rows:        auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on. Set to 'off' to disable.
+//auto_flush_interval        auto-flushing is triggered above this time (defaults to 1000 milliseconds). If set, explicitly implies auto_flush=on. Set to 'off' to disable.
 // request_min_throughput: bytes per second, used to calculate each request's timeout (defaults to 100KiB/s)
 // request_timeout:        minimum request timeout in milliseconds (defaults to 10 seconds)
 // retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
