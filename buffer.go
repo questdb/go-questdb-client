@@ -28,7 +28,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"math/big"
 	"strconv"
@@ -120,20 +119,6 @@ func (b *buffer) writeBigInt(i *big.Int) {
 	var a [64]byte
 	s := i.Append(a[0:0], 16)
 	b.Write(s)
-}
-
-// WriteTo wraps the built-in bytes.Buffer.WriteTo method
-// and writes the contents of the buffer to the provided
-// io.Writer
-func (b *buffer) WriteTo(w io.Writer) (int64, error) {
-	n, err := b.Buffer.WriteTo(w)
-	if err != nil {
-		b.lastMsgPos -= int(n)
-		return n, err
-	}
-	b.lastMsgPos = 0
-	b.msgCount = 0
-	return n, nil
 }
 
 func (b *buffer) writeTableName(str string) error {
@@ -384,6 +369,17 @@ func (b *buffer) prepareForField() bool {
 		b.WriteByte(',')
 	}
 	return true
+}
+
+func (b *buffer) Bytes() []byte {
+	return b.Buffer.Bytes()
+}
+
+func (b *buffer) Reset() {
+	b.Buffer.Reset()
+	b.lastMsgPos = 0
+	b.msgCount = 0
+	b.resetMsgFlags()
 }
 
 func (b *buffer) DiscardPendingMsg() {

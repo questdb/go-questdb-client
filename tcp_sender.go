@@ -205,6 +205,9 @@ func (s *tcpLineSender) Flush(ctx context.Context) error {
 		s.conn.SetWriteDeadline(time.Time{})
 	}
 
+	// Always reset the buffer at the end of flush.
+	defer s.buf.Reset()
+
 	if _, err := s.buf.WriteTo(s.conn); err != nil {
 		return err
 	}
