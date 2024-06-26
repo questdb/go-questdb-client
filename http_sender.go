@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -194,17 +195,20 @@ func (s *httpLineSender) flush0(ctx context.Context, closing bool) error {
 	if s.buf.msgCount == 0 {
 		return nil
 	}
+	// Always reset the buffer at the end of flush.
+	defer s.buf.Reset()
 
 	// We rely on the following HTTP client implicit behavior:
 	// s.buf implements WriteTo method which is used by the client.
 	req, err = http.NewRequest(
 		http.MethodPost,
 		s.uri,
-		&s.buf,
+		bytes.NewReader(s.buf.Bytes()),
 	)
 	if err != nil {
 		return err
 	}
+	req.ContentLength = int64(s.BufLen())
 
 	if s.user != "" && s.pass != "" {
 		req.SetBasicAuth(s.user, s.pass)
