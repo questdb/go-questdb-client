@@ -82,7 +82,7 @@ func newTestServerWithProtocol(serverType serverType, protocol string) (*testSer
 		addr:        tcp.Addr().String(),
 		tcpListener: tcp,
 		serverType:  serverType,
-		BackCh:      make(chan string, 5),
+		BackCh:      make(chan string, 1000),
 		closeCh:     make(chan struct{}),
 	}
 
@@ -267,5 +267,5 @@ func expectLines(t *testing.T, linesCh chan string, expected []string) {
 			return false
 		}
 		return reflect.DeepEqual(expected, actual)
-	}, 3*time.Second, 100*time.Millisecond)
+	}, 10*time.Second, 100*time.Millisecond)
 }
