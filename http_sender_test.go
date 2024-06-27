@@ -454,6 +454,71 @@ func TestTimeBasedAutoFlush(t *testing.T) {
 	assert.Equal(t, 0, qdb.MsgCount(sender))
 }
 
+func TestTimeBasedAutoFlushWithRowBasedFlushDisabled(t *testing.T) {
+	ctx := context.Background()
+	autoFlushInterval := 10 * time.Millisecond
+
+	srv, err := newTestHttpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := qdb.NewLineSender(
+		ctx,
+		qdb.WithHttp(),
+		qdb.WithAddress(srv.Addr()),
+		qdb.WithAutoFlushRows(0),
+		qdb.WithAutoFlushInterval(autoFlushInterval),
+	)
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	// Send a message and ensure it's buffered
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, qdb.MsgCount(sender))
+
+	time.Sleep(2 * autoFlushInterval)
+
+	// Send one additional message and ensure that both messages are flushed
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 0, qdb.MsgCount(sender))
+}
+
+func TestRowBasedAutoFlushWithTimeBasedFlushDisabled(t *testing.T) {
+	ctx := context.Background()
+	autoFlushRows := 1000
+
+	srv, err := newTestHttpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := qdb.NewLineSender(
+		ctx,
+		qdb.WithHttp(),
+		qdb.WithAddress(srv.Addr()),
+		qdb.WithAutoFlushRows(autoFlushRows),
+		qdb.WithAutoFlushInterval(0),
+	)
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	// Send autoFlushRows - 1 messages and ensure all are buffered
+	for i := 0; i < autoFlushRows-1; i++ {
+		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+		assert.NoError(t, err)
+	}
+
+	assert.Equal(t, autoFlushRows-1, qdb.MsgCount(sender))
+
+	// Send one additional message and ensure that all are flushed
+	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 0, qdb.MsgCount(sender))
+}
+
 func TestNoFlushWhenAutoFlushDisabled(t *testing.T) {
 	ctx := context.Background()
 	autoFlushRows := 10
