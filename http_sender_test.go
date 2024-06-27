@@ -580,17 +580,28 @@ func TestSuccessAfterRetries(t *testing.T) {
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()), qdb.WithRetryTimeout(time.Minute))
+	sender, err := qdb.NewLineSender(
+		ctx, qdb.WithHttp(),
+		qdb.WithAddress(srv.Addr()),
+		qdb.WithAutoFlushDisabled(),
+		qdb.WithRetryTimeout(time.Minute),
+	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
-	err = sender.Table(testTable).Symbol("abc", "def").AtNow(ctx)
-	assert.NoError(t, err)
+	for i := 0; i < 10; i++ {
+		err = sender.Table(testTable).Int64Column("foobar", int64(i)).AtNow(ctx)
+		assert.NoError(t, err)
+	}
 
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
 
-	expectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,abc=def", testTable)})
+	expected := make([]string, 0)
+	for i := 0; i < 10; i++ {
+		expected = append(expected, fmt.Sprintf("%s foobar=%di", testTable, i))
+	}
+	expectLines(t, srv.BackCh, expected)
 	assert.Zero(t, qdb.BufLen(sender))
 }
 

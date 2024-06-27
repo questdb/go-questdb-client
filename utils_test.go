@@ -82,7 +82,7 @@ func newTestServerWithProtocol(serverType serverType, protocol string) (*testSer
 		addr:        tcp.Addr().String(),
 		tcpListener: tcp,
 		serverType:  serverType,
-		BackCh:      make(chan string, 5),
+		BackCh:      make(chan string, 1000),
 		closeCh:     make(chan struct{}),
 	}
 
@@ -197,6 +197,8 @@ func (s *testServer) serveHttp() {
 		switch s.serverType {
 		case failFirstThenSendToBackChannel:
 			if atomic.AddInt64(&reqs, 1) == 1 {
+				// Consume request body.
+				_, err = io.Copy(io.Discard, r.Body)
 				w.WriteHeader(http.StatusInternalServerError)
 			} else {
 				err = readAndSendToBackChannel(r, lineFeed)
@@ -265,5 +267,5 @@ func expectLines(t *testing.T, linesCh chan string, expected []string) {
 			return false
 		}
 		return reflect.DeepEqual(expected, actual)
-	}, 3*time.Second, 100*time.Millisecond)
+	}, 10*time.Second, 100*time.Millisecond)
 }
