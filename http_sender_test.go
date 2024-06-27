@@ -638,6 +638,38 @@ func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
 	assert.Empty(t, qdb.Messages(sender))
 }
 
+func TestSuccessAfterRetries(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestHttpServer(failFirstThenSendToBackChannel)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := qdb.NewLineSender(
+		ctx, qdb.WithHttp(),
+		qdb.WithAddress(srv.Addr()),
+		qdb.WithAutoFlushDisabled(),
+		qdb.WithRetryTimeout(time.Minute),
+	)
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	for i := 0; i < 10; i++ {
+		err = sender.Table(testTable).Int64Column("foobar", int64(i)).AtNow(ctx)
+		assert.NoError(t, err)
+	}
+
+	err = sender.Flush(ctx)
+	assert.NoError(t, err)
+
+	expected := make([]string, 0)
+	for i := 0; i < 10; i++ {
+		expected = append(expected, fmt.Sprintf("%s foobar=%di", testTable, i))
+	}
+	expectLines(t, srv.BackCh, expected)
+	assert.Zero(t, qdb.BufLen(sender))
+}
+
 func TestBufferClearAfterFlush(t *testing.T) {
 	ctx := context.Background()
 

@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -170,9 +171,7 @@ func (s *httpLineSender) Flush(ctx context.Context) error {
 
 func (s *httpLineSender) flush0(ctx context.Context, closing bool) error {
 	var (
-		req           *http.Request
-		retryInterval time.Duration
-
+		retryInterval    time.Duration
 		maxRetryInterval = time.Second
 	)
 
@@ -194,25 +193,10 @@ func (s *httpLineSender) flush0(ctx context.Context, closing bool) error {
 	if s.buf.msgCount == 0 {
 		return nil
 	}
+	// Always reset the buffer at the end of flush.
+	defer s.buf.Reset()
 
-	// We rely on the following HTTP client implicit behavior:
-	// s.buf implements WriteTo method which is used by the client.
-	req, err = http.NewRequest(
-		http.MethodPost,
-		s.uri,
-		&s.buf,
-	)
-	if err != nil {
-		return err
-	}
-
-	if s.user != "" && s.pass != "" {
-		req.SetBasicAuth(s.user, s.pass)
-	} else if s.token != "" {
-		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
-	}
-
-	retry, err := s.makeRequest(ctx, req)
+	retry, err := s.makeRequest(ctx)
 	if !retry {
 		s.refreshFlushDeadline(err)
 		return err
@@ -230,7 +214,7 @@ func (s *httpLineSender) flush0(ctx context.Context, closing bool) error {
 			jitter := time.Duration(rand.Intn(10)) * time.Millisecond
 			time.Sleep(retryInterval + jitter)
 
-			retry, err = s.makeRequest(ctx, req)
+			retry, err = s.makeRequest(ctx)
 			if !retry {
 				s.refreshFlushDeadline(err)
 				return err
@@ -354,7 +338,23 @@ func (s *httpLineSender) At(ctx context.Context, ts time.Time) error {
 }
 
 // makeRequest returns a boolean if we need to retry the request
-func (s *httpLineSender) makeRequest(ctx context.Context, req *http.Request) (bool, error) {
+func (s *httpLineSender) makeRequest(ctx context.Context) (bool, error) {
+	req, err := http.NewRequest(
+		http.MethodPost,
+		s.uri,
+		bytes.NewReader(s.buf.Bytes()),
+	)
+	if err != nil {
+		return false, err
+	}
+	req.ContentLength = int64(s.BufLen())
+
+	if s.user != "" && s.pass != "" {
+		req.SetBasicAuth(s.user, s.pass)
+	} else if s.token != "" {
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
+	}
+
 	// reqTimeout = ( request.len() / min_throughput ) + request_timeout
 	// nb: conversion from int to time.Duration is in milliseconds
 	reqTimeout := time.Duration(s.buf.Len()/s.minThroughputBytesPerSecond)*time.Second + s.requestTimeout

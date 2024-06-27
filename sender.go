@@ -83,6 +83,9 @@ type LineSender interface {
 	// TimestampColumn adds a timestamp column value to the ILP
 	// message.
 	//
+	// Should be used only for non-designated timestamp column.
+	// Designated timestamp column values should be passed to At/AtNow.
+	//
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
@@ -110,8 +113,8 @@ type LineSender interface {
 	// '-', '*' '%%', '~', or a non-printable char.
 	BoolColumn(name string, val bool) LineSender
 
-	// At sets the timestamp in Epoch nanoseconds and finalizes
-	// the ILP message.
+	// At sets the designated timestamp value and finalizes the ILP
+	// message.
 	//
 	// If the underlying buffer reaches configured capacity or the
 	// number of buffered messages exceeds the auto-flush trigger, this
@@ -120,9 +123,9 @@ type LineSender interface {
 	// If ts.IsZero(), no timestamp is sent to the server.
 	At(ctx context.Context, ts time.Time) error
 
-	// AtNow omits the timestamp and finalizes the ILP message.
-	// The server will insert each message using the system clock
-	// as the row timestamp.
+	// AtNow omits designated timestamp value and finalizes the ILP
+	// message. The server will insert each message using the system
+	// clock as the row timestamp.
 	//
 	// If the underlying buffer reaches configured capacity or the
 	// number of buffered messages exceeds the auto-flush trigger, this

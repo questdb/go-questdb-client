@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,11 +44,12 @@ import (
 type serverType int64
 
 const (
-	sendToBackChannel serverType = 0
-	readAndDiscard    serverType = 1
-	returning500      serverType = 2
-	returning403      serverType = 3
-	returning404      serverType = 4
+	sendToBackChannel              serverType = 0
+	readAndDiscard                 serverType = 1
+	returning500                   serverType = 2
+	returning403                   serverType = 3
+	returning404                   serverType = 4
+	failFirstThenSendToBackChannel serverType = 5
 )
 
 type testServer struct {
@@ -80,7 +82,7 @@ func newTestServerWithProtocol(serverType serverType, protocol string) (*testSer
 		addr:        tcp.Addr().String(),
 		tcpListener: tcp,
 		serverType:  serverType,
-		BackCh:      make(chan string, 5),
+		BackCh:      make(chan string, 1000),
 		closeCh:     make(chan struct{}),
 	}
 
@@ -186,21 +188,23 @@ func (s *testServer) serveHttp() {
 		}
 	}()
 
+	var reqs int64
 	http.Serve(s.tcpListener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var (
 			err error
 		)
 
 		switch s.serverType {
-		case sendToBackChannel:
-			r := bufio.NewReader(r.Body)
-			var l string
-			for err == nil {
-				l, err = r.ReadString('\n')
-				if err == nil && len(l) > 0 {
-					lineFeed <- l[0 : len(l)-1]
-				}
+		case failFirstThenSendToBackChannel:
+			if atomic.AddInt64(&reqs, 1) == 1 {
+				// Consume request body.
+				_, err = io.Copy(io.Discard, r.Body)
+				w.WriteHeader(http.StatusInternalServerError)
+			} else {
+				err = readAndSendToBackChannel(r, lineFeed)
 			}
+		case sendToBackChannel:
+			err = readAndSendToBackChannel(r, lineFeed)
 		case readAndDiscard:
 			_, err = io.Copy(io.Discard, r.Body)
 		case returning500:
@@ -232,6 +236,21 @@ func (s *testServer) serveHttp() {
 	}))
 }
 
+func readAndSendToBackChannel(r *http.Request, lineFeed chan string) error {
+	read := bufio.NewReader(r.Body)
+	var (
+		l   string
+		err error
+	)
+	for err == nil {
+		l, err = read.ReadString('\n')
+		if err == nil && len(l) > 0 {
+			lineFeed <- l[0 : len(l)-1]
+		}
+	}
+	return err
+}
+
 func (s *testServer) Close() {
 	close(s.closeCh)
 	s.tcpListener.Close()
@@ -248,5 +267,5 @@ func expectLines(t *testing.T, linesCh chan string, expected []string) {
 			return false
 		}
 		return reflect.DeepEqual(expected, actual)
-	}, 3*time.Second, 100*time.Millisecond)
+	}, 10*time.Second, 100*time.Millisecond)
 }
