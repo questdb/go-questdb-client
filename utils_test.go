@@ -197,6 +197,8 @@ func (s *testServer) serveHttp() {
 		switch s.serverType {
 		case failFirstThenSendToBackChannel:
 			if atomic.AddInt64(&reqs, 1) == 1 {
+				// Consume request body.
+				_, err = io.Copy(io.Discard, r.Body)
 				w.WriteHeader(http.StatusInternalServerError)
 			} else {
 				err = readAndSendToBackChannel(r, lineFeed)
