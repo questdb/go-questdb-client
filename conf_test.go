@@ -400,7 +400,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithHttp(),
 				qdb.WithAddress(addr),
 				qdb.WithAutoFlushRows(100),
-				qdb.WithAutoFlushInterval(1000),
+				qdb.WithAutoFlushInterval(1000 * time.Millisecond),
 			},
 		},
 		{
@@ -422,7 +422,7 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithHttp(),
 				qdb.WithAddress(addr),
 				qdb.WithAutoFlushRows(0),
-				qdb.WithAutoFlushInterval(1000),
+				qdb.WithAutoFlushInterval(1000 * time.Millisecond),
 			},
 		},
 	}

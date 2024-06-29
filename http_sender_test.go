@@ -462,13 +462,8 @@ func TestTimeBasedAutoFlushWithRowBasedFlushDisabled(t *testing.T) {
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(
-		ctx,
-		qdb.WithHttp(),
-		qdb.WithAddress(srv.Addr()),
-		qdb.WithAutoFlushRows(0),
-		qdb.WithAutoFlushInterval(autoFlushInterval),
-	)
+	sender, err := qdb.LineSenderFromConf(ctx,
+		fmt.Sprintf("http::addr=%s;auto_flush_rows=off;auto_flush_interval=%d;", srv.Addr(), autoFlushInterval.Milliseconds()))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
@@ -494,13 +489,8 @@ func TestRowBasedAutoFlushWithTimeBasedFlushDisabled(t *testing.T) {
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(
-		ctx,
-		qdb.WithHttp(),
-		qdb.WithAddress(srv.Addr()),
-		qdb.WithAutoFlushRows(autoFlushRows),
-		qdb.WithAutoFlushInterval(0),
-	)
+	sender, err := qdb.LineSenderFromConf(ctx,
+		fmt.Sprintf("http::addr=%s;auto_flush_rows=%d;auto_flush_interval=off;", srv.Addr(), autoFlushRows))
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 

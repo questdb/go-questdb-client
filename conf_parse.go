@@ -116,7 +116,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
-			senderConf.autoFlushInterval = time.Duration(parsedVal)
+			senderConf.autoFlushInterval = time.Duration(parsedVal) * time.Millisecond
 		case "min_throughput", "init_buf_size", "max_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
@@ -138,7 +138,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
-			timeoutDur := time.Duration(timeout * int(time.Millisecond))
+			timeoutDur := time.Duration(timeout) * time.Millisecond
 
 			switch k {
 			case "request_timeout":
