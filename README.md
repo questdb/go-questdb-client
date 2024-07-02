@@ -127,5 +127,5 @@ Note that the migrated code uses the HTTP sender instead of the TCP one.
 
 If you need help, have additional questions or want to provide feedback, you
 may find in our [Community Forum](https://community.questdb.io/).
-You can also [sign up to our mailing list](https://questdb.io/community/)
+You can also [sign up to our mailing list](https://questdb.io/contributors/)
 to get notified of new releases.
