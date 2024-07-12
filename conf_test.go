@@ -118,26 +118,26 @@ func TestParserHappyCases(t *testing.T) {
 			},
 		},
 		{
-			name:   "https with min_throughput",
-			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;", addr, min_throughput),
+			name:   "https with request_min_throughput",
+			config: fmt.Sprintf("https::addr=%s;request_min_throughput=%d;", addr, min_throughput),
 			expected: qdb.ConfigData{
 				Schema: "https",
 				KeyValuePairs: map[string]string{
-					"addr":           addr,
-					"min_throughput": fmt.Sprintf("%d", min_throughput),
+					"addr":                   addr,
+					"request_min_throughput": fmt.Sprintf("%d", min_throughput),
 				},
 			},
 		},
 		{
-			name:   "https with min_throughput, init_buf_size and tls_verify=unsafe_off",
-			config: fmt.Sprintf("https::addr=%s;min_throughput=%d;init_buf_size=%d;tls_verify=unsafe_off;", addr, min_throughput, 1024),
+			name:   "https with request_min_throughput, init_buf_size and tls_verify=unsafe_off",
+			config: fmt.Sprintf("https::addr=%s;request_min_throughput=%d;init_buf_size=%d;tls_verify=unsafe_off;", addr, min_throughput, 1024),
 			expected: qdb.ConfigData{
 				Schema: "https",
 				KeyValuePairs: map[string]string{
-					"addr":           addr,
-					"min_throughput": fmt.Sprintf("%d", min_throughput),
-					"init_buf_size":  "1024",
-					"tls_verify":     "unsafe_off",
+					"addr":                   addr,
+					"request_min_throughput": fmt.Sprintf("%d", min_throughput),
+					"init_buf_size":          "1024",
+					"tls_verify":             "unsafe_off",
 				},
 			},
 		},
@@ -153,16 +153,16 @@ func TestParserHappyCases(t *testing.T) {
 			},
 		},
 		{
-			name: "http with min_throughput, request_timeout, and retry_timeout",
-			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;request_timeout=%d;retry_timeout=%d;",
+			name: "http with request_min_throughput, request_timeout, and retry_timeout",
+			config: fmt.Sprintf("http::addr=%s;request_min_throughput=%d;request_timeout=%d;retry_timeout=%d;",
 				addr, min_throughput, request_timeout.Milliseconds(), retry_timeout.Milliseconds()),
 			expected: qdb.ConfigData{
 				Schema: "http",
 				KeyValuePairs: map[string]string{
-					"addr":            addr,
-					"min_throughput":  fmt.Sprintf("%d", min_throughput),
-					"request_timeout": fmt.Sprintf("%d", request_timeout.Milliseconds()),
-					"retry_timeout":   fmt.Sprintf("%d", retry_timeout.Milliseconds()),
+					"addr":                   addr,
+					"request_min_throughput": fmt.Sprintf("%d", min_throughput),
+					"request_timeout":        fmt.Sprintf("%d", request_timeout.Milliseconds()),
+					"retry_timeout":          fmt.Sprintf("%d", retry_timeout.Milliseconds()),
 				},
 			},
 		},
@@ -373,8 +373,8 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name: "min_throughput",
-			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;",
+			name: "request_min_throughput",
+			config: fmt.Sprintf("http::addr=%s;request_min_throughput=%d;",
 				addr, minThroughput),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithHttp(),

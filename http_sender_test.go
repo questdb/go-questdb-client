@@ -66,8 +66,8 @@ func TestHttpHappyCasesFromConf(t *testing.T) {
 				addr, pass, user),
 		},
 		{
-			name: "min_throughput",
-			config: fmt.Sprintf("http::addr=%s;min_throughput=%d;",
+			name: "request_min_throughput",
+			config: fmt.Sprintf("http::addr=%s;request_min_throughput=%d;",
 				addr, min_throughput),
 		},
 		{
@@ -150,7 +150,7 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 		},
 		{
 			name:        "negative min throughput",
-			config:      "http::min_throughput=-1;",
+			config:      "http::request_min_throughput=-1;",
 			expectedErr: "min throughput is negative",
 		},
 		{

@@ -124,8 +124,8 @@ func TestTcpPathologicalCasesFromEnv(t *testing.T) {
 			expectedErr: "requestTimeout setting is not available",
 		},
 		{
-			name:        "min_throughput",
-			config:      "tcp::min_throughput=5;",
+			name:        "request_min_throughput",
+			config:      "tcp::request_min_throughput=5;",
 			expectedErr: "minThroughput setting is not available",
 		},
 		{
@@ -158,8 +158,8 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 			expectedErr: "retryTimeout setting is not available",
 		},
 		{
-			name:        "min_throughput",
-			config:      "tcp::min_throughput=5;",
+			name:        "request_min_throughput",
+			config:      "tcp::request_min_throughput=5;",
 			expectedErr: "minThroughput setting is not available",
 		},
 		{
