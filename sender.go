@@ -263,10 +263,10 @@ func WithBearerToken(token string) LineSenderOption {
 	}
 }
 
-// WithRequestTimeout is used in combination with min_throughput
+// WithRequestTimeout is used in combination with request_min_throughput
 // to set the timeout of an ILP request. Defaults to 10 seconds.
 //
-// timeout = (request.len() / min_throughput) + request_timeout
+// timeout = (request.len() / request_min_throughput) + request_timeout
 //
 // Only available for the HTTP sender.
 func WithRequestTimeout(timeout time.Duration) LineSenderOption {
@@ -278,7 +278,7 @@ func WithRequestTimeout(timeout time.Duration) LineSenderOption {
 // WithMinThroughput is used in combination with request_timeout
 // to set the timeout of an ILP request. Defaults to 100KiB/s.
 //
-// timeout = (request.len() / min_throughput) + request_timeout
+// timeout = (request.len() / request_min_throughput) + request_timeout
 //
 // Only available for the HTTP sender.
 func WithMinThroughput(bytesPerSecond int) LineSenderOption {
@@ -429,27 +429,45 @@ func LineSenderFromEnv(ctx context.Context) (LineSender, error) {
 //
 // Options:
 // http(s) and tcp(s):
+//
 // -------------------
+//
 // addr:           hostname/port of QuestDB endpoint
+//
 // init_buf_size:  initial growable ILP buffer size in bytes (defaults to 128KiB)
+//
 // tls_verify:     determines if TLS certificates should be validated (defaults to "on", can be set to "unsafe_off")
 //
 // http(s)-only
+//
 // ------------
+//
 // username:               for basic authentication
+//
 // password:               for basic authentication
+//
 // token:                  bearer token auth (used instead of basic authentication)
+//
 // auto_flush:             determines if auto-flushing is enabled (values "on" or "off", defaults to "on")
+//
 // auto_flush_rows:        auto-flushing is triggered above this row count (defaults to 75000). If set, explicitly implies auto_flush=on. Set to 'off' to disable.
+//
 // auto_flush_interval:    auto-flushing is triggered above this time, in milliseconds (defaults to 1000 milliseconds). If set, explicitly implies auto_flush=on. Set to 'off' to disable.
+//
 // request_min_throughput: bytes per second, used to calculate each request's timeout (defaults to 100KiB/s)
+//
 // request_timeout:        minimum request timeout in milliseconds (defaults to 10 seconds)
+//
 // retry_timeout:          cumulative maximum millisecond duration spent in retries (defaults to 10 seconds)
+//
 // max_buf_size:           buffer growth limit in bytes. Client errors if breached (default is 100MiB)
 //
 // tcp(s)-only
+//
 // -----------
+//
 // username:  KID (key ID) for ECDSA authentication
+//
 // token:     Secret K (D) for ECDSA authentication
 func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 	c, err := confFromStr(conf)

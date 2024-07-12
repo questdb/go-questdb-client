@@ -355,7 +355,7 @@ func (s *httpLineSender) makeRequest(ctx context.Context) (bool, error) {
 		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
 	}
 
-	// reqTimeout = ( request.len() / min_throughput ) + request_timeout
+	// reqTimeout = ( request.len() / request_min_throughput ) + request_timeout
 	// nb: conversion from int to time.Duration is in milliseconds
 	reqTimeout := time.Duration(s.buf.Len()/s.minThroughputBytesPerSecond)*time.Second + s.requestTimeout
 	reqCtx, cancel := context.WithTimeout(ctx, reqTimeout)
