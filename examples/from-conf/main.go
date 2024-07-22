@@ -43,12 +43,11 @@ func main() {
 		log.Fatal(err)
 	}
 	err = sender.
-		Table("trades_go").
-		Symbol("pair", "GBPJPY").
-		Symbol("type", "sell").
-		Float64Column("traded_price", 135.97).
-		Float64Column("limit_price", 0.84).
-		Int64Column("qty", 400).
+		Table("trades").
+		Symbol("symbol", "BTC-USD").
+		Symbol("side", "sell").
+		Float64Column("price", 39269.98).
+		Float64Column("amount", 0.001).
 		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)
