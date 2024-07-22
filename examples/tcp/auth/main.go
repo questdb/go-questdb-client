@@ -8,8 +8,6 @@ import (
 	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
-const dateOnly = "2006-01-02"
-
 func main() {
 	ctx := context.TODO()
 	sender, err := qdb.NewLineSender(
