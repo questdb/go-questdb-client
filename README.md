@@ -73,7 +73,7 @@ func main() {
 }
 ```
 
-HTTP is the recommended transport to use.To connect via TCP, set the configuration string to:
+HTTP is the recommended transport to use. To connect via TCP, set the configuration string to:
 ```go
 	// ...
 	sender, err := qdb.LineSenderFromConf(ctx, "tcp::addr=localhost:9009;")
