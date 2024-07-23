@@ -54,7 +54,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// You can pass a time, rather than using the AtNow call
+	// You can pass a timestamp, rather than using the AtNow call
 	err = sender.
 		Table("trades").
 		Symbol("symbol", "BTC-USD").
