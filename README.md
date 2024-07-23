@@ -49,7 +49,7 @@ func main() {
 		Symbol("side", "sell").
 		Float64Column("price", 2615.54).
 		Float64Column("amount", 0.00044).
-		AtNow(ctx)
+		AtNow(ctx) // timestamp will be set at the server side
 	if err != nil {
 		log.Fatal(err)
 	}
