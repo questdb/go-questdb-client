@@ -284,6 +284,19 @@ func TestErrorOnContextDeadline(t *testing.T) {
 	t.Fail()
 }
 
+func TestTcpPingReturnsError(t *testing.T) {
+	ctx := context.Background()
+	srv, err := newTestTcpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	assert.ErrorContains(t, sender.Ping(ctx), "ping not supported")
+}
+
 func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 

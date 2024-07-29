@@ -148,6 +148,12 @@ type LineSender interface {
 	// If auto-flush is enabled, the client will flush any remaining buffered
 	// messages before closing itself.
 	Close(ctx context.Context) error
+
+	// Ping will send an HTTP request to the server's /ping path
+	// to test connectivity.
+	//
+	// Valid only for HTTP senders. TCP senders will return an error
+	Ping(ctx context.Context) error
 }
 
 const (

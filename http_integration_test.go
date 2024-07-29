@@ -122,3 +122,57 @@ func (suite *integrationTestSuite) TestServerSideError() {
 	sender.Close(ctx)
 	questdbC.Stop(ctx)
 }
+
+func (suite *integrationTestSuite) TestHttpPingSuccess() {
+	if testing.Short() {
+		suite.T().Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+
+	var (
+		sender qdb.LineSender
+		err    error
+	)
+
+	questdbC, err := setupQuestDB(ctx, noAuth)
+	assert.NoError(suite.T(), err)
+
+	sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
+	assert.NoError(suite.T(), err)
+
+	assert.Eventually(suite.T(), func() bool {
+		return sender.Ping(ctx) != nil
+	}, time.Second, 100*time.Millisecond)
+
+	sender.Close(ctx)
+	questdbC.Stop(ctx)
+
+}
+
+func (suite *integrationTestSuite) TestHttpsBasicAuthPingSuccess() {
+	if testing.Short() {
+		suite.T().Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+
+	var (
+		sender qdb.LineSender
+		err    error
+	)
+
+	questdbC, err := setupQuestDB(ctx, httpBasicAuth)
+	assert.NoError(suite.T(), err)
+
+	sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
+	assert.NoError(suite.T(), err)
+
+	assert.Eventually(suite.T(), func() bool {
+		return sender.Ping(ctx) != nil
+	}, time.Second, 100*time.Millisecond)
+
+	sender.Close(ctx)
+	questdbC.Stop(ctx)
+
+}

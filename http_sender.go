@@ -107,9 +107,10 @@ type httpLineSender struct {
 	pass  string
 	token string
 
-	client http.Client
-	uri    string
-	closed bool
+	client  http.Client
+	uri     string
+	pingUri string
+	closed  bool
 
 	// Global transport is used unless a custom transport was provided.
 	globalTransport *globalHttpTransport
@@ -156,11 +157,13 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 		s.globalTransport.RegisterClient()
 	}
 
-	s.uri = "http"
+	var protocol = "http"
 	if conf.tlsMode != tlsDisabled {
-		s.uri += "s"
+		protocol += "s"
 	}
-	s.uri += fmt.Sprintf("://%s/write", s.address)
+
+	s.uri = fmt.Sprintf("%s://%s/write", protocol, s.address)
+	s.pingUri = fmt.Sprintf("%s://%s/ping", protocol, s.address)
 
 	return s, nil
 }
@@ -337,6 +340,42 @@ func (s *httpLineSender) At(ctx context.Context, ts time.Time) error {
 	return nil
 }
 
+func (s *httpLineSender) Ping(ctx context.Context) error {
+	buf := bytes.Buffer{}
+	success := http.StatusNoContent
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		s.pingUri,
+		&buf,
+	)
+	if err != nil {
+		return err
+	}
+
+	s.setAuth(req)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != success {
+		return fmt.Errorf("ping returned status %d, expected %d", resp.StatusCode, success)
+	}
+
+	return nil
+
+}
+
+func (s *httpLineSender) setAuth(req *http.Request) {
+	if s.user != "" && s.pass != "" {
+		req.SetBasicAuth(s.user, s.pass)
+	} else if s.token != "" {
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
+	}
+}
+
 // makeRequest returns a boolean if we need to retry the request
 func (s *httpLineSender) makeRequest(ctx context.Context) (bool, error) {
 	req, err := http.NewRequest(
@@ -347,13 +386,10 @@ func (s *httpLineSender) makeRequest(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	req.ContentLength = int64(s.BufLen())
 
-	if s.user != "" && s.pass != "" {
-		req.SetBasicAuth(s.user, s.pass)
-	} else if s.token != "" {
-		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
-	}
+	s.setAuth(req)
+
+	req.ContentLength = int64(s.BufLen())
 
 	// reqTimeout = ( request.len() / request_min_throughput ) + request_timeout
 	// nb: conversion from int to time.Duration is in milliseconds
