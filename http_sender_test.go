@@ -93,19 +93,19 @@ func TestHttpHappyCasesFromConf(t *testing.T) {
 }
 
 func TestHttpHappyCasesFromEnv(t *testing.T) {
-	var (
-		addr = "localhost:1111"
-	)
+	// Set up test server to handle pings from constructor
+	s, err := newTestServerWithProtocol(readAndDiscard, "http")
+	assert.NoError(t, err)
 
 	testCases := []httpConfigTestCase{
 		{
 			name:   "addr only",
-			config: fmt.Sprintf("http::addr=%s", addr),
+			config: fmt.Sprintf("http::addr=%s", s.addr),
 		},
 		{
 			name: "auto flush",
 			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000;",
-				addr),
+				s.addr),
 		},
 	}
 

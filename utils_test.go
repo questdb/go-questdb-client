@@ -194,6 +194,12 @@ func (s *testServer) serveHttp() {
 			err error
 		)
 
+		// handle ping
+		if r.URL.Path == "/ping" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		switch s.serverType {
 		case failFirstThenSendToBackChannel:
 			if atomic.AddInt64(&reqs, 1) == 1 {

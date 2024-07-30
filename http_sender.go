@@ -107,10 +107,9 @@ type httpLineSender struct {
 	pass  string
 	token string
 
-	client  http.Client
-	uri     string
-	pingUri string
-	closed  bool
+	client http.Client
+	uri    string
+	closed bool
 
 	// Global transport is used unless a custom transport was provided.
 	globalTransport *globalHttpTransport
@@ -163,9 +162,9 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 	}
 
 	s.uri = fmt.Sprintf("%s://%s/write", protocol, s.address)
-	s.pingUri = fmt.Sprintf("%s://%s/ping", protocol, s.address)
 
-	return s, nil
+	var pingUri = fmt.Sprintf("%s://%s/ping", protocol, s.address)
+	return s, s.ping(pingUri)
 }
 
 func (s *httpLineSender) Flush(ctx context.Context) error {
@@ -340,13 +339,13 @@ func (s *httpLineSender) At(ctx context.Context, ts time.Time) error {
 	return nil
 }
 
-func (s *httpLineSender) Ping(ctx context.Context) error {
+func (s *httpLineSender) ping(uri string) error {
 	buf := bytes.Buffer{}
 	success := http.StatusNoContent
 
 	req, err := http.NewRequest(
 		http.MethodPost,
-		s.pingUri,
+		uri,
 		&buf,
 	)
 	if err != nil {

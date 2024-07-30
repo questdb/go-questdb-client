@@ -241,10 +241,6 @@ func (s *tcpLineSender) At(ctx context.Context, ts time.Time) error {
 	return nil
 }
 
-func (s *tcpLineSender) Ping(ctx context.Context) error {
-	return errors.New("ping not supported for tcp senders")
-}
-
 // Messages returns a copy of accumulated ILP messages that are not
 // flushed to the TCP connection yet. Useful for debugging purposes.
 func (s *tcpLineSender) Messages() string {
