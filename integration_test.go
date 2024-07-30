@@ -192,7 +192,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	)
 	if setupProxy || auth == httpBasicAuth || auth == httpBearerAuth {
 		req = testcontainers.ContainerRequest{
-			Image:        "haproxy:2.6.0",
+			Image:        "haproxy:2.6.4",
 			ExposedPorts: []string{"8443/tcp", "8444/tcp", "8445/tcp", "8888/tcp"},
 			WaitingFor:   wait.ForHTTP("/").WithPort("8888"),
 			Networks:     []string{networkName},
