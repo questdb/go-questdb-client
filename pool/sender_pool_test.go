@@ -62,3 +62,45 @@ func TestDoubleReleaseShouldFail(t *testing.T) {
 	assert.Error(t, p.Release(ctx, s1))
 
 }
+
+func TestMaxPoolSize(t *testing.T) {
+	// Create a pool with 2 max senders
+	p := pool.FromConf("http::addr=localhost:1234", pool.WithMaxSenders(2))
+	ctx := context.Background()
+
+	// Allocate 3 senders
+	s1, err := p.Acquire(ctx)
+	assert.NoError(t, err)
+
+	s2, err := p.Acquire(ctx)
+	assert.NoError(t, err)
+
+	s3, err := p.Acquire(ctx)
+	assert.NoError(t, err)
+
+	// Release all senders in reverse order
+	// Internal slice will look like: [ s3 , s2 ]
+	assert.NoError(t, p.Release(ctx, s3))
+	assert.NoError(t, p.Release(ctx, s2))
+	assert.NoError(t, p.Release(ctx, s1))
+
+	// Acquire 3 more senders.
+
+	// The first one will be s2 (senders get popped off the slice)
+	s, err := p.Acquire(ctx)
+	assert.NoError(t, err)
+	assert.Same(t, s, s2)
+
+	// The next will be s3
+	s, err = p.Acquire(ctx)
+	assert.NoError(t, err)
+	assert.Same(t, s, s3)
+
+	// The final one will not be s1, s2, or s3 because the slice is empty
+	s, err = p.Acquire(ctx)
+	assert.NoError(t, err)
+	assert.NotSame(t, s, s1)
+	assert.NotSame(t, s, s2)
+	assert.NotSame(t, s, s3)
+
+}
