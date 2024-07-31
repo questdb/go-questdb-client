@@ -130,7 +130,7 @@ func (p *LineSenderPool) Close(ctx context.Context) error {
 
 	err := fmt.Errorf("error closing one or more LineSenders in the pool")
 	for _, senderErr := range senderErrors {
-		err = fmt.Errorf("%w %w", err, senderErr)
+		err = fmt.Errorf("%s %w", err, senderErr)
 	}
 
 	return err
