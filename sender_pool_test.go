@@ -21,7 +21,7 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-package pool_test
+package questdb_test
 
 import (
 	"context"
@@ -30,13 +30,12 @@ import (
 	"testing"
 	"time"
 
-	utils "github.com/questdb/go-questdb-client/v3/internal/testutils"
-	"github.com/questdb/go-questdb-client/v3/pool"
+	"github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestBasicBehavior(t *testing.T) {
-	p := pool.FromConf("http::addr=localhost:1234")
+	p := questdb.PoolFromConf("http::addr=localhost:1234")
 	ctx := context.Background()
 
 	// Start with an empty pool, allocate a new sender
@@ -75,7 +74,7 @@ func TestBasicBehavior(t *testing.T) {
 }
 
 func TestDoubleReleaseShouldFail(t *testing.T) {
-	p := pool.FromConf("http::addr=localhost:1234")
+	p := questdb.PoolFromConf("http::addr=localhost:1234")
 	ctx := context.Background()
 
 	// Start with an empty pool, allocate a new sender
@@ -92,7 +91,7 @@ func TestDoubleReleaseShouldFail(t *testing.T) {
 
 func TestMaxPoolSize(t *testing.T) {
 	// Create a pool with 2 max senders
-	p := pool.FromConf("http::addr=localhost:1234", pool.WithMaxSenders(2))
+	p := questdb.PoolFromConf("http::addr=localhost:1234", questdb.WithMaxSenders(2))
 	ctx := context.Background()
 
 	// Allocate 3 senders
@@ -139,12 +138,12 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 		numThreads = 5
 	)
 
-	srv, err := utils.NewTestHttpServer(utils.SendToBackChannel)
+	srv, err := newTestHttpServer(sendToBackChannel)
 	assert.NoError(t, err)
 
 	wg := &sync.WaitGroup{}
 
-	pool := pool.FromConf(fmt.Sprintf("http::addr=%s", srv.Addr()), pool.WithMaxSenders(maxSenders))
+	pool := questdb.PoolFromConf(fmt.Sprintf("http::addr=%s", srv.Addr()), questdb.WithMaxSenders(maxSenders))
 
 	for i := 0; i < numThreads; i++ {
 		i := i
@@ -163,16 +162,24 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 
 	wg.Wait()
 
-	lines := []string{}
-	for len(srv.BackCh) > 0 {
-		lines = append(lines, <-srv.BackCh)
-	}
-
 	assert.NoError(t, pool.Close(ctx))
+
+	lines := []string{}
+
+	go func() {
+		for {
+			select {
+			case msg := <-srv.BackCh:
+				lines = append(lines, msg)
+			default:
+				continue
+			}
+		}
+	}()
 
 	assert.Eventually(t, func() bool {
 		return len(lines) == numThreads
-	}, time.Second, 100*time.Millisecond)
+	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
 
 }
 
@@ -183,12 +190,12 @@ func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
 		numThreads = 5
 	)
 
-	srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
+	srv, err := newTestTcpServer(sendToBackChannel)
 	assert.NoError(t, err)
 
 	wg := &sync.WaitGroup{}
 
-	pool := pool.FromConf(fmt.Sprintf("tcp::addr=%s", srv.Addr()), pool.WithMaxSenders(maxSenders))
+	pool := questdb.PoolFromConf(fmt.Sprintf("tcp::addr=%s", srv.Addr()), questdb.WithMaxSenders(maxSenders))
 
 	for i := 0; i < numThreads; i++ {
 		i := i
@@ -207,21 +214,29 @@ func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
 
 	wg.Wait()
 
-	lines := []string{}
-	for len(srv.BackCh) > 0 {
-		lines = append(lines, <-srv.BackCh)
-	}
-
 	assert.NoError(t, pool.Close(ctx))
+
+	lines := []string{}
+
+	go func() {
+		for {
+			select {
+			case msg := <-srv.BackCh:
+				lines = append(lines, msg)
+			default:
+				continue
+			}
+		}
+	}()
 
 	assert.Eventually(t, func() bool {
 		return len(lines) == numThreads
-	}, time.Second, 100*time.Millisecond)
+	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
 
 }
 
 func TestAcquireOnAClosedPool(t *testing.T) {
-	p := pool.FromConf("http::addr=localhost:1234")
+	p := questdb.PoolFromConf("http::addr=localhost:1234")
 	ctx := context.Background()
 
 	assert.NoError(t, p.Close(ctx))

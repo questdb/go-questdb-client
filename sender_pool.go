@@ -22,26 +22,15 @@
  *
  ******************************************************************************/
 
-// Package pool provides a mechanism to cache previously-used [qdb.LineSender] objects
-// in memory so they can be reused without having to allocate and instantiate new senders.
-//
-// A LineSenderPool is thread-safe and can be used to concurrently Acquire and Release LineSenders
-// across multiple goroutines.
-//
-// Since LineSenders must be used in a single-threaded context, a typical pattern is to Acquire
-// a LineSender from a LineSenderPool at the beginning of a goroutine and use a deferred
-// execution block to Release the LineSender at the end of the goroutine.
-package pool
+package questdb
 
 import (
 	"context"
 	"fmt"
 	"sync"
-
-	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
-// LineSenderPool wraps a mutex-protected slice of [qdb.LineSender]. It allows a goroutine to
+// LineSenderPool wraps a mutex-protected slice of [LineSender]. It allows a goroutine to
 // Acquire a sender from the pool and Release it back to the pool when it's done being used.
 type LineSenderPool struct {
 	maxSenders int
@@ -49,24 +38,24 @@ type LineSenderPool struct {
 
 	closed bool
 
-	senders []qdb.LineSender
+	senders []LineSender
 	mu      *sync.Mutex
 }
 
 // LineSenderPoolOption defines line sender pool config option.
 type LineSenderPoolOption func(*LineSenderPool)
 
-// FromConf instantiates a new LineSenderPool with a QuestDB configuration string.
+// PoolFromConf instantiates a new LineSenderPool with a QuestDB configuration string.
 // Any sender acquired from this pool will be initialized with the same configuration
 // string that was passed into the conf argument.
 //
 // The default maximum number of senders is 64, but can be customized by using the
 // [WithMaxSenders] option
-func FromConf(conf string, opts ...LineSenderPoolOption) *LineSenderPool {
+func PoolFromConf(conf string, opts ...LineSenderPoolOption) *LineSenderPool {
 	pool := &LineSenderPool{
 		maxSenders: 64,
 		conf:       conf,
-		senders:    []qdb.LineSender{},
+		senders:    []LineSender{},
 		mu:         &sync.Mutex{},
 	}
 
@@ -86,7 +75,7 @@ func WithMaxSenders(count int) LineSenderPoolOption {
 
 // Acquire returns a LineSender from the pool. If the pool is empty, a new
 // LineSender will be instantiated using the pool's config string.
-func (p *LineSenderPool) Acquire(ctx context.Context) (qdb.LineSender, error) {
+func (p *LineSenderPool) Acquire(ctx context.Context) (LineSender, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -101,14 +90,14 @@ func (p *LineSenderPool) Acquire(ctx context.Context) (qdb.LineSender, error) {
 		return s, nil
 	}
 
-	return qdb.LineSenderFromConf(ctx, p.conf)
+	return LineSenderFromConf(ctx, p.conf)
 
 }
 
 // Release flushes a LineSender and returns it back to the pool. If the pool
 // is full, the sender is closed and discarded. In cases where the sender's
 // flush fails, it is not added back to the pool.
-func (p *LineSenderPool) Release(ctx context.Context, s qdb.LineSender) error {
+func (p *LineSenderPool) Release(ctx context.Context, s LineSender) error {
 	// If there is an error on flush, do not add the sender back to the pool
 	if err := s.Flush(ctx); err != nil {
 		return err
