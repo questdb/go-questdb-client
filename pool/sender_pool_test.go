@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	utils "github.com/questdb/go-questdb-client/v3/internal/testutils"
 	"github.com/questdb/go-questdb-client/v3/pool"
@@ -167,7 +168,9 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 		lines = append(lines, <-srv.BackCh)
 	}
 
-	assert.Len(t, lines, numThreads)
+	assert.Eventually(t, func() bool {
+		return len(lines) == numThreads
+	}, time.Second, 100*time.Millisecond)
 
 	assert.NoError(t, pool.Close(ctx))
 }
@@ -208,7 +211,9 @@ func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
 		lines = append(lines, <-srv.BackCh)
 	}
 
-	assert.Len(t, lines, numThreads)
+	assert.Eventually(t, func() bool {
+		return len(lines) == numThreads
+	}, time.Second, 100*time.Millisecond)
 
 	assert.NoError(t, pool.Close(ctx))
 }
