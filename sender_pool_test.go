@@ -140,6 +140,7 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 
 	srv, err := newTestHttpServer(sendToBackChannel)
 	assert.NoError(t, err)
+	defer srv.Close()
 
 	wg := &sync.WaitGroup{}
 
@@ -171,6 +172,8 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 			select {
 			case msg := <-srv.BackCh:
 				lines = append(lines, msg)
+			case <-srv.closeCh:
+				return
 			default:
 				continue
 			}
@@ -192,6 +195,7 @@ func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
 
 	srv, err := newTestTcpServer(sendToBackChannel)
 	assert.NoError(t, err)
+	defer srv.Close()
 
 	wg := &sync.WaitGroup{}
 
@@ -223,6 +227,8 @@ func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
 			select {
 			case msg := <-srv.BackCh:
 				lines = append(lines, msg)
+			case <-srv.closeCh:
+				return
 			default:
 				continue
 			}
