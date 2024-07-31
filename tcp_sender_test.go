@@ -32,7 +32,6 @@ import (
 	"time"
 
 	qdb "github.com/questdb/go-questdb-client/v3"
-	utils "github.com/questdb/go-questdb-client/v3/internal/testutils"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -52,7 +51,7 @@ func TestTcpHappyCasesFromConf(t *testing.T) {
 		initBufSize = 1000
 	)
 
-	testServer, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	testServer, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer testServer.Close()
 
@@ -85,7 +84,7 @@ func TestTcpHappyCasesFromEnv(t *testing.T) {
 		initBufSize = 4200
 	)
 
-	testServer, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	testServer, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer testServer.Close()
 
@@ -211,7 +210,7 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -235,7 +234,7 @@ func TestErrorOnUnavailableServer(t *testing.T) {
 
 func TestErrorOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -262,7 +261,7 @@ func TestErrorOnContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
 
-	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -288,7 +287,7 @@ func TestErrorOnContextDeadline(t *testing.T) {
 func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(b, err)
 	defer srv.Close()
 
@@ -316,7 +315,7 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 func BenchmarkLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := utils.NewTestTcpServer(utils.ReadAndDiscard)
+	srv, err := newTestTcpServer(readAndDiscard)
 	assert.NoError(b, err)
 	defer srv.Close()
 
