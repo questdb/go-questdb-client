@@ -25,8 +25,11 @@ package pool_test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 
+	utils "github.com/questdb/go-questdb-client/v3/internal/testutils"
 	"github.com/questdb/go-questdb-client/v3/pool"
 	"github.com/stretchr/testify/assert"
 )
@@ -126,4 +129,97 @@ func TestMaxPoolSize(t *testing.T) {
 	assert.NotSame(t, s, s2)
 	assert.NotSame(t, s, s3)
 
+}
+
+func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
+	var (
+		ctx        = context.Background()
+		maxSenders = 2
+		numThreads = 5
+	)
+
+	srv, err := utils.NewTestHttpServer(utils.SendToBackChannel)
+	assert.NoError(t, err)
+
+	wg := &sync.WaitGroup{}
+
+	pool := pool.FromConf(fmt.Sprintf("http::addr=%s", srv.Addr()), pool.WithMaxSenders(maxSenders))
+
+	for i := 0; i < numThreads; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			sender, err := pool.Acquire(ctx)
+			assert.NoError(t, err)
+
+			sender.Table("test").Int64Column("thread", int64(i)).AtNow(ctx)
+
+			err = pool.Release(ctx, sender)
+			assert.NoError(t, err)
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
+
+	lines := []string{}
+	for len(srv.BackCh) > 0 {
+		lines = append(lines, <-srv.BackCh)
+	}
+
+	assert.Len(t, lines, numThreads)
+
+	assert.NoError(t, pool.Close(ctx))
+}
+
+func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
+	var (
+		ctx        = context.Background()
+		maxSenders = 2
+		numThreads = 5
+	)
+
+	srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
+	assert.NoError(t, err)
+
+	wg := &sync.WaitGroup{}
+
+	pool := pool.FromConf(fmt.Sprintf("tcp::addr=%s", srv.Addr()), pool.WithMaxSenders(maxSenders))
+
+	for i := 0; i < numThreads; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			sender, err := pool.Acquire(ctx)
+			assert.NoError(t, err)
+
+			sender.Table("test").Int64Column("thread", int64(i)).AtNow(ctx)
+
+			err = pool.Release(ctx, sender)
+			assert.NoError(t, err)
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
+
+	lines := []string{}
+	for len(srv.BackCh) > 0 {
+		lines = append(lines, <-srv.BackCh)
+	}
+
+	assert.Len(t, lines, numThreads)
+
+	assert.NoError(t, pool.Close(ctx))
+}
+
+func TestAcquireOnAClosedPool(t *testing.T) {
+	p := pool.FromConf("http::addr=localhost:1234")
+	ctx := context.Background()
+
+	p.Close(ctx)
+	assert.True(t, p.IsClosed())
+
+	_, err := p.Acquire(ctx)
+	assert.ErrorContains(t, err, "cannot Acquire a LineSender from a closed LineSenderPool")
 }

@@ -172,3 +172,11 @@ func (p *LineSenderPool) IsClosed() bool {
 
 	return p.closed
 }
+
+// Len returns the numbers of cached LineSenders in the pool's internal slice
+func (p *LineSenderPool) Len() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return len(p.senders)
+}
