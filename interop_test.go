@@ -33,6 +33,7 @@ import (
 	"testing"
 
 	qdb "github.com/questdb/go-questdb-client/v3"
+	utils "github.com/questdb/go-questdb-client/v3/internal/testutils"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -72,7 +73,7 @@ func TestTcpClientInterop(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			srv, err := newTestTcpServer(sendToBackChannel)
+			srv, err := utils.NewTestTcpServer(utils.SendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
@@ -105,7 +106,7 @@ func TestTcpClientInterop(t *testing.T) {
 				err = sender.Flush(ctx)
 				assert.NoError(t, err)
 
-				expectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
+				utils.ExpectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
 			case "ERROR":
 				assert.Error(t, err)
 			default:
@@ -126,7 +127,7 @@ func TestHttpClientInterop(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			srv, err := newTestHttpServer(sendToBackChannel)
+			srv, err := utils.NewTestHttpServer(utils.SendToBackChannel)
 			assert.NoError(t, err)
 
 			sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
@@ -159,7 +160,7 @@ func TestHttpClientInterop(t *testing.T) {
 				err = sender.Flush(ctx)
 				assert.NoError(t, err)
 
-				expectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
+				utils.ExpectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
 			case "ERROR":
 				assert.Error(t, err)
 			default:

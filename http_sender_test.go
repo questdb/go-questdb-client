@@ -34,6 +34,7 @@ import (
 	"time"
 
 	qdb "github.com/questdb/go-questdb-client/v3"
+	utils "github.com/questdb/go-questdb-client/v3/internal/testutils"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -225,7 +226,7 @@ func TestErrorWhenSenderTypeIsNotSpecified(t *testing.T) {
 func TestHttpErrorWhenMaxBufferSizeIsReached(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -248,7 +249,7 @@ func TestHttpErrorWhenMaxBufferSizeIsReached(t *testing.T) {
 func TestHttpErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -266,7 +267,7 @@ func TestHttpErrorOnFlushWhenMessageIsPending(t *testing.T) {
 func TestNoOpOnFlushWhenNoMessagesAreWritten(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -284,7 +285,7 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
 	defer cancel()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -310,7 +311,7 @@ func TestErrorOnContextDeadlineHttp(t *testing.T) {
 func TestRetryOn500(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(returning500)
+	srv, err := utils.NewTestHttpServer(utils.Returning500)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -337,7 +338,7 @@ func TestRetryOn500(t *testing.T) {
 func TestNoRetryOn400FromProxy(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(returning403)
+	srv, err := utils.NewTestHttpServer(utils.Returning403)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -364,7 +365,7 @@ func TestNoRetryOn400FromProxy(t *testing.T) {
 func TestNoRetryOn400FromServer(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(returning404)
+	srv, err := utils.NewTestHttpServer(utils.Returning404)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -394,7 +395,7 @@ func TestRowBasedAutoFlush(t *testing.T) {
 	ctx := context.Background()
 	autoFlushRows := 10
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -426,7 +427,7 @@ func TestTimeBasedAutoFlush(t *testing.T) {
 	ctx := context.Background()
 	autoFlushInterval := 10 * time.Millisecond
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -458,7 +459,7 @@ func TestTimeBasedAutoFlushWithRowBasedFlushDisabled(t *testing.T) {
 	ctx := context.Background()
 	autoFlushInterval := 10 * time.Millisecond
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -485,7 +486,7 @@ func TestRowBasedAutoFlushWithTimeBasedFlushDisabled(t *testing.T) {
 	ctx := context.Background()
 	autoFlushRows := 1000
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -514,7 +515,7 @@ func TestNoFlushWhenAutoFlushDisabled(t *testing.T) {
 	autoFlushRows := 10
 	autoFlushInterval := time.Duration(autoFlushRows-1) * time.Millisecond
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -545,7 +546,7 @@ func TestSenderDoubleClose(t *testing.T) {
 	ctx := context.Background()
 	autoFlushRows := 10
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -570,7 +571,7 @@ func TestSenderDoubleClose(t *testing.T) {
 func TestErrorOnFlushWhenSenderIsClosed(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -588,7 +589,7 @@ func TestErrorOnFlushWhenSenderIsClosed(t *testing.T) {
 func TestAutoFlushWhenSenderIsClosed(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -607,7 +608,7 @@ func TestAutoFlushWhenSenderIsClosed(t *testing.T) {
 func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -631,7 +632,7 @@ func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
 func TestSuccessAfterRetries(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(failFirstThenSendToBackChannel)
+	srv, err := utils.NewTestHttpServer(utils.FailFirstThenSendToBackChannel)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -656,14 +657,14 @@ func TestSuccessAfterRetries(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		expected = append(expected, fmt.Sprintf("%s foobar=%di", testTable, i))
 	}
-	expectLines(t, srv.BackCh, expected)
+	utils.ExpectLines(t, srv.BackCh, expected)
 	assert.Zero(t, qdb.BufLen(sender))
 }
 
 func TestBufferClearAfterFlush(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(sendToBackChannel)
+	srv, err := utils.NewTestHttpServer(utils.SendToBackChannel)
 	assert.NoError(t, err)
 	defer srv.Close()
 
@@ -677,7 +678,7 @@ func TestBufferClearAfterFlush(t *testing.T) {
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
 
-	expectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,abc=def", testTable)})
+	utils.ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,abc=def", testTable)})
 	assert.Zero(t, qdb.BufLen(sender))
 
 	err = sender.Table(testTable).Symbol("ghi", "jkl").AtNow(ctx)
@@ -686,7 +687,7 @@ func TestBufferClearAfterFlush(t *testing.T) {
 	err = sender.Flush(ctx)
 	assert.NoError(t, err)
 
-	expectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,ghi=jkl", testTable)})
+	utils.ExpectLines(t, srv.BackCh, []string{fmt.Sprintf("%s,ghi=jkl", testTable)})
 }
 
 func TestCustomTransportAndTlsInit(t *testing.T) {
@@ -729,7 +730,7 @@ func TestCustomTransportAndTlsInit(t *testing.T) {
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(b, err)
 	defer srv.Close()
 
@@ -757,7 +758,7 @@ func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	ctx := context.Background()
 
-	srv, err := newTestHttpServer(readAndDiscard)
+	srv, err := utils.NewTestHttpServer(utils.ReadAndDiscard)
 	assert.NoError(b, err)
 	defer srv.Close()
 
