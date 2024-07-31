@@ -12,6 +12,8 @@ type LineSenderPool struct {
 	maxSenders int
 	conf       string
 
+	closed bool
+
 	senders []qdb.LineSender
 	mu      *sync.Mutex
 }
@@ -43,6 +45,10 @@ func (p *LineSenderPool) Acquire(ctx context.Context) (qdb.LineSender, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.closed {
+		return nil, fmt.Errorf("cannot Acquire a LineSender from a closed LineSenderPool")
+	}
+
 	if len(p.senders) > 0 {
 		// Pop sender off the slice and return it
 		s := p.senders[len(p.senders)-1]
@@ -55,7 +61,10 @@ func (p *LineSenderPool) Acquire(ctx context.Context) (qdb.LineSender, error) {
 }
 
 func (p *LineSenderPool) Release(ctx context.Context, s qdb.LineSender) error {
-	err := s.Flush(ctx)
+	// If there is an error on flush, do not add the sender back to the pool
+	if err := s.Flush(ctx); err != nil {
+		return err
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -66,10 +75,47 @@ func (p *LineSenderPool) Release(ctx context.Context, s qdb.LineSender) error {
 		}
 	}
 
-	if len(p.senders) < p.maxSenders {
-		p.senders = append(p.senders, s)
+	if p.closed || len(p.senders) >= p.maxSenders {
+		return s.Close(ctx)
+	}
+
+	p.senders = append(p.senders, s)
+
+	return nil
+
+}
+
+func (p *LineSenderPool) Close(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.closed = true
+
+	var senderErrors []error
+
+	for _, s := range p.senders {
+		senderErr := s.Close(ctx)
+		if senderErr != nil {
+			senderErrors = append(senderErrors, senderErr)
+
+		}
+	}
+
+	if len(senderErrors) == 0 {
+		return nil
+	}
+
+	err := fmt.Errorf("error closing one or more LineSenders in the pool")
+	for _, senderErr := range senderErrors {
+		err = fmt.Errorf("%w %w", err, senderErr)
 	}
 
 	return err
+}
 
+func (p *LineSenderPool) IsClosed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.closed
 }
