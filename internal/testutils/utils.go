@@ -41,44 +41,44 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type serverType int64
+type ServerType int64
 
 const (
-	sendToBackChannel              serverType = 0
-	readAndDiscard                 serverType = 1
-	returning500                   serverType = 2
-	returning403                   serverType = 3
-	returning404                   serverType = 4
-	failFirstThenSendToBackChannel serverType = 5
+	SendToBackChannel              ServerType = 0
+	ReadAndDiscard                 ServerType = 1
+	Returning500                   ServerType = 2
+	Returning403                   ServerType = 3
+	Returning404                   ServerType = 4
+	FailFirstThenSendToBackChannel ServerType = 5
 )
 
-type testServer struct {
+type TestServer struct {
 	addr        string
 	tcpListener net.Listener
-	serverType  serverType
+	serverType  ServerType
 	BackCh      chan string
 	closeCh     chan struct{}
 	wg          sync.WaitGroup
 }
 
-func (t *testServer) Addr() string {
+func (t *TestServer) Addr() string {
 	return t.addr
 }
 
-func newTestTcpServer(serverType serverType) (*testServer, error) {
+func NewTestTcpServer(serverType ServerType) (*TestServer, error) {
 	return newTestServerWithProtocol(serverType, "tcp")
 }
 
-func newTestHttpServer(serverType serverType) (*testServer, error) {
+func NewTestHttpServer(serverType ServerType) (*TestServer, error) {
 	return newTestServerWithProtocol(serverType, "http")
 }
 
-func newTestServerWithProtocol(serverType serverType, protocol string) (*testServer, error) {
+func newTestServerWithProtocol(serverType ServerType, protocol string) (*TestServer, error) {
 	tcp, err := net.Listen("tcp", "127.0.0.1:")
 	if err != nil {
 		return nil, err
 	}
-	s := &testServer{
+	s := &TestServer{
 		addr:        tcp.Addr().String(),
 		tcpListener: tcp,
 		serverType:  serverType,
@@ -91,7 +91,7 @@ func newTestServerWithProtocol(serverType serverType, protocol string) (*testSer
 		s.wg.Add(1)
 		go s.serveTcp()
 	case "http":
-		go s.serveHttp()
+		go s.ServeHttp()
 	default:
 		return nil, fmt.Errorf("invalid protocol %q", protocol)
 	}
@@ -99,7 +99,7 @@ func newTestServerWithProtocol(serverType serverType, protocol string) (*testSer
 	return s, nil
 }
 
-func (s *testServer) serveTcp() {
+func (s *TestServer) serveTcp() {
 	defer s.wg.Done()
 
 	for {
@@ -117,9 +117,9 @@ func (s *testServer) serveTcp() {
 		s.wg.Add(1)
 		go func() {
 			switch s.serverType {
-			case sendToBackChannel:
+			case SendToBackChannel:
 				s.handleSendToBackChannel(conn)
-			case readAndDiscard:
+			case ReadAndDiscard:
 				s.handleReadAndDiscard(conn)
 			default:
 				panic(fmt.Sprintf("server type is not supported: %d", s.serverType))
@@ -129,7 +129,7 @@ func (s *testServer) serveTcp() {
 	}
 }
 
-func (s *testServer) handleSendToBackChannel(conn net.Conn) {
+func (s *TestServer) handleSendToBackChannel(conn net.Conn) {
 	defer conn.Close()
 
 	r := bufio.NewReader(conn)
@@ -153,7 +153,7 @@ func (s *testServer) handleSendToBackChannel(conn net.Conn) {
 	}
 }
 
-func (s *testServer) handleReadAndDiscard(conn net.Conn) {
+func (s *TestServer) handleReadAndDiscard(conn net.Conn) {
 	defer conn.Close()
 
 	for {
@@ -174,7 +174,7 @@ func (s *testServer) handleReadAndDiscard(conn net.Conn) {
 	}
 }
 
-func (s *testServer) serveHttp() {
+func (s *TestServer) ServeHttp() {
 	lineFeed := make(chan string)
 
 	go func() {
@@ -195,7 +195,7 @@ func (s *testServer) serveHttp() {
 		)
 
 		switch s.serverType {
-		case failFirstThenSendToBackChannel:
+		case FailFirstThenSendToBackChannel:
 			if atomic.AddInt64(&reqs, 1) == 1 {
 				// Consume request body.
 				_, err = io.Copy(io.Discard, r.Body)
@@ -203,16 +203,16 @@ func (s *testServer) serveHttp() {
 			} else {
 				err = readAndSendToBackChannel(r, lineFeed)
 			}
-		case sendToBackChannel:
+		case SendToBackChannel:
 			err = readAndSendToBackChannel(r, lineFeed)
-		case readAndDiscard:
+		case ReadAndDiscard:
 			_, err = io.Copy(io.Discard, r.Body)
-		case returning500:
+		case Returning500:
 			w.WriteHeader(http.StatusInternalServerError)
-		case returning403:
+		case Returning403:
 			w.WriteHeader(http.StatusForbidden)
 			io.WriteString(w, "Forbidden")
-		case returning404:
+		case Returning404:
 			w.WriteHeader(http.StatusNotFound)
 			data, err := json.Marshal(map[string]interface{}{
 				"code":    "404",
@@ -251,13 +251,13 @@ func readAndSendToBackChannel(r *http.Request, lineFeed chan string) error {
 	return err
 }
 
-func (s *testServer) Close() {
+func (s *TestServer) Close() {
 	close(s.closeCh)
 	s.tcpListener.Close()
 	s.wg.Wait()
 }
 
-func expectLines(t *testing.T, linesCh chan string, expected []string) {
+func ExpectLines(t *testing.T, linesCh chan string, expected []string) {
 	actual := make([]string, 0)
 	assert.Eventually(t, func() bool {
 		select {
