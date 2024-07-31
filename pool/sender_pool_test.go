@@ -155,8 +155,8 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 
 			sender.Table("test").Int64Column("thread", int64(i)).AtNow(ctx)
 
-			err = pool.Release(ctx, sender)
-			assert.NoError(t, err)
+			assert.NoError(t, pool.Release(ctx, sender))
+
 			wg.Done()
 		}()
 	}
@@ -168,11 +168,12 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 		lines = append(lines, <-srv.BackCh)
 	}
 
+	assert.NoError(t, pool.Close(ctx))
+
 	assert.Eventually(t, func() bool {
 		return len(lines) == numThreads
 	}, time.Second, 100*time.Millisecond)
 
-	assert.NoError(t, pool.Close(ctx))
 }
 
 func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
@@ -198,8 +199,8 @@ func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
 
 			sender.Table("test").Int64Column("thread", int64(i)).AtNow(ctx)
 
-			err = pool.Release(ctx, sender)
-			assert.NoError(t, err)
+			assert.NoError(t, pool.Release(ctx, sender))
+
 			wg.Done()
 		}()
 	}
@@ -211,18 +212,19 @@ func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
 		lines = append(lines, <-srv.BackCh)
 	}
 
+	assert.NoError(t, pool.Close(ctx))
+
 	assert.Eventually(t, func() bool {
 		return len(lines) == numThreads
 	}, time.Second, 100*time.Millisecond)
 
-	assert.NoError(t, pool.Close(ctx))
 }
 
 func TestAcquireOnAClosedPool(t *testing.T) {
 	p := pool.FromConf("http::addr=localhost:1234")
 	ctx := context.Background()
 
-	p.Close(ctx)
+	assert.NoError(t, p.Close(ctx))
 	assert.True(t, p.IsClosed())
 
 	_, err := p.Acquire(ctx)
