@@ -100,7 +100,7 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
+	ctx := context.TODO()
 
 	pool := qdb.PoolFromConf("http::addr=localhost:9000")
 	defer func() {

@@ -66,14 +66,15 @@ func PoolFromConf(conf string, opts ...LineSenderPoolOption) *LineSenderPool {
 	return pool
 }
 
-// WithMaxSenders sets the maximum number of senders in the pool
+// WithMaxSenders sets the maximum number of senders in the pool.
+// The default maximum number of senders is 64.
 func WithMaxSenders(count int) LineSenderPoolOption {
 	return func(lsp *LineSenderPool) {
 		lsp.maxSenders = count
 	}
 }
 
-// Acquire returns a LineSender from the pool. If the pool is empty, a new
+// Acquire obtains a LineSender from the pool. If the pool is empty, a new
 // LineSender will be instantiated using the pool's config string.
 func (p *LineSenderPool) Acquire(ctx context.Context) (LineSender, error) {
 	p.mu.Lock()
@@ -94,7 +95,7 @@ func (p *LineSenderPool) Acquire(ctx context.Context) (LineSender, error) {
 
 }
 
-// Release flushes a LineSender and returns it back to the pool. If the pool
+// Release flushes the LineSender and returns it back to the pool. If the pool
 // is full, the sender is closed and discarded. In cases where the sender's
 // flush fails, it is not added back to the pool.
 func (p *LineSenderPool) Release(ctx context.Context, s LineSender) error {
@@ -108,7 +109,7 @@ func (p *LineSenderPool) Release(ctx context.Context, s LineSender) error {
 
 	for i := range p.senders {
 		if p.senders[i] == s {
-			return fmt.Errorf("LineSender %p is has already been released back to the pool", s)
+			return fmt.Errorf("LineSender %p has already been released back to the pool", s)
 		}
 	}
 
@@ -162,7 +163,7 @@ func (p *LineSenderPool) IsClosed() bool {
 	return p.closed
 }
 
-// Len returns the numbers of cached LineSenders in the pool's internal slice
+// Len returns the numbers of cached LineSenders in the pool.
 func (p *LineSenderPool) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
