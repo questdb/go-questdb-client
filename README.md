@@ -42,7 +42,7 @@ func main() {
 		log.Fatal(err)
 	}
 	// Make sure to close the sender on exit to release resources.
-	defer sender.Close()
+	defer sender.Close(ctx)
 	// Send a few ILP messages.
 	err = sender.
 		Table("trades").
