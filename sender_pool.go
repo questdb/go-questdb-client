@@ -32,6 +32,8 @@ import (
 
 // LineSenderPool wraps a mutex-protected slice of [LineSender]. It allows a goroutine to
 // Acquire a sender from the pool and Release it back to the pool when it's done being used.
+//
+// WARNING: This is an experimental API that is designed to work with HTTP senders ONLY
 type LineSenderPool struct {
 	maxSenders int
 	conf       string
@@ -124,6 +126,7 @@ func (p *LineSenderPool) Release(ctx context.Context, s LineSender) error {
 }
 
 // Close sets the pool's status to "closed" and closes all cached LineSenders.
+// When LineSenders are released back into a closed pool, they will be closed and discarded.
 func (p *LineSenderPool) Close(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

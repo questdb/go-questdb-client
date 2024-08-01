@@ -77,6 +77,8 @@ To connect via TCP, set the configuration string to:
 
 ## Pooled Line Senders
 
+**Warning: Experimental feature designed for use with HTTP senders ONLY**
+
 Version 3 of the client introduces a `LineSenderPool`, which provides a mechanism
 to cache previously-used `LineSender`s in memory so they can be reused without
 having to allocate and instantiate new senders.
@@ -123,7 +125,6 @@ func main() {
 	if err := pool.Release(ctx, sender); err != nil {
 		panic(err)
 	}
-
 }
 ```
 
