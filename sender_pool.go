@@ -26,7 +26,9 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -53,7 +55,11 @@ type LineSenderPoolOption func(*LineSenderPool)
 //
 // The default maximum number of senders is 64, but can be customized by using the
 // [WithMaxSenders] option
-func PoolFromConf(conf string, opts ...LineSenderPoolOption) *LineSenderPool {
+func PoolFromConf(conf string, opts ...LineSenderPoolOption) (*LineSenderPool, error) {
+	if strings.HasPrefix(conf, "tcp") {
+		return nil, errors.New("tcp/s not supported for pooled senders, use http/s only")
+	}
+
 	pool := &LineSenderPool{
 		maxSenders: 64,
 		conf:       conf,
@@ -65,7 +71,7 @@ func PoolFromConf(conf string, opts ...LineSenderPoolOption) *LineSenderPool {
 		opt(pool)
 	}
 
-	return pool
+	return pool, nil
 }
 
 // WithMaxSenders sets the maximum number of senders in the pool.

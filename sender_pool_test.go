@@ -32,10 +32,12 @@ import (
 
 	"github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBasicBehavior(t *testing.T) {
-	p := questdb.PoolFromConf("http::addr=localhost:1234")
+	p, err := questdb.PoolFromConf("http::addr=localhost:1234")
+	require.NoError(t, err)
 	ctx := context.Background()
 
 	// Start with an empty pool, allocate a new sender
@@ -73,7 +75,9 @@ func TestBasicBehavior(t *testing.T) {
 }
 
 func TestDoubleReleaseShouldFail(t *testing.T) {
-	p := questdb.PoolFromConf("http::addr=localhost:1234")
+	p, err := questdb.PoolFromConf("http::addr=localhost:1234")
+	require.NoError(t, err)
+
 	ctx := context.Background()
 
 	// Start with an empty pool, allocate a new sender
@@ -89,7 +93,9 @@ func TestDoubleReleaseShouldFail(t *testing.T) {
 
 func TestMaxPoolSize(t *testing.T) {
 	// Create a pool with 2 max senders
-	p := questdb.PoolFromConf("http::addr=localhost:1234", questdb.WithMaxSenders(2))
+	p, err := questdb.PoolFromConf("http::addr=localhost:1234", questdb.WithMaxSenders(2))
+	require.NoError(t, err)
+
 	ctx := context.Background()
 
 	// Allocate 3 senders
@@ -141,7 +147,8 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 
 	wg := &sync.WaitGroup{}
 
-	pool := questdb.PoolFromConf(fmt.Sprintf("http::addr=%s", srv.Addr()), questdb.WithMaxSenders(maxSenders))
+	pool, err := questdb.PoolFromConf(fmt.Sprintf("http::addr=%s", srv.Addr()), questdb.WithMaxSenders(maxSenders))
+	require.NoError(t, err)
 
 	for i := 0; i < numThreads; i++ {
 		i := i
@@ -182,67 +189,12 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
 }
 
-func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
-	var (
-		ctx        = context.Background()
-		maxSenders = 2
-		numThreads = 5
-	)
+func TestTcpNotSupported(t *testing.T) {
 
-	srv, err := newTestTcpServer(sendToBackChannel)
-	assert.NoError(t, err)
-	defer srv.Close()
+	_, err := questdb.PoolFromConf("tcp::addr=localhost:9000")
+	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
 
-	wg := &sync.WaitGroup{}
+	_, err = questdb.PoolFromConf("tcps::addr=localhost:9000")
+	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
 
-	pool := questdb.PoolFromConf(fmt.Sprintf("tcp::addr=%s", srv.Addr()), questdb.WithMaxSenders(maxSenders))
-
-	for i := 0; i < numThreads; i++ {
-		i := i
-		wg.Add(1)
-		go func() {
-			sender, err := pool.Acquire(ctx)
-			assert.NoError(t, err)
-
-			sender.Table("test").Int64Column("thread", int64(i)).AtNow(ctx)
-
-			assert.NoError(t, pool.Release(ctx, sender))
-
-			wg.Done()
-		}()
-	}
-
-	wg.Wait()
-
-	assert.NoError(t, pool.Close(ctx))
-
-	lines := []string{}
-
-	go func() {
-		for {
-			select {
-			case msg := <-srv.BackCh:
-				lines = append(lines, msg)
-			case <-srv.closeCh:
-				return
-			default:
-				continue
-			}
-		}
-	}()
-
-	assert.Eventually(t, func() bool {
-		return len(lines) == numThreads
-	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
-}
-
-func TestAcquireOnAClosedPool(t *testing.T) {
-	p := questdb.PoolFromConf("http::addr=localhost:1234")
-	ctx := context.Background()
-
-	assert.NoError(t, p.Close(ctx))
-	assert.True(t, p.IsClosed())
-
-	_, err := p.Acquire(ctx)
-	assert.ErrorContains(t, err, "cannot Acquire a LineSender from a closed LineSenderPool")
 }
