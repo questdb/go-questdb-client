@@ -35,7 +35,7 @@ import (
 // LineSenderPool wraps a mutex-protected slice of [LineSender]. It allows a goroutine to
 // Acquire a sender from the pool and Release it back to the pool when it's done being used.
 //
-// WARNING: This is an experimental API that is designed to work with HTTP senders ONLY
+// WARNING: This is an experimental API that is designed to work with HTTP senders ONLY.
 type LineSenderPool struct {
 	maxSenders int
 	conf       string
@@ -54,7 +54,7 @@ type LineSenderPoolOption func(*LineSenderPool)
 // string that was passed into the conf argument.
 //
 // The default maximum number of senders is 64, but can be customized by using the
-// [WithMaxSenders] option
+// [WithMaxSenders] option.
 func PoolFromConf(conf string, opts ...LineSenderPoolOption) (*LineSenderPool, error) {
 	if strings.HasPrefix(conf, "tcp") {
 		return nil, errors.New("tcp/s not supported for pooled senders, use http/s only")

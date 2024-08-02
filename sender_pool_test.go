@@ -190,11 +190,9 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 }
 
 func TestTcpNotSupported(t *testing.T) {
-
 	_, err := questdb.PoolFromConf("tcp::addr=localhost:9000")
 	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
 
 	_, err = questdb.PoolFromConf("tcps::addr=localhost:9000")
 	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
-
 }
