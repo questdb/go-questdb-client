@@ -75,6 +75,59 @@ To connect via TCP, set the configuration string to:
 	// ...
 ```
 
+## Pooled Line Senders
+
+**Warning: Experimental feature designed for use with HTTP senders ONLY**
+
+Version 3 of the client introduces a `LineSenderPool`, which provides a mechanism
+to cache previously-used `LineSender`s in memory so they can be reused without
+having to allocate and instantiate new senders.
+
+A LineSenderPool is thread-safe and can be used to concurrently Acquire and Release senders
+across multiple goroutines.
+
+Since `LineSender`s must be used in a single-threaded context, a typical pattern is to Acquire
+a sender from a `LineSenderPool` at the beginning of a goroutine and use a deferred
+execution block to Release the sender at the end of the goroutine.
+
+Here is an example of the `LineSenderPool` Acquire, Release, and Close semantics:
+
+```go
+package main
+
+import (
+	"context"
+
+	qdb "github.com/questdb/go-questdb-client/v3"
+)
+
+func main() {
+	ctx := context.TODO()
+
+	pool := qdb.PoolFromConf("http::addr=localhost:9000")
+	defer func() {
+		err := pool.Close(ctx)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	sender, err := pool.Acquire(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	sender.Table("prices").
+		Symbol("ticker", "AAPL").
+		Float64Column("price", 123.45).
+		AtNow(ctx)
+
+	if err := pool.Release(ctx, sender); err != nil {
+		panic(err)
+	}
+}
+```
+
 ## Migration from v2
 
 v2 code example:
