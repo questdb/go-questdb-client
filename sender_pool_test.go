@@ -70,7 +70,6 @@ func TestBasicBehavior(t *testing.T) {
 	s5, err := p.Acquire(ctx)
 	assert.NoError(t, err)
 	assert.Same(t, s3, s5)
-
 }
 
 func TestDoubleReleaseShouldFail(t *testing.T) {
@@ -86,7 +85,6 @@ func TestDoubleReleaseShouldFail(t *testing.T) {
 
 	// Try to release the sender again. This should fail because it already exists in the slice
 	assert.Error(t, p.Release(ctx, s1))
-
 }
 
 func TestMaxPoolSize(t *testing.T) {
@@ -128,7 +126,6 @@ func TestMaxPoolSize(t *testing.T) {
 	assert.NotSame(t, s, s1)
 	assert.NotSame(t, s, s2)
 	assert.NotSame(t, s, s3)
-
 }
 
 func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
@@ -183,7 +180,6 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		return len(lines) == numThreads
 	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
-
 }
 
 func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
@@ -238,7 +234,6 @@ func TestMultiThreadedPoolWritesOverTcp(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		return len(lines) == numThreads
 	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
-
 }
 
 func TestAcquireOnAClosedPool(t *testing.T) {

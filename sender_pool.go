@@ -94,7 +94,6 @@ func (p *LineSenderPool) Acquire(ctx context.Context) (LineSender, error) {
 	}
 
 	return LineSenderFromConf(ctx, p.conf)
-
 }
 
 // Release flushes the LineSender and returns it back to the pool. If the pool
@@ -122,7 +121,6 @@ func (p *LineSenderPool) Release(ctx context.Context, s LineSender) error {
 	p.senders = append(p.senders, s)
 
 	return nil
-
 }
 
 // Close sets the pool's status to "closed" and closes all cached LineSenders.
