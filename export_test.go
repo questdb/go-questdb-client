@@ -29,10 +29,14 @@ type (
 	ConfigData       = configData
 	TcpLineSender    = tcpLineSender
 	LineSenderConfig = lineSenderConfig
+	SenderType       = senderType
 )
 
 var (
-	GlobalTransport = globalTransport
+	GlobalTransport            = globalTransport
+	NoSenderType    SenderType = noSenderType
+	HttpSenderType  SenderType = httpSenderType
+	TcpSenderType   SenderType = tcpSenderType
 )
 
 func NewBuffer(initBufSize int, maxBufSize int, fileNameLimit int) Buffer {
@@ -75,4 +79,8 @@ func BufLen(s LineSender) int {
 		return ts.BufLen()
 	}
 	panic("unexpected struct")
+}
+
+func NewLineSenderConfig(t SenderType) *LineSenderConfig {
+	return newLineSenderConfig(t)
 }

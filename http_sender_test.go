@@ -625,7 +625,7 @@ func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
 
 	err = sender.Close(ctx)
 	assert.NoError(t, err)
-	assert.Empty(t, qdb.Messages(sender))
+	assert.NotEmpty(t, qdb.Messages(sender))
 }
 
 func TestSuccessAfterRetries(t *testing.T) {

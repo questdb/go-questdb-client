@@ -208,6 +208,34 @@ type lineSenderConfig struct {
 	autoFlushInterval time.Duration
 }
 
+func newLineSenderConfig(t senderType) *lineSenderConfig {
+	switch t {
+	case tcpSenderType:
+		return &lineSenderConfig{
+			senderType:    t,
+			address:       defaultTcpAddress,
+			initBufSize:   defaultInitBufferSize,
+			fileNameLimit: defaultFileNameLimit,
+		}
+	case httpSenderType:
+		return &lineSenderConfig{
+			senderType:        t,
+			address:           defaultHttpAddress,
+			requestTimeout:    defaultRequestTimeout,
+			retryTimeout:      defaultRetryTimeout,
+			minThroughput:     defaultMinThroughput,
+			autoFlushRows:     defaultAutoFlushRows,
+			autoFlushInterval: defaultAutoFlushInterval,
+			initBufSize:       defaultInitBufferSize,
+			maxBufSize:        defaultMaxBufferSize,
+			fileNameLimit:     defaultFileNameLimit,
+		}
+	default:
+		return &lineSenderConfig{}
+	}
+
+}
+
 // LineSenderOption defines line sender config option.
 type LineSenderOption func(*lineSenderConfig)
 
@@ -481,7 +509,29 @@ func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 // sender corresponds to a single client connection. LineSender should
 // not be called concurrently by multiple goroutines.
 func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, error) {
-	conf := &lineSenderConfig{}
+	var conf *lineSenderConfig
+
+	// Iterate over all options to introspect the sender type
+	// This is used to set defaults based on the type of sender
+	tmp := newLineSenderConfig(noSenderType)
+	for _, opt := range opts {
+		opt(tmp)
+		switch tmp.senderType {
+		case httpSenderType:
+			conf = newLineSenderConfig(httpSenderType)
+		case tcpSenderType:
+			conf = newLineSenderConfig(tcpSenderType)
+		}
+
+		if conf != nil {
+			break
+		}
+	}
+
+	if tmp.senderType == noSenderType {
+		return nil, errors.New("sender type is not specified: use WithHttp or WithTcp")
+	}
+
 	for _, opt := range opts {
 		opt(conf)
 	}
@@ -538,17 +588,6 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 		return errors.New("tcpKeyId is empty and tcpKey is not. both (or none) must be provided")
 	}
 
-	// Set defaults
-	if conf.address == "" {
-		conf.address = defaultTcpAddress
-	}
-	if conf.initBufSize == 0 {
-		conf.initBufSize = defaultInitBufferSize
-	}
-	if conf.fileNameLimit == 0 {
-		conf.fileNameLimit = defaultFileNameLimit
-	}
-
 	return nil
 }
 
@@ -561,35 +600,6 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	// validate http-specific settings
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
 		return errors.New("both basic and token authentication cannot be used")
-	}
-
-	// Set defaults
-	if conf.address == "" {
-		conf.address = defaultHttpAddress
-	}
-	if conf.requestTimeout == 0 {
-		conf.requestTimeout = defaultRequestTimeout
-	}
-	if conf.retryTimeout == 0 {
-		conf.retryTimeout = defaultRetryTimeout
-	}
-	if conf.minThroughput == 0 {
-		conf.minThroughput = defaultMinThroughput
-	}
-	if conf.autoFlushRows == 0 {
-		conf.autoFlushRows = defaultAutoFlushRows
-	}
-	if conf.autoFlushInterval == 0 {
-		conf.autoFlushInterval = defaultAutoFlushInterval
-	}
-	if conf.initBufSize == 0 {
-		conf.initBufSize = defaultInitBufferSize
-	}
-	if conf.maxBufSize == 0 {
-		conf.maxBufSize = defaultMaxBufferSize
-	}
-	if conf.fileNameLimit == 0 {
-		conf.fileNameLimit = defaultFileNameLimit
 	}
 
 	return nil
