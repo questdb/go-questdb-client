@@ -204,10 +204,8 @@ type lineSenderConfig struct {
 	httpToken string
 
 	// Auto-flush fields
-	disableAutoFlushRows     bool
-	autoFlushRows            int
-	disableAutoFlushInterval bool
-	autoFlushInterval        time.Duration
+	autoFlushRows     int
+	autoFlushInterval time.Duration
 }
 
 // LineSenderOption defines line sender config option.
@@ -386,9 +384,6 @@ func WithAutoFlushDisabled() LineSenderOption {
 func WithAutoFlushRows(rows int) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.autoFlushRows = rows
-		if rows == 0 {
-			s.disableAutoFlushRows = true
-		}
 	}
 }
 
@@ -399,9 +394,6 @@ func WithAutoFlushRows(rows int) LineSenderOption {
 func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.autoFlushInterval = interval
-		if interval == 0 {
-			s.disableAutoFlushInterval = true
-		}
 	}
 }
 
@@ -598,14 +590,6 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	}
 	if conf.fileNameLimit == 0 {
 		conf.fileNameLimit = defaultFileNameLimit
-	}
-
-	// Disable auto flush if specified in the conf
-	if conf.disableAutoFlushRows {
-		conf.autoFlushRows = 0
-	}
-	if conf.disableAutoFlushInterval {
-		conf.autoFlushInterval = 0
 	}
 
 	return nil
