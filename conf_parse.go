@@ -90,6 +90,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		case "token_y":
 			// Some clients require public key.
 			// But since Go sender doesn't need it, we ignore the values.
+			continue
 		case "auto_flush":
 			if v == "off" {
 				senderConf.autoFlushRows = 0
