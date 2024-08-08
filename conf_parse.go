@@ -90,16 +90,17 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		case "token_y":
 			// Some clients require public key.
 			// But since Go sender doesn't need it, we ignore the values.
+			continue
 		case "auto_flush":
 			if v == "off" {
-				senderConf.autoFlushRows = 0
-				senderConf.autoFlushInterval = 0
+				senderConf.disableAutoFlushRows = true
+				senderConf.disableAutoFlushInterval = true
 			} else if v != "on" {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not 'on' or 'off'", k, v)
 			}
 		case "auto_flush_rows":
 			if v == "off" {
-				senderConf.autoFlushRows = 0
+				senderConf.disableAutoFlushRows = true
 				continue
 			}
 			parsedVal, err := strconv.Atoi(v)
@@ -109,7 +110,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			senderConf.autoFlushRows = parsedVal
 		case "auto_flush_interval":
 			if v == "off" {
-				senderConf.autoFlushInterval = 0
+				senderConf.disableAutoFlushInterval = true
 				continue
 			}
 			parsedVal, err := strconv.Atoi(v)
