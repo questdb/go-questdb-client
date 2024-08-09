@@ -33,10 +33,12 @@ type (
 )
 
 var (
-	GlobalTransport            = globalTransport
-	NoSenderType    SenderType = noSenderType
-	HttpSenderType  SenderType = httpSenderType
-	TcpSenderType   SenderType = tcpSenderType
+	GlobalTransport                     = globalTransport
+	NoSenderType             SenderType = noSenderType
+	HttpSenderType           SenderType = httpSenderType
+	TcpSenderType            SenderType = tcpSenderType
+	DefaultAutoFlushInterval            = defaultAutoFlushInterval
+	DefaultAutoFlushRows                = defaultAutoFlushRows
 )
 
 func NewBuffer(initBufSize int, maxBufSize int, fileNameLimit int) Buffer {
