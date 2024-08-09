@@ -143,7 +143,7 @@ func (p *LineSenderPool) Acquire(ctx context.Context) (LineSender, error) {
 	if p.conf != "" {
 		return LineSenderFromConf(ctx, p.conf)
 	} else {
-		conf := &lineSenderConfig{}
+		conf := newLineSenderConfig(httpSenderType)
 		for _, opt := range p.opts {
 			opt(conf)
 			if conf.senderType == tcpSenderType {
