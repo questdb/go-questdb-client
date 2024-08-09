@@ -217,7 +217,6 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			initBufSize:   defaultInitBufferSize,
 			fileNameLimit: defaultFileNameLimit,
 		}
-	case httpSenderType:
 	default:
 		return &lineSenderConfig{
 			senderType:        t,
