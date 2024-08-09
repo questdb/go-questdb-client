@@ -218,6 +218,7 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			fileNameLimit: defaultFileNameLimit,
 		}
 	case httpSenderType:
+	default:
 		return &lineSenderConfig{
 			senderType:        t,
 			address:           defaultHttpAddress,
@@ -230,8 +231,6 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			maxBufSize:        defaultMaxBufferSize,
 			fileNameLimit:     defaultFileNameLimit,
 		}
-	default:
-		return &lineSenderConfig{}
 	}
 
 }
@@ -511,8 +510,9 @@ func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, error) {
 	var conf *lineSenderConfig
 
-	// Iterate over all options to introspect the sender type
-	// This is used to set defaults based on the type of sender
+	// Iterate over all options to determine the sender type
+	// This is used to set defaults based on the type of sender (http vs tcp)
+	// Worst case performance is 2N for the number of LineSenderOptions
 	tmp := newLineSenderConfig(noSenderType)
 	for _, opt := range opts {
 		opt(tmp)
