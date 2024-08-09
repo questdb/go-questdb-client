@@ -37,7 +37,7 @@ type configData struct {
 }
 
 func confFromStr(conf string) (*lineSenderConfig, error) {
-	senderConf := &lineSenderConfig{}
+	var senderConf *lineSenderConfig
 
 	data, err := parseConfigStr(conf)
 	if err != nil {
@@ -46,14 +46,14 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 
 	switch data.Schema {
 	case "http":
-		senderConf.senderType = httpSenderType
+		senderConf = newLineSenderConfig(httpSenderType)
 	case "https":
-		senderConf.senderType = httpSenderType
+		senderConf = newLineSenderConfig(httpSenderType)
 		senderConf.tlsMode = tlsEnabled
 	case "tcp":
-		senderConf.senderType = tcpSenderType
+		senderConf = newLineSenderConfig(tcpSenderType)
 	case "tcps":
-		senderConf.senderType = tcpSenderType
+		senderConf = newLineSenderConfig(tcpSenderType)
 		senderConf.tlsMode = tlsEnabled
 	default:
 		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
@@ -90,6 +90,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		case "token_y":
 			// Some clients require public key.
 			// But since Go sender doesn't need it, we ignore the values.
+			continue
 		case "auto_flush":
 			if v == "off" {
 				senderConf.autoFlushRows = 0

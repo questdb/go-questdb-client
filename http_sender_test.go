@@ -502,6 +502,12 @@ func TestRowBasedAutoFlushWithTimeBasedFlushDisabled(t *testing.T) {
 
 	assert.Equal(t, autoFlushRows-1, qdb.MsgCount(sender))
 
+	// Sleep past the default interval
+	time.Sleep(qdb.DefaultAutoFlushInterval + time.Millisecond)
+
+	// Check that the number of messages hasn't changed
+	assert.Equal(t, autoFlushRows-1, qdb.MsgCount(sender))
+
 	// Send one additional message and ensure that all are flushed
 	err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 	assert.NoError(t, err)
@@ -511,8 +517,6 @@ func TestRowBasedAutoFlushWithTimeBasedFlushDisabled(t *testing.T) {
 
 func TestNoFlushWhenAutoFlushDisabled(t *testing.T) {
 	ctx := context.Background()
-	autoFlushRows := 10
-	autoFlushInterval := time.Duration(autoFlushRows-1) * time.Millisecond
 
 	srv, err := newTestHttpServer(readAndDiscard)
 	assert.NoError(t, err)
@@ -524,21 +528,54 @@ func TestNoFlushWhenAutoFlushDisabled(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
-		qdb.WithAutoFlushRows(autoFlushRows),
-		qdb.WithAutoFlushInterval(autoFlushInterval),
+		qdb.WithAutoFlushRows(qdb.DefaultAutoFlushRows),
+		qdb.WithAutoFlushInterval(qdb.DefaultAutoFlushInterval),
 		qdb.WithAutoFlushDisabled(),
 	)
 	assert.NoError(t, err)
 	defer sender.Close(ctx)
 
 	// Send autoFlushRows + 1 messages and ensure all are buffered
-	for i := 0; i < autoFlushRows+1; i++ {
+	for i := 0; i < qdb.DefaultAutoFlushRows+1; i++ {
 		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
 		assert.NoError(t, err)
-		time.Sleep(time.Millisecond)
 	}
 
-	assert.Equal(t, autoFlushRows+1, qdb.MsgCount(sender))
+	// Sleep past the default interval
+	time.Sleep(qdb.DefaultAutoFlushInterval + time.Millisecond)
+
+	assert.Equal(t, qdb.DefaultAutoFlushRows+1, qdb.MsgCount(sender))
+}
+
+func TestNoFlushWhenAutoFlushRowsAndIntervalAre0(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestHttpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	// opts are processed sequentially, so AutoFlushDisabled will
+	// override AutoFlushRows
+	sender, err := qdb.NewLineSender(
+		ctx,
+		qdb.WithHttp(),
+		qdb.WithAddress(srv.Addr()),
+		qdb.WithAutoFlushRows(0),
+		qdb.WithAutoFlushInterval(0),
+	)
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	// Send autoFlushRows + 1 messages and ensure all are buffered
+	for i := 0; i < qdb.DefaultAutoFlushRows+1; i++ {
+		err = sender.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+		assert.NoError(t, err)
+	}
+
+	// Sleep past the default interval
+	time.Sleep(qdb.DefaultAutoFlushInterval + time.Millisecond)
+
+	assert.Equal(t, qdb.DefaultAutoFlushRows+1, qdb.MsgCount(sender))
 }
 
 func TestSenderDoubleClose(t *testing.T) {
@@ -625,7 +662,7 @@ func TestNoFlushWhenSenderIsClosedAndAutoFlushIsDisabled(t *testing.T) {
 
 	err = sender.Close(ctx)
 	assert.NoError(t, err)
-	assert.Empty(t, qdb.Messages(sender))
+	assert.NotEmpty(t, qdb.Messages(sender))
 }
 
 func TestSuccessAfterRetries(t *testing.T) {

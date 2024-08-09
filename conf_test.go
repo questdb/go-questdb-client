@@ -432,7 +432,15 @@ func TestHappyCasesFromConf(t *testing.T) {
 			actual, err := qdb.ConfFromStr(tc.config)
 			assert.NoError(t, err)
 
-			expected := &qdb.LineSenderConfig{}
+			var expected *qdb.LineSenderConfig
+			switch tc.config[0] {
+			case 'h':
+				expected = qdb.NewLineSenderConfig(qdb.HttpSenderType)
+			case 't':
+				expected = qdb.NewLineSenderConfig(qdb.TcpSenderType)
+			default:
+				assert.FailNow(t, "happy case configs must start with either 'http' or 'tcp'")
+			}
 			for _, opt := range tc.expectedOpts {
 				opt(expected)
 			}
