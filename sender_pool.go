@@ -37,14 +37,19 @@ import (
 //
 // WARNING: This is an experimental API that is designed to work with HTTP senders ONLY.
 type LineSenderPool struct {
+	// options
 	maxSenders int
-	conf       string
-	opts       []LineSenderOption
 
-	closed bool
+	// presence of a non-empty conf takes precedence over opts
+	conf string
+	opts []LineSenderOption
 
+	// senders are stored here
 	senders []LineSender
-	mu      *sync.Mutex
+
+	// plumbing fields
+	closed bool
+	mu     *sync.Mutex
 }
 
 // LineSenderPoolOption defines line sender pool config option.
