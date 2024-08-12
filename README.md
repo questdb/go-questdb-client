@@ -80,15 +80,15 @@ To connect via TCP, set the configuration string to:
 **Warning: Experimental feature designed for use with HTTP senders ONLY**
 
 Version 3 of the client introduces a `LineSenderPool`, which provides a mechanism
-to cache previously-used `LineSender`s in memory so they can be reused without
-having to allocate and instantiate new senders.
+to pool previously-used `LineSender`s so they can be reused without having
+to allocate and instantiate new senders.
 
-A LineSenderPool is thread-safe and can be used to concurrently Acquire and Release senders
+A LineSenderPool is thread-safe and can be used to concurrently obtain senders
 across multiple goroutines.
 
 Since `LineSender`s must be used in a single-threaded context, a typical pattern is to Acquire
 a sender from a `LineSenderPool` at the beginning of a goroutine and use a deferred
-execution block to Release the sender at the end of the goroutine.
+execution block to Close the sender at the end of the goroutine.
 
 Here is an example of the `LineSenderPool` Acquire, Release, and Close semantics:
 
@@ -112,7 +112,7 @@ func main() {
 		}
 	}()
 
-	sender, err := pool.Acquire(ctx)
+	sender, err := pool.Sender(ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -122,7 +122,8 @@ func main() {
 		Float64Column("price", 123.45).
 		AtNow(ctx)
 
-	if err := pool.Release(ctx, sender); err != nil {
+	// Close call returns the sender back to the pool
+	if err := sender.Close(ctx); err != nil {
 		panic(err)
 	}
 }

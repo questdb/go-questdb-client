@@ -27,6 +27,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,35 +42,35 @@ func TestBasicBehavior(t *testing.T) {
 	ctx := context.Background()
 
 	// Start with an empty pool, allocate a new sender
-	s1, err := p.Acquire(ctx)
+	s1, err := p.Sender(ctx)
 	assert.NoError(t, err)
 
 	// Release the sender and add it to the pool
-	assert.NoError(t, p.Release(ctx, s1))
+	assert.NoError(t, s1.Close(ctx))
 
 	// Acquiring a sender will return the initial one from the pool
-	s2, err := p.Acquire(ctx)
+	s2, err := p.Sender(ctx)
 	assert.NoError(t, err)
 	assert.Same(t, s1, s2)
 
 	// Acquiring another sender will create a new one
-	s3, err := p.Acquire(ctx)
+	s3, err := p.Sender(ctx)
 	assert.NoError(t, err)
 	assert.NotSame(t, s1, s3)
 
 	// Releasing the new sender will add it back to the pool
-	assert.NoError(t, p.Release(ctx, s3))
+	assert.NoError(t, s3.Close(ctx))
 
 	// Releasing the original sender will add it to the end of the pool slice
-	assert.NoError(t, p.Release(ctx, s2))
+	assert.NoError(t, s2.Close(ctx))
 
 	// Acquiring a new sender will pop the original one off the slice
-	s4, err := p.Acquire(ctx)
+	s4, err := p.Sender(ctx)
 	assert.NoError(t, err)
 	assert.Same(t, s1, s4)
 
 	// Acquiring another sender will pop the second one off the slice
-	s5, err := p.Acquire(ctx)
+	s5, err := p.Sender(ctx)
 	assert.NoError(t, err)
 	assert.Same(t, s3, s5)
 }
@@ -81,57 +82,80 @@ func TestDoubleReleaseShouldFail(t *testing.T) {
 	ctx := context.Background()
 
 	// Start with an empty pool, allocate a new sender
-	s1, err := p.Acquire(ctx)
+	s1, err := p.Sender(ctx)
 	assert.NoError(t, err)
 
 	// Release the sender
-	assert.NoError(t, p.Release(ctx, s1))
+	assert.NoError(t, s1.Close(ctx))
 
-	// Try to release the sender again. This should fail because it already exists in the slice
-	assert.Error(t, p.Release(ctx, s1))
+	// Try to release the sender again. This should fail
+	assert.Error(t, s1.Close(ctx))
 }
 
 func TestMaxPoolSize(t *testing.T) {
 	// Create a pool with 2 max senders
-	p, err := questdb.PoolFromConf("http::addr=localhost:1234", questdb.WithMaxSenders(2))
+	p, err := questdb.PoolFromConf("http::addr=localhost:1234", questdb.WithMaxSenders(3))
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
 	// Allocate 3 senders
-	s1, err := p.Acquire(ctx)
+	s1, err := p.Sender(ctx)
 	assert.NoError(t, err)
 
-	s2, err := p.Acquire(ctx)
+	s2, err := p.Sender(ctx)
 	assert.NoError(t, err)
 
-	s3, err := p.Acquire(ctx)
+	s3, err := p.Sender(ctx)
 	assert.NoError(t, err)
 
 	// Release all senders in reverse order
 	// Internal slice will look like: [ s3 , s2 ]
-	assert.NoError(t, p.Release(ctx, s3))
-	assert.NoError(t, p.Release(ctx, s2))
-	assert.NoError(t, p.Release(ctx, s1))
+	assert.NoError(t, s3.Close(ctx))
+	assert.NoError(t, s2.Close(ctx))
+	assert.NoError(t, s1.Close(ctx))
 
 	// Acquire 3 more senders.
 
-	// The first one will be s2 (senders get popped off the slice)
-	s, err := p.Acquire(ctx)
+	// The first one will be s3 (senders get popped off the slice)
+	s, err := p.Sender(ctx)
+	assert.NoError(t, err)
+	assert.Same(t, s, s1)
+
+	// The next will be s2
+	s, err = p.Sender(ctx)
 	assert.NoError(t, err)
 	assert.Same(t, s, s2)
 
-	// The next will be s3
-	s, err = p.Acquire(ctx)
+	// The final one will s1
+	s, err = p.Sender(ctx)
 	assert.NoError(t, err)
 	assert.Same(t, s, s3)
 
-	// The final one will not be s1, s2, or s3 because the slice is empty
-	s, err = p.Acquire(ctx)
-	assert.NoError(t, err)
-	assert.NotSame(t, s, s1)
-	assert.NotSame(t, s, s2)
-	assert.NotSame(t, s, s3)
+	// Now verify the Sender caller gets blocked until a sender is freed
+	successFlag := int64(0)
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		s, err := p.Sender(ctx)
+		assert.NoError(t, err)
+		atomic.AddInt64(&successFlag, 1)
+		assert.Same(t, s, s3)
+		assert.NoError(t, s.Close(ctx))
+		wg.Done()
+	}()
+
+	assert.Equal(t, atomic.LoadInt64(&successFlag), int64(0))
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, atomic.LoadInt64(&successFlag), int64(0))
+
+	assert.NoError(t, s3.Close(ctx))
+	wg.Wait()
+	assert.Equal(t, atomic.LoadInt64(&successFlag), int64(1))
+
+	assert.NoError(t, s2.Close(ctx))
+	assert.NoError(t, s1.Close(ctx))
+	assert.NoError(t, p.Close(ctx))
 }
 
 func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
@@ -154,12 +178,12 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 		i := i
 		wg.Add(1)
 		go func() {
-			sender, err := pool.Acquire(ctx)
+			sender, err := pool.Sender(ctx)
 			assert.NoError(t, err)
 
 			sender.Table("test").Int64Column("thread", int64(i)).AtNow(ctx)
 
-			assert.NoError(t, pool.Release(ctx, sender))
+			assert.NoError(t, sender.Close(ctx))
 
 			wg.Done()
 		}()
