@@ -208,32 +208,6 @@ type lineSenderConfig struct {
 	autoFlushInterval time.Duration
 }
 
-func newLineSenderConfig(t senderType) *lineSenderConfig {
-	switch t {
-	case tcpSenderType:
-		return &lineSenderConfig{
-			senderType:    t,
-			address:       defaultTcpAddress,
-			initBufSize:   defaultInitBufferSize,
-			fileNameLimit: defaultFileNameLimit,
-		}
-	default:
-		return &lineSenderConfig{
-			senderType:        t,
-			address:           defaultHttpAddress,
-			requestTimeout:    defaultRequestTimeout,
-			retryTimeout:      defaultRetryTimeout,
-			minThroughput:     defaultMinThroughput,
-			autoFlushRows:     defaultAutoFlushRows,
-			autoFlushInterval: defaultAutoFlushInterval,
-			initBufSize:       defaultInitBufferSize,
-			maxBufSize:        defaultMaxBufferSize,
-			fileNameLimit:     defaultFileNameLimit,
-		}
-	}
-
-}
-
 // LineSenderOption defines line sender config option.
 type LineSenderOption func(*lineSenderConfig)
 
