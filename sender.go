@@ -537,6 +537,31 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, e
 	return newLineSender(ctx, conf)
 }
 
+func newLineSenderConfig(t senderType) *lineSenderConfig {
+	switch t {
+	case tcpSenderType:
+		return &lineSenderConfig{
+			senderType:    t,
+			address:       defaultTcpAddress,
+			initBufSize:   defaultInitBufferSize,
+			fileNameLimit: defaultFileNameLimit,
+		}
+	default:
+		return &lineSenderConfig{
+			senderType:        t,
+			address:           defaultHttpAddress,
+			requestTimeout:    defaultRequestTimeout,
+			retryTimeout:      defaultRetryTimeout,
+			minThroughput:     defaultMinThroughput,
+			autoFlushRows:     defaultAutoFlushRows,
+			autoFlushInterval: defaultAutoFlushInterval,
+			initBufSize:       defaultInitBufferSize,
+			maxBufSize:        defaultMaxBufferSize,
+			fileNameLimit:     defaultFileNameLimit,
+		}
+	}
+}
+
 func newLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
 	switch conf.senderType {
 	case tcpSenderType:
