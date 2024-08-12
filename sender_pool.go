@@ -99,11 +99,7 @@ func PoolFromConf(conf string, opts ...LineSenderPoolOption) (*LineSenderPool, e
 //	}
 //
 //	// Add Pool-level options manually
-//	for _, opt := range []LineSenderPoolOption{
-//		WithMaxSenders(32),
-//	} {
-//		opt(p)
-//	}
+//	WithMaxSenders(32)(p)
 func PoolFromOptions(opts ...LineSenderOption) (*LineSenderPool, error) {
 	pool := &LineSenderPool{
 		maxSenders: 64,
