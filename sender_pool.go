@@ -40,15 +40,18 @@ import (
 //
 // WARNING: This is an experimental API that is designed to work with HTTP senders ONLY.
 type LineSenderPool struct {
-	maxSenders int
+	maxSenders int // the only option
 	numSenders int // number of used and free senders
-	conf       string
 
-	closed bool
+	// presence of a non-empty conf takes precedence over opts
+	conf string
+	opts []LineSenderOption
 
 	freeSenders []*pooledSender
-	mu          *sync.Mutex
-	cond        sync.Cond // used to wake up free sender waiters
+
+	closed bool
+	mu     *sync.Mutex
+	cond   sync.Cond // used to wake up free sender waiters
 }
 
 type pooledSender struct {
@@ -87,6 +90,38 @@ func PoolFromConf(conf string, opts ...LineSenderPoolOption) (*LineSenderPool, e
 	return pool, nil
 }
 
+// PoolFromOptions instantiates a new LineSenderPool using programmatic options.
+// Any sender acquired from this pool will be initialized with the same options
+// that were passed into the opts argument.
+//
+// Unlike [PoolFromConf], PoolFromOptions does not have the ability to customize
+// the returned LineSenderPool. In this case, to add options (such as [WithMaxSenders]),
+// you need manually apply these options after calling this method.
+//
+//	// Create a PoolFromOptions with LineSender options
+//	p, err := PoolFromOptions(
+//		WithHttp(),
+//		WithAutoFlushRows(1000000),
+//	)
+//
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	// Add Pool-level options manually
+//	WithMaxSenders(32)(p)
+func PoolFromOptions(opts ...LineSenderOption) (*LineSenderPool, error) {
+	pool := &LineSenderPool{
+		maxSenders:  64,
+		opts:        opts,
+		freeSenders: make([]*pooledSender, 0, 64),
+		mu:          &sync.Mutex{},
+	}
+	pool.cond = *sync.NewCond(pool.mu)
+
+	return pool, nil
+}
+
 // WithMaxSenders sets the maximum number of senders in the pool.
 // The default maximum number of senders is 64.
 func WithMaxSenders(count int) LineSenderPoolOption {
@@ -101,6 +136,11 @@ func WithMaxSenders(count int) LineSenderPoolOption {
 // this calls will block until one of the senders is returned back to
 // the pool by calling sender.Close().
 func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
+	var (
+		s   LineSender
+		err error
+	)
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -121,11 +161,25 @@ func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
 		return s, nil
 	}
 
-	s, err := LineSenderFromConf(ctx, p.conf)
+	if p.conf != "" {
+		s, err = LineSenderFromConf(ctx, p.conf)
+	} else {
+		conf := newLineSenderConfig(httpSenderType)
+		for _, opt := range p.opts {
+			opt(conf)
+			if conf.senderType == tcpSenderType {
+				return nil, errors.New("tcp/s not supported for pooled senders, use http/s only")
+			}
+		}
+		s, err = newHttpLineSender(conf)
+	}
+
 	if err != nil {
 		return nil, err
 	}
+
 	p.numSenders++
+
 	ps := &pooledSender{
 		pool:    p,
 		wrapped: s,
