@@ -202,7 +202,10 @@ func (p *LineSenderPool) free(ctx context.Context, ps *pooledSender) error {
 		// Failed to flush, close and call it a day
 		p.numSenders--
 		closeErr := ps.wrapped.Close(ctx)
-		return fmt.Errorf("%s %w", flushErr, closeErr)
+		if closeErr != nil {
+			return fmt.Errorf("%s %w", flushErr, closeErr)
+		}
+		return flushErr
 	}
 
 	if ps.dirty || p.closed {
