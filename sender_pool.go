@@ -197,6 +197,8 @@ func (p *LineSenderPool) free(ctx context.Context, ps *pooledSender) error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Notify free sender waiters, if any
+	defer p.cond.Broadcast()
 
 	if flushErr != nil {
 		// Failed to flush, close and call it a day
@@ -215,8 +217,6 @@ func (p *LineSenderPool) free(ctx context.Context, ps *pooledSender) error {
 	}
 
 	p.freeSenders = append(p.freeSenders, ps)
-	// Notify free sender waiters, if any
-	p.cond.Broadcast()
 	return nil
 }
 
