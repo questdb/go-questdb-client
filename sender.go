@@ -415,7 +415,7 @@ func LineSenderFromEnv(ctx context.Context) (LineSender, error) {
 
 // LineSenderFromConf creates a LineSender using the QuestDB config string format.
 //
-// Example config string: "http::addr=localhost;username=joe;password=123;auto_flush_rows=1000;"
+// Example config string: "http::addr=localhost;username=admin;password=quest;auto_flush_rows=1000;"
 //
 // QuestDB ILP clients use a common key-value configuration string format across all
 // implementations. We opted for this config over a URL because it reduces the amount
