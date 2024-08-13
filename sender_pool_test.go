@@ -31,14 +31,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/questdb/go-questdb-client/v3"
 	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestBasicBehavior(t *testing.T) {
-	p, err := questdb.PoolFromConf("http::addr=localhost:1234")
+	p, err := qdb.PoolFromConf("http::addr=localhost:1234")
 	require.NoError(t, err)
 	ctx := context.Background()
 
@@ -83,7 +82,7 @@ func TestFlushOnClose(t *testing.T) {
 	assert.NoError(t, err)
 	defer srv.Close()
 
-	p, err := questdb.PoolFromOptions(
+	p, err := qdb.PoolFromOptions(
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
 		qdb.WithAutoFlushDisabled(),
@@ -105,7 +104,7 @@ func TestFlushOnClose(t *testing.T) {
 }
 
 func TestPooledSenderDoubleClose(t *testing.T) {
-	p, err := questdb.PoolFromConf("http::addr=localhost:1234")
+	p, err := qdb.PoolFromConf("http::addr=localhost:1234")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -123,7 +122,7 @@ func TestPooledSenderDoubleClose(t *testing.T) {
 
 func TestMaxPoolSize(t *testing.T) {
 	// Create a pool with 2 max senders
-	p, err := questdb.PoolFromConf("http::addr=localhost:1234", questdb.WithMaxSenders(3))
+	p, err := qdb.PoolFromConf("http::addr=localhost:1234", qdb.WithMaxSenders(3))
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -200,7 +199,7 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 
 	wg := &sync.WaitGroup{}
 
-	pool, err := questdb.PoolFromConf(fmt.Sprintf("http::addr=%s", srv.Addr()), questdb.WithMaxSenders(maxSenders))
+	pool, err := qdb.PoolFromConf(fmt.Sprintf("http::addr=%s", srv.Addr()), qdb.WithMaxSenders(maxSenders))
 	require.NoError(t, err)
 
 	for i := 0; i < numThreads; i++ {
@@ -243,9 +242,9 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 }
 
 func TestTcpNotSupported(t *testing.T) {
-	_, err := questdb.PoolFromConf("tcp::addr=localhost:9000")
+	_, err := qdb.PoolFromConf("tcp::addr=localhost:9000")
 	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
 
-	_, err = questdb.PoolFromConf("tcps::addr=localhost:9000")
+	_, err = qdb.PoolFromConf("tcps::addr=localhost:9000")
 	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
 }
