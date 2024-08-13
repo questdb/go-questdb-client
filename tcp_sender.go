@@ -33,7 +33,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -137,7 +136,7 @@ func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (*tcpLineSend
 
 func (s *tcpLineSender) Close(_ context.Context) error {
 	if s.conn == nil {
-		return errors.New("double tcp sender close")
+		return errDoubleSenderClose
 	}
 	conn := s.conn
 	s.conn = nil
@@ -193,7 +192,7 @@ func (s *tcpLineSender) Flush(ctx context.Context) error {
 	}
 	if s.buf.HasTable() {
 		s.buf.DiscardPendingMsg()
-		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
+		return errFlushWithPendingMessage
 	}
 
 	if err = ctx.Err(); err != nil {

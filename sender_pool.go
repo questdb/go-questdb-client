@@ -35,6 +35,12 @@ import (
 	"time"
 )
 
+var (
+	errAcquireFromClosedPool = errors.New("cannot acquire a LineSender from a closed LineSenderPool")
+	errHttpOnlySender        = errors.New("tcp/s not supported for pooled senders, use http/s only")
+	errPooledSenderClose     = errors.New("error closing one or more LineSenders in the pool")
+)
+
 // LineSenderPool wraps a mutex-protected slice of [LineSender]. It allows a goroutine to
 // Acquire a sender from the pool and Release it back to the pool when it's done being used.
 //
@@ -72,7 +78,7 @@ type LineSenderPoolOption func(*LineSenderPool)
 // [WithMaxSenders] option.
 func PoolFromConf(conf string, opts ...LineSenderPoolOption) (*LineSenderPool, error) {
 	if strings.HasPrefix(conf, "tcp") {
-		return nil, errors.New("tcp/s not supported for pooled senders, use http/s only")
+		return nil, errHttpOnlySender
 	}
 
 	pool := &LineSenderPool{
@@ -145,12 +151,16 @@ func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
 	defer p.mu.Unlock()
 
 	if p.closed {
-		return nil, errors.New("cannot Acquire a LineSender from a closed LineSenderPool")
+		return nil, errAcquireFromClosedPool
 	}
 
 	// We may have to wait for a free sender
 	for len(p.freeSenders) == 0 && p.numSenders == p.maxSenders {
 		p.cond.Wait()
+	}
+
+	if p.closed {
+		return nil, errAcquireFromClosedPool
 	}
 
 	if len(p.freeSenders) > 0 {
@@ -168,7 +178,7 @@ func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
 		for _, opt := range p.opts {
 			opt(conf)
 			if conf.senderType == tcpSenderType {
-				return nil, errors.New("tcp/s not supported for pooled senders, use http/s only")
+				return nil, errHttpOnlySender
 			}
 		}
 		s, err = newHttpLineSender(conf)
@@ -247,7 +257,7 @@ func (p *LineSenderPool) Close(ctx context.Context) error {
 		return nil
 	}
 
-	err := errors.New("error closing one or more LineSenders in the pool")
+	err := errPooledSenderClose
 	for _, senderErr := range senderErrors {
 		err = fmt.Errorf("%s %w", err, senderErr)
 	}
@@ -340,7 +350,7 @@ func (ps *pooledSender) Flush(ctx context.Context) error {
 
 func (ps *pooledSender) Close(ctx context.Context) error {
 	if atomic.AddUint64(&ps.tick, 1)&1 == 1 {
-		return errors.New("double pooled sender close")
+		return errDoubleSenderClose
 	}
 	return ps.pool.free(ctx, ps)
 }

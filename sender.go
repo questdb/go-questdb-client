@@ -35,6 +35,13 @@ import (
 	"time"
 )
 
+var (
+	errClosedSenderFlush       = errors.New("cannot flush a closed LineSender")
+	errFlushWithPendingMessage = errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
+	errClosedSenderAt          = errors.New("cannot queue new messages on a closed LineSender")
+	errDoubleSenderClose       = errors.New("double sender close")
+)
+
 // LineSender allows you to insert rows into QuestDB by sending ILP
 // messages over HTTP or TCP protocol.
 //
