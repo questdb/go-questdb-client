@@ -133,7 +133,7 @@ func WithMaxSenders(count int) LineSenderPoolOption {
 // Sender obtains a LineSender from the pool. If the pool is empty, a new
 // LineSender will be instantiated using the pool's config string.
 // If there is already maximum number of senders obtained from the pool,
-// this calls will block until one of the senders is returned back to
+// this call will block until one of the senders is returned back to
 // the pool by calling sender.Close().
 func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
 	var (
@@ -337,7 +337,7 @@ func (ps *pooledSender) Flush(ctx context.Context) error {
 
 func (ps *pooledSender) Close(ctx context.Context) error {
 	if atomic.AddUint64(&ps.tick, 1)&1 == 1 {
-		return errors.New("double sender close")
+		return errors.New("double pooled sender close")
 	}
 	return ps.pool.free(ctx, ps)
 }

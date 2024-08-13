@@ -601,7 +601,7 @@ func TestSenderDoubleClose(t *testing.T) {
 	assert.NoError(t, err)
 
 	err = sender.Close(ctx)
-	assert.NoError(t, err)
+	assert.Error(t, err)
 }
 
 func TestErrorOnFlushWhenSenderIsClosed(t *testing.T) {

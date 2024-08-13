@@ -207,6 +207,23 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 	}
 }
 
+func TestTcpSenderDoubleClose(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestTcpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+
+	err = sender.Close(ctx)
+	assert.NoError(t, err)
+
+	err = sender.Close(ctx)
+	assert.Error(t, err)
+}
+
 func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 	ctx := context.Background()
 

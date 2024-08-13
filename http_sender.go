@@ -285,7 +285,7 @@ func (s *httpLineSender) BoolColumn(name string, val bool) LineSender {
 
 func (s *httpLineSender) Close(ctx context.Context) error {
 	if s.closed {
-		return nil
+		return errors.New("double http sender close")
 	}
 
 	var err error

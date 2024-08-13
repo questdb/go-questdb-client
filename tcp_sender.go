@@ -136,12 +136,12 @@ func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (*tcpLineSend
 }
 
 func (s *tcpLineSender) Close(_ context.Context) error {
-	if s.conn != nil {
-		conn := s.conn
-		s.conn = nil
-		return conn.Close()
+	if s.conn == nil {
+		return errors.New("double tcp sender close")
 	}
-	return nil
+	conn := s.conn
+	s.conn = nil
+	return conn.Close()
 }
 
 func (s *tcpLineSender) Table(name string) LineSender {
