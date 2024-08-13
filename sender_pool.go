@@ -191,7 +191,7 @@ func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
 func (p *LineSenderPool) free(ctx context.Context, ps *pooledSender) error {
 	var flushErr error
 
-	if ps.dirty {
+	if !ps.dirty {
 		flushErr = ps.Flush(ctx)
 	}
 

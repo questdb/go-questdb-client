@@ -64,6 +64,10 @@ func Messages(s LineSender) string {
 }
 
 func MsgCount(s LineSender) int {
+	if ps, ok := s.(*pooledSender); ok {
+		hs, _ := ps.wrapped.(*httpLineSender)
+		return hs.MsgCount()
+	}
 	if hs, ok := s.(*httpLineSender); ok {
 		return hs.MsgCount()
 	}

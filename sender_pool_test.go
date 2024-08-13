@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/questdb/go-questdb-client/v3"
+	qdb "github.com/questdb/go-questdb-client/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -75,7 +76,35 @@ func TestBasicBehavior(t *testing.T) {
 	assert.Same(t, s3, s5)
 }
 
-func TestDoubleReleaseShouldFail(t *testing.T) {
+func TestFlushOnClose(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestHttpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+
+	p, err := questdb.PoolFromOptions(
+		qdb.WithHttp(),
+		qdb.WithAddress(srv.Addr()),
+		qdb.WithAutoFlushDisabled(),
+	)
+	assert.NoError(t, err)
+	defer p.Close(ctx)
+
+	s, err := p.Sender(ctx)
+	assert.NoError(t, err)
+
+	err = s.Table(testTable).StringColumn("bar", "baz").AtNow(ctx)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 1, qdb.MsgCount(s))
+
+	assert.NoError(t, s.Close(ctx))
+
+	assert.Equal(t, 0, qdb.MsgCount(s))
+}
+
+func TestPooledSenderDoubleClose(t *testing.T) {
 	p, err := questdb.PoolFromConf("http::addr=localhost:1234")
 	require.NoError(t, err)
 
