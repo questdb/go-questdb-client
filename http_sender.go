@@ -29,7 +29,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -176,7 +175,7 @@ func (s *httpLineSender) flush0(ctx context.Context, closing bool) error {
 	)
 
 	if s.closed {
-		return errors.New("cannot flush a closed LineSender")
+		return errClosedSenderFlush
 	}
 
 	err := s.buf.LastErr()
@@ -187,7 +186,7 @@ func (s *httpLineSender) flush0(ctx context.Context, closing bool) error {
 	}
 	if s.buf.HasTable() {
 		s.buf.DiscardPendingMsg()
-		return errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
+		return errFlushWithPendingMessage
 	}
 
 	if s.buf.msgCount == 0 {
@@ -285,7 +284,7 @@ func (s *httpLineSender) BoolColumn(name string, val bool) LineSender {
 
 func (s *httpLineSender) Close(ctx context.Context) error {
 	if s.closed {
-		return nil
+		return errDoubleSenderClose
 	}
 
 	var err error
@@ -309,7 +308,7 @@ func (s *httpLineSender) AtNow(ctx context.Context) error {
 
 func (s *httpLineSender) At(ctx context.Context, ts time.Time) error {
 	if s.closed {
-		return errors.New("cannot queue new messages on a closed LineSender")
+		return errClosedSenderAt
 	}
 
 	sendTs := true
