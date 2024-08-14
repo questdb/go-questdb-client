@@ -145,7 +145,7 @@ func TestMaxPoolSize(t *testing.T) {
 
 	// Acquire 3 more senders.
 
-	// The first one will be s3 (senders get popped off the slice)
+	// The first one will be s1 (senders get popped off the slice)
 	s, err := p.Sender(ctx)
 	assert.NoError(t, err)
 	assert.Same(t, s, s1)
@@ -155,7 +155,7 @@ func TestMaxPoolSize(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Same(t, s, s2)
 
-	// The final one will s1
+	// The final one will s3
 	s, err = p.Sender(ctx)
 	assert.NoError(t, err)
 	assert.Same(t, s, s3)
