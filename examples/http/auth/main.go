@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	qdb "github.com/questdb/go-questdb-client/v3"
 	"log"
 	"time"
+
+	qdb "github.com/questdb/go-questdb-client/v3"
 )
 
 func main() {
@@ -14,8 +15,8 @@ func main() {
 		qdb.WithHttp(),
 		qdb.WithAddress("localhost:9000"),
 		qdb.WithBasicAuth(
-			"testUser1",     // username
-			"testPassword1", // password
+			"admin", // username
+			"quest", // password
 		),
 	)
 	if err != nil {
@@ -35,12 +36,11 @@ func main() {
 		log.Fatal(err)
 	}
 	err = sender.
-		Table("trades_go").
-		Symbol("pair", "USDGBP").
-		Symbol("type", "buy").
-		Float64Column("traded_price", 0.83).
-		Float64Column("limit_price", 0.84).
-		Int64Column("qty", 100).
+		Table("trades").
+		Symbol("symbol", "ETH-USD").
+		Symbol("side", "sell").
+		Float64Column("price", 2615.54).
+		Float64Column("amount", 0.00044).
 		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)
@@ -51,12 +51,11 @@ func main() {
 		log.Fatal(err)
 	}
 	err = sender.
-		Table("trades_go").
-		Symbol("pair", "GBPJPY").
-		Symbol("type", "sell").
-		Float64Column("traded_price", 135.97).
-		Float64Column("limit_price", 0.84).
-		Int64Column("qty", 400).
+		Table("trades").
+		Symbol("symbol", "BTC-USD").
+		Symbol("side", "sell").
+		Float64Column("price", 39269.98).
+		Float64Column("amount", 0.001).
 		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)

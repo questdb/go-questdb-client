@@ -27,7 +27,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
@@ -43,19 +42,27 @@ func main() {
 	}
 	// Make sure to close the sender on exit to release resources.
 	defer sender.Close(ctx)
-
 	// Send a few ILP messages.
+	err = sender.
+		Table("trades").
+		Symbol("symbol", "ETH-USD").
+		Symbol("side", "sell").
+		Float64Column("price", 2615.54).
+		Float64Column("amount", 0.00044).
+		AtNow(ctx) // timestamp will be set at the server side
+
 	tradedTs, err := time.Parse(time.RFC3339, "2022-08-06T15:04:05.123456Z")
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// You can pass a timestamp, rather than using the AtNow call
 	err = sender.
-		Table("trades_go").
-		Symbol("pair", "USDGBP").
-		Symbol("type", "buy").
-		Float64Column("traded_price", 0.83).
-		Float64Column("limit_price", 0.84).
-		Int64Column("qty", 100).
+		Table("trades").
+		Symbol("symbol", "BTC-USD").
+		Symbol("side", "sell").
+		Float64Column("price", 39269.98).
+		Float64Column("amount", 0.001).
 		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)
@@ -85,7 +92,7 @@ func main() {
 }
 ```
 
-To connect via TCP, set the configuration string to:
+HTTP is the recommended transport to use. To connect via TCP, set the configuration string to:
 ```go
 	// ...
 	sender, err := qdb.LineSenderFromConf(ctx, "tcp::addr=localhost:9009;")
