@@ -9,7 +9,7 @@ Golang client for QuestDB's [Influx Line Protocol](https://questdb.io/docs/refer
 The library requires Go 1.19 or newer.
 
 Features:
-* Context-aware API.
+* [Context](https://www.digitalocean.com/community/tutorials/how-to-use-contexts-in-go)-aware API.
 * Optimized for batch writes.
 * Supports TLS encryption and ILP authentication.
 * Automatic write retries and connection reuse for ILP over HTTP.
@@ -50,6 +50,8 @@ func main() {
 		Float64Column("price", 2615.54).
 		Float64Column("amount", 0.00044).
 		AtNow(ctx) // timestamp will be set at the server side
+
+	tradedTs, err := time.Parse(time.RFC3339, "2022-08-06T15:04:05.123456Z")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -61,10 +63,27 @@ func main() {
 		Symbol("side", "sell").
 		Float64Column("price", 39269.98).
 		Float64Column("amount", 0.001).
-		At(ctx, time.Now())
+		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	tradedTs, err = time.Parse(time.RFC3339, "2022-08-06T15:04:06.987654Z")
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = sender.
+		Table("trades_go").
+		Symbol("pair", "GBPJPY").
+		Symbol("type", "sell").
+		Float64Column("traded_price", 135.97).
+		Float64Column("limit_price", 0.84).
+		Int64Column("qty", 400).
+		At(ctx, tradedTs)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Make sure that the messages are sent over the network.
 	err = sender.Flush(ctx)
 	if err != nil {
@@ -78,6 +97,60 @@ HTTP is the recommended transport to use. To connect via TCP, set the configurat
 	// ...
 	sender, err := qdb.LineSenderFromConf(ctx, "tcp::addr=localhost:9009;")
 	// ...
+```
+
+## Pooled Line Senders
+
+**Warning: Experimental feature designed for use with HTTP senders ONLY**
+
+Version 3 of the client introduces a `LineSenderPool`, which provides a mechanism
+to pool previously-used `LineSender`s so they can be reused without having
+to allocate and instantiate new senders.
+
+A LineSenderPool is thread-safe and can be used to concurrently obtain senders
+across multiple goroutines.
+
+Since `LineSender`s must be used in a single-threaded context, a typical pattern is to Acquire
+a sender from a `LineSenderPool` at the beginning of a goroutine and use a deferred
+execution block to Close the sender at the end of the goroutine.
+
+Here is an example of the `LineSenderPool` Acquire, Release, and Close semantics:
+
+```go
+package main
+
+import (
+	"context"
+
+	qdb "github.com/questdb/go-questdb-client/v3"
+)
+
+func main() {
+	ctx := context.TODO()
+
+	pool := qdb.PoolFromConf("http::addr=localhost:9000")
+	defer func() {
+		err := pool.Close(ctx)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	sender, err := pool.Sender(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	sender.Table("prices").
+		Symbol("ticker", "AAPL").
+		Float64Column("price", 123.45).
+		AtNow(ctx)
+
+	// Close call returns the sender back to the pool
+	if err := sender.Close(ctx); err != nil {
+		panic(err)
+	}
+}
 ```
 
 ## Migration from v2
