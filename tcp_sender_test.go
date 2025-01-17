@@ -300,7 +300,6 @@ func TestErrorOnContextDeadline(t *testing.T) {
 	}
 	t.Fail()
 }
-
 func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
