@@ -59,6 +59,7 @@ func (suite *integrationTestSuite) TestE2EWriteInBatches() {
 	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
 	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)
+	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
 	for i := 0; i < n; i++ {
 		for j := 0; j < nBatch; j++ {
@@ -112,6 +113,7 @@ func (suite *integrationTestSuite) TestE2EImplicitFlush() {
 	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithInitBufferSize(bufCap))
 	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)
+	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
 	for i := 0; i < 10*bufCap; i++ {
 		err = sender.
@@ -147,6 +149,7 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuth() {
 	)
 	assert.NoError(suite.T(), err)
 
+	dropTable(suite.T(), testTable, questdbC.httpAddress)
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
@@ -169,7 +172,7 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuth() {
 
 	expected := tableData{
 		Columns: []column{
-			{"str_col", "STRING"},
+			{"str_col", "VARCHAR"},
 			{"timestamp", "TIMESTAMP"},
 		},
 		Dataset: [][]interface{}{
@@ -214,6 +217,7 @@ func (suite *integrationTestSuite) TestE2EFailedAuth() {
 		return
 	}
 
+	dropTable(suite.T(), testTable, questdbC.httpAddress)
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
@@ -252,6 +256,7 @@ func (suite *integrationTestSuite) TestE2EWritesWithTlsProxy() {
 	)
 	assert.NoError(suite.T(), err)
 	defer sender.Close(ctx)
+	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
 	err = sender.
 		Table(testTable).
@@ -270,7 +275,7 @@ func (suite *integrationTestSuite) TestE2EWritesWithTlsProxy() {
 
 	expected := tableData{
 		Columns: []column{
-			{"str_col", "STRING"},
+			{"str_col", "VARCHAR"},
 			{"timestamp", "TIMESTAMP"},
 		},
 		Dataset: [][]interface{}{
@@ -305,6 +310,7 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuthWithTlsProxy() {
 		qdb.WithTlsInsecureSkipVerify(),
 	)
 	assert.NoError(suite.T(), err)
+	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
 	err = sender.
 		Table(testTable).
@@ -328,7 +334,7 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuthWithTlsProxy() {
 
 	expected := tableData{
 		Columns: []column{
-			{"str_col", "STRING"},
+			{"str_col", "VARCHAR"},
 			{"timestamp", "TIMESTAMP"},
 		},
 		Dataset: [][]interface{}{
@@ -336,6 +342,66 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuthWithTlsProxy() {
 			{"barbaz", "1970-01-01T00:00:00.000002Z"},
 		},
 		Count: 2,
+	}
+
+	assert.Eventually(suite.T(), func() bool {
+		data := queryTableData(suite.T(), testTable, questdbC.httpAddress)
+		return reflect.DeepEqual(expected, data)
+	}, eventualDataTimeout, 100*time.Millisecond)
+}
+
+func (suite *integrationTestSuite) TestDoubleArrayColumn() {
+	if testing.Short() {
+		suite.T().Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+	questdbC, err := setupQuestDB(ctx, noAuth)
+	assert.NoError(suite.T(), err)
+	defer questdbC.Stop(ctx)
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
+	assert.NoError(suite.T(), err)
+	defer sender.Close(ctx)
+	dropTable(suite.T(), testTable, questdbC.httpAddress)
+
+	values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
+	values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
+	values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
+	arrayND, err := qdb.NewNDArray[float64](2, 2, 1, 2)
+	assert.NoError(suite.T(), err)
+	arrayND.Fill(11.0)
+
+	err = sender.
+		Table(testTable).
+		Float641DArrayColumn("array_1d", values1D).
+		Float642DArrayColumn("array_2d", values2D).
+		Float643DArrayColumn("array_3d", values3D).
+		Float64NDArrayColumn("array_nd", arrayND).
+		At(ctx, time.UnixMicro(1))
+	assert.NoError(suite.T(), err)
+
+	err = sender.Flush(ctx)
+	assert.NoError(suite.T(), err)
+
+	// Expected results
+	expected := tableData{
+		Columns: []column{
+			{"array_1d", "ARRAY"},
+			{"array_2d", "ARRAY"},
+			{"array_3d", "ARRAY"},
+			{"array_nd", "ARRAY"},
+			{"timestamp", "TIMESTAMP"},
+		},
+		Dataset: [][]interface{}{
+			{
+				[]interface{}{float64(1), float64(2), float64(3), float64(4), float64(5)},
+				[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}, []interface{}{float64(5), float64(6)}},
+				[]interface{}{[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}}, []interface{}{[]interface{}{float64(5), float64(6)}, []interface{}{float64(7), float64(8)}}},
+				[]interface{}{[]interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}, []interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}},
+				"1970-01-01T00:00:00.000001Z"},
+		},
+		Count: 1,
 	}
 
 	assert.Eventually(suite.T(), func() bool {
@@ -353,6 +419,23 @@ type tableData struct {
 type column struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
+}
+
+func dropTable(t *testing.T, tableName, address string) {
+	// We always query data using the QuestDB container over http
+	address = "http://" + address
+	u, err := url.Parse(address)
+	assert.NoError(t, err)
+
+	u.Path += "exec"
+	params := url.Values{}
+	params.Add("query", "drop table if exists '"+tableName+"'")
+	u.RawQuery = params.Encode()
+	url := fmt.Sprintf("%v", u)
+
+	res, err := http.Get(url)
+	assert.NoError(t, err)
+	defer res.Body.Close()
 }
 
 func queryTableData(t *testing.T, tableName, address string) tableData {

@@ -202,6 +202,17 @@ func TestParserHappyCases(t *testing.T) {
 			},
 		},
 		{
+			name:   "protocol version",
+			config: fmt.Sprintf("http::addr=%s;protocol_version=1;", addr),
+			expected: qdb.ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr":             addr,
+					"protocol_version": "1",
+				},
+			},
+		},
+		{
 			name:   "equal sign in password",
 			config: fmt.Sprintf("http::addr=%s;username=%s;password=pass=word;", addr, user),
 			expected: qdb.ConfigData{
@@ -288,15 +299,16 @@ type configTestCase struct {
 
 func TestHappyCasesFromConf(t *testing.T) {
 	var (
-		addr           = "localhost:1111"
-		user           = "test-user"
-		pass           = "test-pass"
-		token          = "test-token"
-		minThroughput  = 999
-		requestTimeout = time.Second * 88
-		retryTimeout   = time.Second * 99
-		initBufSize    = 256
-		maxBufSize     = 1024
+		addr            = "localhost:1111"
+		user            = "test-user"
+		pass            = "test-pass"
+		token           = "test-token"
+		minThroughput   = 999
+		requestTimeout  = time.Second * 88
+		retryTimeout    = time.Second * 99
+		initBufSize     = 256
+		maxBufSize      = 1024
+		protocolVersion = qdb.ProtocolVersion2
 	)
 
 	testCases := []configTestCase{
@@ -380,6 +392,16 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithHttp(),
 				qdb.WithAddress(addr),
 				qdb.WithMinThroughput(minThroughput),
+			},
+		},
+		{
+			name: "protocol_version",
+			config: fmt.Sprintf("http::addr=%s;protocol_version=%d;",
+				addr, protocolVersion),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithHttp(),
+				qdb.WithAddress(addr),
+				qdb.WithProtocolVersion(protocolVersion),
 			},
 		},
 		{

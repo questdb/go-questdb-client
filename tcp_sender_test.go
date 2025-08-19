@@ -67,6 +67,10 @@ func TestTcpHappyCasesFromConf(t *testing.T) {
 			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;",
 				addr, initBufSize),
 		},
+		{
+			name:   "protocol_version",
+			config: fmt.Sprintf("tcp::addr=%s;protocol_version=2;", addr),
+		},
 	}
 
 	for _, tc := range testCases {
@@ -100,6 +104,10 @@ func TestTcpHappyCasesFromEnv(t *testing.T) {
 			config: fmt.Sprintf("tcp::addr=%s;init_buf_size=%d;",
 				addr, initBufSize),
 		},
+		{
+			name:   "protocol_version",
+			config: fmt.Sprintf("tcp::addr=%s;protocol_version=2;", addr),
+		},
 	}
 
 	for _, tc := range testCases {
@@ -132,6 +140,11 @@ func TestTcpPathologicalCasesFromEnv(t *testing.T) {
 			name:        "auto_flush_rows",
 			config:      "tcp::auto_flush_rows=5;",
 			expectedErr: "autoFlushRows setting is not available",
+		},
+		{
+			name:        "protocol_version",
+			config:      "tcp::protocol_version=3;",
+			expectedErr: "current client only supports protocol version 1(text format for all datatypes), 2(binary format for part datatypes) or explicitly unset",
 		},
 	}
 
@@ -196,6 +209,11 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 			name:        "schema is case-sensitive",
 			config:      "tCp::addr=localhost:1234;",
 			expectedErr: "invalid schema",
+		},
+		{
+			name:        "protocol version",
+			config:      "tcp::protocol_version=abc;",
+			expectedErr: "invalid protocol_version value",
 		},
 	}
 
@@ -301,6 +319,53 @@ func TestErrorOnContextDeadline(t *testing.T) {
 	t.Fail()
 }
 
+func TestArrayColumnUnsupportedInTCPProtocolV1(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
+	defer cancel()
+
+	srv, err := newTestTcpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
+	values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
+	values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
+	arrayND, err := qdb.NewNDArray[float64](2, 2, 1, 2)
+	assert.NoError(t, err)
+	arrayND.Fill(11.0)
+
+	err = sender.
+		Table(testTable).
+		Float641DArrayColumn("array_1d", values1D).
+		At(ctx, time.UnixMicro(1))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+
+	err = sender.
+		Table(testTable).
+		Float642DArrayColumn("array_2d", values2D).
+		At(ctx, time.UnixMicro(2))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+
+	err = sender.
+		Table(testTable).
+		Float643DArrayColumn("array_3d", values3D).
+		At(ctx, time.UnixMicro(3))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+
+	err = sender.
+		Table(testTable).
+		Float64NDArrayColumn("array_nd", arrayND).
+		At(ctx, time.UnixMicro(4))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+}
+
 func BenchmarkLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
@@ -308,9 +373,16 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 	assert.NoError(b, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
 	assert.NoError(b, err)
 	defer sender.Close(ctx)
+
+	// Prepare test array data
+	values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
+	values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
+	values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
+	arrayND, _ := qdb.NewNDArray[float64](2, 3)
+	arrayND.Fill(1.5)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -323,6 +395,10 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 				BoolColumn("bool_col", true).
 				TimestampColumn("timestamp_col", time.UnixMicro(42)).
+				Float641DArrayColumn("array_1d", values1D).
+				Float642DArrayColumn("array_2d", values2D).
+				Float643DArrayColumn("array_3d", values3D).
+				Float64NDArrayColumn("array_nd", arrayND).
 				At(ctx, time.UnixMicro(int64(1000*i)))
 		}
 		sender.Flush(ctx)
@@ -336,9 +412,15 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 	assert.NoError(b, err)
 	defer srv.Close()
 
-	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
 	assert.NoError(b, err)
 	defer sender.Close(ctx)
+
+	values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
+	values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
+	values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
+	arrayND, _ := qdb.NewNDArray[float64](2, 3)
+	arrayND.Fill(1.5)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -350,6 +432,10 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 			StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 			BoolColumn("bool_col", true).
 			TimestampColumn("timestamp_col", time.UnixMicro(42)).
+			Float641DArrayColumn("array_1d", values1D).
+			Float642DArrayColumn("array_2d", values2D).
+			Float643DArrayColumn("array_3d", values3D).
+			Float64NDArrayColumn("array_nd", arrayND).
 			At(ctx, time.UnixMicro(int64(1000*i)))
 	}
 	sender.Flush(ctx)
