@@ -177,17 +177,13 @@ func validateShape(shape []uint) error {
 	return nil
 }
 
-// product calculates the product of slice elements with overflow protection
+// product calculates the product of slice elements
 func product(s []uint) uint {
 	if len(s) == 0 {
-		return 1
+		return 0
 	}
 	p := uint(1)
 	for _, v := range s {
-		// Check for potential overflow before multiplication
-		if v > 0 && p > MaxElements/v {
-			return MaxElements + 1 // Return a value that will trigger validation error
-		}
 		p *= v
 	}
 	return p

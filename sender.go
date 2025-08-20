@@ -472,6 +472,15 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 	}
 }
 
+// WithProtocolVersion sets the ingestion protocol version.
+//
+//   - HTTP transport automatically negotiates the protocol version by default(unset, STRONGLY RECOMMENDED).
+//     You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
+//   - TCP transport does not negotiate the protocol version and uses [ProtocolVersion1] by
+//     default. You must explicitly set [ProtocolVersion2] in order to ingest
+//     arrays.
+//
+// NOTE: QuestDB server version 9.0.0 or later is required for [ProtocolVersion2].
 func WithProtocolVersion(version protocolVersion) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.protocolVersion = version

@@ -17,6 +17,7 @@ Features:
 
 New in v3:
 * Supports ILP over HTTP using the same client semantics
+* Supports n-dimensional arrays of doubles for QuestDB servers 9.0.0 and up
 
 Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3).
 
@@ -98,6 +99,95 @@ HTTP is the recommended transport to use. To connect via TCP, set the configurat
 	sender, err := qdb.LineSenderFromConf(ctx, "tcp::addr=localhost:9009;")
 	// ...
 ```
+
+## N-dimensional arrays
+
+QuestDB server version 9.0.0 and newer supports n-dimensional arrays of double precision floating point numbers. 
+The Go client provides several methods to send arrays to QuestDB:
+
+### 1D Arrays
+
+```go
+// Send a 1D array of doubles
+values1D := []float64{1.1, 2.2, 3.3, 4.4}
+err = sender.
+    Table("measurements").
+    Symbol("sensor", "temp_probe_1").
+    Float641DArrayColumn("readings", values1D).
+    AtNow(ctx)
+```
+
+### 2D Arrays
+
+```go
+// Send a 2D array of doubles (must be rectangular)
+values2D := [][]float64{
+    {1.1, 2.2, 3.3},
+    {4.4, 5.5, 6.6},
+    {7.7, 8.8, 9.9},
+}
+err = sender.
+    Table("matrix_data").
+    Symbol("experiment", "test_001").
+    Float642DArrayColumn("matrix", values2D).
+    AtNow(ctx)
+```
+
+### 3D Arrays
+
+```go
+// Send a 3D array of doubles (must be regular cuboid shape)
+values3D := [][][]float64{
+    {{1.0, 2.0}, {3.0, 4.0}},
+    {{5.0, 6.0}, {7.0, 8.0}},
+}
+err = sender.
+    Table("tensor_data").
+    Symbol("model", "neural_net_v1").
+    Float643DArrayColumn("weights", values3D).
+    AtNow(ctx)
+```
+
+### N-dimensional Arrays
+
+For higher dimensions, use the `NewNDArray` function:
+
+```go
+// Create a 2x3x4 array
+arr, err := qdb.NewNDArray[float64](2, 3, 4)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Fill with values
+arr.Fill(1.5)
+
+// Or set individual values
+arr.Set([]uint{0, 1, 2}, 42.0)
+
+err = sender.
+    Table("ndarray_data").
+    Symbol("dataset", "training_batch_1").
+    Float64NDArrayColumn("features", arr).
+    AtNow(ctx)
+```
+
+The array data is sent over a new protocol version (2) that is auto-negotiated
+when using HTTP(s), or can be specified explicitly via the ``protocol_version=2``
+parameter when using TCP(s).
+
+We recommend using HTTP(s), but here is an TCP example, should you need it::
+
+```go
+sender, err := qdb.NewLineSender(ctx, 
+    qdb.WithTcp(), 
+    qdb.WithProtocolVersion(qdb.ProtocolVersion2))
+```
+
+When using ``protocol_version=2`` (with either TCP(s) or HTTP(s)), the sender
+will now also serialize ``float64`` (double-precision) columns as binary.
+You might see a performance uplift if this is a dominant data type in your
+ingestion workload.
 
 ## Pooled Line Senders
 
