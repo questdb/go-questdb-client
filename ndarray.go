@@ -208,10 +208,13 @@ func validateShape(shape []uint) error {
 
 func product(s []uint) uint {
 	if len(s) == 0 {
-		return 0
+		return 1
 	}
 	p := uint(1)
 	for _, v := range s {
+		if v != 0 && p > MaxArrayElements/v {
+			return MaxArrayElements + 1
+		}
 		p *= v
 	}
 	return p

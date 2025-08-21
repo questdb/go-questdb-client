@@ -178,7 +178,8 @@ func TestReshape_InvalidShapes(t *testing.T) {
 	}{
 		{"wrong size", []uint{5}},
 		{"empty shape", []uint{}},
-		{"too large", []uint{qdb.MaxArrayElements + 1}},
+		{"too large1", []uint{qdb.MaxArrayElements + 1}},
+		{"too large2", []uint{4294967296, 4294967296}},
 	}
 
 	for _, tc := range testCases {

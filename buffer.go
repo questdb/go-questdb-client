@@ -647,8 +647,8 @@ func (b *buffer) Float64Array2DColumn(name string, values [][]float64) *buffer {
 	var dim2 int
 	if dim1 > 0 {
 		dim2 = len(values[0])
-		totalElements := dim1 * dim2
-		if dim1 > MaxArrayElements || dim2 > MaxArrayElements || totalElements > MaxArrayElements || totalElements < 0 {
+		totalElements := product([]uint{uint(dim1), uint(dim2)})
+		if totalElements > MaxArrayElements {
 			b.lastErr = fmt.Errorf("array size %d exceeds maximum limit %d", totalElements, MaxArrayElements)
 			return b
 		}
@@ -699,8 +699,8 @@ func (b *buffer) Float64Array3DColumn(name string, values [][][]float64) *buffer
 		if dim2 > 0 {
 			dim3 = len(values[0][0])
 		}
-		totalElements := dim1 * dim2 * dim3
-		if dim1 > MaxArrayElements || dim2 > MaxArrayElements || dim3 > MaxArrayElements || totalElements > MaxArrayElements || totalElements < 0 {
+		totalElements := product([]uint{uint(dim1), uint(dim2), uint(dim3)})
+		if totalElements > MaxArrayElements {
 			b.lastErr = fmt.Errorf("array size %d exceeds maximum limit %d", totalElements, MaxArrayElements)
 			return b
 		}

@@ -27,6 +27,7 @@ package questdb_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/big"
 	"path/filepath"
 	"reflect"
@@ -417,11 +418,12 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 			"double array",
 			testTable,
 			func(s qdb.LineSender) error {
-				values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
-				values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
-				values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
+				values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0, math.NaN()}
+				values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}, {math.NaN(), math.NaN()}}
+				values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, math.NaN()}}}
 				arrayND, _ := qdb.NewNDArray[float64](2, 2, 1, 2)
 				arrayND.Fill(11.0)
+				arrayND.Set(math.NaN(), 1, 1, 0, 1)
 
 				err := s.
 					Table(testTable).
@@ -464,10 +466,10 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 				},
 				Dataset: [][]interface{}{
 					{
-						[]interface{}{float64(1), float64(2), float64(3), float64(4), float64(5)},
-						[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}, []interface{}{float64(5), float64(6)}},
-						[]interface{}{[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}}, []interface{}{[]interface{}{float64(5), float64(6)}, []interface{}{float64(7), float64(8)}}},
-						[]interface{}{[]interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}, []interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}},
+						[]interface{}{float64(1), float64(2), float64(3), float64(4), float64(5), nil},
+						[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}, []interface{}{float64(5), float64(6)}, []interface{}{nil, nil}},
+						[]interface{}{[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}}, []interface{}{[]interface{}{float64(5), float64(6)}, []interface{}{float64(7), nil}}},
+						[]interface{}{[]interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}, []interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), nil}}}},
 						"1970-01-01T00:00:00.000001Z"},
 					{
 						[]interface{}{},
