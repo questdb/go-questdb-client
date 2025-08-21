@@ -10,8 +10,8 @@ const (
 	MaxDimensions = 32
 )
 
-// Numeric represents the constraint for numeric types that can be used in NdArray
-type Numeric interface {
+// NdArrayElementType represents the constraint for numeric types that can be used in NdArray
+type NdArrayElementType interface {
 	~float64
 }
 
@@ -24,7 +24,7 @@ type Numeric interface {
 // ResetAppendIndex to reset the array for reuse after sending data.
 //
 // By default, all values in the array are initialized to zero.
-type NdArray[T Numeric] struct {
+type NdArray[T NdArrayElementType] struct {
 	data        []T
 	shape       []uint
 	appendIndex uint
@@ -32,7 +32,7 @@ type NdArray[T Numeric] struct {
 
 // NewNDArray creates a new NdArray with the specified shape.
 // All elements are initialized to zero by default.
-func NewNDArray[T Numeric](shape ...uint) (*NdArray[T], error) {
+func NewNDArray[T NdArrayElementType](shape ...uint) (*NdArray[T], error) {
 	if err := validateShape(shape); err != nil {
 		return nil, fmt.Errorf("invalid shape: %w", err)
 	}
