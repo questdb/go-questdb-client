@@ -120,14 +120,14 @@ type LineSender interface {
 	// '-', '*' '%%', '~', or a non-printable char.
 	BoolColumn(name string, val bool) LineSender
 
-	// Float641DArrayColumn adds an array of 64-bit floats (double array) to the ILP message.
+	// Float64Array1DColumn adds an array of 64-bit floats (double array) to the ILP message.
 	//
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
-	Float641DArrayColumn(name string, values []float64) LineSender
+	Float64Array1DColumn(name string, values []float64) LineSender
 
-	// Float642DArrayColumn adds a 2D array of 64-bit floats (double 2D array) to the ILP message.
+	// Float64Array2DColumn adds a 2D array of 64-bit floats (double 2D array) to the ILP message.
 	//
 	// The values parameter must have a regular (rectangular) shape - all rows must have
 	// exactly the same length. If the array has irregular shape, this method returns an error.
@@ -141,9 +141,9 @@ type LineSender interface {
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
-	Float642DArrayColumn(name string, values [][]float64) LineSender
+	Float64Array2DColumn(name string, values [][]float64) LineSender
 
-	// Float643DArrayColumn adds a 3D array of 64-bit floats (double 3D array) to the ILP message.
+	// Float64Array3DColumn adds a 3D array of 64-bit floats (double 3D array) to the ILP message.
 	//
 	// The values parameter must have a regular (cuboid) shape - all dimensions must have
 	// consistent sizes throughout. If the array has irregular shape, this method returns an error.
@@ -163,20 +163,20 @@ type LineSender interface {
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
-	Float643DArrayColumn(name string, values [][][]float64) LineSender
+	Float64Array3DColumn(name string, values [][][]float64) LineSender
 
-	// Float64NDArrayColumn adds an n-dimensional array of 64-bit floats (double n-D array) to the ILP message.
+	// Float64ArrayNDColumn adds an n-dimensional array of 64-bit floats (double n-D array) to the ILP message.
 	//
 	// Example usage:
 	//   // Create a 2x3x4 array
 	//   arr, _ := questdb.NewNDArray[float64](2, 3, 4)
 	//   arr.Fill(1.5)
-	//   sender.Float64NDArrayColumn("ndarray_col", arr)
+	//   sender.Float64ArrayNDColumn("ndarray_col", arr)
 	//
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
-	Float64NDArrayColumn(name string, values *NdArray[float64]) LineSender
+	Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender
 
 	// At sets the designated timestamp value and finalizes the ILP
 	// message.

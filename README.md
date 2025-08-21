@@ -113,7 +113,7 @@ values1D := []float64{1.1, 2.2, 3.3, 4.4}
 err = sender.
     Table("measurements").
     Symbol("sensor", "temp_probe_1").
-    Float641DArrayColumn("readings", values1D).
+    Float64Array1DColumn("readings", values1D).
     AtNow(ctx)
 ```
 
@@ -129,7 +129,7 @@ values2D := [][]float64{
 err = sender.
     Table("matrix_data").
     Symbol("experiment", "test_001").
-    Float642DArrayColumn("matrix", values2D).
+    Float64Array2DColumn("matrix", values2D).
     AtNow(ctx)
 ```
 
@@ -144,7 +144,7 @@ values3D := [][][]float64{
 err = sender.
     Table("tensor_data").
     Symbol("model", "neural_net_v1").
-    Float643DArrayColumn("weights", values3D).
+    Float64Array3DColumn("weights", values3D).
     AtNow(ctx)
 ```
 
@@ -168,7 +168,7 @@ arr.Set([]uint{0, 1, 2}, 42.0)
 err = sender.
     Table("ndarray_data").
     Symbol("dataset", "training_batch_1").
-    Float64NDArrayColumn("features", arr).
+    Float64ArrayNDColumn("features", arr).
     AtNow(ctx)
 ```
 
@@ -176,7 +176,7 @@ The array data is sent over a new protocol version (2) that is auto-negotiated
 when using HTTP(s), or can be specified explicitly via the ``protocol_version=2``
 parameter when using TCP(s).
 
-We recommend using HTTP(s), but here is an TCP example, should you need it::
+We recommend using HTTP(s), but here is an TCP example, should you need it:
 
 ```go
 sender, err := qdb.NewLineSender(ctx, 

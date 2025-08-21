@@ -144,7 +144,7 @@ func TestTcpPathologicalCasesFromEnv(t *testing.T) {
 		{
 			name:        "protocol_version",
 			config:      "tcp::protocol_version=3;",
-			expectedErr: "current client only supports protocol version 1(text format for all datatypes), 2(binary format for part datatypes) or explicitly unset",
+			expectedErr: "current client only supports protocol version 1 (text format for all datatypes), 2 (binary format for part datatypes) or explicitly unset",
 		},
 	}
 
@@ -339,28 +339,28 @@ func TestArrayColumnUnsupportedInTCPProtocolV1(t *testing.T) {
 
 	err = sender.
 		Table(testTable).
-		Float641DArrayColumn("array_1d", values1D).
+		Float64Array1DColumn("array_1d", values1D).
 		At(ctx, time.UnixMicro(1))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
 
 	err = sender.
 		Table(testTable).
-		Float642DArrayColumn("array_2d", values2D).
+		Float64Array2DColumn("array_2d", values2D).
 		At(ctx, time.UnixMicro(2))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
 
 	err = sender.
 		Table(testTable).
-		Float643DArrayColumn("array_3d", values3D).
+		Float64Array3DColumn("array_3d", values3D).
 		At(ctx, time.UnixMicro(3))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
 
 	err = sender.
 		Table(testTable).
-		Float64NDArrayColumn("array_nd", arrayND).
+		Float64ArrayNDColumn("array_nd", arrayND).
 		At(ctx, time.UnixMicro(4))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
@@ -395,10 +395,10 @@ func BenchmarkLineSenderBatch1000(b *testing.B) {
 				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 				BoolColumn("bool_col", true).
 				TimestampColumn("timestamp_col", time.UnixMicro(42)).
-				Float641DArrayColumn("array_1d", values1D).
-				Float642DArrayColumn("array_2d", values2D).
-				Float643DArrayColumn("array_3d", values3D).
-				Float64NDArrayColumn("array_nd", arrayND).
+				Float64Array1DColumn("array_1d", values1D).
+				Float64Array2DColumn("array_2d", values2D).
+				Float64Array3DColumn("array_3d", values3D).
+				Float64ArrayNDColumn("array_nd", arrayND).
 				At(ctx, time.UnixMicro(int64(1000*i)))
 		}
 		sender.Flush(ctx)
@@ -432,10 +432,10 @@ func BenchmarkLineSenderNoFlush(b *testing.B) {
 			StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 			BoolColumn("bool_col", true).
 			TimestampColumn("timestamp_col", time.UnixMicro(42)).
-			Float641DArrayColumn("array_1d", values1D).
-			Float642DArrayColumn("array_2d", values2D).
-			Float643DArrayColumn("array_3d", values3D).
-			Float64NDArrayColumn("array_nd", arrayND).
+			Float64Array1DColumn("array_1d", values1D).
+			Float64Array2DColumn("array_2d", values2D).
+			Float64Array3DColumn("array_3d", values3D).
+			Float64ArrayNDColumn("array_nd", arrayND).
 			At(ctx, time.UnixMicro(int64(1000*i)))
 	}
 	sender.Flush(ctx)

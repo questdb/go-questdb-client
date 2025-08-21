@@ -456,7 +456,7 @@ func TestInvalidColumnName(t *testing.T) {
 	assert.Empty(t, buf.Messages())
 }
 
-func TestFloat64ColumnBinaryFormat(t *testing.T) {
+func TestFloat64ColumnBinary(t *testing.T) {
 	testCases := []struct {
 		name string
 		val  float64
@@ -474,14 +474,14 @@ func TestFloat64ColumnBinaryFormat(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := newTestBuffer()
-			err := buf.Table(testTable).Float64ColumnBinaryFormat("a_col", tc.val).At(time.Time{}, false)
+			err := buf.Table(testTable).Float64ColumnBinary("a_col", tc.val).At(time.Time{}, false)
 			assert.NoError(t, err)
 			assert.Equal(t, buf.Messages(), float64ToByte(testTable, "a_col", tc.val))
 		})
 	}
 }
 
-func TestFloat641DArrayColumn(t *testing.T) {
+func TestFloat64Array1DColumn(t *testing.T) {
 	testCases := []struct {
 		name   string
 		values []float64
@@ -490,20 +490,24 @@ func TestFloat641DArrayColumn(t *testing.T) {
 		{"multiple values", []float64{1.1, 2.2, 3.3}},
 		{"empty array", []float64{}},
 		{"with special values", []float64{math.NaN(), math.Inf(1), math.Inf(-1), 0.0}},
+		{"null array", nil},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := newTestBuffer()
+			for _, littleEndian := range []bool{true, false} {
+				qdb.SetLittleEndian(littleEndian)
+				buf := newTestBuffer()
 
-			err := buf.Table(testTable).Float641DArrayColumn("array_col", tc.values).At(time.Time{}, false)
-			assert.NoError(t, err)
-			assert.Equal(t, float641DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				err := buf.Table(testTable).Float64Array1DColumn("array_col", tc.values).At(time.Time{}, false)
+				assert.NoError(t, err)
+				assert.Equal(t, float641DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+			}
 		})
 	}
 }
 
-func TestFloat642DArrayColumn(t *testing.T) {
+func TestFloat64Array2DColumn(t *testing.T) {
 	testCases := []struct {
 		name   string
 		values [][]float64
@@ -512,30 +516,33 @@ func TestFloat642DArrayColumn(t *testing.T) {
 		{"1x3 array", [][]float64{{1.0, 2.0, 3.0}}},
 		{"3x1 array", [][]float64{{1.0}, {2.0}, {3.0}}},
 		{"empty array", [][]float64{}},
+		{"null array", nil},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := newTestBuffer()
-
-			err := buf.Table(testTable).Float642DArrayColumn("array_col", tc.values).At(time.Time{}, false)
-			assert.NoError(t, err)
-			assert.Equal(t, float642DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+			for _, littleEndian := range []bool{true, false} {
+				qdb.SetLittleEndian(littleEndian)
+				buf := newTestBuffer()
+				err := buf.Table(testTable).Float64Array2DColumn("array_col", tc.values).At(time.Time{}, false)
+				assert.NoError(t, err)
+				assert.Equal(t, float642DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+			}
 		})
 	}
 }
 
-func TestFloat642DArrayColumnIrregularShape(t *testing.T) {
+func TestFloat64Array2DColumnIrregularShape(t *testing.T) {
 	buf := newTestBuffer()
 
 	irregularArray := [][]float64{{1.0, 2.0}, {3.0, 4.0, 5.0}}
-	err := buf.Table(testTable).Float642DArrayColumn("array_col", irregularArray).At(time.Time{}, false)
+	err := buf.Table(testTable).Float64Array2DColumn("array_col", irregularArray).At(time.Time{}, false)
 
 	assert.ErrorContains(t, err, "irregular 2D array shape")
 	assert.Empty(t, buf.Messages())
 }
 
-func TestFloat643DArrayColumn(t *testing.T) {
+func TestFloat64Array3DColumn(t *testing.T) {
 	testCases := []struct {
 		name   string
 		values [][][]float64
@@ -543,29 +550,35 @@ func TestFloat643DArrayColumn(t *testing.T) {
 		{"2x2x2 array", [][][]float64{{{1.1, 2.2}, {3.3, 4.4}}, {{5.5, 6.6}, {7.7, 8.8}}}},
 		{"1x1x3 array", [][][]float64{{{1.0, 2.0, 3.0}}}},
 		{"empty array", [][][]float64{}},
+		{"null array", nil},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := newTestBuffer()
-
-			err := buf.Table(testTable).Float643DArrayColumn("array_col", tc.values).At(time.Time{}, false)
-			assert.NoError(t, err)
-			assert.Equal(t, float643DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+			for _, littleEndian := range []bool{true, false} {
+				qdb.SetLittleEndian(littleEndian)
+				buf := newTestBuffer()
+				err := buf.Table(testTable).Float64Array3DColumn("array_col", tc.values).At(time.Time{}, false)
+				assert.NoError(t, err)
+				assert.Equal(t, float643DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+			}
 		})
 	}
 }
 
-func TestFloat643DArrayColumnIrregularShape(t *testing.T) {
+func TestFloat64Array3DColumnIrregularShape(t *testing.T) {
 	buf := newTestBuffer()
 	irregularArray := [][][]float64{{{1.0, 2.0}, {3.0}}, {{4.0, 5.0}, {6.0, 7.0}}}
-	err := buf.Table(testTable).Float643DArrayColumn("array_col", irregularArray).At(time.Time{}, false)
-
-	assert.ErrorContains(t, err, "irregular 3D array shape")
+	err := buf.Table(testTable).Float64Array3DColumn("array_col", irregularArray).At(time.Time{}, false)
+	assert.ErrorContains(t, err, "irregular 3D array shape: level2[0][1] has length 1, expected 2")
+	assert.Empty(t, buf.Messages())
+	irregularArray2 := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{4.0, 5.0}}}
+	err = buf.Table(testTable).Float64Array3DColumn("array_col", irregularArray2).At(time.Time{}, false)
+	assert.ErrorContains(t, err, "irregular 3D array shape: level1[1] has length 1, expected 2")
 	assert.Empty(t, buf.Messages())
 }
 
-func TestFloat64NDArrayColumn(t *testing.T) {
+func TestFloat64ArrayNDColumn(t *testing.T) {
 	testCases := []struct {
 		name  string
 		shape []uint
@@ -574,28 +587,73 @@ func TestFloat64NDArrayColumn(t *testing.T) {
 		{"1D array", []uint{3}, []float64{1.0, 2.0, 3.0}},
 		{"2D array", []uint{2, 2}, []float64{1.0, 2.0, 3.0, 4.0}},
 		{"3D array", []uint{2, 1, 2}, []float64{1.0, 2.0, 3.0, 4.0}},
+		{"null array", nil, nil},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := newTestBuffer()
-			ndArray, err := qdb.NewNDArray[float64](tc.shape...)
-			assert.NoError(t, err)
-			for _, val := range tc.data {
-				ndArray.Append(val)
+			for _, littleEndian := range []bool{true, false} {
+				qdb.SetLittleEndian(littleEndian)
+				buf := newTestBuffer()
+				var err error
+				if tc.data == nil {
+					err = buf.Table(testTable).Float64ArrayNDColumn("ndarray_col", nil).At(time.Time{}, false)
+					assert.NoError(t, err)
+					assert.Equal(t, float64NDArrayToByte(testTable, "ndarray_col", nil), buf.Messages())
+				} else {
+					ndArray, err := qdb.NewNDArray[float64](tc.shape...)
+					assert.NoError(t, err)
+					for _, val := range tc.data {
+						ndArray.Append(val)
+					}
+					err = buf.Table(testTable).Float64ArrayNDColumn("ndarray_col", ndArray).At(time.Time{}, false)
+					assert.NoError(t, err)
+					assert.Equal(t, float64NDArrayToByte(testTable, "ndarray_col", ndArray), buf.Messages())
+				}
 			}
-
-			err = buf.Table(testTable).Float64NDArrayColumn("ndarray_col", ndArray).At(time.Time{}, false)
-			assert.NoError(t, err)
-			assert.Equal(t, float64NDArrayToByte(testTable, "ndarray_col", ndArray), buf.Messages())
 		})
 	}
 }
 
-func TestFloat64NDArrayColumnNil(t *testing.T) {
+func TestFloat64Array1DColumnExceedsMaxElements(t *testing.T) {
 	buf := newTestBuffer()
-	err := buf.Table(testTable).Float64NDArrayColumn("ndarray_col", nil).At(time.Time{}, false)
-	assert.ErrorContains(t, err, "NDArray cannot be nil")
+	largeSize := qdb.MaxArrayElements + 1
+	values := make([]float64, largeSize)
+
+	err := buf.Table(testTable).Float64Array1DColumn("array_col", values).At(time.Time{}, false)
+	assert.ErrorContains(t, err, "array size 268435456 exceeds maximum limit 268435455")
+	assert.Empty(t, buf.Messages())
+}
+
+func TestFloat64Array2DColumnExceedsMaxElements(t *testing.T) {
+	buf := newTestBuffer()
+	dim1 := 65536
+	dim2 := 4097
+	values := make([][]float64, dim1)
+	for i := range values {
+		values[i] = make([]float64, dim2)
+	}
+
+	err := buf.Table(testTable).Float64Array2DColumn("array_col", values).At(time.Time{}, false)
+	assert.ErrorContains(t, err, "array size 268500992 exceeds maximum limit 268435455")
+	assert.Empty(t, buf.Messages())
+}
+
+func TestFloat64Array3DColumnExceedsMaxElements(t *testing.T) {
+	buf := newTestBuffer()
+	dim1 := 1024
+	dim2 := 1024
+	dim3 := 256
+	values := make([][][]float64, dim1)
+	for i := range values {
+		values[i] = make([][]float64, dim2)
+		for j := range values[i] {
+			values[i][j] = make([]float64, dim3)
+		}
+	}
+
+	err := buf.Table(testTable).Float64Array3DColumn("array_col", values).At(time.Time{}, false)
+	assert.ErrorContains(t, err, "array size 268435456 exceeds maximum limit 268435455")
 	assert.Empty(t, buf.Messages())
 }
 
@@ -614,7 +672,23 @@ func float64ToByte(table, col string, val float64) []byte {
 	return buf
 }
 
+func nullArrayToByte(table, col string) []byte {
+	buf := make([]byte, 0, 128)
+	buf = append(buf, ([]byte)(table)...)
+	buf = append(buf, ' ')
+	buf = append(buf, ([]byte)(col)...)
+	buf = append(buf, '=')
+	buf = append(buf, '=')
+	buf = append(buf, 14)
+	buf = append(buf, 33)
+	buf = append(buf, '\n')
+	return buf
+}
+
 func float641DArrayToByte(table, col string, vals []float64) []byte {
+	if vals == nil {
+		return nullArrayToByte(table, col)
+	}
 	buf := make([]byte, 0, 128)
 	buf = append(buf, ([]byte)(table)...)
 	buf = append(buf, ' ')
@@ -640,6 +714,9 @@ func float641DArrayToByte(table, col string, vals []float64) []byte {
 }
 
 func float642DArrayToByte(table, col string, vals [][]float64) []byte {
+	if vals == nil {
+		return nullArrayToByte(table, col)
+	}
 	buf := make([]byte, 0, 256)
 	buf = append(buf, ([]byte)(table)...)
 	buf = append(buf, ' ')
@@ -673,6 +750,9 @@ func float642DArrayToByte(table, col string, vals [][]float64) []byte {
 }
 
 func float643DArrayToByte(table, col string, vals [][][]float64) []byte {
+	if vals == nil {
+		return nullArrayToByte(table, col)
+	}
 	buf := make([]byte, 0, 512)
 	buf = append(buf, ([]byte)(table)...)
 	buf = append(buf, ' ')
@@ -712,6 +792,9 @@ func float643DArrayToByte(table, col string, vals [][][]float64) []byte {
 }
 
 func float64NDArrayToByte(table, col string, ndarray *qdb.NdArray[float64]) []byte {
+	if ndarray == nil {
+		return nullArrayToByte(table, col)
+	}
 	buf := make([]byte, 0, 512)
 	buf = append(buf, ([]byte)(table)...)
 	buf = append(buf, ' ')
@@ -729,7 +812,7 @@ func float64NDArrayToByte(table, col string, ndarray *qdb.NdArray[float64]) []by
 		buf = append(buf, shapeData...)
 	}
 
-	data := ndarray.GetData()
+	data := ndarray.Data()
 	for _, val := range data {
 		valData := make([]byte, 8)
 		binary.LittleEndian.PutUint64(valData, math.Float64bits(val))

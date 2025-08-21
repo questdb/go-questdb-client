@@ -68,7 +68,7 @@ func TestNew_InvalidShapes(t *testing.T) {
 	}{
 		{"empty shape", []uint{}},
 		{"too many dimensions", make([]uint, qdb.MaxDimensions+1)},
-		{"too many elements", []uint{qdb.MaxElements + 1}},
+		{"too many elements", []uint{qdb.MaxArrayElements + 1}},
 	}
 
 	for _, tc := range testCases {
@@ -163,7 +163,7 @@ func TestReshape_ValidShapes(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.newShape, reshaped.Shape())
 			assert.Equal(t, arr.Size(), reshaped.Size())
-			assert.Equal(t, arr.GetData(), reshaped.GetData())
+			assert.Equal(t, arr.Data(), reshaped.Data())
 		})
 	}
 }
@@ -178,7 +178,7 @@ func TestReshape_InvalidShapes(t *testing.T) {
 	}{
 		{"wrong size", []uint{5}},
 		{"empty shape", []uint{}},
-		{"too large", []uint{qdb.MaxElements + 1}},
+		{"too large", []uint{qdb.MaxArrayElements + 1}},
 	}
 
 	for _, tc := range testCases {
@@ -206,7 +206,7 @@ func TestAppend(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, values, arr.GetData())
+	assert.Equal(t, values, arr.Data())
 	_, err = arr.Append(5.0)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "array is full")
@@ -268,7 +268,7 @@ func TestGetData_SharedReference(t *testing.T) {
 	arr, err := qdb.NewNDArray[float64](2, 2)
 	require.NoError(t, err)
 
-	data := arr.GetData()
+	data := arr.Data()
 	data[0] = 42.0
 	val, err := arr.Get(0, 0)
 	require.NoError(t, err)
@@ -288,9 +288,9 @@ func TestMaxLimits(t *testing.T) {
 	})
 
 	t.Run("max elements", func(t *testing.T) {
-		arr, err := qdb.NewNDArray[float64](qdb.MaxElements)
+		arr, err := qdb.NewNDArray[float64](qdb.MaxArrayElements)
 		require.NoError(t, err)
-		assert.Equal(t, qdb.MaxElements, arr.Size())
+		assert.Equal(t, qdb.MaxArrayElements, arr.Size())
 	})
 }
 

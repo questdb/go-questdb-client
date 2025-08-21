@@ -170,7 +170,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				}
 				pVersion := protocolVersion(version)
 				if pVersion < ProtocolVersion1 || pVersion > ProtocolVersion2 {
-					return nil, NewInvalidConfigStrError("current client only supports protocol version 1(text format for all datatypes), 2(binary format for part datatypes) or explicitly unset")
+					return nil, NewInvalidConfigStrError("current client only supports protocol version 1 (text format for all datatypes), 2 (binary format for part datatypes) or explicitly unset")
 				}
 				senderConf.protocolVersion = pVersion
 			}

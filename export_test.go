@@ -132,3 +132,7 @@ func ProtocolVersion(s LineSender) protocolVersion {
 func NewLineSenderConfig(t SenderType) *LineSenderConfig {
 	return newLineSenderConfig(t)
 }
+
+func SetLittleEndian(littleEndian bool) {
+	isLittleEndian = littleEndian
+}

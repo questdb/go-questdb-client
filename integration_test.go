@@ -132,7 +132,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 		return nil, err
 	}
 	req := testcontainers.ContainerRequest{
-		Image:          "questdb/questdb:9.0.1",
+		Image:          "questdb/questdb:9.0.2",
 		ExposedPorts:   []string{"9000/tcp", "9009/tcp"},
 		WaitingFor:     wait.ForHTTP("/").WithPort("9000"),
 		Networks:       []string{networkName},
@@ -423,13 +423,36 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 				arrayND, _ := qdb.NewNDArray[float64](2, 2, 1, 2)
 				arrayND.Fill(11.0)
 
+				err := s.
+					Table(testTable).
+					Float64Array1DColumn("array_1d", values1D).
+					Float64Array2DColumn("array_2d", values2D).
+					Float64Array3DColumn("array_3d", values3D).
+					Float64ArrayNDColumn("array_nd", arrayND).
+					At(ctx, time.UnixMicro(1))
+				if err != nil {
+					return err
+				}
+				// empty array
+				emptyNdArray, _ := qdb.NewNDArray[float64](2, 2, 0, 2)
+				err = s.
+					Table(testTable).
+					Float64Array1DColumn("array_1d", []float64{}).
+					Float64Array2DColumn("array_2d", [][]float64{{}}).
+					Float64Array3DColumn("array_3d", [][][]float64{{{}}}).
+					Float64ArrayNDColumn("array_nd", emptyNdArray).
+					At(ctx, time.UnixMicro(2))
+				if err != nil {
+					return err
+				}
+				// null array
 				return s.
 					Table(testTable).
-					Float641DArrayColumn("array_1d", values1D).
-					Float642DArrayColumn("array_2d", values2D).
-					Float643DArrayColumn("array_3d", values3D).
-					Float64NDArrayColumn("array_nd", arrayND).
-					At(ctx, time.UnixMicro(1))
+					Float64Array1DColumn("array_1d", nil).
+					Float64Array2DColumn("array_2d", nil).
+					Float64Array3DColumn("array_3d", nil).
+					Float64ArrayNDColumn("array_nd", nil).
+					At(ctx, time.UnixMicro(3))
 			},
 			tableData{
 				Columns: []column{
@@ -446,8 +469,20 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 						[]interface{}{[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}}, []interface{}{[]interface{}{float64(5), float64(6)}, []interface{}{float64(7), float64(8)}}},
 						[]interface{}{[]interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}, []interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}},
 						"1970-01-01T00:00:00.000001Z"},
+					{
+						[]interface{}{},
+						[]interface{}{},
+						[]interface{}{},
+						[]interface{}{},
+						"1970-01-01T00:00:00.000002Z"},
+					{
+						nil,
+						nil,
+						nil,
+						nil,
+						"1970-01-01T00:00:00.000003Z"},
 				},
-				Count: 1,
+				Count: 3,
 			},
 		},
 	}

@@ -194,22 +194,22 @@ func (s *tcpLineSender) BoolColumn(name string, val bool) LineSender {
 	return s
 }
 
-func (s *tcpLineSender) Float641DArrayColumn(name string, values []float64) LineSender {
+func (s *tcpLineSender) Float64Array1DColumn(name string, values []float64) LineSender {
 	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
 	return s
 }
 
-func (s *tcpLineSender) Float642DArrayColumn(name string, values [][]float64) LineSender {
+func (s *tcpLineSender) Float64Array2DColumn(name string, values [][]float64) LineSender {
 	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
 	return s
 }
 
-func (s *tcpLineSender) Float643DArrayColumn(name string, values [][][]float64) LineSender {
+func (s *tcpLineSender) Float64Array3DColumn(name string, values [][][]float64) LineSender {
 	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
 	return s
 }
 
-func (s *tcpLineSender) Float64NDArrayColumn(name string, values *NdArray[float64]) LineSender {
+func (s *tcpLineSender) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
 	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
 	return s
 }
@@ -323,26 +323,26 @@ func (s *tcpLineSenderV2) BoolColumn(name string, val bool) LineSender {
 }
 
 func (s *tcpLineSenderV2) Float64Column(name string, val float64) LineSender {
-	s.buf.Float64ColumnBinaryFormat(name, val)
+	s.buf.Float64ColumnBinary(name, val)
 	return s
 }
 
-func (s *tcpLineSenderV2) Float641DArrayColumn(name string, values []float64) LineSender {
-	s.buf.Float641DArrayColumn(name, values)
+func (s *tcpLineSenderV2) Float64Array1DColumn(name string, values []float64) LineSender {
+	s.buf.Float64Array1DColumn(name, values)
 	return s
 }
 
-func (s *tcpLineSenderV2) Float642DArrayColumn(name string, values [][]float64) LineSender {
-	s.buf.Float642DArrayColumn(name, values)
+func (s *tcpLineSenderV2) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	s.buf.Float64Array2DColumn(name, values)
 	return s
 }
 
-func (s *tcpLineSenderV2) Float643DArrayColumn(name string, values [][][]float64) LineSender {
-	s.buf.Float643DArrayColumn(name, values)
+func (s *tcpLineSenderV2) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	s.buf.Float64Array3DColumn(name, values)
 	return s
 }
 
-func (s *tcpLineSenderV2) Float64NDArrayColumn(name string, values *NdArray[float64]) LineSender {
-	s.buf.Float64NDArrayColumn(name, values)
+func (s *tcpLineSenderV2) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	s.buf.Float64ArrayNDColumn(name, values)
 	return s
 }

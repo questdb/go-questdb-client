@@ -324,23 +324,23 @@ func (ps *pooledSender) BoolColumn(name string, val bool) LineSender {
 	return ps
 }
 
-func (ps *pooledSender) Float641DArrayColumn(name string, values []float64) LineSender {
-	ps.wrapped.Float641DArrayColumn(name, values)
+func (ps *pooledSender) Float64Array1DColumn(name string, values []float64) LineSender {
+	ps.wrapped.Float64Array1DColumn(name, values)
 	return ps
 }
 
-func (ps *pooledSender) Float642DArrayColumn(name string, values [][]float64) LineSender {
-	ps.wrapped.Float642DArrayColumn(name, values)
+func (ps *pooledSender) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	ps.wrapped.Float64Array2DColumn(name, values)
 	return ps
 }
 
-func (ps *pooledSender) Float643DArrayColumn(name string, values [][][]float64) LineSender {
-	ps.wrapped.Float643DArrayColumn(name, values)
+func (ps *pooledSender) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	ps.wrapped.Float64Array3DColumn(name, values)
 	return ps
 }
 
-func (ps *pooledSender) Float64NDArrayColumn(name string, values *NdArray[float64]) LineSender {
-	ps.wrapped.Float64NDArrayColumn(name, values)
+func (ps *pooledSender) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	ps.wrapped.Float64ArrayNDColumn(name, values)
 	return ps
 }
 

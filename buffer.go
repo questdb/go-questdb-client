@@ -41,23 +41,25 @@ import (
 // chars found in table or column name.
 var errInvalidMsg = errors.New("invalid message")
 
-type binaryFlag byte
+type binaryCode byte
 
 const (
-	arrayBinaryFlag   binaryFlag = 14
-	float64BinaryFlag binaryFlag = 16
+	arrayCode   binaryCode = 14
+	float64Code binaryCode = 16
 )
 
-// isLittleEndian checks if the current machine uses little-endian byte order
-func isLittleEndian() bool {
+var isLittleEndian = func() bool {
 	var i int32 = 0x01020304
 	return *(*byte)(unsafe.Pointer(&i)) == 0x04
-}
+}()
+
+// MaxArrayElements defines the maximum total number of elements of Array
+const MaxArrayElements = (1 << 28) - 1
 
 // writeFloat64Data optimally writes float64 slice data to buffer
 // Uses batch memory copy on little-endian machines for better performance
 func (b *buffer) writeFloat64Data(data []float64) {
-	if isLittleEndian() && len(data) > 0 {
+	if isLittleEndian && len(data) > 0 {
 		b.Write(unsafe.Slice((*byte)(unsafe.Pointer(&data[0])), len(data)*8))
 	} else {
 		bytes := make([]byte, 8)
@@ -68,15 +70,14 @@ func (b *buffer) writeFloat64Data(data []float64) {
 	}
 }
 
-// writeUint32 optimally writes a single uint32 value
-func (b *buffer) writeUint32(val uint32) {
-	if isLittleEndian() {
+func (b *buffer) writeInt32(val int32) {
+	if isLittleEndian {
 		// On little-endian machines, we can directly write the uint32 as bytes
 		b.Write((*[4]byte)(unsafe.Pointer(&val))[:])
 	} else {
 		// On big-endian machines, use the standard conversion
 		data := make([]byte, 4)
-		binary.LittleEndian.PutUint32(data, val)
+		binary.LittleEndian.PutUint32(data, uint32(val))
 		b.Write(data)
 	}
 }
@@ -85,6 +86,7 @@ type arrayElemType byte
 
 const (
 	arrayElemDouble arrayElemType = 10
+	arrayElemNull                 = 33
 )
 
 // buffer is a wrapper on top of bytes.Buffer. It extends the
@@ -571,7 +573,7 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 	return b
 }
 
-func (b *buffer) Float64ColumnBinaryFormat(name string, val float64) *buffer {
+func (b *buffer) Float64ColumnBinary(name string, val float64) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -582,8 +584,8 @@ func (b *buffer) Float64ColumnBinaryFormat(name string, val float64) *buffer {
 	b.WriteByte('=')
 	// binary format flag
 	b.WriteByte('=')
-	b.WriteByte(byte(float64BinaryFlag))
-	if isLittleEndian() {
+	b.WriteByte(byte(float64Code))
+	if isLittleEndian {
 		b.Write((*[8]byte)(unsafe.Pointer(&val))[:])
 	} else {
 		data := make([]byte, 8)
@@ -594,15 +596,7 @@ func (b *buffer) Float64ColumnBinaryFormat(name string, val float64) *buffer {
 	return b
 }
 
-func (b *buffer) writeFloat64ArrayHeader(dims byte) {
-	b.WriteByte('=')
-	b.WriteByte('=')
-	b.WriteByte(byte(arrayBinaryFlag))
-	b.WriteByte(byte(arrayElemDouble))
-	b.WriteByte(dims)
-}
-
-func (b *buffer) Float641DArrayColumn(name string, values []float64) *buffer {
+func (b *buffer) Float64Array1DColumn(name string, values []float64) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -610,12 +604,20 @@ func (b *buffer) Float641DArrayColumn(name string, values []float64) *buffer {
 	if b.lastErr != nil {
 		return b
 	}
+	if values == nil {
+		b.writeNullArray()
+		return b
+	}
 
 	dim1 := len(values)
+	if dim1 > MaxArrayElements {
+		b.lastErr = fmt.Errorf("array size %d exceeds maximum limit %d", dim1, MaxArrayElements)
+		return b
+	}
 	b.writeFloat64ArrayHeader(1)
 
 	// Write shape
-	b.writeUint32(uint32(dim1))
+	b.writeInt32(int32(dim1))
 
 	// Write values
 	if len(values) > 0 {
@@ -626,7 +628,7 @@ func (b *buffer) Float641DArrayColumn(name string, values []float64) *buffer {
 	return b
 }
 
-func (b *buffer) Float642DArrayColumn(name string, values [][]float64) *buffer {
+func (b *buffer) Float64Array2DColumn(name string, values [][]float64) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -635,11 +637,21 @@ func (b *buffer) Float642DArrayColumn(name string, values [][]float64) *buffer {
 		return b
 	}
 
+	if values == nil {
+		b.writeNullArray()
+		return b
+	}
+
 	// Validate array shape
 	dim1 := len(values)
 	var dim2 int
 	if dim1 > 0 {
 		dim2 = len(values[0])
+		totalElements := dim1 * dim2
+		if dim1 > MaxArrayElements || dim2 > MaxArrayElements || totalElements > MaxArrayElements || totalElements < 0 {
+			b.lastErr = fmt.Errorf("array size %d exceeds maximum limit %d", totalElements, MaxArrayElements)
+			return b
+		}
 		for i, row := range values {
 			if len(row) != dim2 {
 				b.lastErr = fmt.Errorf("irregular 2D array shape: row %d has length %d, expected %d", i, len(row), dim2)
@@ -651,8 +663,8 @@ func (b *buffer) Float642DArrayColumn(name string, values [][]float64) *buffer {
 	b.writeFloat64ArrayHeader(2)
 
 	// Write shape
-	b.writeUint32(uint32(dim1))
-	b.writeUint32(uint32(dim2))
+	b.writeInt32(int32(dim1))
+	b.writeInt32(int32(dim2))
 
 	// Write values
 	for _, row := range values {
@@ -665,12 +677,17 @@ func (b *buffer) Float642DArrayColumn(name string, values [][]float64) *buffer {
 	return b
 }
 
-func (b *buffer) Float643DArrayColumn(name string, values [][][]float64) *buffer {
+func (b *buffer) Float64Array3DColumn(name string, values [][][]float64) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
 	if b.lastErr != nil {
+		return b
+	}
+
+	if values == nil {
+		b.writeNullArray()
 		return b
 	}
 
@@ -681,6 +698,11 @@ func (b *buffer) Float643DArrayColumn(name string, values [][][]float64) *buffer
 		dim2 = len(values[0])
 		if dim2 > 0 {
 			dim3 = len(values[0][0])
+		}
+		totalElements := dim1 * dim2 * dim3
+		if dim1 > MaxArrayElements || dim2 > MaxArrayElements || dim3 > MaxArrayElements || totalElements > MaxArrayElements || totalElements < 0 {
+			b.lastErr = fmt.Errorf("array size %d exceeds maximum limit %d", totalElements, MaxArrayElements)
+			return b
 		}
 
 		for i, level1 := range values {
@@ -700,9 +722,9 @@ func (b *buffer) Float643DArrayColumn(name string, values [][][]float64) *buffer
 	b.writeFloat64ArrayHeader(3)
 
 	// Write shape
-	b.writeUint32(uint32(dim1))
-	b.writeUint32(uint32(dim2))
-	b.writeUint32(uint32(dim3))
+	b.writeInt32(int32(dim1))
+	b.writeInt32(int32(dim2))
+	b.writeInt32(int32(dim3))
 
 	// Write values
 	for _, level1 := range values {
@@ -717,7 +739,7 @@ func (b *buffer) Float643DArrayColumn(name string, values [][][]float64) *buffer
 	return b
 }
 
-func (b *buffer) Float64NDArrayColumn(name string, value *NdArray[float64]) *buffer {
+func (b *buffer) Float64ArrayNDColumn(name string, value *NdArray[float64]) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -726,25 +748,23 @@ func (b *buffer) Float64NDArrayColumn(name string, value *NdArray[float64]) *buf
 		return b
 	}
 
-	// Validate the NdArray
 	if value == nil {
-		b.lastErr = fmt.Errorf("NDArray cannot be nil")
+		b.writeNullArray()
 		return b
 	}
 
 	shape := value.Shape()
 	numDims := value.NDims()
-
 	// Write nDims
 	b.writeFloat64ArrayHeader(byte(numDims))
 
 	// Write shape
 	for _, dim := range shape {
-		b.writeUint32(uint32(dim))
+		b.writeInt32(int32(dim))
 	}
 
 	// Write data
-	data := value.GetData()
+	data := value.Data()
 	if len(data) > 0 {
 		b.writeFloat64Data(data)
 	}
@@ -826,4 +846,20 @@ func (b *buffer) At(ts time.Time, sendTs bool) error {
 	b.msgCount++
 	b.resetMsgFlags()
 	return nil
+}
+
+func (b *buffer) writeFloat64ArrayHeader(dims byte) {
+	b.WriteByte('=')
+	b.WriteByte('=')
+	b.WriteByte(byte(arrayCode))
+	b.WriteByte(byte(arrayElemDouble))
+	b.WriteByte(dims)
+}
+
+func (b *buffer) writeNullArray() {
+	b.WriteByte('=')
+	b.WriteByte('=')
+	b.WriteByte(byte(arrayCode))
+	b.WriteByte(byte(arrayElemNull))
+	b.hasFields = true
 }

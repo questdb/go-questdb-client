@@ -8,9 +8,6 @@ import (
 const (
 	// MaxDimensions defines the maximum dims of NdArray
 	MaxDimensions = 32
-
-	// MaxElements defines the maximum total number of elements of NdArray
-	MaxElements = (1 << 28) - 1
 )
 
 // Numeric represents the constraint for numeric types that can be used in NdArray
@@ -18,14 +15,23 @@ type Numeric interface {
 	~float64
 }
 
-// NdArray represents a generic n-dimensional array with shape validation
+// NdArray represents a generic n-dimensional array with shape validation.
+// It's designed to be used with the [LineSender.Float64ArrayNDColumn] method for sending
+// multi-dimensional arrays to QuestDB via the ILP protocol.
+//
+// NdArray instances are meant to be reused across multiple calls to the sender
+// to avoid memory allocations. Use Append to populate data and
+// ResetAppendIndex to reset the array for reuse after sending data.
+//
+// By default, all values in the array are initialized to zero.
 type NdArray[T Numeric] struct {
 	data        []T
 	shape       []uint
 	appendIndex uint
 }
 
-// NewNDArray creates a new NdArray with the specified shape
+// NewNDArray creates a new NdArray with the specified shape.
+// All elements are initialized to zero by default.
 func NewNDArray[T Numeric](shape ...uint) (*NdArray[T], error) {
 	if err := validateShape(shape); err != nil {
 		return nil, fmt.Errorf("invalid shape: %w", err)
@@ -109,7 +115,22 @@ func (n *NdArray[T]) Reshape(newShape ...uint) (*NdArray[T], error) {
 	return newArray, nil
 }
 
-// Append adds a value to the array sequentially
+// Append adds a value to the array sequentially at the current append index.
+// Returns true if there's more space for additional values, false if the array is now full.
+// Use ResetAppendIndex() to reuse the array for multiple ILP messages.
+//
+// Example:
+//
+//	arr, _ := NewNDArray[float64](2, 3) // 2x3 array (6 elements total)
+//	hasMore, _ := arr.Append(1.0)       // hasMore = true, index now at 1
+//	hasMore, _ = arr.Append(2.0)        // hasMore = true, index now at 2
+//	// ... append 4 more values
+//	hasMore, _ = arr.Append(6.0)        // hasMore = false, array is full
+//
+//	// To reuse the array:
+//	arr.ResetAppendIndex()
+//	arr.Append(10.0)                    // overwrites
+//	...
 func (n *NdArray[T]) Append(val T) (bool, error) {
 	if n.appendIndex >= uint(len(n.data)) {
 		return false, errors.New("array is full")
@@ -119,13 +140,27 @@ func (n *NdArray[T]) Append(val T) (bool, error) {
 	return n.appendIndex < uint(len(n.data)), nil
 }
 
-// ResetAppendIndex resets the append index to 0
+// ResetAppendIndex resets the append index to 0, allowing the NdArray to be reused
+// for multiple append operations. This is useful for reusing arrays across multiple
+// messages/rows ingestion without reallocating memory.
+//
+// Example:
+//
+//	arr, _ := NewNDArray[float64](2) // 1D array with 3 elements
+//	arr.Append(2.0)
+//	arr.Append(3.0) // array is now full
+//
+//	// sender.Float64ArrayNDColumn(arr)
+//
+//	arr.ResetAppendIndex() // reset for reuse
+//	arr.Append(4.0)
+//	arr.Append(5.0)
 func (n *NdArray[T]) ResetAppendIndex() {
 	n.appendIndex = 0
 }
 
-// GetData returns the underlying data slice
-func (n *NdArray[T]) GetData() []T {
+// Data returns the underlying data slice
+func (n *NdArray[T]) Data() []T {
 	return n.data
 }
 
@@ -137,9 +172,7 @@ func (n *NdArray[T]) Fill(value T) {
 	n.appendIndex = uint(len(n.data)) // Mark as full
 }
 
-// positionsToIndex converts multi-dimensional positions to a flat index
 func (n *NdArray[T]) positionsToIndex(positions []uint) (int, error) {
-	// Validate positions are within bounds
 	for i, pos := range positions {
 		if pos >= n.shape[i] {
 			return 0, fmt.Errorf("position[%d]=%d is out of bounds for dimension size %d",
@@ -147,7 +180,6 @@ func (n *NdArray[T]) positionsToIndex(positions []uint) (int, error) {
 		}
 	}
 
-	// Calculate flat index
 	index := 0
 	for i, pos := range positions {
 		index += int(pos) * int(product(n.shape[i+1:]))
@@ -155,29 +187,25 @@ func (n *NdArray[T]) positionsToIndex(positions []uint) (int, error) {
 	return index, nil
 }
 
-// validateShape validates that shape dimensions are valid
 func validateShape(shape []uint) error {
 	if len(shape) == 0 {
 		return errors.New("shape cannot be empty")
 	}
 
-	// Check maximum dimensions limit
 	if len(shape) > MaxDimensions {
 		return fmt.Errorf("too many dimensions: %d exceeds maximum of %d",
 			len(shape), MaxDimensions)
 	}
 
-	// Check maximum elements limit
 	totalElements := product(shape)
-	if totalElements > MaxElements {
+	if totalElements > MaxArrayElements {
 		return fmt.Errorf("array too large: %d elements exceeds maximum of %d",
-			totalElements, MaxElements)
+			totalElements, MaxArrayElements)
 	}
 
 	return nil
 }
 
-// product calculates the product of slice elements
 func product(s []uint) uint {
 	if len(s) == 0 {
 		return 0

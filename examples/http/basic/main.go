@@ -35,32 +35,25 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	hasMore := true
-	val := 100.0
-	for hasMore {
-		hasMore, err = array.Append(val + 1)
-		val = val + 1
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
+	// Fill array with value 87.2
+	array.Fill(87.2)
 	err = sender.
 		Table("trades").
 		Symbol("symbol", "ETH-USD").
 		Symbol("side", "sell").
 		Float64Column("price", 2615.54).
 		Float64Column("amount", 0.00044).
-		Float64NDArrayColumn("price_history", array).
+		Float64ArrayNDColumn("price_history", array).
 		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Reuse array
-	hasMore = true
+	// `Append` value to array
+	hasMore := true
 	array.ResetAppendIndex()
-	val = 200.0
+	val := 200.0
 	for hasMore {
 		hasMore, err = array.Append(val + 1)
 		val = val + 1
@@ -78,7 +71,7 @@ func main() {
 		Symbol("side", "sell").
 		Float64Column("price", 39269.98).
 		Float64Column("amount", 0.001).
-		Float64NDArrayColumn("price_history", array).
+		Float64ArrayNDColumn("price_history", array).
 		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)

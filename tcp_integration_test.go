@@ -374,10 +374,10 @@ func (suite *integrationTestSuite) TestDoubleArrayColumn() {
 
 	err = sender.
 		Table(testTable).
-		Float641DArrayColumn("array_1d", values1D).
-		Float642DArrayColumn("array_2d", values2D).
-		Float643DArrayColumn("array_3d", values3D).
-		Float64NDArrayColumn("array_nd", arrayND).
+		Float64Array1DColumn("array_1d", values1D).
+		Float64Array2DColumn("array_2d", values2D).
+		Float64Array3DColumn("array_3d", values3D).
+		Float64ArrayNDColumn("array_nd", arrayND).
 		At(ctx, time.UnixMicro(1))
 	assert.NoError(suite.T(), err)
 
