@@ -45,8 +45,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Reuse array
-	// `Append` value to array
+	// Reuse array by resetting index and appending new values sequentially
 	hasMore := true
 	array.ResetAppendIndex()
 	val := 200.0
