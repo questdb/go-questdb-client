@@ -777,6 +777,7 @@ func TestAutoDetectProtocolVersionOldServer1(t *testing.T) {
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion1)
+	assert.NoError(t, err)
 }
 
 func TestAutoDetectProtocolVersionOldServer2(t *testing.T) {
@@ -787,6 +788,7 @@ func TestAutoDetectProtocolVersionOldServer2(t *testing.T) {
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion1)
+	assert.NoError(t, err)
 }
 
 func TestAutoDetectProtocolVersionOldServer3(t *testing.T) {
@@ -797,6 +799,7 @@ func TestAutoDetectProtocolVersionOldServer3(t *testing.T) {
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion1)
+	assert.NoError(t, err)
 }
 
 func TestAutoDetectProtocolVersionNewServer1(t *testing.T) {
@@ -807,6 +810,7 @@ func TestAutoDetectProtocolVersionNewServer1(t *testing.T) {
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion2)
+	assert.NoError(t, err)
 }
 
 func TestAutoDetectProtocolVersionNewServer2(t *testing.T) {
@@ -817,6 +821,7 @@ func TestAutoDetectProtocolVersionNewServer2(t *testing.T) {
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion2)
+	assert.NoError(t, err)
 }
 
 func TestAutoDetectProtocolVersionNewServer3(t *testing.T) {
@@ -827,6 +832,7 @@ func TestAutoDetectProtocolVersionNewServer3(t *testing.T) {
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion2)
+	assert.NoError(t, err)
 }
 
 func TestAutoDetectProtocolVersionNewServer4(t *testing.T) {
@@ -857,6 +863,7 @@ func TestSpecifyProtocolVersion(t *testing.T) {
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
 	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion1)
+	assert.NoError(t, err)
 }
 
 func TestArrayColumnUnsupportedInHttpProtocolV1(t *testing.T) {
