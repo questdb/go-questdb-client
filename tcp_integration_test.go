@@ -56,6 +56,7 @@ func (suite *integrationTestSuite) TestE2EWriteInBatches() {
 	assert.NoError(suite.T(), err)
 	if questdbC == nil {
 		assert.Fail(suite.T(), "fail to start QuestDB")
+		return
 	}
 	defer questdbC.Stop(ctx)
 
