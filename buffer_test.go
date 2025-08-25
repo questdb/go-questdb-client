@@ -635,7 +635,7 @@ func TestFloat64Array2DColumnExceedsMaxElements(t *testing.T) {
 	}
 
 	err := buf.Table(testTable).Float64Array2DColumn("array_col", values).At(time.Time{}, false)
-	assert.ErrorContains(t, err, "array size 268500992 exceeds maximum limit 268435455")
+	assert.ErrorContains(t, err, "array size 268435456 exceeds maximum limit 268435455")
 	assert.Empty(t, buf.Messages())
 }
 
