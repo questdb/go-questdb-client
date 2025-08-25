@@ -54,6 +54,9 @@ func (suite *integrationTestSuite) TestE2EWriteInBatches() {
 
 	questdbC, err := setupQuestDB(ctx, noAuth)
 	assert.NoError(suite.T(), err)
+	if questdbC == nil {
+		assert.Fail(suite.T(), "fail to start QuestDB")
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
