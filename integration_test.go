@@ -74,14 +74,19 @@ func (c *questdbContainer) Stop(ctx context.Context) error {
 			return err
 		}
 	}
-	err := c.Terminate(ctx)
-	if err != nil {
-		return err
+	if c.Container != nil {
+		err := c.Terminate(ctx)
+		if err != nil {
+			return err
+		}
 	}
-	err = c.network.Remove(ctx)
-	if err != nil {
-		return err
+	if c.network != nil {
+		err := c.network.Remove(ctx)
+		if err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
