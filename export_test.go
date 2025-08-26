@@ -74,7 +74,7 @@ func Messages(s LineSender) []byte {
 
 func MsgCount(s LineSender) int {
 	if ps, ok := s.(*pooledSender); ok {
-		s = ps
+		s = ps.wrapped
 	}
 	if hs, ok := s.(*httpLineSender); ok {
 		return hs.MsgCount()
@@ -93,7 +93,7 @@ func MsgCount(s LineSender) int {
 
 func BufLen(s LineSender) int {
 	if ps, ok := s.(*pooledSender); ok {
-		s = ps
+		s = ps.wrapped
 	}
 	if hs, ok := s.(*httpLineSender); ok {
 		return hs.BufLen()
@@ -112,7 +112,7 @@ func BufLen(s LineSender) int {
 
 func ProtocolVersion(s LineSender) protocolVersion {
 	if ps, ok := s.(*pooledSender); ok {
-		s = ps
+		s = ps.wrapped
 	}
 	if _, ok := s.(*httpLineSender); ok {
 		return ProtocolVersion1
