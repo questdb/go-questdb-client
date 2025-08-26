@@ -53,11 +53,17 @@ func (suite *integrationTestSuite) TestE2EWriteInBatches() {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer sender.Close(ctx)
 	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
@@ -67,10 +73,16 @@ func (suite *integrationTestSuite) TestE2EWriteInBatches() {
 				Table(testTable).
 				Int64Column("long_col", int64(j)).
 				At(ctx, time.UnixMicro(int64(i*nBatch+j)))
-			assert.NoError(suite.T(), err)
+			if err != nil {
+				assert.Fail(suite.T(), err.Error())
+				return
+			}
 		}
 		err = sender.Flush(ctx)
-		assert.NoError(suite.T(), err)
+		if err != nil {
+			assert.Fail(suite.T(), err.Error())
+			return
+		}
 	}
 
 	expected := tableData{
@@ -107,11 +119,17 @@ func (suite *integrationTestSuite) TestE2EImplicitFlush() {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithInitBufferSize(bufCap))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer sender.Close(ctx)
 	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
@@ -120,7 +138,10 @@ func (suite *integrationTestSuite) TestE2EImplicitFlush() {
 			Table(testTable).
 			BoolColumn("b", true).
 			AtNow(ctx)
-		assert.NoError(suite.T(), err)
+		if err != nil {
+			assert.Fail(suite.T(), err.Error())
+			return
+		}
 	}
 
 	assert.Eventually(suite.T(), func() bool {
@@ -138,7 +159,10 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuth() {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, authEnabled)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -147,23 +171,35 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuth() {
 		qdb.WithAddress(questdbC.ilpAddress),
 		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 	)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	dropTable(suite.T(), testTable, questdbC.httpAddress)
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
 		At(ctx, time.UnixMicro(2))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.Flush(ctx)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	// Close the connection to make sure that ILP messages are written. That's because
 	// the server may not write messages that are received immediately after the signed
@@ -196,7 +232,10 @@ func (suite *integrationTestSuite) TestE2EFailedAuth() {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, authEnabled)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -205,7 +244,10 @@ func (suite *integrationTestSuite) TestE2EFailedAuth() {
 		qdb.WithAddress(questdbC.ilpAddress),
 		qdb.WithAuth("wrongKeyId", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 	)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer sender.Close(ctx)
 
 	err = sender.
@@ -245,7 +287,10 @@ func (suite *integrationTestSuite) TestE2EWritesWithTlsProxy() {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDBWithProxy(ctx, noAuth)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -254,7 +299,10 @@ func (suite *integrationTestSuite) TestE2EWritesWithTlsProxy() {
 		qdb.WithAddress(questdbC.proxyIlpTcpAddress), // We're sending data through proxy.
 		qdb.WithTlsInsecureSkipVerify(),
 	)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer sender.Close(ctx)
 	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
@@ -262,16 +310,25 @@ func (suite *integrationTestSuite) TestE2EWritesWithTlsProxy() {
 		Table(testTable).
 		StringColumn("str_col", "foobar").
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
 		At(ctx, time.UnixMicro(2))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.Flush(ctx)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	expected := tableData{
 		Columns: []column{
@@ -299,7 +356,10 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuthWithTlsProxy() {
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDBWithProxy(ctx, authEnabled)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -309,23 +369,35 @@ func (suite *integrationTestSuite) TestE2ESuccessfulAuthWithTlsProxy() {
 		qdb.WithAuth("testUser1", "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48"),
 		qdb.WithTlsInsecureSkipVerify(),
 	)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
 		At(ctx, time.UnixMicro(2))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.Flush(ctx)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	// Close the connection to make sure that ILP messages are written. That's because
 	// the server may not write messages that are received immediately after the signed
@@ -357,11 +429,17 @@ func (suite *integrationTestSuite) TestDoubleArrayColumn() {
 
 	ctx := context.Background()
 	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer sender.Close(ctx)
 	dropTable(suite.T(), testTable, questdbC.httpAddress)
 
@@ -369,7 +447,10 @@ func (suite *integrationTestSuite) TestDoubleArrayColumn() {
 	values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
 	values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
 	arrayND, err := qdb.NewNDArray[float64](2, 2, 1, 2)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	arrayND.Fill(11.0)
 
 	err = sender.
@@ -379,10 +460,16 @@ func (suite *integrationTestSuite) TestDoubleArrayColumn() {
 		Float64Array3DColumn("array_3d", values3D).
 		Float64ArrayNDColumn("array_nd", arrayND).
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.Flush(ctx)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	// Expected results
 	expected := tableData{

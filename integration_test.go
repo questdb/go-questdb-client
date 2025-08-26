@@ -140,7 +140,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	req := testcontainers.ContainerRequest{
 		Image:          "questdb/questdb:9.0.2",
 		ExposedPorts:   []string{"9000/tcp", "9009/tcp"},
-		WaitingFor:     wait.ForHTTP("/").WithPort("9000"),
+		WaitingFor:     wait.ForHTTP("/ping").WithPort("9000"),
 		Networks:       []string{networkName},
 		NetworkAliases: map[string][]string{networkName: {"questdb"}},
 		Env:            env,
@@ -155,7 +155,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	newNetwork, err := testcontainers.GenericNetwork(ctx, testcontainers.GenericNetworkRequest{
 		NetworkRequest: testcontainers.NetworkRequest{
 			Name:           networkName,
-			CheckDuplicate: false,
+			CheckDuplicate: true,
 		},
 	})
 	if err != nil {
