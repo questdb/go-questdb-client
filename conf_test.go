@@ -29,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
+	qdb "github.com/questdb/go-questdb-client/v4"
 	"github.com/stretchr/testify/assert"
 )
 

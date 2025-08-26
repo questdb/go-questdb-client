@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
+	qdb "github.com/questdb/go-questdb-client/v4"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -64,6 +64,7 @@ func (suite *integrationTestSuite) TestE2ESuccessfulHttpBasicAuthWithTlsProxy() 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
+		Float64Array1DColumn("arr_col", []float64{1.0, 2.0, 3.0}).
 		At(ctx, time.UnixMicro(1))
 	if err != nil {
 		assert.Fail(suite.T(), err.Error())
@@ -88,11 +89,12 @@ func (suite *integrationTestSuite) TestE2ESuccessfulHttpBasicAuthWithTlsProxy() 
 	expected := tableData{
 		Columns: []column{
 			{"str_col", "VARCHAR"},
+			{"arr_col", "ARRAY"},
 			{"timestamp", "TIMESTAMP"},
 		},
 		Dataset: [][]interface{}{
-			{"foobar", "1970-01-01T00:00:00.000001Z"},
-			{"barbaz", "1970-01-01T00:00:00.000002Z"},
+			{"foobar", []interface{}{float64(1), float64(2), float64(3)}, "1970-01-01T00:00:00.000001Z"},
+			{"barbaz", nil, "1970-01-01T00:00:00.000002Z"},
 		},
 		Count: 2,
 	}
@@ -110,18 +112,13 @@ func (suite *integrationTestSuite) TestServerSideError() {
 
 	ctx := context.Background()
 
-	var (
-		sender qdb.LineSender
-		err    error
-	)
-
 	questdbC, err := setupQuestDB(ctx, noAuth)
 	if err != nil {
 		assert.Fail(suite.T(), err.Error())
 		return
 	}
 
-	sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
 	if err != nil {
 		assert.Fail(suite.T(), err.Error())
 		return

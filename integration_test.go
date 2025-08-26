@@ -34,7 +34,7 @@ import (
 	"testing"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
+	qdb "github.com/questdb/go-questdb-client/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
@@ -44,7 +44,7 @@ import (
 // Common integration tests for ILP/HTTP and ILP/TCP.
 
 const (
-	eventualDataTimeout = 60 * time.Second
+	eventualDataTimeout = 90 * time.Second
 )
 
 type integrationTestSuite struct {

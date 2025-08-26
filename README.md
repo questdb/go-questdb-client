@@ -1,4 +1,4 @@
-[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
+[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
 
 # go-questdb-client
 
@@ -15,11 +15,10 @@ Features:
 * Automatic write retries and connection reuse for ILP over HTTP.
 * Tested against QuestDB 7.3.10 and newer versions.
 
-New in v3:
-* Supports ILP over HTTP using the same client semantics
+New in v4:
 * Supports n-dimensional arrays of doubles for QuestDB servers 9.0.0 and up
 
-Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3).
+Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4).
 
 ## Quickstart
 
@@ -31,7 +30,7 @@ import (
 	"log"
 	"time"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
+	qdb "github.com/questdb/go-questdb-client/v4"
 )
 
 func main() {
@@ -212,7 +211,7 @@ package main
 import (
 	"context"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
+	qdb "github.com/questdb/go-questdb-client/v4"
 )
 
 func main() {
@@ -242,54 +241,6 @@ func main() {
 	}
 }
 ```
-
-## Migration from v2
-
-v2 code example:
-```go
-package main
-
-import (
-	"context"
-
-	qdb "github.com/questdb/go-questdb-client/v2"
-)
-
-func main() {
-	// Connect to QuestDB running on 127.0.0.1:9009 (ILP/TCP)
-	sender, err := qdb.NewLineSender(context.TODO())
-	// ...
-	defer sender.Close()
-	// ...
-}
-```
-
-Migrated v3 code:
-```go
-package main
-
-import (
-	"context"
-
-	qdb "github.com/questdb/go-questdb-client/v3"
-)
-
-func main() {
-	// Connect to QuestDB running on 127.0.0.1:9000 (ILP/HTTP)
-	sender, err := qdb.NewLineSender(context.TODO(), qdb.WithHTTP())
-	// Alternatively, you can use the LineSenderFromConf function:
-	// sender, err := qdb.LineSenderFromConf(ctx, "http::addr=localhost:9000;")
-	// ...
-	// or you can export the "http::addr=localhost:9000;" config string to
-	// the QDB_CLIENT_CONF environment variable and use the LineSenderFromEnv function:
-	// sender, err := qdb.LineSenderFromEnv(ctx)
-	// ...
-	defer sender.Close(context.TODO())
-	// ...
-}
-```
-
-Note that the migrated code uses the HTTP sender instead of the TCP one.
 
 ## Community
 
