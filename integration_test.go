@@ -155,7 +155,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	newNetwork, err := testcontainers.GenericNetwork(ctx, testcontainers.GenericNetworkRequest{
 		NetworkRequest: testcontainers.NetworkRequest{
 			Name:           networkName,
-			CheckDuplicate: true,
+			CheckDuplicate: false,
 		},
 	})
 	if err != nil {
