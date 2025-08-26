@@ -4,13 +4,13 @@
   lang: go
   path: examples/tcp/basic/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
     and [repo](https://github.com/questdb/go-questdb-client).
 - name: ilp-auth
   lang: go
   path: examples/tcp/auth/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
     and [repo](https://github.com/questdb/go-questdb-client).
   auth:
     kid: testUser1
@@ -22,7 +22,7 @@
   lang: go
   path: examples/tcp/auth-and-tls/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
     and [repo](https://github.com/questdb/go-questdb-client).
   auth:
     kid: testUser1
@@ -34,6 +34,6 @@
   lang: go
   path: examples/from-conf/main.go
   header: |-
-    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v3)
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
     and [repo](https://github.com/questdb/go-questdb-client).
   conf: http::addr=localhost:9000;

@@ -37,7 +37,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	qdb "github.com/questdb/go-questdb-client/v3"
+	qdb "github.com/questdb/go-questdb-client/v4"
 )
 
 func (suite *integrationTestSuite) TestE2EWriteInBatches() {
