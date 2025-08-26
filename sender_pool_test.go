@@ -37,7 +37,7 @@ import (
 )
 
 func TestBasicBehavior(t *testing.T) {
-	p, err := qdb.PoolFromConf("http::addr=localhost:1234")
+	p, err := qdb.PoolFromConf("http::addr=localhost:1234;protocol_version=2;")
 	require.NoError(t, err)
 	ctx := context.Background()
 
@@ -104,7 +104,7 @@ func TestFlushOnClose(t *testing.T) {
 }
 
 func TestPooledSenderDoubleClose(t *testing.T) {
-	p, err := qdb.PoolFromConf("http::addr=localhost:1234")
+	p, err := qdb.PoolFromConf("http::addr=localhost:1234;protocol_version=1;")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -122,7 +122,7 @@ func TestPooledSenderDoubleClose(t *testing.T) {
 
 func TestMaxPoolSize(t *testing.T) {
 	// Create a pool with 2 max senders
-	p, err := qdb.PoolFromConf("http::addr=localhost:1234", qdb.WithMaxSenders(3))
+	p, err := qdb.PoolFromConf("http::addr=localhost:1234;protocol_version=1;", qdb.WithMaxSenders(3))
 	require.NoError(t, err)
 
 	ctx := context.Background()

@@ -162,6 +162,18 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			return nil, NewInvalidConfigStrError("tls_roots is not available in the go client")
 		case "tls_roots_password":
 			return nil, NewInvalidConfigStrError("tls_roots_password is not available in the go client")
+		case "protocol_version":
+			if v != "auto" {
+				version, err := strconv.Atoi(v)
+				if err != nil {
+					return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+				}
+				pVersion := protocolVersion(version)
+				if pVersion < ProtocolVersion1 || pVersion > ProtocolVersion2 {
+					return nil, NewInvalidConfigStrError("current client only supports protocol version 1 (text format for all datatypes), 2 (binary format for part datatypes) or explicitly unset")
+				}
+				senderConf.protocolVersion = pVersion
+			}
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}

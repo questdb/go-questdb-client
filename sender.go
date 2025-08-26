@@ -120,6 +120,64 @@ type LineSender interface {
 	// '-', '*' '%%', '~', or a non-printable char.
 	BoolColumn(name string, val bool) LineSender
 
+	// Float64Array1DColumn adds an array of 64-bit floats (double array) to the ILP message.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	Float64Array1DColumn(name string, values []float64) LineSender
+
+	// Float64Array2DColumn adds a 2D array of 64-bit floats (double 2D array) to the ILP message.
+	//
+	// The values parameter must have a regular (rectangular) shape - all rows must have
+	// exactly the same length. If the array has irregular shape, this method returns an error.
+	//
+	// Example of valid input:
+	//   values := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}  // 3x2 regular shape
+	//
+	// Example of invalid input:
+	//   values := [][]float64{{1.0, 2.0}, {3.0}, {4.0, 5.0, 6.0}}   // irregular shape - returns error
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	Float64Array2DColumn(name string, values [][]float64) LineSender
+
+	// Float64Array3DColumn adds a 3D array of 64-bit floats (double 3D array) to the ILP message.
+	//
+	// The values parameter must have a regular (cuboid) shape - all dimensions must have
+	// consistent sizes throughout. If the array has irregular shape, this method returns an error.
+	//
+	// Example of valid input:
+	//   values := [][][]float64{
+	//     {{1.0, 2.0}, {3.0, 4.0}},    // 2x2 matrix
+	//     {{5.0, 6.0}, {7.0, 8.0}},    // 2x2 matrix (same shape)
+	//   }  // 2x2x2 regular shape
+	//
+	// Example of invalid input:
+	//   values := [][][]float64{
+	//     {{1.0, 2.0}, {3.0, 4.0}},    // 2x2 matrix
+	//     {{5.0}, {6.0, 7.0, 8.0}},    // irregular matrix - returns error
+	//   }
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	Float64Array3DColumn(name string, values [][][]float64) LineSender
+
+	// Float64ArrayNDColumn adds an n-dimensional array of 64-bit floats (double n-D array) to the ILP message.
+	//
+	// Example usage:
+	//   // Create a 2x3x4 array
+	//   arr, _ := questdb.NewNDArray[float64](2, 3, 4)
+	//   arr.Fill(1.5)
+	//   sender.Float64ArrayNDColumn("ndarray_col", arr)
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender
+
 	// At sets the designated timestamp value and finalizes the ILP
 	// message.
 	//
@@ -189,6 +247,14 @@ const (
 	tlsInsecureSkipVerify tlsMode = 2
 )
 
+type protocolVersion int64
+
+const (
+	protocolVersionUnset protocolVersion = 0
+	ProtocolVersion1     protocolVersion = 1
+	ProtocolVersion2     protocolVersion = 2
+)
+
 type lineSenderConfig struct {
 	senderType    senderType
 	address       string
@@ -213,6 +279,8 @@ type lineSenderConfig struct {
 	// Auto-flush fields
 	autoFlushRows     int
 	autoFlushInterval time.Duration
+
+	protocolVersion protocolVersion
 }
 
 // LineSenderOption defines line sender config option.
@@ -404,6 +472,21 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 	}
 }
 
+// WithProtocolVersion sets the ingestion protocol version.
+//
+//   - HTTP transport automatically negotiates the protocol version by default(unset, STRONGLY RECOMMENDED).
+//     You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
+//   - TCP transport does not negotiate the protocol version and uses [ProtocolVersion1] by
+//     default. You must explicitly set [ProtocolVersion2] in order to ingest
+//     arrays.
+//
+// NOTE: QuestDB server version 9.0.0 or later is required for [ProtocolVersion2].
+func WithProtocolVersion(version protocolVersion) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.protocolVersion = version
+	}
+}
+
 // LineSenderFromEnv creates a LineSender with a config string defined by the QDB_CLIENT_CONF
 // environment variable. See LineSenderFromConf for the config string format.
 //
@@ -556,7 +639,7 @@ func newLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, err
 		if err != nil {
 			return nil, err
 		}
-		return newHttpLineSender(conf)
+		return newHttpLineSender(ctx, conf)
 	}
 	return nil, errors.New("sender type is not specified: use WithHttp or WithTcp")
 }
@@ -637,6 +720,10 @@ func validateConf(conf *lineSenderConfig) error {
 	}
 	if conf.autoFlushInterval < 0 {
 		return fmt.Errorf("auto flush interval is negative: %d", conf.autoFlushInterval)
+	}
+	if conf.protocolVersion < protocolVersionUnset || conf.protocolVersion > ProtocolVersion2 {
+		return errors.New("current client only supports protocol version 1(text format for all datatypes), " +
+			"2(binary format for part datatypes) or explicitly unset")
 	}
 
 	return nil

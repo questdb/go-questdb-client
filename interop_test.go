@@ -75,7 +75,7 @@ func TestTcpClientInterop(t *testing.T) {
 			srv, err := newTestTcpServer(sendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()))
+			sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
 			assert.NoError(t, err)
 
 			sender.Table(tc.Table)
@@ -129,7 +129,7 @@ func TestHttpClientInterop(t *testing.T) {
 			srv, err := newTestHttpServer(sendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+			sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
 			assert.NoError(t, err)
 
 			sender.Table(tc.Table)

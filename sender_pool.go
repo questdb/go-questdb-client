@@ -181,7 +181,7 @@ func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
 				return nil, errHttpOnlySender
 			}
 		}
-		s, err = newHttpLineSender(conf)
+		s, err = newHttpLineSender(ctx, conf)
 	}
 
 	if err != nil {
@@ -321,6 +321,26 @@ func (ps *pooledSender) StringColumn(name, val string) LineSender {
 
 func (ps *pooledSender) BoolColumn(name string, val bool) LineSender {
 	ps.wrapped.BoolColumn(name, val)
+	return ps
+}
+
+func (ps *pooledSender) Float64Array1DColumn(name string, values []float64) LineSender {
+	ps.wrapped.Float64Array1DColumn(name, values)
+	return ps
+}
+
+func (ps *pooledSender) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	ps.wrapped.Float64Array2DColumn(name, values)
+	return ps
+}
+
+func (ps *pooledSender) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	ps.wrapped.Float64Array3DColumn(name, values)
+	return ps
+}
+
+func (ps *pooledSender) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	ps.wrapped.Float64ArrayNDColumn(name, values)
 	return ps
 }
 

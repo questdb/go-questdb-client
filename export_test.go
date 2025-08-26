@@ -53,11 +53,20 @@ func ConfFromStr(conf string) (*LineSenderConfig, error) {
 	return confFromStr(conf)
 }
 
-func Messages(s LineSender) string {
+func Messages(s LineSender) []byte {
+	if ps, ok := s.(*pooledSender); ok {
+		s = ps.wrapped
+	}
 	if hs, ok := s.(*httpLineSender); ok {
 		return hs.Messages()
 	}
+	if hs, ok := s.(*httpLineSenderV2); ok {
+		return hs.Messages()
+	}
 	if ts, ok := s.(*tcpLineSender); ok {
+		return ts.Messages()
+	}
+	if ts, ok := s.(*tcpLineSenderV2); ok {
 		return ts.Messages()
 	}
 	panic("unexpected struct")
@@ -65,28 +74,65 @@ func Messages(s LineSender) string {
 
 func MsgCount(s LineSender) int {
 	if ps, ok := s.(*pooledSender); ok {
-		hs, _ := ps.wrapped.(*httpLineSender)
-		return hs.MsgCount()
+		s = ps.wrapped
 	}
 	if hs, ok := s.(*httpLineSender); ok {
 		return hs.MsgCount()
 	}
+	if hs, ok := s.(*httpLineSenderV2); ok {
+		return hs.MsgCount()
+	}
 	if ts, ok := s.(*tcpLineSender); ok {
+		return ts.MsgCount()
+	}
+	if ts, ok := s.(*tcpLineSenderV2); ok {
 		return ts.MsgCount()
 	}
 	panic("unexpected struct")
 }
 
 func BufLen(s LineSender) int {
+	if ps, ok := s.(*pooledSender); ok {
+		s = ps.wrapped
+	}
 	if hs, ok := s.(*httpLineSender); ok {
+		return hs.BufLen()
+	}
+	if hs, ok := s.(*httpLineSenderV2); ok {
 		return hs.BufLen()
 	}
 	if ts, ok := s.(*tcpLineSender); ok {
 		return ts.BufLen()
+	}
+	if ts, ok := s.(*tcpLineSenderV2); ok {
+		return ts.BufLen()
+	}
+	panic("unexpected struct")
+}
+
+func ProtocolVersion(s LineSender) protocolVersion {
+	if ps, ok := s.(*pooledSender); ok {
+		s = ps.wrapped
+	}
+	if _, ok := s.(*httpLineSender); ok {
+		return ProtocolVersion1
+	}
+	if _, ok := s.(*httpLineSenderV2); ok {
+		return ProtocolVersion2
+	}
+	if _, ok := s.(*tcpLineSender); ok {
+		return ProtocolVersion1
+	}
+	if _, ok := s.(*tcpLineSenderV2); ok {
+		return ProtocolVersion2
 	}
 	panic("unexpected struct")
 }
 
 func NewLineSenderConfig(t SenderType) *LineSenderConfig {
 	return newLineSenderConfig(t)
+}
+
+func SetLittleEndian(littleEndian bool) {
+	isLittleEndian = littleEndian
 }

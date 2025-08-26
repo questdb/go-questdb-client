@@ -42,7 +42,10 @@ func (suite *integrationTestSuite) TestE2ESuccessfulHttpBasicAuthWithTlsProxy() 
 	ctx := context.Background()
 
 	questdbC, err := setupQuestDB(ctx, httpBasicAuth)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer questdbC.Stop(ctx)
 
 	sender, err := qdb.NewLineSender(
@@ -52,27 +55,39 @@ func (suite *integrationTestSuite) TestE2ESuccessfulHttpBasicAuthWithTlsProxy() 
 		qdb.WithBasicAuth(basicAuthUser, basicAuthPass),
 		qdb.WithTlsInsecureSkipVerify(),
 	)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	defer sender.Close(ctx)
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "foobar").
 		At(ctx, time.UnixMicro(1))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.
 		Table(testTable).
 		StringColumn("str_col", "barbaz").
 		At(ctx, time.UnixMicro(2))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.Flush(ctx)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	expected := tableData{
 		Columns: []column{
-			{"str_col", "STRING"},
+			{"str_col", "VARCHAR"},
 			{"timestamp", "TIMESTAMP"},
 		},
 		Dataset: [][]interface{}{
@@ -101,19 +116,34 @@ func (suite *integrationTestSuite) TestServerSideError() {
 	)
 
 	questdbC, err := setupQuestDB(ctx, noAuth)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	err = sender.Table(testTable).Int64Column("long_col", 42).AtNow(ctx)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	err = sender.Flush(ctx)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 
 	// Now, use wrong type for the long_col.
 	err = sender.Table(testTable).StringColumn("long_col", "42").AtNow(ctx)
-	assert.NoError(suite.T(), err)
+	if err != nil {
+		assert.Fail(suite.T(), err.Error())
+		return
+	}
 	err = sender.Flush(ctx)
 	assert.Error(suite.T(), err)
 	assert.ErrorContains(suite.T(), err, "my_test_table, column: long_col; cast error from protocol type: STRING to column type")

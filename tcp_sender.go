@@ -33,6 +33,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -45,7 +46,11 @@ type tcpLineSender struct {
 	conn    net.Conn
 }
 
-func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (*tcpLineSender, error) {
+type tcpLineSenderV2 struct {
+	tcpLineSender
+}
+
+func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
 	var (
 		d    net.Dialer
 		key  *ecdsa.PrivateKey
@@ -131,7 +136,13 @@ func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (*tcpLineSend
 
 	s.conn = conn
 
-	return s, nil
+	if conf.protocolVersion == protocolVersionUnset || conf.protocolVersion == ProtocolVersion1 {
+		return s, nil
+	} else {
+		return &tcpLineSenderV2{
+			*s,
+		}, nil
+	}
 }
 
 func (s *tcpLineSender) Close(_ context.Context) error {
@@ -180,6 +191,26 @@ func (s *tcpLineSender) StringColumn(name, val string) LineSender {
 
 func (s *tcpLineSender) BoolColumn(name string, val bool) LineSender {
 	s.buf.BoolColumn(name, val)
+	return s
+}
+
+func (s *tcpLineSender) Float64Array1DColumn(name string, values []float64) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
+	return s
+}
+
+func (s *tcpLineSender) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
+	return s
+}
+
+func (s *tcpLineSender) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
+	return s
+}
+
+func (s *tcpLineSender) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
 	return s
 }
 
@@ -240,9 +271,9 @@ func (s *tcpLineSender) At(ctx context.Context, ts time.Time) error {
 	return nil
 }
 
-// Messages returns a copy of accumulated ILP messages that are not
+// Messages returns the accumulated ILP messages that are not
 // flushed to the TCP connection yet. Useful for debugging purposes.
-func (s *tcpLineSender) Messages() string {
+func (s *tcpLineSender) Messages() []byte {
 	return s.buf.Messages()
 }
 
@@ -254,4 +285,64 @@ func (s *tcpLineSender) MsgCount() int {
 // BufLen returns the number of bytes written to the buffer.
 func (s *tcpLineSender) BufLen() int {
 	return s.buf.Len()
+}
+
+func (s *tcpLineSenderV2) Table(name string) LineSender {
+	s.buf.Table(name)
+	return s
+}
+
+func (s *tcpLineSenderV2) Symbol(name, val string) LineSender {
+	s.buf.Symbol(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV2) Int64Column(name string, val int64) LineSender {
+	s.buf.Int64Column(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV2) Long256Column(name string, val *big.Int) LineSender {
+	s.buf.Long256Column(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV2) TimestampColumn(name string, ts time.Time) LineSender {
+	s.buf.TimestampColumn(name, ts)
+	return s
+}
+
+func (s *tcpLineSenderV2) StringColumn(name, val string) LineSender {
+	s.buf.StringColumn(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV2) BoolColumn(name string, val bool) LineSender {
+	s.buf.BoolColumn(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV2) Float64Column(name string, val float64) LineSender {
+	s.buf.Float64ColumnBinary(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV2) Float64Array1DColumn(name string, values []float64) LineSender {
+	s.buf.Float64Array1DColumn(name, values)
+	return s
+}
+
+func (s *tcpLineSenderV2) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	s.buf.Float64Array2DColumn(name, values)
+	return s
+}
+
+func (s *tcpLineSenderV2) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	s.buf.Float64Array3DColumn(name, values)
+	return s
+}
+
+func (s *tcpLineSenderV2) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	s.buf.Float64ArrayNDColumn(name, values)
+	return s
 }

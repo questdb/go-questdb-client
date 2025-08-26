@@ -27,12 +27,21 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Prepare array data.
+	// QuestDB server version 9.0.0 or later is required for array support.
+	array, err := qdb.NewNDArray[float64](2, 3, 2)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Fill array with value 87.2
+	array.Fill(87.2)
 	err = sender.
 		Table("trades").
 		Symbol("symbol", "ETH-USD").
 		Symbol("side", "sell").
 		Float64Column("price", 2615.54).
 		Float64Column("amount", 0.00044).
+		Float64ArrayNDColumn("price_history", array).
 		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)
@@ -42,12 +51,25 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Reuse array by resetting index and appending new values sequentially
+	hasMore := true
+	array.ResetAppendIndex()
+	val := 200.0
+	for hasMore {
+		hasMore, err = array.Append(val + 1)
+		val = val + 1
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	err = sender.
 		Table("trades").
 		Symbol("symbol", "BTC-USD").
 		Symbol("side", "sell").
 		Float64Column("price", 39269.98).
 		Float64Column("amount", 0.001).
+		Float64ArrayNDColumn("price_history", array).
 		At(ctx, tradedTs)
 	if err != nil {
 		log.Fatal(err)

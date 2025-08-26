@@ -53,12 +53,14 @@ const (
 )
 
 type testServer struct {
-	addr        string
-	tcpListener net.Listener
-	serverType  serverType
-	BackCh      chan string
-	closeCh     chan struct{}
-	wg          sync.WaitGroup
+	addr              string
+	tcpListener       net.Listener
+	serverType        serverType
+	protocolVersions  []int
+	BackCh            chan string
+	closeCh           chan struct{}
+	wg                sync.WaitGroup
+	settingsReqErrMsg string
 }
 
 func (t *testServer) Addr() string {
@@ -66,24 +68,42 @@ func (t *testServer) Addr() string {
 }
 
 func newTestTcpServer(serverType serverType) (*testServer, error) {
-	return newTestServerWithProtocol(serverType, "tcp")
+	return newTestServerWithProtocol(serverType, "tcp", []int{})
 }
 
 func newTestHttpServer(serverType serverType) (*testServer, error) {
-	return newTestServerWithProtocol(serverType, "http")
+	return newTestServerWithProtocol(serverType, "http", []int{1, 2})
 }
 
-func newTestServerWithProtocol(serverType serverType, protocol string) (*testServer, error) {
+func newTestHttpServerWithErrMsg(serverType serverType, errMsg string) (*testServer, error) {
 	tcp, err := net.Listen("tcp", "127.0.0.1:")
 	if err != nil {
 		return nil, err
 	}
 	s := &testServer{
-		addr:        tcp.Addr().String(),
-		tcpListener: tcp,
-		serverType:  serverType,
-		BackCh:      make(chan string, 1000),
-		closeCh:     make(chan struct{}),
+		addr:              tcp.Addr().String(),
+		tcpListener:       tcp,
+		serverType:        serverType,
+		BackCh:            make(chan string, 1000),
+		closeCh:           make(chan struct{}),
+		settingsReqErrMsg: errMsg,
+	}
+	go s.serveHttp()
+	return s, nil
+}
+
+func newTestServerWithProtocol(serverType serverType, protocol string, protocolVersions []int) (*testServer, error) {
+	tcp, err := net.Listen("tcp", "127.0.0.1:")
+	if err != nil {
+		return nil, err
+	}
+	s := &testServer{
+		addr:             tcp.Addr().String(),
+		tcpListener:      tcp,
+		serverType:       serverType,
+		BackCh:           make(chan string, 1000),
+		closeCh:          make(chan struct{}),
+		protocolVersions: protocolVersions,
 	}
 
 	switch protocol {
@@ -193,6 +213,58 @@ func (s *testServer) serveHttp() {
 		var (
 			err error
 		)
+		if r.Method == "GET" && r.URL.Path == "/settings" {
+			if len(s.settingsReqErrMsg) != 0 {
+				w.WriteHeader(http.StatusInternalServerError)
+				data, err := json.Marshal(map[string]interface{}{
+					"code":    "500",
+					"message": s.settingsReqErrMsg,
+				})
+				if err != nil {
+					panic(err)
+				}
+				w.Write(data)
+				return
+			} else if s.protocolVersions == nil {
+				w.WriteHeader(http.StatusNotFound)
+				data, err := json.Marshal(map[string]interface{}{
+					"code":    "404",
+					"message": "Not Found",
+				})
+				if err != nil {
+					panic(err)
+				}
+				w.Write(data)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			var data []byte
+			if len(s.protocolVersions) == 0 {
+				data, err = json.Marshal(map[string]interface{}{
+					"version": "8.1.2",
+				})
+			} else {
+				data, err = json.Marshal(map[string]interface{}{
+					"config": map[string]interface{}{
+						"release.type":                "OSS",
+						"release.version":             "[DEVELOPMENT]",
+						"http.settings.readonly":      false,
+						"line.proto.support.versions": s.protocolVersions,
+						"ilp.proto.transports":        []string{"tcp", "http"},
+						"posthog.enabled":             false,
+						"posthog.api.key":             nil,
+						"cairo.max.file.name.length":  256,
+					},
+					"preferences.version": 0,
+					"preferences":         map[string]interface{}{},
+				})
+			}
+			if err != nil {
+				panic(err)
+			}
+			w.Write(data)
+			return
+		}
 
 		switch s.serverType {
 		case failFirstThenSendToBackChannel:

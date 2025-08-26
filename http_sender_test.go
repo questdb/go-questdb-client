@@ -57,27 +57,27 @@ func TestHttpHappyCasesFromConf(t *testing.T) {
 	testCases := []httpConfigTestCase{
 		{
 			name: "request_timeout and retry_timeout milli conversion",
-			config: fmt.Sprintf("http::addr=%s;request_timeout=%d;retry_timeout=%d;",
+			config: fmt.Sprintf("http::addr=%s;request_timeout=%d;retry_timeout=%d;protocol_version=2;",
 				addr, request_timeout.Milliseconds(), retry_timeout.Milliseconds()),
 		},
 		{
 			name: "pass before user",
-			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s;",
+			config: fmt.Sprintf("http::addr=%s;password=%s;username=%s;protocol_version=2;",
 				addr, pass, user),
 		},
 		{
 			name: "request_min_throughput",
-			config: fmt.Sprintf("http::addr=%s;request_min_throughput=%d;",
+			config: fmt.Sprintf("http::addr=%s;request_min_throughput=%d;protocol_version=2;",
 				addr, min_throughput),
 		},
 		{
 			name: "bearer token",
-			config: fmt.Sprintf("http::addr=%s;token=%s;",
+			config: fmt.Sprintf("http::addr=%s;token=%s;protocol_version=2;",
 				addr, token),
 		},
 		{
 			name: "auto flush",
-			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000;",
+			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000;protocol_version=2;",
 				addr),
 		},
 	}
@@ -100,11 +100,11 @@ func TestHttpHappyCasesFromEnv(t *testing.T) {
 	testCases := []httpConfigTestCase{
 		{
 			name:   "addr only",
-			config: fmt.Sprintf("http::addr=%s", addr),
+			config: fmt.Sprintf("http::addr=%s;protocol_version=1;", addr),
 		},
 		{
 			name: "auto flush",
-			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000;",
+			config: fmt.Sprintf("http::addr=%s;auto_flush_rows=100;auto_flush_interval=1000;protocol_version=2;",
 				addr),
 		},
 	}
@@ -167,6 +167,11 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			name:        "schema is case-sensitive",
 			config:      "hTtp::addr=localhost:1234;",
 			expectedErr: "invalid schema",
+		},
+		{
+			name:        "protocol version",
+			config:      "http::protocol_version=abc;",
+			expectedErr: "invalid protocol_version value",
 		},
 	}
 
@@ -729,13 +734,13 @@ func TestBufferClearAfterFlush(t *testing.T) {
 func TestCustomTransportAndTlsInit(t *testing.T) {
 	ctx := context.Background()
 
-	s1, err := qdb.NewLineSender(ctx, qdb.WithHttp())
+	s1, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
 	assert.NoError(t, err)
 
-	s2, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithTls())
+	s2, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithTls(), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
 	assert.NoError(t, err)
 
-	s3, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithTlsInsecureSkipVerify())
+	s3, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithTlsInsecureSkipVerify(), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
 	assert.NoError(t, err)
 
 	transport := http.Transport{}
@@ -744,6 +749,7 @@ func TestCustomTransportAndTlsInit(t *testing.T) {
 		qdb.WithHttp(),
 		qdb.WithHttpTransport(&transport),
 		qdb.WithTls(),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion2),
 	)
 	assert.NoError(t, err)
 
@@ -763,6 +769,150 @@ func TestCustomTransportAndTlsInit(t *testing.T) {
 	assert.Equal(t, int64(0), qdb.GlobalTransport.ClientCount())
 }
 
+func TestAutoDetectProtocolVersionOldServer1(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", nil)
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion1)
+	assert.NoError(t, err)
+}
+
+func TestAutoDetectProtocolVersionOldServer2(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion1)
+	assert.NoError(t, err)
+}
+
+func TestAutoDetectProtocolVersionOldServer3(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{1})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion1)
+	assert.NoError(t, err)
+}
+
+func TestAutoDetectProtocolVersionNewServer1(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{1, 2})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion2)
+	assert.NoError(t, err)
+}
+
+func TestAutoDetectProtocolVersionNewServer2(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion2)
+	assert.NoError(t, err)
+}
+
+func TestAutoDetectProtocolVersionNewServer3(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2, 3})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion2)
+	assert.NoError(t, err)
+}
+
+func TestAutoDetectProtocolVersionNewServer4(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{3})
+	assert.NoError(t, err)
+	defer srv.Close()
+	_, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.ErrorContains(t, err, "server does not support current client")
+}
+
+func TestAutoDetectProtocolVersionError(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestHttpServerWithErrMsg(readAndDiscard, "Internal error")
+	assert.NoError(t, err)
+	defer srv.Close()
+	_, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.ErrorContains(t, err, "failed to detect server line protocol version [http-status=500, http-message={\"code\":\"500\",\"message\":\"Internal error\"}]")
+}
+
+func TestSpecifyProtocolVersion(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{1, 2})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion1)
+	assert.NoError(t, err)
+}
+
+func TestArrayColumnUnsupportedInHttpProtocolV1(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
+	defer cancel()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{1})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
+	values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
+	values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
+	arrayND, err := qdb.NewNDArray[float64](2, 2, 1, 2)
+	assert.NoError(t, err)
+	arrayND.Fill(11.0)
+
+	err = sender.
+		Table(testTable).
+		Float64Array1DColumn("array_1d", values1D).
+		At(ctx, time.UnixMicro(1))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+
+	err = sender.
+		Table(testTable).
+		Float64Array2DColumn("array_2d", values2D).
+		At(ctx, time.UnixMicro(2))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+
+	err = sender.
+		Table(testTable).
+		Float64Array3DColumn("array_3d", values3D).
+		At(ctx, time.UnixMicro(3))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+
+	err = sender.
+		Table(testTable).
+		Float64ArrayNDColumn("array_nd", arrayND).
+		At(ctx, time.UnixMicro(4))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+}
+
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 	ctx := context.Background()
 
@@ -772,6 +922,12 @@ func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.NoError(b, err)
+
+	values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
+	values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
+	values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
+	arrayND, _ := qdb.NewNDArray[float64](2, 3)
+	arrayND.Fill(10.0)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -784,6 +940,10 @@ func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
 				StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 				BoolColumn("bool_col", true).
 				TimestampColumn("timestamp_col", time.UnixMicro(42)).
+				Float64Array1DColumn("array_1d", values1D).
+				Float64Array2DColumn("array_2d", values2D).
+				Float64Array3DColumn("array_3d", values3D).
+				Float64ArrayNDColumn("array_nd", arrayND).
 				At(ctx, time.UnixMicro(int64(1000*i)))
 		}
 		sender.Flush(ctx)
@@ -801,6 +961,12 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.NoError(b, err)
 
+	values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
+	values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}
+	values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, 8.0}}}
+	arrayND, _ := qdb.NewNDArray[float64](2, 3)
+	arrayND.Fill(10)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sender.
@@ -811,6 +977,10 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 			StringColumn("str_col", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua").
 			BoolColumn("bool_col", true).
 			TimestampColumn("timestamp_col", time.UnixMicro(42)).
+			Float64Array1DColumn("array_1d", values1D).
+			Float64Array2DColumn("array_2d", values2D).
+			Float64Array3DColumn("array_3d", values3D).
+			Float64ArrayNDColumn("array_nd", arrayND).
 			At(ctx, time.UnixMicro(int64(1000*i)))
 	}
 	sender.Flush(ctx)

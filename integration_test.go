@@ -27,6 +27,7 @@ package questdb_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/big"
 	"path/filepath"
 	"reflect"
@@ -73,14 +74,19 @@ func (c *questdbContainer) Stop(ctx context.Context) error {
 			return err
 		}
 	}
-	err := c.Terminate(ctx)
-	if err != nil {
-		return err
+	if c.Container != nil {
+		err := c.Terminate(ctx)
+		if err != nil {
+			return err
+		}
 	}
-	err = c.network.Remove(ctx)
-	if err != nil {
-		return err
+	if c.network != nil {
+		err := c.network.Remove(ctx)
+		if err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -131,12 +137,13 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	if err != nil {
 		return nil, err
 	}
+	uniqueNetworkName := fmt.Sprintf("%s-%d", networkName, time.Now().UnixNano())
 	req := testcontainers.ContainerRequest{
-		Image:          "questdb/questdb:7.4.2",
+		Image:          "questdb/questdb:9.0.2",
 		ExposedPorts:   []string{"9000/tcp", "9009/tcp"},
-		WaitingFor:     wait.ForHTTP("/").WithPort("9000"),
-		Networks:       []string{networkName},
-		NetworkAliases: map[string][]string{networkName: {"questdb"}},
+		WaitingFor:     wait.ForHTTP("/settings").WithPort("9000"),
+		Networks:       []string{uniqueNetworkName},
+		NetworkAliases: map[string][]string{uniqueNetworkName: {"questdb"}},
 		Env:            env,
 		Mounts: testcontainers.Mounts(testcontainers.ContainerMount{
 			Source: testcontainers.GenericBindMountSource{
@@ -145,10 +152,9 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 			Target: testcontainers.ContainerMountTarget("/root/.questdb/auth"),
 		}),
 	}
-
 	newNetwork, err := testcontainers.GenericNetwork(ctx, testcontainers.GenericNetworkRequest{
 		NetworkRequest: testcontainers.NetworkRequest{
-			Name:           networkName,
+			Name:           uniqueNetworkName,
 			CheckDuplicate: true,
 		},
 	})
@@ -194,8 +200,8 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 		req = testcontainers.ContainerRequest{
 			Image:        "haproxy:2.6.4",
 			ExposedPorts: []string{"8443/tcp", "8444/tcp", "8445/tcp", "8888/tcp"},
-			WaitingFor:   wait.ForHTTP("/").WithPort("8888"),
-			Networks:     []string{networkName},
+			WaitingFor:   wait.ForHTTP("/settings").WithPort("8888"),
+			Networks:     []string{uniqueNetworkName},
 			Mounts: testcontainers.Mounts(testcontainers.ContainerMount{
 				Source: testcontainers.GenericBindMountSource{
 					HostPath: path,
@@ -298,7 +304,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 					{"double_col", "DOUBLE"},
 					{"long_col", "LONG"},
 					{"long256_col", "LONG256"},
-					{"str_col", "STRING"},
+					{"str_col", "VARCHAR"},
 					{"bool_col", "BOOLEAN"},
 					{"timestamp_col", "TIMESTAMP"},
 					{"timestamp", "TIMESTAMP"},
@@ -312,10 +318,10 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		},
 		{
 			"escaped chars",
-			"my-awesome_test 1=2.csv",
+			"m y-awesome_test 1=2.csv",
 			func(s qdb.LineSender) error {
 				return s.
-					Table("my-awesome_test 1=2.csv").
+					Table("m y-awesome_test 1=2.csv").
 					Symbol("sym_name 1=2", "value 1,2=3\n4\r5\"6\\7").
 					StringColumn("str_name 1=2", "value 1,2=3\n4\r5\"6\\7").
 					At(ctx, time.UnixMicro(1))
@@ -323,7 +329,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 			tableData{
 				Columns: []column{
 					{"sym_name 1=2", "SYMBOL"},
-					{"str_name 1=2", "STRING"},
+					{"str_name 1=2", "VARCHAR"},
 					{"timestamp", "TIMESTAMP"},
 				},
 				Dataset: [][]interface{}{
@@ -413,44 +419,139 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 				Count: 1,
 			},
 		},
+		{
+			"double array",
+			testTable,
+			func(s qdb.LineSender) error {
+				values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0, math.NaN()}
+				values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}, {math.NaN(), math.NaN()}}
+				values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, math.NaN()}}}
+				arrayND, _ := qdb.NewNDArray[float64](2, 2, 1, 2)
+				arrayND.Fill(11.0)
+				arrayND.Set(math.NaN(), 1, 1, 0, 1)
+
+				err := s.
+					Table(testTable).
+					Float64Array1DColumn("array_1d", values1D).
+					Float64Array2DColumn("array_2d", values2D).
+					Float64Array3DColumn("array_3d", values3D).
+					Float64ArrayNDColumn("array_nd", arrayND).
+					At(ctx, time.UnixMicro(1))
+				if err != nil {
+					return err
+				}
+				// empty array
+				emptyNdArray, _ := qdb.NewNDArray[float64](2, 2, 0, 2)
+				err = s.
+					Table(testTable).
+					Float64Array1DColumn("array_1d", []float64{}).
+					Float64Array2DColumn("array_2d", [][]float64{{}}).
+					Float64Array3DColumn("array_3d", [][][]float64{{{}}}).
+					Float64ArrayNDColumn("array_nd", emptyNdArray).
+					At(ctx, time.UnixMicro(2))
+				if err != nil {
+					return err
+				}
+				// null array
+				return s.
+					Table(testTable).
+					Float64Array1DColumn("array_1d", nil).
+					Float64Array2DColumn("array_2d", nil).
+					Float64Array3DColumn("array_3d", nil).
+					Float64ArrayNDColumn("array_nd", nil).
+					At(ctx, time.UnixMicro(3))
+			},
+			tableData{
+				Columns: []column{
+					{"array_1d", "ARRAY"},
+					{"array_2d", "ARRAY"},
+					{"array_3d", "ARRAY"},
+					{"array_nd", "ARRAY"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]interface{}{
+					{
+						[]interface{}{float64(1), float64(2), float64(3), float64(4), float64(5), nil},
+						[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}, []interface{}{float64(5), float64(6)}, []interface{}{nil, nil}},
+						[]interface{}{[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}}, []interface{}{[]interface{}{float64(5), float64(6)}, []interface{}{float64(7), nil}}},
+						[]interface{}{[]interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}, []interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), nil}}}},
+						"1970-01-01T00:00:00.000001Z"},
+					{
+						[]interface{}{},
+						[]interface{}{},
+						[]interface{}{},
+						[]interface{}{},
+						"1970-01-01T00:00:00.000002Z"},
+					{
+						nil,
+						nil,
+						nil,
+						nil,
+						"1970-01-01T00:00:00.000003Z"},
+				},
+				Count: 3,
+			},
+		},
 	}
 
 	for _, tc := range testCases {
 		for _, protocol := range []string{"tcp", "http"} {
-			suite.T().Run(fmt.Sprintf("%s: %s", tc.name, protocol), func(t *testing.T) {
-				var (
-					sender qdb.LineSender
-					err    error
-				)
+			for _, pVersion := range []int{0, 1, 2} {
+				suite.T().Run(fmt.Sprintf("%s: %s", tc.name, protocol), func(t *testing.T) {
+					var (
+						sender qdb.LineSender
+						err    error
+					)
 
-				questdbC, err := setupQuestDB(ctx, noAuth)
-				assert.NoError(t, err)
-
-				switch protocol {
-				case "tcp":
-					sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
+					ignoreArray := false
+					questdbC, err := setupQuestDB(ctx, noAuth)
 					assert.NoError(t, err)
-				case "http":
-					sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
+
+					switch protocol {
+					case "tcp":
+						if pVersion == 0 {
+							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
+							ignoreArray = true
+						} else if pVersion == 1 {
+							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
+							ignoreArray = true
+						} else if pVersion == 2 {
+							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
+						}
+						assert.NoError(t, err)
+					case "http":
+						if pVersion == 0 {
+							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
+						} else if pVersion == 1 {
+							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
+							ignoreArray = true
+						} else if pVersion == 2 {
+							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
+						}
+						assert.NoError(t, err)
+					default:
+						panic(protocol)
+					}
+					if ignoreArray && tc.name == "double array" {
+						return
+					}
+
+					dropTable(t, tc.tableName, questdbC.httpAddress)
+					err = tc.writerFn(sender)
 					assert.NoError(t, err)
-				default:
-					panic(protocol)
-				}
 
-				err = tc.writerFn(sender)
-				assert.NoError(t, err)
+					err = sender.Flush(ctx)
+					assert.NoError(t, err)
 
-				err = sender.Flush(ctx)
-				assert.NoError(t, err)
+					assert.Eventually(t, func() bool {
+						data := queryTableData(t, tc.tableName, questdbC.httpAddress)
+						return reflect.DeepEqual(tc.expected, data)
+					}, eventualDataTimeout, 100*time.Millisecond)
 
-				assert.Eventually(t, func() bool {
-					data := queryTableData(t, tc.tableName, questdbC.httpAddress)
-					return reflect.DeepEqual(tc.expected, data)
-				}, eventualDataTimeout, 100*time.Millisecond)
-
-				sender.Close(ctx)
-				questdbC.Stop(ctx)
-			})
+					sender.Close(ctx)
+					questdbC.Stop(ctx)
+				})
+			}
 		}
 	}
 }

@@ -29,6 +29,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -114,9 +115,12 @@ type httpLineSender struct {
 	globalTransport *globalHttpTransport
 }
 
-func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
-	var transport *http.Transport
+type httpLineSenderV2 struct {
+	httpLineSender
+}
 
+func newHttpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
+	var transport *http.Transport
 	s := &httpLineSender{
 		address:                     conf.address,
 		minThroughputBytesPerSecond: conf.minThroughput,
@@ -155,13 +159,29 @@ func newHttpLineSender(conf *lineSenderConfig) (*httpLineSender, error) {
 		s.globalTransport.RegisterClient()
 	}
 
+	// auto detect server line protocol version
+	pVersion := conf.protocolVersion
+	if pVersion == protocolVersionUnset {
+		var err error
+		pVersion, err = s.detectProtocolVersion(ctx, conf)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	s.uri = "http"
 	if conf.tlsMode != tlsDisabled {
 		s.uri += "s"
 	}
 	s.uri += fmt.Sprintf("://%s/write", s.address)
 
-	return s, nil
+	if pVersion == ProtocolVersion1 {
+		return s, nil
+	} else {
+		return &httpLineSenderV2{
+			*s,
+		}, nil
+	}
 }
 
 func (s *httpLineSender) Flush(ctx context.Context) error {
@@ -282,6 +302,26 @@ func (s *httpLineSender) BoolColumn(name string, val bool) LineSender {
 	return s
 }
 
+func (s *httpLineSender) Float64Array1DColumn(name string, values []float64) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
+	return s
+}
+
+func (s *httpLineSender) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
+	return s
+}
+
+func (s *httpLineSender) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
+	return s
+}
+
+func (s *httpLineSender) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support double-array"))
+	return s
+}
+
 func (s *httpLineSender) Close(ctx context.Context) error {
 	if s.closed {
 		return errDoubleSenderClose
@@ -399,6 +439,92 @@ func (s *httpLineSender) makeRequest(ctx context.Context) (bool, error) {
 
 }
 
+func (s *httpLineSender) detectProtocolVersion(ctx context.Context, conf *lineSenderConfig) (protocolVersion, error) {
+	scheme := "http"
+	if conf.tlsMode != tlsDisabled {
+		scheme = "https"
+	}
+	settingsUri := fmt.Sprintf("%s://%s/settings", scheme, s.address)
+
+	req, err := http.NewRequest(http.MethodGet, settingsUri, nil)
+	if err != nil {
+		return protocolVersionUnset, err
+	}
+	if s.user != "" && s.pass != "" {
+		req.SetBasicAuth(s.user, s.pass)
+	} else if s.token != "" {
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, s.requestTimeout)
+	defer cancel()
+	req = req.WithContext(reqCtx)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return protocolVersionUnset, err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case 404:
+		return ProtocolVersion1, nil
+	case 200:
+		return parseServerSettings(resp, conf)
+	default:
+		buf, _ := io.ReadAll(resp.Body)
+		if len(buf) > 1024 {
+			buf = append(buf[:1024], []byte("...")...)
+		}
+		return protocolVersionUnset, fmt.Errorf("failed to detect server line protocol version [http-status=%d, http-message=%s]",
+			resp.StatusCode, string(buf))
+	}
+}
+
+func parseServerSettings(resp *http.Response, conf *lineSenderConfig) (protocolVersion, error) {
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return protocolVersionUnset, fmt.Errorf("%d: %s", resp.StatusCode, resp.Status)
+	}
+
+	var settings struct {
+		Config struct {
+			LineProtoSupportVersions []int `json:"line.proto.support.versions"`
+			MaxFileNameLength        int   `json:"cairo.max.file.name.length"`
+		} `json:"config"`
+	}
+
+	if err := json.Unmarshal(buf, &settings); err != nil {
+		return ProtocolVersion1, nil
+	}
+
+	// Update file name limit if provided by server
+	if settings.Config.MaxFileNameLength != 0 {
+		conf.fileNameLimit = settings.Config.MaxFileNameLength
+	}
+
+	// Determine protocol version based on server support
+	versions := settings.Config.LineProtoSupportVersions
+	if len(versions) == 0 {
+		return ProtocolVersion1, nil
+	}
+
+	hasProtocolVersion1 := false
+	for _, version := range versions {
+		if version == 2 {
+			return ProtocolVersion2, nil
+		}
+		if version == 1 {
+			hasProtocolVersion1 = true
+		}
+	}
+	if hasProtocolVersion1 {
+		return ProtocolVersion1, nil
+	}
+
+	return protocolVersionUnset, errors.New("server does not support current client")
+}
+
 func isRetryableError(statusCode int) bool {
 	switch statusCode {
 	case 500, // Internal Server Error
@@ -416,9 +542,9 @@ func isRetryableError(statusCode int) bool {
 	}
 }
 
-// Messages returns a copy of accumulated ILP messages that are not
+// Messages returns the accumulated ILP messages that are not
 // flushed to the TCP connection yet. Useful for debugging purposes.
-func (s *httpLineSender) Messages() string {
+func (s *httpLineSender) Messages() []byte {
 	return s.buf.Messages()
 }
 
@@ -430,4 +556,64 @@ func (s *httpLineSender) MsgCount() int {
 // BufLen returns the number of bytes written to the buffer.
 func (s *httpLineSender) BufLen() int {
 	return s.buf.Len()
+}
+
+func (s *httpLineSenderV2) Table(name string) LineSender {
+	s.buf.Table(name)
+	return s
+}
+
+func (s *httpLineSenderV2) Symbol(name, val string) LineSender {
+	s.buf.Symbol(name, val)
+	return s
+}
+
+func (s *httpLineSenderV2) Int64Column(name string, val int64) LineSender {
+	s.buf.Int64Column(name, val)
+	return s
+}
+
+func (s *httpLineSenderV2) Long256Column(name string, val *big.Int) LineSender {
+	s.buf.Long256Column(name, val)
+	return s
+}
+
+func (s *httpLineSenderV2) TimestampColumn(name string, ts time.Time) LineSender {
+	s.buf.TimestampColumn(name, ts)
+	return s
+}
+
+func (s *httpLineSenderV2) StringColumn(name, val string) LineSender {
+	s.buf.StringColumn(name, val)
+	return s
+}
+
+func (s *httpLineSenderV2) BoolColumn(name string, val bool) LineSender {
+	s.buf.BoolColumn(name, val)
+	return s
+}
+
+func (s *httpLineSenderV2) Float64Column(name string, val float64) LineSender {
+	s.buf.Float64ColumnBinary(name, val)
+	return s
+}
+
+func (s *httpLineSenderV2) Float64Array1DColumn(name string, values []float64) LineSender {
+	s.buf.Float64Array1DColumn(name, values)
+	return s
+}
+
+func (s *httpLineSenderV2) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	s.buf.Float64Array2DColumn(name, values)
+	return s
+}
+
+func (s *httpLineSenderV2) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	s.buf.Float64Array3DColumn(name, values)
+	return s
+}
+
+func (s *httpLineSenderV2) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	s.buf.Float64ArrayNDColumn(name, values)
+	return s
 }
