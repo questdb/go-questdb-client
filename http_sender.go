@@ -450,6 +450,11 @@ func (s *httpLineSender) detectProtocolVersion(ctx context.Context, conf *lineSe
 	if err != nil {
 		return protocolVersionUnset, err
 	}
+	if s.user != "" && s.pass != "" {
+		req.SetBasicAuth(s.user, s.pass)
+	} else if s.token != "" {
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", s.token))
+	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, s.requestTimeout)
 	defer cancel()

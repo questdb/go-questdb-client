@@ -37,7 +37,7 @@ import (
 )
 
 func TestBasicBehavior(t *testing.T) {
-	p, err := qdb.PoolFromConf("http::addr=localhost:1234")
+	p, err := qdb.PoolFromConf("http::addr=localhost:1234;protocol_version=2;")
 	require.NoError(t, err)
 	ctx := context.Background()
 

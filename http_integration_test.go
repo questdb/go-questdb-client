@@ -87,7 +87,7 @@ func (suite *integrationTestSuite) TestE2ESuccessfulHttpBasicAuthWithTlsProxy() 
 
 	expected := tableData{
 		Columns: []column{
-			{"str_col", "STRING"},
+			{"str_col", "VARCHAR"},
 			{"timestamp", "TIMESTAMP"},
 		},
 		Dataset: [][]interface{}{

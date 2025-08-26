@@ -200,7 +200,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 		req = testcontainers.ContainerRequest{
 			Image:        "haproxy:2.6.4",
 			ExposedPorts: []string{"8443/tcp", "8444/tcp", "8445/tcp", "8888/tcp"},
-			WaitingFor:   wait.ForHTTP("/").WithPort("8888"),
+			WaitingFor:   wait.ForHTTP("/settings").WithPort("8888"),
 			Networks:     []string{uniqueNetworkName},
 			Mounts: testcontainers.Mounts(testcontainers.ContainerMount{
 				Source: testcontainers.GenericBindMountSource{
