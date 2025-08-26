@@ -137,12 +137,13 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	if err != nil {
 		return nil, err
 	}
+	uniqueNetworkName := fmt.Sprintf("%s-%d", networkName, time.Now().UnixNano())
 	req := testcontainers.ContainerRequest{
 		Image:          "questdb/questdb:9.0.2",
 		ExposedPorts:   []string{"9000/tcp", "9009/tcp"},
 		WaitingFor:     wait.ForHTTP("/settings").WithPort("9000"),
-		Networks:       []string{networkName},
-		NetworkAliases: map[string][]string{networkName: {"questdb"}},
+		Networks:       []string{uniqueNetworkName},
+		NetworkAliases: map[string][]string{uniqueNetworkName: {"questdb"}},
 		Env:            env,
 		Mounts: testcontainers.Mounts(testcontainers.ContainerMount{
 			Source: testcontainers.GenericBindMountSource{
@@ -151,11 +152,10 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 			Target: testcontainers.ContainerMountTarget("/root/.questdb/auth"),
 		}),
 	}
-
 	newNetwork, err := testcontainers.GenericNetwork(ctx, testcontainers.GenericNetworkRequest{
 		NetworkRequest: testcontainers.NetworkRequest{
-			Name:           networkName,
-			CheckDuplicate: false,
+			Name:           uniqueNetworkName,
+			CheckDuplicate: true,
 		},
 	})
 	if err != nil {
@@ -201,7 +201,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 			Image:        "haproxy:2.6.4",
 			ExposedPorts: []string{"8443/tcp", "8444/tcp", "8445/tcp", "8888/tcp"},
 			WaitingFor:   wait.ForHTTP("/").WithPort("8888"),
-			Networks:     []string{networkName},
+			Networks:     []string{uniqueNetworkName},
 			Mounts: testcontainers.Mounts(testcontainers.ContainerMount{
 				Source: testcontainers.GenericBindMountSource{
 					HostPath: path,
