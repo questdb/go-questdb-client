@@ -553,8 +553,8 @@ func (b *buffer) TimestampColumn(name string, ts time.Time) *buffer {
 		return b
 	}
 	b.WriteByte('=')
-	b.writeInt(ts.UnixMicro())
-	b.WriteByte('t')
+	b.writeInt(ts.UnixNano())
+	b.WriteByte('n')
 	b.hasFields = true
 	return b
 }

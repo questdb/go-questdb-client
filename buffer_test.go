@@ -117,7 +117,7 @@ func TestTimestampSerialization(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Check the buffer
-			expected := []byte("my_test_table a_col=" + strconv.FormatInt(tc.val.UnixMicro(), 10) + "t\n")
+			expected := []byte("my_test_table a_col=" + strconv.FormatInt(tc.val.UnixNano(), 10) + "n\n")
 			assert.Equal(t, expected, buf.Messages())
 		})
 	}
