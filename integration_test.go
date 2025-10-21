@@ -31,6 +31,7 @@ import (
 	"math/big"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -492,47 +493,93 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 				Count: 3,
 			},
 		},
+		{
+			"decimal type",
+			testTable,
+			func(s qdb.LineSender) error {
+				err := s.
+					Table(testTable).
+					DecimalColumn("text_col", "123.45").
+					DecimalColumn("binary_col", qdb.NewDecimalFromInt64(12345, 2)).
+					DecimalColumn("binary_neg_col", qdb.NewDecimalFromInt64(-12345, 2)).
+					DecimalColumn("binary_null_col", qdb.NullDecimal()).
+					At(ctx, time.UnixMicro(1))
+				if err != nil {
+					return err
+				}
+
+				return s.
+					Table(testTable).
+					DecimalColumn("text_col", "123.46").
+					DecimalColumn("binary_col", qdb.NewDecimalFromInt64(12346, 2)).
+					DecimalColumn("binary_neg_col", qdb.NewDecimalFromInt64(-12346, 2)).
+					DecimalColumn("binary_null_col", qdb.NullDecimal()).
+					At(ctx, time.UnixMicro(2))
+			},
+			tableData{
+				Columns: []column{
+					{"text_col", "DECIMAL(18,3)"},
+					{"binary_col", "DECIMAL(18,3)"},
+					{"binary_neg_col", "DECIMAL(18,3)"},
+					{"binary_null_col", "DECIMAL(18,3)"},
+					{"timestamp", "TIMESTAMP"},
+				},
+				Dataset: [][]any{
+					{"123.450", "123.450", "-123.450", nil, "1970-01-01T00:00:00.000001Z"},
+					{"123.460", "123.460", "-123.460", nil, "1970-01-01T00:00:00.000002Z"},
+				},
+				Count: 2,
+			},
+		},
 	}
 
 	for _, tc := range testCases {
 		for _, protocol := range []string{"tcp", "http"} {
-			for _, pVersion := range []int{0, 1, 2} {
+			for _, pVersion := range []int{0, 1, 2, 3} {
 				suite.T().Run(fmt.Sprintf("%s: %s", tc.name, protocol), func(t *testing.T) {
 					var (
 						sender qdb.LineSender
 						err    error
 					)
 
-					ignoreArray := false
 					questdbC, err := setupQuestDB(ctx, noAuth)
 					assert.NoError(t, err)
 
+					currentVersion := pVersion
 					switch protocol {
 					case "tcp":
-						if pVersion == 0 {
+						switch pVersion {
+						case 0:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
-							ignoreArray = true
-						} else if pVersion == 1 {
+							currentVersion = 1
+						case 1:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
-							ignoreArray = true
-						} else if pVersion == 2 {
+						case 2:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
+						case 3:
+							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion3))
 						}
 						assert.NoError(t, err)
 					case "http":
-						if pVersion == 0 {
+						switch pVersion {
+						case 0:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
-						} else if pVersion == 1 {
+							currentVersion = 3
+						case 1:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
-							ignoreArray = true
-						} else if pVersion == 2 {
+						case 2:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
+						case 3:
+							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion3))
 						}
 						assert.NoError(t, err)
 					default:
 						panic(protocol)
 					}
-					if ignoreArray && tc.name == "double array" {
+					if currentVersion < 2 && tc.name == "double array" {
+						return
+					}
+					if currentVersion < 3 && strings.Contains(tc.name, "decimal") {
 						return
 					}
 

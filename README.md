@@ -188,6 +188,37 @@ will now also serialize ``float64`` (double-precision) columns as binary.
 You might see a performance uplift if this is a dominant data type in your
 ingestion workload.
 
+## Decimal columns
+
+QuestDB server version 9.2.0 and newer supports decimal columns with arbitrary precision and scale.
+The Go client converts supported decimal values to QuestDB's text/binary wire format automatically, pass any of the following to `DecimalColumn`:
+
+- `questdb.ScaledDecimal`, including helpers like `questdb.NewDecimalFromInt64` and `questdb.NewDecimal`.
+- Types implementing `questdb.DecimalMarshaler`.
+- `github.com/shopspring/decimal.Decimal` values or pointers.
+- `nil` or `questdb.NullDecimal()` to send a `NULL`.
+
+```go
+price := qdb.NewDecimalFromInt64(12345, 2) // 123.45 with scale 2
+commission := qdb.NewDecimal(big.NewInt(-750), 4) // -0.0750 with scale 4
+
+err = sender.
+    Table("trades").
+    Symbol("symbol", "ETH-USD").
+    DecimalColumn("price", price).
+    DecimalColumn("commission", commission).
+    AtNow(ctx)
+```
+
+To emit textual decimals, pass a validated string literal (without the trailing `d`—the client adds it):
+
+```go
+err = sender.
+    Table("quotes").
+    DecimalColumn("mid", "1.23456").
+    AtNow(ctx)
+```
+
 ## Pooled Line Senders
 
 **Warning: Experimental feature designed for use with HTTP senders ONLY**

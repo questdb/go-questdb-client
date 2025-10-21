@@ -27,8 +27,10 @@ package questdb_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -60,8 +62,10 @@ type testColumn struct {
 }
 
 type testResult struct {
-	Status string `json:"status"`
-	Line   string `json:"line"`
+	Status       string   `json:"status"`
+	Line         string   `json:"line"`
+	AnyLines     []string `json:"anyLines"`
+	BinaryBase64 string   `json:"binaryBase64"`
 }
 
 func TestTcpClientInterop(t *testing.T) {
@@ -75,44 +79,9 @@ func TestTcpClientInterop(t *testing.T) {
 			srv, err := newTestTcpServer(sendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
+			sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion3))
 			assert.NoError(t, err)
-
-			sender.Table(tc.Table)
-			for _, s := range tc.Symbols {
-				sender.Symbol(s.Name, s.Value)
-			}
-			for _, s := range tc.Columns {
-				switch s.Type {
-				case "LONG":
-					sender.Int64Column(s.Name, int64(s.Value.(float64)))
-				case "DOUBLE":
-					sender.Float64Column(s.Name, s.Value.(float64))
-				case "STRING":
-					sender.StringColumn(s.Name, s.Value.(string))
-				case "BOOLEAN":
-					sender.BoolColumn(s.Name, s.Value.(bool))
-				default:
-					assert.Fail(t, "unexpected column type: "+s.Type)
-				}
-			}
-
-			err = sender.AtNow(ctx)
-
-			switch tc.Result.Status {
-			case "SUCCESS":
-				assert.NoError(t, err)
-				err = sender.Flush(ctx)
-				assert.NoError(t, err)
-
-				expectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
-			case "ERROR":
-				assert.Error(t, err)
-			default:
-				assert.Fail(t, "unexpected test status: "+tc.Result.Status)
-			}
-
-			sender.Close(ctx)
+			execute(t, ctx, sender, srv.BackCh, tc)
 			srv.Close()
 		})
 	}
@@ -129,47 +98,90 @@ func TestHttpClientInterop(t *testing.T) {
 			srv, err := newTestHttpServer(sendToBackChannel)
 			assert.NoError(t, err)
 
-			sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
+			sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion3))
 			assert.NoError(t, err)
-
-			sender.Table(tc.Table)
-			for _, s := range tc.Symbols {
-				sender.Symbol(s.Name, s.Value)
-			}
-			for _, s := range tc.Columns {
-				switch s.Type {
-				case "LONG":
-					sender.Int64Column(s.Name, int64(s.Value.(float64)))
-				case "DOUBLE":
-					sender.Float64Column(s.Name, s.Value.(float64))
-				case "STRING":
-					sender.StringColumn(s.Name, s.Value.(string))
-				case "BOOLEAN":
-					sender.BoolColumn(s.Name, s.Value.(bool))
-				default:
-					assert.Fail(t, "unexpected column type: "+s.Type)
-				}
-			}
-
-			err = sender.AtNow(ctx)
-
-			switch tc.Result.Status {
-			case "SUCCESS":
-				assert.NoError(t, err)
-				err = sender.Flush(ctx)
-				assert.NoError(t, err)
-
-				expectLines(t, srv.BackCh, strings.Split(tc.Result.Line, "\n"))
-			case "ERROR":
-				assert.Error(t, err)
-			default:
-				assert.Fail(t, "unexpected test status: "+tc.Result.Status)
-			}
-
-			sender.Close(ctx)
+			execute(t, ctx, sender, srv.BackCh, tc)
 			srv.Close()
 		})
 	}
+}
+
+func execute(t *testing.T, ctx context.Context, sender qdb.LineSender, backCh chan string, tc testCase) {
+	sender.Table(tc.Table)
+	for _, s := range tc.Symbols {
+		sender.Symbol(s.Name, s.Value)
+	}
+	for _, s := range tc.Columns {
+		switch s.Type {
+		case "LONG":
+			sender.Int64Column(s.Name, int64(s.Value.(float64)))
+		case "DOUBLE":
+			sender.Float64Column(s.Name, s.Value.(float64))
+		case "STRING":
+			sender.StringColumn(s.Name, s.Value.(string))
+		case "BOOLEAN":
+			sender.BoolColumn(s.Name, s.Value.(bool))
+		case "DECIMAL":
+			dec, err := parseDecimal64(s.Value.(string))
+			assert.NoError(t, err)
+			sender.DecimalColumn(s.Name, dec)
+		default:
+			assert.Fail(t, "unexpected column type: "+s.Type)
+		}
+	}
+
+	err := sender.AtNow(ctx)
+
+	switch tc.Result.Status {
+	case "SUCCESS":
+		assert.NoError(t, err)
+		err = sender.Flush(ctx)
+		assert.NoError(t, err)
+
+		if len(tc.Result.BinaryBase64) > 0 {
+			expectBinaryBase64(t, backCh, tc.Result.BinaryBase64)
+		} else if len(tc.Result.AnyLines) > 0 {
+			expectAnyLines(t, backCh, tc.Result.AnyLines)
+		} else {
+			expectLines(t, backCh, strings.Split(tc.Result.Line, "\n"))
+		}
+	case "ERROR":
+		assert.Error(t, err)
+	default:
+		assert.Fail(t, "unexpected test status: "+tc.Result.Status)
+	}
+
+	sender.Close(ctx)
+}
+
+// parseDecimal64 quick and dirty parser for a decimal64 value from its string representation
+func parseDecimal64(s string) (qdb.ScaledDecimal, error) {
+	// Remove whitespace
+	s = strings.TrimSpace(s)
+
+	// Check for empty string
+	if s == "" {
+		return qdb.ScaledDecimal{}, fmt.Errorf("empty string")
+	}
+
+	// Find the decimal point and remove it
+	pointIndex := strings.Index(s, ".")
+	if pointIndex != -1 {
+		s = strings.ReplaceAll(s, ".", "")
+	}
+
+	// Parse the integer part
+	unscaled, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return qdb.ScaledDecimal{}, err
+	}
+
+	scale := 0
+	if pointIndex != -1 {
+		scale = len(s) - pointIndex
+	}
+
+	return qdb.NewDecimalFromInt64(unscaled, uint32(scale)), nil
 }
 
 func readTestCases() (testCases, error) {

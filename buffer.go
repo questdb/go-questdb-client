@@ -573,6 +573,47 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 	return b
 }
 
+func (b *buffer) DecimalColumn(name string, val any) *buffer {
+	if !b.prepareForField() {
+		return b
+	}
+	b.lastErr = b.writeColumnName(name)
+	if b.lastErr != nil {
+		return b
+	}
+	b.WriteByte('=')
+	if str, ok := val.(string); ok {
+		if err := validateDecimalText(str); err != nil {
+			b.lastErr = err
+			return b
+		}
+		b.WriteString(str)
+		b.WriteByte('d')
+		b.hasFields = true
+		return b
+	}
+
+	dec, err := normalizeDecimalValue(val)
+	if err != nil {
+		b.lastErr = err
+		return b
+	}
+	scale, payload, err := dec.toBinary()
+	if err != nil {
+		b.lastErr = err
+		return b
+	}
+	b.WriteByte('=')
+	b.WriteByte(decimalBinaryTypeCode)
+	b.WriteByte(scale)
+	b.WriteByte(byte(len(payload)))
+	if len(payload) > 0 {
+		b.Write(payload)
+	}
+	b.hasFields = true
+	return b
+}
+
 func (b *buffer) Float64ColumnBinary(name string, val float64) *buffer {
 	if !b.prepareForField() {
 		return b

@@ -63,10 +63,16 @@ func Messages(s LineSender) []byte {
 	if hs, ok := s.(*httpLineSenderV2); ok {
 		return hs.Messages()
 	}
+	if hs, ok := s.(*httpLineSenderV3); ok {
+		return hs.Messages()
+	}
 	if ts, ok := s.(*tcpLineSender); ok {
 		return ts.Messages()
 	}
 	if ts, ok := s.(*tcpLineSenderV2); ok {
+		return ts.Messages()
+	}
+	if ts, ok := s.(*tcpLineSenderV3); ok {
 		return ts.Messages()
 	}
 	panic("unexpected struct")
@@ -82,10 +88,16 @@ func MsgCount(s LineSender) int {
 	if hs, ok := s.(*httpLineSenderV2); ok {
 		return hs.MsgCount()
 	}
+	if hs, ok := s.(*httpLineSenderV3); ok {
+		return hs.MsgCount()
+	}
 	if ts, ok := s.(*tcpLineSender); ok {
 		return ts.MsgCount()
 	}
 	if ts, ok := s.(*tcpLineSenderV2); ok {
+		return ts.MsgCount()
+	}
+	if ts, ok := s.(*tcpLineSenderV3); ok {
 		return ts.MsgCount()
 	}
 	panic("unexpected struct")
@@ -101,10 +113,16 @@ func BufLen(s LineSender) int {
 	if hs, ok := s.(*httpLineSenderV2); ok {
 		return hs.BufLen()
 	}
+	if hs, ok := s.(*httpLineSenderV3); ok {
+		return hs.BufLen()
+	}
 	if ts, ok := s.(*tcpLineSender); ok {
 		return ts.BufLen()
 	}
 	if ts, ok := s.(*tcpLineSenderV2); ok {
+		return ts.BufLen()
+	}
+	if ts, ok := s.(*tcpLineSenderV3); ok {
 		return ts.BufLen()
 	}
 	panic("unexpected struct")
@@ -120,11 +138,17 @@ func ProtocolVersion(s LineSender) protocolVersion {
 	if _, ok := s.(*httpLineSenderV2); ok {
 		return ProtocolVersion2
 	}
+	if _, ok := s.(*httpLineSenderV3); ok {
+		return ProtocolVersion3
+	}
 	if _, ok := s.(*tcpLineSender); ok {
 		return ProtocolVersion1
 	}
 	if _, ok := s.(*tcpLineSenderV2); ok {
 		return ProtocolVersion2
+	}
+	if _, ok := s.(*tcpLineSenderV3); ok {
+		return ProtocolVersion3
 	}
 	panic("unexpected struct")
 }

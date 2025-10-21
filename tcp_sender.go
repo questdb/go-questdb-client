@@ -50,6 +50,10 @@ type tcpLineSenderV2 struct {
 	tcpLineSender
 }
 
+type tcpLineSenderV3 struct {
+	tcpLineSenderV2
+}
+
 func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
 	var (
 		d    net.Dialer
@@ -136,12 +140,27 @@ func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, 
 
 	s.conn = conn
 
-	if conf.protocolVersion == protocolVersionUnset || conf.protocolVersion == ProtocolVersion1 {
+	pVersion := conf.protocolVersion
+	if pVersion == protocolVersionUnset {
+		pVersion = ProtocolVersion1
+	}
+
+	switch pVersion {
+	case ProtocolVersion1:
 		return s, nil
-	} else {
+	case ProtocolVersion2:
 		return &tcpLineSenderV2{
 			*s,
 		}, nil
+	case ProtocolVersion3:
+		return &tcpLineSenderV3{
+			tcpLineSenderV2{
+				*s,
+			},
+		}, nil
+	default:
+		conn.Close()
+		return nil, fmt.Errorf("unsupported protocol version %d", pVersion)
 	}
 }
 
@@ -181,6 +200,11 @@ func (s *tcpLineSender) TimestampColumn(name string, ts time.Time) LineSender {
 
 func (s *tcpLineSender) Float64Column(name string, val float64) LineSender {
 	s.buf.Float64Column(name, val)
+	return s
+}
+
+func (s *tcpLineSender) DecimalColumn(name string, val any) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support decimal"))
 	return s
 }
 
@@ -344,5 +368,75 @@ func (s *tcpLineSenderV2) Float64Array3DColumn(name string, values [][][]float64
 
 func (s *tcpLineSenderV2) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
 	s.buf.Float64ArrayNDColumn(name, values)
+	return s
+}
+
+func (s *tcpLineSenderV2) DecimalColumn(name string, val any) LineSender {
+	s.buf.SetLastErr(errors.New("current protocol version does not support decimal"))
+	return s
+}
+
+func (s *tcpLineSenderV3) Table(name string) LineSender {
+	s.buf.Table(name)
+	return s
+}
+
+func (s *tcpLineSenderV3) Symbol(name, val string) LineSender {
+	s.buf.Symbol(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV3) Int64Column(name string, val int64) LineSender {
+	s.buf.Int64Column(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV3) Long256Column(name string, val *big.Int) LineSender {
+	s.buf.Long256Column(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV3) TimestampColumn(name string, ts time.Time) LineSender {
+	s.buf.TimestampColumn(name, ts)
+	return s
+}
+
+func (s *tcpLineSenderV3) StringColumn(name, val string) LineSender {
+	s.buf.StringColumn(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV3) BoolColumn(name string, val bool) LineSender {
+	s.buf.BoolColumn(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV3) Float64Column(name string, val float64) LineSender {
+	s.buf.Float64ColumnBinary(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV3) Float64Array1DColumn(name string, values []float64) LineSender {
+	s.buf.Float64Array1DColumn(name, values)
+	return s
+}
+
+func (s *tcpLineSenderV3) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	s.buf.Float64Array2DColumn(name, values)
+	return s
+}
+
+func (s *tcpLineSenderV3) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	s.buf.Float64Array3DColumn(name, values)
+	return s
+}
+
+func (s *tcpLineSenderV3) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	s.buf.Float64ArrayNDColumn(name, values)
+	return s
+}
+
+func (s *tcpLineSenderV3) DecimalColumn(name string, val any) LineSender {
+	s.buf.DecimalColumn(name, val)
 	return s
 }

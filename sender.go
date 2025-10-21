@@ -106,6 +106,17 @@ type LineSender interface {
 	// '-', '*' '%%', '~', or a non-printable char.
 	Float64Column(name string, val float64) LineSender
 
+	// DecimalColumn adds a decimal column value to the ILP message.
+	//
+	// Supported value types include questdb.Decimal, any custom type implementing
+	// questdb.DecimalMarshaler, github.com/shopspring/decimal.Decimal (value or pointer),
+	// and nil to encode a NULL decimal.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	DecimalColumn(name string, val any) LineSender
+
 	// StringColumn adds a string column value to the ILP message.
 	//
 	// Column name cannot contain any of the following characters:
@@ -253,6 +264,7 @@ const (
 	protocolVersionUnset protocolVersion = 0
 	ProtocolVersion1     protocolVersion = 1
 	ProtocolVersion2     protocolVersion = 2
+	ProtocolVersion3     protocolVersion = 3
 )
 
 type lineSenderConfig struct {
@@ -479,8 +491,10 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 //   - TCP transport does not negotiate the protocol version and uses [ProtocolVersion1] by
 //     default. You must explicitly set [ProtocolVersion2] in order to ingest
 //     arrays.
+//   - [ProtocolVersion3] enables decimal binary encoding (ILP v3).
 //
 // NOTE: QuestDB server version 9.0.0 or later is required for [ProtocolVersion2].
+// For [ProtocolVersion3], make sure the server advertises ILP v3 support via /settings.
 func WithProtocolVersion(version protocolVersion) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.protocolVersion = version
@@ -721,9 +735,9 @@ func validateConf(conf *lineSenderConfig) error {
 	if conf.autoFlushInterval < 0 {
 		return fmt.Errorf("auto flush interval is negative: %d", conf.autoFlushInterval)
 	}
-	if conf.protocolVersion < protocolVersionUnset || conf.protocolVersion > ProtocolVersion2 {
-		return errors.New("current client only supports protocol version 1(text format for all datatypes), " +
-			"2(binary format for part datatypes) or explicitly unset")
+	if conf.protocolVersion < protocolVersionUnset || conf.protocolVersion > ProtocolVersion3 {
+		return errors.New("current client only supports protocol version 1 (text format for all datatypes), " +
+			"2 (binary format for floats/arrays), 3 (binary decimals) or explicitly unset")
 	}
 
 	return nil

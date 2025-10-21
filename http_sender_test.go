@@ -827,7 +827,7 @@ func TestAutoDetectProtocolVersionNewServer2(t *testing.T) {
 func TestAutoDetectProtocolVersionNewServer3(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2, 3})
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2, 4})
 	assert.NoError(t, err)
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
@@ -838,11 +838,22 @@ func TestAutoDetectProtocolVersionNewServer3(t *testing.T) {
 func TestAutoDetectProtocolVersionNewServer4(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{3})
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{4})
 	assert.NoError(t, err)
 	defer srv.Close()
 	_, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.ErrorContains(t, err, "server does not support current client")
+}
+
+func TestAutoDetectProtocolVersionNewServer5(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2, 3})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion3)
+	assert.NoError(t, err)
 }
 
 func TestAutoDetectProtocolVersionError(t *testing.T) {
@@ -911,6 +922,25 @@ func TestArrayColumnUnsupportedInHttpProtocolV1(t *testing.T) {
 		At(ctx, time.UnixMicro(4))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+}
+
+func TestDecimalColumnUnsupportedInHttpProtocolV2(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
+	defer cancel()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	err = sender.
+		Table(testTable).
+		DecimalColumn("price", "12.99").
+		At(ctx, time.UnixMicro(1))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support decimal")
 }
 
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
