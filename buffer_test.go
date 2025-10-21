@@ -37,8 +37,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-const decimalTypeCode byte = 0x17
-
 type bufWriterFn func(b *qdb.Buffer) error
 
 type fakeShopspringDecimal struct {
