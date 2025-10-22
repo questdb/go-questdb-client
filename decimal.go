@@ -361,7 +361,7 @@ func validateDecimalText(text string) error {
 			seenDot = true
 			i++
 		case ch == 'e' || ch == 'E':
-			if digits == 0 && !seenDot {
+			if digits == 0 {
 				return fmt.Errorf("decimal literal exponent without mantissa")
 			}
 			i++
