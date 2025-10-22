@@ -545,13 +545,11 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 					questdbC, err := setupQuestDB(ctx, noAuth)
 					assert.NoError(t, err)
 
-					currentVersion := pVersion
 					switch protocol {
 					case "tcp":
 						switch pVersion {
 						case 0:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress))
-							currentVersion = 1
 						case 1:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(questdbC.ilpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
 						case 2:
@@ -564,7 +562,6 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 						switch pVersion {
 						case 0:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress))
-							currentVersion = 3
 						case 1:
 							sender, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(questdbC.httpAddress), qdb.WithProtocolVersion(qdb.ProtocolVersion1))
 						case 2:
@@ -576,10 +573,11 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 					default:
 						panic(protocol)
 					}
-					if currentVersion < 2 && tc.name == "double array" {
+					senderVersion := qdb.ProtocolVersion(sender)
+					if senderVersion < 2 && tc.name == "double array" {
 						return
 					}
-					if currentVersion < 3 && strings.Contains(tc.name, "decimal") {
+					if senderVersion < 3 && strings.Contains(tc.name, "decimal") {
 						return
 					}
 
