@@ -139,7 +139,7 @@ func (d ScaledDecimal) toBinary() (byte, []byte, error) {
 		payload = []byte{0}
 	}
 	if len(payload) > maxDecimalBytes {
-		return 0, nil, fmt.Errorf("decimal value exceeds 256-bit range (got %d bytes)", len(payload))
+		return 0, nil, fmt.Errorf("decimal value exceeds 127-bytes limit (got %d bytes)", len(payload))
 	}
 	return byte(d.scale), payload, nil
 }

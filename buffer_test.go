@@ -608,7 +608,7 @@ func TestDecimalColumnErrors(t *testing.T) {
 		bigVal := new(big.Int).Lsh(big.NewInt(1), 2100)
 		dec := qdb.NewDecimal(bigVal, 0)
 		err := buf.Table(testTable).DecimalColumn("price", dec).At(time.Time{}, false)
-		assert.ErrorContains(t, err, "exceeds 256-bit range")
+		assert.ErrorContains(t, err, "exceeds 127-bytes limit")
 		assert.Empty(t, buf.Messages())
 	})
 
