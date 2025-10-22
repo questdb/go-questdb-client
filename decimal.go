@@ -56,7 +56,7 @@ type shopspringDecimal interface {
 }
 
 // NewScaledDecimal constructs a decimal from a two's complement big-endian unscaled value and a scale.
-// A nil unscaled slice produces a NULL decimal.
+// A nil/empty unscaled slice produces a NULL decimal.
 func NewScaledDecimal(unscaled []byte, scale uint32) ScaledDecimal {
 	if len(unscaled) == 0 {
 		return NullDecimal()
