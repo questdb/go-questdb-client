@@ -385,9 +385,6 @@ func validateDecimalText(text string) error {
 			if i != length {
 				return fmt.Errorf("decimal literal has trailing characters")
 			}
-			if digits == 0 && !seenDot {
-				return fmt.Errorf("decimal literal missing mantissa digits")
-			}
 			return nil
 		default:
 			return fmt.Errorf("decimal literal contains invalid character %q", ch)
