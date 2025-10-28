@@ -618,6 +618,13 @@ func TestDecimalColumnErrors(t *testing.T) {
 		assert.ErrorContains(t, err, "unsupported decimal column value type")
 		assert.Empty(t, buf.Messages())
 	})
+
+	t.Run("no column", func(t *testing.T) {
+		buf := newTestBuffer()
+		err := buf.Table(testTable).DecimalColumn("price", qdb.NullDecimal()).At(time.Time{}, false)
+		assert.ErrorContains(t, err, "no symbols or columns were provided: invalid message")
+		assert.Empty(t, buf.Messages())
+	})
 }
 
 func TestFloat64Array1DColumn(t *testing.T) {

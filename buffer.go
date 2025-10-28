@@ -581,12 +581,12 @@ func (b *buffer) DecimalColumn(name string, val any) *buffer {
 	if b.lastErr != nil {
 		return b
 	}
-	b.WriteByte('=')
 	if str, ok := val.(string); ok {
 		if err := validateDecimalText(str); err != nil {
 			b.lastErr = err
 			return b
 		}
+		b.WriteByte('=')
 		b.WriteString(str)
 		b.WriteByte('d')
 		b.hasFields = true
@@ -603,6 +603,11 @@ func (b *buffer) DecimalColumn(name string, val any) *buffer {
 		b.lastErr = err
 		return b
 	}
+	if len(payload) == 0 {
+		// Don't write null decimals
+		return b
+	}
+	b.WriteByte('=')
 	b.WriteByte('=')
 	b.WriteByte(decimalBinaryTypeCode)
 	b.WriteByte(scale)
