@@ -125,7 +125,7 @@ type LineSender interface {
 	// '-', '*' '%%', '~', or a non-printable char.
 	DecimalColumnScaled(name string, val ScaledDecimal) LineSender
 
-	// DecimalColumnScaled adds a decimal column value to the ILP message.
+	// DecimalColumnShopspring adds a decimal column value to the ILP message.
 	//
 	// Serializes the decimal value using the binary representation.
 	//
