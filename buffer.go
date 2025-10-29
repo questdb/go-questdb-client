@@ -574,6 +574,10 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 }
 
 func (b *buffer) DecimalColumnScaled(name string, val ScaledDecimal) *buffer {
+	if val.IsNull() {
+		// Don't write null decimals
+		return b
+	}
 	if !b.prepareForField() {
 		return b
 	}
@@ -583,10 +587,6 @@ func (b *buffer) DecimalColumnScaled(name string, val ScaledDecimal) *buffer {
 func (b *buffer) decimalColumnScaled(name string, val ScaledDecimal) *buffer {
 	if err := val.ensureValidScale(); err != nil {
 		b.lastErr = err
-		return b
-	}
-	if val.IsNull() {
-		// Don't write null decimals
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -623,15 +623,22 @@ func (b *buffer) DecimalColumnString(name string, val string) *buffer {
 }
 
 func (b *buffer) DecimalColumnShopspring(name string, val ShopspringDecimal) *buffer {
-	if !b.prepareForField() {
+	if val == nil {
 		return b
 	}
-	if val == nil {
+	if b.lastErr != nil {
 		return b
 	}
 	dec, err := convertShopspringDecimal(val)
 	if err != nil {
 		b.lastErr = err
+		return b
+	}
+	if dec.IsNull() {
+		// Don't write null decimals
+		return b
+	}
+	if !b.prepareForField() {
 		return b
 	}
 	return b.decimalColumnScaled(name, dec)
