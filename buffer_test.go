@@ -619,6 +619,11 @@ func TestDecimalColumnShopspring(t *testing.T) {
 			expectedBytes: []byte{0x17, 0x02, 0x02, 0x30, 0x39},
 		},
 		{
+			name:          "zero",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(0), exp: 0},
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0x00},
+		},
+		{
 			name:          "positive exponent multiplies coefficient",
 			value:         fakeShopspringDecimal{coeff: big.NewInt(123), exp: 2},
 			expectedBytes: []byte{0x17, 0x00, 0x02, 0x30, 0x0C},

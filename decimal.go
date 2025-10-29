@@ -165,7 +165,7 @@ func bigPow10(exponent int) *big.Int {
 
 func bigIntToTwosComplement(value *big.Int) ([32]byte, uint8, error) {
 	if value.Sign() == 0 {
-		return [32]byte{0}, 32, nil
+		return [32]byte{0}, 31, nil
 	}
 	if value.Sign() > 0 {
 		bytes := value.Bytes()
