@@ -574,7 +574,7 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 }
 
 func (b *buffer) DecimalColumnScaled(name string, val ScaledDecimal) *buffer {
-	if val.IsNull() {
+	if val.isNull() {
 		// Don't write null decimals
 		return b
 	}
@@ -634,7 +634,7 @@ func (b *buffer) DecimalColumnShopspring(name string, val ShopspringDecimal) *bu
 		b.lastErr = err
 		return b
 	}
-	if dec.IsNull() {
+	if dec.isNull() {
 		// Don't write null decimals
 		return b
 	}

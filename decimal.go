@@ -100,27 +100,13 @@ func NewDecimalFromInt64(unscaled int64, scale uint32) ScaledDecimal {
 	}
 }
 
-// IsNull reports whether the decimal represents NULL.
-func (d ScaledDecimal) IsNull() bool {
+// isNull reports whether the decimal represents NULL.
+func (d ScaledDecimal) isNull() bool {
 	return d.offset >= 32
 }
 
-// Scale returns the decimal scale.
-func (d ScaledDecimal) Scale() uint32 {
-	return d.scale
-}
-
-// UnscaledValue returns a copy of the unscaled integer value.
-// For NULL decimals it returns nil.
-func (d ScaledDecimal) UnscaledValue() *big.Int {
-	if d.IsNull() {
-		return nil
-	}
-	return twosComplementToBigInt(d.unscaled[d.offset:])
-}
-
 func (d ScaledDecimal) ensureValidScale() error {
-	if d.IsNull() {
+	if d.isNull() {
 		return nil
 	}
 	if d.scale > maxDecimalScale {
@@ -231,25 +217,6 @@ func trimTwosComplement(bytes []byte) int {
 		break
 	}
 	return i
-}
-
-func twosComplementToBigInt(bytes []byte) *big.Int {
-	if len(bytes) == 0 {
-		return big.NewInt(0)
-	}
-	if bytes[0]&0x80 == 0 {
-		return new(big.Int).SetBytes(bytes)
-	}
-
-	inverted := make([]byte, len(bytes))
-	for i := range bytes {
-		inverted[i] = ^bytes[i]
-	}
-
-	magnitude := new(big.Int).SetBytes(inverted)
-	magnitude.Add(magnitude, big.NewInt(1))
-	magnitude.Neg(magnitude)
-	return magnitude
 }
 
 // validateDecimalText checks that the provided string is a valid decimal representation.
