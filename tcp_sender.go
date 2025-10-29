@@ -203,8 +203,18 @@ func (s *tcpLineSender) Float64Column(name string, val float64) LineSender {
 	return s
 }
 
-func (s *tcpLineSender) DecimalColumn(name string, val any) LineSender {
-	s.buf.SetLastErr(errors.New("current protocol version does not support decimal"))
+func (s *tcpLineSender) DecimalColumnString(name string, val string) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *tcpLineSender) DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *tcpLineSender) DecimalColumnScaled(name string, val ScaledDecimal) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
 
@@ -371,8 +381,18 @@ func (s *tcpLineSenderV2) Float64ArrayNDColumn(name string, values *NdArray[floa
 	return s
 }
 
-func (s *tcpLineSenderV2) DecimalColumn(name string, val any) LineSender {
-	s.buf.SetLastErr(errors.New("current protocol version does not support decimal"))
+func (s *tcpLineSenderV2) DecimalColumnString(name string, val string) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *tcpLineSenderV2) DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *tcpLineSenderV2) DecimalColumnScaled(name string, val ScaledDecimal) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
 
@@ -436,7 +456,17 @@ func (s *tcpLineSenderV3) Float64ArrayNDColumn(name string, values *NdArray[floa
 	return s
 }
 
-func (s *tcpLineSenderV3) DecimalColumn(name string, val any) LineSender {
-	s.buf.DecimalColumn(name, val)
+func (s *tcpLineSenderV3) DecimalColumnString(name string, val string) LineSender {
+	s.buf.DecimalColumnString(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV3) DecimalColumnScaled(name string, val ScaledDecimal) LineSender {
+	s.buf.DecimalColumnScaled(name, val)
+	return s
+}
+
+func (s *tcpLineSenderV3) DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender {
+	s.buf.DecimalColumnShopspring(name, val)
 	return s
 }

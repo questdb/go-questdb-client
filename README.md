@@ -191,12 +191,11 @@ ingestion workload.
 ## Decimal columns
 
 QuestDB server version 9.2.0 and newer supports decimal columns with arbitrary precision and scale.
-The Go client converts supported decimal values to QuestDB's text/binary wire format automatically, pass any of the following to `DecimalColumn`:
+The Go client converts supported decimal values to QuestDB's text/binary wire format automatically:
 
-- `questdb.ScaledDecimal`, including helpers like `questdb.NewDecimalFromInt64` and `questdb.NewDecimal`.
-- Types implementing `questdb.DecimalMarshaler`.
-- `github.com/shopspring/decimal.Decimal` values or pointers.
-- `nil` or `questdb.NullDecimal()` to send a `NULL`.
+- `DecimalColumnScaled`: `questdb.ScaledDecimal`, including helpers like `questdb.NewDecimalFromInt64` and `questdb.NewDecimal`.
+- `DecimalColumnShopspring`: `github.com/shopspring/decimal.Decimal` values or pointers.
+- `DecimalColumnString`: `string` literals representing decimal values (validated at runtime).
 
 ```go
 price := qdb.NewDecimalFromInt64(12345, 2) // 123.45 with scale 2
@@ -205,17 +204,17 @@ commission := qdb.NewDecimal(big.NewInt(-750), 4) // -0.0750 with scale 4
 err = sender.
     Table("trades").
     Symbol("symbol", "ETH-USD").
-    DecimalColumn("price", price).
-    DecimalColumn("commission", commission).
+    DecimalColumnScaled("price", price).
+    DecimalColumnScaled("commission", commission).
     AtNow(ctx)
 ```
 
-To emit textual decimals, pass a validated string literal (without the trailing `d`—the client adds it):
+To emit textual decimals, pass a validated string literal:
 
 ```go
 err = sender.
     Table("quotes").
-    DecimalColumn("mid", "1.23456").
+    DecimalColumnString("mid", "1.23456").
     AtNow(ctx)
 ```
 

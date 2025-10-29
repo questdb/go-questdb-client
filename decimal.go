@@ -28,79 +28,81 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
-	"reflect"
 )
 
 const (
 	decimalBinaryTypeCode byte   = 0x17
 	maxDecimalScale       uint32 = 76
-	maxDecimalBytes       int    = 127
 )
 
 // ScaledDecimal represents a decimal value as a two's complement big-endian byte slice and a scale.
-// NULL decimals are represented by valid=false.
+// NULL decimals are represented by an offset of 32.
 type ScaledDecimal struct {
 	scale    uint32
-	unscaled []byte
-	valid    bool
+	unscaled [32]byte
+	offset   uint8
 }
 
-// DecimalMarshaler allows custom types to provide a QuestDB-compatible decimal representation.
-type DecimalMarshaler interface {
-	QuestDBDecimal() (ScaledDecimal, error)
-}
-
-type shopspringDecimal interface {
+type ShopspringDecimal interface {
 	Coefficient() *big.Int
 	Exponent() int32
 }
 
 // NewScaledDecimal constructs a decimal from a two's complement big-endian unscaled value and a scale.
 // A nil/empty unscaled slice produces a NULL decimal.
-func NewScaledDecimal(unscaled []byte, scale uint32) ScaledDecimal {
+func NewScaledDecimal(unscaled []byte, scale uint32) (ScaledDecimal, error) {
 	if len(unscaled) == 0 {
-		return NullDecimal()
+		return ScaledDecimal{
+			offset: 32,
+		}, nil
+	}
+	normalized, offset, err := normalizeTwosComplement(unscaled)
+	if err != nil {
+		return ScaledDecimal{}, err
 	}
 	return ScaledDecimal{
 		scale:    scale,
-		unscaled: normalizeTwosComplement(unscaled),
-		valid:    true,
-	}
+		unscaled: normalized,
+		offset:   offset,
+	}, nil
 }
 
 // NewDecimal constructs a decimal from an arbitrary-precision integer and a scale.
 // Providing a nil unscaled value produces a NULL decimal.
-func NewDecimal(unscaled *big.Int, scale uint32) ScaledDecimal {
+func NewDecimal(unscaled *big.Int, scale uint32) (ScaledDecimal, error) {
 	if unscaled == nil {
-		return NullDecimal()
+		return ScaledDecimal{
+			offset: 32,
+		}, nil
+	}
+	unscaledRaw, offset, err := bigIntToTwosComplement(unscaled)
+	if err != nil {
+		return ScaledDecimal{}, err
 	}
 	return ScaledDecimal{
 		scale:    scale,
-		unscaled: bigIntToTwosComplement(unscaled),
-		valid:    true,
-	}
+		unscaled: unscaledRaw,
+		offset:   offset,
+	}, nil
 }
 
 // NewDecimalFromInt64 constructs a decimal from a 64-bit integer and a scale.
 func NewDecimalFromInt64(unscaled int64, scale uint32) ScaledDecimal {
 	var be [8]byte
 	binary.BigEndian.PutUint64(be[:], uint64(unscaled))
-	payload := trimTwosComplement(be[:])
+	offset := trimTwosComplement(be[:])
+	payload := [32]byte{}
+	copy(payload[32-(8-offset):], be[offset:])
 	return ScaledDecimal{
 		scale:    scale,
 		unscaled: payload,
-		valid:    true,
+		offset:   uint8(32 - (8 - offset)),
 	}
-}
-
-// NullDecimal returns a NULL decimal representation.
-func NullDecimal() ScaledDecimal {
-	return ScaledDecimal{}
 }
 
 // IsNull reports whether the decimal represents NULL.
 func (d ScaledDecimal) IsNull() bool {
-	return !d.valid
+	return d.offset >= 32
 }
 
 // Scale returns the decimal scale.
@@ -114,7 +116,7 @@ func (d ScaledDecimal) UnscaledValue() *big.Int {
 	if d.IsNull() {
 		return nil
 	}
-	return twosComplementToBigInt(d.unscaled)
+	return twosComplementToBigInt(d.unscaled[d.offset:])
 }
 
 func (d ScaledDecimal) ensureValidScale() error {
@@ -127,104 +129,26 @@ func (d ScaledDecimal) ensureValidScale() error {
 	return nil
 }
 
-func (d ScaledDecimal) toBinary() (byte, []byte, error) {
-	if d.IsNull() {
-		return 0, nil, nil
-	}
-	if err := d.ensureValidScale(); err != nil {
-		return 0, nil, err
-	}
-	payload := append([]byte(nil), d.unscaled...)
-	if len(payload) == 0 {
-		payload = []byte{0}
-	}
-	if len(payload) > maxDecimalBytes {
-		return 0, nil, fmt.Errorf("decimal value exceeds 127-bytes limit (got %d bytes)", len(payload))
-	}
-	return byte(d.scale), payload, nil
-}
-
-func normalizeDecimalValue(value any) (ScaledDecimal, error) {
-	if value == nil {
-		return NullDecimal(), nil
-	}
-
-	switch v := value.(type) {
-	case ScaledDecimal:
-		return canonicalDecimal(v), nil
-	case *ScaledDecimal:
-		if v == nil {
-			return NullDecimal(), nil
-		}
-		return canonicalDecimal(*v), nil
-	case DecimalMarshaler:
-		if isNilInterface(v) {
-			return NullDecimal(), nil
-		}
-		dec, err := v.QuestDBDecimal()
-		if err != nil {
-			return ScaledDecimal{}, err
-		}
-		return canonicalDecimal(dec), nil
-	}
-
-	if dec, ok := convertShopspringDecimal(value); ok {
-		return dec, nil
-	}
-
-	return ScaledDecimal{}, fmt.Errorf("unsupported decimal column value type %T", value)
-}
-
-func canonicalDecimal(d ScaledDecimal) ScaledDecimal {
-	if !d.valid {
-		return NullDecimal()
-	}
-	if len(d.unscaled) == 0 {
-		return NullDecimal()
-	}
-	return ScaledDecimal{
-		scale:    d.scale,
-		unscaled: normalizeTwosComplement(d.unscaled),
-		valid:    true,
-	}
-}
-
-func convertShopspringDecimal(value any) (ScaledDecimal, bool) {
-	dec, ok := value.(shopspringDecimal)
-	if !ok {
-		return ScaledDecimal{}, false
-	}
-	if isNilInterface(dec) {
-		return NullDecimal(), true
-	}
-
-	coeff := dec.Coefficient()
+func convertShopspringDecimal(value ShopspringDecimal) (ScaledDecimal, error) {
+	coeff := value.Coefficient()
 	if coeff == nil {
-		return NullDecimal(), true
+		return ScaledDecimal{
+			offset: 32,
+		}, nil
 	}
 
-	exp := dec.Exponent()
+	exp := value.Exponent()
+	var scale uint32
+	var unscaled *big.Int
 	if exp >= 0 {
-		unscaled := new(big.Int).Set(coeff)
+		unscaled = new(big.Int).Set(coeff)
 		unscaled.Mul(unscaled, bigPow10(int(exp)))
-		return NewDecimal(unscaled, 0), true
+		scale = 0
+	} else {
+		scale = uint32(-exp)
+		unscaled = new(big.Int).Set(coeff)
 	}
-	scale := uint32(-exp)
-	unscaled := new(big.Int).Set(coeff)
-	return NewDecimal(unscaled, scale), true
-}
-
-func isNilInterface(value any) bool {
-	if value == nil {
-		return true
-	}
-	rv := reflect.ValueOf(value)
-	switch rv.Kind() {
-	case reflect.Interface, reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func:
-		return rv.IsNil()
-	default:
-		return false
-	}
+	return NewDecimal(unscaled, scale)
 }
 
 func bigPow10(exponent int) *big.Int {
@@ -239,16 +163,16 @@ func bigPow10(exponent int) *big.Int {
 	return result
 }
 
-func bigIntToTwosComplement(value *big.Int) []byte {
+func bigIntToTwosComplement(value *big.Int) ([32]byte, uint8, error) {
 	if value.Sign() == 0 {
-		return []byte{0}
+		return [32]byte{0}, 32, nil
 	}
 	if value.Sign() > 0 {
 		bytes := value.Bytes()
 		if bytes[0]&0x80 != 0 {
-			return append([]byte{0x00}, bytes...)
+			bytes = append([]byte{0x00}, bytes...)
 		}
-		return trimTwosComplement(bytes)
+		return normalizeTwosComplement(bytes)
 	}
 
 	bitLen := value.BitLen()
@@ -265,27 +189,30 @@ func bigIntToTwosComplement(value *big.Int) []byte {
 		bytes = append(padding, bytes...)
 	}
 
-	bytes = trimTwosComplement(bytes)
 	if bytes[0]&0x80 == 0 {
 		bytes = append([]byte{0xFF}, bytes...)
 	}
-	return trimTwosComplement(bytes)
+	return normalizeTwosComplement(bytes)
 }
 
-func normalizeTwosComplement(src []byte) []byte {
+// normalizeTwosComplement normalizes a two's complement big-endian byte slice to fit within 32 bytes and returns the normalized value along with the offset to the first significant byte.
+func normalizeTwosComplement(src []byte) ([32]byte, uint8, error) {
 	if len(src) == 0 {
-		return []byte{0}
+		return [32]byte{0}, 32, nil
 	}
-	trimmed := trimTwosComplement(append([]byte(nil), src...))
-	if len(trimmed) == 0 {
-		return []byte{0}
+	offset := trimTwosComplement(src)
+	if len(src)-offset > 32 {
+		return [32]byte{}, 0, fmt.Errorf("decimal unscaled value exceeds 32 bytes")
 	}
-	return trimmed
+	var trimmed [32]byte
+	copy(trimmed[32-(len(src)-offset):], src[offset:])
+	return trimmed, uint8(32 - (len(src) - offset)), nil
 }
 
-func trimTwosComplement(bytes []byte) []byte {
+// trimTwosComplement removes redundant sign bytes from a two's complement big-endian byte slice and returns the offset to the first significant byte.
+func trimTwosComplement(bytes []byte) int {
 	if len(bytes) <= 1 {
-		return bytes
+		return 0
 	}
 	signBit := bytes[0] & 0x80
 	i := 0
@@ -303,7 +230,7 @@ func trimTwosComplement(bytes []byte) []byte {
 		}
 		break
 	}
-	return bytes[i:]
+	return i
 }
 
 func twosComplementToBigInt(bytes []byte) *big.Int {

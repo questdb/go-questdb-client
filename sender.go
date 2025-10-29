@@ -40,6 +40,7 @@ var (
 	errFlushWithPendingMessage = errors.New("pending ILP message must be finalized with At or AtNow before calling Flush")
 	errClosedSenderAt          = errors.New("cannot queue new messages on a closed LineSender")
 	errDoubleSenderClose       = errors.New("double sender close")
+	errDecimalNotSupported     = errors.New("current protocol version does not support decimal")
 )
 
 // LineSender allows you to insert rows into QuestDB by sending ILP
@@ -108,14 +109,30 @@ type LineSender interface {
 
 	// DecimalColumn adds a decimal column value to the ILP message.
 	//
-	// Supported value types include questdb.Decimal, any custom type implementing
-	// questdb.DecimalMarshaler, github.com/shopspring/decimal.Decimal (value or pointer),
-	// and nil to encode a NULL decimal.
+	// Serializes the decimal value using the text representation.
 	//
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
-	DecimalColumn(name string, val any) LineSender
+	DecimalColumnString(name string, val string) LineSender
+
+	// DecimalColumnScaled adds a decimal column value to the ILP message.
+	//
+	// Serializes the decimal value using the binary representation.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	DecimalColumnScaled(name string, val ScaledDecimal) LineSender
+
+	// DecimalColumnScaled adds a decimal column value to the ILP message.
+	//
+	// Serializes the decimal value using the binary representation.
+	//
+	// Column name cannot contain any of the following characters:
+	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
+	// '-', '*' '%%', '~', or a non-printable char.
+	DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender
 
 	// StringColumn adds a string column value to the ILP message.
 	//

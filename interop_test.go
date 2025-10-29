@@ -124,7 +124,7 @@ func execute(t *testing.T, ctx context.Context, sender qdb.LineSender, backCh ch
 		case "DECIMAL":
 			dec, err := parseDecimal64(s.Value.(string))
 			assert.NoError(t, err)
-			sender.DecimalColumn(s.Name, dec)
+			sender.DecimalColumnScaled(s.Name, dec)
 		default:
 			assert.Fail(t, "unexpected column type: "+s.Type)
 		}

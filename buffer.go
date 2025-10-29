@@ -573,50 +573,68 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 	return b
 }
 
-func (b *buffer) DecimalColumn(name string, val any) *buffer {
+func (b *buffer) DecimalColumnScaled(name string, val ScaledDecimal) *buffer {
 	if !b.prepareForField() {
+		return b
+	}
+	return b.decimalColumnScaled(name, val)
+}
+
+func (b *buffer) decimalColumnScaled(name string, val ScaledDecimal) *buffer {
+	if err := val.ensureValidScale(); err != nil {
+		b.lastErr = err
+		return b
+	}
+	if val.IsNull() {
+		// Don't write null decimals
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
 	if b.lastErr != nil {
 		return b
 	}
-	if str, ok := val.(string); ok {
-		if err := validateDecimalText(str); err != nil {
-			b.lastErr = err
-			return b
-		}
-		b.WriteByte('=')
-		b.WriteString(str)
-		b.WriteByte('d')
-		b.hasFields = true
-		return b
-	}
-
-	dec, err := normalizeDecimalValue(val)
-	if err != nil {
-		b.lastErr = err
-		return b
-	}
-	scale, payload, err := dec.toBinary()
-	if err != nil {
-		b.lastErr = err
-		return b
-	}
-	if len(payload) == 0 {
-		// Don't write null decimals
-		return b
-	}
 	b.WriteByte('=')
 	b.WriteByte('=')
 	b.WriteByte(decimalBinaryTypeCode)
-	b.WriteByte(scale)
-	b.WriteByte(byte(len(payload)))
-	if len(payload) > 0 {
-		b.Write(payload)
-	}
+	b.WriteByte((uint8)(val.scale))
+	b.WriteByte(32 - val.offset)
+	b.Write(val.unscaled[val.offset:])
 	b.hasFields = true
 	return b
+}
+
+func (b *buffer) DecimalColumnString(name string, val string) *buffer {
+	if !b.prepareForField() {
+		return b
+	}
+	if err := validateDecimalText(val); err != nil {
+		b.lastErr = err
+		return b
+	}
+	b.lastErr = b.writeColumnName(name)
+	if b.lastErr != nil {
+		return b
+	}
+	b.WriteByte('=')
+	b.WriteString(val)
+	b.WriteByte('d')
+	b.hasFields = true
+	return b
+}
+
+func (b *buffer) DecimalColumnShopspring(name string, val ShopspringDecimal) *buffer {
+	if !b.prepareForField() {
+		return b
+	}
+	if val == nil {
+		return b
+	}
+	dec, err := convertShopspringDecimal(val)
+	if err != nil {
+		b.lastErr = err
+		return b
+	}
+	return b.decimalColumnScaled(name, dec)
 }
 
 func (b *buffer) Float64ColumnBinary(name string, val float64) *buffer {

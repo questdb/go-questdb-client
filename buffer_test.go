@@ -494,11 +494,14 @@ func TestFloat64ColumnBinary(t *testing.T) {
 	}
 }
 
-func TestDecimalColumnText(t *testing.T) {
+func TestDecimalColumnScaled(t *testing.T) {
+	negative, err := qdb.NewDecimal(big.NewInt(-12345), 3)
+	assert.NoError(t, err)
+
 	prefix := []byte(testTable + " price==")
 	testCases := []struct {
 		name     string
-		value    any
+		value    qdb.ScaledDecimal
 		expected []byte
 	}{
 		{
@@ -508,7 +511,7 @@ func TestDecimalColumnText(t *testing.T) {
 		},
 		{
 			name:     "negative",
-			value:    qdb.NewDecimal(big.NewInt(-12345), 3),
+			value:    negative,
 			expected: append(prefix, 0x17, 0x03, 0x02, 0xCF, 0xC7, 0x0A),
 		},
 		{
@@ -516,29 +519,132 @@ func TestDecimalColumnText(t *testing.T) {
 			value:    qdb.NewDecimalFromInt64(0, 4),
 			expected: append(prefix, 0x17, 0x04, 0x01, 0x0, 0x0A),
 		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := newTestBuffer()
+			err := buf.Table(testTable).DecimalColumnScaled("price", tc.value).At(time.Time{}, false)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, buf.Messages())
+		})
+	}
+}
+
+func TestDecimalColumnScaledTrimmingAndPadding(t *testing.T) {
+	prefix := []byte(testTable + " price==")
+
+	testCases := []struct {
+		name          string
+		value         qdb.ScaledDecimal
+		expectedBytes []byte
+	}{
 		{
-			name:     "null decimal",
-			value:    qdb.NullDecimal(),
-			expected: append(prefix, 0x17, 0x0, 0x0, 0x0A),
+			name:          "127 boundary",
+			value:         qdb.NewDecimalFromInt64(127, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0x7F},
 		},
 		{
-			name:     "shopspring compatible",
-			value:    fakeShopspringDecimal{coeff: big.NewInt(123456), exp: -4},
-			expected: append(prefix, 0x17, 0x04, 0x03, 0x01, 0xE2, 0x40, 0x0A),
+			name:          "128 sign extension",
+			value:         qdb.NewDecimalFromInt64(128, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0x00, 0x80},
 		},
 		{
-			name:     "nil pointer treated as null",
-			value:    (*fakeShopspringDecimal)(nil),
-			expected: append(prefix, 0x17, 0x0, 0x0, 0x0A),
+			name:          "255 sign extension",
+			value:         qdb.NewDecimalFromInt64(255, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0x00, 0xFF},
+		},
+		{
+			name:          "32768 sign extension",
+			value:         qdb.NewDecimalFromInt64(32768, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x03, 0x00, 0x80, 0x00},
+		},
+		{
+			name:          "-1",
+			value:         qdb.NewDecimalFromInt64(-1, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0xFF},
+		},
+		{
+			name:          "-2",
+			value:         qdb.NewDecimalFromInt64(-2, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0xFE},
+		},
+		{
+			name:          "-127",
+			value:         qdb.NewDecimalFromInt64(-127, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0x81},
+		},
+		{
+			name:          "-128",
+			value:         qdb.NewDecimalFromInt64(-128, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0x80},
+		},
+		{
+			name:          "-129",
+			value:         qdb.NewDecimalFromInt64(-129, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0xFF, 0x7F},
+		},
+		{
+			name:          "-256 sign extension",
+			value:         qdb.NewDecimalFromInt64(-256, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0xFF, 0x00},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := newTestBuffer()
-			err := buf.Table(testTable).DecimalColumn("price", tc.value).At(time.Time{}, false)
+
+			err := buf.Table(testTable).DecimalColumnScaled("price", tc.value).At(time.Time{}, false)
 			assert.NoError(t, err)
-			assert.Equal(t, tc.expected, buf.Messages())
+
+			expected := append(append([]byte{}, prefix...), tc.expectedBytes...)
+			expected = append(expected, '\n')
+			assert.Equal(t, expected, buf.Messages())
+		})
+	}
+}
+
+func TestDecimalColumnShopspring(t *testing.T) {
+	prefix := []byte(testTable + " price==")
+
+	testCases := []struct {
+		name          string
+		value         fakeShopspringDecimal
+		expectedBytes []byte
+	}{
+		{
+			name:          "negative exponent scales value",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(12345), exp: -2},
+			expectedBytes: []byte{0x17, 0x02, 0x02, 0x30, 0x39},
+		},
+		{
+			name:          "positive exponent multiplies coefficient",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(123), exp: 2},
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0x30, 0x0C},
+		},
+		{
+			name:          "positive value sign extension",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(128), exp: 0},
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0x00, 0x80},
+		},
+		{
+			name:          "negative value sign extension",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(-12345), exp: -3},
+			expectedBytes: []byte{0x17, 0x03, 0x02, 0xCF, 0xC7},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := newTestBuffer()
+
+			err := buf.Table(testTable).DecimalColumnShopspring("price", tc.value).At(time.Time{}, false)
+			assert.NoError(t, err)
+
+			expected := append(append([]byte{}, prefix...), tc.expectedBytes...)
+			expected = append(expected, '\n')
+			assert.Equal(t, expected, buf.Messages())
 		})
 	}
 }
@@ -561,7 +667,7 @@ func TestDecimalColumnStringValidation(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				buf := newTestBuffer()
-				err := buf.Table(testTable).DecimalColumn("price", tc.value).At(time.Time{}, false)
+				err := buf.Table(testTable).DecimalColumnString("price", tc.value).At(time.Time{}, false)
 				assert.NoError(t, err)
 				expected := []byte(testTable + " price=" + tc.expected + "\n")
 				assert.Equal(t, expected, buf.Messages())
@@ -585,7 +691,7 @@ func TestDecimalColumnStringValidation(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				buf := newTestBuffer()
-				err := buf.Table(testTable).DecimalColumn("price", tc.value).At(time.Time{}, false)
+				err := buf.Table(testTable).DecimalColumnString("price", tc.value).At(time.Time{}, false)
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), "decimal")
 				assert.Empty(t, buf.Messages())
@@ -598,30 +704,20 @@ func TestDecimalColumnErrors(t *testing.T) {
 	t.Run("invalid scale", func(t *testing.T) {
 		buf := newTestBuffer()
 		dec := qdb.NewDecimalFromInt64(1, 100)
-		err := buf.Table(testTable).DecimalColumn("price", dec).At(time.Time{}, false)
+		err := buf.Table(testTable).DecimalColumnScaled("price", dec).At(time.Time{}, false)
 		assert.ErrorContains(t, err, "decimal scale")
 		assert.Empty(t, buf.Messages())
 	})
 
 	t.Run("overflow", func(t *testing.T) {
-		buf := newTestBuffer()
 		bigVal := new(big.Int).Lsh(big.NewInt(1), 2100)
-		dec := qdb.NewDecimal(bigVal, 0)
-		err := buf.Table(testTable).DecimalColumn("price", dec).At(time.Time{}, false)
-		assert.ErrorContains(t, err, "exceeds 127-bytes limit")
-		assert.Empty(t, buf.Messages())
-	})
-
-	t.Run("unsupported type", func(t *testing.T) {
-		buf := newTestBuffer()
-		err := buf.Table(testTable).DecimalColumn("price", struct{}{}).At(time.Time{}, false)
-		assert.ErrorContains(t, err, "unsupported decimal column value type")
-		assert.Empty(t, buf.Messages())
+		_, err := qdb.NewDecimal(bigVal, 0)
+		assert.ErrorContains(t, err, "exceeds 32 bytes")
 	})
 
 	t.Run("no column", func(t *testing.T) {
 		buf := newTestBuffer()
-		err := buf.Table(testTable).DecimalColumn("price", qdb.NullDecimal()).At(time.Time{}, false)
+		err := buf.Table(testTable).DecimalColumnShopspring("price", nil).At(time.Time{}, false)
 		assert.ErrorContains(t, err, "no symbols or columns were provided: invalid message")
 		assert.Empty(t, buf.Messages())
 	})

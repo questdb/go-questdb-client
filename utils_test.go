@@ -74,7 +74,7 @@ func newTestTcpServer(serverType serverType) (*testServer, error) {
 }
 
 func newTestHttpServer(serverType serverType) (*testServer, error) {
-	return newTestServerWithProtocol(serverType, "http", []int{1, 2})
+	return newTestServerWithProtocol(serverType, "http", []int{1, 2, 3})
 }
 
 func newTestHttpServerWithErrMsg(serverType serverType, errMsg string) (*testServer, error) {

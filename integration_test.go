@@ -499,10 +499,10 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 			func(s qdb.LineSender) error {
 				err := s.
 					Table(testTable).
-					DecimalColumn("text_col", "123.45").
-					DecimalColumn("binary_col", qdb.NewDecimalFromInt64(12345, 2)).
-					DecimalColumn("binary_neg_col", qdb.NewDecimalFromInt64(-12345, 2)).
-					DecimalColumn("binary_null_col", qdb.NullDecimal()).
+					DecimalColumnString("text_col", "123.45").
+					DecimalColumnScaled("binary_col", qdb.NewDecimalFromInt64(12345, 2)).
+					DecimalColumnScaled("binary_neg_col", qdb.NewDecimalFromInt64(-12345, 2)).
+					DecimalColumnShopspring("binary_null_col", nil).
 					At(ctx, time.UnixMicro(1))
 				if err != nil {
 					return err
@@ -510,10 +510,10 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 
 				return s.
 					Table(testTable).
-					DecimalColumn("text_col", "123.46").
-					DecimalColumn("binary_col", qdb.NewDecimalFromInt64(12346, 2)).
-					DecimalColumn("binary_neg_col", qdb.NewDecimalFromInt64(-12346, 2)).
-					DecimalColumn("binary_null_col", qdb.NullDecimal()).
+					DecimalColumnString("text_col", "123.46").
+					DecimalColumnScaled("binary_col", qdb.NewDecimalFromInt64(12346, 2)).
+					DecimalColumnScaled("binary_neg_col", qdb.NewDecimalFromInt64(-12346, 2)).
+					DecimalColumnShopspring("binary_null_col", nil).
 					At(ctx, time.UnixMicro(2))
 			},
 			tableData{
@@ -521,12 +521,11 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 					{"text_col", "DECIMAL(18,3)"},
 					{"binary_col", "DECIMAL(18,3)"},
 					{"binary_neg_col", "DECIMAL(18,3)"},
-					{"binary_null_col", "DECIMAL(18,3)"},
 					{"timestamp", "TIMESTAMP"},
 				},
 				Dataset: [][]any{
-					{"123.450", "123.450", "-123.450", nil, "1970-01-01T00:00:00.000001Z"},
-					{"123.460", "123.460", "-123.460", nil, "1970-01-01T00:00:00.000002Z"},
+					{"123.450", "123.450", "-123.450", "1970-01-01T00:00:00.000001Z"},
+					{"123.460", "123.460", "-123.460", "1970-01-01T00:00:00.000002Z"},
 				},
 				Count: 2,
 			},
