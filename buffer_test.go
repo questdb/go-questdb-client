@@ -705,6 +705,43 @@ func TestDecimalColumnFromStringValidation(t *testing.T) {
 	})
 }
 
+func TestNewDecimalUnsafe(t *testing.T) {
+	t.Run("trimsLeadingZeros", func(t *testing.T) {
+		raw := []byte{0x00, 0x00, 0x01, 0x23}
+		dec, err := qdb.NewDecimalUnsafe(raw, 2)
+		assert.NoError(t, err)
+
+		expected := qdb.NewDecimalFromInt64(0x0123, 2)
+		assert.Equal(t, expected, dec)
+	})
+
+	t.Run("trimsSignExtensionForNegative", func(t *testing.T) {
+		raw := []byte{0xFF, 0xFF, 0xCF, 0xC7}
+		dec, err := qdb.NewDecimalUnsafe(raw, 3)
+		assert.NoError(t, err)
+
+		expected, err := qdb.NewDecimal(big.NewInt(-12345), 3)
+		assert.NoError(t, err)
+		assert.Equal(t, expected, dec)
+	})
+
+	t.Run("emptyInputProducesNullDecimal", func(t *testing.T) {
+		dec, err := qdb.NewDecimalUnsafe(nil, 5)
+		assert.NoError(t, err)
+
+		buf := newTestBuffer()
+		err = buf.Table(testTable).DecimalColumn("price", dec).At(time.Time{}, false)
+		assert.ErrorContains(t, err, "no symbols or columns")
+		assert.Empty(t, buf.Messages())
+	})
+
+	t.Run("errorsWhenUnscaledExceeds32Bytes", func(t *testing.T) {
+		tooWide := append([]byte{0x01}, make([]byte, 32)...)
+		_, err := qdb.NewDecimalUnsafe(tooWide, 0)
+		assert.ErrorContains(t, err, "exceeds 32 bytes")
+	})
+}
+
 func TestDecimalColumnErrors(t *testing.T) {
 	t.Run("invalid scale", func(t *testing.T) {
 		buf := newTestBuffer()
