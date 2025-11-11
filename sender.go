@@ -107,7 +107,7 @@ type LineSender interface {
 	// '-', '*' '%%', '~', or a non-printable char.
 	Float64Column(name string, val float64) LineSender
 
-	// DecimalColumn adds a decimal column value to the ILP message.
+	// DecimalColumnFromString adds a decimal column value to the ILP message.
 	//
 	// Serializes the decimal value using the text representation.
 	//
