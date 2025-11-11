@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"testing"
@@ -1015,4 +1016,34 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	}
 	sender.Flush(ctx)
 	sender.Close(ctx)
+}
+
+func BenchmarkHttpLineSenderDecimal(b *testing.B) {
+	const decimalStr = "123456.789"
+
+	ctx := context.Background()
+
+	srv, err := newTestHttpServer(readAndDiscard)
+	assert.NoError(b, err)
+	defer srv.Close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.NoError(b, err)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bi := big.NewInt(int64(i))
+		for j := 0; j < 1000; j++ {
+			d1 := qdb.NewDecimalFromInt64(int64(j), 3)
+			d2, _ := qdb.NewDecimal(bi, 3)
+			sender.
+				Table(testTable).
+				DecimalColumnScaled("dec_col", d1).
+				DecimalColumnScaled("dec_col2", d2).
+				DecimalColumnString("dec_col3", decimalStr).
+				At(ctx, time.UnixMicro(int64(1000*i)))
+		}
+		sender.Flush(ctx)
+		sender.Close(ctx)
+	}
 }
