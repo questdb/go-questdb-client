@@ -114,16 +114,16 @@ type LineSender interface {
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
-	DecimalColumnString(name string, val string) LineSender
+	DecimalColumnFromString(name string, val string) LineSender
 
-	// DecimalColumnScaled adds a decimal column value to the ILP message.
+	// DecimalColumn adds a decimal column value to the ILP message.
 	//
 	// Serializes the decimal value using the binary representation.
 	//
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
-	DecimalColumnScaled(name string, val ScaledDecimal) LineSender
+	DecimalColumn(name string, val ScaledDecimal) LineSender
 
 	// DecimalColumnShopspring adds a decimal column value to the ILP message.
 	//

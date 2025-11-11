@@ -573,7 +573,7 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 	return b
 }
 
-func (b *buffer) DecimalColumnScaled(name string, val ScaledDecimal) *buffer {
+func (b *buffer) DecimalColumn(name string, val ScaledDecimal) *buffer {
 	if val.isNull() {
 		// Don't write null decimals
 		return b
@@ -581,10 +581,10 @@ func (b *buffer) DecimalColumnScaled(name string, val ScaledDecimal) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
-	return b.decimalColumnScaled(name, val)
+	return b.decimalColumn(name, val)
 }
 
-func (b *buffer) decimalColumnScaled(name string, val ScaledDecimal) *buffer {
+func (b *buffer) decimalColumn(name string, val ScaledDecimal) *buffer {
 	if err := val.ensureValidScale(); err != nil {
 		b.lastErr = err
 		return b
@@ -603,7 +603,7 @@ func (b *buffer) decimalColumnScaled(name string, val ScaledDecimal) *buffer {
 	return b
 }
 
-func (b *buffer) DecimalColumnString(name string, val string) *buffer {
+func (b *buffer) DecimalColumnFromString(name string, val string) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
@@ -641,7 +641,7 @@ func (b *buffer) DecimalColumnShopspring(name string, val ShopspringDecimal) *bu
 	if !b.prepareForField() {
 		return b
 	}
-	return b.decimalColumnScaled(name, dec)
+	return b.decimalColumn(name, dec)
 }
 
 func (b *buffer) Float64ColumnBinary(name string, val float64) *buffer {

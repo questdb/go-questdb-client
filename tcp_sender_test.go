@@ -379,7 +379,7 @@ func TestDecimalColumnUnsupportedInTCPProtocolV2(t *testing.T) {
 
 	err = sender.
 		Table(testTable).
-		DecimalColumnString("price", "12.99").
+		DecimalColumnFromString("price", "12.99").
 		At(ctx, time.UnixMicro(1))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "current protocol version does not support decimal")

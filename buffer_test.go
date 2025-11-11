@@ -494,7 +494,7 @@ func TestFloat64ColumnBinary(t *testing.T) {
 	}
 }
 
-func TestDecimalColumnScaled(t *testing.T) {
+func TestDecimalColumn(t *testing.T) {
 	negative, err := qdb.NewDecimal(big.NewInt(-12345), 3)
 	assert.NoError(t, err)
 
@@ -524,14 +524,14 @@ func TestDecimalColumnScaled(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := newTestBuffer()
-			err := buf.Table(testTable).DecimalColumnScaled("price", tc.value).At(time.Time{}, false)
+			err := buf.Table(testTable).DecimalColumn("price", tc.value).At(time.Time{}, false)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expected, buf.Messages())
 		})
 	}
 }
 
-func TestDecimalColumnScaledTrimmingAndPadding(t *testing.T) {
+func TestDecimalColumnTrimmingAndPadding(t *testing.T) {
 	prefix := []byte(testTable + " price==")
 
 	testCases := []struct {
@@ -595,7 +595,7 @@ func TestDecimalColumnScaledTrimmingAndPadding(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := newTestBuffer()
 
-			err := buf.Table(testTable).DecimalColumnScaled("price", tc.value).At(time.Time{}, false)
+			err := buf.Table(testTable).DecimalColumn("price", tc.value).At(time.Time{}, false)
 			assert.NoError(t, err)
 
 			expected := append(append([]byte{}, prefix...), tc.expectedBytes...)
@@ -654,7 +654,7 @@ func TestDecimalColumnShopspring(t *testing.T) {
 	}
 }
 
-func TestDecimalColumnStringValidation(t *testing.T) {
+func TestDecimalColumnFromStringValidation(t *testing.T) {
 	t.Run("valid strings", func(t *testing.T) {
 		testCases := []struct {
 			name     string
@@ -672,7 +672,7 @@ func TestDecimalColumnStringValidation(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				buf := newTestBuffer()
-				err := buf.Table(testTable).DecimalColumnString("price", tc.value).At(time.Time{}, false)
+				err := buf.Table(testTable).DecimalColumnFromString("price", tc.value).At(time.Time{}, false)
 				assert.NoError(t, err)
 				expected := []byte(testTable + " price=" + tc.expected + "\n")
 				assert.Equal(t, expected, buf.Messages())
@@ -696,7 +696,7 @@ func TestDecimalColumnStringValidation(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				buf := newTestBuffer()
-				err := buf.Table(testTable).DecimalColumnString("price", tc.value).At(time.Time{}, false)
+				err := buf.Table(testTable).DecimalColumnFromString("price", tc.value).At(time.Time{}, false)
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), "decimal")
 				assert.Empty(t, buf.Messages())
@@ -709,7 +709,7 @@ func TestDecimalColumnErrors(t *testing.T) {
 	t.Run("invalid scale", func(t *testing.T) {
 		buf := newTestBuffer()
 		dec := qdb.NewDecimalFromInt64(1, 100)
-		err := buf.Table(testTable).DecimalColumnScaled("price", dec).At(time.Time{}, false)
+		err := buf.Table(testTable).DecimalColumn("price", dec).At(time.Time{}, false)
 		assert.ErrorContains(t, err, "decimal scale")
 		assert.Empty(t, buf.Messages())
 	})

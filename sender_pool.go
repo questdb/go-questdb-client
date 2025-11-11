@@ -314,8 +314,8 @@ func (ps *pooledSender) Float64Column(name string, val float64) LineSender {
 	return ps
 }
 
-func (ps *pooledSender) DecimalColumnString(name string, val string) LineSender {
-	ps.wrapped.DecimalColumnString(name, val)
+func (ps *pooledSender) DecimalColumnFromString(name string, val string) LineSender {
+	ps.wrapped.DecimalColumnFromString(name, val)
 	return ps
 }
 
@@ -324,8 +324,8 @@ func (ps *pooledSender) DecimalColumnShopspring(name string, val ShopspringDecim
 	return ps
 }
 
-func (ps *pooledSender) DecimalColumnScaled(name string, val ScaledDecimal) LineSender {
-	ps.wrapped.DecimalColumnScaled(name, val)
+func (ps *pooledSender) DecimalColumn(name string, val ScaledDecimal) LineSender {
+	ps.wrapped.DecimalColumn(name, val)
 	return ps
 }
 

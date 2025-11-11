@@ -305,7 +305,7 @@ func (s *httpLineSender) Float64Column(name string, val float64) LineSender {
 	return s
 }
 
-func (s *httpLineSender) DecimalColumnString(name string, val string) LineSender {
+func (s *httpLineSender) DecimalColumnFromString(name string, val string) LineSender {
 	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
@@ -315,7 +315,7 @@ func (s *httpLineSender) DecimalColumnShopspring(name string, val ShopspringDeci
 	return s
 }
 
-func (s *httpLineSender) DecimalColumnScaled(name string, val ScaledDecimal) LineSender {
+func (s *httpLineSender) DecimalColumn(name string, val ScaledDecimal) LineSender {
 	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
@@ -652,7 +652,7 @@ func (s *httpLineSenderV2) Float64ArrayNDColumn(name string, values *NdArray[flo
 	return s
 }
 
-func (s *httpLineSenderV2) DecimalColumnString(name string, val string) LineSender {
+func (s *httpLineSenderV2) DecimalColumnFromString(name string, val string) LineSender {
 	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
@@ -662,7 +662,7 @@ func (s *httpLineSenderV2) DecimalColumnShopspring(name string, val ShopspringDe
 	return s
 }
 
-func (s *httpLineSenderV2) DecimalColumnScaled(name string, val ScaledDecimal) LineSender {
+func (s *httpLineSenderV2) DecimalColumn(name string, val ScaledDecimal) LineSender {
 	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
@@ -727,13 +727,13 @@ func (s *httpLineSenderV3) Float64ArrayNDColumn(name string, values *NdArray[flo
 	return s
 }
 
-func (s *httpLineSenderV3) DecimalColumnScaled(name string, val ScaledDecimal) LineSender {
-	s.buf.DecimalColumnScaled(name, val)
+func (s *httpLineSenderV3) DecimalColumn(name string, val ScaledDecimal) LineSender {
+	s.buf.DecimalColumn(name, val)
 	return s
 }
 
-func (s *httpLineSenderV3) DecimalColumnString(name string, val string) LineSender {
-	s.buf.DecimalColumnString(name, val)
+func (s *httpLineSenderV3) DecimalColumnFromString(name string, val string) LineSender {
+	s.buf.DecimalColumnFromString(name, val)
 	return s
 }
 
