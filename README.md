@@ -193,7 +193,7 @@ ingestion workload.
 QuestDB server version 9.2.0 and newer supports decimal columns with arbitrary precision and scale.
 The Go client converts supported decimal values to QuestDB's text/binary wire format automatically:
 
-- `DecimalColumn`: `questdb.ScaledDecimal`, including helpers like `questdb.NewDecimalFromInt64` and `questdb.NewDecimal`.
+- `DecimalColumn`: `questdb.Decimal`, including helpers like `questdb.NewDecimalFromInt64` and `questdb.NewDecimal`.
 - `DecimalColumnShopspring`: `github.com/shopspring/decimal.Decimal` values or pointers.
 - `DecimalColumnFromString`: `string` literals representing decimal values (validated at runtime).
 
