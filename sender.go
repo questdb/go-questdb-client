@@ -123,7 +123,7 @@ type LineSender interface {
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', ”', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
-	DecimalColumn(name string, val ScaledDecimal) LineSender
+	DecimalColumn(name string, val Decimal) LineSender
 
 	// DecimalColumnShopspring adds a decimal column value to the ILP message.
 	//

@@ -501,7 +501,7 @@ func TestDecimalColumn(t *testing.T) {
 	prefix := []byte(testTable + " price==")
 	testCases := []struct {
 		name     string
-		value    qdb.ScaledDecimal
+		value    qdb.Decimal
 		expected []byte
 	}{
 		{
@@ -536,7 +536,7 @@ func TestDecimalColumnTrimmingAndPadding(t *testing.T) {
 
 	testCases := []struct {
 		name          string
-		value         qdb.ScaledDecimal
+		value         qdb.Decimal
 		expectedBytes []byte
 	}{
 		{

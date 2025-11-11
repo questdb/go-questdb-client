@@ -324,7 +324,7 @@ func (ps *pooledSender) DecimalColumnShopspring(name string, val ShopspringDecim
 	return ps
 }
 
-func (ps *pooledSender) DecimalColumn(name string, val ScaledDecimal) LineSender {
+func (ps *pooledSender) DecimalColumn(name string, val Decimal) LineSender {
 	ps.wrapped.DecimalColumn(name, val)
 	return ps
 }

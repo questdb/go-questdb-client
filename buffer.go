@@ -573,7 +573,7 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 	return b
 }
 
-func (b *buffer) DecimalColumn(name string, val ScaledDecimal) *buffer {
+func (b *buffer) DecimalColumn(name string, val Decimal) *buffer {
 	if val.isNull() {
 		// Don't write null decimals
 		return b
@@ -584,7 +584,7 @@ func (b *buffer) DecimalColumn(name string, val ScaledDecimal) *buffer {
 	return b.decimalColumn(name, val)
 }
 
-func (b *buffer) decimalColumn(name string, val ScaledDecimal) *buffer {
+func (b *buffer) decimalColumn(name string, val Decimal) *buffer {
 	if err := val.ensureValidScale(); err != nil {
 		b.lastErr = err
 		return b

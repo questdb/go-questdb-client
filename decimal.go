@@ -35,9 +35,8 @@ const (
 	maxDecimalScale       uint32 = 76
 )
 
-// ScaledDecimal represents a decimal value as a two's complement big-endian byte slice and a scale.
-// NULL decimals are represented by an offset of 32.
-type ScaledDecimal struct {
+// Decimal represents a decimal value as a two's complement big-endian byte slice and a scale.
+type Decimal struct {
 	scale    uint32
 	unscaled [32]byte
 	offset   uint8
@@ -48,19 +47,20 @@ type ShopspringDecimal interface {
 	Exponent() int32
 }
 
-// NewScaledDecimal constructs a decimal from a two's complement big-endian unscaled value and a scale.
+// NewDecimalUnsafe constructs a decimal from a two's complement big-endian unscaled value and a scale.
 // A nil/empty unscaled slice produces a NULL decimal.
-func NewScaledDecimal(unscaled []byte, scale uint32) (ScaledDecimal, error) {
+func NewDecimalUnsafe(unscaled []byte, scale uint32) (Decimal, error) {
 	if len(unscaled) == 0 {
-		return ScaledDecimal{
+		// NULL decimals are represented by an offset of 32.
+		return Decimal{
 			offset: 32,
 		}, nil
 	}
 	normalized, offset, err := normalizeTwosComplement(unscaled)
 	if err != nil {
-		return ScaledDecimal{}, err
+		return Decimal{}, err
 	}
-	return ScaledDecimal{
+	return Decimal{
 		scale:    scale,
 		unscaled: normalized,
 		offset:   offset,
@@ -69,17 +69,17 @@ func NewScaledDecimal(unscaled []byte, scale uint32) (ScaledDecimal, error) {
 
 // NewDecimal constructs a decimal from an arbitrary-precision integer and a scale.
 // Providing a nil unscaled value produces a NULL decimal.
-func NewDecimal(unscaled *big.Int, scale uint32) (ScaledDecimal, error) {
+func NewDecimal(unscaled *big.Int, scale uint32) (Decimal, error) {
 	if unscaled == nil {
-		return ScaledDecimal{
+		return Decimal{
 			offset: 32,
 		}, nil
 	}
 	unscaledRaw, offset, err := bigIntToTwosComplement(unscaled)
 	if err != nil {
-		return ScaledDecimal{}, err
+		return Decimal{}, err
 	}
-	return ScaledDecimal{
+	return Decimal{
 		scale:    scale,
 		unscaled: unscaledRaw,
 		offset:   offset,
@@ -87,13 +87,13 @@ func NewDecimal(unscaled *big.Int, scale uint32) (ScaledDecimal, error) {
 }
 
 // NewDecimalFromInt64 constructs a decimal from a 64-bit integer and a scale.
-func NewDecimalFromInt64(unscaled int64, scale uint32) ScaledDecimal {
+func NewDecimalFromInt64(unscaled int64, scale uint32) Decimal {
 	var be [8]byte
 	binary.BigEndian.PutUint64(be[:], uint64(unscaled))
 	offset := trimTwosComplement(be[:])
 	payload := [32]byte{}
 	copy(payload[32-(8-offset):], be[offset:])
-	return ScaledDecimal{
+	return Decimal{
 		scale:    scale,
 		unscaled: payload,
 		offset:   uint8(32 - (8 - offset)),
@@ -101,11 +101,11 @@ func NewDecimalFromInt64(unscaled int64, scale uint32) ScaledDecimal {
 }
 
 // isNull reports whether the decimal represents NULL.
-func (d ScaledDecimal) isNull() bool {
+func (d Decimal) isNull() bool {
 	return d.offset >= 32
 }
 
-func (d ScaledDecimal) ensureValidScale() error {
+func (d Decimal) ensureValidScale() error {
 	if d.isNull() {
 		return nil
 	}
@@ -115,10 +115,10 @@ func (d ScaledDecimal) ensureValidScale() error {
 	return nil
 }
 
-func convertShopspringDecimal(value ShopspringDecimal) (ScaledDecimal, error) {
+func convertShopspringDecimal(value ShopspringDecimal) (Decimal, error) {
 	coeff := value.Coefficient()
 	if coeff == nil {
-		return ScaledDecimal{
+		return Decimal{
 			offset: 32,
 		}, nil
 	}

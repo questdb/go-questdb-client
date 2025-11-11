@@ -213,7 +213,7 @@ func (s *tcpLineSender) DecimalColumnShopspring(name string, val ShopspringDecim
 	return s
 }
 
-func (s *tcpLineSender) DecimalColumn(name string, val ScaledDecimal) LineSender {
+func (s *tcpLineSender) DecimalColumn(name string, val Decimal) LineSender {
 	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
@@ -391,7 +391,7 @@ func (s *tcpLineSenderV2) DecimalColumnShopspring(name string, val ShopspringDec
 	return s
 }
 
-func (s *tcpLineSenderV2) DecimalColumn(name string, val ScaledDecimal) LineSender {
+func (s *tcpLineSenderV2) DecimalColumn(name string, val Decimal) LineSender {
 	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
@@ -461,7 +461,7 @@ func (s *tcpLineSenderV3) DecimalColumnFromString(name string, val string) LineS
 	return s
 }
 
-func (s *tcpLineSenderV3) DecimalColumn(name string, val ScaledDecimal) LineSender {
+func (s *tcpLineSenderV3) DecimalColumn(name string, val Decimal) LineSender {
 	s.buf.DecimalColumn(name, val)
 	return s
 }

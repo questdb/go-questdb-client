@@ -155,13 +155,13 @@ func execute(t *testing.T, ctx context.Context, sender qdb.LineSender, backCh ch
 }
 
 // parseDecimal64 quick and dirty parser for a decimal64 value from its string representation
-func parseDecimal64(s string) (qdb.ScaledDecimal, error) {
+func parseDecimal64(s string) (qdb.Decimal, error) {
 	// Remove whitespace
 	s = strings.TrimSpace(s)
 
 	// Check for empty string
 	if s == "" {
-		return qdb.ScaledDecimal{}, fmt.Errorf("empty string")
+		return qdb.Decimal{}, fmt.Errorf("empty string")
 	}
 
 	// Find the decimal point and remove it
@@ -173,7 +173,7 @@ func parseDecimal64(s string) (qdb.ScaledDecimal, error) {
 	// Parse the integer part
 	unscaled, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return qdb.ScaledDecimal{}, err
+		return qdb.Decimal{}, err
 	}
 
 	scale := 0

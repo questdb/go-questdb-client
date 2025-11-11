@@ -315,7 +315,7 @@ func (s *httpLineSender) DecimalColumnShopspring(name string, val ShopspringDeci
 	return s
 }
 
-func (s *httpLineSender) DecimalColumn(name string, val ScaledDecimal) LineSender {
+func (s *httpLineSender) DecimalColumn(name string, val Decimal) LineSender {
 	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
@@ -662,7 +662,7 @@ func (s *httpLineSenderV2) DecimalColumnShopspring(name string, val ShopspringDe
 	return s
 }
 
-func (s *httpLineSenderV2) DecimalColumn(name string, val ScaledDecimal) LineSender {
+func (s *httpLineSenderV2) DecimalColumn(name string, val Decimal) LineSender {
 	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
@@ -727,7 +727,7 @@ func (s *httpLineSenderV3) Float64ArrayNDColumn(name string, values *NdArray[flo
 	return s
 }
 
-func (s *httpLineSenderV3) DecimalColumn(name string, val ScaledDecimal) LineSender {
+func (s *httpLineSenderV3) DecimalColumn(name string, val Decimal) LineSender {
 	s.buf.DecimalColumn(name, val)
 	return s
 }
