@@ -154,11 +154,12 @@ func bigIntToTwosComplement(value *big.Int) ([32]byte, uint8, error) {
 		return [32]byte{0}, 31, nil
 	}
 	if value.Sign() > 0 {
-		bytes := value.Bytes()
-		if bytes[0]&0x80 != 0 {
-			bytes = append([]byte{0x00}, bytes...)
+		if value.BitLen() > 255 {
+			return [32]byte{}, 0, fmt.Errorf("decimal unscaled value exceeds 32 bytes")
 		}
-		return normalizeTwosComplement(bytes)
+		buf := [32]byte{}
+		value.FillBytes(buf[:])
+		return buf, uint8(trimTwosComplement(buf[:])), nil
 	}
 
 	bitLen := value.BitLen()
