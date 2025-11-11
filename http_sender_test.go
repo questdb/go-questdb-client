@@ -1038,9 +1038,9 @@ func BenchmarkHttpLineSenderDecimal(b *testing.B) {
 			d2, _ := qdb.NewDecimal(bi, 3)
 			sender.
 				Table(testTable).
-				DecimalColumnScaled("dec_col", d1).
-				DecimalColumnScaled("dec_col2", d2).
-				DecimalColumnString("dec_col3", decimalStr).
+				DecimalColumn("dec_col", d1).
+				DecimalColumn("dec_col2", d2).
+				DecimalColumnFromString("dec_col3", decimalStr).
 				At(ctx, time.UnixMicro(int64(1000*i)))
 		}
 		sender.Flush(ctx)
