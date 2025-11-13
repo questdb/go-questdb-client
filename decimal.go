@@ -173,11 +173,6 @@ func bigIntToTwosComplement(value *big.Int) ([32]byte, uint8, error) {
 	buf := [32]byte{}
 	tmp.FillBytes(buf[:])
 	offset := 32 - uint8(byteLen)
-	if buf[offset]&0x80 == 0 {
-		// Ensure sign bit is set for negative numbers
-		buf[offset-1] = 0xFF
-		offset--
-	}
 
 	return buf, offset, nil
 }
