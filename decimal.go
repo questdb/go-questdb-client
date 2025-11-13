@@ -163,23 +163,23 @@ func bigIntToTwosComplement(value *big.Int) ([32]byte, uint8, error) {
 	}
 
 	bitLen := value.BitLen()
-	byteLen := (bitLen + 8) / 8
-	if byteLen == 0 {
-		byteLen = 1
+	if bitLen > 255 {
+		return [32]byte{}, 0, fmt.Errorf("decimal unscaled value exceeds 32 bytes")
 	}
+	byteLen := (bitLen + 8) / 8
 
 	tmp := new(big.Int).Lsh(big.NewInt(1), uint(byteLen*8))
 	tmp.Add(tmp, value) // value is negative, so this subtracts magnitude
-	bytes := tmp.Bytes()
-	if len(bytes) < int(byteLen) {
-		padding := make([]byte, int(byteLen)-len(bytes))
-		bytes = append(padding, bytes...)
+	buf := [32]byte{}
+	tmp.FillBytes(buf[:])
+	offset := 32 - uint8(byteLen)
+	if buf[offset]&0x80 == 0 {
+		// Ensure sign bit is set for negative numbers
+		buf[offset-1] = 0xFF
+		offset--
 	}
 
-	if bytes[0]&0x80 == 0 {
-		bytes = append([]byte{0xFF}, bytes...)
-	}
-	return normalizeTwosComplement(bytes)
+	return buf, offset, nil
 }
 
 // normalizeTwosComplement normalizes a two's complement big-endian byte slice to fit within 32 bytes and returns the normalized value along with the offset to the first significant byte.
