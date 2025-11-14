@@ -86,7 +86,7 @@ type arrayElemType byte
 
 const (
 	arrayElemDouble arrayElemType = 10
-	arrayElemNull   arrayElemType = 33
+	arrayElemNull   arrayElemType = 40
 )
 
 // buffer is a wrapper on top of bytes.Buffer. It extends the
