@@ -140,7 +140,7 @@ func setupQuestDB0(ctx context.Context, auth ilpAuthType, setupProxy bool) (*que
 	}
 	uniqueNetworkName := fmt.Sprintf("%s-%d", networkName, time.Now().UnixNano())
 	req := testcontainers.ContainerRequest{
-		Image:          "questdb/questdb:9.0.2",
+		Image:          "questdb/questdb:9.2.0",
 		ExposedPorts:   []string{"9000/tcp", "9009/tcp"},
 		WaitingFor:     wait.ForHTTP("/settings").WithPort("9000"),
 		Networks:       []string{uniqueNetworkName},
