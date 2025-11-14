@@ -143,8 +143,8 @@ func TestTcpPathologicalCasesFromEnv(t *testing.T) {
 		},
 		{
 			name:        "protocol_version",
-			config:      "tcp::protocol_version=3;",
-			expectedErr: "current client only supports protocol version 1 (text format for all datatypes), 2 (binary format for part datatypes) or explicitly unset",
+			config:      "tcp::protocol_version=4;",
+			expectedErr: "current client only supports protocol version 1 (text format for all datatypes), 2 (binary format for part datatypes), 3 (decimals) or explicitly unset",
 		},
 	}
 
