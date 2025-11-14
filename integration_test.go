@@ -56,7 +56,7 @@ func TestIntegrationSuite(t *testing.T) {
 	suite.Run(t, new(integrationTestSuite))
 }
 
-type writerFn func(b qdb.LineSender) error
+type writerFn func(t *testing.T, s qdb.LineSender, httpAddress string) error
 
 type questdbContainer struct {
 	testcontainers.Container
@@ -271,7 +271,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		{
 			"all column types",
 			testTable,
-			func(s qdb.LineSender) error {
+			func(t *testing.T, s qdb.LineSender, httpAddress string) error {
 				val, _ := big.NewInt(0).SetString("123a4", 16)
 				err := s.
 					Table(testTable).
@@ -320,7 +320,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		{
 			"escaped chars",
 			"m y-awesome_test 1=2.csv",
-			func(s qdb.LineSender) error {
+			func(t *testing.T, s qdb.LineSender, httpAddress string) error {
 				return s.
 					Table("m y-awesome_test 1=2.csv").
 					Symbol("sym_name 1=2", "value 1,2=3\n4\r5\"6\\7").
@@ -342,7 +342,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		{
 			"single symbol",
 			testTable,
-			func(s qdb.LineSender) error {
+			func(t *testing.T, s qdb.LineSender, httpAddress string) error {
 				return s.
 					Table(testTable).
 					Symbol("foo", "bar").
@@ -362,7 +362,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		{
 			"single column",
 			testTable,
-			func(s qdb.LineSender) error {
+			func(t *testing.T, s qdb.LineSender, httpAddress string) error {
 				return s.
 					Table(testTable).
 					Int64Column("foobar", 1_000_042).
@@ -382,7 +382,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		{
 			"single column long256",
 			testTable,
-			func(s qdb.LineSender) error {
+			func(t *testing.T, s qdb.LineSender, httpAddress string) error {
 				val, _ := big.NewInt(0).SetString("7fffffffffffffff", 16)
 				return s.
 					Table(testTable).
@@ -403,7 +403,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		{
 			"double value with exponent",
 			testTable,
-			func(s qdb.LineSender) error {
+			func(t *testing.T, s qdb.LineSender, httpAddress string) error {
 				return s.
 					Table(testTable).
 					Float64Column("foobar", 4.2e-100).
@@ -423,7 +423,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		{
 			"double array",
 			testTable,
-			func(s qdb.LineSender) error {
+			func(t *testing.T, s qdb.LineSender, httpAddress string) error {
 				values1D := []float64{1.0, 2.0, 3.0, 4.0, 5.0, math.NaN()}
 				values2D := [][]float64{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}, {math.NaN(), math.NaN()}}
 				values3D := [][][]float64{{{1.0, 2.0}, {3.0, 4.0}}, {{5.0, 6.0}, {7.0, math.NaN()}}}
@@ -503,7 +503,15 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 		{
 			"decimal type",
 			testTable,
-			func(s qdb.LineSender) error {
+			func(t *testing.T, s qdb.LineSender, httpAddress string) error {
+				// decimal columns must be pre-created
+				ddl(t,
+					"create table "+testTable+"("+
+						"text_col decimal(18,3), binary_col decimal(18,3), "+
+						"binary_neg_col decimal(18,3), binary_null_col decimal(18,3), ts timestamp"+
+						") timestamp(ts) partition by day;",
+					httpAddress)
+
 				d := qdb.NewDecimalFromInt64(12345, 2)
 				neg_d, err := qdb.NewDecimal(big.NewInt(-12345), 2)
 				if err != nil {
@@ -538,7 +546,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 					{"text_col", "DECIMAL(18,3)"},
 					{"binary_col", "DECIMAL(18,3)"},
 					{"binary_neg_col", "DECIMAL(18,3)"},
-					{"timestamp", "TIMESTAMP"},
+					{"ts", "TIMESTAMP"},
 				},
 				Dataset: [][]any{
 					{"123.450", "123.450", "-123.450", "1970-01-01T00:00:00.000001Z"},
@@ -601,8 +609,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 						return
 					}
 
-					dropTable(t, tc.tableName, questdbC.httpAddress)
-					err = tc.writerFn(sender)
+					err = tc.writerFn(t, sender, questdbC.httpAddress)
 					assert.NoError(t, err)
 
 					err = sender.Flush(ctx)

@@ -508,6 +508,23 @@ type column struct {
 	Type string `json:"type"`
 }
 
+func ddl(t *testing.T, ddl, address string) {
+	// We always query data using the QuestDB container over http
+	address = "http://" + address
+	u, err := url.Parse(address)
+	assert.NoError(t, err)
+
+	u.Path += "exec"
+	params := url.Values{}
+	params.Add("query", ddl)
+	u.RawQuery = params.Encode()
+	url := fmt.Sprintf("%v", u)
+
+	res, err := http.Get(url)
+	assert.NoError(t, err)
+	defer res.Body.Close()
+}
+
 func dropTable(t *testing.T, tableName, address string) {
 	// We always query data using the QuestDB container over http
 	address = "http://" + address
