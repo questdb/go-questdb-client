@@ -507,8 +507,8 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 				// decimal columns must be pre-created
 				ddl(t,
 					"create table "+testTable+"("+
-						"text_col decimal(18,3), binary_col decimal(18,3), "+
-						"binary_neg_col decimal(18,3), binary_null_col decimal(18,3), ts timestamp"+
+						"  text_col decimal(18,3), binary_col decimal(18,3), "+
+						"  binary_neg_col decimal(18,3), binary_null_col decimal(18,3), ts timestamp"+
 						") timestamp(ts) partition by day;",
 					httpAddress)
 
@@ -549,8 +549,8 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 					{"ts", "TIMESTAMP"},
 				},
 				Dataset: [][]any{
-					{"123.450", "123.450", "-123.450", "1970-01-01T00:00:00.000001Z"},
-					{"123.460", "123.460", "-123.460", "1970-01-01T00:00:00.000002Z"},
+					{"123.450", "123.450", "-123.450", nil, "1970-01-01T00:00:00.000001Z"},
+					{"123.460", "123.460", "-123.460", nil, "1970-01-01T00:00:00.000002Z"},
 				},
 				Count: 2,
 			},
