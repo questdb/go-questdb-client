@@ -591,9 +591,13 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 					}
 					senderVersion := qdb.ProtocolVersion(sender)
 					if senderVersion < 2 && tc.name == "double array" {
+						sender.Close(ctx)
+						questdbC.Stop(ctx)
 						return
 					}
 					if senderVersion < 3 && strings.Contains(tc.name, "decimal") {
+						sender.Close(ctx)
+						questdbC.Stop(ctx)
 						return
 					}
 
