@@ -39,6 +39,19 @@ import (
 
 type bufWriterFn func(b *qdb.Buffer) error
 
+type fakeShopspringDecimal struct {
+	coeff *big.Int
+	exp   int32
+}
+
+func (f fakeShopspringDecimal) Coefficient() *big.Int {
+	return f.coeff
+}
+
+func (f fakeShopspringDecimal) Exponent() int32 {
+	return f.exp
+}
+
 func newTestBuffer() qdb.Buffer {
 	return qdb.NewBuffer(128*1024, 1024*1024, 127)
 }
@@ -481,6 +494,277 @@ func TestFloat64ColumnBinary(t *testing.T) {
 	}
 }
 
+func TestDecimalColumn(t *testing.T) {
+	negative, err := qdb.NewDecimal(big.NewInt(-12345), 3)
+	assert.NoError(t, err)
+
+	prefix := []byte(testTable + " price==")
+	testCases := []struct {
+		name     string
+		value    qdb.Decimal
+		expected []byte
+	}{
+		{
+			name:     "positive",
+			value:    qdb.NewDecimalFromInt64(12345, 2),
+			expected: append(prefix, 0x17, 0x02, 0x02, 0x30, 0x39, 0x0A),
+		},
+		{
+			name:     "negative",
+			value:    negative,
+			expected: append(prefix, 0x17, 0x03, 0x02, 0xCF, 0xC7, 0x0A),
+		},
+		{
+			name:     "zero with scale",
+			value:    qdb.NewDecimalFromInt64(0, 4),
+			expected: append(prefix, 0x17, 0x04, 0x01, 0x0, 0x0A),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := newTestBuffer()
+			err := buf.Table(testTable).DecimalColumn("price", tc.value).At(time.Time{}, false)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, buf.Messages())
+		})
+	}
+}
+
+func TestDecimalColumnTrimmingAndPadding(t *testing.T) {
+	prefix := []byte(testTable + " price==")
+
+	testCases := []struct {
+		name          string
+		value         qdb.Decimal
+		expectedBytes []byte
+	}{
+		{
+			name:          "127 boundary",
+			value:         qdb.NewDecimalFromInt64(127, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0x7F},
+		},
+		{
+			name:          "128 sign extension",
+			value:         qdb.NewDecimalFromInt64(128, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0x00, 0x80},
+		},
+		{
+			name:          "255 sign extension",
+			value:         qdb.NewDecimalFromInt64(255, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0x00, 0xFF},
+		},
+		{
+			name:          "32768 sign extension",
+			value:         qdb.NewDecimalFromInt64(32768, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x03, 0x00, 0x80, 0x00},
+		},
+		{
+			name:          "-1",
+			value:         qdb.NewDecimalFromInt64(-1, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0xFF},
+		},
+		{
+			name:          "-2",
+			value:         qdb.NewDecimalFromInt64(-2, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0xFE},
+		},
+		{
+			name:          "-127",
+			value:         qdb.NewDecimalFromInt64(-127, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0x81},
+		},
+		{
+			name:          "-128",
+			value:         qdb.NewDecimalFromInt64(-128, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0x80},
+		},
+		{
+			name:          "-129",
+			value:         qdb.NewDecimalFromInt64(-129, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0xFF, 0x7F},
+		},
+		{
+			name:          "-256 sign extension",
+			value:         qdb.NewDecimalFromInt64(-256, 0),
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0xFF, 0x00},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := newTestBuffer()
+
+			err := buf.Table(testTable).DecimalColumn("price", tc.value).At(time.Time{}, false)
+			assert.NoError(t, err)
+
+			expected := append(append([]byte{}, prefix...), tc.expectedBytes...)
+			expected = append(expected, '\n')
+			assert.Equal(t, expected, buf.Messages())
+		})
+	}
+}
+
+func TestDecimalColumnShopspring(t *testing.T) {
+	prefix := []byte(testTable + " price==")
+
+	testCases := []struct {
+		name          string
+		value         fakeShopspringDecimal
+		expectedBytes []byte
+	}{
+		{
+			name:          "negative exponent scales value",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(12345), exp: -2},
+			expectedBytes: []byte{0x17, 0x02, 0x02, 0x30, 0x39},
+		},
+		{
+			name:          "zero",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(0), exp: 0},
+			expectedBytes: []byte{0x17, 0x00, 0x01, 0x00},
+		},
+		{
+			name:          "positive exponent multiplies coefficient",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(123), exp: 2},
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0x30, 0x0C},
+		},
+		{
+			name:          "positive value sign extension",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(128), exp: 0},
+			expectedBytes: []byte{0x17, 0x00, 0x02, 0x00, 0x80},
+		},
+		{
+			name:          "negative value sign extension",
+			value:         fakeShopspringDecimal{coeff: big.NewInt(-12345), exp: -3},
+			expectedBytes: []byte{0x17, 0x03, 0x02, 0xCF, 0xC7},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := newTestBuffer()
+
+			err := buf.Table(testTable).DecimalColumnShopspring("price", tc.value).At(time.Time{}, false)
+			assert.NoError(t, err)
+
+			expected := append(append([]byte{}, prefix...), tc.expectedBytes...)
+			expected = append(expected, '\n')
+			assert.Equal(t, expected, buf.Messages())
+		})
+	}
+}
+
+func TestDecimalColumnFromStringValidation(t *testing.T) {
+	t.Run("valid strings", func(t *testing.T) {
+		testCases := []struct {
+			name     string
+			value    string
+			expected string
+		}{
+			{"integer", "123", "123d"},
+			{"decimal", "123.450", "123.450d"},
+			{"negative", "-0.001", "-0.001d"},
+			{"exponent positive", "1.2e3", "1.2e3d"},
+			{"exponent negative", "-4.5E-2", "-4.5E-2d"},
+			{"nan token", "NaN", "NaNd"},
+			{"infinity token", "Infinity", "Infinityd"},
+		}
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				buf := newTestBuffer()
+				err := buf.Table(testTable).DecimalColumnFromString("price", tc.value).At(time.Time{}, false)
+				assert.NoError(t, err)
+				expected := []byte(testTable + " price=" + tc.expected + "\n")
+				assert.Equal(t, expected, buf.Messages())
+			})
+		}
+	})
+
+	t.Run("invalid strings", func(t *testing.T) {
+		testCases := []struct {
+			name  string
+			value string
+		}{
+			{"empty", ""},
+			{"sign only", "+"},
+			{"double dot", "12.3.4"},
+			{"invalid char", "12a3"},
+			{"exponent missing mantissa", "e10"},
+			{"exponent no digits", "1.2e"},
+			{"exponent sign no digits", "1.2e+"},
+		}
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				buf := newTestBuffer()
+				err := buf.Table(testTable).DecimalColumnFromString("price", tc.value).At(time.Time{}, false)
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), "decimal")
+				assert.Empty(t, buf.Messages())
+			})
+		}
+	})
+}
+
+func TestNewDecimalUnsafe(t *testing.T) {
+	t.Run("trimsLeadingZeros", func(t *testing.T) {
+		raw := []byte{0x00, 0x00, 0x01, 0x23}
+		dec, err := qdb.NewDecimalUnsafe(raw, 2)
+		assert.NoError(t, err)
+
+		expected := qdb.NewDecimalFromInt64(0x0123, 2)
+		assert.Equal(t, expected, dec)
+	})
+
+	t.Run("trimsSignExtensionForNegative", func(t *testing.T) {
+		raw := []byte{0xFF, 0xFF, 0xCF, 0xC7}
+		dec, err := qdb.NewDecimalUnsafe(raw, 3)
+		assert.NoError(t, err)
+
+		expected, err := qdb.NewDecimal(big.NewInt(-12345), 3)
+		assert.NoError(t, err)
+		assert.Equal(t, expected, dec)
+	})
+
+	t.Run("emptyInputProducesNullDecimal", func(t *testing.T) {
+		dec, err := qdb.NewDecimalUnsafe(nil, 5)
+		assert.NoError(t, err)
+
+		buf := newTestBuffer()
+		err = buf.Table(testTable).DecimalColumn("price", dec).At(time.Time{}, false)
+		assert.ErrorContains(t, err, "no symbols or columns")
+		assert.Empty(t, buf.Messages())
+	})
+
+	t.Run("errorsWhenUnscaledExceeds32Bytes", func(t *testing.T) {
+		tooWide := append([]byte{0x01}, make([]byte, 32)...)
+		_, err := qdb.NewDecimalUnsafe(tooWide, 0)
+		assert.ErrorContains(t, err, "exceeds 32 bytes")
+	})
+}
+
+func TestDecimalColumnErrors(t *testing.T) {
+	t.Run("invalid scale", func(t *testing.T) {
+		buf := newTestBuffer()
+		dec := qdb.NewDecimalFromInt64(1, 100)
+		err := buf.Table(testTable).DecimalColumn("price", dec).At(time.Time{}, false)
+		assert.ErrorContains(t, err, "decimal scale")
+		assert.Empty(t, buf.Messages())
+	})
+
+	t.Run("overflow", func(t *testing.T) {
+		bigVal := new(big.Int).Lsh(big.NewInt(1), 2100)
+		_, err := qdb.NewDecimal(bigVal, 0)
+		assert.ErrorContains(t, err, "exceeds 32 bytes")
+	})
+
+	t.Run("no column", func(t *testing.T) {
+		buf := newTestBuffer()
+		err := buf.Table(testTable).DecimalColumnShopspring("price", nil).At(time.Time{}, false)
+		assert.ErrorContains(t, err, "no symbols or columns were provided: invalid message")
+		assert.Empty(t, buf.Messages())
+	})
+}
+
 func TestFloat64Array1DColumn(t *testing.T) {
 	testCases := []struct {
 		name   string
@@ -498,10 +782,15 @@ func TestFloat64Array1DColumn(t *testing.T) {
 			for _, littleEndian := range []bool{true, false} {
 				qdb.SetLittleEndian(littleEndian)
 				buf := newTestBuffer()
-
-				err := buf.Table(testTable).Float64Array1DColumn("array_col", tc.values).At(time.Time{}, false)
-				assert.NoError(t, err)
-				assert.Equal(t, float641DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				if tc.values == nil {
+					err := buf.Table(testTable).Float64Array1DColumn("array_col", nil).At(time.UnixMicro(42), true)
+					assert.NoError(t, err)
+					assert.Equal(t, []byte(testTable+" 42000\n"), buf.Messages())
+				} else {
+					err := buf.Table(testTable).Float64Array1DColumn("array_col", tc.values).At(time.Time{}, false)
+					assert.NoError(t, err)
+					assert.Equal(t, float641DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				}
 			}
 		})
 	}
@@ -524,9 +813,15 @@ func TestFloat64Array2DColumn(t *testing.T) {
 			for _, littleEndian := range []bool{true, false} {
 				qdb.SetLittleEndian(littleEndian)
 				buf := newTestBuffer()
-				err := buf.Table(testTable).Float64Array2DColumn("array_col", tc.values).At(time.Time{}, false)
-				assert.NoError(t, err)
-				assert.Equal(t, float642DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				if tc.values == nil {
+					err := buf.Table(testTable).Float64Array2DColumn("array_col", nil).At(time.UnixMicro(42), true)
+					assert.NoError(t, err)
+					assert.Equal(t, []byte(testTable+" 42000\n"), buf.Messages())
+				} else {
+					err := buf.Table(testTable).Float64Array2DColumn("array_col", tc.values).At(time.Time{}, false)
+					assert.NoError(t, err)
+					assert.Equal(t, float642DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				}
 			}
 		})
 	}
@@ -558,9 +853,15 @@ func TestFloat64Array3DColumn(t *testing.T) {
 			for _, littleEndian := range []bool{true, false} {
 				qdb.SetLittleEndian(littleEndian)
 				buf := newTestBuffer()
-				err := buf.Table(testTable).Float64Array3DColumn("array_col", tc.values).At(time.Time{}, false)
-				assert.NoError(t, err)
-				assert.Equal(t, float643DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				if tc.values == nil {
+					err := buf.Table(testTable).Float64Array3DColumn("array_col", nil).At(time.UnixMicro(42), true)
+					assert.NoError(t, err)
+					assert.Equal(t, []byte(testTable+" 42000\n"), buf.Messages())
+				} else {
+					err := buf.Table(testTable).Float64Array3DColumn("array_col", tc.values).At(time.Time{}, false)
+					assert.NoError(t, err)
+					assert.Equal(t, float643DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				}
 			}
 		})
 	}
@@ -597,9 +898,9 @@ func TestFloat64ArrayNDColumn(t *testing.T) {
 				buf := newTestBuffer()
 				var err error
 				if tc.data == nil {
-					err = buf.Table(testTable).Float64ArrayNDColumn("ndarray_col", nil).At(time.Time{}, false)
+					err = buf.Table(testTable).Float64ArrayNDColumn("ndarray_col", nil).At(time.UnixMicro(42), true)
 					assert.NoError(t, err)
-					assert.Equal(t, float64NDArrayToByte(testTable, "ndarray_col", nil), buf.Messages())
+					assert.Equal(t, []byte(testTable+" 42000\n"), buf.Messages())
 				} else {
 					ndArray, err := qdb.NewNDArray[float64](tc.shape...)
 					assert.NoError(t, err)

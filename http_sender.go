@@ -119,6 +119,10 @@ type httpLineSenderV2 struct {
 	httpLineSender
 }
 
+type httpLineSenderV3 struct {
+	httpLineSenderV2
+}
+
 func newHttpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
 	var transport *http.Transport
 	s := &httpLineSender{
@@ -175,12 +179,21 @@ func newHttpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender,
 	}
 	s.uri += fmt.Sprintf("://%s/write", s.address)
 
-	if pVersion == ProtocolVersion1 {
+	switch pVersion {
+	case ProtocolVersion1:
 		return s, nil
-	} else {
+	case ProtocolVersion2:
 		return &httpLineSenderV2{
 			*s,
 		}, nil
+	case ProtocolVersion3:
+		return &httpLineSenderV3{
+			httpLineSenderV2{
+				*s,
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported protocol version %d", pVersion)
 	}
 }
 
@@ -289,6 +302,21 @@ func (s *httpLineSender) TimestampColumn(name string, ts time.Time) LineSender {
 
 func (s *httpLineSender) Float64Column(name string, val float64) LineSender {
 	s.buf.Float64Column(name, val)
+	return s
+}
+
+func (s *httpLineSender) DecimalColumnFromString(name string, val string) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *httpLineSender) DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *httpLineSender) DecimalColumn(name string, val Decimal) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
 	return s
 }
 
@@ -509,16 +537,22 @@ func parseServerSettings(resp *http.Response, conf *lineSenderConfig) (protocolV
 		return ProtocolVersion1, nil
 	}
 
-	hasProtocolVersion1 := false
+	hasProtocol1 := false
+	hasProtocol2 := false
 	for _, version := range versions {
-		if version == 2 {
-			return ProtocolVersion2, nil
-		}
-		if version == 1 {
-			hasProtocolVersion1 = true
+		switch version {
+		case 3:
+			return ProtocolVersion3, nil
+		case 2:
+			hasProtocol2 = true
+		case 1:
+			hasProtocol1 = true
 		}
 	}
-	if hasProtocolVersion1 {
+	if hasProtocol2 {
+		return ProtocolVersion2, nil
+	}
+	if hasProtocol1 {
 		return ProtocolVersion1, nil
 	}
 
@@ -615,5 +649,95 @@ func (s *httpLineSenderV2) Float64Array3DColumn(name string, values [][][]float6
 
 func (s *httpLineSenderV2) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
 	s.buf.Float64ArrayNDColumn(name, values)
+	return s
+}
+
+func (s *httpLineSenderV2) DecimalColumnFromString(name string, val string) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *httpLineSenderV2) DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *httpLineSenderV2) DecimalColumn(name string, val Decimal) LineSender {
+	s.buf.SetLastErr(errDecimalNotSupported)
+	return s
+}
+
+func (s *httpLineSenderV3) Table(name string) LineSender {
+	s.buf.Table(name)
+	return s
+}
+
+func (s *httpLineSenderV3) Symbol(name, val string) LineSender {
+	s.buf.Symbol(name, val)
+	return s
+}
+
+func (s *httpLineSenderV3) Int64Column(name string, val int64) LineSender {
+	s.buf.Int64Column(name, val)
+	return s
+}
+
+func (s *httpLineSenderV3) Long256Column(name string, val *big.Int) LineSender {
+	s.buf.Long256Column(name, val)
+	return s
+}
+
+func (s *httpLineSenderV3) TimestampColumn(name string, ts time.Time) LineSender {
+	s.buf.TimestampColumn(name, ts)
+	return s
+}
+
+func (s *httpLineSenderV3) StringColumn(name, val string) LineSender {
+	s.buf.StringColumn(name, val)
+	return s
+}
+
+func (s *httpLineSenderV3) BoolColumn(name string, val bool) LineSender {
+	s.buf.BoolColumn(name, val)
+	return s
+}
+
+func (s *httpLineSenderV3) Float64Column(name string, val float64) LineSender {
+	s.buf.Float64ColumnBinary(name, val)
+	return s
+}
+
+func (s *httpLineSenderV3) Float64Array1DColumn(name string, values []float64) LineSender {
+	s.buf.Float64Array1DColumn(name, values)
+	return s
+}
+
+func (s *httpLineSenderV3) Float64Array2DColumn(name string, values [][]float64) LineSender {
+	s.buf.Float64Array2DColumn(name, values)
+	return s
+}
+
+func (s *httpLineSenderV3) Float64Array3DColumn(name string, values [][][]float64) LineSender {
+	s.buf.Float64Array3DColumn(name, values)
+	return s
+}
+
+func (s *httpLineSenderV3) Float64ArrayNDColumn(name string, values *NdArray[float64]) LineSender {
+	s.buf.Float64ArrayNDColumn(name, values)
+	return s
+}
+
+func (s *httpLineSenderV3) DecimalColumn(name string, val Decimal) LineSender {
+	s.buf.DecimalColumn(name, val)
+	return s
+}
+
+func (s *httpLineSenderV3) DecimalColumnFromString(name string, val string) LineSender {
+	s.buf.DecimalColumnFromString(name, val)
+	return s
+}
+
+func (s *httpLineSenderV3) DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender {
+	s.buf.DecimalColumnShopspring(name, val)
 	return s
 }

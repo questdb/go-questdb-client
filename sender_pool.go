@@ -314,6 +314,21 @@ func (ps *pooledSender) Float64Column(name string, val float64) LineSender {
 	return ps
 }
 
+func (ps *pooledSender) DecimalColumnFromString(name string, val string) LineSender {
+	ps.wrapped.DecimalColumnFromString(name, val)
+	return ps
+}
+
+func (ps *pooledSender) DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender {
+	ps.wrapped.DecimalColumnShopspring(name, val)
+	return ps
+}
+
+func (ps *pooledSender) DecimalColumn(name string, val Decimal) LineSender {
+	ps.wrapped.DecimalColumn(name, val)
+	return ps
+}
+
 func (ps *pooledSender) StringColumn(name, val string) LineSender {
 	ps.wrapped.StringColumn(name, val)
 	return ps

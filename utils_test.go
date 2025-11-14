@@ -26,6 +26,7 @@ package questdb_test
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,6 +40,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/exp/slices"
 )
 
 type serverType int64
@@ -72,7 +74,7 @@ func newTestTcpServer(serverType serverType) (*testServer, error) {
 }
 
 func newTestHttpServer(serverType serverType) (*testServer, error) {
-	return newTestServerWithProtocol(serverType, "http", []int{1, 2})
+	return newTestServerWithProtocol(serverType, "http", []int{1, 2, 3})
 }
 
 func newTestHttpServerWithErrMsg(serverType serverType, errMsg string) (*testServer, error) {
@@ -339,5 +341,32 @@ func expectLines(t *testing.T, linesCh chan string, expected []string) {
 			return false
 		}
 		return reflect.DeepEqual(expected, actual)
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
+func expectAnyLines(t *testing.T, linesCh chan string, expected []string) {
+	assert.Eventually(t, func() bool {
+		select {
+		case l := <-linesCh:
+			return slices.Contains(expected, l)
+		default:
+			return false
+		}
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
+func expectBinaryBase64(t *testing.T, linesCh chan string, expected string) {
+	data, err := base64.StdEncoding.DecodeString(expected)
+	assert.NoError(t, err)
+
+	actual := make([]byte, 0)
+	assert.Eventually(t, func() bool {
+		select {
+		case l := <-linesCh:
+			actual = append(actual, []byte(l+"\n")...)
+		default:
+			return false
+		}
+		return slices.Equal(data, actual)
 	}, 10*time.Second, 100*time.Millisecond)
 }

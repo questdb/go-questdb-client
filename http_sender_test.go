@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"testing"
@@ -827,7 +828,7 @@ func TestAutoDetectProtocolVersionNewServer2(t *testing.T) {
 func TestAutoDetectProtocolVersionNewServer3(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2, 3})
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2, 4})
 	assert.NoError(t, err)
 	defer srv.Close()
 	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
@@ -838,11 +839,22 @@ func TestAutoDetectProtocolVersionNewServer3(t *testing.T) {
 func TestAutoDetectProtocolVersionNewServer4(t *testing.T) {
 	ctx := context.Background()
 
-	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{3})
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{4})
 	assert.NoError(t, err)
 	defer srv.Close()
 	_, err = qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
 	assert.ErrorContains(t, err, "server does not support current client")
+}
+
+func TestAutoDetectProtocolVersionNewServer5(t *testing.T) {
+	ctx := context.Background()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2, 3})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.Equal(t, qdb.ProtocolVersion(sender), qdb.ProtocolVersion3)
+	assert.NoError(t, err)
 }
 
 func TestAutoDetectProtocolVersionError(t *testing.T) {
@@ -911,6 +923,25 @@ func TestArrayColumnUnsupportedInHttpProtocolV1(t *testing.T) {
 		At(ctx, time.UnixMicro(4))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+}
+
+func TestDecimalColumnUnsupportedInHttpProtocolV2(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
+	defer cancel()
+
+	srv, err := newTestServerWithProtocol(readAndDiscard, "http", []int{2})
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	err = sender.
+		Table(testTable).
+		DecimalColumnFromString("price", "12.99").
+		At(ctx, time.UnixMicro(1))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support decimal")
 }
 
 func BenchmarkHttpLineSenderBatch1000(b *testing.B) {
@@ -985,4 +1016,34 @@ func BenchmarkHttpLineSenderNoFlush(b *testing.B) {
 	}
 	sender.Flush(ctx)
 	sender.Close(ctx)
+}
+
+func BenchmarkHttpLineSenderDecimal(b *testing.B) {
+	const decimalStr = "123456.789"
+
+	ctx := context.Background()
+
+	srv, err := newTestHttpServer(readAndDiscard)
+	assert.NoError(b, err)
+	defer srv.Close()
+
+	sender, err := qdb.NewLineSender(ctx, qdb.WithHttp(), qdb.WithAddress(srv.Addr()))
+	assert.NoError(b, err)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bi := big.NewInt(int64(i))
+		for j := 0; j < 1000; j++ {
+			d1 := qdb.NewDecimalFromInt64(int64(j), 3)
+			d2, _ := qdb.NewDecimal(bi, 3)
+			sender.
+				Table(testTable).
+				DecimalColumn("dec_col", d1).
+				DecimalColumn("dec_col2", d2).
+				DecimalColumnFromString("dec_col3", decimalStr).
+				At(ctx, time.UnixMicro(int64(1000*i)))
+		}
+		sender.Flush(ctx)
+		sender.Close(ctx)
+	}
 }

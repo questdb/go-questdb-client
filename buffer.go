@@ -86,7 +86,6 @@ type arrayElemType byte
 
 const (
 	arrayElemDouble arrayElemType = 10
-	arrayElemNull   arrayElemType = 33
 )
 
 // buffer is a wrapper on top of bytes.Buffer. It extends the
@@ -573,6 +572,77 @@ func (b *buffer) Float64Column(name string, val float64) *buffer {
 	return b
 }
 
+func (b *buffer) DecimalColumn(name string, val Decimal) *buffer {
+	if val.isNull() {
+		// Don't write null decimals
+		return b
+	}
+	if !b.prepareForField() {
+		return b
+	}
+	return b.decimalColumn(name, val)
+}
+
+func (b *buffer) decimalColumn(name string, val Decimal) *buffer {
+	if err := val.ensureValidScale(); err != nil {
+		b.lastErr = err
+		return b
+	}
+	b.lastErr = b.writeColumnName(name)
+	if b.lastErr != nil {
+		return b
+	}
+	b.WriteByte('=')
+	b.WriteByte('=')
+	b.WriteByte(decimalBinaryTypeCode)
+	b.WriteByte((uint8)(val.scale))
+	b.WriteByte(32 - val.offset)
+	b.Write(val.unscaled[val.offset:])
+	b.hasFields = true
+	return b
+}
+
+func (b *buffer) DecimalColumnFromString(name string, val string) *buffer {
+	if !b.prepareForField() {
+		return b
+	}
+	if err := validateDecimalText(val); err != nil {
+		b.lastErr = err
+		return b
+	}
+	b.lastErr = b.writeColumnName(name)
+	if b.lastErr != nil {
+		return b
+	}
+	b.WriteByte('=')
+	b.WriteString(val)
+	b.WriteByte('d')
+	b.hasFields = true
+	return b
+}
+
+func (b *buffer) DecimalColumnShopspring(name string, val ShopspringDecimal) *buffer {
+	if val == nil {
+		return b
+	}
+	if b.lastErr != nil {
+		return b
+	}
+	dec, err := convertShopspringDecimal(val)
+	if err != nil {
+		b.lastErr = err
+		return b
+	}
+	if dec.isNull() {
+		// Don't write null decimals
+		return b
+	}
+	if !b.prepareForField() {
+		return b
+	}
+	return b.decimalColumn(name, dec)
+}
+
 func (b *buffer) Float64ColumnBinary(name string, val float64) *buffer {
 	if !b.prepareForField() {
 		return b
@@ -597,15 +667,15 @@ func (b *buffer) Float64ColumnBinary(name string, val float64) *buffer {
 }
 
 func (b *buffer) Float64Array1DColumn(name string, values []float64) *buffer {
+	if values == nil {
+		// Don't write null arrays
+		return b
+	}
 	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
 	if b.lastErr != nil {
-		return b
-	}
-	if values == nil {
-		b.writeNullArray()
 		return b
 	}
 
@@ -629,16 +699,15 @@ func (b *buffer) Float64Array1DColumn(name string, values []float64) *buffer {
 }
 
 func (b *buffer) Float64Array2DColumn(name string, values [][]float64) *buffer {
+	if values == nil {
+		// Don't write null arrays
+		return b
+	}
 	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
 	if b.lastErr != nil {
-		return b
-	}
-
-	if values == nil {
-		b.writeNullArray()
 		return b
 	}
 
@@ -678,16 +747,15 @@ func (b *buffer) Float64Array2DColumn(name string, values [][]float64) *buffer {
 }
 
 func (b *buffer) Float64Array3DColumn(name string, values [][][]float64) *buffer {
+	if values == nil {
+		// Don't write null arrays
+		return b
+	}
 	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
 	if b.lastErr != nil {
-		return b
-	}
-
-	if values == nil {
-		b.writeNullArray()
 		return b
 	}
 
@@ -740,16 +808,15 @@ func (b *buffer) Float64Array3DColumn(name string, values [][][]float64) *buffer
 }
 
 func (b *buffer) Float64ArrayNDColumn(name string, value *NdArray[float64]) *buffer {
+	if value == nil {
+		// Don't write null arrays
+		return b
+	}
 	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
 	if b.lastErr != nil {
-		return b
-	}
-
-	if value == nil {
-		b.writeNullArray()
 		return b
 	}
 
@@ -831,7 +898,7 @@ func (b *buffer) At(ts time.Time, sendTs bool) error {
 		b.DiscardPendingMsg()
 		return fmt.Errorf("table name was not provided: %w", errInvalidMsg)
 	}
-	if !b.hasTags && !b.hasFields {
+	if !b.hasTags && !b.hasFields && !sendTs {
 		b.DiscardPendingMsg()
 		return fmt.Errorf("no symbols or columns were provided: %w", errInvalidMsg)
 	}
@@ -854,12 +921,4 @@ func (b *buffer) writeFloat64ArrayHeader(dims byte) {
 	b.WriteByte(byte(arrayCode))
 	b.WriteByte(byte(arrayElemDouble))
 	b.WriteByte(dims)
-}
-
-func (b *buffer) writeNullArray() {
-	b.WriteByte('=')
-	b.WriteByte('=')
-	b.WriteByte(byte(arrayCode))
-	b.WriteByte(byte(arrayElemNull))
-	b.hasFields = true
 }

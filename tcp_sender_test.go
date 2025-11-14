@@ -143,8 +143,8 @@ func TestTcpPathologicalCasesFromEnv(t *testing.T) {
 		},
 		{
 			name:        "protocol_version",
-			config:      "tcp::protocol_version=3;",
-			expectedErr: "current client only supports protocol version 1 (text format for all datatypes), 2 (binary format for part datatypes) or explicitly unset",
+			config:      "tcp::protocol_version=4;",
+			expectedErr: "current client only supports protocol version 1 (text format for all datatypes), 2 (binary format for part datatypes), 3 (decimals) or explicitly unset",
 		},
 	}
 
@@ -364,6 +364,25 @@ func TestArrayColumnUnsupportedInTCPProtocolV1(t *testing.T) {
 		At(ctx, time.UnixMicro(4))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "current protocol version does not support double-array")
+}
+
+func TestDecimalColumnUnsupportedInTCPProtocolV2(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
+	defer cancel()
+
+	srv, err := newTestTcpServer(readAndDiscard)
+	assert.NoError(t, err)
+	defer srv.Close()
+	sender, err := qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(srv.Addr()), qdb.WithProtocolVersion(qdb.ProtocolVersion2))
+	assert.NoError(t, err)
+	defer sender.Close(ctx)
+
+	err = sender.
+		Table(testTable).
+		DecimalColumnFromString("price", "12.99").
+		At(ctx, time.UnixMicro(1))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "current protocol version does not support decimal")
 }
 
 func BenchmarkLineSenderBatch1000(b *testing.B) {
