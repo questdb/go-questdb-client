@@ -667,11 +667,11 @@ func (b *buffer) Float64ColumnBinary(name string, val float64) *buffer {
 }
 
 func (b *buffer) Float64Array1DColumn(name string, values []float64) *buffer {
-	if !b.prepareForField() {
-		return b
-	}
 	if values == nil {
 		// Don't write null arrays
+		return b
+	}
+	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -699,11 +699,11 @@ func (b *buffer) Float64Array1DColumn(name string, values []float64) *buffer {
 }
 
 func (b *buffer) Float64Array2DColumn(name string, values [][]float64) *buffer {
-	if !b.prepareForField() {
-		return b
-	}
 	if values == nil {
 		// Don't write null arrays
+		return b
+	}
+	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -747,11 +747,11 @@ func (b *buffer) Float64Array2DColumn(name string, values [][]float64) *buffer {
 }
 
 func (b *buffer) Float64Array3DColumn(name string, values [][][]float64) *buffer {
-	if !b.prepareForField() {
-		return b
-	}
 	if values == nil {
 		// Don't write null arrays
+		return b
+	}
+	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)
@@ -808,11 +808,11 @@ func (b *buffer) Float64Array3DColumn(name string, values [][][]float64) *buffer
 }
 
 func (b *buffer) Float64ArrayNDColumn(name string, value *NdArray[float64]) *buffer {
-	if !b.prepareForField() {
-		return b
-	}
 	if value == nil {
 		// Don't write null arrays
+		return b
+	}
+	if !b.prepareForField() {
 		return b
 	}
 	b.lastErr = b.writeColumnName(name)

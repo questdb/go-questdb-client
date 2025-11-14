@@ -433,6 +433,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 
 				err := s.
 					Table(testTable).
+					Int64Column("i", 1).
 					Float64Array1DColumn("array_1d", values1D).
 					Float64Array2DColumn("array_2d", values2D).
 					Float64Array3DColumn("array_3d", values3D).
@@ -445,6 +446,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 				emptyNdArray, _ := qdb.NewNDArray[float64](2, 2, 0, 2)
 				err = s.
 					Table(testTable).
+					Int64Column("i", 2).
 					Float64Array1DColumn("array_1d", []float64{}).
 					Float64Array2DColumn("array_2d", [][]float64{{}}).
 					Float64Array3DColumn("array_3d", [][][]float64{{{}}}).
@@ -456,6 +458,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 				// null array
 				return s.
 					Table(testTable).
+					Int64Column("i", 3).
 					Float64Array1DColumn("array_1d", nil).
 					Float64Array2DColumn("array_2d", nil).
 					Float64Array3DColumn("array_3d", nil).
@@ -464,6 +467,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 			},
 			tableData{
 				Columns: []column{
+					{"i", "LONG"},
 					{"array_1d", "ARRAY"},
 					{"array_2d", "ARRAY"},
 					{"array_3d", "ARRAY"},
@@ -472,18 +476,21 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 				},
 				Dataset: [][]interface{}{
 					{
+						float64(1),
 						[]interface{}{float64(1), float64(2), float64(3), float64(4), float64(5), nil},
 						[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}, []interface{}{float64(5), float64(6)}, []interface{}{nil, nil}},
 						[]interface{}{[]interface{}{[]interface{}{float64(1), float64(2)}, []interface{}{float64(3), float64(4)}}, []interface{}{[]interface{}{float64(5), float64(6)}, []interface{}{float64(7), nil}}},
 						[]interface{}{[]interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), float64(11)}}}, []interface{}{[]interface{}{[]interface{}{float64(11), float64(11)}}, []interface{}{[]interface{}{float64(11), nil}}}},
 						"1970-01-01T00:00:00.000001Z"},
 					{
+						float64(2),
 						[]interface{}{},
 						[]interface{}{},
 						[]interface{}{},
 						[]interface{}{},
 						"1970-01-01T00:00:00.000002Z"},
 					{
+						float64(3),
 						nil,
 						nil,
 						nil,
