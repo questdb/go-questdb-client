@@ -782,10 +782,15 @@ func TestFloat64Array1DColumn(t *testing.T) {
 			for _, littleEndian := range []bool{true, false} {
 				qdb.SetLittleEndian(littleEndian)
 				buf := newTestBuffer()
-
-				err := buf.Table(testTable).Float64Array1DColumn("array_col", tc.values).At(time.Time{}, false)
-				assert.NoError(t, err)
-				assert.Equal(t, float641DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				if tc.values == nil {
+					err := buf.Table(testTable).Float64Array1DColumn("array_col", nil).At(time.UnixMicro(42), true)
+					assert.NoError(t, err)
+					assert.Equal(t, []byte(testTable+" 42000\n"), buf.Messages())
+				} else {
+					err := buf.Table(testTable).Float64Array1DColumn("array_col", tc.values).At(time.Time{}, false)
+					assert.NoError(t, err)
+					assert.Equal(t, float641DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				}
 			}
 		})
 	}
@@ -808,9 +813,15 @@ func TestFloat64Array2DColumn(t *testing.T) {
 			for _, littleEndian := range []bool{true, false} {
 				qdb.SetLittleEndian(littleEndian)
 				buf := newTestBuffer()
-				err := buf.Table(testTable).Float64Array2DColumn("array_col", tc.values).At(time.Time{}, false)
-				assert.NoError(t, err)
-				assert.Equal(t, float642DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				if tc.values == nil {
+					err := buf.Table(testTable).Float64Array2DColumn("array_col", nil).At(time.UnixMicro(42), true)
+					assert.NoError(t, err)
+					assert.Equal(t, []byte(testTable+" 42000\n"), buf.Messages())
+				} else {
+					err := buf.Table(testTable).Float64Array2DColumn("array_col", tc.values).At(time.Time{}, false)
+					assert.NoError(t, err)
+					assert.Equal(t, float642DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				}
 			}
 		})
 	}
@@ -842,9 +853,15 @@ func TestFloat64Array3DColumn(t *testing.T) {
 			for _, littleEndian := range []bool{true, false} {
 				qdb.SetLittleEndian(littleEndian)
 				buf := newTestBuffer()
-				err := buf.Table(testTable).Float64Array3DColumn("array_col", tc.values).At(time.Time{}, false)
-				assert.NoError(t, err)
-				assert.Equal(t, float643DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				if tc.values == nil {
+					err := buf.Table(testTable).Float64Array3DColumn("array_col", nil).At(time.UnixMicro(42), true)
+					assert.NoError(t, err)
+					assert.Equal(t, []byte(testTable+" 42000\n"), buf.Messages())
+				} else {
+					err := buf.Table(testTable).Float64Array3DColumn("array_col", tc.values).At(time.Time{}, false)
+					assert.NoError(t, err)
+					assert.Equal(t, float643DArrayToByte(testTable, "array_col", tc.values), buf.Messages())
+				}
 			}
 		})
 	}
@@ -881,9 +898,9 @@ func TestFloat64ArrayNDColumn(t *testing.T) {
 				buf := newTestBuffer()
 				var err error
 				if tc.data == nil {
-					err = buf.Table(testTable).Float64ArrayNDColumn("ndarray_col", nil).At(time.Time{}, false)
+					err = buf.Table(testTable).Float64ArrayNDColumn("ndarray_col", nil).At(time.UnixMicro(42), true)
 					assert.NoError(t, err)
-					assert.Equal(t, float64NDArrayToByte(testTable, "ndarray_col", nil), buf.Messages())
+					assert.Equal(t, []byte(testTable+" 42000\n"), buf.Messages())
 				} else {
 					ndArray, err := qdb.NewNDArray[float64](tc.shape...)
 					assert.NoError(t, err)
