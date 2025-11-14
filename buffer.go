@@ -86,7 +86,6 @@ type arrayElemType byte
 
 const (
 	arrayElemDouble arrayElemType = 10
-	arrayElemNull   arrayElemType = 40
 )
 
 // buffer is a wrapper on top of bytes.Buffer. It extends the
@@ -671,12 +670,12 @@ func (b *buffer) Float64Array1DColumn(name string, values []float64) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
-	b.lastErr = b.writeColumnName(name)
-	if b.lastErr != nil {
+	if values == nil {
+		// Don't write null arrays
 		return b
 	}
-	if values == nil {
-		b.writeNullArray()
+	b.lastErr = b.writeColumnName(name)
+	if b.lastErr != nil {
 		return b
 	}
 
@@ -703,13 +702,12 @@ func (b *buffer) Float64Array2DColumn(name string, values [][]float64) *buffer {
 	if !b.prepareForField() {
 		return b
 	}
-	b.lastErr = b.writeColumnName(name)
-	if b.lastErr != nil {
+	if values == nil {
+		// Don't write null arrays
 		return b
 	}
-
-	if values == nil {
-		b.writeNullArray()
+	b.lastErr = b.writeColumnName(name)
+	if b.lastErr != nil {
 		return b
 	}
 
@@ -752,13 +750,12 @@ func (b *buffer) Float64Array3DColumn(name string, values [][][]float64) *buffer
 	if !b.prepareForField() {
 		return b
 	}
-	b.lastErr = b.writeColumnName(name)
-	if b.lastErr != nil {
+	if values == nil {
+		// Don't write null arrays
 		return b
 	}
-
-	if values == nil {
-		b.writeNullArray()
+	b.lastErr = b.writeColumnName(name)
+	if b.lastErr != nil {
 		return b
 	}
 
@@ -814,13 +811,12 @@ func (b *buffer) Float64ArrayNDColumn(name string, value *NdArray[float64]) *buf
 	if !b.prepareForField() {
 		return b
 	}
-	b.lastErr = b.writeColumnName(name)
-	if b.lastErr != nil {
+	if value == nil {
+		// Don't write null arrays
 		return b
 	}
-
-	if value == nil {
-		b.writeNullArray()
+	b.lastErr = b.writeColumnName(name)
+	if b.lastErr != nil {
 		return b
 	}
 
@@ -925,12 +921,4 @@ func (b *buffer) writeFloat64ArrayHeader(dims byte) {
 	b.WriteByte(byte(arrayCode))
 	b.WriteByte(byte(arrayElemDouble))
 	b.WriteByte(dims)
-}
-
-func (b *buffer) writeNullArray() {
-	b.WriteByte('=')
-	b.WriteByte('=')
-	b.WriteByte(byte(arrayCode))
-	b.WriteByte(byte(arrayElemNull))
-	b.hasFields = true
 }
