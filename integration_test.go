@@ -497,22 +497,32 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 			"decimal type",
 			testTable,
 			func(s qdb.LineSender) error {
-				err := s.
+				d := qdb.NewDecimalFromInt64(12345, 2)
+				neg_d, err := qdb.NewDecimal(big.NewInt(-12345), 2)
+				if err != nil {
+					return err
+				}
+				err = s.
 					Table(testTable).
 					DecimalColumnFromString("text_col", "123.45").
-					DecimalColumn("binary_col", qdb.NewDecimalFromInt64(12345, 2)).
-					DecimalColumn("binary_neg_col", qdb.NewDecimalFromInt64(-12345, 2)).
+					DecimalColumn("binary_col", d).
+					DecimalColumn("binary_neg_col", neg_d).
 					DecimalColumnShopspring("binary_null_col", nil).
 					At(ctx, time.UnixMicro(1))
 				if err != nil {
 					return err
 				}
 
+				d, err = qdb.NewDecimal(big.NewInt(12346), 2)
+				if err != nil {
+					return err
+				}
+				neg_d = qdb.NewDecimalFromInt64(-12346, 2)
 				return s.
 					Table(testTable).
 					DecimalColumnFromString("text_col", "123.46").
-					DecimalColumn("binary_col", qdb.NewDecimalFromInt64(12346, 2)).
-					DecimalColumn("binary_neg_col", qdb.NewDecimalFromInt64(-12346, 2)).
+					DecimalColumn("binary_col", d).
+					DecimalColumn("binary_neg_col", neg_d).
 					DecimalColumnShopspring("binary_null_col", nil).
 					At(ctx, time.UnixMicro(2))
 			},
