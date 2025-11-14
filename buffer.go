@@ -898,7 +898,7 @@ func (b *buffer) At(ts time.Time, sendTs bool) error {
 		b.DiscardPendingMsg()
 		return fmt.Errorf("table name was not provided: %w", errInvalidMsg)
 	}
-	if !b.hasTags && !b.hasFields {
+	if !b.hasTags && !b.hasFields && !sendTs {
 		b.DiscardPendingMsg()
 		return fmt.Errorf("no symbols or columns were provided: %w", errInvalidMsg)
 	}
