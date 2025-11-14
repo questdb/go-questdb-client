@@ -546,6 +546,7 @@ func (suite *integrationTestSuite) TestE2EValidWrites() {
 					{"text_col", "DECIMAL(18,3)"},
 					{"binary_col", "DECIMAL(18,3)"},
 					{"binary_neg_col", "DECIMAL(18,3)"},
+					{"binary_null_col", "DECIMAL(18,3)"},
 					{"ts", "TIMESTAMP"},
 				},
 				Dataset: [][]any{
