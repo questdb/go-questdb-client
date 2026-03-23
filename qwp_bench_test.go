@@ -25,7 +25,9 @@
 package questdb
 
 import (
+	"context"
 	"testing"
+	"time"
 )
 
 // BenchmarkQwpVarint measures varint encoding throughput.
@@ -128,6 +130,76 @@ func BenchmarkQwpFlush(b *testing.B) {
 		schemaHash := tb.getSchemaHash()
 		enc.encodeTableWithDeltaDict(tb, symList, -1, 2, qwpSchemaModeFull, schemaHash)
 		tb.reset()
+	}
+}
+
+// BenchmarkQwpSenderSteadyState measures the full sender hot path:
+// Table/Symbol/columns/At for 10 rows, then encode + reset.
+// This exercises the complete pipeline (sender methods → columnar
+// buffers → encoder) without network I/O. Target: 0 allocs/op
+// after warmup, proving the hot path is allocation-free.
+func BenchmarkQwpSenderSteadyState(b *testing.B) {
+	ctx := context.Background()
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// Create a sender with auto-flush disabled (no network).
+	s := &qwpLineSender{
+		tableBuffers:     make(map[string]*qwpTableBuffer),
+		globalSymbols:    make(map[string]int32),
+		sentSchemaHashes: make(map[int64]struct{}),
+		maxSentSymbolId:  -1,
+		batchMaxSymbolId: -1,
+	}
+
+	// Pre-populate the symbol dictionary (warmup).
+	s.globalSymbols["AAPL"] = 0
+	s.globalSymbolList = append(s.globalSymbolList, "AAPL")
+	s.batchMaxSymbolId = 0
+
+	// Warmup: 2 flushes with 10 rows each to grow all backing buffers.
+	for flush := 0; flush < 2; flush++ {
+		for r := 0; r < 10; r++ {
+			s.Table("t").
+				Symbol("sym", "AAPL").
+				Int64Column("qty", int64(100+r)).
+				Float64Column("price", 150.5+float64(r)).
+				StringColumn("note", "test").
+				At(ctx, ts.Add(time.Duration(r)*time.Microsecond))
+		}
+		tables := s.buildTableEncodeInfo()
+		s.encoders[0].encodeMultiTableWithDeltaDict(
+			tables,
+			s.globalSymbolList,
+			s.maxSentSymbolId,
+			s.batchMaxSymbolId,
+		)
+		// Mark schema as sent so subsequent flushes use reference mode.
+		for _, t := range tables {
+			skey := qwpSchemaKey(t.tb.tableNameHash, t.schemaHash)
+			s.sentSchemaHashes[skey] = struct{}{}
+		}
+		s.resetAfterFlush()
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		for r := 0; r < 10; r++ {
+			s.Table("t").
+				Symbol("sym", "AAPL").
+				Int64Column("qty", int64(100+r)).
+				Float64Column("price", 150.5+float64(r)).
+				StringColumn("note", "test").
+				At(ctx, ts.Add(time.Duration(r)*time.Microsecond))
+		}
+		tables := s.buildTableEncodeInfo()
+		s.encoders[0].encodeMultiTableWithDeltaDict(
+			tables,
+			s.globalSymbolList,
+			s.maxSentSymbolId,
+			s.batchMaxSymbolId,
+		)
+		s.resetAfterFlush()
 	}
 }
 
