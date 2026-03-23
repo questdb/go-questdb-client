@@ -79,8 +79,10 @@ const qwpVersion byte = 0x01
 
 // QWP message header layout.
 const (
-	qwpHeaderSize       = 12
-	qwpHeaderOffsetFlags = 5
+	qwpHeaderSize              = 12
+	qwpHeaderOffsetFlags       = 5
+	qwpHeaderOffsetTableCount  = 6
+	qwpHeaderOffsetPayloadLen  = 8
 )
 
 // QWP header flag bits.
