@@ -510,3 +510,63 @@ func TestQwpAsyncCloseAfterError(t *testing.T) {
 		t.Fatalf("double close: got %v, want errDoubleSenderClose", err)
 	}
 }
+
+func TestQwpAsyncCloseUnresponsiveServer(t *testing.T) {
+	// Verify that Close() completes within a reasonable timeout even
+	// when the server accepts the WebSocket connection and reads
+	// messages but never sends ACKs. Without a cancellable context in
+	// the I/O goroutine, sendMessage or readAck would block forever
+	// and Close() would hang.
+
+	// blockForever keeps the server handler alive but never sends ACKs.
+	blockForever := make(chan struct{})
+	defer close(blockForever)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		// Read messages but never ACK — simulate an unresponsive server.
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			// Block instead of sending an ACK.
+			<-blockForever
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert a row and start async flush (enqueue to I/O goroutine).
+	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
+	// Manually enqueue so we have an in-flight batch.
+	s.enqueueFlush(context.Background())
+
+	// Close must complete within 5 seconds. Without context
+	// cancellation, the I/O goroutine would block forever on
+	// readAck(context.Background()).
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Close(context.Background())
+	}()
+
+	select {
+	case err := <-done:
+		// Close completed — it should return an error (cancelled context).
+		t.Logf("Close returned: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() did not complete within 5 seconds — I/O goroutine is stuck")
+	}
+}

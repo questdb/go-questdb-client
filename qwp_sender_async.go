@@ -28,6 +28,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // qwpAsyncState manages the in-flight window and I/O goroutine for
@@ -66,6 +67,12 @@ type qwpAsyncState struct {
 	// wg tracks the I/O goroutine for clean shutdown.
 	wg sync.WaitGroup
 
+	// ctx is a cancellable context used by the I/O goroutine for all
+	// WebSocket operations. Cancelled by stop() to unblock sendMessage
+	// and readAck if the server becomes unresponsive.
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	// transport is the WebSocket connection used by the I/O goroutine.
 	transport *qwpTransport
 }
@@ -74,10 +81,13 @@ type qwpAsyncState struct {
 // The send channel is buffered to the window size so the user goroutine
 // can enqueue without blocking until the window is full.
 func newQwpAsyncState(maxWindow int, transport *qwpTransport) *qwpAsyncState {
+	ctx, cancel := context.WithCancel(context.Background())
 	a := &qwpAsyncState{
 		sendCh:      make(chan []byte, maxWindow),
 		inFlightMax: maxWindow,
 		done:        make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
 		transport:   transport,
 	}
 	a.cond = sync.NewCond(&a.mu)
@@ -175,8 +185,9 @@ func (a *qwpAsyncState) ioLoop() {
 	defer close(a.done)
 
 	for batch := range a.sendCh {
-		// Send the batch over the WebSocket.
-		if err := a.transport.sendMessage(context.Background(), batch); err != nil {
+		// Send the batch over the WebSocket. Uses the cancellable
+		// context so stop() can unblock this if the server hangs.
+		if err := a.transport.sendMessage(a.ctx, batch); err != nil {
 			a.setError(fmt.Errorf("qwp: async send failed: %w", err))
 			// Drain remaining batches from channel to unblock senders.
 			for range a.sendCh {
@@ -186,7 +197,7 @@ func (a *qwpAsyncState) ioLoop() {
 		}
 
 		// Read the ACK.
-		status, ackData, err := a.transport.readAck(context.Background())
+		status, ackData, err := a.transport.readAck(a.ctx)
 		if err != nil {
 			a.setError(fmt.Errorf("qwp: async ACK read failed: %w", err))
 			for range a.sendCh {
@@ -218,9 +229,31 @@ func (a *qwpAsyncState) start() {
 	go a.ioLoop()
 }
 
-// stop closes the send channel and waits for the I/O goroutine to exit.
-// Must be called exactly once.
+// qwpAsyncStopGracePeriod is the time stop() waits for the I/O
+// goroutine to finish normally before force-cancelling the context.
+const qwpAsyncStopGracePeriod = 2 * time.Second
+
+// stop closes the send channel and waits for the I/O goroutine to
+// exit. If the goroutine doesn't finish within the grace period
+// (e.g., stuck on an unresponsive server), the I/O context is
+// cancelled to force exit. Must be called exactly once.
 func (a *qwpAsyncState) stop() {
+	// Signal no more batches.
 	close(a.sendCh)
+
+	// Wait for the goroutine to finish processing remaining batches.
+	// If it's stuck on a network operation, cancel the I/O context
+	// after the grace period to force it to exit.
+	select {
+	case <-a.done:
+		// Normal exit — goroutine finished processing all batches.
+	case <-time.After(qwpAsyncStopGracePeriod):
+		// Goroutine is stuck — cancel the I/O context to unblock
+		// sendMessage or readAck.
+		a.cancel()
+		<-a.done
+	}
+
 	a.wg.Wait()
+	a.cancel() // Ensure context is always cleaned up (idempotent).
 }

@@ -909,11 +909,28 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 
 	s.closed = true
 
-	flushErr := s.flush0(ctx)
-
-	// Stop the async I/O goroutine before closing the connection.
+	var flushErr error
 	if s.asyncState != nil {
+		// Async close: enqueue pending rows non-blocking, then
+		// stop the I/O goroutine (cancel context + close channel
+		// + wait). For a guaranteed graceful flush, call Flush()
+		// before Close().
+		if s.hasTable {
+			if s.currentTable != nil {
+				s.currentTable.cancelRow()
+			}
+			s.hasTable = false
+			s.currentTable = nil
+		}
+		if s.pendingRowCount > 0 {
+			flushErr = s.enqueueFlush(ctx)
+		}
 		s.asyncState.stop()
+		if flushErr == nil {
+			flushErr = s.asyncState.checkError()
+		}
+	} else {
+		flushErr = s.flush0(ctx)
 	}
 
 	closeErr := s.transport.close(ctx)
