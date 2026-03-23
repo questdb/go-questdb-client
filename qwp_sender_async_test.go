@@ -297,7 +297,7 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 	}
 
 	// Stop the I/O goroutine.
-	a.stop()
+	a.stop(5 * time.Second)
 
 	// Verify all 3 batches were received.
 	mu.Lock()
@@ -369,7 +369,7 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 	a.sendCh <- qwpAsyncBatch{data: []byte{0x02}}
 
 	// Wait for error to propagate.
-	a.stop()
+	a.stop(5 * time.Second)
 
 	err := a.checkError()
 	if err == nil {
@@ -452,7 +452,7 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 	}
 
 	// Stop should close the channel and wait for goroutine exit.
-	a.stop()
+	a.stop(5 * time.Second)
 
 	// Verify the done channel is closed (goroutine exited).
 	select {
@@ -548,13 +548,15 @@ func TestQwpAsyncCloseUnresponsiveServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Use a short close timeout for this test so it doesn't take 5s.
+	s.closeTimeout = 500 * time.Millisecond
 
 	// Insert a row and start async flush (enqueue to I/O goroutine).
 	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
 	// Manually enqueue so we have an in-flight batch.
 	s.enqueueFlush(context.Background())
 
-	// Close must complete within 5 seconds. Without context
+	// Close must complete within 3 seconds. Without context
 	// cancellation, the I/O goroutine would block forever on
 	// readAck(context.Background()).
 	done := make(chan error, 1)
@@ -566,7 +568,7 @@ func TestQwpAsyncCloseUnresponsiveServer(t *testing.T) {
 	case err := <-done:
 		// Close completed — it should return an error (cancelled context).
 		t.Logf("Close returned: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Close() did not complete within 5 seconds — I/O goroutine is stuck")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close() did not complete within 3 seconds — I/O goroutine is stuck")
 	}
 }

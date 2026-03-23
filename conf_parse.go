@@ -185,6 +185,12 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.inFlightWindow = parsedVal
+		case "close_timeout":
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int (milliseconds)", k, v)
+			}
+			senderConf.closeTimeout = time.Duration(parsedVal) * time.Millisecond
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}

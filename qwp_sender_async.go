@@ -127,7 +127,9 @@ func (a *qwpAsyncState) acquireSlot() error {
 }
 
 // releaseSlot decrements the in-flight count and wakes waiters.
-// Called by the I/O goroutine after receiving an ACK.
+// Called by the I/O goroutine after receiving an ACK. Uses Signal
+// instead of Broadcast because only one waiter can proceed per slot
+// release (the single user goroutine in acquireSlot or waitEmpty).
 func (a *qwpAsyncState) releaseSlot() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -135,7 +137,7 @@ func (a *qwpAsyncState) releaseSlot() {
 	if a.inFlightCount > 0 {
 		a.inFlightCount--
 	}
-	a.cond.Broadcast()
+	a.cond.Signal()
 }
 
 // setError records the first I/O error and wakes all waiters.
@@ -257,15 +259,11 @@ func (a *qwpAsyncState) start() {
 	go a.ioLoop()
 }
 
-// qwpAsyncStopGracePeriod is the time stop() waits for the I/O
-// goroutine to finish normally before force-cancelling the context.
-const qwpAsyncStopGracePeriod = 2 * time.Second
-
 // stop closes the send channel and waits for the I/O goroutine to
 // exit. If the goroutine doesn't finish within the grace period
 // (e.g., stuck on an unresponsive server), the I/O context is
 // cancelled to force exit. Must be called exactly once.
-func (a *qwpAsyncState) stop() {
+func (a *qwpAsyncState) stop(gracePeriod time.Duration) {
 	// Signal no more batches.
 	close(a.sendCh)
 
@@ -275,7 +273,7 @@ func (a *qwpAsyncState) stop() {
 	select {
 	case <-a.done:
 		// Normal exit — goroutine finished processing all batches.
-	case <-time.After(qwpAsyncStopGracePeriod):
+	case <-time.After(gracePeriod):
 		// Goroutine is stuck — cancel the I/O context to unblock
 		// sendMessage or readAck.
 		a.cancel()

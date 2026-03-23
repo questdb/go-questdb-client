@@ -107,6 +107,10 @@ type qwpLineSender struct {
 	// avoiding allocation on every flush.
 	encodeInfoBuf []qwpTableEncodeInfo
 
+	// pendingSchemaKeysBuf is a reusable scratch slice for flushAsync,
+	// avoiding allocation on every explicit Flush() in async mode.
+	pendingSchemaKeysBuf []int64
+
 	// globalSymbols maps symbol strings to global IDs.
 	globalSymbols map[string]int32
 	// globalSymbolList maps IDs to symbol strings (for delta dict).
@@ -141,6 +145,10 @@ type qwpLineSender struct {
 	asyncState      *qwpAsyncState
 	inFlightWindow  int
 
+	// closeTimeout is the time Close() waits for the async I/O
+	// goroutine to finish before force-cancelling. Defaults to 5s.
+	closeTimeout time.Duration
+
 	// Lifecycle.
 	closed bool
 }
@@ -164,6 +172,7 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 		autoFlushRows:     autoFlushRows,
 		autoFlushInterval: autoFlushInterval,
 		inFlightWindow:    window,
+		closeTimeout:      5 * time.Second,
 	}
 
 	if err := s.transport.connect(ctx, address, opts); err != nil {
@@ -837,11 +846,11 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 
 	// Capture pending state before waiting.
 	pendingMaxSymbolId := s.batchMaxSymbolId
-	var pendingSchemaKeys []int64
+	s.pendingSchemaKeysBuf = s.pendingSchemaKeysBuf[:0]
 	for _, t := range tables {
 		skey := qwpSchemaKey(t.tb.tableNameHash, t.schemaHash)
 		if _, ok := s.sentSchemaHashes[skey]; !ok {
-			pendingSchemaKeys = append(pendingSchemaKeys, skey)
+			s.pendingSchemaKeysBuf = append(s.pendingSchemaKeysBuf, skey)
 		}
 	}
 
@@ -851,7 +860,7 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	}
 
 	// ACK received — commit schema and symbol caches.
-	for _, skey := range pendingSchemaKeys {
+	for _, skey := range s.pendingSchemaKeysBuf {
 		s.sentSchemaHashes[skey] = struct{}{}
 	}
 	if pendingMaxSymbolId > s.maxSentSymbolId {
@@ -976,7 +985,7 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 		if s.pendingRowCount > 0 {
 			flushErr = s.enqueueFlush(ctx)
 		}
-		s.asyncState.stop()
+		s.asyncState.stop(s.closeTimeout)
 		if flushErr == nil {
 			flushErr = s.asyncState.checkError()
 		}

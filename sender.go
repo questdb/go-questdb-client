@@ -314,7 +314,8 @@ type lineSenderConfig struct {
 	protocolVersion protocolVersion
 
 	// QWP-specific fields
-	inFlightWindow int // 0 = default (sync mode), >1 = async mode
+	inFlightWindow int           // 0 = default (sync mode), >1 = async mode
+	closeTimeout   time.Duration // 0 = use default (5s)
 }
 
 // LineSenderOption defines line sender config option.
@@ -349,6 +350,18 @@ func WithQwp() LineSenderOption {
 func WithInFlightWindow(window int) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.inFlightWindow = window
+	}
+}
+
+// WithCloseTimeout sets the time Close() waits for the async I/O
+// goroutine to finish before force-cancelling. Defaults to 5 seconds.
+// Calling Flush() before Close() guarantees all data is ACKed
+// regardless of this timeout.
+//
+// Only relevant for the QWP sender in async mode (in-flight window > 1).
+func WithCloseTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.closeTimeout = d
 	}
 }
 
@@ -822,6 +835,9 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		return nil, err
 	}
 	s.maxBufSize = conf.maxBufSize
+	if conf.closeTimeout > 0 {
+		s.closeTimeout = conf.closeTimeout
+	}
 	return s, nil
 }
 
