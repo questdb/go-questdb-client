@@ -412,3 +412,101 @@ func TestQwpAsyncConcurrentAcquireRelease(t *testing.T) {
 	}
 	a.mu.Unlock()
 }
+
+func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
+	// Verify the I/O goroutine exits cleanly after stop().
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			ack := make([]byte, 9)
+			ack[0] = qwpWireStatusOK
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	}))
+	defer srv.Close()
+
+	var transport qwpTransport
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newQwpAsyncState(2, &transport)
+	a.start()
+
+	// Send a batch and wait for ACK.
+	a.acquireSlot()
+	a.sendCh <- []byte{0x01}
+	if err := a.waitEmpty(); err != nil {
+		t.Fatalf("waitEmpty: %v", err)
+	}
+
+	// Stop should close the channel and wait for goroutine exit.
+	a.stop()
+
+	// Verify the done channel is closed (goroutine exited).
+	select {
+	case <-a.done:
+		// Good.
+	default:
+		t.Fatal("done channel not closed after stop()")
+	}
+
+	// Verify stopped flag is set.
+	a.mu.Lock()
+	if !a.stopped {
+		t.Fatal("stopped flag not set after stop()")
+	}
+	a.mu.Unlock()
+
+	transport.close(context.Background())
+}
+
+func TestQwpAsyncCloseAfterError(t *testing.T) {
+	// Verify Close works correctly after an I/O error in async mode.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		// Close immediately to cause an error on the next send.
+		conn.Close(websocket.StatusGoingAway, "bye")
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Add a row.
+	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
+
+	// Flush will fail (server closed connection).
+	err = s.Flush(context.Background())
+	// Error is expected since the server closed the connection.
+	t.Logf("Flush error (expected): %v", err)
+
+	// Close should not panic or hang.
+	closeErr := s.Close(context.Background())
+	t.Logf("Close error: %v", closeErr)
+
+	// Double close should return the standard error.
+	err = s.Close(context.Background())
+	if err != errDoubleSenderClose {
+		t.Fatalf("double close: got %v, want errDoubleSenderClose", err)
+	}
+}

@@ -840,6 +840,12 @@ func (s *qwpLineSender) flush0(ctx context.Context) error {
 
 	defer s.resetAfterFlush()
 
+	// Route through the async path if async mode is active,
+	// so the ioLoop goroutine owns all transport access.
+	if s.asyncState != nil {
+		return s.flushAsync(ctx)
+	}
+
 	for _, tb := range s.tableBuffers {
 		if tb.rowCount == 0 {
 			continue
