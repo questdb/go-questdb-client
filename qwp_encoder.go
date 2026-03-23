@@ -47,7 +47,7 @@ type qwpEncoder struct {
 //	Header (12 bytes) → TableBlock → patched PayloadLength.
 func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaHash int64) []byte {
 	e.wb.reset()
-	e.writeHeader(0x00, 1)
+	e.writeHeader(qwpFlagGorilla, 1)
 	e.writeTableBlock(tb, schemaMode, schemaHash)
 	e.patchPayloadLength()
 	return e.wb.bytes()
@@ -75,7 +75,7 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 	schemaHash int64,
 ) []byte {
 	e.wb.reset()
-	e.writeHeader(qwpFlagDeltaSymbolDict, 1)
+	e.writeHeader(qwpFlagDeltaSymbolDict|qwpFlagGorilla, 1)
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
 	e.writeTableBlock(tb, schemaMode, schemaHash)
 	e.patchPayloadLength()
@@ -166,6 +166,10 @@ func (e *qwpEncoder) encodeSchemaFull(tb *qwpTableBuffer) {
 
 // --- column data ---
 
+// qwpEncodingUncompressed is the encoding prefix byte for
+// uncompressed timestamp data when Gorilla mode is enabled.
+const qwpEncodingUncompressed byte = 0x00
+
 // encodeColumnData writes the wire-format data for a single column.
 // For nullable columns, the null bitmap is written first. Then the
 // type-specific data follows.
@@ -177,6 +181,14 @@ func (e *qwpEncoder) encodeColumnData(col *qwpColumnBuffer) {
 	switch col.typeCode {
 	case qwpTypeBoolean:
 		e.encodeBoolColumn(col)
+
+	case qwpTypeTimestamp, qwpTypeTimestampNano:
+		// Timestamp columns require an encoding prefix byte
+		// when Gorilla mode is enabled (FLAG_GORILLA in header).
+		// We always enable Gorilla mode, so always write the
+		// uncompressed encoding byte (0x00) followed by raw data.
+		e.wb.putByte(qwpEncodingUncompressed)
+		e.wb.putBytes(col.fixedData)
 
 	case qwpTypeString, qwpTypeVarchar:
 		e.encodeStringColumn(col)

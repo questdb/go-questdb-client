@@ -25,7 +25,7 @@
 
 ## Phase 4: WebSocket Transport
 
-- [ ] Add `github.com/coder/websocket` dependency: `go get github.com/coder/websocket`. Create `qwp_transport.go` with a `qwpTransport` struct wrapping `*websocket.Conn`. Methods: connect(ctx, url, opts) error, sendMessage(ctx, data []byte) error, readAck(ctx) (statusCode byte, payload []byte, err error), close(ctx) error. Write a basic test that connects to ws://localhost:9000/write/v4 and verifies the connection succeeds (integration test, skip if server unavailable).
+- [x] Add `github.com/coder/websocket` dependency and create `qwp_transport.go` with qwpTransport struct wrapping *websocket.Conn. Methods: connect(ctx,url,opts), sendMessage(ctx,data), readAck(ctx)→(status,payload,err), close(ctx). ACK format: status(1B)+sequence(8B LE)+optional error(uint16 len+UTF-8). TLS insecure skip verify via custom http.Client. Auth header support. Gorilla encoding byte (0x00) prepended to timestamp columns. 11 tests: ACK parsing (6 cases), sequence parsing, unconnected, mock WS connect/close, mock send/receive, mock error ACK, integration test vs real QuestDB.
 - [ ] Add ACK response parsing to `qwp_transport.go`: parse status codes, handle PARTIAL error payload (extract table errors). Create `qwp_errors.go` with QwpError type (statusCode, message, tableErrors). Write unit tests for parsing each status code from byte slices.
 - [ ] Add TLS support: wss:// connections with configurable certificate verification. Add auth header support (Basic and Bearer). Write test for auth header construction.
 - [ ] Add retry logic for STATUS_OVERLOADED (0x07): exponential backoff (10ms, 20ms, 40ms... up to 1s), cumulative timeout from retryTimeout config. Match the existing HTTP sender's retry pattern in http_sender.go.
