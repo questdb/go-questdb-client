@@ -26,7 +26,9 @@ package questdb
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
+	"math/bits"
 )
 
 // qwpLongNull is the uint64 bit pattern for int64 MinInt64
@@ -371,4 +373,184 @@ func (c *qwpColumnBuffer) reset() {
 	c.nullBitmap = c.nullBitmap[:0]
 	c.nullCount = 0
 	c.rowCount = 0
+}
+
+// truncateTo rolls the column back to exactly n rows, discarding
+// any data beyond that point. Used by qwpTableBuffer.cancelRow().
+func (c *qwpColumnBuffer) truncateTo(n int) {
+	if n >= c.rowCount {
+		return
+	}
+
+	switch c.typeCode {
+	case qwpTypeBoolean:
+		newLen := (n + 7) / 8
+		if newLen < len(c.boolData) {
+			c.boolData = c.boolData[:newLen]
+		}
+		// Clear any trailing bits in the last byte.
+		if n > 0 && n%8 != 0 {
+			c.boolData[newLen-1] &= (1 << uint(n%8)) - 1
+		}
+
+	case qwpTypeString, qwpTypeVarchar:
+		c.strOffsets = c.strOffsets[:n+1]
+		c.strData = c.strData[:c.strOffsets[n]]
+
+	case qwpTypeSymbol:
+		c.symbolIDs = c.symbolIDs[:n]
+
+	default:
+		// Fixed-width types.
+		if c.fixedSize > 0 {
+			c.fixedData = c.fixedData[:n*c.fixedSize]
+		}
+	}
+
+	// Truncate null bitmap and recount.
+	if c.nullable {
+		newBitmapLen := (n + 7) / 8
+		if newBitmapLen < len(c.nullBitmap) {
+			c.nullBitmap = c.nullBitmap[:newBitmapLen]
+		}
+		if n > 0 && n%8 != 0 && newBitmapLen > 0 {
+			c.nullBitmap[newBitmapLen-1] &= (1 << uint(n%8)) - 1
+		}
+		c.nullCount = 0
+		for _, b := range c.nullBitmap {
+			c.nullCount += bits.OnesCount8(b)
+		}
+	}
+
+	c.rowCount = n
+}
+
+// --- qwpTableBuffer ---------------------------------------------------
+
+// qwpTableBuffer aggregates columnar data for a single table. It
+// manages multiple qwpColumnBuffer instances and handles row commits
+// with automatic gap-filling for columns not set in a given row.
+type qwpTableBuffer struct {
+	tableName   string
+	columns     []*qwpColumnBuffer
+	columnIndex map[string]int // column name → index in columns slice
+
+	// rowCount is the number of committed (finalized) rows.
+	rowCount int
+
+	// committedColumnCount tracks how many columns existed at the
+	// last commitRow() call. Columns with index >= this value were
+	// added during the current in-progress row and should be
+	// removed on cancelRow().
+	committedColumnCount int
+
+	// Schema hash caching. The hash is lazily computed on first
+	// call to getSchemaHash() and invalidated when columns change.
+	schemaHash      int64
+	schemaHashValid bool
+}
+
+// newQwpTableBuffer creates a table buffer for the given table name.
+func newQwpTableBuffer(tableName string) *qwpTableBuffer {
+	return &qwpTableBuffer{
+		tableName:   tableName,
+		columnIndex: make(map[string]int),
+	}
+}
+
+// getOrCreateColumn looks up an existing column by name or creates a
+// new one. Returns an error if a column with the same name but a
+// different type already exists, or if the column was already set
+// for the current in-progress row (duplicate column in same row).
+func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, nullable bool) (*qwpColumnBuffer, error) {
+	idx, exists := tb.columnIndex[name]
+	if exists {
+		col := tb.columns[idx]
+		if col.typeCode != typeCode {
+			return nil, fmt.Errorf(
+				"qwp: column %q type conflict: existing %d, got %d",
+				name, col.typeCode, typeCode,
+			)
+		}
+		// Check for duplicate column within the same row.
+		if col.rowCount > tb.rowCount {
+			return nil, fmt.Errorf("qwp: column %q already set for current row", name)
+		}
+		return col, nil
+	}
+
+	// New column. Check limits.
+	if len(tb.columns) >= qwpMaxColumnsPerTable {
+		return nil, fmt.Errorf(
+			"qwp: table %q exceeds maximum column count (%d)",
+			tb.tableName, qwpMaxColumnsPerTable,
+		)
+	}
+
+	col := newQwpColumnBuffer(name, typeCode, nullable)
+
+	// Backfill with nulls for all previously committed rows so
+	// the new column has the same row count as the table.
+	for i := 0; i < tb.rowCount; i++ {
+		col.addNull()
+	}
+
+	tb.columnIndex[name] = len(tb.columns)
+	tb.columns = append(tb.columns, col)
+	tb.schemaHashValid = false
+	return col, nil
+}
+
+// commitRow finalizes the current in-progress row. Any column that
+// was not set for this row is gap-filled with a null sentinel.
+func (tb *qwpTableBuffer) commitRow() {
+	for _, col := range tb.columns {
+		if col.rowCount <= tb.rowCount {
+			col.addNull()
+		}
+	}
+	tb.rowCount++
+	tb.committedColumnCount = len(tb.columns)
+}
+
+// cancelRow discards the current in-progress row, rolling back any
+// column values that were set since the last commitRow(). Columns
+// that were created during this row are removed entirely.
+func (tb *qwpTableBuffer) cancelRow() {
+	// Remove columns created during this row.
+	if len(tb.columns) > tb.committedColumnCount {
+		for i := tb.committedColumnCount; i < len(tb.columns); i++ {
+			delete(tb.columnIndex, tb.columns[i].name)
+		}
+		tb.columns = tb.columns[:tb.committedColumnCount]
+		tb.schemaHashValid = false
+	}
+
+	// Truncate any columns that were set during this row.
+	for _, col := range tb.columns {
+		if col.rowCount > tb.rowCount {
+			col.truncateTo(tb.rowCount)
+		}
+	}
+}
+
+// reset clears all row data and columns, retaining the table name.
+func (tb *qwpTableBuffer) reset() {
+	for _, col := range tb.columns {
+		col.reset()
+	}
+	tb.rowCount = 0
+	tb.committedColumnCount = 0
+	tb.schemaHashValid = false
+}
+
+// getSchemaHash returns a hash over the column definitions (names
+// and wire type codes). The hash is lazily computed and cached until
+// the column set changes.
+func (tb *qwpTableBuffer) getSchemaHash() int64 {
+	if !tb.schemaHashValid {
+		tb.schemaHash = qwpComputeSchemaHash(tb.columns)
+		tb.schemaHashValid = true
+	}
+	return tb.schemaHash
 }

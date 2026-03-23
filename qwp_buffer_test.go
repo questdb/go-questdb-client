@@ -782,3 +782,482 @@ func TestQwpColumnBufferNegativeValues(t *testing.T) {
 		}
 	})
 }
+
+// --- truncateTo tests ---
+
+func TestQwpColumnBufferTruncateTo(t *testing.T) {
+	t.Run("FixedWidth", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLong, false)
+		c.addLong(100)
+		c.addLong(200)
+		c.addLong(300)
+
+		c.truncateTo(2)
+
+		if c.rowCount != 2 {
+			t.Fatalf("rowCount = %d, want 2", c.rowCount)
+		}
+		if len(c.fixedData) != 16 {
+			t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
+		}
+		v := int64(binary.LittleEndian.Uint64(c.fixedData[8:16]))
+		if v != 200 {
+			t.Fatalf("row 1 = %d, want 200", v)
+		}
+	})
+
+	t.Run("Bool", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeBoolean, false)
+		for i := 0; i < 10; i++ {
+			c.addBool(i%2 == 0)
+		}
+
+		c.truncateTo(3)
+
+		if c.rowCount != 3 {
+			t.Fatalf("rowCount = %d, want 3", c.rowCount)
+		}
+		// Bits 0,1,2 → true,false,true → 0b00000101 = 0x05
+		if len(c.boolData) != 1 || c.boolData[0] != 0x05 {
+			t.Fatalf("boolData = %x, want [05]", c.boolData)
+		}
+	})
+
+	t.Run("String", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeString, false)
+		c.addString("hello")
+		c.addString("world")
+		c.addString("foo")
+
+		c.truncateTo(2)
+
+		if c.rowCount != 2 {
+			t.Fatalf("rowCount = %d, want 2", c.rowCount)
+		}
+		if string(c.strData) != "helloworld" {
+			t.Fatalf("strData = %q, want %q", c.strData, "helloworld")
+		}
+		expectedOff := []uint32{0, 5, 10}
+		if len(c.strOffsets) != len(expectedOff) {
+			t.Fatalf("strOffsets len = %d, want %d", len(c.strOffsets), len(expectedOff))
+		}
+		for i, off := range expectedOff {
+			if c.strOffsets[i] != off {
+				t.Fatalf("strOffsets[%d] = %d, want %d", i, c.strOffsets[i], off)
+			}
+		}
+	})
+
+	t.Run("Symbol", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeSymbol, false)
+		c.addSymbolID(0)
+		c.addSymbolID(1)
+		c.addSymbolID(2)
+
+		c.truncateTo(1)
+
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+		if len(c.symbolIDs) != 1 || c.symbolIDs[0] != 0 {
+			t.Fatalf("symbolIDs = %v, want [0]", c.symbolIDs)
+		}
+	})
+
+	t.Run("NullableWithBitmap", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLong, true)
+		c.addLong(100)
+		c.addNull()
+		c.addLong(200)
+		c.addNull()
+
+		c.truncateTo(2)
+
+		if c.rowCount != 2 {
+			t.Fatalf("rowCount = %d, want 2", c.rowCount)
+		}
+		if c.nullCount != 1 {
+			t.Fatalf("nullCount = %d, want 1", c.nullCount)
+		}
+		// Bitmap: only row 1 null → bit 1 set → 0x02
+		if !bytes.Equal(c.nullBitmap, []byte{0x02}) {
+			t.Fatalf("nullBitmap = %x, want [02]", c.nullBitmap)
+		}
+	})
+
+	t.Run("NoOp", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLong, false)
+		c.addLong(42)
+
+		c.truncateTo(5) // n >= rowCount, should be no-op
+
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+	})
+}
+
+// --- qwpTableBuffer tests ---
+
+func TestQwpTableBufferBasic(t *testing.T) {
+	tb := newQwpTableBuffer("test_table")
+	if tb.tableName != "test_table" {
+		t.Fatalf("tableName = %q, want %q", tb.tableName, "test_table")
+	}
+	if tb.rowCount != 0 {
+		t.Fatalf("rowCount = %d, want 0", tb.rowCount)
+	}
+	if len(tb.columns) != 0 {
+		t.Fatalf("columns len = %d, want 0", len(tb.columns))
+	}
+}
+
+func TestQwpTableBufferGetOrCreateColumn(t *testing.T) {
+	t.Run("CreateNew", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		col, err := tb.getOrCreateColumn("price", qwpTypeDouble, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if col.name != "price" {
+			t.Fatalf("name = %q, want %q", col.name, "price")
+		}
+		if col.typeCode != qwpTypeDouble {
+			t.Fatalf("typeCode = %d, want %d", col.typeCode, qwpTypeDouble)
+		}
+		if len(tb.columns) != 1 {
+			t.Fatalf("columns len = %d, want 1", len(tb.columns))
+		}
+	})
+
+	t.Run("GetExisting", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		col1, _ := tb.getOrCreateColumn("price", qwpTypeDouble, false)
+		col1.addDouble(1.5)
+		tb.commitRow()
+
+		col2, err := tb.getOrCreateColumn("price", qwpTypeDouble, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if col2 != col1 {
+			t.Fatal("should return same column pointer")
+		}
+		if len(tb.columns) != 1 {
+			t.Fatal("should not create duplicate column")
+		}
+	})
+
+	t.Run("TypeConflict", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		_, err := tb.getOrCreateColumn("price", qwpTypeDouble, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = tb.getOrCreateColumn("price", qwpTypeLong, false)
+		if err == nil {
+			t.Fatal("expected type conflict error")
+		}
+	})
+
+	t.Run("DuplicateColumnInRow", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		col, _ := tb.getOrCreateColumn("price", qwpTypeDouble, false)
+		col.addDouble(1.5)
+
+		_, err := tb.getOrCreateColumn("price", qwpTypeDouble, false)
+		if err == nil {
+			t.Fatal("expected duplicate column error")
+		}
+	})
+
+	t.Run("BackfillOnCreate", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		// Commit 2 rows with only "a".
+		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(10)
+		tb.commitRow()
+
+		col, _ = tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(20)
+		tb.commitRow()
+
+		// Now create column "b" — should be backfilled with 2 nulls.
+		colB, _ := tb.getOrCreateColumn("b", qwpTypeLong, true)
+		if colB.rowCount != 2 {
+			t.Fatalf("new column rowCount = %d, want 2 (backfilled)", colB.rowCount)
+		}
+		if colB.nullCount != 2 {
+			t.Fatalf("new column nullCount = %d, want 2", colB.nullCount)
+		}
+	})
+}
+
+func TestQwpTableBufferCommitRow(t *testing.T) {
+	t.Run("GapFilling", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		// Row 0: set both columns.
+		colA, _ := tb.getOrCreateColumn("a", qwpTypeLong, true)
+		colA.addLong(100)
+		colB, _ := tb.getOrCreateColumn("b", qwpTypeDouble, true)
+		colB.addDouble(1.5)
+		tb.commitRow()
+
+		// Row 1: set only column "a" — column "b" should be gap-filled.
+		colA, _ = tb.getOrCreateColumn("a", qwpTypeLong, true)
+		colA.addLong(200)
+		tb.commitRow()
+
+		if tb.rowCount != 2 {
+			t.Fatalf("rowCount = %d, want 2", tb.rowCount)
+		}
+		if colB.rowCount != 2 {
+			t.Fatalf("colB rowCount = %d, want 2", colB.rowCount)
+		}
+		if colB.nullCount != 1 {
+			t.Fatalf("colB nullCount = %d, want 1", colB.nullCount)
+		}
+	})
+
+	t.Run("MultipleGaps", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		// Create 3 columns. Set different subsets each row.
+		colA, _ := tb.getOrCreateColumn("a", qwpTypeLong, true)
+		colA.addLong(1)
+		colB, _ := tb.getOrCreateColumn("b", qwpTypeLong, true)
+		colB.addLong(2)
+		colC, _ := tb.getOrCreateColumn("c", qwpTypeLong, true)
+		colC.addLong(3)
+		tb.commitRow()
+
+		// Row 1: only set "b".
+		colB, _ = tb.getOrCreateColumn("b", qwpTypeLong, true)
+		colB.addLong(20)
+		tb.commitRow()
+
+		// "a" and "c" should have null at row 1.
+		if colA.nullCount != 1 {
+			t.Fatalf("colA nullCount = %d, want 1", colA.nullCount)
+		}
+		if colC.nullCount != 1 {
+			t.Fatalf("colC nullCount = %d, want 1", colC.nullCount)
+		}
+		if colB.nullCount != 0 {
+			t.Fatalf("colB nullCount = %d, want 0", colB.nullCount)
+		}
+	})
+}
+
+func TestQwpTableBufferCancelRow(t *testing.T) {
+	t.Run("RollbackValues", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		// Commit row 0.
+		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(100)
+		tb.commitRow()
+
+		// Start row 1, then cancel.
+		col, _ = tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(200)
+		tb.cancelRow()
+
+		if tb.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", tb.rowCount)
+		}
+		if col.rowCount != 1 {
+			t.Fatalf("col rowCount = %d, want 1", col.rowCount)
+		}
+		// Verify the column only has the first value.
+		v := int64(binary.LittleEndian.Uint64(col.fixedData[0:8]))
+		if v != 100 {
+			t.Fatalf("row 0 = %d, want 100", v)
+		}
+	})
+
+	t.Run("RemoveNewColumns", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		// Commit row 0 with column "a".
+		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(100)
+		tb.commitRow()
+
+		// Start row 1, add column "b" (new), then cancel.
+		col, _ = tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(200)
+		_, _ = tb.getOrCreateColumn("b", qwpTypeDouble, false)
+		tb.cancelRow()
+
+		// Column "b" should be removed.
+		if len(tb.columns) != 1 {
+			t.Fatalf("columns len = %d, want 1", len(tb.columns))
+		}
+		if _, exists := tb.columnIndex["b"]; exists {
+			t.Fatal("column 'b' should not exist after cancel")
+		}
+	})
+
+	t.Run("CancelWithStringColumn", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		col, _ := tb.getOrCreateColumn("msg", qwpTypeString, false)
+		col.addString("hello")
+		tb.commitRow()
+
+		col, _ = tb.getOrCreateColumn("msg", qwpTypeString, false)
+		col.addString("world")
+		tb.cancelRow()
+
+		if col.rowCount != 1 {
+			t.Fatalf("col rowCount = %d, want 1", col.rowCount)
+		}
+		if string(col.strData) != "hello" {
+			t.Fatalf("strData = %q, want %q", col.strData, "hello")
+		}
+	})
+
+	t.Run("CancelBoolColumn", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		col, _ := tb.getOrCreateColumn("flag", qwpTypeBoolean, false)
+		col.addBool(true)
+		tb.commitRow()
+
+		col, _ = tb.getOrCreateColumn("flag", qwpTypeBoolean, false)
+		col.addBool(false)
+		tb.cancelRow()
+
+		if col.rowCount != 1 {
+			t.Fatalf("col rowCount = %d, want 1", col.rowCount)
+		}
+		// Only bit 0 (true) should remain.
+		if col.boolData[0] != 0x01 {
+			t.Fatalf("boolData = %x, want [01]", col.boolData)
+		}
+	})
+
+	t.Run("CancelWithNoCommittedRows", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(42)
+		tb.cancelRow()
+
+		// Everything should be rolled back.
+		if tb.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0", tb.rowCount)
+		}
+		// Column "a" was created during this row, so it should be removed.
+		if len(tb.columns) != 0 {
+			t.Fatalf("columns len = %d, want 0", len(tb.columns))
+		}
+	})
+}
+
+func TestQwpTableBufferReset(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+
+	col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+	col.addLong(100)
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("a", qwpTypeLong, false)
+	col.addLong(200)
+	tb.commitRow()
+
+	tb.reset()
+
+	if tb.rowCount != 0 {
+		t.Fatalf("rowCount = %d, want 0", tb.rowCount)
+	}
+	// Columns still exist but with no data.
+	if len(tb.columns) != 1 {
+		t.Fatalf("columns len = %d, want 1", len(tb.columns))
+	}
+	if tb.columns[0].rowCount != 0 {
+		t.Fatalf("col rowCount = %d, want 0", tb.columns[0].rowCount)
+	}
+}
+
+func TestQwpTableBufferSchemaHash(t *testing.T) {
+	t.Run("Deterministic", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		col, _ := tb.getOrCreateColumn("price", qwpTypeDouble, false)
+		col.addDouble(1.5)
+		tb.commitRow()
+
+		h1 := tb.getSchemaHash()
+		h2 := tb.getSchemaHash()
+		if h1 != h2 {
+			t.Fatalf("schema hash not deterministic: %d vs %d", h1, h2)
+		}
+	})
+
+	t.Run("ChangeOnNewColumn", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+
+		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(1)
+		tb.commitRow()
+		h1 := tb.getSchemaHash()
+
+		colB, _ := tb.getOrCreateColumn("b", qwpTypeDouble, false)
+		colB.addDouble(2.0)
+		col, _ = tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(2)
+		tb.commitRow()
+		h2 := tb.getSchemaHash()
+
+		if h1 == h2 {
+			t.Fatal("schema hash should change when a new column is added")
+		}
+	})
+
+	t.Run("NullableAffectsHash", func(t *testing.T) {
+		tb1 := newQwpTableBuffer("t")
+		col, _ := tb1.getOrCreateColumn("x", qwpTypeLong, false)
+		col.addLong(1)
+		tb1.commitRow()
+
+		tb2 := newQwpTableBuffer("t")
+		col, _ = tb2.getOrCreateColumn("x", qwpTypeLong, true)
+		col.addLong(1)
+		tb2.commitRow()
+
+		if tb1.getSchemaHash() == tb2.getSchemaHash() {
+			t.Fatal("nullable flag should affect schema hash")
+		}
+	})
+
+	t.Run("XXHash64EmptyInput", func(t *testing.T) {
+		// Verify xxhash64 matches canonical test vector.
+		h := xxhash64([]byte{}, 0)
+		if h != 0xEF46DB3751D8E999 {
+			t.Fatalf("xxhash64(empty, 0) = %016X, want EF46DB3751D8E999", h)
+		}
+	})
+
+	t.Run("KnownValue", func(t *testing.T) {
+		// Schema: col "ts" (TIMESTAMP, non-nullable)
+		// Input bytes: "ts" + 0x0A = [0x74, 0x73, 0x0A]
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("ts", qwpTypeTimestamp, false)
+		col.addTimestamp(0)
+		tb.commitRow()
+
+		h := tb.getSchemaHash()
+		expected := int64(xxhash64([]byte{0x74, 0x73, 0x0A}, 0))
+		if h != expected {
+			t.Fatalf("schema hash = %d, want %d", h, expected)
+		}
+	})
+}
