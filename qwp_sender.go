@@ -95,6 +95,10 @@ type qwpLineSender struct {
 	// encoder is the reusable QWP message encoder.
 	encoder qwpEncoder
 
+	// encodeInfoBuf is a reusable scratch slice for buildTableEncodeInfo,
+	// avoiding allocation on every flush.
+	encodeInfoBuf []qwpTableEncodeInfo
+
 	// globalSymbols maps symbol strings to global IDs.
 	globalSymbols map[string]int32
 	// globalSymbolList maps IDs to symbol strings (for delta dict).
@@ -721,7 +725,7 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 			// Schema error callback: force full schema for all tables.
 			for i := range tables {
 				delete(s.sentSchemaHashes, qwpSchemaKey(
-					tables[i].tb.tableName, tables[i].schemaHash))
+					tables[i].tb.tableNameHash, tables[i].schemaHash))
 				tables[i].schemaMode = qwpSchemaModeFull
 			}
 		},
@@ -733,7 +737,7 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 
 	// Mark all schemas and symbols as sent on success.
 	for _, t := range tables {
-		skey := qwpSchemaKey(t.tb.tableName, t.schemaHash)
+		skey := qwpSchemaKey(t.tb.tableNameHash, t.schemaHash)
 		s.sentSchemaHashes[skey] = struct{}{}
 	}
 	if s.batchMaxSymbolId > s.maxSentSymbolId {
@@ -744,26 +748,27 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 }
 
 // buildTableEncodeInfo collects non-empty tables with their schema
-// mode and hash for encoding.
+// mode and hash for encoding. Reuses s.encodeInfoBuf to avoid
+// allocating a new slice on every flush.
 func (s *qwpLineSender) buildTableEncodeInfo() []qwpTableEncodeInfo {
-	var tables []qwpTableEncodeInfo
+	s.encodeInfoBuf = s.encodeInfoBuf[:0]
 	for _, tb := range s.tableBuffers {
 		if tb.rowCount == 0 {
 			continue
 		}
 		schemaHash := tb.getSchemaHash()
-		skey := qwpSchemaKey(tb.tableName, schemaHash)
+		skey := qwpSchemaKey(tb.tableNameHash, schemaHash)
 		mode := qwpSchemaModeFull
 		if _, ok := s.sentSchemaHashes[skey]; ok {
 			mode = qwpSchemaModeReference
 		}
-		tables = append(tables, qwpTableEncodeInfo{
+		s.encodeInfoBuf = append(s.encodeInfoBuf, qwpTableEncodeInfo{
 			tb:         tb,
 			schemaMode: mode,
 			schemaHash: schemaHash,
 		})
 	}
-	return tables
+	return s.encodeInfoBuf
 }
 
 // flushAsync encodes all tables into a single multi-table message,
@@ -808,7 +813,7 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	pendingMaxSymbolId := s.batchMaxSymbolId
 	var pendingSchemaKeys []int64
 	for _, t := range tables {
-		skey := qwpSchemaKey(t.tb.tableName, t.schemaHash)
+		skey := qwpSchemaKey(t.tb.tableNameHash, t.schemaHash)
 		if _, ok := s.sentSchemaHashes[skey]; !ok {
 			pendingSchemaKeys = append(pendingSchemaKeys, skey)
 		}
@@ -880,7 +885,7 @@ func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 	// Optimistic cache: if the batch fails, ioErr prevents
 	// further operations so stale cache entries are harmless.
 	for _, t := range tables {
-		skey := qwpSchemaKey(t.tb.tableName, t.schemaHash)
+		skey := qwpSchemaKey(t.tb.tableNameHash, t.schemaHash)
 		s.sentSchemaHashes[skey] = struct{}{}
 	}
 

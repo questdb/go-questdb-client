@@ -1376,14 +1376,16 @@ func TestQwpSchemaKeyDistinguishesTables(t *testing.T) {
 
 	// Unit test for qwpSchemaKey: same schema hash, different tables.
 	schemaHash := int64(0x1234567890ABCDEF)
-	keyA := qwpSchemaKey("tableA", schemaHash)
-	keyB := qwpSchemaKey("tableB", schemaHash)
+	hashA := xxhash64([]byte("tableA"), 0)
+	hashB := xxhash64([]byte("tableB"), 0)
+	keyA := qwpSchemaKey(hashA, schemaHash)
+	keyB := qwpSchemaKey(hashB, schemaHash)
 	if keyA == keyB {
 		t.Fatalf("schema keys should differ for different table names, both = %d", keyA)
 	}
 
 	// Same table + same schema hash must produce the same key.
-	keyA2 := qwpSchemaKey("tableA", schemaHash)
+	keyA2 := qwpSchemaKey(hashA, schemaHash)
 	if keyA != keyA2 {
 		t.Fatalf("same table+schema should produce same key: %d != %d", keyA, keyA2)
 	}

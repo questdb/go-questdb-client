@@ -647,13 +647,22 @@ type qwpTableBuffer struct {
 	// call to getSchemaHash() and invalidated when columns change.
 	schemaHash      int64
 	schemaHashValid bool
+
+	// hashBuf is a reusable scratch buffer for schema hash computation,
+	// avoiding allocation on every getSchemaHash() call after reset().
+	hashBuf []byte
+
+	// tableNameHash caches the XXHash64 of the table name for use in
+	// qwpSchemaKey, avoiding a string→[]byte conversion per flush.
+	tableNameHash uint64
 }
 
 // newQwpTableBuffer creates a table buffer for the given table name.
 func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 	return &qwpTableBuffer{
-		tableName:   tableName,
-		columnIndex: make(map[string]int),
+		tableName:     tableName,
+		columnIndex:   make(map[string]int),
+		tableNameHash: xxhash64([]byte(tableName), 0),
 	}
 }
 
@@ -791,7 +800,13 @@ func (tb *qwpTableBuffer) approxDataSize() int {
 // the column set changes.
 func (tb *qwpTableBuffer) getSchemaHash() int64 {
 	if !tb.schemaHashValid {
-		tb.schemaHash = qwpComputeSchemaHash(tb.columns)
+		// Reuse hashBuf to avoid allocation.
+		tb.hashBuf = tb.hashBuf[:0]
+		for _, col := range tb.columns {
+			tb.hashBuf = append(tb.hashBuf, col.name...)
+			tb.hashBuf = append(tb.hashBuf, col.wireTypeCode())
+		}
+		tb.schemaHash = int64(xxhash64(tb.hashBuf, 0))
 		tb.schemaHashValid = true
 	}
 	return tb.schemaHash

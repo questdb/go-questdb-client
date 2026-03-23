@@ -39,28 +39,17 @@ const (
 )
 
 // qwpSchemaKey computes a cache key that combines the schema hash
-// with a hash of the table name. The server associates schema hashes
-// per table, so two tables with identical columns need distinct cache
-// keys. This mirrors the Java client's approach:
+// with a precomputed hash of the table name. The server associates
+// schema hashes per table, so two tables with identical columns need
+// distinct cache keys. This mirrors the Java client's approach:
 //
 //	schemaKey = schemaHash ^ (int64(hashString(tableName)) << 32)
-func qwpSchemaKey(tableName string, schemaHash int64) int64 {
-	nameHash := int64(uint32(xxhash64([]byte(tableName), 0)))
+//
+// tableNameHash must be xxhash64([]byte(tableName), 0), cached in
+// qwpTableBuffer.tableNameHash to avoid allocation.
+func qwpSchemaKey(tableNameHash uint64, schemaHash int64) int64 {
+	nameHash := int64(uint32(tableNameHash))
 	return schemaHash ^ (nameHash << 32)
-}
-
-// qwpComputeSchemaHash computes the XXHash64 schema hash over the
-// column definitions. The input is the concatenation of each
-// column's UTF-8 name bytes followed by its wire type code byte.
-// This matches the Java QwpSchemaHash implementation.
-func qwpComputeSchemaHash(columns []*qwpColumnBuffer) int64 {
-	// Build the input byte sequence: for each column, name + wireTypeCode.
-	var buf []byte
-	for _, col := range columns {
-		buf = append(buf, col.name...)
-		buf = append(buf, col.wireTypeCode())
-	}
-	return int64(xxhash64(buf, 0))
 }
 
 // xxhash64 computes the XXHash64 digest of data with the given seed.
