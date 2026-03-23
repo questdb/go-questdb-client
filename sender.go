@@ -762,9 +762,6 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.minThroughput != 0 {
 		return errors.New("minThroughput setting is not available in the QWP client")
 	}
-	if conf.maxBufSize != 0 {
-		return errors.New("maxBufferSize setting is not available in the QWP client")
-	}
 	// QWP auth: either Basic (user+pass) or Bearer (token), not both.
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
 		return errors.New("both basic and token authentication cannot be used")
@@ -817,8 +814,13 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		window = 1
 	}
 
-	return newQwpLineSender(ctx, address, opts, conf.retryTimeout,
+	s, err := newQwpLineSender(ctx, address, opts, conf.retryTimeout,
 		conf.autoFlushRows, conf.autoFlushInterval, window)
+	if err != nil {
+		return nil, err
+	}
+	s.maxBufSize = conf.maxBufSize
+	return s, nil
 }
 
 func validateConf(conf *lineSenderConfig) error {

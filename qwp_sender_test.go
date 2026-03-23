@@ -1918,3 +1918,83 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		}
 	})
 }
+
+func TestQwpMaxBufSizeTriggersFlush(t *testing.T) {
+	// Verify that when maxBufSize is set and the accumulated buffer
+	// size exceeds it, At() triggers an auto-flush.
+
+	var messageCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			messageCount++
+			ack := make([]byte, 9)
+			ack[0] = qwpWireStatusOK
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+
+	// Set a small max buffer size (200 bytes). Each LONG column is 8 bytes,
+	// plus null bitmap flag, plus schema overhead per row. With ~25 rows
+	// of one LONG column, we should exceed 200 bytes and trigger a flush.
+	s.maxBufSize = 200
+
+	// Insert rows without explicit flush. Auto-flush by maxBufSize should
+	// trigger before we run out of rows.
+	for i := 0; i < 50; i++ {
+		err := s.Table("t").Int64Column("x", int64(i)).AtNow(context.Background())
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+	}
+
+	// Explicit flush for remaining rows.
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// We should have received at least 2 messages: one from the
+	// maxBufSize-triggered flush and one from the explicit Flush.
+	if messageCount < 2 {
+		t.Fatalf("expected at least 2 messages (maxBufSize flush + final), got %d", messageCount)
+	}
+}
+
+func TestQwpMaxBufSizeFromConfig(t *testing.T) {
+	// Verify that maxBufSize is accepted from config strings.
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	confStr := fmt.Sprintf("ws::addr=%s;max_buf_size=1024;", addr)
+	s, err := LineSenderFromConf(context.Background(), confStr)
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer s.Close(context.Background())
+
+	// Verify the sender was created successfully with maxBufSize.
+	// Insert some data to verify it works.
+	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}

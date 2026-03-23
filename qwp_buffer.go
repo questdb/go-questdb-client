@@ -769,6 +769,23 @@ func (tb *qwpTableBuffer) reset() {
 	tb.schemaHashValid = false
 }
 
+// approxDataSize returns the approximate number of bytes of column
+// data currently stored in this table buffer. This is used for
+// maxBufSize enforcement to prevent unbounded memory growth.
+func (tb *qwpTableBuffer) approxDataSize() int {
+	size := 0
+	for _, col := range tb.columns {
+		size += len(col.fixedData)
+		size += len(col.strData)
+		size += len(col.boolData)
+		size += len(col.arrayData)
+		size += len(col.symbolIDs) * 4 // int32 each
+		size += len(col.strOffsets) * 4 // uint32 each
+		size += len(col.nullBitmap)
+	}
+	return size
+}
+
 // getSchemaHash returns a hash over the column definitions (names
 // and wire type codes). The hash is lazily computed and cached until
 // the column set changes.

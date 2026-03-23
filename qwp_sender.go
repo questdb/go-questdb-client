@@ -119,6 +119,9 @@ type qwpLineSender struct {
 	flushDeadline     time.Time
 	pendingRowCount   int
 
+	// Buffer size limit. 0 means no limit.
+	maxBufSize int
+
 	// Connection and retry config.
 	retryTimeout time.Duration
 
@@ -624,6 +627,21 @@ func (s *qwpLineSender) At(ctx context.Context, ts time.Time) error {
 	s.hasTable = false
 	s.currentTable = nil
 	s.pendingRowCount++
+
+	// Check maxBufSize: if the total buffer size exceeds the limit,
+	// trigger a flush to prevent unbounded memory growth.
+	if s.maxBufSize > 0 {
+		total := 0
+		for _, tb := range s.tableBuffers {
+			total += tb.approxDataSize()
+		}
+		if total > s.maxBufSize {
+			if s.asyncState != nil {
+				return s.enqueueFlush(ctx)
+			}
+			return s.Flush(ctx)
+		}
+	}
 
 	// Check auto-flush thresholds.
 	if s.autoFlushRows > 0 && s.pendingRowCount >= s.autoFlushRows {
