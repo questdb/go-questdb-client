@@ -1426,17 +1426,20 @@ func TestQwpSenderSchemaKeyPerTable(t *testing.T) {
 	s.Table("beta").Int64Column("x", 2).AtNow(context.Background())
 	s.Flush(context.Background())
 
-	// Should have sent 2 messages (one per table in sync mode).
-	if len(messages) != 2 {
-		t.Fatalf("messages = %d, want 2", len(messages))
+	// With multi-table batching, both tables are in 1 message.
+	if len(messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(messages))
 	}
 
-	// Both messages must use full schema mode (0x00), not reference (0x01).
-	for i, msg := range messages {
-		schemaMode := extractSchemaMode(t, msg)
-		if schemaMode != byte(qwpSchemaModeFull) {
-			t.Fatalf("message %d: schemaMode = 0x%02X, want 0x%02X (full)",
-				i, schemaMode, qwpSchemaModeFull)
+	// Both tables in the message must use full schema mode.
+	modes := extractAllSchemaModes(t, messages[0])
+	if len(modes) != 2 {
+		t.Fatalf("tables in message = %d, want 2", len(modes))
+	}
+	for i, mode := range modes {
+		if mode != byte(qwpSchemaModeFull) {
+			t.Fatalf("table %d: schemaMode = 0x%02X, want 0x%02X (full)",
+				i, mode, qwpSchemaModeFull)
 		}
 	}
 
@@ -1451,14 +1454,14 @@ func TestQwpSenderSchemaKeyPerTable(t *testing.T) {
 	s.Table("beta").Int64Column("x", 4).AtNow(context.Background())
 	s.Flush(context.Background())
 
-	if len(messages) != 2 {
-		t.Fatalf("messages = %d, want 2", len(messages))
+	if len(messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(messages))
 	}
-	for i, msg := range messages {
-		schemaMode := extractSchemaMode(t, msg)
-		if schemaMode != byte(qwpSchemaModeReference) {
-			t.Fatalf("message %d (2nd flush): schemaMode = 0x%02X, want 0x%02X (ref)",
-				i, schemaMode, qwpSchemaModeReference)
+	modes = extractAllSchemaModes(t, messages[0])
+	for i, mode := range modes {
+		if mode != byte(qwpSchemaModeReference) {
+			t.Fatalf("table %d (2nd flush): schemaMode = 0x%02X, want 0x%02X (ref)",
+				i, mode, qwpSchemaModeReference)
 		}
 	}
 }
@@ -1524,6 +1527,79 @@ func extractSchemaMode(t *testing.T, msg []byte) byte {
 
 	// Schema mode byte.
 	return msg[off]
+}
+
+// extractAllSchemaModes parses a multi-table QWP message and returns
+// the schema mode byte for each table block. It skips the header,
+// delta dict, and then for each table: extracts the schema mode and
+// skips the rest of the table block.
+func extractAllSchemaModes(t *testing.T, msg []byte) []byte {
+	t.Helper()
+	if len(msg) < qwpHeaderSize {
+		t.Fatalf("message too short: %d", len(msg))
+	}
+
+	tableCount := binary.LittleEndian.Uint16(msg[6:8])
+	off := qwpHeaderSize
+	flags := msg[qwpHeaderOffsetFlags]
+
+	// Skip delta dict if present.
+	if flags&qwpFlagDeltaSymbolDict != 0 {
+		_, n, _ := qwpReadVarint(msg[off:])
+		off += n
+		deltaCount, n, _ := qwpReadVarint(msg[off:])
+		off += n
+		for i := uint64(0); i < deltaCount; i++ {
+			slen, n, _ := qwpReadVarint(msg[off:])
+			off += n + int(slen)
+		}
+	}
+
+	var modes []byte
+	for ti := uint16(0); ti < tableCount; ti++ {
+		// Skip table name.
+		nameLen, n, _ := qwpReadVarint(msg[off:])
+		off += n + int(nameLen)
+		// Skip rowCount.
+		_, n, _ = qwpReadVarint(msg[off:])
+		off += n
+		// Read colCount (needed to skip column data).
+		colCount, n, _ := qwpReadVarint(msg[off:])
+		off += n
+		// Schema mode byte.
+		schemaMode := msg[off]
+		modes = append(modes, schemaMode)
+		off++
+
+		if schemaMode == byte(qwpSchemaModeFull) {
+			// Skip full schema: colCount × (name string + type byte)
+			for c := uint64(0); c < colCount; c++ {
+				slen, n, _ := qwpReadVarint(msg[off:])
+				off += n + int(slen) + 1 // name + type byte
+			}
+		} else {
+			// Schema reference: 8-byte hash.
+			off += 8
+		}
+
+		// Skip column data. For simplicity, we consume the rest
+		// up to the next table or end of message. Since we only
+		// need schema modes, skip to the end if last table.
+		// This is a test helper, so we just return what we have.
+		// For a precise skip, we'd need full column type parsing.
+		if ti < tableCount-1 {
+			// We need to skip column data to find the next table.
+			// For test purposes with simple 1-column tables:
+			// null flag (1) + column data (varies by type).
+			// This helper assumes the tests use simple types.
+			// Skip remaining bytes until we find the next table name.
+			// A more robust approach: skip per-column based on type.
+			// For now, skip based on known test data: 1 LONG column.
+			off += 1 + 8 // null flag + 8-byte fixed value
+		}
+	}
+
+	return modes
 }
 
 func TestQwpAsyncNoCacheOnFlushFailure(t *testing.T) {

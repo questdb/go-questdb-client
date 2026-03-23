@@ -1448,3 +1448,139 @@ func TestQwpEncoderTimestampNoEncodingPrefix(t *testing.T) {
 		t.Fatalf("did not consume all bytes: off=%d, len=%d", off, len(msg))
 	}
 }
+
+func TestQwpEncoderMultiTable(t *testing.T) {
+	// Encode 3 tables into a single QWP message and verify the
+	// header has tableCount=3 and all table data is present.
+
+	tb1 := newQwpTableBuffer("alpha")
+	col, _ := tb1.getOrCreateColumn("x", qwpTypeLong, false)
+	col.addLong(10)
+	tb1.commitRow()
+
+	tb2 := newQwpTableBuffer("beta")
+	col, _ = tb2.getOrCreateColumn("y", qwpTypeDouble, false)
+	col.addDouble(3.14)
+	tb2.commitRow()
+
+	tb3 := newQwpTableBuffer("gamma")
+	col, _ = tb3.getOrCreateColumn("z", qwpTypeString, false)
+	col.addString("hello")
+	tb3.commitRow()
+
+	tables := []qwpTableEncodeInfo{
+		{tb: tb1, schemaMode: qwpSchemaModeFull, schemaHash: 0},
+		{tb: tb2, schemaMode: qwpSchemaModeFull, schemaHash: 0},
+		{tb: tb3, schemaMode: qwpSchemaModeReference, schemaHash: 0x1234},
+	}
+
+	globalDict := []string{"sym0"}
+	var enc qwpEncoder
+	msg := enc.encodeMultiTableWithDeltaDict(tables, globalDict, -1, 0)
+
+	// Verify header.
+	if len(msg) < qwpHeaderSize {
+		t.Fatalf("message too short: %d", len(msg))
+	}
+
+	magic := binary.LittleEndian.Uint32(msg[0:4])
+	if magic != qwpMagic {
+		t.Fatalf("magic = 0x%08X, want 0x%08X", magic, qwpMagic)
+	}
+	if msg[4] != qwpVersion {
+		t.Fatalf("version = %d, want %d", msg[4], qwpVersion)
+	}
+	if msg[5] != qwpFlagDeltaSymbolDict {
+		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], qwpFlagDeltaSymbolDict)
+	}
+
+	// TableCount = 3
+	tableCount := binary.LittleEndian.Uint16(msg[6:8])
+	if tableCount != 3 {
+		t.Fatalf("tableCount = %d, want 3", tableCount)
+	}
+
+	// PayloadLength matches
+	payloadLen := binary.LittleEndian.Uint32(msg[8:12])
+	if int(payloadLen) != len(msg)-qwpHeaderSize {
+		t.Fatalf("payloadLength = %d, want %d", payloadLen, len(msg)-qwpHeaderSize)
+	}
+
+	// Parse past the delta dict.
+	off := qwpHeaderSize
+	_, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	deltaCount, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	for i := uint64(0); i < deltaCount; i++ {
+		slen, n, _ := qwpReadVarint(msg[off:])
+		off += n + int(slen)
+	}
+
+	// Parse table 1: "alpha" with LONG column
+	nameLen, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if string(msg[off:off+int(nameLen)]) != "alpha" {
+		t.Fatalf("table 1 name = %q, want %q", string(msg[off:off+int(nameLen)]), "alpha")
+	}
+	off += int(nameLen)
+	rowCount, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if rowCount != 1 {
+		t.Fatalf("table 1 rowCount = %d, want 1", rowCount)
+	}
+	colCount, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if colCount != 1 {
+		t.Fatalf("table 1 colCount = %d, want 1", colCount)
+	}
+	if msg[off] != byte(qwpSchemaModeFull) {
+		t.Fatalf("table 1 schemaMode = 0x%02X, want FULL", msg[off])
+	}
+	off++
+	// Skip full schema: col "x" (varint(1) + 'x' + 0x05)
+	slen, n, _ := qwpReadVarint(msg[off:])
+	off += n + int(slen) + 1
+	// Column data: null flag (1) + int64 LE (8)
+	off += 1 + 8
+
+	// Parse table 2: "beta" with DOUBLE column
+	nameLen, n, _ = qwpReadVarint(msg[off:])
+	off += n
+	if string(msg[off:off+int(nameLen)]) != "beta" {
+		t.Fatalf("table 2 name = %q, want %q", string(msg[off:off+int(nameLen)]), "beta")
+	}
+	off += int(nameLen)
+	off++ // rowCount=1
+	off++ // colCount=1
+	if msg[off] != byte(qwpSchemaModeFull) {
+		t.Fatalf("table 2 schemaMode = 0x%02X, want FULL", msg[off])
+	}
+	off++
+	slen, n, _ = qwpReadVarint(msg[off:])
+	off += n + int(slen) + 1 // col "y" + type
+	off += 1 + 8             // null flag + double
+
+	// Parse table 3: "gamma" with STRING column, REFERENCE schema
+	nameLen, n, _ = qwpReadVarint(msg[off:])
+	off += n
+	if string(msg[off:off+int(nameLen)]) != "gamma" {
+		t.Fatalf("table 3 name = %q, want %q", string(msg[off:off+int(nameLen)]), "gamma")
+	}
+	off += int(nameLen)
+	off++ // rowCount=1
+	off++ // colCount=1
+	if msg[off] != byte(qwpSchemaModeReference) {
+		t.Fatalf("table 3 schemaMode = 0x%02X, want REFERENCE", msg[off])
+	}
+	off++
+	off += 8 // schema hash (int64)
+	off++    // null flag
+	// String column: (rowCount+1) uint32 offsets + data
+	// 2 offsets = 8 bytes + "hello" = 5 bytes
+	off += 8 + 5
+
+	if off != len(msg) {
+		t.Fatalf("did not consume all bytes: off=%d, len=%d", off, len(msg))
+	}
+}

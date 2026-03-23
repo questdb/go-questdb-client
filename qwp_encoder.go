@@ -82,6 +82,41 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 	return e.wb.bytes()
 }
 
+// qwpTableEncodeInfo carries per-table encoding parameters for
+// multi-table message encoding.
+type qwpTableEncodeInfo struct {
+	tb         *qwpTableBuffer
+	schemaMode qwpSchemaMode
+	schemaHash int64
+}
+
+// encodeMultiTableWithDeltaDict encodes multiple table buffers into
+// a single QWP message with a shared delta symbol dictionary. The
+// header's tableCount field is set to len(tables), allowing the
+// server to process all tables from one WebSocket frame. This
+// reduces round-trips compared to one message per table.
+//
+// The message layout is:
+//
+//	Header (12 bytes, tableCount=N) → DeltaDict →
+//	TableBlock₁ → TableBlock₂ → ... → TableBlockₙ →
+//	patched PayloadLength.
+func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
+	tables []qwpTableEncodeInfo,
+	globalDict []string,
+	maxSentId int,
+	batchMaxId int,
+) []byte {
+	e.wb.reset()
+	e.writeHeader(qwpFlagDeltaSymbolDict, uint16(len(tables)))
+	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
+	for i := range tables {
+		e.writeTableBlock(tables[i].tb, tables[i].schemaMode, tables[i].schemaHash)
+	}
+	e.patchPayloadLength()
+	return e.wb.bytes()
+}
+
 // --- header and payload helpers ---
 
 // writeHeader writes the 12-byte QWP message header with the given

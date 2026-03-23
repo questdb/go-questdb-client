@@ -680,17 +680,44 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 	return s.flushSync(ctx)
 }
 
-// flushSync sends each table buffer synchronously with retry.
+// flushSync encodes all non-empty tables into a single multi-table
+// QWP message and sends it with retry. This reduces round-trips
+// compared to sending one message per table.
 func (s *qwpLineSender) flushSync(ctx context.Context) error {
-	for _, tb := range s.tableBuffers {
-		if tb.rowCount == 0 {
-			continue
-		}
-		if err := s.flushTable(ctx, tb); err != nil {
-			return err
-		}
+	// Collect non-empty tables and build encode info.
+	tables := s.buildTableEncodeInfo()
+	if len(tables) == 0 {
+		return nil
 	}
 
+	err := s.transport.sendWithRetry(ctx, s.retryTimeout,
+		func() []byte {
+			return s.encoder.encodeMultiTableWithDeltaDict(
+				tables,
+				s.globalSymbolList,
+				s.maxSentSymbolId,
+				s.batchMaxSymbolId,
+			)
+		},
+		func() {
+			// Schema error callback: force full schema for all tables.
+			for i := range tables {
+				delete(s.sentSchemaHashes, qwpSchemaKey(
+					tables[i].tb.tableName, tables[i].schemaHash))
+				tables[i].schemaMode = qwpSchemaModeFull
+			}
+		},
+	)
+
+	if err != nil {
+		return err
+	}
+
+	// Mark all schemas and symbols as sent on success.
+	for _, t := range tables {
+		skey := qwpSchemaKey(t.tb.tableName, t.schemaHash)
+		s.sentSchemaHashes[skey] = struct{}{}
+	}
 	if s.batchMaxSymbolId > s.maxSentSymbolId {
 		s.maxSentSymbolId = s.batchMaxSymbolId
 	}
@@ -698,74 +725,83 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 	return nil
 }
 
-// flushAsync encodes each table, acquires a slot, and enqueues
-// the batch for the I/O goroutine to send.
+// buildTableEncodeInfo collects non-empty tables with their schema
+// mode and hash for encoding.
+func (s *qwpLineSender) buildTableEncodeInfo() []qwpTableEncodeInfo {
+	var tables []qwpTableEncodeInfo
+	for _, tb := range s.tableBuffers {
+		if tb.rowCount == 0 {
+			continue
+		}
+		schemaHash := tb.getSchemaHash()
+		skey := qwpSchemaKey(tb.tableName, schemaHash)
+		mode := qwpSchemaModeFull
+		if _, ok := s.sentSchemaHashes[skey]; ok {
+			mode = qwpSchemaModeReference
+		}
+		tables = append(tables, qwpTableEncodeInfo{
+			tb:         tb,
+			schemaMode: mode,
+			schemaHash: schemaHash,
+		})
+	}
+	return tables
+}
+
+// flushAsync encodes all tables into a single multi-table message,
+// acquires a slot, enqueues the batch, and waits for the ACK.
 func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	// Check for I/O errors before encoding.
 	if err := s.asyncState.checkError(); err != nil {
 		return err
 	}
 
-	// Collect schema keys to commit only after all batches are ACKed.
-	// If any batch fails, we must not cache schemas or symbol IDs —
-	// the server never received them.
+	tables := s.buildTableEncodeInfo()
+	if len(tables) == 0 {
+		return nil
+	}
+
+	// Encode all tables into a single multi-table message.
+	encoded := s.encoder.encodeMultiTableWithDeltaDict(
+		tables,
+		s.globalSymbolList,
+		s.maxSentSymbolId,
+		s.batchMaxSymbolId,
+	)
+
+	// Copy the encoded data since the encoder reuses its buffer.
+	batch := make([]byte, len(encoded))
+	copy(batch, encoded)
+
+	// Acquire a slot in the in-flight window.
+	if err := s.asyncState.acquireSlot(); err != nil {
+		return err
+	}
+
+	// Enqueue the batch for the I/O goroutine.
+	select {
+	case s.asyncState.sendCh <- batch:
+	case <-ctx.Done():
+		s.asyncState.releaseSlot()
+		return ctx.Err()
+	}
+
+	// Capture pending state before waiting.
+	pendingMaxSymbolId := s.batchMaxSymbolId
 	var pendingSchemaKeys []int64
-
-	for _, tb := range s.tableBuffers {
-		if tb.rowCount == 0 {
-			continue
-		}
-
-		// Encode the table into a batch payload.
-		schemaHash := tb.getSchemaHash()
-		skey := qwpSchemaKey(tb.tableName, schemaHash)
-		_, schemaKnown := s.sentSchemaHashes[skey]
-
-		mode := qwpSchemaModeFull
-		if schemaKnown {
-			mode = qwpSchemaModeReference
-		}
-		encoded := s.encoder.encodeTableWithDeltaDict(
-			tb,
-			s.globalSymbolList,
-			s.maxSentSymbolId,
-			s.batchMaxSymbolId,
-			mode,
-			schemaHash,
-		)
-
-		// Copy the encoded data since the encoder reuses its buffer.
-		batch := make([]byte, len(encoded))
-		copy(batch, encoded)
-
-		// Acquire a slot in the in-flight window.
-		if err := s.asyncState.acquireSlot(); err != nil {
-			return err
-		}
-
-		// Enqueue the batch for the I/O goroutine.
-		select {
-		case s.asyncState.sendCh <- batch:
-		case <-ctx.Done():
-			s.asyncState.releaseSlot()
-			return ctx.Err()
-		}
-
-		// Track new schema keys for deferred commit.
-		if !schemaKnown {
+	for _, t := range tables {
+		skey := qwpSchemaKey(t.tb.tableName, t.schemaHash)
+		if _, ok := s.sentSchemaHashes[skey]; !ok {
 			pendingSchemaKeys = append(pendingSchemaKeys, skey)
 		}
 	}
 
-	// Capture the batch max symbol ID before waiting.
-	pendingMaxSymbolId := s.batchMaxSymbolId
-
-	// Wait for all in-flight batches to be ACKed before returning.
+	// Wait for the batch to be ACKed before returning.
 	if err := s.asyncState.waitEmpty(); err != nil {
 		return err
 	}
 
-	// All batches ACKed — commit schema and symbol caches.
+	// ACK received — commit schema and symbol caches.
 	for _, skey := range pendingSchemaKeys {
 		s.sentSchemaHashes[skey] = struct{}{}
 	}
@@ -795,47 +831,39 @@ func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 		return err
 	}
 
-	for _, tb := range s.tableBuffers {
-		if tb.rowCount == 0 {
-			continue
-		}
+	tables := s.buildTableEncodeInfo()
+	if len(tables) == 0 {
+		s.resetAfterFlush()
+		return nil
+	}
 
-		schemaHash := tb.getSchemaHash()
-		skey := qwpSchemaKey(tb.tableName, schemaHash)
-		_, schemaKnown := s.sentSchemaHashes[skey]
+	// Encode all tables into a single multi-table message.
+	encoded := s.encoder.encodeMultiTableWithDeltaDict(
+		tables,
+		s.globalSymbolList,
+		s.maxSentSymbolId,
+		s.batchMaxSymbolId,
+	)
 
-		mode := qwpSchemaModeFull
-		if schemaKnown {
-			mode = qwpSchemaModeReference
-		}
-		encoded := s.encoder.encodeTableWithDeltaDict(
-			tb,
-			s.globalSymbolList,
-			s.maxSentSymbolId,
-			s.batchMaxSymbolId,
-			mode,
-			schemaHash,
-		)
+	batch := make([]byte, len(encoded))
+	copy(batch, encoded)
 
-		batch := make([]byte, len(encoded))
-		copy(batch, encoded)
+	if err := s.asyncState.acquireSlot(); err != nil {
+		return err
+	}
 
-		if err := s.asyncState.acquireSlot(); err != nil {
-			return err
-		}
+	select {
+	case s.asyncState.sendCh <- batch:
+	case <-ctx.Done():
+		s.asyncState.releaseSlot()
+		return ctx.Err()
+	}
 
-		select {
-		case s.asyncState.sendCh <- batch:
-		case <-ctx.Done():
-			s.asyncState.releaseSlot()
-			return ctx.Err()
-		}
-
-		// Optimistic cache: if the batch fails, ioErr prevents
-		// further operations so stale cache entries are harmless.
-		if !schemaKnown {
-			s.sentSchemaHashes[skey] = struct{}{}
-		}
+	// Optimistic cache: if the batch fails, ioErr prevents
+	// further operations so stale cache entries are harmless.
+	for _, t := range tables {
+		skey := qwpSchemaKey(t.tb.tableName, t.schemaHash)
+		s.sentSchemaHashes[skey] = struct{}{}
 	}
 
 	if s.batchMaxSymbolId > s.maxSentSymbolId {
@@ -843,44 +871,6 @@ func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 	}
 
 	s.resetAfterFlush()
-	return nil
-}
-
-// flushTable encodes and sends a single table buffer, handling
-// schema caching and retry logic.
-func (s *qwpLineSender) flushTable(ctx context.Context, tb *qwpTableBuffer) error {
-	schemaHash := tb.getSchemaHash()
-	skey := qwpSchemaKey(tb.tableName, schemaHash)
-	_, schemaKnown := s.sentSchemaHashes[skey]
-
-	err := s.transport.sendWithRetry(ctx, s.retryTimeout,
-		func() []byte {
-			mode := qwpSchemaModeFull
-			if schemaKnown {
-				mode = qwpSchemaModeReference
-			}
-			return s.encoder.encodeTableWithDeltaDict(
-				tb,
-				s.globalSymbolList,
-				s.maxSentSymbolId,
-				s.batchMaxSymbolId,
-				mode,
-				schemaHash,
-			)
-		},
-		func() {
-			// Schema error callback: switch to full schema.
-			delete(s.sentSchemaHashes, skey)
-			schemaKnown = false
-		},
-	)
-
-	if err != nil {
-		return err
-	}
-
-	// Mark schema as sent on success.
-	s.sentSchemaHashes[skey] = struct{}{}
 	return nil
 }
 
@@ -969,20 +959,7 @@ func (s *qwpLineSender) flush0(ctx context.Context) error {
 		return s.flushAsync(ctx)
 	}
 
-	for _, tb := range s.tableBuffers {
-		if tb.rowCount == 0 {
-			continue
-		}
-		if err := s.flushTable(ctx, tb); err != nil {
-			return err
-		}
-	}
-
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
-
-	return nil
+	return s.flushSync(ctx)
 }
 
 // --- QwpSender interface: extended column types ---
