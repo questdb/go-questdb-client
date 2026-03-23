@@ -113,6 +113,41 @@ The goal is ZERO allocations per flush at steady state in sync mode. Current ben
 
 - [x] **Clean up dead code: async branch in `flush0`.** In `qwp_sender.go`, `flush0` (called from `Close`) has `if s.asyncState != nil { return s.flushAsync(ctx) }` — but after the Phase 11 restructuring, the async `Close()` path uses `enqueueFlush` + `stop()` directly, never going through `flush0`. This async branch is dead code. Remove it and add a comment explaining the async close path goes through `enqueueFlush`. This is a minor cleanup, not a performance fix.
 
+## Phase 13: Critical Wire Format Correctness Fixes
+
+Two critical encoding bugs found by comparing the Go encoder byte-for-byte against the Java server decoder. These bugs mean **ALL data with nullable columns is silently corrupted** — the server will misparse every column after the first nullable one.
+
+### Issue A: Null rows must be EXCLUDED from column data
+
+The Go encoder writes data for ALL `rowCount` rows, including null rows (with sentinel values like MinInt64, NaN, empty strings). **The Java server expects data for only `valueCount = rowCount - nullCount` rows.** Null rows are identified solely by the null bitmap — no data is written for them.
+
+This means:
+- Fixed-width: server reads `valueCount * fixedSize` bytes, Go writes `rowCount * fixedSize` → extra bytes shift all subsequent columns
+- String: server reads `(valueCount + 1)` offsets, Go writes `(rowCount + 1)` → misalignment
+- Symbol: server reads `valueCount` varints, Go writes `rowCount` varints → misalignment
+- Boolean: server reads `ceil(valueCount/8)` bytes, Go writes `ceil(rowCount/8)` → misalignment
+- Array: server skips null rows, Go writes null sentinel arrays → extra bytes
+
+### Issue B: Decimal scale byte is in the wrong section
+
+The Go encoder writes the scale byte in the **schema** section (after type code). The Java server reads it from the **column data** section (after null bitmap, before values). This corrupts both the schema parse (shifts all subsequent column defs by 1 byte per decimal column) AND the data parse (missing scale byte before values).
+
+### Tasks
+
+- [ ] **CRITICAL: Fix null-value packing — only emit non-null rows in column data.** This is the biggest change. The encoder must skip null rows when writing data. Read the Java server decoders to understand the exact expected format for each type:
+  - `QwpFixedWidthColumnCursor.of()` in `/home/jara/devel/oss/questdb-http2/core/src/main/java/io/questdb/cutlass/qwp/protocol/QwpFixedWidthColumnCursor.java` — reads `valueCount = rowCount - nullCount` values, NOT `rowCount`
+  - `QwpStringColumnCursor.of()` — reads `(valueCount + 1)` offsets, NOT `(rowCount + 1)`
+  - `QwpBooleanColumnCursor.of()` — reads `ceil(valueCount/8)` bits, NOT `ceil(rowCount/8)`
+  - `QwpSymbolColumnCursor.of()` — reads `valueCount` varints, NOT `rowCount`
+  - `QwpArrayColumnCursor.of()` — skips null rows, only reads data for non-null rows
+  **Implementation approach:** There are two strategies. Either (a) stop writing sentinel data in `addNull()` (only set bitmap bit + increment rowCount), and encode the data arrays as-is (which now contain only non-null values). Or (b) keep writing sentinels in `addNull()` but filter them out in the encoder using the null bitmap. Approach (a) is cleaner — the buffer already has `rowCount` and `nullCount`, and the data arrays would naturally contain only `valueCount = rowCount - nullCount` entries. The `addNull()` method should ONLY mark the null bitmap and increment rowCount, without appending sentinel data. The `commitRow()` gap-fill must also only call the bitmap-marking version of addNull. The encoder then writes the data arrays directly. BUT: `truncateTo()` for row cancel needs adjustment since data arrays are now shorter than rowCount. Track `valueCount` per column explicitly. Write golden byte tests that encode a column with nulls and verify the output matches what the Java server expects: null bitmap + only non-null values packed together.
+
+- [ ] **CRITICAL: Move decimal scale byte from schema to column data section.** In `qwp_encoder.go`, `encodeSchemaFull()` currently writes a scale byte after the type code for decimal columns. Remove that. Instead, in `encodeColumnData()`, for decimal types, write the scale byte AFTER the null bitmap flag/bitmap and BEFORE the packed values. Read `QwpDecimalColumnCursor.of()` in the Java server to verify the exact position. Also read `QwpSchema.parseFullSchema()` to confirm it does NOT expect a scale byte in the schema — it just reads (varint name + 1 byte type) per column. Write a golden byte test for a table with a decimal column that has some null and some non-null values.
+
+- [ ] **Update ALL golden byte tests for the new null-packing format.** After fixing the encoder, every existing test that uses nullable columns or addNull() will produce different bytes. Update the expected values. Also add NEW tests specifically for the null-packing behavior: (a) a non-nullable column (0x00 flag, all rows' data), (b) a nullable column with 0 nulls (0x00 flag, all rows' data), (c) a nullable column with some nulls (0x01 flag + bitmap + only non-null values), (d) a nullable column that is ALL nulls (0x01 flag + bitmap + 0 data bytes). Test each category for: fixed-width (LONG), STRING, BOOLEAN, SYMBOL, ARRAY.
+
+- [ ] **Verify with integration test against running QuestDB.** After fixing encoding, write an integration test that inserts rows with nullable columns (some null, some not) via QWP, queries via HTTP /exec, and verifies the data is correct. This must pass against the real server to confirm wire compatibility. Include: nullable LONG with some nulls, nullable STRING with some nulls, nullable BOOLEAN with some nulls, nullable DOUBLE with some nulls. Skip this test if server is unavailable (`skipIfNoServer`).
+
 ## Completed
 - [x] Project initialization and exploration
 

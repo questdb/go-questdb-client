@@ -526,12 +526,21 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name:   "ws with auth",
-			config: fmt.Sprintf("ws::addr=%s;username=%s;token=%s;", addr, user, token),
+			name:   "ws with bearer token",
+			config: fmt.Sprintf("ws::addr=%s;token=%s;", addr, token),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithQwp(),
 				qdb.WithAddress(addr),
-				qdb.WithAuth(user, token),
+				qdb.WithBearerToken(token),
+			},
+		},
+		{
+			name:   "ws with basic auth",
+			config: fmt.Sprintf("ws::addr=%s;username=%s;password=%s;", addr, user, pass),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithBasicAuth(user, pass),
 			},
 		},
 	}
