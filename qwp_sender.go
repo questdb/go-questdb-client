@@ -360,13 +360,15 @@ func (s *qwpLineSender) DecimalColumn(name string, val Decimal) LineSender {
 }
 
 func (s *qwpLineSender) DecimalColumnFromString(name string, val string) LineSender {
-	// Delegate to the ILP-style text encoding for now.
-	// The QWP sender stores decimals in binary form.
 	if s.lastErr != nil {
 		return s
 	}
-	s.lastErr = fmt.Errorf("qwp: DecimalColumnFromString not yet implemented")
-	return s
+	d, err := parseDecimalFromString(val)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	return s.DecimalColumn(name, d)
 }
 
 func (s *qwpLineSender) DecimalColumnShopspring(name string, val ShopspringDecimal) LineSender {

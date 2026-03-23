@@ -215,6 +215,112 @@ func trimTwosComplement(bytes []byte) int {
 	return i
 }
 
+// parseDecimalFromString parses a decimal string into a Decimal value.
+// It handles integers ("123"), decimals ("123.45"), negative values ("-1.5"),
+// and scientific notation ("1.23e5", "1.23e-5").
+// Special values (NaN, Infinity) return an error since they cannot be
+// represented in the QWP binary wire format.
+func parseDecimalFromString(text string) (Decimal, error) {
+	if text == "" {
+		return Decimal{}, fmt.Errorf("decimal literal cannot be empty")
+	}
+
+	switch text {
+	case "NaN", "Infinity", "+Infinity", "-Infinity":
+		return Decimal{}, fmt.Errorf("decimal value %q cannot be represented in binary format", text)
+	}
+
+	negative := false
+	i := 0
+	if text[0] == '-' {
+		negative = true
+		i++
+	} else if text[0] == '+' {
+		i++
+	}
+
+	if i >= len(text) {
+		return Decimal{}, fmt.Errorf("decimal literal contains sign without digits")
+	}
+
+	// Collect digit characters (ignoring the decimal point) and track scale.
+	var digits []byte
+	scale := 0
+	seenDot := false
+	for i < len(text) {
+		ch := text[i]
+		switch {
+		case ch >= '0' && ch <= '9':
+			digits = append(digits, ch)
+			if seenDot {
+				scale++
+			}
+			i++
+		case ch == '.':
+			seenDot = true
+			i++
+		case ch == 'e' || ch == 'E':
+			goto parseExponent
+		default:
+			return Decimal{}, fmt.Errorf("decimal literal contains invalid character %q", ch)
+		}
+	}
+	goto buildDecimal
+
+parseExponent:
+	{
+		i++ // skip 'e'/'E'
+		if i >= len(text) {
+			return Decimal{}, fmt.Errorf("decimal literal has incomplete exponent")
+		}
+		expNeg := false
+		if text[i] == '-' {
+			expNeg = true
+			i++
+		} else if text[i] == '+' {
+			i++
+		}
+		if i >= len(text) {
+			return Decimal{}, fmt.Errorf("decimal literal has incomplete exponent")
+		}
+		exp := 0
+		for i < len(text) {
+			if text[i] < '0' || text[i] > '9' {
+				return Decimal{}, fmt.Errorf("decimal literal exponent has invalid character")
+			}
+			exp = exp*10 + int(text[i]-'0')
+			i++
+		}
+		if expNeg {
+			scale += exp
+		} else {
+			scale -= exp
+		}
+	}
+
+buildDecimal:
+	if len(digits) == 0 {
+		return Decimal{}, fmt.Errorf("decimal literal must contain at least one digit")
+	}
+
+	// If scale is negative, the exponent shifted us past the decimal point.
+	// Pad with zeros and set scale to 0.
+	if scale < 0 {
+		for j := 0; j < -scale; j++ {
+			digits = append(digits, '0')
+		}
+		scale = 0
+	}
+
+	unscaled := new(big.Int)
+	unscaled.SetString(string(digits), 10)
+	if negative {
+		unscaled.Neg(unscaled)
+	}
+
+	return NewDecimal(unscaled, uint32(scale))
+}
+
 // validateDecimalText checks that the provided string is a valid decimal representation.
 // It accepts numeric digits, optional sign, decimal point, exponent (e/E) and NaN/Infinity tokens.
 func validateDecimalText(text string) error {

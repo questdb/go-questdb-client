@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -372,6 +373,329 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 	}
 	if s.pendingRowCount != 2 {
 		t.Fatalf("pendingRowCount = %d, want 2", s.pendingRowCount)
+	}
+}
+
+func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
+	// Mock server that counts received messages.
+	msgCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			msgCount++
+			ack := make([]byte, 9)
+			ack[0] = qwpWireStatusOK
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	// autoFlushRows=0 (disabled), autoFlushInterval=10ms.
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+
+	// First row: initializes the deadline but does not flush.
+	err = s.Table("t").Int64Column("x", int64(1)).AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("row 1: %v", err)
+	}
+	if msgCount != 0 {
+		t.Fatalf("after row 1: msgCount = %d, want 0", msgCount)
+	}
+	if s.pendingRowCount != 1 {
+		t.Fatalf("after row 1: pendingRowCount = %d, want 1", s.pendingRowCount)
+	}
+
+	// Wait for the interval to expire.
+	time.Sleep(20 * time.Millisecond)
+
+	// Second row: should trigger time-based auto-flush.
+	err = s.Table("t").Int64Column("x", int64(2)).AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("row 2: %v", err)
+	}
+	if msgCount != 1 {
+		t.Fatalf("after row 2: msgCount = %d, want 1 (time-based flush)", msgCount)
+	}
+	if s.pendingRowCount != 0 {
+		t.Fatalf("after row 2: pendingRowCount = %d, want 0", s.pendingRowCount)
+	}
+}
+
+func TestQwpSenderAutoFlushDisabled(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	// Both autoFlushRows=0 and autoFlushInterval=0 (disabled).
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+
+	// Insert many rows — no auto-flush should trigger.
+	for i := 0; i < 100; i++ {
+		err := s.Table("t").Int64Column("x", int64(i)).AtNow(context.Background())
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+	}
+
+	if s.pendingRowCount != 100 {
+		t.Fatalf("pendingRowCount = %d, want 100", s.pendingRowCount)
+	}
+}
+
+func TestQwpSenderDecimalColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	d := NewDecimalFromInt64(12345, 2) // 123.45
+	err := s.Table("t").
+		DecimalColumn("price", d).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderDecimalColumnFromString(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	err := s.Table("t").
+		DecimalColumnFromString("price", "123.45").
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderDecimalColumnFromStringVariants(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	cases := []string{
+		"0", "1", "-1", "123.456", "-99.99",
+		"1e5", "1.23e10", "1.5e-3",
+	}
+
+	// Each case uses a different column name since scale must be
+	// consistent within a column.
+	for i, val := range cases {
+		colName := fmt.Sprintf("d%d", i)
+		err := s.Table("t").
+			DecimalColumnFromString(colName, val).
+			AtNow(context.Background())
+		if err != nil {
+			t.Fatalf("DecimalColumnFromString(%q): %v", val, err)
+		}
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderDecimalColumnFromStringInvalid(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// NaN is not representable in binary.
+	s.Table("t").DecimalColumnFromString("d", "NaN")
+	err := s.At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected error for NaN decimal")
+	}
+}
+
+func TestQwpSenderFloat64Array1D(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	err := s.Table("t").
+		Float64Array1DColumn("arr", []float64{1.0, 2.0, 3.0}).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderFloat64Array2D(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	err := s.Table("t").
+		Float64Array2DColumn("mat", [][]float64{{1.0, 2.0}, {3.0, 4.0}}).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderFloat64Array2DIrregular(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Irregular array should error.
+	s.Table("t").Float64Array2DColumn("mat", [][]float64{{1.0, 2.0}, {3.0}})
+	err := s.At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected error for irregular 2D array")
+	}
+}
+
+func TestQwpSenderFloat64Array3D(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	err := s.Table("t").
+		Float64Array3DColumn("tensor", [][][]float64{
+			{{1.0, 2.0}, {3.0, 4.0}},
+			{{5.0, 6.0}, {7.0, 8.0}},
+		}).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderFloat64ArrayND(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	arr, err := NewNDArray[float64](2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range []float64{1.0, 2.0, 3.0, 4.0, 5.0, 6.0} {
+		_ = i
+		arr.Append(v)
+	}
+
+	err = s.Table("t").
+		Float64ArrayNDColumn("nd", arr).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderFloat64ArrayEmpty(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Empty 1D array.
+	err := s.Table("t").
+		Float64Array1DColumn("arr", []float64{}).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+
+	// Empty 2D array.
+	err = s.Table("t").
+		Float64Array2DColumn("mat", [][]float64{}).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestParseDecimalFromString(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantScale uint32
+		wantErr   bool
+	}{
+		{"0", 0, false},
+		{"123", 0, false},
+		{"-123", 0, false},
+		{"123.45", 2, false},
+		{"-99.99", 2, false},
+		{"1e5", 0, false},
+		{"1.5e-3", 4, false},
+		{"1.23e2", 0, false},
+		{"NaN", 0, true},
+		{"Infinity", 0, true},
+		{"+Infinity", 0, true},
+		{"-Infinity", 0, true},
+		{"", 0, true},
+		{"+", 0, true},
+	}
+
+	for _, tc := range tests {
+		d, err := parseDecimalFromString(tc.input)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseDecimalFromString(%q): expected error, got nil", tc.input)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseDecimalFromString(%q): %v", tc.input, err)
+			continue
+		}
+		if d.scale != tc.wantScale {
+			t.Errorf("parseDecimalFromString(%q): scale = %d, want %d", tc.input, d.scale, tc.wantScale)
+		}
 	}
 }
 
