@@ -606,3 +606,228 @@ func TestQwpEncoderDecimalSchema(t *testing.T) {
 		t.Fatalf("decimal data = %x, want %x", msg[off:off+8], expected)
 	}
 }
+
+// --- Golden byte tests for boolean, string, symbol, array, decimal encoding ---
+
+func TestQwpEncoderBoolGoldenBytes(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("flag", qwpTypeBoolean, false)
+	col.addBool(true)
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("flag", qwpTypeBoolean, false)
+	col.addBool(false)
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("flag", qwpTypeBoolean, false)
+	col.addBool(true)
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2                // table name "t"
+	off += 1                // rowCount=3
+	off += 1                // colCount=1
+	off += 1                // schemaMode=FULL
+	off += 1 + 4 + 1        // col "flag": varint(4) + "flag" + type
+
+	// Bool data: 3 bits packed into 1 byte.
+	// bits: 1,0,1 = 0b00000101 = 0x05
+	if msg[off] != 0x05 {
+		t.Fatalf("bool data = 0x%02X, want 0x05", msg[off])
+	}
+}
+
+func TestQwpEncoderBoolNullableGoldenBytes(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("flag", qwpTypeBoolean, true)
+	col.addBool(true) // row 0
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("flag", qwpTypeBoolean, true)
+	col.addNull() // row 1: null
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("flag", qwpTypeBoolean, true)
+	col.addBool(false) // row 2
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2         // table name "t"
+	off += 1         // rowCount=3
+	off += 1         // colCount=1
+	off += 1         // schemaMode=FULL
+	off += 1 + 4 + 1 // col "flag": varint(4) + "flag" + wireTypeCode (0x81)
+
+	// Null bitmap: 1 byte. Row 1 null → bit 1 → 0x02.
+	if msg[off] != 0x02 {
+		t.Fatalf("null bitmap = 0x%02X, want 0x02", msg[off])
+	}
+	off++
+
+	// Bool data: bits 0=true, 1=false(sentinel), 2=false.
+	// Only bit 0 is set → 0x01.
+	if msg[off] != 0x01 {
+		t.Fatalf("bool data = 0x%02X, want 0x01", msg[off])
+	}
+}
+
+func TestQwpEncoderStringGoldenBytes(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("s", qwpTypeString, false)
+	col.addString("hello")
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("s", qwpTypeString, false)
+	col.addString("world")
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2     // table name "t"
+	off += 1     // rowCount=2
+	off += 1     // colCount=1
+	off += 1     // schemaMode=FULL
+	off += 1 + 1 + 1 // col "s": varint(1) + "s" + type
+
+	// String encoding: (rowCount+1) × uint32 LE offsets + data.
+	// Offsets: [0, 5, 10]
+	expectedOffsets := []uint32{0, 5, 10}
+	for i, want := range expectedOffsets {
+		got := binary.LittleEndian.Uint32(msg[off:])
+		if got != want {
+			t.Fatalf("offset[%d] = %d, want %d", i, got, want)
+		}
+		off += 4
+	}
+
+	// String data: "helloworld"
+	if string(msg[off:off+10]) != "helloworld" {
+		t.Fatalf("string data = %q, want %q", msg[off:off+10], "helloworld")
+	}
+}
+
+func TestQwpEncoderSymbolGoldenBytes(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("sym", qwpTypeSymbol, false)
+	col.addSymbolID(0)
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("sym", qwpTypeSymbol, false)
+	col.addSymbolID(1)
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("sym", qwpTypeSymbol, false)
+	col.addSymbolID(42)
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2     // table name "t"
+	off += 1     // rowCount=3
+	off += 1     // colCount=1
+	off += 1     // schemaMode=FULL
+	off += 1 + 3 + 1 // col "sym": varint(3) + "sym" + type
+
+	// Symbol IDs as varints: 0, 1, 42.
+	// varint(0) = [0x00]
+	if msg[off] != 0x00 {
+		t.Fatalf("symbol[0] = 0x%02X, want 0x00", msg[off])
+	}
+	off++
+
+	// varint(1) = [0x01]
+	if msg[off] != 0x01 {
+		t.Fatalf("symbol[1] = 0x%02X, want 0x01", msg[off])
+	}
+	off++
+
+	// varint(42) = [0x2A]
+	if msg[off] != 0x2A {
+		t.Fatalf("symbol[2] = 0x%02X, want 0x2A", msg[off])
+	}
+}
+
+func TestQwpEncoderArrayGoldenBytes(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("arr", qwpTypeDoubleArray, false)
+	col.addDoubleArray(1, []int32{2}, []float64{1.5, 2.5})
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2     // table name "t"
+	off += 1     // rowCount=1
+	off += 1     // colCount=1
+	off += 1     // schemaMode=FULL
+	off += 1 + 3 + 1 // col "arr": varint(3) + "arr" + type
+
+	// Array data: nDims=1, shape=[2], elements=[1.5, 2.5]
+	// nDims
+	if msg[off] != 0x01 {
+		t.Fatalf("nDims = %d, want 1", msg[off])
+	}
+	off++
+
+	// shape[0] = 2 (uint32 LE)
+	if binary.LittleEndian.Uint32(msg[off:]) != 2 {
+		t.Fatalf("shape[0] = %d, want 2", binary.LittleEndian.Uint32(msg[off:]))
+	}
+	off += 4
+
+	// element 0: 1.5
+	got := math.Float64frombits(binary.LittleEndian.Uint64(msg[off:]))
+	if got != 1.5 {
+		t.Fatalf("element[0] = %v, want 1.5", got)
+	}
+	off += 8
+
+	// element 1: 2.5
+	got = math.Float64frombits(binary.LittleEndian.Uint64(msg[off:]))
+	if got != 2.5 {
+		t.Fatalf("element[1] = %v, want 2.5", got)
+	}
+}
+
+func TestQwpEncoderVarcharGoldenBytes(t *testing.T) {
+	// VARCHAR uses same encoding as STRING.
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("v", qwpTypeVarchar, false)
+	col.addString("abc")
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2     // table name "t"
+	off += 1     // rowCount=1
+	off += 1     // colCount=1
+	off += 1     // schemaMode=FULL
+	off += 1 + 1 + 1 // col "v": varint(1) + "v" + type (0x0F)
+
+	// Offsets: [0, 3] → 2 × uint32 LE
+	if binary.LittleEndian.Uint32(msg[off:]) != 0 {
+		t.Fatalf("offset[0] = %d, want 0", binary.LittleEndian.Uint32(msg[off:]))
+	}
+	off += 4
+	if binary.LittleEndian.Uint32(msg[off:]) != 3 {
+		t.Fatalf("offset[1] = %d, want 3", binary.LittleEndian.Uint32(msg[off:]))
+	}
+	off += 4
+
+	// Data: "abc"
+	if string(msg[off:off+3]) != "abc" {
+		t.Fatalf("data = %q, want %q", msg[off:off+3], "abc")
+	}
+}
