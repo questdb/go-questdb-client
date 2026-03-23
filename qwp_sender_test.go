@@ -1525,3 +1525,59 @@ func extractSchemaMode(t *testing.T, msg []byte) byte {
 	// Schema mode byte.
 	return msg[off]
 }
+
+func TestQwpAsyncNoCacheOnFlushFailure(t *testing.T) {
+	// Verify that when flushAsync fails, schema hashes and symbol IDs
+	// are NOT cached. Previously, flushAsync updated caches optimistically
+	// before ACK, meaning a failed batch would leave stale cache entries
+	// that cause subsequent flushes to use schema reference mode for
+	// schemas the server never received.
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		// Read the first message, then return a WRITE_ERROR.
+		_, _, err = conn.Read(context.Background())
+		if err != nil {
+			return
+		}
+		ack := make([]byte, 9)
+		ack[0] = qwpWireStatusWriteError
+		conn.Write(context.Background(), websocket.MessageBinary, ack)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+
+	// Insert a row with a symbol (to test both schema and symbol caching).
+	s.Table("t").Symbol("sym", "AAPL").Int64Column("x", 1).AtNow(context.Background())
+
+	// Flush should fail because the server returns WRITE_ERROR.
+	flushErr := s.Flush(context.Background())
+	if flushErr == nil {
+		t.Fatal("expected flush error, got nil")
+	}
+
+	// Schema hashes must NOT be cached after a failed flush.
+	if len(s.sentSchemaHashes) != 0 {
+		t.Fatalf("sentSchemaHashes should be empty after failed flush, got %d entries",
+			len(s.sentSchemaHashes))
+	}
+
+	// Symbol ID must NOT be advanced after a failed flush.
+	if s.maxSentSymbolId != -1 {
+		t.Fatalf("maxSentSymbolId should be -1 after failed flush, got %d",
+			s.maxSentSymbolId)
+	}
+}

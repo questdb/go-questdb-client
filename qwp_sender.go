@@ -692,6 +692,11 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 		return err
 	}
 
+	// Collect schema keys to commit only after all batches are ACKed.
+	// If any batch fails, we must not cache schemas or symbol IDs —
+	// the server never received them.
+	var pendingSchemaKeys []int64
+
 	for _, tb := range s.tableBuffers {
 		if tb.rowCount == 0 {
 			continue
@@ -732,16 +737,29 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		// Optimistically mark schema as sent.
-		s.sentSchemaHashes[skey] = struct{}{}
+		// Track new schema keys for deferred commit.
+		if !schemaKnown {
+			pendingSchemaKeys = append(pendingSchemaKeys, skey)
+		}
 	}
 
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
+	// Capture the batch max symbol ID before waiting.
+	pendingMaxSymbolId := s.batchMaxSymbolId
 
 	// Wait for all in-flight batches to be ACKed before returning.
-	return s.asyncState.waitEmpty()
+	if err := s.asyncState.waitEmpty(); err != nil {
+		return err
+	}
+
+	// All batches ACKed — commit schema and symbol caches.
+	for _, skey := range pendingSchemaKeys {
+		s.sentSchemaHashes[skey] = struct{}{}
+	}
+	if pendingMaxSymbolId > s.maxSentSymbolId {
+		s.maxSentSymbolId = pendingMaxSymbolId
+	}
+
+	return nil
 }
 
 // flushTable encodes and sends a single table buffer, handling
