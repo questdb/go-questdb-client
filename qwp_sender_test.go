@@ -699,6 +699,309 @@ func TestParseDecimalFromString(t *testing.T) {
 	}
 }
 
+// --- QwpSender extended column type tests ---
+
+func TestQwpSenderByteColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.ByteColumn("b", 42).
+		ByteColumn("neg", -128).
+		ByteColumn("max", 127).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderShortColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.ShortColumn("s", 1000).
+		ShortColumn("neg", -32768).
+		ShortColumn("max", 32767).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderInt32Column(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.Int32Column("i", 100000).
+		Int32Column("neg", -2147483648).
+		Int32Column("max", 2147483647).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderFloat32Column(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.Float32Column("f", 3.14).
+		Float32Column("zero", 0).
+		Float32Column("neg", -1.5).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderCharColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.CharColumn("c", 'A').
+		CharColumn("digit", '9').
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderDateColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	ts := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC)
+	s.Table("t")
+	err := s.DateColumn("d", ts).
+		DateColumn("epoch", time.Unix(0, 0).UTC()).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderTimestampNanosColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	ts := time.Date(2024, 6, 15, 10, 30, 0, 123456789, time.UTC)
+	s.Table("t")
+	err := s.TimestampNanosColumn("ts", ts).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderUuidColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// UUID: 550e8400-e29b-41d4-a716-446655440000
+	hi := uint64(0x550e8400e29b41d4)
+	lo := uint64(0xa716446655440000)
+	s.Table("t")
+	err := s.UuidColumn("id", hi, lo).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderVarcharColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.VarcharColumn("v", "hello world").
+		VarcharColumn("empty", "").
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderGeohashColumn(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.GeohashColumn("geo", 0xABCDE, 20).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderInt64Array1D(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.Int64Array1DColumn("arr", []int64{10, 20, 30}).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderInt64Array2D(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.Int64Array2DColumn("mat", [][]int64{{1, 2}, {3, 4}}).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderInt64Array3D(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.Int64Array3DColumn("tensor", [][][]int64{
+		{{1, 2}, {3, 4}},
+		{{5, 6}, {7, 8}},
+	}).AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderMixedExtendedTypes(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	ts := time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC)
+	s.Table("mixed")
+	err := s.ByteColumn("b", 1).
+		ShortColumn("sh", 1000).
+		Int32Column("i", 50000).
+		Float32Column("f", 2.5).
+		CharColumn("c", 'X').
+		DateColumn("dt", ts).
+		UuidColumn("id", 0x1234, 0x5678).
+		VarcharColumn("vc", "test").
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+func TestQwpSenderExtendedNoTable(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// ByteColumn without Table should error.
+	s.ByteColumn("b", 1)
+	err := s.At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected error for ByteColumn without Table")
+	}
+}
+
+func TestQwpSenderMethodChaining(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// QwpSender methods return QwpSender and can be chained.
+	// Table() returns LineSender, so call it first then chain
+	// QwpSender-specific methods on the concrete sender.
+	s.Table("t")
+	err := s.ByteColumn("b", 1).
+		ShortColumn("sh", 2).
+		Int32Column("i", 3).
+		Float32Column("f", 4.0).
+		At(context.Background(), time.Now())
+	if err != nil {
+		t.Fatalf("chained At: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
 // --- Integration test ---
 
 func TestQwpSenderIntegration(t *testing.T) {

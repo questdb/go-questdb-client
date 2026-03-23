@@ -31,6 +31,55 @@ import (
 	"time"
 )
 
+// QwpSender extends LineSender with column types only available
+// in the QWP binary protocol. These types are not part of ILP
+// and cannot be used with HTTP or TCP senders.
+type QwpSender interface {
+	LineSender
+
+	// ByteColumn adds a BYTE (int8) column value.
+	ByteColumn(name string, val int8) QwpSender
+
+	// ShortColumn adds a SHORT (int16) column value.
+	ShortColumn(name string, val int16) QwpSender
+
+	// Int32Column adds an INT (int32) column value.
+	Int32Column(name string, val int32) QwpSender
+
+	// Float32Column adds a FLOAT (float32) column value.
+	Float32Column(name string, val float32) QwpSender
+
+	// CharColumn adds a CHAR column value stored as a UTF-16 code unit.
+	CharColumn(name string, val rune) QwpSender
+
+	// DateColumn adds a DATE column value (milliseconds since epoch).
+	DateColumn(name string, val time.Time) QwpSender
+
+	// TimestampNanosColumn adds a TIMESTAMP column value (nanoseconds since epoch).
+	TimestampNanosColumn(name string, val time.Time) QwpSender
+
+	// UuidColumn adds a UUID column value from high and low 64-bit parts.
+	UuidColumn(name string, hi, lo uint64) QwpSender
+
+	// VarcharColumn adds a VARCHAR column value.
+	VarcharColumn(name string, val string) QwpSender
+
+	// GeohashColumn adds a GEOHASH column value with the given bit precision.
+	GeohashColumn(name string, hash uint64, precision int) QwpSender
+
+	// Int64Array1DColumn adds a 1-dimensional LONG array column.
+	Int64Array1DColumn(name string, values []int64) QwpSender
+
+	// Int64Array2DColumn adds a 2-dimensional LONG array column.
+	Int64Array2DColumn(name string, values [][]int64) QwpSender
+
+	// Int64Array3DColumn adds a 3-dimensional LONG array column.
+	Int64Array3DColumn(name string, values [][][]int64) QwpSender
+}
+
+// Compile-time check that qwpLineSender implements QwpSender.
+var _ QwpSender = (*qwpLineSender)(nil)
+
 // qwpLineSender implements LineSender for the QWP WebSocket protocol.
 // In sync mode (in-flight window = 1), each Flush() encodes and
 // sends one batch at a time, blocking until the server ACKs.
@@ -717,4 +766,322 @@ func (s *qwpLineSender) flush0(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// --- QwpSender interface: extended column types ---
+
+func (s *qwpLineSender) ByteColumn(name string, val int8) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: ByteColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeByte, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addByte(val)
+	return s
+}
+
+func (s *qwpLineSender) ShortColumn(name string, val int16) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: ShortColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeShort, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addShort(val)
+	return s
+}
+
+func (s *qwpLineSender) Int32Column(name string, val int32) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: Int32Column() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeInt, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addInt32(val)
+	return s
+}
+
+func (s *qwpLineSender) Float32Column(name string, val float32) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: Float32Column() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeFloat, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addFloat32(val)
+	return s
+}
+
+func (s *qwpLineSender) CharColumn(name string, val rune) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: CharColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeChar, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addChar(val)
+	return s
+}
+
+func (s *qwpLineSender) DateColumn(name string, val time.Time) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: DateColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDate, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addLong(val.UnixMilli())
+	return s
+}
+
+func (s *qwpLineSender) TimestampNanosColumn(name string, val time.Time) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: TimestampNanosColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeTimestamp, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	// Store nanoseconds converted to microseconds for QWP wire format.
+	col.addTimestamp(val.UnixNano() / 1000)
+	return s
+}
+
+func (s *qwpLineSender) UuidColumn(name string, hi, lo uint64) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: UuidColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeUuid, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addUuid(hi, lo)
+	return s
+}
+
+func (s *qwpLineSender) VarcharColumn(name string, val string) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: VarcharColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeVarchar, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addString(val)
+	return s
+}
+
+func (s *qwpLineSender) GeohashColumn(name string, hash uint64, precision int) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: GeohashColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeGeohash, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	if err := col.addGeohash(hash, int8(precision)); err != nil {
+		s.lastErr = err
+	}
+	return s
+}
+
+func (s *qwpLineSender) Int64Array1DColumn(name string, values []int64) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: Int64Array1DColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	col.addLongArray(1, []int32{int32(len(values))}, values)
+	return s
+}
+
+func (s *qwpLineSender) Int64Array2DColumn(name string, values [][]int64) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: Int64Array2DColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+
+	if len(values) == 0 {
+		col.addLongArray(2, []int32{0, 0}, nil)
+		return s
+	}
+	dim0 := int32(len(values))
+	dim1 := int32(len(values[0]))
+	flat := make([]int64, 0, int(dim0)*int(dim1))
+	for _, row := range values {
+		if int32(len(row)) != dim1 {
+			s.lastErr = fmt.Errorf("qwp: irregular 2D array: row lengths differ")
+			return s
+		}
+		flat = append(flat, row...)
+	}
+	col.addLongArray(2, []int32{dim0, dim1}, flat)
+	return s
+}
+
+func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: Int64Array3DColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, false)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+
+	if len(values) == 0 {
+		col.addLongArray(3, []int32{0, 0, 0}, nil)
+		return s
+	}
+	dim0 := int32(len(values))
+	dim1 := int32(len(values[0]))
+	dim2 := int32(0)
+	if len(values[0]) > 0 {
+		dim2 = int32(len(values[0][0]))
+	}
+	flat := make([]int64, 0, int(dim0)*int(dim1)*int(dim2))
+	for _, plane := range values {
+		if int32(len(plane)) != dim1 {
+			s.lastErr = fmt.Errorf("qwp: irregular 3D array")
+			return s
+		}
+		for _, row := range plane {
+			if int32(len(row)) != dim2 {
+				s.lastErr = fmt.Errorf("qwp: irregular 3D array")
+				return s
+			}
+			flat = append(flat, row...)
+		}
+	}
+	col.addLongArray(3, []int32{dim0, dim1, dim2}, flat)
+	return s
 }
