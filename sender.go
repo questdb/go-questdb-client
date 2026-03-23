@@ -265,6 +265,7 @@ const (
 	noSenderType   senderType = 0
 	httpSenderType senderType = 1
 	tcpSenderType  senderType = 2
+	qwpSenderType  senderType = 3
 )
 
 type tlsMode int64
@@ -310,6 +311,9 @@ type lineSenderConfig struct {
 	autoFlushInterval time.Duration
 
 	protocolVersion protocolVersion
+
+	// QWP-specific fields
+	inFlightWindow int // 0 = default (sync mode), >1 = async mode
 }
 
 // LineSenderOption defines line sender config option.
@@ -326,6 +330,24 @@ func WithHttp() LineSenderOption {
 func WithTcp() LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.senderType = tcpSenderType
+	}
+}
+
+// WithQwp enables ingestion over the QWP WebSocket protocol.
+func WithQwp() LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.senderType = qwpSenderType
+	}
+}
+
+// WithInFlightWindow sets the number of concurrent in-flight batches
+// for async QWP mode. A value of 1 (default) uses synchronous mode.
+// Values > 1 enable async mode with a dedicated I/O goroutine.
+//
+// Only available for the QWP sender.
+func WithInFlightWindow(window int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.inFlightWindow = window
 	}
 }
 
@@ -641,6 +663,16 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			initBufSize:   defaultInitBufferSize,
 			fileNameLimit: defaultFileNameLimit,
 		}
+	case qwpSenderType:
+		return &lineSenderConfig{
+			senderType:        t,
+			address:           defaultHttpAddress,
+			retryTimeout:      defaultRetryTimeout,
+			autoFlushRows:     defaultAutoFlushRows,
+			autoFlushInterval: defaultAutoFlushInterval,
+			initBufSize:       defaultInitBufferSize,
+			fileNameLimit:     defaultFileNameLimit,
+		}
 	default:
 		return &lineSenderConfig{
 			senderType:        t,
@@ -671,8 +703,14 @@ func newLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, err
 			return nil, err
 		}
 		return newHttpLineSender(ctx, conf)
+	case qwpSenderType:
+		err := sanitizeQwpConf(conf)
+		if err != nil {
+			return nil, err
+		}
+		return newQwpLineSenderFromConf(ctx, conf)
 	}
-	return nil, errors.New("sender type is not specified: use WithHttp or WithTcp")
+	return nil, errors.New("sender type is not specified: use WithHttp, WithTcp, or WithQwp")
 }
 
 func sanitizeTcpConf(conf *lineSenderConfig) error {
@@ -710,6 +748,39 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	return nil
 }
 
+func sanitizeQwpConf(conf *lineSenderConfig) error {
+	err := validateConf(conf)
+	if err != nil {
+		return err
+	}
+
+	// QWP does not support HTTP-specific settings.
+	if conf.requestTimeout != 0 {
+		return errors.New("requestTimeout setting is not available in the QWP client")
+	}
+	if conf.minThroughput != 0 {
+		return errors.New("minThroughput setting is not available in the QWP client")
+	}
+	if conf.maxBufSize != 0 {
+		return errors.New("maxBufferSize setting is not available in the QWP client")
+	}
+	// QWP does not support HTTP auth.
+	if conf.httpUser != "" || conf.httpPass != "" {
+		return errors.New("basic auth (httpUser/httpPass) is not available in the QWP client")
+	}
+	if conf.httpToken != "" {
+		return errors.New("bearer token auth (httpToken) is not available in the QWP client; use token for key-based auth")
+	}
+	if conf.inFlightWindow < 0 {
+		return fmt.Errorf("in-flight window is negative: %d", conf.inFlightWindow)
+	}
+	if conf.protocolVersion != protocolVersionUnset {
+		return errors.New("protocol_version setting is not available in the QWP client")
+	}
+
+	return nil
+}
+
 func sanitizeHttpConf(conf *lineSenderConfig) error {
 	err := validateConf(conf)
 	if err != nil {
@@ -722,6 +793,30 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	}
 
 	return nil
+}
+
+func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
+	scheme := "ws"
+	if conf.tlsMode != tlsDisabled {
+		scheme = "wss"
+	}
+	address := scheme + "://" + conf.address
+
+	opts := qwpTransportOpts{
+		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
+	}
+	// QWP uses token-based auth (same key fields as TCP).
+	if conf.tcpKeyId != "" && conf.tcpKey != "" {
+		opts.authorization = conf.tcpKey
+	}
+
+	window := conf.inFlightWindow
+	if window <= 0 {
+		window = 1
+	}
+
+	return newQwpLineSender(ctx, address, opts, conf.retryTimeout,
+		conf.autoFlushRows, conf.autoFlushInterval, window)
 }
 
 func validateConf(conf *lineSenderConfig) error {

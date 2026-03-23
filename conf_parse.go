@@ -55,6 +55,11 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 	case "tcps":
 		senderConf = newLineSenderConfig(tcpSenderType)
 		senderConf.tlsMode = tlsEnabled
+	case "ws":
+		senderConf = newLineSenderConfig(qwpSenderType)
+	case "wss":
+		senderConf = newLineSenderConfig(qwpSenderType)
+		senderConf.tlsMode = tlsEnabled
 	default:
 		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
 	}
@@ -67,7 +72,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			switch senderConf.senderType {
 			case httpSenderType:
 				senderConf.httpUser = v
-			case tcpSenderType:
+			case tcpSenderType, qwpSenderType:
 				senderConf.tcpKeyId = v
 			default:
 				panic("add a case for " + k)
@@ -81,7 +86,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			switch senderConf.senderType {
 			case httpSenderType:
 				senderConf.httpToken = v
-			case tcpSenderType:
+			case tcpSenderType, qwpSenderType:
 				senderConf.tcpKey = v
 			default:
 				panic("add a case for " + k)
@@ -174,6 +179,12 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				}
 				senderConf.protocolVersion = pVersion
 			}
+		case "in_flight_window":
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			senderConf.inFlightWindow = parsedVal
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}

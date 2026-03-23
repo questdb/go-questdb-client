@@ -234,6 +234,37 @@ func TestParserHappyCases(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:   "ws schema",
+			config: fmt.Sprintf("ws::addr=%s;", addr),
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+				},
+			},
+		},
+		{
+			name:   "wss schema",
+			config: fmt.Sprintf("wss::addr=%s;", addr),
+			expected: qdb.ConfigData{
+				Schema: "wss",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+				},
+			},
+		},
+		{
+			name:   "ws with in_flight_window",
+			config: fmt.Sprintf("ws::addr=%s;in_flight_window=4;", addr),
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr":              addr,
+					"in_flight_window": "4",
+				},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -447,6 +478,62 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithAutoFlushInterval(1000 * time.Millisecond),
 			},
 		},
+		{
+			name:   "ws basic",
+			config: fmt.Sprintf("ws::addr=%s;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+			},
+		},
+		{
+			name:   "wss with tls",
+			config: fmt.Sprintf("wss::addr=%s;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithTls(),
+			},
+		},
+		{
+			name:   "wss with tls_verify unsafe_off",
+			config: fmt.Sprintf("wss::addr=%s;tls_verify=unsafe_off;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithTlsInsecureSkipVerify(),
+			},
+		},
+		{
+			name:   "ws with in_flight_window",
+			config: fmt.Sprintf("ws::addr=%s;in_flight_window=4;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithInFlightWindow(4),
+			},
+		},
+		{
+			name:   "ws with auto_flush and retry_timeout",
+			config: fmt.Sprintf("ws::addr=%s;auto_flush_rows=100;auto_flush_interval=500;retry_timeout=%d;",
+				addr, retryTimeout.Milliseconds()),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithAutoFlushRows(100),
+				qdb.WithAutoFlushInterval(500 * time.Millisecond),
+				qdb.WithRetryTimeout(retryTimeout),
+			},
+		},
+		{
+			name:   "ws with auth",
+			config: fmt.Sprintf("ws::addr=%s;username=%s;token=%s;", addr, user, token),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithAuth(user, token),
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -455,13 +542,17 @@ func TestHappyCasesFromConf(t *testing.T) {
 			assert.NoError(t, err)
 
 			var expected *qdb.LineSenderConfig
-			switch tc.config[0] {
-			case 'h':
-				expected = qdb.NewLineSenderConfig(qdb.HttpSenderType)
-			case 't':
-				expected = qdb.NewLineSenderConfig(qdb.TcpSenderType)
-			default:
-				assert.FailNow(t, "happy case configs must start with either 'http' or 'tcp'")
+			if len(tc.config) >= 2 && tc.config[:2] == "ws" {
+				expected = qdb.NewLineSenderConfig(qdb.QwpSenderType)
+			} else {
+				switch tc.config[0] {
+				case 'h':
+					expected = qdb.NewLineSenderConfig(qdb.HttpSenderType)
+				case 't':
+					expected = qdb.NewLineSenderConfig(qdb.TcpSenderType)
+				default:
+					assert.FailNow(t, "happy case configs must start with 'http', 'tcp', or 'ws'")
+				}
 			}
 			for _, opt := range tc.expectedOpts {
 				opt(expected)

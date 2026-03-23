@@ -37,6 +37,7 @@ var (
 	NoSenderType             SenderType = noSenderType
 	HttpSenderType           SenderType = httpSenderType
 	TcpSenderType            SenderType = tcpSenderType
+	QwpSenderType            SenderType = qwpSenderType
 	DefaultAutoFlushInterval            = defaultAutoFlushInterval
 	DefaultAutoFlushRows                = defaultAutoFlushRows
 )
