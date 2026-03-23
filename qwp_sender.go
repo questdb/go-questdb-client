@@ -122,26 +122,43 @@ type qwpLineSender struct {
 	// Connection and retry config.
 	retryTimeout time.Duration
 
+	// Async mode (in-flight window > 1).
+	asyncState      *qwpAsyncState
+	inFlightWindow  int
+
 	// Lifecycle.
 	closed bool
 }
 
 // newQwpLineSender creates a new QWP sender and establishes a
-// WebSocket connection to the server.
-func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration) (*qwpLineSender, error) {
+// WebSocket connection to the server. If inFlightWindow > 1, async
+// mode is enabled with a dedicated I/O goroutine.
+func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, inFlightWindow ...int) (*qwpLineSender, error) {
+	window := 1
+	if len(inFlightWindow) > 0 && inFlightWindow[0] > 1 {
+		window = inFlightWindow[0]
+	}
+
 	s := &qwpLineSender{
-		tableBuffers:     make(map[string]*qwpTableBuffer),
-		globalSymbols:    make(map[string]int32),
-		sentSchemaHashes: make(map[int64]struct{}),
-		maxSentSymbolId:  -1,
-		batchMaxSymbolId: -1,
-		retryTimeout:     retryTimeout,
-		autoFlushRows:    autoFlushRows,
+		tableBuffers:      make(map[string]*qwpTableBuffer),
+		globalSymbols:     make(map[string]int32),
+		sentSchemaHashes:  make(map[int64]struct{}),
+		maxSentSymbolId:   -1,
+		batchMaxSymbolId:  -1,
+		retryTimeout:      retryTimeout,
+		autoFlushRows:     autoFlushRows,
 		autoFlushInterval: autoFlushInterval,
+		inFlightWindow:    window,
 	}
 
 	if err := s.transport.connect(ctx, address, opts); err != nil {
 		return nil, err
+	}
+
+	// Start async I/O goroutine if window > 1.
+	if window > 1 {
+		s.asyncState = newQwpAsyncState(window, &s.transport)
+		s.asyncState.start()
 	}
 
 	return s, nil
@@ -641,23 +658,87 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 
 	defer s.resetAfterFlush()
 
-	// Encode and send each table buffer that has rows.
+	if s.asyncState != nil {
+		return s.flushAsync(ctx)
+	}
+	return s.flushSync(ctx)
+}
+
+// flushSync sends each table buffer synchronously with retry.
+func (s *qwpLineSender) flushSync(ctx context.Context) error {
 	for _, tb := range s.tableBuffers {
 		if tb.rowCount == 0 {
 			continue
 		}
-
 		if err := s.flushTable(ctx, tb); err != nil {
 			return err
 		}
 	}
 
-	// Update maxSentSymbolId after all tables flushed successfully.
 	if s.batchMaxSymbolId > s.maxSentSymbolId {
 		s.maxSentSymbolId = s.batchMaxSymbolId
 	}
 
 	return nil
+}
+
+// flushAsync encodes each table, acquires a slot, and enqueues
+// the batch for the I/O goroutine to send.
+func (s *qwpLineSender) flushAsync(ctx context.Context) error {
+	// Check for I/O errors before encoding.
+	if err := s.asyncState.checkError(); err != nil {
+		return err
+	}
+
+	for _, tb := range s.tableBuffers {
+		if tb.rowCount == 0 {
+			continue
+		}
+
+		// Encode the table into a batch payload.
+		schemaHash := tb.getSchemaHash()
+		_, schemaKnown := s.sentSchemaHashes[schemaHash]
+
+		mode := qwpSchemaModeFull
+		if schemaKnown {
+			mode = qwpSchemaModeReference
+		}
+		encoded := s.encoder.encodeTableWithDeltaDict(
+			tb,
+			s.globalSymbolList,
+			s.maxSentSymbolId,
+			s.batchMaxSymbolId,
+			mode,
+			schemaHash,
+		)
+
+		// Copy the encoded data since the encoder reuses its buffer.
+		batch := make([]byte, len(encoded))
+		copy(batch, encoded)
+
+		// Acquire a slot in the in-flight window.
+		if err := s.asyncState.acquireSlot(); err != nil {
+			return err
+		}
+
+		// Enqueue the batch for the I/O goroutine.
+		select {
+		case s.asyncState.sendCh <- batch:
+		case <-ctx.Done():
+			s.asyncState.releaseSlot()
+			return ctx.Err()
+		}
+
+		// Optimistically mark schema as sent.
+		s.sentSchemaHashes[schemaHash] = struct{}{}
+	}
+
+	if s.batchMaxSymbolId > s.maxSentSymbolId {
+		s.maxSentSymbolId = s.batchMaxSymbolId
+	}
+
+	// Wait for all in-flight batches to be ACKed before returning.
+	return s.asyncState.waitEmpty()
 }
 
 // flushTable encodes and sends a single table buffer, handling
@@ -725,6 +806,11 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 	var flushErr error
 	if s.pendingRowCount > 0 {
 		flushErr = s.flush0(ctx)
+	}
+
+	// Stop the async I/O goroutine before closing the connection.
+	if s.asyncState != nil {
+		s.asyncState.stop()
 	}
 
 	closeErr := s.transport.close(ctx)

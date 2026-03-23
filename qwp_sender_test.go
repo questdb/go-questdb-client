@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1220,5 +1221,149 @@ func TestQwpSenderServerError(t *testing.T) {
 	}
 	if qErr.Status != qwpWireStatusWriteError {
 		t.Fatalf("status = %d, want %d", qErr.Status, qwpWireStatusWriteError)
+	}
+}
+
+// --- Async sender tests ---
+
+func TestQwpSenderAsyncBasic(t *testing.T) {
+	// Mock server that counts messages.
+	var mu sync.Mutex
+	msgCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			msgCount++
+			mu.Unlock()
+			ack := make([]byte, 9)
+			ack[0] = qwpWireStatusOK
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify async mode is enabled.
+	if s.asyncState == nil {
+		t.Fatal("asyncState should not be nil for window=2")
+	}
+
+	// Send 5 rows.
+	for i := 0; i < 5; i++ {
+		err := s.Table("t").Int64Column("x", int64(i)).AtNow(context.Background())
+		if err != nil {
+			t.Fatalf("AtNow %d: %v", i, err)
+		}
+	}
+
+	// Flush — waits for all batches to be ACKed.
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if s.pendingRowCount != 0 {
+		t.Fatalf("pendingRowCount = %d, want 0", s.pendingRowCount)
+	}
+
+	mu.Lock()
+	if msgCount != 1 {
+		t.Fatalf("server received %d messages, want 1", msgCount)
+	}
+	mu.Unlock()
+
+	// Close cleanly.
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestQwpSenderAsyncMultipleFlushes(t *testing.T) {
+	var mu sync.Mutex
+	msgCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			msgCount++
+			mu.Unlock()
+			ack := make([]byte, 9)
+			ack[0] = qwpWireStatusOK
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+
+	// Flush 1: 2 rows.
+	for i := 0; i < 2; i++ {
+		s.Table("t").Int64Column("x", int64(i)).AtNow(context.Background())
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush 1: %v", err)
+	}
+
+	// Flush 2: 3 rows.
+	for i := 0; i < 3; i++ {
+		s.Table("t").Int64Column("x", int64(i+10)).AtNow(context.Background())
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush 2: %v", err)
+	}
+
+	mu.Lock()
+	if msgCount != 2 {
+		t.Fatalf("server received %d messages, want 2", msgCount)
+	}
+	mu.Unlock()
+}
+
+func TestQwpSenderAsyncCloseAutoFlush(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Add rows but don't flush — Close should auto-flush.
+	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
+	s.Table("t").Int64Column("x", 2).AtNow(context.Background())
+
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

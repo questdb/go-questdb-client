@@ -1,0 +1,414 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2022 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+func TestQwpAsyncAcquireAndRelease(t *testing.T) {
+	a := newQwpAsyncState(2, nil)
+
+	// Should acquire 2 slots without blocking.
+	if err := a.acquireSlot(); err != nil {
+		t.Fatalf("acquire 1: %v", err)
+	}
+	if err := a.acquireSlot(); err != nil {
+		t.Fatalf("acquire 2: %v", err)
+	}
+
+	a.mu.Lock()
+	if a.inFlightCount != 2 {
+		t.Fatalf("inFlightCount = %d, want 2", a.inFlightCount)
+	}
+	a.mu.Unlock()
+
+	// Release one slot.
+	a.releaseSlot()
+
+	a.mu.Lock()
+	if a.inFlightCount != 1 {
+		t.Fatalf("inFlightCount after release = %d, want 1", a.inFlightCount)
+	}
+	a.mu.Unlock()
+
+	// Should be able to acquire one more.
+	if err := a.acquireSlot(); err != nil {
+		t.Fatalf("acquire 3: %v", err)
+	}
+}
+
+func TestQwpAsyncAcquireBlocksAtMax(t *testing.T) {
+	a := newQwpAsyncState(1, nil)
+
+	// Fill the window.
+	if err := a.acquireSlot(); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	// Second acquire should block. Use a goroutine to test.
+	acquired := make(chan struct{})
+	go func() {
+		a.acquireSlot()
+		close(acquired)
+	}()
+
+	// Wait a bit — should NOT have acquired.
+	select {
+	case <-acquired:
+		t.Fatal("acquire should have blocked but didn't")
+	case <-time.After(50 * time.Millisecond):
+		// Good, it's blocked.
+	}
+
+	// Release the slot — should unblock.
+	a.releaseSlot()
+
+	select {
+	case <-acquired:
+		// Good, unblocked.
+	case <-time.After(time.Second):
+		t.Fatal("acquire did not unblock after release")
+	}
+}
+
+func TestQwpAsyncSetErrorUnblocksAcquire(t *testing.T) {
+	a := newQwpAsyncState(1, nil)
+
+	// Fill the window.
+	a.acquireSlot()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- a.acquireSlot()
+	}()
+
+	// Wait for the goroutine to be blocked.
+	time.Sleep(20 * time.Millisecond)
+
+	// Set an error — should unblock with error.
+	testErr := fmt.Errorf("test I/O failure")
+	a.setError(testErr)
+
+	select {
+	case err := <-errCh:
+		if err != testErr {
+			t.Fatalf("acquire returned wrong error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acquire did not unblock after setError")
+	}
+}
+
+func TestQwpAsyncWaitEmpty(t *testing.T) {
+	a := newQwpAsyncState(3, nil)
+
+	// Acquire 3 slots.
+	a.acquireSlot()
+	a.acquireSlot()
+	a.acquireSlot()
+
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- a.waitEmpty()
+	}()
+
+	// Should still be waiting.
+	select {
+	case <-doneCh:
+		t.Fatal("waitEmpty should be blocking")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Release 2 — still 1 in flight.
+	a.releaseSlot()
+	a.releaseSlot()
+
+	select {
+	case <-doneCh:
+		t.Fatal("waitEmpty should still be blocking with 1 in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Release last.
+	a.releaseSlot()
+
+	select {
+	case err := <-doneCh:
+		if err != nil {
+			t.Fatalf("waitEmpty: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitEmpty did not return after all released")
+	}
+}
+
+func TestQwpAsyncWaitEmptyWithError(t *testing.T) {
+	a := newQwpAsyncState(2, nil)
+
+	a.acquireSlot()
+
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- a.waitEmpty()
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	testErr := fmt.Errorf("transport error")
+	a.setError(testErr)
+
+	select {
+	case err := <-doneCh:
+		if err != testErr {
+			t.Fatalf("waitEmpty returned wrong error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitEmpty did not return after setError")
+	}
+}
+
+func TestQwpAsyncCheckError(t *testing.T) {
+	a := newQwpAsyncState(2, nil)
+
+	if err := a.checkError(); err != nil {
+		t.Fatalf("checkError on fresh state: %v", err)
+	}
+
+	testErr := fmt.Errorf("some error")
+	a.setError(testErr)
+
+	if err := a.checkError(); err != testErr {
+		t.Fatalf("checkError = %v, want %v", err, testErr)
+	}
+
+	// Second setError should not overwrite.
+	a.setError(fmt.Errorf("second error"))
+	if err := a.checkError(); err != testErr {
+		t.Fatalf("checkError after second setError = %v, want %v", err, testErr)
+	}
+}
+
+func TestQwpAsyncMarkStopped(t *testing.T) {
+	a := newQwpAsyncState(1, nil)
+
+	// Fill window.
+	a.acquireSlot()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- a.acquireSlot()
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	a.markStopped()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected error after markStopped")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acquire did not unblock after markStopped")
+	}
+}
+
+func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
+	// Mock WebSocket server that ACKs each message.
+	var received [][]byte
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, data, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			received = append(received, data)
+			mu.Unlock()
+			ack := make([]byte, 9)
+			ack[0] = qwpWireStatusOK
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	}))
+	defer srv.Close()
+
+	// Create transport and connect.
+	var transport qwpTransport
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.close(context.Background())
+
+	// Create async state with window=2.
+	a := newQwpAsyncState(2, &transport)
+	a.start()
+
+	// Send 3 batches through the I/O loop.
+	for i := 0; i < 3; i++ {
+		if err := a.acquireSlot(); err != nil {
+			t.Fatalf("acquireSlot %d: %v", i, err)
+		}
+		a.sendCh <- []byte{byte(i + 1), byte(i + 2)}
+	}
+
+	// Wait for all in-flight to be ACKed.
+	if err := a.waitEmpty(); err != nil {
+		t.Fatalf("waitEmpty: %v", err)
+	}
+
+	// Stop the I/O goroutine.
+	a.stop()
+
+	// Verify all 3 batches were received.
+	mu.Lock()
+	if len(received) != 3 {
+		t.Fatalf("received %d batches, want 3", len(received))
+	}
+	mu.Unlock()
+
+	// Verify no error.
+	if err := a.checkError(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQwpAsyncIoLoopServerError(t *testing.T) {
+	// Mock server that returns an error ACK on the second message.
+	msgCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			msgCount++
+			if msgCount == 2 {
+				// Return error ACK.
+				errMsg := "bad batch"
+				ack := make([]byte, 3+len(errMsg))
+				ack[0] = qwpWireStatusWriteError
+				ack[1] = byte(len(errMsg))
+				ack[2] = 0
+				copy(ack[3:], errMsg)
+				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			} else {
+				ack := make([]byte, 9)
+				ack[0] = qwpWireStatusOK
+				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			}
+		}
+	}))
+	defer srv.Close()
+
+	var transport qwpTransport
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.close(context.Background())
+
+	a := newQwpAsyncState(2, &transport)
+	a.start()
+
+	// Send first batch (will succeed).
+	a.acquireSlot()
+	a.sendCh <- []byte{0x01}
+
+	// Give the I/O loop time to process.
+	time.Sleep(20 * time.Millisecond)
+
+	// Send second batch (will fail).
+	a.acquireSlot()
+	a.sendCh <- []byte{0x02}
+
+	// Wait for error to propagate.
+	a.stop()
+
+	err := a.checkError()
+	if err == nil {
+		t.Fatal("expected error from server")
+	}
+	qErr, ok := err.(*QwpError)
+	if !ok {
+		t.Fatalf("expected *QwpError, got %T: %v", err, err)
+	}
+	if qErr.Status != qwpWireStatusWriteError {
+		t.Fatalf("status = %d, want %d", qErr.Status, qwpWireStatusWriteError)
+	}
+}
+
+func TestQwpAsyncConcurrentAcquireRelease(t *testing.T) {
+	a := newQwpAsyncState(4, nil)
+
+	var wg sync.WaitGroup
+	const goroutines = 8
+	const iterations = 100
+
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				if err := a.acquireSlot(); err != nil {
+					return
+				}
+				a.releaseSlot()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	a.mu.Lock()
+	if a.inFlightCount != 0 {
+		t.Fatalf("inFlightCount = %d, want 0", a.inFlightCount)
+	}
+	a.mu.Unlock()
+}
