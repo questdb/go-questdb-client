@@ -78,6 +78,17 @@ type qwpColumnBuffer struct {
 	// (TYPE_SYMBOL only). Null rows use -1 as sentinel.
 	symbolIDs []int32
 
+	// arrayOffsets and arrayData store variable-width N-dimensional
+	// array data (TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY). arrayOffsets
+	// has rowCount+1 entries with arrayOffsets[0]==0. Row i's encoded
+	// data spans arrayData[arrayOffsets[i]:arrayOffsets[i+1]].
+	// Each row's encoded data contains:
+	//   nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+	//   elements (product(shape) × 8 bytes LE).
+	// Null arrays are encoded as nDims=1, dim0=0 (5 bytes total).
+	arrayOffsets []uint32
+	arrayData    []byte
+
 	// nullBitmap has one bit per row for nullable columns only.
 	// A set bit means the row is NULL, LSB-first within each byte.
 	// May be shorter than (rowCount+7)/8 when trailing rows are
@@ -108,8 +119,11 @@ func newQwpColumnBuffer(name string, typeCode qwpTypeCode, nullable bool) *qwpCo
 		scale:            -1,
 		geohashPrecision: -1,
 	}
-	if typeCode == qwpTypeString || typeCode == qwpTypeVarchar {
+	switch typeCode {
+	case qwpTypeString, qwpTypeVarchar:
 		c.strOffsets = []uint32{0}
+	case qwpTypeDoubleArray, qwpTypeLongArray:
+		c.arrayOffsets = []uint32{0}
 	}
 	return c
 }
@@ -272,6 +286,74 @@ func (c *qwpColumnBuffer) addLong256(l0, l1, l2, l3 uint64) {
 	c.rowCount++
 }
 
+// addDoubleArray appends an N-dimensional float64 array value
+// (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
+//
+//	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+//	elements (product(shape) × 8 bytes LE, row-major order).
+func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []float64) {
+	metaSize := 1 + int(nDims)*4
+	dataSize := len(flatData) * 8
+	totalSize := metaSize + dataSize
+
+	off := len(c.arrayData)
+	c.arrayData = append(c.arrayData, make([]byte, totalSize)...)
+	buf := c.arrayData[off:]
+
+	// nDims
+	buf[0] = nDims
+	pos := 1
+
+	// shape: each dimension as uint32 LE
+	for i := 0; i < int(nDims); i++ {
+		binary.LittleEndian.PutUint32(buf[pos:], uint32(shape[i]))
+		pos += 4
+	}
+
+	// flattened elements: each float64 LE
+	for _, v := range flatData {
+		binary.LittleEndian.PutUint64(buf[pos:], math.Float64bits(v))
+		pos += 8
+	}
+
+	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+	c.rowCount++
+}
+
+// addLongArray appends an N-dimensional int64 array value
+// (TYPE_LONG_ARRAY). The encoded data is stored as:
+//
+//	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+//	elements (product(shape) × 8 bytes LE, row-major order).
+func (c *qwpColumnBuffer) addLongArray(nDims uint8, shape []int32, flatData []int64) {
+	metaSize := 1 + int(nDims)*4
+	dataSize := len(flatData) * 8
+	totalSize := metaSize + dataSize
+
+	off := len(c.arrayData)
+	c.arrayData = append(c.arrayData, make([]byte, totalSize)...)
+	buf := c.arrayData[off:]
+
+	// nDims
+	buf[0] = nDims
+	pos := 1
+
+	// shape: each dimension as uint32 LE
+	for i := 0; i < int(nDims); i++ {
+		binary.LittleEndian.PutUint32(buf[pos:], uint32(shape[i]))
+		pos += 4
+	}
+
+	// flattened elements: each int64 LE
+	for _, v := range flatData {
+		binary.LittleEndian.PutUint64(buf[pos:], uint64(v))
+		pos += 8
+	}
+
+	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+	c.rowCount++
+}
+
 // addNull appends a type-appropriate null sentinel value. For
 // nullable columns, the corresponding null bitmap bit is also set.
 // Sentinel values match the QuestDB conventions:
@@ -331,6 +413,14 @@ func (c *qwpColumnBuffer) addNull() {
 		c.appendU64(qwpLongNull)
 		c.appendU64(qwpLongNull)
 
+	case qwpTypeDoubleArray, qwpTypeLongArray:
+		// Null array sentinel: nDims=1, dim0=0 (5 bytes total).
+		off := len(c.arrayData)
+		c.arrayData = append(c.arrayData, 0, 0, 0, 0, 0)
+		c.arrayData[off] = 0x01 // nDims = 1
+		// dim0 = 0 (already zero from append)
+		c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+
 	case qwpTypeGeohash:
 		// -1 (all bits set) is the QuestDB geohash null sentinel.
 		c.appendU64(math.MaxUint64)
@@ -370,6 +460,13 @@ func (c *qwpColumnBuffer) reset() {
 	}
 	c.strData = c.strData[:0]
 	c.symbolIDs = c.symbolIDs[:0]
+	if c.typeCode == qwpTypeDoubleArray || c.typeCode == qwpTypeLongArray {
+		c.arrayOffsets = c.arrayOffsets[:1]
+		c.arrayOffsets[0] = 0
+	} else {
+		c.arrayOffsets = c.arrayOffsets[:0]
+	}
+	c.arrayData = c.arrayData[:0]
 	c.nullBitmap = c.nullBitmap[:0]
 	c.nullCount = 0
 	c.rowCount = 0
@@ -399,6 +496,10 @@ func (c *qwpColumnBuffer) truncateTo(n int) {
 
 	case qwpTypeSymbol:
 		c.symbolIDs = c.symbolIDs[:n]
+
+	case qwpTypeDoubleArray, qwpTypeLongArray:
+		c.arrayOffsets = c.arrayOffsets[:n+1]
+		c.arrayData = c.arrayData[:c.arrayOffsets[n]]
 
 	default:
 		// Fixed-width types.

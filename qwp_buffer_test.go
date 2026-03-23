@@ -1261,3 +1261,560 @@ func TestQwpTableBufferSchemaHash(t *testing.T) {
 		}
 	})
 }
+
+// --- array column buffer tests ---
+
+func TestQwpColumnBufferDoubleArray1D(t *testing.T) {
+	c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+	c.addDoubleArray(1, []int32{3}, []float64{1.0, 2.0, 3.0})
+
+	if c.rowCount != 1 {
+		t.Fatalf("rowCount = %d, want 1", c.rowCount)
+	}
+	if c.fixedSize != -1 {
+		t.Fatalf("fixedSize = %d, want -1", c.fixedSize)
+	}
+	// Offsets: [0, 29] → 1 + 4 + 3*8 = 29 bytes
+	if len(c.arrayOffsets) != 2 {
+		t.Fatalf("arrayOffsets len = %d, want 2", len(c.arrayOffsets))
+	}
+	if c.arrayOffsets[0] != 0 || c.arrayOffsets[1] != 29 {
+		t.Fatalf("arrayOffsets = %v, want [0 29]", c.arrayOffsets)
+	}
+
+	data := c.arrayData
+	if len(data) != 29 {
+		t.Fatalf("arrayData len = %d, want 29", len(data))
+	}
+
+	// nDims = 1
+	if data[0] != 0x01 {
+		t.Fatalf("nDims = 0x%02X, want 0x01", data[0])
+	}
+	// shape[0] = 3 LE
+	dim0 := binary.LittleEndian.Uint32(data[1:5])
+	if dim0 != 3 {
+		t.Fatalf("shape[0] = %d, want 3", dim0)
+	}
+	// elements: 1.0, 2.0, 3.0
+	for i, want := range []float64{1.0, 2.0, 3.0} {
+		off := 5 + i*8
+		got := math.Float64frombits(binary.LittleEndian.Uint64(data[off : off+8]))
+		if got != want {
+			t.Fatalf("element[%d] = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestQwpColumnBufferDoubleArray2D(t *testing.T) {
+	c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+	// 2×3 array, row-major: [1,2,3,4,5,6]
+	c.addDoubleArray(2, []int32{2, 3}, []float64{1, 2, 3, 4, 5, 6})
+
+	// Size: 1 + 2*4 + 6*8 = 1 + 8 + 48 = 57
+	if len(c.arrayData) != 57 {
+		t.Fatalf("arrayData len = %d, want 57", len(c.arrayData))
+	}
+
+	data := c.arrayData
+	if data[0] != 0x02 {
+		t.Fatalf("nDims = %d, want 2", data[0])
+	}
+	if binary.LittleEndian.Uint32(data[1:5]) != 2 {
+		t.Fatalf("shape[0] = %d, want 2", binary.LittleEndian.Uint32(data[1:5]))
+	}
+	if binary.LittleEndian.Uint32(data[5:9]) != 3 {
+		t.Fatalf("shape[1] = %d, want 3", binary.LittleEndian.Uint32(data[5:9]))
+	}
+
+	// Verify all 6 elements
+	for i := 0; i < 6; i++ {
+		off := 9 + i*8
+		got := math.Float64frombits(binary.LittleEndian.Uint64(data[off : off+8]))
+		if got != float64(i+1) {
+			t.Fatalf("element[%d] = %v, want %v", i, got, float64(i+1))
+		}
+	}
+
+	if c.arrayOffsets[0] != 0 || c.arrayOffsets[1] != 57 {
+		t.Fatalf("arrayOffsets = %v, want [0 57]", c.arrayOffsets)
+	}
+}
+
+func TestQwpColumnBufferDoubleArray3D(t *testing.T) {
+	c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+	// 2×2×2 array
+	flat := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+	c.addDoubleArray(3, []int32{2, 2, 2}, flat)
+
+	// Size: 1 + 3*4 + 8*8 = 1 + 12 + 64 = 77
+	if len(c.arrayData) != 77 {
+		t.Fatalf("arrayData len = %d, want 77", len(c.arrayData))
+	}
+
+	data := c.arrayData
+	if data[0] != 0x03 {
+		t.Fatalf("nDims = %d, want 3", data[0])
+	}
+	for d := 0; d < 3; d++ {
+		off := 1 + d*4
+		dim := binary.LittleEndian.Uint32(data[off : off+4])
+		if dim != 2 {
+			t.Fatalf("shape[%d] = %d, want 2", d, dim)
+		}
+	}
+}
+
+func TestQwpColumnBufferLongArray1D(t *testing.T) {
+	c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
+	c.addLongArray(1, []int32{4}, []int64{10, 20, 30, 40})
+
+	if c.rowCount != 1 {
+		t.Fatalf("rowCount = %d, want 1", c.rowCount)
+	}
+	// Size: 1 + 4 + 4*8 = 37
+	if len(c.arrayData) != 37 {
+		t.Fatalf("arrayData len = %d, want 37", len(c.arrayData))
+	}
+
+	data := c.arrayData
+	if data[0] != 0x01 {
+		t.Fatalf("nDims = 0x%02X, want 0x01", data[0])
+	}
+	dim0 := binary.LittleEndian.Uint32(data[1:5])
+	if dim0 != 4 {
+		t.Fatalf("shape[0] = %d, want 4", dim0)
+	}
+
+	for i, want := range []int64{10, 20, 30, 40} {
+		off := 5 + i*8
+		got := int64(binary.LittleEndian.Uint64(data[off : off+8]))
+		if got != want {
+			t.Fatalf("element[%d] = %d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestQwpColumnBufferLongArray2D(t *testing.T) {
+	c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
+	// 3×2 array
+	c.addLongArray(2, []int32{3, 2}, []int64{100, 200, 300, 400, 500, 600})
+
+	// Size: 1 + 2*4 + 6*8 = 57
+	if len(c.arrayData) != 57 {
+		t.Fatalf("arrayData len = %d, want 57", len(c.arrayData))
+	}
+
+	data := c.arrayData
+	if data[0] != 0x02 {
+		t.Fatalf("nDims = %d, want 2", data[0])
+	}
+	if binary.LittleEndian.Uint32(data[1:5]) != 3 {
+		t.Fatalf("shape[0] = %d, want 3", binary.LittleEndian.Uint32(data[1:5]))
+	}
+	if binary.LittleEndian.Uint32(data[5:9]) != 2 {
+		t.Fatalf("shape[1] = %d, want 2", binary.LittleEndian.Uint32(data[5:9]))
+	}
+}
+
+func TestQwpColumnBufferArrayMultipleRows(t *testing.T) {
+	c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+
+	// Row 0: 1D with 2 elements → 1 + 4 + 2*8 = 21 bytes
+	c.addDoubleArray(1, []int32{2}, []float64{1.5, 2.5})
+	// Row 1: 1D with 3 elements → 1 + 4 + 3*8 = 29 bytes
+	c.addDoubleArray(1, []int32{3}, []float64{10, 20, 30})
+
+	if c.rowCount != 2 {
+		t.Fatalf("rowCount = %d, want 2", c.rowCount)
+	}
+
+	expectedOffsets := []uint32{0, 21, 50}
+	if len(c.arrayOffsets) != 3 {
+		t.Fatalf("arrayOffsets len = %d, want 3", len(c.arrayOffsets))
+	}
+	for i, want := range expectedOffsets {
+		if c.arrayOffsets[i] != want {
+			t.Fatalf("arrayOffsets[%d] = %d, want %d", i, c.arrayOffsets[i], want)
+		}
+	}
+
+	// Verify row 0's first element
+	row0Data := c.arrayData[c.arrayOffsets[0]:c.arrayOffsets[1]]
+	elem0 := math.Float64frombits(binary.LittleEndian.Uint64(row0Data[5:13]))
+	if elem0 != 1.5 {
+		t.Fatalf("row0 elem[0] = %v, want 1.5", elem0)
+	}
+
+	// Verify row 1's first element
+	row1Data := c.arrayData[c.arrayOffsets[1]:c.arrayOffsets[2]]
+	elem1 := math.Float64frombits(binary.LittleEndian.Uint64(row1Data[5:13]))
+	if elem1 != 10 {
+		t.Fatalf("row1 elem[0] = %v, want 10", elem1)
+	}
+}
+
+func TestQwpColumnBufferArrayEmpty(t *testing.T) {
+	// A 1D array with 0 elements (not null, but empty).
+	c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+	c.addDoubleArray(1, []int32{0}, nil)
+
+	// Size: 1 + 4 + 0 = 5 bytes
+	if len(c.arrayData) != 5 {
+		t.Fatalf("arrayData len = %d, want 5", len(c.arrayData))
+	}
+	if c.arrayData[0] != 0x01 {
+		t.Fatalf("nDims = %d, want 1", c.arrayData[0])
+	}
+	dim0 := binary.LittleEndian.Uint32(c.arrayData[1:5])
+	if dim0 != 0 {
+		t.Fatalf("shape[0] = %d, want 0", dim0)
+	}
+}
+
+func TestQwpColumnBufferArrayNull(t *testing.T) {
+	t.Run("DoubleArrayNullable", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
+		c.addNull()
+
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+		if c.nullCount != 1 {
+			t.Fatalf("nullCount = %d, want 1", c.nullCount)
+		}
+		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
+			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
+		}
+
+		// Null sentinel: nDims=1, dim0=0 → 5 bytes
+		if len(c.arrayData) != 5 {
+			t.Fatalf("arrayData len = %d, want 5", len(c.arrayData))
+		}
+		if c.arrayData[0] != 0x01 {
+			t.Fatalf("null sentinel nDims = %d, want 1", c.arrayData[0])
+		}
+		dim0 := binary.LittleEndian.Uint32(c.arrayData[1:5])
+		if dim0 != 0 {
+			t.Fatalf("null sentinel dim0 = %d, want 0", dim0)
+		}
+
+		expectedOffsets := []uint32{0, 5}
+		for i, want := range expectedOffsets {
+			if c.arrayOffsets[i] != want {
+				t.Fatalf("arrayOffsets[%d] = %d, want %d", i, c.arrayOffsets[i], want)
+			}
+		}
+	})
+
+	t.Run("LongArrayNullable", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLongArray, true)
+		c.addNull()
+
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+		if c.nullCount != 1 {
+			t.Fatalf("nullCount = %d, want 1", c.nullCount)
+		}
+		if len(c.arrayData) != 5 {
+			t.Fatalf("arrayData len = %d, want 5", len(c.arrayData))
+		}
+	})
+
+	t.Run("InterleavedNullAndData", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
+		c.addDoubleArray(1, []int32{2}, []float64{1.0, 2.0}) // row 0: 21 bytes
+		c.addNull()                                            // row 1: 5 bytes
+		c.addDoubleArray(1, []int32{1}, []float64{3.0})       // row 2: 13 bytes
+
+		if c.rowCount != 3 {
+			t.Fatalf("rowCount = %d, want 3", c.rowCount)
+		}
+		if c.nullCount != 1 {
+			t.Fatalf("nullCount = %d, want 1", c.nullCount)
+		}
+
+		// Bitmap: row 1 null → bit 1 → 0x02
+		if !bytes.Equal(c.nullBitmap, []byte{0x02}) {
+			t.Fatalf("nullBitmap = %x, want [02]", c.nullBitmap)
+		}
+
+		expectedOffsets := []uint32{0, 21, 26, 39}
+		if len(c.arrayOffsets) != 4 {
+			t.Fatalf("arrayOffsets len = %d, want 4", len(c.arrayOffsets))
+		}
+		for i, want := range expectedOffsets {
+			if c.arrayOffsets[i] != want {
+				t.Fatalf("arrayOffsets[%d] = %d, want %d", i, c.arrayOffsets[i], want)
+			}
+		}
+	})
+}
+
+func TestQwpColumnBufferArrayReset(t *testing.T) {
+	c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
+	c.addDoubleArray(1, []int32{2}, []float64{1.0, 2.0})
+	c.addNull()
+
+	origArrayDataCap := cap(c.arrayData)
+	c.reset()
+
+	if c.rowCount != 0 {
+		t.Fatalf("rowCount = %d, want 0", c.rowCount)
+	}
+	if c.nullCount != 0 {
+		t.Fatalf("nullCount = %d, want 0", c.nullCount)
+	}
+	if len(c.arrayData) != 0 {
+		t.Fatalf("arrayData len = %d, want 0", len(c.arrayData))
+	}
+	if len(c.arrayOffsets) != 1 || c.arrayOffsets[0] != 0 {
+		t.Fatalf("arrayOffsets = %v, want [0]", c.arrayOffsets)
+	}
+	if len(c.nullBitmap) != 0 {
+		t.Fatalf("nullBitmap len = %d, want 0", len(c.nullBitmap))
+	}
+	// Capacity retained.
+	if cap(c.arrayData) != origArrayDataCap {
+		t.Fatalf("arrayData cap changed from %d to %d", origArrayDataCap, cap(c.arrayData))
+	}
+
+	// Reuse after reset.
+	c.addDoubleArray(1, []int32{1}, []float64{42.0})
+	if c.rowCount != 1 {
+		t.Fatalf("after reuse: rowCount = %d, want 1", c.rowCount)
+	}
+	if len(c.arrayOffsets) != 2 {
+		t.Fatalf("after reuse: arrayOffsets len = %d, want 2", len(c.arrayOffsets))
+	}
+}
+
+func TestQwpColumnBufferArrayTruncateTo(t *testing.T) {
+	t.Run("TruncateMiddle", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+		c.addDoubleArray(1, []int32{2}, []float64{1.0, 2.0}) // row 0: 21 bytes
+		c.addDoubleArray(1, []int32{3}, []float64{3, 4, 5})   // row 1: 29 bytes
+		c.addDoubleArray(1, []int32{1}, []float64{6.0})       // row 2: 13 bytes
+
+		c.truncateTo(2)
+
+		if c.rowCount != 2 {
+			t.Fatalf("rowCount = %d, want 2", c.rowCount)
+		}
+		// Offsets: [0, 21, 50]
+		expectedOffsets := []uint32{0, 21, 50}
+		if len(c.arrayOffsets) != 3 {
+			t.Fatalf("arrayOffsets len = %d, want 3", len(c.arrayOffsets))
+		}
+		for i, want := range expectedOffsets {
+			if c.arrayOffsets[i] != want {
+				t.Fatalf("arrayOffsets[%d] = %d, want %d", i, c.arrayOffsets[i], want)
+			}
+		}
+		if len(c.arrayData) != 50 {
+			t.Fatalf("arrayData len = %d, want 50", len(c.arrayData))
+		}
+	})
+
+	t.Run("TruncateToZero", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
+		c.addLongArray(1, []int32{2}, []int64{10, 20})
+
+		c.truncateTo(0)
+
+		if c.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0", c.rowCount)
+		}
+		if len(c.arrayOffsets) != 1 || c.arrayOffsets[0] != 0 {
+			t.Fatalf("arrayOffsets = %v, want [0]", c.arrayOffsets)
+		}
+		if len(c.arrayData) != 0 {
+			t.Fatalf("arrayData len = %d, want 0", len(c.arrayData))
+		}
+	})
+
+	t.Run("TruncateWithNulls", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
+		c.addDoubleArray(1, []int32{1}, []float64{1.0}) // row 0: 13 bytes
+		c.addNull()                                       // row 1: 5 bytes (null)
+		c.addDoubleArray(1, []int32{1}, []float64{2.0}) // row 2: 13 bytes
+
+		c.truncateTo(2)
+
+		if c.rowCount != 2 {
+			t.Fatalf("rowCount = %d, want 2", c.rowCount)
+		}
+		if c.nullCount != 1 {
+			t.Fatalf("nullCount = %d, want 1", c.nullCount)
+		}
+		if !bytes.Equal(c.nullBitmap, []byte{0x02}) {
+			t.Fatalf("nullBitmap = %x, want [02]", c.nullBitmap)
+		}
+		expectedOffsets := []uint32{0, 13, 18}
+		for i, want := range expectedOffsets {
+			if c.arrayOffsets[i] != want {
+				t.Fatalf("arrayOffsets[%d] = %d, want %d", i, c.arrayOffsets[i], want)
+			}
+		}
+	})
+
+	t.Run("NoOp", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+		c.addDoubleArray(1, []int32{1}, []float64{42.0})
+
+		c.truncateTo(5) // n >= rowCount
+
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+	})
+}
+
+func TestQwpColumnBufferArrayGoldenBytes(t *testing.T) {
+	// Golden byte test: 1D double array [1.5, -2.5]
+	c := newQwpColumnBuffer("vals", qwpTypeDoubleArray, false)
+	c.addDoubleArray(1, []int32{2}, []float64{1.5, -2.5})
+
+	expected := []byte{
+		0x01,                   // nDims = 1
+		0x02, 0x00, 0x00, 0x00, // shape[0] = 2 (uint32 LE)
+	}
+	// element 0: float64(1.5) LE
+	e0 := make([]byte, 8)
+	binary.LittleEndian.PutUint64(e0, math.Float64bits(1.5))
+	expected = append(expected, e0...)
+	// element 1: float64(-2.5) LE
+	e1 := make([]byte, 8)
+	binary.LittleEndian.PutUint64(e1, math.Float64bits(-2.5))
+	expected = append(expected, e1...)
+
+	if !bytes.Equal(c.arrayData, expected) {
+		t.Fatalf("arrayData = %x\nwant      = %x", c.arrayData, expected)
+	}
+}
+
+func TestQwpColumnBufferArrayConstructor(t *testing.T) {
+	t.Run("DoubleArray", func(t *testing.T) {
+		c := newQwpColumnBuffer("arr", qwpTypeDoubleArray, false)
+		if c.fixedSize != -1 {
+			t.Fatalf("fixedSize = %d, want -1", c.fixedSize)
+		}
+		if len(c.arrayOffsets) != 1 || c.arrayOffsets[0] != 0 {
+			t.Fatalf("arrayOffsets = %v, want [0]", c.arrayOffsets)
+		}
+		// strOffsets should NOT be initialized for array types.
+		if len(c.strOffsets) != 0 {
+			t.Fatalf("strOffsets len = %d, want 0", len(c.strOffsets))
+		}
+	})
+
+	t.Run("LongArray", func(t *testing.T) {
+		c := newQwpColumnBuffer("arr", qwpTypeLongArray, true)
+		if c.fixedSize != -1 {
+			t.Fatalf("fixedSize = %d, want -1", c.fixedSize)
+		}
+		if len(c.arrayOffsets) != 1 || c.arrayOffsets[0] != 0 {
+			t.Fatalf("arrayOffsets = %v, want [0]", c.arrayOffsets)
+		}
+		if !c.nullable {
+			t.Fatal("nullable should be true")
+		}
+	})
+}
+
+func TestQwpTableBufferArrayGapFill(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+
+	// Row 0: set both columns.
+	colA, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+	colA.addLong(100)
+	colArr, _ := tb.getOrCreateColumn("arr", qwpTypeDoubleArray, true)
+	colArr.addDoubleArray(1, []int32{2}, []float64{1.0, 2.0})
+	tb.commitRow()
+
+	// Row 1: set only "a" → "arr" should be gap-filled with null.
+	colA, _ = tb.getOrCreateColumn("a", qwpTypeLong, false)
+	colA.addLong(200)
+	tb.commitRow()
+
+	if colArr.rowCount != 2 {
+		t.Fatalf("arr rowCount = %d, want 2", colArr.rowCount)
+	}
+	if colArr.nullCount != 1 {
+		t.Fatalf("arr nullCount = %d, want 1", colArr.nullCount)
+	}
+
+	// Row 1's data should be the null sentinel (5 bytes).
+	row1Data := colArr.arrayData[colArr.arrayOffsets[1]:colArr.arrayOffsets[2]]
+	if len(row1Data) != 5 {
+		t.Fatalf("gap-filled row data len = %d, want 5", len(row1Data))
+	}
+	if row1Data[0] != 0x01 {
+		t.Fatalf("gap-filled nDims = %d, want 1", row1Data[0])
+	}
+	dim0 := binary.LittleEndian.Uint32(row1Data[1:5])
+	if dim0 != 0 {
+		t.Fatalf("gap-filled dim0 = %d, want 0", dim0)
+	}
+}
+
+func TestQwpTableBufferArrayCancelRow(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+
+	// Row 0: commit with array.
+	colArr, _ := tb.getOrCreateColumn("arr", qwpTypeDoubleArray, false)
+	colArr.addDoubleArray(1, []int32{2}, []float64{1.0, 2.0})
+	tb.commitRow()
+
+	// Start row 1, then cancel.
+	colArr, _ = tb.getOrCreateColumn("arr", qwpTypeDoubleArray, false)
+	colArr.addDoubleArray(1, []int32{3}, []float64{3, 4, 5})
+	tb.cancelRow()
+
+	if tb.rowCount != 1 {
+		t.Fatalf("rowCount = %d, want 1", tb.rowCount)
+	}
+	if colArr.rowCount != 1 {
+		t.Fatalf("col rowCount = %d, want 1", colArr.rowCount)
+	}
+	// Only row 0's data should remain (21 bytes).
+	if len(colArr.arrayData) != 21 {
+		t.Fatalf("arrayData len = %d, want 21", len(colArr.arrayData))
+	}
+	if len(colArr.arrayOffsets) != 2 {
+		t.Fatalf("arrayOffsets len = %d, want 2", len(colArr.arrayOffsets))
+	}
+}
+
+func TestQwpColumnBufferArrayWireTypeCode(t *testing.T) {
+	t.Run("DoubleArrayNonNullable", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+		if c.wireTypeCode() != 0x11 {
+			t.Fatalf("wireTypeCode = 0x%02X, want 0x11", c.wireTypeCode())
+		}
+	})
+
+	t.Run("DoubleArrayNullable", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
+		// 0x11 | 0x80 = 0x91
+		if c.wireTypeCode() != 0x91 {
+			t.Fatalf("wireTypeCode = 0x%02X, want 0x91", c.wireTypeCode())
+		}
+	})
+
+	t.Run("LongArrayNonNullable", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
+		if c.wireTypeCode() != 0x12 {
+			t.Fatalf("wireTypeCode = 0x%02X, want 0x12", c.wireTypeCode())
+		}
+	})
+
+	t.Run("LongArrayNullable", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLongArray, true)
+		// 0x12 | 0x80 = 0x92
+		if c.wireTypeCode() != 0x92 {
+			t.Fatalf("wireTypeCode = 0x%02X, want 0x92", c.wireTypeCode())
+		}
+	})
+}
