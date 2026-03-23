@@ -70,23 +70,23 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			senderConf.address = v
 		case "username":
 			switch senderConf.senderType {
-			case httpSenderType:
+			case httpSenderType, qwpSenderType:
 				senderConf.httpUser = v
-			case tcpSenderType, qwpSenderType:
+			case tcpSenderType:
 				senderConf.tcpKeyId = v
 			default:
 				panic("add a case for " + k)
 			}
 		case "password":
-			if senderConf.senderType != httpSenderType {
-				return nil, NewInvalidConfigStrError("%s is only supported for HTTP sender", k)
+			if senderConf.senderType != httpSenderType && senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for HTTP and QWP senders", k)
 			}
 			senderConf.httpPass = v
 		case "token":
 			switch senderConf.senderType {
-			case httpSenderType:
+			case httpSenderType, qwpSenderType:
 				senderConf.httpToken = v
-			case tcpSenderType, qwpSenderType:
+			case tcpSenderType:
 				senderConf.tcpKey = v
 			default:
 				panic("add a case for " + k)

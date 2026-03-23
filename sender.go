@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math/big"
@@ -764,12 +765,9 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.maxBufSize != 0 {
 		return errors.New("maxBufferSize setting is not available in the QWP client")
 	}
-	// QWP does not support HTTP auth.
-	if conf.httpUser != "" || conf.httpPass != "" {
-		return errors.New("basic auth (httpUser/httpPass) is not available in the QWP client")
-	}
-	if conf.httpToken != "" {
-		return errors.New("bearer token auth (httpToken) is not available in the QWP client; use token for key-based auth")
+	// QWP auth: either Basic (user+pass) or Bearer (token), not both.
+	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
+		return errors.New("both basic and token authentication cannot be used")
 	}
 	if conf.inFlightWindow < 0 {
 		return fmt.Errorf("in-flight window is negative: %d", conf.inFlightWindow)
@@ -805,9 +803,13 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	opts := qwpTransportOpts{
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 	}
-	// QWP uses token-based auth (same key fields as TCP).
-	if conf.tcpKeyId != "" && conf.tcpKey != "" {
-		opts.authorization = conf.tcpKey
+	// QWP auth: Basic (username:password) or Bearer (token).
+	// Matches the Java client's buildWebSocketAuthHeader().
+	if conf.httpUser != "" && conf.httpPass != "" {
+		creds := conf.httpUser + ":" + conf.httpPass
+		opts.authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+	} else if conf.httpToken != "" {
+		opts.authorization = "Bearer " + conf.httpToken
 	}
 
 	window := conf.inFlightWindow

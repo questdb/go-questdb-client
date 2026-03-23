@@ -1651,3 +1651,194 @@ func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestQwpAuthConfigParsing(t *testing.T) {
+	t.Run("bearer_token", func(t *testing.T) {
+		conf, err := confFromStr("ws::addr=localhost:9000;token=my_secret_token;")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if conf.httpToken != "my_secret_token" {
+			t.Fatalf("httpToken = %q, want %q", conf.httpToken, "my_secret_token")
+		}
+	})
+
+	t.Run("basic_auth", func(t *testing.T) {
+		conf, err := confFromStr("ws::addr=localhost:9000;username=admin;password=quest;")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if conf.httpUser != "admin" {
+			t.Fatalf("httpUser = %q, want %q", conf.httpUser, "admin")
+		}
+		if conf.httpPass != "quest" {
+			t.Fatalf("httpPass = %q, want %q", conf.httpPass, "quest")
+		}
+	})
+
+	t.Run("basic_and_token_conflict", func(t *testing.T) {
+		// Validation happens at sender creation, not parsing.
+		_, err := LineSenderFromConf(context.Background(),
+			"ws::addr=localhost:9000;username=admin;password=quest;token=tok;")
+		if err == nil {
+			t.Fatal("expected error for conflicting basic + token auth")
+		}
+		if !strings.Contains(err.Error(), "both basic and token") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestQwpAuthHeaderFormat(t *testing.T) {
+	// Verify the exact Authorization header sent during WebSocket upgrade.
+
+	t.Run("bearer", func(t *testing.T) {
+		var gotAuth string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+				Subprotocols: []string{qwpSubprotocol},
+			})
+			if err != nil {
+				return
+			}
+			defer conn.CloseNow()
+			for {
+				_, _, err := conn.Read(context.Background())
+				if err != nil {
+					return
+				}
+				ack := make([]byte, 9)
+				ack[0] = qwpWireStatusOK
+				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			}
+		}))
+		defer srv.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+		opts := qwpTransportOpts{
+			authorization: "Bearer my_token",
+		}
+		s, err := newQwpLineSender(context.Background(), wsURL, opts, 0, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close(context.Background())
+
+		if gotAuth != "Bearer my_token" {
+			t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer my_token")
+		}
+	})
+
+	t.Run("basic", func(t *testing.T) {
+		var gotAuth string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+				Subprotocols: []string{qwpSubprotocol},
+			})
+			if err != nil {
+				return
+			}
+			defer conn.CloseNow()
+			for {
+				_, _, err := conn.Read(context.Background())
+				if err != nil {
+					return
+				}
+				ack := make([]byte, 9)
+				ack[0] = qwpWireStatusOK
+				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			}
+		}))
+		defer srv.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+		opts := qwpTransportOpts{
+			authorization: "Basic YWRtaW46cXVlc3Q=", // base64("admin:quest")
+		}
+		s, err := newQwpLineSender(context.Background(), wsURL, opts, 0, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close(context.Background())
+
+		if gotAuth != "Basic YWRtaW46cXVlc3Q=" {
+			t.Fatalf("Authorization header = %q, want %q", gotAuth, "Basic YWRtaW46cXVlc3Q=")
+		}
+	})
+
+	t.Run("from_config_bearer", func(t *testing.T) {
+		var gotAuth string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+				Subprotocols: []string{qwpSubprotocol},
+			})
+			if err != nil {
+				return
+			}
+			defer conn.CloseNow()
+			for {
+				_, _, err := conn.Read(context.Background())
+				if err != nil {
+					return
+				}
+				ack := make([]byte, 9)
+				ack[0] = qwpWireStatusOK
+				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			}
+		}))
+		defer srv.Close()
+
+		addr := strings.TrimPrefix(srv.URL, "http://")
+		confStr := fmt.Sprintf("ws::addr=%s;token=secret123;", addr)
+		s, err := LineSenderFromConf(context.Background(), confStr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close(context.Background())
+
+		if gotAuth != "Bearer secret123" {
+			t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer secret123")
+		}
+	})
+
+	t.Run("from_config_basic", func(t *testing.T) {
+		var gotAuth string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+				Subprotocols: []string{qwpSubprotocol},
+			})
+			if err != nil {
+				return
+			}
+			defer conn.CloseNow()
+			for {
+				_, _, err := conn.Read(context.Background())
+				if err != nil {
+					return
+				}
+				ack := make([]byte, 9)
+				ack[0] = qwpWireStatusOK
+				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			}
+		}))
+		defer srv.Close()
+
+		addr := strings.TrimPrefix(srv.URL, "http://")
+		confStr := fmt.Sprintf("ws::addr=%s;username=admin;password=quest;", addr)
+		s, err := LineSenderFromConf(context.Background(), confStr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close(context.Background())
+
+		// base64("admin:quest") = "YWRtaW46cXVlc3Q="
+		want := "Basic YWRtaW46cXVlc3Q="
+		if gotAuth != want {
+			t.Fatalf("Authorization header = %q, want %q", gotAuth, want)
+		}
+	})
+}
