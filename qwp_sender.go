@@ -92,8 +92,16 @@ type qwpLineSender struct {
 	// currentTable is the table buffer for the current in-progress row.
 	currentTable *qwpTableBuffer
 
-	// encoder is the reusable QWP message encoder.
-	encoder qwpEncoder
+	// encoders provides double-buffered QWP message encoders for async
+	// mode. In sync mode, only encoders[0] is used. In async mode, the
+	// two encoders alternate: while one encoder's output is being sent
+	// over the wire, the other can encode the next batch.
+	encoders          [2]qwpEncoder
+	currentEncoderIdx int
+	// encoderReady signals when an encoder's buffer is safe to reuse.
+	// A token is placed after sendMessage completes for that buffer.
+	// In sync mode, these are nil (not used).
+	encoderReady [2]chan struct{}
 
 	// encodeInfoBuf is a reusable scratch slice for buildTableEncodeInfo,
 	// avoiding allocation on every flush.
@@ -166,6 +174,12 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 	if window > 1 {
 		s.asyncState = newQwpAsyncState(window, &s.transport)
 		s.asyncState.start()
+		// Initialize double-buffered encoder ready channels.
+		// Both start with a token (both encoders available).
+		s.encoderReady[0] = make(chan struct{}, 1)
+		s.encoderReady[1] = make(chan struct{}, 1)
+		s.encoderReady[0] <- struct{}{}
+		s.encoderReady[1] <- struct{}{}
 	}
 
 	return s, nil
@@ -714,7 +728,7 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 
 	err := s.transport.sendWithRetry(ctx, s.retryTimeout,
 		func() []byte {
-			return s.encoder.encodeMultiTableWithDeltaDict(
+			return s.encoders[0].encodeMultiTableWithDeltaDict(
 				tables,
 				s.globalSymbolList,
 				s.maxSentSymbolId,
@@ -784,30 +798,42 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 		return nil
 	}
 
+	// Wait for the current encoder to be available (double-buffered).
+	encIdx := s.currentEncoderIdx
+	<-s.encoderReady[encIdx]
+
 	// Encode all tables into a single multi-table message.
-	encoded := s.encoder.encodeMultiTableWithDeltaDict(
+	encoded := s.encoders[encIdx].encodeMultiTableWithDeltaDict(
 		tables,
 		s.globalSymbolList,
 		s.maxSentSymbolId,
 		s.batchMaxSymbolId,
 	)
 
-	// Copy the encoded data since the encoder reuses its buffer.
-	batch := make([]byte, len(encoded))
-	copy(batch, encoded)
-
 	// Acquire a slot in the in-flight window.
 	if err := s.asyncState.acquireSlot(); err != nil {
+		// Return the encoder token since we won't enqueue.
+		s.encoderReady[encIdx] <- struct{}{}
 		return err
 	}
 
-	// Enqueue the batch for the I/O goroutine.
+	// Enqueue the batch with the encoder's ready signal.
+	// No copy needed — the ioLoop signals encoderReady after
+	// sendMessage, at which point the buffer is safe to reuse.
+	batch := qwpAsyncBatch{
+		data:        encoded,
+		readySignal: s.encoderReady[encIdx],
+	}
 	select {
 	case s.asyncState.sendCh <- batch:
 	case <-ctx.Done():
+		s.encoderReady[encIdx] <- struct{}{}
 		s.asyncState.releaseSlot()
 		return ctx.Err()
 	}
+
+	// Swap to the other encoder for the next flush.
+	s.currentEncoderIdx = 1 - s.currentEncoderIdx
 
 	// Capture pending state before waiting.
 	pendingMaxSymbolId := s.batchMaxSymbolId
@@ -860,27 +886,39 @@ func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 		return nil
 	}
 
+	// Wait for the current encoder to be available (double-buffered).
+	encIdx := s.currentEncoderIdx
+	<-s.encoderReady[encIdx]
+
 	// Encode all tables into a single multi-table message.
-	encoded := s.encoder.encodeMultiTableWithDeltaDict(
+	encoded := s.encoders[encIdx].encodeMultiTableWithDeltaDict(
 		tables,
 		s.globalSymbolList,
 		s.maxSentSymbolId,
 		s.batchMaxSymbolId,
 	)
 
-	batch := make([]byte, len(encoded))
-	copy(batch, encoded)
-
 	if err := s.asyncState.acquireSlot(); err != nil {
+		s.encoderReady[encIdx] <- struct{}{}
 		return err
 	}
 
+	// No copy needed — the ioLoop signals encoderReady after
+	// sendMessage, at which point the buffer is safe to reuse.
+	batch := qwpAsyncBatch{
+		data:        encoded,
+		readySignal: s.encoderReady[encIdx],
+	}
 	select {
 	case s.asyncState.sendCh <- batch:
 	case <-ctx.Done():
+		s.encoderReady[encIdx] <- struct{}{}
 		s.asyncState.releaseSlot()
 		return ctx.Err()
 	}
+
+	// Swap to the other encoder for the next flush.
+	s.currentEncoderIdx = 1 - s.currentEncoderIdx
 
 	// Optimistic cache: if the batch fails, ioErr prevents
 	// further operations so stale cache entries are harmless.

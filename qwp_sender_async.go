@@ -35,10 +35,18 @@ import (
 // async QWP mode (in-flight window > 1). It coordinates between the
 // user goroutine (which encodes and enqueues batches) and the I/O
 // goroutine (which sends over WebSocket and processes ACKs).
+// qwpAsyncBatch carries an encoded batch payload and a signal channel
+// to mark the encoder's buffer as reusable after the data is written
+// to the socket.
+type qwpAsyncBatch struct {
+	data        []byte
+	readySignal chan<- struct{} // signaled after sendMessage completes
+}
+
 type qwpAsyncState struct {
 	// sendCh carries encoded batch payloads from the user goroutine
 	// to the I/O goroutine. Buffered to decouple encoding from sending.
-	sendCh chan []byte
+	sendCh chan qwpAsyncBatch
 
 	// mu protects inFlightCount, ioErr, and stopped.
 	mu   sync.Mutex
@@ -83,7 +91,7 @@ type qwpAsyncState struct {
 func newQwpAsyncState(maxWindow int, transport *qwpTransport) *qwpAsyncState {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &qwpAsyncState{
-		sendCh:      make(chan []byte, maxWindow),
+		sendCh:      make(chan qwpAsyncBatch, maxWindow),
 		inFlightMax: maxWindow,
 		done:        make(chan struct{}),
 		ctx:         ctx,
@@ -187,20 +195,37 @@ func (a *qwpAsyncState) ioLoop() {
 	for batch := range a.sendCh {
 		// Send the batch over the WebSocket. Uses the cancellable
 		// context so stop() can unblock this if the server hangs.
-		if err := a.transport.sendMessage(a.ctx, batch); err != nil {
+		if err := a.transport.sendMessage(a.ctx, batch.data); err != nil {
+			// Signal encoder ready even on failure so the user
+			// goroutine doesn't deadlock waiting for the encoder.
+			if batch.readySignal != nil {
+				batch.readySignal <- struct{}{}
+			}
 			a.setError(fmt.Errorf("qwp: async send failed: %w", err))
 			// Drain remaining batches from channel to unblock senders.
-			for range a.sendCh {
+			for b := range a.sendCh {
+				if b.readySignal != nil {
+					b.readySignal <- struct{}{}
+				}
 				a.releaseSlot()
 			}
 			return
+		}
+
+		// Encoder buffer has been written to the socket — safe to
+		// reuse now. Signal before readAck to maximize concurrency.
+		if batch.readySignal != nil {
+			batch.readySignal <- struct{}{}
 		}
 
 		// Read the ACK.
 		status, ackData, err := a.transport.readAck(a.ctx)
 		if err != nil {
 			a.setError(fmt.Errorf("qwp: async ACK read failed: %w", err))
-			for range a.sendCh {
+			for b := range a.sendCh {
+				if b.readySignal != nil {
+					b.readySignal <- struct{}{}
+				}
 				a.releaseSlot()
 			}
 			return
@@ -212,7 +237,10 @@ func (a *qwpAsyncState) ioLoop() {
 				qErr = &QwpError{Status: byte(status), Message: "unknown error"}
 			}
 			a.setError(qErr)
-			for range a.sendCh {
+			for b := range a.sendCh {
+				if b.readySignal != nil {
+					b.readySignal <- struct{}{}
+				}
 				a.releaseSlot()
 			}
 			return

@@ -288,7 +288,7 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 		if err := a.acquireSlot(); err != nil {
 			t.Fatalf("acquireSlot %d: %v", i, err)
 		}
-		a.sendCh <- []byte{byte(i + 1), byte(i + 2)}
+		a.sendCh <- qwpAsyncBatch{data: []byte{byte(i + 1), byte(i + 2)}}
 	}
 
 	// Wait for all in-flight to be ACKed.
@@ -359,14 +359,14 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 
 	// Send first batch (will succeed).
 	a.acquireSlot()
-	a.sendCh <- []byte{0x01}
+	a.sendCh <- qwpAsyncBatch{data: []byte{0x01}}
 
 	// Give the I/O loop time to process.
 	time.Sleep(20 * time.Millisecond)
 
 	// Send second batch (will fail).
 	a.acquireSlot()
-	a.sendCh <- []byte{0x02}
+	a.sendCh <- qwpAsyncBatch{data: []byte{0x02}}
 
 	// Wait for error to propagate.
 	a.stop()
@@ -446,7 +446,7 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 
 	// Send a batch and wait for ACK.
 	a.acquireSlot()
-	a.sendCh <- []byte{0x01}
+	a.sendCh <- qwpAsyncBatch{data: []byte{0x01}}
 	if err := a.waitEmpty(); err != nil {
 		t.Fatalf("waitEmpty: %v", err)
 	}
