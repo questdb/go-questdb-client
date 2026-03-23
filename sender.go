@@ -638,6 +638,8 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, e
 			conf = newLineSenderConfig(httpSenderType)
 		case tcpSenderType:
 			conf = newLineSenderConfig(tcpSenderType)
+		case qwpSenderType:
+			conf = newLineSenderConfig(qwpSenderType)
 		}
 
 		if conf != nil {
@@ -646,7 +648,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, e
 	}
 
 	if tmp.senderType == noSenderType {
-		return nil, errors.New("sender type is not specified: use WithHttp or WithTcp")
+		return nil, errors.New("sender type is not specified: use WithHttp, WithTcp, or WithQwp")
 	}
 
 	for _, opt := range opts {

@@ -225,7 +225,7 @@ func TestErrorWhenSenderTypeIsNotSpecified(t *testing.T) {
 
 	_, err := qdb.NewLineSender(ctx)
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "sender type is not specified: use WithHttp or WithTcp")
+	assert.ErrorContains(t, err, "sender type is not specified: use WithHttp, WithTcp, or WithQwp")
 }
 
 func TestHttpErrorWhenMaxBufferSizeIsReached(t *testing.T) {

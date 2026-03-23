@@ -49,6 +49,9 @@ const qwpLongNull uint64 = 0x8000000000000000
 //   - SYMBOL: symbolIDs (global dictionary IDs)
 //
 // For nullable columns, a null bitmap tracks which rows are NULL.
+// Data arrays contain only valueCount = rowCount - nullCount entries
+// (non-null values only). For non-nullable columns, data arrays
+// contain rowCount entries (sentinel values for null rows).
 type qwpColumnBuffer struct {
 	name     string
 	typeCode qwpTypeCode // base type code (without nullable flag)
@@ -58,8 +61,9 @@ type qwpColumnBuffer struct {
 	// 0 for BOOLEAN (bit-packed), or -1 for variable-width types.
 	fixedSize int
 
-	// fixedData stores contiguous fixed-width values. Row i occupies
-	// bytes [i*fixedSize : (i+1)*fixedSize]. Null rows contain
+	// fixedData stores contiguous fixed-width values. For nullable
+	// columns, only non-null values are stored (valueCount entries).
+	// For non-nullable columns, all rows are stored including
 	// sentinel values (e.g. MinInt64 for LONG, NaN for DOUBLE).
 	fixedData []byte
 
@@ -68,14 +72,15 @@ type qwpColumnBuffer struct {
 	boolData []byte
 
 	// strOffsets and strData store variable-width string/varchar
-	// data. strOffsets has rowCount+1 entries with strOffsets[0]==0.
-	// String for row i spans strData[strOffsets[i]:strOffsets[i+1]].
-	// Null rows repeat the previous offset (zero-length string).
+	// data. strOffsets has valueCount+1 entries with strOffsets[0]==0.
+	// String for value i spans strData[strOffsets[i]:strOffsets[i+1]].
+	// For nullable columns, only non-null values are stored.
 	strOffsets []uint32
 	strData    []byte
 
-	// symbolIDs stores one global symbol dictionary ID per row
-	// (TYPE_SYMBOL only). Null rows use -1 as sentinel.
+	// symbolIDs stores one global symbol dictionary ID per value
+	// (TYPE_SYMBOL only). For nullable columns, only non-null
+	// values are stored. For non-nullable, null uses -1 sentinel.
 	symbolIDs []int32
 
 	// arrayOffsets and arrayData store variable-width N-dimensional
@@ -160,6 +165,37 @@ func (c *qwpColumnBuffer) markNull() {
 // bitmap to cover all rowCount rows.
 func (c *qwpColumnBuffer) nullBitmapLen() int {
 	return (c.rowCount + 7) / 8
+}
+
+// valueCount returns the number of non-null data entries stored
+// in this column. For nullable columns, this is rowCount - nullCount
+// (data arrays only contain non-null values). For non-nullable
+// columns, this equals rowCount (sentinels are stored for nulls).
+func (c *qwpColumnBuffer) valueCount() int {
+	if c.nullable {
+		return c.rowCount - c.nullCount
+	}
+	return c.rowCount
+}
+
+// countNullsInFirstN counts the number of null bits set in the
+// null bitmap for the first n rows. Used by truncateTo to determine
+// how many data entries correspond to the first n rows.
+func countNullsInFirstN(bitmap []byte, n int) int {
+	if n == 0 {
+		return 0
+	}
+	fullBytes := n / 8
+	count := 0
+	for i := 0; i < fullBytes && i < len(bitmap); i++ {
+		count += bits.OnesCount8(bitmap[i])
+	}
+	rem := n % 8
+	if rem > 0 && fullBytes < len(bitmap) {
+		mask := byte((1 << uint(rem)) - 1)
+		count += bits.OnesCount8(bitmap[fullBytes] & mask)
+	}
+	return count
 }
 
 // trackDataGrowth increments the parent table's running data size
@@ -253,15 +289,17 @@ func (c *qwpColumnBuffer) addTimestamp(v int64) {
 }
 
 // addBool appends a boolean value, bit-packed into boolData.
-// Bit i = row i's value, LSB-first within each byte (TYPE_BOOLEAN).
+// Bit position is based on valueCount (non-null values only for
+// nullable columns), LSB-first within each byte (TYPE_BOOLEAN).
 func (c *qwpColumnBuffer) addBool(v bool) {
-	byteIdx := c.rowCount / 8
+	vc := c.valueCount()
+	byteIdx := vc / 8
 	if len(c.boolData) <= byteIdx {
 		c.boolData = append(c.boolData, 0)
 		c.trackDataGrowth(1)
 	}
 	if v {
-		c.boolData[byteIdx] |= 1 << uint(c.rowCount%8)
+		c.boolData[byteIdx] |= 1 << uint(vc%8)
 	}
 	c.rowCount++
 }
@@ -471,22 +509,32 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 	return nil
 }
 
-// addNull appends a type-appropriate null sentinel value. For
-// nullable columns, the corresponding null bitmap bit is also set.
-// Sentinel values match the QuestDB conventions:
+// addNull marks a row as null. For nullable columns, only the null
+// bitmap is set — no sentinel data is appended to the data arrays.
+// This means data arrays contain only valueCount = rowCount - nullCount
+// entries (non-null values only), which matches the QWP wire format.
+//
+// For non-nullable columns, type-appropriate sentinel values are
+// appended so that data arrays always have rowCount entries:
 //   - LONG/TIMESTAMP/DATE: math.MinInt64
-//   - DOUBLE: NaN
-//   - FLOAT: NaN
+//   - DOUBLE: NaN, FLOAT: NaN
 //   - INT/SHORT/BYTE/CHAR: 0
 //   - STRING/VARCHAR: empty (repeated offset)
 //   - SYMBOL: -1
-//   - UUID: two MinInt64
-//   - LONG256: four MinInt64
+//   - UUID: two MinInt64, LONG256: four MinInt64
 func (c *qwpColumnBuffer) addNull() {
 	if c.nullable {
+		// Nullable columns: only mark the bitmap, no data appended.
+		// The wire format expects valueCount data entries (non-null
+		// rows only), identified by the null bitmap.
 		c.markNull()
+		c.rowCount++
+		return
 	}
 
+	// Non-nullable columns: append sentinel data so that data
+	// arrays have rowCount entries. The wire format for non-nullable
+	// columns expects rowCount values (no bitmap).
 	switch c.typeCode {
 	case qwpTypeBoolean:
 		// False sentinel; bit stays 0 from zero-initialization.
@@ -600,42 +648,57 @@ func (c *qwpColumnBuffer) reset() {
 
 // truncateTo rolls the column back to exactly n rows, discarding
 // any data beyond that point. Used by qwpTableBuffer.cancelRow().
+//
+// For nullable columns, data arrays contain only valueCount entries
+// (non-null values). To truncate to n rows, we first count nulls
+// in the first n rows to determine newValueCount, then truncate
+// data arrays to that count. For non-nullable columns, data arrays
+// have rowCount entries, and newValueCount = n.
 func (c *qwpColumnBuffer) truncateTo(n int) {
 	if n >= c.rowCount {
 		return
 	}
 
+	// Compute how many data entries correspond to the first n rows.
+	// For nullable columns, skip null rows (no data stored).
+	// For non-nullable, newVC = n (sentinel data is stored).
+	nullsInN := 0
+	if c.nullable {
+		nullsInN = countNullsInFirstN(c.nullBitmap, n)
+	}
+	newVC := n - nullsInN
+
 	switch c.typeCode {
 	case qwpTypeBoolean:
-		newLen := (n + 7) / 8
+		newLen := (newVC + 7) / 8
 		if newLen < len(c.boolData) {
 			c.boolData = c.boolData[:newLen]
 		}
 		// Clear any trailing bits in the last byte.
-		if n > 0 && n%8 != 0 {
-			c.boolData[newLen-1] &= (1 << uint(n%8)) - 1
+		if newVC > 0 && newVC%8 != 0 {
+			c.boolData[newLen-1] &= (1 << uint(newVC%8)) - 1
 		}
 
 	case qwpTypeString, qwpTypeVarchar:
-		c.strOffsets = c.strOffsets[:n+1]
-		c.strData = c.strData[:c.strOffsets[n]]
+		c.strOffsets = c.strOffsets[:newVC+1]
+		c.strData = c.strData[:c.strOffsets[newVC]]
 
 	case qwpTypeSymbol:
-		c.symbolIDs = c.symbolIDs[:n]
+		c.symbolIDs = c.symbolIDs[:newVC]
 
 	case qwpTypeDoubleArray, qwpTypeLongArray:
-		c.arrayOffsets = c.arrayOffsets[:n+1]
-		c.arrayData = c.arrayData[:c.arrayOffsets[n]]
+		c.arrayOffsets = c.arrayOffsets[:newVC+1]
+		c.arrayData = c.arrayData[:c.arrayOffsets[newVC]]
 
 	case qwpTypeGeohash:
-		// Geohash stores 8 bytes per row in fixedData despite
+		// Geohash stores 8 bytes per value in fixedData despite
 		// fixedSize being -1 (wire size depends on precision).
-		c.fixedData = c.fixedData[:n*8]
+		c.fixedData = c.fixedData[:newVC*8]
 
 	default:
 		// Fixed-width types.
 		if c.fixedSize > 0 {
-			c.fixedData = c.fixedData[:n*c.fixedSize]
+			c.fixedData = c.fixedData[:newVC*c.fixedSize]
 		}
 	}
 

@@ -310,10 +310,12 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeLong, true)
 		c.addNull()
 
-		expected := make([]byte, 8)
-		binary.LittleEndian.PutUint64(expected, qwpLongNull)
-		if !bytes.Equal(c.fixedData, expected) {
-			t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+		// Nullable null: no sentinel data, only bitmap.
+		if len(c.fixedData) != 0 {
+			t.Fatalf("fixedData should be empty for nullable null, got %x", c.fixedData)
+		}
+		if c.valueCount() != 0 {
+			t.Fatalf("valueCount = %d, want 0", c.valueCount())
 		}
 		// Bitmap: row 0 is null → bit 0 set → [0x01]
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
@@ -322,16 +324,18 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		if c.nullCount != 1 {
 			t.Fatalf("nullCount = %d, want 1", c.nullCount)
 		}
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
 	})
 
 	t.Run("DoubleNullable", func(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeDouble, true)
 		c.addNull()
 
-		// Verify the value reads back as NaN.
-		v := math.Float64frombits(binary.LittleEndian.Uint64(c.fixedData))
-		if !math.IsNaN(v) {
-			t.Fatalf("null double sentinel should be NaN, got %v", v)
+		// Nullable null: no sentinel data.
+		if len(c.fixedData) != 0 {
+			t.Fatalf("fixedData should be empty for nullable null, got %x", c.fixedData)
 		}
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
@@ -342,9 +346,8 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeFloat, true)
 		c.addNull()
 
-		v := math.Float32frombits(binary.LittleEndian.Uint32(c.fixedData))
-		if !math.IsNaN(float64(v)) {
-			t.Fatalf("null float sentinel should be NaN, got %v", v)
+		if len(c.fixedData) != 0 {
+			t.Fatalf("fixedData should be empty for nullable null, got %x", c.fixedData)
 		}
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
@@ -355,8 +358,8 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeInt, true)
 		c.addNull()
 
-		if !bytes.Equal(c.fixedData, []byte{0, 0, 0, 0}) {
-			t.Fatalf("fixedData = %x, want [00000000]", c.fixedData)
+		if len(c.fixedData) != 0 {
+			t.Fatalf("fixedData should be empty for nullable null, got %x", c.fixedData)
 		}
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
@@ -367,8 +370,8 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeByte, true)
 		c.addNull()
 
-		if !bytes.Equal(c.fixedData, []byte{0}) {
-			t.Fatalf("fixedData = %x, want [00]", c.fixedData)
+		if len(c.fixedData) != 0 {
+			t.Fatalf("fixedData should be empty for nullable null, got %x", c.fixedData)
 		}
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
@@ -379,9 +382,9 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeBoolean, true)
 		c.addNull()
 
-		// Bit 0 should be 0 (false sentinel).
-		if !bytes.Equal(c.boolData, []byte{0x00}) {
-			t.Fatalf("boolData = %x, want [00]", c.boolData)
+		// Nullable null: no data appended to boolData.
+		if len(c.boolData) != 0 {
+			t.Fatalf("boolData should be empty for nullable null, got %x", c.boolData)
 		}
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
@@ -392,12 +395,9 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeString, true)
 		c.addNull()
 
-		// Offset repeats: [0, 0] → empty string sentinel.
-		expectedOffsets := []uint32{0, 0}
-		for i, off := range expectedOffsets {
-			if c.strOffsets[i] != off {
-				t.Fatalf("strOffsets[%d] = %d, want %d", i, c.strOffsets[i], off)
-			}
+		// Nullable null: only the initial offset [0], no extra offset.
+		if len(c.strOffsets) != 1 || c.strOffsets[0] != 0 {
+			t.Fatalf("strOffsets = %v, want [0]", c.strOffsets)
 		}
 		if len(c.strData) != 0 {
 			t.Fatalf("strData should be empty, got %q", c.strData)
@@ -411,8 +411,9 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeSymbol, true)
 		c.addNull()
 
-		if len(c.symbolIDs) != 1 || c.symbolIDs[0] != -1 {
-			t.Fatalf("symbolIDs = %v, want [-1]", c.symbolIDs)
+		// Nullable null: no symbol ID appended.
+		if len(c.symbolIDs) != 0 {
+			t.Fatalf("symbolIDs should be empty for nullable null, got %v", c.symbolIDs)
 		}
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
@@ -423,12 +424,9 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeUuid, true)
 		c.addNull()
 
-		// Two MinInt64 LE values = 16 bytes.
-		expected := make([]byte, 16)
-		binary.LittleEndian.PutUint64(expected[0:8], qwpLongNull)
-		binary.LittleEndian.PutUint64(expected[8:16], qwpLongNull)
-		if !bytes.Equal(c.fixedData, expected) {
-			t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+		// Nullable null: no sentinel data.
+		if len(c.fixedData) != 0 {
+			t.Fatalf("fixedData should be empty for nullable null, got %x", c.fixedData)
 		}
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
@@ -439,13 +437,9 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeLong256, true)
 		c.addNull()
 
-		// Four MinInt64 LE values = 32 bytes.
-		expected := make([]byte, 32)
-		for i := 0; i < 4; i++ {
-			binary.LittleEndian.PutUint64(expected[i*8:(i+1)*8], qwpLongNull)
-		}
-		if !bytes.Equal(c.fixedData, expected) {
-			t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+		// Nullable null: no sentinel data.
+		if len(c.fixedData) != 0 {
+			t.Fatalf("fixedData should be empty for nullable null, got %x", c.fixedData)
 		}
 		if !bytes.Equal(c.nullBitmap, []byte{0x01}) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
@@ -477,32 +471,26 @@ func TestQwpColumnBufferNullBitmapPattern(t *testing.T) {
 		t.Fatalf("nullBitmap = %x, want [1A]", c.nullBitmap)
 	}
 
-	// fixedData: 6 rows × 8 bytes = 48 bytes.
-	if len(c.fixedData) != 48 {
-		t.Fatalf("fixedData len = %d, want 48", len(c.fixedData))
+	// fixedData: 3 non-null values × 8 bytes = 24 bytes (no sentinels for nullable).
+	if len(c.fixedData) != 24 {
+		t.Fatalf("fixedData len = %d, want 24", len(c.fixedData))
+	}
+	if c.valueCount() != 3 {
+		t.Fatalf("valueCount = %d, want 3", c.valueCount())
 	}
 
-	// Verify non-null values are at correct offsets.
+	// Non-null values are packed contiguously (no gaps for null rows).
 	v0 := int64(binary.LittleEndian.Uint64(c.fixedData[0:8]))
 	if v0 != 100 {
-		t.Fatalf("row 0 = %d, want 100", v0)
+		t.Fatalf("value 0 = %d, want 100", v0)
+	}
+	v1 := int64(binary.LittleEndian.Uint64(c.fixedData[8:16]))
+	if v1 != 200 {
+		t.Fatalf("value 1 = %d, want 200", v1)
 	}
 	v2 := int64(binary.LittleEndian.Uint64(c.fixedData[16:24]))
-	if v2 != 200 {
-		t.Fatalf("row 2 = %d, want 200", v2)
-	}
-	v5 := int64(binary.LittleEndian.Uint64(c.fixedData[40:48]))
-	if v5 != 300 {
-		t.Fatalf("row 5 = %d, want 300", v5)
-	}
-
-	// Verify null sentinels (MinInt64) at null row offsets.
-	for _, rowIdx := range []int{1, 3, 4} {
-		off := rowIdx * 8
-		v := int64(binary.LittleEndian.Uint64(c.fixedData[off : off+8]))
-		if v != math.MinInt64 {
-			t.Fatalf("null sentinel at row %d = %d, want MinInt64", rowIdx, v)
-		}
+	if v2 != 300 {
+		t.Fatalf("value 2 = %d, want 300", v2)
 	}
 }
 
@@ -539,15 +527,15 @@ func TestQwpColumnBufferNullBitmapMultipleBytes(t *testing.T) {
 func TestQwpColumnBufferNullStringInterleaved(t *testing.T) {
 	c := newQwpColumnBuffer("col", qwpTypeString, true)
 	c.addString("hello") // row 0
-	c.addNull()          // row 1
+	c.addNull()          // row 1 (nullable: no offset appended)
 	c.addString("world") // row 2
 
 	if string(c.strData) != "helloworld" {
 		t.Fatalf("strData = %q, want %q", c.strData, "helloworld")
 	}
 
-	// Offsets: [0, 5, 5, 10] — null row repeats offset.
-	expectedOffsets := []uint32{0, 5, 5, 10}
+	// Offsets: [0, 5, 10] — only non-null values, no entry for null row.
+	expectedOffsets := []uint32{0, 5, 10}
 	if len(c.strOffsets) != len(expectedOffsets) {
 		t.Fatalf("strOffsets len = %d, want %d", len(c.strOffsets), len(expectedOffsets))
 	}
@@ -555,6 +543,9 @@ func TestQwpColumnBufferNullStringInterleaved(t *testing.T) {
 		if c.strOffsets[i] != off {
 			t.Fatalf("strOffsets[%d] = %d, want %d", i, c.strOffsets[i], off)
 		}
+	}
+	if c.valueCount() != 2 {
+		t.Fatalf("valueCount = %d, want 2", c.valueCount())
 	}
 
 	// Bitmap: row 1 null → bit 1 set → 0x02
@@ -1488,23 +1479,16 @@ func TestQwpColumnBufferArrayNull(t *testing.T) {
 			t.Fatalf("nullBitmap = %x, want [01]", c.nullBitmap)
 		}
 
-		// Null sentinel: nDims=1, dim0=0 → 5 bytes
-		if len(c.arrayData) != 5 {
-			t.Fatalf("arrayData len = %d, want 5", len(c.arrayData))
+		// Nullable null: no sentinel data appended to arrayData.
+		if len(c.arrayData) != 0 {
+			t.Fatalf("arrayData len = %d, want 0", len(c.arrayData))
 		}
-		if c.arrayData[0] != 0x01 {
-			t.Fatalf("null sentinel nDims = %d, want 1", c.arrayData[0])
+		if c.valueCount() != 0 {
+			t.Fatalf("valueCount = %d, want 0", c.valueCount())
 		}
-		dim0 := binary.LittleEndian.Uint32(c.arrayData[1:5])
-		if dim0 != 0 {
-			t.Fatalf("null sentinel dim0 = %d, want 0", dim0)
-		}
-
-		expectedOffsets := []uint32{0, 5}
-		for i, want := range expectedOffsets {
-			if c.arrayOffsets[i] != want {
-				t.Fatalf("arrayOffsets[%d] = %d, want %d", i, c.arrayOffsets[i], want)
-			}
+		// Only the initial offset [0] remains.
+		if len(c.arrayOffsets) != 1 || c.arrayOffsets[0] != 0 {
+			t.Fatalf("arrayOffsets = %v, want [0]", c.arrayOffsets)
 		}
 	})
 
@@ -1518,15 +1502,16 @@ func TestQwpColumnBufferArrayNull(t *testing.T) {
 		if c.nullCount != 1 {
 			t.Fatalf("nullCount = %d, want 1", c.nullCount)
 		}
-		if len(c.arrayData) != 5 {
-			t.Fatalf("arrayData len = %d, want 5", len(c.arrayData))
+		// Nullable null: no sentinel data.
+		if len(c.arrayData) != 0 {
+			t.Fatalf("arrayData len = %d, want 0", len(c.arrayData))
 		}
 	})
 
 	t.Run("InterleavedNullAndData", func(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
 		c.addDoubleArray(1, []int32{2}, []float64{1.0, 2.0}) // row 0: 21 bytes
-		c.addNull()                                            // row 1: 5 bytes
+		c.addNull()                                            // row 1: nullable, no data
 		c.addDoubleArray(1, []int32{1}, []float64{3.0})       // row 2: 13 bytes
 
 		if c.rowCount != 3 {
@@ -1535,15 +1520,19 @@ func TestQwpColumnBufferArrayNull(t *testing.T) {
 		if c.nullCount != 1 {
 			t.Fatalf("nullCount = %d, want 1", c.nullCount)
 		}
+		if c.valueCount() != 2 {
+			t.Fatalf("valueCount = %d, want 2", c.valueCount())
+		}
 
 		// Bitmap: row 1 null → bit 1 → 0x02
 		if !bytes.Equal(c.nullBitmap, []byte{0x02}) {
 			t.Fatalf("nullBitmap = %x, want [02]", c.nullBitmap)
 		}
 
-		expectedOffsets := []uint32{0, 21, 26, 39}
-		if len(c.arrayOffsets) != 4 {
-			t.Fatalf("arrayOffsets len = %d, want 4", len(c.arrayOffsets))
+		// Only non-null data: 21 + 13 = 34 bytes, 2 values + initial offset.
+		expectedOffsets := []uint32{0, 21, 34}
+		if len(c.arrayOffsets) != 3 {
+			t.Fatalf("arrayOffsets len = %d, want 3", len(c.arrayOffsets))
 		}
 		for i, want := range expectedOffsets {
 			if c.arrayOffsets[i] != want {
@@ -1638,7 +1627,7 @@ func TestQwpColumnBufferArrayTruncateTo(t *testing.T) {
 	t.Run("TruncateWithNulls", func(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
 		c.addDoubleArray(1, []int32{1}, []float64{1.0}) // row 0: 13 bytes
-		c.addNull()                                       // row 1: 5 bytes (null)
+		c.addNull()                                       // row 1: nullable null, no data
 		c.addDoubleArray(1, []int32{1}, []float64{2.0}) // row 2: 13 bytes
 
 		c.truncateTo(2)
@@ -1652,11 +1641,19 @@ func TestQwpColumnBufferArrayTruncateTo(t *testing.T) {
 		if !bytes.Equal(c.nullBitmap, []byte{0x02}) {
 			t.Fatalf("nullBitmap = %x, want [02]", c.nullBitmap)
 		}
-		expectedOffsets := []uint32{0, 13, 18}
+		// After truncate to 2 rows: 1 null in first 2, so valueCount = 1.
+		// arrayOffsets: [0, 13] (newVC + 1 = 2 entries).
+		expectedOffsets := []uint32{0, 13}
+		if len(c.arrayOffsets) != len(expectedOffsets) {
+			t.Fatalf("arrayOffsets len = %d, want %d", len(c.arrayOffsets), len(expectedOffsets))
+		}
 		for i, want := range expectedOffsets {
 			if c.arrayOffsets[i] != want {
 				t.Fatalf("arrayOffsets[%d] = %d, want %d", i, c.arrayOffsets[i], want)
 			}
+		}
+		if len(c.arrayData) != 13 {
+			t.Fatalf("arrayData len = %d, want 13", len(c.arrayData))
 		}
 	})
 
@@ -1745,18 +1742,28 @@ func TestQwpTableBufferArrayGapFill(t *testing.T) {
 	if colArr.nullCount != 1 {
 		t.Fatalf("arr nullCount = %d, want 1", colArr.nullCount)
 	}
+	if colArr.valueCount() != 1 {
+		t.Fatalf("arr valueCount = %d, want 1", colArr.valueCount())
+	}
 
-	// Row 1's data should be the null sentinel (5 bytes).
-	row1Data := colArr.arrayData[colArr.arrayOffsets[1]:colArr.arrayOffsets[2]]
-	if len(row1Data) != 5 {
-		t.Fatalf("gap-filled row data len = %d, want 5", len(row1Data))
+	// Nullable null: no data appended for gap-filled row.
+	// Only row 0's data (21 bytes) is in arrayData.
+	if len(colArr.arrayData) != 21 {
+		t.Fatalf("arrayData len = %d, want 21", len(colArr.arrayData))
 	}
-	if row1Data[0] != 0x01 {
-		t.Fatalf("gap-filled nDims = %d, want 1", row1Data[0])
+	expectedOffsets := []uint32{0, 21}
+	if len(colArr.arrayOffsets) != len(expectedOffsets) {
+		t.Fatalf("arrayOffsets len = %d, want %d", len(colArr.arrayOffsets), len(expectedOffsets))
 	}
-	dim0 := binary.LittleEndian.Uint32(row1Data[1:5])
-	if dim0 != 0 {
-		t.Fatalf("gap-filled dim0 = %d, want 0", dim0)
+	for i, want := range expectedOffsets {
+		if colArr.arrayOffsets[i] != want {
+			t.Fatalf("arrayOffsets[%d] = %d, want %d", i, colArr.arrayOffsets[i], want)
+		}
+	}
+
+	// Null bitmap: row 1 is null → bit 1 → 0x02.
+	if !bytes.Equal(colArr.nullBitmap, []byte{0x02}) {
+		t.Fatalf("nullBitmap = %x, want [02]", colArr.nullBitmap)
 	}
 }
 
@@ -2031,10 +2038,12 @@ func TestQwpColumnBufferDecimalScaleTracking(t *testing.T) {
 		if c.nullCount != 1 {
 			t.Fatalf("nullCount = %d, want 1", c.nullCount)
 		}
-		// Data should be 8 zero bytes (null sentinel).
-		expected := make([]byte, 8)
-		if !bytes.Equal(c.fixedData, expected) {
-			t.Fatalf("fixedData = %x, want all zeros", c.fixedData)
+		// Nullable null: no data appended.
+		if len(c.fixedData) != 0 {
+			t.Fatalf("fixedData should be empty for nullable null, got %x", c.fixedData)
+		}
+		if c.valueCount() != 0 {
+			t.Fatalf("valueCount = %d, want 0", c.valueCount())
 		}
 	})
 
@@ -2149,10 +2158,12 @@ func TestQwpColumnBufferDecimalNullInterleaved(t *testing.T) {
 		t.Fatalf("nullBitmap = %x, want [02]", c.nullBitmap)
 	}
 
-	// Row 1 should be 8 zero bytes (null sentinel).
-	nullRow := c.fixedData[8:16]
-	if !bytes.Equal(nullRow, make([]byte, 8)) {
-		t.Fatalf("null row = %x, want all zeros", nullRow)
+	// Nullable null: only 2 non-null values stored (16 bytes total).
+	if c.valueCount() != 2 {
+		t.Fatalf("valueCount = %d, want 2", c.valueCount())
+	}
+	if len(c.fixedData) != 16 {
+		t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
 	}
 }
 
@@ -2280,10 +2291,21 @@ func TestQwpColumnBufferGeohashNull(t *testing.T) {
 	if c.nullCount != 1 {
 		t.Fatalf("nullCount = %d, want 1", c.nullCount)
 	}
-	// Null sentinel: all bits set = MaxUint64.
-	nullVal := binary.LittleEndian.Uint64(c.fixedData[8:16])
-	if nullVal != math.MaxUint64 {
-		t.Fatalf("null sentinel = 0x%X, want 0xFFFFFFFFFFFFFFFF", nullVal)
+	if c.valueCount() != 1 {
+		t.Fatalf("valueCount = %d, want 1", c.valueCount())
+	}
+	// Nullable null: no sentinel data. Only 1 non-null value (8 bytes).
+	if len(c.fixedData) != 8 {
+		t.Fatalf("fixedData len = %d, want 8", len(c.fixedData))
+	}
+	// Verify the non-null value.
+	v := binary.LittleEndian.Uint64(c.fixedData[0:8])
+	if v != 0xABC {
+		t.Fatalf("value = 0x%X, want 0xABC", v)
+	}
+	// Bitmap: row 1 null → bit 1 → 0x02.
+	if !bytes.Equal(c.nullBitmap, []byte{0x02}) {
+		t.Fatalf("nullBitmap = %x, want [02]", c.nullBitmap)
 	}
 }
 

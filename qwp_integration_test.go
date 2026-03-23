@@ -543,3 +543,159 @@ func TestQwpIntegrationAutoFlush(t *testing.T) {
 
 	t.Log("QWP auto-flush integration test passed")
 }
+
+// TestQwpIntegrationNullableColumns verifies that nullable columns
+// with interleaved null and non-null values are correctly encoded,
+// sent via QWP, and stored in QuestDB. This test validates the
+// Phase 13 null-packing fix against the real server.
+func TestQwpIntegrationNullableColumns(t *testing.T) {
+	qwpSkipIfNoServer(t)
+	ctx := context.Background()
+
+	tableName := "qwp_integ_nullable"
+	qwpDropTable(t, tableName)
+	defer qwpDropTable(t, tableName)
+
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(ctx)
+
+	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Row 0: all columns have values.
+	err = s.Table(tableName).
+		Symbol("sym", "AAPL").
+		Int64Column("qty", 100).
+		Float64Column("price", 150.5).
+		StringColumn("note", "buy").
+		BoolColumn("flag", true).
+		At(ctx, ts)
+	if err != nil {
+		t.Fatalf("row 0: %v", err)
+	}
+
+	// Row 1: qty and note are null (not set), others present.
+	err = s.Table(tableName).
+		Symbol("sym", "GOOG").
+		Float64Column("price", 2800.0).
+		BoolColumn("flag", false).
+		At(ctx, ts.Add(time.Microsecond))
+	if err != nil {
+		t.Fatalf("row 1: %v", err)
+	}
+
+	// Row 2: price and flag are null, others present.
+	err = s.Table(tableName).
+		Symbol("sym", "MSFT").
+		Int64Column("qty", 50).
+		StringColumn("note", "sell").
+		At(ctx, ts.Add(2*time.Microsecond))
+	if err != nil {
+		t.Fatalf("row 2: %v", err)
+	}
+
+	// Row 3: all nullable columns are null (only symbol + timestamp).
+	err = s.Table(tableName).
+		Symbol("sym", "TSLA").
+		At(ctx, ts.Add(3*time.Microsecond))
+	if err != nil {
+		t.Fatalf("row 3: %v", err)
+	}
+
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	result := qwpWaitForRows(t, tableName, 4)
+	if result.Count != 4 {
+		t.Fatalf("count = %d, want 4", result.Count)
+	}
+
+	// Verify data by querying specific values.
+	// Row 0: all values present.
+	r0 := qwpQuery(t, fmt.Sprintf("SELECT sym, qty, price, note, flag FROM '%s' WHERE sym = 'AAPL'", tableName))
+	if r0.Count != 1 {
+		t.Fatalf("AAPL count = %d, want 1", r0.Count)
+	}
+	row0 := r0.Dataset[0]
+	if row0[0] != "AAPL" {
+		t.Fatalf("row0 sym = %v, want AAPL", row0[0])
+	}
+	if qty, ok := row0[1].(float64); !ok || int64(qty) != 100 {
+		t.Fatalf("row0 qty = %v, want 100", row0[1])
+	}
+	if price, ok := row0[2].(float64); !ok || price != 150.5 {
+		t.Fatalf("row0 price = %v, want 150.5", row0[2])
+	}
+	if row0[3] != "buy" {
+		t.Fatalf("row0 note = %v, want buy", row0[3])
+	}
+	if row0[4] != true {
+		t.Fatalf("row0 flag = %v, want true", row0[4])
+	}
+
+	// Row 1: qty and note are null.
+	r1 := qwpQuery(t, fmt.Sprintf("SELECT sym, qty, price, note, flag FROM '%s' WHERE sym = 'GOOG'", tableName))
+	if r1.Count != 1 {
+		t.Fatalf("GOOG count = %d, want 1", r1.Count)
+	}
+	row1 := r1.Dataset[0]
+	if row1[1] != nil {
+		t.Fatalf("row1 qty = %v, want nil", row1[1])
+	}
+	if price, ok := row1[2].(float64); !ok || price != 2800.0 {
+		t.Fatalf("row1 price = %v, want 2800.0", row1[2])
+	}
+	// QuestDB JSON API returns "" for null STRING, not JSON null.
+	if row1[3] != nil && row1[3] != "" {
+		t.Fatalf("row1 note = %v, want nil or empty", row1[3])
+	}
+	if row1[4] != false {
+		t.Fatalf("row1 flag = %v, want false", row1[4])
+	}
+
+	// Row 2: price and flag are null.
+	r2 := qwpQuery(t, fmt.Sprintf("SELECT sym, qty, price, note, flag FROM '%s' WHERE sym = 'MSFT'", tableName))
+	if r2.Count != 1 {
+		t.Fatalf("MSFT count = %d, want 1", r2.Count)
+	}
+	row2 := r2.Dataset[0]
+	if qty, ok := row2[1].(float64); !ok || int64(qty) != 50 {
+		t.Fatalf("row2 qty = %v, want 50", row2[1])
+	}
+	if row2[2] != nil {
+		t.Fatalf("row2 price = %v, want nil", row2[2])
+	}
+	if row2[3] != "sell" {
+		t.Fatalf("row2 note = %v, want sell", row2[3])
+	}
+	// QuestDB JSON API may return false for null BOOLEAN.
+	if row2[4] != nil && row2[4] != false {
+		t.Fatalf("row2 flag = %v, want nil or false", row2[4])
+	}
+
+	// Row 3: all nullable columns null.
+	r3 := qwpQuery(t, fmt.Sprintf("SELECT sym, qty, price, note, flag FROM '%s' WHERE sym = 'TSLA'", tableName))
+	if r3.Count != 1 {
+		t.Fatalf("TSLA count = %d, want 1", r3.Count)
+	}
+	row3 := r3.Dataset[0]
+	if row3[1] != nil {
+		t.Fatalf("row3 qty = %v, want nil", row3[1])
+	}
+	if row3[2] != nil {
+		t.Fatalf("row3 price = %v, want nil", row3[2])
+	}
+	// STRING nulls may appear as "" in JSON.
+	if row3[3] != nil && row3[3] != "" {
+		t.Fatalf("row3 note = %v, want nil or empty", row3[3])
+	}
+	// BOOLEAN nulls may appear as false in JSON.
+	if row3[4] != nil && row3[4] != false {
+		t.Fatalf("row3 flag = %v, want nil or false", row3[4])
+	}
+
+	t.Log("QWP nullable columns integration test passed")
+}

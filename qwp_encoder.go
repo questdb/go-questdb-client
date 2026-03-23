@@ -185,19 +185,13 @@ func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer, schemaMode qwpSchemaMod
 // encodeSchemaFull writes full column definitions: for each column,
 // the name (varint string) and base type code (without the 0x80
 // nullable flag — nullability is signaled via the null bitmap flag
-// byte in the data section). Decimal columns get an extra scale
-// byte after the type code.
+// byte in the data section). The schema section does NOT include
+// decimal scale — the scale byte is written in the column data
+// section, matching the Java server's QwpSchema.parseFullSchema().
 func (e *qwpEncoder) encodeSchemaFull(tb *qwpTableBuffer) {
 	for _, col := range tb.columns {
 		e.wb.putString(col.name)
 		e.wb.putByte(byte(col.typeCode)) // base type code, no nullable flag
-		if qwpIsDecimalType(col.typeCode) {
-			if col.scale >= 0 {
-				e.wb.putByte(byte(col.scale))
-			} else {
-				e.wb.putByte(0)
-			}
-		}
 	}
 }
 
@@ -234,6 +228,16 @@ func (e *qwpEncoder) encodeColumnData(col *qwpColumnBuffer) {
 	case qwpTypeGeohash:
 		e.encodeGeohashColumn(col)
 
+	case qwpTypeDecimal64, qwpTypeDecimal128, qwpTypeDecimal256:
+		// Decimal columns: scale byte before the packed values.
+		// Matches QwpDecimalColumnCursor.of() in the Java server.
+		if col.scale >= 0 {
+			e.wb.putByte(byte(col.scale))
+		} else {
+			e.wb.putByte(0)
+		}
+		e.wb.putBytes(col.fixedData)
+
 	default:
 		// Fixed-width types: raw bytes from fixedData.
 		if col.fixedSize > 0 {
@@ -265,11 +269,12 @@ func (e *qwpEncoder) encodeNullBitmapFlag(col *qwpColumnBuffer) {
 	}
 }
 
-// encodeBoolColumn writes bit-packed boolean values. Like the null
-// bitmap, the boolData may be shorter than needed; missing bytes
-// are padded with zeros.
+// encodeBoolColumn writes bit-packed boolean values for non-null
+// rows only. The number of bits is valueCount (= rowCount - nullCount
+// for nullable columns, = rowCount for non-nullable).
 func (e *qwpEncoder) encodeBoolColumn(col *qwpColumnBuffer) {
-	boolLen := (col.rowCount + 7) / 8
+	vc := col.valueCount()
+	boolLen := (vc + 7) / 8
 	for i := 0; i < boolLen; i++ {
 		if i < len(col.boolData) {
 			e.wb.putByte(col.boolData[i])
@@ -304,9 +309,10 @@ func (e *qwpEncoder) encodeArrayColumn(col *qwpColumnBuffer) {
 }
 
 // encodeGeohashColumn writes geohash column data: a precision
-// varint followed by per-row packed bytes. Each row's 8-byte
-// value from fixedData is truncated to ceil(precision/8) bytes
-// on the wire, written in little-endian byte order.
+// varint followed by per-value packed bytes. Each value's 8-byte
+// entry from fixedData is truncated to ceil(precision/8) bytes
+// on the wire, written in little-endian byte order. Only non-null
+// values are included (valueCount entries for nullable columns).
 func (e *qwpEncoder) encodeGeohashColumn(col *qwpColumnBuffer) {
 	precision := col.geohashPrecision
 	if precision <= 0 {
@@ -319,8 +325,9 @@ func (e *qwpEncoder) encodeGeohashColumn(col *qwpColumnBuffer) {
 
 	e.wb.putVarint(uint64(precision))
 
+	vc := col.valueCount()
 	valueSize := (int(precision) + 7) / 8
-	for i := 0; i < col.rowCount; i++ {
+	for i := 0; i < vc; i++ {
 		off := i * 8
 		// Write only the low valueSize bytes from each 8-byte
 		// LE value. This is the same as writing the value in

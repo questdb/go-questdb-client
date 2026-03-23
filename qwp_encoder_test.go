@@ -436,22 +436,16 @@ func TestQwpEncoderNullableColumn(t *testing.T) {
 	}
 	off++
 
-	// Column data: 3 × int64 LE
-	// Row 0: 100
+	// Column data: only 2 non-null values (valueCount = 3 - 1 = 2)
+	// Value 0: 100
 	if int64(binary.LittleEndian.Uint64(msg[off:])) != 100 {
-		t.Fatalf("row 0 = %d, want 100", int64(binary.LittleEndian.Uint64(msg[off:])))
+		t.Fatalf("value 0 = %d, want 100", int64(binary.LittleEndian.Uint64(msg[off:])))
 	}
 	off += 8
 
-	// Row 1: null sentinel (MinInt64)
-	if binary.LittleEndian.Uint64(msg[off:]) != qwpLongNull {
-		t.Fatalf("row 1 = 0x%016X, want null sentinel", binary.LittleEndian.Uint64(msg[off:]))
-	}
-	off += 8
-
-	// Row 2: 200
+	// Value 1: 200 (null row skipped, no sentinel)
 	if int64(binary.LittleEndian.Uint64(msg[off:])) != 200 {
-		t.Fatalf("row 2 = %d, want 200", int64(binary.LittleEndian.Uint64(msg[off:])))
+		t.Fatalf("value 1 = %d, want 200", int64(binary.LittleEndian.Uint64(msg[off:])))
 	}
 	off += 8
 
@@ -591,7 +585,8 @@ func TestQwpEncoderReuse(t *testing.T) {
 }
 
 func TestQwpEncoderDecimalSchema(t *testing.T) {
-	// Verify that decimal columns get the extra scale byte in schema.
+	// Verify that decimal columns have scale byte in the DATA section
+	// (after null bitmap flag), NOT in the schema section.
 	tb := newQwpTableBuffer("t")
 	col, _ := tb.getOrCreateColumn("d", qwpTypeDecimal64, false)
 	if err := col.addDecimal(NewDecimalFromInt64(100, 3)); err != nil {
@@ -614,19 +609,22 @@ func TestQwpEncoderDecimalSchema(t *testing.T) {
 	// Column "d": name varint(1) + 'd' = 2 bytes
 	off += 2
 
-	// Type code: DECIMAL64 = 0x13
+	// Type code: DECIMAL64 = 0x13 (no scale byte in schema!)
 	if msg[off] != 0x13 {
 		t.Fatalf("typeCode = 0x%02X, want 0x13", msg[off])
 	}
 	off++
 
-	// Scale byte: 3
-	if msg[off] != 3 {
-		t.Fatalf("scale = %d, want 3", msg[off])
+	// Null bitmap flag: 0x00 (no nulls)
+	if msg[off] != 0x00 {
+		t.Fatalf("nullBitmapFlag = 0x%02X, want 0x00", msg[off])
 	}
 	off++
 
-	// Null bitmap flag: 0x00 (no nulls)
+	// Scale byte: 3 (in data section, after null bitmap)
+	if msg[off] != 3 {
+		t.Fatalf("scale = %d, want 3", msg[off])
+	}
 	off++
 
 	// Column data: 8 bytes big-endian (100 = 0x64)
@@ -1260,24 +1258,18 @@ func TestQwpEncoderGeohashNullable(t *testing.T) {
 	}
 	off++
 
-	// Row 0: 0xABC → LE [0xBC, 0x0A]
+	// Only non-null values emitted (valueCount = 2).
+	// Value 0: 0xABC → LE [0xBC, 0x0A]
 	expected0 := []byte{0xBC, 0x0A}
 	if !bytes.Equal(msg[off:off+2], expected0) {
-		t.Fatalf("row 0 = %x, want %x", msg[off:off+2], expected0)
+		t.Fatalf("value 0 = %x, want %x", msg[off:off+2], expected0)
 	}
 	off += 2
 
-	// Row 1: null sentinel → 0xFFFFFFFFFFFFFFFF → LE [0xFF, 0xFF]
-	expected1 := []byte{0xFF, 0xFF}
+	// Value 1: 0x123 → LE [0x23, 0x01] (null row skipped)
+	expected1 := []byte{0x23, 0x01}
 	if !bytes.Equal(msg[off:off+2], expected1) {
-		t.Fatalf("row 1 (null) = %x, want %x", msg[off:off+2], expected1)
-	}
-	off += 2
-
-	// Row 2: 0x123 → LE [0x23, 0x01]
-	expected2 := []byte{0x23, 0x01}
-	if !bytes.Equal(msg[off:off+2], expected2) {
-		t.Fatalf("row 2 = %x, want %x", msg[off:off+2], expected2)
+		t.Fatalf("value 1 = %x, want %x", msg[off:off+2], expected1)
 	}
 	off += 2
 
@@ -1583,4 +1575,336 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 	if off != len(msg) {
 		t.Fatalf("did not consume all bytes: off=%d, len=%d", off, len(msg))
 	}
+}
+
+// --- Phase 13: Null-packing golden byte tests ---
+//
+// These tests verify the exact wire format for nullable columns with the
+// null-value packing fix: only non-null (valueCount) data entries are
+// emitted, not rowCount entries. Each test encodes a single-column table
+// and checks the raw column data bytes.
+
+// extractColumnData encodes a single-column table and returns the bytes
+// starting from the column data section (after header, table name,
+// row/col counts, and schema). This is a test helper for golden byte
+// verification of column encoding.
+func extractColumnData(tb *qwpTableBuffer) []byte {
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	off := qwpHeaderSize
+	// Skip table name (varint string).
+	nameLen, n, _ := qwpReadVarint(msg[off:])
+	off += n + int(nameLen)
+	// Skip rowCount varint.
+	_, n, _ = qwpReadVarint(msg[off:])
+	off += n
+	// Skip colCount varint.
+	_, n, _ = qwpReadVarint(msg[off:])
+	off += n
+	// Skip schemaMode (1 byte = FULL).
+	off++
+	// Skip schema: for each column, varint string + 1 byte type code.
+	for i := 0; i < len(tb.columns); i++ {
+		sLen, sn, _ := qwpReadVarint(msg[off:])
+		off += sn + int(sLen) // name
+		off++                 // type code
+	}
+
+	return msg[off:]
+}
+
+func TestQwpEncoderNullPackingLong(t *testing.T) {
+	t.Run("NonNullable", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("v", qwpTypeLong, false)
+		col.addLong(10)
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("v", qwpTypeLong, false)
+		col.addLong(20)
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x00 flag (no nulls) + 2×8 bytes
+		expected := []byte{0x00}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], 10)
+		expected = append(expected, buf[:]...)
+		binary.LittleEndian.PutUint64(buf[:], 20)
+		expected = append(expected, buf[:]...)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+
+	t.Run("NullableNoNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("v", qwpTypeLong, true)
+		col.addLong(10)
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("v", qwpTypeLong, true)
+		col.addLong(20)
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x00 flag (nullable but 0 nulls) + 2×8 bytes
+		expected := []byte{0x00}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], 10)
+		expected = append(expected, buf[:]...)
+		binary.LittleEndian.PutUint64(buf[:], 20)
+		expected = append(expected, buf[:]...)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+
+	t.Run("NullableSomeNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("v", qwpTypeLong, true)
+		col.addLong(10)
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("v", qwpTypeLong, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("v", qwpTypeLong, true)
+		col.addLong(30)
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (row 1 null → 0x02) + only 2 values (10, 30)
+		expected := []byte{0x01, 0x02}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], 10)
+		expected = append(expected, buf[:]...)
+		binary.LittleEndian.PutUint64(buf[:], 30)
+		expected = append(expected, buf[:]...)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+
+	t.Run("NullableAllNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("v", qwpTypeLong, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("v", qwpTypeLong, true)
+		col.addNull()
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (both null → 0x03) + 0 data bytes
+		expected := []byte{0x01, 0x03}
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+}
+
+func TestQwpEncoderNullPackingString(t *testing.T) {
+	t.Run("NullableSomeNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("s", qwpTypeString, true)
+		col.addString("abc")
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("s", qwpTypeString, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("s", qwpTypeString, true)
+		col.addString("de")
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (row 1 null → 0x02)
+		// (valueCount+1) = 3 offsets: [0, 3, 5] as uint32 LE
+		// string data: "abcde"
+		expected := []byte{0x01, 0x02}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], 0)
+		expected = append(expected, buf[:]...)
+		binary.LittleEndian.PutUint32(buf[:], 3)
+		expected = append(expected, buf[:]...)
+		binary.LittleEndian.PutUint32(buf[:], 5)
+		expected = append(expected, buf[:]...)
+		expected = append(expected, "abcde"...)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+
+	t.Run("NullableAllNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("s", qwpTypeString, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("s", qwpTypeString, true)
+		col.addNull()
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (0x03) + 1 offset (valueCount+1=1): [0]
+		expected := []byte{0x01, 0x03}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], 0)
+		expected = append(expected, buf[:]...)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+}
+
+func TestQwpEncoderNullPackingBoolean(t *testing.T) {
+	t.Run("NullableSomeNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("b", qwpTypeBoolean, true)
+		col.addBool(true)
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("b", qwpTypeBoolean, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("b", qwpTypeBoolean, true)
+		col.addBool(false)
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("b", qwpTypeBoolean, true)
+		col.addBool(true)
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (row 1 null → 0x02)
+		// valueCount = 3 → ceil(3/8) = 1 byte
+		// Values: true=1, false=0, true=1 → bits 0,1,2 = 1,0,1 = 0x05
+		expected := []byte{0x01, 0x02, 0x05}
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+
+	t.Run("NullableAllNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("b", qwpTypeBoolean, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("b", qwpTypeBoolean, true)
+		col.addNull()
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (0x03) + 0 data bytes (valueCount=0)
+		expected := []byte{0x01, 0x03}
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+}
+
+func TestQwpEncoderNullPackingSymbol(t *testing.T) {
+	t.Run("NullableSomeNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("sym", qwpTypeSymbol, true)
+		col.addSymbolID(0)
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("sym", qwpTypeSymbol, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("sym", qwpTypeSymbol, true)
+		col.addSymbolID(1)
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (row 1 null → 0x02)
+		// valueCount = 2 → 2 varints: 0 (1 byte) + 1 (1 byte)
+		expected := []byte{0x01, 0x02, 0x00, 0x01}
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+
+	t.Run("NullableAllNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("sym", qwpTypeSymbol, true)
+		col.addNull()
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (0x01) + 0 data bytes
+		expected := []byte{0x01, 0x01}
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+}
+
+func TestQwpEncoderNullPackingArray(t *testing.T) {
+	t.Run("NullableSomeNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("arr", qwpTypeDoubleArray, true)
+		col.addDoubleArray(1, []int32{1}, []float64{3.14})
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("arr", qwpTypeDoubleArray, true)
+		col.addNull()
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (row 1 null → 0x02)
+		// Only 1 non-null array: nDims=1, shape=[1], data=[3.14]
+		// = 1 + 4 + 8 = 13 bytes
+		expected := []byte{0x01, 0x02}
+		arrayEntry := make([]byte, 13)
+		arrayEntry[0] = 0x01 // nDims
+		binary.LittleEndian.PutUint32(arrayEntry[1:], 1)
+		binary.LittleEndian.PutUint64(arrayEntry[5:], math.Float64bits(3.14))
+		expected = append(expected, arrayEntry...)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+
+	t.Run("NullableAllNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("arr", qwpTypeDoubleArray, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("arr", qwpTypeDoubleArray, true)
+		col.addNull()
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (0x03) + 0 data bytes
+		expected := []byte{0x01, 0x03}
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
+}
+
+func TestQwpEncoderNullPackingDecimal(t *testing.T) {
+	t.Run("NullableSomeNulls", func(t *testing.T) {
+		tb := newQwpTableBuffer("t")
+		col, _ := tb.getOrCreateColumn("d", qwpTypeDecimal64, true)
+		if err := col.addDecimal(NewDecimalFromInt64(42, 2)); err != nil {
+			t.Fatal(err)
+		}
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("d", qwpTypeDecimal64, true)
+		col.addNull()
+		tb.commitRow()
+		col, _ = tb.getOrCreateColumn("d", qwpTypeDecimal64, true)
+		if err := col.addDecimal(NewDecimalFromInt64(99, 2)); err != nil {
+			t.Fatal(err)
+		}
+		tb.commitRow()
+
+		data := extractColumnData(tb)
+		// 0x01 flag + bitmap (row 1 null → 0x02)
+		// Scale byte: 2
+		// valueCount = 2 → 2×8 bytes big-endian
+		expected := []byte{0x01, 0x02}
+		expected = append(expected, 0x02) // scale
+		expected = append(expected, 0, 0, 0, 0, 0, 0, 0, 42)
+		expected = append(expected, 0, 0, 0, 0, 0, 0, 0, 99)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("data = %x, want %x", data, expected)
+		}
+	})
 }
