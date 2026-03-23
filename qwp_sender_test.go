@@ -2000,3 +2000,152 @@ func TestQwpMaxBufSizeFromConfig(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 }
+
+// --- Phase 15: Edge Case & Validation Tests ---
+
+func TestQwpSenderTableNameLengthValidation(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+	s.fileNameLimit = 127
+
+	t.Run("AtLimit", func(t *testing.T) {
+		name := strings.Repeat("a", 127)
+		s.Table(name)
+		err := s.Int64Column("x", 1).AtNow(context.Background())
+		if err != nil {
+			t.Fatalf("table name at limit (127) should succeed: %v", err)
+		}
+		s.Flush(context.Background())
+	})
+
+	t.Run("OverLimit", func(t *testing.T) {
+		name := strings.Repeat("a", 128)
+		s.Table(name)
+		err := s.AtNow(context.Background())
+		if err == nil {
+			t.Fatal("expected error for table name over limit (128)")
+		}
+		if !strings.Contains(err.Error(), "exceeds limit") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestQwpSenderColumnNameLengthValidation(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+	s.fileNameLimit = 127
+
+	t.Run("AtLimit", func(t *testing.T) {
+		colName := strings.Repeat("c", 127)
+		s.Table("t")
+		err := s.Int64Column(colName, 42).AtNow(context.Background())
+		if err != nil {
+			t.Fatalf("column name at limit (127) should succeed: %v", err)
+		}
+		s.Flush(context.Background())
+	})
+
+	t.Run("OverLimit", func(t *testing.T) {
+		colName := strings.Repeat("c", 128)
+		s.Table("t")
+		err := s.Int64Column(colName, 42).AtNow(context.Background())
+		if err == nil {
+			t.Fatal("expected error for column name over limit (128)")
+		}
+		if !strings.Contains(err.Error(), "exceeds limit") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestQwpSenderGeohashPrecisionValidation(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	tests := []struct {
+		name      string
+		precision int
+		wantErr   bool
+	}{
+		{"precision_0", 0, true},
+		{"precision_1", 1, false},
+		{"precision_30", 30, false},
+		{"precision_60", 60, false},
+		{"precision_61", 61, true},
+		{"precision_negative", -1, true},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Use unique table+column names per subtest to avoid precision conflicts.
+			tblName := fmt.Sprintf("t%d", i)
+			s.Table(tblName)
+			err := s.GeohashColumn("geo", 0xABC, tt.precision).AtNow(context.Background())
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for precision %d", tt.precision)
+				}
+				if !strings.Contains(err.Error(), "out of range") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("precision %d should be valid: %v", tt.precision, err)
+				}
+				s.Flush(context.Background())
+			}
+		})
+	}
+}
+
+func TestQwpSenderTimestampNanosColumnTypeCode(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	ts := time.Date(2024, 6, 15, 10, 30, 0, 123456789, time.UTC)
+	s.Table("t")
+	err := s.TimestampNanosColumn("tsn", ts).
+		AtNow(context.Background())
+	if err != nil {
+		t.Fatalf("At: %v", err)
+	}
+
+	// Verify the column uses qwpTypeTimestampNano (0x10) not qwpTypeTimestamp (0x0A).
+	tb := s.tableBuffers["t"]
+	if tb == nil {
+		t.Fatal("table buffer not found")
+	}
+	var col *qwpColumnBuffer
+	for _, c := range tb.columns {
+		if c.name == "tsn" {
+			col = c
+			break
+		}
+	}
+	if col == nil {
+		t.Fatal("column 'tsn' not found")
+	}
+	if col.typeCode != qwpTypeTimestampNano {
+		t.Fatalf("typeCode = 0x%02X, want 0x%02X (qwpTypeTimestampNano)",
+			col.typeCode, qwpTypeTimestampNano)
+	}
+
+	// Verify the stored value is nanoseconds, not microseconds.
+	expectedNanos := ts.UnixNano()
+	if len(col.fixedData) < 8 {
+		t.Fatal("fixedData too short")
+	}
+	storedVal := int64(binary.LittleEndian.Uint64(col.fixedData[:8]))
+	if storedVal != expectedNanos {
+		t.Fatalf("stored value = %d, want %d (nanoseconds)", storedVal, expectedNanos)
+	}
+}

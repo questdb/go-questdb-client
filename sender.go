@@ -835,6 +835,7 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		return nil, err
 	}
 	s.maxBufSize = conf.maxBufSize
+	s.fileNameLimit = conf.fileNameLimit
 	if conf.closeTimeout > 0 {
 		s.closeTimeout = conf.closeTimeout
 	}

@@ -456,7 +456,15 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 		return nil
 	}
 
-	// Track and validate scale.
+	// Validate scale bounds.
+	if d.scale > maxDecimalScale {
+		return fmt.Errorf(
+			"qwp: column %q: decimal scale %d exceeds maximum %d",
+			c.name, d.scale, maxDecimalScale,
+		)
+	}
+
+	// Track and validate scale consistency.
 	if c.scale < 0 {
 		c.scale = int8(d.scale)
 	} else if uint32(c.scale) != d.scale {
@@ -505,6 +513,7 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 		}
 	}
 
+	c.trackDataGrowth(wireSize)
 	c.rowCount++
 	return nil
 }

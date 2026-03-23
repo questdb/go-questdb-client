@@ -138,6 +138,9 @@ type qwpLineSender struct {
 	// Buffer size limit. 0 means no limit.
 	maxBufSize int
 
+	// Maximum length for table and column names.
+	fileNameLimit int
+
 	// Connection and retry config.
 	retryTimeout time.Duration
 
@@ -198,9 +201,12 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 
 // qwpValidateTableName validates a table name using the same rules
 // as the existing ILP buffer.
-func qwpValidateTableName(name string) error {
+func qwpValidateTableName(name string, limit int) error {
 	if name == "" {
 		return fmt.Errorf("qwp: table name cannot be empty")
+	}
+	if limit > 0 && len(name) > limit {
+		return fmt.Errorf("qwp: table name length %d exceeds limit %d", len(name), limit)
 	}
 	if name[0] == '.' || name[len(name)-1] == '.' {
 		return fmt.Errorf("qwp: table name %q cannot start or end with '.'", name)
@@ -215,9 +221,12 @@ func qwpValidateTableName(name string) error {
 
 // qwpValidateColumnName validates a column name using the same
 // rules as the existing ILP buffer.
-func qwpValidateColumnName(name string) error {
+func qwpValidateColumnName(name string, limit int) error {
 	if name == "" {
 		return fmt.Errorf("qwp: column name cannot be empty")
+	}
+	if limit > 0 && len(name) > limit {
+		return fmt.Errorf("qwp: column name length %d exceeds limit %d", len(name), limit)
 	}
 	for i := 0; i < len(name); i++ {
 		if illegalColumnNameChar(name[i]) {
@@ -237,7 +246,7 @@ func (s *qwpLineSender) Table(name string) LineSender {
 		s.lastErr = fmt.Errorf("qwp: table %q already set; call At() or AtNow() to finalize the row first", s.currentTable.tableName)
 		return s
 	}
-	if err := qwpValidateTableName(name); err != nil {
+	if err := qwpValidateTableName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -260,7 +269,7 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		s.lastErr = fmt.Errorf("qwp: Symbol() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -298,7 +307,7 @@ func (s *qwpLineSender) Int64Column(name string, val int64) LineSender {
 		s.lastErr = fmt.Errorf("qwp: Int64Column() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -319,7 +328,7 @@ func (s *qwpLineSender) Long256Column(name string, val *big.Int) LineSender {
 		s.lastErr = fmt.Errorf("qwp: Long256Column() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -356,7 +365,7 @@ func (s *qwpLineSender) TimestampColumn(name string, ts time.Time) LineSender {
 		s.lastErr = fmt.Errorf("qwp: TimestampColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -377,7 +386,7 @@ func (s *qwpLineSender) Float64Column(name string, val float64) LineSender {
 		s.lastErr = fmt.Errorf("qwp: Float64Column() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -398,7 +407,7 @@ func (s *qwpLineSender) StringColumn(name, val string) LineSender {
 		s.lastErr = fmt.Errorf("qwp: StringColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -419,7 +428,7 @@ func (s *qwpLineSender) BoolColumn(name string, val bool) LineSender {
 		s.lastErr = fmt.Errorf("qwp: BoolColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -440,7 +449,7 @@ func (s *qwpLineSender) DecimalColumn(name string, val Decimal) LineSender {
 		s.lastErr = fmt.Errorf("qwp: DecimalColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -487,7 +496,7 @@ func (s *qwpLineSender) Float64Array1DColumn(name string, values []float64) Line
 		s.lastErr = fmt.Errorf("qwp: Float64Array1DColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -508,7 +517,7 @@ func (s *qwpLineSender) Float64Array2DColumn(name string, values [][]float64) Li
 		s.lastErr = fmt.Errorf("qwp: Float64Array2DColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -545,7 +554,7 @@ func (s *qwpLineSender) Float64Array3DColumn(name string, values [][][]float64) 
 		s.lastErr = fmt.Errorf("qwp: Float64Array3DColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -594,7 +603,7 @@ func (s *qwpLineSender) Float64ArrayNDColumn(name string, values *NdArray[float6
 	if values == nil {
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1031,7 +1040,7 @@ func (s *qwpLineSender) ByteColumn(name string, val int8) QwpSender {
 		s.lastErr = fmt.Errorf("qwp: ByteColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1052,7 +1061,7 @@ func (s *qwpLineSender) ShortColumn(name string, val int16) QwpSender {
 		s.lastErr = fmt.Errorf("qwp: ShortColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1073,7 +1082,7 @@ func (s *qwpLineSender) Int32Column(name string, val int32) QwpSender {
 		s.lastErr = fmt.Errorf("qwp: Int32Column() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1094,7 +1103,7 @@ func (s *qwpLineSender) Float32Column(name string, val float32) QwpSender {
 		s.lastErr = fmt.Errorf("qwp: Float32Column() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1115,7 +1124,7 @@ func (s *qwpLineSender) CharColumn(name string, val rune) QwpSender {
 		s.lastErr = fmt.Errorf("qwp: CharColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1136,7 +1145,7 @@ func (s *qwpLineSender) DateColumn(name string, val time.Time) QwpSender {
 		s.lastErr = fmt.Errorf("qwp: DateColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1157,17 +1166,17 @@ func (s *qwpLineSender) TimestampNanosColumn(name string, val time.Time) QwpSend
 		s.lastErr = fmt.Errorf("qwp: TimestampNanosColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeTimestamp, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeTimestampNano, false)
 	if err != nil {
 		s.lastErr = err
 		return s
 	}
-	// Store nanoseconds converted to microseconds for QWP wire format.
-	col.addTimestamp(val.UnixNano() / 1000)
+	// Store nanoseconds directly — qwpTypeTimestampNano (0x10) is int64 nanos.
+	col.addTimestamp(val.UnixNano())
 	return s
 }
 
@@ -1179,7 +1188,7 @@ func (s *qwpLineSender) UuidColumn(name string, hi, lo uint64) QwpSender {
 		s.lastErr = fmt.Errorf("qwp: UuidColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1200,7 +1209,7 @@ func (s *qwpLineSender) VarcharColumn(name string, val string) QwpSender {
 		s.lastErr = fmt.Errorf("qwp: VarcharColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1221,8 +1230,12 @@ func (s *qwpLineSender) GeohashColumn(name string, hash uint64, precision int) Q
 		s.lastErr = fmt.Errorf("qwp: GeohashColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
+		return s
+	}
+	if precision < 1 || precision > 60 {
+		s.lastErr = fmt.Errorf("qwp: GeohashColumn() precision %d out of range [1, 60]", precision)
 		return s
 	}
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeGeohash, false)
@@ -1244,7 +1257,7 @@ func (s *qwpLineSender) Int64Array1DColumn(name string, values []int64) QwpSende
 		s.lastErr = fmt.Errorf("qwp: Int64Array1DColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1265,7 +1278,7 @@ func (s *qwpLineSender) Int64Array2DColumn(name string, values [][]int64) QwpSen
 		s.lastErr = fmt.Errorf("qwp: Int64Array2DColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1301,7 +1314,7 @@ func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpS
 		s.lastErr = fmt.Errorf("qwp: Int64Array3DColumn() called without Table()")
 		return s
 	}
-	if err := qwpValidateColumnName(name); err != nil {
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
 		return s
 	}

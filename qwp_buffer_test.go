@@ -2436,3 +2436,117 @@ func TestQwpTableBufferRunningDataSizeCancelRow(t *testing.T) {
 			tb.approxDataSize(), sizeAfterCommit)
 	}
 }
+
+// TestQwpTableBufferDecimalTrackDataGrowth verifies that addDecimal
+// increments the running dataSize counter so maxBufSize enforcement
+// works correctly with decimal columns.
+func TestQwpTableBufferDecimalTrackDataGrowth(t *testing.T) {
+	iterativeSize := func(tb *qwpTableBuffer) int {
+		size := 0
+		for _, col := range tb.columns {
+			size += len(col.fixedData)
+			size += len(col.strData)
+			size += len(col.boolData)
+			size += len(col.arrayData)
+			size += len(col.symbolIDs) * 4
+			size += len(col.strOffsets) * 4
+			size += len(col.nullBitmap)
+		}
+		return size
+	}
+
+	t.Run("Decimal64", func(t *testing.T) {
+		tb := newQwpTableBuffer("dec64")
+		for i := 0; i < 5; i++ {
+			col, _ := tb.getOrCreateColumn("price", qwpTypeDecimal64, false)
+			if err := col.addDecimal(NewDecimalFromInt64(int64(100+i), 2)); err != nil {
+				t.Fatal(err)
+			}
+			col, _ = tb.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
+			col.addTimestamp(int64(1000000 + i))
+			tb.commitRow()
+
+			got := tb.approxDataSize()
+			want := iterativeSize(tb)
+			if got != want {
+				t.Fatalf("row %d: approxDataSize() = %d, iterative = %d", i, got, want)
+			}
+			if got == 0 {
+				t.Fatalf("row %d: approxDataSize() should be > 0", i)
+			}
+		}
+	})
+
+	t.Run("Decimal128", func(t *testing.T) {
+		tb := newQwpTableBuffer("dec128")
+		for i := 0; i < 3; i++ {
+			col, _ := tb.getOrCreateColumn("amount", qwpTypeDecimal128, false)
+			if err := col.addDecimal(NewDecimalFromInt64(int64(999+i), 4)); err != nil {
+				t.Fatal(err)
+			}
+			col, _ = tb.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
+			col.addTimestamp(int64(2000000 + i))
+			tb.commitRow()
+
+			got := tb.approxDataSize()
+			want := iterativeSize(tb)
+			if got != want {
+				t.Fatalf("row %d: approxDataSize() = %d, iterative = %d", i, got, want)
+			}
+		}
+	})
+
+	t.Run("Decimal256", func(t *testing.T) {
+		tb := newQwpTableBuffer("dec256")
+		col, _ := tb.getOrCreateColumn("big", qwpTypeDecimal256, false)
+		if err := col.addDecimal(NewDecimalFromInt64(42, 10)); err != nil {
+			t.Fatal(err)
+		}
+		col, _ = tb.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
+		col.addTimestamp(3000000)
+		tb.commitRow()
+
+		got := tb.approxDataSize()
+		want := iterativeSize(tb)
+		if got != want {
+			t.Fatalf("approxDataSize() = %d, iterative = %d", got, want)
+		}
+		// Decimal256 writes 32 bytes per value.
+		if got < 32 {
+			t.Fatalf("approxDataSize() = %d, expected >= 32 for Decimal256", got)
+		}
+	})
+}
+
+// TestQwpColumnBufferDecimalScaleValidation verifies that addDecimal
+// rejects scale values exceeding the maximum (76).
+func TestQwpColumnBufferDecimalScaleValidation(t *testing.T) {
+	t.Run("MaxScaleOK", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+		d := NewDecimalFromInt64(1, 76)
+		if err := c.addDecimal(d); err != nil {
+			t.Fatalf("scale 76 should be valid: %v", err)
+		}
+	})
+
+	t.Run("ScaleTooLarge", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+		d := NewDecimalFromInt64(1, 77)
+		err := c.addDecimal(d)
+		if err == nil {
+			t.Fatal("expected error for scale 77")
+		}
+		if !bytes.Contains([]byte(err.Error()), []byte("exceeds maximum")) {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("ScaleWayTooLarge", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+		d := NewDecimalFromInt64(1, 100)
+		err := c.addDecimal(d)
+		if err == nil {
+			t.Fatal("expected error for scale 100")
+		}
+	})
+}
