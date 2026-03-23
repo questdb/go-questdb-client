@@ -105,7 +105,7 @@ type qwpLineSender struct {
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
 
-	// sentSchemaHashes tracks which table schema hashes have been
+	// sentSchemaHashes tracks which (table, schema) pairs have been
 	// successfully sent to the server.
 	sentSchemaHashes map[int64]struct{}
 
@@ -699,7 +699,8 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 
 		// Encode the table into a batch payload.
 		schemaHash := tb.getSchemaHash()
-		_, schemaKnown := s.sentSchemaHashes[schemaHash]
+		skey := qwpSchemaKey(tb.tableName, schemaHash)
+		_, schemaKnown := s.sentSchemaHashes[skey]
 
 		mode := qwpSchemaModeFull
 		if schemaKnown {
@@ -732,7 +733,7 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 		}
 
 		// Optimistically mark schema as sent.
-		s.sentSchemaHashes[schemaHash] = struct{}{}
+		s.sentSchemaHashes[skey] = struct{}{}
 	}
 
 	if s.batchMaxSymbolId > s.maxSentSymbolId {
@@ -747,7 +748,8 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 // schema caching and retry logic.
 func (s *qwpLineSender) flushTable(ctx context.Context, tb *qwpTableBuffer) error {
 	schemaHash := tb.getSchemaHash()
-	_, schemaKnown := s.sentSchemaHashes[schemaHash]
+	skey := qwpSchemaKey(tb.tableName, schemaHash)
+	_, schemaKnown := s.sentSchemaHashes[skey]
 
 	err := s.transport.sendWithRetry(ctx, s.retryTimeout,
 		func() []byte {
@@ -766,7 +768,7 @@ func (s *qwpLineSender) flushTable(ctx context.Context, tb *qwpTableBuffer) erro
 		},
 		func() {
 			// Schema error callback: switch to full schema.
-			delete(s.sentSchemaHashes, schemaHash)
+			delete(s.sentSchemaHashes, skey)
 			schemaKnown = false
 		},
 	)
@@ -776,7 +778,7 @@ func (s *qwpLineSender) flushTable(ctx context.Context, tb *qwpTableBuffer) erro
 	}
 
 	// Mark schema as sent on success.
-	s.sentSchemaHashes[schemaHash] = struct{}{}
+	s.sentSchemaHashes[skey] = struct{}{}
 	return nil
 }
 

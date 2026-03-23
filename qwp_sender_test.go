@@ -1367,3 +1367,161 @@ func TestQwpSenderAsyncCloseAutoFlush(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestQwpSchemaKeyDistinguishesTables(t *testing.T) {
+	// Two tables with identical column definitions must get different
+	// schema cache keys. Without table-name-aware keying, the second
+	// table would incorrectly reuse the first table's cached schema
+	// and the server would reject it.
+
+	// Unit test for qwpSchemaKey: same schema hash, different tables.
+	schemaHash := int64(0x1234567890ABCDEF)
+	keyA := qwpSchemaKey("tableA", schemaHash)
+	keyB := qwpSchemaKey("tableB", schemaHash)
+	if keyA == keyB {
+		t.Fatalf("schema keys should differ for different table names, both = %d", keyA)
+	}
+
+	// Same table + same schema hash must produce the same key.
+	keyA2 := qwpSchemaKey("tableA", schemaHash)
+	if keyA != keyA2 {
+		t.Fatalf("same table+schema should produce same key: %d != %d", keyA, keyA2)
+	}
+}
+
+func TestQwpSenderSchemaKeyPerTable(t *testing.T) {
+	// Verify that two tables with identical columns both get full
+	// schema mode on first flush (not schema reference mode).
+	var messages [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, data, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			messages = append(messages, append([]byte(nil), data...))
+			ack := make([]byte, 9)
+			ack[0] = qwpWireStatusOK
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+
+	// Insert one row into each of two tables with identical columns.
+	s.Table("alpha").Int64Column("x", 1).AtNow(context.Background())
+	s.Table("beta").Int64Column("x", 2).AtNow(context.Background())
+	s.Flush(context.Background())
+
+	// Should have sent 2 messages (one per table in sync mode).
+	if len(messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(messages))
+	}
+
+	// Both messages must use full schema mode (0x00), not reference (0x01).
+	for i, msg := range messages {
+		schemaMode := extractSchemaMode(t, msg)
+		if schemaMode != byte(qwpSchemaModeFull) {
+			t.Fatalf("message %d: schemaMode = 0x%02X, want 0x%02X (full)",
+				i, schemaMode, qwpSchemaModeFull)
+		}
+	}
+
+	// After first flush, both keys should be cached.
+	if len(s.sentSchemaHashes) != 2 {
+		t.Fatalf("sentSchemaHashes = %d, want 2", len(s.sentSchemaHashes))
+	}
+
+	// Second flush of both tables should now use schema reference.
+	messages = messages[:0]
+	s.Table("alpha").Int64Column("x", 3).AtNow(context.Background())
+	s.Table("beta").Int64Column("x", 4).AtNow(context.Background())
+	s.Flush(context.Background())
+
+	if len(messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(messages))
+	}
+	for i, msg := range messages {
+		schemaMode := extractSchemaMode(t, msg)
+		if schemaMode != byte(qwpSchemaModeReference) {
+			t.Fatalf("message %d (2nd flush): schemaMode = 0x%02X, want 0x%02X (ref)",
+				i, schemaMode, qwpSchemaModeReference)
+		}
+	}
+}
+
+// extractSchemaMode parses a QWP message and returns the schema mode
+// byte. It skips the header, delta dict (if present), table name,
+// rowCount, and colCount to reach the schema mode byte.
+func extractSchemaMode(t *testing.T, msg []byte) byte {
+	t.Helper()
+	if len(msg) < qwpHeaderSize {
+		t.Fatalf("message too short: %d", len(msg))
+	}
+
+	off := qwpHeaderSize
+	flags := msg[qwpHeaderOffsetFlags]
+
+	// Skip delta dict if present.
+	if flags&qwpFlagDeltaSymbolDict != 0 {
+		// deltaStart varint
+		_, n, err := qwpReadVarint(msg[off:])
+		if err != nil {
+			t.Fatalf("read deltaStart: %v", err)
+		}
+		off += n
+
+		// deltaCount varint
+		deltaCount, n, err := qwpReadVarint(msg[off:])
+		if err != nil {
+			t.Fatalf("read deltaCount: %v", err)
+		}
+		off += n
+
+		// Skip delta symbol strings.
+		for i := uint64(0); i < deltaCount; i++ {
+			strLen, n, err := qwpReadVarint(msg[off:])
+			if err != nil {
+				t.Fatalf("read symbol len: %v", err)
+			}
+			off += n + int(strLen)
+		}
+	}
+
+	// Skip table name (varint string).
+	nameLen, n, err := qwpReadVarint(msg[off:])
+	if err != nil {
+		t.Fatalf("read table name len: %v", err)
+	}
+	off += n + int(nameLen)
+
+	// Skip rowCount varint.
+	_, n, err = qwpReadVarint(msg[off:])
+	if err != nil {
+		t.Fatalf("read rowCount: %v", err)
+	}
+	off += n
+
+	// Skip colCount varint.
+	_, n, err = qwpReadVarint(msg[off:])
+	if err != nil {
+		t.Fatalf("read colCount: %v", err)
+	}
+	off += n
+
+	// Schema mode byte.
+	return msg[off]
+}

@@ -38,6 +38,17 @@ const (
 	xxhPrime5 uint64 = 0x27D4EB2F165667C5
 )
 
+// qwpSchemaKey computes a cache key that combines the schema hash
+// with a hash of the table name. The server associates schema hashes
+// per table, so two tables with identical columns need distinct cache
+// keys. This mirrors the Java client's approach:
+//
+//	schemaKey = schemaHash ^ (int64(hashString(tableName)) << 32)
+func qwpSchemaKey(tableName string, schemaHash int64) int64 {
+	nameHash := int64(uint32(xxhash64([]byte(tableName), 0)))
+	return schemaHash ^ (nameHash << 32)
+}
+
 // qwpComputeSchemaHash computes the XXHash64 schema hash over the
 // column definitions. The input is the concatenation of each
 // column's UTF-8 name bytes followed by its wire type code byte.
