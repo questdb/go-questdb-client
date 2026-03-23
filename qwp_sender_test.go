@@ -1581,3 +1581,73 @@ func TestQwpAsyncNoCacheOnFlushFailure(t *testing.T) {
 			s.maxSentSymbolId)
 	}
 }
+
+func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
+	// Verify that auto-flush in async mode enqueues batches without
+	// blocking on ACKs. With window=4 and autoFlushRows=10, inserting
+	// 30 rows should enqueue 3 batches concurrently (all in-flight),
+	// not serialized (one at a time with ACK waits).
+
+	// ackGate blocks the mock server from sending ACKs until closed.
+	ackGate := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			// Block until the gate is opened.
+			<-ackGate
+
+			ack := make([]byte, 9)
+			ack[0] = qwpWireStatusOK
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	// window=4, autoFlushRows=10
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 10, 0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert 30 rows → triggers auto-flush at rows 10, 20, 30.
+	// With non-blocking auto-flush, all 3 should be enqueued without
+	// waiting for ACKs (window=4 has room for all 3).
+	for i := 0; i < 30; i++ {
+		err := s.Table("t").Int64Column("x", int64(i)).AtNow(context.Background())
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+	}
+
+	// All 30 rows have been inserted. The user goroutine returned
+	// from AtNow without blocking. Verify that multiple batches are
+	// in-flight (enqueued but not yet ACKed).
+	s.asyncState.mu.Lock()
+	count := s.asyncState.inFlightCount
+	s.asyncState.mu.Unlock()
+
+	if count < 2 {
+		t.Fatalf("expected at least 2 batches in-flight concurrently, got %d", count)
+	}
+
+	// Release the gate so the server can ACK all batches.
+	close(ackGate)
+
+	// Close the sender — this waits for all in-flight batches.
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}

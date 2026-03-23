@@ -627,6 +627,11 @@ func (s *qwpLineSender) At(ctx context.Context, ts time.Time) error {
 
 	// Check auto-flush thresholds.
 	if s.autoFlushRows > 0 && s.pendingRowCount >= s.autoFlushRows {
+		// In async mode, enqueue without waiting for ACKs so the
+		// user goroutine isn't blocked on every auto-flush.
+		if s.asyncState != nil {
+			return s.enqueueFlush(ctx)
+		}
 		return s.Flush(ctx)
 	}
 
@@ -634,6 +639,9 @@ func (s *qwpLineSender) At(ctx context.Context, ts time.Time) error {
 		if s.flushDeadline.IsZero() {
 			s.flushDeadline = time.Now().Add(s.autoFlushInterval)
 		} else if time.Now().After(s.flushDeadline) {
+			if s.asyncState != nil {
+				return s.enqueueFlush(ctx)
+			}
 			return s.Flush(ctx)
 		}
 	}
@@ -655,6 +663,12 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 		return errFlushWithPendingMessage
 	}
 	if s.pendingRowCount == 0 {
+		// In async mode, wait for any in-flight batches from
+		// previous auto-flushes to complete. This lets the user
+		// call Flush() as a barrier to confirm all data was ACKed.
+		if s.asyncState != nil {
+			return s.asyncState.waitEmpty()
+		}
 		return nil
 	}
 
@@ -762,6 +776,76 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	return nil
 }
 
+// enqueueFlush encodes all pending table buffers and enqueues them
+// for the I/O goroutine without waiting for ACKs. This is the
+// auto-flush path for async mode — At() returns promptly instead of
+// blocking on a full round-trip. Schema and symbol caches are updated
+// optimistically; if the I/O goroutine later fails, ioErr is set and
+// all subsequent operations return that error (the sender is terminal).
+//
+// This mirrors the Java client's flushPendingRows(), which enqueues
+// and updates sentSchemaHashes immediately without awaiting ACKs.
+func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
+	if s.pendingRowCount == 0 {
+		return nil
+	}
+
+	// Check for I/O errors before encoding.
+	if err := s.asyncState.checkError(); err != nil {
+		return err
+	}
+
+	for _, tb := range s.tableBuffers {
+		if tb.rowCount == 0 {
+			continue
+		}
+
+		schemaHash := tb.getSchemaHash()
+		skey := qwpSchemaKey(tb.tableName, schemaHash)
+		_, schemaKnown := s.sentSchemaHashes[skey]
+
+		mode := qwpSchemaModeFull
+		if schemaKnown {
+			mode = qwpSchemaModeReference
+		}
+		encoded := s.encoder.encodeTableWithDeltaDict(
+			tb,
+			s.globalSymbolList,
+			s.maxSentSymbolId,
+			s.batchMaxSymbolId,
+			mode,
+			schemaHash,
+		)
+
+		batch := make([]byte, len(encoded))
+		copy(batch, encoded)
+
+		if err := s.asyncState.acquireSlot(); err != nil {
+			return err
+		}
+
+		select {
+		case s.asyncState.sendCh <- batch:
+		case <-ctx.Done():
+			s.asyncState.releaseSlot()
+			return ctx.Err()
+		}
+
+		// Optimistic cache: if the batch fails, ioErr prevents
+		// further operations so stale cache entries are harmless.
+		if !schemaKnown {
+			s.sentSchemaHashes[skey] = struct{}{}
+		}
+	}
+
+	if s.batchMaxSymbolId > s.maxSentSymbolId {
+		s.maxSentSymbolId = s.batchMaxSymbolId
+	}
+
+	s.resetAfterFlush()
+	return nil
+}
+
 // flushTable encodes and sends a single table buffer, handling
 // schema caching and retry logic.
 func (s *qwpLineSender) flushTable(ctx context.Context, tb *qwpTableBuffer) error {
@@ -825,10 +909,7 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 
 	s.closed = true
 
-	var flushErr error
-	if s.pendingRowCount > 0 {
-		flushErr = s.flush0(ctx)
-	}
+	flushErr := s.flush0(ctx)
 
 	// Stop the async I/O goroutine before closing the connection.
 	if s.asyncState != nil {
@@ -855,6 +936,11 @@ func (s *qwpLineSender) flush0(ctx context.Context) error {
 		s.currentTable = nil
 	}
 	if s.pendingRowCount == 0 {
+		// In async mode, wait for any in-flight batches from
+		// previous auto-flushes before Close() tears down.
+		if s.asyncState != nil {
+			return s.asyncState.waitEmpty()
+		}
 		return nil
 	}
 
