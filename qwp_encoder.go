@@ -251,9 +251,28 @@ func (e *qwpEncoder) encodeArrayColumn(col *qwpColumnBuffer) {
 	e.wb.putBytes(col.arrayData)
 }
 
-// encodeGeohashColumn writes geohash column data: precision varint
-// followed by packed bits per row.
+// encodeGeohashColumn writes geohash column data: a precision
+// varint followed by per-row packed bytes. Each row's 8-byte
+// value from fixedData is truncated to ceil(precision/8) bytes
+// on the wire, written in little-endian byte order.
 func (e *qwpEncoder) encodeGeohashColumn(col *qwpColumnBuffer) {
-	// Geohash encoding: precision varint + packed bits per row.
-	// Will be implemented in Phase 3 geohash task.
+	precision := col.geohashPrecision
+	if precision <= 0 {
+		// No precision established (column has only nulls).
+		// Write precision 0, no per-row data needed beyond
+		// the null bitmap (already written).
+		e.wb.putVarint(0)
+		return
+	}
+
+	e.wb.putVarint(uint64(precision))
+
+	valueSize := (int(precision) + 7) / 8
+	for i := 0; i < col.rowCount; i++ {
+		off := i * 8
+		// Write only the low valueSize bytes from each 8-byte
+		// LE value. This is the same as writing the value in
+		// little-endian order truncated to valueSize bytes.
+		e.wb.putBytes(col.fixedData[off : off+valueSize])
+	}
 }

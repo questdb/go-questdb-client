@@ -21,7 +21,7 @@
 - [x] Add array column encoding: raw arrayData (per-row nDims+shape+elements). Decimal column encoding: big-endian unscaled values with scale byte in schema. Golden byte tests for 1D double array, decimal schema+data.
 - [x] Add delta symbol dictionary encoding to the encoder: encodeTableWithDeltaDict(tb, globalDict, maxSentId, batchMaxId, schemaMode, schemaHash) prepends delta dict (deltaStart+deltaCount+symbol strings) before table block, sets FLAG_DELTA_SYMBOL_DICT in header. Refactored encoder to use writeHeader/writeTableBlock/patchPayloadLength helpers. 4 tests: full golden bytes, empty delta, all-new symbols, delta+schema ref.
 - [x] Add schema hash computation: XXHash64 over column names + wire type codes in qwp_hash.go. Matches Java QwpTableBuffer.getSchemaHash(). Tests: deterministic, column change, nullable affects hash, known value, XXHash64 empty input canonical vector.
-- [ ] Add geohash column encoding to the encoder. Write golden byte test.
+- [x] Add geohash column encoding: addGeohash(value, precision) in buffer with precision tracking, truncateTo support. Encoder writes precision varint + per-row ceil(precision/8) bytes LE. 4 buffer tests + 4 encoder golden byte tests (precision 20/12/8/60, nullable, null sentinel).
 
 ## Phase 4: WebSocket Transport
 

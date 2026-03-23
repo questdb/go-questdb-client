@@ -286,6 +286,29 @@ func (c *qwpColumnBuffer) addLong256(l0, l1, l2, l3 uint64) {
 	c.rowCount++
 }
 
+// addGeohash appends a geohash value as a uint64 in LE byte order
+// (TYPE_GEOHASH). The precision (1–60 bits) is tracked per column:
+// the first non-null value establishes it, and all subsequent
+// values must use the same precision. Returns an error if the
+// precision conflicts.
+//
+// The value is stored as 8 bytes in fixedData for efficient
+// random access. At encoding time, only ceil(precision/8) bytes
+// are written to the wire per row.
+func (c *qwpColumnBuffer) addGeohash(value uint64, precision int8) error {
+	if c.geohashPrecision < 0 {
+		c.geohashPrecision = precision
+	} else if c.geohashPrecision != precision {
+		return fmt.Errorf(
+			"qwp: column %q: geohash precision %d conflicts with established precision %d",
+			c.name, precision, c.geohashPrecision,
+		)
+	}
+	c.appendU64(value)
+	c.rowCount++
+	return nil
+}
+
 // addDoubleArray appends an N-dimensional float64 array value
 // (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
 //
@@ -570,6 +593,11 @@ func (c *qwpColumnBuffer) truncateTo(n int) {
 	case qwpTypeDoubleArray, qwpTypeLongArray:
 		c.arrayOffsets = c.arrayOffsets[:n+1]
 		c.arrayData = c.arrayData[:c.arrayOffsets[n]]
+
+	case qwpTypeGeohash:
+		// Geohash stores 8 bytes per row in fixedData despite
+		// fixedSize being -1 (wire size depends on precision).
+		c.fixedData = c.fixedData[:n*8]
 
 	default:
 		// Fixed-width types.

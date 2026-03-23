@@ -1093,3 +1093,206 @@ func TestQwpEncoderDeltaDictWithSchemaRef(t *testing.T) {
 		t.Fatalf("schemaHash = %d, want %d", gotHash, schemaHash)
 	}
 }
+
+// --- Geohash encoder tests ---
+
+func TestQwpEncoderGeohashGoldenBytes(t *testing.T) {
+	// Precision=20 bits → 3 bytes per row on wire.
+	// 3 rows: 0x12345, 0xABCDE, 0x00001
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("geo", qwpTypeGeohash, false)
+	if err := col.addGeohash(0x12345, 20); err != nil {
+		t.Fatal(err)
+	}
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("geo", qwpTypeGeohash, false)
+	if err := col.addGeohash(0xABCDE, 20); err != nil {
+		t.Fatal(err)
+	}
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("geo", qwpTypeGeohash, false)
+	if err := col.addGeohash(0x00001, 20); err != nil {
+		t.Fatal(err)
+	}
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2     // table name "t"
+	off += 1     // rowCount=3
+	off += 1     // colCount=1
+	off += 1     // schemaMode=FULL
+	off += 1 + 3 + 1 // col "geo": varint(3) + "geo" + type (0x0E)
+
+	// Precision varint: 20 = 0x14
+	if msg[off] != 0x14 {
+		t.Fatalf("precision varint = 0x%02X, want 0x14", msg[off])
+	}
+	off++
+
+	// Row 0: 0x12345 → LE bytes [0x45, 0x23, 0x01] (3 bytes)
+	expected0 := []byte{0x45, 0x23, 0x01}
+	if !bytes.Equal(msg[off:off+3], expected0) {
+		t.Fatalf("row 0 = %x, want %x", msg[off:off+3], expected0)
+	}
+	off += 3
+
+	// Row 1: 0xABCDE → LE bytes [0xDE, 0xBC, 0x0A]
+	expected1 := []byte{0xDE, 0xBC, 0x0A}
+	if !bytes.Equal(msg[off:off+3], expected1) {
+		t.Fatalf("row 1 = %x, want %x", msg[off:off+3], expected1)
+	}
+	off += 3
+
+	// Row 2: 0x00001 → LE bytes [0x01, 0x00, 0x00]
+	expected2 := []byte{0x01, 0x00, 0x00}
+	if !bytes.Equal(msg[off:off+3], expected2) {
+		t.Fatalf("row 2 = %x, want %x", msg[off:off+3], expected2)
+	}
+	off += 3
+
+	if off != len(msg) {
+		t.Fatalf("unconsumed bytes: off=%d, len=%d", off, len(msg))
+	}
+}
+
+func TestQwpEncoderGeohashNullable(t *testing.T) {
+	// Precision=12 bits → 2 bytes per row.
+	// Row 0: 0xABC (non-null), Row 1: null, Row 2: 0x123 (non-null)
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("geo", qwpTypeGeohash, true)
+	if err := col.addGeohash(0xABC, 12); err != nil {
+		t.Fatal(err)
+	}
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("geo", qwpTypeGeohash, true)
+	col.addNull()
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("geo", qwpTypeGeohash, true)
+	if err := col.addGeohash(0x123, 12); err != nil {
+		t.Fatal(err)
+	}
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2     // table name "t"
+	off += 1     // rowCount=3
+	off += 1     // colCount=1
+	off += 1     // schemaMode=FULL
+	off += 1 + 3 + 1 // col "geo": varint(3) + "geo" + wireTypeCode (0x8E = nullable geohash)
+
+	// Null bitmap: row 1 null → bit 1 → 0x02
+	if msg[off] != 0x02 {
+		t.Fatalf("null bitmap = 0x%02X, want 0x02", msg[off])
+	}
+	off++
+
+	// Precision varint: 12 = 0x0C
+	if msg[off] != 0x0C {
+		t.Fatalf("precision varint = 0x%02X, want 0x0C", msg[off])
+	}
+	off++
+
+	// Row 0: 0xABC → LE [0xBC, 0x0A]
+	expected0 := []byte{0xBC, 0x0A}
+	if !bytes.Equal(msg[off:off+2], expected0) {
+		t.Fatalf("row 0 = %x, want %x", msg[off:off+2], expected0)
+	}
+	off += 2
+
+	// Row 1: null sentinel → 0xFFFFFFFFFFFFFFFF → LE [0xFF, 0xFF]
+	expected1 := []byte{0xFF, 0xFF}
+	if !bytes.Equal(msg[off:off+2], expected1) {
+		t.Fatalf("row 1 (null) = %x, want %x", msg[off:off+2], expected1)
+	}
+	off += 2
+
+	// Row 2: 0x123 → LE [0x23, 0x01]
+	expected2 := []byte{0x23, 0x01}
+	if !bytes.Equal(msg[off:off+2], expected2) {
+		t.Fatalf("row 2 = %x, want %x", msg[off:off+2], expected2)
+	}
+	off += 2
+
+	if off != len(msg) {
+		t.Fatalf("unconsumed bytes: off=%d, len=%d", off, len(msg))
+	}
+}
+
+func TestQwpEncoderGeohashPrecision8(t *testing.T) {
+	// Precision=8 bits → exactly 1 byte per row.
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("g", qwpTypeGeohash, false)
+	if err := col.addGeohash(0xAB, 8); err != nil {
+		t.Fatal(err)
+	}
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2     // table name "t"
+	off += 1     // rowCount=1
+	off += 1     // colCount=1
+	off += 1     // schemaMode=FULL
+	off += 1 + 1 + 1 // col "g": varint(1) + "g" + type
+
+	// Precision: 8
+	if msg[off] != 0x08 {
+		t.Fatalf("precision = 0x%02X, want 0x08", msg[off])
+	}
+	off++
+
+	// 1 byte: 0xAB
+	if msg[off] != 0xAB {
+		t.Fatalf("row 0 = 0x%02X, want 0xAB", msg[off])
+	}
+	off++
+
+	if off != len(msg) {
+		t.Fatalf("unconsumed bytes: off=%d, len=%d", off, len(msg))
+	}
+}
+
+func TestQwpEncoderGeohashPrecision60(t *testing.T) {
+	// Precision=60 bits → 8 bytes per row (max).
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("g", qwpTypeGeohash, false)
+	if err := col.addGeohash(0x0FFFFFFFFFFFFFFF, 60); err != nil {
+		t.Fatal(err)
+	}
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize
+	off += 2     // table name "t"
+	off += 1     // rowCount=1
+	off += 1     // colCount=1
+	off += 1     // schemaMode
+	off += 1 + 1 + 1 // col "g"
+
+	// Precision: 60 = 0x3C
+	if msg[off] != 0x3C {
+		t.Fatalf("precision = 0x%02X, want 0x3C", msg[off])
+	}
+	off++
+
+	// 8 bytes LE of 0x0FFFFFFFFFFFFFFF
+	expected := make([]byte, 8)
+	binary.LittleEndian.PutUint64(expected, 0x0FFFFFFFFFFFFFFF)
+	if !bytes.Equal(msg[off:off+8], expected) {
+		t.Fatalf("row 0 = %x, want %x", msg[off:off+8], expected)
+	}
+}

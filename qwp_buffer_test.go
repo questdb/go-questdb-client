@@ -2205,3 +2205,106 @@ func TestQwpTableBufferDecimalGapFill(t *testing.T) {
 		t.Fatalf("decimal col scale = %d, want 2", colD.scale)
 	}
 }
+
+// --- geohash column buffer tests ---
+
+func TestQwpColumnBufferGeohashBasic(t *testing.T) {
+	c := newQwpColumnBuffer("geo", qwpTypeGeohash, false)
+	if err := c.addGeohash(0x12345, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	if c.rowCount != 1 {
+		t.Fatalf("rowCount = %d, want 1", c.rowCount)
+	}
+	if c.geohashPrecision != 20 {
+		t.Fatalf("geohashPrecision = %d, want 20", c.geohashPrecision)
+	}
+	// Stored as 8 bytes LE in fixedData.
+	if len(c.fixedData) != 8 {
+		t.Fatalf("fixedData len = %d, want 8", len(c.fixedData))
+	}
+	got := binary.LittleEndian.Uint64(c.fixedData)
+	if got != 0x12345 {
+		t.Fatalf("fixedData value = 0x%X, want 0x12345", got)
+	}
+}
+
+func TestQwpColumnBufferGeohashPrecisionTracking(t *testing.T) {
+	t.Run("ConsistentPrecision", func(t *testing.T) {
+		c := newQwpColumnBuffer("geo", qwpTypeGeohash, false)
+		if err := c.addGeohash(1, 15); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addGeohash(2, 15); err != nil {
+			t.Fatal(err)
+		}
+		if c.rowCount != 2 {
+			t.Fatalf("rowCount = %d, want 2", c.rowCount)
+		}
+	})
+
+	t.Run("PrecisionConflict", func(t *testing.T) {
+		c := newQwpColumnBuffer("geo", qwpTypeGeohash, false)
+		if err := c.addGeohash(1, 15); err != nil {
+			t.Fatal(err)
+		}
+		err := c.addGeohash(2, 30)
+		if err == nil {
+			t.Fatal("expected precision conflict error")
+		}
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1 (unchanged)", c.rowCount)
+		}
+	})
+
+	t.Run("NullDoesNotSetPrecision", func(t *testing.T) {
+		c := newQwpColumnBuffer("geo", qwpTypeGeohash, true)
+		c.addNull()
+		if c.geohashPrecision != -1 {
+			t.Fatalf("geohashPrecision = %d, want -1", c.geohashPrecision)
+		}
+	})
+}
+
+func TestQwpColumnBufferGeohashNull(t *testing.T) {
+	c := newQwpColumnBuffer("geo", qwpTypeGeohash, true)
+	if err := c.addGeohash(0xABC, 12); err != nil {
+		t.Fatal(err)
+	}
+	c.addNull()
+
+	if c.rowCount != 2 {
+		t.Fatalf("rowCount = %d, want 2", c.rowCount)
+	}
+	if c.nullCount != 1 {
+		t.Fatalf("nullCount = %d, want 1", c.nullCount)
+	}
+	// Null sentinel: all bits set = MaxUint64.
+	nullVal := binary.LittleEndian.Uint64(c.fixedData[8:16])
+	if nullVal != math.MaxUint64 {
+		t.Fatalf("null sentinel = 0x%X, want 0xFFFFFFFFFFFFFFFF", nullVal)
+	}
+}
+
+func TestQwpColumnBufferGeohashTruncateTo(t *testing.T) {
+	c := newQwpColumnBuffer("geo", qwpTypeGeohash, false)
+	if err := c.addGeohash(1, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.addGeohash(2, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.addGeohash(3, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	c.truncateTo(2)
+
+	if c.rowCount != 2 {
+		t.Fatalf("rowCount = %d, want 2", c.rowCount)
+	}
+	if len(c.fixedData) != 16 {
+		t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
+	}
+}
