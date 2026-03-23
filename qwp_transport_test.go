@@ -31,6 +31,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -343,4 +344,218 @@ func TestQwpIntegrationConnect(t *testing.T) {
 		t.Fatalf("expected OK, got status 0x%02X: %s", status, errStr)
 	}
 	t.Logf("ACK OK, sequence=%d", parseAckSequence(data))
+}
+
+// --- Retry logic tests ---
+
+// buildWireAckOK builds an OK ACK using the actual wire status code.
+func buildWireAckOK(seq int64) []byte {
+	data := make([]byte, 9)
+	data[0] = qwpWireStatusOK
+	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
+	return data
+}
+
+// buildWireAckError builds an error ACK using a wire status code.
+func buildWireAckError(status byte, seq int64, errMsg string) []byte {
+	data := make([]byte, 11+len(errMsg))
+	data[0] = status
+	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
+	binary.LittleEndian.PutUint16(data[9:11], uint16(len(errMsg)))
+	copy(data[11:], errMsg)
+	return data
+}
+
+func TestQwpTransportSendWithRetrySuccess(t *testing.T) {
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		conn.Write(context.Background(), websocket.MessageBinary, buildWireAckOK(0))
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close(context.Background())
+
+	msg := []byte{0x51, 0x57, 0x50, 0x31} // dummy
+	err := tr.sendWithRetry(context.Background(), time.Second,
+		func() []byte { return msg }, nil)
+	if err != nil {
+		t.Fatalf("sendWithRetry: %v", err)
+	}
+}
+
+func TestQwpTransportSendWithRetryNonRetriable(t *testing.T) {
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		ack := buildWireAckError(qwpWireStatusParseError, 0, "bad message")
+		conn.Write(context.Background(), websocket.MessageBinary, ack)
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close(context.Background())
+
+	err := tr.sendWithRetry(context.Background(), time.Second,
+		func() []byte { return []byte{0x00} }, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	qErr, ok := err.(*QwpError)
+	if !ok {
+		t.Fatalf("expected *QwpError, got %T", err)
+	}
+	if qErr.Status != qwpWireStatusParseError {
+		t.Fatalf("status = %d, want %d", qErr.Status, qwpWireStatusParseError)
+	}
+}
+
+func TestQwpTransportSendWithRetryRecovery(t *testing.T) {
+	// Server returns INTERNAL_ERROR twice, then OK.
+	callCount := 0
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			callCount++
+			if callCount <= 2 {
+				ack := buildWireAckError(qwpWireStatusInternalError, 0, "temporary")
+				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			} else {
+				conn.Write(context.Background(), websocket.MessageBinary, buildWireAckOK(0))
+			}
+		}
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close(context.Background())
+
+	err := tr.sendWithRetry(context.Background(), 5*time.Second,
+		func() []byte { return []byte{0x00} }, nil)
+	if err != nil {
+		t.Fatalf("sendWithRetry should succeed after retries: %v", err)
+	}
+	if callCount != 3 {
+		t.Fatalf("expected 3 calls (2 retries + 1 success), got %d", callCount)
+	}
+}
+
+func TestQwpTransportSendWithRetryTimeout(t *testing.T) {
+	// Server always returns INTERNAL_ERROR.
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			ack := buildWireAckError(qwpWireStatusInternalError, 0, "always failing")
+			conn.Write(context.Background(), websocket.MessageBinary, ack)
+		}
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close(context.Background())
+
+	// Very short timeout to trigger quickly.
+	err := tr.sendWithRetry(context.Background(), 50*time.Millisecond,
+		func() []byte { return []byte{0x00} }, nil)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	_, ok := err.(*RetryTimeoutError)
+	if !ok {
+		t.Fatalf("expected *RetryTimeoutError, got %T: %v", err, err)
+	}
+}
+
+func TestQwpTransportSendWithRetryNoRetry(t *testing.T) {
+	// retryTimeout=0 means no retries even for retriable errors.
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		ack := buildWireAckError(qwpWireStatusInternalError, 0, "fail")
+		conn.Write(context.Background(), websocket.MessageBinary, ack)
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close(context.Background())
+
+	err := tr.sendWithRetry(context.Background(), 0,
+		func() []byte { return []byte{0x00} }, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	qErr, ok := err.(*QwpError)
+	if !ok {
+		t.Fatalf("expected *QwpError, got %T", err)
+	}
+	if qErr.Status != qwpWireStatusInternalError {
+		t.Fatalf("status = %d, want %d", qErr.Status, qwpWireStatusInternalError)
+	}
+}
+
+func TestQwpTransportSendWithRetrySchemaError(t *testing.T) {
+	// Server returns SCHEMA_ERROR on first call, then OK.
+	callCount := 0
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			callCount++
+			if callCount == 1 {
+				ack := buildWireAckError(qwpWireStatusSchemaError, 0, "unknown hash")
+				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			} else {
+				conn.Write(context.Background(), websocket.MessageBinary, buildWireAckOK(0))
+			}
+		}
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close(context.Background())
+
+	schemaErrorCalled := false
+	err := tr.sendWithRetry(context.Background(), time.Second,
+		func() []byte { return []byte{0x00} },
+		func() { schemaErrorCalled = true },
+	)
+	if err != nil {
+		t.Fatalf("sendWithRetry: %v", err)
+	}
+	if !schemaErrorCalled {
+		t.Fatal("onSchemaError callback should have been called")
+	}
+	if callCount != 2 {
+		t.Fatalf("expected 2 calls, got %d", callCount)
+	}
 }

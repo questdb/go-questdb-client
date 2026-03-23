@@ -29,7 +29,9 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"net/http"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -187,4 +189,101 @@ func (t *qwpTransport) close(ctx context.Context) error {
 	err := t.conn.Close(websocket.StatusNormalClosure, "")
 	t.conn = nil
 	return err
+}
+
+// sendWithRetry sends a QWP message and reads the ACK, retrying
+// on retriable errors (INTERNAL_ERROR) with exponential backoff.
+// The retryTimeout is the maximum cumulative time to spend retrying;
+// 0 means no retries. Returns nil on success, or a *QwpError on
+// server rejection, or a transport error on connection failure.
+//
+// The sendFn callback generates the message bytes. It may be called
+// multiple times if the server responds with SCHEMA_ERROR, in which
+// case onSchemaError is called first to allow the caller to switch
+// from schema-reference to full-schema mode before re-encoding.
+func (t *qwpTransport) sendWithRetry(
+	ctx context.Context,
+	retryTimeout time.Duration,
+	sendFn func() []byte,
+	onSchemaError func(),
+) error {
+	const (
+		initialInterval  = 10 * time.Millisecond
+		maxInterval      = time.Second
+		maxJitterMs      = 10
+	)
+
+	msg := sendFn()
+	if err := t.sendMessage(ctx, msg); err != nil {
+		return err
+	}
+
+	_, data, err := t.readAck(ctx)
+	if err != nil {
+		return err
+	}
+
+	qErr := newQwpErrorFromAck(data)
+	if qErr == nil {
+		return nil // OK
+	}
+
+	// Handle schema error: re-encode with full schema and resend.
+	if qErr.IsSchemaError() && onSchemaError != nil {
+		onSchemaError()
+		msg = sendFn()
+		if err := t.sendMessage(ctx, msg); err != nil {
+			return err
+		}
+		_, data, err = t.readAck(ctx)
+		if err != nil {
+			return err
+		}
+		qErr = newQwpErrorFromAck(data)
+		if qErr == nil {
+			return nil
+		}
+	}
+
+	// Non-retriable error: return immediately.
+	if !qErr.IsRetriable() || retryTimeout <= 0 {
+		return qErr
+	}
+
+	// Retry loop with exponential backoff.
+	retryStart := time.Now()
+	interval := initialInterval
+
+	for qErr != nil && qErr.IsRetriable() {
+		if time.Since(retryStart) > retryTimeout {
+			return NewRetryTimeoutError(retryTimeout, qErr)
+		}
+
+		jitter := time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval + jitter):
+		}
+
+		msg = sendFn()
+		if err := t.sendMessage(ctx, msg); err != nil {
+			return err
+		}
+		_, data, err = t.readAck(ctx)
+		if err != nil {
+			return err
+		}
+		qErr = newQwpErrorFromAck(data)
+
+		interval *= 2
+		if interval > maxInterval {
+			interval = maxInterval
+		}
+	}
+
+	if qErr != nil {
+		return qErr
+	}
+	return nil
 }
