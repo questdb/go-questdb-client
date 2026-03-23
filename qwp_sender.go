@@ -954,8 +954,9 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 	return closeErr
 }
 
-// flush0 is the internal flush used by Close. It doesn't check
-// the closed flag.
+// flush0 is the internal flush used by Close in sync mode. The async
+// Close path uses enqueueFlush + stop() directly, so this function
+// is only called when asyncState == nil.
 func (s *qwpLineSender) flush0(ctx context.Context) error {
 	if s.hasTable {
 		// Drop the pending row silently on close.
@@ -966,22 +967,10 @@ func (s *qwpLineSender) flush0(ctx context.Context) error {
 		s.currentTable = nil
 	}
 	if s.pendingRowCount == 0 {
-		// In async mode, wait for any in-flight batches from
-		// previous auto-flushes before Close() tears down.
-		if s.asyncState != nil {
-			return s.asyncState.waitEmpty()
-		}
 		return nil
 	}
 
 	defer s.resetAfterFlush()
-
-	// Route through the async path if async mode is active,
-	// so the ioLoop goroutine owns all transport access.
-	if s.asyncState != nil {
-		return s.flushAsync(ctx)
-	}
-
 	return s.flushSync(ctx)
 }
 

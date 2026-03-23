@@ -111,7 +111,7 @@ The goal is ZERO allocations per flush at steady state in sync mode. Current ben
 
 - [ ] **Add full-sender steady-state benchmark.** The existing `BenchmarkQwpFlush` tests raw buffer+encoder operations, not the sender layer. Add `BenchmarkQwpSenderSteadyState` that: (1) creates a `qwpLineSender` with a mock transport (or nil transport + skip send), (2) warms up with 100 rows across 2 flushes, (3) benchmarks the loop: `Table("t").Symbol("sym","AAPL").Int64Column("qty",100).Float64Column("price",150.5).StringColumn("note","test").At(ctx,ts)` for 10 rows, then calls a mock flush that exercises encoding but skips network. Verify `0 allocs/op` and `0 B/op` at steady state. This is the definitive proof that the hot path is allocation-free.
 
-- [ ] **Clean up dead code: async branch in `flush0`.** In `qwp_sender.go`, `flush0` (called from `Close`) has `if s.asyncState != nil { return s.flushAsync(ctx) }` — but after the Phase 11 restructuring, the async `Close()` path uses `enqueueFlush` + `stop()` directly, never going through `flush0`. This async branch is dead code. Remove it and add a comment explaining the async close path goes through `enqueueFlush`. This is a minor cleanup, not a performance fix.
+- [x] **Clean up dead code: async branch in `flush0`.** In `qwp_sender.go`, `flush0` (called from `Close`) has `if s.asyncState != nil { return s.flushAsync(ctx) }` — but after the Phase 11 restructuring, the async `Close()` path uses `enqueueFlush` + `stop()` directly, never going through `flush0`. This async branch is dead code. Remove it and add a comment explaining the async close path goes through `enqueueFlush`. This is a minor cleanup, not a performance fix.
 
 ## Completed
 - [x] Project initialization and exploration
