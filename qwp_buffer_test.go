@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"math/big"
 	"testing"
 )
 
@@ -1817,4 +1818,390 @@ func TestQwpColumnBufferArrayWireTypeCode(t *testing.T) {
 			t.Fatalf("wireTypeCode = 0x%02X, want 0x92", c.wireTypeCode())
 		}
 	})
+}
+
+// --- decimal column buffer tests ---
+
+func TestQwpColumnBufferDecimal64Basic(t *testing.T) {
+	c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+	// 12345 with scale 2 → represents 123.45
+	d := NewDecimalFromInt64(12345, 2)
+	if err := c.addDecimal(d); err != nil {
+		t.Fatal(err)
+	}
+
+	if c.rowCount != 1 {
+		t.Fatalf("rowCount = %d, want 1", c.rowCount)
+	}
+	if c.scale != 2 {
+		t.Fatalf("scale = %d, want 2", c.scale)
+	}
+	if len(c.fixedData) != 8 {
+		t.Fatalf("fixedData len = %d, want 8", len(c.fixedData))
+	}
+
+	// 12345 = 0x3039 → big-endian 8 bytes: [0,0,0,0,0,0,0x30,0x39]
+	expected := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x39}
+	if !bytes.Equal(c.fixedData, expected) {
+		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+	}
+}
+
+func TestQwpColumnBufferDecimal64Negative(t *testing.T) {
+	c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+	// -42 with scale 0
+	d := NewDecimalFromInt64(-42, 0)
+	if err := c.addDecimal(d); err != nil {
+		t.Fatal(err)
+	}
+
+	// -42 in two's complement big-endian 8 bytes:
+	// [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xD6]
+	expected := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xD6}
+	if !bytes.Equal(c.fixedData, expected) {
+		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+	}
+}
+
+func TestQwpColumnBufferDecimal64Zero(t *testing.T) {
+	c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+	d := NewDecimalFromInt64(0, 5)
+	if err := c.addDecimal(d); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := make([]byte, 8) // all zeros
+	if !bytes.Equal(c.fixedData, expected) {
+		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+	}
+	if c.scale != 5 {
+		t.Fatalf("scale = %d, want 5", c.scale)
+	}
+}
+
+func TestQwpColumnBufferDecimal128(t *testing.T) {
+	c := newQwpColumnBuffer("amount", qwpTypeDecimal128, false)
+	d := NewDecimalFromInt64(999999999, 4)
+	if err := c.addDecimal(d); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(c.fixedData) != 16 {
+		t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
+	}
+
+	// 999999999 = 0x3B9AC9FF → big-endian 16 bytes
+	expected := make([]byte, 16)
+	expected[12] = 0x3B
+	expected[13] = 0x9A
+	expected[14] = 0xC9
+	expected[15] = 0xFF
+	if !bytes.Equal(c.fixedData, expected) {
+		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+	}
+}
+
+func TestQwpColumnBufferDecimal128Negative(t *testing.T) {
+	c := newQwpColumnBuffer("amount", qwpTypeDecimal128, false)
+	d := NewDecimalFromInt64(-1, 0)
+	if err := c.addDecimal(d); err != nil {
+		t.Fatal(err)
+	}
+
+	// -1 in two's complement 16 bytes: all 0xFF
+	expected := bytes.Repeat([]byte{0xFF}, 16)
+	if !bytes.Equal(c.fixedData, expected) {
+		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+	}
+}
+
+func TestQwpColumnBufferDecimal256(t *testing.T) {
+	c := newQwpColumnBuffer("amount", qwpTypeDecimal256, false)
+	d := NewDecimalFromInt64(42, 10)
+	if err := c.addDecimal(d); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(c.fixedData) != 32 {
+		t.Fatalf("fixedData len = %d, want 32", len(c.fixedData))
+	}
+
+	// 42 = 0x2A → big-endian 32 bytes: last byte is 0x2A, rest 0x00
+	expected := make([]byte, 32)
+	expected[31] = 0x2A
+	if !bytes.Equal(c.fixedData, expected) {
+		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+	}
+	if c.scale != 10 {
+		t.Fatalf("scale = %d, want 10", c.scale)
+	}
+}
+
+func TestQwpColumnBufferDecimal256Negative(t *testing.T) {
+	c := newQwpColumnBuffer("amount", qwpTypeDecimal256, false)
+	d := NewDecimalFromInt64(-42, 0)
+	if err := c.addDecimal(d); err != nil {
+		t.Fatal(err)
+	}
+
+	// -42 in two's complement 32 bytes: leading 0xFF, last byte 0xD6
+	expected := bytes.Repeat([]byte{0xFF}, 32)
+	expected[31] = 0xD6
+	if !bytes.Equal(c.fixedData, expected) {
+		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+	}
+}
+
+func TestQwpColumnBufferDecimalScaleTracking(t *testing.T) {
+	t.Run("FirstValueSetsScale", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+		if c.scale != -1 {
+			t.Fatalf("initial scale = %d, want -1", c.scale)
+		}
+
+		d := NewDecimalFromInt64(100, 3)
+		if err := c.addDecimal(d); err != nil {
+			t.Fatal(err)
+		}
+		if c.scale != 3 {
+			t.Fatalf("scale = %d, want 3", c.scale)
+		}
+	})
+
+	t.Run("ConsistentScale", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+		if err := c.addDecimal(NewDecimalFromInt64(100, 2)); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(NewDecimalFromInt64(200, 2)); err != nil {
+			t.Fatal(err)
+		}
+		if c.rowCount != 2 {
+			t.Fatalf("rowCount = %d, want 2", c.rowCount)
+		}
+	})
+
+	t.Run("ScaleConflict", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+		if err := c.addDecimal(NewDecimalFromInt64(100, 2)); err != nil {
+			t.Fatal(err)
+		}
+
+		err := c.addDecimal(NewDecimalFromInt64(200, 5))
+		if err == nil {
+			t.Fatal("expected scale conflict error")
+		}
+		// rowCount should not have incremented on error.
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1 (unchanged after error)", c.rowCount)
+		}
+	})
+
+	t.Run("NullDoesNotSetScale", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, true)
+		c.addNull() // null first
+
+		if c.scale != -1 {
+			t.Fatalf("scale after null = %d, want -1", c.scale)
+		}
+
+		// Now set a non-null value.
+		if err := c.addDecimal(NewDecimalFromInt64(100, 7)); err != nil {
+			t.Fatal(err)
+		}
+		if c.scale != 7 {
+			t.Fatalf("scale = %d, want 7", c.scale)
+		}
+	})
+
+	t.Run("NullDecimalCallsAddNull", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, true)
+		// Construct a null Decimal.
+		d, err := NewDecimalUnsafe(nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err != nil {
+			t.Fatal(err)
+		}
+
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+		if c.nullCount != 1 {
+			t.Fatalf("nullCount = %d, want 1", c.nullCount)
+		}
+		// Data should be 8 zero bytes (null sentinel).
+		expected := make([]byte, 8)
+		if !bytes.Equal(c.fixedData, expected) {
+			t.Fatalf("fixedData = %x, want all zeros", c.fixedData)
+		}
+	})
+
+	t.Run("ScalePersistsAcrossReset", func(t *testing.T) {
+		c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+		if err := c.addDecimal(NewDecimalFromInt64(100, 4)); err != nil {
+			t.Fatal(err)
+		}
+		c.reset()
+
+		// Scale should persist — it's a column property, not row data.
+		if c.scale != 4 {
+			t.Fatalf("scale after reset = %d, want 4", c.scale)
+		}
+
+		// Adding with same scale should still work.
+		if err := c.addDecimal(NewDecimalFromInt64(200, 4)); err != nil {
+			t.Fatal(err)
+		}
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+	})
+}
+
+func TestQwpColumnBufferDecimalOverflow(t *testing.T) {
+	t.Run("Decimal64Overflow", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal64, false)
+
+		// Create a value that requires more than 8 bytes.
+		// Use a big.Int larger than int64 max.
+		bigVal := new(big.Int).Lsh(big.NewInt(1), 64) // 2^64
+		d, err := NewDecimal(bigVal, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = c.addDecimal(d)
+		if err == nil {
+			t.Fatal("expected overflow error for DECIMAL64")
+		}
+		if c.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0 (unchanged after error)", c.rowCount)
+		}
+	})
+
+	t.Run("Decimal128FitsLargeValue", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal128, false)
+
+		// 2^64 fits in 16 bytes (needs 9 bytes: 0x01 + 8 zero bytes).
+		bigVal := new(big.Int).Lsh(big.NewInt(1), 64)
+		d, err := NewDecimal(bigVal, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := c.addDecimal(d); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+	})
+}
+
+func TestQwpColumnBufferDecimalMultipleRows(t *testing.T) {
+	c := newQwpColumnBuffer("price", qwpTypeDecimal64, false)
+	if err := c.addDecimal(NewDecimalFromInt64(100, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.addDecimal(NewDecimalFromInt64(-50, 2)); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(c.fixedData) != 16 { // 2 rows × 8 bytes
+		t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
+	}
+
+	// Row 0: 100 = 0x64 → [0,0,0,0,0,0,0,0x64]
+	row0 := c.fixedData[0:8]
+	expected0 := []byte{0, 0, 0, 0, 0, 0, 0, 0x64}
+	if !bytes.Equal(row0, expected0) {
+		t.Fatalf("row 0 = %x, want %x", row0, expected0)
+	}
+
+	// Row 1: -50 = 0xCE in two's complement → [0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xCE]
+	row1 := c.fixedData[8:16]
+	expected1 := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xCE}
+	if !bytes.Equal(row1, expected1) {
+		t.Fatalf("row 1 = %x, want %x", row1, expected1)
+	}
+}
+
+func TestQwpColumnBufferDecimalNullInterleaved(t *testing.T) {
+	c := newQwpColumnBuffer("price", qwpTypeDecimal64, true)
+	if err := c.addDecimal(NewDecimalFromInt64(100, 2)); err != nil {
+		t.Fatal(err)
+	}
+	c.addNull() // row 1: null
+	if err := c.addDecimal(NewDecimalFromInt64(200, 2)); err != nil {
+		t.Fatal(err)
+	}
+
+	if c.rowCount != 3 {
+		t.Fatalf("rowCount = %d, want 3", c.rowCount)
+	}
+	if c.nullCount != 1 {
+		t.Fatalf("nullCount = %d, want 1", c.nullCount)
+	}
+	// Bitmap: row 1 null → bit 1 → 0x02
+	if !bytes.Equal(c.nullBitmap, []byte{0x02}) {
+		t.Fatalf("nullBitmap = %x, want [02]", c.nullBitmap)
+	}
+
+	// Row 1 should be 8 zero bytes (null sentinel).
+	nullRow := c.fixedData[8:16]
+	if !bytes.Equal(nullRow, make([]byte, 8)) {
+		t.Fatalf("null row = %x, want all zeros", nullRow)
+	}
+}
+
+func TestQwpColumnBufferDecimalWireTypeCode(t *testing.T) {
+	t.Run("Decimal64", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDecimal64, false)
+		if c.wireTypeCode() != 0x13 {
+			t.Fatalf("wireTypeCode = 0x%02X, want 0x13", c.wireTypeCode())
+		}
+	})
+	t.Run("Decimal128Nullable", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDecimal128, true)
+		// 0x14 | 0x80 = 0x94
+		if c.wireTypeCode() != 0x94 {
+			t.Fatalf("wireTypeCode = 0x%02X, want 0x94", c.wireTypeCode())
+		}
+	})
+	t.Run("Decimal256", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeDecimal256, false)
+		if c.wireTypeCode() != 0x15 {
+			t.Fatalf("wireTypeCode = 0x%02X, want 0x15", c.wireTypeCode())
+		}
+	})
+}
+
+func TestQwpTableBufferDecimalGapFill(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+
+	colA, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+	colA.addLong(100)
+	colD, _ := tb.getOrCreateColumn("d", qwpTypeDecimal64, true)
+	if err := colD.addDecimal(NewDecimalFromInt64(42, 2)); err != nil {
+		t.Fatal(err)
+	}
+	tb.commitRow()
+
+	// Row 1: only set "a" → "d" should be gap-filled with null.
+	colA, _ = tb.getOrCreateColumn("a", qwpTypeLong, false)
+	colA.addLong(200)
+	tb.commitRow()
+
+	if colD.rowCount != 2 {
+		t.Fatalf("decimal col rowCount = %d, want 2", colD.rowCount)
+	}
+	if colD.nullCount != 1 {
+		t.Fatalf("decimal col nullCount = %d, want 1", colD.nullCount)
+	}
+	// Scale should still be 2 (set by row 0).
+	if colD.scale != 2 {
+		t.Fatalf("decimal col scale = %d, want 2", colD.scale)
+	}
 }

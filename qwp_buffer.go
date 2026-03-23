@@ -354,6 +354,76 @@ func (c *qwpColumnBuffer) addLongArray(nDims uint8, shape []int32, flatData []in
 	c.rowCount++
 }
 
+// addDecimal appends a Decimal value to a decimal column
+// (TYPE_DECIMAL64, TYPE_DECIMAL128, or TYPE_DECIMAL256). The
+// unscaled value is written in big-endian byte order, sign-extended
+// to fill the column's fixed width (8, 16, or 32 bytes).
+//
+// Scale is tracked per column: the first non-null value establishes
+// the scale, and all subsequent values must have the same scale.
+// Returns an error if the scale conflicts or the value overflows
+// the column's storage size.
+//
+// If the Decimal is null, addNull() is called instead.
+func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
+	if d.isNull() {
+		c.addNull()
+		return nil
+	}
+
+	// Track and validate scale.
+	if c.scale < 0 {
+		c.scale = int8(d.scale)
+	} else if uint32(c.scale) != d.scale {
+		return fmt.Errorf(
+			"qwp: column %q: decimal scale %d conflicts with established scale %d",
+			c.name, d.scale, c.scale,
+		)
+	}
+
+	wireSize := c.fixedSize // 8, 16, or 32
+	startOffset := uint8(32 - wireSize)
+
+	// Check for overflow: significant bytes that don't fit.
+	if d.offset < startOffset {
+		// Verify the bytes beyond wire size are pure sign extension.
+		signByte := byte(0x00)
+		if d.unscaled[d.offset]&0x80 != 0 {
+			signByte = 0xFF
+		}
+		for i := d.offset; i < startOffset; i++ {
+			if d.unscaled[i] != signByte {
+				return fmt.Errorf(
+					"qwp: column %q: decimal value overflows %d-byte storage",
+					c.name, wireSize,
+				)
+			}
+		}
+	}
+
+	// Write sign-extended big-endian unscaled value.
+	n := len(c.fixedData)
+	c.fixedData = append(c.fixedData, make([]byte, wireSize)...)
+	dst := c.fixedData[n:]
+
+	var signByte byte
+	if d.offset < 32 && d.unscaled[d.offset]&0x80 != 0 {
+		signByte = 0xFF
+	}
+
+	for i := range dst {
+		srcIdx := startOffset + uint8(i)
+		if srcIdx < d.offset {
+			dst[i] = signByte
+		} else {
+			dst[i] = d.unscaled[srcIdx]
+		}
+	}
+
+	c.rowCount++
+	return nil
+}
+
 // addNull appends a type-appropriate null sentinel value. For
 // nullable columns, the corresponding null bitmap bit is also set.
 // Sentinel values match the QuestDB conventions:
