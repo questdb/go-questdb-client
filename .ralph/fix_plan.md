@@ -93,7 +93,7 @@ These are bugs and design issues found during architectural review. They range f
 
 - [x] **MINOR: No maxBufSize enforcement on columnar buffers.** `sanitizeQwpConf()` rejects `maxBufSize != 0` as an error, but there's no size tracking at all. A user can accumulate unbounded data in columnar buffers before flushing, potentially exhausting memory. **Fix:** Track approximate buffer size in `qwpTableBuffer` (increment on each add, decrement on reset). Check against a configurable limit in `At()` and return an error if exceeded. Accept `maxBufSize` in config instead of rejecting it. Write a test that verifies the error when buffer limit is exceeded.
 
-- [ ] **MINOR: Long256 wire format — verify endianness.** The spec (01-qwp-protocol.md) says Long256 is "32 bytes, four int64s, little-endian" but the original Java `QwpConstants.java` says "32 bytes big-endian". Read the Java client's `QwpColumnWriter.java` to see how Long256 is actually encoded on the wire and compare with the Go implementation in `qwp_buffer.go:addLong256()`. If there's a mismatch, fix the Go encoding. Write a golden byte test with a known Long256 value verified against the Java output.
+- [x] **MINOR: Long256 wire format — verify endianness.** The spec (01-qwp-protocol.md) says Long256 is "32 bytes, four int64s, little-endian" but the original Java `QwpConstants.java` says "32 bytes big-endian". Read the Java client's `QwpColumnWriter.java` to see how Long256 is actually encoded on the wire and compare with the Go implementation in `qwp_buffer.go:addLong256()`. If there's a mismatch, fix the Go encoding. Write a golden byte test with a known Long256 value verified against the Java output.
 
 ## Completed
 - [x] Project initialization and exploration
