@@ -148,12 +148,14 @@ func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer, schemaMode qwpSchemaMod
 // --- schema ---
 
 // encodeSchemaFull writes full column definitions: for each column,
-// the name (varint string) and wire type code. Decimal columns get
-// an extra scale byte.
+// the name (varint string) and base type code (without the 0x80
+// nullable flag — nullability is signaled via the null bitmap flag
+// byte in the data section). Decimal columns get an extra scale
+// byte after the type code.
 func (e *qwpEncoder) encodeSchemaFull(tb *qwpTableBuffer) {
 	for _, col := range tb.columns {
 		e.wb.putString(col.name)
-		e.wb.putByte(col.wireTypeCode())
+		e.wb.putByte(byte(col.typeCode)) // base type code, no nullable flag
 		if qwpIsDecimalType(col.typeCode) {
 			if col.scale >= 0 {
 				e.wb.putByte(byte(col.scale))
@@ -171,12 +173,14 @@ func (e *qwpEncoder) encodeSchemaFull(tb *qwpTableBuffer) {
 const qwpEncodingUncompressed byte = 0x00
 
 // encodeColumnData writes the wire-format data for a single column.
-// For nullable columns, the null bitmap is written first. Then the
-// type-specific data follows.
+// Every column starts with a null bitmap flag byte:
+//   - 0x00: no nulls in this column
+//   - non-zero: null bitmap follows (ceil(rowCount/8) bytes)
+//
+// After the flag (and optional bitmap), the type-specific data follows.
 func (e *qwpEncoder) encodeColumnData(col *qwpColumnBuffer) {
-	if col.nullable {
-		e.encodeNullBitmap(col)
-	}
+	// Write null bitmap flag + optional bitmap for every column.
+	e.encodeNullBitmapFlag(col)
 
 	switch col.typeCode {
 	case qwpTypeBoolean:
@@ -210,11 +214,19 @@ func (e *qwpEncoder) encodeColumnData(col *qwpColumnBuffer) {
 	}
 }
 
-// encodeNullBitmap writes the null bitmap for a nullable column.
-// The bitmap has (rowCount+7)/8 bytes with LSB-first bit packing.
-// The column's nullBitmap may be shorter if trailing rows are
-// non-null; missing bytes are padded with zeros.
-func (e *qwpEncoder) encodeNullBitmap(col *qwpColumnBuffer) {
+// encodeNullBitmapFlag writes the null bitmap flag byte and optional
+// bitmap for a column. The format is:
+//   - 0x00 flag byte if the column has no nulls (1 byte total)
+//   - 0x01 flag byte + bitmap bytes if nulls are present
+//     (1 + ceil(rowCount/8) bytes total)
+func (e *qwpEncoder) encodeNullBitmapFlag(col *qwpColumnBuffer) {
+	if col.nullCount == 0 {
+		e.wb.putByte(0x00)
+		return
+	}
+
+	// Has nulls: write flag byte (0x01) then the bitmap.
+	e.wb.putByte(0x01)
 	bitmapLen := col.nullBitmapLen()
 	for i := 0; i < bitmapLen; i++ {
 		if i < len(col.nullBitmap) {

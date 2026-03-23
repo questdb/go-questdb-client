@@ -81,14 +81,16 @@ func TestQwpEncoderFixedWidthGoldenBytes(t *testing.T) {
 	// Column "b": name varint(1) + 'b', type DOUBLE (0x07)
 	expected = append(expected, 0x01, 0x62, 0x07)
 
-	// Column "a" data: 2 × int64 LE
+	// Column "a" data: null bitmap flag (0x00) + 2 × int64 LE
+	expected = append(expected, 0x00) // null bitmap flag: no nulls
 	buf8 := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf8, 1)
 	expected = append(expected, buf8...)
 	binary.LittleEndian.PutUint64(buf8, 2)
 	expected = append(expected, buf8...)
 
-	// Column "b" data: 2 × float64 LE
+	// Column "b" data: null bitmap flag (0x00) + 2 × float64 LE
+	expected = append(expected, 0x00) // null bitmap flag: no nulls
 	binary.LittleEndian.PutUint64(buf8, math.Float64bits(1.5))
 	expected = append(expected, buf8...)
 	binary.LittleEndian.PutUint64(buf8, math.Float64bits(2.5))
@@ -174,7 +176,11 @@ func TestQwpEncoderSchemaReference(t *testing.T) {
 	}
 	off += 8
 
-	// Column data: 1 × int64 LE = 10.
+	// Column data: null bitmap flag (0x00) + 1 × int64 LE = 10.
+	if msg[off] != 0x00 {
+		t.Fatalf("null bitmap flag = 0x%02X, want 0x00", msg[off])
+	}
+	off++
 	gotVal := int64(binary.LittleEndian.Uint64(msg[off : off+8]))
 	if gotVal != 10 {
 		t.Fatalf("column value = %d, want 10", gotVal)
@@ -278,48 +284,57 @@ func TestQwpEncoderAllFixedTypes(t *testing.T) {
 	}
 
 	// Now verify column data bytes.
-	// Column "b" (BYTE): 1 byte
+	// Each column starts with null bitmap flag byte (0x00 = no nulls).
+
+	// Column "b" (BYTE): flag + 1 byte
+	off++ // null bitmap flag
 	if msg[off] != 42 {
 		t.Fatalf("byte col = %d, want 42", msg[off])
 	}
 	off++
 
-	// Column "s" (SHORT): 2 bytes LE
+	// Column "s" (SHORT): flag + 2 bytes LE
+	off++ // null bitmap flag
 	gotShort := int16(binary.LittleEndian.Uint16(msg[off:]))
 	if gotShort != 1000 {
 		t.Fatalf("short col = %d, want 1000", gotShort)
 	}
 	off += 2
 
-	// Column "i" (INT): 4 bytes LE
+	// Column "i" (INT): flag + 4 bytes LE
+	off++ // null bitmap flag
 	gotInt := int32(binary.LittleEndian.Uint32(msg[off:]))
 	if gotInt != 100000 {
 		t.Fatalf("int col = %d, want 100000", gotInt)
 	}
 	off += 4
 
-	// Column "l" (LONG): 8 bytes LE
+	// Column "l" (LONG): flag + 8 bytes LE
+	off++ // null bitmap flag
 	gotLong := int64(binary.LittleEndian.Uint64(msg[off:]))
 	if gotLong != 9876543210 {
 		t.Fatalf("long col = %d, want 9876543210", gotLong)
 	}
 	off += 8
 
-	// Column "f" (FLOAT): 4 bytes LE
+	// Column "f" (FLOAT): flag + 4 bytes LE
+	off++ // null bitmap flag
 	gotFloat := math.Float32frombits(binary.LittleEndian.Uint32(msg[off:]))
 	if gotFloat != 3.14 {
 		t.Fatalf("float col = %v, want 3.14", gotFloat)
 	}
 	off += 4
 
-	// Column "d" (DOUBLE): 8 bytes LE
+	// Column "d" (DOUBLE): flag + 8 bytes LE
+	off++ // null bitmap flag
 	gotDouble := math.Float64frombits(binary.LittleEndian.Uint64(msg[off:]))
 	if gotDouble != 2.71828 {
 		t.Fatalf("double col = %v, want 2.71828", gotDouble)
 	}
 	off += 8
 
-	// Column "ts" (TIMESTAMP): encoding byte + 8 bytes LE
+	// Column "ts" (TIMESTAMP): flag + encoding byte + 8 bytes LE
+	off++ // null bitmap flag
 	if msg[off] != qwpEncodingUncompressed {
 		t.Fatalf("timestamp encoding = 0x%02X, want 0x00", msg[off])
 	}
@@ -330,21 +345,24 @@ func TestQwpEncoderAllFixedTypes(t *testing.T) {
 	}
 	off += 8
 
-	// Column "ch" (CHAR): 2 bytes LE
+	// Column "ch" (CHAR): flag + 2 bytes LE
+	off++ // null bitmap flag
 	gotChar := binary.LittleEndian.Uint16(msg[off:])
 	if gotChar != 0x0041 {
 		t.Fatalf("char col = 0x%04X, want 0x0041", gotChar)
 	}
 	off += 2
 
-	// Column "dt" (DATE): 8 bytes LE
+	// Column "dt" (DATE): flag + 8 bytes LE
+	off++ // null bitmap flag
 	gotDate := int64(binary.LittleEndian.Uint64(msg[off:]))
 	if gotDate != 9999999999 {
 		t.Fatalf("date col = %d, want 9999999999", gotDate)
 	}
 	off += 8
 
-	// Column "u" (UUID): 16 bytes (lo LE then hi LE)
+	// Column "u" (UUID): flag + 16 bytes (lo LE then hi LE)
+	off++ // null bitmap flag
 	gotLo := binary.LittleEndian.Uint64(msg[off:])
 	gotHi := binary.LittleEndian.Uint64(msg[off+8:])
 	if gotLo != 0x1122334455667788 || gotHi != 0xAABBCCDDEEFF0011 {
@@ -352,7 +370,8 @@ func TestQwpEncoderAllFixedTypes(t *testing.T) {
 	}
 	off += 16
 
-	// Column "l256" (LONG256): 32 bytes (4 × int64 LE)
+	// Column "l256" (LONG256): flag + 32 bytes (4 × int64 LE)
+	off++ // null bitmap flag
 	for i, want := range []uint64{1, 2, 3, 4} {
 		got := binary.LittleEndian.Uint64(msg[off:])
 		if got != want {
@@ -361,7 +380,8 @@ func TestQwpEncoderAllFixedTypes(t *testing.T) {
 		off += 8
 	}
 
-	// Column "tsn" (TIMESTAMP_NANOS): encoding byte + 8 bytes LE
+	// Column "tsn" (TIMESTAMP_NANOS): flag + encoding byte + 8 bytes LE
+	off++ // null bitmap flag
 	if msg[off] != qwpEncodingUncompressed {
 		t.Fatalf("timestamp_nanos encoding = 0x%02X, want 0x00", msg[off])
 	}
@@ -405,14 +425,20 @@ func TestQwpEncoderNullableColumn(t *testing.T) {
 	off += 1 + 1
 	// schemaMode=FULL
 	off++
-	// Column "v": varint(1) + 'v' + typeCode (LONG|nullable = 0x85)
+	// Column "v": varint(1) + 'v' + typeCode (LONG = 0x05, no nullable flag)
 	off += 2
-	if msg[off] != 0x85 {
-		t.Fatalf("wireTypeCode = 0x%02X, want 0x85", msg[off])
+	if msg[off] != 0x05 {
+		t.Fatalf("wireTypeCode = 0x%02X, want 0x05", msg[off])
 	}
 	off++
 
-	// Null bitmap: (3+7)/8 = 1 byte. Row 1 is null → bit 1 → 0x02.
+	// Null bitmap flag: 0x01 (has nulls).
+	if msg[off] != 0x01 {
+		t.Fatalf("nullBitmapFlag = 0x%02X, want 0x01", msg[off])
+	}
+	off++
+
+	// Null bitmap: row 1 null → bit 1 → 0x02.
 	if msg[off] != 0x02 {
 		t.Fatalf("nullBitmap = 0x%02X, want 0x02", msg[off])
 	}
@@ -472,16 +498,16 @@ func TestQwpEncoderMultipleColumns(t *testing.T) {
 	// colCount=3: 1 byte
 	// schemaMode: 1 byte
 	// 3 columns × (varint(1) + name(1) + type(1)) = 9 bytes
-	// 3 columns × 2 rows × 4 bytes = 24 bytes
-	// Total payload = 6 + 1 + 1 + 1 + 9 + 24 = 42
-	// Total message = 12 + 42 = 54
+	// 3 columns × (1 flag byte + 2 rows × 4 bytes) = 3 × 9 = 27 bytes
+	// Total payload = 6 + 1 + 1 + 1 + 9 + 27 = 45
+	// Total message = 12 + 45 = 57
 
 	payloadLen := binary.LittleEndian.Uint32(msg[8:12])
-	if payloadLen != 42 {
-		t.Fatalf("payloadLength = %d, want 42", payloadLen)
+	if payloadLen != 45 {
+		t.Fatalf("payloadLength = %d, want 45", payloadLen)
 	}
-	if len(msg) != 54 {
-		t.Fatalf("message length = %d, want 54", len(msg))
+	if len(msg) != 57 {
+		t.Fatalf("message length = %d, want 57", len(msg))
 	}
 }
 
@@ -608,6 +634,9 @@ func TestQwpEncoderDecimalSchema(t *testing.T) {
 	}
 	off++
 
+	// Null bitmap flag: 0x00 (no nulls)
+	off++
+
 	// Column data: 8 bytes big-endian (100 = 0x64)
 	expected := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64}
 	if !bytes.Equal(msg[off:off+8], expected) {
@@ -640,7 +669,8 @@ func TestQwpEncoderBoolGoldenBytes(t *testing.T) {
 	off += 1                // schemaMode=FULL
 	off += 1 + 4 + 1        // col "flag": varint(4) + "flag" + type
 
-	// Bool data: 3 bits packed into 1 byte.
+	// Null bitmap flag (0x00) then bool data: 3 bits packed.
+	off++ // null bitmap flag
 	// bits: 1,0,1 = 0b00000101 = 0x05
 	if msg[off] != 0x05 {
 		t.Fatalf("bool data = 0x%02X, want 0x05", msg[off])
@@ -669,6 +699,12 @@ func TestQwpEncoderBoolNullableGoldenBytes(t *testing.T) {
 	off += 1         // colCount=1
 	off += 1         // schemaMode=FULL
 	off += 1 + 4 + 1 // col "flag": varint(4) + "flag" + wireTypeCode (0x81)
+
+	// Null bitmap flag: 0x01 (has nulls)
+	if msg[off] != 0x01 {
+		t.Fatalf("null bitmap flag = 0x%02X, want 0x01", msg[off])
+	}
+	off++
 
 	// Null bitmap: 1 byte. Row 1 null → bit 1 → 0x02.
 	if msg[off] != 0x02 {
@@ -702,6 +738,9 @@ func TestQwpEncoderStringGoldenBytes(t *testing.T) {
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
 	off += 1 + 1 + 1 // col "s": varint(1) + "s" + type
+
+	// Null bitmap flag (0x00)
+	off++
 
 	// String encoding: (rowCount+1) × uint32 LE offsets + data.
 	// Offsets: [0, 5, 10]
@@ -743,6 +782,9 @@ func TestQwpEncoderSymbolGoldenBytes(t *testing.T) {
 	off += 1     // schemaMode=FULL
 	off += 1 + 3 + 1 // col "sym": varint(3) + "sym" + type
 
+	// Null bitmap flag (0x00)
+	off++
+
 	// Symbol IDs as varints: 0, 1, 42.
 	// varint(0) = [0x00]
 	if msg[off] != 0x00 {
@@ -778,6 +820,9 @@ func TestQwpEncoderArrayGoldenBytes(t *testing.T) {
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
 	off += 1 + 3 + 1 // col "arr": varint(3) + "arr" + type
+
+	// Null bitmap flag (0x00)
+	off++
 
 	// Array data: nDims=1, shape=[2], elements=[1.5, 2.5]
 	// nDims
@@ -823,6 +868,9 @@ func TestQwpEncoderVarcharGoldenBytes(t *testing.T) {
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
 	off += 1 + 1 + 1 // col "v": varint(1) + "v" + type (0x0F)
+
+	// Null bitmap flag (0x00)
+	off++
 
 	// Offsets: [0, 3] → 2 × uint32 LE
 	if binary.LittleEndian.Uint32(msg[off:]) != 0 {
@@ -955,6 +1003,9 @@ func TestQwpEncoderDeltaDictGoldenBytes(t *testing.T) {
 	if msg[off] != 0x09 {
 		t.Fatalf("typeCode = 0x%02X, want 0x09 (SYMBOL)", msg[off])
 	}
+	off++
+
+	// Null bitmap flag (0x00)
 	off++
 
 	// Column data: 2 symbol IDs as varints.
@@ -1137,6 +1188,9 @@ func TestQwpEncoderGeohashGoldenBytes(t *testing.T) {
 	off += 1     // schemaMode=FULL
 	off += 1 + 3 + 1 // col "geo": varint(3) + "geo" + type (0x0E)
 
+	// Null bitmap flag (0x00)
+	off++
+
 	// Precision varint: 20 = 0x14
 	if msg[off] != 0x14 {
 		t.Fatalf("precision varint = 0x%02X, want 0x14", msg[off])
@@ -1196,7 +1250,13 @@ func TestQwpEncoderGeohashNullable(t *testing.T) {
 	off += 1     // rowCount=3
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
-	off += 1 + 3 + 1 // col "geo": varint(3) + "geo" + wireTypeCode (0x8E = nullable geohash)
+	off += 1 + 3 + 1 // col "geo": varint(3) + "geo" + type (0x0E, no nullable flag)
+
+	// Null bitmap flag: 0x01 (has nulls)
+	if msg[off] != 0x01 {
+		t.Fatalf("null bitmap flag = 0x%02X, want 0x01", msg[off])
+	}
+	off++
 
 	// Null bitmap: row 1 null → bit 1 → 0x02
 	if msg[off] != 0x02 {
@@ -1256,6 +1316,9 @@ func TestQwpEncoderGeohashPrecision8(t *testing.T) {
 	off += 1     // schemaMode=FULL
 	off += 1 + 1 + 1 // col "g": varint(1) + "g" + type
 
+	// Null bitmap flag (0x00)
+	off++
+
 	// Precision: 8
 	if msg[off] != 0x08 {
 		t.Fatalf("precision = 0x%02X, want 0x08", msg[off])
@@ -1292,6 +1355,9 @@ func TestQwpEncoderGeohashPrecision60(t *testing.T) {
 	off += 1     // colCount=1
 	off += 1     // schemaMode
 	off += 1 + 1 + 1 // col "g"
+
+	// Null bitmap flag (0x00)
+	off++
 
 	// Precision: 60 = 0x3C
 	if msg[off] != 0x3C {
