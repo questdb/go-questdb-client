@@ -605,9 +605,11 @@ func (s *qwpLineSender) At(ctx context.Context, ts time.Time) error {
 		return fmt.Errorf("qwp: At() called without Table()")
 	}
 
-	// Add designated timestamp column if provided.
+	// Add designated timestamp column. The Java client uses an empty
+	// string name for the designated timestamp, distinguishing it from
+	// regular columns (which cannot have empty names).
 	if !ts.IsZero() {
-		col, err := s.currentTable.getOrCreateColumn("timestamp", qwpTypeTimestamp, false)
+		col, err := s.currentTable.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
 		if err != nil {
 			s.currentTable.cancelRow()
 			s.hasTable = false

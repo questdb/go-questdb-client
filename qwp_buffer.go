@@ -700,6 +700,32 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 	return col, nil
 }
 
+// getOrCreateDesignatedTimestamp returns the designated timestamp
+// column, creating it if needed. The designated timestamp uses an
+// empty string name to distinguish it from regular columns (which
+// cannot have empty names). This matches the Java client behavior.
+func (tb *qwpTableBuffer) getOrCreateDesignatedTimestamp(typeCode qwpTypeCode) (*qwpColumnBuffer, error) {
+	const dtName = "" // empty name = designated timestamp
+	idx, exists := tb.columnIndex[dtName]
+	if exists {
+		col := tb.columns[idx]
+		if col.rowCount > tb.rowCount {
+			return nil, fmt.Errorf("qwp: designated timestamp already set for current row")
+		}
+		return col, nil
+	}
+
+	col := newQwpColumnBuffer(dtName, typeCode, false)
+	for i := 0; i < tb.rowCount; i++ {
+		col.addNull()
+	}
+
+	tb.columnIndex[dtName] = len(tb.columns)
+	tb.columns = append(tb.columns, col)
+	tb.schemaHashValid = false
+	return col, nil
+}
+
 // commitRow finalizes the current in-progress row. Any column that
 // was not set for this row is gap-filled with a null sentinel.
 func (tb *qwpTableBuffer) commitRow() {
