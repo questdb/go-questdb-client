@@ -99,6 +99,10 @@ type qwpColumnBuffer struct {
 	// rowCount is the total number of rows including nulls.
 	rowCount int
 
+	// table is the parent table buffer for running data size tracking.
+	// Nil for standalone columns in tests/benchmarks.
+	table *qwpTableBuffer
+
 	// scale is the decimal scale (0–76) for DECIMAL types, or -1
 	// if not yet established. Set on the first non-null decimal value.
 	scale int8
@@ -144,8 +148,9 @@ func (c *qwpColumnBuffer) wireTypeCode() byte {
 // and increments nullCount. The bitmap is grown as needed.
 func (c *qwpColumnBuffer) markNull() {
 	byteIdx := c.rowCount / 8
-	for len(c.nullBitmap) <= byteIdx {
+	if len(c.nullBitmap) <= byteIdx {
 		c.nullBitmap = append(c.nullBitmap, 0)
+		c.trackDataGrowth(1)
 	}
 	c.nullBitmap[byteIdx] |= 1 << uint(c.rowCount%8)
 	c.nullCount++
@@ -157,35 +162,49 @@ func (c *qwpColumnBuffer) nullBitmapLen() int {
 	return (c.rowCount + 7) / 8
 }
 
+// trackDataGrowth increments the parent table's running data size
+// counter. No-op if the column is not attached to a table (standalone
+// tests/benchmarks).
+func (c *qwpColumnBuffer) trackDataGrowth(n int) {
+	if c.table != nil {
+		c.table.dataSize += n
+	}
+}
+
 // --- fixed-width append helpers -----------------------------------------
 // These write directly into fixedData with no intermediate allocation.
 
 func (c *qwpColumnBuffer) appendByte(v byte) {
 	c.fixedData = append(c.fixedData, v)
+	c.trackDataGrowth(1)
 }
 
 func (c *qwpColumnBuffer) appendU16(v uint16) {
 	n := len(c.fixedData)
 	c.fixedData = append(c.fixedData, 0, 0)
 	binary.LittleEndian.PutUint16(c.fixedData[n:], v)
+	c.trackDataGrowth(2)
 }
 
 func (c *qwpColumnBuffer) appendU32(v uint32) {
 	n := len(c.fixedData)
 	c.fixedData = append(c.fixedData, 0, 0, 0, 0)
 	binary.LittleEndian.PutUint32(c.fixedData[n:], v)
+	c.trackDataGrowth(4)
 }
 
 func (c *qwpColumnBuffer) appendU64(v uint64) {
 	n := len(c.fixedData)
 	c.fixedData = append(c.fixedData, 0, 0, 0, 0, 0, 0, 0, 0)
 	binary.LittleEndian.PutUint64(c.fixedData[n:], v)
+	c.trackDataGrowth(8)
 }
 
 func (c *qwpColumnBuffer) appendI64BE(v int64) {
 	n := len(c.fixedData)
 	c.fixedData = append(c.fixedData, 0, 0, 0, 0, 0, 0, 0, 0)
 	binary.BigEndian.PutUint64(c.fixedData[n:], uint64(v))
+	c.trackDataGrowth(8)
 }
 
 // --- per-type add methods -----------------------------------------------
@@ -237,8 +256,9 @@ func (c *qwpColumnBuffer) addTimestamp(v int64) {
 // Bit i = row i's value, LSB-first within each byte (TYPE_BOOLEAN).
 func (c *qwpColumnBuffer) addBool(v bool) {
 	byteIdx := c.rowCount / 8
-	for len(c.boolData) <= byteIdx {
+	if len(c.boolData) <= byteIdx {
 		c.boolData = append(c.boolData, 0)
+		c.trackDataGrowth(1)
 	}
 	if v {
 		c.boolData[byteIdx] |= 1 << uint(c.rowCount%8)
@@ -252,12 +272,14 @@ func (c *qwpColumnBuffer) addBool(v bool) {
 func (c *qwpColumnBuffer) addString(v string) {
 	c.strData = append(c.strData, v...)
 	c.strOffsets = append(c.strOffsets, uint32(len(c.strData)))
+	c.trackDataGrowth(len(v) + 4) // string bytes + uint32 offset
 	c.rowCount++
 }
 
 // addSymbolID appends a global symbol dictionary ID (TYPE_SYMBOL).
 func (c *qwpColumnBuffer) addSymbolID(id int32) {
 	c.symbolIDs = append(c.symbolIDs, id)
+	c.trackDataGrowth(4)
 	c.rowCount++
 }
 
@@ -340,6 +362,7 @@ func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []
 	}
 
 	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+	c.trackDataGrowth(totalSize + 4) // array data + uint32 offset
 	c.rowCount++
 }
 
@@ -374,6 +397,7 @@ func (c *qwpColumnBuffer) addLongArray(nDims uint8, shape []int32, flatData []in
 	}
 
 	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+	c.trackDataGrowth(totalSize + 4) // array data + uint32 offset
 	c.rowCount++
 }
 
@@ -467,8 +491,9 @@ func (c *qwpColumnBuffer) addNull() {
 	case qwpTypeBoolean:
 		// False sentinel; bit stays 0 from zero-initialization.
 		byteIdx := c.rowCount / 8
-		for len(c.boolData) <= byteIdx {
+		if len(c.boolData) <= byteIdx {
 			c.boolData = append(c.boolData, 0)
+			c.trackDataGrowth(1)
 		}
 
 	case qwpTypeByte:
@@ -476,9 +501,11 @@ func (c *qwpColumnBuffer) addNull() {
 
 	case qwpTypeShort, qwpTypeChar:
 		c.fixedData = append(c.fixedData, 0, 0)
+		c.trackDataGrowth(2)
 
 	case qwpTypeInt:
 		c.fixedData = append(c.fixedData, 0, 0, 0, 0)
+		c.trackDataGrowth(4)
 
 	case qwpTypeFloat:
 		c.appendU32(math.Float32bits(float32(math.NaN())))
@@ -492,9 +519,11 @@ func (c *qwpColumnBuffer) addNull() {
 	case qwpTypeString, qwpTypeVarchar:
 		// Repeat current offset → zero-length string sentinel.
 		c.strOffsets = append(c.strOffsets, uint32(len(c.strData)))
+		c.trackDataGrowth(4)
 
 	case qwpTypeSymbol:
 		c.symbolIDs = append(c.symbolIDs, -1)
+		c.trackDataGrowth(4)
 
 	case qwpTypeUuid:
 		c.appendU64(qwpLongNull)
@@ -513,6 +542,7 @@ func (c *qwpColumnBuffer) addNull() {
 		c.arrayData[off] = 0x01 // nDims = 1
 		// dim0 = 0 (already zero from append)
 		c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+		c.trackDataGrowth(5 + 4) // 5 data + uint32 offset
 
 	case qwpTypeGeohash:
 		// -1 (all bits set) is the QuestDB geohash null sentinel.
@@ -520,11 +550,13 @@ func (c *qwpColumnBuffer) addNull() {
 
 	case qwpTypeDecimal64:
 		c.fixedData = append(c.fixedData, 0, 0, 0, 0, 0, 0, 0, 0)
+		c.trackDataGrowth(8)
 
 	case qwpTypeDecimal128:
 		c.fixedData = append(c.fixedData,
 			0, 0, 0, 0, 0, 0, 0, 0,
 			0, 0, 0, 0, 0, 0, 0, 0)
+		c.trackDataGrowth(16)
 
 	case qwpTypeDecimal256:
 		c.fixedData = append(c.fixedData,
@@ -532,6 +564,7 @@ func (c *qwpColumnBuffer) addNull() {
 			0, 0, 0, 0, 0, 0, 0, 0,
 			0, 0, 0, 0, 0, 0, 0, 0,
 			0, 0, 0, 0, 0, 0, 0, 0)
+		c.trackDataGrowth(32)
 
 	default:
 		panic("qwp: addNull called on unsupported column type")
@@ -648,6 +681,12 @@ type qwpTableBuffer struct {
 	schemaHash      int64
 	schemaHashValid bool
 
+	// dataSize is a running counter of approximate data bytes stored
+	// across all columns. Incremented by column addX methods via
+	// trackDataGrowth. Reset to 0 in reset(), recomputed from scratch
+	// in cancelRow(). Makes approxDataSize() O(1).
+	dataSize int
+
 	// hashBuf is a reusable scratch buffer for schema hash computation,
 	// avoiding allocation on every getSchemaHash() call after reset().
 	hashBuf []byte
@@ -696,6 +735,13 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 	}
 
 	col := newQwpColumnBuffer(name, typeCode, nullable)
+	col.table = tb
+
+	// Account for initial offset entries (strOffsets[0] or arrayOffsets[0]).
+	switch typeCode {
+	case qwpTypeString, qwpTypeVarchar, qwpTypeDoubleArray, qwpTypeLongArray:
+		tb.dataSize += 4
+	}
 
 	// Backfill with nulls for all previously committed rows so
 	// the new column has the same row count as the table.
@@ -725,6 +771,7 @@ func (tb *qwpTableBuffer) getOrCreateDesignatedTimestamp(typeCode qwpTypeCode) (
 	}
 
 	col := newQwpColumnBuffer(dtName, typeCode, false)
+	col.table = tb
 	for i := 0; i < tb.rowCount; i++ {
 		col.addNull()
 	}
@@ -766,6 +813,10 @@ func (tb *qwpTableBuffer) cancelRow() {
 			col.truncateTo(tb.rowCount)
 		}
 	}
+
+	// Recompute from scratch since truncation makes incremental
+	// tracking impractical (this is the rare path).
+	tb.recomputeDataSize()
 }
 
 // reset clears all row data and columns, retaining the table name.
@@ -776,23 +827,39 @@ func (tb *qwpTableBuffer) reset() {
 	tb.rowCount = 0
 	tb.committedColumnCount = 0
 	tb.schemaHashValid = false
+
+	// Reset data size, then re-account for initial offset entries
+	// that column reset() preserves (strOffsets[:1], arrayOffsets[:1]).
+	tb.dataSize = 0
+	for _, col := range tb.columns {
+		switch col.typeCode {
+		case qwpTypeString, qwpTypeVarchar, qwpTypeDoubleArray, qwpTypeLongArray:
+			tb.dataSize += 4
+		}
+	}
 }
 
 // approxDataSize returns the approximate number of bytes of column
-// data currently stored in this table buffer. This is used for
-// maxBufSize enforcement to prevent unbounded memory growth.
+// data currently stored in this table buffer. This is O(1) — it
+// returns the running counter maintained by column addX methods.
 func (tb *qwpTableBuffer) approxDataSize() int {
+	return tb.dataSize
+}
+
+// recomputeDataSize recalculates dataSize from scratch by iterating
+// all columns. Used after cancelRow() which may truncate columns.
+func (tb *qwpTableBuffer) recomputeDataSize() {
 	size := 0
 	for _, col := range tb.columns {
 		size += len(col.fixedData)
 		size += len(col.strData)
 		size += len(col.boolData)
 		size += len(col.arrayData)
-		size += len(col.symbolIDs) * 4 // int32 each
-		size += len(col.strOffsets) * 4 // uint32 each
+		size += len(col.symbolIDs) * 4
+		size += len(col.strOffsets) * 4
 		size += len(col.nullBitmap)
 	}
-	return size
+	tb.dataSize = size
 }
 
 // getSchemaHash returns a hash over the column definitions (names

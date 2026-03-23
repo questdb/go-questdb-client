@@ -2308,3 +2308,109 @@ func TestQwpColumnBufferGeohashTruncateTo(t *testing.T) {
 		t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
 	}
 }
+
+// TestQwpTableBufferRunningDataSize verifies that the running dataSize
+// counter on qwpTableBuffer matches the iterative computation for a
+// table with mixed column types: symbol, long, double, string, bool,
+// timestamp.
+func TestQwpTableBufferRunningDataSize(t *testing.T) {
+	tb := newQwpTableBuffer("test_running_size")
+
+	// Helper to recompute data size iteratively.
+	iterativeSize := func() int {
+		size := 0
+		for _, col := range tb.columns {
+			size += len(col.fixedData)
+			size += len(col.strData)
+			size += len(col.boolData)
+			size += len(col.arrayData)
+			size += len(col.symbolIDs) * 4
+			size += len(col.strOffsets) * 4
+			size += len(col.nullBitmap)
+		}
+		return size
+	}
+
+	// Insert 10 rows with mixed types.
+	for i := 0; i < 10; i++ {
+		col, _ := tb.getOrCreateColumn("sym", qwpTypeSymbol, false)
+		col.addSymbolID(int32(i % 3))
+
+		col, _ = tb.getOrCreateColumn("val", qwpTypeLong, false)
+		col.addLong(int64(i * 100))
+
+		col, _ = tb.getOrCreateColumn("price", qwpTypeDouble, false)
+		col.addDouble(float64(i) * 1.5)
+
+		col, _ = tb.getOrCreateColumn("msg", qwpTypeString, false)
+		col.addString("hello")
+
+		col, _ = tb.getOrCreateColumn("flag", qwpTypeBoolean, false)
+		col.addBool(i%2 == 0)
+
+		col, _ = tb.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
+		col.addTimestamp(int64(1000000 + i))
+
+		tb.commitRow()
+
+		got := tb.approxDataSize()
+		want := iterativeSize()
+		if got != want {
+			t.Fatalf("row %d: approxDataSize() = %d, iterative = %d", i, got, want)
+		}
+	}
+
+	// Verify after reset: running counter matches iterative.
+	tb.reset()
+	if tb.approxDataSize() != iterativeSize() {
+		t.Fatalf("after reset: approxDataSize() = %d, iterative = %d",
+			tb.approxDataSize(), iterativeSize())
+	}
+
+	// Insert again and verify the counter still works.
+	for i := 0; i < 5; i++ {
+		col, _ := tb.getOrCreateColumn("sym", qwpTypeSymbol, false)
+		col.addSymbolID(int32(i))
+
+		col, _ = tb.getOrCreateColumn("val", qwpTypeLong, false)
+		col.addLong(int64(i))
+
+		col, _ = tb.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
+		col.addTimestamp(int64(2000000 + i))
+
+		tb.commitRow()
+	}
+
+	got := tb.approxDataSize()
+	want := iterativeSize()
+	if got != want {
+		t.Fatalf("after re-insert: approxDataSize() = %d, iterative = %d", got, want)
+	}
+}
+
+// TestQwpTableBufferRunningDataSizeCancelRow verifies that the
+// running dataSize is correct after cancelRow().
+func TestQwpTableBufferRunningDataSizeCancelRow(t *testing.T) {
+	tb := newQwpTableBuffer("test_cancel_size")
+
+	// Add a committed row.
+	col, _ := tb.getOrCreateColumn("val", qwpTypeLong, false)
+	col.addLong(42)
+	col, _ = tb.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
+	col.addTimestamp(1000000)
+	tb.commitRow()
+
+	sizeAfterCommit := tb.approxDataSize()
+
+	// Start a row and cancel it.
+	col, _ = tb.getOrCreateColumn("val", qwpTypeLong, false)
+	col.addLong(99)
+	col, _ = tb.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
+	col.addTimestamp(2000000)
+	tb.cancelRow()
+
+	if tb.approxDataSize() != sizeAfterCommit {
+		t.Fatalf("after cancelRow: approxDataSize() = %d, want %d",
+			tb.approxDataSize(), sizeAfterCommit)
+	}
+}
