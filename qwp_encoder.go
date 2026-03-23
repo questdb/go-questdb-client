@@ -38,29 +38,101 @@ type qwpEncoder struct {
 }
 
 // encodeTable encodes a single table buffer into a complete QWP
-// message. The returned byte slice references the encoder's internal
-// buffer and is valid until the next encode call.
+// message without a delta symbol dictionary. The returned byte slice
+// references the encoder's internal buffer and is valid until the
+// next encode call.
 //
 // The message layout is:
 //
-//	Header (12 bytes) → TableName → RowCount → ColCount →
-//	Schema → ColumnData... → patched PayloadLength.
+//	Header (12 bytes) → TableBlock → patched PayloadLength.
 func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaHash int64) []byte {
 	e.wb.reset()
+	e.writeHeader(0x00, 1)
+	e.writeTableBlock(tb, schemaMode, schemaHash)
+	e.patchPayloadLength()
+	return e.wb.bytes()
+}
 
-	// --- Header (12 bytes) ---
-	e.wb.putUint32LE(qwpMagic)  // offset 0-3: "QWP1"
-	e.wb.putByte(qwpVersion)    // offset 4: version
-	e.wb.putByte(0x00)          // offset 5: flags
-	e.wb.putUint16LE(1)         // offset 6-7: tableCount = 1
-	e.wb.putUint32LE(0)         // offset 8-11: payloadLength placeholder
+// encodeTableWithDeltaDict encodes a single table buffer with a
+// prepended delta symbol dictionary. The dictionary sends only new
+// symbols (those with IDs from maxSentId+1 through batchMaxId)
+// and sets FLAG_DELTA_SYMBOL_DICT in the header.
+//
+// The message layout is:
+//
+//	Header (12 bytes, flags=0x08) → DeltaDict → TableBlock →
+//	patched PayloadLength.
+//
+// globalDict maps symbol IDs (indices) to symbol strings.
+// maxSentId is the last successfully ACKed symbol ID (-1 if none).
+// batchMaxId is the highest symbol ID used in this batch.
+func (e *qwpEncoder) encodeTableWithDeltaDict(
+	tb *qwpTableBuffer,
+	globalDict []string,
+	maxSentId int,
+	batchMaxId int,
+	schemaMode qwpSchemaMode,
+	schemaHash int64,
+) []byte {
+	e.wb.reset()
+	e.writeHeader(qwpFlagDeltaSymbolDict, 1)
+	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
+	e.writeTableBlock(tb, schemaMode, schemaHash)
+	e.patchPayloadLength()
+	return e.wb.bytes()
+}
 
-	// --- Table block ---
+// --- header and payload helpers ---
+
+// writeHeader writes the 12-byte QWP message header with the given
+// flags and table count. PayloadLength is set to 0 (placeholder).
+func (e *qwpEncoder) writeHeader(flags byte, tableCount uint16) {
+	e.wb.putUint32LE(qwpMagic)
+	e.wb.putByte(qwpVersion)
+	e.wb.putByte(flags)
+	e.wb.putUint16LE(tableCount)
+	e.wb.putUint32LE(0) // payloadLength placeholder
+}
+
+// patchPayloadLength patches the payload length field at offset 8
+// with the actual number of bytes after the 12-byte header.
+func (e *qwpEncoder) patchPayloadLength() {
+	payloadLen := uint32(e.wb.len() - qwpHeaderSize)
+	e.wb.patchUint32LE(qwpHeaderOffsetPayloadLen, payloadLen)
+}
+
+// --- delta symbol dictionary ---
+
+// writeDeltaDict writes the delta symbol dictionary section. It
+// encodes symbols from ID maxSentId+1 through batchMaxId (inclusive).
+//
+// Wire format:
+//
+//	[deltaStart: varint] [deltaCount: varint]
+//	[symbol0: string] [symbol1: string] ...
+func (e *qwpEncoder) writeDeltaDict(globalDict []string, maxSentId, batchMaxId int) {
+	deltaStart := maxSentId + 1
+	deltaCount := batchMaxId - maxSentId
+	if deltaCount < 0 {
+		deltaCount = 0
+	}
+
+	e.wb.putVarint(uint64(deltaStart))
+	e.wb.putVarint(uint64(deltaCount))
+	for i := deltaStart; i < deltaStart+deltaCount; i++ {
+		e.wb.putString(globalDict[i])
+	}
+}
+
+// --- table block ---
+
+// writeTableBlock writes a single table block: table name, row/col
+// counts, schema, and column data.
+func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaHash int64) {
 	e.wb.putString(tb.tableName)
 	e.wb.putVarint(uint64(tb.rowCount))
 	e.wb.putVarint(uint64(len(tb.columns)))
 
-	// --- Schema ---
 	e.wb.putByte(byte(schemaMode))
 	if schemaMode == qwpSchemaModeFull {
 		e.encodeSchemaFull(tb)
@@ -68,17 +140,12 @@ func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, s
 		e.wb.putInt64LE(schemaHash)
 	}
 
-	// --- Column data ---
 	for _, col := range tb.columns {
 		e.encodeColumnData(col)
 	}
-
-	// --- Patch payload length ---
-	payloadLen := uint32(e.wb.len() - qwpHeaderSize)
-	e.wb.patchUint32LE(qwpHeaderOffsetPayloadLen, payloadLen)
-
-	return e.wb.bytes()
 }
+
+// --- schema ---
 
 // encodeSchemaFull writes full column definitions: for each column,
 // the name (varint string) and wire type code. Decimal columns get
@@ -97,11 +164,12 @@ func (e *qwpEncoder) encodeSchemaFull(tb *qwpTableBuffer) {
 	}
 }
 
+// --- column data ---
+
 // encodeColumnData writes the wire-format data for a single column.
 // For nullable columns, the null bitmap is written first. Then the
 // type-specific data follows.
 func (e *qwpEncoder) encodeColumnData(col *qwpColumnBuffer) {
-	// Null bitmap for nullable columns.
 	if col.nullable {
 		e.encodeNullBitmap(col)
 	}
@@ -183,8 +251,8 @@ func (e *qwpEncoder) encodeArrayColumn(col *qwpColumnBuffer) {
 	e.wb.putBytes(col.arrayData)
 }
 
-// encodeGeohashColumn writes geohash column data. Currently a
-// placeholder — geohash encoding will be added in a later phase.
+// encodeGeohashColumn writes geohash column data: precision varint
+// followed by packed bits per row.
 func (e *qwpEncoder) encodeGeohashColumn(col *qwpColumnBuffer) {
 	// Geohash encoding: precision varint + packed bits per row.
 	// Will be implemented in Phase 3 geohash task.

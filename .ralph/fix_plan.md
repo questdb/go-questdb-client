@@ -19,8 +19,8 @@
 - [x] Add boolean column encoding to the encoder: bit-packed output. Null bitmap encoding for nullable columns. Golden byte tests: 3 bools → 0x05, nullable bool with null → bitmap 0x02 + data 0x01.
 - [x] Add string/varchar column encoding: (rowCount+1) uint32 LE offsets + string data. Symbol column encoding: varint global IDs per row. Golden byte tests for strings ("hello","world") offsets [0,5,10], symbols [0,1,42], varchar "abc".
 - [x] Add array column encoding: raw arrayData (per-row nDims+shape+elements). Decimal column encoding: big-endian unscaled values with scale byte in schema. Golden byte tests for 1D double array, decimal schema+data.
-- [ ] Add delta symbol dictionary encoding to the encoder: method `encodeTableWithDeltaDict(tb, globalDict, maxSentId, batchMaxId, schemaMode, schemaHash)` that prepends delta dictionary before table data, sets FLAG_DELTA_SYMBOL_DICT in header. Write test with known dictionary state.
-- [ ] Add schema hash computation: compute hash over column names + wire type codes. Implement to match Java `QwpTableBuffer.getSchemaHash()`. Write test that computes hash for known columns and verifies against Java-computed value (read the Java source to determine the algorithm, compute expected values).
+- [x] Add delta symbol dictionary encoding to the encoder: encodeTableWithDeltaDict(tb, globalDict, maxSentId, batchMaxId, schemaMode, schemaHash) prepends delta dict (deltaStart+deltaCount+symbol strings) before table block, sets FLAG_DELTA_SYMBOL_DICT in header. Refactored encoder to use writeHeader/writeTableBlock/patchPayloadLength helpers. 4 tests: full golden bytes, empty delta, all-new symbols, delta+schema ref.
+- [x] Add schema hash computation: XXHash64 over column names + wire type codes in qwp_hash.go. Matches Java QwpTableBuffer.getSchemaHash(). Tests: deterministic, column change, nullable affects hash, known value, XXHash64 empty input canonical vector.
 - [ ] Add geohash column encoding to the encoder. Write golden byte test.
 
 ## Phase 4: WebSocket Transport

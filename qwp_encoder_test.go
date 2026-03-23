@@ -831,3 +831,265 @@ func TestQwpEncoderVarcharGoldenBytes(t *testing.T) {
 		t.Fatalf("data = %q, want %q", msg[off:off+3], "abc")
 	}
 }
+
+// --- Delta symbol dictionary tests ---
+
+func TestQwpEncoderDeltaDictGoldenBytes(t *testing.T) {
+	// Scenario: globalDict = ["AAPL", "MSFT", "GOOG"]
+	// maxSentId = 0 (only AAPL was sent before)
+	// batchMaxId = 2 (GOOG is the highest ID in this batch)
+	// Delta: symbols 1 and 2 → ["MSFT", "GOOG"]
+	globalDict := []string{"AAPL", "MSFT", "GOOG"}
+
+	tb := newQwpTableBuffer("trades")
+	col, _ := tb.getOrCreateColumn("sym", qwpTypeSymbol, false)
+	col.addSymbolID(0) // AAPL
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("sym", qwpTypeSymbol, false)
+	col.addSymbolID(2) // GOOG
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTableWithDeltaDict(tb, globalDict, 0, 2, qwpSchemaModeFull, 0)
+
+	// Verify header.
+	magic := binary.LittleEndian.Uint32(msg[0:4])
+	if magic != qwpMagic {
+		t.Fatalf("magic = 0x%08X, want 0x%08X", magic, qwpMagic)
+	}
+	if msg[4] != qwpVersion {
+		t.Fatalf("version = %d, want %d", msg[4], qwpVersion)
+	}
+	// Flags: FLAG_DELTA_SYMBOL_DICT = 0x08
+	if msg[5] != qwpFlagDeltaSymbolDict {
+		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], qwpFlagDeltaSymbolDict)
+	}
+	// TableCount = 1
+	if binary.LittleEndian.Uint16(msg[6:8]) != 1 {
+		t.Fatalf("tableCount = %d, want 1", binary.LittleEndian.Uint16(msg[6:8]))
+	}
+	// Payload length
+	payloadLen := binary.LittleEndian.Uint32(msg[8:12])
+	if int(payloadLen) != len(msg)-qwpHeaderSize {
+		t.Fatalf("payloadLength = %d, want %d", payloadLen, len(msg)-qwpHeaderSize)
+	}
+
+	// Parse delta dictionary after header.
+	off := qwpHeaderSize
+
+	// deltaStart = 1 (maxSentId + 1)
+	deltaStart, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if deltaStart != 1 {
+		t.Fatalf("deltaStart = %d, want 1", deltaStart)
+	}
+
+	// deltaCount = 2
+	deltaCount, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if deltaCount != 2 {
+		t.Fatalf("deltaCount = %d, want 2", deltaCount)
+	}
+
+	// Symbol 1: "MSFT"
+	symLen, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	sym := string(msg[off : off+int(symLen)])
+	off += int(symLen)
+	if sym != "MSFT" {
+		t.Fatalf("delta symbol[0] = %q, want %q", sym, "MSFT")
+	}
+
+	// Symbol 2: "GOOG"
+	symLen, n, _ = qwpReadVarint(msg[off:])
+	off += n
+	sym = string(msg[off : off+int(symLen)])
+	off += int(symLen)
+	if sym != "GOOG" {
+		t.Fatalf("delta symbol[1] = %q, want %q", sym, "GOOG")
+	}
+
+	// Now table block follows.
+	// Table name "trades"
+	nameLen, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	tableName := string(msg[off : off+int(nameLen)])
+	off += int(nameLen)
+	if tableName != "trades" {
+		t.Fatalf("tableName = %q, want %q", tableName, "trades")
+	}
+
+	// rowCount = 2
+	rowCount, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if rowCount != 2 {
+		t.Fatalf("rowCount = %d, want 2", rowCount)
+	}
+
+	// colCount = 1
+	colCount, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if colCount != 1 {
+		t.Fatalf("colCount = %d, want 1", colCount)
+	}
+
+	// schemaMode = FULL
+	if msg[off] != 0x00 {
+		t.Fatalf("schemaMode = 0x%02X, want 0x00", msg[off])
+	}
+	off++
+
+	// Column "sym": name + type (SYMBOL = 0x09)
+	symNameLen, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	off += int(symNameLen) // skip name
+	if msg[off] != 0x09 {
+		t.Fatalf("typeCode = 0x%02X, want 0x09 (SYMBOL)", msg[off])
+	}
+	off++
+
+	// Column data: 2 symbol IDs as varints.
+	// ID 0 (AAPL)
+	id0, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if id0 != 0 {
+		t.Fatalf("symbolID[0] = %d, want 0", id0)
+	}
+
+	// ID 2 (GOOG)
+	id1, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if id1 != 2 {
+		t.Fatalf("symbolID[1] = %d, want 2", id1)
+	}
+
+	// Verify we consumed all bytes.
+	if off != len(msg) {
+		t.Fatalf("unconsumed bytes: off=%d, len=%d", off, len(msg))
+	}
+}
+
+func TestQwpEncoderDeltaDictEmptyDelta(t *testing.T) {
+	// No new symbols: maxSentId=2, batchMaxId=2.
+	globalDict := []string{"A", "B", "C"}
+
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("sym", qwpTypeSymbol, false)
+	col.addSymbolID(0)
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTableWithDeltaDict(tb, globalDict, 2, 2, qwpSchemaModeFull, 0)
+
+	// Flags should still have delta dict flag.
+	if msg[5] != qwpFlagDeltaSymbolDict {
+		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], qwpFlagDeltaSymbolDict)
+	}
+
+	off := qwpHeaderSize
+
+	// deltaStart = 3
+	deltaStart, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if deltaStart != 3 {
+		t.Fatalf("deltaStart = %d, want 3", deltaStart)
+	}
+
+	// deltaCount = 0
+	deltaCount, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if deltaCount != 0 {
+		t.Fatalf("deltaCount = %d, want 0", deltaCount)
+	}
+
+	// Table block should follow immediately.
+	nameLen, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	tableName := string(msg[off : off+int(nameLen)])
+	if tableName != "t" {
+		t.Fatalf("tableName = %q, want %q", tableName, "t")
+	}
+}
+
+func TestQwpEncoderDeltaDictAllNew(t *testing.T) {
+	// All symbols are new: maxSentId=-1 (none sent).
+	globalDict := []string{"X", "Y"}
+
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("s", qwpTypeSymbol, false)
+	col.addSymbolID(1) // Y
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 1, qwpSchemaModeFull, 0)
+
+	off := qwpHeaderSize
+
+	// deltaStart = 0 (maxSentId=-1, so -1+1=0)
+	deltaStart, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if deltaStart != 0 {
+		t.Fatalf("deltaStart = %d, want 0", deltaStart)
+	}
+
+	// deltaCount = 2 (batchMaxId=1, 1-(-1)=2)
+	deltaCount, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	if deltaCount != 2 {
+		t.Fatalf("deltaCount = %d, want 2", deltaCount)
+	}
+
+	// Symbol 0: "X"
+	symLen, n, _ := qwpReadVarint(msg[off:])
+	off += n
+	sym := string(msg[off : off+int(symLen)])
+	off += int(symLen)
+	if sym != "X" {
+		t.Fatalf("delta symbol[0] = %q, want %q", sym, "X")
+	}
+
+	// Symbol 1: "Y"
+	symLen, n, _ = qwpReadVarint(msg[off:])
+	off += n
+	sym = string(msg[off : off+int(symLen)])
+	off += int(symLen)
+	if sym != "Y" {
+		t.Fatalf("delta symbol[1] = %q, want %q", sym, "Y")
+	}
+}
+
+func TestQwpEncoderDeltaDictWithSchemaRef(t *testing.T) {
+	// Delta dict + schema reference mode.
+	globalDict := []string{"A"}
+
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("s", qwpTypeSymbol, false)
+	col.addSymbolID(0)
+	tb.commitRow()
+
+	schemaHash := tb.getSchemaHash()
+
+	var enc qwpEncoder
+	msg := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 0, qwpSchemaModeReference, schemaHash)
+
+	off := qwpHeaderSize
+
+	// Skip delta dict: deltaStart=0, deltaCount=1, "A"
+	off += 1 + 1 + 1 + 1 // varint(0) + varint(1) + varint(1) + 'A'
+
+	// Skip table name "t"
+	off += 1 + 1
+	// rowCount=1, colCount=1
+	off += 1 + 1
+	// schemaMode = REFERENCE (0x01)
+	if msg[off] != 0x01 {
+		t.Fatalf("schemaMode = 0x%02X, want 0x01", msg[off])
+	}
+	off++
+
+	// Schema hash: int64 LE
+	gotHash := int64(binary.LittleEndian.Uint64(msg[off : off+8]))
+	if gotHash != schemaHash {
+		t.Fatalf("schemaHash = %d, want %d", gotHash, schemaHash)
+	}
+}
