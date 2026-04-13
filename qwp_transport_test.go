@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"net/http"
@@ -34,6 +35,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- Unit tests for ACK parsing ---
@@ -558,4 +561,32 @@ func TestQwpTransportSendWithRetrySchemaError(t *testing.T) {
 	if callCount != 2 {
 		t.Fatalf("expected 2 calls, got %d", callCount)
 	}
+}
+
+func TestQwpDumpWriter(t *testing.T) {
+	var buf bytes.Buffer
+	ctx := context.Background()
+
+	s, err := newQwpLineSender(ctx, "", qwpTransportOpts{}, 0, 0, 0, &buf)
+	require.NoError(t, err)
+
+	// Insert a row and flush.
+	s.Table("test_dump").Int64Column("val", 42)
+	require.NoError(t, s.At(ctx, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)))
+	require.NoError(t, s.Flush(ctx))
+	require.NoError(t, s.Close(ctx))
+
+	// The dump should start with the HTTP upgrade request.
+	// Go's HTTP client lowercases some header names, so check
+	// case-insensitively where needed.
+	dump := buf.String()
+	assert.Contains(t, dump, "GET /write/v4 HTTP/1.1\r\n")
+	assert.Contains(t, dump, "Upgrade: websocket\r\n")
+	// Go sends "Sec-Websocket-Protocol" (lowercase 'w').
+	assert.Contains(t, dump, "Sec-Websocket-Protocol: qwp\r\n")
+
+	// Should have some binary data after the HTTP request (WebSocket frames).
+	httpEnd := strings.Index(dump, "\r\n\r\n")
+	require.Greater(t, httpEnd, 0)
+	assert.Greater(t, len(dump), httpEnd+4, "expected WebSocket frames after HTTP upgrade")
 }

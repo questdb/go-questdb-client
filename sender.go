@@ -29,6 +29,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"os"
@@ -316,6 +317,7 @@ type lineSenderConfig struct {
 	// QWP-specific fields
 	inFlightWindow int           // 0 = default (sync mode), >1 = async mode
 	closeTimeout   time.Duration // 0 = use default (5s)
+	dumpWriter     io.Writer     // if set, record outgoing bytes (unexported)
 }
 
 // LineSenderOption defines line sender config option.
@@ -362,6 +364,19 @@ func WithInFlightWindow(window int) LineSenderOption {
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.closeTimeout = d
+	}
+}
+
+// WithQwpDumpWriter returns an option that records all outgoing TCP
+// bytes to w. When no server address is configured, an in-process
+// fake WebSocket acceptor is used so the dump includes the full HTTP
+// upgrade and WebSocket framing — replayable via "cat dump.bin | nc
+// host port".
+//
+// Only available for the QWP sender.
+func WithQwpDumpWriter(w io.Writer) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.dumpWriter = w
 	}
 }
 
@@ -830,7 +845,7 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	}
 
 	s, err := newQwpLineSender(ctx, address, opts, conf.retryTimeout,
-		conf.autoFlushRows, conf.autoFlushInterval, window)
+		conf.autoFlushRows, conf.autoFlushInterval, conf.dumpWriter, window)
 	if err != nil {
 		return nil, err
 	}

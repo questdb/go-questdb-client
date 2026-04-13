@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/big"
 	"time"
 )
@@ -158,8 +159,9 @@ type qwpLineSender struct {
 
 // newQwpLineSender creates a new QWP sender and establishes a
 // WebSocket connection to the server. If inFlightWindow > 1, async
-// mode is enabled with a dedicated I/O goroutine.
-func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, inFlightWindow ...int) (*qwpLineSender, error) {
+// mode is enabled with a dedicated I/O goroutine. If dumpWriter is
+// non-nil, outgoing TCP bytes are recorded (see WithQwpDumpWriter).
+func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
 	window := 1
 	if len(inFlightWindow) > 0 && inFlightWindow[0] > 1 {
 		window = inFlightWindow[0]
@@ -178,6 +180,7 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 		closeTimeout:      5 * time.Second,
 	}
 
+	s.transport.dumpWriter = dumpWriter
 	if err := s.transport.connect(ctx, address, opts); err != nil {
 		return nil, err
 	}
