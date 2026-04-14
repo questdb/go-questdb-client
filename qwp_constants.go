@@ -24,6 +24,8 @@
 
 package questdb
 
+import "time"
+
 // qwpTypeCode represents a QWP column type.
 type qwpTypeCode byte
 
@@ -105,14 +107,65 @@ const (
 	qwpStatusWriteError     qwpStatusCode = 0x09 // write failure (e.g., table not accepting writes)
 )
 
-// QWP batch and table limits.
+// QWP sender defaults and limits.
+//
+// Values are aligned with the Java client (io.questdb.client.cutlass.qwp)
+// unless marked Go-only. The Java analogue is noted on each constant so
+// the two clients can be kept in lockstep. These are not all honored by
+// the sender yet — wiring follows in a later change.
 const (
-	qwpDefaultMaxBatchSize      = 16 * 1024 * 1024 // 16 MB
-	qwpDefaultMaxTablesPerBatch = 256
-	qwpMaxColumnsPerTable       = 2048
-	qwpDefaultMaxRowsPerTable   = 1_000_000
-	qwpDefaultMaxInFlightWindow = 4
-	qwpDefaultInitRecvBufSize   = 64 * 1024 // 64 KB
+	// qwpDefaultAutoFlushBytes is the byte-size trigger for auto-flush.
+	// A value of 0 disables the byte-based trigger.
+	// Java: QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES = 0.
+	qwpDefaultAutoFlushBytes = 0
+
+	// qwpDefaultAutoFlushInterval is the time trigger for auto-flush.
+	// Java: QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100 ms.
+	qwpDefaultAutoFlushInterval = 100 * time.Millisecond
+
+	// qwpDefaultAutoFlushRows is the row-count trigger for auto-flush.
+	// Java: QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS = 1_000.
+	qwpDefaultAutoFlushRows = 1_000
+
+	// qwpDefaultInFlightWindow is the default maximum number of batches
+	// that may be outstanding (unacked) in async mode.
+	// Java: QwpWebSocketSender.DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128.
+	qwpDefaultInFlightWindow = 128
+
+	// qwpDefaultMaxSchemasPerConnection caps the schema cache per
+	// connection; callers may recycle the connection on overflow.
+	// Java: QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535.
+	qwpDefaultMaxSchemasPerConnection = 65_535
+
+	// qwpDefaultInitEncoderBufSize is the initial encoder buffer size.
+	// Java: QwpWebSocketSender.DEFAULT_BUFFER_SIZE = 8192.
+	qwpDefaultInitEncoderBufSize = 8 * 1024 // 8 KB
+
+	// qwpDefaultMicrobatchBufSize is the per-encoder microbatch buffer
+	// size used to coalesce rows before a WebSocket frame is sent.
+	// Java: QwpWebSocketSender.DEFAULT_MICROBATCH_BUFFER_SIZE = 1 MB.
+	qwpDefaultMicrobatchBufSize = 1 * 1024 * 1024 // 1 MB
+
+	// qwpMaxTableNameLength caps table-name length. Honored by the
+	// shared lineSenderConfig.fileNameLimit (defaultFileNameLimit in
+	// sender.go), enforced in qwpValidateTableName.
+	// Java: QwpWebSocketSender.MAX_TABLE_NAME_LENGTH = 127.
+	qwpMaxTableNameLength = 127
+
+	// qwpMaxColumnNameLength caps column-name length. Honored by the
+	// same lineSenderConfig.fileNameLimit, enforced in
+	// qwpValidateColumnName.
+	// Java: QwpTableBuffer.MAX_COLUMN_NAME_LENGTH = 127.
+	qwpMaxColumnNameLength = 127
+
+	// qwpMaxColumnsPerTable caps columns per table. Go-only; the Java
+	// client does not enforce a hard cap.
+	qwpMaxColumnsPerTable = 2048
+
+	// qwpDefaultInitRecvBufSize is the initial capacity of the ACK
+	// receive buffer. Go-only; the Java client manages the read path
+	// differently and has no direct counterpart.
+	qwpDefaultInitRecvBufSize = 64 * 1024 // 64 KB
 )
 
 // qwpFixedTypeSize returns the per-value size in bytes for fixed-width

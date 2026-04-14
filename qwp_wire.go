@@ -37,6 +37,16 @@ type qwpWireBuffer struct {
 	buf []byte
 }
 
+// preallocate sets the initial backing-array capacity. Safe to call
+// on a zero-value buffer; a no-op if the existing capacity already
+// meets or exceeds initCap.
+func (w *qwpWireBuffer) preallocate(initCap int) {
+	if initCap <= 0 || cap(w.buf) >= initCap {
+		return
+	}
+	w.buf = make([]byte, 0, initCap)
+}
+
 // ensure grows the buffer so that at least n more bytes can be written
 // without further allocation. This should be called before writing a
 // known number of bytes to avoid repeated slice growth.

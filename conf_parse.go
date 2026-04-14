@@ -100,6 +100,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if v == "off" {
 				senderConf.autoFlushRows = 0
 				senderConf.autoFlushInterval = 0
+				senderConf.autoFlushBytes = 0
 			} else if v != "on" {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not 'on' or 'off'", k, v)
 			}
@@ -123,6 +124,16 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.autoFlushInterval = time.Duration(parsedVal) * time.Millisecond
+		case "auto_flush_bytes":
+			if v == "off" {
+				senderConf.autoFlushBytes = 0
+				continue
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			senderConf.autoFlushBytes = parsedVal
 		case "request_min_throughput", "init_buf_size", "max_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
@@ -191,6 +202,12 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
 			senderConf.closeTimeout = time.Duration(parsedVal) * time.Millisecond
+		case "max_schemas_per_connection":
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			senderConf.maxSchemasPerConnection = parsedVal
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}

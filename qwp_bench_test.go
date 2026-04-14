@@ -167,7 +167,7 @@ func BenchmarkQwpSenderSteadyState(b *testing.B) {
 				StringColumn("note", "test").
 				At(ctx, ts.Add(time.Duration(r)*time.Microsecond))
 		}
-		tables := s.buildTableEncodeInfo()
+		tables, _ := s.buildTableEncodeInfo()
 		s.encoders[0].encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,
@@ -192,7 +192,7 @@ func BenchmarkQwpSenderSteadyState(b *testing.B) {
 				StringColumn("note", "test").
 				At(ctx, ts.Add(time.Duration(r)*time.Microsecond))
 		}
-		tables := s.buildTableEncodeInfo()
+		tables, _ := s.buildTableEncodeInfo()
 		s.encoders[0].encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,

@@ -311,13 +311,15 @@ type lineSenderConfig struct {
 	// Auto-flush fields
 	autoFlushRows     int
 	autoFlushInterval time.Duration
+	autoFlushBytes    int // QWP-only; 0 disables the byte-size trigger
 
 	protocolVersion protocolVersion
 
 	// QWP-specific fields
-	inFlightWindow int           // 0 = default (sync mode), >1 = async mode
-	closeTimeout   time.Duration // 0 = use default (5s)
-	dumpWriter     io.Writer     // if set, record outgoing bytes (unexported)
+	inFlightWindow          int           // 0 = unset (treated as sync mode 1); seeded to qwpDefaultInFlightWindow by newLineSenderConfig
+	closeTimeout            time.Duration // 0 = use default (5s)
+	maxSchemasPerConnection int           // 0 = unset; seeded to qwpDefaultMaxSchemasPerConnection
+	dumpWriter              io.Writer     // if set, record outgoing bytes (unexported)
 }
 
 // LineSenderOption defines line sender config option.
@@ -345,8 +347,9 @@ func WithQwp() LineSenderOption {
 }
 
 // WithInFlightWindow sets the number of concurrent in-flight batches
-// for async QWP mode. A value of 1 (default) uses synchronous mode.
-// Values > 1 enable async mode with a dedicated I/O goroutine.
+// for async QWP mode. A value of 1 forces synchronous mode (each
+// Flush blocks until the ACK arrives). Values > 1 enable async mode
+// with a dedicated I/O goroutine. Defaults to 128.
 //
 // Only available for the QWP sender.
 func WithInFlightWindow(window int) LineSenderOption {
@@ -364,6 +367,18 @@ func WithInFlightWindow(window int) LineSenderOption {
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.closeTimeout = d
+	}
+}
+
+// WithMaxSchemasPerConnection caps the number of schema IDs that may
+// be registered on a single QWP connection before the sender returns
+// an error. Once the cap is hit, the caller should close and re-open
+// the sender to start a new schema ID space. Defaults to 65535.
+//
+// Only available for the QWP sender.
+func WithMaxSchemasPerConnection(n int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.maxSchemasPerConnection = n
 	}
 }
 
@@ -552,6 +567,18 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 	}
 }
 
+// WithAutoFlushBytes triggers an auto-flush once the cumulative size
+// of all buffered table data exceeds the given byte threshold. A value
+// of 0 disables the byte-based trigger. Defaults to 0.
+//
+// Only available for the QWP sender. Distinct from WithMaxBufferSize:
+// this is a soft trigger, while WithMaxBufferSize is a hard cap.
+func WithAutoFlushBytes(bytes int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.autoFlushBytes = bytes
+	}
+}
+
 // WithProtocolVersion sets the ingestion protocol version.
 //
 //   - HTTP transport automatically negotiates the protocol version by default(unset, STRONGLY RECOMMENDED).
@@ -696,13 +723,15 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 		}
 	case qwpSenderType:
 		return &lineSenderConfig{
-			senderType:        t,
-			address:           defaultHttpAddress,
-			retryTimeout:      defaultRetryTimeout,
-			autoFlushRows:     defaultAutoFlushRows,
-			autoFlushInterval: defaultAutoFlushInterval,
-			initBufSize:       defaultInitBufferSize,
-			fileNameLimit:     defaultFileNameLimit,
+			senderType:              t,
+			address:                 defaultHttpAddress,
+			retryTimeout:            defaultRetryTimeout,
+			autoFlushRows:           qwpDefaultAutoFlushRows,
+			autoFlushInterval:       qwpDefaultAutoFlushInterval,
+			inFlightWindow:          qwpDefaultInFlightWindow,
+			maxSchemasPerConnection: qwpDefaultMaxSchemasPerConnection,
+			initBufSize:             defaultInitBufferSize,
+			fileNameLimit:           defaultFileNameLimit,
 		}
 	default:
 		return &lineSenderConfig{
@@ -766,8 +795,14 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	if conf.autoFlushInterval != 0 {
 		return errors.New("autoFlushInterval setting is not available in the TCP client")
 	}
+	if conf.autoFlushBytes != 0 {
+		return errors.New("autoFlushBytes setting is not available in the TCP client")
+	}
 	if conf.maxBufSize != 0 {
 		return errors.New("maxBufferSize setting is not available in the TCP client")
+	}
+	if conf.maxSchemasPerConnection != 0 {
+		return errors.New("maxSchemasPerConnection setting is not available in the TCP client")
 	}
 	if conf.tcpKey == "" && conf.tcpKeyId != "" {
 		return errors.New("tcpKey is empty and tcpKeyId is not. both (or none) must be provided")
@@ -816,6 +851,12 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
 		return errors.New("both basic and token authentication cannot be used")
 	}
+	if conf.autoFlushBytes != 0 {
+		return errors.New("autoFlushBytes setting is not available in the HTTP client")
+	}
+	if conf.maxSchemasPerConnection != 0 {
+		return errors.New("maxSchemasPerConnection setting is not available in the HTTP client")
+	}
 
 	return nil
 }
@@ -851,8 +892,18 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	}
 	s.maxBufSize = conf.maxBufSize
 	s.fileNameLimit = conf.fileNameLimit
+	s.autoFlushBytes = conf.autoFlushBytes
+	s.maxSchemasPerConnection = conf.maxSchemasPerConnection
 	if conf.closeTimeout > 0 {
 		s.closeTimeout = conf.closeTimeout
+	}
+	// Async mode's encoder buffers are pre-sized for the microbatch
+	// role: max(1 MB, 2 * autoFlushBytes). Matches the Java client's
+	// MicrobatchBuffer sizing. The 1 MB floor was already applied in
+	// newQwpLineSender; grow further if autoFlushBytes warrants it.
+	if s.asyncState != nil && conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
+		s.encoders[0].wb.preallocate(conf.autoFlushBytes * 2)
+		s.encoders[1].wb.preallocate(conf.autoFlushBytes * 2)
 	}
 	return s, nil
 }
@@ -884,6 +935,12 @@ func validateConf(conf *lineSenderConfig) error {
 	}
 	if conf.autoFlushInterval < 0 {
 		return fmt.Errorf("auto flush interval is negative: %d", conf.autoFlushInterval)
+	}
+	if conf.autoFlushBytes < 0 {
+		return fmt.Errorf("auto flush bytes is negative: %d", conf.autoFlushBytes)
+	}
+	if conf.maxSchemasPerConnection < 0 {
+		return fmt.Errorf("max schemas per connection is negative: %d", conf.maxSchemasPerConnection)
 	}
 	if conf.protocolVersion < protocolVersionUnset || conf.protocolVersion > ProtocolVersion3 {
 		return errors.New("current client only supports protocol version 1 (text format for all datatypes), " +

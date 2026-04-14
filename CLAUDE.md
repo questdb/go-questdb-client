@@ -133,10 +133,10 @@ own framing, codecs, and server handshake. Everything QWP lives in
   *only* advanced after the server ACKs the batch, so retries after
   failure don't produce dangling references.
 
-Async mode is enabled by `WithInFlightWindow(n)` or `in_flight_window=n`
-in the config, with `n > 1`. `WithInFlightWindow(1)` (the default)
-keeps the sender fully synchronous: each `Flush` blocks until the ACK
-arrives.
+Async mode is the default: the QWP sender is seeded with
+`qwpDefaultInFlightWindow = 128`. Override with `WithInFlightWindow(n)` 
+or `in_flight_window=n` in the config. `WithInFlightWindow(1)` forces 
+synchronous mode — each `Flush` blocks until the ACK arrives.
 
 Delta symbol dictionaries send only new symbols since the last ACK;
 this is why symbol/schema cache updates must be gated on ACK — a

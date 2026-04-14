@@ -132,6 +132,10 @@ type qwpLineSender struct {
 	nextSchemaId     int
 	maxSentSchemaId  int
 	batchMaxSchemaId int
+	// maxSchemasPerConnection caps nextSchemaId. 0 disables the cap.
+	// When the cap is hit, Flush returns an error and the caller must
+	// close and re-open the sender.
+	maxSchemasPerConnection int
 
 	// Row state.
 	hasTable bool
@@ -140,6 +144,7 @@ type qwpLineSender struct {
 	// Auto-flush configuration.
 	autoFlushRows     int
 	autoFlushInterval time.Duration
+	autoFlushBytes    int // 0 disables the byte-size trigger
 	flushDeadline     time.Time
 	pendingRowCount   int
 
@@ -188,6 +193,17 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 		inFlightWindow:    window,
 		closeTimeout:      5 * time.Second,
 	}
+	// Initial encoder buffer capacity. Sync mode uses the small 8 KB
+	// default. Async mode uses 1 MB: the user goroutine fills it while the
+	// I/O goroutine transmits the other one. The size can be further grown
+	// by newQwpLineSenderFromConf when autoFlushBytes is large enough to need
+	// max(1 MB, 2*autoFlushBytes).
+	initEncoderCap := qwpDefaultInitEncoderBufSize
+	if window > 1 {
+		initEncoderCap = qwpDefaultMicrobatchBufSize
+	}
+	s.encoders[0].wb.preallocate(initEncoderCap)
+	s.encoders[1].wb.preallocate(initEncoderCap)
 
 	s.transport.dumpWriter = dumpWriter
 	if err := s.transport.connect(ctx, address, opts); err != nil {
@@ -676,14 +692,17 @@ func (s *qwpLineSender) At(ctx context.Context, ts time.Time) error {
 	s.currentTable = nil
 	s.pendingRowCount++
 
-	// Check maxBufSize: if the total buffer size exceeds the limit,
-	// trigger a flush to prevent unbounded memory growth.
-	if s.maxBufSize > 0 {
+	// Size-based triggers: maxBufSize is a hard cap (forced flush to
+	// prevent unbounded memory growth); autoFlushBytes is a soft
+	// trigger. One iteration covers both.
+	if s.maxBufSize > 0 || s.autoFlushBytes > 0 {
 		total := 0
 		for _, tb := range s.tableBuffers {
 			total += tb.approxDataSize()
 		}
-		if total > s.maxBufSize {
+		triggered := (s.maxBufSize > 0 && total > s.maxBufSize) ||
+			(s.autoFlushBytes > 0 && total >= s.autoFlushBytes)
+		if triggered {
 			if s.asyncState != nil {
 				return s.enqueueFlush(ctx)
 			}
@@ -751,12 +770,15 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // compared to sending one message per table.
 func (s *qwpLineSender) flushSync(ctx context.Context) error {
 	// Collect non-empty tables and build encode info.
-	tables := s.buildTableEncodeInfo()
+	tables, err := s.buildTableEncodeInfo()
+	if err != nil {
+		return err
+	}
 	if len(tables) == 0 {
 		return nil
 	}
 
-	err := s.transport.sendAndAck(ctx,
+	err = s.transport.sendAndAck(ctx,
 		func() []byte {
 			return s.encoders[0].encodeMultiTableWithDeltaDict(
 				tables,
@@ -788,7 +810,9 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 // mode based on whether the ID has already been ACKed by the
 // server. Reuses s.encodeInfoBuf to avoid allocating per flush.
 // Also sets s.batchMaxSchemaId to the highest schema ID in the batch.
-func (s *qwpLineSender) buildTableEncodeInfo() []qwpTableEncodeInfo {
+// Returns an error if assigning a new schema ID would exceed
+// maxSchemasPerConnection (when > 0).
+func (s *qwpLineSender) buildTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
 	s.encodeInfoBuf = s.encodeInfoBuf[:0]
 	batchMax := s.maxSentSchemaId
 	for _, tb := range s.tableBuffers {
@@ -796,6 +820,12 @@ func (s *qwpLineSender) buildTableEncodeInfo() []qwpTableEncodeInfo {
 			continue
 		}
 		if tb.schemaId < 0 {
+			if s.maxSchemasPerConnection > 0 && s.nextSchemaId >= s.maxSchemasPerConnection {
+				return nil, fmt.Errorf(
+					"qwp: schema registry exhausted (limit %d); close and re-open the sender to reset",
+					s.maxSchemasPerConnection,
+				)
+			}
 			tb.schemaId = s.nextSchemaId
 			s.nextSchemaId++
 		}
@@ -813,7 +843,7 @@ func (s *qwpLineSender) buildTableEncodeInfo() []qwpTableEncodeInfo {
 		})
 	}
 	s.batchMaxSchemaId = batchMax
-	return s.encodeInfoBuf
+	return s.encodeInfoBuf, nil
 }
 
 // flushAsync encodes all tables into a single multi-table message,
@@ -834,7 +864,10 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 		return err
 	}
 
-	tables := s.buildTableEncodeInfo()
+	tables, err := s.buildTableEncodeInfo()
+	if err != nil {
+		return err
+	}
 	if len(tables) == 0 {
 		return nil
 	}
@@ -908,7 +941,10 @@ func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 		return err
 	}
 
-	tables := s.buildTableEncodeInfo()
+	tables, err := s.buildTableEncodeInfo()
+	if err != nil {
+		return err
+	}
 	if len(tables) == 0 {
 		s.resetAfterFlush()
 		return nil
