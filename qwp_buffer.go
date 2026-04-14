@@ -431,7 +431,7 @@ func (c *qwpColumnBuffer) addLongArray(nDims uint8, shape []int32, flatData []in
 
 // addDecimal appends a Decimal value to a decimal column
 // (TYPE_DECIMAL64, TYPE_DECIMAL128, or TYPE_DECIMAL256). The
-// unscaled value is written in big-endian byte order, sign-extended
+// unscaled value is written in little-endian byte order, sign-extended
 // to fill the column's fixed width (8, 16, or 32 bytes).
 //
 // Scale is tracked per column: the first non-null value establishes
@@ -484,7 +484,10 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 		}
 	}
 
-	// Write sign-extended big-endian unscaled value.
+	// Write sign-extended little-endian unscaled value. The internal
+	// representation is 32-byte big-endian (unscaled[0] = MSB,
+	// unscaled[31] = LSB); reverse to produce LE wire bytes and
+	// sign-extend any positions above the significant bytes.
 	n := len(c.fixedData)
 	c.fixedData = append(c.fixedData, make([]byte, wireSize)...)
 	dst := c.fixedData[n:]
@@ -495,8 +498,8 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 	}
 
 	for i := range dst {
-		srcIdx := startOffset + uint8(i)
-		if srcIdx < d.offset {
+		srcIdx := 31 - i
+		if uint8(srcIdx) < d.offset {
 			dst[i] = signByte
 		} else {
 			dst[i] = d.unscaled[srcIdx]

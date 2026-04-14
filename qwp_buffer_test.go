@@ -1763,8 +1763,8 @@ func TestQwpColumnBufferDecimal64Basic(t *testing.T) {
 		t.Fatalf("fixedData len = %d, want 8", len(c.fixedData))
 	}
 
-	// 12345 = 0x3039 → big-endian 8 bytes: [0,0,0,0,0,0,0x30,0x39]
-	expected := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x39}
+	// 12345 = 0x3039 → little-endian 8 bytes: [0x39,0x30,0,0,0,0,0,0]
+	expected := []byte{0x39, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 	if !bytes.Equal(c.fixedData, expected) {
 		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
 	}
@@ -1778,9 +1778,9 @@ func TestQwpColumnBufferDecimal64Negative(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// -42 in two's complement big-endian 8 bytes:
-	// [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xD6]
-	expected := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xD6}
+	// -42 in two's complement little-endian 8 bytes:
+	// [0xD6, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+	expected := []byte{0xD6, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 	if !bytes.Equal(c.fixedData, expected) {
 		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
 	}
@@ -1813,12 +1813,12 @@ func TestQwpColumnBufferDecimal128(t *testing.T) {
 		t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
 	}
 
-	// 999999999 = 0x3B9AC9FF → big-endian 16 bytes
+	// 999999999 = 0x3B9AC9FF → little-endian 16 bytes
 	expected := make([]byte, 16)
-	expected[12] = 0x3B
-	expected[13] = 0x9A
-	expected[14] = 0xC9
-	expected[15] = 0xFF
+	expected[0] = 0xFF
+	expected[1] = 0xC9
+	expected[2] = 0x9A
+	expected[3] = 0x3B
 	if !bytes.Equal(c.fixedData, expected) {
 		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
 	}
@@ -1849,9 +1849,9 @@ func TestQwpColumnBufferDecimal256(t *testing.T) {
 		t.Fatalf("fixedData len = %d, want 32", len(c.fixedData))
 	}
 
-	// 42 = 0x2A → big-endian 32 bytes: last byte is 0x2A, rest 0x00
+	// 42 = 0x2A → little-endian 32 bytes: first byte is 0x2A, rest 0x00
 	expected := make([]byte, 32)
-	expected[31] = 0x2A
+	expected[0] = 0x2A
 	if !bytes.Equal(c.fixedData, expected) {
 		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
 	}
@@ -1867,9 +1867,9 @@ func TestQwpColumnBufferDecimal256Negative(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// -42 in two's complement 32 bytes: leading 0xFF, last byte 0xD6
+	// -42 in two's complement little-endian 32 bytes: first byte 0xD6, rest 0xFF
 	expected := bytes.Repeat([]byte{0xFF}, 32)
-	expected[31] = 0xD6
+	expected[0] = 0xD6
 	if !bytes.Equal(c.fixedData, expected) {
 		t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
 	}
@@ -2038,16 +2038,16 @@ func TestQwpColumnBufferDecimalMultipleRows(t *testing.T) {
 		t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
 	}
 
-	// Row 0: 100 = 0x64 → [0,0,0,0,0,0,0,0x64]
+	// Row 0: 100 = 0x64 → LE [0x64,0,0,0,0,0,0,0]
 	row0 := c.fixedData[0:8]
-	expected0 := []byte{0, 0, 0, 0, 0, 0, 0, 0x64}
+	expected0 := []byte{0x64, 0, 0, 0, 0, 0, 0, 0}
 	if !bytes.Equal(row0, expected0) {
 		t.Fatalf("row 0 = %x, want %x", row0, expected0)
 	}
 
-	// Row 1: -50 = 0xCE in two's complement → [0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xCE]
+	// Row 1: -50 = 0xCE in two's complement → LE [0xCE,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF]
 	row1 := c.fixedData[8:16]
-	expected1 := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xCE}
+	expected1 := []byte{0xCE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 	if !bytes.Equal(row1, expected1) {
 		t.Fatalf("row 1 = %x, want %x", row1, expected1)
 	}

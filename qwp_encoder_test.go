@@ -639,8 +639,8 @@ func TestQwpEncoderDecimalSchema(t *testing.T) {
 	}
 	off++
 
-	// Column data: 8 bytes big-endian (100 = 0x64)
-	expected := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64}
+	// Column data: 8 bytes little-endian (100 = 0x64)
+	expected := []byte{0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 	if !bytes.Equal(msg[off:off+8], expected) {
 		t.Fatalf("decimal data = %x, want %x", msg[off:off+8], expected)
 	}
@@ -1931,11 +1931,11 @@ func TestQwpEncoderNullPackingDecimal(t *testing.T) {
 		data := extractColumnData(tb)
 		// 0x01 flag + bitmap (row 1 null → 0x02)
 		// Scale byte: 2
-		// valueCount = 2 → 2×8 bytes big-endian
+		// valueCount = 2 → 2×8 bytes little-endian
 		expected := []byte{0x01, 0x02}
 		expected = append(expected, 0x02) // scale
-		expected = append(expected, 0, 0, 0, 0, 0, 0, 0, 42)
-		expected = append(expected, 0, 0, 0, 0, 0, 0, 0, 99)
+		expected = append(expected, 42, 0, 0, 0, 0, 0, 0, 0)
+		expected = append(expected, 99, 0, 0, 0, 0, 0, 0, 0)
 		if !bytes.Equal(data, expected) {
 			t.Fatalf("data = %x, want %x", data, expected)
 		}

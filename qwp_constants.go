@@ -48,9 +48,9 @@ const (
 	qwpTypeTimestampNano qwpTypeCode = 0x10 // int64 nanoseconds, 8 bytes LE
 	qwpTypeDoubleArray   qwpTypeCode = 0x11 // N-dimensional float64 array
 	qwpTypeLongArray     qwpTypeCode = 0x12 // N-dimensional int64 array
-	qwpTypeDecimal64     qwpTypeCode = 0x13 // 8 bytes, big-endian unscaled
-	qwpTypeDecimal128    qwpTypeCode = 0x14 // 16 bytes, big-endian unscaled
-	qwpTypeDecimal256    qwpTypeCode = 0x15 // 32 bytes, big-endian unscaled
+	qwpTypeDecimal64     qwpTypeCode = 0x13 // 8 bytes, little-endian unscaled
+	qwpTypeDecimal128    qwpTypeCode = 0x14 // 16 bytes, little-endian unscaled
+	qwpTypeDecimal256    qwpTypeCode = 0x15 // 32 bytes, little-endian unscaled
 	qwpTypeChar          qwpTypeCode = 0x16 // UTF-16 code unit, 2 bytes LE
 )
 
