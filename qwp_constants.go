@@ -80,11 +80,8 @@ const (
 
 // QWP header flag bits.
 const (
-	qwpFlagLZ4             byte = 0x01 // LZ4 compression
-	qwpFlagZstd            byte = 0x02 // Zstd compression
 	qwpFlagGorilla         byte = 0x04 // Gorilla timestamp encoding
 	qwpFlagDeltaSymbolDict byte = 0x08 // delta symbol dictionary
-	qwpFlagCompressionMask byte = 0x03 // bits 0-1
 )
 
 // qwpSchemaMode values control how column schema is transmitted.
