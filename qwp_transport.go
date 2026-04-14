@@ -48,6 +48,16 @@ const qwpWritePath = "/write/v4"
 // qwpSubprotocol is the WebSocket subprotocol for QWP.
 const qwpSubprotocol = "qwp"
 
+// Version-negotiation HTTP headers (QWP spec §3).
+const (
+	qwpHeaderMaxVersion = "X-QWP-Max-Version"
+	qwpHeaderClientId   = "X-QWP-Client-Id"
+	qwpHeaderVersion    = "X-QWP-Version"
+)
+
+// qwpClientId is sent in X-QWP-Client-Id during the upgrade handshake.
+const qwpClientId = "go/4"
+
 // qwpAckMinSize is the minimum ACK response size:
 // 1 byte status + 8 bytes sequence number.
 const qwpAckMinSize = 9
@@ -107,11 +117,13 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		Subprotocols: []string{qwpSubprotocol},
 	}
 
-	// Auth header.
+	// Upgrade headers: QWP version negotiation (§3) and optional auth.
+	dialOpts.HTTPHeader = http.Header{
+		qwpHeaderMaxVersion: []string{fmt.Sprintf("%d", qwpVersion)},
+		qwpHeaderClientId:   []string{qwpClientId},
+	}
 	if opts.authorization != "" {
-		dialOpts.HTTPHeader = http.Header{
-			"Authorization": []string{opts.authorization},
-		}
+		dialOpts.HTTPHeader.Set("Authorization", opts.authorization)
 	}
 
 	if t.dumpWriter != nil {
@@ -146,9 +158,20 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		}
 	}
 
-	conn, _, err := websocket.Dial(ctx, wsURL, dialOpts)
+	conn, resp, err := websocket.Dial(ctx, wsURL, dialOpts)
 	if err != nil {
 		return fmt.Errorf("qwp: websocket dial: %w", err)
+	}
+
+	// Validate the server-selected QWP version. If absent, assume v1
+	// (spec §3: server may omit the header on v1). If present and not
+	// equal to our version, the server has chosen a version we don't
+	// speak — we'd get parse errors on every message, so fail fast.
+	if resp != nil {
+		if v := resp.Header.Get(qwpHeaderVersion); v != "" && v != fmt.Sprintf("%d", qwpVersion) {
+			conn.Close(websocket.StatusProtocolError, "version mismatch")
+			return fmt.Errorf("qwp: server selected protocol version %q, client supports %d", v, qwpVersion)
+		}
 	}
 
 	// Remove the default read limit — QWP ACKs are small but

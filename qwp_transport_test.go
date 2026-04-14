@@ -214,6 +214,106 @@ func TestQwpTransportConnectAndClose(t *testing.T) {
 	}
 }
 
+// TestQwpTransportNegotiationHeaders verifies that connect() sends
+// the QWP version negotiation headers during the WebSocket upgrade.
+func TestQwpTransportNegotiationHeaders(t *testing.T) {
+	var gotMaxVersion, gotClientId string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMaxVersion = r.Header.Get(qwpHeaderMaxVersion)
+		gotClientId = r.Header.Get(qwpHeaderClientId)
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer tr.close(context.Background())
+
+	if gotMaxVersion != "1" {
+		t.Errorf("X-QWP-Max-Version = %q, want %q", gotMaxVersion, "1")
+	}
+	if gotClientId != qwpClientId {
+		t.Errorf("X-QWP-Client-Id = %q, want %q", gotClientId, qwpClientId)
+	}
+}
+
+// TestQwpTransportVersionMatchAccepted verifies that connect() succeeds
+// when the server returns the same protocol version in X-QWP-Version.
+func TestQwpTransportVersionMatchAccepted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer tr.close(context.Background())
+}
+
+// TestQwpTransportVersionMismatchRejected verifies that a server response
+// advertising a different QWP version aborts the handshake.
+func TestQwpTransportVersionMismatchRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "2")
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{qwpSubprotocol},
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{})
+	if err == nil {
+		tr.close(context.Background())
+		t.Fatal("expected version mismatch error")
+	}
+	if !strings.Contains(err.Error(), "version") {
+		t.Fatalf("expected version error, got: %v", err)
+	}
+	if tr.conn != nil {
+		t.Fatal("conn should be nil after rejected handshake")
+	}
+}
+
 func TestQwpTransportSendAndReceive(t *testing.T) {
 	srv := newTestWSServer(t, func(conn *websocket.Conn) {
 		// Read a message, reply with ACK OK.
