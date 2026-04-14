@@ -54,15 +54,6 @@ const (
 	qwpTypeChar          qwpTypeCode = 0x16 // UTF-16 code unit, 2 bytes LE
 )
 
-const (
-	// qwpTypeNullableFlag is the high bit of the type code byte,
-	// indicating that the column has a null bitmap.
-	qwpTypeNullableFlag qwpTypeCode = 0x80
-
-	// qwpTypeMask masks out the nullable flag to get the base type code.
-	qwpTypeMask qwpTypeCode = 0x7F
-)
-
 // qwpMagic is the 4-byte magic at the start of every QWP message.
 // Stored as a uint32 in little-endian byte order: "QWP1".
 const qwpMagic uint32 = 0x31505751
@@ -131,7 +122,7 @@ const (
 // types. Returns 0 for bit-packed types (BOOLEAN) and -1 for
 // variable-width types.
 func qwpFixedTypeSize(tc qwpTypeCode) int {
-	switch tc & qwpTypeMask {
+	switch tc {
 	case qwpTypeBoolean:
 		return 0 // bit-packed
 	case qwpTypeByte:
@@ -164,6 +155,5 @@ func qwpIsFixedWidthType(tc qwpTypeCode) bool {
 // qwpIsDecimalType reports whether the given type code is a decimal type
 // that carries a scale byte in the schema.
 func qwpIsDecimalType(tc qwpTypeCode) bool {
-	base := tc & qwpTypeMask
-	return base == qwpTypeDecimal64 || base == qwpTypeDecimal128 || base == qwpTypeDecimal256
+	return tc == qwpTypeDecimal64 || tc == qwpTypeDecimal128 || tc == qwpTypeDecimal256
 }

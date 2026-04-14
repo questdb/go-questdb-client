@@ -554,23 +554,6 @@ func TestQwpColumnBufferNullStringInterleaved(t *testing.T) {
 	}
 }
 
-func TestQwpColumnBufferWireTypeCode(t *testing.T) {
-	t.Run("NonNullable", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeLong, false)
-		if c.wireTypeCode() != 0x05 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x05", c.wireTypeCode())
-		}
-	})
-
-	t.Run("Nullable", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeLong, true)
-		// 0x05 | 0x80 = 0x85
-		if c.wireTypeCode() != 0x85 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x85", c.wireTypeCode())
-		}
-	})
-}
-
 func TestQwpColumnBufferReset(t *testing.T) {
 	t.Run("FixedWidth", func(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeLong, true)
@@ -1760,38 +1743,6 @@ func TestQwpTableBufferArrayCancelRow(t *testing.T) {
 	}
 }
 
-func TestQwpColumnBufferArrayWireTypeCode(t *testing.T) {
-	t.Run("DoubleArrayNonNullable", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
-		if c.wireTypeCode() != 0x11 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x11", c.wireTypeCode())
-		}
-	})
-
-	t.Run("DoubleArrayNullable", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
-		// 0x11 | 0x80 = 0x91
-		if c.wireTypeCode() != 0x91 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x91", c.wireTypeCode())
-		}
-	})
-
-	t.Run("LongArrayNonNullable", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
-		if c.wireTypeCode() != 0x12 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x12", c.wireTypeCode())
-		}
-	})
-
-	t.Run("LongArrayNullable", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeLongArray, true)
-		// 0x12 | 0x80 = 0x92
-		if c.wireTypeCode() != 0x92 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x92", c.wireTypeCode())
-		}
-	})
-}
-
 // --- decimal column buffer tests ---
 
 func TestQwpColumnBufferDecimal64Basic(t *testing.T) {
@@ -2130,28 +2081,6 @@ func TestQwpColumnBufferDecimalNullInterleaved(t *testing.T) {
 	if len(c.fixedData) != 16 {
 		t.Fatalf("fixedData len = %d, want 16", len(c.fixedData))
 	}
-}
-
-func TestQwpColumnBufferDecimalWireTypeCode(t *testing.T) {
-	t.Run("Decimal64", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeDecimal64, false)
-		if c.wireTypeCode() != 0x13 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x13", c.wireTypeCode())
-		}
-	})
-	t.Run("Decimal128Nullable", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeDecimal128, true)
-		// 0x14 | 0x80 = 0x94
-		if c.wireTypeCode() != 0x94 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x94", c.wireTypeCode())
-		}
-	})
-	t.Run("Decimal256", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeDecimal256, false)
-		if c.wireTypeCode() != 0x15 {
-			t.Fatalf("wireTypeCode = 0x%02X, want 0x15", c.wireTypeCode())
-		}
-	})
 }
 
 func TestQwpTableBufferDecimalGapFill(t *testing.T) {

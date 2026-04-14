@@ -429,7 +429,7 @@ func TestQwpEncoderNullableColumn(t *testing.T) {
 	// Column "v": varint(1) + 'v' + typeCode (LONG = 0x05, no nullable flag)
 	off += 2
 	if msg[off] != 0x05 {
-		t.Fatalf("wireTypeCode = 0x%02X, want 0x05", msg[off])
+		t.Fatalf("typeCode = 0x%02X, want 0x05", msg[off])
 	}
 	off++
 
@@ -702,7 +702,7 @@ func TestQwpEncoderBoolNullableGoldenBytes(t *testing.T) {
 	off += 1         // colCount=1
 	off += 1         // schemaMode=FULL
 	off += 1         // schemaId varint (0 = 1 byte)
-	off += 1 + 4 + 1 // col "flag": varint(4) + "flag" + wireTypeCode (0x81)
+	off += 1 + 4 + 1 // col "flag": varint(4) + "flag" + typeCode (BOOLEAN = 0x01)
 
 	// Null bitmap flag: 0x01 (has nulls)
 	if msg[off] != 0x01 {

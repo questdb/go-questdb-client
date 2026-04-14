@@ -137,16 +137,6 @@ func newQwpColumnBuffer(name string, typeCode qwpTypeCode, nullable bool) *qwpCo
 	return c
 }
 
-// wireTypeCode returns the type code byte for the wire format,
-// including the nullable flag in the high bit.
-func (c *qwpColumnBuffer) wireTypeCode() byte {
-	tc := byte(c.typeCode)
-	if c.nullable {
-		tc |= byte(qwpTypeNullableFlag)
-	}
-	return tc
-}
-
 // --- null bitmap helpers ------------------------------------------------
 
 // markNull sets the null bit for the current row (at index rowCount)
