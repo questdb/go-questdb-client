@@ -33,11 +33,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/coder/websocket"
 )
@@ -58,9 +56,13 @@ const (
 // qwpClientId is sent in X-QWP-Client-Id during the upgrade handshake.
 const qwpClientId = "go/4"
 
-// qwpAckMinSize is the minimum ACK response size:
-// 1 byte status + 8 bytes sequence number.
-const qwpAckMinSize = 9
+// QWP ACK response sizes (spec §13). An OK ACK is exactly
+// qwpAckOKSize bytes; an error ACK is exactly
+// qwpAckErrorHeaderSize + msg_len bytes.
+const (
+	qwpAckOKSize          = 9  // status(1) + sequence(8)
+	qwpAckErrorHeaderSize = 11 // status(1) + sequence(8) + msg_len(2)
+)
 
 // qwpTransportOpts configures a WebSocket transport connection.
 type qwpTransportOpts struct {
@@ -195,13 +197,17 @@ func (t *qwpTransport) sendMessage(ctx context.Context, data []byte) error {
 
 // readAck reads and parses the server's ACK response. It returns
 // the status code and the full response payload (including the
-// status byte).
+// status byte). The payload is validated against the exact length
+// required by §13: OK ACKs must be exactly qwpAckOKSize bytes, error
+// ACKs must be exactly qwpAckErrorHeaderSize + msg_len bytes. This
+// mirrors the Java client's WebSocketResponse.isStructurallyValid
+// and fails loudly on any unrecognized shape (e.g. a legacy PARTIAL
+// response) instead of decoding it into garbage fields.
 //
-// ACK format:
+// ACK layouts:
 //
-//	[statusCode: uint8]
-//	[errorLength: uint16 LE] (optional, present when status != OK)
-//	[errorMessage: UTF-8]    (errorLength bytes)
+//	OK:    [status: uint8 (0x00)] [sequence: int64 LE]
+//	Error: [status: uint8] [sequence: int64 LE] [msg_len: uint16 LE] [msg: UTF-8]
 func (t *qwpTransport) readAck(ctx context.Context) (qwpStatusCode, []byte, error) {
 	if t.conn == nil {
 		return 0, nil, fmt.Errorf("qwp: not connected")
@@ -214,11 +220,24 @@ func (t *qwpTransport) readAck(ctx context.Context) (qwpStatusCode, []byte, erro
 	if msgType != websocket.MessageBinary {
 		return 0, nil, fmt.Errorf("qwp: expected binary message, got %v", msgType)
 	}
-	if len(data) < qwpAckMinSize {
+	if len(data) < qwpAckOKSize {
 		return 0, nil, fmt.Errorf("qwp: ack too short: %d bytes", len(data))
 	}
 
 	statusCode := qwpStatusCode(data[0])
+	if statusCode == qwpStatusOK {
+		if len(data) != qwpAckOKSize {
+			return 0, nil, fmt.Errorf("qwp: malformed OK ack: got %d bytes, want %d", len(data), qwpAckOKSize)
+		}
+		return statusCode, data, nil
+	}
+	if len(data) < qwpAckErrorHeaderSize {
+		return 0, nil, fmt.Errorf("qwp: malformed error ack: got %d bytes, want at least %d", len(data), qwpAckErrorHeaderSize)
+	}
+	msgLen := int(binary.LittleEndian.Uint16(data[9:11]))
+	if len(data) != qwpAckErrorHeaderSize+msgLen {
+		return 0, nil, fmt.Errorf("qwp: malformed error ack: status=0x%02X, got %d bytes, want %d", byte(statusCode), len(data), qwpAckErrorHeaderSize+msgLen)
+	}
 	return statusCode, data, nil
 }
 
@@ -372,78 +391,20 @@ func qwpFakeServer(conn net.Conn) {
 	}
 }
 
-// sendWithRetry sends a QWP message and reads the ACK, retrying
-// on retriable errors (OVERLOADED) with exponential backoff.
-// The retryTimeout is the maximum cumulative time to spend retrying;
-// 0 means no retries. Returns nil on success, or a *QwpError on
-// server rejection, or a transport error on connection failure.
-//
-// The sendFn callback generates the message bytes. It is called
-// once per send attempt.
-func (t *qwpTransport) sendWithRetry(
-	ctx context.Context,
-	retryTimeout time.Duration,
-	sendFn func() []byte,
-) error {
-	const (
-		initialInterval = 10 * time.Millisecond
-		maxInterval     = time.Second
-		maxJitterMs     = 10
-	)
-
+// sendAndAck sends a QWP message and reads exactly one ACK.
+// Returns nil on OK, a *QwpError for server-side rejections, or a
+// transport error on connection failure. No retry: the spec defines
+// no retriable status, so any non-OK response is terminal.
+func (t *qwpTransport) sendAndAck(ctx context.Context, sendFn func() []byte) error {
 	msg := sendFn()
 	if err := t.sendMessage(ctx, msg); err != nil {
 		return err
 	}
-
 	_, data, err := t.readAck(ctx)
 	if err != nil {
 		return err
 	}
-
-	qErr := newQwpErrorFromAck(data)
-	if qErr == nil {
-		return nil // OK
-	}
-
-	// Non-retriable error: return immediately.
-	if !qErr.IsRetriable() || retryTimeout <= 0 {
-		return qErr
-	}
-
-	// Retry loop with exponential backoff.
-	retryStart := time.Now()
-	interval := initialInterval
-
-	for qErr != nil && qErr.IsRetriable() {
-		if time.Since(retryStart) > retryTimeout {
-			return NewRetryTimeoutError(retryTimeout, qErr)
-		}
-
-		jitter := time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(interval + jitter):
-		}
-
-		msg = sendFn()
-		if err := t.sendMessage(ctx, msg); err != nil {
-			return err
-		}
-		_, data, err = t.readAck(ctx)
-		if err != nil {
-			return err
-		}
-		qErr = newQwpErrorFromAck(data)
-
-		interval *= 2
-		if interval > maxInterval {
-			interval = maxInterval
-		}
-	}
-
-	if qErr != nil {
+	if qErr := newQwpErrorFromAck(data); qErr != nil {
 		return qErr
 	}
 	return nil

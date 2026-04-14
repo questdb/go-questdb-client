@@ -62,42 +62,15 @@ func TestQwpErrorNoMessage(t *testing.T) {
 	}
 }
 
-func TestQwpErrorIsRetriable(t *testing.T) {
-	tests := []struct {
-		status qwpStatusCode
-		want   bool
-	}{
-		{qwpStatusOK, false},
-		{qwpStatusPartial, false},
-		{qwpStatusSchemaMismatch, false},
-		{qwpStatusTableNotFound, false},
-		{qwpStatusParseError, false},
-		{qwpStatusInternalError, false},
-		{qwpStatusOverloaded, true},
-		{qwpStatusSecurityError, false},
-		{qwpStatusWriteError, false},
-	}
-	for _, tc := range tests {
-		e := &QwpError{Status: tc.status}
-		if e.IsRetriable() != tc.want {
-			t.Fatalf("IsRetriable for status 0x%02X: got %v, want %v",
-				byte(tc.status), e.IsRetriable(), tc.want)
-		}
-	}
-}
-
 func TestQwpStatusName(t *testing.T) {
 	tests := []struct {
 		status qwpStatusCode
 		want   string
 	}{
 		{qwpStatusOK, "OK"},
-		{qwpStatusPartial, "PARTIAL"},
 		{qwpStatusSchemaMismatch, "SCHEMA_MISMATCH"},
-		{qwpStatusTableNotFound, "TABLE_NOT_FOUND"},
 		{qwpStatusParseError, "PARSE_ERROR"},
 		{qwpStatusInternalError, "INTERNAL_ERROR"},
-		{qwpStatusOverloaded, "OVERLOADED"},
 		{qwpStatusSecurityError, "SECURITY_ERROR"},
 		{qwpStatusWriteError, "WRITE_ERROR"},
 		{qwpStatusCode(42), "UNKNOWN(42)"},
@@ -164,19 +137,6 @@ func TestNewQwpErrorFromAck(t *testing.T) {
 		}
 	})
 
-	t.Run("Overloaded", func(t *testing.T) {
-		data := make([]byte, 9)
-		data[0] = byte(qwpStatusOverloaded)
-
-		e := newQwpErrorFromAck(data)
-		if e == nil {
-			t.Fatal("expected error, got nil")
-		}
-		if !e.IsRetriable() {
-			t.Fatal("overloaded should be retriable")
-		}
-	})
-
 	t.Run("EmptyPayload", func(t *testing.T) {
 		e := newQwpErrorFromAck([]byte{})
 		if e == nil {
@@ -184,19 +144,6 @@ func TestNewQwpErrorFromAck(t *testing.T) {
 		}
 		if e.Message == "" {
 			t.Fatal("expected error message for empty payload")
-		}
-	})
-
-	t.Run("InternalErrorNotRetriable", func(t *testing.T) {
-		data := make([]byte, 9)
-		data[0] = byte(qwpStatusInternalError)
-
-		e := newQwpErrorFromAck(data)
-		if e == nil {
-			t.Fatal("expected error, got nil")
-		}
-		if e.IsRetriable() {
-			t.Fatal("internal error should not be retriable per spec")
 		}
 	})
 }

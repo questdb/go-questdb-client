@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -330,13 +331,13 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 			}
 			msgCount++
 			if msgCount == 2 {
-				// Return error ACK.
+				// Spec-compliant error ACK: status + sequence + msg_len + msg.
 				errMsg := "bad batch"
-				ack := make([]byte, 3+len(errMsg))
+				ack := make([]byte, qwpAckErrorHeaderSize+len(errMsg))
 				ack[0] = byte(qwpStatusWriteError)
-				ack[1] = byte(len(errMsg))
-				ack[2] = 0
-				copy(ack[3:], errMsg)
+				binary.LittleEndian.PutUint64(ack[1:9], 0)
+				binary.LittleEndian.PutUint16(ack[9:11], uint16(len(errMsg)))
+				copy(ack[11:], errMsg)
 				conn.Write(context.Background(), websocket.MessageBinary, ack)
 			} else {
 				ack := make([]byte, 9)

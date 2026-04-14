@@ -31,18 +31,12 @@ func qwpStatusName(status qwpStatusCode) string {
 	switch status {
 	case qwpStatusOK:
 		return "OK"
-	case qwpStatusPartial:
-		return "PARTIAL"
 	case qwpStatusSchemaMismatch:
 		return "SCHEMA_MISMATCH"
-	case qwpStatusTableNotFound:
-		return "TABLE_NOT_FOUND"
 	case qwpStatusParseError:
 		return "PARSE_ERROR"
 	case qwpStatusInternalError:
 		return "INTERNAL_ERROR"
-	case qwpStatusOverloaded:
-		return "OVERLOADED"
 	case qwpStatusSecurityError:
 		return "SECURITY_ERROR"
 	case qwpStatusWriteError:
@@ -75,13 +69,6 @@ func (e *QwpError) Error() string {
 		return fmt.Sprintf("qwp: server error %s (0x%02X): %s", name, byte(e.Status), e.Message)
 	}
 	return fmt.Sprintf("qwp: server error %s (0x%02X)", name, byte(e.Status))
-}
-
-// IsRetriable reports whether the error indicates a transient
-// condition that may succeed on retry. Per the QWP spec, only
-// OVERLOADED is retriable.
-func (e *QwpError) IsRetriable() bool {
-	return e.Status == qwpStatusOverloaded
 }
 
 // newQwpErrorFromAck creates a QwpError from a raw ACK response

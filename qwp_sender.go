@@ -756,7 +756,7 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 		return nil
 	}
 
-	err := s.transport.sendWithRetry(ctx, s.retryTimeout,
+	err := s.transport.sendAndAck(ctx,
 		func() []byte {
 			return s.encoders[0].encodeMultiTableWithDeltaDict(
 				tables,
