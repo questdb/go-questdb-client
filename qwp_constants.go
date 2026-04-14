@@ -107,13 +107,14 @@ type qwpStatusCode byte
 
 const (
 	qwpStatusOK             qwpStatusCode = 0x00 // batch accepted
-	qwpStatusPartial        qwpStatusCode = 0x01 // some rows failed
-	qwpStatusSchemaRequired qwpStatusCode = 0x02 // schema hash not recognized
-	qwpStatusSchemaMismatch qwpStatusCode = 0x03 // column type incompatible
-	qwpStatusTableNotFound  qwpStatusCode = 0x04 // table doesn't exist
+	qwpStatusPartial        qwpStatusCode = 0x01 // some rows failed; error payload has per-table details
+	qwpStatusSchemaMismatch qwpStatusCode = 0x03 // column type incompatible with existing table
+	qwpStatusTableNotFound  qwpStatusCode = 0x04 // table does not exist (auto-create disabled)
 	qwpStatusParseError     qwpStatusCode = 0x05 // malformed message
-	qwpStatusInternalError  qwpStatusCode = 0x06 // server error
-	qwpStatusOverloaded     qwpStatusCode = 0x07 // backpressure, retry later
+	qwpStatusInternalError  qwpStatusCode = 0x06 // server-side error
+	qwpStatusOverloaded     qwpStatusCode = 0x07 // back-pressure; client should retry with backoff
+	qwpStatusSecurityError  qwpStatusCode = 0x08 // authorization failure
+	qwpStatusWriteError     qwpStatusCode = 0x09 // write failure (e.g., table not accepting writes)
 )
 
 // QWP batch and table limits.

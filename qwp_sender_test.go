@@ -59,7 +59,7 @@ func newQwpTestServer(t *testing.T) *httptest.Server {
 			}
 			// Send OK ACK with sequence=0.
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -346,7 +346,7 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 			}
 			msgCount++
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -396,7 +396,7 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 			}
 			msgCount++
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -1111,7 +1111,7 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 			}
 			messages = append(messages, data)
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -1205,7 +1205,7 @@ func TestQwpSenderServerError(t *testing.T) {
 			// Return WRITE_ERROR.
 			errMsg := "table error"
 			ack := make([]byte, 11+len(errMsg))
-			ack[0] = qwpWireStatusWriteError
+			ack[0] = byte(qwpStatusWriteError)
 			binary.LittleEndian.PutUint16(ack[9:11], uint16(len(errMsg)))
 			copy(ack[11:], errMsg)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
@@ -1230,8 +1230,8 @@ func TestQwpSenderServerError(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *QwpError, got %T: %v", err, err)
 	}
-	if qErr.Status != qwpWireStatusWriteError {
-		t.Fatalf("status = %d, want %d", qErr.Status, qwpWireStatusWriteError)
+	if qErr.Status != qwpStatusWriteError {
+		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusWriteError)
 	}
 }
 
@@ -1258,7 +1258,7 @@ func TestQwpSenderAsyncBasic(t *testing.T) {
 			msgCount++
 			mu.Unlock()
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -1324,7 +1324,7 @@ func TestQwpSenderAsyncMultipleFlushes(t *testing.T) {
 			msgCount++
 			mu.Unlock()
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -1398,7 +1398,7 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 			}
 			messages = append(messages, append([]byte(nil), data...))
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -1624,7 +1624,7 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 			return
 		}
 		ack := make([]byte, 9)
-		ack[0] = qwpWireStatusWriteError
+		ack[0] = byte(qwpStatusWriteError)
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
 	}))
 	defer srv.Close()
@@ -1681,7 +1681,7 @@ func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
 			<-ackGate
 
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -1781,7 +1781,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 					return
 				}
 				ack := make([]byte, 9)
-				ack[0] = qwpWireStatusOK
+				ack[0] = byte(qwpStatusOK)
 				conn.Write(context.Background(), websocket.MessageBinary, ack)
 			}
 		}))
@@ -1819,7 +1819,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 					return
 				}
 				ack := make([]byte, 9)
-				ack[0] = qwpWireStatusOK
+				ack[0] = byte(qwpStatusOK)
 				conn.Write(context.Background(), websocket.MessageBinary, ack)
 			}
 		}))
@@ -1857,7 +1857,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 					return
 				}
 				ack := make([]byte, 9)
-				ack[0] = qwpWireStatusOK
+				ack[0] = byte(qwpStatusOK)
 				conn.Write(context.Background(), websocket.MessageBinary, ack)
 			}
 		}))
@@ -1893,7 +1893,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 					return
 				}
 				ack := make([]byte, 9)
-				ack[0] = qwpWireStatusOK
+				ack[0] = byte(qwpStatusOK)
 				conn.Write(context.Background(), websocket.MessageBinary, ack)
 			}
 		}))
@@ -1935,7 +1935,7 @@ func TestQwpMaxBufSizeTriggersFlush(t *testing.T) {
 			}
 			messageCount++
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))

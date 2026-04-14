@@ -108,12 +108,13 @@ func TestQwpParseAckError(t *testing.T) {
 	t.Run("AllStatusCodes", func(t *testing.T) {
 		codes := []qwpStatusCode{
 			qwpStatusPartial,
-			qwpStatusSchemaRequired,
 			qwpStatusSchemaMismatch,
 			qwpStatusTableNotFound,
 			qwpStatusParseError,
 			qwpStatusInternalError,
 			qwpStatusOverloaded,
+			qwpStatusSecurityError,
+			qwpStatusWriteError,
 		}
 		for _, code := range codes {
 			errMsg := "error for status"
@@ -351,28 +352,10 @@ func TestQwpIntegrationConnect(t *testing.T) {
 
 // --- Retry logic tests ---
 
-// buildWireAckOK builds an OK ACK using the actual wire status code.
-func buildWireAckOK(seq int64) []byte {
-	data := make([]byte, 9)
-	data[0] = qwpWireStatusOK
-	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
-	return data
-}
-
-// buildWireAckError builds an error ACK using a wire status code.
-func buildWireAckError(status byte, seq int64, errMsg string) []byte {
-	data := make([]byte, 11+len(errMsg))
-	data[0] = status
-	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
-	binary.LittleEndian.PutUint16(data[9:11], uint16(len(errMsg)))
-	copy(data[11:], errMsg)
-	return data
-}
-
 func TestQwpTransportSendWithRetrySuccess(t *testing.T) {
 	srv := newTestWSServer(t, func(conn *websocket.Conn) {
 		conn.Read(context.Background())
-		conn.Write(context.Background(), websocket.MessageBinary, buildWireAckOK(0))
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
 	})
 	defer srv.Close()
 
@@ -385,7 +368,7 @@ func TestQwpTransportSendWithRetrySuccess(t *testing.T) {
 
 	msg := []byte{0x51, 0x57, 0x50, 0x31} // dummy
 	err := tr.sendWithRetry(context.Background(), time.Second,
-		func() []byte { return msg }, nil)
+		func() []byte { return msg })
 	if err != nil {
 		t.Fatalf("sendWithRetry: %v", err)
 	}
@@ -394,7 +377,7 @@ func TestQwpTransportSendWithRetrySuccess(t *testing.T) {
 func TestQwpTransportSendWithRetryNonRetriable(t *testing.T) {
 	srv := newTestWSServer(t, func(conn *websocket.Conn) {
 		conn.Read(context.Background())
-		ack := buildWireAckError(qwpWireStatusParseError, 0, "bad message")
+		ack := buildAckError(qwpStatusParseError, 0, "bad message")
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
 	})
 	defer srv.Close()
@@ -407,7 +390,7 @@ func TestQwpTransportSendWithRetryNonRetriable(t *testing.T) {
 	defer tr.close(context.Background())
 
 	err := tr.sendWithRetry(context.Background(), time.Second,
-		func() []byte { return []byte{0x00} }, nil)
+		func() []byte { return []byte{0x00} })
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -415,13 +398,13 @@ func TestQwpTransportSendWithRetryNonRetriable(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *QwpError, got %T", err)
 	}
-	if qErr.Status != qwpWireStatusParseError {
-		t.Fatalf("status = %d, want %d", qErr.Status, qwpWireStatusParseError)
+	if qErr.Status != qwpStatusParseError {
+		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusParseError)
 	}
 }
 
 func TestQwpTransportSendWithRetryRecovery(t *testing.T) {
-	// Server returns INTERNAL_ERROR twice, then OK.
+	// Server returns OVERLOADED twice, then OK.
 	callCount := 0
 	srv := newTestWSServer(t, func(conn *websocket.Conn) {
 		for {
@@ -431,10 +414,10 @@ func TestQwpTransportSendWithRetryRecovery(t *testing.T) {
 			}
 			callCount++
 			if callCount <= 2 {
-				ack := buildWireAckError(qwpWireStatusInternalError, 0, "temporary")
+				ack := buildAckError(qwpStatusOverloaded, 0, "backpressure")
 				conn.Write(context.Background(), websocket.MessageBinary, ack)
 			} else {
-				conn.Write(context.Background(), websocket.MessageBinary, buildWireAckOK(0))
+				conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
 			}
 		}
 	})
@@ -448,7 +431,7 @@ func TestQwpTransportSendWithRetryRecovery(t *testing.T) {
 	defer tr.close(context.Background())
 
 	err := tr.sendWithRetry(context.Background(), 5*time.Second,
-		func() []byte { return []byte{0x00} }, nil)
+		func() []byte { return []byte{0x00} })
 	if err != nil {
 		t.Fatalf("sendWithRetry should succeed after retries: %v", err)
 	}
@@ -458,14 +441,14 @@ func TestQwpTransportSendWithRetryRecovery(t *testing.T) {
 }
 
 func TestQwpTransportSendWithRetryTimeout(t *testing.T) {
-	// Server always returns INTERNAL_ERROR.
+	// Server always returns OVERLOADED.
 	srv := newTestWSServer(t, func(conn *websocket.Conn) {
 		for {
 			_, _, err := conn.Read(context.Background())
 			if err != nil {
 				return
 			}
-			ack := buildWireAckError(qwpWireStatusInternalError, 0, "always failing")
+			ack := buildAckError(qwpStatusOverloaded, 0, "always failing")
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	})
@@ -480,7 +463,7 @@ func TestQwpTransportSendWithRetryTimeout(t *testing.T) {
 
 	// Very short timeout to trigger quickly.
 	err := tr.sendWithRetry(context.Background(), 50*time.Millisecond,
-		func() []byte { return []byte{0x00} }, nil)
+		func() []byte { return []byte{0x00} })
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -494,7 +477,7 @@ func TestQwpTransportSendWithRetryNoRetry(t *testing.T) {
 	// retryTimeout=0 means no retries even for retriable errors.
 	srv := newTestWSServer(t, func(conn *websocket.Conn) {
 		conn.Read(context.Background())
-		ack := buildWireAckError(qwpWireStatusInternalError, 0, "fail")
+		ack := buildAckError(qwpStatusOverloaded, 0, "fail")
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
 	})
 	defer srv.Close()
@@ -507,7 +490,7 @@ func TestQwpTransportSendWithRetryNoRetry(t *testing.T) {
 	defer tr.close(context.Background())
 
 	err := tr.sendWithRetry(context.Background(), 0,
-		func() []byte { return []byte{0x00} }, nil)
+		func() []byte { return []byte{0x00} })
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -515,51 +498,8 @@ func TestQwpTransportSendWithRetryNoRetry(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *QwpError, got %T", err)
 	}
-	if qErr.Status != qwpWireStatusInternalError {
-		t.Fatalf("status = %d, want %d", qErr.Status, qwpWireStatusInternalError)
-	}
-}
-
-func TestQwpTransportSendWithRetrySchemaError(t *testing.T) {
-	// Server returns SCHEMA_ERROR on first call, then OK.
-	callCount := 0
-	srv := newTestWSServer(t, func(conn *websocket.Conn) {
-		for {
-			_, _, err := conn.Read(context.Background())
-			if err != nil {
-				return
-			}
-			callCount++
-			if callCount == 1 {
-				ack := buildWireAckError(qwpWireStatusSchemaError, 0, "unknown hash")
-				conn.Write(context.Background(), websocket.MessageBinary, ack)
-			} else {
-				conn.Write(context.Background(), websocket.MessageBinary, buildWireAckOK(0))
-			}
-		}
-	})
-	defer srv.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
-		t.Fatal(err)
-	}
-	defer tr.close(context.Background())
-
-	schemaErrorCalled := false
-	err := tr.sendWithRetry(context.Background(), time.Second,
-		func() []byte { return []byte{0x00} },
-		func() { schemaErrorCalled = true },
-	)
-	if err != nil {
-		t.Fatalf("sendWithRetry: %v", err)
-	}
-	if !schemaErrorCalled {
-		t.Fatal("onSchemaError callback should have been called")
-	}
-	if callCount != 2 {
-		t.Fatalf("expected 2 calls, got %d", callCount)
+	if qErr.Status != qwpStatusOverloaded {
+		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusOverloaded)
 	}
 }
 

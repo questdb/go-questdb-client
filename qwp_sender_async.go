@@ -233,10 +233,10 @@ func (a *qwpAsyncState) ioLoop() {
 			return
 		}
 
-		if byte(status) != qwpWireStatusOK {
+		if status != qwpStatusOK {
 			qErr := newQwpErrorFromAck(ackData)
 			if qErr == nil {
-				qErr = &QwpError{Status: byte(status), Message: "unknown error"}
+				qErr = &QwpError{Status: status, Message: "unknown error"}
 			}
 			a.setError(qErr)
 			for b := range a.sendCh {

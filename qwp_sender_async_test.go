@@ -265,7 +265,7 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 			received = append(received, data)
 			mu.Unlock()
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))
@@ -333,14 +333,14 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 				// Return error ACK.
 				errMsg := "bad batch"
 				ack := make([]byte, 3+len(errMsg))
-				ack[0] = qwpWireStatusWriteError
+				ack[0] = byte(qwpStatusWriteError)
 				ack[1] = byte(len(errMsg))
 				ack[2] = 0
 				copy(ack[3:], errMsg)
 				conn.Write(context.Background(), websocket.MessageBinary, ack)
 			} else {
 				ack := make([]byte, 9)
-				ack[0] = qwpWireStatusOK
+				ack[0] = byte(qwpStatusOK)
 				conn.Write(context.Background(), websocket.MessageBinary, ack)
 			}
 		}
@@ -379,8 +379,8 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *QwpError, got %T: %v", err, err)
 	}
-	if qErr.Status != qwpWireStatusWriteError {
-		t.Fatalf("status = %d, want %d", qErr.Status, qwpWireStatusWriteError)
+	if qErr.Status != qwpStatusWriteError {
+		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusWriteError)
 	}
 }
 
@@ -429,7 +429,7 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 				return
 			}
 			ack := make([]byte, 9)
-			ack[0] = qwpWireStatusOK
+			ack[0] = byte(qwpStatusOK)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
 		}
 	}))

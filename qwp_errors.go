@@ -26,44 +26,38 @@ package questdb
 
 import "fmt"
 
-// QWP WebSocket wire status codes. These are the values actually
-// sent by the QuestDB server in ACK responses over WebSocket,
-// which differ from the internal QWP protocol constants.
-const (
-	qwpWireStatusOK            byte = 0   // Batch accepted
-	qwpWireStatusParseError    byte = 1   // Malformed message
-	qwpWireStatusSchemaError   byte = 2   // Schema hash not recognized
-	qwpWireStatusWriteError    byte = 3   // Write failure (type mismatch, table error)
-	qwpWireStatusSecurityError byte = 4   // Authentication/authorization failure
-	qwpWireStatusInternalError byte = 255 // Server internal error
-)
-
-// qwpWireStatusName returns a human-readable name for a wire status code.
-func qwpWireStatusName(status byte) string {
+// qwpStatusName returns a human-readable name for a QWP status code.
+func qwpStatusName(status qwpStatusCode) string {
 	switch status {
-	case qwpWireStatusOK:
+	case qwpStatusOK:
 		return "OK"
-	case qwpWireStatusParseError:
+	case qwpStatusPartial:
+		return "PARTIAL"
+	case qwpStatusSchemaMismatch:
+		return "SCHEMA_MISMATCH"
+	case qwpStatusTableNotFound:
+		return "TABLE_NOT_FOUND"
+	case qwpStatusParseError:
 		return "PARSE_ERROR"
-	case qwpWireStatusSchemaError:
-		return "SCHEMA_ERROR"
-	case qwpWireStatusWriteError:
-		return "WRITE_ERROR"
-	case qwpWireStatusSecurityError:
-		return "SECURITY_ERROR"
-	case qwpWireStatusInternalError:
+	case qwpStatusInternalError:
 		return "INTERNAL_ERROR"
+	case qwpStatusOverloaded:
+		return "OVERLOADED"
+	case qwpStatusSecurityError:
+		return "SECURITY_ERROR"
+	case qwpStatusWriteError:
+		return "WRITE_ERROR"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", status)
 	}
 }
 
 // QwpError represents an error returned by the QuestDB server in
-// a QWP ACK response. It contains the wire status code, the
+// a QWP ACK response. It contains the status code, the
 // sequence number from the response, and an optional error message.
 type QwpError struct {
-	// Status is the wire status byte from the ACK response.
-	Status byte
+	// Status is the status code from the ACK response.
+	Status qwpStatusCode
 
 	// Sequence is the sequence number from the ACK, used to
 	// correlate responses with requests in async mode.
@@ -76,24 +70,18 @@ type QwpError struct {
 
 // Error implements the error interface.
 func (e *QwpError) Error() string {
-	name := qwpWireStatusName(e.Status)
+	name := qwpStatusName(e.Status)
 	if e.Message != "" {
-		return fmt.Sprintf("qwp: server error %s (0x%02X): %s", name, e.Status, e.Message)
+		return fmt.Sprintf("qwp: server error %s (0x%02X): %s", name, byte(e.Status), e.Message)
 	}
-	return fmt.Sprintf("qwp: server error %s (0x%02X)", name, e.Status)
+	return fmt.Sprintf("qwp: server error %s (0x%02X)", name, byte(e.Status))
 }
 
 // IsRetriable reports whether the error indicates a transient
-// condition that may succeed on retry. Currently only
-// INTERNAL_ERROR is retriable (the server may recover).
+// condition that may succeed on retry. Per the QWP spec, only
+// OVERLOADED is retriable.
 func (e *QwpError) IsRetriable() bool {
-	return e.Status == qwpWireStatusInternalError
-}
-
-// IsSchemaError reports whether the server rejected the schema
-// hash and wants the client to resend with full schema.
-func (e *QwpError) IsSchemaError() bool {
-	return e.Status == qwpWireStatusSchemaError
+	return e.Status == qwpStatusOverloaded
 }
 
 // newQwpErrorFromAck creates a QwpError from a raw ACK response
@@ -103,8 +91,8 @@ func newQwpErrorFromAck(data []byte) *QwpError {
 		return &QwpError{Message: "empty ACK response"}
 	}
 
-	status := data[0]
-	if status == qwpWireStatusOK {
+	status := qwpStatusCode(data[0])
+	if status == qwpStatusOK {
 		return nil
 	}
 

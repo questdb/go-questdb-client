@@ -350,25 +350,22 @@ func qwpFakeServer(conn net.Conn) {
 }
 
 // sendWithRetry sends a QWP message and reads the ACK, retrying
-// on retriable errors (INTERNAL_ERROR) with exponential backoff.
+// on retriable errors (OVERLOADED) with exponential backoff.
 // The retryTimeout is the maximum cumulative time to spend retrying;
 // 0 means no retries. Returns nil on success, or a *QwpError on
 // server rejection, or a transport error on connection failure.
 //
-// The sendFn callback generates the message bytes. It may be called
-// multiple times if the server responds with SCHEMA_ERROR, in which
-// case onSchemaError is called first to allow the caller to switch
-// from schema-reference to full-schema mode before re-encoding.
+// The sendFn callback generates the message bytes. It is called
+// once per send attempt.
 func (t *qwpTransport) sendWithRetry(
 	ctx context.Context,
 	retryTimeout time.Duration,
 	sendFn func() []byte,
-	onSchemaError func(),
 ) error {
 	const (
-		initialInterval  = 10 * time.Millisecond
-		maxInterval      = time.Second
-		maxJitterMs      = 10
+		initialInterval = 10 * time.Millisecond
+		maxInterval     = time.Second
+		maxJitterMs     = 10
 	)
 
 	msg := sendFn()
@@ -384,23 +381,6 @@ func (t *qwpTransport) sendWithRetry(
 	qErr := newQwpErrorFromAck(data)
 	if qErr == nil {
 		return nil // OK
-	}
-
-	// Handle schema error: re-encode with full schema and resend.
-	if qErr.IsSchemaError() && onSchemaError != nil {
-		onSchemaError()
-		msg = sendFn()
-		if err := t.sendMessage(ctx, msg); err != nil {
-			return err
-		}
-		_, data, err = t.readAck(ctx)
-		if err != nil {
-			return err
-		}
-		qErr = newQwpErrorFromAck(data)
-		if qErr == nil {
-			return nil
-		}
 	}
 
 	// Non-retriable error: return immediately.

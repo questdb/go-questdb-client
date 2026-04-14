@@ -765,15 +765,6 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 				s.batchMaxSymbolId,
 			)
 		},
-		func() {
-			// Schema error callback: server doesn't recognize one
-			// of the schema IDs we used in reference mode. Force
-			// every table to full mode so the server re-registers.
-			// The schema IDs themselves are reused.
-			for i := range tables {
-				tables[i].schemaMode = qwpSchemaModeFull
-			}
-		},
 	)
 
 	if err != nil {
