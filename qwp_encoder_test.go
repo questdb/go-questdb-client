@@ -76,6 +76,8 @@ func TestQwpEncoderFixedWidthGoldenBytes(t *testing.T) {
 	expected = append(expected, 0x02)
 	// SchemaMode = FULL (0x00)
 	expected = append(expected, 0x00)
+	// SchemaId = 0 (varint)
+	expected = append(expected, 0x00)
 	// Column "a": name varint(1) + 'a', type LONG (0x05)
 	expected = append(expected, 0x01, 0x61, 0x05)
 	// Column "b": name varint(1) + 'b', type DOUBLE (0x07)
@@ -155,10 +157,10 @@ func TestQwpEncoderSchemaReference(t *testing.T) {
 	col.addLong(10)
 	tb.commitRow()
 
-	schemaHash := tb.getSchemaHash()
+	const schemaId = 7
 
 	var enc qwpEncoder
-	msg := enc.encodeTable(tb, qwpSchemaModeReference, schemaHash)
+	msg := enc.encodeTable(tb, qwpSchemaModeReference, schemaId)
 
 	// Parse past header (12) + table name "t" (2) + rowCount (1) + colCount (1).
 	off := 12 + 2 + 1 + 1
@@ -169,12 +171,15 @@ func TestQwpEncoderSchemaReference(t *testing.T) {
 	}
 	off++
 
-	// Schema hash: int64 LE (8 bytes).
-	gotHash := int64(binary.LittleEndian.Uint64(msg[off : off+8]))
-	if gotHash != schemaHash {
-		t.Fatalf("schemaHash = %d, want %d", gotHash, schemaHash)
+	// Schema id: varint (single byte for small IDs).
+	gotId, n, err := qwpReadVarint(msg[off:])
+	if err != nil {
+		t.Fatalf("failed to parse schemaId varint: %v", err)
 	}
-	off += 8
+	if int(gotId) != schemaId {
+		t.Fatalf("schemaId = %d, want %d", gotId, schemaId)
+	}
+	off += n
 
 	// Column data: null bitmap flag (0x00) + 1 × int64 LE = 10.
 	if msg[off] != 0x00 {
@@ -274,6 +279,8 @@ func TestQwpEncoderAllFixedTypes(t *testing.T) {
 	if msg[off] != 0x00 {
 		t.Fatalf("schemaMode = 0x%02X, want 0x00", msg[off])
 	}
+	off++
+	// Schema id varint (0 = 1 byte).
 	off++
 
 	// Skip schema definitions (12 columns).
@@ -417,6 +424,8 @@ func TestQwpEncoderNullableColumn(t *testing.T) {
 	off += 1 + 1
 	// schemaMode=FULL
 	off++
+	// schemaId varint (0 = 1 byte)
+	off++
 	// Column "v": varint(1) + 'v' + typeCode (LONG = 0x05, no nullable flag)
 	off += 2
 	if msg[off] != 0x05 {
@@ -483,17 +492,18 @@ func TestQwpEncoderMultipleColumns(t *testing.T) {
 	// rowCount=2: 1 byte
 	// colCount=3: 1 byte
 	// schemaMode: 1 byte
+	// schemaId varint(0): 1 byte
 	// 3 columns × (varint(1) + name(1) + type(1)) = 9 bytes
 	// 3 columns × (1 flag byte + 2 rows × 4 bytes) = 3 × 9 = 27 bytes
-	// Total payload = 6 + 1 + 1 + 1 + 9 + 27 = 45
-	// Total message = 12 + 45 = 57
+	// Total payload = 6 + 1 + 1 + 1 + 1 + 9 + 27 = 46
+	// Total message = 12 + 46 = 58
 
 	payloadLen := binary.LittleEndian.Uint32(msg[8:12])
-	if payloadLen != 45 {
-		t.Fatalf("payloadLength = %d, want 45", payloadLen)
+	if payloadLen != 46 {
+		t.Fatalf("payloadLength = %d, want 46", payloadLen)
 	}
-	if len(msg) != 57 {
-		t.Fatalf("message length = %d, want 57", len(msg))
+	if len(msg) != 58 {
+		t.Fatalf("message length = %d, want 58", len(msg))
 	}
 }
 
@@ -605,6 +615,8 @@ func TestQwpEncoderDecimalSchema(t *testing.T) {
 	off += 1 + 1
 	// schemaMode=FULL
 	off++
+	// schemaId varint (0 = 1 byte)
+	off++
 
 	// Column "d": name varint(1) + 'd' = 2 bytes
 	off += 2
@@ -657,6 +669,7 @@ func TestQwpEncoderBoolGoldenBytes(t *testing.T) {
 	off += 1                // rowCount=3
 	off += 1                // colCount=1
 	off += 1                // schemaMode=FULL
+	off += 1                // schemaId varint (0 = 1 byte)
 	off += 1 + 4 + 1        // col "flag": varint(4) + "flag" + type
 
 	// Null bitmap flag (0x00) then bool data: 3 bits packed.
@@ -688,6 +701,7 @@ func TestQwpEncoderBoolNullableGoldenBytes(t *testing.T) {
 	off += 1         // rowCount=3
 	off += 1         // colCount=1
 	off += 1         // schemaMode=FULL
+	off += 1         // schemaId varint (0 = 1 byte)
 	off += 1 + 4 + 1 // col "flag": varint(4) + "flag" + wireTypeCode (0x81)
 
 	// Null bitmap flag: 0x01 (has nulls)
@@ -727,6 +741,7 @@ func TestQwpEncoderStringGoldenBytes(t *testing.T) {
 	off += 1     // rowCount=2
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
+	off += 1     // schemaId varint (0 = 1 byte)
 	off += 1 + 1 + 1 // col "s": varint(1) + "s" + type
 
 	// Null bitmap flag (0x00)
@@ -770,6 +785,7 @@ func TestQwpEncoderSymbolGoldenBytes(t *testing.T) {
 	off += 1     // rowCount=3
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
+	off += 1     // schemaId varint (0 = 1 byte)
 	off += 1 + 3 + 1 // col "sym": varint(3) + "sym" + type
 
 	// Null bitmap flag (0x00)
@@ -809,6 +825,7 @@ func TestQwpEncoderArrayGoldenBytes(t *testing.T) {
 	off += 1     // rowCount=1
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
+	off += 1     // schemaId varint (0 = 1 byte)
 	off += 1 + 3 + 1 // col "arr": varint(3) + "arr" + type
 
 	// Null bitmap flag (0x00)
@@ -857,6 +874,7 @@ func TestQwpEncoderVarcharGoldenBytes(t *testing.T) {
 	off += 1     // rowCount=1
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
+	off += 1     // schemaId varint (0 = 1 byte)
 	off += 1 + 1 + 1 // col "v": varint(1) + "v" + type (0x0F)
 
 	// Null bitmap flag (0x00)
@@ -983,6 +1001,8 @@ func TestQwpEncoderDeltaDictGoldenBytes(t *testing.T) {
 	if msg[off] != 0x00 {
 		t.Fatalf("schemaMode = 0x%02X, want 0x00", msg[off])
 	}
+	off++
+	// schemaId varint (0 = 1 byte)
 	off++
 
 	// Column "sym": name + type (SYMBOL = 0x09)
@@ -1116,10 +1136,10 @@ func TestQwpEncoderDeltaDictWithSchemaRef(t *testing.T) {
 	col.addSymbolID(0)
 	tb.commitRow()
 
-	schemaHash := tb.getSchemaHash()
+	const schemaId = 11
 
 	var enc qwpEncoder
-	msg := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 0, qwpSchemaModeReference, schemaHash)
+	msg := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 0, qwpSchemaModeReference, schemaId)
 
 	off := qwpHeaderSize
 
@@ -1136,10 +1156,13 @@ func TestQwpEncoderDeltaDictWithSchemaRef(t *testing.T) {
 	}
 	off++
 
-	// Schema hash: int64 LE
-	gotHash := int64(binary.LittleEndian.Uint64(msg[off : off+8]))
-	if gotHash != schemaHash {
-		t.Fatalf("schemaHash = %d, want %d", gotHash, schemaHash)
+	// Schema id: varint.
+	gotId, _, err := qwpReadVarint(msg[off:])
+	if err != nil {
+		t.Fatalf("parse schemaId: %v", err)
+	}
+	if int(gotId) != schemaId {
+		t.Fatalf("schemaId = %d, want %d", gotId, schemaId)
 	}
 }
 
@@ -1174,6 +1197,7 @@ func TestQwpEncoderGeohashGoldenBytes(t *testing.T) {
 	off += 1     // rowCount=3
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
+	off += 1     // schemaId varint (0 = 1 byte)
 	off += 1 + 3 + 1 // col "geo": varint(3) + "geo" + type (0x0E)
 
 	// Null bitmap flag (0x00)
@@ -1238,6 +1262,7 @@ func TestQwpEncoderGeohashNullable(t *testing.T) {
 	off += 1     // rowCount=3
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
+	off += 1     // schemaId varint (0 = 1 byte)
 	off += 1 + 3 + 1 // col "geo": varint(3) + "geo" + type (0x0E, no nullable flag)
 
 	// Null bitmap flag: 0x01 (has nulls)
@@ -1296,6 +1321,7 @@ func TestQwpEncoderGeohashPrecision8(t *testing.T) {
 	off += 1     // rowCount=1
 	off += 1     // colCount=1
 	off += 1     // schemaMode=FULL
+	off += 1     // schemaId varint (0 = 1 byte)
 	off += 1 + 1 + 1 // col "g": varint(1) + "g" + type
 
 	// Null bitmap flag (0x00)
@@ -1336,6 +1362,7 @@ func TestQwpEncoderGeohashPrecision60(t *testing.T) {
 	off += 1     // rowCount=1
 	off += 1     // colCount=1
 	off += 1     // schemaMode
+	off += 1     // schemaId varint (0 = 1 byte)
 	off += 1 + 1 + 1 // col "g"
 
 	// Null bitmap flag (0x00)
@@ -1419,6 +1446,8 @@ func TestQwpEncoderTimestampNoEncodingPrefix(t *testing.T) {
 	off++
 	// schemaMode=FULL
 	off++
+	// schemaId varint (0 = 1 byte)
+	off++
 	// Column "ts": varint(1) + 't' + 's' + typeCode TIMESTAMP (0x0A)
 	off += 4
 
@@ -1461,9 +1490,9 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 	tb3.commitRow()
 
 	tables := []qwpTableEncodeInfo{
-		{tb: tb1, schemaMode: qwpSchemaModeFull, schemaHash: 0},
-		{tb: tb2, schemaMode: qwpSchemaModeFull, schemaHash: 0},
-		{tb: tb3, schemaMode: qwpSchemaModeReference, schemaHash: 0x1234},
+		{tb: tb1, schemaMode: qwpSchemaModeFull, schemaId: 0},
+		{tb: tb2, schemaMode: qwpSchemaModeFull, schemaId: 1},
+		{tb: tb3, schemaMode: qwpSchemaModeReference, schemaId: 2},
 	}
 
 	globalDict := []string{"sym0"}
@@ -1530,6 +1559,7 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 		t.Fatalf("table 1 schemaMode = 0x%02X, want FULL", msg[off])
 	}
 	off++
+	off++ // schemaId varint (0 = 1 byte)
 	// Skip full schema: col "x" (varint(1) + 'x' + 0x05)
 	slen, n, _ := qwpReadVarint(msg[off:])
 	off += n + int(slen) + 1
@@ -1549,6 +1579,7 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 		t.Fatalf("table 2 schemaMode = 0x%02X, want FULL", msg[off])
 	}
 	off++
+	off++ // schemaId varint (1 = 1 byte)
 	slen, n, _ = qwpReadVarint(msg[off:])
 	off += n + int(slen) + 1 // col "y" + type
 	off += 1 + 8             // null flag + double
@@ -1566,7 +1597,7 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 		t.Fatalf("table 3 schemaMode = 0x%02X, want REFERENCE", msg[off])
 	}
 	off++
-	off += 8 // schema hash (int64)
+	off++    // schemaId varint (2 = 1 byte)
 	off++    // null flag
 	// String column: (rowCount+1) uint32 offsets + data
 	// 2 offsets = 8 bytes + "hello" = 5 bytes
@@ -1603,6 +1634,8 @@ func extractColumnData(tb *qwpTableBuffer) []byte {
 	_, n, _ = qwpReadVarint(msg[off:])
 	off += n
 	// Skip schemaMode (1 byte = FULL).
+	off++
+	// Skip schemaId varint (0 = 1 byte).
 	off++
 	// Skip schema: for each column, varint string + 1 byte type code.
 	for i := 0; i < len(tb.columns); i++ {

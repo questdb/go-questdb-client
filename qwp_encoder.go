@@ -42,13 +42,17 @@ type qwpEncoder struct {
 // references the encoder's internal buffer and is valid until the
 // next encode call.
 //
+// schemaId is the connection-scoped schema identifier the server
+// uses to register (full mode) or look up (reference mode) this
+// table's column set.
+//
 // The message layout is:
 //
 //	Header (12 bytes) → TableBlock → patched PayloadLength.
-func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaHash int64) []byte {
+func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaId int) []byte {
 	e.wb.reset()
 	e.writeHeader(0, 1)
-	e.writeTableBlock(tb, schemaMode, schemaHash)
+	e.writeTableBlock(tb, schemaMode, schemaId)
 	e.patchPayloadLength()
 	return e.wb.bytes()
 }
@@ -72,12 +76,12 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 	maxSentId int,
 	batchMaxId int,
 	schemaMode qwpSchemaMode,
-	schemaHash int64,
+	schemaId int,
 ) []byte {
 	e.wb.reset()
 	e.writeHeader(qwpFlagDeltaSymbolDict, 1)
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
-	e.writeTableBlock(tb, schemaMode, schemaHash)
+	e.writeTableBlock(tb, schemaMode, schemaId)
 	e.patchPayloadLength()
 	return e.wb.bytes()
 }
@@ -87,7 +91,7 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 type qwpTableEncodeInfo struct {
 	tb         *qwpTableBuffer
 	schemaMode qwpSchemaMode
-	schemaHash int64
+	schemaId   int
 }
 
 // encodeMultiTableWithDeltaDict encodes multiple table buffers into
@@ -111,7 +115,7 @@ func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
 	e.writeHeader(qwpFlagDeltaSymbolDict, uint16(len(tables)))
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
 	for i := range tables {
-		e.writeTableBlock(tables[i].tb, tables[i].schemaMode, tables[i].schemaHash)
+		e.writeTableBlock(tables[i].tb, tables[i].schemaMode, tables[i].schemaId)
 	}
 	e.patchPayloadLength()
 	return e.wb.bytes()
@@ -163,16 +167,21 @@ func (e *qwpEncoder) writeDeltaDict(globalDict []string, maxSentId, batchMaxId i
 
 // writeTableBlock writes a single table block: table name, row/col
 // counts, schema, and column data.
-func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaHash int64) {
+//
+// Per QWP spec §9, the schema section starts with a mode byte
+// (0x00 = full, 0x01 = reference) followed by a varint schema_id
+// in both modes. In full mode the column definitions follow; in
+// reference mode the server looks up the schema by ID in its
+// per-connection registry.
+func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaId int) {
 	e.wb.putString(tb.tableName)
 	e.wb.putVarint(uint64(tb.rowCount))
 	e.wb.putVarint(uint64(len(tb.columns)))
 
 	e.wb.putByte(byte(schemaMode))
+	e.wb.putVarint(uint64(schemaId))
 	if schemaMode == qwpSchemaModeFull {
 		e.encodeSchemaFull(tb)
-	} else {
-		e.wb.putInt64LE(schemaHash)
 	}
 
 	for _, col := range tb.columns {

@@ -108,10 +108,6 @@ type qwpLineSender struct {
 	// avoiding allocation on every flush.
 	encodeInfoBuf []qwpTableEncodeInfo
 
-	// pendingSchemaKeysBuf is a reusable scratch slice for flushAsync,
-	// avoiding allocation on every explicit Flush() in async mode.
-	pendingSchemaKeysBuf []int64
-
 	// globalSymbols maps symbol strings to global IDs.
 	globalSymbols map[string]int32
 	// globalSymbolList maps IDs to symbol strings (for delta dict).
@@ -122,9 +118,20 @@ type qwpLineSender struct {
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
 
-	// sentSchemaHashes tracks which (table, schema) pairs have been
-	// successfully sent to the server.
-	sentSchemaHashes map[int64]struct{}
+	// Schema registry (per QWP spec §16).
+	// Schema IDs are small integers assigned sequentially by the
+	// client and scoped to the connection lifetime. They are global
+	// across all tables; the server indexes its registry by ID.
+	// nextSchemaId is the next unassigned ID.
+	// maxSentSchemaId is the highest ID ACKed by the server; a table
+	// whose schemaId <= maxSentSchemaId is safe to encode in
+	// reference mode.
+	// batchMaxSchemaId is the highest schemaId used in the pending
+	// batch — set by buildTableEncodeInfo, promoted to
+	// maxSentSchemaId on ACK.
+	nextSchemaId     int
+	maxSentSchemaId  int
+	batchMaxSchemaId int
 
 	// Row state.
 	hasTable bool
@@ -170,9 +177,11 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 	s := &qwpLineSender{
 		tableBuffers:      make(map[string]*qwpTableBuffer),
 		globalSymbols:     make(map[string]int32),
-		sentSchemaHashes:  make(map[int64]struct{}),
 		maxSentSymbolId:   -1,
 		batchMaxSymbolId:  -1,
+		nextSchemaId:      0,
+		maxSentSchemaId:   -1,
+		batchMaxSchemaId:  -1,
 		retryTimeout:      retryTimeout,
 		autoFlushRows:     autoFlushRows,
 		autoFlushInterval: autoFlushInterval,
@@ -757,10 +766,11 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 			)
 		},
 		func() {
-			// Schema error callback: force full schema for all tables.
+			// Schema error callback: server doesn't recognize one
+			// of the schema IDs we used in reference mode. Force
+			// every table to full mode so the server re-registers.
+			// The schema IDs themselves are reused.
 			for i := range tables {
-				delete(s.sentSchemaHashes, qwpSchemaKey(
-					tables[i].tb.tableNameHash, tables[i].schemaHash))
 				tables[i].schemaMode = qwpSchemaModeFull
 			}
 		},
@@ -770,10 +780,10 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 		return err
 	}
 
-	// Mark all schemas and symbols as sent on success.
-	for _, t := range tables {
-		skey := qwpSchemaKey(t.tb.tableNameHash, t.schemaHash)
-		s.sentSchemaHashes[skey] = struct{}{}
+	// Advance ACKed state: all schema IDs in this batch are now
+	// known to the server; bump the highest-ACKed symbol ID too.
+	if s.batchMaxSchemaId > s.maxSentSchemaId {
+		s.maxSentSchemaId = s.batchMaxSchemaId
 	}
 	if s.batchMaxSymbolId > s.maxSentSymbolId {
 		s.maxSentSymbolId = s.batchMaxSymbolId
@@ -782,32 +792,51 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 	return nil
 }
 
-// buildTableEncodeInfo collects non-empty tables with their schema
-// mode and hash for encoding. Reuses s.encodeInfoBuf to avoid
-// allocating a new slice on every flush.
+// buildTableEncodeInfo collects non-empty tables, assigning fresh
+// schema IDs to any that lack one and selecting full or reference
+// mode based on whether the ID has already been ACKed by the
+// server. Reuses s.encodeInfoBuf to avoid allocating per flush.
+// Also sets s.batchMaxSchemaId to the highest schema ID in the batch.
 func (s *qwpLineSender) buildTableEncodeInfo() []qwpTableEncodeInfo {
 	s.encodeInfoBuf = s.encodeInfoBuf[:0]
+	batchMax := s.maxSentSchemaId
 	for _, tb := range s.tableBuffers {
 		if tb.rowCount == 0 {
 			continue
 		}
-		schemaHash := tb.getSchemaHash()
-		skey := qwpSchemaKey(tb.tableNameHash, schemaHash)
+		if tb.schemaId < 0 {
+			tb.schemaId = s.nextSchemaId
+			s.nextSchemaId++
+		}
 		mode := qwpSchemaModeFull
-		if _, ok := s.sentSchemaHashes[skey]; ok {
+		if tb.schemaId <= s.maxSentSchemaId {
 			mode = qwpSchemaModeReference
+		}
+		if tb.schemaId > batchMax {
+			batchMax = tb.schemaId
 		}
 		s.encodeInfoBuf = append(s.encodeInfoBuf, qwpTableEncodeInfo{
 			tb:         tb,
 			schemaMode: mode,
-			schemaHash: schemaHash,
+			schemaId:   tb.schemaId,
 		})
 	}
+	s.batchMaxSchemaId = batchMax
 	return s.encodeInfoBuf
 }
 
 // flushAsync encodes all tables into a single multi-table message,
-// acquires a slot, enqueues the batch, and waits for the ACK.
+// acquires a slot, enqueues the batch, and waits for all in-flight
+// batches to drain before returning. Used by the public Flush() in
+// async mode.
+//
+// Matches the Java client's flushPendingRows() + awaitPendingAcks():
+// schema and symbol IDs are advanced immediately after a successful
+// enqueue, not after the ACK. If a later batch fails, the I/O
+// goroutine stores the error into asyncState.ioErr; every subsequent
+// user-facing call hits checkError() at the top of the flush path
+// and returns the error. Stale cache state can therefore never
+// reach the wire on a live connection.
 func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	// Check for I/O errors before encoding.
 	if err := s.asyncState.checkError(); err != nil {
@@ -856,41 +885,28 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	// Swap to the other encoder for the next flush.
 	s.currentEncoderIdx = 1 - s.currentEncoderIdx
 
-	// Capture pending state before waiting.
-	pendingMaxSymbolId := s.batchMaxSymbolId
-	s.pendingSchemaKeysBuf = s.pendingSchemaKeysBuf[:0]
-	for _, t := range tables {
-		skey := qwpSchemaKey(t.tb.tableNameHash, t.schemaHash)
-		if _, ok := s.sentSchemaHashes[skey]; !ok {
-			s.pendingSchemaKeysBuf = append(s.pendingSchemaKeysBuf, skey)
-		}
+	// Advance highest-sent schema and symbol IDs immediately after
+	// enqueue — same semantics as Java's flushPendingRows. If a
+	// subsequent ACK fails, asyncState.ioErr poisons the sender.
+	if s.batchMaxSchemaId > s.maxSentSchemaId {
+		s.maxSentSchemaId = s.batchMaxSchemaId
+	}
+	if s.batchMaxSymbolId > s.maxSentSymbolId {
+		s.maxSentSymbolId = s.batchMaxSymbolId
 	}
 
-	// Wait for the batch to be ACKed before returning.
-	if err := s.asyncState.waitEmpty(); err != nil {
-		return err
-	}
-
-	// ACK received — commit schema and symbol caches.
-	for _, skey := range s.pendingSchemaKeysBuf {
-		s.sentSchemaHashes[skey] = struct{}{}
-	}
-	if pendingMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = pendingMaxSymbolId
-	}
-
-	return nil
+	// Drain all in-flight batches before returning (Flush semantics).
+	return s.asyncState.waitEmpty()
 }
 
 // enqueueFlush encodes all pending table buffers and enqueues them
 // for the I/O goroutine without waiting for ACKs. This is the
 // auto-flush path for async mode — At() returns promptly instead of
-// blocking on a full round-trip. Schema and symbol caches are updated
-// optimistically; if the I/O goroutine later fails, ioErr is set and
-// all subsequent operations return that error (the sender is terminal).
-//
-// This mirrors the Java client's flushPendingRows(), which enqueues
-// and updates sentSchemaHashes immediately without awaiting ACKs.
+// blocking on a full round-trip. Schema and symbol caches are
+// updated optimistically; if the I/O goroutine later fails, ioErr
+// is set and all subsequent operations return that error (the
+// sender is terminal, so stale cache entries can never reach the
+// wire). Mirrors the Java client's flushPendingRows().
 func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 	if s.pendingRowCount == 0 {
 		return nil
@@ -941,13 +957,11 @@ func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 	// Swap to the other encoder for the next flush.
 	s.currentEncoderIdx = 1 - s.currentEncoderIdx
 
-	// Optimistic cache: if the batch fails, ioErr prevents
-	// further operations so stale cache entries are harmless.
-	for _, t := range tables {
-		skey := qwpSchemaKey(t.tb.tableNameHash, t.schemaHash)
-		s.sentSchemaHashes[skey] = struct{}{}
+	// Optimistic cache: if the batch fails, ioErr prevents further
+	// operations so stale cache entries are harmless.
+	if s.batchMaxSchemaId > s.maxSentSchemaId {
+		s.maxSentSchemaId = s.batchMaxSchemaId
 	}
-
 	if s.batchMaxSymbolId > s.maxSentSymbolId {
 		s.maxSentSymbolId = s.batchMaxSymbolId
 	}

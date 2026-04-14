@@ -748,32 +748,27 @@ type qwpTableBuffer struct {
 	// removed on cancelRow().
 	committedColumnCount int
 
-	// Schema hash caching. The hash is lazily computed on first
-	// call to getSchemaHash() and invalidated when columns change.
-	schemaHash      int64
-	schemaHashValid bool
+	// schemaId is the per-connection schema identifier for this
+	// table's current column set. -1 means unassigned — the sender
+	// allocates a fresh ID from its nextSchemaId counter on the next
+	// flush and sends the schema in full mode. Reset to -1 whenever
+	// the column set changes so a new ID is allocated and the server
+	// re-registers the schema.
+	schemaId int
 
 	// dataSize is a running counter of approximate data bytes stored
 	// across all columns. Incremented by column addX methods via
 	// trackDataGrowth. Reset to 0 in reset(), recomputed from scratch
 	// in cancelRow(). Makes approxDataSize() O(1).
 	dataSize int
-
-	// hashBuf is a reusable scratch buffer for schema hash computation,
-	// avoiding allocation on every getSchemaHash() call after reset().
-	hashBuf []byte
-
-	// tableNameHash caches the XXHash64 of the table name for use in
-	// qwpSchemaKey, avoiding a string→[]byte conversion per flush.
-	tableNameHash uint64
 }
 
 // newQwpTableBuffer creates a table buffer for the given table name.
 func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 	return &qwpTableBuffer{
-		tableName:     tableName,
-		columnIndex:   make(map[string]int),
-		tableNameHash: xxhash64([]byte(tableName), 0),
+		tableName:   tableName,
+		columnIndex: make(map[string]int),
+		schemaId:    -1,
 	}
 }
 
@@ -823,7 +818,7 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 
 	tb.columnIndex[name] = len(tb.columns)
 	tb.columns = append(tb.columns, col)
-	tb.schemaHashValid = false
+	tb.schemaId = -1
 	return col, nil
 }
 
@@ -850,7 +845,7 @@ func (tb *qwpTableBuffer) getOrCreateDesignatedTimestamp(typeCode qwpTypeCode) (
 
 	tb.columnIndex[dtName] = len(tb.columns)
 	tb.columns = append(tb.columns, col)
-	tb.schemaHashValid = false
+	tb.schemaId = -1
 	return col, nil
 }
 
@@ -876,7 +871,7 @@ func (tb *qwpTableBuffer) cancelRow() {
 			delete(tb.columnIndex, tb.columns[i].name)
 		}
 		tb.columns = tb.columns[:tb.committedColumnCount]
-		tb.schemaHashValid = false
+		tb.schemaId = -1
 	}
 
 	// Truncate any columns that were set during this row.
@@ -892,13 +887,14 @@ func (tb *qwpTableBuffer) cancelRow() {
 }
 
 // reset clears all row data and columns, retaining the table name.
+// Preserves schemaId: between flushes the column set is unchanged,
+// so the server's registry entry is still valid.
 func (tb *qwpTableBuffer) reset() {
 	for _, col := range tb.columns {
 		col.reset()
 	}
 	tb.rowCount = 0
 	tb.committedColumnCount = 0
-	tb.schemaHashValid = false
 
 	// Reset data size, then re-account for initial offset entries
 	// that column reset() preserves (strOffsets[:1], arrayOffsets[:1]).
@@ -934,19 +930,3 @@ func (tb *qwpTableBuffer) recomputeDataSize() {
 	tb.dataSize = size
 }
 
-// getSchemaHash returns a hash over the column definitions (names
-// and wire type codes). The hash is lazily computed and cached until
-// the column set changes.
-func (tb *qwpTableBuffer) getSchemaHash() int64 {
-	if !tb.schemaHashValid {
-		// Reuse hashBuf to avoid allocation.
-		tb.hashBuf = tb.hashBuf[:0]
-		for _, col := range tb.columns {
-			tb.hashBuf = append(tb.hashBuf, col.name...)
-			tb.hashBuf = append(tb.hashBuf, col.wireTypeCode())
-		}
-		tb.schemaHash = int64(xxhash64(tb.hashBuf, 0))
-		tb.schemaHashValid = true
-	}
-	return tb.schemaHash
-}

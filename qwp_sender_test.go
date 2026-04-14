@@ -1048,9 +1048,9 @@ func TestQwpSenderIntegration(t *testing.T) {
 		t.Fatalf("Flush (row 2): %v", err)
 	}
 
-	// Verify schema was cached.
-	if len(s.sentSchemaHashes) == 0 {
-		t.Fatal("sentSchemaHashes should not be empty after flush")
+	// Verify schema was registered (schema ID advanced past -1).
+	if s.maxSentSchemaId < 0 {
+		t.Fatal("maxSentSchemaId should have advanced after flush")
 	}
 
 	t.Log("QWP sender integration test passed")
@@ -1058,27 +1058,38 @@ func TestQwpSenderIntegration(t *testing.T) {
 
 // --- Validation tests ---
 
-func TestQwpSenderSchemaHashCaching(t *testing.T) {
+func TestQwpSenderSchemaIdCaching(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
 	s := newQwpSenderForTest(t, srv.URL)
 	defer s.Close(context.Background())
 
-	// First flush: full schema.
+	// First flush: full schema; the table should be assigned
+	// schemaId 0 and it should be promoted to maxSentSchemaId.
 	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
 	s.Flush(context.Background())
 
-	if len(s.sentSchemaHashes) != 1 {
-		t.Fatalf("sentSchemaHashes count = %d, want 1", len(s.sentSchemaHashes))
+	tb := s.tableBuffers["t"]
+	if tb == nil || tb.schemaId != 0 {
+		t.Fatalf("first flush: table schemaId = %v, want 0", tb)
+	}
+	if s.maxSentSchemaId != 0 {
+		t.Fatalf("first flush: maxSentSchemaId = %d, want 0", s.maxSentSchemaId)
+	}
+	if s.nextSchemaId != 1 {
+		t.Fatalf("first flush: nextSchemaId = %d, want 1", s.nextSchemaId)
 	}
 
-	// Second flush: should use cached schema.
+	// Second flush: same column set, should reuse schemaId and not
+	// allocate a new one.
 	s.Table("t").Int64Column("x", 2).AtNow(context.Background())
 	s.Flush(context.Background())
 
-	// Hash count should still be 1 (same schema).
-	if len(s.sentSchemaHashes) != 1 {
-		t.Fatalf("sentSchemaHashes count = %d, want 1", len(s.sentSchemaHashes))
+	if tb.schemaId != 0 {
+		t.Fatalf("second flush: schemaId = %d, want 0 (same column set)", tb.schemaId)
+	}
+	if s.nextSchemaId != 1 {
+		t.Fatalf("second flush: nextSchemaId = %d, want 1 (no new ID allocated)", s.nextSchemaId)
 	}
 }
 
@@ -1368,30 +1379,7 @@ func TestQwpSenderAsyncCloseAutoFlush(t *testing.T) {
 	}
 }
 
-func TestQwpSchemaKeyDistinguishesTables(t *testing.T) {
-	// Two tables with identical column definitions must get different
-	// schema cache keys. Without table-name-aware keying, the second
-	// table would incorrectly reuse the first table's cached schema
-	// and the server would reject it.
-
-	// Unit test for qwpSchemaKey: same schema hash, different tables.
-	schemaHash := int64(0x1234567890ABCDEF)
-	hashA := xxhash64([]byte("tableA"), 0)
-	hashB := xxhash64([]byte("tableB"), 0)
-	keyA := qwpSchemaKey(hashA, schemaHash)
-	keyB := qwpSchemaKey(hashB, schemaHash)
-	if keyA == keyB {
-		t.Fatalf("schema keys should differ for different table names, both = %d", keyA)
-	}
-
-	// Same table + same schema hash must produce the same key.
-	keyA2 := qwpSchemaKey(hashA, schemaHash)
-	if keyA != keyA2 {
-		t.Fatalf("same table+schema should produce same key: %d != %d", keyA, keyA2)
-	}
-}
-
-func TestQwpSenderSchemaKeyPerTable(t *testing.T) {
+func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 	// Verify that two tables with identical columns both get full
 	// schema mode on first flush (not schema reference mode).
 	var messages [][]byte
@@ -1445,9 +1433,17 @@ func TestQwpSenderSchemaKeyPerTable(t *testing.T) {
 		}
 	}
 
-	// After first flush, both keys should be cached.
-	if len(s.sentSchemaHashes) != 2 {
-		t.Fatalf("sentSchemaHashes = %d, want 2", len(s.sentSchemaHashes))
+	// After first flush, both tables should have distinct schema IDs
+	// and maxSentSchemaId should have advanced to cover both.
+	if s.tableBuffers["alpha"].schemaId == s.tableBuffers["beta"].schemaId {
+		t.Fatalf("tables must have distinct schema IDs, both = %d",
+			s.tableBuffers["alpha"].schemaId)
+	}
+	if s.maxSentSchemaId != 1 {
+		t.Fatalf("maxSentSchemaId = %d, want 1", s.maxSentSchemaId)
+	}
+	if s.nextSchemaId != 2 {
+		t.Fatalf("nextSchemaId = %d, want 2", s.nextSchemaId)
 	}
 
 	// Second flush of both tables should now use schema reference.
@@ -1572,6 +1568,9 @@ func extractAllSchemaModes(t *testing.T, msg []byte) []byte {
 		schemaMode := msg[off]
 		modes = append(modes, schemaMode)
 		off++
+		// Schema ID varint (both modes per QWP spec §9).
+		_, n, _ = qwpReadVarint(msg[off:])
+		off += n
 
 		if schemaMode == byte(qwpSchemaModeFull) {
 			// Skip full schema: colCount × (name string + type byte)
@@ -1579,9 +1578,6 @@ func extractAllSchemaModes(t *testing.T, msg []byte) []byte {
 				slen, n, _ := qwpReadVarint(msg[off:])
 				off += n + int(slen) + 1 // name + type byte
 			}
-		} else {
-			// Schema reference: 8-byte hash.
-			off += 8
 		}
 
 		// Skip column data. For simplicity, we consume the rest
@@ -1604,12 +1600,14 @@ func extractAllSchemaModes(t *testing.T, msg []byte) []byte {
 	return modes
 }
 
-func TestQwpAsyncNoCacheOnFlushFailure(t *testing.T) {
-	// Verify that when flushAsync fails, schema hashes and symbol IDs
-	// are NOT cached. Previously, flushAsync updated caches optimistically
-	// before ACK, meaning a failed batch would leave stale cache entries
-	// that cause subsequent flushes to use schema reference mode for
-	// schemas the server never received.
+func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
+	// In async mode the sender matches the Java client's
+	// flushPendingRows() semantics: schema and symbol IDs are
+	// advanced immediately after enqueue, not after ACK. If a batch
+	// later fails, the sender is poisoned via asyncState.ioErr and
+	// every subsequent user-facing call returns that error — so
+	// stale cache state can never reach the wire on a live
+	// connection. This test pins that invariant.
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -1638,25 +1636,21 @@ func TestQwpAsyncNoCacheOnFlushFailure(t *testing.T) {
 	}
 	defer s.Close(context.Background())
 
-	// Insert a row with a symbol (to test both schema and symbol caching).
+	// Insert a row with a symbol (to exercise both schema and symbol paths).
 	s.Table("t").Symbol("sym", "AAPL").Int64Column("x", 1).AtNow(context.Background())
 
-	// Flush should fail because the server returns WRITE_ERROR.
+	// Flush returns the WRITE_ERROR from the server.
 	flushErr := s.Flush(context.Background())
 	if flushErr == nil {
 		t.Fatal("expected flush error, got nil")
 	}
 
-	// Schema hashes must NOT be cached after a failed flush.
-	if len(s.sentSchemaHashes) != 0 {
-		t.Fatalf("sentSchemaHashes should be empty after failed flush, got %d entries",
-			len(s.sentSchemaHashes))
-	}
-
-	// Symbol ID must NOT be advanced after a failed flush.
-	if s.maxSentSymbolId != -1 {
-		t.Fatalf("maxSentSymbolId should be -1 after failed flush, got %d",
-			s.maxSentSymbolId)
+	// After the failure, the sender must be terminal: the next
+	// flush must return the stored I/O error rather than try to
+	// reuse the (now stale) schema/symbol state.
+	s.Table("t").Int64Column("x", 2).AtNow(context.Background())
+	if err := s.Flush(context.Background()); err == nil {
+		t.Fatal("expected sender to be terminal after failure, got nil from second Flush")
 	}
 }
 

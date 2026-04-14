@@ -1179,77 +1179,42 @@ func TestQwpTableBufferReset(t *testing.T) {
 	}
 }
 
-func TestQwpTableBufferSchemaHash(t *testing.T) {
-	t.Run("Deterministic", func(t *testing.T) {
+func TestQwpTableBufferSchemaId(t *testing.T) {
+	t.Run("UnassignedByDefault", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
-
-		col, _ := tb.getOrCreateColumn("price", qwpTypeDouble, false)
-		col.addDouble(1.5)
-		tb.commitRow()
-
-		h1 := tb.getSchemaHash()
-		h2 := tb.getSchemaHash()
-		if h1 != h2 {
-			t.Fatalf("schema hash not deterministic: %d vs %d", h1, h2)
+		if tb.schemaId != -1 {
+			t.Fatalf("new table schemaId = %d, want -1", tb.schemaId)
 		}
 	})
 
-	t.Run("ChangeOnNewColumn", func(t *testing.T) {
+	t.Run("InvalidatedOnNewColumn", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
-
 		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
 		col.addLong(1)
 		tb.commitRow()
-		h1 := tb.getSchemaHash()
 
-		colB, _ := tb.getOrCreateColumn("b", qwpTypeDouble, false)
-		colB.addDouble(2.0)
-		col, _ = tb.getOrCreateColumn("a", qwpTypeLong, false)
-		col.addLong(2)
-		tb.commitRow()
-		h2 := tb.getSchemaHash()
+		// Sender would have assigned an ID at this point.
+		tb.schemaId = 7
 
-		if h1 == h2 {
-			t.Fatal("schema hash should change when a new column is added")
+		if _, err := tb.getOrCreateColumn("b", qwpTypeDouble, false); err != nil {
+			t.Fatal(err)
+		}
+		if tb.schemaId != -1 {
+			t.Fatalf("schemaId = %d after column add, want -1", tb.schemaId)
 		}
 	})
 
-	t.Run("NullableAffectsHash", func(t *testing.T) {
-		tb1 := newQwpTableBuffer("t")
-		col, _ := tb1.getOrCreateColumn("x", qwpTypeLong, false)
-		col.addLong(1)
-		tb1.commitRow()
-
-		tb2 := newQwpTableBuffer("t")
-		col, _ = tb2.getOrCreateColumn("x", qwpTypeLong, true)
-		col.addLong(1)
-		tb2.commitRow()
-
-		if tb1.getSchemaHash() == tb2.getSchemaHash() {
-			t.Fatal("nullable flag should affect schema hash")
-		}
-	})
-
-	t.Run("XXHash64EmptyInput", func(t *testing.T) {
-		// Verify xxhash64 matches canonical test vector.
-		h := xxhash64([]byte{}, 0)
-		if h != 0xEF46DB3751D8E999 {
-			t.Fatalf("xxhash64(empty, 0) = %016X, want EF46DB3751D8E999", h)
-		}
-	})
-
-	t.Run("KnownValue", func(t *testing.T) {
-		// Schema: col "ts" (TIMESTAMP, non-nullable)
-		// Input bytes: "ts" + 0x0A = [0x74, 0x73, 0x0A]
+	t.Run("PreservedAcrossReset", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
-		col, _ := tb.getOrCreateColumn("ts", qwpTypeTimestamp, false)
-		col.addTimestamp(0)
+		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+		col.addLong(1)
 		tb.commitRow()
 
-		h := tb.getSchemaHash()
-		expected := int64(xxhash64([]byte{0x74, 0x73, 0x0A}, 0))
-		if h != expected {
-			t.Fatalf("schema hash = %d, want %d", h, expected)
+		tb.schemaId = 3
+		tb.reset()
+
+		if tb.schemaId != 3 {
+			t.Fatalf("schemaId = %d after reset, want 3 (column set unchanged)", tb.schemaId)
 		}
 	})
 }
