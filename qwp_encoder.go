@@ -38,23 +38,25 @@ type qwpEncoder struct {
 }
 
 // encodeTable encodes a single table buffer into a complete QWP
-// message without a delta symbol dictionary. The returned byte slice
-// references the encoder's internal buffer and is valid until the
-// next encode call.
+// message with an empty delta symbol dictionary. The returned byte
+// slice references the encoder's internal buffer and is valid until
+// the next encode call.
 //
 // schemaId is the connection-scoped schema identifier the server
 // uses to register (full mode) or look up (reference mode) this
 // table's column set.
 //
+// Used for tests and single-table convenience; the production sender
+// batches multiple tables through encodeMultiTableWithDeltaDict. Both
+// paths set FLAG_DELTA_SYMBOL_DICT, which is the only symbol-encoding
+// mode WebSocket clients emit (see QWP spec §12).
+//
 // The message layout is:
 //
-//	Header (12 bytes) → TableBlock → patched PayloadLength.
+//	Header (12 bytes, flags=0x08) → empty DeltaDict →
+//	TableBlock → patched PayloadLength.
 func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaId int) []byte {
-	e.wb.reset()
-	e.writeHeader(0, 1)
-	e.writeTableBlock(tb, schemaMode, schemaId)
-	e.patchPayloadLength()
-	return e.wb.bytes()
+	return e.encodeTableWithDeltaDict(tb, nil, -1, -1, schemaMode, schemaId)
 }
 
 // encodeTableWithDeltaDict encodes a single table buffer with a

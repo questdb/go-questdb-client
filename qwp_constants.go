@@ -60,13 +60,6 @@ const (
 // Stored as a uint32 in little-endian byte order: "QWP1".
 const qwpMagic uint32 = 0x31505751
 
-// Capability negotiation magic values (little-endian uint32).
-const (
-	qwpMagicCapabilityRequest  uint32 = 0x3F504C49 // "ILP?"
-	qwpMagicCapabilityResponse uint32 = 0x21504C49 // "ILP!"
-	qwpMagicFallback           uint32 = 0x30504C49 // "ILP0"
-)
-
 // qwpVersion is the current protocol version.
 const qwpVersion byte = 0x01
 
