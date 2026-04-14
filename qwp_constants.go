@@ -90,7 +90,7 @@ type qwpSchemaMode byte
 
 const (
 	qwpSchemaModeFull      qwpSchemaMode = 0x00 // full column definitions
-	qwpSchemaModeReference qwpSchemaMode = 0x01 // schema hash reference
+	qwpSchemaModeReference qwpSchemaMode = 0x01 // reference a schema already registered by ID
 )
 
 // qwpStatusCode represents a server response status.
@@ -150,7 +150,7 @@ func qwpIsFixedWidthType(tc qwpTypeCode) bool {
 }
 
 // qwpIsDecimalType reports whether the given type code is a decimal type
-// that carries a scale byte in the schema.
+// that carries a scale byte at the start of its column data section.
 func qwpIsDecimalType(tc qwpTypeCode) bool {
 	return tc == qwpTypeDecimal64 || tc == qwpTypeDecimal128 || tc == qwpTypeDecimal256
 }
