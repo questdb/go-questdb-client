@@ -100,47 +100,65 @@ QWP is not a version of ILP — it is a distinct binary protocol with its
 own framing, codecs, and server handshake. Everything QWP lives in
 `qwp_*.go`:
 
-- `qwp_constants.go` — magic (`"QWP1"`), header flags (LZ4, Zstd, Gorilla
-  timestamp encoding, delta symbol dictionary), type codes, and ACK
-  status codes.
+- `qwp_constants.go` — magic (`"QWP1"`), header flags (Gorilla timestamp
+  encoding, delta symbol dictionary), type codes, and ACK status codes.
 - `qwp_wire.go` + `qwp_varint.go` — low-level wire primitives; little-
-  endian fixed-width writers and varint encoding.
+  endian fixed-width writers and unsigned LEB128 varint encoding.
 - `qwp_buffer.go` — `qwpColumnBuffer` (per-type columnar storage,
   bit-packed booleans, offset+data for strings, separate null bitmap)
-  and `qwpTableBuffer` (gap-fill, row cancel, per-table schema). This
-  replaces the ILP text buffer for QWP senders; the same hot-path
+  and `qwpTableBuffer` (gap-fill, row cancel, per-table schema id).
+  This replaces the ILP text buffer for QWP senders; the same hot-path
   discipline applies but the data is stored in columnar form until the
-  encoder serializes a batch.
+  encoder serializes a batch. Production columns are created with
+  `nullable=false` and rely on type-specific sentinels (MinInt64,
+  NaN, etc.) for null rows, so the wire emits `null_flag=0` — the
+  nullable-bitmap path is currently only exercised by `DecimalColumn`
+  and unit tests.
 - `qwp_encoder.go` — builds a multi-table QWP message from a set of
   table buffers in one flush.
-- `qwp_hash.go` — XXHash64-based schema hashing. The sender caches
-  `(tableName, schemaHash)` keys for schemas the server has already
-  ACKed; subsequent batches for that table use *reference mode* and
-  skip re-sending the schema.
+- `qwp_gorilla.go` — delta-of-delta timestamp compression. Encoder
+  emits a 1-byte encoding flag (`0x00` uncompressed, `0x01` Gorilla)
+  only when `FLAG_GORILLA` is set on the message header. Falls back
+  to uncompressed when the column has ≤ 2 non-null values or any DoD
+  exceeds int32.
 - `qwp_transport.go` — WebSocket transport built on
   `github.com/coder/websocket` (the only non-stdlib runtime dependency
-  for QWP). Reads 9-byte ACK frames (1-byte status + 8-byte cumulative
-  sequence number). Supports an optional dump writer that records all
-  outgoing bytes including the HTTP upgrade handshake.
+  for QWP). Performs the `/write/v4` HTTP upgrade with QWP version
+  negotiation headers (`X-QWP-Max-Version`, `X-QWP-Client-Id`). Reads
+  9-byte ACK frames (1-byte status + 8-byte cumulative sequence
+  number). Supports an optional dump writer that records all outgoing
+  bytes including the HTTP upgrade handshake.
 - `qwp_errors.go` — `QwpError` with typed status codes parsed from ACKs.
 - `qwp_sender.go` — `qwpLineSender` (implements both `LineSender` and
   `QwpSender`), with *double-buffered* encoders so async mode can encode
   batch N+1 while batch N is flying. Sync mode uses only `encoders[0]`.
+  Schema IDs are small integers allocated sequentially from
+  `nextSchemaId` and stored on each `qwpTableBuffer`; a batch uses
+  *reference mode* when the table's `schemaId <= maxSentSchemaId`,
+  otherwise *full mode*. A column-set change resets the table's
+  `schemaId` to `-1` so a fresh ID is allocated.
 - `qwp_sender_async.go` — `qwpAsyncState`, the dedicated I/O goroutine
   (`ioLoop`), and the non-blocking-enqueue / blocking-drain split.
   Cancellable via context; `Close()` waits up to `closeTimeout`
-  (default 5s) before force-cancelling. Schema and symbol caches are
-  *only* advanced after the server ACKs the batch, so retries after
-  failure don't produce dangling references.
+  (default 5s) before force-cancelling.
 
 Async mode is the default: the QWP sender is seeded with
 `qwpDefaultInFlightWindow = 128`. Override with `WithInFlightWindow(n)` 
 or `in_flight_window=n` in the config. `WithInFlightWindow(1)` forces 
 synchronous mode — each `Flush` blocks until the ACK arrives.
 
-Delta symbol dictionaries send only new symbols since the last ACK;
-this is why symbol/schema cache updates must be gated on ACK — a
-rejected batch must not mark symbols as "known to the server."
+Delta symbol dictionaries send only new symbols since the last cache
+advance. Cache-advancement timing differs by mode and mirrors the Java
+client:
+
+- **Sync mode**: `maxSentSchemaId` / `maxSentSymbolId` advance only
+  after the server ACKs the batch. A failed flush leaves the caches
+  untouched, so a retry re-sends the full schema and the symbol delta.
+- **Async mode**: caches advance immediately after a successful
+  *enqueue*, not after the ACK. Safety comes from the sender being
+  terminal on I/O error — if any in-flight batch fails, `asyncState.ioErr`
+  is set and every subsequent user-facing call returns that error, so
+  stale cache state can never reach the wire.
 
 ### Config string reference
 
@@ -218,6 +236,10 @@ last sender is released.
   fluent API keeps returning the same sender, and the error surfaces on
   the next `At`/`AtNow`/`Flush`. QWP follows the same pattern on its
   per-row builder. Preserve this when adding methods.
-- QWP schema/symbol cache updates are gated on server ACK. Never advance
-  them speculatively from the enqueue side — a lost batch after a cache
-  bump will corrupt every subsequent message for that table.
+- QWP schema/symbol cache advancement differs by mode. In sync mode
+  (`flushSync`), advance `maxSentSchemaId` / `maxSentSymbolId` only
+  after a successful ACK. In async mode (`flushAsync`, `enqueueFlush`),
+  advance them immediately after a successful enqueue — the sender is
+  terminal on I/O error (`asyncState.ioErr` poisons every subsequent
+  call), so stale cache state cannot reach the wire on a live
+  connection. Both behaviors match the Java client.
