@@ -60,8 +60,11 @@ func TestQwpEncoderFixedWidthGoldenBytes(t *testing.T) {
 	expected = append(expected, 0x51, 0x57, 0x50, 0x31)
 	// Version = 1
 	expected = append(expected, 0x01)
-	// Flags = 0x08 (FLAG_DELTA_SYMBOL_DICT — encodeTable always emits an empty delta dict)
-	expected = append(expected, 0x08)
+	// Flags = 0x0C (FLAG_DELTA_SYMBOL_DICT | FLAG_GORILLA; encodeTable
+	// always emits an empty delta dict and the timestamp-column encoding
+	// flag byte is gated on FLAG_GORILLA even when no timestamp column
+	// is present).
+	expected = append(expected, 0x0C)
 	// TableCount = 1 (uint16 LE)
 	expected = append(expected, 0x01, 0x00)
 	// PayloadLength placeholder (will be patched)
@@ -135,9 +138,9 @@ func TestQwpEncoderHeader(t *testing.T) {
 		t.Fatalf("version = %d, want %d", msg[4], qwpVersion)
 	}
 
-	// Flags = 0x08 (FLAG_DELTA_SYMBOL_DICT — encodeTable always emits an empty delta dict)
-	if msg[5] != 0x08 {
-		t.Fatalf("flags = 0x%02X, want 0x08", msg[5])
+	// Flags = 0x0C (FLAG_DELTA_SYMBOL_DICT | FLAG_GORILLA).
+	if msg[5] != 0x0C {
+		t.Fatalf("flags = 0x%02X, want 0x0C", msg[5])
 	}
 
 	// TableCount = 1
@@ -343,8 +346,13 @@ func TestQwpEncoderAllFixedTypes(t *testing.T) {
 	}
 	off += 8
 
-	// Column "ts" (TIMESTAMP): flag + 8 bytes LE (no encoding prefix without Gorilla)
+	// Column "ts" (TIMESTAMP): null bitmap flag + encoding flag (0x00
+	// uncompressed; single value, no Gorilla) + 8 bytes LE.
 	off++ // null bitmap flag
+	if msg[off] != qwpTsEncodingUncompressed {
+		t.Fatalf("ts encoding flag = 0x%02X, want 0x00", msg[off])
+	}
+	off++ // encoding flag
 	gotTs := int64(binary.LittleEndian.Uint64(msg[off:]))
 	if gotTs != 1234567890 {
 		t.Fatalf("timestamp col = %d, want 1234567890", gotTs)
@@ -386,8 +394,13 @@ func TestQwpEncoderAllFixedTypes(t *testing.T) {
 		off += 8
 	}
 
-	// Column "tsn" (TIMESTAMP_NANOS): flag + 8 bytes LE (no encoding prefix without Gorilla)
+	// Column "tsn" (TIMESTAMP_NANOS): null bitmap flag + encoding flag
+	// (0x00 uncompressed; single value) + 8 bytes LE.
 	off++ // null bitmap flag
+	if msg[off] != qwpTsEncodingUncompressed {
+		t.Fatalf("tsn encoding flag = 0x%02X, want 0x00", msg[off])
+	}
+	off++ // encoding flag
 	gotTsNano := int64(binary.LittleEndian.Uint64(msg[off:]))
 	if gotTsNano != 1234567890123456789 {
 		t.Fatalf("timestamp_nanos col = %d, want 1234567890123456789", gotTsNano)
@@ -928,9 +941,10 @@ func TestQwpEncoderDeltaDictGoldenBytes(t *testing.T) {
 	if msg[4] != qwpVersion {
 		t.Fatalf("version = %d, want %d", msg[4], qwpVersion)
 	}
-	// Flags: FLAG_DELTA_SYMBOL_DICT only (no Gorilla)
-	if msg[5] != qwpFlagDeltaSymbolDict {
-		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], qwpFlagDeltaSymbolDict)
+	// Flags: FLAG_DELTA_SYMBOL_DICT | FLAG_GORILLA (both are always set).
+	wantFlags := qwpFlagDeltaSymbolDict | qwpFlagGorilla
+	if msg[5] != wantFlags {
+		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], wantFlags)
 	}
 	// TableCount = 1
 	if binary.LittleEndian.Uint16(msg[6:8]) != 1 {
@@ -1054,9 +1068,10 @@ func TestQwpEncoderDeltaDictEmptyDelta(t *testing.T) {
 	var enc qwpEncoder
 	msg := enc.encodeTableWithDeltaDict(tb, globalDict, 2, 2, qwpSchemaModeFull, 0)
 
-	// Flags should have delta dict flag only (no Gorilla).
-	if msg[5] != qwpFlagDeltaSymbolDict {
-		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], qwpFlagDeltaSymbolDict)
+	// Flags: FLAG_DELTA_SYMBOL_DICT | FLAG_GORILLA.
+	wantFlags := qwpFlagDeltaSymbolDict | qwpFlagGorilla
+	if msg[5] != wantFlags {
+		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], wantFlags)
 	}
 
 	off := qwpHeaderSize
@@ -1386,10 +1401,10 @@ func TestQwpEncoderGeohashPrecision60(t *testing.T) {
 	}
 }
 
-func TestQwpEncoderNoGorillaFlag(t *testing.T) {
-	// Verify that the encoder does NOT set FLAG_GORILLA (0x04) in the
-	// header flags. Setting it without implementing Gorilla compression
-	// would cause the server to misinterpret timestamp data.
+func TestQwpEncoderGorillaFlag(t *testing.T) {
+	// Verify that FLAG_GORILLA (0x04) is always set alongside
+	// FLAG_DELTA_SYMBOL_DICT (0x08) on every outgoing message, so the
+	// server expects a 1-byte encoding flag per timestamp column.
 
 	t.Run("encodeTable", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
@@ -1401,8 +1416,11 @@ func TestQwpEncoderNoGorillaFlag(t *testing.T) {
 		msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
 
 		flags := msg[qwpHeaderOffsetFlags]
-		if flags&qwpFlagGorilla != 0 {
-			t.Fatalf("FLAG_GORILLA (0x04) must not be set, got flags=0x%02X", flags)
+		if flags&qwpFlagGorilla == 0 {
+			t.Fatalf("FLAG_GORILLA must be set, got flags=0x%02X", flags)
+		}
+		if flags&qwpFlagDeltaSymbolDict == 0 {
+			t.Fatalf("FLAG_DELTA_SYMBOL_DICT must be set, got flags=0x%02X", flags)
 		}
 	})
 
@@ -1417,20 +1435,20 @@ func TestQwpEncoderNoGorillaFlag(t *testing.T) {
 		msg := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 0, qwpSchemaModeFull, 0)
 
 		flags := msg[qwpHeaderOffsetFlags]
-		if flags&qwpFlagGorilla != 0 {
-			t.Fatalf("FLAG_GORILLA (0x04) must not be set, got flags=0x%02X", flags)
+		if flags&qwpFlagGorilla == 0 {
+			t.Fatalf("FLAG_GORILLA must be set, got flags=0x%02X", flags)
 		}
-		// Delta dict flag should be set.
 		if flags&qwpFlagDeltaSymbolDict == 0 {
-			t.Fatalf("FLAG_DELTA_SYMBOL_DICT should be set, got flags=0x%02X", flags)
+			t.Fatalf("FLAG_DELTA_SYMBOL_DICT must be set, got flags=0x%02X", flags)
 		}
 	})
 }
 
-func TestQwpEncoderTimestampNoEncodingPrefix(t *testing.T) {
-	// Verify that timestamp columns are encoded as raw 8-byte LE values
-	// without a 0x00 encoding prefix byte. The prefix is only required
-	// when FLAG_GORILLA is set (which we don't support).
+func TestQwpEncoderTimestampEncodingPrefix(t *testing.T) {
+	// With FLAG_GORILLA always set at the message level, every timestamp
+	// column must emit a 1-byte encoding flag after the null bitmap.
+	// One value means Gorilla isn't used, so the flag is 0x00 and the
+	// raw int64 LE follows.
 
 	tb := newQwpTableBuffer("t")
 	col, _ := tb.getOrCreateColumn("ts", qwpTypeTimestamp, false)
@@ -1442,35 +1460,149 @@ func TestQwpEncoderTimestampNoEncodingPrefix(t *testing.T) {
 
 	// Parse to column data section.
 	off := qwpHeaderSize + 2 // +2 for empty delta symbol dictionary
-	// Table name "t": varint(1) + 't'
-	off += 2
-	// rowCount=1
-	off++
-	// colCount=1
-	off++
-	// schemaMode=FULL
-	off++
-	// schemaId varint (0 = 1 byte)
-	off++
-	// Column "ts": varint(1) + 't' + 's' + typeCode TIMESTAMP (0x0A)
-	off += 4
+	off += 2                 // table name "t" (varint 1 + 't')
+	off++                    // rowCount=1
+	off++                    // colCount=1
+	off++                    // schemaMode=FULL
+	off++                    // schemaId varint (0 = 1 byte)
+	off += 4                 // column "ts": varint(2) + "ts" + typeCode TIMESTAMP (0x0A)
 
-	// Null bitmap flag: 0x00 (no nulls)
 	if msg[off] != 0x00 {
 		t.Fatalf("null bitmap flag = 0x%02X, want 0x00", msg[off])
 	}
 	off++
 
-	// Next 8 bytes should be the raw timestamp value (no 0x00 prefix).
+	if msg[off] != qwpTsEncodingUncompressed {
+		t.Fatalf("ts encoding flag = 0x%02X, want 0x00 (uncompressed)", msg[off])
+	}
+	off++
+
 	gotTs := int64(binary.LittleEndian.Uint64(msg[off:]))
 	if gotTs != 1234567890 {
 		t.Fatalf("timestamp = %d, want 1234567890", gotTs)
 	}
 	off += 8
 
-	// Verify we consumed all bytes.
 	if off != len(msg) {
 		t.Fatalf("did not consume all bytes: off=%d, len=%d", off, len(msg))
+	}
+}
+
+func TestQwpEncoderTimestampGorillaPath(t *testing.T) {
+	// A timestamp column with more than two values and well-behaved
+	// DoDs is encoded with ENCODING_GORILLA and a Gorilla payload.
+	// Round-trip the bit stream through the test decoder to confirm.
+	values := []int64{1_000, 2_000, 3_000, 4_000, 5_000}
+	tb := newQwpTableBuffer("t")
+	for _, v := range values {
+		col, _ := tb.getOrCreateColumn("ts", qwpTypeTimestamp, false)
+		col.addTimestamp(v)
+		tb.commitRow()
+	}
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	off := qwpHeaderSize + 2 // empty delta dict
+	off += 2                 // table name "t"
+	off++                    // rowCount=5
+	off++                    // colCount=1
+	off++                    // schemaMode=FULL
+	off++                    // schemaId=0
+	off += 4                 // column "ts" + type TIMESTAMP
+	off++                    // null bitmap flag (0x00 no nulls)
+
+	if msg[off] != qwpTsEncodingGorilla {
+		t.Fatalf("encoding flag = 0x%02X, want 0x01 (gorilla)", msg[off])
+	}
+	off++
+
+	got := decodeGorilla(t, msg[off:], len(values))
+	for i, want := range values {
+		if got[i] != want {
+			t.Fatalf("ts[%d] = %d, want %d", i, got[i], want)
+		}
+	}
+}
+
+func TestQwpEncoderTimestampGorillaOverflowFallback(t *testing.T) {
+	// DoD overflowing int32 must force ENCODING_UNCOMPRESSED.
+	values := []int64{0, 0, -math.MaxInt64 / 2, -math.MaxInt64 / 2}
+	tb := newQwpTableBuffer("t")
+	for _, v := range values {
+		col, _ := tb.getOrCreateColumn("ts", qwpTypeTimestamp, false)
+		col.addTimestamp(v)
+		tb.commitRow()
+	}
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	off := qwpHeaderSize + 2
+	off += 2 // table name
+	off++    // rowCount
+	off++    // colCount
+	off++    // schemaMode
+	off++    // schemaId
+	off += 4 // column "ts" + type
+	off++    // null bitmap flag
+
+	if msg[off] != qwpTsEncodingUncompressed {
+		t.Fatalf("encoding flag = 0x%02X, want 0x00 (fallback)", msg[off])
+	}
+	off++
+
+	for i, want := range values {
+		got := int64(binary.LittleEndian.Uint64(msg[off+i*8:]))
+		if got != want {
+			t.Fatalf("ts[%d] = %d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestQwpEncoderGorillaDisabled(t *testing.T) {
+	// When gorillaDisabled is set, FLAG_GORILLA must be clear and
+	// timestamp columns must be raw int64 LE with no encoding-flag
+	// byte — the same wire shape the spec mandates when FLAG_GORILLA
+	// is unset (§12).
+	values := []int64{100, 200, 300, 400, 500}
+	tb := newQwpTableBuffer("t")
+	for _, v := range values {
+		col, _ := tb.getOrCreateColumn("ts", qwpTypeTimestamp, false)
+		col.addTimestamp(v)
+		tb.commitRow()
+	}
+
+	var enc qwpEncoder
+	enc.gorillaDisabled = true
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	flags := msg[qwpHeaderOffsetFlags]
+	if flags&qwpFlagGorilla != 0 {
+		t.Fatalf("FLAG_GORILLA must be clear when disabled, got flags=0x%02X", flags)
+	}
+	if flags&qwpFlagDeltaSymbolDict == 0 {
+		t.Fatalf("FLAG_DELTA_SYMBOL_DICT must stay set, got flags=0x%02X", flags)
+	}
+
+	off := qwpHeaderSize + 2 // empty delta dict
+	off += 2                 // table name "t"
+	off++                    // rowCount=5
+	off++                    // colCount=1
+	off++                    // schemaMode=FULL
+	off++                    // schemaId=0
+	off += 4                 // column "ts" + type TIMESTAMP
+	off++                    // null bitmap flag (0x00 no nulls)
+
+	// No encoding-flag byte: next 5*8 bytes are the raw values.
+	for i, want := range values {
+		got := int64(binary.LittleEndian.Uint64(msg[off+i*8:]))
+		if got != want {
+			t.Fatalf("ts[%d] = %d, want %d", i, got, want)
+		}
+	}
+	if off+len(values)*8 != len(msg) {
+		t.Fatalf("unexpected trailing bytes: off=%d len=%d", off+len(values)*8, len(msg))
 	}
 }
 
@@ -1515,8 +1647,9 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 	if msg[4] != qwpVersion {
 		t.Fatalf("version = %d, want %d", msg[4], qwpVersion)
 	}
-	if msg[5] != qwpFlagDeltaSymbolDict {
-		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], qwpFlagDeltaSymbolDict)
+	wantFlags := qwpFlagDeltaSymbolDict | qwpFlagGorilla
+	if msg[5] != wantFlags {
+		t.Fatalf("flags = 0x%02X, want 0x%02X", msg[5], wantFlags)
 	}
 
 	// TableCount = 3

@@ -208,6 +208,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.maxSchemasPerConnection = parsedVal
+		case "gorilla":
+			switch v {
+			case "on":
+				senderConf.gorillaDisabled = false
+			case "off":
+				senderConf.gorillaDisabled = true
+			default:
+				return nil, NewInvalidConfigStrError("invalid gorilla value, %q is not 'on' or 'off'", v)
+			}
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}

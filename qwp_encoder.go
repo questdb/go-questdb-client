@@ -34,7 +34,15 @@ package questdb
 //	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
 //	// msg is valid until the next encode call.
 type qwpEncoder struct {
-	wb qwpWireBuffer
+	wb      qwpWireBuffer
+	gorilla qwpGorillaEncoder
+
+	// gorillaDisabled flips off FLAG_GORILLA in the header and skips
+	// the per-column encoding-flag byte for timestamps. Stored as the
+	// negation so the zero value (0 / false) matches the default of
+	// Gorilla being enabled. Mirrors QwpWebSocketSender's
+	// gorillaEnabled=true default in the Java client.
+	gorillaDisabled bool
 }
 
 // encodeTable encodes a single table buffer into a complete QWP
@@ -48,12 +56,13 @@ type qwpEncoder struct {
 //
 // Used for tests and single-table convenience; the production sender
 // batches multiple tables through encodeMultiTableWithDeltaDict. Both
-// paths set FLAG_DELTA_SYMBOL_DICT, which is the only symbol-encoding
-// mode WebSocket clients emit (see QWP spec §12).
+// paths set FLAG_DELTA_SYMBOL_DICT (the only symbol-encoding mode
+// WebSocket clients emit) and FLAG_GORILLA (timestamp columns are
+// always preceded by a 1-byte encoding flag; see QWP spec §12).
 //
 // The message layout is:
 //
-//	Header (12 bytes, flags=0x08) → empty DeltaDict →
+//	Header (12 bytes, flags=0x0C) → empty DeltaDict →
 //	TableBlock → patched PayloadLength.
 func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaId int) []byte {
 	return e.encodeTableWithDeltaDict(tb, nil, -1, -1, schemaMode, schemaId)
@@ -61,12 +70,12 @@ func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, s
 
 // encodeTableWithDeltaDict encodes a single table buffer with a
 // prepended delta symbol dictionary. The dictionary sends only new
-// symbols (those with IDs from maxSentId+1 through batchMaxId)
-// and sets FLAG_DELTA_SYMBOL_DICT in the header.
+// symbols (those with IDs from maxSentId+1 through batchMaxId) and
+// sets FLAG_DELTA_SYMBOL_DICT | FLAG_GORILLA in the header.
 //
 // The message layout is:
 //
-//	Header (12 bytes, flags=0x08) → DeltaDict → TableBlock →
+//	Header (12 bytes, flags=0x0C) → DeltaDict → TableBlock →
 //	patched PayloadLength.
 //
 // globalDict maps symbol IDs (indices) to symbol strings.
@@ -81,7 +90,7 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 	schemaId int,
 ) []byte {
 	e.wb.reset()
-	e.writeHeader(qwpFlagDeltaSymbolDict, 1)
+	e.writeHeader(e.headerFlags(), 1)
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
 	e.writeTableBlock(tb, schemaMode, schemaId)
 	e.patchPayloadLength()
@@ -114,7 +123,7 @@ func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
 	batchMaxId int,
 ) []byte {
 	e.wb.reset()
-	e.writeHeader(qwpFlagDeltaSymbolDict, uint16(len(tables)))
+	e.writeHeader(e.headerFlags(), uint16(len(tables)))
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
 	for i := range tables {
 		e.writeTableBlock(tables[i].tb, tables[i].schemaMode, tables[i].schemaId)
@@ -124,6 +133,17 @@ func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
 }
 
 // --- header and payload helpers ---
+
+// headerFlags returns the header flags byte for the current encoder
+// state. FLAG_DELTA_SYMBOL_DICT is always set; FLAG_GORILLA is
+// included unless gorillaDisabled is true.
+func (e *qwpEncoder) headerFlags() byte {
+	flags := qwpFlagDeltaSymbolDict
+	if !e.gorillaDisabled {
+		flags |= qwpFlagGorilla
+	}
+	return flags
+}
 
 // writeHeader writes the 12-byte QWP message header with the given
 // flags and table count. PayloadLength is set to 0 (placeholder).
@@ -223,9 +243,7 @@ func (e *qwpEncoder) encodeColumnData(col *qwpColumnBuffer) {
 		e.encodeBoolColumn(col)
 
 	case qwpTypeTimestamp, qwpTypeTimestampNano:
-		// Without FLAG_GORILLA, timestamps are raw fixed-width
-		// data with no encoding prefix byte.
-		e.wb.putBytes(col.fixedData)
+		e.encodeTimestampColumn(col)
 
 	case qwpTypeString, qwpTypeVarchar:
 		e.encodeStringColumn(col)
@@ -317,6 +335,30 @@ func (e *qwpEncoder) encodeSymbolColumn(col *qwpColumnBuffer) {
 // in arrayData, so we just emit the raw bytes.
 func (e *qwpEncoder) encodeArrayColumn(col *qwpColumnBuffer) {
 	e.wb.putBytes(col.arrayData)
+}
+
+// encodeTimestampColumn writes a timestamp column's payload. The wire
+// shape depends on whether FLAG_GORILLA is set at the message level:
+//
+//   - FLAG_GORILLA on (default): a 1-byte encoding flag (0x01 = Gorilla,
+//     0x00 = uncompressed) followed by the payload. Gorilla is used when
+//     the column has more than two non-null values and every DoD fits in
+//     int32. All other cases fall back to raw int64 LE values, matching
+//     QwpColumnWriter.writeTimestampColumn in the Java client.
+//   - FLAG_GORILLA off: raw int64 LE values with no encoding flag byte.
+func (e *qwpEncoder) encodeTimestampColumn(col *qwpColumnBuffer) {
+	if e.gorillaDisabled {
+		e.wb.putBytes(col.fixedData)
+		return
+	}
+	count := col.valueCount()
+	if count > 2 && qwpGorillaEncodedSize(col.fixedData, count) >= 0 {
+		e.wb.putByte(qwpTsEncodingGorilla)
+		e.gorilla.encodeTimestamps(&e.wb, col.fixedData, count)
+		return
+	}
+	e.wb.putByte(qwpTsEncodingUncompressed)
+	e.wb.putBytes(col.fixedData)
 }
 
 // encodeGeohashColumn writes geohash column data: a precision

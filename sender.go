@@ -320,6 +320,7 @@ type lineSenderConfig struct {
 	closeTimeout            time.Duration // 0 = use default (5s)
 	maxSchemasPerConnection int           // 0 = unset; seeded to qwpDefaultMaxSchemasPerConnection
 	dumpWriter              io.Writer     // if set, record outgoing bytes (unexported)
+	gorillaDisabled         bool          // false (default) = Gorilla timestamp encoding enabled
 }
 
 // LineSenderOption defines line sender config option.
@@ -379,6 +380,19 @@ func WithCloseTimeout(d time.Duration) LineSenderOption {
 func WithMaxSchemasPerConnection(n int) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.maxSchemasPerConnection = n
+	}
+}
+
+// WithGorilla enables or disables Gorilla delta-of-delta encoding for
+// timestamp columns. Defaults to enabled. When disabled, FLAG_GORILLA
+// is cleared on every message and timestamp columns are sent as raw
+// int64 little-endian values with no encoding-flag prefix.
+//
+// Mirrors QwpWebSocketSender.setGorillaEnabled in the Java client
+// (default true there as well). Only available for the QWP sender.
+func WithGorilla(enabled bool) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.gorillaDisabled = !enabled
 	}
 }
 
@@ -897,6 +911,8 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	if conf.closeTimeout > 0 {
 		s.closeTimeout = conf.closeTimeout
 	}
+	s.encoders[0].gorillaDisabled = conf.gorillaDisabled
+	s.encoders[1].gorillaDisabled = conf.gorillaDisabled
 	// Async mode's encoder buffers are pre-sized for the microbatch
 	// role: max(1 MB, 2 * autoFlushBytes). Matches the Java client's
 	// MicrobatchBuffer sizing. The 1 MB floor was already applied in

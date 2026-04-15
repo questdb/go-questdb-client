@@ -543,6 +543,24 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithBasicAuth(user, pass),
 			},
 		},
+		{
+			name:   "ws with gorilla=off",
+			config: fmt.Sprintf("ws::addr=%s;gorilla=off;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithGorilla(false),
+			},
+		},
+		{
+			name:   "ws with gorilla=on",
+			config: fmt.Sprintf("ws::addr=%s;gorilla=on;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithGorilla(true),
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -613,6 +631,11 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			name:                   "invalid auto_flush_interval",
 			config:                 "http::addr=localhost:1111;auto_flush_interval=invalid;",
 			expectedErrMsgContains: "invalid auto_flush_interval",
+		},
+		{
+			name:                   "invalid gorilla value",
+			config:                 "ws::addr=localhost:1111;gorilla=maybe;",
+			expectedErrMsgContains: "not 'on' or 'off'",
 		},
 		{
 			name:                   "unsupported option",
