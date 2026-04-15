@@ -76,6 +76,20 @@ type QwpSender interface {
 
 	// Int64Array3DColumn adds a 3-dimensional LONG array column.
 	Int64Array3DColumn(name string, values [][][]int64) QwpSender
+
+	// Decimal64Column adds a DECIMAL64 column value (8 bytes on the wire,
+	// 18 digits of precision). Returns an error on the next At/AtNow/Flush
+	// if the value's unscaled coefficient does not fit in 64 bits.
+	Decimal64Column(name string, val Decimal) QwpSender
+
+	// Decimal128Column adds a DECIMAL128 column value (16 bytes on the wire,
+	// 38 digits of precision). Returns an error on the next At/AtNow/Flush
+	// if the value's unscaled coefficient does not fit in 128 bits.
+	Decimal128Column(name string, val Decimal) QwpSender
+
+	// Decimal256Column adds a DECIMAL256 column value (32 bytes on the wire,
+	// 77 digits of precision). Equivalent to DecimalColumn.
+	Decimal256Column(name string, val Decimal) QwpSender
 }
 
 // Compile-time check that qwpLineSender implements QwpSender.
@@ -469,26 +483,49 @@ func (s *qwpLineSender) BoolColumn(name string, val bool) LineSender {
 	return s
 }
 
-func (s *qwpLineSender) DecimalColumn(name string, val Decimal) LineSender {
+// addDecimalColumn is the shared implementation for DecimalColumn and
+// the Decimal{64,128,256}Column methods. It binds the column to the
+// given QWP decimal type on first use; subsequent rows must use the
+// same width or getOrCreateColumn returns a type-conflict error.
+func (s *qwpLineSender) addDecimalColumn(apiName, colName string, typeCode qwpTypeCode, val Decimal) {
 	if s.lastErr != nil {
-		return s
+		return
 	}
 	if !s.hasTable {
-		s.lastErr = fmt.Errorf("qwp: DecimalColumn() called without Table()")
-		return s
+		s.lastErr = fmt.Errorf("qwp: %s() called without Table()", apiName)
+		return
 	}
-	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
+	if err := qwpValidateColumnName(colName, s.fileNameLimit); err != nil {
 		s.lastErr = err
-		return s
+		return
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDecimal256, true)
+	col, err := s.currentTable.getOrCreateColumn(colName, typeCode, true)
 	if err != nil {
 		s.lastErr = err
-		return s
+		return
 	}
 	if err := col.addDecimal(val); err != nil {
 		s.lastErr = err
 	}
+}
+
+func (s *qwpLineSender) DecimalColumn(name string, val Decimal) LineSender {
+	s.addDecimalColumn("DecimalColumn", name, qwpTypeDecimal256, val)
+	return s
+}
+
+func (s *qwpLineSender) Decimal64Column(name string, val Decimal) QwpSender {
+	s.addDecimalColumn("Decimal64Column", name, qwpTypeDecimal64, val)
+	return s
+}
+
+func (s *qwpLineSender) Decimal128Column(name string, val Decimal) QwpSender {
+	s.addDecimalColumn("Decimal128Column", name, qwpTypeDecimal128, val)
+	return s
+}
+
+func (s *qwpLineSender) Decimal256Column(name string, val Decimal) QwpSender {
+	s.addDecimalColumn("Decimal256Column", name, qwpTypeDecimal256, val)
 	return s
 }
 
