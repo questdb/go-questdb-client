@@ -710,7 +710,7 @@ func (c *qwpColumnBuffer) truncateTo(n int) {
 		if newBitmapLen < len(c.nullBitmap) {
 			c.nullBitmap = c.nullBitmap[:newBitmapLen]
 		}
-		if n > 0 && n%8 != 0 && newBitmapLen > 0 {
+		if n > 0 && n%8 != 0 && newBitmapLen-1 < len(c.nullBitmap) {
 			c.nullBitmap[newBitmapLen-1] &= (1 << uint(n%8)) - 1
 		}
 		c.nullCount = 0
@@ -830,7 +830,7 @@ func (tb *qwpTableBuffer) getOrCreateDesignatedTimestamp(typeCode qwpTypeCode) (
 		return col, nil
 	}
 
-	col := newQwpColumnBuffer(dtName, typeCode, false)
+	col := newQwpColumnBuffer(dtName, typeCode, true)
 	col.table = tb
 	for i := 0; i < tb.rowCount; i++ {
 		col.addNull()

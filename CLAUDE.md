@@ -109,11 +109,15 @@ own framing, codecs, and server handshake. Everything QWP lives in
   and `qwpTableBuffer` (gap-fill, row cancel, per-table schema id).
   This replaces the ILP text buffer for QWP senders; the same hot-path
   discipline applies but the data is stored in columnar form until the
-  encoder serializes a batch. Production columns are created with
-  `nullable=false` and rely on type-specific sentinels (MinInt64,
-  NaN, etc.) for null rows, so the wire emits `null_flag=0` — the
-  nullable-bitmap path is currently only exercised by `DecimalColumn`
-  and unit tests.
+  encoder serializes a batch. Null-handling strategy mirrors the Java
+  client: wide types (INT, LONG, FLOAT, DOUBLE, TIMESTAMP,
+  TIMESTAMP_NANOS, DATE, STRING, VARCHAR, SYMBOL, UUID, LONG256,
+  DECIMAL*, DOUBLE_ARRAY, LONG_ARRAY) use the null bitmap path
+  (`nullable=true`); narrow types (BOOLEAN, BYTE, SHORT, CHAR) plus
+  GEOHASH use a type-specific sentinel and emit `null_flag=0`. The
+  bitmap is grown lazily only when a null is marked, so
+  `len(nullBitmap)` may be less than `ceil(rowCount/8)` when trailing
+  rows are non-null.
 - `qwp_encoder.go` — builds a multi-table QWP message from a set of
   table buffers in one flush.
 - `qwp_gorilla.go` — delta-of-delta timestamp compression. Encoder

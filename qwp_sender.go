@@ -302,7 +302,7 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		return s
 	}
 
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeSymbol, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeSymbol, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -339,7 +339,7 @@ func (s *qwpLineSender) Int64Column(name string, val int64) LineSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLong, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLong, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -360,7 +360,7 @@ func (s *qwpLineSender) Long256Column(name string, val *big.Int) LineSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLong256, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLong256, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -397,7 +397,7 @@ func (s *qwpLineSender) TimestampColumn(name string, ts time.Time) LineSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeTimestamp, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeTimestamp, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -418,7 +418,7 @@ func (s *qwpLineSender) Float64Column(name string, val float64) LineSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDouble, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDouble, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -439,7 +439,7 @@ func (s *qwpLineSender) StringColumn(name, val string) LineSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeString, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeString, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -528,7 +528,7 @@ func (s *qwpLineSender) Float64Array1DColumn(name string, values []float64) Line
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -549,7 +549,7 @@ func (s *qwpLineSender) Float64Array2DColumn(name string, values [][]float64) Li
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -586,7 +586,7 @@ func (s *qwpLineSender) Float64Array3DColumn(name string, values [][][]float64) 
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -635,7 +635,7 @@ func (s *qwpLineSender) Float64ArrayNDColumn(name string, values *NdArray[float6
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1130,7 +1130,7 @@ func (s *qwpLineSender) Int32Column(name string, val int32) QwpSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeInt, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeInt, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1151,7 +1151,7 @@ func (s *qwpLineSender) Float32Column(name string, val float32) QwpSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeFloat, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeFloat, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1193,7 +1193,7 @@ func (s *qwpLineSender) DateColumn(name string, val time.Time) QwpSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDate, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDate, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1214,7 +1214,7 @@ func (s *qwpLineSender) TimestampNanosColumn(name string, val time.Time) QwpSend
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeTimestampNano, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeTimestampNano, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1236,7 +1236,7 @@ func (s *qwpLineSender) UuidColumn(name string, hi, lo uint64) QwpSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeUuid, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeUuid, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1257,7 +1257,7 @@ func (s *qwpLineSender) VarcharColumn(name string, val string) QwpSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeVarchar, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeVarchar, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1305,7 +1305,7 @@ func (s *qwpLineSender) Int64Array1DColumn(name string, values []int64) QwpSende
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1326,7 +1326,7 @@ func (s *qwpLineSender) Int64Array2DColumn(name string, values [][]int64) QwpSen
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1362,7 +1362,7 @@ func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpS
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, false)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, true)
 	if err != nil {
 		s.lastErr = err
 		return s
