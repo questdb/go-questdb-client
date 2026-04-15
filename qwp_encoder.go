@@ -313,7 +313,7 @@ func (e *qwpEncoder) encodeBoolColumn(col *qwpColumnBuffer) {
 	}
 }
 
-// encodeStringColumn writes (rowCount+1) cumulative uint32 LE
+// encodeStringColumn writes (valueCount+1) cumulative uint32 LE
 // offsets followed by the concatenated string data.
 func (e *qwpEncoder) encodeStringColumn(col *qwpColumnBuffer) {
 	for _, off := range col.strOffsets {
