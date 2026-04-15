@@ -43,9 +43,6 @@ import (
 // qwpWritePath is the WebSocket endpoint for QWP ingestion.
 const qwpWritePath = "/write/v4"
 
-// qwpSubprotocol is the WebSocket subprotocol for QWP.
-const qwpSubprotocol = "qwp"
-
 // Version-negotiation HTTP headers (QWP spec §3).
 const (
 	qwpHeaderMaxVersion = "X-QWP-Max-Version"
@@ -118,13 +115,10 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	wsURL := url + qwpWritePath
 
 	dialOpts := &websocket.DialOptions{
-		Subprotocols: []string{qwpSubprotocol},
-	}
-
-	// Upgrade headers: QWP version negotiation (§3) and optional auth.
-	dialOpts.HTTPHeader = http.Header{
-		qwpHeaderMaxVersion: []string{fmt.Sprintf("%d", qwpVersion)},
-		qwpHeaderClientId:   []string{qwpClientId},
+		HTTPHeader: http.Header{
+			qwpHeaderMaxVersion: []string{fmt.Sprintf("%d", qwpVersion)},
+			qwpHeaderClientId:   []string{qwpClientId},
+		},
 	}
 	if opts.authorization != "" {
 		dialOpts.HTTPHeader.Set("Authorization", opts.authorization)
@@ -325,7 +319,6 @@ func qwpFakeServer(conn net.Conn) {
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + accept + "\r\n" +
-		"Sec-WebSocket-Protocol: " + qwpSubprotocol + "\r\n" +
 		"\r\n"
 	if _, err := conn.Write([]byte(resp)); err != nil {
 		return

@@ -165,9 +165,7 @@ func TestQwpTransportNotConnected(t *testing.T) {
 func newTestWSServer(t *testing.T, handler func(*websocket.Conn)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols: []string{qwpSubprotocol},
-		})
+		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			t.Logf("websocket accept error: %v", err)
 			return
@@ -218,9 +216,7 @@ func TestQwpTransportNegotiationHeaders(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMaxVersion = r.Header.Get(qwpHeaderMaxVersion)
 		gotClientId = r.Header.Get(qwpHeaderClientId)
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols: []string{qwpSubprotocol},
-		})
+		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
@@ -253,9 +249,7 @@ func TestQwpTransportNegotiationHeaders(t *testing.T) {
 func TestQwpTransportVersionMatchAccepted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols: []string{qwpSubprotocol},
-		})
+		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
@@ -281,9 +275,7 @@ func TestQwpTransportVersionMatchAccepted(t *testing.T) {
 func TestQwpTransportVersionMismatchRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "2")
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols: []string{qwpSubprotocol},
-		})
+		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
@@ -583,8 +575,6 @@ func TestQwpDumpWriter(t *testing.T) {
 	dump := buf.String()
 	assert.Contains(t, dump, "GET /write/v4 HTTP/1.1\r\n")
 	assert.Contains(t, dump, "Upgrade: websocket\r\n")
-	// Go sends "Sec-Websocket-Protocol" (lowercase 'w').
-	assert.Contains(t, dump, "Sec-Websocket-Protocol: qwp\r\n")
 
 	// Should have some binary data after the HTTP request (WebSocket frames).
 	httpEnd := strings.Index(dump, "\r\n\r\n")
