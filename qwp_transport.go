@@ -217,12 +217,20 @@ func (t *qwpTransport) readAck(ctx context.Context) (qwpStatusCode, []byte, erro
 		return 0, nil, fmt.Errorf("qwp: not connected")
 	}
 
-	msgType, data, err := t.conn.Read(ctx)
-	if err != nil {
-		return 0, nil, fmt.Errorf("qwp: read ack: %w", err)
-	}
-	if msgType != websocket.MessageBinary {
-		return 0, nil, fmt.Errorf("qwp: expected binary message, got %v", msgType)
+	// Skip non-binary data frames. coder/websocket handles ping/pong
+	// and close control frames internally, so only stray text frames
+	// can reach us — e.g. a misbehaving proxy injecting keep-alives.
+	// Match the Java client, which ignores them and keeps reading.
+	var data []byte
+	for {
+		msgType, buf, err := t.conn.Read(ctx)
+		if err != nil {
+			return 0, nil, fmt.Errorf("qwp: read ack: %w", err)
+		}
+		if msgType == websocket.MessageBinary {
+			data = buf
+			break
+		}
 	}
 	if len(data) < qwpAckOKSize {
 		return 0, nil, fmt.Errorf("qwp: ack too short: %d bytes", len(data))

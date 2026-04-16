@@ -591,6 +591,43 @@ func TestReadAckRejectsErrorLengthMismatch(t *testing.T) {
 	}
 }
 
+// TestReadAckSkipsTextFrames ensures readAck keeps reading past stray
+// non-binary frames (e.g. text keep-alives a proxy might inject) rather
+// than surfacing them as a protocol error. Matches the Java client.
+func TestReadAckSkipsTextFrames(t *testing.T) {
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		// Inject a text frame before the binary ACK.
+		if err := conn.Write(context.Background(), websocket.MessageText, []byte("keepalive")); err != nil {
+			t.Logf("text write: %v", err)
+			return
+		}
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(7))
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close(context.Background())
+
+	if err := tr.sendMessage(context.Background(), []byte{0x00}); err != nil {
+		t.Fatal(err)
+	}
+	status, data, err := tr.readAck(context.Background())
+	if err != nil {
+		t.Fatalf("readAck: %v", err)
+	}
+	if status != qwpStatusOK {
+		t.Fatalf("status = 0x%02X, want OK", status)
+	}
+	if seq := parseAckSequence(data); seq != 7 {
+		t.Fatalf("sequence = %d, want 7", seq)
+	}
+}
+
 func TestQwpDumpWriter(t *testing.T) {
 	var buf bytes.Buffer
 	ctx := context.Background()
