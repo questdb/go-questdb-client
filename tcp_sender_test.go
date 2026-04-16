@@ -198,7 +198,7 @@ func TestTcpPathologicalCasesFromConf(t *testing.T) {
 		{
 			name:        "invalid private key size",
 			config:      "tcp::username=test_key_id;token=1234567890;",
-			expectedErr: "connection refused",
+			expectedErr: "failed to parse auth key",
 		},
 		{
 			name:        "max_buf_size is set",
