@@ -935,6 +935,90 @@ func TestQwpSenderInt64Array3D(t *testing.T) {
 	}
 }
 
+func TestQwpSenderFloat64Array1DOverflowRejected(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Lazy zero pages keep the RAM cost negligible.
+	values := make([]float64, MaxArrayElements+1)
+	err := s.Table("t").
+		Float64Array1DColumn("arr", values).
+		At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected overflow error for oversized 1D array")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQwpSenderInt64Array1DOverflowRejected(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	values := make([]int64, MaxArrayElements+1)
+	s.Table("t")
+	s.Int64Array1DColumn("arr", values)
+	err := s.At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected overflow error for oversized 1D array")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQwpSenderFloat64Array2DProductOverflowRejected(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Each dim fits within MaxArrayElements, but their product does not.
+	dim0 := 65536
+	dim1 := 4097 // 65536 * 4097 = 268 500 992 > MaxArrayElements
+	rows := make([][]float64, dim0)
+	for i := range rows {
+		rows[i] = make([]float64, dim1)
+	}
+	err := s.Table("t").
+		Float64Array2DColumn("mat", rows).
+		At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected overflow error for oversized 2D array")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQwpSenderInt64Array2DProductOverflowRejected(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	dim0 := 65536
+	dim1 := 4097
+	rows := make([][]int64, dim0)
+	for i := range rows {
+		rows[i] = make([]int64, dim1)
+	}
+	s.Table("t")
+	s.Int64Array2DColumn("mat", rows)
+	err := s.At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected overflow error for oversized 2D array")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestQwpSenderMixedExtendedTypes(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()

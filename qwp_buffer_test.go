@@ -2444,3 +2444,76 @@ func TestQwpColumnBufferDecimalScaleValidation(t *testing.T) {
 		}
 	})
 }
+
+func TestQwpValidateArrayShape(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		if err := qwpValidateArrayShape(nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if err := qwpValidateArrayShape([]int{}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("Valid", func(t *testing.T) {
+		cases := [][]int{
+			{0},
+			{1},
+			{MaxArrayElements},
+			{3, 4, 5},
+			{0, 1 << 20}, // zero dim short-circuits the product
+		}
+		for _, shape := range cases {
+			if err := qwpValidateArrayShape(shape); err != nil {
+				t.Fatalf("shape %v: unexpected error: %v", shape, err)
+			}
+		}
+	})
+
+	t.Run("NegativeDim", func(t *testing.T) {
+		err := qwpValidateArrayShape([]int{-1})
+		if err == nil {
+			t.Fatal("expected error for negative dimension")
+		}
+	})
+
+	t.Run("SingleDimExceedsMax", func(t *testing.T) {
+		err := qwpValidateArrayShape([]int{MaxArrayElements + 1})
+		if err == nil {
+			t.Fatal("expected error for oversized single dimension")
+		}
+	})
+
+	t.Run("ZeroFirstThenOversizedDim", func(t *testing.T) {
+		// A zero dim zeroes the running product, but a later dim
+		// larger than MaxArrayElements must still be rejected.
+		err := qwpValidateArrayShape([]int{0, MaxArrayElements + 1})
+		if err == nil {
+			t.Fatal("expected error for oversized trailing dimension")
+		}
+	})
+
+	t.Run("ProductOverflow", func(t *testing.T) {
+		// Each dimension fits in MaxArrayElements but their product
+		// does not.
+		err := qwpValidateArrayShape([]int{1 << 14, 1 << 14, 1 << 14})
+		if err == nil {
+			t.Fatal("expected error for product overflow")
+		}
+	})
+
+	t.Run("ProductAtMax", func(t *testing.T) {
+		// Product equals MaxArrayElements exactly → accepted.
+		if err := qwpValidateArrayShape([]int{1, MaxArrayElements}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("ProductOneOverMax", func(t *testing.T) {
+		// 2^14 * 2^14 == 2^28 == MaxArrayElements+1 → rejected.
+		if err := qwpValidateArrayShape([]int{1 << 14, 1 << 14}); err == nil {
+			t.Fatal("expected rejection for product one over max")
+		}
+	})
+}
+

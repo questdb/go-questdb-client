@@ -565,6 +565,10 @@ func (s *qwpLineSender) Float64Array1DColumn(name string, values []float64) Line
 		s.lastErr = err
 		return s
 	}
+	if err := qwpValidateArrayShape([]int{len(values)}); err != nil {
+		s.lastErr = err
+		return s
+	}
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, true)
 	if err != nil {
 		s.lastErr = err
@@ -596,18 +600,22 @@ func (s *qwpLineSender) Float64Array2DColumn(name string, values [][]float64) Li
 		col.addDoubleArray(2, []int32{0, 0}, nil)
 		return s
 	}
-	dim0 := int32(len(values))
-	dim1 := int32(len(values[0]))
+	dim0 := len(values)
+	dim1 := len(values[0])
+	if err := qwpValidateArrayShape([]int{dim0, dim1}); err != nil {
+		s.lastErr = err
+		return s
+	}
 	// Flatten.
-	flat := make([]float64, 0, int(dim0)*int(dim1))
+	flat := make([]float64, 0, dim0*dim1)
 	for _, row := range values {
-		if int32(len(row)) != dim1 {
+		if len(row) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 2D array: row lengths differ")
 			return s
 		}
 		flat = append(flat, row...)
 	}
-	col.addDoubleArray(2, []int32{dim0, dim1}, flat)
+	col.addDoubleArray(2, []int32{int32(dim0), int32(dim1)}, flat)
 	return s
 }
 
@@ -633,27 +641,31 @@ func (s *qwpLineSender) Float64Array3DColumn(name string, values [][][]float64) 
 		col.addDoubleArray(3, []int32{0, 0, 0}, nil)
 		return s
 	}
-	dim0 := int32(len(values))
-	dim1 := int32(len(values[0]))
-	dim2 := int32(0)
+	dim0 := len(values)
+	dim1 := len(values[0])
+	dim2 := 0
 	if len(values[0]) > 0 {
-		dim2 = int32(len(values[0][0]))
+		dim2 = len(values[0][0])
 	}
-	flat := make([]float64, 0, int(dim0)*int(dim1)*int(dim2))
+	if err := qwpValidateArrayShape([]int{dim0, dim1, dim2}); err != nil {
+		s.lastErr = err
+		return s
+	}
+	flat := make([]float64, 0, dim0*dim1*dim2)
 	for _, plane := range values {
-		if int32(len(plane)) != dim1 {
+		if len(plane) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 3D array")
 			return s
 		}
 		for _, row := range plane {
-			if int32(len(row)) != dim2 {
+			if len(row) != dim2 {
 				s.lastErr = fmt.Errorf("qwp: irregular 3D array")
 				return s
 			}
 			flat = append(flat, row...)
 		}
 	}
-	col.addDoubleArray(3, []int32{dim0, dim1, dim2}, flat)
+	col.addDoubleArray(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, flat)
 	return s
 }
 
@@ -672,15 +684,29 @@ func (s *qwpLineSender) Float64ArrayNDColumn(name string, values *NdArray[float6
 		s.lastErr = err
 		return s
 	}
+	shape := values.Shape()
+	shapeInt := make([]int, len(shape))
+	for i, d := range shape {
+		if d > uint(MaxArrayElements) {
+			s.lastErr = fmt.Errorf(
+				"qwp: array dimension %d size %d exceeds maximum %d",
+				i, d, MaxArrayElements,
+			)
+			return s
+		}
+		shapeInt[i] = int(d)
+	}
+	if err := qwpValidateArrayShape(shapeInt); err != nil {
+		s.lastErr = err
+		return s
+	}
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, true)
 	if err != nil {
 		s.lastErr = err
 		return s
 	}
-
-	shape := values.Shape()
-	shapeI32 := make([]int32, len(shape))
-	for i, d := range shape {
+	shapeI32 := make([]int32, len(shapeInt))
+	for i, d := range shapeInt {
 		shapeI32[i] = int32(d)
 	}
 	col.addDoubleArray(uint8(len(shape)), shapeI32, values.Data())
@@ -1342,6 +1368,10 @@ func (s *qwpLineSender) Int64Array1DColumn(name string, values []int64) QwpSende
 		s.lastErr = err
 		return s
 	}
+	if err := qwpValidateArrayShape([]int{len(values)}); err != nil {
+		s.lastErr = err
+		return s
+	}
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLongArray, true)
 	if err != nil {
 		s.lastErr = err
@@ -1373,17 +1403,21 @@ func (s *qwpLineSender) Int64Array2DColumn(name string, values [][]int64) QwpSen
 		col.addLongArray(2, []int32{0, 0}, nil)
 		return s
 	}
-	dim0 := int32(len(values))
-	dim1 := int32(len(values[0]))
-	flat := make([]int64, 0, int(dim0)*int(dim1))
+	dim0 := len(values)
+	dim1 := len(values[0])
+	if err := qwpValidateArrayShape([]int{dim0, dim1}); err != nil {
+		s.lastErr = err
+		return s
+	}
+	flat := make([]int64, 0, dim0*dim1)
 	for _, row := range values {
-		if int32(len(row)) != dim1 {
+		if len(row) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 2D array: row lengths differ")
 			return s
 		}
 		flat = append(flat, row...)
 	}
-	col.addLongArray(2, []int32{dim0, dim1}, flat)
+	col.addLongArray(2, []int32{int32(dim0), int32(dim1)}, flat)
 	return s
 }
 
@@ -1409,26 +1443,30 @@ func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpS
 		col.addLongArray(3, []int32{0, 0, 0}, nil)
 		return s
 	}
-	dim0 := int32(len(values))
-	dim1 := int32(len(values[0]))
-	dim2 := int32(0)
+	dim0 := len(values)
+	dim1 := len(values[0])
+	dim2 := 0
 	if len(values[0]) > 0 {
-		dim2 = int32(len(values[0][0]))
+		dim2 = len(values[0][0])
 	}
-	flat := make([]int64, 0, int(dim0)*int(dim1)*int(dim2))
+	if err := qwpValidateArrayShape([]int{dim0, dim1, dim2}); err != nil {
+		s.lastErr = err
+		return s
+	}
+	flat := make([]int64, 0, dim0*dim1*dim2)
 	for _, plane := range values {
-		if int32(len(plane)) != dim1 {
+		if len(plane) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 3D array")
 			return s
 		}
 		for _, row := range plane {
-			if int32(len(row)) != dim2 {
+			if len(row) != dim2 {
 				s.lastErr = fmt.Errorf("qwp: irregular 3D array")
 				return s
 			}
 			flat = append(flat, row...)
 		}
 	}
-	col.addLongArray(3, []int32{dim0, dim1, dim2}, flat)
+	col.addLongArray(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, flat)
 	return s
 }

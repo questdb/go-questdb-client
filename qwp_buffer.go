@@ -359,6 +359,39 @@ func (c *qwpColumnBuffer) addGeohash(value uint64, precision int8) error {
 	return nil
 }
 
+// qwpValidateArrayShape checks that each dimension is non-negative and
+// fits within MaxArrayElements, and that the product of all dimensions
+// does not overflow or exceed MaxArrayElements. Mirrors Java's
+// Math.multiplyExact discipline on the element-count product so that
+// adversarial inputs cannot produce a bogus int32 shape when the
+// caller later casts each dimension.
+func qwpValidateArrayShape(shape []int) error {
+	total := 1
+	for i, d := range shape {
+		if d < 0 {
+			return fmt.Errorf("qwp: array dimension %d is negative: %d", i, d)
+		}
+		if d > MaxArrayElements {
+			return fmt.Errorf(
+				"qwp: array dimension %d size %d exceeds maximum %d",
+				i, d, MaxArrayElements,
+			)
+		}
+		if d == 0 {
+			total = 0
+			continue
+		}
+		if total > MaxArrayElements/d {
+			return fmt.Errorf(
+				"qwp: array element count exceeds maximum %d",
+				MaxArrayElements,
+			)
+		}
+		total *= d
+	}
+	return nil
+}
+
 // addDoubleArray appends an N-dimensional float64 array value
 // (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
 //
