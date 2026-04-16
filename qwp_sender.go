@@ -171,9 +171,15 @@ type qwpLineSender struct {
 	// Connection and retry config.
 	retryTimeout time.Duration
 
+	// syncSequence is the sequence of the next batch to send in sync
+	// mode (inFlightWindow == 1). First batch is 0. Incremented after
+	// each successful send so flushSync can recognise its own ACK and
+	// ignore stale ACKs for earlier batches on the same connection.
+	syncSequence int64
+
 	// Async mode (in-flight window > 1).
-	asyncState      *qwpAsyncState
-	inFlightWindow  int
+	asyncState     *qwpAsyncState
+	inFlightWindow int
 
 	// closeTimeout is the time Close() waits for the async I/O
 	// goroutine to finish before force-cancelling. Defaults to 5s.
@@ -829,10 +835,12 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 }
 
 // flushSync encodes all non-empty tables into a single multi-table
-// QWP message and sends it with retry. This reduces round-trips
-// compared to sending one message per table.
+// QWP message, sends it, and reads ACKs until one whose sequence is
+// at least the just-sent batch's sequence arrives. Earlier sequences
+// are absorbed the way the Java client does in waitForAck — a defensive
+// measure against stale ACKs that can otherwise be mistaken for a
+// response to the wrong batch.
 func (s *qwpLineSender) flushSync(ctx context.Context) error {
-	// Collect non-empty tables and build encode info.
 	tables, err := s.buildTableEncodeInfo()
 	if err != nil {
 		return err
@@ -841,19 +849,36 @@ func (s *qwpLineSender) flushSync(ctx context.Context) error {
 		return nil
 	}
 
-	err = s.transport.sendAndAck(ctx,
-		func() []byte {
-			return s.encoders[0].encodeMultiTableWithDeltaDict(
-				tables,
-				s.globalSymbolList,
-				s.maxSentSymbolId,
-				s.batchMaxSymbolId,
-			)
-		},
+	msg := s.encoders[0].encodeMultiTableWithDeltaDict(
+		tables,
+		s.globalSymbolList,
+		s.maxSentSymbolId,
+		s.batchMaxSymbolId,
 	)
-
-	if err != nil {
+	if err := s.transport.sendMessage(ctx, msg); err != nil {
 		return err
+	}
+	expected := s.syncSequence
+	s.syncSequence++
+
+	for {
+		status, data, err := s.transport.readAck(ctx)
+		if err != nil {
+			return err
+		}
+		seq := parseAckSequence(data)
+		if status != qwpStatusOK {
+			qErr := newQwpErrorFromAck(data)
+			if qErr == nil {
+				qErr = &QwpError{Status: status, Sequence: seq, Message: "unknown error"}
+			}
+			return qErr
+		}
+		if seq >= expected {
+			break
+		}
+		// Stale ACK for an earlier batch on this connection — absorb
+		// and keep reading. Matches Java's waitForAck.
 	}
 
 	// Advance ACKed state: all schema IDs in this batch are now

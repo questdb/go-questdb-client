@@ -59,15 +59,11 @@ func buildAckError(status qwpStatusCode, seq int64, errMsg string) []byte {
 	return data
 }
 
+// TestQwpParseAckError exercises parseAckError on inputs that satisfy
+// its precondition (non-OK ACKs of exactly qwpAckErrorHeaderSize + msgLen
+// bytes, as enforced by readAck). Malformed-length inputs are readAck's
+// responsibility and are covered in TestReadAckRejects* tests.
 func TestQwpParseAckError(t *testing.T) {
-	t.Run("OK_NoError", func(t *testing.T) {
-		data := buildAckOK(0)
-		msg := parseAckError(data)
-		if msg != "" {
-			t.Fatalf("expected empty, got %q", msg)
-		}
-	})
-
 	t.Run("ErrorWithMessage", func(t *testing.T) {
 		errMsg := "bad data"
 		data := buildAckError(qwpStatusParseError, 1, errMsg)
@@ -80,25 +76,6 @@ func TestQwpParseAckError(t *testing.T) {
 
 	t.Run("EmptyErrorMessage", func(t *testing.T) {
 		data := buildAckError(qwpStatusInternalError, 2, "")
-		msg := parseAckError(data)
-		if msg != "" {
-			t.Fatalf("expected empty, got %q", msg)
-		}
-	})
-
-	t.Run("TruncatedPayload", func(t *testing.T) {
-		// Build valid header then truncate data.
-		data := buildAckError(qwpStatusParseError, 3, "long error")
-		data = data[:13] // truncate to only 2 of the message bytes
-		msg := parseAckError(data)
-		if msg != "" {
-			t.Fatalf("expected empty for truncated, got %q", msg)
-		}
-	})
-
-	t.Run("TooShortForLength", func(t *testing.T) {
-		// Only status + sequence, no error length field.
-		data := buildAckOK(0)
 		msg := parseAckError(data)
 		if msg != "" {
 			t.Fatalf("expected empty, got %q", msg)

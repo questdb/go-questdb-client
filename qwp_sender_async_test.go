@@ -26,7 +26,6 @@ package questdb
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -317,7 +316,8 @@ func TestQwpAsyncMarkStopped(t *testing.T) {
 }
 
 func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
-	// Mock WebSocket server that ACKs each message.
+	// Mock WebSocket server that ACKs each message with an
+	// incrementing cumulative sequence (0-indexed, matches Java).
 	var received [][]byte
 	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -327,6 +327,7 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
+		var seq int64
 		for {
 			_, data, err := conn.Read(context.Background())
 			if err != nil {
@@ -335,9 +336,8 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 			mu.Lock()
 			received = append(received, data)
 			mu.Unlock()
-			ack := make([]byte, 9)
-			ack[0] = byte(qwpStatusOK)
-			conn.Write(context.Background(), websocket.MessageBinary, ack)
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
 		}
 	}))
 	defer srv.Close()
@@ -385,7 +385,6 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 
 func TestQwpAsyncIoLoopServerError(t *testing.T) {
 	// Mock server that returns an error ACK on the second message.
-	msgCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
@@ -393,26 +392,19 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
+		var seq int64
 		for {
 			_, _, err := conn.Read(context.Background())
 			if err != nil {
 				return
 			}
-			msgCount++
-			if msgCount == 2 {
-				// Spec-compliant error ACK: status + sequence + msg_len + msg.
-				errMsg := "bad batch"
-				ack := make([]byte, qwpAckErrorHeaderSize+len(errMsg))
-				ack[0] = byte(qwpStatusWriteError)
-				binary.LittleEndian.PutUint64(ack[1:9], 0)
-				binary.LittleEndian.PutUint16(ack[9:11], uint16(len(errMsg)))
-				copy(ack[11:], errMsg)
-				conn.Write(context.Background(), websocket.MessageBinary, ack)
+			if seq == 1 {
+				conn.Write(context.Background(), websocket.MessageBinary,
+					buildAckError(qwpStatusWriteError, seq, "bad batch"))
 			} else {
-				ack := make([]byte, 9)
-				ack[0] = byte(qwpStatusOK)
-				conn.Write(context.Background(), websocket.MessageBinary, ack)
+				conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
 			}
+			seq++
 		}
 	}))
 	defer srv.Close()
@@ -492,14 +484,14 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
+		var seq int64
 		for {
 			_, _, err := conn.Read(context.Background())
 			if err != nil {
 				return
 			}
-			ack := make([]byte, 9)
-			ack[0] = byte(qwpStatusOK)
-			conn.Write(context.Background(), websocket.MessageBinary, ack)
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
 		}
 	}))
 	defer srv.Close()
@@ -520,15 +512,20 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 		t.Fatalf("waitEmpty: %v", err)
 	}
 
-	// Stop should close the channel and wait for goroutine exit.
+	// Stop should close the channel and wait for both goroutines.
 	a.stop(5 * time.Second)
 
-	// Verify the done channel is closed (goroutine exited).
-	select {
-	case <-a.done:
-		// Good.
-	default:
-		t.Fatal("done channel not closed after stop()")
+	// Verify both done channels are closed (goroutines exited).
+	for name, ch := range map[string]chan struct{}{
+		"sender":   a.doneSender,
+		"receiver": a.doneReceiver,
+	} {
+		select {
+		case <-ch:
+			// Good.
+		default:
+			t.Fatalf("%s done channel not closed after stop()", name)
+		}
 	}
 
 	// Verify stopped flag is set.
@@ -637,5 +634,195 @@ func TestQwpAsyncCloseUnresponsiveServer(t *testing.T) {
 		t.Logf("Close returned: %v", err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("Close() did not complete within 3 seconds — I/O goroutine is stuck")
+	}
+}
+
+// TestQwpAsyncCumulativeAck exercises the Java-aligned cumulative-ACK
+// behaviour: the server receives several batches and coalesces them
+// into a single ACK whose sequence covers all of them. The client
+// must release multiple in-flight slots from that one ACK instead of
+// wedging waiting for a 1:1 correspondence.
+func TestQwpAsyncCumulativeAck(t *testing.T) {
+	const batches = 3
+
+	// Server delays ACKing until all batches have been read, then
+	// emits one cumulative ACK (sequence = last batch index).
+	read := make(chan struct{}, batches)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		for i := 0; i < batches; i++ {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			read <- struct{}{}
+		}
+		// One ACK covers batches 0..batches-1.
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(int64(batches-1)))
+		// Drain any further reads until the client closes, so the
+		// handler stays alive for the receiver's post-ACK checks.
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	var transport qwpTransport
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.close(context.Background())
+
+	a := newQwpAsyncState(batches, &transport)
+	a.start()
+
+	for i := 0; i < batches; i++ {
+		if err := a.acquireSlot(context.Background()); err != nil {
+			t.Fatalf("acquireSlot %d: %v", i, err)
+		}
+		a.sendCh <- qwpAsyncBatch{data: []byte{byte(i)}}
+	}
+
+	// Wait for the server to confirm all batches landed before the
+	// cumulative ACK goes out.
+	for i := 0; i < batches; i++ {
+		select {
+		case <-read:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("server never received batch %d", i)
+		}
+	}
+
+	if err := a.waitEmpty(context.Background()); err != nil {
+		t.Fatalf("waitEmpty: %v", err)
+	}
+
+	a.mu.Lock()
+	if a.ackedSequence != int64(batches-1) {
+		t.Fatalf("ackedSequence = %d, want %d", a.ackedSequence, batches-1)
+	}
+	if a.inFlightCount != 0 {
+		t.Fatalf("inFlightCount = %d, want 0", a.inFlightCount)
+	}
+	a.mu.Unlock()
+
+	a.stop(2 * time.Second)
+}
+
+// TestQwpAsyncServerOverAcksIsProtocolError verifies the client rejects
+// an ACK whose cumulative sequence exceeds the number of batches sent.
+func TestQwpAsyncServerOverAcksIsProtocolError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if _, _, err := conn.Read(context.Background()); err != nil {
+			return
+		}
+		// Client has sent exactly 1 batch (sequence 0); ACK seq=5.
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(5))
+	}))
+	defer srv.Close()
+
+	var transport qwpTransport
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.close(context.Background())
+
+	a := newQwpAsyncState(2, &transport)
+	a.start()
+
+	a.acquireSlot(context.Background())
+	a.sendCh <- qwpAsyncBatch{data: []byte{0x00}}
+
+	// The receiver must surface an ioErr and waitEmpty should return it.
+	err := a.waitEmpty(context.Background())
+	if err == nil {
+		t.Fatal("expected protocol error, got nil")
+	}
+	if !strings.Contains(err.Error(), "server acknowledged sequence 5") {
+		t.Fatalf("error should mention the over-ACK, got: %v", err)
+	}
+
+	a.stop(2 * time.Second)
+}
+
+// TestQwpAsyncErrorAckCarriesSequence checks that an error ACK's
+// sequence field reaches the caller through QwpError, so callers can
+// identify which batch failed (matches Java's "Server error for batch N").
+func TestQwpAsyncErrorAckCarriesSequence(t *testing.T) {
+	const failingSeq = 2
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		var seq int64
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			if seq == failingSeq {
+				conn.Write(context.Background(), websocket.MessageBinary,
+					buildAckError(qwpStatusWriteError, seq, "bad batch"))
+				return
+			}
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+		}
+	}))
+	defer srv.Close()
+
+	var transport qwpTransport
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.close(context.Background())
+
+	a := newQwpAsyncState(4, &transport)
+	a.start()
+
+	for i := 0; i <= failingSeq; i++ {
+		if err := a.acquireSlot(context.Background()); err != nil {
+			// Once the error is set later batches may not get slots.
+			break
+		}
+		a.sendCh <- qwpAsyncBatch{data: []byte{byte(i)}}
+	}
+
+	// Give the receiver a moment to process the error ACK, then stop.
+	a.stop(2 * time.Second)
+
+	err := a.checkError()
+	if err == nil {
+		t.Fatal("expected error from server")
+	}
+	qErr, ok := err.(*QwpError)
+	if !ok {
+		t.Fatalf("expected *QwpError, got %T: %v", err, err)
+	}
+	if qErr.Sequence != failingSeq {
+		t.Fatalf("sequence = %d, want %d", qErr.Sequence, failingSeq)
+	}
+	if qErr.Status != qwpStatusWriteError {
+		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusWriteError)
 	}
 }

@@ -118,7 +118,8 @@ func TestNewQwpErrorFromAck(t *testing.T) {
 	})
 
 	t.Run("WriteErrorNoMessage", func(t *testing.T) {
-		data := make([]byte, 9)
+		// 11 bytes: status + sequence + msg_len(0), no trailing message.
+		data := make([]byte, 11)
 		data[0] = byte(qwpStatusWriteError)
 		binary.LittleEndian.PutUint64(data[1:9], 99)
 
@@ -137,13 +138,4 @@ func TestNewQwpErrorFromAck(t *testing.T) {
 		}
 	})
 
-	t.Run("EmptyPayload", func(t *testing.T) {
-		e := newQwpErrorFromAck([]byte{})
-		if e == nil {
-			t.Fatal("expected error for empty payload")
-		}
-		if e.Message == "" {
-			t.Fatal("expected error message for empty payload")
-		}
-	})
 }

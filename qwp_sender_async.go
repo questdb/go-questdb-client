@@ -31,10 +31,13 @@ import (
 	"time"
 )
 
-// qwpAsyncState manages the in-flight window and I/O goroutine for
+// qwpAsyncState manages the in-flight window and I/O goroutines for
 // async QWP mode (in-flight window > 1). It coordinates between the
-// user goroutine (which encodes and enqueues batches) and the I/O
-// goroutine (which sends over WebSocket and processes ACKs).
+// user goroutine (which encodes and enqueues batches) and two I/O
+// goroutines: senderLoop transmits batches, receiverLoop processes
+// ACKs in parallel so multiple batches can be in flight on the wire
+// at once (matches the Java client's sliding-window design).
+//
 // qwpAsyncBatch carries an encoded batch payload and a signal channel
 // to mark the encoder's buffer as reusable after the data is written
 // to the socket.
@@ -45,60 +48,83 @@ type qwpAsyncBatch struct {
 
 type qwpAsyncState struct {
 	// sendCh carries encoded batch payloads from the user goroutine
-	// to the I/O goroutine. Buffered to decouple encoding from sending.
+	// to senderLoop. Buffered to decouple encoding from sending.
 	sendCh chan qwpAsyncBatch
 
-	// mu protects inFlightCount, ioErr, and stopped.
+	// mu protects inFlightCount, nextSequence, ackedSequence,
+	// senderDone, lastSentSequence, ioErr, and stopped.
 	mu   sync.Mutex
 	cond *sync.Cond
 
-	// inFlightCount is the number of batches sent but not yet ACKed.
+	// inFlightCount is the number of batches enqueued on sendCh or
+	// sent but not yet ACKed. Incremented in acquireSlot; decremented
+	// by releaseSlot (enqueue-cancelled or send-failed batches) and
+	// by releaseSlotsUpTo (ACK-based cumulative release).
 	inFlightCount int
-	// inFlightMax is the maximum concurrent in-flight batches.
-	inFlightMax int
+	inFlightMax   int
 
-	// nextSequence is the sequence number to assign to the next batch.
-	//lint:ignore U1000 sequence tracking pending
-	nextSequence uint64
-	// ackedSequence is the highest cumulative sequence ACKed by the server.
-	//lint:ignore U1000 sequence tracking pending
-	ackedSequence uint64
+	// nextSequence is the sequence number that will be assigned to
+	// the next successfully-sent batch. First batch is 0. Incremented
+	// only by senderLoop after a successful sendMessage.
+	nextSequence int64
+	// ackedSequence is the highest cumulative sequence acknowledged
+	// by the server, or -1 if none. Updated only by receiverLoop.
+	// The -1 sentinel matches Java's InFlightWindow.highestAcked and
+	// disambiguates "no ACK yet" from "sequence 0 ACKed" — without it,
+	// a server that starts its sequence counter at 0 would look like
+	// a stale ACK and never release the first slot.
+	ackedSequence int64
 
-	// ioErr is the first error from the I/O goroutine. Once set, all
-	// blocking operations return this error.
+	// lastSentSequence is the sequence of the last batch actually
+	// transmitted, or -1 if none. Set by senderLoop as it exits
+	// (sendCh closed and drained). Once senderDone is true,
+	// receiverLoop exits when ackedSequence >= lastSentSequence.
+	lastSentSequence int64
+	senderDone       bool
+
+	// ioErr is the first error from either I/O goroutine. Once set,
+	// all blocking operations return this error.
 	ioErr error
 
-	// stopped is set to true after the I/O goroutine exits.
+	// stopped is set to true after both I/O goroutines have exited.
 	stopped bool
 
-	// done is closed when the I/O goroutine exits.
-	done chan struct{}
+	// doneSender is closed when senderLoop exits; doneReceiver is
+	// closed when receiverLoop exits.
+	doneSender   chan struct{}
+	doneReceiver chan struct{}
 
-	// wg tracks the I/O goroutine for clean shutdown.
+	// wg tracks both I/O goroutines for clean shutdown.
 	wg sync.WaitGroup
 
-	// ctx is a cancellable context used by the I/O goroutine for all
-	// WebSocket operations. Cancelled by stop() to unblock sendMessage
-	// and readAck if the server becomes unresponsive.
+	// ctx is a cancellable context used by both goroutines for all
+	// WebSocket operations. Cancelled by stop() or senderLoop (on
+	// clean drain) to unblock sendMessage/readAck if the server
+	// becomes unresponsive.
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// transport is the WebSocket connection used by the I/O goroutine.
+	// transport is the WebSocket connection shared by both goroutines.
+	// senderLoop and receiverLoop are single-writer / single-reader
+	// on the connection respectively.
 	transport *qwpTransport
 }
 
-// newQwpAsyncState creates async state with the given in-flight window size.
-// The send channel is buffered to the window size so the user goroutine
-// can enqueue without blocking until the window is full.
+// newQwpAsyncState creates async state with the given in-flight window
+// size. The send channel is buffered to the window size so the user
+// goroutine can enqueue without blocking until the window is full.
 func newQwpAsyncState(maxWindow int, transport *qwpTransport) *qwpAsyncState {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &qwpAsyncState{
-		sendCh:      make(chan qwpAsyncBatch, maxWindow),
-		inFlightMax: maxWindow,
-		done:        make(chan struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
-		transport:   transport,
+		sendCh:           make(chan qwpAsyncBatch, maxWindow),
+		inFlightMax:      maxWindow,
+		ackedSequence:    -1,
+		lastSentSequence: -1,
+		doneSender:       make(chan struct{}),
+		doneReceiver:     make(chan struct{}),
+		ctx:              ctx,
+		cancel:           cancel,
+		transport:        transport,
 	}
 	a.cond = sync.NewCond(&a.mu)
 	return a
@@ -164,10 +190,10 @@ func (a *qwpAsyncState) startCtxWatcher(ctx context.Context) chan struct{} {
 	return cancelWatch
 }
 
-// releaseSlot decrements the in-flight count and wakes waiters.
-// Called by the I/O goroutine after receiving an ACK. Uses Signal
-// instead of Broadcast because only one waiter can proceed per slot
-// release (the single user goroutine in acquireSlot or waitEmpty).
+// releaseSlot decrements inFlightCount by one and wakes a waiter.
+// Used when a batch never reaches the wire: either the user goroutine
+// cancelled its enqueue after acquireSlot, or senderLoop drained a
+// batch without sending it (send failed or shutting down).
 func (a *qwpAsyncState) releaseSlot() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -176,6 +202,32 @@ func (a *qwpAsyncState) releaseSlot() {
 		a.inFlightCount--
 	}
 	a.cond.Signal()
+}
+
+// releaseSlotsUpTo processes a cumulative ACK: advances ackedSequence
+// to the given sequence and releases (delta) slots, where delta counts
+// the batches newly acknowledged. Returns a protocol error if the
+// server acknowledged more batches than were sent. Called only by
+// receiverLoop.
+func (a *qwpAsyncState) releaseSlotsUpTo(seq int64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if seq <= a.ackedSequence {
+		// Stale or duplicate ACK — Java absorbs and keeps reading.
+		return nil
+	}
+	if seq >= a.nextSequence {
+		return fmt.Errorf(
+			"qwp: server acknowledged sequence %d but only %d batches sent",
+			seq, a.nextSequence,
+		)
+	}
+	delta := int(seq - a.ackedSequence)
+	a.ackedSequence = seq
+	a.inFlightCount -= delta
+	a.cond.Broadcast()
+	return nil
 }
 
 // setError records the first I/O error and wakes all waiters.
@@ -230,7 +282,7 @@ func (a *qwpAsyncState) waitEmpty(ctx context.Context) error {
 	return a.ioErr
 }
 
-// markStopped signals that the I/O goroutine has exited.
+// markStopped signals that both I/O goroutines have exited.
 func (a *qwpAsyncState) markStopped() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -239,99 +291,161 @@ func (a *qwpAsyncState) markStopped() {
 	a.cond.Broadcast()
 }
 
-// ioLoop is the I/O goroutine. It reads encoded batches from sendCh,
-// sends them over the WebSocket, reads ACKs, and updates flow control.
-func (a *qwpAsyncState) ioLoop() {
+// senderLoop consumes batches from sendCh, transmits them over the
+// WebSocket, and assigns sequence numbers. It never blocks on ACKs;
+// that is receiverLoop's job. Exits when sendCh is closed.
+func (a *qwpAsyncState) senderLoop() {
 	defer a.wg.Done()
-	defer a.markStopped()
-	defer close(a.done)
+	defer close(a.doneSender)
 
 	for batch := range a.sendCh {
-		// Send the batch over the WebSocket. Uses the cancellable
-		// context so stop() can unblock this if the server hangs.
-		if err := a.transport.sendMessage(a.ctx, batch.data); err != nil {
-			// Signal encoder ready even on failure so the user
-			// goroutine doesn't deadlock waiting for the encoder.
+		a.mu.Lock()
+		drop := a.ioErr != nil || a.ctx.Err() != nil
+		a.mu.Unlock()
+
+		if drop {
+			// Already failing or shutting down — drain without sending.
 			if batch.readySignal != nil {
 				batch.readySignal <- struct{}{}
 			}
-			a.setError(fmt.Errorf("qwp: async send failed: %w", err))
-			// Drain remaining batches from channel to unblock senders.
-			for b := range a.sendCh {
-				if b.readySignal != nil {
-					b.readySignal <- struct{}{}
-				}
-				a.releaseSlot()
-			}
-			return
+			a.releaseSlot()
+			continue
 		}
 
-		// Encoder buffer has been written to the socket — safe to
-		// reuse now. Signal before readAck to maximize concurrency.
+		if err := a.transport.sendMessage(a.ctx, batch.data); err != nil {
+			// Signal encoder buffer as reusable so the user goroutine
+			// does not deadlock on encoder handoff.
+			if batch.readySignal != nil {
+				batch.readySignal <- struct{}{}
+			}
+			a.releaseSlot()
+			a.setError(fmt.Errorf("qwp: async send failed: %w", err))
+			continue
+		}
+
+		// Send succeeded — the encoder buffer is safe to reuse.
 		if batch.readySignal != nil {
 			batch.readySignal <- struct{}{}
 		}
+		a.mu.Lock()
+		a.nextSequence++
+		a.mu.Unlock()
+	}
 
-		// Read the ACK.
-		status, ackData, err := a.transport.readAck(a.ctx)
-		if err != nil {
-			a.setError(fmt.Errorf("qwp: async ACK read failed: %w", err))
-			for b := range a.sendCh {
-				if b.readySignal != nil {
-					b.readySignal <- struct{}{}
-				}
-				a.releaseSlot()
-			}
-			return
-		}
+	// sendCh has been closed and drained. Record the highest
+	// sequence actually sent so receiverLoop can decide when to
+	// exit, and wake it if it is currently blocked in readAck but
+	// has no more ACKs to process. If nothing was sent at all,
+	// lastSentSequence stays -1 and the receiver exits immediately.
+	a.mu.Lock()
+	a.lastSentSequence = a.nextSequence - 1
+	a.senderDone = true
+	caughtUp := a.ackedSequence >= a.lastSentSequence
+	a.cond.Broadcast()
+	a.mu.Unlock()
 
-		if status != qwpStatusOK {
-			qErr := newQwpErrorFromAck(ackData)
-			if qErr == nil {
-				qErr = &QwpError{Status: status, Message: "unknown error"}
-			}
-			a.setError(qErr)
-			for b := range a.sendCh {
-				if b.readySignal != nil {
-					b.readySignal <- struct{}{}
-				}
-				a.releaseSlot()
-			}
-			return
-		}
-
-		// ACK success — release the slot.
-		a.releaseSlot()
+	if caughtUp {
+		a.cancel()
 	}
 }
 
-// start launches the I/O goroutine.
-func (a *qwpAsyncState) start() {
-	a.wg.Add(1)
-	go a.ioLoop()
+// receiverLoop reads ACKs from the WebSocket and releases in-flight
+// slots. Matches Java's cumulative-ACK semantics: a single ACK with
+// sequence N releases (N - ackedSequence) slots.
+//
+// Exits when (a) senderLoop has finished AND ackedSequence has caught
+// up to lastSentSequence, (b) ioErr has been set by either loop, or
+// (c) readAck returns an error because ctx was cancelled.
+func (a *qwpAsyncState) receiverLoop() {
+	defer a.wg.Done()
+	defer close(a.doneReceiver)
+
+	for {
+		a.mu.Lock()
+		if a.ioErr != nil {
+			a.mu.Unlock()
+			return
+		}
+		if a.senderDone && a.ackedSequence >= a.lastSentSequence {
+			a.mu.Unlock()
+			return
+		}
+		a.mu.Unlock()
+
+		status, data, err := a.transport.readAck(a.ctx)
+		if err != nil {
+			// Distinguish a clean shutdown (ctx cancelled once the
+			// sender has drained and the receiver has nothing more
+			// to wait for) from a real I/O failure.
+			a.mu.Lock()
+			draining := a.senderDone && a.ackedSequence >= a.lastSentSequence
+			a.mu.Unlock()
+			if !draining {
+				a.setError(fmt.Errorf("qwp: async ack read failed: %w", err))
+			}
+			return
+		}
+
+		seq := parseAckSequence(data)
+
+		if status != qwpStatusOK {
+			qErr := newQwpErrorFromAck(data)
+			if qErr == nil {
+				qErr = &QwpError{Status: status, Sequence: seq, Message: "unknown error"}
+			}
+			a.setError(qErr)
+			return
+		}
+
+		if err := a.releaseSlotsUpTo(seq); err != nil {
+			a.setError(err)
+			return
+		}
+	}
 }
 
-// stop closes the send channel and waits for the I/O goroutine to
-// exit. If the goroutine doesn't finish within the grace period
-// (e.g., stuck on an unresponsive server), the I/O context is
-// cancelled to force exit. Must be called exactly once.
+// start launches the sender and receiver goroutines.
+func (a *qwpAsyncState) start() {
+	a.wg.Add(2)
+	go a.senderLoop()
+	go a.receiverLoop()
+	go func() {
+		a.wg.Wait()
+		a.markStopped()
+	}()
+}
+
+// stop closes the send channel and waits for both I/O goroutines to
+// exit. If they do not finish within the grace period (e.g., stuck
+// on an unresponsive server), the I/O context is cancelled to force
+// them out. Must be called exactly once.
 func (a *qwpAsyncState) stop(gracePeriod time.Duration) {
-	// Signal no more batches.
 	close(a.sendCh)
 
-	// Wait for the goroutine to finish processing remaining batches.
-	// If it's stuck on a network operation, cancel the I/O context
-	// after the grace period to force it to exit.
+	// Wait for senderLoop to drain and exit, then for receiverLoop
+	// to catch up and exit. senderLoop self-cancels the I/O context
+	// if it observes the receiver already caught up, so in the
+	// normal case we do not have to force anything.
+	timer := time.NewTimer(gracePeriod)
+	defer timer.Stop()
+
 	select {
-	case <-a.done:
-		// Normal exit — goroutine finished processing all batches.
-	case <-time.After(gracePeriod):
-		// Goroutine is stuck — cancel the I/O context to unblock
-		// sendMessage or readAck.
+	case <-a.doneSender:
+	case <-timer.C:
 		a.cancel()
-		<-a.done
+		<-a.doneSender
+		<-a.doneReceiver
+		a.wg.Wait()
+		return
+	}
+
+	select {
+	case <-a.doneReceiver:
+	case <-timer.C:
+		a.cancel()
+		<-a.doneReceiver
 	}
 
 	a.wg.Wait()
-	a.cancel() // Ensure context is always cleaned up (idempotent).
+	a.cancel() // idempotent; ensures context is always cleaned up
 }

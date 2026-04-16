@@ -53,8 +53,8 @@ type QwpError struct {
 	// Status is the status code from the ACK response.
 	Status qwpStatusCode
 
-	// Sequence is the sequence number from the ACK, used to
-	// correlate responses with requests in async mode.
+	// Sequence is the cumulative sequence number from the ACK, used
+	// to correlate responses with requests in async mode.
 	Sequence int64
 
 	// Message is the server's error description, or empty if
@@ -71,18 +71,17 @@ func (e *QwpError) Error() string {
 	return fmt.Sprintf("qwp: server error %s (0x%02X)", name, byte(e.Status))
 }
 
-// newQwpErrorFromAck creates a QwpError from a raw ACK response
-// payload. Returns nil if the status is OK.
+// newQwpErrorFromAck creates a QwpError from a raw ACK payload.
+// Returns nil if the status is OK.
+//
+// Precondition: data has already been validated by readAck, which
+// guarantees qwpAckOKSize bytes for OK status and at least
+// qwpAckErrorHeaderSize + msg_len bytes for non-OK statuses.
 func newQwpErrorFromAck(data []byte) *QwpError {
-	if len(data) < 1 {
-		return &QwpError{Message: "empty ACK response"}
-	}
-
 	status := qwpStatusCode(data[0])
 	if status == qwpStatusOK {
 		return nil
 	}
-
 	return &QwpError{
 		Status:   status,
 		Sequence: parseAckSequence(data),

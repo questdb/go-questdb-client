@@ -253,33 +253,28 @@ func (t *qwpTransport) readAck(ctx context.Context) (qwpStatusCode, []byte, erro
 	return statusCode, data, nil
 }
 
-// parseAckError extracts an error message from an ACK response
-// payload. The layout is:
+// parseAckError extracts an error message from a non-OK ACK payload.
+// The layout is:
 //
 //	[statusCode: uint8] [sequence: int64 LE] [errorLength: uint16 LE] [errorMessage: UTF-8]
 //
-// The error length and message are only present for non-OK statuses.
-// Returns empty string if no error message is present.
+// Precondition: data has already been validated by readAck, which
+// guarantees at least qwpAckErrorHeaderSize bytes for non-OK statuses
+// and that the trailing bytes match the declared errorLength.
 func parseAckError(data []byte) string {
-	// data[0] = status, data[1:9] = sequence, data[9:11] = errLen.
-	const errLenOffset = 9   // 1 (status) + 8 (sequence)
-	const errMsgOffset = 11  // errLenOffset + 2 (uint16)
-	if len(data) < errMsgOffset {
-		return ""
-	}
+	const errLenOffset = 9  // 1 (status) + 8 (sequence)
+	const errMsgOffset = 11 // errLenOffset + 2 (uint16)
 	errLen := int(binary.LittleEndian.Uint16(data[errLenOffset:errMsgOffset]))
-	if len(data) < errMsgOffset+errLen {
-		return ""
-	}
 	return string(data[errMsgOffset : errMsgOffset+errLen])
 }
 
-// parseAckSequence extracts the sequence number from an ACK
-// response. Returns 0 if the response is too short.
+// parseAckSequence extracts the cumulative sequence number from an
+// ACK payload. The wire field is signed (int64 LE) and uses -1 as
+// a sentinel; matches Java's long semantics.
+//
+// Precondition: data has already been validated by readAck, which
+// guarantees at least qwpAckOKSize bytes.
 func parseAckSequence(data []byte) int64 {
-	if len(data) < 9 {
-		return 0
-	}
 	return int64(binary.LittleEndian.Uint64(data[1:9]))
 }
 
