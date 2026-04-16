@@ -186,14 +186,3 @@ func qwpFixedTypeSize(tc qwpTypeCode) int {
 	}
 }
 
-// qwpIsFixedWidthType reports whether the given type code is a
-// fixed-width type (not bit-packed and not variable-width).
-func qwpIsFixedWidthType(tc qwpTypeCode) bool {
-	return qwpFixedTypeSize(tc) > 0
-}
-
-// qwpIsDecimalType reports whether the given type code is a decimal type
-// that carries a scale byte at the start of its column data section.
-func qwpIsDecimalType(tc qwpTypeCode) bool {
-	return tc == qwpTypeDecimal64 || tc == qwpTypeDecimal128 || tc == qwpTypeDecimal256
-}
