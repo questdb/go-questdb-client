@@ -134,6 +134,11 @@ const (
 	// client does not enforce a hard cap.
 	qwpMaxColumnsPerTable = 2048
 
+	// qwpMaxTablesPerBatch is the hard upper bound on distinct tables
+	// in a single QWP message: the wire format encodes the table count
+	// as uint16.
+	qwpMaxTablesPerBatch = 0xFFFF
+
 	// qwpDefaultInitRecvBufSize is the initial capacity of the ACK
 	// receive buffer. Go-only; the Java client manages the read path
 	// differently and has no direct counterpart.

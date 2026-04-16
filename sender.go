@@ -745,6 +745,7 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			inFlightWindow:          qwpDefaultInFlightWindow,
 			maxSchemasPerConnection: qwpDefaultMaxSchemasPerConnection,
 			initBufSize:             defaultInitBufferSize,
+			maxBufSize:              defaultMaxBufferSize,
 			fileNameLimit:           defaultFileNameLimit,
 		}
 	default:
@@ -840,6 +841,12 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	}
 	if conf.minThroughput != 0 {
 		return errors.New("minThroughput setting is not available in the QWP client")
+	}
+	if conf.httpTransport != nil {
+		return errors.New("httpTransport setting is not available in the QWP client")
+	}
+	if conf.tcpKeyId != "" || conf.tcpKey != "" {
+		return errors.New("TCP auth settings (tcpKeyId/tcpKey) are not available in the QWP client")
 	}
 	// QWP auth: either Basic (user+pass) or Bearer (token), not both.
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {

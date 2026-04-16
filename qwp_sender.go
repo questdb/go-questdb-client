@@ -907,6 +907,13 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
 		if tb.rowCount == 0 {
 			continue
 		}
+		// QWP wire format encodes table count as uint16.
+		if len(s.encodeInfoBuf) == qwpMaxTablesPerBatch {
+			return nil, fmt.Errorf(
+				"qwp: too many tables in one batch: exceeded %d",
+				qwpMaxTablesPerBatch,
+			)
+		}
 		if tb.schemaId < 0 {
 			if s.maxSchemasPerConnection > 0 && s.nextSchemaId >= s.maxSchemasPerConnection {
 				return nil, fmt.Errorf(

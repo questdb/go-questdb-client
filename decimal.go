@@ -283,12 +283,16 @@ parseExponent:
 		if i >= len(text) {
 			return Decimal{}, fmt.Errorf("decimal literal has incomplete exponent")
 		}
+		const maxExp = 1_000_000
 		exp := 0
 		for i < len(text) {
 			if text[i] < '0' || text[i] > '9' {
 				return Decimal{}, fmt.Errorf("decimal literal exponent has invalid character")
 			}
 			exp = exp*10 + int(text[i]-'0')
+			if exp > maxExp {
+				return Decimal{}, fmt.Errorf("decimal literal exponent is too large")
+			}
 			i++
 		}
 		if expNeg {
@@ -313,7 +317,9 @@ buildDecimal:
 	}
 
 	unscaled := new(big.Int)
-	unscaled.SetString(string(digits), 10)
+	if _, ok := unscaled.SetString(string(digits), 10); !ok {
+		return Decimal{}, fmt.Errorf("decimal literal has invalid digits")
+	}
 	if negative {
 		unscaled.Neg(unscaled)
 	}

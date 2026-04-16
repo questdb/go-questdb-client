@@ -41,6 +41,8 @@ const (
 	qwpTestPollPeriod = 100 * time.Millisecond
 )
 
+var qwpTestHTTPClient = &http.Client{Timeout: qwpTestWaitPeriod}
+
 // qwpTableResult holds query results from QuestDB's /exec endpoint.
 type qwpTableResult struct {
 	Columns []qwpColumnInfo  `json:"columns"`
@@ -76,7 +78,7 @@ func qwpDropTable(t *testing.T, tableName string) {
 	params.Add("query", "DROP TABLE IF EXISTS '"+tableName+"';")
 	u.RawQuery = params.Encode()
 
-	resp, err := http.Get(u.String())
+	resp, err := qwpTestHTTPClient.Get(u.String())
 	if err != nil {
 		t.Logf("warning: could not drop table %q: %v", tableName, err)
 		return
@@ -93,7 +95,7 @@ func qwpQuery(t *testing.T, query string) qwpTableResult {
 	params.Add("query", query)
 	u.RawQuery = params.Encode()
 
-	resp, err := http.Get(u.String())
+	resp, err := qwpTestHTTPClient.Get(u.String())
 	if err != nil {
 		t.Fatalf("query failed: %v", err)
 	}

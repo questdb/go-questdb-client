@@ -944,6 +944,7 @@ func (tb *qwpTableBuffer) recomputeDataSize() {
 		size += len(col.arrayData)
 		size += len(col.symbolIDs) * 4
 		size += len(col.strOffsets) * 4
+		size += len(col.arrayOffsets) * 4
 		size += len(col.nullBitmap)
 	}
 	tb.dataSize = size
