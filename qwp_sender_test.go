@@ -43,6 +43,7 @@ import (
 func newQwpTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			t.Logf("websocket accept error: %v", err)
@@ -329,6 +330,7 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 	// Mock server that counts received messages.
 	msgCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -377,6 +379,7 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 	// Mock server that counts received messages.
 	msgCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1175,6 +1178,7 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 	// Track sent messages to verify delta dict content.
 	var messages [][]byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1266,6 +1270,7 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 
 func TestQwpSenderServerError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1316,6 +1321,7 @@ func TestQwpSenderAsyncBasic(t *testing.T) {
 	var mu sync.Mutex
 	msgCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1380,6 +1386,7 @@ func TestQwpSenderAsyncMultipleFlushes(t *testing.T) {
 	var mu sync.Mutex
 	msgCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1454,6 +1461,7 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 	// schema mode on first flush (not schema reference mode).
 	var messages [][]byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1678,6 +1686,7 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 	// connection. This test pins that invariant.
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1730,6 +1739,7 @@ func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
 	ackGate := make(chan struct{})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1832,6 +1842,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		var gotAuth string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotAuth = r.Header.Get("Authorization")
+			w.Header().Set(qwpHeaderVersion, "1")
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
@@ -1868,6 +1879,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		var gotAuth string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotAuth = r.Header.Get("Authorization")
+			w.Header().Set(qwpHeaderVersion, "1")
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
@@ -1904,6 +1916,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		var gotAuth string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotAuth = r.Header.Get("Authorization")
+			w.Header().Set(qwpHeaderVersion, "1")
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
@@ -1938,6 +1951,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		var gotAuth string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotAuth = r.Header.Get("Authorization")
+			w.Header().Set(qwpHeaderVersion, "1")
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
@@ -1977,6 +1991,7 @@ func TestQwpMaxBufSizeTriggersFlush(t *testing.T) {
 
 	var messageCount int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return

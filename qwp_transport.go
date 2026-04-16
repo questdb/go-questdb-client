@@ -161,15 +161,23 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		return fmt.Errorf("qwp: websocket dial: %w", err)
 	}
 
-	// Validate the server-selected QWP version. If absent, assume v1
-	// (spec §3: server may omit the header on v1). If present and not
-	// equal to our version, the server has chosen a version we don't
-	// speak — we'd get parse errors on every message, so fail fast.
-	if resp != nil {
-		if v := resp.Header.Get(qwpHeaderVersion); v != "" && v != fmt.Sprintf("%d", qwpVersion) {
-			conn.Close(websocket.StatusProtocolError, "version mismatch")
-			return fmt.Errorf("qwp: server selected protocol version %q, client supports %d", v, qwpVersion)
-		}
+	// Validate the server-selected QWP version. Require the header to
+	// be present and match our version — a missing header signals a
+	// non-QWP endpoint or a server that did not run the negotiation
+	// path, and a mismatched version means we'd get parse errors on
+	// every message. Fail fast in both cases to match the Java client.
+	if resp == nil {
+		conn.Close(websocket.StatusProtocolError, "no upgrade response")
+		return fmt.Errorf("qwp: no HTTP upgrade response available for version negotiation")
+	}
+	serverVersion := resp.Header.Get(qwpHeaderVersion)
+	if serverVersion == "" {
+		conn.Close(websocket.StatusProtocolError, "missing version header")
+		return fmt.Errorf("qwp: server did not return %s header", qwpHeaderVersion)
+	}
+	if serverVersion != fmt.Sprintf("%d", qwpVersion) {
+		conn.Close(websocket.StatusProtocolError, "version mismatch")
+		return fmt.Errorf("qwp: server selected protocol version %q, client supports %d", serverVersion, qwpVersion)
 	}
 
 	// Remove the default read limit — QWP ACKs are small but
@@ -319,6 +327,7 @@ func qwpFakeServer(conn net.Conn) {
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + accept + "\r\n" +
+		qwpHeaderVersion + ": " + fmt.Sprintf("%d", qwpVersion) + "\r\n" +
 		"\r\n"
 	if _, err := conn.Write([]byte(resp)); err != nil {
 		return

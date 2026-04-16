@@ -321,6 +321,7 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 	var received [][]byte
 	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -386,6 +387,7 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 	// Mock server that returns an error ACK on the second message.
 	msgCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -484,6 +486,7 @@ func TestQwpAsyncConcurrentAcquireRelease(t *testing.T) {
 func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 	// Verify the I/O goroutine exits cleanly after stop().
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -541,6 +544,7 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 func TestQwpAsyncCloseAfterError(t *testing.T) {
 	// Verify Close works correctly after an I/O error in async mode.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -587,6 +591,7 @@ func TestQwpAsyncCloseUnresponsiveServer(t *testing.T) {
 	defer close(blockForever)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return

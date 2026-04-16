@@ -165,6 +165,7 @@ func TestQwpTransportNotConnected(t *testing.T) {
 func newTestWSServer(t *testing.T, handler func(*websocket.Conn)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			t.Logf("websocket accept error: %v", err)
@@ -216,6 +217,7 @@ func TestQwpTransportNegotiationHeaders(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMaxVersion = r.Header.Get(qwpHeaderMaxVersion)
 		gotClientId = r.Header.Get(qwpHeaderClientId)
+		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -268,6 +270,39 @@ func TestQwpTransportVersionMatchAccepted(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	defer tr.close(context.Background())
+}
+
+// TestQwpTransportVersionMissingRejected verifies that a server response
+// without the X-QWP-Version header aborts the handshake. Matches the
+// Java client's fail-fast behavior on non-QWP endpoints.
+func TestQwpTransportVersionMissingRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{})
+	if err == nil {
+		tr.close(context.Background())
+		t.Fatal("expected missing-version error")
+	}
+	if !strings.Contains(err.Error(), qwpHeaderVersion) {
+		t.Fatalf("expected error mentioning %s, got: %v", qwpHeaderVersion, err)
+	}
+	if tr.conn != nil {
+		t.Fatal("conn should be nil after rejected handshake")
+	}
 }
 
 // TestQwpTransportVersionMismatchRejected verifies that a server response
