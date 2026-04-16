@@ -226,13 +226,6 @@ func (c *qwpColumnBuffer) appendU64(v uint64) {
 	c.trackDataGrowth(8)
 }
 
-func (c *qwpColumnBuffer) appendI64BE(v int64) {
-	n := len(c.fixedData)
-	c.fixedData = append(c.fixedData, 0, 0, 0, 0, 0, 0, 0, 0)
-	binary.BigEndian.PutUint64(c.fixedData[n:], uint64(v))
-	c.trackDataGrowth(8)
-}
-
 // --- per-type add methods -----------------------------------------------
 
 // addByte appends an int8 value (TYPE_BYTE).
