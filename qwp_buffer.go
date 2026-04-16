@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -950,3 +950,41 @@ func (tb *qwpTableBuffer) recomputeDataSize() {
 	tb.dataSize = size
 }
 
+// --- name validation ---
+
+// qwpValidateTableName validates a table name using the same rules
+// as the existing ILP buffer.
+func qwpValidateTableName(name string, limit int) error {
+	if name == "" {
+		return fmt.Errorf("qwp: table name cannot be empty")
+	}
+	if limit > 0 && len(name) > limit {
+		return fmt.Errorf("qwp: table name length %d exceeds limit %d", len(name), limit)
+	}
+	if name[0] == '.' || name[len(name)-1] == '.' {
+		return fmt.Errorf("qwp: table name %q cannot start or end with '.'", name)
+	}
+	for i := 0; i < len(name); i++ {
+		if illegalTableNameChar(name[i]) {
+			return fmt.Errorf("qwp: table name %q contains illegal character", name)
+		}
+	}
+	return nil
+}
+
+// qwpValidateColumnName validates a column name using the same
+// rules as the existing ILP buffer.
+func qwpValidateColumnName(name string, limit int) error {
+	if name == "" {
+		return fmt.Errorf("qwp: column name cannot be empty")
+	}
+	if limit > 0 && len(name) > limit {
+		return fmt.Errorf("qwp: column name length %d exceeds limit %d", len(name), limit)
+	}
+	for i := 0; i < len(name); i++ {
+		if illegalColumnNameChar(name[i]) {
+			return fmt.Errorf("qwp: column name %q contains illegal character", name)
+		}
+	}
+	return nil
+}

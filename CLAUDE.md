@@ -180,12 +180,12 @@ Non-obvious behaviors:
 ### Connection pooling
 
 `sender_pool.go` provides `LineSenderPool` (`PoolFromConf`,
-`NewLineSenderPool`). It is HTTP-only by design — constructors reject
-TCP configs with `errHttpOnlySender`. QWP has its own in-flight-window
-concurrency model and does not participate in the pool. The HTTP
-transport itself is shared across all `httpLineSender*` instances via
-the `globalTransport` singleton, which closes idle connections when the
-last sender is released.
+`NewLineSenderPool`). It is HTTP-only by design — non-HTTP configs
+(TCP/TCPS and WS/WSS) are rejected with `errHttpOnlySender`. QWP has
+its own in-flight-window concurrency model and does not participate in
+the pool. The HTTP transport itself is shared across all
+`httpLineSender*` instances via the `globalTransport` singleton, which
+closes idle connections when the last sender is released.
 
 ### Value types
 

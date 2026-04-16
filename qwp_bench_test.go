@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -132,16 +132,13 @@ func BenchmarkQwpFlush(b *testing.B) {
 	}
 }
 
-// BenchmarkQwpSenderSteadyState measures the full sender hot path:
-// Table/Symbol/columns/At for 10 rows, then encode + reset.
-// This exercises the complete pipeline (sender methods → columnar
-// buffers → encoder) without network I/O. Target: 0 allocs/op
-// after warmup, proving the hot path is allocation-free.
-func BenchmarkQwpSenderSteadyState(b *testing.B) {
+// qwpSteadyStateSetup returns a warmed qwpLineSender plus the iteration
+// closure that both BenchmarkQwpSenderSteadyState and
+// TestQwpSenderSteadyStateZeroAllocs exercise.
+func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 	ctx := context.Background()
 	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	// Create a sender with auto-flush disabled (no network).
 	s := &qwpLineSender{
 		tableBuffers:     make(map[string]*qwpTableBuffer),
 		globalSymbols:    make(map[string]int32),
@@ -152,13 +149,11 @@ func BenchmarkQwpSenderSteadyState(b *testing.B) {
 		batchMaxSchemaId: -1,
 	}
 
-	// Pre-populate the symbol dictionary (warmup).
 	s.globalSymbols["AAPL"] = 0
 	s.globalSymbolList = append(s.globalSymbolList, "AAPL")
 	s.batchMaxSymbolId = 0
 
-	// Warmup: 2 flushes with 10 rows each to grow all backing buffers.
-	for flush := 0; flush < 2; flush++ {
+	iter := func() {
 		for r := 0; r < 10; r++ {
 			s.Table("t").
 				Symbol("sym", "AAPL").
@@ -174,32 +169,39 @@ func BenchmarkQwpSenderSteadyState(b *testing.B) {
 			s.maxSentSymbolId,
 			s.batchMaxSymbolId,
 		)
-		// Mark schema as sent so subsequent flushes use reference mode.
 		if s.batchMaxSchemaId > s.maxSentSchemaId {
 			s.maxSentSchemaId = s.batchMaxSchemaId
 		}
 		s.resetAfterFlush()
 	}
 
+	// Warmup: 2 flushes to grow all backing buffers.
+	iter()
+	iter()
+	return s, iter
+}
+
+// BenchmarkQwpSenderSteadyState measures the full sender hot path:
+// Table/Symbol/columns/At for 10 rows, then encode + reset.
+// This exercises the complete pipeline (sender methods → columnar
+// buffers → encoder) without network I/O. Target: 0 allocs/op
+// after warmup, proving the hot path is allocation-free.
+func BenchmarkQwpSenderSteadyState(b *testing.B) {
+	_, iter := qwpSteadyStateSetup()
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		for r := 0; r < 10; r++ {
-			s.Table("t").
-				Symbol("sym", "AAPL").
-				Int64Column("qty", int64(100+r)).
-				Float64Column("price", 150.5+float64(r)).
-				StringColumn("note", "test").
-				At(ctx, ts.Add(time.Duration(r)*time.Microsecond))
-		}
-		tables, _ := s.buildTableEncodeInfo()
-		s.encoders[0].encodeMultiTableWithDeltaDict(
-			tables,
-			s.globalSymbolList,
-			s.maxSentSymbolId,
-			s.batchMaxSymbolId,
-		)
-		s.resetAfterFlush()
+		iter()
+	}
+}
+
+// TestQwpSenderSteadyStateZeroAllocs pins the 0-allocs/op invariant
+// programmatically so the invariant survives refactors without a
+// developer having to read the benchmark output.
+func TestQwpSenderSteadyStateZeroAllocs(t *testing.T) {
+	_, iter := qwpSteadyStateSetup()
+	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
+		t.Fatalf("steady-state allocs/op = %g, want 0", allocs)
 	}
 }
 

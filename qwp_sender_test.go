@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -373,6 +373,7 @@ func TestQwpSenderClosedOperations(t *testing.T) {
 
 func TestQwpSenderAutoFlushRows(t *testing.T) {
 	// Mock server that counts received messages.
+	var mu sync.Mutex
 	msgCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
@@ -388,7 +389,9 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 			if err != nil {
 				return
 			}
+			mu.Lock()
 			msgCount++
+			mu.Unlock()
 			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
 			seq++
 		}
@@ -412,8 +415,11 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 	}
 
 	// Auto-flush should have triggered at row 3.
-	if msgCount != 1 {
-		t.Fatalf("auto-flush messages = %d, want 1", msgCount)
+	mu.Lock()
+	gotMsgCount := msgCount
+	mu.Unlock()
+	if gotMsgCount != 1 {
+		t.Fatalf("auto-flush messages = %d, want 1", gotMsgCount)
 	}
 	if s.pendingRowCount != 2 {
 		t.Fatalf("pendingRowCount = %d, want 2", s.pendingRowCount)
@@ -422,7 +428,13 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 
 func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 	// Mock server that counts received messages.
+	var mu sync.Mutex
 	msgCount := 0
+	readMsgCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return msgCount
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
@@ -437,7 +449,9 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 			if err != nil {
 				return
 			}
+			mu.Lock()
 			msgCount++
+			mu.Unlock()
 			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
 			seq++
 		}
@@ -457,8 +471,8 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("row 1: %v", err)
 	}
-	if msgCount != 0 {
-		t.Fatalf("after row 1: msgCount = %d, want 0", msgCount)
+	if got := readMsgCount(); got != 0 {
+		t.Fatalf("after row 1: msgCount = %d, want 0", got)
 	}
 	if s.pendingRowCount != 1 {
 		t.Fatalf("after row 1: pendingRowCount = %d, want 1", s.pendingRowCount)
@@ -472,8 +486,8 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("row 2: %v", err)
 	}
-	if msgCount != 1 {
-		t.Fatalf("after row 2: msgCount = %d, want 1 (time-based flush)", msgCount)
+	if got := readMsgCount(); got != 1 {
+		t.Fatalf("after row 2: msgCount = %d, want 1 (time-based flush)", got)
 	}
 	if s.pendingRowCount != 0 {
 		t.Fatalf("after row 2: pendingRowCount = %d, want 0", s.pendingRowCount)
@@ -1589,6 +1603,12 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 // the schema mode byte for each table block. It skips the header,
 // delta dict, and then for each table: extracts the schema mode and
 // skips the rest of the table block.
+//
+// Precondition: every table in the message has exactly one non-null
+// LONG column. In full mode the helper asserts the type byte; in
+// reference mode the caller is responsible for maintaining the same
+// shape across flushes. The only caller today is
+// TestQwpSenderSchemaIdPerTable, which uses Int64Column("x", ...).
 func extractAllSchemaModes(t *testing.T, msg []byte) []byte {
 	t.Helper()
 	if len(msg) < qwpHeaderSize {
@@ -1616,12 +1636,16 @@ func extractAllSchemaModes(t *testing.T, msg []byte) []byte {
 		// Skip table name.
 		nameLen, n, _ := qwpReadVarint(msg[off:])
 		off += n + int(nameLen)
-		// Skip rowCount.
-		_, n, _ = qwpReadVarint(msg[off:])
+		// Row count — needed to size the column data skip.
+		rowCount, n, _ := qwpReadVarint(msg[off:])
 		off += n
-		// Read colCount (needed to skip column data).
+		// Column count.
 		colCount, n, _ := qwpReadVarint(msg[off:])
 		off += n
+		if colCount != 1 {
+			t.Fatalf("table %d: colCount=%d, helper only supports 1 column",
+				ti, colCount)
+		}
 		// Schema mode byte.
 		schemaMode := msg[off]
 		modes = append(modes, schemaMode)
@@ -1631,28 +1655,23 @@ func extractAllSchemaModes(t *testing.T, msg []byte) []byte {
 		off += n
 
 		if schemaMode == byte(qwpSchemaModeFull) {
-			// Skip full schema: colCount × (name string + type byte)
-			for c := uint64(0); c < colCount; c++ {
-				slen, n, _ := qwpReadVarint(msg[off:])
-				off += n + int(slen) + 1 // name + type byte
+			// Full schema: name string + type byte.
+			slen, n, _ := qwpReadVarint(msg[off:])
+			off += n + int(slen)
+			if tc := qwpTypeCode(msg[off]); tc != qwpTypeLong {
+				t.Fatalf("table %d: column type=0x%02X, helper only supports qwpTypeLong",
+					ti, tc)
 			}
+			off++
 		}
 
-		// Skip column data. For simplicity, we consume the rest
-		// up to the next table or end of message. Since we only
-		// need schema modes, skip to the end if last table.
-		// This is a test helper, so we just return what we have.
-		// For a precise skip, we'd need full column type parsing.
-		if ti < tableCount-1 {
-			// We need to skip column data to find the next table.
-			// For test purposes with simple 1-column tables:
-			// null flag (1) + column data (varies by type).
-			// This helper assumes the tests use simple types.
-			// Skip remaining bytes until we find the next table name.
-			// A more robust approach: skip per-column based on type.
-			// For now, skip based on known test data: 1 LONG column.
-			off += 1 + 8 // null flag + 8-byte fixed value
+		// Column data: null bitmap flag (1 byte, asserted 0x00 = no
+		// nulls) followed by rowCount × 8 bytes for the LONG values.
+		if msg[off] != 0x00 {
+			t.Fatalf("table %d: null bitmap flag=0x%02X, helper requires non-null values",
+				ti, msg[off])
 		}
+		off += 1 + int(rowCount)*8
 	}
 
 	return modes
