@@ -58,8 +58,10 @@ type qwpAsyncState struct {
 	inFlightMax int
 
 	// nextSequence is the sequence number to assign to the next batch.
+	//lint:ignore U1000 sequence tracking pending
 	nextSequence uint64
 	// ackedSequence is the highest cumulative sequence ACKed by the server.
+	//lint:ignore U1000 sequence tracking pending
 	ackedSequence uint64
 
 	// ioErr is the first error from the I/O goroutine. Once set, all
