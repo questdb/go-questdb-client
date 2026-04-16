@@ -1540,69 +1540,6 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 	}
 }
 
-// extractSchemaMode parses a QWP message and returns the schema mode
-// byte. It skips the header, delta dict (if present), table name,
-// rowCount, and colCount to reach the schema mode byte.
-func extractSchemaMode(t *testing.T, msg []byte) byte {
-	t.Helper()
-	if len(msg) < qwpHeaderSize {
-		t.Fatalf("message too short: %d", len(msg))
-	}
-
-	off := qwpHeaderSize
-	flags := msg[qwpHeaderOffsetFlags]
-
-	// Skip delta dict if present.
-	if flags&qwpFlagDeltaSymbolDict != 0 {
-		// deltaStart varint
-		_, n, err := qwpReadVarint(msg[off:])
-		if err != nil {
-			t.Fatalf("read deltaStart: %v", err)
-		}
-		off += n
-
-		// deltaCount varint
-		deltaCount, n, err := qwpReadVarint(msg[off:])
-		if err != nil {
-			t.Fatalf("read deltaCount: %v", err)
-		}
-		off += n
-
-		// Skip delta symbol strings.
-		for i := uint64(0); i < deltaCount; i++ {
-			strLen, n, err := qwpReadVarint(msg[off:])
-			if err != nil {
-				t.Fatalf("read symbol len: %v", err)
-			}
-			off += n + int(strLen)
-		}
-	}
-
-	// Skip table name (varint string).
-	nameLen, n, err := qwpReadVarint(msg[off:])
-	if err != nil {
-		t.Fatalf("read table name len: %v", err)
-	}
-	off += n + int(nameLen)
-
-	// Skip rowCount varint.
-	_, n, err = qwpReadVarint(msg[off:])
-	if err != nil {
-		t.Fatalf("read rowCount: %v", err)
-	}
-	off += n
-
-	// Skip colCount varint.
-	_, n, err = qwpReadVarint(msg[off:])
-	if err != nil {
-		t.Fatalf("read colCount: %v", err)
-	}
-	off += n
-
-	// Schema mode byte.
-	return msg[off]
-}
-
 // extractAllSchemaModes parses a multi-table QWP message and returns
 // the schema mode byte for each table block. It skips the header,
 // delta dict, and then for each table: extracts the schema mode and
