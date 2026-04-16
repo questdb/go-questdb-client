@@ -101,15 +101,8 @@ const (
 //
 // Values are aligned with the Java client (io.questdb.client.cutlass.qwp)
 // unless marked Go-only. The Java analogue is noted on each constant so
-// the two clients can be kept in lockstep. These are not all honored by
-// the sender yet — wiring follows in a later change.
+// the two clients can be kept in lockstep.
 const (
-	// qwpDefaultAutoFlushBytes is the byte-size trigger for auto-flush.
-	// A value of 0 disables the byte-based trigger.
-	// Java: QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES = 0.
-	//lint:ignore U1000 auto-flush wiring pending
-	qwpDefaultAutoFlushBytes = 0
-
 	// qwpDefaultAutoFlushInterval is the time trigger for auto-flush.
 	// Java: QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100 ms.
 	qwpDefaultAutoFlushInterval = 100 * time.Millisecond
@@ -136,20 +129,6 @@ const (
 	// size used to coalesce rows before a WebSocket frame is sent.
 	// Java: QwpWebSocketSender.DEFAULT_MICROBATCH_BUFFER_SIZE = 1 MB.
 	qwpDefaultMicrobatchBufSize = 1 * 1024 * 1024 // 1 MB
-
-	// qwpMaxTableNameLength caps table-name length. Honored by the
-	// shared lineSenderConfig.fileNameLimit (defaultFileNameLimit in
-	// sender.go), enforced in qwpValidateTableName.
-	// Java: QwpWebSocketSender.MAX_TABLE_NAME_LENGTH = 127.
-	//lint:ignore U1000 default wiring pending
-	qwpMaxTableNameLength = 127
-
-	// qwpMaxColumnNameLength caps column-name length. Honored by the
-	// same lineSenderConfig.fileNameLimit, enforced in
-	// qwpValidateColumnName.
-	// Java: QwpTableBuffer.MAX_COLUMN_NAME_LENGTH = 127.
-	//lint:ignore U1000 default wiring pending
-	qwpMaxColumnNameLength = 127
 
 	// qwpMaxColumnsPerTable caps columns per table. Go-only; the Java
 	// client does not enforce a hard cap.
