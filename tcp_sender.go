@@ -28,6 +28,7 @@ import (
 	"bufio"
 	"context"
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -74,11 +75,23 @@ func newTcpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, 
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode auth key: %v", err)
 		}
-		// TODO(puzpuzpuz): migrate to crypto/ecdh one we don't need to support Go 1.19
-		key = new(ecdsa.PrivateKey)
-		key.PublicKey.Curve = elliptic.P256()
-		key.PublicKey.X, key.PublicKey.Y = key.PublicKey.Curve.ScalarBaseMult(rawKey)
-		key.D = new(big.Int).SetBytes(rawKey)
+		// Derive the P-256 public key via crypto/ecdh, which also
+		// validates the raw scalar. The public key encoding is the
+		// uncompressed SEC1 form: 0x04 || X (32 bytes) || Y (32 bytes).
+		ecdhPriv, err := ecdh.P256().NewPrivateKey(rawKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse auth key: %v", err)
+		}
+		pub := ecdhPriv.PublicKey().Bytes()
+		half := (len(pub) - 1) / 2
+		key = &ecdsa.PrivateKey{
+			PublicKey: ecdsa.PublicKey{
+				Curve: elliptic.P256(),
+				X:     new(big.Int).SetBytes(pub[1 : 1+half]),
+				Y:     new(big.Int).SetBytes(pub[1+half:]),
+			},
+			D: new(big.Int).SetBytes(rawKey),
+		}
 	}
 
 	if conf.tlsMode == tlsDisabled {
