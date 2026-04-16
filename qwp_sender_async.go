@@ -103,10 +103,22 @@ func newQwpAsyncState(maxWindow int, transport *qwpTransport) *qwpAsyncState {
 }
 
 // acquireSlot blocks until there is space in the in-flight window.
-// Returns an error if the I/O goroutine has failed.
-func (a *qwpAsyncState) acquireSlot() error {
+// Returns ctx.Err() if ctx is cancelled during the wait, or the I/O
+// goroutine's error if it has failed. Mirrors the Java client's
+// InFlightWindow.addInFlight, which checks Thread.interrupt() during
+// its park-spin.
+func (a *qwpAsyncState) acquireSlot(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// Watcher goroutine is spawned lazily on the first cond.Wait so
+	// the fast path (slot immediately available) pays no overhead.
+	var watchCancel chan struct{}
+	defer func() {
+		if watchCancel != nil {
+			close(watchCancel)
+		}
+	}()
 
 	for a.inFlightCount >= a.inFlightMax {
 		if a.ioErr != nil {
@@ -114,6 +126,12 @@ func (a *qwpAsyncState) acquireSlot() error {
 		}
 		if a.stopped {
 			return fmt.Errorf("qwp: async I/O goroutine stopped")
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if watchCancel == nil {
+			watchCancel = a.startCtxWatcher(ctx)
 		}
 		a.cond.Wait()
 	}
@@ -124,6 +142,24 @@ func (a *qwpAsyncState) acquireSlot() error {
 
 	a.inFlightCount++
 	return nil
+}
+
+// startCtxWatcher launches a goroutine that Broadcasts on the cond
+// when ctx is cancelled, so a caller in cond.Wait() wakes up and
+// can return ctx.Err(). The returned channel stops the watcher —
+// close it after exiting the wait loop.
+func (a *qwpAsyncState) startCtxWatcher(ctx context.Context) chan struct{} {
+	cancelWatch := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			a.mu.Lock()
+			a.cond.Broadcast()
+			a.mu.Unlock()
+		case <-cancelWatch:
+		}
+	}()
+	return cancelWatch
 }
 
 // releaseSlot decrements the in-flight count and wakes waiters.
@@ -160,10 +196,18 @@ func (a *qwpAsyncState) checkError() error {
 }
 
 // waitEmpty blocks until all in-flight batches have been ACKed.
-// Returns an error if the I/O goroutine fails before draining.
-func (a *qwpAsyncState) waitEmpty() error {
+// Returns ctx.Err() if ctx is cancelled during the wait, or the I/O
+// goroutine's error if it fails before draining.
+func (a *qwpAsyncState) waitEmpty(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	var watchCancel chan struct{}
+	defer func() {
+		if watchCancel != nil {
+			close(watchCancel)
+		}
+	}()
 
 	for a.inFlightCount > 0 {
 		if a.ioErr != nil {
@@ -171,6 +215,12 @@ func (a *qwpAsyncState) waitEmpty() error {
 		}
 		if a.stopped {
 			return fmt.Errorf("qwp: async I/O goroutine stopped with %d batches in flight", a.inFlightCount)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if watchCancel == nil {
+			watchCancel = a.startCtxWatcher(ctx)
 		}
 		a.cond.Wait()
 	}

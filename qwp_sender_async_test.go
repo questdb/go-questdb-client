@@ -42,10 +42,10 @@ func TestQwpAsyncAcquireAndRelease(t *testing.T) {
 	a := newQwpAsyncState(2, nil)
 
 	// Should acquire 2 slots without blocking.
-	if err := a.acquireSlot(); err != nil {
+	if err := a.acquireSlot(context.Background()); err != nil {
 		t.Fatalf("acquire 1: %v", err)
 	}
-	if err := a.acquireSlot(); err != nil {
+	if err := a.acquireSlot(context.Background()); err != nil {
 		t.Fatalf("acquire 2: %v", err)
 	}
 
@@ -65,7 +65,7 @@ func TestQwpAsyncAcquireAndRelease(t *testing.T) {
 	a.mu.Unlock()
 
 	// Should be able to acquire one more.
-	if err := a.acquireSlot(); err != nil {
+	if err := a.acquireSlot(context.Background()); err != nil {
 		t.Fatalf("acquire 3: %v", err)
 	}
 }
@@ -74,14 +74,14 @@ func TestQwpAsyncAcquireBlocksAtMax(t *testing.T) {
 	a := newQwpAsyncState(1, nil)
 
 	// Fill the window.
-	if err := a.acquireSlot(); err != nil {
+	if err := a.acquireSlot(context.Background()); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
 	// Second acquire should block. Use a goroutine to test.
 	acquired := make(chan struct{})
 	go func() {
-		a.acquireSlot()
+		a.acquireSlot(context.Background())
 		close(acquired)
 	}()
 
@@ -108,11 +108,11 @@ func TestQwpAsyncSetErrorUnblocksAcquire(t *testing.T) {
 	a := newQwpAsyncState(1, nil)
 
 	// Fill the window.
-	a.acquireSlot()
+	a.acquireSlot(context.Background())
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- a.acquireSlot()
+		errCh <- a.acquireSlot(context.Background())
 	}()
 
 	// Wait for the goroutine to be blocked.
@@ -132,17 +132,88 @@ func TestQwpAsyncSetErrorUnblocksAcquire(t *testing.T) {
 	}
 }
 
+func TestQwpAsyncAcquireUnblocksOnCtxCancel(t *testing.T) {
+	a := newQwpAsyncState(1, nil)
+
+	// Fill the window.
+	a.acquireSlot(context.Background())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- a.acquireSlot(ctx)
+	}()
+
+	// Wait for the goroutine to be parked on the cond.
+	time.Sleep(20 * time.Millisecond)
+
+	// Cancel the context — should unblock with ctx.Err().
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != context.Canceled {
+			t.Fatalf("acquire err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acquire did not unblock after ctx cancel")
+	}
+
+	// Slot count must still reflect the one acquired slot — the
+	// cancelled caller must not claim a slot.
+	a.mu.Lock()
+	if a.inFlightCount != 1 {
+		t.Fatalf("inFlightCount = %d, want 1", a.inFlightCount)
+	}
+	a.mu.Unlock()
+}
+
+func TestQwpAsyncAcquireAlreadyCancelled(t *testing.T) {
+	a := newQwpAsyncState(1, nil)
+	a.acquireSlot(context.Background())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := a.acquireSlot(ctx); err != context.Canceled {
+		t.Fatalf("acquireSlot with cancelled ctx = %v, want context.Canceled", err)
+	}
+}
+
+func TestQwpAsyncWaitEmptyUnblocksOnCtxCancel(t *testing.T) {
+	a := newQwpAsyncState(2, nil)
+	a.acquireSlot(context.Background())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- a.waitEmpty(ctx)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-doneCh:
+		if err != context.Canceled {
+			t.Fatalf("waitEmpty err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitEmpty did not unblock after ctx cancel")
+	}
+}
+
 func TestQwpAsyncWaitEmpty(t *testing.T) {
 	a := newQwpAsyncState(3, nil)
 
 	// Acquire 3 slots.
-	a.acquireSlot()
-	a.acquireSlot()
-	a.acquireSlot()
+	a.acquireSlot(context.Background())
+	a.acquireSlot(context.Background())
+	a.acquireSlot(context.Background())
 
 	doneCh := make(chan error, 1)
 	go func() {
-		doneCh <- a.waitEmpty()
+		doneCh <- a.waitEmpty(context.Background())
 	}()
 
 	// Should still be waiting.
@@ -178,11 +249,11 @@ func TestQwpAsyncWaitEmpty(t *testing.T) {
 func TestQwpAsyncWaitEmptyWithError(t *testing.T) {
 	a := newQwpAsyncState(2, nil)
 
-	a.acquireSlot()
+	a.acquireSlot(context.Background())
 
 	doneCh := make(chan error, 1)
 	go func() {
-		doneCh <- a.waitEmpty()
+		doneCh <- a.waitEmpty(context.Background())
 	}()
 
 	time.Sleep(20 * time.Millisecond)
@@ -225,11 +296,11 @@ func TestQwpAsyncMarkStopped(t *testing.T) {
 	a := newQwpAsyncState(1, nil)
 
 	// Fill window.
-	a.acquireSlot()
+	a.acquireSlot(context.Background())
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- a.acquireSlot()
+		errCh <- a.acquireSlot(context.Background())
 	}()
 
 	time.Sleep(20 * time.Millisecond)
@@ -284,14 +355,14 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 
 	// Send 3 batches through the I/O loop.
 	for i := 0; i < 3; i++ {
-		if err := a.acquireSlot(); err != nil {
+		if err := a.acquireSlot(context.Background()); err != nil {
 			t.Fatalf("acquireSlot %d: %v", i, err)
 		}
 		a.sendCh <- qwpAsyncBatch{data: []byte{byte(i + 1), byte(i + 2)}}
 	}
 
 	// Wait for all in-flight to be ACKed.
-	if err := a.waitEmpty(); err != nil {
+	if err := a.waitEmpty(context.Background()); err != nil {
 		t.Fatalf("waitEmpty: %v", err)
 	}
 
@@ -355,14 +426,14 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 	a.start()
 
 	// Send first batch (will succeed).
-	a.acquireSlot()
+	a.acquireSlot(context.Background())
 	a.sendCh <- qwpAsyncBatch{data: []byte{0x01}}
 
 	// Give the I/O loop time to process.
 	time.Sleep(20 * time.Millisecond)
 
 	// Send second batch (will fail).
-	a.acquireSlot()
+	a.acquireSlot(context.Background())
 	a.sendCh <- qwpAsyncBatch{data: []byte{0x02}}
 
 	// Wait for error to propagate.
@@ -393,7 +464,7 @@ func TestQwpAsyncConcurrentAcquireRelease(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				if err := a.acquireSlot(); err != nil {
+				if err := a.acquireSlot(context.Background()); err != nil {
 					return
 				}
 				a.releaseSlot()
@@ -440,9 +511,9 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 	a.start()
 
 	// Send a batch and wait for ACK.
-	a.acquireSlot()
+	a.acquireSlot(context.Background())
 	a.sendCh <- qwpAsyncBatch{data: []byte{0x01}}
-	if err := a.waitEmpty(); err != nil {
+	if err := a.waitEmpty(context.Background()); err != nil {
 		t.Fatalf("waitEmpty: %v", err)
 	}
 

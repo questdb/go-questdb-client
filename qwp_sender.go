@@ -789,7 +789,7 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 		// previous auto-flushes to complete. This lets the user
 		// call Flush() as a barrier to confirm all data was ACKed.
 		if s.asyncState != nil {
-			return s.asyncState.waitEmpty()
+			return s.asyncState.waitEmpty(ctx)
 		}
 		return nil
 	}
@@ -922,7 +922,7 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	)
 
 	// Acquire a slot in the in-flight window.
-	if err := s.asyncState.acquireSlot(); err != nil {
+	if err := s.asyncState.acquireSlot(ctx); err != nil {
 		// Return the encoder token since we won't enqueue.
 		s.encoderReady[encIdx] <- struct{}{}
 		return err
@@ -957,7 +957,7 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	}
 
 	// Drain all in-flight batches before returning (Flush semantics).
-	return s.asyncState.waitEmpty()
+	return s.asyncState.waitEmpty(ctx)
 }
 
 // enqueueFlush encodes all pending table buffers and enqueues them
@@ -999,7 +999,7 @@ func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 		s.batchMaxSymbolId,
 	)
 
-	if err := s.asyncState.acquireSlot(); err != nil {
+	if err := s.asyncState.acquireSlot(ctx); err != nil {
 		s.encoderReady[encIdx] <- struct{}{}
 		return err
 	}
