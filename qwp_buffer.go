@@ -141,11 +141,15 @@ func newQwpColumnBuffer(name string, typeCode qwpTypeCode, nullable bool) *qwpCo
 
 // markNull sets the null bit for the current row (at index rowCount)
 // and increments nullCount. The bitmap is grown as needed.
+//
+// Non-null appends (addLong, etc.) bump rowCount without touching the
+// bitmap, so the first null after a run of non-nulls may need to skip
+// past several bytes — grow to byteIdx+1 in a single append.
 func (c *qwpColumnBuffer) markNull() {
 	byteIdx := c.rowCount / 8
-	if len(c.nullBitmap) <= byteIdx {
-		c.nullBitmap = append(c.nullBitmap, 0)
-		c.trackDataGrowth(1)
+	if need := byteIdx + 1 - len(c.nullBitmap); need > 0 {
+		c.nullBitmap = append(c.nullBitmap, make([]byte, need)...)
+		c.trackDataGrowth(need)
 	}
 	c.nullBitmap[byteIdx] |= 1 << uint(c.rowCount%8)
 	c.nullCount++

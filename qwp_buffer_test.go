@@ -524,6 +524,50 @@ func TestQwpColumnBufferNullBitmapMultipleBytes(t *testing.T) {
 	}
 }
 
+// Regression: non-null appends bump rowCount without touching the
+// bitmap, so the first null after a run of non-nulls may need to grow
+// the bitmap by more than one byte. Previously markNull grew only by
+// one byte and panicked at the indexing step.
+func TestQwpColumnBufferNullBitmapFirstNullAcrossByteBoundary(t *testing.T) {
+	t.Run("FirstNullAtRow8", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLong, true)
+		for i := 0; i < 8; i++ {
+			c.addLong(int64(i))
+		}
+		c.addNull() // row 8
+
+		if c.rowCount != 9 {
+			t.Fatalf("rowCount = %d, want 9", c.rowCount)
+		}
+		if c.nullCount != 1 {
+			t.Fatalf("nullCount = %d, want 1", c.nullCount)
+		}
+		expected := []byte{0x00, 0x01}
+		if !bytes.Equal(c.nullBitmap, expected) {
+			t.Fatalf("nullBitmap = %x, want %x", c.nullBitmap, expected)
+		}
+	})
+
+	t.Run("FirstNullAtRow16", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLong, true)
+		for i := 0; i < 16; i++ {
+			c.addLong(int64(i))
+		}
+		c.addNull() // row 16
+
+		if c.rowCount != 17 {
+			t.Fatalf("rowCount = %d, want 17", c.rowCount)
+		}
+		if c.nullCount != 1 {
+			t.Fatalf("nullCount = %d, want 1", c.nullCount)
+		}
+		expected := []byte{0x00, 0x00, 0x01}
+		if !bytes.Equal(c.nullBitmap, expected) {
+			t.Fatalf("nullBitmap = %x, want %x", c.nullBitmap, expected)
+		}
+	})
+}
+
 func TestQwpColumnBufferNullStringInterleaved(t *testing.T) {
 	c := newQwpColumnBuffer("col", qwpTypeString, true)
 	c.addString("hello") // row 0
