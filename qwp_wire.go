@@ -26,8 +26,14 @@ package questdb
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
+	"math/bits"
 )
+
+// qwpMaxVarintLen is the maximum number of bytes a varint-encoded
+// uint64 can occupy (ceil(64/7) = 10).
+const qwpMaxVarintLen = 10
 
 // qwpWireBuffer is a low-level byte buffer for building QWP binary
 // messages. It wraps a []byte and provides typed put methods for all
@@ -158,4 +164,53 @@ func (w *qwpWireBuffer) putBytes(data []byte) {
 // payload length after the full message has been written.
 func (w *qwpWireBuffer) patchUint32LE(offset int, v uint32) {
 	binary.LittleEndian.PutUint32(w.buf[offset:], v)
+}
+
+// qwpPutVarint encodes v as an unsigned LEB128 varint into buf and
+// returns the number of bytes written. buf must have at least
+// qwpMaxVarintLen bytes of space.
+func qwpPutVarint(buf []byte, v uint64) int {
+	i := 0
+	for v > 0x7F {
+		buf[i] = byte(v&0x7F) | 0x80
+		v >>= 7
+		i++
+	}
+	buf[i] = byte(v)
+	return i + 1
+}
+
+// qwpReadVarint decodes an unsigned LEB128 varint from buf. It returns
+// the decoded value and the number of bytes consumed, or an error if
+// the varint is malformed or truncated.
+func qwpReadVarint(buf []byte) (uint64, int, error) {
+	var v uint64
+	var shift uint
+	for i, b := range buf {
+		if i >= qwpMaxVarintLen {
+			return 0, 0, errors.New("qwp: varint overflow")
+		}
+		v |= uint64(b&0x7F) << shift
+		if b&0x80 == 0 {
+			return v, i + 1, nil
+		}
+		shift += 7
+	}
+	return 0, 0, errors.New("qwp: varint truncated")
+}
+
+// qwpVarintSize returns the number of bytes needed to encode v as an
+// unsigned LEB128 varint.
+func qwpVarintSize(v uint64) int {
+	if v == 0 {
+		return 1
+	}
+	// Number of bits needed, divided by 7, rounded up.
+	return (bits.Len64(v) + 6) / 7
+}
+
+// qwpStringSize returns the number of bytes needed to encode s as a
+// varint-prefixed UTF-8 string (varint length + string bytes).
+func qwpStringSize(s string) int {
+	return qwpVarintSize(uint64(len(s))) + len(s)
 }

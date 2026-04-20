@@ -102,8 +102,8 @@ own framing, codecs, and server handshake. Everything QWP lives in
 
 - `qwp_constants.go` — magic (`"QWP1"`), header flags (Gorilla timestamp
   encoding, delta symbol dictionary), type codes, and ACK status codes.
-- `qwp_wire.go` + `qwp_varint.go` — low-level wire primitives; little-
-  endian fixed-width writers and unsigned LEB128 varint encoding.
+- `qwp_wire.go` — low-level wire primitives; little-endian fixed-width
+  writers and unsigned LEB128 varint encoding.
 - `qwp_buffer.go` — `qwpColumnBuffer` (per-type columnar storage,
   bit-packed booleans, offset+data for strings, separate null bitmap)
   and `qwpTableBuffer` (gap-fill, row cancel, per-table schema id).
@@ -204,7 +204,7 @@ closes idle connections when the last sender is released.
 - `buffer_test.go`, `conf_test.go`, `tcp_sender_test.go`,
   `http_sender_test.go`, `sender_pool_test.go`, `ndarray_test.go`,
   `qwp_buffer_test.go`, `qwp_encoder_test.go`, `qwp_sender_test.go`,
-  `qwp_sender_async_test.go`, `qwp_wire_test.go`, `qwp_varint_test.go`,
+  `qwp_sender_async_test.go`, `qwp_wire_test.go`,
   `qwp_errors_test.go`, `qwp_transport_test.go` — pure unit tests, no
   Docker required. QWP unit tests use `httptest.Server` to stand in for
   the QuestDB WebSocket endpoint (`newQwpTestServer` in
