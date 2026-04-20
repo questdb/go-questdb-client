@@ -207,6 +207,84 @@ func TestQwpSenderSteadyStateZeroAllocs(t *testing.T) {
 	}
 }
 
+// qwpSteadyStateSetupWithNulls mirrors qwpSteadyStateSetup but
+// introduces nulls (by skipping column calls on select rows) and
+// adds a bool column. This exercises the nullable-column bitmap
+// encoder path and the bit-packed bool payload path, which the
+// all-values-set steady-state variant does not touch.
+func qwpSteadyStateSetupWithNulls() (*qwpLineSender, func()) {
+	ctx := context.Background()
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	s := &qwpLineSender{
+		tableBuffers:     make(map[string]*qwpTableBuffer),
+		globalSymbols:    make(map[string]int32),
+		maxSentSymbolId:  -1,
+		batchMaxSymbolId: -1,
+		nextSchemaId:     0,
+		maxSentSchemaId:  -1,
+		batchMaxSchemaId: -1,
+	}
+
+	s.globalSymbols["AAPL"] = 0
+	s.globalSymbolList = append(s.globalSymbolList, "AAPL")
+	s.batchMaxSymbolId = 0
+
+	iter := func() {
+		for r := 0; r < 10; r++ {
+			b := s.Table("t").Symbol("sym", "AAPL")
+			if r%3 != 0 {
+				b = b.Int64Column("qty", int64(100+r))
+			}
+			b = b.Float64Column("price", 150.5+float64(r))
+			if r%2 == 0 {
+				b = b.StringColumn("note", "test")
+			}
+			b = b.BoolColumn("active", r%2 == 0)
+			if err := b.At(ctx, ts.Add(time.Duration(r)*time.Microsecond)); err != nil {
+				panic(err)
+			}
+		}
+		tables, _ := s.buildTableEncodeInfo()
+		s.encoders[0].encodeMultiTableWithDeltaDict(
+			tables,
+			s.globalSymbolList,
+			s.maxSentSymbolId,
+			s.batchMaxSymbolId,
+		)
+		if s.batchMaxSchemaId > s.maxSentSchemaId {
+			s.maxSentSchemaId = s.batchMaxSchemaId
+		}
+		s.resetAfterFlush()
+	}
+
+	iter()
+	iter()
+	return s, iter
+}
+
+// BenchmarkQwpSenderSteadyStateNulls is the null-mix counterpart of
+// BenchmarkQwpSenderSteadyState. Int64 and String columns each take
+// nulls on some rows, and a bool column is present throughout — so
+// this bench exercises the null-bitmap and bool-payload encoder paths.
+func BenchmarkQwpSenderSteadyStateNulls(b *testing.B) {
+	_, iter := qwpSteadyStateSetupWithNulls()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		iter()
+	}
+}
+
+// TestQwpSenderSteadyStateNullsZeroAllocs pins the 0-allocs/op
+// invariant for the null-mix variant.
+func TestQwpSenderSteadyStateNullsZeroAllocs(t *testing.T) {
+	_, iter := qwpSteadyStateSetupWithNulls()
+	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
+		t.Fatalf("steady-state-nulls allocs/op = %g, want 0", allocs)
+	}
+}
+
 // BenchmarkQwpColumnAdd measures per-column add throughput.
 func BenchmarkQwpColumnAdd(b *testing.B) {
 	b.Run("Long", func(b *testing.B) {
