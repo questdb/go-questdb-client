@@ -159,6 +159,9 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 
 	conn, resp, err := websocket.Dial(ctx, wsURL, dialOpts)
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		return fmt.Errorf("qwp: websocket dial: %w", err)
 	}
 

@@ -959,6 +959,9 @@ func validateConf(conf *lineSenderConfig) error {
 	if conf.autoFlushInterval < 0 {
 		return fmt.Errorf("auto flush interval is negative: %d", conf.autoFlushInterval)
 	}
+	if conf.closeTimeout < 0 {
+		return fmt.Errorf("close timeout is negative: %d", conf.closeTimeout)
+	}
 	if conf.autoFlushBytes < 0 {
 		return fmt.Errorf("auto flush bytes is negative: %d", conf.autoFlushBytes)
 	}

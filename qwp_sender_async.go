@@ -167,6 +167,12 @@ func (a *qwpAsyncState) acquireSlot(ctx context.Context) error {
 	if a.ioErr != nil {
 		return a.ioErr
 	}
+	if a.stopped {
+		return fmt.Errorf("qwp: async I/O goroutine stopped")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	a.inFlightCount++
 	return nil
@@ -301,6 +307,12 @@ func (a *qwpAsyncState) senderLoop() {
 	for batch := range a.sendCh {
 		a.mu.Lock()
 		drop := a.ioErr != nil || a.ctx.Err() != nil
+		if !drop {
+			// Reserve the sequence number before the message hits the
+			// wire so receiverLoop can never observe an ACK whose
+			// sequence is >= nextSequence for an in-flight batch.
+			a.nextSequence++
+		}
 		a.mu.Unlock()
 
 		if drop {
@@ -327,9 +339,6 @@ func (a *qwpAsyncState) senderLoop() {
 		if batch.readySignal != nil {
 			batch.readySignal <- struct{}{}
 		}
-		a.mu.Lock()
-		a.nextSequence++
-		a.mu.Unlock()
 	}
 
 	// sendCh has been closed and drained. Record the highest
@@ -409,10 +418,6 @@ func (a *qwpAsyncState) start() {
 	a.wg.Add(2)
 	go a.senderLoop()
 	go a.receiverLoop()
-	go func() {
-		a.wg.Wait()
-		a.markStopped()
-	}()
 }
 
 // stop closes the send channel and waits for both I/O goroutines to
@@ -436,6 +441,7 @@ func (a *qwpAsyncState) stop(gracePeriod time.Duration) {
 		<-a.doneSender
 		<-a.doneReceiver
 		a.wg.Wait()
+		a.markStopped()
 		return
 	}
 
@@ -448,4 +454,5 @@ func (a *qwpAsyncState) stop(gracePeriod time.Duration) {
 
 	a.wg.Wait()
 	a.cancel() // idempotent; ensures context is always cleaned up
+	a.markStopped()
 }

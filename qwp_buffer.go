@@ -484,10 +484,11 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 		)
 	}
 
-	// Track and validate scale consistency.
-	if c.scale < 0 {
-		c.scale = int8(d.scale)
-	} else if uint32(c.scale) != d.scale {
+	// Validate scale consistency without mutating c.scale yet — the
+	// subsequent overflow check may still reject the value, and we
+	// must not leave the column with a latched scale if no row is
+	// actually written.
+	if c.scale >= 0 && uint32(c.scale) != d.scale {
 		return fmt.Errorf(
 			"qwp: column %q: decimal scale %d conflicts with established scale %d",
 			c.name, d.scale, c.scale,
@@ -536,6 +537,10 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 		}
 	}
 
+	// Commit the scale only after the row was successfully written.
+	if c.scale < 0 {
+		c.scale = int8(d.scale)
+	}
 	c.trackDataGrowth(wireSize)
 	c.rowCount++
 	return nil

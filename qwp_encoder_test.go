@@ -564,8 +564,7 @@ func TestQwpEncoderEmptyTable(t *testing.T) {
 	if rowCount != 0 {
 		t.Fatalf("rowCount = %d, want 0", rowCount)
 	}
-	colCount, n, _ := qwpReadVarint(msg[off:])
-	off += n
+	colCount, _, _ := qwpReadVarint(msg[off:])
 	if colCount != 1 {
 		t.Fatalf("colCount = %d, want 1", colCount)
 	}
@@ -1140,7 +1139,6 @@ func TestQwpEncoderDeltaDictAllNew(t *testing.T) {
 	symLen, n, _ = qwpReadVarint(msg[off:])
 	off += n
 	sym = string(msg[off : off+int(symLen)])
-	off += int(symLen)
 	if sym != "Y" {
 		t.Fatalf("delta symbol[1] = %q, want %q", sym, "Y")
 	}

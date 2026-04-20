@@ -155,12 +155,14 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 
 	iter := func() {
 		for r := 0; r < 10; r++ {
-			s.Table("t").
+			if err := s.Table("t").
 				Symbol("sym", "AAPL").
 				Int64Column("qty", int64(100+r)).
 				Float64Column("price", 150.5+float64(r)).
 				StringColumn("note", "test").
-				At(ctx, ts.Add(time.Duration(r)*time.Microsecond))
+				At(ctx, ts.Add(time.Duration(r)*time.Microsecond)); err != nil {
+				panic(err)
+			}
 		}
 		tables, _ := s.buildTableEncodeInfo()
 		s.encoders[0].encodeMultiTableWithDeltaDict(

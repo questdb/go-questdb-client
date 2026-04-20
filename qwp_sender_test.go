@@ -736,6 +736,9 @@ func TestParseDecimalFromString(t *testing.T) {
 		{"-Infinity", 0, true},
 		{"", 0, true},
 		{"+", 0, true},
+		{"1.2.3", 0, true},
+		{"1.2.", 0, true},
+		{".1.", 0, true},
 	}
 
 	for _, tc := range tests {
@@ -1298,8 +1301,7 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 	if deltaStart != 0 {
 		t.Fatalf("msg1 deltaStart = %d, want 0", deltaStart)
 	}
-	deltaCount, n, _ := qwpReadVarint(msg1[off:])
-	off += n
+	deltaCount, _, _ := qwpReadVarint(msg1[off:])
 	if deltaCount != 2 {
 		t.Fatalf("msg1 deltaCount = %d, want 2", deltaCount)
 	}
@@ -1699,8 +1701,7 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 		if err != nil {
 			return
 		}
-		ack := make([]byte, 9)
-		ack[0] = byte(qwpStatusWriteError)
+		ack := buildAckError(qwpStatusWriteError, 0, "write failed")
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
 	}))
 	defer srv.Close()

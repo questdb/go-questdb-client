@@ -24,6 +24,8 @@
 
 package questdb
 
+import "fmt"
+
 // qwpEncoder encodes qwpTableBuffer data into QWP v1 binary messages.
 // It owns a reusable qwpWireBuffer to minimize allocations across
 // successive encode calls.
@@ -123,6 +125,15 @@ func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
 	batchMaxId int,
 ) []byte {
 	e.wb.reset()
+	// buildTableEncodeInfo enforces qwpMaxTablesPerBatch (0xFFFF); guard
+	// locally so a regression cannot silently truncate the header's
+	// 16-bit tableCount and produce a malformed frame.
+	if len(tables) > qwpMaxTablesPerBatch {
+		panic(fmt.Sprintf(
+			"qwp: encoder got %d tables, exceeds uint16 tableCount limit %d",
+			len(tables), qwpMaxTablesPerBatch,
+		))
+	}
 	e.writeHeader(e.headerFlags(), uint16(len(tables)))
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
 	for i := range tables {

@@ -257,6 +257,9 @@ func parseDecimalFromString(text string) (Decimal, error) {
 			}
 			i++
 		case ch == '.':
+			if seenDot {
+				return Decimal{}, fmt.Errorf("decimal literal has multiple decimal points")
+			}
 			seenDot = true
 			i++
 		case ch == 'e' || ch == 'E':

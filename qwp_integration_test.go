@@ -78,12 +78,17 @@ func qwpDropTable(t *testing.T, tableName string) {
 	params.Add("query", "DROP TABLE IF EXISTS '"+tableName+"';")
 	u.RawQuery = params.Encode()
 
-	resp, err := qwpTestHTTPClient.Get(u.String())
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u.String(), nil)
+	if err != nil {
+		t.Logf("warning: could not build request to drop table %q: %v", tableName, err)
+		return
+	}
+	resp, err := qwpTestHTTPClient.Do(req)
 	if err != nil {
 		t.Logf("warning: could not drop table %q: %v", tableName, err)
 		return
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // qwpQuery executes a SQL query against QuestDB's HTTP API.
@@ -95,7 +100,11 @@ func qwpQuery(t *testing.T, query string) qwpTableResult {
 	params.Add("query", query)
 	u.RawQuery = params.Encode()
 
-	resp, err := qwpTestHTTPClient.Get(u.String())
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u.String(), nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := qwpTestHTTPClient.Do(req)
 	if err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
