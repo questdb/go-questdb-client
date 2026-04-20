@@ -638,6 +638,26 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			expectedErrMsgContains: "not 'on' or 'off'",
 		},
 		{
+			name:                   "in_flight_window on HTTP",
+			config:                 "http::addr=localhost:1111;in_flight_window=4;",
+			expectedErrMsgContains: "in_flight_window is only supported for QWP senders",
+		},
+		{
+			name:                   "close_timeout on TCP",
+			config:                 "tcp::addr=localhost:1111;close_timeout=1000;",
+			expectedErrMsgContains: "close_timeout is only supported for QWP senders",
+		},
+		{
+			name:                   "max_schemas_per_connection on HTTP",
+			config:                 "http::addr=localhost:1111;max_schemas_per_connection=8;",
+			expectedErrMsgContains: "max_schemas_per_connection is only supported for QWP senders",
+		},
+		{
+			name:                   "gorilla on TCP",
+			config:                 "tcp::addr=localhost:1111;gorilla=off;",
+			expectedErrMsgContains: "gorilla is only supported for QWP senders",
+		},
+		{
 			name:                   "unsupported option",
 			config:                 "http::addr=localhost:1111;unsupported_option=invalid;",
 			expectedErrMsgContains: "unsupported option",

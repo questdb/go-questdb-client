@@ -281,14 +281,26 @@ func TestQwpIntegrationSymbolDedup(t *testing.T) {
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	// Flush 1: symbols AAPL, MSFT.
-	s.Table(tableName).Symbol("sym", "AAPL").Int64Column("v", 1).At(ctx, ts)
-	s.Table(tableName).Symbol("sym", "MSFT").Int64Column("v", 2).At(ctx, ts.Add(time.Microsecond))
-	s.Flush(ctx)
+	if err := s.Table(tableName).Symbol("sym", "AAPL").Int64Column("v", 1).At(ctx, ts); err != nil {
+		t.Fatalf("row AAPL: %v", err)
+	}
+	if err := s.Table(tableName).Symbol("sym", "MSFT").Int64Column("v", 2).At(ctx, ts.Add(time.Microsecond)); err != nil {
+		t.Fatalf("row MSFT: %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush 1: %v", err)
+	}
 
 	// Flush 2: reuse AAPL, add GOOG.
-	s.Table(tableName).Symbol("sym", "AAPL").Int64Column("v", 3).At(ctx, ts.Add(2*time.Microsecond))
-	s.Table(tableName).Symbol("sym", "GOOG").Int64Column("v", 4).At(ctx, ts.Add(3*time.Microsecond))
-	s.Flush(ctx)
+	if err := s.Table(tableName).Symbol("sym", "AAPL").Int64Column("v", 3).At(ctx, ts.Add(2*time.Microsecond)); err != nil {
+		t.Fatalf("row AAPL (flush 2): %v", err)
+	}
+	if err := s.Table(tableName).Symbol("sym", "GOOG").Int64Column("v", 4).At(ctx, ts.Add(3*time.Microsecond)); err != nil {
+		t.Fatalf("row GOOG: %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush 2: %v", err)
+	}
 
 	result := qwpWaitForRows(t, tableName, 4)
 	if result.Count != 4 {
@@ -320,9 +332,15 @@ func TestQwpIntegrationMultiTable(t *testing.T) {
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	// Interleave rows into two tables.
-	s.Table(table1).Int64Column("x", 1).At(ctx, ts)
-	s.Table(table2).Float64Column("y", 2.5).At(ctx, ts)
-	s.Table(table1).Int64Column("x", 3).At(ctx, ts.Add(time.Microsecond))
+	if err := s.Table(table1).Int64Column("x", 1).At(ctx, ts); err != nil {
+		t.Fatalf("table1 row 1: %v", err)
+	}
+	if err := s.Table(table2).Float64Column("y", 2.5).At(ctx, ts); err != nil {
+		t.Fatalf("table2 row 1: %v", err)
+	}
+	if err := s.Table(table1).Int64Column("x", 3).At(ctx, ts.Add(time.Microsecond)); err != nil {
+		t.Fatalf("table1 row 2: %v", err)
+	}
 
 	if err := s.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)

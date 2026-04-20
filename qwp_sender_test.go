@@ -739,6 +739,13 @@ func TestParseDecimalFromString(t *testing.T) {
 		{"1.2.3", 0, true},
 		{"1.2.", 0, true},
 		{".1.", 0, true},
+		// Exponent out of range: scale > maxDecimalScale (76).
+		{"1e-77", 0, true},
+		// Exponent out of range: scale < -maxDecimalScale. Without the
+		// guard, buildDecimal would allocate ~1MB of '0' padding before
+		// bigIntToTwosComplement rejects the result.
+		{"1e1000000", 0, true},
+		{"1e-1000000", 0, true},
 	}
 
 	for _, tc := range tests {

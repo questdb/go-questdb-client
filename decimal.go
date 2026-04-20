@@ -310,6 +310,18 @@ buildDecimal:
 		return Decimal{}, fmt.Errorf("decimal literal must contain at least one digit")
 	}
 
+	// The representable unscaled value fits in 255 bits (~10^76), so any
+	// |scale| larger than maxDecimalScale cannot produce a representable
+	// Decimal. Reject before the zero-padding loop (which scales linearly
+	// in -scale) or handing a scale > maxDecimalScale to NewDecimal, which
+	// does not call ensureValidScale.
+	if scale > int(maxDecimalScale) || scale < -int(maxDecimalScale) {
+		return Decimal{}, fmt.Errorf(
+			"decimal literal scale %d is out of range [-%d, %d]",
+			scale, maxDecimalScale, maxDecimalScale,
+		)
+	}
+
 	// If scale is negative, the exponent shifted us past the decimal point.
 	// Pad with zeros and set scale to 0.
 	if scale < 0 {

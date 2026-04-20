@@ -76,6 +76,9 @@ func Messages(s LineSender) []byte {
 	if ts, ok := s.(*tcpLineSenderV3); ok {
 		return ts.Messages()
 	}
+	if _, ok := s.(*qwpLineSender); ok {
+		panic("Messages() is not applicable to QWP senders: QWP has no ILP message buffer")
+	}
 	panic("unexpected struct")
 }
 
@@ -100,6 +103,9 @@ func MsgCount(s LineSender) int {
 	}
 	if ts, ok := s.(*tcpLineSenderV3); ok {
 		return ts.MsgCount()
+	}
+	if qs, ok := s.(*qwpLineSender); ok {
+		return qs.pendingRowCount
 	}
 	panic("unexpected struct")
 }
@@ -126,6 +132,13 @@ func BufLen(s LineSender) int {
 	if ts, ok := s.(*tcpLineSenderV3); ok {
 		return ts.BufLen()
 	}
+	if qs, ok := s.(*qwpLineSender); ok {
+		total := 0
+		for _, tb := range qs.tableBuffers {
+			total += tb.approxDataSize()
+		}
+		return total
+	}
 	panic("unexpected struct")
 }
 
@@ -150,6 +163,9 @@ func ProtocolVersion(s LineSender) protocolVersion {
 	}
 	if _, ok := s.(*tcpLineSenderV3); ok {
 		return ProtocolVersion3
+	}
+	if _, ok := s.(*qwpLineSender); ok {
+		panic("ProtocolVersion() is not applicable to QWP senders: QWP is not an ILP protocol")
 	}
 	panic("unexpected struct")
 }

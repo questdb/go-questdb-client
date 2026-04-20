@@ -191,24 +191,36 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				senderConf.protocolVersion = pVersion
 			}
 		case "in_flight_window":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.inFlightWindow = parsedVal
 		case "close_timeout":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
 			senderConf.closeTimeout = time.Duration(parsedVal) * time.Millisecond
 		case "max_schemas_per_connection":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.maxSchemasPerConnection = parsedVal
 		case "gorilla":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
 			switch v {
 			case "on":
 				senderConf.gorillaDisabled = false
