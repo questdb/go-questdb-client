@@ -90,6 +90,16 @@ type QwpSender interface {
 	// Decimal256Column adds a DECIMAL256 column value (32 bytes on the wire,
 	// 77 digits of precision). Equivalent to DecimalColumn.
 	Decimal256Column(name string, val Decimal) QwpSender
+
+	// AtNano closes the current row with a nanosecond-resolution
+	// designated timestamp (TYPE_TIMESTAMP_NANO on the wire). It is
+	// the nanosecond counterpart of LineSender.At, which uses
+	// microseconds.
+	//
+	// A table's designated timestamp resolution is fixed by its first
+	// row: mixing At and AtNano on rows of the same table within one
+	// flush returns a type-conflict error.
+	AtNano(ctx context.Context, ts time.Time) error
 }
 
 // Compile-time check that qwpLineSender implements QwpSender.
@@ -683,6 +693,18 @@ func (s *qwpLineSender) Float64ArrayNDColumn(name string, values *NdArray[float6
 // --- LineSender interface: At / AtNow ---
 
 func (s *qwpLineSender) At(ctx context.Context, ts time.Time) error {
+	return s.atWithTimestamp(ctx, ts, qwpTypeTimestamp)
+}
+
+func (s *qwpLineSender) AtNano(ctx context.Context, ts time.Time) error {
+	return s.atWithTimestamp(ctx, ts, qwpTypeTimestampNano)
+}
+
+// atWithTimestamp is the shared implementation of At and AtNano. The
+// typeCode selects the designated timestamp column type, which also
+// determines the unit used to convert ts: qwpTypeTimestamp → micros,
+// qwpTypeTimestampNano → nanos.
+func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeCode qwpTypeCode) error {
 	if s.closed {
 		return errClosedSenderAt
 	}
@@ -706,14 +728,23 @@ func (s *qwpLineSender) At(ctx context.Context, ts time.Time) error {
 	// string name for the designated timestamp, distinguishing it from
 	// regular columns (which cannot have empty names).
 	if !ts.IsZero() {
-		col, err := s.currentTable.getOrCreateDesignatedTimestamp(qwpTypeTimestamp)
+		col, err := s.currentTable.getOrCreateDesignatedTimestamp(typeCode)
 		if err != nil {
 			s.currentTable.cancelRow()
 			s.hasTable = false
 			s.currentTable = nil
 			return err
 		}
-		col.addTimestamp(ts.UnixMicro())
+		var v int64
+		switch typeCode {
+		case qwpTypeTimestamp:
+			v = ts.UnixMicro()
+		case qwpTypeTimestampNano:
+			v = ts.UnixNano()
+		default:
+			return fmt.Errorf("qwp: invalid designated timestamp type 0x%02X", typeCode)
+		}
+		col.addTimestamp(v)
 	}
 
 	// Commit the row (gap-fills missing columns).

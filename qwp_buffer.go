@@ -268,8 +268,9 @@ func (c *qwpColumnBuffer) addDouble(v float64) {
 	c.rowCount++
 }
 
-// addTimestamp appends an int64 microsecond timestamp in LE byte
-// order (TYPE_TIMESTAMP).
+// addTimestamp appends an int64 timestamp in LE byte order. Used for
+// TYPE_TIMESTAMP (micros), TYPE_TIMESTAMP_NANO (nanos), and TYPE_DATE
+// (millis); the unit is implied by the column's type code.
 func (c *qwpColumnBuffer) addTimestamp(v int64) {
 	c.appendU64(uint64(v))
 	c.rowCount++
@@ -854,11 +855,23 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 // column, creating it if needed. The designated timestamp uses an
 // empty string name to distinguish it from regular columns (which
 // cannot have empty names). This matches the Java client behavior.
+//
+// typeCode selects the resolution for a new column (qwpTypeTimestamp
+// for microseconds or qwpTypeTimestampNano for nanoseconds). If the
+// column already exists, the requested typeCode must match its
+// existing type, otherwise the two resolutions would share one column
+// on the wire and the server would misinterpret the values.
 func (tb *qwpTableBuffer) getOrCreateDesignatedTimestamp(typeCode qwpTypeCode) (*qwpColumnBuffer, error) {
 	const dtName = "" // empty name = designated timestamp
 	idx, exists := tb.columnIndex[dtName]
 	if exists {
 		col := tb.columns[idx]
+		if col.typeCode != typeCode {
+			return nil, fmt.Errorf(
+				"qwp: designated timestamp type conflict: table uses 0x%02X, got 0x%02X",
+				col.typeCode, typeCode,
+			)
+		}
 		if col.rowCount > tb.rowCount {
 			return nil, fmt.Errorf("qwp: designated timestamp already set for current row")
 		}

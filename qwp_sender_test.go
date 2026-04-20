@@ -2221,3 +2221,81 @@ func TestQwpSenderTimestampNanosColumnTypeCode(t *testing.T) {
 		t.Fatalf("stored value = %d, want %d (nanoseconds)", storedVal, expectedNanos)
 	}
 }
+
+func TestQwpSenderAtNanoDesignatedTimestamp(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	ts := time.Date(2024, 6, 15, 10, 30, 0, 123456789, time.UTC)
+	s.Table("t").Int64Column("v", 1)
+	if err := s.AtNano(context.Background(), ts); err != nil {
+		t.Fatalf("AtNano: %v", err)
+	}
+
+	tb := s.tableBuffers["t"]
+	if tb == nil {
+		t.Fatal("table buffer not found")
+	}
+	// Designated timestamp column uses empty name.
+	var col *qwpColumnBuffer
+	for _, c := range tb.columns {
+		if c.name == "" {
+			col = c
+			break
+		}
+	}
+	if col == nil {
+		t.Fatal("designated timestamp column not found")
+	}
+	if col.typeCode != qwpTypeTimestampNano {
+		t.Fatalf("designated ts typeCode = 0x%02X, want 0x%02X (qwpTypeTimestampNano)",
+			col.typeCode, qwpTypeTimestampNano)
+	}
+	if len(col.fixedData) < 8 {
+		t.Fatal("fixedData too short")
+	}
+	storedVal := int64(binary.LittleEndian.Uint64(col.fixedData[:8]))
+	if storedVal != ts.UnixNano() {
+		t.Fatalf("stored designated ts = %d, want %d (nanoseconds)", storedVal, ts.UnixNano())
+	}
+}
+
+func TestQwpSenderAtAndAtNanoConflict(t *testing.T) {
+	// Mixing At (micros) and AtNano (nanos) on the same table within
+	// one flush must fail: the designated timestamp column type is
+	// fixed once chosen.
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	ts := time.Date(2024, 6, 15, 10, 30, 0, 123456789, time.UTC)
+	ctx := context.Background()
+	if err := s.Table("t").Int64Column("v", 1).At(ctx, ts); err != nil {
+		t.Fatalf("At (micros) on first row: %v", err)
+	}
+	s.Table("t").Int64Column("v", 2)
+	err := s.AtNano(ctx, ts.Add(time.Microsecond))
+	if err == nil {
+		t.Fatal("expected type-conflict error when switching to AtNano, got nil")
+	}
+	if !strings.Contains(err.Error(), "designated timestamp type conflict") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The reverse direction (AtNano first, then At) should also fail
+	// on a fresh table.
+	s.Table("t2").Int64Column("v", 1)
+	if err := s.AtNano(ctx, ts); err != nil {
+		t.Fatalf("AtNano (nanos) on first row: %v", err)
+	}
+	err = s.Table("t2").Int64Column("v", 2).At(ctx, ts.Add(time.Microsecond))
+	if err == nil {
+		t.Fatal("expected type-conflict error when switching back to At, got nil")
+	}
+	if !strings.Contains(err.Error(), "designated timestamp type conflict") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
