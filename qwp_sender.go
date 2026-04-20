@@ -162,6 +162,15 @@ type qwpLineSender struct {
 	hasTable bool
 	lastErr  error
 
+	// cachedDesignatedTs is the last-seen designated timestamp
+	// column for the current table, used to skip the map lookup
+	// inside getOrCreateDesignatedTimestamp on every row. The
+	// back-pointer col.table makes invalidation trivial — if the
+	// user switched tables, col.table no longer matches
+	// s.currentTable and we re-lookup. Mirrors cachedTimestampColumn
+	// in the Java QwpWebSocketSender.
+	cachedDesignatedTs *qwpColumnBuffer
+
 	// Auto-flush configuration.
 	autoFlushRows     int
 	autoFlushInterval time.Duration
@@ -725,12 +734,17 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 	// string name for the designated timestamp, distinguishing it from
 	// regular columns (which cannot have empty names).
 	if !ts.IsZero() {
-		col, err := s.currentTable.getOrCreateDesignatedTimestamp(typeCode)
-		if err != nil {
-			s.currentTable.cancelRow()
-			s.hasTable = false
-			s.currentTable = nil
-			return err
+		col := s.cachedDesignatedTs
+		if col == nil || col.table != s.currentTable || col.typeCode != typeCode {
+			var err error
+			col, err = s.currentTable.getOrCreateDesignatedTimestamp(typeCode)
+			if err != nil {
+				s.currentTable.cancelRow()
+				s.hasTable = false
+				s.currentTable = nil
+				return err
+			}
+			s.cachedDesignatedTs = col
 		}
 		var v int64
 		switch typeCode {

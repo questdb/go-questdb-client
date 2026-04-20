@@ -777,6 +777,14 @@ type qwpTableBuffer struct {
 	// removed on cancelRow().
 	committedColumnCount int
 
+	// columnAccessCursor predicts the next column in sequence for
+	// getOrCreateColumn. When callers set the same columns in the
+	// same order every row, the cursor lets us skip the map lookup
+	// entirely. Reset to 0 on every row boundary (commitRow,
+	// cancelRow, reset). Mirrors QwpTableBuffer.columnAccessCursor
+	// in the Java client.
+	columnAccessCursor int
+
 	// schemaId is the per-connection schema identifier for this
 	// table's current column set. -1 means unassigned — the sender
 	// allocates a fresh ID from its nextSchemaId counter on the next
@@ -806,6 +814,26 @@ func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 // different type already exists, or if the column was already set
 // for the current in-progress row (duplicate column in same row).
 func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, nullable bool) (*qwpColumnBuffer, error) {
+	// Fast path: predict the next column in sequence. When columns are
+	// set in the same order every row, this avoids the map lookup
+	// entirely. Falls through to the map on name mismatch.
+	if tb.columnAccessCursor < len(tb.columns) {
+		col := tb.columns[tb.columnAccessCursor]
+		if col.name == name {
+			if col.typeCode != typeCode {
+				return nil, fmt.Errorf(
+					"qwp: column %q type conflict: existing %d, got %d",
+					name, col.typeCode, typeCode,
+				)
+			}
+			if col.rowCount > tb.rowCount {
+				return nil, fmt.Errorf("qwp: column %q already set for current row", name)
+			}
+			tb.columnAccessCursor++
+			return col, nil
+		}
+	}
+
 	idx, exists := tb.columnIndex[name]
 	if exists {
 		col := tb.columns[idx]
@@ -900,6 +928,7 @@ func (tb *qwpTableBuffer) commitRow() {
 	}
 	tb.rowCount++
 	tb.committedColumnCount = len(tb.columns)
+	tb.columnAccessCursor = 0
 }
 
 // cancelRow discards the current in-progress row, rolling back any
@@ -922,6 +951,8 @@ func (tb *qwpTableBuffer) cancelRow() {
 		}
 	}
 
+	tb.columnAccessCursor = 0
+
 	// Recompute from scratch since truncation makes incremental
 	// tracking impractical (this is the rare path).
 	tb.recomputeDataSize()
@@ -936,6 +967,7 @@ func (tb *qwpTableBuffer) reset() {
 	}
 	tb.rowCount = 0
 	tb.committedColumnCount = 0
+	tb.columnAccessCursor = 0
 
 	// Reset data size, then re-account for initial offset entries
 	// that column reset() preserves (strOffsets[:1], arrayOffsets[:1]).
