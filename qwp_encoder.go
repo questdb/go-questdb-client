@@ -291,37 +291,41 @@ func (e *qwpEncoder) encodeColumnData(col *qwpColumnBuffer) {
 //   - 0x00 flag byte if the column has no nulls (1 byte total)
 //   - 0x01 flag byte + bitmap bytes if nulls are present
 //     (1 + ceil(rowCount/8) bytes total)
+//
+// The bitmap is grown lazily (only up to the last index that was
+// marked null), so the backed prefix may be shorter than the
+// required bitmapLen; the remaining bytes are zero-padded.
 func (e *qwpEncoder) encodeNullBitmapFlag(col *qwpColumnBuffer) {
 	if col.nullCount == 0 {
 		e.wb.putByte(0x00)
 		return
 	}
 
-	// Has nulls: write flag byte (0x01) then the bitmap.
 	e.wb.putByte(0x01)
 	bitmapLen := col.nullBitmapLen()
-	for i := 0; i < bitmapLen; i++ {
-		if i < len(col.nullBitmap) {
-			e.wb.putByte(col.nullBitmap[i])
-		} else {
-			e.wb.putByte(0)
-		}
+	prefix := len(col.nullBitmap)
+	if prefix > bitmapLen {
+		prefix = bitmapLen
 	}
+	e.wb.putBytes(col.nullBitmap[:prefix])
+	e.wb.putZeros(bitmapLen - prefix)
 }
 
 // encodeBoolColumn writes bit-packed boolean values for non-null
 // rows only. The number of bits is valueCount (= rowCount - nullCount
-// for nullable columns, = rowCount for non-nullable).
+// for nullable columns, = rowCount for non-nullable). boolData is
+// grown lazily (only up to the last set bit), so the backed prefix
+// may be shorter than the required boolLen; the remaining bytes are
+// zero-padded.
 func (e *qwpEncoder) encodeBoolColumn(col *qwpColumnBuffer) {
 	vc := col.valueCount()
 	boolLen := (vc + 7) / 8
-	for i := 0; i < boolLen; i++ {
-		if i < len(col.boolData) {
-			e.wb.putByte(col.boolData[i])
-		} else {
-			e.wb.putByte(0)
-		}
+	prefix := len(col.boolData)
+	if prefix > boolLen {
+		prefix = boolLen
 	}
+	e.wb.putBytes(col.boolData[:prefix])
+	e.wb.putZeros(boolLen - prefix)
 }
 
 // encodeStringColumn writes (valueCount+1) cumulative uint32 LE

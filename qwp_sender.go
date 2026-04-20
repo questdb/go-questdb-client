@@ -171,12 +171,31 @@ type qwpLineSender struct {
 	// in the Java QwpWebSocketSender.
 	cachedDesignatedTs *qwpColumnBuffer
 
+	// lastTableName / lastTable cache the most recent successful
+	// Table() resolution so repeated calls for the same table skip
+	// validation and the tableBuffers map lookup. Table buffers are
+	// never removed from the map, so a cached pointer is valid for
+	// the lifetime of the sender. Mirrors the same-table
+	// short-circuit in QwpWebSocketSender.table().
+	lastTableName string
+	lastTable     *qwpTableBuffer
+
 	// Auto-flush configuration.
 	autoFlushRows     int
 	autoFlushInterval time.Duration
 	autoFlushBytes    int // 0 disables the byte-size trigger
 	flushDeadline     time.Time
 	pendingRowCount   int
+
+	// pendingBytes tracks the approximate buffered byte total across
+	// all table buffers. Maintained incrementally on each commitRow:
+	// delta = currentTable.approxDataSize() - currentTableBytesBefore.
+	// Reset to 0 in resetAfterFlush. Only updated when the byte-size
+	// triggers (autoFlushBytes, maxBufSize) are enabled, otherwise the
+	// counter and snapshot are dead fields. Mirrors pendingBytes in
+	// the Java QwpWebSocketSender.
+	pendingBytes            int
+	currentTableBytesBefore int
 
 	// Buffer size limit. 0 means no limit.
 	maxBufSize int
@@ -271,17 +290,29 @@ func (s *qwpLineSender) Table(name string) LineSender {
 		s.lastErr = fmt.Errorf("qwp: table %q already set; call At() or AtNow() to finalize the row first", s.currentTable.tableName)
 		return s
 	}
-	if err := qwpValidateTableName(name, s.fileNameLimit); err != nil {
-		s.lastErr = err
-		return s
+
+	var tb *qwpTableBuffer
+	if s.lastTable != nil && s.lastTableName == name {
+		tb = s.lastTable
+	} else {
+		if err := qwpValidateTableName(name, s.fileNameLimit); err != nil {
+			s.lastErr = err
+			return s
+		}
+		var ok bool
+		tb, ok = s.tableBuffers[name]
+		if !ok {
+			tb = newQwpTableBuffer(name)
+			s.tableBuffers[name] = tb
+		}
+		s.lastTableName = name
+		s.lastTable = tb
 	}
 
-	tb, ok := s.tableBuffers[name]
-	if !ok {
-		tb = newQwpTableBuffer(name)
-		s.tableBuffers[name] = tb
-	}
 	s.currentTable = tb
+	if s.maxBufSize > 0 || s.autoFlushBytes > 0 {
+		s.currentTableBytesBefore = tb.approxDataSize()
+	}
 	s.hasTable = true
 	return s
 }
@@ -760,20 +791,22 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 
 	// Commit the row (gap-fills missing columns).
 	s.currentTable.commitRow()
+
+	// Size-based triggers: maxBufSize is a hard cap (forced flush to
+	// prevent unbounded memory growth); autoFlushBytes is a soft
+	// trigger. pendingBytes is a running counter updated by the
+	// delta since Table() was called, keeping this O(1) per row.
+	if s.maxBufSize > 0 || s.autoFlushBytes > 0 {
+		s.pendingBytes += s.currentTable.approxDataSize() - s.currentTableBytesBefore
+	}
+
 	s.hasTable = false
 	s.currentTable = nil
 	s.pendingRowCount++
 
-	// Size-based triggers: maxBufSize is a hard cap (forced flush to
-	// prevent unbounded memory growth); autoFlushBytes is a soft
-	// trigger. One iteration covers both.
 	if s.maxBufSize > 0 || s.autoFlushBytes > 0 {
-		total := 0
-		for _, tb := range s.tableBuffers {
-			total += tb.approxDataSize()
-		}
-		triggered := (s.maxBufSize > 0 && total > s.maxBufSize) ||
-			(s.autoFlushBytes > 0 && total >= s.autoFlushBytes)
+		triggered := (s.maxBufSize > 0 && s.pendingBytes > s.maxBufSize) ||
+			(s.autoFlushBytes > 0 && s.pendingBytes >= s.autoFlushBytes)
 		if triggered {
 			if s.asyncState != nil {
 				return s.enqueueFlush(ctx)
@@ -1101,6 +1134,7 @@ func (s *qwpLineSender) resetAfterFlush() {
 		tb.reset()
 	}
 	s.pendingRowCount = 0
+	s.pendingBytes = 0
 	s.batchMaxSymbolId = s.maxSentSymbolId
 
 	// Refresh flush deadline.

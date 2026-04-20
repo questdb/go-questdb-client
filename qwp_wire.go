@@ -159,6 +159,19 @@ func (w *qwpWireBuffer) putBytes(data []byte) {
 	w.buf = append(w.buf, data...)
 }
 
+// putZeros appends n zero bytes. Since reset() preserves the backing
+// array, the memory beyond len(buf) may hold stale data from earlier
+// encodes, so we explicitly clear the new tail (compiled to memclr).
+func (w *qwpWireBuffer) putZeros(n int) {
+	if n <= 0 {
+		return
+	}
+	w.ensure(n)
+	end := len(w.buf)
+	w.buf = w.buf[:end+n]
+	clear(w.buf[end : end+n])
+}
+
 // patchUint32LE writes a uint32 in little-endian at the given offset,
 // overwriting the existing bytes. Used for patching header fields like
 // payload length after the full message has been written.
