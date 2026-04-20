@@ -741,10 +741,10 @@ func TestQwpEncoderBoolNullableGoldenBytes(t *testing.T) {
 
 func TestQwpEncoderStringGoldenBytes(t *testing.T) {
 	tb := newQwpTableBuffer("t")
-	col, _ := tb.getOrCreateColumn("s", qwpTypeString, false)
+	col, _ := tb.getOrCreateColumn("s", qwpTypeVarchar, false)
 	col.addString("hello")
 	tb.commitRow()
-	col, _ = tb.getOrCreateColumn("s", qwpTypeString, false)
+	col, _ = tb.getOrCreateColumn("s", qwpTypeVarchar, false)
 	col.addString("world")
 	tb.commitRow()
 
@@ -1619,7 +1619,7 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 	tb2.commitRow()
 
 	tb3 := newQwpTableBuffer("gamma")
-	col, _ = tb3.getOrCreateColumn("z", qwpTypeString, false)
+	col, _ = tb3.getOrCreateColumn("z", qwpTypeVarchar, false)
 	col.addString("hello")
 	tb3.commitRow()
 
@@ -1873,13 +1873,13 @@ func TestQwpEncoderNullPackingLong(t *testing.T) {
 func TestQwpEncoderNullPackingString(t *testing.T) {
 	t.Run("NullableSomeNulls", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
-		col, _ := tb.getOrCreateColumn("s", qwpTypeString, true)
+		col, _ := tb.getOrCreateColumn("s", qwpTypeVarchar, true)
 		col.addString("abc")
 		tb.commitRow()
-		col, _ = tb.getOrCreateColumn("s", qwpTypeString, true)
+		col, _ = tb.getOrCreateColumn("s", qwpTypeVarchar, true)
 		col.addNull()
 		tb.commitRow()
-		col, _ = tb.getOrCreateColumn("s", qwpTypeString, true)
+		col, _ = tb.getOrCreateColumn("s", qwpTypeVarchar, true)
 		col.addString("de")
 		tb.commitRow()
 
@@ -1903,10 +1903,10 @@ func TestQwpEncoderNullPackingString(t *testing.T) {
 
 	t.Run("NullableAllNulls", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
-		col, _ := tb.getOrCreateColumn("s", qwpTypeString, true)
+		col, _ := tb.getOrCreateColumn("s", qwpTypeVarchar, true)
 		col.addNull()
 		tb.commitRow()
-		col, _ = tb.getOrCreateColumn("s", qwpTypeString, true)
+		col, _ = tb.getOrCreateColumn("s", qwpTypeVarchar, true)
 		col.addNull()
 		tb.commitRow()
 

@@ -39,14 +39,16 @@ const (
 	qwpTypeLong          qwpTypeCode = 0x05 // int64, 8 bytes LE
 	qwpTypeFloat         qwpTypeCode = 0x06 // IEEE 754 float32, 4 bytes LE
 	qwpTypeDouble        qwpTypeCode = 0x07 // IEEE 754 float64, 8 bytes LE
-	qwpTypeString        qwpTypeCode = 0x08 // variable, offset-based
+	// 0x08 was TYPE_STRING in an earlier revision of the QWP spec; it
+	// has been removed in favor of TYPE_VARCHAR (0x0F), which uses the
+	// same wire encoding. Do not reuse this code.
 	qwpTypeSymbol        qwpTypeCode = 0x09 // variable, dictionary-encoded
 	qwpTypeTimestamp     qwpTypeCode = 0x0A // int64 microseconds, 8 bytes LE
 	qwpTypeDate          qwpTypeCode = 0x0B // int64 milliseconds, 8 bytes LE
 	qwpTypeUuid          qwpTypeCode = 0x0C // 16 bytes (lo then hi, LE)
 	qwpTypeLong256       qwpTypeCode = 0x0D // 32 bytes (four int64s, LE)
 	qwpTypeGeohash       qwpTypeCode = 0x0E // varint precision + packed bits
-	qwpTypeVarchar       qwpTypeCode = 0x0F // variable, same encoding as string
+	qwpTypeVarchar       qwpTypeCode = 0x0F // variable, offset-based
 	qwpTypeTimestampNano qwpTypeCode = 0x10 // int64 nanoseconds, 8 bytes LE
 	qwpTypeDoubleArray   qwpTypeCode = 0x11 // N-dimensional float64 array
 	qwpTypeLongArray     qwpTypeCode = 0x12 // N-dimensional int64 array
@@ -165,7 +167,7 @@ func qwpFixedTypeSize(tc qwpTypeCode) int {
 		return 16
 	case qwpTypeLong256, qwpTypeDecimal256:
 		return 32
-	case qwpTypeString, qwpTypeSymbol, qwpTypeVarchar,
+	case qwpTypeSymbol, qwpTypeVarchar,
 		qwpTypeGeohash, qwpTypeDoubleArray, qwpTypeLongArray:
 		return -1 // variable-width
 	default:

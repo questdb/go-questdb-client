@@ -919,15 +919,15 @@ func TestQwpSenderUuidColumn(t *testing.T) {
 	}
 }
 
-func TestQwpSenderVarcharColumn(t *testing.T) {
+func TestQwpSenderStringColumn(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
 	s := newQwpSenderForTest(t, srv.URL)
 	defer s.Close(context.Background())
 
 	s.Table("t")
-	err := s.VarcharColumn("v", "hello world").
-		VarcharColumn("empty", "").
+	err := s.StringColumn("v", "hello world").
+		StringColumn("empty", "").
 		AtNow(context.Background())
 	if err != nil {
 		t.Fatalf("At: %v", err)
@@ -1106,7 +1106,7 @@ func TestQwpSenderMixedExtendedTypes(t *testing.T) {
 		CharColumn("c", 'X').
 		DateColumn("dt", ts).
 		UuidColumn("id", 0x1234, 0x5678).
-		VarcharColumn("vc", "test").
+		StringColumn("vc", "test").
 		AtNow(context.Background())
 	if err != nil {
 		t.Fatalf("At: %v", err)

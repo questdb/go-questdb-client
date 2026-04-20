@@ -60,7 +60,7 @@ func BenchmarkQwpEncode(b *testing.B) {
 		col, _ = tb.getOrCreateColumn("score", qwpTypeDouble, false)
 		col.addDouble(float64(i) * 0.1)
 
-		col, _ = tb.getOrCreateColumn("msg", qwpTypeString, false)
+		col, _ = tb.getOrCreateColumn("msg", qwpTypeVarchar, false)
 		col.addString("hello")
 
 		col, _ = tb.getOrCreateColumn("flag", qwpTypeBoolean, false)
@@ -226,7 +226,7 @@ func BenchmarkQwpColumnAdd(b *testing.B) {
 	})
 
 	b.Run("String", func(b *testing.B) {
-		col := newQwpColumnBuffer("val", qwpTypeString, false)
+		col := newQwpColumnBuffer("val", qwpTypeVarchar, false)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			col.addString("hello world")

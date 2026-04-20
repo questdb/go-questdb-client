@@ -62,9 +62,6 @@ type QwpSender interface {
 	// UuidColumn adds a UUID column value from high and low 64-bit parts.
 	UuidColumn(name string, hi, lo uint64) QwpSender
 
-	// VarcharColumn adds a VARCHAR column value.
-	VarcharColumn(name string, val string) QwpSender
-
 	// GeohashColumn adds a GEOHASH column value with the given bit precision.
 	GeohashColumn(name string, hash uint64, precision int) QwpSender
 
@@ -430,7 +427,7 @@ func (s *qwpLineSender) StringColumn(name, val string) LineSender {
 		s.lastErr = err
 		return s
 	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeString, true)
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeVarchar, true)
 	if err != nil {
 		s.lastErr = err
 		return s
@@ -1329,27 +1326,6 @@ func (s *qwpLineSender) UuidColumn(name string, hi, lo uint64) QwpSender {
 		return s
 	}
 	col.addUuid(hi, lo)
-	return s
-}
-
-func (s *qwpLineSender) VarcharColumn(name string, val string) QwpSender {
-	if s.lastErr != nil {
-		return s
-	}
-	if !s.hasTable {
-		s.lastErr = fmt.Errorf("qwp: VarcharColumn() called without Table()")
-		return s
-	}
-	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
-		s.lastErr = err
-		return s
-	}
-	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeVarchar, true)
-	if err != nil {
-		s.lastErr = err
-		return s
-	}
-	col.addString(val)
 	return s
 }
 

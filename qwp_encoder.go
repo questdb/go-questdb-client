@@ -256,7 +256,7 @@ func (e *qwpEncoder) encodeColumnData(col *qwpColumnBuffer) {
 	case qwpTypeTimestamp, qwpTypeTimestampNano:
 		e.encodeTimestampColumn(col)
 
-	case qwpTypeString, qwpTypeVarchar:
+	case qwpTypeVarchar:
 		e.encodeStringColumn(col)
 
 	case qwpTypeSymbol:

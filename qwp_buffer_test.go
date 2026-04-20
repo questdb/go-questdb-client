@@ -211,7 +211,7 @@ func TestQwpColumnBufferBool(t *testing.T) {
 
 func TestQwpColumnBufferString(t *testing.T) {
 	t.Run("TwoStrings", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeString, false)
+		c := newQwpColumnBuffer("col", qwpTypeVarchar, false)
 		c.addString("hello")
 		c.addString("world")
 
@@ -233,7 +233,7 @@ func TestQwpColumnBufferString(t *testing.T) {
 	})
 
 	t.Run("EmptyString", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeString, false)
+		c := newQwpColumnBuffer("col", qwpTypeVarchar, false)
 		c.addString("")
 		c.addString("abc")
 
@@ -392,7 +392,7 @@ func TestQwpColumnBufferAddNull(t *testing.T) {
 	})
 
 	t.Run("StringNullable", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeString, true)
+		c := newQwpColumnBuffer("col", qwpTypeVarchar, true)
 		c.addNull()
 
 		// Nullable null: only the initial offset [0], no extra offset.
@@ -569,7 +569,7 @@ func TestQwpColumnBufferNullBitmapFirstNullAcrossByteBoundary(t *testing.T) {
 }
 
 func TestQwpColumnBufferNullStringInterleaved(t *testing.T) {
-	c := newQwpColumnBuffer("col", qwpTypeString, true)
+	c := newQwpColumnBuffer("col", qwpTypeVarchar, true)
 	c.addString("hello") // row 0
 	c.addNull()          // row 1 (nullable: no offset appended)
 	c.addString("world") // row 2
@@ -627,7 +627,7 @@ func TestQwpColumnBufferReset(t *testing.T) {
 	})
 
 	t.Run("String", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeString, false)
+		c := newQwpColumnBuffer("col", qwpTypeVarchar, false)
 		c.addString("hello")
 		c.addString("world")
 
@@ -677,7 +677,7 @@ func TestQwpColumnBufferReset(t *testing.T) {
 
 	t.Run("ResetAndReuse", func(t *testing.T) {
 		// Verify that after reset, new data can be added correctly.
-		c := newQwpColumnBuffer("col", qwpTypeString, true)
+		c := newQwpColumnBuffer("col", qwpTypeVarchar, true)
 		c.addString("first")
 		c.addNull()
 
@@ -748,7 +748,7 @@ func TestQwpColumnBufferConstructor(t *testing.T) {
 	})
 
 	t.Run("StringType", func(t *testing.T) {
-		c := newQwpColumnBuffer("msg", qwpTypeString, false)
+		c := newQwpColumnBuffer("msg", qwpTypeVarchar, false)
 		if c.fixedSize != -1 {
 			t.Fatalf("fixedSize = %d, want -1", c.fixedSize)
 		}
@@ -843,7 +843,7 @@ func TestQwpColumnBufferTruncateTo(t *testing.T) {
 	})
 
 	t.Run("String", func(t *testing.T) {
-		c := newQwpColumnBuffer("col", qwpTypeString, false)
+		c := newQwpColumnBuffer("col", qwpTypeVarchar, false)
 		c.addString("hello")
 		c.addString("world")
 		c.addString("foo")
@@ -1128,11 +1128,11 @@ func TestQwpTableBufferCancelRow(t *testing.T) {
 	t.Run("CancelWithStringColumn", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
 
-		col, _ := tb.getOrCreateColumn("msg", qwpTypeString, false)
+		col, _ := tb.getOrCreateColumn("msg", qwpTypeVarchar, false)
 		col.addString("hello")
 		tb.commitRow()
 
-		col, _ = tb.getOrCreateColumn("msg", qwpTypeString, false)
+		col, _ = tb.getOrCreateColumn("msg", qwpTypeVarchar, false)
 		col.addString("world")
 		tb.cancelRow()
 
@@ -2302,7 +2302,7 @@ func TestQwpTableBufferRunningDataSize(t *testing.T) {
 		col, _ = tb.getOrCreateColumn("price", qwpTypeDouble, false)
 		col.addDouble(float64(i) * 1.5)
 
-		col, _ = tb.getOrCreateColumn("msg", qwpTypeString, false)
+		col, _ = tb.getOrCreateColumn("msg", qwpTypeVarchar, false)
 		col.addString("hello")
 
 		col, _ = tb.getOrCreateColumn("flag", qwpTypeBoolean, false)
