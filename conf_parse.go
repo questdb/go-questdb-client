@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -55,6 +55,11 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 	case "tcps":
 		senderConf = newLineSenderConfig(tcpSenderType)
 		senderConf.tlsMode = tlsEnabled
+	case "ws":
+		senderConf = newLineSenderConfig(qwpSenderType)
+	case "wss":
+		senderConf = newLineSenderConfig(qwpSenderType)
+		senderConf.tlsMode = tlsEnabled
 	default:
 		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
 	}
@@ -65,7 +70,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			senderConf.address = v
 		case "username":
 			switch senderConf.senderType {
-			case httpSenderType:
+			case httpSenderType, qwpSenderType:
 				senderConf.httpUser = v
 			case tcpSenderType:
 				senderConf.tcpKeyId = v
@@ -73,13 +78,13 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				panic("add a case for " + k)
 			}
 		case "password":
-			if senderConf.senderType != httpSenderType {
-				return nil, NewInvalidConfigStrError("%s is only supported for HTTP sender", k)
+			if senderConf.senderType != httpSenderType && senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for HTTP and QWP senders", k)
 			}
 			senderConf.httpPass = v
 		case "token":
 			switch senderConf.senderType {
-			case httpSenderType:
+			case httpSenderType, qwpSenderType:
 				senderConf.httpToken = v
 			case tcpSenderType:
 				senderConf.tcpKey = v
@@ -95,6 +100,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if v == "off" {
 				senderConf.autoFlushRows = 0
 				senderConf.autoFlushInterval = 0
+				senderConf.autoFlushBytes = 0
 			} else if v != "on" {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not 'on' or 'off'", k, v)
 			}
@@ -118,6 +124,16 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.autoFlushInterval = time.Duration(parsedVal) * time.Millisecond
+		case "auto_flush_bytes":
+			if v == "off" {
+				senderConf.autoFlushBytes = 0
+				continue
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			senderConf.autoFlushBytes = parsedVal
 		case "request_min_throughput", "init_buf_size", "max_buf_size":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
@@ -173,6 +189,45 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 					return nil, NewInvalidConfigStrError("current client only supports protocol version 1 (text format for all datatypes), 2 (binary format for part datatypes), 3 (decimals) or explicitly unset")
 				}
 				senderConf.protocolVersion = pVersion
+			}
+		case "in_flight_window":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			senderConf.inFlightWindow = parsedVal
+		case "close_timeout":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int (milliseconds)", k, v)
+			}
+			senderConf.closeTimeout = time.Duration(parsedVal) * time.Millisecond
+		case "max_schemas_per_connection":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			senderConf.maxSchemasPerConnection = parsedVal
+		case "gorilla":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "on":
+				senderConf.gorillaDisabled = false
+			case "off":
+				senderConf.gorillaDisabled = true
+			default:
+				return nil, NewInvalidConfigStrError("invalid gorilla value, %q is not 'on' or 'off'", v)
 			}
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)

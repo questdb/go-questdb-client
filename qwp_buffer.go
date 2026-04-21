@@ -1,0 +1,1063 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb
+
+import (
+	"encoding/binary"
+	"fmt"
+	"math"
+	"math/bits"
+)
+
+// qwpLongNull is the uint64 bit pattern for int64 MinInt64
+// (0x8000000000000000), used as the null sentinel for LONG,
+// TIMESTAMP, DATE, UUID, and LONG256 columns.
+const qwpLongNull uint64 = 0x8000000000000000
+
+// qwpColumnBuffer stores columnar data for a single column within a
+// QWP table buffer. Data is stored in a layout optimized for the QWP
+// wire encoding: fixed-width values in a contiguous byte slice,
+// booleans bit-packed, and strings as cumulative offsets plus a data
+// arena.
+//
+// Each column type uses a different subset of fields:
+//   - Fixed-width types (BYTE..LONG256): fixedData with fixedSize stride
+//   - BOOLEAN: boolData (bit-packed, LSB-first)
+//   - STRING/VARCHAR: strOffsets + strData
+//   - SYMBOL: symbolIDs (global dictionary IDs)
+//
+// For nullable columns, a null bitmap tracks which rows are NULL.
+// Data arrays contain only valueCount = rowCount - nullCount entries
+// (non-null values only). For non-nullable columns, data arrays
+// contain rowCount entries (sentinel values for null rows).
+type qwpColumnBuffer struct {
+	name     string
+	typeCode qwpTypeCode // base type code (without nullable flag)
+	nullable bool
+
+	// fixedSize is the per-value byte stride for fixed-width types,
+	// 0 for BOOLEAN (bit-packed), or -1 for variable-width types.
+	fixedSize int
+
+	// fixedData stores contiguous fixed-width values. For nullable
+	// columns, only non-null values are stored (valueCount entries).
+	// For non-nullable columns, all rows are stored including
+	// sentinel values (e.g. MinInt64 for LONG, NaN for DOUBLE).
+	fixedData []byte
+
+	// boolData stores bit-packed boolean values (TYPE_BOOLEAN only).
+	// Bit i corresponds to row i, LSB-first within each byte.
+	boolData []byte
+
+	// strOffsets and strData store variable-width string/varchar
+	// data. strOffsets has valueCount+1 entries with strOffsets[0]==0.
+	// String for value i spans strData[strOffsets[i]:strOffsets[i+1]].
+	// For nullable columns, only non-null values are stored.
+	strOffsets []uint32
+	strData    []byte
+
+	// symbolIDs stores one global symbol dictionary ID per value
+	// (TYPE_SYMBOL only). For nullable columns, only non-null
+	// values are stored. For non-nullable, null uses -1 sentinel.
+	symbolIDs []int32
+
+	// arrayOffsets and arrayData store variable-width N-dimensional
+	// array data (TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY). arrayOffsets
+	// has rowCount+1 entries with arrayOffsets[0]==0. Row i's encoded
+	// data spans arrayData[arrayOffsets[i]:arrayOffsets[i+1]].
+	// Each row's encoded data contains:
+	//   nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+	//   elements (product(shape) × 8 bytes LE).
+	// Null arrays are encoded as nDims=1, dim0=0 (5 bytes total).
+	arrayOffsets []uint32
+	arrayData    []byte
+
+	// nullBitmap has one bit per row for nullable columns only.
+	// A set bit means the row is NULL, LSB-first within each byte.
+	// May be shorter than (rowCount+7)/8 when trailing rows are
+	// non-null; the encoder pads with zero bytes.
+	nullBitmap []byte
+	nullCount  int
+
+	// rowCount is the total number of rows including nulls.
+	rowCount int
+
+	// table is the parent table buffer for running data size tracking.
+	// Nil for standalone columns in tests/benchmarks.
+	table *qwpTableBuffer
+
+	// scale is the decimal scale (0–76) for DECIMAL types, or -1
+	// if not yet established. Set on the first non-null decimal value.
+	scale int8
+
+	// geohashPrecision is the bit precision (1–60) for GEOHASH,
+	// or -1 if not yet established.
+	geohashPrecision int8
+}
+
+// newQwpColumnBuffer creates a column buffer for the given name,
+// type, and nullability. The fixedSize is derived from the type code.
+func newQwpColumnBuffer(name string, typeCode qwpTypeCode, nullable bool) *qwpColumnBuffer {
+	c := &qwpColumnBuffer{
+		name:             name,
+		typeCode:         typeCode,
+		nullable:         nullable,
+		fixedSize:        qwpFixedTypeSize(typeCode),
+		scale:            -1,
+		geohashPrecision: -1,
+	}
+	switch typeCode {
+	case qwpTypeVarchar:
+		c.strOffsets = []uint32{0}
+	case qwpTypeDoubleArray, qwpTypeLongArray:
+		c.arrayOffsets = []uint32{0}
+	}
+	return c
+}
+
+// --- null bitmap helpers ------------------------------------------------
+
+// markNull sets the null bit for the current row (at index rowCount)
+// and increments nullCount. The bitmap is grown as needed.
+//
+// Non-null appends (addLong, etc.) bump rowCount without touching the
+// bitmap, so the first null after a run of non-nulls may need to skip
+// past several bytes — grow to byteIdx+1 in a single append.
+func (c *qwpColumnBuffer) markNull() {
+	byteIdx := c.rowCount / 8
+	if need := byteIdx + 1 - len(c.nullBitmap); need > 0 {
+		c.nullBitmap = append(c.nullBitmap, make([]byte, need)...)
+		c.trackDataGrowth(need)
+	}
+	c.nullBitmap[byteIdx] |= 1 << uint(c.rowCount%8)
+	c.nullCount++
+}
+
+// nullBitmapLen returns the number of bytes needed for the null
+// bitmap to cover all rowCount rows.
+func (c *qwpColumnBuffer) nullBitmapLen() int {
+	return (c.rowCount + 7) / 8
+}
+
+// valueCount returns the number of non-null data entries stored
+// in this column. For nullable columns, this is rowCount - nullCount
+// (data arrays only contain non-null values). For non-nullable
+// columns, this equals rowCount (sentinels are stored for nulls).
+func (c *qwpColumnBuffer) valueCount() int {
+	if c.nullable {
+		return c.rowCount - c.nullCount
+	}
+	return c.rowCount
+}
+
+// countNullsInFirstN counts the number of null bits set in the
+// null bitmap for the first n rows. Used by truncateTo to determine
+// how many data entries correspond to the first n rows.
+func countNullsInFirstN(bitmap []byte, n int) int {
+	if n == 0 {
+		return 0
+	}
+	fullBytes := n / 8
+	count := 0
+	for i := 0; i < fullBytes && i < len(bitmap); i++ {
+		count += bits.OnesCount8(bitmap[i])
+	}
+	rem := n % 8
+	if rem > 0 && fullBytes < len(bitmap) {
+		mask := byte((1 << uint(rem)) - 1)
+		count += bits.OnesCount8(bitmap[fullBytes] & mask)
+	}
+	return count
+}
+
+// trackDataGrowth increments the parent table's running data size
+// counter. No-op if the column is not attached to a table (standalone
+// tests/benchmarks).
+func (c *qwpColumnBuffer) trackDataGrowth(n int) {
+	if c.table != nil {
+		c.table.dataSize += n
+	}
+}
+
+// --- fixed-width append helpers -----------------------------------------
+// These write directly into fixedData with no intermediate allocation.
+
+func (c *qwpColumnBuffer) appendByte(v byte) {
+	c.fixedData = append(c.fixedData, v)
+	c.trackDataGrowth(1)
+}
+
+func (c *qwpColumnBuffer) appendU16(v uint16) {
+	n := len(c.fixedData)
+	c.fixedData = append(c.fixedData, 0, 0)
+	binary.LittleEndian.PutUint16(c.fixedData[n:], v)
+	c.trackDataGrowth(2)
+}
+
+func (c *qwpColumnBuffer) appendU32(v uint32) {
+	n := len(c.fixedData)
+	c.fixedData = append(c.fixedData, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(c.fixedData[n:], v)
+	c.trackDataGrowth(4)
+}
+
+func (c *qwpColumnBuffer) appendU64(v uint64) {
+	n := len(c.fixedData)
+	c.fixedData = append(c.fixedData, 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint64(c.fixedData[n:], v)
+	c.trackDataGrowth(8)
+}
+
+// --- per-type add methods -----------------------------------------------
+
+// addByte appends an int8 value (TYPE_BYTE).
+func (c *qwpColumnBuffer) addByte(v int8) {
+	c.appendByte(byte(v))
+	c.rowCount++
+}
+
+// addShort appends an int16 value in LE byte order (TYPE_SHORT).
+func (c *qwpColumnBuffer) addShort(v int16) {
+	c.appendU16(uint16(v))
+	c.rowCount++
+}
+
+// addInt32 appends an int32 value in LE byte order (TYPE_INT).
+func (c *qwpColumnBuffer) addInt32(v int32) {
+	c.appendU32(uint32(v))
+	c.rowCount++
+}
+
+// addLong appends an int64 value in LE byte order (TYPE_LONG).
+func (c *qwpColumnBuffer) addLong(v int64) {
+	c.appendU64(uint64(v))
+	c.rowCount++
+}
+
+// addFloat32 appends an IEEE 754 float32 in LE byte order (TYPE_FLOAT).
+func (c *qwpColumnBuffer) addFloat32(v float32) {
+	c.appendU32(math.Float32bits(v))
+	c.rowCount++
+}
+
+// addDouble appends an IEEE 754 float64 in LE byte order (TYPE_DOUBLE).
+func (c *qwpColumnBuffer) addDouble(v float64) {
+	c.appendU64(math.Float64bits(v))
+	c.rowCount++
+}
+
+// addTimestamp appends an int64 timestamp in LE byte order. Used for
+// TYPE_TIMESTAMP (micros), TYPE_TIMESTAMP_NANO (nanos), and TYPE_DATE
+// (millis); the unit is implied by the column's type code.
+func (c *qwpColumnBuffer) addTimestamp(v int64) {
+	c.appendU64(uint64(v))
+	c.rowCount++
+}
+
+// addBool appends a boolean value, bit-packed into boolData.
+// Bit position is based on valueCount (non-null values only for
+// nullable columns), LSB-first within each byte (TYPE_BOOLEAN).
+func (c *qwpColumnBuffer) addBool(v bool) {
+	vc := c.valueCount()
+	byteIdx := vc / 8
+	if len(c.boolData) <= byteIdx {
+		c.boolData = append(c.boolData, 0)
+		c.trackDataGrowth(1)
+	}
+	if v {
+		c.boolData[byteIdx] |= 1 << uint(vc%8)
+	}
+	c.rowCount++
+}
+
+// addString appends a UTF-8 string value. The string bytes are
+// concatenated into strData and a cumulative offset is appended
+// to strOffsets (TYPE_STRING, TYPE_VARCHAR).
+func (c *qwpColumnBuffer) addString(v string) {
+	c.strData = append(c.strData, v...)
+	c.strOffsets = append(c.strOffsets, uint32(len(c.strData)))
+	c.trackDataGrowth(len(v) + 4) // string bytes + uint32 offset
+	c.rowCount++
+}
+
+// addSymbolID appends a global symbol dictionary ID (TYPE_SYMBOL).
+func (c *qwpColumnBuffer) addSymbolID(id int32) {
+	c.symbolIDs = append(c.symbolIDs, id)
+	c.trackDataGrowth(4)
+	c.rowCount++
+}
+
+// addChar appends a rune as a UTF-16 code unit in LE byte order
+// (TYPE_CHAR). Only BMP code points (U+0000..U+FFFF) are supported.
+func (c *qwpColumnBuffer) addChar(v rune) {
+	c.appendU16(uint16(v))
+	c.rowCount++
+}
+
+// addUuid appends a UUID as two uint64s in wire order: lo first,
+// then hi, both little-endian (TYPE_UUID, 16 bytes total).
+func (c *qwpColumnBuffer) addUuid(hi, lo uint64) {
+	c.appendU64(lo)
+	c.appendU64(hi)
+	c.rowCount++
+}
+
+// addLong256 appends a 256-bit integer as four uint64s in
+// little-endian byte order (TYPE_LONG256, 32 bytes total).
+func (c *qwpColumnBuffer) addLong256(l0, l1, l2, l3 uint64) {
+	c.appendU64(l0)
+	c.appendU64(l1)
+	c.appendU64(l2)
+	c.appendU64(l3)
+	c.rowCount++
+}
+
+// addGeohash appends a geohash value as a uint64 in LE byte order
+// (TYPE_GEOHASH). The precision (1–60 bits) is tracked per column:
+// the first non-null value establishes it, and all subsequent
+// values must use the same precision. Returns an error if the
+// precision conflicts.
+//
+// The value is stored as 8 bytes in fixedData for efficient
+// random access. At encoding time, only ceil(precision/8) bytes
+// are written to the wire per row.
+func (c *qwpColumnBuffer) addGeohash(value uint64, precision int8) error {
+	if c.geohashPrecision < 0 {
+		c.geohashPrecision = precision
+	} else if c.geohashPrecision != precision {
+		return fmt.Errorf(
+			"qwp: column %q: geohash precision %d conflicts with established precision %d",
+			c.name, precision, c.geohashPrecision,
+		)
+	}
+	c.appendU64(value)
+	c.rowCount++
+	return nil
+}
+
+// qwpValidateArrayShape checks that each dimension is non-negative and
+// fits within MaxArrayElements, and that the product of all dimensions
+// does not overflow or exceed MaxArrayElements. Mirrors Java's
+// Math.multiplyExact discipline on the element-count product so that
+// adversarial inputs cannot produce a bogus int32 shape when the
+// caller later casts each dimension.
+func qwpValidateArrayShape(shape []int) error {
+	total := 1
+	for i, d := range shape {
+		if d < 0 {
+			return fmt.Errorf("qwp: array dimension %d is negative: %d", i, d)
+		}
+		if d > MaxArrayElements {
+			return fmt.Errorf(
+				"qwp: array dimension %d size %d exceeds maximum %d",
+				i, d, MaxArrayElements,
+			)
+		}
+		if d == 0 {
+			total = 0
+			continue
+		}
+		if total > MaxArrayElements/d {
+			return fmt.Errorf(
+				"qwp: array element count exceeds maximum %d",
+				MaxArrayElements,
+			)
+		}
+		total *= d
+	}
+	return nil
+}
+
+// growArrayData extends c.arrayData by n bytes and returns the start
+// offset of the new region. Capacity is doubled on growth (mirroring
+// qwpWireBuffer.ensure) so repeated row appends amortize to no
+// per-row allocation. The new region is not zero-initialized; callers
+// must overwrite every byte.
+func (c *qwpColumnBuffer) growArrayData(n int) int {
+	off := len(c.arrayData)
+	need := off + n
+	if need > cap(c.arrayData) {
+		newCap := 2 * cap(c.arrayData)
+		if newCap < need {
+			newCap = need
+		}
+		newBuf := make([]byte, off, newCap)
+		copy(newBuf, c.arrayData)
+		c.arrayData = newBuf
+	}
+	c.arrayData = c.arrayData[:need]
+	return off
+}
+
+// addDoubleArray appends an N-dimensional float64 array value
+// (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
+//
+//	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+//	elements (product(shape) × 8 bytes LE, row-major order).
+func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []float64) {
+	metaSize := 1 + int(nDims)*4
+	dataSize := len(flatData) * 8
+	totalSize := metaSize + dataSize
+
+	off := c.growArrayData(totalSize)
+	buf := c.arrayData[off:]
+
+	// nDims
+	buf[0] = nDims
+	pos := 1
+
+	// shape: each dimension as uint32 LE
+	for i := 0; i < int(nDims); i++ {
+		binary.LittleEndian.PutUint32(buf[pos:], uint32(shape[i]))
+		pos += 4
+	}
+
+	// flattened elements: each float64 LE
+	for _, v := range flatData {
+		binary.LittleEndian.PutUint64(buf[pos:], math.Float64bits(v))
+		pos += 8
+	}
+
+	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+	c.trackDataGrowth(totalSize + 4) // array data + uint32 offset
+	c.rowCount++
+}
+
+// addLongArray appends an N-dimensional int64 array value
+// (TYPE_LONG_ARRAY). The encoded data is stored as:
+//
+//	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+//	elements (product(shape) × 8 bytes LE, row-major order).
+func (c *qwpColumnBuffer) addLongArray(nDims uint8, shape []int32, flatData []int64) {
+	metaSize := 1 + int(nDims)*4
+	dataSize := len(flatData) * 8
+	totalSize := metaSize + dataSize
+
+	off := c.growArrayData(totalSize)
+	buf := c.arrayData[off:]
+
+	// nDims
+	buf[0] = nDims
+	pos := 1
+
+	// shape: each dimension as uint32 LE
+	for i := 0; i < int(nDims); i++ {
+		binary.LittleEndian.PutUint32(buf[pos:], uint32(shape[i]))
+		pos += 4
+	}
+
+	// flattened elements: each int64 LE
+	for _, v := range flatData {
+		binary.LittleEndian.PutUint64(buf[pos:], uint64(v))
+		pos += 8
+	}
+
+	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+	c.trackDataGrowth(totalSize + 4) // array data + uint32 offset
+	c.rowCount++
+}
+
+// addDecimal appends a Decimal value to a decimal column
+// (TYPE_DECIMAL64, TYPE_DECIMAL128, or TYPE_DECIMAL256). The
+// unscaled value is written in little-endian byte order, sign-extended
+// to fill the column's fixed width (8, 16, or 32 bytes).
+//
+// Scale is tracked per column: the first non-null value establishes
+// the scale, and all subsequent values must have the same scale.
+// Returns an error if the scale conflicts or the value overflows
+// the column's storage size.
+//
+// If the Decimal is null, addNull() is called instead.
+func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
+	if d.isNull() {
+		c.addNull()
+		return nil
+	}
+
+	// Validate scale bounds.
+	if d.scale > maxDecimalScale {
+		return fmt.Errorf(
+			"qwp: column %q: decimal scale %d exceeds maximum %d",
+			c.name, d.scale, maxDecimalScale,
+		)
+	}
+
+	// Validate scale consistency without mutating c.scale yet — the
+	// subsequent overflow check may still reject the value, and we
+	// must not leave the column with a latched scale if no row is
+	// actually written.
+	if c.scale >= 0 && uint32(c.scale) != d.scale {
+		return fmt.Errorf(
+			"qwp: column %q: decimal scale %d conflicts with established scale %d",
+			c.name, d.scale, c.scale,
+		)
+	}
+
+	wireSize := c.fixedSize // 8, 16, or 32
+	startOffset := uint8(32 - wireSize)
+
+	// Check for overflow: significant bytes that don't fit.
+	if d.offset < startOffset {
+		// Verify the bytes beyond wire size are pure sign extension.
+		signByte := byte(0x00)
+		if d.unscaled[d.offset]&0x80 != 0 {
+			signByte = 0xFF
+		}
+		for i := d.offset; i < startOffset; i++ {
+			if d.unscaled[i] != signByte {
+				return fmt.Errorf(
+					"qwp: column %q: decimal value overflows %d-byte storage",
+					c.name, wireSize,
+				)
+			}
+		}
+	}
+
+	// Write sign-extended little-endian unscaled value. The internal
+	// representation is 32-byte big-endian (unscaled[0] = MSB,
+	// unscaled[31] = LSB); reverse to produce LE wire bytes and
+	// sign-extend any positions above the significant bytes.
+	n := len(c.fixedData)
+	c.fixedData = append(c.fixedData, make([]byte, wireSize)...)
+	dst := c.fixedData[n:]
+
+	var signByte byte
+	if d.offset < 32 && d.unscaled[d.offset]&0x80 != 0 {
+		signByte = 0xFF
+	}
+
+	for i := range dst {
+		srcIdx := 31 - i
+		if uint8(srcIdx) < d.offset {
+			dst[i] = signByte
+		} else {
+			dst[i] = d.unscaled[srcIdx]
+		}
+	}
+
+	// Commit the scale only after the row was successfully written.
+	if c.scale < 0 {
+		c.scale = int8(d.scale)
+	}
+	c.trackDataGrowth(wireSize)
+	c.rowCount++
+	return nil
+}
+
+// addNull marks a row as null. For nullable columns, only the null
+// bitmap is set — no sentinel data is appended to the data arrays.
+// This means data arrays contain only valueCount = rowCount - nullCount
+// entries (non-null values only), which matches the QWP wire format.
+//
+// For non-nullable columns, type-appropriate sentinel values are
+// appended so that data arrays always have rowCount entries:
+//   - LONG/TIMESTAMP/DATE: math.MinInt64
+//   - DOUBLE: NaN, FLOAT: NaN
+//   - INT/SHORT/BYTE/CHAR: 0
+//   - STRING/VARCHAR: empty (repeated offset)
+//   - SYMBOL: -1
+//   - UUID: two MinInt64, LONG256: four MinInt64
+func (c *qwpColumnBuffer) addNull() {
+	if c.nullable {
+		// Nullable columns: only mark the bitmap, no data appended.
+		// The wire format expects valueCount data entries (non-null
+		// rows only), identified by the null bitmap.
+		c.markNull()
+		c.rowCount++
+		return
+	}
+
+	// Non-nullable columns: append sentinel data so that data
+	// arrays have rowCount entries. The wire format for non-nullable
+	// columns expects rowCount values (no bitmap).
+	switch c.typeCode {
+	case qwpTypeBoolean:
+		// False sentinel; bit stays 0 from zero-initialization.
+		byteIdx := c.rowCount / 8
+		if len(c.boolData) <= byteIdx {
+			c.boolData = append(c.boolData, 0)
+			c.trackDataGrowth(1)
+		}
+
+	case qwpTypeByte:
+		c.appendByte(0)
+
+	case qwpTypeShort, qwpTypeChar:
+		c.fixedData = append(c.fixedData, 0, 0)
+		c.trackDataGrowth(2)
+
+	case qwpTypeInt:
+		c.fixedData = append(c.fixedData, 0, 0, 0, 0)
+		c.trackDataGrowth(4)
+
+	case qwpTypeFloat:
+		c.appendU32(math.Float32bits(float32(math.NaN())))
+
+	case qwpTypeLong, qwpTypeTimestamp, qwpTypeDate, qwpTypeTimestampNano:
+		c.appendU64(qwpLongNull)
+
+	case qwpTypeDouble:
+		c.appendU64(math.Float64bits(math.NaN()))
+
+	case qwpTypeVarchar:
+		// Repeat current offset → zero-length string sentinel.
+		c.strOffsets = append(c.strOffsets, uint32(len(c.strData)))
+		c.trackDataGrowth(4)
+
+	case qwpTypeSymbol:
+		c.symbolIDs = append(c.symbolIDs, -1)
+		c.trackDataGrowth(4)
+
+	case qwpTypeUuid:
+		c.appendU64(qwpLongNull)
+		c.appendU64(qwpLongNull)
+
+	case qwpTypeLong256:
+		c.appendU64(qwpLongNull)
+		c.appendU64(qwpLongNull)
+		c.appendU64(qwpLongNull)
+		c.appendU64(qwpLongNull)
+
+	case qwpTypeDoubleArray, qwpTypeLongArray:
+		// Null array sentinel: nDims=1, dim0=0 (5 bytes total).
+		off := len(c.arrayData)
+		c.arrayData = append(c.arrayData, 0, 0, 0, 0, 0)
+		c.arrayData[off] = 0x01 // nDims = 1
+		// dim0 = 0 (already zero from append)
+		c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
+		c.trackDataGrowth(5 + 4) // 5 data + uint32 offset
+
+	case qwpTypeGeohash:
+		// -1 (all bits set) is the QuestDB geohash null sentinel.
+		c.appendU64(math.MaxUint64)
+
+	case qwpTypeDecimal64:
+		c.fixedData = append(c.fixedData, 0, 0, 0, 0, 0, 0, 0, 0)
+		c.trackDataGrowth(8)
+
+	case qwpTypeDecimal128:
+		c.fixedData = append(c.fixedData,
+			0, 0, 0, 0, 0, 0, 0, 0,
+			0, 0, 0, 0, 0, 0, 0, 0)
+		c.trackDataGrowth(16)
+
+	case qwpTypeDecimal256:
+		c.fixedData = append(c.fixedData,
+			0, 0, 0, 0, 0, 0, 0, 0,
+			0, 0, 0, 0, 0, 0, 0, 0,
+			0, 0, 0, 0, 0, 0, 0, 0,
+			0, 0, 0, 0, 0, 0, 0, 0)
+		c.trackDataGrowth(32)
+
+	default:
+		panic("qwp: addNull called on unsupported column type")
+	}
+
+	c.rowCount++
+}
+
+// reset clears all row data but retains the backing array capacity
+// and column metadata (name, type, nullable, scale, precision).
+func (c *qwpColumnBuffer) reset() {
+	c.fixedData = c.fixedData[:0]
+	c.boolData = c.boolData[:0]
+	if c.typeCode == qwpTypeVarchar {
+		c.strOffsets = c.strOffsets[:1]
+		c.strOffsets[0] = 0
+	} else {
+		c.strOffsets = c.strOffsets[:0]
+	}
+	c.strData = c.strData[:0]
+	c.symbolIDs = c.symbolIDs[:0]
+	if c.typeCode == qwpTypeDoubleArray || c.typeCode == qwpTypeLongArray {
+		c.arrayOffsets = c.arrayOffsets[:1]
+		c.arrayOffsets[0] = 0
+	} else {
+		c.arrayOffsets = c.arrayOffsets[:0]
+	}
+	c.arrayData = c.arrayData[:0]
+	c.nullBitmap = c.nullBitmap[:0]
+	c.nullCount = 0
+	c.rowCount = 0
+}
+
+// truncateTo rolls the column back to exactly n rows, discarding
+// any data beyond that point. Used by qwpTableBuffer.cancelRow().
+//
+// For nullable columns, data arrays contain only valueCount entries
+// (non-null values). To truncate to n rows, we first count nulls
+// in the first n rows to determine newValueCount, then truncate
+// data arrays to that count. For non-nullable columns, data arrays
+// have rowCount entries, and newValueCount = n.
+func (c *qwpColumnBuffer) truncateTo(n int) {
+	if n >= c.rowCount {
+		return
+	}
+
+	// Compute how many data entries correspond to the first n rows.
+	// For nullable columns, skip null rows (no data stored).
+	// For non-nullable, newVC = n (sentinel data is stored).
+	nullsInN := 0
+	if c.nullable {
+		nullsInN = countNullsInFirstN(c.nullBitmap, n)
+	}
+	newVC := n - nullsInN
+
+	switch c.typeCode {
+	case qwpTypeBoolean:
+		newLen := (newVC + 7) / 8
+		if newLen < len(c.boolData) {
+			c.boolData = c.boolData[:newLen]
+		}
+		// Clear any trailing bits in the last byte.
+		if newVC > 0 && newVC%8 != 0 {
+			c.boolData[newLen-1] &= (1 << uint(newVC%8)) - 1
+		}
+
+	case qwpTypeVarchar:
+		c.strOffsets = c.strOffsets[:newVC+1]
+		c.strData = c.strData[:c.strOffsets[newVC]]
+
+	case qwpTypeSymbol:
+		c.symbolIDs = c.symbolIDs[:newVC]
+
+	case qwpTypeDoubleArray, qwpTypeLongArray:
+		c.arrayOffsets = c.arrayOffsets[:newVC+1]
+		c.arrayData = c.arrayData[:c.arrayOffsets[newVC]]
+
+	case qwpTypeGeohash:
+		// Geohash stores 8 bytes per value in fixedData despite
+		// fixedSize being -1 (wire size depends on precision).
+		c.fixedData = c.fixedData[:newVC*8]
+
+	default:
+		// Fixed-width types.
+		if c.fixedSize > 0 {
+			c.fixedData = c.fixedData[:newVC*c.fixedSize]
+		}
+	}
+
+	// Truncate null bitmap and recount.
+	if c.nullable {
+		newBitmapLen := (n + 7) / 8
+		if newBitmapLen < len(c.nullBitmap) {
+			c.nullBitmap = c.nullBitmap[:newBitmapLen]
+		}
+		if n > 0 && n%8 != 0 && newBitmapLen-1 < len(c.nullBitmap) {
+			c.nullBitmap[newBitmapLen-1] &= (1 << uint(n%8)) - 1
+		}
+		c.nullCount = 0
+		for _, b := range c.nullBitmap {
+			c.nullCount += bits.OnesCount8(b)
+		}
+	}
+
+	c.rowCount = n
+}
+
+// --- qwpTableBuffer ---------------------------------------------------
+
+// qwpTableBuffer aggregates columnar data for a single table. It
+// manages multiple qwpColumnBuffer instances and handles row commits
+// with automatic gap-filling for columns not set in a given row.
+type qwpTableBuffer struct {
+	tableName   string
+	columns     []*qwpColumnBuffer
+	columnIndex map[string]int // column name → index in columns slice
+
+	// rowCount is the number of committed (finalized) rows.
+	rowCount int
+
+	// committedColumnCount tracks how many columns existed at the
+	// last commitRow() call. Columns with index >= this value were
+	// added during the current in-progress row and should be
+	// removed on cancelRow().
+	committedColumnCount int
+
+	// columnAccessCursor predicts the next column in sequence for
+	// getOrCreateColumn. When callers set the same columns in the
+	// same order every row, the cursor lets us skip the map lookup
+	// entirely. Reset to 0 on every row boundary (commitRow,
+	// cancelRow, reset). Mirrors QwpTableBuffer.columnAccessCursor
+	// in the Java client.
+	columnAccessCursor int
+
+	// schemaId is the per-connection schema identifier for this
+	// table's current column set. -1 means unassigned — the sender
+	// allocates a fresh ID from its nextSchemaId counter on the next
+	// flush and sends the schema in full mode. Reset to -1 whenever
+	// the column set changes so a new ID is allocated and the server
+	// re-registers the schema.
+	schemaId int
+
+	// dataSize is a running counter of approximate data bytes stored
+	// across all columns. Incremented by column addX methods via
+	// trackDataGrowth. Reset to 0 in reset(), recomputed from scratch
+	// in cancelRow(). Makes approxDataSize() O(1).
+	dataSize int
+}
+
+// newQwpTableBuffer creates a table buffer for the given table name.
+func newQwpTableBuffer(tableName string) *qwpTableBuffer {
+	return &qwpTableBuffer{
+		tableName:   tableName,
+		columnIndex: make(map[string]int),
+		schemaId:    -1,
+	}
+}
+
+// getOrCreateColumn looks up an existing column by name or creates a
+// new one. Returns an error if a column with the same name but a
+// different type already exists, or if the column was already set
+// for the current in-progress row (duplicate column in same row).
+func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, nullable bool) (*qwpColumnBuffer, error) {
+	// Fast path: predict the next column in sequence. When columns are
+	// set in the same order every row, this avoids the map lookup
+	// entirely. Falls through to the map on name mismatch.
+	if tb.columnAccessCursor < len(tb.columns) {
+		col := tb.columns[tb.columnAccessCursor]
+		if col.name == name {
+			if col.typeCode != typeCode {
+				return nil, fmt.Errorf(
+					"qwp: column %q type conflict: existing %d, got %d",
+					name, col.typeCode, typeCode,
+				)
+			}
+			if col.rowCount > tb.rowCount {
+				return nil, fmt.Errorf("qwp: column %q already set for current row", name)
+			}
+			tb.columnAccessCursor++
+			return col, nil
+		}
+	}
+
+	idx, exists := tb.columnIndex[name]
+	if exists {
+		col := tb.columns[idx]
+		if col.typeCode != typeCode {
+			return nil, fmt.Errorf(
+				"qwp: column %q type conflict: existing %d, got %d",
+				name, col.typeCode, typeCode,
+			)
+		}
+		// Check for duplicate column within the same row.
+		if col.rowCount > tb.rowCount {
+			return nil, fmt.Errorf("qwp: column %q already set for current row", name)
+		}
+		return col, nil
+	}
+
+	// New column. Check limits.
+	if len(tb.columns) >= qwpMaxColumnsPerTable {
+		return nil, fmt.Errorf(
+			"qwp: table %q exceeds maximum column count (%d)",
+			tb.tableName, qwpMaxColumnsPerTable,
+		)
+	}
+
+	col := newQwpColumnBuffer(name, typeCode, nullable)
+	col.table = tb
+
+	// Account for initial offset entries (strOffsets[0] or arrayOffsets[0]).
+	switch typeCode {
+	case qwpTypeVarchar, qwpTypeDoubleArray, qwpTypeLongArray:
+		tb.dataSize += 4
+	}
+
+	// Backfill with nulls for all previously committed rows so
+	// the new column has the same row count as the table.
+	for i := 0; i < tb.rowCount; i++ {
+		col.addNull()
+	}
+
+	tb.columnIndex[name] = len(tb.columns)
+	tb.columns = append(tb.columns, col)
+	tb.schemaId = -1
+	return col, nil
+}
+
+// getOrCreateDesignatedTimestamp returns the designated timestamp
+// column, creating it if needed. The designated timestamp uses an
+// empty string name to distinguish it from regular columns (which
+// cannot have empty names). This matches the Java client behavior.
+//
+// typeCode selects the resolution for a new column (qwpTypeTimestamp
+// for microseconds or qwpTypeTimestampNano for nanoseconds). If the
+// column already exists, the requested typeCode must match its
+// existing type, otherwise the two resolutions would share one column
+// on the wire and the server would misinterpret the values.
+func (tb *qwpTableBuffer) getOrCreateDesignatedTimestamp(typeCode qwpTypeCode) (*qwpColumnBuffer, error) {
+	const dtName = "" // empty name = designated timestamp
+	idx, exists := tb.columnIndex[dtName]
+	if exists {
+		col := tb.columns[idx]
+		if col.typeCode != typeCode {
+			return nil, fmt.Errorf(
+				"qwp: designated timestamp type conflict: table uses 0x%02X, got 0x%02X",
+				col.typeCode, typeCode,
+			)
+		}
+		if col.rowCount > tb.rowCount {
+			return nil, fmt.Errorf("qwp: designated timestamp already set for current row")
+		}
+		return col, nil
+	}
+
+	col := newQwpColumnBuffer(dtName, typeCode, true)
+	col.table = tb
+	for i := 0; i < tb.rowCount; i++ {
+		col.addNull()
+	}
+
+	tb.columnIndex[dtName] = len(tb.columns)
+	tb.columns = append(tb.columns, col)
+	tb.schemaId = -1
+	return col, nil
+}
+
+// commitRow finalizes the current in-progress row. Any column that
+// was not set for this row is gap-filled with a null sentinel.
+func (tb *qwpTableBuffer) commitRow() {
+	for _, col := range tb.columns {
+		if col.rowCount <= tb.rowCount {
+			col.addNull()
+		}
+	}
+	tb.rowCount++
+	tb.committedColumnCount = len(tb.columns)
+	tb.columnAccessCursor = 0
+}
+
+// cancelRow discards the current in-progress row, rolling back any
+// column values that were set since the last commitRow(). Columns
+// that were created during this row are removed entirely.
+func (tb *qwpTableBuffer) cancelRow() {
+	// Remove columns created during this row.
+	if len(tb.columns) > tb.committedColumnCount {
+		for i := tb.committedColumnCount; i < len(tb.columns); i++ {
+			delete(tb.columnIndex, tb.columns[i].name)
+		}
+		tb.columns = tb.columns[:tb.committedColumnCount]
+		tb.schemaId = -1
+	}
+
+	// Truncate any columns that were set during this row.
+	for _, col := range tb.columns {
+		if col.rowCount > tb.rowCount {
+			col.truncateTo(tb.rowCount)
+		}
+	}
+
+	tb.columnAccessCursor = 0
+
+	// Recompute from scratch since truncation makes incremental
+	// tracking impractical (this is the rare path).
+	tb.recomputeDataSize()
+}
+
+// reset clears all row data and columns, retaining the table name.
+// Preserves schemaId: between flushes the column set is unchanged,
+// so the server's registry entry is still valid.
+func (tb *qwpTableBuffer) reset() {
+	for _, col := range tb.columns {
+		col.reset()
+	}
+	tb.rowCount = 0
+	tb.committedColumnCount = 0
+	tb.columnAccessCursor = 0
+
+	// Reset data size, then re-account for initial offset entries
+	// that column reset() preserves (strOffsets[:1], arrayOffsets[:1]).
+	tb.dataSize = 0
+	for _, col := range tb.columns {
+		switch col.typeCode {
+		case qwpTypeVarchar, qwpTypeDoubleArray, qwpTypeLongArray:
+			tb.dataSize += 4
+		}
+	}
+}
+
+// approxDataSize returns the approximate number of bytes of column
+// data currently stored in this table buffer. This is O(1) — it
+// returns the running counter maintained by column addX methods.
+func (tb *qwpTableBuffer) approxDataSize() int {
+	return tb.dataSize
+}
+
+// recomputeDataSize recalculates dataSize from scratch by iterating
+// all columns. Used after cancelRow() which may truncate columns.
+func (tb *qwpTableBuffer) recomputeDataSize() {
+	size := 0
+	for _, col := range tb.columns {
+		size += len(col.fixedData)
+		size += len(col.strData)
+		size += len(col.boolData)
+		size += len(col.arrayData)
+		size += len(col.symbolIDs) * 4
+		size += len(col.strOffsets) * 4
+		size += len(col.arrayOffsets) * 4
+		size += len(col.nullBitmap)
+	}
+	tb.dataSize = size
+}
+
+// --- name validation ---
+
+// qwpValidateTableName validates a table name using the same rules
+// as the existing ILP buffer.
+func qwpValidateTableName(name string, limit int) error {
+	if name == "" {
+		return fmt.Errorf("qwp: table name cannot be empty")
+	}
+	if limit > 0 && len(name) > limit {
+		return fmt.Errorf("qwp: table name length %d exceeds limit %d", len(name), limit)
+	}
+	if name[0] == '.' || name[len(name)-1] == '.' {
+		return fmt.Errorf("qwp: table name %q cannot start or end with '.'", name)
+	}
+	for i := 0; i < len(name); i++ {
+		if illegalTableNameChar(name[i]) {
+			return fmt.Errorf("qwp: table name %q contains illegal character", name)
+		}
+	}
+	return nil
+}
+
+// qwpValidateColumnName validates a column name using the same
+// rules as the existing ILP buffer.
+func qwpValidateColumnName(name string, limit int) error {
+	if name == "" {
+		return fmt.Errorf("qwp: column name cannot be empty")
+	}
+	if limit > 0 && len(name) > limit {
+		return fmt.Errorf("qwp: column name length %d exceeds limit %d", len(name), limit)
+	}
+	for i := 0; i < len(name); i++ {
+		if illegalColumnNameChar(name[i]) {
+			return fmt.Errorf("qwp: column name %q contains illegal character", name)
+		}
+	}
+	return nil
+}
