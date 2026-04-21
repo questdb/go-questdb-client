@@ -390,6 +390,27 @@ func qwpValidateArrayShape(shape []int) error {
 	return nil
 }
 
+// growArrayData extends c.arrayData by n bytes and returns the start
+// offset of the new region. Capacity is doubled on growth (mirroring
+// qwpWireBuffer.ensure) so repeated row appends amortize to no
+// per-row allocation. The new region is not zero-initialized; callers
+// must overwrite every byte.
+func (c *qwpColumnBuffer) growArrayData(n int) int {
+	off := len(c.arrayData)
+	need := off + n
+	if need > cap(c.arrayData) {
+		newCap := 2 * cap(c.arrayData)
+		if newCap < need {
+			newCap = need
+		}
+		newBuf := make([]byte, off, newCap)
+		copy(newBuf, c.arrayData)
+		c.arrayData = newBuf
+	}
+	c.arrayData = c.arrayData[:need]
+	return off
+}
+
 // addDoubleArray appends an N-dimensional float64 array value
 // (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
 //
@@ -400,8 +421,7 @@ func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []
 	dataSize := len(flatData) * 8
 	totalSize := metaSize + dataSize
 
-	off := len(c.arrayData)
-	c.arrayData = append(c.arrayData, make([]byte, totalSize)...)
+	off := c.growArrayData(totalSize)
 	buf := c.arrayData[off:]
 
 	// nDims
@@ -435,8 +455,7 @@ func (c *qwpColumnBuffer) addLongArray(nDims uint8, shape []int32, flatData []in
 	dataSize := len(flatData) * 8
 	totalSize := metaSize + dataSize
 
-	off := len(c.arrayData)
-	c.arrayData = append(c.arrayData, make([]byte, totalSize)...)
+	off := c.growArrayData(totalSize)
 	buf := c.arrayData[off:]
 
 	// nDims
