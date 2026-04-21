@@ -25,9 +25,11 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -301,6 +303,83 @@ func TestQwpSenderErrorInvalidTableName(t *testing.T) {
 	err := s.At(context.Background(), time.Now())
 	if err == nil {
 		t.Fatal("expected error for empty table name")
+	}
+}
+
+func TestQwpSenderErrorNegativeLong256(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("tbl").Long256Column("h", big.NewInt(-42))
+	err := s.At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected error for negative long256")
+	}
+	if !strings.Contains(err.Error(), "cannot be negative") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQwpSenderErrorOversizedLong256(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// 2^256: one bit beyond the representable range.
+	bigVal := new(big.Int).Lsh(big.NewInt(1), 256)
+	s.Table("tbl").Long256Column("h", bigVal)
+	err := s.At(context.Background(), time.Now())
+	if err == nil {
+		t.Fatal("expected error for oversized long256")
+	}
+	if !strings.Contains(err.Error(), "larger than 256-bit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQwpSenderLong256Encoding(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Distinct-per-limb pattern catches byte-order and limb-order bugs.
+	// High-to-low 64-bit words: 0x01..01, 0x02..02, 0x03..03, 0x04..04.
+	val, ok := new(big.Int).SetString(
+		"0101010101010101020202020202020203030303030303030404040404040404", 16)
+	if !ok {
+		t.Fatal("SetString failed")
+	}
+	s.Table("t").Long256Column("h", val)
+	if err := s.At(context.Background(), time.Now()); err != nil {
+		t.Fatalf("At: %v", err)
+	}
+
+	tb := s.tableBuffers["t"]
+	var col *qwpColumnBuffer
+	for _, c := range tb.columns {
+		if c.name == "h" {
+			col = c
+			break
+		}
+	}
+	if col == nil {
+		t.Fatal("column 'h' not found")
+	}
+
+	// Wire layout: four LE-encoded uint64 limbs, least-significant first.
+	var expected [32]byte
+	for i := 0; i < 8; i++ {
+		expected[i] = 0x04
+		expected[8+i] = 0x03
+		expected[16+i] = 0x02
+		expected[24+i] = 0x01
+	}
+	if !bytes.Equal(col.fixedData, expected[:]) {
+		t.Fatalf("fixedData = %x, want %x", col.fixedData, expected)
 	}
 }
 

@@ -228,6 +228,22 @@ func TestErrorWhenSenderTypeIsNotSpecified(t *testing.T) {
 	assert.ErrorContains(t, err, "sender type is not specified: use WithHttp, WithTcp, or WithQwp")
 }
 
+func TestErrorWhenConflictingTransportOptions(t *testing.T) {
+	ctx := context.Background()
+
+	cases := [][]qdb.LineSenderOption{
+		{qdb.WithHttp(), qdb.WithQwp()},
+		{qdb.WithHttp(), qdb.WithTcp()},
+		{qdb.WithTcp(), qdb.WithQwp()},
+		{qdb.WithQwp(), qdb.WithHttp()},
+	}
+	for _, opts := range cases {
+		_, err := qdb.NewLineSender(ctx, opts...)
+		assert.Error(t, err)
+		assert.ErrorContains(t, err, "conflicting transport options: use only one of WithHttp, WithTcp, or WithQwp")
+	}
+}
+
 func TestHttpErrorWhenMaxBufferSizeIsReached(t *testing.T) {
 	ctx := context.Background()
 

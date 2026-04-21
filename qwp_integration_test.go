@@ -29,8 +29,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -727,4 +729,83 @@ func TestQwpIntegrationNullableColumns(t *testing.T) {
 	}
 
 	t.Log("QWP nullable columns integration test passed")
+}
+
+// --- Long256 round-trip ---
+
+func TestQwpIntegrationLong256(t *testing.T) {
+	qwpSkipIfNoServer(t)
+	ctx := context.Background()
+
+	tableName := "qwp_integ_long256"
+	qwpDropTable(t, tableName)
+	defer qwpDropTable(t, tableName)
+
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(ctx)
+
+	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Distinct-per-limb pattern round-trips all four 64-bit words.
+	hexStr := "0101010101010101020202020202020203030303030303030404040404040404"
+	val, ok := new(big.Int).SetString(hexStr, 16)
+	if !ok {
+		t.Fatal("SetString failed")
+	}
+
+	// Also cover: zero, one, and 2^256-1 (max).
+	maxVal := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+
+	rows := []struct {
+		tag string
+		v   *big.Int
+	}{
+		{"pattern", val},
+		{"zero", big.NewInt(0)},
+		{"one", big.NewInt(1)},
+		{"max", maxVal},
+	}
+
+	for i, r := range rows {
+		err = s.Table(tableName).
+			Symbol("tag", r.tag).
+			Long256Column("h", r.v).
+			At(ctx, ts.Add(time.Duration(i)*time.Microsecond))
+		if err != nil {
+			t.Fatalf("row %s: %v", r.tag, err)
+		}
+	}
+
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	result := qwpWaitForRows(t, tableName, len(rows))
+	if result.Count != len(rows) {
+		t.Fatalf("count = %d, want %d", result.Count, len(rows))
+	}
+
+	for _, r := range rows {
+		q := qwpQuery(t, fmt.Sprintf("SELECT tag, h FROM '%s' WHERE tag = '%s'", tableName, r.tag))
+		if q.Count != 1 {
+			t.Fatalf("%s: count = %d, want 1", r.tag, q.Count)
+		}
+		gotStr, ok := q.Dataset[0][1].(string)
+		if !ok {
+			t.Fatalf("%s: h not a string: %#v", r.tag, q.Dataset[0][1])
+		}
+		// Compare numerically — QuestDB may render with varying zero-padding (0x0 vs 0x00).
+		gotBig, ok := new(big.Int).SetString(strings.TrimPrefix(gotStr, "0x"), 16)
+		if !ok {
+			t.Fatalf("%s: could not parse returned hex %q", r.tag, gotStr)
+		}
+		if gotBig.Cmp(r.v) != 0 {
+			t.Fatalf("%s: h = %s, want %s", r.tag, gotBig.Text(16), r.v.Text(16))
+		}
+	}
+
+	t.Log("QWP long256 integration test passed")
 }

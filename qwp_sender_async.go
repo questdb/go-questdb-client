@@ -64,8 +64,9 @@ type qwpAsyncState struct {
 	inFlightMax   int
 
 	// nextSequence is the sequence number that will be assigned to
-	// the next successfully-sent batch. First batch is 0. Incremented
-	// only by senderLoop after a successful sendMessage.
+	// the next attempted send. First batch is 0. Incremented by
+	// senderLoop before sendMessage so a concurrent ACK for an
+	// in-flight batch never satisfies seq >= nextSequence.
 	nextSequence int64
 	// ackedSequence is the highest cumulative sequence acknowledged
 	// by the server, or -1 if none. Updated only by receiverLoop.

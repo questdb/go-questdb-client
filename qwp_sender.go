@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/big"
@@ -388,6 +389,16 @@ func (s *qwpLineSender) Long256Column(name string, val *big.Int) LineSender {
 		s.lastErr = err
 		return s
 	}
+	if val != nil {
+		if val.Sign() < 0 {
+			s.lastErr = fmt.Errorf("qwp: long256 cannot be negative: %s", val.String())
+			return s
+		}
+		if val.BitLen() > 256 {
+			s.lastErr = fmt.Errorf("qwp: long256 cannot be larger than 256-bit: %d", val.BitLen())
+			return s
+		}
+	}
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeLong256, true)
 	if err != nil {
 		s.lastErr = err
@@ -397,17 +408,15 @@ func (s *qwpLineSender) Long256Column(name string, val *big.Int) LineSender {
 	if val == nil {
 		col.addNull()
 	} else {
-		// Convert big.Int to four uint64 limbs in LE order.
-		var mask big.Int
-		mask.SetUint64(0xFFFFFFFFFFFFFFFF)
-		var tmp big.Int
-		l0 := tmp.And(val, &mask).Uint64()
-		tmp.Rsh(val, 64)
-		l1 := tmp.And(&tmp, &mask).Uint64()
-		tmp.Rsh(val, 128)
-		l2 := tmp.And(&tmp, &mask).Uint64()
-		tmp.Rsh(val, 192)
-		l3 := tmp.And(&tmp, &mask).Uint64()
+		// FillBytes writes the magnitude as big-endian; negatives and
+		// oversize values were rejected above. Reinterpret as four
+		// little-endian uint64 limbs.
+		var buf [32]byte
+		val.FillBytes(buf[:])
+		l3 := binary.BigEndian.Uint64(buf[0:8])
+		l2 := binary.BigEndian.Uint64(buf[8:16])
+		l1 := binary.BigEndian.Uint64(buf[16:24])
+		l0 := binary.BigEndian.Uint64(buf[24:32])
 		col.addLong256(l0, l1, l2, l3)
 	}
 	return s
@@ -1004,8 +1013,15 @@ func (s *qwpLineSender) flushAsync(ctx context.Context) error {
 	}
 
 	// Wait for the current encoder to be available (double-buffered).
+	// Honour ctx here too: if the I/O goroutine is stuck in sendMessage,
+	// the previous batch's readySignal never fires and an unguarded
+	// receive would silently extend the user's Flush deadline.
 	encIdx := s.currentEncoderIdx
-	<-s.encoderReady[encIdx]
+	select {
+	case <-s.encoderReady[encIdx]:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	// Encode all tables into a single multi-table message.
 	encoded := s.encoders[encIdx].encodeMultiTableWithDeltaDict(
@@ -1082,8 +1098,14 @@ func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
 	}
 
 	// Wait for the current encoder to be available (double-buffered).
+	// Ctx-aware for the same reason as flushAsync: a stuck I/O goroutine
+	// must not extend the caller's deadline.
 	encIdx := s.currentEncoderIdx
-	<-s.encoderReady[encIdx]
+	select {
+	case <-s.encoderReady[encIdx]:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	// Encode all tables into a single multi-table message.
 	encoded := s.encoders[encIdx].encodeMultiTableWithDeltaDict(

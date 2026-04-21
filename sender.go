@@ -694,32 +694,29 @@ func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 // sender corresponds to a single client connection. LineSender should
 // not be called concurrently by multiple goroutines.
 func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, error) {
-	var conf *lineSenderConfig
-
-	// Iterate over all options to determine the sender type
-	// This is used to set defaults based on the type of sender (http vs tcp)
-	// Worst case performance is 2N for the number of LineSenderOptions
+	// First pass: discover the sender type and reject conflicting
+	// transport options. We must iterate every option (not stop at the
+	// first transport) so that mixing e.g. WithHttp + WithQwp is caught
+	// before pass 2 seeds HTTP defaults onto a QWP config.
 	tmp := newLineSenderConfig(noSenderType)
+	sType := noSenderType
 	for _, opt := range opts {
 		opt(tmp)
-		switch tmp.senderType {
-		case httpSenderType:
-			conf = newLineSenderConfig(httpSenderType)
-		case tcpSenderType:
-			conf = newLineSenderConfig(tcpSenderType)
-		case qwpSenderType:
-			conf = newLineSenderConfig(qwpSenderType)
+		if tmp.senderType == noSenderType {
+			continue
 		}
-
-		if conf != nil {
-			break
+		if sType == noSenderType {
+			sType = tmp.senderType
+		} else if tmp.senderType != sType {
+			return nil, errors.New("conflicting transport options: use only one of WithHttp, WithTcp, or WithQwp")
 		}
 	}
 
-	if tmp.senderType == noSenderType {
+	if sType == noSenderType {
 		return nil, errors.New("sender type is not specified: use WithHttp, WithTcp, or WithQwp")
 	}
 
+	conf := newLineSenderConfig(sType)
 	for _, opt := range opts {
 		opt(conf)
 	}
