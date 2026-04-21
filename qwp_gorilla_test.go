@@ -186,6 +186,78 @@ func TestQwpGorillaEncodedSizeEdges(t *testing.T) {
 	}
 }
 
+// Constant-delta series: every DoD is 0, so every index 2..N-1 costs a
+// single bit. Size = 8 (ts0) + 8 (ts1) + ceil((N-2)/8).
+// Ported from QwpGorillaEncoderTest.testCalculateEncodedSizeConstantDelta.
+func TestQwpGorillaEncodedSizeConstantDelta(t *testing.T) {
+	const n = 100
+	ts := make([]int64, n)
+	for i := range ts {
+		ts[i] = 1_000_000_000 + int64(i)*1000
+	}
+	src := intsToBytes(ts)
+	want := 8 + 8 + (n-2+7)/8 // = 29
+	if got := qwpGorillaEncodedSize(src, n); got != want {
+		t.Fatalf("constant-delta size: got %d, want %d", got, want)
+	}
+}
+
+// Three timestamps with identical deltas: a single DoD=0 → 1 bit → 1 byte.
+// Total = 8 + 8 + 1 = 17.
+// Ported from QwpGorillaEncoderTest.testCalculateEncodedSizeIdenticalDeltas.
+func TestQwpGorillaEncodedSizeIdenticalDeltas(t *testing.T) {
+	ts := []int64{100, 200, 300}
+	src := intsToBytes(ts)
+	if got := qwpGorillaEncodedSize(src, len(ts)); got != 17 {
+		t.Fatalf("identical-delta size: got %d, want 17", got)
+	}
+}
+
+// Three timestamps with a small (7-bit bucket) DoD: 9 bits → 2 bytes.
+// deltas = [100, 150], DoD = 50. Total = 8 + 8 + 2 = 18.
+// Ported from QwpGorillaEncoderTest.testCalculateEncodedSizeSmallDoD.
+func TestQwpGorillaEncodedSizeSmallDoD(t *testing.T) {
+	ts := []int64{100, 200, 350}
+	src := intsToBytes(ts)
+	if got := qwpGorillaEncodedSize(src, len(ts)); got != 18 {
+		t.Fatalf("small-DoD size: got %d, want 18", got)
+	}
+}
+
+// Round-trip every bucket boundary (both endpoints) so an accidental
+// off-by-one in qwpGorillaBucket won't silently corrupt the wire format.
+// Ported from QwpGorillaEncoderTest.testEncodeDecodeBucketBoundaries.
+func TestQwpGorillaRoundTripBucketBoundaries(t *testing.T) {
+	// Fixed prefix: ts0=0, ts1=10_000 → initial delta=10_000.
+	// Each test case sets ts2 so the DoD hits a specific bucket boundary.
+	cases := []struct {
+		name string
+		dod  int64
+	}{
+		{"bucket0_dod0", 0},
+		{"bucket1_max_63", 63},
+		{"bucket1_min_neg64", -64},
+		{"bucket2_start_64", 64},
+		{"bucket2_start_neg65", -65},
+		{"bucket2_max_255", 255},
+		{"bucket2_min_neg256", -256},
+		{"bucket3_start_256", 256},
+		{"bucket3_start_neg257", -257},
+		{"bucket3_max_2047", 2047},
+		{"bucket3_min_neg2048", -2048},
+		{"bucket4_start_2048", 2048},
+		{"bucket4_start_neg2049", -2049},
+		{"bucket4_large_pos", 100_000},
+		{"bucket4_large_neg", -100_000},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ts := []int64{0, 10_000, 10_000 + 10_000 + c.dod}
+			assertRoundTrip(t, ts)
+		})
+	}
+}
+
 func TestQwpGorillaEncodedSizeOverflowFallback(t *testing.T) {
 	// Construct DoDs that exceed int32 range.
 	// deltas: 0, INT32_MAX, 0  → DoD at i=3 = -INT32_MAX, still fits.
