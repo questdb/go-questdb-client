@@ -169,7 +169,7 @@ func TestQwpTransportConnectAndClose(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
 	var tr qwpTransport
-	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{})
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath})
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestQwpTransportNegotiationHeaders(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	defer tr.close(context.Background())
@@ -243,7 +243,7 @@ func TestQwpTransportVersionMatchAccepted(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	defer tr.close(context.Background())
@@ -269,7 +269,7 @@ func TestQwpTransportVersionMissingRejected(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{})
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath})
 	if err == nil {
 		tr.close(context.Background())
 		t.Fatal("expected missing-version error")
@@ -302,7 +302,7 @@ func TestQwpTransportVersionMismatchRejected(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{})
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath})
 	if err == nil {
 		tr.close(context.Background())
 		t.Fatal("expected version mismatch error")
@@ -340,7 +340,7 @@ func TestQwpTransportSendAndReceive(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	defer tr.close(context.Background())
@@ -383,7 +383,7 @@ func TestQwpTransportAckWithError(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	defer tr.close(context.Background())
@@ -414,7 +414,7 @@ func TestQwpIntegrationConnect(t *testing.T) {
 	ctx := context.Background()
 
 	var tr qwpTransport
-	err := tr.connect(ctx, "ws://localhost:9000", qwpTransportOpts{})
+	err := tr.connect(ctx, "ws://localhost:9000", qwpTransportOpts{endpointPath: qwpWritePath})
 	if err != nil {
 		t.Skipf("QuestDB not available: %v", err)
 	}
@@ -462,7 +462,7 @@ func TestQwpTransportSendAndAckSuccess(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer tr.close(context.Background())
@@ -483,7 +483,7 @@ func TestQwpTransportSendAndAckServerError(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer tr.close(context.Background())
@@ -517,7 +517,7 @@ func TestReadAckRejectsOversizedOK(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer tr.close(context.Background())
@@ -551,7 +551,7 @@ func TestReadAckRejectsErrorLengthMismatch(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer tr.close(context.Background())
@@ -585,7 +585,7 @@ func TestReadAckSkipsTextFrames(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer tr.close(context.Background())
@@ -605,11 +605,133 @@ func TestReadAckSkipsTextFrames(t *testing.T) {
 	}
 }
 
+// TestQwpTransportEgressUpgrade exercises the opts.endpointPath,
+// opts.acceptEncoding, and opts.maxBatchRows fields wired in step 6.
+// Each subtest inspects the HTTP upgrade request the transport sends,
+// then lets the WebSocket handshake complete so connect() returns.
+func TestQwpTransportEgressUpgrade(t *testing.T) {
+	type reqSnapshot struct {
+		path           string
+		acceptEncoding string
+		maxBatchRows   string
+		hasAcceptEnc   bool
+		hasMaxRows     bool
+	}
+
+	newServer := func(capture *reqSnapshot) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			capture.path = r.URL.Path
+			capture.acceptEncoding = r.Header.Get(qwpHeaderAcceptEncoding)
+			capture.maxBatchRows = r.Header.Get(qwpHeaderMaxBatchRows)
+			// Values() canonicalizes the key internally, so we can
+			// probe for header presence without assuming what the
+			// canonical form of "X-QWP-*" happens to be.
+			capture.hasAcceptEnc = len(r.Header.Values(qwpHeaderAcceptEncoding)) > 0
+			capture.hasMaxRows = len(r.Header.Values(qwpHeaderMaxBatchRows)) > 0
+			w.Header().Set(qwpHeaderVersion, "1")
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.CloseNow()
+			for {
+				if _, _, err := conn.Read(context.Background()); err != nil {
+					return
+				}
+			}
+		}))
+	}
+
+	t.Run("ReadPathWithBothEgressHeaders", func(t *testing.T) {
+		var got reqSnapshot
+		srv := newServer(&got)
+		defer srv.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+		var tr qwpTransport
+		opts := qwpTransportOpts{
+			endpointPath:   qwpReadPath,
+			acceptEncoding: "zstd;level=3,raw",
+			maxBatchRows:   10_000,
+		}
+		require.NoError(t, tr.connect(context.Background(), wsURL, opts))
+		defer tr.close(context.Background())
+
+		assert.Equal(t, qwpReadPath, got.path)
+		assert.Equal(t, "zstd;level=3,raw", got.acceptEncoding)
+		assert.Equal(t, "10000", got.maxBatchRows)
+	})
+
+	t.Run("IngestPathStampsNoEgressHeaders", func(t *testing.T) {
+		var got reqSnapshot
+		srv := newServer(&got)
+		defer srv.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+		var tr qwpTransport
+		opts := qwpTransportOpts{endpointPath: qwpWritePath}
+		require.NoError(t, tr.connect(context.Background(), wsURL, opts))
+		defer tr.close(context.Background())
+
+		assert.Equal(t, qwpWritePath, got.path)
+		assert.False(t, got.hasAcceptEnc, "accept-encoding must be omitted on ingest")
+		assert.False(t, got.hasMaxRows, "max-batch-rows must be omitted on ingest")
+	})
+
+	t.Run("EmptyEndpointPathRejected", func(t *testing.T) {
+		// No server needed — the empty-path check short-circuits before
+		// any network I/O so the call never leaves the process.
+		var tr qwpTransport
+		err := tr.connect(context.Background(), "ws://unused", qwpTransportOpts{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "endpointPath is required")
+		assert.Nil(t, tr.conn)
+	})
+
+	t.Run("EmptyAcceptEncodingOmitsHeader", func(t *testing.T) {
+		var got reqSnapshot
+		srv := newServer(&got)
+		defer srv.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+		var tr qwpTransport
+		opts := qwpTransportOpts{
+			endpointPath:   qwpReadPath,
+			acceptEncoding: "",
+			maxBatchRows:   0,
+		}
+		require.NoError(t, tr.connect(context.Background(), wsURL, opts))
+		defer tr.close(context.Background())
+
+		assert.Equal(t, qwpReadPath, got.path)
+		assert.False(t, got.hasAcceptEnc, "empty acceptEncoding must omit header")
+		assert.False(t, got.hasMaxRows, "zero maxBatchRows must omit header")
+	})
+
+	t.Run("MaxBatchRowsOnlyOmitsAcceptEncoding", func(t *testing.T) {
+		var got reqSnapshot
+		srv := newServer(&got)
+		defer srv.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+		var tr qwpTransport
+		opts := qwpTransportOpts{
+			endpointPath: qwpReadPath,
+			maxBatchRows: 1,
+		}
+		require.NoError(t, tr.connect(context.Background(), wsURL, opts))
+		defer tr.close(context.Background())
+
+		assert.False(t, got.hasAcceptEnc)
+		assert.Equal(t, "1", got.maxBatchRows)
+	})
+}
+
 func TestQwpDumpWriter(t *testing.T) {
 	var buf bytes.Buffer
 	ctx := context.Background()
 
-	s, err := newQwpLineSender(ctx, "", qwpTransportOpts{}, 0, 0, 0, &buf)
+	s, err := newQwpLineSender(ctx, "", qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, &buf)
 	require.NoError(t, err)
 
 	// Insert a row and flush.

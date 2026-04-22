@@ -40,14 +40,24 @@ import (
 	"github.com/coder/websocket"
 )
 
-// qwpWritePath is the WebSocket endpoint for QWP ingestion.
-const qwpWritePath = "/write/v4"
-
-// Version-negotiation HTTP headers (QWP spec §3).
+// QWP WebSocket endpoint paths. Ingest and egress are separate endpoints;
+// they share the version-negotiation headers but otherwise do not overlap.
 const (
-	qwpHeaderMaxVersion = "X-QWP-Max-Version"
-	qwpHeaderClientId   = "X-QWP-Client-Id"
-	qwpHeaderVersion    = "X-QWP-Version"
+	qwpWritePath = "/write/v4" // ingest (QwpSender)
+	qwpReadPath  = "/read/v1"  // egress (QwpQueryClient)
+)
+
+// QWP HTTP headers exchanged on the WebSocket upgrade. The version
+// negotiation triple is shared by ingest and egress. The accept-encoding
+// / max-batch-rows / content-encoding triple is egress-only — ingest
+// never sends or reads them.
+const (
+	qwpHeaderMaxVersion      = "X-QWP-Max-Version"
+	qwpHeaderClientId        = "X-QWP-Client-Id"
+	qwpHeaderVersion         = "X-QWP-Version"
+	qwpHeaderAcceptEncoding  = "X-QWP-Accept-Encoding"
+	qwpHeaderMaxBatchRows    = "X-QWP-Max-Batch-Rows"
+	qwpHeaderContentEncoding = "X-QWP-Content-Encoding"
 )
 
 // qwpClientId is sent in X-QWP-Client-Id during the upgrade handshake.
@@ -63,7 +73,10 @@ const (
 	qwpAckErrorHeaderSize = 11 // status(1) + sequence(8) + msg_len(2)
 )
 
-// qwpTransportOpts configures a WebSocket transport connection.
+// qwpTransportOpts configures a WebSocket transport connection. The
+// same struct drives both ingest (/write/v4) and egress (/read/v1)
+// connections; acceptEncoding and maxBatchRows are egress-only and
+// inert at their zero values.
 type qwpTransportOpts struct {
 	// tlsMode controls certificate verification.
 	// When true, certificate verification is skipped.
@@ -73,6 +86,24 @@ type qwpTransportOpts struct {
 	// header, e.g. "Bearer <token>" or "Basic <base64>".
 	// Empty string means no auth.
 	authorization string
+
+	// endpointPath is the HTTP path used for the WebSocket upgrade.
+	// Required: ingest callers set qwpWritePath, egress callers set
+	// qwpReadPath. Empty strings are rejected by connect() so mistakes
+	// surface loudly instead of dialing the wrong endpoint by default.
+	endpointPath string
+
+	// acceptEncoding, when non-empty, is sent verbatim as the
+	// X-QWP-Accept-Encoding upgrade header. Egress-only. Matches the
+	// Java client's WebSocketClient.setQwpAcceptEncoding contract:
+	// the caller builds the value ("zstd;level=3,raw" etc.); the
+	// transport just forwards it. Empty string omits the header.
+	acceptEncoding string
+
+	// maxBatchRows, when > 0, is sent as the X-QWP-Max-Batch-Rows
+	// upgrade header. Egress-only. Zero omits the header and lets
+	// the server use its own cap.
+	maxBatchRows int
 }
 
 // qwpTransport wraps a WebSocket connection for sending QWP
@@ -104,15 +135,19 @@ func (c *teeConn) Write(p []byte) (int, error) {
 }
 
 // connect establishes a WebSocket connection to the QWP endpoint.
-// The url should be a ws:// or wss:// URL without the path; the
-// /write/v4 path is appended automatically.
+// The url should be a ws:// or wss:// URL without the path; the path
+// comes from opts.endpointPath, which is required.
 //
 // If t.dumpWriter is set, outgoing TCP bytes are recorded. When the
 // url is empty, an in-process pipe with a fake WebSocket acceptor
 // is used so the dump includes full HTTP upgrade + WebSocket framing
 // without requiring a real server.
 func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTransportOpts) error {
-	wsURL := url + qwpWritePath
+	if opts.endpointPath == "" {
+		return fmt.Errorf("qwp: endpointPath is required")
+	}
+	path := opts.endpointPath
+	wsURL := url + path
 
 	dialOpts := &websocket.DialOptions{
 		HTTPHeader: http.Header{
@@ -122,6 +157,12 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	}
 	if opts.authorization != "" {
 		dialOpts.HTTPHeader.Set("Authorization", opts.authorization)
+	}
+	if opts.acceptEncoding != "" {
+		dialOpts.HTTPHeader.Set(qwpHeaderAcceptEncoding, opts.acceptEncoding)
+	}
+	if opts.maxBatchRows > 0 {
+		dialOpts.HTTPHeader.Set(qwpHeaderMaxBatchRows, fmt.Sprintf("%d", opts.maxBatchRows))
 	}
 
 	if t.dumpWriter != nil {
@@ -137,7 +178,7 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 			},
 		}
 		// Use a dummy URL so the WS library has something to parse.
-		wsURL = "ws://dump.local" + qwpWritePath
+		wsURL = "ws://dump.local" + path
 
 		// If Dial fails, close the pipe so the fake server goroutine exits.
 		defer func() {

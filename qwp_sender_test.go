@@ -71,7 +71,7 @@ func newQwpTestServer(t *testing.T) *httptest.Server {
 func newQwpSenderForTest(t *testing.T, serverURL string) *qwpLineSender {
 	t.Helper()
 	wsURL := "ws" + strings.TrimPrefix(serverURL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("newQwpLineSender: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 3, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 3, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +539,7 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	// autoFlushRows=0 (disabled), autoFlushInterval=10ms.
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 10*time.Millisecond, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 10*time.Millisecond, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +579,7 @@ func TestQwpSenderAutoFlushDisabled(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	// Both autoFlushRows=0 and autoFlushInterval=0 (disabled).
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1236,7 +1236,7 @@ func TestQwpSenderMethodChaining(t *testing.T) {
 
 func TestQwpSenderIntegration(t *testing.T) {
 	ctx := context.Background()
-	s, err := newQwpLineSender(ctx, "ws://localhost:9000", qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://localhost:9000", qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Skipf("QuestDB not available: %v", err)
 	}
@@ -1346,7 +1346,7 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1440,7 +1440,7 @@ func TestQwpSenderServerError(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1490,7 +1490,7 @@ func TestQwpSenderAsyncBasic(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1555,7 +1555,7 @@ func TestQwpSenderAsyncMultipleFlushes(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 3)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1589,7 +1589,7 @@ func TestQwpSenderAsyncCloseAutoFlush(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1628,7 +1628,7 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1793,7 +1793,7 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1851,7 +1851,7 @@ func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	// window=4, autoFlushRows=10
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 10, 0, nil, 4)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 10, 0, nil, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1951,6 +1951,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 		opts := qwpTransportOpts{
 			authorization: "Bearer my_token",
+			endpointPath:  qwpWritePath,
 		}
 		s, err := newQwpLineSender(context.Background(), wsURL, opts, 0, 0, 0, nil)
 		if err != nil {
@@ -1988,6 +1989,7 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 		opts := qwpTransportOpts{
 			authorization: "Basic YWRtaW46cXVlc3Q=", // base64("admin:quest")
+			endpointPath:  qwpWritePath,
 		}
 		s, err := newQwpLineSender(context.Background(), wsURL, opts, 0, 0, 0, nil)
 		if err != nil {
@@ -2099,7 +2101,7 @@ func TestQwpMaxBufSizeTriggersFlush(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

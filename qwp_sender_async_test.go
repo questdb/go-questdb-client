@@ -345,7 +345,7 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 	// Create transport and connect.
 	var transport qwpTransport
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer transport.close(context.Background())
@@ -411,7 +411,7 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 
 	var transport qwpTransport
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer transport.close(context.Background())
@@ -498,7 +498,7 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 
 	var transport qwpTransport
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -552,7 +552,7 @@ func TestQwpAsyncCloseAfterError(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -608,7 +608,7 @@ func TestQwpAsyncCloseUnresponsiveServer(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,7 +676,7 @@ func TestQwpAsyncCumulativeAck(t *testing.T) {
 
 	var transport qwpTransport
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer transport.close(context.Background())
@@ -737,7 +737,7 @@ func TestQwpAsyncServerOverAcksIsProtocolError(t *testing.T) {
 
 	var transport qwpTransport
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer transport.close(context.Background())
@@ -792,7 +792,7 @@ func TestQwpAsyncErrorAckCarriesSequence(t *testing.T) {
 
 	var transport qwpTransport
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{}); err != nil {
+	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
 	defer transport.close(context.Background())
