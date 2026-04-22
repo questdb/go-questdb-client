@@ -79,10 +79,15 @@ func TestQwpFlagBitPositions(t *testing.T) {
 	if qwpFlagDeltaSymbolDict != 0x08 {
 		t.Fatalf("qwpFlagDeltaSymbolDict = 0x%02X, want 0x08", qwpFlagDeltaSymbolDict)
 	}
-	// Flags are independent bits, so OR'ing them yields both set.
-	if qwpFlagGorilla&qwpFlagDeltaSymbolDict != 0 {
-		t.Fatalf("flag bits overlap: gorilla=0x%02X, deltaDict=0x%02X",
-			qwpFlagGorilla, qwpFlagDeltaSymbolDict)
+	if qwpFlagZstd != 0x10 {
+		t.Fatalf("qwpFlagZstd = 0x%02X, want 0x10", qwpFlagZstd)
+	}
+	// Flags are independent bits; OR'ing yields all three set distinctly.
+	if qwpFlagGorilla&qwpFlagDeltaSymbolDict != 0 ||
+		qwpFlagGorilla&qwpFlagZstd != 0 ||
+		qwpFlagDeltaSymbolDict&qwpFlagZstd != 0 {
+		t.Fatalf("flag bits overlap: gorilla=0x%02X, deltaDict=0x%02X, zstd=0x%02X",
+			qwpFlagGorilla, qwpFlagDeltaSymbolDict, qwpFlagZstd)
 	}
 }
 
@@ -108,6 +113,8 @@ func TestQwpStatusCodes(t *testing.T) {
 		{qwpStatusInternalError, 0x06},
 		{qwpStatusSecurityError, 0x08},
 		{qwpStatusWriteError, 0x09},
+		{qwpStatusCancelled, 0x0A},
+		{qwpStatusLimitExceeded, 0x0B},
 	}
 	for _, c := range cases {
 		if byte(c.code) != c.want {
@@ -145,11 +152,55 @@ func TestQwpTypeCodes(t *testing.T) {
 		{qwpTypeDecimal128, 0x14},
 		{qwpTypeDecimal256, 0x15},
 		{qwpTypeChar, 0x16},
+		{qwpTypeBinary, 0x17},
+		{qwpTypeIPv4, 0x18},
 	}
 	for _, c := range cases {
 		if byte(c.tc) != c.want {
 			t.Errorf("type code 0x%02X, want 0x%02X", byte(c.tc), c.want)
 		}
+	}
+}
+
+func TestQwpMsgKinds(t *testing.T) {
+	// Egress message-kind discriminators (spec §5). Values here are
+	// the wire bytes the egress server sends and the Go client must
+	// dispatch on; they must match the Java QwpEgressMsgKind constants.
+	cases := []struct {
+		kind qwpMsgKind
+		want byte
+	}{
+		{qwpMsgKindDataBatch, 0x00},
+		{qwpMsgKindResponse, 0x01},
+		{qwpMsgKindQueryRequest, 0x10},
+		{qwpMsgKindResultBatch, 0x11},
+		{qwpMsgKindResultEnd, 0x12},
+		{qwpMsgKindQueryError, 0x13},
+		{qwpMsgKindCancel, 0x14},
+		{qwpMsgKindCredit, 0x15},
+		{qwpMsgKindExecDone, 0x16},
+	}
+	for _, c := range cases {
+		if byte(c.kind) != c.want {
+			t.Errorf("msg kind 0x%02X, want 0x%02X", byte(c.kind), c.want)
+		}
+	}
+}
+
+func TestQwpHardeningCaps(t *testing.T) {
+	if qwpMaxRowsPerBatch != 1_048_576 {
+		t.Fatalf("qwpMaxRowsPerBatch = %d, want 1_048_576", qwpMaxRowsPerBatch)
+	}
+	if qwpMaxTableNameLen != 127 {
+		t.Fatalf("qwpMaxTableNameLen = %d, want 127", qwpMaxTableNameLen)
+	}
+	if qwpMaxColumnNameLen != 127 {
+		t.Fatalf("qwpMaxColumnNameLen = %d, want 127", qwpMaxColumnNameLen)
+	}
+	// Array element cap leaves head-room for the per-row bookkeeping
+	// so `elements * 8` stays under int32.
+	if qwpMaxArrayElements*8 >= 1<<31 {
+		t.Fatalf("qwpMaxArrayElements*8 = %d overflows int32", qwpMaxArrayElements*8)
 	}
 }
 
@@ -164,6 +215,7 @@ func TestQwpFixedTypeSize(t *testing.T) {
 		{qwpTypeChar, 2},
 		{qwpTypeInt, 4},
 		{qwpTypeFloat, 4},
+		{qwpTypeIPv4, 4},
 		{qwpTypeLong, 8},
 		{qwpTypeDouble, 8},
 		{qwpTypeTimestamp, 8},
@@ -177,6 +229,7 @@ func TestQwpFixedTypeSize(t *testing.T) {
 		// Variable-width types report -1.
 		{qwpTypeSymbol, -1},
 		{qwpTypeVarchar, -1},
+		{qwpTypeBinary, -1},
 		{qwpTypeGeohash, -1},
 		{qwpTypeDoubleArray, -1},
 		{qwpTypeLongArray, -1},

@@ -56,6 +56,29 @@ const (
 	qwpTypeDecimal128    qwpTypeCode = 0x14 // 16 bytes, little-endian unscaled
 	qwpTypeDecimal256    qwpTypeCode = 0x15 // 32 bytes, little-endian unscaled
 	qwpTypeChar          qwpTypeCode = 0x16 // UTF-16 code unit, 2 bytes LE
+	// Decoder-only types: the Go encoder never emits them, but the
+	// egress `RESULT_BATCH` decoder must handle columns the server
+	// produces from arbitrary SELECTs (pg_catalog views, IP lookups,
+	// binary columns, etc.).
+	qwpTypeBinary qwpTypeCode = 0x17 // variable, offset+data (same layout as VARCHAR)
+	qwpTypeIPv4   qwpTypeCode = 0x18 // 4 bytes LE, identical to INT
+)
+
+// qwpMsgKind is the one-byte discriminator at the start of every QWP
+// egress payload (spec §5). Ingress DATA_BATCH messages use 0x00; the
+// 0x10..0x16 range is reserved for egress request/response kinds.
+type qwpMsgKind byte
+
+const (
+	qwpMsgKindDataBatch    qwpMsgKind = 0x00
+	qwpMsgKindResponse     qwpMsgKind = 0x01
+	qwpMsgKindQueryRequest qwpMsgKind = 0x10
+	qwpMsgKindResultBatch  qwpMsgKind = 0x11
+	qwpMsgKindResultEnd    qwpMsgKind = 0x12
+	qwpMsgKindQueryError   qwpMsgKind = 0x13
+	qwpMsgKindCancel       qwpMsgKind = 0x14
+	qwpMsgKindCredit       qwpMsgKind = 0x15
+	qwpMsgKindExecDone     qwpMsgKind = 0x16
 )
 
 // qwpMagic is the 4-byte magic at the start of every QWP message.
@@ -77,6 +100,7 @@ const (
 const (
 	qwpFlagGorilla         byte = 0x04 // Gorilla timestamp encoding
 	qwpFlagDeltaSymbolDict byte = 0x08 // delta symbol dictionary
+	qwpFlagZstd            byte = 0x10 // payload after prelude is zstd-compressed (egress only)
 )
 
 // qwpSchemaMode values control how column schema is transmitted.
@@ -97,6 +121,9 @@ const (
 	qwpStatusInternalError  qwpStatusCode = 0x06 // server-side error
 	qwpStatusSecurityError  qwpStatusCode = 0x08 // authorization failure
 	qwpStatusWriteError     qwpStatusCode = 0x09 // write failure (e.g., table not accepting writes)
+	// Egress-specific status codes (spec §15).
+	qwpStatusCancelled     qwpStatusCode = 0x0A // query terminated in response to CANCEL
+	qwpStatusLimitExceeded qwpStatusCode = 0x0B // a protocol limit was hit
 )
 
 // QWP sender defaults and limits.
@@ -145,6 +172,20 @@ const (
 	// receive buffer. Go-only; the Java client manages the read path
 	// differently and has no direct counterpart.
 	qwpDefaultInitRecvBufSize = 64 * 1024 // 64 KB
+
+	// Hardening caps used by the egress `RESULT_BATCH` decoder. Match
+	// the Java reference decoder (QwpResultBatchDecoder.java) so hostile
+	// or buggy server frames that advertise out-of-range dimensions are
+	// rejected before any large allocation.
+	qwpMaxRowsPerBatch  = 1_048_576 // per-batch row cap
+	qwpMaxTableNameLen  = 127       // UTF-8 bytes
+	qwpMaxColumnNameLen = 127       // UTF-8 bytes
+	qwpMaxArrayNDims    = 32        // max array dimensionality; matches Java reference
+	// qwpMaxArrayElements caps the element count of a single ARRAY cell
+	// so that element-count * 8 (element stride) plus the per-row shape
+	// header (up to qwpMaxArrayNDims * 4 bytes) together stay inside
+	// int32. The 1024-byte slack covers that shape header.
+	qwpMaxArrayElements = (1<<31 - 1 - 1024) / 8
 )
 
 // qwpFixedTypeSize returns the per-value size in bytes for fixed-width
@@ -158,7 +199,7 @@ func qwpFixedTypeSize(tc qwpTypeCode) int {
 		return 1
 	case qwpTypeShort, qwpTypeChar:
 		return 2
-	case qwpTypeInt, qwpTypeFloat:
+	case qwpTypeInt, qwpTypeFloat, qwpTypeIPv4:
 		return 4
 	case qwpTypeLong, qwpTypeDouble, qwpTypeTimestamp, qwpTypeDate,
 		qwpTypeTimestampNano, qwpTypeDecimal64:
@@ -167,7 +208,7 @@ func qwpFixedTypeSize(tc qwpTypeCode) int {
 		return 16
 	case qwpTypeLong256, qwpTypeDecimal256:
 		return 32
-	case qwpTypeSymbol, qwpTypeVarchar,
+	case qwpTypeSymbol, qwpTypeVarchar, qwpTypeBinary,
 		qwpTypeGeohash, qwpTypeDoubleArray, qwpTypeLongArray:
 		return -1 // variable-width
 	default:

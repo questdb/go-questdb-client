@@ -41,6 +41,10 @@ func qwpStatusName(status qwpStatusCode) string {
 		return "SECURITY_ERROR"
 	case qwpStatusWriteError:
 		return "WRITE_ERROR"
+	case qwpStatusCancelled:
+		return "CANCELLED"
+	case qwpStatusLimitExceeded:
+		return "LIMIT_EXCEEDED"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", status)
 	}

@@ -1500,6 +1500,41 @@ func TestQwpColumnBufferArrayNull(t *testing.T) {
 		}
 	})
 
+	t.Run("DoubleArrayNonNullable", func(t *testing.T) {
+		// Non-nullable array + addNull writes the 1-byte nDims=0 NULL
+		// sentinel (matching the Java reference). No bitmap is kept.
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+		c.addNull()
+
+		if c.rowCount != 1 {
+			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+		if c.nullCount != 0 {
+			t.Fatalf("nullCount = %d, want 0 for non-nullable", c.nullCount)
+		}
+		if len(c.nullBitmap) != 0 {
+			t.Fatalf("nullBitmap should be empty, got %x", c.nullBitmap)
+		}
+		if !bytes.Equal(c.arrayData, []byte{0x00}) {
+			t.Fatalf("arrayData = %x, want [00]", c.arrayData)
+		}
+		if len(c.arrayOffsets) != 2 || c.arrayOffsets[1] != 1 {
+			t.Fatalf("arrayOffsets = %v, want [0 1]", c.arrayOffsets)
+		}
+	})
+
+	t.Run("LongArrayNonNullable", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
+		c.addNull()
+
+		if !bytes.Equal(c.arrayData, []byte{0x00}) {
+			t.Fatalf("arrayData = %x, want [00]", c.arrayData)
+		}
+		if len(c.arrayOffsets) != 2 || c.arrayOffsets[1] != 1 {
+			t.Fatalf("arrayOffsets = %v, want [0 1]", c.arrayOffsets)
+		}
+	})
+
 	t.Run("InterleavedNullAndData", func(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
 		c.addDoubleArray(1, []int32{2}, []float64{1.0, 2.0}) // row 0: 21 bytes

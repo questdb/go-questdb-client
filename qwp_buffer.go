@@ -90,7 +90,9 @@ type qwpColumnBuffer struct {
 	// Each row's encoded data contains:
 	//   nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
 	//   elements (product(shape) × 8 bytes LE).
-	// Null arrays are encoded as nDims=1, dim0=0 (5 bytes total).
+	// A NULL array is encoded as nDims=0 (1 byte total), matching the
+	// Java reference. This sentinel is only written for non-nullable
+	// columns; nullable columns use the null bitmap and skip the data.
 	arrayOffsets []uint32
 	arrayData    []byte
 
@@ -641,13 +643,11 @@ func (c *qwpColumnBuffer) addNull() {
 		c.appendU64(qwpLongNull)
 
 	case qwpTypeDoubleArray, qwpTypeLongArray:
-		// Null array sentinel: nDims=1, dim0=0 (5 bytes total).
-		off := len(c.arrayData)
-		c.arrayData = append(c.arrayData, 0, 0, 0, 0, 0)
-		c.arrayData[off] = 0x01 // nDims = 1
-		// dim0 = 0 (already zero from append)
+		// Null array sentinel: nDims=0 (1 byte total), matching the
+		// Java reference. The decoder reads this as "row NULL".
+		c.arrayData = append(c.arrayData, 0x00)
 		c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
-		c.trackDataGrowth(5 + 4) // 5 data + uint32 offset
+		c.trackDataGrowth(1 + 4) // 1 data + uint32 offset
 
 	case qwpTypeGeohash:
 		// -1 (all bits set) is the QuestDB geohash null sentinel.

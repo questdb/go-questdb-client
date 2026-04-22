@@ -360,8 +360,10 @@ func assertRoundTrip(t *testing.T, ts []int64) {
 	}
 }
 
-// decodeGorilla mirrors QwpGorillaDecoder + QwpBitReader from the Java
-// reference. Used only in tests to validate the encoder's output.
+// decodeGorilla delegates to the production qwpGorillaDecoder so the
+// existing encoder tests double as decoder round-trip coverage. Errors
+// from the production decoder are turned into t.Fatalf here because
+// the encoder-side tests do not set up hostile inputs.
 func decodeGorilla(t *testing.T, data []byte, count int) []int64 {
 	t.Helper()
 	if count == 0 {
@@ -384,87 +386,14 @@ func decodeGorilla(t *testing.T, data []byte, count int) []int64 {
 	if count == 2 {
 		return out
 	}
-	br := &testBitReader{data: data[16:]}
-	prevTs := ts1
-	prevDelta := ts1 - ts0
+	var dec qwpGorillaDecoder
+	dec.reset(ts0, ts1, data[16:])
 	for i := 2; i < count; i++ {
-		dod := decodeDoD(t, br)
-		delta := prevDelta + dod
-		ts := prevTs + delta
+		ts, err := dec.decodeNext()
+		if err != nil {
+			t.Fatalf("decodeNext at i=%d: %v", i, err)
+		}
 		out = append(out, ts)
-		prevDelta = delta
-		prevTs = ts
 	}
 	return out
-}
-
-func decodeDoD(t *testing.T, br *testBitReader) int64 {
-	t.Helper()
-	if br.readBit(t) == 0 {
-		return 0
-	}
-	if br.readBit(t) == 0 {
-		return br.readSigned(t, 7)
-	}
-	if br.readBit(t) == 0 {
-		return br.readSigned(t, 9)
-	}
-	if br.readBit(t) == 0 {
-		return br.readSigned(t, 12)
-	}
-	return br.readSigned(t, 32)
-}
-
-// testBitReader is an LSB-first bit reader matching QwpBitReader.
-type testBitReader struct {
-	data      []byte
-	bitBuffer uint64
-	bitsAvail int
-	pos       int
-}
-
-func (r *testBitReader) readBit(t *testing.T) uint64 {
-	t.Helper()
-	return r.readBits(t, 1)
-}
-
-func (r *testBitReader) readBits(t *testing.T, n int) uint64 {
-	t.Helper()
-	var result uint64
-	shift := 0
-	for n > 0 {
-		if r.bitsAvail == 0 {
-			if r.pos >= len(r.data) {
-				t.Fatalf("bit read overflow")
-			}
-			r.bitBuffer = uint64(r.data[r.pos])
-			r.pos++
-			r.bitsAvail = 8
-		}
-		take := n
-		if take > r.bitsAvail {
-			take = r.bitsAvail
-		}
-		var mask uint64
-		if take == 64 {
-			mask = ^uint64(0)
-		} else {
-			mask = (uint64(1) << take) - 1
-		}
-		result |= (r.bitBuffer & mask) << shift
-		r.bitBuffer >>= take
-		r.bitsAvail -= take
-		shift += take
-		n -= take
-	}
-	return result
-}
-
-func (r *testBitReader) readSigned(t *testing.T, n int) int64 {
-	t.Helper()
-	u := r.readBits(t, n)
-	if n < 64 && u&(uint64(1)<<(n-1)) != 0 {
-		u |= ^uint64(0) << n
-	}
-	return int64(u)
 }

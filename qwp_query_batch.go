@@ -1,0 +1,554 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math"
+)
+
+// qwpColumnSchemaInfo captures the per-column metadata carried in the
+// schema section of a RESULT_BATCH frame. One instance per column;
+// persisted in the decoder's connection-scoped schema registry so
+// subsequent batches that reference a prior schema id can reuse them.
+//
+// Named with the "Schema" infix to avoid colliding with the
+// `qwpColumnInfo` struct already defined in `qwp_integration_test.go`
+// (which is the JSON shape returned by QuestDB's /exec endpoint).
+type qwpColumnSchemaInfo struct {
+	name          string
+	wireType      qwpTypeCode
+	scale         uint8  // valid only for DECIMAL64/128/256
+	precisionBits uint16 // valid only for GEOHASH
+}
+
+// qwpSymbolEntry points to one entry in a connection-scoped symbol
+// dictionary: (offset, length) into the heap, packed into two uint32s
+// so the aggregate entries slice has predictable per-element size.
+type qwpSymbolEntry struct {
+	offset uint32
+	length uint32
+}
+
+// qwpSymbolDictView is a snapshot view over the decoder's connection-
+// scoped symbol dictionary. The underlying heap is append-only, so a
+// snapshot taken at the time a column is decoded remains valid after
+// subsequent batches extend the dict. The view is two slice headers
+// whose lengths are frozen at snapshot time; len(entries) is the
+// snapshot's dictionary size.
+type qwpSymbolDictView struct {
+	heap    []byte
+	entries []qwpSymbolEntry
+}
+
+// qwpColumnLayout is the per-column parsed state for one RESULT_BATCH.
+// All slice fields alias into the frame's payload (the WebSocket recv
+// buffer) except `timestampBuf`, which the decoder owns because the
+// Gorilla-decoded int64 values cannot be produced in-place.
+//
+// Lifetime: layouts are pool-owned (qwpQueryDecoder.layoutPool) and
+// reused across batches. `clear` nil-s the slice headers but preserves
+// backing arrays on the non-aliasing fields (`nonNullIdx`, `symbolRowIds`,
+// `timestampBuf`, `arrayRowStart`, `arrayRowLen`), so subsequent batches
+// with the same column width avoid reallocation.
+type qwpColumnLayout struct {
+	info *qwpColumnSchemaInfo
+
+	// null bitmap (LSB-first; 1 = NULL). Nil when the column has no
+	// nulls in this batch; the decoder skips allocating `nonNullIdx`
+	// on this branch and typed accessors fall back to identity indexing.
+	nullBitmap []byte
+
+	// Count of non-null rows in this batch (== rowCount when nullBitmap
+	// is nil, else rowCount - popcount(nullBitmap)).
+	nonNullCount int
+
+	// Dense index per row: nonNullIdx[row] is the position of row
+	// within the non-null values region, or -1 if the row is NULL.
+	// Nil when nullBitmap == nil (identity mapping row → row).
+	nonNullIdx []int32
+
+	// Dense values region. For fixed-width types this is nonNullCount *
+	// sizeBytes bytes of packed values. For STRING/VARCHAR/BINARY this
+	// is the (nonNullCount+1)*4-byte offsets array; the concatenated
+	// bytes live in `stringBytes`. For SYMBOL/ARRAY this is left nil
+	// and per-cell readers go through `symbolRowIds` / arrayRow*.
+	// For Gorilla TIMESTAMP, this aliases `timestampBuf` reinterpreted
+	// as bytes so the Int64 accessor path stays uniform.
+	values []byte
+
+	// Concatenated UTF-8 / opaque byte region for STRING/VARCHAR/BINARY.
+	stringBytes []byte
+
+	// Per-row symbol dictionary id (size rowCount; NULL rows hold
+	// undefined values — callers must null-check first).
+	symbolRowIds []int32
+
+	// Connection-scoped dictionary snapshot for this column's SYMBOL
+	// values. Zero value (nil heap) for non-SYMBOL columns.
+	symbolDict qwpSymbolDictView
+
+	// Per-row array start/length (in `values`) for ARRAY columns. Size
+	// rowCount; NULL rows hold (0, 0).
+	arrayRowStart []int32
+	arrayRowLen   []int32
+
+	// Decoder-owned decode buffer for Gorilla-encoded TIMESTAMP columns.
+	// Sized to nonNullCount; `values` aliases this as bytes.
+	timestampBuf []int64
+}
+
+// clear resets the layout between reuses. Backing arrays on the
+// non-aliasing fields are kept so the decoder amortises allocation
+// across batches of the same column width.
+func (l *qwpColumnLayout) clear() {
+	l.info = nil
+	l.nullBitmap = nil
+	l.nonNullCount = 0
+	l.nonNullIdx = l.nonNullIdx[:0]
+	l.values = nil
+	l.stringBytes = nil
+	l.symbolRowIds = l.symbolRowIds[:0]
+	l.symbolDict = qwpSymbolDictView{}
+	l.arrayRowStart = l.arrayRowStart[:0]
+	l.arrayRowLen = l.arrayRowLen[:0]
+	l.timestampBuf = l.timestampBuf[:0]
+}
+
+// denseIndex maps a logical row index to the dense-values index. The
+// typed accessors call this after a null-check to find the byte offset
+// of a non-null value in `values`.
+func (l *qwpColumnLayout) denseIndex(row int) int {
+	if l.nullBitmap == nil {
+		return row
+	}
+	return int(l.nonNullIdx[row])
+}
+
+// isNull reports whether the cell at `row` is NULL in this batch.
+func (l *qwpColumnLayout) isNull(row int) bool {
+	if l.nullBitmap == nil {
+		return false
+	}
+	b := l.nullBitmap[row>>3]
+	return b&(1<<(row&7)) != 0
+}
+
+// QwpColumnBatch is a column-major view over one decoded RESULT_BATCH
+// frame. The batch is valid only for the duration of the current
+// iteration of a *QwpQuery's `Batches()` range — its accessors return
+// slice views that alias the underlying WebSocket recv buffer. Do not
+// retain any returned slice or string beyond the loop iteration; use
+// `CopyAll` (once implemented in the I/O-goroutine slab) if you need
+// persistent copies.
+//
+// All typed accessors are safe to call on NULL rows: they return the
+// zero value of their return type (0, false, "", nil). Use `IsNull`
+// first if you need to distinguish.
+type QwpColumnBatch struct {
+	payload     []byte
+	requestId   int64
+	batchSeq    int64
+	rowCount    int
+	columnCount int
+	columns     []qwpColumnSchemaInfo // alias into the schema registry
+	layouts     []qwpColumnLayout     // one per column; pool-owned
+}
+
+// Payload returns the raw frame payload that backs this batch. Exposed
+// for byte-counting / metrics — callers must not mutate or retain it.
+func (b *QwpColumnBatch) Payload() []byte { return b.payload }
+
+// RequestId returns the client-assigned 64-bit id from the originating
+// QUERY_REQUEST. All frames for one query share the same id.
+func (b *QwpColumnBatch) RequestId() int64 { return b.requestId }
+
+// BatchSeq returns the monotonic per-request sequence number (starts at
+// 0 for the first batch of a query, increments by 1 per RESULT_BATCH).
+func (b *QwpColumnBatch) BatchSeq() int64 { return b.batchSeq }
+
+// RowCount returns the number of rows in this batch.
+func (b *QwpColumnBatch) RowCount() int { return b.rowCount }
+
+// ColumnCount returns the number of columns.
+func (b *QwpColumnBatch) ColumnCount() int { return b.columnCount }
+
+// ColumnName returns the server-reported column name.
+func (b *QwpColumnBatch) ColumnName(col int) string { return b.columns[col].name }
+
+// ColumnType returns the wire-type byte for the column (one of the
+// `qwpType*` constants, e.g. 0x04 for INT). Callers dispatch on this
+// to pick the right typed accessor.
+func (b *QwpColumnBatch) ColumnType(col int) byte { return byte(b.columns[col].wireType) }
+
+// DecimalScale returns the decimal scale for DECIMAL64/128/256 columns.
+// Not meaningful for other types; returns 0.
+func (b *QwpColumnBatch) DecimalScale(col int) int { return int(b.columns[col].scale) }
+
+// GeohashPrecisionBits returns the precision in bits for a GEOHASH
+// column. Not meaningful for other types; returns 0.
+func (b *QwpColumnBatch) GeohashPrecisionBits(col int) int {
+	return int(b.columns[col].precisionBits)
+}
+
+// IsNull reports whether the cell at (col, row) is NULL in this batch.
+//
+// Note: QuestDB uses sentinel values for several primitive types (e.g.
+// Long.MinValue for LONG, NaN for FLOAT/DOUBLE, -1 for GEOHASH). Those
+// rows also return true from IsNull — the server encodes them via the
+// null bitmap, so "real NaN" and "explicit NULL" are indistinguishable
+// over the wire.
+func (b *QwpColumnBatch) IsNull(col, row int) bool {
+	return b.layouts[col].isNull(row)
+}
+
+// NonNullCount returns the count of non-null rows in a column —
+// i.e. the size of the dense values region before row-level dispatch.
+func (b *QwpColumnBatch) NonNullCount(col int) int {
+	return b.layouts[col].nonNullCount
+}
+
+// --- Fixed-width typed accessors ---
+//
+// Each accessor assumes the caller knows the column's wire type. Call
+// ColumnType(col) for generic dispatch; in a schema-aware query runner
+// the caller already knows. NULL rows return the zero value of the
+// accessor's return type.
+
+// Bool returns the BOOLEAN value at (col, row). BOOLEAN is bit-packed
+// on the wire: 8 non-null values per byte, LSB-first.
+func (b *QwpColumnBatch) Bool(col, row int) bool {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return false
+	}
+	idx := l.denseIndex(row)
+	return l.values[idx>>3]&(1<<(idx&7)) != 0
+}
+
+// Int8 returns the BYTE value at (col, row).
+func (b *QwpColumnBatch) Int8(col, row int) int8 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	return int8(l.values[l.denseIndex(row)])
+}
+
+// Int16 returns the SHORT value at (col, row).
+func (b *QwpColumnBatch) Int16(col, row int) int16 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 2
+	return int16(binary.LittleEndian.Uint16(l.values[i : i+2]))
+}
+
+// Char returns the CHAR value at (col, row) as a rune. The wire format
+// stores CHAR as a 2-byte UTF-16 code unit — code points outside the
+// BMP are not representable and the encoder refuses to emit them, so
+// the returned value always fits in a uint16.
+func (b *QwpColumnBatch) Char(col, row int) rune {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 2
+	return rune(binary.LittleEndian.Uint16(l.values[i : i+2]))
+}
+
+// Int32 returns the INT or IPv4 value at (col, row). Both share the
+// 4-byte LE wire layout; IPv4's four octets are the four bytes of the
+// int32 in network-independent little-endian order.
+func (b *QwpColumnBatch) Int32(col, row int) int32 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 4
+	return int32(binary.LittleEndian.Uint32(l.values[i : i+4]))
+}
+
+// Int64 returns an 8-byte column value at (col, row). Applicable to
+// LONG, DATE, TIMESTAMP, TIMESTAMP_NANOS, and DECIMAL64 columns —
+// they all share the int64 LE wire format.
+func (b *QwpColumnBatch) Int64(col, row int) int64 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 8
+	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// Float32 returns the FLOAT value at (col, row). NULL rows return 0,
+// NOT NaN — callers who want to distinguish explicit NaN from NULL
+// must check IsNull first (see the note on IsNull about QuestDB's
+// sentinel-based null encoding).
+func (b *QwpColumnBatch) Float32(col, row int) float32 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 4
+	return math.Float32frombits(binary.LittleEndian.Uint32(l.values[i : i+4]))
+}
+
+// Float64 returns the DOUBLE value at (col, row).
+func (b *QwpColumnBatch) Float64(col, row int) float64 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 8
+	return math.Float64frombits(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// --- Wide fixed-width: UUID, LONG256, DECIMAL128, DECIMAL256 ---
+
+// UuidLo returns the low 64 bits of a UUID (byte offset 0 within the
+// 16-byte cell).
+func (b *QwpColumnBatch) UuidLo(col, row int) int64 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 16
+	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// UuidHi returns the high 64 bits of a UUID (byte offset 8).
+func (b *QwpColumnBatch) UuidHi(col, row int) int64 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row)*16 + 8
+	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// Decimal128Lo returns the low 64 bits of a DECIMAL128 unscaled value.
+// Pair with `DecimalScale(col)` to reconstruct the full decimal.
+func (b *QwpColumnBatch) Decimal128Lo(col, row int) int64 {
+	return b.UuidLo(col, row) // same wire layout: 16 LE bytes
+}
+
+// Decimal128Hi returns the high 64 bits of a DECIMAL128 unscaled value.
+func (b *QwpColumnBatch) Decimal128Hi(col, row int) int64 {
+	return b.UuidHi(col, row)
+}
+
+// Long256Word returns word `word` of a LONG256 or DECIMAL256 value at
+// (col, row). word=0 is the least-significant 64 bits, word=3 the most.
+func (b *QwpColumnBatch) Long256Word(col, row, word int) int64 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	if word < 0 || word > 3 {
+		panic(fmt.Sprintf("QwpColumnBatch.Long256Word: word %d out of [0,3]", word))
+	}
+	i := l.denseIndex(row)*32 + word*8
+	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// --- Strings, varchars, binary ---
+//
+// Each zero-copy accessor returns a []byte sub-slice of the frame
+// payload. The slice is valid only for the current iteration of
+// `*QwpQuery.Batches()`; the next iteration reuses the same underlying
+// recv buffer and the bytes are no longer stable. Call `bytes.Clone`
+// (or the materializing helper) if you need to retain a value.
+//
+// The Java client carries two parallel "A/B" view objects per string
+// column because each accessor re-points one mutable DirectUtf8String
+// and the user needs two slots to hold two views at once. Go slices
+// are independent value-copies of a {ptr, len, cap} triple, so every
+// call produces an independent view — no A/B distinction needed.
+
+// Str returns the UTF-8 bytes of a STRING, VARCHAR, or SYMBOL cell.
+// Returns nil for NULL rows. The returned slice aliases the payload;
+// do not retain it past the current batch iteration.
+func (b *QwpColumnBatch) Str(col, row int) []byte {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return nil
+	}
+	wt := l.info.wireType
+	if wt == qwpTypeSymbol {
+		rowIdx := l.symbolRowIds[row]
+		if int(rowIdx) >= len(l.symbolDict.entries) {
+			return nil
+		}
+		e := l.symbolDict.entries[rowIdx]
+		return l.symbolDict.heap[e.offset : e.offset+e.length]
+	}
+	if wt == qwpTypeVarchar || wt == qwpTypeBinary {
+		// Treat BINARY under Str as an opaque byte-bag view for
+		// callers that want the bytes without explicit BINARY
+		// typing. The dedicated Binary accessor is the idiomatic
+		// entry point for BINARY columns.
+		return b.stringSlice(l, row)
+	}
+	return nil
+}
+
+// String returns the cell at (col, row) as a newly-allocated string.
+// Applicable to STRING, VARCHAR, and SYMBOL columns. Returns "" for
+// NULL rows.
+func (b *QwpColumnBatch) String(col, row int) string {
+	s := b.Str(col, row)
+	if s == nil {
+		return ""
+	}
+	return string(s)
+}
+
+// Binary returns the opaque bytes of a BINARY cell. Returns nil for
+// NULL rows. The returned slice aliases the payload.
+func (b *QwpColumnBatch) Binary(col, row int) []byte {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return nil
+	}
+	if l.info.wireType != qwpTypeBinary {
+		return nil
+	}
+	return b.stringSlice(l, row)
+}
+
+// stringSlice implements the shared offset-decode for STRING / VARCHAR
+// / BINARY. The `values` region holds a (nonNullCount+1) * 4-byte array
+// of uint32 offsets into `stringBytes`; row i covers bytes [off[dense],
+// off[dense+1]).
+func (b *QwpColumnBatch) stringSlice(l *qwpColumnLayout, row int) []byte {
+	dense := l.denseIndex(row)
+	start := binary.LittleEndian.Uint32(l.values[dense*4:])
+	end := binary.LittleEndian.Uint32(l.values[dense*4+4:])
+	return l.stringBytes[start:end]
+}
+
+// --- Arrays ---
+
+// ArrayNDims returns the dimensionality of the array value at (col, row),
+// or 0 for NULL rows.
+func (b *QwpColumnBatch) ArrayNDims(col, row int) int {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	start := l.arrayRowStart[row]
+	return int(l.values[start])
+}
+
+// ArrayDim returns the extent of dimension `dim` of the array at
+// (col, row). `dim` must be in [0, ArrayNDims(col, row)).
+func (b *QwpColumnBatch) ArrayDim(col, row, dim int) int {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	start := int(l.arrayRowStart[row])
+	nDims := int(l.values[start])
+	if dim < 0 || dim >= nDims {
+		panic(fmt.Sprintf("QwpColumnBatch.ArrayDim: dim %d out of [0, %d)", dim, nDims))
+	}
+	off := start + 1 + dim*4
+	return int(int32(binary.LittleEndian.Uint32(l.values[off : off+4])))
+}
+
+// arrayElementCount returns the element count for the array at row
+// `row` in layout `l`, plus the byte offset within `l.values` where
+// the flattened data region begins (one byte past the shape header).
+// The decoder converts any inline nDims=0 NULL sentinel into a null
+// bitmap bit and bounds-checks the per-dimension extents against
+// qwpMaxArrayElements, so callers that reach this helper know the
+// row is non-null and the product fits in int.
+func arrayElementCount(l *qwpColumnLayout, row int) (nDims, elems, dataBase int) {
+	start := int(l.arrayRowStart[row])
+	nDims = int(l.values[start])
+	elems = 1
+	for d := 0; d < nDims; d++ {
+		off := start + 1 + d*4
+		dim := int(int32(binary.LittleEndian.Uint32(l.values[off : off+4])))
+		elems *= dim
+	}
+	return nDims, elems, start + 1 + nDims*4
+}
+
+// Float64Array returns the flattened (row-major) elements of a
+// DOUBLE_ARRAY cell. Returns nil for NULL rows. The returned slice
+// allocates a fresh []float64 because the wire format stores the
+// elements contiguously and Go does not permit reinterpreting a []byte
+// as []float64 without copying. Use `ArrayDim` to reshape.
+func (b *QwpColumnBatch) Float64Array(col, row int) []float64 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return nil
+	}
+	_, elems, base := arrayElementCount(l, row)
+	out := make([]float64, elems)
+	for i := 0; i < elems; i++ {
+		off := base + i*8
+		out[i] = math.Float64frombits(binary.LittleEndian.Uint64(l.values[off : off+8]))
+	}
+	return out
+}
+
+// Int64Array returns the flattened (row-major) elements of a LONG_ARRAY
+// cell. Returns nil for NULL rows.
+func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return nil
+	}
+	_, elems, base := arrayElementCount(l, row)
+	out := make([]int64, elems)
+	for i := 0; i < elems; i++ {
+		off := base + i*8
+		out[i] = int64(binary.LittleEndian.Uint64(l.values[off : off+8]))
+	}
+	return out
+}
+
+// --- Materializing escape hatch (wired in the I/O-goroutine slab) ---
+
+// SerializedBatch is a heap-owned copy of a QwpColumnBatch, safe to
+// retain past the iteration that produced it. The concrete shape lands
+// with the I/O goroutine integration; the type is declared here so the
+// signature of `CopyAll` is stable.
+type SerializedBatch struct{}
+
+// CopyAll materialises every column into a heap-owned `SerializedBatch`
+// that callers may retain past the current iteration. Not yet
+// implemented — returns an error in this slab; the I/O goroutine
+// integration fills it in when the release-channel lifetime contract
+// is wired up.
+func (b *QwpColumnBatch) CopyAll() (*SerializedBatch, error) {
+	return nil, errors.New("qwp: QwpColumnBatch.CopyAll not yet implemented")
+}
