@@ -99,6 +99,91 @@ HTTP is the recommended transport to use. To connect via TCP, set the configurat
 	// ...
 ```
 
+## QuestDB Wire Protocol (QWP) over WebSocket
+
+QWP is QuestDB's binary *columnar* wire protocol. Compared to ILP, it
+offers higher throughput for wide rows and exposes the full QuestDB type
+system — including `byte`, `short`, `int`, `float`, `char`, `date`,
+nanosecond timestamps, `uuid`, `geohash`, `int64` arrays, and
+fixed-width decimals.
+
+Switch the Quickstart to QWP by changing the schema to `ws` (plain) or
+`wss` (TLS):
+
+```go
+sender, err := qdb.LineSenderFromConf(ctx, "ws::addr=localhost:9000;")
+```
+
+The full fluent API shown in the Quickstart (`Table`, `Symbol`,
+`Float64Column`, `Int64Column`, `At`, `AtNow`, `Flush`, `Close`) works
+unchanged, as do the array and decimal methods shown below. QWP is a
+distinct binary protocol rather than a version of ILP, so the
+`protocol_version` configuration key does not apply.
+
+### QWP-only column types
+
+To access types that ILP does not expose, type-assert the sender to
+`qdb.QwpSender`:
+
+```go
+sender, err := qdb.LineSenderFromConf(ctx, "ws::addr=localhost:9000;")
+if err != nil {
+    log.Fatal(err)
+}
+defer sender.Close(ctx)
+qwp := sender.(qdb.QwpSender)
+
+err = qwp.
+    Table("sensors").
+    Symbol("site", "roof").
+    ByteColumn("status_code", 3).
+    ShortColumn("battery", 4812).
+    Int32Column("sample_count", 120_000).
+    Float32Column("temperature", 21.7).
+    CharColumn("grade", 'A').
+    DateColumn("calibrated", time.Now()).
+    TimestampNanosColumn("captured", time.Now()).
+    UuidColumn("device_id", 0x0123456789abcdef, 0xfedcba9876543210).
+    GeohashColumn("location", 0x1fb9, 15).
+    Int64Array1DColumn("raw_counts", []int64{10, 20, 30}).
+    Decimal64Column("voltage", qdb.NewDecimalFromInt64(12345, 4)).
+    AtNano(ctx, time.Now())
+```
+
+`QwpSender` adds: `ByteColumn`, `ShortColumn`, `Int32Column`,
+`Float32Column`, `CharColumn`, `DateColumn`, `TimestampNanosColumn`,
+`UuidColumn`, `GeohashColumn`, `Int64Array1DColumn`,
+`Int64Array2DColumn`, `Int64Array3DColumn`, `Decimal64Column`,
+`Decimal128Column`, `Decimal256Column`, and `AtNano` (nanosecond-
+resolution designated timestamp; `At` uses microseconds).
+
+### In-flight window
+
+By default the QWP sender runs asynchronously with an in-flight window
+of 128 unacked batches, pipelining encoding with transmission. Set the
+window to 1 to force synchronous flushing, where every `Flush` blocks
+until the server ACKs:
+
+```go
+sender, err := qdb.LineSenderFromConf(ctx,
+    "ws::addr=localhost:9000;in_flight_window=1;")
+```
+
+The programmatic equivalent is `qdb.WithInFlightWindow(1)`.
+
+### Authentication
+
+Basic auth and bearer tokens work the same way as for HTTP:
+
+```go
+qdb.LineSenderFromConf(ctx, "wss::addr=host:9000;username=admin;password=secret;")
+qdb.LineSenderFromConf(ctx, "wss::addr=host:9000;token=<bearer>;")
+```
+
+`LineSenderPool` is HTTP-only and cannot be used with QWP — QWP's
+in-flight window already provides pipelined concurrency from a single
+sender.
+
 ## N-dimensional arrays
 
 QuestDB server version 9.0.0 and newer supports n-dimensional arrays of double precision floating point numbers. 
