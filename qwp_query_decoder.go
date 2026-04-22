@@ -156,15 +156,21 @@ func (r *qwpSchemaRegistry) put(id int, cols []qwpColumnSchemaInfo) {
 // Decoding is zero-copy where possible — column-layout slices alias
 // into the payload []byte the caller hands to decode().
 //
+// The decoder owns connection-scoped state (dict, schemas) but NOT
+// the per-batch layout pool. Each caller's out.layouts slice is
+// grown/reused in place by decode(), so two batches whose buffers
+// the I/O goroutine alternates between never share layout storage.
+// That in turn lets the I/O goroutine emit batch N and immediately
+// decode batch N+1 without corrupting batch N's view.
+//
 // The decoder is not safe for concurrent use.
 type qwpQueryDecoder struct {
 	dict      qwpConnDict
 	schemas   qwpSchemaRegistry
 	gorilla   qwpGorillaDecoder
 	br        qwpByteReader
-	layouts   []qwpColumnLayout // pool, grown to max observed column count
-	deltaOn   bool              // current frame has FLAG_DELTA_SYMBOL_DICT set
-	gorillaOn bool              // current frame has FLAG_GORILLA set
+	deltaOn   bool // current frame has FLAG_DELTA_SYMBOL_DICT set
+	gorillaOn bool // current frame has FLAG_GORILLA set
 }
 
 // decode parses the payload of a RESULT_BATCH frame into out. The
@@ -275,23 +281,26 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 			"unknown schema mode 0x%02X", schemaMode))
 	}
 
-	// Grow the layout pool to columnCount. Pool-owned slices are
-	// preserved so subsequent batches with the same width don't
-	// reallocate.
-	for len(d.layouts) < columnCount {
-		d.layouts = append(d.layouts, qwpColumnLayout{})
+	// Grow the batch's own layout pool to columnCount. Pool-owned
+	// slices are preserved so subsequent decodes into the SAME batch
+	// with the same column width don't reallocate — the I/O goroutine
+	// amortises across batches that reuse the same qwpBatchBuffer.
+	//
+	// Crucially, `out.layouts` lives on the batch, not on the decoder.
+	// Two batches whose buffers the I/O goroutine alternates between
+	// never share layout storage, so emitting batch N while decoding
+	// batch N+1 does not corrupt batch N's view.
+	for len(out.layouts) < columnCount {
+		out.layouts = append(out.layouts, qwpColumnLayout{})
 	}
 
-	// Populate `out` up-front so per-column parsers can index into its
-	// layouts slice via d.layouts (the batch and the decoder share the
-	// same backing layouts). This avoids a second copy at the end.
 	out.payload = payload
 	out.requestId = requestId
 	out.batchSeq = batchSeq
 	out.rowCount = rowCount
 	out.columnCount = columnCount
 	out.columns = cols
-	out.layouts = d.layouts[:columnCount]
+	out.layouts = out.layouts[:columnCount]
 
 	// Per-column parse
 	for i := 0; i < columnCount; i++ {
@@ -699,6 +708,21 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 	// values slice covers the entire array region read above.
 	l.values = d.br.buf[base:d.br.pos]
 	return nil
+}
+
+// qwpPeekMsgKind returns the msg_kind byte at offset qwpHeaderSize of
+// payload without validating magic, version, or flags. Used by the I/O
+// goroutine's dispatch loop to pick the right per-kind decoder method;
+// the chosen method re-runs parseFrameHeader for the full validation.
+//
+// Cheaper than reparsing the whole header twice — but still bounds-checks
+// the payload so a truncated frame cannot panic the dispatch site.
+func qwpPeekMsgKind(payload []byte) (qwpMsgKind, error) {
+	if len(payload) < qwpHeaderSize+1 {
+		return 0, newQwpDecodeError(fmt.Sprintf(
+			"frame payload too short for msg_kind peek: %d", len(payload)))
+	}
+	return qwpMsgKind(payload[qwpHeaderSize]), nil
 }
 
 // parseFrameHeader validates the 12-byte QWP header, primes d.br to the

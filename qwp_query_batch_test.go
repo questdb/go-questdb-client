@@ -540,15 +540,110 @@ func TestQwpColumnBatchEmptyArrayViaZeroShape(t *testing.T) {
 	}
 }
 
-// --- Copy-all placeholder ---
+// --- CopyAll ---
 
-func TestQwpColumnBatchCopyAllNotImplemented(t *testing.T) {
-	info := qwpColumnSchemaInfo{name: "x", wireType: qwpTypeLong}
-	layout := buildFixedLayout(&info, []byte{0, 0, 0, 0, 0, 0, 0, 0}, 1)
-	batch := newSingleColumnBatch(info, layout, 1)
-	_, err := batch.CopyAll()
-	if err == nil {
-		t.Fatal("CopyAll should return an error until the I/O-goroutine slab fills it in")
+// TestQwpColumnBatchCopyAllSurvivesPoolReuse is the contract CopyAll
+// exists to satisfy: a snapshot taken from batch N remains valid and
+// correct after batch N's pool-owned layout slices are reused for
+// batch N+1. The live batch aliases the decoder's layout pool, so
+// without the copy the snapshot's nonNullIdx / symbolRowIds /
+// timestampBuf entries would read batch N+1 data.
+func TestQwpColumnBatchCopyAllSurvivesPoolReuse(t *testing.T) {
+	// Build a nullable Int64 column so nonNullIdx is non-trivial and
+	// we can observe it getting overwritten.
+	info := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+	rowBytes := [][]byte{
+		binary.LittleEndian.AppendUint64(nil, uint64(100)),
+		nil, // NULL
+		binary.LittleEndian.AppendUint64(nil, uint64(300)),
+	}
+	layout := buildNullableLayout(&info, rowBytes)
+	batch := newSingleColumnBatch(info, layout, 3)
+
+	snapshot := batch.CopyAll()
+
+	// Simulate the decoder overwriting the pool-owned fields in place,
+	// the same way qwpColumnLayout.clear() + parseNullSection would.
+	for i := range batch.layouts[0].nonNullIdx {
+		batch.layouts[0].nonNullIdx[i] = 0xBAD
+	}
+	batch.layouts[0].values = []byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0}
+
+	// Snapshot must still see the original values.
+	if got := snapshot.Int64(0, 0); got != 100 {
+		t.Fatalf("snapshot.Int64(0,0) = %d, want 100", got)
+	}
+	if !snapshot.IsNull(0, 1) {
+		t.Fatal("snapshot row 1 should be NULL")
+	}
+	if got := snapshot.Int64(0, 2); got != 300 {
+		t.Fatalf("snapshot.Int64(0,2) = %d, want 300", got)
+	}
+	if snapshot.RowCount() != 3 || snapshot.ColumnCount() != 1 {
+		t.Fatalf("snapshot row/col count = (%d, %d), want (3, 1)",
+			snapshot.RowCount(), snapshot.ColumnCount())
+	}
+	if snapshot.ColumnName(0) != "v" {
+		t.Fatalf("snapshot column name = %q", snapshot.ColumnName(0))
+	}
+}
+
+// TestQwpColumnBatchCopyAllGorillaTimestampSurvivesPoolReuse covers
+// the Gorilla-TIMESTAMP corner of CopyAll. For Gorilla-encoded
+// columns the decoder sets layout.values to alias layout.timestampBuf
+// (see parseTimestamp), so the snapshot must re-point values at the
+// CLONED timestampBuf. Without that re-point, decoding a second frame
+// into the same QwpColumnBatch overwrites the source's timestampBuf
+// in place and the snapshot's Int64 accessor starts reading batch
+// N+1 values.
+func TestQwpColumnBatchCopyAllGorillaTimestampSurvivesPoolReuse(t *testing.T) {
+	// Small, regular DoDs push the encoder onto the Gorilla path;
+	// nonNullCount >= 3 is required for Gorilla (parseTimestamp
+	// rejects otherwise).
+	orig := []int64{1_000_000, 1_000_100, 1_000_200, 1_000_310, 1_000_520}
+	origRows := make([]func(*qwpColumnBuffer), len(orig))
+	for i, v := range orig {
+		v := v
+		origRows[i] = func(c *qwpColumnBuffer) { c.addLong(v) }
+	}
+	frame1 := encodeSingleColumnBatch(t, "ts", qwpTypeTimestamp, false, origRows)
+
+	// A second batch whose values are nowhere near the first, so a
+	// stale alias produces obviously-wrong reads rather than
+	// coincidentally-matching values.
+	fresh := []int64{5_000_000, 5_000_999, 5_001_888, 5_002_555, 5_003_333}
+	freshRows := make([]func(*qwpColumnBuffer), len(fresh))
+	for i, v := range fresh {
+		v := v
+		freshRows[i] = func(c *qwpColumnBuffer) { c.addLong(v) }
+	}
+	frame2 := encodeSingleColumnBatch(t, "ts", qwpTypeTimestamp, false, freshRows)
+
+	var dec qwpQueryDecoder
+	var batch QwpColumnBatch
+	if err := dec.decode(frame1, &batch); err != nil {
+		t.Fatalf("decode 1: %v", err)
+	}
+	// Precondition: the first decode must actually have taken the
+	// Gorilla path. If encoder heuristics change and this falls back
+	// to the uncompressed branch, the test no longer covers the bug.
+	if len(batch.layouts[0].timestampBuf) == 0 {
+		t.Fatal("test precondition: expected Gorilla path to populate timestampBuf")
+	}
+
+	snapshot := batch.CopyAll()
+
+	// Decode a second frame into the SAME batch. The decoder reuses
+	// batch.layouts[0].timestampBuf in place, so the source's backing
+	// array is now clobbered.
+	if err := dec.decode(frame2, &batch); err != nil {
+		t.Fatalf("decode 2: %v", err)
+	}
+
+	for i, w := range orig {
+		if got := snapshot.Int64(0, i); got != w {
+			t.Fatalf("snapshot.Int64(0, %d) = %d, want %d", i, got, w)
+		}
 	}
 }
 

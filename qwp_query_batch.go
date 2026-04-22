@@ -26,9 +26,9 @@ package questdb
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"math"
+	"slices"
 )
 
 // qwpColumnSchemaInfo captures the per-column metadata carried in the
@@ -70,11 +70,15 @@ type qwpSymbolDictView struct {
 // buffer) except `timestampBuf`, which the decoder owns because the
 // Gorilla-decoded int64 values cannot be produced in-place.
 //
-// Lifetime: layouts are pool-owned (qwpQueryDecoder.layoutPool) and
-// reused across batches. `clear` nil-s the slice headers but preserves
-// backing arrays on the non-aliasing fields (`nonNullIdx`, `symbolRowIds`,
-// `timestampBuf`, `arrayRowStart`, `arrayRowLen`), so subsequent batches
-// with the same column width avoid reallocation.
+// Lifetime: layouts live on the enclosing QwpColumnBatch and are
+// grown in place by the decoder across decodes into the SAME batch.
+// Two QwpBatchBuffers that the I/O goroutine alternates between
+// therefore never share layout storage, so emitting batch N while
+// decoding batch N+1 does not corrupt N's view. `clear` nil-s the
+// slice headers but preserves backing arrays on the non-aliasing
+// fields (`nonNullIdx`, `symbolRowIds`, `timestampBuf`,
+// `arrayRowStart`, `arrayRowLen`), so subsequent decodes into the
+// same batch with the same column width avoid reallocation.
 type qwpColumnLayout struct {
 	info *qwpColumnSchemaInfo
 
@@ -536,19 +540,73 @@ func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
 	return out
 }
 
-// --- Materializing escape hatch (wired in the I/O-goroutine slab) ---
+// --- Materializing escape hatch ---
 
 // SerializedBatch is a heap-owned copy of a QwpColumnBatch, safe to
-// retain past the iteration that produced it. The concrete shape lands
-// with the I/O goroutine integration; the type is declared here so the
-// signature of `CopyAll` is stable.
-type SerializedBatch struct{}
+// retain past the iteration that produced it. It is a type alias for
+// QwpColumnBatch so every typed accessor (Int64, Str, Float64Array, …)
+// works identically on the serialized copy.
+//
+// The shape of a SerializedBatch differs from a live batch in two ways,
+// both of which are invisible to callers:
+//
+//  1. The pool-owned layout arrays (nonNullIdx, symbolRowIds,
+//     arrayRowStart, arrayRowLen, timestampBuf) are freshly-allocated
+//     heap slices, not aliases into the decoder's reused pool.
+//  2. The per-layout slices that alias the payload (values,
+//     stringBytes, nullBitmap) still alias — but the batch retains the
+//     payload []byte, which coder/websocket returns fresh per frame,
+//     so the aliased bytes outlive the next decode.
+type SerializedBatch = QwpColumnBatch
 
-// CopyAll materialises every column into a heap-owned `SerializedBatch`
-// that callers may retain past the current iteration. Not yet
-// implemented — returns an error in this slab; the I/O goroutine
-// integration fills it in when the release-channel lifetime contract
-// is wired up.
-func (b *QwpColumnBatch) CopyAll() (*SerializedBatch, error) {
-	return nil, errors.New("qwp: QwpColumnBatch.CopyAll not yet implemented")
+// CopyAll materialises the batch into a heap-owned *SerializedBatch
+// that the caller may retain past the current iteration of
+// *QwpQuery.Batches(). The I/O goroutine's decoder reuses its per-column
+// layout pool on the next frame, so a raw *QwpColumnBatch is only valid
+// for the current iteration; CopyAll is the escape hatch.
+//
+// Cost: one []qwpColumnLayout slice + one fresh backing slice per
+// pool-owned layout field. Payload and schema metadata are retained by
+// reference (no bulk data copy).
+func (b *QwpColumnBatch) CopyAll() *SerializedBatch {
+	sb := &SerializedBatch{
+		payload:     b.payload,
+		requestId:   b.requestId,
+		batchSeq:    b.batchSeq,
+		rowCount:    b.rowCount,
+		columnCount: b.columnCount,
+		columns:     b.columns,
+		layouts:     make([]qwpColumnLayout, b.columnCount),
+	}
+	for i := 0; i < b.columnCount; i++ {
+		src := &b.layouts[i]
+		dst := &sb.layouts[i]
+		dst.info = src.info
+		// nullBitmap: aliases payload for server-sent bitmaps; owned heap
+		// buffer after array nDims=0 NULL promotion. Either way, retaining
+		// the slice header keeps the backing array reachable for the life
+		// of the SerializedBatch.
+		dst.nullBitmap = src.nullBitmap
+		dst.nonNullCount = src.nonNullCount
+		dst.nonNullIdx = slices.Clone(src.nonNullIdx)
+		dst.values = src.values
+		dst.stringBytes = src.stringBytes
+		dst.symbolRowIds = slices.Clone(src.symbolRowIds)
+		// symbolDict snapshot: heap + entries lengths are frozen at
+		// snapshot time and the decoder only ever append-extends them,
+		// so the view stays valid without copying.
+		dst.symbolDict = src.symbolDict
+		dst.arrayRowStart = slices.Clone(src.arrayRowStart)
+		dst.arrayRowLen = slices.Clone(src.arrayRowLen)
+		dst.timestampBuf = slices.Clone(src.timestampBuf)
+		// Gorilla TIMESTAMP: values aliases timestampBuf (not payload).
+		// Re-point at the cloned buffer so the snapshot survives the
+		// decoder reusing the source's timestampBuf on a later decode.
+		// Detected by timestampBuf being non-empty — parseTimestamp's
+		// non-Gorilla branches leave it cleared to :0.
+		if len(src.timestampBuf) > 0 {
+			dst.values = int64sAsBytes(dst.timestampBuf)
+		}
+	}
+	return sb
 }
