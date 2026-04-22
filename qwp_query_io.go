@@ -445,9 +445,26 @@ func (io *qwpEgressIO) dispatcherRun() {
 		io.currentRequestId = req.requestId
 		io.creditEnabled = req.initialCredit > 0
 		io.currentQueryDone = false
-		// A pending cancel from a prior query must not leak into
-		// this one; drop it.
-		io.cancelRequestId.Store(-1)
+		// Clear a lingering prior-query cancel without clobbering a
+		// user-thread Cancel(req.requestId) that raced the dispatcher
+		// picking up this request off the single-slot queue. The user
+		// can call QwpQuery.Cancel() as soon as Query() returns —
+		// submitQuery is non-blocking, so the user's Cancel can reach
+		// the atomic before the dispatcher even starts processing.
+		// CAS loop: only clear if the stored id is a prior-query id
+		// (not -1, not req.requestId). Any user Store that races the
+		// CAS either commits first (we see req.requestId and bail) or
+		// overwrites our -1 afterwards (drainPendingCancel picks it
+		// up on the next loop iteration either way).
+		for {
+			cur := io.cancelRequestId.Load()
+			if cur == -1 || cur == req.requestId {
+				break
+			}
+			if io.cancelRequestId.CompareAndSwap(cur, -1) {
+				break
+			}
+		}
 		io.pendingCredit.Store(0)
 
 		if err := io.sendQueryRequest(req); err != nil {
