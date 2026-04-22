@@ -30,6 +30,20 @@ import (
 	"unsafe"
 )
 
+// ExecResult is the outcome of a non-SELECT statement (DDL / INSERT /
+// UPDATE / ...) submitted via the QWP egress protocol. It mirrors the
+// body of an EXEC_DONE frame.
+type ExecResult struct {
+	// OpType is the server's CompiledQuery.TYPE_* discriminator for
+	// the executed statement (opaque to the client — surfaced for
+	// callers that want to distinguish INSERT from UPDATE from DELETE
+	// from pure DDL).
+	OpType byte
+
+	// RowsAffected is the number of rows modified. 0 for pure DDL.
+	RowsAffected int64
+}
+
 // qwpConnDict is the connection-scoped symbol dictionary. The server
 // sends a delta section at the head of every RESULT_BATCH listing
 // symbols assigned since the previous batch; the decoder appends them
@@ -163,37 +177,13 @@ type qwpQueryDecoder struct {
 // reuse payload (or close the WebSocket buffer that backs it) until
 // the caller is done reading out.
 func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
-	if len(payload) < qwpHeaderSize+1 {
-		return newQwpDecodeError(fmt.Sprintf(
-			"RESULT_BATCH payload too short: %d", len(payload)))
-	}
-	// Header
-	magic := binary.LittleEndian.Uint32(payload[0:4])
-	if magic != qwpMagic {
-		return newQwpDecodeError(fmt.Sprintf("bad magic 0x%08X", magic))
-	}
-	if payload[4] != qwpVersion {
-		return newQwpDecodeError(fmt.Sprintf(
-			"unsupported version %d", payload[4]))
-	}
-	flags := payload[qwpHeaderOffsetFlags]
-	d.deltaOn = flags&qwpFlagDeltaSymbolDict != 0
-	d.gorillaOn = flags&qwpFlagGorilla != 0
-	if flags&qwpFlagZstd != 0 {
-		return newQwpDecodeError(
-			"FLAG_ZSTD set but zstd not yet supported in this client")
-	}
-
-	// Body
-	d.br.reset(payload[qwpHeaderSize:])
-
-	msgKind, err := d.br.readByte()
+	msgKind, err := d.parseFrameHeader(payload)
 	if err != nil {
 		return err
 	}
-	if msgKind != byte(qwpMsgKindResultBatch) {
+	if msgKind != qwpMsgKindResultBatch {
 		return newQwpDecodeError(fmt.Sprintf(
-			"expected RESULT_BATCH (0x11), got 0x%02X", msgKind))
+			"expected RESULT_BATCH (0x11), got 0x%02X", byte(msgKind)))
 	}
 	requestId, err := d.br.readInt64LE()
 	if err != nil {
@@ -709,6 +699,156 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 	// values slice covers the entire array region read above.
 	l.values = d.br.buf[base:d.br.pos]
 	return nil
+}
+
+// parseFrameHeader validates the 12-byte QWP header, primes d.br to the
+// frame body, reads the msg_kind byte, and returns it. Sets d.deltaOn /
+// d.gorillaOn from the flags byte. Rejects FLAG_ZSTD — this client does
+// not yet implement zstd decompression.
+//
+// Shared by every per-kind decoder (decode / decodeResultEnd /
+// decodeQueryError / decodeExecDone) so header validation stays uniform.
+func (d *qwpQueryDecoder) parseFrameHeader(payload []byte) (qwpMsgKind, error) {
+	if len(payload) < qwpHeaderSize+1 {
+		return 0, newQwpDecodeError(fmt.Sprintf(
+			"frame payload too short: %d", len(payload)))
+	}
+	magic := binary.LittleEndian.Uint32(payload[0:4])
+	if magic != qwpMagic {
+		return 0, newQwpDecodeError(fmt.Sprintf("bad magic 0x%08X", magic))
+	}
+	if payload[4] != qwpVersion {
+		return 0, newQwpDecodeError(fmt.Sprintf(
+			"unsupported version %d", payload[4]))
+	}
+	flags := payload[qwpHeaderOffsetFlags]
+	d.deltaOn = flags&qwpFlagDeltaSymbolDict != 0
+	d.gorillaOn = flags&qwpFlagGorilla != 0
+	if flags&qwpFlagZstd != 0 {
+		return 0, newQwpDecodeError(
+			"FLAG_ZSTD set but zstd not yet supported in this client")
+	}
+	d.br.reset(payload[qwpHeaderSize:])
+	kindByte, err := d.br.readByte()
+	if err != nil {
+		return 0, err
+	}
+	return qwpMsgKind(kindByte), nil
+}
+
+// decodeResultEnd parses a RESULT_END (0x12) frame. The frame announces
+// the end of a streaming query and carries the server-reported total
+// row count.
+//
+// Wire layout (after the 12-byte header):
+//
+//	msg_kind(1) + request_id(int64 LE) + final_seq(varint) + total_rows(varint)
+//
+// final_seq is currently unused by this client — it matches the last
+// batch's seq and is already tracked by the I/O layer. It is still
+// consumed so the cursor is aligned when reading total_rows.
+func (d *qwpQueryDecoder) decodeResultEnd(payload []byte) (requestId int64, totalRows int64, err error) {
+	msgKind, err := d.parseFrameHeader(payload)
+	if err != nil {
+		return 0, 0, err
+	}
+	if msgKind != qwpMsgKindResultEnd {
+		return 0, 0, newQwpDecodeError(fmt.Sprintf(
+			"expected RESULT_END (0x12), got 0x%02X", byte(msgKind)))
+	}
+	requestId, err = d.br.readInt64LE()
+	if err != nil {
+		return 0, 0, err
+	}
+	// final_seq: read and discard. readVarint already rejects
+	// overflowing 10-byte sequences, matching the Java guard.
+	if _, err = d.br.readVarint(); err != nil {
+		return 0, 0, err
+	}
+	totalRows, err = d.br.readVarintInt63()
+	if err != nil {
+		return 0, 0, err
+	}
+	return requestId, totalRows, nil
+}
+
+// decodeQueryError parses a QUERY_ERROR (0x13) frame. The returned
+// QwpQueryError carries the server's status byte and UTF-8 message.
+//
+// Wire layout (after the 12-byte header):
+//
+//	msg_kind(1) + request_id(int64 LE) + status(1) + msg_len(uint16 LE) + message(msg_len UTF-8 bytes)
+//
+// msg_len is treated as unsigned (range 0..65535); the qwpByteReader.slice
+// call below rejects a msg_len that overruns the frame — this is the
+// port of Java's "msg_len ... exceeds frame remainder" hardening guard.
+func (d *qwpQueryDecoder) decodeQueryError(payload []byte) (*QwpQueryError, error) {
+	msgKind, err := d.parseFrameHeader(payload)
+	if err != nil {
+		return nil, err
+	}
+	if msgKind != qwpMsgKindQueryError {
+		return nil, newQwpDecodeError(fmt.Sprintf(
+			"expected QUERY_ERROR (0x13), got 0x%02X", byte(msgKind)))
+	}
+	requestId, err := d.br.readInt64LE()
+	if err != nil {
+		return nil, err
+	}
+	status, err := d.br.readByte()
+	if err != nil {
+		return nil, err
+	}
+	msgLen, err := d.br.readUint16LE()
+	if err != nil {
+		return nil, err
+	}
+	msgBytes, err := d.br.slice(int(msgLen))
+	if err != nil {
+		return nil, wrapQwpDecodeError(fmt.Sprintf(
+			"QUERY_ERROR msg_len %d exceeds frame remainder", msgLen), err)
+	}
+	return &QwpQueryError{
+		RequestId: requestId,
+		Status:    qwpStatusCode(status),
+		// Copy: msgBytes aliases the payload, which is reclaimed once
+		// the I/O goroutine advances past the frame. QwpQueryError is
+		// surfaced to the user and outlives the frame.
+		Message: string(msgBytes),
+	}, nil
+}
+
+// decodeExecDone parses an EXEC_DONE (0x16) frame — the terminal ack
+// for a non-SELECT statement.
+//
+// Wire layout (after the 12-byte header):
+//
+//	msg_kind(1) + request_id(int64 LE) + op_type(1) + rows_affected(varint)
+func (d *qwpQueryDecoder) decodeExecDone(payload []byte) (requestId int64, result ExecResult, err error) {
+	msgKind, err := d.parseFrameHeader(payload)
+	if err != nil {
+		return 0, ExecResult{}, err
+	}
+	if msgKind != qwpMsgKindExecDone {
+		return 0, ExecResult{}, newQwpDecodeError(fmt.Sprintf(
+			"expected EXEC_DONE (0x16), got 0x%02X", byte(msgKind)))
+	}
+	requestId, err = d.br.readInt64LE()
+	if err != nil {
+		return 0, ExecResult{}, err
+	}
+	opType, err := d.br.readByte()
+	if err != nil {
+		return 0, ExecResult{}, err
+	}
+	rowsAffected, err := d.br.readVarintInt63()
+	if err != nil {
+		return 0, ExecResult{}, err
+	}
+	return requestId, ExecResult{
+		OpType:       opType,
+		RowsAffected: rowsAffected,
+	}, nil
 }
 
 // int64sAsBytes reinterprets an []int64 as []byte (len*8, cap*8)

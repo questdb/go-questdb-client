@@ -1134,6 +1134,371 @@ func buildArrayHardeningFrame(t *testing.T, nDims int, shape []int32) []byte {
 	return out
 }
 
+// writeQwpFrame builds a complete QWP frame: a 12-byte header with the
+// given flags plus the supplied body bytes. The body must start with the
+// msg_kind byte. payload_length is patched in; table_count is written
+// as 0 (ignored by the egress response decoders).
+func writeQwpFrame(flags byte, body []byte) []byte {
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
+	buf.WriteByte(qwpVersion)
+	buf.WriteByte(flags)
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(0)) // table_count
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0)) // payload_length placeholder
+	buf.Write(body)
+	out := buf.Bytes()
+	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:],
+		uint32(len(out)-qwpHeaderSize))
+	return out
+}
+
+// buildResultEndBody assembles a RESULT_END body given requestId,
+// finalSeq, and totalRows. Returns the msg_kind byte followed by the
+// fixed and varint fields (no header).
+func buildResultEndBody(requestId int64, finalSeq uint64, totalRows uint64) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(byte(qwpMsgKindResultEnd))
+	_ = binary.Write(&buf, binary.LittleEndian, uint64(requestId))
+	putVarintBytes(&buf, finalSeq)
+	putVarintBytes(&buf, totalRows)
+	return buf.Bytes()
+}
+
+// buildQueryErrorBody assembles a QUERY_ERROR body. rawMsgLen overrides
+// the msg_len field on the wire (used to inject hostile values); pass -1
+// to fall back to len(msg).
+func buildQueryErrorBody(requestId int64, status byte, msg string, rawMsgLen int) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(byte(qwpMsgKindQueryError))
+	_ = binary.Write(&buf, binary.LittleEndian, uint64(requestId))
+	buf.WriteByte(status)
+	msgLen := uint16(len(msg))
+	if rawMsgLen >= 0 {
+		msgLen = uint16(rawMsgLen)
+	}
+	_ = binary.Write(&buf, binary.LittleEndian, msgLen)
+	buf.WriteString(msg)
+	return buf.Bytes()
+}
+
+// buildExecDoneBody assembles an EXEC_DONE body.
+func buildExecDoneBody(requestId int64, opType byte, rowsAffected uint64) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(byte(qwpMsgKindExecDone))
+	_ = binary.Write(&buf, binary.LittleEndian, uint64(requestId))
+	buf.WriteByte(opType)
+	putVarintBytes(&buf, rowsAffected)
+	return buf.Bytes()
+}
+
+func TestQwpDecoderResultEnd(t *testing.T) {
+	t.Run("RoundTrip", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildResultEndBody(42, 7, 1234))
+		var dec qwpQueryDecoder
+		reqId, total, err := dec.decodeResultEnd(frame)
+		if err != nil {
+			t.Fatalf("decodeResultEnd: %v", err)
+		}
+		if reqId != 42 {
+			t.Fatalf("requestId = %d, want 42", reqId)
+		}
+		if total != 1234 {
+			t.Fatalf("totalRows = %d, want 1234", total)
+		}
+	})
+
+	t.Run("ZeroRows", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildResultEndBody(1, 0, 0))
+		var dec qwpQueryDecoder
+		_, total, err := dec.decodeResultEnd(frame)
+		if err != nil {
+			t.Fatalf("decodeResultEnd: %v", err)
+		}
+		if total != 0 {
+			t.Fatalf("totalRows = %d, want 0", total)
+		}
+	})
+
+	t.Run("WrongMsgKind", func(t *testing.T) {
+		body := buildResultEndBody(1, 0, 0)
+		body[0] = byte(qwpMsgKindExecDone)
+		frame := writeQwpFrame(0, body)
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeResultEnd(frame)
+		assertDecodeErrContains(t, err, "expected RESULT_END")
+	})
+
+	t.Run("TruncatedBeforeRequestId", func(t *testing.T) {
+		// Header + msg_kind only.
+		frame := writeQwpFrame(0, []byte{byte(qwpMsgKindResultEnd)})
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeResultEnd(frame)
+		assertDecodeErrContains(t, err, "end of buffer")
+	})
+
+	t.Run("TruncatedBeforeFinalSeq", func(t *testing.T) {
+		var body bytes.Buffer
+		body.WriteByte(byte(qwpMsgKindResultEnd))
+		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
+		frame := writeQwpFrame(0, body.Bytes())
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeResultEnd(frame)
+		assertDecodeErrContains(t, err, "truncated")
+	})
+
+	t.Run("TotalRowsVarintOverflow", func(t *testing.T) {
+		// 10 bytes with continuation bit through byte 9 and a value
+		// bit past bit 63 — rejects at readVarint's overflow guard.
+		var body bytes.Buffer
+		body.WriteByte(byte(qwpMsgKindResultEnd))
+		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
+		putVarintBytes(&body, 0) // final_seq = 0
+		body.Write([]byte{
+			0x80, 0x80, 0x80, 0x80, 0x80,
+			0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
+		})
+		frame := writeQwpFrame(0, body.Bytes())
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeResultEnd(frame)
+		if err == nil {
+			t.Fatal("expected varint overflow error, got nil")
+		}
+	})
+
+	t.Run("BadMagic", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildResultEndBody(1, 0, 0))
+		frame[0] = 0xFF
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeResultEnd(frame)
+		assertDecodeErrContains(t, err, "bad magic")
+	})
+
+	t.Run("ZstdFlagRejected", func(t *testing.T) {
+		frame := writeQwpFrame(qwpFlagZstd, buildResultEndBody(1, 0, 0))
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeResultEnd(frame)
+		assertDecodeErrContains(t, err, "zstd")
+	})
+}
+
+func TestQwpDecoderQueryError(t *testing.T) {
+	// Port of Java QwpResultBatchDecoderHardeningTest.testQueryErrorValidMessageDecodes.
+	t.Run("ValidMessageDecodes", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildQueryErrorBody(99, 0x05, "boom", -1))
+		var dec qwpQueryDecoder
+		qe, err := dec.decodeQueryError(frame)
+		if err != nil {
+			t.Fatalf("decodeQueryError: %v", err)
+		}
+		if qe.RequestId != 99 {
+			t.Fatalf("RequestId = %d, want 99", qe.RequestId)
+		}
+		if qe.Status != qwpStatusCode(0x05) {
+			t.Fatalf("Status = 0x%02X, want 0x05", byte(qe.Status))
+		}
+		if qe.Message != "boom" {
+			t.Fatalf("Message = %q, want %q", qe.Message, "boom")
+		}
+	})
+
+	// Port of Java testQueryErrorMsgLenOverrunIsRejected: msgLen claims
+	// 0xFFFF but the frame has no bytes of message.
+	t.Run("MsgLenOverrunRejected", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildQueryErrorBody(0, 0, "", 0xFFFF))
+		var dec qwpQueryDecoder
+		_, err := dec.decodeQueryError(frame)
+		assertDecodeErrContains(t, err, "msg_len")
+		if !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("expected 'exceeds' in error, got: %v", err)
+		}
+	})
+
+	t.Run("EmptyMessage", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusCancelled), "", -1))
+		var dec qwpQueryDecoder
+		qe, err := dec.decodeQueryError(frame)
+		if err != nil {
+			t.Fatalf("decodeQueryError: %v", err)
+		}
+		if qe.Status != qwpStatusCancelled {
+			t.Fatalf("Status = 0x%02X, want CANCELLED", byte(qe.Status))
+		}
+		if qe.Message != "" {
+			t.Fatalf("Message = %q, want empty", qe.Message)
+		}
+	})
+
+	t.Run("CancelledStatusSurfaces", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusCancelled),
+			"query cancelled", -1))
+		var dec qwpQueryDecoder
+		qe, err := dec.decodeQueryError(frame)
+		if err != nil {
+			t.Fatalf("decodeQueryError: %v", err)
+		}
+		// Error() must mention CANCELLED and the message.
+		if s := qe.Error(); !strings.Contains(s, "CANCELLED") ||
+			!strings.Contains(s, "query cancelled") {
+			t.Fatalf("Error() = %q, missing status name or message", s)
+		}
+	})
+
+	t.Run("LimitExceededStatusSurfaces", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusLimitExceeded),
+			"rows cap hit", -1))
+		var dec qwpQueryDecoder
+		qe, err := dec.decodeQueryError(frame)
+		if err != nil {
+			t.Fatalf("decodeQueryError: %v", err)
+		}
+		if qe.Status != qwpStatusLimitExceeded {
+			t.Fatalf("Status = 0x%02X, want LIMIT_EXCEEDED", byte(qe.Status))
+		}
+	})
+
+	t.Run("WrongMsgKind", func(t *testing.T) {
+		body := buildQueryErrorBody(1, 0x05, "x", -1)
+		body[0] = byte(qwpMsgKindResultBatch)
+		frame := writeQwpFrame(0, body)
+		var dec qwpQueryDecoder
+		_, err := dec.decodeQueryError(frame)
+		assertDecodeErrContains(t, err, "expected QUERY_ERROR")
+	})
+
+	t.Run("TruncatedBeforeStatus", func(t *testing.T) {
+		var body bytes.Buffer
+		body.WriteByte(byte(qwpMsgKindQueryError))
+		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
+		frame := writeQwpFrame(0, body.Bytes())
+		var dec qwpQueryDecoder
+		_, err := dec.decodeQueryError(frame)
+		assertDecodeErrContains(t, err, "end of buffer")
+	})
+
+	t.Run("TruncatedBeforeMsgLen", func(t *testing.T) {
+		var body bytes.Buffer
+		body.WriteByte(byte(qwpMsgKindQueryError))
+		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
+		body.WriteByte(0x05)
+		// Only 1 byte after status — msg_len needs 2.
+		body.WriteByte(0x00)
+		frame := writeQwpFrame(0, body.Bytes())
+		var dec qwpQueryDecoder
+		_, err := dec.decodeQueryError(frame)
+		assertDecodeErrContains(t, err, "end of buffer")
+	})
+
+	t.Run("UnicodeMessage", func(t *testing.T) {
+		msg := "ünïcødé ⚠"
+		frame := writeQwpFrame(0, buildQueryErrorBody(1, 0x06, msg, -1))
+		var dec qwpQueryDecoder
+		qe, err := dec.decodeQueryError(frame)
+		if err != nil {
+			t.Fatalf("decodeQueryError: %v", err)
+		}
+		if qe.Message != msg {
+			t.Fatalf("Message = %q, want %q", qe.Message, msg)
+		}
+	})
+}
+
+func TestQwpDecoderExecDone(t *testing.T) {
+	t.Run("RoundTrip", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildExecDoneBody(100, 0x04, 42))
+		var dec qwpQueryDecoder
+		reqId, res, err := dec.decodeExecDone(frame)
+		if err != nil {
+			t.Fatalf("decodeExecDone: %v", err)
+		}
+		if reqId != 100 {
+			t.Fatalf("requestId = %d, want 100", reqId)
+		}
+		if res.OpType != 0x04 {
+			t.Fatalf("OpType = 0x%02X, want 0x04", res.OpType)
+		}
+		if res.RowsAffected != 42 {
+			t.Fatalf("RowsAffected = %d, want 42", res.RowsAffected)
+		}
+	})
+
+	t.Run("PureDDLZeroRows", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildExecDoneBody(1, 0x01, 0))
+		var dec qwpQueryDecoder
+		_, res, err := dec.decodeExecDone(frame)
+		if err != nil {
+			t.Fatalf("decodeExecDone: %v", err)
+		}
+		if res.RowsAffected != 0 {
+			t.Fatalf("RowsAffected = %d, want 0", res.RowsAffected)
+		}
+	})
+
+	t.Run("WrongMsgKind", func(t *testing.T) {
+		body := buildExecDoneBody(1, 0x01, 0)
+		body[0] = byte(qwpMsgKindQueryError)
+		frame := writeQwpFrame(0, body)
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeExecDone(frame)
+		assertDecodeErrContains(t, err, "expected EXEC_DONE")
+	})
+
+	t.Run("TruncatedBeforeOpType", func(t *testing.T) {
+		var body bytes.Buffer
+		body.WriteByte(byte(qwpMsgKindExecDone))
+		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
+		frame := writeQwpFrame(0, body.Bytes())
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeExecDone(frame)
+		assertDecodeErrContains(t, err, "end of buffer")
+	})
+
+	t.Run("TruncatedBeforeRowsAffected", func(t *testing.T) {
+		var body bytes.Buffer
+		body.WriteByte(byte(qwpMsgKindExecDone))
+		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
+		body.WriteByte(0x04)
+		frame := writeQwpFrame(0, body.Bytes())
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeExecDone(frame)
+		assertDecodeErrContains(t, err, "truncated")
+	})
+
+	t.Run("RowsAffectedVarintOverflow", func(t *testing.T) {
+		var body bytes.Buffer
+		body.WriteByte(byte(qwpMsgKindExecDone))
+		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
+		body.WriteByte(0x04)
+		body.Write([]byte{
+			0x80, 0x80, 0x80, 0x80, 0x80,
+			0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
+		})
+		frame := writeQwpFrame(0, body.Bytes())
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeExecDone(frame)
+		if err == nil {
+			t.Fatal("expected varint overflow error, got nil")
+		}
+	})
+
+	t.Run("RowsAffectedInt63Overflow", func(t *testing.T) {
+		// 10-byte varint encoding exactly 2^63 — a valid uint64 but
+		// readVarintInt63 rejects because the int64 cast sign-flips.
+		// 9 continuation bytes of zero, then 0x01 (bit 63).
+		var body bytes.Buffer
+		body.WriteByte(byte(qwpMsgKindExecDone))
+		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
+		body.WriteByte(0x04)
+		body.Write([]byte{
+			0x80, 0x80, 0x80, 0x80, 0x80,
+			0x80, 0x80, 0x80, 0x80, 0x01,
+		})
+		frame := writeQwpFrame(0, body.Bytes())
+		var dec qwpQueryDecoder
+		_, _, err := dec.decodeExecDone(frame)
+		assertDecodeErrContains(t, err, "int63")
+	})
+}
+
 func assertDecodeErrContains(t *testing.T, err error, substr string) {
 	t.Helper()
 	if err == nil {
