@@ -761,6 +761,258 @@ func TestQwpColumnBatchCopyAllScaleAndPrecisionAreRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
+// --- Column handle ---
+
+// TestQwpColumnHandleMirrorsBatchAccessors asserts the captured column
+// handle returns the same values as the batch-level (col, row)
+// accessors for every fixed-width type, including NULL rows.
+func TestQwpColumnHandleMirrorsBatchAccessors(t *testing.T) {
+	// Nullable Int64 column: 5 rows (V N V V N), values 100/300/400.
+	intInfo := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+	rowBytes := [][]byte{
+		binary.LittleEndian.AppendUint64(nil, 100),
+		nil,
+		binary.LittleEndian.AppendUint64(nil, 300),
+		binary.LittleEndian.AppendUint64(nil, 400),
+		nil,
+	}
+	intLayout := buildNullableLayout(&intInfo, rowBytes)
+
+	// VARCHAR column: 3 rows, no nulls.
+	strInfo := qwpColumnSchemaInfo{name: "s", wireType: qwpTypeVarchar}
+	strLayout := buildStringLayout(&strInfo, []string{"foo", "bar", "baz"})
+
+	// Build a two-column batch manually (same rowCount across columns
+	// isn't a hard invariant here — the string accessor only indexes
+	// into its own column's values/offsets).
+	batch := &QwpColumnBatch{
+		requestId:   1,
+		rowCount:    5,
+		columnCount: 2,
+		columns:     []qwpColumnSchemaInfo{intInfo, strInfo},
+		layouts:     []qwpColumnLayout{intLayout, strLayout},
+	}
+
+	icol := batch.Column(0)
+	if icol.Name() != "v" {
+		t.Fatalf("Name = %q", icol.Name())
+	}
+	if icol.Type() != byte(qwpTypeLong) {
+		t.Fatalf("Type = %#x", icol.Type())
+	}
+	if icol.RowCount() != 5 {
+		t.Fatalf("RowCount = %d", icol.RowCount())
+	}
+	if icol.NonNullCount() != 3 {
+		t.Fatalf("NonNullCount = %d", icol.NonNullCount())
+	}
+	if !icol.HasNulls() {
+		t.Fatal("HasNulls should be true for nullable column")
+	}
+	for row := 0; row < 5; row++ {
+		if icol.IsNull(row) != batch.IsNull(0, row) {
+			t.Fatalf("IsNull mismatch at %d", row)
+		}
+		if icol.Int64(row) != batch.Int64(0, row) {
+			t.Fatalf("Int64 mismatch at %d: col=%d batch=%d",
+				row, icol.Int64(row), batch.Int64(0, row))
+		}
+	}
+
+	scol := batch.Column(1)
+	if scol.HasNulls() {
+		t.Fatal("HasNulls should be false for non-nullable column")
+	}
+	for row, want := range []string{"foo", "bar", "baz"} {
+		if got := scol.String(row); got != want {
+			t.Fatalf("String(%d) = %q, want %q", row, got, want)
+		}
+		if !bytes.Equal(scol.Str(row), []byte(want)) {
+			t.Fatalf("Str(%d) mismatch", row)
+		}
+	}
+}
+
+// --- Bulk range accessors ---
+
+func TestQwpColumnRangeNoNulls(t *testing.T) {
+	intInfo := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+	// 6 rows of 8 bytes, values 10..60 step 10.
+	values := make([]byte, 48)
+	for i := 0; i < 6; i++ {
+		binary.LittleEndian.PutUint64(values[i*8:], uint64((i+1)*10))
+	}
+	layout := buildFixedLayout(&intInfo, values, 6)
+	batch := newSingleColumnBatch(intInfo, layout, 6)
+
+	col := batch.Column(0)
+	got := col.Int64Range(1, 5, nil)
+	want := []int64{20, 30, 40, 50}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("Int64Range[%d] = %d, want %d", i, got[i], w)
+		}
+	}
+
+	// Empty / reversed ranges return dst unchanged.
+	if out := col.Int64Range(3, 3, []int64{7}); len(out) != 1 || out[0] != 7 {
+		t.Fatalf("empty range altered dst: %v", out)
+	}
+	if out := col.Int64Range(5, 2, nil); len(out) != 0 {
+		t.Fatalf("reversed range should return empty, got %v", out)
+	}
+
+	// Append into a prealloc'd buffer: no realloc should happen.
+	dst := make([]int64, 0, 6)
+	dst = col.Int64Range(0, 6, dst)
+	if cap(dst) != 6 {
+		t.Fatalf("cap grew unexpectedly: %d", cap(dst))
+	}
+	for i, w := range []int64{10, 20, 30, 40, 50, 60} {
+		if dst[i] != w {
+			t.Fatalf("full range [%d] = %d, want %d", i, dst[i], w)
+		}
+	}
+}
+
+func TestQwpColumnInt64RangeWithNulls(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+	rowBytes := [][]byte{
+		binary.LittleEndian.AppendUint64(nil, 100),
+		nil,
+		binary.LittleEndian.AppendUint64(nil, 300),
+		binary.LittleEndian.AppendUint64(nil, 400),
+		nil,
+	}
+	layout := buildNullableLayout(&info, rowBytes)
+	batch := newSingleColumnBatch(info, layout, 5)
+
+	col := batch.Column(0)
+	dst := col.Int64Range(0, 5, nil)
+	// NULL rows become 0 (matching the per-cell Int64 accessor).
+	want := []int64{100, 0, 300, 400, 0}
+	for i, w := range want {
+		if dst[i] != w {
+			t.Fatalf("Int64Range[%d] = %d, want %d", i, dst[i], w)
+		}
+	}
+}
+
+func TestQwpColumnFloat64Range(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "d", wireType: qwpTypeDouble}
+	values := make([]byte, 24)
+	binary.LittleEndian.PutUint64(values[0:], math.Float64bits(1.1))
+	binary.LittleEndian.PutUint64(values[8:], math.Float64bits(2.2))
+	binary.LittleEndian.PutUint64(values[16:], math.Float64bits(3.3))
+	layout := buildFixedLayout(&info, values, 3)
+	batch := newSingleColumnBatch(info, layout, 3)
+
+	col := batch.Column(0)
+	dst := col.Float64Range(0, 3, nil)
+	want := []float64{1.1, 2.2, 3.3}
+	for i, w := range want {
+		if dst[i] != w {
+			t.Fatalf("Float64Range[%d] = %v, want %v", i, dst[i], w)
+		}
+	}
+}
+
+func TestQwpColumnInt32Range(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "i", wireType: qwpTypeInt}
+	values := make([]byte, 16)
+	for i := 0; i < 4; i++ {
+		binary.LittleEndian.PutUint32(values[i*4:], uint32(i*111))
+	}
+	layout := buildFixedLayout(&info, values, 4)
+	batch := newSingleColumnBatch(info, layout, 4)
+
+	col := batch.Column(0)
+	dst := col.Int32Range(1, 4, nil)
+	want := []int32{111, 222, 333}
+	for i, w := range want {
+		if dst[i] != w {
+			t.Fatalf("Int32Range[%d] = %d, want %d", i, dst[i], w)
+		}
+	}
+}
+
+func TestQwpColumnFloat32Range(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "f", wireType: qwpTypeFloat}
+	values := make([]byte, 12)
+	binary.LittleEndian.PutUint32(values[0:], math.Float32bits(1.5))
+	binary.LittleEndian.PutUint32(values[4:], math.Float32bits(-2.5))
+	binary.LittleEndian.PutUint32(values[8:], math.Float32bits(3.25))
+	layout := buildFixedLayout(&info, values, 3)
+	batch := newSingleColumnBatch(info, layout, 3)
+
+	col := batch.Column(0)
+	dst := col.Float32Range(0, 3, nil)
+	want := []float32{1.5, -2.5, 3.25}
+	for i, w := range want {
+		if dst[i] != w {
+			t.Fatalf("Float32Range[%d] = %v, want %v", i, dst[i], w)
+		}
+	}
+}
+
+// TestQwpColumnRangeOOBPanicsInNoNullsPath pins the safety contract
+// of the no-nulls fast path: misuse with toRow > rowCount must panic
+// the same way the per-cell accessor does, instead of silently reading
+// past the values buffer via unsafe.Slice.
+func TestQwpColumnRangeOOBPanicsInNoNullsPath(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func(col QwpColumn)
+	}{
+		{"Int64Range", func(col QwpColumn) { col.Int64Range(0, 5, nil) }},
+		{"Float64Range", func(col QwpColumn) { col.Float64Range(0, 5, nil) }},
+		{"Int32Range", func(col QwpColumn) { col.Int32Range(0, 5, nil) }},
+		{"Float32Range", func(col QwpColumn) { col.Float32Range(0, 5, nil) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+			values := make([]byte, 16) // exactly 2 rows × 8 bytes
+			layout := buildFixedLayout(&info, values, 2)
+			batch := newSingleColumnBatch(info, layout, 2)
+			col := batch.Column(0)
+
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("%s: expected panic for toRow > rowCount, got none", tc.name)
+				}
+			}()
+			tc.run(col)
+		})
+	}
+}
+
+// TestQwpColumnRangeZeroAllocWhenPrealloc asserts Range accessors
+// don't allocate when dst has sufficient capacity — the intended usage
+// pattern for steady-state row sweeps.
+func TestQwpColumnRangeZeroAllocWhenPrealloc(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+	values := make([]byte, 8*100)
+	for i := 0; i < 100; i++ {
+		binary.LittleEndian.PutUint64(values[i*8:], uint64(i))
+	}
+	layout := buildFixedLayout(&info, values, 100)
+	batch := newSingleColumnBatch(info, layout, 100)
+
+	col := batch.Column(0)
+	buf := make([]int64, 0, 100)
+	allocs := testing.AllocsPerRun(100, func() {
+		buf = buf[:0]
+		buf = col.Int64Range(0, 100, buf)
+	})
+	if allocs != 0 {
+		t.Fatalf("Int64Range with prealloc dst allocated %v/run, want 0", allocs)
+	}
+}
+
 // --- Zero-alloc contract ---
 
 func TestQwpColumnBatchZeroAlloc(t *testing.T) {

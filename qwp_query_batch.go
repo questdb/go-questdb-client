@@ -270,6 +270,13 @@ func (b *QwpColumnBatch) NonNullCount(col int) int {
 // ColumnType(col) for generic dispatch; in a schema-aware query runner
 // the caller already knows. NULL rows return the zero value of the
 // accessor's return type.
+//
+// The QwpColumn handle (`Column(col)`) duplicates each accessor body.
+// Routing the batch surface through `b.Column(col).X(row)` would halve
+// the maintenance surface but ~doubles per-cell latency on Go 1.26 —
+// the inliner does not flatten the by-value receiver chain, so the
+// QwpColumn struct construction stays on the hot path. When adding a
+// new wire type, mirror it on both surfaces.
 
 // Bool returns the BOOLEAN value at (col, row). BOOLEAN is bit-packed
 // on the wire: 8 non-null values per byte, LSB-first.
@@ -445,7 +452,7 @@ func (b *QwpColumnBatch) Str(col, row int) []byte {
 		// callers that want the bytes without explicit BINARY
 		// typing. The dedicated Binary accessor is the idiomatic
 		// entry point for BINARY columns.
-		return b.stringSlice(l, row)
+		return qwpStringSlice(l, row)
 	}
 	return nil
 }
@@ -471,14 +478,14 @@ func (b *QwpColumnBatch) Binary(col, row int) []byte {
 	if l.info.wireType != qwpTypeBinary {
 		return nil
 	}
-	return b.stringSlice(l, row)
+	return qwpStringSlice(l, row)
 }
 
-// stringSlice implements the shared offset-decode for STRING / VARCHAR
-// / BINARY. The `values` region holds a (nonNullCount+1) * 4-byte array
-// of uint32 offsets into `stringBytes`; row i covers bytes [off[dense],
-// off[dense+1]).
-func (b *QwpColumnBatch) stringSlice(l *qwpColumnLayout, row int) []byte {
+// qwpStringSlice implements the shared offset-decode for STRING /
+// VARCHAR / BINARY. The `values` region holds a (nonNullCount+1) *
+// 4-byte array of uint32 offsets into `stringBytes`; row i covers
+// bytes [off[dense], off[dense+1]).
+func qwpStringSlice(l *qwpColumnLayout, row int) []byte {
 	dense := l.denseIndex(row)
 	start := binary.LittleEndian.Uint32(l.values[dense*4:])
 	end := binary.LittleEndian.Uint32(l.values[dense*4+4:])
@@ -573,6 +580,408 @@ func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
 		copy(out, src)
 	}
 	return out
+}
+
+// --- Column handle ---
+//
+// QwpColumn is a cached view over a single column of a QwpColumnBatch.
+// It captures the column's layout pointer once so per-row accessors
+// avoid the per-cell bounds-checked indexing into the batch's layout
+// slice. Use this when iterating many rows of one column — the common
+// shape for row-major consumers.
+//
+// Lifetime matches the parent QwpColumnBatch: valid only inside the
+// current iteration of *QwpQuery.Batches(). Do not retain past the
+// iteration. Returned by value (a layout pointer plus the row count) so
+// storing the handle is allocation-free.
+type QwpColumn struct {
+	layout   *qwpColumnLayout
+	rowCount int
+}
+
+// Column returns a cached handle over column `col`. Prefer the handle's
+// typed accessors (`Int64(row)`, `Str(row)`, …) when iterating many
+// rows of the same column; it eliminates the per-cell `&b.layouts[col]`
+// bounds check and slice re-derivation the batch-level accessors pay.
+func (b *QwpColumnBatch) Column(col int) QwpColumn {
+	return QwpColumn{layout: &b.layouts[col], rowCount: b.rowCount}
+}
+
+// Name returns the server-reported column name.
+func (c QwpColumn) Name() string { return c.layout.info.name }
+
+// Type returns the wire-type byte for this column (one of the
+// `qwpType*` constants).
+func (c QwpColumn) Type() byte { return byte(c.layout.info.wireType) }
+
+// RowCount returns the row count of the owning batch.
+func (c QwpColumn) RowCount() int { return c.rowCount }
+
+// NonNullCount returns the count of non-null rows in this column.
+func (c QwpColumn) NonNullCount() int { return c.layout.nonNullCount }
+
+// DecimalScale returns the scale for DECIMAL64/128/256 columns; 0 otherwise.
+func (c QwpColumn) DecimalScale() int { return int(c.layout.scale) }
+
+// GeohashPrecisionBits returns the precision in bits for GEOHASH columns.
+func (c QwpColumn) GeohashPrecisionBits() int { return int(c.layout.precisionBits) }
+
+// HasNulls reports whether this column carries a null bitmap in the
+// current batch. When false, every per-cell null check resolves to
+// false in one branch and Range accessors take the bulk-memmove path.
+func (c QwpColumn) HasNulls() bool { return c.layout.nullBitmap != nil }
+
+// IsNull reports whether the cell at row is NULL.
+func (c QwpColumn) IsNull(row int) bool { return c.layout.isNull(row) }
+
+// Bool returns the BOOLEAN value at row.
+func (c QwpColumn) Bool(row int) bool {
+	l := c.layout
+	if l.isNull(row) {
+		return false
+	}
+	idx := l.denseIndex(row)
+	return l.values[idx>>3]&(1<<(idx&7)) != 0
+}
+
+// Int8 returns the BYTE value at row.
+func (c QwpColumn) Int8(row int) int8 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	return int8(l.values[l.denseIndex(row)])
+}
+
+// Int16 returns the SHORT value at row.
+func (c QwpColumn) Int16(row int) int16 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 2
+	return int16(binary.LittleEndian.Uint16(l.values[i : i+2]))
+}
+
+// Char returns the CHAR value at row as a rune (2-byte UTF-16 code unit).
+func (c QwpColumn) Char(row int) rune {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 2
+	return rune(binary.LittleEndian.Uint16(l.values[i : i+2]))
+}
+
+// Int32 returns the INT or IPv4 value at row.
+func (c QwpColumn) Int32(row int) int32 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 4
+	return int32(binary.LittleEndian.Uint32(l.values[i : i+4]))
+}
+
+// Int64 returns an 8-byte column value at row (LONG, DATE, TIMESTAMP,
+// TIMESTAMP_NANOS, DECIMAL64).
+func (c QwpColumn) Int64(row int) int64 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 8
+	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// Float32 returns the FLOAT value at row.
+func (c QwpColumn) Float32(row int) float32 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 4
+	return math.Float32frombits(binary.LittleEndian.Uint32(l.values[i : i+4]))
+}
+
+// Float64 returns the DOUBLE value at row.
+func (c QwpColumn) Float64(row int) float64 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 8
+	return math.Float64frombits(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// UuidLo returns the low 64 bits of a UUID at row.
+func (c QwpColumn) UuidLo(row int) int64 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row) * 16
+	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// UuidHi returns the high 64 bits of a UUID at row.
+func (c QwpColumn) UuidHi(row int) int64 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	i := l.denseIndex(row)*16 + 8
+	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// Decimal128Lo returns the low 64 bits of a DECIMAL128 unscaled value.
+func (c QwpColumn) Decimal128Lo(row int) int64 { return c.UuidLo(row) }
+
+// Decimal128Hi returns the high 64 bits of a DECIMAL128 unscaled value.
+func (c QwpColumn) Decimal128Hi(row int) int64 { return c.UuidHi(row) }
+
+// Long256Word returns word `word` of a LONG256 or DECIMAL256 value at row.
+func (c QwpColumn) Long256Word(row, word int) int64 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	if word < 0 || word > 3 {
+		panic(fmt.Sprintf("QwpColumn.Long256Word: word %d out of [0,3]", word))
+	}
+	i := l.denseIndex(row)*32 + word*8
+	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// Str returns the UTF-8 bytes of a STRING, VARCHAR, SYMBOL, or BINARY
+// cell. Returns nil for NULL rows. The returned slice aliases the
+// payload; do not retain past the batch iteration.
+func (c QwpColumn) Str(row int) []byte {
+	l := c.layout
+	if l.isNull(row) {
+		return nil
+	}
+	wt := l.info.wireType
+	if wt == qwpTypeSymbol {
+		rowIdx := l.symbolRowIds[row]
+		if int(rowIdx) >= len(l.symbolDict.entries) {
+			return nil
+		}
+		e := l.symbolDict.entries[rowIdx]
+		return l.symbolDict.heap[e.offset : e.offset+e.length]
+	}
+	if wt == qwpTypeVarchar || wt == qwpTypeBinary {
+		return qwpStringSlice(l, row)
+	}
+	return nil
+}
+
+// String returns the cell at row as a newly-allocated string.
+func (c QwpColumn) String(row int) string {
+	s := c.Str(row)
+	if s == nil {
+		return ""
+	}
+	return string(s)
+}
+
+// Binary returns the opaque bytes of a BINARY cell. Returns nil for
+// NULL rows. The returned slice aliases the payload.
+func (c QwpColumn) Binary(row int) []byte {
+	l := c.layout
+	if l.isNull(row) {
+		return nil
+	}
+	if l.info.wireType != qwpTypeBinary {
+		return nil
+	}
+	return qwpStringSlice(l, row)
+}
+
+// ArrayNDims returns the dimensionality of the array at row, or 0 for NULL.
+func (c QwpColumn) ArrayNDims(row int) int {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	start := l.arrayRowStart[row]
+	return int(l.values[start])
+}
+
+// ArrayDim returns the extent of dimension `dim` of the array at row.
+func (c QwpColumn) ArrayDim(row, dim int) int {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	start := int(l.arrayRowStart[row])
+	nDims := int(l.values[start])
+	if dim < 0 || dim >= nDims {
+		panic(fmt.Sprintf("QwpColumn.ArrayDim: dim %d out of [0, %d)", dim, nDims))
+	}
+	off := start + 1 + dim*4
+	return int(int32(binary.LittleEndian.Uint32(l.values[off : off+4])))
+}
+
+// Float64Array returns the flattened (row-major) elements of a
+// DOUBLE_ARRAY cell. Returns nil for NULL rows.
+func (c QwpColumn) Float64Array(row int) []float64 {
+	l := c.layout
+	if l.isNull(row) {
+		return nil
+	}
+	_, elems, base := arrayElementCount(l, row)
+	out := make([]float64, elems)
+	if elems > 0 {
+		src := unsafe.Slice((*float64)(unsafe.Pointer(&l.values[base])), elems)
+		copy(out, src)
+	}
+	return out
+}
+
+// Int64Array returns the flattened (row-major) elements of a LONG_ARRAY
+// cell. Returns nil for NULL rows.
+func (c QwpColumn) Int64Array(row int) []int64 {
+	l := c.layout
+	if l.isNull(row) {
+		return nil
+	}
+	_, elems, base := arrayElementCount(l, row)
+	out := make([]int64, elems)
+	if elems > 0 {
+		src := unsafe.Slice((*int64)(unsafe.Pointer(&l.values[base])), elems)
+		copy(out, src)
+	}
+	return out
+}
+
+// --- Bulk row-range accessors ---
+//
+// Each *Range method appends values for rows [fromRow, toRow) onto dst
+// and returns the extended slice (the append pattern). NULL rows become
+// the zero value of the element type. When the column has no nulls the
+// dense region is bulk-copied via a single memmove (identity indexing);
+// otherwise the accessor walks the null bitmap once, writing a zero for
+// NULL rows and a decoded value for non-NULL rows.
+//
+// Preallocate dst (e.g. `dst := make([]int64, 0, batch.RowCount())`) to
+// keep the common row-sweep path allocation-free. When dst's remaining
+// capacity is short, slices.Grow performs one resize.
+//
+// The caller is responsible for matching the method to the column's
+// wire type. Mis-typed calls (e.g. Int64Range on a DOUBLE column) will
+// produce numeric noise, not a type error — follow the same discipline
+// as the per-row typed accessors.
+
+// Int64Range appends int64 values for rows [fromRow, toRow).
+func (c QwpColumn) Int64Range(fromRow, toRow int, dst []int64) []int64 {
+	n := toRow - fromRow
+	if n <= 0 {
+		return dst
+	}
+	l := c.layout
+	base := len(dst)
+	dst = slices.Grow(dst, n)[:base+n]
+	if l.nullBitmap == nil {
+		// Bounds-checked sub-slice first so caller misuse panics the
+		// same way as the per-cell accessor (l.values[i:i+8]); only
+		// then reinterpret as []int64.
+		chunk := l.values[fromRow*8 : toRow*8]
+		src := unsafe.Slice((*int64)(unsafe.Pointer(&chunk[0])), n)
+		copy(dst[base:], src)
+		return dst
+	}
+	for i := 0; i < n; i++ {
+		row := fromRow + i
+		if l.nullBitmap[row>>3]&(1<<(row&7)) != 0 {
+			dst[base+i] = 0
+			continue
+		}
+		idx := int(l.nonNullIdx[row]) * 8
+		dst[base+i] = int64(binary.LittleEndian.Uint64(l.values[idx : idx+8]))
+	}
+	return dst
+}
+
+// Float64Range appends float64 values for rows [fromRow, toRow).
+func (c QwpColumn) Float64Range(fromRow, toRow int, dst []float64) []float64 {
+	n := toRow - fromRow
+	if n <= 0 {
+		return dst
+	}
+	l := c.layout
+	base := len(dst)
+	dst = slices.Grow(dst, n)[:base+n]
+	if l.nullBitmap == nil {
+		chunk := l.values[fromRow*8 : toRow*8]
+		src := unsafe.Slice((*float64)(unsafe.Pointer(&chunk[0])), n)
+		copy(dst[base:], src)
+		return dst
+	}
+	for i := 0; i < n; i++ {
+		row := fromRow + i
+		if l.nullBitmap[row>>3]&(1<<(row&7)) != 0 {
+			dst[base+i] = 0
+			continue
+		}
+		idx := int(l.nonNullIdx[row]) * 8
+		dst[base+i] = math.Float64frombits(binary.LittleEndian.Uint64(l.values[idx : idx+8]))
+	}
+	return dst
+}
+
+// Int32Range appends int32 values for rows [fromRow, toRow).
+func (c QwpColumn) Int32Range(fromRow, toRow int, dst []int32) []int32 {
+	n := toRow - fromRow
+	if n <= 0 {
+		return dst
+	}
+	l := c.layout
+	base := len(dst)
+	dst = slices.Grow(dst, n)[:base+n]
+	if l.nullBitmap == nil {
+		chunk := l.values[fromRow*4 : toRow*4]
+		src := unsafe.Slice((*int32)(unsafe.Pointer(&chunk[0])), n)
+		copy(dst[base:], src)
+		return dst
+	}
+	for i := 0; i < n; i++ {
+		row := fromRow + i
+		if l.nullBitmap[row>>3]&(1<<(row&7)) != 0 {
+			dst[base+i] = 0
+			continue
+		}
+		idx := int(l.nonNullIdx[row]) * 4
+		dst[base+i] = int32(binary.LittleEndian.Uint32(l.values[idx : idx+4]))
+	}
+	return dst
+}
+
+// Float32Range appends float32 values for rows [fromRow, toRow).
+func (c QwpColumn) Float32Range(fromRow, toRow int, dst []float32) []float32 {
+	n := toRow - fromRow
+	if n <= 0 {
+		return dst
+	}
+	l := c.layout
+	base := len(dst)
+	dst = slices.Grow(dst, n)[:base+n]
+	if l.nullBitmap == nil {
+		chunk := l.values[fromRow*4 : toRow*4]
+		src := unsafe.Slice((*float32)(unsafe.Pointer(&chunk[0])), n)
+		copy(dst[base:], src)
+		return dst
+	}
+	for i := 0; i < n; i++ {
+		row := fromRow + i
+		if l.nullBitmap[row>>3]&(1<<(row&7)) != 0 {
+			dst[base+i] = 0
+			continue
+		}
+		idx := int(l.nonNullIdx[row]) * 4
+		dst[base+i] = math.Float32frombits(binary.LittleEndian.Uint32(l.values[idx : idx+4]))
+	}
+	return dst
 }
 
 // --- Materializing escape hatch ---
