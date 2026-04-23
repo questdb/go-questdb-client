@@ -503,13 +503,57 @@ func (d *qwpQueryDecoder) parseNullSection(l *qwpColumnLayout, rowCount int) err
 	} else {
 		l.nonNullIdx = l.nonNullIdx[:rowCount]
 	}
+	// Iterate one bitmap byte at a time (8 rows) so each byte is
+	// loaded once and the per-row `bitmap[i>>3]` bounds check is
+	// folded away. Fast paths for the common all-non-null and
+	// all-null bytes avoid the inner bit loop entirely.
+	idx := l.nonNullIdx
 	dense := int32(0)
-	for i := 0; i < rowCount; i++ {
-		if bitmap[i>>3]&(1<<(i&7)) != 0 {
-			l.nonNullIdx[i] = -1
-		} else {
-			l.nonNullIdx[i] = dense
-			dense++
+	fullBytes := rowCount >> 3
+	for bi := 0; bi < fullBytes; bi++ {
+		bits := bitmap[bi]
+		base := bi << 3
+		switch bits {
+		case 0x00:
+			idx[base] = dense
+			idx[base+1] = dense + 1
+			idx[base+2] = dense + 2
+			idx[base+3] = dense + 3
+			idx[base+4] = dense + 4
+			idx[base+5] = dense + 5
+			idx[base+6] = dense + 6
+			idx[base+7] = dense + 7
+			dense += 8
+		case 0xFF:
+			idx[base] = -1
+			idx[base+1] = -1
+			idx[base+2] = -1
+			idx[base+3] = -1
+			idx[base+4] = -1
+			idx[base+5] = -1
+			idx[base+6] = -1
+			idx[base+7] = -1
+		default:
+			for j := 0; j < 8; j++ {
+				if bits&(1<<j) != 0 {
+					idx[base+j] = -1
+				} else {
+					idx[base+j] = dense
+					dense++
+				}
+			}
+		}
+	}
+	if tail := rowCount & 7; tail != 0 {
+		bits := bitmap[fullBytes]
+		base := fullBytes << 3
+		for j := 0; j < tail; j++ {
+			if bits&(1<<j) != 0 {
+				idx[base+j] = -1
+			} else {
+				idx[base+j] = dense
+				dense++
+			}
 		}
 	}
 	l.nonNullCount = int(dense)
