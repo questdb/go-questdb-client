@@ -628,8 +628,9 @@ func TestQwpEgressIOConcurrentCancelAndShutdown(t *testing.T) {
 // is valid but body is truncated (just the msg_kind byte with nothing
 // after it). handleResultBatch must return the borrowed buffer to the
 // pool — stranding it would permanently leak a slot — surface a
-// synthesized decode-error event, and terminate the query cleanly so
-// the dispatcher is ready for the next submit.
+// synthesized decode-error event, and terminate the query cleanly.
+// Connection-level poisoning behavior after this path is covered by
+// TestQwpEgressIODecodeFailurePoisons.
 func TestQwpEgressIODecodeFailure(t *testing.T) {
 	const wantReqID = int64(17)
 
@@ -673,6 +674,71 @@ func TestQwpEgressIODecodeFailure(t *testing.T) {
 	if !waitForPoolSize(io, poolSize, 500*time.Millisecond) {
 		t.Fatalf("buffer pool size = %d, want %d — decode-error path stranded a buffer",
 			len(io.buffers), poolSize)
+	}
+}
+
+// TestQwpEgressIODecodeFailurePoisons verifies the terminal-flag
+// contract: once a decode error desyncs the per-connection decoder
+// state, ioErr is latched and every subsequent submitQuery returns
+// it immediately — a fresh query must never be decoded against
+// stale dict/schema state. Mirrors the ingest-side asyncState.ioErr
+// pattern documented in CLAUDE.md.
+func TestQwpEgressIODecodeFailurePoisons(t *testing.T) {
+	const wantReqID = int64(31)
+
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		m.readBinary(ctx)
+		// Truncated RESULT_BATCH — same shape as TestQwpEgressIODecodeFailure.
+		m.sendBinary(ctx, writeQwpFrame(0, []byte{byte(qwpMsgKindResultBatch)}))
+		// Hold the connection open so the reader does not synthesize
+		// its own "server closed" event that would race the decode
+		// error we're trying to observe as the terminal event.
+		time.Sleep(500 * time.Millisecond)
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close(context.Background())
+
+	io := newQwpEgressIO(tr, 2)
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT 1", requestId: wantReqID}); err != nil {
+		t.Fatalf("submitQuery first: %v", err)
+	}
+
+	ev := takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindError {
+		t.Fatalf("event kind = %v, want Error", ev.kind)
+	}
+
+	// The latch is set on the dispatcher goroutine right before the
+	// error event hits the channel; by the time the user has observed
+	// the event, loadIoErr must also be populated.
+	gotLoad := io.loadIoErr()
+	if gotLoad == nil {
+		t.Fatalf("loadIoErr() = nil after decode failure, want latched error")
+	}
+	if !strings.Contains(gotLoad.Error(), "decode") {
+		t.Errorf("loadIoErr() = %q, expected to contain \"decode\"", gotLoad.Error())
+	}
+
+	// A follow-up submitQuery must fail synchronously with the latched
+	// error — not block, not succeed, not return a different error.
+	// Using a generous ctx timeout ensures we are not accidentally
+	// observing ctx expiry.
+	gotSubmit := io.submitQuery(ctx, qwpRequest{sql: "SELECT 2", requestId: wantReqID + 1})
+	if gotSubmit == nil {
+		t.Fatalf("submitQuery after decode failure: got nil error, want latched decode error")
+	}
+	if gotSubmit != gotLoad {
+		t.Errorf("submitQuery returned %q, want identity with latched %q",
+			gotSubmit.Error(), gotLoad.Error())
 	}
 }
 

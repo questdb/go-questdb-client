@@ -231,6 +231,21 @@ type qwpEgressIO struct {
 	currentRequestId int64
 	creditEnabled    bool
 	currentQueryDone bool
+
+	// ioErrMu guards ioErr. Set on the dispatcher goroutine from any
+	// decoder- or framing-level error path; read on the user goroutine
+	// from submitQuery.
+	ioErrMu sync.Mutex
+	// ioErr latches the first decoder- or framing-level error for the
+	// life of this connection. Once set, every subsequent submitQuery
+	// returns this error synchronously so a fresh query is never
+	// decoded against a desynced qwpConnDict / qwpSchemaRegistry /
+	// zstd stream — an undetectable subset of out-of-range reads
+	// could leave the dict accidentally in sync with the server
+	// (offsets match) while values are wrong, producing silently
+	// corrupted results. Mirrors the ingress-side asyncState.ioErr
+	// terminal-flag pattern (see CLAUDE.md).
+	ioErr error
 }
 
 // qwpReaderEvent is what the reader goroutine hands to the dispatcher:
@@ -295,9 +310,14 @@ func (io *qwpEgressIO) start() {
 
 // submitQuery hands the request to the I/O goroutine. Blocks if a
 // prior query's submission has not yet been picked up (single-slot
-// queue). Returns ctx.Err() on user cancellation or a sentinel error
-// if the I/O goroutine has shut down.
+// queue). Returns ctx.Err() on user cancellation, a sentinel error
+// if the I/O goroutine has shut down, or the latched ioErr if a
+// prior decoder/framing failure has poisoned the connection (a fresh
+// submit would be decoded against desynced state).
 func (io *qwpEgressIO) submitQuery(ctx context.Context, req qwpRequest) error {
+	if err := io.loadIoErr(); err != nil {
+		return err
+	}
 	select {
 	case io.requests <- req:
 		return nil
@@ -306,6 +326,25 @@ func (io *qwpEgressIO) submitQuery(ctx context.Context, req qwpRequest) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// setIoErr latches err as the connection's terminal ioErr — first
+// writer wins. Called by the dispatcher on any decoder- or framing-
+// level failure so subsequent submitQuery calls fail immediately
+// rather than running a fresh query against a desynced decoder.
+func (io *qwpEgressIO) setIoErr(err error) {
+	io.ioErrMu.Lock()
+	defer io.ioErrMu.Unlock()
+	if io.ioErr == nil {
+		io.ioErr = err
+	}
+}
+
+// loadIoErr returns the latched terminal error, or nil if none.
+func (io *qwpEgressIO) loadIoErr() error {
+	io.ioErrMu.Lock()
+	defer io.ioErrMu.Unlock()
+	return io.ioErr
 }
 
 // takeEvent pops the next event. Blocks until one arrives or ctx is
@@ -551,7 +590,9 @@ func (io *qwpEgressIO) receiveLoop() {
 func (io *qwpEgressIO) dispatchFrame(payload []byte) {
 	kind, err := qwpPeekMsgKind(payload)
 	if err != nil {
-		io.emitError(0, fmt.Sprintf("qwp: %v", err))
+		// Header parse failure — we have no trustworthy framing, so
+		// poison the connection before emitting.
+		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
 		io.currentQueryDone = true
 		return
 	}
@@ -565,7 +606,10 @@ func (io *qwpEgressIO) dispatchFrame(payload []byte) {
 	case qwpMsgKindExecDone:
 		io.handleExecDone(payload)
 	default:
-		io.emitError(0, fmt.Sprintf("qwp: unknown msg_kind 0x%02X", byte(kind)))
+		// Unknown msg_kind means we are talking to a server whose
+		// protocol we do not understand — treat as terminal so we do
+		// not parade a desynced stream to the next query.
+		io.poisonAndEmitError(fmt.Sprintf("qwp: unknown msg_kind 0x%02X", byte(kind)))
 		io.currentQueryDone = true
 	}
 }
@@ -596,11 +640,15 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte) {
 
 	if err := io.decoder.decode(payload, &buf.batch); err != nil {
 		// Decoder failed mid-frame: dict/registry state may be out
-		// of sync with the server. Return the buffer, surface the
-		// error, and stop the query — re-entering the recv loop on
-		// a desynced decoder would just produce more garbage.
+		// of sync with the server. Return the buffer, poison the
+		// connection so the next submitQuery fails immediately
+		// (self-correction via the delta-dict sync check is
+		// probabilistic — a mis-advanced reader can leave the dict
+		// *accidentally* in sync at the offset level while values
+		// are wrong, producing silently corrupt rows), surface the
+		// error, and stop the query.
 		io.buffers <- buf
-		io.emitError(0, fmt.Sprintf("qwp: decode: %v", err))
+		io.poisonAndEmitError(fmt.Sprintf("qwp: decode: %v", err))
 		io.currentQueryDone = true
 		return
 	}
@@ -623,7 +671,7 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte) {
 func (io *qwpEgressIO) handleResultEnd(payload []byte) {
 	reqId, total, err := io.decoder.decodeResultEnd(payload)
 	if err != nil {
-		io.emitError(0, fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:      qwpEventKindEnd,
@@ -639,7 +687,7 @@ func (io *qwpEgressIO) handleResultEnd(payload []byte) {
 func (io *qwpEgressIO) handleQueryError(payload []byte) {
 	qe, err := io.decoder.decodeQueryError(payload)
 	if err != nil {
-		io.emitError(0, fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:       qwpEventKindError,
@@ -656,7 +704,7 @@ func (io *qwpEgressIO) handleQueryError(payload []byte) {
 func (io *qwpEgressIO) handleExecDone(payload []byte) {
 	reqId, result, err := io.decoder.decodeExecDone(payload)
 	if err != nil {
-		io.emitError(0, fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:       qwpEventKindExecDone,
@@ -757,6 +805,27 @@ func (io *qwpEgressIO) emitError(status qwpStatusCode, msg string) {
 		kind:       qwpEventKindError,
 		requestId:  io.currentRequestId,
 		errStatus:  status,
+		errMessage: msg,
+	})
+}
+
+// poisonAndEmitError latches msg as the connection's terminal ioErr
+// AND emits it as the current query's Error event. Use this in place
+// of emitError for any decoder- or framing-level failure that leaves
+// the per-connection decoder state (symbol dict, schema registry,
+// zstd stream) desynced from the server: once the decoder is out of
+// sync, a follow-up query would decode against stale state and could
+// return silently corrupt rows. The latched ioErr causes every
+// subsequent submitQuery to fail immediately. Does NOT flip
+// currentQueryDone — callers that also need to terminate the current
+// query set it where it belongs, matching the existing emitError
+// call sites.
+func (io *qwpEgressIO) poisonAndEmitError(msg string) {
+	io.setIoErr(errors.New(msg))
+	io.emit(qwpEvent{
+		kind:       qwpEventKindError,
+		requestId:  io.currentRequestId,
+		errStatus:  0,
 		errMessage: msg,
 	})
 }
