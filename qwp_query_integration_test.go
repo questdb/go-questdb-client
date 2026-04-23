@@ -330,30 +330,199 @@ func TestQwpIntegrationCompressedBatches(t *testing.T) {
 // long enough to be interrupted, invokes Cancel from the iterating
 // goroutine's defer, and verifies iteration ends cleanly (the
 // server's CANCELLED echo is swallowed by the cursor's cancel-aware
-// error path).
+// error path). Unlike older revisions that only checked `saw >= 1`,
+// this test also verifies the post-cancel invariant that actually
+// matters in production: the client's dispatcher returned to idle so
+// a follow-up Query can round-trip without stranding.
+//
+// We deliberately do NOT assert that Cancel short-circuited the
+// server: long_sequence streams tens of millions of rows per second
+// on localhost and races past Cancel() before the cancel frame
+// reaches the server. What we guarantee is (a) the iterator does not
+// panic or hang, and (b) the client is reusable after the iteration
+// ends — whichever side (cancel or natural RESULT_END) won the race.
 func TestQwpIntegrationCancelLongRunningQuery(t *testing.T) {
-	c := newTestQueryClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	qwpSkipIfNoServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// Small batches so the iterator enters the yield body before the
+	// server has finished streaming — otherwise saw stays 0 for fast
+	// queries.
+	c, err := NewQwpQueryClient(ctx,
+		WithQwpQueryAddress(qwpTestAddr),
+		WithQwpQueryMaxBatchRows(500),
+	)
+	if err != nil {
+		t.Fatalf("NewQwpQueryClient: %v", err)
+	}
 	defer c.Close(ctx)
 
-	// long_sequence(N) is a server-side row generator; a large value
-	// gives the cancel time to reach the server before completion.
 	q := c.Query(ctx, "SELECT x FROM long_sequence(10000000)")
-	defer q.Close()
 
+	start := time.Now()
 	var saw int
 	for _, err := range q.Batches() {
 		if err != nil {
+			q.Close()
 			t.Fatalf("unexpected iter err: %v", err)
 		}
 		saw++
 		if saw == 1 {
-			// Cancel after the first batch is drained.
 			q.Cancel()
 		}
 	}
+	elapsed := time.Since(start)
+	q.Close()
+
 	if saw < 1 {
 		t.Errorf("saw %d batches, want >= 1", saw)
+	}
+	// Cancel must not deadlock the iterator — 15s is generous for
+	// 10M rows on a local server whether the cancel short-circuits
+	// or the server finishes streaming naturally.
+	if elapsed > 15*time.Second {
+		t.Errorf("iteration took %v — suggests cancel-drain hung", elapsed)
+	}
+
+	// Client must stay usable: a follow-up Query should round-trip
+	// cleanly whether the cancel or the natural RESULT_END won. This
+	// is the real production-visible property — a broken cancel-drain
+	// would leave the dispatcher stranded and the next Query would
+	// block forever on the single-slot requests channel.
+	q2 := c.Query(ctx, "SELECT 1")
+	var rows int
+	for batch, err := range q2.Batches() {
+		if err != nil {
+			q2.Close()
+			t.Fatalf("follow-up query err: %v", err)
+		}
+		rows += batch.RowCount()
+	}
+	q2.Close()
+	if rows != 1 {
+		t.Errorf("follow-up query rows=%d, want 1", rows)
+	}
+}
+
+// TestQwpIntegrationCtxDeadlineMidStream exercises the other shutdown
+// path through Batches(): the query's ctx expires while the iterator
+// is blocked in takeEvent. The iterator must yield the ctx error once,
+// then kick the dispatcher (cancel + drain on a fresh cleanup ctx) so
+// the client stays usable. Complements the explicit-Cancel test above
+// which exits via the !keepGoing break-out.
+func TestQwpIntegrationCtxDeadlineMidStream(t *testing.T) {
+	c := newTestQueryClient(t)
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer clientCancel()
+	defer c.Close(clientCtx)
+
+	// A short ctx on the Query itself; long enough to establish the
+	// stream but short enough to expire mid-flight against a 10M-row
+	// sequence.
+	queryCtx, queryCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer queryCancel()
+	q := c.Query(queryCtx, "SELECT x FROM long_sequence(10000000)")
+
+	start := time.Now()
+	var iterErr error
+	var saw int
+	for batch, err := range q.Batches() {
+		if err != nil {
+			iterErr = err
+			break
+		}
+		saw++
+		_ = batch
+	}
+	elapsed := time.Since(start)
+	q.Close()
+
+	if iterErr == nil {
+		t.Fatal("expected ctx-deadline error from the iterator, got nil")
+	}
+	if !errors.Is(iterErr, context.DeadlineExceeded) {
+		t.Errorf("iter err = %v, want context.DeadlineExceeded", iterErr)
+	}
+	if elapsed > 15*time.Second {
+		t.Errorf("iteration took %v — ctx expiry did not unblock the iterator", elapsed)
+	}
+	_ = saw
+
+	// Client-level ctx is still live; the dispatcher should be back to
+	// idle thanks to cancelAndDrainOnCleanupCtx. A follow-up query
+	// confirms we did not strand the connection.
+	q2 := c.Query(clientCtx, "SELECT 1")
+	var rows int
+	for batch, err := range q2.Batches() {
+		if err != nil {
+			q2.Close()
+			t.Fatalf("follow-up query err after ctx-expiry teardown: %v", err)
+		}
+		rows += batch.RowCount()
+	}
+	q2.Close()
+	if rows != 1 {
+		t.Errorf("follow-up rows=%d, want 1", rows)
+	}
+}
+
+// TestQwpIntegrationClientCloseDuringLongQuery exercises the
+// transport-teardown path: while a long-running SELECT is mid-stream,
+// another goroutine closes the QwpQueryClient. The iterator must see a
+// transport error (the read side fails once the WebSocket close frame
+// lands) and exit without hanging. This is the closest we can get, in
+// an integration test, to a server-initiated connection close — the
+// local close also tears down the read direction and surfaces through
+// the same code path.
+//
+// Does NOT read the batch's aliased slices after Close is called — the
+// public contract explicitly flags that as undefined (the transport
+// may free the underlying buffer). RowCount is safe because it reads
+// an integer field, not a payload-backed slice.
+func TestQwpIntegrationClientCloseDuringLongQuery(t *testing.T) {
+	c := newTestQueryClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	q := c.Query(ctx, "SELECT x FROM long_sequence(10000000)")
+
+	start := time.Now()
+	closed := make(chan struct{})
+	var saw int
+	var iterErr error
+	for batch, err := range q.Batches() {
+		if err != nil {
+			iterErr = err
+			break
+		}
+		saw++
+		_ = batch.RowCount()
+		if saw == 1 {
+			go func() {
+				closeCtx, closeCancel := context.WithTimeout(
+					context.Background(), 5*time.Second)
+				defer closeCancel()
+				_ = c.Close(closeCtx)
+				close(closed)
+			}()
+		}
+	}
+	elapsed := time.Since(start)
+	q.Close()
+
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("client Close did not return within 10s of starting")
+	}
+
+	if saw < 1 {
+		t.Errorf("saw %d batches before close, want >= 1", saw)
+	}
+	if iterErr == nil {
+		t.Error("expected the iterator to surface a transport error after client Close")
+	}
+	if elapsed > 15*time.Second {
+		t.Errorf("iteration took %v — client Close did not unblock the iterator", elapsed)
 	}
 }

@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"sync"
 	"testing"
 )
 
@@ -646,6 +647,118 @@ func TestQwpColumnBatchCopyAllGorillaTimestampSurvivesPoolReuse(t *testing.T) {
 			t.Fatalf("snapshot.Int64(0, %d) = %d, want %d", i, got, w)
 		}
 	}
+}
+
+// buildDecimalGeohashFrame produces a one-row RESULT_BATCH frame with
+// a DECIMAL64 column (given scale) and a GEOHASH column (given precision
+// bits). The decoder reads the per-batch scale / precision off the DATA
+// section and stores them on qwpColumnLayout, which is what the race
+// test below observes concurrently.
+func buildDecimalGeohashFrame(t *testing.T, scale uint32, precision int8, unscaled int64) []byte {
+	t.Helper()
+	tb := newQwpTableBuffer("t")
+	dcol, err := tb.getOrCreateColumn("d", qwpTypeDecimal64, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn d: %v", err)
+	}
+	if err := dcol.addDecimal(NewDecimalFromInt64(unscaled, scale)); err != nil {
+		t.Fatalf("addDecimal: %v", err)
+	}
+	gcol, err := tb.getOrCreateColumn("g", qwpTypeGeohash, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn g: %v", err)
+	}
+	if err := gcol.addGeohash(uint64(unscaled), precision); err != nil {
+		t.Fatalf("addGeohash: %v", err)
+	}
+	tb.commitRow()
+	var enc qwpEncoder
+	ingress := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+	return wrapAsResultBatch(ingress, 1, 0)
+}
+
+// TestQwpColumnBatchCopyAllScaleAndPrecisionAreRaceFree exercises the
+// concurrency invariant that commit 58e1915 ("Fix data race on decimal
+// scale and geohash precision") added: a held SerializedBatch snapshot
+// must be safe to read while the decoder writes the next batch's scale
+// / precision into the source QwpColumnBatch.
+//
+// Before that fix both fields lived on the connection-scoped
+// qwpColumnSchemaInfo, which the decoder mutated per batch and which
+// every snapshot aliased via layouts[i].info — so this test paired
+// with `go test -race` flagged the write/read overlap. Post-fix the
+// fields are on qwpColumnLayout and CopyAll takes value copies, so the
+// snapshot's accessors read memory the decoder never touches again.
+//
+// Without -race this test is still meaningful: a snapshot must keep
+// its frame-A values even after frame B is decoded into the source
+// batch.
+func TestQwpColumnBatchCopyAllScaleAndPrecisionAreRaceFree(t *testing.T) {
+	frameA := buildDecimalGeohashFrame(t, 2, 20, 12345)
+	frameB := buildDecimalGeohashFrame(t, 7, 40, 99999)
+
+	var dec qwpQueryDecoder
+	var batch QwpColumnBatch
+	if err := dec.decode(frameA, &batch); err != nil {
+		t.Fatalf("decode A: %v", err)
+	}
+	if s := batch.DecimalScale(0); s != 2 {
+		t.Fatalf("A scale = %d, want 2", s)
+	}
+	if p := batch.GeohashPrecisionBits(1); p != 20 {
+		t.Fatalf("A precision = %d, want 20", p)
+	}
+
+	snapshot := batch.CopyAll()
+
+	const readers = 4
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if s := snapshot.DecimalScale(0); s != 2 {
+					t.Errorf("snapshot.DecimalScale = %d, want 2", s)
+					return
+				}
+				if p := snapshot.GeohashPrecisionBits(1); p != 20 {
+					t.Errorf("snapshot.GeohashPrecisionBits = %d, want 20", p)
+					return
+				}
+			}
+		}()
+	}
+
+	// Repeatedly re-decode frame B into the same batch. Each decode
+	// writes frame-B scale / precision into the layout; -race catches
+	// any overlap with the readers above.
+	for i := 0; i < 200; i++ {
+		if err := dec.decode(frameB, &batch); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("decode B [%d]: %v", i, err)
+		}
+		if s := batch.DecimalScale(0); s != 7 {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("live batch scale = %d, want 7", s)
+		}
+		if p := batch.GeohashPrecisionBits(1); p != 40 {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("live batch precision = %d, want 40", p)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
 }
 
 // --- Zero-alloc contract ---
