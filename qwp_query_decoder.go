@@ -356,8 +356,10 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	// Two batches whose buffers the I/O goroutine alternates between
 	// never share layout storage, so emitting batch N while decoding
 	// batch N+1 does not corrupt batch N's view.
-	for len(out.layouts) < columnCount {
-		out.layouts = append(out.layouts, qwpColumnLayout{})
+	if cap(out.layouts) < columnCount {
+		out.layouts = make([]qwpColumnLayout, columnCount)
+	} else {
+		out.layouts = out.layouts[:columnCount]
 	}
 
 	// When FLAG_ZSTD was set, the per-column parse reads from the
@@ -375,7 +377,6 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	out.rowCount = rowCount
 	out.columnCount = columnCount
 	out.columns = cols
-	out.layouts = out.layouts[:columnCount]
 
 	// Per-column parse
 	for i := 0; i < columnCount; i++ {
