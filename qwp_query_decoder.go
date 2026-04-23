@@ -94,8 +94,7 @@ func (d *qwpConnDict) appendDelta(br *qwpByteReader) error {
 	if err != nil {
 		return err
 	}
-	if deltaStart < 0 || deltaCount < 0 ||
-		deltaStart+deltaCount > int64(^uint32(0)) {
+	if deltaStart+deltaCount > int64(^uint32(0)) {
 		return newQwpDecodeError(fmt.Sprintf(
 			"delta symbol section out of range: start=%d count=%d",
 			deltaStart, deltaCount))
@@ -278,7 +277,7 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	if err != nil {
 		return err
 	}
-	if nameLen < 0 || nameLen > qwpMaxTableNameLen {
+	if nameLen > qwpMaxTableNameLen {
 		return newQwpDecodeError(fmt.Sprintf(
 			"table name length out of range: %d", nameLen))
 	}
@@ -290,7 +289,7 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	if err != nil {
 		return err
 	}
-	if rowCount64 < 0 || rowCount64 > qwpMaxRowsPerBatch {
+	if rowCount64 > qwpMaxRowsPerBatch {
 		return newQwpDecodeError(fmt.Sprintf(
 			"row_count out of range: %d", rowCount64))
 	}
@@ -300,7 +299,7 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	if err != nil {
 		return err
 	}
-	if colCount64 < 0 || colCount64 > qwpMaxColumnsPerTable {
+	if colCount64 > qwpMaxColumnsPerTable {
 		return newQwpDecodeError(fmt.Sprintf(
 			"column_count out of range: %d", colCount64))
 	}
@@ -315,7 +314,7 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	if err != nil {
 		return err
 	}
-	if schemaId64 < 0 || schemaId64 >= qwpDefaultMaxSchemasPerConnection {
+	if schemaId64 >= qwpDefaultMaxSchemasPerConnection {
 		return newQwpDecodeError(fmt.Sprintf(
 			"schema_id out of range: %d", schemaId64))
 	}
@@ -405,7 +404,7 @@ func (d *qwpQueryDecoder) parseFullSchema(columnCount int) ([]qwpColumnSchemaInf
 		if err != nil {
 			return nil, err
 		}
-		if nameLen64 < 0 || nameLen64 > qwpMaxColumnNameLen {
+		if nameLen64 > qwpMaxColumnNameLen {
 			return nil, newQwpDecodeError(fmt.Sprintf(
 				"column name length out of range: %d", nameLen64))
 		}
@@ -757,7 +756,7 @@ func (d *qwpQueryDecoder) parseGeohash(l *qwpColumnLayout) error {
 	if err != nil {
 		return err
 	}
-	if precBits64 < 0 || precBits64 > 60 {
+	if precBits64 > 60 {
 		return newQwpDecodeError(fmt.Sprintf(
 			"geohash precision out of range: %d", precBits64))
 	}
