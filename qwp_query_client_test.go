@@ -975,7 +975,7 @@ func TestQwpQueryInitialCreditReachesWire(t *testing.T) {
 
 // TestQwpQueryCloseIdempotentAfterFinish locks in the documented
 // contract that Close on an already-finished cursor is a safe no-op.
-// Exercised via the CAS guard on q.done.
+// Exercised via the CAS guard on q.state.
 func TestQwpQueryCloseIdempotentAfterFinish(t *testing.T) {
 	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -994,8 +994,9 @@ func TestQwpQueryCloseIdempotentAfterFinish(t *testing.T) {
 		}
 	}
 	// First Close after a normal iteration-to-End: no-op because the
-	// iterator's deferred q.done.Store(true) already fired. Second
-	// Close: no-op via CAS. Neither call should panic or block.
+	// iterator's deferred state→Done already fired. Second Close:
+	// same, the CAS from Idle fails on Done state. Neither call
+	// should panic or block.
 	q.Close()
 	q.Close()
 }
@@ -1003,8 +1004,8 @@ func TestQwpQueryCloseIdempotentAfterFinish(t *testing.T) {
 // TestQwpQueryDrainAfterIteratorCtxExpiry reproduces the bug where
 // Batches() yields (nil, ctx.Err()) without sending CANCEL or
 // draining, leaving the dispatcher stuck in receiveLoop for the
-// abandoned query. The iterator's deferred q.done.Store(true) then
-// poisons the q.Close() CAS so Close early-returns too, and the next
+// abandoned query. The iterator's deferred state→Done then poisons
+// the q.Close() CAS so Close early-returns too, and the next
 // c.Query() deadlocks on the single-slot requests channel (or, with a
 // bounded ctx, returns a stale error instead of running cleanly).
 //
@@ -1207,5 +1208,100 @@ func TestQwpQueryYieldPanicReleasesBufferAndDrains(t *testing.T) {
 	}
 	if q2.TotalRows() != 1 {
 		t.Errorf("q2.TotalRows=%d, want 1", q2.TotalRows())
+	}
+}
+
+// TestQwpQueryCloseIsNoOpWhileIterating verifies Close called from
+// another goroutine while Batches() is in flight returns immediately
+// and does not compete with the iterator for the dispatcher's single
+// terminal event. Before the fix, Close's CAS guard only prevented
+// double-close by the same caller; a concurrent Close and Batches
+// both entered drainUntilTerminal, and whichever lost the race on the
+// one terminal frame blocked until its cleanup ctx expired (5 s).
+func TestQwpQueryCloseIsNoOpWhileIterating(t *testing.T) {
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// Query 1: send one batch, then block until CANCEL arrives so
+		// the iterator stays parked in takeEvent while the test
+		// invokes Close concurrently.
+		req1 := m.readBinary(ctx)
+		reqID1, _, _ := parseQueryRequest(t, req1)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID1, 0, "v", 7))
+		for {
+			frame := m.readBinary(ctx)
+			if frame[0] == byte(qwpMsgKindCancel) {
+				break
+			}
+		}
+		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(
+			reqID1, byte(qwpStatusCancelled), "cancelled", -1)))
+		// Query 2: RESULT_END only — proves the dispatcher returned
+		// to idle via the iterator's own drain path.
+		req2 := m.readBinary(ctx)
+		reqID2, _, _ := parseQueryRequest(t, req2)
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID2, 0, 0)))
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	q := c.Query(ctx, "SELECT 1")
+
+	seen := make(chan int64, 1)
+	iterDone := make(chan struct{})
+	go func() {
+		defer close(iterDone)
+		for b, err := range q.Batches() {
+			if err != nil {
+				return
+			}
+			seen <- b.Int64(0, 0)
+		}
+	}()
+
+	// Wait until the iterator has yielded the first batch — it is
+	// now parked in takeEvent waiting on the next event.
+	select {
+	case v := <-seen:
+		if v != 7 {
+			t.Fatalf("seen=%d, want 7", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("iterator never yielded a batch")
+	}
+
+	// Close must return quickly. With the bug it would race the
+	// iterator for the terminal event and block up to the 5 s
+	// cleanup timeout.
+	closeReturned := make(chan struct{})
+	go func() {
+		q.Close()
+		close(closeReturned)
+	}()
+	select {
+	case <-closeReturned:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Close blocked while Batches iteration in flight")
+	}
+
+	// The iterator is still parked. Cancel() triggers the server's
+	// CANCELLED echo, which the iterator swallows and exits cleanly.
+	q.Cancel()
+	select {
+	case <-iterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("iterator did not end after Cancel")
+	}
+
+	// Follow-up Query must complete — the dispatcher is idle because
+	// the iterator (not the racing Close) drained to the terminal
+	// frame.
+	q2 := c.Query(ctx, "SELECT 2")
+	defer q2.Close()
+	for _, err := range q2.Batches() {
+		if err != nil {
+			t.Fatalf("q2 err (dispatcher stranded?): %v", err)
+		}
 	}
 }

@@ -328,7 +328,7 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string) *QwpQuery {
 	}
 	if c.closed.Load() {
 		q.pendingErr = errors.New("qwp query: client is closed")
-		q.done.Store(true)
+		q.state.Store(qwpQueryStateDone)
 		return q
 	}
 	reqId := c.nextRequestId
@@ -340,7 +340,7 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string) *QwpQuery {
 		initialCredit: c.cfg.initialCredit,
 	}); err != nil {
 		q.pendingErr = err
-		q.done.Store(true)
+		q.state.Store(qwpQueryStateDone)
 	}
 	return q
 }
@@ -454,14 +454,30 @@ func eventToError(ev qwpEvent, reqId int64) error {
 	return errors.New("qwp query: unspecified error")
 }
 
+// Query lifecycle states. Transitions are linear: Idle → Iterating →
+// Done, or Idle → Done (if Close runs before Batches is entered, or
+// submit failed so the query is Done from construction). Coordination
+// between Close and Batches is done via CAS on this state — see the
+// per-method comments for the exact handshake.
+const (
+	qwpQueryStateIdle int32 = iota
+	qwpQueryStateIterating
+	qwpQueryStateDone
+)
+
 // QwpQuery is a streaming cursor over a SELECT result set returned by
 // (*QwpQueryClient).Query. It is single-use: once the range over
 // Batches() terminates (by End, Error, or break), the cursor is done
 // and must not be iterated again.
 //
 // Thread safety: Batches and the buffers it yields are single-consumer
-// — do not share the cursor across goroutines. Cancel and Close are
-// safe to call from other goroutines.
+// — do not share the cursor across goroutines. Cancel is safe to call
+// from other goroutines at any time. Close is safe to call from other
+// goroutines too, but is a no-op while a Batches iteration is in
+// flight: the iterator runs its own cancel+drain on every exit path,
+// so a concurrent Close would only race it for the dispatcher's
+// single terminal event. To unblock a hung iterator from another
+// goroutine, use Cancel (or cancel the context passed to Query).
 type QwpQuery struct {
 	client *QwpQueryClient
 	ctx    context.Context
@@ -483,11 +499,13 @@ type QwpQuery struct {
 	// iteration of Batches() so callers discover it naturally.
 	pendingErr error
 
-	// done is set true after the iterator reaches a terminal event
-	// (RESULT_END / EXEC_DONE / QUERY_ERROR / transport failure), a
-	// synthesized error from the wrong statement kind, or a caller-
-	// driven break-out. Further iterations become no-ops.
-	done atomic.Bool
+	// state is the lifecycle phase (see qwpQueryState* constants).
+	// Batches() enters via CAS(Idle→Iterating); Close() takes
+	// ownership of cleanup only via CAS(Idle→Done). Either defer
+	// flips to Done on exit. A failed CAS in Close means an iterator
+	// is active (and will clean up itself) or the query is already
+	// done — both cases are no-ops.
+	state atomic.Int32
 
 	// cancelled records whether Cancel() has been invoked. Used to
 	// avoid emitting a synthesized "cancelled by caller" error on top
@@ -509,14 +527,19 @@ type QwpQuery struct {
 // retain data across iterations.
 func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 	return func(yield func(*QwpColumnBatch, error) bool) {
-		if q.done.Load() {
+		// CAS Idle→Iterating grabs the iteration slot and also locks
+		// out a concurrent Close from running its own drain. On
+		// failure the query is already Done (either Close won the
+		// race, a prior iteration ran, or submit failed) — surface
+		// pendingErr once and stop.
+		if !q.state.CompareAndSwap(qwpQueryStateIdle, qwpQueryStateIterating) {
 			if q.pendingErr != nil {
 				yield(nil, q.pendingErr)
 				q.pendingErr = nil
 			}
 			return
 		}
-		defer q.done.Store(true)
+		defer q.state.Store(qwpQueryStateDone)
 
 		for {
 			ev, err := q.client.io.takeEvent(q.ctx)
@@ -527,10 +550,10 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 				// receiveLoop for this query, so cancel + drain on a
 				// cleanup ctx before returning — symmetrical to the
 				// !keepGoing break-out below. The caller's deferred
-				// Close() sees done=true (set by the defer on this
-				// function) and becomes a no-op; without this drain
-				// the dispatcher would stay stuck and strand the
-				// client for follow-up Query/Exec.
+				// Close() sees state=Done (flipped by the defer on
+				// this function) and becomes a no-op; without this
+				// drain the dispatcher would stay stuck and strand
+				// the client for follow-up Query/Exec.
 				yield(nil, err)
 				q.cancelAndDrainOnCleanupCtx()
 				return
@@ -545,8 +568,8 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 					// and the dispatcher — still parked in receiveLoop
 					// for this query — blocks the next Query/Exec.
 					// On panic we also run the cancel+drain before
-					// rethrowing: the outer `defer q.done.Store(true)`
-					// has already flipped done=true, so the caller's
+					// rethrowing: the outer `defer q.state.Store(Done)`
+					// has already flipped the state, so the caller's
 					// defer q.Close() would otherwise be a no-op and
 					// leave the dispatcher stranded.
 					defer func() {
@@ -622,7 +645,7 @@ func (q *QwpQuery) RequestId() int64 {
 // which Batches() swallows silently so a caller-initiated Cancel
 // produces a clean end of iteration.
 func (q *QwpQuery) Cancel() {
-	if q.done.Load() {
+	if q.state.Load() == qwpQueryStateDone {
 		return
 	}
 	q.cancelled.Store(true)
@@ -635,17 +658,22 @@ func (q *QwpQuery) Cancel() {
 // to defer even on already-finished queries; the second call is a
 // no-op.
 //
+// Close is also a no-op while a Batches() iteration is in flight on
+// another goroutine: the iterator performs its own cancel+drain on
+// every exit path, and a concurrent Close would only race it for the
+// dispatcher's single terminal event. Use Cancel (or cancel q.ctx)
+// to unblock an in-flight iterator from another goroutine.
+//
 // Does not close the client itself. Call (*QwpQueryClient).Close
 // to release the underlying WebSocket connection.
 func (q *QwpQuery) Close() {
-	if !q.done.CompareAndSwap(false, true) {
+	// CAS Idle→Done claims exclusive cleanup ownership. Failure means
+	// either a Batches() iteration is running (state=Iterating — it
+	// will clean up on exit) or the cursor is already Done (prior
+	// iteration, Close, or submit failure). Both are no-ops here.
+	if !q.state.CompareAndSwap(qwpQueryStateIdle, qwpQueryStateDone) {
 		return
 	}
-	// Reached only on explicit Close-without-draining — when the
-	// iterator runs to a terminal event or bails via the takeEvent-
-	// error / break-out paths, it sets done=true via its deferred
-	// Store and those paths perform their own cancel+drain, so the
-	// CAS above would already have returned false.
 	q.cancelAndDrainOnCleanupCtx()
 }
 
