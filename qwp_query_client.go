@@ -372,6 +372,15 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string) (ExecResult, erro
 	for {
 		ev, err := c.io.takeEvent(ctx)
 		if err != nil {
+			// ctx expired or I/O terminated before we saw a terminal
+			// event. Cancel + drain on a cleanup ctx so the dispatcher
+			// returns to idle; otherwise the next Query/Exec on this
+			// client blocks on the single-slot requests channel.
+			c.io.requestCancel(reqId)
+			cleanupCtx, cleanupCancel := context.WithTimeout(
+				context.Background(), qwpQueryCleanupDrainTimeout)
+			_ = drainUntilTerminal(cleanupCtx, c.io)
+			cleanupCancel()
 			return ExecResult{}, err
 		}
 		switch ev.kind {
@@ -512,7 +521,18 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 		for {
 			ev, err := q.client.io.takeEvent(q.ctx)
 			if err != nil {
+				// takeEvent returned before a terminal frame (most
+				// often q.ctx expired while we were waiting on the
+				// server). The dispatcher is still parked in
+				// receiveLoop for this query, so cancel + drain on a
+				// cleanup ctx before returning — symmetrical to the
+				// !keepGoing break-out below. The caller's deferred
+				// Close() sees done=true (set by the defer on this
+				// function) and becomes a no-op; without this drain
+				// the dispatcher would stay stuck and strand the
+				// client for follow-up Query/Exec.
 				yield(nil, err)
+				q.cancelAndDrainOnCleanupCtx()
 				return
 			}
 			switch ev.kind {
@@ -526,12 +546,7 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 					// can submit cleanly. Drain uses a bounded cleanup
 					// ctx independent of q.ctx because a common reason
 					// to break out is exactly that q.ctx has expired.
-					q.client.io.requestCancel(q.requestId)
-					q.cancelled.Store(true)
-					cleanupCtx, cancel := context.WithTimeout(
-						context.Background(), qwpQueryCleanupDrainTimeout)
-					_ = drainUntilTerminal(cleanupCtx, q.client.io)
-					cancel()
+					q.cancelAndDrainOnCleanupCtx()
 					return
 				}
 			case qwpEventKindEnd:
@@ -607,19 +622,26 @@ func (q *QwpQuery) Close() {
 	if !q.done.CompareAndSwap(false, true) {
 		return
 	}
-	// Best-effort cancel if the caller never broke out of the range
-	// loop. If the query already reached a terminal event the swap
-	// above would have returned false (done was already true), so
-	// this path runs only on explicit Close-without-draining.
+	// Reached only on explicit Close-without-draining — when the
+	// iterator runs to a terminal event or bails via the takeEvent-
+	// error / break-out paths, it sets done=true via its deferred
+	// Store and those paths perform their own cancel+drain, so the
+	// CAS above would already have returned false.
+	q.cancelAndDrainOnCleanupCtx()
+}
+
+// cancelAndDrainOnCleanupCtx sends a CANCEL for this query's
+// requestId (unless one is already in flight) and drains pending
+// events until a terminal frame arrives, so the dispatcher returns
+// to idle regardless of q.ctx's state. Uses a fresh bounded context
+// because every caller either runs after q.ctx has already been
+// observed done (iterator break-out, takeEvent-error) or inside a
+// user-driven Close which has no meaningful ctx of its own.
+func (q *QwpQuery) cancelAndDrainOnCleanupCtx() {
 	if !q.cancelled.Load() {
 		q.cancelled.Store(true)
 		q.client.io.requestCancel(q.requestId)
 	}
-	// Drain with a bounded cleanup ctx independent of q.ctx: a
-	// common pattern is `defer cancel(); defer q.Close()`, which
-	// leaves q.ctx dead by the time Close runs — passing it here
-	// would make drainUntilTerminal return immediately and strand
-	// the dispatcher mid-query.
 	cleanupCtx, cancel := context.WithTimeout(
 		context.Background(), qwpQueryCleanupDrainTimeout)
 	defer cancel()

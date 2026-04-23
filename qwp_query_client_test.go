@@ -999,3 +999,136 @@ func TestQwpQueryCloseIdempotentAfterFinish(t *testing.T) {
 	q.Close()
 	q.Close()
 }
+
+// TestQwpQueryDrainAfterIteratorCtxExpiry reproduces the bug where
+// Batches() yields (nil, ctx.Err()) without sending CANCEL or
+// draining, leaving the dispatcher stuck in receiveLoop for the
+// abandoned query. The iterator's deferred q.done.Store(true) then
+// poisons the q.Close() CAS so Close early-returns too, and the next
+// c.Query() deadlocks on the single-slot requests channel (or, with a
+// bounded ctx, returns a stale error instead of running cleanly).
+//
+// Exercises the takeEvent-error path specifically: the caller's ctx
+// expires mid-wait before the server has sent anything. With the fix
+// the iterator must CANCEL + drain on a cleanup ctx so the dispatcher
+// returns to idle.
+func TestQwpQueryDrainAfterIteratorCtxExpiry(t *testing.T) {
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// Query 1: send nothing; just wait for CANCEL, then echo
+		// CANCELLED. Mirrors a slow-server / timeout scenario.
+		req1 := m.readBinary(ctx)
+		reqID1, _, _ := parseQueryRequest(t, req1)
+		for {
+			frame := m.readBinary(ctx)
+			if frame[0] == byte(qwpMsgKindCancel) {
+				break
+			}
+		}
+		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(
+			reqID1, byte(qwpStatusCancelled), "cancelled", -1)))
+		// Query 2: one batch + RESULT_END, proving the dispatcher
+		// returned to idle after query 1 was drained.
+		req2 := m.readBinary(ctx)
+		reqID2, _, _ := parseQueryRequest(t, req2)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID2, 0, "v", 99))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID2, 0, 1)))
+	})
+	defer cleanup()
+
+	// Query 1: short-deadline ctx. The iterator's first takeEvent
+	// returns ctx.Err() because the server sends nothing. The body
+	// accepts the (nil, err) without breaking so we exit via the
+	// takeEvent-error return path (the branch that lacked the drain).
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel1()
+	q1 := c.Query(ctx1, "SELECT 1")
+	var iter1Err error
+	var iter1Batches int
+	for _, err := range q1.Batches() {
+		if err != nil {
+			iter1Err = err
+			continue
+		}
+		iter1Batches++
+	}
+	if iter1Err == nil {
+		t.Fatalf("expected ctx-cancel error from iter1, got nil")
+	}
+	if iter1Batches != 0 {
+		t.Fatalf("iter1 batches=%d, want 0", iter1Batches)
+	}
+	// No-op with the current bug; with the fix, already drained by
+	// the iterator's exit path.
+	q1.Close()
+
+	// Query 2 must reach RESULT_END within a reasonable timeout. With
+	// the bug, the dispatcher is still stuck in receiveLoop for query
+	// 1 so this never produces a batch.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	q2 := c.Query(ctx2, "SELECT 2")
+	defer q2.Close()
+	var saw2 int64
+	for b, err := range q2.Batches() {
+		if err != nil {
+			t.Fatalf("iter2 err: %v", err)
+		}
+		saw2 = b.Int64(0, 0)
+	}
+	if saw2 != 99 {
+		t.Errorf("saw2=%d, want 99 (dispatcher stranded on query 1?)", saw2)
+	}
+	if q2.TotalRows() != 1 {
+		t.Errorf("q2.TotalRows=%d, want 1", q2.TotalRows())
+	}
+}
+
+// TestQwpExecDrainAfterCtxExpiry is the Exec-side counterpart of the
+// Batches drain test. Exec's takeEvent loop returns on ctx.Err
+// without CANCEL + drain, leaving the dispatcher stuck on the
+// unfinished server-side query. A subsequent Exec must still work
+// once the first Exec has returned.
+func TestQwpExecDrainAfterCtxExpiry(t *testing.T) {
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// Exec 1: wait for CANCEL, echo CANCELLED.
+		req1 := m.readBinary(ctx)
+		reqID1, _, _ := parseQueryRequest(t, req1)
+		for {
+			frame := m.readBinary(ctx)
+			if frame[0] == byte(qwpMsgKindCancel) {
+				break
+			}
+		}
+		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(
+			reqID1, byte(qwpStatusCancelled), "cancelled", -1)))
+		// Exec 2: EXEC_DONE to prove the dispatcher returned to idle.
+		req2 := m.readBinary(ctx)
+		reqID2, _, _ := parseQueryRequest(t, req2)
+		m.sendBinary(ctx, writeQwpFrame(0, buildExecDoneBody(reqID2, 0x07, 5)))
+	})
+	defer cleanup()
+
+	// Exec 1: short-deadline ctx → takeEvent returns ctx.Err(); Exec
+	// currently returns without cancelling/draining.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel1()
+	if _, err := c.Exec(ctx1, "INSERT INTO x VALUES (1)"); err == nil {
+		t.Fatalf("expected ctx error from Exec 1")
+	}
+
+	// Exec 2 must complete. With the bug the dispatcher is still stuck
+	// on Exec 1, so Exec 2's takeEvent times out on ctx2.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	res, err := c.Exec(ctx2, "INSERT INTO x VALUES (2)")
+	if err != nil {
+		t.Fatalf("Exec 2 err (dispatcher stranded?): %v", err)
+	}
+	if res.OpType != 0x07 || res.RowsAffected != 5 {
+		t.Errorf("Exec 2 result=%+v, want OpType=0x07 RowsAffected=5", res)
+	}
+}
