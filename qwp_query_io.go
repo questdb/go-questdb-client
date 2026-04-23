@@ -352,8 +352,11 @@ func (io *qwpEgressIO) releaseBuffer(buf *qwpBatchBuffer) {
 	select {
 	case io.buffers <- buf:
 	default:
-		// Pool closed between our closed.Load() check and the send.
-		// Buffer is collectible — drop it.
+		// Unreachable in practice: io.buffers has capacity
+		// bufferPoolSize and at most bufferPoolSize buffers exist, so
+		// a release can never overflow it. Non-blocking defensively —
+		// if a double-release or similar accounting bug ever fills the
+		// pool, we'd rather drop the extra buffer than deadlock here.
 	}
 	// Wake the dispatcher so the credit replenish (if flow control is
 	// on) reaches the server without waiting for the next server-
