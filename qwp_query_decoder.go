@@ -625,11 +625,13 @@ func (d *qwpQueryDecoder) parseTimestamp(l *qwpColumnLayout) error {
 		}
 		// bytesConsumed() is bounded by the slice we passed into reset()
 		// (which was d.br.buf[d.br.pos:]), so advance cannot overrun the
-		// outer reader. If it ever does, a decoder invariant was broken.
+		// outer reader for a well-formed frame. Surface a decode error
+		// rather than panicking on malformed network input.
 		consumed := d.gorilla.bytesConsumed()
 		if err := d.br.advance(consumed); err != nil {
-			panic(fmt.Sprintf("qwp: internal: Gorilla bytesConsumed=%d overruns frame (pos=%d, buflen=%d)",
-				consumed, d.br.pos, len(d.br.buf)))
+			return wrapQwpDecodeError(fmt.Sprintf(
+				"Gorilla bytesConsumed=%d overruns frame (pos=%d, buflen=%d)",
+				consumed, d.br.pos, len(d.br.buf)), err)
 		}
 		// Reinterpret the int64 slice as []byte so the Int64 accessor
 		// path stays uniform (it reads 8 LE bytes per dense index).
