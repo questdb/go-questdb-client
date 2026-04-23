@@ -112,6 +112,15 @@ type qwpRequest struct {
 	// replenishes by each batch's byte length after the consumer
 	// releases its buffer.
 	initialCredit int64
+	// bindCount is the number of typed bind parameters encoded in
+	// bindPayload, or 0 when the query has no binds.
+	bindCount int
+	// bindPayload is the pre-encoded typed bind-parameter block for
+	// this query, or nil when bindCount == 0. Owned per request —
+	// buildRequest copies from QwpQueryClient's reusable bind scratch
+	// into this fresh slice before submitQuery, so a follow-up
+	// query's reset + re-encode cannot race the dispatcher.
+	bindPayload []byte
 }
 
 // qwpEgressIO owns the WebSocket transport plus the per-connection
@@ -757,14 +766,18 @@ func (io *qwpEgressIO) drainPendingCredit() bool {
 // sendQueryRequest builds and sends the QUERY_REQUEST frame.
 //
 // Wire layout: msg_kind(0x10) + request_id(int64 LE) + sql_len(varint)
-// + sql(utf8) + initial_credit(varint) + bind_count(varint = 0).
+// + sql(utf8) + initial_credit(varint) + bind_count(varint) +
+// bind_payload(bindPayloadLen bytes, pre-encoded by QwpBinds).
 func (io *qwpEgressIO) sendQueryRequest(req qwpRequest) error {
 	io.sendBuf.reset()
 	io.sendBuf.putByte(byte(qwpMsgKindQueryRequest))
 	io.sendBuf.putInt64LE(req.requestId)
 	io.sendBuf.putString(req.sql)
 	io.sendBuf.putVarint(uint64(req.initialCredit))
-	io.sendBuf.putVarint(0) // bind_count
+	io.sendBuf.putVarint(uint64(req.bindCount))
+	if req.bindCount > 0 && len(req.bindPayload) > 0 {
+		io.sendBuf.putBytes(req.bindPayload)
+	}
 	return io.transport.sendMessage(io.ioCtx, io.sendBuf.bytes())
 }
 

@@ -528,3 +528,71 @@ func TestQwpIntegrationClientCloseDuringLongQuery(t *testing.T) {
 		t.Errorf("iteration took %v — client Close did not unblock the iterator", elapsed)
 	}
 }
+
+// TestQwpIntegrationQueryWithBinds exercises the bind-variable path
+// against the live server. Inserts a handful of rows, then runs the
+// same filtered SELECT three times with different bind values and
+// verifies the server returns the expected result for each set. Two
+// goals: (a) confirm the bind wire payload is accepted by the server
+// (no protocol mismatch with the Java / C client encoders), and (b)
+// confirm repeated calls with the same SQL text produce the expected
+// per-call result sets.
+func TestQwpIntegrationQueryWithBinds(t *testing.T) {
+	const tableName = "qwp_integ_binds"
+	qwpDropTable(t, tableName)
+	defer qwpDropTable(t, tableName)
+
+	qwpSkipIfNoServer(t)
+	insertRows(t, tableName, 9) // host cycles through server0 / server1 / server2
+
+	c := newTestQueryClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	defer c.Close(ctx)
+
+	sql := fmt.Sprintf(
+		"SELECT v FROM '%s' WHERE host = $1 AND v >= $2 ORDER BY v", tableName)
+
+	type tc struct {
+		host   string
+		minV   int64
+		wantVs []int64
+	}
+	cases := []tc{
+		// insertRows writes v=i with host="server{i%3}":
+		//   server0: 0, 3, 6
+		//   server1: 1, 4, 7
+		//   server2: 2, 5, 8
+		{host: "server0", minV: 0, wantVs: []int64{0, 3, 6}},
+		{host: "server1", minV: 4, wantVs: []int64{4, 7}},
+		{host: "server2", minV: 10, wantVs: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			q := c.Query(ctx, sql, WithQueryBinds(func(b *QwpBinds) {
+				b.VarcharBind(0, tc.host).LongBind(1, tc.minV)
+			}))
+			defer q.Close()
+
+			var got []int64
+			for batch, err := range q.Batches() {
+				if err != nil {
+					t.Fatalf("iter err: %v", err)
+				}
+				for r := 0; r < batch.RowCount(); r++ {
+					got = append(got, batch.Int64(0, r))
+				}
+			}
+			if len(got) != len(tc.wantVs) {
+				t.Fatalf("got %d rows, want %d (values %v want %v)",
+					len(got), len(tc.wantVs), got, tc.wantVs)
+			}
+			for i, v := range got {
+				if v != tc.wantVs[i] {
+					t.Errorf("row %d: got v=%d, want %d", i, v, tc.wantVs[i])
+				}
+			}
+		})
+	}
+}

@@ -67,12 +67,47 @@ type QwpQueryClient struct {
 	// goroutines (one query at a time).
 	nextRequestId int64
 
+	// binds is the reusable typed bind-parameter sink. Populated on
+	// the user goroutine by the QwpBindFunc passed to Query / Exec.
+	// buildRequest copies the encoded bytes into a fresh per-request
+	// slice before handing the request to the I/O goroutine, so a
+	// follow-up query's reset + re-encode cannot race the dispatcher.
+	binds QwpBinds
+
 	// closed guards Close against double-close and later Query/Exec.
 	closed atomic.Bool
 	// closeOnce ensures the teardown side effects (I/O shutdown,
 	// transport close) run at most once even under concurrent Close
 	// callers.
 	closeOnce sync.Once
+}
+
+// QwpBindFunc populates the typed bind parameters for a single Query
+// or Exec call. The function is invoked on the caller's goroutine
+// before the query is submitted. Setters must be invoked in strictly
+// ascending index order starting at 0; the latched error on QwpBinds
+// is surfaced as the query's first result.
+type QwpBindFunc func(*QwpBinds)
+
+// QueryOption is a functional option for Query / Exec that attaches
+// per-call settings — currently just bind parameters.
+type QueryOption func(*qwpQueryOptions)
+
+// qwpQueryOptions collects the effective settings for a single Query
+// or Exec invocation. Private so the public surface is the option
+// constructors, not the struct itself.
+type qwpQueryOptions struct {
+	bindFn QwpBindFunc
+}
+
+// WithQueryBinds attaches a bind-parameter setter to a Query or Exec call.
+// The setter runs on the caller's goroutine and receives a reusable
+// *QwpBinds sink. Placeholders in the SQL text are $1, $2, ...; the
+// corresponding setter calls use 0-based indexes. Setters must be
+// invoked in strictly ascending index order with no gaps; a duplicate
+// or out-of-order index surfaces the error through the query result.
+func WithQueryBinds(fn QwpBindFunc) QueryOption {
+	return func(o *qwpQueryOptions) { o.bindFn = fn }
 }
 
 // QwpQueryClientOption is a functional option for NewQwpQueryClient.
@@ -311,6 +346,12 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 // result batches. The server-side execution begins immediately; the
 // cursor drains events lazily as the caller ranges over Batches().
 //
+// Per-call options are supplied via the variadic opts list — see
+// WithQueryBinds for attaching typed bind parameters. Repeating the same
+// SQL text across calls hits the server's SQL-text-keyed factory cache;
+// interpolating values into the SQL string defeats that reuse, use
+// WithQueryBinds instead.
+//
 // Err on a wrong statement kind surfaces through the first Batches()
 // yield: if the server sends EXEC_DONE (non-SELECT statement), the
 // iterator yields (nil, error) and terminates. Use Exec for
@@ -320,7 +361,7 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 // server and drains the remaining events until a terminal frame
 // arrives. Always defer (*QwpQuery).Close() to guarantee cleanup on
 // any path.
-func (c *QwpQueryClient) Query(ctx context.Context, sql string) *QwpQuery {
+func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QueryOption) *QwpQuery {
 	q := &QwpQuery{
 		client: c,
 		ctx:    ctx,
@@ -331,14 +372,14 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string) *QwpQuery {
 		q.state.Store(qwpQueryStateDone)
 		return q
 	}
-	reqId := c.nextRequestId
-	c.nextRequestId++
-	q.requestId = reqId
-	if err := c.io.submitQuery(ctx, qwpRequest{
-		sql:           sql,
-		requestId:     reqId,
-		initialCredit: c.cfg.initialCredit,
-	}); err != nil {
+	req, err := c.buildRequest(sql, opts)
+	if err != nil {
+		q.pendingErr = err
+		q.state.Store(qwpQueryStateDone)
+		return q
+	}
+	q.requestId = req.requestId
+	if err := c.io.submitQuery(ctx, req); err != nil {
 		q.pendingErr = err
 		q.state.Store(qwpQueryStateDone)
 	}
@@ -351,21 +392,23 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string) *QwpQuery {
 // QUERY_ERROR frame the returned error is a *QwpQueryError; on a
 // transport or decode failure it is a plain error.
 //
+// Per-call options are supplied via the variadic opts list — see
+// WithQueryBinds for attaching typed bind parameters.
+//
 // Calling Exec on a SELECT statement returns an error — SELECT sends
 // RESULT_BATCH + RESULT_END, which Exec does not expect. Use Query
 // for SELECTs.
-func (c *QwpQueryClient) Exec(ctx context.Context, sql string) (ExecResult, error) {
+func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOption) (ExecResult, error) {
 	if c.closed.Load() {
 		return ExecResult{}, errors.New("qwp query: client is closed")
 	}
-	reqId := c.nextRequestId
-	c.nextRequestId++
+	req, err := c.buildRequest(sql, opts)
+	if err != nil {
+		return ExecResult{}, err
+	}
+	reqId := req.requestId
 
-	if err := c.io.submitQuery(ctx, qwpRequest{
-		sql:           sql,
-		requestId:     reqId,
-		initialCredit: c.cfg.initialCredit,
-	}); err != nil {
+	if err := c.io.submitQuery(ctx, req); err != nil {
 		return ExecResult{}, err
 	}
 
@@ -412,6 +455,39 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string) (ExecResult, erro
 			return ExecResult{}, fmt.Errorf("qwp query: unexpected event kind %d", ev.kind)
 		}
 	}
+}
+
+// buildRequest assembles the qwpRequest for a Query / Exec call. The
+// bind setter runs on the caller's goroutine against the client's
+// reusable QwpBinds scratch; the encoded bytes are then copied into a
+// fresh per-request slice so the dispatcher's read of bindPayload is
+// always against a request-owned buffer, independent of what the
+// caller does with the scratch afterwards.
+func (c *QwpQueryClient) buildRequest(sql string, opts []QueryOption) (qwpRequest, error) {
+	var settings qwpQueryOptions
+	for _, opt := range opts {
+		opt(&settings)
+	}
+	c.binds.reset()
+	if settings.bindFn != nil {
+		settings.bindFn(&c.binds)
+		if err := c.binds.Err(); err != nil {
+			return qwpRequest{}, err
+		}
+	}
+	var bindPayload []byte
+	if src := c.binds.bufferBytes(); len(src) > 0 {
+		bindPayload = append([]byte(nil), src...)
+	}
+	reqId := c.nextRequestId
+	c.nextRequestId++
+	return qwpRequest{
+		sql:           sql,
+		requestId:     reqId,
+		initialCredit: c.cfg.initialCredit,
+		bindCount:     c.binds.Count(),
+		bindPayload:   bindPayload,
+	}, nil
 }
 
 // drainUntilTerminal reads and discards events until a terminal one

@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -1303,5 +1304,280 @@ func TestQwpQueryCloseIsNoOpWhileIterating(t *testing.T) {
 		if err != nil {
 			t.Fatalf("q2 err (dispatcher stranded?): %v", err)
 		}
+	}
+}
+
+// --- Bind parameter tests ---
+
+// parseQueryRequestWithBinds parses a client-sent QUERY_REQUEST and
+// returns the bind count plus the raw bind payload bytes, in addition
+// to the usual tuple. Tests that exercise WithQueryBinds assert against
+// this richer view.
+func parseQueryRequestWithBinds(t *testing.T, frame []byte) (int64, string, int64, int, []byte) {
+	t.Helper()
+	if len(frame) < 1+8 {
+		t.Fatalf("QUERY_REQUEST frame too short: %d", len(frame))
+	}
+	if kind := frame[0]; kind != byte(qwpMsgKindQueryRequest) {
+		t.Fatalf("expected msg_kind 0x10, got 0x%02X", kind)
+	}
+	p := 1
+	requestId := int64(binary.LittleEndian.Uint64(frame[p:]))
+	p += 8
+	sqlLen, n, err := qwpReadVarint(frame[p:])
+	if err != nil {
+		t.Fatalf("bad sql_len varint: %v", err)
+	}
+	p += n
+	sql := string(frame[p : p+int(sqlLen)])
+	p += int(sqlLen)
+	credit, n, err := qwpReadVarint(frame[p:])
+	if err != nil {
+		t.Fatalf("bad credit varint: %v", err)
+	}
+	p += n
+	bindCount, n, err := qwpReadVarint(frame[p:])
+	if err != nil {
+		t.Fatalf("bad bind_count varint: %v", err)
+	}
+	p += n
+	return requestId, sql, int64(credit), int(bindCount), frame[p:]
+}
+
+// TestQwpQueryWithBindsWiresBindPayload sends a query with mixed-type
+// binds and asserts the server sees the pre-encoded bind bytes along
+// with a matching bind_count.
+func TestQwpQueryWithBindsWiresBindPayload(t *testing.T) {
+	const wantSQL = "SELECT * FROM trades WHERE sym = $1 AND price >= $2 AND ts >= $3 LIMIT 1000"
+	var gotFrame []byte
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		gotFrame = append(gotFrame, m.readBinary(ctx)...)
+		reqID, _, _, _, _ := parseQueryRequestWithBinds(t, gotFrame)
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID, 0, 0)))
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	q := c.Query(ctx, wantSQL, WithQueryBinds(func(b *QwpBinds) {
+		b.VarcharBind(0, "AAPL").
+			DoubleBind(1, 100.0).
+			TimestampMicrosBind(2, 1_700_000_000_000_000)
+	}))
+	defer q.Close()
+	for _, err := range q.Batches() {
+		if err != nil {
+			t.Fatalf("iterator error: %v", err)
+		}
+	}
+
+	_, sql, _, bindCount, bindPayload := parseQueryRequestWithBinds(t, gotFrame)
+	if sql != wantSQL {
+		t.Errorf("sql=%q, want %q", sql, wantSQL)
+	}
+	if bindCount != 3 {
+		t.Fatalf("bind_count=%d, want 3", bindCount)
+	}
+
+	// Build the expected bind payload by running the same encoder
+	// against a fresh QwpBinds instance. This way the expected bytes
+	// live in exactly one place (the production encoder) and the test
+	// asserts only the wiring, not the encoding.
+	var expected QwpBinds
+	expected.VarcharBind(0, "AAPL").
+		DoubleBind(1, 100.0).
+		TimestampMicrosBind(2, 1_700_000_000_000_000)
+	if !bytes.Equal(bindPayload, expected.bufferBytes()) {
+		t.Fatalf("bind payload mismatch:\n got: % x\nwant: % x",
+			bindPayload, expected.bufferBytes())
+	}
+}
+
+// TestQwpQueryWithBindsEmpty verifies a query with zero-argument binds
+// (user passed WithQueryBinds with no setter calls) sends bind_count=0
+// and an empty bind payload — equivalent to not using WithQueryBinds
+// at all.
+func TestQwpQueryWithBindsEmpty(t *testing.T) {
+	var gotFrame []byte
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		gotFrame = append(gotFrame, m.readBinary(ctx)...)
+		reqID, _, _, _, _ := parseQueryRequestWithBinds(t, gotFrame)
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID, 0, 0)))
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	q := c.Query(ctx, "SELECT 1", WithQueryBinds(func(b *QwpBinds) {}))
+	defer q.Close()
+	for _, err := range q.Batches() {
+		if err != nil {
+			t.Fatalf("iterator error: %v", err)
+		}
+	}
+
+	_, _, _, bindCount, bindPayload := parseQueryRequestWithBinds(t, gotFrame)
+	if bindCount != 0 {
+		t.Errorf("bind_count=%d, want 0", bindCount)
+	}
+	if len(bindPayload) != 0 {
+		t.Errorf("bind payload should be empty, got % x", bindPayload)
+	}
+}
+
+// TestQwpQueryWithBindsSurfacesEncodingError verifies a bind setter
+// that produces a latched QwpBinds error (e.g. out-of-order index)
+// fails the query through the iterator's first yield, without sending
+// a QUERY_REQUEST to the server.
+func TestQwpQueryWithBindsSurfacesEncodingError(t *testing.T) {
+	done := make(chan struct{})
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		// Server should never see a frame for a bind-failing query.
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		_, _, err := m.conn.Read(ctx)
+		if err == nil {
+			t.Errorf("server received a frame despite bind error")
+		}
+		close(done)
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	q := c.Query(ctx, "SELECT 1", WithQueryBinds(func(b *QwpBinds) {
+		b.LongBind(0, 1)
+		b.LongBind(5, 2) // out-of-order
+	}))
+	defer q.Close()
+
+	var sawErr error
+	for _, err := range q.Batches() {
+		if err != nil {
+			sawErr = err
+			break
+		}
+	}
+	if sawErr == nil {
+		t.Fatal("expected bind error to surface via Batches")
+	}
+	if !strings.Contains(sawErr.Error(), "out of order") {
+		t.Fatalf("unexpected error: %v", sawErr)
+	}
+	<-done
+}
+
+// TestQwpExecWithBinds verifies WithQueryBinds is plumbed through Exec,
+// not just Query. Drives an EXEC_DONE against a bind-bearing UPDATE-
+// style request.
+func TestQwpExecWithBinds(t *testing.T) {
+	var gotFrame []byte
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		gotFrame = append(gotFrame, m.readBinary(ctx)...)
+		reqID, _, _, _, _ := parseQueryRequestWithBinds(t, gotFrame)
+		m.sendBinary(ctx, writeQwpFrame(0, buildExecDoneBody(reqID, 0x01, 42)))
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := c.Exec(ctx, "UPDATE trades SET price = $1 WHERE sym = $2",
+		WithQueryBinds(func(b *QwpBinds) {
+			b.DoubleBind(0, 200.5).VarcharBind(1, "MSFT")
+		}))
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if res.RowsAffected != 42 {
+		t.Errorf("RowsAffected=%d, want 42", res.RowsAffected)
+	}
+
+	_, _, _, bindCount, bindPayload := parseQueryRequestWithBinds(t, gotFrame)
+	if bindCount != 2 {
+		t.Fatalf("bind_count=%d, want 2", bindCount)
+	}
+	var expected QwpBinds
+	expected.DoubleBind(0, 200.5).VarcharBind(1, "MSFT")
+	if !bytes.Equal(bindPayload, expected.bufferBytes()) {
+		t.Fatalf("bind payload mismatch:\n got: % x\nwant: % x",
+			bindPayload, expected.bufferBytes())
+	}
+}
+
+// TestQwpQueryBindsResetAcrossCalls verifies the per-client bind
+// scratch is reset between calls — a second query with fewer binds
+// must not accidentally include the prior call's trailing bytes.
+func TestQwpQueryBindsResetAcrossCalls(t *testing.T) {
+	frames := make(chan []byte, 2)
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for i := 0; i < 2; i++ {
+			f := m.readBinary(ctx)
+			frames <- f
+			reqID, _, _, _, _ := parseQueryRequestWithBinds(t, f)
+			m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID, 0, 0)))
+		}
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// First query has 3 binds.
+	q1 := c.Query(ctx, "SELECT 1", WithQueryBinds(func(b *QwpBinds) {
+		b.LongBind(0, 1).LongBind(1, 2).LongBind(2, 3)
+	}))
+	for _, err := range q1.Batches() {
+		if err != nil {
+			t.Fatalf("q1 err: %v", err)
+		}
+	}
+	q1.Close()
+
+	// Second query has 1 bind — must not carry over the first two longs.
+	q2 := c.Query(ctx, "SELECT 2", WithQueryBinds(func(b *QwpBinds) {
+		b.IntBind(0, 99)
+	}))
+	for _, err := range q2.Batches() {
+		if err != nil {
+			t.Fatalf("q2 err: %v", err)
+		}
+	}
+	q2.Close()
+
+	close(frames)
+	got := make([][]byte, 0, 2)
+	for f := range frames {
+		got = append(got, f)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 frames, got %d", len(got))
+	}
+	_, _, _, count1, payload1 := parseQueryRequestWithBinds(t, got[0])
+	_, _, _, count2, payload2 := parseQueryRequestWithBinds(t, got[1])
+	if count1 != 3 {
+		t.Errorf("q1 bind_count=%d, want 3", count1)
+	}
+	if count2 != 1 {
+		t.Errorf("q2 bind_count=%d, want 1", count2)
+	}
+
+	var wantPayload2 QwpBinds
+	wantPayload2.IntBind(0, 99)
+	if !bytes.Equal(payload2, wantPayload2.bufferBytes()) {
+		t.Fatalf("q2 payload mismatch (possible carry-over from q1):\n got: % x\nwant: % x",
+			payload2, wantPayload2.bufferBytes())
+	}
+	// Sanity: payload1 must not be a prefix/subset of payload2 (i.e., they
+	// encode different things).
+	if bytes.Contains(payload2, payload1) {
+		t.Fatalf("q2 payload contains q1 payload — scratch not reset")
 	}
 }
