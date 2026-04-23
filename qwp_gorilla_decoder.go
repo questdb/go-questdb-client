@@ -24,10 +24,19 @@
 
 package questdb
 
-// qwpBitReader reads bits LSB-first from a byte slice, pulling bytes
-// lazily into a 64-bit accumulator. It is the inverse of qwpBitWriter
-// in qwp_gorilla.go and is used by qwpGorillaDecoder to consume the
-// delta-of-delta bitstream emitted by the encoder.
+import "encoding/binary"
+
+// qwpBitReader reads bits LSB-first from a byte slice using a 64-bit
+// accumulator. It is the inverse of qwpBitWriter in qwp_gorilla.go and
+// is used by qwpGorillaDecoder to consume the delta-of-delta bitstream
+// emitted by the encoder.
+//
+// Refills go through a single 8-byte little-endian load whenever the
+// source has 8 bytes available, falling back to a byte-by-byte tail for
+// the last <8 bytes of the buffer. The Gorilla DoD path issues several
+// single-bit reads followed by a wide signed payload per row; once the
+// accumulator is loaded, all reads up to its 64-bit capacity hit the
+// fast path (a single shift+mask) without touching the source slice.
 //
 // Error model: every read returns *qwpDecodeError (via
 // newQwpDecodeError) when the underlying byte slice is exhausted before
@@ -35,10 +44,10 @@ package questdb
 // as a decode failure on the enclosing RESULT_BATCH frame.
 type qwpBitReader struct {
 	data      []byte
-	bitBuffer uint64
-	bitsAvail int
-	pos       int
-	bitsRead  int64
+	bitBuffer uint64 // accumulator; bits are LSB-aligned, count is bitsAvail
+	bitsAvail int    // bits currently held in bitBuffer; in [0, 64]
+	pos       int    // index of the next byte to load from data
+	bitsRead  int64  // total bits consumed since reset
 }
 
 // reset rebinds the reader to a new byte slice and zeroes all residual
@@ -55,11 +64,24 @@ func (r *qwpBitReader) reset(data []byte) {
 // bytesConsumed returns ceil(bitsRead / 8) — the byte count of the
 // bitstream region read so far, rounded up to the next byte boundary.
 // Matches the encoder's byte-aligned output (qwpBitWriter.finish
-// always pads trailing bits with zeros to a full byte).
+// always pads trailing bits with zeros to a full byte). The 8-byte
+// fast-path refill may speculatively load bytes beyond the bits the
+// caller actually consumes; bytesConsumed reflects bits read, not
+// bytes loaded, so it remains a faithful cursor for the outer reader.
 func (r *qwpBitReader) bytesConsumed() int { return int((r.bitsRead + 7) >> 3) }
 
 // readBit reads a single bit, LSB-first within each source byte.
+// Specialised so the hot Gorilla prefix-decoding path stays inlinable
+// when the accumulator is already populated — the common case after
+// the first refill.
 func (r *qwpBitReader) readBit() (uint64, error) {
+	if r.bitsAvail >= 1 {
+		bit := r.bitBuffer & 1
+		r.bitBuffer >>= 1
+		r.bitsAvail--
+		r.bitsRead++
+		return bit, nil
+	}
 	return r.readBits(1)
 }
 
@@ -69,17 +91,50 @@ func (r *qwpBitReader) readBits(n int) (uint64, error) {
 	if n <= 0 || n > 64 {
 		return 0, newQwpDecodeError("bit count out of range")
 	}
+	if r.bitsAvail >= n {
+		var mask uint64
+		if n == 64 {
+			mask = ^uint64(0)
+		} else {
+			mask = (uint64(1) << n) - 1
+		}
+		result := r.bitBuffer & mask
+		if n == 64 {
+			r.bitBuffer = 0
+		} else {
+			r.bitBuffer >>= n
+		}
+		r.bitsAvail -= n
+		r.bitsRead += int64(n)
+		return result, nil
+	}
+	return r.readBitsSlow(n)
+}
+
+// readBitsSlow is the cold path for reads that span a refill. Each
+// iteration drains whatever's already in the accumulator, then refills
+// — preferring an 8-byte LE load when 8 source bytes are available,
+// falling back to a 1-byte load for the tail. Multi-iteration logic is
+// only exercised when n exceeds the bits already buffered (which, after
+// the first refill, can be at most one extra iteration since a single
+// 64-bit accumulator load satisfies any n <= 64).
+func (r *qwpBitReader) readBitsSlow(n int) (uint64, error) {
 	var result uint64
 	shift := 0
 	remaining := n
 	for remaining > 0 {
 		if r.bitsAvail == 0 {
-			if r.pos >= len(r.data) {
+			if r.pos+8 <= len(r.data) {
+				r.bitBuffer = binary.LittleEndian.Uint64(r.data[r.pos:])
+				r.pos += 8
+				r.bitsAvail = 64
+			} else if r.pos < len(r.data) {
+				r.bitBuffer = uint64(r.data[r.pos])
+				r.pos++
+				r.bitsAvail = 8
+			} else {
 				return 0, newQwpDecodeError("bit read past end of buffer")
 			}
-			r.bitBuffer = uint64(r.data[r.pos])
-			r.pos++
-			r.bitsAvail = 8
 		}
 		take := remaining
 		if take > r.bitsAvail {
@@ -92,7 +147,11 @@ func (r *qwpBitReader) readBits(n int) (uint64, error) {
 			mask = (uint64(1) << take) - 1
 		}
 		result |= (r.bitBuffer & mask) << shift
-		r.bitBuffer >>= take
+		if take == 64 {
+			r.bitBuffer = 0
+		} else {
+			r.bitBuffer >>= take
+		}
 		r.bitsAvail -= take
 		shift += take
 		remaining -= take

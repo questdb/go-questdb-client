@@ -327,3 +327,61 @@ func BenchmarkQwpColumnAdd(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkQwpGorillaDecode measures Gorilla DoD decoding throughput
+// over a long timestamp column. The bit reader's hot loop issues up to
+// four single-bit prefix reads plus one wide signed read per row, so
+// this is the regression gate for the 8-byte LE refill optimisation in
+// qwpBitReader.readBits / readBitsSlow.
+func BenchmarkQwpGorillaDecode(b *testing.B) {
+	const n = 4096
+	mk := func(stepFn func(i int) int64) []byte {
+		ts := make([]int64, n)
+		var cur int64
+		for i := range ts {
+			cur += stepFn(i)
+			ts[i] = cur
+		}
+		var wb qwpWireBuffer
+		var enc qwpGorillaEncoder
+		enc.encodeTimestamps(&wb, intsToBytes(ts), n)
+		// Strip the 16-byte uncompressed prefix the bit reader doesn't
+		// touch — the decoder's reset() takes only the bit-packed tail.
+		return append([]byte(nil), wb.bytes()[16:]...)
+	}
+
+	cases := []struct {
+		name string
+		data []byte
+		ts0  int64
+		ts1  int64
+	}{
+		{"ConstantDelta", mk(func(int) int64 { return 1000 }), 0, 1000},
+		{"SmallJitter", mk(func(i int) int64 {
+			// Most DoDs land in the 1- or 9-bit bucket.
+			return 1000 + int64((i*37)%5) - 2
+		}), 0, 1000},
+		{"WideJitter", mk(func(i int) int64 {
+			// Forces the 32-bit bucket via large alternating jumps.
+			if i%2 == 0 {
+				return 1_000_000
+			}
+			return 1
+		}), 0, 1_000_000},
+	}
+
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			var dec qwpGorillaDecoder
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				dec.reset(c.ts0, c.ts1, c.data)
+				for j := 2; j < n; j++ {
+					if _, err := dec.decodeNext(); err != nil {
+						b.Fatalf("decodeNext[%d]: %v", j, err)
+					}
+				}
+			}
+		})
+	}
+}
