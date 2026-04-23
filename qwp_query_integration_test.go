@@ -417,11 +417,13 @@ func TestQwpIntegrationCtxDeadlineMidStream(t *testing.T) {
 	defer c.Close(clientCtx)
 
 	// A short ctx on the Query itself; long enough to establish the
-	// stream but short enough to expire mid-flight against a 10M-row
-	// sequence.
+	// stream but short enough to expire mid-flight. The row count must
+	// give the deadline a wide window to land in: 100M int64 rows stream
+	// in ~1.2s (and linearly longer on slower CI), giving the 200ms deadline
+	// headroom on either end.
 	queryCtx, queryCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer queryCancel()
-	q := c.Query(queryCtx, "SELECT x FROM long_sequence(10000000)")
+	q := c.Query(queryCtx, "SELECT x FROM long_sequence(100000000)")
 
 	start := time.Now()
 	var iterErr error
