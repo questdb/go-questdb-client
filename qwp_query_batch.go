@@ -534,10 +534,16 @@ func arrayElementCount(l *qwpColumnLayout, row int) (nDims, elems, dataBase int)
 }
 
 // Float64Array returns the flattened (row-major) elements of a
-// DOUBLE_ARRAY cell. Returns nil for NULL rows. The returned slice
-// allocates a fresh []float64 because the wire format stores the
-// elements contiguously and Go does not permit reinterpreting a []byte
-// as []float64 without copying. Use `ArrayDim` to reshape.
+// DOUBLE_ARRAY cell. Returns nil for NULL rows. The returned slice is a
+// fresh []float64 owned by the caller; the payload is memmove'd from
+// the wire bytes via an unsafe reinterpretation. Use `ArrayDim` to
+// reshape.
+//
+// Safety: float64 is 8 bytes on every supported architecture and Go
+// stores them little-endian on all targets questdb-client supports, so
+// the wire layout matches the in-memory layout. The reinterpreted
+// source slice is only ever read by `copy`, which lowers to memmove —
+// no 8-byte-aligned load is issued against the unaligned payload.
 func (b *QwpColumnBatch) Float64Array(col, row int) []float64 {
 	l := &b.layouts[col]
 	if l.isNull(row) {
@@ -545,15 +551,16 @@ func (b *QwpColumnBatch) Float64Array(col, row int) []float64 {
 	}
 	_, elems, base := arrayElementCount(l, row)
 	out := make([]float64, elems)
-	for i := 0; i < elems; i++ {
-		off := base + i*8
-		out[i] = math.Float64frombits(binary.LittleEndian.Uint64(l.values[off : off+8]))
+	if elems > 0 {
+		src := unsafe.Slice((*float64)(unsafe.Pointer(&l.values[base])), elems)
+		copy(out, src)
 	}
 	return out
 }
 
 // Int64Array returns the flattened (row-major) elements of a LONG_ARRAY
-// cell. Returns nil for NULL rows.
+// cell. Returns nil for NULL rows. See `Float64Array` for the memmove /
+// endianness contract.
 func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
 	l := &b.layouts[col]
 	if l.isNull(row) {
@@ -561,9 +568,9 @@ func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
 	}
 	_, elems, base := arrayElementCount(l, row)
 	out := make([]int64, elems)
-	for i := 0; i < elems; i++ {
-		off := base + i*8
-		out[i] = int64(binary.LittleEndian.Uint64(l.values[off : off+8]))
+	if elems > 0 {
+		src := unsafe.Slice((*int64)(unsafe.Pointer(&l.values[base])), elems)
+		copy(out, src)
 	}
 	return out
 }
