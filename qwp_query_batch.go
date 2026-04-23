@@ -41,10 +41,8 @@ import (
 // `qwpColumnInfo` struct already defined in `qwp_integration_test.go`
 // (which is the JSON shape returned by QuestDB's /exec endpoint).
 type qwpColumnSchemaInfo struct {
-	name          string
-	wireType      qwpTypeCode
-	scale         uint8  // valid only for DECIMAL64/128/256
-	precisionBits uint16 // valid only for GEOHASH
+	name     string
+	wireType qwpTypeCode
 }
 
 // qwpSymbolEntry points to one entry in a connection-scoped symbol
@@ -82,6 +80,19 @@ type qwpSymbolDictView struct {
 // same batch with the same column width avoid reallocation.
 type qwpColumnLayout struct {
 	info *qwpColumnSchemaInfo
+
+	// scale is the decimal scale for DECIMAL64/128/256 columns. Read
+	// from the DATA section per batch; zero for non-decimal columns.
+	// Stored per-layout (not on the shared qwpColumnSchemaInfo) so the
+	// decoder's write is exclusive to the dispatcher's per-batch
+	// storage — the consumer reads its own batch's layout, which
+	// cannot be mutated concurrently.
+	scale uint8
+
+	// precisionBits is the precision in bits for GEOHASH columns. Read
+	// from the DATA section per batch; zero for non-GEOHASH columns.
+	// See `scale` for the per-layout placement rationale.
+	precisionBits uint16
 
 	// null bitmap (LSB-first; 1 = NULL). Nil when the column has no
 	// nulls in this batch; the decoder skips allocating `nonNullIdx`
@@ -132,6 +143,8 @@ type qwpColumnLayout struct {
 // across batches of the same column width.
 func (l *qwpColumnLayout) clear() {
 	l.info = nil
+	l.scale = 0
+	l.precisionBits = 0
 	l.nullBitmap = nil
 	l.nonNullCount = 0
 	l.nonNullIdx = l.nonNullIdx[:0]
@@ -226,12 +239,12 @@ func (b *QwpColumnBatch) ColumnType(col int) byte { return byte(b.columns[col].w
 
 // DecimalScale returns the decimal scale for DECIMAL64/128/256 columns.
 // Not meaningful for other types; returns 0.
-func (b *QwpColumnBatch) DecimalScale(col int) int { return int(b.columns[col].scale) }
+func (b *QwpColumnBatch) DecimalScale(col int) int { return int(b.layouts[col].scale) }
 
 // GeohashPrecisionBits returns the precision in bits for a GEOHASH
 // column. Not meaningful for other types; returns 0.
 func (b *QwpColumnBatch) GeohashPrecisionBits(col int) int {
-	return int(b.columns[col].precisionBits)
+	return int(b.layouts[col].precisionBits)
 }
 
 // IsNull reports whether the cell at (col, row) is NULL in this batch.
@@ -621,6 +634,8 @@ func (b *QwpColumnBatch) CopyAll() *SerializedBatch {
 		src := &b.layouts[i]
 		dst := &sb.layouts[i]
 		dst.info = src.info
+		dst.scale = src.scale
+		dst.precisionBits = src.precisionBits
 		// nullBitmap: aliases payload for server-sent bitmaps; owned heap
 		// buffer after array nDims=0 NULL promotion. Either way, retaining
 		// the slice header keeps the backing array reachable for the life

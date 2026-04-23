@@ -591,7 +591,7 @@ func (d *qwpQueryDecoder) parseDecimal(l *qwpColumnLayout, sizeBytes int) error 
 	if err != nil {
 		return err
 	}
-	l.info.scale = scale
+	l.scale = scale
 	return d.readFixed(l, sizeBytes)
 }
 
@@ -679,7 +679,7 @@ func (d *qwpQueryDecoder) parseGeohash(l *qwpColumnLayout) error {
 		return newQwpDecodeError(fmt.Sprintf(
 			"geohash precision out of range: %d", precBits64))
 	}
-	l.info.precisionBits = uint16(precBits64)
+	l.precisionBits = uint16(precBits64)
 	bytesPerValue := int((precBits64 + 7) / 8)
 	return d.readFixed(l, bytesPerValue)
 }

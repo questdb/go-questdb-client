@@ -232,11 +232,12 @@ func TestQwpColumnBatchFixedWidth(t *testing.T) {
 	})
 
 	t.Run("Decimal128", func(t *testing.T) {
-		info := qwpColumnSchemaInfo{name: "d128", wireType: qwpTypeDecimal128, scale: 4}
+		info := qwpColumnSchemaInfo{name: "d128", wireType: qwpTypeDecimal128}
 		values := make([]byte, 16)
 		binary.LittleEndian.PutUint64(values[0:], 0xAAAA_BBBB_CCCC_DDDD)
 		binary.LittleEndian.PutUint64(values[8:], 0x1111_2222_3333_4444)
 		layout := buildFixedLayout(&info, values, 1)
+		layout.scale = 4
 		batch := newSingleColumnBatch(info, layout, 1)
 		if got := batch.Decimal128Lo(0, 0); uint64(got) != 0xAAAA_BBBB_CCCC_DDDD {
 			t.Fatalf("Decimal128Lo = %#x", uint64(got))
