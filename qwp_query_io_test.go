@@ -25,8 +25,13 @@
 package questdb
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/binary"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -980,5 +985,154 @@ func waitForEventsCount(io *qwpEgressIO, want int, timeout time.Duration) bool {
 			return len(io.events) >= want
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// newStalledTransport returns a qwpTransport whose WebSocket conn is
+// wired to an in-process net.Pipe. The server side completes the HTTP
+// upgrade, optionally emits preSend bytes right after the upgrade
+// (for seeding a valid inbound WebSocket frame before the stall), and
+// then stops reading. Because net.Pipe is synchronous and unbuffered,
+// any subsequent client-side Write blocks until the pipe is closed.
+// Use this to simulate a hung peer (TCP zero-window, stuck
+// application) without relying on OS socket buffer sizes.
+//
+// The caller must arrange for the returned clientConn to be closed at
+// test end so a blocked Write unwinds and goroutines don't leak.
+func newStalledTransport(t *testing.T, preSend []byte) (tr *qwpTransport, clientConn net.Conn) {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+
+	stallDone := make(chan struct{})
+	t.Cleanup(func() {
+		close(stallDone)
+	})
+
+	go func() {
+		defer serverConn.Close()
+		br := bufio.NewReader(serverConn)
+		var wsKey string
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				break
+			}
+			if len(line) > 20 && strings.EqualFold(line[:19], "Sec-WebSocket-Key: ") {
+				wsKey = strings.TrimSpace(line[19:])
+			}
+		}
+		h := sha1.New()
+		h.Write([]byte(wsKey + wsAcceptGUID))
+		accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+		resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: " + accept + "\r\n" +
+			qwpHeaderVersion + ": " + fmt.Sprintf("%d", qwpVersion) + "\r\n" +
+			"\r\n"
+		if _, err := serverConn.Write([]byte(resp)); err != nil {
+			return
+		}
+		if len(preSend) > 0 {
+			if _, err := serverConn.Write(preSend); err != nil {
+				return
+			}
+		}
+		// Stall: never read again. The client's next Write blocks
+		// because net.Pipe has no buffer.
+		<-stallDone
+	}()
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(dialCtx, "ws://stall.local"+qwpReadPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			qwpHeaderMaxVersion: []string{fmt.Sprintf("%d", qwpVersion)},
+			qwpHeaderClientId:   []string{qwpClientId},
+		},
+		HTTPClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+					return clientConn, nil
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	conn.SetReadLimit(-1)
+
+	return &qwpTransport{conn: conn}, clientConn
+}
+
+// TestQwpEgressIOShutdownUnblocksStuckWrite checks that qwpEgressIO's
+// shutdown returns promptly even when the dispatcher is parked inside
+// a conn.Write that the peer has stopped draining AND the reader is
+// not currently inside conn.Read. Regression guard for sendMessage
+// passing context.Background(): with that bug the Write has no ctx
+// to observe shutdown, so it stays parked until the underlying
+// transport is torn down externally. Cancelling readCtx does NOT
+// help here — coder/websocket only tears down the underlying net.Conn
+// via the AfterFunc registered during an active Read, and that
+// AfterFunc has been unregistered by the time the reader parks on
+// frameCh.
+//
+// Scenario setup:
+//
+//  1. Server upgrades, emits one valid binary WS frame, then stalls.
+//  2. Reader receives the frame, returns from conn.Read (Read timeout
+//     AfterFunc cleared), and parks on the frameCh/shutdownCh select.
+//  3. User submits a query. Dispatcher picks it up and enters
+//     sendQueryRequest → conn.Write; net.Pipe blocks the Write because
+//     the server is no longer reading.
+//  4. shutdown is called. Reader wakes via shutdownCh and exits. The
+//     dispatcher must also wind down within the timeout — only a
+//     shutdown-aware Write ctx can guarantee that.
+func TestQwpEgressIOShutdownUnblocksStuckWrite(t *testing.T) {
+	// One valid server-to-client binary WS frame: FIN+binary opcode,
+	// 1-byte payload (content is irrelevant — the dispatcher never
+	// decodes it, because it's stuck in Write before reaching
+	// receiveLoop).
+	preSend := []byte{0x82, 0x01, 0x00}
+	tr, clientConn := newStalledTransport(t, preSend)
+	t.Cleanup(func() { _ = clientConn.Close() })
+
+	io := newQwpEgressIO(tr, 2)
+	io.start()
+
+	// Let the reader pull the pre-sent frame off the wire and park on
+	// the frameCh send — at which point it is no longer inside
+	// conn.Read and readCtx cancellation can no longer tear down the
+	// underlying net.Conn via coder/websocket's read AfterFunc.
+	time.Sleep(100 * time.Millisecond)
+
+	submitCtx, submitCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer submitCancel()
+	if err := io.submitQuery(submitCtx, qwpRequest{sql: "SELECT 1", requestId: 1}); err != nil {
+		t.Fatalf("submitQuery: %v", err)
+	}
+
+	// Give the dispatcher time to pick up the request and park inside
+	// conn.Write on the stalled pipe.
+	time.Sleep(100 * time.Millisecond)
+
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer shutCancel()
+	start := time.Now()
+	err := io.shutdown(shutCtx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("shutdown returned %v after %v; want clean return — sendMessage ctx must participate in shutdown", err, elapsed)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("shutdown took %v; want well under 500ms — dispatcher was stuck in Write past shutdown signal", elapsed)
 	}
 }

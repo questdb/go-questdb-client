@@ -192,12 +192,22 @@ type qwpEgressIO struct {
 	// consulted when creditEnabled.
 	pendingCredit atomic.Int64
 
-	// readCtx / readCancel control the reader goroutine's Read.
-	// Cancelled on shutdown() to unblock a parked Read; cancelling
-	// tears down the underlying conn (coder/websocket semantics),
+	// ioCtx / ioCancel gate every conn-level I/O this struct owns —
+	// the reader's conn.Read and the dispatcher's conn.Write calls
+	// (sendQueryRequest / sendCancel / sendCredit). Cancelled on
+	// shutdown() to unblock both sides: cancelling tears down the
+	// underlying conn via coder/websocket's ctx-driven AfterFunc,
 	// which is fine at shutdown.
-	readCtx    context.Context
-	readCancel context.CancelFunc
+	//
+	// Reusing the same ctx for both directions is deliberate. If only
+	// the reader's Read ctx is cancelled and the dispatcher is parked
+	// in Write on a peer that has stopped draining, Read's AfterFunc
+	// tears down rwc only while Read is active; between Reads (e.g.
+	// after the reader has consumed a frame and is parked on
+	// frameCh), the AfterFunc is unregistered and shutdown can't
+	// reach the dispatcher. The Write ctx closes that gap.
+	ioCtx    context.Context
+	ioCancel context.CancelFunc
 
 	// shutdownCh closes when shutdown() is called for the first time.
 	// doneCh closes when BOTH dispatcher and reader goroutines have
@@ -239,7 +249,7 @@ func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
 	if bufferPoolSize < 1 {
 		panic("qwp: bufferPoolSize must be >= 1")
 	}
-	readCtx, readCancel := context.WithCancel(context.Background())
+	ioCtx, ioCancel := context.WithCancel(context.Background())
 	io := &qwpEgressIO{
 		transport:  tr,
 		buffers:    make(chan *qwpBatchBuffer, bufferPoolSize),
@@ -247,8 +257,8 @@ func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
 		requests:   make(chan qwpRequest, 1),
 		frameCh:    make(chan qwpReaderEvent),
 		notifyCh:   make(chan struct{}, 1),
-		readCtx:    readCtx,
-		readCancel: readCancel,
+		ioCtx:      ioCtx,
+		ioCancel:   ioCancel,
 		shutdownCh: make(chan struct{}),
 		doneCh:     make(chan struct{}),
 	}
@@ -358,11 +368,14 @@ func (io *qwpEgressIO) releaseBuffer(buf *qwpBatchBuffer) {
 func (io *qwpEgressIO) shutdown(ctx context.Context) error {
 	io.shutdownOnce.Do(func() {
 		close(io.shutdownCh)
-		// Cancel the reader's Read. coder/websocket tears down the
-		// underlying TCP when the Read ctx is cancelled mid-frame —
-		// acceptable here because we are destroying the connection
-		// anyway.
-		io.readCancel()
+		// Cancel the shared I/O ctx. coder/websocket tears down the
+		// underlying TCP when an active Read or Write's ctx is
+		// cancelled — acceptable here because we are destroying the
+		// connection anyway. Cancelling both directions matters: if
+		// the dispatcher is parked inside conn.Write on a peer that
+		// has stopped draining and the reader is not currently inside
+		// conn.Read, only the Write's own ctx can unstick it.
+		io.ioCancel()
 	})
 	select {
 	case <-io.doneCh:
@@ -396,7 +409,7 @@ func (io *qwpEgressIO) notify() {
 func (io *qwpEgressIO) readerRun() {
 	defer close(io.frameCh)
 	for {
-		msgType, data, err := io.transport.conn.Read(io.readCtx)
+		msgType, data, err := io.transport.conn.Read(io.ioCtx)
 		if err != nil {
 			select {
 			case io.frameCh <- qwpReaderEvent{err: err}:
@@ -701,7 +714,7 @@ func (io *qwpEgressIO) sendQueryRequest(req qwpRequest) error {
 	io.sendBuf.putString(req.sql)
 	io.sendBuf.putVarint(uint64(req.initialCredit))
 	io.sendBuf.putVarint(0) // bind_count
-	return io.transport.sendMessage(context.Background(), io.sendBuf.bytes())
+	return io.transport.sendMessage(io.ioCtx, io.sendBuf.bytes())
 }
 
 // sendCancel builds and sends a CANCEL frame. Wire layout:
@@ -710,7 +723,7 @@ func (io *qwpEgressIO) sendCancel(requestId int64) error {
 	io.sendBuf.reset()
 	io.sendBuf.putByte(byte(qwpMsgKindCancel))
 	io.sendBuf.putInt64LE(requestId)
-	return io.transport.sendMessage(context.Background(), io.sendBuf.bytes())
+	return io.transport.sendMessage(io.ioCtx, io.sendBuf.bytes())
 }
 
 // sendCredit builds and sends a CREDIT frame. Wire layout:
@@ -720,7 +733,7 @@ func (io *qwpEgressIO) sendCredit(requestId, additionalBytes int64) error {
 	io.sendBuf.putByte(byte(qwpMsgKindCredit))
 	io.sendBuf.putInt64LE(requestId)
 	io.sendBuf.putVarint(uint64(additionalBytes))
-	return io.transport.sendMessage(context.Background(), io.sendBuf.bytes())
+	return io.transport.sendMessage(io.ioCtx, io.sendBuf.bytes())
 }
 
 // emit pushes an event to the consumer, aborting on shutdown to avoid
