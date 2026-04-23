@@ -1132,3 +1132,80 @@ func TestQwpExecDrainAfterCtxExpiry(t *testing.T) {
 		t.Errorf("Exec 2 result=%+v, want OpType=0x07 RowsAffected=5", res)
 	}
 }
+
+// TestQwpQueryYieldPanicReleasesBufferAndDrains verifies that a panic
+// raised inside the Batches() yield body does not permanently leak the
+// current batch buffer or strand the dispatcher on the in-flight query.
+// Without the panic-safe release + drain, bufferPoolSize=1 starves on
+// the first panic and a follow-up Query deadlocks on the dispatcher
+// still parked in receiveLoop for query 1.
+func TestQwpQueryYieldPanicReleasesBufferAndDrains(t *testing.T) {
+	c, cleanup := newMockQueryClient(t, 1, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// Query 1: one batch, wait for CANCEL, echo CANCELLED.
+		req1 := m.readBinary(ctx)
+		reqID1, _, _ := parseQueryRequest(t, req1)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID1, 0, "v", 42))
+		for {
+			frame := m.readBinary(ctx)
+			if frame[0] == byte(qwpMsgKindCancel) {
+				break
+			}
+		}
+		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(
+			reqID1, byte(qwpStatusCancelled), "cancelled", -1)))
+		// Query 2: one batch + RESULT_END. Proves the pool has buffers
+		// available and the dispatcher is idle.
+		req2 := m.readBinary(ctx)
+		reqID2, _, _ := parseQueryRequest(t, req2)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID2, 0, "v", 99))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID2, 0, 1)))
+	})
+	defer cleanup()
+
+	// Query 1: panic from inside the yield body. Recover the panic so
+	// the test survives, and let defer q1.Close() run on the way out.
+	func() {
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel1()
+		q1 := c.Query(ctx1, "SELECT 1")
+		defer q1.Close()
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic from yield body")
+			}
+		}()
+		for _, err := range q1.Batches() {
+			if err != nil {
+				t.Fatalf("iter err: %v", err)
+			}
+			panic("boom")
+		}
+	}()
+
+	// Query 2 must complete. With the bug:
+	//   - bufferPoolSize=1 and the batch buffer from query 1 is never
+	//     returned to the pool, so the dispatcher's handleResultBatch
+	//     blocks forever waiting for a free buffer on the next batch.
+	//   - even before that point, the dispatcher is still parked in
+	//     receiveLoop for query 1 (no CANCEL was ever sent, no drain
+	//     happened), so query 2's takeEvent never wakes.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	q2 := c.Query(ctx2, "SELECT 2")
+	defer q2.Close()
+	var saw int64
+	for b, err := range q2.Batches() {
+		if err != nil {
+			t.Fatalf("q2 err (dispatcher stranded?): %v", err)
+		}
+		saw = b.Int64(0, 0)
+	}
+	if saw != 99 {
+		t.Errorf("saw=%d, want 99", saw)
+	}
+	if q2.TotalRows() != 1 {
+		t.Errorf("q2.TotalRows=%d, want 1", q2.TotalRows())
+	}
+}

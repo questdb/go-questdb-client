@@ -537,8 +537,27 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 			}
 			switch ev.kind {
 			case qwpEventKindBatch:
-				keepGoing := yield(&ev.batch.batch, nil)
-				q.client.io.releaseBuffer(ev.batch)
+				keepGoing := false
+				func() {
+					// Release the buffer even if the caller's yield
+					// body panics. Without this, a single panic with
+					// bufferPoolSize=1 permanently starves the pool,
+					// and the dispatcher — still parked in receiveLoop
+					// for this query — blocks the next Query/Exec.
+					// On panic we also run the cancel+drain before
+					// rethrowing: the outer `defer q.done.Store(true)`
+					// has already flipped done=true, so the caller's
+					// defer q.Close() would otherwise be a no-op and
+					// leave the dispatcher stranded.
+					defer func() {
+						q.client.io.releaseBuffer(ev.batch)
+						if r := recover(); r != nil {
+							q.cancelAndDrainOnCleanupCtx()
+							panic(r)
+						}
+					}()
+					keepGoing = yield(&ev.batch.batch, nil)
+				}()
 				if !keepGoing {
 					// User broke out — request cancel and drain the
 					// remaining events until a terminal frame so the
