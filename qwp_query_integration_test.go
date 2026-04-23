@@ -258,6 +258,74 @@ func TestQwpIntegrationQueryMultipleBatches(t *testing.T) {
 	}
 }
 
+// TestQwpIntegrationCompressedBatches round-trips a SELECT with
+// compression=zstd against the live server. Verifies the accept-
+// encoding handshake negotiates zstd (if the server supports it),
+// every RESULT_BATCH's FLAG_ZSTD bit drives the decompression path,
+// and the decoded values match what we ingested. Enough rows (50) to
+// cross a batch boundary so at least one compressed batch is
+// guaranteed to be non-trivial.
+//
+// When the server does not support zstd, the handshake falls back to
+// raw per the accept-encoding semantics ("zstd;level=3,raw" lists raw
+// as an acceptable alternative). The client still succeeds; this test
+// just won't exercise the decompression path in that case. A log line
+// calls out which branch ran so test output makes the coverage
+// obvious.
+func TestQwpIntegrationCompressedBatches(t *testing.T) {
+	const tableName = "qwp_integ_query_zstd"
+	qwpDropTable(t, tableName)
+	defer qwpDropTable(t, tableName)
+	qwpSkipIfNoServer(t)
+	const totalRows = 50
+	insertRows(t, tableName, totalRows)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := NewQwpQueryClient(ctx,
+		WithQwpQueryAddress(qwpTestAddr),
+		WithQwpQueryCompression(qwpCompressionZstd),
+		WithQwpQueryMaxBatchRows(10),
+	)
+	if err != nil {
+		t.Fatalf("NewQwpQueryClient: %v", err)
+	}
+	defer c.Close(ctx)
+
+	q := c.Query(ctx, fmt.Sprintf("SELECT v FROM '%s' ORDER BY v", tableName))
+	defer q.Close()
+
+	var rows, batches, compressedBatches int
+	for batch, err := range q.Batches() {
+		if err != nil {
+			t.Fatalf("iter err: %v", err)
+		}
+		batches++
+		if len(batch.zstdScratch) > 0 {
+			compressedBatches++
+		}
+		n := batch.RowCount()
+		for r := 0; r < n; r++ {
+			want := int64(rows)
+			if got := batch.Int64(0, r); got != want {
+				t.Errorf("row %d (batch %d): got %d, want %d", rows, batches, got, want)
+			}
+			rows++
+		}
+	}
+	if rows != totalRows {
+		t.Errorf("rows=%d, want %d", rows, totalRows)
+	}
+	if q.TotalRows() != int64(totalRows) {
+		t.Errorf("TotalRows=%d, want %d", q.TotalRows(), totalRows)
+	}
+	if compressedBatches == 0 {
+		t.Logf("server accepted compression=zstd advertisement but sent no compressed batches (fell back to raw)")
+	} else {
+		t.Logf("%d of %d batches arrived zstd-compressed", compressedBatches, batches)
+	}
+}
+
 // TestQwpIntegrationCancelLongRunningQuery submits a query that runs
 // long enough to be interrupted, invokes Cancel from the iterating
 // goroutine's defer, and verifies iteration ends cleanly (the

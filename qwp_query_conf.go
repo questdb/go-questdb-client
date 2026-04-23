@@ -66,9 +66,35 @@ type qwpQueryClientConfig struct {
 	// bytes before the server parks; the client auto-replenishes as
 	// the consumer releases each batch.
 	initialCredit int64
+	// compression is the preference the client advertises on the
+	// upgrade handshake. One of "raw", "zstd", "auto". Default "raw"
+	// matches Java's library default — no compression, no handshake
+	// header, no server-side encode cost. "zstd" asks for zstd first
+	// and falls back to raw; "auto" advertises both and lets the
+	// server pick.
+	compression string
+	// compressionLevel is the zstd level hint sent via the accept-
+	// encoding header. Ignored when compression == "raw". Clamped
+	// server-side to [1, 9]; client accepts [1, 22] matching Java.
+	compressionLevel int
 	// tlsMode mirrors lineSenderConfig's three-valued TLS state.
 	tlsMode tlsMode
 }
+
+// qwpCompressionRaw / qwpCompressionZstd / qwpCompressionAuto are the
+// three valid values for qwpQueryClientConfig.compression. "raw" is
+// the library default: omits the accept-encoding header entirely so
+// servers that do not know about compression see an unchanged
+// handshake.
+const (
+	qwpCompressionRaw  = "raw"
+	qwpCompressionZstd = "zstd"
+	qwpCompressionAuto = "auto"
+)
+
+// qwpDefaultCompressionLevel matches Java QwpQueryClient's compression
+// level default. Only relevant when compression != "raw".
+const qwpDefaultCompressionLevel = 3
 
 // qwpDefaultEgressBufferPoolSize is the I/O decode pool depth when the
 // caller hasn't overridden it. Matches the Java client default
@@ -82,10 +108,26 @@ const qwpDefaultEgressBufferPoolSize = 4
 // path.
 func qwpQueryDefaultConfig() *qwpQueryClientConfig {
 	return &qwpQueryClientConfig{
-		address:        defaultHttpAddress, // "localhost:9000"
-		endpointPath:   qwpReadPath,        // "/read/v1"
-		bufferPoolSize: qwpDefaultEgressBufferPoolSize,
+		address:          defaultHttpAddress, // "localhost:9000"
+		endpointPath:     qwpReadPath,        // "/read/v1"
+		bufferPoolSize:   qwpDefaultEgressBufferPoolSize,
+		compression:      qwpCompressionRaw,
+		compressionLevel: qwpDefaultCompressionLevel,
 	}
+}
+
+// buildAcceptEncodingHeader translates the user's compression
+// preference into the X-QWP-Accept-Encoding header value. "raw"
+// returns an empty string so the transport omits the header entirely
+// (Java parity — servers that pre-date egress compression see an
+// unchanged handshake). "zstd" and "auto" both advertise
+// "zstd;level=N,raw"; the server picks one. Mirrors Java's
+// QwpQueryClient.buildAcceptEncodingHeader.
+func (c *qwpQueryClientConfig) buildAcceptEncodingHeader() string {
+	if c.compression == qwpCompressionRaw {
+		return ""
+	}
+	return fmt.Sprintf("zstd;level=%d,raw", c.compressionLevel)
 }
 
 // validate is the single-source sanity gate shared by both config entry
@@ -112,6 +154,19 @@ func (c *qwpQueryClientConfig) validate() error {
 	}
 	if c.initialCredit < 0 {
 		return fmt.Errorf("qwp query: initial credit must be >= 0, got %d", c.initialCredit)
+	}
+	switch c.compression {
+	case qwpCompressionRaw, qwpCompressionZstd, qwpCompressionAuto:
+		// ok
+	default:
+		return fmt.Errorf(
+			"qwp query: unsupported compression %q (expected raw, zstd, or auto)",
+			c.compression)
+	}
+	if c.compressionLevel < 1 || c.compressionLevel > 22 {
+		return fmt.Errorf(
+			"qwp query: compression level must be in [1, 22], got %d",
+			c.compressionLevel)
 	}
 	basicSet := c.httpUser != "" || c.httpPass != ""
 	authModes := 0
@@ -188,6 +243,21 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid initial_credit %q: %v", v, err)
 			}
 			cfg.initialCredit = n
+		case "compression":
+			switch v {
+			case qwpCompressionRaw, qwpCompressionZstd, qwpCompressionAuto:
+				cfg.compression = v
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid compression %q, expected raw, zstd, or auto", v)
+			}
+		case "compression_level":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid compression_level %q: %v", v, err)
+			}
+			cfg.compressionLevel = n
 		case "tls_verify":
 			switch v {
 			case "on":

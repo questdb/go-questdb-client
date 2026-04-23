@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"unsafe"
 )
 
 // qwpColumnSchemaInfo captures the per-column metadata carried in the
@@ -181,6 +182,20 @@ type QwpColumnBatch struct {
 	columnCount int
 	columns     []qwpColumnSchemaInfo // alias into the schema registry
 	layouts     []qwpColumnLayout     // one per column; pool-owned
+
+	// zstdScratch holds the decompressed body when the owning
+	// RESULT_BATCH carried FLAG_ZSTD. The decoder grows it to match
+	// the frame's content size and reuses the backing array across
+	// decodes into the SAME batch. The layout byte-slices alias into
+	// this buffer when the batch is compressed; `payload` is pointed
+	// at it by the decoder so the existing aliasing invariants hold
+	// without duplicating state.
+	//
+	// Lives on the batch (not on the decoder) for the same reason the
+	// layout pool does: two qwpBatchBuffers that the I/O goroutine
+	// alternates between must not share scratch storage, else
+	// decoding batch N+1 would clobber batch N's view.
+	zstdScratch []byte
 }
 
 // Payload returns the raw frame payload that backs this batch. Exposed
@@ -557,6 +572,13 @@ func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
 //     stringBytes, nullBitmap) still alias — but the batch retains the
 //     payload []byte, which coder/websocket returns fresh per frame,
 //     so the aliased bytes outlive the next decode.
+//
+// When the source batch was zstd-compressed on the wire, `payload`
+// aliased the per-batch decompression scratch — which the decoder
+// reuses across decodes into the same batch. CopyAll therefore deep-
+// clones the scratch buffer and re-points every aliasing layout slice
+// at the clone, so the snapshot survives scratch reuse on the next
+// RESULT_BATCH.
 type SerializedBatch = QwpColumnBatch
 
 // CopyAll materialises the batch into a heap-owned *SerializedBatch
@@ -567,16 +589,33 @@ type SerializedBatch = QwpColumnBatch
 //
 // Cost: one []qwpColumnLayout slice + one fresh backing slice per
 // pool-owned layout field. Payload and schema metadata are retained by
-// reference (no bulk data copy).
+// reference (no bulk data copy) — except when the source was
+// compressed, in which case the whole payload is deep-cloned once and
+// every aliasing slice is re-pointed at the clone via offset
+// translation.
 func (b *QwpColumnBatch) CopyAll() *SerializedBatch {
 	sb := &SerializedBatch{
-		payload:     b.payload,
 		requestId:   b.requestId,
 		batchSeq:    b.batchSeq,
 		rowCount:    b.rowCount,
 		columnCount: b.columnCount,
 		columns:     b.columns,
 		layouts:     make([]qwpColumnLayout, b.columnCount),
+	}
+	// When the source batch was compressed on the wire, payload
+	// aliased b.zstdScratch — a per-batch buffer the decoder reuses on
+	// the next decode into the same QwpColumnBatch. Clone the whole
+	// scratch once and translate every aliasing slice onto the clone,
+	// so the snapshot is independent of later decodes.
+	srcPayload := b.payload
+	compressed := len(b.zstdScratch) > 0
+	var clonedPayload []byte
+	if compressed {
+		clonedPayload = slices.Clone(srcPayload)
+		sb.zstdScratch = clonedPayload
+		sb.payload = clonedPayload
+	} else {
+		sb.payload = srcPayload
 	}
 	for i := 0; i < b.columnCount; i++ {
 		src := &b.layouts[i]
@@ -586,11 +625,11 @@ func (b *QwpColumnBatch) CopyAll() *SerializedBatch {
 		// buffer after array nDims=0 NULL promotion. Either way, retaining
 		// the slice header keeps the backing array reachable for the life
 		// of the SerializedBatch.
-		dst.nullBitmap = src.nullBitmap
+		dst.nullBitmap = rebindIfAliased(src.nullBitmap, srcPayload, clonedPayload)
 		dst.nonNullCount = src.nonNullCount
 		dst.nonNullIdx = slices.Clone(src.nonNullIdx)
-		dst.values = src.values
-		dst.stringBytes = src.stringBytes
+		dst.values = rebindIfAliased(src.values, srcPayload, clonedPayload)
+		dst.stringBytes = rebindIfAliased(src.stringBytes, srcPayload, clonedPayload)
 		dst.symbolRowIds = slices.Clone(src.symbolRowIds)
 		// symbolDict snapshot: heap + entries lengths are frozen at
 		// snapshot time and the decoder only ever append-extends them,
@@ -609,4 +648,36 @@ func (b *QwpColumnBatch) CopyAll() *SerializedBatch {
 		}
 	}
 	return sb
+}
+
+// rebindIfAliased returns src unchanged when clonedPayload is nil (the
+// non-compressed CopyAll path — payload bytes are stable and aliasing
+// is fine) or when src is empty. Otherwise it translates src's
+// offset+length onto clonedPayload so the snapshot references the
+// clone rather than the reusable scratch. Inputs outside srcPayload
+// (heap-owned slices — `int64sAsBytes(timestampBuf)`, promoted array
+// null bitmaps) fall through as-is; the caller's follow-up branches
+// re-point them explicitly.
+func rebindIfAliased(src, srcPayload, clonedPayload []byte) []byte {
+	if len(clonedPayload) == 0 || len(src) == 0 {
+		return src
+	}
+	if !aliases(src, srcPayload) {
+		return src
+	}
+	offset := int(uintptr(unsafe.Pointer(&src[0])) - uintptr(unsafe.Pointer(&srcPayload[0])))
+	return clonedPayload[offset : offset+len(src)]
+}
+
+// aliases reports whether sub points into the backing array of parent.
+// Compares addresses directly — the slice headers may have different
+// lengths, so len-based checks are not sufficient.
+func aliases(sub, parent []byte) bool {
+	if len(sub) == 0 || len(parent) == 0 {
+		return false
+	}
+	subAddr := uintptr(unsafe.Pointer(&sub[0]))
+	parentAddr := uintptr(unsafe.Pointer(&parent[0]))
+	parentEnd := parentAddr + uintptr(len(parent))
+	return subAddr >= parentAddr && subAddr+uintptr(len(sub)) <= parentEnd
 }

@@ -28,7 +28,25 @@ import (
 	"encoding/binary"
 	"fmt"
 	"unsafe"
+
+	// Pure-Go zstd via klauspost/compress.
+	// Future option for higher throughput: github.com/valyala/gozstd (cgo
+	// wrapper around libzstd; ~1.5-2x faster decompression at the cost of
+	// requiring a C toolchain and making cross-compilation harder).
+	"github.com/klauspost/compress/zstd"
 )
+
+// qwpZstdMaxDecompressedSize caps the decompressed payload of a single
+// RESULT_BATCH frame. Mirrors Java QwpResultBatchDecoder.MAX_SCRATCH
+// (64 MiB). The decoder reads the zstd frame header's content-size
+// field up front and rejects anything larger — this both short-circuits
+// obvious bombs and lets us size the scratch in one allocation.
+const qwpZstdMaxDecompressedSize = 64 * 1024 * 1024
+
+// qwpZstdMinScratchGrow is the floor when growing the per-batch zstd
+// scratch buffer. Matches Java's MIN_SCRATCH — amortises the first
+// allocation so bursts of small batches don't re-alloc on every frame.
+const qwpZstdMinScratchGrow = 1024 * 1024
 
 // ExecResult is the outcome of a non-SELECT statement (DDL / INSERT /
 // UPDATE / ...) submitted via the QWP egress protocol. It mirrors the
@@ -171,6 +189,27 @@ type qwpQueryDecoder struct {
 	br        qwpByteReader
 	deltaOn   bool // current frame has FLAG_DELTA_SYMBOL_DICT set
 	gorillaOn bool // current frame has FLAG_GORILLA set
+	zstdOn    bool // current frame has FLAG_ZSTD set
+
+	// zstdDec is lazy-initialised on the first FLAG_ZSTD frame the
+	// decoder sees. One decoder per connection; reused across every
+	// compressed batch. klauspost/compress/zstd is designed to be
+	// reused — DecodeAll is stateless above the decoder goroutines.
+	// Concurrency is pinned to 1 because the dispatcher only ever
+	// calls decode on one frame at a time; the default (GOMAXPROCS)
+	// spawns more workers than we have frames.
+	zstdDec *zstd.Decoder
+}
+
+// close releases decoder-owned resources. Idempotent. Called from the
+// dispatcher's exit defer so the zstd library's internal goroutines do
+// not outlive the I/O goroutines. Must be called after the last decode
+// on this instance.
+func (d *qwpQueryDecoder) close() {
+	if d.zstdDec != nil {
+		d.zstdDec.Close()
+		d.zstdDec = nil
+	}
 }
 
 // decode parses the payload of a RESULT_BATCH frame into out. The
@@ -198,6 +237,18 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	batchSeq, err := d.br.readVarintInt63()
 	if err != nil {
 		return err
+	}
+
+	// FLAG_ZSTD covers the region AFTER the batch prelude — i.e. the
+	// delta symbol section + table block + column data. The 12-byte
+	// header and (msg_kind + request_id + batch_seq) prelude stay
+	// uncompressed. Decompress into the per-batch scratch now, then
+	// rebind d.br to the plain bytes so the rest of the decoder sees
+	// exactly the layout it always has.
+	if d.zstdOn {
+		if err := d.decompressIntoBatch(out); err != nil {
+			return err
+		}
 	}
 
 	if d.deltaOn {
@@ -294,7 +345,16 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 		out.layouts = append(out.layouts, qwpColumnLayout{})
 	}
 
-	out.payload = payload
+	// When FLAG_ZSTD was set, the per-column parse reads from the
+	// decompressed scratch (d.br was rebound above), so out.payload
+	// must point at the scratch — that is what the layout byte-slices
+	// alias. The non-zstd path keeps the original payload so the
+	// lifetime contract is unchanged.
+	if d.zstdOn {
+		out.payload = out.zstdScratch
+	} else {
+		out.payload = payload
+	}
 	out.requestId = requestId
 	out.batchSeq = batchSeq
 	out.rowCount = rowCount
@@ -727,8 +787,12 @@ func qwpPeekMsgKind(payload []byte) (qwpMsgKind, error) {
 
 // parseFrameHeader validates the 12-byte QWP header, primes d.br to the
 // frame body, reads the msg_kind byte, and returns it. Sets d.deltaOn /
-// d.gorillaOn from the flags byte. Rejects FLAG_ZSTD — this client does
-// not yet implement zstd decompression.
+// d.gorillaOn / d.zstdOn from the flags byte.
+//
+// FLAG_ZSTD is only meaningful on RESULT_BATCH — the other per-kind
+// decoders reject d.zstdOn themselves. The flag has to be tracked here
+// (not in decode) so the rejection can share the validated-header
+// path.
 //
 // Shared by every per-kind decoder (decode / decodeResultEnd /
 // decodeQueryError / decodeExecDone) so header validation stays uniform.
@@ -748,10 +812,7 @@ func (d *qwpQueryDecoder) parseFrameHeader(payload []byte) (qwpMsgKind, error) {
 	flags := payload[qwpHeaderOffsetFlags]
 	d.deltaOn = flags&qwpFlagDeltaSymbolDict != 0
 	d.gorillaOn = flags&qwpFlagGorilla != 0
-	if flags&qwpFlagZstd != 0 {
-		return 0, newQwpDecodeError(
-			"FLAG_ZSTD set but zstd not yet supported in this client")
-	}
+	d.zstdOn = flags&qwpFlagZstd != 0
 	d.br.reset(payload[qwpHeaderSize:])
 	kindByte, err := d.br.readByte()
 	if err != nil {
@@ -779,6 +840,10 @@ func (d *qwpQueryDecoder) decodeResultEnd(payload []byte) (requestId int64, tota
 	if msgKind != qwpMsgKindResultEnd {
 		return 0, 0, newQwpDecodeError(fmt.Sprintf(
 			"expected RESULT_END (0x12), got 0x%02X", byte(msgKind)))
+	}
+	if d.zstdOn {
+		return 0, 0, newQwpDecodeError(
+			"FLAG_ZSTD set on non-RESULT_BATCH frame (RESULT_END)")
 	}
 	requestId, err = d.br.readInt64LE()
 	if err != nil {
@@ -814,6 +879,10 @@ func (d *qwpQueryDecoder) decodeQueryError(payload []byte) (*QwpQueryError, erro
 	if msgKind != qwpMsgKindQueryError {
 		return nil, newQwpDecodeError(fmt.Sprintf(
 			"expected QUERY_ERROR (0x13), got 0x%02X", byte(msgKind)))
+	}
+	if d.zstdOn {
+		return nil, newQwpDecodeError(
+			"FLAG_ZSTD set on non-RESULT_BATCH frame (QUERY_ERROR)")
 	}
 	requestId, err := d.br.readInt64LE()
 	if err != nil {
@@ -857,6 +926,10 @@ func (d *qwpQueryDecoder) decodeExecDone(payload []byte) (requestId int64, resul
 		return 0, ExecResult{}, newQwpDecodeError(fmt.Sprintf(
 			"expected EXEC_DONE (0x16), got 0x%02X", byte(msgKind)))
 	}
+	if d.zstdOn {
+		return 0, ExecResult{}, newQwpDecodeError(
+			"FLAG_ZSTD set on non-RESULT_BATCH frame (EXEC_DONE)")
+	}
 	requestId, err = d.br.readInt64LE()
 	if err != nil {
 		return 0, ExecResult{}, err
@@ -873,6 +946,87 @@ func (d *qwpQueryDecoder) decodeExecDone(payload []byte) (requestId int64, resul
 		OpType:       opType,
 		RowsAffected: rowsAffected,
 	}, nil
+}
+
+// decompressIntoBatch decompresses the remaining d.br bytes (the zstd
+// frame covering the delta section + table block) into out.zstdScratch
+// and rebinds d.br onto the decompressed bytes. The caller must have
+// already validated d.zstdOn and consumed the uncompressed prelude
+// (msg_kind + request_id + batch_seq) — only the region from there to
+// the end of the payload is a single zstd frame, per Java
+// QwpResultBatchDecoder.decodeBatch.
+//
+// The scratch is pre-sized from the zstd frame header's content-size
+// field. Unknown content size is treated as a protocol violation —
+// the server calls the one-shot Zstd.compress API, which leaves
+// ZSTD_c_contentSizeFlag at its default (on), so every server-emitted
+// frame declares its content size (see Java QwpResultBatchDecoder
+// line 302-307 for the same contract). A content size that exceeds
+// qwpZstdMaxDecompressedSize is rejected up front rather than driving
+// unbounded scratch growth.
+func (d *qwpQueryDecoder) decompressIntoBatch(out *QwpColumnBatch) error {
+	compressed, err := d.br.slice(d.br.remaining())
+	if err != nil {
+		return err
+	}
+	if len(compressed) == 0 {
+		return newQwpDecodeError(
+			"FLAG_ZSTD set but no compressed payload follows the prelude")
+	}
+	var hdr zstd.Header
+	if err := hdr.Decode(compressed); err != nil {
+		return wrapQwpDecodeError("invalid zstd frame header", err)
+	}
+	if !hdr.HasFCS {
+		return newQwpDecodeError(
+			"zstd frame missing content size (protocol violation)")
+	}
+	if hdr.FrameContentSize > uint64(qwpZstdMaxDecompressedSize) {
+		return newQwpDecodeError(fmt.Sprintf(
+			"zstd frame content size %d exceeds client cap %d",
+			hdr.FrameContentSize, qwpZstdMaxDecompressedSize))
+	}
+	expected := int(hdr.FrameContentSize)
+
+	// Grow the per-batch scratch in one shot. Start at qwpZstdMinScratchGrow
+	// so a burst of small batches does not re-alloc on every frame; doubling
+	// when we exceed the current capacity follows the Java MIN/MAX_SCRATCH
+	// shape. Clamp to qwpZstdMaxDecompressedSize so doubling from a current
+	// cap > 32 MiB cannot allocate past the cap — expected is already known
+	// to fit under it from the check above.
+	if cap(out.zstdScratch) < expected {
+		newCap := cap(out.zstdScratch) * 2
+		if newCap < expected {
+			newCap = expected
+		}
+		if newCap > qwpZstdMaxDecompressedSize {
+			newCap = qwpZstdMaxDecompressedSize
+		}
+		if newCap < qwpZstdMinScratchGrow {
+			newCap = qwpZstdMinScratchGrow
+		}
+		out.zstdScratch = make([]byte, 0, newCap)
+	} else {
+		out.zstdScratch = out.zstdScratch[:0]
+	}
+
+	if d.zstdDec == nil {
+		dec, err := zstd.NewReader(nil,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(uint64(qwpZstdMaxDecompressedSize)),
+		)
+		if err != nil {
+			return wrapQwpDecodeError("zstd decoder init failed", err)
+		}
+		d.zstdDec = dec
+	}
+	decoded, err := d.zstdDec.DecodeAll(compressed, out.zstdScratch)
+	if err != nil {
+		return wrapQwpDecodeError("zstd decompression failed", err)
+	}
+	out.zstdScratch = decoded
+	d.br.reset(decoded)
+	return nil
 }
 
 // int64sAsBytes reinterprets an []int64 as []byte (len*8, cap*8)

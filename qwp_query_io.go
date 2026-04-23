@@ -433,6 +433,13 @@ func (io *qwpEgressIO) dispatcherRun() {
 	// waitgroup-gated doneCh fires in start().
 	defer io.closed.Store(true)
 	defer close(io.events)
+	// Release decoder-owned resources (zstd decompression goroutines
+	// in particular) before the dispatcher itself exits. Runs LIFO
+	// relative to the defers above, which is the order we want: the
+	// last consumer that may wake on the closed events channel has
+	// already seen its terminal signal by the time decoder.close()
+	// tears down zstd state.
+	defer io.decoder.close()
 
 	for {
 		var req qwpRequest

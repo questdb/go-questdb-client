@@ -33,6 +33,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // qwpQueryCleanupDrainTimeout bounds the drain that happens on
@@ -149,6 +151,25 @@ func WithQwpQueryInitialCredit(bytes int64) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.initialCredit = bytes }
 }
 
+// WithQwpQueryCompression selects the compression codec advertised to
+// the server on the WebSocket upgrade. Accepted values: "raw" (default,
+// no compression, accept-encoding header omitted), "zstd" (demand zstd,
+// fall back to raw if the server cannot), "auto" (advertise both and
+// let the server pick). Anything else surfaces as an error from the
+// constructor. Matches Java QwpQueryClient.withCompression's
+// preference argument.
+func WithQwpQueryCompression(preference string) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.compression = preference }
+}
+
+// WithQwpQueryCompressionLevel overrides the zstd compression level
+// hint the client sends in the accept-encoding header. Ignored when
+// the compression preference is "raw". Accepts [1, 22] matching
+// Java; the server clamps down to its own supported range.
+func WithQwpQueryCompressionLevel(level int) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.compressionLevel = level }
+}
+
 // WithQwpQueryTls enables TLS with full certificate validation against
 // the system cert pool.
 func WithQwpQueryTls() QwpQueryClientOption {
@@ -207,14 +228,42 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 		endpointPath:          cfg.endpointPath,
 		authorization:         cfg.effectiveAuthorization(),
 		maxBatchRows:          cfg.maxBatchRows,
-		// acceptEncoding left empty — compression arrives in step 9.
+		acceptEncoding:        cfg.buildAcceptEncodingHeader(),
 	}
 	if err := c.transport.connect(ctx, wsURL, opts); err != nil {
 		return nil, err
 	}
+	// Early probe: if we told the server we can accept zstd, round-
+	// trip a transient decoder so any klauspost/compress init failure
+	// surfaces here on the user goroutine rather than mid-stream on
+	// the first compressed batch. Matches Java's probeZstdAvailable
+	// in intent; cheaper in pure Go since there is no JNI library to
+	// load.
+	if cfg.compression != qwpCompressionRaw {
+		if err := probeZstdAvailable(); err != nil {
+			_ = c.transport.close(ctx)
+			return nil, err
+		}
+	}
 	c.io = newQwpEgressIO(&c.transport, cfg.bufferPoolSize)
 	c.io.start()
 	return c, nil
+}
+
+// probeZstdAvailable allocates and immediately closes a zstd decoder
+// so init-time failures (allocation pressure, bundled-library issues)
+// surface synchronously at construction time. The Go port is simpler
+// than Java's because klauspost/compress is pure Go — there is no
+// native library to be missing. The probe still serves as a small
+// sanity gate and matches Java's ordering (init after upgrade so
+// transport errors surface first).
+func probeZstdAvailable() error {
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		return fmt.Errorf("qwp query: zstd decoder init failed: %w", err)
+	}
+	dec.Close()
+	return nil
 }
 
 // effectiveAuthorization computes the Authorization header value

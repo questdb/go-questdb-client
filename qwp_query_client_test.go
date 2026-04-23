@@ -142,6 +142,53 @@ func TestQwpQueryClientFromConfHappyPath(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "compression_default_is_raw",
+			conf: "ws::addr=a:1;",
+			chk: func(t *testing.T, c *qwpQueryClientConfig) {
+				if c.compression != qwpCompressionRaw {
+					t.Errorf("compression=%q, want raw", c.compression)
+				}
+				if c.compressionLevel != qwpDefaultCompressionLevel {
+					t.Errorf("compressionLevel=%d, want %d",
+						c.compressionLevel, qwpDefaultCompressionLevel)
+				}
+				if got := c.buildAcceptEncodingHeader(); got != "" {
+					t.Errorf("accept-encoding header=%q, want empty (raw)", got)
+				}
+			},
+		},
+		{
+			name: "compression_zstd_builds_header",
+			conf: "ws::addr=a:1;compression=zstd;compression_level=7;",
+			chk: func(t *testing.T, c *qwpQueryClientConfig) {
+				if c.compression != qwpCompressionZstd {
+					t.Errorf("compression=%q, want zstd", c.compression)
+				}
+				if c.compressionLevel != 7 {
+					t.Errorf("compressionLevel=%d, want 7", c.compressionLevel)
+				}
+				if got := c.buildAcceptEncodingHeader(); got != "zstd;level=7,raw" {
+					t.Errorf("accept-encoding=%q, want %q",
+						got, "zstd;level=7,raw")
+				}
+			},
+		},
+		{
+			name: "compression_auto_also_advertises_zstd",
+			conf: "ws::addr=a:1;compression=auto;",
+			chk: func(t *testing.T, c *qwpQueryClientConfig) {
+				if c.compression != qwpCompressionAuto {
+					t.Errorf("compression=%q, want auto", c.compression)
+				}
+				// "auto" advertises the same header value as "zstd";
+				// the server picks. Level defaults to 3.
+				if got := c.buildAcceptEncodingHeader(); got != "zstd;level=3,raw" {
+					t.Errorf("accept-encoding=%q, want %q",
+						got, "zstd;level=3,raw")
+				}
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -171,6 +218,10 @@ func TestQwpQueryClientFromConfErrors(t *testing.T) {
 		{"tls_on_ws", "ws::addr=a:1;tls_verify=on;", "tls_verify requires"},
 		{"tls_bad", "wss::addr=a:1;tls_verify=off;", "invalid tls_verify"},
 		{"tls_roots_rejected", "wss::addr=a:1;tls_roots=/tmp/foo;", "tls_roots is not available"},
+		{"compression_unsupported_value", "ws::addr=a:1;compression=lzma;", "invalid compression"},
+		{"compression_level_non_numeric", "ws::addr=a:1;compression=zstd;compression_level=seven;", "invalid compression_level"},
+		{"compression_level_too_low", "ws::addr=a:1;compression=zstd;compression_level=0;", "compression level must be in [1, 22]"},
+		{"compression_level_too_high", "ws::addr=a:1;compression=zstd;compression_level=23;", "compression level must be in [1, 22]"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,6 +249,8 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 		WithQwpQueryClientID("unit-test/1.0"),
 		WithQwpQueryInitialCredit(4096),
 		WithQwpQueryTlsInsecureSkipVerify(),
+		WithQwpQueryCompression(qwpCompressionZstd),
+		WithQwpQueryCompressionLevel(9),
 	} {
 		opt(cfg)
 	}
@@ -224,6 +277,15 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 	}
 	if cfg.tlsMode != tlsInsecureSkipVerify {
 		t.Errorf("tlsMode=%v", cfg.tlsMode)
+	}
+	if cfg.compression != qwpCompressionZstd {
+		t.Errorf("compression=%q", cfg.compression)
+	}
+	if cfg.compressionLevel != 9 {
+		t.Errorf("compressionLevel=%d", cfg.compressionLevel)
+	}
+	if got := cfg.buildAcceptEncodingHeader(); got != "zstd;level=9,raw" {
+		t.Errorf("accept-encoding=%q", got)
 	}
 }
 
@@ -728,7 +790,69 @@ func TestQwpQueryClientSendsEgressHeaders(t *testing.T) {
 		t.Errorf("X-QWP-Max-Batch-Rows=%q, want 1234", sawMaxBatchRows)
 	}
 	if sawAcceptEnc != "" {
-		t.Errorf("X-QWP-Accept-Encoding=%q, want empty (compression arrives in step 9)", sawAcceptEnc)
+		t.Errorf("X-QWP-Accept-Encoding=%q, want empty (default compression=raw omits the header)", sawAcceptEnc)
+	}
+}
+
+// TestQwpQueryClientSendsAcceptEncodingWhenCompressed covers the
+// compression opt-in path. When the user sets compression to "zstd"
+// or "auto", the client advertises zstd in the upgrade handshake;
+// "raw" (default, covered above) omits the header entirely.
+func TestQwpQueryClientSendsAcceptEncodingWhenCompressed(t *testing.T) {
+	cases := []struct {
+		name   string
+		opts   []QwpQueryClientOption
+		wantAE string
+	}{
+		{
+			name: "zstd_default_level",
+			opts: []QwpQueryClientOption{
+				WithQwpQueryCompression(qwpCompressionZstd),
+			},
+			wantAE: "zstd;level=3,raw",
+		},
+		{
+			name: "zstd_explicit_level",
+			opts: []QwpQueryClientOption{
+				WithQwpQueryCompression(qwpCompressionZstd),
+				WithQwpQueryCompressionLevel(7),
+			},
+			wantAE: "zstd;level=7,raw",
+		},
+		{
+			name: "auto_also_advertises_zstd",
+			opts: []QwpQueryClientOption{
+				WithQwpQueryCompression(qwpCompressionAuto),
+			},
+			wantAE: "zstd;level=3,raw",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var sawAE string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sawAE = r.Header.Get(qwpHeaderAcceptEncoding)
+				w.Header().Set(qwpHeaderVersion, "1")
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.CloseNow()
+			}))
+			defer srv.Close()
+			addr := strings.TrimPrefix(srv.URL, "http://")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			opts := append([]QwpQueryClientOption{WithQwpQueryAddress(addr)}, tc.opts...)
+			c, err := NewQwpQueryClient(ctx, opts...)
+			if err != nil {
+				t.Fatalf("ctor: %v", err)
+			}
+			defer c.Close(ctx)
+			if sawAE != tc.wantAE {
+				t.Errorf("X-QWP-Accept-Encoding=%q, want %q", sawAE, tc.wantAE)
+			}
+		})
 	}
 }
 

@@ -31,6 +31,8 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // --- Test helpers ---
@@ -837,13 +839,19 @@ func TestQwpDecoderHardening(t *testing.T) {
 		assertDecodeErrContains(t, err, "unsupported wire type")
 	})
 
-	t.Run("H26_ZstdFlagRejected", func(t *testing.T) {
+	t.Run("H26_ZstdFlagOnGarbageRejected", func(t *testing.T) {
+		// FLAG_ZSTD set but the body after the prelude is plain
+		// (uncompressed) bytes — the zstd frame-header parser rejects
+		// as "invalid zstd frame header". Same guarantee as the old
+		// "not yet supported" check: a malformed or mis-flagged batch
+		// cannot sneak past the decoder.
 		buf := writeMinimalResultBatch(0)
 		buf[qwpHeaderOffsetFlags] |= qwpFlagZstd
 		var dec qwpQueryDecoder
+		defer dec.close()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
-		assertDecodeErrContains(t, err, "zstd")
+		assertDecodeErrContains(t, err, "invalid zstd frame header")
 	})
 
 	t.Run("H18_DeltaDictOutOfSync", func(t *testing.T) {
@@ -1274,10 +1282,13 @@ func TestQwpDecoderResultEnd(t *testing.T) {
 	})
 
 	t.Run("ZstdFlagRejected", func(t *testing.T) {
+		// FLAG_ZSTD is only valid on RESULT_BATCH; carrying it on a
+		// RESULT_END frame is a protocol violation that the decoder
+		// catches at the top of decodeResultEnd.
 		frame := writeQwpFrame(qwpFlagZstd, buildResultEndBody(1, 0, 0))
 		var dec qwpQueryDecoder
 		_, _, err := dec.decodeResultEnd(frame)
-		assertDecodeErrContains(t, err, "zstd")
+		assertDecodeErrContains(t, err, "FLAG_ZSTD set on non-RESULT_BATCH")
 	})
 }
 
@@ -1537,5 +1548,398 @@ func typeCodeName(t qwpTypeCode) string {
 		return "SYMBOL"
 	default:
 		return "TYPE_" + itoa(int(t))
+	}
+}
+
+// --- zstd helpers ---
+
+// zstdCompressForTest compresses src using a real klauspost encoder
+// configured to always write the FrameContentSize field, matching what
+// the server's libzstd encoder produces with its default
+// ZSTD_c_contentSizeFlag=on.
+//
+// WithSingleSegment(true) is required because klauspost omits the FCS
+// field for frames <256 bytes in multi-segment mode (see frameenc.go).
+// libzstd has no such behavior — when the source size is known it
+// always emits FCS. Without the flag our small test payloads would
+// produce HasFCS=false frames, which the decoder correctly rejects as
+// a protocol violation, but that is not what we want to exercise on
+// the happy path. SingleSegment changes no decoded bytes — only the
+// presence of the FCS field.
+func zstdCompressForTest(t *testing.T, src []byte) []byte {
+	t.Helper()
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithSingleSegment(true),
+	)
+	if err != nil {
+		t.Fatalf("zstd.NewWriter: %v", err)
+	}
+	defer enc.Close()
+	return enc.EncodeAll(src, nil)
+}
+
+// compressResultBatchBody rewrites a RESULT_BATCH frame so its
+// post-prelude body is zstd-compressed. Input must be the raw output
+// of wrapAsResultBatch (uncompressed). The header's FLAG_ZSTD bit is
+// set and the payload-length field is rewritten to reflect the
+// shorter compressed body.
+//
+// Layout mirrors QwpWebSocketEncoder.java:
+//
+//	[12 header (FLAG_ZSTD set)] [msg_kind:1] [requestId:8] [batchSeq:varint] [ZSTD(delta + table block)]
+func compressResultBatchBody(t *testing.T, frame []byte) []byte {
+	t.Helper()
+	if len(frame) < qwpHeaderSize+1+8+1 {
+		t.Fatalf("compressResultBatchBody: frame too short (%d)", len(frame))
+	}
+	// Re-parse the prelude to know where the compressible body starts.
+	// msg_kind(1) + requestId(8) + batchSeq(varint)
+	p := qwpHeaderSize
+	if frame[p] != byte(qwpMsgKindResultBatch) {
+		t.Fatalf("compressResultBatchBody: msg_kind = 0x%02X, want RESULT_BATCH",
+			frame[p])
+	}
+	p += 1 + 8
+	_, n := binary.Uvarint(frame[p:])
+	if n <= 0 {
+		t.Fatalf("compressResultBatchBody: bad batchSeq varint at offset %d", p)
+	}
+	p += n
+
+	prelude := frame[qwpHeaderSize:p]
+	body := frame[p:]
+	compressed := zstdCompressForTest(t, body)
+
+	out := make([]byte, 0, qwpHeaderSize+len(prelude)+len(compressed))
+	out = append(out, frame[:qwpHeaderSize]...)
+	out = append(out, prelude...)
+	out = append(out, compressed...)
+	// Set FLAG_ZSTD on the header and patch the payload length.
+	out[qwpHeaderOffsetFlags] |= qwpFlagZstd
+	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:],
+		uint32(len(out)-qwpHeaderSize))
+	return out
+}
+
+// --- zstd decoder tests ---
+
+func TestQwpDecoderZstdHappyPath(t *testing.T) {
+	// Encoder-driven positive path: build a real RESULT_BATCH with a
+	// handful of rows, compress the body with klauspost's zstd encoder,
+	// and decode through the production decompression path. Asserts
+	// every typed accessor reads the same values as the uncompressed
+	// reference.
+	tb := newQwpTableBuffer("t")
+	for _, v := range []int64{1, -2, 1234567890, math.MaxInt64} {
+		col, err := tb.getOrCreateColumn("x", qwpTypeLong, false)
+		if err != nil {
+			t.Fatalf("getOrCreateColumn: %v", err)
+		}
+		col.addLong(v)
+		tb.commitRow()
+	}
+	var enc qwpEncoder
+	ingress := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+	raw := wrapAsResultBatch(ingress, 42, 7)
+	compressed := compressResultBatchBody(t, raw)
+
+	if compressed[qwpHeaderOffsetFlags]&qwpFlagZstd == 0 {
+		t.Fatal("compressResultBatchBody did not set FLAG_ZSTD")
+	}
+	if len(compressed) >= len(raw) {
+		// Small frames may not compress — we still want to assert the
+		// decoder succeeds either way. Log for visibility.
+		t.Logf("compressed frame (%d bytes) >= raw (%d bytes)",
+			len(compressed), len(raw))
+	}
+
+	var dec qwpQueryDecoder
+	defer dec.close()
+	var b QwpColumnBatch
+	if err := dec.decode(compressed, &b); err != nil {
+		t.Fatalf("decode(zstd): %v", err)
+	}
+	if b.RequestId() != 42 {
+		t.Fatalf("RequestId = %d, want 42", b.RequestId())
+	}
+	if b.BatchSeq() != 7 {
+		t.Fatalf("BatchSeq = %d, want 7", b.BatchSeq())
+	}
+	if b.RowCount() != 4 {
+		t.Fatalf("RowCount = %d, want 4", b.RowCount())
+	}
+	for i, w := range []int64{1, -2, 1234567890, math.MaxInt64} {
+		if got := b.Int64(0, i); got != w {
+			t.Fatalf("Int64[%d] = %d, want %d", i, got, w)
+		}
+	}
+	if len(b.zstdScratch) == 0 {
+		t.Fatal("zstdScratch empty after compressed decode")
+	}
+}
+
+func TestQwpDecoderZstdReusesScratchAcrossDecodes(t *testing.T) {
+	// Decode two compressed batches into the SAME QwpColumnBatch.
+	// The decoder's zstd scratch is per-batch (on QwpColumnBatch, not
+	// on the decoder), so batch N+1's decompressed bytes must land in
+	// the same backing array as batch N — growing only if N+1 needs
+	// more capacity.
+	build := func(v int64, batchSeq uint64, mode qwpSchemaMode) []byte {
+		tb := newQwpTableBuffer("t")
+		col, err := tb.getOrCreateColumn("x", qwpTypeLong, false)
+		if err != nil {
+			t.Fatalf("getOrCreateColumn: %v", err)
+		}
+		col.addLong(v)
+		tb.commitRow()
+		var enc qwpEncoder
+		ingress := enc.encodeTable(tb, mode, 0)
+		raw := wrapAsResultBatch(ingress, 1, batchSeq)
+		return compressResultBatchBody(t, raw)
+	}
+
+	var dec qwpQueryDecoder
+	defer dec.close()
+	var b QwpColumnBatch
+
+	if err := dec.decode(build(111, 0, qwpSchemaModeFull), &b); err != nil {
+		t.Fatalf("first decode: %v", err)
+	}
+	if got := b.Int64(0, 0); got != 111 {
+		t.Fatalf("first Int64 = %d, want 111", got)
+	}
+	scratchCap0 := cap(b.zstdScratch)
+
+	if err := dec.decode(build(222, 1, qwpSchemaModeReference), &b); err != nil {
+		t.Fatalf("second decode: %v", err)
+	}
+	if got := b.Int64(0, 0); got != 222 {
+		t.Fatalf("second Int64 = %d, want 222", got)
+	}
+	// Capacity should not shrink; rarely grows because batch 2 is the
+	// same shape as batch 1. Either outcome is valid — this asserts the
+	// amortisation invariant (cap is at least what we had before).
+	if cap(b.zstdScratch) < scratchCap0 {
+		t.Fatalf("zstdScratch cap shrank: was %d, now %d",
+			scratchCap0, cap(b.zstdScratch))
+	}
+}
+
+func TestQwpDecoderZstdHardening(t *testing.T) {
+	// Build a reusable uncompressed frame that every subtest derives
+	// from via surgical header / body mutation.
+	tb := newQwpTableBuffer("t")
+	col, err := tb.getOrCreateColumn("x", qwpTypeLong, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn: %v", err)
+	}
+	col.addLong(99)
+	tb.commitRow()
+	var enc qwpEncoder
+	baseRaw := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+
+	t.Run("InvalidZstdFrame", func(t *testing.T) {
+		// FLAG_ZSTD set but the body is plain (uncompressed) bytes —
+		// the Header.Decode call rejects.
+		frame := make([]byte, len(baseRaw))
+		copy(frame, baseRaw)
+		frame[qwpHeaderOffsetFlags] |= qwpFlagZstd
+		var dec qwpQueryDecoder
+		defer dec.close()
+		var b QwpColumnBatch
+		err := dec.decode(frame, &b)
+		assertDecodeErrContains(t, err, "invalid zstd frame header")
+	})
+
+	t.Run("TruncatedZstdStream", func(t *testing.T) {
+		// Compress the body, then truncate the final byte so zstd
+		// DecodeAll fails mid-stream. Header.Decode still succeeds
+		// because the header lives at the front of the frame.
+		frame := compressResultBatchBody(t, baseRaw)
+		frame = frame[:len(frame)-1]
+		// Patch payload length to reflect the shorter body.
+		binary.LittleEndian.PutUint32(frame[qwpHeaderOffsetPayloadLen:],
+			uint32(len(frame)-qwpHeaderSize))
+		var dec qwpQueryDecoder
+		defer dec.close()
+		var b QwpColumnBatch
+		err := dec.decode(frame, &b)
+		assertDecodeErrContains(t, err, "zstd decompression failed")
+	})
+
+	t.Run("MissingContentSize", func(t *testing.T) {
+		// A streaming zstd encoder with no pre-declared size writes
+		// a frame where HasFCS=false. Protocol violation per Java —
+		// the decoder must reject without decompressing.
+		//
+		// Build the body as usual but run it through NewWriter +
+		// Write + Close rather than EncodeAll.
+		p := qwpHeaderSize + 1 + 8
+		_, n := binary.Uvarint(baseRaw[p:])
+		p += n
+		body := baseRaw[p:]
+
+		var cbuf bytes.Buffer
+		w, err := zstd.NewWriter(&cbuf,
+			zstd.WithEncoderLevel(zstd.SpeedDefault),
+			zstd.WithEncoderConcurrency(1),
+		)
+		if err != nil {
+			t.Fatalf("NewWriter: %v", err)
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		compressed := cbuf.Bytes()
+
+		// Sanity: verify the streaming writer really didn't set FCS.
+		// If klauspost changes its behavior in a future version we
+		// want to know here instead of in a confusing test failure
+		// downstream.
+		var hdr zstd.Header
+		if err := hdr.Decode(compressed); err != nil {
+			t.Fatalf("streaming zstd header.Decode: %v", err)
+		}
+		if hdr.HasFCS {
+			t.Skip("streaming zstd writer emitted HasFCS=true; skipping")
+		}
+
+		out := make([]byte, 0, p+len(compressed))
+		out = append(out, baseRaw[:p]...)
+		out = append(out, compressed...)
+		out[qwpHeaderOffsetFlags] |= qwpFlagZstd
+		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:],
+			uint32(len(out)-qwpHeaderSize))
+
+		var dec qwpQueryDecoder
+		defer dec.close()
+		var b QwpColumnBatch
+		err = dec.decode(out, &b)
+		assertDecodeErrContains(t, err, "zstd frame missing content size")
+	})
+
+	t.Run("ContentSizeExceedsCap", func(t *testing.T) {
+		// Hand-craft a minimal but valid zstd frame whose FCS field
+		// declares a size just above the client cap. Header.Decode
+		// must accept the header (FCS >64 MiB is valid zstd); the
+		// decoder must reject before calling DecodeAll.
+		//
+		// zstd frame shape (RFC 8478 §3.1):
+		//   magic(4) = 0xFD2FB528
+		//   frame_header_descriptor(1) = 0b11100000
+		//     (frame_content_size_flag=3 → 8-byte FCS,
+		//      single_segment=1, no dict, no checksum)
+		//   frame_content_size(8) = huge
+		//   ... (blocks follow, but Header.Decode only needs the
+		//   prelude)
+		const hugeFCS = uint64(qwpZstdMaxDecompressedSize) + 1
+		hdr := make([]byte, 0, 13)
+		hdr = binary.LittleEndian.AppendUint32(hdr, 0xFD2FB528)
+		hdr = append(hdr, 0b11100000)
+		hdr = binary.LittleEndian.AppendUint64(hdr, hugeFCS)
+		// Add a single "raw" block (3-byte header signaling 0-byte
+		// last raw block) so Header.Decode succeeds on bounded input.
+		// block_header: last=1, block_type=raw(0), block_size=0
+		hdr = append(hdr, 0x01, 0x00, 0x00)
+
+		// Splice into a frame.
+		p := qwpHeaderSize + 1 + 8
+		_, n := binary.Uvarint(baseRaw[p:])
+		p += n
+		out := make([]byte, 0, p+len(hdr))
+		out = append(out, baseRaw[:p]...)
+		out = append(out, hdr...)
+		out[qwpHeaderOffsetFlags] |= qwpFlagZstd
+		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:],
+			uint32(len(out)-qwpHeaderSize))
+
+		var dec qwpQueryDecoder
+		defer dec.close()
+		var b QwpColumnBatch
+		err := dec.decode(out, &b)
+		assertDecodeErrContains(t, err, "exceeds client cap")
+	})
+
+	t.Run("EmptyCompressedPayload", func(t *testing.T) {
+		// FLAG_ZSTD set but there is nothing after the prelude. Not
+		// a hostile case — just a wire-level bug we must surface
+		// instead of calling Header.Decode on zero bytes.
+		p := qwpHeaderSize + 1 + 8
+		_, n := binary.Uvarint(baseRaw[p:])
+		p += n
+		out := make([]byte, p)
+		copy(out, baseRaw[:p])
+		out[qwpHeaderOffsetFlags] |= qwpFlagZstd
+		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:],
+			uint32(p-qwpHeaderSize))
+
+		var dec qwpQueryDecoder
+		defer dec.close()
+		var b QwpColumnBatch
+		err := dec.decode(out, &b)
+		assertDecodeErrContains(t, err, "FLAG_ZSTD set but no compressed payload")
+	})
+}
+
+func TestQwpDecoderZstdCloseIsIdempotent(t *testing.T) {
+	// decoder.close() must be safe to call more than once and must
+	// cope with a never-initialised zstd decoder. Exercises the nil
+	// branch of the close path.
+	var dec qwpQueryDecoder
+	dec.close()
+	dec.close()
+}
+
+func TestQwpColumnBatchCopyAllZstdSurvivesPoolReuse(t *testing.T) {
+	// CopyAll must deep-clone the zstd scratch so a snapshot stays
+	// valid after the decoder reuses the source batch's scratch for a
+	// later frame. Without the clone + alias-translation branch in
+	// CopyAll, the snapshot's byte-aliasing slices would drift onto
+	// garbage bytes.
+	buildStrings := func(values []string, batchSeq uint64, mode qwpSchemaMode) []byte {
+		tb := newQwpTableBuffer("t")
+		for _, v := range values {
+			col, err := tb.getOrCreateColumn("s", qwpTypeVarchar, false)
+			if err != nil {
+				t.Fatalf("getOrCreateColumn: %v", err)
+			}
+			col.addString(v)
+			tb.commitRow()
+		}
+		var enc qwpEncoder
+		ingress := enc.encodeTable(tb, mode, 0)
+		raw := wrapAsResultBatch(ingress, 1, batchSeq)
+		return compressResultBatchBody(t, raw)
+	}
+
+	var dec qwpQueryDecoder
+	defer dec.close()
+	var b QwpColumnBatch
+	if err := dec.decode(buildStrings([]string{"hello", "world"}, 0, qwpSchemaModeFull), &b); err != nil {
+		t.Fatalf("first decode: %v", err)
+	}
+	snap := b.CopyAll()
+	if got := snap.String(0, 0); got != "hello" {
+		t.Fatalf("snap[0] = %q, want %q", got, "hello")
+	}
+
+	// Decode a second batch into the SAME b. The decoder reuses
+	// b.zstdScratch — without the deep-clone in CopyAll the snapshot
+	// would now see the second batch's bytes.
+	if err := dec.decode(buildStrings([]string{"x", "y"}, 1, qwpSchemaModeReference), &b); err != nil {
+		t.Fatalf("second decode: %v", err)
+	}
+	if got := snap.String(0, 0); got != "hello" {
+		t.Fatalf("snap[0] after reuse = %q, want %q (CopyAll didn't clone scratch)",
+			got, "hello")
+	}
+	if got := snap.String(0, 1); got != "world" {
+		t.Fatalf("snap[1] after reuse = %q, want %q",
+			got, "world")
 	}
 }
