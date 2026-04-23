@@ -105,26 +105,41 @@ func (d *qwpConnDict) appendDelta(br *qwpByteReader) error {
 			"delta symbol dict out of sync: expected start=%d, got=%d",
 			d.size(), deltaStart))
 	}
+	// Hoist buf+pos as locals so the per-entry varint read can stay a
+	// one-byte load+branch. The function-call boundary of
+	// readVarintInt63 / qwpReadVarint blocks inlining; symbol entries
+	// are typically short strings whose length encodes in a single byte.
+	buf := br.buf
+	bufLen := len(buf)
+	pos := br.pos
 	for i := int64(0); i < deltaCount; i++ {
-		entryLen, err := br.readVarintInt63()
-		if err != nil {
-			return err
+		var entryLen uint64
+		if pos < bufLen && buf[pos] < 0x80 {
+			entryLen = uint64(buf[pos])
+			pos++
+		} else {
+			br.pos = pos
+			v, err := br.readVarintInt63()
+			if err != nil {
+				return err
+			}
+			pos = br.pos
+			entryLen = uint64(v)
 		}
-		if entryLen < 0 {
-			return newQwpDecodeError(fmt.Sprintf(
-				"negative delta symbol entry length: %d", entryLen))
+		if entryLen > uint64(bufLen-pos) {
+			br.pos = pos
+			return newQwpDecodeError("unexpected end of buffer while slicing")
 		}
-		bytes, err := br.slice(int(entryLen))
-		if err != nil {
-			return err
-		}
+		end := pos + int(entryLen)
 		offset := uint32(len(d.heap))
-		d.heap = append(d.heap, bytes...)
+		d.heap = append(d.heap, buf[pos:end]...)
 		d.entries = append(d.entries, qwpSymbolEntry{
 			offset: offset,
 			length: uint32(entryLen),
 		})
+		pos = end
 	}
+	br.pos = pos
 	return nil
 }
 
@@ -650,22 +665,44 @@ func (d *qwpQueryDecoder) parseSymbol(l *qwpColumnLayout, rowCount int) error {
 	} else {
 		l.symbolRowIds = l.symbolRowIds[:rowCount]
 	}
-	dictSize := len(l.symbolDict.entries)
+	dictSize := uint64(len(l.symbolDict.entries))
 	noNulls := l.nullBitmap == nil
+	// Hoist the byte buffer + position into locals: symbol-heavy result
+	// sets visit this loop once per non-null row, and going through the
+	// readVarintInt63 / qwpReadVarint call boundary on every iteration
+	// blocks inlining of what's otherwise a one-byte fast path.
+	buf := d.br.buf
+	bufLen := len(buf)
+	pos := d.br.pos
 	for i := 0; i < rowCount; i++ {
 		if !noNulls && l.nonNullIdx[i] < 0 {
 			continue
 		}
-		id64, err := d.br.readVarintInt63()
-		if err != nil {
-			return err
+		var id uint64
+		if pos < bufLen && buf[pos] < 0x80 {
+			// Fast path: single-byte varint (id < 128). Covers typical
+			// categorical columns where the dictionary is small.
+			id = uint64(buf[pos])
+			pos++
+		} else {
+			// Cold path: multi-byte varint, EOF, or overflow. Sync pos
+			// back to the reader and let it produce the wrapped error.
+			d.br.pos = pos
+			v, err := d.br.readVarintInt63()
+			if err != nil {
+				return err
+			}
+			pos = d.br.pos
+			id = uint64(v)
 		}
-		if id64 < 0 || int(id64) >= dictSize {
+		if id >= dictSize {
+			d.br.pos = pos
 			return newQwpDecodeError(fmt.Sprintf(
-				"symbol index out of range: %d", id64))
+				"symbol index out of range: %d", id))
 		}
-		l.symbolRowIds[i] = int32(id64)
+		l.symbolRowIds[i] = int32(id)
 	}
+	d.br.pos = pos
 	return nil
 }
 
