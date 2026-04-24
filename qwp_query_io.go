@@ -327,6 +327,15 @@ func (io *qwpEgressIO) submitQuery(ctx context.Context, req qwpRequest) error {
 	if err := io.loadIoErr(); err != nil {
 		return err
 	}
+	// Non-blocking shutdown check first: if shutdownCh is already
+	// closed, Go's select would otherwise non-deterministically pick
+	// the buffered requests slot, leaving the request to rot after
+	// the dispatcher has already returned.
+	select {
+	case <-io.shutdownCh:
+		return errors.New("qwp: I/O goroutine shut down")
+	default:
+	}
 	select {
 	case io.requests <- req:
 		return nil
