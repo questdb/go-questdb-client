@@ -345,7 +345,7 @@ func BenchmarkQwpColumnAdd(b *testing.B) {
 // qwpBitReader.readBits / readBitsSlow.
 func BenchmarkQwpGorillaDecode(b *testing.B) {
 	const n = 4096
-	mk := func(stepFn func(i int) int64) []byte {
+	mk := func(stepFn func(i int) int64) ([]byte, int64, int64) {
 		ts := make([]int64, n)
 		var cur int64
 		for i := range ts {
@@ -357,8 +357,21 @@ func BenchmarkQwpGorillaDecode(b *testing.B) {
 		enc.encodeTimestamps(&wb, intsToBytes(ts), n)
 		// Strip the 16-byte uncompressed prefix the bit reader doesn't
 		// touch — the decoder's reset() takes only the bit-packed tail.
-		return append([]byte(nil), wb.bytes()[16:]...)
+		return append([]byte(nil), wb.bytes()[16:]...), ts[0], ts[1]
 	}
+
+	constantData, constantTs0, constantTs1 := mk(func(int) int64 { return 1000 })
+	smallData, smallTs0, smallTs1 := mk(func(i int) int64 {
+		// Most DoDs land in the 1- or 9-bit bucket.
+		return 1000 + int64((i*37)%5) - 2
+	})
+	wideData, wideTs0, wideTs1 := mk(func(i int) int64 {
+		// Forces the 32-bit bucket via large alternating jumps.
+		if i%2 == 0 {
+			return 1_000_000
+		}
+		return 1
+	})
 
 	cases := []struct {
 		name string
@@ -366,18 +379,9 @@ func BenchmarkQwpGorillaDecode(b *testing.B) {
 		ts0  int64
 		ts1  int64
 	}{
-		{"ConstantDelta", mk(func(int) int64 { return 1000 }), 0, 1000},
-		{"SmallJitter", mk(func(i int) int64 {
-			// Most DoDs land in the 1- or 9-bit bucket.
-			return 1000 + int64((i*37)%5) - 2
-		}), 0, 1000},
-		{"WideJitter", mk(func(i int) int64 {
-			// Forces the 32-bit bucket via large alternating jumps.
-			if i%2 == 0 {
-				return 1_000_000
-			}
-			return 1
-		}), 0, 1_000_000},
+		{"ConstantDelta", constantData, constantTs0, constantTs1},
+		{"SmallJitter", smallData, smallTs0, smallTs1},
+		{"WideJitter", wideData, wideTs0, wideTs1},
 	}
 
 	for _, c := range cases {
