@@ -232,7 +232,7 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 				return len(lines) == numThreads
 			}
 		}
-	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
+	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d", numThreads, len(lines))
 }
 
 func TestTcpNotSupported(t *testing.T) {
