@@ -1200,7 +1200,7 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 		flushErr = s.flush0(ctx)
 	}
 
-	closeErr := s.transport.close(ctx)
+	closeErr := s.transport.close()
 
 	if flushErr != nil {
 		return flushErr

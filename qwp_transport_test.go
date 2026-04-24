@@ -132,7 +132,7 @@ func TestQwpTransportNotConnected(t *testing.T) {
 	}
 
 	// close on unconnected should be no-op.
-	if err := tr.close(context.Background()); err != nil {
+	if err := tr.close(); err != nil {
 		t.Fatalf("close on unconnected: %v", err)
 	}
 }
@@ -178,7 +178,7 @@ func TestQwpTransportConnectAndClose(t *testing.T) {
 		t.Fatal("conn should not be nil after connect")
 	}
 
-	err = tr.close(context.Background())
+	err = tr.close()
 	if err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestQwpTransportNegotiationHeaders(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	if gotMaxVersion != "1" {
 		t.Errorf("X-QWP-Max-Version = %q, want %q", gotMaxVersion, "1")
@@ -246,7 +246,7 @@ func TestQwpTransportVersionMatchAccepted(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 }
 
 // TestQwpTransportVersionMissingRejected verifies that a server response
@@ -271,7 +271,7 @@ func TestQwpTransportVersionMissingRejected(t *testing.T) {
 	var tr qwpTransport
 	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath})
 	if err == nil {
-		tr.close(context.Background())
+		tr.close()
 		t.Fatal("expected missing-version error")
 	}
 	if !strings.Contains(err.Error(), qwpHeaderVersion) {
@@ -304,7 +304,7 @@ func TestQwpTransportVersionMismatchRejected(t *testing.T) {
 	var tr qwpTransport
 	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath})
 	if err == nil {
-		tr.close(context.Background())
+		tr.close()
 		t.Fatal("expected version mismatch error")
 	}
 	if !strings.Contains(err.Error(), "version") {
@@ -343,7 +343,7 @@ func TestQwpTransportSendAndReceive(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	// Build a simple QWP message.
 	tb := newQwpTableBuffer("test")
@@ -386,7 +386,7 @@ func TestQwpTransportAckWithError(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	// Send dummy message.
 	if err := tr.sendMessage(context.Background(), []byte{0x00}); err != nil {
@@ -418,7 +418,7 @@ func TestQwpIntegrationConnect(t *testing.T) {
 	if err != nil {
 		t.Skipf("QuestDB not available: %v", err)
 	}
-	defer tr.close(ctx)
+	defer tr.close()
 
 	// Send a simple QWP message with delta symbol dict (required
 	// by the server for symbol columns) and verify the ACK.
@@ -465,7 +465,7 @@ func TestQwpTransportSendAndAckSuccess(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	msg := []byte{0x51, 0x57, 0x50, 0x31} // dummy
 	if err := tr.sendAndAck(context.Background(), func() []byte { return msg }); err != nil {
@@ -486,7 +486,7 @@ func TestQwpTransportSendAndAckServerError(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	err := tr.sendAndAck(context.Background(), func() []byte { return []byte{0x00} })
 	if err == nil {
@@ -520,7 +520,7 @@ func TestReadAckRejectsOversizedOK(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	if err := tr.sendMessage(context.Background(), []byte{0x00}); err != nil {
 		t.Fatal(err)
@@ -554,7 +554,7 @@ func TestReadAckRejectsErrorLengthMismatch(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	if err := tr.sendMessage(context.Background(), []byte{0x00}); err != nil {
 		t.Fatal(err)
@@ -588,7 +588,7 @@ func TestReadAckSkipsTextFrames(t *testing.T) {
 	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	if err := tr.sendMessage(context.Background(), []byte{0x00}); err != nil {
 		t.Fatal(err)
@@ -655,7 +655,7 @@ func TestQwpTransportEgressUpgrade(t *testing.T) {
 			maxBatchRows:   10_000,
 		}
 		require.NoError(t, tr.connect(context.Background(), wsURL, opts))
-		defer tr.close(context.Background())
+		defer tr.close()
 
 		assert.Equal(t, qwpReadPath, got.path)
 		assert.Equal(t, "zstd;level=3,raw", got.acceptEncoding)
@@ -671,7 +671,7 @@ func TestQwpTransportEgressUpgrade(t *testing.T) {
 		var tr qwpTransport
 		opts := qwpTransportOpts{endpointPath: qwpWritePath}
 		require.NoError(t, tr.connect(context.Background(), wsURL, opts))
-		defer tr.close(context.Background())
+		defer tr.close()
 
 		assert.Equal(t, qwpWritePath, got.path)
 		assert.False(t, got.hasAcceptEnc, "accept-encoding must be omitted on ingest")
@@ -701,7 +701,7 @@ func TestQwpTransportEgressUpgrade(t *testing.T) {
 			maxBatchRows:   0,
 		}
 		require.NoError(t, tr.connect(context.Background(), wsURL, opts))
-		defer tr.close(context.Background())
+		defer tr.close()
 
 		assert.Equal(t, qwpReadPath, got.path)
 		assert.False(t, got.hasAcceptEnc, "empty acceptEncoding must omit header")
@@ -720,7 +720,7 @@ func TestQwpTransportEgressUpgrade(t *testing.T) {
 			maxBatchRows: 1,
 		}
 		require.NoError(t, tr.connect(context.Background(), wsURL, opts))
-		defer tr.close(context.Background())
+		defer tr.close()
 
 		assert.False(t, got.hasAcceptEnc)
 		assert.Equal(t, "1", got.maxBatchRows)

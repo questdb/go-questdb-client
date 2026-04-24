@@ -276,7 +276,7 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 	// load.
 	if cfg.compression != qwpCompressionRaw {
 		if err := probeZstdAvailable(); err != nil {
-			_ = c.transport.close(ctx)
+			_ = c.transport.close()
 			return nil, err
 		}
 	}
@@ -335,7 +335,7 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 				firstErr = err
 			}
 		}
-		if err := c.transport.close(ctx); err != nil && firstErr == nil {
+		if err := c.transport.close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	})

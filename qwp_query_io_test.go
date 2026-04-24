@@ -191,7 +191,7 @@ func TestQwpEgressIOHappyPathSelect(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 4)
 	io.start()
@@ -223,7 +223,7 @@ func TestQwpEgressIOExecDone(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -261,7 +261,7 @@ func TestQwpEgressIOQueryError(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -317,7 +317,7 @@ func TestQwpEgressIOCancel(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -376,7 +376,7 @@ func TestQwpEgressIOShutdownUnblocksRead(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -418,7 +418,7 @@ func TestQwpEgressIOPoolBackpressure(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 1) // pool of size 1
 	io.start()
@@ -499,7 +499,7 @@ func TestQwpEgressIOCreditReplenish(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -559,7 +559,7 @@ func TestQwpEgressIOUnknownMsgKind(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 1)
 	io.start()
@@ -631,7 +631,7 @@ func TestQwpEgressIOCacheResetBetweenQueries(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -697,7 +697,7 @@ func TestQwpEgressIOCacheResetTruncatedPoisons(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 1)
 	io.start()
@@ -741,7 +741,7 @@ func TestQwpEgressIOConcurrentCancelAndShutdown(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -790,7 +790,7 @@ func TestQwpEgressIODecodeFailure(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	const poolSize = 2
 	io := newQwpEgressIO(tr, poolSize)
@@ -844,7 +844,7 @@ func TestQwpEgressIODecodeFailurePoisons(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -906,7 +906,7 @@ func TestQwpEgressIOReleaseAfterShutdown(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -996,7 +996,7 @@ func TestQwpEgressIOTakeEventWakesOnShutdown(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()
@@ -1067,7 +1067,7 @@ func TestQwpEgressIOShutdownPreservesQueuedEvents(t *testing.T) {
 	defer srv.Close()
 
 	tr := connectEgress(t, srv.URL)
-	defer tr.close(context.Background())
+	defer tr.close()
 
 	io := newQwpEgressIO(tr, 2)
 	io.start()

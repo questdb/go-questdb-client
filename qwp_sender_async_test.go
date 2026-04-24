@@ -348,7 +348,7 @@ func TestQwpAsyncIoLoopSendAndAck(t *testing.T) {
 	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer transport.close(context.Background())
+	defer transport.close()
 
 	// Create async state with window=2.
 	a := newQwpAsyncState(2, &transport)
@@ -414,7 +414,7 @@ func TestQwpAsyncIoLoopServerError(t *testing.T) {
 	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer transport.close(context.Background())
+	defer transport.close()
 
 	a := newQwpAsyncState(2, &transport)
 	a.start()
@@ -535,7 +535,7 @@ func TestQwpAsyncGoroutineLeakOnClose(t *testing.T) {
 	}
 	a.mu.Unlock()
 
-	transport.close(context.Background())
+	transport.close()
 }
 
 func TestQwpAsyncCloseAfterError(t *testing.T) {
@@ -679,7 +679,7 @@ func TestQwpAsyncCumulativeAck(t *testing.T) {
 	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer transport.close(context.Background())
+	defer transport.close()
 
 	a := newQwpAsyncState(batches, &transport)
 	a.start()
@@ -740,7 +740,7 @@ func TestQwpAsyncServerOverAcksIsProtocolError(t *testing.T) {
 	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer transport.close(context.Background())
+	defer transport.close()
 
 	a := newQwpAsyncState(2, &transport)
 	a.start()
@@ -795,7 +795,7 @@ func TestQwpAsyncErrorAckCarriesSequence(t *testing.T) {
 	if err := transport.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 		t.Fatal(err)
 	}
-	defer transport.close(context.Background())
+	defer transport.close()
 
 	a := newQwpAsyncState(4, &transport)
 	a.start()

@@ -57,7 +57,6 @@ const (
 	qwpHeaderVersion         = "X-QWP-Version"
 	qwpHeaderAcceptEncoding  = "X-QWP-Accept-Encoding"
 	qwpHeaderMaxBatchRows    = "X-QWP-Max-Batch-Rows"
-	qwpHeaderContentEncoding = "X-QWP-Content-Encoding"
 )
 
 // qwpClientId is sent in X-QWP-Client-Id during the upgrade handshake.
@@ -199,10 +198,10 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	}
 
 	conn, resp, err := websocket.Dial(ctx, wsURL, dialOpts)
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+	}
 	if err != nil {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
 		return fmt.Errorf("qwp: websocket dial: %w", err)
 	}
 
@@ -324,7 +323,7 @@ func parseAckSequence(data []byte) int64 {
 }
 
 // close sends a graceful WebSocket close frame and cleans up.
-func (t *qwpTransport) close(ctx context.Context) error {
+func (t *qwpTransport) close() error {
 	if t.conn == nil {
 		return nil
 	}

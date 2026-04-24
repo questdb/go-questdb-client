@@ -113,7 +113,6 @@ const qwpVersion byte = 0x01
 const (
 	qwpHeaderSize              = 12
 	qwpHeaderOffsetFlags       = 5
-	qwpHeaderOffsetTableCount  = 6
 	qwpHeaderOffsetPayloadLen  = 8
 )
 
