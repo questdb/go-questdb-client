@@ -27,7 +27,6 @@ package questdb
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -1799,12 +1798,6 @@ func assertDecodeErrContains(t *testing.T, err error, substr string) {
 	t.Helper()
 	if err == nil {
 		t.Fatalf("expected error containing %q, got nil", substr)
-	}
-	var de *qwpDecodeError
-	if !errors.As(err, &de) {
-		// Magic / version / msgKind errors don't go through qwpDecodeError
-		// right now if they are constructed directly — accept either type,
-		// but still check for substring.
 	}
 	if !strings.Contains(err.Error(), substr) {
 		t.Fatalf("error %q does not contain %q", err.Error(), substr)
