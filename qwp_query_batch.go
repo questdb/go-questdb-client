@@ -583,8 +583,6 @@ func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
 	return out
 }
 
-// --- Column handle ---
-//
 // QwpColumn is a cached view over a single column of a QwpColumnBatch.
 // It captures the column's layout pointer once so per-row accessors
 // avoid the per-cell bounds-checked indexing into the batch's layout

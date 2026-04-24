@@ -535,6 +535,39 @@ func writeMinimalResultBatchWithRawNameLenVarint(nameLenVarint []byte) []byte {
 	return out
 }
 
+// writeStringResultBatchCustom builds a RESULT_BATCH with one VARCHAR
+// column, len(offsets)-1 non-null rows, and the provided offsets /
+// payload stamped verbatim into the frame. Used by the offset-validation
+// hardening subtests.
+func writeStringResultBatchCustom(offsets []uint32, payload []byte) []byte {
+	nonNull := len(offsets) - 1
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
+	buf.WriteByte(qwpVersion)
+	buf.WriteByte(0)
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+	buf.WriteByte(byte(qwpMsgKindResultBatch))
+	_ = binary.Write(&buf, binary.LittleEndian, uint64(7))
+	putVarintBytes(&buf, 0)
+	putVarintBytes(&buf, 0)
+	putVarintBytes(&buf, uint64(nonNull))
+	putVarintBytes(&buf, 1)
+	buf.WriteByte(byte(qwpSchemaModeFull))
+	putVarintBytes(&buf, 0)
+	putVarintBytes(&buf, 1)
+	buf.WriteByte('s')
+	buf.WriteByte(byte(qwpTypeVarchar))
+	buf.WriteByte(0)
+	for _, off := range offsets {
+		_ = binary.Write(&buf, binary.LittleEndian, off)
+	}
+	buf.Write(payload)
+	out := buf.Bytes()
+	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
+	return out
+}
+
 // writeStringResultBatch builds a RESULT_BATCH with one VARCHAR column,
 // nonNull rows, and the given totalBytes value stamped into
 // offsets[nonNull]. Used by the negative-totalBytes regression.
@@ -757,6 +790,34 @@ func TestQwpDecoderHardening(t *testing.T) {
 		if got := b.String(0, 0); got != "hello" {
 			t.Fatalf("String = %q, want hello", got)
 		}
+	})
+
+	t.Run("H17a_StringOffsetsNotMonotonic", func(t *testing.T) {
+		// Row 0 spans [0, 8), row 1 spans [8, 5) — slicing would
+		// panic in qwpStringSlice.
+		buf := writeStringResultBatchCustom([]uint32{0, 8, 5}, []byte("helloworld"))
+		var dec qwpQueryDecoder
+		var b QwpColumnBatch
+		err := dec.decode(buf, &b)
+		assertDecodeErrContains(t, err, "offset at index")
+	})
+
+	t.Run("H17b_StringOffsetExceedsTotalBytes", func(t *testing.T) {
+		// Row 0 claims to run to offset 11 but totalBytes = 10 —
+		// the final slice is length 10, so end=11 would panic.
+		buf := writeStringResultBatchCustom([]uint32{0, 11, 10}, []byte("0123456789"))
+		var dec qwpQueryDecoder
+		var b QwpColumnBatch
+		err := dec.decode(buf, &b)
+		assertDecodeErrContains(t, err, "offset at index")
+	})
+
+	t.Run("H17c_StringFirstOffsetNotZero", func(t *testing.T) {
+		buf := writeStringResultBatchCustom([]uint32{3, 5}, []byte("hello"))
+		var dec qwpQueryDecoder
+		var b QwpColumnBatch
+		err := dec.decode(buf, &b)
+		assertDecodeErrContains(t, err, "first offset")
 	})
 
 	t.Run("H25_UnsupportedWireTypeString", func(t *testing.T) {

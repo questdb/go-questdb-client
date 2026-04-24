@@ -713,6 +713,26 @@ func (d *qwpQueryDecoder) parseString(l *qwpColumnLayout) error {
 		return newQwpDecodeError(fmt.Sprintf(
 			"invalid string column total bytes: %d", totalBytes))
 	}
+	// Validate intermediate offsets so qwpStringSlice cannot panic on
+	// a malformed frame: first offset must be 0, and each offset must
+	// be non-decreasing and <= totalBytes.
+	if l.nonNullCount > 0 {
+		if first := binary.LittleEndian.Uint32(offsets); first != 0 {
+			return newQwpDecodeError(fmt.Sprintf(
+				"invalid string column first offset: %d (expected 0)", first))
+		}
+		total := uint32(totalBytes)
+		prev := uint32(0)
+		for i := 1; i <= l.nonNullCount; i++ {
+			off := binary.LittleEndian.Uint32(offsets[i*4:])
+			if off < prev || off > total {
+				return newQwpDecodeError(fmt.Sprintf(
+					"invalid string column offset at index %d: %d (prev=%d, total=%d)",
+					i, off, prev, total))
+			}
+			prev = off
+		}
+	}
 	stringBytes, err := d.br.slice(int(totalBytes))
 	if err != nil {
 		return err
