@@ -182,7 +182,9 @@ func (r *qwpBitReader) readSigned(n int) (int64, error) {
 //	"1111"+ s32    → any other DoD               (36 bits)
 //
 // Prefix bits are read LSB-first, so the encoder's 0b01 for "10" is
-// observed here as readBit=0 then readBit=1 in that order.
+// observed here as readBit=1 then readBit=0 — the leading 1 falls past
+// the "b==0 → DoD=0" check, and the trailing 0 selects the 7-bit
+// signed payload for the "10" bucket.
 type qwpGorillaDecoder struct {
 	br        qwpBitReader
 	prevTs    int64
