@@ -799,16 +799,15 @@ func (d *qwpQueryDecoder) parseGeohash(l *qwpColumnLayout) error {
 	return d.readFixed(l, bytesPerValue)
 }
 
-// parseArray reads per-row array entries (skipping NULL rows per the
-// Java reference decoder) and bookkeeps (start, length) into
-// layout.values for each row. The values slice is set to alias the
-// entire array-data region of the payload so accessors can address
-// elements by (row-start + offset).
+// parseArray reads per-row array entries (skipping NULL rows flagged
+// in the null bitmap) and bookkeeps (start, length) into layout.values
+// for each row. The values slice is set to alias the entire array-data
+// region of the payload so accessors can address elements by
+// (row-start + offset).
 //
-// An inline nDims byte of 0 is the Java reference's NULL sentinel for
-// an array row: the decoder marks the row NULL (promoting the null
-// bitmap to an owned, mutable copy the first time it is needed) and
-// consumes no further bytes for that row.
+// The server encodes a NULL array via the null bitmap, never inline,
+// so a non-null row must carry nDims >= 1. An inline nDims of 0 is
+// rejected as a malformed frame.
 func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 	base := d.br.pos
 	if cap(l.arrayRowStart) < rowCount {
@@ -822,7 +821,6 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 		l.arrayElems = l.arrayElems[:rowCount]
 	}
 	noNulls := l.nullBitmap == nil
-	ownedBitmap := false
 	for i := 0; i < rowCount; i++ {
 		if !noNulls && l.nonNullIdx[i] < 0 {
 			l.arrayRowStart[i] = 0
@@ -835,26 +833,9 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 			return err
 		}
 		nDims := int(nDimsByte)
-		if nDims == 0 {
-			// nDims=0 is the NULL sentinel in the Java reference.
-			// Promote the null bitmap to an owned copy (creating a
-			// fresh zeroed one if none was sent) so we can set the
-			// bit, then consume no further bytes for this row.
-			if !ownedBitmap {
-				owned := make([]byte, (rowCount+7)>>3)
-				copy(owned, l.nullBitmap)
-				l.nullBitmap = owned
-				ownedBitmap = true
-			}
-			l.nullBitmap[i>>3] |= 1 << (i & 7)
-			l.nonNullCount--
-			l.arrayRowStart[i] = 0
-			l.arrayElems[i] = 0
-			continue
-		}
-		if nDims > qwpMaxArrayNDims {
+		if nDims < 1 || nDims > qwpMaxArrayNDims {
 			return newQwpDecodeError(fmt.Sprintf(
-				"ARRAY nDims out of range [0, %d]: %d", qwpMaxArrayNDims, nDims))
+				"ARRAY nDims out of range [1, %d]: %d", qwpMaxArrayNDims, nDims))
 		}
 		shapeBytes, err := d.br.slice(4 * nDims)
 		if err != nil {

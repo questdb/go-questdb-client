@@ -515,9 +515,9 @@ func TestQwpColumnBatchInt64Array2D(t *testing.T) {
 
 func TestQwpColumnBatchEmptyArrayViaZeroShape(t *testing.T) {
 	// A non-null 1-D empty array is encoded as (nDims=1, dim0=0): 5
-	// bytes of shape, 0 bytes of elements. Distinct from the NULL
-	// sentinel (nDims=0, 1 byte) — accessors should report a real
-	// 1-D array with zero length, not a NULL row.
+	// bytes of shape, 0 bytes of elements. Distinct from a NULL row
+	// (null bitmap bit set, no inline bytes) — accessors should
+	// report a real 1-D array with zero length.
 	info := qwpColumnSchemaInfo{name: "a", wireType: qwpTypeDoubleArray}
 	var buf bytes.Buffer
 	buf.WriteByte(1) // nDims

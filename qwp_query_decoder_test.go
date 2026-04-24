@@ -380,56 +380,6 @@ func TestQwpDecoderRoundTripFloat64Array(t *testing.T) {
 	}
 }
 
-func TestQwpDecoderRoundTripArrayNullSentinel(t *testing.T) {
-	// Non-nullable DOUBLE_ARRAY column with an interleaved null row.
-	// The encoder emits the 1-byte nDims=0 NULL sentinel for that row
-	// and the decoder must report it as NULL through IsNull and the
-	// array accessors.
-	tb := newQwpTableBuffer("t")
-	col, err := tb.getOrCreateColumn("a", qwpTypeDoubleArray, false)
-	if err != nil {
-		t.Fatalf("getOrCreateColumn: %v", err)
-	}
-	col.addDoubleArray(1, []int32{2}, []float64{1.5, 2.5})
-	tb.commitRow()
-	col, _ = tb.getOrCreateColumn("a", qwpTypeDoubleArray, false)
-	col.addNull()
-	tb.commitRow()
-	col, _ = tb.getOrCreateColumn("a", qwpTypeDoubleArray, false)
-	col.addDoubleArray(1, []int32{1}, []float64{3.5})
-	tb.commitRow()
-
-	var enc qwpEncoder
-	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
-
-	var dec qwpQueryDecoder
-	var batch QwpColumnBatch
-	if err := dec.decode(frame, &batch); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if batch.IsNull(0, 0) {
-		t.Fatalf("row 0 should be non-null")
-	}
-	if !batch.IsNull(0, 1) {
-		t.Fatalf("row 1 should be NULL (nDims=0 sentinel)")
-	}
-	if batch.IsNull(0, 2) {
-		t.Fatalf("row 2 should be non-null")
-	}
-	if got := batch.ArrayNDims(0, 1); got != 0 {
-		t.Fatalf("ArrayNDims(0, 1) = %d, want 0", got)
-	}
-	if got := batch.Float64Array(0, 1); got != nil {
-		t.Fatalf("Float64Array(0, 1) = %v, want nil", got)
-	}
-	if got := batch.Float64Array(0, 0); len(got) != 2 || got[0] != 1.5 || got[1] != 2.5 {
-		t.Fatalf("Float64Array(0, 0) = %v, want [1.5 2.5]", got)
-	}
-	if got := batch.Float64Array(0, 2); len(got) != 1 || got[0] != 3.5 {
-		t.Fatalf("Float64Array(0, 2) = %v, want [3.5]", got)
-	}
-}
-
 func TestQwpDecoderRoundTripSymbolDelta(t *testing.T) {
 	// Batch 1 introduces three symbols; Batch 2 adds one more via a
 	// delta section. The decoder's connection-scoped dict must grow
@@ -1045,28 +995,15 @@ func TestQwpDecoderHardening(t *testing.T) {
 		assertDecodeErrContains(t, err, "ARRAY nDims")
 	})
 
-	t.Run("H29b_ArrayNDimsZeroIsNull", func(t *testing.T) {
-		// nDims = 0 is the Java reference's NULL sentinel: the decoder
-		// must mark the row null, consume no further bytes, and return
-		// zero-value accessors for that row.
+	t.Run("H29b_ArrayNDimsZeroRejected", func(t *testing.T) {
+		// The server always encodes NULL arrays via the null bitmap, so
+		// an inline nDims=0 on a row the bitmap marked non-null is a
+		// malformed frame. The decoder must reject it.
 		frame := buildArrayHardeningFrame(t, 0, nil)
 		var dec qwpQueryDecoder
 		var b QwpColumnBatch
-		if err := dec.decode(frame, &b); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if !b.IsNull(0, 0) {
-			t.Fatalf("row 0 should be NULL for inline nDims=0")
-		}
-		if got := b.ArrayNDims(0, 0); got != 0 {
-			t.Fatalf("ArrayNDims = %d, want 0", got)
-		}
-		if got := b.Float64Array(0, 0); got != nil {
-			t.Fatalf("Float64Array = %v, want nil", got)
-		}
-		if nnc := b.NonNullCount(0); nnc != 0 {
-			t.Fatalf("NonNullCount = %d, want 0", nnc)
-		}
+		err := dec.decode(frame, &b)
+		assertDecodeErrContains(t, err, "ARRAY nDims")
 	})
 
 	t.Run("H30_GeohashPrecisionOutOfRange", func(t *testing.T) {
@@ -1131,11 +1068,10 @@ func buildArrayHardeningFrame(t *testing.T, nDims int, shape []int32) []byte {
 	for _, d := range shape {
 		_ = binary.Write(&buf, binary.LittleEndian, d)
 	}
-	// The decoder either consumes no further bytes (nDims=0 → NULL) or
-	// rejects on the shape/nDims check before reading any element
-	// bytes, so we don't need to append them for those paths. Append
-	// zero padding just to avoid a truncated-frame error masking the
-	// real one.
+	// The decoder rejects on the shape/nDims check before reading any
+	// element bytes, so we don't need to append them for those paths.
+	// Append zero padding just to avoid a truncated-frame error
+	// masking the real one.
 	buf.Write(make([]byte, 8))
 	out := buf.Bytes()
 	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))

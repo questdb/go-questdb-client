@@ -1500,39 +1500,29 @@ func TestQwpColumnBufferArrayNull(t *testing.T) {
 		}
 	})
 
-	t.Run("DoubleArrayNonNullable", func(t *testing.T) {
-		// Non-nullable array + addNull writes the 1-byte nDims=0 NULL
-		// sentinel (matching the Java reference). No bitmap is kept.
+	t.Run("DoubleArrayNonNullablePanics", func(t *testing.T) {
+		// The wire format has no inline NULL sentinel for arrays, so
+		// addNull on a non-nullable array column has no valid
+		// encoding. The public API never produces this shape (array
+		// columns are always nullable), so this is purely a guard
+		// against misuse of the low-level buffer constructor.
 		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic, got none")
+			}
+		}()
 		c.addNull()
-
-		if c.rowCount != 1 {
-			t.Fatalf("rowCount = %d, want 1", c.rowCount)
-		}
-		if c.nullCount != 0 {
-			t.Fatalf("nullCount = %d, want 0 for non-nullable", c.nullCount)
-		}
-		if len(c.nullBitmap) != 0 {
-			t.Fatalf("nullBitmap should be empty, got %x", c.nullBitmap)
-		}
-		if !bytes.Equal(c.arrayData, []byte{0x00}) {
-			t.Fatalf("arrayData = %x, want [00]", c.arrayData)
-		}
-		if len(c.arrayOffsets) != 2 || c.arrayOffsets[1] != 1 {
-			t.Fatalf("arrayOffsets = %v, want [0 1]", c.arrayOffsets)
-		}
 	})
 
-	t.Run("LongArrayNonNullable", func(t *testing.T) {
+	t.Run("LongArrayNonNullablePanics", func(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic, got none")
+			}
+		}()
 		c.addNull()
-
-		if !bytes.Equal(c.arrayData, []byte{0x00}) {
-			t.Fatalf("arrayData = %x, want [00]", c.arrayData)
-		}
-		if len(c.arrayOffsets) != 2 || c.arrayOffsets[1] != 1 {
-			t.Fatalf("arrayOffsets = %v, want [0 1]", c.arrayOffsets)
-		}
 	})
 
 	t.Run("InterleavedNullAndData", func(t *testing.T) {
