@@ -190,8 +190,8 @@ func (c *qwpQueryClientConfig) validate() error {
 
 // parseQwpQueryConf parses a ws:: / wss:: config string into a
 // qwpQueryClientConfig. The supported key set mirrors Java
-// QwpQueryClient.fromConfig (subset: tls_roots / tls_roots_password
-//is rejected by the Go module).
+// QwpQueryClient.fromConfig, except tls_roots / tls_roots_password,
+// which aren't supported.
 func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 	data, err := parseConfigStr(conf)
 	if err != nil {
