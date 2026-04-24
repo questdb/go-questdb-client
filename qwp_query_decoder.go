@@ -68,11 +68,14 @@ type ExecResult struct {
 // to the heap + entries arrays here. Subsequent batches refer to
 // prior dictionary ids without retransmitting the strings.
 //
-// The heap is append-only and never shrinks — this is the invariant
-// that lets a qwpSymbolDictView snapshot taken during decode stay
-// valid even if the user's handler is still iterating a previous
-// batch. Growth is amortised by Go's append; no explicit capacity
-// tuning needed.
+// Within a single dict generation the heap is append-only, which
+// keeps a qwpSymbolDictView snapshot taken during decode valid even
+// if the user's handler is still iterating a previous batch. A
+// CACHE_RESET crosses the generation boundary by swapping to a fresh
+// backing array (see clear); pre-reset snapshots keep the old array
+// alive via their own slice headers, so snapshot validity is
+// preserved across the reset. Growth within a generation is amortised
+// by Go's append; no explicit capacity tuning needed.
 type qwpConnDict struct {
 	heap    []byte
 	entries []qwpSymbolEntry
@@ -155,6 +158,21 @@ func (d *qwpConnDict) snapshot() qwpSymbolDictView {
 	}
 }
 
+// clear resets the dict so the next delta section restarts at id 0.
+// Fresh backing arrays are allocated with the old capacities so a
+// workload that churns just above the server's soft cap settles back
+// to a stable size in one allocation instead of paying log N append
+// grow-copies. Critically, swapping in new arrays (rather than
+// truncating via [:0]) detaches any live qwpSymbolDictView snapshots
+// a user handler is still iterating on a prior batch: those snapshots
+// keep the old backing store alive via their own slice headers, and
+// subsequent appendDelta writes into the fresh array cannot corrupt
+// the bytes those snapshots address.
+func (d *qwpConnDict) clear() {
+	d.heap = make([]byte, 0, cap(d.heap))
+	d.entries = make([]qwpSymbolEntry, 0, cap(d.entries))
+}
+
 // qwpSchemaRegistry indexes column-info slices by server-assigned
 // schema id. Subsequent RESULT_BATCH frames that reference a prior
 // schema (mode=0x01) look up by id instead of retransmitting the
@@ -180,6 +198,20 @@ func (r *qwpSchemaRegistry) put(id int, cols []qwpColumnSchemaInfo) {
 		r.slots = append(r.slots, nil)
 	}
 	r.slots[id] = cols
+}
+
+// clear drops every registered schema so the next RESULT_BATCH must
+// ship its schema in full mode with a fresh id. Slot storage is
+// retained (len = 0, cap preserved) to avoid reallocation when a
+// workload churns just above the server's soft cap. The registry's
+// references to the per-id []qwpColumnSchemaInfo slices are nilled
+// so the slices can be GC'd once the last user-facing alias drops:
+// decode() aliases the registered slice into qwpColumnBatch.columns
+// (it does not copy), so any QwpColumnBatch the user still holds
+// keeps its own reference and continues to read stable schema info.
+func (r *qwpSchemaRegistry) clear() {
+	clear(r.slots)
+	r.slots = r.slots[:0]
 }
 
 // qwpQueryDecoder is a stateful, reusable decoder for RESULT_BATCH
@@ -1029,6 +1061,53 @@ func (d *qwpQueryDecoder) decodeExecDone(payload []byte) (requestId int64, resul
 		OpType:       opType,
 		RowsAffected: rowsAffected,
 	}, nil
+}
+
+// decodeCacheReset parses a CACHE_RESET (0x17) frame and returns its
+// reset_mask byte. The frame has no request_id — it is a connection-
+// scoped notification, not a per-query reply. Invalid zstd flag is
+// rejected with the same policy as the other non-RESULT_BATCH
+// decoders so a server that sets FLAG_ZSTD on a control frame is
+// caught before any downstream work.
+//
+// Wire layout (after the 12-byte header):
+//
+//	msg_kind(1) + reset_mask(1)
+func (d *qwpQueryDecoder) decodeCacheReset(payload []byte) (byte, error) {
+	msgKind, err := d.parseFrameHeader(payload)
+	if err != nil {
+		return 0, err
+	}
+	if msgKind != qwpMsgKindCacheReset {
+		return 0, newQwpDecodeError(fmt.Sprintf(
+			"expected CACHE_RESET (0x17), got 0x%02X", byte(msgKind)))
+	}
+	if d.zstdOn {
+		return 0, newQwpDecodeError(
+			"FLAG_ZSTD set on non-RESULT_BATCH frame (CACHE_RESET)")
+	}
+	mask, err := d.br.readByte()
+	if err != nil {
+		return 0, wrapQwpDecodeError("CACHE_RESET truncated before reset_mask", err)
+	}
+	return mask, nil
+}
+
+// applyCacheReset drops the connection-scoped caches indicated by
+// mask (bitwise OR of qwpResetMaskDict and qwpResetMaskSchemas).
+// Invoked from the I/O dispatcher when the server emits a
+// CACHE_RESET frame: discards the SYMBOL dict and / or schema-
+// fingerprint cache so the next RESULT_BATCH's deltaStart and schema-
+// reference ids line up with the server's fresh counter. Bits the
+// server does not set are preserved — the server can reset the dict
+// without dropping schemas, or vice versa.
+func (d *qwpQueryDecoder) applyCacheReset(mask byte) {
+	if mask&qwpResetMaskDict != 0 {
+		d.dict.clear()
+	}
+	if mask&qwpResetMaskSchemas != 0 {
+		d.schemas.clear()
+	}
 }
 
 // decompressIntoBatch decompresses the remaining d.br bytes (the zstd

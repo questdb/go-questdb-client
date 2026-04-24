@@ -66,7 +66,7 @@ const (
 
 // qwpMsgKind is the one-byte discriminator at the start of every QWP
 // egress payload (spec §5). Ingress DATA_BATCH messages use 0x00; the
-// 0x10..0x16 range is reserved for egress request/response kinds.
+// 0x10..0x17 range is reserved for egress request/response kinds.
 type qwpMsgKind byte
 
 const (
@@ -79,6 +79,27 @@ const (
 	qwpMsgKindCancel       qwpMsgKind = 0x14
 	qwpMsgKindCredit       qwpMsgKind = 0x15
 	qwpMsgKindExecDone     qwpMsgKind = 0x16
+	// qwpMsgKindCacheReset is a server → client connection-scoped
+	// cache-reset notification. Body is a single reset_mask byte (see
+	// qwpResetMask* below) whose bits tell the client which caches to
+	// discard. Sent between queries when a cache reaches the server's
+	// configured soft cap; after applying, the next RESULT_BATCH's
+	// delta-dict deltaStart and schema-reference ids are expected to
+	// line up with a fresh server counter. Does not surface to users.
+	qwpMsgKindCacheReset qwpMsgKind = 0x17
+)
+
+// Bit flags carried in the reset_mask byte of a CACHE_RESET frame.
+// Mirrors the Java QwpEgressMsgKind.RESET_MASK_* constants.
+const (
+	// qwpResetMaskDict clears the connection-scoped SYMBOL dict. After
+	// applying, the next RESULT_BATCH's delta section must start at
+	// deltaStart=0 — i.e. the server has also reset its dict to empty.
+	qwpResetMaskDict byte = 0x01
+	// qwpResetMaskSchemas clears the schema-fingerprint cache. After
+	// applying, the next RESULT_BATCH must ship its schema in full
+	// mode (not reference mode) with a fresh id.
+	qwpResetMaskSchemas byte = 0x02
 )
 
 // qwpMagic is the 4-byte magic at the start of every QWP message.

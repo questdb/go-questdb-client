@@ -179,11 +179,28 @@ func TestQwpMsgKinds(t *testing.T) {
 		{qwpMsgKindCancel, 0x14},
 		{qwpMsgKindCredit, 0x15},
 		{qwpMsgKindExecDone, 0x16},
+		{qwpMsgKindCacheReset, 0x17},
 	}
 	for _, c := range cases {
 		if byte(c.kind) != c.want {
 			t.Errorf("msg kind 0x%02X, want 0x%02X", byte(c.kind), c.want)
 		}
+	}
+}
+
+func TestQwpCacheResetMaskBits(t *testing.T) {
+	// Reset-mask bits on the CACHE_RESET frame body. Must match the
+	// Java QwpEgressMsgKind.RESET_MASK_* constants (bit 0 = dict,
+	// bit 1 = schema-fingerprint cache).
+	if qwpResetMaskDict != 0x01 {
+		t.Errorf("qwpResetMaskDict = 0x%02X, want 0x01", qwpResetMaskDict)
+	}
+	if qwpResetMaskSchemas != 0x02 {
+		t.Errorf("qwpResetMaskSchemas = 0x%02X, want 0x02", qwpResetMaskSchemas)
+	}
+	if qwpResetMaskDict&qwpResetMaskSchemas != 0 {
+		t.Errorf("reset-mask bits overlap: dict=0x%02X schemas=0x%02X",
+			qwpResetMaskDict, qwpResetMaskSchemas)
 	}
 }
 

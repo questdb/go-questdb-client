@@ -580,6 +580,150 @@ func TestQwpEgressIOUnknownMsgKind(t *testing.T) {
 	}
 }
 
+// TestQwpEgressIOCacheResetBetweenQueries drives the server-emitted
+// CACHE_RESET path end-to-end: query 1's response seeds the
+// connection-scoped SYMBOL dict and schema registry; the server then
+// emits CACHE_RESET with mask=DICT|SCHEMAS; query 2 runs afterwards.
+// Validates three invariants:
+//   - the dispatcher does not surface CACHE_RESET to the user (the
+//     event stream is {Batch, End} for Q1 and {ExecDone} for Q2);
+//   - the decoder's dict and schema registry are both cleared by the
+//     time Q2's terminal event is delivered;
+//   - nothing about Q2's normal completion is disturbed.
+func TestQwpEgressIOCacheResetBetweenQueries(t *testing.T) {
+	const q1ReqID = int64(11)
+	const q2ReqID = int64(12)
+
+	// Build Q1's RESULT_BATCH with a SYMBOL column so the delta dict
+	// section feeds qwpConnDict.entries. schemaId=10 in full mode
+	// registers a schema in the decoder's registry.
+	globalDict := []string{"AAPL", "MSFT"}
+	tb := newQwpTableBuffer("t")
+	col, err := tb.getOrCreateColumn("s", qwpTypeSymbol, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn: %v", err)
+	}
+	col.addSymbolID(0)
+	tb.commitRow()
+	col.addSymbolID(1)
+	tb.commitRow()
+	var enc qwpEncoder
+	q1Batch := wrapAsResultBatch(
+		enc.encodeTableWithDeltaDict(tb, globalDict, -1, 1, qwpSchemaModeFull, 10),
+		q1ReqID, 0)
+
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Query 1: batch with symbols + RESULT_END, then CACHE_RESET.
+		m.readBinary(ctx)
+		m.sendBinary(ctx, q1Batch)
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(q1ReqID, 0, 2)))
+		m.sendBinary(ctx, writeQwpFrame(0, buildCacheResetBody(qwpResetMaskDict|qwpResetMaskSchemas)))
+
+		// Query 2: a plain EXEC_DONE. If the dispatcher were to leak
+		// CACHE_RESET as an event, the test's event sequence would pick
+		// that up before the ExecDone.
+		m.readBinary(ctx)
+		m.sendBinary(ctx, writeQwpFrame(0, buildExecDoneBody(q2ReqID, 0x01, 0)))
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close(context.Background())
+
+	io := newQwpEgressIO(tr, 2)
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Query 1 → expect Batch, End; decoder state populated afterwards.
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT s FROM t", requestId: q1ReqID}); err != nil {
+		t.Fatalf("submitQuery q1: %v", err)
+	}
+	batchEv := takeEventOrFail(t, io, 2*time.Second)
+	if batchEv.kind != qwpEventKindBatch {
+		t.Fatalf("q1 first event = %v, want Batch (errMsg=%q)", batchEv.kind, batchEv.errMessage)
+	}
+	if got := batchEv.batch.batch.String(0, 0); got != "AAPL" {
+		t.Errorf("q1 batch row 0 = %q, want AAPL", got)
+	}
+	batchEv.batch.release()
+	endEv := takeEventOrFail(t, io, 2*time.Second)
+	if endEv.kind != qwpEventKindEnd {
+		t.Fatalf("q1 second event = %v, want End (errMsg=%q)", endEv.kind, endEv.errMessage)
+	}
+
+	// Query 2 → expect ExecDone only (no CACHE_RESET event surfaces).
+	if err := io.submitQuery(ctx, qwpRequest{sql: "INSERT INTO t VALUES ('x')", requestId: q2ReqID}); err != nil {
+		t.Fatalf("submitQuery q2: %v", err)
+	}
+	ev := takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindExecDone {
+		t.Fatalf("q2 first event kind = %v, want ExecDone (errMsg=%q)",
+			ev.kind, ev.errMessage)
+	}
+	if ev.requestId != q2ReqID {
+		t.Errorf("q2 ExecDone requestId = %d, want %d", ev.requestId, q2ReqID)
+	}
+
+	// Shut the dispatcher down so it cannot touch the decoder while we
+	// inspect — the happens-before via events channel already covers
+	// correctness; the shutdown makes the intent explicit for readers.
+	shutdownIO(t, io)
+
+	if io.decoder.dict.size() != 0 {
+		t.Errorf("dict not cleared after CACHE_RESET: size=%d", io.decoder.dict.size())
+	}
+	if _, ok := io.decoder.schemas.get(10); ok {
+		t.Errorf("schema id 10 not cleared after CACHE_RESET")
+	}
+}
+
+// TestQwpEgressIOCacheResetTruncatedPoisons feeds a CACHE_RESET frame
+// that ends right after the msg_kind byte (no reset_mask). The
+// dispatcher must surface the decode error, poison the connection,
+// and reject the next submitQuery immediately.
+func TestQwpEgressIOCacheResetTruncatedPoisons(t *testing.T) {
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		m.readBinary(ctx)
+		m.sendBinary(ctx, writeQwpFrame(0, []byte{byte(qwpMsgKindCacheReset)}))
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close(context.Background())
+
+	io := newQwpEgressIO(tr, 1)
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := io.submitQuery(ctx, qwpRequest{sql: "x", requestId: 1}); err != nil {
+		t.Fatalf("submitQuery: %v", err)
+	}
+
+	ev := takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindError {
+		t.Fatalf("event kind = %v, want Error", ev.kind)
+	}
+	if !strings.Contains(ev.errMessage, "truncated before reset_mask") {
+		t.Errorf("errMessage = %q, want truncated-reset_mask", ev.errMessage)
+	}
+
+	// A fresh submitQuery must now fail synchronously because the
+	// decoder state is untrustworthy.
+	if err := io.submitQuery(ctx, qwpRequest{sql: "x", requestId: 2}); err == nil {
+		t.Fatal("submitQuery after poison returned nil; expected latched ioErr")
+	}
+}
+
 // TestQwpEgressIOConcurrentCancelAndShutdown stress-tests the cancel /
 // shutdown races: a test-runner goroutine fires requestCancel while
 // the test's main goroutine fires shutdown. Both should complete

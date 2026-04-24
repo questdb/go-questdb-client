@@ -614,6 +614,8 @@ func (io *qwpEgressIO) dispatchFrame(payload []byte) {
 		io.handleQueryError(payload)
 	case qwpMsgKindExecDone:
 		io.handleExecDone(payload)
+	case qwpMsgKindCacheReset:
+		io.handleCacheReset(payload)
 	default:
 		// Unknown msg_kind means we are talking to a server whose
 		// protocol we do not understand — treat as terminal so we do
@@ -706,6 +708,24 @@ func (io *qwpEgressIO) handleQueryError(payload []byte) {
 		})
 	}
 	io.currentQueryDone = true
+}
+
+// handleCacheReset parses CACHE_RESET and applies the requested reset
+// to the decoder's connection-scoped caches. No user-visible event is
+// emitted and the current query is NOT marked done — the server emits
+// CACHE_RESET between queries (after the prior query's terminal
+// frame, before the next query's RESULT_BATCH), so handling it is
+// invisible from the user's perspective. A truncated or otherwise
+// malformed frame is terminal: the decoder's per-connection state
+// cannot be trusted, so we poison the connection.
+func (io *qwpEgressIO) handleCacheReset(payload []byte) {
+	mask, err := io.decoder.decodeCacheReset(payload)
+	if err != nil {
+		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.currentQueryDone = true
+		return
+	}
+	io.decoder.applyCacheReset(mask)
 }
 
 // handleExecDone parses EXEC_DONE, emits an ExecDone event, and marks

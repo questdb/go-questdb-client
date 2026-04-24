@@ -1510,6 +1510,294 @@ func TestQwpDecoderExecDone(t *testing.T) {
 	})
 }
 
+// buildCacheResetBody assembles a CACHE_RESET body: msg_kind + 1-byte
+// reset_mask. Returned bytes are ready to drop into writeQwpFrame.
+func buildCacheResetBody(mask byte) []byte {
+	return []byte{byte(qwpMsgKindCacheReset), mask}
+}
+
+func TestQwpDecoderCacheReset(t *testing.T) {
+	t.Run("RoundTripMaskValues", func(t *testing.T) {
+		// Every reset_mask value the server can plausibly emit (the two
+		// defined bits in every combination, plus the zero reset). The
+		// decoder surfaces the byte verbatim — the I/O layer is what
+		// maps bits to cache clears.
+		for _, mask := range []byte{
+			0x00,
+			qwpResetMaskDict,
+			qwpResetMaskSchemas,
+			qwpResetMaskDict | qwpResetMaskSchemas,
+		} {
+			frame := writeQwpFrame(0, buildCacheResetBody(mask))
+			var dec qwpQueryDecoder
+			got, err := dec.decodeCacheReset(frame)
+			if err != nil {
+				t.Fatalf("mask=0x%02X: decodeCacheReset: %v", mask, err)
+			}
+			if got != mask {
+				t.Fatalf("mask=0x%02X: got 0x%02X", mask, got)
+			}
+		}
+	})
+
+	t.Run("UnknownMaskBitsPreserved", func(t *testing.T) {
+		// The decoder must not filter unknown bits — a future server
+		// extension may introduce new bits, and rejecting them would
+		// make forward compatibility impossible. Caller (applyCacheReset)
+		// ignores bits it does not recognise; decode preserves them.
+		frame := writeQwpFrame(0, buildCacheResetBody(0xFF))
+		var dec qwpQueryDecoder
+		got, err := dec.decodeCacheReset(frame)
+		if err != nil {
+			t.Fatalf("decodeCacheReset: %v", err)
+		}
+		if got != 0xFF {
+			t.Fatalf("mask=0x%02X, want 0xFF", got)
+		}
+	})
+
+	t.Run("WrongMsgKind", func(t *testing.T) {
+		body := buildCacheResetBody(qwpResetMaskDict)
+		body[0] = byte(qwpMsgKindResultEnd)
+		frame := writeQwpFrame(0, body)
+		var dec qwpQueryDecoder
+		_, err := dec.decodeCacheReset(frame)
+		assertDecodeErrContains(t, err, "expected CACHE_RESET")
+	})
+
+	t.Run("TruncatedBeforeMask", func(t *testing.T) {
+		// Header + msg_kind only, reset_mask missing. Java mirrors this
+		// with "CACHE_RESET frame truncated before reset_mask".
+		frame := writeQwpFrame(0, []byte{byte(qwpMsgKindCacheReset)})
+		var dec qwpQueryDecoder
+		_, err := dec.decodeCacheReset(frame)
+		assertDecodeErrContains(t, err, "truncated before reset_mask")
+	})
+
+	t.Run("BadMagic", func(t *testing.T) {
+		frame := writeQwpFrame(0, buildCacheResetBody(qwpResetMaskDict))
+		frame[0] = 0xFF
+		var dec qwpQueryDecoder
+		_, err := dec.decodeCacheReset(frame)
+		assertDecodeErrContains(t, err, "bad magic")
+	})
+
+	t.Run("ZstdFlagRejected", func(t *testing.T) {
+		// CACHE_RESET is a 2-byte control frame; FLAG_ZSTD is only
+		// valid on RESULT_BATCH. Match the other non-RESULT_BATCH
+		// decoder guards.
+		frame := writeQwpFrame(qwpFlagZstd, buildCacheResetBody(qwpResetMaskDict))
+		var dec qwpQueryDecoder
+		_, err := dec.decodeCacheReset(frame)
+		assertDecodeErrContains(t, err, "FLAG_ZSTD set on non-RESULT_BATCH")
+	})
+}
+
+func TestQwpDecoderApplyCacheReset(t *testing.T) {
+	// Decode a frame that populates both the connection dict (delta
+	// with three symbols) and the schema registry (one schema at id
+	// 3). Then exercise applyCacheReset with each mask combo and
+	// assert the correct subset was cleared.
+	seedDecoder := func() qwpQueryDecoder {
+		globalDict := []string{"AAPL", "MSFT", "GOOG"}
+		tb := newQwpTableBuffer("t")
+		for _, id := range []int32{0, 1, 2} {
+			col, _ := tb.getOrCreateColumn("s", qwpTypeSymbol, false)
+			col.addSymbolID(id)
+			tb.commitRow()
+		}
+		var enc qwpEncoder
+		ingress := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 2, qwpSchemaModeFull, 3)
+		frame := wrapAsResultBatch(ingress, 1, 0)
+		var dec qwpQueryDecoder
+		var b QwpColumnBatch
+		if err := dec.decode(frame, &b); err != nil {
+			t.Fatalf("seed decode: %v", err)
+		}
+		if dec.dict.size() != 3 {
+			t.Fatalf("seed dict size = %d, want 3", dec.dict.size())
+		}
+		if _, ok := dec.schemas.get(3); !ok {
+			t.Fatalf("seed schemas missing id 3")
+		}
+		return dec
+	}
+
+	t.Run("MaskZeroIsNoOp", func(t *testing.T) {
+		dec := seedDecoder()
+		dec.applyCacheReset(0)
+		if dec.dict.size() != 3 {
+			t.Errorf("dict mutated by zero mask: size=%d", dec.dict.size())
+		}
+		if _, ok := dec.schemas.get(3); !ok {
+			t.Errorf("schemas mutated by zero mask")
+		}
+	})
+
+	t.Run("DictOnly", func(t *testing.T) {
+		dec := seedDecoder()
+		dec.applyCacheReset(qwpResetMaskDict)
+		if dec.dict.size() != 0 {
+			t.Errorf("dict not cleared: size=%d", dec.dict.size())
+		}
+		if _, ok := dec.schemas.get(3); !ok {
+			t.Errorf("schemas unexpectedly cleared by DictOnly")
+		}
+	})
+
+	t.Run("SchemasOnly", func(t *testing.T) {
+		dec := seedDecoder()
+		dec.applyCacheReset(qwpResetMaskSchemas)
+		if dec.dict.size() != 3 {
+			t.Errorf("dict unexpectedly cleared by SchemasOnly: size=%d", dec.dict.size())
+		}
+		if _, ok := dec.schemas.get(3); ok {
+			t.Errorf("schemas not cleared")
+		}
+	})
+
+	t.Run("Both", func(t *testing.T) {
+		dec := seedDecoder()
+		dec.applyCacheReset(qwpResetMaskDict | qwpResetMaskSchemas)
+		if dec.dict.size() != 0 {
+			t.Errorf("dict not cleared: size=%d", dec.dict.size())
+		}
+		if _, ok := dec.schemas.get(3); ok {
+			t.Errorf("schemas not cleared")
+		}
+	})
+
+	t.Run("UnknownBitsIgnored", func(t *testing.T) {
+		// 0xF0 touches none of the defined reset bits — both caches
+		// must be preserved for forward compat.
+		dec := seedDecoder()
+		dec.applyCacheReset(0xF0)
+		if dec.dict.size() != 3 {
+			t.Errorf("dict cleared by unknown bits: size=%d", dec.dict.size())
+		}
+		if _, ok := dec.schemas.get(3); !ok {
+			t.Errorf("schemas cleared by unknown bits")
+		}
+	})
+}
+
+// TestQwpConnDictClearDetachesSnapshot documents the core safety
+// invariant of qwpConnDict.clear: a snapshot a user handler is still
+// iterating on a prior batch must keep reading the original bytes,
+// even after clear() followed by a fresh appendDelta fills the new
+// backing array. [:0] reuse would fail this test because the new
+// symbols would overwrite the old heap region the snapshot aliases.
+func TestQwpConnDictClearDetachesSnapshot(t *testing.T) {
+	var dict qwpConnDict
+
+	// Prime with three symbols.
+	seedBytes := buildDeltaBytes(0, []string{"AAPL", "MSFT", "GOOG"})
+	var br qwpByteReader
+	br.reset(seedBytes)
+	if err := dict.appendDelta(&br); err != nil {
+		t.Fatalf("seed appendDelta: %v", err)
+	}
+
+	// Take a snapshot — simulates a user handler iterating a batch.
+	snap := dict.snapshot()
+
+	// Reset and append different symbols — these must land in a fresh
+	// backing array so the snapshot's heap remains untouched.
+	dict.clear()
+	replacementBytes := buildDeltaBytes(0, []string{"ZZZZ", "YYYY", "XXXX"})
+	br.reset(replacementBytes)
+	if err := dict.appendDelta(&br); err != nil {
+		t.Fatalf("post-clear appendDelta: %v", err)
+	}
+
+	want := []string{"AAPL", "MSFT", "GOOG"}
+	for i, w := range want {
+		e := snap.entries[i]
+		got := string(snap.heap[e.offset : e.offset+e.length])
+		if got != w {
+			t.Fatalf("snapshot[%d] = %q, want %q (clear did not detach snapshot)", i, got, w)
+		}
+	}
+}
+
+// TestQwpConnDictClearPreservesCapacity checks that clear() retains
+// the backing-array capacity so a workload that churns just above the
+// server's soft cap does not reallocate on every CACHE_RESET. The
+// invariant matches the Java client's QwpResultBatchDecoder comment
+// on applyCacheReset.
+func TestQwpConnDictClearPreservesCapacity(t *testing.T) {
+	var dict qwpConnDict
+	// Grow the dict to a non-trivial size so cap is well above the
+	// initial empty.
+	var br qwpByteReader
+	br.reset(buildDeltaBytes(0, []string{"AAAA", "BBBB", "CCCC", "DDDD"}))
+	if err := dict.appendDelta(&br); err != nil {
+		t.Fatalf("seed appendDelta: %v", err)
+	}
+	heapCapBefore := cap(dict.heap)
+	entriesCapBefore := cap(dict.entries)
+	if heapCapBefore == 0 || entriesCapBefore == 0 {
+		t.Fatalf("precondition: caps must be non-zero (heap=%d entries=%d)",
+			heapCapBefore, entriesCapBefore)
+	}
+
+	dict.clear()
+
+	if cap(dict.heap) < heapCapBefore {
+		t.Errorf("heap cap shrunk after clear: before=%d after=%d",
+			heapCapBefore, cap(dict.heap))
+	}
+	if cap(dict.entries) < entriesCapBefore {
+		t.Errorf("entries cap shrunk after clear: before=%d after=%d",
+			entriesCapBefore, cap(dict.entries))
+	}
+	if len(dict.heap) != 0 || len(dict.entries) != 0 {
+		t.Errorf("cleared dict not empty: heap=%d entries=%d",
+			len(dict.heap), len(dict.entries))
+	}
+}
+
+// buildDeltaBytes emits a (deltaStart + deltaCount + per-entry
+// len+bytes) block as appendDelta expects to read.
+func buildDeltaBytes(deltaStart int, entries []string) []byte {
+	var buf bytes.Buffer
+	putVarintBytes(&buf, uint64(deltaStart))
+	putVarintBytes(&buf, uint64(len(entries)))
+	for _, s := range entries {
+		putVarintBytes(&buf, uint64(len(s)))
+		buf.WriteString(s)
+	}
+	return buf.Bytes()
+}
+
+func TestQwpSchemaRegistryClear(t *testing.T) {
+	var reg qwpSchemaRegistry
+	cols := []qwpColumnSchemaInfo{{name: "a", wireType: qwpTypeLong}}
+	reg.put(3, cols)
+	reg.put(5, cols)
+
+	// A live alias — simulates the user holding a QwpColumnBatch with
+	// columns that reference a registry slot. After clear, the alias
+	// must remain readable (Go's GC keeps the underlying slice alive
+	// via the alias); only the registry's lookup table is reset.
+	aliased, ok := reg.get(3)
+	if !ok {
+		t.Fatalf("precondition: registry missing id 3")
+	}
+
+	reg.clear()
+
+	if _, ok := reg.get(3); ok {
+		t.Errorf("cleared registry still returns id 3")
+	}
+	if _, ok := reg.get(5); ok {
+		t.Errorf("cleared registry still returns id 5")
+	}
+	if aliased[0].name != "a" {
+		t.Errorf("alias corrupted by clear: name=%q", aliased[0].name)
+	}
+}
+
 func assertDecodeErrContains(t *testing.T, err error, substr string) {
 	t.Helper()
 	if err == nil {
