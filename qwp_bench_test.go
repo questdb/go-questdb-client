@@ -199,8 +199,14 @@ func BenchmarkQwpSenderSteadyState(b *testing.B) {
 
 // TestQwpSenderSteadyStateZeroAllocs pins the 0-allocs/op invariant
 // programmatically so the invariant survives refactors without a
-// developer having to read the benchmark output.
+// developer having to read the benchmark output. Only meaningful for
+// non-race builds: race instrumentation forces some stack-allocatable
+// values to escape and inflates allocs/op (see TestQwpSender
+// SteadyStateNullsZeroAllocs for the variant that trips on this).
 func TestQwpSenderSteadyStateZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
 	_, iter := qwpSteadyStateSetup()
 	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
 		t.Fatalf("steady-state allocs/op = %g, want 0", allocs)
@@ -277,8 +283,12 @@ func BenchmarkQwpSenderSteadyStateNulls(b *testing.B) {
 }
 
 // TestQwpSenderSteadyStateNullsZeroAllocs pins the 0-allocs/op
-// invariant for the null-mix variant.
+// invariant for the null-mix variant. See sibling test for the -race
+// caveat.
 func TestQwpSenderSteadyStateNullsZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
 	_, iter := qwpSteadyStateSetupWithNulls()
 	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
 		t.Fatalf("steady-state-nulls allocs/op = %g, want 0", allocs)
