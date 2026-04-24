@@ -724,8 +724,9 @@ func (q *QwpQuery) Cancel() {
 	if q.state.Load() == qwpQueryStateDone {
 		return
 	}
-	q.cancelled.Store(true)
-	q.client.io.requestCancel(q.requestId)
+	if q.cancelled.CompareAndSwap(false, true) {
+		q.client.io.requestCancel(q.requestId)
+	}
 }
 
 // Close finalizes the cursor. Drains any pending events to a
@@ -761,8 +762,7 @@ func (q *QwpQuery) Close() {
 // observed done (iterator break-out, takeEvent-error) or inside a
 // user-driven Close which has no meaningful ctx of its own.
 func (q *QwpQuery) cancelAndDrainOnCleanupCtx() {
-	if !q.cancelled.Load() {
-		q.cancelled.Store(true)
+	if q.cancelled.CompareAndSwap(false, true) {
 		q.client.io.requestCancel(q.requestId)
 	}
 	cleanupCtx, cancel := context.WithTimeout(
