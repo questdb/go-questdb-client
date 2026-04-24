@@ -457,7 +457,7 @@ func TestQwpColumnBatchFloat64Array1D(t *testing.T) {
 		info:          &info,
 		values:        values,
 		arrayRowStart: []int32{0},
-		arrayRowLen:   []int32{int32(len(values))},
+		arrayElems:    []int32{3},
 		nonNullCount:  1,
 	}
 	batch := newSingleColumnBatch(info, layout, 1)
@@ -493,7 +493,7 @@ func TestQwpColumnBatchInt64Array2D(t *testing.T) {
 		info:          &info,
 		values:        values,
 		arrayRowStart: []int32{0},
-		arrayRowLen:   []int32{int32(len(values))},
+		arrayElems:    []int32{6},
 		nonNullCount:  1,
 	}
 	batch := newSingleColumnBatch(info, layout, 1)
@@ -527,7 +527,7 @@ func TestQwpColumnBatchEmptyArrayViaZeroShape(t *testing.T) {
 		info:          &info,
 		values:        values,
 		arrayRowStart: []int32{0},
-		arrayRowLen:   []int32{int32(len(values))},
+		arrayElems:    []int32{0},
 		nonNullCount:  1,
 	}
 	batch := newSingleColumnBatch(info, layout, 1)
@@ -539,6 +539,112 @@ func TestQwpColumnBatchEmptyArrayViaZeroShape(t *testing.T) {
 	}
 	if got := batch.Float64Array(0, 0); len(got) != 0 {
 		t.Fatalf("Float64Array len = %d, want 0", len(got))
+	}
+}
+
+// TestQwpColumnFloat64ArrayInto exercises the append-into-dst variant
+// of Float64Array: it must extend dst with the row's elements, leave
+// dst unchanged on a NULL row, and reuse dst's backing array across
+// successive calls (the hot-loop pattern this accessor exists for).
+func TestQwpColumnFloat64ArrayInto(t *testing.T) {
+	// Two non-null rows back-to-back: row 0 = [1.5, 2.5], row 1 = [3.5].
+	info := qwpColumnSchemaInfo{name: "a", wireType: qwpTypeDoubleArray}
+	var buf bytes.Buffer
+	buf.WriteByte(1) // row 0 nDims
+	_ = binary.Write(&buf, binary.LittleEndian, int32(2))
+	_ = binary.Write(&buf, binary.LittleEndian, 1.5)
+	_ = binary.Write(&buf, binary.LittleEndian, 2.5)
+	row1Start := int32(buf.Len())
+	buf.WriteByte(1) // row 1 nDims
+	_ = binary.Write(&buf, binary.LittleEndian, int32(1))
+	_ = binary.Write(&buf, binary.LittleEndian, 3.5)
+	values := buf.Bytes()
+
+	layout := qwpColumnLayout{
+		info:          &info,
+		values:        values,
+		arrayRowStart: []int32{0, row1Start},
+		arrayElems:    []int32{2, 1},
+		nonNullCount:  2,
+	}
+	batch := newSingleColumnBatch(info, layout, 2)
+	col := batch.Column(0)
+
+	dst := make([]float64, 0, 8)
+	dst = col.Float64ArrayInto(0, dst)
+	if len(dst) != 2 || dst[0] != 1.5 || dst[1] != 2.5 {
+		t.Fatalf("row 0 into dst = %v", dst)
+	}
+	// Append-style: a second call without truncating extends dst.
+	dst = col.Float64ArrayInto(1, dst)
+	if len(dst) != 3 || dst[2] != 3.5 {
+		t.Fatalf("row 1 appended dst = %v", dst)
+	}
+	// Hot-loop pattern: truncate before each row to reuse the backing
+	// array. Capacity must be preserved across the truncation.
+	beforeCap := cap(dst)
+	dst = dst[:0]
+	dst = col.Float64ArrayInto(0, dst)
+	if len(dst) != 2 || cap(dst) != beforeCap {
+		t.Fatalf("reuse: len=%d cap=%d (was %d)", len(dst), cap(dst), beforeCap)
+	}
+}
+
+// TestQwpColumnFloat64ArrayIntoNull verifies that a NULL row leaves
+// dst unchanged (no zero-fill, no truncation) — distinct from the
+// per-cell Float64Array which returns nil for NULL.
+func TestQwpColumnFloat64ArrayIntoNull(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "a", wireType: qwpTypeDoubleArray}
+	// Null bitmap has bit 0 set → row 0 is NULL.
+	layout := qwpColumnLayout{
+		info:          &info,
+		values:        []byte{},
+		arrayRowStart: []int32{0},
+		arrayElems:    []int32{0},
+		nullBitmap:    []byte{0x01},
+		nonNullCount:  0,
+	}
+	batch := newSingleColumnBatch(info, layout, 1)
+	col := batch.Column(0)
+
+	dst := []float64{99.0, 99.0}
+	got := col.Float64ArrayInto(0, dst)
+	if len(got) != 2 || got[0] != 99.0 || got[1] != 99.0 {
+		t.Fatalf("NULL row mutated dst = %v", got)
+	}
+}
+
+// TestQwpColumnInt64ArrayInto mirrors the Float64ArrayInto test for
+// LONG_ARRAY columns.
+func TestQwpColumnInt64ArrayInto(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "a", wireType: qwpTypeLongArray}
+	var buf bytes.Buffer
+	buf.WriteByte(1)
+	_ = binary.Write(&buf, binary.LittleEndian, int32(3))
+	for _, v := range []int64{10, 20, 30} {
+		_ = binary.Write(&buf, binary.LittleEndian, v)
+	}
+	values := buf.Bytes()
+
+	layout := qwpColumnLayout{
+		info:          &info,
+		values:        values,
+		arrayRowStart: []int32{0},
+		arrayElems:    []int32{3},
+		nonNullCount:  1,
+	}
+	batch := newSingleColumnBatch(info, layout, 1)
+	col := batch.Column(0)
+
+	dst := col.Int64ArrayInto(0, nil)
+	want := []int64{10, 20, 30}
+	if len(dst) != len(want) {
+		t.Fatalf("Int64ArrayInto len = %d, want %d", len(dst), len(want))
+	}
+	for i, w := range want {
+		if dst[i] != w {
+			t.Fatalf("Int64ArrayInto[%d] = %d, want %d", i, dst[i], w)
+		}
 	}
 }
 

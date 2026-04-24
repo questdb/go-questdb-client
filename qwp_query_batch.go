@@ -76,7 +76,7 @@ type qwpSymbolDictView struct {
 // decoding batch N+1 does not corrupt N's view. `clear` nil-s the
 // slice headers but preserves backing arrays on the non-aliasing
 // fields (`nonNullIdx`, `symbolRowIds`, `timestampBuf`,
-// `arrayRowStart`, `arrayRowLen`), so subsequent decodes into the
+// `arrayRowStart`, `arrayElems`), so subsequent decodes into the
 // same batch with the same column width avoid reallocation.
 type qwpColumnLayout struct {
 	info *qwpColumnSchemaInfo
@@ -128,10 +128,14 @@ type qwpColumnLayout struct {
 	// values. Zero value (nil heap) for non-SYMBOL columns.
 	symbolDict qwpSymbolDictView
 
-	// Per-row array start/length (in `values`) for ARRAY columns. Size
-	// rowCount; NULL rows hold (0, 0).
+	// arrayRowStart is the byte offset within `values` where each
+	// array row's nDims byte begins. Size rowCount; NULL rows hold 0.
 	arrayRowStart []int32
-	arrayRowLen   []int32
+	// arrayElems is the precomputed element count for each array row,
+	// cached at decode time so per-cell accessors avoid re-walking the
+	// shape header. Bounded by qwpMaxArrayElements (fits in int32).
+	// Size rowCount; NULL rows hold 0.
+	arrayElems []int32
 
 	// Decoder-owned decode buffer for Gorilla-encoded TIMESTAMP columns.
 	// Sized to nonNullCount; `values` aliases this as bytes.
@@ -153,7 +157,7 @@ func (l *qwpColumnLayout) clear() {
 	l.symbolRowIds = l.symbolRowIds[:0]
 	l.symbolDict = qwpSymbolDictView{}
 	l.arrayRowStart = l.arrayRowStart[:0]
-	l.arrayRowLen = l.arrayRowLen[:0]
+	l.arrayElems = l.arrayElems[:0]
 	l.timestampBuf = l.timestampBuf[:0]
 }
 
@@ -521,23 +525,20 @@ func (b *QwpColumnBatch) ArrayDim(col, row, dim int) int {
 	return int(int32(binary.LittleEndian.Uint32(l.values[off : off+4])))
 }
 
-// arrayElementCount returns the element count for the array at row
-// `row` in layout `l`, plus the byte offset within `l.values` where
-// the flattened data region begins (one byte past the shape header).
-// The decoder converts any inline nDims=0 NULL sentinel into a null
-// bitmap bit and bounds-checks the per-dimension extents against
-// qwpMaxArrayElements, so callers that reach this helper know the
-// row is non-null and the product fits in int.
-func arrayElementCount(l *qwpColumnLayout, row int) (nDims, elems, dataBase int) {
+// arrayElementCount returns the cached element count for the array at
+// row `row` in layout `l`, plus the byte offset within `l.values`
+// where the flattened data region begins (one byte past the shape
+// header). The decoder precomputes the element count into l.arrayElems
+// at parse time so per-cell accessors do not re-walk the shape header
+// on every call. The decoder also bounds-checks the per-dimension
+// extents against qwpMaxArrayElements, so callers that reach this
+// helper know the row is non-null and the product fits in int.
+func arrayElementCount(l *qwpColumnLayout, row int) (elems, dataBase int) {
 	start := int(l.arrayRowStart[row])
-	nDims = int(l.values[start])
-	elems = 1
-	for d := 0; d < nDims; d++ {
-		off := start + 1 + d*4
-		dim := int(int32(binary.LittleEndian.Uint32(l.values[off : off+4])))
-		elems *= dim
-	}
-	return nDims, elems, start + 1 + nDims*4
+	nDims := int(l.values[start])
+	elems = int(l.arrayElems[row])
+	dataBase = start + 1 + nDims*4
+	return elems, dataBase
 }
 
 // Float64Array returns the flattened (row-major) elements of a
@@ -556,7 +557,7 @@ func (b *QwpColumnBatch) Float64Array(col, row int) []float64 {
 	if l.isNull(row) {
 		return nil
 	}
-	_, elems, base := arrayElementCount(l, row)
+	elems, base := arrayElementCount(l, row)
 	out := make([]float64, elems)
 	if elems > 0 {
 		src := unsafe.Slice((*float64)(unsafe.Pointer(&l.values[base])), elems)
@@ -573,7 +574,7 @@ func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
 	if l.isNull(row) {
 		return nil
 	}
-	_, elems, base := arrayElementCount(l, row)
+	elems, base := arrayElementCount(l, row)
 	out := make([]int64, elems)
 	if elems > 0 {
 		src := unsafe.Slice((*int64)(unsafe.Pointer(&l.values[base])), elems)
@@ -830,7 +831,7 @@ func (c QwpColumn) Float64Array(row int) []float64 {
 	if l.isNull(row) {
 		return nil
 	}
-	_, elems, base := arrayElementCount(l, row)
+	elems, base := arrayElementCount(l, row)
 	out := make([]float64, elems)
 	if elems > 0 {
 		src := unsafe.Slice((*float64)(unsafe.Pointer(&l.values[base])), elems)
@@ -846,13 +847,54 @@ func (c QwpColumn) Int64Array(row int) []int64 {
 	if l.isNull(row) {
 		return nil
 	}
-	_, elems, base := arrayElementCount(l, row)
+	elems, base := arrayElementCount(l, row)
 	out := make([]int64, elems)
 	if elems > 0 {
 		src := unsafe.Slice((*int64)(unsafe.Pointer(&l.values[base])), elems)
 		copy(out, src)
 	}
 	return out
+}
+
+// Float64ArrayInto appends the flattened (row-major) elements of a
+// DOUBLE_ARRAY cell at row to dst and returns the extended slice. NULL
+// rows contribute nothing — dst is returned unchanged. Use this in hot
+// loops where the per-cell allocation of Float64Array would dominate;
+// reuse dst across rows by truncating with `dst = dst[:0]` between
+// calls.
+func (c QwpColumn) Float64ArrayInto(row int, dst []float64) []float64 {
+	l := c.layout
+	if l.isNull(row) {
+		return dst
+	}
+	elems, base := arrayElementCount(l, row)
+	if elems == 0 {
+		return dst
+	}
+	dstBase := len(dst)
+	dst = slices.Grow(dst, elems)[:dstBase+elems]
+	src := unsafe.Slice((*float64)(unsafe.Pointer(&l.values[base])), elems)
+	copy(dst[dstBase:], src)
+	return dst
+}
+
+// Int64ArrayInto appends the flattened (row-major) elements of a
+// LONG_ARRAY cell at row to dst and returns the extended slice. See
+// Float64ArrayInto for the contract — NULL rows contribute nothing.
+func (c QwpColumn) Int64ArrayInto(row int, dst []int64) []int64 {
+	l := c.layout
+	if l.isNull(row) {
+		return dst
+	}
+	elems, base := arrayElementCount(l, row)
+	if elems == 0 {
+		return dst
+	}
+	dstBase := len(dst)
+	dst = slices.Grow(dst, elems)[:dstBase+elems]
+	src := unsafe.Slice((*int64)(unsafe.Pointer(&l.values[base])), elems)
+	copy(dst[dstBase:], src)
+	return dst
 }
 
 // --- Bulk row-range accessors ---
@@ -995,7 +1037,7 @@ func (c QwpColumn) Float32Range(fromRow, toRow int, dst []float32) []float32 {
 // both of which are invisible to callers:
 //
 //  1. The pool-owned layout arrays (nonNullIdx, symbolRowIds,
-//     arrayRowStart, arrayRowLen, timestampBuf) are freshly-allocated
+//     arrayRowStart, arrayElems, timestampBuf) are freshly-allocated
 //     heap slices, not aliases into the decoder's reused pool.
 //  2. The per-layout slices that alias the payload (values,
 //     stringBytes, nullBitmap) still alias — but the batch retains the
@@ -1067,7 +1109,7 @@ func (b *QwpColumnBatch) CopyAll() *SerializedBatch {
 		// so the view stays valid without copying.
 		dst.symbolDict = src.symbolDict
 		dst.arrayRowStart = slices.Clone(src.arrayRowStart)
-		dst.arrayRowLen = slices.Clone(src.arrayRowLen)
+		dst.arrayElems = slices.Clone(src.arrayElems)
 		dst.timestampBuf = slices.Clone(src.timestampBuf)
 		// Gorilla TIMESTAMP: values aliases timestampBuf (not payload).
 		// Re-point at the cloned buffer so the snapshot survives the

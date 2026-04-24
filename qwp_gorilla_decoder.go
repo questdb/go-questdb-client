@@ -87,23 +87,22 @@ func (r *qwpBitReader) readBit() (uint64, error) {
 
 // readBits reads the low n bits of the stream and returns them
 // LSB-aligned in a uint64. n must be in [1, 64].
+//
+// Mask construction is branchless via `^uint64(0) >> (64 - n)`: for n
+// in [1, 64] the shift count is in [0, 63] and the result is the
+// expected n-bit mask, with no n == 64 special case (`uint64(1) << 64`
+// is 0 in Go, which would make the obvious `(1 << n) - 1` form wrong).
+// The accumulator drain uses the same idea via two chained shifts so
+// the inner shift count is always in [0, 63] and Go does not have to
+// emit a runtime guard for shift-by-width.
 func (r *qwpBitReader) readBits(n int) (uint64, error) {
 	if n <= 0 || n > 64 {
 		return 0, newQwpDecodeError("bit count out of range")
 	}
 	if r.bitsAvail >= n {
-		var mask uint64
-		if n == 64 {
-			mask = ^uint64(0)
-		} else {
-			mask = (uint64(1) << n) - 1
-		}
+		mask := ^uint64(0) >> (64 - n)
 		result := r.bitBuffer & mask
-		if n == 64 {
-			r.bitBuffer = 0
-		} else {
-			r.bitBuffer >>= n
-		}
+		r.bitBuffer = (r.bitBuffer >> 1) >> (n - 1)
 		r.bitsAvail -= n
 		r.bitsRead += int64(n)
 		return result, nil
@@ -118,6 +117,11 @@ func (r *qwpBitReader) readBits(n int) (uint64, error) {
 // only exercised when n exceeds the bits already buffered (which, after
 // the first refill, can be at most one extra iteration since a single
 // 64-bit accumulator load satisfies any n <= 64).
+//
+// Mask construction and accumulator drain use the same branchless
+// idioms as readBits — `take` is in [1, 64] inside the loop body, so
+// `^uint64(0) >> (64 - take)` and `(buf >> 1) >> (take - 1)` both have
+// shift counts in [0, 63] and need no runtime guard.
 func (r *qwpBitReader) readBitsSlow(n int) (uint64, error) {
 	var result uint64
 	shift := 0
@@ -140,18 +144,9 @@ func (r *qwpBitReader) readBitsSlow(n int) (uint64, error) {
 		if take > r.bitsAvail {
 			take = r.bitsAvail
 		}
-		var mask uint64
-		if take == 64 {
-			mask = ^uint64(0)
-		} else {
-			mask = (uint64(1) << take) - 1
-		}
+		mask := ^uint64(0) >> (64 - take)
 		result |= (r.bitBuffer & mask) << shift
-		if take == 64 {
-			r.bitBuffer = 0
-		} else {
-			r.bitBuffer >>= take
-		}
+		r.bitBuffer = (r.bitBuffer >> 1) >> (take - 1)
 		r.bitsAvail -= take
 		shift += take
 		remaining -= take

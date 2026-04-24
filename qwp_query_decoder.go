@@ -816,17 +816,17 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 	} else {
 		l.arrayRowStart = l.arrayRowStart[:rowCount]
 	}
-	if cap(l.arrayRowLen) < rowCount {
-		l.arrayRowLen = make([]int32, rowCount)
+	if cap(l.arrayElems) < rowCount {
+		l.arrayElems = make([]int32, rowCount)
 	} else {
-		l.arrayRowLen = l.arrayRowLen[:rowCount]
+		l.arrayElems = l.arrayElems[:rowCount]
 	}
 	noNulls := l.nullBitmap == nil
 	ownedBitmap := false
 	for i := 0; i < rowCount; i++ {
 		if !noNulls && l.nonNullIdx[i] < 0 {
 			l.arrayRowStart[i] = 0
-			l.arrayRowLen[i] = 0
+			l.arrayElems[i] = 0
 			continue
 		}
 		rowStart := d.br.pos
@@ -849,7 +849,7 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 			l.nullBitmap[i>>3] |= 1 << (i & 7)
 			l.nonNullCount--
 			l.arrayRowStart[i] = 0
-			l.arrayRowLen[i] = 0
+			l.arrayElems[i] = 0
 			continue
 		}
 		if nDims > qwpMaxArrayNDims {
@@ -878,7 +878,7 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 			return err
 		}
 		l.arrayRowStart[i] = int32(rowStart - base)
-		l.arrayRowLen[i] = int32(d.br.pos - rowStart)
+		l.arrayElems[i] = int32(elements)
 	}
 	// values slice covers the entire array region read above.
 	l.values = d.br.buf[base:d.br.pos]
