@@ -1070,18 +1070,20 @@ func TestQwpColumnFloat32Range(t *testing.T) {
 // past the values buffer via unsafe.Slice.
 func TestQwpColumnRangeOOBPanicsInNoNullsPath(t *testing.T) {
 	cases := []struct {
-		name string
-		run  func(col QwpColumn)
+		name     string
+		wireType qwpTypeCode
+		rowBytes int
+		run      func(col QwpColumn)
 	}{
-		{"Int64Range", func(col QwpColumn) { col.Int64Range(0, 5, nil) }},
-		{"Float64Range", func(col QwpColumn) { col.Float64Range(0, 5, nil) }},
-		{"Int32Range", func(col QwpColumn) { col.Int32Range(0, 5, nil) }},
-		{"Float32Range", func(col QwpColumn) { col.Float32Range(0, 5, nil) }},
+		{"Int64Range", qwpTypeLong, 8, func(col QwpColumn) { col.Int64Range(0, 5, nil) }},
+		{"Float64Range", qwpTypeDouble, 8, func(col QwpColumn) { col.Float64Range(0, 5, nil) }},
+		{"Int32Range", qwpTypeInt, 4, func(col QwpColumn) { col.Int32Range(0, 5, nil) }},
+		{"Float32Range", qwpTypeFloat, 4, func(col QwpColumn) { col.Float32Range(0, 5, nil) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			info := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
-			values := make([]byte, 16) // exactly 2 rows × 8 bytes
+			info := qwpColumnSchemaInfo{name: "v", wireType: tc.wireType}
+			values := make([]byte, 2*tc.rowBytes) // exactly 2 rows wide
 			layout := buildFixedLayout(&info, values, 2)
 			batch := newSingleColumnBatch(info, layout, 2)
 			col := batch.Column(0)
