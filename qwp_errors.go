@@ -79,7 +79,7 @@ func (e *QwpError) Error() string {
 // Returns nil if the status is OK.
 //
 // Precondition: data has already been validated by readAck, which
-// guarantees qwpAckOKSize bytes for OK status and at least
+// guarantees at least qwpAckOKMinSize bytes for OK status and
 // qwpAckErrorHeaderSize + msg_len bytes for non-OK statuses.
 func newQwpErrorFromAck(data []byte) *QwpError {
 	status := qwpStatusCode(data[0])

@@ -41,11 +41,14 @@ import (
 
 // --- Unit tests for ACK parsing ---
 
-// buildAckOK builds a minimal OK ACK response (9 bytes).
+// buildAckOK builds a minimal OK ACK response (11 bytes): the
+// fixed status + sequence header followed by tableCount=0 and no
+// per-table entries.
 func buildAckOK(seq int64) []byte {
-	data := make([]byte, 9)
+	data := make([]byte, qwpAckOKMinSize)
 	data[0] = byte(qwpStatusOK)
 	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
+	// data[9:11] is tableCount, already zero.
 	return data
 }
 
@@ -504,12 +507,13 @@ func TestQwpTransportSendAndAckServerError(t *testing.T) {
 // --- Strict ACK validation tests (mirror Java isStructurallyValid) ---
 
 // TestReadAckRejectsOversizedOK ensures readAck fails loudly when an OK
-// response carries trailing garbage beyond the fixed 9-byte shape.
+// response carries trailing garbage past the per-table entries section.
 func TestReadAckRejectsOversizedOK(t *testing.T) {
 	srv := newTestWSServer(t, func(conn *websocket.Conn) {
 		conn.Read(context.Background())
-		// buildAckOK produces 9 bytes; pad with one extra byte so the
-		// length no longer matches qwpAckOKSize.
+		// buildAckOK produces an 11-byte OK with tableCount=0; pad
+		// with one extra byte so the trailing entries section no
+		// longer ends exactly at len(data).
 		ack := append(buildAckOK(0), 0x00)
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
 	})
