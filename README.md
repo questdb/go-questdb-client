@@ -184,6 +184,88 @@ qdb.LineSenderFromConf(ctx, "wss::addr=host:9000;token=<bearer>;")
 in-flight window already provides pipelined concurrency from a single
 sender.
 
+### Querying with `QwpQueryClient`
+
+QWP also supports the query side: streaming columnar result batches
+from the server back to the client over the same WebSocket protocol.
+Use `QwpQueryClient` to run SELECT and DML statements:
+
+```go
+client, err := qdb.NewQwpQueryClient(ctx,
+    qdb.WithQwpQueryAddress("localhost:9000"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close(ctx)
+
+// Non-SELECT statements use Exec.
+if _, err := client.Exec(ctx,
+    "CREATE TABLE example (ts TIMESTAMP, v LONG) TIMESTAMP(ts)"); err != nil {
+    log.Fatal(err)
+}
+
+// SELECT returns a *QwpQuery; range over its Batches iterator.
+q := client.Query(ctx, "SELECT ts, v FROM example")
+defer q.Close()
+
+var sum int64
+for batch, err := range q.Batches() {
+    if err != nil {
+        log.Fatal(err)
+    }
+    vCol := batch.Column(1) // column 1 is `v` (LONG)
+    for r := 0; r < vCol.RowCount(); r++ {
+        sum += vCol.Int64(r)
+    }
+}
+```
+
+For tight column sweeps you can decode a row range into a caller-owned
+slice in one shot. On a no-null column this lowers to a single
+`memmove`, after which the inner loop is branch-free and vectorizable:
+
+```go
+buf := make([]int64, 0, 1024)
+for batch, err := range q.Batches() {
+    if err != nil {
+        log.Fatal(err)
+    }
+    buf = batch.Column(1).Int64Range(0, batch.RowCount(), buf[:0])
+    for _, v := range buf {
+        sum += v
+    }
+}
+```
+
+Bind parameters are passed via `qdb.WithQueryBinds` and use `$1`, `$2`,
+... placeholders. Setters take 0-based indexes and must be called in
+ascending order:
+
+```go
+q := client.Query(ctx,
+    "SELECT ts, v FROM example WHERE v > $1",
+    qdb.WithQueryBinds(func(b *qdb.QwpBinds) {
+        b.LongBind(0, 100)
+    }),
+)
+```
+
+Configuration via a config string is also supported:
+
+```go
+client, err := qdb.QwpQueryClientFromConf(ctx,
+    "ws::addr=localhost:9000;username=admin;password=secret;")
+```
+
+`QwpQueryClient` is **not** safe for concurrent `Query` or `Exec` calls —
+open one client per query-issuing goroutine. `Cancel` (on `*QwpQuery`)
+and `Close` (on the client) are safe to call from any goroutine,
+including from within an in-flight iterator.
+
+A complete runnable example is at
+[`examples/qwp/query/main.go`](examples/qwp/query/main.go).
+
 ## N-dimensional arrays
 
 QuestDB server version 9.0.0 and newer supports n-dimensional arrays of double precision floating point numbers. 
