@@ -165,7 +165,7 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 			}
 		}
 		tables, _ := s.buildTableEncodeInfo()
-		s.encoders[0].encodeMultiTableWithDeltaDict(
+		s.encoder.encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,
 			s.maxSentSymbolId,
@@ -252,7 +252,7 @@ func qwpSteadyStateSetupWithNulls() (*qwpLineSender, func()) {
 			}
 		}
 		tables, _ := s.buildTableEncodeInfo()
-		s.encoders[0].encodeMultiTableWithDeltaDict(
+		s.encoder.encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,
 			s.maxSentSymbolId,

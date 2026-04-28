@@ -460,8 +460,8 @@ func TestQwpIntegrationAsyncMode(t *testing.T) {
 	}
 	defer s.Close(ctx)
 
-	if s.asyncState == nil {
-		t.Fatal("expected async mode with window=4")
+	if s.cursorEngine == nil || s.cursorSendLoop == nil {
+		t.Fatal("expected cursor engine + send loop to be wired")
 	}
 
 	const rowCount = 1000

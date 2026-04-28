@@ -220,10 +220,6 @@ const (
 	// Java: QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535.
 	qwpDefaultMaxSchemasPerConnection = 65_535
 
-	// qwpDefaultInitEncoderBufSize is the initial encoder buffer size.
-	// Java: QwpWebSocketSender.DEFAULT_BUFFER_SIZE = 8192.
-	qwpDefaultInitEncoderBufSize = 8 * 1024 // 8 KB
-
 	// qwpDefaultMicrobatchBufSize is the per-encoder microbatch buffer
 	// size used to coalesce rows before a WebSocket frame is sent.
 	// Java: QwpWebSocketSender.DEFAULT_MICROBATCH_BUFFER_SIZE = 1 MB.

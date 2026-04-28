@@ -103,31 +103,27 @@ type QwpSender interface {
 // Compile-time check that qwpLineSender implements QwpSender.
 var _ QwpSender = (*qwpLineSender)(nil)
 
-// qwpLineSender implements LineSender for the QWP WebSocket protocol.
-// In sync mode (in-flight window = 1), each Flush() encodes and
-// sends one batch at a time, blocking until the server ACKs.
+// qwpLineSender implements LineSender for the QWP WebSocket
+// protocol. All wire I/O goes through the cursor engine + send
+// loop, regardless of whether store-and-forward (sf_dir) is set —
+// sf_dir picks disk-backed segments, the empty value picks
+// memory-backed segments. The producer encodes a batch into the
+// engine; the I/O goroutine pair drains the engine to the wire and
+// processes ACKs.
 type qwpLineSender struct {
-	// transport manages the WebSocket connection.
-	transport qwpTransport
-
 	// tableBuffers stores one columnar buffer per active table.
 	tableBuffers map[string]*qwpTableBuffer
 	// currentTable is the table buffer for the current in-progress row.
 	currentTable *qwpTableBuffer
 
-	// encoders provides double-buffered QWP message encoders for async
-	// mode. In sync mode, only encoders[0] is used. In async mode, the
-	// two encoders alternate: while one encoder's output is being sent
-	// over the wire, the other can encode the next batch.
-	encoders          [2]qwpEncoder
-	currentEncoderIdx int
-	// encoderReady signals when an encoder's buffer is safe to reuse.
-	// A token is placed after sendMessage completes for that buffer.
-	// In sync mode, these are nil (not used).
-	encoderReady [2]chan struct{}
+	// encoder builds the next QWP message. The cursor engine takes
+	// a copy of the encoded bytes via tryAppend, so a single slot
+	// is enough — no double-buffering needed.
+	encoder qwpEncoder
 
-	// encodeInfoBuf is a reusable scratch slice for buildTableEncodeInfo,
-	// avoiding allocation on every flush.
+	// encodeInfoBuf is a reusable scratch slice for
+	// buildCursorTableEncodeInfo, avoiding allocation on every
+	// flush.
 	encodeInfoBuf []qwpTableEncodeInfo
 
 	// globalSymbols maps symbol strings to global IDs.
@@ -207,31 +203,25 @@ type qwpLineSender struct {
 	// Connection and retry config.
 	retryTimeout time.Duration
 
-	// syncSequence is the sequence of the next batch to send in sync
-	// mode (inFlightWindow == 1). First batch is 0. Incremented after
-	// each successful send so flushSync can recognise its own ACK and
-	// ignore stale ACKs for earlier batches on the same connection.
-	syncSequence int64
-
-	// Async mode (in-flight window > 1).
-	asyncState     *qwpAsyncState
+	// inFlightWindow is retained as a config knob for backwards
+	// compat but is a no-op in cursor mode — the engine handles
+	// concurrency via its own backpressure model.
 	inFlightWindow int
 
-	// closeTimeout is the time Close() waits for the async I/O
-	// goroutine to finish before force-cancelling. Defaults to 5s.
+	// cursorEngine + cursorSendLoop are set on every sender. The
+	// engine is memory-backed when sf_dir is empty and disk-backed
+	// otherwise. The send loop owns the WebSocket connection;
+	// reconnect is its responsibility.
+	cursorEngine   *qwpSfCursorEngine
+	cursorSendLoop *qwpSfSendLoop
+
+	// closeTimeout bounds Close()'s wait for the engine's
+	// ackedFsn to catch up to publishedFsn. <= 0 means fast close
+	// (skip the drain). Defaults to 5s.
 	closeTimeout time.Duration
 
-	// Cursor mode (set when sf_dir is configured). When non-nil, the
-	// engine + send loop replace asyncState: flushed batches are
-	// appended to the engine and transmitted by the send loop's
-	// goroutines. Memory mode still uses asyncState in this PR; the
-	// cursor unification is deferred to a later cleanup.
-	cursorEngine      *qwpSfCursorEngine
-	cursorSendLoop    *qwpSfSendLoop
-	closeFlushTimeout time.Duration
-
 	// drainerPool is non-nil only when the user opted into
-	// drain_orphans in cursor mode. Closed alongside the cursor
+	// drain_orphans (SF mode only). Closed alongside the cursor
 	// engine in closeCursor.
 	drainerPool *qwpSfDrainerPool
 
@@ -239,10 +229,15 @@ type qwpLineSender struct {
 	closed bool
 }
 
-// newQwpLineSender creates a new QWP sender and establishes a
-// WebSocket connection to the server. If inFlightWindow > 1, async
-// mode is enabled with a dedicated I/O goroutine. If dumpWriter is
-// non-nil, outgoing TCP bytes are recorded (see WithQwpDumpWriter).
+// newQwpLineSender creates a new QWP sender backed by an
+// in-memory cursor engine. The send loop establishes the
+// WebSocket connection synchronously; on failure, the constructor
+// returns the dial / upgrade error directly. inFlightWindow is
+// accepted for backwards compatibility but is a no-op (the cursor
+// engine handles concurrency via its own backpressure model). If
+// dumpWriter is non-nil, outgoing bytes are recorded across every
+// transport instance the send loop creates (initial connect plus
+// reconnects).
 func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
 	window := 1
 	if len(inFlightWindow) > 0 && inFlightWindow[0] > 1 {
@@ -263,35 +258,28 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 		inFlightWindow:    window,
 		closeTimeout:      5 * time.Second,
 	}
-	// Initial encoder buffer capacity. Sync mode uses the small 8 KB
-	// default. Async mode uses 1 MB: the user goroutine fills it while the
-	// I/O goroutine transmits the other one. The size can be further grown
-	// by newQwpLineSenderFromConf when autoFlushBytes is large enough to need
-	// max(1 MB, 2*autoFlushBytes).
-	initEncoderCap := qwpDefaultInitEncoderBufSize
-	if window > 1 {
-		initEncoderCap = qwpDefaultMicrobatchBufSize
-	}
-	s.encoders[0].wb.preallocate(initEncoderCap)
-	s.encoders[1].wb.preallocate(initEncoderCap)
+	s.encoder.wb.preallocate(qwpDefaultMicrobatchBufSize)
 
-	s.transport.dumpWriter = dumpWriter
-	if err := s.transport.connect(ctx, address, opts); err != nil {
+	// Build a memory-backed cursor engine. Same architecture as SF
+	// mode, just no disk involvement.
+	engine, err := qwpSfNewCursorEngine("", qwpSfDefaultMaxBytes, qwpSfDefaultMemoryMaxTotalBytes, qwpSfEngineDefaultAppendDeadline)
+	if err != nil {
 		return nil, err
 	}
-
-	// Start async I/O goroutine if window > 1.
-	if window > 1 {
-		s.asyncState = newQwpAsyncState(window, &s.transport)
-		s.asyncState.start()
-		// Initialize double-buffered encoder ready channels.
-		// Both start with a token (both encoders available).
-		s.encoderReady[0] = make(chan struct{}, 1)
-		s.encoderReady[1] = make(chan struct{}, 1)
-		s.encoderReady[0] <- struct{}{}
-		s.encoderReady[1] <- struct{}{}
+	factory := qwpSfBuildReconnectFactory(address, opts, dumpWriter)
+	transport, err := factory(ctx)
+	if err != nil {
+		_ = engine.engineClose()
+		return nil, err
 	}
-
+	loop := qwpSfNewSendLoop(engine, transport, factory,
+		qwpSfDefaultParkInterval,
+		qwpSfDefaultReconnectMaxDuration,
+		qwpSfDefaultReconnectInitialBackoff,
+		qwpSfDefaultReconnectMaxBackoff)
+	loop.sendLoopStart()
+	s.cursorEngine = engine
+	s.cursorSendLoop = loop
 	return s, nil
 }
 
@@ -831,34 +819,36 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 		triggered := (s.maxBufSize > 0 && s.pendingBytes > s.maxBufSize) ||
 			(s.autoFlushBytes > 0 && s.pendingBytes >= s.autoFlushBytes)
 		if triggered {
-			if s.asyncState != nil {
-				return s.enqueueFlush(ctx)
-			}
-			return s.Flush(ctx)
+			return s.autoFlush(ctx)
 		}
 	}
 
-	// Check auto-flush thresholds.
+	// Auto-flush thresholds use enqueueCursor — never wait for
+	// server ACKs from the user goroutine. Explicit Flush() is
+	// where the drain barrier lives.
 	if s.autoFlushRows > 0 && s.pendingRowCount >= s.autoFlushRows {
-		// In async mode, enqueue without waiting for ACKs so the
-		// user goroutine isn't blocked on every auto-flush.
-		if s.asyncState != nil {
-			return s.enqueueFlush(ctx)
-		}
-		return s.Flush(ctx)
+		return s.autoFlush(ctx)
 	}
 
 	if s.autoFlushInterval > 0 {
 		if s.flushDeadline.IsZero() {
 			s.flushDeadline = time.Now().Add(s.autoFlushInterval)
 		} else if time.Now().After(s.flushDeadline) {
-			if s.asyncState != nil {
-				return s.enqueueFlush(ctx)
-			}
-			return s.Flush(ctx)
+			return s.autoFlush(ctx)
 		}
 	}
 
+	return nil
+}
+
+// autoFlush dispatches an auto-flush trigger from atWithTimestamp.
+// Resets pending state on success so subsequent rows hit a clean
+// trigger window. Errors propagate to the user.
+func (s *qwpLineSender) autoFlush(ctx context.Context) error {
+	if err := s.enqueueCursor(ctx); err != nil {
+		return err
+	}
+	s.resetAfterFlush()
 	return nil
 }
 
@@ -876,303 +866,16 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 		return errFlushWithPendingMessage
 	}
 	if s.pendingRowCount == 0 {
-		// Cursor mode: Flush() never waits for server ACK (Java
-		// spec — design decision #1 in qwp-cursor-durability.md).
-		// We surface any terminal I/O error the loop has recorded
-		// so producers don't keep silently buffering into a dead
-		// engine, but we don't block on drain. Use Close to wait.
-		if s.qwpCursorMode() {
-			return s.cursorSendLoop.sendLoopCheckError()
-		}
-		// In async mode, wait for any in-flight batches from
-		// previous auto-flushes to complete. This lets the user
-		// call Flush() as a barrier to confirm all data was ACKed.
-		if s.asyncState != nil {
-			return s.asyncState.waitEmpty(ctx)
-		}
-		return nil
+		// Flush() never waits for server ACK on the cursor path
+		// (Java spec — design decision #1 in
+		// qwp-cursor-durability.md). Surface any terminal I/O
+		// error the loop has recorded so producers don't keep
+		// silently buffering into a dead engine; otherwise return.
+		// Callers wanting a drain barrier should call Close.
+		return s.cursorSendLoop.sendLoopCheckError()
 	}
-
 	defer s.resetAfterFlush()
-
-	if s.qwpCursorMode() {
-		return s.flushCursor(ctx)
-	}
-	if s.asyncState != nil {
-		return s.flushAsync(ctx)
-	}
-	return s.flushSync(ctx)
-}
-
-// flushSync encodes all non-empty tables into a single multi-table
-// QWP message, sends it, and reads ACKs until one whose sequence is
-// at least the just-sent batch's sequence arrives. Earlier sequences
-// are absorbed the way the Java client does in waitForAck — a defensive
-// measure against stale ACKs that can otherwise be mistaken for a
-// response to the wrong batch.
-func (s *qwpLineSender) flushSync(ctx context.Context) error {
-	tables, err := s.buildTableEncodeInfo()
-	if err != nil {
-		return err
-	}
-	if len(tables) == 0 {
-		return nil
-	}
-
-	msg := s.encoders[0].encodeMultiTableWithDeltaDict(
-		tables,
-		s.globalSymbolList,
-		s.maxSentSymbolId,
-		s.batchMaxSymbolId,
-	)
-	if err := s.transport.sendMessage(ctx, msg); err != nil {
-		return err
-	}
-	expected := s.syncSequence
-	s.syncSequence++
-
-	for {
-		status, data, err := s.transport.readAck(ctx)
-		if err != nil {
-			return err
-		}
-		seq := parseAckSequence(data)
-		if status != qwpStatusOK {
-			qErr := newQwpErrorFromAck(data)
-			if qErr == nil {
-				qErr = &QwpError{Status: status, Sequence: seq, Message: "unknown error"}
-			}
-			return qErr
-		}
-		if seq >= expected {
-			break
-		}
-		// Stale ACK for an earlier batch on this connection — absorb
-		// and keep reading. Matches Java's waitForAck.
-	}
-
-	// Advance ACKed state: all schema IDs in this batch are now
-	// known to the server; bump the highest-ACKed symbol ID too.
-	if s.batchMaxSchemaId > s.maxSentSchemaId {
-		s.maxSentSchemaId = s.batchMaxSchemaId
-	}
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
-
-	return nil
-}
-
-// buildTableEncodeInfo collects non-empty tables, assigning fresh
-// schema IDs to any that lack one and selecting full or reference
-// mode based on whether the ID has already been ACKed by the
-// server. Reuses s.encodeInfoBuf to avoid allocating per flush.
-// Also sets s.batchMaxSchemaId to the highest schema ID in the batch.
-// Returns an error if assigning a new schema ID would exceed
-// maxSchemasPerConnection (when > 0).
-func (s *qwpLineSender) buildTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
-	s.encodeInfoBuf = s.encodeInfoBuf[:0]
-	batchMax := s.maxSentSchemaId
-	for _, tb := range s.tableBuffers {
-		if tb.rowCount == 0 {
-			continue
-		}
-		// QWP wire format encodes table count as uint16.
-		if len(s.encodeInfoBuf) == qwpMaxTablesPerBatch {
-			return nil, fmt.Errorf(
-				"qwp: too many tables in one batch: exceeded %d",
-				qwpMaxTablesPerBatch,
-			)
-		}
-		if tb.schemaId < 0 {
-			if s.maxSchemasPerConnection > 0 && s.nextSchemaId >= s.maxSchemasPerConnection {
-				return nil, fmt.Errorf(
-					"qwp: schema registry exhausted (limit %d); close and re-open the sender to reset",
-					s.maxSchemasPerConnection,
-				)
-			}
-			tb.schemaId = s.nextSchemaId
-			s.nextSchemaId++
-		}
-		mode := qwpSchemaModeFull
-		if tb.schemaId <= s.maxSentSchemaId {
-			mode = qwpSchemaModeReference
-		}
-		if tb.schemaId > batchMax {
-			batchMax = tb.schemaId
-		}
-		s.encodeInfoBuf = append(s.encodeInfoBuf, qwpTableEncodeInfo{
-			tb:         tb,
-			schemaMode: mode,
-			schemaId:   tb.schemaId,
-		})
-	}
-	s.batchMaxSchemaId = batchMax
-	return s.encodeInfoBuf, nil
-}
-
-// flushAsync encodes all tables into a single multi-table message,
-// acquires a slot, enqueues the batch, and waits for all in-flight
-// batches to drain before returning. Used by the public Flush() in
-// async mode.
-//
-// Matches the Java client's flushPendingRows() + awaitPendingAcks():
-// schema and symbol IDs are advanced immediately after a successful
-// enqueue, not after the ACK. If a later batch fails, the I/O
-// goroutine stores the error into asyncState.ioErr; every subsequent
-// user-facing call hits checkError() at the top of the flush path
-// and returns the error. Stale cache state can therefore never
-// reach the wire on a live connection.
-func (s *qwpLineSender) flushAsync(ctx context.Context) error {
-	// Check for I/O errors before encoding.
-	if err := s.asyncState.checkError(); err != nil {
-		return err
-	}
-
-	tables, err := s.buildTableEncodeInfo()
-	if err != nil {
-		return err
-	}
-	if len(tables) == 0 {
-		return nil
-	}
-
-	// Wait for the current encoder to be available (double-buffered).
-	// Honour ctx here too: if the I/O goroutine is stuck in sendMessage,
-	// the previous batch's readySignal never fires and an unguarded
-	// receive would silently extend the user's Flush deadline.
-	encIdx := s.currentEncoderIdx
-	select {
-	case <-s.encoderReady[encIdx]:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Encode all tables into a single multi-table message.
-	encoded := s.encoders[encIdx].encodeMultiTableWithDeltaDict(
-		tables,
-		s.globalSymbolList,
-		s.maxSentSymbolId,
-		s.batchMaxSymbolId,
-	)
-
-	// Acquire a slot in the in-flight window.
-	if err := s.asyncState.acquireSlot(ctx); err != nil {
-		// Return the encoder token since we won't enqueue.
-		s.encoderReady[encIdx] <- struct{}{}
-		return err
-	}
-
-	// Enqueue the batch with the encoder's ready signal.
-	// No copy needed — the ioLoop signals encoderReady after
-	// sendMessage, at which point the buffer is safe to reuse.
-	batch := qwpAsyncBatch{
-		data:        encoded,
-		readySignal: s.encoderReady[encIdx],
-	}
-	select {
-	case s.asyncState.sendCh <- batch:
-	case <-ctx.Done():
-		s.encoderReady[encIdx] <- struct{}{}
-		s.asyncState.releaseSlot()
-		return ctx.Err()
-	}
-
-	// Swap to the other encoder for the next flush.
-	s.currentEncoderIdx = 1 - s.currentEncoderIdx
-
-	// Advance highest-sent schema and symbol IDs immediately after
-	// enqueue — same semantics as Java's flushPendingRows. If a
-	// subsequent ACK fails, asyncState.ioErr poisons the sender.
-	if s.batchMaxSchemaId > s.maxSentSchemaId {
-		s.maxSentSchemaId = s.batchMaxSchemaId
-	}
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
-
-	// Drain all in-flight batches before returning (Flush semantics).
-	return s.asyncState.waitEmpty(ctx)
-}
-
-// enqueueFlush encodes all pending table buffers and enqueues them
-// for the I/O goroutine without waiting for ACKs. This is the
-// auto-flush path for async mode — At() returns promptly instead of
-// blocking on a full round-trip. Schema and symbol caches are
-// updated optimistically; if the I/O goroutine later fails, ioErr
-// is set and all subsequent operations return that error (the
-// sender is terminal, so stale cache entries can never reach the
-// wire). Mirrors the Java client's flushPendingRows().
-func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
-	if s.pendingRowCount == 0 {
-		return nil
-	}
-
-	// Check for I/O errors before encoding.
-	if err := s.asyncState.checkError(); err != nil {
-		return err
-	}
-
-	tables, err := s.buildTableEncodeInfo()
-	if err != nil {
-		return err
-	}
-	if len(tables) == 0 {
-		s.resetAfterFlush()
-		return nil
-	}
-
-	// Wait for the current encoder to be available (double-buffered).
-	// Ctx-aware for the same reason as flushAsync: a stuck I/O goroutine
-	// must not extend the caller's deadline.
-	encIdx := s.currentEncoderIdx
-	select {
-	case <-s.encoderReady[encIdx]:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Encode all tables into a single multi-table message.
-	encoded := s.encoders[encIdx].encodeMultiTableWithDeltaDict(
-		tables,
-		s.globalSymbolList,
-		s.maxSentSymbolId,
-		s.batchMaxSymbolId,
-	)
-
-	if err := s.asyncState.acquireSlot(ctx); err != nil {
-		s.encoderReady[encIdx] <- struct{}{}
-		return err
-	}
-
-	// No copy needed — the ioLoop signals encoderReady after
-	// sendMessage, at which point the buffer is safe to reuse.
-	batch := qwpAsyncBatch{
-		data:        encoded,
-		readySignal: s.encoderReady[encIdx],
-	}
-	select {
-	case s.asyncState.sendCh <- batch:
-	case <-ctx.Done():
-		s.encoderReady[encIdx] <- struct{}{}
-		s.asyncState.releaseSlot()
-		return ctx.Err()
-	}
-
-	// Swap to the other encoder for the next flush.
-	s.currentEncoderIdx = 1 - s.currentEncoderIdx
-
-	// Optimistic cache: if the batch fails, ioErr prevents further
-	// operations so stale cache entries are harmless.
-	if s.batchMaxSchemaId > s.maxSentSchemaId {
-		s.maxSentSchemaId = s.batchMaxSchemaId
-	}
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
-
-	s.resetAfterFlush()
-	return nil
+	return s.flushCursor(ctx)
 }
 
 // resetAfterFlush clears all table buffers and resets counters.
@@ -1198,66 +901,12 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 	if s.closed {
 		return errDoubleSenderClose
 	}
-
 	s.closed = true
-
-	// Cursor mode owns its own transport via the send loop —
-	// closeCursor handles the full teardown (drain + loop close +
-	// engine close). The s.transport field is unused on this path.
-	if s.qwpCursorMode() {
-		return s.closeCursor(ctx)
-	}
-
-	var flushErr error
-	if s.asyncState != nil {
-		// Async close: enqueue pending rows non-blocking, then
-		// stop the I/O goroutine (cancel context + close channel
-		// + wait). For a guaranteed graceful flush, call Flush()
-		// before Close().
-		if s.hasTable {
-			if s.currentTable != nil {
-				s.currentTable.cancelRow()
-			}
-			s.hasTable = false
-			s.currentTable = nil
-		}
-		if s.pendingRowCount > 0 {
-			flushErr = s.enqueueFlush(ctx)
-		}
-		s.asyncState.stop(s.closeTimeout)
-		if flushErr == nil {
-			flushErr = s.asyncState.checkError()
-		}
-	} else {
-		flushErr = s.flush0(ctx)
-	}
-
-	closeErr := s.transport.close()
-
-	if flushErr != nil {
-		return flushErr
-	}
-	return closeErr
-}
-
-// flush0 is the internal flush used by Close in sync mode. The async
-// Close path uses enqueueFlush + stop() directly, so this function
-// is only called when asyncState == nil.
-func (s *qwpLineSender) flush0(ctx context.Context) error {
-	if s.hasTable {
-		// Drop the pending row silently on close.
-		if s.currentTable != nil {
-			s.currentTable.cancelRow()
-		}
-		s.hasTable = false
-		s.currentTable = nil
-	}
-	if s.pendingRowCount == 0 {
-		return nil
-	}
-
-	defer s.resetAfterFlush()
-	return s.flushSync(ctx)
+	// All wire I/O goes through the cursor engine + send loop,
+	// regardless of whether sf_dir was set. closeCursor drains
+	// (up to closeTimeout), stops the loop, closes the engine,
+	// and tears down the orphan-drainer pool if one was started.
+	return s.closeCursor(ctx)
 }
 
 // --- QwpSender interface: extended column types ---

@@ -46,6 +46,11 @@ const qwpSfDefaultMaxBytes int64 = 4 * 1024 * 1024
 // is set. Mirrors Java's 10 GiB SF default.
 const qwpSfDefaultMaxTotalBytes int64 = 10 * 1024 * 1024 * 1024
 
+// qwpSfDefaultMemoryMaxTotalBytes is the default total cap when
+// sf_dir is empty (memory mode cursor). Mirrors Java's 128 MiB
+// memory-mode default.
+const qwpSfDefaultMemoryMaxTotalBytes int64 = 128 * 1024 * 1024
+
 // qwpSfDefaultCloseFlushTimeout mirrors Java's 5-second default.
 const qwpSfDefaultCloseFlushTimeout = 5 * time.Second
 
@@ -98,18 +103,15 @@ func newQwpCursorLineSender(
 		autoFlushBytes:          autoFlushBytes,
 		maxBufSize:              maxBufSize,
 		maxSchemasPerConnection: maxSchemasPerConnection,
-		// Cursor mode never uses qwpAsyncState — the cursor engine is
-		// the queue, the send loop is the I/O goroutine pair.
-		inFlightWindow:    1,
-		closeTimeout:      closeFlushTimeout,
-		cursorEngine:      cursorEngine,
-		cursorSendLoop:    cursorSendLoop,
-		closeFlushTimeout: closeFlushTimeout,
+		inFlightWindow: 1,
+		closeTimeout:   closeFlushTimeout,
+		cursorEngine:   cursorEngine,
+		cursorSendLoop: cursorSendLoop,
 	}
 	// Single encoder slot is enough — the cursor engine takes a copy
 	// of the bytes via tryAppend, so the encoder buffer can be reused
 	// immediately. No double-buffering needed here.
-	s.encoders[0].wb.preallocate(qwpDefaultMicrobatchBufSize)
+	s.encoder.wb.preallocate(qwpDefaultMicrobatchBufSize)
 	return s, nil
 }
 
@@ -210,7 +212,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		return nil, err
 	}
 	s.fileNameLimit = conf.fileNameLimit
-	s.encoders[0].gorillaDisabled = conf.gorillaDisabled
+	s.encoder.gorillaDisabled = conf.gorillaDisabled
 
 	// Orphan adoption (drain_orphans=on). At foreground startup,
 	// scan <sf_dir>/* for sibling slots that hold unacked data and
@@ -258,8 +260,9 @@ func qwpSfBuildReconnectFactory(address string, opts qwpTransportOpts, dumpWrite
 }
 
 // flushCursor encodes the pending rows as a self-sufficient QWP
-// frame and appends it to the cursor engine. Used by Flush and
-// auto-flush in cursor mode.
+// frame, appends it to the cursor engine, and (for explicit
+// Flush() callers) blocks until ackedFsn catches up. Used by
+// Flush and auto-flush in cursor mode.
 //
 // Self-sufficient = full schema definitions for every table + full
 // symbol-dict delta from id 0 (mirrors Java decision #14). The
@@ -268,11 +271,17 @@ func qwpSfBuildReconnectFactory(address string, opts qwpTransportOpts, dumpWrite
 // — refs to schema/symbol IDs the new server has never seen would
 // be unrecoverable. Producer-side maxSentSchemaId / maxSentSymbolId
 // retention is therefore a no-op on the cursor path.
+//
+// The Go API contract — `Flush() returns once the server has
+// confirmed the batch` — predates the cursor unification and is
+// what existing users rely on. We deviate from the Java spec's
+// `flush() never waits for ACK` here in favor of preserving the
+// Go contract. Use auto-flush for non-blocking enqueue.
 func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 		return err
 	}
-	tables, err := s.buildCursorTableEncodeInfo()
+	tables, err := s.buildTableEncodeInfo()
 	if err != nil {
 		return err
 	}
@@ -282,7 +291,7 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 	// Encoder slot 0 is reused on every flush — engine.tryAppend
 	// copies the bytes into the segment, so the encoder buffer is
 	// safe to overwrite immediately.
-	encoded := s.encoders[0].encodeMultiTableWithDeltaDict(
+	encoded := s.encoder.encodeMultiTableWithDeltaDict(
 		tables,
 		s.globalSymbolList,
 		-1, // maxSentSymbolId=-1 → emit the full dict from id 0
@@ -318,20 +327,113 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 		return err
 	}
+	// Drain barrier: wait for the server to ACK every published
+	// frame. Bounded by ctx; falls through on a terminal loop
+	// error so the producer surfaces it immediately.
+	if err := s.waitCursorEmpty(ctx); err != nil {
+		return err
+	}
+	// Bump the producer-side ACK trackers. Cursor frames are
+	// self-sufficient so this is informational only — we never
+	// emit refs — but tests and external observers still inspect
+	// these counters to confirm a flush has been ACK'd by the
+	// server.
+	if s.batchMaxSchemaId > s.maxSentSchemaId {
+		s.maxSentSchemaId = s.batchMaxSchemaId
+	}
+	if s.batchMaxSymbolId > s.maxSentSymbolId {
+		s.maxSentSymbolId = s.batchMaxSymbolId
+	}
 	return nil
 }
 
-// buildCursorTableEncodeInfo is the cursor-mode equivalent of
-// buildTableEncodeInfo: every table is encoded in FULL schema mode
-// regardless of whether its schema ID has been ACK'd. Mirrors the
-// Java client's "self-sufficient frames" contract — refs make
-// replay impossible.
+// enqueueCursor is the auto-flush path's append-only counterpart
+// of flushCursor. It encodes pending rows and appends them into
+// the cursor engine, but does NOT wait for ACKs — so the user
+// goroutine isn't blocked on every auto-flush trigger. Mirrors the
+// Java client's flushPendingRows contract: schema and symbol
+// trackers advance optimistically because the send loop is
+// terminal on I/O error (ioErr poisons every subsequent call), so
+// stale tracker state cannot reach the wire.
+func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
+	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+		return err
+	}
+	tables, err := s.buildTableEncodeInfo()
+	if err != nil {
+		return err
+	}
+	if len(tables) == 0 {
+		return nil
+	}
+	encoded := s.encoder.encodeMultiTableWithDeltaDict(
+		tables,
+		s.globalSymbolList,
+		-1, // self-sufficient: full dict from id 0
+		s.batchMaxSymbolId,
+	)
+	type appendResult struct {
+		fsn int64
+		err error
+	}
+	resCh := make(chan appendResult, 1)
+	go func() {
+		fsn, err := s.cursorEngine.engineAppendBlocking(encoded)
+		resCh <- appendResult{fsn: fsn, err: err}
+	}()
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			return res.err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if s.batchMaxSchemaId > s.maxSentSchemaId {
+		s.maxSentSchemaId = s.batchMaxSchemaId
+	}
+	if s.batchMaxSymbolId > s.maxSentSymbolId {
+		s.maxSentSymbolId = s.batchMaxSymbolId
+	}
+	return nil
+}
+
+// waitCursorEmpty blocks until ackedFsn ≥ publishedFsn, ctx
+// cancels, or the send loop records a terminal error. Unlike
+// waitCursorDrain it has no internal timeout — Flush is bounded by
+// the user's ctx, not by closeFlushTimeout.
+func (s *qwpLineSender) waitCursorEmpty(ctx context.Context) error {
+	const pollInterval = 5 * time.Millisecond
+	tick := time.NewTicker(pollInterval)
+	defer tick.Stop()
+	for {
+		if s.cursorEngine.engineAckedFsn() >= s.cursorEngine.enginePublishedFsn() {
+			return nil
+		}
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			return err
+		}
+		select {
+		case <-tick.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// buildTableEncodeInfo collects non-empty tables, assigns fresh
+// schema IDs to any that lack one, and emits every table in FULL
+// schema mode. Mirrors the Java client's "self-sufficient frames"
+// contract — refs to schema/symbol IDs the new server has never
+// seen would be unrecoverable on replay (post-reconnect, post-
+// restart, drainer adopting an orphan slot), so the cursor wire
+// path always carries the schema in full.
 //
-// Schema IDs are still assigned monotonically (so the connection-
-// scoped server-side registry stays consistent for reconnects on
-// the same connection), but useSchemaRef is forced to false on
-// every encode.
-func (s *qwpLineSender) buildCursorTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
+// Schema IDs are still assigned monotonically so the connection-
+// scoped server-side registry stays consistent across the lifetime
+// of a single connection; but useSchemaRef is forced to false on
+// every encode regardless of maxSentSchemaId.
+func (s *qwpLineSender) buildTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
 	s.encodeInfoBuf = s.encodeInfoBuf[:0]
 	batchMax := s.maxSentSchemaId
 	for _, tb := range s.tableBuffers {
@@ -401,7 +503,7 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 		s.resetAfterFlush()
 	}
 	// Wait for drain.
-	if s.closeFlushTimeout > 0 {
+	if s.closeTimeout > 0 {
 		if err := s.waitCursorDrain(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -430,8 +532,8 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 // (closeCursor) proceeds with shutdown rather than failing — the
 // data is durable on disk in SF mode and will be replayed.
 func (s *qwpLineSender) waitCursorDrain(ctx context.Context) error {
-	deadline := time.Now().Add(s.closeFlushTimeout)
-	timer := time.NewTimer(s.closeFlushTimeout)
+	deadline := time.Now().Add(s.closeTimeout)
+	timer := time.NewTimer(s.closeTimeout)
 	defer timer.Stop()
 	const pollInterval = 5 * time.Millisecond
 	tick := time.NewTicker(pollInterval)

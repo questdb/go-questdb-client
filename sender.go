@@ -1057,15 +1057,12 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	if conf.closeTimeout > 0 {
 		s.closeTimeout = conf.closeTimeout
 	}
-	s.encoders[0].gorillaDisabled = conf.gorillaDisabled
-	s.encoders[1].gorillaDisabled = conf.gorillaDisabled
-	// Async mode's encoder buffers are pre-sized for the microbatch
-	// role: max(1 MB, 2 * autoFlushBytes). Matches the Java client's
-	// MicrobatchBuffer sizing. The 1 MB floor was already applied in
+	s.encoder.gorillaDisabled = conf.gorillaDisabled
+	// Encoder buffer is pre-sized for the microbatch role: max(1 MB,
+	// 2 * autoFlushBytes). The 1 MB floor was already applied in
 	// newQwpLineSender; grow further if autoFlushBytes warrants it.
-	if s.asyncState != nil && conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
-		s.encoders[0].wb.preallocate(conf.autoFlushBytes * 2)
-		s.encoders[1].wb.preallocate(conf.autoFlushBytes * 2)
+	if conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
+		s.encoder.wb.preallocate(conf.autoFlushBytes * 2)
 	}
 	return s, nil
 }

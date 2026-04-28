@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -107,10 +108,11 @@ func TestQwpSenderBasicRow(t *testing.T) {
 	}
 }
 
-// TestQwpSyncFlushAbsorbsStaleAck verifies that sync-mode flushSync
-// ignores an ACK whose cumulative sequence is older than the batch it
-// just sent and keeps reading until the matching ACK arrives. Matches
-// Java's waitForAck, which tolerates stale ACKs on the same connection.
+// TestQwpSyncFlushAbsorbsStaleAck verifies that the cursor send
+// loop tolerates an ACK whose cumulative sequence is older than the
+// most recent published batch and keeps making forward progress.
+// engineAcknowledge is monotonic — it clamps to ackedFsn — so stale
+// ACKs are absorbed without breaking the engine's drain accounting.
 func TestQwpSyncFlushAbsorbsStaleAck(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
@@ -145,10 +147,6 @@ func TestQwpSyncFlushAbsorbsStaleAck(t *testing.T) {
 		if err := s.Flush(context.Background()); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
-	}
-
-	if got := s.syncSequence; got != 3 {
-		t.Fatalf("syncSequence = %d, want 3", got)
 	}
 }
 
@@ -451,9 +449,14 @@ func TestQwpSenderClosedOperations(t *testing.T) {
 }
 
 func TestQwpSenderAutoFlushRows(t *testing.T) {
-	// Mock server that counts received messages.
+	// Mock server that counts received messages and signals the
+	// test goroutine on every receive — cursor mode's auto-flush is
+	// asynchronous (send loop transmits in the background), so the
+	// test must wait for the server to observe the frame rather
+	// than poll on shared memory.
 	var mu sync.Mutex
 	msgCount := 0
+	msgReceived := make(chan struct{}, 16)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
@@ -473,6 +476,10 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 			mu.Unlock()
 			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
 			seq++
+			select {
+			case msgReceived <- struct{}{}:
+			default:
+			}
 		}
 	}))
 	defer srv.Close()
@@ -493,7 +500,13 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 		}
 	}
 
-	// Auto-flush should have triggered at row 3.
+	// Auto-flush should have triggered at row 3. Block until the
+	// server signals it received that frame.
+	select {
+	case <-msgReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("auto-flush frame did not reach the server within 2s")
+	}
 	mu.Lock()
 	gotMsgCount := msgCount
 	mu.Unlock()
@@ -506,7 +519,8 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 }
 
 func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
-	// Mock server that counts received messages.
+	// Mock server that counts received messages and signals on
+	// every receive (see TestQwpSenderAutoFlushRows for rationale).
 	var mu sync.Mutex
 	msgCount := 0
 	readMsgCount := func() int {
@@ -514,6 +528,7 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 		defer mu.Unlock()
 		return msgCount
 	}
+	msgReceived := make(chan struct{}, 16)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
@@ -533,6 +548,10 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 			mu.Unlock()
 			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
 			seq++
+			select {
+			case msgReceived <- struct{}{}:
+			default:
+			}
 		}
 	}))
 	defer srv.Close()
@@ -560,10 +579,16 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 	// Wait for the interval to expire.
 	time.Sleep(20 * time.Millisecond)
 
-	// Second row: should trigger time-based auto-flush.
+	// Second row: triggers time-based auto-flush. Block until the
+	// server signals it received the frame.
 	err = s.Table("t").Int64Column("x", int64(2)).AtNow(context.Background())
 	if err != nil {
 		t.Fatalf("row 2: %v", err)
+	}
+	select {
+	case <-msgReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("time-based auto-flush did not reach the server within 2s")
 	}
 	if got := readMsgCount(); got != 1 {
 		t.Fatalf("after row 2: msgCount = %d, want 1 (time-based flush)", got)
@@ -1392,26 +1417,21 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 		t.Fatalf("msg1 deltaCount = %d, want 2", deltaCount)
 	}
 
-	// Parse second message: delta should start at 2 with count 1.
+	// Cursor mode emits self-sufficient frames: every batch carries
+	// the full symbol dict from id 0. So the second message also
+	// has deltaStart=0 (NOT 2), with all three symbols repeated.
+	// This is the documented "self-sufficient frames" decision (see
+	// design/qwp-cursor-durability.md decision #14).
 	msg2 := messages[1]
 	off = qwpHeaderSize
 	deltaStart2, n, _ := qwpReadVarint(msg2[off:])
 	off += n
-	if deltaStart2 != 2 {
-		t.Fatalf("msg2 deltaStart = %d, want 2", deltaStart2)
+	if deltaStart2 != 0 {
+		t.Fatalf("msg2 deltaStart = %d, want 0 (cursor mode is self-sufficient)", deltaStart2)
 	}
-	deltaCount2, n, _ := qwpReadVarint(msg2[off:])
-	off += n
-	if deltaCount2 != 1 {
-		t.Fatalf("msg2 deltaCount = %d, want 1", deltaCount2)
-	}
-
-	// Verify the new symbol is "GOOG".
-	symLen, n, _ := qwpReadVarint(msg2[off:])
-	off += n
-	sym := string(msg2[off : off+int(symLen)])
-	if sym != "GOOG" {
-		t.Fatalf("msg2 delta symbol = %q, want %q", sym, "GOOG")
+	deltaCount2, _, _ := qwpReadVarint(msg2[off:])
+	if deltaCount2 != 3 {
+		t.Fatalf("msg2 deltaCount = %d, want 3 (full dict re-sent)", deltaCount2)
 	}
 }
 
@@ -1452,9 +1472,9 @@ func TestQwpSenderServerError(t *testing.T) {
 		t.Fatal("expected error from server")
 	}
 
-	qErr, ok := err.(*QwpError)
-	if !ok {
-		t.Fatalf("expected *QwpError, got %T: %v", err, err)
+	var qErr *QwpError
+	if !errors.As(err, &qErr) {
+		t.Fatalf("expected *QwpError in chain, got %T: %v", err, err)
 	}
 	if qErr.Status != qwpStatusWriteError {
 		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusWriteError)
@@ -1571,9 +1591,9 @@ func TestQwpSenderAsyncBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify async mode is enabled.
-	if s.asyncState == nil {
-		t.Fatal("asyncState should not be nil for window=2")
+	// Verify the cursor engine is wired (memory-backed, no sf_dir).
+	if s.cursorEngine == nil || s.cursorSendLoop == nil {
+		t.Fatal("cursor engine and send loop must be wired for QWP sender")
 	}
 
 	// Send 5 rows.
@@ -1755,10 +1775,13 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 		t.Fatalf("messages = %d, want 1", len(messages))
 	}
 	modes = extractAllSchemaModes(t, messages[0])
+	// Cursor mode emits self-sufficient frames: schema is repeated
+	// in full on every batch (no schema-ref optimization). See
+	// design/qwp-cursor-durability.md decision #14.
 	for i, mode := range modes {
-		if mode != byte(qwpSchemaModeReference) {
-			t.Fatalf("table %d (2nd flush): schemaMode = 0x%02X, want 0x%02X (ref)",
-				i, mode, qwpSchemaModeReference)
+		if mode != byte(qwpSchemaModeFull) {
+			t.Fatalf("table %d (2nd flush): schemaMode = 0x%02X, want 0x%02X (full, cursor self-sufficient)",
+				i, mode, qwpSchemaModeFull)
 		}
 	}
 }
@@ -1944,13 +1967,13 @@ func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
 
 	// All 30 rows have been inserted. The user goroutine returned
 	// from AtNow without blocking. Verify that multiple batches are
-	// in-flight (enqueued but not yet ACKed).
-	s.asyncState.mu.Lock()
-	count := s.asyncState.inFlightCount
-	s.asyncState.mu.Unlock()
-
-	if count < 2 {
-		t.Fatalf("expected at least 2 batches in-flight concurrently, got %d", count)
+	// in-flight (published into the engine but not yet ACKed).
+	pub := s.cursorEngine.enginePublishedFsn()
+	acked := s.cursorEngine.engineAckedFsn()
+	inFlight := pub - acked
+	if inFlight < 2 {
+		t.Fatalf("expected at least 2 batches in-flight concurrently, got %d (published=%d acked=%d)",
+			inFlight, pub, acked)
 	}
 
 	// Release the gate so the server can ACK all batches.
