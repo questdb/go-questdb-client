@@ -49,9 +49,11 @@ const (
 const qwpSfDrainerPollInterval = 50 * time.Millisecond
 
 // qwpSfDrainerPoolCloseGrace bounds how long the pool's close()
-// waits for active drainers to exit cleanly. Mirrors the Java
-// 3-second grace.
-const qwpSfDrainerPoolCloseGrace = 3 * time.Second
+// waits for active drainers to exit cleanly before cancelling the
+// pool's master ctx to forcibly unwind blocking dials. Mirrors the
+// Java 3-second grace. var (not const) so package tests can dial
+// it down without paying the full 3 s.
+var qwpSfDrainerPoolCloseGrace = 3 * time.Second
 
 // qwpSfOrphanDrainer empties one orphan slot and exits. Owned by
 // qwpSfDrainerPool; one instance per slot.
@@ -171,6 +173,13 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	}
 	transport, err := d.clientFactory(ctx)
 	if err != nil {
+		// Pool close (or caller cancellation) during the dial:
+		// don't drop a .failed sentinel — the slot is still
+		// drainable on a future sender start.
+		if ctx.Err() != nil || d.stopRequested.Load() {
+			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
+			return
+		}
 		msg := err.Error()
 		d.recordFailure("initial connect: " + msg)
 		return
@@ -215,12 +224,23 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 // semaphore channel. Idle pool (no orphans submitted) costs zero
 // goroutines. Closing the pool requests every still-running
 // drainer to stop and waits up to qwpSfDrainerPoolCloseGrace for
-// them to exit cleanly.
+// them to exit cleanly; if any drainer is still alive after the
+// grace (typically blocked in a TCP dial / WS upgrade), the pool
+// cancels its master context so blocking I/O unwinds, then waits
+// for full exit before returning.
 type qwpSfDrainerPool struct {
 	maxConcurrent int
 	sem           chan struct{}
 	closed        atomic.Bool
 	wg            sync.WaitGroup
+
+	// ctx is the master context handed to every drainerRun call.
+	// Cancelled in drainerPoolClose so dials and other ctx-aware
+	// blocking calls unwind. Independent of the caller's setup
+	// ctx — drainers are long-lived and must outlive whatever
+	// transient ctx was used to construct the parent sender.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu     sync.Mutex
 	active []*qwpSfOrphanDrainer
@@ -232,9 +252,12 @@ func qwpSfNewDrainerPool(maxConcurrent int) *qwpSfDrainerPool {
 	if maxConcurrent <= 0 {
 		panic("qwp/sf: maxConcurrent must be > 0")
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &qwpSfDrainerPool{
 		maxConcurrent: maxConcurrent,
 		sem:           make(chan struct{}, maxConcurrent),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 }
 
@@ -242,22 +265,33 @@ func qwpSfNewDrainerPool(maxConcurrent int) *qwpSfDrainerPool {
 // Returns an error if the pool has been closed.
 //
 // Drainers queue when the concurrency cap is reached: the
-// goroutine takes a slot on the semaphore and proceeds.
+// goroutine takes a slot on the semaphore and proceeds. The
+// caller's ctx only gates the semaphore wait — once the drainer
+// is running, it observes the pool's master ctx instead, so
+// drainers outlive the caller's (typically setup-only) ctx.
 func (p *qwpSfDrainerPool) drainerPoolSubmit(ctx context.Context, d *qwpSfOrphanDrainer) error {
 	if p.closed.Load() {
 		return errors.New("qwp/sf: drainer pool closed")
 	}
 	p.mu.Lock()
+	if p.closed.Load() {
+		p.mu.Unlock()
+		return errors.New("qwp/sf: drainer pool closed")
+	}
 	p.active = append(p.active, d)
-	p.mu.Unlock()
 	p.wg.Add(1)
+	p.mu.Unlock()
 	go func() {
 		defer p.wg.Done()
-		// Wait for a slot. If the pool closes mid-wait, the slot
-		// channel never frees up — but ctx.Done unblocks us.
+		defer p.removeActive(d)
+		// Wait for a slot. The caller's ctx unblocks if the user
+		// gives up on setup; the pool's ctx unblocks on close.
 		select {
 		case p.sem <- struct{}{}:
 		case <-ctx.Done():
+			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
+			return
+		case <-p.ctx.Done():
 			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
 			return
 		}
@@ -266,13 +300,33 @@ func (p *qwpSfDrainerPool) drainerPoolSubmit(ctx context.Context, d *qwpSfOrphan
 			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
 			return
 		}
-		d.drainerRun(ctx)
+		// Use the pool's ctx so the drainer is detached from the
+		// caller's setup ctx (its expected lifetime is far longer)
+		// but is forcibly cancellable when the pool is closing.
+		d.drainerRun(p.ctx)
 	}()
 	return nil
 }
 
-// drainerPoolSnapshot returns a copy of the currently-tracked
-// drainers (active + finished). Useful for status accessors.
+// removeActive unlinks d from the active list when its goroutine
+// exits. Called from a defer in drainerPoolSubmit's worker.
+func (p *qwpSfDrainerPool) removeActive(d *qwpSfOrphanDrainer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, x := range p.active {
+		if x == d {
+			n := len(p.active)
+			p.active[i] = p.active[n-1]
+			p.active[n-1] = nil
+			p.active = p.active[:n-1]
+			return
+		}
+	}
+}
+
+// drainerPoolSnapshot returns a copy of the drainers currently
+// running (or queued on the semaphore). Drainers that have run
+// to completion are pruned. Useful for status accessors.
 func (p *qwpSfDrainerPool) drainerPoolSnapshot() []*qwpSfOrphanDrainer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -282,9 +336,11 @@ func (p *qwpSfDrainerPool) drainerPoolSnapshot() []*qwpSfOrphanDrainer {
 }
 
 // drainerPoolClose stops the pool. Sets closed=true so new submits
-// fail; requests stop on every tracked drainer; waits up to
-// qwpSfDrainerPoolCloseGrace for drainers to exit, then proceeds.
-// Idempotent.
+// fail; requests a polite stop on every tracked drainer; waits up
+// to qwpSfDrainerPoolCloseGrace. If any drainer is still alive at
+// the grace boundary it is most likely parked in a TCP dial / WS
+// upgrade — cancel the master ctx to unwind those blocking calls,
+// then wait for full exit. Idempotent.
 func (p *qwpSfDrainerPool) drainerPoolClose() {
 	if !p.closed.CompareAndSwap(false, true) {
 		return
@@ -302,5 +358,10 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 	select {
 	case <-doneCh:
 	case <-time.After(qwpSfDrainerPoolCloseGrace):
+		p.cancel()
+		<-doneCh
 	}
+	// Release the master ctx even on the clean-exit path so the
+	// underlying timer goroutine doesn't linger.
+	p.cancel()
 }

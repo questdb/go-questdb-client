@@ -211,23 +211,91 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 		require.NoError(t, engine.engineClose())
 	}
 
+	drainers := make([]*qwpSfOrphanDrainer, 0, len(dirs))
 	for _, dir := range dirs {
 		drainer := qwpSfNewOrphanDrainer(
 			dir, segSize, qwpSfUnlimitedTotalBytes,
 			qwpSfDialFor(srv),
 			1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
 		)
+		drainers = append(drainers, drainer)
 		require.NoError(t, pool.drainerPoolSubmit(context.Background(), drainer))
 	}
 	pool.drainerPoolClose()
-	// All drainers should have run.
-	snap := pool.drainerPoolSnapshot()
-	require.Len(t, snap, 3)
-	for _, d := range snap {
-		// We don't strictly require Success since close grace might
-		// cut some off, but the outcome must not be PENDING.
+	// Every submitted drainer must reach a terminal state — we
+	// don't strictly require Success since close grace might cut
+	// some off, but the outcome must not be PENDING.
+	for _, d := range drainers {
 		assert.NotEqual(t, qwpSfDrainOutcomePending, d.drainerOutcome())
 	}
+	// Snapshot must be empty after close: completed drainers are
+	// pruned from the active list as their goroutines exit.
+	assert.Empty(t, pool.drainerPoolSnapshot())
+}
+
+// Regression: a drainer parked inside clientFactory(ctx) — e.g. a
+// long-running TCP dial / WS upgrade against a black-holed peer —
+// must not survive past drainerPoolClose. The pool cancels its
+// master ctx after the polite-stop grace; the dial unwinds; the
+// drainer goroutine exits.
+func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
+	prevGrace := qwpSfDrainerPoolCloseGrace
+	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
+	defer func() { qwpSfDrainerPoolCloseGrace = prevGrace }()
+
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+
+	dialEntered := make(chan struct{}, 1)
+	blockingFactory := func(ctx context.Context) (*qwpTransport, error) {
+		select {
+		case dialEntered <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	pool := qwpSfNewDrainerPool(1)
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		blockingFactory,
+		1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	require.NoError(t, pool.drainerPoolSubmit(context.Background(), drainer))
+
+	// Make sure the drainer is actually parked in the dial before
+	// we close — otherwise we'd be testing the polite-stop path.
+	select {
+	case <-dialEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainer never entered clientFactory")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		pool.drainerPoolClose()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainerPoolClose did not return after grace + ctx cancel")
+	}
+
+	// Drainer must have exited cleanly as Stopped (not Failed) —
+	// a ctx-cancel during dial should NOT leave a .failed sentinel
+	// in the slot, since the slot is still recoverable.
+	assert.Equal(t, qwpSfDrainOutcomeStopped, drainer.drainerOutcome())
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "must not leave .failed sentinel on close-during-dial")
+
+	// Active list must be pruned: drainer goroutine has exited.
+	assert.Empty(t, pool.drainerPoolSnapshot())
 }
 
 func TestQwpSfDrainerPoolRejectsAfterClose(t *testing.T) {
