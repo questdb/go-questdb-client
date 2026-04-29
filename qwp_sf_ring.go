@@ -168,11 +168,18 @@ func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, e
 		return nil, fmt.Errorf("qwp/sf: read %s: %w", sfDir, err)
 	}
 	var opened []*qwpSfSegment
-	cleanupOpened := func() {
+	// Defense-in-depth: anything escaping the recovery body — a panic
+	// from native munmap, an OOM from a future concurrent allocator,
+	// the FSN-gap error below — must close every recovered fd+mmap
+	// before propagating. After the success path opened is reassigned
+	// to drop the active segment (transferred to the ring) and the
+	// sealed segments (transferred to ring.sealedSegments), so this
+	// cleanup is a no-op once we reach the bottom.
+	defer func() {
 		for _, s := range opened {
 			_ = s.close()
 		}
-	}
+	}()
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".sfa") {
@@ -193,9 +200,23 @@ func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, e
 		// baseSeq=0 and frameCount=0, which would otherwise collide
 		// with the real baseSeq=0 segment and trip the contiguity
 		// check below. No data to recover; close and unlink.
+		//
+		// CAUTION: only unlink when the file is genuinely empty past
+		// the header. If frame[0] failed CRC (bit-rot, partial-page-
+		// write at crash, etc.) but valid frames followed, scanFrames
+		// returns lastGood=HEADER_SIZE and frameCount=0 — yet
+		// tornTailBytes is non-zero. Treating that as "empty hot
+		// spare" would silently destroy every surviving frame.
+		// Quarantine to <path>.corrupt instead so a postmortem can
+		// recover what's left.
 		if seg.segmentFrameCount() == 0 {
+			torn := seg.segmentTornTailBytes()
 			_ = seg.close()
-			_ = os.Remove(path)
+			if torn > 0 {
+				_ = os.Rename(path, path+".corrupt")
+			} else {
+				_ = os.Remove(path)
+			}
 			continue
 		}
 		opened = append(opened, seg)
@@ -210,13 +231,13 @@ func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, e
 	})
 	// Sanity: the recovered segments must form a contiguous FSN
 	// range. Detect gaps so a partial-write/manual-deletion mishap
-	// doesn't silently produce duplicate or missing FSNs.
+	// doesn't silently produce duplicate or missing FSNs. The deferred
+	// cleanup above handles closing on the error path.
 	for i := 1; i < len(opened); i++ {
 		prev := opened[i-1]
 		curr := opened[i]
 		expected := prev.segmentBaseSeq() + prev.segmentFrameCount()
 		if curr.segmentBaseSeq() != expected {
-			cleanupOpened()
 			return nil, fmt.Errorf(
 				"qwp/sf: FSN gap in recovered segments: prev baseSeq=%d frameCount=%d expected next baseSeq=%d but got %d",
 				prev.segmentBaseSeq(), prev.segmentFrameCount(), expected, curr.segmentBaseSeq())
@@ -227,9 +248,12 @@ func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, e
 	// manager installs a hot spare, the producer rotates.
 	last := len(opened) - 1
 	active := opened[last]
-	opened = opened[:last]
+	sealed := opened[:last]
 	r := qwpSfNewSegmentRing(active, maxBytesPerSegment)
-	r.sealedSegments = opened
+	r.sealedSegments = sealed
+	// Ownership transferred to the ring — clear opened so the deferred
+	// cleanup leaves the recovered segments alone.
+	opened = nil
 	return r, nil
 }
 
@@ -244,7 +268,17 @@ func (r *qwpSfSegmentRing) segmentRingAckedFsn() int64 {
 // server has confirmed every FSN up to and including this value.
 // Idempotent: a second call with the same or smaller value is a
 // no-op.
+//
+// Defense-in-depth: clamp at publishedFsn so a malformed/poisoned
+// server response with a bogus wireSeq cannot move ackedFsn past
+// what the producer has actually written. Without the clamp, the
+// segment manager could trim segments the I/O thread is still
+// iterating and SEGV the process on the next mmap read.
 func (r *qwpSfSegmentRing) acknowledge(seq int64) {
+	pub := r.publishedFsn.Load()
+	if seq > pub {
+		seq = pub
+	}
 	for {
 		cur := r.ackedFsn.Load()
 		if seq <= cur {

@@ -262,6 +262,35 @@ func TestQwpSfSegmentRecoveryHandlesCleanPartialFill(t *testing.T) {
 	assert.Equal(t, int64(0), seg.segmentTornTailBytes())
 }
 
+func TestQwpSfSegmentRecoveryRejectsNegativeBaseSeq(t *testing.T) {
+	// FSNs are non-negative by construction. A negative baseSeq on disk
+	// means bit-rot or a hand-edited file; recovery must refuse it
+	// rather than feeding the bad value into the unsigned-comparison
+	// sort and contiguity check, which would place the segment last
+	// and trip the FSN-gap error.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-badbase.sfa")
+	{
+		seg, err := qwpSfCreateSegment(path, 0, 4096)
+		require.NoError(t, err)
+		require.NoError(t, seg.close())
+	}
+	// Rewrite the on-disk baseSeq field at offset 8 to a negative
+	// value (sign bit set).
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	var bad [8]byte
+	binary.LittleEndian.PutUint64(bad[:], 0xFFFFFFFFFFFFFFFF) // int64(-1)
+	_, err = f.WriteAt(bad[:], 8)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	seg, err := qwpSfOpenSegment(path)
+	require.Error(t, err)
+	assert.Nil(t, seg)
+	assert.Contains(t, err.Error(), "bad baseSeq")
+}
+
 func TestQwpSfSegmentRecoveryRejectsOversizedLength(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sf-bad.sfa")

@@ -581,6 +581,18 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// and replaying them cannot fix the rejection. Mark the
 			// loop terminal directly so the next user-thread API call
 			// surfaces it. recordFatal stops the running flag.
+			//
+			// Same sanity clamp as the success branch below: don't
+			// trust a rejection wireSeq beyond what we've actually
+			// sent. Java's handleServerRejection clamps for the same
+			// reason on the DROP path (which advances ackedFsn); on
+			// our terminal-only path we clamp for log clarity so the
+			// surfaced error reports a sequence the producer can
+			// correlate to a real frame.
+			highestSent := l.nextWireSeq.Load() - 1
+			if highestSent >= 0 && seq > highestSent {
+				seq = highestSent
+			}
 			qErr := newQwpErrorFromAck(data)
 			if qErr == nil {
 				qErr = &QwpError{Status: status, Sequence: seq, Message: "unknown error"}

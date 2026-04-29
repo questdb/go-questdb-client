@@ -246,6 +246,17 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 		return nil, fmt.Errorf("qwp/sf: unsupported version in %s: %d", path, version)
 	}
 	baseSeq := int64(binary.LittleEndian.Uint64(buf[8:16]))
+	// FSNs are non-negative by construction. A negative baseSeq on disk
+	// means bit-rot or a hand-edited file — refuse so qwpSfOpenRing's
+	// per-file skip handles it like any other unreadable .sfa rather
+	// than feeding the bad value into the unsigned-comparison sort and
+	// contiguity check (which would place the segment last and trip the
+	// FSN-gap error, taking the whole recovery down).
+	if baseSeq < 0 {
+		_ = qwpSfMunmap(buf)
+		_ = f.Close()
+		return nil, fmt.Errorf("qwp/sf: bad baseSeq in %s: %d", path, baseSeq)
+	}
 	lastGood := qwpSfScanFrames(buf, fileSize)
 	count := qwpSfCountFrames(buf, lastGood)
 	tornTail := qwpSfDetectTornTail(buf, lastGood, fileSize)

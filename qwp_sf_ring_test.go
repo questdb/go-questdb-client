@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -305,6 +306,58 @@ func TestQwpSfRingOpenExistingRejectsFsnGap(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "FSN gap")
 	assert.Nil(t, r)
+}
+
+func TestQwpSfRingOpenExistingQuarantinesCorruptFirstFrame(t *testing.T) {
+	// A bit-flip in the first frame's CRC makes scanFrames bail out at
+	// HEADER_SIZE with frameCount=0 — but valid frames may follow. The
+	// pre-fix recovery path would silently unlink the file as an "empty
+	// hot spare", destroying every surviving frame. The fix quarantines
+	// torn-tail-bearing files to <path>.corrupt instead so a postmortem
+	// can recover what's left.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-corrupt.sfa")
+	{
+		seg, err := qwpSfCreateSegment(path, 0, 4096)
+		require.NoError(t, err)
+		_, err = seg.tryAppend([]byte("frame-zero"))
+		require.NoError(t, err)
+		_, err = seg.tryAppend([]byte("frame-one"))
+		require.NoError(t, err)
+		// Flip a byte in frame[0]'s CRC. The frame is at HEADER_SIZE;
+		// CRC is the first 4 bytes of the frame.
+		buf := seg.address()
+		buf[qwpSfHeaderSize] ^= 0xFF
+		require.NoError(t, seg.close())
+	}
+
+	r, err := qwpSfOpenRing(dir, 4096)
+	require.NoError(t, err)
+	assert.Nil(t, r)
+
+	// Original file is gone; quarantine sentinel is in its place.
+	_, statErr := os.Stat(path)
+	assert.True(t, os.IsNotExist(statErr), "original .sfa should have been renamed")
+	_, statErr = os.Stat(path + ".corrupt")
+	assert.NoError(t, statErr, "<path>.corrupt should exist after quarantine")
+}
+
+func TestQwpSfRingAcknowledgeClampsAtPublishedFsn(t *testing.T) {
+	// Defense-in-depth: a malformed/poisoned ACK with a wireSeq beyond
+	// publishedFsn must NOT advance ackedFsn past what the producer has
+	// actually written, otherwise the segment manager could trim
+	// segments the I/O thread is still iterating.
+	seg, err := qwpSfCreateInMemorySegment(0, 4096)
+	require.NoError(t, err)
+	r := qwpSfNewSegmentRing(seg, 4096)
+	defer func() { _ = r.segmentRingClose() }()
+
+	r.appendOrFsn([]byte("a"))
+	r.appendOrFsn([]byte("b"))
+	require.Equal(t, int64(1), r.segmentRingPublishedFsn())
+
+	r.acknowledge(1 << 30)
+	assert.Equal(t, int64(1), r.segmentRingAckedFsn())
 }
 
 // formatHex16 mirrors the segment-manager filename format.

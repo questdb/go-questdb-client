@@ -98,6 +98,22 @@ type QwpSender interface {
 	// row: mixing At and AtNano on rows of the same table within one
 	// flush returns a type-conflict error.
 	AtNano(ctx context.Context, ts time.Time) error
+
+	// AckedFsn returns the highest server-acknowledged frame
+	// sequence number, or -1 if no batch has been ACK'd yet.
+	// Snapshot accessor — for a bounded wait, use AwaitAckedFsn.
+	AckedFsn() int64
+
+	// AwaitAckedFsn blocks until AckedFsn() >= target, the timeout
+	// elapses, or the I/O loop latches a terminal error. Returns
+	// true on success, false on timeout.
+	//
+	// Useful for tests and user code that need to confirm a specific
+	// publish has been server-acknowledged. The timeout does not
+	// extend Flush's own ACK wait — pair AwaitAckedFsn with the
+	// auto-flush path (which enqueues without waiting), not with
+	// Flush (which already blocks on ACK).
+	AwaitAckedFsn(target int64, timeout time.Duration) (bool, error)
 }
 
 // Compile-time check that qwpLineSender implements QwpSender.

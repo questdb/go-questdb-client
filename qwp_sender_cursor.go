@@ -219,7 +219,20 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	// spawn a drainer per orphan, capped at max_background_drainers
 	// concurrent goroutines. Failures drop a .failed sentinel into
 	// the slot so future foreground starts skip it.
+	//
+	// `s` already owns engine + loop at this point. Any failure in
+	// the orphan-setup block must close `s` (which closes both),
+	// otherwise we leak the connected sender plus its I/O goroutine,
+	// transport, and segment manager. defer+success flag covers
+	// panics; explicit error returns cover any future error path
+	// added below.
 	if conf.drainOrphans {
+		setupOK := false
+		defer func() {
+			if !setupOK {
+				_ = s.closeCursor(ctx)
+			}
+		}()
 		maxDrainers := conf.maxBackgroundDrainers
 		if maxDrainers <= 0 {
 			maxDrainers = 4 // matches Java default
@@ -239,6 +252,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			}
 			s.drainerPool = pool
 		}
+		setupOK = true
 	}
 
 	return s, nil
@@ -448,10 +462,11 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
 //
 // Drain semantics:
 //   - closeFlushTimeout > 0: block up to that long for ackedFsn ≥
-//     publishedFsn. Logs a warning on timeout (returns nil and
-//     proceeds with shutdown — pending data is on disk and will
-//     replay on the next sender start in SF mode, or is lost in
-//     memory mode).
+//     publishedFsn. On timeout, returns a drain-timeout error so
+//     the caller cannot silently lose data — shutdown still
+//     completes. SF-mode users can recover the unacked tail by
+//     reopening on the same sf_dir; memory-mode users have no
+//     recovery path and must treat the timeout as fatal.
 //   - closeFlushTimeout <= 0: skip the drain entirely (fast close).
 func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	// Encode any pending rows from the open API call into the engine
@@ -466,7 +481,13 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	}
 	var firstErr error
 	if s.pendingRowCount > 0 {
-		if err := s.flushCursor(ctx); err != nil && firstErr == nil {
+		// Enqueue the pending rows but do NOT block on ACK here —
+		// flushCursor's ACK wait is unbounded by ctx alone, and
+		// would deadlock against a silent server. waitCursorDrain
+		// below is the single bounded ACK wait, governed by
+		// closeFlushTimeout. Mirrors Java's flushPendingRows() +
+		// drainOnClose() split.
+		if err := s.enqueueCursor(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		s.resetAfterFlush()
@@ -497,9 +518,14 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 
 // waitCursorDrain blocks until ackedFsn ≥ publishedFsn, the
 // send-loop reports a terminal error, or the user's ctx /
-// closeFlushTimeout expires. On timeout, returns nil so the caller
-// (closeCursor) proceeds with shutdown rather than failing — the
-// data is durable on disk in SF mode and will be replayed.
+// closeFlushTimeout expires. On timeout, returns a drain-timeout
+// error carrying publishedFsn, ackedFsn, and the count of unacked
+// batches — closeCursor captures it as firstErr but still proceeds
+// with shutdown so the I/O thread, transport, and segment manager
+// always tear down cleanly. Mirrors Java QwpWebSocketSender's
+// drainOnClose contract: silently swallowing the timeout would
+// hide data loss from users who only call Close() and never call
+// Flush() afterwards.
 func (s *qwpLineSender) waitCursorDrain(ctx context.Context) error {
 	deadline := time.Now().Add(s.closeTimeout)
 	timer := time.NewTimer(s.closeTimeout)
@@ -515,14 +541,73 @@ func (s *qwpLineSender) waitCursorDrain(ctx context.Context) error {
 			return err
 		}
 		if !time.Now().Before(deadline) {
-			return nil
+			return s.drainTimeoutError()
 		}
 		select {
 		case <-tick.C:
 		case <-timer.C:
-			return nil
+			return s.drainTimeoutError()
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+	}
+}
+
+// drainTimeoutError builds the close-drain timeout error. Snapshot
+// publishedFsn first so the (target - acked) count cannot go
+// negative under a concurrent ACK that lands between the two reads.
+func (s *qwpLineSender) drainTimeoutError() error {
+	target := s.cursorEngine.enginePublishedFsn()
+	acked := s.cursorEngine.engineAckedFsn()
+	return fmt.Errorf(
+		"qwp/cursor: close drain timed out after %s [publishedFsn=%d, ackedFsn=%d] - server did not acknowledge %d pending batches; data may be lost (use a larger close_flush_timeout or smaller batches)",
+		s.closeTimeout, target, acked, target-acked,
+	)
+}
+
+// AckedFsn implements QwpSender.AckedFsn.
+func (s *qwpLineSender) AckedFsn() int64 {
+	return s.cursorEngine.engineAckedFsn()
+}
+
+// AwaitAckedFsn implements QwpSender.AwaitAckedFsn. Polls on a
+// 5ms tick — same cadence as waitCursorEmpty / waitCursorDrain —
+// and surfaces send-loop terminal errors synchronously so the
+// caller can distinguish "still in flight" from "permanently
+// failed".
+func (s *qwpLineSender) AwaitAckedFsn(target int64, timeout time.Duration) (bool, error) {
+	if s.closed {
+		return false, errClosedSenderFlush
+	}
+	if s.cursorEngine.engineAckedFsn() >= target {
+		return true, nil
+	}
+	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+		return false, err
+	}
+	if timeout <= 0 {
+		return false, nil
+	}
+	deadline := time.Now().Add(timeout)
+	const pollInterval = 5 * time.Millisecond
+	tick := time.NewTicker(pollInterval)
+	defer tick.Stop()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		if s.cursorEngine.engineAckedFsn() >= target {
+			return true, nil
+		}
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			return false, err
+		}
+		select {
+		case <-tick.C:
+			if !time.Now().Before(deadline) {
+				return s.cursorEngine.engineAckedFsn() >= target, nil
+			}
+		case <-timer.C:
+			return s.cursorEngine.engineAckedFsn() >= target, nil
 		}
 	}
 }

@@ -61,6 +61,11 @@ type qwpSfTestServerOpts struct {
 	// protocol (version/config mismatch). This is what
 	// TestQwpSfSendLoopProtocolMismatchIsTerminal exercises.
 	silentDropAfterFrames int
+	// silentAcks → read frames forever and never write any ACK
+	// back. Connection stays alive so the send loop does not go
+	// terminal; the producer's Close drain-wait is what surfaces
+	// the missing ACKs. Used by close-drain-timeout tests.
+	silentAcks bool
 }
 
 // qwpSfTestServer is a fake QWP server for send-loop tests. It
@@ -129,6 +134,9 @@ func newQwpSfTestServer(t *testing.T, opts qwpSfTestServerOpts) *qwpSfTestServer
 			if opts.silentDropAfterFrames > 0 &&
 				localFramesReceived >= opts.silentDropAfterFrames {
 				return
+			}
+			if opts.silentAcks {
+				continue
 			}
 			if opts.rejectStatus != 0 {
 				_ = conn.Write(context.Background(), websocket.MessageBinary,

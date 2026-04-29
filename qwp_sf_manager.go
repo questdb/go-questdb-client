@@ -388,9 +388,18 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 						_ = os.Remove(path)
 					}
 				}
+			} else if path != "" {
+				// Defense-in-depth: qwpSfCreateSegment already best-
+				// effort removes the file on its own failure paths
+				// (truncate fail, mmap fail). If a future change
+				// breaks that invariant — or if anything before the
+				// try block leaves a file on disk — this second-line
+				// remove keeps the slot from accumulating zero-content
+				// .sfa files under sustained provisioning failure.
+				// Repeated remove on an already-removed path is a
+				// harmless no-op.
+				_ = os.Remove(path)
 			}
-			// On err, spare is nil; nothing to clean up. The next
-			// poll tick will retry.
 		}
 	}
 

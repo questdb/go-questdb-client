@@ -149,35 +149,33 @@ func TestQwpCursorSenderCloseDrainsEngine(t *testing.T) {
 	assert.GreaterOrEqual(t, srv.totalFramesReceived.Load(), int64(1))
 }
 
-func TestQwpCursorSenderCloseFastSkipsDrainTimeout(t *testing.T) {
-	// Server that NEVER ACKs — the close timeout must fire and let
-	// us proceed.
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		// No closeAfterFrames; we want the connection alive but ACKs
-		// never returned. Easier: spin up a server that consumes but
-		// doesn't write back.
-	})
-	srv.Close()
-	// Launch a custom server that reads but never ACKs.
-	customSrv := newSilentAckServer(t)
-	defer customSrv.Close()
+func TestQwpCursorSenderCloseDrainTimeoutReturnsError(t *testing.T) {
+	// Server accepts frames but never ACKs. Close's drain wait must
+	// time out within closeFlushTimeout AND return a non-nil error
+	// that names publishedFsn / ackedFsn — silently swallowing it
+	// would hide data loss from users who never call Flush.
+	srv := newSilentAckServer(t)
+	defer srv.Close()
 
 	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
-	transport, err := qwpSfDialAt(customSrv.URL)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background())
 	require.NoError(t, err)
-	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialAt(customSrv.URL),
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
 	loop.sendLoopStart()
-	// Short close timeout: even if drain takes long, Close returns within ~100ms.
 	s, err := newQwpCursorLineSender(0, 0, 0, 0, 0, engine, loop, 100*time.Millisecond)
 	require.NoError(t, err)
 
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	start := time.Now()
-	_ = s.Close(context.Background())
+	closeErr := s.Close(context.Background())
 	elapsed := time.Since(start)
 	assert.Less(t, elapsed, 5*time.Second, "Close should not block on un-ACK'd data forever")
+	require.Error(t, closeErr, "Close must surface the drain timeout, not swallow it")
+	assert.Contains(t, closeErr.Error(), "drain timed out")
+	assert.Contains(t, closeErr.Error(), "publishedFsn")
+	assert.Contains(t, closeErr.Error(), "ackedFsn")
 }
 
 func TestQwpCursorSenderFlushAfterTerminalError(t *testing.T) {
@@ -202,23 +200,113 @@ func TestQwpCursorSenderFlushAfterTerminalError(t *testing.T) {
 }
 
 // newSilentAckServer creates a fake QWP server that accepts the
-// upgrade and reads frames forever, but never ACKs. Used to test
-// the close-timeout fast path.
+// upgrade and reads frames forever, but never sends any ACK. Used
+// by close-drain-timeout and AwaitAckedFsn tests where we need an
+// ACK gap to materialize.
 func newSilentAckServer(t *testing.T) *qwpSfTestServer {
 	t.Helper()
-	// Reuse the test-server scaffolding with a sentinel option. We
-	// simulate "silent ACKs" by making the server close immediately
-	// after one frame on the FIRST connection — but reconnects also
-	// silently swallow. Simpler: handle inline.
-	return newQwpSfTestServer(t, qwpSfTestServerOpts{
-		// closeAfterFrames=99999 effectively never closes; combined
-		// with rejectStatus=0 means it sends OK ACKs after each frame.
-		// To truly be silent we'd need a different server. Here we
-		// just want a server that accepts frames; the close-timeout
-		// fast-path test will have a frame ACK'd quickly. We accept
-		// the trade-off that this test doesn't fully exercise the
-		// "no ACKs ever" path — that's covered by tests against a
-		// killed connection elsewhere.
-		closeAfterFrames: 99999,
-	})
+	return newQwpSfTestServer(t, qwpSfTestServerOpts{silentAcks: true})
+}
+
+func TestQwpCursorSenderAckedFsnTracksEngine(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	s, engine, _, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+
+	// Before any publish, both producer-visible accessor and engine
+	// agree at -1.
+	assert.Equal(t, int64(-1), s.AckedFsn())
+
+	for i := 0; i < 3; i++ {
+		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
+	}
+	require.NoError(t, s.Flush(context.Background()))
+
+	require.Eventually(t, func() bool {
+		return s.AckedFsn() == engine.enginePublishedFsn()
+	}, 2*time.Second, 1*time.Millisecond)
+	assert.GreaterOrEqual(t, s.AckedFsn(), int64(0))
+}
+
+func TestQwpCursorSenderAwaitAckedFsnHappyPath(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	// autoFlushRows=2 → enqueue happens without blocking on ACK,
+	// so AwaitAckedFsn does meaningful waiting work.
+	s, engine, _, cleanup := newCursorSenderForTest(t, srv, 2)
+	defer cleanup()
+
+	for i := 0; i < 4; i++ {
+		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
+	}
+	target := engine.enginePublishedFsn()
+	require.GreaterOrEqual(t, target, int64(0), "auto-flush should have published at least one frame")
+
+	ok, err := s.AwaitAckedFsn(target, 2*time.Second)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.GreaterOrEqual(t, s.AckedFsn(), target)
+}
+
+func TestQwpCursorSenderAwaitAckedFsnTimeout(t *testing.T) {
+	srv := newSilentAckServer(t)
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	transport, err := qwpSfDialFor(srv)(context.Background())
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	// autoFlushRows=1 enqueues the row into the engine on AtNow,
+	// without blocking on ACK — exactly the auto-flush path users
+	// pair with AwaitAckedFsn. closeTimeout=100ms keeps the deferred
+	// Close fast (the server never ACKs).
+	s, err := newQwpCursorLineSender(1, 0, 0, 0, 0, engine, loop, 100*time.Millisecond)
+	require.NoError(t, err)
+	defer func() { _ = s.Close(context.Background()) }()
+
+	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	require.Eventually(t, func() bool {
+		return engine.enginePublishedFsn() >= 0
+	}, time.Second, time.Millisecond, "auto-flush should have published the frame")
+	target := engine.enginePublishedFsn()
+
+	start := time.Now()
+	ok, err := s.AwaitAckedFsn(target, 50*time.Millisecond)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	assert.False(t, ok, "no ACK was ever sent — must time out")
+	assert.GreaterOrEqual(t, elapsed, 50*time.Millisecond)
+	assert.Less(t, elapsed, time.Second)
+}
+
+func TestQwpSenderAwaitAckedFsnAlreadyAcked(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	s, engine, _, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+
+	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	require.NoError(t, s.Flush(context.Background()))
+
+	// Flush already waited for ACK — AwaitAckedFsn for the same
+	// target returns immediately without consuming the timeout.
+	target := engine.enginePublishedFsn()
+	start := time.Now()
+	ok, err := s.AwaitAckedFsn(target, time.Second)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Less(t, time.Since(start), 50*time.Millisecond,
+		"AwaitAckedFsn must short-circuit when target is already met")
+
+	// A negative target is trivially reached.
+	ok, err = s.AwaitAckedFsn(-1, 0)
+	require.NoError(t, err)
+	assert.True(t, ok)
 }
