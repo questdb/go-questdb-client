@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -41,7 +42,7 @@ func TestQwpSfEngineMemoryModeAppend(t *testing.T) {
 	defer func() { _ = e.engineClose() }()
 
 	for i := int64(0); i < 5; i++ {
-		fsn, err := e.engineAppendBlocking([]byte("frame"))
+		fsn, err := e.engineAppendBlocking(context.Background(), []byte("frame"))
 		require.NoError(t, err)
 		assert.Equal(t, i, fsn)
 	}
@@ -60,7 +61,7 @@ func TestQwpSfEngineDiskModeWritesAndRecovers(t *testing.T) {
 		assert.False(t, e.engineWasRecoveredFromDisk())
 
 		for i := 0; i < 5; i++ {
-			_, err := e.engineAppendBlocking([]byte{byte(i), byte(i + 1)})
+			_, err := e.engineAppendBlocking(context.Background(), []byte{byte(i), byte(i + 1)})
 			require.NoError(t, err)
 		}
 		assert.Equal(t, int64(4), e.enginePublishedFsn())
@@ -105,7 +106,7 @@ func TestQwpSfEngineFullDrainUnlinksFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 3; i++ {
-		fsn, err := e.engineAppendBlocking([]byte("hi"))
+		fsn, err := e.engineAppendBlocking(context.Background(), []byte("hi"))
 		require.NoError(t, err)
 		// Immediately ACK each frame so the ring fully drains.
 		e.engineAcknowledge(fsn)
@@ -134,12 +135,12 @@ func TestQwpSfEngineBackpressureTimeout(t *testing.T) {
 	// Fill the active until the next append blocks. capacity = 96-24
 	// = 72; each frame uses 8+16 = 24, so 3 frames fit.
 	for i := 0; i < 3; i++ {
-		_, err := e.engineAppendBlocking(make([]byte, 16))
+		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
 		require.NoError(t, err, "iteration %d", i)
 	}
 	// The next append must time out.
 	start := time.Now()
-	_, err = e.engineAppendBlocking(make([]byte, 16))
+	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
 	elapsed := time.Since(start)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, qwpSfErrBackpressureTimeout))
@@ -155,7 +156,7 @@ func TestQwpSfEnginePayloadTooLarge(t *testing.T) {
 	defer func() { _ = e.engineClose() }()
 
 	huge := make([]byte, segSize) // can never fit (header + envelope alone exceeds)
-	_, err = e.engineAppendBlocking(huge)
+	_, err = e.engineAppendBlocking(context.Background(), huge)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, qwpSfErrPayloadTooLarge))
 }
@@ -174,9 +175,9 @@ func TestQwpSfEngineSharedManager(t *testing.T) {
 	// Both engines should be able to append and have the manager
 	// supply spares to both rings.
 	for i := 0; i < 3; i++ {
-		_, err := e1.engineAppendBlocking([]byte("a"))
+		_, err := e1.engineAppendBlocking(context.Background(), []byte("a"))
 		require.NoError(t, err)
-		_, err = e2.engineAppendBlocking([]byte("b"))
+		_, err = e2.engineAppendBlocking(context.Background(), []byte("b"))
 		require.NoError(t, err)
 	}
 	require.NoError(t, e1.engineClose())

@@ -97,7 +97,7 @@ func TestQwpSfDrainerDrainsRealOrphan(t *testing.T) {
 		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
 		require.NoError(t, err)
 		for i := 0; i < 3; i++ {
-			_, err := engine.engineAppendBlocking([]byte{byte(i)})
+			_, err := engine.engineAppendBlocking(context.Background(), []byte{byte(i)})
 			require.NoError(t, err)
 		}
 		// Don't acknowledge → engineClose leaves residual .sfa files.
@@ -160,7 +160,7 @@ func TestQwpSfDrainerMarksFailedOnAuthRejection(t *testing.T) {
 	{
 		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
 		require.NoError(t, err)
-		_, err = engine.engineAppendBlocking([]byte("data"))
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
 		require.NoError(t, err)
 		require.NoError(t, engine.engineClose())
 	}
@@ -206,7 +206,7 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 		dirs[i] = t.TempDir()
 		engine, err := qwpSfNewCursorEngine(dirs[i], segSize, qwpSfUnlimitedTotalBytes, time.Second)
 		require.NoError(t, err)
-		_, err = engine.engineAppendBlocking([]byte{byte(i)})
+		_, err = engine.engineAppendBlocking(context.Background(), []byte{byte(i)})
 		require.NoError(t, err)
 		require.NoError(t, engine.engineClose())
 	}
@@ -251,7 +251,7 @@ func TestSfConfDrainOrphansEndToEnd(t *testing.T) {
 	{
 		engine, err := qwpSfNewCursorEngine(orphanDir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 		require.NoError(t, err)
-		_, err = engine.engineAppendBlocking([]byte("orphaned-frame"))
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("orphaned-frame"))
 		require.NoError(t, err)
 		require.NoError(t, engine.engineClose())
 	}

@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -276,12 +277,20 @@ func (e *qwpSfCursorEngine) engineFindSegmentContaining(fsn int64) *qwpSfSegment
 // and waiting for ACK-driven trim to free space. Returns the
 // assigned FSN on success.
 //
+// ctx is honoured during the backpressure spin: a cancelled or
+// deadline-expired ctx returns ctx.Err() immediately, so callers
+// passing a tighter deadline than e.appendDeadline get their
+// deadline respected.
+//
 // Backpressure is surfaced two ways:
 //   - engineTotalBackpressureStalls() counter — incremented once per
 //     blocking-call that had to wait for the manager.
 //   - The error from a deadline expiry distinguishes "wire path is
 //     wedged" from a genuine over-large payload.
-func (e *qwpSfCursorEngine) engineAppendBlocking(payload []byte) (int64, error) {
+func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []byte) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	fsn := e.ring.appendOrFsn(payload)
 	if fsn >= 0 {
 		return fsn, nil
@@ -293,11 +302,18 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(payload []byte) (int64, error) 
 	// deadline clock.
 	e.backpressureStalls.Add(1)
 	deadline := time.Now().Add(e.appendDeadline)
+	timer := time.NewTimer(qwpSfEngineParkInterval)
+	defer timer.Stop()
 	for {
 		if time.Now().After(deadline) {
 			return 0, fmt.Errorf("%w (deadline %s)", qwpSfErrBackpressureTimeout, e.appendDeadline)
 		}
-		time.Sleep(qwpSfEngineParkInterval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		timer.Reset(qwpSfEngineParkInterval)
 		fsn = e.ring.appendOrFsn(payload)
 		if fsn >= 0 {
 			return fsn, nil

@@ -156,7 +156,7 @@ func TestQwpSfSendLoopHappyPath(t *testing.T) {
 
 	// Append 10 frames.
 	for i := 0; i < 10; i++ {
-		_, err := engine.engineAppendBlocking([]byte(fmt.Sprintf("frame-%d", i)))
+		_, err := engine.engineAppendBlocking(context.Background(), []byte(fmt.Sprintf("frame-%d", i)))
 		require.NoError(t, err)
 	}
 
@@ -188,7 +188,7 @@ func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 	defer func() { _ = loop.sendLoopClose() }()
 
 	for i := 0; i < 10; i++ {
-		_, err := engine.engineAppendBlocking([]byte(fmt.Sprintf("f-%d", i)))
+		_, err := engine.engineAppendBlocking(context.Background(), []byte(fmt.Sprintf("f-%d", i)))
 		require.NoError(t, err)
 	}
 	// All 10 frames should eventually be ACKed despite the server
@@ -221,7 +221,7 @@ func TestQwpSfSendLoopServerErrorIsTerminal(t *testing.T) {
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	_, err = engine.engineAppendBlocking([]byte("bad"))
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("bad"))
 	require.NoError(t, err)
 
 	// Loop must record a terminal error rather than entering reconnect.
@@ -259,7 +259,7 @@ func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	_, err = engine.engineAppendBlocking([]byte("hi"))
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("hi"))
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
@@ -289,7 +289,7 @@ func TestQwpSfSendLoopReconnectBudgetExhausted(t *testing.T) {
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	_, err = engine.engineAppendBlocking([]byte("data"))
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
 	require.NoError(t, err)
 
 	// Send the frame, server closes, reconnect tries (server is
@@ -325,7 +325,7 @@ func TestQwpSfSendLoopNilFactoryIsTerminalOnFailure(t *testing.T) {
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	_, err = engine.engineAppendBlocking([]byte("data"))
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {

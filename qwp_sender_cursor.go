@@ -298,28 +298,11 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 		s.batchMaxSymbolId,
 	)
 	// engineAppendBlocking spins on backpressure for up to the
-	// engine's deadline; honour the user's ctx as well so a stuck
-	// I/O loop doesn't extend Flush past the caller's timeout.
-	type appendResult struct {
-		fsn int64
-		err error
-	}
-	resCh := make(chan appendResult, 1)
-	go func() {
-		fsn, err := s.cursorEngine.engineAppendBlocking(encoded)
-		resCh <- appendResult{fsn: fsn, err: err}
-	}()
-	select {
-	case res := <-resCh:
-		if res.err != nil {
-			return res.err
-		}
-	case <-ctx.Done():
-		// The append goroutine will eventually return when the
-		// engine's deadline expires; we don't wait. The frame may or
-		// may not land in the engine depending on timing — but the
-		// caller's ctx took precedence.
-		return ctx.Err()
+	// engine's deadline OR until ctx fires, whichever comes first.
+	// The synchronous call avoids the orphan-goroutine race against
+	// the encoder buffer (which is reused on the next flush).
+	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
+		return err
 	}
 	// Surface any wire failure observed during the append window —
 	// the loop may have hit a server-rejected status that won't be
@@ -372,22 +355,8 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 		-1, // self-sufficient: full dict from id 0
 		s.batchMaxSymbolId,
 	)
-	type appendResult struct {
-		fsn int64
-		err error
-	}
-	resCh := make(chan appendResult, 1)
-	go func() {
-		fsn, err := s.cursorEngine.engineAppendBlocking(encoded)
-		resCh <- appendResult{fsn: fsn, err: err}
-	}()
-	select {
-	case res := <-resCh:
-		if res.err != nil {
-			return res.err
-		}
-	case <-ctx.Done():
-		return ctx.Err()
+	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
+		return err
 	}
 	if s.batchMaxSchemaId > s.maxSentSchemaId {
 		s.maxSentSchemaId = s.batchMaxSchemaId
