@@ -321,6 +321,26 @@ type lineSenderConfig struct {
 	maxSchemasPerConnection int           // 0 = unset; seeded to qwpDefaultMaxSchemasPerConnection
 	dumpWriter              io.Writer     // if set, record outgoing bytes (unexported)
 	gorillaDisabled         bool          // false (default) = Gorilla timestamp encoding enabled
+
+	// QWP store-and-forward (cursor) fields. Setting sfDir activates
+	// cursor mode: flushed batches are persisted to mmap'd files
+	// under <sfDir>/<senderId>/ and the I/O loop replays from disk
+	// on reconnect / restart. When sfDir is empty, the sender stays
+	// on the in-memory async path (qwpAsyncState).
+	sfDir                         string
+	senderId                      string        // empty -> "default" at construction
+	sfMaxBytes                    int64         // per-segment size (bytes); 0 -> 4 MiB
+	sfMaxTotalBytes               int64         // total cap (bytes); 0 -> 10 GiB
+	sfDurability                  string        // empty / "memory" only; reserved future "flush" / "append"
+	sfAppendDeadlineMillis        int           // 0 -> 30000
+	reconnectMaxDurationMillis    int           // 0 -> 300000 (5 min)
+	reconnectInitialBackoffMillis int           // 0 -> 100
+	reconnectMaxBackoffMillis     int           // 0 -> 5000
+	initialConnectRetry           bool          // default false
+	closeFlushTimeoutMillis       int           // 0 -> 5000; -1 / negative -> fast close (skip drain)
+	closeFlushTimeoutSet          bool          // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
+	drainOrphans                  bool          // default false (Phase 6)
+	maxBackgroundDrainers         int           // 0 -> 4 (Phase 6)
 }
 
 // LineSenderOption defines line sender config option.
@@ -368,6 +388,93 @@ func WithInFlightWindow(window int) LineSenderOption {
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.closeTimeout = d
+	}
+}
+
+// WithSfDir activates the store-and-forward cursor path against
+// the given group root. The sender's slot lives at
+// `<sfDir>/<senderId>/`; flushed batches are persisted there and
+// replayed on reconnect / restart. Setting an empty string is a
+// no-op (memory mode).
+//
+// Only available for the QWP sender.
+func WithSfDir(dir string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfDir = dir
+	}
+}
+
+// WithSenderId sets the sub-directory name under sfDir that
+// uniquely identifies this sender's slot. Defaults to "default";
+// multi-sender deployments must set distinct IDs to avoid lock
+// collisions on the same slot. Only meaningful when sf_dir is set.
+//
+// Only available for the QWP sender.
+func WithSenderId(id string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.senderId = id
+	}
+}
+
+// WithSfMaxBytes sets the per-segment cap (bytes) for the cursor
+// engine. Defaults to 4 MiB. Lower values rotate segments more
+// aggressively; higher values amortize the rotation overhead.
+//
+// Only available for the QWP sender.
+func WithSfMaxBytes(n int64) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfMaxBytes = n
+	}
+}
+
+// WithSfMaxTotalBytes caps the total cursor allocation (active +
+// hot spare + sealed segments) for this sender. The producer is
+// backpressured when an append would exceed the cap. Defaults to
+// 10 GiB.
+//
+// Only available for the QWP sender.
+func WithSfMaxTotalBytes(n int64) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfMaxTotalBytes = n
+	}
+}
+
+// WithReconnectPolicy configures the per-outage reconnect cap and
+// backoff policy. maxDuration bounds the total time spent
+// reconnecting before the loop gives up; initialBackoff and
+// maxBackoff bound a backoff sleep between attempts (with jitter).
+//
+// Only available for the QWP sender.
+func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.reconnectMaxDurationMillis = int(maxDuration / time.Millisecond)
+		s.reconnectInitialBackoffMillis = int(initialBackoff / time.Millisecond)
+		s.reconnectMaxBackoffMillis = int(maxBackoff / time.Millisecond)
+	}
+}
+
+// WithInitialConnectRetry, when true, applies the same
+// retry-with-backoff policy to the initial connect attempt as is
+// applied on reconnect. By default an initial connect failure is
+// terminal — useful for catching misconfig early.
+//
+// Only available for the QWP sender.
+func WithInitialConnectRetry(retry bool) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.initialConnectRetry = retry
+	}
+}
+
+// WithCloseFlushTimeout bounds Close()'s wait for the cursor
+// engine's ackedFsn to catch up to publishedFsn. A zero or
+// negative duration skips the drain entirely (fast close).
+// Defaults to 5 seconds.
+//
+// Only meaningful for the QWP sender in cursor mode (sf_dir set).
+func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.closeFlushTimeoutSet = true
+		s.closeFlushTimeoutMillis = int(d / time.Millisecond)
 	}
 }
 
@@ -855,6 +962,33 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.protocolVersion != protocolVersionUnset {
 		return errors.New("protocol_version setting is not available in the QWP client")
 	}
+	// Cursor / store-and-forward validation. sf_dir activates cursor
+	// mode; the sf_*, sender_id, drain_orphans, max_background_drainers
+	// knobs are only meaningful when cursor mode is on.
+	if conf.sfDir == "" {
+		if conf.senderId != "" {
+			return errors.New("sender_id requires sf_dir to be set")
+		}
+		if conf.sfMaxBytes != 0 || conf.sfMaxTotalBytes != 0 || conf.sfDurability != "" || conf.sfAppendDeadlineMillis != 0 {
+			return errors.New("sf_max_bytes / sf_max_total_bytes / sf_durability / sf_append_deadline_millis require sf_dir to be set")
+		}
+		if conf.drainOrphans || conf.maxBackgroundDrainers != 0 {
+			return errors.New("drain_orphans / max_background_drainers require sf_dir to be set")
+		}
+	}
+	if conf.sfMaxBytes < 0 {
+		return fmt.Errorf("sf_max_bytes must be > 0: %d", conf.sfMaxBytes)
+	}
+	if conf.sfMaxTotalBytes < 0 {
+		return fmt.Errorf("sf_max_total_bytes must be > 0: %d", conf.sfMaxTotalBytes)
+	}
+	if conf.sfMaxBytes > 0 && conf.sfMaxTotalBytes > 0 && conf.sfMaxTotalBytes < conf.sfMaxBytes {
+		return fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_bytes (%d)",
+			conf.sfMaxTotalBytes, conf.sfMaxBytes)
+	}
+	if conf.maxBackgroundDrainers < 0 {
+		return fmt.Errorf("max_background_drainers must be >= 0: %d", conf.maxBackgroundDrainers)
+	}
 
 	return nil
 }
@@ -897,6 +1031,13 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		opts.authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
 	} else if conf.httpToken != "" {
 		opts.authorization = "Bearer " + conf.httpToken
+	}
+
+	// Cursor / SF mode: when sf_dir is set, build a cursor engine +
+	// send loop instead of qwpAsyncState. Memory mode (no sf_dir) is
+	// handled by the existing path below.
+	if conf.sfDir != "" {
+		return newQwpCursorLineSenderFromConf(ctx, conf, address, opts)
 	}
 
 	window := conf.inFlightWindow

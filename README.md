@@ -439,6 +439,73 @@ func main() {
 }
 ```
 
+## QWP store-and-forward (SF)
+
+QuestDB's WebSocket transport (`ws::` / `wss::`, see Java client docs)
+supports an opt-in **store-and-forward** mode: outgoing batches are
+persisted to mmap'd disk segments before they leave the wire, and the
+I/O loop replays from disk on transient disconnects or process
+restarts. User code does not see brief outages; an unrecoverable
+failure surfaces on the next `At` / `AtNow` / `Flush` call.
+
+Activate SF by setting `sf_dir` (the parent directory under which the
+sender's slot is created) on a `ws::` / `wss::` connection string:
+
+```go
+sender, err := qdb.LineSenderFromConf(ctx,
+    "ws::addr=localhost:9000;"+
+    "sf_dir=/var/lib/questdb-sf;"+
+    "sender_id=my-app;"+
+    "close_flush_timeout_millis=5000;")
+```
+
+The slot lives at `<sf_dir>/<sender_id>/`. An advisory exclusive
+`flock` on `<slot>/.lock` prevents two senders from sharing a slot;
+the lock releases automatically when the process exits.
+
+### Connect-string knobs (QWP only)
+
+| Key | Default | Effect |
+|---|---|---|
+| `sf_dir` | unset | Group root. Setting it activates SF. |
+| `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_.` only. |
+| `sf_max_bytes` | 4 MiB | Per-segment file size. |
+| `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
+| `sf_durability` | `memory` | Reserved; `flush` / `append` are deferred follow-ups. |
+| `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
+| `reconnect_max_duration_millis` | 300000 | Per-outage cap on reconnect retries. |
+| `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
+| `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
+| `initial_connect_retry` | `off` | When `on`, applies the same backoff to the initial connect. |
+| `close_flush_timeout_millis` | 5000 | `Close` waits this long for ACKs; `0` / `-1` skips the drain. |
+| `drain_orphans` | `off` | When `on`, scan `<sf_dir>/*` and adopt sibling slots that hold unacked data. |
+| `max_background_drainers` | 4 | Cap on concurrent orphan drainers. |
+
+The same options are available programmatically:
+`WithSfDir`, `WithSenderId`, `WithSfMaxBytes`, `WithSfMaxTotalBytes`,
+`WithReconnectPolicy`, `WithInitialConnectRetry`, `WithCloseFlushTimeout`.
+
+### Failure semantics
+
+- **Transient disconnect**: caught by the I/O loop, transparent to user code.
+- **Auth rejection (HTTP 401/403)** on connect or reconnect: terminal — surfaced on the next user-thread call.
+- **Server rejected a frame** (e.g. schema mismatch): terminal; replay would just rebound, so the loop stops and reports the rejection. Bytes stay on disk for inspection.
+- **Reconnect cap exhausted**: terminal; restart the process to resume from disk.
+- **Disk cap full**: `At` / `AtNow` block up to `sf_append_deadline_millis`, then fail with a "wire path is not draining" error.
+
+### Crash recovery
+
+On startup with the same `sf_dir` + `sender_id`, the sender opens
+existing segment files, validates per-frame CRC32C, recovers any torn
+tail at the active segment's last good frame, and resumes sending
+where the prior session left off.
+
+If a previous sender process crashed and left its slot dir behind,
+turning on `drain_orphans=on` will scan sibling slots under `sf_dir`
+and adopt them on a separate connection: the foreground sender is
+unaffected, and a `.failed` sentinel is dropped if a drainer can't
+make progress (auth rejection, exhausted reconnect cap, etc.).
+
 ## Community
 
 If you need help, have additional questions or want to provide feedback, you

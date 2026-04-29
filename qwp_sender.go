@@ -221,6 +221,20 @@ type qwpLineSender struct {
 	// goroutine to finish before force-cancelling. Defaults to 5s.
 	closeTimeout time.Duration
 
+	// Cursor mode (set when sf_dir is configured). When non-nil, the
+	// engine + send loop replace asyncState: flushed batches are
+	// appended to the engine and transmitted by the send loop's
+	// goroutines. Memory mode still uses asyncState in this PR; the
+	// cursor unification is deferred to a later cleanup.
+	cursorEngine      *qwpSfCursorEngine
+	cursorSendLoop    *qwpSfSendLoop
+	closeFlushTimeout time.Duration
+
+	// drainerPool is non-nil only when the user opted into
+	// drain_orphans in cursor mode. Closed alongside the cursor
+	// engine in closeCursor.
+	drainerPool *qwpSfDrainerPool
+
 	// Lifecycle.
 	closed bool
 }
@@ -862,6 +876,14 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 		return errFlushWithPendingMessage
 	}
 	if s.pendingRowCount == 0 {
+		// Cursor mode: Flush() never waits for server ACK (Java
+		// spec — design decision #1 in qwp-cursor-durability.md).
+		// We surface any terminal I/O error the loop has recorded
+		// so producers don't keep silently buffering into a dead
+		// engine, but we don't block on drain. Use Close to wait.
+		if s.qwpCursorMode() {
+			return s.cursorSendLoop.sendLoopCheckError()
+		}
 		// In async mode, wait for any in-flight batches from
 		// previous auto-flushes to complete. This lets the user
 		// call Flush() as a barrier to confirm all data was ACKed.
@@ -873,6 +895,9 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 
 	defer s.resetAfterFlush()
 
+	if s.qwpCursorMode() {
+		return s.flushCursor(ctx)
+	}
 	if s.asyncState != nil {
 		return s.flushAsync(ctx)
 	}
@@ -1175,6 +1200,13 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 	}
 
 	s.closed = true
+
+	// Cursor mode owns its own transport via the send loop —
+	// closeCursor handles the full teardown (drain + loop close +
+	// engine close). The s.transport field is unused on this path.
+	if s.qwpCursorMode() {
+		return s.closeCursor(ctx)
+	}
 
 	var flushErr error
 	if s.asyncState != nil {

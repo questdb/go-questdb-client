@@ -231,12 +231,157 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				return nil, NewInvalidConfigStrError("invalid gorilla value, %q is not 'on' or 'off'", v)
 			}
+		case "sf_dir":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			senderConf.sfDir = v
+		case "sender_id":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			if err := validateSenderId(v); err != nil {
+				return nil, err
+			}
+			senderConf.senderId = v
+		case "sf_max_bytes":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int", k, v)
+			}
+			senderConf.sfMaxBytes = parsedVal
+		case "sf_max_total_bytes":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int", k, v)
+			}
+			senderConf.sfMaxTotalBytes = parsedVal
+		case "sf_durability":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "memory":
+				senderConf.sfDurability = v
+			case "flush", "append":
+				return nil, NewInvalidConfigStrError(
+					"sf_durability=%s is not yet supported (deferred follow-up; use sf_durability=memory)", v)
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid sf_durability value, %q is not 'memory' (other values reserved for future use)", v)
+			}
+		case "sf_append_deadline_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.sfAppendDeadlineMillis = parsedVal
+		case "reconnect_max_duration_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal < 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative int (milliseconds)", k, v)
+			}
+			senderConf.reconnectMaxDurationMillis = parsedVal
+		case "reconnect_initial_backoff_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.reconnectInitialBackoffMillis = parsedVal
+		case "reconnect_max_backoff_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.reconnectMaxBackoffMillis = parsedVal
+		case "initial_connect_retry":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "on", "true":
+				senderConf.initialConnectRetry = true
+			case "off", "false":
+				senderConf.initialConnectRetry = false
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
+			}
+		case "close_flush_timeout_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int (milliseconds)", k, v)
+			}
+			senderConf.closeFlushTimeoutSet = true
+			senderConf.closeFlushTimeoutMillis = parsedVal
+		case "drain_orphans":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "on", "true":
+				senderConf.drainOrphans = true
+			case "off", "false":
+				senderConf.drainOrphans = false
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
+			}
+		case "max_background_drainers":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal < 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative int", k, v)
+			}
+			senderConf.maxBackgroundDrainers = parsedVal
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}
 	}
 
 	return senderConf, nil
+}
+
+// validateSenderId enforces the same character set the Java client
+// allows for sender_id: ASCII letters, digits, '-', '_', '.'. The
+// value is used as a path segment under sf_dir; permitting '/' or
+// '\\' would let users traverse out of the slot dir.
+func validateSenderId(id string) error {
+	if id == "" {
+		return NewInvalidConfigStrError("sender_id must not be empty")
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'
+		if !ok {
+			return NewInvalidConfigStrError("sender_id contains invalid character: %q", string(c))
+		}
+	}
+	return nil
 }
 
 func parseConfigStr(conf string) (configData, error) {
