@@ -33,6 +33,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
@@ -880,23 +881,20 @@ func TestQwpTransportEgressUpgrade(t *testing.T) {
 }
 
 func TestQwpDumpWriter(t *testing.T) {
-	// dump mode wires its synthetic server through net.Pipe(); the
-	// cursor send loop's separate sender + receiver goroutines on
-	// that pipe deadlock the in-process WebSocket reader. The
-	// dump-mode pipeline still records the upgrade handshake and
-	// outgoing bytes correctly — we just exit before the drain
-	// barrier that hangs on net.Pipe — so the test exercises
-	// connect + the first sendMessage, then closes.
 	var buf bytes.Buffer
 	ctx := context.Background()
 
-	var transport qwpTransport
-	transport.dumpWriter = &buf
-	require.NoError(t, transport.connect(ctx, "", qwpTransportOpts{}))
-	require.NoError(t, transport.sendMessage(ctx, []byte{0x00, 0x01, 0x02, 0x03}))
-	_ = transport.close(ctx)
+	s, err := newQwpLineSender(ctx, "", qwpTransportOpts{}, 0, 0, 0, &buf)
+	require.NoError(t, err)
 
-	// The dump should start with the HTTP upgrade request.
+	// Insert a row and flush — exercises the full sender pipeline so
+	// the dump captures both the HTTP upgrade and at least one
+	// WebSocket binary frame round-trip.
+	s.Table("test_dump").Int64Column("val", 42)
+	require.NoError(t, s.At(ctx, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)))
+	require.NoError(t, s.Flush(ctx))
+	require.NoError(t, s.Close(ctx))
+
 	dump := buf.String()
 	assert.Contains(t, dump, "GET /write/v4 HTTP/1.1\r\n")
 	assert.Contains(t, dump, "Upgrade: websocket\r\n")

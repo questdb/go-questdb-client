@@ -55,6 +55,12 @@ type qwpSfTestServerOpts struct {
 	// with that HTTP status code on the WebSocket upgrade request,
 	// rejecting the connection. Used to exercise auth-terminal.
 	upgradeStatus int
+	// silentDropAfterFrames > 0 → on EVERY connection, read N frames
+	// then close the WebSocket without sending any ACK. Models a
+	// server that accepts the upgrade but doesn't speak our wire
+	// protocol (version/config mismatch). This is what
+	// TestQwpSfSendLoopProtocolMismatchIsTerminal exercises.
+	silentDropAfterFrames int
 }
 
 // qwpSfTestServer is a fake QWP server for send-loop tests. It
@@ -64,11 +70,16 @@ type qwpSfTestServer struct {
 	*httptest.Server
 	totalFramesReceived atomic.Int64
 	connCount           atomic.Int64
+	// kill is closed by tests that want to actively tear down every
+	// in-flight WS connection. httptest.Server.Close (and even
+	// CloseClientConnections) do not force-close hijacked
+	// connections, so handlers select on this channel to exit.
+	kill chan struct{}
 }
 
 func newQwpSfTestServer(t *testing.T, opts qwpSfTestServerOpts) *qwpSfTestServer {
 	t.Helper()
-	s := &qwpSfTestServer{}
+	s := &qwpSfTestServer{kill: make(chan struct{})}
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if opts.upgradeStatus != 0 {
 			w.WriteHeader(opts.upgradeStatus)
@@ -81,6 +92,18 @@ func newQwpSfTestServer(t *testing.T, opts qwpSfTestServerOpts) *qwpSfTestServer
 			return
 		}
 		defer conn.CloseNow()
+		// killWatcher: if the test fires s.kill, drop this WS.
+		// httptest.Server.Close/CloseClientConnections do not force-
+		// close hijacked WebSocket conns, so we need our own signal.
+		killCtx, cancelKill := context.WithCancel(context.Background())
+		defer cancelKill()
+		go func() {
+			select {
+			case <-s.kill:
+				_ = conn.CloseNow()
+			case <-killCtx.Done():
+			}
+		}()
 		myConnID := s.connCount.Add(1)
 		var localSeq int64
 		var localFramesReceived int
@@ -97,6 +120,14 @@ func newQwpSfTestServer(t *testing.T, opts qwpSfTestServerOpts) *qwpSfTestServer
 			if opts.closeAfterFrames > 0 &&
 				myConnID == 1 &&
 				localFramesReceived >= opts.closeAfterFrames {
+				return
+			}
+			// silentDropAfterFrames applies to EVERY connection: read N
+			// frames then close without ACKing. Models a server that
+			// accepts the upgrade but doesn't understand our wire
+			// protocol — reconnects would just hammer it.
+			if opts.silentDropAfterFrames > 0 &&
+				localFramesReceived >= opts.silentDropAfterFrames {
 				return
 			}
 			if opts.rejectStatus != 0 {
@@ -237,13 +268,61 @@ func TestQwpSfSendLoopServerErrorIsTerminal(t *testing.T) {
 	assert.Equal(t, int64(0), loop.sendLoopTotalReconnects())
 }
 
+// TestQwpSfSendLoopSilentDropAfterFrameIsTerminal verifies that when
+// the server accepts the WS upgrade but silently disconnects after
+// the first frame (without sending any ACK), the send loop classifies
+// it as a server version/config mismatch and fails fast instead of
+// entering a hot reconnect loop. Without this guard, every dial
+// succeeds and the receiver reset its backoff on each attempt — burning
+// thousands of ephemeral ports per second until reconnectMaxDuration
+// (5 minutes default) expired.
+func TestQwpSfSendLoopSilentDropAfterFrameIsTerminal(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{silentDropAfterFrames: 1})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background())
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		return loop.sendLoopCheckError() != nil
+	}, 2*time.Second, 1*time.Millisecond, "loop should have failed fast")
+
+	gotErr := loop.sendLoopCheckError()
+	require.Error(t, gotErr)
+	assert.Contains(t, gotErr.Error(), "without ACKing",
+		"error should explain the no-ACK detection")
+
+	// The whole point: we must NOT hammer the server with thousands
+	// of reconnects. Cap at a small number — the loop should give up
+	// after the very first connection that fails the heuristic.
+	assert.LessOrEqual(t, loop.sendLoopTotalReconnects(), int64(1),
+		"expected at most one reconnect before terminal classification")
+	assert.LessOrEqual(t, srv.connCount.Load(), int64(2),
+		"server should have seen at most 2 connections")
+}
+
 func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
-	// First server: dies after the initial connect, but reconnect
-	// goes to a *different* server that rejects with 401 — we want
-	// to verify the rejection is detected as terminal.
+	// First server ACKs at least one frame (so the post-disconnect
+	// classification is "had a real conversation, try to reconnect"
+	// rather than the no-ACK protocol-mismatch terminal path); then
+	// the WS conn is killed and the reconnect factory points at a
+	// *different* server that rejects the upgrade with 401, which is
+	// what this test actually exercises.
 	authSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{upgradeStatus: 401})
 	defer authSrv.Close()
-	dataSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 1})
+	dataSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer dataSrv.Close()
 
 	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
@@ -261,6 +340,13 @@ func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
 
 	_, err = engine.engineAppendBlocking(context.Background(), []byte("hi"))
 	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, time.Second, time.Millisecond, "expected the warm-up frame to be ACKed by dataSrv")
+
+	// Tear down the live WS so the loop falls into reconnect, where
+	// it'll hit authSrv and surface the 401.
+	close(dataSrv.kill)
 
 	require.Eventually(t, func() bool {
 		return loop.sendLoopCheckError() != nil
@@ -272,7 +358,12 @@ func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
 }
 
 func TestQwpSfSendLoopReconnectBudgetExhausted(t *testing.T) {
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 1})
+	// Healthy server first — get a successful ACK on the live
+	// connection so the disconnect, when it comes, is NOT classified
+	// as "no ACKs ever, must be a protocol mismatch" by run(). Then
+	// take the server down so reconnects fail with connection-refused
+	// and the per-outage budget actually gets exercised.
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 
 	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
@@ -281,21 +372,22 @@ func TestQwpSfSendLoopReconnectBudgetExhausted(t *testing.T) {
 	transport, err := qwpSfDialFor(srv)(context.Background())
 	require.NoError(t, err)
 
-	// Take the server down after grabbing the initial transport;
-	// the reconnect factory will hit "connection refused" until
-	// the per-outage cap fires.
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 200*time.Millisecond /* short cap */, 10*time.Millisecond, 50*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("warm-up"))
 	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, time.Second, time.Millisecond, "expected the warm-up frame to be ACKed")
 
-	// Send the frame, server closes, reconnect tries (server is
-	// alive but only accepts 1 frame each connection — so the
-	// reconnect succeeds quickly... we need to take the server
-	// down).
+	// Tear the live WS conn (kill channel) AND shut down the
+	// listener (Close) so reconnect attempts fail with connection-
+	// refused. CloseClientConnections / Close do not force-close
+	// hijacked WS conns, so the kill channel is required.
+	close(srv.kill)
 	srv.Close()
 
 	require.Eventually(t, func() bool {

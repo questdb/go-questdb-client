@@ -106,8 +106,13 @@ type qwpSfSendLoop struct {
 	// during ACK handling.
 	fsnAtZero atomic.Int64
 	// nextWireSeq is the next wire sequence the send goroutine will
-	// emit. Reset to 0 on every reconnect.
-	nextWireSeq int64
+	// emit. Reset to 0 on every reconnect. Atomic because the
+	// receiver goroutine reads it for its sanity check on incoming
+	// ACKs — without atomics, an in-process server (e.g. the dump-
+	// mode pipe) can deliver an ACK before the producer's plain-int
+	// increment is visible to the consumer, and the consumer's
+	// "highestSent < 0" guard then drops a real ACK.
+	nextWireSeq atomic.Int64
 	// sendingSegment / sendOffset track the cursor inside the
 	// engine's segment chain. Producer-only state.
 	sendingSegment *qwpSfSegment
@@ -141,6 +146,14 @@ type qwpSfSendLoop struct {
 	totalReconnects        atomic.Int64
 	totalReconnectAttempts atomic.Int64
 	totalFramesReplayed    atomic.Int64
+
+	// Per-connection counters used to detect "server up but doesn't
+	// speak our protocol". A WS upgrade that succeeds followed by a
+	// drop after we sent ≥1 frame and saw zero ACKs is unrecoverable
+	// (likely a server-side version/config mismatch — reconnecting
+	// just hammers the server). Reset on every connection swap.
+	framesSentOnConn atomic.Int64
+	acksRecvOnConn   atomic.Int64
 }
 
 // qwpSfNewSendLoop constructs a send loop bound to the given engine
@@ -273,7 +286,9 @@ func (l *qwpSfSendLoop) sendLoopTotalAcks() int64 {
 func (l *qwpSfSendLoop) positionCursorForStart() {
 	replayStart := l.engine.engineAckedFsn() + 1
 	l.fsnAtZero.Store(replayStart)
-	l.nextWireSeq = 0
+	l.nextWireSeq.Store(0)
+	l.framesSentOnConn.Store(0)
+	l.acksRecvOnConn.Store(0)
 	l.positionCursorAt(replayStart)
 }
 
@@ -328,6 +343,32 @@ func (l *qwpSfSendLoop) run() {
 		}
 		if qwpSfIsTerminalUpgradeError(err) {
 			l.recordFatal(fmt.Errorf("qwp/sf: WebSocket upgrade failed (won't retry): %w", err))
+			return
+		}
+		// Detect "server up, accepts the WS upgrade, but doesn't speak
+		// our QWP protocol" — the dial succeeds every time, so plain
+		// reconnect-with-backoff would hammer the server in a hot
+		// loop until reconnectMaxDuration expires (5 min default),
+		// burning thousands of ephemeral ports per second. The
+		// signature: this connection sent ≥1 frame and saw zero ACKs
+		// before dropping. A healthy server either ACKs OK or sends a
+		// non-OK status ACK (which is already classified terminal in
+		// receiverLoop) — silent disconnect after a frame is a
+		// version/config mismatch, and reconnecting can't fix it.
+		if l.framesSentOnConn.Load() > 0 && l.acksRecvOnConn.Load() == 0 {
+			// The connection finished the WS upgrade and the X-QWP-
+			// Version negotiation, then closed without ACKing any of
+			// the frames we sent. Reconnect can't fix this — the
+			// server isn't speaking the same wire-format dialect we
+			// are (most often: server build is older than this
+			// client's branch, even if both sides declared the same
+			// X-QWP-Version). Fail terminally to avoid hammering the
+			// server with thousands of dial attempts per second.
+			l.recordFatal(fmt.Errorf(
+				"qwp/sf: server accepted the WebSocket upgrade but disconnected "+
+					"without ACKing any of the %d frame(s) we sent — server is "+
+					"likely running an incompatible build (won't retry): %w",
+				l.framesSentOnConn.Load(), err))
 			return
 		}
 		// Reconnect with backoff.
@@ -448,6 +489,18 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 		return false, errors.New("qwp/sf: transport gone mid-loop")
 	}
 	payload := base[l.sendOffset+qwpSfFrameHeaderSize : frameEnd]
+	// Bump nextWireSeq BEFORE the wire write. The receiver
+	// goroutine uses nextWireSeq to validate incoming ACK
+	// sequence numbers; if we incremented after sendMessage, a
+	// fast in-process server could deliver an ACK before the
+	// store became visible and the receiver's sanity check would
+	// reject a legitimate ACK. The trade-off — a wire failure
+	// leaves nextWireSeq advanced for a frame that never made it
+	// — is harmless because every reconnect path resets it via
+	// swapClient/positionCursorForStart.
+	wireSeq := l.nextWireSeq.Load()
+	fsnSent := l.fsnAtZero.Load() + wireSeq
+	l.nextWireSeq.Store(wireSeq + 1)
 	if err := transport.sendMessage(ctx, payload); err != nil {
 		// Treat ctx-cancelled as a clean shutdown rather than a
 		// wire failure — runOneConnection will return nil and the
@@ -458,9 +511,8 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	l.sendOffset = frameEnd
-	fsnSent := l.fsnAtZero.Load() + l.nextWireSeq
-	l.nextWireSeq++
 	l.totalFramesSent.Add(1)
+	l.framesSentOnConn.Add(1)
 	if l.replayTargetFsn >= 0 {
 		l.totalFramesReplayed.Add(1)
 		if fsnSent >= l.replayTargetFsn {
@@ -533,7 +585,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 		// sent. A malformed/replayed server response could
 		// otherwise force trim of segments the new server hasn't
 		// seen.
-		highestSent := l.nextWireSeq - 1
+		highestSent := l.nextWireSeq.Load() - 1
 		if highestSent < 0 {
 			continue
 		}
@@ -543,6 +595,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 		}
 		l.engine.engineAcknowledge(l.fsnAtZero.Load() + capped)
 		l.totalAcks.Add(1)
+		l.acksRecvOnConn.Add(1)
 	}
 }
 
@@ -614,7 +667,9 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) {
 	}
 	replayStart := l.engine.engineAckedFsn() + 1
 	l.fsnAtZero.Store(replayStart)
-	l.nextWireSeq = 0
+	l.nextWireSeq.Store(0)
+	l.framesSentOnConn.Store(0)
+	l.acksRecvOnConn.Store(0)
 	pubAtSwap := l.engine.enginePublishedFsn()
 	if pubAtSwap >= replayStart {
 		l.replayTargetFsn = pubAtSwap

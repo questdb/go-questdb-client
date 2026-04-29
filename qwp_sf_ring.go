@@ -91,9 +91,12 @@ type qwpSfSegmentRing struct {
 	ackedFsn     atomic.Int64
 	publishedFsn atomic.Int64
 
-	// nextSeq is producer-only state: the FSN that appendOrFsn will
-	// assign next. Plain int64; the producer is single-threaded.
-	nextSeq int64
+	// nextSeq is the FSN that appendOrFsn will assign next.
+	// Producer-only mutator (single-threaded), but the segment
+	// manager goroutine reads it via nextSeqHint to seed a fresh
+	// spare's baseSeq, so the field has to be atomic to avoid a
+	// torn-read race under -race.
+	nextSeq atomic.Int64
 
 	// mu protects sealedSegments and serialises against close. It also
 	// covers the producer's mutation when adding a sealed segment to
@@ -130,9 +133,9 @@ func qwpSfNewSegmentRing(initialActive *qwpSfSegment, maxBytesPerSegment int64) 
 	// publishedFsn == nextSeq - 1 == -1 (or baseSeq-1 for a
 	// rebased-recovered segment).
 	frameCount := initialActive.segmentFrameCount()
-	r.nextSeq = initialActive.segmentBaseSeq() + frameCount
+	r.nextSeq.Store(initialActive.segmentBaseSeq() + frameCount)
 	if frameCount > 0 {
-		r.publishedFsn.Store(r.nextSeq - 1)
+		r.publishedFsn.Store(r.nextSeq.Load() - 1)
 	} else {
 		r.publishedFsn.Store(-1)
 	}
@@ -322,8 +325,8 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 		r.managerWakeup()
 	}
 	_ = off // offset is not used by callers; kept for parity with the Java return.
-	fsn := r.nextSeq
-	r.nextSeq++
+	fsn := r.nextSeq.Load()
+	r.nextSeq.Store(fsn + 1)
 	r.publishedFsn.Store(fsn)
 	return fsn
 }
@@ -542,7 +545,7 @@ func (r *qwpSfSegmentRing) needsHotSpare() bool {
 // for the segment manager to know what baseSeq to stamp the next
 // spare with (provisional; rebased at rotation).
 func (r *qwpSfSegmentRing) nextSeqHint() int64 {
-	return r.nextSeq
+	return r.nextSeq.Load()
 }
 
 // segmentRingPublishedFsn returns the highest FSN whose frame is
