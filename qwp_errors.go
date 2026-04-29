@@ -31,6 +31,8 @@ func qwpStatusName(status qwpStatusCode) string {
 	switch status {
 	case qwpStatusOK:
 		return "OK"
+	case qwpStatusDurableAck:
+		return "DURABLE_ACK"
 	case qwpStatusSchemaMismatch:
 		return "SCHEMA_MISMATCH"
 	case qwpStatusParseError:
@@ -76,14 +78,14 @@ func (e *QwpError) Error() string {
 }
 
 // newQwpErrorFromAck creates a QwpError from a raw ACK payload.
-// Returns nil if the status is OK.
+// Returns nil if the status is OK or DURABLE_ACK (success / progress
+// frames carry no error).
 //
 // Precondition: data has already been validated by readAck, which
-// guarantees at least qwpAckOKMinSize bytes for OK status and
-// qwpAckErrorHeaderSize + msg_len bytes for non-OK statuses.
+// guarantees the layout invariants documented on readAck.
 func newQwpErrorFromAck(data []byte) *QwpError {
 	status := qwpStatusCode(data[0])
-	if status == qwpStatusOK {
+	if status == qwpStatusOK || status == qwpStatusDurableAck {
 		return nil
 	}
 	return &QwpError{

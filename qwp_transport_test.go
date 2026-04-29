@@ -42,15 +42,68 @@ import (
 
 // --- Unit tests for ACK parsing ---
 
-// buildAckOK builds a minimal OK ACK response (11 bytes): the
-// fixed status + sequence header followed by tableCount=0 and no
-// per-table entries.
+// buildAckOK builds a minimal OK ACK response (11 bytes — status +
+// sequence + tableCount=0, no per-table entries).
 func buildAckOK(seq int64) []byte {
 	data := make([]byte, qwpAckOKMinSize)
 	data[0] = byte(qwpStatusOK)
 	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
-	// data[9:11] is tableCount, already zero.
+	binary.LittleEndian.PutUint16(data[9:11], 0)
 	return data
+}
+
+// buildAckOKWithTables builds an OK ACK whose tail carries one or
+// more per-table watermark entries (nameLen + name + seqTxn). Used by
+// tests that exercise the new OK-with-watermark wire shape.
+func buildAckOKWithTables(seq int64, entries ...struct {
+	name   string
+	seqTxn int64
+}) []byte {
+	tail := encodeAckTableEntries(entries)
+	data := make([]byte, 11+len(tail))
+	data[0] = byte(qwpStatusOK)
+	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
+	binary.LittleEndian.PutUint16(data[9:11], uint16(len(entries)))
+	copy(data[11:], tail)
+	return data
+}
+
+// buildAckDurable builds a STATUS_DURABLE_ACK response (status +
+// tableCount + entries).
+func buildAckDurable(entries ...struct {
+	name   string
+	seqTxn int64
+}) []byte {
+	tail := encodeAckTableEntries(entries)
+	data := make([]byte, 3+len(tail))
+	data[0] = byte(qwpStatusDurableAck)
+	binary.LittleEndian.PutUint16(data[1:3], uint16(len(entries)))
+	copy(data[3:], tail)
+	return data
+}
+
+// encodeAckTableEntries serializes per-table watermark entries
+// (nameLen(2) + name + seqTxn(8)) without the leading tableCount.
+// Caller is responsible for prepending tableCount.
+func encodeAckTableEntries(entries []struct {
+	name   string
+	seqTxn int64
+}) []byte {
+	size := 0
+	for _, e := range entries {
+		size += 2 + len(e.name) + 8
+	}
+	out := make([]byte, size)
+	off := 0
+	for _, e := range entries {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(e.name)))
+		off += 2
+		copy(out[off:], e.name)
+		off += len(e.name)
+		binary.LittleEndian.PutUint64(out[off:off+8], uint64(e.seqTxn))
+		off += 8
+	}
+	return out
 }
 
 // buildAckError builds an error ACK response with message.
@@ -878,6 +931,167 @@ func TestQwpTransportEgressUpgrade(t *testing.T) {
 		assert.False(t, got.hasAcceptEnc)
 		assert.Equal(t, "1", got.maxBatchRows)
 	})
+}
+
+// TestReadAckOKWithTableEntries exercises the new OK ACK shape that
+// carries per-table watermark entries (status + seq + tableCount +
+// [nameLen + name + seqTxn] * tableCount). The wire frame for one
+// 19-char table name lands at exactly 42 bytes — this is the size
+// the live QuestDB server returns for typical SF write paths.
+func TestReadAckOKWithTableEntries(t *testing.T) {
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		ack := buildAckOKWithTables(7,
+			struct {
+				name   string
+				seqTxn int64
+			}{"my_test_table_xxxxx", 100},
+		)
+		// Sanity: this is the 42-byte ACK shape from the live server.
+		// 11 (header) + 2 (nameLen) + 19 (name) + 8 (seqTxn) = 40.
+		// Adjust if the helper layout ever changes.
+		conn.Write(context.Background(), websocket.MessageBinary, ack)
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	require.NoError(t, tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}))
+	defer tr.close()
+
+	require.NoError(t, tr.sendMessage(context.Background(), []byte{0x00}))
+	status, data, err := tr.readAck(context.Background())
+	require.NoError(t, err)
+	if status != qwpStatusOK {
+		t.Fatalf("status = 0x%02X, want OK", status)
+	}
+	if seq := parseAckSequence(data); seq != 7 {
+		t.Fatalf("sequence = %d, want 7", seq)
+	}
+}
+
+// TestReadAckDurableAck verifies that DURABLE_ACK frames pass the
+// validator, are returned with the correct status code, and don't
+// trip the OK / error decoders.
+func TestReadAckDurableAck(t *testing.T) {
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		conn.Write(context.Background(), websocket.MessageBinary,
+			buildAckDurable(struct {
+				name   string
+				seqTxn int64
+			}{"durable_table", 42}))
+		// Followed by a normal OK terminator so sendAndAck has
+		// something to return.
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	require.NoError(t, tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}))
+	defer tr.close()
+
+	require.NoError(t, tr.sendMessage(context.Background(), []byte{0x00}))
+	status, _, err := tr.readAck(context.Background())
+	require.NoError(t, err)
+	if status != qwpStatusDurableAck {
+		t.Fatalf("status = 0x%02X, want DURABLE_ACK", status)
+	}
+}
+
+// TestSendAndAckSkipsDurableAck verifies that sendAndAck reads past
+// any DURABLE_ACK frames (per-table fsync progress) and only resolves
+// when an OK or error frame arrives.
+func TestSendAndAckSkipsDurableAck(t *testing.T) {
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		// Send two DURABLE_ACKs followed by an OK. sendAndAck must
+		// keep reading and resolve on the OK.
+		conn.Write(context.Background(), websocket.MessageBinary,
+			buildAckDurable(struct {
+				name   string
+				seqTxn int64
+			}{"t1", 1}))
+		conn.Write(context.Background(), websocket.MessageBinary,
+			buildAckDurable(struct {
+				name   string
+				seqTxn int64
+			}{"t2", 2}))
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	require.NoError(t, tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}))
+	defer tr.close()
+
+	err := tr.sendAndAck(context.Background(), func() []byte { return []byte{0x00} })
+	require.NoError(t, err)
+}
+
+// TestReadAckRejectsTruncatedTableEntry confirms that an OK frame
+// whose tableCount declares N entries but whose body terminates early
+// is rejected as malformed.
+func TestReadAckRejectsTruncatedTableEntry(t *testing.T) {
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		// Build an OK frame with tableCount=1 but no entry bytes.
+		ack := make([]byte, 11)
+		ack[0] = byte(qwpStatusOK)
+		binary.LittleEndian.PutUint64(ack[1:9], 0)
+		binary.LittleEndian.PutUint16(ack[9:11], 1) // claims 1 entry
+		conn.Write(context.Background(), websocket.MessageBinary, ack)
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	require.NoError(t, tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}))
+	defer tr.close()
+
+	require.NoError(t, tr.sendMessage(context.Background(), []byte{0x00}))
+	_, _, err := tr.readAck(context.Background())
+	if err == nil {
+		t.Fatal("expected malformed-OK error for truncated table entry")
+	}
+	if !strings.Contains(err.Error(), "malformed OK") {
+		t.Fatalf("error should mention 'malformed OK', got: %v", err)
+	}
+}
+
+// TestReadAckRejectsEmptyTableName confirms that a per-table entry
+// with nameLen=0 is rejected. Mirrors the Java client's
+// validateTableEntries guard.
+func TestReadAckRejectsEmptyTableName(t *testing.T) {
+	srv := newTestWSServer(t, func(conn *websocket.Conn) {
+		conn.Read(context.Background())
+		// OK frame with one entry: nameLen=0, seqTxn=0. The validator
+		// must reject this even though the byte count adds up.
+		ack := make([]byte, 11+2+8)
+		ack[0] = byte(qwpStatusOK)
+		binary.LittleEndian.PutUint64(ack[1:9], 0)
+		binary.LittleEndian.PutUint16(ack[9:11], 1)
+		binary.LittleEndian.PutUint16(ack[11:13], 0) // nameLen=0
+		binary.LittleEndian.PutUint64(ack[13:21], 0) // seqTxn
+		conn.Write(context.Background(), websocket.MessageBinary, ack)
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	require.NoError(t, tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}))
+	defer tr.close()
+
+	require.NoError(t, tr.sendMessage(context.Background(), []byte{0x00}))
+	_, _, err := tr.readAck(context.Background())
+	if err == nil {
+		t.Fatal("expected malformed-OK error for empty table name")
+	}
+	if !strings.Contains(err.Error(), "empty table name") {
+		t.Fatalf("error should mention 'empty table name', got: %v", err)
+	}
 }
 
 func TestQwpDumpWriter(t *testing.T) {

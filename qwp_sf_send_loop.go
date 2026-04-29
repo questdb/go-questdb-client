@@ -567,6 +567,13 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			}
 			return err
 		}
+		if status == qwpStatusDurableAck {
+			// Per-table fsync confirmation. Cursor SF doesn't
+			// currently surface durable-ack progress to the
+			// producer, but receiving one is not an error — match
+			// the Java client and silently ignore.
+			continue
+		}
 		seq := parseAckSequence(data)
 		if status != qwpStatusOK {
 			// Application-layer rejection by the server. The bytes

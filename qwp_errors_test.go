@@ -68,6 +68,7 @@ func TestQwpStatusName(t *testing.T) {
 		want   string
 	}{
 		{qwpStatusOK, "OK"},
+		{qwpStatusDurableAck, "DURABLE_ACK"},
 		{qwpStatusSchemaMismatch, "SCHEMA_MISMATCH"},
 		{qwpStatusParseError, "PARSE_ERROR"},
 		{qwpStatusInternalError, "INTERNAL_ERROR"},
@@ -86,11 +87,22 @@ func TestQwpStatusName(t *testing.T) {
 
 func TestNewQwpErrorFromAck(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
-		data := make([]byte, 9)
+		// 11 bytes: status + sequence + tableCount(0), no trailing entries.
+		data := make([]byte, 11)
 		data[0] = byte(qwpStatusOK)
 		err := newQwpErrorFromAck(data)
 		if err != nil {
 			t.Fatalf("expected nil for OK status, got: %v", err)
+		}
+	})
+
+	t.Run("DurableAck", func(t *testing.T) {
+		// 3 bytes: status + tableCount(0).
+		data := make([]byte, 3)
+		data[0] = byte(qwpStatusDurableAck)
+		err := newQwpErrorFromAck(data)
+		if err != nil {
+			t.Fatalf("expected nil for DURABLE_ACK status, got: %v", err)
 		}
 	})
 

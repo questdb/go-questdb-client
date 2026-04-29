@@ -66,14 +66,24 @@ const (
 // (e.g. java/1.0.2).
 const qwpClientId = "go/4.1.0"
 
-// QWP ACK response sizes (spec §13). An OK ACK is at least
-// qwpAckOKMinSize bytes (status + sequence + tableCount=0); when
-// tables committed in the acknowledged batch their per-table entries
-// trail the header and the total length grows by 2+name+8 each. An
-// error ACK is exactly qwpAckErrorHeaderSize + msg_len bytes.
+// QWP ACK response sizes (spec §13). All ACKs share a fixed header
+// shape, but their tails vary:
+//
+//	OK:           [status(1)] [sequence(8)] [tableCount(2)] [entries…]
+//	DURABLE_ACK:  [status(1)] [tableCount(2)] [entries…]
+//	Error:        [status(1)] [sequence(8)] [msg_len(2)] [msg]
+//
+// Each table entry is [nameLen(2)] [name(nameLen)] [seqTxn(8)]. The
+// minimum frame sizes below correspond to a payload with zero entries.
 const (
-	qwpAckOKMinSize       = 11 // status(1) + sequence(8) + tableCount(2)
-	qwpAckErrorHeaderSize = 11 // status(1) + sequence(8) + msg_len(2)
+	qwpAckOKMinSize         = 11 // status(1) + sequence(8) + tableCount(2)
+	qwpAckDurableMinSize    = 3  // status(1) + tableCount(2)
+	qwpAckErrorHeaderSize   = 11 // status(1) + sequence(8) + msg_len(2)
+	qwpAckTableEntryHeader  = 10 // nameLen(2) + seqTxn(8)
+	qwpAckSequenceOffset    = 1  // status(1)
+	qwpAckOKTablesOffset    = 9  // status(1) + sequence(8)
+	qwpAckDurableTablesOff  = 1  // status(1)
+	qwpAckErrorMsgLenOffset = 9  // status(1) + sequence(8)
 )
 
 // qwpTransportOpts configures a WebSocket transport connection. The
@@ -315,8 +325,13 @@ func (t *qwpTransport) sendMessage(ctx context.Context, data []byte) error {
 
 // readAck reads and parses the server's ACK response. It returns
 // the status code and the full response payload (including the
-// status byte). The payload is validated against the shape required
-// by §13:
+// status byte). The payload is validated against the exact shape
+// required by spec §13: OK and DURABLE_ACK frames carry per-table
+// watermark entries and must consume the frame exactly; error frames
+// must end exactly at status + sequence + msg_len + msg. This
+// mirrors the Java client's WebSocketResponse.isStructurallyValid
+// and fails loudly on any unrecognized shape (e.g. a legacy 9-byte
+// OK response) instead of decoding it into garbage fields.
 //
 //   - OK ACKs are status(1) + sequence(8) + tableCount(2) +
 //     tableCount × (nameLen(2) + name + seqTxn(8)). Minimum 11 bytes;
@@ -329,127 +344,122 @@ func (t *qwpTransport) sendMessage(ctx context.Context, data []byte) error {
 //     that arrives is silently consumed.
 //   - Error ACKs are exactly qwpAckErrorHeaderSize + msg_len bytes.
 //
-// Mirrors the Java client's WebSocketResponse.isStructurallyValid;
-// unrecognized shapes fail loudly instead of decoding into garbage
-// fields.
+//	OK:           [status (0x00)] [sequence: int64 LE] [tableCount: uint16 LE] [entries…]
+//	DURABLE_ACK:  [status (0x02)]                      [tableCount: uint16 LE] [entries…]
+//	Error:        [status]        [sequence: int64 LE] [msg_len: uint16 LE]   [msg: UTF-8]
+//
+// Each table entry is [nameLen: uint16 LE] [name (nameLen bytes UTF-8)]
+// [seqTxn: int64 LE]. nameLen must be > 0 — empty names are rejected.
 func (t *qwpTransport) readAck(ctx context.Context) (qwpStatusCode, []byte, error) {
 	if t.conn == nil {
 		return 0, nil, fmt.Errorf("qwp: not connected")
 	}
 
-	// Loop reads until a usable ACK arrives. We skip stray non-binary
-	// frames (proxy keep-alives) and unsolicited DURABLE_ACK frames
-	// the same way: continue and keep reading.
+	// Skip non-binary data frames. coder/websocket handles ping/pong
+	// and close control frames internally, so only stray text frames
+	// can reach us — e.g. a misbehaving proxy injecting keep-alives.
+	// Match the Java client, which ignores them and keeps reading.
+	var data []byte
 	for {
-		// Skip non-binary data frames. coder/websocket handles ping/pong
-		// and close control frames internally, so only stray text frames
-		// can reach us — e.g. a misbehaving proxy injecting keep-alives.
-		// Match the Java client, which ignores them and keeps reading.
-		var data []byte
-		for {
-			msgType, buf, err := t.conn.Read(ctx)
-			if err != nil {
-				return 0, nil, fmt.Errorf("qwp: read ack: %w", err)
-			}
-			if msgType == websocket.MessageBinary {
-				data = buf
-				break
-			}
+		msgType, buf, err := t.conn.Read(ctx)
+		if err != nil {
+			return 0, nil, fmt.Errorf("qwp: read ack: %w", err)
 		}
-		if len(data) < 1 {
-			return 0, nil, fmt.Errorf("qwp: ack too short: %d bytes", len(data))
-		}
-		statusCode := qwpStatusCode(data[0])
-
-		switch statusCode {
-		case qwpStatusOK:
-			if len(data) < qwpAckOKMinSize {
-				return 0, nil, fmt.Errorf("qwp: malformed OK ack: got %d bytes, want at least %d", len(data), qwpAckOKMinSize)
-			}
-			if !validateAckTableEntries(data[9:]) {
-				return 0, nil, fmt.Errorf("qwp: malformed OK ack: bad table entries section, got %d bytes", len(data))
-			}
-			return statusCode, data, nil
-
-		case qwpStatusDurableAck:
-			// DURABLE_ACK: status(1) + tableCount(2) + entries. Verify
-			// shape and continue reading — we do not surface durable
-			// watermarks today.
-			if len(data) < 3 {
-				return 0, nil, fmt.Errorf("qwp: malformed durable-ack: got %d bytes, want at least 3", len(data))
-			}
-			if !validateAckTableEntries(data[1:]) {
-				return 0, nil, fmt.Errorf("qwp: malformed durable-ack: bad table entries section, got %d bytes", len(data))
-			}
-			continue
-
-		default:
-			if len(data) < qwpAckErrorHeaderSize {
-				return 0, nil, fmt.Errorf("qwp: malformed error ack: got %d bytes, want at least %d", len(data), qwpAckErrorHeaderSize)
-			}
-			msgLen := int(binary.LittleEndian.Uint16(data[9:11]))
-			if len(data) != qwpAckErrorHeaderSize+msgLen {
-				return 0, nil, fmt.Errorf("qwp: malformed error ack: status=0x%02X, got %d bytes, want %d", byte(statusCode), len(data), qwpAckErrorHeaderSize+msgLen)
-			}
-			return statusCode, data, nil
+		if msgType == websocket.MessageBinary {
+			data = buf
+			break
 		}
 	}
+	if len(data) < 1 {
+		return 0, nil, fmt.Errorf("qwp: ack too short: %d bytes", len(data))
+	}
+
+	statusCode := qwpStatusCode(data[0])
+	switch statusCode {
+	case qwpStatusOK:
+		if len(data) < qwpAckOKMinSize {
+			return 0, nil, fmt.Errorf("qwp: malformed OK ack: got %d bytes, want at least %d", len(data), qwpAckOKMinSize)
+		}
+		if err := validateAckTableEntries(data[qwpAckOKTablesOffset:]); err != nil {
+			return 0, nil, fmt.Errorf("qwp: malformed OK ack: %w", err)
+		}
+		return statusCode, data, nil
+	case qwpStatusDurableAck:
+		if len(data) < qwpAckDurableMinSize {
+			return 0, nil, fmt.Errorf("qwp: malformed durable ack: got %d bytes, want at least %d", len(data), qwpAckDurableMinSize)
+		}
+		if err := validateAckTableEntries(data[qwpAckDurableTablesOff:]); err != nil {
+			return 0, nil, fmt.Errorf("qwp: malformed durable ack: %w", err)
+		}
+		return statusCode, data, nil
+	}
+	// Error frame.
+	if len(data) < qwpAckErrorHeaderSize {
+		return 0, nil, fmt.Errorf("qwp: malformed error ack: got %d bytes, want at least %d", len(data), qwpAckErrorHeaderSize)
+	}
+	msgLen := int(binary.LittleEndian.Uint16(data[qwpAckErrorMsgLenOffset : qwpAckErrorMsgLenOffset+2]))
+	if len(data) != qwpAckErrorHeaderSize+msgLen {
+		return 0, nil, fmt.Errorf("qwp: malformed error ack: status=0x%02X, got %d bytes, want %d", byte(statusCode), len(data), qwpAckErrorHeaderSize+msgLen)
+	}
+	return statusCode, data, nil
 }
 
-// validateAckTableEntries walks the per-table entries section that
-// trails an OK or DURABLE_ACK header. The buffer must start at the
-// 2-byte little-endian table count, contain `tableCount` entries of
-// shape (nameLen(2) + name + seqTxn(8)), and end exactly at the last
-// entry — no trailing bytes. Mirrors Java's validateTableEntries.
-func validateAckTableEntries(buf []byte) bool {
-	if len(buf) < 2 {
-		return false
+// validateAckTableEntries walks the per-table watermark trailer of an
+// OK or DURABLE_ACK frame and checks that its declared length consumes
+// the buffer exactly. Returns nil on success or a descriptive error
+// for any truncation, lying-length entry, empty table name, or
+// trailing garbage.
+func validateAckTableEntries(tail []byte) error {
+	if len(tail) < 2 {
+		return fmt.Errorf("missing table count")
 	}
-	tableCount := int(binary.LittleEndian.Uint16(buf[0:2]))
+	tableCount := int(binary.LittleEndian.Uint16(tail[0:2]))
 	off := 2
 	for i := 0; i < tableCount; i++ {
-		if len(buf) < off+2 {
-			return false
+		if len(tail) < off+2 {
+			return fmt.Errorf("truncated table entry %d (header)", i)
 		}
-		nameLen := int(binary.LittleEndian.Uint16(buf[off : off+2]))
+		nameLen := int(binary.LittleEndian.Uint16(tail[off : off+2]))
 		off += 2
-		// Empty table names are rejected as structurally invalid — a
-		// valid table name is never zero bytes, and accepting empty
-		// names would let a misbehaving server poison any per-table
-		// tracker with "" entries.
-		if nameLen == 0 || len(buf) < off+nameLen+8 {
-			return false
+		// Empty names indicate a corrupt or hostile payload — match
+		// the Java client and reject them. A valid table name is
+		// never zero bytes.
+		if nameLen == 0 {
+			return fmt.Errorf("empty table name in entry %d", i)
+		}
+		if len(tail) < off+nameLen+8 {
+			return fmt.Errorf("truncated table entry %d (body)", i)
 		}
 		off += nameLen + 8
 	}
-	return off == len(buf)
+	if off != len(tail) {
+		return fmt.Errorf("trailing %d bytes after %d table entries", len(tail)-off, tableCount)
+	}
+	return nil
 }
 
-// parseAckError extracts an error message from a non-OK ACK payload.
-// The layout is:
+// parseAckError extracts an error message from a non-OK, non-durable
+// ACK payload. The layout is:
 //
 //	[statusCode: uint8] [sequence: int64 LE] [errorLength: uint16 LE] [errorMessage: UTF-8]
 //
 // Precondition: data has already been validated by readAck, which
-// guarantees at least qwpAckErrorHeaderSize bytes for non-OK statuses
+// guarantees at least qwpAckErrorHeaderSize bytes for error statuses
 // and that the trailing bytes match the declared errorLength.
 func parseAckError(data []byte) string {
-	const errLenOffset = 9  // 1 (status) + 8 (sequence)
-	const errMsgOffset = 11 // errLenOffset + 2 (uint16)
-	errLen := int(binary.LittleEndian.Uint16(data[errLenOffset:errMsgOffset]))
-	return string(data[errMsgOffset : errMsgOffset+errLen])
+	errLen := int(binary.LittleEndian.Uint16(data[qwpAckErrorMsgLenOffset : qwpAckErrorMsgLenOffset+2]))
+	start := qwpAckErrorHeaderSize
+	return string(data[start : start+errLen])
 }
 
 // parseAckSequence extracts the cumulative sequence number from an
-// ACK payload. The wire field is signed (int64 LE) and uses -1 as
-// a sentinel; matches Java's long semantics.
+// OK or error ACK payload. The wire field is signed (int64 LE) and
+// uses -1 as a sentinel; matches Java's long semantics. DURABLE_ACK
+// frames have no sequence — callers must skip them before calling.
 //
-// Precondition: data has already been validated by readAck, which
-// guarantees at least qwpAckOKMinSize bytes for OK ACKs and the
-// header for error ACKs. Not valid for DURABLE_ACK frames, which
-// carry no sequence; readAck never returns those.
+// Precondition: data has already been validated by readAck.
 func parseAckSequence(data []byte) int64 {
-	return int64(binary.LittleEndian.Uint64(data[1:9]))
+	return int64(binary.LittleEndian.Uint64(data[qwpAckSequenceOffset : qwpAckSequenceOffset+8]))
 }
 
 // close sends a graceful WebSocket close frame and cleans up.
@@ -557,13 +567,16 @@ func qwpFakeServer(conn net.Conn) {
 			return
 		case 0x02: // Binary frame — send QWP OK ACK.
 			seq++
-			// 2 bytes WS header + 11 bytes payload (status + seq + tableCount=0).
 			var ack [13]byte
-			ack[0] = 0x82 // FIN+BINARY
-			ack[1] = 0x0B // payload length 11
+			// Unmasked binary frame: FIN+BINARY=0x82, payload length=11.
+			ack[0] = 0x82
+			ack[1] = 0x0B
+			// Payload: status OK (0x00) + sequence (uint64 LE) +
+			// tableCount=0 (uint16 LE). The 2-byte zero-table-count
+			// trailer is required by the QWP §13 OK ACK shape.
 			ack[2] = 0x00 // STATUS_OK
-			binary.LittleEndian.PutUint64(ack[3:11], seq)
-			// ack[11:13] is tableCount=0 (already zero).
+			binary.LittleEndian.PutUint64(ack[3:], seq)
+			binary.LittleEndian.PutUint16(ack[11:], 0)
 			if _, err := conn.Write(ack[:]); err != nil {
 				return
 			}
@@ -572,21 +585,32 @@ func qwpFakeServer(conn net.Conn) {
 	}
 }
 
-// sendAndAck sends a QWP message and reads exactly one ACK.
-// Returns nil on OK, a *QwpError for server-side rejections, or a
-// transport error on connection failure. No retry: the spec defines
-// no retriable status, so any non-OK response is terminal.
+// sendAndAck sends a QWP message and reads ACK frames until a
+// terminal one (OK or error) arrives. Returns nil on OK, a *QwpError
+// for server-side rejections, or a transport error on connection
+// failure. DURABLE_ACK frames may arrive interleaved when the server
+// has primary replication enabled and the connection opted in; they
+// carry per-table fsync progress and don't conclude the request, so
+// we drop them and keep reading.
+//
+// No retry: the spec defines no retriable status, so any non-OK
+// terminal response is terminal.
 func (t *qwpTransport) sendAndAck(ctx context.Context, sendFn func() []byte) error {
 	msg := sendFn()
 	if err := t.sendMessage(ctx, msg); err != nil {
 		return err
 	}
-	_, data, err := t.readAck(ctx)
-	if err != nil {
-		return err
+	for {
+		status, data, err := t.readAck(ctx)
+		if err != nil {
+			return err
+		}
+		if status == qwpStatusDurableAck {
+			continue
+		}
+		if qErr := newQwpErrorFromAck(data); qErr != nil {
+			return qErr
+		}
+		return nil
 	}
-	if qErr := newQwpErrorFromAck(data); qErr != nil {
-		return qErr
-	}
-	return nil
 }

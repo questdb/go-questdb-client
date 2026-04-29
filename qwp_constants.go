@@ -185,7 +185,7 @@ type qwpStatusCode byte
 
 const (
 	qwpStatusOK             qwpStatusCode = 0x00 // batch accepted
-	qwpStatusDurableAck     qwpStatusCode = 0x02 // batch WAL uploaded to object store (opt-in)
+	qwpStatusDurableAck     qwpStatusCode = 0x02 // per-table durable-upload ACK (replication primaries opted-in)
 	qwpStatusSchemaMismatch qwpStatusCode = 0x03 // column type incompatible with existing table
 	qwpStatusParseError     qwpStatusCode = 0x05 // malformed message
 	qwpStatusInternalError  qwpStatusCode = 0x06 // server-side error
