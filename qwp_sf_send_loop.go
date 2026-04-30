@@ -717,7 +717,9 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// path can advance ackedFsn past publishedFsn, which makes
 			// the segment manager trim sealed segments the I/O thread
 			// is still reading. Mirrors handleServerRejection in the
-			// Java client.
+			// Java client. The clamp only feeds the FSN math; the
+			// reported MessageSequence is the raw server-sent seq so
+			// it round-trips verbatim against server-side logs.
 			highestSent := l.nextWireSeq.Load() - 1
 			cappedSeq := seq
 			if highestSent < 0 {
@@ -734,7 +736,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				AppliedPolicy:    pol,
 				ServerStatusByte: int(status),
 				ServerMessage:    msg,
-				MessageSequence:  cappedSeq,
+				MessageSequence:  seq,
 				FromFsn:          fsn,
 				ToFsn:            fsn,
 				DetectedAt:       time.Now(),
