@@ -87,6 +87,34 @@ const (
 	// delta-dict deltaStart and schema-reference ids are expected to
 	// line up with a fresh server counter. Does not surface to users.
 	qwpMsgKindCacheReset qwpMsgKind = 0x17
+	// qwpMsgKindServerInfo is the unsolicited server → client frame
+	// delivered as the first WebSocket frame after a v2 upgrade. Body
+	// (little-endian, after the 12-byte QWP header):
+	// role(u8) + epoch(u64) + capabilities(u32) + server_wall_ns(i64)
+	// + cluster_id(u16_len + utf8) + node_id(u16_len + utf8). v1
+	// servers omit the frame entirely. The byte 0x18 is also bound to
+	// qwpTypeIPv4 in the qwpTypeCode enum; no collision since the two
+	// are distinct types.
+	qwpMsgKindServerInfo qwpMsgKind = 0x18
+)
+
+// SERVER_INFO role byte values (spec §11.8). Mirror Java
+// QwpEgressMsgKind.ROLE_*.
+const (
+	// qwpRoleStandalone marks a node with no replication configured.
+	// OSS single-node default; behaves like a primary for routing
+	// purposes and is accepted by target=primary.
+	qwpRoleStandalone byte = 0x00
+	// qwpRolePrimary is the authoritative write node; reads see latest
+	// commits.
+	qwpRolePrimary byte = 0x01
+	// qwpRoleReplica is read-only and may lag the primary by up to the
+	// replication poll interval.
+	qwpRoleReplica byte = 0x02
+	// qwpRolePrimaryCatchup signals a promotion in flight; behaves like
+	// a primary but is still uploading in-flight segments. Accepted by
+	// target=primary.
+	qwpRolePrimaryCatchup byte = 0x03
 )
 
 // Bit flags carried in the reset_mask byte of a CACHE_RESET frame.
@@ -106,8 +134,26 @@ const (
 // Stored as a uint32 in little-endian byte order: "QWP1".
 const qwpMagic uint32 = 0x31505751
 
-// qwpVersion is the current protocol version.
+// qwpVersion is the version byte stamped into the 12-byte QWP header
+// of every ingest frame this client encodes. Held at v1 so the
+// encoded ingest stream stays compatible with both v1 and v2 QuestDB
+// servers (v2 servers accept v1-stamped ingest frames as a subset of
+// their wire protocol). The handshake max-version we advertise is
+// qwpMaxSupportedVersion, which may exceed qwpVersion to opt the
+// connection into v2 server-side features (SERVER_INFO frame, multi-
+// endpoint routing, transparent failover) without changing the encoded
+// frame format.
 const qwpVersion byte = 0x01
+
+// qwpMaxSupportedVersion is the highest QWP protocol version this
+// client knows how to consume on the wire. Advertised in the
+// X-QWP-Max-Version handshake header; the server echoes
+// min(server_max, client_max) back as X-QWP-Version. v2 enables the
+// server to emit SERVER_INFO and the v2-only egress features (target
+// filter, transparent failover). Decoders accept any version byte
+// <= qwpMaxSupportedVersion in incoming server frames so a v2 server's
+// RESULT_BATCH frames (version-byte = 2) are honoured.
+const qwpMaxSupportedVersion byte = 0x02
 
 // QWP message header layout.
 const (

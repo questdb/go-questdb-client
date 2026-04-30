@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,6 +155,48 @@ func newTestWSServer(t *testing.T, handler func(*websocket.Conn)) *httptest.Serv
 		defer conn.CloseNow()
 		handler(conn)
 	}))
+}
+
+// newTestWSServerV2 is the v2-aware variant. It echoes the negotiated
+// version as the X-QWP-Version response header (default qwpMaxSupportedVersion;
+// override via opts.version), and when serverInfoFrame is non-nil
+// writes it as the first WebSocket binary frame after the upgrade. The
+// caller-supplied handler runs after the SERVER_INFO frame is sent so
+// tests can drive arbitrary post-handshake choreography.
+func newTestWSServerV2(t *testing.T, opts testWSServerV2Opts, handler func(*websocket.Conn)) *httptest.Server {
+	t.Helper()
+	version := opts.version
+	if version == 0 {
+		version = qwpMaxSupportedVersion
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", version))
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Logf("websocket accept error: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+		if opts.serverInfoFrame != nil {
+			if err := conn.Write(r.Context(), websocket.MessageBinary, opts.serverInfoFrame); err != nil {
+				t.Logf("server: SERVER_INFO write error: %v", err)
+				return
+			}
+		}
+		if handler != nil {
+			handler(conn)
+		}
+	}))
+}
+
+type testWSServerV2Opts struct {
+	// version is the value echoed in X-QWP-Version. Zero defaults to
+	// qwpMaxSupportedVersion.
+	version byte
+	// serverInfoFrame, when non-nil, is written as the first binary
+	// frame after the upgrade. Built via buildServerInfoFrame in
+	// qwp_server_info_test.go.
+	serverInfoFrame []byte
 }
 
 func TestQwpTransportConnectAndClose(t *testing.T) {
@@ -315,6 +358,156 @@ func TestQwpTransportVersionMismatchRejected(t *testing.T) {
 	}
 	if tr.conn != nil {
 		t.Fatal("conn should be nil after rejected handshake")
+	}
+}
+
+// TestQwpTransportV2NegotiationConsumesServerInfo verifies that an
+// egress-style connection that advertises maxVersion=2 reads the
+// SERVER_INFO frame the v2 server emits, and exposes the decoded
+// fields via tr.serverInfo. The recv buffer must be clean for
+// follow-up frames.
+func TestQwpTransportV2NegotiationConsumesServerInfo(t *testing.T) {
+	frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+		qwpRolePrimary, 17, 0, 1234567890, "alpha", "node-A")
+	srv := newTestWSServerV2(t, testWSServerV2Opts{
+		serverInfoFrame: frame,
+	}, func(conn *websocket.Conn) {
+		// Stay alive so the client can close cleanly.
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{
+		endpointPath:      qwpReadPath,
+		maxVersion:        qwpMaxSupportedVersion,
+		serverInfoTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer tr.close()
+
+	if tr.negotiatedVersion != qwpMaxSupportedVersion {
+		t.Errorf("negotiatedVersion = %d, want %d",
+			tr.negotiatedVersion, qwpMaxSupportedVersion)
+	}
+	if tr.serverInfo == nil {
+		t.Fatal("serverInfo should be populated on v2 connection")
+	}
+	if tr.serverInfo.Role != qwpRolePrimary {
+		t.Errorf("Role = 0x%02X, want PRIMARY", tr.serverInfo.Role)
+	}
+	if tr.serverInfo.NodeId != "node-A" {
+		t.Errorf("NodeId = %q, want node-A", tr.serverInfo.NodeId)
+	}
+}
+
+// TestQwpTransportV2NegotiationDecodeFailureClosesConn ensures that a
+// malformed SERVER_INFO frame surfaces as a connect-time error and
+// nils tr.conn, so callers see a clean failure rather than a partly
+// usable transport.
+func TestQwpTransportV2NegotiationDecodeFailureClosesConn(t *testing.T) {
+	srv := newTestWSServerV2(t, testWSServerV2Opts{
+		serverInfoFrame: []byte{0xDE, 0xAD, 0xBE, 0xEF}, // not a valid frame
+	}, func(conn *websocket.Conn) {
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{
+		endpointPath:      qwpReadPath,
+		maxVersion:        qwpMaxSupportedVersion,
+		serverInfoTimeout: 2 * time.Second,
+	})
+	if err == nil {
+		tr.close()
+		t.Fatal("expected SERVER_INFO decode error")
+	}
+	if !strings.Contains(err.Error(), "SERVER_INFO") {
+		t.Errorf("error = %v, want SERVER_INFO", err)
+	}
+	if tr.conn != nil {
+		t.Error("conn must be nil after failed SERVER_INFO read")
+	}
+}
+
+// TestQwpTransportV2NegotiationTimeout verifies that a stalled v2
+// server (one that never emits SERVER_INFO) trips the bounded timeout.
+func TestQwpTransportV2NegotiationTimeout(t *testing.T) {
+	srv := newTestWSServerV2(t, testWSServerV2Opts{
+		// Don't emit SERVER_INFO at all; just keep the conn open.
+	}, func(conn *websocket.Conn) {
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{
+		endpointPath:      qwpReadPath,
+		maxVersion:        qwpMaxSupportedVersion,
+		serverInfoTimeout: 50 * time.Millisecond,
+	})
+	if err == nil {
+		tr.close()
+		t.Fatal("expected SERVER_INFO timeout error")
+	}
+	if !strings.Contains(err.Error(), "SERVER_INFO") {
+		t.Errorf("error = %v, want SERVER_INFO timeout", err)
+	}
+}
+
+// TestQwpTransportV1ConnectSkipsServerInfoRead ensures that a server
+// that echoes X-QWP-Version=1 does not trigger a SERVER_INFO read,
+// even when the client advertises maxVersion=2 with a non-zero
+// timeout. Backward-compat path with v1 deployments.
+func TestQwpTransportV1ConnectSkipsServerInfoRead(t *testing.T) {
+	srv := newTestWSServerV2(t, testWSServerV2Opts{
+		version: 1,
+		// Even if we somehow set serverInfoFrame, the v1 path should not
+		// touch it.
+	}, func(conn *websocket.Conn) {
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{
+		endpointPath:      qwpReadPath,
+		maxVersion:        qwpMaxSupportedVersion,
+		serverInfoTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer tr.close()
+
+	if tr.negotiatedVersion != 1 {
+		t.Errorf("negotiatedVersion = %d, want 1", tr.negotiatedVersion)
+	}
+	if tr.serverInfo != nil {
+		t.Errorf("serverInfo should be nil on v1, got %+v", tr.serverInfo)
 	}
 }
 

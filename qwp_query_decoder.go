@@ -944,7 +944,7 @@ func (d *qwpQueryDecoder) parseFrameHeader(payload []byte) (qwpMsgKind, error) {
 	if magic != qwpMagic {
 		return 0, newQwpDecodeError(fmt.Sprintf("bad magic 0x%08X", magic))
 	}
-	if payload[4] != qwpVersion {
+	if payload[4] > qwpMaxSupportedVersion {
 		return 0, newQwpDecodeError(fmt.Sprintf(
 			"unsupported version %d", payload[4]))
 	}

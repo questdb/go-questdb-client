@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,9 +58,33 @@ const qwpQueryCleanupDrainTimeout = 5 * time.Second
 // (on the returned *QwpQuery) and Close are safe to call from other
 // goroutines.
 type QwpQueryClient struct {
-	cfg       *qwpQueryClientConfig
-	transport qwpTransport
-	io        *qwpEgressIO
+	cfg *qwpQueryClientConfig
+
+	// transportPtr and ioPtr are atomically replaced by the failover
+	// orchestrator on reconnect. The session reads through the
+	// transport() / io() accessors so a swap mid-Query is observed
+	// as a clean generation boundary. Both pointers are set during
+	// construction (newQwpQueryClient) and never nil while the
+	// client is live.
+	transportPtr atomic.Pointer[qwpTransport]
+	ioPtr        atomic.Pointer[qwpEgressIO]
+
+	// genMu serialises the destroy-old / build-new pair during
+	// reconnect. nextEvent reads under no lock; reconnect grabs this
+	// mutex so two concurrent transport faults cannot both spawn a
+	// new generation. Held only across the reconnect critical
+	// section, never across user-facing waits.
+	genMu sync.Mutex
+
+	// currentEndpointIdx tracks the index in cfg.endpoints currently
+	// bound. -1 before construction completes, set by connectWalk and
+	// updated by reconnectAndReplay. Read by the failover orchestrator
+	// to skip the failed endpoint on the next walk.
+	currentEndpointIdx atomic.Int32
+	// serverInfo holds the SERVER_INFO from the bound generation.
+	// Nil on v1 connections. Written by connectWalk and
+	// reconnectAndReplay; read via the public ServerInfo() accessor.
+	serverInfo atomic.Pointer[QwpServerInfo]
 
 	// nextRequestId is the monotonic client-assigned request id
 	// handed to the I/O goroutine on each submit. Assigned from the
@@ -80,6 +105,54 @@ type QwpQueryClient struct {
 	// transport close) run at most once even under concurrent Close
 	// callers.
 	closeOnce sync.Once
+}
+
+// transport returns the bound generation's transport. Callers should
+// re-load on every use rather than caching, since the pointer is
+// swapped atomically on transparent failover. Never returns nil for
+// a live client; Close stores nil but the closed flag short-circuits
+// any subsequent call before transport() is read.
+func (c *QwpQueryClient) transport() *qwpTransport {
+	return c.transportPtr.Load()
+}
+
+// io returns the bound generation's I/O goroutine pair. See transport().
+func (c *QwpQueryClient) io() *qwpEgressIO {
+	return c.ioPtr.Load()
+}
+
+// publishGeneration atomically swaps the bound transport + I/O + the
+// connect-walk metadata. Used by both the initial connect path and
+// the failover reconnect path so the publish ordering stays
+// consistent across both. Holds genMu so two concurrent transport
+// faults cannot both spawn a new generation.
+func (c *QwpQueryClient) publishGeneration(r *qwpConnectResult) {
+	c.transportPtr.Store(r.transport)
+	c.ioPtr.Store(r.io)
+	c.currentEndpointIdx.Store(int32(r.endpointIdx))
+	c.serverInfo.Store(r.serverInfo)
+}
+
+// ServerInfo returns the SERVER_INFO frame consumed during the bound
+// generation's WebSocket handshake, or nil if the negotiated version
+// is v1 (no SERVER_INFO emitted). The returned pointer is owned by
+// the client and is replaced atomically on each transparent failover
+// reconnect; callers that need to retain a value across a possible
+// reconnect should copy out the fields.
+func (c *QwpQueryClient) ServerInfo() *QwpServerInfo {
+	return c.serverInfo.Load()
+}
+
+// CurrentEndpoint returns the host:port string of the endpoint the
+// client is currently bound to. Updated atomically on each transparent
+// failover reconnect. Returns the empty string before the constructor
+// has completed.
+func (c *QwpQueryClient) CurrentEndpoint() string {
+	idx := int(c.currentEndpointIdx.Load())
+	if idx < 0 || idx >= len(c.cfg.endpoints) {
+		return ""
+	}
+	return c.cfg.endpoints[idx].String()
 }
 
 // QwpBindFunc populates the typed bind parameters for a single Query
@@ -118,9 +191,44 @@ func WithQueryBinds(fn QwpBindFunc) QueryOption {
 type QwpQueryClientOption func(*qwpQueryClientConfig)
 
 // WithQwpQueryAddress overrides the default "localhost:9000" server
-// address. Form is "host:port".
+// address. Accepts a single "host:port" or a comma-separated list of
+// endpoints; the latter is equivalent to WithQwpQueryEndpoints. The
+// connect walk uses the first endpoint matching the target= filter.
+// Errors during parsing are deferred to validate(), so a malformed
+// addr surfaces from the client constructor.
 func WithQwpQueryAddress(addr string) QwpQueryClientOption {
-	return func(c *qwpQueryClientConfig) { c.address = addr }
+	return func(c *qwpQueryClientConfig) {
+		eps, err := parseEndpointList(addr, qwpDefaultPort)
+		if err != nil {
+			// Stash a sentinel single-entry list with the bad address
+			// so validate() surfaces a useful error from the
+			// originating field; the err itself is not wired through
+			// the options API. Keep at least one entry so validate's
+			// "no endpoints" path is not also tripped.
+			c.endpoints = []qwpEndpoint{{host: addr, port: 0}}
+			return
+		}
+		c.endpoints = eps
+	}
+}
+
+// WithQwpQueryEndpoints sets the ordered list of endpoints the connect
+// walk attempts. Each entry is a "host[:port]" string; missing port
+// defaults to qwpDefaultPort. Errors during parsing are deferred to
+// validate() so the client constructor surfaces them. Use this option
+// when the configured endpoints are typed at the call site (e.g., a
+// service-discovery layer); WithQwpQueryAddress with a comma-separated
+// list is equivalent.
+func WithQwpQueryEndpoints(addrs ...string) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) {
+		joined := strings.Join(addrs, ",")
+		eps, err := parseEndpointList(joined, qwpDefaultPort)
+		if err != nil {
+			c.endpoints = []qwpEndpoint{{host: joined, port: 0}}
+			return
+		}
+		c.endpoints = eps
+	}
 }
 
 // WithQwpQueryEndpointPath overrides the default "/read/v1" WebSocket
@@ -211,6 +319,76 @@ func WithQwpQueryTls() QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.tlsMode = tlsEnabled }
 }
 
+// WithQwpQueryTarget restricts the connect walk to endpoints whose
+// SERVER_INFO.role passes the given filter. Accepts "any" (default,
+// matches any role), "primary" (STANDALONE | PRIMARY |
+// PRIMARY_CATCHUP), or "replica" (REPLICA only). Mirrors Java's
+// withTarget. An invalid value is deferred to validate(): the client
+// constructor surfaces the error.
+//
+// target=primary or replica forces v2 negotiation: a v1 server has
+// no SERVER_INFO and cannot satisfy a role-specific filter.
+func WithQwpQueryTarget(target string) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) {
+		t, err := parseTargetFilter(target)
+		if err != nil {
+			// Stash an out-of-range sentinel; validate() turns this
+			// into a typed error from the client constructor.
+			c.target = qwpTargetFilter(255)
+			return
+		}
+		c.target = t
+	}
+}
+
+// WithQwpQueryFailover toggles transparent reconnect-and-replay on
+// transport-terminal failure mid-query. Default true; matches Java's
+// failover=on default. When false, transport errors surface directly
+// through Batches() / Exec().
+func WithQwpQueryFailover(enabled bool) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.failoverEnabled = enabled }
+}
+
+// WithQwpQueryFailoverMaxAttempts caps the number of executeOnce
+// invocations per Query / Exec call. Counts the initial attempt plus
+// every reconnect retry. Must be >= 1; the default
+// (qwpDefaultFailoverMaxAttempts = 8) matches Java.
+func WithQwpQueryFailoverMaxAttempts(n int) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.failoverMaxAttempts = n }
+}
+
+// WithQwpQueryFailoverBackoff sets the exponential backoff between
+// reconnect attempts. initial is the first sleep (doubled per retry);
+// max is the ceiling. Defaults match Java
+// (qwpDefaultFailoverInitialBackoff = 50ms,
+// qwpDefaultFailoverMaxBackoff = 1s).
+func WithQwpQueryFailoverBackoff(initial, max time.Duration) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) {
+		c.failoverBackoffInitial = initial
+		c.failoverBackoffMax = max
+	}
+}
+
+// WithQwpQueryServerInfoTimeout overrides the SERVER_INFO read
+// deadline applied during each WebSocket upgrade. Default
+// qwpDefaultServerInfoTimeout (5s) matches Java's
+// DEFAULT_SERVER_INFO_TIMEOUT_MS. Must be > 0; setting 0 disables the
+// SERVER_INFO read entirely (only safe when target=any AND the server
+// is known to be v1).
+func WithQwpQueryServerInfoTimeout(d time.Duration) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.serverInfoTimeout = d }
+}
+
+// WithQwpQueryReplayExec opts Exec into transparent replay on
+// transport-terminal failure. Default false because non-idempotent
+// statements (INSERT / UPDATE / DELETE / DDL) might double-execute
+// if the server applied the statement before the transport drop was
+// detected. Callers that know their statements are idempotent can
+// opt in to match Java's transparent replay behaviour.
+func WithQwpQueryReplayExec(enabled bool) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.replayExec = enabled }
+}
+
 // WithQwpQueryTlsInsecureSkipVerify enables TLS but skips certificate
 // validation. Intended for testing only.
 func WithQwpQueryTlsInsecureSkipVerify() QwpQueryClientOption {
@@ -241,31 +419,12 @@ func QwpQueryClientFromConf(ctx context.Context, conf string) (*QwpQueryClient, 
 }
 
 // newQwpQueryClient is the internal factory shared by both public
-// entry points. It performs validation, opens the transport, and
-// spawns the I/O goroutines.
+// entry points. It performs validation, runs the multi-endpoint
+// connect walk, and spawns the I/O goroutines for the bound
+// generation. The walk applies the target= role filter against the
+// SERVER_INFO frame each endpoint emits.
 func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQueryClient, error) {
 	if err := cfg.validate(); err != nil {
-		return nil, err
-	}
-	c := &QwpQueryClient{
-		cfg:           cfg,
-		nextRequestId: 1, // match Java's QwpQueryClient.nextRequestId initial value
-	}
-
-	scheme := "ws"
-	if cfg.tlsMode != tlsDisabled {
-		scheme = "wss"
-	}
-	wsURL := scheme + "://" + cfg.address
-
-	opts := qwpTransportOpts{
-		tlsInsecureSkipVerify: cfg.tlsMode == tlsInsecureSkipVerify,
-		endpointPath:          cfg.endpointPath,
-		authorization:         cfg.effectiveAuthorization(),
-		maxBatchRows:          cfg.maxBatchRows,
-		acceptEncoding:        cfg.buildAcceptEncodingHeader(),
-	}
-	if err := c.transport.connect(ctx, wsURL, opts); err != nil {
 		return nil, err
 	}
 	// Early probe: if we told the server we can accept zstd, round-
@@ -273,16 +432,78 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 	// surfaces here on the user goroutine rather than mid-stream on
 	// the first compressed batch. Matches Java's probeZstdAvailable
 	// in intent; cheaper in pure Go since there is no JNI library to
-	// load.
+	// load. Run before the dial so a misbehaving zstd binding does
+	// not leak a half-open WebSocket.
 	if cfg.compression != qwpCompressionRaw {
 		if err := probeZstdAvailable(); err != nil {
-			_ = c.transport.close()
 			return nil, err
 		}
 	}
-	c.io = newQwpEgressIO(&c.transport, cfg.bufferPoolSize)
-	c.io.start()
+
+	c := &QwpQueryClient{
+		cfg:           cfg,
+		nextRequestId: 1, // match Java's QwpQueryClient.nextRequestId initial value
+	}
+	c.currentEndpointIdx.Store(-1)
+
+	result, err := connectWalk(ctx, cfg, 0)
+	if err != nil {
+		return nil, err
+	}
+	c.publishGeneration(result)
 	return c, nil
+}
+
+// reconnectAndReplay tears down the current generation, walks the
+// endpoint list (skipping the just-failed index), publishes the new
+// generation, and resubmits the in-flight query with a fresh
+// requestId. Returns the new generation's QwpServerInfo (nil for v1)
+// or a non-nil error if the walk fails. Holds c.genMu for the
+// duration of the swap so two concurrent transport faults serialise.
+//
+// Mirrors the high-level shape of Java's reconnectSkippingIndex +
+// executeOnce composition.
+func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySession, failedIdx int) (*QwpServerInfo, error) {
+	c.genMu.Lock()
+	defer c.genMu.Unlock()
+
+	// Tear down the dying generation. Use the cleanup-bounded ctx
+	// independent of the user's so the dispatcher's exit waits a
+	// fixed budget regardless of what the caller's deadline says.
+	cleanupCtx, cancel := context.WithTimeout(
+		context.Background(), qwpQueryCleanupDrainTimeout)
+	defer cancel()
+	if oldIO := c.io(); oldIO != nil {
+		_ = oldIO.shutdown(cleanupCtx)
+	}
+	if oldTr := c.transport(); oldTr != nil {
+		_ = oldTr.close()
+	}
+
+	// Walk endpoints starting one past the failed index. n=1 means
+	// we'll come back to the same host — same behavior as a
+	// single-endpoint reconnect.
+	startIdx := failedIdx + 1
+	if startIdx >= len(c.cfg.endpoints) {
+		startIdx = 0
+	}
+	result, err := connectWalk(ctx, c.cfg, startIdx)
+	if err != nil {
+		return nil, err
+	}
+	c.publishGeneration(result)
+
+	// Allocate a fresh requestId for the replay attempt. Matches
+	// Java's nextRequestId++ on each executeOnce: the server treats
+	// each attempt as a distinct query (the prior server's request
+	// is now orphaned by the dropped connection).
+	newReqID := c.nextRequestId
+	c.nextRequestId++
+	s.currentRequestId.Store(newReqID)
+	if err := s.submit(ctx); err != nil {
+		return nil, fmt.Errorf("qwp query: replay submit failed: %w", err)
+	}
+	return result.serverInfo, nil
 }
 
 // probeZstdAvailable allocates and immediately closes a zstd decoder
@@ -330,13 +551,15 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 	var firstErr error
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
-		if c.io != nil {
-			if err := c.io.shutdown(ctx); err != nil {
+		if io := c.io(); io != nil {
+			if err := io.shutdown(ctx); err != nil {
 				firstErr = err
 			}
 		}
-		if err := c.transport.close(); err != nil && firstErr == nil {
-			firstErr = err
+		if tr := c.transport(); tr != nil {
+			if err := tr.close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	})
 	return firstErr
@@ -387,7 +610,8 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QueryOpt
 		return q
 	}
 	q.requestId = req.requestId
-	if err := c.io.submitQuery(ctx, req); err != nil {
+	q.session = newQwpQuerySession(c, req)
+	if err := q.session.submit(ctx); err != nil {
 		q.pendingErr = err
 		q.state.Store(qwpQueryStateDone)
 	}
@@ -416,21 +640,22 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 	}
 	reqId := req.requestId
 
-	if err := c.io.submitQuery(ctx, req); err != nil {
+	session := newQwpQuerySession(c, req)
+	if err := session.submit(ctx); err != nil {
 		return ExecResult{}, err
 	}
 
 	for {
-		ev, err := c.io.takeEvent(ctx)
+		ev, err := session.nextEvent(ctx)
 		if err != nil {
 			// ctx expired or I/O terminated before we saw a terminal
 			// event. Cancel + drain on a cleanup ctx so the dispatcher
 			// returns to idle; otherwise the next Query/Exec on this
 			// client blocks on the single-slot requests channel.
-			c.io.requestCancel(reqId)
+			c.io().requestCancel(reqId)
 			cleanupCtx, cleanupCancel := context.WithTimeout(
 				context.Background(), qwpQueryCleanupDrainTimeout)
-			_ = drainUntilTerminal(cleanupCtx, c.io)
+			_ = drainUntilTerminal(cleanupCtx, c.io())
 			cleanupCancel()
 			return ExecResult{}, err
 		}
@@ -439,6 +664,24 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 			return ev.execResult, nil
 		case qwpEventKindError:
 			return ExecResult{}, eventToError(ev, reqId)
+		case qwpEventKindTransportError:
+			// The session has already exhausted its replay budget (or
+			// failover was disabled). Surface the underlying transport
+			// error so callers can errors.Is / errors.As against the
+			// cause without picking up *QwpQueryError (which carries
+			// server-status bytes that are meaningless for client-
+			// side faults).
+			return ExecResult{}, fmt.Errorf("qwp query: %s", ev.errMessage)
+		case qwpEventKindFailoverReset:
+			// The session ran a successful reconnect-and-replay. With
+			// replayExec disabled (the default), Exec must surface
+			// the reset to the caller so non-idempotent statements
+			// don't double-execute. With replayExec enabled, the
+			// reset is informational — fall through and consume the
+			// next event from the new generation.
+			if !c.cfg.replayExec {
+				return ExecResult{}, ev.failoverReset
+			}
 		case qwpEventKindBatch:
 			// Server streamed a result batch for what we asked for as
 			// an exec. Release the buffer, send a CANCEL so the
@@ -446,11 +689,11 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 			// drain to a terminal frame on a cleanup-bounded context
 			// so the dispatcher returns to idle regardless of the
 			// caller's ctx. Then surface the type-mismatch.
-			c.io.releaseBuffer(ev.batch)
-			c.io.requestCancel(reqId)
+			c.io().releaseBuffer(ev.batch)
+			c.io().requestCancel(reqId)
 			cleanupCtx, cancel := context.WithTimeout(
 				context.Background(), qwpQueryCleanupDrainTimeout)
-			_ = drainUntilTerminal(cleanupCtx, c.io)
+			_ = drainUntilTerminal(cleanupCtx, c.io())
 			cancel()
 			return ExecResult{}, fmt.Errorf(
 				"qwp query: Exec called on a SELECT-style statement; use Query instead")
@@ -499,8 +742,12 @@ func (c *QwpQueryClient) buildRequest(sql string, opts []QueryOption) (qwpReques
 }
 
 // drainUntilTerminal reads and discards events until a terminal one
-// (End / ExecDone / Error) arrives. Releases any batch buffers along
-// the way. Returns a transport/context error if takeEvent fails.
+// (End / ExecDone / Error / TransportError) arrives. Releases any
+// batch buffers along the way. Returns a transport/context error if
+// takeEvent fails. Includes TransportError because a poisoned
+// connection's pending events will be one of these — looping past
+// would block forever waiting for an End the I/O goroutine will
+// never emit.
 func drainUntilTerminal(ctx context.Context, io *qwpEgressIO) error {
 	for {
 		ev, err := io.takeEvent(ctx)
@@ -510,7 +757,8 @@ func drainUntilTerminal(ctx context.Context, io *qwpEgressIO) error {
 		switch ev.kind {
 		case qwpEventKindBatch:
 			io.releaseBuffer(ev.batch)
-		case qwpEventKindEnd, qwpEventKindExecDone, qwpEventKindError:
+		case qwpEventKindEnd, qwpEventKindExecDone, qwpEventKindError,
+			qwpEventKindTransportError:
 			return nil
 		}
 	}
@@ -567,10 +815,17 @@ type QwpQuery struct {
 	ctx    context.Context
 	sql    string
 
-	// requestId is the client-assigned id for this query. Captured
-	// from the client's nextRequestId counter at Query() time so a
-	// concurrent Cancel sends a CANCEL for this query, not whatever
-	// is currently in flight.
+	// session orchestrates submission and event consumption,
+	// including transparent reconnect-and-replay on transport-
+	// terminal failure. Owns the in-flight requestId across replays;
+	// the requestId field below is the *initial* attempt's id and is
+	// used only for diagnostics (RequestId accessor).
+	session *qwpQuerySession
+
+	// requestId is the initial (first-attempt) client-assigned id.
+	// Surfaced via RequestId for log correlation; on replay the
+	// session's currentRequestId diverges. Cancel routes through the
+	// session so it always targets the live generation.
 	requestId int64
 
 	// totalRows is set when a RESULT_END frame arrives. Read via
@@ -628,7 +883,7 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 		defer q.state.Store(qwpQueryStateDone)
 
 		for {
-			ev, err := q.client.io.takeEvent(q.ctx)
+			ev, err := q.session.nextEvent(q.ctx)
 			if err != nil {
 				// takeEvent returned before a terminal frame (most
 				// often q.ctx expired while we were waiting on the
@@ -659,7 +914,7 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 					// defer q.Close() would otherwise be a no-op and
 					// leave the dispatcher stranded.
 					defer func() {
-						q.client.io.releaseBuffer(ev.batch)
+						q.client.io().releaseBuffer(ev.batch)
 						if r := recover(); r != nil {
 							q.cancelAndDrainOnCleanupCtx()
 							panic(r)
@@ -691,6 +946,27 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 				}
 				yield(nil, eventToError(ev, q.requestId))
 				return
+			case qwpEventKindTransportError:
+				// Synthesized client-side transport-terminal failure
+				// — the connection is poisoned and cannot serve more
+				// frames. Surface as a plain error; the session
+				// orchestrator (qwp_query_failover.go) intercepts
+				// this case before it reaches Batches when failover
+				// is enabled and replay succeeds.
+				yield(nil, fmt.Errorf("qwp query: %s", ev.errMessage))
+				return
+			case qwpEventKindFailoverReset:
+				// Emitted by the session orchestrator after a
+				// successful reconnect-and-replay. Yield as a
+				// non-fatal error so the caller can detect via
+				// errors.As and discard accumulated state, then
+				// continue iterating to consume the new generation's
+				// batches. ev.failoverReset is always non-nil for
+				// this kind.
+				if !yield(nil, ev.failoverReset) {
+					q.cancelAndDrainOnCleanupCtx()
+					return
+				}
 			case qwpEventKindExecDone:
 				// Wrong statement kind: user ran a non-SELECT via
 				// Query. Surface with a typed error so they can
@@ -735,7 +1011,15 @@ func (q *QwpQuery) Cancel() {
 		return
 	}
 	if q.cancelled.CompareAndSwap(false, true) {
-		q.client.io.requestCancel(q.requestId)
+		// Route through the session so cancel targets the live
+		// generation's request_id even after a transparent failover
+		// reconnect (where the session's currentRequestId diverges
+		// from q.requestId).
+		if q.session != nil {
+			q.session.requestCancel()
+		} else {
+			q.client.io().requestCancel(q.requestId)
+		}
 	}
 }
 
@@ -773,10 +1057,14 @@ func (q *QwpQuery) Close() {
 // user-driven Close which has no meaningful ctx of its own.
 func (q *QwpQuery) cancelAndDrainOnCleanupCtx() {
 	if q.cancelled.CompareAndSwap(false, true) {
-		q.client.io.requestCancel(q.requestId)
+		if q.session != nil {
+			q.session.requestCancel()
+		} else {
+			q.client.io().requestCancel(q.requestId)
+		}
 	}
 	cleanupCtx, cancel := context.WithTimeout(
 		context.Background(), qwpQueryCleanupDrainTimeout)
 	defer cancel()
-	_ = drainUntilTerminal(cleanupCtx, q.client.io)
+	_ = drainUntilTerminal(cleanupCtx, q.client.io())
 }

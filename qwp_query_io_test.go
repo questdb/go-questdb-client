@@ -680,8 +680,8 @@ func TestQwpEgressIOUnknownMsgKind(t *testing.T) {
 	}
 
 	ev := takeEventOrFail(t, io, 2*time.Second)
-	if ev.kind != qwpEventKindError {
-		t.Fatalf("event kind = %v, want Error", ev.kind)
+	if ev.kind != qwpEventKindTransportError {
+		t.Fatalf("event kind = %v, want TransportError", ev.kind)
 	}
 	if !strings.Contains(ev.errMessage, "unknown msg_kind") {
 		t.Errorf("errMessage = %q, want unknown-msg-kind", ev.errMessage)
@@ -818,8 +818,8 @@ func TestQwpEgressIOCacheResetTruncatedPoisons(t *testing.T) {
 	}
 
 	ev := takeEventOrFail(t, io, 2*time.Second)
-	if ev.kind != qwpEventKindError {
-		t.Fatalf("event kind = %v, want Error", ev.kind)
+	if ev.kind != qwpEventKindTransportError {
+		t.Fatalf("event kind = %v, want TransportError", ev.kind)
 	}
 	if !strings.Contains(ev.errMessage, "truncated before reset_mask") {
 		t.Errorf("errMessage = %q, want truncated-reset_mask", ev.errMessage)
@@ -912,8 +912,8 @@ func TestQwpEgressIODecodeFailure(t *testing.T) {
 	}
 
 	ev := takeEventOrFail(t, io, 2*time.Second)
-	if ev.kind != qwpEventKindError {
-		t.Fatalf("event kind = %v, want Error", ev.kind)
+	if ev.kind != qwpEventKindTransportError {
+		t.Fatalf("event kind = %v, want TransportError", ev.kind)
 	}
 	if !strings.Contains(ev.errMessage, "decode") {
 		t.Errorf("errMessage = %q, expected to contain \"decode\"", ev.errMessage)
@@ -965,8 +965,8 @@ func TestQwpEgressIODecodeFailurePoisons(t *testing.T) {
 	}
 
 	ev := takeEventOrFail(t, io, 2*time.Second)
-	if ev.kind != qwpEventKindError {
-		t.Fatalf("event kind = %v, want Error", ev.kind)
+	if ev.kind != qwpEventKindTransportError {
+		t.Fatalf("event kind = %v, want TransportError", ev.kind)
 	}
 
 	// The latch is set on the dispatcher goroutine right before the

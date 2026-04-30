@@ -35,7 +35,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -76,8 +78,8 @@ const (
 
 // qwpTransportOpts configures a WebSocket transport connection. The
 // same struct drives both ingest (/write/v4) and egress (/read/v1)
-// connections; acceptEncoding and maxBatchRows are egress-only and
-// inert at their zero values.
+// connections; acceptEncoding, maxBatchRows, maxVersion, and
+// serverInfoTimeout are egress-only and inert at their zero values.
 type qwpTransportOpts struct {
 	// tlsMode controls certificate verification.
 	// When true, certificate verification is skipped.
@@ -105,6 +107,24 @@ type qwpTransportOpts struct {
 	// upgrade header. Egress-only. Zero omits the header and lets
 	// the server use its own cap.
 	maxBatchRows int
+
+	// maxVersion is the value advertised in the X-QWP-Max-Version
+	// handshake header. Zero means qwpVersion (the v1 default), which
+	// keeps ingest connections compatible with both v1 and v2
+	// QuestDB servers. Egress callers set qwpMaxSupportedVersion to
+	// opt the connection into v2-only server features (SERVER_INFO,
+	// multi-endpoint failover). The transport accepts any echoed
+	// X-QWP-Version that is <= maxVersion.
+	maxVersion byte
+
+	// serverInfoTimeout, when > 0, enables synchronous consumption of
+	// the SERVER_INFO frame after the upgrade for connections that
+	// negotiate version >= 2. Zero leaves the WebSocket recv buffer
+	// untouched after the upgrade, suitable for ingest connections
+	// where SERVER_INFO is not expected. Must be > 0 on egress
+	// connections that advertise maxVersion >= 2 because a v2 server
+	// emits the frame unsolicited before any client request.
+	serverInfoTimeout time.Duration
 }
 
 // qwpTransport wraps a WebSocket connection for sending QWP
@@ -121,6 +141,18 @@ type qwpTransport struct {
 	// dumpWriter, when non-nil, records all outgoing TCP bytes
 	// (HTTP upgrade + WebSocket frames). Set before connect().
 	dumpWriter io.Writer
+
+	// negotiatedVersion is the QWP wire-protocol version selected by
+	// the server's X-QWP-Version response header. Populated by
+	// connect(); 0 before connect() has succeeded. Egress callers
+	// branch on this to decide whether to expect a SERVER_INFO frame.
+	negotiatedVersion byte
+
+	// serverInfo holds the SERVER_INFO frame consumed during connect()
+	// when the negotiated version is >= 2 and opts.serverInfoTimeout
+	// is > 0. Nil on v1 connections and on connections that did not
+	// opt into SERVER_INFO consumption (ingest senders).
+	serverInfo *QwpServerInfo
 }
 
 // teeConn wraps a net.Conn, copying all Write calls to a side writer.
@@ -150,9 +182,13 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	path := opts.endpointPath
 	wsURL := url + path
 
+	advertisedMax := opts.maxVersion
+	if advertisedMax == 0 {
+		advertisedMax = qwpVersion
+	}
 	dialOpts := &websocket.DialOptions{
 		HTTPHeader: http.Header{
-			qwpHeaderMaxVersion: []string{fmt.Sprintf("%d", qwpVersion)},
+			qwpHeaderMaxVersion: []string{fmt.Sprintf("%d", advertisedMax)},
 			qwpHeaderClientId:   []string{qwpClientId},
 		},
 	}
@@ -221,9 +257,10 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		conn.Close(websocket.StatusProtocolError, "missing version header")
 		return fmt.Errorf("qwp: server did not return %s header", qwpHeaderVersion)
 	}
-	if serverVersion != fmt.Sprintf("%d", qwpVersion) {
+	negotiated, err := strconv.Atoi(serverVersion)
+	if err != nil || negotiated < 1 || negotiated > int(advertisedMax) {
 		conn.Close(websocket.StatusProtocolError, "version mismatch")
-		return fmt.Errorf("qwp: server selected protocol version %q, client supports %d", serverVersion, qwpVersion)
+		return fmt.Errorf("qwp: server selected protocol version %q, client supports up to %d", serverVersion, advertisedMax)
 	}
 
 	// Remove the default read limit — QWP ACKs are small but
@@ -231,8 +268,39 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	conn.SetReadLimit(-1)
 
 	t.conn = conn
+	t.negotiatedVersion = byte(negotiated)
 	if t.recvBuf == nil {
 		t.recvBuf = make([]byte, 0, qwpDefaultInitRecvBufSize)
+	}
+
+	// v2 servers emit SERVER_INFO as the first WebSocket frame after
+	// the upgrade response, before any client request. Consume it
+	// synchronously so the I/O goroutines start with a clean recv
+	// queue and the user-visible ServerInfo() accessor is populated
+	// before submit. Egress connections opt in via opts.serverInfoTimeout
+	// > 0; ingest senders leave it zero so the ACK loop is never
+	// fed a SERVER_INFO frame it doesn't know how to parse.
+	if t.negotiatedVersion >= 2 && opts.serverInfoTimeout > 0 {
+		readCtx, cancel := context.WithTimeout(ctx, opts.serverInfoTimeout)
+		defer cancel()
+		msgType, payload, err := t.conn.Read(readCtx)
+		if err != nil {
+			t.conn.Close(websocket.StatusProtocolError, "SERVER_INFO read failed")
+			t.conn = nil
+			return fmt.Errorf("qwp: SERVER_INFO read failed: %w", err)
+		}
+		if msgType != websocket.MessageBinary {
+			t.conn.Close(websocket.StatusProtocolError, "SERVER_INFO non-binary")
+			t.conn = nil
+			return fmt.Errorf("qwp: expected SERVER_INFO binary frame, got %v", msgType)
+		}
+		info, err := decodeServerInfo(payload)
+		if err != nil {
+			t.conn.Close(websocket.StatusProtocolError, "SERVER_INFO decode failed")
+			t.conn = nil
+			return fmt.Errorf("qwp: SERVER_INFO decode failed: %w", err)
+		}
+		t.serverInfo = info
 	}
 	return nil
 }

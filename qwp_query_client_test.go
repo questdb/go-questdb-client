@@ -51,8 +51,8 @@ func TestQwpQueryClientFromConfHappyPath(t *testing.T) {
 			name: "minimal_ws",
 			conf: "ws::addr=localhost:9000;",
 			chk: func(t *testing.T, c *qwpQueryClientConfig) {
-				if c.address != "localhost:9000" {
-					t.Errorf("address=%q", c.address)
+				if got := c.addressString(); got != "localhost:9000" {
+					t.Errorf("addressString=%q", got)
 				}
 				if c.endpointPath != qwpReadPath {
 					t.Errorf("endpointPath=%q", c.endpointPath)
@@ -83,8 +83,8 @@ func TestQwpQueryClientFromConfHappyPath(t *testing.T) {
 				"initial_credit=131072;" +
 				"tls_verify=unsafe_off;",
 			chk: func(t *testing.T, c *qwpQueryClientConfig) {
-				if c.address != "db.example:9443" {
-					t.Errorf("address=%q", c.address)
+				if got := c.addressString(); got != "db.example:9443" {
+					t.Errorf("addressString=%q", got)
 				}
 				if c.endpointPath != "/read/v2" {
 					t.Errorf("endpointPath=%q", c.endpointPath)
@@ -334,28 +334,111 @@ func TestQwpQueryClientFromConfIPv6(t *testing.T) {
 	})
 }
 
-// TestQwpQueryClientFromConfRejectsMultiAddress pins the Go client's
-// single-endpoint contract: the Java client supports comma-separated
-// addr= for failover, but the Go client does not (see qwp_query_conf
-// docstring). The user sees a parser-level rejection rather than a
-// downstream "host not found".
-func TestQwpQueryClientFromConfRejectsMultiAddress(t *testing.T) {
-	cases := []string{
-		"ws::addr=a:9000,b:9000;",
-		"ws::addr=a:9000,b:9000,c:9000;",
-		"ws::addr=[::1]:9000,[fe80::1]:9000;",
+// TestQwpQueryClientFromConfAcceptsMultiAddress verifies that
+// comma-separated addr= entries become an ordered endpoint list. The
+// connect walk in qwp_query_failover.go consumes them in order; the
+// parser's responsibility is just shape validation here.
+func TestQwpQueryClientFromConfAcceptsMultiAddress(t *testing.T) {
+	cases := []struct {
+		conf      string
+		wantHosts []string
+		wantPorts []int
+	}{
+		{
+			conf:      "ws::addr=a:9000,b:9001;",
+			wantHosts: []string{"a", "b"},
+			wantPorts: []int{9000, 9001},
+		},
+		{
+			conf:      "ws::addr=a:9000,b:9000,c:9000;",
+			wantHosts: []string{"a", "b", "c"},
+			wantPorts: []int{9000, 9000, 9000},
+		},
+		{
+			conf:      "ws::addr=[::1]:9000,[fe80::1]:9001;",
+			wantHosts: []string{"::1", "fe80::1"},
+			wantPorts: []int{9000, 9001},
+		},
 	}
-	for _, conf := range cases {
-		t.Run(conf, func(t *testing.T) {
-			_, err := parseQwpQueryConf(conf)
-			if err == nil {
-				t.Fatalf("expected error for %q", conf)
+	for _, tc := range cases {
+		t.Run(tc.conf, func(t *testing.T) {
+			cfg, err := parseQwpQueryConf(tc.conf)
+			if err != nil {
+				t.Fatalf("parseQwpQueryConf: %v", err)
 			}
-			if !strings.Contains(err.Error(), "multi-address") {
-				t.Errorf("err=%v, want 'multi-address' substring", err)
+			if len(cfg.endpoints) != len(tc.wantHosts) {
+				t.Fatalf("len(endpoints) = %d, want %d", len(cfg.endpoints), len(tc.wantHosts))
+			}
+			for i, ep := range cfg.endpoints {
+				if ep.host != tc.wantHosts[i] || ep.port != tc.wantPorts[i] {
+					t.Errorf("endpoints[%d] = %s:%d, want %s:%d",
+						i, ep.host, ep.port, tc.wantHosts[i], tc.wantPorts[i])
+				}
 			}
 		})
 	}
+}
+
+// TestQwpQueryClientFromConfV2KeysParse verifies the v2 connection-
+// string keys (target, failover, failover_max_attempts,
+// failover_backoff_initial_ms, failover_backoff_max_ms,
+// server_info_timeout_ms, replay_exec) parse into the expected config
+// fields and reject malformed values with actionable errors.
+func TestQwpQueryClientFromConfV2KeysParse(t *testing.T) {
+	t.Run("happy_path", func(t *testing.T) {
+		conf := "ws::addr=a:9000;target=primary;failover=off;" +
+			"failover_max_attempts=3;failover_backoff_initial_ms=10;" +
+			"failover_backoff_max_ms=200;server_info_timeout_ms=750;" +
+			"replay_exec=on;"
+		cfg, err := parseQwpQueryConf(conf)
+		if err != nil {
+			t.Fatalf("parseQwpQueryConf: %v", err)
+		}
+		if cfg.target != qwpTargetPrimary {
+			t.Errorf("target=%v, want primary", cfg.target)
+		}
+		if cfg.failoverEnabled {
+			t.Errorf("failoverEnabled=true, want false")
+		}
+		if cfg.failoverMaxAttempts != 3 {
+			t.Errorf("failoverMaxAttempts=%d, want 3", cfg.failoverMaxAttempts)
+		}
+		if cfg.failoverBackoffInitial != 10*time.Millisecond {
+			t.Errorf("failoverBackoffInitial=%v, want 10ms", cfg.failoverBackoffInitial)
+		}
+		if cfg.failoverBackoffMax != 200*time.Millisecond {
+			t.Errorf("failoverBackoffMax=%v, want 200ms", cfg.failoverBackoffMax)
+		}
+		if cfg.serverInfoTimeout != 750*time.Millisecond {
+			t.Errorf("serverInfoTimeout=%v, want 750ms", cfg.serverInfoTimeout)
+		}
+		if !cfg.replayExec {
+			t.Errorf("replayExec=false, want true")
+		}
+	})
+
+	t.Run("invalid_target", func(t *testing.T) {
+		_, err := parseQwpQueryConf("ws::addr=a:9000;target=leader;")
+		if err == nil || !strings.Contains(err.Error(), "target") {
+			t.Errorf("err=%v, want target validation error", err)
+		}
+	})
+
+	t.Run("invalid_failover", func(t *testing.T) {
+		_, err := parseQwpQueryConf("ws::addr=a:9000;failover=maybe;")
+		if err == nil || !strings.Contains(err.Error(), "failover") {
+			t.Errorf("err=%v, want failover validation error", err)
+		}
+	})
+
+	t.Run("backoff_max_lt_initial", func(t *testing.T) {
+		_, err := parseQwpQueryConf(
+			"ws::addr=a:9000;failover_backoff_initial_ms=100;" +
+				"failover_backoff_max_ms=10;")
+		if err == nil || !strings.Contains(err.Error(), "failover_backoff_max") {
+			t.Errorf("err=%v, want max-lt-initial error", err)
+		}
+	})
 }
 
 // TestQwpQueryClientFromConfTlsVariations exercises the tls_verify
@@ -575,8 +658,8 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 	} {
 		opt(cfg)
 	}
-	if cfg.address != "example:9000" {
-		t.Errorf("address=%q", cfg.address)
+	if got := cfg.addressString(); got != "example:9000" {
+		t.Errorf("addressString=%q", got)
 	}
 	if cfg.endpointPath != "/read/v2" {
 		t.Errorf("endpointPath=%q", cfg.endpointPath)

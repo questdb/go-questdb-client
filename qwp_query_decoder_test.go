@@ -1008,7 +1008,10 @@ func TestQwpDecoderHardening(t *testing.T) {
 
 	t.Run("H3_UnsupportedVersion", func(t *testing.T) {
 		buf := writeMinimalResultBatch(0)
-		buf[4] = 0x02
+		// Version byte must exceed qwpMaxSupportedVersion (currently 2);
+		// 0xFF guarantees rejection regardless of how the supported
+		// ceiling moves.
+		buf[4] = 0xFF
 		var dec qwpQueryDecoder
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)

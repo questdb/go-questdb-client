@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // qwpQueryClientConfig is the internal configuration of QwpQueryClient.
@@ -37,8 +38,12 @@ import (
 // — QWP egress has its own concerns (buffer pool depth, max batch
 // rows) and does not inherit ILP-era knobs.
 type qwpQueryClientConfig struct {
-	// address is "host:port". Default "localhost:9000".
-	address string
+	// endpoints is the ordered list of WebSocket endpoints the connect
+	// walk attempts. The first matching the target= filter wins;
+	// transient failures during the walk skip to the next entry. The
+	// failover orchestrator reuses the same list for reconnect.
+	// Default is one entry pointing at defaultHttpAddress.
+	endpoints []qwpEndpoint
 	// endpointPath is the HTTP path used for the WebSocket upgrade.
 	// Default "/read/v1".
 	endpointPath string
@@ -80,6 +85,42 @@ type qwpQueryClientConfig struct {
 	compressionLevel int
 	// tlsMode mirrors lineSenderConfig's three-valued TLS state.
 	tlsMode tlsMode
+
+	// target constrains the connect walk by SERVER_INFO.role. Default
+	// is qwpTargetAny, which accepts any role and is satisfied by v1
+	// servers (which do not emit SERVER_INFO at all). qwpTargetPrimary
+	// and qwpTargetReplica require v2 (without SERVER_INFO the role
+	// is unknown and the filter cannot be evaluated).
+	target qwpTargetFilter
+	// failoverEnabled toggles transparent reconnect-and-replay on
+	// transport-terminal failure mid-query. Default true; matches
+	// Java's failover=on default. When false, transport errors
+	// surface directly through Batches() / Exec().
+	failoverEnabled bool
+	// failoverMaxAttempts caps the number of executeOnce invocations
+	// per Query / Exec. Counts the initial attempt plus every
+	// reconnect retry. Default qwpDefaultFailoverMaxAttempts.
+	failoverMaxAttempts int
+	// failoverBackoffInitial is the initial sleep between reconnect
+	// attempts. Doubled on each subsequent attempt up to
+	// failoverBackoffMax. Default qwpDefaultFailoverInitialBackoff.
+	failoverBackoffInitial time.Duration
+	// failoverBackoffMax caps the exponential backoff. Default
+	// qwpDefaultFailoverMaxBackoff.
+	failoverBackoffMax time.Duration
+	// serverInfoTimeout bounds the synchronous read of SERVER_INFO
+	// after each upgrade. Only consulted when target != qwpTargetAny
+	// (which forces v2 negotiation) or when the caller advertises
+	// maxVersion >= 2 explicitly. Default
+	// qwpDefaultServerInfoTimeout.
+	serverInfoTimeout time.Duration
+	// replayExec opts Exec into transparent replay on transport-
+	// terminal failures. Default false — non-idempotent statements
+	// (INSERT/UPDATE/DELETE/DDL) might double-execute on a transport
+	// drop after the server applied the statement. Callers that know
+	// their statements are idempotent can opt in via
+	// WithQwpQueryReplayExec(true).
+	replayExec bool
 }
 
 // qwpCompressionRaw / qwpCompressionZstd / qwpCompressionAuto are the
@@ -104,16 +145,44 @@ const qwpDefaultCompressionLevel = 3
 // drains and back-pressures the WebSocket via the TCP window.
 const qwpDefaultEgressBufferPoolSize = 4
 
+// Failover defaults — match Java QwpQueryClient.DEFAULT_FAILOVER_*.
+const (
+	// qwpDefaultFailoverMaxAttempts is the cap on executeOnce
+	// invocations per Query/Exec call. Counts the initial attempt
+	// plus every reconnect retry. Java's DEFAULT_FAILOVER_MAX_ATTEMPTS
+	// = 8.
+	qwpDefaultFailoverMaxAttempts = 8
+	// qwpDefaultFailoverInitialBackoff is the initial sleep between
+	// reconnect attempts; doubled per retry up to
+	// qwpDefaultFailoverMaxBackoff. Java's
+	// DEFAULT_FAILOVER_INITIAL_BACKOFF_MS = 50.
+	qwpDefaultFailoverInitialBackoff = 50 * time.Millisecond
+	// qwpDefaultFailoverMaxBackoff caps the exponential backoff.
+	// Java's DEFAULT_FAILOVER_MAX_BACKOFF_MS = 1000.
+	qwpDefaultFailoverMaxBackoff = 1 * time.Second
+	// qwpDefaultServerInfoTimeout bounds the synchronous SERVER_INFO
+	// read after the upgrade. Java's DEFAULT_SERVER_INFO_TIMEOUT_MS =
+	// 5000.
+	qwpDefaultServerInfoTimeout = 5 * time.Second
+)
+
 // qwpQueryDefaultConfig returns the zero-arg default config. Used as
 // the seed for both the functional-options path and the config-string
-// path.
+// path. Seeds endpoints with a single entry pointing at the local
+// QuestDB default; functional options or addr= override it.
 func qwpQueryDefaultConfig() *qwpQueryClientConfig {
 	return &qwpQueryClientConfig{
-		address:          defaultHttpAddress, // "localhost:9000"
-		endpointPath:     qwpReadPath,        // "/read/v1"
-		bufferPoolSize:   qwpDefaultEgressBufferPoolSize,
-		compression:      qwpCompressionRaw,
-		compressionLevel: qwpDefaultCompressionLevel,
+		endpoints:              []qwpEndpoint{{host: "127.0.0.1", port: qwpDefaultPort}},
+		endpointPath:           qwpReadPath, // "/read/v1"
+		bufferPoolSize:         qwpDefaultEgressBufferPoolSize,
+		compression:            qwpCompressionRaw,
+		compressionLevel:       qwpDefaultCompressionLevel,
+		target:                 qwpTargetAny,
+		failoverEnabled:        true,
+		failoverMaxAttempts:    qwpDefaultFailoverMaxAttempts,
+		failoverBackoffInitial: qwpDefaultFailoverInitialBackoff,
+		failoverBackoffMax:     qwpDefaultFailoverMaxBackoff,
+		serverInfoTimeout:      qwpDefaultServerInfoTimeout,
 	}
 }
 
@@ -137,11 +206,17 @@ func (c *qwpQueryClientConfig) buildAcceptEncodingHeader() string {
 // checks (mutually-exclusive auth modes, TLS-only roots keys, bufferPool
 // >= 1) plus the host-required check pushed into the Go parser.
 func (c *qwpQueryClientConfig) validate() error {
-	if c.address == "" {
-		return fmt.Errorf("qwp query: address is empty")
+	if len(c.endpoints) == 0 {
+		return fmt.Errorf("qwp query: no endpoints configured")
 	}
-	if err := validateQwpAddr(c.address); err != nil {
-		return err
+	for i, ep := range c.endpoints {
+		if ep.host == "" {
+			return fmt.Errorf("qwp query: endpoint %d has empty host", i)
+		}
+		if ep.port < 1 || ep.port > 65535 {
+			return fmt.Errorf("qwp query: endpoint %d port %d out of range [1, 65535]",
+				i, ep.port)
+		}
 	}
 	if c.endpointPath == "" {
 		return fmt.Errorf("qwp query: endpoint path is empty")
@@ -189,56 +264,41 @@ func (c *qwpQueryClientConfig) validate() error {
 	if basicSet && (c.httpUser == "" || c.httpPass == "") {
 		return fmt.Errorf("qwp query: both username and password must be provided together")
 	}
+	if c.failoverMaxAttempts < 1 {
+		return fmt.Errorf(
+			"qwp query: failover_max_attempts must be >= 1, got %d", c.failoverMaxAttempts)
+	}
+	if c.failoverBackoffInitial < 0 {
+		return fmt.Errorf(
+			"qwp query: failover_backoff_initial must be >= 0, got %v",
+			c.failoverBackoffInitial)
+	}
+	if c.failoverBackoffMax < 0 {
+		return fmt.Errorf(
+			"qwp query: failover_backoff_max must be >= 0, got %v",
+			c.failoverBackoffMax)
+	}
+	if c.failoverBackoffMax < c.failoverBackoffInitial {
+		return fmt.Errorf(
+			"qwp query: failover_backoff_max (%v) must be >= failover_backoff_initial (%v)",
+			c.failoverBackoffMax, c.failoverBackoffInitial)
+	}
+	if c.serverInfoTimeout < 0 {
+		return fmt.Errorf(
+			"qwp query: server_info_timeout must be >= 0, got %v", c.serverInfoTimeout)
+	}
 	return nil
 }
 
-// validateQwpAddr checks that an addr= value is a well-formed
-// host[:port] (or bracketed IPv6) form. It enforces the port-range
-// [1, 65535] when present and rejects malformed bracketed IPv6 inputs
-// up front so callers see a parser-level error rather than an opaque
-// dial failure later. Multi-address (comma-separated) entries are not
-// supported in the Go client; an embedded comma in addr is rejected
-// here so the user sees an actionable error rather than a "host not
-// found" downstream.
-//
-// Forms accepted:
-//   - "host"             — bare host, port defaults to the URL scheme's
-//   - "host:port"        — explicit port; validated against [1, 65535]
-//   - "[ipv6]:port"      — bracketed IPv6 with port
-//   - "[ipv6]"           — bracketed IPv6 without port
-//   - "ipv6::with::colons" — bare IPv6 (>=2 colons unbracketed)
-//
-// Rejected:
-//   - empty string (caught earlier in validate())
-//   - empty bracketed host: "[]:port"
-//   - missing closing ']': "[::1:9000"
-//   - trailing garbage after ']': "[::1]9000"
-//   - port out of [1, 65535]
-//   - non-numeric port
-//   - comma-separated multi-address (Go client doesn't support failover)
-func validateQwpAddr(s string) error {
-	if strings.Contains(s, ",") {
-		return fmt.Errorf(
-			"qwp query: invalid addr %q: multi-address (comma-separated) is not supported", s)
+// addressString returns a comma-joined "host:port,..." form of the
+// configured endpoints. Used by error messages and tests; not part of
+// the public API.
+func (c *qwpQueryClientConfig) addressString() string {
+	parts := make([]string, 0, len(c.endpoints))
+	for _, ep := range c.endpoints {
+		parts = append(parts, ep.String())
 	}
-	host, port, err := splitQwpHostPort(s)
-	if err != nil {
-		return fmt.Errorf("qwp query: invalid addr %q: %w", s, err)
-	}
-	if host == "" {
-		return fmt.Errorf("qwp query: invalid addr %q: empty host", s)
-	}
-	if port == "" {
-		return nil
-	}
-	n, err := strconv.Atoi(port)
-	if err != nil {
-		return fmt.Errorf("qwp query: invalid addr %q: invalid port %q", s, port)
-	}
-	if n < 1 || n > 65535 {
-		return fmt.Errorf("qwp query: invalid addr %q: port %d out of range [1, 65535]", s, n)
-	}
-	return nil
+	return strings.Join(parts, ",")
 }
 
 // splitQwpHostPort splits a single host[:port] entry. Returns the host
@@ -246,7 +306,22 @@ func validateQwpAddr(s string) error {
 // when no port was supplied), and a structural error for malformed
 // bracketed forms. The port string is returned untrimmed so the caller
 // can produce a useful error message; numeric validation happens in
-// validateQwpAddr.
+// parseEndpointList.
+//
+// Forms accepted:
+//   - "host"             — bare host, port defaults to qwpDefaultPort
+//   - "host:port"        — explicit port; validated against [1, 65535]
+//   - "[ipv6]:port"      — bracketed IPv6 with port
+//   - "[ipv6]"           — bracketed IPv6 without port
+//   - "ipv6::with::colons" — bare IPv6 (>=2 colons unbracketed)
+//
+// Rejected (by parseEndpointList using these errors):
+//   - empty string
+//   - empty bracketed host: "[]:port"
+//   - missing closing ']': "[::1:9000"
+//   - trailing garbage after ']': "[::1]9000"
+//   - port out of [1, 65535]
+//   - non-numeric port
 func splitQwpHostPort(s string) (host, port string, err error) {
 	if strings.HasPrefix(s, "[") {
 		end := strings.IndexByte(s, ']')
@@ -302,7 +377,11 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 	for k, v := range data.KeyValuePairs {
 		switch k {
 		case "addr":
-			cfg.address = v
+			eps, err := parseEndpointList(v, qwpDefaultPort)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("%v", err)
+			}
+			cfg.endpoints = eps
 		case "path":
 			cfg.endpointPath = v
 		case "auth":
@@ -363,6 +442,76 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 			return nil, NewInvalidConfigStrError("tls_roots is not available in the go client")
 		case "tls_roots_password":
 			return nil, NewInvalidConfigStrError("tls_roots_password is not available in the go client")
+		case "target":
+			t, err := parseTargetFilter(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("%v", err)
+			}
+			cfg.target = t
+		case "failover":
+			switch v {
+			case "on":
+				cfg.failoverEnabled = true
+			case "off":
+				cfg.failoverEnabled = false
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid failover %q, expected on or off", v)
+			}
+		case "failover_max_attempts":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid failover_max_attempts %q: %v", v, err)
+			}
+			if n < 1 {
+				return nil, NewInvalidConfigStrError(
+					"failover_max_attempts must be >= 1, got %d", n)
+			}
+			cfg.failoverMaxAttempts = n
+		case "failover_backoff_initial_ms":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid failover_backoff_initial_ms %q: %v", v, err)
+			}
+			if n < 0 {
+				return nil, NewInvalidConfigStrError(
+					"failover_backoff_initial_ms must be >= 0, got %d", n)
+			}
+			cfg.failoverBackoffInitial = time.Duration(n) * time.Millisecond
+		case "failover_backoff_max_ms":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid failover_backoff_max_ms %q: %v", v, err)
+			}
+			if n < 0 {
+				return nil, NewInvalidConfigStrError(
+					"failover_backoff_max_ms must be >= 0, got %d", n)
+			}
+			cfg.failoverBackoffMax = time.Duration(n) * time.Millisecond
+		case "server_info_timeout_ms":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid server_info_timeout_ms %q: %v", v, err)
+			}
+			if n < 0 {
+				return nil, NewInvalidConfigStrError(
+					"server_info_timeout_ms must be >= 0, got %d", n)
+			}
+			cfg.serverInfoTimeout = time.Duration(n) * time.Millisecond
+		case "replay_exec":
+			switch v {
+			case "on":
+				cfg.replayExec = true
+			case "off":
+				cfg.replayExec = false
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid replay_exec %q, expected on or off", v)
+			}
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}

@@ -41,7 +41,25 @@ const (
 	qwpEventKindBatch    qwpEventKind = iota + 1 // RESULT_BATCH: batch field valid
 	qwpEventKindEnd                              // RESULT_END: totalRows valid
 	qwpEventKindExecDone                         // EXEC_DONE: execResult valid
-	qwpEventKindError                            // QUERY_ERROR or synthesized transport/decode error
+	// qwpEventKindError is the server's QUERY_ERROR frame. The
+	// connection is still healthy; the next query may submit on the
+	// same I/O goroutine. Surfaced to the user as *QwpQueryError.
+	qwpEventKindError
+	// qwpEventKindTransportError is a synthesized client-side terminal
+	// failure: reader closed, server closed, decoder out of sync, send
+	// failure, or unknown msg_kind. The decoder's per-connection state
+	// is no longer trustworthy and the I/O goroutine has poisoned ioErr
+	// (or will, on its way out). Routed by the failover orchestrator
+	// to the reconnect-and-replay path; surfaced to the user as a
+	// plain error when failover is disabled or exhausted.
+	qwpEventKindTransportError
+	// qwpEventKindFailoverReset is emitted by the session orchestrator
+	// (not the I/O goroutine) on the consumer side after a successful
+	// reconnect and resubmit. Carries the new generation's
+	// QwpServerInfo so the user can discard accumulated rows from the
+	// prior connection. Internal to qwp_query_failover.go;
+	// qwp_query_io.go never produces this kind directly.
+	qwpEventKindFailoverReset
 )
 
 // qwpEvent is the discriminated-union event carried on qwpEgressIO.events
@@ -60,12 +78,18 @@ type qwpEvent struct {
 	// ExecDone kind
 	execResult ExecResult
 
-	// Error kind — carries both server-reported QUERY_ERROR and
-	// synthesized client-side errors (transport read failure, decode
-	// failure, etc.). A zero status + prefixed client message
-	// distinguishes the synthesized case.
+	// Error kind — carries the server-reported QUERY_ERROR status +
+	// message. TransportError kind reuses errMessage; status is
+	// always 0 on the synthesized variant since it does not
+	// correspond to a server status byte. FailoverReset kind reuses
+	// failoverReset.
 	errStatus  qwpStatusCode
 	errMessage string
+
+	// FailoverReset kind — populated by qwp_query_failover.go after a
+	// successful reconnect; carries through to the user as
+	// *QwpFailoverReset. Nil for any other kind.
+	failoverReset *QwpFailoverReset
 }
 
 // qwpBatchBuffer is a pool-owned container for one decoded
@@ -855,12 +879,15 @@ func (io *qwpEgressIO) emit(ev qwpEvent) {
 	}
 }
 
-// emitError emits a synthesized client-side error event, attributed to
-// the current query. Inherits emit's shutdown-drop semantics — see the
-// comment on emit.
+// emitError emits a synthesized client-side transport-error event,
+// attributed to the current query. Inherits emit's shutdown-drop
+// semantics — see the comment on emit. status is preserved on the
+// event for diagnostic purposes but is conventionally zero for
+// synthesized failures (the server status byte only exists on actual
+// QUERY_ERROR frames, which use handleQueryError directly).
 func (io *qwpEgressIO) emitError(status qwpStatusCode, msg string) {
 	io.emit(qwpEvent{
-		kind:       qwpEventKindError,
+		kind:       qwpEventKindTransportError,
 		requestId:  io.currentRequestId,
 		errStatus:  status,
 		errMessage: msg,
@@ -868,20 +895,26 @@ func (io *qwpEgressIO) emitError(status qwpStatusCode, msg string) {
 }
 
 // poisonAndEmitError latches msg as the connection's terminal ioErr
-// AND emits it as the current query's Error event. Use this in place
-// of emitError for any decoder- or framing-level failure that leaves
-// the per-connection decoder state (symbol dict, schema registry,
-// zstd stream) desynced from the server: once the decoder is out of
-// sync, a follow-up query would decode against stale state and could
-// return silently corrupt rows. The latched ioErr causes every
-// subsequent submitQuery to fail immediately. Does NOT flip
+// AND emits it as the current query's TransportError event. Use this
+// in place of emitError for any decoder- or framing-level failure
+// that leaves the per-connection decoder state (symbol dict, schema
+// registry, zstd stream) desynced from the server: once the decoder
+// is out of sync, a follow-up query would decode against stale state
+// and could return silently corrupt rows. The latched ioErr causes
+// every subsequent submitQuery to fail immediately. Does NOT flip
 // currentQueryDone — callers that also need to terminate the current
 // query set it where it belongs, matching the existing emitError
 // call sites.
+//
+// The transport-error kind makes the failover orchestrator route this
+// to the reconnect-and-replay path; without the kind split a server
+// QUERY_ERROR would be indistinguishable from a decoder desync and the
+// orchestrator would either retry SQL errors (wrong) or never retry
+// transport faults (also wrong).
 func (io *qwpEgressIO) poisonAndEmitError(msg string) {
 	io.setIoErr(errors.New(msg))
 	io.emit(qwpEvent{
-		kind:       qwpEventKindError,
+		kind:       qwpEventKindTransportError,
 		requestId:  io.currentRequestId,
 		errStatus:  0,
 		errMessage: msg,
