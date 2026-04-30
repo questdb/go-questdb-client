@@ -1461,6 +1461,82 @@ func TestQwpSenderServerError(t *testing.T) {
 	}
 }
 
+// TestQwpSyncFlushFailureDoesNotAdvanceMaxSentSymbolId verifies that a
+// sync-mode flush failure leaves maxSentSymbolId / maxSentSchemaId
+// untouched, so a follow-up flush re-includes the symbols and schema
+// the server never received. Without this, a retry after a transient
+// failure would ship a delta dictionary missing the symbol the failed
+// batch carried, and the server's dict would be out of sync — leaving
+// later RESULT_BATCHes referring to ids the server cannot resolve.
+//
+// flushSync's success path (qwp_sender.go:931-936) advances both ids
+// only after the matching ACK has been read; the failure paths return
+// before reaching that block. Mirrors the Java client's
+// QwpDeltaDictRollbackTest.
+func TestQwpSyncFlushFailureDoesNotAdvanceMaxSentSymbolId(t *testing.T) {
+	// Server returns WRITE_ERROR for every flush. Sync-mode (no
+	// in-flight window) hits the server-error branch of flushSync.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, _, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			conn.Write(context.Background(), websocket.MessageBinary,
+				buildAckError(qwpStatusWriteError, 0, "write failed"))
+		}
+	}))
+	defer srv.Close()
+
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Buffer a row with a symbol — registers symbol id 0 in the
+	// global dict and bumps batchMaxSymbolId to 0.
+	if err := s.Table("t").
+		Symbol("sym", "AAPL").
+		Int64Column("v", 1).
+		AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow: %v", err)
+	}
+	if s.batchMaxSymbolId != 0 {
+		t.Fatalf("batchMaxSymbolId after enqueue = %d, want 0", s.batchMaxSymbolId)
+	}
+	if s.maxSentSymbolId != -1 {
+		t.Fatalf("maxSentSymbolId pre-flush = %d, want -1", s.maxSentSymbolId)
+	}
+	preMaxSentSchemaId := s.maxSentSchemaId
+
+	// flushSync returns the server's WRITE_ERROR. The advancement
+	// block at the bottom of flushSync MUST be skipped.
+	err := s.Flush(context.Background())
+	if err == nil {
+		t.Fatal("expected flush to fail with WRITE_ERROR, got nil")
+	}
+	if qErr, ok := err.(*QwpError); !ok || qErr.Status != qwpStatusWriteError {
+		t.Fatalf("err = %v, want *QwpError{WriteError}", err)
+	}
+
+	if s.maxSentSymbolId != -1 {
+		t.Errorf(
+			"maxSentSymbolId advanced on failure: got %d, want -1 (a retry would now ship a delta missing symbol AAPL)",
+			s.maxSentSymbolId,
+		)
+	}
+	if s.maxSentSchemaId != preMaxSentSchemaId {
+		t.Errorf(
+			"maxSentSchemaId advanced on failure: before=%d after=%d (a retry would now reference a schema the server never registered)",
+			preMaxSentSchemaId, s.maxSentSchemaId,
+		)
+	}
+}
+
 // --- Async sender tests ---
 
 func TestQwpSenderAsyncBasic(t *testing.T) {

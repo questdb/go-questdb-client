@@ -124,6 +124,23 @@ func buildOneRowInt64Batch(t *testing.T, requestId int64, batchSeq uint64, colNa
 	return wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), requestId, batchSeq)
 }
 
+// buildOneRowVarcharBatch produces a RESULT_BATCH frame with a single
+// column (wireType=VARCHAR), one row, value=val. Used by the aliasing
+// test, which needs a column type whose accessor returns bytes that
+// alias directly into the per-frame payload.
+func buildOneRowVarcharBatch(t *testing.T, requestId int64, batchSeq uint64, colName string, val string) []byte {
+	t.Helper()
+	tb := newQwpTableBuffer("t")
+	col, err := tb.getOrCreateColumn(colName, qwpTypeVarchar, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn: %v", err)
+	}
+	col.addString(val)
+	tb.commitRow()
+	var enc qwpEncoder
+	return wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), requestId, batchSeq)
+}
+
 // --- Parsers for frames sent by the client to the mock server ---
 
 // parseQueryRequest decodes a client-sent QUERY_REQUEST frame. Egress
@@ -463,6 +480,97 @@ func TestQwpEgressIOPoolBackpressure(t *testing.T) {
 	}
 	if val1 != 10 || val2 != 20 {
 		t.Fatalf("batch values = %d, %d; want 10, 20", val1, val2)
+	}
+}
+
+// TestQwpEgressIOInPlaceDecodeAliasing pins the cross-batch isolation
+// invariant: while the user holds batch N, the dispatcher decoding
+// batch N+1 into a DIFFERENT pool buffer must not corrupt batch N's
+// view. VARCHAR makes the property visible — its accessor returns a
+// byte slice aliased into the frame's payload, so any cross-buffer
+// clobber would surface as wrong bytes on a re-read.
+//
+// In the Go architecture each qwpBatchBuffer holds its own
+// QwpColumnBatch with per-batch layouts, and coder/websocket hands
+// the dispatcher a fresh []byte per binary frame; holding a buffer
+// pins that frame's payload via the layout's aliased slices. This
+// test is the negative case the existing CopyAll-survives-pool-reuse
+// tests don't cover: there we explicitly snapshot before reuse, here
+// we read the live aliased view across reuse.
+func TestQwpEgressIOInPlaceDecodeAliasing(t *testing.T) {
+	const wantReqID = int64(7)
+
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		m.readBinary(ctx)
+		m.sendBinary(ctx, buildOneRowVarcharBatch(t, wantReqID, 0, "v", "ALPHA"))
+		m.sendBinary(ctx, buildOneRowVarcharBatch(t, wantReqID, 1, "v", "BRAVO"))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(wantReqID, 1, 2)))
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+
+	// Pool size 2: the dispatcher can decode batch 1 into a
+	// different buffer while batch 0 is still held by the user.
+	io := newQwpEgressIO(tr, 2)
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := io.submitQuery(ctx, qwpRequest{sql: "x", requestId: wantReqID}); err != nil {
+		t.Fatalf("submitQuery: %v", err)
+	}
+
+	ev0 := takeEventOrFail(t, io, 2*time.Second)
+	if ev0.kind != qwpEventKindBatch {
+		t.Fatalf("ev0 kind = %v, errMsg=%q", ev0.kind, ev0.errMessage)
+	}
+	if got := ev0.batch.batch.String(0, 0); got != "ALPHA" {
+		t.Fatalf("batch0 first read = %q, want ALPHA", got)
+	}
+	// Capture the aliased byte view too — the bytes themselves must
+	// stay stable, not just an accessor that happens to recopy them.
+	str0Before := ev0.batch.batch.Str(0, 0)
+	if string(str0Before) != "ALPHA" {
+		t.Fatalf("Str(0,0) = %q, want ALPHA", str0Before)
+	}
+
+	// Pull batch 1 WITHOUT releasing batch 0. The dispatcher must
+	// take the second buffer from the pool and decode payload 1 into
+	// it; batch 0's view must remain untouched.
+	ev1 := takeEventOrFail(t, io, 2*time.Second)
+	if ev1.kind != qwpEventKindBatch {
+		t.Fatalf("ev1 kind = %v, errMsg=%q", ev1.kind, ev1.errMessage)
+	}
+	if got := ev1.batch.batch.String(0, 0); got != "BRAVO" {
+		t.Fatalf("batch1 read = %q, want BRAVO", got)
+	}
+	if ev1.batch == ev0.batch {
+		t.Fatal("dispatcher reused the still-held batch buffer; pool isolation broken")
+	}
+
+	// Re-read batch 0 AFTER batch 1 has been decoded. Without
+	// cross-batch isolation the alias would now resolve to BRAVO.
+	if got := ev0.batch.batch.String(0, 0); got != "ALPHA" {
+		t.Fatalf("batch0 re-read after batch1 decode = %q, want ALPHA", got)
+	}
+	// The aliased byte view captured before batch 1 arrived must
+	// also still resolve to the same bytes — a stale slice header
+	// pointing into a clobbered buffer would surface here.
+	if string(str0Before) != "ALPHA" {
+		t.Fatalf("aliased Str(0,0) drifted to %q after batch1 decode, want ALPHA", str0Before)
+	}
+
+	ev0.batch.release()
+	ev1.batch.release()
+
+	end := takeEventOrFail(t, io, 2*time.Second)
+	if end.kind != qwpEventKindEnd {
+		t.Fatalf("end kind = %v, errMsg=%q", end.kind, end.errMessage)
 	}
 }
 
@@ -976,6 +1084,71 @@ func TestQwpEgressIOReleaseAfterShutdown(t *testing.T) {
 	case <-done2:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("second releaseBuffer after shutdown blocked")
+	}
+}
+
+// TestQwpEgressIOReleaseClosePoolRace races releaseBuffer against the
+// dispatcher's exit-defer (closed.Store(true) + close(events)) across
+// 200 iterations to surface any TOCTOU bug in the closed.Load() guard
+// in releaseBuffer. Mirrors Java's QwpEgressIoThreadCloseRaceTest.
+//
+// In the Java client the concern is a leaked native scratch buffer:
+// a user thread reads closed==false, pauses, lets closePool drain
+// freeBuffers, then offers its buffer into the now-emptied queue and
+// the buffer's native memory leaks. Go's qwpBatchBuffer holds only
+// GC-managed slices, so the failure mode here is narrower — what we
+// pin is that the release/exit pair never panics, never blocks, and
+// has no data race detectable under -race. The existing single-shot
+// TestQwpEgressIOReleaseAfterShutdown only covers the post-shutdown
+// case; the close-during-release window needs the loop.
+func TestQwpEgressIOReleaseClosePoolRace(t *testing.T) {
+	const iterations = 200
+	for iter := 0; iter < iterations; iter++ {
+		// Synthetic egress IO: never started, transport unused.
+		// releaseBuffer touches only closed / pendingCredit /
+		// buffers / notifyCh, all of which the constructor sets up.
+		io := newQwpEgressIO(nil, 2)
+		// Pull both pool buffers out so we can release them — what
+		// the dispatcher would have handed to the user as a batch.
+		b0 := <-io.buffers
+		b1 := <-io.buffers
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			io.releaseBuffer(b0)
+			io.releaseBuffer(b1)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			// Mirror the dispatcher's exit defers (LIFO): close
+			// events first, then flip closed. Either order is
+			// safe by the same argument the production code makes
+			// — releaseBuffer's fallback path is harmless on a
+			// drained, dead pool.
+			close(io.events)
+			io.closed.Store(true)
+		}()
+
+		// Release the start gate so both goroutines hit the racing
+		// section as close to simultaneously as the runtime allows.
+		close(start)
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: race between releaseBuffer and exit-defer deadlocked", iter)
+		}
 	}
 }
 

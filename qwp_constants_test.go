@@ -172,3 +172,79 @@ func TestQwpLongNullSentinel(t *testing.T) {
 		t.Fatalf("qwpLongNull = 0x%016X, want 0x8000000000000000", qwpLongNull)
 	}
 }
+
+func TestQwpFlagBitPositions(t *testing.T) {
+	// Header flag bits. Drift here is a wire-format break — the
+	// server uses these exact bits to signal Gorilla / delta-dict /
+	// zstd payload encoding. Mirrors Java's QwpConstantsTest
+	// testFlagBitPositions.
+	if qwpFlagGorilla != 0x04 {
+		t.Errorf("qwpFlagGorilla = 0x%02X, want 0x04", qwpFlagGorilla)
+	}
+	if qwpFlagDeltaSymbolDict != 0x08 {
+		t.Errorf("qwpFlagDeltaSymbolDict = 0x%02X, want 0x08", qwpFlagDeltaSymbolDict)
+	}
+	// qwpFlagZstd is Go-side specific (the egress server uses it for
+	// RESULT_BATCH compression). Pinned to catch silent drift.
+	if qwpFlagZstd != 0x10 {
+		t.Errorf("qwpFlagZstd = 0x%02X, want 0x10", qwpFlagZstd)
+	}
+}
+
+func TestQwpHeaderSize(t *testing.T) {
+	// 12-byte header: 4 magic + 1 version + 2 reserved + 1 flags
+	// + 4 payload-length. Drift here means the encoder and the
+	// decoder won't agree on where the payload starts. Mirrors
+	// Java's QwpConstantsTest testHeaderSize.
+	if qwpHeaderSize != 12 {
+		t.Errorf("qwpHeaderSize = %d, want 12", qwpHeaderSize)
+	}
+	// Pin the offsets the decoder actually reaches into too — a
+	// reorganised header that kept the size but moved the flags or
+	// payload-length fields would slip past the size check above.
+	if qwpHeaderOffsetFlags != 5 {
+		t.Errorf("qwpHeaderOffsetFlags = %d, want 5", qwpHeaderOffsetFlags)
+	}
+	if qwpHeaderOffsetPayloadLen != 8 {
+		t.Errorf("qwpHeaderOffsetPayloadLen = %d, want 8", qwpHeaderOffsetPayloadLen)
+	}
+}
+
+func TestQwpMaxColumnsPerTable(t *testing.T) {
+	// Mirrors Java's QwpConstantsTest testMaxColumnsPerTable.
+	if qwpMaxColumnsPerTable != 2048 {
+		t.Errorf("qwpMaxColumnsPerTable = %d, want 2048", qwpMaxColumnsPerTable)
+	}
+}
+
+func TestQwpIsFixedWidthType(t *testing.T) {
+	// Go has no isFixedWidth() boolean — the same information is
+	// encoded in qwpFixedTypeSize (>= 0 for fixed, -1 for variable).
+	// Mirrors Java's QwpConstantsTest testIsFixedWidthType: the
+	// classification is a wire-format invariant (fixed-width types
+	// pack into the data section without offsets, variable-width
+	// types carry a (nonNullCount+1)*4 offset table or a custom
+	// per-cell layout).
+	fixed := []qwpTypeCode{
+		qwpTypeBoolean, qwpTypeByte, qwpTypeShort, qwpTypeChar,
+		qwpTypeInt, qwpTypeLong, qwpTypeFloat, qwpTypeDouble,
+		qwpTypeTimestamp, qwpTypeTimestampNano, qwpTypeDate,
+		qwpTypeUuid, qwpTypeLong256,
+		qwpTypeDecimal64, qwpTypeDecimal128, qwpTypeDecimal256,
+		qwpTypeIPv4,
+	}
+	for _, tc := range fixed {
+		if qwpFixedTypeSize(tc) < 0 {
+			t.Errorf("qwpFixedTypeSize(0x%02X) = -1; expected fixed-width type", byte(tc))
+		}
+	}
+	variable := []qwpTypeCode{
+		qwpTypeSymbol, qwpTypeGeohash, qwpTypeVarchar, qwpTypeBinary,
+		qwpTypeDoubleArray, qwpTypeLongArray,
+	}
+	for _, tc := range variable {
+		if qwpFixedTypeSize(tc) != -1 {
+			t.Errorf("qwpFixedTypeSize(0x%02X) = %d; expected -1 (variable-width)", byte(tc), qwpFixedTypeSize(tc))
+		}
+	}
+}
