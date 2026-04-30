@@ -567,8 +567,10 @@ type QwpQuery struct {
 
 	// totalRows is set when a RESULT_END frame arrives. Read via
 	// TotalRows(). Default 0 on a query that never reached End
-	// (cancelled, errored, or still running).
-	totalRows int64
+	// (cancelled, errored, or still running). Atomic because the
+	// iterator goroutine in Batches() writes it while a sibling
+	// goroutine (e.g. cancel/observer) may call TotalRows().
+	totalRows atomic.Int64
 
 	// pendingErr holds an error surfaced at submit time (closed
 	// client, submit blocked on ctx cancel). Yielded on the first
@@ -668,7 +670,7 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 					return
 				}
 			case qwpEventKindEnd:
-				q.totalRows = ev.totalRows
+				q.totalRows.Store(ev.totalRows)
 				return
 			case qwpEventKindError:
 				// A server-sent cancellation echo (status=Cancelled)
@@ -698,9 +700,9 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 
 // TotalRows returns the server-reported total-row count from the
 // RESULT_END frame, or 0 if the query did not reach End (cancelled,
-// errored, or still running).
+// errored, or still running). Safe to call from any goroutine.
 func (q *QwpQuery) TotalRows() int64 {
-	return q.totalRows
+	return q.totalRows.Load()
 }
 
 // RequestId returns the client-assigned id for this query. Exposed

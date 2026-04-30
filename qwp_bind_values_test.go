@@ -240,6 +240,34 @@ func TestQwpBindsGeohashMinMax(t *testing.T) {
 	})
 }
 
+func TestQwpBindsGeohashMasksHighBits(t *testing.T) {
+	// precisionBits=5 keeps only the low 5 bits; the wire byte should
+	// be 0x1F regardless of the high bits in value.
+	t.Run("subByte", func(t *testing.T) {
+		var b QwpBinds
+		b.GeohashBind(0, 0xFFFF_FFFF_FFFF_FFFF, 5)
+		var w byteBuf
+		w.put(byte(qwpTypeGeohash), testBindNonNull)
+		w.putVarint(5)
+		w.put(0x1F)
+		assertEncoded(t, &b, 1, w.b)
+	})
+	// precisionBits=60 (max). Only the low 60 bits matter; the top
+	// nibble of the highest wire byte must be zero.
+	t.Run("maxPrecision", func(t *testing.T) {
+		var b QwpBinds
+		b.GeohashBind(0, 0xFFFF_FFFF_FFFF_FFFF, 60)
+		var w byteBuf
+		w.put(byte(qwpTypeGeohash), testBindNonNull)
+		w.putVarint(60)
+		masked := uint64(0x0FFF_FFFF_FFFF_FFFF)
+		for i := 0; i < 8; i++ {
+			w.put(byte(masked >> (i * 8)))
+		}
+		assertEncoded(t, &b, 1, w.b)
+	})
+}
+
 func TestQwpBindsGeohashRejectsOutOfRange(t *testing.T) {
 	cases := []int{0, 61, -1}
 	for _, p := range cases {

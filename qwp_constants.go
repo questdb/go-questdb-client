@@ -207,6 +207,19 @@ const (
 	// header (up to qwpMaxArrayNDims * 4 bytes) together stay inside
 	// int32. The 1024-byte slack covers that shape header.
 	qwpMaxArrayElements = (1<<31 - 1 - 1024) / 8
+
+	// qwpMaxConnDictHeapBytes caps the connection-scoped SYMBOL dict
+	// UTF-8 heap at 256 MiB. Servers that approach this cap are
+	// expected to emit CACHE_RESET; crossing it without a reset is a
+	// misbehaving (or hostile) server. Below uint32 max so the
+	// uint32 offsets stored on each entry cannot wrap. Mirrors Java
+	// QwpResultBatchDecoder.MAX_CONN_DICT_HEAP_BYTES.
+	qwpMaxConnDictHeapBytes = 256 * 1024 * 1024
+
+	// qwpMaxConnDictSize caps the connection-scoped SYMBOL dict entry
+	// count. Mirrors Java QwpResultBatchDecoder.MAX_CONN_DICT_SIZE
+	// (2^23) — same defensive intent as the heap cap.
+	qwpMaxConnDictSize = 8_388_608
 )
 
 // qwpFixedTypeSize returns the per-value size in bytes for fixed-width

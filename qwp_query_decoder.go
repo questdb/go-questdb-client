@@ -97,7 +97,14 @@ func (d *qwpConnDict) appendDelta(br *qwpByteReader) error {
 	if err != nil {
 		return err
 	}
-	if deltaStart+deltaCount > int64(^uint32(0)) {
+	// Reject hostile (deltaStart, deltaCount) before any allocation.
+	// The entry-count cap also guards the per-entry uint32 offset
+	// path below: with size capped at qwpMaxConnDictSize and heap
+	// capped at qwpMaxConnDictHeapBytes (both well below 1<<32),
+	// uint32(len(d.heap)) cannot overflow.
+	if deltaStart < 0 || deltaCount < 0 ||
+		deltaStart > qwpMaxConnDictSize ||
+		deltaCount > int64(qwpMaxConnDictSize)-deltaStart {
 		return newQwpDecodeError(fmt.Sprintf(
 			"delta symbol section out of range: start=%d count=%d",
 			deltaStart, deltaCount))
@@ -127,6 +134,18 @@ func (d *qwpConnDict) appendDelta(br *qwpByteReader) error {
 			}
 			pos = br.pos
 			entryLen = uint64(v)
+		}
+		// Heap-byte cap. Check before the body-fits-in-buffer test so
+		// a hostile advertised entryLen near uint64-max is rejected at
+		// the cap rather than misinterpreted by the bufLen-pos
+		// subtraction. uint64 arithmetic keeps len(d.heap)+entryLen
+		// from wrapping past int max. The cap is also what keeps the
+		// uint32 offset stored below from wrapping.
+		if uint64(len(d.heap))+entryLen > qwpMaxConnDictHeapBytes {
+			br.pos = pos
+			return newQwpDecodeError(fmt.Sprintf(
+				"connection SYMBOL dict heap exceeds cap (%d bytes); server must emit CACHE_RESET",
+				qwpMaxConnDictHeapBytes))
 		}
 		if entryLen > uint64(bufLen-pos) {
 			br.pos = pos

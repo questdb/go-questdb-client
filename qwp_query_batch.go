@@ -408,13 +408,15 @@ func (b *QwpColumnBatch) Decimal128Hi(col, row int) int64 {
 
 // Long256Word returns word `word` of a LONG256 or DECIMAL256 value at
 // (col, row). word=0 is the least-significant 64 bits, word=3 the most.
+// Panics on word out of [0,3] regardless of whether the row is NULL —
+// that is always programmer error and should not be masked by a NULL.
 func (b *QwpColumnBatch) Long256Word(col, row, word int) int64 {
+	if word < 0 || word > 3 {
+		panic(fmt.Sprintf("QwpColumnBatch.Long256Word: word %d out of [0,3]", word))
+	}
 	l := &b.layouts[col]
 	if l.isNull(row) {
 		return 0
-	}
-	if word < 0 || word > 3 {
-		panic(fmt.Sprintf("QwpColumnBatch.Long256Word: word %d out of [0,3]", word))
 	}
 	i := l.denseIndex(row)*32 + word*8
 	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
@@ -434,9 +436,13 @@ func (b *QwpColumnBatch) Long256Word(col, row, word int) int64 {
 // are independent value-copies of a {ptr, len, cap} triple, so every
 // call produces an independent view — no A/B distinction needed.
 
-// Str returns the UTF-8 bytes of a STRING, VARCHAR, or SYMBOL cell.
-// Returns nil for NULL rows. The returned slice aliases the payload;
-// do not retain it past the current batch iteration.
+// Str returns the UTF-8 bytes of a STRING, VARCHAR, SYMBOL, or BINARY
+// cell. Returns nil for NULL rows and for any column whose wire type
+// is not one of those four — there is no way to distinguish "the row
+// is NULL" from "this column is not a string" through the return value
+// alone, so callers that care must know the column type up front (e.g.
+// from ColumnType). The returned slice aliases the payload; do not
+// retain it past the current batch iteration.
 func (b *QwpColumnBatch) Str(col, row int) []byte {
 	l := &b.layouts[col]
 	if l.isNull(row) {
@@ -740,21 +746,27 @@ func (c QwpColumn) Decimal128Lo(row int) int64 { return c.UuidLo(row) }
 func (c QwpColumn) Decimal128Hi(row int) int64 { return c.UuidHi(row) }
 
 // Long256Word returns word `word` of a LONG256 or DECIMAL256 value at row.
+// Panics on word out of [0,3] regardless of whether the row is NULL —
+// that is always programmer error and should not be masked by a NULL.
 func (c QwpColumn) Long256Word(row, word int) int64 {
+	if word < 0 || word > 3 {
+		panic(fmt.Sprintf("QwpColumn.Long256Word: word %d out of [0,3]", word))
+	}
 	l := c.layout
 	if l.isNull(row) {
 		return 0
-	}
-	if word < 0 || word > 3 {
-		panic(fmt.Sprintf("QwpColumn.Long256Word: word %d out of [0,3]", word))
 	}
 	i := l.denseIndex(row)*32 + word*8
 	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
 }
 
 // Str returns the UTF-8 bytes of a STRING, VARCHAR, SYMBOL, or BINARY
-// cell. Returns nil for NULL rows. The returned slice aliases the
-// payload; do not retain past the batch iteration.
+// cell. Returns nil for NULL rows and for any column whose wire type
+// is not one of those four — there is no way to distinguish "the row
+// is NULL" from "this column is not a string" through the return value
+// alone, so callers that care must know the column type up front (e.g.
+// from QwpColumn.Type). The returned slice aliases the payload; do not
+// retain past the batch iteration.
 func (c QwpColumn) Str(row int) []byte {
 	l := c.layout
 	if l.isNull(row) {

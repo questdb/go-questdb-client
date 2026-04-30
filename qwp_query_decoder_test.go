@@ -1753,6 +1753,46 @@ func TestQwpConnDictClearPreservesCapacity(t *testing.T) {
 	}
 }
 
+// TestQwpConnDictRejectsOversizedDeltaCount verifies the per-connection
+// entry-count cap blocks a hostile (or buggy) server frame that would
+// otherwise grow the dict past the bound the uint32 entry offset assumes.
+func TestQwpConnDictRejectsOversizedDeltaCount(t *testing.T) {
+	var dict qwpConnDict
+	var buf bytes.Buffer
+	putVarintBytes(&buf, 0) // deltaStart
+	// One past the cap — server-side framing must reject this even
+	// before we try to allocate.
+	putVarintBytes(&buf, uint64(qwpMaxConnDictSize)+1)
+	var br qwpByteReader
+	br.reset(buf.Bytes())
+	err := dict.appendDelta(&br)
+	if err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected out-of-range error, got %v", err)
+	}
+}
+
+// TestQwpConnDictRejectsOversizedHeap verifies the per-connection heap
+// cap blocks a single delta entry whose length would push the heap past
+// the cap. Tests with a synthetic short header — the appendDelta loop
+// must check before allocating, since uint32 offset overflow on the
+// next entry would be silent corruption.
+func TestQwpConnDictRejectsOversizedHeap(t *testing.T) {
+	var dict qwpConnDict
+	var buf bytes.Buffer
+	putVarintBytes(&buf, 0) // deltaStart
+	putVarintBytes(&buf, 1) // deltaCount = 1
+	// Advertise an entry length larger than the heap cap. Only the
+	// header is read; the loop must reject on the cap check before
+	// looking at the body.
+	putVarintBytes(&buf, uint64(qwpMaxConnDictHeapBytes)+1)
+	var br qwpByteReader
+	br.reset(buf.Bytes())
+	err := dict.appendDelta(&br)
+	if err == nil || !strings.Contains(err.Error(), "exceeds cap") {
+		t.Fatalf("expected exceeds-cap error, got %v", err)
+	}
+}
+
 // buildDeltaBytes emits a (deltaStart + deltaCount + per-entry
 // len+bytes) block as appendDelta expects to read.
 func buildDeltaBytes(deltaStart int, entries []string) []byte {

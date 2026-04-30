@@ -339,6 +339,10 @@ func (b *QwpBinds) NullLong256Bind(index int) *QwpBinds { return b.setNull(index
 // GeohashBind binds a GEOHASH parameter with the given precision in
 // bits (1..60) and packed value. The low ceil(precisionBits/8) bytes of
 // value are written little-endian on the wire.
+//
+// value is masked to precisionBits before encoding, so bits above the
+// declared precision cannot leak into the top wire byte (which would
+// otherwise pass through when precisionBits is not a multiple of 8).
 func (b *QwpBinds) GeohashBind(index int, value uint64, precisionBits int) *QwpBinds {
 	if b.err != nil {
 		return b
@@ -354,6 +358,9 @@ func (b *QwpBinds) GeohashBind(index int, value uint64, precisionBits int) *QwpB
 	}
 	b.writeHeader(qwpTypeGeohash, false)
 	b.appendVarint(uint64(precisionBits))
+	if precisionBits < 64 {
+		value &= (uint64(1) << precisionBits) - 1
+	}
 	byteCount := (precisionBits + 7) >> 3
 	for i := 0; i < byteCount; i++ {
 		b.buf = append(b.buf, byte(value>>(i*8)))
