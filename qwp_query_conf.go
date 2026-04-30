@@ -372,8 +372,14 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 		return nil, NewInvalidConfigStrError("tls_verify requires the wss:: schema")
 	}
 
+	// Wrap validate's plain errors as *InvalidConfigStrError so a caller
+	// that came in via the conf-string path sees one consistent error
+	// type — both the per-key parse errors above and the cross-field
+	// validation errors below. The functional-options path
+	// (NewQwpQueryClient) calls validate() directly and keeps the plain
+	// fmt.Errorf form, where "config string" framing would be wrong.
 	if err := cfg.validate(); err != nil {
-		return nil, err
+		return nil, NewInvalidConfigStrError("%v", err)
 	}
 	return cfg, nil
 }

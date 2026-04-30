@@ -676,6 +676,11 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte) {
 
 	select {
 	case <-io.shutdownCh:
+		// Buffer is orphaned to GC here rather than returned to the
+		// pool: shutdown is racing the events send, the dispatcher is
+		// about to exit, and nobody will drain io.buffers anyway. The
+		// always-balanced bookkeeping the pool comment describes
+		// applies to the steady state, not to this terminal path.
 		io.currentQueryDone = true
 		return
 	case io.events <- qwpEvent{
@@ -833,6 +838,16 @@ func (io *qwpEgressIO) sendCredit(requestId, additionalBytes int64) error {
 // stranding the I/O goroutine on an unresponsive consumer. The events
 // channel's bufferPoolSize+2 capacity guarantees non-batch events always
 // fit in the steady state, so the select hits the fast path.
+//
+// If shutdown wins the race, the event is silently dropped. This is
+// acceptable because shutdown is always user-initiated (Close /
+// QwpQuery.Close): any QUERY_ERROR or synthesized error that arrives in
+// the same instant is for a query the caller is no longer waiting on,
+// and after Close returns takeEvent reports "I/O goroutine terminated"
+// rather than the lost event. Connection-state poisoning (via
+// poisonAndEmitError → setIoErr) is independent of the emit and is
+// preserved across the drop, so a follow-up submitQuery on the same
+// client still surfaces the underlying failure.
 func (io *qwpEgressIO) emit(ev qwpEvent) {
 	select {
 	case io.events <- ev:
@@ -841,7 +856,8 @@ func (io *qwpEgressIO) emit(ev qwpEvent) {
 }
 
 // emitError emits a synthesized client-side error event, attributed to
-// the current query.
+// the current query. Inherits emit's shutdown-drop semantics — see the
+// comment on emit.
 func (io *qwpEgressIO) emitError(status qwpStatusCode, msg string) {
 	io.emit(qwpEvent{
 		kind:       qwpEventKindError,

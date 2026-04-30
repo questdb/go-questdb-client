@@ -352,10 +352,18 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 // interpolating values into the SQL string defeats that reuse, use
 // WithQueryBinds instead.
 //
-// Err on a wrong statement kind surfaces through the first Batches()
-// yield: if the server sends EXEC_DONE (non-SELECT statement), the
-// iterator yields (nil, error) and terminates. Use Exec for
-// statements that do not produce a result set.
+// Query never returns an error directly: any failure raised at submit
+// time (closed client, bind setter error, ctx-cancelled submit) is
+// latched on the returned *QwpQuery and yielded as the first element of
+// Batches(). Callers MUST iterate Batches() to observe submit failures;
+// dropping the cursor without ranging it discards the latched error
+// silently. Use Exec for statements where the synchronous error
+// signature is more natural.
+//
+// Err on a wrong statement kind also surfaces through the first
+// Batches() yield: if the server sends EXEC_DONE (non-SELECT
+// statement), the iterator yields (nil, error) and terminates. Use
+// Exec for statements that do not produce a result set.
 //
 // Breaking out of the range loop early sends a CANCEL frame to the
 // server and drains the remaining events until a terminal frame
