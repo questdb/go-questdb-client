@@ -114,6 +114,42 @@ type QwpSender interface {
 	// auto-flush path (which enqueues without waiting), not with
 	// Flush (which already blocks on ACK).
 	AwaitAckedFsn(target int64, timeout time.Duration) (bool, error)
+
+	// FlushAndGetSequence behaves identically to Flush but returns
+	// the published FSN (highest committed-to-disk-and-queued-for-
+	// wire frame sequence) post-flush. Distinct from AckedFsn(),
+	// which is the highest *server-acknowledged* sequence — the
+	// returned FSN is the upper bound of any SenderError.ToFsn that
+	// could surface for this batch. Use AwaitAckedFsn for ack
+	// confirmation.
+	FlushAndGetSequence(ctx context.Context) (int64, error)
+
+	// LastTerminalError returns a snapshot of the most recent
+	// terminal SenderError the I/O loop latched (server rejection,
+	// WS protocol violation, auth failure, reconnect-budget
+	// exhaustion). Returns nil if the sender has not gone terminal
+	// yet, or if it failed for a non-server reason (transport
+	// error before classification).
+	LastTerminalError() *SenderError
+
+	// TotalServerErrors returns the cumulative count of SenderError
+	// payloads the I/O loop has built (DROP and HALT combined).
+	// Includes batches where the user handler dropped the
+	// notification due to inbox overflow.
+	TotalServerErrors() int64
+
+	// DroppedErrorNotifications returns the cumulative count of
+	// SenderError payloads that did not reach the user-supplied
+	// handler because the bounded inbox was full at offer time.
+	// Non-zero means the handler is too slow for the error rate;
+	// raise WithErrorInboxCapacity or speed up the handler.
+	DroppedErrorNotifications() int64
+
+	// TotalErrorNotificationsDelivered returns the cumulative count
+	// of SenderError payloads delivered to the user-supplied
+	// handler. Includes deliveries where the handler panicked
+	// (caught by the dispatcher).
+	TotalErrorNotificationsDelivered() int64
 }
 
 // Compile-time check that qwpLineSender implements QwpSender.
@@ -255,6 +291,23 @@ type qwpLineSender struct {
 // transport instance the send loop creates (initial connect plus
 // reconnects).
 func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
+	s, err := newQwpLineSenderUnstarted(ctx, address, opts, retryTimeout,
+		autoFlushRows, autoFlushInterval, dumpWriter, inFlightWindow...)
+	if err != nil {
+		return nil, err
+	}
+	s.cursorSendLoop.sendLoopStart()
+	return s, nil
+}
+
+// newQwpLineSenderUnstarted builds the sender, engine, and loop but
+// does NOT call sendLoopStart. Used by newQwpLineSenderFromConf so the
+// resolver / handler / capacity from connect-string + builder options
+// can be applied to the loop before it starts processing — otherwise
+// the very first received frame races against the post-construction
+// setters and could be classified with the default resolver / handled
+// by the default handler instead of the user-configured ones.
+func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
 	window := 1
 	if len(inFlightWindow) > 0 && inFlightWindow[0] > 1 {
 		window = inFlightWindow[0]
@@ -293,7 +346,6 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 		qwpSfDefaultReconnectMaxDuration,
 		qwpSfDefaultReconnectInitialBackoff,
 		qwpSfDefaultReconnectMaxBackoff)
-	loop.sendLoopStart()
 	s.cursorEngine = engine
 	s.cursorSendLoop = loop
 	return s, nil
@@ -875,23 +927,39 @@ func (s *qwpLineSender) AtNow(ctx context.Context) error {
 // --- LineSender interface: Flush ---
 
 func (s *qwpLineSender) Flush(ctx context.Context) error {
+	_, err := s.FlushAndGetSequence(ctx)
+	return err
+}
+
+// FlushAndGetSequence implements QwpSender.FlushAndGetSequence.
+// Flushes any pending rows and returns the published FSN — the
+// upper bound on any SenderError.ToFsn that could surface for this
+// batch. Callers wanting server-ack confirmation should pair the
+// returned FSN with AwaitAckedFsn.
+func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) {
 	if s.closed {
-		return errClosedSenderFlush
+		return -1, errClosedSenderFlush
 	}
 	if s.hasTable {
-		return errFlushWithPendingMessage
+		return -1, errFlushWithPendingMessage
 	}
 	if s.pendingRowCount == 0 {
 		// Flush() never waits for server ACK on the cursor path
 		// (Java spec — design decision #1 in
 		// qwp-cursor-durability.md). Surface any terminal I/O
 		// error the loop has recorded so producers don't keep
-		// silently buffering into a dead engine; otherwise return.
-		// Callers wanting a drain barrier should call Close.
-		return s.cursorSendLoop.sendLoopCheckError()
+		// silently buffering into a dead engine; otherwise return
+		// the current published FSN.
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			return -1, err
+		}
+		return s.cursorEngine.enginePublishedFsn(), nil
 	}
 	defer s.resetAfterFlush()
-	return s.flushCursor(ctx)
+	if err := s.flushCursor(ctx); err != nil {
+		return -1, err
+	}
+	return s.cursorEngine.enginePublishedFsn(), nil
 }
 
 // resetAfterFlush clears all table buffers and resets counters.

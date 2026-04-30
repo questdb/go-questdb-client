@@ -24,6 +24,8 @@
 
 package questdb
 
+import "github.com/coder/websocket"
+
 type (
 	Buffer           = buffer
 	ConfigData       = configData
@@ -31,6 +33,20 @@ type (
 	LineSenderConfig = lineSenderConfig
 	SenderType       = senderType
 )
+
+// QwpSfClassify exposes the internal status-byte → Category mapping
+// for cross-language regression tests in the questdb_test package.
+func QwpSfClassify(status QwpStatusCode) Category { return qwpSfClassify(status) }
+
+// QwpSfDefaultPolicyFor exposes the spec-default Category → Policy
+// mapping for unit tests.
+func QwpSfDefaultPolicyFor(c Category) Policy { return qwpSfDefaultPolicyFor(c) }
+
+// QwpSfIsTerminalCloseCode exposes the WS terminal close-code
+// classifier for unit tests.
+func QwpSfIsTerminalCloseCode(code websocket.StatusCode) bool {
+	return qwpSfIsTerminalCloseCode(code)
+}
 
 var (
 	GlobalTransport                     = globalTransport

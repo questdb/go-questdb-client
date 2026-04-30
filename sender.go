@@ -341,6 +341,14 @@ type lineSenderConfig struct {
 	closeFlushTimeoutSet          bool          // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
 	drainOrphans                  bool          // default false (Phase 6)
 	maxBackgroundDrainers         int           // 0 -> 4 (Phase 6)
+
+	// QWP server-error API (Phase 5). All fields are QWP-only.
+	errorHandler         SenderErrorHandler                       // nil -> default loud handler
+	errorPolicyResolver  func(Category) Policy                    // nil -> per-category map / global / spec defaults
+	errorPolicyPerCat    [numCategories]Policy                    // PolicyAuto = unset; cleared at construction
+	errorPolicyPerCatSet bool                                     // tracks whether *any* per-category override was set
+	errorPolicyGlobal    Policy                                   // PolicyAuto = unset
+	errorInboxCapacity   int                                      // 0 -> qwpSfDefaultErrorInboxCapacity; sanitizer floors at qwpSfMinErrorInboxCapacity
 }
 
 // LineSenderOption defines line sender config option.
@@ -388,6 +396,73 @@ func WithInFlightWindow(window int) LineSenderOption {
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.closeTimeout = d
+	}
+}
+
+// WithErrorHandler registers a callback invoked asynchronously when
+// the SF send loop observes a server-side batch rejection. The
+// handler runs on a dedicated dispatcher goroutine; slow handlers
+// cannot stall publishing. If the bounded inbox fills up, surplus
+// notifications are dropped (visible via
+// QwpSender.DroppedErrorNotifications()).
+//
+// Passing nil reverts to the default loud-not-silent handler that
+// logs ERROR for HALT and WARN for DROP.
+//
+// Only available for the QWP sender.
+func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.errorHandler = h
+	}
+}
+
+// WithErrorPolicy sets the Policy applied for one Category. Per-
+// category overrides take precedence over the connect-string global
+// on_server_error and the spec defaults; a programmatic resolver
+// registered via WithErrorPolicyResolver still wins over both.
+//
+// PolicyAuto removes any prior override (falls through to next
+// layer). CategoryProtocolViolation and CategoryUnknown are forced
+// HALT regardless of this setting.
+//
+// Only available for the QWP sender.
+func WithErrorPolicy(c Category, p Policy) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		if int(c) >= len(s.errorPolicyPerCat) {
+			return
+		}
+		s.errorPolicyPerCat[c] = p
+		if p != PolicyAuto {
+			s.errorPolicyPerCatSet = true
+		}
+	}
+}
+
+// WithErrorPolicyResolver registers a programmatic resolver invoked
+// for every Category before any per-category map or global default.
+// Returning PolicyAuto from the resolver falls through to the next
+// layer (per-category map, then global, then spec default).
+//
+// CategoryProtocolViolation and CategoryUnknown are forced HALT and
+// bypass the resolver entirely.
+//
+// Only available for the QWP sender.
+func WithErrorPolicyResolver(r func(Category) Policy) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.errorPolicyResolver = r
+	}
+}
+
+// WithErrorInboxCapacity sets the size of the bounded inbox between
+// the I/O goroutine and the dispatcher goroutine. Larger values
+// tolerate slower handlers at the cost of memory; smaller values
+// surface backpressure (drop counter) sooner. Defaults to 256;
+// minimum is 16 (sanitized at construction).
+//
+// Only available for the QWP sender.
+func WithErrorInboxCapacity(n int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.errorInboxCapacity = n
 	}
 }
 
@@ -923,6 +998,11 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	if conf.maxSchemasPerConnection != 0 {
 		return errors.New("maxSchemasPerConnection setting is not available in the TCP client")
 	}
+	if conf.errorHandler != nil || conf.errorPolicyResolver != nil ||
+		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
+		conf.errorInboxCapacity != 0 {
+		return errors.New("server-error API settings are only available in the QWP client")
+	}
 	if conf.tcpKey == "" && conf.tcpKeyId != "" {
 		return errors.New("tcpKey is empty and tcpKeyId is not. both (or none) must be provided")
 	}
@@ -989,6 +1069,13 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.maxBackgroundDrainers < 0 {
 		return fmt.Errorf("max_background_drainers must be >= 0: %d", conf.maxBackgroundDrainers)
 	}
+	// Server-error API knobs (Phase 5). User-supplied
+	// errorInboxCapacity must be ≥ qwpSfMinErrorInboxCapacity (16);
+	// 0 falls back to the default at construction.
+	if conf.errorInboxCapacity != 0 && conf.errorInboxCapacity < qwpSfMinErrorInboxCapacity {
+		return fmt.Errorf("error_inbox_capacity must be >= %d: %d",
+			qwpSfMinErrorInboxCapacity, conf.errorInboxCapacity)
+	}
 
 	return nil
 }
@@ -1008,6 +1095,11 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	}
 	if conf.maxSchemasPerConnection != 0 {
 		return errors.New("maxSchemasPerConnection setting is not available in the HTTP client")
+	}
+	if conf.errorHandler != nil || conf.errorPolicyResolver != nil ||
+		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
+		conf.errorInboxCapacity != 0 {
+		return errors.New("server-error API settings are only available in the QWP client")
 	}
 
 	return nil
@@ -1045,7 +1137,7 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		window = 1
 	}
 
-	s, err := newQwpLineSender(ctx, address, opts, conf.retryTimeout,
+	s, err := newQwpLineSenderUnstarted(ctx, address, opts, conf.retryTimeout,
 		conf.autoFlushRows, conf.autoFlushInterval, conf.dumpWriter, window)
 	if err != nil {
 		return nil, err
@@ -1060,10 +1152,21 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	s.encoder.gorillaDisabled = conf.gorillaDisabled
 	// Encoder buffer is pre-sized for the microbatch role: max(1 MB,
 	// 2 * autoFlushBytes). The 1 MB floor was already applied in
-	// newQwpLineSender; grow further if autoFlushBytes warrants it.
+	// newQwpLineSenderUnstarted; grow further if autoFlushBytes warrants it.
 	if conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
 		s.encoder.wb.preallocate(conf.autoFlushBytes * 2)
 	}
+	// Server-error API knobs (Phase 5). Apply BEFORE sendLoopStart so
+	// the very first received frame uses the user-configured handler
+	// and resolver, not the defaults.
+	resolver := &qwpSfPolicyResolver{
+		resolver: conf.errorPolicyResolver,
+		perCat:   conf.errorPolicyPerCat,
+		global:   conf.errorPolicyGlobal,
+	}
+	s.cursorSendLoop.sendLoopSetPolicyResolver(resolver)
+	s.cursorSendLoop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
+	s.cursorSendLoop.sendLoopStart()
 	return s, nil
 }
 

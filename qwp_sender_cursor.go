@@ -195,6 +195,16 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
 		reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+	// Wire the user-configured server-error API knobs (Phase 5)
+	// before sendLoopStart so they're visible from the receiver
+	// goroutine the moment it starts.
+	resolver := &qwpSfPolicyResolver{
+		resolver: conf.errorPolicyResolver,
+		perCat:   conf.errorPolicyPerCat,
+		global:   conf.errorPolicyGlobal,
+	}
+	loop.sendLoopSetPolicyResolver(resolver)
+	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
 	loop.sendLoopStart()
 
 	s, err := newQwpCursorLineSender(
@@ -610,4 +620,37 @@ func (s *qwpLineSender) AwaitAckedFsn(target int64, timeout time.Duration) (bool
 			return s.cursorEngine.engineAckedFsn() >= target, nil
 		}
 	}
+}
+
+// LastTerminalError implements QwpSender.LastTerminalError.
+func (s *qwpLineSender) LastTerminalError() *SenderError {
+	if s.cursorSendLoop == nil {
+		return nil
+	}
+	return s.cursorSendLoop.sendLoopLastTerminalServerError()
+}
+
+// TotalServerErrors implements QwpSender.TotalServerErrors.
+func (s *qwpLineSender) TotalServerErrors() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalServerErrors()
+}
+
+// DroppedErrorNotifications implements QwpSender.DroppedErrorNotifications.
+func (s *qwpLineSender) DroppedErrorNotifications() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopDispatcher().droppedNotifications()
+}
+
+// TotalErrorNotificationsDelivered implements
+// QwpSender.TotalErrorNotificationsDelivered.
+func (s *qwpLineSender) TotalErrorNotificationsDelivered() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopDispatcher().totalDelivered()
 }

@@ -27,21 +27,23 @@ package questdb
 import "fmt"
 
 // qwpStatusName returns a human-readable name for a QWP status code.
-func qwpStatusName(status qwpStatusCode) string {
+// Used by (*SenderError).Error() to format the wire-byte component of
+// rejection messages.
+func qwpStatusName(status QwpStatusCode) string {
 	switch status {
-	case qwpStatusOK:
+	case QwpStatusOK:
 		return "OK"
-	case qwpStatusDurableAck:
+	case QwpStatusDurableAck:
 		return "DURABLE_ACK"
-	case qwpStatusSchemaMismatch:
+	case QwpStatusSchemaMismatch:
 		return "SCHEMA_MISMATCH"
-	case qwpStatusParseError:
+	case QwpStatusParseError:
 		return "PARSE_ERROR"
-	case qwpStatusInternalError:
+	case QwpStatusInternalError:
 		return "INTERNAL_ERROR"
-	case qwpStatusSecurityError:
+	case QwpStatusSecurityError:
 		return "SECURITY_ERROR"
-	case qwpStatusWriteError:
+	case QwpStatusWriteError:
 		return "WRITE_ERROR"
 	case qwpStatusCancelled:
 		return "CANCELLED"
@@ -52,45 +54,17 @@ func qwpStatusName(status qwpStatusCode) string {
 	}
 }
 
-// QwpError represents an error returned by the QuestDB server in
-// a QWP ACK response. It contains the status code, the
-// sequence number from the response, and an optional error message.
-type QwpError struct {
-	// Status is the status code from the ACK response.
-	Status qwpStatusCode
-
-	// Sequence is the cumulative sequence number from the ACK, used
-	// to correlate responses with requests in async mode.
-	Sequence int64
-
-	// Message is the server's error description, or empty if
-	// no error message was included in the response.
-	Message string
-}
-
-// Error implements the error interface.
-func (e *QwpError) Error() string {
-	name := qwpStatusName(e.Status)
-	if e.Message != "" {
-		return fmt.Sprintf("qwp: server error %s (0x%02X): %s", name, byte(e.Status), e.Message)
-	}
-	return fmt.Sprintf("qwp: server error %s (0x%02X)", name, byte(e.Status))
-}
-
-// newQwpErrorFromAck creates a QwpError from a raw ACK payload.
-// Returns nil if the status is OK or DURABLE_ACK (success / progress
-// frames carry no error).
+// parseAckErrorPayload extracts the status code, cumulative sequence
+// number, and server error message from a non-OK ACK frame. Used by
+// the SF send loop's receiver to assemble a *SenderError with the
+// surrounding FSN-span context.
 //
 // Precondition: data has already been validated by readAck, which
 // guarantees the layout invariants documented on readAck.
-func newQwpErrorFromAck(data []byte) *QwpError {
-	status := qwpStatusCode(data[0])
-	if status == qwpStatusOK || status == qwpStatusDurableAck {
-		return nil
+func parseAckErrorPayload(data []byte) (status QwpStatusCode, seq int64, msg string) {
+	status = QwpStatusCode(data[0])
+	if status == QwpStatusOK || status == QwpStatusDurableAck {
+		return status, 0, ""
 	}
-	return &QwpError{
-		Status:   status,
-		Sequence: parseAckSequence(data),
-		Message:  parseAckError(data),
-	}
+	return status, parseAckSequence(data), parseAckError(data)
 }

@@ -357,12 +357,95 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative int", k, v)
 			}
 			senderConf.maxBackgroundDrainers = parsedVal
+		case "on_server_error":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			pol, err := parseErrorPolicyValue(k, v, true)
+			if err != nil {
+				return nil, err
+			}
+			senderConf.errorPolicyGlobal = pol
+		case "on_schema_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategorySchemaMismatch); err != nil {
+				return nil, err
+			}
+		case "on_parse_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategoryParseError); err != nil {
+				return nil, err
+			}
+		case "on_internal_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategoryInternalError); err != nil {
+				return nil, err
+			}
+		case "on_security_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategorySecurityError); err != nil {
+				return nil, err
+			}
+		case "on_write_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategoryWriteError); err != nil {
+				return nil, err
+			}
+		case "error_inbox_capacity":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			if parsedVal < qwpSfMinErrorInboxCapacity {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %d: must be >= %d",
+					k, parsedVal, qwpSfMinErrorInboxCapacity)
+			}
+			senderConf.errorInboxCapacity = parsedVal
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}
 	}
 
 	return senderConf, nil
+}
+
+// parseErrorPolicyValue parses a connect-string Policy value. When
+// allowAuto is true, "auto" is accepted (used by the global
+// on_server_error key whose default semantic is "use the per-category
+// table"); per-category keys reject "auto" because the sentinel is
+// only meaningful at the global layer.
+func parseErrorPolicyValue(k, v string, allowAuto bool) (Policy, error) {
+	switch v {
+	case "halt":
+		return PolicyHalt, nil
+	case "drop":
+		return PolicyDropAndContinue, nil
+	case "auto":
+		if allowAuto {
+			return PolicyAuto, nil
+		}
+	}
+	if allowAuto {
+		return PolicyAuto, NewInvalidConfigStrError(
+			"invalid %s value, %q is not 'auto' / 'halt' / 'drop'", k, v)
+	}
+	return PolicyAuto, NewInvalidConfigStrError(
+		"invalid %s value, %q is not 'halt' / 'drop'", k, v)
+}
+
+// setPerCategoryPolicy parses v as a Policy and stores it on the
+// per-category override slot for c, gating to QWP and setting the
+// per-category-set flag for sanitizer routing.
+func setPerCategoryPolicy(conf *lineSenderConfig, k, v string, c Category) error {
+	if conf.senderType != qwpSenderType {
+		return NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+	}
+	pol, err := parseErrorPolicyValue(k, v, false)
+	if err != nil {
+		return err
+	}
+	conf.errorPolicyPerCat[c] = pol
+	conf.errorPolicyPerCatSet = true
+	return nil
 }
 
 // validateSenderId enforces the same character set the Java client

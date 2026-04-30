@@ -179,7 +179,9 @@ func TestQwpCursorSenderCloseDrainTimeoutReturnsError(t *testing.T) {
 }
 
 func TestQwpCursorSenderFlushAfterTerminalError(t *testing.T) {
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: qwpStatusSchemaMismatch})
+	// ParseError defaults to Halt; SchemaMismatch is now Drop and
+	// would not produce a terminal error.
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusParseError})
 	defer srv.Close()
 
 	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 0)

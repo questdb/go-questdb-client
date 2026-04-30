@@ -350,7 +350,7 @@ func (t *qwpTransport) sendMessage(ctx context.Context, data []byte) error {
 //
 // Each table entry is [nameLen: uint16 LE] [name (nameLen bytes UTF-8)]
 // [seqTxn: int64 LE]. nameLen must be > 0 — empty names are rejected.
-func (t *qwpTransport) readAck(ctx context.Context) (qwpStatusCode, []byte, error) {
+func (t *qwpTransport) readAck(ctx context.Context) (QwpStatusCode, []byte, error) {
 	if t.conn == nil {
 		return 0, nil, fmt.Errorf("qwp: not connected")
 	}
@@ -374,9 +374,9 @@ func (t *qwpTransport) readAck(ctx context.Context) (qwpStatusCode, []byte, erro
 		return 0, nil, fmt.Errorf("qwp: ack too short: %d bytes", len(data))
 	}
 
-	statusCode := qwpStatusCode(data[0])
+	statusCode := QwpStatusCode(data[0])
 	switch statusCode {
-	case qwpStatusOK:
+	case QwpStatusOK:
 		if len(data) < qwpAckOKMinSize {
 			return 0, nil, fmt.Errorf("qwp: malformed OK ack: got %d bytes, want at least %d", len(data), qwpAckOKMinSize)
 		}
@@ -384,7 +384,7 @@ func (t *qwpTransport) readAck(ctx context.Context) (qwpStatusCode, []byte, erro
 			return 0, nil, fmt.Errorf("qwp: malformed OK ack: %w", err)
 		}
 		return statusCode, data, nil
-	case qwpStatusDurableAck:
+	case QwpStatusDurableAck:
 		if len(data) < qwpAckDurableMinSize {
 			return 0, nil, fmt.Errorf("qwp: malformed durable ack: got %d bytes, want at least %d", len(data), qwpAckDurableMinSize)
 		}
@@ -585,32 +585,3 @@ func qwpFakeServer(conn net.Conn) {
 	}
 }
 
-// sendAndAck sends a QWP message and reads ACK frames until a
-// terminal one (OK or error) arrives. Returns nil on OK, a *QwpError
-// for server-side rejections, or a transport error on connection
-// failure. DURABLE_ACK frames may arrive interleaved when the server
-// has primary replication enabled and the connection opted in; they
-// carry per-table fsync progress and don't conclude the request, so
-// we drop them and keep reading.
-//
-// No retry: the spec defines no retriable status, so any non-OK
-// terminal response is terminal.
-func (t *qwpTransport) sendAndAck(ctx context.Context, sendFn func() []byte) error {
-	msg := sendFn()
-	if err := t.sendMessage(ctx, msg); err != nil {
-		return err
-	}
-	for {
-		status, data, err := t.readAck(ctx)
-		if err != nil {
-			return err
-		}
-		if status == qwpStatusDurableAck {
-			continue
-		}
-		if qErr := newQwpErrorFromAck(data); qErr != nil {
-			return qErr
-		}
-		return nil
-	}
-}

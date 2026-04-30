@@ -1448,10 +1448,12 @@ func TestQwpSenderServerError(t *testing.T) {
 			if err != nil {
 				return
 			}
-			// Return WRITE_ERROR.
-			errMsg := "table error"
+			// Return PARSE_ERROR (default Halt). WRITE_ERROR is now
+			// default Drop and would not surface a terminal Flush
+			// error.
+			errMsg := "bad message"
 			ack := make([]byte, 11+len(errMsg))
-			ack[0] = byte(qwpStatusWriteError)
+			ack[0] = byte(QwpStatusParseError)
 			binary.LittleEndian.PutUint16(ack[9:11], uint16(len(errMsg)))
 			copy(ack[11:], errMsg)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
@@ -1472,12 +1474,13 @@ func TestQwpSenderServerError(t *testing.T) {
 		t.Fatal("expected error from server")
 	}
 
-	var qErr *QwpError
-	if !errors.As(err, &qErr) {
-		t.Fatalf("expected *QwpError in chain, got %T: %v", err, err)
+	var senderErr *SenderError
+	if !errors.As(err, &senderErr) {
+		t.Fatalf("expected *SenderError in chain, got %T: %v", err, err)
 	}
-	if qErr.Status != qwpStatusWriteError {
-		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusWriteError)
+	if senderErr.ServerStatusByte != int(QwpStatusParseError) {
+		t.Fatalf("status = 0x%02X, want 0x%02X",
+			senderErr.ServerStatusByte, byte(QwpStatusParseError))
 	}
 }
 
@@ -1881,12 +1884,14 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 		}
 		defer conn.CloseNow()
 
-		// Read the first message, then return a WRITE_ERROR.
+		// Read the first message, then return a PARSE_ERROR
+		// (default Halt). WRITE_ERROR is now default Drop and would
+		// not poison the sender.
 		_, _, err = conn.Read(context.Background())
 		if err != nil {
 			return
 		}
-		ack := buildAckError(qwpStatusWriteError, 0, "write failed")
+		ack := buildAckError(QwpStatusParseError, 0, "bad message")
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
 	}))
 	defer srv.Close()

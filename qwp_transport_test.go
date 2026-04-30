@@ -46,7 +46,7 @@ import (
 // sequence + tableCount=0, no per-table entries).
 func buildAckOK(seq int64) []byte {
 	data := make([]byte, qwpAckOKMinSize)
-	data[0] = byte(qwpStatusOK)
+	data[0] = byte(QwpStatusOK)
 	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
 	binary.LittleEndian.PutUint16(data[9:11], 0)
 	return data
@@ -61,7 +61,7 @@ func buildAckOKWithTables(seq int64, entries ...struct {
 }) []byte {
 	tail := encodeAckTableEntries(entries)
 	data := make([]byte, 11+len(tail))
-	data[0] = byte(qwpStatusOK)
+	data[0] = byte(QwpStatusOK)
 	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
 	binary.LittleEndian.PutUint16(data[9:11], uint16(len(entries)))
 	copy(data[11:], tail)
@@ -76,7 +76,7 @@ func buildAckDurable(entries ...struct {
 }) []byte {
 	tail := encodeAckTableEntries(entries)
 	data := make([]byte, 3+len(tail))
-	data[0] = byte(qwpStatusDurableAck)
+	data[0] = byte(QwpStatusDurableAck)
 	binary.LittleEndian.PutUint16(data[1:3], uint16(len(entries)))
 	copy(data[3:], tail)
 	return data
@@ -107,7 +107,7 @@ func encodeAckTableEntries(entries []struct {
 }
 
 // buildAckError builds an error ACK response with message.
-func buildAckError(status qwpStatusCode, seq int64, errMsg string) []byte {
+func buildAckError(status QwpStatusCode, seq int64, errMsg string) []byte {
 	data := make([]byte, 11+len(errMsg))
 	data[0] = byte(status)
 	binary.LittleEndian.PutUint64(data[1:9], uint64(seq))
@@ -123,7 +123,7 @@ func buildAckError(status qwpStatusCode, seq int64, errMsg string) []byte {
 func TestQwpParseAckError(t *testing.T) {
 	t.Run("ErrorWithMessage", func(t *testing.T) {
 		errMsg := "bad data"
-		data := buildAckError(qwpStatusParseError, 1, errMsg)
+		data := buildAckError(QwpStatusParseError, 1, errMsg)
 
 		msg := parseAckError(data)
 		if msg != errMsg {
@@ -132,7 +132,7 @@ func TestQwpParseAckError(t *testing.T) {
 	})
 
 	t.Run("EmptyErrorMessage", func(t *testing.T) {
-		data := buildAckError(qwpStatusInternalError, 2, "")
+		data := buildAckError(QwpStatusInternalError, 2, "")
 		msg := parseAckError(data)
 		if msg != "" {
 			t.Fatalf("expected empty, got %q", msg)
@@ -140,12 +140,12 @@ func TestQwpParseAckError(t *testing.T) {
 	})
 
 	t.Run("AllStatusCodes", func(t *testing.T) {
-		codes := []qwpStatusCode{
-			qwpStatusSchemaMismatch,
-			qwpStatusParseError,
-			qwpStatusInternalError,
-			qwpStatusSecurityError,
-			qwpStatusWriteError,
+		codes := []QwpStatusCode{
+			QwpStatusSchemaMismatch,
+			QwpStatusParseError,
+			QwpStatusInternalError,
+			QwpStatusSecurityError,
+			QwpStatusWriteError,
 		}
 		for _, code := range codes {
 			errMsg := "error for status"
@@ -168,7 +168,7 @@ func TestQwpParseAckSequence(t *testing.T) {
 	}
 
 	// Error response should also have sequence.
-	dataErr := buildAckError(qwpStatusParseError, 99, "err")
+	dataErr := buildAckError(QwpStatusParseError, 99, "err")
 	seq = parseAckSequence(dataErr)
 	if seq != 99 {
 		t.Fatalf("sequence = %d, want 99", seq)
@@ -613,7 +613,7 @@ func TestQwpTransportSendAndReceive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readAck: %v", err)
 	}
-	if status != qwpStatusOK {
+	if status != QwpStatusOK {
 		t.Fatalf("status = 0x%02X, want 0x00 (OK)", status)
 	}
 }
@@ -624,7 +624,7 @@ func TestQwpTransportAckWithError(t *testing.T) {
 		// Read message, reply with error ACK.
 		conn.Read(context.Background())
 
-		ack := buildAckError(qwpStatusWriteError, 1, errMsg)
+		ack := buildAckError(QwpStatusWriteError, 1, errMsg)
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
 	})
 	defer srv.Close()
@@ -646,63 +646,13 @@ func TestQwpTransportAckWithError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readAck: %v", err)
 	}
-	if status != qwpStatusWriteError {
+	if status != QwpStatusWriteError {
 		t.Fatalf("status = 0x%02X, want 0x09", status)
 	}
 
 	msg := parseAckError(data)
 	if msg != errMsg {
 		t.Fatalf("error message = %q, want %q", msg, errMsg)
-	}
-}
-
-// --- sendAndAck tests ---
-
-func TestQwpTransportSendAndAckSuccess(t *testing.T) {
-	srv := newTestWSServer(t, func(conn *websocket.Conn) {
-		conn.Read(context.Background())
-		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
-	})
-	defer srv.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
-		t.Fatal(err)
-	}
-	defer tr.close()
-
-	msg := []byte{0x51, 0x57, 0x50, 0x31} // dummy
-	if err := tr.sendAndAck(context.Background(), func() []byte { return msg }); err != nil {
-		t.Fatalf("sendAndAck: %v", err)
-	}
-}
-
-func TestQwpTransportSendAndAckServerError(t *testing.T) {
-	srv := newTestWSServer(t, func(conn *websocket.Conn) {
-		conn.Read(context.Background())
-		ack := buildAckError(qwpStatusParseError, 0, "bad message")
-		conn.Write(context.Background(), websocket.MessageBinary, ack)
-	})
-	defer srv.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	var tr qwpTransport
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
-		t.Fatal(err)
-	}
-	defer tr.close()
-
-	err := tr.sendAndAck(context.Background(), func() []byte { return []byte{0x00} })
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	qErr, ok := err.(*QwpError)
-	if !ok {
-		t.Fatalf("expected *QwpError, got %T", err)
-	}
-	if qErr.Status != qwpStatusParseError {
-		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusParseError)
 	}
 }
 
@@ -747,7 +697,7 @@ func TestReadAckRejectsErrorLengthMismatch(t *testing.T) {
 		conn.Read(context.Background())
 		// Build an error ACK claiming msg_len=10 but carrying only 5 msg bytes.
 		ack := make([]byte, 16)
-		ack[0] = byte(qwpStatusWriteError)
+		ack[0] = byte(QwpStatusWriteError)
 		binary.LittleEndian.PutUint64(ack[1:9], 0)
 		binary.LittleEndian.PutUint16(ack[9:11], 10)
 		copy(ack[11:], "short") // only 5 bytes, not 10
@@ -803,7 +753,7 @@ func TestReadAckSkipsTextFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readAck: %v", err)
 	}
-	if status != qwpStatusOK {
+	if status != QwpStatusOK {
 		t.Fatalf("status = 0x%02X, want OK", status)
 	}
 	if seq := parseAckSequence(data); seq != 7 {
@@ -962,7 +912,7 @@ func TestReadAckOKWithTableEntries(t *testing.T) {
 	require.NoError(t, tr.sendMessage(context.Background(), []byte{0x00}))
 	status, data, err := tr.readAck(context.Background())
 	require.NoError(t, err)
-	if status != qwpStatusOK {
+	if status != QwpStatusOK {
 		t.Fatalf("status = 0x%02X, want OK", status)
 	}
 	if seq := parseAckSequence(data); seq != 7 {
@@ -981,8 +931,8 @@ func TestReadAckDurableAck(t *testing.T) {
 				name   string
 				seqTxn int64
 			}{"durable_table", 42}))
-		// Followed by a normal OK terminator so sendAndAck has
-		// something to return.
+		// Followed by a normal OK terminator so the test has something
+		// to return after the durable-ack tail.
 		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
 	})
 	defer srv.Close()
@@ -995,40 +945,9 @@ func TestReadAckDurableAck(t *testing.T) {
 	require.NoError(t, tr.sendMessage(context.Background(), []byte{0x00}))
 	status, _, err := tr.readAck(context.Background())
 	require.NoError(t, err)
-	if status != qwpStatusDurableAck {
+	if status != QwpStatusDurableAck {
 		t.Fatalf("status = 0x%02X, want DURABLE_ACK", status)
 	}
-}
-
-// TestSendAndAckSkipsDurableAck verifies that sendAndAck reads past
-// any DURABLE_ACK frames (per-table fsync progress) and only resolves
-// when an OK or error frame arrives.
-func TestSendAndAckSkipsDurableAck(t *testing.T) {
-	srv := newTestWSServer(t, func(conn *websocket.Conn) {
-		conn.Read(context.Background())
-		// Send two DURABLE_ACKs followed by an OK. sendAndAck must
-		// keep reading and resolve on the OK.
-		conn.Write(context.Background(), websocket.MessageBinary,
-			buildAckDurable(struct {
-				name   string
-				seqTxn int64
-			}{"t1", 1}))
-		conn.Write(context.Background(), websocket.MessageBinary,
-			buildAckDurable(struct {
-				name   string
-				seqTxn int64
-			}{"t2", 2}))
-		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
-	})
-	defer srv.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	var tr qwpTransport
-	require.NoError(t, tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}))
-	defer tr.close()
-
-	err := tr.sendAndAck(context.Background(), func() []byte { return []byte{0x00} })
-	require.NoError(t, err)
 }
 
 // TestReadAckRejectsTruncatedTableEntry confirms that an OK frame
@@ -1039,7 +958,7 @@ func TestReadAckRejectsTruncatedTableEntry(t *testing.T) {
 		conn.Read(context.Background())
 		// Build an OK frame with tableCount=1 but no entry bytes.
 		ack := make([]byte, 11)
-		ack[0] = byte(qwpStatusOK)
+		ack[0] = byte(QwpStatusOK)
 		binary.LittleEndian.PutUint64(ack[1:9], 0)
 		binary.LittleEndian.PutUint16(ack[9:11], 1) // claims 1 entry
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
@@ -1070,7 +989,7 @@ func TestReadAckRejectsEmptyTableName(t *testing.T) {
 		// OK frame with one entry: nameLen=0, seqTxn=0. The validator
 		// must reject this even though the byte count adds up.
 		ack := make([]byte, 11+2+8)
-		ack[0] = byte(qwpStatusOK)
+		ack[0] = byte(QwpStatusOK)
 		binary.LittleEndian.PutUint64(ack[1:9], 0)
 		binary.LittleEndian.PutUint16(ack[9:11], 1)
 		binary.LittleEndian.PutUint16(ack[11:13], 0) // nameLen=0

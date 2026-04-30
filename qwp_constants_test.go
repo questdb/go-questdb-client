@@ -42,17 +42,17 @@ func TestQwpMagicBytesValue(t *testing.T) {
 
 func TestQwpStatusCodes(t *testing.T) {
 	// ACK status codes the server emits. These must match the Java
-	// reference so QwpError classification stays correct.
+	// reference so SenderError classification stays correct.
 	cases := []struct {
-		code qwpStatusCode
+		code QwpStatusCode
 		want byte
 	}{
-		{qwpStatusOK, 0x00},
-		{qwpStatusSchemaMismatch, 0x03},
-		{qwpStatusParseError, 0x05},
-		{qwpStatusInternalError, 0x06},
-		{qwpStatusSecurityError, 0x08},
-		{qwpStatusWriteError, 0x09},
+		{QwpStatusOK, 0x00},
+		{QwpStatusSchemaMismatch, 0x03},
+		{QwpStatusParseError, 0x05},
+		{QwpStatusInternalError, 0x06},
+		{QwpStatusSecurityError, 0x08},
+		{QwpStatusWriteError, 0x09},
 		{qwpStatusCancelled, 0x0A},
 		{qwpStatusLimitExceeded, 0x0B},
 	}

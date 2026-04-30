@@ -180,20 +180,23 @@ const (
 	qwpSchemaModeReference qwpSchemaMode = 0x01 // reference a schema already registered by ID
 )
 
-// qwpStatusCode represents a server response status.
-type qwpStatusCode byte
+// QwpStatusCode represents a server response status. The byte value is
+// stable on the QWP wire and is preserved on SenderError.ServerStatusByte
+// for cross-language debugging; the recommended way to discriminate
+// rejections is the higher-level Category enum.
+type QwpStatusCode byte
 
 const (
-	qwpStatusOK             qwpStatusCode = 0x00 // batch accepted
-	qwpStatusDurableAck     qwpStatusCode = 0x02 // per-table durable-upload ACK (replication primaries opted-in)
-	qwpStatusSchemaMismatch qwpStatusCode = 0x03 // column type incompatible with existing table
-	qwpStatusParseError     qwpStatusCode = 0x05 // malformed message
-	qwpStatusInternalError  qwpStatusCode = 0x06 // server-side error
-	qwpStatusSecurityError  qwpStatusCode = 0x08 // authorization failure
-	qwpStatusWriteError     qwpStatusCode = 0x09 // write failure (e.g., table not accepting writes)
+	QwpStatusOK             QwpStatusCode = 0x00 // batch accepted
+	QwpStatusDurableAck     QwpStatusCode = 0x02 // per-table durable-upload ACK (replication primaries opted-in)
+	QwpStatusSchemaMismatch QwpStatusCode = 0x03 // column type incompatible with existing table
+	QwpStatusParseError     QwpStatusCode = 0x05 // malformed message
+	QwpStatusInternalError  QwpStatusCode = 0x06 // server-side error
+	QwpStatusSecurityError  QwpStatusCode = 0x08 // authorization failure
+	QwpStatusWriteError     QwpStatusCode = 0x09 // write failure (e.g., table not accepting writes)
 	// Egress-specific status codes (spec §15).
-	qwpStatusCancelled     qwpStatusCode = 0x0A // query terminated in response to CANCEL
-	qwpStatusLimitExceeded qwpStatusCode = 0x0B // a protocol limit was hit
+	qwpStatusCancelled     QwpStatusCode = 0x0A // query terminated in response to CANCEL
+	qwpStatusLimitExceeded QwpStatusCode = 0x0B // a protocol limit was hit
 )
 
 // QWP sender defaults and limits.

@@ -34,6 +34,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // qwpSf send-loop tunables. Defaults match the Java
@@ -99,6 +101,18 @@ type qwpSfSendLoop struct {
 	reconnectInitialBackoff time.Duration
 	reconnectMaxBackoff     time.Duration
 
+	// policyResolver chooses Halt vs DropAndContinue per Category.
+	// Non-nil; defaults are baked in via qwpSfDefaultPolicyFor.
+	// Atomic pointer because setters can run concurrently with the
+	// receiver goroutine that reads it on every classified rejection.
+	policyResolver atomic.Pointer[qwpSfPolicyResolver]
+
+	// dispatcher delivers SenderError payloads asynchronously to the
+	// user-supplied SenderErrorHandler. Non-nil; uses the default
+	// loud-not-silent handler if the user did not configure one.
+	// Atomic pointer for the same reason as policyResolver.
+	dispatcher atomic.Pointer[qwpSfErrorDispatcher]
+
 	// fsnAtZero is the FSN that wireSeq=0 maps to on the current
 	// connection. After a reconnect it's set to engine.ackedFsn()+1
 	// so server-side ACK math stays aligned with the disk state.
@@ -140,9 +154,18 @@ type qwpSfSendLoop struct {
 	// the producer can sample it from any goroutine.
 	lastError atomic.Pointer[error]
 
+	// lastTerminalServerError is the typed-payload sibling to
+	// lastError. Set when recordFatalServerError is called with a
+	// fully-populated *SenderError (server-rejection path, WS
+	// terminal close, auth-terminal upgrade, reconnect-budget
+	// exhaustion). Independent of lastError so QwpSender accessors
+	// can return the typed payload without an errors.As walk.
+	lastTerminalServerError atomic.Pointer[SenderError]
+
 	// Counters.
 	totalFramesSent        atomic.Int64
 	totalAcks              atomic.Int64
+	totalServerErrors      atomic.Int64
 	totalReconnects        atomic.Int64
 	totalReconnectAttempts atomic.Int64
 	totalFramesReplayed    atomic.Int64
@@ -198,8 +221,51 @@ func qwpSfNewSendLoop(
 		done:                    make(chan struct{}),
 		replayTargetFsn:         -1,
 	}
+	l.policyResolver.Store(&qwpSfPolicyResolver{})
+	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
 	l.transport.Store(transport)
 	return l
+}
+
+// sendLoopSetPolicyResolver replaces the policy resolver used to map
+// Categories to Policies. Safe to call any time — the resolver is
+// stored atomically and the receiver goroutine picks up the new value
+// on its next classified rejection. Pass nil to fall back to spec
+// defaults.
+func (l *qwpSfSendLoop) sendLoopSetPolicyResolver(r *qwpSfPolicyResolver) {
+	if r == nil {
+		r = &qwpSfPolicyResolver{}
+	}
+	l.policyResolver.Store(r)
+}
+
+// sendLoopSetErrorHandler replaces the user-supplied SenderErrorHandler
+// and the dispatcher's inbox capacity. Safe to call any time — the
+// dispatcher is swapped atomically and the previous one is closed
+// (its in-flight goroutine drains briefly, then exits). Passing
+// handler=nil reverts to the default loud-not-silent handler;
+// capacity ≤ 0 keeps the default capacity.
+//
+// Note: any notifications still queued on the previous dispatcher at
+// swap time are subject to its drain timeout — extremely fast swap +
+// flood scenarios may lose a notification, matching offer's
+// best-effort contract.
+func (l *qwpSfSendLoop) sendLoopSetErrorHandler(handler SenderErrorHandler, capacity int) {
+	if capacity <= 0 {
+		capacity = qwpSfDefaultErrorInboxCapacity
+	}
+	old := l.dispatcher.Swap(newQwpSfErrorDispatcher(handler, capacity))
+	if old != nil {
+		old.close()
+	}
+}
+
+// sendLoopDispatcher exposes the dispatcher for counter accessors on
+// the QwpSender public surface. Safe to call concurrently with
+// sendLoopSetErrorHandler — returns whatever dispatcher is current
+// at the moment of call.
+func (l *qwpSfSendLoop) sendLoopDispatcher() *qwpSfErrorDispatcher {
+	return l.dispatcher.Load()
 }
 
 // sendLoopStart launches the I/O goroutine. Idempotent — a second
@@ -224,6 +290,9 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 	if t := l.transport.Swap(nil); t != nil {
 		_ = t.close(context.Background())
 	}
+	if d := l.dispatcher.Load(); d != nil {
+		d.close()
+	}
 	return l.checkErrorOrNil()
 }
 
@@ -247,6 +316,36 @@ func (l *qwpSfSendLoop) recordFatal(err error) {
 	}
 	l.lastError.CompareAndSwap(nil, &err)
 	l.running.Store(false)
+}
+
+// recordFatalServerError latches a typed *SenderError as the terminal
+// error. It populates both lastError (so producer-side errors.As
+// continues to work) and lastTerminalServerError (so the QwpSender
+// accessor can return the typed payload directly without an unwrap
+// walk). Idempotent — only the first failure wins, matching
+// recordFatal's semantics.
+func (l *qwpSfSendLoop) recordFatalServerError(se *SenderError) {
+	if se == nil {
+		return
+	}
+	var err error = se
+	l.lastError.CompareAndSwap(nil, &err)
+	l.lastTerminalServerError.CompareAndSwap(nil, se)
+	l.running.Store(false)
+}
+
+// sendLoopLastTerminalServerError returns the typed *SenderError the
+// I/O goroutine latched as terminal, or nil if either no terminal
+// error has occurred or the terminal error has no typed payload
+// (legacy recordFatal path used for transport-only failures).
+func (l *qwpSfSendLoop) sendLoopLastTerminalServerError() *SenderError {
+	return l.lastTerminalServerError.Load()
+}
+
+// sendLoopTotalServerErrors returns the cumulative count of
+// SenderError payloads built by the loop (DROP and HALT combined).
+func (l *qwpSfSendLoop) sendLoopTotalServerErrors() int64 {
+	return l.totalServerErrors.Load()
 }
 
 // sendLoopFsnAtZero returns the FSN that wireSeq=0 maps to on the
@@ -337,12 +436,37 @@ func (l *qwpSfSendLoop) run() {
 		if err == nil {
 			return
 		}
+		// Already-terminal SenderErrors come back here from
+		// receiverLoop's classify branch — route them through
+		// recordFatalServerError (idempotent) so the typed payload is
+		// preserved end-to-end.
+		var alreadyTyped *SenderError
+		if errors.As(err, &alreadyTyped) {
+			l.recordFatalServerError(alreadyTyped)
+			return
+		}
+		// WebSocket close-frame violations (PROTOCOL_ERROR 1002,
+		// UNSUPPORTED_DATA 1003, MESSAGE_TOO_BIG 1009, etc.) come up
+		// from either inner goroutine via runOneConnection's first-
+		// error aggregation. They map to ProtocolViolation+Halt; do
+		// not retry — replaying the same bytes will produce the same
+		// close frame.
+		if code := websocket.CloseStatus(err); qwpSfIsTerminalCloseCode(code) {
+			se := l.qwpSfBuildProtocolViolationSE(code, err.Error())
+			l.totalServerErrors.Add(1)
+			l.dispatcher.Load().offer(se)
+			l.recordFatalServerError(se)
+			return
+		}
 		if l.reconnectFactory == nil {
 			l.recordFatal(err)
 			return
 		}
 		if qwpSfIsTerminalUpgradeError(err) {
-			l.recordFatal(fmt.Errorf("qwp/sf: WebSocket upgrade failed (won't retry): %w", err))
+			se := l.qwpSfBuildUpgradeFailureSE(err)
+			l.totalServerErrors.Add(1)
+			l.dispatcher.Load().offer(se)
+			l.recordFatalServerError(se)
 			return
 		}
 		// Detect "server up, accepts the WS upgrade, but doesn't speak
@@ -364,11 +488,15 @@ func (l *qwpSfSendLoop) run() {
 			// client's branch, even if both sides declared the same
 			// X-QWP-Version). Fail terminally to avoid hammering the
 			// server with thousands of dial attempts per second.
-			l.recordFatal(fmt.Errorf(
-				"qwp/sf: server accepted the WebSocket upgrade but disconnected "+
+			reason := fmt.Sprintf(
+				"server accepted the WebSocket upgrade but disconnected "+
 					"without ACKing any of the %d frame(s) we sent — server is "+
-					"likely running an incompatible build (won't retry): %w",
-				l.framesSentOnConn.Load(), err))
+					"likely running an incompatible build (won't retry): %s",
+				l.framesSentOnConn.Load(), err.Error())
+			se := l.qwpSfBuildBudgetExhaustedSE(reason)
+			l.totalServerErrors.Add(1)
+			l.dispatcher.Load().offer(se)
+			l.recordFatalServerError(se)
 			return
 		}
 		// Reconnect with backoff.
@@ -567,7 +695,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			}
 			return err
 		}
-		if status == qwpStatusDurableAck {
+		if status == QwpStatusDurableAck {
 			// Per-table fsync confirmation. Cursor SF doesn't
 			// currently surface durable-ack progress to the
 			// producer, but receiving one is not an error — match
@@ -575,30 +703,58 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			continue
 		}
 		seq := parseAckSequence(data)
-		if status != qwpStatusOK {
-			// Application-layer rejection by the server. The bytes
-			// on disk are the bytes the server rejected — reconnecting
-			// and replaying them cannot fix the rejection. Mark the
-			// loop terminal directly so the next user-thread API call
-			// surfaces it. recordFatal stops the running flag.
+		if status != QwpStatusOK {
+			// Application-layer rejection by the server. Classify the
+			// status byte, resolve the policy, surface a typed
+			// SenderError. Halt latches and exits the receiver loop;
+			// DropAndContinue advances ackedFsn past the rejected
+			// span and keeps draining (the bytes on disk are the
+			// bytes the server rejected — reconnect/replay cannot
+			// fix them; only dropping moves us past them).
 			//
-			// Same sanity clamp as the success branch below: don't
-			// trust a rejection wireSeq beyond what we've actually
-			// sent. Java's handleServerRejection clamps for the same
-			// reason on the DROP path (which advances ackedFsn); on
-			// our terminal-only path we clamp for log clarity so the
-			// surfaced error reports a sequence the producer can
-			// correlate to a real frame.
+			// Sanity clamp: do not trust a rejection wireSeq beyond
+			// what we have actually sent. Without this clamp the DROP
+			// path can advance ackedFsn past publishedFsn, which makes
+			// the segment manager trim sealed segments the I/O thread
+			// is still reading. Mirrors handleServerRejection in the
+			// Java client.
 			highestSent := l.nextWireSeq.Load() - 1
-			if highestSent >= 0 && seq > highestSent {
-				seq = highestSent
+			cappedSeq := seq
+			if highestSent < 0 {
+				cappedSeq = 0
+			} else if cappedSeq > highestSent {
+				cappedSeq = highestSent
 			}
-			qErr := newQwpErrorFromAck(data)
-			if qErr == nil {
-				qErr = &QwpError{Status: status, Sequence: seq, Message: "unknown error"}
+			_, _, msg := parseAckErrorPayload(data)
+			fsn := l.fsnAtZero.Load() + cappedSeq
+			cat := qwpSfClassify(status)
+			pol := l.policyResolver.Load().resolve(cat)
+			se := &SenderError{
+				Category:         cat,
+				AppliedPolicy:    pol,
+				ServerStatusByte: int(status),
+				ServerMessage:    msg,
+				MessageSequence:  cappedSeq,
+				FromFsn:          fsn,
+				ToFsn:            fsn,
+				DetectedAt:       time.Now(),
 			}
-			l.recordFatal(fmt.Errorf("qwp/sf: server rejected wire seq %d: %w", seq, qErr))
-			return qErr
+			l.totalServerErrors.Add(1)
+			l.dispatcher.Load().offer(se)
+			if pol == PolicyHalt {
+				l.recordFatalServerError(se)
+				return se
+			}
+			// PolicyDropAndContinue: advance past the rejected span
+			// via the same engine entry the success branch uses. The
+			// segment manager will trim the now-acked range on its
+			// next maintenance pass. Bump totalAcks for parity with
+			// the success path so producer-visible counters reflect
+			// "the server has resolved this batch".
+			l.engine.engineAcknowledge(fsn)
+			l.totalAcks.Add(1)
+			l.acksRecvOnConn.Add(1)
+			continue
 		}
 		// Sanity: don't trust an ACK beyond what we've actually
 		// sent. A malformed/replayed server response could
@@ -639,7 +795,10 @@ func (l *qwpSfSendLoop) reconnectWithBackoff(initial error) bool {
 		}
 		if err != nil {
 			if qwpSfIsTerminalUpgradeError(err) {
-				l.recordFatal(fmt.Errorf("qwp/sf: terminal upgrade error during reconnect: %w", err))
+				se := l.qwpSfBuildUpgradeFailureSE(err)
+				l.totalServerErrors.Add(1)
+				l.dispatcher.Load().offer(se)
+				l.recordFatalServerError(se)
 				return false
 			}
 			lastErr = err
@@ -669,9 +828,12 @@ func (l *qwpSfSendLoop) reconnectWithBackoff(initial error) bool {
 		return false
 	}
 	elapsed := time.Since(outageStart)
-	l.recordFatal(fmt.Errorf(
-		"qwp/sf: reconnect failed after %s / %d attempts: %w",
-		elapsed, attempts, lastErr))
+	reason := fmt.Sprintf("reconnect failed after %s / %d attempts: %v",
+		elapsed, attempts, lastErr)
+	se := l.qwpSfBuildBudgetExhaustedSE(reason)
+	l.totalServerErrors.Add(1)
+	l.dispatcher.Load().offer(se)
+	l.recordFatalServerError(se)
 	return false
 }
 
@@ -698,32 +860,130 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) {
 	l.positionCursorAt(replayStart)
 }
 
-// qwpSfIsTerminalUpgradeError reports whether err indicates a
-// server-side reject that won't fix itself on retry. Detected by
-// message sniffing: WebSocket upgrade failures with a non-101 HTTP
-// status (401 unauthorized, 403 forbidden, 426 upgrade-required,
-// etc.) indicate auth or version mismatch — retrying just delays
-// the user seeing the misconfig.
-//
-// Mirrors Java's CursorWebSocketSendLoop.findUpgradeFailureMessage.
-// coder/websocket reports these failures with messages like
-// "failed to WebSocket dial: expected handshake response status
-// code 101 but got 401". We match on common substrings.
+// qwpSfIsTerminalUpgradeError reports whether err indicates any
+// server-side WebSocket-upgrade reject that won't fix itself on
+// retry — auth or protocol-mismatch alike. Kept for backwards
+// compatibility; callers that need the auth-vs-protocol split
+// should use qwpSfIsAuthFailure / qwpSfIsProtocolUpgradeFailure
+// instead.
 func qwpSfIsTerminalUpgradeError(err error) bool {
+	return qwpSfIsAuthFailure(err) || qwpSfIsProtocolUpgradeFailure(err)
+}
+
+// qwpSfIsAuthFailure reports whether err indicates the server
+// rejected the WebSocket upgrade with an auth-related HTTP status
+// (401 unauthorized, 403 forbidden). These map to
+// CategorySecurityError on the SenderError surface.
+//
+// coder/websocket reports upgrade failures with messages like
+// "failed to WebSocket dial: expected handshake response status
+// code 101 but got 401" — we match on the status-code substring
+// plus the textual "unauthorized" / "forbidden" hints servers
+// commonly emit alongside.
+func qwpSfIsAuthFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	// Status-code-like substrings in the upgrade error.
+	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{
-		"got 401", "got 403", "got 404", "got 426",
+		"got 401", "got 403",
 		"unauthorized", "forbidden",
 	} {
-		if strings.Contains(strings.ToLower(msg), marker) {
+		if strings.Contains(msg, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// qwpSfIsProtocolUpgradeFailure reports whether err indicates the
+// server rejected the WebSocket upgrade with a protocol-related
+// HTTP status (404 not found — wrong endpoint; 426 upgrade required
+// — wrong protocol version). These map to
+// CategoryProtocolViolation on the SenderError surface.
+func qwpSfIsProtocolUpgradeFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"got 404", "got 426",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// qwpSfBuildUpgradeFailureSE constructs a typed *SenderError for an
+// upgrade-failure terminal: SecurityError for auth (401/403),
+// ProtocolViolation for protocol (404/426). Callers must have
+// already determined the err is one of those two via the helpers
+// above.
+func (l *qwpSfSendLoop) qwpSfBuildUpgradeFailureSE(err error) *SenderError {
+	cat := CategoryProtocolViolation
+	if qwpSfIsAuthFailure(err) {
+		cat = CategorySecurityError
+	}
+	from := l.engine.engineAckedFsn() + 1
+	to := l.engine.enginePublishedFsn()
+	if to < from {
+		to = from
+	}
+	return &SenderError{
+		Category:         cat,
+		AppliedPolicy:    PolicyHalt,
+		ServerStatusByte: NoStatusByte,
+		ServerMessage:    "ws-upgrade-failed: " + err.Error(),
+		MessageSequence:  NoMessageSequence,
+		FromFsn:          from,
+		ToFsn:            to,
+		DetectedAt:       time.Now(),
+	}
+}
+
+// qwpSfBuildProtocolViolationSE constructs a typed *SenderError for
+// a terminal WebSocket close frame (PROTOCOL_ERROR /
+// UNSUPPORTED_DATA / etc.). The FSN span is the unacked window at
+// close time.
+func (l *qwpSfSendLoop) qwpSfBuildProtocolViolationSE(code websocket.StatusCode, reason string) *SenderError {
+	from := l.engine.engineAckedFsn() + 1
+	to := l.engine.enginePublishedFsn()
+	if to < from {
+		to = from
+	}
+	return &SenderError{
+		Category:         CategoryProtocolViolation,
+		AppliedPolicy:    PolicyHalt,
+		ServerStatusByte: NoStatusByte,
+		ServerMessage:    fmt.Sprintf("ws-close[%d]: %s", code, reason),
+		MessageSequence:  NoMessageSequence,
+		FromFsn:          from,
+		ToFsn:            to,
+		DetectedAt:       time.Now(),
+	}
+}
+
+// qwpSfBuildBudgetExhaustedSE constructs a typed *SenderError for
+// reconnect-budget exhaustion. Treated as a ProtocolViolation since
+// the wire is gone — the FSN span is the unacked window.
+func (l *qwpSfSendLoop) qwpSfBuildBudgetExhaustedSE(reason string) *SenderError {
+	from := l.engine.engineAckedFsn() + 1
+	to := l.engine.enginePublishedFsn()
+	if to < from {
+		to = from
+	}
+	return &SenderError{
+		Category:         CategoryProtocolViolation,
+		AppliedPolicy:    PolicyHalt,
+		ServerStatusByte: NoStatusByte,
+		ServerMessage:    reason,
+		MessageSequence:  NoMessageSequence,
+		FromFsn:          from,
+		ToFsn:            to,
+		DetectedAt:       time.Now(),
+	}
 }
 
 // qwpSfConnectWithRetry runs the same exponential-backoff-with-jitter

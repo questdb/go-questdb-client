@@ -177,6 +177,68 @@ Non-obvious behaviors:
 - `tls_roots`, `tls_roots_password`: explicitly rejected — the Go
   client uses the system cert pool via `crypto/tls` defaults.
 
+**QWP server-error API knobs** (all QWP-only):
+
+- `on_server_error=auto|halt|drop` — global default applied to every
+  Category that lacks a more specific override. `auto` (the default)
+  falls through to per-category defaults (see § Error handling).
+- `on_schema_error`, `on_parse_error`, `on_internal_error`,
+  `on_security_error`, `on_write_error` (each `halt|drop`) — per-
+  category overrides. Take precedence over `on_server_error`.
+  `PROTOCOL_VIOLATION` and `UNKNOWN` are not user-configurable —
+  always HALT.
+- `error_inbox_capacity=N` — bounded inbox between the I/O goroutine
+  and the user-handler dispatcher goroutine. Minimum 16; default 256.
+
+### Error handling
+
+QWP server-side rejections surface as `*SenderError`, which is both
+an immutable payload and the typed `error` returned by producer-side
+calls after a HALT-policy latch. Two delivery paths:
+
+1. **Async callback** registered via `WithErrorHandler(func(*SenderError))`.
+   Runs on a dedicated dispatcher goroutine; never blocks publishing.
+   Slow handlers cause inbox overflow drops (visible via
+   `QwpSender.DroppedErrorNotifications()`).
+2. **Producer-side typed error** unwrapped via
+   `errors.As(err, &senderErr)` after `Flush` / `FlushAndGetSequence`.
+
+Categories (Java spec, mirror 1:1):
+
+| Wire | Category | Default Policy |
+|---|---|---|
+| 0x03 | `CategorySchemaMismatch` | DropAndContinue |
+| 0x05 | `CategoryParseError` | Halt |
+| 0x06 | `CategoryInternalError` | Halt |
+| 0x08 | `CategorySecurityError` | Halt |
+| 0x09 | `CategoryWriteError` | DropAndContinue |
+| n/a (WS close 1002/1003/1007/1008/1009/1010, or 404/426 upgrade) | `CategoryProtocolViolation` | Halt (forced) |
+| n/a (any byte not above) | `CategoryUnknown` | Halt (forced) |
+
+Policy resolution precedence (highest first): builder
+`WithErrorPolicyResolver(func(Category) Policy)` → builder
+`WithErrorPolicy(Category, Policy)` → connect-string `on_*_error`
+→ connect-string `on_server_error` → spec defaults.
+
+DropAndContinue advances `engineAckedFsn` past the rejected span and
+keeps draining; the data is dropped from the SF disk store and the
+async handler is the only path to dead-letter. Halt latches the
+typed error on the I/O loop; the next producer API call returns it.
+The sender does not auto-resume — close + rebuild is the supported
+recovery path (matching Java; `resumeAfterHalt` deferred).
+
+Surface accessors on `QwpSender`:
+
+- `LastTerminalError() *SenderError` — snapshot of the latched
+  Halt payload, or nil.
+- `TotalServerErrors()`, `DroppedErrorNotifications()`,
+  `TotalErrorNotificationsDelivered()` — ops counters.
+- `FlushAndGetSequence(ctx) (int64, error)` — returns the published
+  FSN post-flush; the upper bound on any
+  `SenderError.ToFsn` for that batch. Pair with `AwaitAckedFsn` for
+  ack confirmation; `AckedFsn()` is the *server-acknowledged*
+  watermark, not the published one.
+
 ### Connection pooling
 
 `sender_pool.go` provides `LineSenderPool` (`PoolFromConf`,
