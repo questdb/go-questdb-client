@@ -27,6 +27,7 @@ package questdb
 import (
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // qwpQueryClientConfig is the internal configuration of QwpQueryClient.
@@ -139,6 +140,9 @@ func (c *qwpQueryClientConfig) validate() error {
 	if c.address == "" {
 		return fmt.Errorf("qwp query: address is empty")
 	}
+	if err := validateQwpAddr(c.address); err != nil {
+		return err
+	}
 	if c.endpointPath == "" {
 		return fmt.Errorf("qwp query: endpoint path is empty")
 	}
@@ -186,6 +190,93 @@ func (c *qwpQueryClientConfig) validate() error {
 		return fmt.Errorf("qwp query: both username and password must be provided together")
 	}
 	return nil
+}
+
+// validateQwpAddr checks that an addr= value is a well-formed
+// host[:port] (or bracketed IPv6) form. It enforces the port-range
+// [1, 65535] when present and rejects malformed bracketed IPv6 inputs
+// up front so callers see a parser-level error rather than an opaque
+// dial failure later. Multi-address (comma-separated) entries are not
+// supported in the Go client; an embedded comma in addr is rejected
+// here so the user sees an actionable error rather than a "host not
+// found" downstream.
+//
+// Forms accepted:
+//   - "host"             — bare host, port defaults to the URL scheme's
+//   - "host:port"        — explicit port; validated against [1, 65535]
+//   - "[ipv6]:port"      — bracketed IPv6 with port
+//   - "[ipv6]"           — bracketed IPv6 without port
+//   - "ipv6::with::colons" — bare IPv6 (>=2 colons unbracketed)
+//
+// Rejected:
+//   - empty string (caught earlier in validate())
+//   - empty bracketed host: "[]:port"
+//   - missing closing ']': "[::1:9000"
+//   - trailing garbage after ']': "[::1]9000"
+//   - port out of [1, 65535]
+//   - non-numeric port
+//   - comma-separated multi-address (Go client doesn't support failover)
+func validateQwpAddr(s string) error {
+	if strings.Contains(s, ",") {
+		return fmt.Errorf(
+			"qwp query: invalid addr %q: multi-address (comma-separated) is not supported", s)
+	}
+	host, port, err := splitQwpHostPort(s)
+	if err != nil {
+		return fmt.Errorf("qwp query: invalid addr %q: %w", s, err)
+	}
+	if host == "" {
+		return fmt.Errorf("qwp query: invalid addr %q: empty host", s)
+	}
+	if port == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("qwp query: invalid addr %q: invalid port %q", s, port)
+	}
+	if n < 1 || n > 65535 {
+		return fmt.Errorf("qwp query: invalid addr %q: port %d out of range [1, 65535]", s, n)
+	}
+	return nil
+}
+
+// splitQwpHostPort splits a single host[:port] entry. Returns the host
+// (with surrounding brackets stripped, if any), the port string (empty
+// when no port was supplied), and a structural error for malformed
+// bracketed forms. The port string is returned untrimmed so the caller
+// can produce a useful error message; numeric validation happens in
+// validateQwpAddr.
+func splitQwpHostPort(s string) (host, port string, err error) {
+	if strings.HasPrefix(s, "[") {
+		end := strings.IndexByte(s, ']')
+		if end < 0 {
+			return "", "", fmt.Errorf("missing closing ']' in IPv6 address")
+		}
+		host = s[1:end]
+		rest := s[end+1:]
+		switch {
+		case rest == "":
+			return host, "", nil
+		case rest[0] == ':':
+			return host, rest[1:], nil
+		default:
+			return "", "", fmt.Errorf("expected ':' after ']' in IPv6 address")
+		}
+	}
+	// No brackets: count colons.
+	colons := strings.Count(s, ":")
+	switch colons {
+	case 0:
+		return s, "", nil
+	case 1:
+		i := strings.IndexByte(s, ':')
+		return s[:i], s[i+1:], nil
+	default:
+		// Multi-colon, unbracketed → bare IPv6 host without port.
+		// A custom port on IPv6 requires brackets.
+		return s, "", nil
+	}
 }
 
 // parseQwpQueryConf parses a ws:: / wss:: config string into a

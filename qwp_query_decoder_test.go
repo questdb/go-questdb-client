@@ -161,11 +161,181 @@ func TestQwpDecoderRoundTripFixedWidth(t *testing.T) {
 				func(c *qwpColumnBuffer) { c.addBool(true) },
 				func(c *qwpColumnBuffer) { c.addBool(false) },
 				func(c *qwpColumnBuffer) { c.addBool(true) },
+				func(c *qwpColumnBuffer) { c.addBool(false) },
+				func(c *qwpColumnBuffer) { c.addBool(false) },
+				func(c *qwpColumnBuffer) { c.addBool(true) },
+				func(c *qwpColumnBuffer) { c.addBool(true) },
+				func(c *qwpColumnBuffer) { c.addBool(false) },
+				func(c *qwpColumnBuffer) { c.addBool(true) },
+				func(c *qwpColumnBuffer) { c.addBool(false) },
 			},
 			check: func(t *testing.T, b *QwpColumnBatch) {
-				for i, w := range []bool{true, false, true} {
+				// 10 booleans cross a byte boundary in the bit-packed
+				// wire payload (8 bits/byte). The decoder must walk
+				// across both bytes.
+				want := []bool{true, false, true, false, false, true, true, false, true, false}
+				for i, w := range want {
 					if got := b.Bool(0, i); got != w {
 						t.Fatalf("Bool[%d] = %v, want %v", i, got, w)
+					}
+				}
+			},
+		},
+		{
+			name: "BYTE", wt: qwpTypeByte,
+			rows: []func(col *qwpColumnBuffer){
+				func(c *qwpColumnBuffer) { c.addByte(math.MinInt8) },
+				func(c *qwpColumnBuffer) { c.addByte(-1) },
+				func(c *qwpColumnBuffer) { c.addByte(0) },
+				func(c *qwpColumnBuffer) { c.addByte(7) },
+				func(c *qwpColumnBuffer) { c.addByte(math.MaxInt8) },
+			},
+			check: func(t *testing.T, b *QwpColumnBatch) {
+				for i, w := range []int8{math.MinInt8, -1, 0, 7, math.MaxInt8} {
+					if got := b.Int8(0, i); got != w {
+						t.Fatalf("Int8[%d] = %d, want %d", i, got, w)
+					}
+				}
+			},
+		},
+		{
+			name: "SHORT", wt: qwpTypeShort,
+			rows: []func(col *qwpColumnBuffer){
+				func(c *qwpColumnBuffer) { c.addShort(math.MinInt16) },
+				func(c *qwpColumnBuffer) { c.addShort(-1) },
+				func(c *qwpColumnBuffer) { c.addShort(0) },
+				func(c *qwpColumnBuffer) { c.addShort(42) },
+				func(c *qwpColumnBuffer) { c.addShort(math.MaxInt16) },
+			},
+			check: func(t *testing.T, b *QwpColumnBatch) {
+				for i, w := range []int16{math.MinInt16, -1, 0, 42, math.MaxInt16} {
+					if got := b.Int16(0, i); got != w {
+						t.Fatalf("Int16[%d] = %d, want %d", i, got, w)
+					}
+				}
+			},
+		},
+		{
+			name: "CHAR", wt: qwpTypeChar,
+			rows: []func(col *qwpColumnBuffer){
+				func(c *qwpColumnBuffer) { c.addChar('a') },
+				func(c *qwpColumnBuffer) { c.addChar('Z') },
+				func(c *qwpColumnBuffer) { c.addChar('0') },
+				func(c *qwpColumnBuffer) { c.addChar(' ') },
+				// Highest BMP code point — pins the LE 2-byte
+				// reassembly path against off-by-one shifts in the
+				// decoder.
+				func(c *qwpColumnBuffer) { c.addChar(0xFFFE) },
+			},
+			check: func(t *testing.T, b *QwpColumnBatch) {
+				for i, w := range []rune{'a', 'Z', '0', ' ', 0xFFFE} {
+					if got := b.Char(0, i); got != w {
+						t.Fatalf("Char[%d] = %U, want %U", i, got, w)
+					}
+				}
+			},
+		},
+		{
+			name: "FLOAT", wt: qwpTypeFloat,
+			rows: []func(col *qwpColumnBuffer){
+				func(c *qwpColumnBuffer) { c.addFloat32(float32(math.Inf(-1))) },
+				func(c *qwpColumnBuffer) { c.addFloat32(-1.5) },
+				func(c *qwpColumnBuffer) { c.addFloat32(0) },
+				func(c *qwpColumnBuffer) { c.addFloat32(1.5) },
+				func(c *qwpColumnBuffer) { c.addFloat32(float32(math.Inf(1))) },
+			},
+			check: func(t *testing.T, b *QwpColumnBatch) {
+				want := []float32{
+					float32(math.Inf(-1)), -1.5, 0, 1.5, float32(math.Inf(1)),
+				}
+				for i, w := range want {
+					if got := b.Float32(0, i); got != w {
+						t.Fatalf("Float32[%d] = %v, want %v", i, got, w)
+					}
+				}
+			},
+		},
+		{
+			name: "DATE", wt: qwpTypeDate,
+			rows: []func(col *qwpColumnBuffer){
+				func(c *qwpColumnBuffer) { c.addTimestamp(0) },
+				func(c *qwpColumnBuffer) { c.addTimestamp(1_700_000_000_000) },
+				func(c *qwpColumnBuffer) { c.addTimestamp(math.MinInt64 + 1) },
+				func(c *qwpColumnBuffer) { c.addTimestamp(math.MaxInt64) },
+			},
+			check: func(t *testing.T, b *QwpColumnBatch) {
+				want := []int64{0, 1_700_000_000_000, math.MinInt64 + 1, math.MaxInt64}
+				for i, w := range want {
+					if got := b.Int64(0, i); got != w {
+						t.Fatalf("Date Int64[%d] = %d, want %d", i, got, w)
+					}
+				}
+			},
+		},
+		{
+			name: "TIMESTAMP_NANO", wt: qwpTypeTimestampNano,
+			rows: []func(col *qwpColumnBuffer){
+				func(c *qwpColumnBuffer) { c.addTimestamp(1_700_000_000_000_000_000) },
+				func(c *qwpColumnBuffer) { c.addTimestamp(1_700_000_000_000_000_001) },
+			},
+			check: func(t *testing.T, b *QwpColumnBatch) {
+				want := []int64{1_700_000_000_000_000_000, 1_700_000_000_000_000_001}
+				for i, w := range want {
+					if got := b.Int64(0, i); got != w {
+						t.Fatalf("TsNano Int64[%d] = %d, want %d", i, got, w)
+					}
+				}
+			},
+		},
+		{
+			name: "UUID", wt: qwpTypeUuid,
+			rows: []func(col *qwpColumnBuffer){
+				func(c *qwpColumnBuffer) {
+					c.addUuid(0x99AABBCCDDEEFF00, 0x1122334455667788)
+				},
+				func(c *qwpColumnBuffer) { c.addUuid(0, 0) },
+				func(c *qwpColumnBuffer) {
+					c.addUuid(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+				},
+			},
+			check: func(t *testing.T, b *QwpColumnBatch) {
+				type uuidPair struct{ hi, lo uint64 }
+				want := []uuidPair{
+					{0x99AABBCCDDEEFF00, 0x1122334455667788},
+					{0, 0},
+					{0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF},
+				}
+				for i, w := range want {
+					if got := uint64(b.UuidLo(0, i)); got != w.lo {
+						t.Fatalf("UuidLo[%d] = %#x, want %#x", i, got, w.lo)
+					}
+					if got := uint64(b.UuidHi(0, i)); got != w.hi {
+						t.Fatalf("UuidHi[%d] = %#x, want %#x", i, got, w.hi)
+					}
+				}
+			},
+		},
+		{
+			name: "LONG256", wt: qwpTypeLong256,
+			rows: []func(col *qwpColumnBuffer){
+				func(c *qwpColumnBuffer) {
+					c.addLong256(0x1111111111111111, 0x2222222222222222,
+						0x3333333333333333, 0x4444444444444444)
+				},
+				func(c *qwpColumnBuffer) { c.addLong256(0, 0, 0, 0) },
+			},
+			check: func(t *testing.T, b *QwpColumnBatch) {
+				want := [][4]uint64{
+					{0x1111111111111111, 0x2222222222222222,
+						0x3333333333333333, 0x4444444444444444},
+					{0, 0, 0, 0},
+				}
+				for i, row := range want {
+					for w := 0; w < 4; w++ {
+						if got := uint64(b.Long256Word(0, i, w)); got != row[w] {
+							t.Fatalf("Long256[%d].word[%d] = %#x, want %#x",
+								i, w, got, row[w])
+						}
 					}
 				}
 			},
@@ -344,6 +514,187 @@ func TestQwpDecoderRoundTripGeohash(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestQwpDecoderRoundTripDecimal128(t *testing.T) {
+	// Drives a DECIMAL128 column through the encoder→decoder pipeline
+	// so the per-type DECIMAL128 layout (1-byte scale + 16 LE bytes)
+	// is exercised end-to-end. The hand-built layout test in
+	// qwp_query_batch_test.go bypasses the decoder; this round-trip
+	// catches regressions in the DECIMAL128-specific decoder branch.
+	tb := newQwpTableBuffer("t")
+	col, err := tb.getOrCreateColumn("d", qwpTypeDecimal128, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn: %v", err)
+	}
+	type d128 struct {
+		scale     uint32
+		hi, lo    uint64
+		signedHi  int64
+	}
+	cases := []d128{
+		{scale: 4, hi: 0x0102030405060708, lo: 0xCAFEBABEDEADBEEF, signedHi: 0x0102030405060708},
+		{scale: 4, hi: 0, lo: 1, signedHi: 0},
+		{scale: 4, hi: 0xFFFFFFFFFFFFFFFF, lo: 0xFFFFFFFFFFFFFFFF, signedHi: -1},
+	}
+	// Build a Decimal value at the desired scale and unscaled coefficient
+	// so addDecimal picks DECIMAL128 width. NewDecimal builds a 32-byte
+	// big-endian unscaled buffer directly.
+	for _, c := range cases {
+		// Build big-endian 16-byte unscaled value: hi || lo.
+		buf := make([]byte, 32)
+		binary.BigEndian.PutUint64(buf[16:], c.hi)
+		binary.BigEndian.PutUint64(buf[24:], c.lo)
+		dec, err := NewDecimalUnsafe(buf, c.scale)
+		if err != nil {
+			t.Fatalf("NewDecimalUnsafe: %v", err)
+		}
+		// addDecimal will pick a wireSize matching the column's
+		// fixedSize (16 for DECIMAL128). The Decimal's own significant
+		// bytes can be wider; for that case the encoder rejects with
+		// an overflow error rather than truncate. We picked values
+		// whose significant bytes fit in 16.
+		if err := col.addDecimal(dec); err != nil {
+			t.Fatalf("addDecimal: %v", err)
+		}
+		tb.commitRow()
+		col, err = tb.getOrCreateColumn("d", qwpTypeDecimal128, false)
+		if err != nil {
+			t.Fatalf("getOrCreateColumn (next row): %v", err)
+		}
+	}
+	var enc qwpEncoder
+	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+
+	var dec qwpQueryDecoder
+	var batch QwpColumnBatch
+	if err := dec.decode(frame, &batch); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := batch.DecimalScale(0); got != 4 {
+		t.Fatalf("DecimalScale = %d, want 4", got)
+	}
+	for i, c := range cases {
+		if got := uint64(batch.Decimal128Lo(0, i)); got != c.lo {
+			t.Fatalf("Decimal128Lo[%d] = %#x, want %#x", i, got, c.lo)
+		}
+		if got := batch.Decimal128Hi(0, i); got != c.signedHi {
+			t.Fatalf("Decimal128Hi[%d] = %#x, want %#x", i, uint64(got), c.hi)
+		}
+	}
+}
+
+func TestQwpDecoderRoundTripDecimal256(t *testing.T) {
+	// Drives a DECIMAL256 column through the full pipeline to cover
+	// the wide-decimal branch of the decoder. DECIMAL256 stores 32 LE
+	// bytes after a 1-byte scale. Three rows so the per-row dense
+	// indexing into the values slice has to advance correctly.
+	tb := newQwpTableBuffer("t")
+	col, err := tb.getOrCreateColumn("d", qwpTypeDecimal256, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn: %v", err)
+	}
+	type d256 struct {
+		scale       uint32
+		w0, w1, w2, w3 uint64
+	}
+	cases := []d256{
+		{scale: 7, w0: 0x1111111111111111, w1: 0x2222222222222222,
+			w2: 0x3333333333333333, w3: 0x4444444444444444},
+		{scale: 7, w0: 0, w1: 0, w2: 0, w3: 1},
+	}
+	for _, c := range cases {
+		// Build big-endian 32-byte unscaled value: w3 || w2 || w1 || w0.
+		buf := make([]byte, 32)
+		binary.BigEndian.PutUint64(buf[0:], c.w3)
+		binary.BigEndian.PutUint64(buf[8:], c.w2)
+		binary.BigEndian.PutUint64(buf[16:], c.w1)
+		binary.BigEndian.PutUint64(buf[24:], c.w0)
+		d, err := NewDecimalUnsafe(buf, c.scale)
+		if err != nil {
+			t.Fatalf("NewDecimalUnsafe: %v", err)
+		}
+		if err := col.addDecimal(d); err != nil {
+			t.Fatalf("addDecimal: %v", err)
+		}
+		tb.commitRow()
+		col, err = tb.getOrCreateColumn("d", qwpTypeDecimal256, false)
+		if err != nil {
+			t.Fatalf("getOrCreateColumn (next row): %v", err)
+		}
+	}
+	var enc qwpEncoder
+	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+
+	var dec qwpQueryDecoder
+	var batch QwpColumnBatch
+	if err := dec.decode(frame, &batch); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := batch.DecimalScale(0); got != 7 {
+		t.Fatalf("DecimalScale = %d, want 7", got)
+	}
+	for i, c := range cases {
+		want := [4]uint64{c.w0, c.w1, c.w2, c.w3}
+		for w := 0; w < 4; w++ {
+			if got := uint64(batch.Long256Word(0, i, w)); got != want[w] {
+				t.Fatalf("Decimal256[%d].word[%d] = %#x, want %#x",
+					i, w, got, want[w])
+			}
+		}
+	}
+}
+
+func TestQwpDecoderRoundTripInt64Array(t *testing.T) {
+	// Mirrors TestQwpDecoderRoundTripFloat64Array for the LONG_ARRAY
+	// type code. Two rows of a 2x3 int64 array, decoded via
+	// Int64Array; the shape and dense-index machinery is shared with
+	// the DOUBLE_ARRAY path.
+	tb := newQwpTableBuffer("t")
+	col, err := tb.getOrCreateColumn("a", qwpTypeLongArray, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn: %v", err)
+	}
+	col.addLongArray(2, []int32{2, 3}, []int64{1, 2, 3, 4, 5, 6})
+	tb.commitRow()
+	col, err = tb.getOrCreateColumn("a", qwpTypeLongArray, false)
+	if err != nil {
+		t.Fatalf("getOrCreateColumn (row 2): %v", err)
+	}
+	col.addLongArray(2, []int32{2, 3}, []int64{10, 20, 30, 40, 50, 60})
+	tb.commitRow()
+
+	var enc qwpEncoder
+	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+
+	var dec qwpQueryDecoder
+	var batch QwpColumnBatch
+	if err := dec.decode(frame, &batch); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for row := 0; row < 2; row++ {
+		if got := batch.ArrayNDims(0, row); got != 2 {
+			t.Fatalf("ArrayNDims[%d] = %d, want 2", row, got)
+		}
+		if d0, d1 := batch.ArrayDim(0, row, 0), batch.ArrayDim(0, row, 1); d0 != 2 || d1 != 3 {
+			t.Fatalf("ArrayDim[%d] = %dx%d, want 2x3", row, d0, d1)
+		}
+	}
+	want := [][]int64{
+		{1, 2, 3, 4, 5, 6},
+		{10, 20, 30, 40, 50, 60},
+	}
+	for row, w := range want {
+		got := batch.Int64Array(0, row)
+		if len(got) != len(w) {
+			t.Fatalf("Int64Array[%d] len = %d, want %d", row, len(got), len(w))
+		}
+		for i := range w {
+			if got[i] != w[i] {
+				t.Fatalf("Int64Array[%d][%d] = %d, want %d", row, i, got[i], w[i])
+			}
+		}
 	}
 }
 

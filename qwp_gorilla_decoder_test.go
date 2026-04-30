@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"encoding/binary"
 	"errors"
 	"math/rand"
 	"testing"
@@ -128,15 +129,254 @@ func TestQwpBitReaderTruncated(t *testing.T) {
 }
 
 func TestQwpBitReaderOutOfRangeBitCount(t *testing.T) {
-	// Guard against n=0 and n>64 — caller bugs would otherwise return
-	// garbage (mask computation relies on 1 <= n <= 64).
+	// Guard against n<0 and n>64 — caller bugs would otherwise return
+	// garbage (mask computation relies on 1 <= n <= 64). n=0 is a
+	// no-op success path (matches Java contract); see
+	// TestQwpBitReaderReadBitsZeroIsNoop.
 	var br qwpBitReader
 	br.reset([]byte{0xFF})
-	for _, n := range []int{0, -1, 65, 100} {
+	for _, n := range []int{-1, 65, 100} {
 		_, err := br.readBits(n)
 		if err == nil {
 			t.Fatalf("readBits(%d) should error", n)
 		}
+	}
+}
+
+func TestQwpBitReaderReadBitsZeroIsNoop(t *testing.T) {
+	// Mirror of Java's testReadBitsZeroBitsReturnsZeroWithoutAdvancing:
+	// a zero-width read must yield 0 and leave the bit position
+	// unchanged so the next read still sees byte 0 intact.
+	var br qwpBitReader
+	br.reset([]byte{0xFF})
+	got, err := br.readBits(0)
+	if err != nil {
+		t.Fatalf("readBits(0): %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("readBits(0) = %d, want 0", got)
+	}
+	if br.bitsRead != 0 {
+		t.Fatalf("bitsRead after readBits(0) = %d, want 0", br.bitsRead)
+	}
+	if bit, err := br.readBit(); err != nil || bit != 1 {
+		t.Fatalf("readBit after readBits(0) = (%d, %v), want (1, nil)", bit, err)
+	}
+}
+
+func TestQwpBitReaderReadBits64FullWord(t *testing.T) {
+	// 64-bit read must use the branchless mask path (^uint64(0) for
+	// n=64) and reproduce the input verbatim. Mirror of Java's
+	// testReadBits64ReadsFullWord.
+	value := uint64(0x0123456789ABCDEF)
+	src := make([]byte, 8)
+	binary.LittleEndian.PutUint64(src, value)
+
+	var br qwpBitReader
+	br.reset(src)
+	got, err := br.readBits(64)
+	if err != nil {
+		t.Fatalf("readBits(64): %v", err)
+	}
+	if got != value {
+		t.Fatalf("readBits(64) = %#x, want %#x", got, value)
+	}
+	if br.bitsRead != 64 {
+		t.Fatalf("bitsRead = %d, want 64", br.bitsRead)
+	}
+}
+
+func TestQwpBitReaderReadBits64TwiceDoesNotLeakStaleBuffer(t *testing.T) {
+	// Regression: a full-width readBits(64) must clear the
+	// accumulator so the next read sees a clean slate. Java's
+	// `bitBuffer >>>= 64` is a no-op (shift mod 64 == 0); the same
+	// pitfall applies in Go via `r.bitBuffer >> 1 >> 63 == bitBuffer`
+	// without the chained-shift form. Two disjoint halves (8 bytes
+	// of 0xFF then 8 of 0x00) catch the regression: the second 64-bit
+	// read must be exactly 0, not the OR of stale all-ones with the
+	// fresh zeros.
+	src := make([]byte, 16)
+	for i := 0; i < 8; i++ {
+		src[i] = 0xFF
+	}
+
+	var br qwpBitReader
+	br.reset(src)
+
+	first, err := br.readBits(64)
+	if err != nil {
+		t.Fatalf("first readBits(64): %v", err)
+	}
+	if first != ^uint64(0) {
+		t.Fatalf("first readBits(64) = %#x, want %#x", first, ^uint64(0))
+	}
+	if br.bitsRead != 64 {
+		t.Fatalf("bitsRead after first read = %d, want 64", br.bitsRead)
+	}
+
+	second, err := br.readBits(64)
+	if err != nil {
+		t.Fatalf("second readBits(64): %v", err)
+	}
+	if second != 0 {
+		t.Fatalf("second readBits(64) = %#x, want 0 (stale-buffer regression)", second)
+	}
+	if br.bitsRead != 128 {
+		t.Fatalf("bitsRead after second read = %d, want 128", br.bitsRead)
+	}
+}
+
+func TestQwpBitReaderArbitraryWidths(t *testing.T) {
+	// Sequence of mixed widths within and across byte boundaries.
+	// Source: 0xFF, 0x55, 0xAA, 0x00 (32 bits).
+	// LSB-first decoding of byte 0xFF: 5 bits = 0b11111 = 0x1F,
+	// then remaining 3 bits = 0b111 = 0x7. Byte 0x55 read whole
+	// = 0x55. Last 16 bits combine 0xAA (low) and 0x00 (high) =
+	// 0x00AA. Mirrors Java's testReadBitsArbitraryWidths.
+	src := []byte{0xFF, 0x55, 0xAA, 0x00}
+
+	var br qwpBitReader
+	br.reset(src)
+
+	got, err := br.readBits(5)
+	if err != nil || got != 0x1F {
+		t.Fatalf("readBits(5) = (%#x, %v), want (0x1F, nil)", got, err)
+	}
+	got, err = br.readBits(3)
+	if err != nil || got != 0x7 {
+		t.Fatalf("readBits(3) = (%#x, %v), want (0x7, nil)", got, err)
+	}
+	if br.bitsRead != 8 {
+		t.Fatalf("bitsRead after byte 0 = %d, want 8", br.bitsRead)
+	}
+	got, err = br.readBits(8)
+	if err != nil || got != 0x55 {
+		t.Fatalf("readBits(8) = (%#x, %v), want (0x55, nil)", got, err)
+	}
+	got, err = br.readBits(16)
+	if err != nil || got != 0x00AA {
+		t.Fatalf("readBits(16) = (%#x, %v), want (0x00AA, nil)", got, err)
+	}
+	if br.bitsRead != 32 {
+		t.Fatalf("bitsRead final = %d, want 32", br.bitsRead)
+	}
+}
+
+func TestQwpBitReaderSpansSlowPathRefills(t *testing.T) {
+	// 24-bit read must traverse the refill loop in readBitsSlow more
+	// than once when the accumulator is empty and the source has
+	// fewer than 8 bytes (forces the byte-by-byte refill branch).
+	// LSB-first across [0x01, 0x02, 0x03, 0x00] = 0x030201.
+	src := []byte{0x01, 0x02, 0x03, 0x00}
+
+	var br qwpBitReader
+	br.reset(src)
+	got, err := br.readBits(24)
+	if err != nil {
+		t.Fatalf("readBits(24): %v", err)
+	}
+	if got != 0x030201 {
+		t.Fatalf("readBits(24) = %#x, want 0x030201", got)
+	}
+	if br.bitsRead != 24 {
+		t.Fatalf("bitsRead = %d, want 24", br.bitsRead)
+	}
+}
+
+func TestQwpBitReaderMultiRefillAcrossLargeBuffer(t *testing.T) {
+	// Walk a 16-byte buffer with a sequence of widths summing to
+	// 128 bits. Each width forces an accumulator refill at a
+	// different boundary point, and the trailing readBit must
+	// surface the past-end error. Mirror of Java's
+	// testReadBitsAcrossLargeRefill.
+	src := make([]byte, 16)
+	for i := range src {
+		src[i] = byte(i)
+	}
+
+	var br qwpBitReader
+	br.reset(src)
+	widths := []int{1, 7, 13, 19, 23, 33, 32}
+	totalBits := int64(0)
+	for _, w := range widths {
+		if _, err := br.readBits(w); err != nil {
+			t.Fatalf("readBits(%d): %v", w, err)
+		}
+		totalBits += int64(w)
+		if br.bitsRead != totalBits {
+			t.Fatalf("bitsRead after readBits(%d) = %d, want %d", w, br.bitsRead, totalBits)
+		}
+	}
+	if _, err := br.readBit(); err == nil {
+		t.Fatalf("readBit after exhausting 128 bits should error")
+	}
+}
+
+func TestQwpBitReaderSignedDoesNotExtendWhenMsbClear(t *testing.T) {
+	// 5-bit field with MSB clear: encode +5 (0b00101), read back as
+	// +5 — sign-extension must NOT fire for MSB=0. Mirrors Java's
+	// testReadSignedDoesNotExtendWhenMsbClear.
+	var br qwpBitReader
+	br.reset([]byte{0b00000101})
+	got, err := br.readSigned(5)
+	if err != nil {
+		t.Fatalf("readSigned(5): %v", err)
+	}
+	if got != 5 {
+		t.Fatalf("readSigned(5) = %d, want 5", got)
+	}
+}
+
+func TestQwpBitReaderSigned64BitsBehavesLikeReadBits(t *testing.T) {
+	// readSigned(64) special-cases the sign-extend so the value
+	// already occupies the full int64 unchanged. Mirror of Java's
+	// testReadSigned64BitsBehavesLikeReadBits.
+	want := int64(-0x0011223344556678) // i.e. 0xFFEEDDCCBBAA9988
+	src := make([]byte, 8)
+	binary.LittleEndian.PutUint64(src, uint64(want))
+
+	var br qwpBitReader
+	br.reset(src)
+	got, err := br.readSigned(64)
+	if err != nil {
+		t.Fatalf("readSigned(64): %v", err)
+	}
+	if got != want {
+		t.Fatalf("readSigned(64) = %d, want %d", got, want)
+	}
+}
+
+func TestQwpBitReaderResetClearsAllState(t *testing.T) {
+	// After a partial read on buffer 1, reset(buffer2) must reseed
+	// the position to 0 and force the first read to come from
+	// buffer2 — not from leftover bits in the accumulator. Mirror of
+	// Java's testResetClearsAllState.
+	var br qwpBitReader
+	br.reset([]byte{0xAB, 0xCD})
+	if _, err := br.readBits(10); err != nil {
+		t.Fatalf("readBits(10): %v", err)
+	}
+	if br.bitsRead != 10 {
+		t.Fatalf("bitsRead after first run = %d, want 10", br.bitsRead)
+	}
+
+	br.reset([]byte{0x12, 0x34})
+	if br.bitsRead != 0 {
+		t.Fatalf("bitsRead after reset = %d, want 0", br.bitsRead)
+	}
+	if br.bitsAvail != 0 || br.bitBuffer != 0 || br.pos != 0 {
+		t.Fatalf("residual state after reset: bitsAvail=%d bitBuffer=%#x pos=%d",
+			br.bitsAvail, br.bitBuffer, br.pos)
+	}
+	got, err := br.readBits(8)
+	if err != nil {
+		t.Fatalf("readBits(8) after reset: %v", err)
+	}
+	if got != 0x12 {
+		t.Fatalf("readBits(8) after reset = %#x, want 0x12", got)
+	}
+	if br.bitsRead != 8 {
+		t.Fatalf("bitsRead = %d, want 8", br.bitsRead)
 	}
 }
 
@@ -279,6 +519,67 @@ func TestQwpGorillaDecoderRoundTripRandom(t *testing.T) {
 		if got != ts[i] {
 			t.Fatalf("ts[%d] = %d, want %d", i, got, ts[i])
 		}
+	}
+}
+
+func TestQwpGorillaDecoderDecodePastEndOfEmptyBitstream(t *testing.T) {
+	// Reset to a zero-length bitstream and verify decodeNext surfaces
+	// the bit reader's "past end of buffer" error on the very first
+	// call. Asking for a value when there are no bytes at all is the
+	// unambiguous past-end case (a trailing-zero pattern would
+	// resemble a valid 1-bit "DoD == 0" prefix). Mirror of Java's
+	// testDecodePastEndOfEmptyBitstreamThrows.
+	var dec qwpGorillaDecoder
+	dec.reset(0, 100, nil)
+	_, err := dec.decodeNext()
+	if err == nil {
+		t.Fatalf("decodeNext on empty bitstream must error")
+	}
+	var de *qwpDecodeError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected *qwpDecodeError, got %T: %v", err, err)
+	}
+}
+
+func TestQwpGorillaDecoderDecodePastEndOfLargeBucketBitstream(t *testing.T) {
+	// Encode a sequence whose DoDs land in the 36-bit fallback bucket
+	// (each emitted value consumes a known multi-byte chunk). After
+	// decoding the encoded values, keep asking for more until the
+	// past-end check fires. The cap is generous (64 spurious calls)
+	// — the trailing bit pattern of the last byte determines exactly
+	// when the reader runs out of payload, so we loop until it does.
+	// Mirror of Java's testDecodePastEndOfLargeBucketBitstreamThrows.
+	ts := []int64{1_000_000, 2_000_000, 3_500_000, 7_000_000}
+	src := intsToBytes(ts)
+	var wb qwpWireBuffer
+	var enc qwpGorillaEncoder
+	enc.encodeTimestamps(&wb, src, len(ts))
+
+	var dec qwpGorillaDecoder
+	dec.reset(ts[0], ts[1], wb.bytes()[16:])
+	for i := 2; i < len(ts); i++ {
+		got, err := dec.decodeNext()
+		if err != nil {
+			t.Fatalf("decodeNext[%d]: %v", i, err)
+		}
+		if got != ts[i] {
+			t.Fatalf("decodeNext[%d] = %d, want %d", i, got, ts[i])
+		}
+	}
+
+	var seenErr error
+	for i := 0; i < 64; i++ {
+		if _, err := dec.decodeNext(); err != nil {
+			seenErr = err
+			break
+		}
+	}
+	if seenErr == nil {
+		t.Fatalf("decodeNext past end must eventually error")
+	}
+	var de *qwpDecodeError
+	if !errors.As(seenErr, &de) {
+		t.Fatalf("expected *qwpDecodeError past end, got %T: %v", seenErr, seenErr)
 	}
 }
 

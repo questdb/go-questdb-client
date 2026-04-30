@@ -72,6 +72,18 @@ const (
 	qwpGeohashMaxBits = 60
 )
 
+// Per-width DECIMAL scale caps. Mirrors Java QwpBindValues constants
+// DECIMAL64_MAX_SCALE / DECIMAL128_MAX_SCALE / DECIMAL256_MAX_SCALE.
+// The server only enforces scale <= maxDecimalScale (76) regardless of
+// width; the per-width caps are a client-side preflight that surfaces
+// "scale exceeds the type's representable digits" as a typed error
+// before bytes leave the process.
+const (
+	qwpDecimal64MaxScale  = 18
+	qwpDecimal128MaxScale = 38
+	qwpDecimal256MaxScale = 76
+)
+
 // Err returns the first latched bind-encoding error, or nil. Exposed for
 // tests; the client checks this directly before submitting.
 func (b *QwpBinds) Err() error { return b.err }
@@ -368,8 +380,33 @@ func (b *QwpBinds) GeohashBind(index int, value uint64, precisionBits int) *QwpB
 	return b
 }
 
-// NullGeohashBind binds a NULL GEOHASH parameter.
-func (b *QwpBinds) NullGeohashBind(index int) *QwpBinds { return b.setNull(index, qwpTypeGeohash) }
+// NullGeohashBind binds a NULL GEOHASH parameter with the minimum
+// precision (1 bit). The server reads the precision_bits varint
+// regardless of null, so a precision must be present on the wire even
+// for null. Use NullGeohashBindWithPrecision for explicit control.
+func (b *QwpBinds) NullGeohashBind(index int) *QwpBinds {
+	return b.NullGeohashBindWithPrecision(index, qwpGeohashMinBits)
+}
+
+// NullGeohashBindWithPrecision binds a NULL GEOHASH parameter with the
+// given precision. Mirrors Java's setNullGeohash.
+func (b *QwpBinds) NullGeohashBindWithPrecision(index int, precisionBits int) *QwpBinds {
+	if b.err != nil {
+		return b
+	}
+	if precisionBits < qwpGeohashMinBits || precisionBits > qwpGeohashMaxBits {
+		b.err = fmt.Errorf(
+			"qwp bind: GEOHASH precision must be in [%d, %d], got %d",
+			qwpGeohashMinBits, qwpGeohashMaxBits, precisionBits)
+		return b
+	}
+	if !b.advance(index) {
+		return b
+	}
+	b.writeHeader(qwpTypeGeohash, true)
+	b.appendVarint(uint64(precisionBits))
+	return b
+}
 
 // VarcharBind binds a VARCHAR parameter. Wire encoding is:
 // offset0(u32 LE = 0) | length_bytes(u32 LE) | UTF-8 bytes.
@@ -388,9 +425,10 @@ func (b *QwpBinds) VarcharBind(index int, value string) *QwpBinds {
 func (b *QwpBinds) NullVarcharBind(index int) *QwpBinds { return b.setNull(index, qwpTypeVarchar) }
 
 // Decimal64Bind binds a DECIMAL64 parameter from an explicit scale and
-// unscaled int64.
+// unscaled int64. Scale must be in [0, 18]; DECIMAL64 can only store 18
+// digits of precision, so a higher scale is mathematically invalid.
 func (b *QwpBinds) Decimal64Bind(index int, scale int, unscaled int64) *QwpBinds {
-	if !b.checkScale(scale) {
+	if !b.checkScale64(scale) {
 		return b
 	}
 	if !b.advance(index) {
@@ -402,14 +440,35 @@ func (b *QwpBinds) Decimal64Bind(index int, scale int, unscaled int64) *QwpBinds
 	return b
 }
 
-// NullDecimal64Bind binds a NULL DECIMAL64 parameter.
-func (b *QwpBinds) NullDecimal64Bind(index int) *QwpBinds { return b.setNull(index, qwpTypeDecimal64) }
+// NullDecimal64Bind binds a NULL DECIMAL64 parameter with implicit
+// scale 0. The server reads the scale byte regardless of null, so the
+// scale must be present on the wire even for null. Use
+// NullDecimal64BindWithScale to bind a NULL with a specific scale.
+func (b *QwpBinds) NullDecimal64Bind(index int) *QwpBinds {
+	return b.NullDecimal64BindWithScale(index, 0)
+}
+
+// NullDecimal64BindWithScale binds a NULL DECIMAL64 parameter with the
+// given scale. The scale becomes part of the bound variable's type on
+// the server, so it is required for NULL the same way as for non-null.
+// Mirrors Java's setNullDecimal64.
+func (b *QwpBinds) NullDecimal64BindWithScale(index int, scale int) *QwpBinds {
+	if !b.checkScale64(scale) {
+		return b
+	}
+	if !b.advance(index) {
+		return b
+	}
+	b.writeHeader(qwpTypeDecimal64, true)
+	b.buf = append(b.buf, byte(scale))
+	return b
+}
 
 // Decimal128Bind binds a DECIMAL128 parameter from an explicit scale and
 // 128-bit unscaled value split into lo / hi 64-bit halves (wire order:
-// lo then hi, little-endian).
+// lo then hi, little-endian). Scale must be in [0, 38].
 func (b *QwpBinds) Decimal128Bind(index int, scale int, lo, hi uint64) *QwpBinds {
-	if !b.checkScale(scale) {
+	if !b.checkScale128(scale) {
 		return b
 	}
 	if !b.advance(index) {
@@ -422,16 +481,32 @@ func (b *QwpBinds) Decimal128Bind(index int, scale int, lo, hi uint64) *QwpBinds
 	return b
 }
 
-// NullDecimal128Bind binds a NULL DECIMAL128 parameter.
+// NullDecimal128Bind binds a NULL DECIMAL128 parameter with implicit
+// scale 0. See NullDecimal64Bind for the rationale. Use
+// NullDecimal128BindWithScale for an explicit scale.
 func (b *QwpBinds) NullDecimal128Bind(index int) *QwpBinds {
-	return b.setNull(index, qwpTypeDecimal128)
+	return b.NullDecimal128BindWithScale(index, 0)
+}
+
+// NullDecimal128BindWithScale binds a NULL DECIMAL128 parameter with
+// the given scale. Mirrors Java's setNullDecimal128.
+func (b *QwpBinds) NullDecimal128BindWithScale(index int, scale int) *QwpBinds {
+	if !b.checkScale128(scale) {
+		return b
+	}
+	if !b.advance(index) {
+		return b
+	}
+	b.writeHeader(qwpTypeDecimal128, true)
+	b.buf = append(b.buf, byte(scale))
+	return b
 }
 
 // Decimal256Bind binds a DECIMAL256 parameter from an explicit scale and
 // 256-bit unscaled value split into four 64-bit limbs (wire order:
-// ll, lh, hl, hh, each little-endian).
+// ll, lh, hl, hh, each little-endian). Scale must be in [0, 76].
 func (b *QwpBinds) Decimal256Bind(index int, scale int, ll, lh, hl, hh uint64) *QwpBinds {
-	if !b.checkScale(scale) {
+	if !b.checkScale256(scale) {
 		return b
 	}
 	if !b.advance(index) {
@@ -446,20 +521,37 @@ func (b *QwpBinds) Decimal256Bind(index int, scale int, ll, lh, hl, hh uint64) *
 	return b
 }
 
-// NullDecimal256Bind binds a NULL DECIMAL256 parameter.
+// NullDecimal256Bind binds a NULL DECIMAL256 parameter with implicit
+// scale 0. See NullDecimal64Bind for the rationale. Use
+// NullDecimal256BindWithScale for an explicit scale.
 func (b *QwpBinds) NullDecimal256Bind(index int) *QwpBinds {
-	return b.setNull(index, qwpTypeDecimal256)
+	return b.NullDecimal256BindWithScale(index, 0)
+}
+
+// NullDecimal256BindWithScale binds a NULL DECIMAL256 parameter with
+// the given scale. Mirrors Java's setNullDecimal256.
+func (b *QwpBinds) NullDecimal256BindWithScale(index int, scale int) *QwpBinds {
+	if !b.checkScale256(scale) {
+		return b
+	}
+	if !b.advance(index) {
+		return b
+	}
+	b.writeHeader(qwpTypeDecimal256, true)
+	b.buf = append(b.buf, byte(scale))
+	return b
 }
 
 // DecimalBind binds a parameter from a Decimal value, choosing the
 // narrowest DECIMAL64 / 128 / 256 wire type that holds the unscaled
-// coefficient. A NULL Decimal encodes as a typed DECIMAL256 null.
+// coefficient. A NULL Decimal encodes as a typed DECIMAL256 null with
+// scale 0.
 func (b *QwpBinds) DecimalBind(index int, value Decimal) *QwpBinds {
 	if b.err != nil {
 		return b
 	}
 	if value.isNull() {
-		return b.setNull(index, qwpTypeDecimal256)
+		return b.NullDecimal256BindWithScale(index, 0)
 	}
 	if err := value.ensureValidScale(); err != nil {
 		b.err = fmt.Errorf("qwp bind: %w", err)
@@ -517,14 +609,26 @@ func (b *QwpBinds) setNull(index int, t qwpTypeCode) *QwpBinds {
 	return b
 }
 
-func (b *QwpBinds) checkScale(scale int) bool {
+func (b *QwpBinds) checkScale64(scale int) bool {
+	return b.checkScaleRange(scale, qwpDecimal64MaxScale, "DECIMAL64")
+}
+
+func (b *QwpBinds) checkScale128(scale int) bool {
+	return b.checkScaleRange(scale, qwpDecimal128MaxScale, "DECIMAL128")
+}
+
+func (b *QwpBinds) checkScale256(scale int) bool {
+	return b.checkScaleRange(scale, qwpDecimal256MaxScale, "DECIMAL256")
+}
+
+func (b *QwpBinds) checkScaleRange(scale, maxScale int, typeName string) bool {
 	if b.err != nil {
 		return false
 	}
-	if scale < 0 || uint32(scale) > maxDecimalScale {
+	if scale < 0 || scale > maxScale {
 		b.err = fmt.Errorf(
-			"qwp bind: DECIMAL scale must be in [0, %d], got %d",
-			maxDecimalScale, scale)
+			"qwp bind: %s scale must be in [0, %d], got %d",
+			typeName, maxScale, scale)
 		return false
 	}
 	return true

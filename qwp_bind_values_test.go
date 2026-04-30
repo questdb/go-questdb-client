@@ -191,6 +191,178 @@ func TestQwpBindsDecimalRejectsBadScale(t *testing.T) {
 	}
 }
 
+func TestQwpBindsDecimalPerWidthScaleCaps(t *testing.T) {
+	// Per-width scale caps: DECIMAL64 stores up to 18 digits,
+	// DECIMAL128 up to 38, DECIMAL256 up to 76. The check is a
+	// client-side preflight — the server enforces only the global
+	// cap (76), so callers who bypass per-width validation can land
+	// in a state where the bound parameter's coefficient overflows
+	// the type's representable range. Mirrors Java's
+	// QwpBindValuesTest scale-bound rejections.
+	type scaleCase struct {
+		name     string
+		typeName string // expected substring in error message
+		ok       int
+		bad      int
+		bind     func(b *QwpBinds, scale int) *QwpBinds
+	}
+	cases := []scaleCase{
+		{
+			name: "Decimal64", typeName: "DECIMAL64",
+			ok:  qwpDecimal64MaxScale,
+			bad: qwpDecimal64MaxScale + 1,
+			bind: func(b *QwpBinds, scale int) *QwpBinds {
+				return b.Decimal64Bind(0, scale, 1)
+			},
+		},
+		{
+			name: "Decimal128", typeName: "DECIMAL128",
+			ok:  qwpDecimal128MaxScale,
+			bad: qwpDecimal128MaxScale + 1,
+			bind: func(b *QwpBinds, scale int) *QwpBinds {
+				return b.Decimal128Bind(0, scale, 0, 0)
+			},
+		},
+		{
+			name: "Decimal256", typeName: "DECIMAL256",
+			ok:  qwpDecimal256MaxScale,
+			bad: qwpDecimal256MaxScale + 1,
+			bind: func(b *QwpBinds, scale int) *QwpBinds {
+				return b.Decimal256Bind(0, scale, 0, 0, 0, 0)
+			},
+		},
+		{
+			name: "NullDecimal64WithScale", typeName: "DECIMAL64",
+			ok:  qwpDecimal64MaxScale,
+			bad: qwpDecimal64MaxScale + 1,
+			bind: func(b *QwpBinds, scale int) *QwpBinds {
+				return b.NullDecimal64BindWithScale(0, scale)
+			},
+		},
+		{
+			name: "NullDecimal128WithScale", typeName: "DECIMAL128",
+			ok:  qwpDecimal128MaxScale,
+			bad: qwpDecimal128MaxScale + 1,
+			bind: func(b *QwpBinds, scale int) *QwpBinds {
+				return b.NullDecimal128BindWithScale(0, scale)
+			},
+		},
+		{
+			name: "NullDecimal256WithScale", typeName: "DECIMAL256",
+			ok:  qwpDecimal256MaxScale,
+			bad: qwpDecimal256MaxScale + 1,
+			bind: func(b *QwpBinds, scale int) *QwpBinds {
+				return b.NullDecimal256BindWithScale(0, scale)
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name+"AcceptsBoundary", func(t *testing.T) {
+			var b QwpBinds
+			c.bind(&b, c.ok)
+			if err := b.Err(); err != nil {
+				t.Fatalf("scale=%d should be accepted: %v", c.ok, err)
+			}
+		})
+		t.Run(c.name+"RejectsOverBoundary", func(t *testing.T) {
+			var b QwpBinds
+			c.bind(&b, c.bad)
+			if b.Err() == nil {
+				t.Fatalf("scale=%d should be rejected", c.bad)
+			}
+			// Error must call out the per-width type so the user knows
+			// to upgrade rather than bisecting on scale.
+			if !strings.Contains(b.Err().Error(), c.typeName) {
+				t.Fatalf("error %q must mention %s", b.Err(), c.typeName)
+			}
+		})
+		t.Run(c.name+"RejectsNegative", func(t *testing.T) {
+			var b QwpBinds
+			c.bind(&b, -1)
+			if b.Err() == nil {
+				t.Fatalf("scale=-1 should be rejected")
+			}
+		})
+	}
+}
+
+func TestQwpBindsNullDecimalWithScale(t *testing.T) {
+	// NullDecimalXBindWithScale must place the explicit scale byte
+	// after the null bitmap so the server's setDecimal path picks up
+	// the correct precision/type.
+	cases := []struct {
+		name  string
+		bind  func(b *QwpBinds) *QwpBinds
+		typ   qwpTypeCode
+		scale byte
+	}{
+		{"Decimal64Scale5",
+			func(b *QwpBinds) *QwpBinds { return b.NullDecimal64BindWithScale(0, 5) },
+			qwpTypeDecimal64, 5},
+		{"Decimal128Scale20",
+			func(b *QwpBinds) *QwpBinds { return b.NullDecimal128BindWithScale(0, 20) },
+			qwpTypeDecimal128, 20},
+		{"Decimal256Scale50",
+			func(b *QwpBinds) *QwpBinds { return b.NullDecimal256BindWithScale(0, 50) },
+			qwpTypeDecimal256, 50},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var b QwpBinds
+			c.bind(&b)
+			var w byteBuf
+			w.put(byte(c.typ), testBindNullFlag, testBindNullBitmap, c.scale)
+			assertEncoded(t, &b, 1, w.b)
+		})
+	}
+}
+
+func TestQwpBindsNullGeohashWithPrecision(t *testing.T) {
+	// NullGeohashBindWithPrecision must place the precision varint
+	// after the null bitmap, matching the wire layout of a non-null
+	// GEOHASH bind. The server reads the varint unconditionally.
+	cases := []struct {
+		name      string
+		precision int
+	}{
+		{"Min", qwpGeohashMinBits},
+		{"Mid", 30},
+		{"Max", qwpGeohashMaxBits},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var b QwpBinds
+			b.NullGeohashBindWithPrecision(0, c.precision)
+			var w byteBuf
+			w.put(byte(qwpTypeGeohash), testBindNullFlag, testBindNullBitmap)
+			w.putVarint(uint64(c.precision))
+			assertEncoded(t, &b, 1, w.b)
+		})
+	}
+	t.Run("DefaultUsesMinBits", func(t *testing.T) {
+		var b QwpBinds
+		b.NullGeohashBind(0)
+		var w byteBuf
+		w.put(byte(qwpTypeGeohash), testBindNullFlag, testBindNullBitmap)
+		w.putVarint(uint64(qwpGeohashMinBits))
+		assertEncoded(t, &b, 1, w.b)
+	})
+	t.Run("RejectsZero", func(t *testing.T) {
+		var b QwpBinds
+		b.NullGeohashBindWithPrecision(0, 0)
+		if b.Err() == nil {
+			t.Fatalf("precision=0 must be rejected")
+		}
+	})
+	t.Run("RejectsTooLarge", func(t *testing.T) {
+		var b QwpBinds
+		b.NullGeohashBindWithPrecision(0, qwpGeohashMaxBits+1)
+		if b.Err() == nil {
+			t.Fatalf("precision=%d must be rejected", qwpGeohashMaxBits+1)
+		}
+	})
+}
+
 func TestQwpBindsDouble(t *testing.T) {
 	var b QwpBinds
 	b.DoubleBind(0, 2.718281828)
@@ -250,6 +422,47 @@ func TestQwpBindsGeohashMasksHighBits(t *testing.T) {
 		w.put(byte(qwpTypeGeohash), testBindNonNull)
 		w.putVarint(5)
 		w.put(0x1F)
+		assertEncoded(t, &b, 1, w.b)
+	})
+	// Non-byte-aligned across a byte boundary. precisionBits=12
+	// emits 2 wire bytes; only the low 4 bits of the second byte
+	// carry payload, the upper nibble must be zero. Mirrors Java's
+	// boundary-bug regression: an unmasked value would leak the
+	// shifted-in high bit into the second wire byte's upper nibble.
+	t.Run("subNibbleAcrossByte_12", func(t *testing.T) {
+		var b QwpBinds
+		b.GeohashBind(0, 0xFFFF_FFFF_FFFF_FFFF, 12)
+		masked := uint64(0x0FFF) // low 12 bits of all-ones
+		var w byteBuf
+		w.put(byte(qwpTypeGeohash), testBindNonNull)
+		w.putVarint(12)
+		w.put(byte(masked))
+		w.put(byte(masked >> 8))
+		assertEncoded(t, &b, 1, w.b)
+	})
+	// precisionBits=20 emits 3 wire bytes; only the low 4 bits of
+	// the third byte carry payload.
+	t.Run("nonByteAligned_20", func(t *testing.T) {
+		var b QwpBinds
+		b.GeohashBind(0, 0xFFFF_FFFF_FFFF_FFFF, 20)
+		masked := uint64(0x0F_FFFF)
+		var w byteBuf
+		w.put(byte(qwpTypeGeohash), testBindNonNull)
+		w.putVarint(20)
+		for i := 0; i < 3; i++ {
+			w.put(byte(masked >> (i * 8)))
+		}
+		assertEncoded(t, &b, 1, w.b)
+	})
+	// Byte-aligned mid-range. precisionBits=24 emits exactly 3 wire
+	// bytes; every bit is payload.
+	t.Run("byteAligned_24", func(t *testing.T) {
+		var b QwpBinds
+		b.GeohashBind(0, 0xFFFF_FFFF_FFFF_FFFF, 24)
+		var w byteBuf
+		w.put(byte(qwpTypeGeohash), testBindNonNull)
+		w.putVarint(24)
+		w.put(0xFF, 0xFF, 0xFF)
 		assertEncoded(t, &b, 1, w.b)
 	})
 	// precisionBits=60 (max). Only the low 60 bits matter; the top
@@ -342,14 +555,6 @@ func TestQwpBindsMixedTypes(t *testing.T) {
 
 func TestQwpBindsNullExhaustive(t *testing.T) {
 	var b QwpBinds
-	// Order must match the sequence of null setters below.
-	wantTypes := []qwpTypeCode{
-		qwpTypeBoolean, qwpTypeByte, qwpTypeShort, qwpTypeChar,
-		qwpTypeInt, qwpTypeLong, qwpTypeFloat, qwpTypeDouble,
-		qwpTypeDate, qwpTypeTimestamp, qwpTypeTimestampNano,
-		qwpTypeUuid, qwpTypeLong256, qwpTypeGeohash, qwpTypeVarchar,
-		qwpTypeDecimal64, qwpTypeDecimal128, qwpTypeDecimal256,
-	}
 	b.NullBooleanBind(0).
 		NullByteBind(1).
 		NullShortBind(2).
@@ -369,11 +574,33 @@ func TestQwpBindsNullExhaustive(t *testing.T) {
 		NullDecimal128Bind(16).
 		NullDecimal256Bind(17)
 
+	// Plain null types (no metadata after the bitmap byte).
+	plainTypes := []qwpTypeCode{
+		qwpTypeBoolean, qwpTypeByte, qwpTypeShort, qwpTypeChar,
+		qwpTypeInt, qwpTypeLong, qwpTypeFloat, qwpTypeDouble,
+		qwpTypeDate, qwpTypeTimestamp, qwpTypeTimestampNano,
+		qwpTypeUuid, qwpTypeLong256, // 13 entries
+	}
+
 	var w byteBuf
-	for _, tc := range wantTypes {
+	for _, tc := range plainTypes {
 		w.put(byte(tc), testBindNullFlag, testBindNullBitmap)
 	}
-	assertEncoded(t, &b, len(wantTypes), w.b)
+	// GEOHASH null carries the precision varint after the bitmap; the
+	// server reads it unconditionally, even for null. Default precision
+	// is qwpGeohashMinBits=1.
+	w.put(byte(qwpTypeGeohash), testBindNullFlag, testBindNullBitmap)
+	w.putVarint(uint64(qwpGeohashMinBits))
+	// VARCHAR null is plain.
+	w.put(byte(qwpTypeVarchar), testBindNullFlag, testBindNullBitmap)
+	// DECIMAL64/128/256 null carry a 1-byte scale (default 0). The
+	// server's setDecimal path reads this byte unconditionally; without
+	// it the next bind's type code would be misread as a scale.
+	w.put(byte(qwpTypeDecimal64), testBindNullFlag, testBindNullBitmap, 0x00)
+	w.put(byte(qwpTypeDecimal128), testBindNullFlag, testBindNullBitmap, 0x00)
+	w.put(byte(qwpTypeDecimal256), testBindNullFlag, testBindNullBitmap, 0x00)
+
+	assertEncoded(t, &b, 18, w.b)
 }
 
 func TestQwpBindsShort(t *testing.T) {
@@ -489,8 +716,10 @@ func TestQwpBindsDecimalAutoWidthNull(t *testing.T) {
 	}
 	var b QwpBinds
 	b.DecimalBind(0, nullDecimal)
+	// NULL Decimal canonicalises to DECIMAL256 with scale 0; the scale
+	// byte must be on the wire (the server reads it unconditionally).
 	var w byteBuf
-	w.put(byte(qwpTypeDecimal256), testBindNullFlag, testBindNullBitmap)
+	w.put(byte(qwpTypeDecimal256), testBindNullFlag, testBindNullBitmap, 0x00)
 	assertEncoded(t, &b, 1, w.b)
 }
 

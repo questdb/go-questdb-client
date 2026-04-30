@@ -499,9 +499,13 @@ func (d *qwpQueryDecoder) parseColumn(l *qwpColumnLayout, rowCount int) error {
 		return d.readFixed(l, 2)
 	case qwpTypeInt, qwpTypeFloat, qwpTypeIPv4:
 		return d.readFixed(l, 4)
-	case qwpTypeLong, qwpTypeDouble:
+	case qwpTypeLong, qwpTypeDouble, qwpTypeDate:
+		// DATE shares the LONG layout — no Gorilla encoding flag, plain
+		// int64 LE values. Matches the Java QwpColumnWriter, which only
+		// branches into writeTimestampColumn for TIMESTAMP and
+		// TIMESTAMP_NANOS; DATE rides the same path as LONG / DOUBLE.
 		return d.readFixed(l, 8)
-	case qwpTypeDate, qwpTypeTimestamp, qwpTypeTimestampNano:
+	case qwpTypeTimestamp, qwpTypeTimestampNano:
 		return d.parseTimestamp(l)
 	case qwpTypeUuid:
 		return d.readFixed(l, 16)

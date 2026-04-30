@@ -86,7 +86,10 @@ func (r *qwpBitReader) readBit() (uint64, error) {
 }
 
 // readBits reads the low n bits of the stream and returns them
-// LSB-aligned in a uint64. n must be in [1, 64].
+// LSB-aligned in a uint64. n must be in [0, 64]. n == 0 returns 0
+// without consuming any bits, matching the Java QwpBitReader contract
+// — callers in the decoder occasionally pass a width derived from a
+// runtime computation and rely on the zero case being a no-op.
 //
 // Mask construction is branchless via `^uint64(0) >> (64 - n)`: for n
 // in [1, 64] the shift count is in [0, 63] and the result is the
@@ -96,7 +99,10 @@ func (r *qwpBitReader) readBit() (uint64, error) {
 // the inner shift count is always in [0, 63] and Go does not have to
 // emit a runtime guard for shift-by-width.
 func (r *qwpBitReader) readBits(n int) (uint64, error) {
-	if n <= 0 || n > 64 {
+	if n == 0 {
+		return 0, nil
+	}
+	if n < 0 || n > 64 {
 		return 0, newQwpDecodeError("bit count out of range")
 	}
 	if r.bitsAvail >= n {

@@ -237,6 +237,326 @@ func TestQwpQueryClientFromConfErrors(t *testing.T) {
 	}
 }
 
+// TestQwpQueryClientFromConfPortBoundaries pins the addr= port-range
+// validation: ports outside [1, 65535] and non-numeric ports are
+// rejected at parse time so the user sees an actionable error rather
+// than an opaque dial failure later. Ports of 1 and 65535 are accepted.
+// Mirrors the Java QwpQueryClientFromConfigTest port-boundary tests.
+func TestQwpQueryClientFromConfPortBoundaries(t *testing.T) {
+	t.Run("Reject", func(t *testing.T) {
+		cases := []struct {
+			conf    string
+			wantSub string
+		}{
+			{"ws::addr=db:0;", "out of range"},
+			{"ws::addr=db:-1;", "out of range"},
+			{"ws::addr=db:65536;", "out of range"},
+			{"ws::addr=db:2147483647;", "out of range"},
+			{"ws::addr=host:abc;", "invalid port"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.conf, func(t *testing.T) {
+				_, err := parseQwpQueryConf(tc.conf)
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.conf)
+				}
+				if !strings.Contains(err.Error(), tc.wantSub) {
+					t.Errorf("err=%v, want substring %q", err, tc.wantSub)
+				}
+			})
+		}
+	})
+	t.Run("AcceptBoundaries", func(t *testing.T) {
+		// 1 and 65535 are the inclusive boundaries of the legal range.
+		// "addr=host" with no port is also legal — the URL scheme
+		// supplies a default port at dial time.
+		for _, conf := range []string{
+			"ws::addr=db:1;",
+			"ws::addr=db:65535;",
+			"ws::addr=db.internal;",
+		} {
+			if _, err := parseQwpQueryConf(conf); err != nil {
+				t.Errorf("unexpected error for %q: %v", conf, err)
+			}
+		}
+	})
+}
+
+// TestQwpQueryClientFromConfIPv6 pins the bracketed-IPv6 and bare-IPv6
+// parsing paths in the addr= validator. The validator accepts:
+//   - bracketed with port:    [::1]:9000
+//   - bracketed without port: [fe80::1]
+//   - bare IPv6 (>= 2 colons): fe80::1 (no port; brackets required for port)
+// And rejects:
+//   - empty bracketed host:   [] :9000
+//   - missing closing ']':    [::1:9000
+//   - trailing garbage after ']': [::1]9000
+// Mirrors the Java QwpQueryClientFromConfigTest IPv6 cases. The Go
+// client targets a single endpoint; the comma-separated multi-address
+// form Java accepts is rejected up front (see TestRejectsMultiAddress).
+func TestQwpQueryClientFromConfIPv6(t *testing.T) {
+	t.Run("Accept", func(t *testing.T) {
+		for _, conf := range []string{
+			"ws::addr=[::1]:9000;",
+			"ws::addr=[fe80::1];",
+			"ws::addr=[::1];",
+			"ws::addr=fe80::1;", // bare IPv6, default port
+		} {
+			t.Run(conf, func(t *testing.T) {
+				if _, err := parseQwpQueryConf(conf); err != nil {
+					t.Errorf("unexpected error for %q: %v", conf, err)
+				}
+			})
+		}
+	})
+	t.Run("Reject", func(t *testing.T) {
+		cases := []struct {
+			conf    string
+			wantSub string
+		}{
+			{"ws::addr=[]:9000;", "empty host"},
+			{"ws::addr=[::1:9000;", "missing closing"},
+			{"ws::addr=[::1]9000;", "expected ':'"},
+			{"ws::addr=[::1]:0;", "out of range"},
+			{"ws::addr=[::1]:65536;", "out of range"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.conf, func(t *testing.T) {
+				_, err := parseQwpQueryConf(tc.conf)
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.conf)
+				}
+				if !strings.Contains(err.Error(), tc.wantSub) {
+					t.Errorf("err=%v, want substring %q", err, tc.wantSub)
+				}
+			})
+		}
+	})
+}
+
+// TestQwpQueryClientFromConfRejectsMultiAddress pins the Go client's
+// single-endpoint contract: the Java client supports comma-separated
+// addr= for failover, but the Go client does not (see qwp_query_conf
+// docstring). The user sees a parser-level rejection rather than a
+// downstream "host not found".
+func TestQwpQueryClientFromConfRejectsMultiAddress(t *testing.T) {
+	cases := []string{
+		"ws::addr=a:9000,b:9000;",
+		"ws::addr=a:9000,b:9000,c:9000;",
+		"ws::addr=[::1]:9000,[fe80::1]:9000;",
+	}
+	for _, conf := range cases {
+		t.Run(conf, func(t *testing.T) {
+			_, err := parseQwpQueryConf(conf)
+			if err == nil {
+				t.Fatalf("expected error for %q", conf)
+			}
+			if !strings.Contains(err.Error(), "multi-address") {
+				t.Errorf("err=%v, want 'multi-address' substring", err)
+			}
+		})
+	}
+}
+
+// TestQwpQueryClientFromConfTlsVariations exercises the tls_verify
+// matrix exhaustively: on/unsafe_off accepted on wss://, both rejected
+// on ws://, invalid values rejected, and the legacy tls_roots /
+// tls_roots_password keys explicitly rejected on both schemas (the Go
+// client uses the system trust store only). Mirrors the Java
+// QwpQueryClientFromConfigTest TLS variations.
+func TestQwpQueryClientFromConfTlsVariations(t *testing.T) {
+	type tlsCase struct {
+		name      string
+		conf      string
+		wantTls   tlsMode
+		wantErrIn string
+	}
+	cases := []tlsCase{
+		{
+			name:    "wss_no_tls_verify_defaults_to_enabled",
+			conf:    "wss::addr=db:9000;",
+			wantTls: tlsEnabled,
+		},
+		{
+			name:    "wss_tls_verify_on",
+			conf:    "wss::addr=db:9000;tls_verify=on;",
+			wantTls: tlsEnabled,
+		},
+		{
+			name:    "wss_tls_verify_unsafe_off",
+			conf:    "wss::addr=db:9000;tls_verify=unsafe_off;",
+			wantTls: tlsInsecureSkipVerify,
+		},
+		{
+			name:    "ws_no_tls",
+			conf:    "ws::addr=db:9000;",
+			wantTls: tlsDisabled,
+		},
+		{
+			name:      "ws_tls_verify_on_rejected",
+			conf:      "ws::addr=db:9000;tls_verify=on;",
+			wantErrIn: "tls_verify requires",
+		},
+		{
+			name:      "ws_tls_verify_unsafe_off_rejected",
+			conf:      "ws::addr=db:9000;tls_verify=unsafe_off;",
+			wantErrIn: "tls_verify requires",
+		},
+		{
+			name:      "wss_tls_verify_invalid",
+			conf:      "wss::addr=db:9000;tls_verify=strict;",
+			wantErrIn: "invalid tls_verify",
+		},
+		{
+			name:      "wss_tls_roots_rejected",
+			conf:      "wss::addr=db:9000;tls_roots=/etc/ca.p12;",
+			wantErrIn: "tls_roots is not available",
+		},
+		{
+			name:      "ws_tls_roots_rejected",
+			conf:      "ws::addr=db:9000;tls_roots=/etc/ca.p12;",
+			wantErrIn: "tls_roots is not available",
+		},
+		{
+			name:      "tls_roots_password_rejected",
+			conf:      "wss::addr=db:9000;tls_roots_password=secret;",
+			wantErrIn: "tls_roots_password is not available",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := parseQwpQueryConf(c.conf)
+			if c.wantErrIn != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q", c.wantErrIn)
+				}
+				if !strings.Contains(err.Error(), c.wantErrIn) {
+					t.Errorf("err=%v, want %q", err, c.wantErrIn)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if cfg.tlsMode != c.wantTls {
+				t.Errorf("tlsMode=%v, want %v", cfg.tlsMode, c.wantTls)
+			}
+		})
+	}
+}
+
+// TestQwpQueryClientFromConfCompressionVariations exhaustively covers
+// the compression and compression_level keys: every accepted value
+// (raw / zstd / auto), every boundary on compression_level (1 and 22
+// inclusive), and the rejected values that Java's
+// QwpQueryClientFromConfigTest pins.
+func TestQwpQueryClientFromConfCompressionVariations(t *testing.T) {
+	type compCase struct {
+		name             string
+		conf             string
+		wantCompression  string
+		wantLevel        int
+		wantErrIn        string
+		wantHeaderHasZst bool
+	}
+	cases := []compCase{
+		{
+			name:            "default_is_raw",
+			conf:            "ws::addr=db:9000;",
+			wantCompression: qwpCompressionRaw,
+			wantLevel:       qwpDefaultCompressionLevel,
+		},
+		{
+			name:             "zstd_at_lower_bound",
+			conf:             "ws::addr=db:9000;compression=zstd;compression_level=1;",
+			wantCompression:  qwpCompressionZstd,
+			wantLevel:        1,
+			wantHeaderHasZst: true,
+		},
+		{
+			name:             "zstd_at_upper_bound",
+			conf:             "ws::addr=db:9000;compression=zstd;compression_level=22;",
+			wantCompression:  qwpCompressionZstd,
+			wantLevel:        22,
+			wantHeaderHasZst: true,
+		},
+		{
+			name:             "auto_also_advertises_zstd",
+			conf:             "ws::addr=db:9000;compression=auto;",
+			wantCompression:  qwpCompressionAuto,
+			wantLevel:        qwpDefaultCompressionLevel,
+			wantHeaderHasZst: true,
+		},
+		{
+			name:            "raw_explicit",
+			conf:            "ws::addr=db:9000;compression=raw;",
+			wantCompression: qwpCompressionRaw,
+			wantLevel:       qwpDefaultCompressionLevel,
+		},
+		{
+			name:      "level_zero_rejected",
+			conf:      "ws::addr=db:9000;compression_level=0;",
+			wantErrIn: "must be in [1, 22]",
+		},
+		{
+			name:      "level_negative_rejected",
+			conf:      "ws::addr=db:9000;compression_level=-1;",
+			wantErrIn: "must be in [1, 22]",
+		},
+		{
+			name:      "level_too_large_rejected",
+			conf:      "ws::addr=db:9000;compression_level=23;",
+			wantErrIn: "must be in [1, 22]",
+		},
+		{
+			name:      "level_non_numeric_rejected",
+			conf:      "ws::addr=db:9000;compression_level=high;",
+			wantErrIn: "invalid compression_level",
+		},
+		{
+			name:      "compression_invalid_rejected",
+			conf:      "ws::addr=db:9000;compression=gzip;",
+			wantErrIn: "invalid compression",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := parseQwpQueryConf(c.conf)
+			if c.wantErrIn != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q", c.wantErrIn)
+				}
+				if !strings.Contains(err.Error(), c.wantErrIn) {
+					t.Errorf("err=%v, want %q", err, c.wantErrIn)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if cfg.compression != c.wantCompression {
+				t.Errorf("compression=%q, want %q", cfg.compression, c.wantCompression)
+			}
+			if cfg.compressionLevel != c.wantLevel {
+				t.Errorf("compressionLevel=%d, want %d", cfg.compressionLevel, c.wantLevel)
+			}
+			h := cfg.buildAcceptEncodingHeader()
+			if c.wantHeaderHasZst {
+				if !strings.Contains(h, "zstd") {
+					t.Errorf("buildAcceptEncodingHeader=%q, want to contain 'zstd'", h)
+				}
+				if !strings.Contains(h, "raw") {
+					t.Errorf("buildAcceptEncodingHeader=%q, want to contain 'raw' fallback", h)
+				}
+			} else {
+				if h != "" {
+					t.Errorf("buildAcceptEncodingHeader=%q, want empty for raw", h)
+				}
+			}
+		})
+	}
+}
+
 // --- Functional options tests ---
 
 func TestQwpQueryClientOptionsApply(t *testing.T) {
