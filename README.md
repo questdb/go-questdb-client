@@ -264,7 +264,7 @@ and `Close` (on the client) are safe to call from any goroutine,
 including from within an in-flight iterator.
 
 A complete runnable example is at
-[`examples/qwp/query/main.go`](examples/qwp/query/main.go).
+[`examples/qwp/basic-query/main.go`](examples/qwp/basic-query/main.go).
 
 ## N-dimensional arrays
 
