@@ -223,6 +223,8 @@ func TestQwpQueryClientFromConfErrors(t *testing.T) {
 		{"compression_level_non_numeric", "ws::addr=a:1;compression=zstd;compression_level=seven;", "invalid compression_level"},
 		{"compression_level_too_low", "ws::addr=a:1;compression=zstd;compression_level=0;", "compression level must be in [1, 22]"},
 		{"compression_level_too_high", "ws::addr=a:1;compression=zstd;compression_level=23;", "compression level must be in [1, 22]"},
+		{"server_info_timeout_zero", "ws::addr=a:1;server_info_timeout_ms=0;", "server_info_timeout_ms must be > 0"},
+		{"server_info_timeout_negative", "ws::addr=a:1;server_info_timeout_ms=-1;", "server_info_timeout_ms must be > 0"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -372,9 +372,11 @@ func WithQwpQueryFailoverBackoff(initial, max time.Duration) QwpQueryClientOptio
 // WithQwpQueryServerInfoTimeout overrides the SERVER_INFO read
 // deadline applied during each WebSocket upgrade. Default
 // qwpDefaultServerInfoTimeout (5s) matches Java's
-// DEFAULT_SERVER_INFO_TIMEOUT_MS. Must be > 0; setting 0 disables the
-// SERVER_INFO read entirely (only safe when target=any AND the server
-// is known to be v1).
+// DEFAULT_SERVER_INFO_TIMEOUT_MS. Must be > 0: the egress handshake
+// always advertises maxVersion=qwpMaxSupportedVersion, so a v2 server
+// will negotiate v2 and emit SERVER_INFO unconditionally — skipping
+// the synchronous drain would leave that frame in the recv buffer
+// where the I/O loop would later misread it as a query response.
 func WithQwpQueryServerInfoTimeout(d time.Duration) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.serverInfoTimeout = d }
 }

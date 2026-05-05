@@ -109,9 +109,9 @@ type qwpQueryClientConfig struct {
 	// qwpDefaultFailoverMaxBackoff.
 	failoverBackoffMax time.Duration
 	// serverInfoTimeout bounds the synchronous read of SERVER_INFO
-	// after each upgrade. Only consulted when target != qwpTargetAny
-	// (which forces v2 negotiation) or when the caller advertises
-	// maxVersion >= 2 explicitly. Default
+	// after each upgrade. Egress always advertises maxVersion=v2 in
+	// the handshake, so a v2 server will emit SERVER_INFO and the
+	// drain is mandatory; must be > 0. Default
 	// qwpDefaultServerInfoTimeout.
 	serverInfoTimeout time.Duration
 	// replayExec opts Exec into transparent replay on transport-
@@ -283,9 +283,9 @@ func (c *qwpQueryClientConfig) validate() error {
 			"qwp query: failover_backoff_max (%v) must be >= failover_backoff_initial (%v)",
 			c.failoverBackoffMax, c.failoverBackoffInitial)
 	}
-	if c.serverInfoTimeout < 0 {
+	if c.serverInfoTimeout <= 0 {
 		return fmt.Errorf(
-			"qwp query: server_info_timeout must be >= 0, got %v", c.serverInfoTimeout)
+			"qwp query: server_info_timeout must be > 0, got %v", c.serverInfoTimeout)
 	}
 	return nil
 }
@@ -497,9 +497,9 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 				return nil, NewInvalidConfigStrError(
 					"invalid server_info_timeout_ms %q: %v", v, err)
 			}
-			if n < 0 {
+			if n <= 0 {
 				return nil, NewInvalidConfigStrError(
-					"server_info_timeout_ms must be >= 0, got %d", n)
+					"server_info_timeout_ms must be > 0, got %d", n)
 			}
 			cfg.serverInfoTimeout = time.Duration(n) * time.Millisecond
 		case "replay_exec":
