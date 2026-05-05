@@ -461,7 +461,7 @@ func (s *qwpQuerySession) shouldReplay() bool {
 // configured ceiling. attempt < 1 returns zero (no sleep before
 // the very first try).
 func computeBackoff(cfg *qwpQueryClientConfig, attempt int) time.Duration {
-	if attempt < 1 {
+	if attempt < 1 || cfg.failoverBackoffInitial == 0 {
 		return 0
 	}
 	shift := attempt - 1

@@ -791,4 +791,19 @@ func TestQwpComputeBackoffMonotonic(t *testing.T) {
 				tc.attempt, got, tc.want)
 		}
 	}
+
+	// initial=0 disables backoff entirely, mirroring Java's
+	// `if (failoverInitialBackoffMs > 0L)` guard. Without the
+	// early return, the `d <= 0` overflow branch would fall
+	// through to max for every attempt >= 1.
+	zeroCfg := &qwpQueryClientConfig{
+		failoverBackoffInitial: 0,
+		failoverBackoffMax:     1 * time.Second,
+	}
+	for _, attempt := range []int{0, 1, 2, 5, 100} {
+		if got := computeBackoff(zeroCfg, attempt); got != 0 {
+			t.Errorf("computeBackoff(initial=0, attempt=%d) = %v, want 0",
+				attempt, got)
+		}
+	}
 }
