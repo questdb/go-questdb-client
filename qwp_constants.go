@@ -259,6 +259,16 @@ const (
 	// the Java reference decoder (QwpResultBatchDecoder.java) so hostile
 	// or buggy server frames that advertise out-of-range dimensions are
 	// rejected before any large allocation.
+
+	// qwpMaxBatchSize is the headline protocol cap on a single
+	// RESULT_BATCH frame's wire size, in bytes. Spec §14 "Protocol
+	// Limits" pins this at 16 MiB; the Java server enforces the same
+	// value via QwpConstants.DEFAULT_MAX_BATCH_SIZE. Acts as a direct
+	// upper bound checked before per-section bounds (row count, column
+	// count, dict heap, zstd content size) come into play — those
+	// remain as defense-in-depth, but the single cap is the spec-level
+	// limit a conformant server stays under.
+	qwpMaxBatchSize     = 16 * 1024 * 1024
 	qwpMaxRowsPerBatch  = 1_048_576 // per-batch row cap
 	qwpMaxTableNameLen  = 127       // UTF-8 bytes
 	qwpMaxColumnNameLen = 127       // UTF-8 bytes

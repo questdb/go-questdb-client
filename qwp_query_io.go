@@ -337,6 +337,10 @@ func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
 // what makes tr.close() safe to call right after shutdown() returns:
 // the reader's conn.Read has already unwound before doneCh fires.
 func (io *qwpEgressIO) start() {
+	// Pin the decoder to the version the transport negotiated so
+	// parseFrameHeader rejects any server frame whose header version
+	// byte doesn't match (spec §3 strict-equality requirement).
+	io.decoder.negotiatedVersion = io.transport.negotiatedVersion
 	io.shutdownWG.Add(2)
 	go func() {
 		defer io.shutdownWG.Done()

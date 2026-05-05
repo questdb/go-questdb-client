@@ -48,9 +48,20 @@ import (
 // Tests drive it imperatively: read a frame (typically QUERY_REQUEST /
 // CANCEL / CREDIT), send a scripted response (RESULT_BATCH,
 // RESULT_END, QUERY_ERROR, EXEC_DONE), close cleanly.
+//
+// version, when non-zero, is the QWP wire-protocol version the mock
+// claims to have negotiated in X-QWP-Version. sendBinary rewrites the
+// header version byte of every frame to this value before writing —
+// the shared frame builders (writeQwpFrame, buildOneRowInt64Batch)
+// stamp v1 unconditionally, but the strict-equality check in
+// qwpQueryDecoder.parseFrameHeader requires server frames to match
+// the negotiated version. Tests that negotiate v1 (the default) leave
+// version=0 to skip the rewrite; v2 cluster mocks set it to
+// qwpMaxSupportedVersion.
 type qwpMockEgressConn struct {
-	t    *testing.T
-	conn *websocket.Conn
+	t       *testing.T
+	conn    *websocket.Conn
+	version byte
 }
 
 // readBinary reads one binary frame from the client. Skips non-binary
@@ -68,9 +79,14 @@ func (m *qwpMockEgressConn) readBinary(ctx context.Context) []byte {
 	}
 }
 
-// sendBinary sends one binary frame to the client.
+// sendBinary sends one binary frame to the client. When m.version is
+// non-zero, the frame's QWP header version byte (offset 4) is rewritten
+// to that value first — see the type comment for the rationale.
 func (m *qwpMockEgressConn) sendBinary(ctx context.Context, data []byte) {
 	m.t.Helper()
+	if m.version != 0 && len(data) > 4 {
+		data[4] = m.version
+	}
 	if err := m.conn.Write(ctx, websocket.MessageBinary, data); err != nil {
 		m.t.Fatalf("mock: write: %v", err)
 	}

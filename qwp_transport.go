@@ -294,7 +294,7 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 			t.conn = nil
 			return fmt.Errorf("qwp: expected SERVER_INFO binary frame, got %v", msgType)
 		}
-		info, err := decodeServerInfo(payload)
+		info, err := decodeServerInfo(payload, t.negotiatedVersion)
 		if err != nil {
 			t.conn.Close(websocket.StatusProtocolError, "SERVER_INFO decode failed")
 			t.conn = nil

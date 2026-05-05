@@ -76,6 +76,14 @@ func wrapAsResultBatch(ingress []byte, requestId int64, batchSeq uint64) []byte 
 	return out
 }
 
+// newTestQueryDecoder returns a zero-valued decoder seeded with the
+// negotiated version every test fixture stamps into its frames
+// (qwpVersion = 1). Production code sets this field via
+// qwpEgressIO.start; tests construct decoders directly.
+func newTestQueryDecoder() qwpQueryDecoder {
+	return qwpQueryDecoder{negotiatedVersion: qwpVersion}
+}
+
 // encodeSingleColumnBatch is a convenience that builds a one-column
 // table, populates it via the supplied per-row callbacks, and wraps
 // the output as a RESULT_BATCH frame. Each entry in `rows` is called
@@ -344,7 +352,7 @@ func TestQwpDecoderRoundTripFixedWidth(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			frame := encodeSingleColumnBatch(t, "c", c.wt, false, c.rows)
-			var dec qwpQueryDecoder
+			dec := newTestQueryDecoder()
 			var batch QwpColumnBatch
 			if err := dec.decode(frame, &batch); err != nil {
 				t.Fatalf("decode: %v", err)
@@ -366,7 +374,7 @@ func TestQwpDecoderRoundTripNullable(t *testing.T) {
 		func(c *qwpColumnBuffer) { c.addNull() },
 		func(c *qwpColumnBuffer) { c.addLong(30) },
 	})
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame, &batch); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -402,7 +410,7 @@ func TestQwpDecoderRoundTripVarcharAndBinary(t *testing.T) {
 				func(c *qwpColumnBuffer) { c.addString("日本語") },
 				func(c *qwpColumnBuffer) { c.addString("x") },
 			})
-			var dec qwpQueryDecoder
+			dec := newTestQueryDecoder()
 			var batch QwpColumnBatch
 			if err := dec.decode(frame, &batch); err != nil {
 				t.Fatalf("decode: %v", err)
@@ -426,7 +434,7 @@ func TestQwpDecoderRoundTripTimestampGorilla(t *testing.T) {
 		rows[i] = func(c *qwpColumnBuffer) { c.addLong(v) }
 	}
 	frame := encodeSingleColumnBatch(t, "ts", qwpTypeTimestamp, false, rows)
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame, &batch); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -455,7 +463,7 @@ func TestQwpDecoderRoundTripTimestampUncompressed(t *testing.T) {
 	var enc qwpEncoder
 	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame, &batch); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -490,7 +498,7 @@ func TestQwpDecoderRoundTripGeohash(t *testing.T) {
 			var enc qwpEncoder
 			frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
 
-			var dec qwpQueryDecoder
+			dec := newTestQueryDecoder()
 			var batch QwpColumnBatch
 			if err := dec.decode(frame, &batch); err != nil {
 				t.Fatalf("decode: %v", err)
@@ -567,7 +575,7 @@ func TestQwpDecoderRoundTripDecimal128(t *testing.T) {
 	var enc qwpEncoder
 	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame, &batch); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -627,7 +635,7 @@ func TestQwpDecoderRoundTripDecimal256(t *testing.T) {
 	var enc qwpEncoder
 	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame, &batch); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -668,7 +676,7 @@ func TestQwpDecoderRoundTripInt64Array(t *testing.T) {
 	var enc qwpEncoder
 	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame, &batch); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -710,7 +718,7 @@ func TestQwpDecoderRoundTripFloat64Array(t *testing.T) {
 	var enc qwpEncoder
 	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame, &batch); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -759,7 +767,7 @@ func TestQwpDecoderRoundTripSymbolDelta(t *testing.T) {
 	ingress2 := enc.encodeTableWithDeltaDict(tb2, globalDict, 2, 3, qwpSchemaModeReference, 0)
 	frame2 := wrapAsResultBatch(ingress2, 1, 1)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var b1, b2 QwpColumnBatch
 	if err := dec.decode(frame1, &b1); err != nil {
 		t.Fatalf("decode frame1: %v", err)
@@ -798,7 +806,7 @@ func TestQwpDecoderSchemaModeReference(t *testing.T) {
 	tb2.commitRow()
 	frame2 := wrapAsResultBatch(enc.encodeTable(tb2, qwpSchemaModeReference, 7), 1, 1)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame1, &batch); err != nil {
 		t.Fatalf("decode frame1: %v", err)
@@ -991,38 +999,87 @@ func itoa(n int) string {
 
 func TestQwpDecoderHardening(t *testing.T) {
 	t.Run("H1_PayloadTooShort", func(t *testing.T) {
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(make([]byte, 5), &b)
 		assertDecodeErrContains(t, err, "too short")
 	})
 
+	t.Run("H1a_BatchExceedsWireCap", func(t *testing.T) {
+		// Spec §14: RESULT_BATCH wire size is capped at 16 MiB. A
+		// conformant server stays under; a hostile / buggy server that
+		// goes over must be rejected up front, before any header,
+		// schema, or body bound is exercised. The frame contents do
+		// not need to be valid — the cap fires first.
+		payload := make([]byte, qwpMaxBatchSize+1)
+		dec := newTestQueryDecoder()
+		var b QwpColumnBatch
+		err := dec.decode(payload, &b)
+		assertDecodeErrContains(t, err, "exceeds protocol cap")
+	})
+
+	t.Run("H1b_BatchAtWireCapAccepted", func(t *testing.T) {
+		// A frame whose total wire size equals the 16 MiB cap exactly
+		// must pass the size guard and continue into the regular
+		// parse. We use a minimal valid frame padded out to the cap
+		// via a long table name (still inside the per-table-name
+		// limits enforced downstream — here the parse fails for an
+		// unrelated reason: name_len > qwpMaxTableNameLen). The point
+		// of this test is only to pin that the size guard does NOT
+		// reject a frame at exactly qwpMaxBatchSize bytes.
+		buf := writeMinimalResultBatch(0)
+		// Pad with arbitrary trailing bytes so len(buf) == qwpMaxBatchSize.
+		// The decoder rejects on a downstream check (specifically the
+		// table-name-length cap or end-of-frame mismatch), not on the
+		// size guard, which is what this test asserts.
+		pad := qwpMaxBatchSize - len(buf)
+		if pad < 0 {
+			t.Fatalf("minimal frame already exceeds cap (%d > %d)", len(buf), qwpMaxBatchSize)
+		}
+		buf = append(buf, make([]byte, pad)...)
+		if len(buf) != qwpMaxBatchSize {
+			t.Fatalf("padded frame has %d bytes, want %d", len(buf), qwpMaxBatchSize)
+		}
+		dec := newTestQueryDecoder()
+		var b QwpColumnBatch
+		err := dec.decode(buf, &b)
+		// Any non-size error is fine; the test fails only if the size
+		// guard incorrectly rejects a frame at the cap.
+		if err != nil && strings.Contains(err.Error(), "exceeds protocol cap") {
+			t.Fatalf("frame at cap rejected by size guard: %v", err)
+		}
+	})
+
 	t.Run("H2_BadMagic", func(t *testing.T) {
 		buf := writeMinimalResultBatch(0)
 		buf[0] = 0xFF
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "bad magic")
 	})
 
-	t.Run("H3_UnsupportedVersion", func(t *testing.T) {
-		buf := writeMinimalResultBatch(0)
-		// Version byte must exceed qwpMaxSupportedVersion (currently 2);
-		// 0xFF guarantees rejection regardless of how the supported
-		// ceiling moves.
-		buf[4] = 0xFF
-		var dec qwpQueryDecoder
-		var b QwpColumnBatch
-		err := dec.decode(buf, &b)
-		assertDecodeErrContains(t, err, "unsupported version")
+	t.Run("H3_VersionMismatch", func(t *testing.T) {
+		// Spec §3 requires strict equality between the frame's header
+		// version byte and the negotiated version. The default test
+		// decoder is pinned to qwpVersion (= 1); any other value must
+		// be rejected — including a value within the supported range
+		// (0x02), not just 0xFF.
+		for _, v := range []byte{0x02, 0xFF} {
+			buf := writeMinimalResultBatch(0)
+			buf[4] = v
+			dec := newTestQueryDecoder()
+			var b QwpColumnBatch
+			err := dec.decode(buf, &b)
+			assertDecodeErrContains(t, err, "does not match negotiated version")
+		}
 	})
 
 	t.Run("H4_UnexpectedMsgKind", func(t *testing.T) {
 		buf := writeMinimalResultBatch(0)
 		// msg_kind is the first byte after the 12-byte header.
 		buf[qwpHeaderSize] = 0x00
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "expected RESULT_BATCH")
@@ -1034,7 +1091,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 			0x80, 0x80, 0x80, 0x80, 0x80,
 			0x80, 0x80, 0x80, 0x80, 0x01,
 		})
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		// Both phrasings acceptable — we fail at varintInt63 with
@@ -1063,7 +1120,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 0)
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "row_count")
@@ -1071,7 +1128,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 
 	t.Run("H11_HugeSchemaId", func(t *testing.T) {
 		buf := writeMinimalResultBatch(1_000_000_000)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "schema_id")
@@ -1083,7 +1140,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		buf := writeMinimalResultBatchWithRawSchemaIdVarint([]byte{
 			0x80, 0x80, 0x80, 0x80, 0x08,
 		})
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "schema_id")
@@ -1106,7 +1163,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 42) // unknown id
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "not registered")
@@ -1119,7 +1176,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// + row_count(1) + col_count(1) = 25 → offset 25 is the
 		// schema mode byte.
 		buf[qwpHeaderSize+1+8+1+1+1+1] = 0x42
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "unknown schema mode")
@@ -1127,7 +1184,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 
 	t.Run("H16_StringNegativeTotalBytes", func(t *testing.T) {
 		buf := writeStringResultBatch(1, -1)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "total bytes")
@@ -1135,7 +1192,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 
 	t.Run("H17_StringValidTotalBytesAccepted", func(t *testing.T) {
 		buf := writeStringResultBatch(1, 5)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		if err := dec.decode(buf, &b); err != nil {
 			t.Fatalf("valid totalBytes rejected: %v", err)
@@ -1149,7 +1206,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// Row 0 spans [0, 8), row 1 spans [8, 5) — slicing would
 		// panic in qwpStringSlice.
 		buf := writeStringResultBatchCustom([]uint32{0, 8, 5}, []byte("helloworld"))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "offset at index")
@@ -1159,7 +1216,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// Row 0 claims to run to offset 11 but totalBytes = 10 —
 		// the final slice is length 10, so end=11 would panic.
 		buf := writeStringResultBatchCustom([]uint32{0, 11, 10}, []byte("0123456789"))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "offset at index")
@@ -1167,7 +1224,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 
 	t.Run("H17c_StringFirstOffsetNotZero", func(t *testing.T) {
 		buf := writeStringResultBatchCustom([]uint32{3, 5}, []byte("hello"))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "first offset")
@@ -1197,7 +1254,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "unsupported wire type")
@@ -1211,7 +1268,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// cannot sneak past the decoder.
 		buf := writeMinimalResultBatch(0)
 		buf[qwpHeaderOffsetFlags] |= qwpFlagZstd
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		defer dec.close()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
@@ -1242,7 +1299,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "out of sync")
@@ -1277,7 +1334,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "nonNull<3")
@@ -1301,7 +1358,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "column_count")
@@ -1323,7 +1380,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "table name length")
@@ -1350,7 +1407,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "column name length")
@@ -1374,7 +1431,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "delta symbol section")
@@ -1384,7 +1441,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// DOUBLE_ARRAY column, row_count=1, non-null, nDims=1,
 		// shape[0] = -1 (as int32). The decoder must reject.
 		frame := buildArrayHardeningFrame(t, 1, []int32{-1})
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(frame, &b)
 		assertDecodeErrContains(t, err, "ARRAY dim")
@@ -1394,7 +1451,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// Two dims whose product overflows qwpMaxArrayElements.
 		big := int32(1<<20 + 1)
 		frame := buildArrayHardeningFrame(t, 2, []int32{big, big})
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(frame, &b)
 		assertDecodeErrContains(t, err, "element count")
@@ -1403,7 +1460,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 	t.Run("H29_ArrayNDimsOutOfRange", func(t *testing.T) {
 		// nDims > qwpMaxArrayNDims is still rejected.
 		frame := buildArrayHardeningFrame(t, qwpMaxArrayNDims+1, nil)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(frame, &b)
 		assertDecodeErrContains(t, err, "ARRAY nDims")
@@ -1414,7 +1471,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// an inline nDims=0 on a row the bitmap marked non-null is a
 		// malformed frame. The decoder must reject it.
 		frame := buildArrayHardeningFrame(t, 0, nil)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(frame, &b)
 		assertDecodeErrContains(t, err, "ARRAY nDims")
@@ -1445,7 +1502,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
 		assertDecodeErrContains(t, err, "geohash precision")
@@ -1552,7 +1609,7 @@ func buildExecDoneBody(requestId int64, opType byte, rowsAffected uint64) []byte
 func TestQwpDecoderResultEnd(t *testing.T) {
 	t.Run("RoundTrip", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildResultEndBody(42, 7, 1234))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		reqId, total, err := dec.decodeResultEnd(frame)
 		if err != nil {
 			t.Fatalf("decodeResultEnd: %v", err)
@@ -1567,7 +1624,7 @@ func TestQwpDecoderResultEnd(t *testing.T) {
 
 	t.Run("ZeroRows", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildResultEndBody(1, 0, 0))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, total, err := dec.decodeResultEnd(frame)
 		if err != nil {
 			t.Fatalf("decodeResultEnd: %v", err)
@@ -1581,7 +1638,7 @@ func TestQwpDecoderResultEnd(t *testing.T) {
 		body := buildResultEndBody(1, 0, 0)
 		body[0] = byte(qwpMsgKindExecDone)
 		frame := writeQwpFrame(0, body)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeResultEnd(frame)
 		assertDecodeErrContains(t, err, "expected RESULT_END")
 	})
@@ -1589,7 +1646,7 @@ func TestQwpDecoderResultEnd(t *testing.T) {
 	t.Run("TruncatedBeforeRequestId", func(t *testing.T) {
 		// Header + msg_kind only.
 		frame := writeQwpFrame(0, []byte{byte(qwpMsgKindResultEnd)})
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeResultEnd(frame)
 		assertDecodeErrContains(t, err, "end of buffer")
 	})
@@ -1599,7 +1656,7 @@ func TestQwpDecoderResultEnd(t *testing.T) {
 		body.WriteByte(byte(qwpMsgKindResultEnd))
 		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
 		frame := writeQwpFrame(0, body.Bytes())
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeResultEnd(frame)
 		assertDecodeErrContains(t, err, "truncated")
 	})
@@ -1616,7 +1673,7 @@ func TestQwpDecoderResultEnd(t *testing.T) {
 			0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
 		})
 		frame := writeQwpFrame(0, body.Bytes())
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeResultEnd(frame)
 		if err == nil {
 			t.Fatal("expected varint overflow error, got nil")
@@ -1626,7 +1683,7 @@ func TestQwpDecoderResultEnd(t *testing.T) {
 	t.Run("BadMagic", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildResultEndBody(1, 0, 0))
 		frame[0] = 0xFF
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeResultEnd(frame)
 		assertDecodeErrContains(t, err, "bad magic")
 	})
@@ -1636,7 +1693,7 @@ func TestQwpDecoderResultEnd(t *testing.T) {
 		// RESULT_END frame is a protocol violation that the decoder
 		// catches at the top of decodeResultEnd.
 		frame := writeQwpFrame(qwpFlagZstd, buildResultEndBody(1, 0, 0))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeResultEnd(frame)
 		assertDecodeErrContains(t, err, "FLAG_ZSTD set on non-RESULT_BATCH")
 	})
@@ -1646,7 +1703,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 	// Port of Java QwpResultBatchDecoderHardeningTest.testQueryErrorValidMessageDecodes.
 	t.Run("ValidMessageDecodes", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildQueryErrorBody(99, 0x05, "boom", -1))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		qe, err := dec.decodeQueryError(frame)
 		if err != nil {
 			t.Fatalf("decodeQueryError: %v", err)
@@ -1666,7 +1723,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 	// 0xFFFF but the frame has no bytes of message.
 	t.Run("MsgLenOverrunRejected", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildQueryErrorBody(0, 0, "", 0xFFFF))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, err := dec.decodeQueryError(frame)
 		assertDecodeErrContains(t, err, "msg_len")
 		if !strings.Contains(err.Error(), "exceeds") {
@@ -1676,7 +1733,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 
 	t.Run("EmptyMessage", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusCancelled), "", -1))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		qe, err := dec.decodeQueryError(frame)
 		if err != nil {
 			t.Fatalf("decodeQueryError: %v", err)
@@ -1692,7 +1749,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 	t.Run("CancelledStatusSurfaces", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusCancelled),
 			"query cancelled", -1))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		qe, err := dec.decodeQueryError(frame)
 		if err != nil {
 			t.Fatalf("decodeQueryError: %v", err)
@@ -1707,7 +1764,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 	t.Run("LimitExceededStatusSurfaces", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusLimitExceeded),
 			"rows cap hit", -1))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		qe, err := dec.decodeQueryError(frame)
 		if err != nil {
 			t.Fatalf("decodeQueryError: %v", err)
@@ -1721,7 +1778,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 		body := buildQueryErrorBody(1, 0x05, "x", -1)
 		body[0] = byte(qwpMsgKindResultBatch)
 		frame := writeQwpFrame(0, body)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, err := dec.decodeQueryError(frame)
 		assertDecodeErrContains(t, err, "expected QUERY_ERROR")
 	})
@@ -1731,7 +1788,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 		body.WriteByte(byte(qwpMsgKindQueryError))
 		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
 		frame := writeQwpFrame(0, body.Bytes())
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, err := dec.decodeQueryError(frame)
 		assertDecodeErrContains(t, err, "end of buffer")
 	})
@@ -1744,7 +1801,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 		// Only 1 byte after status — msg_len needs 2.
 		body.WriteByte(0x00)
 		frame := writeQwpFrame(0, body.Bytes())
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, err := dec.decodeQueryError(frame)
 		assertDecodeErrContains(t, err, "end of buffer")
 	})
@@ -1752,7 +1809,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 	t.Run("UnicodeMessage", func(t *testing.T) {
 		msg := "ünïcødé ⚠"
 		frame := writeQwpFrame(0, buildQueryErrorBody(1, 0x06, msg, -1))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		qe, err := dec.decodeQueryError(frame)
 		if err != nil {
 			t.Fatalf("decodeQueryError: %v", err)
@@ -1766,7 +1823,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 func TestQwpDecoderExecDone(t *testing.T) {
 	t.Run("RoundTrip", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildExecDoneBody(100, 0x04, 42))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		reqId, res, err := dec.decodeExecDone(frame)
 		if err != nil {
 			t.Fatalf("decodeExecDone: %v", err)
@@ -1784,7 +1841,7 @@ func TestQwpDecoderExecDone(t *testing.T) {
 
 	t.Run("PureDDLZeroRows", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildExecDoneBody(1, 0x01, 0))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, res, err := dec.decodeExecDone(frame)
 		if err != nil {
 			t.Fatalf("decodeExecDone: %v", err)
@@ -1798,7 +1855,7 @@ func TestQwpDecoderExecDone(t *testing.T) {
 		body := buildExecDoneBody(1, 0x01, 0)
 		body[0] = byte(qwpMsgKindQueryError)
 		frame := writeQwpFrame(0, body)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeExecDone(frame)
 		assertDecodeErrContains(t, err, "expected EXEC_DONE")
 	})
@@ -1808,7 +1865,7 @@ func TestQwpDecoderExecDone(t *testing.T) {
 		body.WriteByte(byte(qwpMsgKindExecDone))
 		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
 		frame := writeQwpFrame(0, body.Bytes())
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeExecDone(frame)
 		assertDecodeErrContains(t, err, "end of buffer")
 	})
@@ -1819,7 +1876,7 @@ func TestQwpDecoderExecDone(t *testing.T) {
 		_ = binary.Write(&body, binary.LittleEndian, uint64(1))
 		body.WriteByte(0x04)
 		frame := writeQwpFrame(0, body.Bytes())
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeExecDone(frame)
 		assertDecodeErrContains(t, err, "truncated")
 	})
@@ -1834,7 +1891,7 @@ func TestQwpDecoderExecDone(t *testing.T) {
 			0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
 		})
 		frame := writeQwpFrame(0, body.Bytes())
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeExecDone(frame)
 		if err == nil {
 			t.Fatal("expected varint overflow error, got nil")
@@ -1854,7 +1911,7 @@ func TestQwpDecoderExecDone(t *testing.T) {
 			0x80, 0x80, 0x80, 0x80, 0x01,
 		})
 		frame := writeQwpFrame(0, body.Bytes())
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, _, err := dec.decodeExecDone(frame)
 		assertDecodeErrContains(t, err, "int63")
 	})
@@ -1879,7 +1936,7 @@ func TestQwpDecoderCacheReset(t *testing.T) {
 			qwpResetMaskDict | qwpResetMaskSchemas,
 		} {
 			frame := writeQwpFrame(0, buildCacheResetBody(mask))
-			var dec qwpQueryDecoder
+			dec := newTestQueryDecoder()
 			got, err := dec.decodeCacheReset(frame)
 			if err != nil {
 				t.Fatalf("mask=0x%02X: decodeCacheReset: %v", mask, err)
@@ -1896,7 +1953,7 @@ func TestQwpDecoderCacheReset(t *testing.T) {
 		// make forward compatibility impossible. Caller (applyCacheReset)
 		// ignores bits it does not recognise; decode preserves them.
 		frame := writeQwpFrame(0, buildCacheResetBody(0xFF))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		got, err := dec.decodeCacheReset(frame)
 		if err != nil {
 			t.Fatalf("decodeCacheReset: %v", err)
@@ -1910,7 +1967,7 @@ func TestQwpDecoderCacheReset(t *testing.T) {
 		body := buildCacheResetBody(qwpResetMaskDict)
 		body[0] = byte(qwpMsgKindResultEnd)
 		frame := writeQwpFrame(0, body)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, err := dec.decodeCacheReset(frame)
 		assertDecodeErrContains(t, err, "expected CACHE_RESET")
 	})
@@ -1919,7 +1976,7 @@ func TestQwpDecoderCacheReset(t *testing.T) {
 		// Header + msg_kind only, reset_mask missing. Java mirrors this
 		// with "CACHE_RESET frame truncated before reset_mask".
 		frame := writeQwpFrame(0, []byte{byte(qwpMsgKindCacheReset)})
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, err := dec.decodeCacheReset(frame)
 		assertDecodeErrContains(t, err, "truncated before reset_mask")
 	})
@@ -1927,7 +1984,7 @@ func TestQwpDecoderCacheReset(t *testing.T) {
 	t.Run("BadMagic", func(t *testing.T) {
 		frame := writeQwpFrame(0, buildCacheResetBody(qwpResetMaskDict))
 		frame[0] = 0xFF
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, err := dec.decodeCacheReset(frame)
 		assertDecodeErrContains(t, err, "bad magic")
 	})
@@ -1937,7 +1994,7 @@ func TestQwpDecoderCacheReset(t *testing.T) {
 		// valid on RESULT_BATCH. Match the other non-RESULT_BATCH
 		// decoder guards.
 		frame := writeQwpFrame(qwpFlagZstd, buildCacheResetBody(qwpResetMaskDict))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		_, err := dec.decodeCacheReset(frame)
 		assertDecodeErrContains(t, err, "FLAG_ZSTD set on non-RESULT_BATCH")
 	})
@@ -1959,7 +2016,7 @@ func TestQwpDecoderApplyCacheReset(t *testing.T) {
 		var enc qwpEncoder
 		ingress := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 2, qwpSchemaModeFull, 3)
 		frame := wrapAsResultBatch(ingress, 1, 0)
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		if err := dec.decode(frame, &b); err != nil {
 			t.Fatalf("seed decode: %v", err)
@@ -2327,7 +2384,7 @@ func TestQwpDecoderZstdHappyPath(t *testing.T) {
 			len(compressed), len(raw))
 	}
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	defer dec.close()
 	var b QwpColumnBatch
 	if err := dec.decode(compressed, &b); err != nil {
@@ -2372,7 +2429,7 @@ func TestQwpDecoderZstdReusesScratchAcrossDecodes(t *testing.T) {
 		return compressResultBatchBody(t, raw)
 	}
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	defer dec.close()
 	var b QwpColumnBatch
 
@@ -2418,7 +2475,7 @@ func TestQwpDecoderZstdHardening(t *testing.T) {
 		frame := make([]byte, len(baseRaw))
 		copy(frame, baseRaw)
 		frame[qwpHeaderOffsetFlags] |= qwpFlagZstd
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		defer dec.close()
 		var b QwpColumnBatch
 		err := dec.decode(frame, &b)
@@ -2434,7 +2491,7 @@ func TestQwpDecoderZstdHardening(t *testing.T) {
 		// Patch payload length to reflect the shorter body.
 		binary.LittleEndian.PutUint32(frame[qwpHeaderOffsetPayloadLen:],
 			uint32(len(frame)-qwpHeaderSize))
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		defer dec.close()
 		var b QwpColumnBatch
 		err := dec.decode(frame, &b)
@@ -2488,7 +2545,7 @@ func TestQwpDecoderZstdHardening(t *testing.T) {
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:],
 			uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		defer dec.close()
 		var b QwpColumnBatch
 		err = dec.decode(out, &b)
@@ -2530,7 +2587,7 @@ func TestQwpDecoderZstdHardening(t *testing.T) {
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:],
 			uint32(len(out)-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		defer dec.close()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
@@ -2550,7 +2607,7 @@ func TestQwpDecoderZstdHardening(t *testing.T) {
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:],
 			uint32(p-qwpHeaderSize))
 
-		var dec qwpQueryDecoder
+		dec := newTestQueryDecoder()
 		defer dec.close()
 		var b QwpColumnBatch
 		err := dec.decode(out, &b)
@@ -2562,7 +2619,7 @@ func TestQwpDecoderZstdCloseIsIdempotent(t *testing.T) {
 	// decoder.close() must be safe to call more than once and must
 	// cope with a never-initialised zstd decoder. Exercises the nil
 	// branch of the close path.
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	dec.close()
 	dec.close()
 }
@@ -2589,7 +2646,7 @@ func TestQwpColumnBatchCopyAllZstdSurvivesPoolReuse(t *testing.T) {
 		return compressResultBatchBody(t, raw)
 	}
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	defer dec.close()
 	var b QwpColumnBatch
 	if err := dec.decode(buildStrings([]string{"hello", "world"}, 0, qwpSchemaModeFull), &b); err != nil {

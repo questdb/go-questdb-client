@@ -727,7 +727,7 @@ func TestQwpColumnBatchCopyAllGorillaTimestampSurvivesPoolReuse(t *testing.T) {
 	}
 	frame2 := encodeSingleColumnBatch(t, "ts", qwpTypeTimestamp, false, freshRows)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frame1, &batch); err != nil {
 		t.Fatalf("decode 1: %v", err)
@@ -803,7 +803,7 @@ func TestQwpColumnBatchCopyAllScaleAndPrecisionAreRaceFree(t *testing.T) {
 	frameA := buildDecimalGeohashFrame(t, 2, 20, 12345)
 	frameB := buildDecimalGeohashFrame(t, 7, 40, 99999)
 
-	var dec qwpQueryDecoder
+	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
 	if err := dec.decode(frameA, &batch); err != nil {
 		t.Fatalf("decode A: %v", err)

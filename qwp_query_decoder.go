@@ -248,6 +248,14 @@ func (r *qwpSchemaRegistry) clear() {
 //
 // The decoder is not safe for concurrent use.
 type qwpQueryDecoder struct {
+	// negotiatedVersion is the QWP wire-protocol version the transport
+	// settled on during the HTTP upgrade. Every server-to-client frame's
+	// header version byte must equal this value — the spec (§3) requires
+	// strict equality with the negotiated version, not merely
+	// <= qwpMaxSupportedVersion. Set once before the first decode call
+	// (via qwpEgressIO.start) and never mutated afterwards.
+	negotiatedVersion byte
+
 	dict      qwpConnDict
 	schemas   qwpSchemaRegistry
 	gorilla   qwpGorillaDecoder
@@ -287,6 +295,16 @@ func (d *qwpQueryDecoder) close() {
 // reuse payload (or close the WebSocket buffer that backs it) until
 // the caller is done reading out.
 func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
+	// Spec §14 caps a RESULT_BATCH at 16 MiB on the wire. Reject up
+	// front before parsing any header or body fields — a conformant
+	// server stays under the cap, and the per-section bounds below
+	// (row count, dict heap, zstd content size) only act as
+	// defense-in-depth once we are inside the frame.
+	if len(payload) > qwpMaxBatchSize {
+		return newQwpDecodeError(fmt.Sprintf(
+			"RESULT_BATCH wire size %d exceeds protocol cap %d",
+			len(payload), qwpMaxBatchSize))
+	}
 	msgKind, err := d.parseFrameHeader(payload)
 	if err != nil {
 		return err
@@ -944,9 +962,10 @@ func (d *qwpQueryDecoder) parseFrameHeader(payload []byte) (qwpMsgKind, error) {
 	if magic != qwpMagic {
 		return 0, newQwpDecodeError(fmt.Sprintf("bad magic 0x%08X", magic))
 	}
-	if payload[4] > qwpMaxSupportedVersion {
+	if payload[4] != d.negotiatedVersion {
 		return 0, newQwpDecodeError(fmt.Sprintf(
-			"unsupported version %d", payload[4]))
+			"frame version %d does not match negotiated version %d",
+			payload[4], d.negotiatedVersion))
 	}
 	flags := payload[qwpHeaderOffsetFlags]
 	d.deltaOn = flags&qwpFlagDeltaSymbolDict != 0

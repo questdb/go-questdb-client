@@ -103,8 +103,13 @@ func (s *QwpServerInfo) String() string {
 // with bounds checks on every length-prefixed string so a hostile
 // u16 length cannot drag bytes from outside the frame.
 //
+// negotiatedVersion is the QWP wire-protocol version selected by the
+// HTTP upgrade handshake. The frame's header version byte must equal
+// it exactly — spec §3 forbids a version-byte mismatch on any
+// server-to-client frame.
+//
 // Mirrors Java QwpServerInfoDecoder.decode.
-func decodeServerInfo(payload []byte) (*QwpServerInfo, error) {
+func decodeServerInfo(payload []byte, negotiatedVersion byte) (*QwpServerInfo, error) {
 	if len(payload) < qwpHeaderSize+1 {
 		return nil, newQwpDecodeError(fmt.Sprintf(
 			"SERVER_INFO frame too short: %d bytes (need >= %d)",
@@ -119,9 +124,10 @@ func decodeServerInfo(payload []byte) (*QwpServerInfo, error) {
 		return nil, newQwpDecodeError(fmt.Sprintf(
 			"SERVER_INFO bad magic 0x%08X", magic))
 	}
-	if payload[4] > qwpMaxSupportedVersion {
+	if payload[4] != negotiatedVersion {
 		return nil, newQwpDecodeError(fmt.Sprintf(
-			"SERVER_INFO unsupported version %d", payload[4]))
+			"SERVER_INFO frame version %d does not match negotiated version %d",
+			payload[4], negotiatedVersion))
 	}
 
 	br := qwpByteReader{}

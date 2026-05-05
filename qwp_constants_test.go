@@ -231,6 +231,14 @@ func TestQwpMaxSqlTextBytes(t *testing.T) {
 	}
 }
 
+func TestQwpMaxBatchSize(t *testing.T) {
+	// Pinned by spec §14 "Protocol Limits": Max batch size 16 MB.
+	// Mirrors Java QwpConstants.DEFAULT_MAX_BATCH_SIZE.
+	if qwpMaxBatchSize != 16*1024*1024 {
+		t.Errorf("qwpMaxBatchSize = %d, want %d", qwpMaxBatchSize, 16*1024*1024)
+	}
+}
+
 func TestQwpIsFixedWidthType(t *testing.T) {
 	// Go has no isFixedWidth() boolean — the same information is
 	// encoded in qwpFixedTypeSize (>= 0 for fixed, -1 for variable).
