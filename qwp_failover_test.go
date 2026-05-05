@@ -138,7 +138,12 @@ func newMockCluster(t *testing.T, n int, tag func(idx int) (role byte, nodeId, c
 				t.Logf("mock node %d: SERVER_INFO write: %v", idx, err)
 				return
 			}
-			mc := &qwpMockEgressConn{t: t, conn: conn}
+			// Stamp v2 on every frame the mock writes — the cluster
+			// advertises qwpMaxSupportedVersion in X-QWP-Version
+			// (see above), and the decoder's strict-equality version
+			// check rejects frames whose header version byte does not
+			// match the negotiated version.
+			mc := &qwpMockEgressConn{t: t, conn: conn, version: qwpMaxSupportedVersion}
 			if handler != nil {
 				handler(idx, mc)
 			} else {
@@ -685,8 +690,11 @@ func TestQwpFailoverDisabledSurfacesTransportError(t *testing.T) {
 }
 
 // TestQwpFailoverRespectsMaxAttempts verifies that after exhausting
-// failoverMaxAttempts the iterator surfaces the underlying
-// transport error rather than looping forever.
+// failoverMaxAttempts the iterator surfaces a typed
+// *QwpFailoverExhaustedError rather than the underlying transport
+// error and rather than looping forever. The exhaustion error must
+// carry the attempt count and unwrap to the most recent transport
+// failure so callers can errors.As against both shapes.
 func TestQwpFailoverRespectsMaxAttempts(t *testing.T) {
 	// Both nodes always fail; max_attempts = 3 means we get 3
 	// connect attempts total before giving up.
@@ -719,7 +727,10 @@ func TestQwpFailoverRespectsMaxAttempts(t *testing.T) {
 	q := c.Query(ctx, "select 1")
 	defer q.Close()
 
-	var resets, terminalErrors int
+	var (
+		resets        int
+		terminalErrs  []error
+	)
 	for _, err := range q.Batches() {
 		if err == nil {
 			continue
@@ -729,16 +740,42 @@ func TestQwpFailoverRespectsMaxAttempts(t *testing.T) {
 			resets++
 			continue
 		}
-		terminalErrors++
+		terminalErrs = append(terminalErrs, err)
 	}
-	if terminalErrors != 1 {
-		t.Errorf("terminalErrors = %d, want 1", terminalErrors)
+	if len(terminalErrs) != 1 {
+		t.Fatalf("terminalErrors = %d, want 1: %v", len(terminalErrs), terminalErrs)
 	}
 	// Resets should be < failoverMaxAttempts because the budget
 	// includes the initial submission.
 	if resets >= cfg.failoverMaxAttempts {
 		t.Errorf("resets = %d, expected < failoverMaxAttempts (%d)",
 			resets, cfg.failoverMaxAttempts)
+	}
+	// Exhaustion must surface as a typed *QwpFailoverExhaustedError
+	// so callers can distinguish "ran out of retries" from "first
+	// attempt failed". The message MUST identify exhaustion and
+	// SHOULD carry the attempt count and the most recent
+	// transport-failure message — assert all three.
+	terminalErr := terminalErrs[0]
+	var exhausted *QwpFailoverExhaustedError
+	if !errors.As(terminalErr, &exhausted) {
+		t.Fatalf("terminal err = %v (%T), want errors.As to match *QwpFailoverExhaustedError",
+			terminalErr, terminalErr)
+	}
+	if exhausted.Attempts != cfg.failoverMaxAttempts {
+		t.Errorf("exhausted.Attempts = %d, want %d (failoverMaxAttempts)",
+			exhausted.Attempts, cfg.failoverMaxAttempts)
+	}
+	if exhausted.LastError == nil {
+		t.Error("exhausted.LastError = nil, want the underlying transport error")
+	}
+	if !strings.Contains(terminalErr.Error(), "failover exhausted") {
+		t.Errorf("terminal err = %q, want it to identify failover exhaustion",
+			terminalErr.Error())
+	}
+	if !strings.Contains(terminalErr.Error(), "last error:") {
+		t.Errorf("terminal err = %q, want it to include the last transport-failure message",
+			terminalErr.Error())
 	}
 }
 
@@ -849,8 +886,9 @@ func TestQwpExecDefaultSurfacesFailoverReset(t *testing.T) {
 			body = appendInt64LE(body, 2)
 			body = append(body, 0)
 			body = append(body, 0)
-			_ = m.conn.Write(ctx, websocket.MessageBinary,
-				writeQwpFrame(0, body))
+			frame := writeQwpFrame(0, body)
+			frame[4] = m.version
+			_ = m.conn.Write(ctx, websocket.MessageBinary, frame)
 			for {
 				if _, _, err := m.conn.Read(ctx); err != nil {
 					return

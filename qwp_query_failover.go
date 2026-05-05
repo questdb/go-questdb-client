@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -435,10 +436,13 @@ func (s *qwpQuerySession) requestCancel() {
 // caller's iterator (Batches() / Exec() loop) yields the reset to the
 // user, who is expected to discard accumulated state and continue.
 //
-// When failover is disabled (cfg.failoverEnabled == false), or when
-// the failover budget is exhausted, the original transport error is
-// returned as-is so the caller surfaces it through the usual error
-// path.
+// When failover is disabled (cfg.failoverEnabled == false), the
+// original transport error is returned as-is so the caller surfaces
+// it through the usual error path. When the failover budget is
+// exhausted (s.attempt >= cfg.failoverMaxAttempts), the event is
+// wrapped into a *QwpFailoverExhaustedError so callers can errors.As
+// against the exhaustion shape and distinguish "we ran out of
+// retries" from "first attempt failed".
 func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	ev, err := s.client.io().takeEvent(ctx)
 	if err != nil {
@@ -448,8 +452,21 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 		return ev, nil
 	}
 	// Transport-terminal failure. Decide whether to retry.
-	if !s.shouldReplay() || s.isCancelled() {
+	if s.isCancelled() {
 		return ev, nil
+	}
+	cfg := s.client.cfg
+	if !cfg.failoverEnabled {
+		return ev, nil
+	}
+	if s.attempt >= cfg.failoverMaxAttempts {
+		// Budget exhausted. Wrap the underlying transport error so
+		// callers can errors.As to *QwpFailoverExhaustedError and
+		// distinguish "we ran out of retries" from "first attempt
+		// failed". Mirrors Java's onError(INTERNAL_ERROR, "transport
+		// failure after N execute attempts ...") at
+		// QwpQueryClient.executeOnce:807-815.
+		return s.exhaustedEvent(ev), nil
 	}
 	lastErr := fmt.Errorf("qwp query: %s", ev.errMessage)
 	failedIdx := int(s.client.currentEndpointIdx.Load())
@@ -494,30 +511,33 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	}, nil
 }
 
-// shouldReplay reports whether the current configuration permits
-// another reconnect attempt for this session. Encapsulates the four
-// "no replay" gates: failover disabled, attempt budget exhausted,
-// fewer than 2 endpoints (nothing to fail over to), and Exec replay
-// disabled when the SQL is non-idempotent.
-func (s *qwpQuerySession) shouldReplay() bool {
-	cfg := s.client.cfg
-	if !cfg.failoverEnabled {
-		return false
+// exhaustedEvent wraps a terminal transport event into a
+// qwpEventKindTransportError event whose typed cause is a
+// *QwpFailoverExhaustedError. Used at the point where the failover
+// budget has been consumed so the caller can errors.As against the
+// exhaustion shape and distinguish it from the first-attempt-failed
+// case. Preserves the original event's underlying error (or its
+// errMessage when no typed cause was attached) as the LastError so
+// errors.Unwrap chains down to the actual transport fault.
+func (s *qwpQuerySession) exhaustedEvent(ev qwpEvent) qwpEvent {
+	cause := ev.transportErr
+	if cause == nil {
+		msg := ev.errMessage
+		if msg == "" {
+			msg = "qwp query: transport-terminal failure"
+		}
+		cause = errors.New(msg)
 	}
-	if s.attempt >= cfg.failoverMaxAttempts {
-		return false
+	exhausted := &QwpFailoverExhaustedError{
+		Attempts:  s.attempt,
+		LastError: cause,
 	}
-	if len(cfg.endpoints) < 2 {
-		// Single-endpoint replay is allowed so the diagnostic shape
-		// matches Java: the outer flow records one failover attempt
-		// (sleep + connectWalk) before surfacing the error. The walk
-		// itself returns immediately because connectWalk skips the
-		// just-failed index and there is nothing else to try, so the
-		// user sees the original transport error wrapped with a
-		// "connect failed (tried 0 endpoints)" reconnect error.
-		return true
+	return qwpEvent{
+		kind:         qwpEventKindTransportError,
+		requestId:    ev.requestId,
+		errMessage:   exhausted.Error(),
+		transportErr: exhausted,
 	}
-	return true
 }
 
 // computeBackoff is the exponential schedule from

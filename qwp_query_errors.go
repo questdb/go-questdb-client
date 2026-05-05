@@ -186,3 +186,59 @@ func (e *QwpFailoverReset) Error() string {
 func (e *QwpFailoverReset) Unwrap() error {
 	return e.LastError
 }
+
+// QwpFailoverExhaustedError surfaces from *QwpQuery.Batches and
+// (*QwpQueryClient).Exec when the failover budget
+// (failover_max_attempts) has been consumed without producing a
+// successful query completion. Carries the attempt count and the most
+// recent transport-terminal error so callers can distinguish "the
+// initial attempt failed" from "every retry within the budget also
+// failed", and surface a useful diagnostic without parsing the
+// underlying message. Mirrors Java's onError(STATUS_INTERNAL_ERROR,
+// "transport failure after N execute attempts ...") shape from
+// QwpQueryClient.executeOnce.
+type QwpFailoverExhaustedError struct {
+	// Attempts is the number of execute attempts (initial submission
+	// plus all replays) that failed before the budget was reached.
+	// Always equal to the configured failover_max_attempts when the
+	// error is constructed by the session orchestrator; preserved as
+	// a separate field so a caller-side log line does not need to
+	// re-derive it from configuration.
+	Attempts int
+
+	// LastError is the most recent transport-terminal error that
+	// pushed the count up to the budget. Non-nil. Available via
+	// errors.Is / errors.As through Unwrap so callers can match on
+	// both the exhaustion shape and the specific underlying cause.
+	LastError error
+}
+
+// Error implements the error interface.
+func (e *QwpFailoverExhaustedError) Error() string {
+	failovers := e.Attempts - 1
+	if failovers < 0 {
+		failovers = 0
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "qwp query: failover exhausted after %d execute attempt",
+		e.Attempts)
+	if e.Attempts != 1 {
+		b.WriteByte('s')
+	}
+	fmt.Fprintf(&b, " (%d failover reconnect", failovers)
+	if failovers != 1 {
+		b.WriteByte('s')
+	}
+	b.WriteByte(')')
+	if e.LastError != nil {
+		fmt.Fprintf(&b, "; last error: %v", e.LastError)
+	}
+	return b.String()
+}
+
+// Unwrap exposes the underlying transport error to errors.Is /
+// errors.As so callers can match on both the exhaustion shape and the
+// specific transport failure that triggered the final retry.
+func (e *QwpFailoverExhaustedError) Unwrap() error {
+	return e.LastError
+}
