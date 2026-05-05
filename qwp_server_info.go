@@ -129,6 +129,13 @@ func decodeServerInfo(payload []byte, negotiatedVersion byte) (*QwpServerInfo, e
 			"SERVER_INFO frame version %d does not match negotiated version %d",
 			payload[4], negotiatedVersion))
 	}
+	// Spec §4: table_count is 0 on every non-RESULT_BATCH frame.
+	tableCount := uint16(payload[qwpHeaderOffsetTableCount]) |
+		uint16(payload[qwpHeaderOffsetTableCount+1])<<8
+	if tableCount != 0 {
+		return nil, newQwpDecodeError(fmt.Sprintf(
+			"SERVER_INFO frame table_count = %d, expected 0", tableCount))
+	}
 
 	br := qwpByteReader{}
 	br.reset(payload[qwpHeaderSize:])

@@ -971,12 +971,27 @@ func (d *qwpQueryDecoder) parseFrameHeader(payload []byte) (qwpMsgKind, error) {
 	d.deltaOn = flags&qwpFlagDeltaSymbolDict != 0
 	d.gorillaOn = flags&qwpFlagGorilla != 0
 	d.zstdOn = flags&qwpFlagZstd != 0
+	tableCount := binary.LittleEndian.Uint16(
+		payload[qwpHeaderOffsetTableCount : qwpHeaderOffsetTableCount+2])
 	d.br.reset(payload[qwpHeaderSize:])
 	kindByte, err := d.br.readByte()
 	if err != nil {
 		return 0, err
 	}
-	return qwpMsgKind(kindByte), nil
+	msgKind := qwpMsgKind(kindByte)
+	// Spec §4: table_count is 1 for RESULT_BATCH and 0 for every other
+	// kind. Reject mismatches up front so a malformed server cannot
+	// smuggle ambiguous framing past the per-kind decoders.
+	expectedTableCount := uint16(0)
+	if msgKind == qwpMsgKindResultBatch {
+		expectedTableCount = 1
+	}
+	if tableCount != expectedTableCount {
+		return 0, newQwpDecodeError(fmt.Sprintf(
+			"frame table_count = %d, expected %d for msg_kind 0x%02X",
+			tableCount, expectedTableCount, byte(msgKind)))
+	}
+	return msgKind, nil
 }
 
 // decodeResultEnd parses a RESULT_END (0x12) frame. The frame announces

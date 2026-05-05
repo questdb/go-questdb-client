@@ -1076,13 +1076,72 @@ func TestQwpDecoderHardening(t *testing.T) {
 	})
 
 	t.Run("H4_UnexpectedMsgKind", func(t *testing.T) {
-		buf := writeMinimalResultBatch(0)
-		// msg_kind is the first byte after the 12-byte header.
-		buf[qwpHeaderSize] = 0x00
+		// Use a frame whose table_count matches the spoofed msg_kind so
+		// the per-kind RESULT_BATCH check is what fires (not the
+		// table_count guard that runs first inside parseFrameHeader).
+		// RESULT_END expects table_count=0; matches the value that
+		// writeQwpFrame sets.
+		buf := writeQwpFrame(0, buildResultEndBody(1, 0, 0))
 		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
 		err := dec.decode(buf, &b)
 		assertDecodeErrContains(t, err, "expected RESULT_BATCH")
+	})
+
+	t.Run("H4a_TableCountWrongOnResultBatch", func(t *testing.T) {
+		// Spec §4: RESULT_BATCH must carry table_count = 1. A
+		// conformant decoder must reject any other value rather than
+		// treat it as a hint. writeMinimalResultBatch sets the field
+		// to 1; flip it to 0 and 5 to cover both directions.
+		for _, tc := range []uint16{0, 5} {
+			buf := writeMinimalResultBatch(0)
+			binary.LittleEndian.PutUint16(
+				buf[qwpHeaderOffsetTableCount:qwpHeaderOffsetTableCount+2], tc)
+			dec := newTestQueryDecoder()
+			var b QwpColumnBatch
+			err := dec.decode(buf, &b)
+			assertDecodeErrContains(t, err, "table_count")
+		}
+	})
+
+	t.Run("H4b_TableCountNonZeroOnResultEnd", func(t *testing.T) {
+		// Spec §4 / §8: RESULT_END must carry table_count = 0.
+		frame := writeQwpFrame(0, buildResultEndBody(1, 0, 0))
+		binary.LittleEndian.PutUint16(
+			frame[qwpHeaderOffsetTableCount:qwpHeaderOffsetTableCount+2], 1)
+		dec := newTestQueryDecoder()
+		_, _, err := dec.decodeResultEnd(frame)
+		assertDecodeErrContains(t, err, "table_count")
+	})
+
+	t.Run("H4c_TableCountNonZeroOnQueryError", func(t *testing.T) {
+		// Spec §4 / §9: QUERY_ERROR must carry table_count = 0.
+		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusParseError), "bad", -1))
+		binary.LittleEndian.PutUint16(
+			frame[qwpHeaderOffsetTableCount:qwpHeaderOffsetTableCount+2], 1)
+		dec := newTestQueryDecoder()
+		_, err := dec.decodeQueryError(frame)
+		assertDecodeErrContains(t, err, "table_count")
+	})
+
+	t.Run("H4d_TableCountNonZeroOnExecDone", func(t *testing.T) {
+		// Spec §4 / §11.6: EXEC_DONE must carry table_count = 0.
+		frame := writeQwpFrame(0, buildExecDoneBody(1, 0, 0))
+		binary.LittleEndian.PutUint16(
+			frame[qwpHeaderOffsetTableCount:qwpHeaderOffsetTableCount+2], 1)
+		dec := newTestQueryDecoder()
+		_, _, err := dec.decodeExecDone(frame)
+		assertDecodeErrContains(t, err, "table_count")
+	})
+
+	t.Run("H4e_TableCountNonZeroOnCacheReset", func(t *testing.T) {
+		// Spec §4 / §11.7: CACHE_RESET must carry table_count = 0.
+		frame := writeQwpFrame(0, buildCacheResetBody(qwpResetMaskDict))
+		binary.LittleEndian.PutUint16(
+			frame[qwpHeaderOffsetTableCount:qwpHeaderOffsetTableCount+2], 1)
+		dec := newTestQueryDecoder()
+		_, err := dec.decodeCacheReset(frame)
+		assertDecodeErrContains(t, err, "table_count")
 	})
 
 	t.Run("H6_TableNameLengthOverflowVarint", func(t *testing.T) {
@@ -1552,7 +1611,7 @@ func buildArrayHardeningFrame(t *testing.T, nDims int, shape []int32) []byte {
 // writeQwpFrame builds a complete QWP frame: a 12-byte header with the
 // given flags plus the supplied body bytes. The body must start with the
 // msg_kind byte. payload_length is patched in; table_count is written
-// as 0 (ignored by the egress response decoders).
+// as 0, which spec §4 mandates for every non-RESULT_BATCH kind.
 func writeQwpFrame(flags byte, body []byte) []byte {
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
@@ -1775,8 +1834,11 @@ func TestQwpDecoderQueryError(t *testing.T) {
 	})
 
 	t.Run("WrongMsgKind", func(t *testing.T) {
+		// Use a non-RESULT_BATCH stand-in (RESULT_END, table_count=0)
+		// so the per-kind QUERY_ERROR check is what fires, not the
+		// table_count guard inside parseFrameHeader.
 		body := buildQueryErrorBody(1, 0x05, "x", -1)
-		body[0] = byte(qwpMsgKindResultBatch)
+		body[0] = byte(qwpMsgKindResultEnd)
 		frame := writeQwpFrame(0, body)
 		dec := newTestQueryDecoder()
 		_, err := dec.decodeQueryError(frame)

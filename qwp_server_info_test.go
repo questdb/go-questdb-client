@@ -78,8 +78,9 @@ func buildServerInfoFrame(version byte, flagBits byte, role byte, epoch uint64, 
 	header[3] = byte(magic >> 24)
 	header[4] = version
 	header[qwpHeaderOffsetFlags] = flagBits
-	// tableCount (uint16 LE) at offset 6 — irrelevant for SERVER_INFO,
-	// leave zero.
+	// tableCount (uint16 LE) at offset 6. Spec §4 mandates 0 on every
+	// non-RESULT_BATCH kind, including SERVER_INFO; leaving the bytes
+	// zero satisfies that.
 	// payloadLen (uint32 LE) at offset 8.
 	payloadLen := uint32(len(body))
 	header[qwpHeaderOffsetPayloadLen] = byte(payloadLen)
@@ -193,6 +194,23 @@ func TestQwpServerInfoDecodeRejectsBadMagic(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bad magic") {
 		t.Errorf("error = %v, want bad magic", err)
+	}
+}
+
+func TestQwpServerInfoDecodeRejectsNonZeroTableCount(t *testing.T) {
+	// Spec §4 mandates table_count = 0 on every non-RESULT_BATCH
+	// frame. SERVER_INFO is no exception — a server that smuggles a
+	// non-zero value here is malformed and must be rejected before any
+	// body bytes are trusted.
+	frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+		qwpRoleStandalone, 0, 0, 0, "", "")
+	frame[qwpHeaderOffsetTableCount] = 1
+	_, err := decodeServerInfo(frame, qwpMaxSupportedVersion)
+	if err == nil {
+		t.Fatal("decoder accepted non-zero table_count")
+	}
+	if !strings.Contains(err.Error(), "table_count") {
+		t.Errorf("error = %v, want table_count", err)
 	}
 }
 
