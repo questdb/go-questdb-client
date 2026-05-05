@@ -217,6 +217,13 @@ func TestQwpMaxColumnsPerTable(t *testing.T) {
 	}
 }
 
+func TestQwpMaxBindsPerQuery(t *testing.T) {
+	// Pinned by spec §16 (max bind parameters per QUERY_REQUEST).
+	if qwpMaxBindsPerQuery != 1024 {
+		t.Errorf("qwpMaxBindsPerQuery = %d, want 1024", qwpMaxBindsPerQuery)
+	}
+}
+
 func TestQwpIsFixedWidthType(t *testing.T) {
 	// Go has no isFixedWidth() boolean — the same information is
 	// encoded in qwpFixedTypeSize (>= 0 for fixed, -1 for variable).

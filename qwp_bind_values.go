@@ -107,7 +107,7 @@ func (b *QwpBinds) reset() {
 
 // advance validates the index and bumps the counters. Returns false
 // (and latches the error) on out-of-order / duplicate index or on
-// exceeding the max column count.
+// exceeding the per-query bind cap.
 func (b *QwpBinds) advance(index int) bool {
 	if b.err != nil {
 		return false
@@ -118,9 +118,9 @@ func (b *QwpBinds) advance(index int) bool {
 			b.expectedNextIndex, index)
 		return false
 	}
-	if b.count >= qwpMaxColumnsPerTable {
+	if b.count >= qwpMaxBindsPerQuery {
 		b.err = fmt.Errorf(
-			"qwp bind: too many binds: exceeds %d", qwpMaxColumnsPerTable)
+			"qwp bind: too many binds: exceeds %d", qwpMaxBindsPerQuery)
 		return false
 	}
 	b.expectedNextIndex++

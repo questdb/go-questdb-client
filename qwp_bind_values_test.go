@@ -746,15 +746,15 @@ func TestQwpBindsRejectsOutOfOrderIndex(t *testing.T) {
 
 func TestQwpBindsTooMany(t *testing.T) {
 	var b QwpBinds
-	for i := 0; i < qwpMaxColumnsPerTable; i++ {
+	for i := 0; i < qwpMaxBindsPerQuery; i++ {
 		b.IntBind(i, int32(i))
 	}
 	if err := b.Err(); err != nil {
-		t.Fatalf("filling %d binds should succeed: %v", qwpMaxColumnsPerTable, err)
+		t.Fatalf("filling %d binds should succeed: %v", qwpMaxBindsPerQuery, err)
 	}
-	b.IntBind(qwpMaxColumnsPerTable, 0)
+	b.IntBind(qwpMaxBindsPerQuery, 0)
 	if b.Err() == nil {
-		t.Fatalf("exceeding %d binds should fail", qwpMaxColumnsPerTable)
+		t.Fatalf("exceeding %d binds should fail", qwpMaxBindsPerQuery)
 	}
 	if !strings.Contains(b.Err().Error(), "too many") {
 		t.Fatalf("got error: %v", b.Err())

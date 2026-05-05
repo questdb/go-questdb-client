@@ -150,9 +150,11 @@ const qwpVersion byte = 0x01
 // X-QWP-Max-Version handshake header; the server echoes
 // min(server_max, client_max) back as X-QWP-Version. v2 enables the
 // server to emit SERVER_INFO and the v2-only egress features (target
-// filter, transparent failover). Decoders accept any version byte
-// <= qwpMaxSupportedVersion in incoming server frames so a v2 server's
-// RESULT_BATCH frames (version-byte = 2) are honoured.
+// filter, transparent failover). Once the handshake settles, decoders
+// enforce strict equality between every server frame's header version
+// byte and the negotiated version (spec §3) — this constant only caps
+// what we will agree to negotiate to, not what we will accept on a
+// live connection.
 const qwpMaxSupportedVersion byte = 0x02
 
 // QWP message header layout.
@@ -229,6 +231,13 @@ const (
 	// qwpMaxColumnsPerTable caps columns per table. Go-only; the Java
 	// client does not enforce a hard cap.
 	qwpMaxColumnsPerTable = 2048
+
+	// qwpMaxBindsPerQuery caps bind parameters per QUERY_REQUEST.
+	// Spec §16. The server enforces this independently; the client-side
+	// preflight surfaces a typed error before bytes leave the process.
+	// Distinct from qwpMaxColumnsPerTable (an ingest concept) — egress
+	// QUERY_REQUEST and ingest DATA_BATCH have independent limits.
+	qwpMaxBindsPerQuery = 1024
 
 	// qwpMaxTablesPerBatch is the hard upper bound on distinct tables
 	// in a single QWP message: the wire format encodes the table count
