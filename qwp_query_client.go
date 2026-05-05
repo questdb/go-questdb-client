@@ -446,7 +446,7 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 	}
 	c.currentEndpointIdx.Store(-1)
 
-	result, err := connectWalk(ctx, cfg, 0)
+	result, err := connectWalk(ctx, cfg, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -480,14 +480,11 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 		_ = oldTr.close()
 	}
 
-	// Walk endpoints starting one past the failed index. n=1 means
-	// we'll come back to the same host — same behavior as a
-	// single-endpoint reconnect.
-	startIdx := failedIdx + 1
-	if startIdx >= len(c.cfg.endpoints) {
-		startIdx = 0
-	}
-	result, err := connectWalk(ctx, c.cfg, startIdx)
+	// Walk the other endpoints, skipping the just-failed one.
+	// connectWalk handles the modulo wrap and the "n=1 means no
+	// candidates" case by returning a connect-failed error, which the
+	// outer failover loop surfaces and may revisit on a later attempt.
+	result, err := connectWalk(ctx, c.cfg, failedIdx)
 	if err != nil {
 		return nil, err
 	}

@@ -405,6 +405,85 @@ func TestQwpFailoverYieldsResetThenResumes(t *testing.T) {
 	}
 }
 
+// TestQwpFailoverSkipsJustFailedEndpoint verifies that on reconnect
+// the connect walk does not revisit the endpoint that just failed,
+// matching Java's reconnectSkippingIndex. With three endpoints where
+// only the middle one passes the role filter, the reconnect must skip
+// the failed primary (rather than rebind to it and trip the same
+// fault) and surface a role-mismatch error instead.
+func TestQwpFailoverSkipsJustFailedEndpoint(t *testing.T) {
+	// idx=0 REPLICA, idx=1 PRIMARY, idx=2 REPLICA. Only the primary
+	// passes target=primary, so initial bind lands on idx=1.
+	cluster := newMockCluster(t, 3, func(idx int) (byte, string, string) {
+		role := qwpRoleReplica
+		if idx == 1 {
+			role = qwpRolePrimary
+		}
+		return role, fmt.Sprintf("node-%d", idx), "test-cluster"
+	},
+		func(idx int, m *qwpMockEgressConn) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			// Drain the QUERY_REQUEST then close the socket to simulate
+			// a transport-terminal fault.
+			_, _, _ = m.conn.Read(ctx)
+			m.conn.Close(websocket.StatusInternalError, "simulated fault")
+		})
+
+	cfg := qwpQueryDefaultConfig()
+	eps, _ := parseEndpointList(cluster.addrList(), qwpDefaultPort)
+	cfg.endpoints = eps
+	cfg.target = qwpTargetPrimary
+	cfg.serverInfoTimeout = 2 * time.Second
+	cfg.failoverEnabled = true
+	cfg.failoverMaxAttempts = 5
+	cfg.failoverBackoffInitial = 1 * time.Millisecond
+	cfg.failoverBackoffMax = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := newQwpQueryClient(ctx, cfg)
+	if err != nil {
+		t.Fatalf("newQwpQueryClient: %v", err)
+	}
+	defer c.Close(ctx)
+
+	if c.CurrentEndpoint() != cluster.nodes[1].addr() {
+		t.Fatalf("initial bind = %s, want %s (the only primary)",
+			c.CurrentEndpoint(), cluster.nodes[1].addr())
+	}
+
+	q := c.Query(ctx, "select v from t")
+	defer q.Close()
+
+	var sawErr bool
+	for _, err := range q.Batches() {
+		if err == nil {
+			t.Errorf("unexpected non-error batch from a poisoned connection")
+			continue
+		}
+		var reset *QwpFailoverReset
+		if errors.As(err, &reset) {
+			t.Errorf("unexpected failover reset; reconnect should fail role filter")
+			continue
+		}
+		if !strings.Contains(err.Error(), "no endpoint matches target=primary") {
+			t.Errorf("err = %v, want role-mismatch text", err)
+		}
+		sawErr = true
+	}
+	if !sawErr {
+		t.Error("expected reconnect to surface a transport error")
+	}
+
+	// The failed primary must be connected exactly once — the initial
+	// bind. Without the skip, the reconnect walk would wrap around to
+	// idx=1 again and the count would be 2.
+	if got := cluster.nodes[1].onConnectCount.Load(); got != 1 {
+		t.Errorf("primary at idx=1 connected %d times, want 1 (no rebind)", got)
+	}
+}
+
 // TestQwpFailoverDisabledSurfacesTransportError verifies that with
 // failoverEnabled=false, a transport-terminal failure mid-query
 // surfaces directly through Batches() instead of triggering replay.

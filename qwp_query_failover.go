@@ -200,11 +200,19 @@ type qwpConnectResult struct {
 // half-open sockets. On a successful return the caller takes
 // ownership of the transport + I/O.
 //
-// startIdx allows the failover path to skip the just-failed endpoint:
-// the walk visits endpoints [startIdx, len-1] then [0, startIdx-1],
-// for a total of len(endpoints) attempts. The initial connect uses
-// startIdx=0.
-func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, startIdx int) (*qwpConnectResult, error) {
+// failedIdx selects between two walk shapes, mirroring Java's
+// reconnectSkippingIndex:
+//
+//   - failedIdx < 0: initial connect. Visits all len(endpoints)
+//     entries starting at index 0.
+//   - failedIdx >= 0: failover reconnect. Visits the other
+//     len(endpoints)-1 entries starting at failedIdx+1 (mod n) and
+//     never revisits failedIdx itself. A transport failure is likely
+//     to repeat immediately on the same socket, so retrying it would
+//     just burn an attempt; the outer failover loop can come back to
+//     this endpoint on a subsequent attempt if every other endpoint
+//     is also unreachable.
+func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int) (*qwpConnectResult, error) {
 	if len(cfg.endpoints) == 0 {
 		return nil, fmt.Errorf("qwp query: no endpoints configured")
 	}
@@ -220,7 +228,13 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, startIdx int) (
 	var lastObserved *QwpServerInfo
 	var lastErr error
 	n := len(cfg.endpoints)
-	for offset := 0; offset < n; offset++ {
+	startIdx := 0
+	stepCount := n
+	if failedIdx >= 0 {
+		startIdx = failedIdx + 1
+		stepCount = n - 1
+	}
+	for offset := 0; offset < stepCount; offset++ {
 		idx := (startIdx + offset) % n
 		ep := cfg.endpoints[idx]
 		wsURL := scheme + "://" + ep.String()
@@ -281,7 +295,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, startIdx int) (
 			lastErr = fmt.Errorf("qwp query: all endpoints unreachable")
 		}
 		return nil, fmt.Errorf("qwp query: connect failed (tried %d endpoints): %w",
-			n, lastErr)
+			stepCount, lastErr)
 	}
 	// Specific role filter and no match — surface a typed
 	// QwpRoleMismatchError carrying the last observed SERVER_INFO so
@@ -441,12 +455,13 @@ func (s *qwpQuerySession) shouldReplay() bool {
 		return false
 	}
 	if len(cfg.endpoints) < 2 {
-		// Single-endpoint deployments can still benefit from a
-		// reconnect (e.g., a transient TCP RST), but the spec only
-		// guarantees failover when multiple endpoints are configured.
-		// Match Java's behaviour: allow single-endpoint replays —
-		// they exercise the same reconnect machinery against the same
-		// host/port.
+		// Single-endpoint replay is allowed so the diagnostic shape
+		// matches Java: the outer flow records one failover attempt
+		// (sleep + connectWalk) before surfacing the error. The walk
+		// itself returns immediately because connectWalk skips the
+		// just-failed index and there is nothing else to try, so the
+		// user sees the original transport error wrapped with a
+		// "connect failed (tried 0 endpoints)" reconnect error.
 		return true
 	}
 	return true
