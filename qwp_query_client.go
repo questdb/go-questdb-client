@@ -668,7 +668,7 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 			// cause without picking up *QwpQueryError (which carries
 			// server-status bytes that are meaningless for client-
 			// side faults).
-			return ExecResult{}, fmt.Errorf("qwp query: %s", ev.errMessage)
+			return ExecResult{}, transportEventError(ev)
 		case qwpEventKindFailoverReset:
 			// The session ran a successful reconnect-and-replay. With
 			// replayExec disabled (the default), Exec must surface
@@ -781,6 +781,19 @@ func eventToError(ev qwpEvent, reqId int64) error {
 		return errors.New(ev.errMessage)
 	}
 	return errors.New("qwp query: unspecified error")
+}
+
+// transportEventError converts a qwpEventKindTransportError into a
+// caller-facing error. When transportErr is set (failover orchestrator
+// path), wraps with %w so errors.As can match the underlying typed
+// cause (e.g. *QwpRoleMismatchError from a failed reconnect walk).
+// Falls back to a plain string-formatted error for I/O-goroutine
+// emissions that only carry errMessage.
+func transportEventError(ev qwpEvent) error {
+	if ev.transportErr != nil {
+		return fmt.Errorf("qwp query: %w", ev.transportErr)
+	}
+	return fmt.Errorf("qwp query: %s", ev.errMessage)
 }
 
 // Query lifecycle states. Transitions are linear: Idle → Iterating →
@@ -950,7 +963,7 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 				// orchestrator (qwp_query_failover.go) intercepts
 				// this case before it reaches Batches when failover
 				// is enabled and replay succeeds.
-				yield(nil, fmt.Errorf("qwp query: %s", ev.errMessage))
+				yield(nil, transportEventError(ev))
 				return
 			case qwpEventKindFailoverReset:
 				// Emitted by the session orchestrator after a

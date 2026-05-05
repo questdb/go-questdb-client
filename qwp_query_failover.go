@@ -424,10 +424,14 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 		// Reconnect failed — surface a transport error wrapping the
 		// dial failure and the original cause. The caller's next
 		// iteration will see this and either retry (if the budget
-		// permits) or surface to the user.
+		// permits) or surface to the user. Thread the typed replayErr
+		// (e.g. *QwpRoleMismatchError) so callers can errors.As
+		// against it on a failover-time mismatch, matching the
+		// initial-connect path.
 		return qwpEvent{
-			kind:       qwpEventKindTransportError,
-			errMessage: fmt.Sprintf("%v (after %v)", replayErr, lastErr),
+			kind:         qwpEventKindTransportError,
+			errMessage:   fmt.Sprintf("%v (after %v)", replayErr, lastErr),
+			transportErr: fmt.Errorf("%w (after %w)", replayErr, lastErr),
 		}, nil
 	}
 	return qwpEvent{

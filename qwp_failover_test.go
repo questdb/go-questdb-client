@@ -467,6 +467,16 @@ func TestQwpFailoverSkipsJustFailedEndpoint(t *testing.T) {
 			t.Errorf("unexpected failover reset; reconnect should fail role filter")
 			continue
 		}
+		// The failover-time role mismatch must surface as a typed
+		// *QwpRoleMismatchError so callers can errors.As against it,
+		// matching the initial-connect path.
+		var rme *QwpRoleMismatchError
+		if !errors.As(err, &rme) {
+			t.Errorf("err = %v (%T), want errors.As to match *QwpRoleMismatchError",
+				err, err)
+		} else if rme.Target != "primary" {
+			t.Errorf("rme.Target = %q, want primary", rme.Target)
+		}
 		if !strings.Contains(err.Error(), "no endpoint matches target=primary") {
 			t.Errorf("err = %v, want role-mismatch text", err)
 		}

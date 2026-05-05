@@ -88,6 +88,13 @@ type qwpEvent struct {
 	errStatus  qwpStatusCode
 	errMessage string
 
+	// TransportError kind — optional typed cause. When set, consumers
+	// wrap with %w so callers can errors.As against the underlying
+	// type (e.g. *QwpRoleMismatchError raised by a failed reconnect).
+	// Nil for I/O-goroutine-emitted transport errors that only carry
+	// a string message via poisonAndEmitError.
+	transportErr error
+
 	// FailoverReset kind — populated by qwp_query_failover.go after a
 	// successful reconnect; carries through to the user as
 	// *QwpFailoverReset. Nil for any other kind.
