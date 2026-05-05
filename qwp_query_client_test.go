@@ -1058,6 +1058,52 @@ func TestQwpExecOnSelectSurfacesMisuse(t *testing.T) {
 	}
 }
 
+// TestQwpQueryRejectsOversizedSql verifies that buildRequest's
+// preflight blocks SQL text exceeding the spec §16 1 MiB limit
+// before any bytes leave the process. Both Query (iterator-yielded
+// error) and Exec (sync error) surface a typed length-limit message.
+func TestQwpQueryRejectsOversizedSql(t *testing.T) {
+	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
+		// Hold the connection open until the client tears it down;
+		// preflight rejects the SQL before any frame leaves the
+		// client, so this read must never return data.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _, _ = m.conn.Read(ctx)
+	})
+	defer cleanup()
+
+	oversized := strings.Repeat("a", qwpMaxSqlTextBytes+1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	q := c.Query(ctx, oversized)
+	defer q.Close()
+	var queryErr error
+	for _, err := range q.Batches() {
+		if err != nil {
+			queryErr = err
+		}
+	}
+	if queryErr == nil {
+		t.Fatal("expected oversized-SQL error from Query")
+	}
+	if !strings.Contains(queryErr.Error(), "exceeds") ||
+		!strings.Contains(queryErr.Error(), "1048576") {
+		t.Errorf("Query err=%v, want size-limit message", queryErr)
+	}
+
+	_, execErr := c.Exec(ctx, oversized)
+	if execErr == nil {
+		t.Fatal("expected oversized-SQL error from Exec")
+	}
+	if !strings.Contains(execErr.Error(), "exceeds") ||
+		!strings.Contains(execErr.Error(), "1048576") {
+		t.Errorf("Exec err=%v, want size-limit message", execErr)
+	}
+}
+
 // TestQwpQueryPoolBackpressureAcrossIterator wires a pool=1 client to
 // a server that emits 3 batches + End. Public Batches() iterator must
 // still surface all batches in order — auto-release per iteration

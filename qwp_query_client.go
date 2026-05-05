@@ -716,6 +716,11 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 // always against a request-owned buffer, independent of what the
 // caller does with the scratch afterwards.
 func (c *QwpQueryClient) buildRequest(sql string, opts []QueryOption) (qwpRequest, error) {
+	if len(sql) > qwpMaxSqlTextBytes {
+		return qwpRequest{}, fmt.Errorf(
+			"qwp query: SQL text length %d exceeds %d-byte limit",
+			len(sql), qwpMaxSqlTextBytes)
+	}
 	var settings qwpQueryOptions
 	for _, opt := range opts {
 		opt(&settings)

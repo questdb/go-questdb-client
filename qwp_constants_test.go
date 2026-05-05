@@ -224,6 +224,13 @@ func TestQwpMaxBindsPerQuery(t *testing.T) {
 	}
 }
 
+func TestQwpMaxSqlTextBytes(t *testing.T) {
+	// Pinned by spec §16 (max SQL text length: 1 MiB UTF-8 bytes).
+	if qwpMaxSqlTextBytes != 1024*1024 {
+		t.Errorf("qwpMaxSqlTextBytes = %d, want %d", qwpMaxSqlTextBytes, 1024*1024)
+	}
+}
+
 func TestQwpIsFixedWidthType(t *testing.T) {
 	// Go has no isFixedWidth() boolean — the same information is
 	// encoded in qwpFixedTypeSize (>= 0 for fixed, -1 for variable).

@@ -239,6 +239,12 @@ const (
 	// QUERY_REQUEST and ingest DATA_BATCH have independent limits.
 	qwpMaxBindsPerQuery = 1024
 
+	// qwpMaxSqlTextBytes caps the UTF-8 byte length of the sql_bytes
+	// field in a QUERY_REQUEST. Spec §16 pins this at 1 MiB. The server
+	// enforces this independently; the client-side preflight produces a
+	// friendlier error and avoids serializing a doomed payload.
+	qwpMaxSqlTextBytes = 1 << 20
+
 	// qwpMaxTablesPerBatch is the hard upper bound on distinct tables
 	// in a single QWP message: the wire format encodes the table count
 	// as uint16.
