@@ -340,6 +340,7 @@ func TestRetryOn500(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)
@@ -367,6 +368,7 @@ func TestNoRetryOn400FromProxy(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)
@@ -394,6 +396,7 @@ func TestNoRetryOn400FromServer(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)
