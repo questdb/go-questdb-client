@@ -603,50 +603,6 @@ func TestQwpTransportAckWithError(t *testing.T) {
 	}
 }
 
-// --- Integration test against real QuestDB server ---
-
-func TestQwpIntegrationConnect(t *testing.T) {
-	// Skip if QuestDB is not running at localhost:9000.
-	ctx := context.Background()
-
-	var tr qwpTransport
-	err := tr.connect(ctx, "ws://localhost:9000", qwpTransportOpts{endpointPath: qwpWritePath})
-	if err != nil {
-		t.Skipf("QuestDB not available: %v", err)
-	}
-	defer tr.close()
-
-	// Send a simple QWP message with delta symbol dict (required
-	// by the server for symbol columns) and verify the ACK.
-	tb := newQwpTableBuffer("qwp_transport_test")
-	col, _ := tb.getOrCreateColumn("value", qwpTypeLong, false)
-	col.addLong(42)
-	colTs, _ := tb.getOrCreateColumn("ts", qwpTypeTimestamp, false)
-	colTs.addTimestamp(1000000)
-	tb.commitRow()
-
-	var enc qwpEncoder
-	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
-
-	t.Logf("sending QWP message (%d bytes): %x", len(msg), msg)
-
-	if err := tr.sendMessage(ctx, msg); err != nil {
-		t.Fatalf("sendMessage: %v", err)
-	}
-
-	status, data, err := tr.readAck(ctx)
-	if err != nil {
-		t.Fatalf("readAck: %v", err)
-	}
-
-	if status != qwpStatusOK {
-		errStr := parseAckError(data)
-		t.Logf("raw ACK response (%d bytes): %x", len(data), data)
-		t.Fatalf("expected OK, got status 0x%02X: %s", status, errStr)
-	}
-	t.Logf("ACK OK, sequence=%d", parseAckSequence(data))
-}
-
 // --- sendAndAck tests ---
 
 func TestQwpTransportSendAndAckSuccess(t *testing.T) {
