@@ -47,9 +47,11 @@ const (
 	qwpEventKindError
 	// qwpEventKindTransportError is a synthesized client-side terminal
 	// failure: reader closed, server closed, decoder out of sync, send
-	// failure, or unknown msg_kind. The decoder's per-connection state
-	// is no longer trustworthy and the I/O goroutine has poisoned ioErr
-	// (or will, on its way out). Routed by the failover orchestrator
+	// failure, or unknown msg_kind. The connection's per-connection
+	// state is no longer trustworthy and the I/O goroutine has
+	// poisoned ioErr — every emission of this kind goes through
+	// poisonAndEmitError, so a follow-up submitQuery returns the
+	// original cause synchronously. Routed by the failover orchestrator
 	// to the reconnect-and-replay path; surfaced to the user as a
 	// plain error when failover is disabled or exhausted.
 	qwpEventKindTransportError
@@ -269,14 +271,16 @@ type qwpEgressIO struct {
 	// decoder- or framing-level error path; read on the user goroutine
 	// from submitQuery.
 	ioErrMu sync.Mutex
-	// ioErr latches the first decoder- or framing-level error for the
-	// life of this connection. Once set, every subsequent submitQuery
-	// returns this error synchronously so a fresh query is never
-	// decoded against a desynced qwpConnDict / qwpSchemaRegistry /
-	// zstd stream — an undetectable subset of out-of-range reads
-	// could leave the dict accidentally in sync with the server
-	// (offsets match) while values are wrong, producing silently
-	// corrupted results. Mirrors the ingress-side asyncState.ioErr
+	// ioErr latches the first transport-class error for the life of
+	// this connection: any reader-error / server-close, send failure,
+	// decoder/framing desync, or unknown msg_kind. Once set, every
+	// subsequent submitQuery returns this error synchronously so a
+	// fresh query is never decoded against a desynced
+	// qwpConnDict / qwpSchemaRegistry / zstd stream — an undetectable
+	// subset of out-of-range reads could leave the dict accidentally
+	// in sync with the server (offsets match) while values are wrong,
+	// producing silently corrupted results — and never sent on a dead
+	// conn either. Mirrors the ingress-side asyncState.ioErr
 	// terminal-flag pattern (see CLAUDE.md).
 	ioErr error
 }
@@ -371,9 +375,10 @@ func (io *qwpEgressIO) submitQuery(ctx context.Context, req qwpRequest) error {
 }
 
 // setIoErr latches err as the connection's terminal ioErr — first
-// writer wins. Called by the dispatcher on any decoder- or framing-
-// level failure so subsequent submitQuery calls fail immediately
-// rather than running a fresh query against a desynced decoder.
+// writer wins. Called by the dispatcher (always via
+// poisonAndEmitError) on any transport-class fault so subsequent
+// submitQuery calls fail immediately rather than running a fresh
+// query against a dead conn or desynced decoder.
 func (io *qwpEgressIO) setIoErr(err error) {
 	io.ioErrMu.Lock()
 	defer io.ioErrMu.Unlock()
@@ -572,7 +577,7 @@ func (io *qwpEgressIO) dispatcherRun() {
 		io.pendingCredit.Store(0)
 
 		if err := io.sendQueryRequest(req); err != nil {
-			io.emitError(0, fmt.Sprintf("qwp: send QUERY_REQUEST: %v", err))
+			io.poisonAndEmitError(fmt.Sprintf("qwp: send QUERY_REQUEST: %v", err))
 			continue
 		}
 
@@ -612,12 +617,12 @@ func (io *qwpEgressIO) receiveLoop() {
 				// Reader goroutine exited without emitting an error
 				// — unusual, but treat as a clean close of an
 				// in-flight query.
-				io.emitError(0, "qwp: reader closed without error")
+				io.poisonAndEmitError("qwp: reader closed without error")
 				io.currentQueryDone = true
 				return
 			}
 			if ev.err != nil {
-				io.emitError(0, fmt.Sprintf("qwp: server closed connection: %v", ev.err))
+				io.poisonAndEmitError(fmt.Sprintf("qwp: server closed connection: %v", ev.err))
 				io.currentQueryDone = true
 				return
 			}
@@ -791,7 +796,7 @@ func (io *qwpEgressIO) drainPendingCancel() bool {
 		return true
 	}
 	if err := io.sendCancel(id); err != nil {
-		io.emitError(0, fmt.Sprintf("qwp: send CANCEL: %v", err))
+		io.poisonAndEmitError(fmt.Sprintf("qwp: send CANCEL: %v", err))
 		io.currentQueryDone = true
 		return false
 	}
@@ -814,7 +819,7 @@ func (io *qwpEgressIO) drainPendingCredit() bool {
 		return true
 	}
 	if err := io.sendCredit(io.currentRequestId, bytes); err != nil {
-		io.emitError(0, fmt.Sprintf("qwp: send CREDIT: %v", err))
+		io.poisonAndEmitError(fmt.Sprintf("qwp: send CREDIT: %v", err))
 		io.currentQueryDone = true
 		return false
 	}
@@ -879,32 +884,22 @@ func (io *qwpEgressIO) emit(ev qwpEvent) {
 	}
 }
 
-// emitError emits a synthesized client-side transport-error event,
-// attributed to the current query. Inherits emit's shutdown-drop
-// semantics — see the comment on emit. status is preserved on the
-// event for diagnostic purposes but is conventionally zero for
-// synthesized failures (the server status byte only exists on actual
-// QUERY_ERROR frames, which use handleQueryError directly).
-func (io *qwpEgressIO) emitError(status qwpStatusCode, msg string) {
-	io.emit(qwpEvent{
-		kind:       qwpEventKindTransportError,
-		requestId:  io.currentRequestId,
-		errStatus:  status,
-		errMessage: msg,
-	})
-}
-
 // poisonAndEmitError latches msg as the connection's terminal ioErr
-// AND emits it as the current query's TransportError event. Use this
-// in place of emitError for any decoder- or framing-level failure
-// that leaves the per-connection decoder state (symbol dict, schema
-// registry, zstd stream) desynced from the server: once the decoder
-// is out of sync, a follow-up query would decode against stale state
-// and could return silently corrupt rows. The latched ioErr causes
-// every subsequent submitQuery to fail immediately. Does NOT flip
-// currentQueryDone — callers that also need to terminate the current
-// query set it where it belongs, matching the existing emitError
-// call sites.
+// AND emits it as the current query's TransportError event. The single
+// entry point for every transport-class fault on the dispatcher path:
+// reader-error / server-close, send failures (QUERY_REQUEST / CANCEL /
+// CREDIT), decoder or framing failures that desync the per-connection
+// state (symbol dict, schema registry, zstd stream), and unknown
+// msg_kinds. After any of those, the connection is unusable — the
+// decoder may be silently out of sync (a mis-advanced reader can leave
+// the dict accidentally aligned at the offset level while values are
+// wrong, producing silently corrupt rows), or the conn itself is dead.
+// The latched ioErr causes every subsequent submitQuery to return
+// immediately with the original cause, matching the documented
+// "I/O goroutine has poisoned ioErr" contract on
+// qwpEventKindTransportError and Java's notifyTerminalFailure pattern.
+// Does NOT flip currentQueryDone — callers that also need to terminate
+// the current query set it where it belongs.
 //
 // The transport-error kind makes the failover orchestrator route this
 // to the reconnect-and-replay path; without the kind split a server
