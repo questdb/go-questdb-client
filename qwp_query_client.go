@@ -486,9 +486,9 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	// connectWalk handles the modulo wrap and the "n=1 means no
 	// candidates" case by returning a connect-failed error, which the
 	// outer failover loop surfaces and may revisit on a later attempt.
-	// Pass &s.cancelled so the walk short-circuits at endpoint
+	// Pass s.cancelCh so the walk short-circuits at endpoint
 	// boundaries when the user calls Cancel mid-failover.
-	result, err := connectWalk(ctx, c.cfg, failedIdx, &s.cancelled)
+	result, err := connectWalk(ctx, c.cfg, failedIdx, s.cancelCh)
 	if err != nil {
 		return nil, err
 	}

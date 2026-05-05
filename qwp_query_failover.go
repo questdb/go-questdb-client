@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -213,16 +214,16 @@ type qwpConnectResult struct {
 //     this endpoint on a subsequent attempt if every other endpoint
 //     is also unreachable.
 //
-// cancelled, when non-nil, is polled at every endpoint boundary to
+// cancelCh, when non-nil, is checked at every endpoint boundary to
 // short-circuit the walk if the user has asked to cancel. Cancel()
-// flips the session's cancelled atomic but does not cancel the user's
-// ctx, so without this poll a slow walk would block on
+// closes the session's cancelCh but does not cancel the user's ctx,
+// so without this check a slow walk would block on
 // serverInfoTimeout × len(endpoints) before honouring the cancel.
 // The check is at the loop boundary only; it does NOT preempt an
 // in-flight Dial / SERVER_INFO read, so the worst-case wait shrinks
 // from the full walk to a single endpoint's timeout. Java has the
 // same boundary-only granularity.
-func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, cancelled *atomic.Bool) (*qwpConnectResult, error) {
+func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, cancelCh <-chan struct{}) (*qwpConnectResult, error) {
 	if len(cfg.endpoints) == 0 {
 		return nil, fmt.Errorf("qwp query: no endpoints configured")
 	}
@@ -246,8 +247,12 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, 
 		stepCount = n - 1
 	}
 	for offset := 0; offset < stepCount; offset++ {
-		if cancelled != nil && cancelled.Load() {
-			return nil, context.Canceled
+		if cancelCh != nil {
+			select {
+			case <-cancelCh:
+				return nil, context.Canceled
+			default:
+			}
 		}
 		idx := (startIdx + offset) % n
 		ep := cfg.endpoints[idx]
@@ -362,10 +367,23 @@ type qwpQuerySession struct {
 	// cfg.failoverMaxAttempts.
 	attempt int
 
-	// cancelled is set by Cancel and checked at every reconnect-and-
-	// replay boundary so the session does not start a fresh attempt
-	// after the user has asked for cancellation.
-	cancelled atomic.Bool
+	// cancelCh is closed by requestCancel and selected on at every
+	// reconnect-and-replay boundary so the session does not start a
+	// fresh attempt after the user has asked for cancellation. A
+	// closed channel lets sleepInterruptible wake immediately on
+	// Cancel without polling. cancelOnce guards the close.
+	cancelCh   chan struct{}
+	cancelOnce sync.Once
+}
+
+// isCancelled reports whether requestCancel has been called.
+func (s *qwpQuerySession) isCancelled() bool {
+	select {
+	case <-s.cancelCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // newQwpQuerySession allocates and returns a session bound to client.
@@ -379,6 +397,7 @@ func newQwpQuerySession(client *QwpQueryClient, req qwpRequest) *qwpQuerySession
 		bindPayload:   req.bindPayload,
 		bindCount:     req.bindCount,
 		initialCredit: req.initialCredit,
+		cancelCh:      make(chan struct{}),
 	}
 	s.currentRequestId.Store(req.requestId)
 	return s
@@ -401,11 +420,11 @@ func (s *qwpQuerySession) submit(ctx context.Context) error {
 }
 
 // requestCancel marks the session cancelled and forwards the cancel
-// to the bound I/O goroutine. Safe to call from any goroutine. Sets
-// the cancelled flag first so the failover loop short-circuits even
-// if the cancel races a reconnect.
+// to the bound I/O goroutine. Safe to call from any goroutine. Closes
+// cancelCh first so the failover loop and any in-flight backoff sleep
+// short-circuit even if the cancel races a reconnect.
 func (s *qwpQuerySession) requestCancel() {
-	s.cancelled.Store(true)
+	s.cancelOnce.Do(func() { close(s.cancelCh) })
 	s.client.io().requestCancel(s.currentRequestId.Load())
 }
 
@@ -429,14 +448,14 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 		return ev, nil
 	}
 	// Transport-terminal failure. Decide whether to retry.
-	if !s.shouldReplay() || s.cancelled.Load() {
+	if !s.shouldReplay() || s.isCancelled() {
 		return ev, nil
 	}
 	lastErr := fmt.Errorf("qwp query: %s", ev.errMessage)
 	failedIdx := int(s.client.currentEndpointIdx.Load())
 	// Backoff (interruptible by ctx and cancel).
 	delay := computeBackoff(s.client.cfg, s.attempt)
-	if !sleepInterruptible(ctx, &s.cancelled, delay) || s.cancelled.Load() {
+	if !sleepInterruptible(ctx, s.cancelCh, delay) || s.isCancelled() {
 		return ev, nil
 	}
 	// Re-bind to a different role-matching endpoint and replay. A
@@ -444,7 +463,7 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	// publishes the new generation on the client.
 	newInfo, replayErr := s.client.reconnectAndReplay(ctx, s, failedIdx)
 	if replayErr != nil {
-		if s.cancelled.Load() {
+		if s.isCancelled() {
 			// Cancel landed during the walk and connectWalk's boundary
 			// poll short-circuited it. Surface the original transport
 			// error rather than a connect-failed wrap, matching the
@@ -525,37 +544,20 @@ func computeBackoff(cfg *qwpQueryClientConfig, attempt int) time.Duration {
 }
 
 // sleepInterruptible blocks for d, returning early when ctx expires
-// or cancelled flips to true. Returns true if the full sleep
-// completed, false if interrupted. Zero d returns immediately.
-func sleepInterruptible(ctx context.Context, cancelled *atomic.Bool, d time.Duration) bool {
+// or cancelCh is closed. Returns true if the full sleep completed,
+// false if interrupted. Zero d returns immediately.
+func sleepInterruptible(ctx context.Context, cancelCh <-chan struct{}, d time.Duration) bool {
 	if d <= 0 {
 		return true
 	}
 	timer := time.NewTimer(d)
 	defer timer.Stop()
-	// Poll cancelled in addition to the ctx because Cancel() doesn't
-	// cancel the user's ctx — the session has its own atomic flag.
-	// Use a small ticker so cancellation reaches the sleeper without
-	// adding a hundred-microsecond floor on every backoff.
-	checkInterval := d / 4
-	if checkInterval < time.Millisecond {
-		checkInterval = time.Millisecond
-	}
-	if checkInterval > 50*time.Millisecond {
-		checkInterval = 50 * time.Millisecond
-	}
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-timer.C:
-			return true
-		case <-ctx.Done():
-			return false
-		case <-ticker.C:
-			if cancelled.Load() {
-				return false
-			}
-		}
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-cancelCh:
+		return false
 	}
 }
