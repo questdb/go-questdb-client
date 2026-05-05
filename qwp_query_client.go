@@ -448,7 +448,7 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 	}
 	c.currentEndpointIdx.Store(-1)
 
-	result, err := connectWalk(ctx, cfg, -1)
+	result, err := connectWalk(ctx, cfg, -1, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -486,7 +486,9 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	// connectWalk handles the modulo wrap and the "n=1 means no
 	// candidates" case by returning a connect-failed error, which the
 	// outer failover loop surfaces and may revisit on a later attempt.
-	result, err := connectWalk(ctx, c.cfg, failedIdx)
+	// Pass &s.cancelled so the walk short-circuits at endpoint
+	// boundaries when the user calls Cancel mid-failover.
+	result, err := connectWalk(ctx, c.cfg, failedIdx, &s.cancelled)
 	if err != nil {
 		return nil, err
 	}

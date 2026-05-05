@@ -59,6 +59,11 @@ type mockClusterNode struct {
 	alive atomic.Bool
 	// onConnectCount counts successful upgrades for diagnostics.
 	onConnectCount atomic.Int64
+	// suppressServerInfo, when true, completes the WebSocket upgrade
+	// but never writes the SERVER_INFO frame, so the client's
+	// SERVER_INFO read times out at serverInfoTimeout. Used by tests
+	// that need a slow but reachable endpoint.
+	suppressServerInfo atomic.Bool
 }
 
 // addr returns the host:port for connection-string assembly.
@@ -120,6 +125,12 @@ func newMockCluster(t *testing.T, n int, tag func(idx int) (role byte, nodeId, c
 			}
 			defer conn.CloseNow()
 			mn.onConnectCount.Add(1)
+			if mn.suppressServerInfo.Load() {
+				// Hold the upgraded connection open without writing
+				// SERVER_INFO so the client's read times out.
+				<-r.Context().Done()
+				return
+			}
 			frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
 				mn.role, uint64(idx+1), 0, time.Now().UnixNano(),
 				mn.clusterId, mn.nodeId)
@@ -983,6 +994,87 @@ func TestQwpFailoverCancelDuringBackoff(t *testing.T) {
 	// should exit much faster.
 	if elapsed > 800*time.Millisecond {
 		t.Errorf("elapsed = %v, expected fast cancel exit", elapsed)
+	}
+}
+
+// TestQwpFailoverCancelDuringWalk verifies that Cancel during the
+// reconnect's connectWalk phase short-circuits at the next endpoint
+// boundary instead of burning a full timeout per remaining endpoint.
+// Node 0 succeeds initially and then drops the connection on the
+// query; nodes 1..3 hang at SERVER_INFO so each attempted bind costs
+// one serverInfoTimeout. Without the boundary cancel poll the walk
+// would cost 3 × serverInfoTimeout; with it, the walk exits after one
+// timeout once the cancel flag is observed.
+func TestQwpFailoverCancelDuringWalk(t *testing.T) {
+	cluster := newMockCluster(t, 4, rolesPrimaryReplicaReplica(),
+		func(idx int, m *qwpMockEgressConn) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if idx == 0 {
+				// Drain the QUERY_REQUEST then close to simulate a
+				// transport-terminal fault.
+				_, _, _ = m.conn.Read(ctx)
+				m.conn.Close(websocket.StatusInternalError, "simulated fault")
+				return
+			}
+			// Nodes 1..3 never reach the handler — suppressServerInfo
+			// holds them at the upgrade barrier. Defensive idle loop.
+			for {
+				if _, _, err := m.conn.Read(ctx); err != nil {
+					return
+				}
+			}
+		})
+	for i := 1; i < 4; i++ {
+		cluster.nodes[i].suppressServerInfo.Store(true)
+	}
+
+	cfg := qwpQueryDefaultConfig()
+	eps, _ := parseEndpointList(cluster.addrList(), qwpDefaultPort)
+	cfg.endpoints = eps
+	cfg.target = qwpTargetAny
+	cfg.serverInfoTimeout = 500 * time.Millisecond
+	cfg.failoverEnabled = true
+	cfg.failoverMaxAttempts = 3
+	cfg.failoverBackoffInitial = 1 * time.Millisecond
+	cfg.failoverBackoffMax = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := newQwpQueryClient(ctx, cfg)
+	if err != nil {
+		t.Fatalf("newQwpQueryClient: %v", err)
+	}
+	defer c.Close(ctx)
+
+	q := c.Query(ctx, "select 1")
+	defer q.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Cancel well before the first slow endpoint's timeout fires
+		// so the boundary poll has the flag set when the walk
+		// progresses to the second slow endpoint.
+		time.Sleep(100 * time.Millisecond)
+		q.Cancel()
+	}()
+
+	start := time.Now()
+	for _, err := range q.Batches() {
+		_ = err
+	}
+	elapsed := time.Since(start)
+	wg.Wait()
+
+	// Without the boundary poll the first walk visits all three slow
+	// endpoints (3 × 500ms = 1.5s); with it the walk exits after the
+	// first endpoint's timeout (~500ms) plus negligible overhead. Use
+	// 1s as the threshold to give CI machines headroom while still
+	// distinguishing the two regimes.
+	if elapsed > 1*time.Second {
+		t.Errorf("elapsed = %v, expected boundary cancel after one endpoint timeout", elapsed)
 	}
 }
 

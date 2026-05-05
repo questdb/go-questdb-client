@@ -212,7 +212,17 @@ type qwpConnectResult struct {
 //     just burn an attempt; the outer failover loop can come back to
 //     this endpoint on a subsequent attempt if every other endpoint
 //     is also unreachable.
-func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int) (*qwpConnectResult, error) {
+//
+// cancelled, when non-nil, is polled at every endpoint boundary to
+// short-circuit the walk if the user has asked to cancel. Cancel()
+// flips the session's cancelled atomic but does not cancel the user's
+// ctx, so without this poll a slow walk would block on
+// serverInfoTimeout × len(endpoints) before honouring the cancel.
+// The check is at the loop boundary only; it does NOT preempt an
+// in-flight Dial / SERVER_INFO read, so the worst-case wait shrinks
+// from the full walk to a single endpoint's timeout. Java has the
+// same boundary-only granularity.
+func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, cancelled *atomic.Bool) (*qwpConnectResult, error) {
 	if len(cfg.endpoints) == 0 {
 		return nil, fmt.Errorf("qwp query: no endpoints configured")
 	}
@@ -236,6 +246,9 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int) 
 		stepCount = n - 1
 	}
 	for offset := 0; offset < stepCount; offset++ {
+		if cancelled != nil && cancelled.Load() {
+			return nil, context.Canceled
+		}
 		idx := (startIdx + offset) % n
 		ep := cfg.endpoints[idx]
 		wsURL := scheme + "://" + ep.String()
@@ -431,6 +444,13 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	// publishes the new generation on the client.
 	newInfo, replayErr := s.client.reconnectAndReplay(ctx, s, failedIdx)
 	if replayErr != nil {
+		if s.cancelled.Load() {
+			// Cancel landed during the walk and connectWalk's boundary
+			// poll short-circuited it. Surface the original transport
+			// error rather than a connect-failed wrap, matching the
+			// pre-walk and post-sleep cancel guards above.
+			return ev, nil
+		}
 		// Reconnect failed — surface a transport error wrapping the
 		// dial failure and the original cause. The caller's next
 		// iteration will see this and either retry (if the budget
