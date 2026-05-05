@@ -58,13 +58,15 @@ func (e *QwpQueryError) Error() string {
 
 // QwpRoleMismatchError is returned by QwpQueryClient construction when
 // none of the configured endpoints satisfies the target= role filter.
-// The connect walk records the most-recently-observed SERVER_INFO and
-// whether any endpoint negotiated v1 so callers can distinguish three
-// failure shapes: "no primary available" (LastObserved non-nil;
-// at least one v2 endpoint reported a different role), "OSS-only
-// cluster" (SawV1Mismatch true; at least one endpoint negotiated v1
-// and cannot report a role), and "all endpoints unreachable" (both
-// fields zero-valued).
+// The connect walk records the most-recently-observed SERVER_INFO,
+// whether any endpoint negotiated v1, and the last underlying transport
+// failure so callers can distinguish four failure shapes: "no primary
+// available" (LastObserved non-nil; at least one v2 endpoint reported a
+// different role), "OSS-only cluster" (SawV1Mismatch true; at least
+// one endpoint negotiated v1 and cannot report a role), "all endpoints
+// unreachable" (LastTransportError non-nil with both other fields
+// zero), and combinations of the above (e.g. one endpoint dialled but
+// reported the wrong role while another refused the connection).
 type QwpRoleMismatchError struct {
 	// Target is the requested role filter ("any", "primary", "replica").
 	// Stored as a string for human-readable error formatting; the
@@ -85,6 +87,14 @@ type QwpRoleMismatchError struct {
 	// role" without parsing the error message.
 	SawV1Mismatch bool
 
+	// LastTransportError is the most recent transport-level failure the
+	// connect walk hit (TCP/TLS dial, WebSocket upgrade, SERVER_INFO
+	// timeout). Populated when at least one endpoint failed before
+	// reaching the role-filter step. Nil when every endpoint dialled
+	// cleanly but failed only the role / v1 checks. Available via
+	// errors.Is / errors.As through Unwrap.
+	LastTransportError error
+
 	// Endpoints lists every endpoint the walk attempted, in the order
 	// they were tried. Useful for diagnosing why none of them matched.
 	Endpoints []string
@@ -104,10 +114,21 @@ func (e *QwpRoleMismatchError) Error() string {
 		b.WriteString(
 			"; at least one endpoint negotiated v1 and cannot supply a role")
 	}
+	if e.LastTransportError != nil {
+		fmt.Fprintf(&b, "; last transport error: %v", e.LastTransportError)
+	}
 	if len(e.Endpoints) > 0 {
 		fmt.Fprintf(&b, " (tried: %s)", strings.Join(e.Endpoints, ", "))
 	}
 	return b.String()
+}
+
+// Unwrap exposes the underlying transport failure (if any) to
+// errors.Is / errors.As so callers can match on both the role-mismatch
+// shape and the specific dial / upgrade failure that contributed to it.
+// Returns nil when every endpoint reached the role-filter step.
+func (e *QwpRoleMismatchError) Unwrap() error {
+	return e.LastTransportError
 }
 
 // QwpFailoverReset is yielded as a non-fatal error by *QwpQuery.Batches

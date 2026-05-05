@@ -347,6 +347,74 @@ func TestQwpClientV1MismatchSurfacesSawV1MismatchFlag(t *testing.T) {
 	}
 }
 
+// TestQwpClientRoleMismatchPreservesTransportError verifies that when
+// the connect walk encounters a mix of transport failures and other
+// non-matching outcomes (e.g. v1 endpoints) under target=primary, the
+// returned QwpRoleMismatchError carries both the v1 flag and the last
+// underlying transport error so callers can tell network problems from
+// pure role mismatch and reach the dial error via errors.As / Unwrap.
+func TestQwpClientRoleMismatchPreservesTransportError(t *testing.T) {
+	// Endpoint A: refuses the WebSocket upgrade with 503 — generates a
+	// transport-level dial error.
+	srvFail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srvFail.Close()
+	// Endpoint B: negotiates QWP v1 — accepted at the transport layer
+	// but skipped by the role filter because v1 has no SERVER_INFO.
+	srvV1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srvV1.Close()
+
+	addrList := strings.TrimPrefix(srvFail.URL, "http://") + "," +
+		strings.TrimPrefix(srvV1.URL, "http://")
+	cfg := qwpQueryDefaultConfig()
+	eps, err := parseEndpointList(addrList, qwpDefaultPort)
+	if err != nil {
+		t.Fatalf("parseEndpointList: %v", err)
+	}
+	cfg.endpoints = eps
+	cfg.target = qwpTargetPrimary
+	cfg.serverInfoTimeout = 500 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = newQwpQueryClient(ctx, cfg)
+	if err == nil {
+		t.Fatal("expected QwpRoleMismatchError")
+	}
+	var rme *QwpRoleMismatchError
+	if !errors.As(err, &rme) {
+		t.Fatalf("err = %v (%T), want *QwpRoleMismatchError", err, err)
+	}
+	if !rme.SawV1Mismatch {
+		t.Errorf("SawV1Mismatch = false, want true (v1 endpoint was visited)")
+	}
+	if rme.LastTransportError == nil {
+		t.Fatal("LastTransportError = nil, want the dial failure from the 503 endpoint")
+	}
+	if !errors.Is(err, rme.LastTransportError) {
+		t.Errorf("errors.Is(err, LastTransportError) = false, want true via Unwrap")
+	}
+	if !strings.Contains(rme.Error(), "last transport error") {
+		t.Errorf("Error string %q missing transport-error hint", rme.Error())
+	}
+	if !strings.Contains(rme.Error(), "negotiated v1") {
+		t.Errorf("Error string %q missing v1 hint", rme.Error())
+	}
+}
+
 // TestQwpClientPrimaryAcceptsStandalone verifies the OSS-friendly
 // rule that target=primary also accepts STANDALONE — the role v1
 // servers report when replication is not configured. Without this,

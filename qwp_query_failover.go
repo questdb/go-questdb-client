@@ -303,16 +303,18 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int) 
 			stepCount, lastErr)
 	}
 	// Specific role filter and no match — surface a typed
-	// QwpRoleMismatchError carrying the last observed SERVER_INFO and
-	// the v1-mismatch flag so callers can distinguish "no primary
-	// available" (LastObserved non-nil), "OSS-only cluster"
-	// (SawV1Mismatch true), and "all endpoints unreachable" (both
-	// zero-valued).
+	// QwpRoleMismatchError carrying the last observed SERVER_INFO, the
+	// v1-mismatch flag, and the last transport error so callers can
+	// distinguish "no primary available" (LastObserved non-nil),
+	// "OSS-only cluster" (SawV1Mismatch true), "all endpoints
+	// unreachable" (LastTransportError non-nil with both other fields
+	// zero), and any combination thereof.
 	return nil, &QwpRoleMismatchError{
-		Target:        cfg.target.String(),
-		LastObserved:  lastObserved,
-		SawV1Mismatch: sawV1Mismatch,
-		Endpoints:     endpointStrings,
+		Target:             cfg.target.String(),
+		LastObserved:       lastObserved,
+		SawV1Mismatch:      sawV1Mismatch,
+		LastTransportError: lastErr,
+		Endpoints:          endpointStrings,
 	}
 }
 
