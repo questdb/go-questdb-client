@@ -58,10 +58,13 @@ func (e *QwpQueryError) Error() string {
 
 // QwpRoleMismatchError is returned by QwpQueryClient construction when
 // none of the configured endpoints satisfies the target= role filter.
-// The connect walk records the most-recently-observed SERVER_INFO so
-// callers can distinguish "no primary available" (LastObserved
-// non-nil; the cluster is up but no node reports the requested role)
-// from "all endpoints unreachable" (LastObserved nil).
+// The connect walk records the most-recently-observed SERVER_INFO and
+// whether any endpoint negotiated v1 so callers can distinguish three
+// failure shapes: "no primary available" (LastObserved non-nil;
+// at least one v2 endpoint reported a different role), "OSS-only
+// cluster" (SawV1Mismatch true; at least one endpoint negotiated v1
+// and cannot report a role), and "all endpoints unreachable" (both
+// fields zero-valued).
 type QwpRoleMismatchError struct {
 	// Target is the requested role filter ("any", "primary", "replica").
 	// Stored as a string for human-readable error formatting; the
@@ -71,9 +74,16 @@ type QwpRoleMismatchError struct {
 
 	// LastObserved is the SERVER_INFO of the most recent endpoint the
 	// connect walk reached and that returned a role this filter would
-	// reject. Nil if every endpoint refused the connection or never
-	// emitted SERVER_INFO (v1 servers).
+	// reject. Nil if every endpoint refused the connection or only
+	// v1 endpoints responded.
 	LastObserved *QwpServerInfo
+
+	// SawV1Mismatch is true when at least one endpoint negotiated QWP
+	// v1 (no SERVER_INFO frame, role unknown) and was therefore skipped
+	// because the target filter requires a role guarantee. Lets callers
+	// detect "the cluster is up but it's OSS / v1 and can't supply a
+	// role" without parsing the error message.
+	SawV1Mismatch bool
 
 	// Endpoints lists every endpoint the walk attempted, in the order
 	// they were tried. Useful for diagnosing why none of them matched.
@@ -89,6 +99,10 @@ func (e *QwpRoleMismatchError) Error() string {
 		if e.LastObserved.NodeId != "" {
 			fmt.Fprintf(&b, " on node %q", e.LastObserved.NodeId)
 		}
+	}
+	if e.SawV1Mismatch {
+		b.WriteString(
+			"; at least one endpoint negotiated v1 and cannot supply a role")
 	}
 	if len(e.Endpoints) > 0 {
 		fmt.Fprintf(&b, " (tried: %s)", strings.Join(e.Endpoints, ", "))

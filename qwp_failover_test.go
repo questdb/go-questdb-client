@@ -282,6 +282,71 @@ func TestQwpClientRoleMismatchSurfacesTypedError(t *testing.T) {
 	}
 }
 
+// TestQwpClientV1MismatchSurfacesSawV1MismatchFlag verifies that when
+// every endpoint negotiates QWP v1 (no SERVER_INFO frame) and the
+// caller asks for target=primary, the typed error reports
+// SawV1Mismatch=true with a LastObserved=nil. Without this flag the
+// caller cannot distinguish "you pointed me at an OSS / v1 cluster"
+// from "all endpoints unreachable".
+func TestQwpClientV1MismatchSurfacesSawV1MismatchFlag(t *testing.T) {
+	// Two v1-only endpoints: each echoes X-QWP-Version=1 on upgrade
+	// and never emits a SERVER_INFO frame, mirroring an OSS server.
+	v1Server := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set(qwpHeaderVersion, "1")
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.CloseNow()
+			for {
+				if _, _, err := conn.Read(r.Context()); err != nil {
+					return
+				}
+			}
+		}))
+	}
+	srvA := v1Server()
+	defer srvA.Close()
+	srvB := v1Server()
+	defer srvB.Close()
+	addrList := strings.TrimPrefix(srvA.URL, "http://") + "," +
+		strings.TrimPrefix(srvB.URL, "http://")
+
+	cfg := qwpQueryDefaultConfig()
+	eps, err := parseEndpointList(addrList, qwpDefaultPort)
+	if err != nil {
+		t.Fatalf("parseEndpointList: %v", err)
+	}
+	cfg.endpoints = eps
+	cfg.target = qwpTargetPrimary
+	cfg.serverInfoTimeout = 500 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = newQwpQueryClient(ctx, cfg)
+	if err == nil {
+		t.Fatal("expected QwpRoleMismatchError")
+	}
+	var rme *QwpRoleMismatchError
+	if !errors.As(err, &rme) {
+		t.Fatalf("err = %v (%T), want *QwpRoleMismatchError", err, err)
+	}
+	if !rme.SawV1Mismatch {
+		t.Errorf("SawV1Mismatch = false, want true")
+	}
+	if rme.LastObserved != nil {
+		t.Errorf("LastObserved = %+v, want nil (no v2 endpoint reported a role)",
+			rme.LastObserved)
+	}
+	if rme.Target != "primary" {
+		t.Errorf("Target = %q, want primary", rme.Target)
+	}
+	if !strings.Contains(rme.Error(), "negotiated v1") {
+		t.Errorf("Error string %q missing v1 hint", rme.Error())
+	}
+}
+
 // TestQwpClientPrimaryAcceptsStandalone verifies the OSS-friendly
 // rule that target=primary also accepts STANDALONE — the role v1
 // servers report when replication is not configured. Without this,

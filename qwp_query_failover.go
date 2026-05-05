@@ -227,6 +227,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int) 
 
 	var lastObserved *QwpServerInfo
 	var lastErr error
+	sawV1Mismatch := false
 	n := len(cfg.endpoints)
 	startIdx := 0
 	stepCount := n
@@ -263,7 +264,11 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int) 
 		if info == nil && cfg.target != qwpTargetAny {
 			// v1 server cannot satisfy a specific role filter — its
 			// role is unknown and a "best effort" bind would give the
-			// caller a false guarantee.
+			// caller a false guarantee. Record this so the final
+			// QwpRoleMismatchError can flag SawV1Mismatch and tell the
+			// caller "the cluster is up but it's OSS / v1" rather than
+			// "all endpoints unreachable".
+			sawV1Mismatch = true
 			_ = tr.close()
 			continue
 		}
@@ -298,13 +303,16 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int) 
 			stepCount, lastErr)
 	}
 	// Specific role filter and no match — surface a typed
-	// QwpRoleMismatchError carrying the last observed SERVER_INFO so
-	// callers can distinguish "no primary available" (LastObserved
-	// non-nil) from "all endpoints unreachable" (LastObserved nil).
+	// QwpRoleMismatchError carrying the last observed SERVER_INFO and
+	// the v1-mismatch flag so callers can distinguish "no primary
+	// available" (LastObserved non-nil), "OSS-only cluster"
+	// (SawV1Mismatch true), and "all endpoints unreachable" (both
+	// zero-valued).
 	return nil, &QwpRoleMismatchError{
-		Target:       cfg.target.String(),
-		LastObserved: lastObserved,
-		Endpoints:    endpointStrings,
+		Target:        cfg.target.String(),
+		LastObserved:  lastObserved,
+		SawV1Mismatch: sawV1Mismatch,
+		Endpoints:     endpointStrings,
 	}
 }
 
