@@ -275,8 +275,13 @@ func (l *qwpSfSendLoop) sendLoopStart() {
 		panic("qwp/sf: send loop already started")
 	}
 	// Position cursor at the first unsent FSN before the goroutine
-	// observes any state.
-	l.positionCursorForStart()
+	// observes any state. If the walk hits a corrupt frame header,
+	// latch the error and still spin up the goroutine — its first
+	// iteration sees running=false and exits cleanly, releasing
+	// wg/done. Producer-side calls then surface the latched error.
+	if err := l.positionCursorForStart(); err != nil {
+		l.recordFatal(err)
+	}
 	l.wg.Add(1)
 	go l.run()
 }
@@ -382,20 +387,29 @@ func (l *qwpSfSendLoop) sendLoopTotalAcks() int64 {
 // cursor (sendingSegment + sendOffset) to the first unsent FSN.
 // Must be called by the I/O goroutine before it starts sending —
 // the producer thread captures the engine's state at that moment.
-func (l *qwpSfSendLoop) positionCursorForStart() {
+// Returns a non-nil error if the cursor walk hits a corrupt frame
+// header; see positionCursorAt.
+func (l *qwpSfSendLoop) positionCursorForStart() error {
 	replayStart := l.engine.engineAckedFsn() + 1
 	l.fsnAtZero.Store(replayStart)
 	l.nextWireSeq.Store(0)
 	l.framesSentOnConn.Store(0)
 	l.acksRecvOnConn.Store(0)
-	l.positionCursorAt(replayStart)
+	return l.positionCursorAt(replayStart)
 }
 
 // positionCursorAt walks the engine's segments to find the one
 // containing targetFsn and sets sendOffset to the byte offset of
 // that frame within it. If targetFsn is past everything published,
 // parks at the live active segment's published offset.
-func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) {
+//
+// Returns a non-nil error if a frame header along the walk has a
+// negative payloadLen — defense-in-depth against a corrupt segment
+// that escaped CRC recovery. Without this check the next loop step
+// would underflow offset and panic on the slice index. tryAppend
+// validates payloadLen on write and recovery's CRC scan validates
+// it on startup, so this is not expected to fire in practice.
+func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) error {
 	seg := l.engine.engineFindSegmentContaining(targetFsn)
 	if seg == nil {
 		l.sendingSegment = l.engine.engineActiveSegment()
@@ -404,7 +418,7 @@ func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) {
 		} else {
 			l.sendOffset = qwpSfHeaderSize
 		}
-		return
+		return nil
 	}
 	l.sendingSegment = seg
 	// Walk frame-by-frame from HEADER_SIZE until we land on targetFsn.
@@ -413,10 +427,15 @@ func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) {
 	base := seg.address()
 	for fsn < targetFsn {
 		payloadLen := int64(int32(binary.LittleEndian.Uint32(base[offset+4 : offset+8])))
+		if payloadLen < 0 {
+			return fmt.Errorf("qwp/sf: negative payloadLen at offset %d in segment baseSeq=%d (corrupt segment)",
+				offset, seg.segmentBaseSeq())
+		}
 		offset += qwpSfFrameHeaderSize + payloadLen
 		fsn++
 	}
 	l.sendOffset = offset
+	return nil
 }
 
 // run is the outer reconnect loop. Each iteration runs one
@@ -791,7 +810,13 @@ func (l *qwpSfSendLoop) reconnectWithBackoff(initial error) bool {
 		l.totalReconnectAttempts.Add(1)
 		newTransport, err := l.reconnectFactory(l.ctx)
 		if err == nil && newTransport != nil {
-			l.swapClient(newTransport)
+			if swapErr := l.swapClient(newTransport); swapErr != nil {
+				// Cursor positioning detected segment corruption —
+				// not retryable; reconnecting won't fix bad bytes
+				// in the on-disk segment.
+				l.recordFatal(swapErr)
+				return false
+			}
 			l.totalReconnects.Add(1)
 			return true
 		}
@@ -842,8 +867,9 @@ func (l *qwpSfSendLoop) reconnectWithBackoff(initial error) bool {
 // swapClient replaces the active transport, realigns fsnAtZero to
 // the next unacked FSN, restarts wire sequencing from 0, and
 // repositions the cursor so the next trySendOne call replays the
-// first unacked frame.
-func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) {
+// first unacked frame. Returns a non-nil error if the cursor walk
+// hits a corrupt frame header; see positionCursorAt.
+func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	old := l.transport.Swap(newTransport)
 	if old != nil {
 		_ = old.close(context.Background())
@@ -859,7 +885,7 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) {
 	} else {
 		l.replayTargetFsn = -1
 	}
-	l.positionCursorAt(replayStart)
+	return l.positionCursorAt(replayStart)
 }
 
 // qwpSfIsTerminalUpgradeError reports whether err indicates any
