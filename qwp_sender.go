@@ -403,6 +403,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 		qwpSfDefaultReconnectMaxDuration,
 		qwpSfDefaultReconnectInitialBackoff,
 		qwpSfDefaultReconnectMaxBackoff)
+	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	s.cursorEngine = engine
 	s.cursorSendLoop = loop
 	return s, nil

@@ -505,6 +505,69 @@ func TestQwpSfSendLoopNilFactoryIsTerminalOnFailure(t *testing.T) {
 	assert.Equal(t, int64(0), loop.sendLoopTotalReconnectAttempts())
 }
 
+// Spec §16: verifies the reconnect-status snapshot the loop exposes
+// is non-empty while connectWithBackoff is iterating, so
+// engineAppendBlocking can produce the diagnostic-rich
+// "reconnecting: attempts=N, outage-elapsed=…" error.
+func TestQwpSfSendLoopReconnectStatusSnapshot(t *testing.T) {
+	// Pre-state: never reconnecting.
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	// Factory that always fails so the loop stays inside
+	// connectWithBackoff for the duration of the outage budget. We
+	// pass a still-good initial transport so the loop runs once,
+	// observes the close, and enters reconnect — which is the state
+	// we want to sample.
+	dialFails := atomic.Bool{}
+	factory := func(ctx context.Context) (*qwpTransport, error) {
+		if dialFails.Load() {
+			return nil, errors.New("dial: connection refused")
+		}
+		return qwpSfDialFor(srv)(ctx)
+	}
+
+	transport, err := factory(context.Background())
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, factory,
+		100*time.Microsecond, 2*time.Second /* outage budget */, 10*time.Millisecond, 30*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	// Pre-reconnect snapshot: not reconnecting.
+	reconnecting, attempts, _ := loop.sendLoopReconnectStatus()
+	assert.False(t, reconnecting)
+	assert.Equal(t, int64(0), attempts)
+
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("warm-up"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, time.Second, time.Millisecond)
+
+	// Now flip the factory to fail and tear the live conn so the
+	// loop is forced into connectWithBackoff with a short backoff
+	// cap (30ms) — gives us many attempts inside the 2s budget.
+	dialFails.Store(true)
+	close(srv.kill)
+
+	require.Eventually(t, func() bool {
+		r, a, start := loop.sendLoopReconnectStatus()
+		return r && a >= 1 && !start.IsZero()
+	}, 1500*time.Millisecond, 5*time.Millisecond,
+		"expected loop to enter reconnect with attempts ≥ 1 and a non-zero outage start")
+
+	r, a, start := loop.sendLoopReconnectStatus()
+	require.True(t, r)
+	assert.GreaterOrEqual(t, a, int64(1))
+	assert.WithinDuration(t, time.Now(), start, 2*time.Second)
+}
+
 func TestQwpSfConnectWithRetrySucceedsEventually(t *testing.T) {
 	// Start with a port that nothing is listening on; flip to a
 	// real server after a few attempts.

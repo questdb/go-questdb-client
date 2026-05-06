@@ -202,6 +202,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	loop := qwpSfNewSendLoop(engine, transport, d.clientFactory,
 		qwpSfDefaultParkInterval,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
+	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 

@@ -147,6 +147,53 @@ func TestQwpSfEngineBackpressureTimeout(t *testing.T) {
 	assert.GreaterOrEqual(t, elapsed, 40*time.Millisecond)
 	// Backpressure stall counter incremented.
 	assert.GreaterOrEqual(t, e.engineTotalBackpressureStalls(), int64(1))
+	// Spec §16: with no loop wired (or loop reports "not
+	// reconnecting"), the message must say "publishing but slow".
+	assert.Contains(t, err.Error(), "wire publishing but slow")
+}
+
+// Spec §16 mandates the backpressure-timeout error distinguish
+// "publishing but slow" from "reconnecting", and the reconnecting
+// variant must include attempt count and outage start.
+func TestQwpSfEngineBackpressureTimeoutReconnecting(t *testing.T) {
+	const segSize int64 = 96
+	e, err := qwpSfNewCursorEngine("", segSize, segSize, 50*time.Millisecond)
+	require.NoError(t, err)
+	defer func() { _ = e.engineClose() }()
+
+	outageStart := time.Now().Add(-3 * time.Second)
+	e.engineSetReconnectStatusGetter(func() (bool, int64, time.Time) {
+		return true, 7, outageStart
+	})
+
+	for i := 0; i < 3; i++ {
+		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
+		require.NoError(t, err, "iteration %d", i)
+	}
+	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, qwpSfErrBackpressureTimeout))
+	msg := err.Error()
+	assert.Contains(t, msg, "reconnecting")
+	assert.Contains(t, msg, "attempts=7")
+	assert.Contains(t, msg, "outage-elapsed=")
+	assert.Contains(t, msg, "outage-start=")
+
+	// After the loop reports "no longer reconnecting", the next
+	// timeout falls back to the slow-publish wording.
+	e.engineSetReconnectStatusGetter(func() (bool, int64, time.Time) {
+		return false, 0, time.Time{}
+	})
+	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wire publishing but slow")
+	assert.NotContains(t, err.Error(), "reconnecting")
+
+	// Detaching the getter (nil) is also valid — same fallback wording.
+	e.engineSetReconnectStatusGetter(nil)
+	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wire publishing but slow")
 }
 
 func TestQwpSfEnginePayloadTooLarge(t *testing.T) {

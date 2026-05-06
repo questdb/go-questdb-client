@@ -93,6 +93,16 @@ type qwpSfCursorEngine struct {
 	// wait. One increment per blocking-call (not per spin).
 	backpressureStalls atomic.Int64
 
+	// reconnectStatus is the (optional) snapshot getter wired in by
+	// the I/O send loop after it is constructed. When nil (e.g. tests
+	// using the engine standalone) the backpressure-timeout error
+	// falls back to the loop-agnostic "wire path is not draining"
+	// wording. When non-nil, engineAppendBlocking checks it on
+	// deadline expiry to distinguish "publishing but slow" from
+	// "reconnecting" per spec §16, and includes attempt count +
+	// outage elapsed in the latter case.
+	reconnectStatus atomic.Pointer[func() (bool, int64, time.Time)]
+
 	// closed is set by engineClose. atomic.Bool so tests / status
 	// accessors can sample it from any goroutine.
 	closed atomic.Bool
@@ -306,7 +316,7 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 	defer timer.Stop()
 	for {
 		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w (deadline %s)", qwpSfErrBackpressureTimeout, e.appendDeadline)
+			return 0, e.formatBackpressureTimeout()
 		}
 		select {
 		case <-timer.C:
@@ -329,6 +339,42 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 // space. One increment per blocking-call, not per spin-park.
 func (e *qwpSfCursorEngine) engineTotalBackpressureStalls() int64 {
 	return e.backpressureStalls.Load()
+}
+
+// engineSetReconnectStatusGetter wires a snapshot accessor that
+// reports whether the I/O loop is currently inside its
+// reconnect-with-backoff phase. Called once by the QWP sender
+// constructor right after the send loop is created. Pass nil to
+// detach (used by tests that tear down the loop independently).
+//
+// The getter is invoked only on the deadline-expiry path of
+// engineAppendBlocking, so the cost is paid only on a true
+// backpressure timeout — never on the steady-state hot path.
+func (e *qwpSfCursorEngine) engineSetReconnectStatusGetter(getter func() (bool, int64, time.Time)) {
+	if getter == nil {
+		e.reconnectStatus.Store(nil)
+		return
+	}
+	e.reconnectStatus.Store(&getter)
+}
+
+// formatBackpressureTimeout builds the LineSenderException-equivalent
+// error returned by engineAppendBlocking when the deadline expires.
+// Per spec §16 the message MUST distinguish "publishing but slow"
+// from "reconnecting"; in the latter case it includes the per-outage
+// attempt count and the wall-clock outage start.
+func (e *qwpSfCursorEngine) formatBackpressureTimeout() error {
+	if g := e.reconnectStatus.Load(); g != nil {
+		if reconnecting, attempts, outageStart := (*g)(); reconnecting {
+			return fmt.Errorf("%w (deadline %s, reconnecting: attempts=%d, outage-elapsed=%s, outage-start=%s)",
+				qwpSfErrBackpressureTimeout,
+				e.appendDeadline,
+				attempts,
+				time.Since(outageStart).Round(time.Millisecond),
+				outageStart.Format(time.RFC3339Nano))
+		}
+	}
+	return fmt.Errorf("%w (deadline %s, wire publishing but slow)", qwpSfErrBackpressureTimeout, e.appendDeadline)
 }
 
 // engineClose tears down the engine. Drains residual on-disk

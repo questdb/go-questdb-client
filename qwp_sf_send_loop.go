@@ -177,6 +177,15 @@ type qwpSfSendLoop struct {
 	// just hammers the server). Reset on every connection swap.
 	framesSentOnConn atomic.Int64
 	acksRecvOnConn   atomic.Int64
+
+	// Reconnect-loop status, exposed so engineAppendBlocking can
+	// distinguish "wire publishing but slow" from "wire is in the
+	// retry loop" when the backpressure deadline fires (spec §16).
+	// outageStartUnixNano is non-zero iff connectWithBackoff is
+	// currently running; reconnectAttempts is the per-outage counter
+	// (resets at the start of each connectWithBackoff call).
+	outageStartUnixNano atomic.Int64
+	reconnectAttempts   atomic.Int64
 }
 
 // qwpSfNewSendLoop constructs a send loop bound to the given engine
@@ -380,6 +389,23 @@ func (l *qwpSfSendLoop) sendLoopTotalReconnects() int64 {
 // (succeeded + failed).
 func (l *qwpSfSendLoop) sendLoopTotalReconnectAttempts() int64 {
 	return l.totalReconnectAttempts.Load()
+}
+
+// sendLoopReconnectStatus reports whether the I/O loop is currently
+// inside connectWithBackoff. When reconnecting is true, attempts is
+// the per-outage attempt counter (≥ 1) and outageStart is the wall-
+// clock time the current outage began. When reconnecting is false,
+// attempts is 0 and outageStart is the zero time.Time.
+//
+// Used by engineAppendBlocking to enrich the backpressure timeout
+// error per spec §16: distinguish "publishing but slow" from
+// "reconnecting" with attempt count + outage start.
+func (l *qwpSfSendLoop) sendLoopReconnectStatus() (reconnecting bool, attempts int64, outageStart time.Time) {
+	startNanos := l.outageStartUnixNano.Load()
+	if startNanos == 0 {
+		return false, 0, time.Time{}
+	}
+	return true, l.reconnectAttempts.Load(), time.Unix(0, startNanos)
 }
 
 // sendLoopTotalFramesSent returns the cumulative frame count
@@ -842,8 +868,15 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 	backoff := l.reconnectInitialBackoff
 	attempts := 0
 	lastErr := initial
+	l.outageStartUnixNano.Store(outageStart.UnixNano())
+	l.reconnectAttempts.Store(0)
+	defer func() {
+		l.outageStartUnixNano.Store(0)
+		l.reconnectAttempts.Store(0)
+	}()
 	for l.running.Load() && time.Now().Before(deadline) {
 		attempts++
+		l.reconnectAttempts.Store(int64(attempts))
 		l.totalReconnectAttempts.Add(1)
 		newTransport, err := l.reconnectFactory(l.ctx)
 		if err == nil && newTransport != nil {

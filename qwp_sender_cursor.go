@@ -205,6 +205,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
 		reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	// Wire the user-configured server-error API knobs (Phase 5)
 	// before sendLoopStart so they're visible from the receiver
 	// goroutine the moment it starts.
