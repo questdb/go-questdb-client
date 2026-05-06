@@ -179,12 +179,22 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	// post-reconnect transport also dumps if the user opted in.
 	factory := qwpSfBuildReconnectFactory(address, opts, conf.dumpWriter)
 
-	// Initial connect — apply retry-with-backoff iff opted in.
+	// Initial connect — three modes:
+	//   - InitialConnectOff:   one factory call, terminal on failure (default).
+	//   - InitialConnectSync:  retry-with-backoff on the calling goroutine.
+	//   - InitialConnectAsync: skip the dial here; the I/O goroutine
+	//                          dials in-band on its first iteration.
+	//                          The producer experiences backpressure
+	//                          (engineAppendBlocking spins) until the
+	//                          wire comes up.
 	var transport *qwpTransport
-	if conf.initialConnectRetry {
+	switch conf.initialConnectMode {
+	case InitialConnectSync:
 		transport, err = qwpSfConnectWithRetry(ctx, factory,
 			reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
-	} else {
+	case InitialConnectAsync:
+		transport = nil
+	default: // InitialConnectOff
 		transport, err = factory(ctx)
 	}
 	if err != nil {

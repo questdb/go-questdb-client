@@ -317,13 +317,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
 			switch v {
-			case "on", "true":
-				senderConf.initialConnectRetry = true
+			case "on", "true", "sync":
+				senderConf.initialConnectMode = InitialConnectSync
 			case "off", "false":
-				senderConf.initialConnectRetry = false
+				senderConf.initialConnectMode = InitialConnectOff
+			case "async":
+				senderConf.initialConnectMode = InitialConnectAsync
 			default:
 				return nil, NewInvalidConfigStrError(
-					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
+					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false' / 'sync' / 'async'", k, v)
 			}
 		case "close_flush_timeout_millis":
 			if senderConf.senderType != qwpSenderType {

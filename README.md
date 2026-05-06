@@ -476,14 +476,15 @@ the lock releases automatically when the process exits.
 | `reconnect_max_duration_millis` | 300000 | Per-outage cap on reconnect retries. |
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
-| `initial_connect_retry` | `off` | When `on`, applies the same backoff to the initial connect. |
+| `initial_connect_retry` | `off` | `off`/`false` = terminal on first failure; `on`/`true`/`sync` = same retry loop as reconnect, blocking the constructor; `async` = same retry loop on the I/O goroutine, constructor returns immediately and producers experience backpressure until the wire comes up. |
 | `close_flush_timeout_millis` | 5000 | `Close` waits this long for ACKs; `0` / `-1` skips the drain. |
 | `drain_orphans` | `off` | When `on`, scan `<sf_dir>/*` and adopt sibling slots that hold unacked data. |
 | `max_background_drainers` | 4 | Cap on concurrent orphan drainers. |
 
 The same options are available programmatically:
 `WithSfDir`, `WithSenderId`, `WithSfMaxBytes`, `WithSfMaxTotalBytes`,
-`WithReconnectPolicy`, `WithInitialConnectRetry`, `WithCloseFlushTimeout`.
+`WithReconnectPolicy`, `WithInitialConnectRetry`,
+`WithInitialConnectMode`, `WithCloseFlushTimeout`.
 
 ### Failure semantics
 

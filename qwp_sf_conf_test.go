@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,7 +65,7 @@ func TestSfConfParseAcceptsAllKnobs(t *testing.T) {
 	assert.Equal(t, 120000, conf.reconnectMaxDurationMillis)
 	assert.Equal(t, 200, conf.reconnectInitialBackoffMillis)
 	assert.Equal(t, 10000, conf.reconnectMaxBackoffMillis)
-	assert.True(t, conf.initialConnectRetry)
+	assert.Equal(t, InitialConnectSync, conf.initialConnectMode)
 	assert.Equal(t, 2500, conf.closeFlushTimeoutMillis)
 	assert.True(t, conf.closeFlushTimeoutSet)
 	assert.True(t, conf.drainOrphans)
@@ -115,6 +116,43 @@ func TestSfConfRejectsNegativeNumbers(t *testing.T) {
 			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;" + c + ";")
 			require.Error(t, err)
 		})
+	}
+}
+
+// TestSfConfInitialConnectRetryValues exercises every accepted spelling
+// of `initial_connect_retry` (Java spec §4.2 / §13.4) and the rejected
+// one. The legacy bool spellings (`on`/`true`/`off`/`false`) and the
+// Java-aligned tri-state words (`sync`/`async`) must all parse; bogus
+// values must be rejected with a message that names every accepted
+// value so users know what to type.
+func TestSfConfInitialConnectRetryValues(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want InitialConnectMode
+	}{
+		{"on", InitialConnectSync},
+		{"true", InitialConnectSync},
+		{"sync", InitialConnectSync},
+		{"off", InitialConnectOff},
+		{"false", InitialConnectOff},
+		{"async", InitialConnectAsync},
+	}
+	for _, c := range cases {
+		t.Run(c.raw, func(t *testing.T) {
+			conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;initial_connect_retry=" + c.raw + ";")
+			require.NoError(t, err)
+			assert.Equal(t, c.want, conf.initialConnectMode)
+		})
+	}
+}
+
+func TestSfConfInitialConnectRetryRejectsBogusValue(t *testing.T) {
+	_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;initial_connect_retry=maybe;")
+	require.Error(t, err)
+	// Error message must enumerate the accepted spellings so users
+	// porting from Java know `sync`/`async` are valid.
+	for _, want := range []string{"sync", "async", "on", "off", "true", "false"} {
+		assert.Contains(t, err.Error(), want)
 	}
 }
 
@@ -226,4 +264,109 @@ func TestSfConfWithSfDirOptionBuilder(t *testing.T) {
 	st, err := os.Stat(filepath.Join(tmp, "opt-builder"))
 	require.NoError(t, err)
 	assert.True(t, st.IsDir())
+}
+
+// reserveLocalPort grabs a free TCP port and immediately releases it.
+// The returned address is suitable for "no server is listening here"
+// scenarios — between the release and the test using the address,
+// another process *could* in principle grab the port, but for short-
+// lived test windows on localhost this is reliable enough in practice.
+func reserveLocalPort(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := l.Addr().String()
+	require.NoError(t, l.Close())
+	return addr
+}
+
+// TestSfConfInitialConnectAsyncReturnsImmediately is the headline
+// behavior of `initial_connect_retry=async`: LineSenderFromConf must
+// return immediately even when no server is reachable. The I/O
+// goroutine retries connect in the background; the producer is
+// unblocked. With `reconnect_max_duration_millis=60000`, anything
+// that waited on connect would hang the test for a minute — assert a
+// sub-second construction time instead.
+func TestSfConfInitialConnectAsyncReturnsImmediately(t *testing.T) {
+	tmp := t.TempDir()
+	addr := reserveLocalPort(t)
+	cfg := strings.Join([]string{
+		"ws::addr=" + addr,
+		"sf_dir=" + tmp,
+		"initial_connect_retry=async",
+		"reconnect_max_duration_millis=60000",
+		"reconnect_initial_backoff_millis=10",
+		"reconnect_max_backoff_millis=50",
+		// Fast close: don't block on a drain that can't complete
+		// without a server.
+		"close_flush_timeout_millis=0;",
+	}, ";")
+
+	t0 := time.Now()
+	ls, err := LineSenderFromConf(context.Background(), cfg)
+	require.NoError(t, err)
+	elapsed := time.Since(t0)
+	assert.Less(t, elapsed, 2*time.Second,
+		"LineSenderFromConf must return immediately in async mode (took %s)", elapsed)
+
+	// Producer-side calls work without a live wire — frames accumulate
+	// on the cursor SF engine while the I/O goroutine is still trying
+	// to connect.
+	require.NoError(t, ls.Table("foo").Int64Column("v", 1).AtNow(context.Background()))
+	require.NoError(t, ls.Close(context.Background()))
+}
+
+// TestSfConfInitialConnectAsyncDeliversWhenServerComesUp covers the
+// late-arrival flow: the sender opens before the server is listening,
+// the producer publishes a row to the cursor SF engine, then the
+// server starts. The buffered frame must be delivered and ACKed by
+// the I/O goroutine once the wire is up.
+func TestSfConfInitialConnectAsyncDeliversWhenServerComesUp(t *testing.T) {
+	// Reserve a port and bind a listener on it that we'll later wrap
+	// with httptest. By holding the port across the gap we avoid the
+	// race where another process could steal it between reserve and
+	// re-bind.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := listener.Addr().String()
+
+	tmp := t.TempDir()
+	cfg := strings.Join([]string{
+		"ws::addr=" + addr,
+		"sf_dir=" + tmp,
+		"initial_connect_retry=async",
+		"reconnect_max_duration_millis=10000",
+		"reconnect_initial_backoff_millis=20",
+		"reconnect_max_backoff_millis=200",
+		"close_flush_timeout_millis=5000;",
+	}, ";")
+
+	ls, err := LineSenderFromConf(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() { _ = ls.Close(context.Background()) }()
+
+	// Append a row before the server is up. The frame lands in the
+	// cursor SF engine; the I/O goroutine is still retrying connect.
+	require.NoError(t, ls.Table("foo").Int64Column("v", 42).AtNow(context.Background()))
+
+	// Spawn the explicit Flush in a goroutine — Flush waits for ACK,
+	// so it'll block until the server arrives.
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- ls.Flush(context.Background())
+	}()
+
+	// Bring the server up on the held port. Use the same handler as
+	// the standard test server (just enough to ACK frames).
+	srv := newQwpSfTestServerOnListener(t, listener)
+	defer srv.Close()
+
+	// Flush must complete and the server must have received our frame.
+	select {
+	case err := <-flushDone:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Flush never completed after server came up")
+	}
+	assert.GreaterOrEqual(t, srv.totalFramesReceived.Load(), int64(1))
 }

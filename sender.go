@@ -287,6 +287,33 @@ const (
 	ProtocolVersion3     protocolVersion = 3
 )
 
+// InitialConnectMode controls how the QWP sender treats failures of
+// its very first connect attempt. Mirrors the Java client's
+// `initial_connect_retry` enum.
+type InitialConnectMode byte
+
+const (
+	// InitialConnectOff (the default) makes any failure on the first
+	// connect terminal — typically a misconfig, retrying just hides
+	// it. The constructor surfaces the dial error directly.
+	InitialConnectOff InitialConnectMode = iota
+	// InitialConnectSync runs the same retry-with-backoff loop as
+	// reconnect on the calling goroutine, blocking the constructor
+	// until either the connection comes up or the reconnect budget
+	// (reconnect_max_duration_millis) is exhausted. Auth/upgrade
+	// failures stay terminal.
+	InitialConnectSync
+	// InitialConnectAsync defers the dial to the I/O goroutine and
+	// returns from the constructor immediately with an unconnected
+	// sender. The producer goroutine can call Table()/At()/Flush()
+	// right away; rows accumulate in the cursor SF engine until the
+	// connection comes up. Connect-budget exhaustion or terminal
+	// upgrade failure is delivered through the configured
+	// SenderErrorHandler (and surfaced from any subsequent producer
+	// API call as a typed error).
+	InitialConnectAsync
+)
+
 type lineSenderConfig struct {
 	senderType    senderType
 	address       string
@@ -336,7 +363,7 @@ type lineSenderConfig struct {
 	reconnectMaxDurationMillis    int           // 0 -> 300000 (5 min)
 	reconnectInitialBackoffMillis int           // 0 -> 100
 	reconnectMaxBackoffMillis     int           // 0 -> 5000
-	initialConnectRetry           bool          // default false
+	initialConnectMode            InitialConnectMode // default InitialConnectOff
 	closeFlushTimeoutMillis       int           // 0 -> 5000; -1 / negative -> fast close (skip drain)
 	closeFlushTimeoutSet          bool          // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
 	drainOrphans                  bool          // default false (Phase 6)
@@ -533,10 +560,31 @@ func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) 
 // applied on reconnect. By default an initial connect failure is
 // terminal — useful for catching misconfig early.
 //
+// Equivalent to WithInitialConnectMode(InitialConnectSync) when
+// retry is true, or WithInitialConnectMode(InitialConnectOff) when
+// retry is false. Use WithInitialConnectMode directly to select
+// InitialConnectAsync.
+//
 // Only available for the QWP sender.
 func WithInitialConnectRetry(retry bool) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.initialConnectRetry = retry
+		if retry {
+			s.initialConnectMode = InitialConnectSync
+		} else {
+			s.initialConnectMode = InitialConnectOff
+		}
+	}
+}
+
+// WithInitialConnectMode configures whether the QWP sender's first
+// connection attempt may retry on failure, and if so whether the
+// retry runs synchronously on the calling thread or asynchronously
+// on the I/O goroutine. See InitialConnectMode for value semantics.
+//
+// Only available for the QWP sender.
+func WithInitialConnectMode(mode InitialConnectMode) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.initialConnectMode = mode
 	}
 }
 

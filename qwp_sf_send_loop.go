@@ -180,9 +180,16 @@ type qwpSfSendLoop struct {
 }
 
 // qwpSfNewSendLoop constructs a send loop bound to the given engine
-// and (initial) transport. The transport must already be connected
-// and WebSocket-upgraded; the send loop takes ownership and will
-// close it on shutdown.
+// and (optional) initial transport.
+//
+//   - When transport is non-nil it must already be connected and
+//     WebSocket-upgraded; the send loop takes ownership and will
+//     close it on shutdown.
+//   - When transport is nil, the loop drives the initial dial on
+//     its I/O goroutine before serving frames — this is the
+//     `initial_connect_retry=async` path. A nil transport is only
+//     valid together with a non-nil factory (otherwise there's no
+//     way for the loop to obtain a connection).
 //
 // Reconnect is opt-in: a nil factory keeps the legacy "single
 // failure is terminal" behavior; a non-nil factory enables retry
@@ -193,8 +200,11 @@ func qwpSfNewSendLoop(
 	factory qwpSfReconnectFactory,
 	parkInterval, reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff time.Duration,
 ) *qwpSfSendLoop {
-	if engine == nil || transport == nil {
-		panic("qwp/sf: engine and transport must be non-nil")
+	if engine == nil {
+		panic("qwp/sf: engine must be non-nil")
+	}
+	if transport == nil && factory == nil {
+		panic("qwp/sf: nil transport requires a non-nil reconnect factory")
 	}
 	if parkInterval <= 0 {
 		parkInterval = qwpSfDefaultParkInterval
@@ -442,9 +452,24 @@ func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) error {
 // connection's worth of I/O via runOneConnection; on wire failure
 // it backs off and reconnects (if a factory is wired) or records
 // the failure as terminal and exits.
+//
+// When the loop is constructed with a nil transport (the
+// `initial_connect_retry=async` path) the very first iteration
+// performs the initial dial in-band on this goroutine using the
+// same backoff loop as reconnect. Producers that publish before
+// the wire is up experience backpressure via engineAppendBlocking;
+// terminal initial-connect failures are surfaced via the dispatcher
+// and latched as the loop's terminal error.
 func (l *qwpSfSendLoop) run() {
 	defer l.wg.Done()
 	defer close(l.done)
+
+	if l.transport.Load() == nil && l.running.Load() {
+		initial := errors.New("async initial connect deferred to I/O goroutine")
+		if !l.connectWithBackoff(initial, "initial connect") {
+			return
+		}
+	}
 
 	for l.running.Load() {
 		err := l.runOneConnection()
@@ -519,7 +544,7 @@ func (l *qwpSfSendLoop) run() {
 			return
 		}
 		// Reconnect with backoff.
-		ok := l.reconnectWithBackoff(err)
+		ok := l.connectWithBackoff(err, "reconnect")
 		if !ok {
 			return
 		}
@@ -795,11 +820,16 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 	}
 }
 
-// reconnectWithBackoff loops on factory.reconnect until success,
+// connectWithBackoff loops on factory.reconnect until success,
 // terminal error, budget exhaustion, or running=false. On success,
 // installs the new transport and resets wire state. Returns true
 // to continue the outer loop, false to exit.
-func (l *qwpSfSendLoop) reconnectWithBackoff(initial error) bool {
+//
+// Shared between the reconnect path (phase="reconnect") and the
+// async-initial-connect path (phase="initial connect"); the phase
+// string only flavors the log/error message — control flow is
+// identical.
+func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 	outageStart := time.Now()
 	deadline := outageStart.Add(l.reconnectMaxDuration)
 	backoff := l.reconnectInitialBackoff
@@ -855,8 +885,8 @@ func (l *qwpSfSendLoop) reconnectWithBackoff(initial error) bool {
 		return false
 	}
 	elapsed := time.Since(outageStart)
-	reason := fmt.Sprintf("reconnect failed after %s / %d attempts: %v",
-		elapsed, attempts, lastErr)
+	reason := fmt.Sprintf("%s failed after %s / %d attempts: %v",
+		phase, elapsed, attempts, lastErr)
 	se := l.qwpSfBuildBudgetExhaustedSE(reason)
 	l.totalServerErrors.Add(1)
 	l.dispatcher.Load().offer(se)
@@ -1016,9 +1046,11 @@ func (l *qwpSfSendLoop) qwpSfBuildBudgetExhaustedSE(reason string) *SenderError 
 
 // qwpSfConnectWithRetry runs the same exponential-backoff-with-jitter
 // loop as the reconnect path, but is reusable from the sender's
-// "ensureConnected" entry point to implement initialConnectRetry.
-// Returns the connected transport on success; an error on terminal
-// upgrade failure (won't retry) or budget exhaustion.
+// "ensureConnected" entry point to implement
+// initial_connect_retry=sync. Returns the connected transport on
+// success; an error on terminal upgrade failure (won't retry) or
+// budget exhaustion. The async variant runs the same loop on the
+// I/O goroutine inside qwpSfSendLoop.run().
 //
 // factory is invoked once per attempt and should produce a fresh,
 // connected, upgraded transport (or return an error). The lambda

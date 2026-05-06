@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -97,7 +98,35 @@ type qwpSfTestServer struct {
 func newQwpSfTestServer(t *testing.T, opts qwpSfTestServerOpts) *qwpSfTestServer {
 	t.Helper()
 	s := &qwpSfTestServer{kill: make(chan struct{})}
-	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.Server = httptest.NewServer(qwpSfTestServerHandler(t, s, opts))
+	return s
+}
+
+// newQwpSfTestServerOnListener builds a test server bound to the
+// given pre-existing listener (rather than letting httptest pick a
+// free port). Used by tests that need to reserve the port BEFORE
+// creating the server — e.g. the async-initial-connect path where
+// the producer must dial first and wait for the server to arrive on
+// a known address.
+//
+// Takes ownership of the listener; the server's Close also closes
+// the underlying listener.
+func newQwpSfTestServerOnListener(t *testing.T, listener net.Listener) *qwpSfTestServer {
+	t.Helper()
+	s := &qwpSfTestServer{kill: make(chan struct{})}
+	s.Server = httptest.NewUnstartedServer(qwpSfTestServerHandler(t, s, qwpSfTestServerOpts{}))
+	_ = s.Server.Listener.Close()
+	s.Server.Listener = listener
+	s.Server.Start()
+	return s
+}
+
+// qwpSfTestServerHandler returns the WebSocket handler used by the
+// fake QWP test server, configured by `opts` and reporting stats on
+// `s`. Extracted from newQwpSfTestServer so the same handler can be
+// wired onto a pre-existing listener via newQwpSfTestServerOnListener.
+func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServerOpts) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if opts.upgradeStatus != 0 {
 			w.WriteHeader(opts.upgradeStatus)
 			return
@@ -183,8 +212,7 @@ func newQwpSfTestServer(t *testing.T, opts qwpSfTestServerOpts) *qwpSfTestServer
 				buildAckOK(localSeq))
 			localSeq++
 		}
-	}))
-	return s
+	})
 }
 
 // qwpSfDialFor builds a transport connected to the given
