@@ -115,6 +115,10 @@ func qwpSfMsync(buf []byte, length int64) error {
 // Returns qwpSfErrLockBusy on contention.
 func qwpSfFlockExclusive(f *os.File) error {
 	const lockBytes uint32 = 1
+	// Stack-allocated OVERLAPPED is safe here because LOCKFILE_FAIL_IMMEDIATELY
+	// forces a synchronous return — the kernel never dereferences &ol after
+	// LockFileEx returns. Do not remove that flag without switching to a
+	// heap-allocated OVERLAPPED with an event handle.
 	var ol windows.Overlapped
 	err := windows.LockFileEx(
 		windows.Handle(f.Fd()),
