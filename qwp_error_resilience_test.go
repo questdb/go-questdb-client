@@ -966,7 +966,7 @@ func TestErrorApiResilience_ServerRestartReplaysCorrectly(t *testing.T) {
 			url = srv2.URL
 		}
 		wsURL := "ws" + strings.TrimPrefix(url, "http")
-		if err := t.connect(ctx, wsURL, qwpTransportOpts{}); err != nil {
+		if err := t.connect(ctx, wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 			return nil, err
 		}
 		return &t, nil

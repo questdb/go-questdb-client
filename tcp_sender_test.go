@@ -27,12 +27,14 @@ package questdb_test
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"testing"
 	"time"
 
 	qdb "github.com/questdb/go-questdb-client/v4"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -263,7 +265,16 @@ func TestErrorOnFlushWhenMessageIsPending(t *testing.T) {
 func TestErrorOnUnavailableServer(t *testing.T) {
 	ctx := context.Background()
 
-	_, err := qdb.NewLineSender(ctx, qdb.WithTcp())
+	// Reserve a free port and immediately release it. The default TCP
+	// address (127.0.0.1:9009) is QuestDB's standard ILP port, so on
+	// any developer machine running QuestDB locally the dial would
+	// succeed and this test would falsely fail.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := l.Addr().String()
+	require.NoError(t, l.Close())
+
+	_, err = qdb.NewLineSender(ctx, qdb.WithTcp(), qdb.WithAddress(addr))
 	assert.ErrorContains(t, err, "failed to connect to server")
 }
 
