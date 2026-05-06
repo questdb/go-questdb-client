@@ -308,6 +308,16 @@ func TestParserPathologicalCases(t *testing.T) {
 			config:                 "http::addr=localhost:9000;username=test;password=pass;word",
 			expectedErrMsgContains: "unexpected end of",
 		},
+		{
+			name:                   "duplicate addr",
+			config:                 "http::addr=localhost:9000;addr=localhost:9001;",
+			expectedErrMsgContains: `duplicate key \"addr\"`,
+		},
+		{
+			name:                   "duplicate on_server_error",
+			config:                 "ws::addr=localhost:9000;on_server_error=auto;on_server_error=halt;",
+			expectedErrMsgContains: `duplicate key \"on_server_error\"`,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -319,6 +329,19 @@ func TestParserPathologicalCases(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.expectedErrMsgContains)
 		})
 	}
+}
+
+func TestParserKeysAreCaseSensitive(t *testing.T) {
+	// Same key bytes in different case are distinct, matching the Rust
+	// client. The lowercase `addr` is recognized; the uppercase `ADDR`
+	// is parsed but later rejected as an unsupported option.
+	parsed, err := qdb.ParseConfigStr("http::addr=localhost:9000;ADDR=localhost:9001;")
+	assert.NoError(t, err)
+	assert.Equal(t, "localhost:9000", parsed.KeyValuePairs["addr"])
+	assert.Equal(t, "localhost:9001", parsed.KeyValuePairs["ADDR"])
+
+	_, err = qdb.ConfFromStr("http::addr=localhost:9000;ADDR=localhost:9001;")
+	assert.ErrorContains(t, err, "unsupported option")
 }
 
 type configTestCase struct {

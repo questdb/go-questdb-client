@@ -526,7 +526,13 @@ func parseConfigStr(conf string) (configData, error) {
 				return result, NewInvalidConfigStrError("empty value for key %q", key)
 			}
 
-			result.KeyValuePairs[key.String()] = value.String()
+			// Reject duplicate keys (case-sensitive) for parity with Rust and
+			// the per-field checks in Java; otherwise dups would silently LWW.
+			keyStr := key.String()
+			if _, exists := result.KeyValuePairs[keyStr]; exists {
+				return result, NewInvalidConfigStrError("duplicate key %q", keyStr)
+			}
+			result.KeyValuePairs[keyStr] = value.String()
 
 			key.Reset()
 			value.Reset()
