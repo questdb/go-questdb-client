@@ -47,11 +47,16 @@ func TestQwpSfSlotLockAcquireCreatesDirAndLockFile(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, st.IsDir())
 
-	// Lock file holds our PID.
-	lockPath := filepath.Join(dir, qwpSfLockFileName)
-	body, err := os.ReadFile(lockPath)
+	// .lock file exists and is empty — the locked range on Windows
+	// would otherwise prevent a contender from reading the PID.
+	lockBody, err := os.ReadFile(filepath.Join(dir, qwpSfLockFileName))
 	require.NoError(t, err)
-	pid, err := strconv.Atoi(strings.TrimSpace(string(body)))
+	assert.Empty(t, lockBody)
+
+	// .lock.pid sidecar holds our PID.
+	pidBody, err := os.ReadFile(filepath.Join(dir, qwpSfLockPidFileName))
+	require.NoError(t, err)
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBody)))
 	require.NoError(t, err)
 	assert.Equal(t, os.Getpid(), pid)
 }

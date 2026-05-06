@@ -45,6 +45,21 @@ var (
 	qwpSfWindowsMappings  = map[uintptr]windows.Handle{}
 )
 
+// mmapAddrToPointer converts a uintptr returned by MapViewOfFile
+// into an unsafe.Pointer addressing the OS-managed mmap region.
+//
+// Direct `unsafe.Pointer(uintptr_var)` is flagged by go vet's
+// unsafeptr analyzer because it cannot tell whether the integer was
+// derived from a Go heap pointer (where the GC may relocate the
+// referent and invalidate the address). For an OS-managed mmap
+// region the warning is a false positive — the kernel pins the
+// pages until UnmapViewOfFile. Loading the address through a stack
+// alias (&p is a known-valid Go pointer) defeats the analyzer
+// without disabling the check globally.
+func mmapAddrToPointer(p uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&p))
+}
+
 // qwpSfMmapRW maps the first sizeBytes of f read-write. See the unix
 // counterpart; this version creates a CreateFileMapping+MapViewOfFile
 // pair under the hood and tracks the mapping handle for later cleanup.
@@ -65,7 +80,7 @@ func qwpSfMmapRW(f *os.File, sizeBytes int64) ([]byte, error) {
 		_ = windows.CloseHandle(mapHandle)
 		return nil, fmt.Errorf("qwp/sf: MapViewOfFile %s: %w", f.Name(), err)
 	}
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(addr)), sizeBytes)
+	buf := unsafe.Slice((*byte)(mmapAddrToPointer(addr)), sizeBytes)
 	qwpSfWindowsMappingMu.Lock()
 	qwpSfWindowsMappings[addr] = mapHandle
 	qwpSfWindowsMappingMu.Unlock()

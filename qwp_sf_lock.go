@@ -37,11 +37,21 @@ import (
 // slot directory; held for the engine's lifetime via flock/LockFileEx.
 const qwpSfLockFileName = ".lock"
 
+// qwpSfLockPidFileName is the sibling sidecar that carries the
+// holder's PID. The PID lives in a separate file because Windows'
+// LockFileEx is a mandatory range lock — while .lock is held, a
+// second handle cannot read its bytes, so the holder's PID can't be
+// recovered from the lock file itself. POSIX flock is advisory and
+// would tolerate co-locating the two, but keeping the layout
+// identical across platforms (and matching the Java client) avoids
+// platform-specific divergence in tests and tooling.
+const qwpSfLockPidFileName = ".lock.pid"
+
 // qwpSfSlotLock is an advisory exclusive lock on a single SF slot
-// directory. The lock file's payload is the holder's PID, written at
-// acquisition time. A failed acquisition reads it back so the error
-// message can name the offending process — turning a vague "slot in
-// use" into actionable diagnostics.
+// directory. The holder's PID is written to a sibling .lock.pid
+// sidecar at acquisition time. A failed acquisition reads it back so
+// the error message can name the offending process — turning a vague
+// "slot in use" into actionable diagnostics.
 //
 // Two senders pointing at the same slot dir is the multi-writer
 // footgun the slot model exists to prevent: their FSN sequences would
@@ -60,8 +70,8 @@ type qwpSfSlotLock struct {
 
 // qwpSfAcquireSlotLock creates slotDir if needed, opens
 // `<slotDir>/.lock`, and acquires an exclusive flock on it. On
-// contention, reads the existing PID payload and returns an error
-// naming the offending process.
+// contention, reads the existing PID payload from the .lock.pid
+// sidecar and returns an error naming the offending process.
 func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 	if slotDir == "" {
 		return nil, errors.New("qwp/sf: slotDir must not be empty")
@@ -70,14 +80,13 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 		return nil, fmt.Errorf("qwp/sf: could not create slot dir %s: %w", slotDir, err)
 	}
 	lockPath := filepath.Join(slotDir, qwpSfLockFileName)
-	// O_RDWR | O_CREATE — never O_TRUNC; another process's PID
-	// payload is read on contention to surface a useful error.
+	pidPath := filepath.Join(slotDir, qwpSfLockPidFileName)
 	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("qwp/sf: could not open slot lock file %s: %w", lockPath, err)
 	}
 	if err := qwpSfFlockExclusive(f); err != nil {
-		holder := qwpSfReadHolder(lockPath)
+		holder := qwpSfReadHolder(pidPath)
 		_ = f.Close()
 		if errors.Is(err, qwpSfErrLockBusy) {
 			return nil, fmt.Errorf(
@@ -86,12 +95,7 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 		}
 		return nil, err
 	}
-	if err := qwpSfWritePid(f); err != nil {
-		// We hold the lock; releasing on the way out is safe — closing
-		// the fd drops the flock per kernel semantics.
-		_ = f.Close()
-		return nil, err
-	}
+	qwpSfWritePid(pidPath)
 	return &qwpSfSlotLock{
 		slotDir:  slotDir,
 		lockPath: lockPath,
@@ -99,12 +103,12 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 	}, nil
 }
 
-// qwpSfReadHolder reads the PID payload of an existing lock file.
-// Best-effort — returns "unknown" if the file can't be read or the
-// payload is empty. The caller is in the error path; we never want a
-// failed PID-read to mask the original lock-busy error.
-func qwpSfReadHolder(lockPath string) string {
-	f, err := os.Open(lockPath)
+// qwpSfReadHolder reads the PID payload of an existing .lock.pid
+// sidecar. Best-effort — returns "unknown" if the file can't be read
+// or the payload is empty. The caller is in the error path; we never
+// want a failed PID-read to mask the original lock-busy error.
+func qwpSfReadHolder(pidPath string) string {
+	f, err := os.Open(pidPath)
 	if err != nil {
 		return "unknown"
 	}
@@ -122,18 +126,18 @@ func qwpSfReadHolder(lockPath string) string {
 	return "pid=" + strings.TrimSpace(string(buf[:n]))
 }
 
-// qwpSfWritePid truncates the lock file and writes the current
-// process's PID followed by a newline.
-func qwpSfWritePid(f *os.File) error {
-	if err := f.Truncate(0); err != nil {
-		return fmt.Errorf("qwp/sf: truncate lock file: %w", err)
+// qwpSfWritePid writes the current process's PID to the .lock.pid
+// sidecar. Diagnostic-only — never block lock acquisition on it; a
+// failed write only degrades the contention error message, it does
+// not affect correctness of the lock itself.
+func qwpSfWritePid(pidPath string) {
+	f, err := os.OpenFile(pidPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return
 	}
-	pid := os.Getpid()
-	payload := fmt.Sprintf("%d\n", pid)
-	if _, err := f.WriteAt([]byte(payload), 0); err != nil {
-		return fmt.Errorf("qwp/sf: write pid: %w", err)
-	}
-	return nil
+	defer f.Close()
+	payload := fmt.Sprintf("%d\n", os.Getpid())
+	_, _ = f.WriteAt([]byte(payload), 0)
 }
 
 // slotPath returns the slot directory this lock guards.
