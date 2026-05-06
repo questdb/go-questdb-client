@@ -510,7 +510,7 @@ func WithMaxBufferSize(sizeInBytes int) LineSenderOption {
 // WithFileNameLimit sets maximum file name length in chars
 // allowed by the server. Affects maximum table and column name
 // lengths accepted by the sender. Should be set to the same value
-// as on the server. Defaults to 127.
+// as on the server. Must be at least 16. Defaults to 127.
 func WithFileNameLimit(limit int) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.fileNameLimit = limit
@@ -937,8 +937,8 @@ func validateConf(conf *lineSenderConfig) error {
 		return fmt.Errorf("max buffer size is negative: %d", conf.maxBufSize)
 	}
 
-	if conf.fileNameLimit < 0 {
-		return fmt.Errorf("file name limit is negative: %d", conf.fileNameLimit)
+	if conf.fileNameLimit < 16 {
+		return fmt.Errorf("max_name_len must be at least 16 bytes: %d", conf.fileNameLimit)
 	}
 
 	if conf.retryTimeout < 0 {

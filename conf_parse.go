@@ -134,7 +134,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.autoFlushBytes = parsedVal
-		case "request_min_throughput", "init_buf_size", "max_buf_size":
+		case "request_min_throughput", "init_buf_size", "max_buf_size", "max_name_len":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
@@ -147,6 +147,8 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				senderConf.initBufSize = parsedVal
 			case "max_buf_size":
 				senderConf.maxBufSize = parsedVal
+			case "max_name_len":
+				senderConf.fileNameLimit = parsedVal
 			default:
 				panic("add a case for " + k)
 			}

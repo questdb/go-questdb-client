@@ -375,6 +375,15 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
+			name:   "max_name_len",
+			config: fmt.Sprintf("http::addr=%s;max_name_len=64;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithHttp(),
+				qdb.WithAddress(addr),
+				qdb.WithFileNameLimit(64),
+			},
+		},
+		{
 			name: "with tls",
 			config: fmt.Sprintf("tcp::addr=%s;tls_verify=on;",
 				addr),

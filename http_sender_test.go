@@ -165,6 +165,11 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			expectedErr: "auto flush interval is negative",
 		},
 		{
+			name:        "max_name_len below minimum",
+			config:      "http::max_name_len=15;",
+			expectedErr: "max_name_len must be at least 16 bytes",
+		},
+		{
 			name:        "schema is case-sensitive",
 			config:      "hTtp::addr=localhost:1234;",
 			expectedErr: "invalid schema",
