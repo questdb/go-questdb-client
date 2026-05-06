@@ -193,7 +193,7 @@ func qwpSfDialFor(server *qwpSfTestServer) qwpSfReconnectFactory {
 	return func(ctx context.Context) (*qwpTransport, error) {
 		var t qwpTransport
 		wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-		if err := t.connect(ctx, wsURL, qwpTransportOpts{}); err != nil {
+		if err := t.connect(ctx, wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 			return nil, err
 		}
 		return &t, nil
@@ -205,7 +205,7 @@ func qwpSfDialAt(url string) qwpSfReconnectFactory {
 	return func(ctx context.Context) (*qwpTransport, error) {
 		var t qwpTransport
 		wsURL := "ws" + strings.TrimPrefix(url, "http")
-		if err := t.connect(ctx, wsURL, qwpTransportOpts{}); err != nil {
+		if err := t.connect(ctx, wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
 			return nil, err
 		}
 		return &t, nil
