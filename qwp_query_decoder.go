@@ -1076,7 +1076,7 @@ func (d *qwpQueryDecoder) decodeQueryError(payload []byte) (*QwpQueryError, erro
 	}
 	return &QwpQueryError{
 		RequestId: requestId,
-		Status:    qwpStatusCode(status),
+		Status:    QwpStatusCode(status),
 		// Copy: msgBytes aliases the payload, which is reclaimed once
 		// the I/O goroutine advances past the frame. QwpQueryError is
 		// surfaced to the user and outlives the frame.

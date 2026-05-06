@@ -289,7 +289,7 @@ func TestQwpEgressIOQueryError(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		m.readBinary(ctx)
-		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusParseError), "bad sql", -1)))
+		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(1, byte(QwpStatusParseError), "bad sql", -1)))
 	})
 	defer srv.Close()
 
@@ -310,8 +310,8 @@ func TestQwpEgressIOQueryError(t *testing.T) {
 	if ev.kind != qwpEventKindError {
 		t.Fatalf("event kind = %v, want Error", ev.kind)
 	}
-	if ev.errStatus != qwpStatusParseError {
-		t.Errorf("errStatus = 0x%02X, want 0x%02X", byte(ev.errStatus), byte(qwpStatusParseError))
+	if ev.errStatus != QwpStatusParseError {
+		t.Errorf("errStatus = 0x%02X, want 0x%02X", byte(ev.errStatus), byte(QwpStatusParseError))
 	}
 	if ev.errMessage != "bad sql" {
 		t.Errorf("errMessage = %q, want %q", ev.errMessage, "bad sql")

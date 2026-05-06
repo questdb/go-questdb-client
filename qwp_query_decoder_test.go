@@ -1116,7 +1116,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 
 	t.Run("H4c_TableCountNonZeroOnQueryError", func(t *testing.T) {
 		// Spec §4 / §9: QUERY_ERROR must carry table_count = 0.
-		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(qwpStatusParseError), "bad", -1))
+		frame := writeQwpFrame(0, buildQueryErrorBody(1, byte(QwpStatusParseError), "bad", -1))
 		binary.LittleEndian.PutUint16(
 			frame[qwpHeaderOffsetTableCount:qwpHeaderOffsetTableCount+2], 1)
 		dec := newTestQueryDecoder()
@@ -1770,7 +1770,7 @@ func TestQwpDecoderQueryError(t *testing.T) {
 		if qe.RequestId != 99 {
 			t.Fatalf("RequestId = %d, want 99", qe.RequestId)
 		}
-		if qe.Status != qwpStatusCode(0x05) {
+		if qe.Status != QwpStatusCode(0x05) {
 			t.Fatalf("Status = 0x%02X, want 0x05", byte(qe.Status))
 		}
 		if qe.Message != "boom" {

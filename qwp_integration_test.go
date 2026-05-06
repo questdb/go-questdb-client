@@ -2408,7 +2408,7 @@ func TestQwpIntegrationConnect(t *testing.T) {
 		t.Fatalf("readAck: %v", err)
 	}
 
-	if status != qwpStatusOK {
+	if status != QwpStatusOK {
 		errStr := parseAckError(data)
 		t.Logf("raw ACK response (%d bytes): %x", len(data), data)
 		t.Fatalf("expected OK, got status 0x%02X: %s", status, errStr)

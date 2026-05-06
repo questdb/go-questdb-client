@@ -293,7 +293,7 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 	l.cancel()
 	l.wg.Wait()
 	if t := l.transport.Swap(nil); t != nil {
-		_ = t.close(context.Background())
+		_ = t.close()
 	}
 	if d := l.dispatcher.Load(); d != nil {
 		d.close()
@@ -872,7 +872,7 @@ func (l *qwpSfSendLoop) reconnectWithBackoff(initial error) bool {
 func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	old := l.transport.Swap(newTransport)
 	if old != nil {
-		_ = old.close(context.Background())
+		_ = old.close()
 	}
 	replayStart := l.engine.engineAckedFsn() + 1
 	l.fsnAtZero.Store(replayStart)

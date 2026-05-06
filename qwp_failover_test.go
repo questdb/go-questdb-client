@@ -801,7 +801,7 @@ func TestQwpQueryErrorIsNotRetried(t *testing.T) {
 			// loop.
 			body := []byte{byte(qwpMsgKindQueryError)}
 			body = appendInt64LE(body, 1) // requestId
-			body = append(body, byte(qwpStatusParseError))
+			body = append(body, byte(QwpStatusParseError))
 			msg := "syntax error"
 			body = appendUint16LE(body, uint16(len(msg)))
 			body = append(body, msg...)
@@ -856,7 +856,7 @@ func TestQwpQueryErrorIsNotRetried(t *testing.T) {
 	if qe == nil {
 		t.Fatal("expected *QwpQueryError, got none")
 	}
-	if qe.Status != qwpStatusParseError {
+	if qe.Status != QwpStatusParseError {
 		t.Errorf("status = 0x%02X, want PARSE_ERROR", byte(qe.Status))
 	}
 }

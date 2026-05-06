@@ -38,8 +38,8 @@ type QwpQueryError struct {
 	RequestId int64
 
 	// Status is the server-reported egress status byte (e.g.
-	// qwpStatusCancelled, qwpStatusLimitExceeded, qwpStatusParseError).
-	Status qwpStatusCode
+	// qwpStatusCancelled, qwpStatusLimitExceeded, QwpStatusParseError).
+	Status QwpStatusCode
 
 	// Message is the server-supplied UTF-8 description, or empty if the
 	// server sent a zero-length message.

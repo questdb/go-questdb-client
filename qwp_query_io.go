@@ -85,7 +85,7 @@ type qwpEvent struct {
 	// always 0 on the synthesized variant since it does not
 	// correspond to a server status byte. FailoverReset kind reuses
 	// failoverReset.
-	errStatus  qwpStatusCode
+	errStatus  QwpStatusCode
 	errMessage string
 
 	// TransportError kind — optional typed cause. When set, consumers

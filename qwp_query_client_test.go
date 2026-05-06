@@ -816,7 +816,7 @@ func TestQwpQueryServerErrorSurfacesAsQwpQueryError(t *testing.T) {
 		req := m.readBinary(ctx)
 		reqID, _, _ := parseQueryRequest(t, req)
 		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(
-			reqID, byte(qwpStatusParseError), "bad sql", -1)))
+			reqID, byte(QwpStatusParseError), "bad sql", -1)))
 	})
 	defer cleanup()
 
@@ -844,8 +844,8 @@ func TestQwpQueryServerErrorSurfacesAsQwpQueryError(t *testing.T) {
 	if !errors.As(lastErr, &qe) {
 		t.Fatalf("err type=%T, want *QwpQueryError: %v", lastErr, lastErr)
 	}
-	if qe.Status != qwpStatusParseError {
-		t.Errorf("Status=0x%02X, want 0x%02X", byte(qe.Status), byte(qwpStatusParseError))
+	if qe.Status != QwpStatusParseError {
+		t.Errorf("Status=0x%02X, want 0x%02X", byte(qe.Status), byte(QwpStatusParseError))
 	}
 	if qe.Message != "bad sql" {
 		t.Errorf("Message=%q", qe.Message)
@@ -1013,7 +1013,7 @@ func TestQwpExecServerErrorReturnsQwpQueryError(t *testing.T) {
 		req := m.readBinary(ctx)
 		reqID, _, _ := parseQueryRequest(t, req)
 		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(
-			reqID, byte(qwpStatusInternalError), "boom", -1)))
+			reqID, byte(QwpStatusInternalError), "boom", -1)))
 	})
 	defer cleanup()
 
@@ -1027,7 +1027,7 @@ func TestQwpExecServerErrorReturnsQwpQueryError(t *testing.T) {
 	if !errors.As(err, &qe) {
 		t.Fatalf("err type=%T, want *QwpQueryError", err)
 	}
-	if qe.Status != qwpStatusInternalError || qe.Message != "boom" {
+	if qe.Status != QwpStatusInternalError || qe.Message != "boom" {
 		t.Errorf("err=%+v", qe)
 	}
 }

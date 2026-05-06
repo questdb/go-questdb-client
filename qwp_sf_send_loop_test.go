@@ -503,7 +503,7 @@ func TestQwpSfConnectWithRetrySucceedsEventually(t *testing.T) {
 		2*time.Second, 5*time.Millisecond, 50*time.Millisecond)
 	require.NoError(t, err)
 	require.NotNil(t, transport)
-	_ = transport.close(context.Background())
+	_ = transport.close()
 	mu.Lock()
 	defer mu.Unlock()
 	assert.GreaterOrEqual(t, factoryAttempts, 3)
