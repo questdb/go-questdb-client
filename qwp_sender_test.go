@@ -2408,3 +2408,62 @@ func TestQwpSenderAtAndAtNanoConflict(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// TestQwpSenderObservabilityCounters verifies the spec §20 counter
+// accessors are wired through the QwpSender interface to the
+// underlying send loop / engine / drainer pool. A fresh sender on a
+// happy-path test server should report zero on every counter both
+// before and after a successful flush, and BackgroundDrainers()
+// should be nil on a memory-backed sender (no SF, no orphan
+// adoption).
+func TestQwpSenderObservabilityCounters(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Reach the accessors through the interface to lock the public
+	// surface in place — a missing method would fail to compile.
+	var qs QwpSender = s
+
+	if got := qs.TotalReconnectAttempts(); got != 0 {
+		t.Fatalf("TotalReconnectAttempts on fresh sender = %d, want 0", got)
+	}
+	if got := qs.TotalReconnectsSucceeded(); got != 0 {
+		t.Fatalf("TotalReconnectsSucceeded on fresh sender = %d, want 0", got)
+	}
+	if got := qs.TotalFramesReplayed(); got != 0 {
+		t.Fatalf("TotalFramesReplayed on fresh sender = %d, want 0", got)
+	}
+	if got := qs.TotalBackpressureStalls(); got != 0 {
+		t.Fatalf("TotalBackpressureStalls on fresh sender = %d, want 0", got)
+	}
+	if got := qs.BackgroundDrainers(); got != nil {
+		t.Fatalf("BackgroundDrainers on memory-backed sender = %v, want nil", got)
+	}
+
+	if err := qs.Table("t").Int64Column("v", 1).AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow: %v", err)
+	}
+	if err := qs.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// A clean flush against the happy-path server must not have
+	// triggered any reconnects, replays, or backpressure stalls.
+	if got := qs.TotalReconnectAttempts(); got != 0 {
+		t.Fatalf("TotalReconnectAttempts after clean flush = %d, want 0", got)
+	}
+	if got := qs.TotalReconnectsSucceeded(); got != 0 {
+		t.Fatalf("TotalReconnectsSucceeded after clean flush = %d, want 0", got)
+	}
+	if got := qs.TotalFramesReplayed(); got != 0 {
+		t.Fatalf("TotalFramesReplayed after clean flush = %d, want 0", got)
+	}
+	if got := qs.TotalBackpressureStalls(); got != 0 {
+		t.Fatalf("TotalBackpressureStalls after clean flush = %d, want 0", got)
+	}
+	if got := qs.BackgroundDrainers(); got != nil {
+		t.Fatalf("BackgroundDrainers after clean flush = %v, want nil", got)
+	}
+}

@@ -393,6 +393,13 @@ func (l *qwpSfSendLoop) sendLoopTotalAcks() int64 {
 	return l.totalAcks.Load()
 }
 
+// sendLoopTotalFramesReplayed returns the cumulative count of
+// frames re-emitted on the post-reconnect catch-up window — i.e.
+// frames whose FSN was already on the wire before the drop.
+func (l *qwpSfSendLoop) sendLoopTotalFramesReplayed() int64 {
+	return l.totalFramesReplayed.Load()
+}
+
 // positionCursorForStart sets fsnAtZero, nextWireSeq, and the
 // cursor (sendingSegment + sendOffset) to the first unsent FSN.
 // Must be called by the I/O goroutine before it starts sending —

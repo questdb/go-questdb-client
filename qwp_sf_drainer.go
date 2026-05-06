@@ -119,6 +119,21 @@ func (d *qwpSfOrphanDrainer) drainerOutcome() qwpSfDrainOutcome {
 	return qwpSfDrainOutcome(d.outcome.Load())
 }
 
+// drainerSlotPath returns the absolute path of the orphan slot
+// the drainer adopted.
+func (d *qwpSfOrphanDrainer) drainerSlotPath() string {
+	return d.slotPath
+}
+
+// drainerLastError returns the latest error string the drainer
+// recorded, or "" if no error has been recorded.
+func (d *qwpSfOrphanDrainer) drainerLastError() string {
+	if p := d.lastErrorMessage.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 // drainerTargetFsn returns the publishedFsn snapshot taken at
 // startup, or -1 if the drainer hasn't started yet.
 func (d *qwpSfOrphanDrainer) drainerTargetFsn() int64 {

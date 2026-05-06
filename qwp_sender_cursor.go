@@ -664,3 +664,57 @@ func (s *qwpLineSender) TotalErrorNotificationsDelivered() int64 {
 	}
 	return s.cursorSendLoop.sendLoopDispatcher().totalDelivered()
 }
+
+// TotalReconnectAttempts implements QwpSender.TotalReconnectAttempts.
+func (s *qwpLineSender) TotalReconnectAttempts() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalReconnectAttempts()
+}
+
+// TotalReconnectsSucceeded implements QwpSender.TotalReconnectsSucceeded.
+func (s *qwpLineSender) TotalReconnectsSucceeded() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalReconnects()
+}
+
+// TotalFramesReplayed implements QwpSender.TotalFramesReplayed.
+func (s *qwpLineSender) TotalFramesReplayed() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalFramesReplayed()
+}
+
+// TotalBackpressureStalls implements QwpSender.TotalBackpressureStalls.
+func (s *qwpLineSender) TotalBackpressureStalls() int64 {
+	if s.cursorEngine == nil {
+		return 0
+	}
+	return s.cursorEngine.engineTotalBackpressureStalls()
+}
+
+// BackgroundDrainers implements QwpSender.BackgroundDrainers.
+func (s *qwpLineSender) BackgroundDrainers() []QwpBackgroundDrainer {
+	if s.drainerPool == nil {
+		return nil
+	}
+	active := s.drainerPool.drainerPoolSnapshot()
+	if len(active) == 0 {
+		return nil
+	}
+	out := make([]QwpBackgroundDrainer, len(active))
+	for i, d := range active {
+		out[i] = QwpBackgroundDrainer{
+			Dir:           d.drainerSlotPath(),
+			FramesPending: d.drainerTargetFsn(),
+			FramesAcked:   d.drainerAckedFsn(),
+			LastError:     d.drainerLastError(),
+			Failed:        d.drainerOutcome() == qwpSfDrainOutcomeFailed,
+		}
+	}
+	return out
+}

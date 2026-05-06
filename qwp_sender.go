@@ -150,6 +150,63 @@ type QwpSender interface {
 	// handler. Includes deliveries where the handler panicked
 	// (caught by the dispatcher).
 	TotalErrorNotificationsDelivered() int64
+
+	// TotalReconnectAttempts returns the cumulative count of
+	// reconnect attempts the I/O loop has issued — succeeded plus
+	// failed. Diverges from TotalReconnectsSucceeded when the server
+	// is flapping. Always 0 when the sender is configured without
+	// reconnect.
+	TotalReconnectAttempts() int64
+
+	// TotalReconnectsSucceeded returns the cumulative count of
+	// successful reconnects. Useful as a heartbeat for outage
+	// recovery.
+	TotalReconnectsSucceeded() int64
+
+	// TotalFramesReplayed returns the cumulative count of frames
+	// re-emitted on a post-reconnect catch-up — i.e. frames whose
+	// FSN was already on the wire before the drop. Useful for
+	// verifying replay actually re-issued the unacked tail.
+	TotalFramesReplayed() int64
+
+	// TotalBackpressureStalls returns the cumulative count of times
+	// engineAppendBlocking had to wait for the manager to free
+	// buffer space. One increment per blocking call, not per spin-
+	// park. Non-zero values mean the producer is outpacing the wire.
+	TotalBackpressureStalls() int64
+
+	// BackgroundDrainers returns a snapshot of the drainers the
+	// foreground sender has dispatched for orphan slot adoption.
+	// Returns nil when the sender was not configured with
+	// drain_orphans (or when no orphans were found at startup).
+	// Snapshots are point-in-time copies; the underlying drainer
+	// goroutines keep running.
+	BackgroundDrainers() []QwpBackgroundDrainer
+}
+
+// QwpBackgroundDrainer is a point-in-time snapshot of one
+// background-drainer goroutine, surfaced via
+// QwpSender.BackgroundDrainers for ops dashboards. The fields
+// mirror the Java client's BackgroundDrainer accessors.
+type QwpBackgroundDrainer struct {
+	// Dir is the absolute path of the orphan slot directory the
+	// drainer adopted.
+	Dir string
+	// FramesPending is the snapshot of the slot's published FSN
+	// the drainer captured at startup — the upper bound the drain
+	// must reach before the slot is fully empty. -1 before the
+	// drainer has opened its engine.
+	FramesPending int64
+	// FramesAcked is the latest server-acknowledged FSN the
+	// drainer has observed. -1 before the drainer's first poll.
+	FramesAcked int64
+	// LastError is the most recent error message the drainer
+	// recorded, or "" if no error has been recorded.
+	LastError string
+	// Failed is true if the drainer ended in the FAILED outcome
+	// (exhausted reconnect budget, auth failure, recovery error)
+	// and dropped a .failed sentinel in the slot.
+	Failed bool
 }
 
 // Compile-time check that qwpLineSender implements QwpSender.
