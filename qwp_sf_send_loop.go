@@ -1051,11 +1051,13 @@ func qwpSfIsAuthFailure(err error) bool {
 // — wrong protocol version). These map to
 // CategoryProtocolViolation on the SenderError surface.
 //
-// NOTE: failover.md (2026-05-08 reclassification) demotes 404/426 to
-// transient so the round-walk can continue to a healthy peer. Until
-// the multi-host loop lands (Phase 4), single-host SF treats them as
-// terminal here — preserving the pre-Phase-1 behaviour rather than
-// retrying for the full reconnect budget against a misconfigured peer.
+// The round-walk (failover.md §6) treats 404/426 as transient and
+// routes them through RecordTransportError so a misconfig on one
+// peer does not lock the client out of healthy siblings. This
+// helper remains as a defensive fallback for the run()-level outer
+// branch; typed `*QwpUpgradeRejectError`s originate from the factory
+// and are consumed by the round-walk, so they do not reach this
+// branch in normal operation.
 func qwpSfIsProtocolUpgradeFailure(err error) bool {
 	if err == nil {
 		return false

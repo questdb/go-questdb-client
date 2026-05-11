@@ -175,11 +175,12 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	}
 
 	// Failover plumbing (failover.md §2 / §13.6). The tracker is
-	// shared between the foreground I/O loop and the initial-
-	// connect-sync path; mid-stream demotions and round-walk
-	// classifications observed on either side inform PickNext on
-	// the next walk. Phase 5 will share the same tracker with
-	// orphan drainers.
+	// shared across every caller drawing from this addr= list: the
+	// foreground I/O loop, the initial-connect-sync path, and each
+	// orphan drainer spawned below. Per-caller `previousIdx` slots
+	// (§2.3) live on the qwpSfSendLoop instances, not on the tracker
+	// — mid-stream demotes stay scoped to their loop while PickNext
+	// classifications inform every caller on the next walk.
 	scheme := "ws"
 	if conf.tlsMode != tlsDisabled {
 		scheme = "wss"
