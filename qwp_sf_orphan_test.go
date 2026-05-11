@@ -118,6 +118,7 @@ func TestQwpSfDrainerDrainsRealOrphan(t *testing.T) {
 	drainer := qwpSfNewOrphanDrainer(
 		dir, segSize, qwpSfUnlimitedTotalBytes,
 		qwpSfDialFor(srv),
+		nil,
 		1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
 	)
 	drainer.drainerRun(context.Background())
@@ -140,6 +141,7 @@ func TestQwpSfDrainerSkipsLockedSlot(t *testing.T) {
 	drainer := qwpSfNewOrphanDrainer(
 		dir, 4096, qwpSfUnlimitedTotalBytes,
 		qwpSfDialFor(srv),
+		nil,
 		1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
 	)
 	drainer.drainerRun(context.Background())
@@ -168,6 +170,7 @@ func TestQwpSfDrainerMarksFailedOnAuthRejection(t *testing.T) {
 	drainer := qwpSfNewOrphanDrainer(
 		dir, segSize, qwpSfUnlimitedTotalBytes,
 		qwpSfDialFor(authSrv),
+		nil,
 		200*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond,
 	)
 	drainer.drainerRun(context.Background())
@@ -186,6 +189,7 @@ func TestQwpSfDrainerSucceedsOnAlreadyDrainedSlot(t *testing.T) {
 	drainer := qwpSfNewOrphanDrainer(
 		dir, 4096, qwpSfUnlimitedTotalBytes,
 		qwpSfDialFor(srv),
+		nil,
 		1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
 	)
 	drainer.drainerRun(context.Background())
@@ -216,6 +220,7 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 		drainer := qwpSfNewOrphanDrainer(
 			dir, segSize, qwpSfUnlimitedTotalBytes,
 			qwpSfDialFor(srv),
+		nil,
 			1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
 		)
 		drainers = append(drainers, drainer)
@@ -264,6 +269,7 @@ func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
 	drainer := qwpSfNewOrphanDrainer(
 		dir, 4096, qwpSfUnlimitedTotalBytes,
 		blockingFactory,
+		nil,
 		1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
 	)
 	require.NoError(t, pool.drainerPoolSubmit(context.Background(), drainer))
@@ -302,10 +308,46 @@ func TestQwpSfDrainerPoolRejectsAfterClose(t *testing.T) {
 	pool := qwpSfNewDrainerPool(1)
 	pool.drainerPoolClose()
 	d := qwpSfNewOrphanDrainer(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
-		nil, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		nil, nil, time.Second, 10*time.Millisecond, 100*time.Millisecond)
 	err := pool.drainerPoolSubmit(context.Background(), d)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "closed")
+}
+
+// TestQwpSfDrainerUsesSharedTracker verifies the Phase 5 wiring:
+// a drainer constructed with a shared tracker records its initial
+// dial outcome onto that tracker (idx=0 becomes Healthy), so
+// foreground PickNext observations are kept consistent across
+// every caller drawing from the same connect-string addr= list.
+func TestQwpSfDrainerUsesSharedTracker(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("drainme"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+
+	tracker := newQwpHostTracker(1, "", qwpTargetAny)
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		tracker,
+		1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	drainer.drainerRun(context.Background())
+	require.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome())
+
+	// The shared tracker must now show host 0 as Healthy — the
+	// drainer's bind landed there and reported success.
+	snap := tracker.snapshot()
+	assert.Equal(t, qwpHostHealthy, snap[0].state,
+		"shared tracker must reflect drainer's successful bind")
 }
 
 func TestSfConfDrainOrphansEndToEnd(t *testing.T) {

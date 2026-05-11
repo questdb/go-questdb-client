@@ -74,28 +74,42 @@ var qwpSfDrainerPoolCloseGrace = 3 * time.Second
 // clears the sentinel — bounded automatic retry, then human-in-
 // the-loop.
 type qwpSfOrphanDrainer struct {
-	slotPath                  string
-	segmentSize               int64
-	sfMaxTotalBytes           int64
-	clientFactory             qwpSfReconnectFactory
-	reconnectMaxDuration      time.Duration
-	reconnectInitialBackoff   time.Duration
-	reconnectMaxBackoff       time.Duration
-	stopRequested             atomic.Bool
-	targetFsn                 atomic.Int64 // -1 until startup observes publishedFsn
-	ackedFsn                  atomic.Int64 // mirrors engine.ackedFsn for visibility
-	outcome                   atomic.Int32
-	lastErrorMessage          atomic.Pointer[string]
+	slotPath                string
+	segmentSize             int64
+	sfMaxTotalBytes         int64
+	clientFactory           qwpSfReconnectFactory
+	// tracker is the shared host-health tracker. When non-nil, the
+	// drainer participates in the same failover.md §2 model the
+	// foreground SF loop uses: PickNext observations from one loop
+	// inform the next. Each drainer's send loop owns a private
+	// previousIdx slot on the shared tracker per §2.3, so mid-stream
+	// demotions don't corrupt foreground's bookkeeping (or each
+	// other's). nil = synthesized 1-host implicit tracker (legacy
+	// single-host tests).
+	tracker                 *qwpHostTracker
+	reconnectMaxDuration    time.Duration
+	reconnectInitialBackoff time.Duration
+	reconnectMaxBackoff     time.Duration
+	stopRequested           atomic.Bool
+	targetFsn               atomic.Int64 // -1 until startup observes publishedFsn
+	ackedFsn                atomic.Int64 // mirrors engine.ackedFsn for visibility
+	outcome                 atomic.Int32
+	lastErrorMessage        atomic.Pointer[string]
 }
 
 // qwpSfNewOrphanDrainer constructs a drainer for the given slot.
 // All knobs are required; pool defaults are not applied here so
 // the caller (the drainer pool) can pass through user-configured
 // values verbatim.
+//
+// tracker is the shared foreground host-health tracker (failover.md
+// §2). Pass nil for legacy single-host tests; the drainer
+// synthesizes a 1-host implicit tracker internally in that case.
 func qwpSfNewOrphanDrainer(
 	slotPath string,
 	segmentSize, sfMaxTotalBytes int64,
 	clientFactory qwpSfReconnectFactory,
+	tracker *qwpHostTracker,
 	reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff time.Duration,
 ) *qwpSfOrphanDrainer {
 	d := &qwpSfOrphanDrainer{
@@ -103,6 +117,7 @@ func qwpSfNewOrphanDrainer(
 		segmentSize:             segmentSize,
 		sfMaxTotalBytes:         sfMaxTotalBytes,
 		clientFactory:           clientFactory,
+		tracker:                 tracker,
 		reconnectMaxDuration:    reconnectMaxDuration,
 		reconnectInitialBackoff: reconnectInitialBackoff,
 		reconnectMaxBackoff:     reconnectMaxBackoff,
@@ -186,7 +201,14 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		d.outcome.Store(int32(qwpSfDrainOutcomeSuccess))
 		return
 	}
-	transport, err := d.clientFactory(ctx, 0)
+	// Initial connect via the round-walk so the drainer immediately
+	// honours classifications the foreground tracker has already
+	// observed (e.g. host 0 is currently TopologyReject — start at
+	// host 1 instead). When d.tracker is nil, qwpSfConnectWithRetry
+	// synthesises a 1-host implicit tracker, matching the legacy
+	// behaviour single-host tests rely on.
+	transport, boundIdx, err := qwpSfConnectWithRetry(ctx, d.clientFactory, d.tracker,
+		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
 	if err != nil {
 		// Pool close (or caller cancellation) during the dial:
 		// don't drop a .failed sentinel — the slot is still
@@ -202,6 +224,11 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	loop := qwpSfNewSendLoop(engine, transport, d.clientFactory,
 		qwpSfDefaultParkInterval,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
+	// Share the foreground tracker; the loop carries its OWN
+	// previousIdx slot (failover.md §2.3 "per-caller previousIdx,
+	// not shared") so a mid-stream demote here doesn't corrupt
+	// foreground's bookkeeping.
+	loop.sendLoopSetHostTracker(d.tracker, boundIdx)
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()

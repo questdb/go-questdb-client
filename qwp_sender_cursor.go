@@ -285,6 +285,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 					orphan,
 					sfMaxBytes, sfMaxTotalBytes,
 					factory,
+					tracker,
 					reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff,
 				)
 				_ = pool.drainerPoolSubmit(ctx, drainer)
