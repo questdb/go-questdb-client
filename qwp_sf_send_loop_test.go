@@ -217,8 +217,10 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 
 // qwpSfDialFor builds a transport connected to the given
 // httptest server. Used as the qwpSfReconnectFactory for tests.
+// The idx parameter is accepted for signature symmetry with
+// multi-host factories and ignored — tests use a single host.
 func qwpSfDialFor(server *qwpSfTestServer) qwpSfReconnectFactory {
-	return func(ctx context.Context) (*qwpTransport, error) {
+	return func(ctx context.Context, _ int) (*qwpTransport, error) {
 		var t qwpTransport
 		wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 		if err := t.connect(ctx, wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
@@ -230,7 +232,7 @@ func qwpSfDialFor(server *qwpSfTestServer) qwpSfReconnectFactory {
 
 // qwpSfDialAt builds a transport connected to a fixed httptest URL.
 func qwpSfDialAt(url string) qwpSfReconnectFactory {
-	return func(ctx context.Context) (*qwpTransport, error) {
+	return func(ctx context.Context, _ int) (*qwpTransport, error) {
 		var t qwpTransport
 		wsURL := "ws" + strings.TrimPrefix(url, "http")
 		if err := t.connect(ctx, wsURL, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
@@ -248,7 +250,7 @@ func TestQwpSfSendLoopHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
@@ -281,7 +283,7 @@ func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
@@ -318,7 +320,7 @@ func TestQwpSfSendLoopServerErrorIsTerminal(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
@@ -358,7 +360,7 @@ func TestQwpSfSendLoopSilentDropAfterFrameIsTerminal(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
@@ -403,7 +405,7 @@ func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(dataSrv)(context.Background())
+	transport, err := qwpSfDialFor(dataSrv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	// Reconnect factory dials the auth-rejecting server.
@@ -448,7 +450,7 @@ func TestQwpSfSendLoopReconnectBudgetExhausted(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
@@ -487,7 +489,7 @@ func TestQwpSfSendLoopNilFactoryIsTerminalOnFailure(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	// Nil factory → wire failure is immediately terminal.
@@ -524,14 +526,14 @@ func TestQwpSfSendLoopReconnectStatusSnapshot(t *testing.T) {
 	// observes the close, and enters reconnect — which is the state
 	// we want to sample.
 	dialFails := atomic.Bool{}
-	factory := func(ctx context.Context) (*qwpTransport, error) {
+	factory := func(ctx context.Context, idx int) (*qwpTransport, error) {
 		if dialFails.Load() {
 			return nil, errors.New("dial: connection refused")
 		}
-		return qwpSfDialFor(srv)(ctx)
+		return qwpSfDialFor(srv)(ctx, idx)
 	}
 
-	transport, err := factory(context.Background())
+	transport, err := factory(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, factory,
@@ -575,7 +577,7 @@ func TestQwpSfConnectWithRetrySucceedsEventually(t *testing.T) {
 	var startedSrv atomic.Bool
 	var mu sync.Mutex
 	factoryAttempts := 0
-	factory := func(ctx context.Context) (*qwpTransport, error) {
+	factory := func(ctx context.Context, idx int) (*qwpTransport, error) {
 		mu.Lock()
 		factoryAttempts++
 		myAttempt := factoryAttempts
@@ -588,9 +590,9 @@ func TestQwpSfConnectWithRetrySucceedsEventually(t *testing.T) {
 			srv = newQwpSfTestServer(t, qwpSfTestServerOpts{})
 			t.Cleanup(srv.Close)
 		}
-		return qwpSfDialFor(srv)(ctx)
+		return qwpSfDialFor(srv)(ctx, idx)
 	}
-	transport, err := qwpSfConnectWithRetry(context.Background(), factory,
+	transport, _, err := qwpSfConnectWithRetry(context.Background(), factory, nil,
 		2*time.Second, 5*time.Millisecond, 50*time.Millisecond)
 	require.NoError(t, err)
 	require.NotNil(t, transport)
@@ -604,17 +606,17 @@ func TestQwpSfConnectWithRetryTerminalUpgrade(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{upgradeStatus: 401})
 	defer srv.Close()
 
-	_, err := qwpSfConnectWithRetry(context.Background(), qwpSfDialFor(srv),
+	_, _, err := qwpSfConnectWithRetry(context.Background(), qwpSfDialFor(srv), nil,
 		200*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "WebSocket upgrade failed")
 }
 
 func TestQwpSfConnectWithRetryBudgetExhausted(t *testing.T) {
-	factory := func(ctx context.Context) (*qwpTransport, error) {
+	factory := func(ctx context.Context, _ int) (*qwpTransport, error) {
 		return nil, errors.New("dial tcp: connection refused")
 	}
-	_, err := qwpSfConnectWithRetry(context.Background(), factory,
+	_, _, err := qwpSfConnectWithRetry(context.Background(), factory, nil,
 		100*time.Millisecond, 5*time.Millisecond, 30*time.Millisecond)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "connect failed")
@@ -707,7 +709,7 @@ func TestQwpSfSendLoopDropAndContinue(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),

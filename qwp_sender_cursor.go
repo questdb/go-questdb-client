@@ -174,10 +174,18 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		return nil, err
 	}
 
-	// Reconnect factory: rebuilds a fresh transport against the same
-	// address+opts on every call. Captures the dumpWriter so the
-	// post-reconnect transport also dumps if the user opted in.
-	factory := qwpSfBuildReconnectFactory(address, opts, conf.dumpWriter)
+	// Failover plumbing (failover.md §2 / §13.6). The tracker is
+	// shared between the foreground I/O loop and the initial-
+	// connect-sync path; mid-stream demotions and round-walk
+	// classifications observed on either side inform PickNext on
+	// the next walk. Phase 5 will share the same tracker with
+	// orphan drainers.
+	scheme := "ws"
+	if conf.tlsMode != tlsDisabled {
+		scheme = "wss"
+	}
+	tracker := newQwpHostTracker(len(conf.endpoints), conf.zone, conf.target)
+	factory := qwpSfBuildEndpointFactory(conf.endpoints, scheme, opts, conf.dumpWriter)
 
 	// Initial connect — three modes:
 	//   - InitialConnectOff:   one factory call, terminal on failure (default).
@@ -187,15 +195,24 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	//                          The producer experiences backpressure
 	//                          (engineAppendBlocking spins) until the
 	//                          wire comes up.
-	var transport *qwpTransport
+	var (
+		transport       *qwpTransport
+		initialBoundIdx = -1
+	)
 	switch conf.initialConnectMode {
 	case InitialConnectSync:
-		transport, err = qwpSfConnectWithRetry(ctx, factory,
+		transport, initialBoundIdx, err = qwpSfConnectWithRetry(ctx, factory, tracker,
 			reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
 	case InitialConnectAsync:
 		transport = nil
 	default: // InitialConnectOff
-		transport, err = factory(ctx)
+		// Single-shot dial of endpoints[0]. Multi-host failover at
+		// initial connect requires opt-in via initial_connect_retry.
+		transport, err = factory(ctx, 0)
+		if err == nil {
+			tracker.RecordSuccess(0)
+			initialBoundIdx = 0
+		}
 	}
 	if err != nil {
 		_ = engine.engineClose()
@@ -205,6 +222,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
 		reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+	loop.sendLoopSetHostTracker(tracker, initialBoundIdx)
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	// Wire the user-configured server-error API knobs (Phase 5)
 	// before sendLoopStart so they're visible from the receiver
@@ -280,14 +298,35 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 }
 
 // qwpSfBuildReconnectFactory returns a factory that dials the given
-// address with the given options on each call. Used for both the
-// initial connect (when initial_connect_retry is on) and subsequent
-// reconnects from the send loop.
+// address with the given options on each call. Used by drainers and
+// legacy single-host paths; the idx parameter is accepted for
+// signature symmetry with qwpSfBuildEndpointFactory and ignored.
 func qwpSfBuildReconnectFactory(address string, opts qwpTransportOpts, dumpWriter io.Writer) qwpSfReconnectFactory {
-	return func(ctx context.Context) (*qwpTransport, error) {
+	return func(ctx context.Context, _ int) (*qwpTransport, error) {
 		var t qwpTransport
 		t.dumpWriter = dumpWriter
 		if err := t.connect(ctx, address, opts); err != nil {
+			return nil, err
+		}
+		return &t, nil
+	}
+}
+
+// qwpSfBuildEndpointFactory returns a factory that dials the
+// endpoint at the supplied idx. Used by the foreground SF loop's
+// round-walk, where PickNext selects the host. Out-of-range idx
+// returns an explicit error so a tracker bug surfaces loudly rather
+// than dialing a random peer.
+func qwpSfBuildEndpointFactory(endpoints []qwpEndpoint, scheme string, opts qwpTransportOpts, dumpWriter io.Writer) qwpSfReconnectFactory {
+	return func(ctx context.Context, idx int) (*qwpTransport, error) {
+		if idx < 0 || idx >= len(endpoints) {
+			return nil, fmt.Errorf("qwp/sf: endpoint index %d out of range [0, %d)",
+				idx, len(endpoints))
+		}
+		var t qwpTransport
+		t.dumpWriter = dumpWriter
+		wsURL := scheme + "://" + endpoints[idx].String()
+		if err := t.connect(ctx, wsURL, opts); err != nil {
 			return nil, err
 		}
 		return &t, nil

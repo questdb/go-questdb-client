@@ -29,7 +29,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,9 +48,11 @@ const (
 )
 
 // qwpSfReconnectFactory is invoked by the send loop on a wire
-// failure to obtain a fresh connected+upgraded transport. The
-// factory encapsulates the dial URL, auth headers, and TLS config —
-// the send loop just receives a ready transport.
+// failure to obtain a fresh connected+upgraded transport. idx is
+// the host index PickNext returned (see failover.md §2); the
+// factory owns the mapping idx → URL, auth headers, and TLS config.
+// Single-host factories may ignore idx — they always dial the same
+// address.
 //
 // Implementations should return immediately on terminal errors
 // (auth rejection, version mismatch) and let transient errors
@@ -60,7 +61,7 @@ const (
 // qwpSfIsTerminalUpgradeError, which sniffs the error chain for
 // the "WebSocket upgrade failed:" sentinel coder/websocket
 // produces on non-101 responses.
-type qwpSfReconnectFactory func(ctx context.Context) (*qwpTransport, error)
+type qwpSfReconnectFactory func(ctx context.Context, idx int) (*qwpTransport, error)
 
 // qwpSfSendLoop owns one I/O goroutine that:
 //  1. Polls the engine's publishedFsn and walks newly-published
@@ -100,6 +101,24 @@ type qwpSfSendLoop struct {
 	reconnectMaxDuration    time.Duration
 	reconnectInitialBackoff time.Duration
 	reconnectMaxBackoff     time.Duration
+
+	// tracker drives the failover.md §13.6 round-walk. Constructed
+	// at sendLoopSetHostTracker time with the host count, client
+	// zone, and target filter. When tracker is nil (legacy single-
+	// host tests), connectWithBackoff falls back to a synthetic
+	// 1-host tracker on first need so the round-walk machinery is
+	// the only code path.
+	tracker *qwpHostTracker
+
+	// previousIdx is this loop's private slot for the §2.3
+	// per-caller mid-stream-demote pattern. After a successful
+	// connect it holds the bound endpoint index; on pump exit the
+	// outer run() loop leaves it as-is so the next connectWithBackoff
+	// can invoke RecordMidStreamFailure(previousIdx) before PickNext.
+	// connectWithBackoff resets it to the new bound idx on success
+	// and to -1 after consuming the mid-stream slot. Single-writer
+	// (the I/O goroutine).
+	previousIdx int
 
 	// policyResolver chooses Halt vs DropAndContinue per Category.
 	// Non-nil; defaults are baked in via qwpSfDefaultPolicyFor.
@@ -239,11 +258,26 @@ func qwpSfNewSendLoop(
 		cancel:                  cancel,
 		done:                    make(chan struct{}),
 		replayTargetFsn:         -1,
+		previousIdx:             -1,
 	}
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
 	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
 	l.transport.Store(transport)
 	return l
+}
+
+// sendLoopSetHostTracker installs the failover.md §2 host-health
+// tracker. Optional — when not called, the loop builds a 1-host
+// implicit tracker on first connectWithBackoff entry so all paths
+// converge on the round-walk machinery. initialBoundIdx is the
+// host index the caller already bound (e.g. from
+// qwpSfConnectWithRetry's initial-sync path); pass -1 when no host
+// has been bound yet (initial-async path) or for legacy single-host
+// tests. MUST be called before sendLoopStart; not safe to call
+// concurrently.
+func (l *qwpSfSendLoop) sendLoopSetHostTracker(tracker *qwpHostTracker, initialBoundIdx int) {
+	l.tracker = tracker
+	l.previousIdx = initialBoundIdx
 }
 
 // sendLoopSetPolicyResolver replaces the policy resolver used to map
@@ -853,80 +887,93 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 	}
 }
 
-// connectWithBackoff loops on factory.reconnect until success,
-// terminal error, budget exhaustion, or running=false. On success,
-// installs the new transport and resets wire state. Returns true
-// to continue the outer loop, false to exit.
+// connectWithBackoff runs the failover.md §13.6 round-walk through
+// qwpSfRunRoundWalk: each iteration demotes a just-failed host
+// (previousIdx), picks the highest-priority unattempted endpoint,
+// dials it, and classifies the outcome. Round-boundary sleep pays
+// equal-jitter exponential backoff for transport rounds and a
+// non-doubling InitialBackoff for role-reject rounds. Returns true
+// on a successful bind (caller resumes the pump loop), false on
+// terminal failure / budget exhaustion / shutdown.
 //
 // Shared between the reconnect path (phase="reconnect") and the
 // async-initial-connect path (phase="initial connect"); the phase
 // string only flavors the log/error message — control flow is
 // identical.
 func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
+	if l.tracker == nil {
+		// Legacy single-host path (tests that didn't call
+		// sendLoopSetHostTracker). Synthesize an implicit 1-host
+		// tracker so the round-walk machinery handles every code
+		// path uniformly.
+		l.tracker = newQwpHostTracker(1, "", qwpTargetAny)
+	}
 	outageStart := time.Now()
-	deadline := outageStart.Add(l.reconnectMaxDuration)
-	backoff := l.reconnectInitialBackoff
-	attempts := 0
-	lastErr := initial
 	l.outageStartUnixNano.Store(outageStart.UnixNano())
 	l.reconnectAttempts.Store(0)
 	defer func() {
 		l.outageStartUnixNano.Store(0)
 		l.reconnectAttempts.Store(0)
 	}()
-	for l.running.Load() && time.Now().Before(deadline) {
-		attempts++
-		l.reconnectAttempts.Store(int64(attempts))
-		l.totalReconnectAttempts.Add(1)
-		newTransport, err := l.reconnectFactory(l.ctx)
-		if err == nil && newTransport != nil {
-			if swapErr := l.swapClient(newTransport); swapErr != nil {
-				// Cursor positioning detected segment corruption —
-				// not retryable; reconnecting won't fix bad bytes
-				// in the on-disk segment.
-				l.recordFatal(swapErr)
-				return false
-			}
-			l.totalReconnects.Add(1)
-			return true
-		}
-		if err != nil {
-			if qwpSfIsTerminalUpgradeError(err) {
-				se := l.qwpSfBuildUpgradeFailureSE(err)
-				l.totalServerErrors.Add(1)
-				l.dispatcher.Load().offer(se)
-				l.recordFatalServerError(se)
-				return false
-			}
-			lastErr = err
-		}
-		// Backoff with jitter: sleep [backoff, 2*backoff). Cap at
-		// remaining budget so we don't oversleep past the deadline.
-		jitter := time.Duration(rand.Int63n(int64(backoff)))
-		sleep := backoff + jitter
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-		if sleep > remaining {
-			sleep = remaining
-		}
-		select {
-		case <-l.ctx.Done():
-			return false
-		case <-time.After(sleep):
-		}
-		backoff *= 2
-		if backoff > l.reconnectMaxBackoff {
-			backoff = l.reconnectMaxBackoff
-		}
+
+	// Snapshot the entering previousIdx and consume it for this
+	// connect cycle. The round-walk calls RecordMidStreamFailure
+	// internally; we reset our slot so a subsequent successful
+	// bind starts clean.
+	enteringPreviousIdx := l.previousIdx
+	l.previousIdx = -1
+
+	params := qwpSfRoundWalkParams{
+		Factory:        l.reconnectFactory,
+		Tracker:        l.tracker,
+		MaxDuration:    l.reconnectMaxDuration,
+		InitialBackoff: l.reconnectInitialBackoff,
+		MaxBackoff:     l.reconnectMaxBackoff,
+		OnAttempt: func() {
+			l.reconnectAttempts.Add(1)
+			l.totalReconnectAttempts.Add(1)
+		},
 	}
-	if !l.running.Load() {
+	result := qwpSfRunRoundWalk(l.ctx, nil, params, enteringPreviousIdx)
+
+	if result.Transport != nil {
+		// Successful bind. Remember the idx so a subsequent
+		// pump-exit can mid-stream-demote.
+		l.previousIdx = result.Idx
+		if swapErr := l.swapClient(result.Transport); swapErr != nil {
+			// Cursor positioning detected segment corruption —
+			// not retryable; reconnecting won't fix bad bytes
+			// in the on-disk segment.
+			l.recordFatal(swapErr)
+			return false
+		}
+		l.totalReconnects.Add(1)
+		return true
+	}
+	if result.Terminal != nil {
+		se := l.qwpSfBuildUpgradeFailureSE(result.Terminal)
+		l.totalServerErrors.Add(1)
+		l.dispatcher.Load().offer(se)
+		l.recordFatalServerError(se)
 		return false
 	}
-	elapsed := time.Since(outageStart)
-	reason := fmt.Sprintf("%s failed after %s / %d attempts: %v",
-		phase, elapsed, attempts, lastErr)
+	if result.Cancelled != nil {
+		// ctx cancelled (close), or the round-walk reported a
+		// configuration error. The latter is rare and benign at
+		// shutdown; sample running to distinguish.
+		if !l.running.Load() {
+			return false
+		}
+		l.recordFatal(fmt.Errorf("%s aborted: %w", phase, result.Cancelled))
+		return false
+	}
+	// Budget exhausted. Surface the underlying error chain to the
+	// dispatcher; reach into qwpSfBuildBudgetExhaustedSE so the
+	// SenderError carries the per-host snapshot. `initial` is the
+	// caller-supplied entry error (the mid-stream failure that
+	// triggered this connectWithBackoff); attach it as context.
+	reason := fmt.Sprintf("%s failed: %v (after entry error: %v)",
+		phase, result.Exhausted, initial)
 	se := l.qwpSfBuildBudgetExhaustedSE(reason)
 	l.totalServerErrors.Add(1)
 	l.dispatcher.Load().offer(se)
@@ -1098,24 +1145,25 @@ func (l *qwpSfSendLoop) qwpSfBuildBudgetExhaustedSE(reason string) *SenderError 
 	}
 }
 
-// qwpSfConnectWithRetry runs the same exponential-backoff-with-jitter
-// loop as the reconnect path, but is reusable from the sender's
-// "ensureConnected" entry point to implement
-// initial_connect_retry=sync. Returns the connected transport on
-// success; an error on terminal upgrade failure (won't retry) or
-// budget exhaustion. The async variant runs the same loop on the
-// I/O goroutine inside qwpSfSendLoop.run().
+// qwpSfConnectWithRetry runs the failover.md §13.6 round-walk on
+// the calling goroutine for the InitialConnectSync path. The walk
+// retries with backoff against every host in the tracker until
+// success, terminal AuthError (401/403), or budget exhaustion.
+// Returns the connected transport plus the bound endpoint index so
+// the caller can seed qwpSfSendLoop's previousIdx.
 //
-// factory is invoked once per attempt and should produce a fresh,
-// connected, upgraded transport (or return an error). The lambda
-// is intentionally shaped like qwpSfReconnectFactory so the same
-// implementation in the sender can serve both startup and reconnect
-// paths verbatim.
+// tracker may be nil — the function synthesizes a 1-host implicit
+// tracker so legacy single-host tests don't need to construct one.
+// In that mode the returned idx is always 0.
+//
+// factory is invoked once per dial attempt; idx is the host index
+// PickNext returned. Single-host callers may ignore idx.
 func qwpSfConnectWithRetry(
 	ctx context.Context,
 	factory qwpSfReconnectFactory,
+	tracker *qwpHostTracker,
 	maxDuration, initialBackoff, maxBackoff time.Duration,
-) (*qwpTransport, error) {
+) (*qwpTransport, int, error) {
 	if maxDuration <= 0 {
 		maxDuration = qwpSfDefaultReconnectMaxDuration
 	}
@@ -1125,49 +1173,29 @@ func qwpSfConnectWithRetry(
 	if maxBackoff <= 0 {
 		maxBackoff = qwpSfDefaultReconnectMaxBackoff
 	}
-	start := time.Now()
-	deadline := start.Add(maxDuration)
-	backoff := initialBackoff
-	attempts := 0
-	var lastErr error
-	for time.Now().Before(deadline) {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		attempts++
-		t, err := factory(ctx)
-		if err == nil && t != nil {
-			return t, nil
-		}
-		if err != nil {
-			if qwpSfIsTerminalUpgradeError(err) {
-				return nil, fmt.Errorf("qwp/sf: WebSocket upgrade failed (won't retry): %w", err)
-			}
-			lastErr = err
-		}
-		jitter := time.Duration(rand.Int63n(int64(backoff)))
-		sleep := backoff + jitter
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-		if sleep > remaining {
-			sleep = remaining
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(sleep):
-		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+	if tracker == nil {
+		tracker = newQwpHostTracker(1, "", qwpTargetAny)
 	}
-	elapsed := time.Since(start)
-	if lastErr == nil {
-		lastErr = errors.New("no attempts made")
+	params := qwpSfRoundWalkParams{
+		Factory:        factory,
+		Tracker:        tracker,
+		MaxDuration:    maxDuration,
+		InitialBackoff: initialBackoff,
+		MaxBackoff:     maxBackoff,
 	}
-	return nil, fmt.Errorf("qwp/sf: connect failed after %s / %d attempts: %w",
-		elapsed, attempts, lastErr)
+	result := qwpSfRunRoundWalk(ctx, nil, params, -1)
+	if result.Transport != nil {
+		return result.Transport, result.Idx, nil
+	}
+	if result.Terminal != nil {
+		return nil, -1, fmt.Errorf("qwp/sf: WebSocket upgrade failed (won't retry): %w", result.Terminal)
+	}
+	if result.Cancelled != nil {
+		return nil, -1, result.Cancelled
+	}
+	if result.Exhausted == nil {
+		return nil, -1, errors.New("qwp/sf: round-walk returned no result")
+	}
+	return nil, -1, fmt.Errorf("qwp/sf: connect failed after %s / %d attempts: %w",
+		result.Exhausted.Elapsed, result.Exhausted.Attempts, result.Exhausted.LastError)
 }

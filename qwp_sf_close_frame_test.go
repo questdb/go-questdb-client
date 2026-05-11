@@ -79,7 +79,7 @@ func TestQwpSfTerminalCloseCodeProducesProtocolViolation(t *testing.T) {
 			defer func() { _ = engine.engineClose() }()
 
 			factory := qwpSfDialAt(httpSrv.URL)
-			transport, err := factory(context.Background())
+			transport, err := factory(context.Background(), 0)
 			require.NoError(t, err)
 
 			loop := qwpSfNewSendLoop(engine, transport, factory,
@@ -135,7 +135,7 @@ func runUpgradeFailureScenario(t *testing.T, upgradeStatus int) *SenderError {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = engine.engineClose() })
 
-	transport, err := qwpSfDialFor(dataSrv)(context.Background())
+	transport, err := qwpSfDialFor(dataSrv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(failSrv),

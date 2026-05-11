@@ -186,7 +186,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		d.outcome.Store(int32(qwpSfDrainOutcomeSuccess))
 		return
 	}
-	transport, err := d.clientFactory(ctx)
+	transport, err := d.clientFactory(ctx, 0)
 	if err != nil {
 		// Pool close (or caller cancellation) during the dial:
 		// don't drop a .failed sentinel — the slot is still

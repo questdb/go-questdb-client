@@ -483,7 +483,7 @@ func TestErrorApiResilience_ReconnectThenAuthFailure(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := qwpSfDialFor(dataSrv)(context.Background())
+	transport, err := qwpSfDialFor(dataSrv)(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialAt(authSrv.URL),
@@ -957,7 +957,7 @@ func TestErrorApiResilience_ServerRestartReplaysCorrectly(t *testing.T) {
 	// the address" — fresh state on the server side, but the client
 	// re-replays its on-disk tail.
 	var attempt atomic.Int32
-	factory := func(ctx context.Context) (*qwpTransport, error) {
+	factory := func(ctx context.Context, _ int) (*qwpTransport, error) {
 		var t qwpTransport
 		var url string
 		if attempt.Add(1) == 1 {
@@ -976,7 +976,7 @@ func TestErrorApiResilience_ServerRestartReplaysCorrectly(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
-	transport, err := factory(context.Background())
+	transport, err := factory(context.Background(), 0)
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, factory,

@@ -393,7 +393,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 		return nil, err
 	}
 	factory := qwpSfBuildReconnectFactory(address, opts, dumpWriter)
-	transport, err := factory(ctx)
+	transport, err := factory(ctx, 0)
 	if err != nil {
 		_ = engine.engineClose()
 		return nil, err

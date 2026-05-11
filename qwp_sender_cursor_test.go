@@ -40,7 +40,7 @@ func newCursorSenderForTest(t *testing.T, srv *qwpSfTestServer, autoFlushRows in
 	t.Helper()
 	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
@@ -131,7 +131,7 @@ func TestQwpCursorSenderCloseDrainsEngine(t *testing.T) {
 
 	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
@@ -159,7 +159,7 @@ func TestQwpCursorSenderCloseDrainTimeoutReturnsError(t *testing.T) {
 
 	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
@@ -259,7 +259,7 @@ func TestQwpCursorSenderAwaitAckedFsnTimeout(t *testing.T) {
 
 	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
-	transport, err := qwpSfDialFor(srv)(context.Background())
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)

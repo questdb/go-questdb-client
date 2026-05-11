@@ -251,7 +251,7 @@ func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
 	require.NoError(t, engine.engineClose())
 
 	dialEntered := make(chan struct{}, 1)
-	blockingFactory := func(ctx context.Context) (*qwpTransport, error) {
+	blockingFactory := func(ctx context.Context, _ int) (*qwpTransport, error) {
 		select {
 		case dialEntered <- struct{}{}:
 		default:
