@@ -276,6 +276,25 @@ func qwpSfRunRoundWalk(
 		attempts++
 		t, err := params.Factory(ctx, idx)
 		if err == nil && t != nil {
+			// failover.md §5 wire-v1 row: a client that ends up on a
+			// v1-negotiated connection cannot satisfy target=primary
+			// or target=replica because v1 has no SERVER_INFO frame to
+			// supply the role byte. The conservative classification is
+			// TopologyReject — the operator either upgrades the server
+			// to v2+ or drops the target= filter; reconnecting to the
+			// same host will reproduce the same outcome. SF is
+			// v1-pinned today (qwpTransportOpts.maxVersion left at
+			// qwpVersion), so this path fires for every successful
+			// upgrade when target≠any.
+			if params.Tracker.target != qwpTargetAny && t.negotiatedVersion < 2 {
+				_ = t.close()
+				params.Tracker.RecordRoleReject(idx, false)
+				lastErr = fmt.Errorf(
+					"qwp/sf: target=%s requires QWP v2+; peer negotiated v1 (no SERVER_INFO available)",
+					params.Tracker.target)
+				lastWasRoleReject = true
+				continue
+			}
 			params.Tracker.RecordSuccess(idx)
 			return qwpSfRoundWalkResult{
 				Transport: t,

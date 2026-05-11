@@ -449,6 +449,106 @@ func TestComputeBackoffEqualJitterShape(t *testing.T) {
 // round-walk semantics in isolation; the send-loop integration
 // tests prove the wiring works end-to-end.
 
+// --- failover.md §5 wire-v1 row: target≠any + v1 negotiation ---
+
+// TestRoundWalkV1TargetPrimaryTopologyRejects verifies the wire-v1
+// row of the role table: when the client requests target=primary
+// and the upgrade negotiates QWP v1 (no SERVER_INFO available),
+// the round-walk classifies the host as TopologyReject rather than
+// binding. The walk exhausts cleanly when every peer is v1.
+func TestRoundWalkV1TargetPrimaryTopologyRejects(t *testing.T) {
+	// Two healthy v1 servers (newRoundWalkHealthyServer emits
+	// X-QWP-Version: 1).
+	srv0 := newRoundWalkHealthyServer(t)
+	defer srv0.Close()
+	srv1 := newRoundWalkHealthyServer(t)
+	defer srv1.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, srv0),
+		endpointForServer(t, srv1),
+	}
+	// target=primary: the spec demands TopologyReject for v1 peers.
+	tracker := newQwpHostTracker(2, "", qwpTargetPrimary)
+	result := runWalkAgainst(t, endpoints, tracker, -1,
+		150*time.Millisecond, 5*time.Millisecond, 30*time.Millisecond)
+
+	assert.Nil(t, result.Transport, "v1-pinned client with target=primary must NOT bind")
+	require.NotNil(t, result.Exhausted, "budget must exhaust after every host is TopologyReject")
+	snap := tracker.snapshot()
+	assert.Equal(t, qwpHostTopologyReject, snap[0].state)
+	assert.Equal(t, qwpHostTopologyReject, snap[1].state)
+	assert.Contains(t, result.Exhausted.Error(), "target=primary",
+		"exhausted error must surface target= cause")
+	assert.Contains(t, result.Exhausted.Error(), "v2",
+		"exhausted error should hint at the v2 requirement")
+}
+
+// TestRoundWalkV1TargetReplicaTopologyRejects: same logic as
+// primary but for target=replica.
+func TestRoundWalkV1TargetReplicaTopologyRejects(t *testing.T) {
+	srv := newRoundWalkHealthyServer(t)
+	defer srv.Close()
+	endpoints := []qwpEndpoint{endpointForServer(t, srv)}
+	tracker := newQwpHostTracker(1, "", qwpTargetReplica)
+	result := runWalkAgainst(t, endpoints, tracker, -1,
+		120*time.Millisecond, 5*time.Millisecond, 30*time.Millisecond)
+	assert.Nil(t, result.Transport)
+	require.NotNil(t, result.Exhausted)
+	snap := tracker.snapshot()
+	assert.Equal(t, qwpHostTopologyReject, snap[0].state)
+	assert.Contains(t, result.Exhausted.Error(), "target=replica")
+}
+
+// TestRoundWalkV1TargetAnyBinds is the control: target=any against
+// a v1 server must bind successfully — the v1+target reject path
+// is gated on target != any.
+func TestRoundWalkV1TargetAnyBinds(t *testing.T) {
+	srv := newRoundWalkHealthyServer(t)
+	defer srv.Close()
+	endpoints := []qwpEndpoint{endpointForServer(t, srv)}
+	tracker := newQwpHostTracker(1, "", qwpTargetAny)
+	result := runWalkAgainst(t, endpoints, tracker, -1,
+		2*time.Second, 50*time.Millisecond, 500*time.Millisecond)
+	require.NotNil(t, result.Transport)
+	defer result.Transport.close()
+	snap := tracker.snapshot()
+	assert.Equal(t, qwpHostHealthy, snap[0].state,
+		"target=any against v1 must bind cleanly")
+}
+
+// TestRoundWalkV1TargetMixedExhaustsCleanly: heterogeneous round
+// where the v1+target reject demotes every host to TopologyReject
+// in turn, and the round-boundary sleep uses InitialBackoff (no
+// exponential doubling) because every classification was role-
+// reject-class. Sanity check: two rounds + an extra walk fit in
+// the budget.
+func TestRoundWalkV1TargetMixedExhaustsCleanly(t *testing.T) {
+	srv0 := newRoundWalkHealthyServer(t)
+	defer srv0.Close()
+	srv1 := newRoundWalkHealthyServer(t)
+	defer srv1.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, srv0),
+		endpointForServer(t, srv1),
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetPrimary)
+	start := time.Now()
+	result := runWalkAgainst(t, endpoints, tracker, -1,
+		300*time.Millisecond, 5*time.Millisecond, 30*time.Millisecond)
+	elapsed := time.Since(start)
+
+	require.NotNil(t, result.Exhausted)
+	// Per-attempt dialing is fast; budget controls the wall clock.
+	assert.GreaterOrEqual(t, elapsed, 300*time.Millisecond,
+		"must consume the full budget")
+	// We expect a healthy number of attempts since every dial is
+	// quick (httptest local) and the role-reject sleep is short.
+	assert.GreaterOrEqual(t, result.Attempts, 4,
+		"every v1 + target reject is a quick attempt; we should rack up several")
+}
+
 // TestRoundWalkPerCallerPreviousIdxIsolation pins down the
 // failover.md §2.3 invariant: two callers (foreground SF loop +
 // orphan drainer) sharing one tracker MUST use private previousIdx
