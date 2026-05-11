@@ -145,6 +145,15 @@ const qwpMagic uint32 = 0x31505751
 // frame format.
 const qwpVersion byte = 0x01
 
+// qwpCapZone is the CAP_ZONE bit in SERVER_INFO.capabilities. When
+// set, the server's SERVER_INFO frame carries an additional
+// zone_id string after node_id; clients use it to drive the
+// failover.md §2 zone-tier classification (Same / Unknown / Other).
+// Absent CAP_ZONE leaves the host's zone tier at Unknown, which
+// PickNext treats as a middle-priority bucket between Same and
+// Other.
+const qwpCapZone uint32 = 1 << 0
+
 // qwpMaxSupportedVersion is the highest QWP protocol version this
 // client knows how to consume on the wire. Advertised in the
 // X-QWP-Max-Version handshake header; the server echoes

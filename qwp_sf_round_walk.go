@@ -276,17 +276,36 @@ func qwpSfRunRoundWalk(
 		attempts++
 		t, err := params.Factory(ctx, idx)
 		if err == nil && t != nil {
-			// failover.md §5 wire-v1 row: a client that ends up on a
-			// v1-negotiated connection cannot satisfy target=primary
-			// or target=replica because v1 has no SERVER_INFO frame to
-			// supply the role byte. The conservative classification is
-			// TopologyReject — the operator either upgrades the server
-			// to v2+ or drops the target= filter; reconnecting to the
-			// same host will reproduce the same outcome. SF is
-			// v1-pinned today (qwpTransportOpts.maxVersion left at
-			// qwpVersion), so this path fires for every successful
-			// upgrade when target≠any.
-			if params.Tracker.target != qwpTargetAny && t.negotiatedVersion < 2 {
+			// Post-upgrade classification per failover.md §5:
+			//
+			//   - v2 with SERVER_INFO: role byte is authoritative.
+			//     Mismatch against target= → role-reject (transient if
+			//     role==PRIMARY_CATCHUP, topology otherwise — same
+			//     transient/topology split as a 421 + role reject).
+			//   - v2 with CAP_ZONE: zone_id feeds RecordZone so the
+			//     tracker's (state, zone) priority can route within
+			//     the configured `zone=` neighbourhood.
+			//   - v1 fallback (no SERVER_INFO): target=any binds; any
+			//     other target produces TopologyReject because v1
+			//     cannot supply the role byte (failover.md §5 wire-v1
+			//     row). The operator either upgrades the server to v2
+			//     or drops the target= filter.
+			if t.serverInfo != nil {
+				if t.serverInfo.ZoneId != "" {
+					params.Tracker.RecordZone(idx, t.serverInfo.ZoneId)
+				}
+				if params.Tracker.target != qwpTargetAny &&
+					!params.Tracker.target.accepts(t.serverInfo.Role) {
+					_ = t.close()
+					transient := t.serverInfo.Role == qwpRolePrimaryCatchup
+					params.Tracker.RecordRoleReject(idx, transient)
+					lastErr = fmt.Errorf(
+						"qwp/sf: target=%s rejected peer with SERVER_INFO.role=%s",
+						params.Tracker.target, qwpRoleName(t.serverInfo.Role))
+					lastWasRoleReject = true
+					continue
+				}
+			} else if params.Tracker.target != qwpTargetAny {
 				_ = t.close()
 				params.Tracker.RecordRoleReject(idx, false)
 				lastErr = fmt.Errorf(

@@ -59,6 +59,12 @@ type QwpServerInfo struct {
 	// operator. Distinct nodes in the same cluster carry distinct
 	// values; surfaced in error messages and diagnostics.
 	NodeId string
+	// ZoneId is the server's zone identifier, populated when
+	// Capabilities & qwpCapZone is set (failover.md §2). The
+	// comparison against the client's configured zone= is
+	// case-insensitive. Empty when the server did not opt into
+	// CAP_ZONE; in that case the host's tracker tier stays Unknown.
+	ZoneId string
 }
 
 // RoleName returns the human-readable name for the role byte. Unknown
@@ -172,6 +178,19 @@ func decodeServerInfo(payload []byte, negotiatedVersion byte) (*QwpServerInfo, e
 	if err != nil {
 		return nil, err
 	}
+	// Optional zone_id, gated by CAP_ZONE in capabilities. Servers
+	// that haven't opted into CAP_ZONE end the frame at node_id;
+	// servers that have opted in append a u16-length-prefixed UTF-8
+	// zone identifier (failover.md §5). The reader's bounds checks
+	// in readUtf8U16 guard against a hostile length declaring more
+	// bytes than the frame contains.
+	var zoneId string
+	if capabilities&qwpCapZone != 0 {
+		zoneId, err = readUtf8U16(&br, "zone_id")
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &QwpServerInfo{
 		Role:         role,
 		Epoch:        epoch,
@@ -179,6 +198,7 @@ func decodeServerInfo(payload []byte, negotiatedVersion byte) (*QwpServerInfo, e
 		ServerWallNs: serverWallNs,
 		ClusterId:    clusterId,
 		NodeId:       nodeId,
+		ZoneId:       zoneId,
 	}, nil
 }
 
