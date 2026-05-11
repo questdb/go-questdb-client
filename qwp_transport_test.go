@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1036,4 +1037,225 @@ func TestQwpDumpWriter(t *testing.T) {
 	httpEnd := strings.Index(dump, "\r\n\r\n")
 	require.Greater(t, httpEnd, 0)
 	assert.Greater(t, len(dump), httpEnd+4, "expected WebSocket frames after HTTP upgrade")
+}
+
+// newUpgradeRejectServer returns an httptest.Server that responds to
+// every request with the given status, headers, and body. Used to
+// drive the qwpTransport.connect() reject-classification paths without
+// running a real WebSocket accept.
+func newUpgradeRejectServer(t *testing.T, status int, headers http.Header, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for k, vs := range headers {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(status)
+		if body != "" {
+			_, _ = w.Write([]byte(body))
+		}
+	}))
+}
+
+// connectUpgradeReject is the shared assertion: drive connect() against
+// the given server and require a *QwpUpgradeRejectError. Returns the
+// typed error so callers can verify its fields.
+func connectUpgradeReject(t *testing.T, srv *httptest.Server, opts qwpTransportOpts) *QwpUpgradeRejectError {
+	t.Helper()
+	if opts.endpointPath == "" {
+		opts.endpointPath = qwpWritePath
+	}
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	err := tr.connect(context.Background(), wsURL, opts)
+	require.Error(t, err)
+	assert.Nil(t, tr.conn, "transport must not retain a conn on a rejected upgrade")
+	var rej *QwpUpgradeRejectError
+	require.ErrorAs(t, err, &rej)
+	return rej
+}
+
+// TestQwpTransportUpgradeReject421PrimaryCatchup verifies that a 421
+// response with X-QuestDB-Role: PRIMARY_CATCHUP surfaces as a typed
+// QwpUpgradeRejectError that classifies as a (transient) role-reject.
+func TestQwpTransportUpgradeReject421PrimaryCatchup(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"PRIMARY_CATCHUP"},
+		"X-QuestDB-Zone": []string{"eu-west-1a"},
+	}, "primary is still catching up")
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.Equal(t, 421, rej.StatusCode)
+	assert.Equal(t, "PRIMARY_CATCHUP", rej.Role)
+	assert.Equal(t, "eu-west-1a", rej.Zone)
+	assert.True(t, rej.IsRoleReject())
+	assert.True(t, rej.IsCatchupRole())
+	assert.Contains(t, rej.Body, "catching up")
+}
+
+// TestQwpTransportUpgradeReject421Replica verifies that a 421 with a
+// non-CATCHUP role surfaces as a topology-style reject (IsRoleReject
+// is true but IsCatchupRole is false).
+func TestQwpTransportUpgradeReject421Replica(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"REPLICA"},
+	}, "")
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.Equal(t, 421, rej.StatusCode)
+	assert.Equal(t, "REPLICA", rej.Role)
+	assert.True(t, rej.IsRoleReject())
+	assert.False(t, rej.IsCatchupRole())
+}
+
+// TestQwpTransportUpgradeReject421CaseInsensitiveRole verifies the
+// PRIMARY_CATCHUP comparison is case-insensitive — failover.md §5
+// mandates case-insensitive matching for the PRIMARY_CATCHUP and
+// REPLICA predicates.
+func TestQwpTransportUpgradeReject421CaseInsensitiveRole(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"primary_catchup"},
+	}, "")
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.True(t, rej.IsCatchupRole(),
+		"PRIMARY_CATCHUP match must be case-insensitive (got %q)", rej.Role)
+}
+
+// TestQwpTransportUpgradeReject421WithoutRole exercises the "421 + no
+// role header" path: spec §5 says this degrades to a generic transport
+// error from the failover loop's perspective. The transport surfaces
+// the typed reject; classification is the caller's responsibility.
+func TestQwpTransportUpgradeReject421WithoutRole(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 421, http.Header{}, "missing role header")
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.Equal(t, 421, rej.StatusCode)
+	assert.Empty(t, rej.Role)
+	assert.False(t, rej.IsRoleReject(), "421 with empty role must not classify as role-reject")
+}
+
+// TestQwpTransportUpgradeReject404 — 404 was previously terminal for
+// SF (qwpSfIsProtocolUpgradeFailure matched "got 404"); per the
+// 2026-05-08 reclassification, it now flows through the round-walk as
+// transient. The transport just surfaces the typed reject.
+func TestQwpTransportUpgradeReject404(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 404, http.Header{}, "not found")
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.Equal(t, 404, rej.StatusCode)
+	assert.False(t, rej.IsRoleReject())
+}
+
+// TestQwpTransportUpgradeReject426 — same reasoning as 404 (rolling
+// upgrade with one peer on a newer/older version).
+func TestQwpTransportUpgradeReject426(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 426, http.Header{}, "upgrade required")
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.Equal(t, 426, rej.StatusCode)
+}
+
+// TestQwpTransportUpgradeReject503 — server reachable but currently
+// unable to serve. failover.md §6 classifies this as transient.
+func TestQwpTransportUpgradeReject503(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 503, http.Header{
+		"Retry-After": []string{"7"},
+	}, "")
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.Equal(t, 503, rej.StatusCode)
+	assert.Equal(t, 7*time.Second, rej.RetryAfter)
+}
+
+// TestQwpTransportUpgradeReject401 — auth-terminal at the failover-loop
+// layer. The transport again just surfaces the typed reject; the SF
+// classifier maps 401/403 to CategorySecurityError separately.
+func TestQwpTransportUpgradeReject401(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 401, http.Header{}, "unauthorized")
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.Equal(t, 401, rej.StatusCode)
+}
+
+// TestQwpTransportUpgradeRejectBodyTruncation verifies the body
+// snippet is bounded by qwpUpgradeBodySnippetCap and that overrun
+// adds a trailing ellipsis so the truncation is observable.
+func TestQwpTransportUpgradeRejectBodyTruncation(t *testing.T) {
+	body := strings.Repeat("X", qwpUpgradeBodySnippetCap+200)
+	srv := newUpgradeRejectServer(t, 500, http.Header{}, body)
+	defer srv.Close()
+
+	rej := connectUpgradeReject(t, srv, qwpTransportOpts{})
+	assert.LessOrEqual(t, len(rej.Body), qwpUpgradeBodySnippetCap+len("…"))
+	assert.True(t, strings.HasSuffix(rej.Body, "…"),
+		"truncated body must end with ellipsis, got %q", rej.Body)
+}
+
+// TestQwpTransportUpgradeRejectErrorIsTyped pins down the
+// errors.As contract so failover loop callers can rely on
+// `var rej *QwpUpgradeRejectError; errors.As(err, &rej)` after a
+// failed connect — even if the transport wraps the error in the
+// future.
+func TestQwpTransportUpgradeRejectErrorIsTyped(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"PRIMARY_CATCHUP"},
+	}, "")
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var tr qwpTransport
+	err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath})
+	require.Error(t, err)
+	var rej *QwpUpgradeRejectError
+	require.ErrorAs(t, err, &rej)
+	assert.Equal(t, 421, rej.StatusCode)
+}
+
+// TestQwpTransportAuthTimeoutBoundsUpgradeReadOnly verifies that the
+// failover.md §1 auth_timeout_ms knob only bounds the upgrade response
+// read — a server that accepts the TCP connection but never writes the
+// HTTP response must trip the timeout, and the resulting error must
+// surface within the configured window (not the OS default connect
+// timeout).
+func TestQwpTransportAuthTimeoutBoundsUpgradeReadOnly(t *testing.T) {
+	// Black-hole acceptor: accept the TCP connection but never send a
+	// response. coder/websocket's Dial will block on response read.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Hold the connection open without responding.
+			_ = conn
+		}
+	}()
+
+	start := time.Now()
+	wsURL := "ws://" + ln.Addr().String()
+	var tr qwpTransport
+	err = tr.connect(context.Background(), wsURL, qwpTransportOpts{
+		endpointPath:  qwpWritePath,
+		authTimeoutMs: 200,
+	})
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	// Should fire close to the configured 200ms — well under any OS
+	// connect default. Allow generous headroom for slow CI.
+	assert.Less(t, elapsed, 2*time.Second,
+		"auth_timeout_ms (200ms) did not bound the upgrade read; elapsed=%s", elapsed)
 }

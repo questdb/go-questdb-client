@@ -135,6 +135,16 @@ type qwpTransportOpts struct {
 	// connections that advertise maxVersion >= 2 because a v2 server
 	// emits the frame unsolicited before any client request.
 	serverInfoTimeout time.Duration
+
+	// authTimeoutMs is the failover.md §1 per-host upper bound on the
+	// HTTP upgrade response read (i.e. the wait between writing the
+	// upgrade request and reading the response headers). It does NOT
+	// cover TCP connect (OS default), TLS handshake, or the post-
+	// upgrade SERVER_INFO frame read. Zero defers to the standard
+	// http.Transport default (effectively unbounded), matching the
+	// pre-failover-spec behavior; sanitizeQwpConf seeds 15000 for
+	// QWP-configured callers.
+	authTimeoutMs int
 }
 
 // qwpTransport wraps a WebSocket connection for sending QWP
@@ -212,17 +222,22 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		dialOpts.HTTPHeader.Set(qwpHeaderMaxBatchRows, fmt.Sprintf("%d", opts.maxBatchRows))
 	}
 
+	// Build the http.Transport so we can install ResponseHeaderTimeout
+	// per failover.md §1 (auth_timeout_ms bounds the upgrade response
+	// read). The same Transport carries TLS config for wss:// and the
+	// pipe-DialContext for dump mode.
+	httpTransport := &http.Transport{}
+	if opts.authTimeoutMs > 0 {
+		httpTransport.ResponseHeaderTimeout = time.Duration(opts.authTimeoutMs) * time.Millisecond
+	}
+
 	if t.dumpWriter != nil {
 		// Dump mode: use an in-process pipe with a fake server.
 		clientConn, serverConn := net.Pipe()
 		go qwpFakeServer(serverConn)
 		wrapped := &teeConn{Conn: clientConn, w: t.dumpWriter}
-		dialOpts.HTTPClient = &http.Client{
-			Transport: &http.Transport{
-				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-					return wrapped, nil
-				},
-			},
+		httpTransport.DialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
+			return wrapped, nil
 		}
 		// Use a dummy URL so the WS library has something to parse.
 		wsURL = "ws://dump.local" + path
@@ -235,22 +250,30 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		}()
 	} else if opts.tlsInsecureSkipVerify {
 		// TLS configuration for wss:// connections.
-		dialOpts.HTTPClient = &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-					MinVersion:         tls.VersionTLS12,
-				},
-			},
+		httpTransport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
 		}
 	}
+	dialOpts.HTTPClient = &http.Client{Transport: httpTransport}
 
 	conn, resp, err := websocket.Dial(ctx, wsURL, dialOpts)
+	if err != nil {
+		// On a non-101 response, build a typed *QwpUpgradeRejectError
+		// from the captured status + headers so the failover loop can
+		// classify the host (role-reject / topology / transport) without
+		// re-parsing string error messages. resp may be nil for TCP/TLS
+		// dial failures or response-header timeouts; in that case fall
+		// back to the wrapped dial error.
+		if resp != nil {
+			rejectErr := buildUpgradeRejectError(resp)
+			resp.Body.Close()
+			return rejectErr
+		}
+		return fmt.Errorf("qwp: websocket dial: %w", err)
+	}
 	if resp != nil && resp.Body != nil {
 		defer resp.Body.Close()
-	}
-	if err != nil {
-		return fmt.Errorf("qwp: websocket dial: %w", err)
 	}
 
 	// Validate the server-selected QWP version. Require the header to
@@ -313,6 +336,47 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		t.serverInfo = info
 	}
 	return nil
+}
+
+// buildUpgradeRejectError snapshots the relevant fields of a non-101
+// upgrade response into a typed QwpUpgradeRejectError. Reads up to
+// qwpUpgradeBodySnippetCap bytes of the body so the error message
+// surfaces operator-supplied text (e.g. a reverse-proxy maintenance
+// page) without unbounded memory cost. The caller is responsible for
+// closing resp.Body once this returns.
+func buildUpgradeRejectError(resp *http.Response) *QwpUpgradeRejectError {
+	role := strings.TrimSpace(resp.Header.Get("X-QuestDB-Role"))
+	zone := strings.TrimSpace(resp.Header.Get("X-QuestDB-Zone"))
+	var retryAfter time.Duration
+	if ra := strings.TrimSpace(resp.Header.Get("Retry-After")); ra != "" {
+		// Per RFC 7231 §7.1.3, Retry-After is either an HTTP-date or a
+		// non-negative integer of seconds. We only honour the seconds
+		// form here — the failover loop's outage budget is the
+		// authoritative wait bound, so HTTP-date precision adds little.
+		if secs, perr := strconv.Atoi(ra); perr == nil && secs > 0 {
+			retryAfter = time.Duration(secs) * time.Second
+		}
+	}
+	var body string
+	if resp.Body != nil {
+		buf := make([]byte, qwpUpgradeBodySnippetCap+1)
+		n, _ := io.ReadFull(resp.Body, buf)
+		switch {
+		case n <= 0:
+			// no body or unreadable; leave empty
+		case n > qwpUpgradeBodySnippetCap:
+			body = strings.TrimSpace(string(buf[:qwpUpgradeBodySnippetCap])) + "…"
+		default:
+			body = strings.TrimSpace(string(buf[:n]))
+		}
+	}
+	return &QwpUpgradeRejectError{
+		StatusCode: resp.StatusCode,
+		Role:       role,
+		Zone:       zone,
+		RetryAfter: retryAfter,
+		Body:       body,
+	}
 }
 
 // sendMessage sends a QWP message as a WebSocket binary frame.

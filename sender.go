@@ -1199,6 +1199,7 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	opts := qwpTransportOpts{
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
+		authTimeoutMs:         conf.authTimeoutMs,
 	}
 	// QWP auth: Basic (username:password) or Bearer (token).
 	// Matches the Java client's buildWebSocketAuthHeader().

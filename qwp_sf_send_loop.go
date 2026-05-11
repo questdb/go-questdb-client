@@ -973,14 +973,18 @@ func qwpSfIsTerminalUpgradeError(err error) bool {
 // (401 unauthorized, 403 forbidden). These map to
 // CategorySecurityError on the SenderError surface.
 //
-// coder/websocket reports upgrade failures with messages like
-// "failed to WebSocket dial: expected handshake response status
-// code 101 but got 401" — we match on the status-code substring
-// plus the textual "unauthorized" / "forbidden" hints servers
-// commonly emit alongside.
+// Preferred path: the transport surfaces a typed *QwpUpgradeRejectError
+// with the parsed status code. Falls back to substring matching on
+// coder/websocket's free-form text so any code path that bypasses the
+// typed reject (e.g. a future change in the dial library) still
+// classifies cleanly.
 func qwpSfIsAuthFailure(err error) bool {
 	if err == nil {
 		return false
+	}
+	var rej *QwpUpgradeRejectError
+	if errors.As(err, &rej) {
+		return rej.StatusCode == 401 || rej.StatusCode == 403
 	}
 	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{
@@ -999,9 +1003,19 @@ func qwpSfIsAuthFailure(err error) bool {
 // HTTP status (404 not found — wrong endpoint; 426 upgrade required
 // — wrong protocol version). These map to
 // CategoryProtocolViolation on the SenderError surface.
+//
+// NOTE: failover.md (2026-05-08 reclassification) demotes 404/426 to
+// transient so the round-walk can continue to a healthy peer. Until
+// the multi-host loop lands (Phase 4), single-host SF treats them as
+// terminal here — preserving the pre-Phase-1 behaviour rather than
+// retrying for the full reconnect budget against a misconfigured peer.
 func qwpSfIsProtocolUpgradeFailure(err error) bool {
 	if err == nil {
 		return false
+	}
+	var rej *QwpUpgradeRejectError
+	if errors.As(err, &rej) {
+		return rej.StatusCode == 404 || rej.StatusCode == 426
 	}
 	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{

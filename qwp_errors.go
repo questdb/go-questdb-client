@@ -24,7 +24,81 @@
 
 package questdb
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// QwpUpgradeRejectError is returned by qwpTransport.connect when the
+// server completes the HTTP exchange with a non-101 status. Construction
+// captures the response status and the failover-relevant headers so the
+// reconnect loop can classify the host without re-parsing strings:
+//
+//   - StatusCode is the HTTP response status (e.g. 421 for a misdirected
+//     request).
+//   - Role is the trimmed X-QuestDB-Role header value (empty if absent).
+//     The spec admits STANDALONE / PRIMARY / REPLICA / PRIMARY_CATCHUP;
+//     unrecognised tokens are surfaced verbatim and classified by the
+//     reconnect loop.
+//   - Zone is the trimmed X-QuestDB-Zone header value (empty if absent).
+//     Used to record host zone tier ahead of any successful upgrade.
+//   - RetryAfter is the parsed Retry-After header in seconds (0 if absent
+//     or unparseable). Hint only — the failover loop's outage budget
+//     still bounds the wait.
+//   - Body is up to qwpUpgradeBodySnippetCap bytes of the response body,
+//     captured for error formatting. Truncation is signalled by a
+//     trailing "…" in the Error() output.
+type QwpUpgradeRejectError struct {
+	StatusCode int
+	Role       string
+	Zone       string
+	RetryAfter time.Duration
+	Body       string
+}
+
+// qwpUpgradeBodySnippetCap bounds how many response-body bytes the
+// transport captures into QwpUpgradeRejectError.Body. Keeps error
+// messages bounded when a misconfigured server returns a large HTML
+// payload on a 4xx/5xx upgrade rejection.
+const qwpUpgradeBodySnippetCap = 512
+
+// Error implements the error interface. The format leads with the
+// HTTP status and tag (Role / Zone / Retry-After) so the failover
+// loop can include the message verbatim in its budget-exhaustion
+// report without losing the structured fields.
+func (e *QwpUpgradeRejectError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "qwp: upgrade rejected with HTTP %d", e.StatusCode)
+	if e.Role != "" {
+		fmt.Fprintf(&b, " (role=%s)", e.Role)
+	}
+	if e.Zone != "" {
+		fmt.Fprintf(&b, " (zone=%s)", e.Zone)
+	}
+	if e.RetryAfter > 0 {
+		fmt.Fprintf(&b, " (retry-after=%s)", e.RetryAfter)
+	}
+	if e.Body != "" {
+		fmt.Fprintf(&b, ": %s", e.Body)
+	}
+	return b.String()
+}
+
+// IsRoleReject reports whether the upgrade was rejected with the
+// failover-spec "topology hint" combination: HTTP 421 plus a non-empty
+// X-QuestDB-Role header. The reconnect loop classifies the host as
+// TransientReject (Role == PRIMARY_CATCHUP, case-insensitive) or
+// TopologyReject (any other non-empty role).
+func (e *QwpUpgradeRejectError) IsRoleReject() bool {
+	return e.StatusCode == 421 && e.Role != ""
+}
+
+// IsCatchupRole reports whether the role tag is PRIMARY_CATCHUP
+// (case-insensitive). Only meaningful when IsRoleReject() is true.
+func (e *QwpUpgradeRejectError) IsCatchupRole() bool {
+	return strings.EqualFold(e.Role, "PRIMARY_CATCHUP")
+}
 
 // qwpStatusName returns a human-readable name for a QWP status code.
 // Used by (*SenderError).Error() to format the wire-byte component of
