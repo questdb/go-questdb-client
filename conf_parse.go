@@ -285,6 +285,34 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
 			}
 			senderConf.sfAppendDeadlineMillis = parsedVal
+		case "auth_timeout_ms":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.authTimeoutMs = parsedVal
+		case "zone":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			// Silently accepted on QWP; SF ingress is zone-blind (v1-pinned)
+			// and treats every host as `Same`. Egress will read it when
+			// the zone-locality work lands. Sharing one connect string
+			// across ingress and egress clients is the documented usage,
+			// so a per-startup WARN would fire spuriously on the SF side.
+			senderConf.zone = v
+		case "target":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			t, err := parseTargetFilter(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("%v", err)
+			}
+			senderConf.target = t
 		case "reconnect_max_duration_millis":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -530,11 +558,20 @@ func parseConfigStr(conf string) (configData, error) {
 
 			// Reject duplicate keys (case-sensitive) for parity with Rust and
 			// the per-field checks in Java; otherwise dups would silently LWW.
+			// `addr` is the documented exception: the failover spec (§1)
+			// allows `addr=h1;addr=h2` as an alternative spelling of
+			// `addr=h1,h2`. Both forms accumulate into a single
+			// comma-joined value so downstream parsers see one shape.
 			keyStr := key.String()
-			if _, exists := result.KeyValuePairs[keyStr]; exists {
-				return result, NewInvalidConfigStrError("duplicate key %q", keyStr)
+			if existing, exists := result.KeyValuePairs[keyStr]; exists {
+				if keyStr == "addr" {
+					result.KeyValuePairs[keyStr] = existing + "," + value.String()
+				} else {
+					return result, NewInvalidConfigStrError("duplicate key %q", keyStr)
+				}
+			} else {
+				result.KeyValuePairs[keyStr] = value.String()
 			}
-			result.KeyValuePairs[keyStr] = value.String()
 
 			key.Reset()
 			value.Reset()

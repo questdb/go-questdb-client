@@ -322,6 +322,17 @@ type lineSenderConfig struct {
 	fileNameLimit int
 	httpTransport *http.Transport
 
+	// Multi-host failover (failover.md §1 / §2). For QWP, sanitizeQwpConf
+	// populates endpoints from address (which may be a comma-joined
+	// list); downstream consumers walk endpoints rather than address.
+	// Non-QWP transports leave endpoints nil and continue using address
+	// directly — sanitizeHttp/sanitizeTcp reject comma-form addr at
+	// validation time since neither transport supports multi-host yet.
+	endpoints     []qwpEndpoint
+	authTimeoutMs int             // QWP-only; 0 -> 15000 (15s) at sanitize time
+	zone          string          // QWP-only; silently ignored on SF ingress (zone-blind, v1-pinned)
+	target        qwpTargetFilter // QWP-only; zero value = qwpTargetAny
+
 	// Retry/timeout-related fields
 	retryTimeout   time.Duration
 	minThroughput  int
@@ -974,6 +985,9 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			initBufSize:             defaultInitBufferSize,
 			maxBufSize:              defaultMaxBufferSize,
 			fileNameLimit:           defaultFileNameLimit,
+			// failover.md §7: 15s upper bound on the HTTP upgrade
+			// response read. Parser overrides on explicit value.
+			authTimeoutMs: 15_000,
 		}
 	default:
 		return &lineSenderConfig{
@@ -1021,6 +1035,9 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 		return err
 	}
 
+	if strings.Contains(conf.address, ",") {
+		return errors.New("multi-host addr is not supported for TCP")
+	}
 	// validate tcp-specific settings
 	if conf.requestTimeout != 0 {
 		return errors.New("requestTimeout setting is not available in the TCP client")
@@ -1090,6 +1107,22 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.protocolVersion != protocolVersionUnset {
 		return errors.New("protocol_version setting is not available in the QWP client")
 	}
+	// Multi-host failover (failover.md §1 / §2). The parser populates
+	// conf.endpoints for connect-string callers; functional-option
+	// callers go through WithAddress, which writes only conf.address.
+	// Back-fill endpoints from a single-host conf.address here so the
+	// downstream code paths can rely on len(endpoints) >= 1.
+	if len(conf.endpoints) == 0 && conf.address != "" {
+		eps, err := parseEndpointList(conf.address, qwpDefaultPort)
+		if err != nil {
+			return err
+		}
+		conf.endpoints = eps
+		conf.address = eps[0].String()
+	}
+	if conf.authTimeoutMs <= 0 {
+		conf.authTimeoutMs = 15_000
+	}
 	// Cursor / store-and-forward validation. sf_dir activates cursor
 	// mode; the sf_*, sender_id, drain_orphans, max_background_drainers
 	// knobs are only meaningful when cursor mode is on.
@@ -1134,6 +1167,9 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 		return err
 	}
 
+	if strings.Contains(conf.address, ",") {
+		return errors.New("multi-host addr is not supported for HTTP")
+	}
 	// validate http-specific settings
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
 		return errors.New("both basic and token authentication cannot be used")

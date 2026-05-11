@@ -66,8 +66,28 @@ func ParseConfigStr(conf string) (configData, error) {
 	return parseConfigStr(conf)
 }
 
+// ConfFromStr parses a connect string into a *LineSenderConfig. The
+// returned config has NOT been sanitized — call SanitizeConf for the
+// post-sanitize shape (defaults applied, endpoints back-filled from
+// address, transport-specific validation run).
 func ConfFromStr(conf string) (*LineSenderConfig, error) {
 	return confFromStr(conf)
+}
+
+// SanitizeConf dispatches to the per-transport sanitizer. Exposed for
+// tests that need to apply post-parse defaults (e.g. authTimeoutMs,
+// QWP endpoints) without going through the full newLineSender path
+// (which would attempt a dial).
+func SanitizeConf(c *LineSenderConfig) error {
+	switch c.senderType {
+	case tcpSenderType:
+		return sanitizeTcpConf(c)
+	case httpSenderType:
+		return sanitizeHttpConf(c)
+	case qwpSenderType:
+		return sanitizeQwpConf(c)
+	}
+	return nil
 }
 
 func Messages(s LineSender) []byte {
@@ -189,6 +209,33 @@ func ProtocolVersion(s LineSender) protocolVersion {
 func NewLineSenderConfig(t SenderType) *LineSenderConfig {
 	return newLineSenderConfig(t)
 }
+
+// ConfigEndpoints returns the multi-host failover list parsed by
+// sanitizeQwpConf. Each entry is rendered as host:port (IPv6 hosts
+// are bracketed) so tests can compare against literals. Returns nil
+// for non-QWP senders.
+func ConfigEndpoints(c *LineSenderConfig) []string {
+	if c == nil || len(c.endpoints) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.endpoints))
+	for i, e := range c.endpoints {
+		out[i] = e.String()
+	}
+	return out
+}
+
+// ConfigAuthTimeoutMs returns the effective auth_timeout_ms after
+// sanitization (default 15000).
+func ConfigAuthTimeoutMs(c *LineSenderConfig) int { return c.authTimeoutMs }
+
+// ConfigZone returns the parsed zone= value (silently stored but
+// unused on SF ingress).
+func ConfigZone(c *LineSenderConfig) string { return c.zone }
+
+// ConfigTarget returns the parsed target= value as a string
+// (any/primary/replica).
+func ConfigTarget(c *LineSenderConfig) string { return c.target.String() }
 
 func SetLittleEndian(littleEndian bool) {
 	isLittleEndian = littleEndian
