@@ -74,10 +74,10 @@ var qwpSfDrainerPoolCloseGrace = 3 * time.Second
 // clears the sentinel — bounded automatic retry, then human-in-
 // the-loop.
 type qwpSfOrphanDrainer struct {
-	slotPath                string
-	segmentSize             int64
-	sfMaxTotalBytes         int64
-	clientFactory           qwpSfReconnectFactory
+	slotPath        string
+	segmentSize     int64
+	sfMaxTotalBytes int64
+	clientFactory   qwpSfReconnectFactory
 	// tracker is the shared host-health tracker. When non-nil, the
 	// drainer participates in the same failover.md §2 model the
 	// foreground SF loop uses: PickNext observations from one loop

@@ -182,7 +182,7 @@ func qwpSfRunRoundWalk(
 	}
 	if params.Factory == nil {
 		return qwpSfRoundWalkResult{
-			Idx: -1,
+			Idx:       -1,
 			Cancelled: fmt.Errorf("qwp/sf: round-walk requires a factory"),
 		}
 	}

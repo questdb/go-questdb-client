@@ -220,7 +220,7 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 		drainer := qwpSfNewOrphanDrainer(
 			dir, segSize, qwpSfUnlimitedTotalBytes,
 			qwpSfDialFor(srv),
-		nil,
+			nil,
 			1*time.Second, 10*time.Millisecond, 100*time.Millisecond,
 		)
 		drainers = append(drainers, drainer)

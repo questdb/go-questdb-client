@@ -54,11 +54,11 @@ const (
 // / max-batch-rows / content-encoding triple is egress-only — ingest
 // never sends or reads them.
 const (
-	qwpHeaderMaxVersion      = "X-QWP-Max-Version"
-	qwpHeaderClientId        = "X-QWP-Client-Id"
-	qwpHeaderVersion         = "X-QWP-Version"
-	qwpHeaderAcceptEncoding  = "X-QWP-Accept-Encoding"
-	qwpHeaderMaxBatchRows    = "X-QWP-Max-Batch-Rows"
+	qwpHeaderMaxVersion     = "X-QWP-Max-Version"
+	qwpHeaderClientId       = "X-QWP-Client-Id"
+	qwpHeaderVersion        = "X-QWP-Version"
+	qwpHeaderAcceptEncoding = "X-QWP-Accept-Encoding"
+	qwpHeaderMaxBatchRows   = "X-QWP-Max-Batch-Rows"
 )
 
 // qwpClientId is sent in X-QWP-Client-Id during the upgrade handshake.
@@ -401,16 +401,18 @@ func (t *qwpTransport) sendMessage(ctx context.Context, data []byte) error {
 //     tableCount × (nameLen(2) + name + seqTxn(8)). Minimum 11 bytes;
 //     the trailing per-table entries section must consume the rest of
 //     the payload exactly.
+//
 //   - DURABLE_ACK frames are unsolicited per-table watermarks; we
 //     skip them and keep reading. Servers only emit them when the
 //     client opts in via the X-QWP-Request-Durable-Ack header, which
 //     this transport does not, but any well-formed durable-ack frame
 //     that arrives is silently consumed.
+//
 //   - Error ACKs are exactly qwpAckErrorHeaderSize + msg_len bytes.
 //
-//	OK:           [status (0x00)] [sequence: int64 LE] [tableCount: uint16 LE] [entries…]
-//	DURABLE_ACK:  [status (0x02)]                      [tableCount: uint16 LE] [entries…]
-//	Error:        [status]        [sequence: int64 LE] [msg_len: uint16 LE]   [msg: UTF-8]
+//     OK:           [status (0x00)] [sequence: int64 LE] [tableCount: uint16 LE] [entries…]
+//     DURABLE_ACK:  [status (0x02)]                      [tableCount: uint16 LE] [entries…]
+//     Error:        [status]        [sequence: int64 LE] [msg_len: uint16 LE]   [msg: UTF-8]
 //
 // Each table entry is [nameLen: uint16 LE] [name (nameLen bytes UTF-8)]
 // [seqTxn: int64 LE]. nameLen must be > 0 — empty names are rejected.
@@ -648,4 +650,3 @@ func qwpFakeServer(conn net.Conn) {
 		// Ignore other opcodes (ping/pong handled by WS library).
 	}
 }
-
