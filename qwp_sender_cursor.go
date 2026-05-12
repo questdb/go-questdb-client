@@ -189,7 +189,9 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	factory := qwpSfBuildEndpointFactory(conf.endpoints, scheme, opts, conf.dumpWriter)
 
 	// Initial connect — three modes:
-	//   - InitialConnectOff:   one factory call, terminal on failure (default).
+	//   - InitialConnectOff:   one single-round walk through every
+	//                          configured endpoint, terminal if all
+	//                          fail (no inter-round retry).
 	//   - InitialConnectSync:  retry-with-backoff on the calling goroutine.
 	//   - InitialConnectAsync: skip the dial here; the I/O goroutine
 	//                          dials in-band on its first iteration.
@@ -207,12 +209,31 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	case InitialConnectAsync:
 		transport = nil
 	default: // InitialConnectOff
-		// Single-shot dial of endpoints[0]. Multi-host failover at
-		// initial connect requires opt-in via initial_connect_retry.
-		transport, err = factory(ctx, 0)
-		if err == nil {
-			tracker.RecordSuccess(0)
-			initialBoundIdx = 0
+		// Single-round walk through every configured endpoint — no
+		// inter-host backoff, no retry across rounds. Mirrors Java's
+		// QwpWebSocketSender.buildAndConnect (failover.md §1.2 /
+		// §4.2): multi-host config gets a full sweep on initial
+		// connect, but only one sweep. Use initial_connect_retry for
+		// retry-with-backoff across multiple sweeps.
+		walkStart := time.Now()
+		rr := qwpSfRunSingleRound(ctx, nil, qwpSfRoundWalkParams{
+			Factory:   factory,
+			Tracker:   tracker,
+			Endpoints: conf.endpoints,
+		}, -1)
+		switch {
+		case rr.Transport != nil:
+			transport = rr.Transport
+			initialBoundIdx = rr.Idx
+		case rr.Terminal != nil:
+			err = fmt.Errorf("qwp/sf: WebSocket upgrade failed (won't retry): %w", rr.Terminal)
+		case rr.Cancelled != nil:
+			err = rr.Cancelled
+		default:
+			// Round exhausted: every endpoint dialed without binding.
+			err = fmt.Errorf("qwp/sf: initial connect failed; %w",
+				buildExhaustedError(tracker, conf.endpoints,
+					time.Since(walkStart), rr.Attempts, rr.LastError))
 		}
 	}
 	if err != nil {

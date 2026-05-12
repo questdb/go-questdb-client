@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -936,4 +937,192 @@ func TestRoundWalkPerCallerPreviousIdxIsolation(t *testing.T) {
 	snap := tracker.snapshot()
 	assert.NotEqual(t, qwpHostHealthy, snap[rA.Idx].state,
 		"caller A's bound host should be demoted post mid-stream")
+}
+
+// --- qwpSfRunSingleRound: the per-round primitive ---
+
+// runSingleRoundAgainst dials the configured endpoints once via
+// qwpSfRunSingleRound and returns the result. Tests assert on the
+// inner-loop result shape (single-round, no inter-round sleep).
+func runSingleRoundAgainst(
+	t *testing.T,
+	endpoints []qwpEndpoint,
+	tracker *qwpHostTracker,
+	previousIdx int,
+) qwpSfSingleRoundResult {
+	t.Helper()
+	factory := qwpSfBuildEndpointFactory(endpoints, "ws", qwpTransportOpts{
+		endpointPath: qwpWritePath,
+	}, nil)
+	params := qwpSfRoundWalkParams{
+		Factory:   factory,
+		Tracker:   tracker,
+		Endpoints: endpoints,
+	}
+	return qwpSfRunSingleRound(context.Background(), nil, params, previousIdx)
+}
+
+// TestRunSingleRoundBindsHealthyPeerWhenFirstRoleRejects is the
+// per-round counterpart to TestRoundWalkBindsHealthyPeerWhenFirstRoleRejects:
+// the inner walks every unattempted host once and binds the healthy
+// peer without paying a round-boundary sleep.
+func TestRunSingleRoundBindsHealthyPeerWhenFirstRoleRejects(t *testing.T) {
+	rejectSrv := newRoundWalkRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"REPLICA"},
+	})
+	defer rejectSrv.Close()
+	healthySrv := newRoundWalkHealthyServer(t)
+	defer healthySrv.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, rejectSrv),
+		endpointForServer(t, healthySrv),
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+
+	start := time.Now()
+	rr := runSingleRoundAgainst(t, endpoints, tracker, -1)
+	elapsed := time.Since(start)
+
+	require.NotNil(t, rr.Transport, "expected successful bind on healthy peer")
+	defer rr.Transport.close()
+	assert.Equal(t, 1, rr.Idx, "must bind to healthy peer at idx=1")
+	assert.Less(t, elapsed, 500*time.Millisecond,
+		"single-round walk must NOT pay any inter-host sleep")
+
+	snap := tracker.snapshot()
+	assert.Equal(t, qwpHostTopologyReject, snap[0].state,
+		"REPLICA reject without CATCHUP must classify as TopologyReject")
+	assert.Equal(t, qwpHostHealthy, snap[1].state)
+}
+
+// TestRunSingleRoundExhaustsWithoutSleep verifies the exhaustion
+// path: when every host is unreachable, the inner returns
+// immediately with LastError set, without paying any round-boundary
+// sleep. The outer multi-round wrapper is the one that pays sleeps;
+// the inner is a pure walk.
+func TestRunSingleRoundExhaustsWithoutSleep(t *testing.T) {
+	endpoints := []qwpEndpoint{
+		{host: "127.0.0.1", port: 1},
+		{host: "127.0.0.1", port: 2},
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+
+	start := time.Now()
+	rr := runSingleRoundAgainst(t, endpoints, tracker, -1)
+	elapsed := time.Since(start)
+
+	assert.Nil(t, rr.Transport)
+	assert.Nil(t, rr.Terminal)
+	assert.Nil(t, rr.Cancelled)
+	require.Error(t, rr.LastError,
+		"exhaustion must surface the most recent dial failure")
+	assert.Equal(t, 2, rr.Attempts, "every host must be attempted before exit")
+	assert.Less(t, elapsed, 2*time.Second,
+		"single-round exhaustion must not sleep; dial timeouts dominate")
+
+	// Both hosts left as TransportError; attempted bits set.
+	snap := tracker.snapshot()
+	for i, h := range snap {
+		assert.Equal(t, qwpHostTransportError, h.state, "host %d state", i)
+		assert.True(t, h.attempted, "host %d attempted", i)
+	}
+}
+
+// TestRunSingleRoundAuthErrorShortCircuits verifies that a 401 on
+// host 0 causes the inner to return Terminal immediately, without
+// dialing host 1 — auth is uniform across the cluster, walking on
+// would just produce identical rejections (failover.md §6).
+func TestRunSingleRoundAuthErrorShortCircuits(t *testing.T) {
+	authSrv := newRoundWalkRejectServer(t, 401, http.Header{})
+	defer authSrv.Close()
+	healthySrv := newRoundWalkHealthyServer(t)
+	defer healthySrv.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, authSrv),
+		endpointForServer(t, healthySrv),
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	rr := runSingleRoundAgainst(t, endpoints, tracker, -1)
+
+	assert.Nil(t, rr.Transport)
+	require.NotNil(t, rr.Terminal, "401 must short-circuit as Terminal")
+	assert.Equal(t, 401, rr.Terminal.StatusCode)
+	assert.Equal(t, 1, rr.Attempts, "walk must stop after the auth-failing host")
+	assert.NotEqual(t, qwpHostHealthy, tracker.snapshot()[1].state,
+		"walk must not have reached the healthy peer")
+}
+
+// TestInitialConnectOffWalksMultiHostToHealthy is the spec-parity
+// test: with `initial_connect_retry` left at its default (off), a
+// connect string with multiple `addr=` entries must walk every host
+// once and land on the healthy peer rather than failing on the
+// first reject. Mirrors Java
+// WriteFailoverTest.testOffModeSinglePassWalkFindsPrimary.
+func TestInitialConnectOffWalksMultiHostToHealthy(t *testing.T) {
+	// Host 0: rejects with 421 + REPLICA (TopologyReject).
+	rejectSrv := newRoundWalkRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"REPLICA"},
+	})
+	defer rejectSrv.Close()
+	// Host 1: SF-compatible test server that ACKs frames.
+	healthySrv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer healthySrv.Close()
+
+	sfDir := t.TempDir()
+	addr0 := strings.TrimPrefix(rejectSrv.URL, "http://")
+	addr1 := strings.TrimPrefix(healthySrv.URL, "http://")
+	conf := fmt.Sprintf(
+		"ws::addr=%s,%s;sf_dir=%s;sender_id=t;close_flush_timeout_millis=2000;",
+		addr0, addr1, sfDir,
+	)
+
+	sender, err := LineSenderFromConf(context.Background(), conf)
+	require.NoError(t, err,
+		"initial connect (default off) must walk past REPLICA and bind on healthy peer")
+	defer func() { _ = sender.Close(context.Background()) }()
+
+	// Send a row and confirm it reached the healthy server — proves
+	// the bind landed on host 1, not on host 0 (which would have
+	// rejected the upgrade outright).
+	require.NoError(t, sender.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	require.NoError(t, sender.Flush(context.Background()))
+	assert.GreaterOrEqual(t, healthySrv.totalFramesReceived.Load(), int64(1),
+		"the healthy peer must have received the test frame")
+}
+
+// TestInitialConnectOffFailsWhenAllRejected: when every endpoint
+// rejects on the initial single-round walk, the constructor must
+// return a clear error rather than hanging or burning the reconnect
+// budget. The error must name the walk and the attempt count.
+func TestInitialConnectOffFailsWhenAllRejected(t *testing.T) {
+	r1 := newRoundWalkRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"REPLICA"},
+	})
+	defer r1.Close()
+	r2 := newRoundWalkRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"PRIMARY_CATCHUP"},
+	})
+	defer r2.Close()
+
+	sfDir := t.TempDir()
+	addr0 := strings.TrimPrefix(r1.URL, "http://")
+	addr1 := strings.TrimPrefix(r2.URL, "http://")
+	conf := fmt.Sprintf(
+		"ws::addr=%s,%s;sf_dir=%s;sender_id=t;",
+		addr0, addr1, sfDir,
+	)
+
+	start := time.Now()
+	sender, err := LineSenderFromConf(context.Background(), conf)
+	elapsed := time.Since(start)
+	if sender != nil {
+		_ = sender.Close(context.Background())
+	}
+	require.Error(t, err, "initial connect must fail when every endpoint rejects")
+	assert.Contains(t, err.Error(), "initial connect",
+		"error must identify the single-round walk: %v", err)
+	assert.Less(t, elapsed, 3*time.Second,
+		"failure must surface promptly; OFF mode must not retry across rounds")
 }

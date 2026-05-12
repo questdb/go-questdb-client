@@ -149,49 +149,86 @@ type qwpSfRoundWalkParams struct {
 	OnAttempt func()
 }
 
-// qwpSfRunRoundWalk drives the failover.md §13.6 round-walk:
+// qwpSfSingleRoundResult is the inner-loop return shape for one walk
+// through every unattempted host in the tracker. qwpSfRunRoundWalk
+// wraps this in a multi-round backoff loop; the InitialConnectOff
+// branch in newQwpCursorLineSenderFromConf calls qwpSfRunSingleRound
+// directly so a multi-host config still gets a full sweep on initial
+// connect (failover.md §1.2 / §4.2; Java parity with
+// QwpWebSocketSender.buildAndConnect).
 //
-//  1. If previousIdx >= 0, record a mid-stream demote against it
-//     before the first PickNext. Mirrors §2.3 ordering invariant.
-//  2. PickNext → dial → classify → record outcome.
-//  3. When PickNext == -1, pay one round-boundary sleep (role-reject
-//     uses ComputeBackoff(0); transport uses the doubling counter)
-//     clamped to the remaining budget, then BeginRound(true).
-//  4. Loop until success, terminal AuthError, budget exhaustion, or
-//     cancellation.
+// Exactly one of Transport / Terminal / Cancelled is non-nil on
+// non-exhaustion exits. When all three are nil, the round was
+// exhausted (every host attempted, no bind) and LastError /
+// LastWasRoleReject describe the last dial.
+type qwpSfSingleRoundResult struct {
+	// Transport is non-nil on success; caller takes ownership.
+	Transport *qwpTransport
+	// Idx is the bound endpoint index, or -1 on any non-success exit.
+	Idx int
+	// Attempts is the dial count consumed during this round
+	// (success inclusive).
+	Attempts int
+	// Terminal is set when the walk hits a 401/403 upgrade reject —
+	// per failover.md §6, auth errors short-circuit failover.
+	Terminal *QwpUpgradeRejectError
+	// Cancelled is ctx.Err() (or context.Canceled when cancelCh
+	// fired) when the walk was interrupted. Also non-nil for
+	// misconfigurations (nil tracker / factory) so callers route
+	// both via the same exit branch.
+	Cancelled error
+	// LastError is the most recent dial failure when the round
+	// exhausted. Nil on success / terminal / cancelled exits.
+	LastError error
+	// LastWasRoleReject indicates the most recent failure was a
+	// role-reject (421 + role header, or v2 SERVER_INFO target
+	// mismatch). Drives the outer loop's round-boundary backoff
+	// selection per §3.2.
+	LastWasRoleReject bool
+}
+
+// qwpSfRunSingleRound walks every unattempted host in the tracker
+// once, dialing each via params.Factory and classifying the outcome.
+// Returns on the first of:
 //
-// The result enum tells the caller which exit path was taken; only
-// one of Transport / Terminal / Exhausted / Cancelled is non-nil.
+//   - successful bind (Transport set);
+//   - terminal AuthError 401/403 (Terminal set) — failover.md §6;
+//   - ctx or cancelCh cancellation (Cancelled set);
+//   - round exhaustion (PickNext returns -1, no remaining
+//     unattempted hosts).
 //
-// ctx is the master context; cancelCh, when non-nil, provides a
-// secondary cancellation channel for callers that distinguish
-// "user close" from "ctx cancelled". Either fires the Cancelled
-// path.
-func qwpSfRunRoundWalk(
+// On exhaustion this function does NOT sleep and does NOT call
+// BeginRound — those belong to the multi-round outer loop. Callers
+// running a single-round walk (the InitialConnectOff branch) treat
+// exhaustion as the terminal "all endpoints unreachable" condition.
+//
+// previousIdx >= 0 triggers RecordMidStreamFailure before the first
+// PickNext (failover.md §2.3 ordering invariant). Pass -1 when no
+// prior bind exists (initial connect).
+func qwpSfRunSingleRound(
 	ctx context.Context,
 	cancelCh <-chan struct{},
 	params qwpSfRoundWalkParams,
 	previousIdx int,
-) qwpSfRoundWalkResult {
+) qwpSfSingleRoundResult {
 	if params.Tracker == nil || params.Tracker.Len() == 0 {
-		return qwpSfRoundWalkResult{
-			Idx: -1,
-			Cancelled: fmt.Errorf(
-				"qwp/sf: round-walk requires a non-empty tracker"),
+		return qwpSfSingleRoundResult{
+			Idx:       -1,
+			Cancelled: fmt.Errorf("qwp/sf: round-walk requires a non-empty tracker"),
 		}
 	}
 	if params.Factory == nil {
-		return qwpSfRoundWalkResult{
+		return qwpSfSingleRoundResult{
 			Idx:       -1,
 			Cancelled: fmt.Errorf("qwp/sf: round-walk requires a factory"),
 		}
 	}
 
-	outageStart := time.Now()
-	backoffAttempt := 0
-	lastWasRoleReject := false
-	var lastErr error
-	attempts := 0
+	var (
+		attempts          int
+		lastErr           error
+		lastWasRoleReject bool
+	)
 
 	// Apply pending mid-stream demote before the first PickNext.
 	// failover.md §2.3 normative ordering: reverse this and
@@ -203,12 +240,12 @@ func qwpSfRunRoundWalk(
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return qwpSfRoundWalkResult{Idx: -1, Cancelled: err, Attempts: attempts}
+			return qwpSfSingleRoundResult{Idx: -1, Cancelled: err, Attempts: attempts}
 		}
 		if cancelCh != nil {
 			select {
 			case <-cancelCh:
-				return qwpSfRoundWalkResult{
+				return qwpSfSingleRoundResult{
 					Idx:       -1,
 					Cancelled: context.Canceled,
 					Attempts:  attempts,
@@ -219,54 +256,12 @@ func qwpSfRunRoundWalk(
 
 		idx := params.Tracker.PickNext()
 		if idx < 0 {
-			// Round exhausted. Pay one round-boundary sleep (per
-			// failover.md §13.6) or terminate if the budget is gone.
-			elapsed := time.Since(outageStart)
-			if elapsed >= params.MaxDuration {
-				return qwpSfRoundWalkResult{
-					Idx:      -1,
-					Attempts: attempts,
-					Exhausted: buildExhaustedError(
-						params.Tracker, params.Endpoints, elapsed, attempts, lastErr),
-				}
+			return qwpSfSingleRoundResult{
+				Idx:               -1,
+				Attempts:          attempts,
+				LastError:         lastErr,
+				LastWasRoleReject: lastWasRoleReject,
 			}
-			var sleep time.Duration
-			if lastWasRoleReject {
-				// Role-reject: no exponential doubling. Use a fresh
-				// ComputeBackoff(0) which surfaces as
-				// EqualJitter(InitialBackoff). Reset the counter so
-				// a subsequent transport-only round doesn't inherit
-				// a stale attempt count.
-				sleep = qwpSfComputeBackoff(0, params.InitialBackoff, params.MaxBackoff)
-				backoffAttempt = 0
-			} else {
-				sleep = qwpSfComputeBackoff(backoffAttempt, params.InitialBackoff, params.MaxBackoff)
-				backoffAttempt++
-			}
-			remaining := params.MaxDuration - elapsed
-			if remaining <= 0 {
-				return qwpSfRoundWalkResult{
-					Idx:      -1,
-					Attempts: attempts,
-					Exhausted: buildExhaustedError(
-						params.Tracker, params.Endpoints, elapsed, attempts, lastErr),
-				}
-			}
-			if sleep > remaining {
-				sleep = remaining
-			}
-			// Sleep interruptible by ctx + cancelCh.
-			if !qwpSfSleepInterruptible(ctx, cancelCh, sleep) {
-				return qwpSfRoundWalkResult{
-					Idx:       -1,
-					Cancelled: context.Canceled,
-					Attempts:  attempts,
-				}
-			}
-			params.Tracker.BeginRound(true)
-			lastWasRoleReject = false
-			lastErr = nil
-			continue
 		}
 
 		// Dial host[idx].
@@ -315,7 +310,7 @@ func qwpSfRunRoundWalk(
 				continue
 			}
 			params.Tracker.RecordSuccess(idx)
-			return qwpSfRoundWalkResult{
+			return qwpSfSingleRoundResult{
 				Transport: t,
 				Idx:       idx,
 				Attempts:  attempts,
@@ -330,7 +325,7 @@ func qwpSfRunRoundWalk(
 		if errors.As(err, &rej) {
 			// AuthError (401 / 403): terminal per §6. Bypass failover.
 			if rej.StatusCode == 401 || rej.StatusCode == 403 {
-				return qwpSfRoundWalkResult{
+				return qwpSfSingleRoundResult{
 					Idx:      -1,
 					Attempts: attempts,
 					Terminal: rej,
@@ -356,6 +351,106 @@ func qwpSfRunRoundWalk(
 		// response-header timeout, etc. — all transient.
 		params.Tracker.RecordTransportError(idx)
 		lastWasRoleReject = false
+	}
+}
+
+// qwpSfRunRoundWalk drives the failover.md §13.6 multi-round walk:
+// each round calls qwpSfRunSingleRound; on exhaustion it pays one
+// round-boundary sleep (equal-jitter exponential for transport
+// rounds, flat InitialBackoff for role-reject rounds per §3.2),
+// clamped to the remaining budget, then BeginRound(true) and
+// retries. Returns on success, terminal AuthError, budget
+// exhaustion, or cancellation.
+//
+// The result enum tells the caller which exit path was taken; only
+// one of Transport / Terminal / Exhausted / Cancelled is non-nil.
+// ctx is the master context; cancelCh, when non-nil, provides a
+// secondary cancellation channel (used to distinguish "user close"
+// from "ctx cancelled").
+func qwpSfRunRoundWalk(
+	ctx context.Context,
+	cancelCh <-chan struct{},
+	params qwpSfRoundWalkParams,
+	previousIdx int,
+) qwpSfRoundWalkResult {
+	outageStart := time.Now()
+	backoffAttempt := 0
+	totalAttempts := 0
+	enteringPreviousIdx := previousIdx
+
+	for {
+		rr := qwpSfRunSingleRound(ctx, cancelCh, params, enteringPreviousIdx)
+		// previousIdx only demotes on the first inner call. Subsequent
+		// rounds enter with -1 so a stale slot doesn't double-demote.
+		enteringPreviousIdx = -1
+		totalAttempts += rr.Attempts
+
+		if rr.Transport != nil {
+			return qwpSfRoundWalkResult{
+				Transport: rr.Transport,
+				Idx:       rr.Idx,
+				Attempts:  totalAttempts,
+			}
+		}
+		if rr.Terminal != nil {
+			return qwpSfRoundWalkResult{
+				Idx:      -1,
+				Attempts: totalAttempts,
+				Terminal: rr.Terminal,
+			}
+		}
+		if rr.Cancelled != nil {
+			return qwpSfRoundWalkResult{
+				Idx:       -1,
+				Cancelled: rr.Cancelled,
+				Attempts:  totalAttempts,
+			}
+		}
+
+		// Round exhausted. Pay one round-boundary sleep or terminate
+		// if the budget is gone.
+		elapsed := time.Since(outageStart)
+		if elapsed >= params.MaxDuration {
+			return qwpSfRoundWalkResult{
+				Idx:      -1,
+				Attempts: totalAttempts,
+				Exhausted: buildExhaustedError(
+					params.Tracker, params.Endpoints, elapsed, totalAttempts, rr.LastError),
+			}
+		}
+		var sleep time.Duration
+		if rr.LastWasRoleReject {
+			// Role-reject: no exponential doubling. ComputeBackoff(0)
+			// surfaces as EqualJitter(InitialBackoff). Reset the
+			// counter so a subsequent transport-only round doesn't
+			// inherit a stale attempt count.
+			sleep = qwpSfComputeBackoff(0, params.InitialBackoff, params.MaxBackoff)
+			backoffAttempt = 0
+		} else {
+			sleep = qwpSfComputeBackoff(backoffAttempt, params.InitialBackoff, params.MaxBackoff)
+			backoffAttempt++
+		}
+		remaining := params.MaxDuration - elapsed
+		if remaining <= 0 {
+			return qwpSfRoundWalkResult{
+				Idx:      -1,
+				Attempts: totalAttempts,
+				Exhausted: buildExhaustedError(
+					params.Tracker, params.Endpoints, elapsed, totalAttempts, rr.LastError),
+			}
+		}
+		if sleep > remaining {
+			sleep = remaining
+		}
+		// Sleep interruptible by ctx + cancelCh.
+		if !qwpSfSleepInterruptible(ctx, cancelCh, sleep) {
+			return qwpSfRoundWalkResult{
+				Idx:       -1,
+				Cancelled: context.Canceled,
+				Attempts:  totalAttempts,
+			}
+		}
+		params.Tracker.BeginRound(true)
 	}
 }
 
