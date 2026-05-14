@@ -141,8 +141,19 @@ type qwpSfSegment struct {
 // qwpSfCreateSegment creates a fresh segment file at path,
 // pre-allocating exactly sizeBytes and mmapping it RW. The 24-byte
 // header is written in-place; the cursor lands at qwpSfHeaderSize.
-// Returns an error on any I/O failure (file already exists, disk
-// full, mmap rejected).
+// Returns an error on any I/O failure (openCleanRW, disk full, mmap
+// rejected).
+//
+// Pre-allocation goes through qwpSfAllocate, which owns the
+// cross-platform "extend + reserve real disk blocks + never shrinks"
+// contract (see qwp_sf_allocate.go). For this call path the file is
+// freshly O_TRUNC'd so currentSize == 0 and qwpSfAllocate reserves
+// blocks for [0, sizeBytes) and advances EOF to sizeBytes in one
+// step. Without the reservation a later store into the mmap'd region
+// after the filesystem fills up would deliver SIGBUS (POSIX) /
+// STATUS_IN_PAGE_ERROR (Windows), tearing down the process —
+// sf-client.md §6 marks block reservation a core invariant of the
+// create path.
 func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, error) {
 	if sizeBytes < qwpSfHeaderSize+qwpSfFrameHeaderSize+1 {
 		return nil, fmt.Errorf("qwp/sf: sizeBytes too small for header + one minimal frame: %d", sizeBytes)
@@ -150,15 +161,18 @@ func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, e
 	// O_TRUNC discards any prior content at the same path — segment
 	// files are write-once-then-fixed, so reusing a stale file is
 	// always an error in the recovery code path; here, on a fresh
-	// create, truncation is the documented behavior.
+	// create, truncation is the documented behavior. The post-open
+	// EOF is 0, which is the precondition qwpSfAllocate's macOS
+	// reservation (F_PEOFPOSMODE — allocates the requested length
+	// immediately beyond EOF) needs in order to cover [0, sizeBytes).
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("qwp/sf: openCleanRW %s: %w", path, err)
 	}
-	if err := f.Truncate(sizeBytes); err != nil {
+	if err := qwpSfAllocate(f, sizeBytes); err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return nil, fmt.Errorf("qwp/sf: truncate %s to %d bytes: %w", path, sizeBytes, err)
+		return nil, err
 	}
 	buf, err := qwpSfMmapRW(f, sizeBytes)
 	if err != nil {

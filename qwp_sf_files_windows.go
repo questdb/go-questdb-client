@@ -125,6 +125,44 @@ func qwpSfMsync(buf []byte, length int64) error {
 	return nil
 }
 
+// qwpSfReserveNewBlocks reserves real disk clusters for f up to
+// currentSize+newBytes via SetFileInformationByHandle(FileAllocationInfo).
+// On NTFS this reserves clusters synchronously and fails with
+// ERROR_DISK_FULL when free space is insufficient. Caller-side
+// contract (never shrinks, short-circuit, post-truncate) is owned by
+// qwpSfAllocate; this helper is single-concern.
+//
+// FileAllocationInfo is file-scope, not range-based — there is no
+// per-range API on NTFS — so the call implicitly re-reserves
+// [0, currentSize) as well. Visible only to a caller who deliberately
+// created sparse holes inside that range; the qwpSfAllocate doc flags
+// hole-filling as non-portable behaviour.
+//
+// FileAllocationInfo does NOT extend the file's logical size (EOF);
+// qwpSfAllocate's f.Truncate follow-up handles that. Windows has no
+// equivalent of the Linux / macOS sparse-fallback path — any failure
+// here surfaces as an error.
+func qwpSfReserveNewBlocks(f *os.File, currentSize, newBytes int64) error {
+	target := currentSize + newBytes
+	// FILE_ALLOCATION_INFO is a single LARGE_INTEGER. Lay it out via a
+	// fixed-size struct so the &info / Sizeof pair matches the
+	// kernel's expectation regardless of Go alignment quirks.
+	info := struct {
+		AllocationSize int64
+	}{AllocationSize: target}
+	err := windows.SetFileInformationByHandle(
+		windows.Handle(f.Fd()),
+		windows.FileAllocationInfo,
+		(*byte)(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	)
+	if err != nil {
+		return fmt.Errorf("qwp/sf: SetFileInformationByHandle(FileAllocationInfo) %s to %d bytes: %w",
+			f.Name(), target, err)
+	}
+	return nil
+}
+
 // qwpSfFlockExclusive acquires an exclusive non-blocking lock on f.
 // Implemented via LockFileEx with LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY.
 // Returns qwpSfErrLockBusy on contention.
