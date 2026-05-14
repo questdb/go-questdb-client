@@ -247,9 +247,9 @@ func TestQwpCursorSenderAwaitAckedFsnHappyPath(t *testing.T) {
 	target := engine.enginePublishedFsn()
 	require.GreaterOrEqual(t, target, int64(0), "auto-flush should have published at least one frame")
 
-	ok, err := s.AwaitAckedFsn(target, 2*time.Second)
-	require.NoError(t, err)
-	require.True(t, ok)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, s.AwaitAckedFsn(ctx, target))
 	assert.GreaterOrEqual(t, s.AckedFsn(), target)
 }
 
@@ -278,11 +278,12 @@ func TestQwpCursorSenderAwaitAckedFsnTimeout(t *testing.T) {
 	}, time.Second, time.Millisecond, "auto-flush should have published the frame")
 	target := engine.enginePublishedFsn()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
 	start := time.Now()
-	ok, err := s.AwaitAckedFsn(target, 50*time.Millisecond)
+	err = s.AwaitAckedFsn(ctx, target)
 	elapsed := time.Since(start)
-	require.NoError(t, err)
-	assert.False(t, ok, "no ACK was ever sent — must time out")
+	require.ErrorIs(t, err, context.DeadlineExceeded, "no ACK was ever sent — must time out")
 	assert.GreaterOrEqual(t, elapsed, 50*time.Millisecond)
 	assert.Less(t, elapsed, time.Second)
 }
@@ -298,17 +299,18 @@ func TestQwpSenderAwaitAckedFsnAlreadyAcked(t *testing.T) {
 	require.NoError(t, s.Flush(context.Background()))
 
 	// Flush already waited for ACK — AwaitAckedFsn for the same
-	// target returns immediately without consuming the timeout.
+	// target returns immediately without consuming the deadline.
 	target := engine.enginePublishedFsn()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 	start := time.Now()
-	ok, err := s.AwaitAckedFsn(target, time.Second)
-	require.NoError(t, err)
-	assert.True(t, ok)
+	require.NoError(t, s.AwaitAckedFsn(ctx, target))
 	assert.Less(t, time.Since(start), 50*time.Millisecond,
 		"AwaitAckedFsn must short-circuit when target is already met")
 
-	// A negative target is trivially reached.
-	ok, err = s.AwaitAckedFsn(-1, 0)
-	require.NoError(t, err)
-	assert.True(t, ok)
+	// A negative target is trivially reached, even with an
+	// already-cancelled context (the pre-loop check returns first).
+	cancelled, cancelFn := context.WithCancel(context.Background())
+	cancelFn()
+	require.NoError(t, s.AwaitAckedFsn(cancelled, -1))
 }

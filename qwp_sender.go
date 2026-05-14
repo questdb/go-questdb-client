@@ -104,16 +104,17 @@ type QwpSender interface {
 	// Snapshot accessor — for a bounded wait, use AwaitAckedFsn.
 	AckedFsn() int64
 
-	// AwaitAckedFsn blocks until AckedFsn() >= target, the timeout
-	// elapses, or the I/O loop latches a terminal error. Returns
-	// true on success, false on timeout.
+	// AwaitAckedFsn blocks until AckedFsn() >= target, ctx is
+	// cancelled / deadlines, or the I/O loop latches a terminal
+	// error. Returns nil on success; ctx.Err() on cancellation /
+	// deadline; *SenderError on a terminal server rejection.
 	//
 	// Useful for tests and user code that need to confirm a specific
-	// publish has been server-acknowledged. The timeout does not
-	// extend Flush's own ACK wait — pair AwaitAckedFsn with the
-	// auto-flush path (which enqueues without waiting), not with
+	// publish has been server-acknowledged. Wrap with
+	// context.WithTimeout for a bounded wait. Pair AwaitAckedFsn with
+	// the auto-flush path (which enqueues without waiting), not with
 	// Flush (which already blocks on ACK).
-	AwaitAckedFsn(target int64, timeout time.Duration) (bool, error)
+	AwaitAckedFsn(ctx context.Context, target int64) error
 
 	// FlushAndGetSequence behaves identically to Flush but returns
 	// the published FSN (highest committed-to-disk-and-queued-for-

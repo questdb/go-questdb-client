@@ -658,39 +658,33 @@ func (s *qwpLineSender) AckedFsn() int64 {
 // and surfaces send-loop terminal errors synchronously so the
 // caller can distinguish "still in flight" from "permanently
 // failed".
-func (s *qwpLineSender) AwaitAckedFsn(target int64, timeout time.Duration) (bool, error) {
+func (s *qwpLineSender) AwaitAckedFsn(ctx context.Context, target int64) error {
 	if s.closed {
-		return false, errClosedSenderFlush
+		return errClosedSenderFlush
 	}
 	if s.cursorEngine.engineAckedFsn() >= target {
-		return true, nil
+		return nil
 	}
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
-		return false, err
+		return err
 	}
-	if timeout <= 0 {
-		return false, nil
-	}
-	deadline := time.Now().Add(timeout)
 	const pollInterval = 5 * time.Millisecond
 	tick := time.NewTicker(pollInterval)
 	defer tick.Stop()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 	for {
 		if s.cursorEngine.engineAckedFsn() >= target {
-			return true, nil
+			return nil
 		}
 		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
-			return false, err
+			return err
 		}
 		select {
 		case <-tick.C:
-			if !time.Now().Before(deadline) {
-				return s.cursorEngine.engineAckedFsn() >= target, nil
+		case <-ctx.Done():
+			if s.cursorEngine.engineAckedFsn() >= target {
+				return nil
 			}
-		case <-timer.C:
-			return s.cursorEngine.engineAckedFsn() >= target, nil
+			return ctx.Err()
 		}
 	}
 }
