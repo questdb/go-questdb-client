@@ -260,3 +260,69 @@ func runHaltVsConcurrentFlushOnce(t *testing.T, iter int) {
 	assert.Greater(t, observed.Load(), int32(0),
 		"iter %d: at least one goroutine should observe *SenderError", iter)
 }
+
+// TestErrorApiHaltLatchedBeforeHandlerInvoked pins the ordering
+// invariant called out in qwp-cursor-error-api.md §120: on a HALT
+// rejection, the I/O loop must set the lastError /
+// lastTerminalServerError latch BEFORE handing the SenderError to the
+// dispatcher. Otherwise a handler that synchronously probes the
+// terminal state races the latch and may observe "no error" even
+// though the sender just halted.
+//
+// The test registers a handler that probes sendLoopCheckError() and
+// sendLoopLastTerminalServerError() — both are atomic-pointer reads,
+// so they're safe to call from the dispatcher goroutine while the
+// producer is parked. Over many iterations the handler must NEVER
+// see either probe return nil. The previous offer-before-latch
+// ordering would fail this assertion intermittently.
+func TestErrorApiHaltLatchedBeforeHandlerInvoked(t *testing.T) {
+	if testing.Short() {
+		t.Skip("race test skipped in short mode")
+	}
+	const iters = 200
+	for i := 0; i < iters; i++ {
+		runHaltLatchedBeforeHandlerOnce(t, i)
+	}
+}
+
+func runHaltLatchedBeforeHandlerOnce(t *testing.T, iter int) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusParseError})
+	defer srv.Close()
+
+	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+
+	type handlerObservation struct {
+		checkErr error
+		terminal *SenderError
+	}
+	gotCh := make(chan handlerObservation, 1)
+	loop.sendLoopSetErrorHandler(func(e *SenderError) {
+		// Read-only probes: atomic pointer loads, no race against
+		// the producer. With correct ordering, both must reflect
+		// the terminal state by the time we get here.
+		obs := handlerObservation{
+			checkErr: loop.sendLoopCheckError(),
+			terminal: loop.sendLoopLastTerminalServerError(),
+		}
+		select {
+		case gotCh <- obs:
+		default:
+		}
+	}, qwpSfMinErrorInboxCapacity)
+
+	require.NoError(t, s.Table("t").Int64Column("v", int64(iter)).AtNow(context.Background()))
+	_ = s.Flush(context.Background())
+
+	select {
+	case obs := <-gotCh:
+		require.NotNil(t, obs.checkErr,
+			"iter %d: sendLoopCheckError() must be non-nil inside handler "+
+				"(latch must be set BEFORE dispatch)", iter)
+		require.NotNil(t, obs.terminal,
+			"iter %d: lastTerminalServerError must be non-nil inside handler "+
+				"(latch must be set BEFORE dispatch)", iter)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("iter %d: handler not invoked within deadline", iter)
+	}
+}

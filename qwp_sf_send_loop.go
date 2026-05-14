@@ -382,6 +382,13 @@ func (l *qwpSfSendLoop) recordFatal(err error) {
 // accessor can return the typed payload directly without an unwrap
 // walk). Idempotent — only the first failure wins, matching
 // recordFatal's semantics.
+//
+// Invariant: callers MUST invoke this before dispatcher.offer(se) on
+// any HALT path. The dispatcher delivers asynchronously to user
+// handlers that may synchronously probe sendLoopCheckError() or call
+// Flush; if the latch is written after offer, those probes race and
+// can see nil. See qwp-cursor-error-api.md §120 and the Java
+// CursorWebSocketSendLoop comments around recordFatal/dispatchError.
 func (l *qwpSfSendLoop) recordFatalServerError(se *SenderError) {
 	if se == nil {
 		return
@@ -565,8 +572,11 @@ func (l *qwpSfSendLoop) run() {
 		if code := websocket.CloseStatus(err); qwpSfIsTerminalCloseCode(code) {
 			se := l.qwpSfBuildProtocolViolationSE(code, err.Error())
 			l.totalServerErrors.Add(1)
-			l.dispatcher.Load().offer(se)
+			// Latch BEFORE dispatching: a handler that synchronously
+			// calls Flush / sendLoopCheckError must observe the typed
+			// terminal error. See qwp-cursor-error-api.md §120.
 			l.recordFatalServerError(se)
+			l.dispatcher.Load().offer(se)
 			return
 		}
 		if l.reconnectFactory == nil {
@@ -576,8 +586,8 @@ func (l *qwpSfSendLoop) run() {
 		if qwpSfIsTerminalUpgradeError(err) {
 			se := l.qwpSfBuildUpgradeFailureSE(err)
 			l.totalServerErrors.Add(1)
-			l.dispatcher.Load().offer(se)
 			l.recordFatalServerError(se)
+			l.dispatcher.Load().offer(se)
 			return
 		}
 		// Detect "server up, accepts the WS upgrade, but doesn't speak
@@ -606,8 +616,8 @@ func (l *qwpSfSendLoop) run() {
 				l.framesSentOnConn.Load(), err.Error())
 			se := l.qwpSfBuildBudgetExhaustedSE(reason)
 			l.totalServerErrors.Add(1)
-			l.dispatcher.Load().offer(se)
 			l.recordFatalServerError(se)
+			l.dispatcher.Load().offer(se)
 			return
 		}
 		// Reconnect with backoff.
@@ -853,11 +863,16 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				DetectedAt:       time.Now(),
 			}
 			l.totalServerErrors.Add(1)
-			l.dispatcher.Load().offer(se)
 			if pol == PolicyHalt {
+				// Latch BEFORE dispatching: a handler that
+				// synchronously calls Flush / sendLoopCheckError
+				// must observe the typed terminal error. See
+				// qwp-cursor-error-api.md §120.
 				l.recordFatalServerError(se)
+				l.dispatcher.Load().offer(se)
 				return se
 			}
+			l.dispatcher.Load().offer(se)
 			// PolicyDropAndContinue: advance past the rejected span
 			// via the same engine entry the success branch uses. The
 			// segment manager will trim the now-acked range on its
@@ -953,8 +968,8 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 	if result.Terminal != nil {
 		se := l.qwpSfBuildUpgradeFailureSE(result.Terminal)
 		l.totalServerErrors.Add(1)
-		l.dispatcher.Load().offer(se)
 		l.recordFatalServerError(se)
+		l.dispatcher.Load().offer(se)
 		return false
 	}
 	if result.Cancelled != nil {
@@ -976,8 +991,8 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		phase, result.Exhausted, initial)
 	se := l.qwpSfBuildBudgetExhaustedSE(reason)
 	l.totalServerErrors.Add(1)
-	l.dispatcher.Load().offer(se)
 	l.recordFatalServerError(se)
+	l.dispatcher.Load().offer(se)
 	return false
 }
 
