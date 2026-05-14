@@ -125,6 +125,82 @@ func TestQwpSfDispatcherCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestQwpSfDispatcherCloseDrainsLeftover asserts that an item in the
+// inbox at close time is delivered even when the dispatcher goroutine
+// never started. Reproduces the never-started race: in production
+// offer's send-to-inbox can complete before its startIfNeeded call,
+// and a close() that wins the closed flag between those two steps
+// would otherwise strand the queued payload.
+func TestQwpSfDispatcherCloseDrainsLeftover(t *testing.T) {
+	var got *SenderError
+	var mu sync.Mutex
+	d := newQwpSfErrorDispatcher(func(e *SenderError) {
+		mu.Lock()
+		got = e
+		mu.Unlock()
+	}, 4)
+
+	want := &SenderError{Category: CategoryParseError, AppliedPolicy: PolicyHalt}
+	d.inbox <- want
+	if d.started.Load() {
+		t.Fatal("test setup: dispatcher unexpectedly started")
+	}
+
+	d.close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got != want {
+		t.Fatalf("got = %v, want %v — close did not synchronously drain", got, want)
+	}
+	if d.totalDelivered() != 1 {
+		t.Errorf("delivered = %d, want 1", d.totalDelivered())
+	}
+}
+
+// TestQwpSfDispatcherOfferCloseRaceNoLoss stresses the offer/close
+// serialization: every offer that returns true must result in a
+// delivered handler invocation, even when close races with offers
+// from many goroutines. Verifies mu prevents a producer's send from
+// landing in an abandoned inbox after close has drained.
+func TestQwpSfDispatcherOfferCloseRaceNoLoss(t *testing.T) {
+	const iterations = 200
+	const offerers = 16
+	for iter := 0; iter < iterations; iter++ {
+		var delivered atomic.Int64
+		d := newQwpSfErrorDispatcher(func(e *SenderError) {
+			delivered.Add(1)
+		}, offerers*2)
+
+		var accepted atomic.Int64
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for k := 0; k < offerers; k++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if d.offer(&SenderError{Category: CategoryParseError}) {
+					accepted.Add(1)
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			d.close()
+		}()
+		close(start)
+		wg.Wait()
+
+		if got, want := delivered.Load(), accepted.Load(); got != want {
+			t.Fatalf("iter %d: delivered=%d, accepted=%d (lost %d)",
+				iter, got, want, want-got)
+		}
+	}
+}
+
 // TestQwpSfDispatcherPanicCaught asserts a panicking handler is
 // recovered and does not stop the dispatcher.
 func TestQwpSfDispatcherPanicCaught(t *testing.T) {

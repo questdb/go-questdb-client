@@ -66,6 +66,14 @@ type qwpSfErrorDispatcher struct {
 	// loop polls done.
 	done chan struct{}
 
+	// mu serializes offer vs close. offer holds it from the closed
+	// check through the channel send; close holds it across the
+	// CAS that flips closed=true and the close(done) call. This
+	// makes the closed-flag check and the channel send atomic with
+	// respect to close — a producer that read closed=false cannot
+	// then have its send land after close has already drained.
+	mu sync.Mutex
+
 	// startMu serializes lazy-start. Combined with started.Load(),
 	// it ensures the goroutine spawns exactly once.
 	startMu sync.Mutex
@@ -104,27 +112,31 @@ func newQwpSfErrorDispatcher(handler SenderErrorHandler, capacity int) *qwpSfErr
 }
 
 // offer enqueues a SenderError for asynchronous delivery to the
-// handler. Non-blocking: returns true if the error was queued, false
-// if the inbox was full or the dispatcher has been closed (the drop
-// counter is bumped in both cases for ops visibility — except when
-// closed, in which case the counter stays put because the sender is
-// shutting down and queueing more would be misleading).
+// handler. Returns true if the error was queued, false if the inbox
+// was full or the dispatcher has been closed (the drop counter is
+// bumped in both cases for ops visibility — except when closed, in
+// which case the counter stays put because the sender is shutting
+// down and queueing more would be misleading).
+//
+// Holds mu for the duration of the closed-check + channel send so
+// close cannot interleave between the two and leave a payload
+// stranded.
 //
 // Lazy-starts the dispatch goroutine on the first successful offer.
 func (d *qwpSfErrorDispatcher) offer(e *SenderError) bool {
 	if d == nil || e == nil {
 		return false
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closed.Load() {
 		return false
 	}
+	if !d.started.Load() {
+		d.startIfNeeded()
+	}
 	select {
 	case d.inbox <- e:
-		// Common case after the first offer: goroutine is already
-		// running; this is a single channel send and a volatile read.
-		if !d.started.Load() {
-			d.startIfNeeded()
-		}
 		return true
 	default:
 		d.dropped.Add(1)
@@ -171,9 +183,9 @@ func (d *qwpSfErrorDispatcher) loop() {
 // exit paths: the inbox is empty (the common case — by the time
 // drain runs, closed.Load() is true and producers stop offering),
 // or qwpSfDispatcherDrainTimeout fires (a slow handler is still
-// chewing through queued items). A producer that races the close
-// (read closed=false then was preempted before the channel send)
-// may lose its notification — best-effort, matching offer's contract.
+// chewing through queued items). With offer/close serialized
+// through mu, no new sends can land here once close has run, so
+// the inbox is guaranteed to go quiet.
 func (d *qwpSfErrorDispatcher) drain() {
 	deadline := time.NewTimer(qwpSfDispatcherDrainTimeout)
 	defer deadline.Stop()
@@ -208,15 +220,35 @@ func (d *qwpSfErrorDispatcher) deliver(e *SenderError) {
 // close stops the dispatch goroutine and waits for it to finish
 // draining (up to qwpSfDispatcherDrainTimeout). Idempotent — second
 // and subsequent calls are no-ops.
+//
+// Acquires mu before flipping closed and closing done, so any
+// in-flight offer either commits its send first (and we drain it
+// below) or sees closed=true and returns false. The post-wait
+// synchronous drain is a belt-and-suspenders sweep that catches
+// payloads landed before the dispatcher goroutine started, or
+// after its drain()'s default case bailed out.
 func (d *qwpSfErrorDispatcher) close() {
 	if d == nil {
 		return
 	}
+	d.mu.Lock()
 	if !d.closed.CompareAndSwap(false, true) {
+		d.mu.Unlock()
 		return
 	}
 	close(d.done)
+	d.mu.Unlock()
 	d.wg.Wait()
+	for {
+		select {
+		case e := <-d.inbox:
+			if e != nil {
+				d.deliver(e)
+			}
+		default:
+			return
+		}
+	}
 }
 
 // droppedNotifications returns the cumulative count of inbox-overflow
