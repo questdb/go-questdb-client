@@ -49,7 +49,8 @@ const qwpSfDispatcherDrainTimeout = 100 * time.Millisecond
 // notifications. The I/O goroutine offers errors non-blockingly into a
 // bounded channel; a dedicated goroutine drains the channel and
 // invokes the user-supplied SenderErrorHandler. A slow handler does
-// not stall publishing — surplus offers drop and bump a counter.
+// not stall publishing — overflow displaces the oldest queued entry
+// (sf-client.md §14.6) and bumps droppedNotifications.
 //
 // The dispatcher goroutine is started lazily on the first successful
 // offer, so workloads that never see a server error pay zero
@@ -112,17 +113,16 @@ func newQwpSfErrorDispatcher(handler SenderErrorHandler, capacity int) *qwpSfErr
 }
 
 // offer enqueues a SenderError for asynchronous delivery to the
-// handler. Returns true if the error was queued, false if the inbox
-// was full or the dispatcher has been closed (the drop counter is
-// bumped in both cases for ops visibility — except when closed, in
-// which case the counter stays put because the sender is shutting
-// down and queueing more would be misleading).
+// handler. Always admits the new entry unless the dispatcher is
+// closed or e is nil. When the inbox is full, the oldest queued
+// entry is displaced to make room (drop-oldest per sf-client.md
+// §14.6 — watermarks are monotonic, so the newest entry is always
+// the most informative). Each displacement bumps droppedNotifications.
 //
-// Holds mu for the duration of the closed-check + channel send so
-// close cannot interleave between the two and leave a payload
-// stranded.
-//
-// Lazy-starts the dispatch goroutine on the first successful offer.
+// Holds mu across the closed-check, send, and any drop step so close
+// cannot interleave. Lazy-starts the dispatch goroutine on the first
+// call. Returns true when the new entry is queued, false only when
+// the dispatcher is closed or e is nil.
 func (d *qwpSfErrorDispatcher) offer(e *SenderError) bool {
 	if d == nil || e == nil {
 		return false
@@ -135,12 +135,23 @@ func (d *qwpSfErrorDispatcher) offer(e *SenderError) bool {
 	if !d.started.Load() {
 		d.startIfNeeded()
 	}
-	select {
-	case d.inbox <- e:
-		return true
-	default:
-		d.dropped.Add(1)
-		return false
+	// Drop-oldest overflow. We hold mu so no concurrent producer can
+	// run; only the consumer goroutine races with our receive step,
+	// and it can only remove items. The loop converges in ≤2 iters:
+	// either our receive drops the head and the retry send succeeds,
+	// or the consumer drained between the failed send and our receive
+	// (default fires) and the retry succeeds without counting a drop.
+	for {
+		select {
+		case d.inbox <- e:
+			return true
+		default:
+		}
+		select {
+		case <-d.inbox:
+			d.dropped.Add(1)
+		default:
+		}
 	}
 }
 
@@ -268,8 +279,8 @@ func (d *qwpSfErrorDispatcher) close() {
 }
 
 // droppedNotifications returns the cumulative count of inbox-overflow
-// drops. Non-zero means the user's handler is slower than the error
-// rate.
+// displacements (drop-oldest) plus any items abandoned at close().
+// Non-zero means the user's handler is slower than the error rate.
 func (d *qwpSfErrorDispatcher) droppedNotifications() int64 {
 	if d == nil {
 		return 0

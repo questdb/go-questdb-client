@@ -80,37 +80,80 @@ func TestQwpSfDispatcherDeliversInOrder(t *testing.T) {
 	}
 }
 
-// TestQwpSfDispatcherSlowHandlerDrops asserts that a slow handler
-// causes inbox-overflow drops instead of stalling the producer side.
-func TestQwpSfDispatcherSlowHandlerDrops(t *testing.T) {
+// TestQwpSfDispatcherSlowHandlerDropsOldest asserts that when a slow
+// handler causes the inbox to fill, the OLDEST queued entry is
+// displaced to admit the new one (sf-client.md §14.6). Every offer
+// must be admitted; only previously queued entries are displaced;
+// the inbox at end-of-flood must contain the most recent items.
+func TestQwpSfDispatcherSlowHandlerDropsOldest(t *testing.T) {
 	release := make(chan struct{})
+	handlerStarted := make(chan struct{})
+	var mu sync.Mutex
+	var delivered []*SenderError
+	var firstOnce sync.Once
 	d := newQwpSfErrorDispatcher(func(e *SenderError) {
+		firstOnce.Do(func() { close(handlerStarted) })
+		mu.Lock()
+		delivered = append(delivered, e)
+		mu.Unlock()
 		<-release
 	}, 4)
-	defer func() {
-		close(release)
-		d.close()
-	}()
 
-	const offers = 64
-	accepted := 0
-	for i := 0; i < offers; i++ {
-		if d.offer(&SenderError{Category: CategoryParseError}) {
-			accepted++
+	items := make([]*SenderError, 9)
+	for i := range items {
+		items[i] = &SenderError{Category: CategoryParseError, ToFsn: int64(i)}
+	}
+
+	// First offer lazy-starts the dispatcher. Wait until the handler
+	// has actually pulled item 0 so the inbox is verifiably empty
+	// before we fill it.
+	if !d.offer(items[0]) {
+		t.Fatal("first offer rejected on empty inbox")
+	}
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not start within timeout")
+	}
+
+	// Fill the inbox to capacity (4) without overflowing.
+	for i := 1; i <= 4; i++ {
+		if !d.offer(items[i]) {
+			t.Fatalf("offer %d rejected on non-full inbox", i)
 		}
 	}
-	dropped := d.droppedNotifications()
-	if dropped == 0 {
-		t.Fatalf("expected drops, got 0 (accepted=%d)", accepted)
+	if got := d.droppedNotifications(); got != 0 {
+		t.Fatalf("dropped = %d before overflow, want 0", got)
 	}
-	// The first one might've fired the goroutine and the inbox cap
-	// is 4, so accepted should be at most cap+1 (one in flight).
-	if accepted > 5 {
-		t.Errorf("accepted = %d, want ≤ 5 (inbox cap 4 + 1 in flight)", accepted)
+
+	// Offer 4 more. Drop-oldest must admit each one and displace the
+	// oldest entry that was queued.
+	for i := 5; i <= 8; i++ {
+		if !d.offer(items[i]) {
+			t.Fatalf("offer %d rejected (drop-oldest must admit every offer)", i)
+		}
 	}
-	if int64(accepted)+dropped != int64(offers) {
-		t.Errorf("accepted (%d) + dropped (%d) = %d, want %d",
-			accepted, dropped, int64(accepted)+dropped, offers)
+	if got, want := d.droppedNotifications(), int64(4); got != want {
+		t.Errorf("dropped = %d, want %d (one per overflow offer)", got, want)
+	}
+
+	// Release the handler and drain. Item 0 was already in the handler
+	// when the flood started; items 1-4 should have been displaced;
+	// items 5-8 should still be queued. Total delivered: 5.
+	close(release)
+	d.close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delivered) != 5 {
+		t.Fatalf("delivered = %d, want 5 (item 0 + 4 newest)", len(delivered))
+	}
+	wantFsns := []int64{0, 5, 6, 7, 8}
+	for i, want := range wantFsns {
+		if delivered[i].ToFsn != want {
+			t.Errorf("delivered[%d] ToFsn = %d, want %d (drop-oldest must preserve newest)",
+				i, delivered[i].ToFsn, want)
+		}
 	}
 }
 
