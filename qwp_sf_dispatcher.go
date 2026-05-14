@@ -222,11 +222,22 @@ func (d *qwpSfErrorDispatcher) deliver(e *SenderError) {
 // and subsequent calls are no-ops.
 //
 // Acquires mu before flipping closed and closing done, so any
-// in-flight offer either commits its send first (and we drain it
-// below) or sees closed=true and returns false. The post-wait
-// synchronous drain is a belt-and-suspenders sweep that catches
-// payloads landed before the dispatcher goroutine started, or
-// after its drain()'s default case bailed out.
+// in-flight offer either commits its send first (and gets handled
+// below) or sees closed=true and returns false.
+//
+// Two post-wait paths:
+//
+//   - Goroutine never started (no offer ever succeeded, or only
+//     direct inbox injection in tests): no loop/drain ran, so call
+//     drain() here to deliver any queued items within the same
+//     bounded budget.
+//
+//   - Goroutine ran: drain() already had its budget. Anything still
+//     in the inbox is what drain() deliberately abandoned via its
+//     timeout (slow handler). Re-delivering on the way out would
+//     defeat the cap, so count those as dropped and exit. This is
+//     what makes qwpSfDispatcherDrainTimeout a hard ceiling on
+//     close() blocking time.
 func (d *qwpSfErrorDispatcher) close() {
 	if d == nil {
 		return
@@ -237,13 +248,18 @@ func (d *qwpSfErrorDispatcher) close() {
 		return
 	}
 	close(d.done)
+	started := d.started.Load()
 	d.mu.Unlock()
 	d.wg.Wait()
+	if !started {
+		d.drain()
+		return
+	}
 	for {
 		select {
 		case e := <-d.inbox:
 			if e != nil {
-				d.deliver(e)
+				d.dropped.Add(1)
 			}
 		default:
 			return
