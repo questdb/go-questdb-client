@@ -1116,18 +1116,26 @@ func TestQwpFailoverCancelDuringWalk(t *testing.T) {
 	}
 }
 
-// TestQwpComputeBackoffMonotonic pins the schedule against the Java
-// reference: 1-based attempts, double-on-each-step, capped at max.
-func TestQwpComputeBackoffMonotonic(t *testing.T) {
+// TestQwpComputeBackoffFullJitter verifies the egress backoff is
+// full-jitter [0, base) per failover.md §3.1 (Java reference
+// QwpQueryClient.java:1557-1568): the 1-based double-on-each-step
+// schedule, capped at max, sets the ceiling; the returned sleep is
+// drawn uniformly below it so co-tenants don't dial in lockstep.
+// Sampling-based — it asserts the [0, base) envelope and that the
+// draw genuinely spans it, which rules out a regression to a
+// deterministic schedule (old behaviour: always == base) or to the
+// ingress equal-jitter shape [base, 2·base).
+func TestQwpComputeBackoffFullJitter(t *testing.T) {
 	cfg := &qwpQueryClientConfig{
 		failoverBackoffInitial: 50 * time.Millisecond,
 		failoverBackoffMax:     1 * time.Second,
 	}
-	cases := []struct {
+	// base is the pre-jitter ceiling: initial doubled per step,
+	// capped at max. computeBackoff must return a draw in [0, base).
+	bases := []struct {
 		attempt int
-		want    time.Duration
+		base    time.Duration
 	}{
-		{0, 0},
 		{1, 50 * time.Millisecond},
 		{2, 100 * time.Millisecond},
 		{3, 200 * time.Millisecond},
@@ -1136,11 +1144,51 @@ func TestQwpComputeBackoffMonotonic(t *testing.T) {
 		{6, 1 * time.Second},  // capped
 		{20, 1 * time.Second}, // capped
 	}
-	for _, tc := range cases {
-		got := computeBackoff(cfg, tc.attempt)
-		if got != tc.want {
-			t.Errorf("computeBackoff(attempt=%d) = %v, want %v",
-				tc.attempt, got, tc.want)
+	const samples = 4000
+	for _, tc := range bases {
+		minSeen := tc.base
+		maxSeen := time.Duration(-1)
+		for i := 0; i < samples; i++ {
+			got := computeBackoff(cfg, tc.attempt)
+			if got < 0 || got >= tc.base {
+				t.Fatalf("computeBackoff(attempt=%d) = %v, want [0, %v)",
+					tc.attempt, got, tc.base)
+			}
+			if got < minSeen {
+				minSeen = got
+			}
+			if got > maxSeen {
+				maxSeen = got
+			}
+		}
+		// Full-jitter spans [0, base): across thousands of draws the
+		// minimum must dip below base/2 and the maximum must rise
+		// above it. This is the signature that separates full-jitter
+		// from a deterministic return (min==max==base, also caught by
+		// the envelope check) and from ingress equal-jitter
+		// [base, 2·base) (every draw would be >= base). P(all draws
+		// land on one side of base/2) ≈ 2·2^-4000, so neither bound
+		// is flaky.
+		half := tc.base / 2
+		if minSeen >= half {
+			t.Errorf("attempt=%d: min sample %v >= base/2 %v; "+
+				"expected full-jitter to dip into [0, base/2)",
+				tc.attempt, minSeen, half)
+		}
+		if maxSeen < half {
+			t.Errorf("attempt=%d: max sample %v < base/2 %v; "+
+				"expected full-jitter to reach into [base/2, base)",
+				tc.attempt, maxSeen, half)
+		}
+	}
+
+	// attempt < 1 means "no sleep before the very first try" — the
+	// caller has not yet failed an attempt, so there is nothing to
+	// back off from. Zero, never jittered.
+	for _, attempt := range []int{0, -1, -100} {
+		if got := computeBackoff(cfg, attempt); got != 0 {
+			t.Errorf("computeBackoff(attempt=%d) = %v, want 0 "+
+				"(no pre-first-try sleep)", attempt, got)
 		}
 	}
 
@@ -1148,13 +1196,28 @@ func TestQwpComputeBackoffMonotonic(t *testing.T) {
 	// `if (failoverInitialBackoffMs > 0L)` guard. Without the
 	// early return, the `d <= 0` overflow branch would fall
 	// through to max for every attempt >= 1.
-	zeroCfg := &qwpQueryClientConfig{
+	zeroInitial := &qwpQueryClientConfig{
 		failoverBackoffInitial: 0,
 		failoverBackoffMax:     1 * time.Second,
 	}
 	for _, attempt := range []int{0, 1, 2, 5, 100} {
-		if got := computeBackoff(zeroCfg, attempt); got != 0 {
+		if got := computeBackoff(zeroInitial, attempt); got != 0 {
 			t.Errorf("computeBackoff(initial=0, attempt=%d) = %v, want 0",
+				attempt, got)
+		}
+	}
+
+	// A non-positive cap collapses the schedule before the jitter
+	// draw: rand.Int63n(0) panics, so the d <= 0 guard must
+	// short-circuit to zero. With initial>0 but max=0 the doubling
+	// result always exceeds max, forcing d to the non-positive cap.
+	zeroMax := &qwpQueryClientConfig{
+		failoverBackoffInitial: 50 * time.Millisecond,
+		failoverBackoffMax:     0,
+	}
+	for _, attempt := range []int{1, 2, 5, 100} {
+		if got := computeBackoff(zeroMax, attempt); got != 0 {
+			t.Errorf("computeBackoff(max=0, attempt=%d) = %v, want 0",
 				attempt, got)
 		}
 	}

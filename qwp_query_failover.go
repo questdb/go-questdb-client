@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -540,14 +541,18 @@ func (s *qwpQuerySession) exhaustedEvent(ev qwpEvent) qwpEvent {
 	}
 }
 
-// computeBackoff is the exponential schedule from
-// QwpQueryClient.java:839-840. attempt is the 1-based count of
+// computeBackoff is the full-jitter exponential schedule from
+// QwpQueryClient.java:1557-1568. attempt is the 1-based count of
 // completed (failed) attempts at the call site — i.e. attempt=1
 // means the initial submission just failed and we are about to
-// retry for the first time. The first retry uses initial; the
-// second uses 2*initial; the schedule doubles per step until the
-// configured ceiling. attempt < 1 returns zero (no sleep before
-// the very first try).
+// retry for the first time. The base doubles per step (initial,
+// 2*initial, 4*initial, …) until the configured ceiling, then
+// full-jitter draws the actual sleep uniformly from [0, base).
+// Egress is single-user, so the lowest expected recovery time
+// wins over the reconnect-storm damping that equal-jitter buys
+// the shared ingress path (failover.md §3.1; ingress jitter in
+// qwp_sf_round_walk.go's qwpSfComputeBackoff). attempt < 1,
+// initial == 0, or a non-positive cap returns zero (no sleep).
 func computeBackoff(cfg *qwpQueryClientConfig, attempt int) time.Duration {
 	if attempt < 1 || cfg.failoverBackoffInitial == 0 {
 		return 0
@@ -560,7 +565,12 @@ func computeBackoff(cfg *qwpQueryClientConfig, attempt int) time.Duration {
 	if d <= 0 || d > cfg.failoverBackoffMax {
 		d = cfg.failoverBackoffMax
 	}
-	return d
+	if d <= 0 {
+		return 0
+	}
+	// Full-jitter: [0, base). rand.Int63n requires a positive
+	// argument; the d > 0 guard above keeps that contract.
+	return time.Duration(rand.Int63n(int64(d)))
 }
 
 // sleepInterruptible blocks for d, returning early when ctx expires
