@@ -6,17 +6,26 @@ Golang client for QuestDB's [Influx Line Protocol](https://questdb.io/docs/refer
 (ILP) over HTTP and TCP. This library makes it easy to insert data into
 [QuestDB](https://questdb.io).
 
-The library requires Go 1.19 or newer.
+The library requires Go 1.23 or newer.
 
 Features:
 * [Context](https://www.digitalocean.com/community/tutorials/how-to-use-contexts-in-go)-aware API.
 * Optimized for batch writes.
-* Supports TLS encryption and ILP authentication.
-* Automatic write retries and connection reuse for ILP over HTTP.
-* Tested against QuestDB 7.3.10 and newer versions.
+* Three transports: ILP over HTTP and TCP, plus QWP (QuestDB's binary
+  columnar protocol) over WebSocket.
+* Supports TLS encryption and authentication.
+* Automatic write retries and connection reuse for ILP over HTTP;
+  store-and-forward, reconnect, and multi-host failover for QWP.
 
 New in v4:
-* Supports n-dimensional arrays of doubles for QuestDB servers 9.0.0 and up
+* QWP WebSocket transport exposing the full QuestDB type system, with a
+  typed server-error API and multi-host failover.
+* N-dimensional arrays of doubles (QuestDB server 9.0.0 and up).
+* Fixed-width decimal columns (QuestDB server 9.2.0 and up).
+
+ILP over HTTP/TCP is compatible with QuestDB 7.3.10 and newer. The QWP
+transport, arrays, and decimals require the newer server versions noted
+above.
 
 Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4).
 
@@ -157,19 +166,26 @@ err = qwp.
 `Decimal128Column`, `Decimal256Column`, and `AtNano` (nanosecond-
 resolution designated timestamp; `At` uses microseconds).
 
-### In-flight window
+### Flush semantics and backpressure
 
-By default the QWP sender runs asynchronously with an in-flight window
-of 128 unacked batches, pipelining encoding with transmission. Set the
-window to 1 to force synchronous flushing, where every `Flush` blocks
-until the server ACKs:
+The QWP sender always pipelines encoding with transmission: a dedicated
+I/O goroutine drains a cursor engine to the WebSocket and owns reconnect
+and replay. You do not configure a pipeline depth — backpressure is
+governed by the engine's segment ring and the append deadline
+(`sf_append_deadline_millis` in store-and-forward mode), not by a
+fixed in-flight count.
 
-```go
-sender, err := qdb.LineSenderFromConf(ctx,
-    "ws::addr=localhost:9000;in_flight_window=1;")
-```
+`in_flight_window` / `qdb.WithInFlightWindow(n)` is **retained for
+backward compatibility but is a no-op** in this architecture. Connect
+strings carrying it still parse; the value is ignored.
 
-The programmatic equivalent is `qdb.WithInFlightWindow(1)`.
+`Flush` blocks until the server has ACKed everything published so far,
+preserving the Go contract that a returned `Flush` means the data is
+durable on the server. Auto-flush (triggered by row/byte/interval
+thresholds) takes a non-blocking path. For explicit ack correlation,
+`FlushAndGetSequence` returns the published FSN (the upper bound of any
+`SenderError.ToFsn` for that batch); pair it with `AwaitAckedFsn` to
+wait for the server to confirm that FSN.
 
 ### Authentication
 
@@ -181,8 +197,94 @@ qdb.LineSenderFromConf(ctx, "wss::addr=host:9000;token=<bearer>;")
 ```
 
 `LineSenderPool` is HTTP-only and cannot be used with QWP — QWP's
-in-flight window already provides pipelined concurrency from a single
-sender.
+cursor engine already pipelines transmission from a single sender.
+
+### Error handling
+
+When the server rejects a published QWP batch, the rejection surfaces
+as a `*qdb.SenderError` carrying a stable `Category`
+(`SCHEMA_MISMATCH`, `PARSE_ERROR`, `INTERNAL_ERROR`, `SECURITY_ERROR`,
+`WRITE_ERROR`, `PROTOCOL_VIOLATION`, `UNKNOWN`), the server message,
+and the `[FromFsn, ToFsn]` span — join that span against the value
+returned by `FlushAndGetSequence` to identify exactly which rows were
+rejected.
+
+There are two delivery paths, both carrying the same payload:
+
+```go
+sender, err := qdb.NewLineSender(ctx,
+    qdb.WithQwp(),
+    qdb.WithAddress("localhost:9000"),
+    // Async: dead-letter channel for DROP_AND_CONTINUE batches.
+    qdb.WithErrorHandler(func(e *qdb.SenderError) {
+        log.Printf("rejected fsn=[%d,%d] %s: %s",
+            e.FromFsn, e.ToFsn, e.Category, e.ServerMessage)
+    }),
+)
+// ...
+
+// Sync: after a HALT, the typed error surfaces on the next
+// producer-thread call (At / AtNow / Flush).
+if err := sender.Flush(ctx); err != nil {
+    var se *qdb.SenderError
+    if errors.As(err, &se) {
+        // inspect se.Category, se.ServerMessage, se.FromFsn, ...
+    }
+}
+```
+
+Each `Category` resolves to a `Policy` — `HALT` (latch the error;
+the sender does not drain further until you close and rebuild it) or
+`DROP_AND_CONTINUE` (drop the rejected span from the store and keep
+going; recover the data via the async handler). Resolution precedence,
+highest first: `WithErrorPolicyResolver` → `WithErrorPolicy(category,
+policy)` → connect-string `on_<category>_error` → connect-string
+`on_server_error` → spec defaults. `PROTOCOL_VIOLATION` and `UNKNOWN`
+are always `HALT` and cannot be overridden.
+
+The connect-string equivalents take `halt` / `drop` (and `auto` for
+the global key):
+
+```go
+qdb.LineSenderFromConf(ctx,
+    "ws::addr=localhost:9000;"+
+    "on_server_error=halt;"+        // global default
+    "on_schema_error=drop;"+        // per-category override
+    "on_write_error=drop;")
+```
+
+Per-category keys are `on_schema_error`, `on_parse_error`,
+`on_internal_error`, `on_security_error`, and `on_write_error`.
+
+### Multi-host failover
+
+`addr` accepts a comma-separated list (or repeated `addr=` keys) for
+transparent failover. The client walks the list in priority order on
+connect and reconnect; it does not shuffle or load-balance — that is
+the server-side coordinator's job.
+
+```go
+qdb.LineSenderFromConf(ctx,
+    "ws::addr=node-a:9000,node-b:9000,node-c:9000;")
+```
+
+`target` constrains which endpoints are acceptable by replicated-cluster
+role: `any` (default), `primary` (writers only — also accepts
+standalone OSS servers), or `replica`. `zone` is an opaque,
+case-insensitive locality identifier (e.g. `eu-west-1a`); when set, the
+client prefers same-zone endpoints. `zone` is effective on the query
+side; for ingestion it is silently accepted but has no effect (QWP
+ingress is zone-blind).
+
+```go
+qdb.LineSenderFromConf(ctx,
+    "ws::addr=node-a:9000,node-b:9000;target=primary;zone=eu-west-1a;")
+```
+
+The reconnect budget and backoff that govern how long failover persists
+through an outage are the `reconnect_*` and `initial_connect_retry`
+knobs documented under [QWP store-and-forward](#qwp-store-and-forward-sf)
+— they apply whether or not `sf_dir` is set.
 
 ### Querying with `QwpQueryClient`
 
