@@ -659,7 +659,7 @@ func (s *qwpLineSender) AckedFsn() int64 {
 // caller can distinguish "still in flight" from "permanently
 // failed".
 func (s *qwpLineSender) AwaitAckedFsn(ctx context.Context, target int64) error {
-	if s.closed {
+	if s.closed.Load() {
 		return errClosedSenderFlush
 	}
 	if s.cursorEngine.engineAckedFsn() >= target {

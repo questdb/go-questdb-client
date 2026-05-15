@@ -110,6 +110,11 @@ type qwpSfSegmentRing struct {
 	// fresh spare immediately. Producer-thread-only field; set once
 	// before producing starts.
 	managerWakeup func()
+	// sendLoopWakeup is invoked by the producer after every publish
+	// so an idle send loop reacts immediately instead of polling.
+	// Producer-thread-only field; set once before producing starts.
+	// nil in unit tests that drive the ring without a send loop.
+	sendLoopWakeup func()
 	// wakeupRequestedForActive coalesces multiple high-water-mark
 	// crossings into a single unpark per active segment.
 	wakeupRequestedForActive bool
@@ -362,6 +367,13 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 	fsn := r.nextSeq.Load()
 	r.nextSeq.Store(fsn + 1)
 	r.publishedFsn.Store(fsn)
+	// Ring the send loop's doorbell after publishedFsn is visible so
+	// a woken loop is guaranteed to observe this frame (the atomic
+	// store happens-before the channel send). Non-blocking and
+	// alloc-free; nil in send-loop-less unit tests.
+	if w := r.sendLoopWakeup; w != nil {
+		w()
+	}
 	return fsn
 }
 
@@ -577,6 +589,13 @@ func (r *qwpSfSegmentRing) totalSegmentBytes() int64 {
 // thread-safe.
 func (r *qwpSfSegmentRing) setManagerWakeup(wakeup func()) {
 	r.managerWakeup = wakeup
+}
+
+// setSendLoopWakeup installs the callback appendOrFsn rings after
+// every publish so the send loop drains promptly without polling.
+// Set once before producing starts; not thread-safe.
+func (r *qwpSfSegmentRing) setSendLoopWakeup(wakeup func()) {
+	r.sendLoopWakeup = wakeup
 }
 
 // needsHotSpare reports whether the segment manager should provision

@@ -163,9 +163,11 @@ func (m *qwpSfSegmentManager) segmentManagerClose() {
 		m.worker.Wait()
 		close(doneCh)
 	}()
+	graceTimer := time.NewTimer(qwpSfManagerCloseGrace)
+	defer graceTimer.Stop()
 	select {
 	case <-doneCh:
-	case <-time.After(qwpSfManagerCloseGrace):
+	case <-graceTimer.C:
 	}
 }
 

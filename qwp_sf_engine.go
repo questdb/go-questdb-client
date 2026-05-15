@@ -424,6 +424,14 @@ func (e *qwpSfCursorEngine) engineSetReconnectStatusGetter(getter func() (bool, 
 	e.reconnectStatus.Store(&getter)
 }
 
+// engineSetSendLoopWakeup wires the producer→send-loop doorbell:
+// appendOrFsn invokes fn after every publish so an idle send loop
+// reacts immediately instead of polling at parkInterval. Called once
+// by qwpSfNewSendLoop before producing starts.
+func (e *qwpSfCursorEngine) engineSetSendLoopWakeup(fn func()) {
+	e.ring.setSendLoopWakeup(fn)
+}
+
 // formatBackpressureTimeout builds the LineSenderException-equivalent
 // error returned by engineAppendBlocking when the deadline expires.
 // Per spec §16 the message MUST distinguish "publishing but slow"

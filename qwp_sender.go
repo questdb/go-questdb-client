@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"sync/atomic"
 	"time"
 )
 
@@ -335,8 +336,12 @@ type qwpLineSender struct {
 	// engine in closeCursor.
 	drainerPool *qwpSfDrainerPool
 
-	// Lifecycle.
-	closed bool
+	// Lifecycle. atomic so a contract-violating concurrent
+	// double-Close has a defined (idempotent) outcome rather than a
+	// data race that could double-close the engine's channels. The
+	// single-producer At/Flush reads are racy only under the same
+	// contract violation; the atomic load keeps them well-defined too.
+	closed atomic.Bool
 }
 
 // newQwpLineSender creates a new QWP sender backed by an
@@ -893,7 +898,7 @@ func (s *qwpLineSender) AtNano(ctx context.Context, ts time.Time) error {
 // determines the unit used to convert ts: qwpTypeTimestamp → micros,
 // qwpTypeTimestampNano → nanos.
 func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeCode qwpTypeCode) error {
-	if s.closed {
+	if s.closed.Load() {
 		return errClosedSenderAt
 	}
 
@@ -1009,7 +1014,7 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // batch. Callers wanting server-ack confirmation should pair the
 // returned FSN with AwaitAckedFsn.
 func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) {
-	if s.closed {
+	if s.closed.Load() {
 		return -1, errClosedSenderFlush
 	}
 	if s.hasTable {
@@ -1054,10 +1059,9 @@ func (s *qwpLineSender) resetAfterFlush() {
 // --- LineSender interface: Close ---
 
 func (s *qwpLineSender) Close(ctx context.Context) error {
-	if s.closed {
+	if !s.closed.CompareAndSwap(false, true) {
 		return errDoubleSenderClose
 	}
-	s.closed = true
 	// All wire I/O goes through the cursor engine + send loop,
 	// regardless of whether sf_dir was set. closeCursor drains
 	// (up to closeTimeout), stops the loop, closes the engine,

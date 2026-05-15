@@ -398,9 +398,11 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 		p.wg.Wait()
 		close(doneCh)
 	}()
+	graceTimer := time.NewTimer(qwpSfDrainerPoolCloseGrace)
+	defer graceTimer.Stop()
 	select {
 	case <-doneCh:
-	case <-time.After(qwpSfDrainerPoolCloseGrace):
+	case <-graceTimer.C:
 		p.cancel()
 		<-doneCh
 	}

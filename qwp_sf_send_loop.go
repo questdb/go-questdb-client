@@ -91,7 +91,20 @@ type qwpSfSendLoop struct {
 	// loop is the only writer (single-writer pattern).
 	transport atomic.Pointer[qwpTransport]
 
+	// parkInterval bounds how long senderLoop sleeps when the engine
+	// has no new frame. The common case is now event-driven via the
+	// wakeup doorbell; this is the defense-in-depth fallback poll, so
+	// worst-case send latency is unchanged from the pure-poll design.
 	parkInterval time.Duration
+
+	// wakeup is a single-slot doorbell rung by the producer (through
+	// the ring's sendLoopWakeup callback) after each publish so an
+	// idle senderLoop reacts immediately instead of spinning at
+	// parkInterval. Mirrors qwpSfSegmentManager.wakeup. Buffered so a
+	// publish never blocks on a busy/parked loop; extra rings
+	// coalesce into the one slot (senderLoop drains all ready frames
+	// per wake, so one token suffices for any backlog).
+	wakeup chan struct{}
 
 	// reconnectFactory is non-nil when reconnect is enabled. A nil
 	// factory makes wire failures immediately terminal (legacy,
@@ -257,13 +270,31 @@ func qwpSfNewSendLoop(
 		ctx:                     ctx,
 		cancel:                  cancel,
 		done:                    make(chan struct{}),
+		wakeup:                  make(chan struct{}, 1),
 		replayTargetFsn:         -1,
 		previousIdx:             -1,
 	}
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
 	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
 	l.transport.Store(transport)
+	// Wire the producer's per-publish doorbell. Set here (before
+	// sendLoopStart and before any producer append) so it satisfies
+	// the ring's "set once before producing starts" contract, and so
+	// every construction path — memory and SF — gets it for free.
+	engine.engineSetSendLoopWakeup(l.wakeSender)
 	return l
+}
+
+// wakeSender pushes a non-blocking token so a parked senderLoop wakes
+// on the very next iteration. Cheap; safe to call from any goroutine;
+// idempotent (multiple publishes coalesce into the single slot).
+// No-op when a token is already pending. Mirrors
+// qwpSfSegmentManager.wakeWorker.
+func (l *qwpSfSendLoop) wakeSender() {
+	select {
+	case l.wakeup <- struct{}{}:
+	default:
+	}
 }
 
 // sendLoopSetHostTracker installs the failover.md §2 host-health
@@ -687,6 +718,13 @@ func (l *qwpSfSendLoop) runOneConnection() error {
 // WebSocket binary message. Returns ctx.Err() on shutdown or the
 // transport's send error on wire failure.
 func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
+	// One reusable timer instead of a fresh time.After per idle
+	// iteration: the old form leaked a parkInterval timer per spin
+	// and, multiplied by the ~20kHz idle wake rate, cost N senders
+	// N×20kHz wakeups. The doorbell makes the common case
+	// event-driven; the timer is only the bounded fallback poll.
+	timer := time.NewTimer(l.parkInterval)
+	defer timer.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil // clean shutdown
@@ -699,10 +737,21 @@ func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
 			return err
 		}
 		if !didWork {
+			// Drain a possibly-fired timer before Reset (same
+			// dance as qwpSfSegmentManager.workerLoop). Wake on
+			// shutdown, a producer doorbell, or the fallback tick.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(l.parkInterval)
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(l.parkInterval):
+			case <-l.wakeup:
+			case <-timer.C:
 			}
 		}
 	}
