@@ -1320,6 +1320,55 @@ func TestQwpEncoderGeohashNullable(t *testing.T) {
 	}
 }
 
+func TestQwpEncoderGeohashAllNull(t *testing.T) {
+	// All-null geohash column: precision was never established.
+	// The encoder must still emit a precision in [1, 60] — the
+	// server validates it (QwpGeoHashColumnCursor.of) and rejects
+	// the whole message on 0. Mirrors the Java client clamp.
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("g", qwpTypeGeohash, true)
+	col.addNull()
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("g", qwpTypeGeohash, true)
+	col.addNull()
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	// Skip to column data.
+	off := qwpHeaderSize + 2 // +2 for empty delta symbol dictionary
+	off += 2     // table name "t"
+	off += 1     // rowCount=2
+	off += 1     // colCount=1
+	off += 1     // schemaMode=FULL
+	off += 1     // schemaId varint (0 = 1 byte)
+	off += 1 + 1 + 1 // col "g": varint(1) + "g" + type
+
+	// Null bitmap flag: 0x01 (has nulls).
+	if msg[off] != 0x01 {
+		t.Fatalf("null bitmap flag = 0x%02X, want 0x01", msg[off])
+	}
+	off++
+
+	// Null bitmap: rows 0 and 1 null → bits 0,1 → 0x03.
+	if msg[off] != 0x03 {
+		t.Fatalf("null bitmap = 0x%02X, want 0x03", msg[off])
+	}
+	off++
+
+	// Precision varint: must be 1 (minimum valid), never 0.
+	if msg[off] != 0x01 {
+		t.Fatalf("precision varint = 0x%02X, want 0x01 (server rejects 0)", msg[off])
+	}
+	off++
+
+	// No value data: valueCount == 0 for an all-null column.
+	if off != len(msg) {
+		t.Fatalf("unconsumed bytes: off=%d, len=%d", off, len(msg))
+	}
+}
+
 func TestQwpEncoderGeohashPrecision8(t *testing.T) {
 	// Precision=8 bits → exactly 1 byte per row.
 	tb := newQwpTableBuffer("t")
