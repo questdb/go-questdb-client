@@ -271,40 +271,21 @@ func qwpSfRunSingleRound(
 		attempts++
 		t, err := params.Factory(ctx, idx)
 		if err == nil && t != nil {
-			// Post-upgrade classification per failover.md §5:
-			//
-			//   - v2 with SERVER_INFO: role byte is authoritative.
-			//     Mismatch against target= → role-reject (transient if
-			//     role==PRIMARY_CATCHUP, topology otherwise — same
-			//     transient/topology split as a 421 + role reject).
-			//   - v2 with CAP_ZONE: zone_id feeds RecordZone so the
-			//     tracker's (state, zone) priority can route within
-			//     the configured `zone=` neighbourhood.
-			//   - v1 fallback (no SERVER_INFO): target=any binds; any
-			//     other target produces TopologyReject because v1
-			//     cannot supply the role byte (failover.md §5 wire-v1
-			//     row). The operator either upgrades the server to v2
-			//     or drops the target= filter.
-			if t.serverInfo != nil {
-				if t.serverInfo.ZoneId != "" {
-					params.Tracker.RecordZone(idx, t.serverInfo.ZoneId)
-				}
-				if params.Tracker.target != qwpTargetAny &&
-					!params.Tracker.target.accepts(t.serverInfo.Role) {
-					_ = t.close()
-					transient := t.serverInfo.Role == qwpRolePrimaryCatchup
-					params.Tracker.RecordRoleReject(idx, transient)
-					lastErr = fmt.Errorf(
-						"qwp/sf: target=%s rejected peer with SERVER_INFO.role=%s",
-						params.Tracker.target, qwpRoleName(t.serverInfo.Role))
-					lastWasRoleReject = true
-					continue
-				}
-			} else if params.Tracker.target != qwpTargetAny {
+			// Post-upgrade classification, failover.md §5 wire-v1
+			// row. Ingress pins QWP v1 (wire-ingress.md §3) and never
+			// reads SERVER_INFO, so the role byte is never available
+			// on this path: target=any binds; target=primary or
+			// target=replica is TopologyReject because v1 cannot
+			// supply the role byte. Zone tier, when known, comes from
+			// the 421 X-QuestDB-Zone reject path below — there is no
+			// SERVER_INFO frame on the ingress connection to read it
+			// from here.
+			if params.Tracker.target != qwpTargetAny {
 				_ = t.close()
 				params.Tracker.RecordRoleReject(idx, false)
 				lastErr = fmt.Errorf(
-					"qwp/sf: target=%s requires QWP v2+; peer negotiated v1 (no SERVER_INFO available)",
+					"qwp/sf: target=%s not honoured on the ingress path "+
+						"(QWP v1, no SERVER_INFO role byte; see wire-ingress.md §3)",
 					params.Tracker.target)
 				lastWasRoleReject = true
 				continue
