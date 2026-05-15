@@ -225,14 +225,16 @@ func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSeg
 		// open-clean-RW would truncate the user's existing active
 		// file out from under the I/O loop, scrambling the in-flight
 		// mmap.
-		minNext := qwpSfScanMaxGeneration(dir) + 1
-		for {
-			cur := m.fileGeneration.Load()
-			if cur >= minNext {
-				break
-			}
-			if m.fileGeneration.CompareAndSwap(cur, minNext) {
-				break
+		if maxGen, found := qwpSfScanMaxGeneration(dir); found {
+			minNext := maxGen + 1
+			for {
+				cur := m.fileGeneration.Load()
+				if cur >= minNext {
+					break
+				}
+				if m.fileGeneration.CompareAndSwap(cur, minNext) {
+					break
+				}
 			}
 		}
 	}
@@ -252,19 +254,18 @@ func (m *qwpSfSegmentManager) wakeWorker() {
 }
 
 // qwpSfScanMaxGeneration returns the highest hex-encoded generation
-// across sf-<gen>.sfa files in dir, or -1 if none exist. Skips files
-// that don't match the pattern (e.g. the legacy sf-initial.sfa).
-func qwpSfScanMaxGeneration(dir string) uint64 {
-	var max uint64 // 0 sentinel — we add 1 before returning, so 0+1=1 covers "none"
-	const noneSentinel uint64 = 0
+// across sf-<gen>.sfa files in dir. found is false when dir is
+// absent/unreadable or holds no matching files; maxGen is then
+// unspecified and the caller must not constrain fileGeneration. Skips
+// files that don't match the pattern (e.g. the legacy sf-initial.sfa).
+func qwpSfScanMaxGeneration(dir string) (maxGen uint64, found bool) {
 	if _, err := os.Stat(dir); err != nil {
-		return noneSentinel
+		return 0, false
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return noneSentinel
+		return 0, false
 	}
-	any := false
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasPrefix(name, "sf-") || !strings.HasSuffix(name, ".sfa") {
@@ -278,19 +279,12 @@ func qwpSfScanMaxGeneration(dir string) uint64 {
 		if err != nil {
 			continue
 		}
-		if !any || gen > max {
-			max = gen
-			any = true
+		if !found || gen > maxGen {
+			maxGen = gen
+			found = true
 		}
 	}
-	if !any {
-		// Caller adds 1 — return a value such that gen+1 == 0 isn't
-		// possible (no segment ever lands at "max + 1 == 0"). Use a
-		// negative-equivalent sentinel: return MaxUint64 so the caller's
-		// max+1 wraps to 0 (Java's "-1L + 1 == 0" semantic).
-		return ^uint64(0)
-	}
-	return max
+	return maxGen, found
 }
 
 // nextSparePath returns the next available <dir>/sf-<gen:016x>.sfa

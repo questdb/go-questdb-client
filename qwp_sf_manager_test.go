@@ -159,9 +159,9 @@ func TestQwpSfManagerRegisterAfterCloseRejects(t *testing.T) {
 
 func TestQwpSfManagerScanMaxGenerationOnEmptyDir(t *testing.T) {
 	dir := t.TempDir()
-	v := qwpSfScanMaxGeneration(dir)
-	// Sentinel: no segments → caller adds 1 to get generation 0.
-	assert.Equal(t, ^uint64(0), v)
+	_, found := qwpSfScanMaxGeneration(dir)
+	// No segments → not found; caller leaves fileGeneration unconstrained.
+	assert.False(t, found)
 }
 
 func TestQwpSfManagerScanMaxGenerationFindsHighest(t *testing.T) {
@@ -174,7 +174,8 @@ func TestQwpSfManagerScanMaxGenerationFindsHighest(t *testing.T) {
 	} {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte{}, 0o644))
 	}
-	v := qwpSfScanMaxGeneration(dir)
+	v, found := qwpSfScanMaxGeneration(dir)
+	require.True(t, found)
 	assert.Equal(t, uint64(0xc), v)
 }
 
