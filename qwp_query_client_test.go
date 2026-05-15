@@ -225,6 +225,8 @@ func TestQwpQueryClientFromConfErrors(t *testing.T) {
 		{"compression_level_too_high", "ws::addr=a:1;compression=zstd;compression_level=23;", "compression level must be in [1, 22]"},
 		{"server_info_timeout_zero", "ws::addr=a:1;server_info_timeout_ms=0;", "server_info_timeout_ms must be > 0"},
 		{"server_info_timeout_negative", "ws::addr=a:1;server_info_timeout_ms=-1;", "server_info_timeout_ms must be > 0"},
+		{"failover_max_duration_negative", "ws::addr=a:1;failover_max_duration_ms=-1;", "failover_max_duration_ms must be >= 0"},
+		{"failover_max_duration_non_numeric", "ws::addr=a:1;failover_max_duration_ms=soon;", "invalid failover_max_duration_ms"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -384,14 +386,15 @@ func TestQwpQueryClientFromConfAcceptsMultiAddress(t *testing.T) {
 // TestQwpQueryClientFromConfV2KeysParse verifies the v2 connection-
 // string keys (target, failover, failover_max_attempts,
 // failover_backoff_initial_ms, failover_backoff_max_ms,
-// server_info_timeout_ms, replay_exec) parse into the expected config
-// fields and reject malformed values with actionable errors.
+// failover_max_duration_ms, server_info_timeout_ms, replay_exec)
+// parse into the expected config fields and reject malformed values
+// with actionable errors.
 func TestQwpQueryClientFromConfV2KeysParse(t *testing.T) {
 	t.Run("happy_path", func(t *testing.T) {
 		conf := "ws::addr=a:9000;target=primary;failover=off;" +
 			"failover_max_attempts=3;failover_backoff_initial_ms=10;" +
-			"failover_backoff_max_ms=200;server_info_timeout_ms=750;" +
-			"replay_exec=on;"
+			"failover_backoff_max_ms=200;failover_max_duration_ms=1500;" +
+			"server_info_timeout_ms=750;replay_exec=on;"
 		cfg, err := parseQwpQueryConf(conf)
 		if err != nil {
 			t.Fatalf("parseQwpQueryConf: %v", err)
@@ -410,6 +413,9 @@ func TestQwpQueryClientFromConfV2KeysParse(t *testing.T) {
 		}
 		if cfg.failoverBackoffMax != 200*time.Millisecond {
 			t.Errorf("failoverBackoffMax=%v, want 200ms", cfg.failoverBackoffMax)
+		}
+		if cfg.failoverMaxDuration != 1500*time.Millisecond {
+			t.Errorf("failoverMaxDuration=%v, want 1500ms", cfg.failoverMaxDuration)
 		}
 		if cfg.serverInfoTimeout != 750*time.Millisecond {
 			t.Errorf("serverInfoTimeout=%v, want 750ms", cfg.serverInfoTimeout)
@@ -439,6 +445,29 @@ func TestQwpQueryClientFromConfV2KeysParse(t *testing.T) {
 				"failover_backoff_max_ms=10;")
 		if err == nil || !strings.Contains(err.Error(), "failover_backoff_max") {
 			t.Errorf("err=%v, want max-lt-initial error", err)
+		}
+	})
+
+	t.Run("failover_max_duration_default", func(t *testing.T) {
+		cfg, err := parseQwpQueryConf("ws::addr=a:9000;")
+		if err != nil {
+			t.Fatalf("parseQwpQueryConf: %v", err)
+		}
+		if cfg.failoverMaxDuration != qwpDefaultFailoverMaxDuration {
+			t.Errorf("failoverMaxDuration=%v, want default %v",
+				cfg.failoverMaxDuration, qwpDefaultFailoverMaxDuration)
+		}
+	})
+
+	t.Run("failover_max_duration_unbounded", func(t *testing.T) {
+		cfg, err := parseQwpQueryConf(
+			"ws::addr=a:9000;failover_max_duration_ms=0;")
+		if err != nil {
+			t.Fatalf("parseQwpQueryConf: %v", err)
+		}
+		if cfg.failoverMaxDuration != 0 {
+			t.Errorf("failoverMaxDuration=%v, want 0 (unbounded)",
+				cfg.failoverMaxDuration)
 		}
 	})
 }
@@ -657,6 +686,7 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 		WithQwpQueryTlsInsecureSkipVerify(),
 		WithQwpQueryCompression(qwpCompressionZstd),
 		WithQwpQueryCompressionLevel(9),
+		WithQwpQueryFailoverMaxDuration(7 * time.Second),
 	} {
 		opt(cfg)
 	}
@@ -692,6 +722,9 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 	}
 	if got := cfg.buildAcceptEncodingHeader(); got != "zstd;level=9,raw" {
 		t.Errorf("accept-encoding=%q", got)
+	}
+	if cfg.failoverMaxDuration != 7*time.Second {
+		t.Errorf("failoverMaxDuration=%v, want 7s", cfg.failoverMaxDuration)
 	}
 }
 

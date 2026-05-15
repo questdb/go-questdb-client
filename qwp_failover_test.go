@@ -779,6 +779,95 @@ func TestQwpFailoverRespectsMaxAttempts(t *testing.T) {
 	}
 }
 
+// TestQwpFailoverRespectsMaxDuration verifies that the wall-clock
+// failover budget (failover_max_duration_ms) ends the loop even when
+// failoverMaxAttempts is set high enough that the attempt cap would
+// never fire. Exhaustion must still surface as a typed
+// *QwpFailoverExhaustedError, and the attempt count must be far below
+// the attempt cap — proving the duration budget, not the attempt cap,
+// was the binding constraint. Mirrors Java's combined give-up test
+// (attempt >= max || now >= deadline) at QwpQueryClient.java:1541.
+func TestQwpFailoverRespectsMaxDuration(t *testing.T) {
+	// Both nodes always fail; the attempt cap is set absurdly high so
+	// only the wall-clock budget can end the loop.
+	cluster := newMockCluster(t, 2, rolesPrimaryReplicaReplica(),
+		func(idx int, m *qwpMockEgressConn) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _, _ = m.conn.Read(ctx)
+			m.conn.Close(websocket.StatusInternalError, "always fail")
+		})
+
+	cfg := qwpQueryDefaultConfig()
+	eps, _ := parseEndpointList(cluster.addrList(), qwpDefaultPort)
+	cfg.endpoints = eps
+	cfg.target = qwpTargetAny
+	cfg.serverInfoTimeout = 1 * time.Second
+	cfg.failoverEnabled = true
+	cfg.failoverMaxAttempts = 100000 // never the binding constraint
+	cfg.failoverBackoffInitial = 5 * time.Millisecond
+	cfg.failoverBackoffMax = 20 * time.Millisecond
+	cfg.failoverMaxDuration = 80 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := newQwpQueryClient(ctx, cfg)
+	if err != nil {
+		t.Fatalf("newQwpQueryClient: %v", err)
+	}
+	defer c.Close(ctx)
+
+	q := c.Query(ctx, "select 1")
+	defer q.Close()
+
+	start := time.Now()
+	var terminalErrs []error
+	for _, err := range q.Batches() {
+		if err == nil {
+			continue
+		}
+		var reset *QwpFailoverReset
+		if errors.As(err, &reset) {
+			continue
+		}
+		terminalErrs = append(terminalErrs, err)
+	}
+	elapsed := time.Since(start)
+
+	if len(terminalErrs) != 1 {
+		t.Fatalf("terminalErrors = %d, want 1: %v", len(terminalErrs), terminalErrs)
+	}
+	terminalErr := terminalErrs[0]
+	var exhausted *QwpFailoverExhaustedError
+	if !errors.As(terminalErr, &exhausted) {
+		t.Fatalf("terminal err = %v (%T), want errors.As to match *QwpFailoverExhaustedError",
+			terminalErr, terminalErr)
+	}
+	// The duration cap, not the attempt cap, must have ended the loop:
+	// attempts must be >= 1 and nowhere near failoverMaxAttempts.
+	if exhausted.Attempts < 1 || exhausted.Attempts >= cfg.failoverMaxAttempts {
+		t.Errorf("exhausted.Attempts = %d, want in [1, %d) — duration budget should bind first",
+			exhausted.Attempts, cfg.failoverMaxAttempts)
+	}
+	if exhausted.LastError == nil {
+		t.Error("exhausted.LastError = nil, want the underlying transport error")
+	}
+	if !strings.Contains(terminalErr.Error(), "failover exhausted") {
+		t.Errorf("terminal err = %q, want it to identify failover exhaustion",
+			terminalErr.Error())
+	}
+	if !strings.Contains(terminalErr.Error(), "last error:") {
+		t.Errorf("terminal err = %q, want it to include the last transport-failure message",
+			terminalErr.Error())
+	}
+	// Sanity: giving up on the wall-clock budget must be prompt, not a
+	// run through 100000 attempts. Generous bound to stay non-flaky on
+	// loaded CI while still catching a broken/missing deadline check.
+	if elapsed > 3*time.Second {
+		t.Errorf("failover took %v, want prompt give-up on the ~80ms budget", elapsed)
+	}
+}
+
 // TestQwpQueryErrorIsNotRetried verifies the kind-split contract:
 // a server-emitted QUERY_ERROR (e.g. a SQL parse error) surfaces
 // directly to the user without any failover attempt, even with

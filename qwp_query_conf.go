@@ -108,6 +108,13 @@ type qwpQueryClientConfig struct {
 	// failoverBackoffMax caps the exponential backoff. Default
 	// qwpDefaultFailoverMaxBackoff.
 	failoverBackoffMax time.Duration
+	// failoverMaxDuration is the total wall-clock cap on the per-
+	// Query/Exec failover loop. Whichever of this or
+	// failoverMaxAttempts fires first ends the loop. 0 disables the
+	// time cap (failover then bounded only by attempts). Default
+	// qwpDefaultFailoverMaxDuration; matches Java's
+	// DEFAULT_FAILOVER_MAX_DURATION_MS.
+	failoverMaxDuration time.Duration
 	// serverInfoTimeout bounds the synchronous read of SERVER_INFO
 	// after each upgrade. Egress always advertises maxVersion=v2 in
 	// the handshake, so a v2 server will emit SERVER_INFO and the
@@ -160,6 +167,10 @@ const (
 	// qwpDefaultFailoverMaxBackoff caps the exponential backoff.
 	// Java's DEFAULT_FAILOVER_MAX_BACKOFF_MS = 1000.
 	qwpDefaultFailoverMaxBackoff = 1 * time.Second
+	// qwpDefaultFailoverMaxDuration is the total wall-clock cap on the
+	// per-Query/Exec failover loop; 0 would disable the cap. Java's
+	// DEFAULT_FAILOVER_MAX_DURATION_MS = 30_000.
+	qwpDefaultFailoverMaxDuration = 30 * time.Second
 	// qwpDefaultServerInfoTimeout bounds the synchronous SERVER_INFO
 	// read after the upgrade. Java's DEFAULT_SERVER_INFO_TIMEOUT_MS =
 	// 5000.
@@ -182,6 +193,7 @@ func qwpQueryDefaultConfig() *qwpQueryClientConfig {
 		failoverMaxAttempts:    qwpDefaultFailoverMaxAttempts,
 		failoverBackoffInitial: qwpDefaultFailoverInitialBackoff,
 		failoverBackoffMax:     qwpDefaultFailoverMaxBackoff,
+		failoverMaxDuration:    qwpDefaultFailoverMaxDuration,
 		serverInfoTimeout:      qwpDefaultServerInfoTimeout,
 	}
 }
@@ -282,6 +294,11 @@ func (c *qwpQueryClientConfig) validate() error {
 		return fmt.Errorf(
 			"qwp query: failover_backoff_max (%v) must be >= failover_backoff_initial (%v)",
 			c.failoverBackoffMax, c.failoverBackoffInitial)
+	}
+	if c.failoverMaxDuration < 0 {
+		return fmt.Errorf(
+			"qwp query: failover_max_duration must be >= 0, got %v",
+			c.failoverMaxDuration)
 	}
 	if c.serverInfoTimeout <= 0 {
 		return fmt.Errorf(
@@ -491,6 +508,17 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 					"failover_backoff_max_ms must be >= 0, got %d", n)
 			}
 			cfg.failoverBackoffMax = time.Duration(n) * time.Millisecond
+		case "failover_max_duration_ms":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid failover_max_duration_ms %q: %v", v, err)
+			}
+			if n < 0 {
+				return nil, NewInvalidConfigStrError(
+					"failover_max_duration_ms must be >= 0, got %d", n)
+			}
+			cfg.failoverMaxDuration = time.Duration(n) * time.Millisecond
 		case "server_info_timeout_ms":
 			n, err := strconv.Atoi(v)
 			if err != nil {

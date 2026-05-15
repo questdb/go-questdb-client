@@ -369,6 +369,13 @@ type qwpQuerySession struct {
 	// cfg.failoverMaxAttempts.
 	attempt int
 
+	// failoverDeadline is the wall-clock cap on this Query/Exec's
+	// failover loop, stamped once at session creation (mirrors Java
+	// computing the deadline before the attempt loop,
+	// QwpQueryClient.java:1517-1528). Zero means no time cap —
+	// failover is then bounded only by cfg.failoverMaxAttempts.
+	failoverDeadline time.Time
+
 	// cancelCh is closed by requestCancel and selected on at every
 	// reconnect-and-replay boundary so the session does not start a
 	// fresh attempt after the user has asked for cancellation. A
@@ -388,6 +395,16 @@ func (s *qwpQuerySession) isCancelled() bool {
 	}
 }
 
+// failoverBudgetExpired reports whether the per-Query/Exec wall-clock
+// failover budget (failover_max_duration_ms) has elapsed. A zero
+// deadline means the budget is disabled — failover is then bounded
+// only by cfg.failoverMaxAttempts. Mirrors Java's
+// failoverMaxDurationMs == 0 → unbounded (QwpQueryClient.java:1527)
+// and the now >= deadline give-up test (QwpQueryClient.java:1541).
+func (s *qwpQuerySession) failoverBudgetExpired() bool {
+	return !s.failoverDeadline.IsZero() && !time.Now().Before(s.failoverDeadline)
+}
+
 // newQwpQuerySession allocates and returns a session bound to client.
 // The retained sql / bind payload comes from the supplied req. The
 // caller must call submit before nextEvent; submit assigns the initial
@@ -402,6 +419,14 @@ func newQwpQuerySession(client *QwpQueryClient, req qwpRequest) *qwpQuerySession
 		cancelCh:      make(chan struct{}),
 	}
 	s.currentRequestId.Store(req.requestId)
+	// Stamp the failover budget deadline once, before the first
+	// submit, mirroring Java computing failoverDeadlineNanos before
+	// the attempt loop (QwpQueryClient.java:1517-1528). A zero or
+	// negative cap leaves failoverDeadline as the zero Time, which
+	// failoverBudgetExpired treats as "no time cap".
+	if d := client.cfg.failoverMaxDuration; d > 0 {
+		s.failoverDeadline = time.Now().Add(d)
+	}
 	return s
 }
 
@@ -440,10 +465,11 @@ func (s *qwpQuerySession) requestCancel() {
 // When failover is disabled (cfg.failoverEnabled == false), the
 // original transport error is returned as-is so the caller surfaces
 // it through the usual error path. When the failover budget is
-// exhausted (s.attempt >= cfg.failoverMaxAttempts), the event is
-// wrapped into a *QwpFailoverExhaustedError so callers can errors.As
-// against the exhaustion shape and distinguish "we ran out of
-// retries" from "first attempt failed".
+// exhausted (s.attempt >= cfg.failoverMaxAttempts, or the
+// failover_max_duration_ms wall-clock budget has elapsed), the event
+// is wrapped into a *QwpFailoverExhaustedError so callers can
+// errors.As against the exhaustion shape and distinguish "we ran out
+// of retries" from "first attempt failed".
 func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	ev, err := s.client.io().takeEvent(ctx)
 	if err != nil {
@@ -460,19 +486,34 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	if !cfg.failoverEnabled {
 		return ev, nil
 	}
-	if s.attempt >= cfg.failoverMaxAttempts {
-		// Budget exhausted. Wrap the underlying transport error so
-		// callers can errors.As to *QwpFailoverExhaustedError and
-		// distinguish "we ran out of retries" from "first attempt
-		// failed". Mirrors Java's onError(INTERNAL_ERROR, "transport
-		// failure after N execute attempts ...") at
-		// QwpQueryClient.executeOnce:807-815.
+	if s.attempt >= cfg.failoverMaxAttempts || s.failoverBudgetExpired() {
+		// Budget exhausted: the attempt cap was reached or the
+		// failover_max_duration_ms wall-clock budget elapsed. Wrap the
+		// underlying transport error so callers can errors.As to
+		// *QwpFailoverExhaustedError and distinguish "we ran out of
+		// retries" from "first attempt failed". Mirrors Java's
+		// combined give-up test (attempt >= max || now >= deadline)
+		// at QwpQueryClient.java:1541, which emits one exhaustion
+		// message for both causes.
 		return s.exhaustedEvent(ev), nil
 	}
 	lastErr := fmt.Errorf("qwp query: %s", ev.errMessage)
 	failedIdx := int(s.client.currentEndpointIdx.Load())
-	// Backoff (interruptible by ctx and cancel).
+	// Backoff (interruptible by ctx and cancel), clamped so the sleep
+	// never overshoots the failover budget. Mirrors Java
+	// QwpQueryClient.java:1569-1583: after the jittered delay,
+	// recompute the remaining budget, give up if it is already spent,
+	// and otherwise shrink the sleep to what remains.
 	delay := computeBackoff(s.client.cfg, s.attempt)
+	if !s.failoverDeadline.IsZero() {
+		remaining := time.Until(s.failoverDeadline)
+		if remaining <= 0 {
+			return s.exhaustedEvent(ev), nil
+		}
+		if delay > remaining {
+			delay = remaining
+		}
+	}
 	if !sleepInterruptible(ctx, s.cancelCh, delay) || s.isCancelled() {
 		return ev, nil
 	}

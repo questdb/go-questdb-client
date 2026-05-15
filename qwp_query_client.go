@@ -369,6 +369,17 @@ func WithQwpQueryFailoverBackoff(initial, max time.Duration) QwpQueryClientOptio
 	}
 }
 
+// WithQwpQueryFailoverMaxDuration caps the total wall-clock time the
+// per-Query / Exec failover loop spends reconnecting and replaying.
+// Whichever of this or WithQwpQueryFailoverMaxAttempts fires first
+// ends the loop. 0 disables the time cap (failover then bounded only
+// by attempts). Must be >= 0; the default
+// (qwpDefaultFailoverMaxDuration = 30s) matches Java's
+// DEFAULT_FAILOVER_MAX_DURATION_MS.
+func WithQwpQueryFailoverMaxDuration(d time.Duration) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.failoverMaxDuration = d }
+}
+
 // WithQwpQueryServerInfoTimeout overrides the SERVER_INFO read
 // deadline applied during each WebSocket upgrade. Default
 // qwpDefaultServerInfoTimeout (5s) matches Java's
