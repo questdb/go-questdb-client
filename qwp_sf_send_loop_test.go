@@ -275,6 +275,78 @@ func TestQwpSfSendLoopHappyPath(t *testing.T) {
 	assert.NoError(t, loop.sendLoopCheckError())
 }
 
+// positionCursorAt walks frame headers on the unrecovered I/O
+// goroutine. A corrupt-but-positive payloadLen must be rejected with
+// an error (which both callers route through recordFatal) rather than
+// overrunning offset and panicking the next slice index — that panic
+// would crash the whole process and bypass the typed-error path.
+func TestQwpSfPositionCursorAtRejectsCorruptPayloadLen(t *testing.T) {
+	unusedFactory := func(context.Context, int) (*qwpTransport, error) {
+		return nil, errors.New("factory not used in this test")
+	}
+
+	// Build an engine with a few real frames so a segment exists with
+	// baseSeq 0 and FSNs 0..2, then corrupt the first frame's
+	// payloadLen field in place and walk past it.
+	newCorruptLoop := func(t *testing.T, corruptBytes [4]byte) *qwpSfSendLoop {
+		t.Helper()
+		engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = engine.engineClose() })
+
+		for i := 0; i < 3; i++ {
+			_, err := engine.engineAppendBlocking(context.Background(), []byte("payl"))
+			require.NoError(t, err)
+		}
+		seg := engine.engineFindSegmentContaining(0)
+		require.NotNil(t, seg)
+
+		// payloadLen of the first frame lives at
+		// [qwpSfHeaderSize+4 : qwpSfHeaderSize+8].
+		addr := seg.address()
+		plOff := qwpSfHeaderSize + 4
+		copy(addr[plOff:plOff+4], corruptBytes[:])
+
+		return qwpSfNewSendLoop(engine, nil, unusedFactory,
+			time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	}
+
+	t.Run("corrupt-but-positive payloadLen", func(t *testing.T) {
+		// 0x7FFFFFFF little-endian: positive int32, ~2 GiB stride.
+		loop := newCorruptLoop(t, [4]byte{0xFF, 0xFF, 0xFF, 0x7F})
+		// targetFsn=2 forces a multi-frame walk; pre-fix this panicked
+		// on the second iteration's out-of-bounds header read.
+		err := loop.positionCursorAt(2)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "corrupt segment")
+	})
+
+	t.Run("negative payloadLen", func(t *testing.T) {
+		// 0xFFFFFFFF little-endian: int32(-1).
+		loop := newCorruptLoop(t, [4]byte{0xFF, 0xFF, 0xFF, 0xFF})
+		err := loop.positionCursorAt(2)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "corrupt segment")
+	})
+
+	t.Run("valid walk is not a false positive", func(t *testing.T) {
+		engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = engine.engineClose() })
+
+		for i := 0; i < 3; i++ {
+			_, err := engine.engineAppendBlocking(context.Background(), []byte("payl"))
+			require.NoError(t, err)
+		}
+		loop := qwpSfNewSendLoop(engine, nil, unusedFactory,
+			time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+
+		require.NoError(t, loop.positionCursorAt(2))
+		// Two 4-byte-payload frames walked: HEADER + 2*(8+4).
+		assert.Equal(t, qwpSfHeaderSize+2*(qwpSfFrameHeaderSize+4), loop.sendOffset)
+	})
+}
+
 func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 5})
 	defer srv.Close()

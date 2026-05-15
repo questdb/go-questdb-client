@@ -488,11 +488,16 @@ func (l *qwpSfSendLoop) positionCursorForStart() error {
 // parks at the live active segment's published offset.
 //
 // Returns a non-nil error if a frame header along the walk has a
-// negative payloadLen — defense-in-depth against a corrupt segment
-// that escaped CRC recovery. Without this check the next loop step
-// would underflow offset and panic on the slice index. tryAppend
-// validates payloadLen on write and recovery's CRC scan validates
-// it on startup, so this is not expected to fire in practice.
+// payloadLen that is negative or that would push the walk past the
+// end of the segment buffer — defense-in-depth against a corrupt
+// segment that escaped CRC recovery. Without these bounds a
+// corrupt-but-positive length (e.g. 0x7FFFFFFF) would overrun offset
+// and panic on the next slice index; the panic fires on the
+// unrecovered I/O goroutine and crashes the process, bypassing
+// recordFatal. Mirrors the bound in qwpSfScanFrames. tryAppend
+// validates payloadLen on write and recovery's CRC scan validates it
+// on startup, so this is not expected to fire in practice; both
+// callers route the returned error through recordFatal.
 func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) error {
 	seg := l.engine.engineFindSegmentContaining(targetFsn)
 	if seg == nil {
@@ -509,11 +514,22 @@ func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) error {
 	offset := qwpSfHeaderSize
 	fsn := seg.segmentBaseSeq()
 	base := seg.address()
+	segLen := int64(len(base))
 	for fsn < targetFsn {
+		// Bound the header read itself: a prior corrupt stride could
+		// have left offset within the buffer but with fewer than
+		// qwpSfFrameHeaderSize bytes remaining.
+		if offset < qwpSfHeaderSize || offset+qwpSfFrameHeaderSize > segLen {
+			return fmt.Errorf("qwp/sf: frame header at offset %d overruns segment size %d baseSeq=%d (corrupt segment)",
+				offset, segLen, seg.segmentBaseSeq())
+		}
 		payloadLen := int64(int32(binary.LittleEndian.Uint32(base[offset+4 : offset+8])))
-		if payloadLen < 0 {
-			return fmt.Errorf("qwp/sf: negative payloadLen at offset %d in segment baseSeq=%d (corrupt segment)",
-				offset, seg.segmentBaseSeq())
+		// Reject negative and corrupt-but-positive lengths: a stride
+		// that runs past the buffer would panic the next iteration's
+		// slice index on the unrecovered I/O goroutine.
+		if payloadLen < 0 || offset+qwpSfFrameHeaderSize+payloadLen > segLen {
+			return fmt.Errorf("qwp/sf: invalid payloadLen %d at offset %d in segment baseSeq=%d size=%d (corrupt segment)",
+				payloadLen, offset, seg.segmentBaseSeq(), segLen)
 		}
 		offset += qwpSfFrameHeaderSize + payloadLen
 		fsn++
