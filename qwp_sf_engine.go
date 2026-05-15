@@ -78,6 +78,17 @@ type qwpSfCursorEngine struct {
 	slotLock    *qwpSfSlotLock
 	ring        *qwpSfSegmentRing
 
+	// watermark is the engine-owned mmap'd .ack-watermark file
+	// (sf-client.md §5.4). nil in memory mode and when the file
+	// could not be opened (recovery then falls back to the
+	// segment-derived lowestBase-1 seed). Lifetime is tied to the
+	// engine: opened in the constructor after the slot lock is
+	// acquired, read once to refine the recovery seed, written
+	// through by the segment manager on every tick where ackedFsn
+	// advanced, closed in engineClose AFTER the manager (the sole
+	// writer) is gone.
+	watermark *qwpSfAckWatermark
+
 	appendDeadline time.Duration
 
 	// recoveredFromDisk is true when the constructor recovered an
@@ -143,6 +154,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	var (
 		lock              *qwpSfSlotLock
 		ring              *qwpSfSegmentRing
+		watermark         *qwpSfAckWatermark
 		recoveredFromDisk bool
 		err               error
 	)
@@ -155,7 +167,13 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			return nil, err
 		}
 	}
-	cleanupLock := func() {
+	// Release order on any failure mirrors the Java reference: the
+	// watermark (its own mmap + fd) is dropped before the slot lock,
+	// so the kernel-held flock outlives every other cleanup.
+	cleanup := func() {
+		if watermark != nil {
+			_ = watermark.close()
+		}
 		if lock != nil {
 			_ = lock.close()
 		}
@@ -168,7 +186,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	if !memoryMode {
 		ring, err = qwpSfOpenRing(sfDir, segmentSizeBytes)
 		if err != nil {
-			cleanupLock()
+			cleanup()
 			return nil, err
 		}
 		recoveredFromDisk = ring != nil
@@ -190,8 +208,47 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			} else if a := ring.getActiveSegment(); a != nil {
 				lowest = a.segmentBaseSeq()
 			}
-			if lowest > 0 {
-				ring.acknowledge(lowest - 1)
+			baseSeed := lowest - 1
+			// Refine the seed with the persisted ack watermark
+			// (sf-client.md §5.4 / §6.5 / §18.1). It may carry
+			// durable-acks the previous sender — or another client
+			// whose orphan slot this drainer adopted — received for
+			// frames inside the lowest surviving sealed segment.
+			// Without honouring it those frames get re-replayed on a
+			// fresh connection, producing row-level duplicates against
+			// a still-alive server unless the table dedupes.
+			//
+			// max(watermark, lowestBase-1) absorbs both orderings of
+			// the manager's "persist then trim" tick:
+			//   - persist crashed before trim: segments still on disk
+			//     are >= lowest, watermark is correct; max picks it.
+			//   - trim ran before persist: those segments are gone so
+			//     lowestBase is higher, watermark is stale; max picks
+			//     lowestBase-1.
+			//
+			// open() returns nil on any setup failure so a missing /
+			// unmappable file never takes the engine down — we just
+			// fall back to the bare lowestBase-1 seed.
+			watermark = qwpSfAckWatermarkOpen(sfDir)
+			watermarkFsn := watermark.read() // nil-safe → INVALID
+			candidate := baseSeed
+			if watermarkFsn > candidate {
+				candidate = watermarkFsn
+			}
+			// Reject a watermark past publishedFsn: a correctly
+			// operating prior session cannot produce one, so an
+			// excess value is corruption (torn write on a non-atomic
+			// FS, bit-rot, manual edit). Trusting it would seed
+			// ackedFsn = publishedFsn after the ring's own clamp and
+			// position the cursor past every un-acked frame — silent
+			// loss of the un-acked tail. Fall back to the
+			// segment-derived seed so that tail still replays.
+			seed := candidate
+			if seed > ring.segmentRingPublishedFsn() {
+				seed = baseSeed
+			}
+			if seed >= 0 {
+				ring.acknowledge(seed)
 			}
 		}
 	}
@@ -201,18 +258,26 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		if memoryMode {
 			initial, err = qwpSfCreateInMemorySegment(0, segmentSizeBytes)
 		} else {
+			// Fresh disk slot: any stale watermark refers to a
+			// fully-drained lifecycle now gone. Unlink it before
+			// opening so the new session's first read() correctly
+			// reports INVALID (magic=0 on a freshly zero-filled
+			// file) rather than honouring an FSN with no segments
+			// behind it.
+			qwpSfAckWatermarkRemoveOrphan(sfDir)
+			watermark = qwpSfAckWatermarkOpen(sfDir)
 			initialPath = filepath.Join(sfDir, "sf-initial.sfa")
 			initial, err = qwpSfCreateSegment(initialPath, 0, segmentSizeBytes)
 		}
 		if err != nil {
-			cleanupLock()
+			cleanup()
 			return nil, err
 		}
 		ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
 	}
-	if err := mgr.segmentManagerRegister(ring, sfDir); err != nil {
+	if err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark); err != nil {
 		_ = ring.segmentRingClose()
-		cleanupLock()
+		cleanup()
 		return nil, err
 	}
 	e := &qwpSfCursorEngine{
@@ -222,6 +287,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		ownsManager:       false,
 		slotLock:          lock,
 		ring:              ring,
+		watermark:         watermark,
 		appendDeadline:    appendDeadline,
 		recoveredFromDisk: recoveredFromDisk,
 	}
@@ -385,10 +451,11 @@ func (e *qwpSfCursorEngine) formatBackpressureTimeout() error {
 // failures, since we're already on the close path.
 //
 // Order: deregister the ring from the manager (so no new spares
-// arrive), close the ring (closes its segments), close the manager
-// if we own it, unlink residual files if fully drained, release the
-// slot lock LAST (so the kernel-held flock outlives any other
-// cleanup work).
+// arrive), close the manager if we own it, close the ring (closes
+// its segments), close the ack-watermark mmap AFTER the manager (its
+// sole writer) is gone, unlink residual files + the now-meaningless
+// watermark if fully drained, release the slot lock LAST (so the
+// kernel-held flock outlives any other cleanup work).
 func (e *qwpSfCursorEngine) engineClose() error {
 	if !e.closed.CompareAndSwap(false, true) {
 		return nil
@@ -410,10 +477,25 @@ func (e *qwpSfCursorEngine) engineClose() error {
 	if err := e.ring.segmentRingClose(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	// Close the watermark mmap/fd after the manager (the sole writer
+	// through it) is gone but before the slot lock is released. With
+	// ownsManager set, segmentManagerClose above has already joined
+	// the worker goroutine, so no persistIfAdvanced can race this
+	// close; the watermark's own mutex covers the residual
+	// shared-manager (test-only) case.
+	if e.watermark != nil {
+		if err := e.watermark.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	if fullyDrained {
 		if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		// A watermark with no segments behind it would only confuse
+		// the next session's recovery seed — drop it, matching the
+		// .sfa unlink and the fresh-slot removeOrphan above.
+		qwpSfAckWatermarkRemoveOrphan(e.sfDir)
 	}
 	if e.slotLock != nil {
 		if err := e.slotLock.close(); err != nil && firstErr == nil {

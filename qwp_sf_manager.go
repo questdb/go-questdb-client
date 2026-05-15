@@ -39,7 +39,7 @@ import (
 
 // qwpSfManager defaults and constants.
 const (
-	qwpSfManagerDefaultPoll        = 1 * time.Millisecond  // poll cadence
+	qwpSfManagerDefaultPoll         = 1 * time.Millisecond // poll cadence
 	qwpSfManagerDiskFullLogThrottle = 30 * time.Second     // throttle disk-full WARNs
 	// qwpSfManagerCloseGrace bounds how long close() waits for the
 	// worker goroutine to exit cleanly. Mirrors Java's 5-second join.
@@ -71,11 +71,11 @@ type qwpSfSegmentManager struct {
 	// the counter past existing on-disk segments at register time.
 	fileGeneration atomic.Uint64
 
-	mu             sync.Mutex
-	rings          []qwpSfManagerRingEntry
-	totalBytes     int64
+	mu              sync.Mutex
+	rings           []qwpSfManagerRingEntry
+	totalBytes      int64
 	lastDiskFullLog time.Time
-	closed         bool
+	closed          bool
 
 	// wakeup is a single-slot channel. wakeWorker pushes into it
 	// non-blockingly; the worker drains in select to coalesce signals.
@@ -90,6 +90,15 @@ type qwpSfSegmentManager struct {
 type qwpSfManagerRingEntry struct {
 	ring *qwpSfSegmentRing
 	dir  string
+	// watermark is the engine-owned .ack-watermark for this slot, or
+	// nil in memory mode / when the file could not be opened. The
+	// manager writes through it on every tick where ackedFsn
+	// advanced; it never closes it (the owning engine does, in
+	// engineClose, after the manager has stopped). The pointer is
+	// copied by value into the per-tick ring snapshot, but the
+	// persist state (lastPersistedAck) lives behind the pointer on
+	// the watermark itself, so the snapshot copy is harmless.
+	watermark *qwpSfAckWatermark
 }
 
 // qwpSfNewSegmentManager constructs a manager with the given
@@ -179,19 +188,29 @@ func (m *qwpSfSegmentManager) segmentManagerDeregister(ring *qwpSfSegmentRing) {
 	}
 }
 
-// segmentManagerRegister registers a ring for ongoing spare
-// creation + trim. dir is the filesystem directory the ring's
-// segments live in — used both for creating spare files and
-// unlinking trimmed ones. The ring MUST already have its initial
-// active segment in place. Wires the ring's "I need a spare"
-// callback so the producer can preempt the polling tick.
+// segmentManagerRegister registers a ring with no ack-watermark
+// (memory mode, or callers that don't persist a watermark — chiefly
+// tests). Recovery for such a slot seeds from the segment-derived
+// lowestBase-1 only.
 func (m *qwpSfSegmentManager) segmentManagerRegister(ring *qwpSfSegmentRing, dir string) error {
+	return m.segmentManagerRegisterWithWatermark(ring, dir, nil)
+}
+
+// segmentManagerRegisterWithWatermark registers a ring for ongoing
+// spare creation + trim. dir is the filesystem directory the ring's
+// segments live in — used both for creating spare files and
+// unlinking trimmed ones. watermark (may be nil) is the slot's
+// engine-owned .ack-watermark the manager keeps current on every
+// tick; the manager never closes it. The ring MUST already have its
+// initial active segment in place. Wires the ring's "I need a spare"
+// callback so the producer can preempt the polling tick.
+func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSegmentRing, dir string, watermark *qwpSfAckWatermark) error {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return errors.New("qwp/sf: segment manager closed")
 	}
-	m.rings = append(m.rings, qwpSfManagerRingEntry{ring: ring, dir: dir})
+	m.rings = append(m.rings, qwpSfManagerRingEntry{ring: ring, dir: dir, watermark: watermark})
 	// Account for bytes the ring already owns when it joins. A
 	// recovered ring (post-restart, orphan adoption) can come up
 	// at-or-above the cap; without this seed, totalBytes stays at 0
@@ -403,7 +422,19 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 		}
 	}
 
-	// 2. Trim any segments that the ring says are fully acked. For
+	// 2. Persist the current ackedFsn to the slot's .ack-watermark
+	//    BEFORE the trim runs (sf-client.md §5.4). The ordering is
+	//    what makes recovery's max(lowestSurvivingBaseSeq-1,
+	//    watermark) clamp crash-safe in either direction: a crash
+	//    after persist but before the unlinks leaves segments on disk
+	//    with a correct watermark; a crash after the unlinks leaves a
+	//    stale-low watermark the higher lowestBase overrides. The
+	//    write is gated on advance, so a steady ackedFsn doesn't
+	//    dirty the mapped page every tick. nil watermark (memory
+	//    mode / open failed) is a no-op.
+	e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
+
+	// 3. Trim any segments that the ring says are fully acked. For
 	//    memory-mode rings, "trim" is just close (the slice is GC'd) —
 	//    no file to unlink.
 	trim := e.ring.drainTrimmable()
