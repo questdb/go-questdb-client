@@ -142,8 +142,9 @@ func TestErrorApiBuilderOption_WithErrorPolicyOverride(t *testing.T) {
 	}, 3*time.Second, 1*time.Millisecond,
 		"override SchemaMismatch=Halt should latch, but LastTerminalError stayed nil")
 
-	require.NoError(t, ls.Table("t").Int64Column("v", 2).AtNow(context.Background()))
-	err = ls.Flush(context.Background())
+	// AtNow surfaces the latched terminal error now that Table()
+	// polls the I/O loop's HALT latch on entry.
+	err = ls.Table("t").Int64Column("v", 2).AtNow(context.Background())
 	require.Error(t, err)
 	var se *SenderError
 	require.True(t, errors.As(err, &se))

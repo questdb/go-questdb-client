@@ -201,6 +201,33 @@ func TestQwpCursorSenderFlushAfterTerminalError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestQwpCursorSenderTableEntrySurfacesTerminalError verifies that
+// once the I/O loop has latched a terminal error, the next Table()
+// call latches it into s.lastErr so the user observes it at the
+// following At/AtNow instead of having to call Flush first. This
+// matches the spec contract that the producer's next API call sees
+// the latched HALT (sf-client.md §14.5).
+func TestQwpCursorSenderTableEntrySurfacesTerminalError(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusParseError})
+	defer srv.Close()
+
+	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+
+	// Push one row and Flush so the loop hits the HALT and latches.
+	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	_ = s.Flush(context.Background())
+	require.Eventually(t, func() bool {
+		return loop.sendLoopCheckError() != nil
+	}, 2*time.Second, 1*time.Millisecond)
+
+	// New row: Table() must observe the latched terminal error and
+	// arrange for it to surface at AtNow, without the user having
+	// to Flush first.
+	err := s.Table("t").Int64Column("v", 2).AtNow(context.Background())
+	require.Error(t, err, "AtNow must surface the latched terminal error from Table()")
+}
+
 // newSilentAckServer creates a fake QWP server that accepts the
 // upgrade and reads frames forever, but never sends any ACK. Used
 // by close-drain-timeout and AwaitAckedFsn tests where we need an

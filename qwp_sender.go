@@ -416,6 +416,19 @@ func (s *qwpLineSender) Table(name string) LineSender {
 	if s.lastErr != nil {
 		return s
 	}
+	// Poll the I/O loop's terminal latch at the start of a new row so a
+	// HALT surfaces on the next At/AtNow without forcing the user to
+	// Flush first. Subsequent Symbol/*Column calls short-circuit on the
+	// latched s.lastErr, preserving the fluent buffer-latch pattern.
+	// The nil guard matches the accessor pattern in qwp_sender_cursor.go
+	// and keeps the bench harness (which hand-builds a sender without
+	// an I/O loop) working.
+	if s.cursorSendLoop != nil {
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			s.lastErr = err
+			return s
+		}
+	}
 	if s.hasTable {
 		s.lastErr = fmt.Errorf("qwp: table %q already set; call At() or AtNow() to finalize the row first", s.currentTable.tableName)
 		return s

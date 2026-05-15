@@ -64,10 +64,9 @@ func TestQwpSenderLastTerminalErrorAndCounters(t *testing.T) {
 	assert.Equal(t, int(QwpStatusParseError), se.ServerStatusByte)
 	assert.GreaterOrEqual(t, s.TotalServerErrors(), int64(1))
 
-	// The next Flush returns the typed *SenderError unwrappable via
-	// errors.As.
-	require.NoError(t, s.Table("t").Int64Column("v", 2).AtNow(context.Background()))
-	err := s.Flush(context.Background())
+	// The next producer call (AtNow, after Table() polls the terminal
+	// latch) returns the typed *SenderError unwrappable via errors.As.
+	err := s.Table("t").Int64Column("v", 2).AtNow(context.Background())
 	require.Error(t, err)
 	var unwrapped *SenderError
 	require.True(t, errors.As(err, &unwrapped),
