@@ -492,6 +492,16 @@ func (r *qwpSfSegmentRing) firstSealed() *qwpSfSegment {
 	return nil
 }
 
+// sealedSegmentCount returns the number of sealed segments under the
+// ring mutex. Thread-safe sibling of getSealedSegments for callers
+// (e.g. tests) that observe the ring while the segment manager
+// concurrently trims via drainTrimmable.
+func (r *qwpSfSegmentRing) sealedSegmentCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.sealedSegments)
+}
+
 // findSegmentContaining returns the segment whose published frame
 // range covers fsn, or nil if no segment currently holds it.
 // Walks sealed first (oldest → newest) then the active.

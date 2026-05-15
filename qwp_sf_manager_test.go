@@ -78,13 +78,17 @@ func TestQwpSfManagerTrimsAckedSegments(t *testing.T) {
 		fsn := r.appendOrFsn(payload)
 		require.GreaterOrEqual(t, fsn, int64(0), "iteration %d", i)
 	}
-	require.Len(t, r.getSealedSegments(), 1)
-	sealedBefore := r.getSealedSegments()[0]
+	// The manager worker is running, so observe the ring through the
+	// lock-protected accessors (sealedSegmentCount / firstSealed), not
+	// the non-thread-safe getSealedSegments.
+	require.Equal(t, 1, r.sealedSegmentCount())
+	sealedBefore := r.firstSealed()
+	require.NotNil(t, sealedBefore)
 	r.acknowledge(sealedBefore.segmentBaseSeq() + sealedBefore.segmentFrameCount() - 1)
 
 	// Manager should pick up the trim within a few ticks.
 	require.Eventually(t, func() bool {
-		return len(r.getSealedSegments()) == 0
+		return r.sealedSegmentCount() == 0
 	}, 1*time.Second, 1*time.Millisecond)
 }
 
