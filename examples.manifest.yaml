@@ -37,3 +37,26 @@
     Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
     and [repo](https://github.com/questdb/go-questdb-client).
   conf: http::addr=localhost:9000;
+- name: qwp-ingest
+  lang: go
+  path: examples/qwp/basic/main.go
+  header: |-
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
+    and [repo](https://github.com/questdb/go-questdb-client).
+  conf: ws::addr=localhost:9000;
+- name: qwp-query
+  lang: go
+  path: examples/qwp/basic-query/main.go
+  header: |-
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
+    and [repo](https://github.com/questdb/go-questdb-client).
+  addr:
+    host: localhost
+    port: 9000
+- name: qwp-sf
+  lang: go
+  path: examples/qwp/sf/main.go
+  header: |-
+    Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
+    and [repo](https://github.com/questdb/go-questdb-client).
+  conf: ws::addr=localhost:9000;
