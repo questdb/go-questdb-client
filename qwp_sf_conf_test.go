@@ -53,7 +53,9 @@ func TestSfConfParseAcceptsAllKnobs(t *testing.T) {
 		"initial_connect_retry=on",
 		"close_flush_timeout_millis=2500",
 		"drain_orphans=on",
-		"max_background_drainers=2;",
+		"max_background_drainers=2",
+		"request_durable_ack=off",
+		"durable_ack_keepalive_interval_millis=200;",
 	}, ";"))
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp/sf", conf.sfDir)
@@ -100,6 +102,72 @@ func TestSfConfRejectsDeferredDurabilityModes(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "deferred")
 	}
+}
+
+// Durable-ack mode is a deferred opt-in feature, but sf-client.md §19
+// makes its connect-string keys normative: the parser MUST recognise
+// request_durable_ack / durable_ack_keepalive_interval_millis so a
+// user porting a Java connect string gets a clear deferred-feature
+// message, not the generic "unsupported option".
+func TestSfConfDurableAckOffParses(t *testing.T) {
+	for _, v := range []string{"off", "false"} {
+		t.Run(v, func(t *testing.T) {
+			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=" + v + ";")
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestSfConfRejectsDurableAckOptIn(t *testing.T) {
+	for _, v := range []string{"on", "true"} {
+		t.Run(v, func(t *testing.T) {
+			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=" + v + ";")
+			require.Error(t, err)
+			// Must name the feature and that it is deferred -- not the
+			// generic "unsupported option" the review flagged.
+			assert.Contains(t, err.Error(), "not implemented")
+			assert.Contains(t, err.Error(), "deferred")
+			assert.NotContains(t, err.Error(), "unsupported option")
+		})
+	}
+}
+
+func TestSfConfRejectsBadDurableAckValue(t *testing.T) {
+	_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=maybe;")
+	require.Error(t, err)
+	for _, want := range []string{"on", "off", "true", "false"} {
+		assert.Contains(t, err.Error(), want)
+	}
+}
+
+func TestSfConfRejectsDurableAckKeysOnNonQwp(t *testing.T) {
+	cases := []string{
+		"request_durable_ack=off",
+		"durable_ack_keepalive_interval_millis=200",
+	}
+	for _, schema := range []string{"http", "tcp"} {
+		for _, c := range cases {
+			t.Run(schema+"/"+c, func(t *testing.T) {
+				_, err := confFromStr(schema + "::addr=localhost:9000;" + c + ";")
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "QWP")
+			})
+		}
+	}
+}
+
+func TestSfConfDurableAckKeepaliveParses(t *testing.T) {
+	// 0 and negative mean "disabled" per sf-client.md §4.3, so any
+	// int is in range; only a non-int is rejected.
+	for _, v := range []string{"200", "0", "-1"} {
+		t.Run(v, func(t *testing.T) {
+			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;durable_ack_keepalive_interval_millis=" + v + ";")
+			require.NoError(t, err)
+		})
+	}
+	_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;durable_ack_keepalive_interval_millis=soon;")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "int")
 }
 
 func TestSfConfRejectsNegativeNumbers(t *testing.T) {

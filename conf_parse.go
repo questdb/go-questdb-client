@@ -430,6 +430,48 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 					k, parsedVal, qwpSfMinErrorInboxCapacity)
 			}
 			senderConf.errorInboxCapacity = parsedVal
+		case "request_durable_ack":
+			if senderConf.senderType != qwpSenderType {
+				// sf-client.md §4.6 mandates rejecting
+				// request_durable_ack=on on non-WebSocket transports.
+				// QWP (ws/wss) is the only WebSocket transport here, so
+				// a non-QWP sender can never honour it -- reject the key
+				// outright, consistent with every other SF key.
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "off", "false":
+				// The default. Non-durable, OK-driven trim is fully
+				// conformant (sf-client.md §9.2 / §19); nothing to wire.
+			case "on", "true":
+				// Durable-ack mode (sf-client.md §4.3 / §8.1 / §9.3 /
+				// §10 / §11) is a deferred opt-in, EE-only QoS feature:
+				// the cursor send loop OK-trims and silently ignores
+				// DURABLE_ACK frames (qwp_sf_send_loop.go). §19 makes
+				// the key normative so we accept it, but opting in is
+				// rejected with a clear deferred-feature message rather
+				// than the generic "unsupported option", mirroring
+				// sf_durability=flush.
+				return nil, NewInvalidConfigStrError(
+					"request_durable_ack=%s is not yet supported: durable-ack mode is not implemented in this client (deferred follow-up; use request_durable_ack=off)", v)
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
+			}
+		case "durable_ack_keepalive_interval_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			// Accepted for connect-string portability (sf-client.md
+			// §4.3 / §19) but inert: it only paces keepalive PINGs in
+			// durable-ack mode, which this client does not implement
+			// (see request_durable_ack). Validate the shape so a typo
+			// still errors helpfully; 0 / negative mean "disabled" per
+			// spec, so any int is in range.
+			if _, err := strconv.Atoi(v); err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
+			}
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}
