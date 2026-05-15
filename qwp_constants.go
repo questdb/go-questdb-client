@@ -155,7 +155,7 @@ const qwpVersion byte = 0x01
 const qwpCapZone uint32 = 1 << 0
 
 // qwpMaxSupportedVersion is the highest QWP protocol version this
-// client knows how to consume on the wire. Advertised in the
+// client will negotiate on the egress (query) path. Advertised in the
 // X-QWP-Max-Version handshake header; the server echoes
 // min(server_max, client_max) back as X-QWP-Version. v2 enables the
 // server to emit SERVER_INFO and the v2-only egress features (target
@@ -164,7 +164,25 @@ const qwpCapZone uint32 = 1 << 0
 // byte and the negotiated version (spec §3) — this constant only caps
 // what we will agree to negotiate to, not what we will accept on a
 // live connection.
+//
+// The ingest path uses qwpMaxSupportedIngestVersion instead: the v2
+// bump is egress-only and ingress is pinned to v1 by spec.
 const qwpMaxSupportedVersion byte = 0x02
+
+// qwpMaxSupportedIngestVersion is the highest QWP version the ingest
+// path advertises in X-QWP-Max-Version. Pinned to v1, mirroring the
+// Java reference's MAX_SUPPORTED_INGEST_VERSION: the v2 bump only adds
+// the egress-side SERVER_INFO control frame, and wire-ingress.md §3
+// fixes ingress at v1 ("Ingress clients do NOT read SERVER_INFO,
+// ignore zone advertising"). Advertising v2 here would be a spec
+// violation that is currently masked only because the server clamps
+// ingest negotiation to v1 (QwpWebSocketUpgradeProcessor: negotiated =
+// min(clientMax, MAX_SUPPORTED_INGEST_VERSION)); a server that bumps
+// its ingest ceiling would then negotiate v2 while our encoder still
+// stamps v1, and spec §3 requires it to reject every frame with
+// PARSE_ERROR. Ingress role/zone routing degrades to the wire-v1 rule
+// (target≠any → TopologyReject) in qwp_sf_round_walk.go.
+const qwpMaxSupportedIngestVersion byte = qwpVersion
 
 // QWP message header layout.
 const (

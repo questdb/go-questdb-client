@@ -1200,17 +1200,15 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,
-		// Opt into v2 negotiation so the server emits SERVER_INFO
-		// (failover.md §5). The SF round-walk consumes Role for
-		// target= filtering and ZoneId (when CAP_ZONE is set) for
-		// zone-locality routing. v1 servers downgrade
-		// transparently: SERVER_INFO is skipped, and the round-walk
-		// falls back to the wire-v1 rule (target≠any →
-		// TopologyReject). 5s is the failover.md §1 hard-coded
-		// SERVER_INFO read timeout — distinct from auth_timeout_ms
-		// which bounds only the HTTP upgrade response read.
-		maxVersion:        qwpMaxSupportedVersion,
-		serverInfoTimeout: 5 * time.Second,
+		// Ingress pins to v1 (wire-ingress.md §3, §15.5): the v2 bump
+		// is egress-only, ingress never reads SERVER_INFO, and the
+		// encoder stamps v1 frames. Advertising v2 here would be a
+		// spec violation masked only by the server clamping ingest
+		// negotiation to v1. serverInfoTimeout is left zero so the
+		// transport never attempts a SERVER_INFO read on ingest; the
+		// SF round-walk degrades target=/zone= to the wire-v1 rule
+		// (target≠any → TopologyReject) in qwp_sf_round_walk.go.
+		maxVersion: qwpMaxSupportedIngestVersion,
 	}
 	// QWP auth: Basic (username:password) or Bearer (token).
 	// Matches the Java client's buildWebSocketAuthHeader().

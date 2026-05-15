@@ -138,9 +138,14 @@ func newRoundWalkV2Server(t *testing.T, role byte, capabilities uint32, zoneId s
 	}))
 }
 
-// runWalkAgainstV2 wraps runWalkAgainst with the transport opts that
-// SF uses in production (v2 advertise + 5s SERVER_INFO timeout) so
-// the v2 server's SERVER_INFO actually gets consumed.
+// runWalkAgainstV2 forces v2 transport opts (v2 advertise + 5s
+// SERVER_INFO timeout) to exercise the round-walk's defensive v2
+// classification branch in isolation. NOTE: production ingest does
+// NOT use these opts — it pins qwpMaxSupportedIngestVersion (v1) and
+// leaves serverInfoTimeout zero (wire-ingress.md §3), so the v2
+// SERVER_INFO branch is unreachable from the real ingest sender. The
+// production-representative path is the v1 fallback exercised by the
+// TestRoundWalkV1Target* cases below.
 func runWalkAgainstV2(
 	t *testing.T,
 	endpoints []qwpEndpoint,
