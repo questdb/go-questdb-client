@@ -21,10 +21,21 @@ jobs:
           cache: true
 
       - name: Run vet
+        # Pin to the matrix-installed Go. Without this, a stray
+        # `toolchain` line re-added to go.mod by `go mod tidy` on a
+        # newer box would silently switch this job off the matrix
+        # version; `local` makes that fail loudly instead.
+        env:
+          GOTOOLCHAIN: local
         run: go vet ./...
 
       - name: Run Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 
       - name: Run tests
+        # Pin to the matrix-installed Go (see "Run vet"). The
+        # Staticcheck step deliberately omits this: staticcheck@v0.7.0
+        # needs go1.25 to build and must stay on GOTOOLCHAIN=auto.
+        env:
+          GOTOOLCHAIN: local
         run: go test -race -v ./...

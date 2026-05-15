@@ -2,8 +2,6 @@ module github.com/questdb/go-questdb-client/v4
 
 go 1.23
 
-toolchain go1.24.4
-
 require (
 	github.com/coder/websocket v1.8.14
 	github.com/klauspost/compress v1.17.0
