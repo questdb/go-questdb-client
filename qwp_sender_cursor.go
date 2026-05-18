@@ -570,10 +570,20 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 		// below is the single bounded ACK wait, governed by
 		// closeFlushTimeout. Mirrors Java's flushPendingRows() +
 		// drainOnClose() split.
-		if err := s.enqueueCursor(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		if err := s.enqueueCursor(ctx); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			// Retain-on-error: only reset the table buffers once the
+			// rows are in a segment. A failed enqueue (ring full +
+			// wire stalled, or ctx cancelled) never persisted them —
+			// resetting here would silently destroy data. SF-mode
+			// users recover the tail by reopening on the same sf_dir;
+			// memory-mode users at least see firstErr. Mirrors the
+			// autoFlush path and Java's flushPendingRows() contract.
+			s.resetAfterFlush()
 		}
-		s.resetAfterFlush()
 	}
 	// Wait for drain.
 	if s.closeTimeout > 0 {

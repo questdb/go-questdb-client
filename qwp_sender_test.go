@@ -150,6 +150,82 @@ func TestQwpSyncFlushAbsorbsStaleAck(t *testing.T) {
 	}
 }
 
+// TestQwpFlushRetainsRowsOnError is a regression test for the
+// retain-on-error contract: when flushCursor fails before the rows
+// are persisted to a segment (here: ctx cancelled, so
+// engineAppendBlocking returns ctx.Err() before assigning an FSN),
+// Flush must NOT reset the table buffers. A prior version registered
+// `defer resetAfterFlush()` ahead of the flushCursor error check,
+// silently destroying rows that were never sent anywhere. The buffer
+// must survive so a subsequent flush delivers the data.
+func TestQwpFlushRetainsRowsOnError(t *testing.T) {
+	var mu sync.Mutex
+	framesReceived := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		var seq int64
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			mu.Lock()
+			framesReceived++
+			mu.Unlock()
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+		}
+	}))
+	defer srv.Close()
+
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	if err := s.Table("t").Int64Column("x", 99).AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow: %v", err)
+	}
+	if s.pendingRowCount != 1 {
+		t.Fatalf("pendingRowCount before flush = %d, want 1", s.pendingRowCount)
+	}
+
+	// Cancelled ctx → engineAppendBlocking returns early, nothing
+	// persisted. The flush must fail and the row must be retained.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Flush(cancelled); err == nil {
+		t.Fatal("Flush with cancelled ctx: want error, got nil")
+	}
+	if s.pendingRowCount != 1 {
+		t.Fatalf("pendingRowCount after failed flush = %d, want 1 "+
+			"(row destroyed — retain-on-error contract violated)", s.pendingRowCount)
+	}
+	mu.Lock()
+	got := framesReceived
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("server received %d frames from the failed flush, want 0", got)
+	}
+
+	// The retained row must be delivered by a subsequent good flush.
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("retry Flush: %v", err)
+	}
+	if s.pendingRowCount != 0 {
+		t.Fatalf("pendingRowCount after retry flush = %d, want 0", s.pendingRowCount)
+	}
+	mu.Lock()
+	got = framesReceived
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("server received %d frames total, want exactly 1 "+
+			"(retained row not delivered, or duplicated)", got)
+	}
+}
+
 func TestQwpSenderMultipleRows(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()

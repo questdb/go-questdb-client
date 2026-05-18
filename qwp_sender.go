@@ -1032,10 +1032,19 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 		}
 		return s.cursorEngine.enginePublishedFsn(), nil
 	}
-	defer s.resetAfterFlush()
 	if err := s.flushCursor(ctx); err != nil {
+		// Retain-on-error: reset the table buffers only after the
+		// rows are safely in a segment. flushCursor returns before
+		// engineAppendBlocking assigns an FSN when the ring is full
+		// and the wire is stalled past the append deadline, or ctx
+		// is cancelled — the rows were never persisted anywhere.
+		// Resetting here would destroy them; instead they're retained
+		// for the next flush attempt (or, in SF mode, recoverable by
+		// reopening on the same sf_dir). Mirrors the autoFlush path
+		// and Java's flushPendingRows() reset-after-seal contract.
 		return -1, err
 	}
+	s.resetAfterFlush()
 	return s.cursorEngine.enginePublishedFsn(), nil
 }
 
