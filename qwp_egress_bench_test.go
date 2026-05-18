@@ -281,8 +281,7 @@ func benchEnsurePopulated(b *testing.B, table string, wantRows int, populate fun
 	}
 	if n := benchTableCount(table); n == int64(wantRows) {
 		b.Logf("%s already holds %d rows, skipping populate "+
-			"(prevents the testing framework's b.N=1 launch pass from re-seeding; "+
-			"DROP it or change QDB_BENCH_ROWS to force a reseed)", table, wantRows)
+			"(DROP it or change QDB_BENCH_ROWS to force a reseed)", table, wantRows)
 		return
 	}
 	populate()
@@ -495,6 +494,17 @@ func BenchmarkQwpEgressRead(b *testing.B) {
 	if benchEnvStr("QDB_BENCH_COMPRESSION", qwpCompressionRaw) == qwpCompressionZstd {
 		opts = append(opts, WithQwpQueryCompression(qwpCompressionZstd))
 	}
+	// Lead #2 levers, A/B'd via env: cap rows/RESULT_BATCH (fewer, larger
+	// frames → fewer goroutine handoffs) and/or enable flow-control credit.
+	if mbr := benchEnvInt(b, "QDB_BENCH_MAX_BATCH_ROWS", 0); mbr > 0 {
+		opts = append(opts, WithQwpQueryMaxBatchRows(mbr))
+	}
+	if cr := benchEnvInt(b, "QDB_BENCH_CREDIT", 0); cr > 0 {
+		opts = append(opts, WithQwpQueryInitialCredit(int64(cr)))
+	}
+	if bp := benchEnvInt(b, "QDB_BENCH_BUFPOOL", 0); bp > 0 {
+		opts = append(opts, WithQwpQueryBufferPoolSize(bp))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -504,13 +514,14 @@ func BenchmarkQwpEgressRead(b *testing.B) {
 	}
 	defer client.Close(ctx)
 
-	scanOnce := func() (rowsSeen int, bytesSeen int64, checksum int64, err error) {
+	scanOnce := func() (rowsSeen int, bytesSeen int64, checksum int64, batches int, err error) {
 		q := client.Query(ctx, "SELECT ts, id, price, sym, note FROM '"+table+"'")
 		defer q.Close()
 		for batch, e := range q.Batches() {
 			if e != nil {
-				return rowsSeen, bytesSeen, checksum, e
+				return rowsSeen, bytesSeen, checksum, batches, e
 			}
+			batches++
 			n := batch.RowCount()
 			for r := 0; r < n; r++ {
 				ts := batch.Int64(0, r)
@@ -524,22 +535,23 @@ func BenchmarkQwpEgressRead(b *testing.B) {
 			rowsSeen += n
 			bytesSeen += int64(len(batch.Payload()))
 		}
-		return rowsSeen, bytesSeen, checksum, nil
+		return rowsSeen, bytesSeen, checksum, batches, nil
 	}
 
 	// Cold warm-up (discarded): primes codec scratch + OS page cache, same
 	// as the Java bench's discarded warm-up pass.
-	if r, _, _, err := scanOnce(); err != nil {
+	if r, _, _, _, err := scanOnce(); err != nil {
 		b.Fatalf("warm-up scan: %v", err)
 	} else if r != rows {
 		b.Fatalf("warm-up scan saw %d rows, want %d (is the table fully applied?)", r, rows)
 	}
 
 	var bytesPerScan int64
+	var batchesPerScan int
 	var sink int64
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		r, bytesSeen, checksum, err := scanOnce()
+		r, bytesSeen, checksum, nb, err := scanOnce()
 		if err != nil {
 			b.Fatalf("scan %d: %v", i, err)
 		}
@@ -547,6 +559,7 @@ func BenchmarkQwpEgressRead(b *testing.B) {
 			b.Fatalf("scan %d saw %d rows, want %d", i, r, rows)
 		}
 		bytesPerScan = bytesSeen
+		batchesPerScan = nb
 		sink ^= checksum
 	}
 	b.StopTimer()
@@ -558,6 +571,14 @@ func BenchmarkQwpEgressRead(b *testing.B) {
 		b.ReportMetric(float64(rows)*float64(b.N)/elapsed, "rows/s")
 	}
 	b.ReportMetric(float64(rows), "rows/op")
+	// Frames/scan is the goroutine-handoff multiplier the wakeup-storm
+	// analysis hinges on: rows/s gated by per-frame handoffs scales with
+	// this, so it must be visible in the bench output and move under the
+	// max_batch_rows lever.
+	b.ReportMetric(float64(batchesPerScan), "batches/op")
+	b.Logf("server batching: %d batches/scan, ~%d rows/batch (max_batch_rows=%d credit=%d)",
+		batchesPerScan, rows/max(batchesPerScan, 1),
+		benchEnvInt(b, "QDB_BENCH_MAX_BATCH_ROWS", 0), benchEnvInt(b, "QDB_BENCH_CREDIT", 0))
 }
 
 // ---------------------------------------------------------------------------
