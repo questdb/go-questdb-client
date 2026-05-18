@@ -851,9 +851,13 @@ func (d *qwpQueryDecoder) parseGeohash(l *qwpColumnLayout) error {
 	if err != nil {
 		return err
 	}
-	if precBits64 > 60 {
+	// The server enforces [1, 60] on GEOLONG precision; mirror the check
+	// here so a varint that decodes out of range fails fast rather than
+	// driving a nonsense bytesPerValue into the length calculation below.
+	// Matches QwpResultBatchDecoder.java.
+	if precBits64 < 1 || precBits64 > 60 {
 		return newQwpDecodeError(fmt.Sprintf(
-			"geohash precision out of range: %d", precBits64))
+			"geohash precision out of range [1, 60]: %d", precBits64))
 	}
 	l.precisionBits = uint16(precBits64)
 	bytesPerValue := int((precBits64 + 7) / 8)
@@ -905,9 +909,14 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 		elements := int64(1)
 		for dim := 0; dim < nDims; dim++ {
 			dl := int32(binary.LittleEndian.Uint32(shapeBytes[dim*4:]))
-			if dl < 0 {
+			// Require dl >= 1 in every dimension. A dl of 0 would zero out
+			// elements and short-circuit the qwpMaxArrayElements cap for
+			// the remaining dimensions, letting them hold arbitrary values
+			// unchecked; the encoder never emits dl == 0. Matches
+			// QwpResultBatchDecoder.java.
+			if dl < 1 {
 				return newQwpDecodeError(fmt.Sprintf(
-					"ARRAY dim %d is negative: %d", dim, dl))
+					"ARRAY dim %d must be >= 1: %d", dim, dl))
 			}
 			elements *= int64(dl)
 			if elements > qwpMaxArrayElements {

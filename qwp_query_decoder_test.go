@@ -1506,6 +1506,18 @@ func TestQwpDecoderHardening(t *testing.T) {
 		assertDecodeErrContains(t, err, "ARRAY dim")
 	})
 
+	t.Run("H27b_ArrayZeroDim", func(t *testing.T) {
+		// shape[0] = 0. A zero-extent dimension would zero out the
+		// element count and short-circuit the qwpMaxArrayElements cap
+		// for any remaining dimensions. The encoder never emits dl == 0;
+		// the decoder must reject it (matches Java's dl < 1 guard).
+		frame := buildArrayHardeningFrame(t, 1, []int32{0})
+		dec := newTestQueryDecoder()
+		var b QwpColumnBatch
+		err := dec.decode(frame, &b)
+		assertDecodeErrContains(t, err, "ARRAY dim")
+	})
+
 	t.Run("H28_ArrayElementCountExceeded", func(t *testing.T) {
 		// Two dims whose product overflows qwpMaxArrayElements.
 		big := int32(1<<20 + 1)
@@ -1558,6 +1570,39 @@ func TestQwpDecoderHardening(t *testing.T) {
 		buf.WriteByte(byte(qwpTypeGeohash))
 		buf.WriteByte(0)         // null flag
 		putVarintBytes(&buf, 61) // precision > 60
+		out := buf.Bytes()
+		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
+
+		dec := newTestQueryDecoder()
+		var b QwpColumnBatch
+		err := dec.decode(out, &b)
+		assertDecodeErrContains(t, err, "geohash precision")
+	})
+
+	t.Run("H30b_GeohashPrecisionZero", func(t *testing.T) {
+		// Lower bound: precision must be >= 1. The server enforces
+		// [1, 60] on GEOLONG precision; a zero would drive
+		// bytesPerValue = 0 into the length calculation. Mirror Java's
+		// varintValue < 1 guard.
+		var buf bytes.Buffer
+		_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
+		buf.WriteByte(qwpVersion)
+		buf.WriteByte(0)
+		_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(byte(qwpMsgKindResultBatch))
+		_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
+		putVarintBytes(&buf, 0) // batch_seq
+		putVarintBytes(&buf, 0) // table_name_len
+		putVarintBytes(&buf, 0) // row_count
+		putVarintBytes(&buf, 1) // col_count
+		buf.WriteByte(byte(qwpSchemaModeFull))
+		putVarintBytes(&buf, 0) // schema_id
+		putVarintBytes(&buf, 1) // col name_len
+		buf.WriteByte('g')
+		buf.WriteByte(byte(qwpTypeGeohash))
+		buf.WriteByte(0)        // null flag
+		putVarintBytes(&buf, 0) // precision < 1
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
