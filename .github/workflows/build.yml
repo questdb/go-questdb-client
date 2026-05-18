@@ -32,6 +32,29 @@ jobs:
       - name: Run Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 
+      - name: Build bench modules
+        # bench/* are separate Go modules with their own go.mod, so
+        # the root `go vet`/`go test ./...` above never touches them.
+        # Project convention is that bench/ builds. `go mod tidy
+        # -diff` fails (with an actionable diff) on go.mod/go.sum
+        # drift — e.g. an indirect dep pulled transitively from the
+        # root via `replace => ../..` but missing from the bench
+        # go.mod; `go build ./...` then proves they compile. The loop
+        # globs bench/*/go.mod so new bench modules are auto-gated.
+        # GOTOOLCHAIN=local pins to the matrix Go (see "Run vet"); the
+        # bench go.mod `go` directive is 1.23, satisfied by both
+        # matrix versions.
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          for mod in bench/*/go.mod; do
+            dir=$(dirname "$mod")
+            echo "::group::$dir"
+            ( cd "$dir" && go mod tidy -diff && go build ./... )
+            echo "::endgroup::"
+          done
+
       - name: Run tests
         # Pin to the matrix-installed Go (see "Run vet"). The
         # Staticcheck step deliberately omits this: staticcheck@v0.7.0
