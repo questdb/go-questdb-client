@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/http"
@@ -728,8 +729,8 @@ func TestQwpFailoverRespectsMaxAttempts(t *testing.T) {
 	defer q.Close()
 
 	var (
-		resets        int
-		terminalErrs  []error
+		resets       int
+		terminalErrs []error
 	)
 	for _, err := range q.Batches() {
 		if err == nil {
@@ -1324,5 +1325,224 @@ func TestQwpComputeBackoffFullJitter(t *testing.T) {
 			t.Errorf("computeBackoff(max=0, attempt=%d) = %v, want 0",
 				attempt, got)
 		}
+	}
+}
+
+// gatedQwpServer stands up an httptest WebSocket server that negotiates
+// qwpMaxSupportedVersion and emits SERVER_INFO only after `release` is
+// closed. onReached is closed (once) the moment a connection has been
+// upgraded and is parked waiting for the gate — i.e. the client is now
+// blocked inside transport.connect()'s SERVER_INFO read, which (on the
+// failover path) means reconnectAndReplay is inside connectWalk holding
+// c.genMu. After the gate opens it answers every QUERY_REQUEST with a
+// RESULT_END so the consumer terminates cleanly, then signals onClosed
+// (once) when the client tears the connection down. The onClosed signal
+// is the leak probe: only a generation that something calls shutdown()
+// on ever closes its WebSocket.
+func gatedQwpServer(t *testing.T, nodeId string, release <-chan struct{},
+	onReached, onClosed *sync.Once, reached, closed chan struct{}) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpMaxSupportedVersion))
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		onReached.Do(func() { close(reached) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		info := buildServerInfoFrame(qwpMaxSupportedVersion, 0, qwpRolePrimary,
+			2, 0, time.Now().UnixNano(), "test-cluster", nodeId)
+		if err := conn.Write(r.Context(), websocket.MessageBinary, info); err != nil {
+			onClosed.Do(func() { close(closed) })
+			return
+		}
+		for {
+			typ, frame, err := conn.Read(r.Context())
+			if err != nil {
+				// Client tore the connection down — the generation that
+				// owns this socket had shutdown() called on it.
+				onClosed.Do(func() { close(closed) })
+				return
+			}
+			if typ != websocket.MessageBinary || len(frame) < 9 ||
+				frame[0] != byte(qwpMsgKindQueryRequest) {
+				continue
+			}
+			reqId := int64(binary.LittleEndian.Uint64(frame[1:9]))
+			end := writeQwpFrame(0, buildResultEndBody(reqId, 0, 0))
+			end[4] = qwpMaxSupportedVersion // match negotiated version
+			if err := conn.Write(r.Context(), websocket.MessageBinary, end); err != nil {
+				onClosed.Do(func() { close(closed) })
+				return
+			}
+		}
+	}))
+}
+
+// TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration is a regression
+// test for the close-vs-reconnect leak: Close() running while
+// reconnectAndReplay is mid connectWalk used to consume closeOnce
+// against the dying generation, after which reconnectAndReplay
+// published a fresh generation (reader + dispatcher + waiter goroutines
+// + a live WebSocket) that nothing ever called shutdown() on — leaked
+// for the process lifetime.
+//
+// Node A binds initially then drops the connection on the query,
+// forcing failover. Node B is the only other candidate and gates its
+// SERVER_INFO write, so the test can call Close() with the failover
+// provably parked inside connectWalk (holding c.genMu). The fix makes
+// Close take c.genMu to set closed + snapshot the bound pair, and makes
+// reconnectAndReplay refuse to publish (and self-tear-down) a
+// generation built while closing. Either way the failover target's
+// WebSocket must end up closed by the client; pre-fix it never was.
+func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
+	var (
+		bReleaseGate           = make(chan struct{})
+		bReached               = make(chan struct{})
+		bClosed                = make(chan struct{})
+		bReachedOnce, bClosed1 sync.Once
+	)
+
+	// Node A: v2 SERVER_INFO, read the QUERY_REQUEST, then drop the
+	// socket to simulate a transport-terminal fault and trigger failover.
+	nodeA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpMaxSupportedVersion))
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		info := buildServerInfoFrame(qwpMaxSupportedVersion, 0, qwpRolePrimary,
+			1, 0, time.Now().UnixNano(), "test-cluster", "node-a")
+		if err := conn.Write(r.Context(), websocket.MessageBinary, info); err != nil {
+			return
+		}
+		_, _, _ = conn.Read(r.Context()) // the QUERY_REQUEST
+		conn.Close(websocket.StatusInternalError, "simulated fault")
+	}))
+	defer nodeA.Close()
+
+	nodeB := gatedQwpServer(t, "node-b", bReleaseGate,
+		&bReachedOnce, &bClosed1, bReached, bClosed)
+	defer nodeB.Close()
+
+	cfg := qwpQueryDefaultConfig()
+	eps, err := parseEndpointList(
+		strings.TrimPrefix(nodeA.URL, "http://")+","+
+			strings.TrimPrefix(nodeB.URL, "http://"), qwpDefaultPort)
+	if err != nil {
+		t.Fatalf("parseEndpointList: %v", err)
+	}
+	cfg.endpoints = eps
+	cfg.target = qwpTargetAny
+	cfg.serverInfoTimeout = 5 * time.Second
+	cfg.failoverEnabled = true
+	cfg.failoverMaxAttempts = 3
+	cfg.failoverBackoffInitial = 1 * time.Millisecond
+	cfg.failoverBackoffMax = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	c, err := newQwpQueryClient(ctx, cfg)
+	if err != nil {
+		t.Fatalf("newQwpQueryClient: %v", err)
+	}
+	defer c.Close(ctx)
+
+	if c.CurrentEndpoint() != strings.TrimPrefix(nodeA.URL, "http://") {
+		t.Fatalf("initial bind = %s, want node A", c.CurrentEndpoint())
+	}
+
+	var qwg sync.WaitGroup
+	qwg.Add(1)
+	go func() {
+		defer qwg.Done()
+		qctx, qcancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer qcancel()
+		q := c.Query(qctx, "select 1")
+		defer q.Close()
+		for _, err := range q.Batches() {
+			if err == nil {
+				continue
+			}
+			var reset *QwpFailoverReset
+			if errors.As(err, &reset) {
+				continue // consume the new generation's frames
+			}
+			// Any terminal error (incl. the close-during-failover
+			// transport error) ends iteration — that is expected here.
+			break
+		}
+	}()
+
+	// Wait until the failover reconnect is provably parked inside
+	// connectWalk on node B (holding c.genMu), then Close from another
+	// goroutine — the exact interleaving that used to leak.
+	select {
+	case <-bReached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("failover did not reach node B")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer ccancel()
+		closeDone <- c.Close(cctx)
+	}()
+	// Best-effort nudge so Close() is blocked on c.genMu while
+	// reconnectAndReplay still holds it (the most interesting
+	// interleaving). Not a correctness requirement — every interleaving
+	// is leak-free post-fix.
+	time.Sleep(75 * time.Millisecond)
+	close(bReleaseGate)
+
+	// The leak probe: post-fix the freshly built generation is torn
+	// down (by Close's snapshot, or by reconnectAndReplay's self-
+	// teardown), so node B's WebSocket is closed by the client. Pre-fix
+	// nothing ever calls shutdown() on it and this never fires.
+	select {
+	case <-bClosed:
+	case <-time.After(6 * time.Second):
+		t.Fatal("regression: failover-target connection was never closed " +
+			"by the client — reconnectAndReplay published a generation " +
+			"that Close() leaked")
+	}
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Errorf("Close returned %v, want nil", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("Close did not return")
+	}
+
+	done := make(chan struct{})
+	go func() { qwg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatal("query goroutine did not unwind after Close")
+	}
+
+	if !c.closed.Load() {
+		t.Error("client closed flag not set after Close")
+	}
+	q := c.Query(ctx, "select 1")
+	var sawClosed bool
+	for _, err := range q.Batches() {
+		if err != nil && strings.Contains(err.Error(), "closed") {
+			sawClosed = true
+		}
+	}
+	q.Close()
+	if !sawClosed {
+		t.Error("Query after Close did not surface a closed-client error")
 	}
 }
