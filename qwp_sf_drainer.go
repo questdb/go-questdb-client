@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -235,6 +236,33 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 
 	timer := time.NewTicker(qwpSfDrainerPollInterval)
 	defer timer.Stop()
+	// No-progress watchdog. A server that completes the WS upgrade
+	// and accepts our frames but never ACKs and never drops the
+	// connection (wedged server, black-hole proxy, or a silently
+	// incompatible build that holds the socket open) keeps acked
+	// below target forever while sendLoopCheckError stays nil — the
+	// run()-level "frames sent, zero acks → terminal" heuristic only
+	// fires after the connection drops, which by definition never
+	// happens here. Without a bound the drainer spins on the poll
+	// interval forever and, on Close, exits Stopped (no .failed
+	// sentinel), so every future process start re-adopts the same
+	// wedged slot in full — an unbounded re-adoption livelock.
+	//
+	// Bound it with the same reconnectMaxDuration budget that bounds
+	// the connect round-walk (this mirrors the Java drainer's
+	// connect-phase deadline semantics — "give the cluster a budget
+	// to settle before quarantining the slot"): if acked makes no
+	// forward progress for that long while we are NOT inside a
+	// (separately bounded) reconnect, drop a .failed sentinel so the
+	// design's "bounded automatic retry, then human-in-the-loop"
+	// promise holds. A reconnect exhausting its own budget still
+	// surfaces ahead of this via sendLoopCheckError.
+	noProgressBudget := d.reconnectMaxDuration
+	if noProgressBudget <= 0 {
+		noProgressBudget = qwpSfDefaultReconnectMaxDuration
+	}
+	lastProgressAcked := engine.engineAckedFsn()
+	lastProgressAt := time.Now()
 	for {
 		acked := engine.engineAckedFsn()
 		d.ackedFsn.Store(acked)
@@ -248,6 +276,24 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		}
 		if d.stopRequested.Load() {
 			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
+			return
+		}
+		// Forward ACK progress, or being inside the separately
+		// bounded reconnect loop, resets the watchdog clock. A fresh
+		// connection thus always gets a full budget to produce its
+		// first ACK.
+		now := time.Now()
+		reconnecting, _, _ := loop.sendLoopReconnectStatus()
+		switch {
+		case acked > lastProgressAcked || reconnecting:
+			lastProgressAcked = acked
+			lastProgressAt = now
+		case now.Sub(lastProgressAt) >= noProgressBudget:
+			d.recordFailure(fmt.Sprintf(
+				"no drain progress: ackedFsn stuck at %d (target %d) for %s "+
+					"on a live connection — server accepted frames but is not "+
+					"ACKing (wedged server or incompatible build)",
+				acked, target, now.Sub(lastProgressAt)))
 			return
 		}
 		select {

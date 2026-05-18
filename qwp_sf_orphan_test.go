@@ -393,3 +393,59 @@ func TestSfConfDrainOrphansEndToEnd(t *testing.T) {
 	// At least the orphan frame must have reached the server.
 	assert.GreaterOrEqual(t, srv.totalFramesReceived.Load(), int64(1))
 }
+
+// Regression: a server that completes the WS upgrade and accepts our
+// frames but never ACKs and never drops the connection must not wedge
+// the drainer forever. Without a no-progress watchdog the drain loop
+// spins on the poll interval indefinitely; on Close it would exit
+// Stopped (no .failed sentinel), so every future process start would
+// re-adopt the same slot in full — an unbounded re-adoption livelock.
+// The watchdog must quarantine the slot with a .failed sentinel after
+// reconnectMaxDuration of zero ACK progress on a live connection.
+func TestQwpSfDrainerMarksFailedWhenConnectedButNeverAcked(t *testing.T) {
+	// silentAcks: read frames forever, never ACK, keep the
+	// connection open — exactly the wedged-but-connected scenario.
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{silentAcks: true})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+
+	// reconnectMaxDuration doubles as the no-progress budget. Keep it
+	// short so the watchdog fires quickly; the connection stays up
+	// the whole time, so the (separately bounded) reconnect path is
+	// never entered and cannot mask the watchdog.
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		nil,
+		300*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond,
+	)
+
+	done := make(chan struct{})
+	go func() {
+		drainer.drainerRun(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("drainer never terminated — no-progress watchdog missing (livelock)")
+	}
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "no drain progress")
+	// The slot now carries .sfa + .failed, so it is no longer a
+	// re-adoption candidate: a future process start won't re-adopt it.
+	assert.False(t, qwpSfIsCandidateOrphan(dir),
+		"slot must be quarantined (not a re-adoption candidate) after the watchdog fires")
+}
