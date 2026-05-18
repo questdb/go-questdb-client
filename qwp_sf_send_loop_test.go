@@ -79,6 +79,13 @@ type qwpSfTestServerOpts struct {
 	// normally. Used to model "server transient close → reconnect
 	// succeeds → next batch hits a rejection".
 	rejectFromConn int
+	// recordFrames → capture every frame's payload bytes, keyed by
+	// the connection that received it, into qwpSfTestServer. Lets a
+	// test reconstruct exactly which rows reached the server on each
+	// connection so it can assert gap-free, correctly-anchored replay
+	// after a mid-flush drop. Off by default so the other suites pay
+	// nothing for the bookkeeping.
+	recordFrames bool
 }
 
 // qwpSfTestServer is a fake QWP server for send-loop tests. It
@@ -93,6 +100,27 @@ type qwpSfTestServer struct {
 	// CloseClientConnections) do not force-close hijacked
 	// connections, so handlers select on this channel to exit.
 	kill chan struct{}
+	// framesMu guards framesByConn. One handler goroutine runs per
+	// connection; in the reconnect tests only one is live at a time,
+	// but the lock keeps the recorder correct under the shared-handler
+	// pattern regardless. Populated only when opts.recordFrames is set.
+	framesMu     sync.Mutex
+	framesByConn map[int64][]string
+}
+
+// recordedFrames returns a deep copy of the per-connection payload
+// log, keyed by the 1-based connection id (s.connCount order). Only
+// non-empty when the server was built with recordFrames:true.
+func (s *qwpSfTestServer) recordedFrames() map[int64][]string {
+	s.framesMu.Lock()
+	defer s.framesMu.Unlock()
+	out := make(map[int64][]string, len(s.framesByConn))
+	for connID, payloads := range s.framesByConn {
+		cp := make([]string, len(payloads))
+		copy(cp, payloads)
+		out[connID] = cp
+	}
+	return out
 }
 
 func newQwpSfTestServer(t *testing.T, opts qwpSfTestServerOpts) *qwpSfTestServer {
@@ -154,12 +182,25 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 		var localSeq int64
 		var localFramesReceived int
 		for {
-			_, _, err := conn.Read(context.Background())
+			_, data, err := conn.Read(context.Background())
 			if err != nil {
 				return
 			}
 			s.totalFramesReceived.Add(1)
 			localFramesReceived++
+			if opts.recordFrames {
+				// Record BEFORE the closeAfterFrames drop below: a
+				// frame the server read but never ACKed (its ACK lost
+				// to the drop) still "reached the server" — that is
+				// exactly the persisted-but-unacked row the real
+				// server dedups when replay re-sends it.
+				s.framesMu.Lock()
+				if s.framesByConn == nil {
+					s.framesByConn = make(map[int64][]string)
+				}
+				s.framesByConn[myConnID] = append(s.framesByConn[myConnID], string(data))
+				s.framesMu.Unlock()
+			}
 			// closeAfterFrames triggers ONLY on the first connection:
 			// we accept N frames and then drop. Subsequent reconnects
 			// behave normally so the loop can drain.
@@ -379,6 +420,122 @@ func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 	assert.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1))
 	// fsnAtZero should have advanced past 0 after the swap.
 	assert.Greater(t, loop.sendLoopFsnAtZero(), int64(0))
+}
+
+// TestQwpSfSendLoopReplayIsGapFree pins the single most important
+// correctness property of the cursor/SF architecture: after a
+// mid-flush connection drop, the union of frames the server receives
+// across all connections covers EVERY appended row with no gap, and
+// the post-reconnect replay is FSN-contiguous, anchored exactly at
+// the client's fsnAtZero (= engineAckedFsn()+1 at swap time).
+//
+// This is at-least-once on the wire by design — qwp-cursor-durability
+// §"Stated assumptions": "Replay-after-reconnect produces
+// duplicates", and the real server dedups by messageSequence; the
+// recovery+dedup contract is explicitly out of this repo's scope. So
+// the test deliberately *expects* duplicates and asserts none of the
+// things server-side dedup handles. It fails only on a replay GAP
+// (permanent data loss) or a MISALIGNED anchor (the client stamping a
+// messageSequence the server's dedup can't key on) — the two failure
+// modes dedup cannot paper over, and the two that are this client's
+// job to guarantee.
+//
+// Why the scenario has teeth: closeAfterFrames:5 over 10 appends
+// means the server reads f-0..f-4 on conn 1 and never sees f-5..f-9
+// on conn 1 at all. The ONLY path by which f-5..f-9 ever reach the
+// server is the post-reconnect replay, so a cursor-repositioning bug
+// that skips any of them is permanent loss that neither the global
+// frame counter nor an `ackedFsn >= 9` liveness check can detect
+// (both are driven off the same client-side FSN math the bug would
+// have corrupted). The contiguity+anchor assertion additionally
+// catches a skip of f-0..f-4 (those f-4-class frames the server DID
+// see pre-drop, so the union alone would mask their loss).
+func TestQwpSfSendLoopReplayIsGapFree(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		closeAfterFrames: 5,
+		recordFrames:     true,
+	})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	const n = 10
+	for i := 0; i < n; i++ {
+		_, err := engine.engineAppendBlocking(
+			context.Background(), []byte(fmt.Sprintf("f-%d", i)))
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= int64(n-1)
+	}, 5*time.Second, 1*time.Millisecond,
+		"loop did not drain every frame after reconnect")
+	require.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1),
+		"the mid-flush drop must have forced at least one reconnect")
+
+	frames := srv.recordedFrames()
+	require.Len(t, frames, 2,
+		"expected exactly two connections (one drop -> one reconnect)")
+	conn1, conn2 := frames[1], frames[2]
+
+	// conn 1: the server reads exactly the first five frames, in
+	// order, then drops. This is independent of how many ACKs it
+	// managed to write before dropping, so this part is race-free.
+	require.Equal(t, []string{"f-0", "f-1", "f-2", "f-3", "f-4"}, conn1,
+		"conn 1 must receive exactly the first 5 frames before the drop")
+
+	// conn 2: the replayed run. Its start depends on how many of
+	// conn 1's ACKs the receiver had processed before the drop
+	// surfaced — a benign race: fsnAtZero = engineAckedFsn()+1 at
+	// swap time, somewhere in [0,4]. Whatever that anchor is, the
+	// replay MUST begin exactly there, be strictly contiguous (no
+	// gap, no reorder), and run through the final frame. fsnAtZero
+	// and the replayed bytes derive from the same ackedFsn snapshot,
+	// so this assertion is race-robust and is precisely the
+	// wire<->messageSequence alignment server-side dedup keys on.
+	require.NotEmpty(t, conn2, "reconnect must have replayed frames")
+	fsnAtZero := loop.sendLoopFsnAtZero()
+	require.GreaterOrEqual(t, fsnAtZero, int64(0))
+	require.LessOrEqual(t, fsnAtZero, int64(4))
+	for i, got := range conn2 {
+		want := fmt.Sprintf("f-%d", fsnAtZero+int64(i))
+		require.Equalf(t, want, got,
+			"replayed frame %d not contiguous from the fsnAtZero anchor "+
+				"(gap, reorder, or misaligned messageSequence)", i)
+	}
+	require.Equalf(t, fmt.Sprintf("f-%d", n-1), conn2[len(conn2)-1],
+		"replay must run through the final frame f-%d", n-1)
+
+	// THE data-loss guard: every appended row reached the server at
+	// least once across the two connections. f-5..f-9 were never seen
+	// on conn 1, so only a correct replay puts them in this set.
+	seen := make(map[string]bool, n)
+	for _, payloads := range frames {
+		for _, p := range payloads {
+			seen[p] = true
+		}
+	}
+	for i := 0; i < n; i++ {
+		require.Truef(t, seen[fmt.Sprintf("f-%d", i)],
+			"row f-%d never reached the server — gap-free replay violated", i)
+	}
+
+	// Duplicates are expected and correct (at-least-once + server
+	// dedup). Assert at least one actually occurred so a future change
+	// that silently stopped replaying can't pass this test trivially.
+	require.Greaterf(t, srv.totalFramesReceived.Load(), int64(n),
+		"replay must re-send >=1 already-received frame (the dup the "+
+			"server dedups); got only %d total for %d rows",
+		srv.totalFramesReceived.Load(), n)
 }
 
 func TestQwpSfSendLoopServerErrorIsTerminal(t *testing.T) {
