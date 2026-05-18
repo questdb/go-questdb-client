@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 
@@ -118,6 +119,12 @@ type qwpBatchBuffer struct {
 	// io is the back-reference used by release() to return the buffer
 	// to its owning pool.
 	io *qwpEgressIO
+	// frameBuf is the recycled WS read buffer this batch's columns
+	// alias on the zero-copy raw path. Non-nil only while a raw batch
+	// is outstanding; releaseBuffer returns it to io.readBufPool and
+	// clears it. nil on the zstd path (columns alias zstdScratch) and
+	// on every error/orphan path (those let GC reclaim).
+	frameBuf *[]byte
 }
 
 // release hands the buffer back to the I/O goroutine's free pool. Safe
@@ -197,6 +204,16 @@ type qwpEgressIO struct {
 	// before decoding a RESULT_BATCH; the user returns it via
 	// release() after processing. Capacity == bufferPoolSize.
 	buffers chan *qwpBatchBuffer
+
+	// readBufPool recycles the raw WS frame byte buffers the reader
+	// reads each message into. Replaces a per-frame io.ReadAll
+	// allocation inside coder/websocket.Conn.Read (the dominant
+	// egress allocation source). Holds *[]byte so the grown capacity
+	// survives reuse. sync.Pool (not a sized chan) keeps the
+	// prototype's ownership surface small: only the steady-state raw
+	// RESULT_BATCH path recycles; every error/orphan path simply
+	// drops its buffer and lets GC reclaim, which sync.Pool tolerates.
+	readBufPool sync.Pool
 
 	// events carries all outbound events to the consumer. Capacity ==
 	// bufferPoolSize+2 so a trailing End/Error after every buffered
@@ -298,7 +315,12 @@ type qwpEgressIO struct {
 // are dropped inside the reader.
 type qwpReaderEvent struct {
 	payload []byte
-	err     error
+	// bufRef is the pooled buffer that backs payload, or nil for an
+	// error event / a payload not drawn from io.readBufPool. The
+	// dispatcher either hands it to the batch buffer (raw path, freed
+	// at releaseBuffer) or returns it to the pool immediately.
+	bufRef *[]byte
+	err    error
 }
 
 // newQwpEgressIO constructs an I/O controller attached to an already-
@@ -320,6 +342,10 @@ func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
 		ioCancel:   ioCancel,
 		shutdownCh: make(chan struct{}),
 		doneCh:     make(chan struct{}),
+	}
+	io.readBufPool.New = func() any {
+		b := make([]byte, 0, 64*1024)
+		return &b
 	}
 	io.cancelRequestId.Store(-1)
 	io.currentRequestId = -1
@@ -435,6 +461,16 @@ func (io *qwpEgressIO) requestCancel(requestId int64) {
 // handler is done with it. Must be called exactly once per KIND_BATCH
 // event. Non-blocking.
 func (io *qwpEgressIO) releaseBuffer(buf *qwpBatchBuffer) {
+	// Recycle the raw frame buffer this batch aliased (raw path only;
+	// nil on zstd / error paths). Safe here: the io.events send/recv
+	// that delivered buf, and the io.buffers handoff that precedes the
+	// next decode into it, serialize all access to buf.frameBuf, so
+	// this never races the dispatcher. Done before the closed check so
+	// the buffer is reclaimed even on a late release after shutdown.
+	if fb := buf.frameBuf; fb != nil {
+		buf.frameBuf = nil
+		io.readBufPool.Put(fb)
+	}
 	if io.closed.Load() {
 		// I/O goroutine is gone; the buffer's backing []byte will be
 		// reclaimed by Go's GC once the user drops their reference.
@@ -496,20 +532,61 @@ func (io *qwpEgressIO) notify() {
 	}
 }
 
+// qwpReadFrameInto reads one complete WebSocket message from r into the
+// recycled buffer *pb, reusing its capacity across frames (the whole
+// point of the pool — it replaces coder/websocket.Conn.Read's per-frame
+// io.ReadAll). It doubles *pb when a frame exceeds the current capacity
+// and writes the grown slice back so the larger capacity persists for
+// the next reuse. coder/websocket requires the message reader be drained
+// to io.EOF.
+func qwpReadFrameInto(r io.Reader, pb *[]byte) ([]byte, error) {
+	b := (*pb)[:0]
+	for {
+		if len(b) == cap(b) {
+			nc := cap(b) * 2
+			if nc < 64*1024 {
+				nc = 64 * 1024
+			}
+			nb := make([]byte, len(b), nc)
+			copy(nb, b)
+			b = nb
+		}
+		n, err := r.Read(b[len(b):cap(b)])
+		b = b[:len(b)+n]
+		if errors.Is(err, io.EOF) {
+			*pb = b
+			return b, nil
+		}
+		if err != nil {
+			*pb = b
+			return nil, err
+		}
+	}
+}
+
+// qwpSameBacking reports whether a and b share a backing array. Used to
+// distinguish the zero-copy raw decode path (batch columns alias the
+// frame buffer) from the zstd path (they alias the batch's own
+// zstdScratch). Robust across buffer reuse, unlike a zstdScratch-length
+// probe, since zstdScratch persists on a recycled qwpBatchBuffer.
+func qwpSameBacking(a, b []byte) bool {
+	return len(a) > 0 && len(b) > 0 && &a[0] == &b[0]
+}
+
 // readerRun is the reader goroutine's top-level loop. It does nothing
 // but pull binary frames off the WebSocket and hand them to the
 // dispatcher via frameCh. Never looks at cancel / credit / user state
 // — kept minimal so a blocked Read stays out of the dispatch-side
 // fast path.
 //
-// Exits when either (a) conn.Read returns an error (server close,
+// Exits when either (a) conn.Reader returns an error (server close,
 // malformed frame, or shutdown-cancelled readCtx), or (b) the
 // dispatcher is shut down. Closes frameCh on the way out so the
 // dispatcher's select sees EOF.
 func (io *qwpEgressIO) readerRun() {
 	defer close(io.frameCh)
 	for {
-		msgType, data, err := io.transport.conn.Read(io.ioCtx)
+		msgType, r, err := io.transport.conn.Reader(io.ioCtx)
 		if err != nil {
 			select {
 			case io.frameCh <- qwpReaderEvent{err: err}:
@@ -517,14 +594,26 @@ func (io *qwpEgressIO) readerRun() {
 			}
 			return
 		}
+		pb := io.readBufPool.Get().(*[]byte)
+		payload, rerr := qwpReadFrameInto(r, pb)
+		if rerr != nil {
+			io.readBufPool.Put(pb)
+			select {
+			case io.frameCh <- qwpReaderEvent{err: rerr}:
+			case <-io.shutdownCh:
+			}
+			return
+		}
 		if msgType != websocket.MessageBinary {
 			// Tolerate stray text frames (keep-alives from misbehaving
 			// proxies) — same policy as readAck.
+			io.readBufPool.Put(pb)
 			continue
 		}
 		select {
-		case io.frameCh <- qwpReaderEvent{payload: data}:
+		case io.frameCh <- qwpReaderEvent{payload: payload, bufRef: pb}:
 		case <-io.shutdownCh:
+			io.readBufPool.Put(pb)
 			return
 		}
 	}
@@ -637,7 +726,7 @@ func (io *qwpEgressIO) receiveLoop() {
 				io.currentQueryDone = true
 				return
 			}
-			io.dispatchFrame(ev.payload)
+			io.dispatchFrame(ev)
 		}
 	}
 }
@@ -645,7 +734,8 @@ func (io *qwpEgressIO) receiveLoop() {
 // dispatchFrame routes a received frame to the matching decoder method
 // and emits the resulting event. Sets currentQueryDone on terminal
 // frames (End / ExecDone / Error) so the receive loop exits.
-func (io *qwpEgressIO) dispatchFrame(payload []byte) {
+func (io *qwpEgressIO) dispatchFrame(ev qwpReaderEvent) {
+	payload := ev.payload
 	kind, err := qwpPeekMsgKind(payload)
 	if err != nil {
 		// Header parse failure — we have no trustworthy framing, so
@@ -656,7 +746,7 @@ func (io *qwpEgressIO) dispatchFrame(payload []byte) {
 	}
 	switch kind {
 	case qwpMsgKindResultBatch:
-		io.handleResultBatch(payload)
+		io.handleResultBatch(payload, ev.bufRef)
 	case qwpMsgKindResultEnd:
 		io.handleResultEnd(payload)
 	case qwpMsgKindQueryError:
@@ -678,7 +768,7 @@ func (io *qwpEgressIO) dispatchFrame(payload []byte) {
 // and emits a batch event. Blocks on the pool when full. The select
 // also watches shutdown + notify so a user-initiated cancel still
 // reaches the wire while we wait for the handler to free up a buffer.
-func (io *qwpEgressIO) handleResultBatch(payload []byte) {
+func (io *qwpEgressIO) handleResultBatch(payload []byte, bufRef *[]byte) {
 	var buf *qwpBatchBuffer
 	for buf == nil {
 		select {
@@ -713,6 +803,21 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte) {
 		return
 	}
 	buf.payloadLen = len(payload)
+	if bufRef != nil && qwpSameBacking(payload, buf.batch.payload) {
+		// Raw (non-zstd) path: decode() left the batch's column slices
+		// aliasing our pooled frame buffer, so it must stay intact
+		// until the user is done. Hand ownership to the batch buffer;
+		// releaseBuffer returns it to readBufPool.
+		buf.frameBuf = bufRef
+	} else {
+		// zstd path: columns alias buf.batch.zstdScratch, so the frame
+		// buffer is dead the moment decode() returns — recycle now.
+		// (Also the defensive no-ref case: nothing to recycle.)
+		if bufRef != nil {
+			io.readBufPool.Put(bufRef)
+		}
+		buf.frameBuf = nil
+	}
 
 	select {
 	case <-io.shutdownCh:
