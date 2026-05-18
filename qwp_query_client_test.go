@@ -63,6 +63,37 @@ func TestQwpQueryClientFromConfHappyPath(t *testing.T) {
 				if c.bufferPoolSize != qwpDefaultEgressBufferPoolSize {
 					t.Errorf("bufferPoolSize=%d", c.bufferPoolSize)
 				}
+				// zone defaults to unset (zone-blind) and
+				// auth_timeout_ms to the shared 15s default so a
+				// connect string omitting them behaves like the
+				// ingest client.
+				if c.zone != "" {
+					t.Errorf("zone=%q, want empty (zone-blind default)", c.zone)
+				}
+				if c.authTimeoutMs != qwpDefaultAuthTimeoutMs {
+					t.Errorf("authTimeoutMs=%d, want %d",
+						c.authTimeoutMs, qwpDefaultAuthTimeoutMs)
+				}
+			},
+		},
+		{
+			// failover.md §1.1 common keys: a connect string shared
+			// verbatim with the ingest client must parse here too
+			// (the ingest side accepts both; the query side is where
+			// zone= is actually effective).
+			name: "zone_and_auth_timeout",
+			conf: "ws::addr=db.example:9000;zone=eu-west-1a;" +
+				"auth_timeout_ms=2500;target=replica;",
+			chk: func(t *testing.T, c *qwpQueryClientConfig) {
+				if c.zone != "eu-west-1a" {
+					t.Errorf("zone=%q, want eu-west-1a", c.zone)
+				}
+				if c.authTimeoutMs != 2500 {
+					t.Errorf("authTimeoutMs=%d, want 2500", c.authTimeoutMs)
+				}
+				if c.target != qwpTargetReplica {
+					t.Errorf("target=%v, want replica", c.target)
+				}
 			},
 		},
 		{
@@ -227,6 +258,9 @@ func TestQwpQueryClientFromConfErrors(t *testing.T) {
 		{"server_info_timeout_negative", "ws::addr=a:1;server_info_timeout_ms=-1;", "server_info_timeout_ms must be > 0"},
 		{"failover_max_duration_negative", "ws::addr=a:1;failover_max_duration_ms=-1;", "failover_max_duration_ms must be >= 0"},
 		{"failover_max_duration_non_numeric", "ws::addr=a:1;failover_max_duration_ms=soon;", "invalid failover_max_duration_ms"},
+		{"auth_timeout_non_numeric", "ws::addr=a:1;auth_timeout_ms=soon;", "invalid auth_timeout_ms"},
+		{"auth_timeout_zero", "ws::addr=a:1;auth_timeout_ms=0;", "auth_timeout_ms must be > 0"},
+		{"auth_timeout_negative", "ws::addr=a:1;auth_timeout_ms=-1;", "auth_timeout_ms must be > 0"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -291,10 +325,12 @@ func TestQwpQueryClientFromConfPortBoundaries(t *testing.T) {
 //   - bracketed with port:    [::1]:9000
 //   - bracketed without port: [fe80::1]
 //   - bare IPv6 (>= 2 colons): fe80::1 (no port; brackets required for port)
+//
 // And rejects:
 //   - empty bracketed host:   [] :9000
 //   - missing closing ']':    [::1:9000
 //   - trailing garbage after ']': [::1]9000
+//
 // Mirrors the Java QwpQueryClientFromConfigTest IPv6 cases. The Go
 // client targets a single endpoint; the comma-separated multi-address
 // form Java accepts is rejected up front (see TestRejectsMultiAddress).

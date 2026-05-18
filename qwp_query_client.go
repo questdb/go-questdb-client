@@ -82,10 +82,21 @@ type QwpQueryClient struct {
 	// after the mutex is released.
 	genMu sync.Mutex
 
+	// hostTracker is the failover.md §2 host-health / zone tracker
+	// shared by the initial connect and every failover reconnect. It
+	// drives endpoint selection via the (state, zone) priority lattice
+	// — the `zone=` locality hint is effective here (the SF ingress
+	// tracker is zone-blind by contrast). Constructed once in
+	// newQwpQueryClient and never replaced; its state (sticky-Healthy,
+	// topology classifications) deliberately persists across
+	// reconnects for the client's lifetime. Thread-safe internally.
+	hostTracker *qwpHostTracker
+
 	// currentEndpointIdx tracks the index in cfg.endpoints currently
 	// bound. -1 before construction completes, set by connectWalk and
 	// updated by reconnectAndReplay. Read by the failover orchestrator
-	// to skip the failed endpoint on the next walk.
+	// to feed RecordMidStreamFailure with the just-failed index before
+	// the reconnect walk.
 	currentEndpointIdx atomic.Int32
 	// serverInfo holds the SERVER_INFO from the bound generation.
 	// Nil on v1 connections. Written by connectWalk and
@@ -398,6 +409,30 @@ func WithQwpQueryServerInfoTimeout(d time.Duration) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.serverInfoTimeout = d }
 }
 
+// WithQwpQueryZone sets the client's opaque, case-insensitive
+// locality hint (failover.md §1.1). When set and target != primary,
+// the connect/reconnect walk prefers endpoints whose server-advertised
+// zone (SERVER_INFO.zone_id under CAP_ZONE, or the X-QuestDB-Zone
+// header on a 421 reject) matches, via the (state, zone) priority
+// lattice. Empty (the default) is zone-blind. Mirrors the ingest
+// WithQwpZone / zone= key so a connect string can be shared verbatim.
+func WithQwpQueryZone(zone string) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.zone = zone }
+}
+
+// WithQwpQueryAuthTimeout overrides the per-host upgrade-response-read
+// bound (failover.md §1.1). It bounds only the wait between writing
+// the WebSocket upgrade request and reading the response headers — not
+// TCP connect, TLS handshake, or the SERVER_INFO read (see
+// WithQwpQueryServerInfoTimeout). Must be > 0; the default
+// (qwpDefaultAuthTimeoutMs = 15s) matches the ingest client and Java.
+// Sub-millisecond durations round down and are rejected by validate().
+func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) {
+		c.authTimeoutMs = int(d.Milliseconds())
+	}
+}
+
 // WithQwpQueryReplayExec opts Exec into transparent replay on
 // transport-terminal failure. Default false because non-idempotent
 // statements (INSERT / UPDATE / DELETE / DDL) might double-execute
@@ -462,10 +497,20 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 	c := &QwpQueryClient{
 		cfg:           cfg,
 		nextRequestId: 1, // match Java's QwpQueryClient.nextRequestId initial value
+		// Fresh tracker: every host starts Unknown with attempted=false,
+		// so the first PickNext sweep walks the addr= list in order
+		// (failover.md §2 selection priority — ties break on the
+		// user-supplied order). zone= and target= shape the (state,
+		// zone) lattice from here on. Mirrors Java connect()'s
+		// hostTracker==null branch (no BeginRound on a fresh tracker).
+		hostTracker: newQwpHostTracker(len(cfg.endpoints), cfg.zone, cfg.target),
 	}
 	c.currentEndpointIdx.Store(-1)
 
-	result, err := connectWalk(ctx, cfg, -1, nil)
+	// allowFallthroughReset=false: initial connect probes each endpoint
+	// exactly once (Java connect() parity), no re-sweep on a uniformly
+	// rejecting cluster.
+	result, err := connectWalk(ctx, cfg, c.hostTracker, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -482,13 +527,17 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 var errClosedDuringFailover = errors.New(
 	"qwp query: client closed during failover")
 
-// reconnectAndReplay tears down the current generation, walks the
-// endpoint list (skipping the just-failed index), publishes the new
-// generation, and resubmits the in-flight query with a fresh
-// requestId. Returns the new generation's QwpServerInfo (nil for v1)
-// or a non-nil error if the walk fails. Holds c.genMu for the
-// duration of the swap so two concurrent transport faults serialise
-// and so a concurrent Close cannot interleave with the swap.
+// reconnectAndReplay tears down the current generation, demotes the
+// just-failed endpoint and walks the host tracker by (state, zone)
+// priority (failover.md §2; the demoted host drops to TransportError
+// so a healthier or same-zone peer is preferred, but it stays a
+// candidate and is retried if nothing better binds — including the
+// n=1 case), publishes the new generation, and resubmits the
+// in-flight query with a fresh requestId. Returns the new
+// generation's QwpServerInfo (nil for v1) or a non-nil error if the
+// walk fails. Holds c.genMu for the duration of the swap so two
+// concurrent transport faults serialise and so a concurrent Close
+// cannot interleave with the swap.
 //
 // Close coordination: Close sets c.closed and snapshots the bound
 // generation under c.genMu. Because this function holds c.genMu for
@@ -510,7 +559,7 @@ var errClosedDuringFailover = errors.New(
 // locally correct (no leaked generation) even if a future closed-
 // setter forgoes the lock.
 //
-// Mirrors the high-level shape of Java's reconnectSkippingIndex +
+// Mirrors the high-level shape of Java's reconnectViaTracker +
 // executeOnce composition.
 func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySession, failedIdx int) (*QwpServerInfo, error) {
 	c.genMu.Lock()
@@ -533,13 +582,28 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 		_ = oldTr.close()
 	}
 
-	// Walk the other endpoints, skipping the just-failed one.
-	// connectWalk handles the modulo wrap and the "n=1 means no
-	// candidates" case by returning a connect-failed error, which the
-	// outer failover loop surfaces and may revisit on a later attempt.
+	// Demote the just-failed endpoint, then open a fresh round. Order
+	// is normative (failover.md §2.3): RecordMidStreamFailure must run
+	// BEFORE the round reset, else sticky-Healthy would preserve the
+	// just-failed host as the priority pick and hand it the first
+	// reconnect attempt again. RecordMidStreamFailure only demotes a
+	// still-Healthy slot and leaves `attempted` untouched; the
+	// subsequent BeginRound(forgetClassifications=false) clears the
+	// per-round bits but keeps topology classifications observed in
+	// prior Executes (wire-egress.md §11.9.2 "lazy forget"). The one
+	// fall-through BeginRound(true) lives inside connectWalk. n=1
+	// degenerates cleanly: the lone host is demoted to TransportError,
+	// PickNext still returns it, and the walk retries the same host —
+	// the only candidate — instead of failing for lack of an
+	// alternative.
+	c.hostTracker.RecordMidStreamFailure(failedIdx)
+	c.hostTracker.BeginRound(false)
 	// Pass s.cancelCh so the walk short-circuits at endpoint
 	// boundaries when the user calls Cancel mid-failover.
-	result, err := connectWalk(ctx, c.cfg, failedIdx, s.cancelCh)
+	// allowFallthroughReset=true: one BeginRound(true) re-sweep so a
+	// long-lived client recovers from a topology change (Java
+	// reconnectViaTracker parity).
+	result, err := connectWalk(ctx, c.cfg, c.hostTracker, s.cancelCh, true)
 	if err != nil {
 		return nil, err
 	}

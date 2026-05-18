@@ -92,6 +92,23 @@ type qwpQueryClientConfig struct {
 	// and qwpTargetReplica require v2 (without SERVER_INFO the role
 	// is unknown and the filter cannot be evaluated).
 	target qwpTargetFilter
+	// zone is the client's opaque, case-insensitive locality hint
+	// (failover.md §1.1). When set and target != primary, the host
+	// tracker prefers endpoints whose server-advertised zone_id
+	// (SERVER_INFO.zone_id under CAP_ZONE, or the X-QuestDB-Zone
+	// header on a 421 reject) matches, via the (state, zone) priority
+	// lattice. Empty (the default) collapses every host to the Same
+	// tier, i.e. zone-blind selection. Shared verbatim with the
+	// ingest connect string, where it is accepted-but-inert (SF
+	// ingress is v1-pinned and zone-blind).
+	zone string
+	// authTimeoutMs is the failover.md §1.1 per-host upper bound on
+	// the HTTP upgrade response read (the wait between writing the
+	// upgrade request and reading the response headers). It does NOT
+	// cover TCP connect, TLS handshake, or the post-upgrade
+	// SERVER_INFO frame read (that uses serverInfoTimeout). Default
+	// qwpDefaultAuthTimeoutMs (15_000); must be > 0.
+	authTimeoutMs int
 	// failoverEnabled toggles transparent reconnect-and-replay on
 	// transport-terminal failure mid-query. Default true; matches
 	// Java's failover=on default. When false, transport errors
@@ -175,6 +192,12 @@ const (
 	// read after the upgrade. Java's DEFAULT_SERVER_INFO_TIMEOUT_MS =
 	// 5000.
 	qwpDefaultServerInfoTimeout = 5 * time.Second
+	// qwpDefaultAuthTimeoutMs is the per-host upgrade-response-read
+	// bound when the caller hasn't overridden it. failover.md §1.1
+	// default (15_000); matches the ingest sender default and Java's
+	// DEFAULT_AUTH_TIMEOUT_MS so a shared connect string behaves
+	// identically on both clients.
+	qwpDefaultAuthTimeoutMs = 15_000
 )
 
 // qwpQueryDefaultConfig returns the zero-arg default config. Used as
@@ -195,6 +218,7 @@ func qwpQueryDefaultConfig() *qwpQueryClientConfig {
 		failoverBackoffMax:     qwpDefaultFailoverMaxBackoff,
 		failoverMaxDuration:    qwpDefaultFailoverMaxDuration,
 		serverInfoTimeout:      qwpDefaultServerInfoTimeout,
+		authTimeoutMs:          qwpDefaultAuthTimeoutMs,
 	}
 }
 
@@ -303,6 +327,10 @@ func (c *qwpQueryClientConfig) validate() error {
 	if c.serverInfoTimeout <= 0 {
 		return fmt.Errorf(
 			"qwp query: server_info_timeout must be > 0, got %v", c.serverInfoTimeout)
+	}
+	if c.authTimeoutMs <= 0 {
+		return fmt.Errorf(
+			"qwp query: auth_timeout_ms must be > 0, got %d", c.authTimeoutMs)
 	}
 	return nil
 }
@@ -465,6 +493,24 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 				return nil, NewInvalidConfigStrError("%v", err)
 			}
 			cfg.target = t
+		case "zone":
+			// Opaque locality hint (failover.md §1.1). Stored verbatim;
+			// the host tracker lowercases for case-insensitive compare.
+			// Accepted here so a single connect string can be shared
+			// with the ingest client (where the same key is
+			// accepted-but-inert).
+			cfg.zone = v
+		case "auth_timeout_ms":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid auth_timeout_ms %q: %v", v, err)
+			}
+			if n <= 0 {
+				return nil, NewInvalidConfigStrError(
+					"auth_timeout_ms must be > 0, got %d", n)
+			}
+			cfg.authTimeoutMs = n
 		case "failover":
 			switch v {
 			case "on":

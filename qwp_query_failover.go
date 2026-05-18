@@ -201,36 +201,57 @@ func parseEndpointList(s string, defaultPort int) ([]qwpEndpoint, error) {
 // failover orchestrator) so the client struct can publish all three
 // atomically.
 type qwpConnectResult struct {
-	transport      *qwpTransport
-	io             *qwpEgressIO
-	endpointIdx    int
-	serverInfo     *QwpServerInfo
+	transport   *qwpTransport
+	io          *qwpEgressIO
+	endpointIdx int
+	serverInfo  *QwpServerInfo
 }
 
-// connectWalk iterates cfg.endpoints in order, attempting one
-// transport.connect per endpoint. The first endpoint whose
-// SERVER_INFO.role passes cfg.target's filter wins; non-matching
-// endpoints are torn down and skipped. v1 servers (no SERVER_INFO)
-// satisfy only target=any — qwpTargetPrimary / qwpTargetReplica are
-// rejected because the role byte is unknown.
+// connectWalk is the egress WalkTracker helper (wire-egress.md
+// §11.9.3), shared by the initial connect (newQwpQueryClient) and
+// every failover reconnect (reconnectAndReplay). Endpoint selection is
+// driven by the failover.md §2 host-health tracker, NOT a positional
+// walk: tracker.PickNext returns the lexicographically-best
+// (state, zone) candidate, the dial outcome is fed back via
+// RecordSuccess / RecordRoleReject / RecordTransportError / RecordZone,
+// and a single fall-through BeginRound(forgetClassifications=true)
+// reset gives stale TransientReject / TopologyReject hosts one more
+// chance before the walk gives up. This replaces the pre-failover-spec
+// (failedIdx+1)%n modulo round-robin, which ignored host health and
+// zone locality entirely (the `zone=` key was inert on the query
+// side).
+//
+// Round entry is the caller's responsibility, per wire-egress.md
+// §11.9.2: the initial connect runs on a fresh all-Unknown tracker
+// (no BeginRound needed); reconnect calls RecordMidStreamFailure on
+// the just-failed index then BeginRound(forgetClassifications=false)
+// before invoking this helper. This function owns only the in-walk
+// classification and (when allowFallthroughReset is set) the one
+// fall-through reset.
+//
+// allowFallthroughReset gates the single
+// BeginRound(forgetClassifications=true) re-sweep that runs when
+// PickNext first returns -1. It is true only on the failover
+// reconnect path (Java reconnectViaTracker), where forgetting stale
+// classifications from prior outages and walking once more lets a
+// long-lived client recover from a topology change. It is false on
+// the initial connect path (Java connect()), which probes every
+// endpoint exactly once and then fails — re-sweeping a freshly
+// role-rejecting cluster on first connect would just double every
+// endpoint's probe count for no diagnostic gain (Java's
+// QwpQueryClientMultiHostFailoverTest.testConnectDoesNotDoubleWalkOnFirstFailure
+// pins this).
+//
+// AuthError (401/403) is terminal per failover.md §6: the helper
+// returns the typed *QwpUpgradeRejectError immediately without walking
+// to the next host (credentials are cluster-wide; retrying every host
+// just floods server logs). All other dial failures are per-endpoint
+// and the walk continues.
 //
 // Closes any partially-bound resources before returning on a failure
 // path so callers do not have to worry about leaked goroutines or
 // half-open sockets. On a successful return the caller takes
 // ownership of the transport + I/O.
-//
-// failedIdx selects between two walk shapes, mirroring Java's
-// reconnectSkippingIndex:
-//
-//   - failedIdx < 0: initial connect. Visits all len(endpoints)
-//     entries starting at index 0.
-//   - failedIdx >= 0: failover reconnect. Visits the other
-//     len(endpoints)-1 entries starting at failedIdx+1 (mod n) and
-//     never revisits failedIdx itself. A transport failure is likely
-//     to repeat immediately on the same socket, so retrying it would
-//     just burn an attempt; the outer failover loop can come back to
-//     this endpoint on a subsequent attempt if every other endpoint
-//     is also unreachable.
 //
 // cancelCh, when non-nil, is checked at every endpoint boundary to
 // short-circuit the walk if the user has asked to cancel. Cancel()
@@ -241,7 +262,7 @@ type qwpConnectResult struct {
 // in-flight Dial / SERVER_INFO read, so the worst-case wait shrinks
 // from the full walk to a single endpoint's timeout. Java has the
 // same boundary-only granularity.
-func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, cancelCh <-chan struct{}) (*qwpConnectResult, error) {
+func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHostTracker, cancelCh <-chan struct{}, allowFallthroughReset bool) (*qwpConnectResult, error) {
 	if len(cfg.endpoints) == 0 {
 		return nil, fmt.Errorf("qwp query: no endpoints configured")
 	}
@@ -257,14 +278,9 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, 
 	var lastObserved *QwpServerInfo
 	var lastErr error
 	sawV1Mismatch := false
-	n := len(cfg.endpoints)
-	startIdx := 0
-	stepCount := n
-	if failedIdx >= 0 {
-		startIdx = failedIdx + 1
-		stepCount = n - 1
-	}
-	for offset := 0; offset < stepCount; offset++ {
+	attempts := 0
+	retriedAfterReset := false
+	for {
 		if cancelCh != nil {
 			select {
 			case <-cancelCh:
@@ -272,7 +288,25 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, 
 			default:
 			}
 		}
-		idx := (startIdx + offset) % n
+
+		idx := tracker.PickNext()
+		if idx < 0 {
+			// Round exhausted. On the reconnect path, give stale
+			// TransientReject / TopologyReject / TransportError hosts
+			// one more shot by forgetting non-Healthy classifications,
+			// then walk once more. Only one reset, then fail
+			// (wire-egress.md §11.9.3 — unlike the SF reconnect loop
+			// there is no wall-clock budget here; the per-Execute loop
+			// owns that). The initial connect passes
+			// allowFallthroughReset=false and fails after the single
+			// sweep.
+			if allowFallthroughReset && !retriedAfterReset {
+				tracker.BeginRound(true)
+				retriedAfterReset = true
+				continue
+			}
+			break
+		}
 		ep := cfg.endpoints[idx]
 		wsURL := scheme + "://" + ep.String()
 
@@ -288,28 +322,65 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, 
 			// will emit it.
 			maxVersion:        qwpMaxSupportedVersion,
 			serverInfoTimeout: cfg.serverInfoTimeout,
+			authTimeoutMs:     cfg.authTimeoutMs,
 		}
+		attempts++
 		if err := tr.connect(ctx, wsURL, opts); err != nil {
+			// transport.connect already cleaned up after itself on the
+			// failure path. Classify per failover.md §5/§6.
+			var rej *QwpUpgradeRejectError
+			if errors.As(err, &rej) {
+				// AuthError 401/403: terminal — bypass failover so a
+				// cluster-wide bad credential does not flood every host.
+				if rej.StatusCode == 401 || rej.StatusCode == 403 {
+					return nil, err
+				}
+				// Record the host's zone tier if the reject carried
+				// X-QuestDB-Zone (no-op on empty / collapsed-to-Same).
+				if rej.Zone != "" {
+					tracker.RecordZone(idx, rej.Zone)
+				}
+				if rej.IsRoleReject() {
+					// 421 + non-empty role: transient (PRIMARY_CATCHUP)
+					// or topology (any other role).
+					tracker.RecordRoleReject(idx, rej.IsCatchupRole())
+					lastErr = err
+					continue
+				}
+				// 421 without role, 404, 426, 503, version mismatch,
+				// etc.: per-endpoint transient.
+				tracker.RecordTransportError(idx)
+				lastErr = err
+				continue
+			}
+			// TCP/TLS dial error, upgrade-response-read timeout, etc.
+			tracker.RecordTransportError(idx)
 			lastErr = err
-			// Try the next endpoint; transport.connect already cleaned
-			// up after itself on the failure path.
 			continue
 		}
 
 		info := tr.serverInfo
+		if info != nil && info.Capabilities&qwpCapZone != 0 {
+			// Server advertised its zone on the v2 SERVER_INFO frame.
+			tracker.RecordZone(idx, info.ZoneId)
+		}
 		if info == nil && cfg.target != qwpTargetAny {
 			// v1 server cannot satisfy a specific role filter — its
 			// role is unknown and a "best effort" bind would give the
-			// caller a false guarantee. Record this so the final
-			// QwpRoleMismatchError can flag SawV1Mismatch and tell the
-			// caller "the cluster is up but it's OSS / v1" rather than
-			// "all endpoints unreachable".
+			// caller a false guarantee. Demote to TopologyReject and
+			// record this so the final QwpRoleMismatchError can flag
+			// SawV1Mismatch and tell the caller "the cluster is up but
+			// it's OSS / v1" rather than "all endpoints unreachable".
 			sawV1Mismatch = true
+			tracker.RecordRoleReject(idx, false)
 			_ = tr.close()
 			continue
 		}
 		if info != nil && !cfg.target.accepts(info.Role) {
 			lastObserved = info
+			// PRIMARY_CATCHUP is catching up and likely to become
+			// writable; any other mismatch is a stable topology fact.
+			tracker.RecordRoleReject(idx, info.Role == qwpRolePrimaryCatchup)
 			_ = tr.close()
 			continue
 		}
@@ -320,6 +391,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, 
 		// reconnects without disturbing the IO goroutine's view.
 		io := newQwpEgressIO(tr, cfg.bufferPoolSize)
 		io.start()
+		tracker.RecordSuccess(idx)
 		return &qwpConnectResult{
 			transport:   tr,
 			io:          io,
@@ -336,7 +408,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, failedIdx int, 
 			lastErr = fmt.Errorf("qwp query: all endpoints unreachable")
 		}
 		return nil, fmt.Errorf("qwp query: connect failed (tried %d endpoints): %w",
-			stepCount, lastErr)
+			attempts, lastErr)
 	}
 	// Specific role filter and no match — surface a typed
 	// QwpRoleMismatchError carrying the last observed SERVER_INFO, the

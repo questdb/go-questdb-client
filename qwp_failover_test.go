@@ -299,6 +299,41 @@ func TestQwpClientRoleMismatchSurfacesTypedError(t *testing.T) {
 	}
 }
 
+// TestQwpClientInitialConnectProbesEachEndpointOnce pins the
+// initial-connect contract after the host-tracker rewrite: the single
+// fall-through BeginRound(forgetClassifications=true) re-sweep is
+// reconnect-only (allowFallthroughReset). On initial connect a
+// uniformly role-rejecting cluster must probe each endpoint exactly
+// once and then fail — not double every probe by re-sweeping the same
+// just-rejected hosts. Go analog of Java
+// QwpQueryClientMultiHostFailoverTest.testConnectDoesNotDoubleWalkOnFirstFailure.
+func TestQwpClientInitialConnectProbesEachEndpointOnce(t *testing.T) {
+	cluster := newMockCluster(t, 3, rolesAllReplicas(), nil)
+
+	cfg := qwpQueryDefaultConfig()
+	eps, _ := parseEndpointList(cluster.addrList(), qwpDefaultPort)
+	cfg.endpoints = eps
+	cfg.target = qwpTargetPrimary // every endpoint REPLICA → all role-reject
+	cfg.serverInfoTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := newQwpQueryClient(ctx, cfg)
+	if err == nil {
+		t.Fatal("expected role-mismatch error when all endpoints are replicas")
+	}
+	var rme *QwpRoleMismatchError
+	if !errors.As(err, &rme) {
+		t.Fatalf("err = %v (%T), want *QwpRoleMismatchError", err, err)
+	}
+	for i := range cluster.nodes {
+		if got := cluster.nodes[i].onConnectCount.Load(); got != 1 {
+			t.Errorf("endpoint idx=%d upgraded %d times, want exactly 1 "+
+				"(no fall-through re-sweep on initial connect)", i, got)
+		}
+	}
+}
+
 // TestQwpClientV1MismatchSurfacesSawV1MismatchFlag verifies that when
 // every endpoint negotiates QWP v1 (no SERVER_INFO frame) and the
 // caller asks for target=primary, the typed error reports
@@ -555,13 +590,24 @@ func TestQwpFailoverYieldsResetThenResumes(t *testing.T) {
 	}
 }
 
-// TestQwpFailoverSkipsJustFailedEndpoint verifies that on reconnect
-// the connect walk does not revisit the endpoint that just failed,
-// matching Java's reconnectSkippingIndex. With three endpoints where
-// only the middle one passes the role filter, the reconnect must skip
-// the failed primary (rather than rebind to it and trip the same
-// fault) and surface a role-mismatch error instead.
-func TestQwpFailoverSkipsJustFailedEndpoint(t *testing.T) {
+// TestQwpFailoverRetriesSoleTargetMatchInsteadOfRoleMismatch pins the
+// host-tracker reconnect contract (failover.md §2 / wire-egress.md
+// §11.9.3, Java reconnectViaTracker): RecordMidStreamFailure demotes
+// the just-failed endpoint to TransportError but it stays a candidate.
+// With three endpoints where only the middle one passes target=primary
+// and that sole primary flaps, the reconnect walk prefers the
+// healthier/role-rejected peers first but, finding none of them
+// target-acceptable, rebinds the demoted-but-only primary rather than
+// declaring a role mismatch — a primary demonstrably exists, it is
+// just dropping the connection. The query therefore yields
+// *QwpFailoverReset events and finally exhausts the attempt budget as
+// *QwpFailoverExhaustedError, NOT *QwpRoleMismatchError.
+//
+// This replaces the pre-failover-spec TestQwpFailoverSkipsJustFailed-
+// Endpoint, whose "skip the failed index for one walk, then surface a
+// role mismatch" assertion described the (failedIdx+1)%n modulo walk
+// that the tracker rewrite removed.
+func TestQwpFailoverRetriesSoleTargetMatchInsteadOfRoleMismatch(t *testing.T) {
 	// idx=0 REPLICA, idx=1 PRIMARY, idx=2 REPLICA. Only the primary
 	// passes target=primary, so initial bind lands on idx=1.
 	cluster := newMockCluster(t, 3, func(idx int) (byte, string, string) {
@@ -606,7 +652,10 @@ func TestQwpFailoverSkipsJustFailedEndpoint(t *testing.T) {
 	q := c.Query(ctx, "select v from t")
 	defer q.Close()
 
-	var sawErr bool
+	var (
+		resets      int
+		terminalErr error
+	)
 	for _, err := range q.Batches() {
 		if err == nil {
 			t.Errorf("unexpected non-error batch from a poisoned connection")
@@ -614,33 +663,60 @@ func TestQwpFailoverSkipsJustFailedEndpoint(t *testing.T) {
 		}
 		var reset *QwpFailoverReset
 		if errors.As(err, &reset) {
-			t.Errorf("unexpected failover reset; reconnect should fail role filter")
+			resets++
+			// Every reconnect must rebind the sole primary, not a
+			// replica — the (state, zone) lattice keeps idx=1 the only
+			// target-acceptable candidate.
+			if reset.NewNode == nil || reset.NewNode.NodeId != "node-1" {
+				t.Errorf("reset.NewNode = %+v, want node-1 (the sole primary)",
+					reset.NewNode)
+			}
 			continue
 		}
-		// The failover-time role mismatch must surface as a typed
-		// *QwpRoleMismatchError so callers can errors.As against it,
-		// matching the initial-connect path.
-		var rme *QwpRoleMismatchError
-		if !errors.As(err, &rme) {
-			t.Errorf("err = %v (%T), want errors.As to match *QwpRoleMismatchError",
-				err, err)
-		} else if rme.Target != "primary" {
-			t.Errorf("rme.Target = %q, want primary", rme.Target)
-		}
-		if !strings.Contains(err.Error(), "no endpoint matches target=primary") {
-			t.Errorf("err = %v, want role-mismatch text", err)
-		}
-		sawErr = true
-	}
-	if !sawErr {
-		t.Error("expected reconnect to surface a transport error")
+		terminalErr = err
 	}
 
-	// The failed primary must be connected exactly once — the initial
-	// bind. Without the skip, the reconnect walk would wrap around to
-	// idx=1 again and the count would be 2.
-	if got := cluster.nodes[1].onConnectCount.Load(); got != 1 {
-		t.Errorf("primary at idx=1 connected %d times, want 1 (no rebind)", got)
+	// The sole primary flaps, so the loop must keep rebinding it and
+	// yield a reset each time until the attempt budget is spent.
+	if resets == 0 {
+		t.Error("expected the sole primary to be rebound (>=1 *QwpFailoverReset)")
+	}
+	if terminalErr == nil {
+		t.Fatal("expected a terminal error after the attempt budget is spent")
+	}
+	// A primary exists and was rebound every time, so this is budget
+	// exhaustion — NOT a role mismatch (the old modulo walk wrongly
+	// reported "no endpoint matches target=primary" here).
+	var rme *QwpRoleMismatchError
+	if errors.As(terminalErr, &rme) {
+		t.Errorf("terminal err = %v, must NOT be *QwpRoleMismatchError: "+
+			"a primary exists and was rebound", terminalErr)
+	}
+	var exhausted *QwpFailoverExhaustedError
+	if !errors.As(terminalErr, &exhausted) {
+		t.Fatalf("terminal err = %v (%T), want errors.As to match "+
+			"*QwpFailoverExhaustedError", terminalErr, terminalErr)
+	}
+	if exhausted.Attempts != cfg.failoverMaxAttempts {
+		t.Errorf("exhausted.Attempts = %d, want %d (failoverMaxAttempts)",
+			exhausted.Attempts, cfg.failoverMaxAttempts)
+	}
+
+	// The sole primary is rebound on every reconnect (initial bind +
+	// one upgrade per failover attempt), proving the tracker demotes
+	// but does NOT permanently skip it.
+	if got := cluster.nodes[1].onConnectCount.Load(); got != int64(cfg.failoverMaxAttempts) {
+		t.Errorf("primary at idx=1 upgraded %d times, want %d "+
+			"(rebound every reconnect, not skipped)",
+			got, cfg.failoverMaxAttempts)
+	}
+	// The replicas never become the bound endpoint; they are only ever
+	// role-rejected, so each is probed at most once.
+	for _, ri := range []int{0, 2} {
+		if got := cluster.nodes[ri].onConnectCount.Load(); got > 1 {
+			t.Errorf("replica at idx=%d upgraded %d times, want <=1 "+
+				"(role-rejected, never preferred again)", ri, got)
+		}
 	}
 }
 
