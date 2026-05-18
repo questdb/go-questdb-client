@@ -265,3 +265,92 @@ func (e *SenderError) Error() string {
 	}
 	return string(sb)
 }
+
+// ----------------------------------------------------------------------
+// Deprecated v4.2.0 compatibility shim. Delete this whole block in
+// v4.4.0 (one minor after the SenderError replacement landed in
+// v4.3.0): the QwpError type, its Error method, and the
+// (*SenderError).As bridge below exist only so source written against
+// v4.2.0's QwpError keeps compiling across the upgrade.
+// ----------------------------------------------------------------------
+
+// QwpError was the v4.2.0 QWP server-rejection payload returned from
+// Flush and delivered to the async error path. v4.3.0 replaced it with
+// SenderError, which additionally carries the [FromFsn, ToFsn]
+// correlation span, the applied Policy, table attribution, and a
+// release-stable Category.
+//
+// Deprecated: use SenderError. This shim only keeps v4.2.0 source
+// compiling and is scheduled for removal in v4.4.0. The
+// (*SenderError).As bridge keeps the historical pattern working:
+//
+//	var qwpErr *questdb.QwpError
+//	if errors.As(err, &qwpErr) { /* still populated, from *SenderError */ }
+//
+// A type switch `case *questdb.QwpError:` will NOT match anymore —
+// Flush now returns *SenderError — so switch on *SenderError (or its
+// Category) instead. Field mapping from the old payload:
+//
+//	QwpError.Status   ← SenderError.ServerStatusByte (Category for the name)
+//	QwpError.Sequence ← SenderError.MessageSequence
+//	QwpError.Message  ← SenderError.ServerMessage
+type QwpError struct {
+	// Status is the raw QWP status byte from the server's ACK
+	// rejection. Zero (the QwpStatusOK byte) when the underlying
+	// SenderError is a CategoryProtocolViolation, which v4.2.0 never
+	// surfaced through this type.
+	//
+	// Deprecated: read SenderError.ServerStatusByte / .Category.
+	Status QwpStatusCode
+
+	// Sequence is the server's per-frame message sequence, mirrored
+	// back in the rejection frame.
+	//
+	// Deprecated: read SenderError.MessageSequence.
+	Sequence int64
+
+	// Message is the server-supplied error description, or empty if
+	// the server sent no text.
+	//
+	// Deprecated: read SenderError.ServerMessage.
+	Message string
+}
+
+// Error implements the error interface, preserving the exact v4.2.0
+// message format so adopters that grep their logs see no change.
+//
+// Deprecated: use SenderError.
+func (e *QwpError) Error() string {
+	name := qwpStatusName(e.Status)
+	if e.Message != "" {
+		return fmt.Sprintf("qwp: server error %s (0x%02X): %s",
+			name, byte(e.Status), e.Message)
+	}
+	return fmt.Sprintf("qwp: server error %s (0x%02X)",
+		name, byte(e.Status))
+}
+
+// As bridges the deprecated *QwpError shim onto the SenderError
+// payload so the historical errors.As(err, &qwpErr) pattern keeps
+// working after the v4.3.0 type replacement. errors.As resolves
+// **SenderError by assignability before consulting this method, so the
+// only target we handle is **QwpError; everything else falls through
+// to the standard walk.
+//
+// Deprecated: exists solely for the QwpError shim; removed with it.
+func (e *SenderError) As(target any) bool {
+	qe, ok := target.(**QwpError)
+	if !ok {
+		return false
+	}
+	status := QwpStatusCode(0)
+	if e.ServerStatusByte != NoStatusByte {
+		status = QwpStatusCode(byte(e.ServerStatusByte))
+	}
+	*qe = &QwpError{
+		Status:   status,
+		Sequence: e.MessageSequence,
+		Message:  e.ServerMessage,
+	}
+	return true
+}

@@ -197,3 +197,46 @@ func TestQwpSenderLastTerminalErrorMessageContainsServerMessage(t *testing.T) {
 	assert.True(t, strings.Contains(se.ServerMessage, "rejected"),
 		"expected 'rejected' in ServerMessage, got %q", se.ServerMessage)
 }
+
+// TestDeprecatedQwpErrorBridge pins the v4.2.0 compatibility shim: the
+// historical errors.As(err, &qwpErr) pattern must keep working against
+// a *SenderError, with the documented field mapping, while the new
+// errors.As(err, &se) path is left intact.
+func TestDeprecatedQwpErrorBridge(t *testing.T) {
+	var err error = &SenderError{
+		Category:         CategorySchemaMismatch,
+		ServerStatusByte: int(QwpStatusSchemaMismatch),
+		ServerMessage:    "column type mismatch",
+		MessageSequence:  42,
+		FromFsn:          10,
+		ToFsn:            12,
+	}
+
+	// Adding (*SenderError).As must not shadow the direct unwrap.
+	var se *SenderError
+	require.True(t, errors.As(err, &se))
+	assert.Equal(t, CategorySchemaMismatch, se.Category)
+
+	// Historical pattern keeps compiling and is populated.
+	var qwpErr *QwpError
+	require.True(t, errors.As(err, &qwpErr))
+	assert.Equal(t, QwpStatusSchemaMismatch, qwpErr.Status)
+	assert.Equal(t, int64(42), qwpErr.Sequence)
+	assert.Equal(t, "column type mismatch", qwpErr.Message)
+	assert.Equal(t,
+		"qwp: server error SCHEMA_MISMATCH (0x03): column type mismatch",
+		qwpErr.Error())
+
+	// Protocol violations carried no status byte in v4.2.0; the shim
+	// reports the zero (OK) byte rather than the -1 sentinel.
+	err = &SenderError{
+		Category:         CategoryProtocolViolation,
+		ServerStatusByte: NoStatusByte,
+		MessageSequence:  NoMessageSequence,
+		ServerMessage:    "policy violation",
+	}
+	qwpErr = nil
+	require.True(t, errors.As(err, &qwpErr))
+	assert.Equal(t, QwpStatusCode(0), qwpErr.Status)
+	assert.Equal(t, "policy violation", qwpErr.Message)
+}
