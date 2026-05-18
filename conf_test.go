@@ -265,6 +265,31 @@ func TestParserHappyCases(t *testing.T) {
 				},
 			},
 		},
+		{
+			// failover.md §1: `addr=h1;addr=h2` is an alternative
+			// spelling of `addr=h1,h2`. The parser MUST accumulate
+			// both forms into a single comma-joined value.
+			name:   "ws addr accumulates across repeated keys",
+			config: "ws::addr=h1:9000;addr=h2:9000;addr=h3:9000;",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr": "h1:9000,h2:9000,h3:9000",
+				},
+			},
+		},
+		{
+			// Comma-form already parses today; accumulator must not
+			// double-comma when mixing with repeated keys.
+			name:   "ws addr accumulates mixed comma and repeated forms",
+			config: "ws::addr=h1:9000,h2:9000;addr=h3:9000;",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr": "h1:9000,h2:9000,h3:9000",
+				},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -308,6 +333,11 @@ func TestParserPathologicalCases(t *testing.T) {
 			config:                 "http::addr=localhost:9000;username=test;password=pass;word",
 			expectedErrMsgContains: "unexpected end of",
 		},
+		{
+			name:                   "duplicate on_server_error",
+			config:                 "ws::addr=localhost:9000;on_server_error=auto;on_server_error=halt;",
+			expectedErrMsgContains: `duplicate key \"on_server_error\"`,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -319,6 +349,19 @@ func TestParserPathologicalCases(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.expectedErrMsgContains)
 		})
 	}
+}
+
+func TestParserKeysAreCaseSensitive(t *testing.T) {
+	// Same key bytes in different case are distinct, matching the Rust
+	// client. The lowercase `addr` is recognized; the uppercase `ADDR`
+	// is parsed but later rejected as an unsupported option.
+	parsed, err := qdb.ParseConfigStr("http::addr=localhost:9000;ADDR=localhost:9001;")
+	assert.NoError(t, err)
+	assert.Equal(t, "localhost:9000", parsed.KeyValuePairs["addr"])
+	assert.Equal(t, "localhost:9001", parsed.KeyValuePairs["ADDR"])
+
+	_, err = qdb.ConfFromStr("http::addr=localhost:9000;ADDR=localhost:9001;")
+	assert.ErrorContains(t, err, "unsupported option")
 }
 
 type configTestCase struct {
@@ -372,6 +415,15 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithAddress(addr),
 				qdb.WithInitBufferSize(initBufSize),
 				qdb.WithMaxBufferSize(maxBufSize),
+			},
+		},
+		{
+			name:   "max_name_len",
+			config: fmt.Sprintf("http::addr=%s;max_name_len=64;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithHttp(),
+				qdb.WithAddress(addr),
+				qdb.WithFileNameLimit(64),
 			},
 		},
 		{
@@ -561,6 +613,57 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithGorilla(true),
 			},
 		},
+		{
+			name:   "ws with auth_timeout_ms",
+			config: fmt.Sprintf("ws::addr=%s;auth_timeout_ms=7000;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithAuthTimeout(7 * time.Second),
+			},
+		},
+		{
+			name:   "ws with target=primary",
+			config: fmt.Sprintf("ws::addr=%s;target=primary;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithTarget(qdb.QwpTargetPrimary),
+			},
+		},
+		{
+			name:   "ws with zone",
+			config: fmt.Sprintf("ws::addr=%s;zone=az-1;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithZone("az-1"),
+			},
+		},
+		{
+			name:   "ws with on_server_error",
+			config: fmt.Sprintf("ws::addr=%s;on_server_error=halt;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithServerErrorPolicy(qdb.PolicyHalt),
+			},
+		},
+		{
+			name: "ws with sf cursor knobs",
+			config: fmt.Sprintf(
+				"ws::addr=%s;sf_dir=/tmp/sf;sf_durability=memory;sf_append_deadline_millis=20000;drain_orphans=on;max_background_drainers=2;",
+				addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithSfDir("/tmp/sf"),
+				qdb.WithSfDurability("memory"),
+				qdb.WithSfAppendDeadline(20 * time.Second),
+				qdb.WithDrainOrphans(true),
+				qdb.WithMaxBackgroundDrainers(2),
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -682,6 +785,36 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			config:                 "http::addr=localhost:9000;username=;",
 			expectedErrMsgContains: "empty value for key",
 		},
+		{
+			name:                   "auth_timeout_ms on HTTP",
+			config:                 "http::addr=localhost:9000;auth_timeout_ms=5000;",
+			expectedErrMsgContains: "auth_timeout_ms is only supported for QWP senders",
+		},
+		{
+			name:                   "zone on TCP",
+			config:                 "tcp::addr=localhost:9009;zone=eu-west-1a;",
+			expectedErrMsgContains: "zone is only supported for QWP senders",
+		},
+		{
+			name:                   "target on HTTP",
+			config:                 "http::addr=localhost:9000;target=primary;",
+			expectedErrMsgContains: "target is only supported for QWP senders",
+		},
+		{
+			name:                   "invalid target value",
+			config:                 "ws::addr=localhost:9000;target=foo;",
+			expectedErrMsgContains: "invalid target",
+		},
+		{
+			name:                   "non-positive auth_timeout_ms",
+			config:                 "ws::addr=localhost:9000;auth_timeout_ms=0;",
+			expectedErrMsgContains: "auth_timeout_ms",
+		},
+		{
+			name:                   "non-numeric auth_timeout_ms",
+			config:                 "ws::addr=localhost:9000;auth_timeout_ms=fast;",
+			expectedErrMsgContains: "auth_timeout_ms",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -690,4 +823,134 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			assert.ErrorContains(t, err, tc.expectedErrMsgContains)
 		})
 	}
+}
+
+// TestQwpFailoverSanitizeErrors covers sanitizer-level rejections for
+// failover-related config: multi-host on HTTP/TCP (not yet wired up
+// in those transports) and malformed QWP endpoint lists.
+func TestQwpFailoverSanitizeErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		config string
+		errMsg string
+	}{
+		{
+			name:   "multi-host addr on HTTP",
+			config: "http::addr=localhost:9000,localhost:9001;",
+			errMsg: "multi-host addr is not supported for HTTP",
+		},
+		{
+			name:   "multi-host addr on HTTP via repeated keys",
+			config: "http::addr=localhost:9000;addr=localhost:9001;",
+			errMsg: "multi-host addr is not supported for HTTP",
+		},
+		{
+			name:   "multi-host addr on TCP",
+			config: "tcp::addr=localhost:9009,localhost:9010;",
+			errMsg: "multi-host addr is not supported for TCP",
+		},
+		{
+			name:   "trailing comma in addr",
+			config: "ws::addr=localhost:9000,;",
+			errMsg: "empty entry in addr list",
+		},
+		{
+			name:   "double comma in addr",
+			config: "ws::addr=h1:9000,,h2:9000;",
+			errMsg: "empty entry in addr list",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := qdb.ConfFromStr(tc.config)
+			assert.NoError(t, err)
+			assert.ErrorContains(t, qdb.SanitizeConf(c), tc.errMsg)
+		})
+	}
+}
+
+// TestQwpFailoverConfKeys covers the connect-string keys mandated by
+// failover.md §1 (addr multi-host, auth_timeout_ms, zone, target).
+// The keys are parsed but not yet consumed by the SF reconnect loop —
+// these tests pin down the parser-and-sanitizer surface so the
+// downstream wire-up phases can rely on it.
+func TestQwpFailoverConfKeys(t *testing.T) {
+	parseSanitize := func(t *testing.T, conf string) *qdb.LineSenderConfig {
+		t.Helper()
+		c, err := qdb.ConfFromStr(conf)
+		assert.NoError(t, err)
+		assert.NoError(t, qdb.SanitizeConf(c))
+		return c
+	}
+
+	t.Run("single host populates endpoints[0]", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=questdb.local:9000;")
+		assert.Equal(t, []string{"questdb.local:9000"}, qdb.ConfigEndpoints(c))
+	})
+
+	t.Run("comma-form addr produces ordered endpoints", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=h1:9000,h2:9000,h3:9000;")
+		assert.Equal(t,
+			[]string{"h1:9000", "h2:9000", "h3:9000"},
+			qdb.ConfigEndpoints(c))
+	})
+
+	t.Run("repeated-key addr produces ordered endpoints", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=h1:9000;addr=h2:9000;addr=h3:9000;")
+		assert.Equal(t,
+			[]string{"h1:9000", "h2:9000", "h3:9000"},
+			qdb.ConfigEndpoints(c))
+	})
+
+	t.Run("missing port defaults to 9000", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=h1,h2:9001,h3;")
+		assert.Equal(t,
+			[]string{"h1:9000", "h2:9001", "h3:9000"},
+			qdb.ConfigEndpoints(c))
+	})
+
+	t.Run("IPv6 bracketed host", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=[::1]:9000,[fe80::1]:9001;")
+		assert.Equal(t,
+			[]string{"[::1]:9000", "[fe80::1]:9001"},
+			qdb.ConfigEndpoints(c))
+	})
+
+	t.Run("auth_timeout_ms default 15s", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=localhost:9000;")
+		assert.Equal(t, 15_000, qdb.ConfigAuthTimeoutMs(c))
+	})
+
+	t.Run("auth_timeout_ms explicit", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=localhost:9000;auth_timeout_ms=5000;")
+		assert.Equal(t, 5_000, qdb.ConfigAuthTimeoutMs(c))
+	})
+
+	t.Run("zone is silently accepted on QWP ingress", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=localhost:9000;zone=eu-west-1a;")
+		assert.Equal(t, "eu-west-1a", qdb.ConfigZone(c))
+	})
+
+	t.Run("target=any (default)", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=localhost:9000;")
+		assert.Equal(t, "any", qdb.ConfigTarget(c))
+	})
+
+	t.Run("target=primary", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=localhost:9000;target=primary;")
+		assert.Equal(t, "primary", qdb.ConfigTarget(c))
+	})
+
+	t.Run("target=replica", func(t *testing.T) {
+		c := parseSanitize(t, "ws::addr=localhost:9000;target=replica;")
+		assert.Equal(t, "replica", qdb.ConfigTarget(c))
+	})
+
+	t.Run("wss tls-mode preserved with multi-host", func(t *testing.T) {
+		c := parseSanitize(t, "wss::addr=h1:9000,h2:9000;zone=dc-a;target=primary;auth_timeout_ms=8000;")
+		assert.Equal(t, []string{"h1:9000", "h2:9000"}, qdb.ConfigEndpoints(c))
+		assert.Equal(t, "dc-a", qdb.ConfigZone(c))
+		assert.Equal(t, "primary", qdb.ConfigTarget(c))
+		assert.Equal(t, 8_000, qdb.ConfigAuthTimeoutMs(c))
+	})
 }

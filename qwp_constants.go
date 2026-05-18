@@ -56,14 +56,133 @@ const (
 	qwpTypeDecimal128    qwpTypeCode = 0x14 // 16 bytes, little-endian unscaled
 	qwpTypeDecimal256    qwpTypeCode = 0x15 // 32 bytes, little-endian unscaled
 	qwpTypeChar          qwpTypeCode = 0x16 // UTF-16 code unit, 2 bytes LE
+	// Decoder-only types: the Go encoder never emits them, but the
+	// egress `RESULT_BATCH` decoder must handle columns the server
+	// produces from arbitrary SELECTs (pg_catalog views, IP lookups,
+	// binary columns, etc.).
+	qwpTypeBinary qwpTypeCode = 0x17 // variable, offset+data (same layout as VARCHAR)
+	qwpTypeIPv4   qwpTypeCode = 0x18 // 4 bytes LE, identical to INT
+)
+
+// qwpMsgKind is the one-byte discriminator at the start of every QWP
+// egress payload (spec §5). Ingress DATA_BATCH messages use 0x00; the
+// 0x10..0x17 range is reserved for egress request/response kinds.
+type qwpMsgKind byte
+
+const (
+	qwpMsgKindDataBatch    qwpMsgKind = 0x00
+	qwpMsgKindResponse     qwpMsgKind = 0x01
+	qwpMsgKindQueryRequest qwpMsgKind = 0x10
+	qwpMsgKindResultBatch  qwpMsgKind = 0x11
+	qwpMsgKindResultEnd    qwpMsgKind = 0x12
+	qwpMsgKindQueryError   qwpMsgKind = 0x13
+	qwpMsgKindCancel       qwpMsgKind = 0x14
+	qwpMsgKindCredit       qwpMsgKind = 0x15
+	qwpMsgKindExecDone     qwpMsgKind = 0x16
+	// qwpMsgKindCacheReset is a server → client connection-scoped
+	// cache-reset notification. Body is a single reset_mask byte (see
+	// qwpResetMask* below) whose bits tell the client which caches to
+	// discard. Sent between queries when a cache reaches the server's
+	// configured soft cap; after applying, the next RESULT_BATCH's
+	// delta-dict deltaStart and schema-reference ids are expected to
+	// line up with a fresh server counter. Does not surface to users.
+	qwpMsgKindCacheReset qwpMsgKind = 0x17
+	// qwpMsgKindServerInfo is the unsolicited server → client frame
+	// delivered as the first WebSocket frame after a v2 upgrade. Body
+	// (little-endian, after the 12-byte QWP header):
+	// role(u8) + epoch(u64) + capabilities(u32) + server_wall_ns(i64)
+	// + cluster_id(u16_len + utf8) + node_id(u16_len + utf8). v1
+	// servers omit the frame entirely. The byte 0x18 is also bound to
+	// qwpTypeIPv4 in the qwpTypeCode enum; no collision since the two
+	// are distinct types.
+	qwpMsgKindServerInfo qwpMsgKind = 0x18
+)
+
+// SERVER_INFO role byte values (spec §11.8). Mirror Java
+// QwpEgressMsgKind.ROLE_*.
+const (
+	// qwpRoleStandalone marks a node with no replication configured.
+	// OSS single-node default; behaves like a primary for routing
+	// purposes and is accepted by target=primary.
+	qwpRoleStandalone byte = 0x00
+	// qwpRolePrimary is the authoritative write node; reads see latest
+	// commits.
+	qwpRolePrimary byte = 0x01
+	// qwpRoleReplica is read-only and may lag the primary by up to the
+	// replication poll interval.
+	qwpRoleReplica byte = 0x02
+	// qwpRolePrimaryCatchup signals a promotion in flight; behaves like
+	// a primary but is still uploading in-flight segments. Accepted by
+	// target=primary.
+	qwpRolePrimaryCatchup byte = 0x03
+)
+
+// Bit flags carried in the reset_mask byte of a CACHE_RESET frame.
+// Mirrors the Java QwpEgressMsgKind.RESET_MASK_* constants.
+const (
+	// qwpResetMaskDict clears the connection-scoped SYMBOL dict. After
+	// applying, the next RESULT_BATCH's delta section must start at
+	// deltaStart=0 — i.e. the server has also reset its dict to empty.
+	qwpResetMaskDict byte = 0x01
+	// qwpResetMaskSchemas clears the schema-fingerprint cache. After
+	// applying, the next RESULT_BATCH must ship its schema in full
+	// mode (not reference mode) with a fresh id.
+	qwpResetMaskSchemas byte = 0x02
 )
 
 // qwpMagic is the 4-byte magic at the start of every QWP message.
 // Stored as a uint32 in little-endian byte order: "QWP1".
 const qwpMagic uint32 = 0x31505751
 
-// qwpVersion is the current protocol version.
+// qwpVersion is the version byte stamped into the 12-byte QWP header
+// of every ingest frame this client encodes. Held at v1 so the
+// encoded ingest stream stays compatible with both v1 and v2 QuestDB
+// servers (v2 servers accept v1-stamped ingest frames as a subset of
+// their wire protocol). The handshake max-version we advertise is
+// qwpMaxSupportedVersion, which may exceed qwpVersion to opt the
+// connection into v2 server-side features (SERVER_INFO frame, multi-
+// endpoint routing, transparent failover) without changing the encoded
+// frame format.
 const qwpVersion byte = 0x01
+
+// qwpCapZone is the CAP_ZONE bit in SERVER_INFO.capabilities. When
+// set, the server's SERVER_INFO frame carries an additional
+// zone_id string after node_id; clients use it to drive the
+// failover.md §2 zone-tier classification (Same / Unknown / Other).
+// Absent CAP_ZONE leaves the host's zone tier at Unknown, which
+// PickNext treats as a middle-priority bucket between Same and
+// Other.
+const qwpCapZone uint32 = 1 << 0
+
+// qwpMaxSupportedVersion is the highest QWP protocol version this
+// client will negotiate on the egress (query) path. Advertised in the
+// X-QWP-Max-Version handshake header; the server echoes
+// min(server_max, client_max) back as X-QWP-Version. v2 enables the
+// server to emit SERVER_INFO and the v2-only egress features (target
+// filter, transparent failover). Once the handshake settles, decoders
+// enforce strict equality between every server frame's header version
+// byte and the negotiated version (spec §3) — this constant only caps
+// what we will agree to negotiate to, not what we will accept on a
+// live connection.
+//
+// The ingest path uses qwpMaxSupportedIngestVersion instead: the v2
+// bump is egress-only and ingress is pinned to v1 by spec.
+const qwpMaxSupportedVersion byte = 0x02
+
+// qwpMaxSupportedIngestVersion is the highest QWP version the ingest
+// path advertises in X-QWP-Max-Version. Pinned to v1, mirroring the
+// Java reference's MAX_SUPPORTED_INGEST_VERSION: the v2 bump only adds
+// the egress-side SERVER_INFO control frame, and wire-ingress.md §3
+// fixes ingress at v1 ("Ingress clients do NOT read SERVER_INFO,
+// ignore zone advertising"). Advertising v2 here would be a spec
+// violation that is currently masked only because the server clamps
+// ingest negotiation to v1 (QwpWebSocketUpgradeProcessor: negotiated =
+// min(clientMax, MAX_SUPPORTED_INGEST_VERSION)); a server that bumps
+// its ingest ceiling would then negotiate v2 while our encoder still
+// stamps v1, and spec §3 requires it to reject every frame with
+// PARSE_ERROR. Ingress role/zone routing degrades to the wire-v1 rule
+// (target≠any → TopologyReject) in qwp_sf_round_walk.go.
+const qwpMaxSupportedIngestVersion byte = qwpVersion
 
 // QWP message header layout.
 const (
@@ -77,6 +196,7 @@ const (
 const (
 	qwpFlagGorilla         byte = 0x04 // Gorilla timestamp encoding
 	qwpFlagDeltaSymbolDict byte = 0x08 // delta symbol dictionary
+	qwpFlagZstd            byte = 0x10 // payload after prelude is zstd-compressed (egress only)
 )
 
 // qwpSchemaMode values control how column schema is transmitted.
@@ -87,16 +207,23 @@ const (
 	qwpSchemaModeReference qwpSchemaMode = 0x01 // reference a schema already registered by ID
 )
 
-// qwpStatusCode represents a server response status.
-type qwpStatusCode byte
+// QwpStatusCode represents a server response status. The byte value is
+// stable on the QWP wire and is preserved on SenderError.ServerStatusByte
+// for cross-language debugging; the recommended way to discriminate
+// rejections is the higher-level Category enum.
+type QwpStatusCode byte
 
 const (
-	qwpStatusOK             qwpStatusCode = 0x00 // batch accepted
-	qwpStatusSchemaMismatch qwpStatusCode = 0x03 // column type incompatible with existing table
-	qwpStatusParseError     qwpStatusCode = 0x05 // malformed message
-	qwpStatusInternalError  qwpStatusCode = 0x06 // server-side error
-	qwpStatusSecurityError  qwpStatusCode = 0x08 // authorization failure
-	qwpStatusWriteError     qwpStatusCode = 0x09 // write failure (e.g., table not accepting writes)
+	QwpStatusOK             QwpStatusCode = 0x00 // batch accepted
+	QwpStatusDurableAck     QwpStatusCode = 0x02 // per-table durable-upload ACK (replication primaries opted-in)
+	QwpStatusSchemaMismatch QwpStatusCode = 0x03 // column type incompatible with existing table
+	QwpStatusParseError     QwpStatusCode = 0x05 // malformed message
+	QwpStatusInternalError  QwpStatusCode = 0x06 // server-side error
+	QwpStatusSecurityError  QwpStatusCode = 0x08 // authorization failure
+	QwpStatusWriteError     QwpStatusCode = 0x09 // write failure (e.g., table not accepting writes)
+	// Egress-specific status codes (spec §15).
+	qwpStatusCancelled     QwpStatusCode = 0x0A // query terminated in response to CANCEL
+	qwpStatusLimitExceeded QwpStatusCode = 0x0B // a protocol limit was hit
 )
 
 // QWP sender defaults and limits.
@@ -123,10 +250,6 @@ const (
 	// Java: QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535.
 	qwpDefaultMaxSchemasPerConnection = 65_535
 
-	// qwpDefaultInitEncoderBufSize is the initial encoder buffer size.
-	// Java: QwpWebSocketSender.DEFAULT_BUFFER_SIZE = 8192.
-	qwpDefaultInitEncoderBufSize = 8 * 1024 // 8 KB
-
 	// qwpDefaultMicrobatchBufSize is the per-encoder microbatch buffer
 	// size used to coalesce rows before a WebSocket frame is sent.
 	// Java: QwpWebSocketSender.DEFAULT_MICROBATCH_BUFFER_SIZE = 1 MB.
@@ -135,6 +258,19 @@ const (
 	// qwpMaxColumnsPerTable caps columns per table. Go-only; the Java
 	// client does not enforce a hard cap.
 	qwpMaxColumnsPerTable = 2048
+
+	// qwpMaxBindsPerQuery caps bind parameters per QUERY_REQUEST.
+	// Spec §16. The server enforces this independently; the client-side
+	// preflight surfaces a typed error before bytes leave the process.
+	// Distinct from qwpMaxColumnsPerTable (an ingest concept) — egress
+	// QUERY_REQUEST and ingest DATA_BATCH have independent limits.
+	qwpMaxBindsPerQuery = 1024
+
+	// qwpMaxSqlTextBytes caps the UTF-8 byte length of the sql_bytes
+	// field in a QUERY_REQUEST. Spec §16 pins this at 1 MiB. The server
+	// enforces this independently; the client-side preflight produces a
+	// friendlier error and avoids serializing a doomed payload.
+	qwpMaxSqlTextBytes = 1 << 20
 
 	// qwpMaxTablesPerBatch is the hard upper bound on distinct tables
 	// in a single QWP message: the wire format encodes the table count
@@ -145,6 +281,65 @@ const (
 	// receive buffer. Go-only; the Java client manages the read path
 	// differently and has no direct counterpart.
 	qwpDefaultInitRecvBufSize = 64 * 1024 // 64 KB
+
+	// Hardening caps used by the egress `RESULT_BATCH` decoder. Match
+	// the Java reference decoder (QwpResultBatchDecoder.java) so hostile
+	// or buggy server frames that advertise out-of-range dimensions are
+	// rejected before any large allocation.
+
+	// qwpMaxBatchSize is the headline protocol cap on a single
+	// RESULT_BATCH frame's wire size, in bytes. Spec §14 "Protocol
+	// Limits" pins this at 16 MiB; the Java server enforces the same
+	// value via QwpConstants.DEFAULT_MAX_BATCH_SIZE. Acts as a direct
+	// upper bound checked before per-section bounds (row count, column
+	// count, dict heap, zstd content size) come into play — those
+	// remain as defense-in-depth, but the single cap is the spec-level
+	// limit a conformant server stays under.
+	qwpMaxBatchSize     = 16 * 1024 * 1024
+	qwpMaxRowsPerBatch  = 1_048_576 // per-batch row cap
+	qwpMaxTableNameLen  = 127       // UTF-8 bytes
+	qwpMaxColumnNameLen = 127       // UTF-8 bytes
+	qwpMaxArrayNDims    = 32        // max array dimensionality; matches Java reference
+	// qwpMaxArrayElements caps the element count of a single ARRAY cell
+	// so that element-count * 8 (element stride) plus the per-row shape
+	// header (up to qwpMaxArrayNDims * 4 bytes) together stay inside
+	// int32. The 1024-byte slack covers that shape header.
+	qwpMaxArrayElements = (1<<31 - 1 - 1024) / 8
+
+	// qwpReadLimitSlack is headroom added on top of qwpMaxBatchSize when
+	// arming the WebSocket read limit. coder/websocket's limitReader
+	// trips ErrMessageTooBig the moment its byte budget reaches zero —
+	// before the terminal io.EOF is delivered — so a legitimate frame of
+	// exactly qwpMaxBatchSize would be rejected without this margin (the
+	// library applies the same +1 trick to its own default limit). The
+	// band between qwpMaxBatchSize and the limit is never a valid frame:
+	// the egress decoder rejects RESULT_BATCH payloads > qwpMaxBatchSize,
+	// and every ACK / SERVER_INFO frame is far smaller.
+	qwpReadLimitSlack = 4096
+
+	// qwpMaxFrameReadLimit is the hard ceiling on a single inbound
+	// WebSocket message. Egress RESULT_BATCH / SERVER_INFO and ingest
+	// ACK frames share one connection, so this single cap covers both.
+	// Armed via Conn.SetReadLimit so a hostile or buggy server cannot
+	// OOM the host with a multi-GB frame: the limit is enforced *during*
+	// the streamed read, before the whole message is resident, rather
+	// than only after — qwpMaxBatchSize alone is checked post-assembly
+	// by the decoder and not at all on the readAck path. It also caps
+	// qwpReadFrameInto's buffer doubling as defense-in-depth.
+	qwpMaxFrameReadLimit = qwpMaxBatchSize + qwpReadLimitSlack
+
+	// qwpMaxConnDictHeapBytes caps the connection-scoped SYMBOL dict
+	// UTF-8 heap at 256 MiB. Servers that approach this cap are
+	// expected to emit CACHE_RESET; crossing it without a reset is a
+	// misbehaving (or hostile) server. Below uint32 max so the
+	// uint32 offsets stored on each entry cannot wrap. Mirrors Java
+	// QwpResultBatchDecoder.MAX_CONN_DICT_HEAP_BYTES.
+	qwpMaxConnDictHeapBytes = 256 * 1024 * 1024
+
+	// qwpMaxConnDictSize caps the connection-scoped SYMBOL dict entry
+	// count. Mirrors Java QwpResultBatchDecoder.MAX_CONN_DICT_SIZE
+	// (2^23) — same defensive intent as the heap cap.
+	qwpMaxConnDictSize = 8_388_608
 )
 
 // qwpFixedTypeSize returns the per-value size in bytes for fixed-width
@@ -158,7 +353,7 @@ func qwpFixedTypeSize(tc qwpTypeCode) int {
 		return 1
 	case qwpTypeShort, qwpTypeChar:
 		return 2
-	case qwpTypeInt, qwpTypeFloat:
+	case qwpTypeInt, qwpTypeFloat, qwpTypeIPv4:
 		return 4
 	case qwpTypeLong, qwpTypeDouble, qwpTypeTimestamp, qwpTypeDate,
 		qwpTypeTimestampNano, qwpTypeDecimal64:
@@ -167,7 +362,7 @@ func qwpFixedTypeSize(tc qwpTypeCode) int {
 		return 16
 	case qwpTypeLong256, qwpTypeDecimal256:
 		return 32
-	case qwpTypeSymbol, qwpTypeVarchar,
+	case qwpTypeSymbol, qwpTypeVarchar, qwpTypeBinary,
 		qwpTypeGeohash, qwpTypeDoubleArray, qwpTypeLongArray:
 		return -1 // variable-width
 	default:

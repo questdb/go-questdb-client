@@ -1500,6 +1500,31 @@ func TestQwpColumnBufferArrayNull(t *testing.T) {
 		}
 	})
 
+	t.Run("DoubleArrayNonNullablePanics", func(t *testing.T) {
+		// The wire format has no inline NULL sentinel for arrays, so
+		// addNull on a non-nullable array column has no valid
+		// encoding. The public API never produces this shape (array
+		// columns are always nullable), so this is purely a guard
+		// against misuse of the low-level buffer constructor.
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic, got none")
+			}
+		}()
+		c.addNull()
+	})
+
+	t.Run("LongArrayNonNullablePanics", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic, got none")
+			}
+		}()
+		c.addNull()
+	})
+
 	t.Run("InterleavedNullAndData", func(t *testing.T) {
 		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, true)
 		c.addDoubleArray(1, []int32{2}, []float64{1.0, 2.0}) // row 0: 21 bytes

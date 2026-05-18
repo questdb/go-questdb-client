@@ -33,12 +33,6 @@ import (
 // implementations stay in lockstep on wire-protocol constants.
 
 func TestQwpMagicBytesValue(t *testing.T) {
-	// "QWP1" in ASCII: Q=0x51, W=0x57, P=0x50, 1=0x31
-	// Stored as uint32 in little-endian: 0x31505751
-	if qwpMagic != 0x31505751 {
-		t.Fatalf("qwpMagic = 0x%08X, want 0x31505751", qwpMagic)
-	}
-
 	var buf [4]byte
 	binary.LittleEndian.PutUint32(buf[:], qwpMagic)
 	if buf != [4]byte{'Q', 'W', 'P', '1'} {
@@ -46,68 +40,21 @@ func TestQwpMagicBytesValue(t *testing.T) {
 	}
 }
 
-func TestQwpHeaderSize(t *testing.T) {
-	if qwpHeaderSize != 12 {
-		t.Fatalf("qwpHeaderSize = %d, want 12", qwpHeaderSize)
-	}
-}
-
-func TestQwpHeaderFieldOffsets(t *testing.T) {
-	// Magic occupies offsets [0..4), version at 4. Then flags, table
-	// count, payload length at documented offsets.
-	if qwpHeaderOffsetFlags != 5 {
-		t.Fatalf("qwpHeaderOffsetFlags = %d, want 5", qwpHeaderOffsetFlags)
-	}
-	if qwpHeaderOffsetTableCount != 6 {
-		t.Fatalf("qwpHeaderOffsetTableCount = %d, want 6", qwpHeaderOffsetTableCount)
-	}
-	if qwpHeaderOffsetPayloadLen != 8 {
-		t.Fatalf("qwpHeaderOffsetPayloadLen = %d, want 8", qwpHeaderOffsetPayloadLen)
-	}
-}
-
-func TestQwpVersion(t *testing.T) {
-	if qwpVersion != 0x01 {
-		t.Fatalf("qwpVersion = 0x%02X, want 0x01", qwpVersion)
-	}
-}
-
-func TestQwpFlagBitPositions(t *testing.T) {
-	if qwpFlagGorilla != 0x04 {
-		t.Fatalf("qwpFlagGorilla = 0x%02X, want 0x04", qwpFlagGorilla)
-	}
-	if qwpFlagDeltaSymbolDict != 0x08 {
-		t.Fatalf("qwpFlagDeltaSymbolDict = 0x%02X, want 0x08", qwpFlagDeltaSymbolDict)
-	}
-	// Flags are independent bits, so OR'ing them yields both set.
-	if qwpFlagGorilla&qwpFlagDeltaSymbolDict != 0 {
-		t.Fatalf("flag bits overlap: gorilla=0x%02X, deltaDict=0x%02X",
-			qwpFlagGorilla, qwpFlagDeltaSymbolDict)
-	}
-}
-
-func TestQwpSchemaModes(t *testing.T) {
-	if qwpSchemaModeFull != 0x00 {
-		t.Fatalf("qwpSchemaModeFull = 0x%02X, want 0x00", qwpSchemaModeFull)
-	}
-	if qwpSchemaModeReference != 0x01 {
-		t.Fatalf("qwpSchemaModeReference = 0x%02X, want 0x01", qwpSchemaModeReference)
-	}
-}
-
 func TestQwpStatusCodes(t *testing.T) {
 	// ACK status codes the server emits. These must match the Java
-	// reference so QwpError classification stays correct.
+	// reference so SenderError classification stays correct.
 	cases := []struct {
-		code qwpStatusCode
+		code QwpStatusCode
 		want byte
 	}{
-		{qwpStatusOK, 0x00},
-		{qwpStatusSchemaMismatch, 0x03},
-		{qwpStatusParseError, 0x05},
-		{qwpStatusInternalError, 0x06},
-		{qwpStatusSecurityError, 0x08},
-		{qwpStatusWriteError, 0x09},
+		{QwpStatusOK, 0x00},
+		{QwpStatusSchemaMismatch, 0x03},
+		{QwpStatusParseError, 0x05},
+		{QwpStatusInternalError, 0x06},
+		{QwpStatusSecurityError, 0x08},
+		{QwpStatusWriteError, 0x09},
+		{qwpStatusCancelled, 0x0A},
+		{qwpStatusLimitExceeded, 0x0B},
 	}
 	for _, c := range cases {
 		if byte(c.code) != c.want {
@@ -145,10 +92,38 @@ func TestQwpTypeCodes(t *testing.T) {
 		{qwpTypeDecimal128, 0x14},
 		{qwpTypeDecimal256, 0x15},
 		{qwpTypeChar, 0x16},
+		{qwpTypeBinary, 0x17},
+		{qwpTypeIPv4, 0x18},
 	}
 	for _, c := range cases {
 		if byte(c.tc) != c.want {
 			t.Errorf("type code 0x%02X, want 0x%02X", byte(c.tc), c.want)
+		}
+	}
+}
+
+func TestQwpMsgKinds(t *testing.T) {
+	// Egress message-kind discriminators (spec §5). Values here are
+	// the wire bytes the egress server sends and the Go client must
+	// dispatch on; they must match the Java QwpEgressMsgKind constants.
+	cases := []struct {
+		kind qwpMsgKind
+		want byte
+	}{
+		{qwpMsgKindDataBatch, 0x00},
+		{qwpMsgKindResponse, 0x01},
+		{qwpMsgKindQueryRequest, 0x10},
+		{qwpMsgKindResultBatch, 0x11},
+		{qwpMsgKindResultEnd, 0x12},
+		{qwpMsgKindQueryError, 0x13},
+		{qwpMsgKindCancel, 0x14},
+		{qwpMsgKindCredit, 0x15},
+		{qwpMsgKindExecDone, 0x16},
+		{qwpMsgKindCacheReset, 0x17},
+	}
+	for _, c := range cases {
+		if byte(c.kind) != c.want {
+			t.Errorf("msg kind 0x%02X, want 0x%02X", byte(c.kind), c.want)
 		}
 	}
 }
@@ -164,6 +139,7 @@ func TestQwpFixedTypeSize(t *testing.T) {
 		{qwpTypeChar, 2},
 		{qwpTypeInt, 4},
 		{qwpTypeFloat, 4},
+		{qwpTypeIPv4, 4},
 		{qwpTypeLong, 8},
 		{qwpTypeDouble, 8},
 		{qwpTypeTimestamp, 8},
@@ -177,6 +153,7 @@ func TestQwpFixedTypeSize(t *testing.T) {
 		// Variable-width types report -1.
 		{qwpTypeSymbol, -1},
 		{qwpTypeVarchar, -1},
+		{qwpTypeBinary, -1},
 		{qwpTypeGeohash, -1},
 		{qwpTypeDoubleArray, -1},
 		{qwpTypeLongArray, -1},
@@ -188,35 +165,108 @@ func TestQwpFixedTypeSize(t *testing.T) {
 	}
 }
 
-func TestQwpMaxTablesPerBatch(t *testing.T) {
-	// The table count field in the header is a uint16, so the max
-	// addressable tables per batch is 0xFFFF.
-	if qwpMaxTablesPerBatch != 0xFFFF {
-		t.Fatalf("qwpMaxTablesPerBatch = %d, want 65535", qwpMaxTablesPerBatch)
-	}
-}
-
-func TestQwpMaxColumnsPerTable(t *testing.T) {
-	// Matches QwpConstants.MAX_COLUMNS_PER_TABLE in the server.
-	if qwpMaxColumnsPerTable != 2048 {
-		t.Fatalf("qwpMaxColumnsPerTable = %d, want 2048", qwpMaxColumnsPerTable)
-	}
-}
-
-func TestQwpTimestampEncodingFlags(t *testing.T) {
-	// Per-column timestamp encoding flag byte values (QWP spec §12).
-	if qwpTsEncodingUncompressed != 0x00 {
-		t.Fatalf("qwpTsEncodingUncompressed = 0x%02X, want 0x00", qwpTsEncodingUncompressed)
-	}
-	if qwpTsEncodingGorilla != 0x01 {
-		t.Fatalf("qwpTsEncodingGorilla = 0x%02X, want 0x01", qwpTsEncodingGorilla)
-	}
-}
-
 func TestQwpLongNullSentinel(t *testing.T) {
 	// Int64 MinInt64 as uint64 — used as the null sentinel for
 	// non-nullable LONG/TIMESTAMP/DATE/UUID/LONG256 columns.
 	if qwpLongNull != 0x8000000000000000 {
 		t.Fatalf("qwpLongNull = 0x%016X, want 0x8000000000000000", qwpLongNull)
+	}
+}
+
+func TestQwpFlagBitPositions(t *testing.T) {
+	// Header flag bits. Drift here is a wire-format break — the
+	// server uses these exact bits to signal Gorilla / delta-dict /
+	// zstd payload encoding. Mirrors Java's QwpConstantsTest
+	// testFlagBitPositions.
+	if qwpFlagGorilla != 0x04 {
+		t.Errorf("qwpFlagGorilla = 0x%02X, want 0x04", qwpFlagGorilla)
+	}
+	if qwpFlagDeltaSymbolDict != 0x08 {
+		t.Errorf("qwpFlagDeltaSymbolDict = 0x%02X, want 0x08", qwpFlagDeltaSymbolDict)
+	}
+	// qwpFlagZstd is Go-side specific (the egress server uses it for
+	// RESULT_BATCH compression). Pinned to catch silent drift.
+	if qwpFlagZstd != 0x10 {
+		t.Errorf("qwpFlagZstd = 0x%02X, want 0x10", qwpFlagZstd)
+	}
+}
+
+func TestQwpHeaderSize(t *testing.T) {
+	// 12-byte header: 4 magic + 1 version + 2 reserved + 1 flags
+	// + 4 payload-length. Drift here means the encoder and the
+	// decoder won't agree on where the payload starts. Mirrors
+	// Java's QwpConstantsTest testHeaderSize.
+	if qwpHeaderSize != 12 {
+		t.Errorf("qwpHeaderSize = %d, want 12", qwpHeaderSize)
+	}
+	// Pin the offsets the decoder actually reaches into too — a
+	// reorganised header that kept the size but moved the flags or
+	// payload-length fields would slip past the size check above.
+	if qwpHeaderOffsetFlags != 5 {
+		t.Errorf("qwpHeaderOffsetFlags = %d, want 5", qwpHeaderOffsetFlags)
+	}
+	if qwpHeaderOffsetPayloadLen != 8 {
+		t.Errorf("qwpHeaderOffsetPayloadLen = %d, want 8", qwpHeaderOffsetPayloadLen)
+	}
+}
+
+func TestQwpMaxColumnsPerTable(t *testing.T) {
+	// Mirrors Java's QwpConstantsTest testMaxColumnsPerTable.
+	if qwpMaxColumnsPerTable != 2048 {
+		t.Errorf("qwpMaxColumnsPerTable = %d, want 2048", qwpMaxColumnsPerTable)
+	}
+}
+
+func TestQwpMaxBindsPerQuery(t *testing.T) {
+	// Pinned by spec §16 (max bind parameters per QUERY_REQUEST).
+	if qwpMaxBindsPerQuery != 1024 {
+		t.Errorf("qwpMaxBindsPerQuery = %d, want 1024", qwpMaxBindsPerQuery)
+	}
+}
+
+func TestQwpMaxSqlTextBytes(t *testing.T) {
+	// Pinned by spec §16 (max SQL text length: 1 MiB UTF-8 bytes).
+	if qwpMaxSqlTextBytes != 1024*1024 {
+		t.Errorf("qwpMaxSqlTextBytes = %d, want %d", qwpMaxSqlTextBytes, 1024*1024)
+	}
+}
+
+func TestQwpMaxBatchSize(t *testing.T) {
+	// Pinned by spec §14 "Protocol Limits": Max batch size 16 MB.
+	// Mirrors Java QwpConstants.DEFAULT_MAX_BATCH_SIZE.
+	if qwpMaxBatchSize != 16*1024*1024 {
+		t.Errorf("qwpMaxBatchSize = %d, want %d", qwpMaxBatchSize, 16*1024*1024)
+	}
+}
+
+func TestQwpIsFixedWidthType(t *testing.T) {
+	// Go has no isFixedWidth() boolean — the same information is
+	// encoded in qwpFixedTypeSize (>= 0 for fixed, -1 for variable).
+	// Mirrors Java's QwpConstantsTest testIsFixedWidthType: the
+	// classification is a wire-format invariant (fixed-width types
+	// pack into the data section without offsets, variable-width
+	// types carry a (nonNullCount+1)*4 offset table or a custom
+	// per-cell layout).
+	fixed := []qwpTypeCode{
+		qwpTypeBoolean, qwpTypeByte, qwpTypeShort, qwpTypeChar,
+		qwpTypeInt, qwpTypeLong, qwpTypeFloat, qwpTypeDouble,
+		qwpTypeTimestamp, qwpTypeTimestampNano, qwpTypeDate,
+		qwpTypeUuid, qwpTypeLong256,
+		qwpTypeDecimal64, qwpTypeDecimal128, qwpTypeDecimal256,
+		qwpTypeIPv4,
+	}
+	for _, tc := range fixed {
+		if qwpFixedTypeSize(tc) < 0 {
+			t.Errorf("qwpFixedTypeSize(0x%02X) = -1; expected fixed-width type", byte(tc))
+		}
+	}
+	variable := []qwpTypeCode{
+		qwpTypeSymbol, qwpTypeGeohash, qwpTypeVarchar, qwpTypeBinary,
+		qwpTypeDoubleArray, qwpTypeLongArray,
+	}
+	for _, tc := range variable {
+		if qwpFixedTypeSize(tc) != -1 {
+			t.Errorf("qwpFixedTypeSize(0x%02X) = %d; expected -1 (variable-width)", byte(tc), qwpFixedTypeSize(tc))
+		}
 	}
 }

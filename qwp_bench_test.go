@@ -165,7 +165,7 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 			}
 		}
 		tables, _ := s.buildTableEncodeInfo()
-		s.encoders[0].encodeMultiTableWithDeltaDict(
+		s.encoder.encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,
 			s.maxSentSymbolId,
@@ -199,8 +199,14 @@ func BenchmarkQwpSenderSteadyState(b *testing.B) {
 
 // TestQwpSenderSteadyStateZeroAllocs pins the 0-allocs/op invariant
 // programmatically so the invariant survives refactors without a
-// developer having to read the benchmark output.
+// developer having to read the benchmark output. Only meaningful for
+// non-race builds: race instrumentation forces some stack-allocatable
+// values to escape and inflates allocs/op (see TestQwpSender
+// SteadyStateNullsZeroAllocs for the variant that trips on this).
 func TestQwpSenderSteadyStateZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
 	_, iter := qwpSteadyStateSetup()
 	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
 		t.Fatalf("steady-state allocs/op = %g, want 0", allocs)
@@ -246,7 +252,7 @@ func qwpSteadyStateSetupWithNulls() (*qwpLineSender, func()) {
 			}
 		}
 		tables, _ := s.buildTableEncodeInfo()
-		s.encoders[0].encodeMultiTableWithDeltaDict(
+		s.encoder.encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,
 			s.maxSentSymbolId,
@@ -277,8 +283,12 @@ func BenchmarkQwpSenderSteadyStateNulls(b *testing.B) {
 }
 
 // TestQwpSenderSteadyStateNullsZeroAllocs pins the 0-allocs/op
-// invariant for the null-mix variant.
+// invariant for the null-mix variant. See sibling test for the -race
+// caveat.
 func TestQwpSenderSteadyStateNullsZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
 	_, iter := qwpSteadyStateSetupWithNulls()
 	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
 		t.Fatalf("steady-state-nulls allocs/op = %g, want 0", allocs)
@@ -326,4 +336,66 @@ func BenchmarkQwpColumnAdd(b *testing.B) {
 			col.addSymbolID(int32(i % 100))
 		}
 	})
+}
+
+// BenchmarkQwpGorillaDecode measures Gorilla DoD decoding throughput
+// over a long timestamp column. The bit reader's hot loop issues up to
+// four single-bit prefix reads plus one wide signed read per row, so
+// this is the regression gate for the 8-byte LE refill optimisation in
+// qwpBitReader.readBits / readBitsSlow.
+func BenchmarkQwpGorillaDecode(b *testing.B) {
+	const n = 4096
+	mk := func(stepFn func(i int) int64) ([]byte, int64, int64) {
+		ts := make([]int64, n)
+		var cur int64
+		for i := range ts {
+			cur += stepFn(i)
+			ts[i] = cur
+		}
+		var wb qwpWireBuffer
+		var enc qwpGorillaEncoder
+		enc.encodeTimestamps(&wb, intsToBytes(ts), n)
+		// Strip the 16-byte uncompressed prefix the bit reader doesn't
+		// touch — the decoder's reset() takes only the bit-packed tail.
+		return append([]byte(nil), wb.bytes()[16:]...), ts[0], ts[1]
+	}
+
+	constantData, constantTs0, constantTs1 := mk(func(int) int64 { return 1000 })
+	smallData, smallTs0, smallTs1 := mk(func(i int) int64 {
+		// Most DoDs land in the 1- or 9-bit bucket.
+		return 1000 + int64((i*37)%5) - 2
+	})
+	wideData, wideTs0, wideTs1 := mk(func(i int) int64 {
+		// Forces the 32-bit bucket via large alternating jumps.
+		if i%2 == 0 {
+			return 1_000_000
+		}
+		return 1
+	})
+
+	cases := []struct {
+		name string
+		data []byte
+		ts0  int64
+		ts1  int64
+	}{
+		{"ConstantDelta", constantData, constantTs0, constantTs1},
+		{"SmallJitter", smallData, smallTs0, smallTs1},
+		{"WideJitter", wideData, wideTs0, wideTs1},
+	}
+
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			var dec qwpGorillaDecoder
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				dec.reset(c.ts0, c.ts1, c.data)
+				for j := 2; j < n; j++ {
+					if _, err := dec.decodeNext(); err != nil {
+						b.Fatalf("decodeNext[%d]: %v", j, err)
+					}
+				}
+			}
+		})
+	}
 }

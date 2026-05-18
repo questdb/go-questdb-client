@@ -65,7 +65,7 @@ func qwpSkipIfNoServer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil)
 	if err != nil {
 		t.Skipf("QuestDB not available at %s: %v", qwpTestAddr, err)
 	}
@@ -150,7 +150,7 @@ func TestQwpIntegrationBasicTypes(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestQwpIntegrationMultipleFlushes(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestQwpIntegrationSymbolDedup(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestQwpIntegrationMultiTable(t *testing.T) {
 	defer qwpDropTable(t, table1)
 	defer qwpDropTable(t, table2)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func TestQwpIntegrationLargeBatch(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 5*time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,14 +454,14 @@ func TestQwpIntegrationAsyncMode(t *testing.T) {
 	defer qwpDropTable(t, tableName)
 
 	// Create sender with in-flight window = 4.
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 5*time.Second, 0, 0, nil, 4)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 0, 0, nil, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close(ctx)
 
-	if s.asyncState == nil {
-		t.Fatal("expected async mode with window=4")
+	if s.cursorEngine == nil || s.cursorSendLoop == nil {
+		t.Fatal("expected cursor engine + send loop to be wired")
 	}
 
 	const rowCount = 1000
@@ -540,7 +540,7 @@ func TestQwpIntegrationAutoFlush(t *testing.T) {
 	defer qwpDropTable(t, tableName)
 
 	// auto-flush every 3 rows.
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 3, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 3, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +588,7 @@ func TestQwpIntegrationNullableColumns(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +742,7 @@ func TestQwpIntegrationLong256(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +824,7 @@ func TestQwpIntegrationAtNow(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1416,7 +1416,7 @@ func TestQwpIntegrationOmittedColumns(t *testing.T) {
 // subtest gets its own sender.
 func newOrSkip(t *testing.T, ctx context.Context) QwpSender {
 	t.Helper()
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
 		t.Skipf("QuestDB not available at %s: %v", qwpTestAddr, err)
 	}
@@ -1880,7 +1880,7 @@ func TestQwpIntegrationAsyncCloseFlushes(t *testing.T) {
 	defer qwpDropTable(t, tableName)
 
 	// Async sender (in-flight window = 4). No explicit Flush.
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 5*time.Second, 0, 0, nil, 4)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 0, 0, nil, 4)
 	if err != nil {
 		t.Skipf("connect: %v", err)
 	}
@@ -1924,7 +1924,7 @@ func TestQwpIntegrationAsyncStressAcks(t *testing.T) {
 
 	// autoFlushRows=2 → 50 batches in flight for 100 rows, with the
 	// default in-flight window the sender must recycle buffers via ACKs.
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 5*time.Second, 2, 0, nil, 4)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 2, 0, nil, 4)
 	if err != nil {
 		t.Skipf("connect: %v", err)
 	}
@@ -1966,7 +1966,7 @@ func TestQwpIntegrationAsyncMultiTable(t *testing.T) {
 	defer qwpDropTable(t, tableA)
 	defer qwpDropTable(t, tableB)
 
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 5*time.Second, 0, 0, nil, 4)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 0, 0, nil, 4)
 	if err != nil {
 		t.Skipf("connect: %v", err)
 	}
@@ -2015,7 +2015,7 @@ func TestQwpIntegrationAsyncRowBasedFlush(t *testing.T) {
 	defer qwpDropTable(t, tableName)
 
 	// autoFlushRows=10, so 50 rows → 5 automatic flushes in async mode.
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 5*time.Second, 10, 0, nil, 4)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 10, 0, nil, 4)
 	if err != nil {
 		t.Skipf("connect: %v", err)
 	}
@@ -2073,7 +2073,7 @@ func TestQwpIntegrationConcurrentSenders(t *testing.T) {
 		for s := 0; s < senderCount; s++ {
 			go func(idx int) {
 				defer wg.Done()
-				sender, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 5*time.Second, 10, 0, nil, 4)
+				sender, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 10, 0, nil, 4)
 				if err != nil {
 					errs <- fmt.Errorf("sender %d connect: %w", idx, err)
 					return
@@ -2124,7 +2124,7 @@ func TestQwpIntegrationConcurrentSenders(t *testing.T) {
 		for s := 0; s < senderCount; s++ {
 			go func(idx int) {
 				defer wg.Done()
-				sender, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{}, 5*time.Second, 10, 0, nil, 4)
+				sender, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 10, 0, nil, 4)
 				if err != nil {
 					errs <- fmt.Errorf("sender %d connect: %w", idx, err)
 					return
@@ -2373,4 +2373,45 @@ func TestQwpIntegrationBoolBitPacking(t *testing.T) {
 			t.Errorf("row %d flag = %v, want %v", i, got, want)
 		}
 	}
+}
+
+func TestQwpIntegrationConnect(t *testing.T) {
+	ctx := context.Background()
+
+	var tr qwpTransport
+	err := tr.connect(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath})
+	if err != nil {
+		t.Skipf("QuestDB not available: %v", err)
+	}
+	defer tr.close()
+
+	// Send a simple QWP message with delta symbol dict (required
+	// by the server for symbol columns) and verify the ACK.
+	tb := newQwpTableBuffer("qwp_transport_test")
+	col, _ := tb.getOrCreateColumn("value", qwpTypeLong, false)
+	col.addLong(42)
+	colTs, _ := tb.getOrCreateColumn("ts", qwpTypeTimestamp, false)
+	colTs.addTimestamp(1000000)
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+
+	t.Logf("sending QWP message (%d bytes): %x", len(msg), msg)
+
+	if err := tr.sendMessage(ctx, msg); err != nil {
+		t.Fatalf("sendMessage: %v", err)
+	}
+
+	status, data, err := tr.readAck(ctx)
+	if err != nil {
+		t.Fatalf("readAck: %v", err)
+	}
+
+	if status != QwpStatusOK {
+		errStr := parseAckError(data)
+		t.Logf("raw ACK response (%d bytes): %x", len(data), data)
+		t.Fatalf("expected OK, got status 0x%02X: %s", status, errStr)
+	}
+	t.Logf("ACK OK, sequence=%d", parseAckSequence(data))
 }

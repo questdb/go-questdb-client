@@ -223,22 +223,16 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 
 	lines := []string{}
 
-	go func() {
+	assert.Eventually(t, func() bool {
 		for {
 			select {
 			case msg := <-srv.BackCh:
 				lines = append(lines, msg)
-			case <-srv.closeCh:
-				return
 			default:
-				continue
+				return len(lines) == numThreads
 			}
 		}
-	}()
-
-	assert.Eventually(t, func() bool {
-		return len(lines) == numThreads
-	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
+	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d", numThreads, len(lines))
 }
 
 func TestTcpNotSupported(t *testing.T) {

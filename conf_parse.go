@@ -134,7 +134,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
 			senderConf.autoFlushBytes = parsedVal
-		case "request_min_throughput", "init_buf_size", "max_buf_size":
+		case "request_min_throughput", "init_buf_size", "max_buf_size", "max_name_len":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
@@ -147,6 +147,8 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				senderConf.initBufSize = parsedVal
 			case "max_buf_size":
 				senderConf.maxBufSize = parsedVal
+			case "max_name_len":
+				senderConf.fileNameLimit = parsedVal
 			default:
 				panic("add a case for " + k)
 			}
@@ -229,12 +231,326 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				return nil, NewInvalidConfigStrError("invalid gorilla value, %q is not 'on' or 'off'", v)
 			}
+		case "sf_dir":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			senderConf.sfDir = v
+		case "sender_id":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			if err := validateSenderId(v); err != nil {
+				return nil, err
+			}
+			senderConf.senderId = v
+		case "sf_max_bytes":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int", k, v)
+			}
+			senderConf.sfMaxBytes = parsedVal
+		case "sf_max_total_bytes":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int", k, v)
+			}
+			senderConf.sfMaxTotalBytes = parsedVal
+		case "sf_durability":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			if err := validateSfDurability(v); err != nil {
+				return nil, err
+			}
+			senderConf.sfDurability = v
+		case "sf_append_deadline_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.sfAppendDeadlineMillis = parsedVal
+		case "auth_timeout_ms":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.authTimeoutMs = parsedVal
+		case "zone":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			// Silently accepted on QWP; SF ingress is zone-blind (v1-pinned)
+			// and treats every host as `Same`. Egress will read it when
+			// the zone-locality work lands. Sharing one connect string
+			// across ingress and egress clients is the documented usage,
+			// so a per-startup WARN would fire spuriously on the SF side.
+			senderConf.zone = v
+		case "target":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			t, err := parseTargetFilter(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("%v", err)
+			}
+			senderConf.target = t
+		case "reconnect_max_duration_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal < 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative int (milliseconds)", k, v)
+			}
+			senderConf.reconnectMaxDurationMillis = parsedVal
+		case "reconnect_initial_backoff_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.reconnectInitialBackoffMillis = parsedVal
+		case "reconnect_max_backoff_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.reconnectMaxBackoffMillis = parsedVal
+		case "initial_connect_retry":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "on", "true", "sync":
+				senderConf.initialConnectMode = InitialConnectSync
+			case "off", "false":
+				senderConf.initialConnectMode = InitialConnectOff
+			case "async":
+				senderConf.initialConnectMode = InitialConnectAsync
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false' / 'sync' / 'async'", k, v)
+			}
+		case "close_flush_timeout_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int (milliseconds)", k, v)
+			}
+			senderConf.closeFlushTimeoutSet = true
+			senderConf.closeFlushTimeoutMillis = parsedVal
+		case "drain_orphans":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "on", "true":
+				senderConf.drainOrphans = true
+			case "off", "false":
+				senderConf.drainOrphans = false
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
+			}
+		case "max_background_drainers":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal < 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative int", k, v)
+			}
+			senderConf.maxBackgroundDrainers = parsedVal
+		case "on_server_error":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			pol, err := parseErrorPolicyValue(k, v, true)
+			if err != nil {
+				return nil, err
+			}
+			senderConf.errorPolicyGlobal = pol
+		case "on_schema_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategorySchemaMismatch); err != nil {
+				return nil, err
+			}
+		case "on_parse_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategoryParseError); err != nil {
+				return nil, err
+			}
+		case "on_internal_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategoryInternalError); err != nil {
+				return nil, err
+			}
+		case "on_security_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategorySecurityError); err != nil {
+				return nil, err
+			}
+		case "on_write_error":
+			if err := setPerCategoryPolicy(senderConf, k, v, CategoryWriteError); err != nil {
+				return nil, err
+			}
+		case "error_inbox_capacity":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			if parsedVal < qwpSfMinErrorInboxCapacity {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %d: must be >= %d",
+					k, parsedVal, qwpSfMinErrorInboxCapacity)
+			}
+			senderConf.errorInboxCapacity = parsedVal
+		case "request_durable_ack":
+			if senderConf.senderType != qwpSenderType {
+				// sf-client.md §4.6 mandates rejecting
+				// request_durable_ack=on on non-WebSocket transports.
+				// QWP (ws/wss) is the only WebSocket transport here, so
+				// a non-QWP sender can never honour it -- reject the key
+				// outright, consistent with every other SF key.
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "off", "false":
+				// The default. Non-durable, OK-driven trim is fully
+				// conformant (sf-client.md §9.2 / §19); nothing to wire.
+			case "on", "true":
+				// Durable-ack mode (sf-client.md §4.3 / §8.1 / §9.3 /
+				// §10 / §11) is a deferred opt-in, EE-only QoS feature:
+				// the cursor send loop OK-trims and silently ignores
+				// DURABLE_ACK frames (qwp_sf_send_loop.go). §19 makes
+				// the key normative so we accept it, but opting in is
+				// rejected with a clear deferred-feature message rather
+				// than the generic "unsupported option", mirroring
+				// sf_durability=flush.
+				return nil, NewInvalidConfigStrError(
+					"request_durable_ack=%s is not yet supported: durable-ack mode is not implemented in this client (deferred follow-up; use request_durable_ack=off)", v)
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
+			}
+		case "durable_ack_keepalive_interval_millis":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			// Accepted for connect-string portability (sf-client.md
+			// §4.3 / §19) but inert: it only paces keepalive PINGs in
+			// durable-ack mode, which this client does not implement
+			// (see request_durable_ack). Validate the shape so a typo
+			// still errors helpfully; 0 / negative mean "disabled" per
+			// spec, so any int is in range.
+			if _, err := strconv.Atoi(v); err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
+			}
 		default:
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}
 	}
 
 	return senderConf, nil
+}
+
+// parseErrorPolicyValue parses a connect-string Policy value. When
+// allowAuto is true, "auto" is accepted (used by the global
+// on_server_error key whose default semantic is "use the per-category
+// table"); per-category keys reject "auto" because the sentinel is
+// only meaningful at the global layer.
+func parseErrorPolicyValue(k, v string, allowAuto bool) (Policy, error) {
+	switch v {
+	case "halt":
+		return PolicyHalt, nil
+	case "drop":
+		return PolicyDropAndContinue, nil
+	case "auto":
+		if allowAuto {
+			return PolicyAuto, nil
+		}
+	}
+	if allowAuto {
+		return PolicyAuto, NewInvalidConfigStrError(
+			"invalid %s value, %q is not 'auto' / 'halt' / 'drop'", k, v)
+	}
+	return PolicyAuto, NewInvalidConfigStrError(
+		"invalid %s value, %q is not 'halt' / 'drop'", k, v)
+}
+
+// setPerCategoryPolicy parses v as a Policy and stores it on the
+// per-category override slot for c, gating to QWP and setting the
+// per-category-set flag for sanitizer routing.
+func setPerCategoryPolicy(conf *lineSenderConfig, k, v string, c Category) error {
+	if conf.senderType != qwpSenderType {
+		return NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+	}
+	pol, err := parseErrorPolicyValue(k, v, false)
+	if err != nil {
+		return err
+	}
+	conf.errorPolicyPerCat[c] = pol
+	conf.errorPolicyPerCatSet = true
+	return nil
+}
+
+// validateSfDurability checks an sf_durability value. The empty
+// string means "unset" (defaults to memory at construction); only
+// "memory" is currently honoured. "flush" / "append" are reserved
+// for a deferred follow-up and rejected with a pointer to the
+// supported value. Shared by the connect-string parser and
+// sanitizeQwpConf so the WithSfDurability functional-option path
+// rejects identically — single source of truth for the value space.
+func validateSfDurability(v string) error {
+	switch v {
+	case "", "memory":
+		return nil
+	case "flush", "append":
+		return NewInvalidConfigStrError(
+			"sf_durability=%s is not yet supported (deferred follow-up; use sf_durability=memory)", v)
+	default:
+		return NewInvalidConfigStrError(
+			"invalid sf_durability value, %q is not 'memory' (other values reserved for future use)", v)
+	}
+}
+
+// validateSenderId enforces the same character set the Java client
+// allows for sender_id: ASCII letters, digits, '-', '_', '.'. The
+// value is used as a path segment under sf_dir; permitting '/' or
+// '\\' would let users traverse out of the slot dir.
+func validateSenderId(id string) error {
+	if id == "" {
+		return NewInvalidConfigStrError("sender_id must not be empty")
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'
+		if !ok {
+			return NewInvalidConfigStrError("sender_id contains invalid character: %q", string(c))
+		}
+	}
+	return nil
 }
 
 func parseConfigStr(conf string) (configData, error) {
@@ -296,7 +612,22 @@ func parseConfigStr(conf string) (configData, error) {
 				return result, NewInvalidConfigStrError("empty value for key %q", key)
 			}
 
-			result.KeyValuePairs[key.String()] = value.String()
+			// Reject duplicate keys (case-sensitive) for parity with Rust and
+			// the per-field checks in Java; otherwise dups would silently LWW.
+			// `addr` is the documented exception: the failover spec (§1)
+			// allows `addr=h1;addr=h2` as an alternative spelling of
+			// `addr=h1,h2`. Both forms accumulate into a single
+			// comma-joined value so downstream parsers see one shape.
+			keyStr := key.String()
+			if existing, exists := result.KeyValuePairs[keyStr]; exists {
+				if keyStr == "addr" {
+					result.KeyValuePairs[keyStr] = existing + "," + value.String()
+				} else {
+					return result, NewInvalidConfigStrError("duplicate key %q", keyStr)
+				}
+			} else {
+				result.KeyValuePairs[keyStr] = value.String()
+			}
 
 			key.Reset()
 			value.Reset()

@@ -287,6 +287,33 @@ const (
 	ProtocolVersion3     protocolVersion = 3
 )
 
+// InitialConnectMode controls how the QWP sender treats failures of
+// its very first connect attempt. Mirrors the Java client's
+// `initial_connect_retry` enum.
+type InitialConnectMode byte
+
+const (
+	// InitialConnectOff (the default) makes any failure on the first
+	// connect terminal — typically a misconfig, retrying just hides
+	// it. The constructor surfaces the dial error directly.
+	InitialConnectOff InitialConnectMode = iota
+	// InitialConnectSync runs the same retry-with-backoff loop as
+	// reconnect on the calling goroutine, blocking the constructor
+	// until either the connection comes up or the reconnect budget
+	// (reconnect_max_duration_millis) is exhausted. Auth/upgrade
+	// failures stay terminal.
+	InitialConnectSync
+	// InitialConnectAsync defers the dial to the I/O goroutine and
+	// returns from the constructor immediately with an unconnected
+	// sender. The producer goroutine can call Table()/At()/Flush()
+	// right away; rows accumulate in the cursor SF engine until the
+	// connection comes up. Connect-budget exhaustion or terminal
+	// upgrade failure is delivered through the configured
+	// SenderErrorHandler (and surfaced from any subsequent producer
+	// API call as a typed error).
+	InitialConnectAsync
+)
+
 type lineSenderConfig struct {
 	senderType    senderType
 	address       string
@@ -294,6 +321,17 @@ type lineSenderConfig struct {
 	maxBufSize    int
 	fileNameLimit int
 	httpTransport *http.Transport
+
+	// Multi-host failover (failover.md §1 / §2). For QWP, sanitizeQwpConf
+	// populates endpoints from address (which may be a comma-joined
+	// list); downstream consumers walk endpoints rather than address.
+	// Non-QWP transports leave endpoints nil and continue using address
+	// directly — sanitizeHttp/sanitizeTcp reject comma-form addr at
+	// validation time since neither transport supports multi-host yet.
+	endpoints     []qwpEndpoint
+	authTimeoutMs int             // QWP-only; 0 -> 15000 (15s) at sanitize time
+	zone          string          // QWP-only; silently ignored on SF ingress (zone-blind, v1-pinned)
+	target        qwpTargetFilter // QWP-only; zero value = qwpTargetAny
 
 	// Retry/timeout-related fields
 	retryTimeout   time.Duration
@@ -321,6 +359,34 @@ type lineSenderConfig struct {
 	maxSchemasPerConnection int           // 0 = unset; seeded to qwpDefaultMaxSchemasPerConnection
 	dumpWriter              io.Writer     // if set, record outgoing bytes (unexported)
 	gorillaDisabled         bool          // false (default) = Gorilla timestamp encoding enabled
+
+	// QWP store-and-forward (cursor) fields. Setting sfDir activates
+	// cursor mode: flushed batches are persisted to mmap'd files
+	// under <sfDir>/<senderId>/ and the I/O loop replays from disk
+	// on reconnect / restart. When sfDir is empty, the sender stays
+	// on the in-memory async path (qwpAsyncState).
+	sfDir                         string
+	senderId                      string        // empty -> "default" at construction
+	sfMaxBytes                    int64         // per-segment size (bytes); 0 -> 4 MiB
+	sfMaxTotalBytes               int64         // total cap (bytes); 0 -> 10 GiB
+	sfDurability                  string        // empty / "memory" only; reserved future "flush" / "append"
+	sfAppendDeadlineMillis        int           // 0 -> 30000
+	reconnectMaxDurationMillis    int           // 0 -> 300000 (5 min)
+	reconnectInitialBackoffMillis int           // 0 -> 100
+	reconnectMaxBackoffMillis     int           // 0 -> 5000
+	initialConnectMode            InitialConnectMode // default InitialConnectOff
+	closeFlushTimeoutMillis       int           // 0 -> 5000; -1 / negative -> fast close (skip drain)
+	closeFlushTimeoutSet          bool          // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
+	drainOrphans                  bool          // default false (Phase 6)
+	maxBackgroundDrainers         int           // 0 -> 4 (Phase 6)
+
+	// QWP server-error API (Phase 5). All fields are QWP-only.
+	errorHandler         SenderErrorHandler                       // nil -> default loud handler
+	errorPolicyResolver  func(Category) Policy                    // nil -> per-category map / global / spec defaults
+	errorPolicyPerCat    [numCategories]Policy                    // PolicyAuto = unset; cleared at construction
+	errorPolicyPerCatSet bool                                     // tracks whether *any* per-category override was set
+	errorPolicyGlobal    Policy                                   // PolicyAuto = unset
+	errorInboxCapacity   int                                      // 0 -> qwpSfDefaultErrorInboxCapacity; sanitizer floors at qwpSfMinErrorInboxCapacity
 }
 
 // LineSenderOption defines line sender config option.
@@ -371,6 +437,185 @@ func WithCloseTimeout(d time.Duration) LineSenderOption {
 	}
 }
 
+// WithErrorHandler registers a callback invoked asynchronously when
+// the SF send loop observes a server-side batch rejection. The
+// handler runs on a dedicated dispatcher goroutine; slow handlers
+// cannot stall publishing. If the bounded inbox fills up, surplus
+// notifications are dropped (visible via
+// QwpSender.DroppedErrorNotifications()).
+//
+// Passing nil reverts to the default loud-not-silent handler that
+// logs ERROR for HALT and WARN for DROP.
+//
+// The handler may call Close() or Flush() on the sender (e.g. to shut
+// down on a HALT) without deadlocking — see SenderErrorHandler for the
+// re-entrancy contract.
+//
+// Only available for the QWP sender.
+func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.errorHandler = h
+	}
+}
+
+// WithErrorPolicy sets the Policy applied for one Category. Per-
+// category overrides take precedence over the connect-string global
+// on_server_error and the spec defaults; a programmatic resolver
+// registered via WithErrorPolicyResolver still wins over both.
+//
+// PolicyAuto removes any prior override (falls through to next
+// layer). CategoryProtocolViolation and CategoryUnknown are forced
+// HALT regardless of this setting.
+//
+// Only available for the QWP sender.
+func WithErrorPolicy(c Category, p Policy) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		if int(c) >= len(s.errorPolicyPerCat) {
+			return
+		}
+		s.errorPolicyPerCat[c] = p
+		if p != PolicyAuto {
+			s.errorPolicyPerCatSet = true
+		}
+	}
+}
+
+// WithErrorPolicyResolver registers a programmatic resolver invoked
+// for every Category before any per-category map or global default.
+// Returning PolicyAuto from the resolver falls through to the next
+// layer (per-category map, then global, then spec default).
+//
+// CategoryProtocolViolation and CategoryUnknown are forced HALT and
+// bypass the resolver entirely.
+//
+// Only available for the QWP sender.
+func WithErrorPolicyResolver(r func(Category) Policy) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.errorPolicyResolver = r
+	}
+}
+
+// WithErrorInboxCapacity sets the size of the bounded inbox between
+// the I/O goroutine and the dispatcher goroutine. Larger values
+// tolerate slower handlers at the cost of memory; smaller values
+// surface backpressure (drop counter) sooner. Defaults to 256;
+// minimum is 16 (sanitized at construction).
+//
+// Only available for the QWP sender.
+func WithErrorInboxCapacity(n int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.errorInboxCapacity = n
+	}
+}
+
+// WithSfDir activates the store-and-forward cursor path against
+// the given group root. The sender's slot lives at
+// `<sfDir>/<senderId>/`; flushed batches are persisted there and
+// replayed on reconnect / restart. Setting an empty string is a
+// no-op (memory mode).
+//
+// Only available for the QWP sender.
+func WithSfDir(dir string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfDir = dir
+	}
+}
+
+// WithSenderId sets the sub-directory name under sfDir that
+// uniquely identifies this sender's slot. Defaults to "default";
+// multi-sender deployments must set distinct IDs to avoid lock
+// collisions on the same slot. Only meaningful when sf_dir is set.
+//
+// Only available for the QWP sender.
+func WithSenderId(id string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.senderId = id
+	}
+}
+
+// WithSfMaxBytes sets the per-segment cap (bytes) for the cursor
+// engine. Defaults to 4 MiB. Lower values rotate segments more
+// aggressively; higher values amortize the rotation overhead.
+//
+// Only available for the QWP sender.
+func WithSfMaxBytes(n int64) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfMaxBytes = n
+	}
+}
+
+// WithSfMaxTotalBytes caps the total cursor allocation (active +
+// hot spare + sealed segments) for this sender. The producer is
+// backpressured when an append would exceed the cap. Defaults to
+// 10 GiB.
+//
+// Only available for the QWP sender.
+func WithSfMaxTotalBytes(n int64) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfMaxTotalBytes = n
+	}
+}
+
+// WithReconnectPolicy configures the per-outage reconnect cap and
+// backoff policy. maxDuration bounds the total time spent
+// reconnecting before the loop gives up; initialBackoff and
+// maxBackoff bound a backoff sleep between attempts (with jitter).
+//
+// Only available for the QWP sender.
+func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.reconnectMaxDurationMillis = int(maxDuration / time.Millisecond)
+		s.reconnectInitialBackoffMillis = int(initialBackoff / time.Millisecond)
+		s.reconnectMaxBackoffMillis = int(maxBackoff / time.Millisecond)
+	}
+}
+
+// WithInitialConnectRetry, when true, applies the same
+// retry-with-backoff policy to the initial connect attempt as is
+// applied on reconnect. By default an initial connect failure is
+// terminal — useful for catching misconfig early.
+//
+// Equivalent to WithInitialConnectMode(InitialConnectSync) when
+// retry is true, or WithInitialConnectMode(InitialConnectOff) when
+// retry is false. Use WithInitialConnectMode directly to select
+// InitialConnectAsync.
+//
+// Only available for the QWP sender.
+func WithInitialConnectRetry(retry bool) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		if retry {
+			s.initialConnectMode = InitialConnectSync
+		} else {
+			s.initialConnectMode = InitialConnectOff
+		}
+	}
+}
+
+// WithInitialConnectMode configures whether the QWP sender's first
+// connection attempt may retry on failure, and if so whether the
+// retry runs synchronously on the calling thread or asynchronously
+// on the I/O goroutine. See InitialConnectMode for value semantics.
+//
+// Only available for the QWP sender.
+func WithInitialConnectMode(mode InitialConnectMode) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.initialConnectMode = mode
+	}
+}
+
+// WithCloseFlushTimeout bounds Close()'s wait for the cursor
+// engine's ackedFsn to catch up to publishedFsn. A zero or
+// negative duration skips the drain entirely (fast close).
+// Defaults to 5 seconds.
+//
+// Only meaningful for the QWP sender in cursor mode (sf_dir set).
+func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.closeFlushTimeoutSet = true
+		s.closeFlushTimeoutMillis = int(d / time.Millisecond)
+	}
+}
+
 // WithMaxSchemasPerConnection caps the number of schema IDs that may
 // be registered on a single QWP connection before the sender returns
 // an error. Once the cap is hit, the caller should close and re-open
@@ -406,6 +651,117 @@ func WithGorilla(enabled bool) LineSenderOption {
 func WithQwpDumpWriter(w io.Writer) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.dumpWriter = w
+	}
+}
+
+// WithAuthTimeout bounds how long the QWP transport waits for the
+// HTTP-upgrade response (the per-host upper bound from failover.md
+// §7). A zero or negative duration falls back to the 15s default at
+// construction. Equivalent to the connect-string auth_timeout_ms key.
+//
+// Only available for the QWP sender.
+func WithAuthTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.authTimeoutMs = int(d / time.Millisecond)
+	}
+}
+
+// WithZone sets the failover zone hint used for endpoint locality.
+// It is silently stored but currently inert on SF ingress, which is
+// zone-blind (wire v1-pinned) and treats every host as local; egress
+// will consult it once zone-locality routing lands. Equivalent to the
+// connect-string zone key.
+//
+// Only available for the QWP sender.
+func WithZone(zone string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.zone = zone
+	}
+}
+
+// WithTarget constrains failover endpoint selection to servers whose
+// advertised role passes the filter (QwpTargetAny / QwpTargetPrimary
+// / QwpTargetReplica). Defaults to QwpTargetAny. Equivalent to the
+// connect-string target=any|primary|replica key.
+//
+// Note: SF ingress is wire v1-pinned and never reads SERVER_INFO, so
+// any value other than QwpTargetAny degrades to a topology reject on
+// the ingest round-walk; the filter is fully honoured on the query
+// (egress) path.
+//
+// Only available for the QWP sender.
+func WithTarget(target qwpTargetFilter) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.target = target
+	}
+}
+
+// WithSfDurability selects the store-and-forward cursor durability
+// mode. Only "memory" (the default when unset) is currently honoured;
+// "flush" and "append" are reserved for a deferred follow-up and are
+// rejected at construction. Requires sf_dir to be set. Equivalent to
+// the connect-string sf_durability key.
+//
+// Only available for the QWP sender.
+func WithSfDurability(mode string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfDurability = mode
+	}
+}
+
+// WithSfAppendDeadline bounds how long a producer call blocks waiting
+// to append a batch into the store-and-forward cursor engine before
+// it returns a backpressure error. A zero or negative duration falls
+// back to the 30s default at construction. Requires sf_dir to be set.
+// Equivalent to the connect-string sf_append_deadline_millis key.
+//
+// Only available for the QWP sender.
+func WithSfAppendDeadline(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfAppendDeadlineMillis = int(d / time.Millisecond)
+	}
+}
+
+// WithDrainOrphans enables adoption and draining of orphaned
+// store-and-forward slots left behind by a crashed or superseded
+// sender sharing the same sf_dir group root. Defaults to disabled.
+// Requires sf_dir to be set. Equivalent to the connect-string
+// drain_orphans key.
+//
+// Only available for the QWP sender.
+func WithDrainOrphans(enabled bool) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.drainOrphans = enabled
+	}
+}
+
+// WithMaxBackgroundDrainers caps the number of concurrent
+// orphan-drainer goroutines. Defaults to 4. Only meaningful when
+// drain_orphans is enabled. Equivalent to the connect-string
+// max_background_drainers key.
+//
+// Only available for the QWP sender.
+func WithMaxBackgroundDrainers(n int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.maxBackgroundDrainers = n
+	}
+}
+
+// WithServerErrorPolicy sets the global fallback Policy applied to a
+// server-side batch rejection when no higher-precedence layer
+// resolves it. Resolution precedence (highest first): the
+// WithErrorPolicyResolver resolver → the WithErrorPolicy per-category
+// override → the connect-string per-category on_*_error → this global
+// policy (connect-string on_server_error) → spec defaults.
+//
+// PolicyAuto (the zero value) leaves the global layer unset, falling
+// through to the spec defaults. CategoryProtocolViolation and
+// CategoryUnknown are always HALT regardless of this setting.
+//
+// Only available for the QWP sender.
+func WithServerErrorPolicy(p Policy) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.errorPolicyGlobal = p
 	}
 }
 
@@ -510,7 +866,7 @@ func WithMaxBufferSize(sizeInBytes int) LineSenderOption {
 // WithFileNameLimit sets maximum file name length in chars
 // allowed by the server. Affects maximum table and column name
 // lengths accepted by the sender. Should be set to the same value
-// as on the server. Defaults to 127.
+// as on the server. Must be at least 16. Defaults to 127.
 func WithFileNameLimit(limit int) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.fileNameLimit = limit
@@ -744,6 +1100,9 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			initBufSize:             defaultInitBufferSize,
 			maxBufSize:              defaultMaxBufferSize,
 			fileNameLimit:           defaultFileNameLimit,
+			// failover.md §7: 15s upper bound on the HTTP upgrade
+			// response read. Parser overrides on explicit value.
+			authTimeoutMs: 15_000,
 		}
 	default:
 		return &lineSenderConfig{
@@ -791,6 +1150,9 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 		return err
 	}
 
+	if strings.Contains(conf.address, ",") {
+		return errors.New("multi-host addr is not supported for TCP")
+	}
 	// validate tcp-specific settings
 	if conf.requestTimeout != 0 {
 		return errors.New("requestTimeout setting is not available in the TCP client")
@@ -815,6 +1177,11 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	}
 	if conf.maxSchemasPerConnection != 0 {
 		return errors.New("maxSchemasPerConnection setting is not available in the TCP client")
+	}
+	if conf.errorHandler != nil || conf.errorPolicyResolver != nil ||
+		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
+		conf.errorInboxCapacity != 0 {
+		return errors.New("server-error API settings are only available in the QWP client")
 	}
 	if conf.tcpKey == "" && conf.tcpKeyId != "" {
 		return errors.New("tcpKey is empty and tcpKeyId is not. both (or none) must be provided")
@@ -855,6 +1222,63 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.protocolVersion != protocolVersionUnset {
 		return errors.New("protocol_version setting is not available in the QWP client")
 	}
+	// Multi-host failover (failover.md §1 / §2). The parser populates
+	// conf.endpoints for connect-string callers; functional-option
+	// callers go through WithAddress, which writes only conf.address.
+	// Back-fill endpoints from a single-host conf.address here so the
+	// downstream code paths can rely on len(endpoints) >= 1.
+	if len(conf.endpoints) == 0 && conf.address != "" {
+		eps, err := parseEndpointList(conf.address, qwpDefaultPort)
+		if err != nil {
+			return err
+		}
+		conf.endpoints = eps
+		conf.address = eps[0].String()
+	}
+	if conf.authTimeoutMs <= 0 {
+		conf.authTimeoutMs = 15_000
+	}
+	// Cursor / store-and-forward validation. sf_dir activates cursor
+	// mode; the sf_*, sender_id, drain_orphans, max_background_drainers
+	// knobs are only meaningful when cursor mode is on.
+	if conf.sfDir == "" {
+		if conf.senderId != "" {
+			return errors.New("sender_id requires sf_dir to be set")
+		}
+		if conf.sfMaxBytes != 0 || conf.sfMaxTotalBytes != 0 || conf.sfDurability != "" || conf.sfAppendDeadlineMillis != 0 {
+			return errors.New("sf_max_bytes / sf_max_total_bytes / sf_durability / sf_append_deadline_millis require sf_dir to be set")
+		}
+		if conf.drainOrphans || conf.maxBackgroundDrainers != 0 {
+			return errors.New("drain_orphans / max_background_drainers require sf_dir to be set")
+		}
+	}
+	// Validate the sf_durability value space for the functional-option
+	// path (WithSfDurability). The connect-string parser already
+	// rejected flush/append/bogus, so this is a harmless re-check
+	// there; it is the only gate on the option path.
+	if err := validateSfDurability(conf.sfDurability); err != nil {
+		return err
+	}
+	if conf.sfMaxBytes < 0 {
+		return fmt.Errorf("sf_max_bytes must be > 0: %d", conf.sfMaxBytes)
+	}
+	if conf.sfMaxTotalBytes < 0 {
+		return fmt.Errorf("sf_max_total_bytes must be > 0: %d", conf.sfMaxTotalBytes)
+	}
+	if conf.sfMaxBytes > 0 && conf.sfMaxTotalBytes > 0 && conf.sfMaxTotalBytes < conf.sfMaxBytes {
+		return fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_bytes (%d)",
+			conf.sfMaxTotalBytes, conf.sfMaxBytes)
+	}
+	if conf.maxBackgroundDrainers < 0 {
+		return fmt.Errorf("max_background_drainers must be >= 0: %d", conf.maxBackgroundDrainers)
+	}
+	// Server-error API knobs (Phase 5). User-supplied
+	// errorInboxCapacity must be ≥ qwpSfMinErrorInboxCapacity (16);
+	// 0 falls back to the default at construction.
+	if conf.errorInboxCapacity != 0 && conf.errorInboxCapacity < qwpSfMinErrorInboxCapacity {
+		return fmt.Errorf("error_inbox_capacity must be >= %d: %d",
+			qwpSfMinErrorInboxCapacity, conf.errorInboxCapacity)
+	}
 
 	return nil
 }
@@ -865,6 +1289,9 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 		return err
 	}
 
+	if strings.Contains(conf.address, ",") {
+		return errors.New("multi-host addr is not supported for HTTP")
+	}
 	// validate http-specific settings
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
 		return errors.New("both basic and token authentication cannot be used")
@@ -874,6 +1301,11 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	}
 	if conf.maxSchemasPerConnection != 0 {
 		return errors.New("maxSchemasPerConnection setting is not available in the HTTP client")
+	}
+	if conf.errorHandler != nil || conf.errorPolicyResolver != nil ||
+		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
+		conf.errorInboxCapacity != 0 {
+		return errors.New("server-error API settings are only available in the QWP client")
 	}
 
 	return nil
@@ -888,6 +1320,17 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 
 	opts := qwpTransportOpts{
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
+		endpointPath:          qwpWritePath,
+		authTimeoutMs:         conf.authTimeoutMs,
+		// Ingress pins to v1 (wire-ingress.md §3, §15.5): the v2 bump
+		// is egress-only, ingress never reads SERVER_INFO, and the
+		// encoder stamps v1 frames. Advertising v2 here would be a
+		// spec violation masked only by the server clamping ingest
+		// negotiation to v1. serverInfoTimeout is left zero so the
+		// transport never attempts a SERVER_INFO read on ingest; the
+		// SF round-walk degrades target=/zone= to the wire-v1 rule
+		// (target≠any → TopologyReject) in qwp_sf_round_walk.go.
+		maxVersion: qwpMaxSupportedIngestVersion,
 	}
 	// QWP auth: Basic (username:password) or Bearer (token).
 	// Matches the Java client's buildWebSocketAuthHeader().
@@ -898,12 +1341,19 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		opts.authorization = "Bearer " + conf.httpToken
 	}
 
+	// Cursor / SF mode: when sf_dir is set, build a cursor engine +
+	// send loop instead of qwpAsyncState. Memory mode (no sf_dir) is
+	// handled by the existing path below.
+	if conf.sfDir != "" {
+		return newQwpCursorLineSenderFromConf(ctx, conf, address, opts)
+	}
+
 	window := conf.inFlightWindow
 	if window <= 0 {
 		window = 1
 	}
 
-	s, err := newQwpLineSender(ctx, address, opts, conf.retryTimeout,
+	s, err := newQwpLineSenderUnstarted(ctx, address, opts, conf.retryTimeout,
 		conf.autoFlushRows, conf.autoFlushInterval, conf.dumpWriter, window)
 	if err != nil {
 		return nil, err
@@ -915,16 +1365,24 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	if conf.closeTimeout > 0 {
 		s.closeTimeout = conf.closeTimeout
 	}
-	s.encoders[0].gorillaDisabled = conf.gorillaDisabled
-	s.encoders[1].gorillaDisabled = conf.gorillaDisabled
-	// Async mode's encoder buffers are pre-sized for the microbatch
-	// role: max(1 MB, 2 * autoFlushBytes). Matches the Java client's
-	// MicrobatchBuffer sizing. The 1 MB floor was already applied in
-	// newQwpLineSender; grow further if autoFlushBytes warrants it.
-	if s.asyncState != nil && conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
-		s.encoders[0].wb.preallocate(conf.autoFlushBytes * 2)
-		s.encoders[1].wb.preallocate(conf.autoFlushBytes * 2)
+	s.encoder.gorillaDisabled = conf.gorillaDisabled
+	// Encoder buffer is pre-sized for the microbatch role: max(1 MB,
+	// 2 * autoFlushBytes). The 1 MB floor was already applied in
+	// newQwpLineSenderUnstarted; grow further if autoFlushBytes warrants it.
+	if conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
+		s.encoder.wb.preallocate(conf.autoFlushBytes * 2)
 	}
+	// Server-error API knobs (Phase 5). Apply BEFORE sendLoopStart so
+	// the very first received frame uses the user-configured handler
+	// and resolver, not the defaults.
+	resolver := &qwpSfPolicyResolver{
+		resolver: conf.errorPolicyResolver,
+		perCat:   conf.errorPolicyPerCat,
+		global:   conf.errorPolicyGlobal,
+	}
+	s.cursorSendLoop.sendLoopSetPolicyResolver(resolver)
+	s.cursorSendLoop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
+	s.cursorSendLoop.sendLoopStart()
 	return s, nil
 }
 
@@ -936,8 +1394,8 @@ func validateConf(conf *lineSenderConfig) error {
 		return fmt.Errorf("max buffer size is negative: %d", conf.maxBufSize)
 	}
 
-	if conf.fileNameLimit < 0 {
-		return fmt.Errorf("file name limit is negative: %d", conf.fileNameLimit)
+	if conf.fileNameLimit < 16 {
+		return fmt.Errorf("max_name_len must be at least 16 bytes: %d", conf.fileNameLimit)
 	}
 
 	if conf.retryTimeout < 0 {

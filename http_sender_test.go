@@ -165,6 +165,11 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			expectedErr: "auto flush interval is negative",
 		},
 		{
+			name:        "max_name_len below minimum",
+			config:      "http::max_name_len=15;",
+			expectedErr: "max_name_len must be at least 16 bytes",
+		},
+		{
 			name:        "schema is case-sensitive",
 			config:      "hTtp::addr=localhost:1234;",
 			expectedErr: "invalid schema",
@@ -340,6 +345,7 @@ func TestRetryOn500(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)
@@ -367,6 +373,7 @@ func TestNoRetryOn400FromProxy(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)
@@ -394,6 +401,7 @@ func TestNoRetryOn400FromServer(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)

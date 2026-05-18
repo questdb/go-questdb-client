@@ -196,11 +196,21 @@ func qwpPutVarint(buf []byte, v uint64) int {
 // qwpReadVarint decodes an unsigned LEB128 varint from buf. It returns
 // the decoded value and the number of bytes consumed, or an error if
 // the varint is malformed or truncated.
+//
+// The byte-10 guard rejects payloads where a 10th byte contributes data
+// bits beyond bit 63 of the result. Without it, a hostile server varint
+// whose final byte sets any of bits 1..6 would silently overflow uint64
+// via the shift below, producing a wildly wrong value the caller cannot
+// distinguish from a legitimate one. Mirrors the Java reference decoder
+// guard in QwpResultBatchDecoder.decodeVarint.
 func qwpReadVarint(buf []byte) (uint64, int, error) {
 	var v uint64
 	var shift uint
 	for i, b := range buf {
 		if i >= qwpMaxVarintLen {
+			return 0, 0, errors.New("qwp: varint overflow")
+		}
+		if shift == 63 && b&0x7E != 0 {
 			return 0, 0, errors.New("qwp: varint overflow")
 		}
 		v |= uint64(b&0x7F) << shift
@@ -226,4 +236,168 @@ func qwpVarintSize(v uint64) int {
 // varint-prefixed UTF-8 string (varint length + string bytes).
 func qwpStringSize(s string) int {
 	return qwpVarintSize(uint64(len(s))) + len(s)
+}
+
+// qwpDecodeError is the sentinel error type returned by decode paths
+// (qwpByteReader, Gorilla decoder, RESULT_BATCH decoder). Dedicated type
+// so callers can distinguish decode failures from transport / framing
+// errors via errors.As, without regex-ing the message. The optional
+// `cause` field carries the underlying error (if any) so errors.Is /
+// errors.As can reach through to its identity.
+type qwpDecodeError struct {
+	msg   string
+	cause error
+}
+
+func (e *qwpDecodeError) Error() string {
+	return "qwp: decode: " + e.msg
+}
+
+func (e *qwpDecodeError) Unwrap() error {
+	return e.cause
+}
+
+func newQwpDecodeError(msg string) *qwpDecodeError {
+	return &qwpDecodeError{msg: msg}
+}
+
+func wrapQwpDecodeError(msg string, cause error) *qwpDecodeError {
+	return &qwpDecodeError{msg: msg, cause: cause}
+}
+
+// qwpByteReader is a position-tracking reader over a QWP frame payload.
+// Produced typed-value errors are always *qwpDecodeError; truncation,
+// overflow, and out-of-range inputs all bubble up as a single error
+// class so the hot path can stay branch-light.
+//
+// The reader aliases its input: slice(n) returns a sub-slice of buf, so
+// the caller must not retain returned slices past the frame's lifetime.
+// In the QWP egress model the WebSocket recv buffer stays pinned while
+// the user's range iteration runs; once it returns, slices derived from
+// this reader are no longer valid.
+type qwpByteReader struct {
+	buf []byte
+	pos int
+}
+
+// reset rebinds the reader to a new buffer and rewinds pos to zero.
+func (r *qwpByteReader) reset(buf []byte) {
+	r.buf = buf
+	r.pos = 0
+}
+
+// remaining returns the count of unread bytes.
+func (r *qwpByteReader) remaining() int { return len(r.buf) - r.pos }
+
+// atEnd reports whether the reader has consumed every byte.
+func (r *qwpByteReader) atEnd() bool { return r.pos >= len(r.buf) }
+
+// readByte reads one byte.
+func (r *qwpByteReader) readByte() (byte, error) {
+	if r.pos >= len(r.buf) {
+		return 0, newQwpDecodeError("unexpected end of buffer reading uint8")
+	}
+	b := r.buf[r.pos]
+	r.pos++
+	return b, nil
+}
+
+// readUint16LE reads a little-endian uint16.
+func (r *qwpByteReader) readUint16LE() (uint16, error) {
+	if r.pos+2 > len(r.buf) {
+		return 0, newQwpDecodeError("unexpected end of buffer reading uint16")
+	}
+	v := binary.LittleEndian.Uint16(r.buf[r.pos:])
+	r.pos += 2
+	return v, nil
+}
+
+// readUint32LE reads a little-endian uint32.
+func (r *qwpByteReader) readUint32LE() (uint32, error) {
+	if r.pos+4 > len(r.buf) {
+		return 0, newQwpDecodeError("unexpected end of buffer reading uint32")
+	}
+	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
+	r.pos += 4
+	return v, nil
+}
+
+// readInt32LE reads a little-endian int32.
+func (r *qwpByteReader) readInt32LE() (int32, error) {
+	u, err := r.readUint32LE()
+	return int32(u), err
+}
+
+// readUint64LE reads a little-endian uint64.
+func (r *qwpByteReader) readUint64LE() (uint64, error) {
+	if r.pos+8 > len(r.buf) {
+		return 0, newQwpDecodeError("unexpected end of buffer reading uint64")
+	}
+	v := binary.LittleEndian.Uint64(r.buf[r.pos:])
+	r.pos += 8
+	return v, nil
+}
+
+// readInt64LE reads a little-endian int64.
+func (r *qwpByteReader) readInt64LE() (int64, error) {
+	u, err := r.readUint64LE()
+	return int64(u), err
+}
+
+// readFloat64LE reads an IEEE 754 little-endian float64.
+func (r *qwpByteReader) readFloat64LE() (float64, error) {
+	u, err := r.readUint64LE()
+	return math.Float64frombits(u), err
+}
+
+// readVarint reads an unsigned LEB128 varint, surfacing the existing
+// overflow / truncation errors from qwpReadVarint as *qwpDecodeError
+// while preserving the underlying error via Unwrap.
+func (r *qwpByteReader) readVarint() (uint64, error) {
+	v, n, err := qwpReadVarint(r.buf[r.pos:])
+	if err != nil {
+		return 0, wrapQwpDecodeError(err.Error(), err)
+	}
+	r.pos += n
+	return v, nil
+}
+
+// readVarintInt63 reads an unsigned varint and rejects values where the
+// uint64→int64 cast would flip the sign. Used for varint-encoded fields
+// that the wire spec treats as non-negative int63 (row count, column
+// count, schema id, name lengths, etc.). Without this check, a hostile
+// varint can drive a length past the bound check via two's-complement
+// arithmetic — see QwpResultBatchDecoder.java around row_count and
+// schema_id.
+func (r *qwpByteReader) readVarintInt63() (int64, error) {
+	v, err := r.readVarint()
+	if err != nil {
+		return 0, err
+	}
+	if v > uint64(1<<63-1) {
+		return 0, newQwpDecodeError("varint overflow: value exceeds int63")
+	}
+	return int64(v), nil
+}
+
+// advance skips n bytes. Errors when fewer than n bytes remain.
+func (r *qwpByteReader) advance(n int) error {
+	if n < 0 || r.pos+n > len(r.buf) {
+		return newQwpDecodeError("unexpected end of buffer while advancing")
+	}
+	r.pos += n
+	return nil
+}
+
+// slice returns a sub-slice of the underlying buffer covering the next
+// n bytes and advances pos. The returned slice aliases the input — do
+// not retain it past the frame's lifetime. Errors when fewer than n
+// bytes remain.
+func (r *qwpByteReader) slice(n int) ([]byte, error) {
+	if n < 0 || r.pos+n > len(r.buf) {
+		return nil, newQwpDecodeError("unexpected end of buffer while slicing")
+	}
+	s := r.buf[r.pos : r.pos+n]
+	r.pos += n
+	return s, nil
 }

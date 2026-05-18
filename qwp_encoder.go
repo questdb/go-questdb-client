@@ -385,9 +385,13 @@ func (e *qwpEncoder) encodeGeohashColumn(col *qwpColumnBuffer) {
 	precision := col.geohashPrecision
 	if precision <= 0 {
 		// No precision established (column has only nulls).
-		// Write precision 0, no per-row data needed beyond
-		// the null bitmap (already written).
-		e.wb.putVarint(0)
+		// The server validates precision against [1, 60]
+		// (QwpGeoHashColumnCursor.of) even for all-null
+		// columns and rejects the whole message otherwise, so
+		// emit the minimum valid precision. valueCount() is 0
+		// here, so no per-row data follows. Mirrors the Java
+		// client's QwpColumnWriter.writeGeoHashColumn clamp.
+		e.wb.putVarint(1)
 		return
 	}
 

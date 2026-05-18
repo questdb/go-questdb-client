@@ -6,17 +6,26 @@ Golang client for QuestDB's [Influx Line Protocol](https://questdb.io/docs/refer
 (ILP) over HTTP and TCP. This library makes it easy to insert data into
 [QuestDB](https://questdb.io).
 
-The library requires Go 1.19 or newer.
+The library requires Go 1.23 or newer.
 
 Features:
 * [Context](https://www.digitalocean.com/community/tutorials/how-to-use-contexts-in-go)-aware API.
 * Optimized for batch writes.
-* Supports TLS encryption and ILP authentication.
-* Automatic write retries and connection reuse for ILP over HTTP.
-* Tested against QuestDB 7.3.10 and newer versions.
+* Three transports: ILP over HTTP and TCP, plus QWP (QuestDB's binary
+  columnar protocol) over WebSocket.
+* Supports TLS encryption and authentication.
+* Automatic write retries and connection reuse for ILP over HTTP;
+  store-and-forward, reconnect, and multi-host failover for QWP.
 
 New in v4:
-* Supports n-dimensional arrays of doubles for QuestDB servers 9.0.0 and up
+* QWP WebSocket transport exposing the full QuestDB type system, with a
+  typed server-error API and multi-host failover.
+* N-dimensional arrays of doubles (QuestDB server 9.0.0 and up).
+* Fixed-width decimal columns (QuestDB server 9.2.0 and up).
+
+ILP over HTTP/TCP is compatible with QuestDB 7.3.10 and newer. The QWP
+transport, arrays, and decimals require the newer server versions noted
+above.
 
 Documentation is available [here](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4).
 
@@ -98,6 +107,266 @@ HTTP is the recommended transport to use. To connect via TCP, set the configurat
 	sender, err := qdb.LineSenderFromConf(ctx, "tcp::addr=localhost:9009;")
 	// ...
 ```
+
+## QuestDB Wire Protocol (QWP) over WebSocket
+
+QWP is QuestDB's binary *columnar* wire protocol. Compared to ILP, it
+offers higher throughput for wide rows and exposes the full QuestDB type
+system — including `byte`, `short`, `int`, `float`, `char`, `date`,
+nanosecond timestamps, `uuid`, `geohash`, `int64` arrays, and
+fixed-width decimals.
+
+Switch the Quickstart to QWP by changing the schema to `ws` (plain) or
+`wss` (TLS):
+
+```go
+sender, err := qdb.LineSenderFromConf(ctx, "ws::addr=localhost:9000;")
+```
+
+The full fluent API shown in the Quickstart (`Table`, `Symbol`,
+`Float64Column`, `Int64Column`, `At`, `AtNow`, `Flush`, `Close`) works
+unchanged, as do the array and decimal methods shown below. QWP is a
+distinct binary protocol rather than a version of ILP, so the
+`protocol_version` configuration key does not apply.
+
+### QWP-only column types
+
+To access types that ILP does not expose, type-assert the sender to
+`qdb.QwpSender`:
+
+```go
+sender, err := qdb.LineSenderFromConf(ctx, "ws::addr=localhost:9000;")
+if err != nil {
+    log.Fatal(err)
+}
+defer sender.Close(ctx)
+qwp := sender.(qdb.QwpSender)
+
+err = qwp.
+    Table("sensors").
+    Symbol("site", "roof").
+    ByteColumn("status_code", 3).
+    ShortColumn("battery", 4812).
+    Int32Column("sample_count", 120_000).
+    Float32Column("temperature", 21.7).
+    CharColumn("grade", 'A').
+    DateColumn("calibrated", time.Now()).
+    TimestampNanosColumn("captured", time.Now()).
+    UuidColumn("device_id", 0x0123456789abcdef, 0xfedcba9876543210).
+    GeohashColumn("location", 0x1fb9, 15).
+    Int64Array1DColumn("raw_counts", []int64{10, 20, 30}).
+    Decimal64Column("voltage", qdb.NewDecimalFromInt64(12345, 4)).
+    AtNano(ctx, time.Now())
+```
+
+`QwpSender` adds: `ByteColumn`, `ShortColumn`, `Int32Column`,
+`Float32Column`, `CharColumn`, `DateColumn`, `TimestampNanosColumn`,
+`UuidColumn`, `GeohashColumn`, `Int64Array1DColumn`,
+`Int64Array2DColumn`, `Int64Array3DColumn`, `Decimal64Column`,
+`Decimal128Column`, `Decimal256Column`, and `AtNano` (nanosecond-
+resolution designated timestamp; `At` uses microseconds).
+
+### Flush semantics and backpressure
+
+The QWP sender always pipelines encoding with transmission: a dedicated
+I/O goroutine drains a cursor engine to the WebSocket and owns reconnect
+and replay. You do not configure a pipeline depth — backpressure is
+governed by the engine's segment ring and the append deadline
+(`sf_append_deadline_millis` in store-and-forward mode), not by a
+fixed in-flight count.
+
+`in_flight_window` / `qdb.WithInFlightWindow(n)` is **retained for
+backward compatibility but is a no-op** in this architecture. Connect
+strings carrying it still parse; the value is ignored.
+
+`Flush` blocks until the server has ACKed everything published so far,
+preserving the Go contract that a returned `Flush` means the data is
+durable on the server. Auto-flush (triggered by row/byte/interval
+thresholds) takes a non-blocking path. For explicit ack correlation,
+`FlushAndGetSequence` returns the published FSN (the upper bound of any
+`SenderError.ToFsn` for that batch); pair it with `AwaitAckedFsn` to
+wait for the server to confirm that FSN.
+
+### Authentication
+
+Basic auth and bearer tokens work the same way as for HTTP:
+
+```go
+qdb.LineSenderFromConf(ctx, "wss::addr=host:9000;username=admin;password=secret;")
+qdb.LineSenderFromConf(ctx, "wss::addr=host:9000;token=<bearer>;")
+```
+
+`LineSenderPool` is HTTP-only and cannot be used with QWP — QWP's
+cursor engine already pipelines transmission from a single sender.
+
+### Error handling
+
+When the server rejects a published QWP batch, the rejection surfaces
+as a `*qdb.SenderError` carrying a stable `Category`
+(`SCHEMA_MISMATCH`, `PARSE_ERROR`, `INTERNAL_ERROR`, `SECURITY_ERROR`,
+`WRITE_ERROR`, `PROTOCOL_VIOLATION`, `UNKNOWN`), the server message,
+and the `[FromFsn, ToFsn]` span — join that span against the value
+returned by `FlushAndGetSequence` to identify exactly which rows were
+rejected.
+
+There are two delivery paths, both carrying the same payload:
+
+```go
+sender, err := qdb.NewLineSender(ctx,
+    qdb.WithQwp(),
+    qdb.WithAddress("localhost:9000"),
+    // Async: dead-letter channel for DROP_AND_CONTINUE batches.
+    qdb.WithErrorHandler(func(e *qdb.SenderError) {
+        log.Printf("rejected fsn=[%d,%d] %s: %s",
+            e.FromFsn, e.ToFsn, e.Category, e.ServerMessage)
+    }),
+)
+// ...
+
+// Sync: after a HALT, the typed error surfaces on the next
+// producer-thread call (At / AtNow / Flush).
+if err := sender.Flush(ctx); err != nil {
+    var se *qdb.SenderError
+    if errors.As(err, &se) {
+        // inspect se.Category, se.ServerMessage, se.FromFsn, ...
+    }
+}
+```
+
+Each `Category` resolves to a `Policy` — `HALT` (latch the error;
+the sender does not drain further until you close and rebuild it) or
+`DROP_AND_CONTINUE` (drop the rejected span from the store and keep
+going; recover the data via the async handler). Resolution precedence,
+highest first: `WithErrorPolicyResolver` → `WithErrorPolicy(category,
+policy)` → connect-string `on_<category>_error` → connect-string
+`on_server_error` → spec defaults. `PROTOCOL_VIOLATION` and `UNKNOWN`
+are always `HALT` and cannot be overridden.
+
+The connect-string equivalents take `halt` / `drop` (and `auto` for
+the global key):
+
+```go
+qdb.LineSenderFromConf(ctx,
+    "ws::addr=localhost:9000;"+
+    "on_server_error=halt;"+        // global default
+    "on_schema_error=drop;"+        // per-category override
+    "on_write_error=drop;")
+```
+
+Per-category keys are `on_schema_error`, `on_parse_error`,
+`on_internal_error`, `on_security_error`, and `on_write_error`.
+
+### Multi-host failover
+
+`addr` accepts a comma-separated list (or repeated `addr=` keys) for
+transparent failover. The client walks the list in priority order on
+connect and reconnect; it does not shuffle or load-balance — that is
+the server-side coordinator's job.
+
+```go
+qdb.LineSenderFromConf(ctx,
+    "ws::addr=node-a:9000,node-b:9000,node-c:9000;")
+```
+
+`target` constrains which endpoints are acceptable by replicated-cluster
+role: `any` (default), `primary` (writers only — also accepts
+standalone OSS servers), or `replica`. `zone` is an opaque,
+case-insensitive locality identifier (e.g. `eu-west-1a`); when set, the
+client prefers same-zone endpoints. `zone` is effective on the query
+side; for ingestion it is silently accepted but has no effect (QWP
+ingress is zone-blind).
+
+```go
+qdb.LineSenderFromConf(ctx,
+    "ws::addr=node-a:9000,node-b:9000;target=primary;zone=eu-west-1a;")
+```
+
+The reconnect budget and backoff that govern how long failover persists
+through an outage are the `reconnect_*` and `initial_connect_retry`
+knobs documented under [QWP store-and-forward](#qwp-store-and-forward-sf)
+— they apply whether or not `sf_dir` is set.
+
+### Querying with `QwpQueryClient`
+
+QWP also supports the query side: streaming columnar result batches
+from the server back to the client over the same WebSocket protocol.
+Use `QwpQueryClient` to run SELECT and DML statements:
+
+```go
+client, err := qdb.NewQwpQueryClient(ctx,
+    qdb.WithQwpQueryAddress("localhost:9000"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close(ctx)
+
+// Non-SELECT statements use Exec.
+if _, err := client.Exec(ctx,
+    "CREATE TABLE example (ts TIMESTAMP, v LONG) TIMESTAMP(ts)"); err != nil {
+    log.Fatal(err)
+}
+
+// SELECT returns a *QwpQuery; range over its Batches iterator.
+q := client.Query(ctx, "SELECT ts, v FROM example")
+defer q.Close()
+
+var sum int64
+for batch, err := range q.Batches() {
+    if err != nil {
+        log.Fatal(err)
+    }
+    vCol := batch.Column(1) // column 1 is `v` (LONG)
+    for r := 0; r < vCol.RowCount(); r++ {
+        sum += vCol.Int64(r)
+    }
+}
+```
+
+For tight column sweeps you can decode a row range into a caller-owned
+slice in one shot. On a no-null column this lowers to a single
+`memmove`, after which the inner loop is branch-free and vectorizable:
+
+```go
+buf := make([]int64, 0, 1024)
+for batch, err := range q.Batches() {
+    if err != nil {
+        log.Fatal(err)
+    }
+    buf = batch.Column(1).Int64Range(0, batch.RowCount(), buf[:0])
+    for _, v := range buf {
+        sum += v
+    }
+}
+```
+
+Bind parameters are passed via `qdb.WithQueryBinds` and use `$1`, `$2`,
+... placeholders. Setters take 0-based indexes and must be called in
+ascending order:
+
+```go
+q := client.Query(ctx,
+    "SELECT ts, v FROM example WHERE v > $1",
+    qdb.WithQueryBinds(func(b *qdb.QwpBinds) {
+        b.LongBind(0, 100)
+    }),
+)
+```
+
+Configuration via a config string is also supported:
+
+```go
+client, err := qdb.QwpQueryClientFromConf(ctx,
+    "ws::addr=localhost:9000;username=admin;password=secret;")
+```
+
+`QwpQueryClient` is **not** safe for concurrent `Query` or `Exec` calls —
+open one client per query-issuing goroutine. `Cancel` (on `*QwpQuery`)
+and `Close` (on the client) are safe to call from any goroutine,
+including from within an in-flight iterator.
+
+A complete runnable example is at
+[`examples/qwp/basic-query/main.go`](examples/qwp/basic-query/main.go).
 
 ## N-dimensional arrays
 
@@ -271,6 +540,74 @@ func main() {
 	}
 }
 ```
+
+## QWP store-and-forward (SF)
+
+QuestDB's WebSocket transport (`ws::` / `wss::`, see Java client docs)
+supports an opt-in **store-and-forward** mode: outgoing batches are
+persisted to mmap'd disk segments before they leave the wire, and the
+I/O loop replays from disk on transient disconnects or process
+restarts. User code does not see brief outages; an unrecoverable
+failure surfaces on the next `At` / `AtNow` / `Flush` call.
+
+Activate SF by setting `sf_dir` (the parent directory under which the
+sender's slot is created) on a `ws::` / `wss::` connection string:
+
+```go
+sender, err := qdb.LineSenderFromConf(ctx,
+    "ws::addr=localhost:9000;"+
+    "sf_dir=/var/lib/questdb-sf;"+
+    "sender_id=my-app;"+
+    "close_flush_timeout_millis=5000;")
+```
+
+The slot lives at `<sf_dir>/<sender_id>/`. An advisory exclusive
+`flock` on `<slot>/.lock` prevents two senders from sharing a slot;
+the lock releases automatically when the process exits.
+
+### Connect-string knobs (QWP only)
+
+| Key | Default | Effect |
+|---|---|---|
+| `sf_dir` | unset | Group root. Setting it activates SF. |
+| `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_.` only. |
+| `sf_max_bytes` | 4 MiB | Per-segment file size. |
+| `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
+| `sf_durability` | `memory` | Reserved; `flush` / `append` are deferred follow-ups. |
+| `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
+| `reconnect_max_duration_millis` | 300000 | Per-outage cap on reconnect retries. |
+| `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
+| `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
+| `initial_connect_retry` | `off` | `off`/`false` = terminal on first failure; `on`/`true`/`sync` = same retry loop as reconnect, blocking the constructor; `async` = same retry loop on the I/O goroutine, constructor returns immediately and producers experience backpressure until the wire comes up. |
+| `close_flush_timeout_millis` | 5000 | `Close` waits this long for ACKs; `0` / `-1` skips the drain. |
+| `drain_orphans` | `off` | When `on`, scan `<sf_dir>/*` and adopt sibling slots that hold unacked data. |
+| `max_background_drainers` | 4 | Cap on concurrent orphan drainers. |
+
+The same options are available programmatically:
+`WithSfDir`, `WithSenderId`, `WithSfMaxBytes`, `WithSfMaxTotalBytes`,
+`WithReconnectPolicy`, `WithInitialConnectRetry`,
+`WithInitialConnectMode`, `WithCloseFlushTimeout`.
+
+### Failure semantics
+
+- **Transient disconnect**: caught by the I/O loop, transparent to user code.
+- **Auth rejection (HTTP 401/403)** on connect or reconnect: terminal — surfaced on the next user-thread call.
+- **Server rejected a frame** (e.g. schema mismatch): terminal; replay would just rebound, so the loop stops and reports the rejection. Bytes stay on disk for inspection.
+- **Reconnect cap exhausted**: terminal; restart the process to resume from disk.
+- **Disk cap full**: `At` / `AtNow` block up to `sf_append_deadline_millis`, then fail with a "wire path is not draining" error.
+
+### Crash recovery
+
+On startup with the same `sf_dir` + `sender_id`, the sender opens
+existing segment files, validates per-frame CRC32C, recovers any torn
+tail at the active segment's last good frame, and resumes sending
+where the prior session left off.
+
+If a previous sender process crashed and left its slot dir behind,
+turning on `drain_orphans=on` will scan sibling slots under `sf_dir`
+and adopt them on a separate connection: the foreground sender is
+unaffected, and a `.failed` sentinel is dropped if a drainer can't
+make progress (auth rejection, exhausted reconnect cap, etc.).
 
 ## Community
 

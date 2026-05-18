@@ -88,9 +88,11 @@ type qwpColumnBuffer struct {
 	// has rowCount+1 entries with arrayOffsets[0]==0. Row i's encoded
 	// data spans arrayData[arrayOffsets[i]:arrayOffsets[i+1]].
 	// Each row's encoded data contains:
-	//   nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+	//   nDims (1 byte, >= 1) + shape (nDims × 4 bytes LE) + flattened
 	//   elements (product(shape) × 8 bytes LE).
-	// Null arrays are encoded as nDims=1, dim0=0 (5 bytes total).
+	// The public ingest API always creates array columns with
+	// nullable=true, so NULL rows are tracked in the null bitmap and
+	// no inline data is appended for them.
 	arrayOffsets []uint32
 	arrayData    []byte
 
@@ -641,13 +643,14 @@ func (c *qwpColumnBuffer) addNull() {
 		c.appendU64(qwpLongNull)
 
 	case qwpTypeDoubleArray, qwpTypeLongArray:
-		// Null array sentinel: nDims=1, dim0=0 (5 bytes total).
-		off := len(c.arrayData)
-		c.arrayData = append(c.arrayData, 0, 0, 0, 0, 0)
-		c.arrayData[off] = 0x01 // nDims = 1
-		// dim0 = 0 (already zero from append)
-		c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
-		c.trackDataGrowth(5 + 4) // 5 data + uint32 offset
+		// Unreachable from the public API: Float64Array* / Int64Array*
+		// always create array columns with nullable=true, so addNull
+		// takes the bitmap branch above. The wire format has no inline
+		// NULL sentinel for arrays — the server's ingest cursor and
+		// the Go egress decoder both reject nDims=0 — so there is no
+		// valid byte sequence to emit here. Fail loud rather than
+		// write a frame the peer will reject.
+		panic("qwp: addNull on a non-nullable array column is not supported")
 
 	case qwpTypeGeohash:
 		// -1 (all bits set) is the QuestDB geohash null sentinel.
