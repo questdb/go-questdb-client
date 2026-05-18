@@ -292,10 +292,17 @@ func TestErrorApiConfString_OnParseErrorDrop(t *testing.T) {
 	require.NoError(t, ls.Table("t").Int64Column("v", 2).AtNow(context.Background()))
 	require.NoError(t, ls.Flush(context.Background()),
 		"second Flush should succeed because on_parse_error=drop continued past the rejection")
+	// Flush no longer blocks on the server ACK (cursor path, commit
+	// 29a6f12), so the PARSE_ERROR rejection is processed by the send
+	// loop asynchronously. Wait for the counter to reflect it before
+	// asserting; checking the no-latch invariant only afterwards makes
+	// it meaningful (the rejection is known to have been handled).
+	require.Eventually(t, func() bool {
+		return qs.TotalServerErrors() >= 1
+	}, 3*time.Second, 1*time.Millisecond,
+		"the rejection must still bump the server-error counter")
 	assert.Nil(t, qs.LastTerminalError(),
 		"on_parse_error=drop must not latch terminal")
-	assert.GreaterOrEqual(t, qs.TotalServerErrors(), int64(1),
-		"the rejection must still bump the server-error counter")
 }
 
 // TestErrorApiConfString_OnSchemaErrorHalt builds a sender from a
