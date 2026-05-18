@@ -306,6 +306,28 @@ const (
 	// int32. The 1024-byte slack covers that shape header.
 	qwpMaxArrayElements = (1<<31 - 1 - 1024) / 8
 
+	// qwpReadLimitSlack is headroom added on top of qwpMaxBatchSize when
+	// arming the WebSocket read limit. coder/websocket's limitReader
+	// trips ErrMessageTooBig the moment its byte budget reaches zero —
+	// before the terminal io.EOF is delivered — so a legitimate frame of
+	// exactly qwpMaxBatchSize would be rejected without this margin (the
+	// library applies the same +1 trick to its own default limit). The
+	// band between qwpMaxBatchSize and the limit is never a valid frame:
+	// the egress decoder rejects RESULT_BATCH payloads > qwpMaxBatchSize,
+	// and every ACK / SERVER_INFO frame is far smaller.
+	qwpReadLimitSlack = 4096
+
+	// qwpMaxFrameReadLimit is the hard ceiling on a single inbound
+	// WebSocket message. Egress RESULT_BATCH / SERVER_INFO and ingest
+	// ACK frames share one connection, so this single cap covers both.
+	// Armed via Conn.SetReadLimit so a hostile or buggy server cannot
+	// OOM the host with a multi-GB frame: the limit is enforced *during*
+	// the streamed read, before the whole message is resident, rather
+	// than only after — qwpMaxBatchSize alone is checked post-assembly
+	// by the decoder and not at all on the readAck path. It also caps
+	// qwpReadFrameInto's buffer doubling as defense-in-depth.
+	qwpMaxFrameReadLimit = qwpMaxBatchSize + qwpReadLimitSlack
+
 	// qwpMaxConnDictHeapBytes caps the connection-scoped SYMBOL dict
 	// UTF-8 heap at 256 MiB. Servers that approach this cap are
 	// expected to emit CACHE_RESET; crossing it without a reset is a

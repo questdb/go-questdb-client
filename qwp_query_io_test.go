@@ -31,6 +31,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1533,5 +1534,44 @@ func TestQwpEgressIOShutdownUnblocksStuckWrite(t *testing.T) {
 	}
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("shutdown took %v; want well under 500ms — dispatcher was stuck in Write past shutdown signal", elapsed)
+	}
+}
+
+// fillFrameReader fills every Read fully and never reports io.EOF,
+// modelling a hostile or buggy server streaming an unbounded frame.
+type fillFrameReader struct{}
+
+func (fillFrameReader) Read(p []byte) (int, error) { return len(p), nil }
+
+// TestQwpReadFrameIntoCeiling pins the defense-in-depth ceiling: an
+// unbounded inbound frame must be rejected without growing the buffer
+// past qwpMaxFrameReadLimit (host-OOM hardening), while a legitimate
+// frame of exactly qwpMaxBatchSize — the egress decoder's own accept
+// boundary — must still be read in full. The latter is what
+// qwpReadLimitSlack buys: coder/websocket's limitReader and this
+// function would otherwise false-reject an exactly-cap frame whose
+// terminal io.EOF arrives on a separate Read.
+func TestQwpReadFrameIntoCeiling(t *testing.T) {
+	buf := make([]byte, 0)
+	pb := &buf
+	out, err := qwpReadFrameInto(fillFrameReader{}, pb)
+	if err == nil {
+		t.Fatalf("unbounded frame: expected error, got nil (len=%d)", len(out))
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("unbounded frame: unexpected error: %v", err)
+	}
+	if cap(*pb) > qwpMaxFrameReadLimit {
+		t.Fatalf("buffer grew to cap %d, exceeds ceiling %d", cap(*pb), qwpMaxFrameReadLimit)
+	}
+
+	buf2 := make([]byte, 0)
+	pb2 := &buf2
+	out2, err := qwpReadFrameInto(io.LimitReader(fillFrameReader{}, qwpMaxBatchSize), pb2)
+	if err != nil {
+		t.Fatalf("exact-qwpMaxBatchSize frame rejected: %v", err)
+	}
+	if len(out2) != qwpMaxBatchSize {
+		t.Fatalf("exact-qwpMaxBatchSize frame: got %d bytes, want %d", len(out2), qwpMaxBatchSize)
 	}
 }

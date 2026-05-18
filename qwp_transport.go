@@ -296,9 +296,15 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		return fmt.Errorf("qwp: server selected protocol version %q, client supports up to %d", serverVersion, advertisedMax)
 	}
 
-	// Remove the default read limit — QWP ACKs are small but
-	// error payloads can vary.
-	conn.SetReadLimit(-1)
+	// Raise — but do not remove — the default read limit. QWP ACKs are
+	// small, but egress RESULT_BATCH frames can reach qwpMaxBatchSize,
+	// so the 32 KiB default is too low. A finite ceiling (not -1) is
+	// load-bearing: this conn is shared by the egress reader and the
+	// ingest readAck path, and coder/websocket enforces the limit while
+	// streaming the message — a hostile or buggy server emitting a
+	// multi-GB frame is cut off mid-read instead of OOMing the host
+	// before any downstream size check runs.
+	conn.SetReadLimit(qwpMaxFrameReadLimit)
 
 	t.conn = conn
 	t.negotiatedVersion = byte(negotiated)

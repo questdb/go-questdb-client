@@ -539,13 +539,28 @@ func (io *qwpEgressIO) notify() {
 // and writes the grown slice back so the larger capacity persists for
 // the next reuse. coder/websocket requires the message reader be drained
 // to io.EOF.
+//
+// Growth is hard-capped at qwpMaxFrameReadLimit. The shared conn's
+// SetReadLimit already cuts a runaway frame off mid-stream, but this
+// independent ceiling keeps the function self-protecting regardless of
+// connection config: it never allocates past the cap, and a frame that
+// fills it without ending is rejected rather than grown further.
 func qwpReadFrameInto(r io.Reader, pb *[]byte) ([]byte, error) {
 	b := (*pb)[:0]
 	for {
 		if len(b) == cap(b) {
+			if cap(b) >= qwpMaxFrameReadLimit {
+				*pb = b
+				return nil, fmt.Errorf(
+					"qwp: inbound frame exceeds %d-byte read limit",
+					qwpMaxFrameReadLimit)
+			}
 			nc := cap(b) * 2
 			if nc < 64*1024 {
 				nc = 64 * 1024
+			}
+			if nc > qwpMaxFrameReadLimit {
+				nc = qwpMaxFrameReadLimit
 			}
 			nb := make([]byte, len(b), nc)
 			copy(nb, b)
