@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
@@ -340,4 +341,74 @@ func TestQwpSenderAwaitAckedFsnAlreadyAcked(t *testing.T) {
 	cancelled, cancelFn := context.WithCancel(context.Background())
 	cancelFn()
 	require.NoError(t, s.AwaitAckedFsn(cancelled, -1))
+}
+
+// stableGoroutineCount returns runtime.NumGoroutine() once it has
+// settled: it GCs and samples until two successive reads agree (or a
+// bounded number of attempts elapse), so a transient teardown
+// goroutine doesn't poison the sample.
+func stableGoroutineCount() int {
+	prev := -1
+	for i := 0; i < 50; i++ {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+		n := runtime.NumGoroutine()
+		if n == prev {
+			return n
+		}
+		prev = n
+	}
+	return prev
+}
+
+// TestQwpCursorNoGoroutineLeakOnClose re-creates the goroutine-leak
+// coverage that the removed TestQwpAsyncGoroutineLeakOnClose provided
+// for the old async state. The cursor model spawns *more* goroutines
+// than the async one did — per sender: run(), plus a senderLoop and a
+// receiverLoop per connection — all of which Close()/sendLoopClose()
+// must join. A leak of even one of them per sender would be invisible
+// to every other cursor test (they each build exactly one sender),
+// so this drives many open/send/flush/close cycles and asserts the
+// goroutine count does not grow with the cycle count.
+func TestQwpCursorNoGoroutineLeakOnClose(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	runCycle := func() {
+		s, engine, _, cleanup := newCursorSenderForTest(t, srv, 0)
+		require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+		require.NoError(t, s.Flush(context.Background()))
+		require.Eventually(t, func() bool {
+			return engine.engineAckedFsn() >= engine.enginePublishedFsn()
+		}, 2*time.Second, 1*time.Millisecond, "frame never ACKed")
+		cleanup() // Close(): joins run() + sender/receiver goroutines.
+	}
+
+	// Warm-up cycle so the httptest accept machinery and any
+	// once-initialized globals are already counted in the baseline.
+	runCycle()
+	base := stableGoroutineCount()
+
+	const cycles = 25
+	for i := 0; i < cycles; i++ {
+		runCycle()
+	}
+
+	// Teardown is partly asynchronous (server-side WS conn goroutines
+	// unwind once the client drops the transport), so give it time to
+	// settle. A per-cycle leak across run()/senderLoop/receiverLoop
+	// would add ~3×25 goroutines — far past the constant slack — so
+	// this stays sensitive without flaking on transient runtime/server
+	// goroutines.
+	const slack = 8
+	var got int
+	require.Eventuallyf(t, func() bool {
+		got = stableGoroutineCount()
+		return got <= base+slack
+	}, 10*time.Second, 100*time.Millisecond,
+		"goroutine count did not return to baseline after %d cursor "+
+			"open/send/flush/close cycles", cycles)
+	assert.LessOrEqualf(t, got, base+slack,
+		"goroutine count grew from %d to %d across %d cycles — Close "+
+			"is leaking cursor send-loop goroutines", base, got, cycles)
 }

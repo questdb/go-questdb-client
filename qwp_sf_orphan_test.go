@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,6 +236,97 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 	}
 	// Snapshot must be empty after close: completed drainers are
 	// pruned from the active list as their goroutines exit.
+	assert.Empty(t, pool.drainerPoolSnapshot())
+}
+
+// TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime proves the
+// max_background_drainers cap is a *runtime* bound, not just a parsed
+// config value: submitting more drainers than the cap must never run
+// more than `cap` drainerRun bodies at once. The clientFactory is the
+// observation point — it is invoked from inside drainerRun only after
+// the goroutine has taken its semaphore slot, so the number of
+// concurrent factory entries equals the number of concurrently
+// running drainers. A factory that parks until the pool's master ctx
+// is cancelled holds every slot occupied, so a cap-violating drainer
+// (if the semaphore were missing) would show up as a (cap+1)th entry.
+func TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime(t *testing.T) {
+	prevGrace := qwpSfDrainerPoolCloseGrace
+	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
+	defer func() { qwpSfDrainerPoolCloseGrace = prevGrace }()
+
+	const (
+		maxConcurrent = 2
+		total         = 5
+	)
+
+	var running atomic.Int32
+	var peak atomic.Int32
+	entered := make(chan struct{}, total)
+
+	// Parks until the pool's master ctx is cancelled (drainerPoolClose).
+	blockingFactory := func(ctx context.Context, _ int) (*qwpTransport, error) {
+		cur := running.Add(1)
+		defer running.Add(-1)
+		for {
+			p := peak.Load()
+			if cur <= p || peak.CompareAndSwap(p, cur) {
+				break
+			}
+		}
+		entered <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	pool := qwpSfNewDrainerPool(maxConcurrent)
+
+	const segSize int64 = 4096
+	drainers := make([]*qwpSfOrphanDrainer, total)
+	for i := range drainers {
+		dir := t.TempDir()
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte{byte(i)})
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+
+		d := qwpSfNewOrphanDrainer(
+			dir, segSize, qwpSfUnlimitedTotalBytes,
+			blockingFactory,
+			nil,
+			time.Second, 10*time.Millisecond, 100*time.Millisecond,
+		)
+		drainers[i] = d
+		require.NoError(t, pool.drainerPoolSubmit(context.Background(), d))
+	}
+
+	// Exactly `maxConcurrent` drainers must reach the factory.
+	for i := 0; i < maxConcurrent; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d drainers entered the factory, want %d", i, maxConcurrent)
+		}
+	}
+	// No further drainer may enter while the first `maxConcurrent`
+	// hold their slots — the rest are parked on the semaphore.
+	select {
+	case <-entered:
+		t.Fatalf("a %dth drainer entered the factory: runtime cap not enforced", maxConcurrent+1)
+	case <-time.After(250 * time.Millisecond):
+	}
+	assert.LessOrEqual(t, peak.Load(), int32(maxConcurrent),
+		"at most %d drainers may run concurrently, observed peak %d", maxConcurrent, peak.Load())
+
+	// Close cancels the master ctx; parked factories unwind, the
+	// queued drainers never enter. The cap must still hold.
+	pool.drainerPoolClose()
+	assert.LessOrEqual(t, peak.Load(), int32(maxConcurrent),
+		"concurrency cap must hold across the full run, observed peak %d", peak.Load())
+	for i, d := range drainers {
+		assert.NotEqual(t, qwpSfDrainOutcomePending, d.drainerOutcome(),
+			"drainer %d still pending after close", i)
+	}
 	assert.Empty(t, pool.drainerPoolSnapshot())
 }
 

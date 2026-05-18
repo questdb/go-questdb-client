@@ -53,6 +53,31 @@ func closeFrameTestServer(t *testing.T, code websocket.StatusCode, reason string
 	}))
 }
 
+// closeAfterNFramesServer accepts the WS upgrade, reads exactly n
+// frames (never ACKing any), then closes with the given terminal
+// code. Consuming every frame the producer sends before closing
+// keeps senderLoop from producing a write error that would race the
+// receiver's close-frame error in runOneConnection's first-error
+// aggregation — so the resulting terminal SenderError is always the
+// close-code one, with a deterministic [ackedFsn+1, publishedFsn]
+// FSN span.
+func closeAfterNFramesServer(t *testing.T, n int, code websocket.StatusCode, reason string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		for i := 0; i < n; i++ {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+		_ = conn.Close(code, reason)
+	}))
+}
+
 // TestQwpSfTerminalCloseCodeProducesProtocolViolation drives the send
 // loop against a server that closes with each terminal code; asserts
 // the loop produces a CategoryProtocolViolation+Halt SenderError and
@@ -109,6 +134,67 @@ func TestQwpSfTerminalCloseCodeProducesProtocolViolation(t *testing.T) {
 			assert.Equal(t, int64(0), loop.sendLoopTotalReconnects())
 		})
 	}
+}
+
+// TestQwpSfTerminalCloseMultiFrameFsnSpan pins the non-degenerate
+// SenderError FSN span. Every other terminal-path test publishes a
+// single unacked frame, so FromFsn == ToFsn and the span is never
+// actually exercised. Here several frames are published and none are
+// ACKed when a terminal close arrives, so qwpSfBuildProtocolViolationSE
+// must report [FromFsn, ToFsn] = [ackedFsn+1, publishedFsn] with
+// FromFsn strictly < ToFsn — the multi-frame correlation window that
+// dead-lettering and AwaitAckedFsn callers rely on.
+func TestQwpSfTerminalCloseMultiFrameFsnSpan(t *testing.T) {
+	const nFrames = 4
+	httpSrv := closeAfterNFramesServer(t, nFrames,
+		websocket.StatusProtocolError, "bad framing")
+	defer httpSrv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	// Publish every frame BEFORE the loop starts: publishedFsn is then
+	// a stable nFrames-1 by the time the close-frame SE is built, and
+	// the server reads exactly the nFrames the producer will send.
+	for i := 0; i < nFrames; i++ {
+		_, err := engine.engineAppendBlocking(context.Background(), []byte{byte(i)})
+		require.NoError(t, err)
+	}
+	require.Equal(t, int64(nFrames-1), engine.enginePublishedFsn())
+	require.Equal(t, int64(-1), engine.engineAckedFsn(),
+		"precondition: nothing ACKed, so FromFsn must come out as 0")
+
+	factory := qwpSfDialAt(httpSrv.URL)
+	transport, err := factory(context.Background(), 0)
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, factory,
+		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	require.Eventually(t, func() bool {
+		return loop.sendLoopCheckError() != nil
+	}, 3*time.Second, 1*time.Millisecond,
+		"loop did not record the terminal close error")
+
+	var se *SenderError
+	require.True(t, errors.As(loop.sendLoopCheckError(), &se),
+		"expected *SenderError, got %v", loop.sendLoopCheckError())
+	assert.Equal(t, CategoryProtocolViolation, se.Category)
+	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
+	assert.Contains(t, se.ServerMessage, "ws-close[")
+	// The point of the test: a real multi-frame span.
+	assert.Equal(t, int64(0), se.FromFsn,
+		"FromFsn = ackedFsn+1 = 0 (nothing ACKed)")
+	assert.Equal(t, int64(nFrames-1), se.ToFsn,
+		"ToFsn = publishedFsn = nFrames-1")
+	assert.Less(t, se.FromFsn, se.ToFsn,
+		"multi-frame span: FromFsn must be strictly < ToFsn (not the "+
+			"degenerate single-frame FromFsn == ToFsn case)")
+	assert.Equal(t, int64(0), loop.sendLoopTotalReconnects(),
+		"terminal close must not trigger reconnect")
 }
 
 // Non-terminal close-code reconnect is already covered by
