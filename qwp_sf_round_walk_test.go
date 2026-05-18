@@ -775,10 +775,16 @@ func TestInitialConnectOffWalksMultiHostToHealthy(t *testing.T) {
 
 	// Send a row and confirm it reached the healthy server — proves
 	// the bind landed on host 1, not on host 0 (which would have
-	// rejected the upgrade outright).
+	// rejected the upgrade outright). Flush no longer blocks on the
+	// server ACK (the cursor architecture made local persistence, not
+	// the ACK, the durability guarantee — see CLAUDE.md), so the send
+	// loop delivers in the background; poll for receipt rather than
+	// reading the counter synchronously right after Flush.
 	require.NoError(t, sender.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.NoError(t, sender.Flush(context.Background()))
-	assert.GreaterOrEqual(t, healthySrv.totalFramesReceived.Load(), int64(1),
+	require.Eventually(t, func() bool {
+		return healthySrv.totalFramesReceived.Load() >= int64(1)
+	}, 2*time.Second, 1*time.Millisecond,
 		"the healthy peer must have received the test frame")
 }
 
