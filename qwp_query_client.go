@@ -622,7 +622,10 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QueryOpt
 		return q
 	}
 	q.requestId = req.requestId
-	q.session = newQwpQuerySession(c, req)
+	// SELECT is idempotent: transparent reconnect-and-replay on a
+	// transport drop is always safe, so the session is replayable
+	// regardless of replay_exec (which only governs Exec).
+	q.session = newQwpQuerySession(c, req, true)
 	if err := q.session.submit(ctx); err != nil {
 		q.pendingErr = err
 		q.state.Store(qwpQueryStateDone)
@@ -652,7 +655,12 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 	}
 	reqId := req.requestId
 
-	session := newQwpQuerySession(c, req)
+	// Exec replays on a transport drop only when the caller opted in
+	// via replay_exec=on. Default off: a non-idempotent statement the
+	// server may already have applied must not be silently re-executed
+	// on the reconnect — nextEvent surfaces the raw transport error
+	// instead (see qwpQuerySession.replayable).
+	session := newQwpQuerySession(c, req, c.cfg.replayExec)
 	if err := session.submit(ctx); err != nil {
 		return ExecResult{}, err
 	}
@@ -685,15 +693,15 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 			// side faults).
 			return ExecResult{}, transportEventError(ev)
 		case qwpEventKindFailoverReset:
-			// The session ran a successful reconnect-and-replay. With
-			// replayExec disabled (the default), Exec must surface
-			// the reset to the caller so non-idempotent statements
-			// don't double-execute. With replayExec enabled, the
-			// reset is informational — fall through and consume the
-			// next event from the new generation.
-			if !c.cfg.replayExec {
-				return ExecResult{}, ev.failoverReset
-			}
+			// Only reachable when this Exec opted into replay
+			// (replay_exec=on): the session passes c.cfg.replayExec as
+			// its replayable flag, and nextEvent emits this event only
+			// for a replayable session — a non-idempotent Exec with
+			// replay_exec=off is short-circuited to a raw transport
+			// error before any reconnect, so it never double-executes.
+			// Here the session already reconnected and resubmitted
+			// transparently; the reset is informational. Consume the
+			// new generation's terminal event on the next iteration.
 		case qwpEventKindBatch:
 			// Server streamed a result batch for what we asked for as
 			// an exec. Release the buffer, send a CANCEL so the

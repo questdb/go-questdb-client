@@ -144,10 +144,12 @@ func (e *QwpRoleMismatchError) Unwrap() error {
 // gets a clear human-readable error and the iterator's deferred
 // cleanup tears down the dying generation.
 //
-// Returned by Exec only when the client was constructed with
-// WithQwpQueryReplayExec(false) (the default), to protect non-
-// idempotent statements from double-execution. With opt-in replay,
-// Exec retries transparently and never surfaces this error.
+// Surfaced only on the Query (SELECT) path. Exec never returns this:
+// with replay_exec=off (the default) a transport drop yields the raw
+// transport error without reconnecting — so a non-idempotent
+// statement the server may already have applied is not silently
+// re-executed — and with replay_exec=on Exec replays transparently
+// and consumes the reset internally.
 type QwpFailoverReset struct {
 	// NewNode is the SERVER_INFO of the endpoint the client just
 	// rebound to, or nil if the new connection negotiated v1 (no

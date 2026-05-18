@@ -950,11 +950,13 @@ func TestQwpQueryErrorIsNotRetried(t *testing.T) {
 	}
 }
 
-// TestQwpExecDefaultSurfacesFailoverReset verifies that with
-// replayExec=false (the default), Exec returns *QwpFailoverReset
-// when a transport drop triggers a successful reconnect — the
-// caller sees the reset and decides whether to retry.
-func TestQwpExecDefaultSurfacesFailoverReset(t *testing.T) {
+// TestQwpExecDefaultDoesNotReplayOnTransportDrop verifies that with
+// replayExec=false (the default), a transport drop mid-Exec does NOT
+// reconnect-and-resubmit: the (possibly already-applied) statement is
+// never silently re-executed on a fresh connection. The caller gets a
+// raw transport error (not *QwpFailoverReset) and the second node is
+// never contacted.
+func TestQwpExecDefaultDoesNotReplayOnTransportDrop(t *testing.T) {
 	first := atomic.Bool{}
 	cluster := newMockCluster(t, 2, rolesPrimaryReplicaReplica(),
 		func(idx int, m *qwpMockEgressConn) {
@@ -962,22 +964,17 @@ func TestQwpExecDefaultSurfacesFailoverReset(t *testing.T) {
 			defer cancel()
 			_, _, _ = m.conn.Read(ctx)
 			if idx == 0 && first.CompareAndSwap(false, true) {
+				// Simulate the server having committed the INSERT, then
+				// the transport dropping before the EXEC_DONE ack lands.
 				m.conn.Close(websocket.StatusInternalError, "fault")
 				return
 			}
-			// Node 1 ack with EXEC_DONE. With replayExec=false, the
-			// client never consumes this — Exec returns the
-			// *QwpFailoverReset error before observing the new
-			// generation's response. Best-effort write so a closed
-			// conn after the test returned does not flag the test
-			// as failed.
-			body := []byte{byte(qwpMsgKindExecDone)}
-			body = appendInt64LE(body, 2)
-			body = append(body, 0)
-			body = append(body, 0)
-			frame := writeQwpFrame(0, body)
-			frame[4] = m.version
-			_ = m.conn.Write(ctx, websocket.MessageBinary, frame)
+			// Reaching any node other than node 0's first connection
+			// means the client reconnected and re-sent the INSERT —
+			// exactly the silent double-execution replay_exec=off must
+			// prevent. Fail loudly from the server goroutine.
+			t.Errorf("node %d received a connection: Exec replayed a "+
+				"non-idempotent statement with replay_exec=off", idx)
 			for {
 				if _, _, err := m.conn.Read(ctx); err != nil {
 					return
@@ -1006,11 +1003,29 @@ func TestQwpExecDefaultSurfacesFailoverReset(t *testing.T) {
 
 	_, err = c.Exec(ctx, "INSERT INTO t VALUES (1)")
 	if err == nil {
-		t.Fatal("expected *QwpFailoverReset error from Exec with replayExec=false")
+		t.Fatal("expected a transport error from Exec with replayExec=false")
 	}
+	// The error must NOT be a failover reset: surfacing one would imply
+	// a successful reconnect-and-replay happened.
 	var reset *QwpFailoverReset
-	if !errors.As(err, &reset) {
-		t.Fatalf("err = %v (%T), want *QwpFailoverReset", err, err)
+	if errors.As(err, &reset) {
+		t.Fatalf("err is *QwpFailoverReset (%v): replay_exec=off must "+
+			"not reconnect-and-replay a non-idempotent Exec", err)
+	}
+	// Nor a failover-exhausted error: we must bail before any retry
+	// budget is consumed, not after exhausting it.
+	var exhausted *QwpFailoverExhaustedError
+	if errors.As(err, &exhausted) {
+		t.Fatalf("err is *QwpFailoverExhaustedError (%v): replay_exec=off "+
+			"must not enter the retry loop at all", err)
+	}
+	// Proof the statement was not re-sent: node 0 was connected exactly
+	// once (initial connect, then faulted) and node 1 was never reached.
+	if got := cluster.nodes[0].onConnectCount.Load(); got != 1 {
+		t.Errorf("node 0 connectCount = %d, want 1 (single submit, no replay)", got)
+	}
+	if got := cluster.nodes[1].onConnectCount.Load(); got != 0 {
+		t.Errorf("node 1 connectCount = %d, want 0 (no reconnect)", got)
 	}
 }
 

@@ -364,6 +364,18 @@ type qwpQuerySession struct {
 	// reads it to send a CANCEL frame for the right generation.
 	currentRequestId atomic.Int64
 
+	// replayable gates whether nextEvent is allowed to
+	// reconnect-and-resubmit on a transport-terminal failure. true
+	// for Query (SELECT is idempotent — replaying is always safe);
+	// for Exec it is cfg.replayExec, false by default so a
+	// non-idempotent INSERT/UPDATE/DELETE/DDL that the server may
+	// have already applied before the transport drop is never
+	// silently re-executed on the new connection. When false,
+	// nextEvent surfaces the raw transport error instead of
+	// resubmitting (the connection is poisoned; the caller must
+	// rebuild and decide whether the statement applied).
+	replayable bool
+
 	// attempt counts executeOnce invocations: 1 on the initial
 	// submission, 2 after the first replay, etc. Capped by
 	// cfg.failoverMaxAttempts.
@@ -409,13 +421,19 @@ func (s *qwpQuerySession) failoverBudgetExpired() bool {
 // The retained sql / bind payload comes from the supplied req. The
 // caller must call submit before nextEvent; submit assigns the initial
 // requestId and dispatches the first attempt to the I/O goroutine.
-func newQwpQuerySession(client *QwpQueryClient, req qwpRequest) *qwpQuerySession {
+//
+// replayable decides whether a transport-terminal failure may be
+// recovered by reconnect-and-resubmit: pass true for Query (SELECT is
+// idempotent) and cfg.replayExec for Exec (false by default to protect
+// non-idempotent statements from double-execution).
+func newQwpQuerySession(client *QwpQueryClient, req qwpRequest, replayable bool) *qwpQuerySession {
 	s := &qwpQuerySession{
 		client:        client,
 		sql:           req.sql,
 		bindPayload:   req.bindPayload,
 		bindCount:     req.bindCount,
 		initialCredit: req.initialCredit,
+		replayable:    replayable,
 		cancelCh:      make(chan struct{}),
 	}
 	s.currentRequestId.Store(req.requestId)
@@ -462,12 +480,15 @@ func (s *qwpQuerySession) requestCancel() {
 // caller's iterator (Batches() / Exec() loop) yields the reset to the
 // user, who is expected to discard accumulated state and continue.
 //
-// When failover is disabled (cfg.failoverEnabled == false), the
-// original transport error is returned as-is so the caller surfaces
-// it through the usual error path. When the failover budget is
-// exhausted (s.attempt >= cfg.failoverMaxAttempts, or the
-// failover_max_duration_ms wall-clock budget has elapsed), the event
-// is wrapped into a *QwpFailoverExhaustedError so callers can
+// When failover is disabled (cfg.failoverEnabled == false), or this
+// session is not replayable (a non-idempotent Exec with
+// replay_exec=off — see s.replayable), the original transport error
+// is returned as-is, WITHOUT reconnecting or resubmitting, so the
+// caller surfaces it through the usual error path and the
+// possibly-already-applied statement is never re-executed. When the
+// failover budget is exhausted (s.attempt >= cfg.failoverMaxAttempts,
+// or the failover_max_duration_ms wall-clock budget has elapsed), the
+// event is wrapped into a *QwpFailoverExhaustedError so callers can
 // errors.As against the exhaustion shape and distinguish "we ran out
 // of retries" from "first attempt failed".
 func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
@@ -484,6 +505,18 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	}
 	cfg := s.client.cfg
 	if !cfg.failoverEnabled {
+		return ev, nil
+	}
+	if !s.replayable {
+		// Non-idempotent Exec with replay_exec=off. The server may
+		// have already applied the INSERT/UPDATE/DELETE/DDL before the
+		// transport dropped, so reconnecting and resubmitting would
+		// risk a silent second execution. Surface the raw transport
+		// error instead: the connection is poisoned (loadIoErr is
+		// latched), the next Query/Exec fails fast, and the caller
+		// must rebuild the client and decide whether the statement
+		// took effect. Query is always replayable (SELECT is
+		// idempotent), so this branch only ever fires for Exec.
 		return ev, nil
 	}
 	if s.attempt >= cfg.failoverMaxAttempts || s.failoverBudgetExpired() {
