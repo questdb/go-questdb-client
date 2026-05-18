@@ -334,6 +334,10 @@ func (l *qwpSfSendLoop) sendLoopSetPolicyResolver(r *qwpSfPolicyResolver) {
 // swap time are subject to its drain timeout — extremely fast swap +
 // flood scenarios may lose a notification, matching offer's
 // best-effort contract.
+//
+// Safe to call from within a SenderErrorHandler: old.close() detects
+// that it is running on the old dispatcher's own loop goroutine and
+// returns without joining itself (see qwpSfErrorDispatcher.close).
 func (l *qwpSfSendLoop) sendLoopSetErrorHandler(handler SenderErrorHandler, capacity int) {
 	if capacity <= 0 {
 		capacity = qwpSfDefaultErrorInboxCapacity

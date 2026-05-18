@@ -26,6 +26,8 @@ package questdb
 
 import (
 	"log"
+	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,6 +90,17 @@ type qwpSfErrorDispatcher struct {
 
 	dropped   atomic.Int64
 	delivered atomic.Int64
+
+	// loopGoid is the goroutine ID of loop(), stored when it starts
+	// and cleared (back to 0) when it exits. close() compares the
+	// caller's goid against it to detect a re-entrant shutdown: a
+	// SenderErrorHandler that calls Close() — or swaps the handler,
+	// routing through sendLoopSetErrorHandler -> old.close() — runs
+	// inside deliver() *on this goroutine*. A wg.Wait() from there
+	// would join the loop goroutine to itself and hang forever. 0
+	// never matches a real goid, so a close() before loop() starts
+	// (or after it exits) takes the normal waiting path.
+	loopGoid atomic.Int64
 
 	// wg waits for the dispatch goroutine to exit during close().
 	wg sync.WaitGroup
@@ -176,6 +189,11 @@ func (d *qwpSfErrorDispatcher) startIfNeeded() {
 // sender continue running.
 func (d *qwpSfErrorDispatcher) loop() {
 	defer d.wg.Done()
+	// Publish our goroutine identity before the first deliver() so a
+	// handler that re-enters close() on this goroutine is recognized.
+	// Cleared on exit so a later close() never matches a stale id.
+	d.loopGoid.Store(qwpGoid())
+	defer d.loopGoid.Store(0)
 	for {
 		select {
 		case e := <-d.inbox:
@@ -261,6 +279,25 @@ func (d *qwpSfErrorDispatcher) close() {
 	close(d.done)
 	started := d.started.Load()
 	d.mu.Unlock()
+
+	// Re-entrant shutdown guard. A SenderErrorHandler invoked by
+	// deliver() on the loop goroutine is allowed to call Close()
+	// (or swap the handler, which routes through
+	// sendLoopSetErrorHandler -> old.close()). Both land here on
+	// this very goroutine. wg.Wait() would block until loop() calls
+	// wg.Done(), but loop() is the current goroutine, suspended in
+	// the handler frame below this call — a permanent self-join that
+	// no timeout escapes. done is already closed above, so once the
+	// handler stack unwinds, loop() observes done, runs its own
+	// bounded drain(), and exits cleanly. Skip the wait (and the
+	// post-wait inbox sweep, which would race loop()'s drain) and
+	// return. Non-loop callers fall through to the normal path. The
+	// g != 0 check keeps a goid parse failure (returns 0) from
+	// matching the loopGoid==0 "not running" sentinel.
+	if g := qwpGoid(); g != 0 && d.loopGoid.Load() == g {
+		return
+	}
+
 	d.wg.Wait()
 	if !started {
 		d.drain()
@@ -310,4 +347,33 @@ func defaultSenderErrorHandler(e *SenderError) {
 		level = "[WARN]"
 	}
 	log.Printf("%s qwp/sf: %s", level, e)
+}
+
+// qwpGoid returns the numeric ID of the calling goroutine, or 0 if it
+// cannot be parsed. Go exposes goroutine identity only through the
+// runtime.Stack header ("goroutine <id> [<status>]:"); there is no
+// public accessor. This is used solely by the dispatcher's re-entrant
+// close() guard — a SenderErrorHandler that calls Close() runs on the
+// dispatcher loop goroutine and a blocking join from there would
+// self-deadlock. The cost (one fixed-size runtime.Stack of the current
+// goroutine only) is paid once at loop() start and on close(), never
+// on the publish/encode hot path.
+func qwpGoid() int64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	const prefix = "goroutine "
+	b := buf[:n]
+	if len(b) < len(prefix) {
+		return 0
+	}
+	b = b[len(prefix):]
+	i := 0
+	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+		i++
+	}
+	id, err := strconv.ParseInt(string(b[:i]), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
 }

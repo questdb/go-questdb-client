@@ -41,6 +41,18 @@ package questdb
 // Any panic from the handler is recovered and logged by the
 // dispatcher. The dispatcher and the sender continue running.
 //
+// # Calling back into the sender
+//
+// The handler may call Close() or Flush() on the sender — e.g. to shut
+// down on a HALT-category error. The terminal *SenderError is latched
+// before the handler is invoked, so a synchronous Flush() returns it
+// promptly rather than blocking. Close() called from the handler is
+// honored and returns without deadlocking; the dispatcher goroutine
+// (this goroutine) finishes unwinding on its own once the handler
+// returns, so any error notifications still queued at that moment are
+// subject to the dispatcher's short best-effort drain and may be
+// dropped (visible via QwpSender.DroppedErrorNotifications()).
+//
 // # What this callback is for
 //
 // Dead-lettering rejected data, alerting, metrics. Producer-thread

@@ -326,3 +326,88 @@ func TestQwpSfDispatcherNilOfferIsNoop(t *testing.T) {
 		t.Errorf("nil offer should not bump dropped: %d", d.droppedNotifications())
 	}
 }
+
+// TestQwpSfDispatcherCloseFromHandlerNoSelfJoin is a regression test
+// for the self-join deadlock: a SenderErrorHandler that calls the
+// sender's Close() runs inside deliver() on the dispatcher loop
+// goroutine, and Close() funnels into dispatcher.close(). Before the
+// fix, close()'s unbounded wg.Wait() waited for loop() to exit while
+// loop() was suspended in the handler frame beneath that wait — a
+// permanent hang no timeout escaped. close() must recognize the
+// re-entrant caller, return without waiting, and let loop() unwind
+// itself once the handler stack returns.
+func TestQwpSfDispatcherCloseFromHandlerNoSelfJoin(t *testing.T) {
+	var d *qwpSfErrorDispatcher
+	returned := make(chan struct{})
+	d = newQwpSfErrorDispatcher(func(e *SenderError) {
+		d.close() // re-entrant: runs on the loop goroutine
+		close(returned)
+	}, 4)
+
+	if !d.offer(&SenderError{Category: CategoryParseError, AppliedPolicy: PolicyHalt}) {
+		t.Fatal("offer rejected on a fresh dispatcher")
+	}
+
+	select {
+	case <-returned:
+		// close() returned to the handler — no self-join.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() from handler deadlocked (self-join on the dispatcher loop goroutine)")
+	}
+
+	// Fully closed: further offers rejected, and the loop goroutine
+	// terminates (wg released) shortly after the handler unwinds.
+	if d.offer(&SenderError{Category: CategoryParseError}) {
+		t.Fatal("offer accepted after re-entrant close")
+	}
+	loopExited := make(chan struct{})
+	go func() { d.wg.Wait(); close(loopExited) }()
+	select {
+	case <-loopExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("loop goroutine did not exit after re-entrant close")
+	}
+	d.close() // idempotent re-close from the test goroutine must not hang
+}
+
+// TestQwpSfDispatcherExternalCloseStillJoinsLoop guards against the
+// re-entrancy fix over-firing: a close() from a goroutine other than
+// the loop's must still block until the loop goroutine has exited, so
+// callers that free resources after Close() returns stay safe.
+func TestQwpSfDispatcherExternalCloseStillJoinsLoop(t *testing.T) {
+	release := make(chan struct{})
+	var inHandler atomic.Bool
+	d := newQwpSfErrorDispatcher(func(e *SenderError) {
+		inHandler.Store(true)
+		<-release // pin the loop goroutine inside deliver()
+	}, 4)
+
+	if !d.offer(&SenderError{Category: CategoryParseError}) {
+		t.Fatal("offer rejected on a fresh dispatcher")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !inHandler.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("handler never invoked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	closeReturned := make(chan struct{})
+	go func() {
+		d.close() // external goroutine: must wait for the loop
+		close(closeReturned)
+	}()
+
+	select {
+	case <-closeReturned:
+		t.Fatal("external close() returned before the loop goroutine exited")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release) // let the handler finish
+	select {
+	case <-closeReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("external close() did not return after the loop drained")
+	}
+}

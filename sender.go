@@ -447,6 +447,10 @@ func WithCloseTimeout(d time.Duration) LineSenderOption {
 // Passing nil reverts to the default loud-not-silent handler that
 // logs ERROR for HALT and WARN for DROP.
 //
+// The handler may call Close() or Flush() on the sender (e.g. to shut
+// down on a HALT) without deadlocking — see SenderErrorHandler for the
+// re-entrancy contract.
+//
 // Only available for the QWP sender.
 func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 	return func(s *lineSenderConfig) {
