@@ -27,6 +27,7 @@ package questdb
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -352,9 +353,13 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 		observedTotal := m.totalBytes
 		m.mu.Unlock()
 		if observedTotal+m.segmentSizeBytes > m.maxTotalBytes {
-			// Disk/memory cap reached: skip provisioning. Logged at
-			// most once per qwpSfManagerDiskFullLogThrottle so a
-			// sustained-disk-full state doesn't drown logs.
+			// Disk/memory cap reached: skip provisioning. Producers
+			// will block on engineAppendBlocking until in-flight
+			// segments are ACK'd and trimmed, so this state is exactly
+			// the one operators need surfaced. Logged at most once per
+			// qwpSfManagerDiskFullLogThrottle so a sustained cap-full
+			// state doesn't drown logs. The log write happens after the
+			// lock is released to keep the syscall off m.mu.
 			now := time.Now()
 			m.mu.Lock()
 			shouldLog := now.Sub(m.lastDiskFullLog) >= qwpSfManagerDiskFullLogThrottle
@@ -362,7 +367,21 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 				m.lastDiskFullLog = now
 			}
 			m.mu.Unlock()
-			_ = shouldLog // logging is the caller's concern; counters are exposed via accessors
+			if shouldLog {
+				if memoryMode {
+					log.Printf("[WARN] qwp/sf: in-memory segment cap reached "+
+						"(%d/%d bytes used, segment size %d); spare provisioning "+
+						"paused — producers block until in-flight segments are "+
+						"ACK'd and trimmed",
+						observedTotal, m.maxTotalBytes, m.segmentSizeBytes)
+				} else {
+					log.Printf("[WARN] qwp/sf: disk cap reached for %q "+
+						"(%d/%d bytes used, segment size %d); spare provisioning "+
+						"paused — producers block until in-flight segments are "+
+						"ACK'd and trimmed",
+						e.dir, observedTotal, m.maxTotalBytes, m.segmentSizeBytes)
+				}
+			}
 		} else {
 			var (
 				spare *qwpSfSegment
