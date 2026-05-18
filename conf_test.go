@@ -613,6 +613,57 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithGorilla(true),
 			},
 		},
+		{
+			name:   "ws with auth_timeout_ms",
+			config: fmt.Sprintf("ws::addr=%s;auth_timeout_ms=7000;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithAuthTimeout(7 * time.Second),
+			},
+		},
+		{
+			name:   "ws with target=primary",
+			config: fmt.Sprintf("ws::addr=%s;target=primary;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithTarget(qdb.QwpTargetPrimary),
+			},
+		},
+		{
+			name:   "ws with zone",
+			config: fmt.Sprintf("ws::addr=%s;zone=az-1;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithZone("az-1"),
+			},
+		},
+		{
+			name:   "ws with on_server_error",
+			config: fmt.Sprintf("ws::addr=%s;on_server_error=halt;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithServerErrorPolicy(qdb.PolicyHalt),
+			},
+		},
+		{
+			name: "ws with sf cursor knobs",
+			config: fmt.Sprintf(
+				"ws::addr=%s;sf_dir=/tmp/sf;sf_durability=memory;sf_append_deadline_millis=20000;drain_orphans=on;max_background_drainers=2;",
+				addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithSfDir("/tmp/sf"),
+				qdb.WithSfDurability("memory"),
+				qdb.WithSfAppendDeadline(20 * time.Second),
+				qdb.WithDrainOrphans(true),
+				qdb.WithMaxBackgroundDrainers(2),
+			},
+		},
 	}
 
 	for _, tc := range testCases {

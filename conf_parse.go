@@ -266,16 +266,10 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			switch v {
-			case "memory":
-				senderConf.sfDurability = v
-			case "flush", "append":
-				return nil, NewInvalidConfigStrError(
-					"sf_durability=%s is not yet supported (deferred follow-up; use sf_durability=memory)", v)
-			default:
-				return nil, NewInvalidConfigStrError(
-					"invalid sf_durability value, %q is not 'memory' (other values reserved for future use)", v)
+			if err := validateSfDurability(v); err != nil {
+				return nil, err
 			}
+			senderConf.sfDurability = v
 		case "sf_append_deadline_millis":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -518,6 +512,26 @@ func setPerCategoryPolicy(conf *lineSenderConfig, k, v string, c Category) error
 	conf.errorPolicyPerCat[c] = pol
 	conf.errorPolicyPerCatSet = true
 	return nil
+}
+
+// validateSfDurability checks an sf_durability value. The empty
+// string means "unset" (defaults to memory at construction); only
+// "memory" is currently honoured. "flush" / "append" are reserved
+// for a deferred follow-up and rejected with a pointer to the
+// supported value. Shared by the connect-string parser and
+// sanitizeQwpConf so the WithSfDurability functional-option path
+// rejects identically — single source of truth for the value space.
+func validateSfDurability(v string) error {
+	switch v {
+	case "", "memory":
+		return nil
+	case "flush", "append":
+		return NewInvalidConfigStrError(
+			"sf_durability=%s is not yet supported (deferred follow-up; use sf_durability=memory)", v)
+	default:
+		return NewInvalidConfigStrError(
+			"invalid sf_durability value, %q is not 'memory' (other values reserved for future use)", v)
+	}
 }
 
 // validateSenderId enforces the same character set the Java client

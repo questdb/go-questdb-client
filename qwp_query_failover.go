@@ -78,6 +78,22 @@ const (
 	qwpTargetReplica
 )
 
+// Exported aliases for the target-filter constants, so callers of
+// WithTarget can name the values without the type being exported
+// (mirrors the ProtocolVersion1/2/3 pattern for protocolVersion).
+// Equivalent to the connect-string target=any|primary|replica values.
+const (
+	// QwpTargetAny accepts any reachable endpoint regardless of role.
+	// The default; equivalent to target=any (or omitting the key).
+	QwpTargetAny = qwpTargetAny
+	// QwpTargetPrimary routes only to STANDALONE / PRIMARY /
+	// PRIMARY_CATCHUP endpoints; equivalent to target=primary.
+	QwpTargetPrimary = qwpTargetPrimary
+	// QwpTargetReplica routes only to REPLICA endpoints; equivalent
+	// to target=replica.
+	QwpTargetReplica = qwpTargetReplica
+)
+
 // String returns the connection-string form for diagnostics and error
 // messages.
 func (t qwpTargetFilter) String() string {

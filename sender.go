@@ -654,6 +654,117 @@ func WithQwpDumpWriter(w io.Writer) LineSenderOption {
 	}
 }
 
+// WithAuthTimeout bounds how long the QWP transport waits for the
+// HTTP-upgrade response (the per-host upper bound from failover.md
+// §7). A zero or negative duration falls back to the 15s default at
+// construction. Equivalent to the connect-string auth_timeout_ms key.
+//
+// Only available for the QWP sender.
+func WithAuthTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.authTimeoutMs = int(d / time.Millisecond)
+	}
+}
+
+// WithZone sets the failover zone hint used for endpoint locality.
+// It is silently stored but currently inert on SF ingress, which is
+// zone-blind (wire v1-pinned) and treats every host as local; egress
+// will consult it once zone-locality routing lands. Equivalent to the
+// connect-string zone key.
+//
+// Only available for the QWP sender.
+func WithZone(zone string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.zone = zone
+	}
+}
+
+// WithTarget constrains failover endpoint selection to servers whose
+// advertised role passes the filter (QwpTargetAny / QwpTargetPrimary
+// / QwpTargetReplica). Defaults to QwpTargetAny. Equivalent to the
+// connect-string target=any|primary|replica key.
+//
+// Note: SF ingress is wire v1-pinned and never reads SERVER_INFO, so
+// any value other than QwpTargetAny degrades to a topology reject on
+// the ingest round-walk; the filter is fully honoured on the query
+// (egress) path.
+//
+// Only available for the QWP sender.
+func WithTarget(target qwpTargetFilter) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.target = target
+	}
+}
+
+// WithSfDurability selects the store-and-forward cursor durability
+// mode. Only "memory" (the default when unset) is currently honoured;
+// "flush" and "append" are reserved for a deferred follow-up and are
+// rejected at construction. Requires sf_dir to be set. Equivalent to
+// the connect-string sf_durability key.
+//
+// Only available for the QWP sender.
+func WithSfDurability(mode string) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfDurability = mode
+	}
+}
+
+// WithSfAppendDeadline bounds how long a producer call blocks waiting
+// to append a batch into the store-and-forward cursor engine before
+// it returns a backpressure error. A zero or negative duration falls
+// back to the 30s default at construction. Requires sf_dir to be set.
+// Equivalent to the connect-string sf_append_deadline_millis key.
+//
+// Only available for the QWP sender.
+func WithSfAppendDeadline(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.sfAppendDeadlineMillis = int(d / time.Millisecond)
+	}
+}
+
+// WithDrainOrphans enables adoption and draining of orphaned
+// store-and-forward slots left behind by a crashed or superseded
+// sender sharing the same sf_dir group root. Defaults to disabled.
+// Requires sf_dir to be set. Equivalent to the connect-string
+// drain_orphans key.
+//
+// Only available for the QWP sender.
+func WithDrainOrphans(enabled bool) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.drainOrphans = enabled
+	}
+}
+
+// WithMaxBackgroundDrainers caps the number of concurrent
+// orphan-drainer goroutines. Defaults to 4. Only meaningful when
+// drain_orphans is enabled. Equivalent to the connect-string
+// max_background_drainers key.
+//
+// Only available for the QWP sender.
+func WithMaxBackgroundDrainers(n int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.maxBackgroundDrainers = n
+	}
+}
+
+// WithServerErrorPolicy sets the global fallback Policy applied to a
+// server-side batch rejection when no higher-precedence layer
+// resolves it. Resolution precedence (highest first): the
+// WithErrorPolicyResolver resolver → the WithErrorPolicy per-category
+// override → the connect-string per-category on_*_error → this global
+// policy (connect-string on_server_error) → spec defaults.
+//
+// PolicyAuto (the zero value) leaves the global layer unset, falling
+// through to the spec defaults. CategoryProtocolViolation and
+// CategoryUnknown are always HALT regardless of this setting.
+//
+// Only available for the QWP sender.
+func WithServerErrorPolicy(p Policy) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.errorPolicyGlobal = p
+	}
+}
+
 // WithTls enables TLS connection encryption.
 func WithTls() LineSenderOption {
 	return func(s *lineSenderConfig) {
@@ -1140,6 +1251,13 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 		if conf.drainOrphans || conf.maxBackgroundDrainers != 0 {
 			return errors.New("drain_orphans / max_background_drainers require sf_dir to be set")
 		}
+	}
+	// Validate the sf_durability value space for the functional-option
+	// path (WithSfDurability). The connect-string parser already
+	// rejected flush/append/bogus, so this is a harmless re-check
+	// there; it is the only gate on the option path.
+	if err := validateSfDurability(conf.sfDurability); err != nil {
+		return err
 	}
 	if conf.sfMaxBytes < 0 {
 		return fmt.Errorf("sf_max_bytes must be > 0: %d", conf.sfMaxBytes)

@@ -104,6 +104,42 @@ func TestSfConfRejectsDeferredDurabilityModes(t *testing.T) {
 	}
 }
 
+// WithSfDurability is the functional-option analogue of the
+// sf_durability connect-string key. The parser rejects flush/append
+// and bogus values up front; the option path is a thin setter, so the
+// equivalent gate lives in sanitizeQwpConf via the shared
+// validateSfDurability helper. These tests pin that parity (SSOT for
+// the value space) — see TestSfConfRejectsDeferredDurabilityModes /
+// TestSfConfRejectsBadDurability for the connect-string side.
+func TestSfDurabilityOptionRejectsDeferredModes(t *testing.T) {
+	for _, v := range []string{"flush", "append"} {
+		t.Run(v, func(t *testing.T) {
+			conf := newLineSenderConfig(qwpSenderType)
+			WithSfDir("/tmp/sf")(conf)
+			WithSfDurability(v)(conf)
+			err := sanitizeQwpConf(conf)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "deferred")
+		})
+	}
+}
+
+func TestSfDurabilityOptionRejectsBogus(t *testing.T) {
+	conf := newLineSenderConfig(qwpSenderType)
+	WithSfDir("/tmp/sf")(conf)
+	WithSfDurability("bogus")(conf)
+	err := sanitizeQwpConf(conf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "memory")
+}
+
+func TestSfDurabilityOptionMemoryAccepted(t *testing.T) {
+	conf := newLineSenderConfig(qwpSenderType)
+	WithSfDir("/tmp/sf")(conf)
+	WithSfDurability("memory")(conf)
+	require.NoError(t, sanitizeQwpConf(conf))
+}
+
 // Durable-ack mode is a deferred opt-in feature, but sf-client.md §19
 // makes its connect-string keys normative: the parser MUST recognise
 // request_durable_ack / durable_ack_keepalive_interval_millis so a
