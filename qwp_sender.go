@@ -1011,8 +1011,15 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // FlushAndGetSequence implements QwpSender.FlushAndGetSequence.
 // Flushes any pending rows and returns the published FSN — the
 // upper bound on any SenderError.ToFsn that could surface for this
-// batch. Callers wanting server-ack confirmation should pair the
-// returned FSN with AwaitAckedFsn.
+// batch.
+//
+// It does NOT wait for the server ACK (Java decision #1 in
+// design/qwp-cursor-durability.md — "flush() never waits for ACK;
+// ACKs are async"): it returns once the batch is published into the
+// cursor engine (in-RAM for memory mode, on-disk for SF) and the
+// send loop delivers + replays it in the background. Callers
+// wanting server-ACK confirmation pair the returned FSN with
+// AwaitAckedFsn.
 func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) {
 	if s.closed.Load() {
 		return -1, errClosedSenderFlush
@@ -1021,12 +1028,12 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 		return -1, errFlushWithPendingMessage
 	}
 	if s.pendingRowCount == 0 {
-		// Flush() never waits for server ACK on the cursor path
-		// (Java spec — design decision #1 in
-		// qwp-cursor-durability.md). Surface any terminal I/O
-		// error the loop has recorded so producers don't keep
-		// silently buffering into a dead engine; otherwise return
-		// the current published FSN.
+		// Nothing to encode, so skip straight to flushCursor's tail:
+		// surface any terminal I/O error the loop has recorded (so
+		// producers don't keep silently buffering into a dead engine),
+		// then return the current published FSN. Same no-ACK-wait
+		// contract as the pending-rows path below — this branch only
+		// elides the empty encode/append.
 		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 			return -1, err
 		}

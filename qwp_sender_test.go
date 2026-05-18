@@ -79,6 +79,24 @@ func newQwpSenderForTest(t *testing.T, serverURL string) *qwpLineSender {
 	return s
 }
 
+// flushAndAwaitAck flushes pending rows and blocks until the server
+// has ACKed them. Flush no longer waits for the ACK (Java decision
+// #1 — see design/qwp-cursor-durability.md), so tests that assert
+// server-side receipt must use this FlushAndGetSequence +
+// AwaitAckedFsn barrier instead of relying on Flush alone.
+func flushAndAwaitAck(t *testing.T, s *qwpLineSender) {
+	t.Helper()
+	fsn, err := s.FlushAndGetSequence(context.Background())
+	if err != nil {
+		t.Fatalf("FlushAndGetSequence: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.AwaitAckedFsn(ctx, fsn); err != nil {
+		t.Fatalf("AwaitAckedFsn(fsn=%d): %v", fsn, err)
+	}
+}
+
 func TestQwpSenderBasicRow(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
@@ -211,11 +229,20 @@ func TestQwpFlushRetainsRowsOnError(t *testing.T) {
 	}
 
 	// The retained row must be delivered by a subsequent good flush.
-	if err := s.Flush(context.Background()); err != nil {
+	// Flush no longer blocks on the ACK (Java decision #1), so use
+	// FlushAndGetSequence + AwaitAckedFsn as the delivery barrier
+	// before asserting receipt.
+	fsn, err := s.FlushAndGetSequence(context.Background())
+	if err != nil {
 		t.Fatalf("retry Flush: %v", err)
 	}
 	if s.pendingRowCount != 0 {
 		t.Fatalf("pendingRowCount after retry flush = %d, want 0", s.pendingRowCount)
+	}
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer awaitCancel()
+	if err := s.AwaitAckedFsn(awaitCtx, fsn); err != nil {
+		t.Fatalf("AwaitAckedFsn: %v", err)
 	}
 	mu.Lock()
 	got = framesReceived
@@ -1462,9 +1489,12 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 		t.Fatalf("after flush 1: maxSentSymbolId = %d, want 1", s.maxSentSymbolId)
 	}
 
-	// Flush 2: add symbol GOOG.
+	// Flush 2: add symbol GOOG. Await delivery — Flush no longer
+	// blocks on the ACK, and the message-bytes assertions below
+	// require both frames to have reached the server. Awaiting the
+	// second FSN implies the first is delivered too (FSN monotonic).
 	s.Table("t").Symbol("sym", "GOOG").Int64Column("v", 3).AtNow(context.Background())
-	s.Flush(context.Background())
+	flushAndAwaitAck(t, s)
 
 	if s.maxSentSymbolId != 2 {
 		t.Fatalf("after flush 2: maxSentSymbolId = %d, want 2", s.maxSentSymbolId)
@@ -1545,7 +1575,15 @@ func TestQwpSenderServerError(t *testing.T) {
 	defer s.Close(context.Background())
 
 	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
-	err = s.Flush(context.Background())
+	// Flush no longer waits for the ACK, so the server's PARSE_ERROR
+	// surfaces on the ACK-confirmation path (or, racily, already on
+	// FlushAndGetSequence). Accept it from either.
+	fsn, err := s.FlushAndGetSequence(context.Background())
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err = s.AwaitAckedFsn(ctx, fsn)
+	}
 	if err == nil {
 		t.Fatal("expected error from server")
 	}
@@ -1607,10 +1645,9 @@ func TestQwpSenderAsyncBasic(t *testing.T) {
 		}
 	}
 
-	// Flush — waits for all batches to be ACKed.
-	if err := s.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
+	// Flush, then await ACK — Flush itself no longer blocks on the
+	// server round-trip; the msgCount assertion needs delivery.
+	flushAndAwaitAck(t, s)
 
 	if s.pendingRowCount != 0 {
 		t.Fatalf("pendingRowCount = %d, want 0", s.pendingRowCount)
@@ -1668,13 +1705,13 @@ func TestQwpSenderAsyncMultipleFlushes(t *testing.T) {
 		t.Fatalf("Flush 1: %v", err)
 	}
 
-	// Flush 2: 3 rows.
+	// Flush 2: 3 rows. Await the second FSN — that implies the first
+	// flush's frame is delivered too (FSN monotonic), so both frames
+	// have reached the server before the msgCount assertion.
 	for i := 0; i < 3; i++ {
 		s.Table("t").Int64Column("x", int64(i+10)).AtNow(context.Background())
 	}
-	if err := s.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush 2: %v", err)
-	}
+	flushAndAwaitAck(t, s)
 
 	mu.Lock()
 	if msgCount != 2 {
@@ -1736,7 +1773,7 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 	// Insert one row into each of two tables with identical columns.
 	s.Table("alpha").Int64Column("x", 1).AtNow(context.Background())
 	s.Table("beta").Int64Column("x", 2).AtNow(context.Background())
-	s.Flush(context.Background())
+	flushAndAwaitAck(t, s) // await delivery before inspecting messages
 
 	// With multi-table batching, both tables are in 1 message.
 	if len(messages) != 1 {
@@ -1768,11 +1805,13 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 		t.Fatalf("nextSchemaId = %d, want 2", s.nextSchemaId)
 	}
 
-	// Second flush of both tables should now use schema reference.
+	// Second flush of both tables. Cursor mode emits self-sufficient
+	// frames, so this still carries full schema (asserted below) —
+	// not a schema ref. Await delivery before inspecting messages.
 	messages = messages[:0]
 	s.Table("alpha").Int64Column("x", 3).AtNow(context.Background())
 	s.Table("beta").Int64Column("x", 4).AtNow(context.Background())
-	s.Flush(context.Background())
+	flushAndAwaitAck(t, s)
 
 	if len(messages) != 1 {
 		t.Fatalf("messages = %d, want 1", len(messages))
@@ -1906,8 +1945,15 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 	// Insert a row with a symbol (to exercise both schema and symbol paths).
 	s.Table("t").Symbol("sym", "AAPL").Int64Column("x", 1).AtNow(context.Background())
 
-	// Flush returns the WRITE_ERROR from the server.
-	flushErr := s.Flush(context.Background())
+	// Flush no longer waits for the ACK, so the server's PARSE_ERROR
+	// surfaces on the ACK-confirmation path (AwaitAckedFsn) or, racily,
+	// already on FlushAndGetSequence. Accept it from either.
+	fsn, flushErr := s.FlushAndGetSequence(context.Background())
+	if flushErr == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		flushErr = s.AwaitAckedFsn(ctx, fsn)
+	}
 	if flushErr == nil {
 		t.Fatal("expected flush error, got nil")
 	}
@@ -2225,10 +2271,10 @@ func TestQwpMaxBufSizeTriggersFlush(t *testing.T) {
 		}
 	}
 
-	// Explicit flush for remaining rows.
-	if err := s.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
+	// Explicit flush for remaining rows, then await delivery — the
+	// messageCount assertion needs the frames on the wire, and Flush
+	// no longer blocks on the ACK.
+	flushAndAwaitAck(t, s)
 
 	// We should have received at least 2 messages: one from the
 	// maxBufSize-triggered flush and one from the explicit Flush.

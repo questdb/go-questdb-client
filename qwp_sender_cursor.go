@@ -356,85 +356,43 @@ func qwpSfBuildEndpointFactory(endpoints []qwpEndpoint, scheme string, opts qwpT
 	}
 }
 
-// flushCursor encodes the pending rows as a self-sufficient QWP
-// frame, appends it to the cursor engine, and (for explicit
-// Flush() callers) blocks until ackedFsn catches up. Used by
-// Flush and auto-flush in cursor mode.
-//
-// Self-sufficient = full schema definitions for every table + full
-// symbol-dict delta from id 0 (mirrors Java decision #14). The
-// frame must replay correctly against any fresh server connection
-// (post-reconnect, post-restart, drainer adopting an orphan slot)
-// — refs to schema/symbol IDs the new server has never seen would
-// be unrecoverable. Producer-side maxSentSchemaId / maxSentSymbolId
-// retention is therefore a no-op on the cursor path.
-//
-// The Go API contract — `Flush() returns once the server has
-// confirmed the batch` — predates the cursor unification and is
-// what existing users rely on. We deviate from the Java spec's
-// `flush() never waits for ACK` here in favor of preserving the
-// Go contract. Use auto-flush for non-blocking enqueue.
+// flushCursor is the explicit-Flush() wire path. It shares
+// encoding and the (non-blocking, no-ACK-wait) engine append with
+// auto-flush via enqueueCursor, then eagerly surfaces any wire
+// failure observed during the append window so a terminal error
+// reaches the producer immediately instead of on its next call.
+// Mirrors Java: flushAndGetSequence() = flushPendingRows() +
+// checkError() (design/qwp-cursor-durability.md decision #1 —
+// "flush() never waits for ACK; ACKs are async"). Callers wanting
+// server-ACK confirmation pair FlushAndGetSequence with
+// AwaitAckedFsn.
 func (s *qwpLineSender) flushCursor(ctx context.Context) error {
-	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+	if err := s.enqueueCursor(ctx); err != nil {
 		return err
 	}
-	tables, err := s.buildTableEncodeInfo()
-	if err != nil {
-		return err
-	}
-	if len(tables) == 0 {
-		return nil
-	}
-	// Encoder slot 0 is reused on every flush — engine.tryAppend
-	// copies the bytes into the segment, so the encoder buffer is
-	// safe to overwrite immediately.
-	encoded := s.encoder.encodeMultiTableWithDeltaDict(
-		tables,
-		s.globalSymbolList,
-		-1, // maxSentSymbolId=-1 → emit the full dict from id 0
-		s.batchMaxSymbolId,
-	)
-	// engineAppendBlocking spins on backpressure for up to the
-	// engine's deadline OR until ctx fires, whichever comes first.
-	// The synchronous call avoids the orphan-goroutine race against
-	// the encoder buffer (which is reused on the next flush).
-	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
-		return err
-	}
-	// Surface any wire failure observed during the append window —
-	// the loop may have hit a server-rejected status that won't be
-	// fixed by reconnecting.
-	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
-		return err
-	}
-	// Drain barrier: wait for the server to ACK every published
-	// frame. Bounded by ctx; falls through on a terminal loop
-	// error so the producer surfaces it immediately.
-	if err := s.waitCursorEmpty(ctx); err != nil {
-		return err
-	}
-	// Bump the producer-side ACK trackers. Cursor frames are
-	// self-sufficient so this is informational only — we never
-	// emit refs — but tests and external observers still inspect
-	// these counters to confirm a flush has been ACK'd by the
-	// server.
-	if s.batchMaxSchemaId > s.maxSentSchemaId {
-		s.maxSentSchemaId = s.batchMaxSchemaId
-	}
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
-	return nil
+	return s.cursorSendLoop.sendLoopCheckError()
 }
 
-// enqueueCursor is the auto-flush path's append-only counterpart
-// of flushCursor. It encodes pending rows and appends them into
-// the cursor engine, but does NOT wait for ACKs — so the user
-// goroutine isn't blocked on every auto-flush trigger. Mirrors the
-// Java client's flushPendingRows contract: schema and symbol
-// trackers advance optimistically because the send loop is
-// terminal on I/O error (ioErr poisons every subsequent call), so
-// stale tracker state cannot reach the wire.
+// enqueueCursor encodes the pending rows as a self-sufficient QWP
+// frame and appends it to the cursor engine. It does NOT wait for
+// the server ACK (Java decision #1 in
+// design/qwp-cursor-durability.md: "flush() never waits for ACK;
+// ACKs are async") — the frame is durable once appended (in-RAM
+// for memory mode, on-disk for SF) and the send loop drains +
+// replays it in the background. Shared by the auto-flush trigger
+// and by flushCursor (explicit Flush()), so the user goroutine is
+// never blocked on a server round-trip.
+//
+// Self-sufficient = full schema definitions for every table + full
+// symbol-dict delta from id 0 (Java decision #14). The frame must
+// replay correctly against any fresh server connection (post-
+// reconnect, post-restart, drainer adopting an orphan slot) — refs
+// to schema/symbol IDs the new server has never seen would be
+// unrecoverable. Producer-side maxSentSchemaId / maxSentSymbolId
+// retention is therefore a no-op on the cursor path: the trackers
+// advance optimistically (the send loop is terminal on I/O error,
+// so stale tracker state cannot reach the wire) and exist only for
+// tests and external observers.
 func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 		return err
@@ -462,29 +420,6 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 		s.maxSentSymbolId = s.batchMaxSymbolId
 	}
 	return nil
-}
-
-// waitCursorEmpty blocks until ackedFsn ≥ publishedFsn, ctx
-// cancels, or the send loop records a terminal error. Unlike
-// waitCursorDrain it has no internal timeout — Flush is bounded by
-// the user's ctx, not by closeFlushTimeout.
-func (s *qwpLineSender) waitCursorEmpty(ctx context.Context) error {
-	const pollInterval = 5 * time.Millisecond
-	tick := time.NewTicker(pollInterval)
-	defer tick.Stop()
-	for {
-		if s.cursorEngine.engineAckedFsn() >= s.cursorEngine.enginePublishedFsn() {
-			return nil
-		}
-		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
-			return err
-		}
-		select {
-		case <-tick.C:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
 }
 
 // buildTableEncodeInfo collects non-empty tables, assigns fresh
@@ -663,11 +598,13 @@ func (s *qwpLineSender) AckedFsn() int64 {
 	return s.cursorEngine.engineAckedFsn()
 }
 
-// AwaitAckedFsn implements QwpSender.AwaitAckedFsn. Polls on a
-// 5ms tick — same cadence as waitCursorEmpty / waitCursorDrain —
-// and surfaces send-loop terminal errors synchronously so the
-// caller can distinguish "still in flight" from "permanently
-// failed".
+// AwaitAckedFsn implements QwpSender.AwaitAckedFsn. This is the
+// server-ACK confirmation primitive: Flush never blocks on ACKs
+// (Java decision #1), so callers wanting delivery confirmation pair
+// FlushAndGetSequence's returned FSN with this. Polls on a 5ms tick
+// — same cadence as waitCursorDrain — and surfaces send-loop
+// terminal errors synchronously so the caller can distinguish
+// "still in flight" from "permanently failed".
 func (s *qwpLineSender) AwaitAckedFsn(ctx context.Context, target int64) error {
 	if s.closed.Load() {
 		return errClosedSenderFlush

@@ -389,6 +389,13 @@ func TestSfConfInitialConnectAsyncReturnsImmediately(t *testing.T) {
 // the producer publishes a row to the cursor SF engine, then the
 // server starts. The buffered frame must be delivered and ACKed by
 // the I/O goroutine once the wire is up.
+//
+// Also pins the post-v4.2.0 flush contract (Java decision #1): with
+// the server still down, FlushAndGetSequence must NOT block on the
+// ACK — it returns the published FSN immediately because the frame
+// is already durable in the SF engine. AwaitAckedFsn is the
+// dedicated barrier that blocks until the I/O loop delivers it and
+// the server ACKs.
 func TestSfConfInitialConnectAsyncDeliversWhenServerComesUp(t *testing.T) {
 	// Reserve a port and bind a listener on it that we'll later wrap
 	// with httptest. By holding the port across the gap we avoid the
@@ -413,28 +420,33 @@ func TestSfConfInitialConnectAsyncDeliversWhenServerComesUp(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = ls.Close(context.Background()) }()
 
+	qs, ok := ls.(QwpSender)
+	require.True(t, ok, "QWP sender must satisfy QwpSender")
+
 	// Append a row before the server is up. The frame lands in the
 	// cursor SF engine; the I/O goroutine is still retrying connect.
-	require.NoError(t, ls.Table("foo").Int64Column("v", 42).AtNow(context.Background()))
+	require.NoError(t, qs.Table("foo").Int64Column("v", 42).AtNow(context.Background()))
 
-	// Spawn the explicit Flush in a goroutine — Flush waits for ACK,
-	// so it'll block until the server arrives.
-	flushDone := make(chan error, 1)
-	go func() {
-		flushDone <- ls.Flush(context.Background())
-	}()
+	// FlushAndGetSequence must return promptly even though the server
+	// is still down: the frame is durable in the SF engine and flush
+	// no longer blocks on the ACK. Bound it tightly so a regression
+	// back to ACK-barrier semantics fails loudly here.
+	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	fsn, err := qs.FlushAndGetSequence(flushCtx)
+	require.NoError(t, err, "FlushAndGetSequence must not block on ACK while the server is down")
+	require.GreaterOrEqual(t, fsn, int64(0))
 
 	// Bring the server up on the held port. Use the same handler as
 	// the standard test server (just enough to ACK frames).
 	srv := newQwpSfTestServerOnListener(t, listener)
 	defer srv.Close()
 
-	// Flush must complete and the server must have received our frame.
-	select {
-	case err := <-flushDone:
-		require.NoError(t, err)
-	case <-time.After(10 * time.Second):
-		t.Fatal("Flush never completed after server came up")
-	}
+	// AwaitAckedFsn is the delivery barrier: block until the I/O loop
+	// has delivered the buffered frame and the server ACKed it.
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer awaitCancel()
+	require.NoError(t, qs.AwaitAckedFsn(awaitCtx, fsn),
+		"buffered frame must be delivered and ACKed once the server is up")
 	assert.GreaterOrEqual(t, srv.totalFramesReceived.Load(), int64(1))
 }

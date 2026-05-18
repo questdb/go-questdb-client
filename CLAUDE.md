@@ -98,12 +98,19 @@ encoding.
 the cursor architecture — backpressure is governed by the engine's segment-ring
 + `engineAppendBlocking` deadline.
 
-Flush semantics: `Flush` blocks until `engineAckedFsn` catches up to
-`enginePublishedFsn` (preserves the Go contract; deviates from Java's
-fire-and-forget `flush()`). Auto-flush takes the non-blocking `enqueueCursor`
-path. `FlushAndGetSequence` returns the published FSN — the upper bound of any
-`SenderError.ToFsn` for that batch. Pair with `AwaitAckedFsn` for ack
-confirmation.
+Flush semantics: `Flush` / `FlushAndGetSequence` **never wait for the server
+ACK** — they return once the batch is published into the cursor engine (in-RAM
+for memory mode, on-disk for SF) and the send loop delivers + replays it in the
+background. This matches the Java spec (`design/qwp-cursor-durability.md`
+decision #1: "flush() never waits for ACK; ACKs are async") and is uniform
+across both the pending-rows and zero-pending branches and auto-flush — all
+route through `enqueueCursor`; explicit `Flush` only additionally surfaces a
+latched send-loop error eagerly. (`Flush` was an ACK barrier
+through v4.2.0; that contract was dropped when the cursor/SF architecture made
+local persistence, not the ACK, the durability guarantee.) `FlushAndGetSequence` returns the
+published FSN — the upper bound of any `SenderError.ToFsn` for that batch;
+**pair it with `AwaitAckedFsn` for server-ACK confirmation** (the dedicated
+primitive now that `Flush` no longer blocks on ACKs).
 
 Orphan-slot adoption (SF mode, `drain_orphans=on`) is implemented in
 `qwp_sf_orphan.go` + `qwp_sf_drainer.go` + `qwp_sf_round_walk.go`; drainers run
