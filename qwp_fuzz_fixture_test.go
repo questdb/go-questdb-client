@@ -619,7 +619,7 @@ func (s *qwpFuzzServer) mustExec(t *testing.T, sql string) qwpTableResult {
 // dropAllTables clears the database between fuzz iterations (the
 // _fuzz_loop.py model: one long-lived server, drop-all per iteration).
 //
-//lint:ignore U1000 fixture API; first consumer is the egress fuzz port (per-iteration cleanup, backlog #5)
+//lint:ignore U1000 fixture API; first consumer is the sender fuzz port (per-iteration drop-all, backlog #6) — the egress port (#5) shipped using per-table DROP instead
 func (s *qwpFuzzServer) dropAllTables(t *testing.T) {
 	t.Helper()
 	res, err := s.execSQL("SHOW TABLES")
