@@ -508,6 +508,8 @@ func (s *qwpFuzzServer) stop() {
 
 // bounce restarts the server on the same ports and data dir, exercising
 // the client's reconnect/replay path. Returns an error in external mode.
+//
+//lint:ignore U1000 fixture API; first consumer is the sender fuzz port (reconnect/replay variants, backlog #6)
 func (s *qwpFuzzServer) bounce() error {
 	if !s.owns {
 		return errors.New("cannot bounce a server in QDB_FUZZ_ADDR mode")
@@ -557,6 +559,10 @@ func (s *qwpFuzzServer) connConf() string {
 	return fmt.Sprintf("ws::addr=%s:%d;", s.host, s.httpPort)
 }
 
+// wsAddr is the host:port for QWP senders that assemble their own
+// connection string in the sender fuzz port (backlog #6).
+//
+//lint:ignore U1000 fixture API; first consumer is the sender fuzz port (backlog #6)
 func (s *qwpFuzzServer) wsAddr() string {
 	return fmt.Sprintf("%s:%d", s.host, s.httpPort)
 }
@@ -612,6 +618,8 @@ func (s *qwpFuzzServer) mustExec(t *testing.T, sql string) qwpTableResult {
 
 // dropAllTables clears the database between fuzz iterations (the
 // _fuzz_loop.py model: one long-lived server, drop-all per iteration).
+//
+//lint:ignore U1000 fixture API; first consumer is the egress fuzz port (per-iteration cleanup, backlog #5)
 func (s *qwpFuzzServer) dropAllTables(t *testing.T) {
 	t.Helper()
 	res, err := s.execSQL("SHOW TABLES")
