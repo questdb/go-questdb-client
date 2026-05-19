@@ -75,7 +75,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -979,6 +981,217 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 	// Clean close ACKed every frame; the SF cursor unlinks rotated
 	// segments. A small residue (lock, ack-watermark, active header) is
 	// normal — Java's slotCapFor is sf_max_bytes + 256 KiB.
+	capBytes := sfMaxBytes + 256*1024
+	for p, dir := range sfDirs {
+		if sz := oracleSfDirSize(dir); sz > capBytes {
+			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
+				p, dir, sz, capBytes)
+		}
+	}
+}
+
+// --- poison-rows / per-frame-drop scenario ---------------------------
+
+// TestQwpFuzzIngressOraclePoisonErrorHandler ports
+// QwpIngressOracleFuzzTest.testOraclePoisonRowsTriggerErrorHandler. It
+// pins the per-batch error contract:
+//
+//  1. the async error handler fires for every poisoned chunk;
+//  2. rows from clean chunks land exactly per the oracle;
+//  3. no row from a poisoned chunk leaks — the WHOLE frame is dropped,
+//     including the well-formed rows next to the bad one (SF drops per
+//     frame, not per row).
+//
+// A poisoned chunk carries one row whose dec256 unscaled value is 2^192
+// (~6.3e57, 58 digits) — well past DECIMAL(50,6)'s 10^50 cap. The
+// server returns CategoryWriteError, whose spec-default policy is
+// DROP_AND_CONTINUE (qwp_sf_classify.go), so the producer keeps going
+// and the rejection surfaces only via the async handler. No server
+// bounce on purpose — the failure mode must be unambiguously the
+// per-frame rejection, not a transport blip.
+//
+// Faithful-port divergences (cf. the file header and the bounce port):
+//
+//   - The sender is built with NewLineSender(...) options rather than a
+//     connect string: Go has no conf+option combiner and WithErrorHandler
+//     is option-only. The options are 1:1 with the Java connect string
+//     (sf_dir, initial_connect_retry=true→sync, close_flush_timeout,
+//     error_inbox_capacity) plus the error handler.
+//   - reconnect_max_duration_millis is omitted (no outage in this
+//     scenario; the default budget is irrelevant).
+//   - Clean rows verified via the QWP query client (oracleAssert);
+//     poisoned-id absence via the fixture /exec count (mirrors Java's
+//     assertSql). Counts are CI-bounded; chunk size stays small enough
+//     to map to a single frame so the per-frame drop is deterministic.
+//   - errCalls >= poisoned-chunk count (inequality, like Java: tolerates
+//     the rare chunk that splits across more than one frame).
+//   - Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
+func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+
+	producerCount := 2 + r.Intn(2)        // 2..3
+	chunksPerProducer := 30 + r.Intn(30)  // 30..59
+	chunkSize := 5 + r.Intn(6)            // 5..10 rows (maps to one frame)
+	const poisonChunkInN = 4              // ~25% of chunks poisoned
+	sfMaxBytes := oraclePickSfMaxBytes(r) // shared with the bounce port
+
+	// Constructible client-side? 2^192 is 58 digits — inside Decimal256's
+	// 76-digit envelope, so NewDecimal accepts it and the rejection is
+	// purely server-side (the whole point of the poison).
+	if _, e := NewDecimal(u256(1, 0, 0, 0), 6); e != nil {
+		t.Fatalf("poison value 2^192 not constructible client-side: %v", e)
+	}
+
+	oracle := newOracleTable()
+	perProducerChunks := make([][][]*oracleRow, producerCount)
+	var poisonedIDs []string
+	totalPoisonedChunks := 0
+	var globalIdx int64
+	for p := 0; p < producerCount; p++ {
+		genR := rand.New(rand.NewSource(r.Int63()))
+		poisonR := rand.New(rand.NewSource(r.Int63()))
+		perProducerChunks[p] = make([][]*oracleRow, chunksPerProducer)
+		for c := 0; c < chunksPerProducer; c++ {
+			poisoned := poisonR.Intn(poisonChunkInN) == 0
+			if poisoned {
+				totalPoisonedChunks++
+			}
+			chunk := make([]*oracleRow, chunkSize)
+			for rr := 0; rr < chunkSize; rr++ {
+				id := globalIdx
+				ts := oracleBaseTsMicros + globalIdx
+				row := oracleGenerateRow(genR, id, ts)
+				if poisoned {
+					// Force dec256 past the column cap. setSignedDecimal
+					// is unconditional in Java; overwrite whatever
+					// generateRow produced (skipped or not).
+					row.set("dec256", oracleCell{kind: ocDec256, dec: u256(1, 0, 0, 0), scale: 6})
+					poisonedIDs = append(poisonedIDs, strconv.FormatInt(id, 10))
+				} else {
+					oracle.addRow(row)
+				}
+				chunk[rr] = row
+				globalIdx++
+			}
+			perProducerChunks[p][c] = chunk
+		}
+	}
+	cleanRows := len(oracle.rows)
+	t.Logf("ingress oracle poison: producers=%d chunks/producer=%d chunkSize=%d "+
+		"poisonedChunks=%d cleanRows=%d sf_max_bytes=%d",
+		producerCount, chunksPerProducer, chunkSize, totalPoisonedChunks, cleanRows, sfMaxBytes)
+
+	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
+	defer srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
+	srv.mustExec(t, oracleCreateSQL)
+
+	sfRoot := t.TempDir()
+	sfDirs := make([]string, producerCount)
+	for p := 0; p < producerCount; p++ {
+		sfDirs[p] = filepath.Join(sfRoot, fmt.Sprintf("p%d", p))
+		if err := os.MkdirAll(sfDirs[p], 0o755); err != nil {
+			t.Fatalf("mkdir sf_dir: %v", err)
+		}
+	}
+
+	var errCalls atomic.Int64 // shared across every producer's handler
+	var wg sync.WaitGroup
+	errs := make([]error, producerCount)
+	for p := 0; p < producerCount; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					errs[p] = fmt.Errorf("producer %d panicked: %v", p, rec)
+				}
+			}()
+			ctx := context.Background()
+			ls, err := NewLineSender(ctx,
+				WithQwp(),
+				WithAddress(srv.wsAddr()),
+				WithSfDir(sfDirs[p]),
+				WithSfMaxBytes(sfMaxBytes),
+				WithInitialConnectRetry(true), // initial_connect_retry=true (sync)
+				WithCloseFlushTimeout(120*time.Second),
+				WithErrorInboxCapacity(4096),
+				WithErrorHandler(func(*SenderError) { errCalls.Add(1) }),
+			)
+			if err != nil {
+				errs[p] = fmt.Errorf("producer %d NewLineSender: %w", p, err)
+				return
+			}
+			qs, ok := ls.(QwpSender)
+			if !ok {
+				errs[p] = fmt.Errorf("producer %d: ws sender is not a QwpSender (%T)", p, ls)
+				_ = ls.Close(ctx)
+				return
+			}
+			defer func() {
+				cctx, ccancel := context.WithTimeout(context.Background(), 150*time.Second)
+				defer ccancel()
+				_ = qs.Close(cctx)
+			}()
+			for c := 0; c < len(perProducerChunks[p]); c++ {
+				for _, row := range perProducerChunks[p][c] {
+					oraclePublish(t, qs, ctx, row)
+				}
+				// Explicit flush per chunk -> chunk == frame, so the
+				// per-frame drop is deterministic. DROP_AND_CONTINUE means
+				// Flush does NOT error on a poisoned chunk (no HALT latch).
+				if err := qs.Flush(ctx); err != nil {
+					errs[p] = fmt.Errorf("producer %d flush chunk %d: %w", p, c, err)
+					return
+				}
+			}
+		}(p)
+	}
+	wg.Wait()
+	for p, e := range errs {
+		if e != nil {
+			t.Fatalf("producer %d: %v", p, e)
+		}
+	}
+
+	// Poisoned frames are dropped, so the table converges to exactly the
+	// clean-row count (globally-unique ts,id + DEDUP -> no dup inflation).
+	srv.awaitRows(t, oracleTableName, cleanRows, 120*time.Second)
+
+	// (a) Clean rows: every clean-chunk row lands once; oracle drives a
+	// typed cell-by-cell check (and asserts the row count is exact).
+	c := newBindFuzzClient(t, srv)
+	oracleAssert(t, c, oracle)
+
+	// (b) Poisoned rows: not a single id from any poisoned chunk leaked
+	// -- this pins the per-frame drop (good rows in a bad frame are gone
+	// too).
+	if len(poisonedIDs) > 0 {
+		res, err := srv.execSQL("SELECT count() FROM '" + oracleTableName +
+			"' WHERE id IN (" + strings.Join(poisonedIDs, ",") + ")")
+		if err != nil {
+			t.Fatalf("poisoned-id count query: %v", err)
+		}
+		if len(res.Dataset) != 1 || len(res.Dataset[0]) != 1 {
+			t.Fatalf("poisoned-id count: unexpected shape %v", res.Dataset)
+		}
+		if n, ok := toInt64(res.Dataset[0][0]); !ok || n != 0 {
+			t.Fatalf("poisoned rows leaked: %d ids from poisoned chunks present "+
+				"(expected 0) -- per-frame drop violated", n)
+		}
+	}
+
+	// (c) Async notifications: at least one per poisoned chunk reached a
+	// handler. Inequality tolerates a chunk split across >1 frame.
+	got := errCalls.Load()
+	if got < int64(totalPoisonedChunks) {
+		t.Fatalf("error handler fired %d times, expected >= %d (poisoned chunks)",
+			got, totalPoisonedChunks)
+	}
+	t.Logf("poison: poisonedChunks=%d handlerCalls=%d", totalPoisonedChunks, got)
+
+	// Clean close ACKed/handled every frame; the SF cursor unlinks
+	// rotated segments. Java's slotCapFor: sf_max_bytes + 256 KiB.
 	capBytes := sfMaxBytes + 256*1024
 	for p, dir := range sfDirs {
 		if sz := oracleSfDirSize(dir); sz > capBytes {
