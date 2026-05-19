@@ -24,10 +24,17 @@
 
 package questdb
 
-// End-to-end QWP egress (query) benchmarks. These are the Go counterparts of
-// the Java client's server-side benchmarks in the QuestDB OSS repo
-// (benchmarks/src/main/java/org/questdb): QwpEgressLatencyBenchmark,
-// QwpEgressBindLatencyBenchmark, and QwpEgressReadBenchmark.
+// End-to-end QWP egress (query) latency benchmarks. These are the Go
+// counterparts of the Java client's two JMH latency benchmarks in the
+// QuestDB OSS repo (benchmarks/src/main/java/org/questdb):
+// QwpEgressLatencyBenchmark and QwpEgressBindLatencyBenchmark.
+//
+// The third Java egress benchmark -- the application-style, cross-protocol
+// QwpEgressReadBenchmark (QWP vs PG-wire vs HTTP) -- is ported separately as
+// the standalone program in bench/qwp-egress-read, not as a `go test`
+// benchmark. There is deliberately no BenchmarkQwpEgressRead here: a `go
+// test` benchmark would only re-measure the QWP read path the standalone
+// program already covers.
 //
 // Unlike the rest of qwp_bench_test.go (pure encode/decode microbenchmarks
 // that never touch a socket) these run against a *live* QuestDB listening on
@@ -47,18 +54,13 @@ package questdb
 //   QDB_BENCH_ADDR           host:port of the server          (default localhost:9000)
 //   QDB_BENCH_SKIP_POPULATE  reuse the existing table          (default false)
 //   QDB_BENCH_SQL            override the latency-bench SQL     (default "SELECT 1")
-//   QDB_BENCH_ROWS           rows to seed for the read bench    (default 1_000_000)
-//   QDB_BENCH_COMPRESSION    "raw" | "zstd" for the read bench  (default raw)
 //
 // Examples:
 //
 //   go test -run '^$' -bench BenchmarkQwpEgressLatency        -benchtime 3000x .
 //   QDB_BENCH_SQL='SELECT id FROM latency_bench' \
 //     go test -run '^$' -bench BenchmarkQwpEgressLatency      -benchtime 2000x .
-//   QDB_BENCH_ROWS=5000000 \
-//     go test -run '^$' -bench BenchmarkQwpEgressRead         -benchtime 5x .
-//   QDB_BENCH_SKIP_POPULATE=1 \
-//     go test -run '^$' -bench BenchmarkQwpEgressRead         -benchtime 10x .
+//   go test -run '^$' -bench BenchmarkQwpEgressBindLatency    -benchtime 3000x .
 
 import (
 	"context"
@@ -70,7 +72,6 @@ import (
 	"net/url"
 	"os"
 	"sort"
-	"strconv"
 	"testing"
 	"time"
 )
@@ -84,18 +85,6 @@ func benchEnvStr(key, def string) string {
 		return v
 	}
 	return def
-}
-
-func benchEnvInt(b *testing.B, key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		b.Fatalf("%s=%q: not an int: %v", key, v, err)
-	}
-	return n
 }
 
 func benchEnvBool(key string) bool {
@@ -440,145 +429,6 @@ func BenchmarkQwpEgressBindLatency(b *testing.B) {
 		b.Fatalf("prime query: %v", err)
 	}
 	runQueryLatency(b, queryOnce)
-}
-
-// ---------------------------------------------------------------------------
-// BenchmarkQwpEgressRead -- Go counterpart of QwpEgressReadBenchmark
-// ---------------------------------------------------------------------------
-
-// BenchmarkQwpEgressRead measures SELECT throughput streaming a full result
-// set over QWP/WebSocket. Narrow representative shape: designated timestamp,
-// one LONG, one DOUBLE, one low-cardinality SYMBOL, one VARCHAR.
-//
-// Each timed iteration runs `SELECT * FROM egress_bench` and walks every cell
-// into an XOR checksum so the compiler/runtime cannot elide the decode. The
-// table is seeded once (QDB_BENCH_ROWS rows, default 1,000,000) outside the
-// timed region; QDB_BENCH_SKIP_POPULATE=1 reuses it. b.SetBytes makes
-// `go test -bench` print MB/s; rows/s is reported as a custom metric.
-//
-// QDB_BENCH_COMPRESSION=zstd exercises the zstd batch-decompression path
-// (advertised to the server; it falls back to raw if unsupported).
-func BenchmarkQwpEgressRead(b *testing.B) {
-	benchSkipIfNoServer(b)
-
-	const table = "egress_bench"
-	rows := benchEnvInt(b, "QDB_BENCH_ROWS", 1_000_000)
-	if rows <= 0 {
-		b.Fatalf("QDB_BENCH_ROWS must be > 0, got %d", rows)
-	}
-	symbols := []string{"AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "NFLX"}
-
-	benchEnsurePopulated(b, table, rows, func() {
-		benchHTTPExec(b, "DROP TABLE IF EXISTS '"+table+"'")
-		benchHTTPExec(b, "CREATE TABLE '"+table+"' "+
-			"(ts TIMESTAMP, id LONG, price DOUBLE, sym SYMBOL, note VARCHAR) "+
-			"TIMESTAMP(ts) PARTITION BY HOUR WAL")
-		base := time.Unix(0, 0).UTC()
-		seedRows(b, table, rows, func(s LineSender, i int) error {
-			n := int64(i + 1)
-			// Symbol(s) must precede non-symbol columns (ILP rule the QWP
-			// sender shares); designated timestamp goes to At().
-			return s.Table(table).
-				Symbol("sym", symbols[i%len(symbols)]).
-				Int64Column("id", n).
-				Float64Column("price", float64(n)*1.5).
-				StringColumn("note", "n"+strconv.Itoa(i&0xFFF)).
-				At(context.Background(), base.Add(time.Duration(i)*10*time.Millisecond))
-		})
-	})
-
-	opts := []QwpQueryClientOption{
-		WithQwpQueryAddress(benchEgressAddr()),
-		WithQwpQueryClientID("qwp-egress-read-bench-go/1.0"),
-	}
-	if benchEnvStr("QDB_BENCH_COMPRESSION", qwpCompressionRaw) == qwpCompressionZstd {
-		opts = append(opts, WithQwpQueryCompression(qwpCompressionZstd))
-	}
-	// Lead #2 levers, A/B'd via env: cap rows/RESULT_BATCH (fewer, larger
-	// frames → fewer goroutine handoffs) and/or enable flow-control credit.
-	if mbr := benchEnvInt(b, "QDB_BENCH_MAX_BATCH_ROWS", 0); mbr > 0 {
-		opts = append(opts, WithQwpQueryMaxBatchRows(mbr))
-	}
-	if cr := benchEnvInt(b, "QDB_BENCH_CREDIT", 0); cr > 0 {
-		opts = append(opts, WithQwpQueryInitialCredit(int64(cr)))
-	}
-	if bp := benchEnvInt(b, "QDB_BENCH_BUFPOOL", 0); bp > 0 {
-		opts = append(opts, WithQwpQueryBufferPoolSize(bp))
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	client, err := NewQwpQueryClient(ctx, opts...)
-	if err != nil {
-		b.Fatalf("NewQwpQueryClient: %v", err)
-	}
-	defer client.Close(ctx)
-
-	scanOnce := func() (rowsSeen int, bytesSeen int64, checksum int64, batches int, err error) {
-		q := client.Query(ctx, "SELECT ts, id, price, sym, note FROM '"+table+"'")
-		defer q.Close()
-		for batch, e := range q.Batches() {
-			if e != nil {
-				return rowsSeen, bytesSeen, checksum, batches, e
-			}
-			batches++
-			n := batch.RowCount()
-			for r := 0; r < n; r++ {
-				ts := batch.Int64(0, r)
-				id := batch.Int64(1, r)
-				priceBits := int64(batch.Float64(2, r))
-				sym := batch.Str(3, r)
-				note := batch.Str(4, r)
-				checksum ^= ts ^ id ^ priceBits ^
-					int64(len(sym)) ^ int64(len(note))
-			}
-			rowsSeen += n
-			bytesSeen += int64(len(batch.Payload()))
-		}
-		return rowsSeen, bytesSeen, checksum, batches, nil
-	}
-
-	// Cold warm-up (discarded): primes codec scratch + OS page cache, same
-	// as the Java bench's discarded warm-up pass.
-	if r, _, _, _, err := scanOnce(); err != nil {
-		b.Fatalf("warm-up scan: %v", err)
-	} else if r != rows {
-		b.Fatalf("warm-up scan saw %d rows, want %d (is the table fully applied?)", r, rows)
-	}
-
-	var bytesPerScan int64
-	var batchesPerScan int
-	var sink int64
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r, bytesSeen, checksum, nb, err := scanOnce()
-		if err != nil {
-			b.Fatalf("scan %d: %v", i, err)
-		}
-		if r != rows {
-			b.Fatalf("scan %d saw %d rows, want %d", i, r, rows)
-		}
-		bytesPerScan = bytesSeen
-		batchesPerScan = nb
-		sink ^= checksum
-	}
-	b.StopTimer()
-
-	_ = sink
-	b.SetBytes(bytesPerScan)
-	elapsed := b.Elapsed().Seconds()
-	if elapsed > 0 {
-		b.ReportMetric(float64(rows)*float64(b.N)/elapsed, "rows/s")
-	}
-	b.ReportMetric(float64(rows), "rows/op")
-	// Frames/scan is the goroutine-handoff multiplier the wakeup-storm
-	// analysis hinges on: rows/s gated by per-frame handoffs scales with
-	// this, so it must be visible in the bench output and move under the
-	// max_batch_rows lever.
-	b.ReportMetric(float64(batchesPerScan), "batches/op")
-	b.Logf("server batching: %d batches/scan, ~%d rows/batch (max_batch_rows=%d credit=%d)",
-		batchesPerScan, rows/max(batchesPerScan, 1),
-		benchEnvInt(b, "QDB_BENCH_MAX_BATCH_ROWS", 0), benchEnvInt(b, "QDB_BENCH_CREDIT", 0))
 }
 
 // ---------------------------------------------------------------------------
