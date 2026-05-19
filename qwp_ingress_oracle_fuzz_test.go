@@ -72,6 +72,8 @@ import (
 	"fmt"
 	"math/big"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -85,6 +87,16 @@ const (
 	oracleNonASCII      = 4  // ~25% of string/symbol values get a non-ASCII suffix
 	oracleBaseTsMicros  = int64(1_700_000_000_000_000)
 )
+
+// oracleCreateSQL is the DEDUP target-table DDL shared by the ingress
+// oracle tests (mirrors QwpIngressOracleFuzzTest.createTargetTable).
+const oracleCreateSQL = "CREATE TABLE " + oracleTableName + " (" +
+	"id LONG, b BOOLEAN, b8 BYTE, s16 SHORT, c CHAR, i INT, l LONG, " +
+	"f FLOAT, d DOUBLE, s STRING, sym SYMBOL, u UUID, l256 LONG256, " +
+	"tn TIMESTAMP_NS, da DOUBLE[], da2 DOUBLE[][], da3 DOUBLE[][][], " +
+	"dec64 DECIMAL(12,3), dec128 DECIMAL(25,4), dec256 DECIMAL(50,6), " +
+	"ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL " +
+	"DEDUP UPSERT KEYS(ts, id)"
 
 // oracleNonASCIISuffixes spans the UTF-8 byte-length spectrum (2/3/4
 // byte) so the wire path exercises multi-byte encoding.
@@ -694,13 +706,7 @@ func TestQwpFuzzIngressOracleMultiSender(t *testing.T) {
 	// wire-level replay cleanly onto the pre-generated oracle.
 	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
 	defer srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
-	srv.mustExec(t, "CREATE TABLE "+oracleTableName+" ("+
-		"id LONG, b BOOLEAN, b8 BYTE, s16 SHORT, c CHAR, i INT, l LONG, "+
-		"f FLOAT, d DOUBLE, s STRING, sym SYMBOL, u UUID, l256 LONG256, "+
-		"tn TIMESTAMP_NS, da DOUBLE[], da2 DOUBLE[][], da3 DOUBLE[][][], "+
-		"dec64 DECIMAL(12,3), dec128 DECIMAL(25,4), dec256 DECIMAL(50,6), "+
-		"ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL "+
-		"DEDUP UPSERT KEYS(ts, id)")
+	srv.mustExec(t, oracleCreateSQL)
 
 	// Pre-generate: each producer owns a contiguous slice; ids and
 	// timestamps are globally unique and interleaved so ts,id order
@@ -763,4 +769,221 @@ func TestQwpFuzzIngressOracleMultiSender(t *testing.T) {
 
 	c := newBindFuzzClient(t, srv) // reused query-client helper
 	oracleAssert(t, c, oracle)
+}
+
+// --- bounce-torture scenario -----------------------------------------
+
+// oraclePickSfMaxBytes mirrors Java pickSfMaxBytes: small segments force
+// frequent rotation (stresses purge bookkeeping), large segments resemble
+// the production default. The chosen value also scales the post-close
+// slot-purge bound.
+func oraclePickSfMaxBytes(r *rand.Rand) int64 {
+	pool := []int64{256 * 1024, 1024 * 1024, 4 * 1024 * 1024}
+	return pool[r.Intn(len(pool))]
+}
+
+// oracleSfDirSize sums every file under dir. The Go SF slot lives at
+// <sf_dir>/<sender_id>/...; Java asserts <sf_dir>/default. Summing the
+// whole tree is faithful to the intent (slot purged after clean close)
+// and robust to the exact nesting.
+func oracleSfDirSize(dir string) int64 {
+	var total int64
+	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
+}
+
+// oracleSenderFromConf builds a QwpSender from a hand-assembled connect
+// string (sf_dir / reconnect / auto_flush tuning the shared
+// oracleNewSender does not expose). The closer's ctx outlasts
+// close_flush_timeout_millis=120000 so a clean drain across an
+// in-flight bounce can complete.
+func oracleSenderFromConf(t *testing.T, conf string) (QwpSender, func()) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ls, err := LineSenderFromConf(ctx, conf)
+	if err != nil {
+		t.Fatalf("LineSenderFromConf(%q): %v", conf, err)
+	}
+	qs, ok := ls.(QwpSender)
+	if !ok {
+		t.Fatalf("ws sender is not a QwpSender (%T)", ls)
+	}
+	closer := func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer ccancel()
+		_ = qs.Close(cctx)
+	}
+	return qs, closer
+}
+
+// TestQwpFuzzIngressOracleMultiSenderBounce is the bounce-torture port of
+// QwpIngressOracleFuzzTest.testOracleMultiSenderTortureUnderServerBounces:
+// concurrent sf_dir-backed producers publish the pre-generated typed
+// oracle while a bouncer SIGTERMs and restarts the server several times
+// on the same port/dataDir. The Go SF send loop owns reconnect + replay
+// from the last ACKed FSN, and DEDUP UPSERT KEYS(ts,id) collapses any
+// wire-level replay, so the final table must match the oracle exactly
+// with zero loss across every server outage.
+//
+// Faithful-port divergences (cf. the file header and the egress/bounds
+// ports' headers):
+//
+//   - Requires a fixture-LAUNCHED server (JDK+jar). In QDB_FUZZ_ADDR mode
+//     the fixture does not own the process and cannot bounce it, so the
+//     test skips — the non-bounce TestQwpFuzzIngressOracleMultiSender
+//     still covers the correctness property against any server.
+//   - The server down-interval is the fixture bounce()'s SIGTERM + fixed
+//     ~500ms gap + JVM reboot, not Java's 40-100ms in-process stop/start
+//     (a network-launched JVM cannot restart that fast). The property
+//     under test — reconnect + gap-free replay across a real outage on a
+//     stable port — is unchanged; a randomized post-bounce settle keeps
+//     producers spanning multiple up/down windows.
+//   - Row counts bounded smaller than the Java suite for CI time while
+//     still crossing batch boundaries and outliving multiple bounces.
+//     Decimals are non-negative (see the file header).
+//   - Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
+func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
+	srv := fuzzServer(t)
+	if !srv.owns {
+		t.Skip("bounce-torture needs a fixture-launched server; " +
+			"QDB_FUZZ_ADDR mode cannot restart the process")
+	}
+	r := newFuzzRand(t)
+
+	producerCount := 2 + r.Intn(3)       // 2..4
+	rowsPerProducer := 300 + r.Intn(400) // 300..699 (CI-bounded)
+	bounces := 2 + r.Intn(3)             // 2..4
+	sfMaxBytes := oraclePickSfMaxBytes(r)
+	batchSizes := make([]int, producerCount)
+	autoFlush := make([]int, producerCount)
+	for p := 0; p < producerCount; p++ {
+		batchSizes[p] = 10 + r.Intn(80) // 10..89
+		autoFlush[p] = 50 + r.Intn(200) // 50..249
+	}
+	bRnd := rand.New(rand.NewSource(r.Int63()))
+	totalRows := producerCount * rowsPerProducer
+	t.Logf("ingress oracle bounce: producers=%d rows/producer=%d total=%d bounces=%d sf_max_bytes=%d",
+		producerCount, rowsPerProducer, totalRows, bounces, sfMaxBytes)
+
+	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
+	defer srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
+	srv.mustExec(t, oracleCreateSQL)
+
+	// Pre-generate: each producer owns a contiguous slice; ids and
+	// timestamps are globally unique so ts,id order is deterministic and
+	// every wire-level replay collapses cleanly under DEDUP.
+	oracle := newOracleTable()
+	perProducer := make([][]*oracleRow, producerCount)
+	var globalIdx int64
+	for p := 0; p < producerCount; p++ {
+		genR := rand.New(rand.NewSource(r.Int63()))
+		perProducer[p] = make([]*oracleRow, rowsPerProducer)
+		for i := 0; i < rowsPerProducer; i++ {
+			id := globalIdx
+			ts := oracleBaseTsMicros + globalIdx
+			row := oracleGenerateRow(genR, id, ts)
+			perProducer[p][i] = row
+			oracle.addRow(row)
+			globalIdx++
+		}
+	}
+
+	sfRoot := t.TempDir()
+	sfDirs := make([]string, producerCount)
+	for p := 0; p < producerCount; p++ {
+		sfDirs[p] = filepath.Join(sfRoot, fmt.Sprintf("p%d", p))
+		if err := os.MkdirAll(sfDirs[p], 0o755); err != nil {
+			t.Fatalf("mkdir sf_dir: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, producerCount)
+	for p := 0; p < producerCount; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					errs[p] = fmt.Errorf("producer %d panicked: %v", p, rec)
+				}
+			}()
+			conf := fmt.Sprintf(
+				"ws::addr=%s;sf_dir=%s;initial_connect_retry=async;"+
+					"reconnect_max_duration_millis=120000;"+
+					"close_flush_timeout_millis=120000;"+
+					"sf_max_bytes=%d;auto_flush_rows=%d;",
+				srv.wsAddr(), sfDirs[p], sfMaxBytes, autoFlush[p])
+			qs, closeSender := oracleSenderFromConf(t, conf)
+			defer closeSender()
+			ctx := context.Background()
+			rows := perProducer[p]
+			bs := batchSizes[p]
+			written := 0
+			for written < len(rows) {
+				end := min(written+bs, len(rows))
+				for i := written; i < end; i++ {
+					oraclePublish(t, qs, ctx, rows[i])
+				}
+				if err := qs.Flush(ctx); err != nil {
+					errs[p] = fmt.Errorf("producer %d flush@%d: %w", p, written, err)
+					return
+				}
+				written = end
+				time.Sleep(time.Millisecond) // mirror Java Os.sleep(1)
+			}
+		}(p)
+	}
+
+	bouncerDone := make(chan struct{})
+	var bounceErr error
+	go func() {
+		defer close(bouncerDone)
+		time.Sleep(150 * time.Millisecond) // let producers warm up
+		for i := 0; i < bounces; i++ {
+			t.Logf("oracle bounce %d/%d", i+1, bounces)
+			if err := srv.bounce(); err != nil {
+				bounceErr = fmt.Errorf("bounce %d/%d: %w", i+1, bounces, err)
+				return
+			}
+			time.Sleep(time.Duration(150+bRnd.Intn(250)) * time.Millisecond)
+		}
+	}()
+
+	// Match the Java ordering: join the bouncer, then the producers.
+	// Always drain producers before any t.Fatalf so no goroutine
+	// touches t after the test function returns.
+	<-bouncerDone
+	wg.Wait()
+	if bounceErr != nil {
+		t.Fatalf("%v", bounceErr)
+	}
+	for p, e := range errs {
+		if e != nil {
+			t.Fatalf("producer %d: %v", p, e)
+		}
+	}
+
+	srv.awaitRows(t, oracleTableName, totalRows, 120*time.Second)
+
+	c := newBindFuzzClient(t, srv)
+	oracleAssert(t, c, oracle)
+
+	// Clean close ACKed every frame; the SF cursor unlinks rotated
+	// segments. A small residue (lock, ack-watermark, active header) is
+	// normal — Java's slotCapFor is sf_max_bytes + 256 KiB.
+	capBytes := sfMaxBytes + 256*1024
+	for p, dir := range sfDirs {
+		if sz := oracleSfDirSize(dir); sz > capBytes {
+			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
+				p, dir, sz, capBytes)
+		}
+	}
 }

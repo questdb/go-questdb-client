@@ -507,9 +507,11 @@ func (s *qwpFuzzServer) stop() {
 }
 
 // bounce restarts the server on the same ports and data dir, exercising
-// the client's reconnect/replay path. Returns an error in external mode.
-//
-//lint:ignore U1000 fixture API; first consumer is the sender fuzz port (reconnect/replay variants, backlog #6)
+// the client's reconnect/replay path: SIGTERM, ~500ms down, then a fresh
+// JVM rebinds the identical ports and dataDir (no data loss — only stop()
+// removes baseDir). Consumed by the ingress-oracle bounce-torture test.
+// Returns an error in QDB_FUZZ_ADDR mode (the fixture does not own that
+// process, so bounce-dependent tests skip themselves).
 func (s *qwpFuzzServer) bounce() error {
 	if !s.owns {
 		return errors.New("cannot bounce a server in QDB_FUZZ_ADDR mode")
@@ -560,9 +562,8 @@ func (s *qwpFuzzServer) connConf() string {
 }
 
 // wsAddr is the host:port for QWP senders that assemble their own
-// connection string in the sender fuzz port (backlog #6).
-//
-//lint:ignore U1000 fixture API; first consumer is the sender fuzz port (backlog #6)
+// connection string (sf_dir / reconnect / auto_flush tuning) instead of
+// using connConf — used by the ingress-oracle bounce-torture test.
 func (s *qwpFuzzServer) wsAddr() string {
 	return fmt.Sprintf("%s:%d", s.host, s.httpPort)
 }
