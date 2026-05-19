@@ -517,13 +517,21 @@ func (d *qwpQueryDecoder) parseColumn(l *qwpColumnLayout, rowCount int) error {
 		return d.readFixed(l, 2)
 	case qwpTypeInt, qwpTypeFloat, qwpTypeIPv4:
 		return d.readFixed(l, 4)
-	case qwpTypeLong, qwpTypeDouble, qwpTypeDate:
-		// DATE shares the LONG layout — no Gorilla encoding flag, plain
-		// int64 LE values. Matches the Java QwpColumnWriter, which only
-		// branches into writeTimestampColumn for TIMESTAMP and
-		// TIMESTAMP_NANOS; DATE rides the same path as LONG / DOUBLE.
+	case qwpTypeLong, qwpTypeDouble:
 		return d.readFixed(l, 8)
-	case qwpTypeTimestamp, qwpTypeTimestampNano:
+	case qwpTypeTimestamp, qwpTypeTimestampNano, qwpTypeDate:
+		// DATE is asymmetric on the wire. The server's *egress*
+		// encoder (QwpResultBatchBuffer) frames DATE exactly like
+		// TIMESTAMP — a 1-byte encoding discriminator (0x00 raw
+		// int64 / 0x01 Gorilla) then the payload — even though the
+		// *ingestion* encoder (Java QwpColumnWriter, and our
+		// qwpEncoder) writes DATE as a plain int64. We decode
+		// egress frames here, so DATE must go through parseTimestamp;
+		// readFixed(8) would skip the discriminator and shift every
+		// value left by 8 bits. Do NOT "align" the ingestion encoder
+		// to this — it breaks DATE ingestion. The asymmetry is by
+		// protocol design; TestQwpIntegrationQwpOnlyTypes guards the
+		// ingestion side, the egress fuzz guards this side.
 		return d.parseTimestamp(l)
 	case qwpTypeUuid:
 		return d.readFixed(l, 16)

@@ -355,6 +355,11 @@ func (e *qwpEncoder) encodeArrayColumn(col *qwpColumnBuffer) {
 // encodeTimestampColumn writes a timestamp column's payload. The wire
 // shape depends on whether FLAG_GORILLA is set at the message level:
 //
+// Note: DATE is NOT routed here. Ingestion frames DATE as a plain
+// int64 (matching the Java QwpColumnWriter); only server *egress*
+// frames DATE timestamp-ish. The asymmetry is by protocol design —
+// see the DATE case in qwp_query_decoder.go's parseColumn.
+//
 //   - FLAG_GORILLA on (default): a 1-byte encoding flag (0x01 = Gorilla,
 //     0x00 = uncompressed) followed by the payload. Gorilla is used when
 //     the column has more than two non-null values and every DoD fits in

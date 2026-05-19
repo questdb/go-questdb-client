@@ -44,7 +44,7 @@ const (
 	// same wire encoding. Do not reuse this code.
 	qwpTypeSymbol        qwpTypeCode = 0x09 // variable, dictionary-encoded
 	qwpTypeTimestamp     qwpTypeCode = 0x0A // int64 microseconds, 8 bytes LE
-	qwpTypeDate          qwpTypeCode = 0x0B // int64 milliseconds, 8 bytes LE
+	qwpTypeDate          qwpTypeCode = 0x0B // int64 ms. Asymmetric: ingestion=plain int64; egress=timestamp-ish framing (enc byte + RAW/Gorilla, like qwpTypeTimestamp)
 	qwpTypeUuid          qwpTypeCode = 0x0C // 16 bytes (lo then hi, LE)
 	qwpTypeLong256       qwpTypeCode = 0x0D // 32 bytes (four int64s, LE)
 	qwpTypeGeohash       qwpTypeCode = 0x0E // varint precision + packed bits

@@ -263,23 +263,10 @@ func TestQwpDecoderRoundTripFixedWidth(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "DATE", wt: qwpTypeDate,
-			rows: []func(col *qwpColumnBuffer){
-				func(c *qwpColumnBuffer) { c.addTimestamp(0) },
-				func(c *qwpColumnBuffer) { c.addTimestamp(1_700_000_000_000) },
-				func(c *qwpColumnBuffer) { c.addTimestamp(math.MinInt64 + 1) },
-				func(c *qwpColumnBuffer) { c.addTimestamp(math.MaxInt64) },
-			},
-			check: func(t *testing.T, b *QwpColumnBatch) {
-				want := []int64{0, 1_700_000_000_000, math.MinInt64 + 1, math.MaxInt64}
-				for i, w := range want {
-					if got := b.Int64(0, i); got != w {
-						t.Fatalf("Date Int64[%d] = %d, want %d", i, got, w)
-					}
-				}
-			},
-		},
+		// DATE has no Go-encode <-> Go-decode round trip: ingestion
+		// frames DATE as plain int64 but egress frames it timestamp-ish
+		// (protocol asymmetry). Egress DATE decode is covered by
+		// TestQwpDecoderEgressDate; ingestion by TestQwpIntegrationQwpOnlyTypes.
 		{
 			name: "TIMESTAMP_NANO", wt: qwpTypeTimestampNano,
 			rows: []func(col *qwpColumnBuffer){
@@ -423,6 +410,99 @@ func TestQwpDecoderRoundTripVarcharAndBinary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// patchSchemaTypeToDate rewrites the schema type code of column colName
+// in a raw qwpEncoder.encodeTable() payload (BEFORE wrapAsResultBatch)
+// to qwpTypeDate. DATE shares TIMESTAMP's *egress* framing (1-byte
+// encoding discriminator + RAW/Gorilla), so encoding the column as
+// TIMESTAMP and relabelling the schema yields byte-for-byte what the
+// server's QwpResultBatchBuffer emits for a DATE column. The ingestion
+// encoder cannot synthesise egress DATE directly (it writes plain
+// int64, by protocol asymmetry). Offsets mirror the proven walk in
+// TestQwpEncoderAllFixedTypes (raw encodeTable layout: qwpHeaderSize
+// header + 2-byte empty delta symbol dict, then name / counts / schema).
+func patchSchemaTypeToDate(t *testing.T, ingress []byte, colName string) {
+	t.Helper()
+	off := qwpHeaderSize + 2 // header + empty delta symbol dict (2 bytes)
+	nameLen, n, err := qwpReadVarint(ingress[off:])
+	if err != nil {
+		t.Fatalf("table-name varint: %v", err)
+	}
+	off += n + int(nameLen) // table name
+	if _, n, err = qwpReadVarint(ingress[off:]); err != nil {
+		t.Fatalf("rowCount varint: %v", err)
+	}
+	off += n // rowCount
+	colCount, n, err := qwpReadVarint(ingress[off:])
+	if err != nil {
+		t.Fatalf("colCount varint: %v", err)
+	}
+	off += n
+	off++ // schema mode
+	if _, n, err = qwpReadVarint(ingress[off:]); err != nil {
+		t.Fatalf("schemaId varint: %v", err)
+	}
+	off += n // schema id
+	for i := 0; i < int(colCount); i++ {
+		cnLen, n, err := qwpReadVarint(ingress[off:])
+		if err != nil {
+			t.Fatalf("col-name varint: %v", err)
+		}
+		off += n
+		name := string(ingress[off : off+int(cnLen)])
+		off += int(cnLen)
+		if name == colName {
+			ingress[off] = byte(qwpTypeDate)
+			return
+		}
+		off++ // skip this column's type code
+	}
+	t.Fatalf("column %q not found in schema", colName)
+}
+
+func TestQwpDecoderEgressDate(t *testing.T) {
+	// DATE egress is framed exactly like TIMESTAMP: a 1-byte encoding
+	// discriminator then RAW int64 / Gorilla. The decoder must route
+	// DATE through parseTimestamp (regression guard for the DATE-as-
+	// plain-int64 bug the egress fuzz caught). Cover both branches.
+	run := func(t *testing.T, vals []int64) {
+		t.Helper()
+		tb := newQwpTableBuffer("t")
+		for _, v := range vals {
+			col, err := tb.getOrCreateColumn("d", qwpTypeTimestamp, false)
+			if err != nil {
+				t.Fatalf("getOrCreateColumn: %v", err)
+			}
+			col.addLong(v)
+			tb.commitRow()
+		}
+		var enc qwpEncoder
+		ingress := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+		patchSchemaTypeToDate(t, ingress, "d")
+		frame := wrapAsResultBatch(ingress, 1, 0)
+		dec := newTestQueryDecoder()
+		var b QwpColumnBatch
+		if err := dec.decode(frame, &b); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if b.RowCount() != len(vals) {
+			t.Fatalf("RowCount = %d, want %d", b.RowCount(), len(vals))
+		}
+		for i, w := range vals {
+			if got := b.Int64(0, i); got != w {
+				t.Fatalf("Int64[%d] = %d, want %d", i, got, w)
+			}
+		}
+	}
+	// <=2 values force the encoder's uncompressed (0x00) branch.
+	t.Run("Uncompressed", func(t *testing.T) {
+		run(t, []int64{0, 1_700_000_000_000})
+	})
+	// >2 values with small delta-of-deltas pick Gorilla (0x01).
+	t.Run("Gorilla", func(t *testing.T) {
+		run(t, []int64{1_000_000, 1_000_100, 1_000_200, 1_000_310, 1_000_520})
+	})
 }
 
 func TestQwpDecoderRoundTripTimestampGorilla(t *testing.T) {

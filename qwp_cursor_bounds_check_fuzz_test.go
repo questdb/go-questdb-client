@@ -47,6 +47,10 @@ package questdb
 //     connection-scoped delta symbol dictionary (FLAG_DELTA_SYMBOL_DICT),
 //     which is out of scope for a single stateless decode call and is
 //     already covered by the decoder hardening tests.
+//   - DATE is excluded: it is asymmetric on the wire (ingestion = plain
+//     int64; egress = timestamp-ish framing), so the ingestion encoder
+//     used here cannot synthesise a valid egress DATE column. Egress
+//     DATE decode is covered by TestQwpDecoderEgressDate.
 //   - We build the valid seed message with the real encoder rather than a
 //     hand-rolled byte writer, so "valid" is guaranteed valid for the Go
 //     decoder; rows are 1-19 (the 0-row/0-col degenerate frame is pinned
@@ -65,11 +69,11 @@ const (
 	boundsCorruptionsPerMsg = 30
 )
 
-// boundsCandidateTypes is the Java FUZZABLE_TYPES set minus SYMBOL (see
-// file header for why).
+// boundsCandidateTypes is the Java FUZZABLE_TYPES set minus SYMBOL and
+// DATE (see file header for why).
 var boundsCandidateTypes = []qwpTypeCode{
 	qwpTypeBoolean, qwpTypeByte, qwpTypeShort, qwpTypeInt, qwpTypeLong,
-	qwpTypeFloat, qwpTypeDouble, qwpTypeTimestamp, qwpTypeDate, qwpTypeTimestampNano,
+	qwpTypeFloat, qwpTypeDouble, qwpTypeTimestamp, qwpTypeTimestampNano,
 	qwpTypeUuid, qwpTypeLong256, qwpTypeChar, qwpTypeVarchar, qwpTypeGeohash,
 	qwpTypeDecimal64, qwpTypeDecimal128, qwpTypeDecimal256, qwpTypeDoubleArray,
 }
