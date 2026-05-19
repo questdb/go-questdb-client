@@ -1,0 +1,101 @@
+# Builds QuestDB from source and runs the Go QWP fuzz suite against it.
+#
+# Modelled on c-questdb-client's ci/run_fuzz_pipeline.yaml (clone questdb,
+# build with Maven, point the test fixture at the built repo). The fixture
+# (qwp_fuzz_fixture_test.go) then launches the SNAPSHOT jar exactly as
+# system_test/fixture.py does.
+#
+# This job MUST actually build, start the server, and run the fuzz tests —
+# never silently skip. Two guards enforce that:
+#   * QDB_FUZZ_STRICT=1 turns an unresolved/unstartable server from a
+#     green t.Skip into a red t.Fatal (see fuzzStrict in the fixture).
+#   * the explicit "Verify QuestDB jar" step fails the job with an
+#     actionable message if the build produced no server jar.
+# The regular build.yml workflow is unaffected: it sets neither QDB_REPO
+# nor QDB_FUZZ_STRICT, so the fuzz tests skip cleanly there.
+#
+# Runs on every pull request (and on demand). The QuestDB build plus
+# first-time dependency download takes a few minutes; the ~/.m2 cache
+# below keeps repeat runs short.
+name: qwp-fuzz
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  qwp-fuzz:
+    name: QWP fuzz vs QuestDB master
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout go-questdb-client
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      # QuestDB's maven-enforcer-plugin pins java.enforce.version=25
+      # (core/pom.xml); building with anything else fails the build.
+      # c-questdb-client uses JDK 25 for the same reason.
+      - name: Install JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Clone QuestDB
+        # Shallow clone of master. The default Maven reactor for the
+        # server jar is just core (+ utils via -am); the
+        # java-questdb-client submodule lives only in the opt-in
+        # local-client profile and the C submodules ship prebuilt, so
+        # no submodule init is needed for `-pl core`.
+        run: git clone --depth 1 https://github.com/questdb/questdb.git
+
+      # QuestDB pulls a large, slow-moving dependency set; cache ~/.m2 so
+      # repeat runs skip the multi-minute first-time download. Key
+      # rotates when this workflow changes.
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: m2-questdb-${{ runner.os }}-${{ hashFiles('.github/workflows/qwp-fuzz.yml') }}
+          restore-keys: |
+            m2-questdb-${{ runner.os }}-
+
+      - name: Build QuestDB server jar
+        # Minimal, verified build: produces core/target/questdb-
+        # <ver>-SNAPSHOT.jar + core/target/classes/.../site/conf in ~30s
+        # (warm .m2). No -Pbuild-web-console: the embedded console UI is
+        # irrelevant to QWP / /exec / /ping, and skipping it removes the
+        # Node-download failure surface. JAVA_HOME is exported by
+        # setup-java; the enforcer verifies it is JDK 25.
+        run: mvn -B -ntp -DskipTests -pl core -am package -f questdb/pom.xml
+
+      - name: Verify QuestDB jar exists
+        # Defense in depth: if Maven "succeeded" but emitted no server
+        # jar (wrong module, layout change), fail HERE with a precise
+        # message instead of letting the fuzz step skip/fatal opaquely.
+        run: |
+          set -euo pipefail
+          jar="$(ls questdb/core/target/questdb-*-SNAPSHOT.jar 2>/dev/null \
+                 | grep -v -- '-tests.jar' | head -n1 || true)"
+          if [ -z "$jar" ]; then
+            echo "::error::No QuestDB server jar under questdb/core/target — the build did not produce it."
+            ls -la questdb/core/target/ || true
+            exit 1
+          fi
+          echo "Found server jar: $jar"
+
+      - name: Run QWP fuzz tests
+        env:
+          GOTOOLCHAIN: local
+          QDB_REPO: ${{ github.workspace }}/questdb
+          # Make a missing/unstartable server a hard failure, not a skip.
+          QDB_FUZZ_STRICT: "1"
+        run: go test -count=1 -timeout 30m -run '^TestQwpFuzz' -v .
