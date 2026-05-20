@@ -1411,9 +1411,10 @@ func TestQwpIntegrationSender(t *testing.T) {
 		t.Fatalf("Flush (row 2): %v", err)
 	}
 
-	// Verify schema was registered (schema ID advanced past -1).
-	if s.maxSentSchemaId < 0 {
-		t.Fatal("maxSentSchemaId should have advanced after flush")
+	// Verify schema was registered: a single schema flushed twice
+	// allocates exactly one id and promotes it to maxSentSchemaId.
+	if s.maxSentSchemaId != 0 {
+		t.Fatalf("maxSentSchemaId = %d after flush, want 0", s.maxSentSchemaId)
 	}
 
 	t.Log("QWP sender integration test passed")

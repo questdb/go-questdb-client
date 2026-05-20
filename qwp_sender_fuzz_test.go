@@ -781,7 +781,6 @@ func senderFuzzAlterTableLoop(
 			continue
 		}
 		start := rnd.Intn(len(cols))
-		issued := false
 		for k := 0; k < len(cols); k++ {
 			c := cols[(start+k)%len(cols)]
 			if c.designated {
@@ -799,10 +798,8 @@ func senderFuzzAlterTableLoop(
 				onFailure(fmt.Errorf("ALTER %s.%s -> %s: %w", tableName, c.name, newType, err))
 				return
 			}
-			issued = true
 			break
 		}
-		_ = issued
 		time.Sleep(time.Duration(10+rnd.Intn(100)) * time.Millisecond)
 	}
 }

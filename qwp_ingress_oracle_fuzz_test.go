@@ -1527,8 +1527,8 @@ func TestQwpFuzzIngressOracleAsyncConnectQueues(t *testing.T) {
 				allEnqueued <- struct{}{}
 				return
 			}
-			if ctorElapsed > 2*time.Second {
-				errs[p] = fmt.Errorf("producer %d: async ctor took %s (must be <2s)", p, ctorElapsed)
+			if ctorElapsed > 500*time.Millisecond {
+				errs[p] = fmt.Errorf("producer %d: async ctor took %s (must be <500ms; offline path should not block on network)", p, ctorElapsed)
 				_ = ls.Close(context.Background())
 				allEnqueued <- struct{}{}
 				return

@@ -483,9 +483,12 @@ func (s *qwpFuzzServer) start() error {
 	cmd.Stdout = f
 	cmd.Stderr = f
 	if len(s.envOverrides) > 0 {
-		// Strip any pre-existing values for the override keys so we
-		// don't end up with two QDB_<KEY>=... entries (Go's exec.Cmd
-		// takes the LAST occurrence, but better to be explicit).
+		// Strip any pre-existing values for the override keys before
+		// appending ours. POSIX leaves the behaviour of duplicate names
+		// in execve's envp unspecified, and getenv() in some libc
+		// implementations returns the FIRST entry — so an inherited
+		// QDB_<KEY>=... would silently win over our override. Dedup is
+		// load-bearing for correctness, not stylistic.
 		cmd.Env = make([]string, 0, len(os.Environ())+len(s.envOverrides))
 		for _, kv := range os.Environ() {
 			eq := strings.IndexByte(kv, '=')
