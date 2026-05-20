@@ -191,6 +191,41 @@ func restartFuzzAssertDistinctIds(t *testing.T, srv *qwpFuzzServer, expected int
 	}
 }
 
+// restartFuzzAssertValInvariant verifies the per-row payload invariant
+// val == id * 1.5 holds for every row. Independent of any in-process
+// counter: a bug that inflates both rowsProduced and the on-table id
+// range in lockstep — so count(), count_distinct(id) and max(id) all
+// agree with the producer's counter — would still trip this check if
+// it corrupted, mis-associated, or split (id, val) pairs. Both writers
+// (restartFuzzWriteRows and the continuous-bounces inline loop) encode
+// val = float64(id) * 1.5; IEEE-754 binary64 makes the SQL comparison
+// against id*1.5 exact for the row counts these tests reach (well under
+// 2^53).
+func restartFuzzAssertValInvariant(t *testing.T, srv *qwpFuzzServer) {
+	t.Helper()
+	sql := "SELECT count() FROM " + restartFuzzTableName +
+		" WHERE val <> id * 1.5"
+	res, err := srv.execSQL(sql)
+	if err != nil {
+		t.Fatalf("val-invariant assert: %v", err)
+	}
+	if len(res.Dataset) != 1 || len(res.Dataset[0]) != 1 {
+		t.Fatalf("val-invariant assert: unexpected shape %+v", res.Dataset)
+	}
+	n, ok := toInt64(res.Dataset[0][0])
+	if !ok {
+		t.Fatalf("val-invariant assert: non-int count cell %+v", res.Dataset[0][0])
+	}
+	if n != 0 {
+		// Surface a sample of the violators to make the failure actionable.
+		sample := "SELECT id, val FROM " + restartFuzzTableName +
+			" WHERE val <> id * 1.5 LIMIT 5"
+		sres, serr := srv.execSQL(sample)
+		t.Fatalf("val-invariant violated: %d rows where val != id*1.5 "+
+			"(sample=%+v, sample err=%v)", n, sres.Dataset, serr)
+	}
+}
+
 // --- entry points -------------------------------------------------
 
 // TestQwpFuzzIngressServerRestartSmokeNoRestart — port of Java
@@ -234,6 +269,7 @@ func TestQwpFuzzIngressServerRestartSmokeNoRestart(t *testing.T) {
 		}
 	}
 	restartFuzzAssertRowCount(t, srv, int64(writers*rowsPerWriter), 60*time.Second)
+	restartFuzzAssertValInvariant(t, srv)
 }
 
 // TestQwpFuzzIngressServerRestartNewSenderRecoversFromSfDir — port of
@@ -294,6 +330,7 @@ func TestQwpFuzzIngressServerRestartNewSenderRecoversFromSfDir(t *testing.T) {
 		rowsPerEpoch, rowsPerEpoch,
 		baseTsNanos+int64(rowsPerEpoch)*1000)
 	restartFuzzAssertRowCount(t, srv, 2*rowsPerEpoch, 90*time.Second)
+	restartFuzzAssertValInvariant(t, srv)
 }
 
 // TestQwpFuzzIngressServerRestartSameSenderSurvives — port of Java
@@ -352,6 +389,7 @@ func TestQwpFuzzIngressServerRestartSameSenderSurvives(t *testing.T) {
 		t.Fatalf("phase 2 flush: %v", err)
 	}
 	restartFuzzAssertRowCount(t, srv, 2*rowsPerPhase, 90*time.Second)
+	restartFuzzAssertValInvariant(t, srv)
 }
 
 // TestQwpFuzzIngressServerRestartMultipleRestartsNewSender — port of
@@ -439,6 +477,7 @@ func TestQwpFuzzIngressServerRestartMultipleRestartsNewSender(t *testing.T) {
 	}
 	ccancel()
 	restartFuzzAssertRowCount(t, srv, totalRows, 180*time.Second)
+	restartFuzzAssertValInvariant(t, srv)
 }
 
 // TestQwpFuzzIngressServerRestartContinuousBounces — port of Java
@@ -580,4 +619,5 @@ func TestQwpFuzzIngressServerRestartContinuousBounces(t *testing.T) {
 	t.Logf("producer wrote %d rows across %d server bounces", expected, bounces)
 	restartFuzzAssertRowCount(t, srv, expected, 180*time.Second)
 	restartFuzzAssertDistinctIds(t, srv, expected)
+	restartFuzzAssertValInvariant(t, srv)
 }
