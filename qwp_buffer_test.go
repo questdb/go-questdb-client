@@ -995,6 +995,50 @@ func TestQwpTableBufferGetOrCreateColumn(t *testing.T) {
 		}
 	})
 
+	t.Run("CaseInsensitive", func(t *testing.T) {
+		// QuestDB column names are case-insensitive throughout the
+		// server stack (LowerCaseCharSequenceIntHashMap), and Java's
+		// QwpTableBuffer also dedupes case-insensitively. Multiple
+		// case-vary'd writes across rows within one frame must
+		// resolve to the same buffer column — otherwise the server
+		// auto-creates parallel columns whose names are equal modulo
+		// case, corrupting the on-disk metadata.
+		tb := newQwpTableBuffer("t")
+
+		col1, err := tb.getOrCreateColumn("Pressure_S", qwpTypeDouble, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		col1.addDouble(1.5)
+		tb.commitRow()
+
+		col2, err := tb.getOrCreateColumn("pressure_s", qwpTypeDouble, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if col2 != col1 {
+			t.Fatal("case-vary'd name should resolve to the same column")
+		}
+		if len(tb.columns) != 1 {
+			t.Fatalf("columns len = %d, want 1 (no parallel case-vary'd column)", len(tb.columns))
+		}
+		// First-seen case wins on the wire (matches Java client).
+		if col1.name != "Pressure_S" {
+			t.Fatalf("col.name = %q, want %q (first-seen case preserved)", col1.name, "Pressure_S")
+		}
+		col2.addDouble(2.5)
+		tb.commitRow()
+
+		// Yet a duplicate within the SAME row — even case-vary'd —
+		// still trips the per-row duplicate guard.
+		col3, _ := tb.getOrCreateColumn("PRESSURE_S", qwpTypeDouble, false)
+		col3.addDouble(3.5)
+		_, err = tb.getOrCreateColumn("pressure_s", qwpTypeDouble, false)
+		if err == nil {
+			t.Fatal("expected per-row duplicate error for case-vary'd second write")
+		}
+	})
+
 	t.Run("BackfillOnCreate", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
 

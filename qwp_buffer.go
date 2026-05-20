@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
+	"strings"
 )
 
 // qwpLongNull is the uint64 bit pattern for int64 MinInt64
@@ -786,9 +787,21 @@ func (c *qwpColumnBuffer) truncateTo(n int) {
 // manages multiple qwpColumnBuffer instances and handles row commits
 // with automatic gap-filling for columns not set in a given row.
 type qwpTableBuffer struct {
-	tableName   string
-	columns     []*qwpColumnBuffer
-	columnIndex map[string]int // column name → index in columns slice
+	tableName string
+	columns   []*qwpColumnBuffer
+	// columnIndex is keyed by the lowercase column name. QuestDB
+	// column names are case-insensitive throughout the server stack
+	// (TableReaderMetadata.columnNameIndexMap and
+	// TableUpdateDetails are LowerCase* maps), so the buffer must
+	// dedupe accordingly — otherwise emitting "Pressure_S" in one
+	// row and "pressure_s" in another within the same wire frame
+	// produces two distinct column definitions, and the server's
+	// QwpTudCache.getOrCreateTable faithfully creates two
+	// case-equivalent columns, corrupting the metadata file.
+	// Mirrors Java QwpTableBuffer.columnNameToIndex
+	// (LowerCaseCharSequenceIntHashMap). The column's own .name
+	// stays case-preserved (first-seen casing) for wire emission.
+	columnIndex map[string]int
 
 	// rowCount is the number of committed (finalized) rows.
 	rowCount int
@@ -856,7 +869,11 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 		}
 	}
 
-	idx, exists := tb.columnIndex[name]
+	// strings.ToLower returns the same string (no allocation) when
+	// the input is already all-lowercase, so the zero-allocs benchmark
+	// path (lowercase column names — the convention) is unaffected.
+	key := strings.ToLower(name)
+	idx, exists := tb.columnIndex[key]
 	if exists {
 		col := tb.columns[idx]
 		if col.typeCode != typeCode {
@@ -895,7 +912,7 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 		col.addNull()
 	}
 
-	tb.columnIndex[name] = len(tb.columns)
+	tb.columnIndex[key] = len(tb.columns)
 	tb.columns = append(tb.columns, col)
 	tb.schemaId = -1
 	return col, nil
@@ -960,7 +977,7 @@ func (tb *qwpTableBuffer) cancelRow() {
 	// Remove columns created during this row.
 	if len(tb.columns) > tb.committedColumnCount {
 		for i := tb.committedColumnCount; i < len(tb.columns); i++ {
-			delete(tb.columnIndex, tb.columns[i].name)
+			delete(tb.columnIndex, strings.ToLower(tb.columns[i].name))
 		}
 		tb.columns = tb.columns[:tb.committedColumnCount]
 		tb.schemaId = -1
