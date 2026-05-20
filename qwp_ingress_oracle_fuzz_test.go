@@ -1037,7 +1037,14 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 //     assertSql). Counts are CI-bounded; chunk size stays small enough
 //     to map to a single frame so the per-frame drop is deterministic.
 //   - errCalls >= poisoned-chunk count (inequality, like Java: tolerates
-//     the rare chunk that splits across more than one frame).
+//     the rare chunk that splits across more than one frame); upper
+//     bound 3x catches "handler fires N times per chunk" regressions
+//     the Java port doesn't guard.
+//   - Goes beyond the Java port: also captures one delivered
+//     *SenderError and asserts Category == CategoryWriteError and
+//     AppliedPolicy == PolicyDropAndContinue, so a misclassification
+//     (wrong status byte → wrong category) or a policy-resolution
+//     regression cannot pass silently behind the call-count alone.
 //   - Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
 func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	srv := fuzzServer(t)
@@ -1109,6 +1116,14 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	}
 
 	var errCalls atomic.Int64 // shared across every producer's handler
+	// Capture one delivered *SenderError so we can assert Category and
+	// AppliedPolicy. Without this the call-count alone would let a
+	// regression that misclassifies the dec256 poison (or resolves the
+	// policy to HALT) sneak past as long as *some* error fires.
+	var (
+		firstErrMu sync.Mutex
+		firstErr   *SenderError
+	)
 	var wg sync.WaitGroup
 	errs := make([]error, producerCount)
 	for p := 0; p < producerCount; p++ {
@@ -1129,7 +1144,17 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 				WithInitialConnectRetry(true), // initial_connect_retry=true (sync)
 				WithCloseFlushTimeout(120*time.Second),
 				WithErrorInboxCapacity(4096),
-				WithErrorHandler(func(*SenderError) { errCalls.Add(1) }),
+				WithErrorHandler(func(e *SenderError) {
+					errCalls.Add(1)
+					if e == nil {
+						return
+					}
+					firstErrMu.Lock()
+					if firstErr == nil {
+						firstErr = e
+					}
+					firstErrMu.Unlock()
+				}),
 			)
 			if err != nil {
 				errs[p] = fmt.Errorf("producer %d NewLineSender: %w", p, err)
@@ -1195,11 +1220,42 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	}
 
 	// (c) Async notifications: at least one per poisoned chunk reached a
-	// handler. Inequality tolerates a chunk split across >1 frame.
+	// handler. Lower-bound inequality tolerates a chunk split across
+	// >1 frame; upper bound (3x) catches a regression that fires the
+	// handler many times per rejection (e.g. one per row in the frame
+	// instead of one per frame).
 	got := errCalls.Load()
 	if got < int64(totalPoisonedChunks) {
 		t.Fatalf("error handler fired %d times, expected >= %d (poisoned chunks)",
 			got, totalPoisonedChunks)
+	}
+	if upper := int64(3 * totalPoisonedChunks); totalPoisonedChunks > 0 && got > upper {
+		t.Fatalf("error handler fired %d times, expected <= %d (3x poisoned chunks)",
+			got, upper)
+	}
+	// Inspect at least one delivered payload: misclassifying the
+	// dec256 overflow into a non-WriteError category, or resolving
+	// its policy to anything other than DROP_AND_CONTINUE, must
+	// fail the test even though the call count alone would still
+	// match. (A HALT resolution would also surface as a Flush error
+	// above, but we assert the policy here explicitly so the
+	// contract is self-documenting.)
+	if totalPoisonedChunks > 0 {
+		firstErrMu.Lock()
+		se := firstErr
+		firstErrMu.Unlock()
+		if se == nil {
+			t.Fatalf("error handler fired %d times but no *SenderError captured", got)
+		}
+		if se.Category != CategoryWriteError {
+			t.Fatalf("error handler: wrong category: got %s (status=0x%02X), "+
+				"expected WRITE_ERROR; msg=%q",
+				se.Category, byte(se.ServerStatusByte), se.ServerMessage)
+		}
+		if se.AppliedPolicy != PolicyDropAndContinue {
+			t.Fatalf("error handler: wrong policy: got %s, expected DROP_AND_CONTINUE",
+				se.AppliedPolicy)
+		}
 	}
 	t.Logf("poison: poisonedChunks=%d handlerCalls=%d", totalPoisonedChunks, got)
 
