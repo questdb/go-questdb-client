@@ -65,10 +65,27 @@ package questdb
 //     oracle, so the read-back matches what actually landed.
 //   - Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
 //
-// Backlog (out of scope for S1):
-//   - Fuzz variants: skip / reorder / dup / new-column / non-ASCII /
-//     diff-case / sendSymbolsWithSpace (one entry-point each).
-//   - Concurrent ALTER COLUMN TYPE thread + cross-type-cast oracle.
+// S3 (this slice) adds the concurrent ALTER COLUMN TYPE thread that
+// runs in parallel with the producers when fuzz.columnConvertProb > 0
+// (Java startAlterTableThread). The producers keep emitting the
+// original wire type for each column; the WAL apply layer casts to
+// the column's current storage type. The value bases were chosen so
+// every conversion in the matrix below is lossless:
+//
+//   - STRING ↔ SYMBOL ↔ VARCHAR — same string bytes, dictionary or
+//     length-prefix encoding only.
+//   - BYTE ↔ SHORT ↔ INT ↔ LONG — integer-family bases capped at the
+//     BYTE range (max 119 for "11"*10+9).
+//   - FLOAT ↔ DOUBLE — values are integer-valued floats (e.g. 70.0),
+//     exactly representable in both widths.
+//   - TIMESTAMP → LONG (one-way; raw microsecond int64).
+//
+// The assertion dispatches on the column's CURRENT wire type
+// (b.ColumnType(ci)) rather than the oracle-stored type, so a column
+// originally written as INT and altered to BYTE reads via Int8 and
+// still matches the stored int64.
+//
+// Backlog (out of scope):
 //   - Server-buffer tuning tests (testLoadSmallBuffer,
 //     forceRecvFragmentationChunkSize) — server-side knob, not
 //     reachable from a network client without a per-test fixture
@@ -618,6 +635,178 @@ func senderFuzzEmitRow(
 	}
 }
 
+// --- ALTER COLUMN TYPE driver (S3) --------------------------------
+
+// senderFuzzColumnInfo captures the bits of `SHOW COLUMNS` the alter
+// loop needs: the column's storage name, its current type as the
+// QuestDB type-name string (e.g. "INT", "SYMBOL"), and whether it is
+// the table's designated timestamp (which `ALTER COLUMN TYPE` cannot
+// touch).
+type senderFuzzColumnInfo struct {
+	name       string
+	typ        string
+	designated bool
+}
+
+// senderFuzzListColumns runs `SHOW COLUMNS FROM '<table>'` and
+// returns one entry per server-side column. Returns nil + nil error
+// when the table doesn't exist yet (producers race the auto-create);
+// the caller treats that as "skip this attempt and try later".
+func senderFuzzListColumns(srv *qwpFuzzServer, table string) ([]senderFuzzColumnInfo, error) {
+	res, err := srv.execSQL("SHOW COLUMNS FROM '" + table + "'")
+	if err != nil {
+		// The server returns an error for unknown tables; the alter
+		// loop polls into existence as producers auto-create, so this
+		// is the expected "not yet" path. Suppress the error to keep
+		// log noise low and let the caller retry.
+		if strings.Contains(err.Error(), "table does not exist") ||
+			strings.Contains(err.Error(), "does not exist") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	nameCol, typeCol, desigCol := -1, -1, -1
+	for i, c := range res.Columns {
+		switch strings.ToLower(c.Name) {
+		case "column":
+			nameCol = i
+		case "type":
+			typeCol = i
+		case "designated":
+			desigCol = i
+		}
+	}
+	if nameCol < 0 || typeCol < 0 {
+		return nil, fmt.Errorf("SHOW COLUMNS missing expected columns (got %+v)", res.Columns)
+	}
+	out := make([]senderFuzzColumnInfo, 0, len(res.Dataset))
+	for _, row := range res.Dataset {
+		if nameCol >= len(row) || typeCol >= len(row) {
+			continue
+		}
+		name, _ := row[nameCol].(string)
+		if name == "" {
+			continue
+		}
+		typ, _ := row[typeCol].(string)
+		designated := false
+		if desigCol >= 0 && desigCol < len(row) {
+			if b, ok := row[desigCol].(bool); ok {
+				designated = b
+			}
+		}
+		out = append(out, senderFuzzColumnInfo{name: name, typ: typ, designated: designated})
+	}
+	return out, nil
+}
+
+// senderFuzzChangeColumnTypeTo mirrors Java
+// QwpSenderFuzzTest.changeColumnTypeTo. Returns the QuestDB type-name
+// string to slot into the ALTER statement, or "" if the column's
+// current type is outside the convertible set (CHAR, UUID, LONG256,
+// TIMESTAMP_NANO, GEOHASH, DECIMAL*, arrays, etc.).
+func senderFuzzChangeColumnTypeTo(rnd *rand.Rand, currentType string) string {
+	switch strings.ToUpper(currentType) {
+	case "STRING":
+		if rnd.Intn(2) == 0 {
+			return "SYMBOL"
+		}
+		return "VARCHAR"
+	case "SYMBOL":
+		if rnd.Intn(2) == 0 {
+			return "STRING"
+		}
+		return "VARCHAR"
+	case "VARCHAR":
+		if rnd.Intn(2) == 0 {
+			return "STRING"
+		}
+		return "SYMBOL"
+	case "BYTE", "SHORT", "INT", "LONG":
+		family := []string{"BYTE", "SHORT", "INT", "LONG"}
+		for {
+			t := family[rnd.Intn(len(family))]
+			if !strings.EqualFold(t, currentType) {
+				return t
+			}
+		}
+	case "FLOAT":
+		return "DOUBLE"
+	case "DOUBLE":
+		return "FLOAT"
+	case "TIMESTAMP":
+		return "LONG"
+	}
+	return ""
+}
+
+// senderFuzzAlterTableLoop runs concurrent to the producers when
+// fuzz.columnConvertProb > 0. Picks a random table, queries its
+// schema, picks the first convertible non-designated column from a
+// random start offset, issues `ALTER TABLE … ALTER COLUMN … TYPE …`,
+// sleeps 10–110 ms, repeats — until the budget is exhausted, the
+// producers signal done, or onFailure fires. Mirrors Java
+// startAlterTableThread.
+//
+// Tolerant of "type is already" (Java tolerates the same; the racy
+// schema read can pick a column that was just altered to that type).
+// All other server-side errors fail the test via onFailure.
+func senderFuzzAlterTableLoop(
+	srv *qwpFuzzServer,
+	numTables, numLines int,
+	convertProb float64,
+	rnd *rand.Rand,
+	producersDone <-chan struct{},
+	onFailure func(error),
+) {
+	budgetCap := int(float64(numLines*numTables) * convertProb)
+	if budgetCap <= 0 {
+		return
+	}
+	budget := rnd.Intn(budgetCap)
+	for budget > 0 {
+		select {
+		case <-producersDone:
+			return
+		default:
+		}
+		tableName := "weather" + strconv.Itoa(rnd.Intn(numTables))
+		cols, err := senderFuzzListColumns(srv, tableName)
+		if err != nil {
+			onFailure(fmt.Errorf("list columns %q: %w", tableName, err))
+			return
+		}
+		if len(cols) == 0 {
+			time.Sleep(time.Duration(10+rnd.Intn(100)) * time.Millisecond)
+			continue
+		}
+		start := rnd.Intn(len(cols))
+		issued := false
+		for k := 0; k < len(cols); k++ {
+			c := cols[(start+k)%len(cols)]
+			if c.designated {
+				continue
+			}
+			newType := senderFuzzChangeColumnTypeTo(rnd, c.typ)
+			if newType == "" {
+				continue
+			}
+			sql := "ALTER TABLE '" + tableName + "' ALTER COLUMN \"" + c.name + "\" TYPE " + newType
+			_, err := srv.execSQL(sql)
+			if err == nil {
+				budget--
+			} else if !strings.Contains(err.Error(), "type is already") {
+				onFailure(fmt.Errorf("ALTER %s.%s -> %s: %w", tableName, c.name, newType, err))
+				return
+			}
+			issued = true
+			break
+		}
+		_ = issued
+		time.Sleep(time.Duration(10+rnd.Intn(100)) * time.Millisecond)
+	}
+}
+
 // --- runner -------------------------------------------------------
 
 // senderFuzzRunTest spawns load.numThreads producer goroutines, each
@@ -650,6 +839,26 @@ func senderFuzzRunTest(t *testing.T, srv *qwpFuzzServer, load senderFuzzLoad, fu
 	// primitive — this slice is its first consumer.
 	srv.dropAllTables(t)
 	t.Cleanup(func() { srv.dropAllTables(t) })
+
+	// Concurrent ALTER COLUMN TYPE thread (Java startAlterTableThread).
+	// Started before the producers so racy alters interleave with the
+	// very first batches; producers signal completion via producersDone
+	// and we join the goroutine BEFORE the assertion runs so the schema
+	// is stable when the oracle reads it back.
+	producersDone := make(chan struct{})
+	var alterWG sync.WaitGroup
+	var alterErr atomic.Value // holds error
+	if fuzz.columnConvertProb > 0 {
+		alterWG.Add(1)
+		alterSeed := rnd.Int63()
+		go func() {
+			defer alterWG.Done()
+			alterRnd := rand.New(rand.NewSource(alterSeed))
+			senderFuzzAlterTableLoop(srv, load.numTables, load.numLines,
+				fuzz.columnConvertProb, alterRnd, producersDone,
+				func(e error) { alterErr.Store(e) })
+		}()
+	}
 
 	var wg sync.WaitGroup
 	errs := make([]error, load.numThreads)
@@ -721,9 +930,16 @@ func senderFuzzRunTest(t *testing.T, srv *qwpFuzzServer, load senderFuzzLoad, fu
 		}(tid, threadSeed)
 	}
 	wg.Wait()
+	close(producersDone)
+	alterWG.Wait()
 	for tid, e := range errs {
 		if e != nil {
 			t.Fatalf("thread %d: %v", tid, e)
+		}
+	}
+	if v := alterErr.Load(); v != nil {
+		if e, ok := v.(error); ok && e != nil {
+			t.Fatalf("alter table thread: %v", e)
 		}
 	}
 
@@ -860,36 +1076,54 @@ func senderFuzzPollRows(t *testing.T, srv *qwpFuzzServer, table string, want int
 func senderFuzzAssertCell(t *testing.T, b *QwpColumnBatch, ci, br int,
 	tableName string, ts int64, colName string, c senderFuzzCell) {
 	t.Helper()
+	// The column's CURRENT wire type — may differ from c.typ when an
+	// ALTER COLUMN TYPE has narrowed/widened the column between write
+	// and assertion. For the convertible families (int/float/string),
+	// dispatch on the current type so the matching typed accessor
+	// fires; the oracle's stored value casts losslessly by construction
+	// (see file header).
+	wt := qwpTypeCode(b.ColumnType(ci))
 	switch c.typ {
 	case sftString, sftSymbol:
+		// STRING ↔ SYMBOL ↔ VARCHAR — b.String works for all three.
 		if got := b.String(ci, br); got != c.s {
-			t.Fatalf("table %q row ts=%d col %q (str): want %q got %q",
-				tableName, ts, colName, c.s, got)
+			t.Fatalf("table %q row ts=%d col %q (str, wt=0x%02x): want %q got %q",
+				tableName, ts, colName, byte(wt), c.s, got)
 		}
-	case sftDouble:
-		if got := b.Float64(ci, br); got != c.f64 {
-			t.Fatalf("table %q row ts=%d col %q (double): want %v got %v",
-				tableName, ts, colName, c.f64, got)
+	case sftDouble, sftFloat:
+		var got float64
+		switch wt {
+		case qwpTypeFloat:
+			got = float64(b.Float32(ci, br))
+		case qwpTypeDouble:
+			got = b.Float64(ci, br)
+		default:
+			t.Fatalf("table %q row ts=%d col %q (float family): unexpected wire type 0x%02x",
+				tableName, ts, colName, byte(wt))
 		}
-	case sftByte:
-		if got := int64(b.Int8(ci, br)); got != c.i64 {
-			t.Fatalf("table %q row ts=%d col %q (byte): want %d got %d",
-				tableName, ts, colName, c.i64, got)
+		if got != c.f64 {
+			t.Fatalf("table %q row ts=%d col %q (float family, wt=0x%02x): want %v got %v",
+				tableName, ts, colName, byte(wt), c.f64, got)
 		}
-	case sftShort:
-		if got := int64(b.Int16(ci, br)); got != c.i64 {
-			t.Fatalf("table %q row ts=%d col %q (short): want %d got %d",
-				tableName, ts, colName, c.i64, got)
+	case sftByte, sftShort, sftInt:
+		// Integer family — BYTE/SHORT/INT/LONG are interconvertible.
+		var got int64
+		switch wt {
+		case qwpTypeByte:
+			got = int64(b.Int8(ci, br))
+		case qwpTypeShort:
+			got = int64(b.Int16(ci, br))
+		case qwpTypeInt:
+			got = int64(b.Int32(ci, br))
+		case qwpTypeLong:
+			got = b.Int64(ci, br)
+		default:
+			t.Fatalf("table %q row ts=%d col %q (int family): unexpected wire type 0x%02x",
+				tableName, ts, colName, byte(wt))
 		}
-	case sftInt:
-		if got := int64(b.Int32(ci, br)); got != c.i64 {
-			t.Fatalf("table %q row ts=%d col %q (int): want %d got %d",
-				tableName, ts, colName, c.i64, got)
-		}
-	case sftFloat:
-		if got := float64(b.Float32(ci, br)); got != c.f64 {
-			t.Fatalf("table %q row ts=%d col %q (float): want %v got %v",
-				tableName, ts, colName, c.f64, got)
+		if got != c.i64 {
+			t.Fatalf("table %q row ts=%d col %q (int family, wt=0x%02x): want %d got %d",
+				tableName, ts, colName, byte(wt), c.i64, got)
 		}
 	case sftChar:
 		if got := b.Char(ci, br); got != c.ch {
@@ -958,6 +1192,7 @@ func TestQwpFuzzSenderLoadNoSymbols(t *testing.T) {
 	fuzz := defaultSenderFuzzFuzz()
 	fuzz.nonAsciiValueFactor = 5
 	fuzz.exerciseSymbols = false
+	fuzz.columnConvertProb = 0.05
 	senderFuzzRunTest(t, srv, senderFuzzLoad{
 		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 20,
 	}, fuzz, r)
@@ -1042,6 +1277,7 @@ func TestQwpFuzzSenderReorderingColumns(t *testing.T) {
 	fuzz.columnReorderingFactor = 4
 	fuzz.nonAsciiValueFactor = 8
 	fuzz.sendSymbolsWithSpace = true
+	fuzz.columnConvertProb = 0.05
 	senderFuzzRunTest(t, srv, senderFuzzLoad{
 		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
 	}, fuzz, r)
@@ -1054,6 +1290,7 @@ func TestQwpFuzzSenderReorderingColumnsNoSymbols(t *testing.T) {
 	fuzz.columnReorderingFactor = 4
 	fuzz.diffCasesInColNames = true
 	fuzz.exerciseSymbols = false
+	fuzz.columnConvertProb = 0.05
 	senderFuzzRunTest(t, srv, senderFuzzLoad{
 		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
 	}, fuzz, r)
@@ -1105,6 +1342,224 @@ func TestQwpFuzzSenderReorderingSkipColumnsWithNonAsciiNoSymbols(t *testing.T) {
 	fuzz.nonAsciiValueFactor = 4
 	fuzz.diffCasesInColNames = true
 	fuzz.exerciseSymbols = false
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+// --- S3 entry points: ALTER COLUMN TYPE in parallel with producers
+//
+// Each test sets a non-zero columnConvertProb which starts the alter
+// loop alongside the producer goroutines. Counts are CI-bounded vs
+// the Java reference; the convertProb values match Java exactly.
+
+// TestQwpFuzzSenderAllMixed is the smoke test for S3: every fuzz
+// dial on at once plus convertProb=0.05 — duplicates, reordering,
+// skip, new-col injection, non-ASCII postfixes, symbols, and the
+// alter loop. If S3 mechanics are wrong, this is the first to fail.
+// Port of Java testAllMixed.
+func TestQwpFuzzSenderAllMixed(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.duplicatesFactor = 3
+	fuzz.columnReorderingFactor = 4
+	fuzz.columnSkipFactor = 5
+	fuzz.newColumnFactor = 10
+	fuzz.nonAsciiValueFactor = 5
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = true
+	fuzz.sendSymbolsWithSpace = true
+	fuzz.columnConvertProb = 0.05
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderAllMixedNoSymbols — Java testAllMixedNoSymbols.
+func TestQwpFuzzSenderAllMixedNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.duplicatesFactor = 3
+	fuzz.columnReorderingFactor = 4
+	fuzz.columnSkipFactor = 5
+	fuzz.newColumnFactor = 10
+	fuzz.nonAsciiValueFactor = 5
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = false
+	fuzz.sendSymbolsWithSpace = true
+	fuzz.columnConvertProb = 0.05
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderAllMixedSingleTable — Java testAllMixedSingleTable
+// (numTables=1, otherwise same as AllMixed).
+func TestQwpFuzzSenderAllMixedSingleTable(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.duplicatesFactor = 3
+	fuzz.columnReorderingFactor = 4
+	fuzz.columnSkipFactor = 5
+	fuzz.newColumnFactor = 10
+	fuzz.nonAsciiValueFactor = 5
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = true
+	fuzz.sendSymbolsWithSpace = true
+	fuzz.columnConvertProb = 0.05
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 1, waitMs: 50,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderAllMixedSplitPart — Java testAllMixedSplitPart.
+// Only newColumnFactor and convertProb are on; everything else off,
+// symbols on (per Java's positional args).
+func TestQwpFuzzSenderAllMixedSplitPart(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.newColumnFactor = 10
+	fuzz.exerciseSymbols = true
+	fuzz.columnConvertProb = 0.05
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 1, waitMs: 50,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderAddColumns — Java testAddColumns (convertProb=0.1).
+func TestQwpFuzzSenderAddColumns(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 1
+	fuzz.columnSkipFactor = 1 + r.Intn(3)
+	fuzz.newColumnFactor = 6
+	fuzz.exerciseSymbols = true
+	fuzz.columnConvertProb = 0.1
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 15 + r.Intn(50), numIterations: 2, numThreads: 3, numTables: 1 + r.Intn(4), waitMs: r.Intn(75),
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderAddColumnsNoSymbols — Java testAddColumnsNoSymbols
+// (convertProb=0.15).
+func TestQwpFuzzSenderAddColumnsNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnSkipFactor = 4
+	fuzz.newColumnFactor = 3
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = false
+	fuzz.columnConvertProb = 0.15
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 15, numIterations: 2, numThreads: 2, numTables: 5, waitMs: 75,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderAddConvertColumns — Java testAddConvertColumns
+// (highest convertProb, 0.2; sendSymbolsWithSpace also on).
+func TestQwpFuzzSenderAddConvertColumns(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnSkipFactor = 4
+	fuzz.exerciseSymbols = true
+	fuzz.sendSymbolsWithSpace = true
+	fuzz.columnConvertProb = 0.2
+	// sendSymbolsWithSpace inflates per-batch wire size like the
+	// LoadSendSymbolsWithSpace test — cap auto-flush rows.
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 15, numIterations: 2, numThreads: 2, numTables: 5, waitMs: 75,
+		clientAutoFlushRows: 5,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderDuplicatesReorderingColumns —
+// Java testDuplicatesReorderingColumns (dup=4, reorder=4, conv=0.05).
+func TestQwpFuzzSenderDuplicatesReorderingColumns(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.duplicatesFactor = 4
+	fuzz.columnReorderingFactor = 4
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = true
+	fuzz.columnConvertProb = 0.05
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderDuplicatesReorderingColumnsNoSymbols —
+// Java testDuplicatesReorderingColumnsNoSymbols.
+func TestQwpFuzzSenderDuplicatesReorderingColumnsNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.duplicatesFactor = 4
+	fuzz.columnReorderingFactor = 4
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = false
+	fuzz.columnConvertProb = 0.05
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderDuplicatesReorderingColumnsSendSymbolsWithSpace —
+// Java testDuplicatesReorderingColumnsSendSymbolsWithSpace.
+func TestQwpFuzzSenderDuplicatesReorderingColumnsSendSymbolsWithSpace(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.duplicatesFactor = 4
+	fuzz.columnReorderingFactor = 4
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = true
+	fuzz.sendSymbolsWithSpace = true
+	fuzz.columnConvertProb = 0.05
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+		clientAutoFlushRows: 5,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderReorderingSkipDuplicateColumnsWithNonAscii —
+// Java testReorderingSkipDuplicateColumnsWithNonAscii.
+func TestQwpFuzzSenderReorderingSkipDuplicateColumnsWithNonAscii(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.duplicatesFactor = 4
+	fuzz.columnReorderingFactor = 4
+	fuzz.columnSkipFactor = 4
+	fuzz.nonAsciiValueFactor = 4
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = true
+	fuzz.columnConvertProb = 0.05
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+// TestQwpFuzzSenderReorderingSkipDuplicateColumnsWithNonAsciiNoSymbols —
+// Java testReorderingSkipDuplicateColumnsWithNonAsciiNoSymbols.
+func TestQwpFuzzSenderReorderingSkipDuplicateColumnsWithNonAsciiNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.duplicatesFactor = 4
+	fuzz.columnReorderingFactor = 4
+	fuzz.columnSkipFactor = 4
+	fuzz.nonAsciiValueFactor = 4
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = false
+	fuzz.columnConvertProb = 0.05
 	senderFuzzRunTest(t, srv, senderFuzzLoad{
 		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
 	}, fuzz, r)
