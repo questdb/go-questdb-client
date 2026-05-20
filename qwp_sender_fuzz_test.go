@@ -57,6 +57,12 @@ package questdb
 //   - Row counts are CI-bounded compared to Java; the property under
 //     test (multi-table multi-thread concurrent ingest, per-type
 //     round-trip across the wire, no row loss) is unchanged.
+//   - The Go QwpSender enforces "no same column twice in one row"
+//     at the client (Java sends both and lets the server apply LWW);
+//     senderFuzzAddColumnValue early-returns on a duplicate key. The
+//     duplicatesFactor mechanic therefore reduces to a no-op at the
+//     wire level in Go; we still record the first value in the
+//     oracle, so the read-back matches what actually landed.
 //   - Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
 //
 // Backlog (out of scope for S1):
@@ -107,10 +113,9 @@ const (
 // senderFuzzLegacyColumnCount: the first 6 entries in the column
 // catalog are STRING/DOUBLE (the legacy ILP types the original Java
 // test grew out of). The 8 typed columns that follow are always set
-// on every row (no skip/new-col injection) — relevant once the
-// schema-evolution slice lands.
-//
-//lint:ignore U1000 consumed by the column-skip / new-column slice (S2): skipColumns and addNewColumn restrict the eligible pool to indices < senderFuzzLegacyColumnCount
+// on every row — skipColumns / addNewColumn restrict their eligible
+// pool to legacy indexes so an unset typed cell never appears in
+// the oracle (cf. file header note on type-default rendering).
 const senderFuzzLegacyColumnCount = 6
 
 // senderFuzzNewColumnRandomizeFactor is the postfix range for
@@ -164,6 +169,14 @@ var senderFuzzSymbolNameBases = [][]string{
 
 var senderFuzzSymbolValueBases = []string{"us-midwest", "London"}
 
+// senderFuzzNonAsciiChars spans the BMP byte-length spectrum (2/3
+// byte UTF-8) so the wire path exercises multi-byte encoding without
+// touching the surrogate pair edge cases — mirrors Java's
+// nonAsciiChars (no astral plane chars; all single Go runes).
+var senderFuzzNonAsciiChars = []rune{
+	'ó', 'í', 'Á', 'ч', 'Ъ', 'Ж', 'ю', 0x3000, 0x3080, 0x3a55,
+}
+
 const senderFuzzBatchSize = 10
 
 // senderFuzzTableNameRandomizeFactor controls the random table-name
@@ -171,6 +184,16 @@ const senderFuzzBatchSize = 10
 // resolves table names case-insensitively, so both forms target the
 // same table.
 const senderFuzzTableNameRandomizeFactor = 2
+
+// senderFuzzMaxNumOfSkippedCols caps how many legacy STRING/DOUBLE
+// columns the skipColumns fuzz may remove from one row (Java
+// MAX_NUM_OF_SKIPPED_COLS). Typed columns are never eligible.
+const senderFuzzMaxNumOfSkippedCols = 2
+
+// senderFuzzSymbolsWithSpaceRandomizeFactor: when sendSymbolsWithSpace
+// is on, ~50% of symbol value emissions get double-spaces injected at
+// a random position. Mirrors Java SEND_SYMBOLS_WITH_SPACE_RANDOMIZE_FACTOR.
+const senderFuzzSymbolsWithSpaceRandomizeFactor = 2
 
 // --- per-row data + per-table oracle ------------------------------
 
@@ -203,20 +226,28 @@ func newSenderFuzzRow(ts int64) *senderFuzzRow {
 
 // senderFuzzTable is the per-table oracle: rows appended in producer
 // order under a lock (concurrent producers can hit the same table),
-// then sorted by ts at assertion time to match `ORDER BY ts`.
+// then sorted by ts at assertion time to match `ORDER BY ts`. The
+// colNames set is the union of every column ever written across the
+// table's rows — the assertion uses it to verify that columns the
+// schema has but a particular row didn't write are NULL on read-back
+// (matches Java's TableData.generateRows NULL-fill behaviour).
 type senderFuzzTable struct {
-	mu   sync.Mutex
-	name string // canonical lowercase
-	rows []*senderFuzzRow
+	mu       sync.Mutex
+	name     string // canonical lowercase
+	rows     []*senderFuzzRow
+	colNames map[string]struct{}
 }
 
 func newSenderFuzzTable(name string) *senderFuzzTable {
-	return &senderFuzzTable{name: name}
+	return &senderFuzzTable{name: name, colNames: make(map[string]struct{}, 32)}
 }
 
 func (t *senderFuzzTable) addRow(r *senderFuzzRow) {
 	t.mu.Lock()
 	t.rows = append(t.rows, r)
+	for k := range r.cells {
+		t.colNames[k] = struct{}{}
+	}
 	t.mu.Unlock()
 }
 
@@ -241,12 +272,18 @@ func (t *senderFuzzTable) snapshotRowsSorted() []*senderFuzzRow {
 // senderFuzzLoad mirrors Java initLoadParameters. Each producer
 // runs numIterations × numLines rows distributed across numTables
 // tables, with an optional sleep between iterations.
+//
+// clientAutoFlushRows, when > 0, adds auto_flush_rows=N to the QWP
+// connect string so the sender flushes every N rows. Used by tests
+// whose fuzz config inflates per-batch frame size past the default
+// server recv buffer (mirrors Java's clientAutoFlushRows).
 type senderFuzzLoad struct {
-	numLines      int
-	numIterations int
-	numThreads    int
-	numTables     int
-	waitMs        int
+	numLines           int
+	numIterations      int
+	numThreads         int
+	numTables          int
+	waitMs             int
+	clientAutoFlushRows int
 }
 
 // senderFuzzFuzz mirrors Java initFuzzParameters. -1 means "off"
@@ -279,6 +316,13 @@ func defaultSenderFuzzFuzz() senderFuzzFuzz {
 }
 
 // --- generation helpers -------------------------------------------
+
+// senderFuzzShouldFuzz: a fuzz factor of -1 (or 0) means "off"; any
+// positive N fires the fuzz on ~1/N of calls. Mirrors Java
+// shouldFuzz.
+func senderFuzzShouldFuzz(rnd *rand.Rand, factor int) bool {
+	return factor > 0 && rnd.Intn(factor) == 0
+}
 
 // senderFuzzGenerateName picks one case variant for a column /
 // symbol name. Used both for catalogued names and for the
@@ -317,9 +361,16 @@ func senderFuzzPickTableName(numTables int, rnd *rand.Rand) string {
 }
 
 // senderFuzzPostfixChar returns the single-character suffix appended
-// to STRING/SYMBOL value bases. S1 keeps it ASCII for stability;
-// the future non-ASCII slice flips this on senderFuzzFuzz.nonAsciiValueFactor.
-func senderFuzzPostfixChar(_ senderFuzzFuzz, rnd *rand.Rand) string {
+// to STRING/SYMBOL value bases. With nonAsciiValueFactor > 0, a
+// matching ratio of calls returns a BMP non-ASCII char from the
+// catalog (2/3-byte UTF-8) — exercises multi-byte encoding on the
+// wire. Otherwise a printable-ASCII letter (Java emits a random
+// BMP char; the surrogate edge cases that fragility implies aren't
+// the property under test).
+func senderFuzzPostfixChar(fuzz senderFuzzFuzz, rnd *rand.Rand) string {
+	if senderFuzzShouldFuzz(rnd, fuzz.nonAsciiValueFactor) {
+		return string(senderFuzzNonAsciiChars[rnd.Intn(len(senderFuzzNonAsciiChars))])
+	}
 	return string(rune('A' + rnd.Intn(26)))
 }
 
@@ -338,6 +389,17 @@ func senderFuzzAddColumnValue(
 	rnd *rand.Rand,
 ) {
 	key := strings.ToLower(colName)
+	// Go-divergence vs Java: the Go QwpSender enforces "no same column
+	// twice in one row" at the client side (Java sends both writes
+	// and lets the server apply LWW). Skip the second emission and
+	// keep the first value in the oracle to match the wire reality.
+	// Affects: the duplicatesFactor mechanic becomes a client-side
+	// no-op; addNewColumn / addNewSymbol attempts that collide on the
+	// generated random postfix likewise skip. Documented in the file
+	// header.
+	if _, exists := row.cells[key]; exists {
+		return
+	}
 	switch typ {
 	case sftDouble:
 		base, _ := strconv.Atoi(valueBase)
@@ -349,7 +411,14 @@ func senderFuzzAddColumnValue(
 		qs.StringColumn(colName, s)
 		row.cells[key] = senderFuzzCell{typ: typ, s: s}
 	case sftSymbol:
-		s := valueBase + senderFuzzPostfixChar(fuzz, rnd)
+		base := valueBase
+		if fuzz.sendSymbolsWithSpace && rnd.Intn(senderFuzzSymbolsWithSpaceRandomizeFactor) == 0 && len(base) > 1 {
+			// Inject double-space at a random interior position
+			// (mirrors Java sendSymbolsWithSpace branch).
+			spaceIdx := rnd.Intn(len(base) - 1)
+			base = base[:spaceIdx] + "  " + base[spaceIdx:]
+		}
+		s := base + senderFuzzPostfixChar(fuzz, rnd)
 		qs.Symbol(colName, s)
 		row.cells[key] = senderFuzzCell{typ: typ, s: s}
 	case sftByte:
@@ -411,13 +480,109 @@ func senderFuzzAddColumnValue(
 	}
 }
 
+// senderFuzzGenerateOrdering returns either the identity ordering or
+// a shuffled permutation of [0..n), depending on columnReorderingFactor.
+// Mirrors Java generateOrdering.
+func senderFuzzGenerateOrdering(n, factor int, rnd *rand.Rand) []int {
+	out := make([]int, n)
+	for i := 0; i < n; i++ {
+		out[i] = i
+	}
+	if senderFuzzShouldFuzz(rnd, factor) {
+		rnd.Shuffle(n, func(i, j int) { out[i], out[j] = out[j], out[i] })
+	}
+	return out
+}
+
+// senderFuzzSkipColumns optionally removes 1..senderFuzzMaxNumOfSkippedCols
+// legacy STRING/DOUBLE indexes (those < senderFuzzLegacyColumnCount)
+// from the ordering. Typed columns are never eligible: an unset
+// typed cell renders differently from its type-default sentinel, so
+// skipping one would clash with the oracle's "absent → NULL"
+// assertion once the future ALTER slice converts types across the
+// integer family. Mirrors Java skipColumns.
+func senderFuzzSkipColumns(orig []int, factor int, rnd *rand.Rand) []int {
+	if !senderFuzzShouldFuzz(rnd, factor) {
+		return orig
+	}
+	out := append([]int(nil), orig...)
+	numToSkip := rnd.Intn(senderFuzzMaxNumOfSkippedCols) + 1
+	for i := 0; i < numToSkip; i++ {
+		// Count legacy-eligible entries still in the slice.
+		eligible := 0
+		for _, idx := range out {
+			if idx < senderFuzzLegacyColumnCount {
+				eligible++
+			}
+		}
+		if eligible == 0 {
+			break
+		}
+		target := rnd.Intn(eligible)
+		for j := 0; j < len(out); j++ {
+			if out[j] < senderFuzzLegacyColumnCount {
+				if target == 0 {
+					out = append(out[:j], out[j+1:]...)
+					break
+				}
+				target--
+			}
+		}
+	}
+	return out
+}
+
+// senderFuzzAddDuplicateColumn re-emits the same column (same name)
+// with a freshly random value when duplicatesFactor fires. Server
+// resolves duplicates per row as last-write-wins; the oracle's
+// row.cells map naturally overwrites the prior cell.
+func senderFuzzAddDuplicateColumn(colIdx int, colName string, qs QwpSender, row *senderFuzzRow, fuzz senderFuzzFuzz, rnd *rand.Rand) {
+	if !senderFuzzShouldFuzz(rnd, fuzz.duplicatesFactor) {
+		return
+	}
+	senderFuzzAddColumnValue(senderFuzzColTypes[colIdx], senderFuzzColValueBases[colIdx],
+		colName, qs, row, fuzz, rnd)
+}
+
+func senderFuzzAddDuplicateSymbol(symIdx int, symName string, qs QwpSender, row *senderFuzzRow, fuzz senderFuzzFuzz, rnd *rand.Rand) {
+	if !senderFuzzShouldFuzz(rnd, fuzz.duplicatesFactor) {
+		return
+	}
+	senderFuzzAddColumnValue(sftSymbol, senderFuzzSymbolValueBases[symIdx],
+		symName, qs, row, fuzz, rnd)
+}
+
+// senderFuzzAddNewColumn picks a random legacy column slot, generates
+// a name with a numeric postfix (so it doesn't collide with the
+// catalogued name), emits its value, and records it. The server
+// auto-adds the column to the table on first write; rows that
+// didn't emit it appear as NULL on read.
+func senderFuzzAddNewColumn(qs QwpSender, row *senderFuzzRow, fuzz senderFuzzFuzz, rnd *rand.Rand) {
+	if !senderFuzzShouldFuzz(rnd, fuzz.newColumnFactor) {
+		return
+	}
+	extraColIdx := rnd.Intn(senderFuzzLegacyColumnCount)
+	colName := senderFuzzGenerateColumnName(extraColIdx, true, fuzz, rnd)
+	senderFuzzAddColumnValue(senderFuzzColTypes[extraColIdx], senderFuzzColValueBases[extraColIdx],
+		colName, qs, row, fuzz, rnd)
+}
+
+func senderFuzzAddNewSymbol(qs QwpSender, row *senderFuzzRow, fuzz senderFuzzFuzz, rnd *rand.Rand) {
+	if !senderFuzzShouldFuzz(rnd, fuzz.newColumnFactor) {
+		return
+	}
+	extraSymIdx := rnd.Intn(len(senderFuzzSymbolNameBases))
+	symName := senderFuzzGenerateSymbolName(extraSymIdx, true, fuzz, rnd)
+	senderFuzzAddColumnValue(sftSymbol, senderFuzzSymbolValueBases[extraSymIdx],
+		symName, qs, row, fuzz, rnd)
+}
+
 // senderFuzzEmitRow emits one row through the QWP sender + records
 // it in the oracle. Symbols first (the QWP ordering invariant the
-// ingress-oracle ports already document), then columns.
-//
-// S1 default fuzz: no reorder / no skip / no dup / no new-col —
-// every catalogued column and every catalogued symbol is emitted
-// once per row, in the catalogued order.
+// ingress-oracle ports already document), then columns. Each symbol
+// /column emission may be followed by a same-cell duplicate and a
+// brand-new injected column, depending on the duplicatesFactor /
+// newColumnFactor settings — faithful to Java generateLine.
 func senderFuzzEmitRow(
 	tableName string,
 	qs QwpSender,
@@ -427,16 +592,29 @@ func senderFuzzEmitRow(
 ) {
 	qs.Table(tableName)
 	if fuzz.exerciseSymbols {
-		for symIdx := range senderFuzzSymbolNameBases {
-			colName := senderFuzzGenerateSymbolName(symIdx, false, fuzz, rnd)
+		symIndexes := senderFuzzSkipColumns(
+			senderFuzzGenerateOrdering(len(senderFuzzSymbolNameBases), fuzz.columnReorderingFactor, rnd),
+			fuzz.columnSkipFactor, rnd)
+		// Note: skipColumns only removes *legacy* indexes; symbol
+		// indexes are 0/1 (always < legacy threshold) so they ARE
+		// eligible for skip in Java — preserve that here.
+		for _, symIdx := range symIndexes {
+			symName := senderFuzzGenerateSymbolName(symIdx, false, fuzz, rnd)
 			senderFuzzAddColumnValue(sftSymbol, senderFuzzSymbolValueBases[symIdx],
-				colName, qs, row, fuzz, rnd)
+				symName, qs, row, fuzz, rnd)
+			senderFuzzAddDuplicateSymbol(symIdx, symName, qs, row, fuzz, rnd)
+			senderFuzzAddNewSymbol(qs, row, fuzz, rnd)
 		}
 	}
-	for colIdx := range senderFuzzColNameBases {
+	colIndexes := senderFuzzSkipColumns(
+		senderFuzzGenerateOrdering(len(senderFuzzColNameBases), fuzz.columnReorderingFactor, rnd),
+		fuzz.columnSkipFactor, rnd)
+	for _, colIdx := range colIndexes {
 		colName := senderFuzzGenerateColumnName(colIdx, false, fuzz, rnd)
 		senderFuzzAddColumnValue(senderFuzzColTypes[colIdx], senderFuzzColValueBases[colIdx],
 			colName, qs, row, fuzz, rnd)
+		senderFuzzAddDuplicateColumn(colIdx, colName, qs, row, fuzz, rnd)
+		senderFuzzAddNewColumn(qs, row, fuzz, rnd)
 	}
 }
 
@@ -488,6 +666,9 @@ func senderFuzzRunTest(t *testing.T, srv *qwpFuzzServer, load senderFuzzLoad, fu
 			tRnd := rand.New(rand.NewSource(seed))
 			ctx := context.Background()
 			conf := fmt.Sprintf("ws::addr=%s;", srv.wsAddr())
+			if load.clientAutoFlushRows > 0 {
+				conf += fmt.Sprintf("auto_flush_rows=%d;", load.clientAutoFlushRows)
+			}
 			sctx, scancel := context.WithTimeout(context.Background(), 15*time.Second)
 			ls, err := LineSenderFromConf(sctx, conf)
 			scancel()
@@ -548,8 +729,12 @@ func senderFuzzRunTest(t *testing.T, srv *qwpFuzzServer, load senderFuzzLoad, fu
 
 	// Wait for WAL apply per table that has rows, then assert.
 	for _, tbl := range oracles {
-		if tbl.size() > 0 {
-			srv.awaitRows(t, tbl.name, tbl.size(), 180*time.Second)
+		if tbl.size() == 0 {
+			continue
+		}
+		if !senderFuzzPollRows(t, srv, tbl.name, tbl.size(), 60*time.Second) {
+			t.Logf("server log tail (8K):\n%s", srv.tailLog(8000))
+			t.Fatalf("table %q did not reach %d rows", tbl.name, tbl.size())
 		}
 	}
 
@@ -616,11 +801,59 @@ func senderFuzzAssertTable(t *testing.T, qc *QwpQueryClient, tbl *senderFuzzTabl
 				}
 				senderFuzzAssertCell(t, batch, ci, br, tbl.name, row.ts, name, cell)
 			}
+			// Columns the table schema has (because some OTHER row
+			// wrote them) but THIS row didn't write must be NULL on
+			// read-back — mirrors Java TableData.generateRows's
+			// NULL-fill behaviour.
+			tbl.mu.Lock()
+			absent := make([]string, 0, 4)
+			for name := range tbl.colNames {
+				if _, set := row.cells[name]; !set {
+					absent = append(absent, name)
+				}
+			}
+			tbl.mu.Unlock()
+			for _, name := range absent {
+				ci, present := colIdx[name]
+				if !present {
+					continue
+				}
+				if !batch.IsNull(ci, br) {
+					t.Fatalf("table %q row ts=%d col %q: expected NULL (unset by this row), got non-null",
+						tbl.name, row.ts, name)
+				}
+			}
 		}
 	}
 	if rowIdx != len(want) {
 		t.Fatalf("table %q: oracle holds %d rows, query returned %d",
 			tbl.name, len(want), rowIdx)
+	}
+}
+
+// senderFuzzPollRows is awaitRows with diagnostic-friendly return
+// semantics (bool, doesn't t.Fatalf) so the caller can dump the
+// server log on timeout.
+func senderFuzzPollRows(t *testing.T, srv *qwpFuzzServer, table string, want int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	q := fmt.Sprintf("SELECT count() FROM '%s'", table)
+	var lastN int64
+	for {
+		res, err := srv.execSQL(q)
+		if err == nil && len(res.Dataset) == 1 && len(res.Dataset[0]) == 1 {
+			if n, ok := toInt64(res.Dataset[0][0]); ok {
+				lastN = n
+				if n >= int64(want) {
+					return true
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Logf("table %q: %d / %d rows after %s", table, lastN, want, timeout)
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -697,4 +930,182 @@ func TestQwpFuzzSenderLoad(t *testing.T) {
 	senderFuzzRunTest(t, srv, senderFuzzLoad{
 		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 20,
 	}, defaultSenderFuzzFuzz(), r)
+}
+
+// --- S2 fuzz variants ---------------------------------------------
+//
+// Each test calls senderFuzzRunTest with a different (load, fuzz)
+// configuration; the runner itself is unchanged. Counts are
+// CI-bounded vs Java. Java enables convertProb=0.05 (ALTER COLUMN
+// TYPE) on most of these via the 7-arg initFuzzParameters overload;
+// the Go ports set convertProb=0 — the ALTER concurrent thread
+// lands as a dedicated S3 slice (see file header). The fuzz
+// mechanics under test here (reorder / skip / dup / new-col /
+// non-ASCII / diff-case / sendSymbolsWithSpace) are exercised in
+// isolation, on a stable schema.
+
+func TestQwpFuzzSenderLoadLargePayload(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 200, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 10,
+	}, defaultSenderFuzzFuzz(), r)
+}
+
+func TestQwpFuzzSenderLoadNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.nonAsciiValueFactor = 5
+	fuzz.exerciseSymbols = false
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 20,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderLoadSendSymbolsWithSpace(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.newColumnFactor = 2
+	fuzz.sendSymbolsWithSpace = true
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 20,
+		clientAutoFlushRows: 5,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderCaseVariationReorderingColumns(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 4
+	fuzz.newColumnFactor = 2
+	fuzz.diffCasesInColNames = true
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderCaseVariationReorderingColumnsNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 4
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = false
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderCaseVariationReorderingColumnsSendSymbolsWithSpace(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 4
+	fuzz.newColumnFactor = 3
+	fuzz.diffCasesInColNames = true
+	fuzz.sendSymbolsWithSpace = true
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+		clientAutoFlushRows: 5,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderNonAsciiValues(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.newColumnFactor = 3
+	fuzz.nonAsciiValueFactor = 4
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderNonAsciiValuesNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.nonAsciiValueFactor = 4
+	fuzz.exerciseSymbols = false
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderReorderingColumns(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 4
+	fuzz.nonAsciiValueFactor = 8
+	fuzz.sendSymbolsWithSpace = true
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderReorderingColumnsNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 4
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = false
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderReorderingManyThreads(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 3
+	fuzz.newColumnFactor = 2
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 40, numIterations: 2, numThreads: 5, numTables: 3, waitMs: 30,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderReorderingNonAscii(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 4
+	fuzz.newColumnFactor = 2
+	fuzz.nonAsciiValueFactor = 4
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderReorderingSkipColumnsWithNonAscii(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 4
+	fuzz.columnSkipFactor = 4
+	fuzz.newColumnFactor = 2
+	fuzz.nonAsciiValueFactor = 4
+	fuzz.diffCasesInColNames = true
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
+}
+
+func TestQwpFuzzSenderReorderingSkipColumnsWithNonAsciiNoSymbols(t *testing.T) {
+	srv := fuzzServer(t)
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	fuzz.columnReorderingFactor = 4
+	fuzz.columnSkipFactor = 4
+	fuzz.nonAsciiValueFactor = 4
+	fuzz.diffCasesInColNames = true
+	fuzz.exerciseSymbols = false
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 50,
+	}, fuzz, r)
 }
