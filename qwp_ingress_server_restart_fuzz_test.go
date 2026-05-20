@@ -181,10 +181,13 @@ func restartFuzzAssertDistinctIds(t *testing.T, srv *qwpFuzzServer, expected int
 	if len(res.Dataset) != 1 || len(res.Dataset[0]) != 4 {
 		t.Fatalf("distinct-id assert: unexpected shape %+v", res.Dataset)
 	}
-	c, _ := toInt64(res.Dataset[0][0])
-	d, _ := toInt64(res.Dataset[0][1])
-	lo, _ := toInt64(res.Dataset[0][2])
-	hi, _ := toInt64(res.Dataset[0][3])
+	c, okC := toInt64(res.Dataset[0][0])
+	d, okD := toInt64(res.Dataset[0][1])
+	lo, okLo := toInt64(res.Dataset[0][2])
+	hi, okHi := toInt64(res.Dataset[0][3])
+	if !okC || !okD || !okLo || !okHi {
+		t.Fatalf("distinct-id assert: non-numeric cell in %+v", res.Dataset[0])
+	}
 	if c != expected || d != expected || lo != 0 || hi != expected-1 {
 		t.Fatalf("distinct-id mismatch: want c=%d d=%d lo=0 hi=%d, got c=%d d=%d lo=%d hi=%d",
 			expected, expected, expected-1, c, d, lo, hi)
