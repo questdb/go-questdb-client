@@ -740,20 +740,30 @@ func (s *qwpFuzzServer) dropAllTables(t *testing.T) {
 
 // awaitRows polls until `table` has at least `want` rows or the deadline
 // passes. Replaces the Java tests' in-process engine.awaitTable / WAL
-// drain, which a network client cannot do.
+// drain, which a network client cannot do. The last execSQL error (if
+// any) is surfaced in the timeout message so "server unreachable the
+// whole window" is distinguishable from "WAL never caught up".
 func (s *qwpFuzzServer) awaitRows(t *testing.T, table string, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	q := fmt.Sprintf("SELECT count() FROM '%s'", table)
+	var lastN int64
+	var lastErr error
 	for {
 		res, err := s.execSQL(q)
-		if err == nil && len(res.Dataset) == 1 && len(res.Dataset[0]) == 1 {
-			if n, ok := toInt64(res.Dataset[0][0]); ok && n >= int64(want) {
-				return
+		if err != nil {
+			lastErr = err
+		} else if len(res.Dataset) == 1 && len(res.Dataset[0]) == 1 {
+			if n, ok := toInt64(res.Dataset[0][0]); ok {
+				lastN = n
+				if n >= int64(want) {
+					return
+				}
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timeout: table %q did not reach %d rows within %s", table, want, timeout)
+			t.Fatalf("timeout: table %q reached %d / %d rows within %s (last execSQL err: %v)",
+				table, lastN, want, timeout, lastErr)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

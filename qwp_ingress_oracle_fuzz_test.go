@@ -791,17 +791,22 @@ func oraclePickSfMaxBytes(r *rand.Rand) int64 {
 // oracleSfDirSize sums every file under dir. The Go SF slot lives at
 // <sf_dir>/<sender_id>/...; Java asserts <sf_dir>/default. Summing the
 // whole tree is faithful to the intent (slot purged after clean close)
-// and robust to the exact nesting.
-func oracleSfDirSize(dir string) int64 {
+// and robust to the exact nesting. Walk errors are returned so callers
+// fail fast — silently returning 0 would let "sz > capBytes" pass
+// vacuously when the directory was unreadable.
+func oracleSfDirSize(dir string) (int64, error) {
 	var total int64
-	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
+	err := filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
 			return nil
 		}
 		total += info.Size()
 		return nil
 	})
-	return total
+	return total, err
 }
 
 // oracleSenderFromConf builds a QwpSender from a hand-assembled connect
@@ -987,7 +992,11 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 	// normal — Java's slotCapFor is sf_max_bytes + 256 KiB.
 	capBytes := sfMaxBytes + 256*1024
 	for p, dir := range sfDirs {
-		if sz := oracleSfDirSize(dir); sz > capBytes {
+		sz, err := oracleSfDirSize(dir)
+		if err != nil {
+			t.Fatalf("producer %d sf_dir %q: walk failed: %v", p, dir, err)
+		}
+		if sz > capBytes {
 			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
 				p, dir, sz, capBytes)
 		}
@@ -1198,7 +1207,11 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	// rotated segments. Java's slotCapFor: sf_max_bytes + 256 KiB.
 	capBytes := sfMaxBytes + 256*1024
 	for p, dir := range sfDirs {
-		if sz := oracleSfDirSize(dir); sz > capBytes {
+		sz, err := oracleSfDirSize(dir)
+		if err != nil {
+			t.Fatalf("producer %d sf_dir %q: walk failed: %v", p, dir, err)
+		}
+		if sz > capBytes {
 			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
 				p, dir, sz, capBytes)
 		}
@@ -1401,7 +1414,11 @@ func TestQwpFuzzIngressOracleSenderRestartReplay(t *testing.T) {
 
 	capBytes := sfMaxBytes + 256*1024
 	for p, dir := range sfDirs {
-		if sz := oracleSfDirSize(dir); sz > capBytes {
+		sz, err := oracleSfDirSize(dir)
+		if err != nil {
+			t.Fatalf("producer %d sf_dir %q: walk failed: %v", p, dir, err)
+		}
+		if sz > capBytes {
 			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
 				p, dir, sz, capBytes)
 		}
@@ -1618,7 +1635,11 @@ func TestQwpFuzzIngressOracleAsyncConnectQueues(t *testing.T) {
 
 	capBytes := sfMaxBytes + 256*1024
 	for p, dir := range sfDirs {
-		if sz := oracleSfDirSize(dir); sz > capBytes {
+		sz, err := oracleSfDirSize(dir)
+		if err != nil {
+			t.Fatalf("producer %d sf_dir %q: walk failed: %v", p, dir, err)
+		}
+		if sz > capBytes {
 			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
 				p, dir, sz, capBytes)
 		}

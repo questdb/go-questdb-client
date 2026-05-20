@@ -1054,15 +1054,20 @@ func senderFuzzAssertTable(t *testing.T, qc *QwpQueryClient, tbl *senderFuzzTabl
 
 // senderFuzzPollRows is awaitRows with diagnostic-friendly return
 // semantics (bool, doesn't t.Fatalf) so the caller can dump the
-// server log on timeout.
+// server log on timeout. The last execSQL error (if any) is surfaced
+// in the timeout log so "server unreachable the whole window" is
+// distinguishable from "WAL never caught up" before reading the tail.
 func senderFuzzPollRows(t *testing.T, srv *qwpFuzzServer, table string, want int, timeout time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	q := fmt.Sprintf("SELECT count() FROM '%s'", table)
 	var lastN int64
+	var lastErr error
 	for {
 		res, err := srv.execSQL(q)
-		if err == nil && len(res.Dataset) == 1 && len(res.Dataset[0]) == 1 {
+		if err != nil {
+			lastErr = err
+		} else if len(res.Dataset) == 1 && len(res.Dataset[0]) == 1 {
 			if n, ok := toInt64(res.Dataset[0][0]); ok {
 				lastN = n
 				if n >= int64(want) {
@@ -1071,7 +1076,8 @@ func senderFuzzPollRows(t *testing.T, srv *qwpFuzzServer, table string, want int
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Logf("table %q: %d / %d rows after %s", table, lastN, want, timeout)
+			t.Logf("table %q: %d / %d rows after %s (last execSQL err: %v)",
+				table, lastN, want, timeout, lastErr)
 			return false
 		}
 		time.Sleep(100 * time.Millisecond)

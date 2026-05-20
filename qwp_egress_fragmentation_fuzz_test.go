@@ -50,7 +50,6 @@ package questdb
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -168,7 +167,7 @@ func TestQwpFuzzEgressFragmentedBackToBackQueries(t *testing.T) {
 		"TIMESTAMP(ts) PARTITION BY DAY WAL")
 	srv.mustExec(t, "INSERT INTO btb SELECT x, CAST(x * 2.5 AS DOUBLE), x::TIMESTAMP "+
 		"FROM long_sequence(8000)")
-	awaitTableRowsViaCount(t, srv, "btb", 8000, 60*time.Second)
+	srv.awaitRows(t, "btb", 8000, 60*time.Second)
 
 	c := fragFuzzNewClient(t, srv, "")
 	for q := 0; q < 5; q++ {
@@ -191,7 +190,7 @@ func TestQwpFuzzEgressFragmentedCreditFlow(t *testing.T) {
 	srv.mustExec(t,
 		"CREATE TABLE cf AS (SELECT x AS id, x::TIMESTAMP AS ts FROM long_sequence(20000)) "+
 			"TIMESTAMP(ts) PARTITION BY DAY WAL")
-	awaitTableRowsViaCount(t, srv, "cf", 20_000, 60*time.Second)
+	srv.awaitRows(t, "cf", 20_000, 60*time.Second)
 
 	c := fragFuzzNewClient(t, srv, "initial_credit=2048;")
 	fragFuzzRunAndVerify(t, c, "cf", 20_000)
@@ -212,7 +211,7 @@ func TestQwpFuzzEgressFragmentedStreamingBigResult(t *testing.T) {
 			"CAST('s_' || (x % 100) AS SYMBOL) AS s, "+
 			"x::TIMESTAMP AS ts "+
 			"FROM long_sequence(50000)) TIMESTAMP(ts) PARTITION BY DAY WAL")
-	awaitTableRowsViaCount(t, srv, "bigt", 50_000, 90*time.Second)
+	srv.awaitRows(t, "bigt", 50_000, 90*time.Second)
 
 	c := fragFuzzNewClient(t, srv, "")
 	fragFuzzRunAndVerify(t, c, "bigt", 50_000)
@@ -230,36 +229,8 @@ func TestQwpFuzzEgressHandshakeSurvivesMicroChunk(t *testing.T) {
 	srv.mustExec(t, "CREATE TABLE tiny(id LONG, ts TIMESTAMP) "+
 		"TIMESTAMP(ts) PARTITION BY DAY WAL")
 	srv.mustExec(t, "INSERT INTO tiny SELECT x, x::TIMESTAMP FROM long_sequence(3)")
-	awaitTableRowsViaCount(t, srv, "tiny", 3, 60*time.Second)
+	srv.awaitRows(t, "tiny", 3, 60*time.Second)
 
 	c := fragFuzzNewClient(t, srv, "")
 	fragFuzzRunAndVerify(t, c, "tiny", 3)
-}
-
-// awaitTableRowsViaCount polls SELECT count() until the table reports
-// at least `want` rows (mirrors engine.awaitTable in Java's in-process
-// tests, but via the public /exec endpoint). Fragmentation knobs slow
-// the WAL-apply rate enough that a tight inline assertion races; this
-// helper keeps row-count expectations stable across chunk sizes.
-func awaitTableRowsViaCount(t *testing.T, srv *qwpFuzzServer, table string, want int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	sql := fmt.Sprintf("SELECT count() FROM '%s'", table)
-	var lastN int64
-	for {
-		res, err := srv.execSQL(sql)
-		if err == nil && len(res.Dataset) == 1 && len(res.Dataset[0]) == 1 {
-			if n, ok := toInt64(res.Dataset[0][0]); ok {
-				lastN = n
-				if n >= int64(want) {
-					return
-				}
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("table %q did not reach %d rows within %s (last %d)",
-				table, want, timeout, lastN)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 }

@@ -135,15 +135,20 @@ func restartFuzzRunOneSender(t *testing.T, srv *qwpFuzzServer, sfDir string,
 // restartFuzzAssertRowCount polls the table until count() reaches the
 // expected value or the deadline elapses; matches WAL apply being
 // asynchronous in QuestDB. Mirrors Java's assertRowCount + the
-// engine.awaitTable wait pattern.
+// engine.awaitTable wait pattern. The last execSQL error (if any) is
+// surfaced on timeout so "server unreachable the whole window" is
+// distinguishable from "WAL never caught up".
 func restartFuzzAssertRowCount(t *testing.T, srv *qwpFuzzServer, expected int64, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	q := "SELECT count() FROM " + restartFuzzTableName
 	var lastN int64
+	var lastErr error
 	for {
 		res, err := srv.execSQL(q)
-		if err == nil && len(res.Dataset) == 1 && len(res.Dataset[0]) == 1 {
+		if err != nil {
+			lastErr = err
+		} else if len(res.Dataset) == 1 && len(res.Dataset[0]) == 1 {
 			if n, ok := toInt64(res.Dataset[0][0]); ok {
 				lastN = n
 				if n == expected {
@@ -155,8 +160,8 @@ func restartFuzzAssertRowCount(t *testing.T, srv *qwpFuzzServer, expected int64,
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("row count did not reach %d within %s (last seen %d)",
-				expected, timeout, lastN)
+			t.Fatalf("row count did not reach %d within %s (last seen %d, last execSQL err: %v)",
+				expected, timeout, lastN, lastErr)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
