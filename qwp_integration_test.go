@@ -46,7 +46,7 @@ const (
 // qwpTestAddr is the host:port the QWP integration tests target. It
 // used to be a const pinned to localhost:9000 (a developer's live
 // server), which caused these tests to silently skip in CI where no
-// such server runs. qwpSkipIfNoServer now boots the shared fuzz
+// such server runs. qwpEnsureServer now boots the shared fuzz
 // fixture and writes the fixture's address here, so the same tests
 // run against a real QuestDB under qwp-fuzz.yml (and any QDB_FUZZ_ADDR
 // the developer points at on their machine, including localhost:9000).
@@ -67,7 +67,7 @@ type qwpColumnInfo struct {
 	Type string `json:"type"`
 }
 
-// qwpSkipIfNoServer ensures a real QuestDB is reachable for the
+// qwpEnsureServer ensures a real QuestDB is reachable for the
 // caller's integration test and writes its host:port into the
 // package-level qwpTestAddr.
 //
@@ -81,7 +81,7 @@ type qwpColumnInfo struct {
 //
 // As a side effect the caller's subsequent qwpQuery / qwpDropTable /
 // "ws://"+qwpTestAddr connect strings all target the resolved server.
-func qwpSkipIfNoServer(t *testing.T) {
+func qwpEnsureServer(t *testing.T) {
 	t.Helper()
 	srv := fuzzServer(t)
 	qwpTestAddr = srv.wsAddr()
@@ -158,7 +158,7 @@ func qwpWaitForRows(t *testing.T, tableName string, expectedRows int) qwpTableRe
 // --- Basic integration test ---
 
 func TestQwpIntegrationBasicTypes(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_basic_types"
@@ -229,7 +229,7 @@ func TestQwpIntegrationBasicTypes(t *testing.T) {
 // --- Multi-row, multi-flush test ---
 
 func TestQwpIntegrationMultipleFlushes(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_multi_flush"
@@ -283,7 +283,7 @@ func TestQwpIntegrationMultipleFlushes(t *testing.T) {
 // --- Symbol deduplication test ---
 
 func TestQwpIntegrationSymbolDedup(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_symbol_dedup"
@@ -331,7 +331,7 @@ func TestQwpIntegrationSymbolDedup(t *testing.T) {
 // --- Multi-table batch test ---
 
 func TestQwpIntegrationMultiTable(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	table1 := "qwp_integ_multi_t1"
@@ -380,7 +380,7 @@ func TestQwpIntegrationMultiTable(t *testing.T) {
 // --- Large batch test ---
 
 func TestQwpIntegrationLargeBatch(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_large_batch"
@@ -422,7 +422,7 @@ func TestQwpIntegrationLargeBatch(t *testing.T) {
 // --- Config string creation test ---
 
 func TestQwpIntegrationFromConf(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_from_conf"
@@ -461,7 +461,7 @@ func TestQwpIntegrationFromConf(t *testing.T) {
 // --- Async mode integration test ---
 
 func TestQwpIntegrationAsyncMode(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_async"
@@ -507,7 +507,7 @@ func TestQwpIntegrationAsyncMode(t *testing.T) {
 // --- Async mode via config string ---
 
 func TestQwpIntegrationAsyncFromConf(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_async_conf"
@@ -547,7 +547,7 @@ func TestQwpIntegrationAsyncFromConf(t *testing.T) {
 // --- Auto-flush integration test ---
 
 func TestQwpIntegrationAutoFlush(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_autoflush"
@@ -596,7 +596,7 @@ func TestQwpIntegrationAutoFlush(t *testing.T) {
 // sent via QWP, and stored in QuestDB. This test validates the
 // Phase 13 null-packing fix against the real server.
 func TestQwpIntegrationNullableColumns(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_nullable"
@@ -750,7 +750,7 @@ func TestQwpIntegrationNullableColumns(t *testing.T) {
 // --- Long256 round-trip ---
 
 func TestQwpIntegrationLong256(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_long256"
@@ -832,7 +832,7 @@ func TestQwpIntegrationLong256(t *testing.T) {
 // server fills it in at receive time. Success means the row lands and
 // the ts column is populated.
 func TestQwpIntegrationAtNow(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_at_now"
@@ -870,7 +870,7 @@ func TestQwpIntegrationAtNow(t *testing.T) {
 // per type rather than once for the suite.
 
 func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
 
@@ -1094,7 +1094,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 // Round-trips Decimal64/128/256 with distinct scales so QuestDB
 // auto-creates columns typed to each of the three fixed widths.
 func TestQwpIntegrationDecimalColumns(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_decimal"
@@ -1155,7 +1155,7 @@ func TestQwpIntegrationDecimalColumns(t *testing.T) {
 // encoding and the same buffer path (qwpColumnBuffer.addDoubleArray),
 // so one dimension exercises the full stack end-to-end.
 func TestQwpIntegrationFloat64Arrays(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_f64_array"
@@ -1206,7 +1206,7 @@ func TestQwpIntegrationFloat64Arrays(t *testing.T) {
 // precision must be fixed in the schema. Mirroring the Java test,
 // pre-create the table with GEOHASH(8c) = 40 bits.
 func TestQwpIntegrationGeohash(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_geohash"
@@ -1288,7 +1288,7 @@ func qwpExec(t *testing.T, query string) {
 // nullable column reports null for the omitted rows while non-nullable
 // types (BYTE, SHORT, BOOL) fall back to their type-specific sentinel.
 func TestQwpIntegrationOmittedColumns(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_omitted"
@@ -1446,7 +1446,7 @@ func newOrSkip(t *testing.T, ctx context.Context) QwpSender {
 // Verifies the encoder assembles a single table block with diverse
 // column types and the server ingests it without coercion errors.
 func TestQwpIntegrationWriteAllTypesInOneRow(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_all_types"
@@ -1503,7 +1503,7 @@ func TestQwpIntegrationWriteAllTypesInOneRow(t *testing.T) {
 // contaminate (i.e. send a LONG payload under the DOUBLE schema or
 // vice versa).
 func TestQwpIntegrationSchemaIsolation(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableA := "qwp_integ_iso_a"
@@ -1598,7 +1598,7 @@ func columnType(t *testing.T, tableName, column string) string {
 // Java test pre-creates a bare table and verifies StringColumn adds
 // a VARCHAR column.
 func TestQwpIntegrationAutoCreateVarcharColumn(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_auto_varchar"
@@ -1633,7 +1633,7 @@ func TestQwpIntegrationAutoCreateVarcharColumn(t *testing.T) {
 // exercise the buffer path, so this is an integration test, not a
 // pure unit test.
 func TestQwpIntegrationNameValidation(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
 
@@ -1673,7 +1673,7 @@ func TestQwpIntegrationNameValidation(t *testing.T) {
 // multi-dimensional branch that the 1D test does not.
 
 func TestQwpIntegrationFloat64Array2D(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_f64_array_2d"
@@ -1711,7 +1711,7 @@ func TestQwpIntegrationFloat64Array2D(t *testing.T) {
 }
 
 func TestQwpIntegrationFloat64Array3D(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_f64_array_3d"
@@ -1755,7 +1755,7 @@ func TestQwpIntegrationFloat64Array3D(t *testing.T) {
 // entry point goes through the websocket handshake.
 
 func TestQwpIntegrationDecimalScaleConflict(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_decimal_scale_conflict"
@@ -1788,7 +1788,7 @@ func TestQwpIntegrationDecimalScaleConflict(t *testing.T) {
 }
 
 func TestQwpIntegrationColumnTypeConflict(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_type_conflict"
@@ -1817,7 +1817,7 @@ func TestQwpIntegrationColumnTypeConflict(t *testing.T) {
 }
 
 func TestQwpIntegrationDuplicateColumnInRow(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_dup_col"
@@ -1843,7 +1843,7 @@ func TestQwpIntegrationDuplicateColumnInRow(t *testing.T) {
 }
 
 func TestQwpIntegrationGeohashPrecisionConflict(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_geohash_prec_conflict"
@@ -1887,7 +1887,7 @@ func TestQwpIntegrationGeohashPrecisionConflict(t *testing.T) {
 // rows and wait for ACKs before returning. A buggy Close that only
 // cancels the goroutine without flushing would silently drop data.
 func TestQwpIntegrationAsyncCloseFlushes(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_async_close_flushes"
@@ -1930,7 +1930,7 @@ func TestQwpIntegrationAsyncCloseFlushes(t *testing.T) {
 // Java uses 200 rows with autoFlushRows=2 (100 batches) — scaled to
 // 100 rows / 50 batches here.
 func TestQwpIntegrationAsyncStressAcks(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_async_stress_acks"
@@ -1971,7 +1971,7 @@ func TestQwpIntegrationAsyncStressAcks(t *testing.T) {
 // per-table buffers and emits one multi-table message per flush;
 // losing a table mid-batch would drop rows silently.
 func TestQwpIntegrationAsyncMultiTable(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableA := "qwp_integ_async_multi_a"
@@ -2022,7 +2022,7 @@ func TestQwpIntegrationAsyncMultiTable(t *testing.T) {
 // batch every N rows without waiting for explicit Flush(). A bug in
 // the row-count trigger would either stall the sender or over-flush.
 func TestQwpIntegrationAsyncRowBasedFlush(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_async_row_flush"
@@ -2067,7 +2067,7 @@ func TestQwpIntegrationAsyncRowBasedFlush(t *testing.T) {
 // client (e.g. a symbol map without per-sender scoping) would corrupt
 // ingestion under concurrency.
 func TestQwpIntegrationConcurrentSenders(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	t.Run("DifferentTables", func(t *testing.T) {
@@ -2197,7 +2197,7 @@ func TestQwpIntegrationConcurrentSenders(t *testing.T) {
 // timestamps cycle through every Gorilla bucket (0-bit, 7-bit, 9-bit,
 // 12-bit, 32-bit) and verifies exact per-row round-trip.
 func TestQwpIntegrationGorillaTimestampRoundTrip(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_gorilla_ts"
@@ -2264,7 +2264,7 @@ func TestQwpIntegrationGorillaTimestampRoundTrip(t *testing.T) {
 // Otherwise the server would decode subsequent rows against the wrong
 // column set and either reject them or mis-map columns.
 func TestQwpIntegrationSchemaEvolution(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_schema_evolution"
@@ -2344,7 +2344,7 @@ func TestQwpIntegrationSchemaEvolution(t *testing.T) {
 // flushes. This writes 24 rows of alternating true/false across 3
 // bytes to cover two byte boundaries.
 func TestQwpIntegrationBoolBitPacking(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	tableName := "qwp_integ_bool_packing"

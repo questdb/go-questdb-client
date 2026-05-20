@@ -92,9 +92,13 @@ func benchEnvBool(key string) bool {
 	return v == "1" || v == "true" || v == "TRUE" || v == "yes"
 }
 
-// benchEgressAddr is the server the benchmarks talk to. Defaults to the same
-// localhost:9000 the integration suite uses.
-func benchEgressAddr() string { return benchEnvStr("QDB_BENCH_ADDR", qwpTestAddr) }
+// benchEgressAddr is the server the benchmarks talk to. Defaults to
+// localhost:9000 (the conventional dev-machine QuestDB), independent
+// of the fixture-driven qwpTestAddr. Override with QDB_BENCH_ADDR.
+// Bench code is not in the CI gate; this default keeps the existing
+// `go test -bench` developer workflow unchanged after the integration
+// tests' qwpTestAddr was switched from a const to a var.
+func benchEgressAddr() string { return benchEnvStr("QDB_BENCH_ADDR", "localhost:9000") }
 
 // ---------------------------------------------------------------------------
 // Live-server helpers (testing.B-typed; mirror the *testing.T helpers in
@@ -102,7 +106,7 @@ func benchEgressAddr() string { return benchEnvStr("QDB_BENCH_ADDR", qwpTestAddr
 // ---------------------------------------------------------------------------
 
 // benchSkipIfNoServer skips the benchmark when no QuestDB egress endpoint is
-// reachable. Same intent as qwpSkipIfNoServer, but it dials the actual egress
+// reachable. Same intent as qwpEnsureServer, but it dials the actual egress
 // path (the read socket) so a server with only ingest wired up still skips
 // cleanly rather than failing deep in @Setup-equivalent code.
 func benchSkipIfNoServer(b *testing.B) {

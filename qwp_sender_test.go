@@ -1362,11 +1362,17 @@ func TestQwpSenderMethodChaining(t *testing.T) {
 
 // --- Integration test ---
 
-func TestQwpSenderIntegration(t *testing.T) {
+// Renamed from TestQwpSenderIntegration to TestQwpIntegrationSender
+// so the qwp-fuzz.yml workflow pattern ^TestQwp(Fuzz|Integration)
+// actually catches it. Used to hard-code "ws://localhost:9000" and
+// silently skip in CI; now goes through the shared fuzz fixture.
+func TestQwpIntegrationSender(t *testing.T) {
+	qwpEnsureServer(t)
 	ctx := context.Background()
-	s, err := newQwpLineSender(ctx, "ws://localhost:9000", qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr,
+		qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
-		t.Skipf("QuestDB not available: %v", err)
+		t.Fatalf("sender open against fixture %s: %v", qwpTestAddr, err)
 	}
 	defer s.Close(ctx)
 

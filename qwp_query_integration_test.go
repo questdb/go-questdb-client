@@ -34,10 +34,10 @@ import (
 
 // newTestQueryClient opens an egress QwpQueryClient against the live
 // local server. Skips the test if the server is unreachable (same
-// policy as qwpSkipIfNoServer).
+// policy as qwpEnsureServer).
 func newTestQueryClient(t *testing.T) *QwpQueryClient {
 	t.Helper()
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c, err := NewQwpQueryClient(ctx, WithQwpQueryAddress(qwpTestAddr))
@@ -82,7 +82,7 @@ func TestQwpIntegrationQuerySimpleSelect(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	insertRows(t, tableName, 3)
 
 	c := newTestQueryClient(t)
@@ -179,7 +179,7 @@ func TestQwpIntegrationQueryFromConf(t *testing.T) {
 	const tableName = "qwp_integ_query_fromconf"
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	insertRows(t, tableName, 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -214,7 +214,7 @@ func TestQwpIntegrationQueryMultipleBatches(t *testing.T) {
 	const tableName = "qwp_integ_query_multibatch"
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	const totalRows = 50
 	insertRows(t, tableName, totalRows)
 
@@ -276,7 +276,7 @@ func TestQwpIntegrationCompressedBatches(t *testing.T) {
 	const tableName = "qwp_integ_query_zstd"
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	const totalRows = 50
 	insertRows(t, tableName, totalRows)
 
@@ -342,7 +342,7 @@ func TestQwpIntegrationCompressedBatches(t *testing.T) {
 // panic or hang, and (b) the client is reusable after the iteration
 // ends — whichever side (cancel or natural RESULT_END) won the race.
 func TestQwpIntegrationCancelLongRunningQuery(t *testing.T) {
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	// Small batches so the iterator enters the yield body before the
@@ -542,7 +542,7 @@ func TestQwpIntegrationQueryWithBinds(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	qwpSkipIfNoServer(t)
+	qwpEnsureServer(t)
 	insertRows(t, tableName, 9) // host cycles through server0 / server1 / server2
 
 	c := newTestQueryClient(t)
