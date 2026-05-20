@@ -763,7 +763,11 @@ func senderFuzzAlterTableLoop(
 	if budgetCap <= 0 {
 		return
 	}
-	budget := rnd.Intn(budgetCap)
+	// +1 so we always attempt at least one ALTER — rnd.Intn is half-open
+	// [0, budgetCap), and a zero budget would let the loop exit without
+	// exercising the ALTER path at all (a regression there would otherwise
+	// pass silently). Java has the same off-by-one; we deviate intentionally.
+	budget := rnd.Intn(budgetCap) + 1
 	for budget > 0 {
 		select {
 		case <-producersDone:
