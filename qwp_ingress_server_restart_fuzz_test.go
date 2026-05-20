@@ -54,6 +54,9 @@ package questdb
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -229,6 +232,35 @@ func restartFuzzAssertValInvariant(t *testing.T, srv *qwpFuzzServer) {
 	}
 }
 
+// restartFuzzAssertSegmentsOnDisk verifies that <sfDir>/default/
+// contains at least one .sfa segment file. Used after a paused-server
+// fast close to confirm the on-disk durability invariant the next
+// epoch's adoption / replay depends on — catches a close-time
+// regression (premature unlink, panic mid-shutdown, a refactor that
+// drops segment preservation) eagerly, before the end-of-test row
+// count inherits the diagnosis. label is prefixed onto any failure
+// message so multi-epoch callers can locate which call site fired.
+func restartFuzzAssertSegmentsOnDisk(t *testing.T, sfDir, label string) {
+	t.Helper()
+	slotDir := filepath.Join(sfDir, qwpSfDefaultSenderId)
+	entries, err := os.ReadDir(slotDir)
+	if err != nil {
+		t.Fatalf("%s: read slot dir %s: %v", label, slotDir, err)
+	}
+	var sfaFiles []string
+	var allNames []string
+	for _, e := range entries {
+		allNames = append(allNames, e.Name())
+		if strings.HasSuffix(e.Name(), ".sfa") {
+			sfaFiles = append(sfaFiles, e.Name())
+		}
+	}
+	if len(sfaFiles) == 0 {
+		t.Fatalf("%s: expected at least one .sfa segment in %s for next-epoch replay, got entries %v",
+			label, slotDir, allNames)
+	}
+}
+
 // --- entry points -------------------------------------------------
 
 // TestQwpFuzzIngressServerRestartSmokeNoRestart — port of Java
@@ -312,11 +344,16 @@ func TestQwpFuzzIngressServerRestartNewSenderRecoversFromSfDir(t *testing.T) {
 	}
 	qs1 := ls1.(QwpSender)
 	restartFuzzWriteRows(t, qs1, 0, rowsPerEpoch, baseTsNanos)
-	if err := qs1.Flush(ctx); err != nil {
+	publishedFsn, err := qs1.FlushAndGetSequence(ctx)
+	if err != nil {
 		t.Fatalf("epoch 1 flush: %v", err)
 	}
 	// Pause BEFORE close so genuinely-unacked frames remain on disk.
+	// srv.pause() is synchronous on JVM exit (SIGTERM + wait), so by
+	// the time it returns the server side of the connection is gone
+	// and ackedFsn is no longer chasing publishedFsn.
 	srv.pause()
+	ackedBeforeClose := qs1.AckedFsn()
 	cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := qs1.Close(cctx); err != nil {
 		// Fast close is best-effort here — sender is disconnected,
@@ -324,6 +361,19 @@ func TestQwpFuzzIngressServerRestartNewSenderRecoversFromSfDir(t *testing.T) {
 		t.Logf("epoch 1 close (expected disconnect): %v", err)
 	}
 	ccancel()
+	// Durability invariant: any frame published but not acked at the
+	// time Close ran must survive on disk for epoch 2 to adopt. The
+	// 5000-row sizing here is the same one Java picked so that "some
+	// won't be drained"; if the test happens to race the send loop
+	// past full drain (ackedBeforeClose == publishedFsn), engineClose
+	// is allowed to unlink and we skip the eager check — the
+	// end-of-test row count still covers the property.
+	if ackedBeforeClose < publishedFsn {
+		restartFuzzAssertSegmentsOnDisk(t, sfDir, "epoch 1")
+	} else {
+		t.Logf("epoch 1: full drain raced ahead of pause (publishedFsn=%d, ackedBeforeClose=%d) — skipping eager disk check",
+			publishedFsn, ackedBeforeClose)
+	}
 
 	// --- Epoch 2: server back on the same port, new sender adopts ---
 	if err := srv.start(); err != nil {
@@ -438,20 +488,38 @@ func TestQwpFuzzIngressServerRestartMultipleRestartsNewSender(t *testing.T) {
 		qs := ls.(QwpSender)
 		restartFuzzWriteRows(t, qs, idBase, rowsPerEpoch,
 			baseTsNanos+idBase*1000)
-		if err := qs.Flush(ctx); err != nil {
+		publishedFsn, err := qs.FlushAndGetSequence(ctx)
+		if err != nil {
 			t.Fatalf("epoch %d flush: %v", epoch, err)
 		}
 		// Random pause: sometimes the server drains everything,
 		// sometimes not.
 		time.Sleep(time.Duration(r.Intn(50)) * time.Millisecond)
 		// Pause server BEFORE sender exits → unacked frames stay on disk.
+		// srv.pause() blocks until the JVM has exited, so ackedFsn is
+		// stable from this point: no further ACKs can reach the loop.
 		srv.pause()
+		ackedBeforeClose := qs.AckedFsn()
 		cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := qs.Close(cctx); err != nil {
 			// Fast close best-effort across the disconnect.
 			t.Logf("epoch %d close (expected disconnect): %v", epoch, err)
 		}
 		ccancel()
+		// Durability invariant: when at least one frame was unacked
+		// at Close time, the slot's .sfa files must survive so the
+		// next epoch can adopt and replay. The random pause above is
+		// designed to land in both regimes (full drain and partial
+		// drain), so we gate on publishedFsn > ackedBeforeClose — a
+		// regression that unlinks segments under that condition trips
+		// here instead of as a vague row-count miss after the loop.
+		if ackedBeforeClose < publishedFsn {
+			restartFuzzAssertSegmentsOnDisk(t, sfDir,
+				fmt.Sprintf("epoch %d", epoch))
+		} else {
+			t.Logf("epoch %d: full drain raced ahead of pause (publishedFsn=%d, ackedBeforeClose=%d) — skipping eager disk check",
+				epoch, publishedFsn, ackedBeforeClose)
+		}
 		totalRows += int64(rowsPerEpoch)
 		idBase += int64(rowsPerEpoch)
 	}
