@@ -93,6 +93,12 @@ type qwpFuzzServer struct {
 	lineTCPort int
 	pgPort     int
 
+	// envOverrides is appended to the JVM child's environment so a
+	// per-instance fixture can flip server config keys at boot (e.g.
+	// QDB_HTTP_RECV_BUFFER_SIZE for the small-buffer fuzz test).
+	// nil/empty on the shared singleton; populated by bootSidecarServer.
+	envOverrides map[string]string
+
 	mu      sync.Mutex
 	cmd     *exec.Cmd
 	waitCh  chan struct{}
@@ -217,6 +223,71 @@ func launchFuzzServer() (*qwpFuzzServer, string, error) {
 		return nil, "", fmt.Errorf("%w\n--- QuestDB log tail ---\n%s", err, log)
 	}
 	return s, "", nil
+}
+
+// bootSidecarServer launches a private QuestDB instance for ONE test,
+// independent of the shared singleton, with the given env overrides
+// applied to the JVM child. Used by fuzz tests that need a server-side
+// config knob the singleton doesn't expose (e.g. small recv buffer,
+// forced wire fragmentation). The instance is torn down via t.Cleanup.
+//
+// Requires fixture-launched mode (Java + jar resolvable). Skips in
+// QDB_FUZZ_ADDR mode (external server we can't restart with custom
+// env). Honours QDB_FUZZ_STRICT exactly like the shared fixture: a
+// resolved-but-unstartable server always fails; an unresolved one
+// fails under STRICT and skips otherwise.
+func bootSidecarServer(t *testing.T, envOverrides map[string]string) *qwpFuzzServer {
+	t.Helper()
+	if strings.TrimSpace(os.Getenv("QDB_FUZZ_ADDR")) != "" {
+		t.Skip("sidecar server requires fixture-launched mode (QDB_FUZZ_ADDR is set — external server we can't restart with custom env)")
+	}
+	javaPath, err := findJava()
+	if err != nil {
+		if fuzzStrict() {
+			t.Fatalf("QDB_FUZZ_STRICT is set but no JDK is available for sidecar boot: %v", err)
+		}
+		t.Skip("no JDK found for sidecar boot")
+	}
+	jarPath, err := findQuestDBJar()
+	if err != nil {
+		if fuzzStrict() {
+			t.Fatalf("QDB_FUZZ_STRICT is set but no QuestDB jar is available for sidecar boot: %v", err)
+		}
+		t.Skip("no QuestDB jar found for sidecar boot")
+	}
+	baseDir, err := os.MkdirTemp("", "qwpfuzz-sidecar-")
+	if err != nil {
+		t.Fatalf("sidecar mkdtemp: %v", err)
+	}
+	s := &qwpFuzzServer{
+		owns:         true,
+		javaPath:     javaPath,
+		jarPath:      jarPath,
+		baseDir:      baseDir,
+		dataDir:      filepath.Join(baseDir, "data"),
+		host:         "127.0.0.1",
+		envOverrides: envOverrides,
+	}
+	s.confDir = filepath.Join(s.dataDir, "conf")
+	s.logPath = filepath.Join(s.dataDir, "log", "log.txt")
+	for _, d := range []string{s.confDir, filepath.Dir(s.logPath)} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			os.RemoveAll(baseDir)
+			t.Fatalf("sidecar mkdir %s: %v", d, err)
+		}
+	}
+	copyMimeTypes(jarPath, s.confDir)
+	if err := s.discoverPorts(); err != nil {
+		os.RemoveAll(baseDir)
+		t.Fatalf("sidecar ports: %v", err)
+	}
+	if err := s.start(); err != nil {
+		log := s.tailLog(4000)
+		s.stop()
+		t.Fatalf("sidecar start: %v\n--- QuestDB log tail ---\n%s", err, log)
+	}
+	t.Cleanup(s.stop)
+	return s
 }
 
 // findJava mirrors fixture.py:_find_java — prefer $JAVA_HOME/bin/java,
@@ -411,6 +482,26 @@ func (s *qwpFuzzServer) start() error {
 	cmd.Dir = s.dataDir
 	cmd.Stdout = f
 	cmd.Stderr = f
+	if len(s.envOverrides) > 0 {
+		// Strip any pre-existing values for the override keys so we
+		// don't end up with two QDB_<KEY>=... entries (Go's exec.Cmd
+		// takes the LAST occurrence, but better to be explicit).
+		cmd.Env = make([]string, 0, len(os.Environ())+len(s.envOverrides))
+		for _, kv := range os.Environ() {
+			eq := strings.IndexByte(kv, '=')
+			if eq < 0 {
+				cmd.Env = append(cmd.Env, kv)
+				continue
+			}
+			if _, override := s.envOverrides[kv[:eq]]; override {
+				continue
+			}
+			cmd.Env = append(cmd.Env, kv)
+		}
+		for k, v := range s.envOverrides {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
 
 	s.mu.Lock()
 	if err := cmd.Start(); err != nil {

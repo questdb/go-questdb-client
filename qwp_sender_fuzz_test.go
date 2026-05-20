@@ -1547,6 +1547,30 @@ func TestQwpFuzzSenderReorderingSkipDuplicateColumnsWithNonAscii(t *testing.T) {
 	}, fuzz, r)
 }
 
+// TestQwpFuzzSenderLoadSmallBuffer — Java testLoadSmallBuffer
+// (the only sender-fuzz @Test method that requires a server-side
+// knob). The server is booted with http.recv.buffer.size=2048, so
+// the client must cap per-frame bytes well under that or the server
+// tears the WS connection down with MESSAGE_TOO_BIG. Java pairs
+// recvBufferSize=2048 with clientAutoFlushRows=3; we match exactly.
+//
+// Requires fixture-launched mode (sidecar JVM with env overrides);
+// skips in QDB_FUZZ_ADDR mode.
+func TestQwpFuzzSenderLoadSmallBuffer(t *testing.T) {
+	srv := bootSidecarServer(t, map[string]string{
+		"QDB_HTTP_RECV_BUFFER_SIZE": "2048",
+	})
+	r := newFuzzRand(t)
+	fuzz := defaultSenderFuzzFuzz()
+	// Java's testLoadSmallBuffer uses the same load shape as testLoad
+	// (no extra fuzz tweaks); the property under test is "wire frame
+	// fits in 2048 B with auto_flush_rows=3".
+	senderFuzzRunTest(t, srv, senderFuzzLoad{
+		numLines: 50, numIterations: 2, numThreads: 3, numTables: 4, waitMs: 20,
+		clientAutoFlushRows: 3,
+	}, fuzz, r)
+}
+
 // TestQwpFuzzSenderReorderingSkipDuplicateColumnsWithNonAsciiNoSymbols —
 // Java testReorderingSkipDuplicateColumnsWithNonAsciiNoSymbols.
 func TestQwpFuzzSenderReorderingSkipDuplicateColumnsWithNonAsciiNoSymbols(t *testing.T) {
