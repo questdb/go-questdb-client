@@ -92,10 +92,13 @@ jobs:
           fi
           echo "Found server jar: $jar"
 
-      - name: Run QWP fuzz tests
+      - name: Run QWP fuzz + integration tests
         env:
           GOTOOLCHAIN: local
           QDB_REPO: ${{ github.workspace }}/questdb
           # Make a missing/unstartable server a hard failure, not a skip.
+          # Applies to both ^TestQwpFuzz and ^TestQwpIntegration: the
+          # integration suite now boots the same shared fuzz fixture
+          # instead of probing an absent localhost:9000 server.
           QDB_FUZZ_STRICT: "1"
-        run: go test -count=1 -timeout 30m -run '^TestQwpFuzz' -v .
+        run: go test -count=1 -timeout 30m -run '^TestQwp(Fuzz|Integration)' -v .

@@ -39,10 +39,18 @@ import (
 )
 
 const (
-	qwpTestAddr       = "localhost:9000"
 	qwpTestWaitPeriod = 5 * time.Second
 	qwpTestPollPeriod = 100 * time.Millisecond
 )
+
+// qwpTestAddr is the host:port the QWP integration tests target. It
+// used to be a const pinned to localhost:9000 (a developer's live
+// server), which caused these tests to silently skip in CI where no
+// such server runs. qwpSkipIfNoServer now boots the shared fuzz
+// fixture and writes the fixture's address here, so the same tests
+// run against a real QuestDB under qwp-fuzz.yml (and any QDB_FUZZ_ADDR
+// the developer points at on their machine, including localhost:9000).
+var qwpTestAddr string
 
 var qwpTestHTTPClient = &http.Client{Timeout: qwpTestWaitPeriod}
 
@@ -59,17 +67,24 @@ type qwpColumnInfo struct {
 	Type string `json:"type"`
 }
 
-// qwpSkipIfNoServer skips the test if QuestDB is not available.
+// qwpSkipIfNoServer ensures a real QuestDB is reachable for the
+// caller's integration test and writes its host:port into the
+// package-level qwpTestAddr.
+//
+// Resolution policy (matches the fuzz fixture):
+//   1. QDB_FUZZ_ADDR — talk to an externally-managed server (a
+//      developer's live localhost:9000, or a long-lived CI box).
+//   2. Otherwise boot a private QuestDB JVM from a QDB_JAR / QDB_REPO
+//      / sibling questdb checkout. Auto-runs under qwp-fuzz.yml.
+//   3. If neither resolves, t.Skip (unless QDB_FUZZ_STRICT=1, in which
+//      case t.Fatal so CI loudly fails instead of silently passing).
+//
+// As a side effect the caller's subsequent qwpQuery / qwpDropTable /
+// "ws://"+qwpTestAddr connect strings all target the resolved server.
 func qwpSkipIfNoServer(t *testing.T) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, nil)
-	if err != nil {
-		t.Skipf("QuestDB not available at %s: %v", qwpTestAddr, err)
-	}
-	s.Close(ctx)
+	srv := fuzzServer(t)
+	qwpTestAddr = srv.wsAddr()
 }
 
 // qwpDropTable drops a table via QuestDB's HTTP API.
