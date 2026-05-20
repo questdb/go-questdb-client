@@ -79,10 +79,10 @@ func insertRows(t *testing.T, tableName string, rows int) {
 // correct values with TotalRows set from RESULT_END.
 func TestQwpIntegrationQuerySimpleSelect(t *testing.T) {
 	const tableName = "qwp_integ_query_simple"
+	qwpEnsureServer(t)
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	qwpEnsureServer(t)
 	insertRows(t, tableName, 3)
 
 	c := newTestQueryClient(t)
@@ -151,6 +151,7 @@ func TestQwpIntegrationQueryError(t *testing.T) {
 // works through Exec.
 func TestQwpIntegrationExecDDL(t *testing.T) {
 	const tableName = "qwp_integ_exec_ddl"
+	qwpEnsureServer(t)
 	qwpDropTable(t, tableName) // ensure clean slate
 	defer qwpDropTable(t, tableName)
 
@@ -177,9 +178,9 @@ func TestQwpIntegrationExecDDL(t *testing.T) {
 // with the same behavior as the functional-options constructor.
 func TestQwpIntegrationQueryFromConf(t *testing.T) {
 	const tableName = "qwp_integ_query_fromconf"
+	qwpEnsureServer(t)
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
-	qwpEnsureServer(t)
 	insertRows(t, tableName, 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -212,9 +213,9 @@ func TestQwpIntegrationQueryFromConf(t *testing.T) {
 // iterator yields them all in order.
 func TestQwpIntegrationQueryMultipleBatches(t *testing.T) {
 	const tableName = "qwp_integ_query_multibatch"
+	qwpEnsureServer(t)
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
-	qwpEnsureServer(t)
 	const totalRows = 50
 	insertRows(t, tableName, totalRows)
 
@@ -274,9 +275,9 @@ func TestQwpIntegrationQueryMultipleBatches(t *testing.T) {
 // obvious.
 func TestQwpIntegrationCompressedBatches(t *testing.T) {
 	const tableName = "qwp_integ_query_zstd"
+	qwpEnsureServer(t)
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
-	qwpEnsureServer(t)
 	const totalRows = 50
 	insertRows(t, tableName, totalRows)
 
@@ -539,10 +540,10 @@ func TestQwpIntegrationClientCloseDuringLongQuery(t *testing.T) {
 // per-call result sets.
 func TestQwpIntegrationQueryWithBinds(t *testing.T) {
 	const tableName = "qwp_integ_binds"
+	qwpEnsureServer(t)
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	qwpEnsureServer(t)
 	insertRows(t, tableName, 9) // host cycles through server0 / server1 / server2
 
 	c := newTestQueryClient(t)

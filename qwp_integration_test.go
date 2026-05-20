@@ -90,6 +90,9 @@ func qwpEnsureServer(t *testing.T) {
 // qwpDropTable drops a table via QuestDB's HTTP API.
 func qwpDropTable(t *testing.T, tableName string) {
 	t.Helper()
+	if qwpTestAddr == "" {
+		t.Fatal("qwpDropTable called before qwpEnsureServer — qwpTestAddr is empty")
+	}
 	u, _ := url.Parse("http://" + qwpTestAddr)
 	u.Path = "/exec"
 	params := url.Values{}
