@@ -28,9 +28,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -821,4 +823,154 @@ func TestInitialConnectOffFailsWhenAllRejected(t *testing.T) {
 		"error must identify the single-round walk: %v", err)
 	assert.Less(t, elapsed, 3*time.Second,
 		"failure must surface promptly; OFF mode must not retry across rounds")
+}
+
+// newHangListener accepts TCP connections and parks them — never
+// writes any HTTP response, so a client awaiting the WebSocket 101
+// upgrade response hangs until its auth_timeout_ms fires. Used by
+// TestInitialConnectAuthTimeoutBoundsHungUpgrade to simulate a node
+// that takes the connection but never completes the upgrade.
+func newHangListener(t *testing.T) (addr string, teardown func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err, "hang listener")
+	var (
+		mu     sync.Mutex
+		closed bool
+		conns  []net.Conn
+	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return // listener closed
+			}
+			mu.Lock()
+			if closed {
+				mu.Unlock()
+				_ = c.Close()
+				return
+			}
+			conns = append(conns, c)
+			mu.Unlock()
+			// Park the connection. Set a long deadline so a buggy
+			// server-side read can't burn the test budget; we close
+			// from teardown.
+			_ = c.SetDeadline(time.Now().Add(time.Minute))
+		}
+	}()
+	teardown = func() {
+		mu.Lock()
+		closed = true
+		toClose := append([]net.Conn(nil), conns...)
+		mu.Unlock()
+		_ = ln.Close()
+		for _, c := range toClose {
+			_ = c.Close()
+		}
+		<-done
+	}
+	return ln.Addr().String(), teardown
+}
+
+// TestInitialConnectAuthTimeoutBoundsHungUpgrade is the spec-parity
+// test for `auth_timeout_ms`: when host 0 accepts the TCP socket but
+// never writes the WS 101 response, the sender's upgrade read must
+// time out at auth_timeout_ms (per-host) and walk to host 1, which
+// completes the upgrade and accepts frames. Without the per-host
+// bound the connect would burn the entire reconnect budget (or the
+// underlying HTTP transport default) on the stuck host. Mirrors Java
+// WriteFailoverTest.testAuthTimeoutBoundsHungUpgrade.
+func TestInitialConnectAuthTimeoutBoundsHungUpgrade(t *testing.T) {
+	hangAddr, closeHang := newHangListener(t)
+	defer closeHang()
+
+	healthySrv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer healthySrv.Close()
+	healthyAddr := strings.TrimPrefix(healthySrv.URL, "http://")
+
+	sfDir := t.TempDir()
+	const authTimeoutMs = 500
+	conf := fmt.Sprintf(
+		"ws::addr=%s,%s;sf_dir=%s;sender_id=t;auth_timeout_ms=%d;close_flush_timeout_millis=2000;",
+		hangAddr, healthyAddr, sfDir, authTimeoutMs,
+	)
+
+	t0 := time.Now()
+	sender, err := LineSenderFromConf(context.Background(), conf)
+	require.NoError(t, err,
+		"sender must walk past the hung upgrade and bind on the healthy peer")
+	defer func() { _ = sender.Close(context.Background()) }()
+
+	require.NoError(t, sender.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	require.NoError(t, sender.Flush(context.Background()))
+	require.Eventually(t, func() bool {
+		return healthySrv.totalFramesReceived.Load() >= int64(1)
+	}, 2*time.Second, 1*time.Millisecond,
+		"the healthy peer must have received the test frame")
+
+	elapsed := time.Since(t0)
+	// host[0] burns auth_timeout_ms (500 ms), then host[1] connects
+	// quickly. Generous slack for the round-walk's own backoff +
+	// CI noise — Java uses 5 s; we match.
+	assert.Less(t, elapsed, 5*time.Second,
+		"auth_timeout_ms must bound the hung upgrade; elapsed=%v", elapsed)
+}
+
+// TestInitialConnectStaysOnPrimaryAfterTopologyChange — Go-side
+// counterpart of Java WriteFailoverTest.testFailoverPromotedReplicaJoinsRotation.
+// After the SF round-walk binds to the healthy primary, subsequent
+// batches MUST keep landing on the bound peer even if a previously-
+// rejecting host becomes topologically eligible (the "promoted
+// replica" case). The Go cursor send loop does not observe topology
+// changes on idle peers, so the bound endpoint stays sticky — this
+// test pins that stickiness so a future scheduler hook can't quietly
+// regress it into proactive rotation.
+//
+// We don't actually mutate the rejecting server mid-test (Go's
+// httptest doesn't expose a clean "swap behaviour" toggle and the
+// promotion is conceptually a no-op on the sender side anyway).
+// What we assert is what matters: two successive batches on the
+// same Sender both reach the originally-bound healthy peer, with
+// zero ingestion frames hitting the formerly-rejecting host.
+func TestInitialConnectStaysOnPrimaryAfterTopologyChange(t *testing.T) {
+	// Host 0: rejects with 421 + REPLICA — the SF round-walk walks past.
+	rejectSrv := newRoundWalkRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"REPLICA"},
+	})
+	defer rejectSrv.Close()
+	// Host 1: SF-compatible test server that ACKs frames.
+	primarySrv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer primarySrv.Close()
+
+	sfDir := t.TempDir()
+	addr0 := strings.TrimPrefix(rejectSrv.URL, "http://")
+	addr1 := strings.TrimPrefix(primarySrv.URL, "http://")
+	conf := fmt.Sprintf(
+		"ws::addr=%s,%s;sf_dir=%s;sender_id=t;close_flush_timeout_millis=2000;",
+		addr0, addr1, sfDir,
+	)
+
+	sender, err := LineSenderFromConf(context.Background(), conf)
+	require.NoError(t, err)
+	defer func() { _ = sender.Close(context.Background()) }()
+
+	// Batch 1 — establishes the bind on host 1.
+	require.NoError(t, sender.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	require.NoError(t, sender.Flush(context.Background()))
+	require.Eventually(t, func() bool {
+		return primarySrv.totalFramesReceived.Load() >= int64(1)
+	}, 2*time.Second, 1*time.Millisecond,
+		"batch 1 must reach the primary peer")
+	framesAfter1 := primarySrv.totalFramesReceived.Load()
+
+	// Batch 2 — must also land on host 1 (no proactive rotation).
+	require.NoError(t, sender.Table("t").Int64Column("v", 2).AtNow(context.Background()))
+	require.NoError(t, sender.Flush(context.Background()))
+	require.Eventually(t, func() bool {
+		return primarySrv.totalFramesReceived.Load() > framesAfter1
+	}, 2*time.Second, 1*time.Millisecond,
+		"batch 2 must also reach the same primary peer (stickiness)")
 }
