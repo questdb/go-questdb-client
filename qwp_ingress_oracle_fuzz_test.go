@@ -1403,3 +1403,220 @@ func TestQwpFuzzIngressOracleSenderRestartReplay(t *testing.T) {
 		}
 	}
 }
+
+// --- async-connect-queues-before-server-starts scenario --------------
+
+// TestQwpFuzzIngressOracleAsyncConnectQueues ports
+// QwpIngressOracleFuzzTest.testOracleAsyncConnectQueuesBeforeServerStarts.
+// The offline-first contract of initial_connect_retry=async: the
+// sender constructor must return promptly even when nothing is
+// listening, the producer thread keeps writing immediately, frames
+// accumulate in sf_dir while the I/O thread retries connect in the
+// background. Once the server is brought up, the queued frames drain.
+// Final cell-by-cell oracle check confirms no loss across the
+// offline -> online transition.
+//
+// Shape: pause the fixture so its port is closed; producers open
+// async, publish everything and signal "enqueued"; a starter
+// goroutine waits for that signal, settles briefly (so the first
+// connect attempt is guaranteed to have hit ECONNREFUSED — proving
+// the ASYNC contract rather than letting the dial happen
+// post-resume), then calls start(); senders' close blocks on
+// close_flush_timeout to drain.
+//
+// Faithful-port divergences (cf. file header + bounce / restart-replay
+// / poison ports):
+//
+//   - Needs the new fixture pause()/start() pair (skips !owns). The
+//     test always leaves the server up via t.Cleanup(start) regardless
+//     of outcome — start() is idempotent.
+//   - Constructor latency assertion: <2s for async mode (same as Java).
+//   - Counts are CI-bounded; decimals non-negative; reproducible via
+//     QWP_FUZZ_SEED.
+func TestQwpFuzzIngressOracleAsyncConnectQueues(t *testing.T) {
+	srv := fuzzServer(t)
+	if !srv.owns {
+		t.Skip("async-connect needs a fixture-launched server " +
+			"(QDB_FUZZ_ADDR mode cannot pause/resume the process)")
+	}
+	// Always restore the server to a running state — start() is
+	// idempotent so this is safe regardless of test outcome.
+	t.Cleanup(func() {
+		if err := srv.start(); err != nil {
+			t.Logf("cleanup: failed to restart server: %v", err)
+			return
+		}
+		if _, err := srv.execSQL("DROP TABLE IF EXISTS '" + oracleTableName + "'"); err != nil {
+			t.Logf("cleanup: drop table: %v", err)
+		}
+	})
+
+	r := newFuzzRand(t)
+	producerCount := 2 + r.Intn(2)       // 2..3
+	rowsPerProducer := 250 + r.Intn(400) // 250..649 (CI-bounded)
+	sfMaxBytes := oraclePickSfMaxBytes(r)
+	totalRows := producerCount * rowsPerProducer
+	t.Logf("ingress oracle async-connect: producers=%d rows/producer=%d total=%d sf_max_bytes=%d",
+		producerCount, rowsPerProducer, totalRows, sfMaxBytes)
+
+	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
+	srv.mustExec(t, oracleCreateSQL)
+
+	// Pre-generate the oracle BEFORE pausing the server.
+	oracle := newOracleTable()
+	perProducer := make([][]*oracleRow, producerCount)
+	var globalIdx int64
+	for p := 0; p < producerCount; p++ {
+		genR := rand.New(rand.NewSource(r.Int63()))
+		perProducer[p] = make([]*oracleRow, rowsPerProducer)
+		for i := 0; i < rowsPerProducer; i++ {
+			id := globalIdx
+			ts := oracleBaseTsMicros + globalIdx
+			row := oracleGenerateRow(genR, id, ts)
+			perProducer[p][i] = row
+			oracle.addRow(row)
+			globalIdx++
+		}
+	}
+
+	sfRoot := t.TempDir()
+	sfDirs := make([]string, producerCount)
+	for p := 0; p < producerCount; p++ {
+		sfDirs[p] = filepath.Join(sfRoot, fmt.Sprintf("p%d", p))
+		if err := os.MkdirAll(sfDirs[p], 0o755); err != nil {
+			t.Fatalf("mkdir sf_dir: %v", err)
+		}
+	}
+
+	// Bring the server down. From here until the starter goroutine
+	// calls srv.start(), the wsAddr port is closed.
+	srv.pause()
+
+	var wg sync.WaitGroup
+	errs := make([]error, producerCount)
+	allEnqueued := make(chan struct{}, producerCount)
+
+	for p := 0; p < producerCount; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					errs[p] = fmt.Errorf("producer %d panicked: %v", p, rec)
+				}
+			}()
+
+			conf := fmt.Sprintf(
+				"ws::addr=%s;sf_dir=%s;initial_connect_retry=async;"+
+					"reconnect_max_duration_millis=120000;"+
+					"reconnect_initial_backoff_millis=20;"+
+					"reconnect_max_backoff_millis=200;"+
+					"sf_max_bytes=%d;"+
+					"close_flush_timeout_millis=120000;",
+				srv.wsAddr(), sfDirs[p], sfMaxBytes)
+
+			// Time the constructor: async mode must return promptly
+			// even when no server listens — the whole point.
+			openCtx, openCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			t0 := time.Now()
+			ls, err := LineSenderFromConf(openCtx, conf)
+			openCancel()
+			ctorElapsed := time.Since(t0)
+			if err != nil {
+				errs[p] = fmt.Errorf("producer %d open: %w", p, err)
+				allEnqueued <- struct{}{}
+				return
+			}
+			if ctorElapsed > 2*time.Second {
+				errs[p] = fmt.Errorf("producer %d: async ctor took %s (must be <2s)", p, ctorElapsed)
+				_ = ls.Close(context.Background())
+				allEnqueued <- struct{}{}
+				return
+			}
+			qs, ok := ls.(QwpSender)
+			if !ok {
+				errs[p] = fmt.Errorf("producer %d: not a QwpSender (%T)", p, ls)
+				_ = ls.Close(context.Background())
+				allEnqueued <- struct{}{}
+				return
+			}
+
+			pubCtx := context.Background()
+			const chunkSize = 50
+			rows := perProducer[p]
+			for i := 0; i < len(rows); i++ {
+				oraclePublish(t, qs, pubCtx, rows[i])
+				if (i+1)%chunkSize == 0 {
+					if err := qs.Flush(pubCtx); err != nil {
+						errs[p] = fmt.Errorf("producer %d flush@%d: %w", p, i, err)
+						allEnqueued <- struct{}{}
+						cctx, ccancel := context.WithTimeout(context.Background(), 150*time.Second)
+						_ = qs.Close(cctx)
+						ccancel()
+						return
+					}
+				}
+			}
+			if err := qs.Flush(pubCtx); err != nil {
+				errs[p] = fmt.Errorf("producer %d final flush: %w", p, err)
+			}
+			// Signal "everything enqueued to sf_dir" BEFORE the
+			// close-block. Frame I/O has not yet started talking to
+			// any server — that only begins once the starter brings
+			// it up and Close() drives the drain.
+			allEnqueued <- struct{}{}
+			cctx, ccancel := context.WithTimeout(context.Background(), 150*time.Second)
+			_ = qs.Close(cctx)
+			ccancel()
+		}(p)
+	}
+
+	starterDone := make(chan struct{})
+	var starterErr error
+	go func() {
+		defer close(starterDone)
+		enqWait := time.After(60 * time.Second)
+		seen := 0
+		for seen < producerCount {
+			select {
+			case <-allEnqueued:
+				seen++
+			case <-enqWait:
+				starterErr = fmt.Errorf("only %d/%d producers enqueued within 60s", seen, producerCount)
+				return
+			}
+		}
+		// Brief settle so the I/O thread has at minimum hit one
+		// ECONNREFUSED retry — exercises the ASYNC contract
+		// (background connect loop) rather than letting the first
+		// connect happen post-server-up.
+		time.Sleep(100 * time.Millisecond)
+		if err := srv.start(); err != nil {
+			starterErr = fmt.Errorf("starter: %w", err)
+		}
+	}()
+
+	<-starterDone
+	wg.Wait()
+	if starterErr != nil {
+		t.Fatalf("%v", starterErr)
+	}
+	for p, e := range errs {
+		if e != nil {
+			t.Fatalf("producer %d: %v", p, e)
+		}
+	}
+
+	srv.awaitRows(t, oracleTableName, totalRows, 180*time.Second)
+
+	c := newBindFuzzClient(t, srv)
+	oracleAssert(t, c, oracle)
+
+	capBytes := sfMaxBytes + 256*1024
+	for p, dir := range sfDirs {
+		if sz := oracleSfDirSize(dir); sz > capBytes {
+			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
+				p, dir, sz, capBytes)
+		}
+	}
+}

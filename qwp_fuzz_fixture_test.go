@@ -375,9 +375,17 @@ line.tcp.commit.interval.fraction=0.1
 }
 
 // start writes the config and launches the JVM, blocking until /ping
-// answers 204 or the process dies / times out.
+// answers 204 or the process dies / times out. Idempotent: if a JVM is
+// already managed by this fixture, returns nil immediately (so a
+// defensive t.Cleanup(start) is safe regardless of test state).
 func (s *qwpFuzzServer) start() error {
 	if !s.owns {
+		return nil
+	}
+	s.mu.Lock()
+	already := s.cmd != nil
+	s.mu.Unlock()
+	if already {
 		return nil
 	}
 	if err := os.WriteFile(filepath.Join(s.confDir, "server.conf"), []byte(s.serverConf()), 0o644); err != nil {
@@ -478,9 +486,16 @@ func (s *qwpFuzzServer) pingOK() bool {
 	return resp.StatusCode == http.StatusNoContent
 }
 
-// stop terminates the JVM (SIGTERM, then SIGKILL after a grace period so
-// JVM shutdown hooks can flush) and removes the temp data dir. Idempotent.
-func (s *qwpFuzzServer) stop() {
+// pause stops the JVM (SIGTERM with kill fallback) without touching the
+// data directory or discovered ports — a subsequent start() boots a
+// fresh JVM that adopts the same dataDir and rebinds the same ports.
+// Idempotent and a no-op in QDB_FUZZ_ADDR mode. Underlies bounce() (the
+// bouncer primitive for the ingress-oracle bounce-torture and
+// restart-replay ports) and stop() (which additionally rm's the data
+// dir on teardown), and is the primitive the ingress-oracle
+// async-connect port calls to arrange a "server not listening yet"
+// state.
+func (s *qwpFuzzServer) pause() {
 	if !s.owns {
 		return
 	}
@@ -501,7 +516,13 @@ func (s *qwpFuzzServer) stop() {
 	if logFile != nil {
 		logFile.Close()
 	}
-	if s.baseDir != "" {
+}
+
+// stop terminates the JVM (via pause()) and removes the temp data dir.
+// Called once at TestMain teardown; not re-entry-safe with start().
+func (s *qwpFuzzServer) stop() {
+	s.pause()
+	if s.owns && s.baseDir != "" {
 		os.RemoveAll(s.baseDir)
 	}
 }
@@ -516,28 +537,10 @@ func (s *qwpFuzzServer) bounce() error {
 	if !s.owns {
 		return errors.New("cannot bounce a server in QDB_FUZZ_ADDR mode")
 	}
-	s.mu.Lock()
-	cmd, waitCh := s.cmd, s.waitCh
-	s.cmd, s.waitCh = nil, nil
-	logFile := s.logFile
-	s.logFile = nil
-	s.mu.Unlock()
-
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		select {
-		case <-waitCh:
-		case <-time.After(fuzzServerStopTimeout):
-			_ = cmd.Process.Kill()
-			<-waitCh
-		}
-	}
-	if logFile != nil {
-		logFile.Close()
-	}
-	// Give the OS a moment to release the listening sockets before the
-	// new JVM rebinds the same ports (fixture.py BounceThread does the
-	// same with a short randomized sleep).
+	s.pause()
+	// Brief settle so the OS can release the listening sockets before
+	// the new JVM rebinds the same ports (fixture.py BounceThread does
+	// the same with a short randomized sleep).
 	time.Sleep(500 * time.Millisecond)
 	return s.start()
 }
