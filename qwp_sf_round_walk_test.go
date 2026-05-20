@@ -33,6 +33,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -933,13 +934,21 @@ func TestInitialConnectAuthTimeoutBoundsHungUpgrade(t *testing.T) {
 // httptest doesn't expose a clean "swap behaviour" toggle and the
 // promotion is conceptually a no-op on the sender side anyway).
 // What we assert is what matters: two successive batches on the
-// same Sender both reach the originally-bound healthy peer, with
-// zero ingestion frames hitting the formerly-rejecting host.
+// same Sender both reach the originally-bound healthy peer, and
+// the rejecting host receives exactly one upgrade attempt — the
+// initial round-walk. A regressed sender that re-walks the ring
+// on every flush would push that count past 1, which is the
+// regression this test exists to catch.
 func TestInitialConnectStaysOnPrimaryAfterTopologyChange(t *testing.T) {
 	// Host 0: rejects with 421 + REPLICA — the SF round-walk walks past.
-	rejectSrv := newRoundWalkRejectServer(t, 421, http.Header{
-		"X-QuestDB-Role": []string{"REPLICA"},
-	})
+	// Inlined (not via newRoundWalkRejectServer) so we can count upgrade
+	// hits and pin the stickiness invariant below.
+	var rejectHits atomic.Int64
+	rejectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rejectHits.Add(1)
+		w.Header().Add("X-QuestDB-Role", "REPLICA")
+		w.WriteHeader(421)
+	}))
 	defer rejectSrv.Close()
 	// Host 1: SF-compatible test server that ACKs frames.
 	primarySrv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
@@ -973,4 +982,12 @@ func TestInitialConnectStaysOnPrimaryAfterTopologyChange(t *testing.T) {
 		return primarySrv.totalFramesReceived.Load() > framesAfter1
 	}, 2*time.Second, 1*time.Millisecond,
 		"batch 2 must also reach the same primary peer (stickiness)")
+
+	// Stickiness invariant: the rejecter was touched exactly once —
+	// by the initial SF round-walk. A regressed sender that re-walks
+	// the full ring on every flush would have hit it again before
+	// batch 2 (or before each frame), so > 1 would mean the
+	// stickiness property has regressed.
+	assert.Equal(t, int64(1), rejectHits.Load(),
+		"rejecting host must be touched only by the initial round-walk")
 }
