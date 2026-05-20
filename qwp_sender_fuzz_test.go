@@ -1001,11 +1001,14 @@ func senderFuzzAssertTable(t *testing.T, qc *QwpQueryClient, tbl *senderFuzzTabl
 			}
 			row := want[rowIdx]
 			rowIdx++
-			if ci, ok := colIdx[tsColName]; ok {
-				if got := batch.Int64(ci, br); got != row.ts {
-					t.Fatalf("table %q row %d ts: want %d got %d",
-						tbl.name, rowIdx-1, row.ts, got)
-				}
+			tsCi, ok := colIdx[tsColName]
+			if !ok {
+				t.Fatalf("table %q: SELECT * missing mandatory %q column",
+					tbl.name, tsColName)
+			}
+			if got := batch.Int64(tsCi, br); got != row.ts {
+				t.Fatalf("table %q row %d ts: want %d got %d",
+					tbl.name, rowIdx-1, row.ts, got)
 			}
 			for name, cell := range row.cells {
 				ci, present := colIdx[name]
@@ -1033,7 +1036,8 @@ func senderFuzzAssertTable(t *testing.T, qc *QwpQueryClient, tbl *senderFuzzTabl
 			for _, name := range absent {
 				ci, present := colIdx[name]
 				if !present {
-					continue
+					t.Fatalf("table %q row ts=%d: column %q in oracle union but absent from schema",
+						tbl.name, row.ts, name)
 				}
 				if !batch.IsNull(ci, br) {
 					t.Fatalf("table %q row ts=%d col %q: expected NULL (unset by this row), got non-null",

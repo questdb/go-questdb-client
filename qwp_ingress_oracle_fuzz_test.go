@@ -517,15 +517,19 @@ func oracleAssert(t *testing.T, c *QwpQueryClient, table *oracleTable) {
 			want := table.rows[rowIdx]
 			rowIdx++
 
-			if ci, ok := colIdx["id"]; ok {
-				if got := batch.Int64(ci, br); got != want.id {
-					t.Fatalf("row %d id: want %d got %d", rowIdx-1, want.id, got)
-				}
+			idCi, ok := colIdx["id"]
+			if !ok {
+				t.Fatalf("row %d: SELECT * missing mandatory column \"id\"", rowIdx-1)
 			}
-			if ci, ok := colIdx["ts"]; ok {
-				if got := batch.Int64(ci, br); got != want.tsMicros {
-					t.Fatalf("id=%d ts: want %d got %d", want.id, want.tsMicros, got)
-				}
+			if got := batch.Int64(idCi, br); got != want.id {
+				t.Fatalf("row %d id: want %d got %d", rowIdx-1, want.id, got)
+			}
+			tsCi, ok := colIdx["ts"]
+			if !ok {
+				t.Fatalf("id=%d: SELECT * missing mandatory column \"ts\"", want.id)
+			}
+			if got := batch.Int64(tsCi, br); got != want.tsMicros {
+				t.Fatalf("id=%d ts: want %d got %d", want.id, want.tsMicros, got)
 			}
 			for name := range table.colNames {
 				ci, present := colIdx[name]
