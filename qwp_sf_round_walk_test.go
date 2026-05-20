@@ -913,11 +913,15 @@ func TestInitialConnectAuthTimeoutBoundsHungUpgrade(t *testing.T) {
 		"the healthy peer must have received the test frame")
 
 	elapsed := time.Since(t0)
-	// host[0] burns auth_timeout_ms (500 ms), then host[1] connects
-	// quickly. Generous slack for the round-walk's own backoff +
-	// CI noise — Java uses 5 s; we match.
-	assert.Less(t, elapsed, 5*time.Second,
-		"auth_timeout_ms must bound the hung upgrade; elapsed=%v", elapsed)
+	// Two-sided bound: host[0] MUST burn ~auth_timeout_ms (500 ms)
+	// before the walk moves on (lower bound catches a regression that
+	// short-circuits host[0]); host[1] connects quickly afterwards
+	// (upper bound catches a regression that lets the per-host timeout
+	// drift well past the configured value).
+	assert.GreaterOrEqual(t, elapsed, 400*time.Millisecond,
+		"host[0] must actually exercise auth_timeout_ms (~500 ms) before the walk moves on; elapsed=%v", elapsed)
+	assert.Less(t, elapsed, 2*time.Second,
+		"auth_timeout_ms must bound the hung upgrade close to the configured 500 ms; elapsed=%v", elapsed)
 }
 
 // TestInitialConnectStaysOnPrimaryAfterTopologyChange — Go-side
