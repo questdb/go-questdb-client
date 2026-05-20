@@ -612,6 +612,34 @@ func (s *qwpFuzzServer) pause() {
 	}
 }
 
+// kill abruptly terminates the JVM with SIGKILL — no graceful shutdown
+// hooks run, no in-flight WS ACKs leave the worker pool, and the OS
+// tears down listening + accepted sockets via RST. The abrupt
+// counterpart to pause()'s SIGTERM. Required by the restart-replay
+// tests in qwp_ingress_server_restart_fuzz_test.go that need to leave
+// the client's SF disk holding genuinely-unacked frames across Close:
+// SIGTERM lets the JVM's shutdown hooks ack everything before exit,
+// which empirically full-drains those tests' 500-5000-row batches
+// every time and skips the "frames stay on disk through close" code
+// path. Idempotent and a no-op in QDB_FUZZ_ADDR mode.
+func (s *qwpFuzzServer) kill() {
+	if !s.owns {
+		return
+	}
+	s.mu.Lock()
+	cmd, waitCh, logFile := s.cmd, s.waitCh, s.logFile
+	s.cmd, s.waitCh, s.logFile = nil, nil, nil
+	s.mu.Unlock()
+
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		<-waitCh
+	}
+	if logFile != nil {
+		logFile.Close()
+	}
+}
+
 // stop terminates the JVM (via pause()) and removes the temp data dir.
 // Called once at TestMain teardown; not re-entry-safe with start().
 func (s *qwpFuzzServer) stop() {

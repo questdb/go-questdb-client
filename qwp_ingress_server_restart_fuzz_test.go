@@ -348,11 +348,14 @@ func TestQwpFuzzIngressServerRestartNewSenderRecoversFromSfDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("epoch 1 flush: %v", err)
 	}
-	// Pause BEFORE close so genuinely-unacked frames remain on disk.
-	// srv.pause() is synchronous on JVM exit (SIGTERM + wait), so by
-	// the time it returns the server side of the connection is gone
-	// and ackedFsn is no longer chasing publishedFsn.
-	srv.pause()
+	// Kill BEFORE close so genuinely-unacked frames remain on disk.
+	// srv.kill() (SIGKILL) is used rather than pause() (SIGTERM): a
+	// graceful JVM shutdown lets the worker pool flush every queued
+	// ACK before exit, which in practice always full-drains the
+	// 5000-row batch and skips the disk-durability code path. SIGKILL
+	// blocks until the process is reaped, so ackedFsn is stable from
+	// this point: no further ACKs can reach the loop.
+	srv.kill()
 	ackedBeforeClose := qs1.AckedFsn()
 	cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := qs1.Close(cctx); err != nil {
@@ -362,16 +365,18 @@ func TestQwpFuzzIngressServerRestartNewSenderRecoversFromSfDir(t *testing.T) {
 	}
 	ccancel()
 	// Durability invariant: any frame published but not acked at the
-	// time Close ran must survive on disk for epoch 2 to adopt. The
-	// 5000-row sizing here is the same one Java picked so that "some
-	// won't be drained"; if the test happens to race the send loop
-	// past full drain (ackedBeforeClose == publishedFsn), engineClose
-	// is allowed to unlink and we skip the eager check — the
+	// time Close ran must survive on disk for epoch 2 to adopt. With
+	// kill() above, the expected outcome is ackedBeforeClose <
+	// publishedFsn — the disk-assert branch fires and catches a
+	// close-time unlink regression eagerly. The else branch only
+	// exists as defense against a rare path where in-flight ACKs were
+	// already in the client's OS receive buffer at kill time and the
+	// send loop drained them before our snapshot; in that case the
 	// end-of-test row count still covers the property.
 	if ackedBeforeClose < publishedFsn {
 		restartFuzzAssertSegmentsOnDisk(t, sfDir, "epoch 1")
 	} else {
-		t.Logf("epoch 1: full drain raced ahead of pause (publishedFsn=%d, ackedBeforeClose=%d) — skipping eager disk check",
+		t.Logf("epoch 1: full drain raced ahead of kill (publishedFsn=%d, ackedBeforeClose=%d) — skipping eager disk check",
 			publishedFsn, ackedBeforeClose)
 	}
 
@@ -495,10 +500,12 @@ func TestQwpFuzzIngressServerRestartMultipleRestartsNewSender(t *testing.T) {
 		// Random pause: sometimes the server drains everything,
 		// sometimes not.
 		time.Sleep(time.Duration(r.Intn(50)) * time.Millisecond)
-		// Pause server BEFORE sender exits → unacked frames stay on disk.
-		// srv.pause() blocks until the JVM has exited, so ackedFsn is
-		// stable from this point: no further ACKs can reach the loop.
-		srv.pause()
+		// Kill server BEFORE sender exits → unacked frames stay on
+		// disk. SIGKILL rather than the graceful SIGTERM (pause) so
+		// the JVM cannot flush queued ACKs through its shutdown hooks
+		// and full-drain the batch; blocks until the process is
+		// reaped, so ackedFsn is stable from this point.
+		srv.kill()
 		ackedBeforeClose := qs.AckedFsn()
 		cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := qs.Close(cctx); err != nil {
@@ -508,16 +515,19 @@ func TestQwpFuzzIngressServerRestartMultipleRestartsNewSender(t *testing.T) {
 		ccancel()
 		// Durability invariant: when at least one frame was unacked
 		// at Close time, the slot's .sfa files must survive so the
-		// next epoch can adopt and replay. The random pause above is
-		// designed to land in both regimes (full drain and partial
-		// drain), so we gate on publishedFsn > ackedBeforeClose — a
-		// regression that unlinks segments under that condition trips
-		// here instead of as a vague row-count miss after the loop.
+		// next epoch can adopt and replay. With kill() above, the
+		// expected outcome each epoch is ackedBeforeClose <
+		// publishedFsn — the disk-assert branch fires. The random
+		// sleep before kill spreads the unacked count across the
+		// 500-1999-row range, so different epochs exercise different
+		// partial-drain depths. The else branch is defensive for the
+		// rare OS-buffered-ACK race; the end-of-test row count keeps
+		// coverage there.
 		if ackedBeforeClose < publishedFsn {
 			restartFuzzAssertSegmentsOnDisk(t, sfDir,
 				fmt.Sprintf("epoch %d", epoch))
 		} else {
-			t.Logf("epoch %d: full drain raced ahead of pause (publishedFsn=%d, ackedBeforeClose=%d) — skipping eager disk check",
+			t.Logf("epoch %d: full drain raced ahead of kill (publishedFsn=%d, ackedBeforeClose=%d) — skipping eager disk check",
 				epoch, publishedFsn, ackedBeforeClose)
 		}
 		totalRows += int64(rowsPerEpoch)
