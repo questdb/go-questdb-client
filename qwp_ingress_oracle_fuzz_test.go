@@ -1200,3 +1200,206 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 		}
 	}
 }
+
+// --- restart-replay scenario -----------------------------------------
+
+// TestQwpFuzzIngressOracleSenderRestartReplay ports
+// QwpIngressOracleFuzzTest.testOracleSenderRestartReplaysAcrossBounces.
+// Each producer opens-and-closes a fresh sender repeatedly with
+// close_flush_timeout_millis=0 so unacked frames stay on disk in the
+// per-producer sf_dir. The next sender on the same slot adopts those
+// frames and replays them (SF on-disk format is shared with the Java
+// client, so the slot-recovery contract is the same). A bouncer
+// interleaves a couple of server restarts. Each producer finishes with
+// one drain-pass sender on default close_flush_timeout to ensure all
+// residual frames have ACKed before the oracle check.
+//
+// Final state must match the oracle exactly — the property under test
+// is "no row loss across sender close/reopen + server bounce, only
+// dedup-collapsed wire-level replays."
+//
+// Faithful-port divergences (cf. file header + bounce / poison ports):
+//
+//   - Uses fixture bounce() for the bouncer; same SIGTERM + ~500ms +
+//     JVM-reboot interval as the bounce-torture port. Needs
+//     fixture-launched mode (skips !owns).
+//   - The drain pass sets close_flush_timeout_millis=120000 explicitly
+//     (Java uses the default; equivalent intent — give the final pass
+//     time to ACK every residual frame).
+//   - Counts are CI-bounded; decimals non-negative.
+//   - Reproducible via QWP_FUZZ_SEED.
+func TestQwpFuzzIngressOracleSenderRestartReplay(t *testing.T) {
+	srv := fuzzServer(t)
+	if !srv.owns {
+		t.Skip("restart-replay needs a fixture-launched server " +
+			"(QDB_FUZZ_ADDR mode cannot bounce the process)")
+	}
+	r := newFuzzRand(t)
+
+	producerCount := 2 + r.Intn(2)       // 2..3
+	rowsPerProducer := 300 + r.Intn(400) // 300..699 (CI-bounded)
+	bounces := 1 + r.Intn(2)             // 1..2
+	sfMaxBytes := oraclePickSfMaxBytes(r)
+	lifetimeSeeds := make([]int64, producerCount)
+	for p := 0; p < producerCount; p++ {
+		lifetimeSeeds[p] = r.Int63()
+	}
+	bRnd := rand.New(rand.NewSource(r.Int63()))
+	totalRows := producerCount * rowsPerProducer
+	t.Logf("ingress oracle restart-replay: producers=%d rows/producer=%d total=%d bounces=%d sf_max_bytes=%d",
+		producerCount, rowsPerProducer, totalRows, bounces, sfMaxBytes)
+
+	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
+	defer srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
+	srv.mustExec(t, oracleCreateSQL)
+
+	oracle := newOracleTable()
+	perProducer := make([][]*oracleRow, producerCount)
+	var globalIdx int64
+	for p := 0; p < producerCount; p++ {
+		genR := rand.New(rand.NewSource(r.Int63()))
+		perProducer[p] = make([]*oracleRow, rowsPerProducer)
+		for i := 0; i < rowsPerProducer; i++ {
+			id := globalIdx
+			ts := oracleBaseTsMicros + globalIdx
+			row := oracleGenerateRow(genR, id, ts)
+			perProducer[p][i] = row
+			oracle.addRow(row)
+			globalIdx++
+		}
+	}
+
+	sfRoot := t.TempDir()
+	sfDirs := make([]string, producerCount)
+	for p := 0; p < producerCount; p++ {
+		sfDirs[p] = filepath.Join(sfRoot, fmt.Sprintf("p%d", p))
+		if err := os.MkdirAll(sfDirs[p], 0o755); err != nil {
+			t.Fatalf("mkdir sf_dir: %v", err)
+		}
+	}
+
+	openSender := func(p int, conf string) (QwpSender, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		ls, err := LineSenderFromConf(ctx, conf)
+		if err != nil {
+			return nil, fmt.Errorf("producer %d open: %w", p, err)
+		}
+		qs, ok := ls.(QwpSender)
+		if !ok {
+			_ = ls.Close(ctx)
+			return nil, fmt.Errorf("producer %d: not a QwpSender (%T)", p, ls)
+		}
+		return qs, nil
+	}
+	closeSender := func(qs QwpSender) {
+		cctx, ccancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer ccancel()
+		_ = qs.Close(cctx)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, producerCount)
+	for p := 0; p < producerCount; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					errs[p] = fmt.Errorf("producer %d panicked: %v", p, rec)
+				}
+			}()
+			lifeR := rand.New(rand.NewSource(lifetimeSeeds[p]))
+			ctx := context.Background()
+			rows := perProducer[p]
+			loopConf := fmt.Sprintf(
+				"ws::addr=%s;sf_dir=%s;initial_connect_retry=async;"+
+					"reconnect_max_duration_millis=120000;"+
+					"sf_max_bytes=%d;close_flush_timeout_millis=0;",
+				srv.wsAddr(), sfDirs[p], sfMaxBytes)
+			written := 0
+			for written < len(rows) {
+				chunk := 30 + lifeR.Intn(200) // 30..229 rows per sender
+				end := min(written+chunk, len(rows))
+				qs, err := openSender(p, loopConf)
+				if err != nil {
+					errs[p] = err
+					return
+				}
+				for i := written; i < end; i++ {
+					oraclePublish(t, qs, ctx, rows[i])
+				}
+				if lifeR.Intn(2) == 0 {
+					if err := qs.Flush(ctx); err != nil {
+						errs[p] = fmt.Errorf("producer %d flush: %w", p, err)
+						closeSender(qs)
+						return
+					}
+				}
+				// Close with timeout=0 -> abandon any unacked frames to
+				// disk for the next sender on the same slot to adopt
+				// and replay.
+				closeSender(qs)
+				written = end
+			}
+			// Final drain pass: open one more sender with a generous
+			// close_flush_timeout so residual frames replay + ACK
+			// before the oracle check.
+			drainConf := fmt.Sprintf(
+				"ws::addr=%s;sf_dir=%s;initial_connect_retry=async;"+
+					"reconnect_max_duration_millis=120000;"+
+					"sf_max_bytes=%d;close_flush_timeout_millis=120000;",
+				srv.wsAddr(), sfDirs[p], sfMaxBytes)
+			qs, err := openSender(p, drainConf)
+			if err != nil {
+				errs[p] = err
+				return
+			}
+			if err := qs.Flush(ctx); err != nil {
+				errs[p] = fmt.Errorf("producer %d drain flush: %w", p, err)
+				closeSender(qs)
+				return
+			}
+			closeSender(qs)
+		}(p)
+	}
+
+	bouncerDone := make(chan struct{})
+	var bounceErr error
+	go func() {
+		defer close(bouncerDone)
+		time.Sleep(200 * time.Millisecond)
+		for i := 0; i < bounces; i++ {
+			t.Logf("restart-replay bounce %d/%d", i+1, bounces)
+			if err := srv.bounce(); err != nil {
+				bounceErr = fmt.Errorf("bounce %d/%d: %w", i+1, bounces, err)
+				return
+			}
+			time.Sleep(time.Duration(300+bRnd.Intn(400)) * time.Millisecond)
+		}
+	}()
+
+	<-bouncerDone
+	wg.Wait()
+	if bounceErr != nil {
+		t.Fatalf("%v", bounceErr)
+	}
+	for p, e := range errs {
+		if e != nil {
+			t.Fatalf("producer %d: %v", p, e)
+		}
+	}
+
+	srv.awaitRows(t, oracleTableName, totalRows, 180*time.Second)
+
+	c := newBindFuzzClient(t, srv)
+	oracleAssert(t, c, oracle)
+
+	capBytes := sfMaxBytes + 256*1024
+	for p, dir := range sfDirs {
+		if sz := oracleSfDirSize(dir); sz > capBytes {
+			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
+				p, dir, sz, capBytes)
+		}
+	}
+}
