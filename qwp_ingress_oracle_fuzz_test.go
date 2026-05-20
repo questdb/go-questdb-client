@@ -1494,12 +1494,17 @@ func TestQwpFuzzIngressOracleSenderRestartReplay(t *testing.T) {
 // offline -> online transition.
 //
 // Shape: pause the fixture so its port is closed; producers open
-// async, publish everything and signal "enqueued"; a starter
-// goroutine waits for that signal, settles briefly (so the first
-// connect attempt is guaranteed to have hit ECONNREFUSED — proving
-// the ASYNC contract rather than letting the dial happen
-// post-resume), then calls start(); senders' close blocks on
-// close_flush_timeout to drain.
+// async, publish everything, then assert
+// QwpSender.TotalReconnectAttempts() >= 2 — the I/O thread bumps
+// that counter via the OnAttempt callback inside connectWithBackoff
+// before each dial, so >=2 proves the first dial completed
+// (ECONNREFUSED) and the backoff loop kicked off a second. Only
+// after that per-producer assertion does the producer signal
+// "enqueued". A starter goroutine waits for the signal and calls
+// start(); senders' close blocks on close_flush_timeout to drain.
+// A regression where ASYNC silently degraded to "no retry until
+// close" would publish + signal fine but fail the counter
+// assertion before any port reopens.
 //
 // Faithful-port divergences (cf. file header + bounce / restart-replay
 // / poison ports):
@@ -1637,10 +1642,44 @@ func TestQwpFuzzIngressOracleAsyncConnectQueues(t *testing.T) {
 			if err := qs.Flush(pubCtx); err != nil {
 				errs[p] = fmt.Errorf("producer %d final flush: %w", p, err)
 			}
+			// Prove the ASYNC contract before signaling. The I/O
+			// thread bumps TotalReconnectAttempts via OnAttempt
+			// inside connectWithBackoff *before* each dial, so
+			// >=2 is the unambiguous "first dial completed
+			// (ECONNREFUSED on the paused port) and the backoff
+			// loop entered the second iteration" signal — a value
+			// of 1 only proves a dial was initiated.
+			// reconnect_initial_backoff_millis=20 means the second
+			// attempt fires within ~40ms; we give 10s of slack for
+			// slow CI before declaring the offline-retry loop dead.
+			// Without this assertion a regression where ASYNC
+			// silently degraded to "no retry until close" would
+			// still pass: producers fill sf_dir locally, signal,
+			// and Close() drives a belated drain once start() runs.
+			if errs[p] == nil {
+				const minAttempts = int64(2)
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					if qs.TotalReconnectAttempts() >= minAttempts {
+						break
+					}
+					if time.Now().After(deadline) {
+						errs[p] = fmt.Errorf(
+							"producer %d: ASYNC contract violation — "+
+								"TotalReconnectAttempts=%d after 10s with port closed "+
+								"(want >=%d). Background offline-retry loop did not "+
+								"execute at least one full ECONNREFUSED cycle; ASYNC "+
+								"appears to have degraded to 'no retry until close'",
+							p, qs.TotalReconnectAttempts(), minAttempts)
+						break
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
 			// Signal "everything enqueued to sf_dir" BEFORE the
-			// close-block. Frame I/O has not yet started talking to
-			// any server — that only begins once the starter brings
-			// it up and Close() drives the drain.
+			// close-block. The wire is still in the offline-retry
+			// loop — it only comes up once the starter brings the
+			// server up and Close() drives the drain.
 			allEnqueued <- struct{}{}
 			cctx, ccancel := context.WithTimeout(context.Background(), 150*time.Second)
 			_ = qs.Close(cctx)
@@ -1663,11 +1702,10 @@ func TestQwpFuzzIngressOracleAsyncConnectQueues(t *testing.T) {
 				return
 			}
 		}
-		// Brief settle so the I/O thread has at minimum hit one
-		// ECONNREFUSED retry — exercises the ASYNC contract
-		// (background connect loop) rather than letting the first
-		// connect happen post-server-up.
-		time.Sleep(100 * time.Millisecond)
+		// Each producer has already asserted >=2 background
+		// connect attempts hit ECONNREFUSED before signaling, so
+		// the ASYNC contract is proven before we get here. Bring
+		// the server up so Close() can drain the queued frames.
 		if err := srv.start(); err != nil {
 			starterErr = fmt.Errorf("starter: %w", err)
 		}
