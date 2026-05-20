@@ -879,7 +879,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 
 		s.Table(tableName)
@@ -903,7 +903,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 
 		s.Table(tableName)
@@ -926,7 +926,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 
 		s.Table(tableName)
@@ -949,7 +949,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 
 		s.Table(tableName)
@@ -973,7 +973,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 
 		s.Table(tableName)
@@ -996,7 +996,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 
 		// a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 — borrowed from the
@@ -1025,7 +1025,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 
 		// Whole second so there's no sub-millisecond noise to worry about.
@@ -1055,7 +1055,7 @@ func TestQwpIntegrationQwpOnlyTypes(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 
 		// Use a nanosecond-precision designated timestamp (AtNano). The
@@ -1101,7 +1101,7 @@ func TestQwpIntegrationDecimalColumns(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	// Mirror the Java port's Decimal{64,128,256}.fromLong(unscaled, scale)
@@ -1162,7 +1162,7 @@ func TestQwpIntegrationFloat64Arrays(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1217,7 +1217,7 @@ func TestQwpIntegrationGeohash(t *testing.T) {
 		"CREATE TABLE '%s' (gh GEOHASH(8c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL",
 		tableName))
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	// Any 40-bit pattern round-trips as long as the client's wire
@@ -1295,7 +1295,7 @@ func TestQwpIntegrationOmittedColumns(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	base := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1426,14 +1426,17 @@ func TestQwpIntegrationOmittedColumns(t *testing.T) {
 	}
 }
 
-// newOrSkip constructs a QWP sender for the integration suite or skips
-// the test on connection failure. Used by per-subtest helpers so each
-// subtest gets its own sender.
-func newOrSkip(t *testing.T, ctx context.Context) QwpSender {
+// newQwpIntegSender constructs a QWP sender for the integration suite.
+// Used by per-subtest helpers so each subtest gets its own sender.
+// Callers must have already run qwpEnsureServer(t), so a connect
+// failure here is a real sender bug, not a deployment gap — Fatalf
+// (also makes QDB_FUZZ_STRICT=1 in qwp-fuzz.yml fail loudly instead of
+// silently passing).
+func newQwpIntegSender(t *testing.T, ctx context.Context) QwpSender {
 	t.Helper()
 	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
 	if err != nil {
-		t.Skipf("QuestDB not available at %s: %v", qwpTestAddr, err)
+		t.Fatalf("connect ws://%s: %v", qwpTestAddr, err)
 	}
 	return s
 }
@@ -1453,7 +1456,7 @@ func TestQwpIntegrationWriteAllTypesInOneRow(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2022, 2, 25, 0, 0, 0, 0, time.UTC)
@@ -1513,7 +1516,7 @@ func TestQwpIntegrationSchemaIsolation(t *testing.T) {
 	defer qwpDropTable(t, tableA)
 	defer qwpDropTable(t, tableB)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	base := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1605,7 +1608,7 @@ func TestQwpIntegrationAutoCreateVarcharColumn(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1638,7 +1641,7 @@ func TestQwpIntegrationNameValidation(t *testing.T) {
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	t.Run("EmptyTableName", func(t *testing.T) {
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 		err := s.Table("").Int64Column("v", 1).At(ctx, ts)
 		if err == nil {
@@ -1654,7 +1657,7 @@ func TestQwpIntegrationNameValidation(t *testing.T) {
 		qwpDropTable(t, tableName)
 		defer qwpDropTable(t, tableName)
 
-		s := newOrSkip(t, ctx)
+		s := newQwpIntegSender(t, ctx)
 		defer s.Close(ctx)
 		err := s.Table(tableName).Int64Column("", 42).At(ctx, ts)
 		if err == nil {
@@ -1680,7 +1683,7 @@ func TestQwpIntegrationFloat64Array2D(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1718,7 +1721,7 @@ func TestQwpIntegrationFloat64Array3D(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1762,7 +1765,7 @@ func TestQwpIntegrationDecimalScaleConflict(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1795,7 +1798,7 @@ func TestQwpIntegrationColumnTypeConflict(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1824,7 +1827,7 @@ func TestQwpIntegrationDuplicateColumnInRow(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1856,7 +1859,7 @@ func TestQwpIntegrationGeohashPrecisionConflict(t *testing.T) {
 		"CREATE TABLE '%s' (g GEOHASH(8c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL",
 		tableName))
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	ts := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1897,7 +1900,7 @@ func TestQwpIntegrationAsyncCloseFlushes(t *testing.T) {
 	// Async sender (in-flight window = 4). No explicit Flush.
 	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 0, 0, nil, 4)
 	if err != nil {
-		t.Skipf("connect: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
 
 	base := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -1941,7 +1944,7 @@ func TestQwpIntegrationAsyncStressAcks(t *testing.T) {
 	// default in-flight window the sender must recycle buffers via ACKs.
 	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 2, 0, nil, 4)
 	if err != nil {
-		t.Skipf("connect: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
 	defer s.Close(ctx)
 
@@ -1983,7 +1986,7 @@ func TestQwpIntegrationAsyncMultiTable(t *testing.T) {
 
 	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 0, 0, nil, 4)
 	if err != nil {
-		t.Skipf("connect: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
 	defer s.Close(ctx)
 
@@ -2032,7 +2035,7 @@ func TestQwpIntegrationAsyncRowBasedFlush(t *testing.T) {
 	// autoFlushRows=10, so 50 rows → 5 automatic flushes in async mode.
 	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 5*time.Second, 10, 0, nil, 4)
 	if err != nil {
-		t.Skipf("connect: %v", err)
+		t.Fatalf("connect: %v", err)
 	}
 	defer s.Close(ctx)
 
@@ -2204,7 +2207,7 @@ func TestQwpIntegrationGorillaTimestampRoundTrip(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	// Build 128 timestamps whose DoDs span all five Gorilla buckets.
@@ -2271,7 +2274,7 @@ func TestQwpIntegrationSchemaEvolution(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	base := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -2351,7 +2354,7 @@ func TestQwpIntegrationBoolBitPacking(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	s := newOrSkip(t, ctx)
+	s := newQwpIntegSender(t, ctx)
 	defer s.Close(ctx)
 
 	base := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -2391,12 +2394,13 @@ func TestQwpIntegrationBoolBitPacking(t *testing.T) {
 }
 
 func TestQwpIntegrationConnect(t *testing.T) {
+	qwpEnsureServer(t)
 	ctx := context.Background()
 
 	var tr qwpTransport
 	err := tr.connect(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath})
 	if err != nil {
-		t.Skipf("QuestDB not available: %v", err)
+		t.Fatalf("connect ws://%s: %v", qwpTestAddr, err)
 	}
 	defer tr.close()
 
