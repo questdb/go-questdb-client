@@ -1103,10 +1103,15 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			fileNameLimit: defaultFileNameLimit,
 		}
 	case qwpSenderType:
+		// retryTimeout deliberately not seeded for QWP: connect-
+		// string.md does not list retry_timeout as a QWP key
+		// (it's HTTP-only), and Sender.java rejects it on the
+		// WebSocket protocol. Leaving the zero value lets
+		// sanitizeQwpConf detect "user set it" and reject.
+		// reconnect_max_duration_millis is the QWP analogue.
 		return &lineSenderConfig{
 			senderType:              t,
 			address:                 defaultHttpAddress,
-			retryTimeout:            defaultRetryTimeout,
 			autoFlushRows:           qwpDefaultAutoFlushRows,
 			autoFlushInterval:       qwpDefaultAutoFlushInterval,
 			autoFlushBytes:          qwpDefaultAutoFlushBytes,
@@ -1220,6 +1225,14 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	}
 	if conf.minThroughput != 0 {
 		return errors.New("minThroughput setting is not available in the QWP client")
+	}
+	if conf.retryTimeout != 0 {
+		// connect-string.md does not list retry_timeout as a QWP key
+		// (it's HTTP-only) and Sender.java rejects it on the
+		// WebSocket protocol. The QWP analogue is the per-outage
+		// reconnect budget; point the user there.
+		return errors.New(
+			"retry_timeout is not supported for QWP; use reconnect_max_duration_millis for the per-outage budget")
 	}
 	if conf.httpTransport != nil {
 		return errors.New("httpTransport setting is not available in the QWP client")
@@ -1387,7 +1400,7 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		window = 1
 	}
 
-	s, err := newQwpLineSenderUnstarted(ctx, address, opts, conf.retryTimeout,
+	s, err := newQwpLineSenderUnstarted(ctx, address, opts,
 		conf.autoFlushRows, conf.autoFlushInterval, conf.dumpWriter, window)
 	if err != nil {
 		return nil, err

@@ -1018,7 +1018,7 @@ func TestQwpDumpWriter(t *testing.T) {
 	var buf bytes.Buffer
 	ctx := context.Background()
 
-	s, err := newQwpLineSender(ctx, "", qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, 0, &buf)
+	s, err := newQwpLineSender(ctx, "", qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, &buf)
 	require.NoError(t, err)
 
 	// Insert a row and flush — exercises the full sender pipeline so

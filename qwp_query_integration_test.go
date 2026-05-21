@@ -53,7 +53,7 @@ func insertRows(t *testing.T, tableName string, rows int) {
 	t.Helper()
 	ctx := context.Background()
 	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr,
-		qwpTransportOpts{endpointPath: qwpWritePath}, time.Second, 0, 0, nil)
+		qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("newQwpLineSender: %v", err)
 	}

@@ -311,9 +311,6 @@ type qwpLineSender struct {
 	// Maximum length for table and column names.
 	fileNameLimit int
 
-	// Connection and retry config.
-	retryTimeout time.Duration
-
 	// inFlightWindow is retained as a config knob for backwards
 	// compat but is a no-op in cursor mode — the engine handles
 	// concurrency via its own backpressure model.
@@ -353,8 +350,8 @@ type qwpLineSender struct {
 // dumpWriter is non-nil, outgoing bytes are recorded across every
 // transport instance the send loop creates (initial connect plus
 // reconnects).
-func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
-	s, err := newQwpLineSenderUnstarted(ctx, address, opts, retryTimeout,
+func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
+	s, err := newQwpLineSenderUnstarted(ctx, address, opts,
 		autoFlushRows, autoFlushInterval, dumpWriter, inFlightWindow...)
 	if err != nil {
 		return nil, err
@@ -370,7 +367,7 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 // the very first received frame races against the post-construction
 // setters and could be classified with the default resolver / handled
 // by the default handler instead of the user-configured ones.
-func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
+func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTransportOpts, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
 	window := 1
 	if len(inFlightWindow) > 0 && inFlightWindow[0] > 1 {
 		window = inFlightWindow[0]
@@ -384,7 +381,6 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 		nextSchemaId:      0,
 		maxSentSchemaId:   -1,
 		batchMaxSchemaId:  -1,
-		retryTimeout:      retryTimeout,
 		autoFlushRows:     autoFlushRows,
 		autoFlushInterval: autoFlushInterval,
 		inFlightWindow:    window,

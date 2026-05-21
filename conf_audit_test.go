@@ -25,8 +25,10 @@
 package questdb
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestConfQwpwsAlias pins the qwpws / qwpwss long-form schema aliases
@@ -350,6 +352,48 @@ func TestConfSharedConnectString(t *testing.T) {
 	}
 	if _, err := parseQwpQueryConf(shared); err != nil {
 		t.Errorf("egress parser rejected the shared connect string: %v", err)
+	}
+}
+
+// TestConfQwpRejectsRetryTimeout pins the fix for the silent-drop
+// audit finding: retry_timeout is HTTP-only (legacy ILP doc) and is
+// not listed in connect-string.md, and Sender.java:3412 rejects it
+// on the WebSocket protocol. The Go QWP sanitizer now rejects too,
+// pointing the user at the QWP analogue.
+func TestConfQwpRejectsRetryTimeout(t *testing.T) {
+	for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+		t.Run(schema, func(t *testing.T) {
+			_, err := LineSenderFromConf(context.Background(),
+				schema+"::addr=localhost:9000;retry_timeout=10000;")
+			if err == nil {
+				t.Fatal("expected error: retry_timeout must not be accepted on QWP")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "retry_timeout") {
+				t.Errorf("error %q does not name retry_timeout", msg)
+			}
+			if !strings.Contains(msg, "reconnect_max_duration_millis") {
+				t.Errorf("error %q does not point to the QWP analogue", msg)
+			}
+		})
+	}
+}
+
+// TestConfQwpRejectsWithRetryTimeoutOption pins the same reject on
+// the functional-option path so users who reach for WithRetryTimeout
+// on a QWP sender get the same error as the connect-string path.
+// (The WithRetryTimeout doc comment already says "Only available for
+// the HTTP sender"; this is the enforcement.)
+func TestConfQwpRejectsWithRetryTimeoutOption(t *testing.T) {
+	_, err := NewLineSender(context.Background(),
+		WithQwp(),
+		WithAddress("localhost:9000"),
+		WithRetryTimeout(5*time.Second))
+	if err == nil {
+		t.Fatal("expected error: WithRetryTimeout must not be accepted on QWP")
+	}
+	if !strings.Contains(err.Error(), "retry_timeout") {
+		t.Errorf("error %q does not name retry_timeout", err.Error())
 	}
 }
 
