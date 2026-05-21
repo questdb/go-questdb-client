@@ -316,6 +316,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative int (milliseconds)", k, v)
 			}
 			senderConf.reconnectMaxDurationMillis = parsedVal
+			senderConf.reconnectMaxDurationMillisSet = true
 		case "reconnect_initial_backoff_millis":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -325,6 +326,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
 			}
 			senderConf.reconnectInitialBackoffMillis = parsedVal
+			senderConf.reconnectInitialBackoffMillisSet = true
 		case "reconnect_max_backoff_millis":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -334,6 +336,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
 			}
 			senderConf.reconnectMaxBackoffMillis = parsedVal
+			senderConf.reconnectMaxBackoffMillisSet = true
 		case "initial_connect_retry":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -349,6 +352,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false' / 'sync' / 'async'", k, v)
 			}
+			senderConf.initialConnectModeSet = true
 		case "close_flush_timeout_millis":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)

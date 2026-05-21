@@ -260,6 +260,105 @@ func TestSfConfInitialConnectRetryRejectsBogusValue(t *testing.T) {
 	}
 }
 
+// TestSfConfReconnectKeyPromotesInitialConnect pins the implicit
+// promotion documented in the connect-string reference: if the user
+// tuned any reconnect_* knob but did not pick an initial_connect_retry
+// mode, sanitize promotes the mode to sync so the reconnect budget
+// actually covers the *first* connect attempt. Mirrors Java's
+// actualInitialConnectMode resolution in Sender.java.
+//
+// confFromStr alone returns the parser's raw view (mode stays unset);
+// the promotion fires in sanitizeQwpConf. The assertions below
+// exercise both layers so future refactors can't silently relocate the
+// promotion to a layer the option-builder path bypasses.
+func TestSfConfReconnectKeyPromotesInitialConnect(t *testing.T) {
+	cases := []string{
+		"reconnect_max_duration_millis=120000",
+		"reconnect_initial_backoff_millis=200",
+		"reconnect_max_backoff_millis=10000",
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;" + c + ";")
+			require.NoError(t, err)
+			// Parser keeps the user's view raw: the mode is unset and
+			// the default-zero InitialConnectOff still reads.
+			assert.False(t, conf.initialConnectModeSet)
+			assert.Equal(t, InitialConnectOff, conf.initialConnectMode)
+			// Sanitize promotes when no explicit mode was chosen.
+			require.NoError(t, sanitizeQwpConf(conf))
+			assert.Equal(t, InitialConnectSync, conf.initialConnectMode)
+		})
+	}
+}
+
+// Explicit initial_connect_retry=off paired with a tuned reconnect
+// budget is a documented escape hatch: fail-fast on startup misconfig
+// while still accepting a generous post-connect outage budget. The
+// explicit choice must win over the promotion.
+func TestSfConfInitialConnectRetryOffOverridesPromotion(t *testing.T) {
+	conf, err := confFromStr(
+		"ws::addr=localhost:9000;sf_dir=/tmp/sf;" +
+			"reconnect_max_duration_millis=120000;" +
+			"initial_connect_retry=off;")
+	require.NoError(t, err)
+	require.NoError(t, sanitizeQwpConf(conf))
+	assert.Equal(t, InitialConnectOff, conf.initialConnectMode)
+}
+
+// initial_connect_retry=async paired with a tuned reconnect budget
+// also wins over the promotion — the explicit choice is preserved
+// verbatim, not silently coerced to sync.
+func TestSfConfInitialConnectRetryAsyncSurvivesPromotion(t *testing.T) {
+	conf, err := confFromStr(
+		"ws::addr=localhost:9000;sf_dir=/tmp/sf;" +
+			"reconnect_max_duration_millis=120000;" +
+			"initial_connect_retry=async;")
+	require.NoError(t, err)
+	require.NoError(t, sanitizeQwpConf(conf))
+	assert.Equal(t, InitialConnectAsync, conf.initialConnectMode)
+}
+
+// No reconnect_* knob set → no promotion. Defends against the
+// promotion logic firing on the QWP defaults (which seed the
+// reconnect fields lazily in the send loop, not at parse time).
+func TestSfConfNoReconnectKeyNoPromotion(t *testing.T) {
+	conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;")
+	require.NoError(t, err)
+	require.NoError(t, sanitizeQwpConf(conf))
+	assert.Equal(t, InitialConnectOff, conf.initialConnectMode)
+}
+
+// Functional-option parity for the promotion. WithReconnectPolicy on
+// its own must promote to sync; an explicit WithInitialConnectRetry
+// (or WithInitialConnectMode) must win over it. This is the option
+// path the Go builder API exposes, separate from the connect string.
+func TestSfOptionsWithReconnectPolicyPromotes(t *testing.T) {
+	conf := newLineSenderConfig(qwpSenderType)
+	WithSfDir("/tmp/sf")(conf)
+	WithReconnectPolicy(2*time.Minute, 100*time.Millisecond, 5*time.Second)(conf)
+	require.NoError(t, sanitizeQwpConf(conf))
+	assert.Equal(t, InitialConnectSync, conf.initialConnectMode)
+}
+
+func TestSfOptionsWithInitialConnectRetryOffOverridesPromotion(t *testing.T) {
+	conf := newLineSenderConfig(qwpSenderType)
+	WithSfDir("/tmp/sf")(conf)
+	WithReconnectPolicy(2*time.Minute, 100*time.Millisecond, 5*time.Second)(conf)
+	WithInitialConnectRetry(false)(conf)
+	require.NoError(t, sanitizeQwpConf(conf))
+	assert.Equal(t, InitialConnectOff, conf.initialConnectMode)
+}
+
+func TestSfOptionsWithInitialConnectModeAsyncSurvivesPromotion(t *testing.T) {
+	conf := newLineSenderConfig(qwpSenderType)
+	WithSfDir("/tmp/sf")(conf)
+	WithReconnectPolicy(2*time.Minute, 100*time.Millisecond, 5*time.Second)(conf)
+	WithInitialConnectMode(InitialConnectAsync)(conf)
+	require.NoError(t, sanitizeQwpConf(conf))
+	assert.Equal(t, InitialConnectAsync, conf.initialConnectMode)
+}
+
 func TestSanitizeQwpConfRejectsSfKeysWithoutSfDir(t *testing.T) {
 	cases := []func(c *lineSenderConfig){
 		func(c *lineSenderConfig) { c.senderId = "x" },

@@ -366,27 +366,36 @@ type lineSenderConfig struct {
 	// on reconnect / restart. When sfDir is empty, the sender stays
 	// on the in-memory async path (qwpAsyncState).
 	sfDir                         string
-	senderId                      string        // empty -> "default" at construction
-	sfMaxBytes                    int64         // per-segment size (bytes); 0 -> 4 MiB
-	sfMaxTotalBytes               int64         // total cap (bytes); 0 -> 10 GiB
-	sfDurability                  string        // empty / "memory" only; reserved future "flush" / "append"
-	sfAppendDeadlineMillis        int           // 0 -> 30000
-	reconnectMaxDurationMillis    int           // 0 -> 300000 (5 min)
-	reconnectInitialBackoffMillis int           // 0 -> 100
-	reconnectMaxBackoffMillis     int           // 0 -> 5000
-	initialConnectMode            InitialConnectMode // default InitialConnectOff
-	closeFlushTimeoutMillis       int           // 0 -> 5000; -1 / negative -> fast close (skip drain)
-	closeFlushTimeoutSet          bool          // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
-	drainOrphans                  bool          // default false (Phase 6)
-	maxBackgroundDrainers         int           // 0 -> 4 (Phase 6)
+	senderId                      string // empty -> "default" at construction
+	sfMaxBytes                    int64  // per-segment size (bytes); 0 -> 4 MiB
+	sfMaxTotalBytes               int64  // total cap (bytes); 0 -> 10 GiB
+	sfDurability                  string // empty / "memory" only; reserved future "flush" / "append"
+	sfAppendDeadlineMillis        int    // 0 -> 30000
+	reconnectMaxDurationMillis    int    // 0 -> 300000 (5 min)
+	reconnectInitialBackoffMillis int    // 0 -> 100
+	reconnectMaxBackoffMillis     int    // 0 -> 5000
+	// Per-key explicit-set flags for the three reconnect_* knobs.
+	// Used by sanitizeQwpConf to implement the implicit promotion of
+	// initial_connect_retry to "on" when the user tuned any reconnect
+	// budget without choosing a connect mode (matches Java's behaviour
+	// — see Sender.java's actualInitialConnectMode resolution).
+	reconnectMaxDurationMillisSet    bool
+	reconnectInitialBackoffMillisSet bool
+	reconnectMaxBackoffMillisSet     bool
+	initialConnectMode               InitialConnectMode // default InitialConnectOff
+	initialConnectModeSet            bool               // true if user explicitly chose a mode (gates the reconnect_*-driven promotion)
+	closeFlushTimeoutMillis          int                // 0 -> 5000; -1 / negative -> fast close (skip drain)
+	closeFlushTimeoutSet             bool               // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
+	drainOrphans                     bool               // default false (Phase 6)
+	maxBackgroundDrainers            int                // 0 -> 4 (Phase 6)
 
 	// QWP server-error API (Phase 5). All fields are QWP-only.
-	errorHandler         SenderErrorHandler                       // nil -> default loud handler
-	errorPolicyResolver  func(Category) Policy                    // nil -> per-category map / global / spec defaults
-	errorPolicyPerCat    [numCategories]Policy                    // PolicyAuto = unset; cleared at construction
-	errorPolicyPerCatSet bool                                     // tracks whether *any* per-category override was set
-	errorPolicyGlobal    Policy                                   // PolicyAuto = unset
-	errorInboxCapacity   int                                      // 0 -> qwpSfDefaultErrorInboxCapacity; sanitizer floors at qwpSfMinErrorInboxCapacity
+	errorHandler         SenderErrorHandler    // nil -> default loud handler
+	errorPolicyResolver  func(Category) Policy // nil -> per-category map / global / spec defaults
+	errorPolicyPerCat    [numCategories]Policy // PolicyAuto = unset; cleared at construction
+	errorPolicyPerCatSet bool                  // tracks whether *any* per-category override was set
+	errorPolicyGlobal    Policy                // PolicyAuto = unset
+	errorInboxCapacity   int                   // 0 -> qwpSfDefaultErrorInboxCapacity; sanitizer floors at qwpSfMinErrorInboxCapacity
 }
 
 // LineSenderOption defines line sender config option.
@@ -567,6 +576,9 @@ func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) 
 		s.reconnectMaxDurationMillis = int(maxDuration / time.Millisecond)
 		s.reconnectInitialBackoffMillis = int(initialBackoff / time.Millisecond)
 		s.reconnectMaxBackoffMillis = int(maxBackoff / time.Millisecond)
+		s.reconnectMaxDurationMillisSet = true
+		s.reconnectInitialBackoffMillisSet = true
+		s.reconnectMaxBackoffMillisSet = true
 	}
 }
 
@@ -588,6 +600,7 @@ func WithInitialConnectRetry(retry bool) LineSenderOption {
 		} else {
 			s.initialConnectMode = InitialConnectOff
 		}
+		s.initialConnectModeSet = true
 	}
 }
 
@@ -600,6 +613,7 @@ func WithInitialConnectRetry(retry bool) LineSenderOption {
 func WithInitialConnectMode(mode InitialConnectMode) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.initialConnectMode = mode
+		s.initialConnectModeSet = true
 	}
 }
 
@@ -1237,6 +1251,25 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	}
 	if conf.authTimeoutMs <= 0 {
 		conf.authTimeoutMs = 15_000
+	}
+	// Implicit promotion of initial_connect_retry. When the user tuned
+	// any reconnect_* knob but did not pick an initial-connect mode,
+	// promote to sync — the reconnect budget they wrote should also
+	// cover the *first* connect attempt. Otherwise the knob name reads
+	// as a generic retry budget but the underlying path only governs
+	// reconnects from an established connection, and the budget is
+	// silently dropped at startup. Mirrors the Java client's
+	// actualInitialConnectMode resolution in Sender.java.
+	//
+	// An explicit user choice (any value of initial_connect_retry, or
+	// either of the With* setters) wins unconditionally — including
+	// "off" paired with a tuned reconnect budget for users who want
+	// fail-fast on startup misconfig but a generous post-connect budget.
+	if !conf.initialConnectModeSet &&
+		(conf.reconnectMaxDurationMillisSet ||
+			conf.reconnectInitialBackoffMillisSet ||
+			conf.reconnectMaxBackoffMillisSet) {
+		conf.initialConnectMode = InitialConnectSync
 	}
 	// Cursor / store-and-forward validation. sf_dir activates cursor
 	// mode; the sf_*, sender_id, drain_orphans, max_background_drainers
