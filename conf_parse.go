@@ -270,14 +270,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			senderConf.inFlightWindow = parsedVal
 		case "close_timeout":
-			if senderConf.senderType != qwpSenderType {
-				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
-			}
-			parsedVal, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int (milliseconds)", k, v)
-			}
-			senderConf.closeTimeout = time.Duration(parsedVal) * time.Millisecond
+			// Java client never accepted close_timeout — only
+			// close_flush_timeout_millis (Sender.java §3071). The
+			// legacy Go-only key was a v4.0-era memory-mode knob;
+			// the cursor architecture (CLAUDE.md) unified memory and
+			// SF paths onto close_flush_timeout_millis. Reject with
+			// a migration hint rather than silently dropping or
+			// going through the generic "unsupported option" path.
+			return nil, NewInvalidConfigStrError(
+				"close_timeout is no longer supported; use close_flush_timeout_millis instead")
 		case "max_schemas_per_connection":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)

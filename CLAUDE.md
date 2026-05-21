@@ -98,6 +98,32 @@ encoding.
 the cursor architecture — backpressure is governed by the engine's segment-ring
 + `engineAppendBlocking` deadline.
 
+### Java-parity QWP knobs (not in connect-string.md)
+
+These connect-string keys are recognised by the Java client
+(`Sender.java`) but are not listed in the
+[native-client spec](https://github.com/questdb/questdb-enterprise/blob/main/questdb/docs/qwp/connect-string.md).
+We accept them for Java-parity portability — a connect string that
+works on the Java client must work here. None should ever be
+considered for removal without a matching change in Java:
+
+- `gorilla=on|off` — gates the Gorilla timestamp encoding in
+  `qwp_encoder.go` (FLAG_GORILLA). Default `on`.
+- `max_schemas_per_connection=N` — caps `nextSchemaId` per
+  connection (default 65535; matches Java's
+  `DEFAULT_MAX_SCHEMAS_PER_CONNECTION`). When the cap is hit, the
+  sender errors and the caller must rebuild.
+- `in_flight_window=N` — see the "retained but a no-op" note above.
+
+`close_timeout=N` (millisecond integer) was a v4.0–v4.5 Go-only key
+for the memory-mode close path. The cursor architecture unified
+memory and SF onto `close_flush_timeout_millis`, which the spec
+also defines. The parser now rejects `close_timeout=` with a
+migration hint pointing at `close_flush_timeout_millis`.
+`WithCloseTimeout(d)` is retained as a deprecated alias that routes
+positive durations through `close_flush_timeout_millis`; new code
+should use `WithCloseFlushTimeout` directly.
+
 Flush semantics: `Flush` / `FlushAndGetSequence` **never wait for the server
 ACK** — they return once the batch is published into the cursor engine (in-RAM
 for memory mode, on-disk for SF) and the send loop delivers + replays it in the

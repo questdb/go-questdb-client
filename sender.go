@@ -354,11 +354,10 @@ type lineSenderConfig struct {
 	protocolVersion protocolVersion
 
 	// QWP-specific fields
-	inFlightWindow          int           // 0 = unset (treated as sync mode 1); seeded to qwpDefaultInFlightWindow by newLineSenderConfig
-	closeTimeout            time.Duration // 0 = use default (5s)
-	maxSchemasPerConnection int           // 0 = unset; seeded to qwpDefaultMaxSchemasPerConnection
-	dumpWriter              io.Writer     // if set, record outgoing bytes (unexported)
-	gorillaDisabled         bool          // false (default) = Gorilla timestamp encoding enabled
+	inFlightWindow          int       // 0 = unset (treated as sync mode 1); seeded to qwpDefaultInFlightWindow by newLineSenderConfig
+	maxSchemasPerConnection int       // 0 = unset; seeded to qwpDefaultMaxSchemasPerConnection
+	dumpWriter              io.Writer // if set, record outgoing bytes (unexported)
+	gorillaDisabled         bool      // false (default) = Gorilla timestamp encoding enabled
 
 	// QWP store-and-forward (cursor) fields. Setting sfDir activates
 	// cursor mode: flushed batches are persisted to mmap'd files
@@ -439,10 +438,19 @@ func WithInFlightWindow(window int) LineSenderOption {
 // Calling Flush() before Close() guarantees all data is ACKed
 // regardless of this timeout.
 //
-// Only relevant for the QWP sender in async mode (in-flight window > 1).
+// Deprecated: use WithCloseFlushTimeout instead. WithCloseTimeout is
+// preserved as an alias so v4.0–v4.5 code keeps compiling — it
+// routes through the same close_flush_timeout_millis path the spec
+// (connect-string.md §Ingress reconnect) defines. d <= 0 is treated
+// as "no override" (default 5s) to match the legacy semantics; to
+// skip the drain entirely, use WithCloseFlushTimeout, where 0 /
+// negative means "fast close".
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.closeTimeout = d
+		if d > 0 {
+			s.closeFlushTimeoutSet = true
+			s.closeFlushTimeoutMillis = int(d / time.Millisecond)
+		}
 	}
 }
 
@@ -1409,8 +1417,12 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	s.fileNameLimit = conf.fileNameLimit
 	s.autoFlushBytes = conf.autoFlushBytes
 	s.maxSchemasPerConnection = conf.maxSchemasPerConnection
-	if conf.closeTimeout > 0 {
-		s.closeTimeout = conf.closeTimeout
+	// Memory mode also honours close_flush_timeout_millis (the
+	// spec-aligned name). closeFlushTimeoutSet distinguishes "user
+	// set 0 / negative -> fast close" from "user did not set ->
+	// keep the constructor's 5s default".
+	if conf.closeFlushTimeoutSet {
+		s.closeTimeout = time.Duration(conf.closeFlushTimeoutMillis) * time.Millisecond
 	}
 	s.encoder.gorillaDisabled = conf.gorillaDisabled
 	// Encoder buffer is pre-sized for the microbatch role: max(1 MB,
@@ -1460,9 +1472,6 @@ func validateConf(conf *lineSenderConfig) error {
 	}
 	if conf.autoFlushInterval < 0 {
 		return fmt.Errorf("auto flush interval is negative: %d", conf.autoFlushInterval)
-	}
-	if conf.closeTimeout < 0 {
-		return fmt.Errorf("close timeout is negative: %d", conf.closeTimeout)
 	}
 	if conf.autoFlushBytes < 0 {
 		return fmt.Errorf("auto flush bytes is negative: %d", conf.autoFlushBytes)

@@ -397,6 +397,48 @@ func TestConfQwpRejectsWithRetryTimeoutOption(t *testing.T) {
 	}
 }
 
+// TestConfRejectsCloseTimeoutWithMigrationHint pins the removal of
+// the Go-only `close_timeout` key. Java never accepted it (only
+// close_flush_timeout_millis, Sender.java §3071), and the cursor
+// architecture unified the memory and SF close paths onto the
+// spec-aligned key. The parser rejects regardless of schema with a
+// migration hint, not the generic "unsupported option" error.
+func TestConfRejectsCloseTimeoutWithMigrationHint(t *testing.T) {
+	for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss", "http", "https", "tcp", "tcps"} {
+		t.Run(schema, func(t *testing.T) {
+			_, err := confFromStr(schema + "::addr=localhost:9000;close_timeout=1000;")
+			if err == nil {
+				t.Fatal("expected error: close_timeout must not be accepted")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "close_timeout") {
+				t.Errorf("error %q does not name close_timeout", msg)
+			}
+			if !strings.Contains(msg, "close_flush_timeout_millis") {
+				t.Errorf("error %q does not point at close_flush_timeout_millis", msg)
+			}
+		})
+	}
+}
+
+// TestConfMemoryModeHonoursCloseFlushTimeout pins the unification:
+// memory mode (no sf_dir) now reads close_flush_timeout_millis, not
+// the removed close_timeout. With the cursor architecture sharing
+// the same engine across memory and SF modes, both keys map to the
+// same runtime field via the spec-aligned name.
+func TestConfMemoryModeHonoursCloseFlushTimeout(t *testing.T) {
+	c, err := confFromStr("ws::addr=localhost:9000;close_flush_timeout_millis=2500;")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !c.closeFlushTimeoutSet {
+		t.Error("closeFlushTimeoutSet=false after explicit user value")
+	}
+	if c.closeFlushTimeoutMillis != 2500 {
+		t.Errorf("closeFlushTimeoutMillis=%d, want 2500", c.closeFlushTimeoutMillis)
+	}
+}
+
 // TestConfRejectsUnknownKeyOnBothSides confirms that a genuinely
 // unknown key (not in either spec set) still errors out, so the
 // silent-accept is scoped.

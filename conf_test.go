@@ -746,9 +746,13 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			expectedErrMsgContains: "in_flight_window is only supported for QWP senders",
 		},
 		{
-			name:                   "close_timeout on TCP",
+			// close_timeout was a Go-only legacy key; the Java client
+			// never accepted it. Removed in favour of the spec-
+			// aligned close_flush_timeout_millis. The parser now
+			// rejects regardless of schema, with a migration hint.
+			name:                   "close_timeout rejected with migration hint",
 			config:                 "tcp::addr=localhost:1111;close_timeout=1000;",
-			expectedErrMsgContains: "close_timeout is only supported for QWP senders",
+			expectedErrMsgContains: "close_timeout is no longer supported",
 		},
 		{
 			name:                   "max_schemas_per_connection on HTTP",
