@@ -36,6 +36,66 @@ type configData struct {
 	KeyValuePairs map[string]string
 }
 
+// egressOnlyKeys lists connect-string keys defined by the spec for the
+// QwpQueryClient (egress) only. The ingress LineSender silently
+// accepts them when the schema is ws:: / wss:: so that one connect
+// string can drive both Sender and QwpQueryClient — per
+// connect-string.md §16-20 ("Each direction reads the keys relevant
+// to it and ignores keys meant only for the other direction") and
+// §Query client keys ("The Sender (ingress) silently consumes the
+// same keys ... the Sender does not interpret the values"). Range,
+// enum, and type checks for these keys happen on the egress side
+// only.
+var egressOnlyKeys = map[string]bool{
+	"buffer_pool_size":            true,
+	"compression":                 true,
+	"compression_level":           true,
+	"failover":                    true,
+	"failover_backoff_initial_ms": true,
+	"failover_backoff_max_ms":     true,
+	"failover_max_attempts":       true,
+	"failover_max_duration_ms":    true,
+	"initial_credit":              true,
+	"max_batch_rows":              true,
+}
+
+// ingressOnlyKeys lists connect-string keys defined by the spec for
+// the ingress LineSender only. The egress QwpQueryClient silently
+// accepts them so a shared connect string works in both directions.
+// Same SSOT as egressOnlyKeys; the lists are kept in sync with
+// connect-string.md §Key index.
+var ingressOnlyKeys = map[string]bool{
+	"auto_flush":                            true,
+	"auto_flush_bytes":                      true,
+	"auto_flush_interval":                   true,
+	"auto_flush_rows":                       true,
+	"close_flush_timeout_millis":            true,
+	"drain_orphans":                         true,
+	"durable_ack_keepalive_interval_millis": true,
+	"error_inbox_capacity":                  true,
+	"init_buf_size":                         true,
+	"initial_connect_retry":                 true,
+	"max_background_drainers":               true,
+	"max_buf_size":                          true,
+	"max_name_len":                          true,
+	"on_internal_error":                     true,
+	"on_parse_error":                        true,
+	"on_schema_error":                       true,
+	"on_security_error":                     true,
+	"on_server_error":                       true,
+	"on_write_error":                        true,
+	"reconnect_initial_backoff_millis":      true,
+	"reconnect_max_backoff_millis":          true,
+	"reconnect_max_duration_millis":         true,
+	"request_durable_ack":                   true,
+	"sender_id":                             true,
+	"sf_append_deadline_millis":             true,
+	"sf_dir":                                true,
+	"sf_durability":                         true,
+	"sf_max_bytes":                          true,
+	"sf_max_total_bytes":                    true,
+}
+
 func confFromStr(conf string) (*lineSenderConfig, error) {
 	var senderConf *lineSenderConfig
 
@@ -55,9 +115,12 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 	case "tcps":
 		senderConf = newLineSenderConfig(tcpSenderType)
 		senderConf.tlsMode = tlsEnabled
-	case "ws":
+	case "ws", "qwpws":
+		// connect-string.md §Protocols and transports: qwpws is a
+		// long-form alias for ws. Same TLS mode (disabled), same
+		// transport selection.
 		senderConf = newLineSenderConfig(qwpSenderType)
-	case "wss":
+	case "wss", "qwpwss":
 		senderConf = newLineSenderConfig(qwpSenderType)
 		senderConf.tlsMode = tlsEnabled
 	default:
@@ -129,28 +192,33 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				senderConf.autoFlushBytes = 0
 				continue
 			}
+			parsedVal, err := parseSizeBytes(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q: %v", k, v, err)
+			}
+			senderConf.autoFlushBytes = int(parsedVal)
+		case "init_buf_size", "max_buf_size":
+			// Size-typed (connect-string.md §Size suffixes); accept
+			// JVM-style k/kb/m/mb/g/gb/t/tb suffixes alongside bare
+			// bytes.
+			parsedVal, err := parseSizeBytes(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q: %v", k, v, err)
+			}
+			if k == "init_buf_size" {
+				senderConf.initBufSize = int(parsedVal)
+			} else {
+				senderConf.maxBufSize = int(parsedVal)
+			}
+		case "request_min_throughput", "max_name_len":
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
-			senderConf.autoFlushBytes = parsedVal
-		case "request_min_throughput", "init_buf_size", "max_buf_size", "max_name_len":
-			parsedVal, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
-			}
-
-			switch k {
-			case "request_min_throughput":
+			if k == "request_min_throughput" {
 				senderConf.minThroughput = parsedVal
-			case "init_buf_size":
-				senderConf.initBufSize = parsedVal
-			case "max_buf_size":
-				senderConf.maxBufSize = parsedVal
-			case "max_name_len":
+			} else {
 				senderConf.fileNameLimit = parsedVal
-			default:
-				panic("add a case for " + k)
 			}
 		case "request_timeout", "retry_timeout":
 			timeout, err := strconv.Atoi(v)
@@ -248,18 +316,18 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			parsedVal, err := strconv.ParseInt(v, 10, 64)
+			parsedVal, err := parseSizeBytes(v)
 			if err != nil || parsedVal <= 0 {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int", k, v)
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive size", k, v)
 			}
 			senderConf.sfMaxBytes = parsedVal
 		case "sf_max_total_bytes":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			parsedVal, err := strconv.ParseInt(v, 10, 64)
+			parsedVal, err := parseSizeBytes(v)
 			if err != nil || parsedVal <= 0 {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int", k, v)
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive size", k, v)
 			}
 			senderConf.sfMaxTotalBytes = parsedVal
 		case "sf_durability":
@@ -471,6 +539,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
 		default:
+			if senderConf.senderType == qwpSenderType && egressOnlyKeys[k] {
+				// Silently accepted on ingress so a single ws:: / wss::
+				// connect string can configure both Sender and
+				// QwpQueryClient. The Sender does not interpret the
+				// value — range/enum/type checks run on the egress side
+				// (qwp_query_conf.go). connect-string.md §16-20 and
+				// §Query client keys are the load-bearing spec text.
+				continue
+			}
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}
 	}
@@ -538,10 +615,63 @@ func validateSfDurability(v string) error {
 	}
 }
 
+// parseSizeBytes parses a size-typed connect-string value: a non-
+// negative decimal integer optionally followed by a JVM-style 1024-
+// based size suffix. connect-string.md §Size suffixes: suffixes are
+// case-insensitive (k / kb / m / mb / g / gb / t / tb). Plain
+// integers (no suffix) are parsed as bytes. Returns an error for
+// empty input, non-numeric prefixes, unknown suffixes, negative
+// values, or int64 overflow.
+//
+// The longest known suffix wins ("kb" before "k"), so "1kb" is 1024
+// and not 1 followed by an unparsed "kb".
+func parseSizeBytes(v string) (int64, error) {
+	if v == "" {
+		return 0, fmt.Errorf("empty size value")
+	}
+	s := strings.ToLower(v)
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "kb"):
+		mult, s = 1<<10, s[:len(s)-2]
+	case strings.HasSuffix(s, "mb"):
+		mult, s = 1<<20, s[:len(s)-2]
+	case strings.HasSuffix(s, "gb"):
+		mult, s = 1<<30, s[:len(s)-2]
+	case strings.HasSuffix(s, "tb"):
+		mult, s = 1<<40, s[:len(s)-2]
+	case strings.HasSuffix(s, "k"):
+		mult, s = 1<<10, s[:len(s)-1]
+	case strings.HasSuffix(s, "m"):
+		mult, s = 1<<20, s[:len(s)-1]
+	case strings.HasSuffix(s, "g"):
+		mult, s = 1<<30, s[:len(s)-1]
+	case strings.HasSuffix(s, "t"):
+		mult, s = 1<<40, s[:len(s)-1]
+	}
+	if s == "" {
+		return 0, fmt.Errorf("no number before size suffix in %q", v)
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid number %q: %v", s, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("size %q must be non-negative", v)
+	}
+	if mult > 1 && n > 0 && n > (1<<62)/mult {
+		return 0, fmt.Errorf("size %q overflows int64", v)
+	}
+	return n * mult, nil
+}
+
 // validateSenderId enforces the same character set the Java client
-// allows for sender_id: ASCII letters, digits, '-', '_', '.'. The
-// value is used as a path segment under sf_dir; permitting '/' or
-// '\\' would let users traverse out of the slot dir.
+// allows for sender_id: ASCII letters, digits, '-', '_'. Matches
+// Sender.java validateSenderId (no '.', no path separators, no
+// spaces) and the connect-string spec at §Store-and-forward "Allowed
+// characters: letters, digits, `_`, `-`". The value is used as a path
+// segment under sf_dir; '.' is excluded to keep slot names stable
+// across filesystems and avoid '..' surprises.
 func validateSenderId(id string) error {
 	if id == "" {
 		return NewInvalidConfigStrError("sender_id must not be empty")
@@ -549,9 +679,11 @@ func validateSenderId(id string) error {
 	for i := 0; i < len(id); i++ {
 		c := id[i]
 		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'
+			(c >= '0' && c <= '9') || c == '-' || c == '_'
 		if !ok {
-			return NewInvalidConfigStrError("sender_id contains invalid character: %q", string(c))
+			return NewInvalidConfigStrError(
+				"sender_id contains invalid character: %q (allowed: letters, digits, _ -)",
+				string(c))
 		}
 	}
 	return nil

@@ -159,8 +159,10 @@ const (
 )
 
 // qwpDefaultCompressionLevel matches Java QwpQueryClient's compression
-// level default. Only relevant when compression != "raw".
-const qwpDefaultCompressionLevel = 3
+// level default (Sender.java compressionLevel field = 1; see also
+// connect-string.md §Query client keys: "Default `1` — the cheapest
+// server-side CPU"). Only relevant when compression != "raw".
+const qwpDefaultCompressionLevel = 1
 
 // qwpDefaultEgressBufferPoolSize is the I/O decode pool depth when the
 // caller hasn't overridden it. Matches the Java client default
@@ -410,12 +412,15 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 	}
 	cfg := qwpQueryDefaultConfig()
 	switch data.Schema {
-	case "ws":
+	case "ws", "qwpws":
+		// connect-string.md §Protocols and transports: qwpws /
+		// qwpwss are long-form aliases for ws / wss.
 		cfg.tlsMode = tlsDisabled
-	case "wss":
+	case "wss", "qwpwss":
 		cfg.tlsMode = tlsEnabled
 	default:
-		return nil, NewInvalidConfigStrError("invalid schema %q, expected ws or wss", data.Schema)
+		return nil, NewInvalidConfigStrError(
+			"invalid schema %q, expected ws, wss, qwpws, or qwpwss", data.Schema)
 	}
 	tlsVerifySet := false
 
@@ -587,11 +592,22 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 					"invalid replay_exec %q, expected on or off", v)
 			}
 		default:
+			if ingressOnlyKeys[k] {
+				// Silently accepted on egress so a single ws:: / wss::
+				// connect string can drive both Sender and
+				// QwpQueryClient. The QwpQueryClient does not
+				// interpret the value — range/enum/type checks run on
+				// the ingress side (conf_parse.go).
+				// connect-string.md §16-20 is the load-bearing spec
+				// text.
+				continue
+			}
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
 		}
 	}
 
-	if tlsVerifySet && data.Schema == "ws" {
+	// tls_verify gates the TLS handshake; only meaningful on wss/qwpwss.
+	if tlsVerifySet && (data.Schema == "ws" || data.Schema == "qwpws") {
 		return nil, NewInvalidConfigStrError("tls_verify requires the wss:: schema")
 	}
 

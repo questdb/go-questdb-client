@@ -214,10 +214,12 @@ func TestQwpQueryClientFromConfHappyPath(t *testing.T) {
 					t.Errorf("compression=%q, want auto", c.compression)
 				}
 				// "auto" advertises the same header value as "zstd";
-				// the server picks. Level defaults to 3.
-				if got := c.buildAcceptEncodingHeader(); got != "zstd;level=3,raw" {
+				// the server picks. Level defaults to 1
+				// (qwpDefaultCompressionLevel; Sender.java parity and
+				// connect-string.md §Query client keys).
+				if got := c.buildAcceptEncodingHeader(); got != "zstd;level=1,raw" {
 					t.Errorf("accept-encoding=%q, want %q",
-						got, "zstd;level=3,raw")
+						got, "zstd;level=1,raw")
 				}
 			},
 		},
@@ -1326,11 +1328,13 @@ func TestQwpQueryClientSendsAcceptEncodingWhenCompressed(t *testing.T) {
 		wantAE string
 	}{
 		{
+			// qwpDefaultCompressionLevel = 1 per Sender.java and
+			// connect-string.md §Query client keys ("Default `1`").
 			name: "zstd_default_level",
 			opts: []QwpQueryClientOption{
 				WithQwpQueryCompression(qwpCompressionZstd),
 			},
-			wantAE: "zstd;level=3,raw",
+			wantAE: "zstd;level=1,raw",
 		},
 		{
 			name: "zstd_explicit_level",
@@ -1345,7 +1349,7 @@ func TestQwpQueryClientSendsAcceptEncodingWhenCompressed(t *testing.T) {
 			opts: []QwpQueryClientOption{
 				WithQwpQueryCompression(qwpCompressionAuto),
 			},
-			wantAE: "zstd;level=3,raw",
+			wantAE: "zstd;level=1,raw",
 		},
 	}
 	for _, tc := range cases {

@@ -130,14 +130,17 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			expectedErr: "both basic and token",
 		},
 		{
+			// Size-typed keys now go through parseSizeBytes, which
+			// rejects negatives at parse time with a more specific
+			// message than the old validateConf "is negative" check.
 			name:        "negative init_buf_size",
 			config:      "http::init_buf_size=-1;",
-			expectedErr: "initial buffer size is negative",
+			expectedErr: "must be non-negative",
 		},
 		{
 			name:        "negative max_buf_size",
 			config:      "http::max_buf_size=-1;",
-			expectedErr: "max buffer size is negative",
+			expectedErr: "must be non-negative",
 		},
 		{
 			name:        "negative retry timeout",
@@ -199,9 +202,11 @@ func TestHttpPathologicalCasesFromEnv(t *testing.T) {
 			expectedErr: "both basic and token",
 		},
 		{
+			// See TestHttpPathologicalCasesFromConf above — size-typed
+			// keys now error at parse time with a different message.
 			name:        "negative max_buf_size",
 			config:      "http::max_buf_size=-1;",
-			expectedErr: "max buffer size is negative",
+			expectedErr: "must be non-negative",
 		},
 		{
 			name:        "schema is case-sensitive",

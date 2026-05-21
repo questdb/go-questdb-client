@@ -1109,6 +1109,7 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			retryTimeout:            defaultRetryTimeout,
 			autoFlushRows:           qwpDefaultAutoFlushRows,
 			autoFlushInterval:       qwpDefaultAutoFlushInterval,
+			autoFlushBytes:          qwpDefaultAutoFlushBytes,
 			inFlightWindow:          qwpDefaultInFlightWindow,
 			maxSchemasPerConnection: qwpDefaultMaxSchemasPerConnection,
 			initBufSize:             defaultInitBufferSize,

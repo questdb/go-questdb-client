@@ -1,0 +1,367 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestConfQwpwsAlias pins the qwpws / qwpwss long-form schema aliases
+// from connect-string.md §Protocols and transports: "qwpws / qwpwss
+// are accepted as long-form aliases for ws / wss." Same TLS mode and
+// transport selection as the short forms.
+func TestConfQwpwsAlias(t *testing.T) {
+	cases := []struct {
+		schema string
+		wantTLS tlsMode
+	}{
+		{"ws", tlsDisabled},
+		{"qwpws", tlsDisabled},
+		{"wss", tlsEnabled},
+		{"qwpwss", tlsEnabled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.schema, func(t *testing.T) {
+			// Ingest parser.
+			c, err := confFromStr(tc.schema + "::addr=localhost:9000;")
+			if err != nil {
+				t.Fatalf("ingest %s parse: %v", tc.schema, err)
+			}
+			if c.senderType != qwpSenderType {
+				t.Errorf("ingest %s senderType=%v, want qwpSenderType", tc.schema, c.senderType)
+			}
+			if c.tlsMode != tc.wantTLS {
+				t.Errorf("ingest %s tlsMode=%v, want %v", tc.schema, c.tlsMode, tc.wantTLS)
+			}
+
+			// Egress parser.
+			qc, err := parseQwpQueryConf(tc.schema + "::addr=localhost:9000;")
+			if err != nil {
+				t.Fatalf("egress %s parse: %v", tc.schema, err)
+			}
+			if qc.tlsMode != tc.wantTLS {
+				t.Errorf("egress %s tlsMode=%v, want %v", tc.schema, qc.tlsMode, tc.wantTLS)
+			}
+		})
+	}
+}
+
+// TestConfQwpwsAliasUnknownSchemaErrorMentionsAliases pins the
+// improved error message — a typo like "wsq::" should mention all four
+// accepted schemas on the egress side so the user knows the long form
+// is also valid.
+func TestConfQwpwsAliasUnknownSchemaErrorMentionsAliases(t *testing.T) {
+	_, err := parseQwpQueryConf("wsq::addr=a:1;")
+	if err == nil {
+		t.Fatal("expected error for wsq::")
+	}
+	msg := err.Error()
+	for _, want := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not contain %q", msg, want)
+		}
+	}
+}
+
+// TestConfSizeSuffix pins the JVM-style 1024-based size-suffix grammar
+// from connect-string.md §Size suffixes. Suffixes are case-
+// insensitive and the long forms (kb/mb/gb/tb) match the short forms
+// (k/m/g/t).
+func TestConfSizeSuffix(t *testing.T) {
+	cases := []struct {
+		input string
+		want  int64
+	}{
+		{"0", 0},
+		{"1024", 1024},
+		{"1k", 1 << 10},
+		{"1K", 1 << 10},
+		{"1kb", 1 << 10},
+		{"1KB", 1 << 10},
+		{"4m", 4 << 20},
+		{"4M", 4 << 20},
+		{"4mb", 4 << 20},
+		{"8m", 8 << 20},
+		{"1g", 1 << 30},
+		{"1G", 1 << 30},
+		{"1gb", 1 << 30},
+		{"10g", 10 << 30},
+		{"1t", 1 << 40},
+		{"1tb", 1 << 40},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			got, err := parseSizeBytes(tc.input)
+			if err != nil {
+				t.Fatalf("parseSizeBytes(%q): %v", tc.input, err)
+			}
+			if got != tc.want {
+				t.Errorf("parseSizeBytes(%q) = %d, want %d", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConfSizeSuffixRejected covers shapes that must error.
+func TestConfSizeSuffixRejected(t *testing.T) {
+	cases := []string{
+		"",
+		"k",       // suffix without a number
+		"abc",     // non-numeric
+		"1.5m",    // floats not supported
+		"-1",      // negative bare
+		"-1m",     // negative with suffix
+		"1xb",     // unknown suffix
+		"1024kb extra", // trailing garbage
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			if _, err := parseSizeBytes(in); err == nil {
+				t.Errorf("parseSizeBytes(%q) expected error", in)
+			}
+		})
+	}
+}
+
+// TestConfSizeSuffixAppliedToKeys verifies the suffix grammar is
+// wired into the size-typed connect-string keys end-to-end.
+func TestConfSizeSuffixAppliedToKeys(t *testing.T) {
+	c, err := confFromStr("ws::addr=localhost:9000;" +
+		"init_buf_size=128k;" +
+		"max_buf_size=10m;" +
+		"auto_flush_bytes=4m;" +
+		"sf_dir=/tmp/sf;sender_id=t;" +
+		"sf_max_bytes=4m;" +
+		"sf_max_total_bytes=1g;")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.initBufSize != 128<<10 {
+		t.Errorf("initBufSize=%d, want %d", c.initBufSize, 128<<10)
+	}
+	if c.maxBufSize != 10<<20 {
+		t.Errorf("maxBufSize=%d, want %d", c.maxBufSize, 10<<20)
+	}
+	if c.autoFlushBytes != 4<<20 {
+		t.Errorf("autoFlushBytes=%d, want %d", c.autoFlushBytes, 4<<20)
+	}
+	if c.sfMaxBytes != int64(4<<20) {
+		t.Errorf("sfMaxBytes=%d, want %d", c.sfMaxBytes, 4<<20)
+	}
+	if c.sfMaxTotalBytes != int64(1<<30) {
+		t.Errorf("sfMaxTotalBytes=%d, want %d", c.sfMaxTotalBytes, 1<<30)
+	}
+}
+
+// TestConfSenderIdRejectsDot pins the spec + Java charset: sender_id
+// must not contain '.'. Sender.java validateSenderId allows only
+// letters / digits / '_' / '-'. The legacy permissive validator
+// allowed '.', which deviated from the spec's "no path separators,
+// no '.', no spaces" rule.
+func TestConfSenderIdRejectsDot(t *testing.T) {
+	_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;sender_id=foo.bar;")
+	if err == nil {
+		t.Fatal("expected error for sender_id with '.'")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "sender_id") {
+		t.Errorf("error %q does not name sender_id", msg)
+	}
+	if !strings.Contains(msg, ".") {
+		t.Errorf("error %q does not show the offending char", msg)
+	}
+}
+
+// TestConfSenderIdAccepted pins the allowed character set so future
+// changes don't accidentally regress.
+func TestConfSenderIdAccepted(t *testing.T) {
+	for _, id := range []string{"a", "Z", "0", "abc-DEF_123", "a_b-c"} {
+		t.Run(id, func(t *testing.T) {
+			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;sender_id=" + id + ";")
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", id, err)
+			}
+		})
+	}
+}
+
+// TestConfQwpAutoFlushBytesDefault pins the spec default of 8 MiB.
+// connect-string.md §Auto-flushing: "Default where supported: `8m`
+// (8 MiB)." Without this, byte-triggered auto-flush is silently
+// disabled on the Go client.
+func TestConfQwpAutoFlushBytesDefault(t *testing.T) {
+	c, err := confFromStr("ws::addr=localhost:9000;")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.autoFlushBytes != qwpDefaultAutoFlushBytes {
+		t.Errorf("autoFlushBytes=%d, want %d (8 MiB)",
+			c.autoFlushBytes, qwpDefaultAutoFlushBytes)
+	}
+	if qwpDefaultAutoFlushBytes != 8<<20 {
+		t.Errorf("qwpDefaultAutoFlushBytes=%d, want %d", qwpDefaultAutoFlushBytes, 8<<20)
+	}
+}
+
+// TestConfQwpAutoFlushOffZerosBytes pins that `auto_flush=off` also
+// clears the new byte default (otherwise users who disable auto-flush
+// would still see byte-triggered flushes).
+func TestConfQwpAutoFlushOffZerosBytes(t *testing.T) {
+	c, err := confFromStr("ws::addr=localhost:9000;auto_flush=off;")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.autoFlushBytes != 0 {
+		t.Errorf("auto_flush=off left autoFlushBytes=%d, want 0", c.autoFlushBytes)
+	}
+}
+
+// TestConfIngestSilentlyAcceptsEgressKeys is the cross-direction
+// silent-accept contract from connect-string.md §16-20 and §Query
+// client keys: a ws:: / wss:: Sender must not error on egress-only
+// keys, because the same connect string must be shareable with a
+// QwpQueryClient.
+func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
+	// One representative value per egress-only key. Values are
+	// intentionally a mix of valid and "garbage-from-the-Sender's-
+	// perspective" forms — the spec says the Sender does not
+	// interpret them, so even invalid values must pass.
+	kvs := []string{
+		"buffer_pool_size=8",
+		"compression=zstd",
+		"compression_level=22",
+		"failover=off",
+		"failover_backoff_initial_ms=10",
+		"failover_backoff_max_ms=2000",
+		"failover_max_attempts=16",
+		"failover_max_duration_ms=60000",
+		"initial_credit=262144",
+		"max_batch_rows=10000",
+	}
+	for _, kv := range kvs {
+		t.Run(kv, func(t *testing.T) {
+			conf := "ws::addr=localhost:9000;" + kv + ";"
+			if _, err := confFromStr(conf); err != nil {
+				t.Errorf("unexpected error parsing %q: %v", conf, err)
+			}
+		})
+	}
+}
+
+// TestConfIngestRejectsEgressKeysOnHttp pins that the silent-accept
+// is QWP-only — HTTP/TCP senders do not share a connect string with
+// QwpQueryClient, so egress-only keys must still error there.
+func TestConfIngestRejectsEgressKeysOnHttp(t *testing.T) {
+	_, err := confFromStr("http::addr=localhost:9000;compression=zstd;")
+	if err == nil {
+		t.Fatal("expected error: compression on http:: must not be silently accepted")
+	}
+	if !strings.Contains(err.Error(), "unsupported option") {
+		t.Errorf("error %q does not say unsupported option", err.Error())
+	}
+}
+
+// TestConfEgressSilentlyAcceptsIngressKeys is the egress side of the
+// shared-connect-string contract. A QwpQueryClient must not error on
+// ingress-only keys (sf_*, reconnect_*, auto_flush_*, on_*_error,
+// etc.).
+func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
+	kvs := []string{
+		"auto_flush=on",
+		"auto_flush_bytes=8m",
+		"auto_flush_interval=100",
+		"auto_flush_rows=1000",
+		"close_flush_timeout_millis=5000",
+		"drain_orphans=off",
+		"durable_ack_keepalive_interval_millis=200",
+		"error_inbox_capacity=256",
+		"init_buf_size=64k",
+		"initial_connect_retry=off",
+		"max_background_drainers=4",
+		"max_buf_size=100m",
+		"max_name_len=127",
+		"on_internal_error=halt",
+		"on_parse_error=halt",
+		"on_schema_error=halt",
+		"on_security_error=halt",
+		"on_server_error=auto",
+		"on_write_error=halt",
+		"reconnect_initial_backoff_millis=100",
+		"reconnect_max_backoff_millis=5000",
+		"reconnect_max_duration_millis=300000",
+		"request_durable_ack=off",
+		"sender_id=ingest-1",
+		"sf_append_deadline_millis=30000",
+		"sf_dir=/tmp/sf",
+		"sf_durability=memory",
+		"sf_max_bytes=4m",
+		"sf_max_total_bytes=10g",
+	}
+	for _, kv := range kvs {
+		t.Run(kv, func(t *testing.T) {
+			conf := "ws::addr=localhost:9000;" + kv + ";"
+			if _, err := parseQwpQueryConf(conf); err != nil {
+				t.Errorf("unexpected error parsing %q: %v", conf, err)
+			}
+		})
+	}
+}
+
+// TestConfSharedConnectString is the end-to-end check on the
+// shared-connect-string contract: one string with both ingress-only
+// and egress-only keys must parse successfully on both sides.
+func TestConfSharedConnectString(t *testing.T) {
+	shared := "wss::addr=db-a:9000,db-b:9000;" +
+		"token=my-token;" +
+		"target=primary;" +
+		"zone=eu-west-1;" +
+		// ingress-only:
+		"sf_dir=/tmp/sf;sender_id=ingest-1;auto_flush_rows=500;" +
+		"reconnect_max_duration_millis=120000;" +
+		"on_schema_error=drop;" +
+		// egress-only:
+		"compression=zstd;compression_level=3;" +
+		"failover_max_attempts=8;failover_max_duration_ms=30000;"
+	if _, err := confFromStr(shared); err != nil {
+		t.Errorf("ingest parser rejected the shared connect string: %v", err)
+	}
+	if _, err := parseQwpQueryConf(shared); err != nil {
+		t.Errorf("egress parser rejected the shared connect string: %v", err)
+	}
+}
+
+// TestConfRejectsUnknownKeyOnBothSides confirms that a genuinely
+// unknown key (not in either spec set) still errors out, so the
+// silent-accept is scoped.
+func TestConfRejectsUnknownKeyOnBothSides(t *testing.T) {
+	bad := "ws::addr=localhost:9000;not_a_real_key=42;"
+	if _, err := confFromStr(bad); err == nil {
+		t.Error("ingest: expected error for not_a_real_key")
+	}
+	if _, err := parseQwpQueryConf(bad); err == nil {
+		t.Error("egress: expected error for not_a_real_key")
+	}
+}
