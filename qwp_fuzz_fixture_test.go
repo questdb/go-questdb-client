@@ -26,11 +26,11 @@
 
 package questdb
 
-// QuestDB server fixture for the QWP fuzz tests. This is the Go port of
-// c-questdb-client's system_test/fixture.py: it locates a QuestDB
-// distribution, launches it on freshly discovered ports, waits until the
-// HTTP service answers /ping, and exposes Stop/Start/Bounce plus an /exec
-// SQL helper so the fuzz tests can drive a real server end to end.
+// QuestDB server fixture for the QWP fuzz tests. Locates a QuestDB
+// distribution, launches it on freshly discovered ports, waits until
+// the HTTP service answers /ping, and exposes Stop/Start/Bounce plus
+// an /exec SQL helper so the fuzz tests can drive a real server end
+// to end.
 //
 // Server resolution order (first hit wins):
 //
@@ -39,7 +39,7 @@ package questdb
 //     (bounce-dependent tests skip themselves).
 //  2. QDB_JAR=/path/to/questdb-*.jar — launch this jar.
 //  3. QDB_REPO=/path/to/questdb — glob core/target for the built
-//     questdb-*-SNAPSHOT.jar (mirrors fixture.py install_questdb_from_repo).
+//     questdb-*-SNAPSHOT.jar.
 //  4. A sibling ../questdb (or ../../questdb) checkout, same glob.
 //
 // When none of these resolve (and no JDK is found) the fuzz tests skip,

@@ -1250,46 +1250,6 @@ func TestQwpTableBufferReset(t *testing.T) {
 	}
 }
 
-func TestQwpTableBufferSchemaId(t *testing.T) {
-	t.Run("UnassignedByDefault", func(t *testing.T) {
-		tb := newQwpTableBuffer("t")
-		if tb.schemaId != -1 {
-			t.Fatalf("new table schemaId = %d, want -1", tb.schemaId)
-		}
-	})
-
-	t.Run("InvalidatedOnNewColumn", func(t *testing.T) {
-		tb := newQwpTableBuffer("t")
-		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
-		col.addLong(1)
-		tb.commitRow()
-
-		// Sender would have assigned an ID at this point.
-		tb.schemaId = 7
-
-		if _, err := tb.getOrCreateColumn("b", qwpTypeDouble, false); err != nil {
-			t.Fatal(err)
-		}
-		if tb.schemaId != -1 {
-			t.Fatalf("schemaId = %d after column add, want -1", tb.schemaId)
-		}
-	})
-
-	t.Run("PreservedAcrossReset", func(t *testing.T) {
-		tb := newQwpTableBuffer("t")
-		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
-		col.addLong(1)
-		tb.commitRow()
-
-		tb.schemaId = 3
-		tb.reset()
-
-		if tb.schemaId != 3 {
-			t.Fatalf("schemaId = %d after reset, want 3 (column set unchanged)", tb.schemaId)
-		}
-	})
-}
-
 // --- array column buffer tests ---
 
 func TestQwpColumnBufferDoubleArray1D(t *testing.T) {

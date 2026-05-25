@@ -49,7 +49,7 @@ func newCursorSenderForTest(t *testing.T, srv *qwpSfTestServer, autoFlushRows in
 	// 5s closeFlushTimeout matches the Java default; long enough
 	// that drain-waits in tests don't flake under heavy parallel
 	// test load.
-	s, err := newQwpCursorLineSender(autoFlushRows, 0, 0, 0, 0, engine, loop, 5*time.Second)
+	s, err := newQwpCursorLineSender(autoFlushRows, 0, 0, 0, engine, loop, 5*time.Second)
 	require.NoError(t, err)
 	cleanup := func() {
 		_ = s.Close(context.Background())
@@ -137,7 +137,7 @@ func TestQwpCursorSenderCloseDrainsEngine(t *testing.T) {
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
 	loop.sendLoopStart()
-	s, err := newQwpCursorLineSender(0, 0, 0, 0, 0, engine, loop, 5*time.Second)
+	s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 5*time.Second)
 	require.NoError(t, err)
 
 	for i := 0; i < 4; i++ {
@@ -165,7 +165,7 @@ func TestQwpCursorSenderCloseDrainTimeoutReturnsError(t *testing.T) {
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
 	loop.sendLoopStart()
-	s, err := newQwpCursorLineSender(0, 0, 0, 0, 0, engine, loop, 100*time.Millisecond)
+	s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 100*time.Millisecond)
 	require.NoError(t, err)
 
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
@@ -296,7 +296,7 @@ func TestQwpCursorSenderAwaitAckedFsnTimeout(t *testing.T) {
 	// without blocking on ACK — exactly the auto-flush path users
 	// pair with AwaitAckedFsn. closeTimeout=100ms keeps the deferred
 	// Close fast (the server never ACKs).
-	s, err := newQwpCursorLineSender(1, 0, 0, 0, 0, engine, loop, 100*time.Millisecond)
+	s, err := newQwpCursorLineSender(1, 0, 0, 0, engine, loop, 100*time.Millisecond)
 	require.NoError(t, err)
 	defer func() { _ = s.Close(context.Background()) }()
 

@@ -354,10 +354,9 @@ type lineSenderConfig struct {
 	protocolVersion protocolVersion
 
 	// QWP-specific fields
-	inFlightWindow          int       // 0 = unset (treated as sync mode 1); seeded to qwpDefaultInFlightWindow by newLineSenderConfig
-	maxSchemasPerConnection int       // 0 = unset; seeded to qwpDefaultMaxSchemasPerConnection
-	dumpWriter              io.Writer // if set, record outgoing bytes (unexported)
-	gorillaDisabled         bool      // false (default) = Gorilla timestamp encoding enabled
+	inFlightWindow  int       // 0 = unset (treated as sync mode 1); seeded to qwpDefaultInFlightWindow by newLineSenderConfig
+	dumpWriter      io.Writer // if set, record outgoing bytes (unexported)
+	gorillaDisabled bool      // false (default) = Gorilla timestamp encoding enabled
 
 	// QWP store-and-forward (cursor) fields. Setting sfDir activates
 	// cursor mode: flushed batches are persisted to mmap'd files
@@ -638,16 +637,13 @@ func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
 	}
 }
 
-// WithMaxSchemasPerConnection caps the number of schema IDs that may
-// be registered on a single QWP connection before the sender returns
-// an error. Once the cap is hit, the caller should close and re-open
-// the sender to start a new schema ID space. Defaults to 65535.
+// WithMaxSchemasPerConnection used to cap the per-connection schema
+// ID space. It is outdated and no longer has any effect; the setter
+// is preserved as a no-op so existing callers keep compiling.
 //
-// Only available for the QWP sender.
+// Deprecated: outdated; this setter is a no-op.
 func WithMaxSchemasPerConnection(n int) LineSenderOption {
-	return func(s *lineSenderConfig) {
-		s.maxSchemasPerConnection = n
-	}
+	return func(*lineSenderConfig) {}
 }
 
 // WithGorilla enables or disables Gorilla delta-of-delta encoding for
@@ -1118,16 +1114,15 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 		// sanitizeQwpConf detect "user set it" and reject.
 		// reconnect_max_duration_millis is the QWP analogue.
 		return &lineSenderConfig{
-			senderType:              t,
-			address:                 defaultHttpAddress,
-			autoFlushRows:           qwpDefaultAutoFlushRows,
-			autoFlushInterval:       qwpDefaultAutoFlushInterval,
-			autoFlushBytes:          qwpDefaultAutoFlushBytes,
-			inFlightWindow:          qwpDefaultInFlightWindow,
-			maxSchemasPerConnection: qwpDefaultMaxSchemasPerConnection,
-			initBufSize:             defaultInitBufferSize,
-			maxBufSize:              defaultMaxBufferSize,
-			fileNameLimit:           defaultFileNameLimit,
+			senderType:        t,
+			address:           defaultHttpAddress,
+			autoFlushRows:     qwpDefaultAutoFlushRows,
+			autoFlushInterval: qwpDefaultAutoFlushInterval,
+			autoFlushBytes:    qwpDefaultAutoFlushBytes,
+			inFlightWindow:    qwpDefaultInFlightWindow,
+			initBufSize:       defaultInitBufferSize,
+			maxBufSize:        defaultMaxBufferSize,
+			fileNameLimit:     defaultFileNameLimit,
 			// failover.md §7: 15s upper bound on the HTTP upgrade
 			// response read. Parser overrides on explicit value.
 			authTimeoutMs: 15_000,
@@ -1202,9 +1197,6 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	}
 	if conf.maxBufSize != 0 {
 		return errors.New("maxBufferSize setting is not available in the TCP client")
-	}
-	if conf.maxSchemasPerConnection != 0 {
-		return errors.New("maxSchemasPerConnection setting is not available in the TCP client")
 	}
 	if conf.errorHandler != nil || conf.errorPolicyResolver != nil ||
 		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
@@ -1354,9 +1346,6 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	if conf.autoFlushBytes != 0 {
 		return errors.New("autoFlushBytes setting is not available in the HTTP client")
 	}
-	if conf.maxSchemasPerConnection != 0 {
-		return errors.New("maxSchemasPerConnection setting is not available in the HTTP client")
-	}
 	if conf.errorHandler != nil || conf.errorPolicyResolver != nil ||
 		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
 		conf.errorInboxCapacity != 0 {
@@ -1416,7 +1405,6 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	s.maxBufSize = conf.maxBufSize
 	s.fileNameLimit = conf.fileNameLimit
 	s.autoFlushBytes = conf.autoFlushBytes
-	s.maxSchemasPerConnection = conf.maxSchemasPerConnection
 	// Memory mode also honours close_flush_timeout_millis (the
 	// spec-aligned name). closeFlushTimeoutSet distinguishes "user
 	// set 0 / negative -> fast close" from "user did not set ->
@@ -1475,9 +1463,6 @@ func validateConf(conf *lineSenderConfig) error {
 	}
 	if conf.autoFlushBytes < 0 {
 		return fmt.Errorf("auto flush bytes is negative: %d", conf.autoFlushBytes)
-	}
-	if conf.maxSchemasPerConnection < 0 {
-		return fmt.Errorf("max schemas per connection is negative: %d", conf.maxSchemasPerConnection)
 	}
 	if conf.protocolVersion < protocolVersionUnset || conf.protocolVersion > ProtocolVersion3 {
 		return errors.New("current client only supports protocol version 1 (text format for all datatypes), " +

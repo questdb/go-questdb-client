@@ -253,10 +253,18 @@ const (
 	// Java: QwpWebSocketSender.DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128.
 	qwpDefaultInFlightWindow = 128
 
-	// qwpDefaultMaxSchemasPerConnection caps the schema cache per
-	// connection; callers may recycle the connection on overflow.
-	// Java: QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535.
-	qwpDefaultMaxSchemasPerConnection = 65_535
+	// qwpEgressMaxSchemaId is the upper bound the egress decoder
+	// enforces on schema_id values arriving from the server. Result-
+	// batch frames carry full and reference-mode table blocks; the
+	// reference-mode lookup keys into a per-connection schema
+	// registry, and the decoder rejects schema_id values >= this
+	// bound to avoid runaway map growth on hostile or buggy server
+	// frames. Matches the QWP spec's per-connection schema-id limit
+	// (65535) and Java's DEFAULT_MAX_SCHEMAS_PER_CONNECTION. Ingest
+	// senders no longer have a configurable cap — the cursor encoder
+	// writes schema_id=0 on every full-mode frame and never grows
+	// any client-side schema accumulator.
+	qwpEgressMaxSchemaId = 65_535
 
 	// qwpDefaultMicrobatchBufSize is the per-encoder microbatch buffer
 	// size used to coalesce rows before a WebSocket frame is sent.

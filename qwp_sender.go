@@ -233,9 +233,8 @@ type qwpLineSender struct {
 	encoder qwpEncoder
 
 	// encodeInfoBuf is a reusable scratch slice for
-	// buildCursorTableEncodeInfo, avoiding allocation on every
-	// flush.
-	encodeInfoBuf []qwpTableEncodeInfo
+	// buildTableEncodeInfo, avoiding allocation on every flush.
+	encodeInfoBuf []*qwpTableBuffer
 
 	// globalSymbols maps symbol strings to global IDs.
 	globalSymbols map[string]int32
@@ -247,24 +246,13 @@ type qwpLineSender struct {
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
 
-	// Schema registry (per QWP spec §16).
-	// Schema IDs are small integers assigned sequentially by the
-	// client and scoped to the connection lifetime. They are global
-	// across all tables; the server indexes its registry by ID.
-	// nextSchemaId is the next unassigned ID.
-	// maxSentSchemaId is the highest ID ACKed by the server; a table
-	// whose schemaId <= maxSentSchemaId is safe to encode in
-	// reference mode.
-	// batchMaxSchemaId is the highest schemaId used in the pending
-	// batch — set by buildTableEncodeInfo, promoted to
-	// maxSentSchemaId on ACK.
-	nextSchemaId     int
-	maxSentSchemaId  int
-	batchMaxSchemaId int
-	// maxSchemasPerConnection caps nextSchemaId. 0 disables the cap.
-	// When the cap is hit, Flush returns an error and the caller must
-	// close and re-open the sender.
-	maxSchemasPerConnection int
+	// Schema IDs are intentionally NOT tracked on the cursor wire
+	// path. Every frame is self-sufficient (full schema mode, full
+	// symbol dict from id 0), so the schema_id varint in the table
+	// block is purely a wire-format formality — we always write 0.
+	// There is no per-connection schema registry on the client side,
+	// no schema-change detection, and no cap to enforce; the server
+	// reads the inline column definitions on every frame regardless.
 
 	// Row state.
 	hasTable bool
@@ -378,9 +366,6 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 		globalSymbols:     make(map[string]int32),
 		maxSentSymbolId:   -1,
 		batchMaxSymbolId:  -1,
-		nextSchemaId:      0,
-		maxSentSchemaId:   -1,
-		batchMaxSchemaId:  -1,
 		autoFlushRows:     autoFlushRows,
 		autoFlushInterval: autoFlushInterval,
 		inFlightWindow:    window,

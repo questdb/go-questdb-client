@@ -432,7 +432,9 @@ func TestQwpIntegrationFromConf(t *testing.T) {
 	qwpDropTable(t, tableName)
 	defer qwpDropTable(t, tableName)
 
-	confStr := fmt.Sprintf("ws::addr=%s;auto_flush=off;retry_timeout=1000;", qwpTestAddr)
+	// retry_timeout is HTTP-only; QWP uses reconnect_max_duration_millis
+	// for the per-outage budget (see the connect-string audit).
+	confStr := fmt.Sprintf("ws::addr=%s;auto_flush=off;reconnect_max_duration_millis=1000;", qwpTestAddr)
 	sender, err := LineSenderFromConf(ctx, confStr)
 	if err != nil {
 		t.Fatalf("LineSenderFromConf: %v", err)
@@ -2264,11 +2266,13 @@ func TestQwpIntegrationGorillaTimestampRoundTrip(t *testing.T) {
 
 // --- Client-focused schema evolution test ---
 //
-// When the user adds a new column mid-session, the client must reset
-// the table's schemaId so the next flush re-registers the expanded
-// schema in FULL mode (not REFERENCE mode against the stale ID).
-// Otherwise the server would decode subsequent rows against the wrong
-// column set and either reject them or mis-map columns.
+// When the user adds a new column mid-session, the next flush must
+// carry the expanded column set inline so the server decodes
+// subsequent rows against the right columns. The cursor encoder
+// emits FULL schema mode on every frame with schema_id=0, so
+// schema evolution is "just" re-sending the new column list —
+// there is no per-table invalidation step to verify on the client
+// side.
 func TestQwpIntegrationSchemaEvolution(t *testing.T) {
 	qwpEnsureServer(t)
 	ctx := context.Background()
@@ -2296,8 +2300,9 @@ func TestQwpIntegrationSchemaEvolution(t *testing.T) {
 		t.Fatalf("phase1 Flush: %v", err)
 	}
 
-	// Phase 2: 5 rows with an added column c. The client must reset
-	// the schemaId so a new FULL-mode schema is registered.
+	// Phase 2: 5 rows with an added column c. The client emits a
+	// FULL schema block carrying the new column on every frame,
+	// so no per-table invalidation is needed.
 	for i := 5; i < 10; i++ {
 		if err := s.Table(tableName).
 			Int64Column("a", int64(i)).

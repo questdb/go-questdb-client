@@ -196,7 +196,7 @@ func (d *qwpConnDict) clear() {
 // schema id. Subsequent RESULT_BATCH frames that reference a prior
 // schema (mode=0x01) look up by id instead of retransmitting the
 // columns. The registry is dense (slice by id) because server ids are
-// monotonic from 0 and capped by qwpDefaultMaxSchemasPerConnection.
+// monotonic from 0 and capped by qwpEgressMaxSchemaId.
 type qwpSchemaRegistry struct {
 	slots [][]qwpColumnSchemaInfo
 }
@@ -211,7 +211,7 @@ func (r *qwpSchemaRegistry) get(id int) ([]qwpColumnSchemaInfo, bool) {
 
 // put records the given columns under id, extending the registry slice
 // to reach id if needed. Caller is responsible for bounding id against
-// qwpDefaultMaxSchemasPerConnection.
+// qwpEgressMaxSchemaId.
 func (r *qwpSchemaRegistry) put(id int, cols []qwpColumnSchemaInfo) {
 	for len(r.slots) <= id {
 		r.slots = append(r.slots, nil)
@@ -383,7 +383,7 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	if err != nil {
 		return err
 	}
-	if schemaId64 >= qwpDefaultMaxSchemasPerConnection {
+	if schemaId64 >= qwpEgressMaxSchemaId {
 		return newQwpDecodeError(fmt.Sprintf(
 			"schema_id out of range: %d", schemaId64))
 	}

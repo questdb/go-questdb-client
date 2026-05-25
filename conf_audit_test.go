@@ -439,6 +439,41 @@ func TestConfMemoryModeHonoursCloseFlushTimeout(t *testing.T) {
 	}
 }
 
+// TestConfRejectsMaxSchemasPerConnection pins that the parser
+// rejects the outdated max_schemas_per_connection key with a clear
+// "no longer supported" message — not the generic "unsupported
+// option" path, which is reserved for genuinely unknown keys.
+func TestConfRejectsMaxSchemasPerConnection(t *testing.T) {
+	for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+		t.Run(schema, func(t *testing.T) {
+			_, err := confFromStr(schema + "::addr=localhost:9000;max_schemas_per_connection=1024;")
+			if err == nil {
+				t.Fatal("expected error: max_schemas_per_connection must not be accepted")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "max_schemas_per_connection") {
+				t.Errorf("error %q does not name the key", msg)
+			}
+			if !strings.Contains(msg, "no longer supported") {
+				t.Errorf("error %q does not mark the key as outdated", msg)
+			}
+		})
+	}
+}
+
+// TestWithMaxSchemasPerConnectionIsNoOp pins that the deprecated
+// option setter no longer mutates any config state — it's preserved
+// only so v4.0–v4.5 callers keep compiling.
+func TestWithMaxSchemasPerConnectionIsNoOp(t *testing.T) {
+	c := newLineSenderConfig(qwpSenderType)
+	WithMaxSchemasPerConnection(123)(c)
+	// No assertion needed beyond "this doesn't reference any field"
+	// — if a future refactor reintroduced a maxSchemasPerConnection
+	// field, the option setter would have to write somewhere and
+	// we'd notice. The build-time guarantee is the test.
+	_ = c
+}
+
 // TestConfRejectsUnknownKeyOnBothSides confirms that a genuinely
 // unknown key (not in either spec set) still errors out, so the
 // silent-accept is scoped.

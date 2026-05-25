@@ -144,9 +144,6 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 		globalSymbols:    make(map[string]int32),
 		maxSentSymbolId:  -1,
 		batchMaxSymbolId: -1,
-		nextSchemaId:     0,
-		maxSentSchemaId:  -1,
-		batchMaxSchemaId: -1,
 	}
 
 	s.globalSymbols["AAPL"] = 0
@@ -171,9 +168,6 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 			s.maxSentSymbolId,
 			s.batchMaxSymbolId,
 		)
-		if s.batchMaxSchemaId > s.maxSentSchemaId {
-			s.maxSentSchemaId = s.batchMaxSchemaId
-		}
 		s.resetAfterFlush()
 	}
 
@@ -227,9 +221,6 @@ func qwpSteadyStateSetupWithNulls() (*qwpLineSender, func()) {
 		globalSymbols:    make(map[string]int32),
 		maxSentSymbolId:  -1,
 		batchMaxSymbolId: -1,
-		nextSchemaId:     0,
-		maxSentSchemaId:  -1,
-		batchMaxSchemaId: -1,
 	}
 
 	s.globalSymbols["AAPL"] = 0
@@ -258,9 +249,6 @@ func qwpSteadyStateSetupWithNulls() (*qwpLineSender, func()) {
 			s.maxSentSymbolId,
 			s.batchMaxSymbolId,
 		)
-		if s.batchMaxSchemaId > s.maxSentSchemaId {
-			s.maxSentSchemaId = s.batchMaxSchemaId
-		}
 		s.resetAfterFlush()
 	}
 

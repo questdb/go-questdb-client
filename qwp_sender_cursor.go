@@ -82,7 +82,6 @@ func newQwpCursorLineSender(
 	autoFlushInterval time.Duration,
 	autoFlushBytes int,
 	maxBufSize int,
-	maxSchemasPerConnection int,
 	cursorEngine *qwpSfCursorEngine,
 	cursorSendLoop *qwpSfSendLoop,
 	closeFlushTimeout time.Duration,
@@ -91,22 +90,18 @@ func newQwpCursorLineSender(
 		return nil, errors.New("qwp/cursor: engine and send loop must be non-nil")
 	}
 	s := &qwpLineSender{
-		tableBuffers:            make(map[string]*qwpTableBuffer),
-		globalSymbols:           make(map[string]int32),
-		maxSentSymbolId:         -1,
-		batchMaxSymbolId:        -1,
-		nextSchemaId:            0,
-		maxSentSchemaId:         -1,
-		batchMaxSchemaId:        -1,
-		autoFlushRows:           autoFlushRows,
-		autoFlushInterval:       autoFlushInterval,
-		autoFlushBytes:          autoFlushBytes,
-		maxBufSize:              maxBufSize,
-		maxSchemasPerConnection: maxSchemasPerConnection,
-		inFlightWindow: 1,
-		closeTimeout:   closeFlushTimeout,
-		cursorEngine:   cursorEngine,
-		cursorSendLoop: cursorSendLoop,
+		tableBuffers:      make(map[string]*qwpTableBuffer),
+		globalSymbols:     make(map[string]int32),
+		maxSentSymbolId:   -1,
+		batchMaxSymbolId:  -1,
+		autoFlushRows:     autoFlushRows,
+		autoFlushInterval: autoFlushInterval,
+		autoFlushBytes:    autoFlushBytes,
+		maxBufSize:        maxBufSize,
+		inFlightWindow:    1,
+		closeTimeout:      closeFlushTimeout,
+		cursorEngine:      cursorEngine,
+		cursorSendLoop:    cursorSendLoop,
 	}
 	// Single encoder slot is enough — the cursor engine takes a copy
 	// of the bytes via tryAppend, so the encoder buffer can be reused
@@ -263,7 +258,6 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		conf.autoFlushInterval,
 		conf.autoFlushBytes,
 		conf.maxBufSize,
-		conf.maxSchemasPerConnection,
 		engine, loop,
 		closeFlushTimeout,
 	)
@@ -388,11 +382,16 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 // replay correctly against any fresh server connection (post-
 // reconnect, post-restart, drainer adopting an orphan slot) — refs
 // to schema/symbol IDs the new server has never seen would be
-// unrecoverable. Producer-side maxSentSchemaId / maxSentSymbolId
-// retention is therefore a no-op on the cursor path: the trackers
-// advance optimistically (the send loop is terminal on I/O error,
-// so stale tracker state cannot reach the wire) and exist only for
-// tests and external observers.
+// unrecoverable.
+//
+// Schema-side: every table block goes out in full mode with
+// schema_id = 0. There is no producer-side schema registry to
+// advance.
+//
+// Symbol-side: maxSentSymbolId is retained because the symbol dict
+// uses a delta encoding (varint-prefixed length, then names), and
+// we always pass `-1` to the encoder to force "full dict from id 0"
+// — but the tracker exists for tests and external observers.
 func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 		return err
@@ -413,30 +412,23 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
 		return err
 	}
-	if s.batchMaxSchemaId > s.maxSentSchemaId {
-		s.maxSentSchemaId = s.batchMaxSchemaId
-	}
 	if s.batchMaxSymbolId > s.maxSentSymbolId {
 		s.maxSentSymbolId = s.batchMaxSymbolId
 	}
 	return nil
 }
 
-// buildTableEncodeInfo collects non-empty tables, assigns fresh
-// schema IDs to any that lack one, and emits every table in FULL
-// schema mode. Mirrors the Java client's "self-sufficient frames"
-// contract — refs to schema/symbol IDs the new server has never
-// seen would be unrecoverable on replay (post-reconnect, post-
-// restart, drainer adopting an orphan slot), so the cursor wire
-// path always carries the schema in full.
-//
-// Schema IDs are still assigned monotonically so the connection-
-// scoped server-side registry stays consistent across the lifetime
-// of a single connection; but useSchemaRef is forced to false on
-// every encode regardless of maxSentSchemaId.
-func (s *qwpLineSender) buildTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
+// buildTableEncodeInfo collects non-empty tables for encoding.
+// Every table goes out in FULL schema mode with schema_id = 0 (the
+// encoder hard-codes both at the wire-write site). No per-table
+// schema-id minting, no schema-change detection, no per-connection
+// schema registry on the client side — matching the c-questdb-
+// client live path. Mirrors the Java client's "self-sufficient
+// frames" contract (Java spec #14): every replayed frame must
+// stand alone against a fresh server connection, so the cursor
+// wire path always carries the schema in full.
+func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 	s.encodeInfoBuf = s.encodeInfoBuf[:0]
-	batchMax := s.maxSentSchemaId
 	for _, tb := range s.tableBuffers {
 		if tb.rowCount == 0 {
 			continue
@@ -447,29 +439,8 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
 				qwpMaxTablesPerBatch,
 			)
 		}
-		if tb.schemaId < 0 {
-			if s.maxSchemasPerConnection > 0 && s.nextSchemaId >= s.maxSchemasPerConnection {
-				return nil, fmt.Errorf(
-					"qwp: schema registry exhausted (limit %d); close and re-open the sender to reset",
-					s.maxSchemasPerConnection,
-				)
-			}
-			tb.schemaId = s.nextSchemaId
-			s.nextSchemaId++
-		}
-		// Cursor path forces full schema on every batch — see
-		// "self-sufficient frames" decision (Java spec #14).
-		mode := qwpSchemaModeFull
-		if tb.schemaId > batchMax {
-			batchMax = tb.schemaId
-		}
-		s.encodeInfoBuf = append(s.encodeInfoBuf, qwpTableEncodeInfo{
-			tb:         tb,
-			schemaMode: mode,
-			schemaId:   tb.schemaId,
-		})
+		s.encodeInfoBuf = append(s.encodeInfoBuf, tb)
 	}
-	s.batchMaxSchemaId = batchMax
 	return s.encodeInfoBuf, nil
 }
 

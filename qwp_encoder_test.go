@@ -1672,11 +1672,11 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 	col.addString("hello")
 	tb3.commitRow()
 
-	tables := []qwpTableEncodeInfo{
-		{tb: tb1, schemaMode: qwpSchemaModeFull, schemaId: 0},
-		{tb: tb2, schemaMode: qwpSchemaModeFull, schemaId: 1},
-		{tb: tb3, schemaMode: qwpSchemaModeReference, schemaId: 2},
-	}
+	// Multi-table production path now hardcodes (qwpSchemaModeFull,
+	// schema_id=0) for every table block — matching the c-questdb-
+	// client live path. The test verifies all three tables come out
+	// in full mode with schema_id=0.
+	tables := []*qwpTableBuffer{tb1, tb2, tb3}
 
 	globalDict := []string{"sym0"}
 	var enc qwpEncoder
@@ -1743,7 +1743,7 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 		t.Fatalf("table 1 schemaMode = 0x%02X, want FULL", msg[off])
 	}
 	off++
-	off++ // schemaId varint (0 = 1 byte)
+	off++ // schemaId varint (0 = 1 byte; production hard-codes 0)
 	// Skip full schema: col "x" (varint(1) + 'x' + 0x05)
 	slen, n, _ := qwpReadVarint(msg[off:])
 	off += n + int(slen) + 1
@@ -1763,12 +1763,14 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 		t.Fatalf("table 2 schemaMode = 0x%02X, want FULL", msg[off])
 	}
 	off++
-	off++ // schemaId varint (1 = 1 byte)
+	off++ // schemaId varint (0 = 1 byte; production hard-codes 0)
 	slen, n, _ = qwpReadVarint(msg[off:])
 	off += n + int(slen) + 1 // col "y" + type
 	off += 1 + 8             // null flag + double
 
-	// Parse table 3: "gamma" with STRING column, REFERENCE schema
+	// Parse table 3: "gamma" with STRING column, FULL schema mode
+	// (the production multi-table path now hard-codes Full / 0 for
+	// every table block).
 	nameLen, n, _ = qwpReadVarint(msg[off:])
 	off += n
 	if string(msg[off:off+int(nameLen)]) != "gamma" {
@@ -1777,12 +1779,15 @@ func TestQwpEncoderMultiTable(t *testing.T) {
 	off += int(nameLen)
 	off++ // rowCount=1
 	off++ // colCount=1
-	if msg[off] != byte(qwpSchemaModeReference) {
-		t.Fatalf("table 3 schemaMode = 0x%02X, want REFERENCE", msg[off])
+	if msg[off] != byte(qwpSchemaModeFull) {
+		t.Fatalf("table 3 schemaMode = 0x%02X, want FULL", msg[off])
 	}
 	off++
-	off++    // schemaId varint (2 = 1 byte)
-	off++    // null flag
+	off++ // schemaId varint (0 = 1 byte)
+	// Full schema: col "z" + type byte
+	slen, n, _ = qwpReadVarint(msg[off:])
+	off += n + int(slen) + 1
+	off++ // null flag
 	// String column: (rowCount+1) uint32 offsets + data
 	// 2 offsets = 8 bytes + "hello" = 5 bytes
 	off += 8 + 5

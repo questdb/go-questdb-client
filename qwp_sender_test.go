@@ -1394,7 +1394,10 @@ func TestQwpIntegrationSender(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	// Second flush with same schema should use reference mode.
+	// Second flush against the same column set — cursor mode always
+	// emits FULL schema with schema_id=0 on every frame. The test
+	// exercises the steady-state flush path; the wire-format
+	// invariant is pinned in encoder tests.
 	err = s.Table("qwp_sender_test").
 		Symbol("host", "test_host").
 		Int64Column("cpu", 99).
@@ -1411,51 +1414,10 @@ func TestQwpIntegrationSender(t *testing.T) {
 		t.Fatalf("Flush (row 2): %v", err)
 	}
 
-	// Verify schema was registered: a single schema flushed twice
-	// allocates exactly one id and promotes it to maxSentSchemaId.
-	if s.maxSentSchemaId != 0 {
-		t.Fatalf("maxSentSchemaId = %d after flush, want 0", s.maxSentSchemaId)
-	}
-
 	t.Log("QWP sender integration test passed")
 }
 
 // --- Validation tests ---
-
-func TestQwpSenderSchemaIdCaching(t *testing.T) {
-	srv := newQwpTestServer(t)
-	defer srv.Close()
-	s := newQwpSenderForTest(t, srv.URL)
-	defer s.Close(context.Background())
-
-	// First flush: full schema; the table should be assigned
-	// schemaId 0 and it should be promoted to maxSentSchemaId.
-	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
-	s.Flush(context.Background())
-
-	tb := s.tableBuffers["t"]
-	if tb == nil || tb.schemaId != 0 {
-		t.Fatalf("first flush: table schemaId = %v, want 0", tb)
-	}
-	if s.maxSentSchemaId != 0 {
-		t.Fatalf("first flush: maxSentSchemaId = %d, want 0", s.maxSentSchemaId)
-	}
-	if s.nextSchemaId != 1 {
-		t.Fatalf("first flush: nextSchemaId = %d, want 1", s.nextSchemaId)
-	}
-
-	// Second flush: same column set, should reuse schemaId and not
-	// allocate a new one.
-	s.Table("t").Int64Column("x", 2).AtNow(context.Background())
-	s.Flush(context.Background())
-
-	if tb.schemaId != 0 {
-		t.Fatalf("second flush: schemaId = %d, want 0 (same column set)", tb.schemaId)
-	}
-	if s.nextSchemaId != 1 {
-		t.Fatalf("second flush: nextSchemaId = %d, want 1 (no new ID allocated)", s.nextSchemaId)
-	}
-}
 
 func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 	// Track sent messages to verify delta dict content.
@@ -1799,18 +1761,10 @@ func TestQwpSenderSchemaIdPerTable(t *testing.T) {
 		}
 	}
 
-	// After first flush, both tables should have distinct schema IDs
-	// and maxSentSchemaId should have advanced to cover both.
-	if s.tableBuffers["alpha"].schemaId == s.tableBuffers["beta"].schemaId {
-		t.Fatalf("tables must have distinct schema IDs, both = %d",
-			s.tableBuffers["alpha"].schemaId)
-	}
-	if s.maxSentSchemaId != 1 {
-		t.Fatalf("maxSentSchemaId = %d, want 1", s.maxSentSchemaId)
-	}
-	if s.nextSchemaId != 2 {
-		t.Fatalf("nextSchemaId = %d, want 2", s.nextSchemaId)
-	}
+	// schema_id is hard-coded to 0 in every full-mode table block on
+	// the cursor wire path, so there is no per-table accumulator to
+	// inspect. The wire-format assertion above (every table block
+	// emits FULL) is the behavioural invariant for this test.
 
 	// Second flush of both tables. Cursor mode emits self-sufficient
 	// frames, so this still carries full schema (asserted below) —

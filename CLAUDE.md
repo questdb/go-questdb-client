@@ -90,9 +90,22 @@ encodes a batch into `qwpSfCursorEngine` via `engineAppendBlocking`; the
 **Cursor frames are self-sufficient** — full schema definitions plus the full
 symbol dictionary from id 0, every flush. This is what makes
 reconnect/replay/orphan-adoption safe across a fresh server connection. There is
-no reference mode on the cursor path; `maxSentSchemaId` / `maxSentSymbolId` on
-`qwpLineSender` are kept for tests and external observers, not as a gate on
-encoding.
+no reference mode on the cursor path.
+
+**Schema IDs are intentionally not tracked on the wire.** Every full-mode table
+block emits `schema_id = 0`. There is no `nextSchemaId` accumulator on the
+sender, no per-table `schemaId` field on the table buffer, and no
+schema-change detection. The wire format still carries the `schema_id` varint
+after the mode byte, but the value is a formality — the inline column
+definitions are the authoritative schema. This diverges from the Java client,
+which mints monotonic `schema_id`s per (table, column-set) and enforces
+`max_schemas_per_connection` at flush time; both behaviours are
+spec-conformant because the server reads the inline schema on every full-mode
+frame regardless of the ID.
+
+Symbol-dict tracking (`maxSentSymbolId`, `batchMaxSymbolId`) is still in
+place: the encoder always passes `-1` to force "full dict from id 0", and the
+trackers exist for tests and external observers.
 
 `WithInFlightWindow(n)` / `in_flight_window=n` is **retained but a no-op** in
 the cursor architecture — backpressure is governed by the engine's segment-ring
@@ -109,11 +122,14 @@ considered for removal without a matching change in Java:
 
 - `gorilla=on|off` — gates the Gorilla timestamp encoding in
   `qwp_encoder.go` (FLAG_GORILLA). Default `on`.
-- `max_schemas_per_connection=N` — caps `nextSchemaId` per
-  connection (default 65535; matches Java's
-  `DEFAULT_MAX_SCHEMAS_PER_CONNECTION`). When the cap is hit, the
-  sender errors and the caller must rebuild.
 - `in_flight_window=N` — see the "retained but a no-op" note above.
+
+`max_schemas_per_connection=N` is **rejected** by the parser with an
+"outdated and no longer supported" message. Java enforces it; we
+deliberately do not, because the cursor encoder writes `schema_id=0`
+on every full-mode frame and has no client-side schema accumulator
+to cap. The `WithMaxSchemasPerConnection` setter is preserved as a
+deprecated no-op so v4.0–v4.5 source compiles unchanged.
 
 `close_timeout=N` (millisecond integer) was a v4.0–v4.5 Go-only key
 for the memory-mode close path. The cursor architecture unified

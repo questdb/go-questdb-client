@@ -820,14 +820,6 @@ type qwpTableBuffer struct {
 	// in the Java client.
 	columnAccessCursor int
 
-	// schemaId is the per-connection schema identifier for this
-	// table's current column set. -1 means unassigned — the sender
-	// allocates a fresh ID from its nextSchemaId counter on the next
-	// flush and sends the schema in full mode. Reset to -1 whenever
-	// the column set changes so a new ID is allocated and the server
-	// re-registers the schema.
-	schemaId int
-
 	// dataSize is a running counter of approximate data bytes stored
 	// across all columns. Incremented by column addX methods via
 	// trackDataGrowth. Reset to 0 in reset(), recomputed from scratch
@@ -840,7 +832,6 @@ func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 	return &qwpTableBuffer{
 		tableName:   tableName,
 		columnIndex: make(map[string]int),
-		schemaId:    -1,
 	}
 }
 
@@ -914,7 +905,6 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 
 	tb.columnIndex[key] = len(tb.columns)
 	tb.columns = append(tb.columns, col)
-	tb.schemaId = -1
 	return col, nil
 }
 
@@ -953,7 +943,6 @@ func (tb *qwpTableBuffer) getOrCreateDesignatedTimestamp(typeCode qwpTypeCode) (
 
 	tb.columnIndex[dtName] = len(tb.columns)
 	tb.columns = append(tb.columns, col)
-	tb.schemaId = -1
 	return col, nil
 }
 
@@ -980,7 +969,6 @@ func (tb *qwpTableBuffer) cancelRow() {
 			delete(tb.columnIndex, strings.ToLower(tb.columns[i].name))
 		}
 		tb.columns = tb.columns[:tb.committedColumnCount]
-		tb.schemaId = -1
 	}
 
 	// Truncate any columns that were set during this row.
@@ -997,9 +985,13 @@ func (tb *qwpTableBuffer) cancelRow() {
 	tb.recomputeDataSize()
 }
 
-// reset clears all row data and columns, retaining the table name.
-// Preserves schemaId: between flushes the column set is unchanged,
-// so the server's registry entry is still valid.
+// reset clears all row data, retaining the table name and the
+// column structure. Column-level state (offsets, dictionary deltas)
+// is reset by col.reset() per column. The cursor encoder writes a
+// full schema + symbol dict for every flush, so no per-table
+// "what's been sent" state needs to survive across flushes —
+// rowCount and the in-progress bookkeeping are all that needs
+// resetting here.
 func (tb *qwpTableBuffer) reset() {
 	for _, col := range tb.columns {
 		col.reset()

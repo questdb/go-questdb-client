@@ -52,15 +52,17 @@ type qwpEncoder struct {
 // slice references the encoder's internal buffer and is valid until
 // the next encode call.
 //
-// schemaId is the connection-scoped schema identifier the server
-// uses to register (full mode) or look up (reference mode) this
-// table's column set.
+// schemaMode and schemaId are passed straight through to the
+// wire-format table-block header. The production cursor sender
+// never invokes this method — it goes through
+// encodeMultiTableWithDeltaDict, which always emits
+// (qwpSchemaModeFull, 0). The schemaMode/schemaId parameters are
+// retained here so tests can construct wire-format fixtures
+// (including 0x01 reference-mode frames) for the egress decoder.
 //
-// Used for tests and single-table convenience; the production sender
-// batches multiple tables through encodeMultiTableWithDeltaDict. Both
-// paths set FLAG_DELTA_SYMBOL_DICT (the only symbol-encoding mode
-// WebSocket clients emit) and FLAG_GORILLA (timestamp columns are
-// always preceded by a 1-byte encoding flag; see QWP spec §12).
+// Both paths set FLAG_DELTA_SYMBOL_DICT (the only symbol-encoding
+// mode WebSocket clients emit) and FLAG_GORILLA (timestamp columns
+// are always preceded by a 1-byte encoding flag; see QWP spec §12).
 //
 // The message layout is:
 //
@@ -99,19 +101,16 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 	return e.wb.bytes()
 }
 
-// qwpTableEncodeInfo carries per-table encoding parameters for
-// multi-table message encoding.
-type qwpTableEncodeInfo struct {
-	tb         *qwpTableBuffer
-	schemaMode qwpSchemaMode
-	schemaId   int
-}
-
 // encodeMultiTableWithDeltaDict encodes multiple table buffers into
 // a single QWP message with a shared delta symbol dictionary. The
 // header's tableCount field is set to len(tables), allowing the
 // server to process all tables from one WebSocket frame. This
 // reduces round-trips compared to one message per table.
+//
+// Every table block is written in FULL schema mode with
+// schema_id = 0 — cursor-architecture self-sufficient frames carry
+// the inline column definitions on every frame, so the schema_id
+// varint is a wire-format formality with no semantic content.
 //
 // The message layout is:
 //
@@ -119,7 +118,7 @@ type qwpTableEncodeInfo struct {
 //	TableBlock₁ → TableBlock₂ → ... → TableBlockₙ →
 //	patched PayloadLength.
 func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
-	tables []qwpTableEncodeInfo,
+	tables []*qwpTableBuffer,
 	globalDict []string,
 	maxSentId int,
 	batchMaxId int,
@@ -137,7 +136,7 @@ func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
 	e.writeHeader(e.headerFlags(), uint16(len(tables)))
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
 	for i := range tables {
-		e.writeTableBlock(tables[i].tb, tables[i].schemaMode, tables[i].schemaId)
+		e.writeTableBlock(tables[i], qwpSchemaModeFull, 0)
 	}
 	e.patchPayloadLength()
 	return e.wb.bytes()
