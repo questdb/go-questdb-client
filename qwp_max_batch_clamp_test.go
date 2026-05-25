@@ -121,25 +121,32 @@ func TestQwpServerMaxBatchSizeParsed(t *testing.T) {
 // table in isolation. Constructed without a real transport so each
 // case can dial in autoFlushBytes + the synthetic cap directly,
 // matching Java's applyServerBatchSizeLimit case analysis.
+//
+// Also pins that s.serverMaxBatchSize mirrors the transport's cap
+// regardless of the opt-out / no-cap branches — the per-row hard
+// guard and the flush-time defensive guard read this mirror,
+// independent of the soft auto-flush trigger.
 func TestQwpApplyServerBatchSizeLimit(t *testing.T) {
 	cases := []struct {
 		name             string
 		autoFlushBytes   int
 		serverCap        int32
 		expectEffective  int64
+		expectMirrorCap  int32
 		passNilTransport bool
 	}{
-		// User opt-out wins regardless of server cap.
-		{"optout_no_cap", 0, 0, 0, false},
-		{"optout_with_cap", 0, 1024 * 1024, 0, false},
-		// No server cap: configured value passes through.
-		{"no_cap_keeps_configured", 8 << 20, 0, 8 << 20, false},
-		{"nil_transport_keeps_configured", 8 << 20, 0, 8 << 20, true},
+		// User opt-out wins for the auto-flush trigger; the raw cap
+		// still mirrors so the per-row hard guard fires.
+		{"optout_no_cap", 0, 0, 0, 0, false},
+		{"optout_with_cap", 0, 1024 * 1024, 0, 1024 * 1024, false},
+		// No server cap: configured value passes through; mirror is 0.
+		{"no_cap_keeps_configured", 8 << 20, 0, 8 << 20, 0, false},
+		{"nil_transport_keeps_configured", 8 << 20, 0, 8 << 20, 0, true},
 		// Configured below safe budget: configured wins.
-		{"configured_below_90pct", 1 << 20, 16 << 20, 1 << 20, false},
+		{"configured_below_90pct", 1 << 20, 16 << 20, 1 << 20, 16 << 20, false},
 		// Configured above safe budget: clamped to floor(cap*9/10).
-		{"clamp_to_90pct_of_16mb", 16 << 20, 16 << 20, int64(16<<20) * 9 / 10, false},
-		{"clamp_to_90pct_of_2mb", 8 << 20, 2 << 20, int64(2<<20) * 9 / 10, false},
+		{"clamp_to_90pct_of_16mb", 16 << 20, 16 << 20, int64(16<<20) * 9 / 10, 16 << 20, false},
+		{"clamp_to_90pct_of_2mb", 8 << 20, 2 << 20, int64(2<<20) * 9 / 10, 2 << 20, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -149,9 +156,11 @@ func TestQwpApplyServerBatchSizeLimit(t *testing.T) {
 				tr = &qwpTransport{serverMaxBatchSize: tc.serverCap}
 			}
 			s.applyServerBatchSizeLimit(tr)
-			got := s.effectiveAutoFlushBytes.Load()
-			if got != tc.expectEffective {
+			if got := s.effectiveAutoFlushBytes.Load(); got != tc.expectEffective {
 				t.Fatalf("effectiveAutoFlushBytes = %d, want %d", got, tc.expectEffective)
+			}
+			if got := s.serverMaxBatchSize.Load(); got != tc.expectMirrorCap {
+				t.Fatalf("serverMaxBatchSize mirror = %d, want %d", got, tc.expectMirrorCap)
 			}
 		})
 	}
@@ -330,6 +339,268 @@ func TestQwpSwapClientFiresOnTransportSwap(t *testing.T) {
 	}
 	if fired != 2 {
 		t.Fatalf("onTransportSwap fired %d times after clear, want 2", fired)
+	}
+}
+
+// TestQwpPerRowGuardFires verifies the per-row hard guard catches a
+// single row whose buffered bytes already exceed the server's wire
+// cap, before commitRow makes the row visible to the batch. Uses
+// auto_flush_bytes=off so the soft trigger does not race the guard.
+func TestQwpPerRowGuardFires(t *testing.T) {
+	// 64 bytes cap — any non-trivial row trips it.
+	srv := newQwpTestServerWithMaxBatch(t, 64)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+addr+";auto_flush_bytes=off;")
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	// 200-byte string column alone exceeds the 64-byte cap.
+	err = ls.Table("t").
+		StringColumn("big", strings.Repeat("x", 200)).
+		AtNow(context.Background())
+	if err == nil {
+		t.Fatal("expected per-row guard to fire, got nil error")
+	}
+	if !strings.Contains(err.Error(), "row too large for server batch cap") {
+		t.Fatalf("error = %q, want substring %q", err.Error(),
+			"row too large for server batch cap")
+	}
+	if !strings.Contains(err.Error(), "serverMaxBatchSize=64") {
+		t.Fatalf("error = %q, want it to name the cap", err.Error())
+	}
+
+	// Sender stays usable: the failed row's bytes were discarded
+	// via cancelRow, and the next Table() call starts a clean row.
+	// We can't easily flush anything meaningful through a 64-byte
+	// cap, so just check that the sender does not latch an error.
+	s := ls.(*qwpLineSender)
+	if s.pendingRowCount != 0 {
+		t.Fatalf("pendingRowCount = %d after guard fire, want 0",
+			s.pendingRowCount)
+	}
+}
+
+// TestQwpPerRowGuardPreservesPriorCommittedRows verifies the per-row
+// guard rolls back ONLY the offending row — earlier rows in the
+// batch stay intact and remain flushable. This is the property that
+// makes the guard recoverable instead of catastrophic.
+func TestQwpPerRowGuardPreservesPriorCommittedRows(t *testing.T) {
+	// 1024 bytes cap: small rows fit, a 2000-byte string does not.
+	srv := newQwpTestServerWithMaxBatch(t, 1024)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+addr+";auto_flush_bytes=off;")
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	ctx := context.Background()
+	// Two small rows commit cleanly.
+	for i := 0; i < 2; i++ {
+		if err := ls.Table("t").
+			Symbol("s", "a").
+			Int64Column("x", int64(i)).
+			AtNow(ctx); err != nil {
+			t.Fatalf("AtNow[%d]: %v", i, err)
+		}
+	}
+
+	// Third row is oversize; guard fires.
+	err = ls.Table("t").
+		StringColumn("big", strings.Repeat("x", 2000)).
+		AtNow(ctx)
+	if err == nil {
+		t.Fatal("expected per-row guard to fire, got nil error")
+	}
+	if !strings.Contains(err.Error(), "row too large for server batch cap") {
+		t.Fatalf("error = %q, want guard-fire substring", err.Error())
+	}
+
+	// The two earlier rows are still pending; flush succeeds (the
+	// encoded frame for two small rows + schema stays under 1024).
+	s := ls.(*qwpLineSender)
+	if s.pendingRowCount != 2 {
+		t.Fatalf("pendingRowCount = %d after guard fire, want 2 (prior rows preserved)",
+			s.pendingRowCount)
+	}
+	if err := ls.Flush(ctx); err != nil {
+		t.Fatalf("Flush of prior rows: %v", err)
+	}
+	if s.pendingRowCount != 0 {
+		t.Fatalf("pendingRowCount = %d after flush, want 0", s.pendingRowCount)
+	}
+}
+
+// TestQwpPerRowGuardNoOpWhenServerHasNoCap pins the older-server
+// path: when the upgrade response omits X-QWP-Max-Batch-Size, the
+// per-row guard short-circuits and an arbitrarily large row commits
+// without complaint. Important so an older server in a rolling
+// upgrade doesn't suddenly start rejecting rows the client was
+// happily sending before.
+func TestQwpPerRowGuardNoOpWhenServerHasNoCap(t *testing.T) {
+	srv := newQwpTestServerWithMaxBatch(t, 0) // header omitted
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+addr+";auto_flush_bytes=off;")
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	// Append a row with a moderately large string. Would trip the
+	// guard against any reasonable cap, but here the server
+	// advertised none.
+	if err := ls.Table("t").
+		StringColumn("big", strings.Repeat("x", 10_000)).
+		AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow with large string and no advertised cap: %v", err)
+	}
+	s := ls.(*qwpLineSender)
+	if s.pendingRowCount != 1 {
+		t.Fatalf("pendingRowCount = %d, want 1", s.pendingRowCount)
+	}
+}
+
+// TestQwpFlushTimeGuardFires verifies the defensive cap check at
+// encode time catches the case where individual rows fit under the
+// cap but their cumulative encoded frame (schema, dict, headers,
+// row data) does not. Drops all pending state in-place and surfaces
+// a typed error naming the size, cap, and dropped-row count.
+func TestQwpFlushTimeGuardFires(t *testing.T) {
+	// Small cap; many small rows; auto-flush off so we control
+	// exactly when the flush triggers.
+	const serverCap = 256
+	srv := newQwpTestServerWithMaxBatch(t, serverCap)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+addr+";auto_flush_bytes=off;")
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	ctx := context.Background()
+	const rows = 100
+	for i := 0; i < rows; i++ {
+		if err := ls.Table("t").
+			Symbol("s", "abc").
+			Int64Column("x", int64(i)).
+			AtNow(ctx); err != nil {
+			t.Fatalf("AtNow[%d]: %v", i, err)
+		}
+	}
+	s := ls.(*qwpLineSender)
+	if s.pendingRowCount != rows {
+		t.Fatalf("pendingRowCount before flush = %d, want %d (per-row guard misfire?)",
+			s.pendingRowCount, rows)
+	}
+
+	err = ls.Flush(ctx)
+	if err == nil {
+		t.Fatalf("expected flush-time defensive guard to fire, got nil error")
+	}
+	if !strings.Contains(err.Error(), "batch too large for server batch cap") {
+		t.Fatalf("error = %q, want guard-fire substring", err.Error())
+	}
+	wantDroppedSub := fmt.Sprintf("droppedRows=%d", rows)
+	if !strings.Contains(err.Error(), wantDroppedSub) {
+		t.Fatalf("error = %q, want %q substring", err.Error(), wantDroppedSub)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("serverMaxBatchSize=%d", serverCap)) {
+		t.Fatalf("error = %q, want serverMaxBatchSize=%d substring", err.Error(), serverCap)
+	}
+}
+
+// TestQwpFlushTimeGuardResetsPendingState verifies the sender is
+// usable after the defensive guard fires: pendingRowCount returns
+// to 0, table buffers are cleared, and a subsequent small flush
+// goes through cleanly.
+func TestQwpFlushTimeGuardResetsPendingState(t *testing.T) {
+	const serverCap = 256
+	srv := newQwpTestServerWithMaxBatch(t, serverCap)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+addr+";auto_flush_bytes=off;")
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		if err := ls.Table("t").
+			Symbol("s", "abc").
+			Int64Column("x", int64(i)).
+			AtNow(ctx); err != nil {
+			t.Fatalf("AtNow[%d]: %v", i, err)
+		}
+	}
+	if err := ls.Flush(ctx); err == nil {
+		t.Fatal("expected flush-time guard to fire")
+	}
+
+	s := ls.(*qwpLineSender)
+	if s.pendingRowCount != 0 {
+		t.Fatalf("pendingRowCount = %d after guard fire, want 0", s.pendingRowCount)
+	}
+	if s.pendingBytes != 0 {
+		t.Fatalf("pendingBytes = %d after guard fire, want 0", s.pendingBytes)
+	}
+
+	// Sender should still accept new rows. The encoded frame for
+	// a single small row fits under the cap.
+	if err := ls.Table("t").
+		Int64Column("x", 1).
+		AtNow(ctx); err != nil {
+		t.Fatalf("AtNow after guard reset: %v", err)
+	}
+	if err := ls.Flush(ctx); err != nil {
+		t.Fatalf("Flush of single row after reset: %v", err)
+	}
+}
+
+// TestQwpFlushTimeGuardNoOpWhenServerHasNoCap is the
+// flush-time equivalent of TestQwpPerRowGuardNoOpWhenServerHasNoCap:
+// no advertised cap means the encoder's output flows straight to
+// engineAppendBlocking, regardless of how large the encoded frame
+// is.
+func TestQwpFlushTimeGuardNoOpWhenServerHasNoCap(t *testing.T) {
+	srv := newQwpTestServerWithMaxBatch(t, 0)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+addr+";auto_flush_bytes=off;")
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		if err := ls.Table("t").
+			Symbol("s", "abc").
+			Int64Column("x", int64(i)).
+			AtNow(ctx); err != nil {
+			t.Fatalf("AtNow[%d]: %v", i, err)
+		}
+	}
+	if err := ls.Flush(ctx); err != nil {
+		t.Fatalf("Flush with no advertised cap: %v", err)
 	}
 }
 

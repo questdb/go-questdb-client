@@ -250,6 +250,16 @@ const (
 	// reduces: a configured value below the advertised cap is kept
 	// as-is, and an explicit user opt-out (auto_flush_bytes=off /
 	// =0) is preserved even when the server advertises a cap.
+	//
+	// The raw advertised cap also arms two hard guards independent
+	// of the soft clamp — both fire even when the user opted out
+	// of byte-size auto-flush: a per-row guard in atWithTimestamp
+	// (rejects any single row whose buffered bytes exceed the cap)
+	// and a defensive flush-time guard in enqueueCursor (rejects
+	// and drops a batch whose encoded frame exceeds the cap, since
+	// schema + dict-delta overhead can push a sub-cap row set above
+	// the wire limit). Both surface typed errors before the frame
+	// ever leaves the process.
 	qwpDefaultAutoFlushBytes = 8 * 1024 * 1024
 
 	// qwpDefaultInFlightWindow is the default maximum number of batches

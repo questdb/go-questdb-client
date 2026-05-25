@@ -294,8 +294,17 @@ type qwpLineSender struct {
 	// trigger fires correctly even before the first transport-swap
 	// callback runs.
 	effectiveAutoFlushBytes atomic.Int64
-	flushDeadline           time.Time
-	pendingRowCount         int
+	// serverMaxBatchSize mirrors the just-bound transport's
+	// serverMaxBatchSize so the producer can apply the per-row hard
+	// guard (atWithTimestamp) and the flush-time defensive cap
+	// check (enqueueCursor) without dereferencing the loop's
+	// transport pointer on every call. Updated together with
+	// effectiveAutoFlushBytes from applyServerBatchSizeLimit; 0
+	// means "no cap advertised" and both guards short-circuit.
+	// Mirrors Java's volatile-int serverMaxBatchSize field.
+	serverMaxBatchSize atomic.Int32
+	flushDeadline      time.Time
+	pendingRowCount    int
 
 	// pendingBytes tracks the approximate buffered byte total across
 	// all table buffers. Maintained incrementally on each commitRow:
@@ -453,7 +462,15 @@ func (s *qwpLineSender) Table(name string) LineSender {
 	}
 
 	s.currentTable = tb
-	if s.maxBufSize > 0 || s.autoFlushBytes > 0 {
+	// Snapshot the table's buffered-byte count at row-start so both
+	// the auto-flush byte-size trigger (post-commit pendingBytes
+	// delta) and the per-row hard guard (pre-commit rowBytes delta
+	// vs serverMaxBatchSize) can read it. Gated to skip the
+	// approxDataSize() call when none of those consumers are
+	// active — the per-row guard joins the gate so a server-
+	// advertised cap arms it even on senders with no auto-flush
+	// configured.
+	if s.maxBufSize > 0 || s.autoFlushBytes > 0 || s.serverMaxBatchSize.Load() > 0 {
 		s.currentTableBytesBefore = tb.approxDataSize()
 	}
 	s.hasTable = true
@@ -940,6 +957,30 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 		col.addTimestamp(v)
 	}
 
+	// Per-row hard guard: if THIS row's buffered bytes already
+	// exceed the server's wire cap, the flush would produce an
+	// oversize WS frame the server closes with ws-close[1009].
+	// Catches the case where a single row is too big to ever ship,
+	// so the user sees a clear error instead of a delayed
+	// terminal-error from a downstream auto-flush. Checked BEFORE
+	// commitRow so the buffered column bytes can be discarded via
+	// cancelRow — prior committed rows in the batch stay intact
+	// and can still be flushed by the caller. The check ignores
+	// the null-padding bytes commitRow will add (bounded by
+	// numColumns * elemSize, far below any realistic cap).
+	// Mirrors Java QwpWebSocketSender.sendRow's pre-nextRow guard.
+	if cap := s.serverMaxBatchSize.Load(); cap > 0 {
+		rowBytes := s.currentTable.approxDataSize() - s.currentTableBytesBefore
+		if int64(rowBytes) > int64(cap) {
+			s.currentTable.cancelRow()
+			s.hasTable = false
+			s.currentTable = nil
+			return fmt.Errorf(
+				"qwp: row too large for server batch cap [rowBytes=%d, serverMaxBatchSize=%d]",
+				rowBytes, cap)
+		}
+	}
+
 	// Commit the row (gap-fills missing columns).
 	s.currentTable.commitRow()
 
@@ -1003,14 +1044,14 @@ func (s *qwpLineSender) autoFlush(ctx context.Context) error {
 	return nil
 }
 
-// applyServerBatchSizeLimit refreshes effectiveAutoFlushBytes from
-// the cap the just-bound transport advertised in X-QWP-Max-Batch-Size.
-// Registered as the send loop's onTransportSwap callback, so it runs
-// after every successful connect — initial bind and every reconnect.
-// A rolling upgrade can leave neighbouring endpoints with different
-// caps, so the clamp is re-evaluated on every swap; never increase
-// past the configured autoFlushBytes, never override an explicit
-// opt-out.
+// applyServerBatchSizeLimit refreshes effectiveAutoFlushBytes and
+// serverMaxBatchSize from the cap the just-bound transport advertised
+// in X-QWP-Max-Batch-Size. Registered as the send loop's
+// onTransportSwap callback, so it runs after every successful connect
+// — initial bind and every reconnect. A rolling upgrade can leave
+// neighbouring endpoints with different caps, so the clamp is
+// re-evaluated on every swap; never increase past the configured
+// autoFlushBytes, never override an explicit opt-out.
 //
 // Resolution (mirrors Java QwpWebSocketSender.applyServerBatchSizeLimit):
 //   - s.autoFlushBytes <= 0: the user disabled byte-size auto-flush;
@@ -1024,16 +1065,24 @@ func (s *qwpLineSender) autoFlush(ctx context.Context) error {
 //     auto-flush could still emit a frame the server closes with
 //     ws-close[1009].
 //
-// Safe to call from any goroutine: atomic.Int64 store on the only
-// mutated field. Cheap; no allocations.
+// Also mirrors the raw cap onto s.serverMaxBatchSize so the per-row
+// hard guard in atWithTimestamp and the flush-time defensive cap
+// check in enqueueCursor can sample it cheaply without dereferencing
+// the loop's transport pointer. Always-update (independent of the
+// opt-out branch) so the guards fire against the freshly-advertised
+// value even when the user opted out of the soft trigger.
+//
+// Safe to call from any goroutine: atomic stores on both fields.
+// Cheap; no allocations.
 func (s *qwpLineSender) applyServerBatchSizeLimit(t *qwpTransport) {
-	if s.autoFlushBytes <= 0 {
-		s.effectiveAutoFlushBytes.Store(0)
-		return
-	}
 	var cap int32
 	if t != nil {
 		cap = t.serverMaxBatchSize
+	}
+	s.serverMaxBatchSize.Store(cap)
+	if s.autoFlushBytes <= 0 {
+		s.effectiveAutoFlushBytes.Store(0)
+		return
 	}
 	if cap <= 0 {
 		s.effectiveAutoFlushBytes.Store(int64(s.autoFlushBytes))

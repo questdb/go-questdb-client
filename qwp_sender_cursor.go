@@ -428,6 +428,27 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 		-1, // self-sufficient: full dict from id 0
 		s.batchMaxSymbolId,
 	)
+	// Defensive flush-time cap check: the per-row guard in
+	// atWithTimestamp catches individual oversize rows, but schema
+	// and dict-delta bytes the encoder adds at message-build time
+	// can push a batch of legitimately-sized rows above the wire
+	// cap. Without this check the frame would be enqueued and the
+	// send loop would emit a ws-close[1009 Message Too Big] after
+	// the producer already returned success. Unlike append-time
+	// errors that retain pending rows for the next flush, an
+	// oversize message will fail the same way on every retry — so
+	// we DROP all pending state in-place via resetAfterFlush and
+	// surface a clear typed error naming the dropped row count.
+	// The sender stays usable; the caller must re-batch with fewer
+	// rows per flush. Mirrors Java QwpWebSocketSender.flushPendingRows.
+	if cap := s.serverMaxBatchSize.Load(); cap > 0 && int64(len(encoded)) > int64(cap) {
+		droppedRows := s.pendingRowCount
+		msgSize := len(encoded)
+		s.resetAfterFlush()
+		return fmt.Errorf(
+			"qwp: batch too large for server batch cap [messageSize=%d, serverMaxBatchSize=%d, droppedRows=%d]",
+			msgSize, cap, droppedRows)
+	}
 	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
 		return err
 	}
