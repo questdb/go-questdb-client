@@ -33,6 +33,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -59,6 +60,16 @@ const (
 	qwpHeaderVersion        = "X-QWP-Version"
 	qwpHeaderAcceptEncoding = "X-QWP-Accept-Encoding"
 	qwpHeaderMaxBatchRows   = "X-QWP-Max-Batch-Rows"
+	// qwpHeaderMaxBatchSize is the server-advertised hard cap on a
+	// single DATA_BATCH wire frame (bytes), echoed in the WebSocket
+	// upgrade response. Used to clamp the producer's
+	// auto_flush_bytes trigger down to 90% of this value so a
+	// soft-flush fires before the encoded batch can exceed the cap
+	// and trip ws-close[1009]. 0 / absent / unparseable means the
+	// server did not advertise a cap (older build) and the
+	// configured auto_flush_bytes is kept verbatim. Mirrors Java
+	// WebSocketClient.QWP_MAX_BATCH_SIZE_HEADER_NAME.
+	qwpHeaderMaxBatchSize = "X-QWP-Max-Batch-Size"
 )
 
 // qwpClientId is sent in X-QWP-Client-Id during the upgrade handshake.
@@ -167,6 +178,17 @@ type qwpTransport struct {
 	// connect(); 0 before connect() has succeeded. Egress callers
 	// branch on this to decide whether to expect a SERVER_INFO frame.
 	negotiatedVersion byte
+
+	// serverMaxBatchSize is the server-advertised hard cap on a
+	// single DATA_BATCH wire frame (bytes), parsed from the
+	// X-QWP-Max-Batch-Size response header during connect(). 0
+	// means the server did not advertise a cap (header absent /
+	// unparseable / non-positive); callers must treat 0 as "no
+	// clamp". Read by the qwpLineSender's transport-swap callback
+	// to refresh its effective auto_flush_bytes threshold on every
+	// successful connect; a rolling upgrade can leave neighbouring
+	// endpoints with different caps.
+	serverMaxBatchSize int32
 
 	// serverInfo holds the SERVER_INFO frame consumed during connect()
 	// when the negotiated version is >= 2 and opts.serverInfoTimeout
@@ -308,6 +330,19 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 
 	t.conn = conn
 	t.negotiatedVersion = byte(negotiated)
+	// Parse the optional X-QWP-Max-Batch-Size advertisement. A
+	// non-positive or unparseable value is treated as "no cap":
+	// older servers that don't emit the header leave the configured
+	// auto_flush_bytes untouched. Mirrors Java
+	// WebSocketClient.extractMaxBatchSize.
+	if cap := resp.Header.Get(qwpHeaderMaxBatchSize); cap != "" {
+		if parsed, perr := strconv.Atoi(cap); perr == nil && parsed > 0 {
+			if parsed > math.MaxInt32 {
+				parsed = math.MaxInt32
+			}
+			t.serverMaxBatchSize = int32(parsed)
+		}
+	}
 	if t.recvBuf == nil {
 		t.recvBuf = make([]byte, 0, qwpDefaultInitRecvBufSize)
 	}

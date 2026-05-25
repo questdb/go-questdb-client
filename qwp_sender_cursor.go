@@ -103,6 +103,16 @@ func newQwpCursorLineSender(
 		cursorEngine:      cursorEngine,
 		cursorSendLoop:    cursorSendLoop,
 	}
+	// Seed effectiveAutoFlushBytes to the configured value so the
+	// auto-flush trigger behaves correctly before the first
+	// transport-swap callback fires (this covers the test paths
+	// that construct a sender directly without wiring the callback,
+	// and the brief window in the conf-driven paths between sender
+	// construction and the callback install + initial seed). The
+	// conf-driven constructors then refine this via
+	// applyServerBatchSizeLimit using the connected transport's
+	// advertised cap.
+	s.effectiveAutoFlushBytes.Store(int64(autoFlushBytes))
 	// Single encoder slot is enough — the cursor engine takes a copy
 	// of the bytes via tryAppend, so the encoder buffer can be reused
 	// immediately. No double-buffering needed here.
@@ -251,7 +261,6 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	}
 	loop.sendLoopSetPolicyResolver(resolver)
 	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
-	loop.sendLoopStart()
 
 	s, err := newQwpCursorLineSender(
 		conf.autoFlushRows,
@@ -268,6 +277,16 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	}
 	s.fileNameLimit = conf.fileNameLimit
 	s.encoder.gorillaDisabled = conf.gorillaDisabled
+	// Seed the byte-trigger clamp from the initial transport (the
+	// sync-connect branches above populated loop.transport; the
+	// async branch leaves it nil and the first reconnect callback
+	// will refresh) and install the swap callback so every
+	// subsequent connect re-applies the clamp. Both happen before
+	// sendLoopStart so the I/O goroutine sees the installed
+	// callback on the very first swap.
+	loop.sendLoopSetOnTransportSwap(s.applyServerBatchSizeLimit)
+	s.applyServerBatchSizeLimit(loop.transport.Load())
+	loop.sendLoopStart()
 
 	// Orphan adoption (drain_orphans=on). At foreground startup,
 	// scan <sf_dir>/* for sibling slots that hold unacked data and

@@ -242,10 +242,14 @@ const (
 
 	// qwpDefaultAutoFlushBytes is the byte-size trigger for auto-flush.
 	// connect-string.md §Auto-flushing: "Default where supported: `8m`
-	// (8 MiB)". Mirrors Java's DEFAULT_AUTO_FLUSH_BYTES. The handshake
-	// is allowed to clamp the effective threshold down to 90% of the
-	// server-advertised X-QWP-Max-Batch-Size, but only downwards — a
-	// configured value below the advertised cap is kept as-is.
+	// (8 MiB)". Mirrors Java's DEFAULT_AUTO_FLUSH_BYTES. The effective
+	// threshold the sender compares pendingBytes against is clamped
+	// down to 90% of the server-advertised X-QWP-Max-Batch-Size on
+	// every successful connect (initial bind and every reconnect) —
+	// see qwpLineSender.applyServerBatchSizeLimit. The clamp only
+	// reduces: a configured value below the advertised cap is kept
+	// as-is, and an explicit user opt-out (auto_flush_bytes=off /
+	// =0) is preserved even when the server advertises a cap.
 	qwpDefaultAutoFlushBytes = 8 * 1024 * 1024
 
 	// qwpDefaultInFlightWindow is the default maximum number of batches

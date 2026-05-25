@@ -218,6 +218,15 @@ type qwpSfSendLoop struct {
 	// (resets at the start of each connectWithBackoff call).
 	outageStartUnixNano atomic.Int64
 	reconnectAttempts   atomic.Int64
+
+	// onTransportSwap, when non-nil, is invoked from swapClient with
+	// the freshly bound transport so the sender can refresh
+	// connection-derived state (currently: the auto_flush_bytes
+	// clamp derived from X-QWP-Max-Batch-Size). Atomic pointer so
+	// the producer-side install in the sender constructor cannot
+	// race the I/O goroutine's reconnect-time read. nil = no
+	// callback installed (legacy bench harness / drainers).
+	onTransportSwap atomic.Pointer[func(*qwpTransport)]
 }
 
 // qwpSfNewSendLoop constructs a send loop bound to the given engine
@@ -295,6 +304,27 @@ func (l *qwpSfSendLoop) wakeSender() {
 	case l.wakeup <- struct{}{}:
 	default:
 	}
+}
+
+// sendLoopSetOnTransportSwap installs a callback fired by swapClient
+// after each successful transport bind (initial sync connect on the
+// memory-mode path, and every reconnect on either path). The
+// sender uses it to refresh state derived from the upgrade
+// response — currently the X-QWP-Max-Batch-Size-derived
+// auto_flush_bytes clamp. Idempotent: a later call replaces the
+// previous callback. Pass nil to clear. Safe to call before
+// sendLoopStart or while the loop is running (atomic install).
+//
+// The callback runs on whichever goroutine triggered the swap: the
+// producer goroutine for the constructor's seed call, the I/O
+// goroutine for every reconnect. Implementations must be cheap and
+// non-blocking — the swap path is on the wire's critical path.
+func (l *qwpSfSendLoop) sendLoopSetOnTransportSwap(cb func(*qwpTransport)) {
+	if cb == nil {
+		l.onTransportSwap.Store(nil)
+		return
+	}
+	l.onTransportSwap.Store(&cb)
 }
 
 // sendLoopSetHostTracker installs the failover.md §2 host-health
@@ -1070,6 +1100,14 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 // repositions the cursor so the next trySendOne call replays the
 // first unacked frame. Returns a non-nil error if the cursor walk
 // hits a corrupt frame header; see positionCursorAt.
+//
+// On success, fires onTransportSwap (if installed) with the new
+// transport so the sender can refresh connection-derived state
+// (the auto_flush_bytes clamp). The callback runs after the
+// transport is published via atomic.Swap and after the cursor is
+// repositioned, so any sender side effect (e.g. an updated
+// effective threshold) is in place before the next trySendOne can
+// publish a frame on the new connection.
 func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	old := l.transport.Swap(newTransport)
 	if old != nil {
@@ -1086,7 +1124,13 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	} else {
 		l.replayTargetFsn = -1
 	}
-	return l.positionCursorAt(replayStart)
+	if err := l.positionCursorAt(replayStart); err != nil {
+		return err
+	}
+	if cb := l.onTransportSwap.Load(); cb != nil {
+		(*cb)(newTransport)
+	}
+	return nil
 }
 
 // qwpSfIsTerminalUpgradeError reports whether err indicates any

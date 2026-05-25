@@ -1405,6 +1405,14 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 	s.maxBufSize = conf.maxBufSize
 	s.fileNameLimit = conf.fileNameLimit
 	s.autoFlushBytes = conf.autoFlushBytes
+	// Seed effectiveAutoFlushBytes from the initial transport (set
+	// by newQwpLineSenderUnstarted's synchronous dial) and install
+	// the swap callback so every reconnect re-applies the clamp.
+	// Both happen before sendLoopStart, so the producer's first
+	// auto-flush trigger and any subsequent reconnect see the
+	// up-to-date threshold.
+	s.cursorSendLoop.sendLoopSetOnTransportSwap(s.applyServerBatchSizeLimit)
+	s.applyServerBatchSizeLimit(s.cursorSendLoop.transport.Load())
 	// Memory mode also honours close_flush_timeout_millis (the
 	// spec-aligned name). closeFlushTimeoutSet distinguishes "user
 	// set 0 / negative -> fast close" from "user did not set ->

@@ -280,8 +280,22 @@ type qwpLineSender struct {
 	autoFlushRows     int
 	autoFlushInterval time.Duration
 	autoFlushBytes    int // 0 disables the byte-size trigger
-	flushDeadline     time.Time
-	pendingRowCount   int
+	// effectiveAutoFlushBytes is the per-connection clamped variant
+	// of autoFlushBytes. Computed from the server-advertised
+	// X-QWP-Max-Batch-Size on every successful connect / reconnect
+	// via the send loop's onTransportSwap callback:
+	//   - autoFlushBytes <= 0 (user opted out):           store 0
+	//   - server cap <= 0      (header absent / older):    store autoFlushBytes
+	//   - otherwise:                                       store min(autoFlushBytes, cap*9/10)
+	// Read by the producer in atWithTimestamp to drive the byte-size
+	// auto-flush trigger; atomic so a reconnect from the I/O
+	// goroutine cannot race the producer's per-row trigger check.
+	// Initialised to autoFlushBytes in the constructors so the
+	// trigger fires correctly even before the first transport-swap
+	// callback runs.
+	effectiveAutoFlushBytes atomic.Int64
+	flushDeadline           time.Time
+	pendingRowCount         int
 
 	// pendingBytes tracks the approximate buffered byte total across
 	// all table buffers. Maintained incrementally on each commitRow:
@@ -942,8 +956,19 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 	s.pendingRowCount++
 
 	if s.maxBufSize > 0 || s.autoFlushBytes > 0 {
+		// The byte-size trigger compares against effectiveAutoFlushBytes,
+		// not the raw configured autoFlushBytes: the send loop's
+		// onTransportSwap callback clamps the threshold down to 90%
+		// of the server-advertised X-QWP-Max-Batch-Size on every
+		// connect, so the soft auto-flush fires before the encoded
+		// batch can exceed the server's hard cap. effectiveAutoFlushBytes
+		// is seeded from autoFlushBytes in the constructor; it is
+		// always > 0 iff the user opted in, regardless of whether a
+		// transport-swap callback has fired yet, so the gate on
+		// s.autoFlushBytes > 0 above stays sound.
+		effective := int(s.effectiveAutoFlushBytes.Load())
 		triggered := (s.maxBufSize > 0 && s.pendingBytes > s.maxBufSize) ||
-			(s.autoFlushBytes > 0 && s.pendingBytes >= s.autoFlushBytes)
+			(effective > 0 && s.pendingBytes >= effective)
 		if triggered {
 			return s.autoFlush(ctx)
 		}
@@ -976,6 +1001,50 @@ func (s *qwpLineSender) autoFlush(ctx context.Context) error {
 	}
 	s.resetAfterFlush()
 	return nil
+}
+
+// applyServerBatchSizeLimit refreshes effectiveAutoFlushBytes from
+// the cap the just-bound transport advertised in X-QWP-Max-Batch-Size.
+// Registered as the send loop's onTransportSwap callback, so it runs
+// after every successful connect — initial bind and every reconnect.
+// A rolling upgrade can leave neighbouring endpoints with different
+// caps, so the clamp is re-evaluated on every swap; never increase
+// past the configured autoFlushBytes, never override an explicit
+// opt-out.
+//
+// Resolution (mirrors Java QwpWebSocketSender.applyServerBatchSizeLimit):
+//   - s.autoFlushBytes <= 0: the user disabled byte-size auto-flush;
+//     keep it disabled even when the server advertises a cap.
+//   - transport == nil OR cap <= 0: the server did not advertise a
+//     cap (older build or async-pending initial connect); the
+//     configured autoFlushBytes is kept verbatim.
+//   - otherwise: store min(autoFlushBytes, cap*9/10). The 10%
+//     headroom covers schema + dict-delta encoding overhead the
+//     soft trigger does not see — without it, an at-the-limit
+//     auto-flush could still emit a frame the server closes with
+//     ws-close[1009].
+//
+// Safe to call from any goroutine: atomic.Int64 store on the only
+// mutated field. Cheap; no allocations.
+func (s *qwpLineSender) applyServerBatchSizeLimit(t *qwpTransport) {
+	if s.autoFlushBytes <= 0 {
+		s.effectiveAutoFlushBytes.Store(0)
+		return
+	}
+	var cap int32
+	if t != nil {
+		cap = t.serverMaxBatchSize
+	}
+	if cap <= 0 {
+		s.effectiveAutoFlushBytes.Store(int64(s.autoFlushBytes))
+		return
+	}
+	safe := int64(cap) * 9 / 10
+	effective := int64(s.autoFlushBytes)
+	if safe < effective {
+		effective = safe
+	}
+	s.effectiveAutoFlushBytes.Store(effective)
 }
 
 func (s *qwpLineSender) AtNow(ctx context.Context) error {
