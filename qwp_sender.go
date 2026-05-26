@@ -113,8 +113,10 @@ type QwpSender interface {
 	// Useful for tests and user code that need to confirm a specific
 	// publish has been server-acknowledged. Wrap with
 	// context.WithTimeout for a bounded wait. Pair AwaitAckedFsn with
-	// the auto-flush path (which enqueues without waiting), not with
-	// Flush (which already blocks on ACK).
+	// the FSN returned by FlushAndGetSequence — none of the flush
+	// paths (explicit Flush, FlushAndGetSequence, auto-flush) wait
+	// for ACK, so AwaitAckedFsn is the only API that blocks on server
+	// acknowledgement.
 	AwaitAckedFsn(ctx context.Context, target int64) error
 
 	// FlushAndGetSequence behaves identically to Flush but returns
