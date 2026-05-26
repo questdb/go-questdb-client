@@ -1,0 +1,72 @@
+# Dispatch pipeline: triggers Enterprise e2e tests for go-questdb-client.
+#
+# This is an Azure DevOps pipeline file. Create it as a pipeline in the
+# go-questdb-client Azure DevOps project (or add the dispatch step to
+# an existing Azure DevOps pipeline). It sends an Azure DevOps REST API
+# call to queue the build-and-test-e2e-go-client pipeline in
+# questdb-enterprise, passing this PR's commit SHA, PR number, and
+# branch name.
+#
+# Required variables (set in Azure DevOps pipeline settings):
+#   ENTERPRISE_ADO_TOKEN   -- PAT with Build:Queue scope
+#   ENTERPRISE_ORG_URL     -- e.g. https://dev.azure.com/questdb
+#   ENTERPRISE_PROJECT     -- e.g. questdb-enterprise
+#   ENTERPRISE_PIPELINE_ID -- build definition ID of the
+#                             build-and-test-e2e-go-client pipeline
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+  - checkout: none
+
+  - bash: |
+      set -eux
+
+      PR_NUMBER="$(System.PullRequest.PullRequestNumber)"
+      COMMIT="$(Build.SourceVersion)"
+      BRANCH="$(Build.SourceBranchName)"
+
+      echo "Dispatching Enterprise e2e pipeline..."
+      echo "  commit:  $COMMIT"
+      echo "  PR:      $PR_NUMBER"
+      echo "  branch:  $BRANCH"
+
+      BODY=$(cat <<EOF
+      {
+        "definition": { "id": $(ENTERPRISE_PIPELINE_ID) },
+        "sourceBranch": "refs/heads/main",
+        "templateParameters": {
+          "goClientCommit": "$COMMIT",
+          "goClientPrNumber": "$PR_NUMBER",
+          "clientBranch": "$BRANCH"
+        }
+      }
+      EOF
+      )
+
+      HTTP_CODE=$(curl -s -o /tmp/dispatch_response.json -w "%{http_code}" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -u ":$(ENTERPRISE_ADO_TOKEN)" \
+        "$(ENTERPRISE_ORG_URL)/$(ENTERPRISE_PROJECT)/_apis/build/builds?api-version=7.0" \
+        -d "$BODY")
+
+      echo "HTTP status: $HTTP_CODE"
+      cat /tmp/dispatch_response.json | jq '{ id: .id, buildNumber: .buildNumber, status: .status }' 2>/dev/null || cat /tmp/dispatch_response.json
+
+      if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+        echo "##vso[task.logissue type=warning]Enterprise e2e dispatch failed (HTTP $HTTP_CODE); continuing."
+      else
+        BUILD_URL=$(cat /tmp/dispatch_response.json | jq -r '._links.web.href // empty')
+        echo "Enterprise e2e build queued: $BUILD_URL"
+      fi
+    displayName: "Dispatch Enterprise e2e pipeline"
+    condition: succeeded()

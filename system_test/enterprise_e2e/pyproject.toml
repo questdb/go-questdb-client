@@ -1,0 +1,24 @@
+[project]
+name = "go-questdb-client-enterprise-e2e"
+version = "0.1.0"
+description = "Enterprise e2e tests for the Go QuestDB client (QWiP durable-ack)."
+requires-python = ">=3.10"
+dependencies = [
+    "pytest>=8.0",
+    "pytest-randomly>=3.15",
+    "psycopg[binary]>=3.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+]
+markers = [
+    "go_client: Go client e2e tests against Enterprise QuestDB",
+]
+log_cli = true
+log_cli_level = "INFO"
