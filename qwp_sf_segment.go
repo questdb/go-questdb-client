@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"os"
 	"sync/atomic"
 	"time"
@@ -376,6 +377,14 @@ func (s *qwpSfSegment) tryAppend(payload []byte) (int64, error) {
 	payloadLen := int64(len(payload))
 	if payloadLen < 0 {
 		return 0, fmt.Errorf("qwp/sf: negative payloadLen: %d", payloadLen)
+	}
+	// The on-disk length is a u32 read back as int32 by the recovery
+	// scanner (qwpSfScanFrames), so any value with bit 31 set would
+	// round-trip as negative and be rejected as a torn tail. Bracket
+	// the writer to the reader's tolerance so a too-large frame fails
+	// here instead of corrupting the segment.
+	if payloadLen > math.MaxInt32 {
+		return 0, fmt.Errorf("qwp/sf: payloadLen exceeds int32: %d", payloadLen)
 	}
 	total := qwpSfFrameHeaderSize + payloadLen
 	offset := s.appendCursor
