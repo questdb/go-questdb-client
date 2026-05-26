@@ -212,8 +212,9 @@ func runUpgradeFailureScenario(t *testing.T, upgradeStatus int) *SenderError {
 	t.Cleanup(failSrv.Close)
 
 	// Data server ACKs the first frame and closes on the second:
-	// frame 1 advances acksRecvOnConn, so the silent-drop guard
-	// won't fire when the connection breaks.
+	// frame 1 advances totalAcks, so the silent-drop guard (which
+	// is gated on totalAcks == 0) won't fire when the connection
+	// breaks.
 	dataSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 2})
 	t.Cleanup(dataSrv.Close)
 

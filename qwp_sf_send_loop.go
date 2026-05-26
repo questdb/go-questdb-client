@@ -202,13 +202,14 @@ type qwpSfSendLoop struct {
 	totalReconnectAttempts atomic.Int64
 	totalFramesReplayed    atomic.Int64
 
-	// Per-connection counters used to detect "server up but doesn't
-	// speak our protocol". A WS upgrade that succeeds followed by a
-	// drop after we sent ≥1 frame and saw zero ACKs is unrecoverable
-	// (likely a server-side version/config mismatch — reconnecting
-	// just hammers the server). Reset on every connection swap.
+	// framesSentOnConn counts frames written to the wire on the
+	// current connection (reset on every connection swap). Paired
+	// with the lifetime totalAcks counter in the silent-drop guard
+	// in run(): a fresh sender whose every dial succeeds and every
+	// frame meets silence (totalAcks == 0) signals "server up but
+	// doesn't speak our protocol" — fail terminally instead of
+	// burning ephemeral ports for reconnectMaxDuration.
 	framesSentOnConn atomic.Int64
-	acksRecvOnConn   atomic.Int64
 
 	// Reconnect-loop status, exposed so engineAppendBlocking can
 	// distinguish "wire publishing but slow" from "wire is in the
@@ -543,7 +544,6 @@ func (l *qwpSfSendLoop) positionCursorForStart() error {
 	l.fsnAtZero.Store(replayStart)
 	l.nextWireSeq.Store(0)
 	l.framesSentOnConn.Store(0)
-	l.acksRecvOnConn.Store(0)
 	return l.positionCursorAt(replayStart)
 }
 
@@ -675,21 +675,30 @@ func (l *qwpSfSendLoop) run() {
 		// our QWP protocol" — the dial succeeds every time, so plain
 		// reconnect-with-backoff would hammer the server in a hot
 		// loop until reconnectMaxDuration expires (5 min default),
-		// burning thousands of ephemeral ports per second. The
-		// signature: this connection sent ≥1 frame and saw zero ACKs
-		// before dropping. A healthy server either ACKs OK or sends a
-		// non-OK status ACK (which is already classified terminal in
-		// receiverLoop) — silent disconnect after a frame is a
-		// version/config mismatch, and reconnecting can't fix it.
-		if l.framesSentOnConn.Load() > 0 && l.acksRecvOnConn.Load() == 0 {
+		// burning thousands of ephemeral ports per second.
+		//
+		// Gate on *lifetime* ACK history (totalAcks), not the per-
+		// connection counter: once any ACK has been observed across
+		// this sender's life, we have proof the server speaks our
+		// wire-format dialect, so a later silent disconnect is a
+		// transient outage (LB drain emitting WS 1001 GoingAway, TCP
+		// RST surfacing as 1006, proxy reset, graceful 1011/1012/
+		// 1013 — none of which are flagged terminal by
+		// qwpSfIsTerminalCloseCode) and reconnect is the right
+		// reaction. Only the never-ACK'd case is still treated as
+		// terminal here, which is the original port-hammering
+		// signature: a fresh sender whose every dial succeeds and
+		// every frame is met with silence.
+		if l.framesSentOnConn.Load() > 0 && l.totalAcks.Load() == 0 {
 			// The connection finished the WS upgrade and the X-QWP-
 			// Version negotiation, then closed without ACKing any of
-			// the frames we sent. Reconnect can't fix this — the
-			// server isn't speaking the same wire-format dialect we
-			// are (most often: server build is older than this
-			// client's branch, even if both sides declared the same
-			// X-QWP-Version). Fail terminally to avoid hammering the
-			// server with thousands of dial attempts per second.
+			// the frames we sent — and no prior connection on this
+			// sender has ACK'd anything either. Reconnect can't fix
+			// this — the server isn't speaking the same wire-format
+			// dialect we are (most often: server build is older than
+			// this client's branch, even if both sides declared the
+			// same X-QWP-Version). Fail terminally to avoid hammering
+			// the server with thousands of dial attempts per second.
 			reason := fmt.Sprintf(
 				"server accepted the WebSocket upgrade but disconnected "+
 					"without ACKing any of the %d frame(s) we sent — server is "+
@@ -1018,7 +1027,6 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// "the server has resolved this batch".
 			l.engine.engineAcknowledge(fsn)
 			l.totalAcks.Add(1)
-			l.acksRecvOnConn.Add(1)
 			continue
 		}
 		// Sanity: don't trust an ACK beyond what we've actually
@@ -1035,7 +1043,6 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 		}
 		l.engine.engineAcknowledge(l.fsnAtZero.Load() + capped)
 		l.totalAcks.Add(1)
-		l.acksRecvOnConn.Add(1)
 	}
 }
 
@@ -1155,7 +1162,6 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	l.fsnAtZero.Store(replayStart)
 	l.nextWireSeq.Store(0)
 	l.framesSentOnConn.Store(0)
-	l.acksRecvOnConn.Store(0)
 	pubAtSwap := l.engine.enginePublishedFsn()
 	if pubAtSwap >= replayStart {
 		l.replayTargetFsn = pubAtSwap

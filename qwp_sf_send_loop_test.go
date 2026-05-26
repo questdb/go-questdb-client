@@ -734,6 +734,73 @@ func TestQwpSfSendLoopSilentDropAfterFrameIsTerminal(t *testing.T) {
 		"server should have seen at most 2 connections")
 }
 
+// TestQwpSfSendLoopSilentDropAfterPriorAckReconnects pins the
+// regression for the silent-drop guard's false-positive failure
+// mode: once any ACK has been observed across this sender's
+// lifetime, a subsequent silent disconnect is a transient outage
+// (LB drain emitting WS 1001 GoingAway, TCP RST surfacing as 1006,
+// proxy reset, 1011/1012/1013 service restarts — none of which are
+// flagged terminal by qwpSfIsTerminalCloseCode), not an
+// incompatible-build mismatch. The loop must keep reconnecting
+// rather than latch a terminal SenderError.
+func TestQwpSfSendLoopSilentDropAfterPriorAckReconnects(t *testing.T) {
+	goodSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer goodSrv.Close()
+	// silentSrv stands in for the LB / proxy that accepts the WS
+	// upgrade but drops every frame without ACKing — what the old
+	// per-connection heuristic mistook for "incompatible build".
+	silentSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{silentDropAfterFrames: 1})
+	defer silentSrv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(goodSrv)(context.Background(), 0)
+	require.NoError(t, err)
+
+	// Reconnect factory points at silentSrv: after goodSrv goes
+	// away, every reconnect lands on the silent-drop server.
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialAt(silentSrv.URL),
+		100*time.Microsecond, 30*time.Second, 1*time.Millisecond, 5*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	// Frame 0: goodSrv ACKs. After this, totalAcks >= 1 and the
+	// silent-drop guard's "never any ACK" precondition is gone.
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("warm-up"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, time.Second, time.Millisecond, "warm-up frame should have been ACK'd by goodSrv")
+
+	// Tear down goodSrv to force the loop into reconnect against silentSrv.
+	close(goodSrv.kill)
+
+	// Enqueue a frame that silentSrv will read and silently drop,
+	// driving the silent-drop guard's reconnect cycle. Without
+	// further work the loop would just park on a quiet silentSrv
+	// connection forever and we'd observe no reconnects either way.
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("post-kill"))
+	require.NoError(t, err)
+
+	// Wait until the loop has accumulated several silent-drop
+	// reconnect cycles against silentSrv. Under the old heuristic
+	// the very first cycle would have latched a terminal
+	// "incompatible build" SenderError, capping connCount at 1.
+	require.Eventually(t, func() bool {
+		return silentSrv.connCount.Load() >= 3
+	}, 2*time.Second, 1*time.Millisecond,
+		"loop should have reconnected to silentSrv multiple times")
+
+	// The whole point: no terminal classification.
+	if gotErr := loop.sendLoopCheckError(); gotErr != nil {
+		t.Fatalf("loop unexpectedly went terminal after prior-ACK silent drop: %v", gotErr)
+	}
+	assert.Nil(t, loop.sendLoopLastTerminalServerError(),
+		"no terminal SenderError should be latched once totalAcks > 0")
+}
+
 func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
 	// First server ACKs at least one frame (so the post-disconnect
 	// classification is "had a real conversation, try to reconnect"
