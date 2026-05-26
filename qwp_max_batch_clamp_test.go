@@ -564,6 +564,87 @@ func TestQwpPerRowGuardNoOpWhenServerHasNoCap(t *testing.T) {
 	}
 }
 
+// TestQwpPerRowGuardMidRowCapTransition is a regression test for the
+// false-reject path on async-initial-connect senders that opted out
+// of both byte-size triggers (autoFlushBytes=0, maxBufSize=0). The
+// Table()-entry snapshot of currentTableBytesBefore was previously
+// gated on at least one of {maxBufSize, autoFlushBytes,
+// serverMaxBatchSize} being non-zero. If the user opted out of the
+// first two and the initial connect was still pending, all three
+// gate inputs were zero, so the snapshot was skipped. If
+// serverMaxBatchSize then flipped from 0 to positive between Table()
+// and At() (the I/O goroutine's onTransportSwap callback firing
+// mid-row), the per-row guard ran with a stale baseline of 0 and
+// computed rowBytes = tb.dataSize - 0 = bytes of every committed
+// row in the buffer, not the in-progress row alone. A valid row
+// whose true delta fit under the cap was rejected as "row too
+// large". Fix is to always snapshot at Table() entry; this test
+// fires the mid-row transition deterministically by flipping
+// serverMaxBatchSize directly.
+func TestQwpPerRowGuardMidRowCapTransition(t *testing.T) {
+	ctx := context.Background()
+	ts := time.Unix(0, 1_000_000_000)
+
+	s := &qwpLineSender{
+		tableBuffers:     make(map[string]*qwpTableBuffer),
+		globalSymbols:    make(map[string]int32),
+		maxSentSymbolId:  -1,
+		batchMaxSymbolId: -1,
+		// autoFlushBytes / maxBufSize both 0 — user opted out of
+		// both byte-size triggers.
+	}
+
+	// Row 1 commits while serverMaxBatchSize is still 0 (initial
+	// connect not yet completed). Use a moderately large string so
+	// row 1 alone occupies enough buffer bytes that a small cap can
+	// distinguish "row 2 alone" from "row 1 + row 2".
+	if err := s.Table("t").
+		Symbol("s", "a").
+		StringColumn("big", strings.Repeat("x", 500)).
+		At(ctx, ts); err != nil {
+		t.Fatalf("row 1 At: %v", err)
+	}
+	if s.pendingRowCount != 1 {
+		t.Fatalf("after row 1: pendingRowCount = %d, want 1", s.pendingRowCount)
+	}
+	tb := s.tableBuffers["t"]
+	row1Bytes := tb.approxDataSize()
+	if row1Bytes < 500 {
+		t.Fatalf("row 1 buffered bytes = %d, want >= 500", row1Bytes)
+	}
+
+	// Row 2: open the row first while cap is still 0, then flip the
+	// cap to a value that's well under the cumulative buffer total
+	// but well above any plausible per-row-2 delta. The mid-row
+	// flip simulates the async-initial-connect onTransportSwap
+	// callback racing the producer.
+	s.Table("t").Symbol("s", "b").Int64Column("v", int64(42))
+
+	// Pick a cap that's a safe margin above row 2's true delta but
+	// strictly below the cumulative buffer size. 200 bytes comfortably
+	// fits row 2's symbol+int delta (well under 100 bytes) while
+	// staying under row1Bytes (>= 500).
+	const cap = int32(200)
+	if int(cap) >= row1Bytes {
+		t.Fatalf("test setup: cap %d must be < row1Bytes %d", cap, row1Bytes)
+	}
+	s.serverMaxBatchSize.Store(cap)
+
+	// With the fix in place, the snapshot taken at Table() entry
+	// reflects the post-row-1 buffer size, so the per-row guard
+	// computes rowBytes against just row 2's delta and passes.
+	// With the pre-fix gate, currentTableBytesBefore stayed at 0
+	// and the guard would compute rowBytes = full buffer total and
+	// falsely reject.
+	if err := s.At(ctx, ts.Add(time.Microsecond)); err != nil {
+		t.Fatalf("row 2 At (mid-row cap transition): %v", err)
+	}
+	if s.pendingRowCount != 2 {
+		t.Fatalf("after row 2: pendingRowCount = %d, want 2 (row 2 should have committed)",
+			s.pendingRowCount)
+	}
+}
+
 // TestQwpFlushTimeGuardFires verifies the defensive cap check at
 // encode time catches the case where individual rows fit under the
 // cap but their cumulative encoded frame (schema, dict, headers,

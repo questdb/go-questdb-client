@@ -467,14 +467,16 @@ func (s *qwpLineSender) Table(name string) LineSender {
 	// Snapshot the table's buffered-byte count at row-start so both
 	// the auto-flush byte-size trigger (post-commit pendingBytes
 	// delta) and the per-row hard guard (pre-commit rowBytes delta
-	// vs serverMaxBatchSize) can read it. Gated to skip the
-	// approxDataSize() call when none of those consumers are
-	// active — the per-row guard joins the gate so a server-
-	// advertised cap arms it even on senders with no auto-flush
-	// configured.
-	if s.maxBufSize > 0 || s.autoFlushBytes > 0 || s.serverMaxBatchSize.Load() > 0 {
-		s.currentTableBytesBefore = tb.approxDataSize()
-	}
+	// vs serverMaxBatchSize) can read it. Always snapshot — the
+	// async-initial-connect path may flip serverMaxBatchSize from 0
+	// to positive between Table() and At(), and a gated snapshot
+	// would leave currentTableBytesBefore stale (carrying over from
+	// a previous row, or 0 if never set) so the per-row guard reads
+	// (current size - 0) as the row's bytes and falsely rejects a
+	// valid row whose true delta fits. approxDataSize is O(1) and
+	// the int assignment doesn't allocate, so unconditional snapshot
+	// preserves the zero-alloc hot path.
+	s.currentTableBytesBefore = tb.approxDataSize()
 	s.hasTable = true
 	return s
 }
