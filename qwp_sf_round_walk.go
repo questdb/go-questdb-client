@@ -337,10 +337,12 @@ func qwpSfRunSingleRound(
 					Terminal: rej,
 				}
 			}
-			// Record zone if the reject carried X-QuestDB-Zone.
-			if rej.Zone != "" {
-				params.Tracker.RecordZone(idx, rej.Zone)
-			}
+			// X-QuestDB-Zone on a 421 reject is intentionally ignored
+			// on the SF-ingest path: ingress is zone-blind by spec
+			// (wire-ingress.md §3 / failover.md §7) and the tracker
+			// is constructed with clientZone="" so every host stays
+			// Same anyway. The egress connectWalk consumes the same
+			// header in qwp_query_failover.go.
 			// 421 + non-empty role: role-reject (transient or topology).
 			// 421 without role, 404, 426, 503, etc.: generic transient.
 			if rej.IsRoleReject() {

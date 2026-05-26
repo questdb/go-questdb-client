@@ -323,37 +323,6 @@ func TestRoundWalkMidStreamDemoteBeforePickNext(t *testing.T) {
 		"mid-stream demote must run before PickNext; host 0 should be TransportError-priority now")
 }
 
-// TestRoundWalkRecordZoneFromRejectHeader: the X-QuestDB-Zone
-// header on a 421 reject must feed RecordZone. Setup: client has
-// zone=eu-west-1a; reject server returns zone=us-east-1a (Other);
-// healthy server doesn't advertise (stays Unknown). After the walk,
-// the rejected host's zone tier is Other.
-func TestRoundWalkRecordZoneFromRejectHeader(t *testing.T) {
-	rejectSrv := newRoundWalkRejectServer(t, 421, http.Header{
-		"X-QuestDB-Role": []string{"PRIMARY_CATCHUP"},
-		"X-QuestDB-Zone": []string{"us-east-1a"},
-	})
-	defer rejectSrv.Close()
-	healthySrv := newRoundWalkHealthyServer(t)
-	defer healthySrv.Close()
-
-	endpoints := []qwpEndpoint{
-		endpointForServer(t, rejectSrv),
-		endpointForServer(t, healthySrv),
-	}
-	tracker := newQwpHostTracker(2, "eu-west-1a", qwpTargetAny)
-	result := runWalkAgainst(t, endpoints, tracker, -1,
-		2*time.Second, 50*time.Millisecond, 500*time.Millisecond)
-	require.NotNil(t, result.Transport)
-	defer result.Transport.close()
-
-	snap := tracker.snapshot()
-	assert.Equal(t, qwpZoneOther, snap[0].zoneTier,
-		"reject server's zone=us-east-1a vs client zone=eu-west-1a must classify as Other")
-	assert.Equal(t, qwpZoneUnknown, snap[1].zoneTier,
-		"healthy server didn't advertise; tier stays Unknown")
-}
-
 // TestRoundWalkExhaustedErrorIncludesPerHostOutcomes verifies that
 // the SenderError's ServerMessage (built from result.Exhausted) lists
 // each configured endpoint with its final state.

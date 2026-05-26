@@ -190,7 +190,13 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	if conf.tlsMode != tlsDisabled {
 		scheme = "wss"
 	}
-	tracker := newQwpHostTracker(len(conf.endpoints), conf.zone, conf.target)
+	// Ingress is zone-blind by spec: wire-ingress.md §3 / failover.md
+	// §7 — ingress pins QWP v1, never reads SERVER_INFO, and ignores
+	// zone advertising. Pass "" for clientZone so every host's tier
+	// stays Same regardless of any 421 X-QuestDB-Zone header. target
+	// is still honoured here — the v1 rule (target≠any →
+	// TopologyReject, failover.md §5) is enforced in qwp_sf_round_walk.go.
+	tracker := newQwpHostTracker(len(conf.endpoints), "", conf.target)
 	factory := qwpSfBuildEndpointFactory(conf.endpoints, scheme, opts, conf.dumpWriter)
 
 	// Initial connect — three modes:

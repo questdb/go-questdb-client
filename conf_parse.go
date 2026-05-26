@@ -359,11 +359,12 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			// Silently accepted on QWP; SF ingress is zone-blind (v1-pinned)
-			// and treats every host as `Same`. Egress will read it when
-			// the zone-locality work lands. Sharing one connect string
-			// across ingress and egress clients is the documented usage,
-			// so a per-startup WARN would fire spuriously on the SF side.
+			// Egress consumes this via the (state, zone) priority
+			// lattice (failover.md §2); ingress is zone-blind by
+			// spec (wire-ingress.md §3 / failover.md §7) and the
+			// value never reaches the SF tracker. Silently accepted
+			// on both so a single connect string works across
+			// ingress and egress clients without per-startup noise.
 			senderConf.zone = v
 		case "target":
 			if senderConf.senderType != qwpSenderType {
