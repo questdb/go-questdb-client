@@ -627,6 +627,24 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	if err := s.submit(ctx); err != nil {
 		return nil, fmt.Errorf("qwp query: replay submit failed: %w", err)
 	}
+	// Re-issue the cancel if Cancel landed during the reconnect.
+	// session.requestCancel reads (currentRequestId, c.io()) without
+	// a lock, so a Cancel racing this function can pick up either
+	// the OLD request_id paired with the NEW io (the window between
+	// publishGeneration and currentRequestId.Store above — the new
+	// dispatcher's top-of-loop CAS then clears the OLD id as a stale
+	// "prior-query" cancel) or the OLD request_id paired with the OLD
+	// io (the window before publishGeneration — the cancel atomic is
+	// set on a torn-down dispatcher that will never read it). In both
+	// cases the user's Cancel intent is silently dropped and the
+	// replay runs to completion. Re-issuing here against the now-
+	// stable (newReqID, c.io()) pair lands one CANCEL frame on the
+	// wire: the dispatcher either matches newReqID in its CAS loop
+	// (no clear) or picks it up via drainPendingCancel in
+	// receiveLoop.
+	if s.isCancelled() {
+		c.io().requestCancel(newReqID)
+	}
 	return result.serverInfo, nil
 }
 
