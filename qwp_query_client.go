@@ -804,7 +804,11 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 			// event. Cancel + drain on a cleanup ctx so the dispatcher
 			// returns to idle; otherwise the next Query/Exec on this
 			// client blocks on the single-slot requests channel.
-			c.io().requestCancel(reqId)
+			// Route through the session so cancel targets the live
+			// generation's request_id even after a transparent failover
+			// reconnect (where the session's currentRequestId diverges
+			// from reqId).
+			session.requestCancel()
 			cleanupCtx, cleanupCancel := context.WithTimeout(
 				context.Background(), qwpQueryCleanupDrainTimeout)
 			_ = drainUntilTerminal(cleanupCtx, c.io())
@@ -840,9 +844,12 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 			// server stops streaming the rest of the result set, and
 			// drain to a terminal frame on a cleanup-bounded context
 			// so the dispatcher returns to idle regardless of the
-			// caller's ctx. Then surface the type-mismatch.
+			// caller's ctx. Then surface the type-mismatch. Cancel
+			// routes through the session so it targets the live
+			// generation's request_id even after a transparent
+			// failover reconnect.
 			c.io().releaseBuffer(ev.batch)
-			c.io().requestCancel(reqId)
+			session.requestCancel()
 			cleanupCtx, cancel := context.WithTimeout(
 				context.Background(), qwpQueryCleanupDrainTimeout)
 			_ = drainUntilTerminal(cleanupCtx, c.io())
