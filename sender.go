@@ -1202,10 +1202,8 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	if conf.maxBufSize != 0 {
 		return errors.New("maxBufferSize setting is not available in the TCP client")
 	}
-	if conf.errorHandler != nil || conf.errorPolicyResolver != nil ||
-		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
-		conf.errorInboxCapacity != 0 {
-		return errors.New("server-error API settings are only available in the QWP client")
+	if err := rejectQwpOnlyOptions(conf); err != nil {
+		return err
 	}
 	if conf.tcpKey == "" && conf.tcpKeyId != "" {
 		return errors.New("tcpKey is empty and tcpKeyId is not. both (or none) must be provided")
@@ -1364,13 +1362,65 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	if conf.autoFlushBytes != 0 {
 		return errors.New("autoFlushBytes setting is not available in the HTTP client")
 	}
+	if err := rejectQwpOnlyOptions(conf); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// rejectQwpOnlyOptions surfaces an error when a QWP-only option was
+// set on a non-QWP sender. The connect-string parser already rejects
+// each of these keys on non-ws/wss schemas; this mirrors the gate
+// for callers that build the config programmatically via With*.
+func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 	if conf.errorHandler != nil || conf.errorPolicyResolver != nil ||
 		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
 		conf.errorInboxCapacity != 0 {
 		return errors.New("server-error API settings are only available in the QWP client")
 	}
-
-	return nil
+	var name string
+	switch {
+	case conf.sfDir != "":
+		name = "sf_dir"
+	case conf.senderId != "":
+		name = "sender_id"
+	case conf.sfMaxBytes != 0:
+		name = "sf_max_bytes"
+	case conf.sfMaxTotalBytes != 0:
+		name = "sf_max_total_bytes"
+	case conf.sfDurability != "":
+		name = "sf_durability"
+	case conf.sfAppendDeadlineMillis != 0:
+		name = "sf_append_deadline_millis"
+	case conf.drainOrphans:
+		name = "drain_orphans"
+	case conf.maxBackgroundDrainers != 0:
+		name = "max_background_drainers"
+	case conf.reconnectMaxDurationMillisSet,
+		conf.reconnectInitialBackoffMillisSet,
+		conf.reconnectMaxBackoffMillisSet:
+		name = "reconnect_*"
+	case conf.initialConnectModeSet:
+		name = "initial_connect_retry"
+	case conf.closeFlushTimeoutSet:
+		name = "close_flush_timeout_millis"
+	case conf.gorillaDisabled:
+		name = "gorilla"
+	case conf.dumpWriter != nil:
+		name = "QWP dump writer"
+	case conf.inFlightWindow != 0:
+		name = "in_flight_window"
+	case conf.authTimeoutMs != 0:
+		name = "auth_timeout_ms"
+	case conf.zone != "":
+		name = "zone"
+	case conf.target != qwpTargetAny:
+		name = "target"
+	default:
+		return nil
+	}
+	return fmt.Errorf("%s is only available in the QWP client", name)
 }
 
 func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {

@@ -25,7 +25,9 @@
 package questdb_test
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -959,4 +961,54 @@ func TestQwpFailoverConfKeys(t *testing.T) {
 		assert.Equal(t, "primary", qdb.ConfigTarget(c))
 		assert.Equal(t, 8_000, qdb.ConfigAuthTimeoutMs(c))
 	})
+}
+
+// TestQwpOnlyOptionsRejectedOnHttpAndTcp pins parity between the
+// connect-string parser (which rejects each QWP-only key on http/tcp
+// schemas with `<key> is only supported for QWP senders`) and the
+// option path. Without this gate, e.g. `WithHttp() + WithSfDir(...)`
+// silently constructs an HTTP sender that ignores the setting.
+func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
+	cases := []struct {
+		name   string
+		opt    qdb.LineSenderOption
+		errMsg string
+	}{
+		{"sf_dir", qdb.WithSfDir("/tmp/sf"), "sf_dir"},
+		{"sender_id", qdb.WithSenderId("ingest-1"), "sender_id"},
+		{"sf_max_bytes", qdb.WithSfMaxBytes(1 << 20), "sf_max_bytes"},
+		{"sf_max_total_bytes", qdb.WithSfMaxTotalBytes(1 << 30), "sf_max_total_bytes"},
+		{"sf_durability", qdb.WithSfDurability("memory"), "sf_durability"},
+		{"sf_append_deadline", qdb.WithSfAppendDeadline(10 * time.Second), "sf_append_deadline_millis"},
+		{"drain_orphans", qdb.WithDrainOrphans(true), "drain_orphans"},
+		{"max_background_drainers", qdb.WithMaxBackgroundDrainers(2), "max_background_drainers"},
+		{"reconnect_policy", qdb.WithReconnectPolicy(time.Minute, 100*time.Millisecond, time.Second), "reconnect_*"},
+		{"initial_connect_mode", qdb.WithInitialConnectMode(qdb.InitialConnectSync), "initial_connect_retry"},
+		{"initial_connect_retry", qdb.WithInitialConnectRetry(true), "initial_connect_retry"},
+		{"close_flush_timeout", qdb.WithCloseFlushTimeout(5 * time.Second), "close_flush_timeout_millis"},
+		{"close_timeout_alias", qdb.WithCloseTimeout(5 * time.Second), "close_flush_timeout_millis"},
+		{"gorilla", qdb.WithGorilla(false), "gorilla"},
+		{"in_flight_window", qdb.WithInFlightWindow(8), "in_flight_window"},
+		{"auth_timeout", qdb.WithAuthTimeout(5 * time.Second), "auth_timeout_ms"},
+		{"zone", qdb.WithZone("eu-west-1a"), "zone"},
+		{"target", qdb.WithTarget(qdb.QwpTargetPrimary), "target"},
+		{"qwp_dump_writer", qdb.WithQwpDumpWriter(io.Discard), "QWP dump writer"},
+		{"error_handler", qdb.WithErrorHandler(func(*qdb.SenderError) {}), "server-error API"},
+		{"error_inbox_capacity", qdb.WithErrorInboxCapacity(64), "server-error API"},
+		{"server_error_policy", qdb.WithServerErrorPolicy(qdb.PolicyHalt), "server-error API"},
+	}
+	for _, transport := range []struct {
+		name string
+		ctor qdb.LineSenderOption
+	}{
+		{"http", qdb.WithHttp()},
+		{"tcp", qdb.WithTcp()},
+	} {
+		for _, tc := range cases {
+			t.Run(transport.name+"/"+tc.name, func(t *testing.T) {
+				_, err := qdb.NewLineSender(context.Background(), transport.ctor, tc.opt)
+				assert.ErrorContains(t, err, tc.errMsg)
+			})
+		}
+	}
 }
