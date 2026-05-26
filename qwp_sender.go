@@ -964,6 +964,10 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 		case qwpTypeTimestampNano:
 			v = ts.UnixNano()
 		default:
+			s.currentTable.cancelRow()
+			s.cachedDesignatedTs = nil
+			s.hasTable = false
+			s.currentTable = nil
 			return fmt.Errorf("qwp: invalid designated timestamp type 0x%02X", typeCode)
 		}
 		col.addTimestamp(v)
