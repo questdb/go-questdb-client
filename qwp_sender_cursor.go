@@ -636,6 +636,16 @@ func (s *qwpLineSender) AwaitAckedFsn(ctx context.Context, target int64) error {
 		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 			return err
 		}
+		if s.closed.Load() {
+			// Concurrent Close() stopped the send loop, so ackedFsn is
+			// frozen and will never advance. Re-check once in case the
+			// ACK landed between the read above and this load; otherwise
+			// fail fast rather than spin until ctx fires.
+			if s.cursorEngine.engineAckedFsn() >= target {
+				return nil
+			}
+			return errClosedSenderFlush
+		}
 		select {
 		case <-tick.C:
 		case <-ctx.Done():

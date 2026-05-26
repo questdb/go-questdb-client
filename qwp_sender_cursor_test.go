@@ -316,6 +316,56 @@ func TestQwpCursorSenderAwaitAckedFsnTimeout(t *testing.T) {
 	assert.Less(t, elapsed, time.Second)
 }
 
+// TestQwpCursorSenderAwaitAckedFsnConcurrentClose verifies that a
+// concurrent Close() unblocks an in-flight AwaitAckedFsn instead of
+// letting it spin until the caller's ctx fires. The send loop halts
+// on close and ackedFsn freezes below target, so the poll loop must
+// observe s.closed and fail fast with errClosedSenderFlush.
+func TestQwpCursorSenderAwaitAckedFsnConcurrentClose(t *testing.T) {
+	srv := newSilentAckServer(t)
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	// closeTimeout=0 skips the drain entirely so Close races straight
+	// into sendLoopClose — the most aggressive shape of the race.
+	s, err := newQwpCursorLineSender(1, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	require.Eventually(t, func() bool {
+		return engine.enginePublishedFsn() >= 0
+	}, time.Second, time.Millisecond, "auto-flush should have published the frame")
+	target := engine.enginePublishedFsn()
+
+	// Long ctx so a hang would manifest as a 5s test stall rather
+	// than masquerading as a DeadlineExceeded.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	awaitErr := make(chan error, 1)
+	go func() {
+		awaitErr <- s.AwaitAckedFsn(ctx, target)
+	}()
+
+	// Give AwaitAckedFsn a moment to enter its poll loop, then close.
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, s.Close(context.Background()))
+
+	select {
+	case err := <-awaitErr:
+		require.ErrorIs(t, err, errClosedSenderFlush,
+			"AwaitAckedFsn must surface errClosedSenderFlush when Close races in mid-poll")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("AwaitAckedFsn did not return after Close — close-observation in the poll loop is missing")
+	}
+}
+
 func TestQwpSenderAwaitAckedFsnAlreadyAcked(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
