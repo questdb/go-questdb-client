@@ -235,10 +235,27 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d", numThreads, len(lines))
 }
 
-func TestTcpNotSupported(t *testing.T) {
-	_, err := qdb.PoolFromConf("tcp::addr=localhost:9000")
-	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
+func TestNonHttpSchemasNotSupported(t *testing.T) {
+	cases := []string{
+		"tcp::addr=localhost:9000",
+		"tcps::addr=localhost:9000",
+		"ws::addr=localhost:9000",
+		"wss::addr=localhost:9000",
+		"qwpws::addr=localhost:9000",
+		"qwpwss::addr=localhost:9000",
+		"grpc::addr=localhost:9000",
+	}
+	for _, conf := range cases {
+		t.Run(conf, func(t *testing.T) {
+			_, err := qdb.PoolFromConf(conf)
+			assert.ErrorContains(t, err, "only http/s")
+		})
+	}
+}
 
-	_, err = qdb.PoolFromConf("tcps::addr=localhost:9000")
-	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
+func TestPoolFromOptionsRejectsQwp(t *testing.T) {
+	p, err := qdb.PoolFromOptions(qdb.WithQwp(), qdb.WithAddress("localhost:9000"))
+	require.NoError(t, err)
+	_, err = p.Sender(context.Background())
+	assert.ErrorContains(t, err, "only http/s")
 }
