@@ -532,6 +532,23 @@ func TestQwpSenderClose(t *testing.T) {
 	}
 }
 
+func TestQwpSenderCloseSurfacesLatchedFluentError(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+
+	// Latch a validation error: '?' is an illegal column-name char.
+	s.Table("t").Symbol("bad?name", "v")
+
+	err := s.Close(context.Background())
+	if err == nil {
+		t.Fatalf("Close: nil, expected latched fluent-API error")
+	}
+	if !strings.Contains(err.Error(), "illegal character") {
+		t.Fatalf("Close: %v, want error mentioning illegal character", err)
+	}
+}
+
 func TestQwpSenderClosedOperations(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()

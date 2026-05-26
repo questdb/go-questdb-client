@@ -498,6 +498,15 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 //     recovery path and must treat the timeout as fatal.
 //   - closeFlushTimeout <= 0: skip the drain entirely (fast close).
 func (s *qwpLineSender) closeCursor(ctx context.Context) error {
+	// Surface any latched fluent-API error (e.g. validation failure on
+	// Symbol/*Column/Table) so Close() doesn't silently swallow it —
+	// mirrors the HTTP sender's flush0, which drains buf.LastErr() on
+	// the close path. Captured first so any subsequent enqueue / drain /
+	// shutdown error doesn't override it: the latched fault is the
+	// original user-facing cause and downstream failures usually
+	// follow from it.
+	firstErr := s.lastErr
+	s.lastErr = nil
 	// Encode any pending rows from the open API call into the engine
 	// first. Drop the pending in-progress row (no At/AtNow yet) the
 	// same way Close does in memory mode.
@@ -508,7 +517,6 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 		s.hasTable = false
 		s.currentTable = nil
 	}
-	var firstErr error
 	if s.pendingRowCount > 0 {
 		// Enqueue the pending rows but do NOT block on ACK here —
 		// flushCursor's ACK wait is unbounded by ctx alone, and
