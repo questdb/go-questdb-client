@@ -86,6 +86,14 @@ type qwpSfTestServerOpts struct {
 	// after a mid-flush drop. Off by default so the other suites pay
 	// nothing for the bookkeeping.
 	recordFrames bool
+	// unsolicitedRejectAtConnect, when non-zero, makes the server
+	// emit a single error ACK (sequence 0) immediately on connection
+	// accept, BEFORE reading any frame from the client. Models a
+	// server that rejects the connection (auth halt, server-side
+	// circuit breaker, transient validation failure on
+	// reconnect) right after the WS upgrade — exercises the
+	// receiver's pre-send rejection guard.
+	unsolicitedRejectAtConnect QwpStatusCode
 }
 
 // qwpSfTestServer is a fake QWP server for send-loop tests. It
@@ -181,6 +189,14 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 		myConnID := s.connCount.Add(1)
 		var localSeq int64
 		var localFramesReceived int
+		if opts.unsolicitedRejectAtConnect != 0 {
+			// Send a single rejection ACK with sequence 0 BEFORE the
+			// client has had a chance to send anything. The receiver
+			// must observe highestSent < 0 and route through the
+			// pre-send rejection guard (no engineAcknowledge advance).
+			_ = conn.Write(context.Background(), websocket.MessageBinary,
+				buildAckError(opts.unsolicitedRejectAtConnect, 0, "pre-send-reject"))
+		}
 		for {
 			_, data, err := conn.Read(context.Background())
 			if err != nil {
@@ -571,6 +587,106 @@ func TestQwpSfSendLoopServerErrorIsTerminal(t *testing.T) {
 	// reconnects should be 0 — terminal status doesn't trigger
 	// reconnect (server isn't going to change its mind on retry).
 	assert.Equal(t, int64(0), loop.sendLoopTotalReconnects())
+}
+
+// TestQwpSfSendLoopPreSendHaltRejectionDoesNotFabricateFsn verifies
+// that a HALT-category rejection ACK arriving BEFORE any frame has
+// been sent on the current connection (highestSent < 0, e.g. right
+// after a fresh swapClient) surfaces the typed SenderError but does
+// NOT attribute it to a fabricated fsnAtZero. The reported span must
+// be the unacked [ackedFsn+1, publishedFsn] window — the same span
+// the protocol-violation close path uses — not the
+// fsnAtZero+cappedSeq(=0) value the old code emitted. Mirrors the
+// Java client's handlePreSendRejection guard.
+func TestQwpSfSendLoopPreSendHaltRejectionDoesNotFabricateFsn(t *testing.T) {
+	// ParseError is HALT by default. The server fires the rejection
+	// immediately on connect, before we publish anything into the
+	// engine, so the receiver sees highestSent < 0.
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		unsolicitedRejectAtConnect: QwpStatusParseError,
+	})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	require.Eventually(t, func() bool {
+		return loop.sendLoopCheckError() != nil
+	}, 2*time.Second, 1*time.Millisecond)
+
+	gotErr := loop.sendLoopCheckError()
+	require.Error(t, gotErr)
+	var senderErr *SenderError
+	require.True(t, errors.As(gotErr, &senderErr),
+		"expected typed *SenderError, got %T: %v", gotErr, gotErr)
+	assert.Equal(t, CategoryParseError, senderErr.Category)
+	assert.Equal(t, PolicyHalt, senderErr.AppliedPolicy)
+	// Engine is empty: ackedFsn=-1, publishedFsn=-1 →
+	// FromFsn = 0, ToFsn = max(0, -1) = 0.
+	assert.Equal(t, int64(0), senderErr.FromFsn)
+	assert.Equal(t, int64(0), senderErr.ToFsn)
+	// The fabricated DROP would have advanced the engine watermark to
+	// fsn 0. Verify it did NOT.
+	assert.Equal(t, int64(-1), engine.engineAckedFsn(),
+		"pre-send rejection must not advance the engine's acked watermark")
+	assert.Equal(t, int64(1), loop.sendLoopTotalServerErrors())
+	assert.Equal(t, int64(0), loop.sendLoopTotalReconnects(),
+		"HALT must not trigger reconnect")
+}
+
+// TestQwpSfSendLoopPreSendDropRejectionDoesNotAdvanceWatermark
+// verifies that a DROP_AND_CONTINUE rejection arriving before any
+// frame has been sent on the current connection is dispatched but
+// does NOT call engineAcknowledge — the old code would have advanced
+// ackedFsn past the next-unsent batch (fsnAtZero == ackedFsn+1 right
+// after a swap), which would let the segment manager trim sealed
+// segments the I/O thread is about to replay.
+func TestQwpSfSendLoopPreSendDropRejectionDoesNotAdvanceWatermark(t *testing.T) {
+	// SchemaMismatch is DROP_AND_CONTINUE by default — this is the
+	// dangerous case where the old code's fabricated
+	// engineAcknowledge(fsnAtZero) silently advanced the watermark.
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		unsolicitedRejectAtConnect: QwpStatusSchemaMismatch,
+	})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	// Wait for the receiver to process the unsolicited rejection.
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalServerErrors() >= 1
+	}, 2*time.Second, 1*time.Millisecond)
+
+	// DROP must not latch — loop stays running, no terminal error.
+	assert.NoError(t, loop.sendLoopCheckError(),
+		"DROP policy must not latch a terminal error")
+	// Critical: the engine watermark must be unchanged. The old code
+	// would have called engineAcknowledge(fsnAtZero) = engineAcknowledge(0),
+	// advancing ackedFsn from -1 to 0.
+	assert.Equal(t, int64(-1), engine.engineAckedFsn(),
+		"pre-send DROP rejection must not advance the engine's acked watermark")
+	// And no spurious totalAcks bump either — the old code added one.
+	assert.Equal(t, int64(0), loop.sendLoopTotalAcks(),
+		"pre-send DROP rejection must not bump totalAcks")
 }
 
 // TestQwpSfSendLoopSilentDropAfterFrameIsTerminal verifies that when

@@ -941,16 +941,54 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// reported MessageSequence is the raw server-sent seq so
 			// it round-trips verbatim against server-side logs.
 			highestSent := l.nextWireSeq.Load() - 1
-			cappedSeq := seq
-			if highestSent < 0 {
-				cappedSeq = 0
-			} else if cappedSeq > highestSent {
-				cappedSeq = highestSent
-			}
 			_, _, msg := parseAckErrorPayload(data)
-			fsn := l.fsnAtZero.Load() + cappedSeq
 			cat := qwpSfClassify(status)
 			pol := l.policyResolver.Load().resolve(cat)
+			if highestSent < 0 {
+				// Pre-send rejection: server emitted an error frame
+				// before we sent anything on this connection (typical
+				// right after a fresh swapClient — auth failure,
+				// server-initiated halt, etc.). The server-named
+				// wireSeq does not correspond to any frame we sent,
+				// so clamping to 0 and acknowledging fsnAtZero would
+				// silently advance ackedFsn past a real unsent batch
+				// (fsnAtZero == ackedFsn + 1 right after a swap).
+				// Attribute the failure to the unacked
+				// [ackedFsn+1, publishedFsn] window — the same span
+				// the protocol-violation close path uses — and skip
+				// the watermark advance entirely; there is nothing
+				// on this connection to drop. Still surface the
+				// typed error so HALT latches and the handler fires.
+				// Mirrors handlePreSendRejection in the Java client.
+				from := l.engine.engineAckedFsn() + 1
+				to := l.engine.enginePublishedFsn()
+				if to < from {
+					to = from
+				}
+				se := &SenderError{
+					Category:         cat,
+					AppliedPolicy:    pol,
+					ServerStatusByte: int(status),
+					ServerMessage:    msg,
+					MessageSequence:  seq,
+					FromFsn:          from,
+					ToFsn:            to,
+					DetectedAt:       time.Now(),
+				}
+				l.totalServerErrors.Add(1)
+				if pol == PolicyHalt {
+					l.recordFatalServerError(se)
+					l.dispatcher.Load().offer(se)
+					return se
+				}
+				l.dispatcher.Load().offer(se)
+				continue
+			}
+			cappedSeq := seq
+			if cappedSeq > highestSent {
+				cappedSeq = highestSent
+			}
+			fsn := l.fsnAtZero.Load() + cappedSeq
 			se := &SenderError{
 				Category:         cat,
 				AppliedPolicy:    pol,
