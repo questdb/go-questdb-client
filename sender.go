@@ -490,8 +490,12 @@ func WithErrorPolicy(c Category, p Policy) LineSenderOption {
 			return
 		}
 		s.errorPolicyPerCat[c] = p
-		if p != PolicyAuto {
-			s.errorPolicyPerCatSet = true
+		s.errorPolicyPerCatSet = false
+		for _, q := range s.errorPolicyPerCat {
+			if q != PolicyAuto {
+				s.errorPolicyPerCatSet = true
+				break
+			}
 		}
 	}
 }

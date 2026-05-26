@@ -166,3 +166,28 @@ func TestErrorApiSanitizerAcceptsAtFloor(t *testing.T) {
 		t.Fatalf("capacity=16 should pass, got %v", err)
 	}
 }
+
+// TestErrorApiWithErrorPolicyAutoClearsPerCatSet asserts that a
+// non-Auto override followed by PolicyAuto on the same category
+// nets out to "no per-category override set", so the HTTP/TCP
+// sanitizers do not falsely reject the build as a QWP-only API use.
+func TestErrorApiWithErrorPolicyAutoClearsPerCatSet(t *testing.T) {
+	cases := []struct {
+		name string
+		st   qdb.SenderType
+	}{
+		{"http", qdb.HttpSenderType},
+		{"tcp", qdb.TcpSenderType},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := qdb.NewLineSenderConfig(tc.st)
+			qdb.WithAddress("h:9000")(conf)
+			qdb.WithErrorPolicy(qdb.CategorySchemaMismatch, qdb.PolicyHalt)(conf)
+			qdb.WithErrorPolicy(qdb.CategorySchemaMismatch, qdb.PolicyAuto)(conf)
+			if err := qdb.SanitizeConf(conf); err != nil {
+				t.Fatalf("sanitizer should not reject net-Auto per-cat override, got %v", err)
+			}
+		})
+	}
+}
