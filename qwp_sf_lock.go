@@ -62,6 +62,16 @@ const qwpSfLockPidFileName = ".lock.pid"
 //
 // The lock is released automatically on close() OR when the process
 // exits (the kernel cleans up flocks for terminated processes).
+//
+// Known operational hole: if an external actor unlinks .lock while it
+// is held (e.g., an operator running `rm .lock`), a fresh acquirer's
+// open(O_CREATE) allocates a new inode and successfully flocks it —
+// both processes then believe they own the slot. flock(2), POSIX
+// fcntl(F_SETLK), and Linux F_OFD_SETLK are all inode-bound on
+// Linux/BSD; no POSIX primitive is path-bound, so this cannot be
+// closed client-side. Operators must treat .lock as opaque metadata
+// and not delete it while a sender is running against the slot. The
+// Java MmapSegment SlotLock has the same property.
 type qwpSfSlotLock struct {
 	slotDir  string
 	lockPath string
