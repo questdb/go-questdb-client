@@ -755,6 +755,77 @@ func TestQwpColumnBatchCopyAllGorillaTimestampSurvivesPoolReuse(t *testing.T) {
 	}
 }
 
+// TestQwpColumnBatchCopyAllRawSurvivesPayloadReuse covers the raw
+// (non-zstd) sibling of TestQwpColumnBatchCopyAllZstdSurvivesPoolReuse.
+// The egress I/O loop reads each WS frame into a buffer borrowed from
+// qwpEgressIO.readBufPool; on the raw path the decoded batch's column
+// slices (values, stringBytes, nullBitmap) alias that pooled buffer
+// directly. releaseBuffer returns the buffer to the pool, and the next
+// inbound frame is decoded into the same backing array in place. A
+// SerializedBatch the caller retained from the released batch must
+// remain valid across that recycle — i.e. CopyAll must deep-clone the
+// payload bytes on the raw path the same way it already does on the
+// zstd path.
+//
+// Reproduces the in-place clobber without touching the I/O loop:
+// allocate one backing array, write frame 1 into it, hand the slice to
+// the decoder, snapshot, then overwrite the array's bytes with frame 2.
+// snapshot.Int64 reads its values from the same backing array the
+// decoder aliased; without the fix the post-clobber read returns the
+// frame-2 little-endian word at that offset, not the original.
+func TestQwpColumnBatchCopyAllRawSurvivesPayloadReuse(t *testing.T) {
+	frame1 := encodeSingleColumnBatch(t, "v", qwpTypeLong, false,
+		[]func(*qwpColumnBuffer){
+			func(c *qwpColumnBuffer) { c.addLong(111) },
+			func(c *qwpColumnBuffer) { c.addLong(222) },
+		})
+	frame2 := encodeSingleColumnBatch(t, "v", qwpTypeLong, false,
+		[]func(*qwpColumnBuffer){
+			func(c *qwpColumnBuffer) { c.addLong(-9999) },
+			func(c *qwpColumnBuffer) { c.addLong(-8888) },
+		})
+	if len(frame2) < len(frame1) {
+		t.Fatalf("test precondition: frame2 (%d) must be >= frame1 (%d) so the clobber overlaps the column data", len(frame2), len(frame1))
+	}
+
+	// One backing array that stands in for a recycled readBufPool
+	// buffer: it holds frame1 first, then the next frame is read into
+	// the same memory in place.
+	pooled := make([]byte, len(frame2))
+	copy(pooled, frame1)
+	payload := pooled[:len(frame1)]
+
+	dec := newTestQueryDecoder()
+	var b QwpColumnBatch
+	if err := dec.decode(payload, &b); err != nil {
+		t.Fatalf("decode 1: %v", err)
+	}
+	if len(b.zstdScratch) != 0 {
+		t.Fatalf("test precondition: expected raw (non-zstd) path; zstdScratch=%d", len(b.zstdScratch))
+	}
+
+	snapshot := b.CopyAll()
+	if got := snapshot.Int64(0, 0); got != 111 {
+		t.Fatalf("pre-clobber snapshot.Int64(0,0) = %d, want 111", got)
+	}
+	if got := snapshot.Int64(0, 1); got != 222 {
+		t.Fatalf("pre-clobber snapshot.Int64(0,1) = %d, want 222", got)
+	}
+
+	// Recycle: the I/O loop hands the buffer back to readBufPool and
+	// the reader's qwpReadFrameInto writes the next frame into the
+	// same backing array. Simulate that with a copy().
+	copy(pooled, frame2)
+
+	// Snapshot must still report frame-1 values.
+	if got := snapshot.Int64(0, 0); got != 111 {
+		t.Fatalf("post-clobber snapshot.Int64(0,0) = %d, want 111 (CopyAll didn't clone the raw payload)", got)
+	}
+	if got := snapshot.Int64(0, 1); got != 222 {
+		t.Fatalf("post-clobber snapshot.Int64(0,1) = %d, want 222 (CopyAll didn't clone the raw payload)", got)
+	}
+}
+
 // buildDecimalGeohashFrame produces a one-row RESULT_BATCH frame with
 // a DECIMAL64 column (given scale) and a GEOHASH column (given precision
 // bits). The decoder reads the per-batch scale / precision off the DATA
