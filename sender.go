@@ -580,16 +580,25 @@ func WithSfMaxTotalBytes(n int64) LineSenderOption {
 // backoff policy. maxDuration bounds the total time spent
 // reconnecting before the loop gives up; initialBackoff and
 // maxBackoff bound a backoff sleep between attempts (with jitter).
+// A zero or negative argument is treated as "leave the default" for
+// that knob — it does not register as an explicit user choice and so
+// does not trigger the initial_connect_retry promotion.
 //
 // Only available for the QWP sender.
 func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.reconnectMaxDurationMillis = int(maxDuration / time.Millisecond)
-		s.reconnectInitialBackoffMillis = int(initialBackoff / time.Millisecond)
-		s.reconnectMaxBackoffMillis = int(maxBackoff / time.Millisecond)
-		s.reconnectMaxDurationMillisSet = true
-		s.reconnectInitialBackoffMillisSet = true
-		s.reconnectMaxBackoffMillisSet = true
+		if maxDuration > 0 {
+			s.reconnectMaxDurationMillis = int(maxDuration / time.Millisecond)
+			s.reconnectMaxDurationMillisSet = true
+		}
+		if initialBackoff > 0 {
+			s.reconnectInitialBackoffMillis = int(initialBackoff / time.Millisecond)
+			s.reconnectInitialBackoffMillisSet = true
+		}
+		if maxBackoff > 0 {
+			s.reconnectMaxBackoffMillis = int(maxBackoff / time.Millisecond)
+			s.reconnectMaxBackoffMillisSet = true
+		}
 	}
 }
 

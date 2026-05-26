@@ -391,6 +391,38 @@ func TestSfOptionsWithInitialConnectModeAsyncSurvivesPromotion(t *testing.T) {
 	assert.Equal(t, InitialConnectAsync, conf.initialConnectMode)
 }
 
+// WithReconnectPolicy with non-positive durations must be a no-op for
+// the corresponding *Set flags, so it does not register as an explicit
+// reconnect tune and does not trigger the initial_connect_retry
+// promotion. Zero / negative values fall back to the defaults at
+// consumption time (qwp_sender_cursor.go), so the same applies here.
+func TestSfOptionsWithReconnectPolicyZeroDoesNotPromote(t *testing.T) {
+	conf := newLineSenderConfig(qwpSenderType)
+	WithSfDir("/tmp/sf")(conf)
+	WithReconnectPolicy(0, 0, 0)(conf)
+	assert.False(t, conf.reconnectMaxDurationMillisSet)
+	assert.False(t, conf.reconnectInitialBackoffMillisSet)
+	assert.False(t, conf.reconnectMaxBackoffMillisSet)
+	require.NoError(t, sanitizeQwpConf(conf))
+	assert.Equal(t, InitialConnectOff, conf.initialConnectMode)
+}
+
+// Per-knob: only the positive arguments register as explicit user
+// choices; the rest stay unset and continue to draw the default.
+func TestSfOptionsWithReconnectPolicyMixedZeroOnlySetsPositive(t *testing.T) {
+	conf := newLineSenderConfig(qwpSenderType)
+	WithSfDir("/tmp/sf")(conf)
+	WithReconnectPolicy(0, 250*time.Millisecond, 0)(conf)
+	assert.False(t, conf.reconnectMaxDurationMillisSet)
+	assert.True(t, conf.reconnectInitialBackoffMillisSet)
+	assert.Equal(t, 250, conf.reconnectInitialBackoffMillis)
+	assert.False(t, conf.reconnectMaxBackoffMillisSet)
+	// One positive knob is enough to register as an explicit reconnect
+	// tune, so the promotion still fires here.
+	require.NoError(t, sanitizeQwpConf(conf))
+	assert.Equal(t, InitialConnectSync, conf.initialConnectMode)
+}
+
 func TestSanitizeQwpConfRejectsSfKeysWithoutSfDir(t *testing.T) {
 	cases := []func(c *lineSenderConfig){
 		func(c *lineSenderConfig) { c.senderId = "x" },
