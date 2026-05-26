@@ -439,6 +439,99 @@ func TestQwpPerRowGuardPreservesPriorCommittedRows(t *testing.T) {
 	}
 }
 
+// TestQwpPerRowGuardClearsCachedDesignatedTs is a regression test
+// for a silent data-loss bug: when the per-row guard fires on the
+// FIRST row of a fresh table, cancelRow removes the just-created
+// designated-TS column from tb.columns (committedColumnCount is 0,
+// so all uncommitted columns get wiped). But s.cachedDesignatedTs
+// still holds a pointer to that now-orphaned column, with col.table
+// still pointing at the same tb. On the user's retry, the cache
+// staleness check at atWithTimestamp passes (col.table matches,
+// typeCode matches), the orphan is reused, addTimestamp writes
+// into a column that is no longer in tb.columns, and commitRow
+// (which only iterates tb.columns) commits the row without a
+// designated timestamp. The encoder then ships the row on the wire
+// with NO designated-TS column. The fix is to nil out
+// s.cachedDesignatedTs on every cancelRow path in atWithTimestamp.
+func TestQwpPerRowGuardClearsCachedDesignatedTs(t *testing.T) {
+	srv := newQwpTestServerWithMaxBatch(t, 64)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+addr+";auto_flush_bytes=off;")
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	ctx := context.Background()
+
+	// First attempt on a fresh table: a 200-byte string trips the
+	// per-row guard. cancelRow wipes both the string column and the
+	// designated-TS column from tb.columns because committedColumnCount
+	// is 0. s.cachedDesignatedTs is left pointing at the orphaned
+	// "" column.
+	err = ls.Table("t").
+		StringColumn("big", strings.Repeat("x", 200)).
+		At(ctx, time.Unix(0, 1_000_000_000))
+	if err == nil {
+		t.Fatal("expected per-row guard to fire, got nil error")
+	}
+	if !strings.Contains(err.Error(), "row too large for server batch cap") {
+		t.Fatalf("error = %q, want guard-fire substring", err.Error())
+	}
+
+	// Retry on the same table with a small row + explicit At(ts).
+	// If cachedDesignatedTs was cleared, getOrCreateDesignatedTimestamp
+	// runs and re-creates the "" column in tb.columns. If not, the
+	// staleness check skips the lookup, the orphan is reused, and
+	// commitRow runs without a "" column in tb.columns.
+	if err := ls.Table("t").
+		Symbol("s", "a").
+		At(ctx, time.Unix(0, 2_000_000_000)); err != nil {
+		t.Fatalf("retry At: %v", err)
+	}
+
+	s := ls.(*qwpLineSender)
+	tb, ok := s.tableBuffers["t"]
+	if !ok || tb == nil {
+		t.Fatal("table buffer for 't' missing after retry")
+	}
+
+	// The designated-TS column lives under the empty-string key.
+	// If the bug is present, cancelRow removed it from columnIndex
+	// and the cached-orphan reuse meant nothing re-added it.
+	if _, ok := tb.columnIndex[""]; !ok {
+		names := make([]string, 0, len(tb.columns))
+		for _, c := range tb.columns {
+			names = append(names, c.name)
+		}
+		t.Fatalf("designated-TS column missing from columnIndex after retry; tb.columns=%v", names)
+	}
+	var dtCol *qwpColumnBuffer
+	for _, c := range tb.columns {
+		if c.name == "" {
+			dtCol = c
+			break
+		}
+	}
+	if dtCol == nil {
+		names := make([]string, 0, len(tb.columns))
+		for _, c := range tb.columns {
+			names = append(names, c.name)
+		}
+		t.Fatalf("designated-TS column not present in tb.columns after retry; tb.columns=%v", names)
+	}
+	// The retry committed exactly one row; the designated-TS column
+	// must reflect that row in its data (i.e., be encoded with the
+	// rest of the table).
+	if dtCol.rowCount != 1 {
+		t.Fatalf("designated-TS column rowCount = %d, want 1 (retry row committed with timestamp)",
+			dtCol.rowCount)
+	}
+}
+
 // TestQwpPerRowGuardNoOpWhenServerHasNoCap pins the older-server
 // path: when the upgrade response omits X-QWP-Max-Batch-Size, the
 // per-row guard short-circuits and an arbitrarily large row commits

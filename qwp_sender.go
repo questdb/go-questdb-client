@@ -922,6 +922,13 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 		if s.currentTable != nil {
 			s.currentTable.cancelRow()
 		}
+		// cancelRow may have wiped the designated-TS column out
+		// of tb.columns / tb.columnIndex (first row of a fresh
+		// or just-flushed table). Drop the cache so the next row
+		// re-runs getOrCreateDesignatedTimestamp and re-inserts
+		// the column — otherwise the stale pointer satisfies the
+		// staleness check and the row commits without a "" column.
+		s.cachedDesignatedTs = nil
 		s.hasTable = false
 		s.currentTable = nil
 		return err
@@ -941,6 +948,7 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 			col, err = s.currentTable.getOrCreateDesignatedTimestamp(typeCode)
 			if err != nil {
 				s.currentTable.cancelRow()
+				s.cachedDesignatedTs = nil
 				s.hasTable = false
 				s.currentTable = nil
 				return err
@@ -975,6 +983,7 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 		rowBytes := s.currentTable.approxDataSize() - s.currentTableBytesBefore
 		if int64(rowBytes) > int64(cap) {
 			s.currentTable.cancelRow()
+			s.cachedDesignatedTs = nil
 			s.hasTable = false
 			s.currentTable = nil
 			return fmt.Errorf(
@@ -1164,6 +1173,12 @@ func (s *qwpLineSender) resetAfterFlush() {
 	s.pendingRowCount = 0
 	s.pendingBytes = 0
 	s.batchMaxSymbolId = s.maxSentSymbolId
+	// Defense in depth: tb.reset() keeps the column structure but
+	// sets committedColumnCount=0, so a post-flush cancelRow would
+	// wipe the designated-TS column out of tb.columns. Drop the
+	// cache here so the first row after a flush always re-runs
+	// getOrCreateDesignatedTimestamp.
+	s.cachedDesignatedTs = nil
 
 	// Refresh flush deadline.
 	if s.autoFlushInterval > 0 {
