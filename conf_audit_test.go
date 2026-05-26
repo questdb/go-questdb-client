@@ -474,6 +474,43 @@ func TestWithMaxSchemasPerConnectionIsNoOp(t *testing.T) {
 	_ = c
 }
 
+// TestWithCloseTimeoutSubMillisecondIsNoOverride pins that the
+// deprecated alias honours its documented "d <= 0 is treated as no
+// override" semantics for sub-millisecond positive durations too.
+// Without this gate, d=500µs satisfies d > 0, truncates to 0 ms,
+// sets closeFlushTimeoutSet=true, and routes into the fast-close
+// branch (qwp_sender_cursor.go:167, sender.go:1493), contradicting
+// the doc. Callers who actually want fast-close must opt in via
+// WithCloseFlushTimeout.
+func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
+	for _, d := range []time.Duration{
+		0,
+		-1 * time.Second,
+		1 * time.Nanosecond,
+		500 * time.Microsecond,
+		999 * time.Microsecond,
+	} {
+		t.Run(d.String(), func(t *testing.T) {
+			c := newLineSenderConfig(qwpSenderType)
+			WithCloseTimeout(d)(c)
+			if c.closeFlushTimeoutSet {
+				t.Errorf("closeFlushTimeoutSet=true for d=%s; want no override", d)
+			}
+			if c.closeFlushTimeoutMillis != 0 {
+				t.Errorf("closeFlushTimeoutMillis=%d for d=%s; want 0 (untouched)", c.closeFlushTimeoutMillis, d)
+			}
+		})
+	}
+	// Sanity: the smallest representable positive value, 1ms, must
+	// still override (the gate is inclusive at the ms boundary).
+	c := newLineSenderConfig(qwpSenderType)
+	WithCloseTimeout(time.Millisecond)(c)
+	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
+		t.Errorf("WithCloseTimeout(1ms): set=%v millis=%d; want set=true millis=1",
+			c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
+	}
+}
+
 // TestConfRejectsUnknownKeyOnBothSides confirms that a genuinely
 // unknown key (not in either spec set) still errors out, so the
 // silent-accept is scoped.

@@ -446,7 +446,7 @@ func WithInFlightWindow(window int) LineSenderOption {
 // negative means "fast close".
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		if d > 0 {
+		if d >= time.Millisecond {
 			s.closeFlushTimeoutSet = true
 			s.closeFlushTimeoutMillis = int(d / time.Millisecond)
 		}
