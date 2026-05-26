@@ -69,6 +69,26 @@ func TestQwpHostTrackerInitialStateZoneAware(t *testing.T) {
 	}
 }
 
+// TestQwpHostTrackerInitialStateZoneWhitespaceOnly confirms that a
+// whitespace-only client zone collapses to the zone-unset shortcut.
+// Without the constructor's TrimSpace the tracker would treat every
+// observed server zone as Other (since EqualFold("  ", any) is
+// false), breaking zone-locality for users who accidentally pass
+// `zone=  `.
+func TestQwpHostTrackerInitialStateZoneWhitespaceOnly(t *testing.T) {
+	tr := newQwpHostTracker(2, "  \t ", qwpTargetAny)
+	for i, h := range tr.snapshot() {
+		assert.Equal(t, qwpZoneSame, h.zoneTier, "host %d zoneTier (whitespace zone → unset → Same)", i)
+	}
+	// Subsequent RecordZone observations must also collapse to Same,
+	// not Other — proves the trim sticks beyond the initial tier.
+	tr.RecordZone(0, "us-east-1a")
+	tr.RecordZone(1, "eu-west-1a")
+	for i, h := range tr.snapshot() {
+		assert.Equal(t, qwpZoneSame, h.zoneTier, "host %d zoneTier after RecordZone", i)
+	}
+}
+
 // TestQwpHostTrackerLen reports the configured host count.
 func TestQwpHostTrackerLen(t *testing.T) {
 	assert.Equal(t, 3, newQwpHostTracker(3, "", qwpTargetAny).Len())

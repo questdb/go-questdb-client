@@ -168,8 +168,10 @@ type qwpHostTracker struct {
 	// lifetime.
 	hosts []qwpHostEntry
 
-	// clientZone is the lowercased value of the connect-string
-	// `zone=` key. Empty when the user did not configure a zone.
+	// clientZone is the trimmed, lowercased value of the
+	// connect-string `zone=` key. Empty when the user did not
+	// configure a zone (including whitespace-only values, which
+	// collapse to "" after the constructor's TrimSpace).
 	clientZone string
 
 	// target collapses zone tiers to Same when set to
@@ -189,14 +191,17 @@ type qwpHostTracker struct {
 //   - Unknown otherwise. RecordZone fills in Same/Other once the
 //     transport observes a server zone for the host.
 //
-// clientZone is case-insensitive (stored lowercased); pass "" when
-// the user did not configure one. numHosts must be > 0; the caller
-// is responsible for validation (sanitizeQwpConf rejects an empty
-// endpoint list before reaching this point).
+// clientZone is case-insensitive and whitespace-insensitive (stored
+// trimmed + lowercased); pass "" when the user did not configure
+// one. A whitespace-only value collapses to "" here so the
+// zone-blind shortcut applies — symmetric with RecordZone, which
+// trims server-side zone observations. numHosts must be > 0; the
+// caller is responsible for validation (sanitizeQwpConf rejects an
+// empty endpoint list before reaching this point).
 func newQwpHostTracker(numHosts int, clientZone string, target qwpTargetFilter) *qwpHostTracker {
 	t := &qwpHostTracker{
 		hosts:      make([]qwpHostEntry, numHosts),
-		clientZone: strings.ToLower(clientZone),
+		clientZone: strings.ToLower(strings.TrimSpace(clientZone)),
 		target:     target,
 	}
 	initialZone := qwpZoneUnknown
