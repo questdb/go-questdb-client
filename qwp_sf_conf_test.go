@@ -140,6 +140,38 @@ func TestSfDurabilityOptionMemoryAccepted(t *testing.T) {
 	require.NoError(t, sanitizeQwpConf(conf))
 }
 
+// WithSenderId is the functional-option analogue of the sender_id
+// connect-string key. The parser rejects '.', '/', '\' and other
+// out-of-charset bytes (TestSfConfRejectsBadSenderId pins that), but
+// the option path used to assign the raw string straight to
+// conf.senderId. The unsanitized value is then joined into the slot
+// path under sfDir, so values like "../etc" would let a caller
+// escape the sf_dir root. sanitizeQwpConf must apply the same charset
+// gate the parser does — these tests pin parity.
+func TestSenderIdOptionRejectsPathTraversal(t *testing.T) {
+	for _, id := range []string{"../etc", "..", "a/b", `a\b`, "foo.bar"} {
+		t.Run(id, func(t *testing.T) {
+			conf := newLineSenderConfig(qwpSenderType)
+			WithSfDir("/tmp/sf")(conf)
+			WithSenderId(id)(conf)
+			err := sanitizeQwpConf(conf)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "sender_id")
+		})
+	}
+}
+
+func TestSenderIdOptionAcceptsValid(t *testing.T) {
+	for _, id := range []string{"default", "ingest-1", "slot_42", "ABCxyz"} {
+		t.Run(id, func(t *testing.T) {
+			conf := newLineSenderConfig(qwpSenderType)
+			WithSfDir("/tmp/sf")(conf)
+			WithSenderId(id)(conf)
+			require.NoError(t, sanitizeQwpConf(conf))
+		})
+	}
+}
+
 // Durable-ack mode is a deferred opt-in feature, but sf-client.md §19
 // makes its connect-string keys normative: the parser MUST recognise
 // request_durable_ack / durable_ack_keepalive_interval_millis so a

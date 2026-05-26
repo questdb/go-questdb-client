@@ -1306,6 +1306,20 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if err := validateSfDurability(conf.sfDurability); err != nil {
 		return err
 	}
+	// Validate the sender_id charset for the functional-option path
+	// (WithSenderId). The connect-string parser gates the parser path
+	// (TestSfConfRejectsBadSenderId); this is the only gate on the
+	// option path. Empty is the "use default" sentinel and resolves
+	// to qwpSfDefaultSenderId downstream — skip validateSenderId's
+	// strict non-empty rule for that case. Critical: senderId is used
+	// unmodified as a path segment under sfDir at slotPath
+	// construction (qwp_sender_cursor.go), so '.', '/' or '\' would
+	// escape the sf_dir root.
+	if conf.senderId != "" {
+		if err := validateSenderId(conf.senderId); err != nil {
+			return err
+		}
+	}
 	if conf.sfMaxBytes < 0 {
 		return fmt.Errorf("sf_max_bytes must be > 0: %d", conf.sfMaxBytes)
 	}
