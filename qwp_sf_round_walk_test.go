@@ -747,6 +747,78 @@ func TestRunSingleRoundAuthErrorShortCircuits(t *testing.T) {
 		"walk must not have reached the healthy peer")
 }
 
+// TestRunSingleRoundCtxCancelDuringDialDoesNotDemote verifies the
+// cancellation race fix: when ctx fires while params.Factory is
+// in-flight, the returned dial error is a wrapped context.Canceled
+// — not a host failure. The walk must surface it as Cancelled and
+// leave the tracker's host state untouched, otherwise a healthy
+// host gets spuriously demoted to TransportError just because the
+// caller stopped waiting (e.g. drainer shutdown, sender Close
+// during reconnect, a watchdog tripping mid-dial).
+func TestRunSingleRoundCtxCancelDuringDialDoesNotDemote(t *testing.T) {
+	dialStarted := make(chan struct{})
+	factory := func(ctx context.Context, _ int) (*qwpTransport, error) {
+		close(dialStarted)
+		<-ctx.Done()
+		return nil, fmt.Errorf("qwp: websocket dial: %w", ctx.Err())
+	}
+	tracker := newQwpHostTracker(1, "", qwpTargetAny)
+	params := qwpSfRoundWalkParams{
+		Factory: factory,
+		Tracker: tracker,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-dialStarted
+		cancel()
+	}()
+	rr := qwpSfRunSingleRound(ctx, nil, params, -1)
+
+	require.NotNil(t, rr.Cancelled, "ctx cancel during dial must surface as Cancelled")
+	assert.True(t, errors.Is(rr.Cancelled, context.Canceled))
+	assert.Equal(t, -1, rr.Idx)
+	assert.Equal(t, 1, rr.Attempts, "the in-flight dial counts as one attempt")
+
+	snap := tracker.snapshot()
+	assert.Equal(t, qwpHostUnknown, snap[0].state,
+		"cancelled dial must not demote the host to TransportError")
+}
+
+// TestRunSingleRoundCancelChDuringDialDoesNotDemote is the
+// cancelCh-channel counterpart. cancelCh exists so the send loop
+// can distinguish "user close" from "ctx cancelled" — the fix must
+// honour both signals symmetrically.
+func TestRunSingleRoundCancelChDuringDialDoesNotDemote(t *testing.T) {
+	dialStarted := make(chan struct{})
+	cancelCh := make(chan struct{})
+	factory := func(_ context.Context, _ int) (*qwpTransport, error) {
+		close(dialStarted)
+		<-cancelCh
+		return nil, errors.New("qwp: websocket dial: connection refused")
+	}
+	tracker := newQwpHostTracker(1, "", qwpTargetAny)
+	params := qwpSfRoundWalkParams{
+		Factory: factory,
+		Tracker: tracker,
+	}
+
+	go func() {
+		<-dialStarted
+		close(cancelCh)
+	}()
+	rr := qwpSfRunSingleRound(context.Background(), cancelCh, params, -1)
+
+	require.NotNil(t, rr.Cancelled, "cancelCh during dial must surface as Cancelled")
+	assert.True(t, errors.Is(rr.Cancelled, context.Canceled))
+	assert.Equal(t, -1, rr.Idx)
+	assert.Equal(t, 1, rr.Attempts)
+
+	snap := tracker.snapshot()
+	assert.Equal(t, qwpHostUnknown, snap[0].state,
+		"cancelCh-aborted dial must not demote the host to TransportError")
+}
+
 // TestInitialConnectOffWalksMultiHostToHealthy is the spec-parity
 // test: with `initial_connect_retry` left at its default (off), a
 // connect string with multiple `addr=` entries must walk every host

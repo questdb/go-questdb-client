@@ -299,6 +299,31 @@ func qwpSfRunSingleRound(
 		}
 		lastErr = err
 
+		// Cancellation race: ctx (or cancelCh) may have fired while
+		// the dial was in flight, in which case err is just a
+		// wrapped context.Canceled / context.DeadlineExceeded — not
+		// a host failure. Recording it as a transport error would
+		// falsely demote a healthy host the caller simply stopped
+		// waiting for. Bail out before classification.
+		if cerr := ctx.Err(); cerr != nil {
+			return qwpSfSingleRoundResult{
+				Idx:       -1,
+				Cancelled: cerr,
+				Attempts:  attempts,
+			}
+		}
+		if cancelCh != nil {
+			select {
+			case <-cancelCh:
+				return qwpSfSingleRoundResult{
+					Idx:       -1,
+					Cancelled: context.Canceled,
+					Attempts:  attempts,
+				}
+			default:
+			}
+		}
+
 		// Classify the failure. Typed *QwpUpgradeRejectError carries
 		// the precise spec-relevant fields; everything else is a
 		// generic transport error.
