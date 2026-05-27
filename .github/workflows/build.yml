@@ -2,6 +2,68 @@ name: build
 on: [push]
 
 jobs:
+  # Cross-repo trigger: fire the questdb-enterprise
+  # build-and-test-e2e-go-client pipeline with this build's SHA so
+  # the go_client-marked failover tests run against an Enterprise
+  # primary. The Enterprise pipeline posts a status check back on the
+  # PR (`enterprise-e2e-go-client` context); this job fire-and-forgets.
+  dispatch-enterprise-e2e:
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.fork }}
+    steps:
+      - name: Queue enterprise go_client e2e
+        env:
+          ENT_DISPATCH_PAT: ${{ secrets.ENT_DISPATCH_PAT }}
+          ENT_ORG_URL: ${{ secrets.ENT_ORG_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ENT_DISPATCH_PAT:-}" ] || [ -z "${ENT_ORG_URL:-}" ]; then
+            echo "ENT_DISPATCH_PAT or ENT_ORG_URL not set; skipping enterprise e2e dispatch."
+            exit 0
+          fi
+
+          PROJECT="questdb-enterprise"
+          PIPELINE_NAME="build-and-test-e2e-go-client"
+
+          echo "Looking up '${PIPELINE_NAME}' in '${PROJECT}'..."
+          PIPELINES=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
+            "${ENT_ORG_URL}${PROJECT}/_apis/pipelines?api-version=7.0")
+          PIPELINE_ID=$(echo "$PIPELINES" | jq -r --arg n "$PIPELINE_NAME" \
+            '.value[] | select(.name == $n) | .id' | head -1)
+
+          if [ -z "$PIPELINE_ID" ] || [ "$PIPELINE_ID" = "null" ]; then
+            echo "Pipeline '${PIPELINE_NAME}' not found in '${PROJECT}'; skipping."
+            exit 0
+          fi
+
+          CLIENT_BRANCH="${GITHUB_REF_NAME}"
+          CLIENT_PR_NUMBER=""
+
+          BODY=$(jq -n \
+            --arg commit "${GITHUB_SHA}" \
+            --arg pr "${CLIENT_PR_NUMBER}" \
+            --arg branch "${CLIENT_BRANCH}" \
+            '{
+              templateParameters: {
+                goClientCommit: $commit,
+                goClientPrNumber: $pr,
+                clientBranch: $branch
+              },
+              resources: { repositories: { self: { refName: "refs/heads/main" } } }
+            }')
+
+          echo "Dispatching enterprise e2e: commit=${GITHUB_SHA} branch=${CLIENT_BRANCH}"
+
+          RESPONSE=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "$BODY" \
+            "${ENT_ORG_URL}${PROJECT}/_apis/pipelines/${PIPELINE_ID}/runs?api-version=7.0")
+
+          RUN_URL=$(echo "$RESPONSE" | jq -r '._links.web.href // ""')
+          echo "Enterprise build queued: ${RUN_URL}"
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -62,67 +124,3 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: go test -race -v ./...
-
-  # Cross-repo trigger: fire the questdb-enterprise
-  # build-and-test-e2e-go-client pipeline with this build's SHA so
-  # the go_client-marked failover tests run against an Enterprise
-  # primary. The Enterprise pipeline posts a status check back on the
-  # PR (`enterprise-e2e-go-client` context); this job fire-and-forgets.
-  dispatch-enterprise-e2e:
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'push' && !github.event.repository.fork
-    steps:
-      - name: Queue enterprise go_client e2e
-        env:
-          ENT_DISPATCH_PAT: ${{ secrets.ENT_DISPATCH_PAT }}
-          ENT_ORG_URL: ${{ secrets.ENT_ORG_URL }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${ENT_DISPATCH_PAT:-}" ] || [ -z "${ENT_ORG_URL:-}" ]; then
-            echo "ENT_DISPATCH_PAT or ENT_ORG_URL not set; skipping enterprise e2e dispatch."
-            exit 0
-          fi
-
-          PROJECT="questdb-enterprise"
-          PIPELINE_NAME="build-and-test-e2e-go-client"
-
-          echo "Looking up '${PIPELINE_NAME}' in '${PROJECT}'..."
-          PIPELINES=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
-            "${ENT_ORG_URL}${PROJECT}/_apis/pipelines?api-version=7.0")
-          PIPELINE_ID=$(echo "$PIPELINES" | jq -r --arg n "$PIPELINE_NAME" \
-            '.value[] | select(.name == $n) | .id' | head -1)
-
-          if [ -z "$PIPELINE_ID" ] || [ "$PIPELINE_ID" = "null" ]; then
-            echo "Pipeline '${PIPELINE_NAME}' not found in '${PROJECT}'; skipping."
-            exit 0
-          fi
-
-          # For push events, extract branch name and PR number (if any).
-          CLIENT_BRANCH="${GITHUB_REF_NAME}"
-          CLIENT_PR_NUMBER=""
-
-          BODY=$(jq -n \
-            --arg commit "${GITHUB_SHA}" \
-            --arg pr "${CLIENT_PR_NUMBER}" \
-            --arg branch "${CLIENT_BRANCH}" \
-            '{
-              templateParameters: {
-                goClientCommit: $commit,
-                goClientPrNumber: $pr,
-                clientBranch: $branch
-              },
-              resources: { repositories: { self: { refName: "refs/heads/main" } } }
-            }')
-
-          echo "Dispatching enterprise e2e: commit=${GITHUB_SHA} branch=${CLIENT_BRANCH}"
-
-          RESPONSE=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            -d "$BODY" \
-            "${ENT_ORG_URL}${PROJECT}/_apis/pipelines/${PIPELINE_ID}/runs?api-version=7.0")
-
-          RUN_URL=$(echo "$RESPONSE" | jq -r '._links.web.href // ""')
-          echo "Enterprise build queued: ${RUN_URL}"
