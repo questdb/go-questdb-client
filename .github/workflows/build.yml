@@ -40,16 +40,22 @@ jobs:
           CLIENT_BRANCH="${GITHUB_REF_NAME}"
           CLIENT_PR_NUMBER=""
 
+          # Azure DevOps rejects empty-string template parameters with
+          # "The 'X' parameter is not a valid String." even when the
+          # pipeline YAML declares `type: string, default: ''`. Omitting
+          # the key entirely lets the YAML default kick in; the
+          # enterprise pipeline already handles empty goClientPrNumber
+          # by skipping the GitHub PR status post.
           BODY=$(jq -n \
             --arg commit "${GITHUB_SHA}" \
             --arg pr "${CLIENT_PR_NUMBER}" \
             --arg branch "${CLIENT_BRANCH}" \
             '{
-              templateParameters: {
+              templateParameters: ({
                 goClientCommit: $commit,
                 goClientPrNumber: $pr,
                 clientBranch: $branch
-              },
+              } | with_entries(select(.value != ""))),
               resources: { repositories: { self: { refName: "refs/heads/main" } } }
             }')
 
