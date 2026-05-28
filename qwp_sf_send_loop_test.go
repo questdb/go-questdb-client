@@ -420,18 +420,35 @@ func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
+	// Warm-up frame: process one ACK deterministically before the
+	// burst so the run() silent-drop guard gates on lifetime
+	// totalAcks > 0 and treats the upcoming mid-burst drop as
+	// transient (reconnect) rather than as "server doesn't speak our
+	// protocol" (terminal halt). Without this, when closeAfterFrames
+	// fires, conn.CloseNow runs with the client's still-unread frames
+	// in the server's TCP RX buffer — Linux turns that close into a
+	// RST, which discards the 4 ACKs the server wrote before the
+	// trigger from the OS receive buffer on the client side. The
+	// receiver loop never sees them, lifetime totalAcks stays at 0,
+	// and run() latches the wrong terminal classification.
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("warm-up"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, time.Second, time.Millisecond, "warm-up frame should ACK before the burst")
+
 	for i := 0; i < 10; i++ {
 		_, err := engine.engineAppendBlocking(context.Background(), []byte(fmt.Sprintf("f-%d", i)))
 		require.NoError(t, err)
 	}
-	// All 10 frames should eventually be ACKed despite the server
-	// dropping the connection after 5. (It will accept them again on
-	// the new connection; with the current test server semantics,
-	// reconnect doesn't truncate.) Actually closeAfterFrames is a
-	// global counter — after the close, the next connect will
-	// receive frames 6..10 cleanly.
+	// All 11 frames (warm-up + 10 burst) should eventually be ACKed
+	// despite the server dropping conn 1 after reading 5 (warm-up +
+	// first 4 burst). closeAfterFrames is gated on myConnID == 1 so
+	// the reconnect lands on a fresh handler instance that ACKs
+	// every frame cleanly; the remaining burst frames hit the server
+	// on conn 2.
 	require.Eventually(t, func() bool {
-		return engine.engineAckedFsn() >= 9
+		return engine.engineAckedFsn() >= 10
 	}, 5*time.Second, 1*time.Millisecond, "loop did not drain after reconnect")
 	assert.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1))
 	// fsnAtZero should have advanced past 0 after the swap.
@@ -456,16 +473,17 @@ func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 // modes dedup cannot paper over, and the two that are this client's
 // job to guarantee.
 //
-// Why the scenario has teeth: closeAfterFrames:5 over 10 appends
-// means the server reads f-0..f-4 on conn 1 and never sees f-5..f-9
-// on conn 1 at all. The ONLY path by which f-5..f-9 ever reach the
-// server is the post-reconnect replay, so a cursor-repositioning bug
-// that skips any of them is permanent loss that neither the global
-// frame counter nor an `ackedFsn >= 9` liveness check can detect
-// (both are driven off the same client-side FSN math the bug would
-// have corrupted). The contiguity+anchor assertion additionally
-// catches a skip of f-0..f-4 (those f-4-class frames the server DID
-// see pre-drop, so the union alone would mask their loss).
+// Why the scenario has teeth: closeAfterFrames:5 over (warm-up + 10
+// burst) appends means the server reads warm-up + f-0..f-3 on conn 1
+// and never sees f-4..f-9 on conn 1 at all. The ONLY path by which
+// f-4..f-9 ever reach the server is the post-reconnect replay, so a
+// cursor-repositioning bug that skips any of them is permanent loss
+// that neither the global frame counter nor an `ackedFsn >= n`
+// liveness check can detect (both are driven off the same client-
+// side FSN math the bug would have corrupted). The contiguity+anchor
+// assertion additionally catches a skip of warm-up..f-3 (those
+// frames the server DID see pre-drop, so the union alone would mask
+// their loss).
 func TestQwpSfSendLoopReplayIsGapFree(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		closeAfterFrames: 5,
@@ -485,14 +503,27 @@ func TestQwpSfSendLoopReplayIsGapFree(t *testing.T) {
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
+	// Warm-up frame: process one ACK deterministically before the
+	// burst so the run() silent-drop guard gates on lifetime
+	// totalAcks > 0 and treats the upcoming mid-burst drop as
+	// transient. See the equivalent block in
+	// TestQwpSfSendLoopReconnectAfterServerClose for the
+	// RST-loses-in-flight-ACKs race that this dodges.
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("warm-up"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, time.Second, time.Millisecond, "warm-up frame should ACK before the burst")
+
 	const n = 10
 	for i := 0; i < n; i++ {
 		_, err := engine.engineAppendBlocking(
 			context.Background(), []byte(fmt.Sprintf("f-%d", i)))
 		require.NoError(t, err)
 	}
+	// FSNs: warm-up=0, f-0..f-9 = 1..10. All-acked = ackedFsn >= n.
 	require.Eventually(t, func() bool {
-		return engine.engineAckedFsn() >= int64(n-1)
+		return engine.engineAckedFsn() >= int64(n)
 	}, 5*time.Second, 1*time.Millisecond,
 		"loop did not drain every frame after reconnect")
 	require.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1),
@@ -503,27 +534,33 @@ func TestQwpSfSendLoopReplayIsGapFree(t *testing.T) {
 		"expected exactly two connections (one drop -> one reconnect)")
 	conn1, conn2 := frames[1], frames[2]
 
-	// conn 1: the server reads exactly the first five frames, in
+	// conn 1: the server reads exactly the warm-up + first four
+	// burst frames (5 total — the closeAfterFrames trigger), in
 	// order, then drops. This is independent of how many ACKs it
 	// managed to write before dropping, so this part is race-free.
-	require.Equal(t, []string{"f-0", "f-1", "f-2", "f-3", "f-4"}, conn1,
-		"conn 1 must receive exactly the first 5 frames before the drop")
+	require.Equal(t, []string{"warm-up", "f-0", "f-1", "f-2", "f-3"}, conn1,
+		"conn 1 must receive warm-up + first 4 burst frames before the drop")
 
 	// conn 2: the replayed run. Its start depends on how many of
 	// conn 1's ACKs the receiver had processed before the drop
 	// surfaced — a benign race: fsnAtZero = engineAckedFsn()+1 at
-	// swap time, somewhere in [0,4]. Whatever that anchor is, the
-	// replay MUST begin exactly there, be strictly contiguous (no
-	// gap, no reorder), and run through the final frame. fsnAtZero
-	// and the replayed bytes derive from the same ackedFsn snapshot,
-	// so this assertion is race-robust and is precisely the
-	// wire<->messageSequence alignment server-side dedup keys on.
+	// swap time, somewhere in [1,4] (warm-up's ACK was waited-on so
+	// fsnAtZero is at least 1; at most warm-up + f-0..f-2 were ACKed
+	// before the close, so fsnAtZero is at most 4). Whatever that
+	// anchor is, the replay MUST begin exactly there, be strictly
+	// contiguous (no gap, no reorder), and run through the final
+	// frame. fsnAtZero and the replayed bytes derive from the same
+	// ackedFsn snapshot, so this assertion is race-robust and is
+	// precisely the wire<->messageSequence alignment server-side
+	// dedup keys on.
 	require.NotEmpty(t, conn2, "reconnect must have replayed frames")
 	fsnAtZero := loop.sendLoopFsnAtZero()
-	require.GreaterOrEqual(t, fsnAtZero, int64(0))
+	require.GreaterOrEqual(t, fsnAtZero, int64(1))
 	require.LessOrEqual(t, fsnAtZero, int64(4))
 	for i, got := range conn2 {
-		want := fmt.Sprintf("f-%d", fsnAtZero+int64(i))
+		// FSN fsnAtZero+i maps to f-(fsnAtZero-1+i): warm-up holds
+		// FSN 0, the burst occupies FSN 1..n.
+		want := fmt.Sprintf("f-%d", fsnAtZero-1+int64(i))
 		require.Equalf(t, want, got,
 			"replayed frame %d not contiguous from the fsnAtZero anchor "+
 				"(gap, reorder, or misaligned messageSequence)", i)
@@ -531,10 +568,11 @@ func TestQwpSfSendLoopReplayIsGapFree(t *testing.T) {
 	require.Equalf(t, fmt.Sprintf("f-%d", n-1), conn2[len(conn2)-1],
 		"replay must run through the final frame f-%d", n-1)
 
-	// THE data-loss guard: every appended row reached the server at
-	// least once across the two connections. f-5..f-9 were never seen
-	// on conn 1, so only a correct replay puts them in this set.
-	seen := make(map[string]bool, n)
+	// THE data-loss guard: every appended burst row reached the
+	// server at least once across the two connections. f-4..f-9 were
+	// never seen on conn 1, so only a correct replay puts them in
+	// this set.
+	seen := make(map[string]bool, n+1)
 	for _, payloads := range frames {
 		for _, p := range payloads {
 			seen[p] = true
@@ -548,10 +586,12 @@ func TestQwpSfSendLoopReplayIsGapFree(t *testing.T) {
 	// Duplicates are expected and correct (at-least-once + server
 	// dedup). Assert at least one actually occurred so a future change
 	// that silently stopped replaying can't pass this test trivially.
-	require.Greaterf(t, srv.totalFramesReceived.Load(), int64(n),
+	// Total appended = warm-up + n burst = n+1; anything past that is
+	// a replayed duplicate.
+	require.Greaterf(t, srv.totalFramesReceived.Load(), int64(n+1),
 		"replay must re-send >=1 already-received frame (the dup the "+
 			"server dedups); got only %d total for %d rows",
-		srv.totalFramesReceived.Load(), n)
+		srv.totalFramesReceived.Load(), n+1)
 }
 
 func TestQwpSfSendLoopServerErrorIsTerminal(t *testing.T) {
