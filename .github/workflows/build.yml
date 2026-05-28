@@ -55,13 +55,27 @@ jobs:
 
           echo "Dispatching enterprise e2e: commit=${GITHUB_SHA} branch=${CLIENT_BRANCH}"
 
-          RESPONSE=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
+          # Capture status and body separately so we can surface Azure
+          # DevOps's error message on 4xx. With -fsS the body is dropped
+          # and only "curl: (22) ... error: 400" reaches the log, which
+          # is useless for diagnosing parameter / YAML mismatches.
+          RESPONSE_FILE=$(mktemp)
+          HTTP_STATUS=$(curl -sS -u ":${ENT_DISPATCH_PAT}" \
             -H "Content-Type: application/json" \
             -X POST \
             -d "$BODY" \
+            -o "$RESPONSE_FILE" \
+            -w '%{http_code}' \
             "${ENT_ORG_URL}${PROJECT}/_apis/pipelines/${PIPELINE_ID}/runs?api-version=7.0")
 
-          RUN_URL=$(echo "$RESPONSE" | jq -r '._links.web.href // ""')
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Dispatch failed with HTTP ${HTTP_STATUS}. Response body:"
+            cat "$RESPONSE_FILE"
+            echo ""
+            exit 1
+          fi
+
+          RUN_URL=$(jq -r '._links.web.href // ""' "$RESPONSE_FILE")
           echo "Enterprise build queued: ${RUN_URL}"
 
   test:
