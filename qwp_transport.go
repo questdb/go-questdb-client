@@ -130,21 +130,19 @@ type qwpTransportOpts struct {
 	maxBatchRows int
 
 	// maxVersion is the value advertised in the X-QWP-Max-Version
-	// handshake header. Zero means qwpVersion (the v1 default), which
-	// keeps ingest connections compatible with both v1 and v2
-	// QuestDB servers. Egress callers set qwpMaxSupportedVersion to
-	// opt the connection into v2-only server features (SERVER_INFO,
-	// multi-endpoint failover). The transport accepts any echoed
-	// X-QWP-Version that is <= maxVersion.
+	// handshake header. Zero means qwpVersion. QWP currently has a
+	// single protocol version, so both ingest and egress callers
+	// advertise qwpVersion; the header is retained as the negotiation
+	// mechanism for a future version bump. The transport accepts any
+	// echoed X-QWP-Version that is <= maxVersion.
 	maxVersion byte
 
 	// serverInfoTimeout, when > 0, enables synchronous consumption of
-	// the SERVER_INFO frame after the upgrade for connections that
-	// negotiate version >= 2. Zero leaves the WebSocket recv buffer
-	// untouched after the upgrade, suitable for ingest connections
-	// where SERVER_INFO is not expected. Must be > 0 on egress
-	// connections that advertise maxVersion >= 2 because a v2 server
-	// emits the frame unsolicited before any client request.
+	// the SERVER_INFO frame after the upgrade. The server always emits
+	// SERVER_INFO as the first post-upgrade frame, so egress callers
+	// set this; ingest senders leave it zero, which leaves the
+	// WebSocket recv buffer untouched after the upgrade and keeps the
+	// ACK loop from being fed a SERVER_INFO frame it does not parse.
 	serverInfoTimeout time.Duration
 
 	// authTimeoutMs is the failover.md §1 per-host upper bound on the
@@ -191,9 +189,8 @@ type qwpTransport struct {
 	serverMaxBatchSize int32
 
 	// serverInfo holds the SERVER_INFO frame consumed during connect()
-	// when the negotiated version is >= 2 and opts.serverInfoTimeout
-	// is > 0. Nil on v1 connections and on connections that did not
-	// opt into SERVER_INFO consumption (ingest senders).
+	// when opts.serverInfoTimeout is > 0. Nil on connections that did
+	// not opt into SERVER_INFO consumption (ingest senders).
 	serverInfo *QwpServerInfo
 }
 
@@ -347,14 +344,14 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		t.recvBuf = make([]byte, 0, qwpDefaultInitRecvBufSize)
 	}
 
-	// v2 servers emit SERVER_INFO as the first WebSocket frame after
+	// The server emits SERVER_INFO as the first WebSocket frame after
 	// the upgrade response, before any client request. Consume it
 	// synchronously so the I/O goroutines start with a clean recv
 	// queue and the user-visible ServerInfo() accessor is populated
 	// before submit. Egress connections opt in via opts.serverInfoTimeout
 	// > 0; ingest senders leave it zero so the ACK loop is never
 	// fed a SERVER_INFO frame it doesn't know how to parse.
-	if t.negotiatedVersion >= 2 && opts.serverInfoTimeout > 0 {
+	if opts.serverInfoTimeout > 0 {
 		readCtx, cancel := context.WithTimeout(ctx, opts.serverInfoTimeout)
 		defer cancel()
 		msgType, payload, err := t.conn.Read(readCtx)

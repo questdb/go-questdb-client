@@ -33,7 +33,7 @@ import "fmt"
 // Usage:
 //
 //	var enc qwpEncoder
-//	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+//	msg := enc.encodeTable(tb)
 //	// msg is valid until the next encode call.
 type qwpEncoder struct {
 	wb      qwpWireBuffer
@@ -52,24 +52,21 @@ type qwpEncoder struct {
 // slice references the encoder's internal buffer and is valid until
 // the next encode call.
 //
-// schemaMode and schemaId are passed straight through to the
-// wire-format table-block header. The production cursor sender
-// never invokes this method — it goes through
-// encodeMultiTableWithDeltaDict, which always emits
-// (qwpSchemaModeFull, 0). The schemaMode/schemaId parameters are
-// retained here so tests can construct wire-format fixtures
-// (including 0x01 reference-mode frames) for the egress decoder.
+// The production cursor sender never invokes this method — it goes
+// through encodeMultiTableWithDeltaDict. encodeTable is retained as a
+// single-table convenience for tests that build wire-format fixtures
+// for the egress decoder.
 //
-// Both paths set FLAG_DELTA_SYMBOL_DICT (the only symbol-encoding
-// mode WebSocket clients emit) and FLAG_GORILLA (timestamp columns
-// are always preceded by a 1-byte encoding flag; see QWP spec §12).
+// It sets FLAG_DELTA_SYMBOL_DICT (the only symbol-encoding mode
+// WebSocket clients emit) and FLAG_GORILLA (timestamp columns are
+// always preceded by a 1-byte encoding flag; see QWP spec §12).
 //
 // The message layout is:
 //
 //	Header (12 bytes, flags=0x0C) → empty DeltaDict →
 //	TableBlock → patched PayloadLength.
-func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaId int) []byte {
-	return e.encodeTableWithDeltaDict(tb, nil, -1, -1, schemaMode, schemaId)
+func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer) []byte {
+	return e.encodeTableWithDeltaDict(tb, nil, -1, -1)
 }
 
 // encodeTableWithDeltaDict encodes a single table buffer with a
@@ -90,13 +87,11 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 	globalDict []string,
 	maxSentId int,
 	batchMaxId int,
-	schemaMode qwpSchemaMode,
-	schemaId int,
 ) []byte {
 	e.wb.reset()
 	e.writeHeader(e.headerFlags(), 1)
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
-	e.writeTableBlock(tb, schemaMode, schemaId)
+	e.writeTableBlock(tb)
 	e.patchPayloadLength()
 	return e.wb.bytes()
 }
@@ -107,10 +102,10 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 // server to process all tables from one WebSocket frame. This
 // reduces round-trips compared to one message per table.
 //
-// Every table block is written in FULL schema mode with
-// schema_id = 0 — cursor-architecture self-sufficient frames carry
-// the inline column definitions on every frame, so the schema_id
-// varint is a wire-format formality with no semantic content.
+// Every table block carries its inline column definitions —
+// cursor-architecture self-sufficient frames repeat the full schema
+// on every frame so reconnect / replay stays safe against a freshly
+// connected server.
 //
 // The message layout is:
 //
@@ -136,7 +131,7 @@ func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
 	e.writeHeader(e.headerFlags(), uint16(len(tables)))
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
 	for i := range tables {
-		e.writeTableBlock(tables[i], qwpSchemaModeFull, 0)
+		e.writeTableBlock(tables[i])
 	}
 	e.patchPayloadLength()
 	return e.wb.bytes()
@@ -197,24 +192,19 @@ func (e *qwpEncoder) writeDeltaDict(globalDict []string, maxSentId, batchMaxId i
 
 // --- table block ---
 
-// writeTableBlock writes a single table block: table name, row/col
-// counts, schema, and column data.
+// writeTableBlock writes a single table block: table name, row and
+// column counts, the inline column schema, and the column data.
 //
-// Per QWP spec §9, the schema section starts with a mode byte
-// (0x00 = full, 0x01 = reference) followed by a varint schema_id
-// in both modes. In full mode the column definitions follow; in
-// reference mode the server looks up the schema by ID in its
-// per-connection registry.
-func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaId int) {
+// Per the QWP ingress wire format the table block is table_name,
+// row_count, col_count, inline columns (a name + type-code pair per
+// column), then the per-column data. The schema is always inline —
+// the wire carries no schema mode byte and no schema id.
+func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer) {
 	e.wb.putString(tb.tableName)
 	e.wb.putVarint(uint64(tb.rowCount))
 	e.wb.putVarint(uint64(len(tb.columns)))
 
-	e.wb.putByte(byte(schemaMode))
-	e.wb.putVarint(uint64(schemaId))
-	if schemaMode == qwpSchemaModeFull {
-		e.encodeSchemaFull(tb)
-	}
+	e.encodeSchemaFull(tb)
 
 	for _, col := range tb.columns {
 		e.encodeColumnData(col)

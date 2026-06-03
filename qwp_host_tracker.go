@@ -362,9 +362,8 @@ func (t *qwpHostTracker) RecordMidStreamFailure(idx int) {
 //
 //   - zoneId == "" (or whitespace-only): no-op; the existing tier
 //     is preserved. This covers servers that did not emit a zone
-//     header (v1 servers, v2 servers without CAP_ZONE, or a 421
-//     reject without X-QuestDB-Zone). The tracker's initial tier
-//     remains in effect.
+//     header (servers without CAP_ZONE, or a 421 reject without
+//     X-QuestDB-Zone). The tracker's initial tier remains in effect.
 //   - zoneId == client zone (case-insensitive): tier becomes Same.
 //   - target=primary or client zone unset: tier becomes Same
 //     regardless of the zoneId value (the spec collapses zone tiers

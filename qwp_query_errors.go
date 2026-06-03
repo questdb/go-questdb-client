@@ -58,15 +58,13 @@ func (e *QwpQueryError) Error() string {
 
 // QwpRoleMismatchError is returned by QwpQueryClient construction when
 // none of the configured endpoints satisfies the target= role filter.
-// The connect walk records the most-recently-observed SERVER_INFO,
-// whether any endpoint negotiated v1, and the last underlying transport
-// failure so callers can distinguish four failure shapes: "no primary
-// available" (LastObserved non-nil; at least one v2 endpoint reported a
-// different role), "OSS-only cluster" (SawV1Mismatch true; at least
-// one endpoint negotiated v1 and cannot report a role), "all endpoints
-// unreachable" (LastTransportError non-nil with both other fields
-// zero), and combinations of the above (e.g. one endpoint dialled but
-// reported the wrong role while another refused the connection).
+// The connect walk records the most-recently-observed SERVER_INFO and
+// the last underlying transport failure so callers can distinguish
+// "no matching role available" (LastObserved non-nil; an endpoint
+// reported a role the filter rejects), "all endpoints unreachable"
+// (LastTransportError non-nil with LastObserved nil), and combinations
+// of the above (e.g. one endpoint dialled but reported the wrong role
+// while another refused the connection).
 type QwpRoleMismatchError struct {
 	// Target is the requested role filter ("any", "primary", "replica").
 	// Stored as a string for human-readable error formatting; the
@@ -76,22 +74,15 @@ type QwpRoleMismatchError struct {
 
 	// LastObserved is the SERVER_INFO of the most recent endpoint the
 	// connect walk reached and that returned a role this filter would
-	// reject. Nil if every endpoint refused the connection or only
-	// v1 endpoints responded.
+	// reject. Nil if every endpoint refused the connection before
+	// reporting a role.
 	LastObserved *QwpServerInfo
-
-	// SawV1Mismatch is true when at least one endpoint negotiated QWP
-	// v1 (no SERVER_INFO frame, role unknown) and was therefore skipped
-	// because the target filter requires a role guarantee. Lets callers
-	// detect "the cluster is up but it's OSS / v1 and can't supply a
-	// role" without parsing the error message.
-	SawV1Mismatch bool
 
 	// LastTransportError is the most recent transport-level failure the
 	// connect walk hit (TCP/TLS dial, WebSocket upgrade, SERVER_INFO
 	// timeout). Populated when at least one endpoint failed before
 	// reaching the role-filter step. Nil when every endpoint dialled
-	// cleanly but failed only the role / v1 checks. Available via
+	// cleanly but failed only the role check. Available via
 	// errors.Is / errors.As through Unwrap.
 	LastTransportError error
 
@@ -109,10 +100,6 @@ func (e *QwpRoleMismatchError) Error() string {
 		if e.LastObserved.NodeId != "" {
 			fmt.Fprintf(&b, " on node %q", e.LastObserved.NodeId)
 		}
-	}
-	if e.SawV1Mismatch {
-		b.WriteString(
-			"; at least one endpoint negotiated v1 and cannot supply a role")
 	}
 	if e.LastTransportError != nil {
 		fmt.Fprintf(&b, "; last transport error: %v", e.LastTransportError)
@@ -152,8 +139,7 @@ func (e *QwpRoleMismatchError) Unwrap() error {
 // and consumes the reset internally.
 type QwpFailoverReset struct {
 	// NewNode is the SERVER_INFO of the endpoint the client just
-	// rebound to, or nil if the new connection negotiated v1 (no
-	// SERVER_INFO emitted).
+	// rebound to (nil only if no SERVER_INFO was available).
 	NewNode *QwpServerInfo
 
 	// Attempt is the 1-based replay attempt counter. Attempt=1 means

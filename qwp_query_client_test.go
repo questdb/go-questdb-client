@@ -1295,6 +1295,11 @@ func TestQwpQueryClientSendsEgressHeaders(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
+		// The egress client reads SERVER_INFO during connect; emit one
+		// so the upgrade-header assertions below are reached.
+		info := buildServerInfoFrame(qwpVersion, 0, qwpRolePrimary, 1, 0,
+			1_700_000_000_000_000_000, "test-cluster", "mock-node")
+		_ = conn.Write(r.Context(), websocket.MessageBinary, info)
 	}))
 	defer srv.Close()
 	addr := strings.TrimPrefix(srv.URL, "http://")
@@ -1363,6 +1368,11 @@ func TestQwpQueryClientSendsAcceptEncodingWhenCompressed(t *testing.T) {
 					return
 				}
 				defer conn.CloseNow()
+				// The egress client reads SERVER_INFO during connect;
+				// emit one so the header assertion below is reached.
+				info := buildServerInfoFrame(qwpVersion, 0, qwpRolePrimary, 1, 0,
+					1_700_000_000_000_000_000, "test-cluster", "mock-node")
+				_ = conn.Write(r.Context(), websocket.MessageBinary, info)
 			}))
 			defer srv.Close()
 			addr := strings.TrimPrefix(srv.URL, "http://")

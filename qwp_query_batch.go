@@ -34,8 +34,8 @@ import (
 
 // qwpColumnSchemaInfo captures the per-column metadata carried in the
 // schema section of a RESULT_BATCH frame. One instance per column;
-// persisted in the decoder's connection-scoped schema registry so
-// subsequent batches that reference a prior schema id can reuse them.
+// the decoder parses it from the first batch of a query (batch_seq ==
+// 0) and reuses it across that query's continuation batches.
 //
 // Named with the "Schema" infix to avoid colliding with the
 // `qwpColumnInfo` struct already defined in `qwp_integration_test.go`
@@ -197,7 +197,7 @@ type QwpColumnBatch struct {
 	batchSeq    int64
 	rowCount    int
 	columnCount int
-	columns     []qwpColumnSchemaInfo // alias into the schema registry
+	columns     []qwpColumnSchemaInfo // alias into the current query's schema
 	layouts     []qwpColumnLayout     // one per column; pool-owned
 
 	// zstdScratch holds the decompressed body when the owning

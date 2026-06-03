@@ -409,9 +409,8 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 // to schema/symbol IDs the new server has never seen would be
 // unrecoverable.
 //
-// Schema-side: every table block goes out in full mode with
-// schema_id = 0. There is no producer-side schema registry to
-// advance.
+// Schema-side: every table block carries its full inline column
+// definitions. There is no producer-side schema registry to advance.
 //
 // Symbol-side: maxSentSymbolId is retained because the symbol dict
 // uses a delta encoding (varint-prefixed length, then names), and
@@ -465,14 +464,13 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 }
 
 // buildTableEncodeInfo collects non-empty tables for encoding.
-// Every table goes out in FULL schema mode with schema_id = 0 (the
-// encoder hard-codes both at the wire-write site). No per-table
-// schema-id minting, no schema-change detection, no per-connection
-// schema registry on the client side — matching the c-questdb-
-// client live path. Mirrors the Java client's "self-sufficient
-// frames" contract (Java spec #14): every replayed frame must
-// stand alone against a fresh server connection, so the cursor
-// wire path always carries the schema in full.
+// Every table block carries its full inline column definitions. There
+// is no schema-change detection and no per-connection schema registry
+// on the client side — matching the c-questdb-client live path.
+// Mirrors the Java client's "self-sufficient frames" contract (Java
+// spec #14): every replayed frame must stand alone against a fresh
+// server connection, so the cursor wire path always carries the
+// schema in full.
 func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 	s.encodeInfoBuf = s.encodeInfoBuf[:0]
 	for _, tb := range s.tableBuffers {

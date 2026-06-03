@@ -850,7 +850,7 @@ func buildDecimalGeohashFrame(t *testing.T, scale uint32, precision int8, unscal
 	}
 	tb.commitRow()
 	var enc qwpEncoder
-	ingress := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+	ingress := enc.encodeTable(tb)
 	return wrapAsResultBatch(ingress, 1, 0)
 }
 

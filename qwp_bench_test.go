@@ -73,12 +73,11 @@ func BenchmarkQwpEncode(b *testing.B) {
 	}
 
 	symList := []string{"s0", "s1", "s2", "s3", "s4"}
-	const schemaId = 0
 
 	var enc qwpEncoder
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		enc.encodeTableWithDeltaDict(tb, symList, -1, 4, qwpSchemaModeFull, schemaId)
+		enc.encodeTableWithDeltaDict(tb, symList, -1, 4)
 	}
 }
 
@@ -127,7 +126,7 @@ func BenchmarkQwpFlush(b *testing.B) {
 			tb.commitRow()
 		}
 
-		enc.encodeTableWithDeltaDict(tb, symList, -1, 2, qwpSchemaModeFull, 0)
+		enc.encodeTableWithDeltaDict(tb, symList, -1, 2)
 		tb.reset()
 	}
 }

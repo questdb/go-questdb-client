@@ -2422,7 +2422,7 @@ func TestQwpIntegrationConnect(t *testing.T) {
 	tb.commitRow()
 
 	var enc qwpEncoder
-	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+	msg := enc.encodeTable(tb)
 
 	t.Logf("sending QWP message (%d bytes): %x", len(msg), msg)
 

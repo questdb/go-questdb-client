@@ -192,55 +192,16 @@ func (d *qwpConnDict) clear() {
 	d.entries = make([]qwpSymbolEntry, 0, cap(d.entries))
 }
 
-// qwpSchemaRegistry indexes column-info slices by server-assigned
-// schema id. Subsequent RESULT_BATCH frames that reference a prior
-// schema (mode=0x01) look up by id instead of retransmitting the
-// columns. The registry is dense (slice by id) because server ids are
-// monotonic from 0 and capped by qwpEgressMaxSchemaId.
-type qwpSchemaRegistry struct {
-	slots [][]qwpColumnSchemaInfo
-}
-
-// get returns the columns registered for id, or (nil, false).
-func (r *qwpSchemaRegistry) get(id int) ([]qwpColumnSchemaInfo, bool) {
-	if id < 0 || id >= len(r.slots) || r.slots[id] == nil {
-		return nil, false
-	}
-	return r.slots[id], true
-}
-
-// put records the given columns under id, extending the registry slice
-// to reach id if needed. Caller is responsible for bounding id against
-// qwpEgressMaxSchemaId.
-func (r *qwpSchemaRegistry) put(id int, cols []qwpColumnSchemaInfo) {
-	for len(r.slots) <= id {
-		r.slots = append(r.slots, nil)
-	}
-	r.slots[id] = cols
-}
-
-// clear drops every registered schema so the next RESULT_BATCH must
-// ship its schema in full mode with a fresh id. Slot storage is
-// retained (len = 0, cap preserved) to avoid reallocation when a
-// workload churns just above the server's soft cap. The registry's
-// references to the per-id []qwpColumnSchemaInfo slices are nilled
-// so the slices can be GC'd once the last user-facing alias drops:
-// decode() aliases the registered slice into qwpColumnBatch.columns
-// (it does not copy), so any QwpColumnBatch the user still holds
-// keeps its own reference and continues to read stable schema info.
-func (r *qwpSchemaRegistry) clear() {
-	clear(r.slots)
-	r.slots = r.slots[:0]
-}
-
 // qwpQueryDecoder is a stateful, reusable decoder for RESULT_BATCH
 // frames. One instance per connection: it accumulates the symbol
-// dictionary and schema registry across every batch of the connection.
-// Decoding is zero-copy where possible — column-layout slices alias
-// into the payload []byte the caller hands to decode().
+// dictionary across the connection and holds the current query's
+// schema between that query's batches. Decoding is zero-copy where
+// possible — column-layout slices alias into the payload []byte the
+// caller hands to decode().
 //
-// The decoder owns connection-scoped state (dict, schemas) but NOT
-// the per-batch layout pool. Each caller's out.layouts slice is
+// The decoder owns connection-scoped state (dict) and per-query state
+// (the schema parsed from the first batch of the current query) but
+// NOT the per-batch layout pool. Each caller's out.layouts slice is
 // grown/reused in place by decode(), so two batches whose buffers
 // the I/O goroutine alternates between never share layout storage.
 // That in turn lets the I/O goroutine emit batch N and immediately
@@ -251,18 +212,32 @@ type qwpQueryDecoder struct {
 	// negotiatedVersion is the QWP wire-protocol version the transport
 	// settled on during the HTTP upgrade. Every server-to-client frame's
 	// header version byte must equal this value — the spec (§3) requires
-	// strict equality with the negotiated version, not merely
-	// <= qwpMaxSupportedVersion. Set once before the first decode call
-	// (via qwpEgressIO.start) and never mutated afterwards.
+	// strict equality with the negotiated version. With a single
+	// protocol version the negotiated value is always qwpVersion. Set
+	// once before the first decode call (via qwpEgressIO.start) and
+	// never mutated afterwards.
 	negotiatedVersion byte
 
 	dict      qwpConnDict
-	schemas   qwpSchemaRegistry
 	gorilla   qwpGorillaDecoder
 	br        qwpByteReader
 	deltaOn   bool // current frame has FLAG_DELTA_SYMBOL_DICT set
 	gorillaOn bool // current frame has FLAG_GORILLA set
 	zstdOn    bool // current frame has FLAG_ZSTD set
+
+	// querySchema holds the column schema parsed from the first batch
+	// (batch_seq == 0) of the current query. Continuation batches
+	// (batch_seq > 0) omit the schema on the wire and reuse it. The
+	// I/O dispatcher calls resetQuerySchema at the start of every query
+	// (qwpEgressIO.dispatcherRun) so a schema from a prior query is
+	// never read across query boundaries. querySchemaValid separates
+	// "schema parsed" from "no batch seen yet" — a continuation batch
+	// arriving before its schema batch is a protocol error. decode()
+	// aliases querySchema into qwpColumnBatch.columns rather than
+	// copying, so a QwpColumnBatch the user still holds keeps its own
+	// reference even after the next query resets the slot.
+	querySchema      []qwpColumnSchemaInfo
+	querySchemaValid bool
 
 	// zstdDec is lazy-initialised on the first FLAG_ZSTD frame the
 	// decoder sees. One decoder per connection; reused across every
@@ -283,6 +258,17 @@ func (d *qwpQueryDecoder) close() {
 		d.zstdDec.Close()
 		d.zstdDec = nil
 	}
+}
+
+// resetQuerySchema drops the schema held for the previous query so the
+// next query's first batch (batch_seq == 0) re-parses it from the
+// wire. The dispatcher calls this at the start of every query, before
+// any of that query's batches are decoded. Dropping the slice releases
+// the decoder's reference; a QwpColumnBatch the user still holds keeps
+// the prior schema alive through its own alias.
+func (d *qwpQueryDecoder) resetQuerySchema() {
+	d.querySchema = nil
+	d.querySchemaValid = false
 }
 
 // decode parses the payload of a RESULT_BATCH frame into out. The
@@ -340,8 +326,9 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 		}
 	}
 
-	// Table block header: name_length varint, name bytes, row_count,
-	// column_count.
+	// Table block header: name_length varint, name bytes, row_count.
+	// col_count and the inline schema follow only on the first batch
+	// of a query (handled below); see the schema section.
 	nameLen, err := d.br.readVarintInt63()
 	if err != nil {
 		return err
@@ -364,55 +351,40 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 	}
 	rowCount := int(rowCount64)
 
-	colCount64, err := d.br.readVarintInt63()
-	if err != nil {
-		return err
-	}
-	if colCount64 > qwpMaxColumnsPerTable {
-		return newQwpDecodeError(fmt.Sprintf(
-			"column_count out of range: %d", colCount64))
-	}
-	columnCount := int(colCount64)
-
-	// Schema section
-	schemaMode, err := d.br.readByte()
-	if err != nil {
-		return err
-	}
-	schemaId64, err := d.br.readVarintInt63()
-	if err != nil {
-		return err
-	}
-	if schemaId64 >= qwpEgressMaxSchemaId {
-		return newQwpDecodeError(fmt.Sprintf(
-			"schema_id out of range: %d", schemaId64))
-	}
-	schemaId := int(schemaId64)
-
+	// Schema section. The first batch of a query (batch_seq == 0)
+	// carries col_count followed by the inline column definitions;
+	// the decoder parses them once and holds them in querySchema.
+	// Continuation batches (batch_seq > 0) drop both col_count and the
+	// columns from the wire and reuse the held schema. The dispatcher
+	// resets querySchema at the start of every query, so a continuation
+	// batch can only legitimately follow a batch_seq == 0 schema batch
+	// on the same query.
+	var columnCount int
 	var cols []qwpColumnSchemaInfo
-	switch qwpSchemaMode(schemaMode) {
-	case qwpSchemaModeFull:
+	if batchSeq == 0 {
+		var colCount64 int64
+		colCount64, err = d.br.readVarintInt63()
+		if err != nil {
+			return err
+		}
+		if colCount64 > qwpMaxColumnsPerTable {
+			return newQwpDecodeError(fmt.Sprintf(
+				"column_count out of range: %d", colCount64))
+		}
+		columnCount = int(colCount64)
 		cols, err = d.parseFullSchema(columnCount)
 		if err != nil {
 			return err
 		}
-		d.schemas.put(schemaId, cols)
-	case qwpSchemaModeReference:
-		var ok bool
-		cols, ok = d.schemas.get(schemaId)
-		if !ok {
-			return newQwpDecodeError(fmt.Sprintf(
-				"schema id %d not registered on this connection",
-				schemaId))
+		d.querySchema = cols
+		d.querySchemaValid = true
+	} else {
+		if !d.querySchemaValid {
+			return newQwpDecodeError(
+				"continuation RESULT_BATCH (batch_seq > 0) arrived before its schema batch")
 		}
-		if len(cols) != columnCount {
-			return newQwpDecodeError(fmt.Sprintf(
-				"schema id %d column count mismatch: registered=%d frame=%d",
-				schemaId, len(cols), columnCount))
-		}
-	default:
-		return newQwpDecodeError(fmt.Sprintf(
-			"unknown schema mode 0x%02X", schemaMode))
+		cols = d.querySchema
+		columnCount = len(cols)
 	}
 
 	// Grow the batch's own layout pool to columnCount. Pool-owned
@@ -464,9 +436,10 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 // live in the data section.
 func (d *qwpQueryDecoder) parseFullSchema(columnCount int) ([]qwpColumnSchemaInfo, error) {
 	// Use a fresh slice per call (rather than pooling). The slice is
-	// handed to the schema registry and must outlive the decode, so
-	// reusing buffer pools here would invalidate the registry on the
-	// next batch.
+	// held in querySchema and reused across the query's continuation
+	// batches, and may also be aliased by a QwpColumnBatch the user
+	// still holds, so it must outlive this decode — reusing buffer
+	// pools here would corrupt those readers on the next batch.
 	cols := make([]qwpColumnSchemaInfo, columnCount)
 	for i := 0; i < columnCount; i++ {
 		nameLen64, err := d.br.readVarintInt63()
@@ -486,8 +459,8 @@ func (d *qwpQueryDecoder) parseFullSchema(columnCount int) ([]qwpColumnSchemaInf
 			return nil, err
 		}
 		// Copy name: nameBytes aliases the payload, which becomes stale
-		// once the frame is recycled. Schema info is kept across frames
-		// via the registry, so we need an owned string.
+		// once the frame is recycled. Schema info is held in querySchema
+		// across the query's batches, so we need an owned string.
 		cols[i] = qwpColumnSchemaInfo{
 			name:     string(nameBytes),
 			wireType: qwpTypeCode(wireType),
@@ -1169,19 +1142,12 @@ func (d *qwpQueryDecoder) decodeCacheReset(payload []byte) (byte, error) {
 }
 
 // applyCacheReset drops the connection-scoped caches indicated by
-// mask (bitwise OR of qwpResetMaskDict and qwpResetMaskSchemas).
-// Invoked from the I/O dispatcher when the server emits a
-// CACHE_RESET frame: discards the SYMBOL dict and / or schema-
-// fingerprint cache so the next RESULT_BATCH's deltaStart and schema-
-// reference ids line up with the server's fresh counter. Bits the
-// server does not set are preserved — the server can reset the dict
-// without dropping schemas, or vice versa.
+// mask. Currently only qwpResetMaskDict is defined: it discards the
+// SYMBOL dict so the next RESULT_BATCH's deltaStart lines up with the
+// server's fresh counter. Bits the server does not set are preserved.
 func (d *qwpQueryDecoder) applyCacheReset(mask byte) {
 	if mask&qwpResetMaskDict != 0 {
 		d.dict.clear()
-	}
-	if mask&qwpResetMaskSchemas != 0 {
-		d.schemas.clear()
 	}
 }
 

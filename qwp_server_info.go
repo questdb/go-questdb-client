@@ -46,8 +46,9 @@ type QwpServerInfo struct {
 	// is primary at the current cluster epoch. 0 on releases without
 	// fencing wired up; treat as a hint.
 	Epoch uint64
-	// Capabilities is a reserved bitfield for future protocol
-	// extensions. v2 servers and clients set it to zero.
+	// Capabilities is the server capability bitfield from SERVER_INFO.
+	// The only bit currently defined is CAP_ZONE (qwpCapZone): when
+	// set, the frame carries a zone_id trailer after node_id.
 	Capabilities uint32
 	// ServerWallNs is the server wall-clock at the time SERVER_INFO was
 	// emitted, in nanoseconds since the Unix epoch.

@@ -248,13 +248,12 @@ type qwpLineSender struct {
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
 
-	// Schema IDs are intentionally NOT tracked on the cursor wire
-	// path. Every frame is self-sufficient (full schema mode, full
-	// symbol dict from id 0), so the schema_id varint in the table
-	// block is purely a wire-format formality — we always write 0.
-	// There is no per-connection schema registry on the client side,
-	// no schema-change detection, and no cap to enforce; the server
-	// reads the inline column definitions on every frame regardless.
+	// Schemas are intentionally NOT tracked on the cursor wire path.
+	// Every frame is self-sufficient: it carries the full inline column
+	// definitions and the full symbol dict from id 0. There is no
+	// per-connection schema registry on the client side and no
+	// schema-change detection; the server reads the inline column
+	// definitions on every frame regardless.
 
 	// Row state.
 	hasTable bool

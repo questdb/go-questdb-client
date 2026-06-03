@@ -195,7 +195,7 @@ func genValidBoundsMessage(t *testing.T, r *rand.Rand) []byte {
 		tb.commitRow()
 	}
 	var enc qwpEncoder
-	ingress := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+	ingress := enc.encodeTable(tb)
 	return wrapAsResultBatch(ingress, 1, 0)
 }
 

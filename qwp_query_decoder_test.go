@@ -58,6 +58,14 @@ func wrapAsResultBatch(ingress []byte, requestId int64, batchSeq uint64) []byte 
 	header := ingress[:qwpHeaderSize]
 	body := ingress[qwpHeaderSize:]
 
+	// A continuation RESULT_BATCH (batch_seq > 0) carries no col_count
+	// and no inline column schema — the decoder reuses the schema parsed
+	// from batch 0. The ingress encoder always writes them, so strip the
+	// schema section here to mirror a real continuation frame.
+	if batchSeq > 0 {
+		body = stripContinuationSchema(body)
+	}
+
 	var prelude bytes.Buffer
 	prelude.WriteByte(byte(qwpMsgKindResultBatch))
 	var reqBuf [8]byte
@@ -73,6 +81,54 @@ func wrapAsResultBatch(ingress []byte, requestId int64, batchSeq uint64) []byte 
 	out = append(out, body...)
 	// Patch payload length (offset 8..12).
 	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
+	return out
+}
+
+// stripContinuationSchema removes the col_count + inline column schema
+// from an ingress-encoded body (deltaDict followed by a table block),
+// leaving deltaDict + table_name + row_count + column data — the shape
+// a real continuation RESULT_BATCH (batch_seq > 0) carries on the wire.
+// The ingress encoder always emits the schema; this drops it so a
+// wrapped continuation frame matches what the server would actually
+// send for batch_seq > 0.
+func stripContinuationSchema(body []byte) []byte {
+	var r qwpByteReader
+	r.reset(body)
+	mustVarint := func(what string) int64 {
+		v, err := r.readVarintInt63()
+		if err != nil {
+			panic("stripContinuationSchema: " + what + ": " + err.Error())
+		}
+		return v
+	}
+	mustAdvance := func(n int, what string) {
+		if err := r.advance(n); err != nil {
+			panic("stripContinuationSchema: " + what + ": " + err.Error())
+		}
+	}
+	// Delta dict: deltaStart, deltaCount, then deltaCount strings.
+	mustVarint("deltaStart")
+	deltaCount := mustVarint("deltaCount")
+	for i := int64(0); i < deltaCount; i++ {
+		mustAdvance(int(mustVarint("dict string len")), "dict string")
+	}
+	// Table block prefix kept on every batch: table_name, row_count.
+	mustAdvance(int(mustVarint("table name len")), "table name")
+	mustVarint("row_count")
+	schemaStart := r.pos
+	// Schema section dropped on continuation batches: col_count, then
+	// per column a name (varint len + bytes) and a 1-byte type code.
+	colCount := mustVarint("col_count")
+	for i := int64(0); i < colCount; i++ {
+		mustAdvance(int(mustVarint("col name len")), "col name")
+		if _, err := r.readByte(); err != nil {
+			panic("stripContinuationSchema: type code: " + err.Error())
+		}
+	}
+	colDataStart := r.pos
+	out := make([]byte, 0, schemaStart+(len(body)-colDataStart))
+	out = append(out, body[:schemaStart]...)
+	out = append(out, body[colDataStart:]...)
 	return out
 }
 
@@ -106,7 +162,7 @@ func encodeSingleColumnBatch(
 		tb.commitRow()
 	}
 	var enc qwpEncoder
-	ingress := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+	ingress := enc.encodeTable(tb)
 	return wrapAsResultBatch(ingress, 1, 0)
 }
 
@@ -439,11 +495,6 @@ func patchSchemaTypeToDate(t *testing.T, ingress []byte, colName string) {
 		t.Fatalf("colCount varint: %v", err)
 	}
 	off += n
-	off++ // schema mode
-	if _, n, err = qwpReadVarint(ingress[off:]); err != nil {
-		t.Fatalf("schemaId varint: %v", err)
-	}
-	off += n // schema id
 	for i := 0; i < int(colCount); i++ {
 		cnLen, n, err := qwpReadVarint(ingress[off:])
 		if err != nil {
@@ -478,7 +529,7 @@ func TestQwpDecoderEgressDate(t *testing.T) {
 			tb.commitRow()
 		}
 		var enc qwpEncoder
-		ingress := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+		ingress := enc.encodeTable(tb)
 		patchSchemaTypeToDate(t, ingress, "d")
 		frame := wrapAsResultBatch(ingress, 1, 0)
 		dec := newTestQueryDecoder()
@@ -541,7 +592,7 @@ func TestQwpDecoderRoundTripTimestampUncompressed(t *testing.T) {
 	col.addLong(43)
 	tb.commitRow()
 	var enc qwpEncoder
-	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+	frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
 
 	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
@@ -576,7 +627,7 @@ func TestQwpDecoderRoundTripGeohash(t *testing.T) {
 				tb.commitRow()
 			}
 			var enc qwpEncoder
-			frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+			frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
 
 			dec := newTestQueryDecoder()
 			var batch QwpColumnBatch
@@ -653,7 +704,7 @@ func TestQwpDecoderRoundTripDecimal128(t *testing.T) {
 		}
 	}
 	var enc qwpEncoder
-	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+	frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
 
 	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
@@ -713,7 +764,7 @@ func TestQwpDecoderRoundTripDecimal256(t *testing.T) {
 		}
 	}
 	var enc qwpEncoder
-	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+	frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
 
 	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
@@ -754,7 +805,7 @@ func TestQwpDecoderRoundTripInt64Array(t *testing.T) {
 	tb.commitRow()
 
 	var enc qwpEncoder
-	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+	frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
 
 	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
@@ -796,7 +847,7 @@ func TestQwpDecoderRoundTripFloat64Array(t *testing.T) {
 	col.addDoubleArray(2, []int32{2, 3}, []float64{1, 2, 3, 4, 5, 6})
 	tb.commitRow()
 	var enc qwpEncoder
-	frame := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+	frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
 
 	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
@@ -834,7 +885,7 @@ func TestQwpDecoderRoundTripSymbolDelta(t *testing.T) {
 	var enc qwpEncoder
 	// maxSentId=-1 (no symbols sent), batchMaxId=2 → delta advertises
 	// ids 0..2.
-	ingress1 := enc.encodeTableWithDeltaDict(tb1, globalDict, -1, 2, qwpSchemaModeFull, 0)
+	ingress1 := enc.encodeTableWithDeltaDict(tb1, globalDict, -1, 2)
 	frame1 := wrapAsResultBatch(ingress1, 1, 0)
 
 	tb2 := newQwpTableBuffer("t")
@@ -843,8 +894,9 @@ func TestQwpDecoderRoundTripSymbolDelta(t *testing.T) {
 		col.addSymbolID(id)
 		tb2.commitRow()
 	}
-	// maxSentId=2, batchMaxId=3 → delta advertises id 3 only.
-	ingress2 := enc.encodeTableWithDeltaDict(tb2, globalDict, 2, 3, qwpSchemaModeReference, 0)
+	// maxSentId=2, batchMaxId=3 → delta advertises id 3 only. Batch 2 is
+	// a continuation (batch_seq=1): no inline schema, reuses batch 1's.
+	ingress2 := enc.encodeTableWithDeltaDict(tb2, globalDict, 2, 3)
 	frame2 := wrapAsResultBatch(ingress2, 1, 1)
 
 	dec := newTestQueryDecoder()
@@ -869,8 +921,10 @@ func TestQwpDecoderRoundTripSymbolDelta(t *testing.T) {
 	}
 }
 
-func TestQwpDecoderSchemaModeReference(t *testing.T) {
-	// Batch 1 registers schema id 7 (full). Batch 2 references it.
+func TestQwpDecoderContinuationReusesSchema(t *testing.T) {
+	// Batch 0 carries the inline schema. Batch 1 is a continuation
+	// (batch_seq=1) with no schema on the wire; the decoder must reuse
+	// the schema parsed from batch 0 to decode it.
 	tb1 := newQwpTableBuffer("t")
 	for _, v := range []int64{1, 2} {
 		col, _ := tb1.getOrCreateColumn("a", qwpTypeLong, false)
@@ -878,13 +932,13 @@ func TestQwpDecoderSchemaModeReference(t *testing.T) {
 		tb1.commitRow()
 	}
 	var enc qwpEncoder
-	frame1 := wrapAsResultBatch(enc.encodeTable(tb1, qwpSchemaModeFull, 7), 1, 0)
+	frame1 := wrapAsResultBatch(enc.encodeTable(tb1), 1, 0)
 
 	tb2 := newQwpTableBuffer("t")
 	col2, _ := tb2.getOrCreateColumn("a", qwpTypeLong, false)
 	col2.addLong(10)
 	tb2.commitRow()
-	frame2 := wrapAsResultBatch(enc.encodeTable(tb2, qwpSchemaModeReference, 7), 1, 1)
+	frame2 := wrapAsResultBatch(enc.encodeTable(tb2), 1, 1)
 
 	dec := newTestQueryDecoder()
 	var batch QwpColumnBatch
@@ -895,20 +949,36 @@ func TestQwpDecoderSchemaModeReference(t *testing.T) {
 		t.Fatalf("decode frame2: %v", err)
 	}
 	if batch.ColumnName(0) != "a" {
-		t.Fatalf("reference-mode batch lost column name: %q", batch.ColumnName(0))
+		t.Fatalf("continuation batch lost column name: %q", batch.ColumnName(0))
 	}
 	if got := batch.Int64(0, 0); got != 10 {
 		t.Fatalf("Int64[0] (frame2) = %d, want 10", got)
 	}
 }
 
+func TestQwpDecoderContinuationBeforeSchemaRejected(t *testing.T) {
+	// A continuation batch (batch_seq > 0) that arrives before any
+	// batch_seq==0 schema batch has no schema to reuse and must be
+	// rejected rather than misparsed.
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
+	col.addLong(10)
+	tb.commitRow()
+	var enc qwpEncoder
+	frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 1)
+
+	dec := newTestQueryDecoder()
+	var batch QwpColumnBatch
+	err := dec.decode(frame, &batch)
+	assertDecodeErrContains(t, err, "before its schema batch")
+}
+
 // --- Hardening tests (ports of QwpResultBatchDecoderHardeningTest) ---
 
 // writeMinimalResultBatch builds a minimal valid RESULT_BATCH frame
-// with 0 rows and 0 columns. The schemaId is written as a plain varint
-// from the given value. Matches QwpResultBatchDecoderHardeningTest.
+// with 0 rows and 0 columns. Matches QwpResultBatchDecoderHardeningTest.
 // writeMinimalResultBatch.
-func writeMinimalResultBatch(schemaId uint64) []byte {
+func writeMinimalResultBatch() []byte {
 	var buf bytes.Buffer
 	// Header
 	_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
@@ -924,31 +994,7 @@ func writeMinimalResultBatch(schemaId uint64) []byte {
 	putVarintBytes(&buf, 0)                                 // name_len
 	putVarintBytes(&buf, 0)                                 // row_count
 	putVarintBytes(&buf, 0)                                 // column_count
-	buf.WriteByte(byte(qwpSchemaModeFull))
-	putVarintBytes(&buf, schemaId)
 	// Patch payloadLength at offset 8.
-	out := buf.Bytes()
-	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
-	return out
-}
-
-// writeMinimalResultBatchWithRawSchemaIdVarint writes the fixed
-// prelude, then injects a raw varint byte sequence for the schema_id.
-func writeMinimalResultBatchWithRawSchemaIdVarint(schemaIdVarint []byte) []byte {
-	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
-	buf.WriteByte(qwpVersion)
-	buf.WriteByte(0)
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
-	buf.WriteByte(byte(qwpMsgKindResultBatch))
-	_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
-	putVarintBytes(&buf, 0)
-	putVarintBytes(&buf, 0)
-	putVarintBytes(&buf, 0)
-	putVarintBytes(&buf, 0)
-	buf.WriteByte(byte(qwpSchemaModeFull))
-	buf.Write(schemaIdVarint)
 	out := buf.Bytes()
 	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 	return out
@@ -991,8 +1037,6 @@ func writeStringResultBatchCustom(offsets []uint32, payload []byte) []byte {
 	putVarintBytes(&buf, 0)
 	putVarintBytes(&buf, uint64(nonNull))
 	putVarintBytes(&buf, 1)
-	buf.WriteByte(byte(qwpSchemaModeFull))
-	putVarintBytes(&buf, 0)
 	putVarintBytes(&buf, 1)
 	buf.WriteByte('s')
 	buf.WriteByte(byte(qwpTypeVarchar))
@@ -1024,8 +1068,6 @@ func writeStringResultBatch(nonNull int, totalBytes int32) []byte {
 	putVarintBytes(&buf, 0)                          // table_name_len
 	putVarintBytes(&buf, uint64(nonNull))            // row_count
 	putVarintBytes(&buf, 1)                          // column_count
-	buf.WriteByte(byte(qwpSchemaModeFull))
-	putVarintBytes(&buf, 0) // schema_id
 	// Schema: column "s" : VARCHAR (egress may send STRING 0x08 but
 	// the encoder-side tests use VARCHAR so the shared offsets+bytes
 	// layout is exercised).
@@ -1107,7 +1149,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// unrelated reason: name_len > qwpMaxTableNameLen). The point
 		// of this test is only to pin that the size guard does NOT
 		// reject a frame at exactly qwpMaxBatchSize bytes.
-		buf := writeMinimalResultBatch(0)
+		buf := writeMinimalResultBatch()
 		// Pad with arbitrary trailing bytes so len(buf) == qwpMaxBatchSize.
 		// The decoder rejects on a downstream check (specifically the
 		// table-name-length cap or end-of-frame mismatch), not on the
@@ -1131,7 +1173,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 	})
 
 	t.Run("H2_BadMagic", func(t *testing.T) {
-		buf := writeMinimalResultBatch(0)
+		buf := writeMinimalResultBatch()
 		buf[0] = 0xFF
 		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
@@ -1146,7 +1188,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// be rejected — including a value within the supported range
 		// (0x02), not just 0xFF.
 		for _, v := range []byte{0x02, 0xFF} {
-			buf := writeMinimalResultBatch(0)
+			buf := writeMinimalResultBatch()
 			buf[4] = v
 			dec := newTestQueryDecoder()
 			var b QwpColumnBatch
@@ -1174,7 +1216,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// treat it as a hint. writeMinimalResultBatch sets the field
 		// to 1; flip it to 0 and 5 to cover both directions.
 		for _, tc := range []uint16{0, 5} {
-			buf := writeMinimalResultBatch(0)
+			buf := writeMinimalResultBatch()
 			binary.LittleEndian.PutUint16(
 				buf[qwpHeaderOffsetTableCount:qwpHeaderOffsetTableCount+2], tc)
 			dec := newTestQueryDecoder()
@@ -1265,62 +1307,6 @@ func TestQwpDecoderHardening(t *testing.T) {
 		assertDecodeErrContains(t, err, "row_count")
 	})
 
-	t.Run("H11_HugeSchemaId", func(t *testing.T) {
-		buf := writeMinimalResultBatch(1_000_000_000)
-		dec := newTestQueryDecoder()
-		var b QwpColumnBatch
-		err := dec.decode(buf, &b)
-		assertDecodeErrContains(t, err, "schema_id")
-	})
-
-	t.Run("H12_NegativeSchemaIdVarint", func(t *testing.T) {
-		// 5-byte varint encoding 0x80000000 (Integer.MIN_VALUE after
-		// cast). Verbatim port of the Java regression.
-		buf := writeMinimalResultBatchWithRawSchemaIdVarint([]byte{
-			0x80, 0x80, 0x80, 0x80, 0x08,
-		})
-		dec := newTestQueryDecoder()
-		var b QwpColumnBatch
-		err := dec.decode(buf, &b)
-		assertDecodeErrContains(t, err, "schema_id")
-	})
-
-	t.Run("H13_ReferenceUnknownId", func(t *testing.T) {
-		var buf bytes.Buffer
-		_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
-		buf.WriteByte(qwpVersion)
-		buf.WriteByte(0)
-		_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
-		_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
-		buf.WriteByte(byte(qwpMsgKindResultBatch))
-		_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
-		putVarintBytes(&buf, 0) // batch_seq
-		putVarintBytes(&buf, 0) // name_len
-		putVarintBytes(&buf, 0) // row_count
-		putVarintBytes(&buf, 0) // column_count
-		buf.WriteByte(byte(qwpSchemaModeReference))
-		putVarintBytes(&buf, 42) // unknown id
-		out := buf.Bytes()
-		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
-		dec := newTestQueryDecoder()
-		var b QwpColumnBatch
-		err := dec.decode(out, &b)
-		assertDecodeErrContains(t, err, "not registered")
-	})
-
-	t.Run("H15_UnknownSchemaMode", func(t *testing.T) {
-		buf := writeMinimalResultBatch(0)
-		// Schema mode byte sits right after column_count = 0. Header
-		// (12) + msg_kind(1) + reqId(8) + batch_seq(1) + name_len(1)
-		// + row_count(1) + col_count(1) = 25 → offset 25 is the
-		// schema mode byte.
-		buf[qwpHeaderSize+1+8+1+1+1+1] = 0x42
-		dec := newTestQueryDecoder()
-		var b QwpColumnBatch
-		err := dec.decode(buf, &b)
-		assertDecodeErrContains(t, err, "unknown schema mode")
-	})
-
 	t.Run("H16_StringNegativeTotalBytes", func(t *testing.T) {
 		buf := writeStringResultBatch(1, -1)
 		dec := newTestQueryDecoder()
@@ -1384,8 +1370,6 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 0) // name_len
 		putVarintBytes(&buf, 1) // row_count = 1
 		putVarintBytes(&buf, 1) // col_count = 1
-		buf.WriteByte(byte(qwpSchemaModeFull))
-		putVarintBytes(&buf, 0)
 		putVarintBytes(&buf, 1)
 		buf.WriteByte('s')
 		buf.WriteByte(0x08) // STRING — unsupported
@@ -1405,7 +1389,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		// as "invalid zstd frame header". Same guarantee as the old
 		// "not yet supported" check: a malformed or mis-flagged batch
 		// cannot sneak past the decoder.
-		buf := writeMinimalResultBatch(0)
+		buf := writeMinimalResultBatch()
 		buf[qwpHeaderOffsetFlags] |= qwpFlagZstd
 		dec := newTestQueryDecoder()
 		defer dec.close()
@@ -1433,8 +1417,6 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 0)
 		putVarintBytes(&buf, 0)
 		putVarintBytes(&buf, 0)
-		buf.WriteByte(byte(qwpSchemaModeFull))
-		putVarintBytes(&buf, 0)
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
@@ -1459,8 +1441,6 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 0)
 		putVarintBytes(&buf, 2) // row_count = 2
 		putVarintBytes(&buf, 1)
-		buf.WriteByte(byte(qwpSchemaModeFull))
-		putVarintBytes(&buf, 0)
 		putVarintBytes(&buf, 1)
 		buf.WriteByte('t')
 		buf.WriteByte(byte(qwpTypeTimestamp))
@@ -1540,8 +1520,6 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 0) // table_name_len
 		putVarintBytes(&buf, 0) // row_count
 		putVarintBytes(&buf, 1) // col_count = 1
-		buf.WriteByte(byte(qwpSchemaModeFull))
-		putVarintBytes(&buf, 0)                             // schema_id
 		putVarintBytes(&buf, uint64(qwpMaxColumnNameLen)+1) // col name_len
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
@@ -1643,8 +1621,6 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 0) // table_name_len
 		putVarintBytes(&buf, 0) // row_count
 		putVarintBytes(&buf, 1) // col_count
-		buf.WriteByte(byte(qwpSchemaModeFull))
-		putVarintBytes(&buf, 0) // schema_id
 		putVarintBytes(&buf, 1) // col name_len
 		buf.WriteByte('g')
 		buf.WriteByte(byte(qwpTypeGeohash))
@@ -1676,8 +1652,6 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 0) // table_name_len
 		putVarintBytes(&buf, 0) // row_count
 		putVarintBytes(&buf, 1) // col_count
-		buf.WriteByte(byte(qwpSchemaModeFull))
-		putVarintBytes(&buf, 0) // schema_id
 		putVarintBytes(&buf, 1) // col name_len
 		buf.WriteByte('g')
 		buf.WriteByte(byte(qwpTypeGeohash))
@@ -1712,8 +1686,6 @@ func buildArrayHardeningFrame(t *testing.T, nDims int, shape []int32) []byte {
 	putVarintBytes(&buf, 0) // table_name_len
 	putVarintBytes(&buf, 1) // row_count = 1
 	putVarintBytes(&buf, 1) // col_count = 1
-	buf.WriteByte(byte(qwpSchemaModeFull))
-	putVarintBytes(&buf, 0) // schema_id
 	putVarintBytes(&buf, 1)
 	buf.WriteByte('a')
 	buf.WriteByte(byte(qwpTypeDoubleArray))
@@ -2112,15 +2084,15 @@ func buildCacheResetBody(mask byte) []byte {
 
 func TestQwpDecoderCacheReset(t *testing.T) {
 	t.Run("RoundTripMaskValues", func(t *testing.T) {
-		// Every reset_mask value the server can plausibly emit (the two
-		// defined bits in every combination, plus the zero reset). The
+		// The defined dict bit, a reserved bit (0x02, formerly the
+		// schemas bit), their combination, and the zero reset. The
 		// decoder surfaces the byte verbatim — the I/O layer is what
 		// maps bits to cache clears.
 		for _, mask := range []byte{
 			0x00,
 			qwpResetMaskDict,
-			qwpResetMaskSchemas,
-			qwpResetMaskDict | qwpResetMaskSchemas,
+			0x02,
+			qwpResetMaskDict | 0x02,
 		} {
 			frame := writeQwpFrame(0, buildCacheResetBody(mask))
 			dec := newTestQueryDecoder()
@@ -2188,10 +2160,11 @@ func TestQwpDecoderCacheReset(t *testing.T) {
 }
 
 func TestQwpDecoderApplyCacheReset(t *testing.T) {
-	// Decode a frame that populates both the connection dict (delta
-	// with three symbols) and the schema registry (one schema at id
-	// 3). Then exercise applyCacheReset with each mask combo and
-	// assert the correct subset was cleared.
+	// Decode a frame that populates the connection dict (delta with
+	// three symbols), then exercise applyCacheReset with each mask and
+	// assert the dict is cleared only when the dict bit is set. The
+	// schema is per-query (reset at query start), not a connection
+	// cache, so CACHE_RESET no longer touches it.
 	seedDecoder := func() qwpQueryDecoder {
 		globalDict := []string{"AAPL", "MSFT", "GOOG"}
 		tb := newQwpTableBuffer("t")
@@ -2201,7 +2174,7 @@ func TestQwpDecoderApplyCacheReset(t *testing.T) {
 			tb.commitRow()
 		}
 		var enc qwpEncoder
-		ingress := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 2, qwpSchemaModeFull, 3)
+		ingress := enc.encodeTableWithDeltaDict(tb, globalDict, -1, 2)
 		frame := wrapAsResultBatch(ingress, 1, 0)
 		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
@@ -2210,9 +2183,6 @@ func TestQwpDecoderApplyCacheReset(t *testing.T) {
 		}
 		if dec.dict.size() != 3 {
 			t.Fatalf("seed dict size = %d, want 3", dec.dict.size())
-		}
-		if _, ok := dec.schemas.get(3); !ok {
-			t.Fatalf("seed schemas missing id 3")
 		}
 		return dec
 	}
@@ -2223,54 +2193,28 @@ func TestQwpDecoderApplyCacheReset(t *testing.T) {
 		if dec.dict.size() != 3 {
 			t.Errorf("dict mutated by zero mask: size=%d", dec.dict.size())
 		}
-		if _, ok := dec.schemas.get(3); !ok {
-			t.Errorf("schemas mutated by zero mask")
-		}
 	})
 
-	t.Run("DictOnly", func(t *testing.T) {
+	t.Run("DictBitClearsDict", func(t *testing.T) {
 		dec := seedDecoder()
 		dec.applyCacheReset(qwpResetMaskDict)
 		if dec.dict.size() != 0 {
 			t.Errorf("dict not cleared: size=%d", dec.dict.size())
 		}
-		if _, ok := dec.schemas.get(3); !ok {
-			t.Errorf("schemas unexpectedly cleared by DictOnly")
-		}
-	})
-
-	t.Run("SchemasOnly", func(t *testing.T) {
-		dec := seedDecoder()
-		dec.applyCacheReset(qwpResetMaskSchemas)
-		if dec.dict.size() != 3 {
-			t.Errorf("dict unexpectedly cleared by SchemasOnly: size=%d", dec.dict.size())
-		}
-		if _, ok := dec.schemas.get(3); ok {
-			t.Errorf("schemas not cleared")
-		}
-	})
-
-	t.Run("Both", func(t *testing.T) {
-		dec := seedDecoder()
-		dec.applyCacheReset(qwpResetMaskDict | qwpResetMaskSchemas)
-		if dec.dict.size() != 0 {
-			t.Errorf("dict not cleared: size=%d", dec.dict.size())
-		}
-		if _, ok := dec.schemas.get(3); ok {
-			t.Errorf("schemas not cleared")
-		}
 	})
 
 	t.Run("UnknownBitsIgnored", func(t *testing.T) {
-		// 0xF0 touches none of the defined reset bits — both caches
-		// must be preserved for forward compat.
+		// 0xF0 touches none of the defined reset bits — the dict must be
+		// preserved for forward compat. 0x02 (formerly the schemas bit)
+		// is now reserved and likewise clears nothing.
 		dec := seedDecoder()
 		dec.applyCacheReset(0xF0)
 		if dec.dict.size() != 3 {
 			t.Errorf("dict cleared by unknown bits: size=%d", dec.dict.size())
 		}
-		if _, ok := dec.schemas.get(3); !ok {
-			t.Errorf("schemas cleared by unknown bits")
+		dec.applyCacheReset(0x02)
+		if dec.dict.size() != 3 {
+			t.Errorf("dict cleared by reserved bit 0x02: size=%d", dec.dict.size())
 		}
 	})
 }
@@ -2404,34 +2348,6 @@ func buildDeltaBytes(deltaStart int, entries []string) []byte {
 	return buf.Bytes()
 }
 
-func TestQwpSchemaRegistryClear(t *testing.T) {
-	var reg qwpSchemaRegistry
-	cols := []qwpColumnSchemaInfo{{name: "a", wireType: qwpTypeLong}}
-	reg.put(3, cols)
-	reg.put(5, cols)
-
-	// A live alias — simulates the user holding a QwpColumnBatch with
-	// columns that reference a registry slot. After clear, the alias
-	// must remain readable (Go's GC keeps the underlying slice alive
-	// via the alias); only the registry's lookup table is reset.
-	aliased, ok := reg.get(3)
-	if !ok {
-		t.Fatalf("precondition: registry missing id 3")
-	}
-
-	reg.clear()
-
-	if _, ok := reg.get(3); ok {
-		t.Errorf("cleared registry still returns id 3")
-	}
-	if _, ok := reg.get(5); ok {
-		t.Errorf("cleared registry still returns id 5")
-	}
-	if aliased[0].name != "a" {
-		t.Errorf("alias corrupted by clear: name=%q", aliased[0].name)
-	}
-}
-
 func assertDecodeErrContains(t *testing.T, err error, substr string) {
 	t.Helper()
 	if err == nil {
@@ -2557,8 +2473,8 @@ func TestQwpDecoderZstdHappyPath(t *testing.T) {
 		tb.commitRow()
 	}
 	var enc qwpEncoder
-	ingress := enc.encodeTable(tb, qwpSchemaModeFull, 0)
-	raw := wrapAsResultBatch(ingress, 42, 7)
+	ingress := enc.encodeTable(tb)
+	raw := wrapAsResultBatch(ingress, 42, 0)
 	compressed := compressResultBatchBody(t, raw)
 
 	if compressed[qwpHeaderOffsetFlags]&qwpFlagZstd == 0 {
@@ -2580,8 +2496,8 @@ func TestQwpDecoderZstdHappyPath(t *testing.T) {
 	if b.RequestId() != 42 {
 		t.Fatalf("RequestId = %d, want 42", b.RequestId())
 	}
-	if b.BatchSeq() != 7 {
-		t.Fatalf("BatchSeq = %d, want 7", b.BatchSeq())
+	if b.BatchSeq() != 0 {
+		t.Fatalf("BatchSeq = %d, want 0", b.BatchSeq())
 	}
 	if b.RowCount() != 4 {
 		t.Fatalf("RowCount = %d, want 4", b.RowCount())
@@ -2602,7 +2518,7 @@ func TestQwpDecoderZstdReusesScratchAcrossDecodes(t *testing.T) {
 	// on the decoder), so batch N+1's decompressed bytes must land in
 	// the same backing array as batch N — growing only if N+1 needs
 	// more capacity.
-	build := func(v int64, batchSeq uint64, mode qwpSchemaMode) []byte {
+	build := func(v int64, batchSeq uint64) []byte {
 		tb := newQwpTableBuffer("t")
 		col, err := tb.getOrCreateColumn("x", qwpTypeLong, false)
 		if err != nil {
@@ -2611,7 +2527,7 @@ func TestQwpDecoderZstdReusesScratchAcrossDecodes(t *testing.T) {
 		col.addLong(v)
 		tb.commitRow()
 		var enc qwpEncoder
-		ingress := enc.encodeTable(tb, mode, 0)
+		ingress := enc.encodeTable(tb)
 		raw := wrapAsResultBatch(ingress, 1, batchSeq)
 		return compressResultBatchBody(t, raw)
 	}
@@ -2620,7 +2536,8 @@ func TestQwpDecoderZstdReusesScratchAcrossDecodes(t *testing.T) {
 	defer dec.close()
 	var b QwpColumnBatch
 
-	if err := dec.decode(build(111, 0, qwpSchemaModeFull), &b); err != nil {
+	// Batch 0 carries the schema; the decoder holds it for the query.
+	if err := dec.decode(build(111, 0), &b); err != nil {
 		t.Fatalf("first decode: %v", err)
 	}
 	if got := b.Int64(0, 0); got != 111 {
@@ -2628,7 +2545,8 @@ func TestQwpDecoderZstdReusesScratchAcrossDecodes(t *testing.T) {
 	}
 	scratchCap0 := cap(b.zstdScratch)
 
-	if err := dec.decode(build(222, 1, qwpSchemaModeReference), &b); err != nil {
+	// Batch 1 is a continuation (no inline schema); it reuses batch 0's.
+	if err := dec.decode(build(222, 1), &b); err != nil {
 		t.Fatalf("second decode: %v", err)
 	}
 	if got := b.Int64(0, 0); got != 222 {
@@ -2654,7 +2572,7 @@ func TestQwpDecoderZstdHardening(t *testing.T) {
 	col.addLong(99)
 	tb.commitRow()
 	var enc qwpEncoder
-	baseRaw := wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), 1, 0)
+	baseRaw := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
 
 	t.Run("InvalidZstdFrame", func(t *testing.T) {
 		// FLAG_ZSTD set but the body is plain (uncompressed) bytes —
@@ -2817,7 +2735,7 @@ func TestQwpColumnBatchCopyAllZstdSurvivesPoolReuse(t *testing.T) {
 	// later frame. Without the clone + alias-translation branch in
 	// CopyAll, the snapshot's byte-aliasing slices would drift onto
 	// garbage bytes.
-	buildStrings := func(values []string, batchSeq uint64, mode qwpSchemaMode) []byte {
+	buildStrings := func(values []string, batchSeq uint64) []byte {
 		tb := newQwpTableBuffer("t")
 		for _, v := range values {
 			col, err := tb.getOrCreateColumn("s", qwpTypeVarchar, false)
@@ -2828,7 +2746,7 @@ func TestQwpColumnBatchCopyAllZstdSurvivesPoolReuse(t *testing.T) {
 			tb.commitRow()
 		}
 		var enc qwpEncoder
-		ingress := enc.encodeTable(tb, mode, 0)
+		ingress := enc.encodeTable(tb)
 		raw := wrapAsResultBatch(ingress, 1, batchSeq)
 		return compressResultBatchBody(t, raw)
 	}
@@ -2836,7 +2754,7 @@ func TestQwpColumnBatchCopyAllZstdSurvivesPoolReuse(t *testing.T) {
 	dec := newTestQueryDecoder()
 	defer dec.close()
 	var b QwpColumnBatch
-	if err := dec.decode(buildStrings([]string{"hello", "world"}, 0, qwpSchemaModeFull), &b); err != nil {
+	if err := dec.decode(buildStrings([]string{"hello", "world"}, 0), &b); err != nil {
 		t.Fatalf("first decode: %v", err)
 	}
 	snap := b.CopyAll()
@@ -2844,10 +2762,11 @@ func TestQwpColumnBatchCopyAllZstdSurvivesPoolReuse(t *testing.T) {
 		t.Fatalf("snap[0] = %q, want %q", got, "hello")
 	}
 
-	// Decode a second batch into the SAME b. The decoder reuses
-	// b.zstdScratch — without the deep-clone in CopyAll the snapshot
-	// would now see the second batch's bytes.
-	if err := dec.decode(buildStrings([]string{"x", "y"}, 1, qwpSchemaModeReference), &b); err != nil {
+	// Decode a second batch (a continuation, reusing batch 0's schema)
+	// into the SAME b. The decoder reuses b.zstdScratch — without the
+	// deep-clone in CopyAll the snapshot would now see the second
+	// batch's bytes.
+	if err := dec.decode(buildStrings([]string{"x", "y"}, 1), &b); err != nil {
 		t.Fatalf("second decode: %v", err)
 	}
 	if got := snap.String(0, 0); got != "hello" {

@@ -1434,15 +1434,13 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,
-		// Ingress pins to v1 (wire-ingress.md §3, §15.5): the v2 bump
-		// is egress-only, ingress never reads SERVER_INFO, and the
-		// encoder stamps v1 frames. Advertising v2 here would be a
-		// spec violation masked only by the server clamping ingest
-		// negotiation to v1. serverInfoTimeout is left zero so the
-		// transport never attempts a SERVER_INFO read on ingest; the
-		// SF round-walk degrades target=/zone= to the wire-v1 rule
-		// (target≠any → TopologyReject) in qwp_sf_round_walk.go.
-		maxVersion: qwpMaxSupportedIngestVersion,
+		// QWP has a single protocol version; advertise it.
+		// serverInfoTimeout is left zero so the transport never
+		// attempts a SERVER_INFO read on ingest (ingest senders do not
+		// consume SERVER_INFO, per wire-ingress.md §3, §15.5); the SF
+		// round-walk therefore degrades target=/zone= to the topology
+		// rule (target != any -> TopologyReject) in qwp_sf_round_walk.go.
+		maxVersion: qwpVersion,
 	}
 	// QWP auth: Basic (username:password) or Bearer (token).
 	// Matches the Java client's buildWebSocketAuthHeader().

@@ -118,7 +118,7 @@ func newMockCluster(t *testing.T, n int, tag func(idx int) (role byte, nodeId, c
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
-			w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpMaxSupportedVersion))
+			w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpVersion))
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				t.Logf("mock node %d: accept: %v", idx, err)
@@ -132,19 +132,19 @@ func newMockCluster(t *testing.T, n int, tag func(idx int) (role byte, nodeId, c
 				<-r.Context().Done()
 				return
 			}
-			frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+			frame := buildServerInfoFrame(qwpVersion, 0,
 				mn.role, uint64(idx+1), 0, time.Now().UnixNano(),
 				mn.clusterId, mn.nodeId)
 			if err := conn.Write(r.Context(), websocket.MessageBinary, frame); err != nil {
 				t.Logf("mock node %d: SERVER_INFO write: %v", idx, err)
 				return
 			}
-			// Stamp v2 on every frame the mock writes — the cluster
-			// advertises qwpMaxSupportedVersion in X-QWP-Version
-			// (see above), and the decoder's strict-equality version
-			// check rejects frames whose header version byte does not
-			// match the negotiated version.
-			mc := &qwpMockEgressConn{t: t, conn: conn, version: qwpMaxSupportedVersion}
+			// Stamp the negotiated version on every frame the mock
+			// writes — the cluster advertises qwpVersion in
+			// X-QWP-Version (see above), and the decoder's
+			// strict-equality version check rejects frames whose header
+			// version byte does not match the negotiated version.
+			mc := &qwpMockEgressConn{t: t, conn: conn, version: qwpVersion}
 			if handler != nil {
 				handler(idx, mc)
 			} else {
@@ -334,77 +334,12 @@ func TestQwpClientInitialConnectProbesEachEndpointOnce(t *testing.T) {
 	}
 }
 
-// TestQwpClientV1MismatchSurfacesSawV1MismatchFlag verifies that when
-// every endpoint negotiates QWP v1 (no SERVER_INFO frame) and the
-// caller asks for target=primary, the typed error reports
-// SawV1Mismatch=true with a LastObserved=nil. Without this flag the
-// caller cannot distinguish "you pointed me at an OSS / v1 cluster"
-// from "all endpoints unreachable".
-func TestQwpClientV1MismatchSurfacesSawV1MismatchFlag(t *testing.T) {
-	// Two v1-only endpoints: each echoes X-QWP-Version=1 on upgrade
-	// and never emits a SERVER_INFO frame, mirroring an OSS server.
-	v1Server := func() *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set(qwpHeaderVersion, "1")
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				return
-			}
-			defer conn.CloseNow()
-			for {
-				if _, _, err := conn.Read(r.Context()); err != nil {
-					return
-				}
-			}
-		}))
-	}
-	srvA := v1Server()
-	defer srvA.Close()
-	srvB := v1Server()
-	defer srvB.Close()
-	addrList := strings.TrimPrefix(srvA.URL, "http://") + "," +
-		strings.TrimPrefix(srvB.URL, "http://")
-
-	cfg := qwpQueryDefaultConfig()
-	eps, err := parseEndpointList(addrList, qwpDefaultPort)
-	if err != nil {
-		t.Fatalf("parseEndpointList: %v", err)
-	}
-	cfg.endpoints = eps
-	cfg.target = qwpTargetPrimary
-	cfg.serverInfoTimeout = 500 * time.Millisecond
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, err = newQwpQueryClient(ctx, cfg)
-	if err == nil {
-		t.Fatal("expected QwpRoleMismatchError")
-	}
-	var rme *QwpRoleMismatchError
-	if !errors.As(err, &rme) {
-		t.Fatalf("err = %v (%T), want *QwpRoleMismatchError", err, err)
-	}
-	if !rme.SawV1Mismatch {
-		t.Errorf("SawV1Mismatch = false, want true")
-	}
-	if rme.LastObserved != nil {
-		t.Errorf("LastObserved = %+v, want nil (no v2 endpoint reported a role)",
-			rme.LastObserved)
-	}
-	if rme.Target != "primary" {
-		t.Errorf("Target = %q, want primary", rme.Target)
-	}
-	if !strings.Contains(rme.Error(), "negotiated v1") {
-		t.Errorf("Error string %q missing v1 hint", rme.Error())
-	}
-}
-
 // TestQwpClientRoleMismatchPreservesTransportError verifies that when
-// the connect walk encounters a mix of transport failures and other
-// non-matching outcomes (e.g. v1 endpoints) under target=primary, the
-// returned QwpRoleMismatchError carries both the v1 flag and the last
-// underlying transport error so callers can tell network problems from
-// pure role mismatch and reach the dial error via errors.As / Unwrap.
+// the connect walk encounters a mix of transport failures and role
+// mismatches under target=primary, the returned QwpRoleMismatchError
+// carries both the last observed SERVER_INFO and the last underlying
+// transport error so callers can tell network problems from pure role
+// mismatch and reach the dial error via errors.As / Unwrap.
 func TestQwpClientRoleMismatchPreservesTransportError(t *testing.T) {
 	// Endpoint A: refuses the WebSocket upgrade with 503 — generates a
 	// transport-level dial error.
@@ -412,25 +347,31 @@ func TestQwpClientRoleMismatchPreservesTransportError(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srvFail.Close()
-	// Endpoint B: negotiates QWP v1 — accepted at the transport layer
-	// but skipped by the role filter because v1 has no SERVER_INFO.
-	srvV1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(qwpHeaderVersion, "1")
+	// Endpoint B: a healthy REPLICA — accepted at the transport layer
+	// but rejected by the target=primary filter, so it lands as a role
+	// mismatch with an observed SERVER_INFO.
+	srvReplica := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpVersion))
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer conn.CloseNow()
+		info := buildServerInfoFrame(qwpVersion, 0, qwpRoleReplica,
+			1, 0, time.Now().UnixNano(), "test-cluster", "node-replica")
+		if err := conn.Write(r.Context(), websocket.MessageBinary, info); err != nil {
+			return
+		}
 		for {
 			if _, _, err := conn.Read(r.Context()); err != nil {
 				return
 			}
 		}
 	}))
-	defer srvV1.Close()
+	defer srvReplica.Close()
 
 	addrList := strings.TrimPrefix(srvFail.URL, "http://") + "," +
-		strings.TrimPrefix(srvV1.URL, "http://")
+		strings.TrimPrefix(srvReplica.URL, "http://")
 	cfg := qwpQueryDefaultConfig()
 	eps, err := parseEndpointList(addrList, qwpDefaultPort)
 	if err != nil {
@@ -450,8 +391,9 @@ func TestQwpClientRoleMismatchPreservesTransportError(t *testing.T) {
 	if !errors.As(err, &rme) {
 		t.Fatalf("err = %v (%T), want *QwpRoleMismatchError", err, err)
 	}
-	if !rme.SawV1Mismatch {
-		t.Errorf("SawV1Mismatch = false, want true (v1 endpoint was visited)")
+	if rme.LastObserved == nil || rme.LastObserved.Role != qwpRoleReplica {
+		t.Errorf("LastObserved = %+v, want the REPLICA endpoint's SERVER_INFO",
+			rme.LastObserved)
 	}
 	if rme.LastTransportError == nil {
 		t.Fatal("LastTransportError = nil, want the dial failure from the 503 endpoint")
@@ -461,9 +403,6 @@ func TestQwpClientRoleMismatchPreservesTransportError(t *testing.T) {
 	}
 	if !strings.Contains(rme.Error(), "last transport error") {
 		t.Errorf("Error string %q missing transport-error hint", rme.Error())
-	}
-	if !strings.Contains(rme.Error(), "negotiated v1") {
-		t.Errorf("Error string %q missing v1 hint", rme.Error())
 	}
 }
 
@@ -1405,7 +1344,7 @@ func TestQwpComputeBackoffFullJitter(t *testing.T) {
 }
 
 // gatedQwpServer stands up an httptest WebSocket server that negotiates
-// qwpMaxSupportedVersion and emits SERVER_INFO only after `release` is
+// qwpVersion and emits SERVER_INFO only after `release` is
 // closed. onReached is closed (once) the moment a connection has been
 // upgraded and is parked waiting for the gate — i.e. the client is now
 // blocked inside transport.connect()'s SERVER_INFO read, which (on the
@@ -1419,7 +1358,7 @@ func gatedQwpServer(t *testing.T, nodeId string, release <-chan struct{},
 	onReached, onClosed *sync.Once, reached, closed chan struct{}) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpMaxSupportedVersion))
+		w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpVersion))
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1431,7 +1370,7 @@ func gatedQwpServer(t *testing.T, nodeId string, release <-chan struct{},
 		case <-r.Context().Done():
 			return
 		}
-		info := buildServerInfoFrame(qwpMaxSupportedVersion, 0, qwpRolePrimary,
+		info := buildServerInfoFrame(qwpVersion, 0, qwpRolePrimary,
 			2, 0, time.Now().UnixNano(), "test-cluster", nodeId)
 		if err := conn.Write(r.Context(), websocket.MessageBinary, info); err != nil {
 			onClosed.Do(func() { close(closed) })
@@ -1451,7 +1390,7 @@ func gatedQwpServer(t *testing.T, nodeId string, release <-chan struct{},
 			}
 			reqId := int64(binary.LittleEndian.Uint64(frame[1:9]))
 			end := writeQwpFrame(0, buildResultEndBody(reqId, 0, 0))
-			end[4] = qwpMaxSupportedVersion // match negotiated version
+			end[4] = qwpVersion // match negotiated version
 			if err := conn.Write(r.Context(), websocket.MessageBinary, end); err != nil {
 				onClosed.Do(func() { close(closed) })
 				return
@@ -1484,16 +1423,16 @@ func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
 		bReachedOnce, bClosed1 sync.Once
 	)
 
-	// Node A: v2 SERVER_INFO, read the QUERY_REQUEST, then drop the
+	// Node A: emits SERVER_INFO, reads the QUERY_REQUEST, then drops the
 	// socket to simulate a transport-terminal fault and trigger failover.
 	nodeA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpMaxSupportedVersion))
+		w.Header().Set(qwpHeaderVersion, fmt.Sprintf("%d", qwpVersion))
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer conn.CloseNow()
-		info := buildServerInfoFrame(qwpMaxSupportedVersion, 0, qwpRolePrimary,
+		info := buildServerInfoFrame(qwpVersion, 0, qwpRolePrimary,
 			1, 0, time.Now().UnixNano(), "test-cluster", "node-a")
 		if err := conn.Write(r.Context(), websocket.MessageBinary, info); err != nil {
 			return

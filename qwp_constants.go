@@ -84,17 +84,18 @@ const (
 	// qwpResetMask* below) whose bits tell the client which caches to
 	// discard. Sent between queries when a cache reaches the server's
 	// configured soft cap; after applying, the next RESULT_BATCH's
-	// delta-dict deltaStart and schema-reference ids are expected to
-	// line up with a fresh server counter. Does not surface to users.
+	// delta-dict deltaStart is expected to line up with a fresh server
+	// counter. Does not surface to users.
 	qwpMsgKindCacheReset qwpMsgKind = 0x17
 	// qwpMsgKindServerInfo is the unsolicited server → client frame
-	// delivered as the first WebSocket frame after a v2 upgrade. Body
-	// (little-endian, after the 12-byte QWP header):
+	// the server emits as the first WebSocket frame after the upgrade,
+	// before any client request. Body (little-endian, after the
+	// 12-byte QWP header):
 	// role(u8) + epoch(u64) + capabilities(u32) + server_wall_ns(i64)
-	// + cluster_id(u16_len + utf8) + node_id(u16_len + utf8). v1
-	// servers omit the frame entirely. The byte 0x18 is also bound to
-	// qwpTypeIPv4 in the qwpTypeCode enum; no collision since the two
-	// are distinct types.
+	// + cluster_id(u16_len + utf8) + node_id(u16_len + utf8). The
+	// server always emits it post-upgrade; ingest senders simply do
+	// not read it. The byte 0x18 is also bound to qwpTypeIPv4 in the
+	// qwpTypeCode enum; no collision since the two are distinct types.
 	qwpMsgKindServerInfo qwpMsgKind = 0x18
 )
 
@@ -124,25 +125,21 @@ const (
 	// applying, the next RESULT_BATCH's delta section must start at
 	// deltaStart=0 — i.e. the server has also reset its dict to empty.
 	qwpResetMaskDict byte = 0x01
-	// qwpResetMaskSchemas clears the schema-fingerprint cache. After
-	// applying, the next RESULT_BATCH must ship its schema in full
-	// mode (not reference mode) with a fresh id.
-	qwpResetMaskSchemas byte = 0x02
 )
 
 // qwpMagic is the 4-byte magic at the start of every QWP message.
 // Stored as a uint32 in little-endian byte order: "QWP1".
 const qwpMagic uint32 = 0x31505751
 
-// qwpVersion is the version byte stamped into the 12-byte QWP header
-// of every ingest frame this client encodes. Held at v1 so the
-// encoded ingest stream stays compatible with both v1 and v2 QuestDB
-// servers (v2 servers accept v1-stamped ingest frames as a subset of
-// their wire protocol). The handshake max-version we advertise is
-// qwpMaxSupportedVersion, which may exceed qwpVersion to opt the
-// connection into v2 server-side features (SERVER_INFO frame, multi-
-// endpoint routing, transparent failover) without changing the encoded
-// frame format.
+// qwpVersion is the sole QWP protocol version. It is stamped into the
+// 12-byte header of every frame this client encodes and advertised
+// verbatim in the X-QWP-Max-Version handshake header on both the
+// ingest and egress paths. The server echoes min(server_max,
+// client_max) back as X-QWP-Version; decoders then enforce strict
+// equality between every server frame's header version byte and the
+// negotiated version (spec §3). The negotiation mechanism is retained
+// so a future version bump has somewhere to grow, but today exactly
+// one version exists.
 const qwpVersion byte = 0x01
 
 // qwpCapZone is the CAP_ZONE bit in SERVER_INFO.capabilities. When
@@ -153,36 +150,6 @@ const qwpVersion byte = 0x01
 // PickNext treats as a middle-priority bucket between Same and
 // Other.
 const qwpCapZone uint32 = 1 << 0
-
-// qwpMaxSupportedVersion is the highest QWP protocol version this
-// client will negotiate on the egress (query) path. Advertised in the
-// X-QWP-Max-Version handshake header; the server echoes
-// min(server_max, client_max) back as X-QWP-Version. v2 enables the
-// server to emit SERVER_INFO and the v2-only egress features (target
-// filter, transparent failover). Once the handshake settles, decoders
-// enforce strict equality between every server frame's header version
-// byte and the negotiated version (spec §3) — this constant only caps
-// what we will agree to negotiate to, not what we will accept on a
-// live connection.
-//
-// The ingest path uses qwpMaxSupportedIngestVersion instead: the v2
-// bump is egress-only and ingress is pinned to v1 by spec.
-const qwpMaxSupportedVersion byte = 0x02
-
-// qwpMaxSupportedIngestVersion is the highest QWP version the ingest
-// path advertises in X-QWP-Max-Version. Pinned to v1, mirroring the
-// Java reference's MAX_SUPPORTED_INGEST_VERSION: the v2 bump only adds
-// the egress-side SERVER_INFO control frame, and wire-ingress.md §3
-// fixes ingress at v1 ("Ingress clients do NOT read SERVER_INFO,
-// ignore zone advertising"). Advertising v2 here would be a spec
-// violation that is currently masked only because the server clamps
-// ingest negotiation to v1 (QwpWebSocketUpgradeProcessor: negotiated =
-// min(clientMax, MAX_SUPPORTED_INGEST_VERSION)); a server that bumps
-// its ingest ceiling would then negotiate v2 while our encoder still
-// stamps v1, and spec §3 requires it to reject every frame with
-// PARSE_ERROR. Ingress role/zone routing degrades to the wire-v1 rule
-// (target≠any → TopologyReject) in qwp_sf_round_walk.go.
-const qwpMaxSupportedIngestVersion byte = qwpVersion
 
 // QWP message header layout.
 const (
@@ -197,14 +164,6 @@ const (
 	qwpFlagGorilla         byte = 0x04 // Gorilla timestamp encoding
 	qwpFlagDeltaSymbolDict byte = 0x08 // delta symbol dictionary
 	qwpFlagZstd            byte = 0x10 // payload after prelude is zstd-compressed (egress only)
-)
-
-// qwpSchemaMode values control how column schema is transmitted.
-type qwpSchemaMode byte
-
-const (
-	qwpSchemaModeFull      qwpSchemaMode = 0x00 // full column definitions
-	qwpSchemaModeReference qwpSchemaMode = 0x01 // reference a schema already registered by ID
 )
 
 // QwpStatusCode represents a server response status. The byte value is
@@ -266,19 +225,6 @@ const (
 	// that may be outstanding (unacked) in async mode.
 	// Java: QwpWebSocketSender.DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128.
 	qwpDefaultInFlightWindow = 128
-
-	// qwpEgressMaxSchemaId is the upper bound the egress decoder
-	// enforces on schema_id values arriving from the server. Result-
-	// batch frames carry full and reference-mode table blocks; the
-	// reference-mode lookup keys into a per-connection schema
-	// registry, and the decoder rejects schema_id values >= this
-	// bound to avoid runaway map growth on hostile or buggy server
-	// frames. Matches the QWP spec's per-connection schema-id limit
-	// (65535) and Java's DEFAULT_MAX_SCHEMAS_PER_CONNECTION. Ingest
-	// senders no longer have a configurable cap — the cursor encoder
-	// writes schema_id=0 on every full-mode frame and never grows
-	// any client-side schema accumulator.
-	qwpEgressMaxSchemaId = 65_535
 
 	// qwpDefaultMicrobatchBufSize is the per-encoder microbatch buffer
 	// size used to coalesce rows before a WebSocket frame is sent.

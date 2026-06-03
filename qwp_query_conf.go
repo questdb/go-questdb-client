@@ -133,10 +133,9 @@ type qwpQueryClientConfig struct {
 	// DEFAULT_FAILOVER_MAX_DURATION_MS.
 	failoverMaxDuration time.Duration
 	// serverInfoTimeout bounds the synchronous read of SERVER_INFO
-	// after each upgrade. Egress always advertises maxVersion=v2 in
-	// the handshake, so a v2 server will emit SERVER_INFO and the
-	// drain is mandatory; must be > 0. Default
-	// qwpDefaultServerInfoTimeout.
+	// after each upgrade. The server always emits SERVER_INFO as the
+	// first post-upgrade frame, so the drain is mandatory on egress;
+	// must be > 0. Default qwpDefaultServerInfoTimeout.
 	serverInfoTimeout time.Duration
 	// replayExec opts Exec into transparent replay on transport-
 	// terminal failures. Default false — non-idempotent statements

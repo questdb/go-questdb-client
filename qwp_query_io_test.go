@@ -54,11 +54,11 @@ import (
 // claims to have negotiated in X-QWP-Version. sendBinary rewrites the
 // header version byte of every frame to this value before writing —
 // the shared frame builders (writeQwpFrame, buildOneRowInt64Batch)
-// stamp v1 unconditionally, but the strict-equality check in
+// stamp qwpVersion unconditionally, but the strict-equality check in
 // qwpQueryDecoder.parseFrameHeader requires server frames to match
-// the negotiated version. Tests that negotiate v1 (the default) leave
-// version=0 to skip the rewrite; v2 cluster mocks set it to
-// qwpMaxSupportedVersion.
+// the negotiated version. Tests leave version=0 to skip the rewrite
+// (frames are already stamped qwpVersion); cluster mocks that stamp
+// frames explicitly set it to qwpVersion.
 type qwpMockEgressConn struct {
 	t       *testing.T
 	conn    *websocket.Conn
@@ -108,16 +108,31 @@ func newQwpMockEgressServer(t *testing.T, handler func(*qwpMockEgressConn)) *htt
 			return
 		}
 		defer conn.CloseNow()
+		// The real server emits SERVER_INFO as the first post-upgrade
+		// frame and the egress client reads it during connect (both
+		// connectEgress and NewQwpQueryClient set serverInfoTimeout > 0).
+		// Mirror that here so connect() does not block waiting for it.
+		info := buildServerInfoFrame(qwpVersion, 0, qwpRolePrimary, 1, 0,
+			1_700_000_000_000_000_000, "test-cluster", "mock-node")
+		if err := conn.Write(r.Context(), websocket.MessageBinary, info); err != nil {
+			t.Logf("mock: SERVER_INFO write: %v", err)
+			return
+		}
 		handler(&qwpMockEgressConn{t: t, conn: conn})
 	}))
 }
 
-// connectEgress dials the mock server with qwpReadPath.
+// connectEgress dials the mock server with qwpReadPath. It sets a
+// SERVER_INFO read timeout so the transport consumes the frame the mock
+// emits post-upgrade, matching the production egress connect path.
 func connectEgress(t *testing.T, url string) *qwpTransport {
 	t.Helper()
 	var tr qwpTransport
 	wsURL := "ws" + strings.TrimPrefix(url, "http")
-	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpReadPath}); err != nil {
+	if err := tr.connect(context.Background(), wsURL, qwpTransportOpts{
+		endpointPath:      qwpReadPath,
+		serverInfoTimeout: 2 * time.Second,
+	}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	return &tr
@@ -138,7 +153,7 @@ func buildOneRowInt64Batch(t *testing.T, requestId int64, batchSeq uint64, colNa
 	col.addLong(val)
 	tb.commitRow()
 	var enc qwpEncoder
-	return wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), requestId, batchSeq)
+	return wrapAsResultBatch(enc.encodeTable(tb), requestId, batchSeq)
 }
 
 // buildOneRowVarcharBatch produces a RESULT_BATCH frame with a single
@@ -155,7 +170,7 @@ func buildOneRowVarcharBatch(t *testing.T, requestId int64, batchSeq uint64, col
 	col.addString(val)
 	tb.commitRow()
 	var enc qwpEncoder
-	return wrapAsResultBatch(enc.encodeTable(tb, qwpSchemaModeFull, 0), requestId, batchSeq)
+	return wrapAsResultBatch(enc.encodeTable(tb), requestId, batchSeq)
 }
 
 // --- Parsers for frames sent by the client to the mock server ---
@@ -707,21 +722,19 @@ func TestQwpEgressIOUnknownMsgKind(t *testing.T) {
 
 // TestQwpEgressIOCacheResetBetweenQueries drives the server-emitted
 // CACHE_RESET path end-to-end: query 1's response seeds the
-// connection-scoped SYMBOL dict and schema registry; the server then
-// emits CACHE_RESET with mask=DICT|SCHEMAS; query 2 runs afterwards.
-// Validates three invariants:
+// connection-scoped SYMBOL dict; the server then emits CACHE_RESET
+// with mask=DICT; query 2 runs afterwards. Validates three invariants:
 //   - the dispatcher does not surface CACHE_RESET to the user (the
 //     event stream is {Batch, End} for Q1 and {ExecDone} for Q2);
-//   - the decoder's dict and schema registry are both cleared by the
-//     time Q2's terminal event is delivered;
+//   - the decoder's dict is cleared by the time Q2's terminal event
+//     is delivered;
 //   - nothing about Q2's normal completion is disturbed.
 func TestQwpEgressIOCacheResetBetweenQueries(t *testing.T) {
 	const q1ReqID = int64(11)
 	const q2ReqID = int64(12)
 
 	// Build Q1's RESULT_BATCH with a SYMBOL column so the delta dict
-	// section feeds qwpConnDict.entries. schemaId=10 in full mode
-	// registers a schema in the decoder's registry.
+	// section feeds qwpConnDict.entries.
 	globalDict := []string{"AAPL", "MSFT"}
 	tb := newQwpTableBuffer("t")
 	col, err := tb.getOrCreateColumn("s", qwpTypeSymbol, false)
@@ -734,7 +747,7 @@ func TestQwpEgressIOCacheResetBetweenQueries(t *testing.T) {
 	tb.commitRow()
 	var enc qwpEncoder
 	q1Batch := wrapAsResultBatch(
-		enc.encodeTableWithDeltaDict(tb, globalDict, -1, 1, qwpSchemaModeFull, 10),
+		enc.encodeTableWithDeltaDict(tb, globalDict, -1, 1),
 		q1ReqID, 0)
 
 	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
@@ -745,7 +758,7 @@ func TestQwpEgressIOCacheResetBetweenQueries(t *testing.T) {
 		m.readBinary(ctx)
 		m.sendBinary(ctx, q1Batch)
 		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(q1ReqID, 0, 2)))
-		m.sendBinary(ctx, writeQwpFrame(0, buildCacheResetBody(qwpResetMaskDict|qwpResetMaskSchemas)))
+		m.sendBinary(ctx, writeQwpFrame(0, buildCacheResetBody(qwpResetMaskDict)))
 
 		// Query 2: a plain EXEC_DONE. If the dispatcher were to leak
 		// CACHE_RESET as an event, the test's event sequence would pick
@@ -802,9 +815,6 @@ func TestQwpEgressIOCacheResetBetweenQueries(t *testing.T) {
 
 	if io.decoder.dict.size() != 0 {
 		t.Errorf("dict not cleared after CACHE_RESET: size=%d", io.decoder.dict.size())
-	}
-	if _, ok := io.decoder.schemas.get(10); ok {
-		t.Errorf("schema id 10 not cleared after CACHE_RESET")
 	}
 }
 

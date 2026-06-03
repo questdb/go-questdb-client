@@ -300,7 +300,7 @@ type qwpEgressIO struct {
 	// decoder/framing desync, or unknown msg_kind. Once set, every
 	// subsequent submitQuery returns this error synchronously so a
 	// fresh query is never decoded against a desynced
-	// qwpConnDict / qwpSchemaRegistry / zstd stream — an undetectable
+	// qwpConnDict / zstd stream — an undetectable
 	// subset of out-of-range reads could leave the dict accidentally
 	// in sync with the server (offsets match) while values are wrong,
 	// producing silently corrupted results — and never sent on a dead
@@ -669,6 +669,11 @@ func (io *qwpEgressIO) dispatcherRun() {
 		io.currentRequestId = req.requestId
 		io.creditEnabled = req.initialCredit > 0
 		io.currentQueryDone = false
+		// Drop any schema held for a prior query. The egress schema
+		// rides only the first batch (batch_seq == 0) of each query
+		// response; resetting here guarantees this query parses its own
+		// schema before any continuation batch reuses it.
+		io.decoder.resetQuerySchema()
 		// Clear a lingering prior-query cancel without clobbering a
 		// user-thread Cancel(req.requestId) that raced the dispatcher
 		// picking up this request off the single-slot queue. The user
@@ -1020,7 +1025,7 @@ func (io *qwpEgressIO) emit(ev qwpEvent) {
 // entry point for every transport-class fault on the dispatcher path:
 // reader-error / server-close, send failures (QUERY_REQUEST / CANCEL /
 // CREDIT), decoder or framing failures that desync the per-connection
-// state (symbol dict, schema registry, zstd stream), and unknown
+// state (symbol dict, current-query schema, zstd stream), and unknown
 // msg_kinds. After any of those, the connection is unusable — the
 // decoder may be silently out of sync (a mis-advanced reader can leave
 // the dict accidentally aligned at the offset level while values are

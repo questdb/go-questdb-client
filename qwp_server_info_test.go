@@ -56,7 +56,7 @@ func TestQwpServerInfoRoleName(t *testing.T) {
 // buildServerInfoFrame produces a full SERVER_INFO QWP message (12-byte
 // header + body) for tests. flagBits is OR-ed onto the header flags so
 // negative tests can craft hostile shapes; pass 0 for the conformant
-// frame v2 servers actually emit.
+// frame servers actually emit.
 func buildServerInfoFrame(version byte, flagBits byte, role byte, epoch uint64, capabilities uint32, serverWallNs int64, clusterId, nodeId string) []byte {
 	body := []byte{}
 	body = append(body, byte(qwpMsgKindServerInfo))
@@ -110,11 +110,11 @@ func appendInt64LE(buf []byte, v int64) []byte {
 
 func TestQwpServerInfoDecodeHappyPath(t *testing.T) {
 	frame := buildServerInfoFrame(
-		qwpMaxSupportedVersion, 0,
+		qwpVersion, 0,
 		qwpRolePrimary, 7, 0, 1_700_000_000_000_000_000,
 		"cluster-A", "node-1",
 	)
-	info, err := decodeServerInfo(frame, qwpMaxSupportedVersion)
+	info, err := decodeServerInfo(frame, qwpVersion)
 	if err != nil {
 		t.Fatalf("decodeServerInfo: %v", err)
 	}
@@ -139,9 +139,9 @@ func TestQwpServerInfoDecodeHappyPath(t *testing.T) {
 }
 
 func TestQwpServerInfoDecodeEmptyIdentifiers(t *testing.T) {
-	frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+	frame := buildServerInfoFrame(qwpVersion, 0,
 		qwpRoleStandalone, 0, 0, 0, "", "")
-	info, err := decodeServerInfo(frame, qwpMaxSupportedVersion)
+	info, err := decodeServerInfo(frame, qwpVersion)
 	if err != nil {
 		t.Fatalf("decodeServerInfo: %v", err)
 	}
@@ -154,18 +154,18 @@ func TestQwpServerInfoDecodeEmptyIdentifiers(t *testing.T) {
 }
 
 func TestQwpServerInfoDecodeRejectsVersionMismatch(t *testing.T) {
-	// Spec §3 requires the SERVER_INFO header version byte to equal
-	// the version negotiated during the HTTP upgrade. A v1-stamped
-	// frame on a v2-negotiated connection (and vice versa) must be
-	// rejected, even though both versions are individually supported.
+	// Spec §3 requires the SERVER_INFO header version byte to equal the
+	// version negotiated during the HTTP upgrade. QWP has a single
+	// version (qwpVersion), so the decoder rejects any frame whose
+	// header version byte differs from the negotiated value.
 	cases := []struct {
 		name              string
 		frameVersion      byte
 		negotiatedVersion byte
 	}{
-		{"v1_frame_v2_connection", 0x01, qwpMaxSupportedVersion},
-		{"v2_frame_v1_connection", qwpMaxSupportedVersion, 0x01},
-		{"too_new_frame", 0xFF, qwpMaxSupportedVersion},
+		{"frame_v0_conn_v1", 0x00, qwpVersion},
+		{"frame_v2_conn_v1", 0x02, qwpVersion},
+		{"too_new_frame", 0xFF, qwpVersion},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -185,10 +185,10 @@ func TestQwpServerInfoDecodeRejectsVersionMismatch(t *testing.T) {
 }
 
 func TestQwpServerInfoDecodeRejectsBadMagic(t *testing.T) {
-	frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+	frame := buildServerInfoFrame(qwpVersion, 0,
 		qwpRoleStandalone, 0, 0, 0, "", "")
 	frame[0] = 0x00 // corrupt magic
-	_, err := decodeServerInfo(frame, qwpMaxSupportedVersion)
+	_, err := decodeServerInfo(frame, qwpVersion)
 	if err == nil {
 		t.Fatal("decoder accepted bad magic")
 	}
@@ -202,10 +202,10 @@ func TestQwpServerInfoDecodeRejectsNonZeroTableCount(t *testing.T) {
 	// frame. SERVER_INFO is no exception — a server that smuggles a
 	// non-zero value here is malformed and must be rejected before any
 	// body bytes are trusted.
-	frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+	frame := buildServerInfoFrame(qwpVersion, 0,
 		qwpRoleStandalone, 0, 0, 0, "", "")
 	frame[qwpHeaderOffsetTableCount] = 1
-	_, err := decodeServerInfo(frame, qwpMaxSupportedVersion)
+	_, err := decodeServerInfo(frame, qwpVersion)
 	if err == nil {
 		t.Fatal("decoder accepted non-zero table_count")
 	}
@@ -215,10 +215,10 @@ func TestQwpServerInfoDecodeRejectsNonZeroTableCount(t *testing.T) {
 }
 
 func TestQwpServerInfoDecodeRejectsWrongMsgKind(t *testing.T) {
-	frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+	frame := buildServerInfoFrame(qwpVersion, 0,
 		qwpRoleStandalone, 0, 0, 0, "", "")
 	frame[qwpHeaderSize] = byte(qwpMsgKindResultBatch)
-	_, err := decodeServerInfo(frame, qwpMaxSupportedVersion)
+	_, err := decodeServerInfo(frame, qwpVersion)
 	if err == nil {
 		t.Fatal("decoder accepted wrong msg_kind")
 	}
@@ -230,10 +230,10 @@ func TestQwpServerInfoDecodeRejectsWrongMsgKind(t *testing.T) {
 func TestQwpServerInfoDecodeRejectsTruncatedFrame(t *testing.T) {
 	// Try truncating at every offset from 0 through one short of full
 	// frame length; every truncation should produce a decode error.
-	full := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+	full := buildServerInfoFrame(qwpVersion, 0,
 		qwpRolePrimary, 5, 0, 1234, "abc", "n1")
 	for cut := 0; cut < len(full); cut++ {
-		_, err := decodeServerInfo(full[:cut], qwpMaxSupportedVersion)
+		_, err := decodeServerInfo(full[:cut], qwpVersion)
 		if err == nil {
 			t.Errorf("truncated frame of length %d decoded without error", cut)
 		}
@@ -243,14 +243,14 @@ func TestQwpServerInfoDecodeRejectsTruncatedFrame(t *testing.T) {
 func TestQwpServerInfoDecodeRejectsOversizedClusterId(t *testing.T) {
 	// Hand-craft a frame whose cluster_id u16 length claims more
 	// bytes than the frame contains.
-	frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+	frame := buildServerInfoFrame(qwpVersion, 0,
 		qwpRolePrimary, 0, 0, 0, "abc", "node")
 	// cluster_id length lives at qwpHeaderSize + 1 (kind) + 1 (role)
 	// + 8 (epoch) + 4 (caps) + 8 (wallNs).
 	clusterLenOffset := qwpHeaderSize + 1 + 1 + 8 + 4 + 8
 	frame[clusterLenOffset] = 0xFF
 	frame[clusterLenOffset+1] = 0xFF
-	_, err := decodeServerInfo(frame, qwpMaxSupportedVersion)
+	_, err := decodeServerInfo(frame, qwpVersion)
 	if err == nil {
 		t.Fatal("decoder accepted oversized cluster_id length")
 	}
@@ -260,7 +260,7 @@ func TestQwpServerInfoDecodeRejectsOversizedClusterId(t *testing.T) {
 }
 
 func TestQwpServerInfoDecodeRejectsOversizedNodeId(t *testing.T) {
-	frame := buildServerInfoFrame(qwpMaxSupportedVersion, 0,
+	frame := buildServerInfoFrame(qwpVersion, 0,
 		qwpRolePrimary, 0, 0, 0, "abc", "node")
 	// node_id length lives right after cluster_id bytes. cluster_id
 	// is "abc" (3 bytes) so node_id length offset = clusterLenOffset
@@ -268,7 +268,7 @@ func TestQwpServerInfoDecodeRejectsOversizedNodeId(t *testing.T) {
 	nodeLenOffset := qwpHeaderSize + 1 + 1 + 8 + 4 + 8 + 2 + 3
 	frame[nodeLenOffset] = 0xFF
 	frame[nodeLenOffset+1] = 0xFF
-	_, err := decodeServerInfo(frame, qwpMaxSupportedVersion)
+	_, err := decodeServerInfo(frame, qwpVersion)
 	if err == nil {
 		t.Fatal("decoder accepted oversized node_id length")
 	}

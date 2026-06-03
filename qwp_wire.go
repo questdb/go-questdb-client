@@ -365,10 +365,9 @@ func (r *qwpByteReader) readVarint() (uint64, error) {
 // readVarintInt63 reads an unsigned varint and rejects values where the
 // uint64→int64 cast would flip the sign. Used for varint-encoded fields
 // that the wire spec treats as non-negative int63 (row count, column
-// count, schema id, name lengths, etc.). Without this check, a hostile
-// varint can drive a length past the bound check via two's-complement
-// arithmetic — see QwpResultBatchDecoder.java around row_count and
-// schema_id.
+// count, name lengths, etc.). Without this check, a hostile varint can
+// drive a length past the bound check via two's-complement arithmetic
+// — see QwpResultBatchDecoder.java around row_count and col_count.
 func (r *qwpByteReader) readVarintInt63() (int64, error) {
 	v, err := r.readVarint()
 	if err != nil {

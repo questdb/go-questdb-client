@@ -277,7 +277,6 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 
 	var lastObserved *QwpServerInfo
 	var lastErr error
-	sawV1Mismatch := false
 	attempts := 0
 	retriedAfterReset := false
 	for {
@@ -317,10 +316,10 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			authorization:         cfg.effectiveAuthorization(),
 			maxBatchRows:          cfg.maxBatchRows,
 			acceptEncoding:        cfg.buildAcceptEncodingHeader(),
-			// target != any forces v2; otherwise we still advertise v2
-			// so v2 servers know the client can read SERVER_INFO and
-			// will emit it.
-			maxVersion:        qwpMaxSupportedVersion,
+			// QWP has a single protocol version; advertise it. The
+			// server always emits SERVER_INFO post-upgrade and the
+			// egress client reads it (serverInfoTimeout > 0).
+			maxVersion:        qwpVersion,
 			serverInfoTimeout: cfg.serverInfoTimeout,
 			authTimeoutMs:     cfg.authTimeoutMs,
 		}
@@ -365,13 +364,11 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			tracker.RecordZone(idx, info.ZoneId)
 		}
 		if info == nil && cfg.target != qwpTargetAny {
-			// v1 server cannot satisfy a specific role filter — its
-			// role is unknown and a "best effort" bind would give the
-			// caller a false guarantee. Demote to TopologyReject and
-			// record this so the final QwpRoleMismatchError can flag
-			// SawV1Mismatch and tell the caller "the cluster is up but
-			// it's OSS / v1" rather than "all endpoints unreachable".
-			sawV1Mismatch = true
+			// Connected but no SERVER_INFO (serverInfoTimeout disabled,
+			// or a non-conformant server): the role is unknown, so a
+			// specific role filter cannot be satisfied without giving the
+			// caller a false guarantee. Demote to TopologyReject rather
+			// than binding to an unknown role.
 			tracker.RecordRoleReject(idx, false)
 			_ = tr.close()
 			continue
@@ -411,16 +408,14 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			attempts, lastErr)
 	}
 	// Specific role filter and no match — surface a typed
-	// QwpRoleMismatchError carrying the last observed SERVER_INFO, the
-	// v1-mismatch flag, and the last transport error so callers can
-	// distinguish "no primary available" (LastObserved non-nil),
-	// "OSS-only cluster" (SawV1Mismatch true), "all endpoints
-	// unreachable" (LastTransportError non-nil with both other fields
-	// zero), and any combination thereof.
+	// QwpRoleMismatchError carrying the last observed SERVER_INFO and
+	// the last transport error so callers can distinguish "no matching
+	// role available" (LastObserved non-nil), "all endpoints
+	// unreachable" (LastTransportError non-nil with LastObserved nil),
+	// and any combination thereof.
 	return nil, &QwpRoleMismatchError{
 		Target:             cfg.target.String(),
 		LastObserved:       lastObserved,
-		SawV1Mismatch:      sawV1Mismatch,
 		LastTransportError: lastErr,
 		Endpoints:          endpointStrings,
 	}
