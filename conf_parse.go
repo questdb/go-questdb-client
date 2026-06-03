@@ -279,13 +279,6 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			// going through the generic "unsupported option" path.
 			return nil, NewInvalidConfigStrError(
 				"close_timeout is no longer supported; use close_flush_timeout_millis instead")
-		case "max_schemas_per_connection":
-			// Outdated knob — kept in the parser so users porting an
-			// older connect string get a clear "no longer supported"
-			// reply rather than the generic "unsupported option"
-			// path.
-			return nil, NewInvalidConfigStrError(
-				"max_schemas_per_connection is outdated and no longer supported")
 		case "gorilla":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)

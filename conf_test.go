@@ -757,13 +757,6 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			expectedErrMsgContains: "close_timeout is no longer supported",
 		},
 		{
-			// max_schemas_per_connection is an outdated knob and is
-			// now rejected regardless of transport.
-			name:                   "max_schemas_per_connection rejected",
-			config:                 "http::addr=localhost:1111;max_schemas_per_connection=8;",
-			expectedErrMsgContains: "max_schemas_per_connection is outdated",
-		},
-		{
 			name:                   "gorilla on TCP",
 			config:                 "tcp::addr=localhost:1111;gorilla=off;",
 			expectedErrMsgContains: "gorilla is only supported for QWP senders",

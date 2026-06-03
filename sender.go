@@ -650,15 +650,6 @@ func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
 	}
 }
 
-// WithMaxSchemasPerConnection used to cap the per-connection schema
-// ID space. It is outdated and no longer has any effect; the setter
-// is preserved as a no-op so existing callers keep compiling.
-//
-// Deprecated: outdated; this setter is a no-op.
-func WithMaxSchemasPerConnection(n int) LineSenderOption {
-	return func(*lineSenderConfig) {}
-}
-
 // WithGorilla enables or disables Gorilla delta-of-delta encoding for
 // timestamp columns. Defaults to enabled. When disabled, FLAG_GORILLA
 // is cleared on every message and timestamp columns are sent as raw
