@@ -547,10 +547,59 @@ func (l *qwpSfSendLoop) positionCursorForStart() error {
 	return l.positionCursorAt(replayStart)
 }
 
-// positionCursorAt walks the engine's segments to find the one
-// containing targetFsn and sets sendOffset to the byte offset of
-// that frame within it. If targetFsn is past everything published,
-// parks at the live active segment's published offset.
+// positionCursorAt points the cursor (sendingSegment + sendOffset) at
+// the frame for targetFsn. It is called at startup and after every
+// reconnect, once fsnAtZero has been reset to targetFsn and nextWireSeq
+// to 0.
+//
+// If targetFsn is already published, the cursor lands exactly on that
+// frame. If targetFsn is not published yet, the cursor parks at the
+// active segment's current tip and the normal send loop waits for the
+// producer to publish more bytes.
+//
+// Returns a non-nil error if the frame walk hits a corrupt header; see
+// positionCursorInSegment.
+func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) error {
+	seg := l.engine.engineFindSegmentContaining(targetFsn)
+	if seg == nil {
+		// No segment currently advertises targetFsn. That normally
+		// means targetFsn is just past publishedFsn and there is
+		// nothing to replay yet, so the cursor resumes from the active
+		// tip.
+		//
+		// The producer runs concurrently with this I/O goroutine,
+		// though: it can publish targetFsn after the lookup above
+		// returns nil but before (or during) the active-tip snapshot
+		// below. publishedOffset() reads publishedCursor, which
+		// tryAppend stores AFTER it increments frameCount — so if this
+		// read observes the new frame's bytes, the frameCount bump that
+		// makes targetFsn discoverable is necessarily visible too, and
+		// the re-check below finds it and lands the cursor exactly on
+		// targetFsn (keeping wireSeq=0 mapped to targetFsn). Without the
+		// re-check we would park at the post-publish tip — one frame
+		// past targetFsn — dropping targetFsn and misnumbering every
+		// following frame by one, i.e. silent row loss on
+		// reconnect-under-load (see Java PR #40). If the producer
+		// publishes only later, both lookups miss, sendOffset stays at
+		// the old tip, and trySendOne sends the frame normally.
+		l.sendingSegment = l.engine.engineActiveSegment()
+		if l.sendingSegment == nil {
+			l.sendOffset = qwpSfHeaderSize
+			return nil
+		}
+		l.sendOffset = l.sendingSegment.publishedOffset()
+		if seg = l.engine.engineFindSegmentContaining(targetFsn); seg != nil {
+			return l.positionCursorInSegment(seg, targetFsn)
+		}
+		return nil
+	}
+	return l.positionCursorInSegment(seg, targetFsn)
+}
+
+// positionCursorInSegment points sendingSegment/sendOffset at targetFsn
+// inside seg, which the caller has already established contains it.
+// Segment frame boundaries are not indexed, so it walks payload strides
+// from the segment's baseSeq until it reaches targetFsn.
 //
 // Returns a non-nil error if a frame header along the walk has a
 // payloadLen that is negative or that would push the walk past the
@@ -561,19 +610,9 @@ func (l *qwpSfSendLoop) positionCursorForStart() error {
 // unrecovered I/O goroutine and crashes the process, bypassing
 // recordFatal. Mirrors the bound in qwpSfScanFrames. tryAppend
 // validates payloadLen on write and recovery's CRC scan validates it
-// on startup, so this is not expected to fire in practice; both
-// callers route the returned error through recordFatal.
-func (l *qwpSfSendLoop) positionCursorAt(targetFsn int64) error {
-	seg := l.engine.engineFindSegmentContaining(targetFsn)
-	if seg == nil {
-		l.sendingSegment = l.engine.engineActiveSegment()
-		if l.sendingSegment != nil {
-			l.sendOffset = l.sendingSegment.publishedOffset()
-		} else {
-			l.sendOffset = qwpSfHeaderSize
-		}
-		return nil
-	}
+// on startup, so this is not expected to fire in practice; the callers
+// route the returned error through recordFatal.
+func (l *qwpSfSendLoop) positionCursorInSegment(seg *qwpSfSegment, targetFsn int64) error {
 	l.sendingSegment = seg
 	// Walk frame-by-frame from HEADER_SIZE until we land on targetFsn.
 	offset := qwpSfHeaderSize

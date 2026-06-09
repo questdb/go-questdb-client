@@ -404,6 +404,111 @@ func TestQwpSfPositionCursorAtRejectsCorruptPayloadLen(t *testing.T) {
 	})
 }
 
+// TestQwpSfPositionCursorAtReconnectRace is a regression guard for the
+// reconnect-under-load row-loss bug (Java PR #40). On reconnect,
+// swapClient pins fsnAtZero to targetFsn = ackedFsn+1 and resets
+// nextWireSeq to 0, then calls positionCursorAt(targetFsn). For wireSeq=0
+// to map back to targetFsn on the new connection, the cursor MUST land on
+// the byte offset where targetFsn's frame begins.
+//
+// The producer runs concurrently with the I/O goroutine: positionCursorAt's
+// first findSegmentContaining can miss targetFsn, and the buggy fallback
+// then read the active segment's *post-publish* tip and parked one frame
+// PAST targetFsn — silently dropping targetFsn and misnumbering every
+// later frame by one, which the server trimmed on its next cumulative ACK
+// while close() still reported clean delivery.
+//
+// We can't pin the exact interleaving, so we hammer positionCursorAt
+// against a live producer and assert the invariant that must always hold
+// post-fix: after positionCursorAt(targetFsn) the cursor sits exactly at
+// targetFsn's frame offset, never past it. targetFsn is always at most one
+// past publishedFsn (just like the reconnect anchor), so its offset is
+// fixed whether the frame is already published, published mid-call, or not
+// yet published. Pre-fix this trips whenever a publish lands inside the
+// lookup→snapshot window; best run under -race.
+func TestQwpSfPositionCursorAtReconnectRace(t *testing.T) {
+	const (
+		frames     = 4000
+		payloadLen = 4
+	)
+	payload := []byte("payl") // payloadLen bytes
+	stride := int64(qwpSfFrameHeaderSize + payloadLen)
+	// One segment large enough to hold every frame, so baseSeq stays 0 and
+	// no rotation perturbs the offset arithmetic.
+	segSize := qwpSfHeaderSize + int64(frames)*stride + 1024
+
+	engine, err := qwpSfNewCursorEngine("", segSize, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = engine.engineClose() })
+
+	unusedFactory := func(context.Context, int) (*qwpTransport, error) {
+		return nil, errors.New("factory not used in this test")
+	}
+	loop := qwpSfNewSendLoop(engine, nil, unusedFactory,
+		time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+
+	// Frame N begins at this offset; the segment never rotates so it is
+	// stable for the whole run.
+	expectedOffset := func(fsn int64) int64 { return qwpSfHeaderSize + fsn*stride }
+
+	// Stop + drain the producer before the engine is torn down. t.Cleanup
+	// runs LIFO, so this (registered after the engine-close cleanup above)
+	// runs first: on a require failure the test goroutine unwinds via
+	// Goexit, and this guarantees the producer is no longer appending when
+	// engineClose runs — otherwise it would nil-deref on the closed segment
+	// and mask the real assertion message with a panic.
+	var prodErr atomic.Value // holds error
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	t.Cleanup(func() { close(stop); <-done })
+	go func() {
+		defer close(done)
+		for i := 0; i < frames; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := engine.engineAppendBlocking(context.Background(), payload); err != nil {
+				prodErr.Store(err)
+				return
+			}
+		}
+	}()
+
+positioning:
+	for {
+		select {
+		case <-done:
+			break positioning
+		default:
+		}
+		// At most one past what's published right now — either already
+		// published, published during the call (the race window), or the
+		// very next frame. This mirrors the reconnect anchor
+		// targetFsn = ackedFsn+1.
+		targetFsn := engine.enginePublishedFsn() + 1
+		if targetFsn >= int64(frames) {
+			continue
+		}
+		require.NoError(t, loop.positionCursorAt(targetFsn))
+		require.Equalf(t, expectedOffset(targetFsn), loop.sendOffset,
+			"positionCursorAt(%d) parked %d stride(s) past the frame — a reconnect here would drop it",
+			targetFsn, (loop.sendOffset-expectedOffset(targetFsn))/stride)
+	}
+	if e := prodErr.Load(); e != nil {
+		t.Fatalf("producer failed: %v", e.(error))
+	}
+
+	// Producer done: every frame is published. A deterministic position on
+	// the last frame must land exactly on it, in the original baseSeq-0
+	// segment (no rotation happened).
+	require.NoError(t, loop.positionCursorAt(int64(frames-1)))
+	require.Equal(t, expectedOffset(int64(frames-1)), loop.sendOffset)
+	require.Equal(t, int64(0), loop.sendingSegment.segmentBaseSeq(),
+		"single segment expected; a rotation would invalidate the offset math above")
+}
+
 func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 5})
 	defer srv.Close()
