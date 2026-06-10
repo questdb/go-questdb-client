@@ -50,12 +50,33 @@ jobs:
           java-version: "25"
 
       - name: Clone QuestDB
-        # Shallow clone of master. The default Maven reactor for the
-        # server jar is just core (+ utils via -am); the
-        # java-questdb-client submodule lives only in the opt-in
-        # local-client profile and the C submodules ship prebuilt, so
-        # no submodule init is needed for `-pl core`.
+        # Shallow clone of master. The C submodules ship prebuilt, so no
+        # blanket submodule init is needed; the java-questdb-client
+        # submodule is fetched on demand by the detect step below.
         run: git clone --depth 1 https://github.com/questdb/questdb.git
+
+      - name: Detect local client profile
+        # core/pom.xml has a test-scoped dependency on
+        # org.questdb:questdb-client, and `package -DskipTests` still
+        # compiles tests, so Maven must resolve it. A release version
+        # resolves from Maven Central; a -SNAPSHOT version (server and
+        # client evolving in lockstep) exists only as the
+        # java-questdb-client submodule, built in-reactor via the
+        # local-client profile. Mirrors the server repo's
+        # .github/actions/detect-local-client composite action.
+        id: client
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/.*<questdb.client.version>\(.*\)<\/questdb.client.version>.*/\1/p' questdb/core/pom.xml | head -1)"
+          echo "questdb.client.version=${version:-<not found>}"
+          if [[ "$version" == *-SNAPSHOT ]]; then
+            echo "SNAPSHOT client version — building the java-questdb-client submodule via -Plocal-client"
+            git -C questdb submodule update --init java-questdb-client
+            echo "client_profile=-Plocal-client" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release client version — resolving from Maven Central"
+            echo "client_profile=" >> "$GITHUB_OUTPUT"
+          fi
 
       # QuestDB pulls a large, slow-moving dependency set; cache ~/.m2 so
       # repeat runs skip the multi-minute first-time download. Key
@@ -71,11 +92,13 @@ jobs:
       - name: Build QuestDB server jar
         # Minimal, verified build: produces core/target/questdb-
         # <ver>-SNAPSHOT.jar + core/target/classes/.../site/conf in ~30s
-        # (warm .m2). No -Pbuild-web-console: the embedded console UI is
-        # irrelevant to QWP / /exec / /ping, and skipping it removes the
-        # Node-download failure surface. JAVA_HOME is exported by
-        # setup-java; the enforcer verifies it is JDK 25.
-        run: mvn -B -ntp -DskipTests -pl core -am package -f questdb/pom.xml
+        # (warm .m2). With local-client active, -am additionally builds
+        # the java-questdb-client module ahead of core (~10s). No
+        # -Pbuild-web-console: the embedded console UI is irrelevant to
+        # QWP / /exec / /ping, and skipping it removes the Node-download
+        # failure surface. JAVA_HOME is exported by setup-java; the
+        # enforcer verifies it is JDK 25.
+        run: mvn -B -ntp -DskipTests -pl core -am package -f questdb/pom.xml ${{ steps.client.outputs.client_profile }}
 
       - name: Verify QuestDB jar exists
         # Defense in depth: if Maven "succeeded" but emitted no server
