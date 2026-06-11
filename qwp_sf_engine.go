@@ -317,6 +317,19 @@ func (e *qwpSfCursorEngine) engineSfDir() string {
 	return e.sfDir
 }
 
+// engineMaxFrameBytes returns the largest frame payload a single
+// segment can hold: the segment size minus the file header and the
+// per-frame header. A payload above this can never be appended —
+// appendOrFsn returns qwpSfPayloadTooLarge for it even against a
+// freshly-rotated spare — so the producer uses this bound to (a)
+// clamp its byte-size auto-flush trigger and (b) drop, rather than
+// retain, an oversize batch at the flush boundary. Kept here so it
+// tracks the segment header layout automatically and cannot drift
+// from what tryAppend actually enforces.
+func (e *qwpSfCursorEngine) engineMaxFrameBytes() int64 {
+	return e.segmentSizeBytes - qwpSfHeaderSize - qwpSfFrameHeaderSize
+}
+
 // engineWasRecoveredFromDisk reports whether the engine opened
 // against a pre-existing on-disk slot. Memory-mode engines and
 // fresh-disk engines return false.

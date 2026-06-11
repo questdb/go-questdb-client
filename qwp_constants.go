@@ -203,22 +203,24 @@ const (
 	// connect-string.md §Auto-flushing: "Default where supported: `8m`
 	// (8 MiB)". Mirrors Java's DEFAULT_AUTO_FLUSH_BYTES. The effective
 	// threshold the sender compares pendingBytes against is clamped
-	// down to 90% of the server-advertised X-QWP-Max-Batch-Size on
-	// every successful connect (initial bind and every reconnect) —
-	// see qwpLineSender.applyServerBatchSizeLimit. The clamp only
-	// reduces: a configured value below the advertised cap is kept
-	// as-is, and an explicit user opt-out (auto_flush_bytes=off /
-	// =0) is preserved even when the server advertises a cap.
+	// down to 90% of two limits — see qwpLineSender.applyServerBatchSizeLimit:
+	//   - the server-advertised X-QWP-Max-Batch-Size, re-evaluated on
+	//     every successful connect (initial bind and every reconnect); and
+	//   - the per-segment frame cap (maxFrameBytes), fixed at construction
+	//     from the cursor engine's segment size. Without this term the
+	//     shipped defaults (8 MiB trigger over a 4 MiB segment) would let
+	//     a batch grow past what a segment can hold and wedge on flush.
+	// The clamp only reduces: a configured value below both caps is kept
+	// as-is, and an explicit user opt-out (auto_flush_bytes=off / =0) is
+	// preserved even when a cap applies.
 	//
-	// The raw advertised cap also arms two hard guards independent
-	// of the soft clamp — both fire even when the user opted out
-	// of byte-size auto-flush: a per-row guard in atWithTimestamp
-	// (rejects any single row whose buffered bytes exceed the cap)
-	// and a defensive flush-time guard in enqueueCursor (rejects
-	// and drops a batch whose encoded frame exceeds the cap, since
-	// schema + dict-delta overhead can push a sub-cap row set above
-	// the wire limit). Both surface typed errors before the frame
-	// ever leaves the process.
+	// Three hard guards back the soft clamp in enqueueCursor /
+	// atWithTimestamp, each dropping or rejecting with a typed error
+	// before the frame leaves the process: a per-row guard (any single
+	// row above the server cap), a flush-time server-cap guard, and a
+	// flush-time segment-cap guard (an encoded frame larger than a
+	// single segment can ever hold). The first two fire even when the
+	// user opted out of byte-size auto-flush.
 	qwpDefaultAutoFlushBytes = 8 * 1024 * 1024
 
 	// qwpDefaultInFlightWindow is the default maximum number of batches

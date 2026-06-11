@@ -103,16 +103,19 @@ func newQwpCursorLineSender(
 		cursorEngine:      cursorEngine,
 		cursorSendLoop:    cursorSendLoop,
 	}
-	// Seed effectiveAutoFlushBytes to the configured value so the
-	// auto-flush trigger behaves correctly before the first
-	// transport-swap callback fires (this covers the test paths
-	// that construct a sender directly without wiring the callback,
-	// and the brief window in the conf-driven paths between sender
-	// construction and the callback install + initial seed). The
-	// conf-driven constructors then refine this via
-	// applyServerBatchSizeLimit using the connected transport's
-	// advertised cap.
-	s.effectiveAutoFlushBytes.Store(int64(autoFlushBytes))
+	// Record the per-segment frame cap (constant for the sender's
+	// lifetime) so the byte-trigger clamp and the flush-time drop guard
+	// bound batches to what a single segment can actually hold.
+	s.maxFrameBytes = cursorEngine.engineMaxFrameBytes()
+	// Seed effectiveAutoFlushBytes via the same clamp the transport-swap
+	// callback applies, with no transport yet (server cap unknown). With
+	// no server cap this yields min(autoFlushBytes, maxFrameBytes*9/10),
+	// already segment-safe before the first connect. Covers the test
+	// paths that build a sender directly without wiring the callback, and
+	// the window in the conf-driven paths between construction and the
+	// callback install; those then refine the server-cap term via
+	// applyServerBatchSizeLimit using the connected transport's cap.
+	s.applyServerBatchSizeLimit(nil)
 	// Single encoder slot is enough — the cursor engine takes a copy
 	// of the bytes via tryAppend, so the encoder buffer can be reused
 	// immediately. No double-buffering needed here.
@@ -446,7 +449,15 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	}
 	tables, err := s.buildTableEncodeInfo()
 	if err != nil {
-		return err
+		// The only error here is "too many tables in one batch": the
+		// wire encodes the table count as a uint16, so this fails
+		// identically on every retry. Like the oversize-frame guards
+		// below, retaining the rows would re-fail forever and wedge the
+		// sender; drop them with a typed error naming the count so the
+		// sender stays usable.
+		droppedRows := s.pendingRowCount
+		s.resetAfterFlush()
+		return fmt.Errorf("%w [droppedRows=%d]", err, droppedRows)
 	}
 	if len(tables) == 0 {
 		return nil
@@ -477,6 +488,30 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 		return fmt.Errorf(
 			"qwp: batch too large for server batch cap [messageSize=%d, serverMaxBatchSize=%d, droppedRows=%d]",
 			msgSize, cap, droppedRows)
+	}
+	// Companion guard for the per-segment frame cap. The encoded frame
+	// must fit a single cursor segment (memory- or disk-backed): a
+	// larger frame can never be appended — engineAppendBlocking would
+	// return qwpSfErrPayloadTooLarge even against a freshly-rotated
+	// spare. Unlike a transient backpressure timeout (the wire will
+	// drain), this fails identically on every retry: the segment cap is
+	// fixed and there is no per-table split path (Java's flushPendingRows
+	// split was not ported). Retaining the rows (the contract for
+	// transient errors) would re-encode the same oversize frame on every
+	// subsequent flush and on Close, permanently wedging the sender and
+	// losing the batch. Drop it in place exactly like the server-cap
+	// guard above so the sender stays usable; the caller must send fewer
+	// rows per flush (or raise sf_max_bytes in store-and-forward mode).
+	// The byte-trigger clamp keeps normal operation well clear of this —
+	// it fires only on an auto-flush opt-out, a single oversize burst,
+	// or pathological symbol-dict growth.
+	if s.maxFrameBytes > 0 && int64(len(encoded)) > s.maxFrameBytes {
+		droppedRows := s.pendingRowCount
+		msgSize := len(encoded)
+		s.resetAfterFlush()
+		return fmt.Errorf(
+			"qwp: batch too large to fit one cursor segment [messageSize=%d, maxFrameBytes=%d, droppedRows=%d]; send fewer rows per flush (or raise sf_max_bytes)",
+			msgSize, s.maxFrameBytes, droppedRows)
 	}
 	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
 		return err

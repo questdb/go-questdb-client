@@ -188,6 +188,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			senderConf.autoFlushInterval = time.Duration(parsedVal) * time.Millisecond
 		case "auto_flush_bytes":
+			senderConf.autoFlushBytesSet = true
 			if v == "off" {
 				senderConf.autoFlushBytes = 0
 				continue

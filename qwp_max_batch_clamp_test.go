@@ -172,10 +172,12 @@ func TestQwpApplyServerBatchSizeLimit(t *testing.T) {
 // advertised cap on the initial connect, without relying on a
 // follow-up reconnect.
 func TestQwpEffectiveAutoFlushBytesSeededOnConnect(t *testing.T) {
-	// Advertise a 4 MiB cap. Configured auto_flush_bytes default
-	// is 8 MiB (qwpDefaultAutoFlushBytes), so the clamp must
-	// reduce it to floor(4 MiB * 9/10).
-	const serverCap = 4 * 1024 * 1024
+	// Advertise a 2 MiB cap — below the memory-mode segment cap
+	// (qwpSfDefaultMaxBytes, 4 MiB) so the server cap is unambiguously
+	// the binding term. Configured auto_flush_bytes default is 8 MiB
+	// (qwpDefaultAutoFlushBytes), so the clamp must reduce it to
+	// floor(2 MiB * 9/10).
+	const serverCap = 2 * 1024 * 1024
 	srv := newQwpTestServerWithMaxBatch(t, serverCap)
 	defer srv.Close()
 
@@ -207,11 +209,14 @@ func TestQwpEffectiveAutoFlushBytesSeededOnConnect(t *testing.T) {
 	}
 }
 
-// TestQwpEffectiveAutoFlushBytesKeptWhenServerHasNoCap pins the
-// "older server" case: when the upgrade response omits
-// X-QWP-Max-Batch-Size, the configured auto_flush_bytes flows
-// through to the trigger unchanged.
-func TestQwpEffectiveAutoFlushBytesKeptWhenServerHasNoCap(t *testing.T) {
+// TestQwpEffectiveAutoFlushBytesClampedToSegmentWhenServerHasNoCap
+// pins the "older server" case: when the upgrade response omits
+// X-QWP-Max-Batch-Size, the per-segment frame cap is the binding
+// floor. The configured 8 MiB default would otherwise let a batch
+// grow past the 4 MiB memory-mode segment and wedge on flush, so the
+// trigger is clamped to floor(maxFrameBytes * 9/10) regardless of the
+// (absent) server cap.
+func TestQwpEffectiveAutoFlushBytesClampedToSegmentWhenServerHasNoCap(t *testing.T) {
 	srv := newQwpTestServerWithMaxBatch(t, 0) // header omitted
 	defer srv.Close()
 
@@ -223,9 +228,36 @@ func TestQwpEffectiveAutoFlushBytesKeptWhenServerHasNoCap(t *testing.T) {
 	defer ls.Close(context.Background())
 
 	s := ls.(*qwpLineSender)
-	if got, want := s.effectiveAutoFlushBytes.Load(), int64(qwpDefaultAutoFlushBytes); got != want {
-		t.Fatalf("effectiveAutoFlushBytes = %d, want %d (server cap unset)",
+	maxFrame := int64(qwpSfDefaultMaxBytes) - qwpSfHeaderSize - qwpSfFrameHeaderSize
+	want := maxFrame * 9 / 10
+	if got := s.effectiveAutoFlushBytes.Load(); got != want {
+		t.Fatalf("effectiveAutoFlushBytes = %d, want %d (segment clamp with server cap unset)",
 			got, want)
+	}
+}
+
+// TestQwpEffectiveAutoFlushBytesKeptWhenBelowSegmentCap pins that a
+// configured byte trigger comfortably under the segment cap flows
+// through unchanged: the segment clamp only ever reduces, never
+// inflates. Companion to the segment-clamp floor test above.
+func TestQwpEffectiveAutoFlushBytesKeptWhenBelowSegmentCap(t *testing.T) {
+	srv := newQwpTestServerWithMaxBatch(t, 0) // no server cap
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	// 1 MiB is well under both the 4 MiB segment and its 90% clamp.
+	const configured = 1 * 1024 * 1024
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+addr+";auto_flush_bytes=1m;")
+	if err != nil {
+		t.Fatalf("LineSenderFromConf: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	s := ls.(*qwpLineSender)
+	if got := s.effectiveAutoFlushBytes.Load(); got != int64(configured) {
+		t.Fatalf("effectiveAutoFlushBytes = %d, want %d (configured, below segment cap)",
+			got, configured)
 	}
 }
 

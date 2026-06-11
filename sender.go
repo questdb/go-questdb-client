@@ -350,6 +350,12 @@ type lineSenderConfig struct {
 	autoFlushRows     int
 	autoFlushInterval time.Duration
 	autoFlushBytes    int // QWP-only; 0 disables the byte-size trigger
+	// autoFlushBytesSet records whether the user explicitly set
+	// auto_flush_bytes (vs. the seeded qwpDefaultAutoFlushBytes).
+	// sanitizeQwpConf uses it to reject only a user-written
+	// auto_flush_bytes > sf_max_bytes contradiction; a defaulted trigger
+	// over a smaller user-chosen segment is left for the runtime clamp.
+	autoFlushBytesSet bool
 
 	protocolVersion protocolVersion
 
@@ -977,6 +983,7 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 func WithAutoFlushBytes(bytes int) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.autoFlushBytes = bytes
+		s.autoFlushBytesSet = true
 	}
 }
 
@@ -1340,6 +1347,22 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.sfMaxBytes > 0 && conf.sfMaxTotalBytes > 0 && conf.sfMaxTotalBytes < conf.sfMaxBytes {
 		return fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_bytes (%d)",
 			conf.sfMaxTotalBytes, conf.sfMaxBytes)
+	}
+	// Reject an explicit auto_flush_bytes that exceeds an explicit
+	// sf_max_bytes. The byte trigger would let a batch grow until its
+	// encoded frame can no longer fit a single segment, and such a frame
+	// can never be flushed — it is dropped at the flush boundary. Gated
+	// on autoFlushBytesSet so a *defaulted* 8 MiB trigger over a smaller
+	// user-chosen segment is left to the runtime clamp (which lowers the
+	// effective trigger to fit); only a user-written contradiction is a
+	// hard error. sf_max_bytes is the per-segment cap, so the frame must
+	// actually fit in slightly less than this (header overhead), but the
+	// trigger clamp already keeps the encoded frame under the segment;
+	// this check just rejects the self-evidently impossible pairing up front.
+	if conf.autoFlushBytesSet && conf.sfMaxBytes > 0 && int64(conf.autoFlushBytes) > conf.sfMaxBytes {
+		return fmt.Errorf(
+			"auto_flush_bytes (%d) must not exceed sf_max_bytes (%d): a batch that fills the byte trigger could not fit in a single segment",
+			conf.autoFlushBytes, conf.sfMaxBytes)
 	}
 	if conf.maxBackgroundDrainers < 0 {
 		return fmt.Errorf("max_background_drainers must be >= 0: %d", conf.maxBackgroundDrainers)

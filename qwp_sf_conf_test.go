@@ -255,6 +255,72 @@ func TestSfConfRejectsNegativeNumbers(t *testing.T) {
 	}
 }
 
+// TestSfConfRejectsAutoFlushBytesAboveSfMaxBytes pins the sanitize-time
+// validation: an explicitly-set auto_flush_bytes that exceeds an
+// explicitly-set sf_max_bytes is rejected, because the byte trigger
+// would let a batch grow until its encoded frame can no longer fit a
+// single segment — an un-flushable pairing. The check is at sanitize,
+// not parse, so it runs for both the connect-string and option paths.
+func TestSfConfRejectsAutoFlushBytesAboveSfMaxBytes(t *testing.T) {
+	conf, err := confFromStr(
+		"ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_bytes=1048576;auto_flush_bytes=2097152;")
+	require.NoError(t, err, "parser accepts both values; the contradiction is caught at sanitize")
+	require.True(t, conf.autoFlushBytesSet)
+
+	err = sanitizeQwpConf(conf)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "auto_flush_bytes")
+	require.Contains(t, err.Error(), "sf_max_bytes")
+}
+
+// TestSfConfRejectsAutoFlushBytesAboveSfMaxBytesViaOptions covers the
+// functional-option set-site: WithAutoFlushBytes must record the
+// explicit-set flag so the same sanitize guard fires.
+func TestSfConfRejectsAutoFlushBytesAboveSfMaxBytesViaOptions(t *testing.T) {
+	conf := newLineSenderConfig(qwpSenderType)
+	for _, opt := range []LineSenderOption{
+		WithAddress("localhost:9000"),
+		WithSfDir("/tmp/sf"),
+		WithSfMaxBytes(1 << 20),
+		WithAutoFlushBytes(2 << 20),
+	} {
+		opt(conf)
+	}
+	require.True(t, conf.autoFlushBytesSet)
+
+	err := sanitizeQwpConf(conf)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "auto_flush_bytes")
+	require.Contains(t, err.Error(), "sf_max_bytes")
+}
+
+// TestSfConfAcceptsDefaultedAutoFlushBytesOverSmallSegment is the
+// no-footgun case: lowering sf_max_bytes while leaving auto_flush_bytes
+// at its 8 MiB default is NOT a user-written contradiction, so sanitize
+// must accept it — the runtime clamp lowers the effective trigger to
+// fit the smaller segment. Rejecting here would force users to hand-tune
+// auto_flush_bytes every time they shrink a segment.
+func TestSfConfAcceptsDefaultedAutoFlushBytesOverSmallSegment(t *testing.T) {
+	conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_bytes=1048576;")
+	require.NoError(t, err)
+	require.False(t, conf.autoFlushBytesSet, "auto_flush_bytes left at default")
+	require.Equal(t, qwpDefaultAutoFlushBytes, conf.autoFlushBytes)
+	require.Greater(t, int64(conf.autoFlushBytes), conf.sfMaxBytes,
+		"precondition: the defaulted trigger exceeds the chosen segment")
+
+	require.NoError(t, sanitizeQwpConf(conf),
+		"a defaulted trigger over a smaller segment is handled by the clamp, not rejected")
+}
+
+// TestSfConfAcceptsAutoFlushBytesBelowSfMaxBytes pins that a valid
+// explicit pairing (trigger at or below the segment) sanitizes cleanly.
+func TestSfConfAcceptsAutoFlushBytesBelowSfMaxBytes(t *testing.T) {
+	conf, err := confFromStr(
+		"ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_bytes=4194304;auto_flush_bytes=2097152;")
+	require.NoError(t, err)
+	require.NoError(t, sanitizeQwpConf(conf))
+}
+
 // TestSfConfInitialConnectRetryValues exercises every accepted spelling
 // of `initial_connect_retry` (Java spec §4.2 / §13.4) and the rejected
 // one. The legacy bool spellings (`on`/`true`/`off`/`false`) and the

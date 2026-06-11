@@ -304,8 +304,21 @@ type qwpLineSender struct {
 	// means "no cap advertised" and both guards short-circuit.
 	// Mirrors Java's volatile-int serverMaxBatchSize field.
 	serverMaxBatchSize atomic.Int32
-	flushDeadline      time.Time
-	pendingRowCount    int
+	// maxFrameBytes is the largest encoded frame the cursor engine's
+	// segments can hold (segment size minus header overhead, from
+	// engineMaxFrameBytes). A frame above this can never be appended,
+	// so it bounds two things, exactly like serverMaxBatchSize:
+	//   - the effectiveAutoFlushBytes clamp, so the soft byte trigger
+	//     fires before a batch can grow past what a segment holds; and
+	//   - the flush-time hard guard in enqueueCursor, which drops an
+	//     over-cap frame with a typed error instead of retaining it and
+	//     re-failing forever.
+	// Constant for the sender's lifetime (the segment size never
+	// changes). 0 in the bench / hand-built test senders that have no
+	// engine, where both uses short-circuit.
+	maxFrameBytes   int64
+	flushDeadline   time.Time
+	pendingRowCount int
 
 	// pendingBytes tracks the approximate buffered byte total across
 	// all table buffers. Maintained incrementally on each commitRow:
@@ -417,6 +430,10 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	s.cursorEngine = engine
 	s.cursorSendLoop = loop
+	// The memory-mode segment is the fixed qwpSfDefaultMaxBytes; record
+	// the largest frame it can hold so the byte-trigger clamp and the
+	// flush-time drop guard bound batches to it.
+	s.maxFrameBytes = engine.engineMaxFrameBytes()
 	return s, nil
 }
 
@@ -1101,14 +1118,30 @@ func (s *qwpLineSender) applyServerBatchSizeLimit(t *qwpTransport) {
 		s.effectiveAutoFlushBytes.Store(0)
 		return
 	}
-	if cap <= 0 {
-		s.effectiveAutoFlushBytes.Store(int64(s.autoFlushBytes))
-		return
-	}
-	safe := int64(cap) * 9 / 10
 	effective := int64(s.autoFlushBytes)
-	if safe < effective {
-		effective = safe
+	// Clamp to 90% of the server-advertised cap. The 10% headroom
+	// covers schema + dict-delta encoding overhead the soft trigger
+	// does not see. cap <= 0 means the server advertised none (older
+	// build or async-pending initial connect): keep the configured
+	// value for this term.
+	if cap > 0 {
+		if safe := int64(cap) * 9 / 10; safe < effective {
+			effective = safe
+		}
+	}
+	// Clamp to 90% of the per-segment frame cap as well. A frame larger
+	// than a single segment can hold can never be appended to the cursor
+	// engine, so the soft trigger must fire before a batch crosses it —
+	// independent of the server cap. This is what keeps the shipped
+	// defaults (8 MiB trigger over a 4 MiB segment) from self-wedging.
+	// Fixed for the sender's lifetime, so re-applying it on every
+	// transport swap is a no-op past the first. maxFrameBytes is 0 in
+	// the hand-built test senders that exercise the server-cap table in
+	// isolation, so this term short-circuits there.
+	if s.maxFrameBytes > 0 {
+		if safe := s.maxFrameBytes * 9 / 10; safe < effective {
+			effective = safe
+		}
 	}
 	s.effectiveAutoFlushBytes.Store(effective)
 }
