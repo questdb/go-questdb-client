@@ -120,15 +120,23 @@ func newQwpCursorLineSender(
 	return s, nil
 }
 
-// newQwpCursorLineSenderFromConf wires a cursor-mode sender from
-// the parsed config. Resolves SF defaults, builds the cursor
-// engine + send loop, runs an initial connect (optionally with
+// newQwpCursorLineSenderFromConf wires a cursor-mode sender from the
+// parsed config. Handles BOTH memory mode (sf_dir empty → RAM-backed
+// cursor engine) and store-and-forward (sf_dir set → mmapped on-disk
+// segments). Resolves the mode-specific defaults, builds the cursor
+// engine + send loop with the shared multi-host failover plumbing
+// (host tracker, endpoint factory, initial-connect mode, reconnect
+// budgets), runs the initial connect (optionally with
 // retry-on-failure), and returns a sender ready for the user.
 //
 // Owns the cursor engine and the send loop; both are torn down on
 // sender.Close.
-func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig, address string, opts qwpTransportOpts) (LineSender, error) {
-	// Resolve defaults.
+func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig, opts qwpTransportOpts) (LineSender, error) {
+	// Resolve defaults. memMode (no sf_dir) selects a RAM-backed cursor
+	// engine (empty slot path) and the smaller memory-mode total-bytes
+	// ceiling; everything else — including the multi-host failover
+	// plumbing below — is shared with store-and-forward.
+	memMode := conf.sfDir == ""
 	senderId := conf.senderId
 	if senderId == "" {
 		senderId = qwpSfDefaultSenderId
@@ -140,6 +148,9 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	sfMaxTotalBytes := conf.sfMaxTotalBytes
 	if sfMaxTotalBytes <= 0 {
 		sfMaxTotalBytes = qwpSfDefaultMaxTotalBytes
+		if memMode {
+			sfMaxTotalBytes = qwpSfDefaultMemoryMaxTotalBytes
+		}
 	}
 	if sfMaxTotalBytes < sfMaxBytes {
 		// Caught earlier in sanitizeQwpConf, but defend in depth
@@ -169,8 +180,13 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		closeFlushTimeout = time.Duration(conf.closeFlushTimeoutMillis) * time.Millisecond
 	}
 
-	// Slot path = <sfDir>/<senderId>/.
-	slotPath := filepath.Join(conf.sfDir, senderId)
+	// Slot path = <sfDir>/<senderId>/. Empty in memory mode → the
+	// cursor engine allocates RAM-backed segments instead of opening
+	// mmapped files under the slot directory.
+	slotPath := ""
+	if !memMode {
+		slotPath = filepath.Join(conf.sfDir, senderId)
+	}
 
 	// Build the cursor engine first — it owns the slot lock and on-disk
 	// recovery.
@@ -283,6 +299,14 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	}
 	s.fileNameLimit = conf.fileNameLimit
 	s.encoder.gorillaDisabled = conf.gorillaDisabled
+	// Pre-size the encoder buffer for the microbatch role: the cursor
+	// engine copies each frame on append so one encoder slot suffices,
+	// but a large auto_flush_bytes warrants a bigger initial buffer to
+	// avoid repeated grows on the hot path. The qwpDefaultMicrobatchBufSize
+	// (1 MB) floor was already applied in newQwpCursorLineSender.
+	if conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
+		s.encoder.wb.preallocate(conf.autoFlushBytes * 2)
+	}
 	// Seed the byte-trigger clamp from the initial transport (the
 	// sync-connect branches above populated loop.transport; the
 	// async branch leaves it nil and the first reconnect callback

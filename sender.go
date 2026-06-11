@@ -1424,12 +1424,6 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 }
 
 func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
-	scheme := "ws"
-	if conf.tlsMode != tlsDisabled {
-		scheme = "wss"
-	}
-	address := scheme + "://" + conf.address
-
 	opts := qwpTransportOpts{
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
@@ -1451,60 +1445,15 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		opts.authorization = "Bearer " + conf.httpToken
 	}
 
-	// Cursor / SF mode: when sf_dir is set, build a cursor engine +
-	// send loop instead of qwpAsyncState. Memory mode (no sf_dir) is
-	// handled by the existing path below.
-	if conf.sfDir != "" {
-		return newQwpCursorLineSenderFromConf(ctx, conf, address, opts)
-	}
-
-	window := conf.inFlightWindow
-	if window <= 0 {
-		window = 1
-	}
-
-	s, err := newQwpLineSenderUnstarted(ctx, address, opts,
-		conf.autoFlushRows, conf.autoFlushInterval, conf.dumpWriter, window)
-	if err != nil {
-		return nil, err
-	}
-	s.maxBufSize = conf.maxBufSize
-	s.fileNameLimit = conf.fileNameLimit
-	s.autoFlushBytes = conf.autoFlushBytes
-	// Seed effectiveAutoFlushBytes from the initial transport (set
-	// by newQwpLineSenderUnstarted's synchronous dial) and install
-	// the swap callback so every reconnect re-applies the clamp.
-	// Both happen before sendLoopStart, so the producer's first
-	// auto-flush trigger and any subsequent reconnect see the
-	// up-to-date threshold.
-	s.cursorSendLoop.sendLoopSetOnTransportSwap(s.applyServerBatchSizeLimit)
-	s.applyServerBatchSizeLimit(s.cursorSendLoop.transport.Load())
-	// Memory mode also honours close_flush_timeout_millis (the
-	// spec-aligned name). closeFlushTimeoutSet distinguishes "user
-	// set 0 / negative -> fast close" from "user did not set ->
-	// keep the constructor's 5s default".
-	if conf.closeFlushTimeoutSet {
-		s.closeTimeout = time.Duration(conf.closeFlushTimeoutMillis) * time.Millisecond
-	}
-	s.encoder.gorillaDisabled = conf.gorillaDisabled
-	// Encoder buffer is pre-sized for the microbatch role: max(1 MB,
-	// 2 * autoFlushBytes). The 1 MB floor was already applied in
-	// newQwpLineSenderUnstarted; grow further if autoFlushBytes warrants it.
-	if conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
-		s.encoder.wb.preallocate(conf.autoFlushBytes * 2)
-	}
-	// Server-error API knobs (Phase 5). Apply BEFORE sendLoopStart so
-	// the very first received frame uses the user-configured handler
-	// and resolver, not the defaults.
-	resolver := &qwpSfPolicyResolver{
-		resolver: conf.errorPolicyResolver,
-		perCat:   conf.errorPolicyPerCat,
-		global:   conf.errorPolicyGlobal,
-	}
-	s.cursorSendLoop.sendLoopSetPolicyResolver(resolver)
-	s.cursorSendLoop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
-	s.cursorSendLoop.sendLoopStart()
-	return s, nil
+	// Both memory mode (no sf_dir) and store-and-forward (sf_dir set)
+	// run on the cursor engine + send loop, and both must honour the
+	// multi-host addr= list, the initial_connect_retry mode, and the
+	// reconnect_* budgets — per the README "Multi-host failover"
+	// section, those failover knobs apply whether or not sf_dir is set.
+	// The two modes differ only in the cursor engine's backing store
+	// (RAM vs mmapped files) and a couple of defaults, which
+	// newQwpCursorLineSenderFromConf resolves from conf.sfDir.
+	return newQwpCursorLineSenderFromConf(ctx, conf, opts)
 }
 
 func validateConf(conf *lineSenderConfig) error {

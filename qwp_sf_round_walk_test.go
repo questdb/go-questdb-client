@@ -867,6 +867,78 @@ func TestInitialConnectOffFailsWhenAllRejected(t *testing.T) {
 		"failure must surface promptly; OFF mode must not retry across rounds")
 }
 
+// TestQwpMemoryModeMultiHostFailsOverToHealthy is the regression test
+// for review C2: memory mode (no sf_dir) must honour the multi-host
+// addr= list exactly as SF mode does. The README's headline failover
+// example (ws::addr=node-a,node-b,node-c;) is memory mode, so a dead
+// first endpoint must not hard-fail the constructor — the sender has
+// to walk past it and bind on the first healthy peer, just like the SF
+// analog TestInitialConnectOffWalksMultiHostToHealthy above.
+//
+// Before the fix the memory path dialed only endpoints[0] (the
+// sanitizer rewrote addr to endpoints[0]; the constructor did one
+// synchronous dial through a single-host factory and installed no host
+// tracker), so this connect returned the dead host's upgrade error.
+func TestQwpMemoryModeMultiHostFailsOverToHealthy(t *testing.T) {
+	// Host 0: dead — rejects every upgrade with 503 (a "generic
+	// transient" the round walk steps past, per qwp_sf_round_walk.go).
+	dead := newRoundWalkRejectServer(t, http.StatusServiceUnavailable, nil)
+	defer dead.Close()
+	// Host 1: healthy SF-compatible server that ACKs frames.
+	healthy := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer healthy.Close()
+
+	deadAddr := strings.TrimPrefix(dead.URL, "http://")
+	healthyAddr := strings.TrimPrefix(healthy.URL, "http://")
+	// NO sf_dir → memory mode. Identical addr shape to the SF analog.
+	conf := fmt.Sprintf("ws::addr=%s,%s;close_flush_timeout_millis=2000;",
+		deadAddr, healthyAddr)
+
+	sender, err := LineSenderFromConf(context.Background(), conf)
+	require.NoError(t, err,
+		"memory-mode multi-host connect must walk past the dead first endpoint and bind on the healthy peer")
+	defer func() { _ = sender.Close(context.Background()) }()
+
+	require.NoError(t, sender.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	require.NoError(t, sender.Flush(context.Background()))
+	require.Eventually(t, func() bool {
+		return healthy.totalFramesReceived.Load() >= int64(1)
+	}, 2*time.Second, 1*time.Millisecond,
+		"the healthy peer must have received the row — proving the bind landed on host 1")
+}
+
+// TestQwpMemoryModeThreadsFailoverConfig pins the rest of review C2:
+// memory mode must thread the multi-host failover tracker AND the
+// user's reconnect budget into the send loop, not discard them. The
+// pre-fix memory path installed no tracker (so reconnect could never
+// fail over off the first node) and hard-coded
+// qwpSfDefaultReconnectMaxDuration (so user reconnect budgets were
+// silently dropped).
+func TestQwpMemoryModeThreadsFailoverConfig(t *testing.T) {
+	a := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer a.Close()
+	b := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer b.Close()
+	addrA := strings.TrimPrefix(a.URL, "http://")
+	addrB := strings.TrimPrefix(b.URL, "http://")
+
+	// NO sf_dir → memory mode, with a non-default reconnect budget.
+	conf := fmt.Sprintf("ws::addr=%s,%s;reconnect_max_duration_millis=1234;",
+		addrA, addrB)
+	sender, err := LineSenderFromConf(context.Background(), conf)
+	require.NoError(t, err)
+	defer func() { _ = sender.Close(context.Background()) }()
+
+	s, ok := sender.(*qwpLineSender)
+	require.True(t, ok, "want *qwpLineSender, got %T", sender)
+	require.NotNil(t, s.cursorSendLoop.tracker,
+		"memory mode must install the multi-host failover tracker")
+	require.Equal(t, 2, s.cursorSendLoop.tracker.Len(),
+		"the tracker must cover both configured endpoints")
+	require.Equal(t, 1234*time.Millisecond, s.cursorSendLoop.reconnectMaxDuration,
+		"memory mode must thread the user's reconnect_max_duration_millis, not the 5-minute default")
+}
+
 // newHangListener accepts TCP connections and parks them — never
 // writes any HTTP response, so a client awaiting the WebSocket 101
 // upgrade response hangs until its auth_timeout_ms fires. Used by
