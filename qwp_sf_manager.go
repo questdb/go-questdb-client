@@ -84,6 +84,13 @@ type qwpSfSegmentManager struct {
 	// done is closed when the worker goroutine exits.
 	done   chan struct{}
 	worker sync.WaitGroup
+
+	// ringSnapshot is workerLoop's reusable copy of rings. Each tick
+	// refills it from rings under mu, then releases mu before the
+	// per-ring service pass so the slow segment syscalls run without
+	// the lock held. Owned solely by workerLoop; the locked refill is
+	// its only synchronization.
+	ringSnapshot []qwpSfManagerRingEntry
 }
 
 // qwpSfManagerRingEntry holds a registered ring and the directory
@@ -311,7 +318,7 @@ func (m *qwpSfSegmentManager) workerLoop() {
 	timer := time.NewTimer(m.pollInterval)
 	defer timer.Stop()
 	for {
-		// Snapshot the registered rings so we don't hold the mutex
+		// Refill the reusable ring snapshot so we don't hold the mutex
 		// through the (potentially slow) syscalls during creation /
 		// unlink.
 		m.mu.Lock()
@@ -319,10 +326,9 @@ func (m *qwpSfSegmentManager) workerLoop() {
 			m.mu.Unlock()
 			return
 		}
-		snapshot := make([]qwpSfManagerRingEntry, len(m.rings))
-		copy(snapshot, m.rings)
+		m.ringSnapshot = append(m.ringSnapshot[:0], m.rings...)
 		m.mu.Unlock()
-		for _, e := range snapshot {
+		for _, e := range m.ringSnapshot {
 			m.serviceRing(e)
 		}
 		if !timer.Stop() {

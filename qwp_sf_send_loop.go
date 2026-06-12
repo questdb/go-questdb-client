@@ -37,14 +37,23 @@ import (
 	"github.com/coder/websocket"
 )
 
-// qwpSf send-loop tunables. Defaults match the Java
-// CursorWebSocketSendLoop spec.
+// qwpSf send-loop tunables. The reconnect and backoff defaults match
+// the Java CursorWebSocketSendLoop spec.
 const (
-	qwpSfDefaultParkInterval               = 50 * time.Microsecond
-	qwpSfDefaultReconnectMaxDuration       = 5 * time.Minute
-	qwpSfDefaultReconnectInitialBackoff    = 100 * time.Millisecond
-	qwpSfDefaultReconnectMaxBackoff        = 5 * time.Second
-	qwpSfReconnectLogThrottleInterval      = 5 * time.Second // throttle "attempt N failed" logs
+	// qwpSfDefaultParkInterval caps how long senderLoop sleeps when the
+	// engine has no new frame and the producer doorbell (wakeSender)
+	// has not fired. The doorbell drives every steady-state send, so
+	// this timer only bounds the recovery time of a missed wakeup and
+	// never gates send latency. The Java spec parks 50µs via
+	// LockSupport.parkNanos, a cheap futex-style park; re-arming a Go
+	// time.Timer that often costs a sizable fraction of a core per idle
+	// sender, so the Go port parks 1ms. Parity of the constant is not
+	// parity of cost.
+	qwpSfDefaultParkInterval            = 1 * time.Millisecond
+	qwpSfDefaultReconnectMaxDuration    = 5 * time.Minute
+	qwpSfDefaultReconnectInitialBackoff = 100 * time.Millisecond
+	qwpSfDefaultReconnectMaxBackoff     = 5 * time.Second
+	qwpSfReconnectLogThrottleInterval   = 5 * time.Second // throttle "attempt N failed" logs
 )
 
 // qwpSfMaxSilentConnStrikes is the number of consecutive ACK-less
@@ -105,9 +114,9 @@ type qwpSfSendLoop struct {
 	transport atomic.Pointer[qwpTransport]
 
 	// parkInterval bounds how long senderLoop sleeps when the engine
-	// has no new frame. The common case is now event-driven via the
-	// wakeup doorbell; this is the defense-in-depth fallback poll, so
-	// worst-case send latency is unchanged from the pure-poll design.
+	// has no new frame. The common case is event-driven via the wakeup
+	// doorbell; this is the defense-in-depth fallback poll. See
+	// qwpSfDefaultParkInterval for why it need not be tight.
 	parkInterval time.Duration
 
 	// wakeup is a single-slot doorbell rung by the producer (through
@@ -859,11 +868,10 @@ func (l *qwpSfSendLoop) runOneConnection() error {
 // WebSocket binary message. Returns ctx.Err() on shutdown or the
 // transport's send error on wire failure.
 func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
-	// One reusable timer instead of a fresh time.After per idle
-	// iteration: the old form leaked a parkInterval timer per spin
-	// and, multiplied by the ~20kHz idle wake rate, cost N senders
-	// N×20kHz wakeups. The doorbell makes the common case
-	// event-driven; the timer is only the bounded fallback poll.
+	// A single reusable timer backs the fallback poll, re-armed each
+	// idle iteration. The doorbell (wakeup) drives the common case, so
+	// the timer only bounds how long a missed wakeup can stall a ready
+	// frame; it never gates steady-state latency.
 	timer := time.NewTimer(l.parkInterval)
 	defer timer.Stop()
 	for {
