@@ -102,6 +102,15 @@ type qwpSfTestServerOpts struct {
 	// reconnect) right after the WS upgrade — exercises the
 	// receiver's pre-send rejection guard.
 	unsolicitedRejectAtConnect QwpStatusCode
+	// forgedAckAtConnect, when non-nil, is written verbatim to the
+	// client as a single WebSocket binary message immediately on
+	// connect — before and without reading any frame — after which the
+	// handler falls through to its normal read loop (which blocks,
+	// since tests using this don't run the sender). Lets a test inject
+	// an early / forged ACK whose sequence names a frame the client has
+	// not finished sending, exercising the receiver's highestFullySent
+	// clamp. Build it with buildAckOK / buildAckError.
+	forgedAckAtConnect []byte
 }
 
 // qwpSfTestServer is a fake QWP server for send-loop tests. It
@@ -204,6 +213,13 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			// pre-send rejection guard (no engineAcknowledge advance).
 			_ = conn.Write(context.Background(), websocket.MessageBinary,
 				buildAckError(opts.unsolicitedRejectAtConnect, 0, "pre-send-reject"))
+		}
+		if opts.forgedAckAtConnect != nil {
+			// Inject a caller-built early / forged ACK before reading
+			// any frame, then fall through to the read loop below (which
+			// blocks until the client tears the connection down).
+			_ = conn.Write(context.Background(), websocket.MessageBinary,
+				opts.forgedAckAtConnect)
 		}
 		for {
 			_, data, err := conn.Read(context.Background())
@@ -1376,4 +1392,103 @@ func TestQwpSfSendLoopDropAndContinue(t *testing.T) {
 	require.GreaterOrEqual(t, dispatched.Load(), int64(1))
 	// Counter bumped on the Drop path.
 	require.GreaterOrEqual(t, loop.sendLoopTotalServerErrors(), int64(1))
+}
+
+// TestQwpSfSendLoopReceiverClampsForgedAckToFullySent is the
+// lying-ACK regression guard. A non-compliant server ACKs a wire
+// sequence whose sendMessage has not yet returned (an early or forged
+// ACK for an in-flight frame). The receiver must clamp the watermark
+// advance to highestFullySent — the last frame fully on the wire — so
+// ackedFsn never covers a frame the send goroutine is still reading
+// out of the mmap'd segment (a trim would munmap it mid-read: SIGSEGV)
+// nor a frame that never went out (silent loss). nextWireSeq is one
+// frame too permissive for this ceiling because it is bumped before
+// the wire write.
+//
+// Layout for both cases: 4 frames published (FSN 0..3). The send
+// goroutine has STARTED all four (nextWireSeq=4) but only frames 0..2
+// have FINISHED sending (highestFullySent=2); FSN 3 is mid-sendMessage.
+// The server forges an ACK naming wire sequence 3. The clamp must hold
+// ackedFsn at FSN 2, never FSN 3. With the clamp keyed off
+// nextWireSeq-1 (=3) instead of highestFullySent (=2) the watermark
+// jumps to FSN 3 and the test fails.
+func TestQwpSfSendLoopReceiverClampsForgedAckToFullySent(t *testing.T) {
+	const (
+		published    = 4  // FSN 0..3 live in the engine
+		fsnAtZero    = 0  // fresh connection: wireSeq 0 maps to FSN 0
+		started      = 4  // nextWireSeq: wireSeq 0..3 all begun
+		fullySent    = 2  // highestFullySent: FSN 0..2 on the wire
+		forgedSeq    = 3  // server ACKs the in-flight FSN 3
+		wantAckedFsn = 2  // clamp ceiling, NOT forgedSeq (3)
+	)
+
+	// run drives receiverLoop in isolation against a server that
+	// greets the connection with forgedAck. The producer/sender
+	// goroutines never run, so the hand-pinned wire state (notably
+	// highestFullySent) stays put — FSN 3 stuck mid-sendMessage — while
+	// the receiver processes the single forged ACK. Returns the
+	// resulting ackedFsn.
+	run := func(t *testing.T, forgedAck []byte) int64 {
+		t.Helper()
+		srv := newQwpSfTestServer(t, qwpSfTestServerOpts{forgedAckAtConnect: forgedAck})
+		defer srv.Close()
+
+		engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		defer func() { _ = engine.engineClose() }()
+		for i := 0; i < published; i++ {
+			_, err := engine.engineAppendBlocking(context.Background(),
+				[]byte(fmt.Sprintf("f%d", i)))
+			require.NoError(t, err)
+		}
+		require.Equal(t, int64(published-1), engine.enginePublishedFsn())
+		require.Equal(t, int64(-1), engine.engineAckedFsn())
+
+		transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+		require.NoError(t, err)
+
+		loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+			100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		// Quiet, non-blocking error sink for the drop-and-continue case.
+		loop.sendLoopSetErrorHandler(func(*SenderError) {}, 8)
+
+		// Pin wire state as if the send goroutine had begun all four
+		// frames but only frames 0..2 finished sending.
+		loop.fsnAtZero.Store(fsnAtZero)
+		loop.nextWireSeq.Store(started)
+		loop.highestFullySent.Store(fullySent)
+		loop.running.Store(true)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = loop.receiverLoop(loop.ctx)
+		}()
+
+		require.Eventually(t, func() bool {
+			return engine.engineAckedFsn() != -1
+		}, 2*time.Second, time.Millisecond, "receiver never processed the forged ACK")
+		got := engine.engineAckedFsn()
+
+		_ = loop.sendLoopClose() // running=false, cancel ctx, close transport + dispatcher
+		<-done
+		return got
+	}
+
+	t.Run("OK ACK", func(t *testing.T) {
+		got := run(t, buildAckOK(forgedSeq))
+		assert.Equal(t, int64(wantAckedFsn), got,
+			"OK-path clamp must hold the watermark at the last fully-sent "+
+				"frame (FSN 2); FSN 3 is still mid-sendMessage")
+	})
+
+	t.Run("error ACK (drop-and-continue)", func(t *testing.T) {
+		// SchemaMismatch resolves to DropAndContinue by default, so the
+		// rejection path advances ackedFsn via engineAcknowledge(fsn) —
+		// exercising the second clamp site.
+		got := run(t, buildAckError(QwpStatusSchemaMismatch, forgedSeq, "forged"))
+		assert.Equal(t, int64(wantAckedFsn), got,
+			"rejection-path clamp must hold the watermark at the last "+
+				"fully-sent frame (FSN 2); FSN 3 is still mid-sendMessage")
+	})
 }
