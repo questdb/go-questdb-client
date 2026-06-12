@@ -159,9 +159,10 @@ type qwpTransportOpts struct {
 }
 
 // qwpTransport wraps a WebSocket connection for sending QWP
-// messages and receiving ACK responses. It is not safe for
-// concurrent use; in sync mode the caller goroutine owns it,
-// in async mode the I/O goroutine owns it.
+// messages and receiving ACK responses. It is owned by the I/O
+// goroutine(s) that drive it — the ingest send loop (qwpSfSendLoop),
+// or the egress reader plus dispatcher — and is not safe for
+// unrestricted concurrent use.
 type qwpTransport struct {
 	// conn is the live WebSocket. A successful connect() assigns it once
 	// and it is never mutated again for the life of the transport —
@@ -391,7 +392,7 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		// dial failures or response-header timeouts; in that case fall
 		// back to the wrapped dial error.
 		if resp != nil {
-			rejectErr := buildUpgradeRejectError(resp)
+			rejectErr := buildUpgradeRejectError(resp, err)
 			resp.Body.Close()
 			return rejectErr
 		}
@@ -488,8 +489,10 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 // qwpUpgradeBodySnippetCap bytes of the body so the error message
 // surfaces operator-supplied text (e.g. a reverse-proxy maintenance
 // page) without unbounded memory cost. The caller is responsible for
-// closing resp.Body once this returns.
-func buildUpgradeRejectError(resp *http.Response) *QwpUpgradeRejectError {
+// closing resp.Body once this returns. cause is the originating
+// websocket.Dial error, retained so it is wrapped (not discarded) —
+// notably when StatusCode is 101 but the upgrade still failed.
+func buildUpgradeRejectError(resp *http.Response, cause error) *QwpUpgradeRejectError {
 	role := strings.TrimSpace(resp.Header.Get("X-QuestDB-Role"))
 	zone := strings.TrimSpace(resp.Header.Get("X-QuestDB-Zone"))
 	var retryAfter time.Duration
@@ -521,6 +524,7 @@ func buildUpgradeRejectError(resp *http.Response) *QwpUpgradeRejectError {
 		Zone:       zone,
 		RetryAfter: retryAfter,
 		Body:       body,
+		cause:      cause,
 	}
 }
 
@@ -547,11 +551,12 @@ func (t *qwpTransport) sendMessage(ctx context.Context, data []byte) error {
 //     the trailing per-table entries section must consume the rest of
 //     the payload exactly.
 //
-//   - DURABLE_ACK frames are unsolicited per-table watermarks; we
-//     skip them and keep reading. Servers only emit them when the
-//     client opts in via the X-QWP-Request-Durable-Ack header, which
-//     this transport does not, but any well-formed durable-ack frame
-//     that arrives is silently consumed.
+//   - DURABLE_ACK frames are unsolicited per-table watermarks. They
+//     are validated and returned to the caller with status
+//     QwpStatusDurableAck — the caller decides what to do with them
+//     (the cursor send loop ignores them and reads on). Servers only
+//     emit them when the client opts in via the X-QWP-Request-Durable-
+//     Ack header, which this transport does not set.
 //
 //   - Error ACKs are exactly qwpAckErrorHeaderSize + msg_len bytes.
 //

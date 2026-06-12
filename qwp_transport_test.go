@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -1192,6 +1193,36 @@ func TestQwpTransportUpgradeRejectErrorIsTyped(t *testing.T) {
 	var rej *QwpUpgradeRejectError
 	require.ErrorAs(t, err, &rej)
 	assert.Equal(t, 421, rej.StatusCode)
+	// The originating websocket.Dial error is wrapped, not discarded.
+	assert.NotNil(t, errors.Unwrap(rej))
+}
+
+// TestQwpUpgradeRejectErrorWrapsCause pins that a non-101 upgrade
+// reject retains the originating dial error instead of discarding it.
+// The degenerate case is a 101 status — the HTTP handshake completed
+// but the WebSocket upgrade still failed (e.g. a bad
+// Sec-WebSocket-Accept); "rejected with HTTP 101" alone is misleading,
+// so the cause must survive in both the Unwrap chain and the message.
+func TestQwpUpgradeRejectErrorWrapsCause(t *testing.T) {
+	cause := errors.New("bad Sec-WebSocket-Accept")
+	rej := buildUpgradeRejectError(&http.Response{
+		StatusCode: 101,
+		Header:     http.Header{},
+	}, cause)
+	require.ErrorIs(t, rej, cause)
+	assert.Equal(t, cause, errors.Unwrap(rej))
+	assert.Contains(t, rej.Error(), "bad Sec-WebSocket-Accept")
+	assert.Contains(t, rej.Error(), "101")
+
+	// A normal non-101 reject keeps a clean, status-led message: the
+	// cause stays reachable via Unwrap (so errors.Is works), but is not
+	// appended to the human message the failover budget report quotes.
+	clean := buildUpgradeRejectError(&http.Response{
+		StatusCode: 421,
+		Header:     http.Header{"X-QuestDB-Role": []string{"PRIMARY"}},
+	}, errors.New("expected handshake response status code 101 but got 421"))
+	assert.NotContains(t, clean.Error(), "expected handshake response status code")
+	assert.NotNil(t, errors.Unwrap(clean))
 }
 
 // TestQwpTransportUpgradeRejectNoConnLeak drives many non-101 upgrade

@@ -55,6 +55,13 @@ type QwpUpgradeRejectError struct {
 	Zone       string
 	RetryAfter time.Duration
 	Body       string
+	// cause is the underlying websocket.Dial error. connect builds this
+	// type only on a dial failure, so it is non-nil in practice. It is
+	// the real reason the upgrade failed when StatusCode is 101: the
+	// HTTP exchange reached the handshake-complete status but the
+	// WebSocket upgrade itself was rejected (e.g. a bad
+	// Sec-WebSocket-Accept). Exposed via Unwrap.
+	cause error
 }
 
 // qwpUpgradeBodySnippetCap bounds how many response-body bytes the
@@ -82,7 +89,22 @@ func (e *QwpUpgradeRejectError) Error() string {
 	if e.Body != "" {
 		fmt.Fprintf(&b, ": %s", e.Body)
 	}
+	// A 101 status means the HTTP handshake completed but the WebSocket
+	// upgrade was still rejected, so "rejected with HTTP 101" is
+	// misleading on its own — surface the underlying dial error that
+	// actually explains the failure.
+	if e.StatusCode == 101 && e.cause != nil {
+		fmt.Fprintf(&b, ": %v", e.cause)
+	}
 	return b.String()
+}
+
+// Unwrap returns the underlying websocket.Dial error so errors.Is /
+// errors.As can reach the transport-level cause. Classification keys
+// off StatusCode via a top-level type assertion, so unwrapping does
+// not affect host-role classification.
+func (e *QwpUpgradeRejectError) Unwrap() error {
+	return e.cause
 }
 
 // IsRoleReject reports whether the upgrade was rejected with the

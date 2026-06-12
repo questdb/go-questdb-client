@@ -116,6 +116,10 @@ type qwpBatchBuffer struct {
 	// (== len(payload)). Captured at decode time so release() can feed
 	// it to the credit-replenish counter when flow control is enabled.
 	payloadLen int
+	// requestId is the query this batch belongs to, stamped at decode
+	// time. release() compares it against io.creditRequestId so a late
+	// release cannot credit a different query's window.
+	requestId int64
 	// io is the back-reference used by release() to return the buffer
 	// to its owning pool.
 	io *qwpEgressIO
@@ -251,6 +255,15 @@ type qwpEgressIO struct {
 	// consulted when creditEnabled.
 	pendingCredit atomic.Int64
 
+	// creditRequestId is the request_id whose CREDIT window pendingCredit
+	// is currently feeding — the dispatcher publishes it (atomically,
+	// since release() runs on the user goroutine) when it begins serving
+	// a query. releaseBuffer credits only a buffer whose own requestId
+	// still matches this, so a buffer released after its query ended and
+	// the next one started cannot pour stale bytes into the new query's
+	// window.
+	creditRequestId atomic.Int64
+
 	// ioCtx / ioCancel gate every conn-level I/O this struct owns —
 	// the reader's conn.Read and the dispatcher's conn.Write calls
 	// (sendQueryRequest / sendCancel / sendCredit). Cancelled on
@@ -307,8 +320,8 @@ type qwpEgressIO struct {
 	// subset of out-of-range reads could leave the dict accidentally
 	// in sync with the server (offsets match) while values are wrong,
 	// producing silently corrupted results — and never sent on a dead
-	// conn either. Mirrors the ingress-side asyncState.ioErr
-	// terminal-flag pattern (see CLAUDE.md).
+	// conn either. Mirrors the ingress send loop's latched terminal
+	// error (recordFatal / sendLoopCheckError in qwp_sf_send_loop.go).
 	ioErr error
 }
 
@@ -352,6 +365,7 @@ func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
 	}
 	io.cancelRequestId.Store(-1)
 	io.currentRequestId = -1
+	io.creditRequestId.Store(-1)
 	for i := 0; i < bufferPoolSize; i++ {
 		io.buffers <- &qwpBatchBuffer{io: io}
 	}
@@ -484,7 +498,16 @@ func (io *qwpEgressIO) releaseBuffer(buf *qwpBatchBuffer) {
 	// the latest counter. When creditEnabled is false, the dispatcher
 	// discards the counter; when true, it sends a CREDIT frame for
 	// the accumulated bytes.
-	io.pendingCredit.Add(int64(buf.payloadLen))
+	//
+	// Only credit when this buffer still belongs to the query the
+	// dispatcher is serving. A buffer released after its query ended —
+	// and a new query already started — would otherwise add its bytes to
+	// the new query's window. Crediting a finished query is itself moot
+	// (the dispatcher zeroes pendingCredit when it starts the next one),
+	// so skipping the stale add is always correct.
+	if buf.requestId == io.creditRequestId.Load() {
+		io.pendingCredit.Add(int64(buf.payloadLen))
+	}
 	select {
 	case io.buffers <- buf:
 	default:
@@ -499,6 +522,17 @@ func (io *qwpEgressIO) releaseBuffer(buf *qwpBatchBuffer) {
 	// initiated frame. Harmless when credit is disabled — the
 	// dispatcher just re-enters its select.
 	io.notify()
+}
+
+// recycleReadBuf returns a reader-owned pooled frame buffer to the
+// pool. nil-safe: error events and payloads not drawn from
+// io.readBufPool carry a nil bufRef. Called on the dispatcher
+// goroutine for every frame whose decode does not transfer buffer
+// ownership to a batch buffer (i.e. everything but a raw RESULT_BATCH).
+func (io *qwpEgressIO) recycleReadBuf(bufRef *[]byte) {
+	if bufRef != nil {
+		io.readBufPool.Put(bufRef)
+	}
 }
 
 // shutdown signals both goroutines to exit and blocks until the
@@ -674,6 +708,10 @@ func (io *qwpEgressIO) dispatcherRun() {
 		}
 
 		io.currentRequestId = req.requestId
+		// Publish the credit-attribution id before any buffer for this
+		// query can be released, so a release() on the user goroutine
+		// compares against the right query.
+		io.creditRequestId.Store(req.requestId)
 		io.creditEnabled = req.initialCredit > 0
 		io.currentQueryDone = false
 		// Drop any schema held for a prior query. The egress schema
@@ -769,11 +807,24 @@ func (io *qwpEgressIO) dispatchFrame(ev qwpReaderEvent) {
 		// poison the connection before emitting.
 		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
 		io.currentQueryDone = true
+		io.recycleReadBuf(ev.bufRef)
 		return
 	}
-	switch kind {
-	case qwpMsgKindResultBatch:
+	if kind == qwpMsgKindResultBatch {
+		// RESULT_BATCH columns may alias the pooled frame buffer on the
+		// raw path, so ownership of ev.bufRef passes to handleResultBatch,
+		// which hands it to the batch buffer and recycles it in
+		// releaseBuffer once the consumer is done.
 		io.handleResultBatch(payload, ev.bufRef)
+		return
+	}
+	// Every other frame kind is parsed synchronously below and copies
+	// out whatever it retains (decodeQueryError copies its message; the
+	// rest return scalars), so the pooled frame buffer is dead the
+	// moment the handler returns — recycle it rather than dropping it to
+	// GC, which on query-heavy workloads would undo the read-buffer pool.
+	defer io.recycleReadBuf(ev.bufRef)
+	switch kind {
 	case qwpMsgKindResultEnd:
 		io.handleResultEnd(payload)
 	case qwpMsgKindQueryError:
@@ -830,6 +881,7 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte, bufRef *[]byte) {
 		return
 	}
 	buf.payloadLen = len(payload)
+	buf.requestId = io.currentRequestId
 	if bufRef != nil && qwpSameBacking(payload, buf.batch.payload) {
 		// Raw (non-zstd) path: decode() left the batch's column slices
 		// aliasing our pooled frame buffer, so it must stay intact

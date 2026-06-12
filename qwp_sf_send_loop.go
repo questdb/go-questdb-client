@@ -717,6 +717,20 @@ func (l *qwpSfSendLoop) positionCursorInSegment(seg *qwpSfSegment, targetFsn int
 func (l *qwpSfSendLoop) run() {
 	defer l.wg.Done()
 	defer close(l.done)
+	// Release the active transport on every exit from this loop,
+	// including a terminal HALT (recordFatal* + offer, then return)
+	// where no reconnect or Close has swapped it out yet. Without this
+	// the dead WebSocket — and its server-side connection — would
+	// linger until the user eventually calls Close(). Idempotent and
+	// nil-safe: on a clean shutdown sendLoopClose has not yet swapped
+	// the transport (it does so after wg.Wait), so the swap here wins
+	// and its later swap sees nil; close() guards a nil conn and pins
+	// one result via closeOnce.
+	defer func() {
+		if t := l.transport.Swap(nil); t != nil {
+			_ = t.close()
+		}
+	}()
 
 	if l.transport.Load() == nil && l.running.Load() {
 		initial := errors.New("async initial connect deferred to I/O goroutine")

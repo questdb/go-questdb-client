@@ -960,8 +960,8 @@ func TestQwpEgressIODecodeFailure(t *testing.T) {
 // contract: once a decode error desyncs the per-connection decoder
 // state, ioErr is latched and every subsequent submitQuery returns
 // it immediately — a fresh query must never be decoded against
-// stale dict/schema state. Mirrors the ingest-side asyncState.ioErr
-// pattern documented in CLAUDE.md.
+// stale dict/schema state. Mirrors the ingest send loop's latched
+// terminal error (recordFatal / sendLoopCheckError).
 func TestQwpEgressIODecodeFailurePoisons(t *testing.T) {
 	const wantReqID = int64(31)
 

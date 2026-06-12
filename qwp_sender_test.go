@@ -1726,13 +1726,13 @@ func TestQwpSenderAsyncCloseAutoFlush(t *testing.T) {
 }
 
 func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
-	// In async mode the sender matches the Java client's
-	// flushPendingRows() semantics: schema and symbol IDs are
-	// advanced immediately after enqueue, not after ACK. If a batch
-	// later fails, the sender is poisoned via asyncState.ioErr and
-	// every subsequent user-facing call returns that error — so
-	// stale cache state can never reach the wire on a live
-	// connection. This test pins that invariant.
+	// The cursor sender matches the Java client's flushPendingRows()
+	// semantics: schema and symbol IDs are advanced immediately at
+	// enqueue, not after ACK. If a batch later fails, the send loop
+	// latches the terminal error (surfaced via sendLoopCheckError) and
+	// every subsequent user-facing call returns it — so stale cache
+	// state can never reach the wire on a live connection. This test
+	// pins that invariant.
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")

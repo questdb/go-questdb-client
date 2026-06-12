@@ -995,6 +995,18 @@ func (d *qwpQueryDecoder) parseFrameHeader(payload []byte) (qwpMsgKind, error) {
 			"frame version %d does not match negotiated version %d",
 			payload[4], d.negotiatedVersion))
 	}
+	// payload_length is the header's own count of the bytes that follow
+	// it; the encoder patches it to (frame size − header size). A
+	// mismatch against the actual body we received means the framing is
+	// desynced — reject it here rather than decode a frame whose length
+	// the server and we disagree on.
+	declaredPayloadLen := binary.LittleEndian.Uint32(
+		payload[qwpHeaderOffsetPayloadLen : qwpHeaderOffsetPayloadLen+4])
+	if int64(declaredPayloadLen) != int64(len(payload)-qwpHeaderSize) {
+		return 0, newQwpDecodeError(fmt.Sprintf(
+			"frame payload_length %d does not match body size %d",
+			declaredPayloadLen, len(payload)-qwpHeaderSize))
+	}
 	flags := payload[qwpHeaderOffsetFlags]
 	d.deltaOn = flags&qwpFlagDeltaSymbolDict != 0
 	d.gorillaOn = flags&qwpFlagGorilla != 0

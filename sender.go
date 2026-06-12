@@ -360,15 +360,16 @@ type lineSenderConfig struct {
 	protocolVersion protocolVersion
 
 	// QWP-specific fields
-	inFlightWindow  int       // 0 = unset (treated as sync mode 1); seeded to qwpDefaultInFlightWindow by newLineSenderConfig
+	inFlightWindow  int       // retained for config compatibility; a no-op in the cursor architecture (see WithInFlightWindow). Seeded to qwpDefaultInFlightWindow by newLineSenderConfig
 	dumpWriter      io.Writer // if set, record outgoing bytes (unexported)
 	gorillaDisabled bool      // false (default) = Gorilla timestamp encoding enabled
 
-	// QWP store-and-forward (cursor) fields. Setting sfDir activates
-	// cursor mode: flushed batches are persisted to mmap'd files
-	// under <sfDir>/<senderId>/ and the I/O loop replays from disk
-	// on reconnect / restart. When sfDir is empty, the sender stays
-	// on the in-memory async path (qwpAsyncState).
+	// QWP store-and-forward (cursor) fields. Setting sfDir selects
+	// disk-backed segments: flushed batches are persisted to mmap'd
+	// files under <sfDir>/<senderId>/ and the send loop replays from
+	// disk on reconnect / restart. When sfDir is empty, segments are
+	// memory-backed; both modes run on the same cursor engine + send
+	// loop.
 	sfDir                         string
 	senderId                      string // empty -> "default" at construction
 	sfMaxBytes                    int64  // per-segment size (bytes); 0 -> 4 MiB

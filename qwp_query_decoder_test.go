@@ -1197,6 +1197,22 @@ func TestQwpDecoderHardening(t *testing.T) {
 		}
 	})
 
+	t.Run("H3a_PayloadLengthMismatch", func(t *testing.T) {
+		// parseFrameHeader validates the header's declared
+		// payload_length against the body it actually received. A frame
+		// whose declared length disagrees with its size is a framing
+		// desync and must be rejected up front, not decoded.
+		correct := uint32(len(writeMinimalResultBatch()) - qwpHeaderSize)
+		for _, declared := range []uint32{correct + 1, correct - 1, 0} {
+			buf := writeMinimalResultBatch()
+			binary.LittleEndian.PutUint32(buf[qwpHeaderOffsetPayloadLen:], declared)
+			dec := newTestQueryDecoder()
+			var b QwpColumnBatch
+			err := dec.decode(buf, &b)
+			assertDecodeErrContains(t, err, "does not match body size")
+		}
+	})
+
 	t.Run("H4_UnexpectedMsgKind", func(t *testing.T) {
 		// Use a frame whose table_count matches the spoofed msg_kind so
 		// the per-kind RESULT_BATCH check is what fires (not the

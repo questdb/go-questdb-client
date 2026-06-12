@@ -551,8 +551,11 @@ func TestQwpSenderAwaitAckedFsnAlreadyAcked(t *testing.T) {
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.NoError(t, s.Flush(context.Background()))
 
-	// Flush already waited for ACK — AwaitAckedFsn for the same
-	// target returns immediately without consuming the deadline.
+	// Flush publishes the batch but does not wait for the ACK; the
+	// in-process test server ACKs almost immediately, so by the time
+	// AwaitAckedFsn runs the engine's acked FSN has reached the
+	// published target and it short-circuits without consuming the
+	// deadline.
 	target := engine.enginePublishedFsn()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
