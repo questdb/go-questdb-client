@@ -282,8 +282,20 @@ func TestQwpTransportConnectAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if tr.conn != nil {
-		t.Fatal("conn should be nil after close")
+	// close() shuts the connection down but deliberately leaves the conn
+	// field intact — it is immutable after connect so the egress reader
+	// and dispatcher can read it lock-free without racing a concurrent
+	// close (see qwpTransport.conn). The connection is nonetheless dead:
+	// I/O on it errors.
+	if tr.conn == nil {
+		t.Fatal("conn should be retained after close (immutable post-connect)")
+	}
+	if err := tr.sendMessage(context.Background(), []byte{0x00}); err == nil {
+		t.Fatal("sendMessage should fail on a closed connection")
+	}
+	// close() is idempotent: a repeat call returns the same nil result.
+	if err := tr.close(); err != nil {
+		t.Fatalf("second close: %v", err)
 	}
 }
 

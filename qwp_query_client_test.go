@@ -1239,6 +1239,61 @@ func TestQwpQueryClientCloseTwiceOK(t *testing.T) {
 	}
 }
 
+// TestQwpQueryClientCloseShortCtxNoReaderRace guards M2: Close(ctx) with
+// an already-cancelled ctx must not race the reader goroutine over the
+// transport's conn. shutdown(ctx) returns via ctx.Done() before doneCh
+// fires (the reader has not joined), so the transport teardown that
+// follows runs while the reader is still live inside readerRun. The
+// reader re-reads io.transport.conn every loop iteration; the teardown
+// must not mutate that field out from under it. Run under -race (CI uses
+// `go test -race`): before the fix this trips the detector on
+// io.transport.conn — readerRun's per-iteration field read vs close()'s
+// t.conn=nil write — and can nil-deref the unsupervised reader goroutine.
+func TestQwpQueryClientCloseShortCtxNoReaderRace(t *testing.T) {
+	// Server streams stray text frames as fast as it can and drains its
+	// own reads concurrently so the client's close handshake completes
+	// promptly. readerRun reads io.transport.conn every iteration, skips
+	// non-binary frames, and loops — so the reader goroutine spins on
+	// that field read while the close lands.
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		go func() {
+			for {
+				if _, _, err := m.conn.Read(context.Background()); err != nil {
+					return
+				}
+			}
+		}()
+		for {
+			if err := m.conn.Write(context.Background(), websocket.MessageText, []byte("x")); err != nil {
+				return
+			}
+		}
+	})
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	// Repeat: each round stands up a fresh generation whose reader spins
+	// on io.transport.conn, then closes it with an already-cancelled ctx.
+	// shutdown(ctx) returns via ctx.Done() before doneCh fires (the reader
+	// has not joined), so the pre-fix unconditional tr.close() nils
+	// io.transport.conn concurrently with the still-spinning reader — a
+	// data race the detector flags within a few rounds.
+	for i := 0; i < 40; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		c, err := NewQwpQueryClient(ctx, WithQwpQueryAddress(addr))
+		cancel()
+		if err != nil {
+			t.Fatalf("round %d ctor: %v", i, err)
+		}
+		// Let the reader reach its read-skip loop and spin on the conn
+		// field before the close writes it.
+		time.Sleep(2 * time.Millisecond)
+		closeCtx, closeCancel := context.WithCancel(context.Background())
+		closeCancel()
+		_ = c.Close(closeCtx)
+	}
+}
+
 // TestQwpQueryOnClosedClient verifies that Query/Exec on a closed
 // client surface an error instead of dialing a stale transport.
 func TestQwpQueryOnClosedClient(t *testing.T) {

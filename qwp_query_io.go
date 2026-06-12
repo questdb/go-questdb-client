@@ -270,9 +270,12 @@ type qwpEgressIO struct {
 
 	// shutdownCh closes when shutdown() is called for the first time.
 	// doneCh closes when BOTH dispatcher and reader goroutines have
-	// exited — shutdown() blocks on doneCh, so once it returns the
-	// caller can safely close the transport without racing the
-	// still-winding-down reader's conn.Read.
+	// exited — shutdown() blocks on doneCh, so a shutdown() that returns
+	// nil has fully joined both goroutines. A short-ctx shutdown() may
+	// instead return early via ctx.Done() with the goroutines still
+	// winding down; the transport teardown that follows stays race-free
+	// regardless because the conn field is immutable after connect (see
+	// qwpTransport.conn).
 	shutdownCh   chan struct{}
 	doneCh       chan struct{}
 	shutdownOnce sync.Once
@@ -359,9 +362,9 @@ func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
 // exactly once, before the first submitQuery.
 //
 // doneCh is closed by the WaitGroup-tracked wrapper once both
-// goroutines have returned — not by the dispatcher alone. This is
-// what makes tr.close() safe to call right after shutdown() returns:
-// the reader's conn.Read has already unwound before doneCh fires.
+// goroutines have returned — not by the dispatcher alone — so a
+// shutdown() that observes doneCh has joined the reader and dispatcher,
+// not just the dispatcher.
 func (io *qwpEgressIO) start() {
 	// Pin the decoder to the version the transport negotiated so
 	// parseFrameHeader rejects any server frame whose header version
@@ -600,8 +603,13 @@ func qwpSameBacking(a, b []byte) bool {
 // dispatcher's select sees EOF.
 func (io *qwpEgressIO) readerRun() {
 	defer close(io.frameCh)
+	// Capture the conn once. The transport assigns it before start()
+	// launches this goroutine and never mutates it again, so reading it
+	// a single time here keeps this loop off the transport's fields — a
+	// concurrent close() tearing the connection down cannot race it.
+	conn := io.transport.conn
 	for {
-		msgType, r, err := io.transport.conn.Reader(io.ioCtx)
+		msgType, r, err := conn.Reader(io.ioCtx)
 		if err != nil {
 			select {
 			case io.frameCh <- qwpReaderEvent{err: err}:
@@ -636,9 +644,8 @@ func (io *qwpEgressIO) readerRun() {
 
 // dispatcherRun is the dispatch goroutine's top-level loop. Exiting
 // just decrements the shutdown WaitGroup — doneCh is closed by the
-// start() wrapper only after the reader also exits, so that
-// tr.close() can run immediately after shutdown() returns without
-// racing the reader's in-flight conn.Read.
+// start() wrapper only after the reader also exits, so a shutdown()
+// that observes doneCh has joined both goroutines.
 func (io *qwpEgressIO) dispatcherRun() {
 	// Defers run LIFO: close(events) first, then closed.Store(true).
 	// Either order is safe because a consumer that wakes on the

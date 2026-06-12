@@ -38,6 +38,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -161,6 +162,14 @@ type qwpTransportOpts struct {
 // concurrent use; in sync mode the caller goroutine owns it,
 // in async mode the I/O goroutine owns it.
 type qwpTransport struct {
+	// conn is the live WebSocket. A successful connect() assigns it once
+	// and it is never mutated again for the life of the transport —
+	// close() shuts the connection down but leaves the field intact. That
+	// immutability is load-bearing: the egress reader and dispatcher read
+	// conn lock-free from their own goroutines, and a concurrent close()
+	// (e.g. a short-ctx Close that returns before those goroutines join)
+	// must not race them. A closed conn already errors every I/O, so
+	// nil-ing the field would buy nothing and only reintroduce that race.
 	conn *websocket.Conn
 
 	// recvBuf is a reusable buffer for reading ACK responses,
@@ -192,6 +201,13 @@ type qwpTransport struct {
 	// when opts.serverInfoTimeout is > 0. Nil on connections that did
 	// not opt into SERVER_INFO consumption (ingest senders).
 	serverInfo *QwpServerInfo
+
+	// closeOnce guards close() so the underlying conn is shut down at
+	// most once and repeat calls return the same result. It writes no
+	// field the I/O goroutines read — conn stays immutable (see above),
+	// so close() never races the lock-free reader/dispatcher.
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // teeConn wraps a net.Conn, copying all Write calls to a side writer.
@@ -566,14 +582,20 @@ func parseAckSequence(data []byte) int64 {
 	return int64(binary.LittleEndian.Uint64(data[qwpAckSequenceOffset : qwpAckSequenceOffset+8]))
 }
 
-// close sends a graceful WebSocket close frame and cleans up.
+// close shuts the WebSocket down with a graceful close frame. Idempotent
+// and safe to call concurrently with the egress reader/dispatcher: it
+// closes the conn — which unblocks and errors their in-flight Read/Write
+// — but never mutates the conn field, so it cannot race their lock-free
+// reads of it. coder/websocket's Conn.Close is itself safe under
+// concurrent and repeated calls; closeOnce additionally pins one result.
 func (t *qwpTransport) close() error {
 	if t.conn == nil {
 		return nil
 	}
-	err := t.conn.Close(websocket.StatusNormalClosure, "")
-	t.conn = nil
-	return err
+	t.closeOnce.Do(func() {
+		t.closeErr = t.conn.Close(websocket.StatusNormalClosure, "")
+	})
+	return t.closeErr
 }
 
 // --- fake server for dump mode ---
