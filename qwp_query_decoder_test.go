@@ -1307,6 +1307,91 @@ func TestQwpDecoderHardening(t *testing.T) {
 		assertDecodeErrContains(t, err, "row_count")
 	})
 
+	t.Run("H7a_CellCountAmplificationRejected", func(t *testing.T) {
+		// M3 regression. An all-null column is nearly free on the wire (a
+		// rowCount/8 null bitmap, zstd-compressible to almost nothing) yet
+		// forces a rowCount-sized index array. row_count and column_count
+		// are each individually within their caps here, but their product
+		// overruns qwpMaxCellsPerBatch — a frame that, if decoded, would
+		// drive a multi-GiB transient allocation. The decoder must reject
+		// it up front, before the per-column loop sizes any index array.
+		//
+		// The frame carries the inline schema for every column but NO
+		// column data: a decoder that skipped the cell-count guard would
+		// fault later reading the first column's null section off the end
+		// of the buffer, never with this "cell count" error.
+		const rowCount = qwpMaxRowsPerBatch
+		columnCount := int(qwpMaxCellsPerBatch/rowCount) + 1
+		if columnCount > qwpMaxColumnsPerTable {
+			t.Fatalf("test setup: columnCount %d exceeds the column cap", columnCount)
+		}
+		var buf bytes.Buffer
+		_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
+		buf.WriteByte(qwpVersion)
+		buf.WriteByte(0)
+		_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(byte(qwpMsgKindResultBatch))
+		_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
+		putVarintBytes(&buf, 0)                   // batch_seq
+		putVarintBytes(&buf, 0)                   // table_name_len
+		putVarintBytes(&buf, uint64(rowCount))    // row_count
+		putVarintBytes(&buf, uint64(columnCount)) // column_count
+		// Inline schema: one tiny LONG column def each (1-byte name +
+		// type code). No column data follows.
+		for i := 0; i < columnCount; i++ {
+			putVarintBytes(&buf, 1)
+			buf.WriteByte('c')
+			buf.WriteByte(byte(qwpTypeLong))
+		}
+		out := buf.Bytes()
+		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
+
+		dec := newTestQueryDecoder()
+		var b QwpColumnBatch
+		err := dec.decode(out, &b)
+		assertDecodeErrContains(t, err, "cell count")
+	})
+
+	t.Run("H7b_CellCountAtCapNotRejectedByGuard", func(t *testing.T) {
+		// Boundary: a batch whose cell count is exactly at the cap clears
+		// the guard. The frame again carries no column data, so decoding
+		// fails while reading the first column — proving the guard did NOT
+		// fire (it would have produced a "cell count" error instead) and
+		// that a maximal conformant batch is not rejected.
+		const rowCount = qwpMaxRowsPerBatch
+		columnCount := int(qwpMaxCellsPerBatch / rowCount) // exactly at the cap
+		var buf bytes.Buffer
+		_ = binary.Write(&buf, binary.LittleEndian, qwpMagic)
+		buf.WriteByte(qwpVersion)
+		buf.WriteByte(0)
+		_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(byte(qwpMsgKindResultBatch))
+		_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
+		putVarintBytes(&buf, 0)                   // batch_seq
+		putVarintBytes(&buf, 0)                   // table_name_len
+		putVarintBytes(&buf, uint64(rowCount))    // row_count
+		putVarintBytes(&buf, uint64(columnCount)) // column_count
+		for i := 0; i < columnCount; i++ {
+			putVarintBytes(&buf, 1)
+			buf.WriteByte('c')
+			buf.WriteByte(byte(qwpTypeLong))
+		}
+		out := buf.Bytes()
+		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
+
+		dec := newTestQueryDecoder()
+		var b QwpColumnBatch
+		err := dec.decode(out, &b)
+		if err == nil {
+			t.Fatal("expected a truncation error reading the first column, got nil")
+		}
+		if containsAny(err.Error(), []string{"cell count"}) {
+			t.Fatalf("cell-count guard fired at the cap boundary: %v", err)
+		}
+	})
+
 	t.Run("H16_StringNegativeTotalBytes", func(t *testing.T) {
 		buf := writeStringResultBatch(1, -1)
 		dec := newTestQueryDecoder()

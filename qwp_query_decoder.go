@@ -387,6 +387,26 @@ func (d *qwpQueryDecoder) decode(payload []byte, out *QwpColumnBatch) error {
 		columnCount = len(cols)
 	}
 
+	// Bound the declared cell count (row_count × column_count) before the
+	// per-column loop sizes any scratch. The decoder materialises a
+	// row-indexed array — rowCount entries wide — for every column that
+	// carries nulls (nonNullIdx) and for every SYMBOL (symbolRowIds) and
+	// ARRAY (arrayRowStart + arrayElems) column, 4..12 bytes of heap per
+	// row. An all-null column is nearly free on the wire (a rowCount/8
+	// null bitmap, zstd-compressible to almost nothing) yet forces that
+	// full rowCount-sized allocation; a frame packed with such columns up
+	// to the decompressed cap would drive multi-GiB transient make()s.
+	// row_count and column_count are each individually capped above, but
+	// their product is not — guard it here so amplified frames are
+	// rejected before any index array is allocated. The int64 product
+	// cannot overflow: both factors are non-negative and within caps that
+	// keep the product well under int64 max.
+	if int64(rowCount)*int64(columnCount) > qwpMaxCellsPerBatch {
+		return newQwpDecodeError(fmt.Sprintf(
+			"RESULT_BATCH cell count out of range: row_count %d × column_count %d exceeds cap %d",
+			rowCount, columnCount, int64(qwpMaxCellsPerBatch)))
+	}
+
 	// Grow the batch's own layout pool to columnCount. Pool-owned
 	// slices are preserved so subsequent decodes into the SAME batch
 	// with the same column width don't reallocate — the I/O goroutine

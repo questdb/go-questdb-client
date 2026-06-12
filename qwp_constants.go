@@ -284,6 +284,24 @@ const (
 	// int32. The 1024-byte slack covers that shape header.
 	qwpMaxArrayElements = (1<<31 - 1 - 1024) / 8
 
+	// qwpMaxCellsPerBatch caps the declared cell count (row_count ×
+	// column_count) of one RESULT_BATCH. The decoder materialises a
+	// row-indexed scratch array — rowCount entries wide — for every
+	// column that carries nulls (nonNullIdx) and for every SYMBOL
+	// (symbolRowIds) and ARRAY (arrayRowStart + arrayElems) column, so a
+	// single column costs 4..12 bytes of heap per row. An all-null column
+	// is nearly free on the wire — a rowCount/8 null bitmap that
+	// zstd-compresses to almost nothing — yet still forces that full
+	// rowCount-sized allocation: a 32–96× amplification. A frame packed
+	// with such columns up to the decompressed-frame cap would otherwise
+	// drive multi-GiB transient `make`s. A conformant server spends at
+	// least one wire byte per cell, so a legitimate batch never declares
+	// more cells than its maximum possible decompressed byte size. Tying
+	// the cap to qwpZstdMaxDecompressedSize rejects amplified frames up
+	// front — before the per-column loop sizes any index array — while
+	// clearing every batch a real server emits.
+	qwpMaxCellsPerBatch = qwpZstdMaxDecompressedSize
+
 	// qwpReadLimitSlack is headroom added on top of qwpMaxBatchSize when
 	// arming the WebSocket read limit. coder/websocket's limitReader
 	// trips ErrMessageTooBig the moment its byte budget reaches zero —
