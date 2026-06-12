@@ -330,7 +330,7 @@ type lineSenderConfig struct {
 	// validation time since neither transport supports multi-host yet.
 	endpoints     []qwpEndpoint
 	authTimeoutMs int             // QWP-only; 0 -> 15000 (15s) at sanitize time
-	zone          string          // QWP-only; silently ignored on SF ingress (zone-blind, v1-pinned)
+	zone          string          // QWP-only; honoured on egress, inert on ingest (no zone routing)
 	target        qwpTargetFilter // QWP-only; zero value = qwpTargetAny
 
 	// Retry/timeout-related fields
@@ -704,10 +704,9 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 }
 
 // WithZone sets the failover zone hint used for endpoint locality.
-// It is silently stored but currently inert on SF ingress, which is
-// zone-blind (wire v1-pinned) and treats every host as local; egress
-// will consult it once zone-locality routing lands. Equivalent to the
-// connect-string zone key.
+// It is silently stored but inert on the ingestion path, which does
+// not route by zone; the egress (query) path consults it to prefer
+// same-zone endpoints. Equivalent to the connect-string zone key.
 //
 // Only available for the QWP sender.
 func WithZone(zone string) LineSenderOption {

@@ -354,11 +354,11 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
 			// Egress consumes this via the (state, zone) priority
-			// lattice (failover.md §2); ingress is zone-blind by
-			// spec (wire-ingress.md §3 / failover.md §7) and the
-			// value never reaches the SF tracker. Silently accepted
-			// on both so a single connect string works across
-			// ingress and egress clients without per-startup noise.
+			// lattice (failover.md §2); the ingestion path does not
+			// route by zone, so the value never reaches the SF tracker.
+			// Silently accepted on both so a single connect string works
+			// across ingress and egress clients without per-startup
+			// noise.
 			senderConf.zone = v
 		case "target":
 			if senderConf.senderType != qwpSenderType {

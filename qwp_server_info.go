@@ -26,10 +26,11 @@ package questdb
 
 import "fmt"
 
-// QwpServerInfo is the decoded SERVER_INFO frame delivered by a v2 QWP
-// egress server as the first WebSocket frame after the upgrade
-// handshake. v1 servers do not emit it, in which case the
-// QwpQueryClient.ServerInfo() accessor returns nil.
+// QwpServerInfo is the decoded SERVER_INFO frame the server emits as
+// the first WebSocket frame after the upgrade handshake. The
+// QwpQueryClient.ServerInfo() accessor returns nil when the client did
+// not consume it (serverInfoTimeout disabled) or the server sent no
+// parseable frame.
 //
 // All fields are populated from a single decode pass; the struct is
 // immutable from the user's perspective and safe to share across

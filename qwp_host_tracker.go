@@ -102,7 +102,8 @@ const (
 	// the master regardless of geography). Priority 1.
 	qwpZoneSame qwpZoneTier = iota
 	// qwpZoneUnknown: server did not advertise a zone (no CAP_ZONE,
-	// no X-QuestDB-Zone header, or v1-pinned client). Priority 2.
+	// no X-QuestDB-Zone header, or the client did not consume
+	// SERVER_INFO). Priority 2.
 	qwpZoneUnknown
 	// qwpZoneOther: server advertised a zone that differs from the
 	// client's `zone=`. Priority 3 (worst). Only reachable when the

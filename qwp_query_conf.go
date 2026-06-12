@@ -87,10 +87,11 @@ type qwpQueryClientConfig struct {
 	tlsMode tlsMode
 
 	// target constrains the connect walk by SERVER_INFO.role. Default
-	// is qwpTargetAny, which accepts any role and is satisfied by v1
-	// servers (which do not emit SERVER_INFO at all). qwpTargetPrimary
-	// and qwpTargetReplica require v2 (without SERVER_INFO the role
-	// is unknown and the filter cannot be evaluated).
+	// is qwpTargetAny, which accepts any role and so needs no role
+	// byte. qwpTargetPrimary and qwpTargetReplica do: if the client
+	// does not consume SERVER_INFO (serverInfoTimeout disabled) or the
+	// server sends no parseable frame, the role is unknown and the
+	// filter cannot be evaluated.
 	target qwpTargetFilter
 	// zone is the client's opaque, case-insensitive locality hint
 	// (failover.md §1.1). When set and target != primary, the host
@@ -99,8 +100,8 @@ type qwpQueryClientConfig struct {
 	// header on a 421 reject) matches, via the (state, zone) priority
 	// lattice. Empty (the default) collapses every host to the Same
 	// tier, i.e. zone-blind selection. Shared verbatim with the
-	// ingest connect string, where it is accepted-but-inert (SF
-	// ingress is v1-pinned and zone-blind).
+	// ingest connect string, where it is accepted-but-inert (the
+	// ingestion path does not route by zone).
 	zone string
 	// authTimeoutMs is the failover.md §1.1 per-host upper bound on
 	// the HTTP upgrade response read (the wait between writing the

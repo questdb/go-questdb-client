@@ -181,9 +181,9 @@ type qwpSfSingleRoundResult struct {
 	// exhausted. Nil on success / terminal / cancelled exits.
 	LastError error
 	// LastWasRoleReject indicates the most recent failure was a
-	// role-reject (421 + role header, or v2 SERVER_INFO target
-	// mismatch). Drives the outer loop's round-boundary backoff
-	// selection per §3.2.
+	// role-reject (421 + role header, or a SERVER_INFO role mismatch
+	// on the egress connect-walk). Drives the outer loop's round-
+	// boundary backoff selection per §3.2.
 	LastWasRoleReject bool
 }
 
@@ -329,11 +329,10 @@ func qwpSfRunSingleRound(
 				}
 			}
 			// X-QuestDB-Zone on a 421 reject is intentionally ignored
-			// on the SF-ingest path: ingress is zone-blind by spec
-			// (wire-ingress.md §3 / failover.md §7) and the tracker
-			// is constructed with clientZone="" so every host stays
-			// Same anyway. The egress connectWalk consumes the same
-			// header in qwp_query_failover.go.
+			// on the SF-ingest path: the ingress walk does not route by
+			// zone, and the tracker is constructed with clientZone="" so
+			// every host stays Same anyway. The egress connect-walk
+			// consumes the same header in qwp_query_failover.go.
 			// 421 + non-empty role: role-reject (transient or topology).
 			// 421 without role, 404, 426, 503, etc.: generic transient.
 			if rej.IsRoleReject() {

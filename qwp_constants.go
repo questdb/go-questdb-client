@@ -30,7 +30,7 @@ import "time"
 type qwpTypeCode byte
 
 // QWP column type codes. Each type has a specific wire encoding
-// defined in the QWP v1 protocol specification.
+// defined in the QWP protocol specification.
 const (
 	qwpTypeBoolean       qwpTypeCode = 0x01 // bit-packed, 1 bit per value
 	qwpTypeByte          qwpTypeCode = 0x02 // int8, 1 byte

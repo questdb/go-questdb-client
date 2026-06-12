@@ -26,7 +26,7 @@ package questdb
 
 import "fmt"
 
-// qwpEncoder encodes qwpTableBuffer data into QWP v1 binary messages.
+// qwpEncoder encodes qwpTableBuffer data into QWP binary messages.
 // It owns a reusable qwpWireBuffer to minimize allocations across
 // successive encode calls.
 //

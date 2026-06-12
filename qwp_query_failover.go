@@ -360,7 +360,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 
 		info := tr.serverInfo
 		if info != nil && info.Capabilities&qwpCapZone != 0 {
-			// Server advertised its zone on the v2 SERVER_INFO frame.
+			// Server advertised its zone on the SERVER_INFO frame.
 			tracker.RecordZone(idx, info.ZoneId)
 		}
 		if info == nil && cfg.target != qwpTargetAny {

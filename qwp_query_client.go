@@ -99,8 +99,9 @@ type QwpQueryClient struct {
 	// the reconnect walk.
 	currentEndpointIdx atomic.Int32
 	// serverInfo holds the SERVER_INFO from the bound generation.
-	// Nil on v1 connections. Written by connectWalk and
-	// reconnectAndReplay; read via the public ServerInfo() accessor.
+	// Nil when it was not consumed (serverInfoTimeout disabled or no
+	// parseable frame). Written by connectWalk and reconnectAndReplay;
+	// read via the public ServerInfo() accessor.
 	serverInfo atomic.Pointer[QwpServerInfo]
 
 	// nextRequestId is the monotonic client-assigned request id
@@ -151,11 +152,11 @@ func (c *QwpQueryClient) publishGeneration(r *qwpConnectResult) {
 }
 
 // ServerInfo returns the SERVER_INFO frame consumed during the bound
-// generation's WebSocket handshake, or nil if the negotiated version
-// is v1 (no SERVER_INFO emitted). The returned pointer is owned by
-// the client and is replaced atomically on each transparent failover
-// reconnect; callers that need to retain a value across a possible
-// reconnect should copy out the fields.
+// generation's WebSocket handshake, or nil if the client did not
+// consume one (serverInfoTimeout disabled or no parseable frame). The
+// returned pointer is owned by the client and is replaced atomically
+// on each transparent failover reconnect; callers that need to retain
+// a value across a possible reconnect should copy out the fields.
 func (c *QwpQueryClient) ServerInfo() *QwpServerInfo {
 	return c.serverInfo.Load()
 }
@@ -343,8 +344,9 @@ func WithQwpQueryTls() QwpQueryClientOption {
 // withTarget. An invalid value is deferred to validate(): the client
 // constructor surfaces the error.
 //
-// target=primary or replica forces v2 negotiation: a v1 server has
-// no SERVER_INFO and cannot satisfy a role-specific filter.
+// target=primary or replica requires the server role from SERVER_INFO;
+// if the client does not consume SERVER_INFO the role is unknown and a
+// role-specific filter cannot be satisfied.
 func WithQwpQueryTarget(target string) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) {
 		t, err := parseTargetFilter(target)
@@ -533,7 +535,7 @@ var errClosedDuringFailover = errors.New(
 // candidate and is retried if nothing better binds — including the
 // n=1 case), publishes the new generation, and resubmits the
 // in-flight query with a fresh requestId. Returns the new
-// generation's QwpServerInfo (nil for v1) or a non-nil error if the
+// generation's QwpServerInfo (nil if none consumed) or a non-nil error if the
 // walk fails. Holds c.genMu for the duration of the swap so two
 // concurrent transport faults serialise and so a concurrent Close
 // cannot interleave with the swap.
