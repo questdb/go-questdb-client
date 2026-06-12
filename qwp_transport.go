@@ -223,6 +223,75 @@ func (c *teeConn) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
+// asyncWritePipeConn wraps the client end of the dump-mode net.Pipe so
+// Write queues the bytes and returns immediately, emulating a kernel
+// socket's send buffer. A real socket buffers the client's send, so
+// sendMessage returns — and the send loop stores highestFullySent —
+// before the server reads the frame and replies. net.Pipe is
+// synchronous: Write blocks until the peer reads, which lets the fake
+// server's OK ACK reach the receiver before highestFullySent is stored.
+// The receiver then clamps that ACK away (its highestFullySent < 0
+// guard) and never advances ackedFsn, so Close drains until timeout.
+// Queuing the write restores the production ordering. A single pump
+// goroutine drains the queue in FIFO order, preserving frame boundaries
+// and byte order; Read and all net.Conn metadata pass through to the
+// embedded pipe end.
+type asyncWritePipeConn struct {
+	net.Conn
+	mu     sync.Mutex
+	cond   *sync.Cond
+	queued []byte
+	closed bool
+}
+
+func newAsyncWritePipeConn(c net.Conn) *asyncWritePipeConn {
+	a := &asyncWritePipeConn{Conn: c}
+	a.cond = sync.NewCond(&a.mu)
+	go a.pump()
+	return a
+}
+
+func (a *asyncWritePipeConn) Write(p []byte) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return 0, net.ErrClosed
+	}
+	a.queued = append(a.queued, p...)
+	a.cond.Signal()
+	return len(p), nil
+}
+
+// pump owns the only Write to the embedded pipe, so queued chunks reach
+// the fake server in order and never interleave. It exits once the conn
+// is closed and the queue is drained.
+func (a *asyncWritePipeConn) pump() {
+	for {
+		a.mu.Lock()
+		for len(a.queued) == 0 && !a.closed {
+			a.cond.Wait()
+		}
+		if len(a.queued) == 0 && a.closed {
+			a.mu.Unlock()
+			return
+		}
+		chunk := a.queued
+		a.queued = nil
+		a.mu.Unlock()
+		if _, err := a.Conn.Write(chunk); err != nil {
+			return
+		}
+	}
+}
+
+func (a *asyncWritePipeConn) Close() error {
+	a.mu.Lock()
+	a.closed = true
+	a.cond.Signal()
+	a.mu.Unlock()
+	return a.Conn.Close()
+}
+
 // connect establishes a WebSocket connection to the QWP endpoint.
 // The url should be a ws:// or wss:// URL without the path; the path
 // comes from opts.endpointPath, which is required.
@@ -282,20 +351,26 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	}
 
 	if t.dumpWriter != nil {
-		// Dump mode: use an in-process pipe with a fake server.
+		// Dump mode: use an in-process pipe with a fake server. The
+		// client write end is buffered (asyncWritePipeConn) so it
+		// behaves like a real socket — without it the synchronous pipe
+		// lets the fake server's ACK race the send loop's bookkeeping.
 		clientConn, serverConn := net.Pipe()
 		go qwpFakeServer(serverConn)
-		wrapped := &teeConn{Conn: clientConn, w: t.dumpWriter}
+		buffered := newAsyncWritePipeConn(clientConn)
+		wrapped := &teeConn{Conn: buffered, w: t.dumpWriter}
 		httpTransport.DialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
 			return wrapped, nil
 		}
 		// Use a dummy URL so the WS library has something to parse.
 		wsURL = "ws://dump.local" + path
 
-		// If Dial fails, close the pipe so the fake server goroutine exits.
+		// If Dial fails, close the buffered conn so the pump and fake
+		// server goroutines exit. On success the WebSocket owns wrapped
+		// and its Close path tears both down.
 		defer func() {
 			if t.conn == nil {
-				clientConn.Close()
+				buffered.Close()
 			}
 		}()
 	} else if opts.tlsInsecureSkipVerify {
