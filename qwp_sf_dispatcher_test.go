@@ -411,3 +411,61 @@ func TestQwpSfDispatcherExternalCloseStillJoinsLoop(t *testing.T) {
 		t.Fatal("external close() did not return after the loop drained")
 	}
 }
+
+// TestQwpSfDispatcherCloseBoundedOnStuckHandler is a regression test
+// for M15: a SenderErrorHandler that never returns must not make
+// close() hang forever. The loop goroutine is parked inside deliver()
+// and never calls wg.Done(); close() bounds its join by
+// qwpSfDispatcherCloseJoinTimeout, abandons the wedged goroutine, and
+// returns. Notifications it could not deliver are counted as dropped.
+func TestQwpSfDispatcherCloseBoundedOnStuckHandler(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block) // release the wedged goroutine at test end
+	var inHandler atomic.Bool
+	d := newQwpSfErrorDispatcher(func(e *SenderError) {
+		inHandler.Store(true)
+		<-block // never returns until the test ends
+	}, 4)
+
+	// First offer lazy-starts the loop and pins it in the handler.
+	if !d.offer(&SenderError{Category: CategoryParseError, ToFsn: 0}) {
+		t.Fatal("offer rejected on a fresh dispatcher")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !inHandler.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("handler never invoked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Queue more behind the wedged handler so close() has items to
+	// account as dropped (capacity is 4, so these three never overflow
+	// on the way in).
+	for i := 1; i <= 3; i++ {
+		if !d.offer(&SenderError{Category: CategoryParseError, ToFsn: int64(i)}) {
+			t.Fatalf("offer %d rejected on a non-full inbox", i)
+		}
+	}
+
+	closeReturned := make(chan struct{})
+	start := time.Now()
+	go func() {
+		d.close()
+		close(closeReturned)
+	}()
+	select {
+	case <-closeReturned:
+	case <-time.After(qwpSfDispatcherCloseJoinTimeout + 2*time.Second):
+		t.Fatal("close() hung on a never-returning handler")
+	}
+	// Must have waited at least the join budget before abandoning — a
+	// near-instant return would mean the bound was skipped.
+	if elapsed := time.Since(start); elapsed < qwpSfDispatcherCloseJoinTimeout {
+		t.Errorf("close() returned after %s, want ≥ join budget %s",
+			elapsed, qwpSfDispatcherCloseJoinTimeout)
+	}
+	// The three queued-but-undelivered items were abandoned as dropped.
+	if got := d.droppedNotifications(); got != 3 {
+		t.Errorf("dropped = %d, want 3 (queued items abandoned at bounded close)", got)
+	}
+}

@@ -47,6 +47,17 @@ const qwpSfMinErrorInboxCapacity = 16
 // up and abandoning anything still in the inbox.
 const qwpSfDispatcherDrainTimeout = 100 * time.Millisecond
 
+// qwpSfDispatcherCloseJoinTimeout bounds how long close() waits to
+// join the dispatch goroutine after signalling done. A healthy
+// goroutine finishes its in-flight handler call and its own bounded
+// drain() well within this budget. A user handler wedged in a
+// never-returning call leaves the goroutine parked in deliver(), so
+// it never observes done and never calls wg.Done(); the bound lets
+// close() abandon that goroutine instead of blocking on it forever.
+// Larger than qwpSfDispatcherDrainTimeout so a handler that is merely
+// slow (not wedged) still joins cleanly.
+const qwpSfDispatcherCloseJoinTimeout = 2 * qwpSfDispatcherDrainTimeout
+
 // qwpSfErrorDispatcher is the off-I/O delivery channel for SenderError
 // notifications. The I/O goroutine offers errors non-blockingly into a
 // bounded channel; a dedicated goroutine drains the channel and
@@ -246,26 +257,32 @@ func (d *qwpSfErrorDispatcher) deliver(e *SenderError) {
 	d.handler(e)
 }
 
-// close stops the dispatch goroutine and waits for it to finish
-// draining (up to qwpSfDispatcherDrainTimeout). Idempotent — second
-// and subsequent calls are no-ops.
+// close stops the dispatch goroutine and joins it within a bounded
+// budget. Idempotent — second and subsequent calls are no-ops.
 //
 // Acquires mu before flipping closed and closing done, so any
 // in-flight offer either commits its send first (and gets handled
 // below) or sees closed=true and returns false.
 //
-// Two post-wait paths:
+// Paths after signalling done:
+//
+//   - Caller is the loop goroutine itself (a handler re-entering
+//     close): the re-entrant guard returns immediately. Joining here
+//     would self-deadlock; loop() unwinds the handler, observes done,
+//     and runs its own bounded drain().
 //
 //   - Goroutine never started (no offer ever succeeded, or only
-//     direct inbox injection in tests): no loop/drain ran, so call
-//     drain() here to deliver any queued items within the same
-//     bounded budget.
+//     direct inbox injection in tests): drain() here delivers any
+//     queued items within the bounded budget.
 //
-//   - Goroutine ran: drain() already had its budget. Anything still
-//     in the inbox is what drain() deliberately abandoned via its
-//     timeout (slow handler). Re-delivering on the way out would
-//     defeat the cap, so count those as dropped and exit. This is
-//     what makes qwpSfDispatcherDrainTimeout a hard ceiling on
+//   - Goroutine ran: join it, bounded by
+//     qwpSfDispatcherCloseJoinTimeout. A handler wedged in a
+//     never-returning call keeps loop() parked in deliver(), so the
+//     join times out and the goroutine is abandoned rather than hung
+//     on. Whatever is still queued — abandoned by drain()'s own
+//     timeout or never reached by a wedged handler — is counted as
+//     dropped, since re-delivering would defeat the bound. Together
+//     these make qwpSfDispatcherCloseJoinTimeout a hard ceiling on
 //     close() blocking time.
 func (d *qwpSfErrorDispatcher) close() {
 	if d == nil {
@@ -298,11 +315,40 @@ func (d *qwpSfErrorDispatcher) close() {
 		return
 	}
 
-	d.wg.Wait()
 	if !started {
+		// The dispatch goroutine never launched (no offer ever
+		// succeeded, or only direct inbox injection in tests). No
+		// loop/drain ran, so deliver any queued items here within the
+		// bounded drain budget.
 		d.drain()
 		return
 	}
+
+	// Join the dispatch goroutine, bounded by
+	// qwpSfDispatcherCloseJoinTimeout. loop() observes done, runs its
+	// own bounded drain(), and calls wg.Done() — normally well within
+	// the budget. A handler wedged in a never-returning call keeps
+	// loop() parked in deliver() so wg.Done() never fires; the bound
+	// abandons that goroutine rather than inheriting its hang.
+	joined := make(chan struct{})
+	go func() {
+		d.wg.Wait()
+		close(joined)
+	}()
+	timer := time.NewTimer(qwpSfDispatcherCloseJoinTimeout)
+	defer timer.Stop()
+	select {
+	case <-joined:
+	case <-timer.C:
+		log.Printf("[WARN] qwp/sf: error handler still running %s after close; "+
+			"abandoning dispatcher goroutine and dropping queued notifications",
+			qwpSfDispatcherCloseJoinTimeout)
+	}
+
+	// Sweep whatever remains queued — items drain() abandoned via its
+	// own timeout, or never reached because the handler is wedged.
+	// Re-delivering would defeat the close-time bound, so count them
+	// as dropped.
 	for {
 		select {
 		case e := <-d.inbox:

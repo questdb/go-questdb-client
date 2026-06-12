@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,17 @@ const qwpSfDrainerPollInterval = 50 * time.Millisecond
 // Java 3-second grace. var (not const) so package tests can dial
 // it down without paying the full 3 s.
 var qwpSfDrainerPoolCloseGrace = 3 * time.Second
+
+// qwpSfDrainerPoolHardCloseGrace bounds how long the pool's close()
+// waits AFTER cancelling the master ctx. Cancellation unwinds
+// ctx-aware blocking (TCP dials, the drainer poll loop); a drainer
+// still alive past this second grace is wedged in I/O the ctx cannot
+// reach — drainerRun's engine-open phase (flock, mmap, full CRC scan
+// of a possibly-huge slot, hung NFS) makes no ctx checks. Such a
+// drainer is abandoned rather than blocking close() on un-cancellable
+// I/O; the slot it holds stays a valid orphan for a future sender to
+// re-adopt. var (not const) so package tests can dial it down.
+var qwpSfDrainerPoolHardCloseGrace = 1 * time.Second
 
 // qwpSfOrphanDrainer empties one orphan slot and exits. Owned by
 // qwpSfDrainerPool; one instance per slot.
@@ -315,8 +327,10 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 // drainer to stop and waits up to qwpSfDrainerPoolCloseGrace for
 // them to exit cleanly; if any drainer is still alive after the
 // grace (typically blocked in a TCP dial / WS upgrade), the pool
-// cancels its master context so blocking I/O unwinds, then waits
-// for full exit before returning.
+// cancels its master context so blocking I/O unwinds, then waits a
+// further qwpSfDrainerPoolHardCloseGrace. A drainer wedged in
+// un-cancellable I/O past that bound is abandoned (with a logged
+// count) so close() never hangs.
 type qwpSfDrainerPool struct {
 	maxConcurrent int
 	sem           chan struct{}
@@ -424,12 +438,25 @@ func (p *qwpSfDrainerPool) drainerPoolSnapshot() []*qwpSfOrphanDrainer {
 	return out
 }
 
+// activeCount returns the number of drainers still tracked as
+// running or queued. drainerPoolClose reports it as the count of
+// drainers abandoned at the hard-grace boundary.
+func (p *qwpSfDrainerPool) activeCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.active)
+}
+
 // drainerPoolClose stops the pool. Sets closed=true so new submits
 // fail; requests a polite stop on every tracked drainer; waits up
 // to qwpSfDrainerPoolCloseGrace. If any drainer is still alive at
 // the grace boundary it is most likely parked in a TCP dial / WS
 // upgrade — cancel the master ctx to unwind those blocking calls,
-// then wait for full exit. Idempotent.
+// then wait a further qwpSfDrainerPoolHardCloseGrace. A drainer
+// still running past that bound is wedged in I/O the ctx cannot
+// reach (engine-open flock / mmap / CRC scan / hung NFS); it is
+// abandoned with a logged count rather than hanging close() — its
+// slot stays a valid orphan for a future sender. Idempotent.
 func (p *qwpSfDrainerPool) drainerPoolClose() {
 	if !p.closed.CompareAndSwap(false, true) {
 		return
@@ -448,9 +475,30 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 	defer graceTimer.Stop()
 	select {
 	case <-doneCh:
+		// Every drainer exited within the polite grace.
 	case <-graceTimer.C:
+		// A drainer outlived the polite grace — most likely parked in
+		// a TCP dial / WS upgrade. Cancel the master ctx to unwind
+		// those ctx-aware blocking calls, then wait a bounded second
+		// grace.
 		p.cancel()
-		<-doneCh
+		hardTimer := time.NewTimer(qwpSfDrainerPoolHardCloseGrace)
+		defer hardTimer.Stop()
+		select {
+		case <-doneCh:
+			// Cancellation unwound the straggler(s).
+		case <-hardTimer.C:
+			// A drainer is wedged in I/O the ctx cannot reach
+			// (engine-open flock / mmap / CRC scan / hung NFS).
+			// Abandon it: its goroutine lives until the syscall
+			// returns, but close() must not block on un-cancellable
+			// I/O. The slot it holds stays a valid orphan a future
+			// sender re-adopts. Surface the abandoned count for ops.
+			log.Printf("[WARN] qwp/sf: %d orphan drainer(s) still running %s "+
+				"after close; abandoning (wedged in un-cancellable disk I/O). "+
+				"Their slots remain adoptable on a future sender start.",
+				p.activeCount(), qwpSfDrainerPoolCloseGrace+qwpSfDrainerPoolHardCloseGrace)
+		}
 	}
 	// Release the master ctx even on the clean-exit path so the
 	// underlying timer goroutine doesn't linger.

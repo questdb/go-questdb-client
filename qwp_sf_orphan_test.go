@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -394,6 +395,80 @@ func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
 
 	// Active list must be pruned: drainer goroutine has exited.
 	assert.Empty(t, pool.drainerPoolSnapshot())
+}
+
+// TestQwpSfDrainerPoolBoundedOnUncancellableDrainer is a regression
+// test for M15: a drainer wedged in I/O the master-ctx cancel cannot
+// reach — modelled here by a clientFactory that ignores its ctx, the
+// way drainerRun's engine-open flock / mmap / CRC scan does — must
+// not make drainerPoolClose hang forever. After the polite grace and
+// the post-cancel hard grace both elapse, close abandons the
+// straggler and returns; the slot stays adoptable.
+func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
+	prevGrace := qwpSfDrainerPoolCloseGrace
+	prevHard := qwpSfDrainerPoolHardCloseGrace
+	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
+	qwpSfDrainerPoolHardCloseGrace = 50 * time.Millisecond
+	defer func() {
+		qwpSfDrainerPoolCloseGrace = prevGrace
+		qwpSfDrainerPoolHardCloseGrace = prevHard
+	}()
+
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+
+	// A factory that ignores its ctx stands in for a drainer wedged in
+	// I/O the master-ctx cancel cannot interrupt.
+	block := make(chan struct{})
+	defer close(block) // release at test end so the goroutine unwinds
+	entered := make(chan struct{}, 1)
+	wedgeFactory := func(_ context.Context, _ int) (*qwpTransport, error) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-block // ignores ctx
+		return nil, errors.New("released")
+	}
+
+	pool := qwpSfNewDrainerPool(1)
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		wedgeFactory,
+		nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	require.NoError(t, pool.drainerPoolSubmit(context.Background(), drainer))
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainer never entered the factory")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		pool.drainerPoolClose()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainerPoolClose hung on an un-cancellable drainer")
+	}
+
+	// Abandoned, not joined: the goroutine is still parked in the
+	// factory, so it is still tracked and still Pending. Its slot is
+	// left intact (no .failed sentinel) for a future sender to adopt.
+	assert.NotEmpty(t, pool.drainerPoolSnapshot(),
+		"wedged drainer must still be tracked (abandoned, not joined)")
+	assert.Equal(t, qwpSfDrainOutcomePending, drainer.drainerOutcome())
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "must not quarantine an abandoned slot")
 }
 
 func TestQwpSfDrainerPoolRejectsAfterClose(t *testing.T) {
