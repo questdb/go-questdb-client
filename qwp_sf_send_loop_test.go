@@ -62,6 +62,14 @@ type qwpSfTestServerOpts struct {
 	// protocol (version/config mismatch). This is what
 	// TestQwpSfSendLoopProtocolMismatchIsTerminal exercises.
 	silentDropAfterFrames int
+	// silentDropUntilConn, when > 0, scopes silentDropAfterFrames to
+	// connections with myConnID < silentDropUntilConn; connections at
+	// or beyond that id ACK normally. Models a *transient* ACK-less
+	// drop (a server restart or LB RST in the first-frame→first-ACK
+	// window) on the first connection(s), after which a healthy
+	// server resumes ACKing — the case the never-ACKed terminal
+	// heuristic must NOT mistake for an incompatible build.
+	silentDropUntilConn int
 	// silentAcks → read frames forever and never write any ACK
 	// back. Connection stays alive so the send loop does not go
 	// terminal; the producer's Close drain-wait is what surfaces
@@ -228,8 +236,16 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			// silentDropAfterFrames applies to EVERY connection: read N
 			// frames then close without ACKing. Models a server that
 			// accepts the upgrade but doesn't understand our wire
-			// protocol — reconnects would just hammer it.
-			if opts.silentDropAfterFrames > 0 &&
+			// protocol — reconnects would just hammer it. When
+			// silentDropUntilConn is set the drop is scoped to the
+			// first (silentDropUntilConn-1) connections, so later
+			// reconnects ACK normally — a transient drop, not an
+			// incompatible build.
+			silentDropActive := opts.silentDropAfterFrames > 0
+			if silentDropActive && opts.silentDropUntilConn > 0 {
+				silentDropActive = myConnID < int64(opts.silentDropUntilConn)
+			}
+			if silentDropActive &&
 				localFramesReceived >= opts.silentDropAfterFrames {
 				return
 			}
@@ -835,13 +851,19 @@ func TestQwpSfSendLoopPreSendDropRejectionDoesNotAdvanceWatermark(t *testing.T) 
 }
 
 // TestQwpSfSendLoopSilentDropAfterFrameIsTerminal verifies that when
-// the server accepts the WS upgrade but silently disconnects after
-// the first frame (without sending any ACK), the send loop classifies
-// it as a server version/config mismatch and fails fast instead of
-// entering a hot reconnect loop. Without this guard, every dial
-// succeeds and the receiver reset its backoff on each attempt — burning
-// thousands of ephemeral ports per second until reconnectMaxDuration
-// (5 minutes default) expired.
+// the server accepts the WS upgrade but silently disconnects after a
+// frame (without sending any ACK) on EVERY connection, the send loop
+// classifies it as a server version/config mismatch and fails fast
+// instead of entering a hot reconnect loop. Without this guard, every
+// dial succeeds and the receiver reset its backoff on each attempt —
+// burning thousands of ephemeral ports per second until
+// reconnectMaxDuration (5 minutes default) expired.
+//
+// The guard fires only after qwpSfMaxSilentConnStrikes consecutive
+// ACK-less connections — at least one full reconnect+replay cycle
+// that still met silence — so this server, which drops on every
+// connection, trips it. A single such drop reconnects instead; see
+// TestQwpSfSendLoopSilentDropOnFirstConnReconnects.
 func TestQwpSfSendLoopSilentDropAfterFrameIsTerminal(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{silentDropAfterFrames: 1})
 	defer srv.Close()
@@ -871,12 +893,67 @@ func TestQwpSfSendLoopSilentDropAfterFrameIsTerminal(t *testing.T) {
 		"error should explain the no-ACK detection")
 
 	// The whole point: we must NOT hammer the server with thousands
-	// of reconnects. Cap at a small number — the loop should give up
-	// after the very first connection that fails the heuristic.
+	// of reconnects. With qwpSfMaxSilentConnStrikes == 2 the loop
+	// gives up after exactly one reconnect+replay cycle that still
+	// met silence — i.e. one reconnect and two connections.
 	assert.LessOrEqual(t, loop.sendLoopTotalReconnects(), int64(1),
 		"expected at most one reconnect before terminal classification")
 	assert.LessOrEqual(t, srv.connCount.Load(), int64(2),
 		"server should have seen at most 2 connections")
+}
+
+// TestQwpSfSendLoopSilentDropOnFirstConnReconnects verifies that a
+// single ACK-less disconnect on the *first* connection — the
+// signature of a routine server restart or LB RST landing in the
+// window between a fresh sender's first frame and its first ACK —
+// reconnects, replays the unacked frame, and recovers once the server
+// ACKs. A repeated ACK-less pattern (>= qwpSfMaxSilentConnStrikes
+// connections, i.e. at least one full reconnect+replay cycle that
+// still met silence) is what trips the terminal classification; that
+// case is TestQwpSfSendLoopSilentDropAfterFrameIsTerminal.
+func TestQwpSfSendLoopSilentDropOnFirstConnReconnects(t *testing.T) {
+	// Conn 1 reads one frame then closes without ACKing (the
+	// transient restart/RST); conn 2+ ACK normally.
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		silentDropAfterFrames: 1,
+		silentDropUntilConn:   2,
+	})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, 5*time.Second, 1*time.Millisecond, 10*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	// One frame: conn 1 reads it and silently drops; the loop must
+	// reconnect to conn 2, replay it, and get the ACK.
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, 2*time.Second, 1*time.Millisecond,
+		"replayed frame should be ACK'd after reconnect to a healthy conn")
+
+	// Crucially: the first ACK-less drop must NOT have latched a
+	// terminal incompatible-build SenderError.
+	if gotErr := loop.sendLoopCheckError(); gotErr != nil {
+		t.Fatalf("loop went terminal on a routine first-connection drop: %v", gotErr)
+	}
+	assert.Nil(t, loop.sendLoopLastTerminalServerError(),
+		"a single ACK-less first-connection drop must not be terminal")
+	// And we recovered via exactly the reconnect+replay path.
+	assert.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1),
+		"loop should have reconnected past the transient drop")
+	assert.GreaterOrEqual(t, loop.sendLoopTotalFramesReplayed(), int64(1),
+		"the unacked frame should have been replayed on the new connection")
 }
 
 // TestQwpSfSendLoopSilentDropAfterPriorAckReconnects pins the

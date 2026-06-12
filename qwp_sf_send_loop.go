@@ -47,6 +47,19 @@ const (
 	qwpSfReconnectLogThrottleInterval      = 5 * time.Second // throttle "attempt N failed" logs
 )
 
+// qwpSfMaxSilentConnStrikes is the number of consecutive ACK-less
+// connections the never-ACKed terminal heuristic in run() tolerates
+// before declaring the server incompatible and stopping retries. A
+// single connection that sends frames and is met with silence is
+// indistinguishable from a routine server restart or LB RST landing
+// in the window between a fresh sender's first frame and its first
+// ACK, so that strike triggers an ordinary reconnect+replay. Reaching
+// this many strikes means at least one full reconnect+replay cycle
+// has also met nothing but silence — strong evidence the server isn't
+// speaking our wire-format dialect. Go-only: there is no Java
+// counterpart.
+const qwpSfMaxSilentConnStrikes = 2
+
 // qwpSfReconnectFactory is invoked by the send loop on a wire
 // failure to obtain a fresh connected+upgraded transport. idx is
 // the host index PickNext returned (see failover.md §2); the
@@ -205,11 +218,21 @@ type qwpSfSendLoop struct {
 	// framesSentOnConn counts frames written to the wire on the
 	// current connection (reset on every connection swap). Paired
 	// with the lifetime totalAcks counter in the silent-drop guard
-	// in run(): a fresh sender whose every dial succeeds and every
-	// frame meets silence (totalAcks == 0) signals "server up but
-	// doesn't speak our protocol" — fail terminally instead of
-	// burning ephemeral ports for reconnectMaxDuration.
+	// in run(): a connection that sends frames yet sees no ACK while
+	// totalAcks == 0 is a candidate for the "server up but doesn't
+	// speak our protocol" classification.
 	framesSentOnConn atomic.Int64
+
+	// silentConnStrikes counts consecutive connections that sent at
+	// least one frame and ended while totalAcks was still 0 — i.e.
+	// ACK-less drops on a sender that has never once been ACK'd. The
+	// silent-drop guard in run() declares the server incompatible
+	// (and stops retrying) once this reaches qwpSfMaxSilentConnStrikes;
+	// a lone restart/RST in the first-frame→first-ACK window stays
+	// below the threshold and reconnects+replays. No reset is needed:
+	// the guard's totalAcks == 0 precondition makes this counter
+	// unreachable — and thus frozen — the moment any ACK lands.
+	silentConnStrikes atomic.Int64
 
 	// Reconnect-loop status, exposed so engineAppendBlocking can
 	// distinguish "wire publishing but slow" from "wire is in the
@@ -724,30 +747,47 @@ func (l *qwpSfSendLoop) run() {
 		// RST surfacing as 1006, proxy reset, graceful 1011/1012/
 		// 1013 — none of which are flagged terminal by
 		// qwpSfIsTerminalCloseCode) and reconnect is the right
-		// reaction. Only the never-ACK'd case is still treated as
-		// terminal here, which is the original port-hammering
-		// signature: a fresh sender whose every dial succeeds and
-		// every frame is met with silence.
+		// reaction. The never-ACK'd case is the terminal candidate
+		// here: the port-hammering signature is a fresh sender whose
+		// every dial succeeds and every frame is met with silence,
+		// repeatedly. The strike-count gate below decides when that
+		// pattern has repeated enough to be conclusive.
 		if l.framesSentOnConn.Load() > 0 && l.totalAcks.Load() == 0 {
-			// The connection finished the WS upgrade and the X-QWP-
-			// Version negotiation, then closed without ACKing any of
-			// the frames we sent — and no prior connection on this
-			// sender has ACK'd anything either. Reconnect can't fix
-			// this — the server isn't speaking the same wire-format
-			// dialect we are (most often: server build is older than
-			// this client's branch, even if both sides declared the
-			// same X-QWP-Version). Fail terminally to avoid hammering
-			// the server with thousands of dial attempts per second.
-			reason := fmt.Sprintf(
-				"server accepted the WebSocket upgrade but disconnected "+
-					"without ACKing any of the %d frame(s) we sent — server is "+
-					"likely running an incompatible build (won't retry): %s",
-				l.framesSentOnConn.Load(), err.Error())
-			se := l.qwpSfBuildBudgetExhaustedSE(reason)
-			l.totalServerErrors.Add(1)
-			l.recordFatalServerError(se)
-			l.dispatcher.Load().offer(se)
-			return
+			// This connection finished the WS upgrade and the X-QWP-
+			// Version negotiation, sent frames, then closed without
+			// ACKing any of them — and no prior connection on this
+			// sender has ACK'd anything either.
+			//
+			// A single such strike is ambiguous: a routine server
+			// restart or LB RST landing in the window between a fresh
+			// sender's first frame and its first ACK produces the
+			// identical signature, so it counts as a strike and falls
+			// through to an ordinary reconnect+replay. Reaching
+			// qwpSfMaxSilentConnStrikes consecutive ACK-less
+			// connections — at least one full reconnect+replay cycle
+			// that still met nothing but silence — is conclusive
+			// evidence the server isn't speaking our wire-format
+			// dialect (most often: a server build older than this
+			// client's branch, even if both sides declared the same
+			// X-QWP-Version). At that point we fail terminally to
+			// avoid hammering the server with thousands of dial
+			// attempts per second until reconnectMaxDuration expires.
+			if l.silentConnStrikes.Add(1) >= qwpSfMaxSilentConnStrikes {
+				reason := fmt.Sprintf(
+					"server accepted the WebSocket upgrade but %d consecutive "+
+						"connection(s) disconnected without ACKing any of the "+
+						"frames we sent — server is likely running an incompatible "+
+						"build (won't retry): %s",
+					l.silentConnStrikes.Load(), err.Error())
+				se := l.qwpSfBuildBudgetExhaustedSE(reason)
+				l.totalServerErrors.Add(1)
+				l.recordFatalServerError(se)
+				l.dispatcher.Load().offer(se)
+				return
+			}
+			// Fall through to reconnect+replay. If the next connection
+			// also sends frames and meets silence the strike count
+			// crosses the threshold and we HALT then.
 		}
 		// Reconnect with backoff.
 		ok := l.connectWithBackoff(err, "reconnect")
