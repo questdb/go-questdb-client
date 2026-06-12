@@ -102,6 +102,32 @@ func TestQwpTypeCodes(t *testing.T) {
 	}
 }
 
+func TestQwpOpTypeCodes(t *testing.T) {
+	// Exported ExecResult.OpType codes, pinned to the server's
+	// CompiledQuery.TYPE_* discriminators. These are a cross-protocol
+	// wire contract (PG wire + QWP EXEC_DONE), so a drift here is a
+	// client/server mismatch, not a cosmetic change.
+	cases := []struct {
+		op   byte
+		want byte
+	}{
+		{QwpOpTypeInsert, 2},
+		{QwpOpTypeTruncate, 3},
+		{QwpOpTypeAlter, 4},
+		{QwpOpTypeDrop, 7},
+		{QwpOpTypeCreateTable, 9},
+		{QwpOpTypeInsertAsSelect, 10},
+		{QwpOpTypeRenameTable, 12},
+		{QwpOpTypeUpdate, 14},
+		{QwpOpTypeCreateTableAsSelect, 21},
+	}
+	for _, c := range cases {
+		if c.op != c.want {
+			t.Errorf("op type %d, want %d", c.op, c.want)
+		}
+	}
+}
+
 func TestQwpMsgKinds(t *testing.T) {
 	// Egress message-kind discriminators (spec §5). Values here are
 	// the wire bytes the egress server sends and the Go client must

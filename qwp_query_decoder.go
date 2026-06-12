@@ -48,14 +48,32 @@ const qwpZstdMaxDecompressedSize = 64 * 1024 * 1024
 // allocation so bursts of small batches don't re-alloc on every frame.
 const qwpZstdMinScratchGrow = 1024 * 1024
 
+// Exported op-type codes for ExecResult.OpType, mirroring the server's
+// CompiledQuery.TYPE_* discriminators. The set covers the statements an
+// EXEC_DONE frame commonly reports; OpType is the raw server byte, so a
+// less common statement can carry a value outside this list. SELECT is
+// absent on purpose — a SELECT streams RESULT_BATCH frames, never an
+// EXEC_DONE.
+const (
+	QwpOpTypeInsert              byte = 2
+	QwpOpTypeTruncate            byte = 3
+	QwpOpTypeAlter               byte = 4
+	QwpOpTypeDrop                byte = 7
+	QwpOpTypeCreateTable         byte = 9
+	QwpOpTypeInsertAsSelect      byte = 10
+	QwpOpTypeRenameTable         byte = 12
+	QwpOpTypeUpdate              byte = 14
+	QwpOpTypeCreateTableAsSelect byte = 21
+)
+
 // ExecResult is the outcome of a non-SELECT statement (DDL / INSERT /
 // UPDATE / ...) submitted via the QWP egress protocol. It mirrors the
 // body of an EXEC_DONE frame.
 type ExecResult struct {
 	// OpType is the server's CompiledQuery.TYPE_* discriminator for
-	// the executed statement (opaque to the client — surfaced for
-	// callers that want to distinguish INSERT from UPDATE from DELETE
-	// from pure DDL).
+	// the executed statement, surfaced so callers can distinguish
+	// INSERT from UPDATE from pure DDL. Compare against the QwpOpType*
+	// constants; an unrecognised value is still a valid raw server byte.
 	OpType byte
 
 	// RowsAffected is the number of rows modified. 0 for pure DDL.

@@ -68,8 +68,7 @@ func (e *QwpQueryError) Error() string {
 type QwpRoleMismatchError struct {
 	// Target is the requested role filter ("any", "primary", "replica").
 	// Stored as a string for human-readable error formatting; the
-	// internal qwpTargetFilter enum is mapped to its name on
-	// construction.
+	// QwpTargetFilter value is mapped to its name on construction.
 	Target string
 
 	// LastObserved is the SERVER_INFO of the most recent endpoint the

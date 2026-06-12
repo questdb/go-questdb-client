@@ -92,7 +92,7 @@ type qwpQueryClientConfig struct {
 	// does not consume SERVER_INFO (serverInfoTimeout disabled) or the
 	// server sends no parseable frame, the role is unknown and the
 	// filter cannot be evaluated.
-	target qwpTargetFilter
+	target QwpTargetFilter
 	// zone is the client's opaque, case-insensitive locality hint
 	// (failover.md §1.1). When set and target != primary, the host
 	// tracker prefers endpoints whose server-advertised zone_id
@@ -333,6 +333,10 @@ func (c *qwpQueryClientConfig) validate() error {
 	if c.authTimeoutMs <= 0 {
 		return fmt.Errorf(
 			"qwp query: auth_timeout_ms must be > 0, got %d", c.authTimeoutMs)
+	}
+	if c.target > qwpTargetReplica {
+		return fmt.Errorf("qwp query: invalid target %d (expected any, primary, or replica)",
+			byte(c.target))
 	}
 	return nil
 }

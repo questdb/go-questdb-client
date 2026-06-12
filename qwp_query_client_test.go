@@ -1900,7 +1900,7 @@ func TestQwpQueryCloseIsNoOpWhileIterating(t *testing.T) {
 
 // parseQueryRequestWithBinds parses a client-sent QUERY_REQUEST and
 // returns the bind count plus the raw bind payload bytes, in addition
-// to the usual tuple. Tests that exercise WithQueryBinds assert against
+// to the usual tuple. Tests that exercise WithQwpQueryBinds assert against
 // this richer view.
 func parseQueryRequestWithBinds(t *testing.T, frame []byte) (int64, string, int64, int, []byte) {
 	t.Helper()
@@ -1950,7 +1950,7 @@ func TestQwpQueryWithBindsWiresBindPayload(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	q := c.Query(ctx, wantSQL, WithQueryBinds(func(b *QwpBinds) {
+	q := c.Query(ctx, wantSQL, WithQwpQueryBinds(func(b *QwpBinds) {
 		b.VarcharBind(0, "AAPL").
 			DoubleBind(1, 100.0).
 			TimestampMicrosBind(2, 1_700_000_000_000_000)
@@ -1985,8 +1985,8 @@ func TestQwpQueryWithBindsWiresBindPayload(t *testing.T) {
 }
 
 // TestQwpQueryWithBindsEmpty verifies a query with zero-argument binds
-// (user passed WithQueryBinds with no setter calls) sends bind_count=0
-// and an empty bind payload — equivalent to not using WithQueryBinds
+// (user passed WithQwpQueryBinds with no setter calls) sends bind_count=0
+// and an empty bind payload — equivalent to not using WithQwpQueryBinds
 // at all.
 func TestQwpQueryWithBindsEmpty(t *testing.T) {
 	var gotFrame []byte
@@ -2001,7 +2001,7 @@ func TestQwpQueryWithBindsEmpty(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	q := c.Query(ctx, "SELECT 1", WithQueryBinds(func(b *QwpBinds) {}))
+	q := c.Query(ctx, "SELECT 1", WithQwpQueryBinds(func(b *QwpBinds) {}))
 	defer q.Close()
 	for _, err := range q.Batches() {
 		if err != nil {
@@ -2038,7 +2038,7 @@ func TestQwpQueryWithBindsSurfacesEncodingError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	q := c.Query(ctx, "SELECT 1", WithQueryBinds(func(b *QwpBinds) {
+	q := c.Query(ctx, "SELECT 1", WithQwpQueryBinds(func(b *QwpBinds) {
 		b.LongBind(0, 1)
 		b.LongBind(5, 2) // out-of-order
 	}))
@@ -2060,7 +2060,7 @@ func TestQwpQueryWithBindsSurfacesEncodingError(t *testing.T) {
 	<-done
 }
 
-// TestQwpExecWithBinds verifies WithQueryBinds is plumbed through Exec,
+// TestQwpExecWithBinds verifies WithQwpQueryBinds is plumbed through Exec,
 // not just Query. Drives an EXEC_DONE against a bind-bearing UPDATE-
 // style request.
 func TestQwpExecWithBinds(t *testing.T) {
@@ -2077,7 +2077,7 @@ func TestQwpExecWithBinds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	res, err := c.Exec(ctx, "UPDATE trades SET price = $1 WHERE sym = $2",
-		WithQueryBinds(func(b *QwpBinds) {
+		WithQwpQueryBinds(func(b *QwpBinds) {
 			b.DoubleBind(0, 200.5).VarcharBind(1, "MSFT")
 		}))
 	if err != nil {
@@ -2120,7 +2120,7 @@ func TestQwpQueryBindsResetAcrossCalls(t *testing.T) {
 	defer cancel()
 
 	// First query has 3 binds.
-	q1 := c.Query(ctx, "SELECT 1", WithQueryBinds(func(b *QwpBinds) {
+	q1 := c.Query(ctx, "SELECT 1", WithQwpQueryBinds(func(b *QwpBinds) {
 		b.LongBind(0, 1).LongBind(1, 2).LongBind(2, 3)
 	}))
 	for _, err := range q1.Batches() {
@@ -2131,7 +2131,7 @@ func TestQwpQueryBindsResetAcrossCalls(t *testing.T) {
 	q1.Close()
 
 	// Second query has 1 bind — must not carry over the first two longs.
-	q2 := c.Query(ctx, "SELECT 2", WithQueryBinds(func(b *QwpBinds) {
+	q2 := c.Query(ctx, "SELECT 2", WithQwpQueryBinds(func(b *QwpBinds) {
 		b.IntBind(0, 99)
 	}))
 	for _, err := range q2.Batches() {

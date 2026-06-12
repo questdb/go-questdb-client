@@ -331,7 +331,7 @@ type lineSenderConfig struct {
 	endpoints     []qwpEndpoint
 	authTimeoutMs int             // QWP-only; 0 -> 15000 (15s) at sanitize time
 	zone          string          // QWP-only; honoured on egress, inert on ingest (no zone routing)
-	target        qwpTargetFilter // QWP-only; zero value = qwpTargetAny
+	target        QwpTargetFilter // QWP-only; zero value = QwpTargetAny
 
 	// Retry/timeout-related fields
 	retryTimeout   time.Duration
@@ -728,7 +728,7 @@ func WithZone(zone string) LineSenderOption {
 // reject keeps writes off replicas. Symmetric with WithZone.
 //
 // Only available for the QWP sender.
-func WithTarget(target qwpTargetFilter) LineSenderOption {
+func WithTarget(target QwpTargetFilter) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.target = target
 	}
@@ -749,8 +749,9 @@ func WithSfDurability(mode string) LineSenderOption {
 
 // WithSfAppendDeadline bounds how long a producer call blocks waiting
 // to append a batch into the store-and-forward cursor engine before
-// it returns a backpressure error. A zero or negative duration falls
-// back to the 30s default at construction. Requires sf_dir to be set.
+// it returns a backpressure error that wraps ErrBackpressureTimeout
+// (match with errors.Is). A zero or negative duration falls back to
+// the 30s default at construction. Requires sf_dir to be set.
 // Equivalent to the connect-string sf_append_deadline_millis key.
 //
 // Only available for the QWP sender.

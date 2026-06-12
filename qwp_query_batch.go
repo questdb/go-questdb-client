@@ -237,8 +237,8 @@ func (b *QwpColumnBatch) ColumnCount() int { return b.columnCount }
 func (b *QwpColumnBatch) ColumnName(col int) string { return b.columns[col].name }
 
 // ColumnType returns the wire-type byte for the column (one of the
-// `qwpType*` constants, e.g. 0x04 for INT). Callers dispatch on this
-// to pick the right typed accessor.
+// `QwpType*` constants, e.g. QwpTypeInt for INT). Callers dispatch on
+// this to pick the right typed accessor.
 func (b *QwpColumnBatch) ColumnType(col int) byte { return byte(b.columns[col].wireType) }
 
 // DecimalScale returns the decimal scale for DECIMAL64/128/256 columns.
@@ -1038,43 +1038,37 @@ func (c QwpColumn) Float32Range(fromRow, toRow int, dst []float32) []float32 {
 
 // --- Materializing escape hatch ---
 
-// SerializedBatch is a heap-owned copy of a QwpColumnBatch, safe to
-// retain past the iteration that produced it. It is a type alias for
-// QwpColumnBatch so every typed accessor (Int64, Str, Float64Array, …)
-// works identically on the serialized copy.
+// CopyAll materialises the batch into a heap-owned *QwpColumnBatch that
+// the caller may retain past the current iteration of
+// *QwpQuery.Batches(). The I/O goroutine's decoder reuses its per-column
+// layout pool on the next frame, so a batch yielded by Batches() is only
+// valid for the current iteration; CopyAll is the escape hatch. Every
+// typed accessor (Int64, Str, Float64Array, …) works identically on the
+// copy.
 //
-// The shape of a SerializedBatch differs from a live batch in two ways,
-// both of which are invisible to callers:
+// The copy differs from a live batch in two ways, both invisible to
+// callers:
 //
 //  1. The pool-owned layout arrays (nonNullIdx, symbolRowIds,
 //     arrayRowStart, arrayElems, timestampBuf) are freshly-allocated
 //     heap slices, not aliases into the decoder's reused pool.
 //  2. The payload bytes are deep-cloned, and every layout slice that
 //     aliased the source payload (values, stringBytes, nullBitmap) is
-//     re-pointed at the clone via offset translation, so the snapshot
-//     is independent of the source's backing buffer.
+//     re-pointed at the clone via offset translation, so the copy is
+//     independent of the source's backing buffer.
 //
-// Both transport paths produce snapshots that survive reuse: the zstd
+// Both transport paths produce copies that survive reuse: the zstd
 // path's `payload` aliased the per-batch decompression scratch the
 // decoder reuses across decodes into the same QwpColumnBatch, and the
 // raw path's `payload` aliased the recycled WS read buffer the egress
 // I/O loop returns to qwpEgressIO.readBufPool on releaseBuffer (see
 // qwp_query_io.go). Cloning covers both.
-type SerializedBatch = QwpColumnBatch
-
-// CopyAll materialises the batch into a heap-owned *SerializedBatch
-// that the caller may retain past the current iteration of
-// *QwpQuery.Batches(). The I/O goroutine's decoder reuses its per-column
-// layout pool on the next frame, so a raw *QwpColumnBatch is only valid
-// for the current iteration; CopyAll is the escape hatch.
 //
 // Cost: one []qwpColumnLayout slice + one fresh backing slice per
 // pool-owned layout field, plus a one-shot deep clone of the payload
-// bytes so the aliasing layout slices (values, stringBytes,
-// nullBitmap) are translated onto storage the source's
-// buffer-recycling cannot reach.
-func (b *QwpColumnBatch) CopyAll() *SerializedBatch {
-	sb := &SerializedBatch{
+// bytes.
+func (b *QwpColumnBatch) CopyAll() *QwpColumnBatch {
+	sb := &QwpColumnBatch{
 		requestId:   b.requestId,
 		batchSeq:    b.batchSeq,
 		rowCount:    b.rowCount,
@@ -1105,7 +1099,7 @@ func (b *QwpColumnBatch) CopyAll() *SerializedBatch {
 		// nullBitmap: aliases payload for server-sent bitmaps; owned heap
 		// buffer after array nDims=0 NULL promotion. Either way, retaining
 		// the slice header keeps the backing array reachable for the life
-		// of the SerializedBatch.
+		// of the copied batch.
 		dst.nullBitmap = rebindIfAliased(src.nullBitmap, srcPayload, clonedPayload)
 		dst.nonNullCount = src.nonNullCount
 		dst.nonNullIdx = slices.Clone(src.nonNullIdx)

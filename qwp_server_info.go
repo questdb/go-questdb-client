@@ -37,7 +37,7 @@ import "fmt"
 // goroutines once published.
 type QwpServerInfo struct {
 	// Role is the server's replication role byte. Compare against the
-	// qwpRole* constants or feed to RoleName for a human-readable form.
+	// QwpRole* constants or feed to RoleName for a human-readable form.
 	// Drives target= filtering on multi-endpoint connections.
 	Role byte
 	// Epoch is a monotonic counter that advances across role
@@ -48,7 +48,7 @@ type QwpServerInfo struct {
 	// fencing wired up; treat as a hint.
 	Epoch uint64
 	// Capabilities is the server capability bitfield from SERVER_INFO.
-	// The only bit currently defined is CAP_ZONE (qwpCapZone): when
+	// The only bit currently defined is CAP_ZONE (QwpCapZone): when
 	// set, the frame carries a zone_id trailer after node_id.
 	Capabilities uint32
 	// ServerWallNs is the server wall-clock at the time SERVER_INFO was
@@ -62,7 +62,7 @@ type QwpServerInfo struct {
 	// values; surfaced in error messages and diagnostics.
 	NodeId string
 	// ZoneId is the server's zone identifier, populated when
-	// Capabilities & qwpCapZone is set (failover.md §2). The
+	// Capabilities & QwpCapZone is set (failover.md §2). The
 	// comparison against the client's configured zone= is
 	// case-insensitive. Empty when the server did not opt into
 	// CAP_ZONE; in that case the host's tracker tier stays Unknown.

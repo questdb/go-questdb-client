@@ -64,6 +64,38 @@ const (
 	qwpTypeIPv4   qwpTypeCode = 0x18 // 4 bytes LE, identical to INT
 )
 
+// Exported column-type codes for QwpColumnBatch.ColumnType. Each value
+// is the wire-type byte the egress decoder reports for a column; switch
+// on ColumnType(col) to choose the matching typed accessor. The values
+// mirror the QWP protocol type codes. Decoder-only types (Binary, IPv4)
+// are included because a SELECT can surface them even though the encoder
+// never emits them.
+const (
+	QwpTypeBoolean       = byte(qwpTypeBoolean)
+	QwpTypeByte          = byte(qwpTypeByte)
+	QwpTypeShort         = byte(qwpTypeShort)
+	QwpTypeInt           = byte(qwpTypeInt)
+	QwpTypeLong          = byte(qwpTypeLong)
+	QwpTypeFloat         = byte(qwpTypeFloat)
+	QwpTypeDouble        = byte(qwpTypeDouble)
+	QwpTypeSymbol        = byte(qwpTypeSymbol)
+	QwpTypeTimestamp     = byte(qwpTypeTimestamp)
+	QwpTypeDate          = byte(qwpTypeDate)
+	QwpTypeUuid          = byte(qwpTypeUuid)
+	QwpTypeLong256       = byte(qwpTypeLong256)
+	QwpTypeGeohash       = byte(qwpTypeGeohash)
+	QwpTypeVarchar       = byte(qwpTypeVarchar)
+	QwpTypeTimestampNano = byte(qwpTypeTimestampNano)
+	QwpTypeDoubleArray   = byte(qwpTypeDoubleArray)
+	QwpTypeLongArray     = byte(qwpTypeLongArray)
+	QwpTypeDecimal64     = byte(qwpTypeDecimal64)
+	QwpTypeDecimal128    = byte(qwpTypeDecimal128)
+	QwpTypeDecimal256    = byte(qwpTypeDecimal256)
+	QwpTypeChar          = byte(qwpTypeChar)
+	QwpTypeBinary        = byte(qwpTypeBinary)
+	QwpTypeIPv4          = byte(qwpTypeIPv4)
+)
+
 // qwpMsgKind is the one-byte discriminator at the start of every QWP
 // egress payload (spec §5). Ingress DATA_BATCH messages use 0x00; the
 // 0x10..0x17 range is reserved for egress request/response kinds.
@@ -118,6 +150,15 @@ const (
 	qwpRolePrimaryCatchup byte = 0x03
 )
 
+// Exported SERVER_INFO role codes for QwpServerInfo.Role. Compare Role
+// against these or call QwpServerInfo.RoleName for a human-readable form.
+const (
+	QwpRoleStandalone     = qwpRoleStandalone
+	QwpRolePrimary        = qwpRolePrimary
+	QwpRoleReplica        = qwpRoleReplica
+	QwpRolePrimaryCatchup = qwpRolePrimaryCatchup
+)
+
 // Bit flags carried in the reset_mask byte of a CACHE_RESET frame.
 // Mirrors the Java QwpEgressMsgKind.RESET_MASK_* constants.
 const (
@@ -150,6 +191,11 @@ const qwpVersion byte = 0x01
 // PickNext treats as a middle-priority bucket between Same and
 // Other.
 const qwpCapZone uint32 = 1 << 0
+
+// QwpCapZone is the exported CAP_ZONE bit for QwpServerInfo.Capabilities.
+// When set, the server advertised a zone_id (surfaced as
+// QwpServerInfo.ZoneId).
+const QwpCapZone = qwpCapZone
 
 // QWP message header layout.
 const (

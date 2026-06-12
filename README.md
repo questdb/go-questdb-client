@@ -346,14 +346,14 @@ for batch, err := range q.Batches() {
 }
 ```
 
-Bind parameters are passed via `qdb.WithQueryBinds` and use `$1`, `$2`,
+Bind parameters are passed via `qdb.WithQwpQueryBinds` and use `$1`, `$2`,
 ... placeholders. Setters take 0-based indexes and must be called in
 ascending order:
 
 ```go
 q := client.Query(ctx,
     "SELECT ts, v FROM example WHERE v > $1",
-    qdb.WithQueryBinds(func(b *qdb.QwpBinds) {
+    qdb.WithQwpQueryBinds(func(b *qdb.QwpBinds) {
         b.LongBind(0, 100)
     }),
 )

@@ -179,7 +179,7 @@ type qwpHostTracker struct {
 	// qwpTargetPrimary (writers must follow the master regardless
 	// of geography). Other target values leave zone-tier assignment
 	// to RecordZone.
-	target qwpTargetFilter
+	target QwpTargetFilter
 }
 
 // newQwpHostTracker constructs a tracker for `numHosts` configured
@@ -199,7 +199,7 @@ type qwpHostTracker struct {
 // trims server-side zone observations. numHosts must be > 0; the
 // caller is responsible for validation (sanitizeQwpConf rejects an
 // empty endpoint list before reaching this point).
-func newQwpHostTracker(numHosts int, clientZone string, target qwpTargetFilter) *qwpHostTracker {
+func newQwpHostTracker(numHosts int, clientZone string, target QwpTargetFilter) *qwpHostTracker {
 	t := &qwpHostTracker{
 		hosts:      make([]qwpHostEntry, numHosts),
 		clientZone: strings.ToLower(strings.TrimSpace(clientZone)),

@@ -96,7 +96,7 @@ func queryOneRow(t *testing.T, c *QwpQueryClient, sql, ctxMsg string, binds QwpB
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	q := c.Query(ctx, sql, WithQueryBinds(binds))
+	q := c.Query(ctx, sql, WithQwpQueryBinds(binds))
 	defer q.Close()
 	seen := false
 	for batch, err := range q.Batches() {

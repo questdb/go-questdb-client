@@ -421,7 +421,7 @@ func BenchmarkQwpEgressBindLatency(b *testing.B) {
 
 	queryOnce := func() error {
 		v := int64(rng.Intn(10) + 1)
-		q := client.Query(ctx, sql, WithQueryBinds(func(bv *QwpBinds) {
+		q := client.Query(ctx, sql, WithQwpQueryBinds(func(bv *QwpBinds) {
 			bv.LongBind(0, v)
 		}))
 		_, _, err := drainQuery(q)

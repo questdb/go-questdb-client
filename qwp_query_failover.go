@@ -59,16 +59,18 @@ func (e qwpEndpoint) String() string {
 	return fmt.Sprintf("%s:%d", e.host, e.port)
 }
 
-// qwpTargetFilter constrains the connect walk to endpoints whose
-// SERVER_INFO.role passes the filter. Mirrors Java QwpQueryClient's
-// TARGET_ANY/PRIMARY/REPLICA constants. Zero value is qwpTargetAny so
+// QwpTargetFilter constrains the connect walk to endpoints whose
+// SERVER_INFO.role passes the filter. The argument type of WithTarget
+// (ingest) and WithQwpQueryTarget (egress); use the QwpTarget*
+// constants to name a value. Mirrors Java QwpQueryClient's
+// TARGET_ANY/PRIMARY/REPLICA constants. Zero value is QwpTargetAny so
 // tests and config defaults can use the zero-init pattern naturally.
-type qwpTargetFilter byte
+type QwpTargetFilter byte
 
 const (
 	// qwpTargetAny accepts any role. The default; matches Java's
 	// TARGET_ANY. Used when callers only want any reachable endpoint.
-	qwpTargetAny qwpTargetFilter = iota
+	qwpTargetAny QwpTargetFilter = iota
 	// qwpTargetPrimary accepts STANDALONE, PRIMARY, and PRIMARY_CATCHUP.
 	// STANDALONE is included so single-node OSS deployments (which do
 	// not configure replication) are not accidentally excluded.
@@ -78,10 +80,9 @@ const (
 	qwpTargetReplica
 )
 
-// Exported aliases for the target-filter constants, so callers of
-// WithTarget can name the values without the type being exported
-// (mirrors the ProtocolVersion1/2/3 pattern for protocolVersion).
-// Equivalent to the connect-string target=any|primary|replica values.
+// Exported names for the QwpTargetFilter constants, so callers of
+// WithTarget / WithQwpQueryTarget can name the values. Equivalent to
+// the connect-string target=any|primary|replica values.
 const (
 	// QwpTargetAny accepts any reachable endpoint regardless of role.
 	// The default; equivalent to target=any (or omitting the key).
@@ -96,7 +97,7 @@ const (
 
 // String returns the connection-string form for diagnostics and error
 // messages.
-func (t qwpTargetFilter) String() string {
+func (t QwpTargetFilter) String() string {
 	switch t {
 	case qwpTargetAny:
 		return "any"
@@ -114,7 +115,7 @@ func (t qwpTargetFilter) String() string {
 // effective config from multiple sources can use absence-as-default
 // without a dedicated branch. Mirrors Java's
 // QwpQueryClient.fromConfig target validation.
-func parseTargetFilter(s string) (qwpTargetFilter, error) {
+func parseTargetFilter(s string) (QwpTargetFilter, error) {
 	switch s {
 	case "", "any":
 		return qwpTargetAny, nil
@@ -132,7 +133,7 @@ func parseTargetFilter(s string) (qwpTargetFilter, error) {
 // Mirrors Java QwpQueryClient.matchesTarget exactly: primary accepts
 // STANDALONE so OSS deployments (which advertise STANDALONE rather
 // than PRIMARY) are treated as primaries for routing purposes.
-func (t qwpTargetFilter) accepts(role byte) bool {
+func (t QwpTargetFilter) accepts(role byte) bool {
 	switch t {
 	case qwpTargetAny:
 		return true

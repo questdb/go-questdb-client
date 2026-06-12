@@ -46,11 +46,15 @@ const qwpSfEngineDefaultAppendDeadline = 30 * time.Second
 // Java's 50µs LockSupport.parkNanos.
 const qwpSfEngineParkInterval = 50 * time.Microsecond
 
-// qwpSfErrBackpressureTimeout is returned by appendBlocking when
-// the configured deadline expires before space frees up.
-//
-//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
-var qwpSfErrBackpressureTimeout = errors.New(
+// ErrBackpressureTimeout is the sentinel a producer call
+// (At / AtNow / Flush / FlushAndGetSequence) wraps when the
+// store-and-forward append deadline (WithSfAppendDeadline /
+// sf_append_deadline_millis) expires before the cursor engine frees
+// space. The wire path is not draining — the server is slow or
+// disconnected, or sf_max_total_bytes is too small. Match it with
+// errors.Is; the wrapped error carries the deadline and reconnect
+// diagnostics in its message.
+var ErrBackpressureTimeout = errors.New(
 	"qwp/sf: cursor ring backpressured — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)")
 
 // qwpSfErrEngineClosed is returned by engineAppendBlocking when the
@@ -507,14 +511,14 @@ func (e *qwpSfCursorEngine) formatBackpressureTimeout() error {
 	if g := e.reconnectStatus.Load(); g != nil {
 		if reconnecting, attempts, outageStart := (*g)(); reconnecting {
 			return fmt.Errorf("%w (deadline %s, reconnecting: attempts=%d, outage-elapsed=%s, outage-start=%s)",
-				qwpSfErrBackpressureTimeout,
+				ErrBackpressureTimeout,
 				e.appendDeadline,
 				attempts,
 				time.Since(outageStart).Round(time.Millisecond),
 				outageStart.Format(time.RFC3339Nano))
 		}
 	}
-	return fmt.Errorf("%w (deadline %s, wire publishing but slow)", qwpSfErrBackpressureTimeout, e.appendDeadline)
+	return fmt.Errorf("%w (deadline %s, wire publishing but slow)", ErrBackpressureTimeout, e.appendDeadline)
 }
 
 // engineClose tears down the engine. Drains residual on-disk

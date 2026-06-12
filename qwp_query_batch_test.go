@@ -762,7 +762,7 @@ func TestQwpColumnBatchCopyAllGorillaTimestampSurvivesPoolReuse(t *testing.T) {
 // slices (values, stringBytes, nullBitmap) alias that pooled buffer
 // directly. releaseBuffer returns the buffer to the pool, and the next
 // inbound frame is decoded into the same backing array in place. A
-// SerializedBatch the caller retained from the released batch must
+// CopyAll result the caller retained from the released batch must
 // remain valid across that recycle — i.e. CopyAll must deep-clone the
 // payload bytes on the raw path the same way it already does on the
 // zstd path.
@@ -856,7 +856,7 @@ func buildDecimalGeohashFrame(t *testing.T, scale uint32, precision int8, unscal
 
 // TestQwpColumnBatchCopyAllScaleAndPrecisionAreRaceFree exercises the
 // concurrency invariant that commit 58e1915 ("Fix data race on decimal
-// scale and geohash precision") added: a held SerializedBatch snapshot
+// scale and geohash precision") added: a held CopyAll snapshot
 // must be safe to read while the decoder writes the next batch's scale
 // / precision into the source QwpColumnBatch.
 //

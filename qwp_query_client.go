@@ -180,9 +180,10 @@ func (c *QwpQueryClient) CurrentEndpoint() string {
 // is surfaced as the query's first result.
 type QwpBindFunc func(*QwpBinds)
 
-// QueryOption is a functional option for Query / Exec that attaches
-// per-call settings — currently just bind parameters.
-type QueryOption func(*qwpQueryOptions)
+// QwpQueryOption is a functional option for Query / Exec that attaches
+// per-call settings — currently just bind parameters. Named for prefix
+// consistency with QwpQueryClientOption (the constructor option type).
+type QwpQueryOption func(*qwpQueryOptions)
 
 // qwpQueryOptions collects the effective settings for a single Query
 // or Exec invocation. Private so the public surface is the option
@@ -191,13 +192,13 @@ type qwpQueryOptions struct {
 	bindFn QwpBindFunc
 }
 
-// WithQueryBinds attaches a bind-parameter setter to a Query or Exec call.
-// The setter runs on the caller's goroutine and receives a reusable
+// WithQwpQueryBinds attaches a bind-parameter setter to a Query or Exec
+// call. The setter runs on the caller's goroutine and receives a reusable
 // *QwpBinds sink. Placeholders in the SQL text are $1, $2, ...; the
 // corresponding setter calls use 0-based indexes. Setters must be
 // invoked in strictly ascending index order with no gaps; a duplicate
 // or out-of-order index surfaces the error through the query result.
-func WithQueryBinds(fn QwpBindFunc) QueryOption {
+func WithQwpQueryBinds(fn QwpBindFunc) QwpQueryOption {
 	return func(o *qwpQueryOptions) { o.bindFn = fn }
 }
 
@@ -338,25 +339,18 @@ func WithQwpQueryTls() QwpQueryClientOption {
 }
 
 // WithQwpQueryTarget restricts the connect walk to endpoints whose
-// SERVER_INFO.role passes the given filter. Accepts "any" (default,
-// matches any role), "primary" (STANDALONE | PRIMARY |
-// PRIMARY_CATCHUP), or "replica" (REPLICA only). Mirrors Java's
-// withTarget. An invalid value is deferred to validate(): the client
-// constructor surfaces the error.
+// SERVER_INFO.role passes the given filter: QwpTargetAny (default,
+// matches any role), QwpTargetPrimary (STANDALONE | PRIMARY |
+// PRIMARY_CATCHUP), or QwpTargetReplica (REPLICA only). Mirrors Java's
+// withTarget. An out-of-range value is surfaced by the client
+// constructor via validate().
 //
-// target=primary or replica requires the server role from SERVER_INFO;
-// if the client does not consume SERVER_INFO the role is unknown and a
-// role-specific filter cannot be satisfied.
-func WithQwpQueryTarget(target string) QwpQueryClientOption {
+// QwpTargetPrimary or QwpTargetReplica requires the server role from
+// SERVER_INFO; if the client does not consume SERVER_INFO the role is
+// unknown and a role-specific filter cannot be satisfied.
+func WithQwpQueryTarget(target QwpTargetFilter) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) {
-		t, err := parseTargetFilter(target)
-		if err != nil {
-			// Stash an out-of-range sentinel; validate() turns this
-			// into a typed error from the client constructor.
-			c.target = qwpTargetFilter(255)
-			return
-		}
-		c.target = t
+		c.target = target
 	}
 }
 
@@ -733,10 +727,10 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 // cursor drains events lazily as the caller ranges over Batches().
 //
 // Per-call options are supplied via the variadic opts list — see
-// WithQueryBinds for attaching typed bind parameters. Repeating the same
-// SQL text across calls hits the server's SQL-text-keyed factory cache;
-// interpolating values into the SQL string defeats that reuse, use
-// WithQueryBinds instead.
+// WithQwpQueryBinds for attaching typed bind parameters. Repeating the
+// same SQL text across calls hits the server's SQL-text-keyed factory
+// cache; interpolating values into the SQL string defeats that reuse,
+// use WithQwpQueryBinds instead.
 //
 // Query never returns an error directly: any failure raised at submit
 // time (closed client, bind setter error, ctx-cancelled submit) is
@@ -755,7 +749,7 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 // server and drains the remaining events until a terminal frame
 // arrives. Always defer (*QwpQuery).Close() to guarantee cleanup on
 // any path.
-func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QueryOption) *QwpQuery {
+func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QwpQueryOption) *QwpQuery {
 	q := &QwpQuery{
 		client: c,
 		ctx:    ctx,
@@ -791,12 +785,12 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QueryOpt
 // transport or decode failure it is a plain error.
 //
 // Per-call options are supplied via the variadic opts list — see
-// WithQueryBinds for attaching typed bind parameters.
+// WithQwpQueryBinds for attaching typed bind parameters.
 //
 // Calling Exec on a SELECT statement returns an error — SELECT sends
 // RESULT_BATCH + RESULT_END, which Exec does not expect. Use Query
 // for SELECTs.
-func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOption) (ExecResult, error) {
+func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (ExecResult, error) {
 	if c.closed.Load() {
 		return ExecResult{}, errors.New("qwp query: client is closed")
 	}
@@ -892,7 +886,7 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QueryOpti
 // fresh per-request slice so the dispatcher's read of bindPayload is
 // always against a request-owned buffer, independent of what the
 // caller does with the scratch afterwards.
-func (c *QwpQueryClient) buildRequest(sql string, opts []QueryOption) (qwpRequest, error) {
+func (c *QwpQueryClient) buildRequest(sql string, opts []QwpQueryOption) (qwpRequest, error) {
 	if len(sql) > qwpMaxSqlTextBytes {
 		return qwpRequest{}, fmt.Errorf(
 			"qwp query: SQL text length %d exceeds %d-byte limit",

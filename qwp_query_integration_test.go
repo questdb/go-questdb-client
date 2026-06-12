@@ -571,7 +571,7 @@ func TestQwpIntegrationQueryWithBinds(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.host, func(t *testing.T) {
-			q := c.Query(ctx, sql, WithQueryBinds(func(b *QwpBinds) {
+			q := c.Query(ctx, sql, WithQwpQueryBinds(func(b *QwpBinds) {
 				b.VarcharBind(0, tc.host).LongBind(1, tc.minV)
 			}))
 			defer q.Close()

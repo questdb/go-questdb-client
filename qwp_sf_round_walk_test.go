@@ -439,7 +439,7 @@ func TestComputeBackoffEqualJitterShape(t *testing.T) {
 // code; the test feeds one directly to prove the round-walk itself is
 // target-agnostic.
 func TestRoundWalkIngressIgnoresTargetFilter(t *testing.T) {
-	for _, target := range []qwpTargetFilter{qwpTargetAny, qwpTargetPrimary, qwpTargetReplica} {
+	for _, target := range []QwpTargetFilter{qwpTargetAny, qwpTargetPrimary, qwpTargetReplica} {
 		t.Run(target.String(), func(t *testing.T) {
 			srv := newRoundWalkHealthyServer(t)
 			defer srv.Close()

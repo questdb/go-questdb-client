@@ -143,7 +143,7 @@ func TestQwpSfEngineBackpressureTimeout(t *testing.T) {
 	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
 	elapsed := time.Since(start)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, qwpSfErrBackpressureTimeout))
+	assert.True(t, errors.Is(err, ErrBackpressureTimeout))
 	assert.GreaterOrEqual(t, elapsed, 40*time.Millisecond)
 	// Backpressure stall counter incremented.
 	assert.GreaterOrEqual(t, e.engineTotalBackpressureStalls(), int64(1))
@@ -172,7 +172,7 @@ func TestQwpSfEngineBackpressureTimeoutReconnecting(t *testing.T) {
 	}
 	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, qwpSfErrBackpressureTimeout))
+	assert.True(t, errors.Is(err, ErrBackpressureTimeout))
 	msg := err.Error()
 	assert.Contains(t, msg, "reconnecting")
 	assert.Contains(t, msg, "attempts=7")
