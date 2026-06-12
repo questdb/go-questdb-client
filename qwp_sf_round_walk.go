@@ -271,25 +271,16 @@ func qwpSfRunSingleRound(
 		attempts++
 		t, err := params.Factory(ctx, idx)
 		if err == nil && t != nil {
-			// Post-upgrade classification, failover.md §5 wire-v1
-			// row. Ingress pins QWP v1 (wire-ingress.md §3) and never
-			// reads SERVER_INFO, so the role byte is never available
-			// on this path: target=any binds; target=primary or
-			// target=replica is TopologyReject because v1 cannot
-			// supply the role byte. Zone tier, when known, comes from
-			// the 421 X-QuestDB-Zone reject path below — there is no
-			// SERVER_INFO frame on the ingress connection to read it
-			// from here.
-			if params.Tracker.target != qwpTargetAny {
-				_ = t.close()
-				params.Tracker.RecordRoleReject(idx, false)
-				lastErr = fmt.Errorf(
-					"qwp/sf: target=%s not honoured on the ingress path "+
-						"(QWP v1, no SERVER_INFO role byte; see wire-ingress.md §3)",
-					params.Tracker.target)
-				lastWasRoleReject = true
-				continue
-			}
+			// A successful upgrade binds unconditionally. Endpoint
+			// selection by server role is an egress-only feature — the
+			// target= filter is applied on the egress connect-walk
+			// (qwp_query_failover.go). The ingress walk does not route
+			// by role, so target= (like the zone= hint) is accepted at
+			// config time but inert here: rejecting healthy upgrades to
+			// "enforce" a filter this path never evaluates would just
+			// connect/close-storm until the reconnect budget expired.
+			// Ingress trackers are built with target=qwpTargetAny
+			// regardless, so this path never observes a non-Any filter.
 			params.Tracker.RecordSuccess(idx)
 			return qwpSfSingleRoundResult{
 				Transport: t,

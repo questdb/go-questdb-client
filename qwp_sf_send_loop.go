@@ -128,12 +128,13 @@ type qwpSfSendLoop struct {
 	reconnectInitialBackoff time.Duration
 	reconnectMaxBackoff     time.Duration
 
-	// tracker drives the failover.md §13.6 round-walk. Constructed
-	// at sendLoopSetHostTracker time with the host count, client
-	// zone, and target filter. When tracker is nil (legacy single-
-	// host tests), connectWithBackoff falls back to a synthetic
-	// 1-host tracker on first need so the round-walk machinery is
-	// the only code path.
+	// tracker drives the failover.md §13.6 round-walk. Constructed at
+	// sendLoopSetHostTracker time with the host count, client zone, and
+	// target filter — both inert on this ingress path, which does not
+	// route by server role or zone (see qwp_sender_cursor.go). When
+	// tracker is nil (legacy single-host tests), connectWithBackoff
+	// falls back to a synthetic 1-host tracker on first need so the
+	// round-walk machinery is the only code path.
 	tracker *qwpHostTracker
 
 	// previousIdx is this loop's private slot for the §2.3

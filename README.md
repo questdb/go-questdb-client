@@ -277,9 +277,10 @@ qdb.LineSenderFromConf(ctx,
 role: `any` (default), `primary` (writers only — also accepts
 standalone OSS servers), or `replica`. `zone` is an opaque,
 case-insensitive locality identifier (e.g. `eu-west-1a`); when set, the
-client prefers same-zone endpoints. `zone` is effective on the query
-side; for ingestion it is silently accepted but has no effect (QWP
-ingress is zone-blind).
+client prefers same-zone endpoints. Both `target` and `zone` are
+effective on the query side; for ingestion they are silently accepted
+but have no effect — the ingestion path does not route by server role
+or zone (role/zone-aware endpoint selection is a query-side feature).
 
 ```go
 qdb.LineSenderFromConf(ctx,

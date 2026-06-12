@@ -209,13 +209,13 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	if conf.tlsMode != tlsDisabled {
 		scheme = "wss"
 	}
-	// Ingress is zone-blind by spec: wire-ingress.md §3 / failover.md
-	// §7 — ingress pins QWP v1, never reads SERVER_INFO, and ignores
-	// zone advertising. Pass "" for clientZone so every host's tier
-	// stays Same regardless of any 421 X-QuestDB-Zone header. target
-	// is still honoured here — the v1 rule (target≠any →
-	// TopologyReject, failover.md §5) is enforced in qwp_sf_round_walk.go.
-	tracker := newQwpHostTracker(len(conf.endpoints), "", conf.target)
+	// The ingress connect path does not route by server role or zone:
+	// role/zone-aware endpoint selection is an egress-only feature,
+	// applied on the egress connect-walk (qwp_query_failover.go). Pass
+	// "" for clientZone and qwpTargetAny for the role filter so every
+	// reachable host binds regardless of the configured zone=/target=.
+	// Both hints are accepted at config time but inert on ingest.
+	tracker := newQwpHostTracker(len(conf.endpoints), "", qwpTargetAny)
 	factory := qwpSfBuildEndpointFactory(conf.endpoints, scheme, opts, conf.dumpWriter)
 
 	// Initial connect — three modes:

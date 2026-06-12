@@ -564,6 +564,39 @@ func TestSfConfEndToEnd(t *testing.T) {
 	assert.GreaterOrEqual(t, srv.totalFramesReceived.Load(), int64(1))
 }
 
+// TestQwpIngressAcceptsTargetInert is the end-to-end M10 regression
+// guard: a connect string with target=primary (or replica) must
+// connect and deliver rows on the ingress path, not storm. The
+// ingestion path does not route by server role (role-based selection
+// is egress-only), so target= is accepted but inert — every reachable
+// host binds, symmetric with zone=. The flush+ACK barrier is the
+// assertion: it only completes once the send loop binds a host and the
+// server ACKs. Were target= "enforced" on this path — which never
+// evaluates the role — the round-walk would reject every upgrade and
+// re-sweep until the reconnect budget expired, so this barrier would
+// hang until timeout.
+func TestQwpIngressAcceptsTargetInert(t *testing.T) {
+	for _, target := range []string{"primary", "replica"} {
+		t.Run("target="+target, func(t *testing.T) {
+			srv := newQwpTestServer(t) // ACKs every frame
+			defer srv.Close()
+			addr := strings.TrimPrefix(srv.URL, "http://")
+
+			ls, err := LineSenderFromConf(context.Background(),
+				"ws::addr="+addr+";target="+target+";")
+			require.NoError(t, err)
+			defer ls.Close(context.Background())
+
+			s, ok := ls.(*qwpLineSender)
+			require.True(t, ok, "LineSenderFromConf must yield a *qwpLineSender")
+
+			require.NoError(t,
+				s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+			flushAndAwaitAck(t, s)
+		})
+	}
+}
+
 func TestSfConfPicksDefaultSenderIdWhenUnset(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()

@@ -364,6 +364,12 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
+			// Egress consumes this as the connect-walk role filter,
+			// matching against the server's advertised role. The
+			// ingestion path does not route by role (role-based
+			// endpoint selection is egress-only), so target is accepted
+			// but inert on ingestion, symmetric with zone above. Parsed
+			// here so a malformed value is still rejected on both paths.
 			t, err := parseTargetFilter(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("%v", err)

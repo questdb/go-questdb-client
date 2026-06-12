@@ -721,10 +721,10 @@ func WithZone(zone string) LineSenderOption {
 // / QwpTargetReplica). Defaults to QwpTargetAny. Equivalent to the
 // connect-string target=any|primary|replica key.
 //
-// Note: SF ingress is wire v1-pinned and never reads SERVER_INFO, so
-// any value other than QwpTargetAny degrades to a topology reject on
-// the ingest round-walk; the filter is fully honoured on the query
-// (egress) path.
+// The filter is honoured on the query (egress) path, which selects
+// endpoints by the server's advertised role. The ingestion path does
+// not route by role, so the value is accepted but inert there (every
+// reachable host binds), symmetric with WithZone.
 //
 // Only available for the QWP sender.
 func WithTarget(target qwpTargetFilter) LineSenderOption {
@@ -1461,11 +1461,12 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,
 		// QWP has a single protocol version; advertise it.
-		// serverInfoTimeout is left zero so the transport never
-		// attempts a SERVER_INFO read on ingest (ingest senders do not
-		// consume SERVER_INFO, per wire-ingress.md §3, §15.5); the SF
-		// round-walk therefore degrades target=/zone= to the topology
-		// rule (target != any -> TopologyReject) in qwp_sf_round_walk.go.
+		// serverInfoTimeout is left zero: the ingest path does not opt
+		// into synchronous SERVER_INFO consumption at connect and does
+		// not route by server role or zone. Role/zone-aware endpoint
+		// selection is an egress-only feature, so target= and zone= are
+		// accepted but inert on ingestion and honoured on the egress
+		// connect-walk instead.
 		maxVersion: qwpVersion,
 	}
 	// QWP auth: Basic (username:password) or Bearer (token).
