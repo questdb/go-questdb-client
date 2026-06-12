@@ -139,11 +139,12 @@ type qwpTransportOpts struct {
 	maxVersion byte
 
 	// serverInfoTimeout, when > 0, enables synchronous consumption of
-	// the SERVER_INFO frame after the upgrade. The server always emits
-	// SERVER_INFO as the first post-upgrade frame, so egress callers
-	// set this; ingest senders leave it zero, which leaves the
-	// WebSocket recv buffer untouched after the upgrade and keeps the
-	// ACK loop from being fed a SERVER_INFO frame it does not parse.
+	// the SERVER_INFO frame after the upgrade. The egress endpoint
+	// (/read/v1) appends an unsolicited SERVER_INFO frame to the 101
+	// response, so egress callers set this. The ingest endpoint
+	// (/write/v4) sends no SERVER_INFO and the client never expects
+	// one — it sends data right after the upgrade and the first inbound
+	// frame is an ACK — so ingest senders leave it zero.
 	serverInfoTimeout time.Duration
 
 	// authTimeoutMs is the failover.md §1 per-host upper bound on the
@@ -360,13 +361,14 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		t.recvBuf = make([]byte, 0, qwpDefaultInitRecvBufSize)
 	}
 
-	// The server emits SERVER_INFO as the first WebSocket frame after
-	// the upgrade response, before any client request. Consume it
-	// synchronously so the I/O goroutines start with a clean recv
-	// queue and the user-visible ServerInfo() accessor is populated
-	// before submit. Egress connections opt in via opts.serverInfoTimeout
-	// > 0; ingest senders leave it zero so the ACK loop is never
-	// fed a SERVER_INFO frame it doesn't know how to parse.
+	// The egress endpoint appends a SERVER_INFO frame to the upgrade
+	// response (the read endpoint always emits it post-handshake),
+	// before any client request. Consume it synchronously so the I/O
+	// goroutines start with a clean recv queue and the user-visible
+	// ServerInfo() accessor is populated before submit. Egress
+	// connections opt in via opts.serverInfoTimeout > 0; the ingest
+	// endpoint sends no SERVER_INFO and the client never expects one,
+	// so ingest senders leave it zero and read ACKs directly.
 	if opts.serverInfoTimeout > 0 {
 		readCtx, cancel := context.WithTimeout(ctx, opts.serverInfoTimeout)
 		defer cancel()

@@ -209,12 +209,14 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	if conf.tlsMode != tlsDisabled {
 		scheme = "wss"
 	}
-	// The ingress connect path does not route by server role or zone:
-	// role/zone-aware endpoint selection is an egress-only feature,
-	// applied on the egress connect-walk (qwp_query_failover.go). Pass
-	// "" for clientZone and qwpTargetAny for the role filter so every
-	// reachable host binds regardless of the configured zone=/target=.
-	// Both hints are accepted at config time but inert on ingest.
+	// The ingress endpoint never sends SERVER_INFO and the client never
+	// expects one (per the wire spec, ingress is role- and zone-blind);
+	// role/zone-aware endpoint selection is egress-only. Pass "" for
+	// clientZone and qwpTargetAny for the role filter so every reachable
+	// host binds regardless of the configured zone=/target=. Both hints
+	// are accepted at config time but inert on ingest; the server's
+	// 421 + X-QuestDB-Role upgrade reject keeps writes off replicas
+	// (see qwp_sf_round_walk.go).
 	tracker := newQwpHostTracker(len(conf.endpoints), "", qwpTargetAny)
 	factory := qwpSfBuildEndpointFactory(conf.endpoints, scheme, opts, conf.dumpWriter)
 

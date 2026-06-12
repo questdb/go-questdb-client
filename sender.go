@@ -704,9 +704,10 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 }
 
 // WithZone sets the failover zone hint used for endpoint locality.
-// It is silently stored but inert on the ingestion path, which does
-// not route by zone; the egress (query) path consults it to prefer
-// same-zone endpoints. Equivalent to the connect-string zone key.
+// It is silently stored but inert on the ingestion path, which is
+// zone-blind — it never receives SERVER_INFO. The egress (query) path
+// consults it to prefer same-zone endpoints. Equivalent to the
+// connect-string zone key.
 //
 // Only available for the QWP sender.
 func WithZone(zone string) LineSenderOption {
@@ -720,10 +721,11 @@ func WithZone(zone string) LineSenderOption {
 // / QwpTargetReplica). Defaults to QwpTargetAny. Equivalent to the
 // connect-string target=any|primary|replica key.
 //
-// The filter is honoured on the query (egress) path, which selects
-// endpoints by the server's advertised role. The ingestion path does
-// not route by role, so the value is accepted but inert there (every
-// reachable host binds), symmetric with WithZone.
+// The filter is honoured on the query (egress) path, which reads the
+// server's role from the SERVER_INFO frame. The ingestion path never
+// receives SERVER_INFO (it is role-blind by the wire-protocol spec),
+// so the value is accepted but inert there — the server's own role
+// reject keeps writes off replicas. Symmetric with WithZone.
 //
 // Only available for the QWP sender.
 func WithTarget(target qwpTargetFilter) LineSenderOption {
@@ -1460,12 +1462,12 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,
 		// QWP has a single protocol version; advertise it.
-		// serverInfoTimeout is left zero: the ingest path does not opt
-		// into synchronous SERVER_INFO consumption at connect and does
-		// not route by server role or zone. Role/zone-aware endpoint
-		// selection is an egress-only feature, so target= and zone= are
-		// accepted but inert on ingestion and honoured on the egress
-		// connect-walk instead.
+		// serverInfoTimeout stays zero: the ingest endpoint sends no
+		// SERVER_INFO frame and the client never expects one — it sends
+		// data right after the upgrade and reads ACKs back. Ingest does
+		// not route by role or zone, so target= and zone= are accepted
+		// but inert on ingestion and honoured on the egress connect-walk
+		// instead.
 		maxVersion: qwpVersion,
 	}
 	// QWP auth: Basic (username:password) or Bearer (token).

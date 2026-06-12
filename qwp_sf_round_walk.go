@@ -271,16 +271,20 @@ func qwpSfRunSingleRound(
 		attempts++
 		t, err := params.Factory(ctx, idx)
 		if err == nil && t != nil {
-			// A successful upgrade binds unconditionally. Endpoint
-			// selection by server role is an egress-only feature — the
-			// target= filter is applied on the egress connect-walk
-			// (qwp_query_failover.go). The ingress walk does not route
-			// by role, so target= (like the zone= hint) is accepted at
-			// config time but inert here: rejecting healthy upgrades to
-			// "enforce" a filter this path never evaluates would just
+			// A successful upgrade binds unconditionally. The ingress
+			// endpoint sends no SERVER_INFO frame and the client never
+			// expects one (per the wire spec, ingress is role- and
+			// zone-blind), so this path has no server role to filter on
+			// — and needs none: the server itself 421-rejects an ingress
+			// upgrade to a REPLICA or PRIMARY_CATCHUP node (with
+			// X-QuestDB-Role), so any node that completes the upgrade is
+			// write-eligible. Those 421s are classified as role rejects
+			// below; a clean upgrade means bind. target= (like zone=) is
+			// thus accepted at config time but inert here — re-rejecting
+			// a node the server already accepted would only
 			// connect/close-storm until the reconnect budget expired.
-			// Ingress trackers are built with target=qwpTargetAny
-			// regardless, so this path never observes a non-Any filter.
+			// Ingress trackers are built with qwpTargetAny regardless,
+			// so this path never observes a non-Any filter.
 			params.Tracker.RecordSuccess(idx)
 			return qwpSfSingleRoundResult{
 				Transport: t,
