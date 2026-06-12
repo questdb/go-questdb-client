@@ -81,7 +81,8 @@ Everything QWP lives in `qwp_*.go`. The buffer (`qwp_buffer.go`), encoder
 
 **All wire I/O — memory-backed *and* disk-backed — goes through the cursor
 engine + send loop** in `qwp_sf_*.go`. `sf_dir` empty selects memory-backed
-segments; set selects disk-backed under `<sf_dir>/<sender_id>/<slot>/*.sfa`,
+segments; set selects disk-backed under `<sf_dir>/<sender_id>/*.sfa` (that
+per-sender directory is itself the slot — there is no extra slot level),
 on-disk-compatible with the Java client's `MmapSegment.java`. The producer
 encodes a batch into `qwpSfCursorEngine` via `engineAppendBlocking`; the
 `qwpSfSendLoop` goroutine drains it to the WebSocket, parses ACKs, advances
@@ -103,9 +104,16 @@ schema from the first `RESULT_BATCH` of a query (`batch_seq == 0`) into
 batches; `qwpEgressIO.dispatcherRun` calls `resetQuerySchema` at the start of
 every query so a schema never leaks across query boundaries.
 
-Symbol-dict tracking (`maxSentSymbolId`, `batchMaxSymbolId`) is still in
-place: the encoder always passes `-1` to force "full dict from id 0", and the
-trackers exist for tests and external observers.
+Symbol-dict tracking (`maxSentSymbolId`, `batchMaxSymbolId`) is still in place,
+and both fields are load-bearing. The encoder always passes `-1` as the
+`maxSentId` arg of `encodeMultiTableWithDeltaDict` to force "full dict from id
+0", but `batchMaxSymbolId` is the separate `batchMaxId` arg and bounds the dict
+actually written: `writeDeltaDict` emits `globalDict[0..batchMaxSymbolId]`, so
+dropping it would silently truncate the symbol dict. `maxSentSymbolId` is the
+cross-flush high-water mark that `resetAfterFlush` rewinds `batchMaxSymbolId` to
+(never to `-1`), so a later batch reusing only earlier symbols still writes the
+full dict its rows reference. Both are also read by tests and external
+observers, but that is incidental to their wire role.
 
 `WithInFlightWindow(n)` / `in_flight_window=n` is **retained but a no-op** in
 the cursor architecture — backpressure is governed by the engine's segment-ring

@@ -242,8 +242,11 @@ type qwpLineSender struct {
 	globalSymbols map[string]int32
 	// globalSymbolList maps IDs to symbol strings (for delta dict).
 	globalSymbolList []string
-	// maxSentSymbolId is the highest symbol ID ACKed by the server.
-	// -1 means no symbols have been sent yet.
+	// maxSentSymbolId is the highest symbol ID included in a frame
+	// appended to the cursor engine — advanced at append time, not on
+	// server ACK. It is the cross-flush high-water mark that
+	// resetAfterFlush rewinds batchMaxSymbolId to. -1 means no symbols
+	// appended yet.
 	maxSentSymbolId int
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int

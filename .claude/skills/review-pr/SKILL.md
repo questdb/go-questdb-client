@@ -122,7 +122,7 @@ Group the callsites from 2.5b by execution context. Typical contexts in this cod
 - **Auto-flush path:** the non-blocking `enqueueCursor` path and whatever triggers it
 - **QWP cursor engine + send loop:** `qwpSfCursorEngine`, `engineAppendBlocking`, `qwpSfSendLoop`, reconnect/replay, ACK parsing, `engineAckedFsn`/`enginePublishedFsn` (`qwp_sf_*.go`)
 - **Background drainer goroutines:** orphan-slot adoption (`qwp_sf_orphan.go`, `qwp_sf_drainer.go`, `qwp_sf_round_walk.go`), visible via `QwpSender.BackgroundDrainers()`
-- **Disk-backed segments:** `sf_dir` set → `<sf_dir>/<sender_id>/<slot>/*.sfa`, on-disk-compatible with the Java client's `MmapSegment.java`
+- **Disk-backed segments:** `sf_dir` set → `<sf_dir>/<sender_id>/*.sfa` (the per-sender directory is itself the slot), on-disk-compatible with the Java client's `MmapSegment.java`
 - **Configuration parsing:** `LineSenderFromConf`, `conf_parse.go`
 - **Authentication / TLS:** TLS config, basic/token auth on HTTP/TCP, QWP handshake
 - **Error callback:** `WithErrorHandler` async path, plus producer-side `errors.As` after `Flush`/`FlushAndGetSequence`

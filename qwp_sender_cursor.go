@@ -454,10 +454,13 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 // Schema-side: every table block carries its full inline column
 // definitions. There is no producer-side schema registry to advance.
 //
-// Symbol-side: maxSentSymbolId is retained because the symbol dict
-// uses a delta encoding (varint-prefixed length, then names), and
-// we always pass `-1` to the encoder to force "full dict from id 0"
-// — but the tracker exists for tests and external observers.
+// Symbol-side: the dict uses a delta encoding (varint-prefixed
+// length, then names). We always pass `-1` as the encoder's maxSentId
+// so the delta starts at id 0 (self-sufficient frame), and
+// batchMaxSymbolId — passed as batchMaxId — bounds how much of
+// globalSymbolList goes out (ids 0..batchMaxSymbolId). maxSentSymbolId
+// carries the high-water mark across flushes so resetAfterFlush can
+// rewind batchMaxSymbolId to it. Both fields do real work here.
 func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 		return err
