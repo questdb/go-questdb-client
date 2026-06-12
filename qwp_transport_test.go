@@ -1194,6 +1194,49 @@ func TestQwpTransportUpgradeRejectErrorIsTyped(t *testing.T) {
 	assert.Equal(t, 421, rej.StatusCode)
 }
 
+// TestQwpTransportUpgradeRejectNoConnLeak drives many non-101 upgrade
+// rejects through connect() and asserts the goroutine count stays flat.
+// Each connect() builds a fresh one-shot http.Transport; without
+// DisableKeepAlives a 421 (steady-state in failover topologies) would
+// park the keep-alive TCP conn in that transport's idle pool, stranding
+// the conn plus its persistConn read/write goroutines — a per-reject
+// leak invisible to the single-shot reject tests above, since each of
+// them builds exactly one transport.
+func TestQwpTransportUpgradeRejectNoConnLeak(t *testing.T) {
+	srv := newUpgradeRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"PRIMARY_CATCHUP"},
+	}, "primary is still catching up")
+	defer srv.Close()
+
+	// Warm-up cycle so the httptest accept machinery and any
+	// once-initialized globals are already counted in the baseline.
+	connectUpgradeReject(t, srv, qwpTransportOpts{})
+	base := stableGoroutineCount()
+
+	const cycles = 30
+	for i := 0; i < cycles; i++ {
+		connectUpgradeReject(t, srv, qwpTransportOpts{})
+	}
+
+	// persistConn teardown is asynchronous — the read/write goroutines
+	// exit once the closed conn unblocks them — so let it settle. A
+	// per-reject leak would add ~2×30 goroutines, far past the slack, so
+	// this stays sensitive without flaking on transient runtime or
+	// httptest server goroutines.
+	const slack = 8
+	var got int
+	require.Eventuallyf(t, func() bool {
+		got = stableGoroutineCount()
+		return got <= base+slack
+	}, 10*time.Second, 100*time.Millisecond,
+		"goroutine count did not return to baseline after %d upgrade-reject "+
+			"connect cycles", cycles)
+	assert.LessOrEqualf(t, got, base+slack,
+		"goroutine count grew from %d to %d across %d upgrade rejects — "+
+			"connect() is leaking pooled conns / persistConn goroutines",
+		base, got, cycles)
+}
+
 // TestQwpTransportAuthTimeoutBoundsUpgradeReadOnly verifies that the
 // failover.md §1 auth_timeout_ms knob only bounds the upgrade response
 // read — a server that accepts the TCP connection but never writes the

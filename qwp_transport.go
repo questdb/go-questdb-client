@@ -262,7 +262,21 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	// per failover.md §1 (auth_timeout_ms bounds the upgrade response
 	// read). The same Transport carries TLS config for wss:// and the
 	// pipe-DialContext for dump mode.
-	httpTransport := &http.Transport{}
+	//
+	// DisableKeepAlives keeps this one-shot transport from pooling. It is
+	// built fresh per connect() and discarded after, so there is no reuse
+	// to gain — and on a non-101 upgrade response (421 role-reject, 503
+	// proxy, ...) coder/websocket reads the body to EOF and closes it,
+	// which would otherwise return the keep-alive TCP conn to this
+	// transport's idle pool. Nothing reuses the abandoned transport or
+	// calls CloseIdleConnections on it, so the parked conn plus its
+	// persistConn read/write goroutines would leak — and role-rejects are
+	// steady-state in a failover topology, so the leak accumulates. A
+	// successful 101 hijacks the conn out of pool management, so the flag
+	// never affects the live WebSocket.
+	httpTransport := &http.Transport{
+		DisableKeepAlives: true,
+	}
 	if opts.authTimeoutMs > 0 {
 		httpTransport.ResponseHeaderTimeout = time.Duration(opts.authTimeoutMs) * time.Millisecond
 	}
