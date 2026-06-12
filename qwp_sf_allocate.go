@@ -29,6 +29,15 @@ import (
 	"os"
 )
 
+// qwpSfReserveNewBlocksFn is the indirection qwpSfAllocate calls to
+// reserve real disk blocks. In production it points at the
+// platform-specific qwpSfReserveNewBlocks; tests swap it to fault-inject
+// a reservation failure (e.g. ENOSPC) without having to actually fill a
+// filesystem, then restore the original in a t.Cleanup. Mirrors the Java
+// client's FilesFacade seam, where ENOSPC at allocate is fault-injected
+// through a test facade (see MmapSegment.create's facade overload).
+var qwpSfReserveNewBlocksFn = qwpSfReserveNewBlocks
+
 // qwpSfAllocate extends f to at least size bytes and reserves real
 // disk blocks for the newly-extended range. Mirrors the Java client's
 // Files.allocate contract (see java-questdb-client core/src/main/java
@@ -83,7 +92,7 @@ func qwpSfAllocate(f *os.File, size int64) error {
 		return nil
 	}
 	newBytes := target - currentSize
-	if err := qwpSfReserveNewBlocks(f, currentSize, newBytes); err != nil {
+	if err := qwpSfReserveNewBlocksFn(f, currentSize, newBytes); err != nil {
 		return err
 	}
 	// Unified EOF advancement. On Linux when fallocate succeeded the

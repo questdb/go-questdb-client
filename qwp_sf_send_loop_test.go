@@ -542,10 +542,19 @@ positioning:
 }
 
 func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
+	// Run over both engine backings so disk-backed reconnect+replay —
+	// otherwise exercised only by the jar-gated fuzz workflow — is
+	// covered here too. "" selects a memory-backed engine; a TempDir
+	// selects disk-backed segments under that slot directory.
+	t.Run("memory", func(t *testing.T) { testQwpSfSendLoopReconnectAfterServerClose(t, "") })
+	t.Run("disk", func(t *testing.T) { testQwpSfSendLoopReconnectAfterServerClose(t, t.TempDir()) })
+}
+
+func testQwpSfSendLoopReconnectAfterServerClose(t *testing.T, sfDir string) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 5})
 	defer srv.Close()
 
-	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	engine, err := qwpSfNewCursorEngine(sfDir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
@@ -622,13 +631,22 @@ func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 // frames the server DID see pre-drop, so the union alone would mask
 // their loss).
 func TestQwpSfSendLoopReplayIsGapFree(t *testing.T) {
+	// Run over both engine backings so disk-backed gap-free replay —
+	// otherwise exercised only by the jar-gated fuzz workflow — is
+	// covered here too. "" selects a memory-backed engine; a TempDir
+	// selects disk-backed segments under that slot directory.
+	t.Run("memory", func(t *testing.T) { testQwpSfSendLoopReplayIsGapFree(t, "") })
+	t.Run("disk", func(t *testing.T) { testQwpSfSendLoopReplayIsGapFree(t, t.TempDir()) })
+}
+
+func testQwpSfSendLoopReplayIsGapFree(t *testing.T, sfDir string) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		closeAfterFrames: 5,
 		recordFrames:     true,
 	})
 	defer srv.Close()
 
-	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	engine, err := qwpSfNewCursorEngine(sfDir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 
@@ -1346,6 +1364,15 @@ func TestQwpSfRecordFatalServerErrorNilSafe(t *testing.T) {
 // notification; sendLoopCheckError returns nil; subsequent frames
 // continue draining.
 func TestQwpSfSendLoopDropAndContinue(t *testing.T) {
+	// Run over both engine backings so disk-backed DROP-and-advance —
+	// otherwise exercised only by the jar-gated fuzz workflow — is
+	// covered here too. "" selects a memory-backed engine; a TempDir
+	// selects disk-backed segments under that slot directory.
+	t.Run("memory", func(t *testing.T) { testQwpSfSendLoopDropAndContinue(t, "") })
+	t.Run("disk", func(t *testing.T) { testQwpSfSendLoopDropAndContinue(t, t.TempDir()) })
+}
+
+func testQwpSfSendLoopDropAndContinue(t *testing.T, sfDir string) {
 	// rejectStatus=SchemaMismatch (default Drop) for the very first
 	// frame only; subsequent frames get OK ACKs. We need the test
 	// server to support that mode — see opts.rejectFirstNFrames below.
@@ -1355,7 +1382,7 @@ func TestQwpSfSendLoopDropAndContinue(t *testing.T) {
 	})
 	defer srv.Close()
 
-	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	engine, err := qwpSfNewCursorEngine(sfDir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 

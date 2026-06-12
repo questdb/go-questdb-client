@@ -103,6 +103,65 @@ func TestQwpCursorSenderFlushNoRowsIsCheap(t *testing.T) {
 		"Flush(no rows) should return immediately, took %s", elapsed)
 }
 
+// TestQwpCursorSenderFlushWithPendingRowsDoesNotWaitForAck pins the
+// headline cursor-mode contract change: Flush / FlushAndGetSequence
+// publish the pending batch and return WITHOUT blocking on the server
+// ACK (design/qwp-cursor-durability.md decision #1: "flush() never waits
+// for ACK; ACKs are async"). TestQwpCursorSenderFlushNoRowsIsCheap covers
+// the zero-pending fast path; this exercises the pending-rows branch —
+// the one that actually encodes and enqueues a frame — against a server
+// that accepts frames but never ACKs. The proof has two halves: the call
+// returns promptly, and ackedFsn is still behind publishedFsn when it
+// does (so it cannot have waited for the withheld ACK).
+func TestQwpCursorSenderFlushWithPendingRowsDoesNotWaitForAck(t *testing.T) {
+	srv := newSilentAckServer(t)
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	// autoFlushRows=0 → rows accumulate until the explicit Flush.
+	// closeTimeout=100ms keeps the deferred Close fast: the server never
+	// ACKs, so a long drain-wait would only stall teardown.
+	s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 100*time.Millisecond)
+	require.NoError(t, err)
+	defer func() { _ = s.Close(context.Background()) }()
+
+	const rows = 5
+	for i := 0; i < rows; i++ {
+		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
+	}
+	require.Equal(t, rows, s.pendingRowCount)
+	// Precondition: the server has withheld every ACK, so nothing is
+	// acked yet — the gap Flush must not block on.
+	require.Equal(t, int64(-1), engine.engineAckedFsn())
+
+	start := time.Now()
+	fsn, err := s.FlushAndGetSequence(context.Background())
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+
+	// Returned promptly: it published into the engine and returned rather
+	// than blocking on an ACK that never comes. 50ms ceiling mirrors the
+	// no-rows sibling above.
+	assert.Less(t, elapsed, 50*time.Millisecond,
+		"Flush(pending rows) must not wait for ACK, took %s", elapsed)
+	// The batch WAS published (a single multi-row frame → FSN 0) and the
+	// pending buffer drained.
+	assert.Equal(t, int64(0), fsn, "single batch publishes FSN 0")
+	assert.Equal(t, fsn, engine.enginePublishedFsn())
+	assert.Equal(t, 0, s.pendingRowCount)
+	// The crux: the server ACK was NOT awaited. With silentAcks no ACK
+	// will ever arrive, so ackedFsn stays behind publishedFsn — this is a
+	// stable post-condition, not a race window.
+	assert.Equal(t, int64(-1), engine.engineAckedFsn(),
+		"Flush must return before the (withheld) server ACK advances ackedFsn")
+}
+
 func TestQwpCursorSenderAutoFlushOnRowCount(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()

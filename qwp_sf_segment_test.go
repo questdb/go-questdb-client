@@ -362,3 +362,126 @@ func TestQwpSfFlockExclusive(t *testing.T) {
 	// Re-acquire on f2 now that f1 has released.
 	require.NoError(t, qwpSfFlockExclusive(f2))
 }
+
+// TestQwpSfSegmentGoldenFileJavaConformance is the Java<->Go .sfa
+// golden-file conformance guard for CLAUDE.md's on-disk compatibility
+// claim: a segment file written by either client must be byte-readable
+// by the other. The "golden" is a canonical .sfa image laid out by hand
+// from the format documented on the Java MmapSegment.java (FILE_MAGIC,
+// HEADER_SIZE, FRAME_HEADER_SIZE, VERSION, baseSeq, CRC32C over
+// (payloadLen, payload)) — built independently of the production
+// qwpSfSegment codec so it pins all three directions of drift:
+//
+//  1. The format constants still equal the Java MmapSegment literals.
+//  2. The Go reader (qwpSfOpenSegment) recovers a hand-built image.
+//  3. The Go writer (qwpSfCreateSegment + tryAppend) reproduces the
+//     image byte-for-byte, except the non-deterministic createdMicros
+//     header field.
+//
+// CRC32C (Castagnoli) is a standardised checksum, so the in-test stdlib
+// crc32 and the Java client's Crc32c necessarily agree on the same
+// bytes; the conformance therefore rests on the byte layout, which this
+// test pins explicitly. A switch to a different polynomial or endianness
+// on either side trips the reader or writer sub-test.
+func TestQwpSfSegmentGoldenFileJavaConformance(t *testing.T) {
+	// 1. Format constants must equal the Java MmapSegment.java literals.
+	assert.Equal(t, uint32(0x31304653), qwpSfFileMagic, "'SF01' little-endian")
+	assert.Equal(t, int64(24), qwpSfHeaderSize)
+	assert.Equal(t, int64(8), qwpSfFrameHeaderSize)
+	assert.Equal(t, byte(1), qwpSfSegmentVersion)
+
+	// Canonical input: a non-zero baseSeq and two frames of differing
+	// length so a length-handling drift is visible.
+	const goldenBaseSeq = int64(7)
+	// A fixed createdMicros keeps the golden image deterministic; the
+	// production writer stamps time.Now(), checked separately below.
+	const goldenCreatedMicros = int64(1_700_000_000_000_000)
+	goldenFrames := [][]byte{[]byte("hello"), []byte("QWP!")}
+
+	crcTable := crc32.MakeTable(crc32.Castagnoli)
+
+	// Build the golden .sfa image by hand from the documented layout.
+	golden := make([]byte, qwpSfHeaderSize)
+	binary.LittleEndian.PutUint32(golden[0:4], 0x31304653) // magic 'SF01'
+	golden[4] = 1                                          // version
+	golden[5] = 0                                          // flags
+	binary.LittleEndian.PutUint16(golden[6:8], 0)          // reserved
+	binary.LittleEndian.PutUint64(golden[8:16], uint64(goldenBaseSeq))
+	binary.LittleEndian.PutUint64(golden[16:24], uint64(goldenCreatedMicros))
+	for _, p := range goldenFrames {
+		frame := make([]byte, qwpSfFrameHeaderSize+int64(len(p)))
+		binary.LittleEndian.PutUint32(frame[4:8], uint32(len(p)))
+		copy(frame[8:], p)
+		// CRC32C covers (payloadLen, payload) — frame[4:] here.
+		crc := crc32.Update(0, crcTable, frame[4:])
+		binary.LittleEndian.PutUint32(frame[0:4], crc)
+		golden = append(golden, frame...)
+	}
+
+	// 2. Reader: a hand-built (cross-impl) image must be recovered intact.
+	t.Run("Go reader accepts the golden image", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "golden.sfa")
+		require.NoError(t, os.WriteFile(path, golden, 0o644))
+
+		seg, err := qwpSfOpenSegment(path)
+		require.NoError(t, err)
+		defer func() { _ = seg.close() }()
+
+		assert.Equal(t, goldenBaseSeq, seg.segmentBaseSeq())
+		assert.Equal(t, int64(len(goldenFrames)), seg.segmentFrameCount())
+		assert.Equal(t, int64(0), seg.segmentTornTailBytes(),
+			"a clean golden image must report no torn tail")
+		assert.Equal(t, int64(len(golden)), seg.publishedOffset(),
+			"recovery must position the cursor just past the last valid frame")
+
+		// Walk the frames back out of the mapping and confirm payloads.
+		buf := seg.address()
+		off := qwpSfHeaderSize
+		for i, p := range goldenFrames {
+			payloadLen := int64(binary.LittleEndian.Uint32(buf[off+4 : off+8]))
+			require.Equalf(t, int64(len(p)), payloadLen, "frame %d payloadLen", i)
+			got := buf[off+qwpSfFrameHeaderSize : off+qwpSfFrameHeaderSize+payloadLen]
+			assert.Equalf(t, p, got, "frame %d payload", i)
+			off += qwpSfFrameHeaderSize + payloadLen
+		}
+	})
+
+	// 3. Writer: the production writer must reproduce the golden image,
+	//    modulo the non-deterministic createdMicros header field.
+	t.Run("Go writer reproduces the golden image", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "written.sfa")
+		const segSize int64 = 4096
+
+		seg, err := qwpSfCreateSegment(path, goldenBaseSeq, segSize)
+		require.NoError(t, err)
+		for _, p := range goldenFrames {
+			_, err := seg.tryAppend(p)
+			require.NoError(t, err)
+		}
+		require.NoError(t, seg.close())
+
+		written, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, int(segSize), len(written),
+			"create pre-allocates the full segment size")
+
+		// Header: everything except createdMicros[16:24] is deterministic.
+		assert.Equal(t, golden[0:16], written[0:16],
+			"magic/version/flags/reserved/baseSeq must match the golden header")
+		gotMicros := int64(binary.LittleEndian.Uint64(written[16:24]))
+		assert.Greaterf(t, gotMicros, int64(1_600_000_000_000_000),
+			"createdMicros must be a plausible recent timestamp, got %d", gotMicros)
+
+		// Frames must be byte-identical to the golden image (CRC + len +
+		// payload). This is what a Java reader would parse.
+		assert.Equal(t, golden[qwpSfHeaderSize:], written[qwpSfHeaderSize:len(golden)],
+			"frame bytes (crc + len + payload) must match the golden image")
+
+		// The pre-allocated tail past the last frame is zero-filled.
+		tail := written[len(golden):]
+		assert.Equal(t, make([]byte, len(tail)), tail,
+			"the reserved tail beyond the written frames must be zero-filled")
+	})
+}

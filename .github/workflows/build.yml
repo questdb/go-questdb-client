@@ -137,6 +137,19 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Run zero-alloc invariant (non-race)
+        # The QWP hot-path 0-allocs/op pins (the Test*ZeroAllocs cases in
+        # qwp_bench_test.go) self-skip under -race: race instrumentation
+        # forces stack-allocatable values to escape and inflates
+        # allocs/op. The "Run tests" step below is -race only, so without
+        # this dedicated non-race run the headline allocation-free
+        # guarantee would never actually be exercised in CI. Cheap — a
+        # handful of testing.AllocsPerRun loops, no network or Docker.
+        # GOTOOLCHAIN=local pins to the matrix Go (see "Run vet").
+        env:
+          GOTOOLCHAIN: local
+        run: go test -run ZeroAllocs -count=1 .
+
       - name: Run tests
         # Pin to the matrix-installed Go (see "Run vet"). The
         # Staticcheck step deliberately omits this: staticcheck@v0.7.0
