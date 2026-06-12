@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -51,6 +52,18 @@ const qwpSfEngineParkInterval = 50 * time.Microsecond
 //lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 var qwpSfErrBackpressureTimeout = errors.New(
 	"qwp/sf: cursor ring backpressured — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)")
+
+// qwpSfErrEngineClosed is returned by engineAppendBlocking when the
+// engine is closed underneath an in-flight or backpressure-parked
+// append. The canonical trigger is a SenderErrorHandler calling
+// Close() while the producer is stalled in the backpressure spin on a
+// wedged wire (a HALT stops the send loop draining, so ackedFsn never
+// advances and the ring stays full). The producer gets this clean
+// error instead of dereferencing a segment that engineClose's
+// segmentRingClose has just nil'd + munmapped.
+//
+//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
+var qwpSfErrEngineClosed = errors.New("qwp/sf: cursor engine closed")
 
 // qwpSfCursorEngine is the cursor-engine facade that bundles a
 // qwpSfSegmentRing with a qwpSfSegmentManager and exposes the
@@ -117,6 +130,22 @@ type qwpSfCursorEngine struct {
 	// closed is set by engineClose. atomic.Bool so tests / status
 	// accessors can sample it from any goroutine.
 	closed atomic.Bool
+
+	// appendMu serializes the producer's ring-append path against
+	// engineClose's segment teardown. The producer's only entry into
+	// appendOrFsn is engineAppendBlocking, which takes this lock around
+	// each ring touch (initial try and every backpressure-spin retry)
+	// and re-checks closed under it; engineClose holds it across the
+	// manager + ring teardown. Together they guarantee no append is
+	// dereferencing the active segment while segmentRingClose nil's and
+	// munmaps it, and that every append after close observes closed and
+	// bails with qwpSfErrEngineClosed. Without it a Close() from a
+	// SenderErrorHandler (running on the dispatcher goroutine) while the
+	// producer is parked in the backpressure spin tears the segment down
+	// under the producer — a nil-pointer deref in memory mode, a SIGBUS
+	// on the munmapped pages in SF mode. Off the per-row hot path:
+	// appendOrFsn runs once per flush, not per row.
+	appendMu sync.Mutex
 }
 
 // qwpSfNewCursorEngine creates an engine with a private
@@ -380,7 +409,10 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	fsn := e.ring.appendOrFsn(payload)
+	fsn, closed := e.tryAppendOrFsn(payload)
+	if closed {
+		return 0, qwpSfErrEngineClosed
+	}
 	if fsn >= 0 {
 		return fsn, nil
 	}
@@ -403,7 +435,10 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 			return 0, ctx.Err()
 		}
 		timer.Reset(qwpSfEngineParkInterval)
-		fsn = e.ring.appendOrFsn(payload)
+		fsn, closed = e.tryAppendOrFsn(payload)
+		if closed {
+			return 0, qwpSfErrEngineClosed
+		}
 		if fsn >= 0 {
 			return fsn, nil
 		}
@@ -411,6 +446,24 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 			return 0, qwpSfErrPayloadTooLarge
 		}
 	}
+}
+
+// tryAppendOrFsn runs one ring.appendOrFsn under appendMu, re-checking
+// closed first so a concurrent engineClose can never tear the active
+// segment down mid-append. Returns (fsn, false) with the appendOrFsn
+// sentinel/result, or (0, true) when the engine has been closed — the
+// signal engineAppendBlocking turns into qwpSfErrEngineClosed so a
+// parked producer unwinds cleanly instead of dereferencing a nil'd /
+// munmapped segment. Lock scope is exactly the ring touch; the spin's
+// park happens with the lock released so engineClose is never delayed
+// by more than one in-flight append.
+func (e *qwpSfCursorEngine) tryAppendOrFsn(payload []byte) (fsn int64, closed bool) {
+	e.appendMu.Lock()
+	defer e.appendMu.Unlock()
+	if e.closed.Load() {
+		return 0, true
+	}
+	return e.ring.appendOrFsn(payload), false
 }
 
 // engineTotalBackpressureStalls returns the cumulative number of
@@ -481,6 +534,17 @@ func (e *qwpSfCursorEngine) engineClose() error {
 	if !e.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	// Serialize the manager + ring teardown against the producer's
+	// append path. closed is now true, so any tryAppendOrFsn that
+	// acquires appendMu after us bails before touching the ring;
+	// acquiring it here drains any append currently in flight. Held
+	// across segmentRingClose so the active segment is nil'd + munmapped
+	// with no producer dereferencing it (C3: a SenderErrorHandler's
+	// Close() racing a producer parked in engineAppendBlocking's
+	// backpressure spin). appendMu is never held by the manager
+	// goroutine, so joining it under the lock cannot deadlock.
+	e.appendMu.Lock()
+	defer e.appendMu.Unlock()
 	// Capture drain state BEFORE closing the ring — once the ring is
 	// closed, its accessors aren't safe to read. The active segment
 	// is never trimmed by drainTrimmable (only sealed segments are),

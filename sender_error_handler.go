@@ -53,6 +53,16 @@ package questdb
 // subject to the dispatcher's short best-effort drain and may be
 // dropped (visible via QwpSender.DroppedErrorNotifications()).
 //
+// Because the handler runs on the dispatcher goroutine — not the
+// producer goroutine — these calls deliberately do NOT touch producer-
+// buffered state: a handler-invoked Close() or Flush() will not flush
+// rows the producer has staged but not yet flushed itself (those are
+// owned by the producer goroutine and may be mid-assembly). Close()
+// still tears down the wire, drains already-published frames up to
+// close_flush_timeout, and releases resources; Flush() still surfaces
+// the latched error. To guarantee a specific batch is flushed, flush it
+// from the producer goroutine before relying on the handler to close.
+//
 // # What this callback is for
 //
 // Dead-lettering rejected data, alerting, metrics. Producer-thread

@@ -547,6 +547,38 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 	return s.encodeInfoBuf, nil
 }
 
+// calledFromErrorHandler reports whether the current goroutine is the
+// error dispatcher's loop goroutine — i.e. we are running inside a
+// user SenderErrorHandler invocation. The handler is documented as
+// allowed to call Close() / Flush(); when it does, those calls run off
+// the producer goroutine. The producer owns lastErr / hasTable /
+// currentTable / pendingRowCount / the tableBuffers map / the encoder
+// with no happens-before against this goroutine, so the Close()/Flush()
+// paths must NOT touch that state — doing so races a producer mid-At(),
+// up to Go's fatal "concurrent map iteration and map write" when
+// buildTableEncodeInfo ranges tableBuffers while Table() writes it.
+//
+// Cheap on the common path: loopGoid is 0 whenever the dispatcher
+// goroutine is not running (no server error has ever been delivered),
+// so the runtime.Stack cost of qwpGoid() is only paid once an error has
+// actually spun the dispatcher up. The g != 0 guard keeps a goid parse
+// failure from matching the loopGoid==0 "not running" sentinel.
+func (s *qwpLineSender) calledFromErrorHandler() bool {
+	if s.cursorSendLoop == nil {
+		return false
+	}
+	d := s.cursorSendLoop.sendLoopDispatcher()
+	if d == nil {
+		return false
+	}
+	lg := d.loopGoid.Load()
+	if lg == 0 {
+		return false
+	}
+	g := qwpGoid()
+	return g != 0 && g == lg
+}
+
 // closeCursor drains the cursor engine and closes the send loop.
 // Returns the first non-nil error from drain / loop shutdown /
 // engine close. Always best-effort: every subsystem is asked to
@@ -561,45 +593,59 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 //     recovery path and must treat the timeout as fatal.
 //   - closeFlushTimeout <= 0: skip the drain entirely (fast close).
 func (s *qwpLineSender) closeCursor(ctx context.Context) error {
-	// Surface any latched fluent-API error (e.g. validation failure on
-	// Symbol/*Column/Table) so Close() doesn't silently swallow it —
-	// mirrors the HTTP sender's flush0, which drains buf.LastErr() on
-	// the close path. Captured first so any subsequent enqueue / drain /
-	// shutdown error doesn't override it: the latched fault is the
-	// original user-facing cause and downstream failures usually
-	// follow from it.
-	firstErr := s.lastErr
-	s.lastErr = nil
-	// Encode any pending rows from the open API call into the engine
-	// first. Drop the pending in-progress row (no At/AtNow yet) the
-	// same way Close does in memory mode.
-	if s.hasTable {
-		if s.currentTable != nil {
-			s.currentTable.cancelRow()
-		}
-		s.hasTable = false
-		s.currentTable = nil
-	}
-	if s.pendingRowCount > 0 {
-		// Enqueue the pending rows but do NOT block on ACK here —
-		// flushCursor's ACK wait is unbounded by ctx alone, and
-		// would deadlock against a silent server. waitCursorDrain
-		// below is the single bounded ACK wait, governed by
-		// closeFlushTimeout. Mirrors Java's flushPendingRows() +
-		// drainOnClose() split.
-		if err := s.enqueueCursor(ctx); err != nil {
-			if firstErr == nil {
-				firstErr = err
+	// A Close() invoked from inside a SenderErrorHandler runs on the
+	// dispatcher goroutine, not the producer goroutine. Flushing pending
+	// rows or even reading lastErr / hasTable / pendingRowCount here
+	// would race a producer still mid-Table()/At() (the C3
+	// producer-state race). Skip every producer-state access in that
+	// case and run only the goroutine-safe teardown below (drain wait,
+	// send-loop close, engine close, drainer pool). The producer
+	// surfaces the latched terminal error and then the closed-sender
+	// error on its next call; its un-flushed in-progress rows were never
+	// handed off and remain its own to retry (SF mode replays whatever
+	// was already persisted on the next open).
+	var firstErr error
+	if !s.calledFromErrorHandler() {
+		// Surface any latched fluent-API error (e.g. validation failure
+		// on Symbol/*Column/Table) so Close() doesn't silently swallow
+		// it — mirrors the HTTP sender's flush0, which drains
+		// buf.LastErr() on the close path. Captured first so any
+		// subsequent enqueue / drain / shutdown error doesn't override
+		// it: the latched fault is the original user-facing cause and
+		// downstream failures usually follow from it.
+		firstErr = s.lastErr
+		s.lastErr = nil
+		// Encode any pending rows from the open API call into the engine
+		// first. Drop the pending in-progress row (no At/AtNow yet) the
+		// same way Close does in memory mode.
+		if s.hasTable {
+			if s.currentTable != nil {
+				s.currentTable.cancelRow()
 			}
-		} else {
-			// Retain-on-error: only reset the table buffers once the
-			// rows are in a segment. A failed enqueue (ring full +
-			// wire stalled, or ctx cancelled) never persisted them —
-			// resetting here would silently destroy data. SF-mode
-			// users recover the tail by reopening on the same sf_dir;
-			// memory-mode users at least see firstErr. Mirrors the
-			// autoFlush path and Java's flushPendingRows() contract.
-			s.resetAfterFlush()
+			s.hasTable = false
+			s.currentTable = nil
+		}
+		if s.pendingRowCount > 0 {
+			// Enqueue the pending rows but do NOT block on ACK here —
+			// flushCursor's ACK wait is unbounded by ctx alone, and
+			// would deadlock against a silent server. waitCursorDrain
+			// below is the single bounded ACK wait, governed by
+			// closeFlushTimeout. Mirrors Java's flushPendingRows() +
+			// drainOnClose() split.
+			if err := s.enqueueCursor(ctx); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				// Retain-on-error: only reset the table buffers once the
+				// rows are in a segment. A failed enqueue (ring full +
+				// wire stalled, or ctx cancelled) never persisted them —
+				// resetting here would silently destroy data. SF-mode
+				// users recover the tail by reopening on the same sf_dir;
+				// memory-mode users at least see firstErr. Mirrors the
+				// autoFlush path and Java's flushPendingRows() contract.
+				s.resetAfterFlush()
+			}
 		}
 	}
 	// Wait for drain.

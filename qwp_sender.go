@@ -1173,6 +1173,20 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	if s.closed.Load() {
 		return -1, errClosedSenderFlush
 	}
+	if s.calledFromErrorHandler() {
+		// Flush() invoked from inside a SenderErrorHandler runs on the
+		// dispatcher goroutine. The handler's documented use of Flush()
+		// is to surface the latched terminal error promptly (it is
+		// latched before the handler runs). We must not read or flush
+		// producer-owned state (hasTable / pendingRowCount / tableBuffers
+		// / the encoder) from this goroutine — that races the producer,
+		// the C3 producer-state hazard. Surface any latched error and
+		// return the published FSN without touching producer state.
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			return -1, err
+		}
+		return s.cursorEngine.enginePublishedFsn(), nil
+	}
 	if s.hasTable {
 		return -1, errFlushWithPendingMessage
 	}
