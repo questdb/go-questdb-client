@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"testing"
 	"time"
@@ -227,6 +228,121 @@ func TestQwpCursorSenderTableEntrySurfacesTerminalError(t *testing.T) {
 	// to Flush first.
 	err := s.Table("t").Int64Column("v", 2).AtNow(context.Background())
 	require.Error(t, err, "AtNow must surface the latched terminal error from Table()")
+}
+
+// TestQwpCursorFlushResetsAfterEnqueueDespiteEagerError reproduces M7.
+// FlushAndGetSequence first publishes the pending rows into the cursor
+// engine (durable — an FSN is assigned and the frame is queued for
+// replay) and only then eagerly samples the send loop's latched error.
+// When a HALT latched by a PREVIOUS batch lands in the window between
+// the publish and that eager check, the call returns (-1, err) even
+// though these rows are already sealed in a segment. If the table
+// buffers are not reset on that path, a user following the documented
+// close+rebuild recovery re-sends the "failed" batch and double-writes
+// it once the SF slot replays the sealed frame. The reset must happen
+// as soon as the enqueue succeeds, before the eager error check.
+//
+// The race is made deterministic by forcing the publish to park: the
+// engine ring is filled to its total-bytes cap so the batch's append
+// blocks on backpressure. Reaching the park proves the in-enqueue error
+// check (which runs before the append) already passed. The test then
+// latches the terminal error and frees a segment, so the parked append
+// completes — sealing the batch — and the eager check that follows
+// surfaces the latched error.
+func TestQwpCursorFlushResetsAfterEnqueueDespiteEagerError(t *testing.T) {
+	const segSize int64 = 4096
+	// Cap at two segments: the ring fills after two segment-sized
+	// frames, so the third append (the batch under test) parks until a
+	// sealed segment is acked and trimmed.
+	engine, err := qwpSfNewCursorEngine("", segSize, 2*segSize, 10*time.Second)
+	require.NoError(t, err)
+
+	// A send loop we never start: nothing mutates lastError except the
+	// explicit recordFatal below, so the latch timing is entirely under
+	// the test's control. A nil transport needs a non-nil (unused)
+	// reconnect factory to satisfy the constructor.
+	unusedFactory := func(context.Context, int) (*qwpTransport, error) {
+		return nil, errors.New("reconnect factory must not be called")
+	}
+	loop := qwpSfNewSendLoop(engine, nil, unusedFactory,
+		time.Millisecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+
+	// closeFlushTimeout=0 → fast close (skip drain) so cleanup never
+	// blocks on the un-acked tail this test deliberately leaves behind.
+	s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+	defer func() { _ = s.Close(context.Background()) }()
+
+	// Fill the ring to its cap with two segment-sized frames. The first
+	// fills the active segment exactly; the second rotates into the
+	// spare and fills it, sealing the first. With both segments full and
+	// the cap reached, the manager won't provision a third — the next
+	// append has nowhere to go and must park.
+	junk := make([]byte, engine.engineMaxFrameBytes()) // one full segment's payload
+	fsn0, err := engine.engineAppendBlocking(context.Background(), junk)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), fsn0)
+	fsn1, err := engine.engineAppendBlocking(context.Background(), junk)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), fsn1)
+
+	// One row for the batch under test.
+	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	require.Equal(t, 1, s.pendingRowCount)
+
+	errHalt := errors.New("simulated HALT from a previous batch")
+
+	baselineStalls := engine.engineTotalBackpressureStalls()
+	type flushResult struct {
+		fsn int64
+		err error
+	}
+	resCh := make(chan flushResult, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	go func() {
+		fsn, err := s.FlushAndGetSequence(ctx)
+		resCh <- flushResult{fsn, err}
+	}()
+
+	// Wait until the batch's append has parked on backpressure. The park
+	// only happens after the in-enqueue error check has passed and the
+	// frame has been encoded, so latching now lands the HALT in exactly
+	// the post-publish window M7 describes.
+	require.Eventually(t, func() bool {
+		return engine.engineTotalBackpressureStalls() > baselineStalls
+	}, 5*time.Second, 100*time.Microsecond,
+		"batch append never parked — ring was not full")
+
+	// Latch the terminal error, then free a segment so the parked append
+	// completes. The append seals the batch (FSN assigned, durable); the
+	// eager check that follows surfaces errHalt.
+	loop.recordFatal(errHalt)
+	engine.engineAcknowledge(fsn0) // trims the sealed first segment
+
+	var res flushResult
+	select {
+	case res = <-resCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("FlushAndGetSequence never returned")
+	}
+
+	// The call reports failure (the eager error surfaced)...
+	require.ErrorIs(t, res.err, errHalt)
+	assert.Equal(t, int64(-1), res.fsn)
+	// ...but the rows WERE durably published (an FSN was assigned).
+	require.Equal(t, int64(2), engine.enginePublishedFsn(),
+		"batch must have been published before the eager error check fired")
+
+	// The fix: a successful enqueue resets the buffers before the eager
+	// error check, so the published rows are not also retained. Retaining
+	// them would double-write the batch when the user re-sends after the
+	// documented close+rebuild recovery and the SF slot replays FSN 2.
+	assert.Equal(t, 0, s.pendingRowCount,
+		"buffers must be reset after a durable enqueue even when Flush returns the latched error")
+	if tb := s.tableBuffers["t"]; tb != nil {
+		assert.Equal(t, 0, tb.rowCount, "table buffer must be reset after a durable enqueue")
+	}
 }
 
 // newSilentAckServer creates a fake QWP server that accepts the

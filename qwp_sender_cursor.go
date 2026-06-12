@@ -412,10 +412,23 @@ func qwpSfBuildEndpointFactory(endpoints []qwpEndpoint, scheme string, opts qwpT
 // "flush() never waits for ACK; ACKs are async"). Callers wanting
 // server-ACK confirmation pair FlushAndGetSequence with
 // AwaitAckedFsn.
+//
+// A successful enqueue resets the table buffers BEFORE the eager
+// error check. Once enqueueCursor returns nil the rows are sealed in
+// a segment (an FSN is assigned, the frame is queued for replay), so
+// they are no longer pending. The eager check can still return an
+// error — a HALT latched by a PREVIOUS batch in the window between
+// enqueueCursor's own pre-append check and this one — and that error
+// is for an already-published batch. Resetting first keeps those rows
+// from being retained: re-sending them after the documented
+// close+rebuild recovery would double-write the batch once the SF
+// slot replays the sealed frame. Mirrors Java flushPendingRows
+// resetting before checkError() throws.
 func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 	if err := s.enqueueCursor(ctx); err != nil {
 		return err
 	}
+	s.resetAfterFlush()
 	return s.cursorSendLoop.sendLoopCheckError()
 }
 

@@ -1203,18 +1203,22 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 		return s.cursorEngine.enginePublishedFsn(), nil
 	}
 	if err := s.flushCursor(ctx); err != nil {
-		// Retain-on-error: reset the table buffers only after the
-		// rows are safely in a segment. flushCursor returns before
-		// engineAppendBlocking assigns an FSN when the ring is full
-		// and the wire is stalled past the append deadline, or ctx
-		// is cancelled — the rows were never persisted anywhere.
-		// Resetting here would destroy them; instead they're retained
-		// for the next flush attempt (or, in SF mode, recoverable by
-		// reopening on the same sf_dir). Mirrors the autoFlush path
-		// and Java's flushPendingRows() reset-after-seal contract.
+		// flushCursor resets the table buffers as soon as the enqueue
+		// succeeds (the rows are sealed in a segment), so an error here
+		// is one of two already-handled cases:
+		//   - enqueueCursor failed before sealing — ring full + wire
+		//     stalled past the append deadline, or ctx cancelled: the
+		//     rows were never persisted and are RETAINED for the next
+		//     flush attempt (or, in SF mode, recoverable by reopening
+		//     the same sf_dir). Mirrors Java's flushPendingRows()
+		//     reset-after-seal contract.
+		//   - enqueueCursor sealed the rows but the eager error check
+		//     then surfaced a HALT latched by a previous batch: the
+		//     buffers were already reset inside flushCursor, so the
+		//     published rows are not double-written when the user
+		//     re-sends after the documented close+rebuild recovery.
 		return -1, err
 	}
-	s.resetAfterFlush()
 	return s.cursorEngine.enginePublishedFsn(), nil
 }
 
