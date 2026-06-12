@@ -179,13 +179,18 @@ fixed in-flight count.
 backward compatibility but is a no-op** in this architecture. Connect
 strings carrying it still parse; the value is ignored.
 
-`Flush` blocks until the server has ACKed everything published so far,
-preserving the Go contract that a returned `Flush` means the data is
-durable on the server. Auto-flush (triggered by row/byte/interval
-thresholds) takes a non-blocking path. For explicit ack correlation,
-`FlushAndGetSequence` returns the published FSN (the upper bound of any
-`SenderError.ToFsn` for that batch); pair it with `AwaitAckedFsn` to
-wait for the server to confirm that FSN.
+`Flush` and `FlushAndGetSequence` **never wait for the server ACK**.
+They return once the batch is published into the cursor engine — in
+RAM for memory mode, on disk for store-and-forward — after which the
+I/O goroutine delivers and replays it in the background. A returned
+`Flush` therefore means the batch is durably *published*, not that the
+server has confirmed it: in memory mode, a process exit before the
+background send completes can still lose unacked rows. Auto-flush
+(triggered by row/byte/interval thresholds) follows the same
+publish-only path. For server-ACK confirmation, `FlushAndGetSequence`
+returns the published FSN (the upper bound of any `SenderError.ToFsn`
+for that batch); pair it with `AwaitAckedFsn` to wait for the server
+to confirm that FSN.
 
 ### Authentication
 

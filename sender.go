@@ -420,22 +420,31 @@ func WithQwp() LineSenderOption {
 	}
 }
 
-// WithInFlightWindow sets the number of concurrent in-flight batches
-// for async QWP mode. A value of 1 forces synchronous mode (each
-// Flush blocks until the ACK arrives). Values > 1 enable async mode
-// with a dedicated I/O goroutine. Defaults to 128.
+// WithInFlightWindow is retained for backward compatibility but is a
+// no-op. In the QWP cursor architecture, backpressure is governed by
+// the engine's segment ring and the append deadline, not by a fixed
+// in-flight batch count. Flush never waits for the server ACK, so
+// there is no synchronous mode to opt into. Connect strings carrying
+// in_flight_window still parse; the value is ignored.
 //
 // Only available for the QWP sender.
+//
+// Deprecated: the in-flight window has no effect and there is no
+// replacement — backpressure is automatic. To confirm server ACKs,
+// pair FlushAndGetSequence with AwaitAckedFsn.
 func WithInFlightWindow(window int) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.inFlightWindow = window
 	}
 }
 
-// WithCloseTimeout sets the time Close() waits for the async I/O
-// goroutine to finish before force-cancelling. Defaults to 5 seconds.
-// Calling Flush() before Close() guarantees all data is ACKed
-// regardless of this timeout.
+// WithCloseTimeout sets the time Close() waits for the I/O goroutine
+// to finish draining published batches to the server before
+// force-cancelling. Defaults to 5 seconds. Because Flush() never waits
+// for the server ACK, this close-time drain — not Flush() — is the
+// sender's last chance to get buffered data confirmed; rows still
+// unacked when the timeout expires may be lost (memory mode) or left
+// on disk for replay (store-and-forward).
 //
 // Deprecated: use WithCloseFlushTimeout instead. WithCloseTimeout is
 // preserved as an alias so v4.0–v4.5 code keeps compiling — it

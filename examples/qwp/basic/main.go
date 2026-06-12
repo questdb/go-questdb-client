@@ -83,8 +83,11 @@ func main() {
 		}
 	}
 
-	// Send everything buffered so far. Flush is a synchronous barrier on
-	// QWP, so batch many rows per Flush rather than flushing per row.
+	// Publish everything buffered so far. Flush returns once the batch
+	// is published to the cursor engine; it does NOT wait for the
+	// server ACK (rejections arrive on the handler above). Batch many
+	// rows per Flush rather than flushing per row. For server-ack
+	// confirmation, use FlushAndGetSequence paired with AwaitAckedFsn.
 	if err := sender.Flush(ctx); err != nil {
 		log.Fatal(err)
 	}

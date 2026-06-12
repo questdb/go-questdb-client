@@ -1032,8 +1032,9 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 	}
 
 	// Auto-flush thresholds use enqueueCursor — never wait for
-	// server ACKs from the user goroutine. Explicit Flush() is
-	// where the drain barrier lives.
+	// server ACKs from the user goroutine. Explicit Flush() follows
+	// the same publish-only path; the send loop drains and replays
+	// in the background.
 	if s.autoFlushRows > 0 && s.pendingRowCount >= s.autoFlushRows {
 		return s.autoFlush(ctx)
 	}
