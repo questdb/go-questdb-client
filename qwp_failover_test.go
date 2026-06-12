@@ -1060,9 +1060,9 @@ func TestQwpExecOptInReplaysTransparently(t *testing.T) {
 				return
 			}
 			body := []byte{byte(qwpMsgKindExecDone)}
-			body = appendInt64LE(body, 2) // replay requestId
-			body = append(body, 0)        // op_type
-			body = append(body, 0)        // rowsAffected varint = 0
+			body = appendInt64LE(body, 2)        // replay requestId
+			body = append(body, QwpOpTypeInsert) // op_type
+			body = append(body, 1)               // rowsAffected varint = 1
 			m.sendBinary(ctx, writeQwpFrame(0, body))
 			for {
 				if _, _, err := m.conn.Read(ctx); err != nil {
@@ -1094,7 +1094,23 @@ func TestQwpExecOptInReplaysTransparently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Exec failed unexpectedly: %v", err)
 	}
-	_ = res
+	// target=any binds endpoint 0 (the primary) first, and the mock
+	// faults its first connection — so a successful Exec here can only
+	// mean the replay path actually ran. Assert the fault fired,
+	// otherwise the test would pass vacuously if the reconnect logic
+	// regressed into never hitting the faulted node.
+	if !first.Load() {
+		t.Fatal("primary's first connection was never faulted; replay path not exercised")
+	}
+	// The replayed EXEC_DONE must decode into the result Exec returns —
+	// distinctive values prove the frame flowed through, not a zero
+	// value from some short-circuit.
+	if res.OpType != QwpOpTypeInsert {
+		t.Errorf("OpType = %d, want %d (QwpOpTypeInsert)", res.OpType, QwpOpTypeInsert)
+	}
+	if res.RowsAffected != 1 {
+		t.Errorf("RowsAffected = %d, want 1", res.RowsAffected)
+	}
 }
 
 // TestQwpFailoverCancelDuringBackoff verifies that Cancel during the

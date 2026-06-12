@@ -568,15 +568,18 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name:   "ws with auto_flush and retry_timeout",
-			config: fmt.Sprintf("ws::addr=%s;auto_flush_rows=100;auto_flush_interval=500;retry_timeout=%d;",
-				addr, retryTimeout.Milliseconds()),
+			// retry_timeout is intentionally NOT paired with ws here: the
+			// parser maps it to WithRetryTimeout for any schema, but the
+			// QWP sanitizer rejects it (see TestQwpSanitizeRejectsRetryTimeout),
+			// so a ws connect string carrying it never reaches a sender.
+			name: "ws with auto_flush",
+			config: fmt.Sprintf("ws::addr=%s;auto_flush_rows=100;auto_flush_interval=500;",
+				addr),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithQwp(),
 				qdb.WithAddress(addr),
 				qdb.WithAutoFlushRows(100),
 				qdb.WithAutoFlushInterval(500 * time.Millisecond),
-				qdb.WithRetryTimeout(retryTimeout),
 			},
 		},
 		{
@@ -868,6 +871,19 @@ func TestQwpFailoverSanitizeErrors(t *testing.T) {
 			assert.ErrorContains(t, qdb.SanitizeConf(c), tc.errMsg)
 		})
 	}
+}
+
+// TestQwpSanitizeRejectsRetryTimeout pins that retry_timeout, though
+// the parser accepts it for any schema, is rejected by the QWP
+// sanitizer: it is an HTTP-ILP retry knob with no QWP analogue
+// (reconnect_max_duration_millis governs the per-outage budget
+// instead). Guards the parser happy-case in TestHappyCasesFromConf,
+// which deliberately omits the ws+retry_timeout pairing.
+func TestQwpSanitizeRejectsRetryTimeout(t *testing.T) {
+	c, err := qdb.ConfFromStr("ws::addr=localhost:9000;retry_timeout=5000;")
+	assert.NoError(t, err, "parser accepts retry_timeout for any schema")
+	assert.ErrorContains(t, qdb.SanitizeConf(c),
+		"retry_timeout is not supported for QWP")
 }
 
 // TestQwpFailoverConfKeys covers the connect-string keys mandated by

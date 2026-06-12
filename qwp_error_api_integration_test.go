@@ -26,9 +26,6 @@ package questdb
 
 import (
 	"context"
-	"errors"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,60 +203,12 @@ func TestErrorApiFsnSpanCorrelation(t *testing.T) {
 		"single-frame span: FromFsn == ToFsn")
 }
 
-// TestErrorApiHaltVsConcurrentFlush exercises the contract: even
-// under tight concurrent Flush + induce-halt, every Flush after the
-// loop has latched MUST surface the typed *SenderError; never sees
-// "callback fired but Flush passed".
-func TestErrorApiHaltVsConcurrentFlush(t *testing.T) {
-	if testing.Short() {
-		t.Skip("race test skipped in short mode")
-	}
-	const iters = 50
-	for i := 0; i < iters; i++ {
-		runHaltVsConcurrentFlushOnce(t, i)
-	}
-}
-
-func runHaltVsConcurrentFlushOnce(t *testing.T, iter int) {
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusParseError})
-	defer srv.Close()
-
-	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 0)
-	defer cleanup()
-
-	require.NoError(t, s.Table("t").Int64Column("v", int64(iter)).AtNow(context.Background()))
-	// Kick off the rejection.
-	_ = s.Flush(context.Background())
-
-	// Hammer Flush from a few goroutines; each must observe a
-	// terminal error after the loop latches.
-	var wg sync.WaitGroup
-	var observed atomic.Int32
-	deadline := time.Now().Add(2 * time.Second)
-	for j := 0; j < 4; j++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for time.Now().Before(deadline) {
-				if loop.sendLoopCheckError() == nil {
-					continue
-				}
-				err := s.Flush(context.Background())
-				if err == nil {
-					return
-				}
-				var se *SenderError
-				if errors.As(err, &se) {
-					observed.Add(1)
-				}
-				return
-			}
-		}()
-	}
-	wg.Wait()
-	assert.Greater(t, observed.Load(), int32(0),
-		"iter %d: at least one goroutine should observe *SenderError", iter)
-}
+// The HALT-vs-concurrent-Flush contract ("every Flush after the latch
+// surfaces the typed *SenderError; never 'callback fired but Flush
+// passed'") is pinned by TestErrorApiResilience_HaltVsConcurrentFlushStress
+// in qwp_error_resilience_test.go, which asserts all-of-N (every
+// hammering goroutine observes the error) after confirming the latch —
+// the quiescent state the LineSender contract actually guarantees.
 
 // TestErrorApiHaltLatchedBeforeHandlerInvoked pins the ordering
 // invariant called out in qwp-cursor-error-api.md §120: on a HALT

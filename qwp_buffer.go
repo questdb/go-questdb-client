@@ -414,38 +414,81 @@ func (c *qwpColumnBuffer) growArrayData(n int) int {
 	return off
 }
 
-// addDoubleArray appends an N-dimensional float64 array value
-// (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
-//
-//	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
-//	elements (product(shape) × 8 bytes LE, row-major order).
-func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []float64) {
+// reserveArrayValue grows arrayData for one array value — a
+// nDims+shape header (1 + nDims×4 bytes) followed by payloadBytes of
+// flattened element data — writes the header, advances the
+// arrayOffsets / dataSize / rowCount bookkeeping, and returns the
+// payload sub-slice (len == payloadBytes) the caller fills with the
+// little-endian elements. Centralising grow+header+bookkeeping lets
+// every typed array writer stream its elements straight into arrayData
+// with no intermediate flattened copy.
+func (c *qwpColumnBuffer) reserveArrayValue(nDims uint8, shape []int32, payloadBytes int) []byte {
 	metaSize := 1 + int(nDims)*4
-	dataSize := len(flatData) * 8
-	totalSize := metaSize + dataSize
+	totalSize := metaSize + payloadBytes
 
 	off := c.growArrayData(totalSize)
-	buf := c.arrayData[off:]
+	buf := c.arrayData[off : off+totalSize]
 
-	// nDims
 	buf[0] = nDims
 	pos := 1
-
-	// shape: each dimension as uint32 LE
 	for i := 0; i < int(nDims); i++ {
 		binary.LittleEndian.PutUint32(buf[pos:], uint32(shape[i]))
 		pos += 4
 	}
 
-	// flattened elements: each float64 LE
-	for _, v := range flatData {
-		binary.LittleEndian.PutUint64(buf[pos:], math.Float64bits(v))
-		pos += 8
-	}
-
 	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
 	c.trackDataGrowth(totalSize + 4) // array data + uint32 offset
 	c.rowCount++
+	return buf[pos:totalSize]
+}
+
+// addDoubleArray appends an N-dimensional float64 array value
+// (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
+//
+//	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+//	elements (product(shape) × 8 bytes LE, row-major order).
+//
+// flatData must already be row-major; the typed 2D/3D writers
+// (addDoubleArray2D / addDoubleArray3D) stream their nested input in
+// directly instead, avoiding an intermediate flat copy.
+func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []float64) {
+	dst := c.reserveArrayValue(nDims, shape, len(flatData)*8)
+	pos := 0
+	for _, v := range flatData {
+		binary.LittleEndian.PutUint64(dst[pos:], math.Float64bits(v))
+		pos += 8
+	}
+}
+
+// addDoubleArray2D appends a regular 2D float64 array, streaming each
+// element straight into arrayData. The caller has already validated
+// the shape is regular (every row len == dim1) and within bounds.
+func (c *qwpColumnBuffer) addDoubleArray2D(dim0, dim1 int, values [][]float64) {
+	dst := c.reserveArrayValue(2, []int32{int32(dim0), int32(dim1)}, dim0*dim1*8)
+	pos := 0
+	for _, row := range values {
+		for _, v := range row {
+			binary.LittleEndian.PutUint64(dst[pos:], math.Float64bits(v))
+			pos += 8
+		}
+	}
+}
+
+// addDoubleArray3D appends a regular 3D float64 array, streaming each
+// element straight into arrayData. The caller has already validated
+// the shape is regular (every plane len == dim1, every row len ==
+// dim2) and within bounds.
+func (c *qwpColumnBuffer) addDoubleArray3D(dim0, dim1, dim2 int, values [][][]float64) {
+	dst := c.reserveArrayValue(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, dim0*dim1*dim2*8)
+	pos := 0
+	for _, plane := range values {
+		for _, row := range plane {
+			for _, v := range row {
+				binary.LittleEndian.PutUint64(dst[pos:], math.Float64bits(v))
+				pos += 8
+			}
+		}
+	}
 }
 
 // addLongArray appends an N-dimensional int64 array value
@@ -453,33 +496,48 @@ func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []
 //
 //	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
 //	elements (product(shape) × 8 bytes LE, row-major order).
+//
+// flatData must already be row-major; the typed 2D/3D writers
+// (addLongArray2D / addLongArray3D) stream their nested input in
+// directly instead, avoiding an intermediate flat copy.
 func (c *qwpColumnBuffer) addLongArray(nDims uint8, shape []int32, flatData []int64) {
-	metaSize := 1 + int(nDims)*4
-	dataSize := len(flatData) * 8
-	totalSize := metaSize + dataSize
-
-	off := c.growArrayData(totalSize)
-	buf := c.arrayData[off:]
-
-	// nDims
-	buf[0] = nDims
-	pos := 1
-
-	// shape: each dimension as uint32 LE
-	for i := 0; i < int(nDims); i++ {
-		binary.LittleEndian.PutUint32(buf[pos:], uint32(shape[i]))
-		pos += 4
-	}
-
-	// flattened elements: each int64 LE
+	dst := c.reserveArrayValue(nDims, shape, len(flatData)*8)
+	pos := 0
 	for _, v := range flatData {
-		binary.LittleEndian.PutUint64(buf[pos:], uint64(v))
+		binary.LittleEndian.PutUint64(dst[pos:], uint64(v))
 		pos += 8
 	}
+}
 
-	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
-	c.trackDataGrowth(totalSize + 4) // array data + uint32 offset
-	c.rowCount++
+// addLongArray2D appends a regular 2D int64 array, streaming each
+// element straight into arrayData. The caller has already validated
+// the shape is regular (every row len == dim1) and within bounds.
+func (c *qwpColumnBuffer) addLongArray2D(dim0, dim1 int, values [][]int64) {
+	dst := c.reserveArrayValue(2, []int32{int32(dim0), int32(dim1)}, dim0*dim1*8)
+	pos := 0
+	for _, row := range values {
+		for _, v := range row {
+			binary.LittleEndian.PutUint64(dst[pos:], uint64(v))
+			pos += 8
+		}
+	}
+}
+
+// addLongArray3D appends a regular 3D int64 array, streaming each
+// element straight into arrayData. The caller has already validated
+// the shape is regular (every plane len == dim1, every row len ==
+// dim2) and within bounds.
+func (c *qwpColumnBuffer) addLongArray3D(dim0, dim1, dim2 int, values [][][]int64) {
+	dst := c.reserveArrayValue(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, dim0*dim1*dim2*8)
+	pos := 0
+	for _, plane := range values {
+		for _, row := range plane {
+			for _, v := range row {
+				binary.LittleEndian.PutUint64(dst[pos:], uint64(v))
+				pos += 8
+			}
+		}
+	}
 }
 
 // addDecimal appends a Decimal value to a decimal column
@@ -839,6 +897,15 @@ type qwpTableBuffer struct {
 	// trackDataGrowth. Reset to 0 in reset(), recomputed from scratch
 	// in cancelRow(). Makes approxDataSize() O(1).
 	dataSize int
+
+	// dirty marks that this buffer was selected by Table() since the
+	// last full flush and therefore appears in the sender's dirtyTables
+	// list. The sender (not reset()) owns this flag: it gates the
+	// append in Table() so each touched table is listed once, and
+	// resetAfterFlush clears it. A per-table reset() during a split
+	// flush deliberately leaves it set so the still-listed (now empty)
+	// buffer is not re-appended if the producer reuses it.
+	dirty bool
 }
 
 // newQwpTableBuffer creates a table buffer for the given table name.

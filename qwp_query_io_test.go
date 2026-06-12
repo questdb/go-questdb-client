@@ -1129,53 +1129,71 @@ func TestQwpEgressIOReleaseAfterShutdown(t *testing.T) {
 // TestQwpEgressIOReleaseAfterShutdown only covers the post-shutdown
 // case; the close-during-release window needs the loop.
 func TestQwpEgressIOReleaseClosePoolRace(t *testing.T) {
-	const iterations = 200
+	const iterations = 50
 	for iter := 0; iter < iterations; iter++ {
-		// Synthetic egress IO: never started, transport unused.
-		// releaseBuffer touches only closed / pendingCredit /
-		// buffers / notifyCh, all of which the constructor sets up.
-		io := newQwpEgressIO(nil, 2)
-		// Pull both pool buffers out so we can release them — what
-		// the dispatcher would have handed to the user as a batch.
-		b0 := <-io.buffers
-		b1 := <-io.buffers
+		runReleaseClosePoolRaceOnce(t, iter)
+	}
+}
 
-		start := make(chan struct{})
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		go func() {
-			defer wg.Done()
-			<-start
-			io.releaseBuffer(b0)
-			io.releaseBuffer(b1)
-		}()
-		go func() {
-			defer wg.Done()
-			<-start
-			// Mirror the dispatcher's exit defers (LIFO): close
-			// events first, then flip closed. Either order is
-			// safe by the same argument the production code makes
-			// — releaseBuffer's fallback path is harmless on a
-			// drained, dead pool.
-			close(io.events)
-			io.closed.Store(true)
-		}()
-
-		// Release the start gate so both goroutines hit the racing
-		// section as close to simultaneously as the runtime allows.
-		close(start)
-
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("iteration %d: race between releaseBuffer and exit-defer deadlocked", iter)
+func runReleaseClosePoolRaceOnce(t *testing.T, iter int) {
+	// A real, started egress IO so the race runs against the REAL
+	// dispatcher teardown driven by shutdown() — not a hand-rolled copy
+	// of its exit defers, which would silently go stale if the teardown
+	// sequence ever changed. The mock just idles; no query is needed —
+	// shutdown() alone makes the dispatcher return and run its exit
+	// defers (decoder.close, close(events), closed.Store(true)).
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		for {
+			if _, _, err := m.conn.Read(ctx); err != nil {
+				return
+			}
 		}
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+
+	io := newQwpEgressIO(tr, 2)
+	io.start()
+
+	// Pull both pool buffers out so we can release them — what the
+	// dispatcher would have handed to the user as batches.
+	b0 := <-io.buffers
+	b1 := <-io.buffers
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		io.releaseBuffer(b0)
+		io.releaseBuffer(b1)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = io.shutdown(ctx)
+	}()
+
+	// Release the start gate so both goroutines hit the racing section
+	// as close to simultaneously as the runtime allows.
+	close(start)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("iteration %d: race between releaseBuffer and shutdown deadlocked", iter)
 	}
 }
 

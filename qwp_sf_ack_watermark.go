@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"encoding/binary"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -134,9 +135,29 @@ func qwpSfAckWatermarkOpen(slotDir string) *qwpSfAckWatermark {
 		err error
 	)
 	if statErr == nil && st.Size() == qwpSfAckWatermarkFileSize {
-		// Preserve the existing watermark bytes.
+		// Preserve the existing watermark bytes, but force a real disk
+		// block under the mapping. A foreign watermark may be sparse
+		// (truncated to 16 bytes but never block-allocated, or copied
+		// sparse); mmap'ing it and later storing through it from the
+		// manager goroutine would SIGBUS on a full disk when the page
+		// fault cannot back the hole. qwpSfAllocate would no-op here (it
+		// reserves only the newly-extended range, and the file is
+		// already full size), so instead read the bytes and write them
+		// straight back: the write allocates the block (the whole file
+		// fits one block) and surfaces ENOSPC here, at open, where it
+		// degrades to the no-watermark fallback — rather than faulting
+		// the manager. A non-sparse foreign file just rewrites in place.
 		f, err = os.OpenFile(path, os.O_RDWR, 0o644)
 		if err != nil {
+			return nil
+		}
+		var preserved [qwpSfAckWatermarkFileSize]byte
+		if _, err := io.ReadFull(f, preserved[:]); err != nil {
+			_ = f.Close()
+			return nil
+		}
+		if _, err := f.WriteAt(preserved[:], 0); err != nil {
+			_ = f.Close()
 			return nil
 		}
 	} else {

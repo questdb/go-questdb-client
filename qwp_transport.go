@@ -76,7 +76,7 @@ const (
 // qwpClientId is sent in X-QWP-Client-Id during the upgrade handshake.
 // Follows the lang/version convention used by other QuestDB clients
 // (e.g. java/1.0.2).
-const qwpClientId = "go/4.1.0"
+const qwpClientId = "go/4.3.0"
 
 // QWP ACK response sizes (spec §13). All ACKs share a fixed header
 // shape, but their tails vary:

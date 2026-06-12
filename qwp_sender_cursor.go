@@ -629,7 +629,10 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 // row re-resolves it against whichever table buffer survives.
 func (s *qwpLineSender) recomputePendingFromBuffers() {
 	rows, bytes := 0, 0
-	for _, tb := range s.tableBuffers {
+	// dirtyTables is the source of truth for what can hold rows: a
+	// split flush resets some entries (rowCount 0, contributing
+	// nothing) and retains the rest; both stay listed.
+	for _, tb := range s.dirtyTables {
 		rows += tb.rowCount
 		bytes += tb.approxDataSize()
 	}
@@ -665,7 +668,10 @@ func (s *qwpLineSender) oversizeTableError(kind qwpFrameCapKind, capVal int64, m
 // schema in full.
 func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 	s.encodeInfoBuf = s.encodeInfoBuf[:0]
-	for _, tb := range s.tableBuffers {
+	// Only dirtyTables can hold rows. The rowCount==0 skip still
+	// matters: a buffer can be dirty-but-empty (a cancelled row, or a
+	// per-table reset mid-split that left it listed).
+	for _, tb := range s.dirtyTables {
 		if tb.rowCount == 0 {
 			continue
 		}
@@ -685,11 +691,13 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 // user SenderErrorHandler invocation. The handler is documented as
 // allowed to call Close() / Flush(); when it does, those calls run off
 // the producer goroutine. The producer owns lastErr / hasTable /
-// currentTable / pendingRowCount / the tableBuffers map / the encoder
-// with no happens-before against this goroutine, so the Close()/Flush()
-// paths must NOT touch that state — doing so races a producer mid-At(),
-// up to Go's fatal "concurrent map iteration and map write" when
-// buildTableEncodeInfo ranges tableBuffers while Table() writes it.
+// currentTable / pendingRowCount / the tableBuffers map / the
+// dirtyTables list / the encoder with no happens-before against this
+// goroutine, so the Close()/Flush() paths must NOT touch that state —
+// doing so races a producer mid-At(): buildTableEncodeInfo ranges
+// dirtyTables while Table() appends to it, and Table() writes the
+// tableBuffers map, either of which corrupts state (a racing slice
+// range/append, or Go's fatal "concurrent map iteration and map write").
 //
 // Cheap on the common path: loopGoid is 0 whenever the dispatcher
 // goroutine is not running (no server error has ever been delivered),

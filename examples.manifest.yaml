@@ -43,7 +43,9 @@
   header: |-
     Go client library [docs](https://pkg.go.dev/github.com/questdb/go-questdb-client/v4)
     and [repo](https://github.com/questdb/go-questdb-client).
-  conf: ws::addr=localhost:9000;
+  addr:
+    host: localhost
+    port: 9000
 - name: qwp-query
   lang: go
   path: examples/qwp/basic-query/main.go

@@ -238,6 +238,16 @@ type qwpLineSender struct {
 	// buildTableEncodeInfo, avoiding allocation on every flush.
 	encodeInfoBuf []*qwpTableBuffer
 
+	// dirtyTables lists the table buffers selected by Table() since the
+	// last full flush — i.e. the only buffers that can hold pending
+	// rows. buildTableEncodeInfo, resetAfterFlush, and
+	// recomputePendingFromBuffers iterate this set instead of the whole
+	// tableBuffers map, so a sender juggling hundreds of tables pays per
+	// flush only for the handful actually written that cycle. Truncated
+	// to [:0] (capacity retained) by resetAfterFlush. Producer-owned,
+	// like tableBuffers and encodeInfoBuf.
+	dirtyTables []*qwpTableBuffer
+
 	// globalSymbols maps symbol strings to global IDs.
 	globalSymbols map[string]int32
 	// globalSymbolList maps IDs to symbol strings (for delta dict).
@@ -483,6 +493,15 @@ func (s *qwpLineSender) Table(name string) LineSender {
 	}
 
 	s.currentTable = tb
+	// Track this table in the dirty set the first time it is selected
+	// in a flush cycle, so flush + reset visit only written tables. The
+	// dirty flag dedupes: repeated Table() calls for the same table (or
+	// the lastTable fast-path above) skip the append. resetAfterFlush
+	// clears the flag and empties the list.
+	if !tb.dirty {
+		tb.dirty = true
+		s.dirtyTables = append(s.dirtyTables, tb)
+	}
 	// Snapshot the table's buffered-byte count at row-start so both
 	// the auto-flush byte-size trigger (post-commit pendingBytes
 	// delta) and the per-row hard guard (pre-commit rowBytes delta
@@ -811,16 +830,15 @@ func (s *qwpLineSender) Float64Array2DColumn(name string, values [][]float64) Li
 		s.lastErr = err
 		return s
 	}
-	// Flatten.
-	flat := make([]float64, 0, dim0*dim1)
+	// Validate row regularity before reserving so the streamed write
+	// fills exactly the reserved payload — no intermediate flat copy.
 	for _, row := range values {
 		if len(row) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 2D array: row lengths differ")
 			return s
 		}
-		flat = append(flat, row...)
 	}
-	col.addDoubleArray(2, []int32{int32(dim0), int32(dim1)}, flat)
+	col.addDoubleArray2D(dim0, dim1, values)
 	return s
 }
 
@@ -856,7 +874,8 @@ func (s *qwpLineSender) Float64Array3DColumn(name string, values [][][]float64) 
 		s.lastErr = err
 		return s
 	}
-	flat := make([]float64, 0, dim0*dim1*dim2)
+	// Validate shape regularity before reserving so the streamed write
+	// fills exactly the reserved payload — no intermediate flat copy.
 	for _, plane := range values {
 		if len(plane) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 3D array")
@@ -867,10 +886,9 @@ func (s *qwpLineSender) Float64Array3DColumn(name string, values [][][]float64) 
 				s.lastErr = fmt.Errorf("qwp: irregular 3D array")
 				return s
 			}
-			flat = append(flat, row...)
 		}
 	}
-	col.addDoubleArray(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, flat)
+	col.addDoubleArray3D(dim0, dim1, dim2, values)
 	return s
 }
 
@@ -1225,11 +1243,17 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	return s.cursorEngine.enginePublishedFsn(), nil
 }
 
-// resetAfterFlush clears all table buffers and resets counters.
+// resetAfterFlush clears the table buffers touched this cycle and
+// resets counters. Only dirtyTables can hold rows, so resetting the
+// rest of the tableBuffers map would be wasted work; the dirty flag is
+// cleared here (the one place that empties the list) so the next
+// Table() re-lists the buffer.
 func (s *qwpLineSender) resetAfterFlush() {
-	for _, tb := range s.tableBuffers {
+	for _, tb := range s.dirtyTables {
 		tb.reset()
+		tb.dirty = false
 	}
+	s.dirtyTables = s.dirtyTables[:0]
 	s.pendingRowCount = 0
 	s.pendingBytes = 0
 	s.batchMaxSymbolId = s.maxSentSymbolId
@@ -1512,15 +1536,15 @@ func (s *qwpLineSender) Int64Array2DColumn(name string, values [][]int64) QwpSen
 		s.lastErr = err
 		return s
 	}
-	flat := make([]int64, 0, dim0*dim1)
+	// Validate row regularity before reserving so the streamed write
+	// fills exactly the reserved payload — no intermediate flat copy.
 	for _, row := range values {
 		if len(row) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 2D array: row lengths differ")
 			return s
 		}
-		flat = append(flat, row...)
 	}
-	col.addLongArray(2, []int32{int32(dim0), int32(dim1)}, flat)
+	col.addLongArray2D(dim0, dim1, values)
 	return s
 }
 
@@ -1556,7 +1580,8 @@ func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpS
 		s.lastErr = err
 		return s
 	}
-	flat := make([]int64, 0, dim0*dim1*dim2)
+	// Validate shape regularity before reserving so the streamed write
+	// fills exactly the reserved payload — no intermediate flat copy.
 	for _, plane := range values {
 		if len(plane) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 3D array")
@@ -1567,9 +1592,8 @@ func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpS
 				s.lastErr = fmt.Errorf("qwp: irregular 3D array")
 				return s
 			}
-			flat = append(flat, row...)
 		}
 	}
-	col.addLongArray(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, flat)
+	col.addLongArray3D(dim0, dim1, dim2, values)
 	return s
 }

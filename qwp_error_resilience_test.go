@@ -796,11 +796,10 @@ func TestErrorApiResilience_TotalServerErrorsCounterStrict(t *testing.T) {
 // Concurrent halt-vs-flush stress
 // =============================================================================
 
-// TestErrorApiResilience_HaltVsConcurrentFlushStress tightens the
-// existing TestErrorApiHaltVsConcurrentFlush: many more iterations
-// and a strict "every hammering goroutine must observe *SenderError"
-// assertion. The contract is "HALT is terminal for every subsequent
-// call"; weaker assertions can hide a race where only one goroutine
+// TestErrorApiResilience_HaltVsConcurrentFlushStress pins the
+// HALT-is-terminal contract under load: many iterations and a strict
+// "every hammering goroutine must observe *SenderError" assertion. A
+// weaker any-of-N assertion can hide a race where only one goroutine
 // observes the latched state. Hammering happens AFTER the latch is
 // confirmed, so the sender is quiescent (no concurrent producer) —
 // matches the LineSender contract that production code must
