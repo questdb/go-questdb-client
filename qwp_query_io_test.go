@@ -1585,3 +1585,255 @@ func TestQwpReadFrameIntoCeiling(t *testing.T) {
 		t.Fatalf("exact-qwpMaxBatchSize frame: got %d bytes, want %d", len(out2), qwpMaxBatchSize)
 	}
 }
+
+// TestQwpEgressIOCacheResetMidQuery drives a CACHE_RESET interleaved
+// between two RESULT_BATCH frames of the SAME query. The server contract
+// is that CACHE_RESET arrives between queries, but the dispatcher must
+// not be tripped up if one lands mid-query: it consumes the frame
+// silently (no user-visible event, the query is not terminated) and
+// clears the connection dict, after which the continuation batch
+// re-seeds the dict from id 0 and decodes normally.
+//
+// The continuation's delta carries deltaStart=0, which qwpConnDict
+// accepts only when the dict was actually cleared (otherwise appendDelta
+// rejects it as out of sync) — so a regression that dropped or
+// mis-ordered the mid-query reset surfaces here as a decode error on
+// batch 1 rather than a silent pass.
+func TestQwpEgressIOCacheResetMidQuery(t *testing.T) {
+	const reqID = int64(21)
+	globalDict := []string{"AAPL", "MSFT"}
+
+	// batch_seq 0: rows AAPL, MSFT (ids 0,1); seeds dict ids 0..1.
+	tb0 := newQwpTableBuffer("t")
+	for _, id := range []int32{0, 1} {
+		col, _ := tb0.getOrCreateColumn("s", qwpTypeSymbol, false)
+		col.addSymbolID(id)
+		tb0.commitRow()
+	}
+	var enc qwpEncoder
+	batch0 := wrapAsResultBatch(enc.encodeTableWithDeltaDict(tb0, globalDict, -1, 1), reqID, 0)
+
+	// batch_seq 1 (continuation): rows MSFT, AAPL (ids 1,0). Re-advertises
+	// ids 0..1 from deltaStart=0 — valid only because the mid-query
+	// CACHE_RESET cleared the dict first.
+	tb1 := newQwpTableBuffer("t")
+	for _, id := range []int32{1, 0} {
+		col, _ := tb1.getOrCreateColumn("s", qwpTypeSymbol, false)
+		col.addSymbolID(id)
+		tb1.commitRow()
+	}
+	batch1 := wrapAsResultBatch(enc.encodeTableWithDeltaDict(tb1, globalDict, -1, 1), reqID, 1)
+
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		m.readBinary(ctx)
+		m.sendBinary(ctx, batch0)
+		m.sendBinary(ctx, writeQwpFrame(0, buildCacheResetBody(qwpResetMaskDict)))
+		m.sendBinary(ctx, batch1)
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID, 1, 4)))
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+	io := newQwpEgressIO(tr, 2)
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT s FROM t", requestId: reqID}); err != nil {
+		t.Fatalf("submitQuery: %v", err)
+	}
+
+	// The mid-query CACHE_RESET is consumed silently: the event stream is
+	// exactly {Batch, Batch, End}.
+	ev0 := takeEventOrFail(t, io, 2*time.Second)
+	if ev0.kind != qwpEventKindBatch {
+		t.Fatalf("event 0 = %v, want Batch (errMsg=%q)", ev0.kind, ev0.errMessage)
+	}
+	if a, b := ev0.batch.batch.String(0, 0), ev0.batch.batch.String(0, 1); a != "AAPL" || b != "MSFT" {
+		t.Errorf("batch 0 rows = %q,%q, want AAPL,MSFT", a, b)
+	}
+	ev0.batch.release()
+
+	ev1 := takeEventOrFail(t, io, 2*time.Second)
+	if ev1.kind != qwpEventKindBatch {
+		t.Fatalf("event 1 = %v, want Batch (errMsg=%q)", ev1.kind, ev1.errMessage)
+	}
+	if a, b := ev1.batch.batch.String(0, 0), ev1.batch.batch.String(0, 1); a != "MSFT" || b != "AAPL" {
+		t.Errorf("batch 1 rows = %q,%q, want MSFT,AAPL", a, b)
+	}
+	ev1.batch.release()
+
+	end := takeEventOrFail(t, io, 2*time.Second)
+	if end.kind != qwpEventKindEnd {
+		t.Fatalf("event 2 = %v, want End (errMsg=%q)", end.kind, end.errMessage)
+	}
+
+	// The continuation re-seeded the dict from id 0 after the reset.
+	shutdownIO(t, io)
+	if got := io.decoder.dict.size(); got != 2 {
+		t.Errorf("dict size after reset+reseed = %d, want 2", got)
+	}
+}
+
+// TestQwpEgressIOCreditStarvationNeverReleases pins the behavior when a
+// flow-controlled query's consumer reads a batch and then never releases
+// it: with the buffer pool exhausted, the dispatcher parks (no busy-spin,
+// no further events) and — because CREDIT is only emitted on release —
+// the server is starved of credit (no CREDIT frame is sent). shutdown
+// must still unblock the parked dispatcher and return cleanly, proving
+// no deadlock or goroutine leak.
+func TestQwpEgressIOCreditStarvationNeverReleases(t *testing.T) {
+	const reqID = int64(31)
+	const initialCredit = int64(64 * 1024)
+
+	sawCredit := make(chan struct{}, 1)
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req := m.readBinary(ctx)
+		if _, _, credit := parseQueryRequest(t, req); credit != initialCredit {
+			t.Errorf("server saw credit=%d, want %d", credit, initialCredit)
+		}
+		// Two batches: with pool size 1 the client decodes the first and
+		// parks acquiring a buffer for the second.
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID, 0, "v", 10))
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID, 1, "v", 20))
+		// Watch for a CREDIT frame until the client disconnects. A
+		// never-releasing consumer sends none. Read directly (not
+		// readBinary) so the expected close/cancel is not fatal.
+		for {
+			typ, data, err := m.conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			if typ == websocket.MessageBinary && len(data) > 0 && data[0] == byte(qwpMsgKindCredit) {
+				select {
+				case sawCredit <- struct{}{}:
+				default:
+				}
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+	io := newQwpEgressIO(tr, 1) // pool of size 1
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := io.submitQuery(ctx, qwpRequest{
+		sql:           "SELECT v FROM t",
+		requestId:     reqID,
+		initialCredit: initialCredit,
+	}); err != nil {
+		t.Fatalf("submitQuery: %v", err)
+	}
+
+	// Read the first batch and HOLD it — never release.
+	ev := takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindBatch {
+		t.Fatalf("first event = %v, want Batch (errMsg=%q)", ev.kind, ev.errMessage)
+	}
+
+	// The dispatcher parks on the exhausted pool: no second event arrives.
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	if _, err := io.takeEvent(shortCtx); err == nil {
+		shortCancel()
+		t.Fatal("event arrived while the consumer starved the pool")
+	}
+	shortCancel()
+
+	// No CREDIT is emitted while the batch is held.
+	select {
+	case <-sawCredit:
+		t.Fatal("client emitted CREDIT despite the consumer never releasing")
+	case <-time.After(800 * time.Millisecond):
+	}
+
+	// shutdown must unblock the parked dispatcher and return cleanly,
+	// even though the held batch is never released.
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutCancel()
+	start := time.Now()
+	if err := io.shutdown(shutCtx); err != nil {
+		t.Fatalf("shutdown returned %v; want clean return despite a never-releasing consumer", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("shutdown took %v; dispatcher did not unblock promptly", elapsed)
+	}
+}
+
+// TestQwpEgressIOBindPath verifies the egress bind path end-to-end at the
+// I/O layer: typed binds encoded via QwpBinds are carried verbatim in the
+// QUERY_REQUEST after the bind_count field, and the query then completes
+// normally. Unit-level coverage for bind transmission, which is otherwise
+// exercised only by the server-fixture fuzz tests.
+func TestQwpEgressIOBindPath(t *testing.T) {
+	const reqID = int64(41)
+	const wantSQL = "SELECT * FROM t WHERE a = $1 AND b = $2"
+
+	// Encode two typed binds the way QwpQueryClient.buildRequest does.
+	var binds QwpBinds
+	binds.reset()
+	binds.LongBind(0, 0x0123456789ABCDEF).VarcharBind(1, "needle")
+	if err := binds.Err(); err != nil {
+		t.Fatalf("encode binds: %v", err)
+	}
+	wantBindPayload := append([]byte(nil), binds.bufferBytes()...)
+	wantBindCount := binds.Count()
+	if wantBindCount != 2 {
+		t.Fatalf("bind count = %d, want 2", wantBindCount)
+	}
+
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req := m.readBinary(ctx)
+		gotID, gotSQL, _ := parseQueryRequest(t, req)
+		if gotID != reqID {
+			t.Errorf("server saw requestId=%d, want %d", gotID, reqID)
+		}
+		if gotSQL != wantSQL {
+			t.Errorf("server saw sql=%q, want %q", gotSQL, wantSQL)
+		}
+		// The typed bind block is the tail of QUERY_REQUEST after the
+		// bind_count varint; verify it byte-for-byte against the client
+		// encoding.
+		if !strings.HasSuffix(string(req), string(wantBindPayload)) {
+			t.Errorf("QUERY_REQUEST missing expected %d-byte bind payload suffix", len(wantBindPayload))
+		}
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID, 0, "v", 777))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID, 0, 1)))
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+	io := newQwpEgressIO(tr, 2)
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := io.submitQuery(ctx, qwpRequest{
+		sql:         wantSQL,
+		requestId:   reqID,
+		bindCount:   wantBindCount,
+		bindPayload: wantBindPayload,
+	}); err != nil {
+		t.Fatalf("submitQuery: %v", err)
+	}
+
+	values := drainBatchesToEnd(t, io, 1)
+	if len(values) != 1 || values[0] != 777 {
+		t.Fatalf("batch values = %v, want [777]", values)
+	}
+}

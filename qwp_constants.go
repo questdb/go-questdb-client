@@ -24,7 +24,10 @@
 
 package questdb
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // qwpTypeCode represents a QWP column type.
 type qwpTypeCode byte
@@ -410,5 +413,71 @@ func qwpFixedTypeSize(tc qwpTypeCode) int {
 		return -1 // variable-width
 	default:
 		return -1
+	}
+}
+
+// qwpIsArrayType reports whether tc is one of the N-dimensional array
+// types (DOUBLE_ARRAY / LONG_ARRAY). The array accessors index the
+// decoder's per-array arrayRowStart / arrayElems side tables, which the
+// decoder populates only for these two types; the bulk array accessors
+// guard on this so a mis-typed call panics with a clear message rather
+// than an opaque slice-bounds error.
+func qwpIsArrayType(tc qwpTypeCode) bool {
+	return tc == qwpTypeDoubleArray || tc == qwpTypeLongArray
+}
+
+// qwpTypeName returns the protocol name of a wire type for diagnostics
+// and panic messages. Unknown codes — including 0x08, the removed
+// TYPE_STRING — render as their hex byte.
+func qwpTypeName(tc qwpTypeCode) string {
+	switch tc {
+	case qwpTypeBoolean:
+		return "BOOLEAN"
+	case qwpTypeByte:
+		return "BYTE"
+	case qwpTypeShort:
+		return "SHORT"
+	case qwpTypeInt:
+		return "INT"
+	case qwpTypeLong:
+		return "LONG"
+	case qwpTypeFloat:
+		return "FLOAT"
+	case qwpTypeDouble:
+		return "DOUBLE"
+	case qwpTypeSymbol:
+		return "SYMBOL"
+	case qwpTypeTimestamp:
+		return "TIMESTAMP"
+	case qwpTypeDate:
+		return "DATE"
+	case qwpTypeUuid:
+		return "UUID"
+	case qwpTypeLong256:
+		return "LONG256"
+	case qwpTypeGeohash:
+		return "GEOHASH"
+	case qwpTypeVarchar:
+		return "VARCHAR"
+	case qwpTypeTimestampNano:
+		return "TIMESTAMP_NANOS"
+	case qwpTypeDoubleArray:
+		return "DOUBLE_ARRAY"
+	case qwpTypeLongArray:
+		return "LONG_ARRAY"
+	case qwpTypeDecimal64:
+		return "DECIMAL64"
+	case qwpTypeDecimal128:
+		return "DECIMAL128"
+	case qwpTypeDecimal256:
+		return "DECIMAL256"
+	case qwpTypeChar:
+		return "CHAR"
+	case qwpTypeBinary:
+		return "BINARY"
+	case qwpTypeIPv4:
+		return "IPv4"
+	default:
+		return fmt.Sprintf("0x%02x", byte(tc))
 	}
 }

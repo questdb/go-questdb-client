@@ -27,7 +27,9 @@ package questdb
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -1223,4 +1225,342 @@ func TestQwpColumnBatchZeroAlloc(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("hot-path accessors allocated %v times/run, want 0", allocs)
 	}
+}
+
+// --- Mis-typed / out-of-bounds accessor contract ---
+
+// assertPanics runs fn, fails if it does not panic, and (when wantSubstr
+// is non-empty) fails if the recovered value's string form does not
+// contain wantSubstr. Pinning the substring stops a test from passing on
+// an unrelated panic (e.g. a nil deref) instead of the guard it targets.
+func assertPanics(t *testing.T, wantSubstr string, fn func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected panic containing %q, got none", wantSubstr)
+		}
+		if msg := fmt.Sprintf("%v", r); wantSubstr != "" && !strings.Contains(msg, wantSubstr) {
+			t.Fatalf("panic %q does not contain %q", msg, wantSubstr)
+		}
+	}()
+	fn()
+}
+
+// TestQwpColumnRangeTypeMismatchPanics pins the *Range width guard: a
+// Range accessor on a column whose wire type is not the matching fixed
+// width panics with a typed message (carrying the column name + wire
+// type) rather than the opaque slice-bounds panic the unguarded memmove
+// path produced — most visibly Int64Range on a bit-packed BOOLEAN,
+// whose dense region is far shorter than toRow*8.
+func TestQwpColumnRangeTypeMismatchPanics(t *testing.T) {
+	mkCol := func(wt qwpTypeCode, rows int) QwpColumn {
+		info := qwpColumnSchemaInfo{name: "c", wireType: wt}
+		// 8 bytes/row of backing storage regardless of the column's real
+		// width, so a too-narrow read could *silently* succeed without
+		// the guard. That proves it is the guard, not an incidental OOB,
+		// that fires.
+		layout := buildFixedLayout(&info, make([]byte, rows*8), rows)
+		return newSingleColumnBatch(info, layout, rows).Column(0)
+	}
+	for _, tc := range []struct {
+		name string
+		wt   qwpTypeCode
+		run  func(c QwpColumn)
+	}{
+		{"Int64Range/BOOLEAN", qwpTypeBoolean, func(c QwpColumn) { c.Int64Range(0, 4, nil) }},
+		{"Int64Range/INT", qwpTypeInt, func(c QwpColumn) { c.Int64Range(0, 4, nil) }},
+		{"Int64Range/SYMBOL", qwpTypeSymbol, func(c QwpColumn) { c.Int64Range(0, 4, nil) }},
+		{"Float64Range/FLOAT", qwpTypeFloat, func(c QwpColumn) { c.Float64Range(0, 4, nil) }},
+		{"Int32Range/LONG", qwpTypeLong, func(c QwpColumn) { c.Int32Range(0, 4, nil) }},
+		{"Int32Range/BOOLEAN", qwpTypeBoolean, func(c QwpColumn) { c.Int32Range(0, 4, nil) }},
+		{"Float32Range/DOUBLE", qwpTypeDouble, func(c QwpColumn) { c.Float32Range(0, 4, nil) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := mkCol(tc.wt, 4)
+			assertPanics(t, "fixed-width", func() { tc.run(c) })
+		})
+	}
+}
+
+// TestQwpColumnRangeSameWidthReinterpretAllowed pins the deliberately
+// permitted case: a Range accessor on a different type of the SAME
+// element width passes the guard and reinterprets the raw bits, so the
+// documented "numeric noise" contract for Int64Range on a DOUBLE column
+// still holds.
+func TestQwpColumnRangeSameWidthReinterpretAllowed(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "d", wireType: qwpTypeDouble}
+	values := make([]byte, 16)
+	binary.LittleEndian.PutUint64(values[0:], math.Float64bits(1.5))
+	binary.LittleEndian.PutUint64(values[8:], math.Float64bits(2.5))
+	layout := buildFixedLayout(&info, values, 2)
+	col := newSingleColumnBatch(info, layout, 2).Column(0)
+
+	got := col.Int64Range(0, 2, nil) // 8-byte DOUBLE read as int64: allowed
+	if len(got) != 2 ||
+		uint64(got[0]) != math.Float64bits(1.5) ||
+		uint64(got[1]) != math.Float64bits(2.5) {
+		t.Fatalf("Int64Range on DOUBLE = %v, want raw float64 bits", got)
+	}
+}
+
+// TestQwpArrayAccessorsOnNonArrayPanic pins the array-type guard: every
+// array accessor, on both the QwpColumnBatch and QwpColumn surfaces,
+// panics with a typed message when the column is not an array — instead
+// of the opaque "index out of range [n] with length 0" from indexing
+// the empty arrayRowStart side table.
+func TestQwpArrayAccessorsOnNonArrayPanic(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+	values := make([]byte, 8)
+	binary.LittleEndian.PutUint64(values, 42)
+	layout := buildFixedLayout(&info, values, 1)
+	batch := newSingleColumnBatch(info, layout, 1)
+	col := batch.Column(0)
+
+	for _, tc := range []struct {
+		name string
+		run  func()
+	}{
+		{"batch.Float64Array", func() { batch.Float64Array(0, 0) }},
+		{"batch.Int64Array", func() { batch.Int64Array(0, 0) }},
+		{"batch.ArrayNDims", func() { batch.ArrayNDims(0, 0) }},
+		{"batch.ArrayDim", func() { batch.ArrayDim(0, 0, 0) }},
+		{"col.Float64Array", func() { col.Float64Array(0) }},
+		{"col.Int64Array", func() { col.Int64Array(0) }},
+		{"col.ArrayNDims", func() { col.ArrayNDims(0) }},
+		{"col.ArrayDim", func() { col.ArrayDim(0, 0) }},
+		{"col.Float64ArrayInto", func() { col.Float64ArrayInto(0, nil) }},
+		{"col.Int64ArrayInto", func() { col.Int64ArrayInto(0, nil) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertPanics(t, "not an array type", tc.run)
+		})
+	}
+}
+
+// TestQwpArrayElementTypeReinterpretAllowed pins the permitted same-width
+// reinterpretation across the two array element types: the guard checks
+// "is an array", not "is THIS array type", so Int64Array on a
+// DOUBLE_ARRAY column decodes the 8-byte elements as raw int64 bits
+// rather than panicking — the array analogue of the *Range reinterpret.
+func TestQwpArrayElementTypeReinterpretAllowed(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "a", wireType: qwpTypeDoubleArray}
+	var buf bytes.Buffer
+	buf.WriteByte(1) // nDims
+	_ = binary.Write(&buf, binary.LittleEndian, int32(2))
+	_ = binary.Write(&buf, binary.LittleEndian, 1.5)
+	_ = binary.Write(&buf, binary.LittleEndian, 2.5)
+	layout := qwpColumnLayout{
+		info:          &info,
+		values:        buf.Bytes(),
+		arrayRowStart: []int32{0},
+		arrayElems:    []int32{2},
+		nonNullCount:  1,
+	}
+	batch := newSingleColumnBatch(info, layout, 1)
+	got := batch.Int64Array(0, 0) // must not panic
+	if len(got) != 2 ||
+		uint64(got[0]) != math.Float64bits(1.5) ||
+		uint64(got[1]) != math.Float64bits(2.5) {
+		t.Fatalf("Int64Array on DOUBLE_ARRAY = %v, want raw float64 bits", got)
+	}
+}
+
+// TestQwpColumnBatchPerCellMistypeAndOOB characterises the per-cell
+// fixed-width accessors under misuse — the behavior the package
+// documents as "undefined" but which must never silently read out of
+// bounds. Two regimes: a same-width mis-type reinterprets the bytes (no
+// panic); a too-narrow column or an out-of-range row slices past the
+// dense values region and surfaces Go's bounds-check panic rather than
+// returning adjacent memory. Pinned so a future "optimisation" to
+// unsafe per-cell indexing that drops the bounds check is caught.
+func TestQwpColumnBatchPerCellMistypeAndOOB(t *testing.T) {
+	t.Run("same_width_reinterpret_no_panic", func(t *testing.T) {
+		info := qwpColumnSchemaInfo{name: "d", wireType: qwpTypeDouble}
+		values := make([]byte, 8)
+		binary.LittleEndian.PutUint64(values, math.Float64bits(1.5))
+		layout := buildFixedLayout(&info, values, 1)
+		batch := newSingleColumnBatch(info, layout, 1)
+		if got := batch.Int64(0, 0); uint64(got) != math.Float64bits(1.5) {
+			t.Fatalf("Int64 on DOUBLE = %#x, want float64 bits %#x",
+				uint64(got), math.Float64bits(1.5))
+		}
+	})
+
+	t.Run("too_narrow_type_panics", func(t *testing.T) {
+		// BYTE column: 1 byte/value, so an 8-byte Int64 read slices past
+		// the 2-byte dense region.
+		info := qwpColumnSchemaInfo{name: "b", wireType: qwpTypeByte}
+		layout := buildFixedLayout(&info, []byte{0x01, 0x02}, 2)
+		batch := newSingleColumnBatch(info, layout, 2)
+		assertPanics(t, "", func() { _ = batch.Int64(0, 0) })
+	})
+
+	t.Run("oob_row_no_nulls_panics", func(t *testing.T) {
+		info := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+		layout := buildFixedLayout(&info, make([]byte, 8), 1)
+		batch := newSingleColumnBatch(info, layout, 1)
+		assertPanics(t, "", func() { _ = batch.Int64(0, 5) })
+	})
+
+	t.Run("oob_row_nullable_panics", func(t *testing.T) {
+		info := qwpColumnSchemaInfo{name: "v", wireType: qwpTypeLong}
+		rowBytes := [][]byte{
+			binary.LittleEndian.AppendUint64(nil, 100),
+			nil,
+		}
+		layout := buildNullableLayout(&info, rowBytes)
+		batch := newSingleColumnBatch(info, layout, 2)
+		assertPanics(t, "", func() { _ = batch.Int64(0, 99) })
+	})
+}
+
+// --- CopyAll: symbol dict + array metadata ---
+
+// TestQwpColumnBatchCopyAllSymbolSurvivesPoolReuse covers the SYMBOL
+// corner of CopyAll. A snapshot must keep resolving its rows to the
+// right strings after the decoder (a) reuses the batch's pool-owned
+// symbolRowIds for the next frame and (b) append-grows the
+// connection-scoped dict. CopyAll clones symbolRowIds and snapshots the
+// append-only dict view, so both survive.
+func TestQwpColumnBatchCopyAllSymbolSurvivesPoolReuse(t *testing.T) {
+	globalDict := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+
+	// frame1 (batch_seq 0): rows alpha,beta,alpha (ids 0,1,0); advertises
+	// dict ids 0..1.
+	tb1 := newQwpTableBuffer("t")
+	for _, id := range []int32{0, 1, 0} {
+		col, _ := tb1.getOrCreateColumn("s", qwpTypeSymbol, false)
+		col.addSymbolID(id)
+		tb1.commitRow()
+	}
+	var enc qwpEncoder
+	frame1 := wrapAsResultBatch(enc.encodeTableWithDeltaDict(tb1, globalDict, -1, 1), 1, 0)
+
+	// frame2 (continuation, batch_seq 1): rows beta,epsilon (ids 1,4).
+	// Row 0's id differs from frame1's, so the snapshot reading "alpha"
+	// at row 0 proves it walks its own cloned symbolRowIds rather than
+	// the reused pool slice. Advertising ids 2..4 append-grows the dict
+	// heap past frame1's frozen prefix.
+	tb2 := newQwpTableBuffer("t")
+	for _, id := range []int32{1, 4} {
+		col, _ := tb2.getOrCreateColumn("s", qwpTypeSymbol, false)
+		col.addSymbolID(id)
+		tb2.commitRow()
+	}
+	frame2 := wrapAsResultBatch(enc.encodeTableWithDeltaDict(tb2, globalDict, 1, 4), 1, 1)
+
+	dec := newTestQueryDecoder()
+	var b QwpColumnBatch
+	if err := dec.decode(frame1, &b); err != nil {
+		t.Fatalf("decode 1: %v", err)
+	}
+	want := []string{"alpha", "beta", "alpha"}
+	for i, w := range want {
+		if got := b.String(0, i); got != w {
+			t.Fatalf("live batch1 row %d = %q, want %q", i, got, w)
+		}
+	}
+
+	snapshot := b.CopyAll()
+
+	// Decode the continuation into the SAME batch: reuses b's pool-owned
+	// symbolRowIds in place and append-extends the decoder's dict.
+	if err := dec.decode(frame2, &b); err != nil {
+		t.Fatalf("decode 2: %v", err)
+	}
+	if got := b.String(0, 0); got != "beta" {
+		t.Fatalf("live batch2 row 0 = %q, want %q", got, "beta")
+	}
+	if got := b.String(0, 1); got != "epsilon" {
+		t.Fatalf("live batch2 row 1 = %q, want %q", got, "epsilon")
+	}
+
+	// Snapshot must still resolve frame1's per-row symbols.
+	for i, w := range want {
+		if got := snapshot.String(0, i); got != w {
+			t.Fatalf("snapshot row %d = %q, want %q (CopyAll didn't snapshot symbol state)", i, got, w)
+		}
+	}
+}
+
+// TestQwpColumnBatchCopyAllArraySurvivesPoolReuse covers the ARRAY
+// corner of CopyAll: a snapshot must keep its shape + elements after the
+// decoder reuses the batch for the next frame. That clobbers two kinds
+// of state at once — the pool-owned arrayRowStart / arrayElems side
+// tables (overwritten in place) and the array bytes in `values` (which
+// alias the recycled payload buffer). CopyAll clones the side tables and
+// rebinds values onto a private payload clone.
+func TestQwpColumnBatchCopyAllArraySurvivesPoolReuse(t *testing.T) {
+	// frame1: two 1-D DOUBLE_ARRAY rows of different lengths, so the
+	// arrayRowStart / arrayElems side tables carry distinct per-row values.
+	frame1 := encodeSingleColumnBatch(t, "a", qwpTypeDoubleArray, false,
+		[]func(*qwpColumnBuffer){
+			func(c *qwpColumnBuffer) { c.addDoubleArray(1, []int32{3}, []float64{1.5, 2.5, 3.5}) },
+			func(c *qwpColumnBuffer) { c.addDoubleArray(1, []int32{2}, []float64{4.5, 5.5}) },
+		})
+	// frame2: different shapes and a larger byte footprint, so writing it
+	// into the recycled buffer fully overwrites frame1's bytes and the
+	// re-decode rewrites arrayRowStart / arrayElems with new values.
+	frame2 := encodeSingleColumnBatch(t, "a", qwpTypeDoubleArray, false,
+		[]func(*qwpColumnBuffer){
+			func(c *qwpColumnBuffer) { c.addDoubleArray(1, []int32{5}, []float64{-1, -2, -3, -4, -5}) },
+			func(c *qwpColumnBuffer) { c.addDoubleArray(1, []int32{4}, []float64{-6, -7, -8, -9}) },
+		})
+	if len(frame2) < len(frame1) {
+		t.Fatalf("precondition: frame2 (%d) must be >= frame1 (%d)", len(frame2), len(frame1))
+	}
+
+	// One backing array recycled across two decodes, standing in for the
+	// egress I/O loop's readBufPool buffer.
+	pooled := make([]byte, len(frame2))
+	copy(pooled, frame1)
+
+	dec := newTestQueryDecoder()
+	var b QwpColumnBatch
+	if err := dec.decode(pooled[:len(frame1)], &b); err != nil {
+		t.Fatalf("decode 1: %v", err)
+	}
+	if len(b.zstdScratch) != 0 {
+		t.Fatalf("precondition: expected raw (non-zstd) path; zstdScratch=%d", len(b.zstdScratch))
+	}
+
+	snapshot := b.CopyAll()
+
+	assertArrayRow := func(label string, row int, wantDim int, want []float64) {
+		t.Helper()
+		if n := snapshot.ArrayNDims(0, row); n != 1 {
+			t.Fatalf("%s: snapshot ArrayNDims(row %d) = %d, want 1", label, row, n)
+		}
+		if d := snapshot.ArrayDim(0, row, 0); d != wantDim {
+			t.Fatalf("%s: snapshot ArrayDim(row %d) = %d, want %d", label, row, d, wantDim)
+		}
+		got := snapshot.Float64Array(0, row)
+		if len(got) != len(want) {
+			t.Fatalf("%s: snapshot Float64Array(row %d) len = %d, want %d", label, row, len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s: snapshot Float64Array(row %d)[%d] = %v, want %v", label, row, i, got[i], want[i])
+			}
+		}
+	}
+
+	assertArrayRow("pre-clobber", 0, 3, []float64{1.5, 2.5, 3.5})
+	assertArrayRow("pre-clobber", 1, 2, []float64{4.5, 5.5})
+
+	// Recycle the buffer and re-decode into the SAME batch: overwrites the
+	// payload bytes the live batch aliased and rewrites its arrayRowStart
+	// / arrayElems in place.
+	copy(pooled, frame2)
+	if err := dec.decode(pooled[:len(frame2)], &b); err != nil {
+		t.Fatalf("decode 2: %v", err)
+	}
+	if d := b.ArrayDim(0, 0, 0); d != 5 {
+		t.Fatalf("live batch2 ArrayDim(row 0) = %d, want 5", d)
+	}
+
+	// The snapshot keeps frame1's shape + elements.
+	assertArrayRow("post-clobber", 0, 3, []float64{1.5, 2.5, 3.5})
+	assertArrayRow("post-clobber", 1, 2, []float64{4.5, 5.5})
 }

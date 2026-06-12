@@ -180,6 +180,36 @@ func (l *qwpColumnLayout) isNull(row int) bool {
 	return b&(1<<(row&7)) != 0
 }
 
+// requireFixedWidth panics with a typed message when the column's wire
+// type is not a fixed-width type of exactly `size` bytes. The bulk
+// *Range accessors call this once per range — amortized over the row
+// span — so a mis-typed call fails with a clear message instead of an
+// opaque slice-bounds panic deep in the memmove path (e.g. Int64Range
+// on a bit-packed BOOLEAN column, whose dense region is far shorter than
+// toRow*8). Same-width reinterpretation is intentionally permitted:
+// Int64Range on a DOUBLE column passes the guard (both are 8-byte) and
+// yields the raw bits decoded as the target type.
+func (l *qwpColumnLayout) requireFixedWidth(method string, size int) {
+	if qwpFixedTypeSize(l.info.wireType) != size {
+		panic(fmt.Sprintf("%s: column %q is %s, not a fixed-width %d-byte type",
+			method, l.info.name, qwpTypeName(l.info.wireType), size))
+	}
+}
+
+// requireArray panics with a typed message when the column is not an
+// array type. The array accessors index arrayRowStart / arrayElems,
+// which the decoder populates only for DOUBLE_ARRAY / LONG_ARRAY
+// columns (clear() rewinds them to :0), so without this guard a
+// mis-typed call panics with an opaque "index out of range [n] with
+// length 0" from arrayRowStart. One byte comparison, amortized against
+// the per-call shape walk / allocation.
+func (l *qwpColumnLayout) requireArray(method string) {
+	if !qwpIsArrayType(l.info.wireType) {
+		panic(fmt.Sprintf("%s: column %q is %s, not an array type",
+			method, l.info.name, qwpTypeName(l.info.wireType)))
+	}
+}
+
 // QwpColumnBatch is a column-major view over one decoded RESULT_BATCH
 // frame. The batch is valid only for the duration of the current
 // iteration of a *QwpQuery's `Batches()` range — its accessors return
@@ -274,6 +304,15 @@ func (b *QwpColumnBatch) NonNullCount(col int) int {
 // ColumnType(col) for generic dispatch; in a schema-aware query runner
 // the caller already knows. NULL rows return the zero value of the
 // accessor's return type.
+//
+// These per-cell accessors do not validate the wire type — that check
+// stays off the hot path. A mis-typed per-cell call is undefined:
+// depending on the column's element width it either reinterprets the
+// underlying bytes (an 8-byte DOUBLE read through Int64 yields numeric
+// noise) or panics with an out-of-range index (Int64 on a 1-byte BYTE
+// or a bit-packed BOOLEAN slices past the dense region). The bulk
+// *Range and array accessors DO guard — there the check amortizes over
+// the call — and panic with a typed message; see their contract notes.
 //
 // The QwpColumn handle (`Column(col)`) duplicates each accessor body.
 // Routing the batch surface through `b.Column(col).X(row)` would halve
@@ -503,11 +542,21 @@ func qwpStringSlice(l *qwpColumnLayout, row int) []byte {
 }
 
 // --- Arrays ---
+//
+// The array accessors (ArrayNDims, ArrayDim, Float64Array, Int64Array,
+// and the QwpColumn *ArrayInto variants) require a DOUBLE_ARRAY or
+// LONG_ARRAY column: they index the decoder's per-array side tables,
+// which exist only for those types. Calling one on a non-array column
+// panics with a typed message. The element accessors do not distinguish
+// DOUBLE_ARRAY from LONG_ARRAY — Int64Array on a DOUBLE_ARRAY column
+// reinterprets the 8-byte elements as int64 (numeric noise), the same
+// same-width reinterpretation the *Range accessors allow.
 
 // ArrayNDims returns the dimensionality of the array value at (col, row),
 // or 0 for NULL rows.
 func (b *QwpColumnBatch) ArrayNDims(col, row int) int {
 	l := &b.layouts[col]
+	l.requireArray("QwpColumnBatch.ArrayNDims")
 	if l.isNull(row) {
 		return 0
 	}
@@ -519,6 +568,7 @@ func (b *QwpColumnBatch) ArrayNDims(col, row int) int {
 // (col, row). `dim` must be in [0, ArrayNDims(col, row)).
 func (b *QwpColumnBatch) ArrayDim(col, row, dim int) int {
 	l := &b.layouts[col]
+	l.requireArray("QwpColumnBatch.ArrayDim")
 	if l.isNull(row) {
 		return 0
 	}
@@ -560,6 +610,7 @@ func arrayElementCount(l *qwpColumnLayout, row int) (elems, dataBase int) {
 // no 8-byte-aligned load is issued against the unaligned payload.
 func (b *QwpColumnBatch) Float64Array(col, row int) []float64 {
 	l := &b.layouts[col]
+	l.requireArray("QwpColumnBatch.Float64Array")
 	if l.isNull(row) {
 		return nil
 	}
@@ -577,6 +628,7 @@ func (b *QwpColumnBatch) Float64Array(col, row int) []float64 {
 // endianness contract.
 func (b *QwpColumnBatch) Int64Array(col, row int) []int64 {
 	l := &b.layouts[col]
+	l.requireArray("QwpColumnBatch.Int64Array")
 	if l.isNull(row) {
 		return nil
 	}
@@ -812,6 +864,7 @@ func (c QwpColumn) Binary(row int) []byte {
 // ArrayNDims returns the dimensionality of the array at row, or 0 for NULL.
 func (c QwpColumn) ArrayNDims(row int) int {
 	l := c.layout
+	l.requireArray("QwpColumn.ArrayNDims")
 	if l.isNull(row) {
 		return 0
 	}
@@ -822,6 +875,7 @@ func (c QwpColumn) ArrayNDims(row int) int {
 // ArrayDim returns the extent of dimension `dim` of the array at row.
 func (c QwpColumn) ArrayDim(row, dim int) int {
 	l := c.layout
+	l.requireArray("QwpColumn.ArrayDim")
 	if l.isNull(row) {
 		return 0
 	}
@@ -838,6 +892,7 @@ func (c QwpColumn) ArrayDim(row, dim int) int {
 // DOUBLE_ARRAY cell. Returns nil for NULL rows.
 func (c QwpColumn) Float64Array(row int) []float64 {
 	l := c.layout
+	l.requireArray("QwpColumn.Float64Array")
 	if l.isNull(row) {
 		return nil
 	}
@@ -854,6 +909,7 @@ func (c QwpColumn) Float64Array(row int) []float64 {
 // cell. Returns nil for NULL rows.
 func (c QwpColumn) Int64Array(row int) []int64 {
 	l := c.layout
+	l.requireArray("QwpColumn.Int64Array")
 	if l.isNull(row) {
 		return nil
 	}
@@ -874,6 +930,7 @@ func (c QwpColumn) Int64Array(row int) []int64 {
 // calls.
 func (c QwpColumn) Float64ArrayInto(row int, dst []float64) []float64 {
 	l := c.layout
+	l.requireArray("QwpColumn.Float64ArrayInto")
 	if l.isNull(row) {
 		return dst
 	}
@@ -893,6 +950,7 @@ func (c QwpColumn) Float64ArrayInto(row int, dst []float64) []float64 {
 // Float64ArrayInto for the contract — NULL rows contribute nothing.
 func (c QwpColumn) Int64ArrayInto(row int, dst []int64) []int64 {
 	l := c.layout
+	l.requireArray("QwpColumn.Int64ArrayInto")
 	if l.isNull(row) {
 		return dst
 	}
@@ -920,13 +978,20 @@ func (c QwpColumn) Int64ArrayInto(row int, dst []int64) []int64 {
 // keep the common row-sweep path allocation-free. When dst's remaining
 // capacity is short, slices.Grow performs one resize.
 //
-// The caller is responsible for matching the method to the column's
-// wire type. Mis-typed calls (e.g. Int64Range on a DOUBLE column) will
-// produce numeric noise, not a type error — follow the same discipline
-// as the per-row typed accessors.
+// Each method requires the column to be a fixed-width type of the
+// matching element width — 8 bytes for Int64Range / Float64Range, 4 for
+// Int32Range / Float32Range. A column of a different width (a bit-packed
+// BOOLEAN, a variable-width SYMBOL / VARCHAR / BINARY, or an array)
+// panics with a typed message instead of reading past the values
+// buffer. Same-width reinterpretation is permitted: Int64Range on a
+// DOUBLE column passes the guard and yields the raw 8-byte bits decoded
+// as int64 ("numeric noise"), so the caller still owns the
+// type-to-semantics match — only the memory-safety failure mode is
+// converted into a clear panic.
 
 // Int64Range appends int64 values for rows [fromRow, toRow).
 func (c QwpColumn) Int64Range(fromRow, toRow int, dst []int64) []int64 {
+	c.layout.requireFixedWidth("QwpColumn.Int64Range", 8)
 	n := toRow - fromRow
 	if n <= 0 {
 		return dst
@@ -957,6 +1022,7 @@ func (c QwpColumn) Int64Range(fromRow, toRow int, dst []int64) []int64 {
 
 // Float64Range appends float64 values for rows [fromRow, toRow).
 func (c QwpColumn) Float64Range(fromRow, toRow int, dst []float64) []float64 {
+	c.layout.requireFixedWidth("QwpColumn.Float64Range", 8)
 	n := toRow - fromRow
 	if n <= 0 {
 		return dst
@@ -984,6 +1050,7 @@ func (c QwpColumn) Float64Range(fromRow, toRow int, dst []float64) []float64 {
 
 // Int32Range appends int32 values for rows [fromRow, toRow).
 func (c QwpColumn) Int32Range(fromRow, toRow int, dst []int32) []int32 {
+	c.layout.requireFixedWidth("QwpColumn.Int32Range", 4)
 	n := toRow - fromRow
 	if n <= 0 {
 		return dst
@@ -1011,6 +1078,7 @@ func (c QwpColumn) Int32Range(fromRow, toRow int, dst []int32) []int32 {
 
 // Float32Range appends float32 values for rows [fromRow, toRow).
 func (c QwpColumn) Float32Range(fromRow, toRow int, dst []float32) []float32 {
+	c.layout.requireFixedWidth("QwpColumn.Float32Range", 4)
 	n := toRow - fromRow
 	if n <= 0 {
 		return dst
