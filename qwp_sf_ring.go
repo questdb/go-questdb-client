@@ -91,6 +91,16 @@ type qwpSfSegmentRing struct {
 	ackedFsn     atomic.Int64
 	publishedFsn atomic.Int64
 
+	// ackNotify is a broadcast channel that acknowledge closes and
+	// replaces each time it advances ackedFsn, so a blocked waiter
+	// (AwaitAckedFsn) wakes immediately instead of polling. Lazily
+	// created by the first subscriber and nil whenever nobody is
+	// waiting, so an ACK with no waiter costs only the mutex. Guarded
+	// by ackNotifyMu; lives off the producer hot path (acknowledge runs
+	// on the I/O goroutine).
+	ackNotifyMu sync.Mutex
+	ackNotify   chan struct{}
+
 	// nextSeq is the FSN that appendOrFsn will assign next.
 	// Producer-only mutator (single-threaded), but the segment
 	// manager goroutine reads it via nextSeqHint to seed a fresh
@@ -116,7 +126,9 @@ type qwpSfSegmentRing struct {
 	// nil in unit tests that drive the ring without a send loop.
 	sendLoopWakeup func()
 	// wakeupRequestedForActive coalesces multiple high-water-mark
-	// crossings into a single unpark per active segment.
+	// crossings into a single backup manager unpark per active segment.
+	// Set when that backup wakeup fires; reset on rotation so each
+	// freshly promoted active segment gets its own one-shot backup.
 	wakeupRequestedForActive bool
 }
 
@@ -290,8 +302,42 @@ func (r *qwpSfSegmentRing) acknowledge(seq int64) {
 			return
 		}
 		if r.ackedFsn.CompareAndSwap(cur, seq) {
+			// ackedFsn moved — wake any AwaitAckedFsn waiters. Done after
+			// the store so a woken waiter that re-reads ackedFsn observes
+			// the new value (close happens-before the receive that wakes
+			// it).
+			r.notifyAckAdvance()
 			return
 		}
+	}
+}
+
+// segmentRingAckNotify returns a channel that is closed the next time
+// acknowledge advances ackedFsn. The contract for a no-lost-wakeup
+// wait is: subscribe (call this) first, then read segmentRingAckedFsn,
+// then block on the returned channel — acknowledge's atomic store of
+// the new FSN precedes its close of this channel, so any advance that
+// races the FSN read still wakes the waiter via the closed channel.
+func (r *qwpSfSegmentRing) segmentRingAckNotify() <-chan struct{} {
+	r.ackNotifyMu.Lock()
+	defer r.ackNotifyMu.Unlock()
+	if r.ackNotify == nil {
+		r.ackNotify = make(chan struct{})
+	}
+	return r.ackNotify
+}
+
+// notifyAckAdvance wakes every current ack-notify subscriber and clears
+// the channel so the next subscriber lazily installs a fresh one. A
+// no-op (just the mutex) when nobody is waiting, which is the common
+// case — only AwaitAckedFsn subscribes.
+func (r *qwpSfSegmentRing) notifyAckAdvance() {
+	r.ackNotifyMu.Lock()
+	ch := r.ackNotify
+	r.ackNotify = nil
+	r.ackNotifyMu.Unlock()
+	if ch != nil {
+		close(ch)
 	}
 }
 
@@ -342,9 +388,14 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 		r.mu.Unlock()
 		r.active.Store(spare)
 		r.hotSpare.Store(nil)
+		// The freshly promoted active has no spare behind it yet, so
+		// re-arm its one-shot backup wakeup: a later high-water-mark
+		// crossing on this new segment must be able to nudge the manager
+		// again if the next spare is slow to arrive. The unconditional
+		// wakeup just below is the separate "make the next spare" signal.
+		r.wakeupRequestedForActive = false
 		// Fresh active just consumed the spare → ask the manager to
 		// start making the next one immediately.
-		r.wakeupRequestedForActive = true
 		if w := r.managerWakeup; w != nil {
 			w()
 		}

@@ -114,6 +114,64 @@ func TestQwpSfRingRotatesIntoHotSpare(t *testing.T) {
 	assert.True(t, r.needsHotSpare())
 }
 
+// TestQwpSfRingBackupWakeupRearmsPerActiveSegment pins the contract
+// that the high-water-mark backup wakeup nudges the segment manager
+// once per active segment: every freshly promoted active must re-arm
+// it so a stalled spare provision on the new segment can still be
+// rescued. A latch that survived rotation would fire the backup only
+// once over the ring's whole lifetime.
+func TestQwpSfRingBackupWakeupRearmsPerActiveSegment(t *testing.T) {
+	// 512-byte segments put the 75% mark at 384, leaving several
+	// 32-byte frames of room before the segment fills, so the active
+	// crosses its HWM well before it rotates.
+	const segSize int64 = 512
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	r := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = r.segmentRingClose() }()
+
+	var wakeups int
+	r.managerWakeup = func() { wakeups++ }
+
+	payload := make([]byte, 24) // 32 bytes on the wire with the frame header
+
+	// drivePastHwm appends until the active is past its high-water mark
+	// (plus one more to prove repeated crossings coalesce), asserting no
+	// rotation or backpressure happens along the way.
+	drivePastHwm := func() {
+		for r.getActiveSegment().publishedOffset() < r.signalAtBytes {
+			fsn := r.appendOrFsn(payload)
+			require.GreaterOrEqual(t, fsn, int64(0), "unexpected backpressure/oversize before HWM")
+		}
+		require.GreaterOrEqual(t, r.appendOrFsn(payload), int64(0))
+	}
+
+	// First active segment, no spare staged: the backup fires exactly
+	// once however many frames land past the mark.
+	drivePastHwm()
+	require.Equal(t, 1, wakeups, "first active should fire one backup wakeup")
+	require.True(t, r.wakeupRequestedForActive)
+
+	// Stage a spare and fill the rest so the next full-segment append
+	// rotates into it. Rotation must re-arm the per-segment backup.
+	spare, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	require.NoError(t, r.installHotSpare(spare))
+	for r.getActiveSegment() != spare {
+		fsn := r.appendOrFsn(payload)
+		require.NotEqual(t, qwpSfBackpressureNoSpare, fsn)
+		require.NotEqual(t, qwpSfPayloadTooLarge, fsn)
+	}
+	require.False(t, r.wakeupRequestedForActive, "rotation must re-arm the backup wakeup")
+
+	// Isolate the second active segment, then drive it past its own HWM
+	// (still no spare). The backup must fire again — the latched-flag bug
+	// suppressed this entirely.
+	wakeups = 0
+	drivePastHwm()
+	require.Equal(t, 1, wakeups, "freshly promoted active must re-fire its backup wakeup")
+}
+
 func TestQwpSfRingTrimsAckedSegments(t *testing.T) {
 	// Each segment fits exactly two minimal frames (16-byte payloads,
 	// 8-byte envelopes). 24 (header) + 2*(8+16) = 72.

@@ -738,6 +738,9 @@ func qwpFakeServer(conn net.Conn) {
 	}
 
 	// --- WebSocket frame loop ---
+	// seq is the next batch's cumulative ACK sequence, 0-based: the
+	// first batch (FSN 0) is acked as sequence 0, matching the real
+	// server and the producer's FSN numbering.
 	var seq uint64
 	var hdr [14]byte // max WS header size
 	for {
@@ -783,20 +786,22 @@ func qwpFakeServer(conn net.Conn) {
 			conn.Write([]byte{0x88, 0x02, 0x03, 0xE8})
 			return
 		case 0x02: // Binary frame — send QWP OK ACK.
-			seq++
 			var ack [13]byte
 			// Unmasked binary frame: FIN+BINARY=0x82, payload length=11.
 			ack[0] = 0x82
 			ack[1] = 0x0B
-			// Payload: status OK (0x00) + sequence (uint64 LE) +
-			// tableCount=0 (uint16 LE). The 2-byte zero-table-count
-			// trailer is required by the QWP §13 OK ACK shape.
+			// Payload: status OK (0x00) + cumulative sequence (uint64 LE)
+			// + tableCount=0 (uint16 LE). The 2-byte zero-table-count
+			// trailer is required by the QWP §13 OK ACK shape. The
+			// sequence is 0-based and built before the post-increment so
+			// dump mode exercises the same ACK path as production.
 			ack[2] = 0x00 // STATUS_OK
 			binary.LittleEndian.PutUint64(ack[3:], seq)
 			binary.LittleEndian.PutUint16(ack[11:], 0)
 			if _, err := conn.Write(ack[:]); err != nil {
 				return
 			}
+			seq++
 		}
 		// Ignore other opcodes (ping/pong handled by WS library).
 	}

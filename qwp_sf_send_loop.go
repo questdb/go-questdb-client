@@ -477,6 +477,15 @@ func (l *qwpSfSendLoop) sendLoopCheckError() error {
 	return l.checkErrorOrNil()
 }
 
+// sendLoopDone returns a channel closed when the I/O goroutine exits —
+// on graceful sendLoopClose and on every terminal HALT path alike
+// (run() closes it via defer). A blocked AwaitAckedFsn selects on it so
+// it stops waiting once ackedFsn can no longer advance, rather than
+// hanging until its ctx fires.
+func (l *qwpSfSendLoop) sendLoopDone() <-chan struct{} {
+	return l.done
+}
+
 func (l *qwpSfSendLoop) checkErrorOrNil() error {
 	if p := l.lastError.Load(); p != nil {
 		return *p

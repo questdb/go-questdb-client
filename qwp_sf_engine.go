@@ -339,6 +339,14 @@ func (e *qwpSfCursorEngine) engineAckedFsn() int64 {
 	return e.ring.segmentRingAckedFsn()
 }
 
+// engineAckNotify returns a channel closed the next time ackedFsn
+// advances. Lets AwaitAckedFsn block until a server ACK lands instead
+// of polling. See qwpSfSegmentRing.segmentRingAckNotify for the
+// subscribe-then-sample ordering callers must follow.
+func (e *qwpSfCursorEngine) engineAckNotify() <-chan struct{} {
+	return e.ring.segmentRingAckNotify()
+}
+
 // engineActiveSegment returns the current active mmap'd segment.
 // I/O thread accessor.
 func (e *qwpSfCursorEngine) engineActiveSegment() *qwpSfSegment {

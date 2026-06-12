@@ -862,24 +862,22 @@ func (s *qwpLineSender) AckedFsn() int64 {
 // AwaitAckedFsn implements QwpSender.AwaitAckedFsn. This is the
 // server-ACK confirmation primitive: Flush never blocks on ACKs
 // (Java decision #1), so callers wanting delivery confirmation pair
-// FlushAndGetSequence's returned FSN with this. Polls on a 5ms tick
-// — same cadence as waitCursorDrain — and surfaces send-loop
-// terminal errors synchronously so the caller can distinguish
-// "still in flight" from "permanently failed".
+// FlushAndGetSequence's returned FSN with this. It blocks until an ACK
+// advances ackedFsn to target — woken directly by the send loop's
+// ack-notify channel rather than a poll, so confirmation latency
+// tracks the ACK itself — or until the send loop dies, the sender is
+// closed, or ctx fires. Send-loop terminal errors surface
+// synchronously so the caller can distinguish "still in flight" from
+// "permanently failed".
 func (s *qwpLineSender) AwaitAckedFsn(ctx context.Context, target int64) error {
 	if s.closed.Load() {
 		return errClosedSenderFlush
 	}
-	if s.cursorEngine.engineAckedFsn() >= target {
-		return nil
-	}
-	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
-		return err
-	}
-	const pollInterval = 5 * time.Millisecond
-	tick := time.NewTicker(pollInterval)
-	defer tick.Stop()
 	for {
+		// Subscribe before sampling ackedFsn: acknowledge stores the new
+		// FSN before it closes this channel, so an ACK that lands between
+		// the sample below and the blocking select still wakes us.
+		ackCh := s.cursorEngine.engineAckNotify()
 		if s.cursorEngine.engineAckedFsn() >= target {
 			return nil
 		}
@@ -890,14 +888,27 @@ func (s *qwpLineSender) AwaitAckedFsn(ctx context.Context, target int64) error {
 			// Concurrent Close() stopped the send loop, so ackedFsn is
 			// frozen and will never advance. Re-check once in case the
 			// ACK landed between the read above and this load; otherwise
-			// fail fast rather than spin until ctx fires.
+			// fail fast rather than wait until ctx fires.
 			if s.cursorEngine.engineAckedFsn() >= target {
 				return nil
 			}
 			return errClosedSenderFlush
 		}
 		select {
-		case <-tick.C:
+		case <-ackCh:
+			// ackedFsn advanced — loop and re-test target.
+		case <-s.cursorSendLoop.sendLoopDone():
+			// The send loop exited: a HALT latched a terminal error or
+			// Close() tore it down, so ackedFsn is now frozen. A final
+			// ACK may have landed in the same instant, so re-test target
+			// before reporting the terminal error or closed state.
+			if s.cursorEngine.engineAckedFsn() >= target {
+				return nil
+			}
+			if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+				return err
+			}
+			return errClosedSenderFlush
 		case <-ctx.Done():
 			if s.cursorEngine.engineAckedFsn() >= target {
 				return nil
