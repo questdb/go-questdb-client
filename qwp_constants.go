@@ -214,13 +214,14 @@ const (
 	// as-is, and an explicit user opt-out (auto_flush_bytes=off / =0) is
 	// preserved even when a cap applies.
 	//
-	// Three hard guards back the soft clamp in enqueueCursor /
-	// atWithTimestamp, each dropping or rejecting with a typed error
-	// before the frame leaves the process: a per-row guard (any single
-	// row above the server cap), a flush-time server-cap guard, and a
-	// flush-time segment-cap guard (an encoded frame larger than a
-	// single segment can ever hold). The first two fire even when the
-	// user opted out of byte-size auto-flush.
+	// Hard guards back the soft clamp in enqueueCursor / atWithTimestamp,
+	// rejecting or splitting with a typed error before an over-cap frame
+	// leaves the process: a per-row guard (any single row above the
+	// server cap) rejects at At() time, and a flush-time cap check
+	// (against the server cap and the per-segment frame cap) re-encodes
+	// the batch one table per frame, flushing every table that fits on
+	// its own and dropping only a table that is individually over-cap.
+	// Both fire even when the user opted out of byte-size auto-flush.
 	qwpDefaultAutoFlushBytes = 8 * 1024 * 1024
 
 	// qwpDefaultInFlightWindow is the default maximum number of batches

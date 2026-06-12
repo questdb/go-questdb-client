@@ -451,10 +451,10 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	if err != nil {
 		// The only error here is "too many tables in one batch": the
 		// wire encodes the table count as a uint16, so this fails
-		// identically on every retry. Like the oversize-frame guards
-		// below, retaining the rows would re-fail forever and wedge the
-		// sender; drop them with a typed error naming the count so the
-		// sender stays usable.
+		// identically on every retry. Like an irreducible over-cap table
+		// in the per-table split below, retaining the rows would re-fail
+		// forever and wedge the sender; drop them with a typed error
+		// naming the count so the sender stays usable.
 		droppedRows := s.pendingRowCount
 		s.resetAfterFlush()
 		return fmt.Errorf("%w [droppedRows=%d]", err, droppedRows)
@@ -468,50 +468,24 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 		-1, // self-sufficient: full dict from id 0
 		s.batchMaxSymbolId,
 	)
-	// Defensive flush-time cap check: the per-row guard in
-	// atWithTimestamp catches individual oversize rows, but schema
-	// and dict-delta bytes the encoder adds at message-build time
-	// can push a batch of legitimately-sized rows above the wire
-	// cap. Without this check the frame would be enqueued and the
-	// send loop would emit a ws-close[1009 Message Too Big] after
-	// the producer already returned success. Unlike append-time
-	// errors that retain pending rows for the next flush, an
-	// oversize message will fail the same way on every retry — so
-	// we DROP all pending state in-place via resetAfterFlush and
-	// surface a clear typed error naming the dropped row count.
-	// The sender stays usable; the caller must re-batch with fewer
-	// rows per flush. Mirrors Java QwpWebSocketSender.flushPendingRows.
-	if cap := s.serverMaxBatchSize.Load(); cap > 0 && int64(len(encoded)) > int64(cap) {
-		droppedRows := s.pendingRowCount
-		msgSize := len(encoded)
-		s.resetAfterFlush()
-		return fmt.Errorf(
-			"qwp: batch too large for server batch cap [messageSize=%d, serverMaxBatchSize=%d, droppedRows=%d]",
-			msgSize, cap, droppedRows)
-	}
-	// Companion guard for the per-segment frame cap. The encoded frame
-	// must fit a single cursor segment (memory- or disk-backed): a
-	// larger frame can never be appended — engineAppendBlocking would
-	// return qwpSfErrPayloadTooLarge even against a freshly-rotated
-	// spare. Unlike a transient backpressure timeout (the wire will
-	// drain), this fails identically on every retry: the segment cap is
-	// fixed and there is no per-table split path (Java's flushPendingRows
-	// split was not ported). Retaining the rows (the contract for
-	// transient errors) would re-encode the same oversize frame on every
-	// subsequent flush and on Close, permanently wedging the sender and
-	// losing the batch. Drop it in place exactly like the server-cap
-	// guard above so the sender stays usable; the caller must send fewer
-	// rows per flush (or raise sf_max_bytes in store-and-forward mode).
-	// The byte-trigger clamp keeps normal operation well clear of this —
-	// it fires only on an auto-flush opt-out, a single oversize burst,
-	// or pathological symbol-dict growth.
-	if s.maxFrameBytes > 0 && int64(len(encoded)) > s.maxFrameBytes {
-		droppedRows := s.pendingRowCount
-		msgSize := len(encoded)
-		s.resetAfterFlush()
-		return fmt.Errorf(
-			"qwp: batch too large to fit one cursor segment [messageSize=%d, maxFrameBytes=%d, droppedRows=%d]; send fewer rows per flush (or raise sf_max_bytes)",
-			msgSize, s.maxFrameBytes, droppedRows)
+	// Flush-time cap check. The per-row guard in atWithTimestamp bounds
+	// individual rows, but the schema and dict-delta bytes the encoder
+	// adds at message-build time can push a batch of legitimately-sized
+	// rows past a wire cap — the server-advertised batch cap
+	// (serverMaxBatchSize) or the per-segment frame cap (maxFrameBytes,
+	// the largest payload one cursor segment holds). A combined frame
+	// over either cap cannot go out as-is: the server answers
+	// ws-close[1009 Message Too Big] and the engine can never append a
+	// frame larger than one segment.
+	//
+	// Such a frame is not doomed when it overruns only because it
+	// aggregates many tables: enqueueCursorSplit re-encodes each table as
+	// its own self-sufficient frame and appends every table that fits on
+	// its own, dropping only a table that is individually over-cap.
+	// Mirrors Java QwpWebSocketSender.flushPendingRows ->
+	// flushPendingRowsSplit.
+	if kind, _ := s.frameCapExceeded(len(encoded)); kind != qwpFrameCapNone {
+		return s.enqueueCursorSplit(ctx, tables)
 	}
 	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
 		return err
@@ -520,6 +494,147 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 		s.maxSentSymbolId = s.batchMaxSymbolId
 	}
 	return nil
+}
+
+// qwpFrameCapKind identifies which wire cap an encoded frame overruns.
+// Both caps treat a non-positive limit as "no limit".
+type qwpFrameCapKind int
+
+const (
+	qwpFrameCapNone    qwpFrameCapKind = iota // fits every active cap
+	qwpFrameCapServer                         // over the server-advertised batch cap
+	qwpFrameCapSegment                        // over the per-segment frame cap
+)
+
+// frameCapExceeded reports which wire cap, if any, an encoded frame of
+// frameLen bytes overruns. The server-advertised batch cap
+// (serverMaxBatchSize) is checked before the per-segment frame cap
+// (maxFrameBytes) so its diagnostics win when both bind; an appendable
+// frame must satisfy both. Returns (qwpFrameCapNone, 0) when the frame
+// fits. No allocation — safe on the flush hot path.
+func (s *qwpLineSender) frameCapExceeded(frameLen int) (qwpFrameCapKind, int64) {
+	if cap := int64(s.serverMaxBatchSize.Load()); cap > 0 && int64(frameLen) > cap {
+		return qwpFrameCapServer, cap
+	}
+	if s.maxFrameBytes > 0 && int64(frameLen) > s.maxFrameBytes {
+		return qwpFrameCapSegment, s.maxFrameBytes
+	}
+	return qwpFrameCapNone, 0
+}
+
+// enqueueCursorSplit is enqueueCursor's over-cap fallback: it re-encodes
+// each pending table as its own self-sufficient single-table frame and
+// appends every table whose frame fits a wire cap. A combined frame that
+// overruns a cap only because it aggregates many tables flushes in full
+// this way — one frame per table. Only a table whose own frame is still
+// over-cap is irreducible: re-encoding it on the next flush would fail
+// identically forever and wedge the sender, so its rows are dropped and
+// named in a typed error while every other table goes out. Mirrors Java
+// QwpWebSocketSender.flushPendingRowsSplit.
+//
+// Each single-table frame carries the full symbol dict from id 0 and the
+// full inline schema, exactly like the combined frame, so it replays
+// against a fresh server connection on its own.
+//
+// The retain-on-error contract holds per table: a table is reset only
+// once its frame is in a segment, so a transient engineAppendBlocking
+// failure (ring full + wire stalled, or ctx cancelled) retains the table
+// that failed and every table after it for the next flush, without
+// re-sending the tables already appended.
+func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTableBuffer) error {
+	var (
+		appended    int
+		droppedRows int
+		oversize    []string
+		worstKind   qwpFrameCapKind
+		worstCap    int64
+		worstSize   int
+		txErr       error
+	)
+	for _, tb := range tables {
+		if tb.rowCount == 0 {
+			continue
+		}
+		frame := s.encoder.encodeTableWithDeltaDict(
+			tb, s.globalSymbolList, -1, s.batchMaxSymbolId)
+		if kind, capVal := s.frameCapExceeded(len(frame)); kind != qwpFrameCapNone {
+			// Irreducible: a single table over the cap can never be sent.
+			// Drop it; the other tables are unaffected.
+			oversize = append(oversize, tb.tableName)
+			droppedRows += tb.rowCount
+			if len(frame) > worstSize {
+				worstKind, worstCap, worstSize = kind, capVal, len(frame)
+			}
+			tb.reset()
+			continue
+		}
+		if _, err := s.cursorEngine.engineAppendBlocking(ctx, frame); err != nil {
+			// Transient: retain this table and the unprocessed tail for
+			// the next flush. Tables already appended stay reset so they
+			// are not re-sent.
+			txErr = err
+			break
+		}
+		appended++
+		tb.reset()
+	}
+
+	if appended > 0 && s.batchMaxSymbolId > s.maxSentSymbolId {
+		s.maxSentSymbolId = s.batchMaxSymbolId
+	}
+
+	if txErr != nil {
+		// Retain-on-error: the failed and not-yet-reached tables still
+		// hold their rows. Bring the aggregate counters back in line with
+		// the surviving buffers; the caller must not reset on error.
+		s.recomputePendingFromBuffers()
+		return txErr
+	}
+
+	// Every table was appended or dropped, so all buffers are empty.
+	// Resetting here (rather than leaving it to the caller, as the
+	// single-frame success path does) keeps the producer counters
+	// consistent with the emptied buffers even when an irreducible-table
+	// error is returned or a caller skips its own post-flush reset.
+	s.resetAfterFlush()
+	if len(oversize) > 0 {
+		return s.oversizeTableError(worstKind, worstCap, worstSize, oversize, droppedRows)
+	}
+	return nil
+}
+
+// recomputePendingFromBuffers rebuilds the aggregate pending-row and
+// pending-byte counters from the table buffers, the source of truth.
+// Used after a partial flush — a per-table split that stopped on a
+// transient append failure — where some buffers were reset and others
+// still hold rows. The designated-timestamp cache is dropped so the next
+// row re-resolves it against whichever table buffer survives.
+func (s *qwpLineSender) recomputePendingFromBuffers() {
+	rows, bytes := 0, 0
+	for _, tb := range s.tableBuffers {
+		rows += tb.rowCount
+		bytes += tb.approxDataSize()
+	}
+	s.pendingRowCount = rows
+	s.pendingBytes = bytes
+	s.cachedDesignatedTs = nil
+}
+
+// oversizeTableError builds the typed error returned when the per-table
+// split dropped one or more individually-over-cap tables. It names the
+// binding cap of the largest dropped frame, lists the dropped tables,
+// and reports the total dropped row count.
+func (s *qwpLineSender) oversizeTableError(kind qwpFrameCapKind, capVal int64, msgSize int, tables []string, droppedRows int) error {
+	switch kind {
+	case qwpFrameCapServer:
+		return fmt.Errorf(
+			"qwp: batch too large for server batch cap, even split per table [oversizeTables=%v, messageSize=%d, serverMaxBatchSize=%d, droppedRows=%d]",
+			tables, msgSize, capVal, droppedRows)
+	default: // qwpFrameCapSegment
+		return fmt.Errorf(
+			"qwp: batch too large to fit one cursor segment, even split per table [oversizeTables=%v, messageSize=%d, maxFrameBytes=%d, droppedRows=%d]; send fewer rows per flush (or raise sf_max_bytes)",
+			tables, msgSize, capVal, droppedRows)
+	}
 }
 
 // buildTableEncodeInfo collects non-empty tables for encoding.

@@ -36,16 +36,15 @@ import (
 )
 
 // TestQwpSegmentCapGuardDropsOversizeBatch is the regression test for
-// the self-wedging cursor sender: a flush whose encoded frame exceeds
-// the per-segment byte cap must be DROPPED with a typed error, not
-// retained forever.
+// the self-wedging cursor sender on the irreducible single-table case: a
+// flush whose only table encodes to a frame larger than the per-segment
+// byte cap must be DROPPED with a typed error, not retained forever.
 //
-// Before the fix, enqueueCursor returned qwpSfErrPayloadTooLarge while
-// retaining the pending rows (the retain-on-error contract meant for
-// transient backpressure). Because the segment cap never grows and
-// there is no per-table split path, every subsequent Flush re-encoded
-// the same (or larger) frame and failed identically forever, and Close
-// re-ran the same doomed enqueue and lost the batch. This pins the
+// The per-table split can rescue a multi-table batch that overruns the
+// cap only by aggregation (TestQwpSplitFlush* covers that), but a lone
+// table over the cap is irreducible: the segment cap never grows, so
+// re-encoding it on every subsequent Flush — and on Close — would fail
+// identically forever and lose the batch anyway. This pins the
 // recoverable behavior: the over-cap batch is dropped in place and the
 // sender stays usable. Segment-cap analogue of TestQwpFlushTimeGuardFires.
 func TestQwpSegmentCapGuardDropsOversizeBatch(t *testing.T) {
