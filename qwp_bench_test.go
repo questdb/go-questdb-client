@@ -282,6 +282,88 @@ func TestQwpSenderSteadyStateNullsZeroAllocs(t *testing.T) {
 	}
 }
 
+// qwpSteadyStateSetupMixedCase mirrors qwpSteadyStateSetupWithNulls but
+// gives every column a mixed-case name. The column index is keyed by the
+// lowercase name, so each cursor miss — which the sparse null pattern
+// guarantees — reaches the map lookup. That lookup stays allocation-free
+// for mixed-case writers via the ASCII-fold cursor compare, the cursor
+// resync on a map hit, and the memoized casing-variant alias keys.
+// Without them strings.ToLower allocates a fresh lowercase key on every
+// cursor-miss column, every row.
+func qwpSteadyStateSetupMixedCase() (*qwpLineSender, func()) {
+	ctx := context.Background()
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	s := &qwpLineSender{
+		tableBuffers:     make(map[string]*qwpTableBuffer),
+		globalSymbols:    make(map[string]int32),
+		maxSentSymbolId:  -1,
+		batchMaxSymbolId: -1,
+	}
+
+	s.globalSymbols["AAPL"] = 0
+	s.globalSymbolList = append(s.globalSymbolList, "AAPL")
+	s.batchMaxSymbolId = 0
+
+	iter := func() {
+		for r := 0; r < 10; r++ {
+			b := s.Table("t").Symbol("Sym", "AAPL")
+			if r%3 != 0 {
+				b = b.Int64Column("Qty", int64(100+r))
+			}
+			b = b.Float64Column("Price", 150.5+float64(r))
+			if r%2 == 0 {
+				b = b.StringColumn("Note", "test")
+			}
+			b = b.BoolColumn("Active", r%2 == 0)
+			if err := b.At(ctx, ts.Add(time.Duration(r)*time.Microsecond)); err != nil {
+				panic(err)
+			}
+		}
+		tables, _ := s.buildTableEncodeInfo()
+		s.encoder.encodeMultiTableWithDeltaDict(
+			tables,
+			s.globalSymbolList,
+			s.maxSentSymbolId,
+			s.batchMaxSymbolId,
+		)
+		s.resetAfterFlush()
+	}
+
+	iter()
+	iter()
+	return s, iter
+}
+
+// BenchmarkQwpSenderSteadyStateMixedCase is the mixed-case counterpart
+// of BenchmarkQwpSenderSteadyStateNulls: the same sparse null pattern,
+// but the column names carry uppercase letters so the run exercises the
+// case-fold lookup path.
+func BenchmarkQwpSenderSteadyStateMixedCase(b *testing.B) {
+	_, iter := qwpSteadyStateSetupMixedCase()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		iter()
+	}
+}
+
+// TestQwpSenderSteadyStateMixedCaseZeroAllocs pins the 0-allocs/op
+// invariant for mixed-case column names. The all-lowercase steady-state
+// pins do not cover it: strings.ToLower returns its input unchanged for
+// a lowercase name, so only an uppercase letter exposes a per-column key
+// allocation on the cursor-miss path. See sibling tests for the -race
+// caveat.
+func TestQwpSenderSteadyStateMixedCaseZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
+	_, iter := qwpSteadyStateSetupMixedCase()
+	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
+		t.Fatalf("steady-state-mixed-case allocs/op = %g, want 0", allocs)
+	}
+}
+
 // BenchmarkQwpColumnAdd measures per-column add throughput.
 func BenchmarkQwpColumnAdd(b *testing.B) {
 	b.Run("Long", func(b *testing.B) {

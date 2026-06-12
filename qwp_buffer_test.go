@@ -1039,6 +1039,113 @@ func TestQwpTableBufferGetOrCreateColumn(t *testing.T) {
 		}
 	})
 
+	t.Run("MixedCaseCursorResync", func(t *testing.T) {
+		// After a sparse skip forces the sequential cursor off the
+		// fast path, a map hit resyncs the cursor to idx+1 so the rest
+		// of the row's columns resolve on the fast path again — even
+		// when each is written with a different ASCII casing.
+		tb := newQwpTableBuffer("t")
+		for i, n := range []string{"Aa", "Bb", "Cc", "Dd"} {
+			col, err := tb.getOrCreateColumn(n, qwpTypeLong, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			col.addLong(int64(i))
+		}
+		tb.commitRow() // cursor reset to 0
+
+		// "aA" hits the ASCII-fold fast path (cursor 0 → 1).
+		if _, err := tb.getOrCreateColumn("aA", qwpTypeLong, false); err != nil {
+			t.Fatal(err)
+		}
+		if tb.columnAccessCursor != 1 {
+			t.Fatalf("cursor = %d after fold-match on idx 0, want 1", tb.columnAccessCursor)
+		}
+		// Skip "Bb": "cC" misses the cursor (it points at Bb), resolves
+		// via the map to column 2, and resyncs the cursor to 3.
+		c, err := tb.getOrCreateColumn("cC", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c != tb.columns[2] {
+			t.Fatal("cC resolved to the wrong column")
+		}
+		if tb.columnAccessCursor != 3 {
+			t.Fatalf("cursor = %d after map hit on idx 2, want 3 (resync)", tb.columnAccessCursor)
+		}
+		// "dD" now hits the resynced fast path (cursor 3 → 4).
+		d, err := tb.getOrCreateColumn("dD", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d != tb.columns[3] {
+			t.Fatal("dD resolved to the wrong column")
+		}
+		if tb.columnAccessCursor != 4 {
+			t.Fatalf("cursor = %d after fold-match on idx 3, want 4", tb.columnAccessCursor)
+		}
+		if len(tb.columns) != 4 {
+			t.Fatalf("columns len = %d, want 4 (no parallel case-vary'd columns)", len(tb.columns))
+		}
+	})
+
+	t.Run("MixedCaseAliasClearedOnCancel", func(t *testing.T) {
+		// A casing-variant alias memoized into columnIndex maps to a
+		// column index. cancelRow must drop it when it removes the
+		// column — otherwise a later lookup dereferences a dangling
+		// index. The reset() case is the sharp edge: it retains columns
+		// but zeroes committedColumnCount, so the next cancelRow removes
+		// every column.
+		tb := newQwpTableBuffer("t")
+		c0, err := tb.getOrCreateColumn("Aa", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c0.addLong(1)
+		tb.commitRow()
+
+		// Force "aA" off the fast path so it resolves via the map and
+		// memoizes a casing-variant alias of the canonical key "aa".
+		tb.columnAccessCursor = 1
+		if _, err := tb.getOrCreateColumn("aA", qwpTypeLong, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := tb.columnIndex["aA"]; !ok {
+			t.Fatal("expected memoized alias key \"aA\"")
+		}
+
+		// reset() keeps the column but zeroes committedColumnCount, so
+		// the partial row below plus cancelRow wipes every column.
+		tb.reset()
+		nb, err := tb.getOrCreateColumn("Bb", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nb.addLong(2)
+		tb.cancelRow()
+
+		if len(tb.aliasKeys) != 0 {
+			t.Fatalf("aliasKeys = %v, want empty after wipe-cancel", tb.aliasKeys)
+		}
+		if _, ok := tb.columnIndex["aA"]; ok {
+			t.Fatal("stale alias \"aA\" survived cancelRow that wiped its column")
+		}
+		if len(tb.columns) != 0 {
+			t.Fatalf("columns len = %d, want 0 after wipe-cancel", len(tb.columns))
+		}
+
+		// Re-adding by the aliased casing must create a fresh column,
+		// not index past the emptied slice via the dropped alias.
+		re, err := tb.getOrCreateColumn("aA", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		re.addLong(3)
+		if tb.columnIndex["aa"] != 0 || tb.columns[0] != re {
+			t.Fatal("re-added column not registered at the canonical key")
+		}
+	})
+
 	t.Run("BackfillOnCreate", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
 

@@ -801,7 +801,21 @@ type qwpTableBuffer struct {
 	// Mirrors Java QwpTableBuffer.columnNameToIndex
 	// (LowerCaseCharSequenceIntHashMap). The column's own .name
 	// stays case-preserved (first-seen casing) for wire emission.
+	//
+	// It may also hold memoized casing-variant alias keys (a verbatim
+	// mixed-case name aliased to a column's canonical lowercase key) so
+	// repeat lookups of a mixed-case column skip strings.ToLower. Alias
+	// keys always carry an uppercase letter, so they never collide with
+	// the all-lowercase canonical keys. See getOrCreateColumn.
 	columnIndex map[string]int
+
+	// aliasKeys records the casing-variant keys memoized into
+	// columnIndex. cancelRow drops them when it removes columns: an
+	// alias maps to a column index that the truncation (or the
+	// committedColumnCount==0 reset case, which removes every column)
+	// can leave dangling past the columns slice. They re-memoize on
+	// demand.
+	aliasKeys []string
 
 	// rowCount is the number of committed (finalized) rows.
 	rowCount int
@@ -835,6 +849,42 @@ func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 	}
 }
 
+// qwpASCIIEqualFold reports whether a and b are equal under ASCII
+// case folding: bytes 'A'–'Z' and 'a'–'z' compare equal ignoring
+// case, every other byte must match verbatim. This matches QuestDB's
+// column-name case-insensitivity, which folds ASCII only (Java
+// Chars.toLowerCaseAscii / LowerCaseCharSequenceIntHashMap).
+//
+// It is a sound accelerator for the lowercase-keyed columnIndex: an
+// ASCII letter is never a UTF-8 continuation byte, so fold-equal
+// inputs differ only in the case of standalone ASCII letters, and
+// strings.ToLower maps them to the same key. A fast-path match
+// therefore never disagrees with the authoritative map lookup, and a
+// non-match falls through to it.
+func qwpASCIIEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca == cb {
+			continue
+		}
+		// The bytes differ. They are ASCII case-folds of each other
+		// only if they differ solely in bit 5 (the 0x20 case bit) and
+		// the folded byte is a letter. The letter check is essential:
+		// OR-ing 0x20 also pairs legal name punctuation ('@'↔'`',
+		// '['↔'{', ']'↔'}', '^'↔'~'), which must not compare equal.
+		if ca^cb != 0x20 {
+			return false
+		}
+		if lower := ca | 0x20; lower < 'a' || lower > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
 // getOrCreateColumn looks up an existing column by name or creates a
 // new one. Returns an error if a column with the same name but a
 // different type already exists, or if the column was already set
@@ -842,10 +892,12 @@ func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, nullable bool) (*qwpColumnBuffer, error) {
 	// Fast path: predict the next column in sequence. When columns are
 	// set in the same order every row, this avoids the map lookup
-	// entirely. Falls through to the map on name mismatch.
+	// entirely. The compare is ASCII case-insensitive (column names
+	// fold case), so a mixed-case writer keeps the fast path without
+	// allocating a lowercase key. Falls through to the map on mismatch.
 	if tb.columnAccessCursor < len(tb.columns) {
 		col := tb.columns[tb.columnAccessCursor]
-		if col.name == name {
+		if qwpASCIIEqualFold(col.name, name) {
 			if col.typeCode != typeCode {
 				return nil, fmt.Errorf(
 					"qwp: column %q type conflict: existing %d, got %d",
@@ -860,11 +912,23 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 		}
 	}
 
-	// strings.ToLower returns the same string (no allocation) when
-	// the input is already all-lowercase, so the zero-allocs benchmark
-	// path (lowercase column names — the convention) is unaffected.
-	key := strings.ToLower(name)
-	idx, exists := tb.columnIndex[key]
+	// Slow path. Probe with the name verbatim first: it hits the
+	// canonical lowercase key for all-lowercase names (the convention)
+	// and any memoized casing-variant alias, so the common case never
+	// calls strings.ToLower — which allocates a fresh key for a name
+	// with an uppercase letter, on every cursor-miss column, every row.
+	idx, exists := tb.columnIndex[name]
+	if !exists {
+		lower := strings.ToLower(name)
+		if idx, exists = tb.columnIndex[lower]; exists && lower != name {
+			// Memoize the verbatim casing as an alias of the canonical
+			// key so the next row's lookup by this casing hits the probe
+			// above without re-lowercasing. aliasKeys records it so
+			// cancelRow can drop it when it removes columns.
+			tb.columnIndex[name] = idx
+			tb.aliasKeys = append(tb.aliasKeys, name)
+		}
+	}
 	if exists {
 		col := tb.columns[idx]
 		if col.typeCode != typeCode {
@@ -877,6 +941,11 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 		if col.rowCount > tb.rowCount {
 			return nil, fmt.Errorf("qwp: column %q already set for current row", name)
 		}
+		// Resync the sequential cursor: after a sparse skip the caller
+		// most likely continues in column-definition order, so predict
+		// idx+1 next. This restores the allocation-free fast path for the
+		// rest of the row instead of a map lookup per remaining column.
+		tb.columnAccessCursor = idx + 1
 		return col, nil
 	}
 
@@ -903,7 +972,7 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 		col.addNull()
 	}
 
-	tb.columnIndex[key] = len(tb.columns)
+	tb.columnIndex[strings.ToLower(name)] = len(tb.columns)
 	tb.columns = append(tb.columns, col)
 	return col, nil
 }
@@ -969,6 +1038,15 @@ func (tb *qwpTableBuffer) cancelRow() {
 			delete(tb.columnIndex, strings.ToLower(tb.columns[i].name))
 		}
 		tb.columns = tb.columns[:tb.committedColumnCount]
+		// Drop memoized casing-variant aliases. Each maps to a column
+		// index that the truncation above can leave dangling (and when
+		// committedColumnCount==0 after reset, every column is removed).
+		// Alias keys carry an uppercase letter, so deleting them never
+		// touches the all-lowercase canonical keys of surviving columns.
+		for _, k := range tb.aliasKeys {
+			delete(tb.columnIndex, k)
+		}
+		tb.aliasKeys = tb.aliasKeys[:0]
 	}
 
 	// Truncate any columns that were set during this row.
