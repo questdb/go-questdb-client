@@ -24,7 +24,11 @@
 
 package questdb
 
-import "github.com/coder/websocket"
+import (
+	"log"
+
+	"github.com/coder/websocket"
+)
 
 // qwpSfClassify maps a QWP server response status byte to a Category.
 // Wire codes are 1:1 with the categories the server distinguishes;
@@ -121,6 +125,28 @@ type qwpSfPolicyResolver struct {
 	global   Policy
 }
 
+// callResolver invokes the user-supplied resolver under a panic guard.
+// The resolver runs on the receiver goroutine, so a panicking
+// WithErrorPolicyResolver callback would otherwise crash the host. A
+// panic is treated as a user bug: recover, log, and fall back to the
+// spec default for the category. That default is always a concrete
+// Halt / DropAndContinue (never PolicyAuto), so resolve's
+// `!= PolicyAuto` check short-circuits the rest of the precedence chain
+// — a broken resolver yields the safe spec policy rather than silently
+// deferring to lower-precedence slots. A clean return is propagated
+// verbatim, including PolicyAuto, which lets resolve fall through.
+//
+// Mirrors the handler panic guard in qwpSfErrorDispatcher.deliver.
+func (r *qwpSfPolicyResolver) callResolver(c Category) (pol Policy) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[ERROR] qwp/sf: error policy resolver panicked on category %s: %v", c, rec)
+			pol = qwpSfDefaultPolicyFor(c)
+		}
+	}()
+	return r.resolver(c)
+}
+
 // resolve returns the Policy to apply for the given Category.
 // PolicyAuto is never returned — every category resolves to a concrete
 // Halt or DropAndContinue choice.
@@ -132,7 +158,7 @@ func (r *qwpSfPolicyResolver) resolve(c Category) Policy {
 	}
 	if r != nil {
 		if r.resolver != nil {
-			if p := r.resolver(c); p != PolicyAuto {
+			if p := r.callResolver(c); p != PolicyAuto {
 				return p
 			}
 		}

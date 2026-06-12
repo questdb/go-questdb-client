@@ -161,6 +161,30 @@ func TestQwpSfPolicyResolverPrecedence(t *testing.T) {
 		}
 	})
 
+	t.Run("panicking resolver falls back to spec default", func(t *testing.T) {
+		// A per-category override is set, but the panic short-circuits
+		// to the spec default rather than falling through to it: a
+		// broken resolver must not silently defer to lower-precedence
+		// slots. SchemaMismatch's spec default is DropAndContinue.
+		r := &qwpSfPolicyResolver{}
+		r.perCat[CategorySchemaMismatch] = PolicyHalt
+		r.resolver = func(Category) Policy { panic("boom") }
+		if got := r.resolve(CategorySchemaMismatch); got != PolicyDropAndContinue {
+			t.Errorf("panicking resolver SchemaMismatch = %s, want DropAndContinue (spec default)", got)
+		}
+	})
+
+	t.Run("panicking resolver does not crash the caller", func(t *testing.T) {
+		// The receiver goroutine invokes resolve directly; a panic that
+		// escapes would take down the host process. ParseError's spec
+		// default is Halt.
+		r := &qwpSfPolicyResolver{}
+		r.resolver = func(Category) Policy { panic("boom") }
+		if got := r.resolve(CategoryParseError); got != PolicyHalt {
+			t.Errorf("panicking resolver ParseError = %s, want Halt (spec default)", got)
+		}
+	})
+
 	t.Run("ProtocolViolation forced Halt regardless", func(t *testing.T) {
 		r := &qwpSfPolicyResolver{global: PolicyDropAndContinue}
 		r.perCat[CategoryProtocolViolation] = PolicyDropAndContinue
