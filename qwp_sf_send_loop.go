@@ -196,6 +196,15 @@ type qwpSfSendLoop struct {
 	// receiver goroutine's reads (and the reset paths re-seed it
 	// between connections), so it must be atomic.
 	highestFullySent atomic.Int64
+	// serverAckedSeq is the highest cumulative wire sequence the server
+	// has OK-ACK'd on the current connection, or -1 before the first
+	// ACK. Reset to -1 on every (re)connect alongside highestFullySent.
+	// Written by the receiver goroutine; read in applyAckWatermark.
+	// Paired with highestFullySent: the engine's ACK cursor advances to
+	// the lesser of the two (see applyAckWatermark), reconciling the
+	// receiver's ACK against the sender's send-completion no matter which
+	// of the two — written on separate goroutines — lands last.
+	serverAckedSeq atomic.Int64
 	// sendingSegment / sendOffset track the cursor inside the
 	// engine's segment chain. Producer-only state.
 	sendingSegment *qwpSfSegment
@@ -334,9 +343,11 @@ func qwpSfNewSendLoop(
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
 	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
 	l.transport.Store(transport)
-	// Seed the "nothing fully sent yet" sentinel; positionCursorForStart
-	// and swapClient re-establish it on every (re)connect.
+	// Seed the "nothing fully sent yet" / "nothing ACK'd yet" sentinels;
+	// positionCursorForStart and swapClient re-establish both on every
+	// (re)connect.
 	l.highestFullySent.Store(-1)
+	l.serverAckedSeq.Store(-1)
 	// Wire the producer's per-publish doorbell. Set here (before
 	// sendLoopStart and before any producer append) so it satisfies
 	// the ring's "set once before producing starts" contract, and so
@@ -603,6 +614,7 @@ func (l *qwpSfSendLoop) positionCursorForStart() error {
 	l.fsnAtZero.Store(replayStart)
 	l.nextWireSeq.Store(0)
 	l.highestFullySent.Store(-1)
+	l.serverAckedSeq.Store(-1)
 	l.framesSentOnConn.Store(0)
 	return l.positionCursorAt(replayStart)
 }
@@ -1004,6 +1016,11 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 	// the segment while the payload slice we handed sendMessage still
 	// points into it.
 	l.highestFullySent.Store(wireSeq)
+	// An ACK for this frame may already have landed and been held back
+	// while highestFullySent still trailed it; reconcile now that the
+	// watermark is published so a quiescent last frame — whose ACK has
+	// no later ACK to re-drive it — does not strand its acknowledgement.
+	l.applyAckWatermark()
 	l.sendOffset = frameEnd
 	l.totalFramesSent.Add(1)
 	l.framesSentOnConn.Add(1)
@@ -1037,6 +1054,39 @@ func (l *qwpSfSendLoop) advanceSegment() *qwpSfSegment {
 		return first
 	}
 	return liveActive
+}
+
+// applyAckWatermark advances the engine's ACK cursor to the lesser of
+// the server's cumulative ACK sequence (serverAckedSeq, owned by the
+// receiver) and the highest wire sequence whose send has fully returned
+// (highestFullySent, owned by the sender), mapped through fsnAtZero.
+// Both inputs are monotonic within a connection but written on separate
+// goroutines, so it is called from both: by the receiver as each ACK
+// lands, and by the sender right after it publishes a fresh
+// highestFullySent. Whichever store completes last observes both values
+// and drives the advance — closing the race where the ACK for the only
+// in-flight frame arrives before the send completes and would otherwise
+// be stranded (no later ACK to re-drive it, leaving engineAckedFsn
+// below publishedFsn forever).
+//
+// The min is the munmap-safety clamp: capping at highestFullySent keeps
+// ackedFsn off any frame the send goroutine is still reading out of the
+// mmap'd segment, and off a frame a wire failure dropped before
+// delivery — so a non-compliant server's early or forged ACK cannot
+// move the watermark past what we have actually put on the wire.
+// engineAcknowledge is monotonic, idempotent, and clamps to
+// publishedFsn internally, so the concurrent calls from the two
+// goroutines are safe and a stale-lower min is ignored.
+func (l *qwpSfSendLoop) applyAckWatermark() {
+	sent := l.highestFullySent.Load()
+	acked := l.serverAckedSeq.Load()
+	if sent < 0 || acked < 0 {
+		return
+	}
+	if acked > sent {
+		acked = sent
+	}
+	l.engine.engineAcknowledge(l.fsnAtZero.Load() + acked)
 }
 
 // receiverLoop reads ACKs from the WebSocket and routes them to
@@ -1168,23 +1218,18 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			l.totalAcks.Add(1)
 			continue
 		}
-		// Sanity: don't trust an ACK beyond the frames whose
-		// sendMessage has fully returned. A malformed, early, or
-		// forged server response could otherwise advance ackedFsn over
-		// an in-flight frame and force a trim (munmap) of a segment the
-		// I/O thread is still reading, or mark a never-delivered frame
-		// acked. highestFullySent is stored only after sendMessage
-		// returns, so it never covers the in-flight frame.
-		highestSent := l.highestFullySent.Load()
-		if highestSent < 0 {
-			continue
-		}
-		capped := seq
-		if capped > highestSent {
-			capped = highestSent
-		}
-		l.engine.engineAcknowledge(l.fsnAtZero.Load() + capped)
+		// Record the server's cumulative ACK sequence, then reconcile it
+		// against highestFullySent. applyAckWatermark caps the advance at
+		// the last fully-sent frame, so a malformed, early, or forged
+		// server response can never move ackedFsn over an in-flight frame
+		// (a trim would munmap a segment the I/O thread is still reading)
+		// nor over a frame a wire failure dropped before delivery. The
+		// matching call on the send side re-drives the same reconciliation
+		// so an ACK that arrives before its frame's send completes is not
+		// stranded when no later ACK follows it.
+		l.serverAckedSeq.Store(seq)
 		l.totalAcks.Add(1)
+		l.applyAckWatermark()
 	}
 }
 
@@ -1284,9 +1329,9 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 
 // swapClient replaces the active transport, realigns fsnAtZero to
 // the next unacked FSN, restarts wire sequencing from 0 (clearing the
-// fully-sent watermark), and repositions the cursor so the next
-// trySendOne call replays the first unacked frame. Returns a non-nil
-// error if the cursor walk hits a corrupt frame header; see
+// fully-sent and server-ACK'd watermarks), and repositions the cursor
+// so the next trySendOne call replays the first unacked frame. Returns
+// a non-nil error if the cursor walk hits a corrupt frame header; see
 // positionCursorAt.
 //
 // On success, fires onTransportSwap (if installed) with the new
@@ -1305,6 +1350,7 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	l.fsnAtZero.Store(replayStart)
 	l.nextWireSeq.Store(0)
 	l.highestFullySent.Store(-1)
+	l.serverAckedSeq.Store(-1)
 	l.framesSentOnConn.Store(0)
 	pubAtSwap := l.engine.enginePublishedFsn()
 	if pubAtSwap >= replayStart {
