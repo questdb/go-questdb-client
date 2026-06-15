@@ -1241,6 +1241,60 @@ func TestQwpEncoderGeohashAllNull(t *testing.T) {
 	}
 }
 
+func TestQwpEncoderGeohashNonNullableAllNull(t *testing.T) {
+	// A non-nullable all-null geohash column never establishes a
+	// precision, yet addNull stores a sentinel per row, so
+	// valueCount()==rowCount. The encoder must clamp the precision to the
+	// minimum valid value AND still emit one value per row — gating the
+	// value bytes on the (never-established) precision instead of on
+	// valueCount() would produce a short frame the server rejects.
+	//
+	// Unreachable via the public API (GeohashColumn establishes precision
+	// on the creating row); this exercises the encoder's defense-in-depth
+	// directly against the buffer.
+	tb := newQwpTableBuffer("t")
+	col, _ := tb.getOrCreateColumn("g", qwpTypeGeohash, false)
+	col.addNull()
+	tb.commitRow()
+	col, _ = tb.getOrCreateColumn("g", qwpTypeGeohash, false)
+	col.addNull()
+	tb.commitRow()
+
+	var enc qwpEncoder
+	msg := enc.encodeTable(tb)
+
+	// Skip to column data.
+	off := qwpHeaderSize + 2 // +2 for empty delta symbol dictionary
+	off += 2                 // table name "t"
+	off += 1                 // rowCount=2
+	off += 1                 // colCount=1
+	off += 1 + 1 + 1         // col "g": varint(1) + "g" + type
+
+	// Null bitmap flag: 0x00 (non-nullable column carries no bitmap).
+	if msg[off] != 0x00 {
+		t.Fatalf("null bitmap flag = 0x%02X, want 0x00", msg[off])
+	}
+	off++
+
+	// Precision varint: clamped to 1 (minimum valid), never 0.
+	if msg[off] != 0x01 {
+		t.Fatalf("precision varint = 0x%02X, want 0x01", msg[off])
+	}
+	off++
+
+	// Precision 1 → 1 byte per value; one sentinel byte per row. The
+	// geohash null sentinel is all-bits-set, so the low byte is 0xFF.
+	expected := []byte{0xFF, 0xFF}
+	if !bytes.Equal(msg[off:off+2], expected) {
+		t.Fatalf("value bytes = %x, want %x", msg[off:off+2], expected)
+	}
+	off += 2
+
+	if off != len(msg) {
+		t.Fatalf("unconsumed bytes: off=%d, len=%d", off, len(msg))
+	}
+}
+
 func TestQwpEncoderGeohashPrecision8(t *testing.T) {
 	// Precision=8 bits → exactly 1 byte per row.
 	tb := newQwpTableBuffer("t")

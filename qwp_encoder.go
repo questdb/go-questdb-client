@@ -378,19 +378,25 @@ func (e *qwpEncoder) encodeTimestampColumn(col *qwpColumnBuffer) {
 func (e *qwpEncoder) encodeGeohashColumn(col *qwpColumnBuffer) {
 	precision := col.geohashPrecision
 	if precision <= 0 {
-		// No precision established (column has only nulls).
+		// No row established a precision (the column holds only nulls).
 		// The server validates precision against [1, 60]
-		// (QwpGeoHashColumnCursor.of) even for all-null
-		// columns and rejects the whole message otherwise, so
-		// emit the minimum valid precision. valueCount() is 0
-		// here, so no per-row data follows. Mirrors the Java
-		// client's QwpColumnWriter.writeGeoHashColumn clamp.
-		e.wb.putVarint(1)
-		return
+		// (QwpGeoHashColumnCursor.of) even for all-null columns and
+		// rejects the whole message otherwise, so emit the minimum valid
+		// precision. Mirrors the Java client's
+		// QwpColumnWriter.writeGeoHashColumn clamp.
+		precision = 1
 	}
 
 	e.wb.putVarint(uint64(precision))
 
+	// The value loop is bounded by valueCount(), not short-circuited on
+	// the clamp above: a nullable all-null column has valueCount()==0, so
+	// nothing follows the precision varint; a non-nullable column stores a
+	// sentinel per row (valueCount()==rowCount), so those bytes must still
+	// reach the wire or the column data is short. The non-nullable
+	// all-null case is unreachable through the public API — GeohashColumn
+	// establishes precision on the row that creates the column — so the
+	// clamp is defense-in-depth.
 	vc := col.valueCount()
 	valueSize := (int(precision) + 7) / 8
 	for i := 0; i < vc; i++ {
