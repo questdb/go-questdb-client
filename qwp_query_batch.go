@@ -1164,10 +1164,9 @@ func (b *QwpColumnBatch) CopyAll() *QwpColumnBatch {
 		dst.info = src.info
 		dst.scale = src.scale
 		dst.precisionBits = src.precisionBits
-		// nullBitmap: aliases payload for server-sent bitmaps; owned heap
-		// buffer after array nDims=0 NULL promotion. Either way, retaining
-		// the slice header keeps the backing array reachable for the life
-		// of the copied batch.
+		// nullBitmap aliases the payload (server-sent bitmap); rebinding
+		// the slice header onto the clone keeps the backing array
+		// reachable for the life of the copied batch.
 		dst.nullBitmap = rebindIfAliased(src.nullBitmap, srcPayload, clonedPayload)
 		dst.nonNullCount = src.nonNullCount
 		dst.nonNullIdx = slices.Clone(src.nonNullIdx)
@@ -1194,13 +1193,12 @@ func (b *QwpColumnBatch) CopyAll() *QwpColumnBatch {
 }
 
 // rebindIfAliased returns src unchanged when it doesn't alias
-// srcPayload — heap-owned slices (`int64sAsBytes(timestampBuf)`,
-// promoted array null bitmaps) fall through as-is so the caller's
-// follow-up branches can re-point them explicitly. When src does
-// alias, the function translates its offset+length onto clonedPayload
-// so the snapshot references the clone rather than the source's
-// reusable buffer. The empty-src early return guards the &src[0]
-// address read below.
+// srcPayload — heap-owned slices (`int64sAsBytes(timestampBuf)`) fall
+// through as-is so the caller's follow-up branches can re-point them
+// explicitly. When src does alias, the function translates its
+// offset+length onto clonedPayload so the snapshot references the
+// clone rather than the source's reusable buffer. The empty-src early
+// return guards the &src[0] address read below.
 func rebindIfAliased(src, srcPayload, clonedPayload []byte) []byte {
 	if len(src) == 0 {
 		return src
