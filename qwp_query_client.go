@@ -897,7 +897,7 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryO
 			// routes through the session so it targets the live
 			// generation's request_id even after a transparent
 			// failover reconnect.
-			c.io().releaseBuffer(ev.batch)
+			ev.batch.release()
 			session.requestCancel()
 			cleanupCtx, cancel := context.WithTimeout(
 				context.Background(), qwpQueryCleanupDrainTimeout)
@@ -1140,7 +1140,7 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 					// defer q.Close() would otherwise be a no-op and
 					// leave the dispatcher stranded.
 					defer func() {
-						q.client.io().releaseBuffer(ev.batch)
+						ev.batch.release()
 						if r := recover(); r != nil {
 							q.cancelAndDrainOnCleanupCtx()
 							panic(r)
