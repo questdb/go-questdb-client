@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -189,6 +190,31 @@ func (d *qwpSfOrphanDrainer) recordFailure(reason string) {
 // drainerRun is the drainer goroutine entry point. Runs to
 // completion (or terminal failure), then sets outcome and exits.
 func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
+	// Convert a panic on this goroutine into the same terminal Failed
+	// outcome an explicit fault produces, so neither untrusted on-disk
+	// .sfa bytes (the CRC/recovery scan in qwpSfNewCursorEngine) nor
+	// user-supplied clientFactory code (invoked via qwpSfConnectWithRetry)
+	// can crash the host process — which would take down the foreground
+	// sender and every sibling drainer with it. Both run on this
+	// goroutine before the send loop's own recover is in play, so this
+	// is the only guard covering them. Registered first so it runs LAST
+	// on unwind (defers are LIFO): the engine-close (slot-lock release)
+	// and send-loop teardown defers run ahead of it, so recordFailure
+	// drops its .failed sentinel onto a quiesced slot. Quarantining is
+	// deliberate — a panic driven by corrupt on-disk bytes would re-panic
+	// on every future re-adoption, so the sentinel breaks that loop
+	// (bounded automatic retry, then human-in-the-loop), exactly as the
+	// no-progress watchdog does for a wedged connection. The scan's
+	// slice/index reads are bounds-checked, so this is defense-in-depth,
+	// not a known reachable panic.
+	defer func() {
+		if r := recover(); r != nil {
+			msg := fmt.Sprintf("qwp/sf: orphan drainer panicked: %v\n%s", r, debug.Stack())
+			log.Printf("[ERROR] %s", msg)
+			d.recordFailure(msg)
+		}
+	}()
+
 	engine, err := qwpSfNewCursorEngine(d.slotPath, d.segmentSize, d.sfMaxTotalBytes, qwpSfEngineDefaultAppendDeadline)
 	if err != nil {
 		// Lock contention is expected (a sibling drainer or the

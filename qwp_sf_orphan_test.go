@@ -481,6 +481,81 @@ func TestQwpSfDrainerPoolRejectsAfterClose(t *testing.T) {
 	assert.Contains(t, err.Error(), "closed")
 }
 
+// TestQwpSfDrainerPoolSurvivesFactoryPanic asserts a panic in the
+// user-supplied clientFactory — invoked on the drainer goroutine from
+// drainerRun's connect phase, before the send loop's own recover is in
+// play — is converted into a latched terminal failure rather than
+// crashing the host process (which would take the whole pool and the
+// foreground sender down with it). The panicking drainer must end Failed
+// with a quarantine sentinel, and the pool's semaphore/active-list
+// bookkeeping must survive intact: on a cap-1 pool a follow-up drainer
+// can only run once the panicking one releases its slot, so its reaching
+// Success proves the worker's cleanup defers ran (no crash, no leaked
+// slot).
+func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	pool := qwpSfNewDrainerPool(1)
+	defer pool.drainerPoolClose()
+
+	const segSize int64 = 4096
+
+	// Unacked slot + a factory that panics. The drainer must get past
+	// drainerRun's already-drained short-circuit and into the connect
+	// phase for the factory to be reached.
+	panicDir := t.TempDir()
+	{
+		engine, err := qwpSfNewCursorEngine(panicDir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+	panicFactory := func(context.Context, int) (*qwpTransport, error) {
+		panic("boom from clientFactory")
+	}
+	panicDrainer := qwpSfNewOrphanDrainer(
+		panicDir, segSize, qwpSfUnlimitedTotalBytes,
+		panicFactory, nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	require.NoError(t, pool.drainerPoolSubmit(context.Background(), panicDrainer))
+
+	// The panic surfaces as a Failed outcome with a quarantine sentinel,
+	// not a process crash.
+	require.Eventually(t, func() bool {
+		return panicDrainer.drainerOutcome() == qwpSfDrainOutcomeFailed
+	}, 2*time.Second, 5*time.Millisecond,
+		"factory panic must surface as a Failed outcome, not crash the host")
+	body, err := os.ReadFile(filepath.Join(panicDir, qwpSfFailedSentinelName))
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "panicked")
+
+	// Pool machinery survived: a healthy drainer submitted to the same
+	// cap-1 pool runs to Success, which is only possible once the
+	// panicking drainer's worker released its semaphore slot on its way
+	// out.
+	healthyDir := t.TempDir()
+	{
+		engine, err := qwpSfNewCursorEngine(healthyDir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+	healthyDrainer := qwpSfNewOrphanDrainer(
+		healthyDir, segSize, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv), nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	require.NoError(t, pool.drainerPoolSubmit(context.Background(), healthyDrainer))
+	require.Eventually(t, func() bool {
+		return healthyDrainer.drainerOutcome() == qwpSfDrainOutcomeSuccess
+	}, 5*time.Second, 10*time.Millisecond,
+		"follow-up drainer must run after the panicking one freed its semaphore slot")
+}
+
 // TestQwpSfDrainerUsesSharedTracker verifies the Phase 5 wiring:
 // a drainer constructed with a shared tracker records its initial
 // dial outcome onto that tracker (idx=0 becomes Healthy), so
