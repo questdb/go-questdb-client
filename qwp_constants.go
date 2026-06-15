@@ -289,12 +289,15 @@ const (
 	// client does not enforce a hard cap.
 	qwpMaxColumnsPerTable = 2048
 
-	// qwpMaxBindsPerQuery caps bind parameters per QUERY_REQUEST.
-	// Spec §16. The server enforces this independently; the client-side
-	// preflight surfaces a typed error before bytes leave the process.
-	// Distinct from qwpMaxColumnsPerTable (an ingest concept) — egress
-	// QUERY_REQUEST and ingest DATA_BATCH have independent limits.
-	qwpMaxBindsPerQuery = 1024
+	// qwpMaxBindsPerQuery caps bind parameters per QUERY_REQUEST. The
+	// server bounds binds by MAX_COLUMNS_PER_TABLE (2048) and the Java
+	// client enforces the same value (QwpBindValues.advance), so a bind
+	// count Java accepts is accepted here too. The server re-checks it
+	// independently; the client-side preflight surfaces a typed error
+	// before bytes leave the process. A distinct constant from
+	// qwpMaxColumnsPerTable, which carries the same value for the ingest
+	// (DATA_BATCH column) side.
+	qwpMaxBindsPerQuery = 2048
 
 	// qwpMaxSqlTextBytes caps the UTF-8 byte length of the sql_bytes
 	// field in a QUERY_REQUEST. Spec §16 pins this at 1 MiB. The server
