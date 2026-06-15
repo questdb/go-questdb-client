@@ -33,6 +33,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -304,10 +305,22 @@ type qwpEgressIO struct {
 	// Owned by the dispatcher; never aliased outside.
 	sendBuf qwpWireBuffer
 
+	// cancelAckTimeout is the post-CANCEL silence bound receiveLoop's
+	// watchdog enforces. Defaults to qwpQueryCancelAckTimeout; set once
+	// at construction (before start) so the dispatcher reads it without
+	// synchronization. Tests shrink it to keep the wedged-peer case fast.
+	cancelAckTimeout time.Duration
+
 	// Per-query state, accessed only from the dispatcher.
 	currentRequestId int64
 	creditEnabled    bool
 	currentQueryDone bool
+	// cancelSent records that a CANCEL frame has gone out for the
+	// current query. Once set, receiveLoop arms the cancel-ack
+	// watchdog so a server that accepts the CANCEL but never sends a
+	// terminal frame cannot strand the dispatcher. Reset per query in
+	// dispatcherRun.
+	cancelSent bool
 
 	// ioErrMu guards ioErr. Set on the dispatcher goroutine from any
 	// decoder- or framing-level error path; read on the user goroutine
@@ -360,6 +373,8 @@ func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
 		ioCancel:   ioCancel,
 		shutdownCh: make(chan struct{}),
 		doneCh:     make(chan struct{}),
+
+		cancelAckTimeout: qwpQueryCancelAckTimeout,
 	}
 	io.readBufPool.New = func() any {
 		b := make([]byte, 0, 64*1024)
@@ -750,6 +765,7 @@ func (io *qwpEgressIO) dispatcherRun() {
 		io.creditRequestId.Store(req.requestId)
 		io.creditEnabled = req.initialCredit > 0
 		io.currentQueryDone = false
+		io.cancelSent = false
 		// Drop any schema held for a prior query. The egress schema
 		// rides only the first batch (batch_seq == 0) of each query
 		// response; resetting here guarantees this query parses its own
@@ -791,7 +807,25 @@ func (io *qwpEgressIO) dispatcherRun() {
 // initiated signals reach the server at loop boundaries; notifyCh
 // wakes the select when those atomics change while we are waiting
 // for a server frame.
+//
+// Once a CANCEL has gone out (io.cancelSent), a watchdog bounds the
+// wait for the server's terminal frame: coder/websocket has no read
+// deadline, so a peer that accepts the CANCEL but goes silent would
+// otherwise park this loop forever, leaving currentQueryDone false so
+// the next submitQuery can never be served. The timer is reset before
+// every park, so it measures silence on the wire rather than decode
+// time or a slow consumer — a server still draining buffered batches
+// post-CANCEL keeps resetting it. On expiry the connection is poisoned
+// and torn down (see the watchdog case).
 func (io *qwpEgressIO) receiveLoop() {
+	var watchdog *time.Timer
+	var watchdogCh <-chan time.Time
+	defer func() {
+		if watchdog != nil {
+			watchdog.Stop()
+		}
+	}()
+
 	for !io.currentQueryDone {
 		select {
 		case <-io.shutdownCh:
@@ -806,8 +840,39 @@ func (io *qwpEgressIO) receiveLoop() {
 			return
 		}
 
+		// Arm or reset the cancel-ack watchdog right before parking, so
+		// it times only this wait for the next server frame. Any decode
+		// or consumer-backpressure delay in the prior iteration's
+		// dispatchFrame happened before this reset and is not charged
+		// against the server.
+		if io.cancelSent {
+			if watchdog == nil {
+				watchdog = time.NewTimer(io.cancelAckTimeout)
+			} else {
+				watchdog.Stop()
+				select {
+				case <-watchdog.C:
+				default:
+				}
+				watchdog.Reset(io.cancelAckTimeout)
+			}
+			watchdogCh = watchdog.C
+		}
+
 		select {
 		case <-io.shutdownCh:
+			return
+		case <-watchdogCh:
+			// Silent peer after CANCEL: poison the connection so the
+			// next submitQuery fails fast against the latched ioErr,
+			// end the query so the dispatcher returns to idle, and
+			// cancel ioCtx to tear down the wedged conn — that unwinds
+			// the reader from its blocked Read instead of leaving it
+			// parked until Close.
+			io.poisonAndEmitError(fmt.Sprintf(
+				"qwp: server did not answer CANCEL within %s", io.cancelAckTimeout))
+			io.currentQueryDone = true
+			io.ioCancel()
 			return
 		case <-io.notifyCh:
 			// State change — loop back to drain. This is how a
@@ -1031,6 +1096,7 @@ func (io *qwpEgressIO) drainPendingCancel() bool {
 		io.currentQueryDone = true
 		return false
 	}
+	io.cancelSent = true
 	return true
 }
 

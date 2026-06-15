@@ -408,6 +408,96 @@ func TestQwpEgressIOCancel(t *testing.T) {
 	}
 }
 
+// TestQwpEgressIOCancelAckWatchdog drives the wedged-peer case: the
+// mock accepts the CANCEL but never sends a terminal frame, and keeps
+// the connection open so only the client-side watchdog — not a server
+// close — can break the deadlock. The dispatcher must convert the
+// silence into a TransportError, poison the connection, and return to
+// idle so a follow-up submitQuery fails fast instead of stranding on
+// the single-slot request queue.
+func TestQwpEgressIOCancelAckWatchdog(t *testing.T) {
+	const wantReqID = int64(9)
+	cancelSeen := make(chan struct{})
+	release := make(chan struct{})
+
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		m.readBinary(ctx) // QUERY_REQUEST
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, wantReqID, 0, "v", 1))
+
+		frame := m.readBinary(ctx) // CANCEL
+		if kind := frame[0]; kind != byte(qwpMsgKindCancel) {
+			t.Errorf("server expected CANCEL, got msg_kind=0x%02X", kind)
+		}
+		close(cancelSeen)
+		// Wedge: pocket the CANCEL and stay silent. Hold the connection
+		// open until the test releases us so the only way out is the
+		// dispatcher's watchdog.
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+
+	io := newQwpEgressIO(tr, 2)
+	// Shrink the watchdog so the wedge resolves quickly; 500ms still
+	// leaves ample room for the mock to read the CANCEL off loopback
+	// before the timer tears the connection down.
+	io.cancelAckTimeout = 500 * time.Millisecond
+	io.start()
+	defer shutdownIO(t, io)
+	defer close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT 1", requestId: wantReqID}); err != nil {
+		t.Fatalf("submitQuery: %v", err)
+	}
+
+	// First batch arrives; release it so the pool is full again.
+	ev := takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindBatch {
+		t.Fatalf("event kind = %v, want Batch", ev.kind)
+	}
+	ev.batch.release()
+
+	// Cancel; the server reads it then goes silent.
+	io.requestCancel(wantReqID)
+	select {
+	case <-cancelSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never saw CANCEL frame")
+	}
+
+	// The watchdog converts the silent peer into a TransportError rather
+	// than parking the dispatcher forever.
+	ev = takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindTransportError {
+		t.Fatalf("event kind = %v, want TransportError (errMsg=%q)", ev.kind, ev.errMessage)
+	}
+	if !strings.Contains(ev.errMessage, "did not answer CANCEL") {
+		t.Errorf("errMessage = %q, want it to name the cancel-ack timeout", ev.errMessage)
+	}
+
+	// Connection is poisoned and the dispatcher is back at idle: a
+	// follow-up submitQuery returns the latched cause immediately
+	// instead of blocking on the single-slot request queue.
+	if err := io.loadIoErr(); err == nil {
+		t.Fatal("ioErr not latched after the watchdog fired")
+	}
+	subCtx, subCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer subCancel()
+	err := io.submitQuery(subCtx, qwpRequest{sql: "SELECT 2", requestId: wantReqID + 1})
+	if err == nil || !strings.Contains(err.Error(), "did not answer CANCEL") {
+		t.Fatalf("follow-up submitQuery = %v, want the latched cancel-ack error", err)
+	}
+}
+
 // TestQwpEgressIOShutdownUnblocksRead forces shutdown while the I/O
 // goroutine is parked on a Read with no traffic. The goroutine must
 // exit within a short grace period — demonstrating the ctx-cancel

@@ -48,6 +48,22 @@ import (
 // shutdownJoinMs default.
 const qwpQueryCleanupDrainTimeout = 5 * time.Second
 
+// qwpQueryCancelAckTimeout bounds how long the egress dispatcher waits
+// for the server's terminal frame once it has sent a CANCEL.
+// coder/websocket exposes no socket read deadline, so this watchdog
+// (armed in receiveLoop) is the client's only defense against a peer
+// that accepts the CANCEL but never sends a terminal frame
+// (QUERY_ERROR(CANCELLED) / RESULT_END / EXEC_DONE): without it the
+// dispatcher parks on the receive channel forever, currentQueryDone
+// stays false, and the next Query/Exec can never be served. It is the
+// dispatcher-side counterpart of qwpQueryCleanupDrainTimeout — the
+// consumer-side drain — and shares its 5s horizon, but it holds even
+// when no consumer is draining (a bare Cancel() the caller has walked
+// away from). Measured as silence on the wire: receiveLoop resets it
+// before every park, so a server still streaming buffered batches
+// post-CANCEL keeps it alive.
+const qwpQueryCancelAckTimeout = qwpQueryCleanupDrainTimeout
+
 // QwpQueryClient is a QuestDB query-side (egress) client. It opens one
 // WebSocket connection to /read/v1, runs a dedicated I/O goroutine
 // pair (reader + dispatcher), and streams result batches to the caller
