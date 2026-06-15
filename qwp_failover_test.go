@@ -1426,11 +1426,14 @@ func gatedQwpServer(t *testing.T, nodeId string, release <-chan struct{},
 // Node A binds initially then drops the connection on the query,
 // forcing failover. Node B is the only other candidate and gates its
 // SERVER_INFO write, so the test can call Close() with the failover
-// provably parked inside connectWalk (holding c.genMu). The fix makes
-// Close take c.genMu to set closed + snapshot the bound pair, and makes
-// reconnectAndReplay refuse to publish (and self-tear-down) a
-// generation built while closing. Either way the failover target's
-// WebSocket must end up closed by the client; pre-fix it never was.
+// provably parked inside connectWalk. reconnectAndReplay holds c.genMu
+// only across its publish, not across the walk, so Close acquires the
+// lock immediately (honouring its ctx), sets closed, and tears down
+// whatever pair is currently bound — here the faulted node-A pair the
+// failover is replacing. reconnectAndReplay's post-walk closed-recheck
+// then refuses to publish the node-B generation it built and self-tears
+// it down. Both paths close a socket, so the failover target's
+// WebSocket ends up closed by the client; pre-fix it never was.
 func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
 	var (
 		bReleaseGate           = make(chan struct{})
@@ -1512,8 +1515,8 @@ func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
 	}()
 
 	// Wait until the failover reconnect is provably parked inside
-	// connectWalk on node B (holding c.genMu), then Close from another
-	// goroutine — the exact interleaving that used to leak.
+	// connectWalk on node B, then Close from another goroutine — the
+	// exact interleaving that used to leak.
 	select {
 	case <-bReached:
 	case <-time.After(10 * time.Second):
@@ -1526,9 +1529,10 @@ func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
 		defer ccancel()
 		closeDone <- c.Close(cctx)
 	}()
-	// Best-effort nudge so Close() is blocked on c.genMu while
-	// reconnectAndReplay still holds it (the most interesting
-	// interleaving). Not a correctness requirement — every interleaving
+	// Give Close() a moment to win c.genMu and snapshot the bound pair
+	// before the walk completes — the interleaving where Close tears down
+	// the dying generation and reconnectAndReplay self-tears-down the one
+	// it just built. Not a correctness requirement — every interleaving
 	// is leak-free post-fix.
 	time.Sleep(75 * time.Millisecond)
 	close(bReleaseGate)
@@ -1547,6 +1551,13 @@ func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
 
 	select {
 	case err := <-closeDone:
+		// Racing a mid-walk failover, Close tears down whatever pair is
+		// bound — the faulted node-A connection the failover is replacing.
+		// Re-closing that already-dead socket yields net.ErrClosed, which
+		// Close swallows (the close postcondition holds), so it still
+		// reports a clean nil. The node-B generation built during the walk
+		// is torn down by reconnectAndReplay's closed-recheck (the leak
+		// probe above), not by Close.
 		if err != nil {
 			t.Errorf("Close returned %v, want nil", err)
 		}

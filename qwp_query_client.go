@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,17 +70,20 @@ type QwpQueryClient struct {
 	transportPtr atomic.Pointer[qwpTransport]
 	ioPtr        atomic.Pointer[qwpEgressIO]
 
-	// genMu serialises generation lifecycle transitions: the
-	// destroy-old / build-new pair in reconnectAndReplay, and Close's
-	// set-closed + snapshot of the bound (transport, io) pair. nextEvent
-	// reads the atomic pointers under no lock; reconnect and Close grab
-	// this mutex so a transport fault cannot publish a fresh generation
-	// that a concurrent Close would never observe (and so leak forever),
-	// and so Close always tears down a consistent generation pair rather
-	// than a torn read straddling publishGeneration. Held only across the
-	// reconnect critical section and Close's flag-set+snapshot — never
-	// across a user-facing wait, since the I/O shutdown in both runs
-	// after the mutex is released.
+	// genMu serialises generation lifecycle transitions: reconnect's
+	// closed-recheck + publishGeneration swap, and Close's set-closed +
+	// snapshot of the bound (transport, io) pair. nextEvent reads the
+	// atomic pointers under no lock; reconnect and Close grab this mutex
+	// so a transport fault cannot publish a fresh generation that a
+	// concurrent Close would never observe (and so leak forever), and so
+	// Close always snapshots a consistent generation pair rather than a
+	// torn read straddling publishGeneration. The lock covers only that
+	// wait-free swap/snapshot — never a user-facing wait. In particular
+	// reconnect's old-generation teardown and failover walk, and Close's
+	// I/O shutdown, all run with the mutex released, so a Close concurrent
+	// with a mid-flight reconnect walk is not blocked on it and can honour
+	// its ctx deadline. Duplicate teardown of the same pair from both
+	// paths is harmless: shutdown() and close() are idempotent.
 	genMu sync.Mutex
 
 	// hostTracker is the failover.md §2 host-health / zone tracker
@@ -139,11 +143,14 @@ func (c *QwpQueryClient) io() *qwpEgressIO {
 	return c.ioPtr.Load()
 }
 
-// publishGeneration atomically swaps the bound transport + I/O + the
-// connect-walk metadata. Used by both the initial connect path and
-// the failover reconnect path so the publish ordering stays
-// consistent across both. Holds genMu so two concurrent transport
-// faults cannot both spawn a new generation.
+// publishGeneration swaps the bound transport + I/O + the connect-walk
+// metadata. Used by both the initial connect path and the failover
+// reconnect path so the publish ordering stays consistent across both.
+// Each Store is individually atomic; callers that race a concurrent
+// reader of the four-pointer tuple (i.e. the reconnect path, against
+// Close's snapshot) hold genMu around this call so the swap is observed
+// whole. The initial-connect path needs no lock — the client is not yet
+// visible to any other goroutine.
 func (c *QwpQueryClient) publishGeneration(r *qwpConnectResult) {
 	c.transportPtr.Store(r.transport)
 	c.ioPtr.Store(r.io)
@@ -529,44 +536,55 @@ var errClosedDuringFailover = errors.New(
 // candidate and is retried if nothing better binds — including the
 // n=1 case), publishes the new generation, and resubmits the
 // in-flight query with a fresh requestId. Returns the new
-// generation's QwpServerInfo (nil if none consumed) or a non-nil error if the
-// walk fails. Holds c.genMu for the duration of the swap so two
-// concurrent transport faults serialise and so a concurrent Close
-// cannot interleave with the swap.
+// generation's QwpServerInfo (nil if none consumed) or a non-nil error
+// if the walk fails.
+//
+// Locking: c.genMu is held only across the publish — the wait-free
+// closed-recheck + publishGeneration swap. The old-generation teardown
+// and the failover walk (dial + WS upgrade + SERVER_INFO per endpoint,
+// up to ~2×N endpoints) run with no lock held, so a concurrent Close
+// acquires c.genMu without waiting on the walk and honours its own ctx
+// deadline. This is safe because shutdown() and close() are idempotent
+// and concurrency-safe: if Close tears the old (or just-built) pair
+// down at the same time we do, the duplicate teardown is a no-op.
 //
 // Close coordination: Close sets c.closed and snapshots the bound
-// generation under c.genMu. Because this function holds c.genMu for
-// its whole body, c.closed cannot change underneath it, so a single
-// check before any work decides the outcome:
+// (io, transport) pair under c.genMu, then tears that pair down after
+// releasing the lock. The outcomes, by where Close lands:
 //
-//   - closed already set (Close won the lock first): Close has
-//     already snapshotted and owns teardown of the bound generation.
-//     Bail before touching it (a second teardown here would race
-//     Close's unlocked tr.close()) and before standing up a fresh
-//     generation Close could never reach.
+//   - before our post-walk recheck (the common case, while we are in
+//     the unlocked walk): Close snapshots and tears down whatever is
+//     bound — the old, already-torn-down pair (idempotent). Our recheck
+//     then sees c.closed, skips publishGeneration, and tears down the
+//     generation the walk just built rather than publishing an orphan
+//     nothing would shut down.
 //
-//   - closed set only after this returns (Close is blocked on
-//     c.genMu): we publish normally; Close then snapshots and tears
-//     down the generation we just published.
+//   - after we publish: Close snapshots and tears down the new
+//     generation we bound. A submit racing in this window fails ("I/O
+//     goroutine shut down") and surfaces as a benign replay-failed error
+//     on the query the user is already closing.
 //
-// The post-connectWalk re-check is belt-and-suspenders: with closed
-// written under c.genMu it is unreachable, but it keeps this function
-// locally correct (no leaked generation) even if a future closed-
-// setter forgoes the lock.
+// The lock-free early-out at the top is a best-effort optimisation to
+// skip a pointless walk when Close has already won; the post-walk
+// recheck under the lock is the authoritative one.
 //
 // Mirrors the high-level shape of Java's reconnectViaTracker +
 // executeOnce composition.
 func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySession, failedIdx int) (*QwpServerInfo, error) {
-	c.genMu.Lock()
-	defer c.genMu.Unlock()
-
+	// Best-effort early-out to skip a pointless walk when Close has
+	// already won. Lock-free: the authoritative check is the post-walk
+	// recheck under c.genMu, since Close may set c.closed any time during
+	// the unlocked walk below.
 	if c.closed.Load() {
 		return nil, errClosedDuringFailover
 	}
 
-	// Tear down the dying generation. Use the cleanup-bounded ctx
-	// independent of the user's so the dispatcher's exit waits a
-	// fixed budget regardless of what the caller's deadline says.
+	// Tear down the dying generation with no lock held. The pointers are
+	// atomic and only publishGeneration writes them, so this cannot race
+	// a publish; shutdown()/close() are idempotent, so a concurrent Close
+	// tearing the same pair down is harmless. Use the cleanup-bounded ctx
+	// independent of the user's so the dispatcher's exit waits a fixed
+	// budget regardless of what the caller's deadline says.
 	cleanupCtx, cancel := context.WithTimeout(
 		context.Background(), qwpQueryCleanupDrainTimeout)
 	defer cancel()
@@ -602,15 +620,22 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	if err != nil {
 		return nil, err
 	}
+
+	// Publish under c.genMu so the four-pointer swap is atomic w.r.t.
+	// Close's snapshot, and recheck c.closed under the same lock. If Close
+	// won the race during the unlocked walk, connectWalk has already
+	// spawned the new generation's I/O goroutines + WebSocket, so tear
+	// them down rather than publish an orphan nothing will shut down. The
+	// teardown runs after Unlock so genMu is not held across the drain.
+	c.genMu.Lock()
 	if c.closed.Load() {
-		// Defensive: see the doc comment. connectWalk already spawned
-		// the new generation's I/O goroutines + WebSocket, so tear them
-		// down here rather than publish an orphan nothing will shut down.
+		c.genMu.Unlock()
 		_ = result.io.shutdown(cleanupCtx)
 		_ = result.transport.close()
 		return nil, errClosedDuringFailover
 	}
 	c.publishGeneration(result)
+	c.genMu.Unlock()
 
 	// Allocate a fresh requestId for the replay attempt. Matches
 	// Java's nextRequestId++ on each executeOnce: the server treats
@@ -693,15 +718,19 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 	c.closeOnce.Do(func() {
 		// Set closed and snapshot the bound (io, transport) pair under
 		// genMu. This is what makes Close safe against a concurrent
-		// reconnectAndReplay: it holds genMu across its whole destroy-
-		// old / build-new / publish swap, so under the lock we observe
-		// exactly one consistent generation — never a torn pair half-
-		// way through publishGeneration — and reconnectAndReplay
-		// observes our closed flag and self-tears-down (or skips
-		// building) any generation we are not the one tearing down.
-		// See reconnectAndReplay's doc for the full interleaving table.
-		// The shutdown/close run after Unlock so genMu is never held
-		// across a user-facing wait.
+		// reconnectAndReplay: reconnect publishes the new generation
+		// under genMu too, so under the lock we observe exactly one
+		// consistent generation — never a torn pair half-way through
+		// publishGeneration. reconnect's post-walk recheck observes our
+		// closed flag and self-tears-down (or skips building) any
+		// generation we did not snapshot; a duplicate teardown of the
+		// pair we DID snapshot is harmless (shutdown/close are
+		// idempotent). Crucially, reconnect holds genMu only across that
+		// publish — not across its failover walk — so this Lock does not
+		// block on a mid-flight reconnect and Close honours its ctx
+		// deadline. See reconnectAndReplay's doc for the full interleaving
+		// table. The shutdown/close run after Unlock so genMu is never
+		// held across a user-facing wait.
 		c.genMu.Lock()
 		c.closed.Store(true)
 		io := c.io()
@@ -714,7 +743,14 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 			}
 		}
 		if tr != nil {
-			if err := tr.close(); err != nil && firstErr == nil {
+			// net.ErrClosed means the socket was already closed by another
+			// path — the transport fault that triggered failover, or a
+			// concurrent reconnect tearing down the same (now-superseded)
+			// generation we snapshotted. The close postcondition holds, so
+			// it is success, not a Close failure. (coder/websocket itself
+			// returns net.ErrClosed, wrapped, only when a close was already
+			// in flight, and swallows it on the path that wins the close.)
+			if err := tr.close(); err != nil && !errors.Is(err, net.ErrClosed) && firstErr == nil {
 				firstErr = err
 			}
 		}
