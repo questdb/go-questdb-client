@@ -29,6 +29,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 
@@ -637,6 +639,24 @@ func qwpSameBacking(a, b []byte) bool {
 // dispatcher's select sees EOF.
 func (io *qwpEgressIO) readerRun() {
 	defer close(io.frameCh)
+	// Convert a panic while reading untrusted server bytes into the
+	// connection's latched terminal error, so the host process cannot
+	// crash. Registered after the frameCh close so it runs FIRST on
+	// unwind (defers are LIFO): setIoErr latches the panic before
+	// close(io.frameCh) wakes the dispatcher, so first-writer-wins keeps
+	// the panic cause (the dispatcher's "reader closed" poison loses the
+	// race) and a follow-up submitQuery surfaces it. setIoErr only takes
+	// a mutex, so it is safe from this goroutine and never blocks — unlike
+	// emit, which the dispatcher owns. qwpReadFrameInto is bounds-checked
+	// and growth-capped, so this is defense-in-depth, not a known
+	// reachable panic.
+	defer func() {
+		if r := recover(); r != nil {
+			err := fmt.Errorf("qwp: egress reader panicked: %v\n%s", r, debug.Stack())
+			log.Printf("[ERROR] %v", err)
+			io.setIoErr(err)
+		}
+	}()
 	// Capture the conn once. The transport assigns it before start()
 	// launches this goroutine and never mutates it again, so reading it
 	// a single time here keeps this loop off the transport's fields — a
@@ -698,6 +718,22 @@ func (io *qwpEgressIO) dispatcherRun() {
 	// already seen its terminal signal by the time decoder.close()
 	// tears down zstd state.
 	defer io.decoder.close()
+	// Convert a panic while dispatching untrusted server bytes into the
+	// same latched terminal error a transport fault produces, so the host
+	// process cannot crash. Registered last so it runs FIRST on unwind
+	// (defers are LIFO), before close(io.events): poisonAndEmitError
+	// latches ioErr and emits a TransportError on the still-open events
+	// channel, so the consumer's takeEvent and any follow-up submitQuery
+	// surface the failure. The decoder's slice/index reads are
+	// bounds-checked, so this is defense-in-depth, not a known reachable
+	// panic.
+	defer func() {
+		if r := recover(); r != nil {
+			msg := fmt.Sprintf("qwp: egress dispatcher panicked: %v\n%s", r, debug.Stack())
+			log.Printf("[ERROR] %s", msg)
+			io.poisonAndEmitError(msg)
+		}
+	}()
 
 	for {
 		var req qwpRequest

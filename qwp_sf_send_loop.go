@@ -29,6 +29,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -743,6 +745,22 @@ func (l *qwpSfSendLoop) run() {
 			_ = t.close()
 		}
 	}()
+	// Convert a panic on this wire-driving goroutine into the same
+	// latched terminal error an explicit HALT produces, so untrusted
+	// server bytes can never crash the host process. Registered last so
+	// it runs FIRST on unwind (defers are LIFO): recordFatal latches the
+	// error before close(l.done) and wg.Done() release any waiter,
+	// preserving the "error latched before the loop exits" ordering the
+	// inline terminal paths below rely on. Every slice/index read on this
+	// path is bounds-checked, so this is defense-in-depth, not a known
+	// reachable panic.
+	defer func() {
+		if r := recover(); r != nil {
+			err := fmt.Errorf("qwp/sf: send loop panicked: %v\n%s", r, debug.Stack())
+			log.Printf("[ERROR] %v", err)
+			l.recordFatal(err)
+		}
+	}()
 
 	if l.transport.Load() == nil && l.running.Load() {
 		initial := errors.New("async initial connect deferred to I/O goroutine")
@@ -876,18 +894,28 @@ func (l *qwpSfSendLoop) runOneConnection() error {
 
 	var inner sync.WaitGroup
 	inner.Add(2)
-	go func() {
+	// runGuarded executes one inner loop and reports its outcome on errCh.
+	// senderLoop and receiverLoop run on their own goroutines, so run()'s
+	// recover defer does not cover them; this converts a panic on either —
+	// e.g. parsing untrusted server ACK bytes in receiverLoop, or walking
+	// segment frames in senderLoop — into an ordinary error so run()'s
+	// terminal-error path latches it via recordFatal instead of crashing
+	// the host. Both loops' slice/index reads are bounds-checked, so this
+	// is defense-in-depth, not a known reachable panic.
+	runGuarded := func(name string, fn func(context.Context) error) {
 		defer inner.Done()
-		err := l.senderLoop(connCtx)
-		errCh <- loopErr{err}
-		connCancel()
-	}()
-	go func() {
-		defer inner.Done()
-		err := l.receiverLoop(connCtx)
-		errCh <- loopErr{err}
-		connCancel()
-	}()
+		defer connCancel()
+		defer func() {
+			if r := recover(); r != nil {
+				err := fmt.Errorf("qwp/sf: %s panicked: %v\n%s", name, r, debug.Stack())
+				log.Printf("[ERROR] %v", err)
+				errCh <- loopErr{err}
+			}
+		}()
+		errCh <- loopErr{fn(connCtx)}
+	}
+	go runGuarded("sender loop", l.senderLoop)
+	go runGuarded("receiver loop", l.receiverLoop)
 	inner.Wait()
 	close(errCh)
 	var first error

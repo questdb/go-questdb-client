@@ -449,6 +449,51 @@ func TestQwpEgressIOShutdownUnblocksRead(t *testing.T) {
 	}
 }
 
+// TestQwpEgressReaderRecoversPanic asserts the readerRun goroutine's
+// top-level recover converts a panic into the connection's latched
+// terminal error instead of crashing the host process. The panic is
+// injected with a nil-conn transport: readerRun dereferences the conn
+// directly (conn.Reader), bypassing the transport's own nil guards, so
+// the first read panics inside coder/websocket. The recover must route
+// that into setIoErr so a follow-up submitQuery surfaces it. This is the
+// only wire goroutine whose panic is reachable without a test seam — the
+// dispatcher's send path is nil-safe and its decode path plus the send
+// loop's ACK parsers are length-validated before use — but all of them
+// share the same recover idiom this guards.
+func TestQwpEgressReaderRecoversPanic(t *testing.T) {
+	io := newQwpEgressIO(&qwpTransport{conn: nil}, 2)
+	io.start()
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = io.shutdown(shutCtx)
+	}()
+
+	// The reader panics on its first conn.Reader; poll until the guard
+	// latches the synthesized terminal error. Reaching the deadline means
+	// the panic escaped the goroutine and the test binary would have
+	// crashed.
+	var ioErr error
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && ioErr == nil {
+		ioErr = io.loadIoErr()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ioErr == nil {
+		t.Fatal("reader panic was not latched within 2s")
+	}
+	if !strings.Contains(ioErr.Error(), "egress reader panicked") {
+		t.Fatalf("latched error = %q, want it to name the recovered reader panic", ioErr)
+	}
+
+	// A follow-up submitQuery must surface the latched cause rather than
+	// running a fresh query against the dead connection.
+	err := io.submitQuery(context.Background(), qwpRequest{sql: "x", requestId: 1})
+	if err == nil || !strings.Contains(err.Error(), "egress reader panicked") {
+		t.Fatalf("submitQuery after panic = %v, want the latched reader-panic error", err)
+	}
+}
+
 // TestQwpEgressIOPoolBackpressure sizes the buffer pool to 1 and has
 // the server emit two batches back-to-back. The I/O loop must not
 // emit the second batch event until the user releases the first —
