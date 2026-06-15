@@ -918,16 +918,24 @@ func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 
 // qwpASCIIEqualFold reports whether a and b are equal under ASCII
 // case folding: bytes 'A'–'Z' and 'a'–'z' compare equal ignoring
-// case, every other byte must match verbatim. This matches QuestDB's
-// column-name case-insensitivity, which folds ASCII only (Java
-// Chars.toLowerCaseAscii / LowerCaseCharSequenceIntHashMap).
+// case, every other byte must match verbatim.
 //
-// It is a sound accelerator for the lowercase-keyed columnIndex: an
-// ASCII letter is never a UTF-8 continuation byte, so fold-equal
-// inputs differ only in the case of standalone ASCII letters, and
-// strings.ToLower maps them to the same key. A fast-path match
-// therefore never disagrees with the authoritative map lookup, and a
-// non-match falls through to it.
+// QuestDB folds column names with full Unicode case-insensitivity:
+// the server's metadata columnNameIndexMap and the Java client's
+// QwpTableBuffer.columnNameToIndex are both a
+// LowerCaseCharSequenceIntHashMap, keyed via Character.toLowerCase.
+// The authoritative key on this side is the matching Unicode fold,
+// strings.ToLower (the canonical columnIndex key below).
+//
+// An ASCII-only comparator is still a sound accelerator for that
+// Unicode-keyed columnIndex: ASCII letters fold identically under
+// ASCII and Unicode, and an ASCII letter is never a UTF-8
+// continuation byte, so ASCII-fold-equal inputs differ only in the
+// case of standalone ASCII letters — strings.ToLower maps them to the
+// same key. A fast-path match therefore never disagrees with the
+// authoritative map lookup, and a non-match falls through to it,
+// where the map still resolves the Unicode-only equivalences (e.g.
+// 'Ü'/'ü', or U+212A KELVIN SIGN folding to 'k').
 func qwpASCIIEqualFold(a, b string) bool {
 	if len(a) != len(b) {
 		return false
