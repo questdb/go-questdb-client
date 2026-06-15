@@ -1,4 +1,10 @@
-# Builds QuestDB from source and runs the Go QWP fuzz suite against it.
+# Builds QuestDB from source and runs the Go QWP fuzz + integration
+# suites against it.
+#
+# "Fuzz" here means seeded property tests: ordinary Test* functions that
+# generate randomized-but-bounded workloads and assert invariants, with a
+# fresh per-run seed logged as QWP_FUZZ_SEED for replay. It is NOT Go's
+# coverage-guided engine (`go test -fuzz`).
 #
 # Modelled on c-questdb-client's ci/run_fuzz_pipeline.yaml (clone questdb,
 # build with Maven, point the test fixture at the built repo). The fixture
@@ -27,7 +33,9 @@ jobs:
   qwp-fuzz:
     name: QWP fuzz vs QuestDB master
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Two server-bound test runs share this budget: the reduced -race
+    # pass (send/ACK + reconnect path) and the full non-race suite.
+    timeout-minutes: 75
     steps:
       - name: Checkout go-questdb-client
         uses: actions/checkout@v4
@@ -115,7 +123,33 @@ jobs:
           fi
           echo "Found server jar: $jar"
 
+      - name: Race-check the QWP send/ACK + reconnect path
+        # The Go send loop is split across two goroutines (senderLoop +
+        # receiverLoop), so the real-server send/ACK + reconnect/replay
+        # path is the historical home of data races (e.g. the stranded
+        # lone-frame ACK). build.yml runs `go test -race`, but every
+        # server-bound suite self-skips there (no server), so this is the
+        # ONLY place that path is race-instrumented.
+        #
+        # Reduced on purpose: only the families that drive concurrent
+        # send/ACK and reconnect/replay — the integration suite
+        # (async-ack stress, concurrent senders) and the ingress fuzz
+        # tests (oracle + server-restart, i.e. ^TestQwpFuzzIngress). The
+        # egress/read, single-thread encoding, and pure-cursor fuzz
+        # families don't exercise that path; the full run below covers
+        # them. Race instruments the Go client only — the JVM server is a
+        # separate process — so the slowdown is bounded.
+        env:
+          GOTOOLCHAIN: local
+          QDB_REPO: ${{ github.workspace }}/questdb
+          QDB_FUZZ_STRICT: "1"
+        run: go test -race -count=1 -timeout 20m -run '^TestQwp(Integration|FuzzIngress)' -v .
+
       - name: Run QWP fuzz + integration tests
+        # Broad correctness pass over every QWP fuzz + integration test.
+        # Runs without -race (the focused race pass above guards the
+        # send/ACK path; a full-suite race run would blow the timeout for
+        # no added coverage of that path).
         env:
           GOTOOLCHAIN: local
           QDB_REPO: ${{ github.workspace }}/questdb
