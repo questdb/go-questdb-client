@@ -181,6 +181,15 @@ func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
 				return nil, errHttpOnlySender
 			}
 		}
+		// Mirror the validation the conf-string branch gets via
+		// LineSenderFromConf->newLineSender. The senderType check above
+		// catches WithTcp/WithQwp, but QWP-only knobs (WithErrorHandler,
+		// WithSfDir, ...) leave senderType unchanged; sanitizeHttpConf
+		// rejects them so the pool never builds an HTTP sender that
+		// silently drops them.
+		if err = sanitizeHttpConf(conf); err != nil {
+			return nil, err
+		}
 		s, err = newHttpLineSender(ctx, conf)
 	}
 

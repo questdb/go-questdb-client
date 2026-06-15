@@ -259,3 +259,26 @@ func TestPoolFromOptionsRejectsQwp(t *testing.T) {
 	_, err = p.Sender(context.Background())
 	assert.ErrorContains(t, err, "only http/s")
 }
+
+// QWP-only knobs do not flip the sender type, so the senderType check
+// in Sender() does not catch them. They must still be rejected, matching
+// the conf-string branch which sanitizes via LineSenderFromConf.
+func TestPoolFromOptionsRejectsQwpOnlyOptions(t *testing.T) {
+	cases := []struct {
+		name string
+		opt  qdb.LineSenderOption
+	}{
+		{"WithErrorHandler", qdb.WithErrorHandler(func(*qdb.SenderError) {})},
+		{"WithServerErrorPolicy", qdb.WithServerErrorPolicy(qdb.PolicyHalt)},
+		{"WithSfDir", qdb.WithSfDir(t.TempDir())},
+		{"WithDrainOrphans", qdb.WithDrainOrphans(true)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := qdb.PoolFromOptions(qdb.WithHttp(), tc.opt)
+			require.NoError(t, err)
+			_, err = p.Sender(context.Background())
+			assert.ErrorContains(t, err, "only available in the QWP client")
+		})
+	}
+}
