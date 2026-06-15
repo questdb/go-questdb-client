@@ -110,7 +110,22 @@ func qwpSfMunmap(buf []byte) error {
 	return nil
 }
 
-// qwpSfMsync synchronously flushes [0, length) of buf to disk.
+// qwpSfMsync flushes the mapped dirty pages of [0, length) to the
+// filesystem via FlushViewOfFile.
+//
+// This is weaker than the unix MS_SYNC counterpart: FlushViewOfFile
+// writes the modified pages into the filesystem cache but Windows does
+// not guarantee they reach the physical disk until FlushFileBuffers is
+// called on the underlying file handle. The OS-crash-durability path that
+// would need that guarantee is not wired yet (qwpSfSegment.msync has only
+// test callers), so the gap is currently latent rather than live.
+//
+// TODO(durability): when fsync-grade durability is enabled, follow the
+// FlushViewOfFile below with windows.FlushFileBuffers(fileHandle) to match
+// MS_SYNC. The file handle is not reachable here — this helper takes only
+// the mapped buffer — so plumb qwpSfSegment.file (or track the file handle
+// alongside the mapping handle in qwpSfWindowsMappings) into the signature
+// at that time.
 func qwpSfMsync(buf []byte, length int64) error {
 	if buf == nil || length <= 0 {
 		return nil
