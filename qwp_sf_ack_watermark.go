@@ -58,11 +58,21 @@ import (
 // existing watermark; ignoring it re-replays already-durable frames,
 // producing row-level duplicates against a still-alive server.
 //
-// Why no CRC: a stale-low watermark only means more re-replay, and a
-// stale-high watermark is rejected by the recovery path's
-// max(lowestBase-1, watermark) clamp + publishedFsn bound. fsync is
-// intentionally NOT performed — a host crash falls back to the
-// segment-derived seed, same as before this feature (no regression).
+// No CRC and no fsync: the watermark is a best-effort replay
+// optimisation, not a crash-durable record. Real fsync durability is
+// the deferred sf_durability=flush|append follow-up; segment files
+// carry their own CRC32C and torn-tail recovery, the watermark does
+// not. Recovery's clamp + bound catch only the gross corruption modes:
+//   - stale-low / INVALID: max(lowestBase-1, watermark) picks the
+//     segment-derived seed, costing only extra re-replay.
+//   - stale-high past publishedFsn: the seed > publishedFsn check
+//     rejects it and falls back to the segment seed.
+// Neither catches a torn 8-byte FSN store that lands in range — true
+// acked FSN < w' <= publishedFsn — from a partially persisted aligned
+// store surviving a power loss: frames in (acked, w'] then look acked
+// and never replay, a silent loss. That residual window is the cost
+// of running without fsync/CRC and closes only when sf_durability
+// gains real flush semantics.
 //
 // Concurrency: single-writer after construction (the segment-manager
 // goroutine, via persistIfAdvanced). read() runs once at engine
@@ -223,10 +233,14 @@ func (w *qwpSfAckWatermark) read() int64 {
 
 // storeLocked writes fsn into the mapped region. Caller MUST hold
 // w.mu and have checked !w.closed. FSN is stored before the magic so
-// that a reader which observes the magic (stamped second, in program
-// order) also observes a valid FSN — no memory fence is needed
-// because the same goroutine performs both stores and crash recovery
-// resumes a fresh process that sees whatever the kernel flushed.
+// that, within a live page cache, a reader which observes the magic
+// (stamped second, in program order) also observes a valid FSN — this
+// keeps a clean restart from honouring magic=AKW1 over a still-zero
+// FSN. No memory fence is needed: the same goroutine performs both
+// stores and read() runs only at startup. The ordering is an
+// intra-process / page-cache property; it does not survive a torn
+// power-loss write, whose residual silent-loss window the no-CRC /
+// no-fsync note above covers.
 func (w *qwpSfAckWatermark) storeLocked(fsn int64) {
 	binary.LittleEndian.PutUint64(w.buf[qwpSfAckWatermarkFsnOffset:qwpSfAckWatermarkFsnOffset+8], uint64(fsn))
 	if !w.magicWritten {
