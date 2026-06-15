@@ -579,20 +579,32 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 	wireSize := c.fixedSize // 8, 16, or 32
 	startOffset := uint8(32 - wireSize)
 
-	// Check for overflow: significant bytes that don't fit.
+	// Check for overflow: the value's significant bytes must fit in the
+	// wire width without altering the value.
 	if d.offset < startOffset {
-		// Verify the bytes beyond wire size are pure sign extension.
 		signByte := byte(0x00)
 		if d.unscaled[d.offset]&0x80 != 0 {
 			signByte = 0xFF
 		}
+		// Two conditions must hold for the truncation to be lossless:
+		// the dropped bytes must be pure sign extension, and the
+		// retained most-significant byte must itself carry a sign bit
+		// matching the value's sign. The latter guards the boundary
+		// where a value needs exactly one extra byte that happens to be
+		// the sign byte (e.g. +2^63), so dropping it would otherwise
+		// flip the sign and store MinInt64.
+		overflow := d.unscaled[startOffset]&0x80 != signByte&0x80
 		for i := d.offset; i < startOffset; i++ {
 			if d.unscaled[i] != signByte {
-				return fmt.Errorf(
-					"qwp: column %q: decimal value overflows %d-byte storage",
-					c.name, wireSize,
-				)
+				overflow = true
+				break
 			}
+		}
+		if overflow {
+			return fmt.Errorf(
+				"qwp: column %q: decimal value overflows %d-byte storage",
+				c.name, wireSize,
+			)
 		}
 	}
 

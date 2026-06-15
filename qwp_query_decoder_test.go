@@ -678,13 +678,16 @@ func TestQwpDecoderRoundTripDecimal128(t *testing.T) {
 		{scale: 4, hi: 0xFFFFFFFFFFFFFFFF, lo: 0xFFFFFFFFFFFFFFFF, signedHi: -1},
 	}
 	// Build a Decimal value at the desired scale and unscaled coefficient
-	// so addDecimal picks DECIMAL128 width. NewDecimal builds a 32-byte
-	// big-endian unscaled buffer directly.
+	// so addDecimal picks DECIMAL128 width. NewDecimalUnsafe takes a
+	// two's complement big-endian unscaled buffer directly.
 	for _, c := range cases {
-		// Build big-endian 16-byte unscaled value: hi || lo.
-		buf := make([]byte, 32)
-		binary.BigEndian.PutUint64(buf[16:], c.hi)
-		binary.BigEndian.PutUint64(buf[24:], c.lo)
+		// Build a big-endian 16-byte two's complement unscaled value
+		// (hi || lo). NewDecimalUnsafe interprets the sign over these 16
+		// bytes, matching the DECIMAL128 column width, so an all-ones
+		// pattern is the signed value -1.
+		buf := make([]byte, 16)
+		binary.BigEndian.PutUint64(buf[0:], c.hi)
+		binary.BigEndian.PutUint64(buf[8:], c.lo)
 		dec, err := NewDecimalUnsafe(buf, c.scale)
 		if err != nil {
 			t.Fatalf("NewDecimalUnsafe: %v", err)

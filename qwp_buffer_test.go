@@ -2203,6 +2203,93 @@ func TestQwpColumnBufferDecimalOverflow(t *testing.T) {
 			t.Fatalf("rowCount = %d, want 1", c.rowCount)
 		}
 	})
+
+	// Boundary cases at exactly ±2^(8·width−1). The unscaled coefficient
+	// of +2^(8·width−1) needs one byte more than the wire width, and that
+	// extra byte is the 0x00 sign byte; without an MSB sign-bit check the
+	// truncated value silently flips sign to the most-negative int (e.g.
+	// +2^63 → MinInt64). The negative endpoints are the genuine
+	// most-negative values and must still be accepted.
+	t.Run("Decimal64PositiveBoundaryOverflows", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal64, false)
+		// 2^63 = MaxInt64 + 1; does not fit a signed 8-byte value.
+		d, err := NewDecimal(new(big.Int).Lsh(big.NewInt(1), 63), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err == nil {
+			t.Fatalf("expected overflow error for +2^63, got bytes %x", c.fixedData)
+		}
+		if c.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0 (unchanged after error)", c.rowCount)
+		}
+	})
+
+	t.Run("Decimal64NegativeBoundaryOverflows", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal64, false)
+		// -(2^63 + 1) = MinInt64 - 1; does not fit a signed 8-byte value.
+		v := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 63), big.NewInt(1))
+		d, err := NewDecimal(v.Neg(v), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err == nil {
+			t.Fatalf("expected overflow error for -(2^63+1), got bytes %x", c.fixedData)
+		}
+		if c.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0 (unchanged after error)", c.rowCount)
+		}
+	})
+
+	t.Run("Decimal64MinInt64Fits", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal64, false)
+		// -2^63 = MinInt64; the most-negative value that fits exactly.
+		d, err := NewDecimal(new(big.Int).Neg(new(big.Int).Lsh(big.NewInt(1), 63)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err != nil {
+			t.Fatalf("unexpected error for -2^63 (MinInt64): %v", err)
+		}
+		// MinInt64 little-endian: seven 0x00 bytes then 0x80.
+		expected := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80}
+		if !bytes.Equal(c.fixedData, expected) {
+			t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+		}
+	})
+
+	t.Run("Decimal128PositiveBoundaryOverflows", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal128, false)
+		// 2^127 = MaxInt128 + 1; does not fit a signed 16-byte value.
+		d, err := NewDecimal(new(big.Int).Lsh(big.NewInt(1), 127), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err == nil {
+			t.Fatalf("expected overflow error for +2^127, got bytes %x", c.fixedData)
+		}
+		if c.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0 (unchanged after error)", c.rowCount)
+		}
+	})
+
+	t.Run("Decimal128MinInt128Fits", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal128, false)
+		// -2^127 = MinInt128; the most-negative value that fits exactly.
+		d, err := NewDecimal(new(big.Int).Neg(new(big.Int).Lsh(big.NewInt(1), 127)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err != nil {
+			t.Fatalf("unexpected error for -2^127 (MinInt128): %v", err)
+		}
+		// MinInt128 little-endian: fifteen 0x00 bytes then 0x80.
+		expected := make([]byte, 16)
+		expected[15] = 0x80
+		if !bytes.Equal(c.fixedData, expected) {
+			t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+		}
+	})
 }
 
 func TestQwpColumnBufferDecimalMultipleRows(t *testing.T) {
