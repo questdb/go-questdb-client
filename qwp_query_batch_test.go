@@ -828,6 +828,69 @@ func TestQwpColumnBatchCopyAllRawSurvivesPayloadReuse(t *testing.T) {
 	}
 }
 
+// TestQwpGeohashAccessorWithNulls verifies the Geohash accessors on both
+// the batch and the cached-column surface at a sub-8-byte precision with
+// interleaved nulls. Precision 12 packs 2 bytes per non-null value, so the
+// dense stride is 2, not 8, and the nulls route every read through the
+// null-bitmap / denseIndex mapping. A wrong (Int64-style *8) stride would
+// index the wrong cell or run past the dense region; this pins the
+// precision-sized stride the accessor must use.
+func TestQwpGeohashAccessorWithNulls(t *testing.T) {
+	const prec = 12
+	type row struct {
+		val  uint64
+		null bool
+	}
+	rows := []row{
+		{0xABC, false},
+		{0, true},
+		{0x123, false},
+		{0, true},
+		{0xFFF, false},
+	}
+	tb := newQwpTableBuffer("t")
+	for _, r := range rows {
+		col, err := tb.getOrCreateColumn("g", qwpTypeGeohash, true)
+		if err != nil {
+			t.Fatalf("getOrCreateColumn: %v", err)
+		}
+		if r.null {
+			col.addNull()
+		} else if err := col.addGeohash(r.val, prec); err != nil {
+			t.Fatalf("addGeohash: %v", err)
+		}
+		tb.commitRow()
+	}
+
+	var enc qwpEncoder
+	frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
+	dec := newTestQueryDecoder()
+	var batch QwpColumnBatch
+	if err := dec.decode(frame, &batch); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got := batch.GeohashPrecisionBits(0); got != prec {
+		t.Fatalf("GeohashPrecisionBits = %d, want %d", got, prec)
+	}
+	col := batch.Column(0)
+	for i, r := range rows {
+		if got := batch.IsNull(0, i); got != r.null {
+			t.Errorf("IsNull(0,%d) = %v, want %v", i, got, r.null)
+		}
+		want := r.val
+		if r.null {
+			want = 0 // NULL rows read as 0 on both surfaces.
+		}
+		if got := batch.Geohash(0, i); got != want {
+			t.Errorf("batch.Geohash(0,%d) = %#x, want %#x", i, got, want)
+		}
+		if got := col.Geohash(i); got != want {
+			t.Errorf("col.Geohash(%d) = %#x, want %#x", i, got, want)
+		}
+	}
+}
+
 // buildDecimalGeohashFrame produces a one-row RESULT_BATCH frame with
 // a DECIMAL64 column (given scale) and a GEOHASH column (given precision
 // bits). The decoder reads the per-batch scale / precision off the DATA

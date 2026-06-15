@@ -461,6 +461,41 @@ func (b *QwpColumnBatch) Long256Word(col, row, word int) int64 {
 	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
 }
 
+// --- Geohash ---
+
+// Geohash returns the packed bits of a GEOHASH cell at (col, row),
+// right-aligned in a uint64 (the low GeohashPrecisionBits(col) bits hold
+// the value). Returns 0 for NULL rows.
+//
+// GEOHASH is dense-packed at ceil(precisionBits/8) bytes per non-null
+// value — a 1..8-byte stride that varies with the column's precision. The
+// generic Int64 accessor assumes a fixed 8-byte stride and so must NOT be
+// used on GEOHASH columns: for any sub-64-bit precision it both indexes by
+// the wrong multiple and reads past the cell. This accessor sizes the
+// stride and the read width by the column's precision.
+func (b *QwpColumnBatch) Geohash(col, row int) uint64 {
+	l := &b.layouts[col]
+	if l.isNull(row) {
+		return 0
+	}
+	valueSize := (int(l.precisionBits) + 7) / 8
+	off := l.denseIndex(row) * valueSize
+	return qwpGeohashBits(l.values[off : off+valueSize])
+}
+
+// qwpGeohashBits assembles up to 8 little-endian bytes into a uint64,
+// right-aligned. The GEOHASH wire form truncates each value to
+// ceil(precisionBits/8) bytes, so the read width is the column's
+// per-value stride rather than a fixed 8 — binary.LittleEndian.Uint64,
+// which demands exactly 8 bytes, cannot be used.
+func qwpGeohashBits(src []byte) uint64 {
+	var v uint64
+	for i := 0; i < len(src); i++ {
+		v |= uint64(src[i]) << (8 * i)
+	}
+	return v
+}
+
 // --- Strings, varchars, binary ---
 //
 // Each zero-copy accessor returns a []byte sub-slice of the frame
@@ -810,6 +845,20 @@ func (c QwpColumn) Long256Word(row, word int) int64 {
 	}
 	i := l.denseIndex(row)*32 + word*8
 	return int64(binary.LittleEndian.Uint64(l.values[i : i+8]))
+}
+
+// Geohash returns the packed bits of a GEOHASH cell at row, right-aligned
+// in a uint64. Returns 0 for NULL rows. See QwpColumnBatch.Geohash for the
+// stride contract — GEOHASH packs ceil(precisionBits/8) bytes per value,
+// so the generic Int64 accessor must not be used.
+func (c QwpColumn) Geohash(row int) uint64 {
+	l := c.layout
+	if l.isNull(row) {
+		return 0
+	}
+	valueSize := (int(l.precisionBits) + 7) / 8
+	off := l.denseIndex(row) * valueSize
+	return qwpGeohashBits(l.values[off : off+valueSize])
 }
 
 // Str returns the UTF-8 bytes of a STRING, VARCHAR, SYMBOL, or BINARY

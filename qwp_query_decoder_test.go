@@ -652,6 +652,19 @@ func TestQwpDecoderRoundTripGeohash(t *testing.T) {
 					t.Fatalf("geohash[%d] = %#x, want %#x", i, got, want)
 				}
 			}
+			// The public Geohash accessors encapsulate exactly the
+			// stride-sized read done by hand above; both surfaces must
+			// agree with the raw layout.
+			col := batch.Column(0)
+			for i, want := range values {
+				want &= mask
+				if got := batch.Geohash(0, i); got != want {
+					t.Errorf("batch.Geohash(0,%d) = %#x, want %#x", i, got, want)
+				}
+				if got := col.Geohash(i); got != want {
+					t.Errorf("col.Geohash(%d) = %#x, want %#x", i, got, want)
+				}
+			}
 		})
 	}
 }
