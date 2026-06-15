@@ -661,6 +661,20 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	c.nextRequestId++
 	s.currentRequestId.Store(newReqID)
 	if err := s.submit(ctx); err != nil {
+		// Submit failed against the just-published generation (the bound
+		// pointers now reference result.io/result.transport). Tear it down
+		// on the cleanup ctx before returning so its dispatcher, reader,
+		// and WebSocket are reclaimed now rather than lingering until the
+		// next reconnect or Close. Symmetric with the closed-recheck
+		// teardown above. The bound pointers keep referencing this dead
+		// pair, which is the same state a transport fault leaves between
+		// the fault and the next reconnect: every reader tolerates it via
+		// idempotent shutdown()/close() (Close's snapshot, the next
+		// reconnect's top-of-function teardown) or an immediate failure (a
+		// fresh Query/Exec's submitQuery, a racing requestCancel's non-
+		// blocking notify).
+		_ = result.io.shutdown(cleanupCtx)
+		_ = result.transport.close()
 		return nil, fmt.Errorf("qwp query: replay submit failed: %w", err)
 	}
 	// Re-issue the cancel if Cancel landed during the reconnect.
