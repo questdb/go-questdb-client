@@ -27,6 +27,7 @@ package questdb
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -169,10 +170,15 @@ func qwpSfNewSegmentRing(initialActive *qwpSfSegment, maxBytesPerSegment int64) 
 //   - All others become sealed segments awaiting ACK and trim.
 //
 // Returns nil if the directory is empty or contains no recognizable
-// .sfa files. A single bad-magic file is silently skipped (a stray
-// unrelated file in the SF dir shouldn't take the whole sender
-// down). A failure to open an otherwise-valid segment is fatal — the
-// caller's data integrity depends on every segment being readable.
+// .sfa files. A bad-content file (qwpSfErrSegmentCorrupt: bad magic,
+// unsupported version, short file, negative baseSeq) is skipped and
+// logged — a stray or hand-damaged .sfa holds no recoverable frames
+// and shouldn't take the whole sender down. Any other error from
+// qwpSfOpenSegment is a syscall/I-O failure (open/stat/mmap returning
+// EMFILE/ENFILE/ENOMEM/EACCES/EIO) on a file that may well be a valid
+// segment, and is fatal: the caller's data integrity depends on every
+// segment being readable, so recovery refuses to start rather than
+// silently amputate the durable-but-unacked log.
 func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, error) {
 	if _, err := os.Stat(sfDir); err != nil {
 		if os.IsNotExist(err) {
@@ -205,11 +211,25 @@ func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, e
 		path := filepath.Join(sfDir, name)
 		seg, err := qwpSfOpenSegment(path)
 		if err != nil {
-			// Stray file with the .sfa extension but bad header /
-			// unreadable: skip rather than fail the recovery. The
-			// engine will log when it surfaces this case via the
-			// returned ring.
-			continue
+			if errors.Is(err, qwpSfErrSegmentCorrupt) {
+				// Bad-content .sfa (bad magic/version/header/baseSeq):
+				// a stray or hand-damaged file with no recoverable
+				// frames behind it. Skip rather than fail the whole
+				// recovery, but log so the skip is never silent.
+				log.Printf("[WARN] qwp/sf: skipping corrupt segment during recovery: %v", err)
+				continue
+			}
+			// A syscall/I-O failure (EMFILE/ENFILE/ENOMEM/EACCES/EIO)
+			// on a file that may be a perfectly valid segment: the
+			// system is under pressure, not the data corrupt. Refuse to
+			// start rather than silently amputate the log. Skipping the
+			// newest segment would drop its persisted-but-unacked frames
+			// with no FSN gap to flag it; skipping the oldest would make
+			// the engine seed ackedFsn from a surviving segment and
+			// treat the skipped frames as already-acked, so neither case
+			// ever replays. The deferred cleanup above closes whatever
+			// was opened before this point.
+			return nil, fmt.Errorf("qwp/sf: open segment %s during recovery: %w", path, err)
 		}
 		// Filter out empty leftovers — typically hot-spare segments
 		// the manager pre-allocated for a prior session that never

@@ -190,6 +190,8 @@ func TestQwpSfSegmentRecoveryRejectsBadMagic(t *testing.T) {
 	seg, err := qwpSfOpenSegment(path)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "bad magic")
+	// Bad content classifies as skippable for recovery.
+	assert.ErrorIs(t, err, qwpSfErrSegmentCorrupt)
 	assert.Nil(t, seg)
 }
 
@@ -208,6 +210,7 @@ func TestQwpSfSegmentRecoveryRejectsBadVersion(t *testing.T) {
 	seg, err := qwpSfOpenSegment(path)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported version")
+	assert.ErrorIs(t, err, qwpSfErrSegmentCorrupt)
 	assert.Nil(t, seg)
 }
 
@@ -289,6 +292,7 @@ func TestQwpSfSegmentRecoveryRejectsNegativeBaseSeq(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, seg)
 	assert.Contains(t, err.Error(), "bad baseSeq")
+	assert.ErrorIs(t, err, qwpSfErrSegmentCorrupt)
 }
 
 func TestQwpSfSegmentRecoveryRejectsOversizedLength(t *testing.T) {

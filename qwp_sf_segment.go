@@ -77,6 +77,21 @@ var qwpSfErrLockBusy = errors.New("qwp/sf: lock busy")
 //lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 var qwpSfErrSegmentFull = errors.New("qwp/sf: segment full")
 
+// qwpSfErrSegmentCorrupt marks a segment file whose *content* is not a
+// valid SF segment: a file shorter than the header, bad magic, an
+// unsupported version, or a negative baseSeq. qwpSfOpenSegment wraps
+// these with this sentinel so qwpSfOpenRing can tell them apart from
+// syscall/I-O failures (open/stat/mmap returning EMFILE/ENFILE/ENOMEM/
+// EACCES/EIO), which it propagates unwrapped. The distinction is
+// load-bearing for crash recovery: a corrupt file holds no recoverable
+// frames and is skipped, whereas an I-O failure means an otherwise-valid
+// segment is merely unreadable right now (the system is under pressure),
+// so recovery must refuse to start rather than silently amputate the
+// durable-but-unacked log.
+//
+//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
+var qwpSfErrSegmentCorrupt = errors.New("qwp/sf: corrupt segment file")
+
 // qwpSfSegment is one mmap-backed (or in-memory) SF segment. The
 // producer thread (single user goroutine) appends frames into the
 // mapping; the I/O thread (single consumer goroutine) reads up to
@@ -230,6 +245,14 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 // are non-zero, indicating an attempted-but-failed frame write), the
 // byte count is exposed via tornTailBytes() so operators can detect
 // silent truncation from corruption or partial writes.
+//
+// Errors are classified for the recovery caller (qwpSfOpenRing): a
+// bad-content file (short file, bad magic, unsupported version,
+// negative baseSeq) is wrapped with qwpSfErrSegmentCorrupt and is safe
+// to skip; a syscall/I-O failure from stat/open/mmap (EMFILE, ENFILE,
+// ENOMEM, EACCES, EIO, ...) is propagated unwrapped, because the file
+// may be a perfectly valid segment that is merely unreadable under
+// resource pressure and must not be silently dropped from the log.
 func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	st, err := os.Stat(path)
 	if err != nil {
@@ -237,7 +260,7 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	}
 	fileSize := st.Size()
 	if fileSize < qwpSfHeaderSize {
-		return nil, fmt.Errorf("qwp/sf: file shorter than header: %s size=%d", path, fileSize)
+		return nil, fmt.Errorf("%w: file shorter than header: %s size=%d", qwpSfErrSegmentCorrupt, path, fileSize)
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -252,25 +275,26 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	if magic != qwpSfFileMagic {
 		_ = qwpSfMunmap(buf)
 		_ = f.Close()
-		return nil, fmt.Errorf("qwp/sf: bad magic in %s: 0x%x", path, magic)
+		return nil, fmt.Errorf("%w: bad magic in %s: 0x%x", qwpSfErrSegmentCorrupt, path, magic)
 	}
 	version := buf[4]
 	if version != qwpSfSegmentVersion {
 		_ = qwpSfMunmap(buf)
 		_ = f.Close()
-		return nil, fmt.Errorf("qwp/sf: unsupported version in %s: %d", path, version)
+		return nil, fmt.Errorf("%w: unsupported version in %s: %d", qwpSfErrSegmentCorrupt, path, version)
 	}
 	baseSeq := int64(binary.LittleEndian.Uint64(buf[8:16]))
 	// FSNs are non-negative by construction. A negative baseSeq on disk
-	// means bit-rot or a hand-edited file — refuse so qwpSfOpenRing's
-	// per-file skip handles it like any other unreadable .sfa rather
-	// than feeding the bad value into the unsigned-comparison sort and
-	// contiguity check (which would place the segment last and trip the
-	// FSN-gap error, taking the whole recovery down).
+	// means bit-rot or a hand-edited file — flag it corrupt so
+	// qwpSfOpenRing's per-file skip handles it like any other
+	// bad-content .sfa rather than feeding the bad value into the
+	// unsigned-comparison sort and contiguity check (which would place
+	// the segment last and trip the FSN-gap error, taking the whole
+	// recovery down).
 	if baseSeq < 0 {
 		_ = qwpSfMunmap(buf)
 		_ = f.Close()
-		return nil, fmt.Errorf("qwp/sf: bad baseSeq in %s: %d", path, baseSeq)
+		return nil, fmt.Errorf("%w: bad baseSeq in %s: %d", qwpSfErrSegmentCorrupt, path, baseSeq)
 	}
 	lastGood := qwpSfScanFrames(buf, fileSize)
 	count := qwpSfCountFrames(buf, lastGood)

@@ -25,8 +25,10 @@
 package questdb
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -398,6 +400,79 @@ func TestQwpSfRingOpenExistingQuarantinesCorruptFirstFrame(t *testing.T) {
 	assert.True(t, os.IsNotExist(statErr), "original .sfa should have been renamed")
 	_, statErr = os.Stat(path + ".corrupt")
 	assert.NoError(t, statErr, "<path>.corrupt should exist after quarantine")
+}
+
+func TestQwpSfRingOpenExistingSkipsCorruptStrayFile(t *testing.T) {
+	// A stray / hand-damaged .sfa (bad magic, no recoverable frames)
+	// must not take recovery down — it is skipped and the valid
+	// segments still recover. This is the skippable half of the
+	// open-error classification.
+	dir := t.TempDir()
+	for _, base := range []int64{0, 5} {
+		path := filepath.Join(dir, "sf-"+formatHex16(uint64(base))+".sfa")
+		seg, err := qwpSfCreateSegment(path, base, 4096)
+		require.NoError(t, err)
+		for i := 0; i < 5; i++ {
+			_, err := seg.tryAppend([]byte{byte(base), byte(i)})
+			require.NoError(t, err)
+		}
+		require.NoError(t, seg.close())
+	}
+	// A zero-filled .sfa has magic 0x00000000 → qwpSfErrSegmentCorrupt.
+	stray := filepath.Join(dir, "sf-stray.sfa")
+	require.NoError(t, os.WriteFile(stray, make([]byte, 4096), 0o644))
+
+	r, err := qwpSfOpenRing(dir, 4096)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	defer func() { _ = r.segmentRingClose() }()
+
+	// Both valid segments recovered; the stray contributed nothing.
+	active := r.getActiveSegment()
+	require.NotNil(t, active)
+	assert.Equal(t, int64(5), active.segmentBaseSeq())
+	assert.Len(t, r.getSealedSegments(), 1)
+	assert.Equal(t, int64(10), r.nextSeqHint())
+}
+
+func TestQwpSfRingOpenExistingFailsOnUnreadableSegment(t *testing.T) {
+	// An I-O failure (here EACCES, standing in for EMFILE/ENFILE/ENOMEM/
+	// EIO) on a file that is a perfectly valid segment must be FATAL:
+	// recovery refuses to start rather than silently dropping the
+	// segment's persisted-but-unacked frames from the log. Skipping the
+	// newest segment would leave a contiguous prefix with no FSN gap to
+	// flag the loss.
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based permission denial is not portable to Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits; cannot induce EACCES")
+	}
+	dir := t.TempDir()
+	var newest string
+	for _, base := range []int64{0, 5} {
+		path := filepath.Join(dir, "sf-"+formatHex16(uint64(base))+".sfa")
+		seg, err := qwpSfCreateSegment(path, base, 4096)
+		require.NoError(t, err)
+		for i := 0; i < 5; i++ {
+			_, err := seg.tryAppend([]byte{byte(base), byte(i)})
+			require.NoError(t, err)
+		}
+		require.NoError(t, seg.close())
+		newest = path
+	}
+	// Make the newest segment unreadable: stat still succeeds, but the
+	// O_RDWR open inside qwpSfOpenSegment fails with EACCES.
+	require.NoError(t, os.Chmod(newest, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(newest, 0o644) })
+
+	r, err := qwpSfOpenRing(dir, 4096)
+	require.Error(t, err)
+	assert.Nil(t, r)
+	// Fatal, not classified as corruption — the file is valid, just
+	// unreadable under (simulated) resource pressure.
+	assert.False(t, errors.Is(err, qwpSfErrSegmentCorrupt),
+		"an I-O failure must not be classified as a skippable corruption")
 }
 
 func TestQwpSfRingAcknowledgeClampsAtPublishedFsn(t *testing.T) {
