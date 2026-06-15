@@ -490,7 +490,11 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
-			if parsedVal < qwpSfMinErrorInboxCapacity {
+			// 0 is the "use the default capacity" sentinel, resolved at
+			// construction (qwpSfDefaultErrorInboxCapacity), matching the
+			// WithErrorInboxCapacity option path. Any other sub-floor value
+			// is a user-supplied undersized inbox and is rejected.
+			if parsedVal != 0 && parsedVal < qwpSfMinErrorInboxCapacity {
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %d: must be >= %d",
 					k, parsedVal, qwpSfMinErrorInboxCapacity)

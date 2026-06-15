@@ -93,7 +93,6 @@ func TestErrorApiConfStringInvalidValues(t *testing.T) {
 		{"ws::addr=h:9000;on_security_error=;", "on_security_error"},
 		{"ws::addr=h:9000;on_write_error=halts;", "on_write_error"},
 		{"ws::addr=h:9000;error_inbox_capacity=-1;", "error_inbox_capacity"},
-		{"ws::addr=h:9000;error_inbox_capacity=0;", "error_inbox_capacity"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.conf, func(t *testing.T) {
@@ -164,6 +163,17 @@ func TestErrorApiSanitizerRejectsTinyInbox(t *testing.T) {
 func TestErrorApiSanitizerAcceptsAtFloor(t *testing.T) {
 	if _, err := qdb.ConfFromStr("ws::addr=h:9000;error_inbox_capacity=16;"); err != nil {
 		t.Fatalf("capacity=16 should pass, got %v", err)
+	}
+}
+
+// TestErrorApiConfStringZeroMeansDefault asserts error_inbox_capacity=0
+// is accepted as the "use the default capacity" sentinel, matching the
+// WithErrorInboxCapacity option path. The default is resolved at
+// construction (qwpSfDefaultErrorInboxCapacity), so 0 bypasses the
+// >= 16 floor instead of being rejected as undersized.
+func TestErrorApiConfStringZeroMeansDefault(t *testing.T) {
+	if _, err := qdb.ConfFromStr("ws::addr=h:9000;error_inbox_capacity=0;"); err != nil {
+		t.Fatalf("error_inbox_capacity=0 should be accepted (use-default), got %v", err)
 	}
 }
 
