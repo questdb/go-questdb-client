@@ -244,9 +244,11 @@ func TestQwpMaxColumnsPerTable(t *testing.T) {
 }
 
 func TestQwpMaxBindsPerQuery(t *testing.T) {
-	// Pinned by spec §16 (max bind parameters per QUERY_REQUEST).
-	if qwpMaxBindsPerQuery != 1024 {
-		t.Errorf("qwpMaxBindsPerQuery = %d, want 1024", qwpMaxBindsPerQuery)
+	// Bind parameters per QUERY_REQUEST are bounded by
+	// MAX_COLUMNS_PER_TABLE (2048); the Java client enforces the same
+	// value, so a bind count Java accepts is accepted here too.
+	if qwpMaxBindsPerQuery != 2048 {
+		t.Errorf("qwpMaxBindsPerQuery = %d, want 2048", qwpMaxBindsPerQuery)
 	}
 }
 
