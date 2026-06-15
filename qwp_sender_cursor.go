@@ -350,6 +350,13 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		orphans := qwpSfScanOrphans(conf.sfDir, ownSlot)
 		if len(orphans) > 0 {
 			pool := qwpSfNewDrainerPool(maxDrainers)
+			// Publish the pool onto the sender before submitting any
+			// drainers. A panic mid-loop then still routes through the
+			// deferred closeCursor, whose drainerPoolClose() reaches the
+			// pool and shuts down the drainers already submitted; leaving
+			// the assignment past the loop would strand those goroutines
+			// and their connections.
+			s.drainerPool = pool
 			for _, orphan := range orphans {
 				drainer := qwpSfNewOrphanDrainer(
 					orphan,
@@ -360,7 +367,6 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 				)
 				_ = pool.drainerPoolSubmit(ctx, drainer)
 			}
-			s.drainerPool = pool
 		}
 		setupOK = true
 	}
