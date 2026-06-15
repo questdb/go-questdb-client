@@ -1114,7 +1114,7 @@ func (c QwpColumn) Float32Range(fromRow, toRow int, dst []float32) []float32 {
 // typed accessor (Int64, Str, Float64Array, …) works identically on the
 // copy.
 //
-// The copy differs from a live batch in two ways, both invisible to
+// The copy differs from a live batch in three ways, all invisible to
 // callers:
 //
 //  1. The pool-owned layout arrays (nonNullIdx, symbolRowIds,
@@ -1124,6 +1124,11 @@ func (c QwpColumn) Float32Range(fromRow, toRow int, dst []float32) []float32 {
 //     aliased the source payload (values, stringBytes, nullBitmap) is
 //     re-pointed at the clone via offset translation, so the copy is
 //     independent of the source's backing buffer.
+//  3. SYMBOL columns copy out only the dictionary entries their rows
+//     reference (compactSymbolDict) into a private heap. A live
+//     symbolDict view aliases the decoder's connection-scoped heap —
+//     append-grown up to qwpMaxConnDictHeapBytes (256 MiB) — so a
+//     retained snapshot must not re-share its slice headers.
 //
 // Both transport paths produce copies that survive reuse: the zstd
 // path's `payload` aliased the per-batch decompression scratch the
@@ -1134,7 +1139,8 @@ func (c QwpColumn) Float32Range(fromRow, toRow int, dst []float32) []float32 {
 //
 // Cost: one []qwpColumnLayout slice + one fresh backing slice per
 // pool-owned layout field, plus a one-shot deep clone of the payload
-// bytes.
+// bytes and, for SYMBOL columns, a compact copy of the referenced
+// dictionary entries and their bytes.
 func (b *QwpColumnBatch) CopyAll() *QwpColumnBatch {
 	sb := &QwpColumnBatch{
 		requestId:   b.requestId,
@@ -1172,11 +1178,20 @@ func (b *QwpColumnBatch) CopyAll() *QwpColumnBatch {
 		dst.nonNullIdx = slices.Clone(src.nonNullIdx)
 		dst.values = rebindIfAliased(src.values, srcPayload, clonedPayload)
 		dst.stringBytes = rebindIfAliased(src.stringBytes, srcPayload, clonedPayload)
-		dst.symbolRowIds = slices.Clone(src.symbolRowIds)
-		// symbolDict snapshot: heap + entries lengths are frozen at
-		// snapshot time and the decoder only ever append-extends them,
-		// so the view stays valid without copying.
-		dst.symbolDict = src.symbolDict
+		// SYMBOL columns: a live symbolDict view aliases the decoder's
+		// connection-scoped heap, which append-grows up to
+		// qwpMaxConnDictHeapBytes (256 MiB). Copy out only the entries
+		// this column's rows reference and reindex symbolRowIds onto the
+		// compact dict, so a retained snapshot pins its own bytes rather
+		// than the whole connection heap. Non-SYMBOL columns have an
+		// empty symbolRowIds and a zero-value symbolDict, so the clones
+		// are no-ops that keep the field shapes uniform with a live batch.
+		if src.info.wireType == qwpTypeSymbol {
+			dst.symbolDict, dst.symbolRowIds = compactSymbolDict(src)
+		} else {
+			dst.symbolRowIds = slices.Clone(src.symbolRowIds)
+			dst.symbolDict = src.symbolDict
+		}
 		dst.arrayRowStart = slices.Clone(src.arrayRowStart)
 		dst.arrayElems = slices.Clone(src.arrayElems)
 		dst.timestampBuf = slices.Clone(src.timestampBuf)
@@ -1190,6 +1205,61 @@ func (b *QwpColumnBatch) CopyAll() *QwpColumnBatch {
 		}
 	}
 	return sb
+}
+
+// compactSymbolDict copies out the dictionary entries this SYMBOL
+// column's non-null rows reference into a freshly-allocated,
+// heap-owned dictionary and returns it alongside a fresh symbolRowIds
+// slice reindexed onto that compact dictionary.
+//
+// A live qwpSymbolDictView aliases the decoder's connection-scoped
+// symbol heap, which the decoder append-grows up to
+// qwpMaxConnDictHeapBytes (256 MiB) over the connection's life. A
+// CopyAll snapshot that re-shared those slice headers would pin the
+// whole heap for as long as the caller retained the copy. Copying out
+// only the referenced symbols bounds the snapshot's symbol memory at
+// the distinct strings its own rows address.
+//
+// NULL rows are skipped: their symbolRowIds value is undefined and the
+// typed accessors null-check before indexing, so the corresponding
+// fresh slot is left 0 and never read. An out-of-range id on a
+// non-null row cannot occur post-decode (parseSymbol validates id <
+// dictSize); the bounds check mirrors the accessors' defense-in-depth
+// by leaving such an id out of range in the compact dict too, so the
+// snapshot renders it identically (as a nil/empty cell) instead of
+// panicking in this escape hatch.
+func compactSymbolDict(src *qwpColumnLayout) (qwpSymbolDictView, []int32) {
+	rowIds := make([]int32, len(src.symbolRowIds))
+	// remap[oldId] = compact id for symbols already copied. The distinct
+	// referenced set is bounded by the row count, not the (possibly
+	// huge) connection dict, so this stays small.
+	remap := make(map[int32]int32)
+	var heap []byte
+	var entries []qwpSymbolEntry
+	for row := range src.symbolRowIds {
+		if src.isNull(row) {
+			continue
+		}
+		oldId := src.symbolRowIds[row]
+		if int(oldId) >= len(src.symbolDict.entries) {
+			rowIds[row] = oldId
+			continue
+		}
+		if newId, ok := remap[oldId]; ok {
+			rowIds[row] = newId
+			continue
+		}
+		e := src.symbolDict.entries[oldId]
+		newId := int32(len(entries))
+		entries = append(entries, qwpSymbolEntry{
+			offset: uint32(len(heap)),
+			length: e.length,
+		})
+		heap = append(heap, src.symbolDict.heap[e.offset:e.offset+e.length]...)
+		remap[oldId] = newId
+		rowIds[row] = newId
+	}
+	return qwpSymbolDictView{heap: heap, entries: entries}, rowIds
 }
 
 // rebindIfAliased returns src unchanged when it doesn't alias

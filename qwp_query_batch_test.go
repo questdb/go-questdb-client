@@ -1484,6 +1484,81 @@ func TestQwpColumnBatchCopyAllSymbolSurvivesPoolReuse(t *testing.T) {
 	}
 }
 
+// TestQwpColumnBatchCopyAllSymbolCopiesOutReferencedBytes asserts the
+// memory-independence half of CopyAll's contract for SYMBOL columns. A
+// live symbolDict view aliases the decoder's connection-scoped heap,
+// which append-grows up to 256 MiB; re-sharing its slice headers would
+// pin the whole heap behind a retained snapshot. CopyAll instead
+// copies out only the entries the column's rows reference. Proven three
+// ways: the snapshot heap does not alias the source heap, it holds only
+// the referenced bytes, and clobbering the source heap leaves the
+// snapshot intact.
+func TestQwpColumnBatchCopyAllSymbolCopiesOutReferencedBytes(t *testing.T) {
+	info := qwpColumnSchemaInfo{name: "sy", wireType: qwpTypeSymbol}
+	// Connection-scoped dict of five symbols; the column references two.
+	heap := []byte("alphabetagammadeltaepsilon")
+	entries := []qwpSymbolEntry{
+		{offset: 0, length: 5},  // alpha
+		{offset: 5, length: 4},  // beta
+		{offset: 9, length: 5},  // gamma
+		{offset: 14, length: 5}, // delta
+		{offset: 19, length: 7}, // epsilon
+	}
+	dict := qwpSymbolDictView{heap: heap, entries: entries}
+
+	// Rows: gamma, alpha, NULL, gamma. Distinct referenced = {alpha,
+	// gamma} = 10 bytes / 2 entries, a strict subset of the 26-byte,
+	// 5-entry connection dict. Row 0 and row 3 share an id so the remap
+	// must collapse them; row 1 is a different id.
+	rowCount := 4
+	bitmap := make([]byte, 1)
+	bitmap[0] = 1 << 2 // row 2 NULL
+	nonNullIdx := []int32{0, 1, -1, 2}
+	symbolRowIds := []int32{2, 0, 2 /* stale, row is NULL */, 2}
+
+	layout := qwpColumnLayout{
+		info:         &info,
+		nullBitmap:   bitmap,
+		nonNullIdx:   nonNullIdx,
+		nonNullCount: 3,
+		symbolRowIds: symbolRowIds,
+		symbolDict:   dict,
+	}
+	batch := newSingleColumnBatch(info, layout, rowCount)
+
+	snapshot := batch.CopyAll()
+	snapDict := snapshot.layouts[0].symbolDict
+
+	// (1) The snapshot heap is a private allocation, not a view into the
+	// connection-scoped heap.
+	if aliases(snapDict.heap, heap) {
+		t.Fatalf("snapshot symbol heap aliases the connection heap; CopyAll must copy out referenced bytes")
+	}
+	// (2) Only the referenced symbols were copied out: alpha(5)+gamma(5)
+	// = 10 bytes across 2 entries, not the full 26-byte / 5-entry dict.
+	if len(snapDict.heap) != 10 {
+		t.Fatalf("snapshot heap = %d bytes, want 10 (only referenced alpha+gamma)", len(snapDict.heap))
+	}
+	if len(snapDict.entries) != 2 {
+		t.Fatalf("snapshot entries = %d, want 2 (distinct referenced symbols)", len(snapDict.entries))
+	}
+
+	// (3) Clobber the source connection heap; a correct copy is wholly
+	// independent of it.
+	for i := range heap {
+		heap[i] = 'X'
+	}
+	want := []string{"gamma", "alpha", "", "gamma"}
+	for i, w := range want {
+		if got := snapshot.String(0, i); got != w {
+			t.Fatalf("snapshot row %d = %q, want %q (CopyAll didn't copy out symbol bytes)", i, got, w)
+		}
+	}
+	if !snapshot.IsNull(0, 2) {
+		t.Fatalf("snapshot row 2 must remain NULL")
+	}
+}
+
 // TestQwpColumnBatchCopyAllArraySurvivesPoolReuse covers the ARRAY
 // corner of CopyAll: a snapshot must keep its shape + elements after the
 // decoder reuses the batch for the next frame. That clobbers two kinds
