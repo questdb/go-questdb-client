@@ -255,6 +255,28 @@ func TestSfConfRejectsNegativeNumbers(t *testing.T) {
 	}
 }
 
+// TestSfConfMaxBytesZeroMeansDefault pins that sf_max_bytes=0 and
+// sf_max_total_bytes=0 are accepted as the "use the default" sentinel,
+// parsing to 0 and resolving to qwpSfDefaultMaxBytes /
+// qwpSfDefaultMaxTotalBytes at construction. This matches the
+// WithSfMaxBytes(0) / WithSfMaxTotalBytes(0) option path and the
+// error_inbox_capacity=0 convention.
+func TestSfConfMaxBytesZeroMeansDefault(t *testing.T) {
+	conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_bytes=0;sf_max_total_bytes=0;")
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), conf.sfMaxBytes)
+	assert.Equal(t, int64(0), conf.sfMaxTotalBytes)
+
+	// Builder parity: WithSfMaxBytes(0) / WithSfMaxTotalBytes(0) also
+	// pass sanitization as the use-default sentinel.
+	optConf := newLineSenderConfig(qwpSenderType)
+	WithAddress("localhost:9000")(optConf)
+	WithSfDir("/tmp/sf")(optConf)
+	WithSfMaxBytes(0)(optConf)
+	WithSfMaxTotalBytes(0)(optConf)
+	require.NoError(t, sanitizeQwpConf(optConf))
+}
+
 // TestSfConfRejectsAutoFlushBytesAboveSfMaxBytes pins the sanitize-time
 // validation: an explicitly-set auto_flush_bytes that exceeds an
 // explicitly-set sf_max_bytes is rejected, because the byte trigger

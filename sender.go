@@ -496,13 +496,20 @@ func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 // registered via WithErrorPolicyResolver still wins over both.
 //
 // PolicyAuto removes any prior override (falls through to next
-// layer). CategoryProtocolViolation and CategoryUnknown are forced
-// HALT regardless of this setting.
+// layer). CategoryProtocolViolation and CategoryUnknown are always
+// HALT: an override for either is ignored and not recorded, matching
+// the connect-string form, which has no on_protocol_violation_error /
+// on_unknown_error key and rejects those outright.
 //
 // Only available for the QWP sender.
 func WithErrorPolicy(c Category, p Policy) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		if int(c) >= len(s.errorPolicyPerCat) {
+		// PROTOCOL_VIOLATION and UNKNOWN are never user-configurable.
+		// Refusing the override here keeps the per-category slot from
+		// ever holding a latent non-HALT policy, so the forced HALT does
+		// not depend on resolve() checking these two categories first.
+		if int(c) >= len(s.errorPolicyPerCat) ||
+			c == CategoryProtocolViolation || c == CategoryUnknown {
 			return
 		}
 		s.errorPolicyPerCat[c] = p
@@ -1341,11 +1348,14 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 			return err
 		}
 	}
+	// 0 is the use-default sentinel for both (resolved to
+	// qwpSfDefaultMaxBytes / qwpSfDefaultMaxTotalBytes at construction),
+	// so only a negative value is rejected here.
 	if conf.sfMaxBytes < 0 {
-		return fmt.Errorf("sf_max_bytes must be > 0: %d", conf.sfMaxBytes)
+		return fmt.Errorf("sf_max_bytes must be >= 0: %d", conf.sfMaxBytes)
 	}
 	if conf.sfMaxTotalBytes < 0 {
-		return fmt.Errorf("sf_max_total_bytes must be > 0: %d", conf.sfMaxTotalBytes)
+		return fmt.Errorf("sf_max_total_bytes must be >= 0: %d", conf.sfMaxTotalBytes)
 	}
 	if conf.sfMaxBytes > 0 && conf.sfMaxTotalBytes > 0 && conf.sfMaxTotalBytes < conf.sfMaxBytes {
 		return fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_bytes (%d)",

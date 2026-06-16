@@ -266,6 +266,26 @@ func TestErrorApiBuilderOption_ProtocolViolationOverrideIgnored(t *testing.T) {
 		"forced HALT for ProtocolViolation should ignore user override")
 }
 
+// TestErrorApiBuilderOption_ForcedHaltCategoriesNotRecorded pins the
+// config-level invariant behind the runtime ignore: WithErrorPolicy
+// must not record an override for the two forced-HALT categories. The
+// connect-string form has no on_protocol_violation_error /
+// on_unknown_error key and rejects them outright; the builder reaches
+// the same end state by never storing the slot, so the forced HALT
+// does not rely on resolve() checking these categories first.
+func TestErrorApiBuilderOption_ForcedHaltCategoriesNotRecorded(t *testing.T) {
+	for _, c := range []Category{CategoryProtocolViolation, CategoryUnknown} {
+		t.Run(c.String(), func(t *testing.T) {
+			conf := newLineSenderConfig(qwpSenderType)
+			WithErrorPolicy(c, PolicyDropAndContinue)(conf)
+			assert.Equal(t, PolicyAuto, conf.errorPolicyPerCat[c],
+				"override for %s must not be recorded", c)
+			assert.False(t, conf.errorPolicyPerCatSet,
+				"recording an ignored override would falsely flag the QWP-only error API as used")
+		})
+	}
+}
+
 // =============================================================================
 // Public-API end-to-end: connect-string keys
 // =============================================================================

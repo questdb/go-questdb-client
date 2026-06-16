@@ -309,18 +309,25 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
+			// 0 is the "use the default segment size" sentinel, resolved
+			// at construction (qwpSfDefaultMaxBytes), matching the
+			// WithSfMaxBytes option path. parseSizeBytes already rejects
+			// negative and non-numeric input.
 			parsedVal, err := parseSizeBytes(v)
-			if err != nil || parsedVal <= 0 {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive size", k, v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative size", k, v)
 			}
 			senderConf.sfMaxBytes = parsedVal
 		case "sf_max_total_bytes":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
+			// 0 is the "use the default total cap" sentinel, resolved at
+			// construction (qwpSfDefaultMaxTotalBytes, or the memory-mode
+			// variant), matching the WithSfMaxTotalBytes option path.
 			parsedVal, err := parseSizeBytes(v)
-			if err != nil || parsedVal <= 0 {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive size", k, v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative size", k, v)
 			}
 			senderConf.sfMaxTotalBytes = parsedVal
 		case "sf_durability":
