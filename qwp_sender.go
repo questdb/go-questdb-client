@@ -1210,6 +1210,27 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 		}
 		return s.cursorEngine.enginePublishedFsn(), nil
 	}
+	// Drain any latched fluent-API error (a Symbol/*Column/Table
+	// validation failure) ahead of the hasTable/pendingRowCount
+	// branches, fulfilling the latch contract's "surfaces on the next
+	// At/AtNow/Flush". Taking it first stops a real producer-side fault
+	// from being masked by errFlushWithPendingMessage or dropped on a
+	// Flush-then-Close. Cancel the in-progress row exactly as At does so
+	// clearing the latch can't strand a partial row a later At would
+	// commit. The calledFromErrorHandler path above skips this: lastErr
+	// is producer-owned, and reading it from the dispatcher goroutine
+	// races the producer (the C3 hazard).
+	err := s.lastErr
+	s.lastErr = nil
+	if err != nil {
+		if s.currentTable != nil {
+			s.currentTable.cancelRow()
+		}
+		s.cachedDesignatedTs = nil
+		s.hasTable = false
+		s.currentTable = nil
+		return -1, err
+	}
 	if s.hasTable {
 		return -1, errFlushWithPendingMessage
 	}

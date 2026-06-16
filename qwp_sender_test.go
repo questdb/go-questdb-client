@@ -549,6 +549,82 @@ func TestQwpSenderCloseSurfacesLatchedFluentError(t *testing.T) {
 	}
 }
 
+// TestQwpSenderFlushSurfacesLatchedFluentError covers the fluent-latch
+// contract on Flush: a Symbol/*Column/Table validation error latched
+// after a row has already committed must surface on the next Flush
+// (mirroring At/AtNow/Close), not be masked or silently dropped while
+// the committed row flushes.
+func TestQwpSenderFlushSurfacesLatchedFluentError(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	ctx := context.Background()
+
+	// Commit a clean row: hasTable=false, pendingRowCount=1.
+	if err := s.Table("t").Float64Column("v", 1).At(ctx, time.Now()); err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	// Symbol() without a preceding Table() latches lastErr; hasTable
+	// stays false, so the committed row is still flushable. This is the
+	// exact case where a latch-blind Flush would flush the row and
+	// return nil, swallowing the error.
+	s.Symbol("s", "v")
+
+	fsn, err := s.FlushAndGetSequence(ctx)
+	if err == nil {
+		t.Fatal("FlushAndGetSequence: nil, expected latched fluent-API error")
+	}
+	if !strings.Contains(err.Error(), "Symbol() called without Table()") {
+		t.Fatalf("FlushAndGetSequence: %v, want Symbol()-without-Table()", err)
+	}
+	if fsn != -1 {
+		t.Fatalf("FlushAndGetSequence fsn: got %d, want -1 on error", fsn)
+	}
+	if s.lastErr != nil {
+		t.Fatalf("lastErr not cleared after surfacing: %v", s.lastErr)
+	}
+
+	// The latch is drained, so the deferred committed row flushes on the
+	// next call without re-surfacing the error.
+	if _, err := s.FlushAndGetSequence(ctx); err != nil {
+		t.Fatalf("second FlushAndGetSequence: %v, want nil", err)
+	}
+}
+
+// TestQwpSenderFlushCancelsInProgressRowOnLatchedError verifies that
+// when Flush surfaces a latched error mid-row (hasTable still set), it
+// cancels the in-progress row as At does — so clearing the latch can't
+// strand a partial row that a later At would commit.
+func TestQwpSenderFlushCancelsInProgressRowOnLatchedError(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	ctx := context.Background()
+
+	// Open a row, then latch a validation error without finalizing it.
+	// The precision check rejects before adding the column, leaving
+	// hasTable=true with currentTable set.
+	s.Table("t")
+	s.GeohashColumn("g", 0, -1)
+	if s.lastErr == nil || !s.hasTable {
+		t.Fatalf("setup: want latched error with hasTable, got err=%v hasTable=%v", s.lastErr, s.hasTable)
+	}
+
+	err := s.Flush(ctx)
+	if err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("Flush: %v, want geohash precision error (not errFlushWithPendingMessage)", err)
+	}
+	// The in-progress row is cancelled and table state reset, so a later
+	// At reports "called without Table()" instead of committing a
+	// stranded partial row.
+	if s.hasTable || s.currentTable != nil {
+		t.Fatalf("in-progress row not cancelled: hasTable=%v currentTable=%v", s.hasTable, s.currentTable)
+	}
+	if err := s.AtNow(ctx); err == nil || !strings.Contains(err.Error(), "At() called without Table()") {
+		t.Fatalf("AtNow after cancelled row: %v, want At()-without-Table()", err)
+	}
+}
+
 func TestQwpSenderClosedOperations(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
