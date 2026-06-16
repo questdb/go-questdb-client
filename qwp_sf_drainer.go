@@ -269,6 +269,10 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// foreground's bookkeeping.
 	loop.sendLoopSetHostTracker(d.tracker, boundIdx)
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
+	// Wired for parity with the foreground loop; the drainer replays an
+	// adopted slot and never appends, so the getter is never consulted
+	// here (no engineAppendBlocking caller to park).
+	engine.engineSetTerminalErrorGetter(loop.sendLoopCheckError)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 

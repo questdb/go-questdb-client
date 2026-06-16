@@ -131,6 +131,22 @@ type qwpSfCursorEngine struct {
 	// outage elapsed in the latter case.
 	reconnectStatus atomic.Pointer[func() (bool, int64, time.Time)]
 
+	// terminalError is the (optional) snapshot getter wired in by the
+	// I/O send loop after it is constructed, alongside reconnectStatus.
+	// It returns the loop's latched terminal error — a *SenderError on a
+	// HALT, a plain error on a transport-fatal or reconnect-budget
+	// exhaustion — or nil while the loop is healthy or merely
+	// reconnecting. engineAppendBlocking polls it on every backpressure
+	// spin iteration: a HALT stops the send loop draining the ring (ACK-
+	// driven trim ceases), so a producer parked on a full ring would
+	// otherwise wait out the whole appendDeadline and return the generic
+	// backpressure-timeout error instead of the real terminal cause.
+	// Polling it lets the parked producer fail fast with the latched
+	// error. nil (the engine used standalone in tests) disables the
+	// check; the spin then relies on the deadline / ctx / closed exits
+	// alone.
+	terminalError atomic.Pointer[func() error]
+
 	// closed is set by engineClose. atomic.Bool so tests / status
 	// accessors can sample it from any goroutine.
 	closed atomic.Bool
@@ -412,6 +428,14 @@ func (e *qwpSfCursorEngine) engineFindSegmentContaining(fsn int64) *qwpSfSegment
 // passing a tighter deadline than e.appendDeadline get their
 // deadline respected.
 //
+// A send-loop HALT latched while the producer is parked here (the wire
+// failed terminally, or the reconnect budget ran out) short-circuits
+// the spin: the loop has stopped draining the ring, so the deadline
+// would only ever expire. engineAppendBlocking returns the latched
+// terminal error directly via the engineSetTerminalErrorGetter hook, so
+// the parked producer fails fast with the real cause instead of a
+// generic backpressure timeout.
+//
 // Backpressure is surfaced two ways:
 //   - engineTotalBackpressureStalls() counter — incremented once per
 //     blocking-call that had to wait for the manager.
@@ -438,6 +462,15 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 	timer := time.NewTimer(qwpSfEngineParkInterval)
 	defer timer.Stop()
 	for {
+		// A send-loop HALT (or reconnect-budget exhaustion) stops the
+		// loop draining the ring: ACK-driven trim ceases, so the
+		// backpressure can never clear and the deadline would only ever
+		// expire. Surface the latched terminal error immediately instead
+		// of spinning it out and masking the real cause behind a generic
+		// backpressure timeout.
+		if err := e.engineTerminalError(); err != nil {
+			return 0, err
+		}
 		if time.Now().After(deadline) {
 			return 0, e.formatBackpressureTimeout()
 		}
@@ -500,6 +533,39 @@ func (e *qwpSfCursorEngine) engineSetReconnectStatusGetter(getter func() (bool, 
 		return
 	}
 	e.reconnectStatus.Store(&getter)
+}
+
+// engineSetTerminalErrorGetter wires a snapshot accessor that returns
+// the I/O send loop's latched terminal error (nil while healthy or
+// merely reconnecting). Called once by the QWP sender constructor right
+// after the send loop is created, alongside
+// engineSetReconnectStatusGetter. Pass nil to detach (used by tests
+// that tear down the loop independently).
+//
+// The getter is polled inside engineAppendBlocking's backpressure spin
+// so a producer parked on a full ring unwinds the moment the send loop
+// HALTs. A HALT stops the send loop, so ACK-driven trim ceases and the
+// ring can never drain again; without this the producer would spin out
+// the full append deadline and mask the real terminal error behind a
+// generic backpressure timeout.
+func (e *qwpSfCursorEngine) engineSetTerminalErrorGetter(getter func() error) {
+	if getter == nil {
+		e.terminalError.Store(nil)
+		return
+	}
+	e.terminalError.Store(&getter)
+}
+
+// engineTerminalError returns the send loop's latched terminal error
+// via the wired getter, or nil when no getter is installed or the loop
+// is healthy. Consulted only on engineAppendBlocking's backpressure
+// spin, so the getter cost is paid only while a producer is actually
+// parked — never on the steady-state hot path.
+func (e *qwpSfCursorEngine) engineTerminalError() error {
+	if g := e.terminalError.Load(); g != nil {
+		return (*g)()
+	}
+	return nil
 }
 
 // engineSetSendLoopWakeup wires the producer→send-loop doorbell:

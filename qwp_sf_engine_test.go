@@ -196,6 +196,71 @@ func TestQwpSfEngineBackpressureTimeoutReconnecting(t *testing.T) {
 	assert.Contains(t, err.Error(), "wire publishing but slow")
 }
 
+// A send-loop HALT latched while a producer is parked on a full ring
+// must surface as the terminal error, fast — not as a backpressure
+// timeout after the full append deadline. The engine polls the wired
+// terminal-error getter on every spin iteration so the parked producer
+// fails fast with the real cause (M2).
+func TestQwpSfEngineBackpressureTerminalErrorFailFast(t *testing.T) {
+	const segSize int64 = 96 // 24 header + 72 payload; three 24B frames fill it
+	// A long deadline makes the fail-fast unambiguous: without the
+	// terminal-error check the call would block ~30s.
+	e, err := qwpSfNewCursorEngine("", segSize, segSize, 30*time.Second)
+	require.NoError(t, err)
+	defer func() { _ = e.engineClose() }()
+
+	// Fill the active segment. These appends succeed outright and never
+	// enter the backpressure spin, so no getter need be wired yet.
+	for i := 0; i < 3; i++ {
+		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
+		require.NoError(t, err, "iteration %d", i)
+	}
+
+	// Simulate the send loop HALTing: a terminal error is now latched
+	// and the ring will never drain again (ACK-driven trim has ceased).
+	halt := errors.New("qwp/sf: send loop HALTed")
+	e.engineSetTerminalErrorGetter(func() error { return halt })
+
+	// Appending into the full ring parks the producer; the first spin
+	// iteration observes the terminal error and returns it.
+	start := time.Now()
+	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, halt),
+		"parked producer must return the latched terminal error, got: %v", err)
+	assert.False(t, errors.Is(err, ErrBackpressureTimeout),
+		"the terminal error must not be masked behind a backpressure timeout")
+	assert.Less(t, elapsed, 5*time.Second,
+		"must fail fast on the latched HALT, not wait out the 30s deadline")
+	// It still counts as one backpressure stall: the producer did park
+	// before observing the terminal error.
+	assert.GreaterOrEqual(t, e.engineTotalBackpressureStalls(), int64(1))
+}
+
+// A getter that reports a healthy loop (nil) must not perturb the
+// normal backpressure path: the spin still times out with the generic
+// backpressure error.
+func TestQwpSfEngineBackpressureHealthyGetterStillTimesOut(t *testing.T) {
+	const segSize int64 = 96
+	e, err := qwpSfNewCursorEngine("", segSize, segSize, 50*time.Millisecond)
+	require.NoError(t, err)
+	defer func() { _ = e.engineClose() }()
+
+	// Loop reports healthy throughout (mirrors steady state / an
+	// in-progress reconnect that has not yet exhausted its budget).
+	e.engineSetTerminalErrorGetter(func() error { return nil })
+
+	for i := 0; i < 3; i++ {
+		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
+		require.NoError(t, err, "iteration %d", i)
+	}
+	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrBackpressureTimeout))
+}
+
 func TestQwpSfEnginePayloadTooLarge(t *testing.T) {
 	const segSize int64 = 256
 	e, err := qwpSfNewCursorEngine("", segSize, segSize*4, time.Second)

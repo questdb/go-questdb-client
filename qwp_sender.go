@@ -443,6 +443,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 		qwpSfDefaultReconnectInitialBackoff,
 		qwpSfDefaultReconnectMaxBackoff)
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
+	engine.engineSetTerminalErrorGetter(loop.sendLoopCheckError)
 	s.cursorEngine = engine
 	s.cursorSendLoop = loop
 	// The memory-mode segment is the fixed qwpSfDefaultMaxBytes; record
