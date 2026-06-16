@@ -1217,12 +1217,15 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	// from being masked by errFlushWithPendingMessage or dropped on a
 	// Flush-then-Close. Cancel the in-progress row exactly as At does so
 	// clearing the latch can't strand a partial row a later At would
-	// commit. The calledFromErrorHandler path above skips this: lastErr
-	// is producer-owned, and reading it from the dispatcher goroutine
-	// races the producer (the C3 hazard).
-	err := s.lastErr
-	s.lastErr = nil
-	if err != nil {
+	// commit. The clear happens only when the latch is set, so a Flush
+	// with no latched error performs no producer-state write at all and
+	// stays a pure read — several goroutines sampling a quiescent
+	// (post-HALT) sender to observe the latched terminal error therefore
+	// race only on read-only state. The calledFromErrorHandler path above
+	// skips this: lastErr is producer-owned, and reading it from the
+	// dispatcher goroutine races the producer (the C3 hazard).
+	if err := s.lastErr; err != nil {
+		s.lastErr = nil
 		if s.currentTable != nil {
 			s.currentTable.cancelRow()
 		}
