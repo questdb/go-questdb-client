@@ -177,8 +177,9 @@ type qwpRequest struct {
 // Goroutine topology (two internal goroutines):
 //
 //   - reader: blocks in conn.Read and pushes each incoming frame to
-//     frameCh. Never sees cancel / credit / user state. Exits when
-//     the server closes the connection or shutdown cancels readCtx.
+//     frameCh. Never sees cancel / credit / user state. Exits when the
+//     server closes the connection or ioCtx is cancelled (on shutdown,
+//     or when the dispatcher tears the connection down after a poison).
 //
 //   - dispatcher (aka the "main" I/O goroutine): selects on frameCh /
 //     notifyCh / shutdownCh, drains the cancel + credit atomics,
@@ -649,9 +650,12 @@ func qwpSameBacking(a, b []byte) bool {
 // fast path.
 //
 // Exits when either (a) conn.Reader returns an error (server close,
-// malformed frame, or shutdown-cancelled readCtx), or (b) the
+// malformed frame, or ioCtx cancelled — on shutdown or when the
+// dispatcher tears the connection down after a poison), or (b) the
 // dispatcher is shut down. Closes frameCh on the way out so the
-// dispatcher's select sees EOF.
+// dispatcher's select sees EOF. A final frameCh send on the way out
+// is consumed either by receiveLoop or by the dispatcher's
+// drainFrameChUntilReaderExits, so it never parks.
 func (io *qwpEgressIO) readerRun() {
 	defer close(io.frameCh)
 	// Convert a panic while reading untrusted server bytes into the
@@ -715,6 +719,13 @@ func (io *qwpEgressIO) readerRun() {
 // just decrements the shutdown WaitGroup — doneCh is closed by the
 // start() wrapper only after the reader also exits, so a shutdown()
 // that observes doneCh has joined both goroutines.
+//
+// The loop exits on shutdown OR on the first transport-class poison: a
+// poison latches ioErr, after which no submitQuery is ever served (they
+// all fail fast on the latch), so the dispatcher tears the connection
+// down and joins the reader rather than parking idle holding a socket.
+// A clean per-query terminal frame does not latch ioErr, so the loop
+// instead continues and serves the next query.
 func (io *qwpEgressIO) dispatcherRun() {
 	// Defers run LIFO: close(events) first, then closed.Store(true).
 	// Either order is safe because a consumer that wakes on the
@@ -795,10 +806,45 @@ func (io *qwpEgressIO) dispatcherRun() {
 
 		if err := io.sendQueryRequest(req); err != nil {
 			io.poisonAndEmitError(fmt.Sprintf("qwp: send QUERY_REQUEST: %v", err))
-			continue
+		} else {
+			io.receiveLoop()
 		}
 
-		io.receiveLoop()
+		// A transport-class fault during this query latched ioErr — every
+		// poison (decode error, unknown msg_kind, header-parse failure,
+		// QUERY_REQUEST / CANCEL / CREDIT send failure, the cancel-ack
+		// watchdog, reader/server close) routes through poisonAndEmitError.
+		// The connection is no longer trustworthy and no future submitQuery
+		// can be served, so there is nothing left for either goroutine to
+		// do. Cancel ioCtx to unblock the reader's conn.Read, drain frameCh
+		// until the reader closes it on its way out, then exit. Without this
+		// the reader goroutine and its socket fd would linger on a conn-alive
+		// poison until QwpQueryClient.Close() — a leak for any caller that
+		// observes the surfaced error but neither closes nor re-queries. A
+		// clean per-query terminal frame (RESULT_END / EXEC_DONE / a server
+		// QUERY_ERROR) does not latch ioErr, so the loop continues and serves
+		// the next query on the still-healthy connection.
+		if io.loadIoErr() != nil {
+			io.ioCancel()
+			io.drainFrameChUntilReaderExits()
+			return
+		}
+	}
+}
+
+// drainFrameChUntilReaderExits receives and discards every remaining
+// frameCh event, recycling each one's pooled read buffer, until the
+// reader closes the channel on its way out. Called by dispatcherRun
+// after a poison has latched ioErr and ioCancel has fired: ioCancel
+// unblocks the reader's conn.Read, and this drain consumes the reader's
+// final event so its frameCh send does not park on a dispatcher that has
+// stopped reading — the reader then returns and closes frameCh via its
+// defer, terminating this range. Bounded by a single conn.Read returning
+// post-cancel; coder/websocket tears the local socket down synchronously
+// on ctx cancel, so no read deadline is needed.
+func (io *qwpEgressIO) drainFrameChUntilReaderExits() {
+	for ev := range io.frameCh {
+		io.recycleReadBuf(ev.bufRef)
 	}
 }
 
@@ -864,15 +910,15 @@ func (io *qwpEgressIO) receiveLoop() {
 			return
 		case <-watchdogCh:
 			// Silent peer after CANCEL: poison the connection so the
-			// next submitQuery fails fast against the latched ioErr,
-			// end the query so the dispatcher returns to idle, and
-			// cancel ioCtx to tear down the wedged conn — that unwinds
-			// the reader from its blocked Read instead of leaving it
-			// parked until Close.
+			// next submitQuery fails fast against the latched ioErr, and
+			// end the query. The dispatcher's post-query poison teardown
+			// (see dispatcherRun) then cancels ioCtx to tear the wedged
+			// conn down and joins the reader, so a peer that accepts the
+			// CANCEL but never sends a terminal frame can strand neither
+			// the dispatcher nor the reader goroutine.
 			io.poisonAndEmitError(fmt.Sprintf(
 				"qwp: server did not answer CANCEL within %s", io.cancelAckTimeout))
 			io.currentQueryDone = true
-			io.ioCancel()
 			return
 		case <-io.notifyCh:
 			// State change — loop back to drain. This is how a

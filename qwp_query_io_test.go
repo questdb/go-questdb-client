@@ -855,6 +855,70 @@ func TestQwpEgressIOUnknownMsgKind(t *testing.T) {
 	}
 }
 
+// TestQwpEgressIOPoisonReclaimsReader verifies that a transport poison
+// which leaves the underlying connection alive does not strand the
+// reader goroutine or its socket fd. After the dispatcher surfaces the
+// TransportError it tears the connection down and joins the reader on
+// its own: doneCh closes without any shutdown() / Close() call. Without
+// the teardown the reader parks forever on a frameCh send to a
+// dispatcher that has stopped reading frameCh, leaking one goroutine +
+// one fd per poisoned client for any caller that observes the error but
+// neither closes nor re-queries.
+func TestQwpEgressIOPoisonReclaimsReader(t *testing.T) {
+	release := make(chan struct{})
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		m.readBinary(ctx) // QUERY_REQUEST
+		// Poison with an unknown msg_kind, then hold the connection open
+		// so the reader cannot exit via a server close — the only way it
+		// can be reclaimed is the dispatcher's own poison teardown (the
+		// path under test).
+		m.sendBinary(ctx, writeQwpFrame(0, []byte{0x7F}))
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	})
+	defer srv.Close()
+	defer close(release)
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+
+	io := newQwpEgressIO(tr, 1)
+	io.start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT 1", requestId: 1}); err != nil {
+		t.Fatalf("submitQuery: %v", err)
+	}
+
+	ev := takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindTransportError {
+		t.Fatalf("event kind = %v, want TransportError (errMsg=%q)", ev.kind, ev.errMessage)
+	}
+
+	// The dispatcher and reader must both exit on their own, with no
+	// shutdown() / Close(). doneCh closes only after BOTH goroutines
+	// return (start()'s WaitGroup wrapper), so observing it proves the
+	// reader was reclaimed rather than stranded on its frameCh send.
+	select {
+	case <-io.doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatcher + reader did not self-terminate after a conn-alive poison; reader goroutine + fd leaked")
+	}
+
+	// The teardown is poison-driven, not a user shutdown: shutdownCh was
+	// never closed. A later Close() would still be a safe no-op.
+	select {
+	case <-io.shutdownCh:
+		t.Fatal("shutdownCh closed without a shutdown() call")
+	default:
+	}
+}
+
 // TestQwpEgressIOCacheResetBetweenQueries drives the server-emitted
 // CACHE_RESET path end-to-end: query 1's response seeds the
 // connection-scoped SYMBOL dict; the server then emits CACHE_RESET
