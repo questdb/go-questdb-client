@@ -1086,6 +1086,23 @@ func TestQwpSenderCharColumn(t *testing.T) {
 	}
 }
 
+func TestQwpSenderCharColumnRejectsNonBMP(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.CharColumn("c", 0x1F600). // 😀 U+1F600, outside the BMP
+						AtNow(context.Background())
+	if err == nil {
+		t.Fatalf("expected CharColumn to reject non-BMP rune")
+	}
+	if !strings.Contains(err.Error(), "CHAR") {
+		t.Fatalf("error should mention CHAR: %v", err)
+	}
+}
+
 func TestQwpSenderDateColumn(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()

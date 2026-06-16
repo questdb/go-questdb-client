@@ -53,6 +53,8 @@ type QwpSender interface {
 	Float32Column(name string, val float32) QwpSender
 
 	// CharColumn adds a CHAR column value stored as a UTF-16 code unit.
+	// Runes outside the BMP (< 0 or > U+FFFF) are rejected — QuestDB's
+	// CHAR is a single UTF-16 code unit, matching Java char semantics.
 	CharColumn(name string, val rune) QwpSender
 
 	// DateColumn adds a DATE column value (milliseconds since epoch).
@@ -1381,6 +1383,10 @@ func (s *qwpLineSender) CharColumn(name string, val rune) QwpSender {
 	}
 	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
+		return s
+	}
+	if val < 0 || val > 0xFFFF {
+		s.lastErr = fmt.Errorf("qwp: CharColumn() CHAR rune %U does not fit in a UTF-16 code unit", val)
 		return s
 	}
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeChar, false)
