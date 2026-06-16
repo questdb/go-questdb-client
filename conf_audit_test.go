@@ -241,6 +241,71 @@ func TestConfQwpAutoFlushOffZerosBytes(t *testing.T) {
 	}
 }
 
+// TestConfAutoFlushOffVsExplicitTriggerIsDeterministic pins that a
+// self-contradictory connect string — auto_flush=off paired with an
+// explicit auto_flush_rows / _interval / _bytes trigger — resolves the
+// same way on every parse. The resolution loop ranges over a map (Go
+// randomizes iteration order), so without a deterministic pre-pass the
+// surviving value would depend on which key the loop visited last and
+// the explicit trigger would be silently zeroed on a fraction of runs.
+// The contract is "explicit trigger wins over off". The string position
+// of auto_flush is irrelevant (the map drops order), so both orderings
+// must agree; many iterations exercise the map-order randomization.
+func TestConfAutoFlushOffVsExplicitTriggerIsDeterministic(t *testing.T) {
+	const iterations = 2000
+	cases := []struct {
+		name     string
+		conf     string
+		wantRows int
+		wantIvl  time.Duration
+		wantByts int
+	}{
+		{
+			// QWP exercises all three triggers, including the byte trigger
+			// that this PR newly lets auto_flush=off zero.
+			name:     "qwp_off_before_triggers",
+			conf:     "ws::addr=localhost:9000;auto_flush=off;auto_flush_rows=1000;auto_flush_interval=500;auto_flush_bytes=4m;",
+			wantRows: 1000,
+			wantIvl:  500 * time.Millisecond,
+			wantByts: 4 << 20,
+		},
+		{
+			name:     "qwp_off_after_triggers",
+			conf:     "ws::addr=localhost:9000;auto_flush_rows=1000;auto_flush_interval=500;auto_flush_bytes=4m;auto_flush=off;",
+			wantRows: 1000,
+			wantIvl:  500 * time.Millisecond,
+			wantByts: 4 << 20,
+		},
+		{
+			// HTTP form (rows + interval only) — the pre-existing nondeterminism.
+			name:     "http_off_with_rows_and_interval",
+			conf:     "http::addr=localhost:9000;auto_flush=off;auto_flush_rows=200;auto_flush_interval=300;",
+			wantRows: 200,
+			wantIvl:  300 * time.Millisecond,
+			wantByts: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < iterations; i++ {
+				c, err := confFromStr(tc.conf)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				if c.autoFlushRows != tc.wantRows {
+					t.Fatalf("iter %d: autoFlushRows=%d, want %d", i, c.autoFlushRows, tc.wantRows)
+				}
+				if c.autoFlushInterval != tc.wantIvl {
+					t.Fatalf("iter %d: autoFlushInterval=%v, want %v", i, c.autoFlushInterval, tc.wantIvl)
+				}
+				if c.autoFlushBytes != tc.wantByts {
+					t.Fatalf("iter %d: autoFlushBytes=%d, want %d", i, c.autoFlushBytes, tc.wantByts)
+				}
+			}
+		})
+	}
+}
+
 // TestConfIngestSilentlyAcceptsEgressKeys is the cross-direction
 // silent-accept contract from connect-string.md §16-20 and §Query
 // client keys: a ws:: / wss:: Sender must not error on egress-only

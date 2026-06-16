@@ -127,6 +127,27 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		return nil, fmt.Errorf("invalid schema: %s", data.Schema)
 	}
 
+	// Resolve auto_flush before the key loop below. That loop ranges over
+	// a map, whose iteration order Go randomizes, so a connect string that
+	// pairs auto_flush=off (which zeroes every trigger, including QWP's
+	// autoFlushBytes) with an explicit auto_flush_rows / _interval / _bytes
+	// must not let map order pick the winner. Applying off here first and
+	// letting the explicit trigger keys overwrite in the loop makes an
+	// explicit trigger deterministically win over off — the only sensible
+	// resolution of a self-contradictory config.
+	if v, ok := data.KeyValuePairs["auto_flush"]; ok {
+		switch v {
+		case "off":
+			senderConf.autoFlushRows = 0
+			senderConf.autoFlushInterval = 0
+			senderConf.autoFlushBytes = 0
+		case "on":
+			// The default; explicit triggers (if any) apply in the loop.
+		default:
+			return nil, NewInvalidConfigStrError("invalid %s value, %q is not 'on' or 'off'", "auto_flush", v)
+		}
+	}
+
 	for k, v := range data.KeyValuePairs {
 		switch k {
 		case "addr":
@@ -160,13 +181,9 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			// But since Go sender doesn't need it, we ignore the values.
 			continue
 		case "auto_flush":
-			if v == "off" {
-				senderConf.autoFlushRows = 0
-				senderConf.autoFlushInterval = 0
-				senderConf.autoFlushBytes = 0
-			} else if v != "on" {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q is not 'on' or 'off'", k, v)
-			}
+			// Resolved in the deterministic pre-pass above so map
+			// iteration order can't decide auto_flush=off vs. an explicit
+			// auto_flush_* trigger.
 		case "auto_flush_rows":
 			if v == "off" {
 				senderConf.autoFlushRows = 0
