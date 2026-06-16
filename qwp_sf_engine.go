@@ -183,12 +183,23 @@ func qwpSfNewCursorEngine(sfDir string, segmentSizeBytes, maxTotalBytes int64, a
 		return nil, err
 	}
 	mgr.segmentManagerStart()
+	// Close the manager (joining its worker goroutine) on any failure
+	// exit of the inner constructor — error return AND panic. The inner
+	// constructor's own deferred guard releases the slot flock on the
+	// same unwind; this guard covers the one resource it can't see — the
+	// manager we own here. ok flips true only once the engine adopts it.
+	ok := false
+	defer func() {
+		if !ok {
+			mgr.segmentManagerClose()
+		}
+	}()
 	e, err := qwpSfNewCursorEngineWithManager(sfDir, segmentSizeBytes, mgr, appendDeadline)
 	if err != nil {
-		mgr.segmentManagerClose()
 		return nil, err
 	}
 	e.ownsManager = true
+	ok = true
 	return e, nil
 }
 
@@ -216,10 +227,26 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			return nil, err
 		}
 	}
-	// Release order on any failure mirrors the Java reference: the
-	// watermark (its own mmap + fd) is dropped before the slot lock,
-	// so the kernel-held flock outlives every other cleanup.
+	// Teardown for every failure exit — error return AND panic. ok
+	// flips true only once the engine adopts these resources, so the
+	// deferred guard runs cleanup on any unwind between the flock
+	// acquisition above and the success return below. Skipping it on a
+	// panic would strand the slot: the kernel-held flock survives the
+	// process, wedging every future foreground open and orphan drainer
+	// (which can no longer release a lock it never took), so the slot's
+	// unacked data becomes unrecoverable.
+	//
+	// Release order mirrors engineClose and the Java reference: the
+	// ring's segment mmaps, then the watermark's own mmap + fd, then the
+	// slot flock LAST so it outlives every other cleanup. A failed
+	// registration never reaches the manager's ring list, so the ring
+	// needs no deregister here — and cleanup touches no manager state,
+	// which keeps it safe to run on the unwind of a registration panic.
+	ok := false
 	cleanup := func() {
+		if ring != nil {
+			_ = ring.segmentRingClose()
+		}
 		if watermark != nil {
 			_ = watermark.close()
 		}
@@ -227,6 +254,11 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			_ = lock.close()
 		}
 	}
+	defer func() {
+		if !ok {
+			cleanup()
+		}
+	}()
 	// Disk mode: try to recover any *.sfa files left behind by a
 	// prior session before deciding to start fresh. Without this the
 	// engine would create a new sf-initial.sfa at baseSeq=0,
@@ -235,7 +267,6 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	if !memoryMode {
 		ring, err = qwpSfOpenRing(sfDir, segmentSizeBytes)
 		if err != nil {
-			cleanup()
 			return nil, err
 		}
 		recoveredFromDisk = ring != nil
@@ -319,14 +350,11 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			initial, err = qwpSfCreateSegment(initialPath, 0, segmentSizeBytes)
 		}
 		if err != nil {
-			cleanup()
 			return nil, err
 		}
 		ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
 	}
 	if err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark); err != nil {
-		_ = ring.segmentRingClose()
-		cleanup()
 		return nil, err
 	}
 	e := &qwpSfCursorEngine{
@@ -340,6 +368,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		appendDeadline:    appendDeadline,
 		recoveredFromDisk: recoveredFromDisk,
 	}
+	ok = true
 	return e, nil
 }
 

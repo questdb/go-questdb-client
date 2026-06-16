@@ -295,3 +295,40 @@ func TestQwpSfEngineSharedManager(t *testing.T) {
 	require.NoError(t, e1.engineClose())
 	require.NoError(t, e2.engineClose())
 }
+
+// TestQwpSfCursorEngineConstructorPanicReleasesSlotLock asserts the
+// constructor's teardown is panic-safe: a panic after the slot flock is
+// acquired (and the initial segment mmap'd) must still release the flock
+// on the unwind. A leaked flock is durable — the kernel holds it for the
+// life of the process — so it would wedge every future foreground open
+// and orphan drainer for that slot, silently defeating recovery: a
+// drainer's recover() drops a .failed sentinel believing the
+// engine-close defer already freed the lock, but on a constructor panic
+// that defer was never registered.
+//
+// A nil manager is the injection seam. The constructor touches the
+// manager only at registration, the last step before the success
+// return; dereferencing a nil receiver there panics with the flock
+// already held and the segment already mapped — exactly the gap the
+// deferred guard covers. (It also confirms cleanup itself is
+// manager-free: a teardown that called a manager method would re-panic
+// on this same nil receiver during the unwind.)
+func TestQwpSfCursorEngineConstructorPanicReleasesSlotLock(t *testing.T) {
+	dir := t.TempDir()
+
+	func() {
+		defer func() {
+			require.NotNil(t, recover(),
+				"nil manager must panic during registration")
+		}()
+		_, _ = qwpSfNewCursorEngineWithManager(dir, 4096, nil, time.Second)
+	}()
+
+	// Re-acquiring the flock proves the deferred teardown released it on
+	// the panic unwind; flock is non-blocking, so a leak would surface
+	// here as qwpSfErrLockBusy rather than hang.
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err,
+		"slot flock must be released after a constructor panic")
+	require.NoError(t, lock.close())
+}
