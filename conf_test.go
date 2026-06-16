@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -234,6 +234,37 @@ func TestParserHappyCases(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:   "ws schema",
+			config: fmt.Sprintf("ws::addr=%s;", addr),
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+				},
+			},
+		},
+		{
+			name:   "wss schema",
+			config: fmt.Sprintf("wss::addr=%s;", addr),
+			expected: qdb.ConfigData{
+				Schema: "wss",
+				KeyValuePairs: map[string]string{
+					"addr": addr,
+				},
+			},
+		},
+		{
+			name:   "ws with in_flight_window",
+			config: fmt.Sprintf("ws::addr=%s;in_flight_window=4;", addr),
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr":              addr,
+					"in_flight_window": "4",
+				},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -447,6 +478,89 @@ func TestHappyCasesFromConf(t *testing.T) {
 				qdb.WithAutoFlushInterval(1000 * time.Millisecond),
 			},
 		},
+		{
+			name:   "ws basic",
+			config: fmt.Sprintf("ws::addr=%s;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+			},
+		},
+		{
+			name:   "wss with tls",
+			config: fmt.Sprintf("wss::addr=%s;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithTls(),
+			},
+		},
+		{
+			name:   "wss with tls_verify unsafe_off",
+			config: fmt.Sprintf("wss::addr=%s;tls_verify=unsafe_off;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithTlsInsecureSkipVerify(),
+			},
+		},
+		{
+			name:   "ws with in_flight_window",
+			config: fmt.Sprintf("ws::addr=%s;in_flight_window=4;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithInFlightWindow(4),
+			},
+		},
+		{
+			name:   "ws with auto_flush and retry_timeout",
+			config: fmt.Sprintf("ws::addr=%s;auto_flush_rows=100;auto_flush_interval=500;retry_timeout=%d;",
+				addr, retryTimeout.Milliseconds()),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithAutoFlushRows(100),
+				qdb.WithAutoFlushInterval(500 * time.Millisecond),
+				qdb.WithRetryTimeout(retryTimeout),
+			},
+		},
+		{
+			name:   "ws with bearer token",
+			config: fmt.Sprintf("ws::addr=%s;token=%s;", addr, token),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithBearerToken(token),
+			},
+		},
+		{
+			name:   "ws with basic auth",
+			config: fmt.Sprintf("ws::addr=%s;username=%s;password=%s;", addr, user, pass),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithBasicAuth(user, pass),
+			},
+		},
+		{
+			name:   "ws with gorilla=off",
+			config: fmt.Sprintf("ws::addr=%s;gorilla=off;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithGorilla(false),
+			},
+		},
+		{
+			name:   "ws with gorilla=on",
+			config: fmt.Sprintf("ws::addr=%s;gorilla=on;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithGorilla(true),
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -455,13 +569,17 @@ func TestHappyCasesFromConf(t *testing.T) {
 			assert.NoError(t, err)
 
 			var expected *qdb.LineSenderConfig
-			switch tc.config[0] {
-			case 'h':
-				expected = qdb.NewLineSenderConfig(qdb.HttpSenderType)
-			case 't':
-				expected = qdb.NewLineSenderConfig(qdb.TcpSenderType)
-			default:
-				assert.FailNow(t, "happy case configs must start with either 'http' or 'tcp'")
+			if len(tc.config) >= 2 && tc.config[:2] == "ws" {
+				expected = qdb.NewLineSenderConfig(qdb.QwpSenderType)
+			} else {
+				switch tc.config[0] {
+				case 'h':
+					expected = qdb.NewLineSenderConfig(qdb.HttpSenderType)
+				case 't':
+					expected = qdb.NewLineSenderConfig(qdb.TcpSenderType)
+				default:
+					assert.FailNow(t, "happy case configs must start with 'http', 'tcp', or 'ws'")
+				}
 			}
 			for _, opt := range tc.expectedOpts {
 				opt(expected)
@@ -513,6 +631,31 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			name:                   "invalid auto_flush_interval",
 			config:                 "http::addr=localhost:1111;auto_flush_interval=invalid;",
 			expectedErrMsgContains: "invalid auto_flush_interval",
+		},
+		{
+			name:                   "invalid gorilla value",
+			config:                 "ws::addr=localhost:1111;gorilla=maybe;",
+			expectedErrMsgContains: "not 'on' or 'off'",
+		},
+		{
+			name:                   "in_flight_window on HTTP",
+			config:                 "http::addr=localhost:1111;in_flight_window=4;",
+			expectedErrMsgContains: "in_flight_window is only supported for QWP senders",
+		},
+		{
+			name:                   "close_timeout on TCP",
+			config:                 "tcp::addr=localhost:1111;close_timeout=1000;",
+			expectedErrMsgContains: "close_timeout is only supported for QWP senders",
+		},
+		{
+			name:                   "max_schemas_per_connection on HTTP",
+			config:                 "http::addr=localhost:1111;max_schemas_per_connection=8;",
+			expectedErrMsgContains: "max_schemas_per_connection is only supported for QWP senders",
+		},
+		{
+			name:                   "gorilla on TCP",
+			config:                 "tcp::addr=localhost:1111;gorilla=off;",
+			expectedErrMsgContains: "gorilla is only supported for QWP senders",
 		},
 		{
 			name:                   "unsupported option",

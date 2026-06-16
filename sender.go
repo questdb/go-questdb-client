@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -26,8 +26,10 @@ package questdb
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"os"
@@ -265,6 +267,7 @@ const (
 	noSenderType   senderType = 0
 	httpSenderType senderType = 1
 	tcpSenderType  senderType = 2
+	qwpSenderType  senderType = 3
 )
 
 type tlsMode int64
@@ -308,8 +311,16 @@ type lineSenderConfig struct {
 	// Auto-flush fields
 	autoFlushRows     int
 	autoFlushInterval time.Duration
+	autoFlushBytes    int // QWP-only; 0 disables the byte-size trigger
 
 	protocolVersion protocolVersion
+
+	// QWP-specific fields
+	inFlightWindow          int           // 0 = unset (treated as sync mode 1); seeded to qwpDefaultInFlightWindow by newLineSenderConfig
+	closeTimeout            time.Duration // 0 = use default (5s)
+	maxSchemasPerConnection int           // 0 = unset; seeded to qwpDefaultMaxSchemasPerConnection
+	dumpWriter              io.Writer     // if set, record outgoing bytes (unexported)
+	gorillaDisabled         bool          // false (default) = Gorilla timestamp encoding enabled
 }
 
 // LineSenderOption defines line sender config option.
@@ -326,6 +337,75 @@ func WithHttp() LineSenderOption {
 func WithTcp() LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.senderType = tcpSenderType
+	}
+}
+
+// WithQwp enables ingestion over the QWP WebSocket protocol.
+func WithQwp() LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.senderType = qwpSenderType
+	}
+}
+
+// WithInFlightWindow sets the number of concurrent in-flight batches
+// for async QWP mode. A value of 1 forces synchronous mode (each
+// Flush blocks until the ACK arrives). Values > 1 enable async mode
+// with a dedicated I/O goroutine. Defaults to 128.
+//
+// Only available for the QWP sender.
+func WithInFlightWindow(window int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.inFlightWindow = window
+	}
+}
+
+// WithCloseTimeout sets the time Close() waits for the async I/O
+// goroutine to finish before force-cancelling. Defaults to 5 seconds.
+// Calling Flush() before Close() guarantees all data is ACKed
+// regardless of this timeout.
+//
+// Only relevant for the QWP sender in async mode (in-flight window > 1).
+func WithCloseTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.closeTimeout = d
+	}
+}
+
+// WithMaxSchemasPerConnection caps the number of schema IDs that may
+// be registered on a single QWP connection before the sender returns
+// an error. Once the cap is hit, the caller should close and re-open
+// the sender to start a new schema ID space. Defaults to 65535.
+//
+// Only available for the QWP sender.
+func WithMaxSchemasPerConnection(n int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.maxSchemasPerConnection = n
+	}
+}
+
+// WithGorilla enables or disables Gorilla delta-of-delta encoding for
+// timestamp columns. Defaults to enabled. When disabled, FLAG_GORILLA
+// is cleared on every message and timestamp columns are sent as raw
+// int64 little-endian values with no encoding-flag prefix.
+//
+// Mirrors QwpWebSocketSender.setGorillaEnabled in the Java client
+// (default true there as well). Only available for the QWP sender.
+func WithGorilla(enabled bool) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.gorillaDisabled = !enabled
+	}
+}
+
+// WithQwpDumpWriter returns an option that records all outgoing TCP
+// bytes to w. When no server address is configured, an in-process
+// fake WebSocket acceptor is used so the dump includes the full HTTP
+// upgrade and WebSocket framing — replayable via "cat dump.bin | nc
+// host port".
+//
+// Only available for the QWP sender.
+func WithQwpDumpWriter(w io.Writer) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.dumpWriter = w
 	}
 }
 
@@ -501,6 +581,18 @@ func WithAutoFlushInterval(interval time.Duration) LineSenderOption {
 	}
 }
 
+// WithAutoFlushBytes triggers an auto-flush once the cumulative size
+// of all buffered table data exceeds the given byte threshold. A value
+// of 0 disables the byte-based trigger. Defaults to 0.
+//
+// Only available for the QWP sender. Distinct from WithMaxBufferSize:
+// this is a soft trigger, while WithMaxBufferSize is a hard cap.
+func WithAutoFlushBytes(bytes int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.autoFlushBytes = bytes
+	}
+}
+
 // WithProtocolVersion sets the ingestion protocol version.
 //
 //   - HTTP transport automatically negotiates the protocol version by default(unset, STRONGLY RECOMMENDED).
@@ -602,30 +694,29 @@ func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 // sender corresponds to a single client connection. LineSender should
 // not be called concurrently by multiple goroutines.
 func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, error) {
-	var conf *lineSenderConfig
-
-	// Iterate over all options to determine the sender type
-	// This is used to set defaults based on the type of sender (http vs tcp)
-	// Worst case performance is 2N for the number of LineSenderOptions
+	// First pass: discover the sender type and reject conflicting
+	// transport options. We must iterate every option (not stop at the
+	// first transport) so that mixing e.g. WithHttp + WithQwp is caught
+	// before pass 2 seeds HTTP defaults onto a QWP config.
 	tmp := newLineSenderConfig(noSenderType)
+	sType := noSenderType
 	for _, opt := range opts {
 		opt(tmp)
-		switch tmp.senderType {
-		case httpSenderType:
-			conf = newLineSenderConfig(httpSenderType)
-		case tcpSenderType:
-			conf = newLineSenderConfig(tcpSenderType)
+		if tmp.senderType == noSenderType {
+			continue
 		}
-
-		if conf != nil {
-			break
+		if sType == noSenderType {
+			sType = tmp.senderType
+		} else if tmp.senderType != sType {
+			return nil, errors.New("conflicting transport options: use only one of WithHttp, WithTcp, or WithQwp")
 		}
 	}
 
-	if tmp.senderType == noSenderType {
-		return nil, errors.New("sender type is not specified: use WithHttp or WithTcp")
+	if sType == noSenderType {
+		return nil, errors.New("sender type is not specified: use WithHttp, WithTcp, or WithQwp")
 	}
 
+	conf := newLineSenderConfig(sType)
 	for _, opt := range opts {
 		opt(conf)
 	}
@@ -640,6 +731,19 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			address:       defaultTcpAddress,
 			initBufSize:   defaultInitBufferSize,
 			fileNameLimit: defaultFileNameLimit,
+		}
+	case qwpSenderType:
+		return &lineSenderConfig{
+			senderType:              t,
+			address:                 defaultHttpAddress,
+			retryTimeout:            defaultRetryTimeout,
+			autoFlushRows:           qwpDefaultAutoFlushRows,
+			autoFlushInterval:       qwpDefaultAutoFlushInterval,
+			inFlightWindow:          qwpDefaultInFlightWindow,
+			maxSchemasPerConnection: qwpDefaultMaxSchemasPerConnection,
+			initBufSize:             defaultInitBufferSize,
+			maxBufSize:              defaultMaxBufferSize,
+			fileNameLimit:           defaultFileNameLimit,
 		}
 	default:
 		return &lineSenderConfig{
@@ -671,8 +775,14 @@ func newLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, err
 			return nil, err
 		}
 		return newHttpLineSender(ctx, conf)
+	case qwpSenderType:
+		err := sanitizeQwpConf(conf)
+		if err != nil {
+			return nil, err
+		}
+		return newQwpLineSenderFromConf(ctx, conf)
 	}
-	return nil, errors.New("sender type is not specified: use WithHttp or WithTcp")
+	return nil, errors.New("sender type is not specified: use WithHttp, WithTcp, or WithQwp")
 }
 
 func sanitizeTcpConf(conf *lineSenderConfig) error {
@@ -697,14 +807,53 @@ func sanitizeTcpConf(conf *lineSenderConfig) error {
 	if conf.autoFlushInterval != 0 {
 		return errors.New("autoFlushInterval setting is not available in the TCP client")
 	}
+	if conf.autoFlushBytes != 0 {
+		return errors.New("autoFlushBytes setting is not available in the TCP client")
+	}
 	if conf.maxBufSize != 0 {
 		return errors.New("maxBufferSize setting is not available in the TCP client")
+	}
+	if conf.maxSchemasPerConnection != 0 {
+		return errors.New("maxSchemasPerConnection setting is not available in the TCP client")
 	}
 	if conf.tcpKey == "" && conf.tcpKeyId != "" {
 		return errors.New("tcpKey is empty and tcpKeyId is not. both (or none) must be provided")
 	}
 	if conf.tcpKeyId == "" && conf.tcpKey != "" {
 		return errors.New("tcpKeyId is empty and tcpKey is not. both (or none) must be provided")
+	}
+
+	return nil
+}
+
+func sanitizeQwpConf(conf *lineSenderConfig) error {
+	err := validateConf(conf)
+	if err != nil {
+		return err
+	}
+
+	// QWP does not support HTTP-specific settings.
+	if conf.requestTimeout != 0 {
+		return errors.New("requestTimeout setting is not available in the QWP client")
+	}
+	if conf.minThroughput != 0 {
+		return errors.New("minThroughput setting is not available in the QWP client")
+	}
+	if conf.httpTransport != nil {
+		return errors.New("httpTransport setting is not available in the QWP client")
+	}
+	if conf.tcpKeyId != "" || conf.tcpKey != "" {
+		return errors.New("TCP auth settings (tcpKeyId/tcpKey) are not available in the QWP client")
+	}
+	// QWP auth: either Basic (user+pass) or Bearer (token), not both.
+	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
+		return errors.New("both basic and token authentication cannot be used")
+	}
+	if conf.inFlightWindow < 0 {
+		return fmt.Errorf("in-flight window is negative: %d", conf.inFlightWindow)
+	}
+	if conf.protocolVersion != protocolVersionUnset {
+		return errors.New("protocol_version setting is not available in the QWP client")
 	}
 
 	return nil
@@ -720,8 +869,63 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
 		return errors.New("both basic and token authentication cannot be used")
 	}
+	if conf.autoFlushBytes != 0 {
+		return errors.New("autoFlushBytes setting is not available in the HTTP client")
+	}
+	if conf.maxSchemasPerConnection != 0 {
+		return errors.New("maxSchemasPerConnection setting is not available in the HTTP client")
+	}
 
 	return nil
+}
+
+func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
+	scheme := "ws"
+	if conf.tlsMode != tlsDisabled {
+		scheme = "wss"
+	}
+	address := scheme + "://" + conf.address
+
+	opts := qwpTransportOpts{
+		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
+	}
+	// QWP auth: Basic (username:password) or Bearer (token).
+	// Matches the Java client's buildWebSocketAuthHeader().
+	if conf.httpUser != "" && conf.httpPass != "" {
+		creds := conf.httpUser + ":" + conf.httpPass
+		opts.authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+	} else if conf.httpToken != "" {
+		opts.authorization = "Bearer " + conf.httpToken
+	}
+
+	window := conf.inFlightWindow
+	if window <= 0 {
+		window = 1
+	}
+
+	s, err := newQwpLineSender(ctx, address, opts, conf.retryTimeout,
+		conf.autoFlushRows, conf.autoFlushInterval, conf.dumpWriter, window)
+	if err != nil {
+		return nil, err
+	}
+	s.maxBufSize = conf.maxBufSize
+	s.fileNameLimit = conf.fileNameLimit
+	s.autoFlushBytes = conf.autoFlushBytes
+	s.maxSchemasPerConnection = conf.maxSchemasPerConnection
+	if conf.closeTimeout > 0 {
+		s.closeTimeout = conf.closeTimeout
+	}
+	s.encoders[0].gorillaDisabled = conf.gorillaDisabled
+	s.encoders[1].gorillaDisabled = conf.gorillaDisabled
+	// Async mode's encoder buffers are pre-sized for the microbatch
+	// role: max(1 MB, 2 * autoFlushBytes). Matches the Java client's
+	// MicrobatchBuffer sizing. The 1 MB floor was already applied in
+	// newQwpLineSender; grow further if autoFlushBytes warrants it.
+	if s.asyncState != nil && conf.autoFlushBytes*2 > qwpDefaultMicrobatchBufSize {
+		s.encoders[0].wb.preallocate(conf.autoFlushBytes * 2)
+		s.encoders[1].wb.preallocate(conf.autoFlushBytes * 2)
+	}
+	return s, nil
 }
 
 func validateConf(conf *lineSenderConfig) error {
@@ -751,6 +955,15 @@ func validateConf(conf *lineSenderConfig) error {
 	}
 	if conf.autoFlushInterval < 0 {
 		return fmt.Errorf("auto flush interval is negative: %d", conf.autoFlushInterval)
+	}
+	if conf.closeTimeout < 0 {
+		return fmt.Errorf("close timeout is negative: %d", conf.closeTimeout)
+	}
+	if conf.autoFlushBytes < 0 {
+		return fmt.Errorf("auto flush bytes is negative: %d", conf.autoFlushBytes)
+	}
+	if conf.maxSchemasPerConnection < 0 {
+		return fmt.Errorf("max schemas per connection is negative: %d", conf.maxSchemasPerConnection)
 	}
 	if conf.protocolVersion < protocolVersionUnset || conf.protocolVersion > ProtocolVersion3 {
 		return errors.New("current client only supports protocol version 1 (text format for all datatypes), " +
