@@ -73,12 +73,11 @@ func BenchmarkQwpEncode(b *testing.B) {
 	}
 
 	symList := []string{"s0", "s1", "s2", "s3", "s4"}
-	const schemaId = 0
 
 	var enc qwpEncoder
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		enc.encodeTableWithDeltaDict(tb, symList, -1, 4, qwpSchemaModeFull, schemaId)
+		enc.encodeTableWithDeltaDict(tb, symList, -1, 4)
 	}
 }
 
@@ -127,7 +126,7 @@ func BenchmarkQwpFlush(b *testing.B) {
 			tb.commitRow()
 		}
 
-		enc.encodeTableWithDeltaDict(tb, symList, -1, 2, qwpSchemaModeFull, 0)
+		enc.encodeTableWithDeltaDict(tb, symList, -1, 2)
 		tb.reset()
 	}
 }
@@ -144,9 +143,6 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 		globalSymbols:    make(map[string]int32),
 		maxSentSymbolId:  -1,
 		batchMaxSymbolId: -1,
-		nextSchemaId:     0,
-		maxSentSchemaId:  -1,
-		batchMaxSchemaId: -1,
 	}
 
 	s.globalSymbols["AAPL"] = 0
@@ -165,15 +161,12 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 			}
 		}
 		tables, _ := s.buildTableEncodeInfo()
-		s.encoders[0].encodeMultiTableWithDeltaDict(
+		s.encoder.encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,
 			s.maxSentSymbolId,
 			s.batchMaxSymbolId,
 		)
-		if s.batchMaxSchemaId > s.maxSentSchemaId {
-			s.maxSentSchemaId = s.batchMaxSchemaId
-		}
 		s.resetAfterFlush()
 	}
 
@@ -199,8 +192,14 @@ func BenchmarkQwpSenderSteadyState(b *testing.B) {
 
 // TestQwpSenderSteadyStateZeroAllocs pins the 0-allocs/op invariant
 // programmatically so the invariant survives refactors without a
-// developer having to read the benchmark output.
+// developer having to read the benchmark output. Only meaningful for
+// non-race builds: race instrumentation forces some stack-allocatable
+// values to escape and inflates allocs/op (see TestQwpSender
+// SteadyStateNullsZeroAllocs for the variant that trips on this).
 func TestQwpSenderSteadyStateZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
 	_, iter := qwpSteadyStateSetup()
 	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
 		t.Fatalf("steady-state allocs/op = %g, want 0", allocs)
@@ -221,9 +220,6 @@ func qwpSteadyStateSetupWithNulls() (*qwpLineSender, func()) {
 		globalSymbols:    make(map[string]int32),
 		maxSentSymbolId:  -1,
 		batchMaxSymbolId: -1,
-		nextSchemaId:     0,
-		maxSentSchemaId:  -1,
-		batchMaxSchemaId: -1,
 	}
 
 	s.globalSymbols["AAPL"] = 0
@@ -246,15 +242,12 @@ func qwpSteadyStateSetupWithNulls() (*qwpLineSender, func()) {
 			}
 		}
 		tables, _ := s.buildTableEncodeInfo()
-		s.encoders[0].encodeMultiTableWithDeltaDict(
+		s.encoder.encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,
 			s.maxSentSymbolId,
 			s.batchMaxSymbolId,
 		)
-		if s.batchMaxSchemaId > s.maxSentSchemaId {
-			s.maxSentSchemaId = s.batchMaxSchemaId
-		}
 		s.resetAfterFlush()
 	}
 
@@ -277,11 +270,97 @@ func BenchmarkQwpSenderSteadyStateNulls(b *testing.B) {
 }
 
 // TestQwpSenderSteadyStateNullsZeroAllocs pins the 0-allocs/op
-// invariant for the null-mix variant.
+// invariant for the null-mix variant. See sibling test for the -race
+// caveat.
 func TestQwpSenderSteadyStateNullsZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
 	_, iter := qwpSteadyStateSetupWithNulls()
 	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
 		t.Fatalf("steady-state-nulls allocs/op = %g, want 0", allocs)
+	}
+}
+
+// qwpSteadyStateSetupMixedCase mirrors qwpSteadyStateSetupWithNulls but
+// gives every column a mixed-case name. The column index is keyed by the
+// lowercase name, so each cursor miss — which the sparse null pattern
+// guarantees — reaches the map lookup. That lookup stays allocation-free
+// for mixed-case writers via the ASCII-fold cursor compare, the cursor
+// resync on a map hit, and the memoized casing-variant alias keys.
+// Without them strings.ToLower allocates a fresh lowercase key on every
+// cursor-miss column, every row.
+func qwpSteadyStateSetupMixedCase() (*qwpLineSender, func()) {
+	ctx := context.Background()
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	s := &qwpLineSender{
+		tableBuffers:     make(map[string]*qwpTableBuffer),
+		globalSymbols:    make(map[string]int32),
+		maxSentSymbolId:  -1,
+		batchMaxSymbolId: -1,
+	}
+
+	s.globalSymbols["AAPL"] = 0
+	s.globalSymbolList = append(s.globalSymbolList, "AAPL")
+	s.batchMaxSymbolId = 0
+
+	iter := func() {
+		for r := 0; r < 10; r++ {
+			b := s.Table("t").Symbol("Sym", "AAPL")
+			if r%3 != 0 {
+				b = b.Int64Column("Qty", int64(100+r))
+			}
+			b = b.Float64Column("Price", 150.5+float64(r))
+			if r%2 == 0 {
+				b = b.StringColumn("Note", "test")
+			}
+			b = b.BoolColumn("Active", r%2 == 0)
+			if err := b.At(ctx, ts.Add(time.Duration(r)*time.Microsecond)); err != nil {
+				panic(err)
+			}
+		}
+		tables, _ := s.buildTableEncodeInfo()
+		s.encoder.encodeMultiTableWithDeltaDict(
+			tables,
+			s.globalSymbolList,
+			s.maxSentSymbolId,
+			s.batchMaxSymbolId,
+		)
+		s.resetAfterFlush()
+	}
+
+	iter()
+	iter()
+	return s, iter
+}
+
+// BenchmarkQwpSenderSteadyStateMixedCase is the mixed-case counterpart
+// of BenchmarkQwpSenderSteadyStateNulls: the same sparse null pattern,
+// but the column names carry uppercase letters so the run exercises the
+// case-fold lookup path.
+func BenchmarkQwpSenderSteadyStateMixedCase(b *testing.B) {
+	_, iter := qwpSteadyStateSetupMixedCase()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		iter()
+	}
+}
+
+// TestQwpSenderSteadyStateMixedCaseZeroAllocs pins the 0-allocs/op
+// invariant for mixed-case column names. The all-lowercase steady-state
+// pins do not cover it: strings.ToLower returns its input unchanged for
+// a lowercase name, so only an uppercase letter exposes a per-column key
+// allocation on the cursor-miss path. See sibling tests for the -race
+// caveat.
+func TestQwpSenderSteadyStateMixedCaseZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
+	_, iter := qwpSteadyStateSetupMixedCase()
+	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
+		t.Fatalf("steady-state-mixed-case allocs/op = %g, want 0", allocs)
 	}
 }
 
@@ -326,4 +405,66 @@ func BenchmarkQwpColumnAdd(b *testing.B) {
 			col.addSymbolID(int32(i % 100))
 		}
 	})
+}
+
+// BenchmarkQwpGorillaDecode measures Gorilla DoD decoding throughput
+// over a long timestamp column. The bit reader's hot loop issues up to
+// four single-bit prefix reads plus one wide signed read per row, so
+// this is the regression gate for the 8-byte LE refill optimisation in
+// qwpBitReader.readBits / readBitsSlow.
+func BenchmarkQwpGorillaDecode(b *testing.B) {
+	const n = 4096
+	mk := func(stepFn func(i int) int64) ([]byte, int64, int64) {
+		ts := make([]int64, n)
+		var cur int64
+		for i := range ts {
+			cur += stepFn(i)
+			ts[i] = cur
+		}
+		var wb qwpWireBuffer
+		var enc qwpGorillaEncoder
+		enc.encodeTimestamps(&wb, intsToBytes(ts), n)
+		// Strip the 16-byte uncompressed prefix the bit reader doesn't
+		// touch — the decoder's reset() takes only the bit-packed tail.
+		return append([]byte(nil), wb.bytes()[16:]...), ts[0], ts[1]
+	}
+
+	constantData, constantTs0, constantTs1 := mk(func(int) int64 { return 1000 })
+	smallData, smallTs0, smallTs1 := mk(func(i int) int64 {
+		// Most DoDs land in the 1- or 9-bit bucket.
+		return 1000 + int64((i*37)%5) - 2
+	})
+	wideData, wideTs0, wideTs1 := mk(func(i int) int64 {
+		// Forces the 32-bit bucket via large alternating jumps.
+		if i%2 == 0 {
+			return 1_000_000
+		}
+		return 1
+	})
+
+	cases := []struct {
+		name string
+		data []byte
+		ts0  int64
+		ts1  int64
+	}{
+		{"ConstantDelta", constantData, constantTs0, constantTs1},
+		{"SmallJitter", smallData, smallTs0, smallTs1},
+		{"WideJitter", wideData, wideTs0, wideTs1},
+	}
+
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			var dec qwpGorillaDecoder
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				dec.reset(c.ts0, c.ts1, c.data)
+				for j := 2; j < n; j++ {
+					if _, err := dec.decodeNext(); err != nil {
+						b.Fatalf("decodeNext[%d]: %v", j, err)
+					}
+				}
+			}
+		})
+	}
 }

@@ -37,7 +37,7 @@ import (
 
 var (
 	errAcquireFromClosedPool = errors.New("cannot acquire a LineSender from a closed LineSenderPool")
-	errHttpOnlySender        = errors.New("tcp/s not supported for pooled senders, use http/s only")
+	errHttpOnlySender        = errors.New("only http/s schemas are supported for pooled senders (tcp/s, ws/wss, qwpws/qwpwss are not)")
 	errPooledSenderClose     = errors.New("error closing one or more LineSenders in the pool")
 )
 
@@ -77,7 +77,7 @@ type LineSenderPoolOption func(*LineSenderPool)
 // The default maximum number of senders is 64, but can be customized by using the
 // [WithMaxSenders] option.
 func PoolFromConf(conf string, opts ...LineSenderPoolOption) (*LineSenderPool, error) {
-	if strings.HasPrefix(conf, "tcp") {
+	if !strings.HasPrefix(conf, "http::") && !strings.HasPrefix(conf, "https::") {
 		return nil, errHttpOnlySender
 	}
 
@@ -177,9 +177,18 @@ func (p *LineSenderPool) Sender(ctx context.Context) (LineSender, error) {
 		conf := newLineSenderConfig(httpSenderType)
 		for _, opt := range p.opts {
 			opt(conf)
-			if conf.senderType == tcpSenderType {
+			if conf.senderType != httpSenderType {
 				return nil, errHttpOnlySender
 			}
+		}
+		// Mirror the validation the conf-string branch gets via
+		// LineSenderFromConf->newLineSender. The senderType check above
+		// catches WithTcp/WithQwp, but QWP-only knobs (WithErrorHandler,
+		// WithSfDir, ...) leave senderType unchanged; sanitizeHttpConf
+		// rejects them so the pool never builds an HTTP sender that
+		// silently drops them.
+		if err = sanitizeHttpConf(conf); err != nil {
+			return nil, err
 		}
 		s, err = newHttpLineSender(ctx, conf)
 	}

@@ -130,14 +130,17 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			expectedErr: "both basic and token",
 		},
 		{
+			// Size-typed keys now go through parseSizeBytes, which
+			// rejects negatives at parse time with a more specific
+			// message than the old validateConf "is negative" check.
 			name:        "negative init_buf_size",
 			config:      "http::init_buf_size=-1;",
-			expectedErr: "initial buffer size is negative",
+			expectedErr: "must be non-negative",
 		},
 		{
 			name:        "negative max_buf_size",
 			config:      "http::max_buf_size=-1;",
-			expectedErr: "max buffer size is negative",
+			expectedErr: "must be non-negative",
 		},
 		{
 			name:        "negative retry timeout",
@@ -163,6 +166,11 @@ func TestHttpPathologicalCasesFromConf(t *testing.T) {
 			name:        "negative auto flush interval",
 			config:      "http::auto_flush_interval=-1;",
 			expectedErr: "auto flush interval is negative",
+		},
+		{
+			name:        "max_name_len below minimum",
+			config:      "http::max_name_len=15;",
+			expectedErr: "max_name_len must be at least 16 bytes",
 		},
 		{
 			name:        "schema is case-sensitive",
@@ -194,9 +202,11 @@ func TestHttpPathologicalCasesFromEnv(t *testing.T) {
 			expectedErr: "both basic and token",
 		},
 		{
+			// See TestHttpPathologicalCasesFromConf above — size-typed
+			// keys now error at parse time with a different message.
 			name:        "negative max_buf_size",
 			config:      "http::max_buf_size=-1;",
-			expectedErr: "max buffer size is negative",
+			expectedErr: "must be non-negative",
 		},
 		{
 			name:        "schema is case-sensitive",
@@ -340,6 +350,7 @@ func TestRetryOn500(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)
@@ -367,6 +378,7 @@ func TestNoRetryOn400FromProxy(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)
@@ -394,6 +406,7 @@ func TestNoRetryOn400FromServer(t *testing.T) {
 		ctx,
 		qdb.WithHttp(),
 		qdb.WithAddress(srv.Addr()),
+		qdb.WithProtocolVersion(qdb.ProtocolVersion1),
 		qdb.WithRequestTimeout(10*time.Millisecond),
 		qdb.WithRetryTimeout(50*time.Millisecond),
 	)

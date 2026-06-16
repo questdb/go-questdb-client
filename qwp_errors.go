@@ -24,67 +24,143 @@
 
 package questdb
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// QwpUpgradeRejectError is returned by qwpTransport.connect when the
+// server completes the HTTP exchange with a non-101 status. Construction
+// captures the response status and the failover-relevant headers so the
+// reconnect loop can classify the host without re-parsing strings:
+//
+//   - StatusCode is the HTTP response status (e.g. 421 for a misdirected
+//     request).
+//   - Role is the trimmed X-QuestDB-Role header value (empty if absent).
+//     The spec admits STANDALONE / PRIMARY / REPLICA / PRIMARY_CATCHUP;
+//     unrecognised tokens are surfaced verbatim and classified by the
+//     reconnect loop.
+//   - Zone is the trimmed X-QuestDB-Zone header value (empty if absent).
+//     Used to record host zone tier ahead of any successful upgrade.
+//   - RetryAfter is the parsed Retry-After header in seconds (0 if absent
+//     or unparseable). Hint only — the failover loop's outage budget
+//     still bounds the wait.
+//   - Body is up to qwpUpgradeBodySnippetCap bytes of the response body,
+//     captured for error formatting. Truncation is signalled by a
+//     trailing "…" in the Error() output.
+type QwpUpgradeRejectError struct {
+	StatusCode int
+	Role       string
+	Zone       string
+	RetryAfter time.Duration
+	Body       string
+	// cause is the underlying websocket.Dial error. connect builds this
+	// type only on a dial failure, so it is non-nil in practice. It is
+	// the real reason the upgrade failed when StatusCode is 101: the
+	// HTTP exchange reached the handshake-complete status but the
+	// WebSocket upgrade itself was rejected (e.g. a bad
+	// Sec-WebSocket-Accept). Exposed via Unwrap.
+	cause error
+}
+
+// qwpUpgradeBodySnippetCap bounds how many response-body bytes the
+// transport captures into QwpUpgradeRejectError.Body. Keeps error
+// messages bounded when a misconfigured server returns a large HTML
+// payload on a 4xx/5xx upgrade rejection.
+const qwpUpgradeBodySnippetCap = 512
+
+// Error implements the error interface. The format leads with the
+// HTTP status and tag (Role / Zone / Retry-After) so the failover
+// loop can include the message verbatim in its budget-exhaustion
+// report without losing the structured fields.
+func (e *QwpUpgradeRejectError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "qwp: upgrade rejected with HTTP %d", e.StatusCode)
+	if e.Role != "" {
+		fmt.Fprintf(&b, " (role=%s)", e.Role)
+	}
+	if e.Zone != "" {
+		fmt.Fprintf(&b, " (zone=%s)", e.Zone)
+	}
+	if e.RetryAfter > 0 {
+		fmt.Fprintf(&b, " (retry-after=%s)", e.RetryAfter)
+	}
+	if e.Body != "" {
+		fmt.Fprintf(&b, ": %s", e.Body)
+	}
+	// A 101 status means the HTTP handshake completed but the WebSocket
+	// upgrade was still rejected, so "rejected with HTTP 101" is
+	// misleading on its own — surface the underlying dial error that
+	// actually explains the failure.
+	if e.StatusCode == 101 && e.cause != nil {
+		fmt.Fprintf(&b, ": %v", e.cause)
+	}
+	return b.String()
+}
+
+// Unwrap returns the underlying websocket.Dial error so errors.Is /
+// errors.As can reach the transport-level cause. Classification keys
+// off StatusCode via a top-level type assertion, so unwrapping does
+// not affect host-role classification.
+func (e *QwpUpgradeRejectError) Unwrap() error {
+	return e.cause
+}
+
+// IsRoleReject reports whether the upgrade was rejected with the
+// failover-spec "topology hint" combination: HTTP 421 plus a non-empty
+// X-QuestDB-Role header. The reconnect loop classifies the host as
+// TransientReject (Role == PRIMARY_CATCHUP, case-insensitive) or
+// TopologyReject (any other non-empty role).
+func (e *QwpUpgradeRejectError) IsRoleReject() bool {
+	return e.StatusCode == 421 && e.Role != ""
+}
+
+// IsCatchupRole reports whether the role tag is PRIMARY_CATCHUP
+// (case-insensitive). Only meaningful when IsRoleReject() is true.
+func (e *QwpUpgradeRejectError) IsCatchupRole() bool {
+	return strings.EqualFold(e.Role, "PRIMARY_CATCHUP")
+}
 
 // qwpStatusName returns a human-readable name for a QWP status code.
-func qwpStatusName(status qwpStatusCode) string {
+// Used by (*SenderError).Error() to format the wire-byte component of
+// rejection messages.
+func qwpStatusName(status QwpStatusCode) string {
 	switch status {
-	case qwpStatusOK:
+	case QwpStatusOK:
 		return "OK"
-	case qwpStatusSchemaMismatch:
+	case QwpStatusDurableAck:
+		return "DURABLE_ACK"
+	case QwpStatusSchemaMismatch:
 		return "SCHEMA_MISMATCH"
-	case qwpStatusParseError:
+	case QwpStatusParseError:
 		return "PARSE_ERROR"
-	case qwpStatusInternalError:
+	case QwpStatusInternalError:
 		return "INTERNAL_ERROR"
-	case qwpStatusSecurityError:
+	case QwpStatusSecurityError:
 		return "SECURITY_ERROR"
-	case qwpStatusWriteError:
+	case QwpStatusWriteError:
 		return "WRITE_ERROR"
+	case qwpStatusCancelled:
+		return "CANCELLED"
+	case qwpStatusLimitExceeded:
+		return "LIMIT_EXCEEDED"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", status)
 	}
 }
 
-// QwpError represents an error returned by the QuestDB server in
-// a QWP ACK response. It contains the status code, the
-// sequence number from the response, and an optional error message.
-type QwpError struct {
-	// Status is the status code from the ACK response.
-	Status qwpStatusCode
-
-	// Sequence is the cumulative sequence number from the ACK, used
-	// to correlate responses with requests in async mode.
-	Sequence int64
-
-	// Message is the server's error description, or empty if
-	// no error message was included in the response.
-	Message string
-}
-
-// Error implements the error interface.
-func (e *QwpError) Error() string {
-	name := qwpStatusName(e.Status)
-	if e.Message != "" {
-		return fmt.Sprintf("qwp: server error %s (0x%02X): %s", name, byte(e.Status), e.Message)
-	}
-	return fmt.Sprintf("qwp: server error %s (0x%02X)", name, byte(e.Status))
-}
-
-// newQwpErrorFromAck creates a QwpError from a raw ACK payload.
-// Returns nil if the status is OK.
+// parseAckErrorPayload extracts the status code, cumulative sequence
+// number, and server error message from a non-OK ACK frame. Used by
+// the SF send loop's receiver to assemble a *SenderError with the
+// surrounding FSN-span context.
 //
 // Precondition: data has already been validated by readAck, which
-// guarantees qwpAckOKSize bytes for OK status and at least
-// qwpAckErrorHeaderSize + msg_len bytes for non-OK statuses.
-func newQwpErrorFromAck(data []byte) *QwpError {
-	status := qwpStatusCode(data[0])
-	if status == qwpStatusOK {
-		return nil
+// guarantees the layout invariants documented on readAck.
+func parseAckErrorPayload(data []byte) (status QwpStatusCode, seq int64, msg string) {
+	status = QwpStatusCode(data[0])
+	if status == QwpStatusOK || status == QwpStatusDurableAck {
+		return status, 0, ""
 	}
-	return &QwpError{
-		Status:   status,
-		Sequence: parseAckSequence(data),
-		Message:  parseAckError(data),
-	}
+	return status, parseAckSequence(data), parseAckError(data)
 }

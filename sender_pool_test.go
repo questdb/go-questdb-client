@@ -223,28 +223,62 @@ func TestMultiThreadedPoolWritesOverHttp(t *testing.T) {
 
 	lines := []string{}
 
-	go func() {
+	assert.Eventually(t, func() bool {
 		for {
 			select {
 			case msg := <-srv.BackCh:
 				lines = append(lines, msg)
-			case <-srv.closeCh:
-				return
 			default:
-				continue
+				return len(lines) == numThreads
 			}
 		}
-	}()
-
-	assert.Eventually(t, func() bool {
-		return len(lines) == numThreads
-	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d")
+	}, time.Second, 100*time.Millisecond, "expected %d flushed lines but only received %d", numThreads, len(lines))
 }
 
-func TestTcpNotSupported(t *testing.T) {
-	_, err := qdb.PoolFromConf("tcp::addr=localhost:9000")
-	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
+func TestNonHttpSchemasNotSupported(t *testing.T) {
+	cases := []string{
+		"tcp::addr=localhost:9000",
+		"tcps::addr=localhost:9000",
+		"ws::addr=localhost:9000",
+		"wss::addr=localhost:9000",
+		"qwpws::addr=localhost:9000",
+		"qwpwss::addr=localhost:9000",
+		"grpc::addr=localhost:9000",
+	}
+	for _, conf := range cases {
+		t.Run(conf, func(t *testing.T) {
+			_, err := qdb.PoolFromConf(conf)
+			assert.ErrorContains(t, err, "only http/s")
+		})
+	}
+}
 
-	_, err = qdb.PoolFromConf("tcps::addr=localhost:9000")
-	assert.ErrorContains(t, err, "tcp/s not supported for pooled senders")
+func TestPoolFromOptionsRejectsQwp(t *testing.T) {
+	p, err := qdb.PoolFromOptions(qdb.WithQwp(), qdb.WithAddress("localhost:9000"))
+	require.NoError(t, err)
+	_, err = p.Sender(context.Background())
+	assert.ErrorContains(t, err, "only http/s")
+}
+
+// QWP-only knobs do not flip the sender type, so the senderType check
+// in Sender() does not catch them. They must still be rejected, matching
+// the conf-string branch which sanitizes via LineSenderFromConf.
+func TestPoolFromOptionsRejectsQwpOnlyOptions(t *testing.T) {
+	cases := []struct {
+		name string
+		opt  qdb.LineSenderOption
+	}{
+		{"WithErrorHandler", qdb.WithErrorHandler(func(*qdb.SenderError) {})},
+		{"WithServerErrorPolicy", qdb.WithServerErrorPolicy(qdb.PolicyHalt)},
+		{"WithSfDir", qdb.WithSfDir(t.TempDir())},
+		{"WithDrainOrphans", qdb.WithDrainOrphans(true)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := qdb.PoolFromOptions(qdb.WithHttp(), tc.opt)
+			require.NoError(t, err)
+			_, err = p.Sender(context.Background())
+			assert.ErrorContains(t, err, "only available in the QWP client")
+		})
+	}
 }

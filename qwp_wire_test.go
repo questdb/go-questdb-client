@@ -256,6 +256,193 @@ func TestQwpVarintDecodeErrors(t *testing.T) {
 	_, _, err = qwpReadVarint(overflow)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "overflow")
+
+	// Byte-10 guard: 10th byte (shift=63) may only contribute bit 0.
+	// Any of data bits 1..6 set means the decoded value would silently
+	// overflow uint64 via the shift. Mirrors the Java byte-10 guard in
+	// QwpResultBatchDecoder.decodeVarint.
+	//
+	// Hostile encoding: 9 continuation bytes + 0x40 (sets bit 62 of byte 10,
+	// i.e. bit 125 of the value — pure garbage, must be rejected).
+	bit62 := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x40}
+	_, _, err = qwpReadVarint(bit62)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "overflow")
+
+	// Hostile encoding: 9 continuation bytes + 0x02 (sets bit 64 of the
+	// value — exactly one bit past uint64 range; the shift would discard
+	// it silently without the guard).
+	bit64 := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02}
+	_, _, err = qwpReadVarint(bit64)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "overflow")
+
+	// Sanity: the in-range byte-10 pattern (bit 63 set, encoding 1<<63)
+	// is NOT rejected by the guard — it's a valid uint64.
+	inRange := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}
+	v, n, err := qwpReadVarint(inRange)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(1)<<63, v)
+	assert.Equal(t, 10, n)
+}
+
+// --- qwpByteReader ---
+
+func TestQwpByteReaderHappyPath(t *testing.T) {
+	// Build a mixed-type buffer, then read back.
+	var w qwpWireBuffer
+	w.putByte(0x42)
+	w.putUint16LE(0x1234)
+	w.putUint32LE(0xDEADBEEF)
+	w.putInt32LE(-7)
+	w.putUint64LE(0x0102030405060708)
+	w.putInt64LE(-42)
+	w.putFloat64LE(3.5)
+	w.putVarint(300)
+	w.putBytes([]byte{0xCA, 0xFE, 0xBA, 0xBE})
+
+	var r qwpByteReader
+	r.reset(w.bytes())
+
+	assert.Equal(t, len(w.bytes()), r.remaining())
+
+	b, err := r.readByte()
+	assert.NoError(t, err)
+	assert.Equal(t, byte(0x42), b)
+
+	u16, err := r.readUint16LE()
+	assert.NoError(t, err)
+	assert.Equal(t, uint16(0x1234), u16)
+
+	u32, err := r.readUint32LE()
+	assert.NoError(t, err)
+	assert.Equal(t, uint32(0xDEADBEEF), u32)
+
+	i32, err := r.readInt32LE()
+	assert.NoError(t, err)
+	assert.Equal(t, int32(-7), i32)
+
+	u64, err := r.readUint64LE()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(0x0102030405060708), u64)
+
+	i64, err := r.readInt64LE()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(-42), i64)
+
+	f64, err := r.readFloat64LE()
+	assert.NoError(t, err)
+	assert.Equal(t, 3.5, f64)
+
+	varint, err := r.readVarint()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(300), varint)
+
+	tail, err := r.slice(4)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0xCA, 0xFE, 0xBA, 0xBE}, tail)
+
+	assert.True(t, r.atEnd())
+	assert.Equal(t, 0, r.remaining())
+}
+
+func TestQwpByteReaderTruncatedAtEveryReader(t *testing.T) {
+	// For each typed reader, supply a buffer one byte short and assert
+	// the read errors instead of reading past the end.
+	cases := []struct {
+		name string
+		buf  []byte
+		fn   func(*qwpByteReader) error
+	}{
+		{"readByte", []byte{}, func(r *qwpByteReader) error { _, err := r.readByte(); return err }},
+		{"readUint16LE", []byte{0x01}, func(r *qwpByteReader) error { _, err := r.readUint16LE(); return err }},
+		{"readUint32LE", []byte{0x01, 0x02, 0x03}, func(r *qwpByteReader) error { _, err := r.readUint32LE(); return err }},
+		{"readInt32LE", []byte{0x01, 0x02, 0x03}, func(r *qwpByteReader) error { _, err := r.readInt32LE(); return err }},
+		{"readUint64LE", []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}, func(r *qwpByteReader) error { _, err := r.readUint64LE(); return err }},
+		{"readInt64LE", []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}, func(r *qwpByteReader) error { _, err := r.readInt64LE(); return err }},
+		{"readFloat64LE", []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}, func(r *qwpByteReader) error { _, err := r.readFloat64LE(); return err }},
+		{"readVarint_truncated", []byte{0x80}, func(r *qwpByteReader) error { _, err := r.readVarint(); return err }},
+		{"slice_past_end", []byte{0x01}, func(r *qwpByteReader) error { _, err := r.slice(2); return err }},
+		{"advance_past_end", []byte{0x01}, func(r *qwpByteReader) error { return r.advance(2) }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var r qwpByteReader
+			r.reset(c.buf)
+			err := c.fn(&r)
+			assert.Error(t, err)
+			var decodeErr *qwpDecodeError
+			assert.ErrorAs(t, err, &decodeErr)
+		})
+	}
+}
+
+func TestQwpByteReaderVarintInt63RejectsSignBit(t *testing.T) {
+	// Varint for 1<<63 (one past int64.MaxValue). The uint64 decoder
+	// accepts it; readVarintInt63 must reject it as overflowing the
+	// signed int63 range used by length / count / id fields on the wire.
+	var w qwpWireBuffer
+	w.putVarint(uint64(1) << 63)
+
+	var r qwpByteReader
+	r.reset(w.bytes())
+
+	_, err := r.readVarintInt63()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "int63")
+
+	// Sanity: math.MaxInt64 fits and round-trips.
+	w.reset()
+	w.putVarint(uint64(math.MaxInt64))
+	r.reset(w.bytes())
+	v, err := r.readVarintInt63()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(math.MaxInt64), v)
+}
+
+func TestQwpByteReaderAdvanceAndSlice(t *testing.T) {
+	buf := []byte{1, 2, 3, 4, 5, 6}
+	var r qwpByteReader
+	r.reset(buf)
+
+	assert.NoError(t, r.advance(2))
+	assert.Equal(t, 4, r.remaining())
+
+	s, err := r.slice(2)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{3, 4}, s)
+
+	// Slice aliases the input — mutating the source surfaces in the view.
+	buf[2] = 0xEE
+	assert.Equal(t, byte(0xEE), s[0])
+
+	// Negative n rejected.
+	assert.Error(t, r.advance(-1))
+	_, err = r.slice(-1)
+	assert.Error(t, err)
+
+	// Running off the end errors.
+	assert.Error(t, r.advance(10))
+}
+
+func TestQwpByteReaderZeroAlloc(t *testing.T) {
+	// Hot-path reads must not allocate. This pins the contract that the
+	// decoder (Step 4) relies on to meet the zero-alloc invariant.
+	buf := make([]byte, 64)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+	var r qwpByteReader
+
+	allocs := testing.AllocsPerRun(100, func() {
+		r.reset(buf)
+		_, _ = r.readByte()
+		_, _ = r.readUint32LE()
+		_, _ = r.readInt64LE()
+		_, _ = r.readFloat64LE()
+		_, _ = r.slice(4)
+	})
+	assert.Equal(t, float64(0), allocs, "qwpByteReader hot path must not allocate")
 }
 
 func TestQwpStringSize(t *testing.T) {

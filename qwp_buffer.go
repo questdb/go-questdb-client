@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
+	"strings"
 )
 
 // qwpLongNull is the uint64 bit pattern for int64 MinInt64
@@ -88,9 +89,11 @@ type qwpColumnBuffer struct {
 	// has rowCount+1 entries with arrayOffsets[0]==0. Row i's encoded
 	// data spans arrayData[arrayOffsets[i]:arrayOffsets[i+1]].
 	// Each row's encoded data contains:
-	//   nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+	//   nDims (1 byte, >= 1) + shape (nDims × 4 bytes LE) + flattened
 	//   elements (product(shape) × 8 bytes LE).
-	// Null arrays are encoded as nDims=1, dim0=0 (5 bytes total).
+	// The public ingest API always creates array columns with
+	// nullable=true, so NULL rows are tracked in the null bitmap and
+	// no inline data is appended for them.
 	arrayOffsets []uint32
 	arrayData    []byte
 
@@ -411,38 +414,81 @@ func (c *qwpColumnBuffer) growArrayData(n int) int {
 	return off
 }
 
-// addDoubleArray appends an N-dimensional float64 array value
-// (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
-//
-//	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
-//	elements (product(shape) × 8 bytes LE, row-major order).
-func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []float64) {
+// reserveArrayValue grows arrayData for one array value — a
+// nDims+shape header (1 + nDims×4 bytes) followed by payloadBytes of
+// flattened element data — writes the header, advances the
+// arrayOffsets / dataSize / rowCount bookkeeping, and returns the
+// payload sub-slice (len == payloadBytes) the caller fills with the
+// little-endian elements. Centralising grow+header+bookkeeping lets
+// every typed array writer stream its elements straight into arrayData
+// with no intermediate flattened copy.
+func (c *qwpColumnBuffer) reserveArrayValue(nDims uint8, shape []int32, payloadBytes int) []byte {
 	metaSize := 1 + int(nDims)*4
-	dataSize := len(flatData) * 8
-	totalSize := metaSize + dataSize
+	totalSize := metaSize + payloadBytes
 
 	off := c.growArrayData(totalSize)
-	buf := c.arrayData[off:]
+	buf := c.arrayData[off : off+totalSize]
 
-	// nDims
 	buf[0] = nDims
 	pos := 1
-
-	// shape: each dimension as uint32 LE
 	for i := 0; i < int(nDims); i++ {
 		binary.LittleEndian.PutUint32(buf[pos:], uint32(shape[i]))
 		pos += 4
 	}
 
-	// flattened elements: each float64 LE
-	for _, v := range flatData {
-		binary.LittleEndian.PutUint64(buf[pos:], math.Float64bits(v))
-		pos += 8
-	}
-
 	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
 	c.trackDataGrowth(totalSize + 4) // array data + uint32 offset
 	c.rowCount++
+	return buf[pos:totalSize]
+}
+
+// addDoubleArray appends an N-dimensional float64 array value
+// (TYPE_DOUBLE_ARRAY). The encoded data is stored as:
+//
+//	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
+//	elements (product(shape) × 8 bytes LE, row-major order).
+//
+// flatData must already be row-major; the typed 2D/3D writers
+// (addDoubleArray2D / addDoubleArray3D) stream their nested input in
+// directly instead, avoiding an intermediate flat copy.
+func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []float64) {
+	dst := c.reserveArrayValue(nDims, shape, len(flatData)*8)
+	pos := 0
+	for _, v := range flatData {
+		binary.LittleEndian.PutUint64(dst[pos:], math.Float64bits(v))
+		pos += 8
+	}
+}
+
+// addDoubleArray2D appends a regular 2D float64 array, streaming each
+// element straight into arrayData. The caller has already validated
+// the shape is regular (every row len == dim1) and within bounds.
+func (c *qwpColumnBuffer) addDoubleArray2D(dim0, dim1 int, values [][]float64) {
+	dst := c.reserveArrayValue(2, []int32{int32(dim0), int32(dim1)}, dim0*dim1*8)
+	pos := 0
+	for _, row := range values {
+		for _, v := range row {
+			binary.LittleEndian.PutUint64(dst[pos:], math.Float64bits(v))
+			pos += 8
+		}
+	}
+}
+
+// addDoubleArray3D appends a regular 3D float64 array, streaming each
+// element straight into arrayData. The caller has already validated
+// the shape is regular (every plane len == dim1, every row len ==
+// dim2) and within bounds.
+func (c *qwpColumnBuffer) addDoubleArray3D(dim0, dim1, dim2 int, values [][][]float64) {
+	dst := c.reserveArrayValue(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, dim0*dim1*dim2*8)
+	pos := 0
+	for _, plane := range values {
+		for _, row := range plane {
+			for _, v := range row {
+				binary.LittleEndian.PutUint64(dst[pos:], math.Float64bits(v))
+				pos += 8
+			}
+		}
+	}
 }
 
 // addLongArray appends an N-dimensional int64 array value
@@ -450,33 +496,48 @@ func (c *qwpColumnBuffer) addDoubleArray(nDims uint8, shape []int32, flatData []
 //
 //	nDims (1 byte) + shape (nDims × 4 bytes LE) + flattened
 //	elements (product(shape) × 8 bytes LE, row-major order).
+//
+// flatData must already be row-major; the typed 2D/3D writers
+// (addLongArray2D / addLongArray3D) stream their nested input in
+// directly instead, avoiding an intermediate flat copy.
 func (c *qwpColumnBuffer) addLongArray(nDims uint8, shape []int32, flatData []int64) {
-	metaSize := 1 + int(nDims)*4
-	dataSize := len(flatData) * 8
-	totalSize := metaSize + dataSize
-
-	off := c.growArrayData(totalSize)
-	buf := c.arrayData[off:]
-
-	// nDims
-	buf[0] = nDims
-	pos := 1
-
-	// shape: each dimension as uint32 LE
-	for i := 0; i < int(nDims); i++ {
-		binary.LittleEndian.PutUint32(buf[pos:], uint32(shape[i]))
-		pos += 4
-	}
-
-	// flattened elements: each int64 LE
+	dst := c.reserveArrayValue(nDims, shape, len(flatData)*8)
+	pos := 0
 	for _, v := range flatData {
-		binary.LittleEndian.PutUint64(buf[pos:], uint64(v))
+		binary.LittleEndian.PutUint64(dst[pos:], uint64(v))
 		pos += 8
 	}
+}
 
-	c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
-	c.trackDataGrowth(totalSize + 4) // array data + uint32 offset
-	c.rowCount++
+// addLongArray2D appends a regular 2D int64 array, streaming each
+// element straight into arrayData. The caller has already validated
+// the shape is regular (every row len == dim1) and within bounds.
+func (c *qwpColumnBuffer) addLongArray2D(dim0, dim1 int, values [][]int64) {
+	dst := c.reserveArrayValue(2, []int32{int32(dim0), int32(dim1)}, dim0*dim1*8)
+	pos := 0
+	for _, row := range values {
+		for _, v := range row {
+			binary.LittleEndian.PutUint64(dst[pos:], uint64(v))
+			pos += 8
+		}
+	}
+}
+
+// addLongArray3D appends a regular 3D int64 array, streaming each
+// element straight into arrayData. The caller has already validated
+// the shape is regular (every plane len == dim1, every row len ==
+// dim2) and within bounds.
+func (c *qwpColumnBuffer) addLongArray3D(dim0, dim1, dim2 int, values [][][]int64) {
+	dst := c.reserveArrayValue(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, dim0*dim1*dim2*8)
+	pos := 0
+	for _, plane := range values {
+		for _, row := range plane {
+			for _, v := range row {
+				binary.LittleEndian.PutUint64(dst[pos:], uint64(v))
+				pos += 8
+			}
+		}
+	}
 }
 
 // addDecimal appends a Decimal value to a decimal column
@@ -518,20 +579,32 @@ func (c *qwpColumnBuffer) addDecimal(d Decimal) error {
 	wireSize := c.fixedSize // 8, 16, or 32
 	startOffset := uint8(32 - wireSize)
 
-	// Check for overflow: significant bytes that don't fit.
+	// Check for overflow: the value's significant bytes must fit in the
+	// wire width without altering the value.
 	if d.offset < startOffset {
-		// Verify the bytes beyond wire size are pure sign extension.
 		signByte := byte(0x00)
 		if d.unscaled[d.offset]&0x80 != 0 {
 			signByte = 0xFF
 		}
+		// Two conditions must hold for the truncation to be lossless:
+		// the dropped bytes must be pure sign extension, and the
+		// retained most-significant byte must itself carry a sign bit
+		// matching the value's sign. The latter guards the boundary
+		// where a value needs exactly one extra byte that happens to be
+		// the sign byte (e.g. +2^63), so dropping it would otherwise
+		// flip the sign and store MinInt64.
+		overflow := d.unscaled[startOffset]&0x80 != signByte&0x80
 		for i := d.offset; i < startOffset; i++ {
 			if d.unscaled[i] != signByte {
-				return fmt.Errorf(
-					"qwp: column %q: decimal value overflows %d-byte storage",
-					c.name, wireSize,
-				)
+				overflow = true
+				break
 			}
+		}
+		if overflow {
+			return fmt.Errorf(
+				"qwp: column %q: decimal value overflows %d-byte storage",
+				c.name, wireSize,
+			)
 		}
 	}
 
@@ -641,13 +714,14 @@ func (c *qwpColumnBuffer) addNull() {
 		c.appendU64(qwpLongNull)
 
 	case qwpTypeDoubleArray, qwpTypeLongArray:
-		// Null array sentinel: nDims=1, dim0=0 (5 bytes total).
-		off := len(c.arrayData)
-		c.arrayData = append(c.arrayData, 0, 0, 0, 0, 0)
-		c.arrayData[off] = 0x01 // nDims = 1
-		// dim0 = 0 (already zero from append)
-		c.arrayOffsets = append(c.arrayOffsets, uint32(len(c.arrayData)))
-		c.trackDataGrowth(5 + 4) // 5 data + uint32 offset
+		// Unreachable from the public API: Float64Array* / Int64Array*
+		// always create array columns with nullable=true, so addNull
+		// takes the bitmap branch above. The wire format has no inline
+		// NULL sentinel for arrays — the server's ingest cursor and
+		// the Go egress decoder both reject nDims=0 — so there is no
+		// valid byte sequence to emit here. Fail loud rather than
+		// write a frame the peer will reject.
+		panic("qwp: addNull on a non-nullable array column is not supported")
 
 	case qwpTypeGeohash:
 		// -1 (all bits set) is the QuestDB geohash null sentinel.
@@ -783,9 +857,35 @@ func (c *qwpColumnBuffer) truncateTo(n int) {
 // manages multiple qwpColumnBuffer instances and handles row commits
 // with automatic gap-filling for columns not set in a given row.
 type qwpTableBuffer struct {
-	tableName   string
-	columns     []*qwpColumnBuffer
-	columnIndex map[string]int // column name → index in columns slice
+	tableName string
+	columns   []*qwpColumnBuffer
+	// columnIndex is keyed by the lowercase column name. QuestDB
+	// column names are case-insensitive throughout the server stack
+	// (TableReaderMetadata.columnNameIndexMap and
+	// TableUpdateDetails are LowerCase* maps), so the buffer must
+	// dedupe accordingly — otherwise emitting "Pressure_S" in one
+	// row and "pressure_s" in another within the same wire frame
+	// produces two distinct column definitions, and the server's
+	// QwpTudCache.getOrCreateTable faithfully creates two
+	// case-equivalent columns, corrupting the metadata file.
+	// Mirrors Java QwpTableBuffer.columnNameToIndex
+	// (LowerCaseCharSequenceIntHashMap). The column's own .name
+	// stays case-preserved (first-seen casing) for wire emission.
+	//
+	// It may also hold memoized casing-variant alias keys (a verbatim
+	// mixed-case name aliased to a column's canonical lowercase key) so
+	// repeat lookups of a mixed-case column skip strings.ToLower. Alias
+	// keys always carry an uppercase letter, so they never collide with
+	// the all-lowercase canonical keys. See getOrCreateColumn.
+	columnIndex map[string]int
+
+	// aliasKeys records the casing-variant keys memoized into
+	// columnIndex. cancelRow drops them when it removes columns: an
+	// alias maps to a column index that the truncation (or the
+	// committedColumnCount==0 reset case, which removes every column)
+	// can leave dangling past the columns slice. They re-memoize on
+	// demand.
+	aliasKeys []string
 
 	// rowCount is the number of committed (finalized) rows.
 	rowCount int
@@ -804,19 +904,20 @@ type qwpTableBuffer struct {
 	// in the Java client.
 	columnAccessCursor int
 
-	// schemaId is the per-connection schema identifier for this
-	// table's current column set. -1 means unassigned — the sender
-	// allocates a fresh ID from its nextSchemaId counter on the next
-	// flush and sends the schema in full mode. Reset to -1 whenever
-	// the column set changes so a new ID is allocated and the server
-	// re-registers the schema.
-	schemaId int
-
 	// dataSize is a running counter of approximate data bytes stored
 	// across all columns. Incremented by column addX methods via
 	// trackDataGrowth. Reset to 0 in reset(), recomputed from scratch
 	// in cancelRow(). Makes approxDataSize() O(1).
 	dataSize int
+
+	// dirty marks that this buffer was selected by Table() since the
+	// last full flush and therefore appears in the sender's dirtyTables
+	// list. The sender (not reset()) owns this flag: it gates the
+	// append in Table() so each touched table is listed once, and
+	// resetAfterFlush clears it. A per-table reset() during a split
+	// flush deliberately leaves it set so the still-listed (now empty)
+	// buffer is not re-appended if the producer reuses it.
+	dirty bool
 }
 
 // newQwpTableBuffer creates a table buffer for the given table name.
@@ -824,8 +925,51 @@ func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 	return &qwpTableBuffer{
 		tableName:   tableName,
 		columnIndex: make(map[string]int),
-		schemaId:    -1,
 	}
+}
+
+// qwpASCIIEqualFold reports whether a and b are equal under ASCII
+// case folding: bytes 'A'–'Z' and 'a'–'z' compare equal ignoring
+// case, every other byte must match verbatim.
+//
+// QuestDB folds column names with full Unicode case-insensitivity:
+// the server's metadata columnNameIndexMap and the Java client's
+// QwpTableBuffer.columnNameToIndex are both a
+// LowerCaseCharSequenceIntHashMap, keyed via Character.toLowerCase.
+// The authoritative key on this side is the matching Unicode fold,
+// strings.ToLower (the canonical columnIndex key below).
+//
+// An ASCII-only comparator is still a sound accelerator for that
+// Unicode-keyed columnIndex: ASCII letters fold identically under
+// ASCII and Unicode, and an ASCII letter is never a UTF-8
+// continuation byte, so ASCII-fold-equal inputs differ only in the
+// case of standalone ASCII letters — strings.ToLower maps them to the
+// same key. A fast-path match therefore never disagrees with the
+// authoritative map lookup, and a non-match falls through to it,
+// where the map still resolves the Unicode-only equivalences (e.g.
+// 'Ü'/'ü', or U+212A KELVIN SIGN folding to 'k').
+func qwpASCIIEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca == cb {
+			continue
+		}
+		// The bytes differ. They are ASCII case-folds of each other
+		// only if they differ solely in bit 5 (the 0x20 case bit) and
+		// the folded byte is a letter. The letter check is essential:
+		// OR-ing 0x20 also pairs legal name punctuation ('@'↔'`',
+		// '['↔'{', ']'↔'}', '^'↔'~'), which must not compare equal.
+		if ca^cb != 0x20 {
+			return false
+		}
+		if lower := ca | 0x20; lower < 'a' || lower > 'z' {
+			return false
+		}
+	}
+	return true
 }
 
 // getOrCreateColumn looks up an existing column by name or creates a
@@ -835,10 +979,12 @@ func newQwpTableBuffer(tableName string) *qwpTableBuffer {
 func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, nullable bool) (*qwpColumnBuffer, error) {
 	// Fast path: predict the next column in sequence. When columns are
 	// set in the same order every row, this avoids the map lookup
-	// entirely. Falls through to the map on name mismatch.
+	// entirely. The compare is ASCII case-insensitive (column names
+	// fold case), so a mixed-case writer keeps the fast path without
+	// allocating a lowercase key. Falls through to the map on mismatch.
 	if tb.columnAccessCursor < len(tb.columns) {
 		col := tb.columns[tb.columnAccessCursor]
-		if col.name == name {
+		if qwpASCIIEqualFold(col.name, name) {
 			if col.typeCode != typeCode {
 				return nil, fmt.Errorf(
 					"qwp: column %q type conflict: existing %d, got %d",
@@ -853,7 +999,23 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 		}
 	}
 
+	// Slow path. Probe with the name verbatim first: it hits the
+	// canonical lowercase key for all-lowercase names (the convention)
+	// and any memoized casing-variant alias, so the common case never
+	// calls strings.ToLower — which allocates a fresh key for a name
+	// with an uppercase letter, on every cursor-miss column, every row.
 	idx, exists := tb.columnIndex[name]
+	if !exists {
+		lower := strings.ToLower(name)
+		if idx, exists = tb.columnIndex[lower]; exists && lower != name {
+			// Memoize the verbatim casing as an alias of the canonical
+			// key so the next row's lookup by this casing hits the probe
+			// above without re-lowercasing. aliasKeys records it so
+			// cancelRow can drop it when it removes columns.
+			tb.columnIndex[name] = idx
+			tb.aliasKeys = append(tb.aliasKeys, name)
+		}
+	}
 	if exists {
 		col := tb.columns[idx]
 		if col.typeCode != typeCode {
@@ -866,6 +1028,11 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 		if col.rowCount > tb.rowCount {
 			return nil, fmt.Errorf("qwp: column %q already set for current row", name)
 		}
+		// Resync the sequential cursor: after a sparse skip the caller
+		// most likely continues in column-definition order, so predict
+		// idx+1 next. This restores the allocation-free fast path for the
+		// rest of the row instead of a map lookup per remaining column.
+		tb.columnAccessCursor = idx + 1
 		return col, nil
 	}
 
@@ -892,9 +1059,8 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 		col.addNull()
 	}
 
-	tb.columnIndex[name] = len(tb.columns)
+	tb.columnIndex[strings.ToLower(name)] = len(tb.columns)
 	tb.columns = append(tb.columns, col)
-	tb.schemaId = -1
 	return col, nil
 }
 
@@ -933,7 +1099,6 @@ func (tb *qwpTableBuffer) getOrCreateDesignatedTimestamp(typeCode qwpTypeCode) (
 
 	tb.columnIndex[dtName] = len(tb.columns)
 	tb.columns = append(tb.columns, col)
-	tb.schemaId = -1
 	return col, nil
 }
 
@@ -957,10 +1122,18 @@ func (tb *qwpTableBuffer) cancelRow() {
 	// Remove columns created during this row.
 	if len(tb.columns) > tb.committedColumnCount {
 		for i := tb.committedColumnCount; i < len(tb.columns); i++ {
-			delete(tb.columnIndex, tb.columns[i].name)
+			delete(tb.columnIndex, strings.ToLower(tb.columns[i].name))
 		}
 		tb.columns = tb.columns[:tb.committedColumnCount]
-		tb.schemaId = -1
+		// Drop memoized casing-variant aliases. Each maps to a column
+		// index that the truncation above can leave dangling (and when
+		// committedColumnCount==0 after reset, every column is removed).
+		// Alias keys carry an uppercase letter, so deleting them never
+		// touches the all-lowercase canonical keys of surviving columns.
+		for _, k := range tb.aliasKeys {
+			delete(tb.columnIndex, k)
+		}
+		tb.aliasKeys = tb.aliasKeys[:0]
 	}
 
 	// Truncate any columns that were set during this row.
@@ -977,9 +1150,13 @@ func (tb *qwpTableBuffer) cancelRow() {
 	tb.recomputeDataSize()
 }
 
-// reset clears all row data and columns, retaining the table name.
-// Preserves schemaId: between flushes the column set is unchanged,
-// so the server's registry entry is still valid.
+// reset clears all row data, retaining the table name and the
+// column structure. Column-level state (offsets, dictionary deltas)
+// is reset by col.reset() per column. The cursor encoder writes a
+// full schema + symbol dict for every flush, so no per-table
+// "what's been sent" state needs to survive across flushes —
+// rowCount and the in-progress bookkeeping are all that needs
+// resetting here.
 func (tb *qwpTableBuffer) reset() {
 	for _, col := range tb.columns {
 		col.reset()

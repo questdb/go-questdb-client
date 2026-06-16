@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +53,8 @@ type QwpSender interface {
 	Float32Column(name string, val float32) QwpSender
 
 	// CharColumn adds a CHAR column value stored as a UTF-16 code unit.
+	// Runes outside the BMP (< 0 or > U+FFFF) are rejected — QuestDB's
+	// CHAR is a single UTF-16 code unit, matching Java char semantics.
 	CharColumn(name string, val rune) QwpSender
 
 	// DateColumn adds a DATE column value (milliseconds since epoch).
@@ -98,66 +101,174 @@ type QwpSender interface {
 	// row: mixing At and AtNano on rows of the same table within one
 	// flush returns a type-conflict error.
 	AtNano(ctx context.Context, ts time.Time) error
+
+	// AckedFsn returns the highest server-acknowledged frame
+	// sequence number, or -1 if no batch has been ACK'd yet.
+	// Snapshot accessor — for a bounded wait, use AwaitAckedFsn.
+	AckedFsn() int64
+
+	// AwaitAckedFsn blocks until AckedFsn() >= target, ctx is
+	// cancelled / deadlines, or the I/O loop latches a terminal
+	// error. Returns nil on success; ctx.Err() on cancellation /
+	// deadline; *SenderError on a terminal server rejection.
+	//
+	// Useful for tests and user code that need to confirm a specific
+	// publish has been server-acknowledged. Wrap with
+	// context.WithTimeout for a bounded wait. Pair AwaitAckedFsn with
+	// the FSN returned by FlushAndGetSequence — none of the flush
+	// paths (explicit Flush, FlushAndGetSequence, auto-flush) wait
+	// for ACK, so AwaitAckedFsn is the only API that blocks on server
+	// acknowledgement.
+	AwaitAckedFsn(ctx context.Context, target int64) error
+
+	// FlushAndGetSequence behaves identically to Flush but returns
+	// the published FSN (highest committed-to-disk-and-queued-for-
+	// wire frame sequence) post-flush. Distinct from AckedFsn(),
+	// which is the highest *server-acknowledged* sequence — the
+	// returned FSN is the upper bound of any SenderError.ToFsn that
+	// could surface for this batch. Use AwaitAckedFsn for ack
+	// confirmation.
+	FlushAndGetSequence(ctx context.Context) (int64, error)
+
+	// LastTerminalError returns a snapshot of the most recent
+	// terminal SenderError the I/O loop latched (server rejection,
+	// WS protocol violation, auth failure, reconnect-budget
+	// exhaustion). Returns nil if the sender has not gone terminal
+	// yet, or if it failed for a non-server reason (transport
+	// error before classification).
+	LastTerminalError() *SenderError
+
+	// TotalServerErrors returns the cumulative count of SenderError
+	// payloads the I/O loop has built (DROP and HALT combined).
+	// Includes batches where the user handler dropped the
+	// notification due to inbox overflow.
+	TotalServerErrors() int64
+
+	// DroppedErrorNotifications returns the cumulative count of
+	// SenderError payloads that did not reach the user-supplied
+	// handler because the bounded inbox was full at offer time.
+	// Non-zero means the handler is too slow for the error rate;
+	// raise WithErrorInboxCapacity or speed up the handler.
+	DroppedErrorNotifications() int64
+
+	// TotalErrorNotificationsDelivered returns the cumulative count
+	// of SenderError payloads delivered to the user-supplied
+	// handler. Includes deliveries where the handler panicked
+	// (caught by the dispatcher).
+	TotalErrorNotificationsDelivered() int64
+
+	// TotalReconnectAttempts returns the cumulative count of
+	// reconnect attempts the I/O loop has issued — succeeded plus
+	// failed. Diverges from TotalReconnectsSucceeded when the server
+	// is flapping. Always 0 when the sender is configured without
+	// reconnect.
+	TotalReconnectAttempts() int64
+
+	// TotalReconnectsSucceeded returns the cumulative count of
+	// successful reconnects. Useful as a heartbeat for outage
+	// recovery.
+	TotalReconnectsSucceeded() int64
+
+	// TotalFramesReplayed returns the cumulative count of frames
+	// re-emitted on a post-reconnect catch-up — i.e. frames whose
+	// FSN was already on the wire before the drop. Useful for
+	// verifying replay actually re-issued the unacked tail.
+	TotalFramesReplayed() int64
+
+	// TotalBackpressureStalls returns the cumulative count of times
+	// engineAppendBlocking had to wait for the manager to free
+	// buffer space. One increment per blocking call, not per spin-
+	// park. Non-zero values mean the producer is outpacing the wire.
+	TotalBackpressureStalls() int64
+
+	// BackgroundDrainers returns a snapshot of the drainers the
+	// foreground sender has dispatched for orphan slot adoption.
+	// Returns nil when the sender was not configured with
+	// drain_orphans (or when no orphans were found at startup).
+	// Snapshots are point-in-time copies; the underlying drainer
+	// goroutines keep running.
+	BackgroundDrainers() []QwpBackgroundDrainer
+}
+
+// QwpBackgroundDrainer is a point-in-time snapshot of one
+// background-drainer goroutine, surfaced via
+// QwpSender.BackgroundDrainers for ops dashboards. The fields
+// mirror the Java client's BackgroundDrainer accessors.
+type QwpBackgroundDrainer struct {
+	// Dir is the absolute path of the orphan slot directory the
+	// drainer adopted.
+	Dir string
+	// FramesPending is the snapshot of the slot's published FSN
+	// the drainer captured at startup — the upper bound the drain
+	// must reach before the slot is fully empty. -1 before the
+	// drainer has opened its engine.
+	FramesPending int64
+	// FramesAcked is the latest server-acknowledged FSN the
+	// drainer has observed. -1 before the drainer's first poll.
+	FramesAcked int64
+	// LastError is the most recent error message the drainer
+	// recorded, or "" if no error has been recorded.
+	LastError string
+	// Failed is true if the drainer ended in the FAILED outcome
+	// (exhausted reconnect budget, auth failure, recovery error)
+	// and dropped a .failed sentinel in the slot.
+	Failed bool
 }
 
 // Compile-time check that qwpLineSender implements QwpSender.
 var _ QwpSender = (*qwpLineSender)(nil)
 
-// qwpLineSender implements LineSender for the QWP WebSocket protocol.
-// In sync mode (in-flight window = 1), each Flush() encodes and
-// sends one batch at a time, blocking until the server ACKs.
+// qwpLineSender implements LineSender for the QWP WebSocket
+// protocol. All wire I/O goes through the cursor engine + send
+// loop, regardless of whether store-and-forward (sf_dir) is set —
+// sf_dir picks disk-backed segments, the empty value picks
+// memory-backed segments. The producer encodes a batch into the
+// engine; the I/O goroutine pair drains the engine to the wire and
+// processes ACKs.
 type qwpLineSender struct {
-	// transport manages the WebSocket connection.
-	transport qwpTransport
-
 	// tableBuffers stores one columnar buffer per active table.
 	tableBuffers map[string]*qwpTableBuffer
 	// currentTable is the table buffer for the current in-progress row.
 	currentTable *qwpTableBuffer
 
-	// encoders provides double-buffered QWP message encoders for async
-	// mode. In sync mode, only encoders[0] is used. In async mode, the
-	// two encoders alternate: while one encoder's output is being sent
-	// over the wire, the other can encode the next batch.
-	encoders          [2]qwpEncoder
-	currentEncoderIdx int
-	// encoderReady signals when an encoder's buffer is safe to reuse.
-	// A token is placed after sendMessage completes for that buffer.
-	// In sync mode, these are nil (not used).
-	encoderReady [2]chan struct{}
+	// encoder builds the next QWP message. The cursor engine takes
+	// a copy of the encoded bytes via tryAppend, so a single slot
+	// is enough — no double-buffering needed.
+	encoder qwpEncoder
 
-	// encodeInfoBuf is a reusable scratch slice for buildTableEncodeInfo,
-	// avoiding allocation on every flush.
-	encodeInfoBuf []qwpTableEncodeInfo
+	// encodeInfoBuf is a reusable scratch slice for
+	// buildTableEncodeInfo, avoiding allocation on every flush.
+	encodeInfoBuf []*qwpTableBuffer
+
+	// dirtyTables lists the table buffers selected by Table() since the
+	// last full flush — i.e. the only buffers that can hold pending
+	// rows. buildTableEncodeInfo, resetAfterFlush, and
+	// recomputePendingFromBuffers iterate this set instead of the whole
+	// tableBuffers map, so a sender juggling hundreds of tables pays per
+	// flush only for the handful actually written that cycle. Truncated
+	// to [:0] (capacity retained) by resetAfterFlush. Producer-owned,
+	// like tableBuffers and encodeInfoBuf.
+	dirtyTables []*qwpTableBuffer
 
 	// globalSymbols maps symbol strings to global IDs.
 	globalSymbols map[string]int32
 	// globalSymbolList maps IDs to symbol strings (for delta dict).
 	globalSymbolList []string
-	// maxSentSymbolId is the highest symbol ID ACKed by the server.
-	// -1 means no symbols have been sent yet.
+	// maxSentSymbolId is the highest symbol ID included in a frame
+	// appended to the cursor engine — advanced at append time, not on
+	// server ACK. It is the cross-flush high-water mark that
+	// resetAfterFlush rewinds batchMaxSymbolId to. -1 means no symbols
+	// appended yet.
 	maxSentSymbolId int
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
 
-	// Schema registry (per QWP spec §16).
-	// Schema IDs are small integers assigned sequentially by the
-	// client and scoped to the connection lifetime. They are global
-	// across all tables; the server indexes its registry by ID.
-	// nextSchemaId is the next unassigned ID.
-	// maxSentSchemaId is the highest ID ACKed by the server; a table
-	// whose schemaId <= maxSentSchemaId is safe to encode in
-	// reference mode.
-	// batchMaxSchemaId is the highest schemaId used in the pending
-	// batch — set by buildTableEncodeInfo, promoted to
-	// maxSentSchemaId on ACK.
-	nextSchemaId     int
-	maxSentSchemaId  int
-	batchMaxSchemaId int
-	// maxSchemasPerConnection caps nextSchemaId. 0 disables the cap.
-	// When the cap is hit, Flush returns an error and the caller must
-	// close and re-open the sender.
-	maxSchemasPerConnection int
+	// Schemas are intentionally NOT tracked on the cursor wire path.
+	// Every frame is self-sufficient: it carries the full inline column
+	// definitions and the full symbol dict from id 0. There is no
+	// per-connection schema registry on the client side and no
+	// schema-change detection; the server reads the inline column
+	// definitions on every frame regardless.
 
 	// Row state.
 	hasTable bool
@@ -185,8 +296,44 @@ type qwpLineSender struct {
 	autoFlushRows     int
 	autoFlushInterval time.Duration
 	autoFlushBytes    int // 0 disables the byte-size trigger
-	flushDeadline     time.Time
-	pendingRowCount   int
+	// effectiveAutoFlushBytes is the per-connection clamped variant
+	// of autoFlushBytes. Computed from the server-advertised
+	// X-QWP-Max-Batch-Size on every successful connect / reconnect
+	// via the send loop's onTransportSwap callback:
+	//   - autoFlushBytes <= 0 (user opted out):           store 0
+	//   - server cap <= 0      (header absent / older):    store autoFlushBytes
+	//   - otherwise:                                       store min(autoFlushBytes, cap*9/10)
+	// Read by the producer in atWithTimestamp to drive the byte-size
+	// auto-flush trigger; atomic so a reconnect from the I/O
+	// goroutine cannot race the producer's per-row trigger check.
+	// Initialised to autoFlushBytes in the constructors so the
+	// trigger fires correctly even before the first transport-swap
+	// callback runs.
+	effectiveAutoFlushBytes atomic.Int64
+	// serverMaxBatchSize mirrors the just-bound transport's
+	// serverMaxBatchSize so the producer can apply the per-row hard
+	// guard (atWithTimestamp) and the flush-time defensive cap
+	// check (enqueueCursor) without dereferencing the loop's
+	// transport pointer on every call. Updated together with
+	// effectiveAutoFlushBytes from applyServerBatchSizeLimit; 0
+	// means "no cap advertised" and both guards short-circuit.
+	// Mirrors Java's volatile-int serverMaxBatchSize field.
+	serverMaxBatchSize atomic.Int32
+	// maxFrameBytes is the largest encoded frame the cursor engine's
+	// segments can hold (segment size minus header overhead, from
+	// engineMaxFrameBytes). A frame above this can never be appended,
+	// so it bounds two things, exactly like serverMaxBatchSize:
+	//   - the effectiveAutoFlushBytes clamp, so the soft byte trigger
+	//     fires before a batch can grow past what a segment holds; and
+	//   - the flush-time hard guard in enqueueCursor, which drops an
+	//     over-cap frame with a typed error instead of retaining it and
+	//     re-failing forever.
+	// Constant for the sender's lifetime (the segment size never
+	// changes). 0 in the bench / hand-built test senders that have no
+	// engine, where both uses short-circuit.
+	maxFrameBytes   int64
+	flushDeadline   time.Time
+	pendingRowCount int
 
 	// pendingBytes tracks the approximate buffered byte total across
 	// all table buffers. Maintained incrementally on each commitRow:
@@ -204,32 +351,63 @@ type qwpLineSender struct {
 	// Maximum length for table and column names.
 	fileNameLimit int
 
-	// Connection and retry config.
-	retryTimeout time.Duration
-
-	// syncSequence is the sequence of the next batch to send in sync
-	// mode (inFlightWindow == 1). First batch is 0. Incremented after
-	// each successful send so flushSync can recognise its own ACK and
-	// ignore stale ACKs for earlier batches on the same connection.
-	syncSequence int64
-
-	// Async mode (in-flight window > 1).
-	asyncState     *qwpAsyncState
+	// inFlightWindow is retained as a config knob for backwards
+	// compat but is a no-op in cursor mode — the engine handles
+	// concurrency via its own backpressure model.
 	inFlightWindow int
 
-	// closeTimeout is the time Close() waits for the async I/O
-	// goroutine to finish before force-cancelling. Defaults to 5s.
+	// cursorEngine + cursorSendLoop are set on every sender. The
+	// engine is memory-backed when sf_dir is empty and disk-backed
+	// otherwise. The send loop owns the WebSocket connection;
+	// reconnect is its responsibility.
+	cursorEngine   *qwpSfCursorEngine
+	cursorSendLoop *qwpSfSendLoop
+
+	// closeTimeout bounds Close()'s wait for the engine's
+	// ackedFsn to catch up to publishedFsn. <= 0 means fast close
+	// (skip the drain). Defaults to 5s.
 	closeTimeout time.Duration
 
-	// Lifecycle.
-	closed bool
+	// drainerPool is non-nil only when the user opted into
+	// drain_orphans (SF mode only). Closed alongside the cursor
+	// engine in closeCursor.
+	drainerPool *qwpSfDrainerPool
+
+	// Lifecycle. atomic so a contract-violating concurrent
+	// double-Close has a defined (idempotent) outcome rather than a
+	// data race that could double-close the engine's channels. The
+	// single-producer At/Flush reads are racy only under the same
+	// contract violation; the atomic load keeps them well-defined too.
+	closed atomic.Bool
 }
 
-// newQwpLineSender creates a new QWP sender and establishes a
-// WebSocket connection to the server. If inFlightWindow > 1, async
-// mode is enabled with a dedicated I/O goroutine. If dumpWriter is
-// non-nil, outgoing TCP bytes are recorded (see WithQwpDumpWriter).
-func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, retryTimeout time.Duration, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
+// newQwpLineSender creates a new QWP sender backed by an
+// in-memory cursor engine. The send loop establishes the
+// WebSocket connection synchronously; on failure, the constructor
+// returns the dial / upgrade error directly. inFlightWindow is
+// accepted for backwards compatibility but is a no-op (the cursor
+// engine handles concurrency via its own backpressure model). If
+// dumpWriter is non-nil, outgoing bytes are recorded across every
+// transport instance the send loop creates (initial connect plus
+// reconnects).
+func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
+	s, err := newQwpLineSenderUnstarted(ctx, address, opts,
+		autoFlushRows, autoFlushInterval, dumpWriter, inFlightWindow...)
+	if err != nil {
+		return nil, err
+	}
+	s.cursorSendLoop.sendLoopStart()
+	return s, nil
+}
+
+// newQwpLineSenderUnstarted builds the sender, engine, and loop but
+// does NOT call sendLoopStart. Used by newQwpLineSenderFromConf so the
+// resolver / handler / capacity from connect-string + builder options
+// can be applied to the loop before it starts processing — otherwise
+// the very first received frame races against the post-construction
+// setters and could be classified with the default resolver / handled
+// by the default handler instead of the user-configured ones.
+func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTransportOpts, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
 	window := 1
 	if len(inFlightWindow) > 0 && inFlightWindow[0] > 1 {
 		window = inFlightWindow[0]
@@ -240,44 +418,38 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 		globalSymbols:     make(map[string]int32),
 		maxSentSymbolId:   -1,
 		batchMaxSymbolId:  -1,
-		nextSchemaId:      0,
-		maxSentSchemaId:   -1,
-		batchMaxSchemaId:  -1,
-		retryTimeout:      retryTimeout,
 		autoFlushRows:     autoFlushRows,
 		autoFlushInterval: autoFlushInterval,
 		inFlightWindow:    window,
 		closeTimeout:      5 * time.Second,
 	}
-	// Initial encoder buffer capacity. Sync mode uses the small 8 KB
-	// default. Async mode uses 1 MB: the user goroutine fills it while the
-	// I/O goroutine transmits the other one. The size can be further grown
-	// by newQwpLineSenderFromConf when autoFlushBytes is large enough to need
-	// max(1 MB, 2*autoFlushBytes).
-	initEncoderCap := qwpDefaultInitEncoderBufSize
-	if window > 1 {
-		initEncoderCap = qwpDefaultMicrobatchBufSize
-	}
-	s.encoders[0].wb.preallocate(initEncoderCap)
-	s.encoders[1].wb.preallocate(initEncoderCap)
+	s.encoder.wb.preallocate(qwpDefaultMicrobatchBufSize)
 
-	s.transport.dumpWriter = dumpWriter
-	if err := s.transport.connect(ctx, address, opts); err != nil {
+	// Build a memory-backed cursor engine. Same architecture as SF
+	// mode, just no disk involvement.
+	engine, err := qwpSfNewCursorEngine("", qwpSfDefaultMaxBytes, qwpSfDefaultMemoryMaxTotalBytes, qwpSfEngineDefaultAppendDeadline)
+	if err != nil {
 		return nil, err
 	}
-
-	// Start async I/O goroutine if window > 1.
-	if window > 1 {
-		s.asyncState = newQwpAsyncState(window, &s.transport)
-		s.asyncState.start()
-		// Initialize double-buffered encoder ready channels.
-		// Both start with a token (both encoders available).
-		s.encoderReady[0] = make(chan struct{}, 1)
-		s.encoderReady[1] = make(chan struct{}, 1)
-		s.encoderReady[0] <- struct{}{}
-		s.encoderReady[1] <- struct{}{}
+	factory := qwpSfBuildReconnectFactory(address, opts, dumpWriter)
+	transport, err := factory(ctx, 0)
+	if err != nil {
+		_ = engine.engineClose()
+		return nil, err
 	}
-
+	loop := qwpSfNewSendLoop(engine, transport, factory,
+		qwpSfDefaultParkInterval,
+		qwpSfDefaultReconnectMaxDuration,
+		qwpSfDefaultReconnectInitialBackoff,
+		qwpSfDefaultReconnectMaxBackoff)
+	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
+	engine.engineSetTerminalErrorGetter(loop.sendLoopCheckError)
+	s.cursorEngine = engine
+	s.cursorSendLoop = loop
+	// The memory-mode segment is the fixed qwpSfDefaultMaxBytes; record
+	// the largest frame it can hold so the byte-trigger clamp and the
+	// flush-time drop guard bound batches to it.
+	s.maxFrameBytes = engine.engineMaxFrameBytes()
 	return s, nil
 }
 
@@ -286,6 +458,19 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 func (s *qwpLineSender) Table(name string) LineSender {
 	if s.lastErr != nil {
 		return s
+	}
+	// Poll the I/O loop's terminal latch at the start of a new row so a
+	// HALT surfaces on the next At/AtNow without forcing the user to
+	// Flush first. Subsequent Symbol/*Column calls short-circuit on the
+	// latched s.lastErr, preserving the fluent buffer-latch pattern.
+	// The nil guard matches the accessor pattern in qwp_sender_cursor.go
+	// and keeps the bench harness (which hand-builds a sender without
+	// an I/O loop) working.
+	if s.cursorSendLoop != nil {
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			s.lastErr = err
+			return s
+		}
 	}
 	if s.hasTable {
 		s.lastErr = fmt.Errorf("qwp: table %q already set; call At() or AtNow() to finalize the row first", s.currentTable.tableName)
@@ -311,9 +496,28 @@ func (s *qwpLineSender) Table(name string) LineSender {
 	}
 
 	s.currentTable = tb
-	if s.maxBufSize > 0 || s.autoFlushBytes > 0 {
-		s.currentTableBytesBefore = tb.approxDataSize()
+	// Track this table in the dirty set the first time it is selected
+	// in a flush cycle, so flush + reset visit only written tables. The
+	// dirty flag dedupes: repeated Table() calls for the same table (or
+	// the lastTable fast-path above) skip the append. resetAfterFlush
+	// clears the flag and empties the list.
+	if !tb.dirty {
+		tb.dirty = true
+		s.dirtyTables = append(s.dirtyTables, tb)
 	}
+	// Snapshot the table's buffered-byte count at row-start so both
+	// the auto-flush byte-size trigger (post-commit pendingBytes
+	// delta) and the per-row hard guard (pre-commit rowBytes delta
+	// vs serverMaxBatchSize) can read it. Always snapshot — the
+	// async-initial-connect path may flip serverMaxBatchSize from 0
+	// to positive between Table() and At(), and a gated snapshot
+	// would leave currentTableBytesBefore stale (carrying over from
+	// a previous row, or 0 if never set) so the per-row guard reads
+	// (current size - 0) as the row's bytes and falsely rejects a
+	// valid row whose true delta fits. approxDataSize is O(1) and
+	// the int assignment doesn't allocate, so unconditional snapshot
+	// preserves the zero-alloc hot path.
+	s.currentTableBytesBefore = tb.approxDataSize()
 	s.hasTable = true
 	return s
 }
@@ -629,16 +833,15 @@ func (s *qwpLineSender) Float64Array2DColumn(name string, values [][]float64) Li
 		s.lastErr = err
 		return s
 	}
-	// Flatten.
-	flat := make([]float64, 0, dim0*dim1)
+	// Validate row regularity before reserving so the streamed write
+	// fills exactly the reserved payload — no intermediate flat copy.
 	for _, row := range values {
 		if len(row) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 2D array: row lengths differ")
 			return s
 		}
-		flat = append(flat, row...)
 	}
-	col.addDoubleArray(2, []int32{int32(dim0), int32(dim1)}, flat)
+	col.addDoubleArray2D(dim0, dim1, values)
 	return s
 }
 
@@ -674,7 +877,8 @@ func (s *qwpLineSender) Float64Array3DColumn(name string, values [][][]float64) 
 		s.lastErr = err
 		return s
 	}
-	flat := make([]float64, 0, dim0*dim1*dim2)
+	// Validate shape regularity before reserving so the streamed write
+	// fills exactly the reserved payload — no intermediate flat copy.
 	for _, plane := range values {
 		if len(plane) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 3D array")
@@ -685,10 +889,9 @@ func (s *qwpLineSender) Float64Array3DColumn(name string, values [][][]float64) 
 				s.lastErr = fmt.Errorf("qwp: irregular 3D array")
 				return s
 			}
-			flat = append(flat, row...)
 		}
 	}
-	col.addDoubleArray(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, flat)
+	col.addDoubleArray3D(dim0, dim1, dim2, values)
 	return s
 }
 
@@ -751,7 +954,7 @@ func (s *qwpLineSender) AtNano(ctx context.Context, ts time.Time) error {
 // determines the unit used to convert ts: qwpTypeTimestamp → micros,
 // qwpTypeTimestampNano → nanos.
 func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeCode qwpTypeCode) error {
-	if s.closed {
+	if s.closed.Load() {
 		return errClosedSenderAt
 	}
 
@@ -761,6 +964,13 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 		if s.currentTable != nil {
 			s.currentTable.cancelRow()
 		}
+		// cancelRow may have wiped the designated-TS column out
+		// of tb.columns / tb.columnIndex (first row of a fresh
+		// or just-flushed table). Drop the cache so the next row
+		// re-runs getOrCreateDesignatedTimestamp and re-inserts
+		// the column — otherwise the stale pointer satisfies the
+		// staleness check and the row commits without a "" column.
+		s.cachedDesignatedTs = nil
 		s.hasTable = false
 		s.currentTable = nil
 		return err
@@ -780,6 +990,7 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 			col, err = s.currentTable.getOrCreateDesignatedTimestamp(typeCode)
 			if err != nil {
 				s.currentTable.cancelRow()
+				s.cachedDesignatedTs = nil
 				s.hasTable = false
 				s.currentTable = nil
 				return err
@@ -793,9 +1004,38 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 		case qwpTypeTimestampNano:
 			v = ts.UnixNano()
 		default:
+			s.currentTable.cancelRow()
+			s.cachedDesignatedTs = nil
+			s.hasTable = false
+			s.currentTable = nil
 			return fmt.Errorf("qwp: invalid designated timestamp type 0x%02X", typeCode)
 		}
 		col.addTimestamp(v)
+	}
+
+	// Per-row hard guard: if THIS row's buffered bytes already
+	// exceed the server's wire cap, the flush would produce an
+	// oversize WS frame the server closes with ws-close[1009].
+	// Catches the case where a single row is too big to ever ship,
+	// so the user sees a clear error instead of a delayed
+	// terminal-error from a downstream auto-flush. Checked BEFORE
+	// commitRow so the buffered column bytes can be discarded via
+	// cancelRow — prior committed rows in the batch stay intact
+	// and can still be flushed by the caller. The check ignores
+	// the null-padding bytes commitRow will add (bounded by
+	// numColumns * elemSize, far below any realistic cap).
+	// Mirrors Java QwpWebSocketSender.sendRow's pre-nextRow guard.
+	if cap := s.serverMaxBatchSize.Load(); cap > 0 {
+		rowBytes := s.currentTable.approxDataSize() - s.currentTableBytesBefore
+		if int64(rowBytes) > int64(cap) {
+			s.currentTable.cancelRow()
+			s.cachedDesignatedTs = nil
+			s.hasTable = false
+			s.currentTable = nil
+			return fmt.Errorf(
+				"qwp: row too large for server batch cap [rowBytes=%d, serverMaxBatchSize=%d]",
+				rowBytes, cap)
+		}
 	}
 
 	// Commit the row (gap-fills missing columns).
@@ -814,38 +1054,120 @@ func (s *qwpLineSender) atWithTimestamp(ctx context.Context, ts time.Time, typeC
 	s.pendingRowCount++
 
 	if s.maxBufSize > 0 || s.autoFlushBytes > 0 {
+		// The byte-size trigger compares against effectiveAutoFlushBytes,
+		// not the raw configured autoFlushBytes: the send loop's
+		// onTransportSwap callback clamps the threshold down to 90%
+		// of the server-advertised X-QWP-Max-Batch-Size on every
+		// connect, so the soft auto-flush fires before the encoded
+		// batch can exceed the server's hard cap. effectiveAutoFlushBytes
+		// is seeded from autoFlushBytes in the constructor; it is
+		// always > 0 iff the user opted in, regardless of whether a
+		// transport-swap callback has fired yet, so the gate on
+		// s.autoFlushBytes > 0 above stays sound.
+		effective := int(s.effectiveAutoFlushBytes.Load())
 		triggered := (s.maxBufSize > 0 && s.pendingBytes > s.maxBufSize) ||
-			(s.autoFlushBytes > 0 && s.pendingBytes >= s.autoFlushBytes)
+			(effective > 0 && s.pendingBytes >= effective)
 		if triggered {
-			if s.asyncState != nil {
-				return s.enqueueFlush(ctx)
-			}
-			return s.Flush(ctx)
+			return s.autoFlush(ctx)
 		}
 	}
 
-	// Check auto-flush thresholds.
+	// Auto-flush thresholds use enqueueCursor — never wait for
+	// server ACKs from the user goroutine. Explicit Flush() follows
+	// the same publish-only path; the send loop drains and replays
+	// in the background.
 	if s.autoFlushRows > 0 && s.pendingRowCount >= s.autoFlushRows {
-		// In async mode, enqueue without waiting for ACKs so the
-		// user goroutine isn't blocked on every auto-flush.
-		if s.asyncState != nil {
-			return s.enqueueFlush(ctx)
-		}
-		return s.Flush(ctx)
+		return s.autoFlush(ctx)
 	}
 
 	if s.autoFlushInterval > 0 {
 		if s.flushDeadline.IsZero() {
 			s.flushDeadline = time.Now().Add(s.autoFlushInterval)
 		} else if time.Now().After(s.flushDeadline) {
-			if s.asyncState != nil {
-				return s.enqueueFlush(ctx)
-			}
-			return s.Flush(ctx)
+			return s.autoFlush(ctx)
 		}
 	}
 
 	return nil
+}
+
+// autoFlush dispatches an auto-flush trigger from atWithTimestamp.
+// Resets pending state on success so subsequent rows hit a clean
+// trigger window. Errors propagate to the user.
+func (s *qwpLineSender) autoFlush(ctx context.Context) error {
+	if err := s.enqueueCursor(ctx); err != nil {
+		return err
+	}
+	s.resetAfterFlush()
+	return nil
+}
+
+// applyServerBatchSizeLimit refreshes effectiveAutoFlushBytes and
+// serverMaxBatchSize from the cap the just-bound transport advertised
+// in X-QWP-Max-Batch-Size. Registered as the send loop's
+// onTransportSwap callback, so it runs after every successful connect
+// — initial bind and every reconnect. A rolling upgrade can leave
+// neighbouring endpoints with different caps, so the clamp is
+// re-evaluated on every swap; never increase past the configured
+// autoFlushBytes, never override an explicit opt-out.
+//
+// Resolution (mirrors Java QwpWebSocketSender.applyServerBatchSizeLimit):
+//   - s.autoFlushBytes <= 0: the user disabled byte-size auto-flush;
+//     keep it disabled even when the server advertises a cap.
+//   - transport == nil OR cap <= 0: the server did not advertise a
+//     cap (older build or async-pending initial connect); the
+//     configured autoFlushBytes is kept verbatim.
+//   - otherwise: store min(autoFlushBytes, cap*9/10). The 10%
+//     headroom covers schema + dict-delta encoding overhead the
+//     soft trigger does not see — without it, an at-the-limit
+//     auto-flush could still emit a frame the server closes with
+//     ws-close[1009].
+//
+// Also mirrors the raw cap onto s.serverMaxBatchSize so the per-row
+// hard guard in atWithTimestamp and the flush-time defensive cap
+// check in enqueueCursor can sample it cheaply without dereferencing
+// the loop's transport pointer. Always-update (independent of the
+// opt-out branch) so the guards fire against the freshly-advertised
+// value even when the user opted out of the soft trigger.
+//
+// Safe to call from any goroutine: atomic stores on both fields.
+// Cheap; no allocations.
+func (s *qwpLineSender) applyServerBatchSizeLimit(t *qwpTransport) {
+	var cap int32
+	if t != nil {
+		cap = t.serverMaxBatchSize
+	}
+	s.serverMaxBatchSize.Store(cap)
+	if s.autoFlushBytes <= 0 {
+		s.effectiveAutoFlushBytes.Store(0)
+		return
+	}
+	effective := int64(s.autoFlushBytes)
+	// Clamp to 90% of the server-advertised cap. The 10% headroom
+	// covers schema + dict-delta encoding overhead the soft trigger
+	// does not see. cap <= 0 means the server advertised none (older
+	// build or async-pending initial connect): keep the configured
+	// value for this term.
+	if cap > 0 {
+		if safe := int64(cap) * 9 / 10; safe < effective {
+			effective = safe
+		}
+	}
+	// Clamp to 90% of the per-segment frame cap as well. A frame larger
+	// than a single segment can hold can never be appended to the cursor
+	// engine, so the soft trigger must fire before a batch crosses it —
+	// independent of the server cap. This is what keeps the shipped
+	// defaults (8 MiB trigger over a 4 MiB segment) from self-wedging.
+	// Fixed for the sender's lifetime, so re-applying it on every
+	// transport swap is a no-op past the first. maxFrameBytes is 0 in
+	// the hand-built test senders that exercise the server-cap table in
+	// isolation, so this term short-circuits there.
+	if s.maxFrameBytes > 0 {
+		if safe := s.maxFrameBytes * 9 / 10; safe < effective {
+			effective = safe
+		}
+	}
+	s.effectiveAutoFlushBytes.Store(effective)
 }
 
 func (s *qwpLineSender) AtNow(ctx context.Context) error {
@@ -855,309 +1177,119 @@ func (s *qwpLineSender) AtNow(ctx context.Context) error {
 // --- LineSender interface: Flush ---
 
 func (s *qwpLineSender) Flush(ctx context.Context) error {
-	if s.closed {
-		return errClosedSenderFlush
+	_, err := s.FlushAndGetSequence(ctx)
+	return err
+}
+
+// FlushAndGetSequence implements QwpSender.FlushAndGetSequence.
+// Flushes any pending rows and returns the published FSN — the
+// upper bound on any SenderError.ToFsn that could surface for this
+// batch.
+//
+// It does NOT wait for the server ACK (Java decision #1 in
+// design/qwp-cursor-durability.md — "flush() never waits for ACK;
+// ACKs are async"): it returns once the batch is published into the
+// cursor engine (in-RAM for memory mode, on-disk for SF) and the
+// send loop delivers + replays it in the background. Callers
+// wanting server-ACK confirmation pair the returned FSN with
+// AwaitAckedFsn.
+func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) {
+	if s.closed.Load() {
+		return -1, errClosedSenderFlush
+	}
+	if s.calledFromErrorHandler() {
+		// Flush() invoked from inside a SenderErrorHandler runs on the
+		// dispatcher goroutine. The handler's documented use of Flush()
+		// is to surface the latched terminal error promptly (it is
+		// latched before the handler runs). We must not read or flush
+		// producer-owned state (hasTable / pendingRowCount / tableBuffers
+		// / the encoder) from this goroutine — that races the producer,
+		// the C3 producer-state hazard. Surface any latched error and
+		// return the published FSN without touching producer state.
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			return -1, err
+		}
+		return s.cursorEngine.enginePublishedFsn(), nil
+	}
+	// Drain any latched fluent-API error (a Symbol/*Column/Table
+	// validation failure) ahead of the hasTable/pendingRowCount
+	// branches, fulfilling the latch contract's "surfaces on the next
+	// At/AtNow/Flush". Taking it first stops a real producer-side fault
+	// from being masked by errFlushWithPendingMessage or dropped on a
+	// Flush-then-Close. Cancel the in-progress row exactly as At does so
+	// clearing the latch can't strand a partial row a later At would
+	// commit. The clear happens only when the latch is set, so a Flush
+	// with no latched error performs no producer-state write at all and
+	// stays a pure read — several goroutines sampling a quiescent
+	// (post-HALT) sender to observe the latched terminal error therefore
+	// race only on read-only state. The calledFromErrorHandler path above
+	// skips this: lastErr is producer-owned, and reading it from the
+	// dispatcher goroutine races the producer (the C3 hazard).
+	if err := s.lastErr; err != nil {
+		s.lastErr = nil
+		if s.currentTable != nil {
+			s.currentTable.cancelRow()
+		}
+		s.cachedDesignatedTs = nil
+		s.hasTable = false
+		s.currentTable = nil
+		return -1, err
 	}
 	if s.hasTable {
-		return errFlushWithPendingMessage
+		return -1, errFlushWithPendingMessage
 	}
 	if s.pendingRowCount == 0 {
-		// In async mode, wait for any in-flight batches from
-		// previous auto-flushes to complete. This lets the user
-		// call Flush() as a barrier to confirm all data was ACKed.
-		if s.asyncState != nil {
-			return s.asyncState.waitEmpty(ctx)
+		// Nothing to encode, so skip straight to flushCursor's tail:
+		// surface any terminal I/O error the loop has recorded (so
+		// producers don't keep silently buffering into a dead engine),
+		// then return the current published FSN. Same no-ACK-wait
+		// contract as the pending-rows path below — this branch only
+		// elides the empty encode/append.
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			return -1, err
 		}
-		return nil
+		return s.cursorEngine.enginePublishedFsn(), nil
 	}
-
-	defer s.resetAfterFlush()
-
-	if s.asyncState != nil {
-		return s.flushAsync(ctx)
+	if err := s.flushCursor(ctx); err != nil {
+		// flushCursor resets the table buffers as soon as the enqueue
+		// succeeds (the rows are sealed in a segment), so an error here
+		// is one of two already-handled cases:
+		//   - enqueueCursor failed before sealing — ring full + wire
+		//     stalled past the append deadline, or ctx cancelled: the
+		//     rows were never persisted and are RETAINED for the next
+		//     flush attempt (or, in SF mode, recoverable by reopening
+		//     the same sf_dir). Mirrors Java's flushPendingRows()
+		//     reset-after-seal contract.
+		//   - enqueueCursor sealed the rows but the eager error check
+		//     then surfaced a HALT latched by a previous batch: the
+		//     buffers were already reset inside flushCursor, so the
+		//     published rows are not double-written when the user
+		//     re-sends after the documented close+rebuild recovery.
+		return -1, err
 	}
-	return s.flushSync(ctx)
+	return s.cursorEngine.enginePublishedFsn(), nil
 }
 
-// flushSync encodes all non-empty tables into a single multi-table
-// QWP message, sends it, and reads ACKs until one whose sequence is
-// at least the just-sent batch's sequence arrives. Earlier sequences
-// are absorbed the way the Java client does in waitForAck — a defensive
-// measure against stale ACKs that can otherwise be mistaken for a
-// response to the wrong batch.
-func (s *qwpLineSender) flushSync(ctx context.Context) error {
-	tables, err := s.buildTableEncodeInfo()
-	if err != nil {
-		return err
-	}
-	if len(tables) == 0 {
-		return nil
-	}
-
-	msg := s.encoders[0].encodeMultiTableWithDeltaDict(
-		tables,
-		s.globalSymbolList,
-		s.maxSentSymbolId,
-		s.batchMaxSymbolId,
-	)
-	if err := s.transport.sendMessage(ctx, msg); err != nil {
-		return err
-	}
-	expected := s.syncSequence
-	s.syncSequence++
-
-	for {
-		status, data, err := s.transport.readAck(ctx)
-		if err != nil {
-			return err
-		}
-		seq := parseAckSequence(data)
-		if status != qwpStatusOK {
-			qErr := newQwpErrorFromAck(data)
-			if qErr == nil {
-				qErr = &QwpError{Status: status, Sequence: seq, Message: "unknown error"}
-			}
-			return qErr
-		}
-		if seq >= expected {
-			break
-		}
-		// Stale ACK for an earlier batch on this connection — absorb
-		// and keep reading. Matches Java's waitForAck.
-	}
-
-	// Advance ACKed state: all schema IDs in this batch are now
-	// known to the server; bump the highest-ACKed symbol ID too.
-	if s.batchMaxSchemaId > s.maxSentSchemaId {
-		s.maxSentSchemaId = s.batchMaxSchemaId
-	}
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
-
-	return nil
-}
-
-// buildTableEncodeInfo collects non-empty tables, assigning fresh
-// schema IDs to any that lack one and selecting full or reference
-// mode based on whether the ID has already been ACKed by the
-// server. Reuses s.encodeInfoBuf to avoid allocating per flush.
-// Also sets s.batchMaxSchemaId to the highest schema ID in the batch.
-// Returns an error if assigning a new schema ID would exceed
-// maxSchemasPerConnection (when > 0).
-func (s *qwpLineSender) buildTableEncodeInfo() ([]qwpTableEncodeInfo, error) {
-	s.encodeInfoBuf = s.encodeInfoBuf[:0]
-	batchMax := s.maxSentSchemaId
-	for _, tb := range s.tableBuffers {
-		if tb.rowCount == 0 {
-			continue
-		}
-		// QWP wire format encodes table count as uint16.
-		if len(s.encodeInfoBuf) == qwpMaxTablesPerBatch {
-			return nil, fmt.Errorf(
-				"qwp: too many tables in one batch: exceeded %d",
-				qwpMaxTablesPerBatch,
-			)
-		}
-		if tb.schemaId < 0 {
-			if s.maxSchemasPerConnection > 0 && s.nextSchemaId >= s.maxSchemasPerConnection {
-				return nil, fmt.Errorf(
-					"qwp: schema registry exhausted (limit %d); close and re-open the sender to reset",
-					s.maxSchemasPerConnection,
-				)
-			}
-			tb.schemaId = s.nextSchemaId
-			s.nextSchemaId++
-		}
-		mode := qwpSchemaModeFull
-		if tb.schemaId <= s.maxSentSchemaId {
-			mode = qwpSchemaModeReference
-		}
-		if tb.schemaId > batchMax {
-			batchMax = tb.schemaId
-		}
-		s.encodeInfoBuf = append(s.encodeInfoBuf, qwpTableEncodeInfo{
-			tb:         tb,
-			schemaMode: mode,
-			schemaId:   tb.schemaId,
-		})
-	}
-	s.batchMaxSchemaId = batchMax
-	return s.encodeInfoBuf, nil
-}
-
-// flushAsync encodes all tables into a single multi-table message,
-// acquires a slot, enqueues the batch, and waits for all in-flight
-// batches to drain before returning. Used by the public Flush() in
-// async mode.
-//
-// Matches the Java client's flushPendingRows() + awaitPendingAcks():
-// schema and symbol IDs are advanced immediately after a successful
-// enqueue, not after the ACK. If a later batch fails, the I/O
-// goroutine stores the error into asyncState.ioErr; every subsequent
-// user-facing call hits checkError() at the top of the flush path
-// and returns the error. Stale cache state can therefore never
-// reach the wire on a live connection.
-func (s *qwpLineSender) flushAsync(ctx context.Context) error {
-	// Check for I/O errors before encoding.
-	if err := s.asyncState.checkError(); err != nil {
-		return err
-	}
-
-	tables, err := s.buildTableEncodeInfo()
-	if err != nil {
-		return err
-	}
-	if len(tables) == 0 {
-		return nil
-	}
-
-	// Wait for the current encoder to be available (double-buffered).
-	// Honour ctx here too: if the I/O goroutine is stuck in sendMessage,
-	// the previous batch's readySignal never fires and an unguarded
-	// receive would silently extend the user's Flush deadline.
-	encIdx := s.currentEncoderIdx
-	select {
-	case <-s.encoderReady[encIdx]:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Encode all tables into a single multi-table message.
-	encoded := s.encoders[encIdx].encodeMultiTableWithDeltaDict(
-		tables,
-		s.globalSymbolList,
-		s.maxSentSymbolId,
-		s.batchMaxSymbolId,
-	)
-
-	// Acquire a slot in the in-flight window.
-	if err := s.asyncState.acquireSlot(ctx); err != nil {
-		// Return the encoder token since we won't enqueue.
-		s.encoderReady[encIdx] <- struct{}{}
-		return err
-	}
-
-	// Enqueue the batch with the encoder's ready signal.
-	// No copy needed — the ioLoop signals encoderReady after
-	// sendMessage, at which point the buffer is safe to reuse.
-	batch := qwpAsyncBatch{
-		data:        encoded,
-		readySignal: s.encoderReady[encIdx],
-	}
-	select {
-	case s.asyncState.sendCh <- batch:
-	case <-ctx.Done():
-		s.encoderReady[encIdx] <- struct{}{}
-		s.asyncState.releaseSlot()
-		return ctx.Err()
-	}
-
-	// Swap to the other encoder for the next flush.
-	s.currentEncoderIdx = 1 - s.currentEncoderIdx
-
-	// Advance highest-sent schema and symbol IDs immediately after
-	// enqueue — same semantics as Java's flushPendingRows. If a
-	// subsequent ACK fails, asyncState.ioErr poisons the sender.
-	if s.batchMaxSchemaId > s.maxSentSchemaId {
-		s.maxSentSchemaId = s.batchMaxSchemaId
-	}
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
-
-	// Drain all in-flight batches before returning (Flush semantics).
-	return s.asyncState.waitEmpty(ctx)
-}
-
-// enqueueFlush encodes all pending table buffers and enqueues them
-// for the I/O goroutine without waiting for ACKs. This is the
-// auto-flush path for async mode — At() returns promptly instead of
-// blocking on a full round-trip. Schema and symbol caches are
-// updated optimistically; if the I/O goroutine later fails, ioErr
-// is set and all subsequent operations return that error (the
-// sender is terminal, so stale cache entries can never reach the
-// wire). Mirrors the Java client's flushPendingRows().
-func (s *qwpLineSender) enqueueFlush(ctx context.Context) error {
-	if s.pendingRowCount == 0 {
-		return nil
-	}
-
-	// Check for I/O errors before encoding.
-	if err := s.asyncState.checkError(); err != nil {
-		return err
-	}
-
-	tables, err := s.buildTableEncodeInfo()
-	if err != nil {
-		return err
-	}
-	if len(tables) == 0 {
-		s.resetAfterFlush()
-		return nil
-	}
-
-	// Wait for the current encoder to be available (double-buffered).
-	// Ctx-aware for the same reason as flushAsync: a stuck I/O goroutine
-	// must not extend the caller's deadline.
-	encIdx := s.currentEncoderIdx
-	select {
-	case <-s.encoderReady[encIdx]:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Encode all tables into a single multi-table message.
-	encoded := s.encoders[encIdx].encodeMultiTableWithDeltaDict(
-		tables,
-		s.globalSymbolList,
-		s.maxSentSymbolId,
-		s.batchMaxSymbolId,
-	)
-
-	if err := s.asyncState.acquireSlot(ctx); err != nil {
-		s.encoderReady[encIdx] <- struct{}{}
-		return err
-	}
-
-	// No copy needed — the ioLoop signals encoderReady after
-	// sendMessage, at which point the buffer is safe to reuse.
-	batch := qwpAsyncBatch{
-		data:        encoded,
-		readySignal: s.encoderReady[encIdx],
-	}
-	select {
-	case s.asyncState.sendCh <- batch:
-	case <-ctx.Done():
-		s.encoderReady[encIdx] <- struct{}{}
-		s.asyncState.releaseSlot()
-		return ctx.Err()
-	}
-
-	// Swap to the other encoder for the next flush.
-	s.currentEncoderIdx = 1 - s.currentEncoderIdx
-
-	// Optimistic cache: if the batch fails, ioErr prevents further
-	// operations so stale cache entries are harmless.
-	if s.batchMaxSchemaId > s.maxSentSchemaId {
-		s.maxSentSchemaId = s.batchMaxSchemaId
-	}
-	if s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
-	}
-
-	s.resetAfterFlush()
-	return nil
-}
-
-// resetAfterFlush clears all table buffers and resets counters.
+// resetAfterFlush clears the table buffers touched this cycle and
+// resets counters. Only dirtyTables can hold rows, so resetting the
+// rest of the tableBuffers map would be wasted work; the dirty flag is
+// cleared here (the one place that empties the list) so the next
+// Table() re-lists the buffer.
 func (s *qwpLineSender) resetAfterFlush() {
-	for _, tb := range s.tableBuffers {
+	for _, tb := range s.dirtyTables {
 		tb.reset()
+		tb.dirty = false
 	}
+	s.dirtyTables = s.dirtyTables[:0]
 	s.pendingRowCount = 0
 	s.pendingBytes = 0
 	s.batchMaxSymbolId = s.maxSentSymbolId
+	// Defense in depth: tb.reset() keeps the column structure but
+	// sets committedColumnCount=0, so a post-flush cancelRow would
+	// wipe the designated-TS column out of tb.columns. Drop the
+	// cache here so the first row after a flush always re-runs
+	// getOrCreateDesignatedTimestamp.
+	s.cachedDesignatedTs = nil
 
 	// Refresh flush deadline.
 	if s.autoFlushInterval > 0 {
@@ -1170,62 +1302,14 @@ func (s *qwpLineSender) resetAfterFlush() {
 // --- LineSender interface: Close ---
 
 func (s *qwpLineSender) Close(ctx context.Context) error {
-	if s.closed {
+	if !s.closed.CompareAndSwap(false, true) {
 		return errDoubleSenderClose
 	}
-
-	s.closed = true
-
-	var flushErr error
-	if s.asyncState != nil {
-		// Async close: enqueue pending rows non-blocking, then
-		// stop the I/O goroutine (cancel context + close channel
-		// + wait). For a guaranteed graceful flush, call Flush()
-		// before Close().
-		if s.hasTable {
-			if s.currentTable != nil {
-				s.currentTable.cancelRow()
-			}
-			s.hasTable = false
-			s.currentTable = nil
-		}
-		if s.pendingRowCount > 0 {
-			flushErr = s.enqueueFlush(ctx)
-		}
-		s.asyncState.stop(s.closeTimeout)
-		if flushErr == nil {
-			flushErr = s.asyncState.checkError()
-		}
-	} else {
-		flushErr = s.flush0(ctx)
-	}
-
-	closeErr := s.transport.close(ctx)
-
-	if flushErr != nil {
-		return flushErr
-	}
-	return closeErr
-}
-
-// flush0 is the internal flush used by Close in sync mode. The async
-// Close path uses enqueueFlush + stop() directly, so this function
-// is only called when asyncState == nil.
-func (s *qwpLineSender) flush0(ctx context.Context) error {
-	if s.hasTable {
-		// Drop the pending row silently on close.
-		if s.currentTable != nil {
-			s.currentTable.cancelRow()
-		}
-		s.hasTable = false
-		s.currentTable = nil
-	}
-	if s.pendingRowCount == 0 {
-		return nil
-	}
-
-	defer s.resetAfterFlush()
-	return s.flushSync(ctx)
+	// All wire I/O goes through the cursor engine + send loop,
+	// regardless of whether sf_dir was set. closeCursor drains
+	// (up to closeTimeout), stops the loop, closes the engine,
+	// and tears down the orphan-drainer pool if one was started.
+	return s.closeCursor(ctx)
 }
 
 // --- QwpSender interface: extended column types ---
@@ -1324,6 +1408,10 @@ func (s *qwpLineSender) CharColumn(name string, val rune) QwpSender {
 	}
 	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
+		return s
+	}
+	if val < 0 || val > 0xFFFF {
+		s.lastErr = fmt.Errorf("qwp: CharColumn() CHAR rune %U does not fit in a UTF-16 code unit", val)
 		return s
 	}
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeChar, false)
@@ -1479,15 +1567,15 @@ func (s *qwpLineSender) Int64Array2DColumn(name string, values [][]int64) QwpSen
 		s.lastErr = err
 		return s
 	}
-	flat := make([]int64, 0, dim0*dim1)
+	// Validate row regularity before reserving so the streamed write
+	// fills exactly the reserved payload — no intermediate flat copy.
 	for _, row := range values {
 		if len(row) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 2D array: row lengths differ")
 			return s
 		}
-		flat = append(flat, row...)
 	}
-	col.addLongArray(2, []int32{int32(dim0), int32(dim1)}, flat)
+	col.addLongArray2D(dim0, dim1, values)
 	return s
 }
 
@@ -1523,7 +1611,8 @@ func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpS
 		s.lastErr = err
 		return s
 	}
-	flat := make([]int64, 0, dim0*dim1*dim2)
+	// Validate shape regularity before reserving so the streamed write
+	// fills exactly the reserved payload — no intermediate flat copy.
 	for _, plane := range values {
 		if len(plane) != dim1 {
 			s.lastErr = fmt.Errorf("qwp: irregular 3D array")
@@ -1534,9 +1623,8 @@ func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpS
 				s.lastErr = fmt.Errorf("qwp: irregular 3D array")
 				return s
 			}
-			flat = append(flat, row...)
 		}
 	}
-	col.addLongArray(3, []int32{int32(dim0), int32(dim1), int32(dim2)}, flat)
+	col.addLongArray3D(dim0, dim1, dim2, values)
 	return s
 }

@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -71,11 +72,29 @@ func newQwpTestServer(t *testing.T) *httptest.Server {
 func newQwpSenderForTest(t *testing.T, serverURL string) *qwpLineSender {
 	t.Helper()
 	wsURL := "ws" + strings.TrimPrefix(serverURL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("newQwpLineSender: %v", err)
 	}
 	return s
+}
+
+// flushAndAwaitAck flushes pending rows and blocks until the server
+// has ACKed them. Flush no longer waits for the ACK (Java decision
+// #1 — see design/qwp-cursor-durability.md), so tests that assert
+// server-side receipt must use this FlushAndGetSequence +
+// AwaitAckedFsn barrier instead of relying on Flush alone.
+func flushAndAwaitAck(t *testing.T, s *qwpLineSender) {
+	t.Helper()
+	fsn, err := s.FlushAndGetSequence(context.Background())
+	if err != nil {
+		t.Fatalf("FlushAndGetSequence: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.AwaitAckedFsn(ctx, fsn); err != nil {
+		t.Fatalf("AwaitAckedFsn(fsn=%d): %v", fsn, err)
+	}
 }
 
 func TestQwpSenderBasicRow(t *testing.T) {
@@ -107,10 +126,11 @@ func TestQwpSenderBasicRow(t *testing.T) {
 	}
 }
 
-// TestQwpSyncFlushAbsorbsStaleAck verifies that sync-mode flushSync
-// ignores an ACK whose cumulative sequence is older than the batch it
-// just sent and keeps reading until the matching ACK arrives. Matches
-// Java's waitForAck, which tolerates stale ACKs on the same connection.
+// TestQwpSyncFlushAbsorbsStaleAck verifies that the cursor send
+// loop tolerates an ACK whose cumulative sequence is older than the
+// most recent published batch and keeps making forward progress.
+// engineAcknowledge is monotonic — it clamps to ackedFsn — so stale
+// ACKs are absorbed without breaking the engine's drain accounting.
 func TestQwpSyncFlushAbsorbsStaleAck(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
@@ -146,9 +166,90 @@ func TestQwpSyncFlushAbsorbsStaleAck(t *testing.T) {
 			t.Fatalf("flush %d: %v", i, err)
 		}
 	}
+}
 
-	if got := s.syncSequence; got != 3 {
-		t.Fatalf("syncSequence = %d, want 3", got)
+// TestQwpFlushRetainsRowsOnError is a regression test for the
+// retain-on-error contract: when flushCursor fails before the rows
+// are persisted to a segment (here: ctx cancelled, so
+// engineAppendBlocking returns ctx.Err() before assigning an FSN),
+// Flush must NOT reset the table buffers. A prior version registered
+// `defer resetAfterFlush()` ahead of the flushCursor error check,
+// silently destroying rows that were never sent anywhere. The buffer
+// must survive so a subsequent flush delivers the data.
+func TestQwpFlushRetainsRowsOnError(t *testing.T) {
+	var mu sync.Mutex
+	framesReceived := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		var seq int64
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			mu.Lock()
+			framesReceived++
+			mu.Unlock()
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+		}
+	}))
+	defer srv.Close()
+
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	if err := s.Table("t").Int64Column("x", 99).AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow: %v", err)
+	}
+	if s.pendingRowCount != 1 {
+		t.Fatalf("pendingRowCount before flush = %d, want 1", s.pendingRowCount)
+	}
+
+	// Cancelled ctx → engineAppendBlocking returns early, nothing
+	// persisted. The flush must fail and the row must be retained.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Flush(cancelled); err == nil {
+		t.Fatal("Flush with cancelled ctx: want error, got nil")
+	}
+	if s.pendingRowCount != 1 {
+		t.Fatalf("pendingRowCount after failed flush = %d, want 1 "+
+			"(row destroyed — retain-on-error contract violated)", s.pendingRowCount)
+	}
+	mu.Lock()
+	got := framesReceived
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("server received %d frames from the failed flush, want 0", got)
+	}
+
+	// The retained row must be delivered by a subsequent good flush.
+	// Flush no longer blocks on the ACK (Java decision #1), so use
+	// FlushAndGetSequence + AwaitAckedFsn as the delivery barrier
+	// before asserting receipt.
+	fsn, err := s.FlushAndGetSequence(context.Background())
+	if err != nil {
+		t.Fatalf("retry Flush: %v", err)
+	}
+	if s.pendingRowCount != 0 {
+		t.Fatalf("pendingRowCount after retry flush = %d, want 0", s.pendingRowCount)
+	}
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer awaitCancel()
+	if err := s.AwaitAckedFsn(awaitCtx, fsn); err != nil {
+		t.Fatalf("AwaitAckedFsn: %v", err)
+	}
+	mu.Lock()
+	got = framesReceived
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("server received %d frames total, want exactly 1 "+
+			"(retained row not delivered, or duplicated)", got)
 	}
 }
 
@@ -431,6 +532,99 @@ func TestQwpSenderClose(t *testing.T) {
 	}
 }
 
+func TestQwpSenderCloseSurfacesLatchedFluentError(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+
+	// Latch a validation error: '?' is an illegal column-name char.
+	s.Table("t").Symbol("bad?name", "v")
+
+	err := s.Close(context.Background())
+	if err == nil {
+		t.Fatalf("Close: nil, expected latched fluent-API error")
+	}
+	if !strings.Contains(err.Error(), "illegal character") {
+		t.Fatalf("Close: %v, want error mentioning illegal character", err)
+	}
+}
+
+// TestQwpSenderFlushSurfacesLatchedFluentError covers the fluent-latch
+// contract on Flush: a Symbol/*Column/Table validation error latched
+// after a row has already committed must surface on the next Flush
+// (mirroring At/AtNow/Close), not be masked or silently dropped while
+// the committed row flushes.
+func TestQwpSenderFlushSurfacesLatchedFluentError(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	ctx := context.Background()
+
+	// Commit a clean row: hasTable=false, pendingRowCount=1.
+	if err := s.Table("t").Float64Column("v", 1).At(ctx, time.Now()); err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	// Symbol() without a preceding Table() latches lastErr; hasTable
+	// stays false, so the committed row is still flushable. This is the
+	// exact case where a latch-blind Flush would flush the row and
+	// return nil, swallowing the error.
+	s.Symbol("s", "v")
+
+	fsn, err := s.FlushAndGetSequence(ctx)
+	if err == nil {
+		t.Fatal("FlushAndGetSequence: nil, expected latched fluent-API error")
+	}
+	if !strings.Contains(err.Error(), "Symbol() called without Table()") {
+		t.Fatalf("FlushAndGetSequence: %v, want Symbol()-without-Table()", err)
+	}
+	if fsn != -1 {
+		t.Fatalf("FlushAndGetSequence fsn: got %d, want -1 on error", fsn)
+	}
+	if s.lastErr != nil {
+		t.Fatalf("lastErr not cleared after surfacing: %v", s.lastErr)
+	}
+
+	// The latch is drained, so the deferred committed row flushes on the
+	// next call without re-surfacing the error.
+	if _, err := s.FlushAndGetSequence(ctx); err != nil {
+		t.Fatalf("second FlushAndGetSequence: %v, want nil", err)
+	}
+}
+
+// TestQwpSenderFlushCancelsInProgressRowOnLatchedError verifies that
+// when Flush surfaces a latched error mid-row (hasTable still set), it
+// cancels the in-progress row as At does — so clearing the latch can't
+// strand a partial row that a later At would commit.
+func TestQwpSenderFlushCancelsInProgressRowOnLatchedError(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	ctx := context.Background()
+
+	// Open a row, then latch a validation error without finalizing it.
+	// The precision check rejects before adding the column, leaving
+	// hasTable=true with currentTable set.
+	s.Table("t")
+	s.GeohashColumn("g", 0, -1)
+	if s.lastErr == nil || !s.hasTable {
+		t.Fatalf("setup: want latched error with hasTable, got err=%v hasTable=%v", s.lastErr, s.hasTable)
+	}
+
+	err := s.Flush(ctx)
+	if err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("Flush: %v, want geohash precision error (not errFlushWithPendingMessage)", err)
+	}
+	// The in-progress row is cancelled and table state reset, so a later
+	// At reports "called without Table()" instead of committing a
+	// stranded partial row.
+	if s.hasTable || s.currentTable != nil {
+		t.Fatalf("in-progress row not cancelled: hasTable=%v currentTable=%v", s.hasTable, s.currentTable)
+	}
+	if err := s.AtNow(ctx); err == nil || !strings.Contains(err.Error(), "At() called without Table()") {
+		t.Fatalf("AtNow after cancelled row: %v, want At()-without-Table()", err)
+	}
+}
+
 func TestQwpSenderClosedOperations(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
@@ -451,9 +645,14 @@ func TestQwpSenderClosedOperations(t *testing.T) {
 }
 
 func TestQwpSenderAutoFlushRows(t *testing.T) {
-	// Mock server that counts received messages.
+	// Mock server that counts received messages and signals the
+	// test goroutine on every receive — cursor mode's auto-flush is
+	// asynchronous (send loop transmits in the background), so the
+	// test must wait for the server to observe the frame rather
+	// than poll on shared memory.
 	var mu sync.Mutex
 	msgCount := 0
+	msgReceived := make(chan struct{}, 16)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
@@ -473,12 +672,16 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 			mu.Unlock()
 			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
 			seq++
+			select {
+			case msgReceived <- struct{}{}:
+			default:
+			}
 		}
 	}))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 3, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 3, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +696,13 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 		}
 	}
 
-	// Auto-flush should have triggered at row 3.
+	// Auto-flush should have triggered at row 3. Block until the
+	// server signals it received that frame.
+	select {
+	case <-msgReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("auto-flush frame did not reach the server within 2s")
+	}
 	mu.Lock()
 	gotMsgCount := msgCount
 	mu.Unlock()
@@ -506,7 +715,8 @@ func TestQwpSenderAutoFlushRows(t *testing.T) {
 }
 
 func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
-	// Mock server that counts received messages.
+	// Mock server that counts received messages and signals on
+	// every receive (see TestQwpSenderAutoFlushRows for rationale).
 	var mu sync.Mutex
 	msgCount := 0
 	readMsgCount := func() int {
@@ -514,6 +724,7 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 		defer mu.Unlock()
 		return msgCount
 	}
+	msgReceived := make(chan struct{}, 16)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
@@ -533,13 +744,17 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 			mu.Unlock()
 			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
 			seq++
+			select {
+			case msgReceived <- struct{}{}:
+			default:
+			}
 		}
 	}))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	// autoFlushRows=0 (disabled), autoFlushInterval=10ms.
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 10*time.Millisecond, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 10*time.Millisecond, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,10 +775,16 @@ func TestQwpSenderAutoFlushTimeInterval(t *testing.T) {
 	// Wait for the interval to expire.
 	time.Sleep(20 * time.Millisecond)
 
-	// Second row: should trigger time-based auto-flush.
+	// Second row: triggers time-based auto-flush. Block until the
+	// server signals it received the frame.
 	err = s.Table("t").Int64Column("x", int64(2)).AtNow(context.Background())
 	if err != nil {
 		t.Fatalf("row 2: %v", err)
+	}
+	select {
+	case <-msgReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("time-based auto-flush did not reach the server within 2s")
 	}
 	if got := readMsgCount(); got != 1 {
 		t.Fatalf("after row 2: msgCount = %d, want 1 (time-based flush)", got)
@@ -579,7 +800,7 @@ func TestQwpSenderAutoFlushDisabled(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	// Both autoFlushRows=0 and autoFlushInterval=0 (disabled).
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -941,6 +1162,23 @@ func TestQwpSenderCharColumn(t *testing.T) {
 	}
 }
 
+func TestQwpSenderCharColumnRejectsNonBMP(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	err := s.CharColumn("c", 0x1F600). // 😀 U+1F600, outside the BMP
+						AtNow(context.Background())
+	if err == nil {
+		t.Fatalf("expected CharColumn to reject non-BMP rune")
+	}
+	if !strings.Contains(err.Error(), "CHAR") {
+		t.Fatalf("error should mention CHAR: %v", err)
+	}
+}
+
 func TestQwpSenderDateColumn(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
@@ -1234,11 +1472,17 @@ func TestQwpSenderMethodChaining(t *testing.T) {
 
 // --- Integration test ---
 
-func TestQwpSenderIntegration(t *testing.T) {
+// Renamed from TestQwpSenderIntegration to TestQwpIntegrationSender
+// so the qwp-fuzz.yml workflow pattern ^TestQwp(Fuzz|Integration)
+// actually catches it. Used to hard-code "ws://localhost:9000" and
+// silently skip in CI; now goes through the shared fuzz fixture.
+func TestQwpIntegrationSender(t *testing.T) {
+	qwpEnsureServer(t)
 	ctx := context.Background()
-	s, err := newQwpLineSender(ctx, "ws://localhost:9000", qwpTransportOpts{}, time.Second, 0, 0, nil)
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr,
+		qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
-		t.Skipf("QuestDB not available: %v", err)
+		t.Fatalf("sender open against fixture %s: %v", qwpTestAddr, err)
 	}
 	defer s.Close(ctx)
 
@@ -1260,7 +1504,10 @@ func TestQwpSenderIntegration(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	// Second flush with same schema should use reference mode.
+	// Second flush against the same column set — cursor mode always
+	// emits FULL schema with schema_id=0 on every frame. The test
+	// exercises the steady-state flush path; the wire-format
+	// invariant is pinned in encoder tests.
 	err = s.Table("qwp_sender_test").
 		Symbol("host", "test_host").
 		Int64Column("cpu", 99).
@@ -1277,50 +1524,10 @@ func TestQwpSenderIntegration(t *testing.T) {
 		t.Fatalf("Flush (row 2): %v", err)
 	}
 
-	// Verify schema was registered (schema ID advanced past -1).
-	if s.maxSentSchemaId < 0 {
-		t.Fatal("maxSentSchemaId should have advanced after flush")
-	}
-
 	t.Log("QWP sender integration test passed")
 }
 
 // --- Validation tests ---
-
-func TestQwpSenderSchemaIdCaching(t *testing.T) {
-	srv := newQwpTestServer(t)
-	defer srv.Close()
-	s := newQwpSenderForTest(t, srv.URL)
-	defer s.Close(context.Background())
-
-	// First flush: full schema; the table should be assigned
-	// schemaId 0 and it should be promoted to maxSentSchemaId.
-	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
-	s.Flush(context.Background())
-
-	tb := s.tableBuffers["t"]
-	if tb == nil || tb.schemaId != 0 {
-		t.Fatalf("first flush: table schemaId = %v, want 0", tb)
-	}
-	if s.maxSentSchemaId != 0 {
-		t.Fatalf("first flush: maxSentSchemaId = %d, want 0", s.maxSentSchemaId)
-	}
-	if s.nextSchemaId != 1 {
-		t.Fatalf("first flush: nextSchemaId = %d, want 1", s.nextSchemaId)
-	}
-
-	// Second flush: same column set, should reuse schemaId and not
-	// allocate a new one.
-	s.Table("t").Int64Column("x", 2).AtNow(context.Background())
-	s.Flush(context.Background())
-
-	if tb.schemaId != 0 {
-		t.Fatalf("second flush: schemaId = %d, want 0 (same column set)", tb.schemaId)
-	}
-	if s.nextSchemaId != 1 {
-		t.Fatalf("second flush: nextSchemaId = %d, want 1 (no new ID allocated)", s.nextSchemaId)
-	}
-}
 
 func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 	// Track sent messages to verify delta dict content.
@@ -1346,7 +1553,7 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1361,9 +1568,12 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 		t.Fatalf("after flush 1: maxSentSymbolId = %d, want 1", s.maxSentSymbolId)
 	}
 
-	// Flush 2: add symbol GOOG.
+	// Flush 2: add symbol GOOG. Await delivery — Flush no longer
+	// blocks on the ACK, and the message-bytes assertions below
+	// require both frames to have reached the server. Awaiting the
+	// second FSN implies the first is delivered too (FSN monotonic).
 	s.Table("t").Symbol("sym", "GOOG").Int64Column("v", 3).AtNow(context.Background())
-	s.Flush(context.Background())
+	flushAndAwaitAck(t, s)
 
 	if s.maxSentSymbolId != 2 {
 		t.Fatalf("after flush 2: maxSentSymbolId = %d, want 2", s.maxSentSymbolId)
@@ -1392,26 +1602,21 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 		t.Fatalf("msg1 deltaCount = %d, want 2", deltaCount)
 	}
 
-	// Parse second message: delta should start at 2 with count 1.
+	// Cursor mode emits self-sufficient frames: every batch carries
+	// the full symbol dict from id 0. So the second message also
+	// has deltaStart=0 (NOT 2), with all three symbols repeated.
+	// This is the documented "self-sufficient frames" decision (see
+	// design/qwp-cursor-durability.md decision #14).
 	msg2 := messages[1]
 	off = qwpHeaderSize
 	deltaStart2, n, _ := qwpReadVarint(msg2[off:])
 	off += n
-	if deltaStart2 != 2 {
-		t.Fatalf("msg2 deltaStart = %d, want 2", deltaStart2)
+	if deltaStart2 != 0 {
+		t.Fatalf("msg2 deltaStart = %d, want 0 (cursor mode is self-sufficient)", deltaStart2)
 	}
-	deltaCount2, n, _ := qwpReadVarint(msg2[off:])
-	off += n
-	if deltaCount2 != 1 {
-		t.Fatalf("msg2 deltaCount = %d, want 1", deltaCount2)
-	}
-
-	// Verify the new symbol is "GOOG".
-	symLen, n, _ := qwpReadVarint(msg2[off:])
-	off += n
-	sym := string(msg2[off : off+int(symLen)])
-	if sym != "GOOG" {
-		t.Fatalf("msg2 delta symbol = %q, want %q", sym, "GOOG")
+	deltaCount2, _, _ := qwpReadVarint(msg2[off:])
+	if deltaCount2 != 3 {
+		t.Fatalf("msg2 deltaCount = %d, want 3 (full dict re-sent)", deltaCount2)
 	}
 }
 
@@ -1428,10 +1633,12 @@ func TestQwpSenderServerError(t *testing.T) {
 			if err != nil {
 				return
 			}
-			// Return WRITE_ERROR.
-			errMsg := "table error"
+			// Return PARSE_ERROR (default Halt). WRITE_ERROR is now
+			// default Drop and would not surface a terminal Flush
+			// error.
+			errMsg := "bad message"
 			ack := make([]byte, 11+len(errMsg))
-			ack[0] = byte(qwpStatusWriteError)
+			ack[0] = byte(QwpStatusParseError)
 			binary.LittleEndian.PutUint16(ack[9:11], uint16(len(errMsg)))
 			copy(ack[11:], errMsg)
 			conn.Write(context.Background(), websocket.MessageBinary, ack)
@@ -1440,24 +1647,33 @@ func TestQwpSenderServerError(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close(context.Background())
 
 	s.Table("t").Int64Column("x", 1).AtNow(context.Background())
-	err = s.Flush(context.Background())
+	// Flush no longer waits for the ACK, so the server's PARSE_ERROR
+	// surfaces on the ACK-confirmation path (or, racily, already on
+	// FlushAndGetSequence). Accept it from either.
+	fsn, err := s.FlushAndGetSequence(context.Background())
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err = s.AwaitAckedFsn(ctx, fsn)
+	}
 	if err == nil {
 		t.Fatal("expected error from server")
 	}
 
-	qErr, ok := err.(*QwpError)
-	if !ok {
-		t.Fatalf("expected *QwpError, got %T: %v", err, err)
+	var senderErr *SenderError
+	if !errors.As(err, &senderErr) {
+		t.Fatalf("expected *SenderError in chain, got %T: %v", err, err)
 	}
-	if qErr.Status != qwpStatusWriteError {
-		t.Fatalf("status = %d, want %d", qErr.Status, qwpStatusWriteError)
+	if senderErr.ServerStatusByte != int(QwpStatusParseError) {
+		t.Fatalf("status = 0x%02X, want 0x%02X",
+			senderErr.ServerStatusByte, byte(QwpStatusParseError))
 	}
 }
 
@@ -1490,14 +1706,14 @@ func TestQwpSenderAsyncBasic(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify async mode is enabled.
-	if s.asyncState == nil {
-		t.Fatal("asyncState should not be nil for window=2")
+	// Verify the cursor engine is wired (memory-backed, no sf_dir).
+	if s.cursorEngine == nil || s.cursorSendLoop == nil {
+		t.Fatal("cursor engine and send loop must be wired for QWP sender")
 	}
 
 	// Send 5 rows.
@@ -1508,10 +1724,9 @@ func TestQwpSenderAsyncBasic(t *testing.T) {
 		}
 	}
 
-	// Flush — waits for all batches to be ACKed.
-	if err := s.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
+	// Flush, then await ACK — Flush itself no longer blocks on the
+	// server round-trip; the msgCount assertion needs delivery.
+	flushAndAwaitAck(t, s)
 
 	if s.pendingRowCount != 0 {
 		t.Fatalf("pendingRowCount = %d, want 0", s.pendingRowCount)
@@ -1555,7 +1770,7 @@ func TestQwpSenderAsyncMultipleFlushes(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 3)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1569,13 +1784,13 @@ func TestQwpSenderAsyncMultipleFlushes(t *testing.T) {
 		t.Fatalf("Flush 1: %v", err)
 	}
 
-	// Flush 2: 3 rows.
+	// Flush 2: 3 rows. Await the second FSN — that implies the first
+	// flush's frame is delivered too (FSN monotonic), so both frames
+	// have reached the server before the msgCount assertion.
 	for i := 0; i < 3; i++ {
 		s.Table("t").Int64Column("x", int64(i+10)).AtNow(context.Background())
 	}
-	if err := s.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush 2: %v", err)
-	}
+	flushAndAwaitAck(t, s)
 
 	mu.Lock()
 	if msgCount != 2 {
@@ -1589,7 +1804,7 @@ func TestQwpSenderAsyncCloseAutoFlush(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1603,176 +1818,14 @@ func TestQwpSenderAsyncCloseAutoFlush(t *testing.T) {
 	}
 }
 
-func TestQwpSenderSchemaIdPerTable(t *testing.T) {
-	// Verify that two tables with identical columns both get full
-	// schema mode on first flush (not schema reference mode).
-	var messages [][]byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(qwpHeaderVersion, "1")
-		conn, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.CloseNow()
-		var seq int64
-		for {
-			_, data, err := conn.Read(context.Background())
-			if err != nil {
-				return
-			}
-			messages = append(messages, append([]byte(nil), data...))
-			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
-			seq++
-		}
-	}))
-	defer srv.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close(context.Background())
-
-	// Insert one row into each of two tables with identical columns.
-	s.Table("alpha").Int64Column("x", 1).AtNow(context.Background())
-	s.Table("beta").Int64Column("x", 2).AtNow(context.Background())
-	s.Flush(context.Background())
-
-	// With multi-table batching, both tables are in 1 message.
-	if len(messages) != 1 {
-		t.Fatalf("messages = %d, want 1", len(messages))
-	}
-
-	// Both tables in the message must use full schema mode.
-	modes := extractAllSchemaModes(t, messages[0])
-	if len(modes) != 2 {
-		t.Fatalf("tables in message = %d, want 2", len(modes))
-	}
-	for i, mode := range modes {
-		if mode != byte(qwpSchemaModeFull) {
-			t.Fatalf("table %d: schemaMode = 0x%02X, want 0x%02X (full)",
-				i, mode, qwpSchemaModeFull)
-		}
-	}
-
-	// After first flush, both tables should have distinct schema IDs
-	// and maxSentSchemaId should have advanced to cover both.
-	if s.tableBuffers["alpha"].schemaId == s.tableBuffers["beta"].schemaId {
-		t.Fatalf("tables must have distinct schema IDs, both = %d",
-			s.tableBuffers["alpha"].schemaId)
-	}
-	if s.maxSentSchemaId != 1 {
-		t.Fatalf("maxSentSchemaId = %d, want 1", s.maxSentSchemaId)
-	}
-	if s.nextSchemaId != 2 {
-		t.Fatalf("nextSchemaId = %d, want 2", s.nextSchemaId)
-	}
-
-	// Second flush of both tables should now use schema reference.
-	messages = messages[:0]
-	s.Table("alpha").Int64Column("x", 3).AtNow(context.Background())
-	s.Table("beta").Int64Column("x", 4).AtNow(context.Background())
-	s.Flush(context.Background())
-
-	if len(messages) != 1 {
-		t.Fatalf("messages = %d, want 1", len(messages))
-	}
-	modes = extractAllSchemaModes(t, messages[0])
-	for i, mode := range modes {
-		if mode != byte(qwpSchemaModeReference) {
-			t.Fatalf("table %d (2nd flush): schemaMode = 0x%02X, want 0x%02X (ref)",
-				i, mode, qwpSchemaModeReference)
-		}
-	}
-}
-
-// extractAllSchemaModes parses a multi-table QWP message and returns
-// the schema mode byte for each table block. It skips the header,
-// delta dict, and then for each table: extracts the schema mode and
-// skips the rest of the table block.
-//
-// Precondition: every table in the message has exactly one non-null
-// LONG column. In full mode the helper asserts the type byte; in
-// reference mode the caller is responsible for maintaining the same
-// shape across flushes. The only caller today is
-// TestQwpSenderSchemaIdPerTable, which uses Int64Column("x", ...).
-func extractAllSchemaModes(t *testing.T, msg []byte) []byte {
-	t.Helper()
-	if len(msg) < qwpHeaderSize {
-		t.Fatalf("message too short: %d", len(msg))
-	}
-
-	tableCount := binary.LittleEndian.Uint16(msg[6:8])
-	off := qwpHeaderSize
-	flags := msg[qwpHeaderOffsetFlags]
-
-	// Skip delta dict if present.
-	if flags&qwpFlagDeltaSymbolDict != 0 {
-		_, n, _ := qwpReadVarint(msg[off:])
-		off += n
-		deltaCount, n, _ := qwpReadVarint(msg[off:])
-		off += n
-		for i := uint64(0); i < deltaCount; i++ {
-			slen, n, _ := qwpReadVarint(msg[off:])
-			off += n + int(slen)
-		}
-	}
-
-	var modes []byte
-	for ti := uint16(0); ti < tableCount; ti++ {
-		// Skip table name.
-		nameLen, n, _ := qwpReadVarint(msg[off:])
-		off += n + int(nameLen)
-		// Row count — needed to size the column data skip.
-		rowCount, n, _ := qwpReadVarint(msg[off:])
-		off += n
-		// Column count.
-		colCount, n, _ := qwpReadVarint(msg[off:])
-		off += n
-		if colCount != 1 {
-			t.Fatalf("table %d: colCount=%d, helper only supports 1 column",
-				ti, colCount)
-		}
-		// Schema mode byte.
-		schemaMode := msg[off]
-		modes = append(modes, schemaMode)
-		off++
-		// Schema ID varint (both modes per QWP spec §9).
-		_, n, _ = qwpReadVarint(msg[off:])
-		off += n
-
-		if schemaMode == byte(qwpSchemaModeFull) {
-			// Full schema: name string + type byte.
-			slen, n, _ := qwpReadVarint(msg[off:])
-			off += n + int(slen)
-			if tc := qwpTypeCode(msg[off]); tc != qwpTypeLong {
-				t.Fatalf("table %d: column type=0x%02X, helper only supports qwpTypeLong",
-					ti, tc)
-			}
-			off++
-		}
-
-		// Column data: null bitmap flag (1 byte, asserted 0x00 = no
-		// nulls) followed by rowCount × 8 bytes for the LONG values.
-		if msg[off] != 0x00 {
-			t.Fatalf("table %d: null bitmap flag=0x%02X, helper requires non-null values",
-				ti, msg[off])
-		}
-		off += 1 + int(rowCount)*8
-	}
-
-	return modes
-}
-
 func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
-	// In async mode the sender matches the Java client's
-	// flushPendingRows() semantics: schema and symbol IDs are
-	// advanced immediately after enqueue, not after ACK. If a batch
-	// later fails, the sender is poisoned via asyncState.ioErr and
-	// every subsequent user-facing call returns that error — so
-	// stale cache state can never reach the wire on a live
-	// connection. This test pins that invariant.
+	// The cursor sender matches the Java client's flushPendingRows()
+	// semantics: schema and symbol IDs are advanced immediately at
+	// enqueue, not after ACK. If a batch later fails, the send loop
+	// latches the terminal error (surfaced via sendLoopCheckError) and
+	// every subsequent user-facing call returns it — so stale cache
+	// state can never reach the wire on a live connection. This test
+	// pins that invariant.
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
@@ -1782,18 +1835,20 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 		}
 		defer conn.CloseNow()
 
-		// Read the first message, then return a WRITE_ERROR.
+		// Read the first message, then return a PARSE_ERROR
+		// (default Halt). WRITE_ERROR is now default Drop and would
+		// not poison the sender.
 		_, _, err = conn.Read(context.Background())
 		if err != nil {
 			return
 		}
-		ack := buildAckError(qwpStatusWriteError, 0, "write failed")
+		ack := buildAckError(QwpStatusParseError, 0, "bad message")
 		conn.Write(context.Background(), websocket.MessageBinary, ack)
 	}))
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1802,8 +1857,15 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 	// Insert a row with a symbol (to exercise both schema and symbol paths).
 	s.Table("t").Symbol("sym", "AAPL").Int64Column("x", 1).AtNow(context.Background())
 
-	// Flush returns the WRITE_ERROR from the server.
-	flushErr := s.Flush(context.Background())
+	// Flush no longer waits for the ACK, so the server's PARSE_ERROR
+	// surfaces on the ACK-confirmation path (AwaitAckedFsn) or, racily,
+	// already on FlushAndGetSequence. Accept it from either.
+	fsn, flushErr := s.FlushAndGetSequence(context.Background())
+	if flushErr == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		flushErr = s.AwaitAckedFsn(ctx, fsn)
+	}
 	if flushErr == nil {
 		t.Fatal("expected flush error, got nil")
 	}
@@ -1851,7 +1913,7 @@ func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	// window=4, autoFlushRows=10
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 10, 0, nil, 4)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 10, 0, nil, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1868,13 +1930,13 @@ func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
 
 	// All 30 rows have been inserted. The user goroutine returned
 	// from AtNow without blocking. Verify that multiple batches are
-	// in-flight (enqueued but not yet ACKed).
-	s.asyncState.mu.Lock()
-	count := s.asyncState.inFlightCount
-	s.asyncState.mu.Unlock()
-
-	if count < 2 {
-		t.Fatalf("expected at least 2 batches in-flight concurrently, got %d", count)
+	// in-flight (published into the engine but not yet ACKed).
+	pub := s.cursorEngine.enginePublishedFsn()
+	acked := s.cursorEngine.engineAckedFsn()
+	inFlight := pub - acked
+	if inFlight < 2 {
+		t.Fatalf("expected at least 2 batches in-flight concurrently, got %d (published=%d acked=%d)",
+			inFlight, pub, acked)
 	}
 
 	// Release the gate so the server can ACK all batches.
@@ -1951,8 +2013,9 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 		opts := qwpTransportOpts{
 			authorization: "Bearer my_token",
+			endpointPath:  qwpWritePath,
 		}
-		s, err := newQwpLineSender(context.Background(), wsURL, opts, 0, 0, 0, nil)
+		s, err := newQwpLineSender(context.Background(), wsURL, opts, 0, 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1988,8 +2051,9 @@ func TestQwpAuthHeaderFormat(t *testing.T) {
 		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 		opts := qwpTransportOpts{
 			authorization: "Basic YWRtaW46cXVlc3Q=", // base64("admin:quest")
+			endpointPath:  qwpWritePath,
 		}
-		s, err := newQwpLineSender(context.Background(), wsURL, opts, 0, 0, 0, nil)
+		s, err := newQwpLineSender(context.Background(), wsURL, opts, 0, 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2099,7 +2163,7 @@ func TestQwpMaxBufSizeTriggersFlush(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{}, 0, 0, 0, nil)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2119,10 +2183,10 @@ func TestQwpMaxBufSizeTriggersFlush(t *testing.T) {
 		}
 	}
 
-	// Explicit flush for remaining rows.
-	if err := s.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
+	// Explicit flush for remaining rows, then await delivery — the
+	// messageCount assertion needs the frames on the wire, and Flush
+	// no longer blocks on the ACK.
+	flushAndAwaitAck(t, s)
 
 	// We should have received at least 2 messages: one from the
 	// maxBufSize-triggered flush and one from the explicit Flush.
@@ -2376,5 +2440,64 @@ func TestQwpSenderAtAndAtNanoConflict(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "designated timestamp type conflict") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestQwpSenderObservabilityCounters verifies the spec §20 counter
+// accessors are wired through the QwpSender interface to the
+// underlying send loop / engine / drainer pool. A fresh sender on a
+// happy-path test server should report zero on every counter both
+// before and after a successful flush, and BackgroundDrainers()
+// should be nil on a memory-backed sender (no SF, no orphan
+// adoption).
+func TestQwpSenderObservabilityCounters(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Reach the accessors through the interface to lock the public
+	// surface in place — a missing method would fail to compile.
+	var qs QwpSender = s
+
+	if got := qs.TotalReconnectAttempts(); got != 0 {
+		t.Fatalf("TotalReconnectAttempts on fresh sender = %d, want 0", got)
+	}
+	if got := qs.TotalReconnectsSucceeded(); got != 0 {
+		t.Fatalf("TotalReconnectsSucceeded on fresh sender = %d, want 0", got)
+	}
+	if got := qs.TotalFramesReplayed(); got != 0 {
+		t.Fatalf("TotalFramesReplayed on fresh sender = %d, want 0", got)
+	}
+	if got := qs.TotalBackpressureStalls(); got != 0 {
+		t.Fatalf("TotalBackpressureStalls on fresh sender = %d, want 0", got)
+	}
+	if got := qs.BackgroundDrainers(); got != nil {
+		t.Fatalf("BackgroundDrainers on memory-backed sender = %v, want nil", got)
+	}
+
+	if err := qs.Table("t").Int64Column("v", 1).AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow: %v", err)
+	}
+	if err := qs.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// A clean flush against the happy-path server must not have
+	// triggered any reconnects, replays, or backpressure stalls.
+	if got := qs.TotalReconnectAttempts(); got != 0 {
+		t.Fatalf("TotalReconnectAttempts after clean flush = %d, want 0", got)
+	}
+	if got := qs.TotalReconnectsSucceeded(); got != 0 {
+		t.Fatalf("TotalReconnectsSucceeded after clean flush = %d, want 0", got)
+	}
+	if got := qs.TotalFramesReplayed(); got != 0 {
+		t.Fatalf("TotalFramesReplayed after clean flush = %d, want 0", got)
+	}
+	if got := qs.TotalBackpressureStalls(); got != 0 {
+		t.Fatalf("TotalBackpressureStalls after clean flush = %d, want 0", got)
+	}
+	if got := qs.BackgroundDrainers(); got != nil {
+		t.Fatalf("BackgroundDrainers after clean flush = %v, want nil", got)
 	}
 }
