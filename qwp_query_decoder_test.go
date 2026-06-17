@@ -885,6 +885,95 @@ func TestQwpDecoderRoundTripFloat64Array(t *testing.T) {
 	}
 }
 
+// TestQwpDecoderRoundTripEmptyVsNullArray pins the empty-vs-NULL array
+// distinction across the wire. QuestDB stores a non-null empty array
+// (cardinality 0) of a given shape as a value distinct from a NULL
+// array: the encoder writes an empty array inline (nDims >= 1 with a
+// 0-length dimension) and a NULL via the null bitmap, and the decoder
+// must round-trip both without conflating them. Before the
+// per-dimension guard in parseArray was relaxed from "dl >= 1" to
+// "dl >= 0", decoding the empty-array rows failed outright.
+func TestQwpDecoderRoundTripEmptyVsNullArray(t *testing.T) {
+	tb := newQwpTableBuffer("t")
+	mk := func() *qwpColumnBuffer {
+		col, err := tb.getOrCreateColumn("a", qwpTypeDoubleArray, true)
+		if err != nil {
+			t.Fatalf("getOrCreateColumn: %v", err)
+		}
+		return col
+	}
+	// Row 0: regular 1x3 array.
+	mk().addDoubleArray(1, []int32{3}, []float64{1, 2, 3})
+	tb.commitRow()
+	// Row 1: empty 1D array, shape {0}.
+	mk().addDoubleArray(1, []int32{0}, nil)
+	tb.commitRow()
+	// Row 2: NULL array.
+	mk().addNull()
+	tb.commitRow()
+	// Row 3: empty 2D array, shape {2, 0} — still cardinality 0.
+	mk().addDoubleArray(2, []int32{2, 0}, nil)
+	tb.commitRow()
+
+	var enc qwpEncoder
+	frame := wrapAsResultBatch(enc.encodeTable(tb), 1, 0)
+	dec := newTestQueryDecoder()
+	var batch QwpColumnBatch
+	if err := dec.decode(frame, &batch); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Row 0: regular, non-null, [1 2 3].
+	if batch.IsNull(0, 0) {
+		t.Fatal("row 0 (regular array) must NOT be null")
+	}
+	got0, want0 := batch.Float64Array(0, 0), []float64{1, 2, 3}
+	if len(got0) != len(want0) {
+		t.Fatalf("row 0 len = %d, want %d", len(got0), len(want0))
+	}
+	for i := range want0 {
+		if got0[i] != want0[i] {
+			t.Fatalf("row 0[%d] = %v, want %v", i, got0[i], want0[i])
+		}
+	}
+
+	// Row 1: empty 1D — non-null, nDims 1, dim 0 == 0, non-nil empty slice.
+	if batch.IsNull(0, 1) {
+		t.Fatal("row 1 (empty 1D array) must NOT be null")
+	}
+	if nd := batch.ArrayNDims(0, 1); nd != 1 {
+		t.Fatalf("row 1 ArrayNDims = %d, want 1", nd)
+	}
+	if d0 := batch.ArrayDim(0, 1, 0); d0 != 0 {
+		t.Fatalf("row 1 ArrayDim(0) = %d, want 0", d0)
+	}
+	if got := batch.Float64Array(0, 1); got == nil || len(got) != 0 {
+		t.Fatalf("row 1 Float64Array = %v (nil=%t), want non-nil empty", got, got == nil)
+	}
+
+	// Row 2: NULL — IsNull true, Float64Array nil.
+	if !batch.IsNull(0, 2) {
+		t.Fatal("row 2 (NULL array) must be null")
+	}
+	if got := batch.Float64Array(0, 2); got != nil {
+		t.Fatalf("row 2 Float64Array = %v, want nil (NULL)", got)
+	}
+
+	// Row 3: empty 2D {2, 0} — non-null, nDims 2, cardinality 0.
+	if batch.IsNull(0, 3) {
+		t.Fatal("row 3 (empty 2D array) must NOT be null")
+	}
+	if nd := batch.ArrayNDims(0, 3); nd != 2 {
+		t.Fatalf("row 3 ArrayNDims = %d, want 2", nd)
+	}
+	if d0, d1 := batch.ArrayDim(0, 3, 0), batch.ArrayDim(0, 3, 1); d0 != 2 || d1 != 0 {
+		t.Fatalf("row 3 ArrayDim = %dx%d, want 2x0", d0, d1)
+	}
+	if got := batch.Float64Array(0, 3); got == nil || len(got) != 0 {
+		t.Fatalf("row 3 Float64Array = %v (nil=%t), want non-nil empty", got, got == nil)
+	}
+}
+
 func TestQwpDecoderRoundTripSymbolDelta(t *testing.T) {
 	// Batch 1 introduces three symbols; Batch 2 adds one more via a
 	// delta section. The decoder's connection-scoped dict must grow
@@ -1681,16 +1770,30 @@ func TestQwpDecoderHardening(t *testing.T) {
 		assertDecodeErrContains(t, err, "ARRAY dim")
 	})
 
-	t.Run("H27b_ArrayZeroDim", func(t *testing.T) {
-		// shape[0] = 0. A zero-extent dimension would zero out the
-		// element count and short-circuit the qwpMaxArrayElements cap
-		// for any remaining dimensions. The encoder never emits dl == 0;
-		// the decoder must reject it (matches Java's dl < 1 guard).
+	t.Run("H27b_ArrayZeroDimIsEmptyArray", func(t *testing.T) {
+		// shape[0] = 0 is a valid empty 1D array (cardinality 0), distinct
+		// from a NULL array (which the null bitmap carries). The decoder
+		// must accept it and report a non-null, zero-element row. The
+		// per-dimension guard still collapses the element-count product to
+		// 0, so the trailing padding bytes are simply left unconsumed.
 		frame := buildArrayHardeningFrame(t, 1, []int32{0})
 		dec := newTestQueryDecoder()
 		var b QwpColumnBatch
-		err := dec.decode(frame, &b)
-		assertDecodeErrContains(t, err, "ARRAY dim")
+		if err := dec.decode(frame, &b); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if b.IsNull(0, 0) {
+			t.Fatal("empty array must NOT be null")
+		}
+		if nd := b.ArrayNDims(0, 0); nd != 1 {
+			t.Fatalf("ArrayNDims = %d, want 1", nd)
+		}
+		if d0 := b.ArrayDim(0, 0, 0); d0 != 0 {
+			t.Fatalf("ArrayDim(0) = %d, want 0", d0)
+		}
+		if got := b.Float64Array(0, 0); got == nil || len(got) != 0 {
+			t.Fatalf("Float64Array = %v (nil=%t), want non-nil empty", got, got == nil)
+		}
 	})
 
 	t.Run("H28_ArrayElementCountExceeded", func(t *testing.T) {

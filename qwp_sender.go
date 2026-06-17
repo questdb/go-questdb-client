@@ -801,6 +801,13 @@ func (s *qwpLineSender) Float64Array1DColumn(name string, values []float64) Line
 		s.lastErr = err
 		return s
 	}
+	// A nil slice is a NULL array (carried in the null bitmap); a non-nil
+	// empty slice is a zero-length 1D array (shape {0}), which QuestDB
+	// stores as a distinct, non-null value.
+	if values == nil {
+		col.addNull()
+		return s
+	}
 	col.addDoubleArray(1, []int32{int32(len(values))}, values)
 	return s
 }
@@ -823,6 +830,12 @@ func (s *qwpLineSender) Float64Array2DColumn(name string, values [][]float64) Li
 		return s
 	}
 
+	// A nil slice is a NULL array; a non-nil empty slice is an empty 2D
+	// array (shape {0, 0}), stored distinct from NULL.
+	if values == nil {
+		col.addNull()
+		return s
+	}
 	if len(values) == 0 {
 		col.addDoubleArray(2, []int32{0, 0}, nil)
 		return s
@@ -863,6 +876,12 @@ func (s *qwpLineSender) Float64Array3DColumn(name string, values [][][]float64) 
 		return s
 	}
 
+	// A nil slice is a NULL array; a non-nil empty slice is an empty 3D
+	// array (shape {0, 0, 0}), stored distinct from NULL.
+	if values == nil {
+		col.addNull()
+		return s
+	}
 	if len(values) == 0 {
 		col.addDoubleArray(3, []int32{0, 0, 0}, nil)
 		return s
@@ -903,11 +922,21 @@ func (s *qwpLineSender) Float64ArrayNDColumn(name string, values *NdArray[float6
 		s.lastErr = fmt.Errorf("qwp: Float64ArrayNDColumn() called without Table()")
 		return s
 	}
-	if values == nil {
-		return s
-	}
 	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
 		s.lastErr = err
+		return s
+	}
+	// A nil NdArray is a NULL array, consistent with the typed 1D/2D/3D
+	// setters: ensure the column exists and mark this row NULL via the
+	// null bitmap. A non-nil NdArray with a zero-length dimension is a
+	// distinct, non-null empty array and flows through the normal path.
+	if values == nil {
+		col, err := s.currentTable.getOrCreateColumn(name, qwpTypeDoubleArray, true)
+		if err != nil {
+			s.lastErr = err
+			return s
+		}
+		col.addNull()
 		return s
 	}
 	shape := values.Shape()
@@ -1535,6 +1564,13 @@ func (s *qwpLineSender) Int64Array1DColumn(name string, values []int64) QwpSende
 		s.lastErr = err
 		return s
 	}
+	// A nil slice is a NULL array (carried in the null bitmap); a non-nil
+	// empty slice is a zero-length 1D array (shape {0}), which QuestDB
+	// stores as a distinct, non-null value.
+	if values == nil {
+		col.addNull()
+		return s
+	}
 	col.addLongArray(1, []int32{int32(len(values))}, values)
 	return s
 }
@@ -1557,6 +1593,12 @@ func (s *qwpLineSender) Int64Array2DColumn(name string, values [][]int64) QwpSen
 		return s
 	}
 
+	// A nil slice is a NULL array; a non-nil empty slice is an empty 2D
+	// array (shape {0, 0}), stored distinct from NULL.
+	if values == nil {
+		col.addNull()
+		return s
+	}
 	if len(values) == 0 {
 		col.addLongArray(2, []int32{0, 0}, nil)
 		return s
@@ -1597,6 +1639,12 @@ func (s *qwpLineSender) Int64Array3DColumn(name string, values [][][]int64) QwpS
 		return s
 	}
 
+	// A nil slice is a NULL array; a non-nil empty slice is an empty 3D
+	// array (shape {0, 0, 0}), stored distinct from NULL.
+	if values == nil {
+		col.addNull()
+		return s
+	}
 	if len(values) == 0 {
 		col.addLongArray(3, []int32{0, 0, 0}, nil)
 		return s

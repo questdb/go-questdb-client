@@ -116,6 +116,102 @@ func TestQwpIntegrationQuerySimpleSelect(t *testing.T) {
 	}
 }
 
+// TestQwpIntegrationEmptyAndNullArray ingests a regular, an empty, and a
+// NULL DOUBLE[] via the QWP sender, then reads them back via the QWP
+// query client — a full Go round-trip against a real QuestDB. It pins the
+// empty-vs-NULL distinction end-to-end: the sender's nil->NULL /
+// empty->empty-array encoding, the server's ingest + storage + egress of
+// an empty array (emitted inline with a 0-length dimension), and the
+// decoder's acceptance of that form. Before parseArray was relaxed from
+// dl>=1 to dl>=0, the egress decode of the empty-array row failed with
+// "ARRAY dim 0 must be >= 1: 0".
+func TestQwpIntegrationEmptyAndNullArray(t *testing.T) {
+	const tableName = "qwp_integ_empty_null_array"
+	qwpEnsureServer(t)
+	qwpDropTable(t, tableName)
+	defer qwpDropTable(t, tableName)
+
+	ctx := context.Background()
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr,
+		qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("newQwpLineSender: %v", err)
+	}
+	base := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+	// Row 0 establishes DOUBLE[] (1-D) with a regular array; row 1 is an
+	// empty array; row 2 is NULL. `i` is an order key so the read side does
+	// not depend on WAL scan order.
+	if err := s.Table(tableName).Int64Column("i", 0).
+		Float64Array1DColumn("d", []float64{1, 2}).
+		At(ctx, base); err != nil {
+		t.Fatalf("At row 0: %v", err)
+	}
+	if err := s.Table(tableName).Int64Column("i", 1).
+		Float64Array1DColumn("d", []float64{}).
+		At(ctx, base.Add(time.Second)); err != nil {
+		t.Fatalf("At row 1 (empty): %v", err)
+	}
+	if err := s.Table(tableName).Int64Column("i", 2).
+		Float64Array1DColumn("d", nil).
+		At(ctx, base.Add(2*time.Second)); err != nil {
+		t.Fatalf("At row 2 (nil): %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	_ = s.Close(ctx)
+	qwpWaitForRows(t, tableName, 3)
+
+	c := newTestQueryClient(t)
+	qctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	defer c.Close(qctx)
+
+	type rowResult struct {
+		seen   bool
+		isNull bool
+		nDims  int
+		elems  []float64
+	}
+	got := map[int64]rowResult{}
+	// Column 0 = i (order key), column 1 = d (the array).
+	q := c.Query(qctx, fmt.Sprintf("SELECT i, d FROM '%s'", tableName))
+	defer q.Close()
+	for batch, err := range q.Batches() {
+		if err != nil {
+			t.Fatalf("iter err: %v", err)
+		}
+		for r := 0; r < batch.RowCount(); r++ {
+			idx := batch.Int64(0, r)
+			rr := rowResult{seen: true, isNull: batch.IsNull(1, r)}
+			if !rr.isNull {
+				rr.nDims = batch.ArrayNDims(1, r)
+				rr.elems = batch.Float64Array(1, r)
+			}
+			got[idx] = rr
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d distinct rows, want 3: %+v", len(got), got)
+	}
+
+	// Row 0: regular 1-D array [1, 2].
+	if r0 := got[0]; r0.isNull || r0.nDims != 1 || len(r0.elems) != 2 ||
+		r0.elems[0] != 1 || r0.elems[1] != 2 {
+		t.Fatalf("row 0 (regular) = %+v, want non-null 1-D [1 2]", r0)
+	}
+	// Row 1: empty array -> non-null, 1-D, zero elements (distinct from NULL).
+	if r1 := got[1]; r1.isNull {
+		t.Fatalf("row 1 (empty array) must NOT be null: %+v", r1)
+	} else if r1.nDims != 1 || len(r1.elems) != 0 {
+		t.Fatalf("row 1 (empty) nDims=%d len=%d, want 1 and 0", r1.nDims, len(r1.elems))
+	}
+	// Row 2: NULL array.
+	if r2 := got[2]; !r2.isNull {
+		t.Fatalf("row 2 (NULL array) must be null: %+v", r2)
+	}
+}
+
 // TestQwpIntegrationQueryError runs a SELECT against a nonexistent
 // table and verifies the server's QUERY_ERROR surfaces as a
 // *QwpQueryError with a useful message.
