@@ -889,9 +889,12 @@ func (d *qwpQueryDecoder) parseGeohash(l *qwpColumnLayout) error {
 // region of the payload so accessors can address elements by
 // (row-start + offset).
 //
-// The server encodes a NULL array via the null bitmap, never inline,
-// so a non-null row must carry nDims >= 1. An inline nDims of 0 is
-// rejected as a malformed frame.
+// A NULL array is signaled by the null bitmap, never inline, so a
+// non-null row must carry nDims >= 1; an inline nDims of 0 is rejected
+// as a malformed frame. Individual dimensions may be 0, though:
+// QuestDB stores empty arrays (cardinality 0) of various shapes as
+// distinct, non-null values, so a 0-length dimension is valid and
+// yields a 0-element row.
 func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 	base := d.br.pos
 	if cap(l.arrayRowStart) < rowCount {
@@ -928,14 +931,18 @@ func (d *qwpQueryDecoder) parseArray(l *qwpColumnLayout, rowCount int) error {
 		elements := int64(1)
 		for dim := 0; dim < nDims; dim++ {
 			dl := int32(binary.LittleEndian.Uint32(shapeBytes[dim*4:]))
-			// Require dl >= 1 in every dimension. A dl of 0 would zero out
-			// elements and short-circuit the qwpMaxArrayElements cap for
-			// the remaining dimensions, letting them hold arbitrary values
-			// unchecked; the encoder never emits dl == 0. Matches
-			// QwpResultBatchDecoder.java.
-			if dl < 1 {
+			// A 0-length dimension is a valid empty array (cardinality 0),
+			// distinct from a NULL array (which the null bitmap carries).
+			// Reject only a negative length, and bound each dimension
+			// independently: a single 0 collapses the element-count product
+			// to 0, so without a per-dimension cap a 0 in one dimension
+			// would let another hold an arbitrary value the product check
+			// below could no longer catch. Matches the server's
+			// QwpArrayColumnCursor.
+			if dl < 0 || int64(dl) > qwpMaxArrayElements {
 				return newQwpDecodeError(fmt.Sprintf(
-					"ARRAY dim %d must be >= 1: %d", dim, dl))
+					"ARRAY dim %d out of range [0, %d]: %d",
+					dim, qwpMaxArrayElements, dl))
 			}
 			elements *= int64(dl)
 			if elements > qwpMaxArrayElements {

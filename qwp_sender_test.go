@@ -1016,6 +1016,55 @@ func TestQwpSenderFloat64ArrayEmpty(t *testing.T) {
 	}
 }
 
+// TestQwpSenderArrayNilIsNullEmptyIsEmpty verifies the typed array
+// setters map a nil slice to a NULL array (null bitmap, no inline data)
+// and a non-nil empty slice to a distinct, non-null empty array (inline
+// nDims + shape header, zero elements). QuestDB treats these as
+// different values, so the wire encoding must too. Float64ArrayNDColumn
+// is covered too: a nil NdArray creates the column and marks the row
+// NULL (rather than being silently dropped).
+func TestQwpSenderArrayNilIsNullEmptyIsEmpty(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	s.Table("t")
+	s.Float64Array1DColumn("dnull", nil)
+	s.Float64Array1DColumn("dempty", []float64{})
+	s.Int64Array1DColumn("lnull", nil)
+	s.Int64Array1DColumn("lempty", []int64{})
+	s.Float64ArrayNDColumn("ndnull", nil)
+	if s.lastErr != nil {
+		t.Fatalf("unexpected lastErr: %v", s.lastErr)
+	}
+
+	// nDims byte (1) + one int32 shape dimension (4) = 5 inline bytes for
+	// an empty 1D array; a NULL writes no inline array data.
+	const emptyArrayInlineLen = 5
+	check := func(name string, wantNullCount, wantArrayDataLen int) {
+		idx, ok := s.currentTable.columnIndex[name]
+		if !ok {
+			t.Fatalf("column %q not found", name)
+		}
+		col := s.currentTable.columns[idx]
+		if col.rowCount != 1 {
+			t.Fatalf("%s: rowCount = %d, want 1", name, col.rowCount)
+		}
+		if col.nullCount != wantNullCount {
+			t.Fatalf("%s: nullCount = %d, want %d", name, col.nullCount, wantNullCount)
+		}
+		if len(col.arrayData) != wantArrayDataLen {
+			t.Fatalf("%s: len(arrayData) = %d, want %d", name, len(col.arrayData), wantArrayDataLen)
+		}
+	}
+	check("dnull", 1, 0)
+	check("dempty", 0, emptyArrayInlineLen)
+	check("lnull", 1, 0)
+	check("lempty", 0, emptyArrayInlineLen)
+	check("ndnull", 1, 0)
+}
+
 func TestParseDecimalFromString(t *testing.T) {
 	tests := []struct {
 		input     string

@@ -152,12 +152,18 @@ type LineSender interface {
 
 	// Float64Array1DColumn adds an array of 64-bit floats (double array) to the ILP message.
 	//
+	// A nil values slice yields a NULL array; a non-nil empty slice yields
+	// a distinct, non-null empty array (cardinality 0).
+	//
 	// Column name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', "', '"', '\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
 	Float64Array1DColumn(name string, values []float64) LineSender
 
 	// Float64Array2DColumn adds a 2D array of 64-bit floats (double 2D array) to the ILP message.
+	//
+	// A nil values slice yields a NULL array; a non-nil empty slice yields
+	// a distinct, non-null empty array (cardinality 0).
 	//
 	// The values parameter must have a regular (rectangular) shape - all rows must have
 	// exactly the same length. If the array has irregular shape, this method returns an error.
@@ -174,6 +180,9 @@ type LineSender interface {
 	Float64Array2DColumn(name string, values [][]float64) LineSender
 
 	// Float64Array3DColumn adds a 3D array of 64-bit floats (double 3D array) to the ILP message.
+	//
+	// A nil values slice yields a NULL array; a non-nil empty slice yields
+	// a distinct, non-null empty array (cardinality 0).
 	//
 	// The values parameter must have a regular (cuboid) shape - all dimensions must have
 	// consistent sizes throughout. If the array has irregular shape, this method returns an error.
@@ -196,6 +205,9 @@ type LineSender interface {
 	Float64Array3DColumn(name string, values [][][]float64) LineSender
 
 	// Float64ArrayNDColumn adds an n-dimensional array of 64-bit floats (double n-D array) to the ILP message.
+	//
+	// A nil value yields a NULL array; a non-nil array with a zero-length
+	// dimension yields a distinct, non-null empty array (cardinality 0).
 	//
 	// Example usage:
 	//   // Create a 2x3x4 array
