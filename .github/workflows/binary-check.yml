@@ -1,0 +1,60 @@
+name: Binary check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  reject-binaries:
+    name: Reject committed executables
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for executable binaries
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            list_cmd=(git diff --name-only --diff-filter=AMRC "$base...$head")
+            scope="PR diff ($base..$head)"
+          else
+            list_cmd=(git ls-files)
+            scope="full tree"
+          fi
+          count=0
+          violations=()
+          while IFS= read -r f; do
+            count=$((count + 1))
+            [ -f "$f" ] || continue
+            mime=$(file --brief --mime-type -- "$f" 2>/dev/null || true)
+            case "$mime" in
+              *application/x-mach-binary*|\
+              *application/x-executable*|\
+              *application/x-pie-executable*|\
+              *application/x-sharedlib*|\
+              *application/x-dosexec*)
+                summary=$(printf '%s\n' "$mime" | head -n1)
+                violations+=("$f — $summary")
+                ;;
+            esac
+          done < <("${list_cmd[@]}")
+          echo "Scanned $scope: $count file(s)"
+          if [ ${#violations[@]} -gt 0 ]; then
+            echo "::error::Committed executable binaries detected:"
+            for v in "${violations[@]}"; do
+              echo "  - $v"
+            done
+            echo
+            echo "Build artifacts must not be committed. For example dirs, use"
+            echo "'go run .' (no artifact) or 'go install' with GOBIN pointing"
+            echo "at a gitignored directory."
+            exit 1
+          fi
+          echo "OK: no committed executables."

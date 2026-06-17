@@ -995,6 +995,157 @@ func TestQwpTableBufferGetOrCreateColumn(t *testing.T) {
 		}
 	})
 
+	t.Run("CaseInsensitive", func(t *testing.T) {
+		// QuestDB column names are case-insensitive throughout the
+		// server stack (LowerCaseCharSequenceIntHashMap), and Java's
+		// QwpTableBuffer also dedupes case-insensitively. Multiple
+		// case-vary'd writes across rows within one frame must
+		// resolve to the same buffer column — otherwise the server
+		// auto-creates parallel columns whose names are equal modulo
+		// case, corrupting the on-disk metadata.
+		tb := newQwpTableBuffer("t")
+
+		col1, err := tb.getOrCreateColumn("Pressure_S", qwpTypeDouble, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		col1.addDouble(1.5)
+		tb.commitRow()
+
+		col2, err := tb.getOrCreateColumn("pressure_s", qwpTypeDouble, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if col2 != col1 {
+			t.Fatal("case-vary'd name should resolve to the same column")
+		}
+		if len(tb.columns) != 1 {
+			t.Fatalf("columns len = %d, want 1 (no parallel case-vary'd column)", len(tb.columns))
+		}
+		// First-seen case wins on the wire (matches Java client).
+		if col1.name != "Pressure_S" {
+			t.Fatalf("col.name = %q, want %q (first-seen case preserved)", col1.name, "Pressure_S")
+		}
+		col2.addDouble(2.5)
+		tb.commitRow()
+
+		// Yet a duplicate within the SAME row — even case-vary'd —
+		// still trips the per-row duplicate guard.
+		col3, _ := tb.getOrCreateColumn("PRESSURE_S", qwpTypeDouble, false)
+		col3.addDouble(3.5)
+		_, err = tb.getOrCreateColumn("pressure_s", qwpTypeDouble, false)
+		if err == nil {
+			t.Fatal("expected per-row duplicate error for case-vary'd second write")
+		}
+	})
+
+	t.Run("MixedCaseCursorResync", func(t *testing.T) {
+		// After a sparse skip forces the sequential cursor off the
+		// fast path, a map hit resyncs the cursor to idx+1 so the rest
+		// of the row's columns resolve on the fast path again — even
+		// when each is written with a different ASCII casing.
+		tb := newQwpTableBuffer("t")
+		for i, n := range []string{"Aa", "Bb", "Cc", "Dd"} {
+			col, err := tb.getOrCreateColumn(n, qwpTypeLong, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			col.addLong(int64(i))
+		}
+		tb.commitRow() // cursor reset to 0
+
+		// "aA" hits the ASCII-fold fast path (cursor 0 → 1).
+		if _, err := tb.getOrCreateColumn("aA", qwpTypeLong, false); err != nil {
+			t.Fatal(err)
+		}
+		if tb.columnAccessCursor != 1 {
+			t.Fatalf("cursor = %d after fold-match on idx 0, want 1", tb.columnAccessCursor)
+		}
+		// Skip "Bb": "cC" misses the cursor (it points at Bb), resolves
+		// via the map to column 2, and resyncs the cursor to 3.
+		c, err := tb.getOrCreateColumn("cC", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c != tb.columns[2] {
+			t.Fatal("cC resolved to the wrong column")
+		}
+		if tb.columnAccessCursor != 3 {
+			t.Fatalf("cursor = %d after map hit on idx 2, want 3 (resync)", tb.columnAccessCursor)
+		}
+		// "dD" now hits the resynced fast path (cursor 3 → 4).
+		d, err := tb.getOrCreateColumn("dD", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d != tb.columns[3] {
+			t.Fatal("dD resolved to the wrong column")
+		}
+		if tb.columnAccessCursor != 4 {
+			t.Fatalf("cursor = %d after fold-match on idx 3, want 4", tb.columnAccessCursor)
+		}
+		if len(tb.columns) != 4 {
+			t.Fatalf("columns len = %d, want 4 (no parallel case-vary'd columns)", len(tb.columns))
+		}
+	})
+
+	t.Run("MixedCaseAliasClearedOnCancel", func(t *testing.T) {
+		// A casing-variant alias memoized into columnIndex maps to a
+		// column index. cancelRow must drop it when it removes the
+		// column — otherwise a later lookup dereferences a dangling
+		// index. The reset() case is the sharp edge: it retains columns
+		// but zeroes committedColumnCount, so the next cancelRow removes
+		// every column.
+		tb := newQwpTableBuffer("t")
+		c0, err := tb.getOrCreateColumn("Aa", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c0.addLong(1)
+		tb.commitRow()
+
+		// Force "aA" off the fast path so it resolves via the map and
+		// memoizes a casing-variant alias of the canonical key "aa".
+		tb.columnAccessCursor = 1
+		if _, err := tb.getOrCreateColumn("aA", qwpTypeLong, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := tb.columnIndex["aA"]; !ok {
+			t.Fatal("expected memoized alias key \"aA\"")
+		}
+
+		// reset() keeps the column but zeroes committedColumnCount, so
+		// the partial row below plus cancelRow wipes every column.
+		tb.reset()
+		nb, err := tb.getOrCreateColumn("Bb", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nb.addLong(2)
+		tb.cancelRow()
+
+		if len(tb.aliasKeys) != 0 {
+			t.Fatalf("aliasKeys = %v, want empty after wipe-cancel", tb.aliasKeys)
+		}
+		if _, ok := tb.columnIndex["aA"]; ok {
+			t.Fatal("stale alias \"aA\" survived cancelRow that wiped its column")
+		}
+		if len(tb.columns) != 0 {
+			t.Fatalf("columns len = %d, want 0 after wipe-cancel", len(tb.columns))
+		}
+
+		// Re-adding by the aliased casing must create a fresh column,
+		// not index past the emptied slice via the dropped alias.
+		re, err := tb.getOrCreateColumn("aA", qwpTypeLong, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		re.addLong(3)
+		if tb.columnIndex["aa"] != 0 || tb.columns[0] != re {
+			t.Fatal("re-added column not registered at the canonical key")
+		}
+	})
+
 	t.Run("BackfillOnCreate", func(t *testing.T) {
 		tb := newQwpTableBuffer("t")
 
@@ -1204,46 +1355,6 @@ func TestQwpTableBufferReset(t *testing.T) {
 	if tb.columns[0].rowCount != 0 {
 		t.Fatalf("col rowCount = %d, want 0", tb.columns[0].rowCount)
 	}
-}
-
-func TestQwpTableBufferSchemaId(t *testing.T) {
-	t.Run("UnassignedByDefault", func(t *testing.T) {
-		tb := newQwpTableBuffer("t")
-		if tb.schemaId != -1 {
-			t.Fatalf("new table schemaId = %d, want -1", tb.schemaId)
-		}
-	})
-
-	t.Run("InvalidatedOnNewColumn", func(t *testing.T) {
-		tb := newQwpTableBuffer("t")
-		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
-		col.addLong(1)
-		tb.commitRow()
-
-		// Sender would have assigned an ID at this point.
-		tb.schemaId = 7
-
-		if _, err := tb.getOrCreateColumn("b", qwpTypeDouble, false); err != nil {
-			t.Fatal(err)
-		}
-		if tb.schemaId != -1 {
-			t.Fatalf("schemaId = %d after column add, want -1", tb.schemaId)
-		}
-	})
-
-	t.Run("PreservedAcrossReset", func(t *testing.T) {
-		tb := newQwpTableBuffer("t")
-		col, _ := tb.getOrCreateColumn("a", qwpTypeLong, false)
-		col.addLong(1)
-		tb.commitRow()
-
-		tb.schemaId = 3
-		tb.reset()
-
-		if tb.schemaId != 3 {
-			t.Fatalf("schemaId = %d after reset, want 3 (column set unchanged)", tb.schemaId)
-		}
-	})
 }
 
 // --- array column buffer tests ---
@@ -1498,6 +1609,31 @@ func TestQwpColumnBufferArrayNull(t *testing.T) {
 		if len(c.arrayData) != 0 {
 			t.Fatalf("arrayData len = %d, want 0", len(c.arrayData))
 		}
+	})
+
+	t.Run("DoubleArrayNonNullablePanics", func(t *testing.T) {
+		// The wire format has no inline NULL sentinel for arrays, so
+		// addNull on a non-nullable array column has no valid
+		// encoding. The public API never produces this shape (array
+		// columns are always nullable), so this is purely a guard
+		// against misuse of the low-level buffer constructor.
+		c := newQwpColumnBuffer("col", qwpTypeDoubleArray, false)
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic, got none")
+			}
+		}()
+		c.addNull()
+	})
+
+	t.Run("LongArrayNonNullablePanics", func(t *testing.T) {
+		c := newQwpColumnBuffer("col", qwpTypeLongArray, false)
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic, got none")
+			}
+		}()
+		c.addNull()
 	})
 
 	t.Run("InterleavedNullAndData", func(t *testing.T) {
@@ -2065,6 +2201,93 @@ func TestQwpColumnBufferDecimalOverflow(t *testing.T) {
 		}
 		if c.rowCount != 1 {
 			t.Fatalf("rowCount = %d, want 1", c.rowCount)
+		}
+	})
+
+	// Boundary cases at exactly ±2^(8·width−1). The unscaled coefficient
+	// of +2^(8·width−1) needs one byte more than the wire width, and that
+	// extra byte is the 0x00 sign byte; without an MSB sign-bit check the
+	// truncated value silently flips sign to the most-negative int (e.g.
+	// +2^63 → MinInt64). The negative endpoints are the genuine
+	// most-negative values and must still be accepted.
+	t.Run("Decimal64PositiveBoundaryOverflows", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal64, false)
+		// 2^63 = MaxInt64 + 1; does not fit a signed 8-byte value.
+		d, err := NewDecimal(new(big.Int).Lsh(big.NewInt(1), 63), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err == nil {
+			t.Fatalf("expected overflow error for +2^63, got bytes %x", c.fixedData)
+		}
+		if c.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0 (unchanged after error)", c.rowCount)
+		}
+	})
+
+	t.Run("Decimal64NegativeBoundaryOverflows", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal64, false)
+		// -(2^63 + 1) = MinInt64 - 1; does not fit a signed 8-byte value.
+		v := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 63), big.NewInt(1))
+		d, err := NewDecimal(v.Neg(v), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err == nil {
+			t.Fatalf("expected overflow error for -(2^63+1), got bytes %x", c.fixedData)
+		}
+		if c.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0 (unchanged after error)", c.rowCount)
+		}
+	})
+
+	t.Run("Decimal64MinInt64Fits", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal64, false)
+		// -2^63 = MinInt64; the most-negative value that fits exactly.
+		d, err := NewDecimal(new(big.Int).Neg(new(big.Int).Lsh(big.NewInt(1), 63)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err != nil {
+			t.Fatalf("unexpected error for -2^63 (MinInt64): %v", err)
+		}
+		// MinInt64 little-endian: seven 0x00 bytes then 0x80.
+		expected := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80}
+		if !bytes.Equal(c.fixedData, expected) {
+			t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
+		}
+	})
+
+	t.Run("Decimal128PositiveBoundaryOverflows", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal128, false)
+		// 2^127 = MaxInt128 + 1; does not fit a signed 16-byte value.
+		d, err := NewDecimal(new(big.Int).Lsh(big.NewInt(1), 127), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err == nil {
+			t.Fatalf("expected overflow error for +2^127, got bytes %x", c.fixedData)
+		}
+		if c.rowCount != 0 {
+			t.Fatalf("rowCount = %d, want 0 (unchanged after error)", c.rowCount)
+		}
+	})
+
+	t.Run("Decimal128MinInt128Fits", func(t *testing.T) {
+		c := newQwpColumnBuffer("val", qwpTypeDecimal128, false)
+		// -2^127 = MinInt128; the most-negative value that fits exactly.
+		d, err := NewDecimal(new(big.Int).Neg(new(big.Int).Lsh(big.NewInt(1), 127)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.addDecimal(d); err != nil {
+			t.Fatalf("unexpected error for -2^127 (MinInt128): %v", err)
+		}
+		// MinInt128 little-endian: fifteen 0x00 bytes then 0x80.
+		expected := make([]byte, 16)
+		expected[15] = 0x80
+		if !bytes.Equal(c.fixedData, expected) {
+			t.Fatalf("fixedData = %x, want %x", c.fixedData, expected)
 		}
 	})
 }

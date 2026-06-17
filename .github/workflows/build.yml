@@ -2,6 +2,88 @@ name: build
 on: [push]
 
 jobs:
+  # Cross-repo trigger: fire the questdb-enterprise
+  # build-and-test-e2e-go-client pipeline with this build's SHA so
+  # the go_client-marked failover tests run against an Enterprise
+  # primary. The Enterprise pipeline posts a status check back on the
+  # PR (`enterprise-e2e-go-client` context); this job fire-and-forgets.
+  dispatch-enterprise-e2e:
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.fork }}
+    steps:
+      - name: Queue enterprise go_client e2e
+        env:
+          ENT_DISPATCH_PAT: ${{ secrets.ENT_DISPATCH_PAT }}
+          ENT_ORG_URL: ${{ secrets.ENT_ORG_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ENT_DISPATCH_PAT:-}" ] || [ -z "${ENT_ORG_URL:-}" ]; then
+            echo "ENT_DISPATCH_PAT or ENT_ORG_URL not set; skipping enterprise e2e dispatch."
+            exit 0
+          fi
+
+          PROJECT="questdb-enterprise"
+          PIPELINE_NAME="build-and-test-e2e-go-client"
+
+          echo "Looking up '${PIPELINE_NAME}' in '${PROJECT}'..."
+          PIPELINES=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
+            "${ENT_ORG_URL}${PROJECT}/_apis/pipelines?api-version=7.0")
+          PIPELINE_ID=$(echo "$PIPELINES" | jq -r --arg n "$PIPELINE_NAME" \
+            '.value[] | select(.name == $n) | .id' | head -1)
+
+          if [ -z "$PIPELINE_ID" ] || [ "$PIPELINE_ID" = "null" ]; then
+            echo "Pipeline '${PIPELINE_NAME}' not found in '${PROJECT}'; skipping."
+            exit 0
+          fi
+
+          CLIENT_BRANCH="${GITHUB_REF_NAME}"
+          CLIENT_PR_NUMBER=""
+
+          # Azure DevOps rejects empty-string template parameters with
+          # "The 'X' parameter is not a valid String." even when the
+          # pipeline YAML declares `type: string, default: ''`. Omitting
+          # the key entirely lets the YAML default kick in; the
+          # enterprise pipeline already handles empty goClientPrNumber
+          # by skipping the GitHub PR status post.
+          BODY=$(jq -n \
+            --arg commit "${GITHUB_SHA}" \
+            --arg pr "${CLIENT_PR_NUMBER}" \
+            --arg branch "${CLIENT_BRANCH}" \
+            '{
+              templateParameters: ({
+                goClientCommit: $commit,
+                goClientPrNumber: $pr,
+                clientBranch: $branch
+              } | with_entries(select(.value != ""))),
+              resources: { repositories: { self: { refName: "refs/heads/main" } } }
+            }')
+
+          echo "Dispatching enterprise e2e: commit=${GITHUB_SHA} branch=${CLIENT_BRANCH}"
+
+          # Capture status and body separately so we can surface Azure
+          # DevOps's error message on 4xx. With -fsS the body is dropped
+          # and only "curl: (22) ... error: 400" reaches the log, which
+          # is useless for diagnosing parameter / YAML mismatches.
+          RESPONSE_FILE=$(mktemp)
+          HTTP_STATUS=$(curl -sS -u ":${ENT_DISPATCH_PAT}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "$BODY" \
+            -o "$RESPONSE_FILE" \
+            -w '%{http_code}' \
+            "${ENT_ORG_URL}${PROJECT}/_apis/pipelines/${PIPELINE_ID}/runs?api-version=7.0")
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Dispatch failed with HTTP ${HTTP_STATUS}. Response body:"
+            cat "$RESPONSE_FILE"
+            echo ""
+            exit 1
+          fi
+
+          RUN_URL=$(jq -r '._links.web.href // ""' "$RESPONSE_FILE")
+          echo "Enterprise build queued: ${RUN_URL}"
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -21,10 +103,57 @@ jobs:
           cache: true
 
       - name: Run vet
+        # Pin to the matrix-installed Go. Without this, a stray
+        # `toolchain` line re-added to go.mod by `go mod tidy` on a
+        # newer box would silently switch this job off the matrix
+        # version; `local` makes that fail loudly instead.
+        env:
+          GOTOOLCHAIN: local
         run: go vet ./...
 
       - name: Run Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 
+      - name: Build bench modules
+        # bench/* are separate Go modules with their own go.mod, so
+        # the root `go vet`/`go test ./...` above never touches them.
+        # Project convention is that bench/ builds. `go mod tidy
+        # -diff` fails (with an actionable diff) on go.mod/go.sum
+        # drift — e.g. an indirect dep pulled transitively from the
+        # root via `replace => ../..` but missing from the bench
+        # go.mod; `go build ./...` then proves they compile. The loop
+        # globs bench/*/go.mod so new bench modules are auto-gated.
+        # GOTOOLCHAIN=local pins to the matrix Go (see "Run vet"); the
+        # bench go.mod `go` directive is 1.23, satisfied by both
+        # matrix versions.
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          for mod in bench/*/go.mod; do
+            dir=$(dirname "$mod")
+            echo "::group::$dir"
+            ( cd "$dir" && go mod tidy -diff && go build ./... )
+            echo "::endgroup::"
+          done
+
+      - name: Run zero-alloc invariant (non-race)
+        # The QWP hot-path 0-allocs/op pins (the Test*ZeroAllocs cases in
+        # qwp_bench_test.go) self-skip under -race: race instrumentation
+        # forces stack-allocatable values to escape and inflates
+        # allocs/op. The "Run tests" step below is -race only, so without
+        # this dedicated non-race run the headline allocation-free
+        # guarantee would never actually be exercised in CI. Cheap — a
+        # handful of testing.AllocsPerRun loops, no network or Docker.
+        # GOTOOLCHAIN=local pins to the matrix Go (see "Run vet").
+        env:
+          GOTOOLCHAIN: local
+        run: go test -run ZeroAllocs -count=1 .
+
       - name: Run tests
-        run: go test -v ./...
+        # Pin to the matrix-installed Go (see "Run vet"). The
+        # Staticcheck step deliberately omits this: staticcheck@v0.7.0
+        # needs go1.25 to build and must stay on GOTOOLCHAIN=auto.
+        env:
+          GOTOOLCHAIN: local
+        run: go test -race -v ./...

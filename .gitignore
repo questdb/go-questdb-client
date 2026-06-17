@@ -11,6 +11,28 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Go build artifacts from the `package main` dirs (each `go build`
+# produces a binary named after its directory). binary-check.yml is the
+# CI backstop; these keep `git status` clean locally.
+/bench/qwp-egress-read/qwp-egress-read
+/bench/qwp-egress-read-wide/qwp-egress-read-wide
+/examples/from-conf/from-conf
+/examples/tcp/basic/basic
+/examples/tcp/auth/auth
+/examples/tcp/auth-and-tls/auth-and-tls
+/examples/http/basic/basic
+/examples/http/auth/auth
+/examples/http/auth-and-tls/auth-and-tls
+/examples/qwp/basic/basic
+/examples/qwp/basic-query/basic-query
+/examples/qwp/sf/sf
+/system_test/enterprise_e2e/sidecar/sidecar
+
+# Python caches from the system_test/enterprise_e2e fixtures
+__pycache__/
+.pytest_cache/
+.venv/
+
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 

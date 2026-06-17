@@ -34,13 +34,13 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/exp/slices"
 )
 
 type serverType int64

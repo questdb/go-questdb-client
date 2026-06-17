@@ -26,14 +26,14 @@ package questdb
 
 import "fmt"
 
-// qwpEncoder encodes qwpTableBuffer data into QWP v1 binary messages.
+// qwpEncoder encodes qwpTableBuffer data into QWP binary messages.
 // It owns a reusable qwpWireBuffer to minimize allocations across
 // successive encode calls.
 //
 // Usage:
 //
 //	var enc qwpEncoder
-//	msg := enc.encodeTable(tb, qwpSchemaModeFull, 0)
+//	msg := enc.encodeTable(tb)
 //	// msg is valid until the next encode call.
 type qwpEncoder struct {
 	wb      qwpWireBuffer
@@ -52,13 +52,12 @@ type qwpEncoder struct {
 // slice references the encoder's internal buffer and is valid until
 // the next encode call.
 //
-// schemaId is the connection-scoped schema identifier the server
-// uses to register (full mode) or look up (reference mode) this
-// table's column set.
+// The production cursor sender never invokes this method — it goes
+// through encodeMultiTableWithDeltaDict. encodeTable is retained as a
+// single-table convenience for tests that build wire-format fixtures
+// for the egress decoder.
 //
-// Used for tests and single-table convenience; the production sender
-// batches multiple tables through encodeMultiTableWithDeltaDict. Both
-// paths set FLAG_DELTA_SYMBOL_DICT (the only symbol-encoding mode
+// It sets FLAG_DELTA_SYMBOL_DICT (the only symbol-encoding mode
 // WebSocket clients emit) and FLAG_GORILLA (timestamp columns are
 // always preceded by a 1-byte encoding flag; see QWP spec §12).
 //
@@ -66,8 +65,8 @@ type qwpEncoder struct {
 //
 //	Header (12 bytes, flags=0x0C) → empty DeltaDict →
 //	TableBlock → patched PayloadLength.
-func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaId int) []byte {
-	return e.encodeTableWithDeltaDict(tb, nil, -1, -1, schemaMode, schemaId)
+func (e *qwpEncoder) encodeTable(tb *qwpTableBuffer) []byte {
+	return e.encodeTableWithDeltaDict(tb, nil, -1, -1)
 }
 
 // encodeTableWithDeltaDict encodes a single table buffer with a
@@ -88,23 +87,13 @@ func (e *qwpEncoder) encodeTableWithDeltaDict(
 	globalDict []string,
 	maxSentId int,
 	batchMaxId int,
-	schemaMode qwpSchemaMode,
-	schemaId int,
 ) []byte {
 	e.wb.reset()
 	e.writeHeader(e.headerFlags(), 1)
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
-	e.writeTableBlock(tb, schemaMode, schemaId)
+	e.writeTableBlock(tb)
 	e.patchPayloadLength()
 	return e.wb.bytes()
-}
-
-// qwpTableEncodeInfo carries per-table encoding parameters for
-// multi-table message encoding.
-type qwpTableEncodeInfo struct {
-	tb         *qwpTableBuffer
-	schemaMode qwpSchemaMode
-	schemaId   int
 }
 
 // encodeMultiTableWithDeltaDict encodes multiple table buffers into
@@ -113,13 +102,18 @@ type qwpTableEncodeInfo struct {
 // server to process all tables from one WebSocket frame. This
 // reduces round-trips compared to one message per table.
 //
+// Every table block carries its inline column definitions —
+// cursor-architecture self-sufficient frames repeat the full schema
+// on every frame so reconnect / replay stays safe against a freshly
+// connected server.
+//
 // The message layout is:
 //
 //	Header (12 bytes, tableCount=N) → DeltaDict →
 //	TableBlock₁ → TableBlock₂ → ... → TableBlockₙ →
 //	patched PayloadLength.
 func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
-	tables []qwpTableEncodeInfo,
+	tables []*qwpTableBuffer,
 	globalDict []string,
 	maxSentId int,
 	batchMaxId int,
@@ -137,7 +131,7 @@ func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
 	e.writeHeader(e.headerFlags(), uint16(len(tables)))
 	e.writeDeltaDict(globalDict, maxSentId, batchMaxId)
 	for i := range tables {
-		e.writeTableBlock(tables[i].tb, tables[i].schemaMode, tables[i].schemaId)
+		e.writeTableBlock(tables[i])
 	}
 	e.patchPayloadLength()
 	return e.wb.bytes()
@@ -198,24 +192,19 @@ func (e *qwpEncoder) writeDeltaDict(globalDict []string, maxSentId, batchMaxId i
 
 // --- table block ---
 
-// writeTableBlock writes a single table block: table name, row/col
-// counts, schema, and column data.
+// writeTableBlock writes a single table block: table name, row and
+// column counts, the inline column schema, and the column data.
 //
-// Per QWP spec §9, the schema section starts with a mode byte
-// (0x00 = full, 0x01 = reference) followed by a varint schema_id
-// in both modes. In full mode the column definitions follow; in
-// reference mode the server looks up the schema by ID in its
-// per-connection registry.
-func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer, schemaMode qwpSchemaMode, schemaId int) {
+// Per the QWP ingress wire format the table block is table_name,
+// row_count, col_count, inline columns (a name + type-code pair per
+// column), then the per-column data. The schema is always inline —
+// the wire carries no schema mode byte and no schema id.
+func (e *qwpEncoder) writeTableBlock(tb *qwpTableBuffer) {
 	e.wb.putString(tb.tableName)
 	e.wb.putVarint(uint64(tb.rowCount))
 	e.wb.putVarint(uint64(len(tb.columns)))
 
-	e.wb.putByte(byte(schemaMode))
-	e.wb.putVarint(uint64(schemaId))
-	if schemaMode == qwpSchemaModeFull {
-		e.encodeSchemaFull(tb)
-	}
+	e.encodeSchemaFull(tb)
 
 	for _, col := range tb.columns {
 		e.encodeColumnData(col)
@@ -355,6 +344,11 @@ func (e *qwpEncoder) encodeArrayColumn(col *qwpColumnBuffer) {
 // encodeTimestampColumn writes a timestamp column's payload. The wire
 // shape depends on whether FLAG_GORILLA is set at the message level:
 //
+// Note: DATE is NOT routed here. Ingestion frames DATE as a plain
+// int64 (matching the Java QwpColumnWriter); only server *egress*
+// frames DATE timestamp-ish. The asymmetry is by protocol design —
+// see the DATE case in qwp_query_decoder.go's parseColumn.
+//
 //   - FLAG_GORILLA on (default): a 1-byte encoding flag (0x01 = Gorilla,
 //     0x00 = uncompressed) followed by the payload. Gorilla is used when
 //     the column has more than two non-null values and every DoD fits in
@@ -384,15 +378,25 @@ func (e *qwpEncoder) encodeTimestampColumn(col *qwpColumnBuffer) {
 func (e *qwpEncoder) encodeGeohashColumn(col *qwpColumnBuffer) {
 	precision := col.geohashPrecision
 	if precision <= 0 {
-		// No precision established (column has only nulls).
-		// Write precision 0, no per-row data needed beyond
-		// the null bitmap (already written).
-		e.wb.putVarint(0)
-		return
+		// No row established a precision (the column holds only nulls).
+		// The server validates precision against [1, 60]
+		// (QwpGeoHashColumnCursor.of) even for all-null columns and
+		// rejects the whole message otherwise, so emit the minimum valid
+		// precision. Mirrors the Java client's
+		// QwpColumnWriter.writeGeoHashColumn clamp.
+		precision = 1
 	}
 
 	e.wb.putVarint(uint64(precision))
 
+	// The value loop is bounded by valueCount(), not short-circuited on
+	// the clamp above: a nullable all-null column has valueCount()==0, so
+	// nothing follows the precision varint; a non-nullable column stores a
+	// sentinel per row (valueCount()==rowCount), so those bytes must still
+	// reach the wire or the column data is short. The non-nullable
+	// all-null case is unreachable through the public API — GeohashColumn
+	// establishes precision on the row that creates the column — so the
+	// clamp is defense-in-depth.
 	vc := col.valueCount()
 	valueSize := (int(precision) + 7) / 8
 	for i := 0; i < vc; i++ {
