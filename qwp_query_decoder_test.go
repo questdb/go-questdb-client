@@ -1982,10 +1982,11 @@ func buildArrayHardeningFrame(t *testing.T, nDims int, shape []int32) []byte {
 	for _, d := range shape {
 		_ = binary.Write(&buf, binary.LittleEndian, d)
 	}
-	// The decoder rejects on the shape/nDims check before reading any
-	// element bytes, so we don't need to append them for those paths.
-	// Append zero padding just to avoid a truncated-frame error
-	// masking the real one.
+	// Each caller's shape is either rejected at the shape/nDims check or
+	// accepted as a 0-element (empty) array, so the decoder consumes no
+	// element bytes. The 8 trailing bytes are slack so a short frame
+	// can't raise a truncated-frame error that masks the behavior under
+	// test.
 	buf.Write(make([]byte, 8))
 	out := buf.Bytes()
 	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))

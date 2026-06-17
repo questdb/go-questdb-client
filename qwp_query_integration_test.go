@@ -122,9 +122,8 @@ func TestQwpIntegrationQuerySimpleSelect(t *testing.T) {
 // empty-vs-NULL distinction end-to-end: the sender's nil->NULL /
 // empty->empty-array encoding, the server's ingest + storage + egress of
 // an empty array (emitted inline with a 0-length dimension), and the
-// decoder's acceptance of that form. Before parseArray was relaxed from
-// dl>=1 to dl>=0, the egress decode of the empty-array row failed with
-// "ARRAY dim 0 must be >= 1: 0".
+// decoder's acceptance of that form, which reads back as a non-null,
+// zero-element row distinct from NULL.
 func TestQwpIntegrationEmptyAndNullArray(t *testing.T) {
 	const tableName = "qwp_integ_empty_null_array"
 	qwpEnsureServer(t)

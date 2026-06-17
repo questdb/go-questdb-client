@@ -135,9 +135,9 @@ func boundsAdderFor(t *testing.T, code qwpTypeCode, r *rand.Rand) func(*qwpColum
 		}
 	case qwpTypeDoubleArray:
 		return func(c *qwpColumnBuffer, r *rand.Rand) {
-			// 1-3 elements: the Go decoder rejects a 0-length dim
-			// ("ARRAY dim 0 must be >= 1"), so a valid seed needs >= 1;
-			// the corruption/truncation passes still explore dim 0.
+			// 1-3 elements so the seed carries real element-data bytes;
+			// the corruption and truncation passes mutate those (and the
+			// shape) and still explore the 0-length-dim form.
 			n := 1 + r.Intn(3)
 			flat := make([]float64, n)
 			for i := range flat {
