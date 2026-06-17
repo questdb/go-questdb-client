@@ -475,6 +475,13 @@ func (s *qwpFuzzServer) start() error {
 		"-Dnoebug",
 		"-XX:+UnlockExperimentalVMOptions",
 		"-XX:+AlwaysPreTouch",
+		// QuestDB's worker pools reach jdk.internal.vm.ContinuationScope
+		// through io.questdb.mp.continuation.WorkerContinuation. Launched as
+		// the named module io.questdb (-m below), the server needs java.base
+		// to export jdk.internal.vm to it; without this flag every worker
+		// thread dies with IllegalAccessError and the HTTP service never
+		// comes up. QuestDB's own launcher passes it.
+		"--add-exports=java.base/jdk.internal.vm=io.questdb",
 		"-p", s.jarPath,
 		"-m", "io.questdb/io.questdb.ServerMain",
 		"-d", s.dataDir,
