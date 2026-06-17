@@ -890,29 +890,45 @@ func TestQwpDecoderRoundTripFloat64Array(t *testing.T) {
 // (cardinality 0) of a given shape as a value distinct from a NULL
 // array: the encoder writes an empty array inline (nDims >= 1 with a
 // 0-length dimension) and a NULL via the null bitmap, and the decoder
-// must round-trip both without conflating them. Before the
-// per-dimension guard in parseArray was relaxed from "dl >= 1" to
-// "dl >= 0", decoding the empty-array rows failed outright.
+// round-trips both without conflating them. A 0-length dimension is the
+// boundary the per-dimension guard in parseArray must admit.
+//
+// Two columns carry the same four row shapes: "a" is a DOUBLE_ARRAY and
+// "b" a LONG_ARRAY, exercising the shared parseArray path for both
+// element types. "a" precedes "b" in the frame, so "b" decoding
+// correctly also pins that the empty and NULL rows of "a" consumed
+// exactly their wire bytes (inter-column alignment).
 func TestQwpDecoderRoundTripEmptyVsNullArray(t *testing.T) {
 	tb := newQwpTableBuffer("t")
-	mk := func() *qwpColumnBuffer {
+	mkDouble := func() *qwpColumnBuffer {
 		col, err := tb.getOrCreateColumn("a", qwpTypeDoubleArray, true)
 		if err != nil {
-			t.Fatalf("getOrCreateColumn: %v", err)
+			t.Fatalf("getOrCreateColumn(a): %v", err)
+		}
+		return col
+	}
+	mkLong := func() *qwpColumnBuffer {
+		col, err := tb.getOrCreateColumn("b", qwpTypeLongArray, true)
+		if err != nil {
+			t.Fatalf("getOrCreateColumn(b): %v", err)
 		}
 		return col
 	}
 	// Row 0: regular 1x3 array.
-	mk().addDoubleArray(1, []int32{3}, []float64{1, 2, 3})
+	mkDouble().addDoubleArray(1, []int32{3}, []float64{1, 2, 3})
+	mkLong().addLongArray(1, []int32{3}, []int64{1, 2, 3})
 	tb.commitRow()
 	// Row 1: empty 1D array, shape {0}.
-	mk().addDoubleArray(1, []int32{0}, nil)
+	mkDouble().addDoubleArray(1, []int32{0}, nil)
+	mkLong().addLongArray(1, []int32{0}, nil)
 	tb.commitRow()
 	// Row 2: NULL array.
-	mk().addNull()
+	mkDouble().addNull()
+	mkLong().addNull()
 	tb.commitRow()
 	// Row 3: empty 2D array, shape {2, 0} — still cardinality 0.
-	mk().addDoubleArray(2, []int32{2, 0}, nil)
+	mkDouble().addDoubleArray(2, []int32{2, 0}, nil)
+	mkLong().addLongArray(2, []int32{2, 0}, nil)
 	tb.commitRow()
 
 	var enc qwpEncoder
@@ -971,6 +987,57 @@ func TestQwpDecoderRoundTripEmptyVsNullArray(t *testing.T) {
 	}
 	if got := batch.Float64Array(0, 3); got == nil || len(got) != 0 {
 		t.Fatalf("row 3 Float64Array = %v (nil=%t), want non-nil empty", got, got == nil)
+	}
+
+	// Column 1 = "b" (LONG_ARRAY): same four shapes, read via Int64Array.
+	// Row 0: regular, non-null, [1 2 3].
+	if batch.IsNull(1, 0) {
+		t.Fatal("col b row 0 (regular array) must NOT be null")
+	}
+	gotL0, wantL0 := batch.Int64Array(1, 0), []int64{1, 2, 3}
+	if len(gotL0) != len(wantL0) {
+		t.Fatalf("col b row 0 len = %d, want %d", len(gotL0), len(wantL0))
+	}
+	for i := range wantL0 {
+		if gotL0[i] != wantL0[i] {
+			t.Fatalf("col b row 0[%d] = %v, want %v", i, gotL0[i], wantL0[i])
+		}
+	}
+
+	// Row 1: empty 1D — non-null, nDims 1, dim 0 == 0, non-nil empty slice.
+	if batch.IsNull(1, 1) {
+		t.Fatal("col b row 1 (empty 1D array) must NOT be null")
+	}
+	if nd := batch.ArrayNDims(1, 1); nd != 1 {
+		t.Fatalf("col b row 1 ArrayNDims = %d, want 1", nd)
+	}
+	if d0 := batch.ArrayDim(1, 1, 0); d0 != 0 {
+		t.Fatalf("col b row 1 ArrayDim(0) = %d, want 0", d0)
+	}
+	if got := batch.Int64Array(1, 1); got == nil || len(got) != 0 {
+		t.Fatalf("col b row 1 Int64Array = %v (nil=%t), want non-nil empty", got, got == nil)
+	}
+
+	// Row 2: NULL — IsNull true, Int64Array nil.
+	if !batch.IsNull(1, 2) {
+		t.Fatal("col b row 2 (NULL array) must be null")
+	}
+	if got := batch.Int64Array(1, 2); got != nil {
+		t.Fatalf("col b row 2 Int64Array = %v, want nil (NULL)", got)
+	}
+
+	// Row 3: empty 2D {2, 0} — non-null, nDims 2, cardinality 0.
+	if batch.IsNull(1, 3) {
+		t.Fatal("col b row 3 (empty 2D array) must NOT be null")
+	}
+	if nd := batch.ArrayNDims(1, 3); nd != 2 {
+		t.Fatalf("col b row 3 ArrayNDims = %d, want 2", nd)
+	}
+	if d0, d1 := batch.ArrayDim(1, 3, 0), batch.ArrayDim(1, 3, 1); d0 != 2 || d1 != 0 {
+		t.Fatalf("col b row 3 ArrayDim = %dx%d, want 2x0", d0, d1)
+	}
+	if got := batch.Int64Array(1, 3); got == nil || len(got) != 0 {
+		t.Fatalf("col b row 3 Int64Array = %v (nil=%t), want non-nil empty", got, got == nil)
 	}
 }
 

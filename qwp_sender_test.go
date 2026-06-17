@@ -1020,7 +1020,9 @@ func TestQwpSenderFloat64ArrayEmpty(t *testing.T) {
 // setters map a nil slice to a NULL array (null bitmap, no inline data)
 // and a non-nil empty slice to a distinct, non-null empty array (inline
 // nDims + shape header, zero elements). QuestDB treats these as
-// different values, so the wire encoding must too.
+// different values, so the wire encoding must too. Float64ArrayNDColumn
+// is covered too: a nil NdArray creates the column and marks the row
+// NULL (rather than being silently dropped).
 func TestQwpSenderArrayNilIsNullEmptyIsEmpty(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
@@ -1032,6 +1034,7 @@ func TestQwpSenderArrayNilIsNullEmptyIsEmpty(t *testing.T) {
 	s.Float64Array1DColumn("dempty", []float64{})
 	s.Int64Array1DColumn("lnull", nil)
 	s.Int64Array1DColumn("lempty", []int64{})
+	s.Float64ArrayNDColumn("ndnull", nil)
 	if s.lastErr != nil {
 		t.Fatalf("unexpected lastErr: %v", s.lastErr)
 	}
@@ -1059,6 +1062,7 @@ func TestQwpSenderArrayNilIsNullEmptyIsEmpty(t *testing.T) {
 	check("dempty", 0, emptyArrayInlineLen)
 	check("lnull", 1, 0)
 	check("lempty", 0, emptyArrayInlineLen)
+	check("ndnull", 1, 0)
 }
 
 func TestParseDecimalFromString(t *testing.T) {

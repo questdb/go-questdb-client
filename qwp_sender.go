@@ -70,12 +70,21 @@ type QwpSender interface {
 	GeohashColumn(name string, hash uint64, precision int) QwpSender
 
 	// Int64Array1DColumn adds a 1-dimensional LONG array column.
+	//
+	// A nil values slice yields a NULL array; a non-nil empty slice yields
+	// a distinct, non-null empty array (cardinality 0).
 	Int64Array1DColumn(name string, values []int64) QwpSender
 
 	// Int64Array2DColumn adds a 2-dimensional LONG array column.
+	//
+	// A nil values slice yields a NULL array; a non-nil empty slice yields
+	// a distinct, non-null empty array (cardinality 0).
 	Int64Array2DColumn(name string, values [][]int64) QwpSender
 
 	// Int64Array3DColumn adds a 3-dimensional LONG array column.
+	//
+	// A nil values slice yields a NULL array; a non-nil empty slice yields
+	// a distinct, non-null empty array (cardinality 0).
 	Int64Array3DColumn(name string, values [][][]int64) QwpSender
 
 	// Decimal64Column adds a DECIMAL64 column value (8 bytes on the wire,
