@@ -581,24 +581,6 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name:   "ws with gorilla=off",
-			config: fmt.Sprintf("ws::addr=%s;gorilla=off;", addr),
-			expectedOpts: []qdb.LineSenderOption{
-				qdb.WithQwp(),
-				qdb.WithAddress(addr),
-				qdb.WithGorilla(false),
-			},
-		},
-		{
-			name:   "ws with gorilla=on",
-			config: fmt.Sprintf("ws::addr=%s;gorilla=on;", addr),
-			expectedOpts: []qdb.LineSenderOption{
-				qdb.WithQwp(),
-				qdb.WithAddress(addr),
-				qdb.WithGorilla(true),
-			},
-		},
-		{
 			name:   "ws with auth_timeout_ms",
 			config: fmt.Sprintf("ws::addr=%s;auth_timeout_ms=7000;", addr),
 			expectedOpts: []qdb.LineSenderOption{
@@ -721,11 +703,6 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			expectedErrMsgContains: "invalid auto_flush_interval",
 		},
 		{
-			name:                   "invalid gorilla value",
-			config:                 "ws::addr=localhost:1111;gorilla=maybe;",
-			expectedErrMsgContains: "not 'on' or 'off'",
-		},
-		{
 			name:                   "in_flight_window on HTTP",
 			config:                 "http::addr=localhost:1111;in_flight_window=4;",
 			expectedErrMsgContains: "unsupported option",
@@ -738,11 +715,6 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			name:                   "close_timeout rejected with migration hint",
 			config:                 "tcp::addr=localhost:1111;close_timeout=1000;",
 			expectedErrMsgContains: "close_timeout is no longer supported",
-		},
-		{
-			name:                   "gorilla on TCP",
-			config:                 "tcp::addr=localhost:1111;gorilla=off;",
-			expectedErrMsgContains: "gorilla is only supported for QWP senders",
 		},
 		{
 			name:                   "unsupported option",
@@ -976,7 +948,6 @@ func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
 		{"initial_connect_retry", qdb.WithInitialConnectRetry(true), "initial_connect_retry"},
 		{"close_flush_timeout", qdb.WithCloseFlushTimeout(5 * time.Second), "close_flush_timeout_millis"},
 		{"close_timeout_alias", qdb.WithCloseTimeout(5 * time.Second), "close_flush_timeout_millis"},
-		{"gorilla", qdb.WithGorilla(false), "gorilla"},
 		{"auth_timeout", qdb.WithAuthTimeout(5 * time.Second), "auth_timeout_ms"},
 		{"zone", qdb.WithZone("eu-west-1a"), "zone"},
 		{"target", qdb.WithTarget(qdb.QwpTargetPrimary), "target"},

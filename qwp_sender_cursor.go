@@ -303,7 +303,6 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		return nil, err
 	}
 	s.fileNameLimit = conf.fileNameLimit
-	s.encoder.gorillaDisabled = conf.gorillaDisabled
 	// Pre-size the encoder buffer for the microbatch role: the cursor
 	// engine copies each frame on append so one encoder slot suffices,
 	// but a large auto_flush_bytes warrants a bigger initial buffer to

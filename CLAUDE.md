@@ -117,15 +117,12 @@ observers, but that is incidental to their wire role.
 
 ### Java-parity QWP knobs (not in connect-string.md)
 
-These connect-string keys are recognised by the Java client
-(`Sender.java`) but are not listed in the
-[native-client spec](https://github.com/questdb/questdb-enterprise/blob/main/questdb/docs/qwp/connect-string.md).
-We accept them for Java-parity portability — a connect string that
-works on the Java client must work here. None should ever be
-considered for removal without a matching change in Java:
-
-- `gorilla=on|off` — gates the Gorilla timestamp encoding in
-  `qwp_encoder.go` (FLAG_GORILLA). Default `on`.
+There are currently no QWP connect-string keys that the Java client
+(`Sender.java`) accepts but the
+[native-client spec](https://github.com/questdb/questdb-enterprise/blob/main/questdb/docs/qwp/connect-string.md)
+omits. Any key added for Java-parity portability — a connect string
+that works on the Java client must work here — should be listed here
+and never removed without a matching change in Java.
 
 `close_timeout=N` (millisecond integer) was a v4.0–v4.5 Go-only key
 for the memory-mode close path. The cursor architecture unified

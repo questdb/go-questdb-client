@@ -372,8 +372,7 @@ type lineSenderConfig struct {
 	protocolVersion protocolVersion
 
 	// QWP-specific fields
-	dumpWriter      io.Writer // if set, record outgoing bytes (unexported)
-	gorillaDisabled bool      // false (default) = Gorilla timestamp encoding enabled
+	dumpWriter io.Writer // if set, record outgoing bytes (unexported)
 
 	// QWP store-and-forward (cursor) fields. Setting sfDir selects
 	// disk-backed segments: flushed batches are persisted to mmap'd
@@ -663,19 +662,6 @@ func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.closeFlushTimeoutSet = true
 		s.closeFlushTimeoutMillis = int(d / time.Millisecond)
-	}
-}
-
-// WithGorilla enables or disables Gorilla delta-of-delta encoding for
-// timestamp columns. Defaults to enabled. When disabled, FLAG_GORILLA
-// is cleared on every message and timestamp columns are sent as raw
-// int64 little-endian values with no encoding-flag prefix.
-//
-// Mirrors QwpWebSocketSender.setGorillaEnabled in the Java client
-// (default true there as well). Only available for the QWP sender.
-func WithGorilla(enabled bool) LineSenderOption {
-	return func(s *lineSenderConfig) {
-		s.gorillaDisabled = !enabled
 	}
 }
 
@@ -1439,8 +1425,6 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "initial_connect_retry"
 	case conf.closeFlushTimeoutSet:
 		name = "close_flush_timeout_millis"
-	case conf.gorillaDisabled:
-		name = "gorilla"
 	case conf.dumpWriter != nil:
 		name = "QWP dump writer"
 	case conf.authTimeoutMs != 0:

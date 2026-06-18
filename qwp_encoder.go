@@ -38,13 +38,6 @@ import "fmt"
 type qwpEncoder struct {
 	wb      qwpWireBuffer
 	gorilla qwpGorillaEncoder
-
-	// gorillaDisabled flips off FLAG_GORILLA in the header and skips
-	// the per-column encoding-flag byte for timestamps. Stored as the
-	// negation so the zero value (0 / false) matches the default of
-	// Gorilla being enabled. Mirrors QwpWebSocketSender's
-	// gorillaEnabled=true default in the Java client.
-	gorillaDisabled bool
 }
 
 // encodeTable encodes a single table buffer into a complete QWP
@@ -140,14 +133,9 @@ func (e *qwpEncoder) encodeMultiTableWithDeltaDict(
 // --- header and payload helpers ---
 
 // headerFlags returns the header flags byte for the current encoder
-// state. FLAG_DELTA_SYMBOL_DICT is always set; FLAG_GORILLA is
-// included unless gorillaDisabled is true.
+// state. QWP ingress always sets FLAG_DELTA_SYMBOL_DICT and FLAG_GORILLA.
 func (e *qwpEncoder) headerFlags() byte {
-	flags := qwpFlagDeltaSymbolDict
-	if !e.gorillaDisabled {
-		flags |= qwpFlagGorilla
-	}
-	return flags
+	return qwpFlagDeltaSymbolDict | qwpFlagGorilla
 }
 
 // writeHeader writes the 12-byte QWP message header with the given
@@ -341,25 +329,19 @@ func (e *qwpEncoder) encodeArrayColumn(col *qwpColumnBuffer) {
 	e.wb.putBytes(col.arrayData)
 }
 
-// encodeTimestampColumn writes a timestamp column's payload. The wire
-// shape depends on whether FLAG_GORILLA is set at the message level:
+// encodeTimestampColumn writes a timestamp column's payload. QWP ingress
+// always sets FLAG_GORILLA at the message level, so the payload is a
+// 1-byte encoding flag (0x01 = Gorilla, 0x00 = uncompressed) followed by
+// the values. Gorilla is used when the column has more than two non-null
+// values and every DoD fits in int32; all other cases fall back to raw
+// int64 LE values, matching QwpColumnWriter.writeTimestampColumn in the
+// Java client.
 //
 // Note: DATE is NOT routed here. Ingestion frames DATE as a plain
 // int64 (matching the Java QwpColumnWriter); only server *egress*
 // frames DATE timestamp-ish. The asymmetry is by protocol design —
 // see the DATE case in qwp_query_decoder.go's parseColumn.
-//
-//   - FLAG_GORILLA on (default): a 1-byte encoding flag (0x01 = Gorilla,
-//     0x00 = uncompressed) followed by the payload. Gorilla is used when
-//     the column has more than two non-null values and every DoD fits in
-//     int32. All other cases fall back to raw int64 LE values, matching
-//     QwpColumnWriter.writeTimestampColumn in the Java client.
-//   - FLAG_GORILLA off: raw int64 LE values with no encoding flag byte.
 func (e *qwpEncoder) encodeTimestampColumn(col *qwpColumnBuffer) {
-	if e.gorillaDisabled {
-		e.wb.putBytes(col.fixedData)
-		return
-	}
 	count := col.valueCount()
 	if count > 2 && qwpGorillaEncodedSize(col.fixedData, count) >= 0 {
 		e.wb.putByte(qwpTsEncodingGorilla)

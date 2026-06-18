@@ -288,18 +288,6 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			// going through the generic "unsupported option" path.
 			return nil, NewInvalidConfigStrError(
 				"close_timeout is no longer supported; use close_flush_timeout_millis instead")
-		case "gorilla":
-			if senderConf.senderType != qwpSenderType {
-				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
-			}
-			switch v {
-			case "on":
-				senderConf.gorillaDisabled = false
-			case "off":
-				senderConf.gorillaDisabled = true
-			default:
-				return nil, NewInvalidConfigStrError("invalid gorilla value, %q is not 'on' or 'off'", v)
-			}
 		case "sf_dir":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
