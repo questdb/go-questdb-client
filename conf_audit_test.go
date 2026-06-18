@@ -366,6 +366,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"auto_flush_interval=100",
 		"auto_flush_rows=1000",
 		"close_flush_timeout_millis=5000",
+		"connection_listener_inbox_capacity=64",
 		"drain_orphans=off",
 		"durable_ack_keepalive_interval_millis=200",
 		"error_inbox_capacity=256",
@@ -390,6 +391,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"sf_durability=memory",
 		"sf_max_bytes=4m",
 		"sf_max_total_bytes=10g",
+		"transaction=on",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
@@ -604,6 +606,156 @@ func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
 	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
 		t.Errorf("WithCloseTimeout(1ms): set=%v millis=%d; want set=true millis=1",
 			c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
+	}
+}
+
+// TestConfQwpIngressAcceptsExtraIngressKeys pins that the ingress-only
+// QWP keys the Java client (Sender.java) accepts but the doc Key index
+// omits — transaction, connection_listener_inbox_capacity — parse on the
+// QWP ingress sender. This client implements neither feature, so they are
+// validated no-ops; accepting them is what lets a connect string shared
+// with a transaction-aware client still load here. The UDP-only keys
+// max_datagram_size / multicast_ttl are excluded: QWP rejects them (see
+// TestConfQwpRejectsUdpKeys).
+func TestConfQwpIngressAcceptsExtraIngressKeys(t *testing.T) {
+	kvs := []string{
+		"transaction=on",
+		"transaction=off",
+		"connection_listener_inbox_capacity=64",
+	}
+	for _, kv := range kvs {
+		t.Run(kv, func(t *testing.T) {
+			conf := "ws::addr=localhost:9000;" + kv + ";"
+			if _, err := confFromStr(conf); err != nil {
+				t.Errorf("QWP ingress rejected %q: %v", kv, err)
+			}
+		})
+	}
+}
+
+// TestConfQwpRejectsUdpKeys pins that the UDP-only ingress keys
+// max_datagram_size / multicast_ttl are rejected on the QWP path by
+// BOTH clients. The unified config API drives the QWP WebSocket
+// transport, where UDP datagram knobs never apply, so a ws:: / wss::
+// connect string carrying them is surfaced as malformed -- mirroring the
+// protocol_version / retry_timeout rejects. The error names the offending
+// key and explains the UDP-only scope.
+func TestConfQwpRejectsUdpKeys(t *testing.T) {
+	for _, k := range []string{"max_datagram_size", "multicast_ttl"} {
+		kv := k + "=1400"
+		for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+			t.Run("ingress/"+schema+"/"+k, func(t *testing.T) {
+				_, err := confFromStr(schema + "::addr=localhost:9000;" + kv + ";")
+				if err == nil {
+					t.Fatalf("QWP ingress must reject %q on %s::", kv, schema)
+				}
+				msg := err.Error()
+				if !strings.Contains(msg, k) {
+					t.Errorf("error %q does not name %s", msg, k)
+				}
+				if !strings.Contains(msg, "UDP") {
+					t.Errorf("error %q does not explain the UDP-only scope", msg)
+				}
+			})
+		}
+		t.Run("egress/"+k, func(t *testing.T) {
+			if _, err := parseQwpQueryConf("ws::addr=localhost:9000;" + kv + ";"); err == nil {
+				t.Fatalf("QWP egress must reject %q", kv)
+			}
+		})
+	}
+}
+
+// TestConfUdpKeysAcceptedOnHttpAndTcp pins that the rejection is
+// QWP-scoped: on the legacy ILP transports this client has no UDP path
+// either, so max_datagram_size / multicast_ttl stay inert validated
+// no-ops -- a valid value parses, and a malformed one still errors via
+// the shape check.
+func TestConfUdpKeysAcceptedOnHttpAndTcp(t *testing.T) {
+	for _, schema := range []string{"http", "https", "tcp", "tcps"} {
+		for _, kv := range []string{"max_datagram_size=1400", "multicast_ttl=1"} {
+			t.Run("accept/"+schema+"/"+kv, func(t *testing.T) {
+				if _, err := confFromStr(schema + "::addr=localhost:9000;" + kv + ";"); err != nil {
+					t.Errorf("%s:: must accept %q: %v", schema, kv, err)
+				}
+			})
+		}
+		t.Run("rejectMalformed/"+schema, func(t *testing.T) {
+			if _, err := confFromStr(schema + "::addr=localhost:9000;max_datagram_size=abc;"); err == nil {
+				t.Errorf("%s:: must reject a non-int max_datagram_size", schema)
+			}
+		})
+	}
+}
+
+// TestConfTransactionRejectedOnHttpAndTcp pins the Java gating
+// (Sender.java: "transaction is only supported for WebSocket
+// transport"). transaction and connection_listener_inbox_capacity are
+// WebSocket-only ingress keys; the legacy ILP transports never carry
+// them, so the parser rejects them there.
+func TestConfTransactionRejectedOnHttpAndTcp(t *testing.T) {
+	for _, kv := range []string{"transaction=on", "connection_listener_inbox_capacity=64"} {
+		for _, schema := range []string{"http", "tcp"} {
+			t.Run(schema+"/"+kv, func(t *testing.T) {
+				_, err := confFromStr(schema + "::addr=localhost:9000;" + kv + ";")
+				if err == nil {
+					t.Fatalf("%s:: must reject %q", schema, kv)
+				}
+				if !strings.Contains(err.Error(), "only supported for QWP") {
+					t.Errorf("error %q does not explain the QWP-only gating", err.Error())
+				}
+			})
+		}
+	}
+}
+
+// TestConfQwpRejectsTokenXY pins that the TCP ILP public-key auth keys
+// token_x / token_y are rejected on the QWP path by BOTH clients. They
+// are absent from the QWP connect-string vocabulary; the egress parser
+// already rejected them, and the ingress parser now matches so the two
+// QWP clients treat a shared string symmetrically. The legacy ILP
+// transports still accept (and ignore) them — covered by the TCP case
+// in conf_test.go.
+func TestConfQwpRejectsTokenXY(t *testing.T) {
+	for _, kv := range []string{"token_x=xyz", "token_y=xyz"} {
+		t.Run("ingress/"+kv, func(t *testing.T) {
+			if _, err := confFromStr("ws::addr=localhost:9000;" + kv + ";"); err == nil {
+				t.Fatalf("QWP ingress must reject %q", kv)
+			}
+		})
+		t.Run("egress/"+kv, func(t *testing.T) {
+			if _, err := parseQwpQueryConf("ws::addr=localhost:9000;" + kv + ";"); err == nil {
+				t.Fatalf("QWP egress must reject %q", kv)
+			}
+		})
+	}
+	// The same keys remain accepted (and ignored) on the legacy ILP tcp:: schema.
+	if _, err := confFromStr("tcp::addr=localhost:9000;username=u;token=t;token_x=xyz;token_y=xyz;"); err != nil {
+		t.Errorf("tcp:: must still accept token_x/token_y: %v", err)
+	}
+}
+
+// TestConfUserPassAliases pins user / pass as the deprecated aliases of
+// username / password (Sender.java). The ingress parser interprets them
+// as credentials; the egress parser silently ignores them (matching
+// QwpQueryClient.fromConfig, which interprets only username / password),
+// so a connect string carrying the aliases loads on both sides.
+func TestConfUserPassAliases(t *testing.T) {
+	conf := "ws::addr=localhost:9000;user=alice;pass=secret;"
+
+	c, err := confFromStr(conf)
+	if err != nil {
+		t.Fatalf("ingress rejected user/pass aliases: %v", err)
+	}
+	if c.httpUser != "alice" {
+		t.Errorf("httpUser=%q, want %q", c.httpUser, "alice")
+	}
+	if c.httpPass != "secret" {
+		t.Errorf("httpPass=%q, want %q", c.httpPass, "secret")
+	}
+
+	if _, err := parseQwpQueryConf(conf); err != nil {
+		t.Errorf("egress rejected user/pass aliases: %v", err)
 	}
 }
 
