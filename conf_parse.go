@@ -48,6 +48,7 @@ type configData struct {
 // only.
 var egressOnlyKeys = map[string]bool{
 	"buffer_pool_size":            true,
+	"client_id":                   true,
 	"compression":                 true,
 	"compression_level":           true,
 	"failover":                    true,
@@ -57,6 +58,9 @@ var egressOnlyKeys = map[string]bool{
 	"failover_max_duration_ms":    true,
 	"initial_credit":              true,
 	"max_batch_rows":              true,
+	"path":                        true,
+	"replay_exec":                 true,
+	"server_info_timeout_ms":      true,
 }
 
 // ingressOnlyKeys lists connect-string keys defined by the spec for

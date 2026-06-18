@@ -37,7 +37,7 @@ import (
 // transport selection as the short forms.
 func TestConfQwpwsAlias(t *testing.T) {
 	cases := []struct {
-		schema string
+		schema  string
 		wantTLS tlsMode
 	}{
 		{"ws", tlsDisabled},
@@ -131,12 +131,12 @@ func TestConfSizeSuffix(t *testing.T) {
 func TestConfSizeSuffixRejected(t *testing.T) {
 	cases := []string{
 		"",
-		"k",       // suffix without a number
-		"abc",     // non-numeric
-		"1.5m",    // floats not supported
-		"-1",      // negative bare
-		"-1m",     // negative with suffix
-		"1xb",     // unknown suffix
+		"k",            // suffix without a number
+		"abc",          // non-numeric
+		"1.5m",         // floats not supported
+		"-1",           // negative bare
+		"-1m",          // negative with suffix
+		"1xb",          // unknown suffix
 		"1024kb extra", // trailing garbage
 	}
 	for _, in := range cases {
@@ -318,6 +318,7 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 	// interpret them, so even invalid values must pass.
 	kvs := []string{
 		"buffer_pool_size=8",
+		"client_id=dashboard",
 		"compression=zstd",
 		"compression_level=22",
 		"failover=off",
@@ -327,6 +328,9 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 		"failover_max_duration_ms=60000",
 		"initial_credit=262144",
 		"max_batch_rows=10000",
+		"path=/read/v2",
+		"replay_exec=on",
+		"server_info_timeout_ms=750",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
