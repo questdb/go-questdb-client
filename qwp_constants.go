@@ -273,13 +273,6 @@ const (
 	// Both fire even when the user opted out of byte-size auto-flush.
 	qwpDefaultAutoFlushBytes = 8 * 1024 * 1024
 
-	// qwpDefaultInFlightWindow seeds in_flight_window for Java-parity
-	// config compatibility. The cursor architecture ignores it —
-	// backpressure is governed by the engine's segment ring and append
-	// deadline (see WithInFlightWindow). Java:
-	// QwpWebSocketSender.DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128.
-	qwpDefaultInFlightWindow = 128
-
 	// qwpDefaultMicrobatchBufSize is the per-encoder microbatch buffer
 	// size used to coalesce rows before a WebSocket frame is sent.
 	// Java: QwpWebSocketSender.DEFAULT_MICROBATCH_BUFFER_SIZE = 1 MB.

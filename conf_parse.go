@@ -278,15 +278,6 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				}
 				senderConf.protocolVersion = pVersion
 			}
-		case "in_flight_window":
-			if senderConf.senderType != qwpSenderType {
-				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
-			}
-			parsedVal, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
-			}
-			senderConf.inFlightWindow = parsedVal
 		case "close_timeout":
 			// Java client never accepted close_timeout — only
 			// close_flush_timeout_millis (Sender.java §3071). The

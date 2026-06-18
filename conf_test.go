@@ -257,17 +257,6 @@ func TestParserHappyCases(t *testing.T) {
 			},
 		},
 		{
-			name:   "ws with in_flight_window",
-			config: fmt.Sprintf("ws::addr=%s;in_flight_window=4;", addr),
-			expected: qdb.ConfigData{
-				Schema: "ws",
-				KeyValuePairs: map[string]string{
-					"addr":              addr,
-					"in_flight_window": "4",
-				},
-			},
-		},
-		{
 			// failover.md §1: `addr=h1;addr=h2` is an alternative
 			// spelling of `addr=h1,h2`. The parser MUST accumulate
 			// both forms into a single comma-joined value.
@@ -559,15 +548,6 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name:   "ws with in_flight_window",
-			config: fmt.Sprintf("ws::addr=%s;in_flight_window=4;", addr),
-			expectedOpts: []qdb.LineSenderOption{
-				qdb.WithQwp(),
-				qdb.WithAddress(addr),
-				qdb.WithInFlightWindow(4),
-			},
-		},
-		{
 			// retry_timeout is intentionally NOT paired with ws here: the
 			// parser maps it to WithRetryTimeout for any schema, but the
 			// QWP sanitizer rejects it (see TestQwpSanitizeRejectsRetryTimeout),
@@ -748,7 +728,7 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 		{
 			name:                   "in_flight_window on HTTP",
 			config:                 "http::addr=localhost:1111;in_flight_window=4;",
-			expectedErrMsgContains: "in_flight_window is only supported for QWP senders",
+			expectedErrMsgContains: "unsupported option",
 		},
 		{
 			// close_timeout was a Go-only legacy key; the Java client
@@ -997,7 +977,6 @@ func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
 		{"close_flush_timeout", qdb.WithCloseFlushTimeout(5 * time.Second), "close_flush_timeout_millis"},
 		{"close_timeout_alias", qdb.WithCloseTimeout(5 * time.Second), "close_flush_timeout_millis"},
 		{"gorilla", qdb.WithGorilla(false), "gorilla"},
-		{"in_flight_window", qdb.WithInFlightWindow(8), "in_flight_window"},
 		{"auth_timeout", qdb.WithAuthTimeout(5 * time.Second), "auth_timeout_ms"},
 		{"zone", qdb.WithZone("eu-west-1a"), "zone"},
 		{"target", qdb.WithTarget(qdb.QwpTargetPrimary), "target"},

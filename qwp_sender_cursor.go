@@ -98,7 +98,6 @@ func newQwpCursorLineSender(
 		autoFlushInterval: autoFlushInterval,
 		autoFlushBytes:    autoFlushBytes,
 		maxBufSize:        maxBufSize,
-		inFlightWindow:    1,
 		closeTimeout:      closeFlushTimeout,
 		cursorEngine:      cursorEngine,
 		cursorSendLoop:    cursorSendLoop,

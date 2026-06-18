@@ -175,9 +175,9 @@ governed by the engine's segment ring and the append deadline
 (`sf_append_deadline_millis` in store-and-forward mode), not by a
 fixed in-flight count.
 
-`in_flight_window` / `qdb.WithInFlightWindow(n)` is **retained for
-backward compatibility but is a no-op** in this architecture. Connect
-strings carrying it still parse; the value is ignored.
+There is no in-flight-window knob: the cursor architecture governs
+backpressure on its own, so connect strings have no pipeline-depth key
+and an unrecognized one is rejected as an unsupported option.
 
 `Flush` and `FlushAndGetSequence` **never wait for the server ACK**.
 They return once the batch is published into the cursor engine — in

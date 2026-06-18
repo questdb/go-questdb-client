@@ -115,10 +115,6 @@ cross-flush high-water mark that `resetAfterFlush` rewinds `batchMaxSymbolId` to
 full dict its rows reference. Both are also read by tests and external
 observers, but that is incidental to their wire role.
 
-`WithInFlightWindow(n)` / `in_flight_window=n` is **retained but a no-op** in
-the cursor architecture — backpressure is governed by the engine's segment-ring
-+ `engineAppendBlocking` deadline.
-
 ### Java-parity QWP knobs (not in connect-string.md)
 
 These connect-string keys are recognised by the Java client
@@ -130,7 +126,6 @@ considered for removal without a matching change in Java:
 
 - `gorilla=on|off` — gates the Gorilla timestamp encoding in
   `qwp_encoder.go` (FLAG_GORILLA). Default `on`.
-- `in_flight_window=N` — see the "retained but a no-op" note above.
 
 `close_timeout=N` (millisecond integer) was a v4.0–v4.5 Go-only key
 for the memory-mode close path. The cursor architecture unified

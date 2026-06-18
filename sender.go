@@ -372,7 +372,6 @@ type lineSenderConfig struct {
 	protocolVersion protocolVersion
 
 	// QWP-specific fields
-	inFlightWindow  int       // retained for config compatibility; a no-op in the cursor architecture (see WithInFlightWindow). Seeded to qwpDefaultInFlightWindow by newLineSenderConfig
 	dumpWriter      io.Writer // if set, record outgoing bytes (unexported)
 	gorillaDisabled bool      // false (default) = Gorilla timestamp encoding enabled
 
@@ -436,24 +435,6 @@ func WithTcp() LineSenderOption {
 func WithQwp() LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.senderType = qwpSenderType
-	}
-}
-
-// WithInFlightWindow is retained for backward compatibility but is a
-// no-op. In the QWP cursor architecture, backpressure is governed by
-// the engine's segment ring and the append deadline, not by a fixed
-// in-flight batch count. Flush never waits for the server ACK, so
-// there is no synchronous mode to opt into. Connect strings carrying
-// in_flight_window still parse; the value is ignored.
-//
-// Only available for the QWP sender.
-//
-// Deprecated: the in-flight window has no effect and there is no
-// replacement — backpressure is automatic. To confirm server ACKs,
-// pair FlushAndGetSequence with AwaitAckedFsn.
-func WithInFlightWindow(window int) LineSenderOption {
-	return func(s *lineSenderConfig) {
-		s.inFlightWindow = window
 	}
 }
 
@@ -1161,7 +1142,6 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			autoFlushRows:     qwpDefaultAutoFlushRows,
 			autoFlushInterval: qwpDefaultAutoFlushInterval,
 			autoFlushBytes:    qwpDefaultAutoFlushBytes,
-			inFlightWindow:    qwpDefaultInFlightWindow,
 			initBufSize:       defaultInitBufferSize,
 			maxBufSize:        defaultMaxBufferSize,
 			fileNameLimit:     defaultFileNameLimit,
@@ -1283,9 +1263,6 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	// QWP auth: either Basic (user+pass) or Bearer (token), not both.
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
 		return errors.New("both basic and token authentication cannot be used")
-	}
-	if conf.inFlightWindow < 0 {
-		return fmt.Errorf("in-flight window is negative: %d", conf.inFlightWindow)
 	}
 	if conf.protocolVersion != protocolVersionUnset {
 		return errors.New("protocol_version setting is not available in the QWP client")
@@ -1466,8 +1443,6 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "gorilla"
 	case conf.dumpWriter != nil:
 		name = "QWP dump writer"
-	case conf.inFlightWindow != 0:
-		name = "in_flight_window"
 	case conf.authTimeoutMs != 0:
 		name = "auth_timeout_ms"
 	case conf.zone != "":
