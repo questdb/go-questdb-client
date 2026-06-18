@@ -47,16 +47,12 @@ type qwpQueryClientConfig struct {
 	// endpointPath is the HTTP path used for the WebSocket upgrade.
 	// Default "/read/v1".
 	endpointPath string
-	// authorization, when non-empty, is sent verbatim as the
-	// Authorization HTTP header. Mutually exclusive with user/pass and
-	// token.
-	authorization string
 	// httpUser / httpPass populate an HTTP Basic Authorization header
-	// at connect time. Mutually exclusive with authorization and token.
+	// at connect time. Mutually exclusive with token.
 	httpUser string
 	httpPass string
 	// httpToken populates a Bearer Authorization header at connect
-	// time. Mutually exclusive with authorization and user/pass.
+	// time. Mutually exclusive with user/pass.
 	httpToken string
 	// clientID overrides the default X-QWP-Client-Id header. Empty
 	// uses the module default (qwpClientId).
@@ -286,18 +282,8 @@ func (c *qwpQueryClientConfig) validate() error {
 			c.compressionLevel)
 	}
 	basicSet := c.httpUser != "" || c.httpPass != ""
-	authModes := 0
-	if c.authorization != "" {
-		authModes++
-	}
-	if basicSet {
-		authModes++
-	}
-	if c.httpToken != "" {
-		authModes++
-	}
-	if authModes > 1 {
-		return fmt.Errorf("qwp query: auth, username/password, and token are mutually exclusive")
+	if basicSet && c.httpToken != "" {
+		return fmt.Errorf("qwp query: username/password and token are mutually exclusive")
 	}
 	if basicSet && (c.httpUser == "" || c.httpPass == "") {
 		return fmt.Errorf("qwp query: both username and password must be provided together")
@@ -438,8 +424,6 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 			cfg.endpoints = eps
 		case "path":
 			cfg.endpointPath = v
-		case "auth":
-			cfg.authorization = v
 		case "username":
 			cfg.httpUser = v
 		case "password":

@@ -280,13 +280,6 @@ func WithQwpQueryEndpointPath(path string) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.endpointPath = path }
 }
 
-// WithQwpQueryAuth sets the raw Authorization HTTP header value sent
-// on the WebSocket upgrade. Mutually exclusive with
-// WithQwpQueryBasicAuth and WithQwpQueryBearerToken.
-func WithQwpQueryAuth(authHeader string) QwpQueryClientOption {
-	return func(c *qwpQueryClientConfig) { c.authorization = authHeader }
-}
-
 // WithQwpQueryBasicAuth enables HTTP Basic authentication. The server
 // validates against the same user store that the Postgres wire
 // protocol uses — a user created via CREATE USER ... WITH PASSWORD ...
@@ -715,12 +708,9 @@ func probeZstdAvailable() error {
 }
 
 // effectiveAuthorization computes the Authorization header value
-// from the config, resolving the three mutually-exclusive auth modes
+// from the config, resolving the two mutually-exclusive auth modes
 // into a single header string.
 func (c *qwpQueryClientConfig) effectiveAuthorization() string {
-	if c.authorization != "" {
-		return c.authorization
-	}
 	if c.httpUser != "" && c.httpPass != "" {
 		creds := c.httpUser + ":" + c.httpPass
 		return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
