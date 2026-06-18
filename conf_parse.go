@@ -271,6 +271,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		case "tls_roots_password":
 			return nil, NewInvalidConfigStrError("tls_roots_password is not available in the go client")
 		case "protocol_version":
+			if senderConf.senderType == qwpSenderType {
+				// protocol_version is not part of the QWP connect-string
+				// vocabulary -- the version is negotiated at the WebSocket
+				// upgrade. Reject any value (including "auto") so a ws:: string
+				// carrying it is surfaced as malformed, matching the egress
+				// QwpQueryClient and the other language clients.
+				return nil, NewInvalidConfigStrError(
+					"protocol_version is not supported for QWP; the protocol version is negotiated during the WebSocket upgrade")
+			}
 			if v != "auto" {
 				version, err := strconv.Atoi(v)
 				if err != nil {

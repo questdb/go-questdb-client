@@ -466,6 +466,68 @@ func TestConfQwpRejectsWithRetryTimeoutOption(t *testing.T) {
 	}
 }
 
+// TestConfQwpIngressRejectsNonQwpKeys pins that the legacy ILP HTTP keys
+// absent from the QWP connect-string vocabulary (connect-string.md Key
+// index) are rejected by the QWP ingress sender. retry_timeout has its own
+// dedicated test above (with the migration-hint assertion); this covers
+// request_timeout, request_min_throughput, and a concrete protocol_version.
+func TestConfQwpIngressRejectsNonQwpKeys(t *testing.T) {
+	keys := []string{
+		"request_timeout=10000",
+		"request_min_throughput=102400",
+		"protocol_version=2",
+		"protocol_version=auto",
+	}
+	for _, kv := range keys {
+		t.Run(kv, func(t *testing.T) {
+			_, err := LineSenderFromConf(context.Background(),
+				"ws::addr=localhost:9000;"+kv+";")
+			if err == nil {
+				t.Fatalf("expected error: %q must not be accepted on QWP ingress", kv)
+			}
+		})
+	}
+}
+
+// TestConfQwpIngressAcceptsNonQwpKeysOnHttp proves the rejection is
+// schema-scoped: the same keys remain valid on the legacy ILP http:: schema.
+func TestConfQwpIngressAcceptsNonQwpKeysOnHttp(t *testing.T) {
+	keys := []string{
+		"request_timeout=10000",
+		"request_min_throughput=102400",
+		"retry_timeout=10000",
+		"protocol_version=2",
+		"protocol_version=auto",
+	}
+	for _, kv := range keys {
+		t.Run(kv, func(t *testing.T) {
+			if _, err := confFromStr("http::addr=localhost:9000;" + kv + ";"); err != nil {
+				t.Fatalf("http:: must accept %q: %v", kv, err)
+			}
+		})
+	}
+}
+
+// TestConfQwpEgressRejectsNonQwpKeys is the egress side: the QwpQueryClient
+// parser rejects the same legacy ILP keys. Unlike the ingress, the egress has
+// no protocol_version=auto pass-through, so even that value is rejected.
+func TestConfQwpEgressRejectsNonQwpKeys(t *testing.T) {
+	keys := []string{
+		"request_timeout=10000",
+		"request_min_throughput=102400",
+		"retry_timeout=10000",
+		"protocol_version=2",
+		"protocol_version=auto",
+	}
+	for _, kv := range keys {
+		t.Run(kv, func(t *testing.T) {
+			if _, err := parseQwpQueryConf("ws::addr=localhost:9000;" + kv + ";"); err == nil {
+				t.Fatalf("expected error: %q must not be accepted on QWP egress", kv)
+			}
+		})
+	}
+}
+
 // TestConfRejectsCloseTimeoutWithMigrationHint pins the removal of
 // the Go-only `close_timeout` key. Java never accepted it (only
 // close_flush_timeout_millis, Sender.java §3071), and the cursor
