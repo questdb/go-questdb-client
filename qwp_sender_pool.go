@@ -161,8 +161,12 @@ func newQwpSenderPool(
 }
 
 // recoverStrandedSlots scans <sfDir>/<base>-<i> for i in [0,maxSize) and binds
-// an async sender to each that holds unacked data but no live owner. Caller
-// holds no lock; runs single-threaded at construction.
+// an async sender to each that holds unacked data but no live owner.
+//
+// Construction-only: like createSlot, the sole caller is newQwpSenderPool,
+// single-threaded before the pool is published, so the direct slotInUse writes
+// and the createSlotAt index bookkeeping here run WITHOUT p.mu. Do not call this
+// off the construction path.
 func (p *qwpSenderPool) recoverStrandedSlots(ctx context.Context) {
 	for i := 0; i < p.maxSize; i++ {
 		if p.slotInUse[i] {
@@ -208,7 +212,7 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			// and break borrower isolation precisely during incident recovery, so
 			// discard it and look for another (M1).
 			if slotTerminallyFailed(slot.delegate) {
-				p.discardLocked(ctx, slot) // releases p.mu
+				p.discardLocked(slot) // releases p.mu
 				p.mu.Lock()
 				continue
 			}
@@ -287,7 +291,7 @@ func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broke
 		return
 	}
 	if broken {
-		p.discardLocked(ctx, ps.slot)
+		p.discardLocked(ps.slot)
 		return // discardLocked unlocks
 	}
 	ps.slot.idleSince = time.Now()
@@ -327,14 +331,18 @@ func closeSlotGuarded(ctx context.Context, delegate LineSender) (err error) {
 }
 
 // discardLocked evicts a broken slot from `all` and closes its delegate outside
-// the lock. Caller holds mu; discardLocked releases it.
-func (p *qwpSenderPool) discardLocked(ctx context.Context, slot *qwpSenderSlot) {
+// the lock. Caller holds mu; discardLocked releases it. The delegate is closed
+// with context.Background(): discarding a broken slot is incidental teardown
+// that a cancelled caller ctx must not cut short, matching reapIdle and the
+// borrow closed-race close site (the discarded slot is terminally failed, so
+// its drain returns immediately regardless).
+func (p *qwpSenderPool) discardLocked(slot *qwpSenderSlot) {
 	p.removeFromAllLocked(slot)
 	if p.storeAndForward && slot.slotIndex >= 0 {
 		p.closingSlots++
 	}
 	p.mu.Unlock()
-	closeErr := closeSlotGuarded(ctx, slot.delegate)
+	closeErr := closeSlotGuarded(context.Background(), slot.delegate)
 	p.mu.Lock()
 	p.reclaimSlotLocked(slot, closeErr)
 	p.broadcastLocked()
@@ -422,8 +430,14 @@ func (p *qwpSenderPool) close(ctx context.Context) error {
 	return firstErr
 }
 
-// createSlot allocates an SF slot index (under the lock) when needed and builds
-// a slot. Used by prewarm, where the caller is single-threaded.
+// createSlot allocates an SF slot index when needed and builds a slot.
+//
+// Construction-only: the sole caller is newQwpSenderPool's prewarm loop, which
+// runs single-threaded before the pool is published, so the *Locked index
+// helpers below are invoked WITHOUT holding p.mu. Do not call createSlot off the
+// construction path — once the pool is shared, allocateSlotIndexLocked /
+// freeSlotIndexLocked must run under p.mu (as borrow does) or they race the
+// slotInUse bitmap.
 func (p *qwpSenderPool) createSlot(ctx context.Context, async bool) (*qwpSenderSlot, error) {
 	slotIndex := -1
 	if p.storeAndForward {
@@ -874,7 +888,9 @@ func (ps *qwpPooledSender) AtNano(ctx context.Context, ts time.Time) error {
 // FlushAndGetSequence mirrors Flush, additionally returning the published FSN.
 func (ps *qwpPooledSender) FlushAndGetSequence(ctx context.Context) (int64, error) {
 	if !ps.live() {
-		return 0, errStaleLease
+		// -1 is the no-FSN sentinel the live sender returns on a failed flush and
+		// AckedFsn reports on a dead lease; keep the stale path consistent.
+		return -1, errStaleLease
 	}
 	fsn, err := ps.slot.delegate.FlushAndGetSequence(ctx)
 	if err != nil {

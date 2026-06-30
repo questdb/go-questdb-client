@@ -308,6 +308,23 @@ func TestQwpSenderLeaseStaleAtFlush(t *testing.T) {
 	if err := s.Flush(ctx); !errors.Is(err, errStaleLease) {
 		t.Errorf("stale Flush=%v, want errStaleLease", err)
 	}
+	// FlushAndGetSequence on a stale lease must return the same -1 no-FSN
+	// sentinel the live sender returns on a failed flush and AckedFsn reports on
+	// a dead lease — not a bare 0, which collides with a valid FSN.
+	qs, ok := s.(QwpSender)
+	if !ok {
+		t.Fatalf("pooled lease %T does not implement QwpSender", s)
+	}
+	fsn, err := qs.FlushAndGetSequence(ctx)
+	if !errors.Is(err, errStaleLease) {
+		t.Errorf("stale FlushAndGetSequence err=%v, want errStaleLease", err)
+	}
+	if fsn != -1 {
+		t.Errorf("stale FlushAndGetSequence fsn=%d, want -1", fsn)
+	}
+	if got := qs.AckedFsn(); got != -1 {
+		t.Errorf("stale AckedFsn=%d, want -1", got)
+	}
 }
 
 func TestQwpSenderPoolBorrowCreateError(t *testing.T) {

@@ -541,12 +541,13 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			// 0 is the "use the default capacity" sentinel, resolved at
 			// construction (qwpSfDefaultErrorInboxCapacity), matching the
-			// WithErrorInboxCapacity option path. Any other sub-floor value
-			// is a user-supplied undersized inbox and is rejected.
-			if parsedVal != 0 && parsedVal < qwpSfMinErrorInboxCapacity {
+			// WithErrorInboxCapacity option path. Any other out-of-range value
+			// is rejected: a sub-floor inbox is undersized, and an over-ceiling
+			// one would panic make(chan) at construction.
+			if parsedVal != 0 && (parsedVal < qwpSfMinErrorInboxCapacity || parsedVal > qwpSfMaxErrorInboxCapacity) {
 				return nil, NewInvalidConfigStrError(
-					"invalid %s value, %d: must be >= %d",
-					k, parsedVal, qwpSfMinErrorInboxCapacity)
+					"invalid %s value, %d: must be in [%d, %d]",
+					k, parsedVal, qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity)
 			}
 			senderConf.errorInboxCapacity = parsedVal
 		case "connection_listener_inbox_capacity":
@@ -557,12 +558,13 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
 			}
-			// 0 is the "use the default capacity" sentinel; any other sub-floor
-			// value is a user-supplied undersized inbox and is rejected.
-			if parsedVal != 0 && parsedVal < qwpSfMinErrorInboxCapacity {
+			// 0 is the "use the default capacity" sentinel; any other out-of-range
+			// value is rejected (sub-floor undersized, over-ceiling would panic
+			// make(chan) at construction).
+			if parsedVal != 0 && (parsedVal < qwpSfMinErrorInboxCapacity || parsedVal > qwpSfMaxErrorInboxCapacity) {
 				return nil, NewInvalidConfigStrError(
-					"invalid %s value, %d: must be >= %d",
-					k, parsedVal, qwpSfMinErrorInboxCapacity)
+					"invalid %s value, %d: must be in [%d, %d]",
+					k, parsedVal, qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity)
 			}
 			senderConf.connectionListenerInboxCapacity = parsedVal
 		case "request_durable_ack":

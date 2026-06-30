@@ -42,6 +42,12 @@ const qwpSfDefaultErrorInboxCapacity = 256
 // capacities by the connect-string sanitizer per the spec.
 const qwpSfMinErrorInboxCapacity = 16
 
+// qwpSfMaxErrorInboxCapacity is the ceiling enforced on user-supplied
+// capacities. Without it a pathological value (e.g. 1<<60) reaches
+// make(chan, capacity) and panics "makechan: size out of range"; an inbox
+// this deep is already far beyond any real backpressure need.
+const qwpSfMaxErrorInboxCapacity = 1 << 20
+
 // qwpSfDispatcherDrainTimeout is the maximum time close() waits for
 // the dispatcher loop to finish draining queued errors before giving
 // up and abandoning anything still in the inbox.

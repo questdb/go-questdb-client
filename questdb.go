@@ -330,6 +330,14 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // teardown step is panic-guarded so a fault in one cannot skip the others — the
 // sender pool (which owns the flocks/mmaps/I/O goroutines) is closed last and
 // always runs.
+//
+// Avoid calling Close from inside a pooled SenderErrorHandler or
+// SenderConnectionListener. Pooled callbacks are funnelled through one
+// serializing mutex (see serializeErrorHandler), so a Close that blocks on a
+// sibling dispatcher mid-delivery head-of-lines the others until each is
+// abandoned at its join timeout (~100ms apiece). It is bounded — no deadlock or
+// panic — but Close may stall. Hand the close off to a separate goroutine
+// instead.
 func (db *QuestDB) Close(ctx context.Context) error {
 	db.closeOnce.Do(func() {
 		hErr := closeStep(func() error { db.housekeeper.stopAndJoin(); return nil })

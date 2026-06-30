@@ -35,6 +35,7 @@ package main
 import (
 	"context"
 	"log"
+	"time"
 
 	qdb "github.com/questdb/go-questdb-client/v4"
 )
@@ -50,21 +51,33 @@ func main() {
 	defer db.Close(ctx)
 
 	// Ingest: borrow a sender, write rows, Close to return it to the pool.
+	// BorrowSender hands back the LineSender interface. Type-assert it to
+	// QwpSender to reach the QWP-only surface — the full type system plus
+	// AtNano for a nanosecond-resolution designated timestamp.
 	sender, err := db.BorrowSender(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := sender.
+	qwpSender, ok := sender.(qdb.QwpSender)
+	if !ok {
+		log.Fatal("a facade lease is always a QwpSender")
+	}
+	// Build the row with the fluent API, then close it with AtNano — the
+	// nanosecond-resolution designated timestamp only QwpSender exposes (the
+	// QWP-only typed columns Int32Column/UuidColumn/arrays/decimals live here
+	// too). The inherited fluent methods return LineSender, so call AtNano on
+	// the QwpSender handle rather than chaining it.
+	qwpSender.
 		Table("trades").
 		Symbol("symbol", "ETH-USD").
-		Float64Column("price", 2615.54).
-		AtNow(ctx); err != nil {
+		Float64Column("price", 2615.54)
+	if err := qwpSender.AtNano(ctx, time.Now()); err != nil {
 		log.Fatal(err)
 	}
-	if err := sender.Flush(ctx); err != nil {
+	if err := qwpSender.Flush(ctx); err != nil {
 		log.Fatal(err)
 	}
-	if err := sender.Close(ctx); err != nil {
+	if err := qwpSender.Close(ctx); err != nil {
 		log.Fatal(err)
 	}
 

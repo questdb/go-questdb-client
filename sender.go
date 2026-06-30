@@ -1454,17 +1454,22 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 		return fmt.Errorf("max_background_drainers must be >= 0: %d", conf.maxBackgroundDrainers)
 	}
 	// Server-error API knobs (Phase 5). User-supplied
-	// errorInboxCapacity must be ≥ qwpSfMinErrorInboxCapacity (16);
-	// 0 falls back to the default at construction.
-	if conf.errorInboxCapacity != 0 && conf.errorInboxCapacity < qwpSfMinErrorInboxCapacity {
-		return fmt.Errorf("error_inbox_capacity must be >= %d: %d",
-			qwpSfMinErrorInboxCapacity, conf.errorInboxCapacity)
+	// errorInboxCapacity must be in [qwpSfMinErrorInboxCapacity (16),
+	// qwpSfMaxErrorInboxCapacity]; 0 falls back to the default at construction.
+	// The ceiling guards make(chan, capacity) from a "makechan: size out of
+	// range" panic on a pathological value.
+	if conf.errorInboxCapacity != 0 && (conf.errorInboxCapacity < qwpSfMinErrorInboxCapacity ||
+		conf.errorInboxCapacity > qwpSfMaxErrorInboxCapacity) {
+		return fmt.Errorf("error_inbox_capacity must be in [%d, %d]: %d",
+			qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity, conf.errorInboxCapacity)
 	}
-	// Same floor for the connection listener inbox; the connect-string parser
-	// enforces it but WithConnectionListenerInboxCapacity reaches here directly.
-	if conf.connectionListenerInboxCapacity != 0 && conf.connectionListenerInboxCapacity < qwpSfMinErrorInboxCapacity {
-		return fmt.Errorf("connection_listener_inbox_capacity must be >= %d: %d",
-			qwpSfMinErrorInboxCapacity, conf.connectionListenerInboxCapacity)
+	// Same bounds for the connection listener inbox; the connect-string parser
+	// enforces the floor but WithConnectionListenerInboxCapacity reaches here
+	// directly.
+	if conf.connectionListenerInboxCapacity != 0 && (conf.connectionListenerInboxCapacity < qwpSfMinErrorInboxCapacity ||
+		conf.connectionListenerInboxCapacity > qwpSfMaxErrorInboxCapacity) {
+		return fmt.Errorf("connection_listener_inbox_capacity must be in [%d, %d]: %d",
+			qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity, conf.connectionListenerInboxCapacity)
 	}
 
 	return nil
