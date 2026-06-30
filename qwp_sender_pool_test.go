@@ -27,13 +27,71 @@ package questdb
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
+
+// poisonFirstConnQwpServer accepts WS upgrades. The first connection — the
+// pool's prewarmed slot — is held idle and then closed with a terminal
+// protocol-violation code when the returned poison func is called, simulating a
+// background HALT of a slot with no lease watching. Every later connection (a
+// replacement slot) is served normally so a re-borrowed slot is healthy.
+func poisonFirstConnQwpServer(t *testing.T) (*httptest.Server, func()) {
+	t.Helper()
+	poison := make(chan struct{})
+	var conns atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if conns.Add(1) == 1 {
+			// First (prewarm) connection: the client's receiver is reading, so a
+			// terminal close lands as a PROTOCOL_VIOLATION HALT even while idle.
+			select {
+			case <-poison:
+				_ = conn.Close(websocket.StatusProtocolError, "poisoned")
+			case <-r.Context().Done():
+			}
+			return
+		}
+		var seq int64
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			_ = conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+		}
+	}))
+	var once sync.Once
+	return srv, func() { once.Do(func() { close(poison) }) }
+}
+
+// awaitSlotPoisoned blocks until the slot's background send loop latches a
+// terminal error, failing the test if it never does.
+func awaitSlotPoisoned(t *testing.T, slot *qwpSenderSlot) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !slotTerminallyFailed(slot.delegate) {
+		if time.Now().After(deadline) {
+			t.Fatal("slot never latched a terminal error")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
 
 func newQwpSenderPoolForTest(t *testing.T, extra string, min, max int) *qwpSenderPool {
 	t.Helper()
@@ -208,19 +266,114 @@ func TestQwpSenderPoolPrewarmFailure(t *testing.T) {
 	}
 }
 
-func TestQwpSenderPoolAtErrorMarksBroken(t *testing.T) {
+// TestQwpSenderPoolBenignErrorDoesNotBreakSlot covers M4: a benign fluent-API
+// validation latch (illegal table name) must NOT mark the slot broken. The
+// underlying connection is healthy, so the borrower recovers on the same slot
+// and the slot is recycled on return rather than torn down — discarding it would
+// churn the pool on a stream with sporadic bad records.
+func TestQwpSenderPoolBenignErrorDoesNotBreakSlot(t *testing.T) {
 	p := senderPoolWithIdle(t, "", 1, 2, 0)
 	ctx := context.Background()
 	s, err := p.borrow(ctx)
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
+	// A bad table name surfaces a validation error...
 	if err := s.Table("bad\tname").Int64Column("v", 1).At(ctx, time.Now()); err == nil {
-		t.Skip("validation did not reject the bad name in this build")
+		t.Fatal("expected the illegal table name to be rejected")
 	}
-	_ = s.Close(ctx)
-	if _, avail, _ := p.poolSnapshot(); avail != 0 {
-		t.Errorf("slot broken via At was recycled (available=%d, want 0)", avail)
+	ps := s.(*qwpPooledSender)
+	if ps.broken {
+		t.Fatal("benign validation error marked the slot broken")
+	}
+	// ...and the borrower recovers on the same slot with a good row.
+	if err := s.Table("good").Int64Column("v", 1).At(ctx, time.Now()); err != nil {
+		t.Fatalf("good row after bad did not recover: %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("flush after recovery: %v", err)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Healthy slot recycled, not discarded.
+	if total, avail, _ := p.poolSnapshot(); total != 1 || avail != 1 {
+		t.Errorf("recycled slot accounting: total=%d avail=%d, want 1/1", total, avail)
+	}
+}
+
+// TestQwpSenderPoolDiscardsBackgroundHaltedSlot covers M1: a slot whose
+// background send loop terminally HALTs while it sits idle in the pool must not
+// be handed to the next borrower. borrow discards it and builds a fresh slot, so
+// borrower isolation holds even during incident recovery.
+func TestQwpSenderPoolDiscardsBackgroundHaltedSlot(t *testing.T) {
+	srv, poison := poisonFirstConnQwpServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+
+	// One prewarmed slot sitting idle in available.
+	if total, avail, _ := p.poolSnapshot(); total != 1 || avail != 1 {
+		t.Fatalf("prewarm: total=%d avail=%d, want 1/1", total, avail)
+	}
+	p.mu.Lock()
+	poisoned := p.available[0]
+	p.mu.Unlock()
+
+	// Poison it via a background protocol-violation close — no lease watching.
+	poison()
+	awaitSlotPoisoned(t, poisoned)
+
+	// Borrow must not hand out the poisoned slot.
+	s, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	ps := s.(*qwpPooledSender)
+	if ps.slot == poisoned {
+		t.Fatal("borrow handed out the poisoned slot")
+	}
+	if slotTerminallyFailed(ps.slot.delegate) {
+		t.Fatal("borrowed replacement slot is itself poisoned")
+	}
+	// The replacement actually works against a fresh connection.
+	if err := s.Table("t").Int64Column("v", 1).At(context.Background(), time.Unix(0, 1000)); err != nil {
+		t.Fatalf("At on replacement: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush on replacement: %v", err)
+	}
+}
+
+// TestQwpSenderPoolReapsBackgroundHaltedSlot covers M1's reapIdle arm: a slot
+// poisoned by a background HALT is reaped even when the pool is at minSize, so
+// the housekeeper clears poisoned slots proactively rather than leaving every
+// borrow to discard one.
+func TestQwpSenderPoolReapsBackgroundHaltedSlot(t *testing.T) {
+	srv, poison := poisonFirstConnQwpServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	// idle_timeout and max_lifetime off + min=1: only the poison check can reap.
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+
+	p.mu.Lock()
+	poisoned := p.available[0]
+	p.mu.Unlock()
+	poison()
+	awaitSlotPoisoned(t, poisoned)
+
+	p.reapIdle()
+	if total, avail, _ := p.poolSnapshot(); total != 0 || avail != 0 {
+		t.Errorf("poisoned slot not reaped at minSize: total=%d avail=%d, want 0/0", total, avail)
 	}
 }
 
@@ -263,23 +416,51 @@ func TestQwpSenderPoolFlushSurfacesLatchedError(t *testing.T) {
 	}
 	defer s.Close(ctx)
 	s.Table("bad\tname").Int64Column("v", 1)
+	// The latched fluent-API validation error must surface on the next Flush.
+	// A require.Error-style guard (not t.Skip) so a validation regression fails
+	// loudly instead of silently skipping (M8).
 	if err := s.Flush(ctx); err == nil {
-		t.Skip("validation did not reject the bad name in this build")
+		t.Fatal("Flush did not surface the latched illegal-table-name error")
+	}
+	// The benign latch must not have poisoned the slot (M4).
+	if s.(*qwpPooledSender).broken {
+		t.Error("a surfaced validation latch marked the slot broken")
 	}
 }
 
-// TestQwpSenderPoolSfBrokenSlotReclaimed covers discardLocked's SF branch: a
-// broken SF lease has its on-disk slot index reclaimed (not leaked) and reused.
+// TestQwpSenderPoolSfBrokenSlotReclaimed covers discardLocked's SF branch via
+// the giveBack-broken path: a lease broken by a genuine terminal HALT has its
+// on-disk slot index reclaimed (not leaked) and reused. The break must be a real
+// terminal error now that a benign validation latch no longer marks the slot
+// broken (M4).
 func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
-	p := senderPoolWithIdle(t, "sf_dir="+t.TempDir()+";", 1, 2, 0)
+	srv, poison := poisonFirstConnQwpServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";sf_dir=" + t.TempDir() + ";"
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+
 	ctx := context.Background()
 	s, err := p.borrow(ctx)
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
-	if err := s.Table("bad\tname").Int64Column("v", 1).AtNow(ctx); err == nil {
-		t.Skip("validation did not reject the bad name in this build")
+	ps := s.(*qwpPooledSender)
+
+	// HALT the borrowed slot's connection, then a producer call observes the
+	// terminal error and marks the lease broken.
+	poison()
+	awaitSlotPoisoned(t, ps.slot)
+	if err := s.Flush(ctx); err == nil {
+		t.Fatal("expected a terminal error after the HALT")
 	}
+	if !ps.broken {
+		t.Fatal("terminal HALT did not mark the slot broken")
+	}
+
 	_ = s.Close(ctx) // broken → discardLocked reclaims the SF slot index
 	if _, _, leaked := p.poolSnapshot(); leaked != 0 {
 		t.Errorf("broken SF slot leaked: %d", leaked)

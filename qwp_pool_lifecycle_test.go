@@ -167,18 +167,34 @@ func TestQwpSenderPoolSfStrandedSlotRecovered(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolBrokenSlotDiscarded pins the broken-slot path: a lease whose
-// write latched an error is discarded on Close, not recycled.
+// TestQwpSenderPoolBrokenSlotDiscarded pins the broken-slot path: a lease broken
+// by a genuine terminal HALT is discarded on Close, not recycled. A benign
+// validation latch no longer breaks the slot (M4), so the break is driven by a
+// real protocol-violation close here.
 func TestQwpSenderPoolBrokenSlotDiscarded(t *testing.T) {
-	p := senderPoolWithIdle(t, "", 1, 2, 0)
+	srv, poison := poisonFirstConnQwpServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+
 	ctx := context.Background()
 	s, err := p.borrow(ctx)
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
-	// An invalid table name latches an error surfaced by AtNow → lease broken.
-	if err := s.Table("bad\tname").Int64Column("v", 1).AtNow(ctx); err == nil {
-		t.Skip("validation did not reject the bad name in this build")
+	ps := s.(*qwpPooledSender)
+	poison()
+	awaitSlotPoisoned(t, ps.slot)
+	// A producer call observes the terminal error and marks the lease broken.
+	if err := s.Flush(ctx); err == nil {
+		t.Fatal("expected a terminal error after the HALT")
+	}
+	if !ps.broken {
+		t.Fatal("terminal HALT did not mark the slot broken")
 	}
 	_ = s.Close(ctx)
 	if _, avail, _ := p.poolSnapshot(); avail != 0 {

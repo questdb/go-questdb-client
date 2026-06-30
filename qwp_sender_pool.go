@@ -200,6 +200,18 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 		if n := len(p.available); n > 0 {
 			slot := p.available[n-1]
 			p.available = p.available[:n-1]
+			// A slot's background send loop keeps running while it sits idle and
+			// can terminally HALT with no lease watching (reconnect-budget
+			// exhaustion after a long outage, PROTOCOL_VIOLATION close, AUTH_FAILED
+			// on reconnect, incompatible-server strike). Handing such a poisoned
+			// slot to the next borrower would fail it through no fault of its own
+			// and break borrower isolation precisely during incident recovery, so
+			// discard it and look for another (M1).
+			if slotTerminallyFailed(slot.delegate) {
+				p.discardLocked(ctx, slot) // releases p.mu
+				p.mu.Lock()
+				continue
+			}
 			gen := slot.generation.Add(1)
 			p.mu.Unlock()
 			return &qwpPooledSender{pool: p, slot: slot, gen: gen}, nil
@@ -281,6 +293,22 @@ func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broke
 	p.mu.Unlock()
 }
 
+// terminalReporter lets the pool detect a delegate whose background send loop
+// has terminally HALTed without growing the public QwpSender interface. Every
+// pooled delegate is a *qwpLineSender, which implements it.
+type terminalReporter interface {
+	terminallyFailed() bool
+}
+
+// slotTerminallyFailed reports whether a slot's delegate has latched a terminal
+// error (a background HALT). A poisoned slot must never be handed to a borrower
+// (M1) nor recycled after a producer error (M4) — it is discarded and rebuilt
+// instead. Mirrors the Query lease's client.terminalError() check.
+func slotTerminallyFailed(delegate QwpSender) bool {
+	tr, ok := delegate.(terminalReporter)
+	return ok && tr.terminallyFailed()
+}
+
 // closeSlotGuarded closes a delegate, converting a panic into an error so a
 // faulting Close cannot strand the pool's SF slot accounting (closingSlots /
 // slotInUse) or skip sibling teardowns. qwpLineSender.Close is itself panic-
@@ -324,10 +352,15 @@ func (p *qwpSenderPool) reapIdle() {
 	for _, slot := range p.available {
 		idleExpired := p.idleTimeout > 0 && now.Sub(slot.idleSince) >= p.idleTimeout
 		overAge := p.maxLifetime > 0 && now.Sub(slot.createdAt) >= p.maxLifetime
+		// A slot poisoned by a background HALT is useless to a borrower, so reap
+		// it even at minSize (borrow re-creates a fresh slot on demand). This
+		// proactively clears poisoned slots so a wave of borrowers does not have
+		// to discard them one by one during incident recovery (M1).
+		poisoned := slotTerminallyFailed(slot.delegate)
 		// removeFromAllLocked already shrinks p.all, so test it directly — do
 		// not also subtract len(toClose) or the reaped count is counted twice
 		// and the pool under-reaps to ~min+excess/2 per tick.
-		if (idleExpired || overAge) && len(p.all) > p.minSize {
+		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
 			p.removeFromAllLocked(slot)
 			if p.storeAndForward && slot.slotIndex >= 0 {
 				p.closingSlots++
@@ -656,12 +689,26 @@ func (ps *qwpPooledSender) Float64ArrayNDColumn(name string, values *NdArray[flo
 	return ps
 }
 
+// markBrokenIfTerminal evicts the slot only when the delegate's background send
+// loop has terminally HALTed, mirroring the Query lease (which evicts on
+// client.terminalError(), not on every producer error). A benign fluent-API
+// latch (illegal column/table name, At without a preceding Table) or a
+// ctx-bounded flush timeout leaves a perfectly healthy connection, so it must be
+// recycled, not discarded — discarding would tear down (and, in SF mode,
+// re-flock/re-mmap) a warm slot on ordinary malformed input, churning the pool
+// on a stream with sporadic bad records (M4).
+func (ps *qwpPooledSender) markBrokenIfTerminal() {
+	if slotTerminallyFailed(ps.slot.delegate) {
+		ps.broken = true
+	}
+}
+
 func (ps *qwpPooledSender) At(ctx context.Context, ts time.Time) error {
 	if !ps.live() {
 		return errStaleLease
 	}
 	if err := ps.slot.delegate.At(ctx, ts); err != nil {
-		ps.broken = true
+		ps.markBrokenIfTerminal()
 		return err
 	}
 	return nil
@@ -672,7 +719,7 @@ func (ps *qwpPooledSender) AtNow(ctx context.Context) error {
 		return errStaleLease
 	}
 	if err := ps.slot.delegate.AtNow(ctx); err != nil {
-		ps.broken = true
+		ps.markBrokenIfTerminal()
 		return err
 	}
 	return nil
@@ -683,7 +730,7 @@ func (ps *qwpPooledSender) Flush(ctx context.Context) error {
 		return errStaleLease
 	}
 	if err := ps.slot.delegate.Flush(ctx); err != nil {
-		ps.broken = true
+		ps.markBrokenIfTerminal()
 		return err
 	}
 	return nil
@@ -805,13 +852,14 @@ func (ps *qwpPooledSender) Decimal256Column(name string, val Decimal) QwpSender 
 }
 
 // AtNano closes the current row with a nanosecond designated timestamp. Like At,
-// a delegate error marks the slot broken so Close discards rather than recycles it.
+// a terminal delegate error marks the slot broken so Close discards rather than
+// recycles it; a benign latch leaves the slot reusable.
 func (ps *qwpPooledSender) AtNano(ctx context.Context, ts time.Time) error {
 	if !ps.live() {
 		return errStaleLease
 	}
 	if err := ps.slot.delegate.AtNano(ctx, ts); err != nil {
-		ps.broken = true
+		ps.markBrokenIfTerminal()
 		return err
 	}
 	return nil
@@ -824,7 +872,7 @@ func (ps *qwpPooledSender) FlushAndGetSequence(ctx context.Context) (int64, erro
 	}
 	fsn, err := ps.slot.delegate.FlushAndGetSequence(ctx)
 	if err != nil {
-		ps.broken = true
+		ps.markBrokenIfTerminal()
 		return fsn, err
 	}
 	return fsn, nil

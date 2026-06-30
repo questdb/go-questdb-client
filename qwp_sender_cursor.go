@@ -956,6 +956,19 @@ func (s *qwpLineSender) LastTerminalError() *SenderError {
 	return s.cursorSendLoop.sendLoopLastTerminalServerError()
 }
 
+// terminallyFailed reports whether the background send loop has latched a
+// terminal error and exited. Unlike LastTerminalError (typed server HALTs only)
+// this also covers the untyped transport/segment-fault paths (recordFatal), so
+// it is the complete "this connection is poisoned" signal — the qwpLineSender
+// analogue of QwpQueryClient.terminalError. It never reports true during a
+// normal transient reconnect: lastError is latched only on the loop's terminal
+// exit and is never cleared. The pool uses it to discard a slot poisoned by a
+// background HALT instead of leaking it to the next borrower (M1) or recycling
+// it after a benign producer error (M4).
+func (s *qwpLineSender) terminallyFailed() bool {
+	return s.cursorSendLoop != nil && s.cursorSendLoop.sendLoopCheckError() != nil
+}
+
 // TotalServerErrors implements QwpSender.TotalServerErrors.
 func (s *qwpLineSender) TotalServerErrors() int64 {
 	if s.cursorSendLoop == nil {
