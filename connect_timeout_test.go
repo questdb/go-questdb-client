@@ -26,7 +26,11 @@ package questdb
 
 import (
 	"context"
+	"errors"
+	"net"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -155,5 +159,60 @@ func TestConnectTimeoutHttpUsesPrivateTransport(t *testing.T) {
 	}
 	if v2.globalTransport != nil {
 		t.Error("a connect_timeout HTTP sender must use a private transport, not the shared global")
+	}
+}
+
+// TestConnectTimeoutHttpCustomTransportNotMutated covers the http_sender.go
+// guard (`&& conf.httpTransport == nil`): a caller-supplied transport is owned by
+// the caller, so connect_timeout must NOT overwrite its DialContext even when set
+// — doing so would silently replace the caller's custom dialer. We prove the
+// custom DialContext survives by invoking it after construction: the sentinel
+// fires only if the field was left intact (a net.Dialer would have replaced it).
+func TestConnectTimeoutHttpCustomTransportNotMutated(t *testing.T) {
+	var dialed atomic.Bool
+	sentinel := errors.New("sentinel dialer")
+	custom := newHttpTransport()
+	custom.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		dialed.Store(true)
+		return nil, sentinel
+	}
+
+	// protocol_version=2 skips the version-detect request, so no network is
+	// touched at build time. httpTransport != nil + connect_timeout set is the
+	// guarded path.
+	c, err := confFromStr("http::addr=192.0.2.1:9009;protocol_version=2;connect_timeout=500;")
+	if err != nil {
+		t.Fatalf("conf: %v", err)
+	}
+	c.httpTransport = custom
+
+	ls, err := newHttpLineSender(context.Background(), c)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	defer ls.Close(context.Background())
+
+	v2, ok := ls.(*httpLineSenderV2)
+	if !ok {
+		t.Fatalf("unexpected sender type %T", ls)
+	}
+	tr, ok := v2.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want *http.Transport", v2.client.Transport)
+	}
+	if tr != custom {
+		t.Fatal("sender did not use the caller-supplied custom transport")
+	}
+	// The sender must not own (and later close) a caller-supplied transport.
+	if v2.ownedTransport != nil {
+		t.Error("a caller-supplied transport must not be adopted as ownedTransport")
+	}
+	// Invoke the transport's dialer: it must still be the caller's sentinel, not a
+	// connect_timeout net.Dialer that replaced it.
+	if _, err := tr.DialContext(context.Background(), "tcp", "127.0.0.1:9"); !errors.Is(err, sentinel) {
+		t.Errorf("DialContext err=%v, want sentinel — connect_timeout overwrote the custom dialer", err)
+	}
+	if !dialed.Load() {
+		t.Error("custom DialContext was not invoked — connect_timeout replaced it")
 	}
 }

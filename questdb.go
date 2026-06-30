@@ -328,19 +328,27 @@ func (db *QuestDB) Close(ctx context.Context) error {
 		hErr := closeStep(func() error { db.housekeeper.stopAndJoin(); return nil })
 		qErr := closeStep(func() error { return db.queryPool.close(ctx) })
 		sErr := closeStep(func() error { return db.senderPool.close(ctx) })
-		// Every step ran; surface the most actionable error, preferring
-		// the sender pool (owns flocks/I/O) over the query pool over the
-		// housekeeper so a recovered panic in any step is not lost.
-		switch {
-		case sErr != nil:
-			db.closeErr = sErr
-		case qErr != nil:
-			db.closeErr = qErr
-		case hErr != nil:
-			db.closeErr = hErr
-		}
+		// Every step ran; surface the most actionable error.
+		db.closeErr = firstCloseErr(sErr, qErr, hErr)
 	})
 	return db.closeErr
+}
+
+// firstCloseErr selects the most actionable teardown error, preferring the
+// sender pool (owns flocks/I/O) over the query pool over the housekeeper so a
+// recovered panic in any step is not lost. Returns nil only when every step
+// succeeded.
+func firstCloseErr(sErr, qErr, hErr error) error {
+	switch {
+	case sErr != nil:
+		return sErr
+	case qErr != nil:
+		return qErr
+	case hErr != nil:
+		return hErr
+	default:
+		return nil
+	}
 }
 
 // closeStep runs one teardown step, converting a panic into an error so a

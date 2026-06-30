@@ -26,9 +26,11 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -383,5 +385,70 @@ func TestNewQuestDBResolveErrors(t *testing.T) {
 func TestCloseStepRecoversPanic(t *testing.T) {
 	if err := closeStep(func() error { panic("teardown boom") }); err == nil {
 		t.Error("closeStep should convert a panic into an error")
+	}
+}
+
+// TestQuestDBCloseIdempotentAndConcurrent pins the three documented Close
+// contracts: idempotent (a second Close is a no-op), safe under concurrent
+// callers (closeOnce), and every caller observes the identical latched result.
+func TestQuestDBCloseIdempotentAndConcurrent(t *testing.T) {
+	ctx := context.Background()
+	srv := newQuestDBTestServer(t, nil)
+	defer srv.Close()
+	db, err := NewQuestDB(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = db.Close(ctx) // -race proves closeOnce serialises teardown
+		}(i)
+	}
+	wg.Wait()
+
+	// closeOnce → every concurrent caller sees the same latched error.
+	for i, e := range errs {
+		if e != errs[0] {
+			t.Errorf("concurrent Close[%d]=%v, want identical to %v", i, e, errs[0])
+		}
+	}
+	// A clean teardown latches no error.
+	if errs[0] != nil {
+		t.Errorf("clean teardown Close=%v, want nil", errs[0])
+	}
+	// A later Close stays a no-op and returns the same latched result.
+	if err := db.Close(ctx); err != nil {
+		t.Errorf("post-hoc Close=%v, want nil (idempotent)", err)
+	}
+}
+
+// TestFirstCloseErrPrecedence covers the teardown-error precedence Close uses:
+// sender pool (owns flocks/I/O) over query pool over housekeeper, with nil only
+// when every step succeeded.
+func TestFirstCloseErrPrecedence(t *testing.T) {
+	sErr := errors.New("sender")
+	qErr := errors.New("query")
+	hErr := errors.New("housekeeper")
+	cases := []struct {
+		name          string
+		s, q, h, want error
+	}{
+		{"sender wins over all", sErr, qErr, hErr, sErr},
+		{"sender wins over query", sErr, qErr, nil, sErr},
+		{"sender wins, query nil", sErr, nil, hErr, sErr},
+		{"query wins over housekeeper", nil, qErr, hErr, qErr},
+		{"housekeeper last", nil, nil, hErr, hErr},
+		{"all clean", nil, nil, nil, nil},
+	}
+	for _, c := range cases {
+		if got := firstCloseErr(c.s, c.q, c.h); got != c.want {
+			t.Errorf("%s: firstCloseErr=%v, want %v", c.name, got, c.want)
+		}
 	}
 }

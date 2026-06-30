@@ -217,6 +217,69 @@ func TestQwpSenderPoolInRangeFence(t *testing.T) {
 	}
 }
 
+// TestQwpSenderPoolFenceExcludesLiveSiblings exercises Hazard-G end-to-end: a
+// pool of ≥2 live SF slots with drain_orphans=on must never adopt a live
+// sibling. It complements the pure-predicate TestQwpSenderPoolInRangeFence by
+// running the real fence through the real qwpSfScanOrphans against real on-disk
+// slot dirs created by real pooled SF senders — proving in-range live siblings
+// are excluded while out-of-range and foreign orphans stay drainable.
+func TestQwpSenderPoolFenceExcludesLiveSiblings(t *testing.T) {
+	sfDir := t.TempDir()
+	// 2 live SF slots; max=3 so the fenced in-range set is default-{0,1,2}. Each
+	// pooled sender ran its own orphan scan at construction (drain_orphans=on).
+	p := newQwpSenderPoolForTest(t, "sf_dir="+sfDir+";drain_orphans=on;", 2, 3)
+	if !p.storeAndForward {
+		t.Fatal("SF not detected")
+	}
+	base := p.slotBase
+
+	// No pooled sender adopted a sibling slot at construction: the fence kept each
+	// new slot's orphan scan off the already-live siblings.
+	p.mu.Lock()
+	slots := append([]*qwpSenderSlot(nil), p.available...)
+	p.mu.Unlock()
+	for _, s := range slots {
+		if d := s.delegate.BackgroundDrainers(); d != nil {
+			t.Errorf("pooled SF sender adopted a sibling at construction: drainers=%v", d)
+		}
+	}
+
+	// Make the two live in-range slot dirs look like drainable orphans (unacked
+	// .sfa, no .failed) so only the fence keeps the scan off them.
+	for _, idx := range []int{0, 1} {
+		seg := filepath.Join(sfDir, base+"-"+strconv.Itoa(idx), "sf-live.sfa")
+		if err := os.WriteFile(seg, []byte{1}, 0o644); err != nil {
+			t.Fatalf("seed live .sfa: %v", err)
+		}
+	}
+	// A genuinely-orphaned out-of-range same-base dir and a foreign dir must stay
+	// drainable — the fence is precise, not a blanket same-base exclusion.
+	for _, name := range []string{base + "-9", "foreign-0"} {
+		dir := filepath.Join(sfDir, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "sf-x.sfa"), []byte{1}, 0o644); err != nil {
+			t.Fatalf("seed orphan .sfa: %v", err)
+		}
+	}
+
+	gotSet := map[string]bool{}
+	for _, o := range qwpSfScanOrphans(sfDir, p.inRangeFence) {
+		gotSet[filepath.Base(o)] = true
+	}
+	for _, fenced := range []string{base + "-0", base + "-1"} {
+		if gotSet[fenced] {
+			t.Errorf("live in-range sibling %q was not fenced from the orphan scan", fenced)
+		}
+	}
+	for _, drainable := range []string{base + "-9", "foreign-0"} {
+		if !gotSet[drainable] {
+			t.Errorf("drainable orphan %q was wrongly fenced", drainable)
+		}
+	}
+}
+
 // TestQwpPooledSenderAt covers the lease's At (vs AtNow exercised elsewhere).
 func TestQwpPooledSenderAt(t *testing.T) {
 	p := senderPoolWithIdle(t, "", 1, 2, 0)
