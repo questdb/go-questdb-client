@@ -143,6 +143,21 @@ type QwpQueryClient struct {
 	// transport close) run at most once even under concurrent Close
 	// callers.
 	closeOnce sync.Once
+
+	// execDrainAbandoned latches when one of Exec's internal cleanup
+	// drains (ctx-error path / SELECT-via-Exec path) abandons before
+	// reaching a terminal frame while the transport stays healthy. It
+	// is the Exec-path analogue of QwpQuery.drainFailed: leftover decoded
+	// events stay queued on the single-stream wire, but loadIoErr() /
+	// terminalError() stay nil and the returned error is the original
+	// ctx / type-mismatch error — not a transport-terminal one — so the
+	// pool lease has no other signal that the worker is desynced. The
+	// lease reads it via execDesynced() to evict rather than recycle the
+	// worker. Standalone clients ignore it (the user owns the client and
+	// the desync surfaces on their own next call). Latch-once: a desynced
+	// wire stays desynced until the worker is rebuilt, and an evicted
+	// worker is discarded, never reused.
+	execDrainAbandoned atomic.Bool
 }
 
 // transport returns the bound generation's transport. Callers should
@@ -170,6 +185,16 @@ func (c *QwpQueryClient) terminalError() error {
 		return io.loadIoErr()
 	}
 	return nil
+}
+
+// execDesynced reports whether one of Exec's internal cleanup drains
+// abandoned before its terminal frame on an otherwise-healthy transport,
+// leaving the single-stream wire desynced. The pool lease checks this in
+// Query.Exec / Query.Close so the worker is evicted rather than recycled
+// — terminalError() / *QwpFailoverExhaustedError do not cover this case
+// because the transport never faulted. See execDrainAbandoned.
+func (c *QwpQueryClient) execDesynced() bool {
+	return c.execDrainAbandoned.Load()
 }
 
 // publishGeneration swaps the bound transport + I/O + the connect-walk
@@ -922,7 +947,14 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryO
 			session.requestCancel()
 			cleanupCtx, cleanupCancel := context.WithTimeout(
 				context.Background(), qwpQueryCleanupDrainTimeout)
-			_ = drainUntilTerminal(cleanupCtx, c.io())
+			if drainErr := drainUntilTerminal(cleanupCtx, c.io()); drainErr != nil {
+				// The drain abandoned before a terminal frame: leftover
+				// events stay queued on the single-stream wire. Latch so a
+				// pool lease evicts this worker rather than recycling a
+				// desynced one (mirrors QwpQuery.drainFailed on the cursor
+				// path).
+				c.execDrainAbandoned.Store(true)
+			}
 			cleanupCancel()
 			return ExecResult{}, err
 		}
@@ -963,7 +995,12 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryO
 			session.requestCancel()
 			cleanupCtx, cancel := context.WithTimeout(
 				context.Background(), qwpQueryCleanupDrainTimeout)
-			_ = drainUntilTerminal(cleanupCtx, c.io())
+			if drainErr := drainUntilTerminal(cleanupCtx, c.io()); drainErr != nil {
+				// Drain abandoned mid-result-set: leftover RESULT_BATCH /
+				// RESULT_END frames stay queued on the wire. Latch so a pool
+				// lease evicts the desynced worker (see execDrainAbandoned).
+				c.execDrainAbandoned.Store(true)
+			}
 			cancel()
 			return ExecResult{}, fmt.Errorf(
 				"qwp query: Exec called on a SELECT-style statement; use Query instead")

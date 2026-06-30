@@ -422,6 +422,16 @@ func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (E
 			q.broken = true
 		}
 	}
+	// Exec's internal cleanup drain (ctx-error / SELECT-via-Exec path) can
+	// abandon before its terminal frame on an otherwise-healthy transport,
+	// leaving the single-stream wire desynced. That surfaces neither a
+	// *QwpFailoverExhaustedError nor a terminalError() — the transport never
+	// faulted — so check the client-level latch explicitly and evict, else the
+	// next borrower would misread the leftover frames as its own (the Exec-path
+	// analogue of the cursor desync handled above and in Close).
+	if q.worker.client.execDesynced() {
+		q.broken = true
+	}
 	return res, err
 }
 
@@ -448,6 +458,12 @@ func (q *Query) Close() error {
 	// its terminal error to the caller via Batches(), not to this lease, so
 	// Exec's eager *QwpFailoverExhaustedError check does not cover it.
 	if !q.broken && q.worker.client.terminalError() != nil {
+		q.broken = true
+	}
+	// An Exec whose internal cleanup drain abandoned on a healthy transport
+	// leaves the wire desynced without latching terminalError(); evict so the
+	// leftover frames cannot leak into the next borrower (see execDesynced).
+	if !q.broken && q.worker.client.execDesynced() {
 		q.broken = true
 	}
 	q.closed = true

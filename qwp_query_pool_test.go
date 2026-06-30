@@ -348,6 +348,46 @@ func TestQwpQueryLeaseExecOverAbandonedDrain(t *testing.T) {
 	}
 }
 
+// TestQwpQueryLeaseEvictsOnExecInternalDrainAbandoned (item C1, Exec-path
+// analogue) covers the gap where Exec's OWN internal cleanup drain (its
+// ctx-error path or SELECT-via-Exec path) abandons before a terminal frame on
+// an otherwise-healthy transport. That latches QwpQueryClient.execDrainAbandoned
+// but surfaces neither a *QwpFailoverExhaustedError nor a terminalError() (the
+// transport never faulted), so before this fix the desynced worker was recycled
+// and the next borrower misread the leftover frames as its own result. The lease
+// must instead evict the worker on return. The abandoned drain is simulated by
+// latching the client flag directly (as the sibling tests simulate drainFailed),
+// since reproducing the real 5s qwpQueryCleanupDrainTimeout would be slow/flaky.
+func TestQwpQueryLeaseEvictsOnExecInternalDrainAbandoned(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+
+	// Simulate an Exec whose internal cleanup drain abandoned: the wire is
+	// desynced but the transport stayed healthy (terminalError() == nil).
+	q.worker.client.execDrainAbandoned.Store(true)
+	if q.worker.client.terminalError() != nil {
+		t.Fatal("precondition: transport must look healthy (terminalError nil)")
+	}
+	if !q.worker.client.execDesynced() {
+		t.Fatal("execDesynced must report the latched abandoned drain")
+	}
+
+	// Returning the lease must evict the desynced worker, not recycle it.
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if !q.broken {
+		t.Error("Close over an abandoned Exec drain must mark the worker broken")
+	}
+	if total, avail := p.poolSnapshot(); total != 0 || avail != 0 {
+		t.Errorf("desynced worker recycled: total=%d avail=%d, want 0/0", total, avail)
+	}
+}
+
 func TestQwpQueryLeaseExecError(t *testing.T) {
 	p := queryPoolWithIdle(t, 1, 2, 0)
 	q, err := p.borrow(context.Background())
