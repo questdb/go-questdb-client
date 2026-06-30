@@ -54,6 +54,10 @@ type qwpDispatcher[T any] struct {
 	startMu sync.Mutex
 	started atomic.Bool
 	closed  atomic.Bool
+	// abandon: set when close() gives up joining a wedged handler. loop()/drain()
+	// then drop instead of deliver, so a handler returning past the close timeout
+	// can't fire callbacks after close() returns (bounded-close contract).
+	abandon atomic.Bool
 
 	dropped   atomic.Int64
 	delivered atomic.Int64
@@ -129,6 +133,10 @@ func (d *qwpDispatcher[T]) loop() {
 	for {
 		select {
 		case e := <-d.inbox:
+			if d.abandon.Load() {
+				d.dropped.Add(1)
+				continue
+			}
 			d.deliver(e)
 		case <-d.done:
 			d.drain()
@@ -143,6 +151,10 @@ func (d *qwpDispatcher[T]) drain() {
 	for {
 		select {
 		case e := <-d.inbox:
+			if d.abandon.Load() {
+				d.dropped.Add(1)
+				continue
+			}
 			d.deliver(e)
 		case <-deadline.C:
 			return
@@ -201,6 +213,7 @@ func (d *qwpDispatcher[T]) close() {
 	select {
 	case <-joined:
 	case <-timer.C:
+		d.abandon.Store(true)
 		log.Printf("[WARN] qwp/sf: handler still running after %s on close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
 			qwpSfDispatcherCloseJoinTimeout)

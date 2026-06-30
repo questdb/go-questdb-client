@@ -1387,7 +1387,10 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		OnRoundExhausted: func() {
 			round++
 			l.connDispatcher.Load().offer(&SenderConnectionEvent{
-				Kind:            SenderAllEndpointsUnreachable,
+				Kind: SenderAllEndpointsUnreachable,
+				// Reconnect-path event: carry the attempt counter, like
+				// OnEndpointFailed (contract: 0 only for the initial connect).
+				AttemptNumber:   l.reconnectAttempts.Load(),
 				RoundNumber:     round,
 				TimestampMillis: time.Now().UnixMilli(),
 			})
