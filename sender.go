@@ -773,7 +773,13 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 // connect_timeout key.
 func WithConnectTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.connectTimeoutMs = int(d / time.Millisecond)
+		ms := int(d / time.Millisecond)
+		// A positive sub-millisecond budget must not truncate to 0, which means
+		// "keep the OS default" — floor it to 1ms so a tight budget stays tight.
+		if d > 0 && ms == 0 {
+			ms = 1
+		}
+		s.connectTimeoutMs = ms
 	}
 }
 
@@ -1452,6 +1458,12 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.errorInboxCapacity != 0 && conf.errorInboxCapacity < qwpSfMinErrorInboxCapacity {
 		return fmt.Errorf("error_inbox_capacity must be >= %d: %d",
 			qwpSfMinErrorInboxCapacity, conf.errorInboxCapacity)
+	}
+	// Same floor for the connection listener inbox; the connect-string parser
+	// enforces it but WithConnectionListenerInboxCapacity reaches here directly.
+	if conf.connectionListenerInboxCapacity != 0 && conf.connectionListenerInboxCapacity < qwpSfMinErrorInboxCapacity {
+		return fmt.Errorf("connection_listener_inbox_capacity must be >= %d: %d",
+			qwpSfMinErrorInboxCapacity, conf.connectionListenerInboxCapacity)
 	}
 
 	return nil

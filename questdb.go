@@ -64,64 +64,71 @@ type QuestDB struct {
 // over the matching connect-string key.
 type QuestDBOption func(*questDBConfig)
 
-// questDBConfig collects builder state. Pool sizes use unset = -1 so an explicit
-// 0 (e.g. query_pool_min=0) is distinguishable from "not set".
+// questDBConfig collects builder state. Each tunable carries a "set" flag so an
+// explicit value (including 0, e.g. query_pool_min=0, or a negative the resolver
+// must reject) is distinguishable from "not set" without a sentinel that a real
+// argument could collide with.
 type questDBConfig struct {
-	senderPoolMin, senderPoolMax int
-	queryPoolMin, queryPoolMax   int
-	acquireTimeout               time.Duration
-	idleTimeout                  time.Duration
-	maxLifetime                  time.Duration
-	housekeeperInterval          time.Duration
-	errorHandler                 SenderErrorHandler
-	connectionListener           SenderConnectionListener
+	senderPoolMin, senderPoolMax       int
+	senderPoolMinSet, senderPoolMaxSet bool
+	queryPoolMin, queryPoolMax         int
+	queryPoolMinSet, queryPoolMaxSet   bool
+	acquireTimeout                     time.Duration
+	acquireTimeoutSet                  bool
+	idleTimeout                        time.Duration
+	idleTimeoutSet                     bool
+	maxLifetime                        time.Duration
+	maxLifetimeSet                     bool
+	housekeeperInterval                time.Duration
+	housekeeperIntervalSet             bool
+	errorHandler                       SenderErrorHandler
+	connectionListener                 SenderConnectionListener
 }
 
-const questDBUnset = -1
-
-func defaultQuestDBConfig() *questDBConfig {
-	return &questDBConfig{
-		senderPoolMin: questDBUnset, senderPoolMax: questDBUnset,
-		queryPoolMin: questDBUnset, queryPoolMax: questDBUnset,
-		acquireTimeout: questDBUnset, idleTimeout: questDBUnset,
-		maxLifetime: questDBUnset, housekeeperInterval: questDBUnset,
-	}
-}
+func defaultQuestDBConfig() *questDBConfig { return &questDBConfig{} }
 
 // WithSenderPoolMin sets the warm/minimum ingest pool size (default 1).
-func WithSenderPoolMin(n int) QuestDBOption { return func(c *questDBConfig) { c.senderPoolMin = n } }
+func WithSenderPoolMin(n int) QuestDBOption {
+	return func(c *questDBConfig) { c.senderPoolMin = n; c.senderPoolMinSet = true }
+}
 
 // WithSenderPoolMax sets the maximum ingest pool size (default 4).
-func WithSenderPoolMax(n int) QuestDBOption { return func(c *questDBConfig) { c.senderPoolMax = n } }
+func WithSenderPoolMax(n int) QuestDBOption {
+	return func(c *questDBConfig) { c.senderPoolMax = n; c.senderPoolMaxSet = true }
+}
 
 // WithQueryPoolMin sets the warm/minimum query pool size (default 1; 0 with
 // lazy_connect).
-func WithQueryPoolMin(n int) QuestDBOption { return func(c *questDBConfig) { c.queryPoolMin = n } }
+func WithQueryPoolMin(n int) QuestDBOption {
+	return func(c *questDBConfig) { c.queryPoolMin = n; c.queryPoolMinSet = true }
+}
 
 // WithQueryPoolMax sets the maximum query pool size (default 4).
-func WithQueryPoolMax(n int) QuestDBOption { return func(c *questDBConfig) { c.queryPoolMax = n } }
+func WithQueryPoolMax(n int) QuestDBOption {
+	return func(c *questDBConfig) { c.queryPoolMax = n; c.queryPoolMaxSet = true }
+}
 
 // WithAcquireTimeout bounds how long BorrowSender/BorrowQuery block when the
 // pool is exhausted (default 5s).
 func WithAcquireTimeout(d time.Duration) QuestDBOption {
-	return func(c *questDBConfig) { c.acquireTimeout = d }
+	return func(c *questDBConfig) { c.acquireTimeout = d; c.acquireTimeoutSet = true }
 }
 
 // WithIdleTimeout sets how long an above-min slot may stay idle before the
 // housekeeper reaps it (default 60s; 0 disables idle reaping).
 func WithIdleTimeout(d time.Duration) QuestDBOption {
-	return func(c *questDBConfig) { c.idleTimeout = d }
+	return func(c *questDBConfig) { c.idleTimeout = d; c.idleTimeoutSet = true }
 }
 
 // WithMaxLifetime sets the maximum age of a pooled slot before recycling
 // (default 30m; 0 disables age recycling).
 func WithMaxLifetime(d time.Duration) QuestDBOption {
-	return func(c *questDBConfig) { c.maxLifetime = d }
+	return func(c *questDBConfig) { c.maxLifetime = d; c.maxLifetimeSet = true }
 }
 
 // WithHousekeeperInterval sets the reaper sweep interval (default 5s).
 func WithHousekeeperInterval(d time.Duration) QuestDBOption {
-	return func(c *questDBConfig) { c.housekeeperInterval = d }
+	return func(c *questDBConfig) { c.housekeeperInterval = d; c.housekeeperIntervalSet = true }
 }
 
 // WithQuestDBErrorHandler applies an ingest SenderErrorHandler to every pooled
@@ -134,6 +141,35 @@ func WithQuestDBErrorHandler(h SenderErrorHandler) QuestDBOption {
 // every pooled sender. See WithConnectionListener.
 func WithQuestDBConnectionListener(l SenderConnectionListener) QuestDBOption {
 	return func(c *questDBConfig) { c.connectionListener = l }
+}
+
+// serializeErrorHandler wraps h so concurrent invocations from the pool's
+// per-sender dispatchers are serialized, preserving the single-goroutine
+// delivery contract. Returns nil unchanged.
+func serializeErrorHandler(h SenderErrorHandler) SenderErrorHandler {
+	if h == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	return func(e *SenderError) {
+		mu.Lock()
+		defer mu.Unlock()
+		h(e)
+	}
+}
+
+// serializeConnectionListener is the SenderConnectionListener counterpart of
+// serializeErrorHandler.
+func serializeConnectionListener(l SenderConnectionListener) SenderConnectionListener {
+	if l == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	return func(e SenderConnectionEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		l(e)
+	}
 }
 
 // Connect opens a QuestDB facade with default pool sizing. The config must use
@@ -187,43 +223,48 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 		}
 	}
 
-	senderMin, err := resolvePoolInt(cfg.senderPoolMin, kv, "sender_pool_min", qwpDefaultPoolMin)
+	senderMin, err := resolvePoolInt(cfg.senderPoolMinSet, cfg.senderPoolMin, kv, "sender_pool_min", qwpDefaultPoolMin)
 	if err != nil {
 		return nil, err
 	}
-	senderMax, err := resolvePoolInt(cfg.senderPoolMax, kv, "sender_pool_max", qwpDefaultPoolMax)
+	senderMax, err := resolvePoolInt(cfg.senderPoolMaxSet, cfg.senderPoolMax, kv, "sender_pool_max", qwpDefaultPoolMax)
 	if err != nil {
 		return nil, err
 	}
-	queryMin, err := resolvePoolInt(cfg.queryPoolMin, kv, "query_pool_min", queryMinDefault)
+	queryMin, err := resolvePoolInt(cfg.queryPoolMinSet, cfg.queryPoolMin, kv, "query_pool_min", queryMinDefault)
 	if err != nil {
 		return nil, err
 	}
-	queryMax, err := resolvePoolInt(cfg.queryPoolMax, kv, "query_pool_max", qwpDefaultPoolMax)
+	queryMax, err := resolvePoolInt(cfg.queryPoolMaxSet, cfg.queryPoolMax, kv, "query_pool_max", qwpDefaultPoolMax)
 	if err != nil {
 		return nil, err
 	}
-	acquire, err := resolvePoolDur(cfg.acquireTimeout, kv, "acquire_timeout_ms", qwpDefaultAcquireTimeout)
+	acquire, err := resolvePoolDur(cfg.acquireTimeoutSet, cfg.acquireTimeout, kv, "acquire_timeout_ms", qwpDefaultAcquireTimeout)
 	if err != nil {
 		return nil, err
 	}
-	idle, err := resolvePoolDur(cfg.idleTimeout, kv, "idle_timeout_ms", qwpDefaultIdleTimeout)
+	idle, err := resolvePoolDur(cfg.idleTimeoutSet, cfg.idleTimeout, kv, "idle_timeout_ms", qwpDefaultIdleTimeout)
 	if err != nil {
 		return nil, err
 	}
-	lifetime, err := resolvePoolDur(cfg.maxLifetime, kv, "max_lifetime_ms", qwpDefaultMaxLifetime)
+	lifetime, err := resolvePoolDur(cfg.maxLifetimeSet, cfg.maxLifetime, kv, "max_lifetime_ms", qwpDefaultMaxLifetime)
 	if err != nil {
 		return nil, err
 	}
-	hkInterval, err := resolvePoolDur(cfg.housekeeperInterval, kv, "housekeeper_interval_ms", qwpDefaultHousekeeperInterval)
+	hkInterval, err := resolvePoolDur(cfg.housekeeperIntervalSet, cfg.housekeeperInterval, kv, "housekeeper_interval_ms", qwpDefaultHousekeeperInterval)
 	if err != nil {
 		return nil, err
 	}
 
+	// Every pooled sender invokes these callbacks on its own dispatcher goroutine,
+	// so serialize them across the pool to keep the single-goroutine contract.
+	errorHandler := serializeErrorHandler(cfg.errorHandler)
+	connectionListener := serializeConnectionListener(cfg.connectionListener)
+
 	// Build both pools + the housekeeper, teardown-hardened: on any failure
 	// close what was already built, in reverse order (Hazard I at the facade).
 	sp, err := newQwpSenderPool(ctx, ingestConf, senderMin, senderMax,
-		acquire, idle, lifetime, cfg.errorHandler, cfg.connectionListener)
+		acquire, idle, lifetime, errorHandler, connectionListener)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +287,7 @@ func validateLazyConnect(kv map[string]string, cfg *questDBConfig) error {
 			"initial_connect_retry (lazy_connect implies async) or setting initial_connect_retry=async", mode)
 	}
 	explicitQueryMin := 0
-	if cfg.queryPoolMin != questDBUnset {
+	if cfg.queryPoolMinSet {
 		explicitQueryMin = cfg.queryPoolMin
 	} else if v, ok := kv["query_pool_min"]; ok {
 		n, err := strconv.Atoi(v)
@@ -340,10 +381,10 @@ func poolBool(kv map[string]string, key string, dflt bool) (bool, error) {
 	}
 }
 
-// resolvePoolInt resolves a pool size: explicit option (!= unset) > connect-string
+// resolvePoolInt resolves a pool size: explicit option (set) > connect-string
 // key > default. Rejects a negative value or a non-integer key.
-func resolvePoolInt(opt int, kv map[string]string, key string, dflt int) (int, error) {
-	if opt != questDBUnset {
+func resolvePoolInt(set bool, opt int, kv map[string]string, key string, dflt int) (int, error) {
+	if set {
 		if opt < 0 {
 			return 0, fmt.Errorf("%s must be >= 0", key)
 		}
@@ -360,9 +401,9 @@ func resolvePoolInt(opt int, kv map[string]string, key string, dflt int) (int, e
 }
 
 // resolvePoolDur resolves a millisecond pool key into a Duration: explicit
-// option (!= unset) > connect-string key > default.
-func resolvePoolDur(opt time.Duration, kv map[string]string, key string, dflt time.Duration) (time.Duration, error) {
-	if opt != time.Duration(questDBUnset) {
+// option (set) > connect-string key > default.
+func resolvePoolDur(set bool, opt time.Duration, kv map[string]string, key string, dflt time.Duration) (time.Duration, error) {
+	if set {
 		if opt < 0 {
 			return 0, fmt.Errorf("%s must be >= 0", key)
 		}

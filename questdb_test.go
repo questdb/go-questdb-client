@@ -245,6 +245,25 @@ func TestQuestDBPoolKeysResolved(t *testing.T) {
 	}
 }
 
+// TestPoolKeysRejectedOnNonWs pins that the facade-owned pool keys are accepted
+// only on ws/wss: an http or tcp config rejects each one, so they cannot be
+// silently ignored on a transport with no pool.
+func TestPoolKeysRejectedOnNonWs(t *testing.T) {
+	keys := []string{
+		"lazy_connect=true", "sender_pool_min=1", "sender_pool_max=2",
+		"query_pool_min=0", "query_pool_max=2", "acquire_timeout_ms=1000",
+		"idle_timeout_ms=1000", "max_lifetime_ms=1000", "housekeeper_interval_ms=100",
+	}
+	for _, schema := range []string{"http", "tcp"} {
+		for _, key := range keys {
+			conf := schema + "::addr=localhost:9000;" + key + ";"
+			if _, err := confFromStr(conf); err == nil {
+				t.Errorf("%s: pool key %q should be rejected on a %s config", schema, key, schema)
+			}
+		}
+	}
+}
+
 func TestWithDefaultAsyncConnect(t *testing.T) {
 	if got := withDefaultAsyncConnect("noseparator"); got != "noseparator" {
 		t.Errorf("no-separator config changed: %q", got)
@@ -274,6 +293,66 @@ func TestNewQuestDBSenderPrewarmFailure(t *testing.T) {
 	_, err := NewQuestDB(context.Background(), "ws::addr=127.0.0.1:1;query_pool_min=0;")
 	if err == nil {
 		t.Error("eager build against a down server should fail")
+	}
+}
+
+// TestNewQuestDBDownServerDefaultConfig pins the default config (both pools
+// prewarming, no query_pool_min=0) against a down server: it must return an
+// error and a nil handle, never panic or hand back a half-built land mine.
+func TestNewQuestDBDownServerDefaultConfig(t *testing.T) {
+	db, err := NewQuestDB(context.Background(), "ws::addr=127.0.0.1:1;")
+	if err == nil {
+		if db != nil {
+			db.Close(context.Background())
+		}
+		t.Fatal("default-config build against a down server should return an error")
+	}
+	if db != nil {
+		t.Errorf("expected a nil handle on build failure, got %v", db)
+	}
+}
+
+// TestQuestDBCloseWithOutstandingLease checks that QuestDB.Close while a borrowed
+// sender is still being written never reaches into the in-use delegate (a data
+// race the -race build would catch), and that returning the lease afterward
+// closes its connection cleanly.
+func TestQuestDBCloseWithOutstandingLease(t *testing.T) {
+	ctx := context.Background()
+	srv := newQuestDBTestServer(t, nil)
+	defer srv.Close()
+	db, err := NewQuestDB(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	s, err := db.BorrowSender(ctx)
+	if err != nil {
+		t.Fatalf("BorrowSender: %v", err)
+	}
+
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = s.Table("t").Int64Column("v", 1).AtNow(ctx)
+				_ = s.Flush(ctx)
+			}
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	if err := db.Close(ctx); err != nil {
+		t.Logf("db.Close: %v", err)
+	}
+	close(stop)
+	<-done
+
+	// The outstanding lease closes its own delegate on return, post-teardown.
+	if err := s.Close(ctx); err != nil {
+		t.Logf("lease Close: %v", err)
 	}
 }
 

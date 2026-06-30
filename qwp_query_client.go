@@ -1132,6 +1132,11 @@ type QwpQuery struct {
 	// avoid emitting a synthesized "cancelled by caller" error on top
 	// of the server's QUERY_ERROR(status=CANCELLED) echo.
 	cancelled atomic.Bool
+
+	// drainFailed is set when the cleanup drain abandons before reaching a
+	// terminal frame, so leftover frames may still arrive. A pooled lease reads
+	// it to evict the worker rather than recycle it onto the next borrower.
+	drainFailed atomic.Bool
 }
 
 // Batches returns a range-over-func iterator that yields each
@@ -1346,5 +1351,7 @@ func (q *QwpQuery) cancelAndDrainOnCleanupCtx() {
 	cleanupCtx, cancel := context.WithTimeout(
 		context.Background(), qwpQueryCleanupDrainTimeout)
 	defer cancel()
-	_ = drainUntilTerminal(cleanupCtx, q.client.io())
+	if err := drainUntilTerminal(cleanupCtx, q.client.io()); err != nil {
+		q.drainFailed.Store(true)
+	}
 }

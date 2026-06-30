@@ -257,12 +257,20 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 // re-borrow (Hazard B). Broken slots are discarded instead of recycled.
 func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broken bool) {
 	p.mu.Lock()
-	if p.closed || ps.slot.generation.Load() != ps.gen {
+	if ps.slot.generation.Load() != ps.gen {
 		p.mu.Unlock()
-		return
+		return // stale lease (already returned / re-borrowed) — never double-act
 	}
 	// Invalidate this lease so a duplicate Close is dropped above.
 	ps.slot.generation.Add(1)
+	if p.closed {
+		// The pool was torn down while this slot was on loan, so close() left it
+		// for us. The producer is done now, so closing the delegate here cannot
+		// race a writer.
+		p.mu.Unlock()
+		_ = closeSlotGuarded(ps.slot.delegate, ctx)
+		return
+	}
 	if broken {
 		p.discardLocked(ctx, ps.slot)
 		return // discardLocked unlocks
@@ -345,8 +353,14 @@ func (p *qwpSenderPool) reapIdle() {
 	}
 }
 
-// close shuts the pool down and closes every slot's delegate (the real
-// disconnect). Idempotent.
+// close shuts the pool down and disconnects its slots. Idempotent.
+//
+// It closes only the returned (available) slots here. A slot still on loan has a
+// live producer goroutine, and closing its delegate concurrently would race that
+// writer (its row buffer and table maps) — a data race the panic guards cannot
+// catch. An outstanding lease instead closes its own delegate when it is returned
+// (giveBack sees p.closed). A lease that is never returned leaks its connection:
+// the caller must return every lease before QuestDB.Close.
 func (p *qwpSenderPool) close(ctx context.Context) error {
 	p.mu.Lock()
 	if p.closed {
@@ -354,14 +368,14 @@ func (p *qwpSenderPool) close(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
-	snapshot := append([]*qwpSenderSlot(nil), p.all...)
+	toClose := append([]*qwpSenderSlot(nil), p.available...)
 	p.all = nil
 	p.available = nil
 	p.broadcastLocked()
 	p.mu.Unlock()
 
 	var firstErr error
-	for _, slot := range snapshot {
+	for _, slot := range toClose {
 		if err := closeSlotGuarded(slot.delegate, ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}

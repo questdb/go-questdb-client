@@ -127,7 +127,7 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 			}
 			if p.closed {
 				p.mu.Unlock()
-				_ = w.client.Close(ctx)
+				_ = closeQueryClientGuarded(w.client, ctx)
 				return nil, errPoolClosed
 			}
 			p.all = append(p.all, w)
@@ -165,7 +165,7 @@ func (p *qwpQueryPool) giveBack(ctx context.Context, q *Query, broken bool) {
 	if broken {
 		p.removeFromAllLocked(q.worker)
 		p.mu.Unlock()
-		_ = q.worker.client.Close(ctx)
+		_ = closeQueryClientGuarded(q.worker.client, ctx)
 		p.mu.Lock()
 		p.broadcastLocked()
 		p.mu.Unlock()
@@ -202,13 +202,25 @@ func (p *qwpQueryPool) reapIdle() {
 	p.mu.Unlock()
 
 	for _, w := range toClose {
-		_ = w.client.Close(context.Background())
+		_ = closeQueryClientGuarded(w.client, context.Background())
 	}
 	if len(toClose) > 0 {
 		p.mu.Lock()
 		p.broadcastLocked()
 		p.mu.Unlock()
 	}
+}
+
+// closeQueryClientGuarded closes a worker's client, converting a panic into an
+// error so a faulting Close cannot unwind through the pool's teardown. Mirrors
+// the sender pool's closeSlotGuarded.
+func closeQueryClientGuarded(client *QwpQueryClient, ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("qwp query pool: client close panicked: %v", r)
+		}
+	}()
+	return client.Close(ctx)
 }
 
 func (p *qwpQueryPool) close(ctx context.Context) error {
@@ -226,7 +238,7 @@ func (p *qwpQueryPool) close(ctx context.Context) error {
 
 	var firstErr error
 	for _, w := range snapshot {
-		if err := w.client.Close(ctx); err != nil && firstErr == nil {
+		if err := closeQueryClientGuarded(w.client, ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -318,6 +330,9 @@ func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (E
 	// race the Exec submission for the next terminal frame.
 	if q.active != nil {
 		q.active.Close()
+		if q.active.drainFailed.Load() {
+			q.broken = true
+		}
 		q.active = nil
 	}
 	res, err := q.worker.client.Exec(ctx, sql, opts...)
@@ -342,6 +357,13 @@ func (q *Query) Close() error {
 	}
 	if q.active != nil {
 		q.active.Close()
+		// A drain that abandoned before the terminal frame leaves leftover
+		// events on the wire that the next borrower would consume as its own
+		// (the egress path does not demux by requestId), so evict rather than
+		// recycle.
+		if q.active.drainFailed.Load() {
+			q.broken = true
+		}
 		q.active = nil
 	}
 	// A cursor that ended in failover-exhaustion (or any transport-terminal

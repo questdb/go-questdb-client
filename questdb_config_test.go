@@ -85,17 +85,25 @@ func TestQuestDBPoolConfigPrecedence(t *testing.T) {
 }
 
 func TestResolvePoolErrors(t *testing.T) {
-	if _, err := resolvePoolInt(questDBUnset, map[string]string{"x": "abc"}, "x", 4); err == nil {
+	if _, err := resolvePoolInt(false, 0, map[string]string{"x": "abc"}, "x", 4); err == nil {
 		t.Error("non-int connect-string value should error")
 	}
-	if _, err := resolvePoolInt(-5, nil, "x", 4); err == nil {
+	if _, err := resolvePoolInt(true, -5, nil, "x", 4); err == nil {
 		t.Error("negative option should error")
 	}
-	if _, err := resolvePoolDur(questDBUnset, map[string]string{"x": "-3"}, "x", time.Second); err == nil {
+	// -1 is a real argument now, not an "unset" sentinel: it must be rejected,
+	// not silently treated as the default.
+	if _, err := resolvePoolInt(true, -1, nil, "x", 4); err == nil {
+		t.Error("negative option (-1) should error, not fall back to default")
+	}
+	if _, err := resolvePoolDur(false, 0, map[string]string{"x": "-3"}, "x", time.Second); err == nil {
 		t.Error("negative duration value should error")
 	}
-	if _, err := resolvePoolDur(-2, nil, "x", time.Second); err == nil {
+	if _, err := resolvePoolDur(true, -2, nil, "x", time.Second); err == nil {
 		t.Error("negative duration option should error")
+	}
+	if _, err := resolvePoolDur(true, -1*time.Nanosecond, nil, "x", time.Second); err == nil {
+		t.Error("negative duration option (-1ns) should error, not fall back to default")
 	}
 	if _, err := poolBool(map[string]string{"x": "maybe"}, "x", false); err == nil {
 		t.Error("invalid bool should error")

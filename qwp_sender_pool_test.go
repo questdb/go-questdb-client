@@ -249,8 +249,8 @@ func TestQwpSenderPoolClosedOps(t *testing.T) {
 		t.Errorf("borrow after close=%v, want errPoolClosed", err)
 	}
 	p.reapIdle()
-	// Returning the still-"live" lease after pool close: the delegate is already
-	// closed, so the Flush fails → broken, and giveBack drops it (pool closed).
+	// The lease was on loan at close, so close() left its delegate open; returning
+	// it now flushes and giveBack closes the delegate (pool already closed).
 	_ = s.Close(ctx)
 }
 

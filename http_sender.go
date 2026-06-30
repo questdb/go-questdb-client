@@ -130,7 +130,7 @@ type httpLineSenderV3 struct {
 	httpLineSenderV2
 }
 
-func newHttpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
+func newHttpLineSender(ctx context.Context, conf *lineSenderConfig) (_ LineSender, err error) {
 	var transport *http.Transport
 	s := &httpLineSender{
 		address:                     conf.address,
@@ -185,11 +185,23 @@ func newHttpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender,
 	if s.globalTransport != nil {
 		s.globalTransport.RegisterClient()
 	}
+	// Construction past this point can fail (protocol detection drains a
+	// keep-alive socket on a non-OK response); Close never runs on that path, so
+	// reap the owned transport and balance the global refcount here.
+	defer func() {
+		if err != nil {
+			if s.ownedTransport != nil {
+				s.ownedTransport.CloseIdleConnections()
+			}
+			if s.globalTransport != nil {
+				s.globalTransport.UnregisterClient()
+			}
+		}
+	}()
 
 	// auto detect server line protocol version
 	pVersion := conf.protocolVersion
 	if pVersion == protocolVersionUnset {
-		var err error
 		pVersion, err = s.detectProtocolVersion(ctx, conf)
 		if err != nil {
 			return nil, err

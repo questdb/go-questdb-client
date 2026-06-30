@@ -97,6 +97,15 @@ func TestConnectionListenerFiresConnected(t *testing.T) {
 	}
 }
 
+// TestDefaultSenderConnectionListener exercises the loud default listener (used
+// when no WithConnectionListener is set) across every kind, including the WARN
+// and ERROR branches and an unknown kind; it must classify and log without panic.
+func TestDefaultSenderConnectionListener(t *testing.T) {
+	for k := SenderConnected; k <= SenderReconnectBudgetExhausted+1; k++ {
+		defaultSenderConnectionListener(SenderConnectionEvent{Kind: k, Host: "h", Port: 9000})
+	}
+}
+
 func TestSenderConnectionEventString(t *testing.T) {
 	e := SenderConnectionEvent{Kind: SenderFailedOver, Host: "h2", Port: 9000, PreviousHost: "h1", PreviousPort: 9000, AttemptNumber: 3}
 	s := e.String()
@@ -124,6 +133,157 @@ func TestConnectionListenerDispatcherDrops(t *testing.T) {
 	}
 	if d.droppedNotifications() == 0 {
 		t.Error("expected dropped > 0 under a blocked handler")
+	}
+}
+
+// listenAndIngest builds a QWP sender against addr with a connection listener
+// feeding events, writes one row, and flushes so the send loop is live. It
+// returns the sender and the event channel; the caller drains the channel.
+func listenAndIngest(t *testing.T, addr string, opts ...LineSenderOption) (LineSender, <-chan SenderConnectionEvent) {
+	t.Helper()
+	events := make(chan SenderConnectionEvent, 128)
+	base := []LineSenderOption{
+		WithQwp(), WithAddress(addr),
+		WithConnectionListener(func(e SenderConnectionEvent) { events <- e }),
+	}
+	s, err := NewLineSender(context.Background(), append(base, opts...)...)
+	if err != nil {
+		t.Fatalf("NewLineSender: %v", err)
+	}
+	_ = s.Table("t").Int64Column("v", 1).AtNow(context.Background())
+	_ = s.Flush(context.Background())
+	return s, events
+}
+
+// waitForKind drains events until kind is seen (returning it) or the deadline
+// fires. seen records every kind observed along the way.
+func waitForKind(t *testing.T, events <-chan SenderConnectionEvent, kind SenderConnectionEventKind, seen map[SenderConnectionEventKind]bool) SenderConnectionEvent {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case e := <-events:
+			seen[e.Kind] = true
+			if e.Kind == kind {
+				return e
+			}
+		case <-deadline:
+			t.Fatalf("never observed %s; saw %v", kind, seen)
+			return SenderConnectionEvent{}
+		}
+	}
+}
+
+// TestConnectionListenerFiresAuthFailed drives a server that serves one
+// connection then rejects every reconnect with 403, and asserts the listener
+// observes the terminal AUTH_FAILED with a cause.
+func TestConnectionListenerFiresAuthFailed(t *testing.T) {
+	var connCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if connCount.Add(1) >= 2 {
+			w.WriteHeader(http.StatusForbidden) // terminal auth reject on reconnect
+			return
+		}
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if _, _, err := conn.Read(context.Background()); err != nil {
+			return
+		}
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
+		// drop after the first ACK → force a reconnect into the 403
+	}))
+	defer srv.Close()
+
+	s, events := listenAndIngest(t, strings.TrimPrefix(srv.URL, "http://"))
+	defer s.Close(context.Background())
+
+	e := waitForKind(t, events, SenderAuthFailed, map[SenderConnectionEventKind]bool{})
+	if e.Cause == nil {
+		t.Error("AUTH_FAILED event should carry a cause")
+	}
+}
+
+// TestConnectionListenerFiresFailedOver drives two endpoints: the first serves
+// one connection then rejects reconnects, the second always accepts. The
+// listener must observe FAILED_OVER carrying the previous endpoint.
+func TestConnectionListenerFiresFailedOver(t *testing.T) {
+	var c1 atomic.Int64
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c1.Add(1) >= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable) // transient reject on reconnect
+			return
+		}
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if _, _, err := conn.Read(context.Background()); err != nil {
+			return
+		}
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
+	}))
+	defer srv1.Close()
+	srv2 := newQwpTestServer(t)
+	defer srv2.Close()
+
+	addr := strings.TrimPrefix(srv1.URL, "http://") + "," + strings.TrimPrefix(srv2.URL, "http://")
+	s, events := listenAndIngest(t, addr)
+	defer s.Close(context.Background())
+
+	seen := map[SenderConnectionEventKind]bool{}
+	e := waitForKind(t, events, SenderFailedOver, seen)
+	if e.PreviousHost == "" {
+		t.Errorf("FAILED_OVER should carry the previous endpoint: %s", e)
+	}
+	if e.Host == "" {
+		t.Errorf("FAILED_OVER should carry the new endpoint: %s", e)
+	}
+}
+
+// TestConnectionListenerFiresUnreachableAndBudgetExhausted drives a server that
+// serves one connection then rejects every reconnect, with a tight reconnect
+// budget. The listener must observe the per-attempt failure, the full-sweep
+// failure, and the terminal budget exhaustion.
+func TestConnectionListenerFiresUnreachableAndBudgetExhausted(t *testing.T) {
+	var connCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if connCount.Add(1) >= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable) // transient reject on every reconnect
+			return
+		}
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if _, _, err := conn.Read(context.Background()); err != nil {
+			return
+		}
+		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
+	}))
+	defer srv.Close()
+
+	s, events := listenAndIngest(t, strings.TrimPrefix(srv.URL, "http://"),
+		WithReconnectPolicy(300*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond))
+	defer s.Close(context.Background())
+
+	seen := map[SenderConnectionEventKind]bool{}
+	e := waitForKind(t, events, SenderReconnectBudgetExhausted, seen)
+	if e.Cause == nil {
+		t.Error("RECONNECT_BUDGET_EXHAUSTED event should carry a cause")
+	}
+	if !seen[SenderEndpointAttemptFailed] {
+		t.Error("expected ENDPOINT_ATTEMPT_FAILED before budget exhaustion")
+	}
+	if !seen[SenderAllEndpointsUnreachable] {
+		t.Error("expected ALL_ENDPOINTS_UNREACHABLE before budget exhaustion")
 	}
 }
 

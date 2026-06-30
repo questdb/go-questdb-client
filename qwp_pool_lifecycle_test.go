@@ -48,6 +48,35 @@ func senderPoolWithIdle(t *testing.T, extra string, min, max int, idle time.Dura
 	return p
 }
 
+// TestQwpSenderPoolReapsOverAge drives the max_lifetime (over-age) reap branch
+// in isolation: idle_timeout is 0 so only the lifetime test can fire.
+func TestQwpSenderPoolReapsOverAge(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 2,
+		500*time.Millisecond, 0 /* idle off */, time.Millisecond /* max_lifetime */, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	defer p.close(context.Background())
+	ctx := context.Background()
+
+	s, err := p.borrow(ctx) // grows to 1
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	_ = s.Close(ctx) // returned → idle in available, but over-age once the budget elapses
+	if total, _, _ := p.poolSnapshot(); total != 1 {
+		t.Fatalf("total=%d, want 1", total)
+	}
+	time.Sleep(5 * time.Millisecond) // exceed max_lifetime
+	p.reapIdle()
+	if total, _, _ := p.poolSnapshot(); total != 0 {
+		t.Errorf("over-age slot not reaped: total=%d, want 0 (min=0)", total)
+	}
+}
+
 // TestQwpSenderPoolReapsToMin pins the reapIdle fix: a single sweep must shrink
 // the pool all the way to minSize (the earlier double-count bug reaped only
 // ~half the excess per sweep).

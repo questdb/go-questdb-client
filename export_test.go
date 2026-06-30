@@ -229,10 +229,6 @@ func ConfigEndpoints(c *LineSenderConfig) []string {
 // sanitization (default 15000).
 func ConfigAuthTimeoutMs(c *LineSenderConfig) int { return c.authTimeoutMs }
 
-// ConfigConnectTimeoutMs returns the parsed connect_timeout value (0
-// when unset; the OS connect timeout then applies).
-func ConfigConnectTimeoutMs(c *LineSenderConfig) int { return c.connectTimeoutMs }
-
 // ConfigZone returns the parsed zone= value (silently stored but
 // unused on SF ingress).
 func ConfigZone(c *LineSenderConfig) string { return c.zone }
