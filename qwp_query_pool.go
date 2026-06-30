@@ -110,6 +110,16 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 		if n := len(p.available); n > 0 {
 			w := p.available[n-1]
 			p.available = p.available[:n-1]
+			// A worker's client can latch a transport-terminal error (failover
+			// exhaustion on a background reconnect) while it sits idle, with no
+			// lease watching. Handing such a poisoned worker to the next borrower
+			// would fail their first query through no fault of their own, so
+			// discard it and look for another (mirrors the sender pool's M1).
+			if w.client.terminalError() != nil {
+				p.discardWorkerLocked(ctx, w) // releases p.mu
+				p.mu.Lock()
+				continue
+			}
 			gen := w.generation.Add(1)
 			p.mu.Unlock()
 			return &Query{pool: p, worker: w, gen: gen}, nil
@@ -127,7 +137,7 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 			}
 			if p.closed {
 				p.mu.Unlock()
-				_ = closeQueryClientGuarded(w.client, ctx)
+				_ = closeQueryClientGuarded(ctx, w.client)
 				return nil, errPoolClosed
 			}
 			p.all = append(p.all, w)
@@ -165,7 +175,7 @@ func (p *qwpQueryPool) giveBack(ctx context.Context, q *Query, broken bool) {
 	if broken {
 		p.removeFromAllLocked(q.worker)
 		p.mu.Unlock()
-		_ = closeQueryClientGuarded(q.worker.client, ctx)
+		_ = closeQueryClientGuarded(ctx, q.worker.client)
 		p.mu.Lock()
 		p.broadcastLocked()
 		p.mu.Unlock()
@@ -173,6 +183,19 @@ func (p *qwpQueryPool) giveBack(ctx context.Context, q *Query, broken bool) {
 	}
 	q.worker.idleSince = time.Now()
 	p.available = append(p.available, q.worker)
+	p.broadcastLocked()
+	p.mu.Unlock()
+}
+
+// discardWorkerLocked evicts a worker from `all` and closes its client outside
+// the lock. Caller holds mu; discardWorkerLocked releases it. Used on borrow
+// when a pooled worker is found terminally failed (mirrors the sender pool's
+// discardLocked).
+func (p *qwpQueryPool) discardWorkerLocked(ctx context.Context, w *qwpQueryWorker) {
+	p.removeFromAllLocked(w)
+	p.mu.Unlock()
+	_ = closeQueryClientGuarded(ctx, w.client)
+	p.mu.Lock()
 	p.broadcastLocked()
 	p.mu.Unlock()
 }
@@ -189,9 +212,13 @@ func (p *qwpQueryPool) reapIdle() {
 	for _, w := range p.available {
 		idleExpired := p.idleTimeout > 0 && now.Sub(w.idleSince) >= p.idleTimeout
 		overAge := p.maxLifetime > 0 && now.Sub(w.createdAt) >= p.maxLifetime
+		// A worker poisoned by a background transport-terminal failure is useless
+		// to a borrower, so reap it even at minSize (borrow re-creates a fresh
+		// worker on demand), mirroring the sender pool's M1 reap.
+		poisoned := w.client.terminalError() != nil
 		// removeFromAllLocked already shrinks p.all; test it directly (don't
 		// also subtract len(toClose) — that double-counts and under-reaps).
-		if (idleExpired || overAge) && len(p.all) > p.minSize {
+		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
 			p.removeFromAllLocked(w)
 			toClose = append(toClose, w)
 			continue
@@ -202,7 +229,7 @@ func (p *qwpQueryPool) reapIdle() {
 	p.mu.Unlock()
 
 	for _, w := range toClose {
-		_ = closeQueryClientGuarded(w.client, context.Background())
+		_ = closeQueryClientGuarded(context.Background(), w.client)
 	}
 	if len(toClose) > 0 {
 		p.mu.Lock()
@@ -214,7 +241,7 @@ func (p *qwpQueryPool) reapIdle() {
 // closeQueryClientGuarded closes a worker's client, converting a panic into an
 // error so a faulting Close cannot unwind through the pool's teardown. Mirrors
 // the sender pool's closeSlotGuarded.
-func closeQueryClientGuarded(client *QwpQueryClient, ctx context.Context) (err error) {
+func closeQueryClientGuarded(ctx context.Context, client *QwpQueryClient) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("qwp query pool: client close panicked: %v", r)
@@ -238,7 +265,7 @@ func (p *qwpQueryPool) close(ctx context.Context) error {
 
 	var firstErr error
 	for _, w := range snapshot {
-		if err := closeQueryClientGuarded(w.client, ctx); err != nil && firstErr == nil {
+		if err := closeQueryClientGuarded(ctx, w.client); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

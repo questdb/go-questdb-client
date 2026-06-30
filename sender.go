@@ -533,8 +533,9 @@ func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 }
 
 // WithConnectionListenerInboxCapacity sets the bounded inbox depth for the
-// connection-event dispatcher. A non-positive value uses the default.
-// Equivalent to the connect-string connection_listener_inbox_capacity key.
+// connection-event dispatcher. Zero uses the default (256); any other value
+// below the minimum of 16 is rejected at construction. Equivalent to the
+// connect-string connection_listener_inbox_capacity key.
 //
 // Only available for the QWP sender.
 func WithConnectionListenerInboxCapacity(capacity int) LineSenderOption {

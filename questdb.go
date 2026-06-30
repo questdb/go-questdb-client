@@ -145,7 +145,14 @@ func WithQuestDBConnectionListener(l SenderConnectionListener) QuestDBOption {
 
 // serializeErrorHandler wraps h so concurrent invocations from the pool's
 // per-sender dispatchers are serialized, preserving the single-goroutine
-// delivery contract. Returns nil unchanged.
+// delivery contract a single sender's handler enjoys. Returns nil unchanged.
+//
+// This deliberately couples every pooled sender's independent dispatcher
+// through one mutex: the contract that the user handler is never called
+// concurrently is worth more than per-sender callback parallelism. The
+// trade-off is that a slow handler head-of-line-blocks sibling dispatchers
+// (inflating their drop counters) — acceptable because the handler is expected
+// to be cheap and each dispatcher's bounded inbox absorbs the backpressure.
 func serializeErrorHandler(h SenderErrorHandler) SenderErrorHandler {
 	if h == nil {
 		return nil

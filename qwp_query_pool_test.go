@@ -284,3 +284,62 @@ func TestQwpQueryLeaseExecError(t *testing.T) {
 		t.Error("Exec against a non-responding server should error")
 	}
 }
+
+// poisonQueryWorker latches a terminal transport error on w's bound I/O, the
+// same state a background failover-exhaustion would leave behind.
+func poisonQueryWorker(t *testing.T, w *qwpQueryWorker) {
+	t.Helper()
+	io := w.client.io()
+	if io == nil {
+		t.Fatal("worker client has no bound io to poison")
+	}
+	io.setIoErr(errors.New("test: terminal transport failure"))
+	if w.client.terminalError() == nil {
+		t.Fatal("worker not poisoned after setIoErr")
+	}
+}
+
+// TestQwpQueryPoolBorrowDiscardsTerminalWorker (item #5): a worker that latched
+// a terminal transport error while idle is discarded on borrow and replaced,
+// never handed to the borrower (mirrors the sender pool's M1).
+func TestQwpQueryPoolBorrowDiscardsTerminalWorker(t *testing.T) {
+	p := newQwpQueryPoolForTest(t, 1, 2)
+	ctx := context.Background()
+	p.mu.Lock()
+	poisoned := p.all[0]
+	p.mu.Unlock()
+	poisonQueryWorker(t, poisoned)
+
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer q.Close()
+	if q.worker == poisoned {
+		t.Fatal("borrow handed out the poisoned worker")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, w := range p.all {
+		if w == poisoned {
+			t.Fatal("poisoned worker still in pool after borrow")
+		}
+	}
+}
+
+// TestQwpQueryPoolReapsTerminalWorker (item #5): reapIdle evicts a
+// terminally-failed worker even at minSize (idle/maxLifetime are off here, so
+// only the poisoned branch can reap).
+func TestQwpQueryPoolReapsTerminalWorker(t *testing.T) {
+	p := newQwpQueryPoolForTest(t, 1, 2)
+	p.mu.Lock()
+	poisoned := p.all[0]
+	p.mu.Unlock()
+	poisonQueryWorker(t, poisoned)
+
+	p.reapIdle()
+
+	if total, avail := p.poolSnapshot(); total != 0 || avail != 0 {
+		t.Errorf("poisoned worker not reaped: total=%d avail=%d, want 0/0", total, avail)
+	}
+}

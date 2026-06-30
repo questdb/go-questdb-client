@@ -178,6 +178,7 @@ func newQwpConnDispatcher(listener SenderConnectionListener, capacity int) *qwpD
 		func(e *SenderConnectionEvent) { listener(*e) },
 		func(e *SenderConnectionEvent) string { return e.String() },
 		func(e *SenderConnectionEvent) bool { return e != nil },
+		"qwp/conn",
 		capacity,
 	)
 }

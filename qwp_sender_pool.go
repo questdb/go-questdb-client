@@ -235,7 +235,10 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			if p.closed {
 				p.freeSlotIndexLocked(slotIndex)
 				p.mu.Unlock()
-				_ = slot.delegate.Close(ctx)
+				// Disconnect off-lock with a panic guard and a background ctx — a
+				// cancelled caller ctx must not cut this close short, matching every
+				// other close site in the pool.
+				_ = closeSlotGuarded(context.Background(), slot.delegate)
 				return nil, errPoolClosed
 			}
 			p.all = append(p.all, slot)
@@ -280,7 +283,7 @@ func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broke
 		// for us. The producer is done now, so closing the delegate here cannot
 		// race a writer.
 		p.mu.Unlock()
-		_ = closeSlotGuarded(ps.slot.delegate, ctx)
+		_ = closeSlotGuarded(ctx, ps.slot.delegate)
 		return
 	}
 	if broken {
@@ -314,7 +317,7 @@ func slotTerminallyFailed(delegate QwpSender) bool {
 // slotInUse) or skip sibling teardowns. qwpLineSender.Close is itself panic-
 // guarded on its I/O goroutines; this is defense-in-depth for the pool's own
 // invariants on the paths that bump closingSlots before the out-of-lock Close.
-func closeSlotGuarded(delegate LineSender, ctx context.Context) (err error) {
+func closeSlotGuarded(ctx context.Context, delegate LineSender) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("qwp pool: delegate close panicked: %v", r)
@@ -331,7 +334,7 @@ func (p *qwpSenderPool) discardLocked(ctx context.Context, slot *qwpSenderSlot) 
 		p.closingSlots++
 	}
 	p.mu.Unlock()
-	closeErr := closeSlotGuarded(slot.delegate, ctx)
+	closeErr := closeSlotGuarded(ctx, slot.delegate)
 	p.mu.Lock()
 	p.reclaimSlotLocked(slot, closeErr)
 	p.broadcastLocked()
@@ -374,7 +377,7 @@ func (p *qwpSenderPool) reapIdle() {
 	p.mu.Unlock()
 
 	for _, slot := range toClose {
-		closeErr := closeSlotGuarded(slot.delegate, context.Background())
+		closeErr := closeSlotGuarded(context.Background(), slot.delegate)
 		p.mu.Lock()
 		p.reclaimSlotLocked(slot, closeErr)
 		p.mu.Unlock()
@@ -409,7 +412,7 @@ func (p *qwpSenderPool) close(ctx context.Context) error {
 
 	var firstErr error
 	for _, slot := range toClose {
-		if err := closeSlotGuarded(slot.delegate, ctx); err != nil && firstErr == nil {
+		if err := closeSlotGuarded(ctx, slot.delegate); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

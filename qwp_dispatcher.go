@@ -43,9 +43,10 @@ import (
 // connection-event listener reuses it without copying it. The error
 // dispatcher predates this type and is left as-is; it could migrate here.
 type qwpDispatcher[T any] struct {
-	handler  func(T)
-	describe func(T) string // used only in the panic-recovery log line
-	valid    func(T) bool   // nil → every item is valid
+	handler   func(T)
+	describe  func(T) string // used only in the panic-recovery log line
+	valid     func(T) bool   // nil → every item is valid
+	logPrefix string         // log tag for the panic-recovery line (e.g. "qwp/conn")
 
 	inbox chan T
 	done  chan struct{}
@@ -65,16 +66,20 @@ type qwpDispatcher[T any] struct {
 	wg        sync.WaitGroup
 }
 
-func newQwpDispatcher[T any](handler func(T), describe func(T) string, valid func(T) bool, capacity int) *qwpDispatcher[T] {
+func newQwpDispatcher[T any](handler func(T), describe func(T) string, valid func(T) bool, logPrefix string, capacity int) *qwpDispatcher[T] {
 	if capacity < 1 {
 		capacity = qwpSfDefaultErrorInboxCapacity
 	}
+	if logPrefix == "" {
+		logPrefix = "qwp"
+	}
 	return &qwpDispatcher[T]{
-		handler:  handler,
-		describe: describe,
-		valid:    valid,
-		inbox:    make(chan T, capacity),
-		done:     make(chan struct{}),
+		handler:   handler,
+		describe:  describe,
+		valid:     valid,
+		logPrefix: logPrefix,
+		inbox:     make(chan T, capacity),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -172,7 +177,7 @@ func (d *qwpDispatcher[T]) deliver(e T) {
 			if d.describe != nil {
 				msg = d.describe(e)
 			}
-			log.Printf("[ERROR] qwp/sf: handler panicked on %s: %v", msg, r)
+			log.Printf("[ERROR] %s: handler panicked on %s: %v", d.logPrefix, msg, r)
 		}
 	}()
 	d.handler(e)

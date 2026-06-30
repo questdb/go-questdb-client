@@ -471,7 +471,15 @@ func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
 // connect timeout. Equivalent to the connect-string connect_timeout key.
 func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) {
-		c.connectTimeoutMs = int(d.Milliseconds())
+		ms := int(d.Milliseconds())
+		// A positive sub-millisecond budget must not truncate to 0, which means
+		// "keep the OS default" — floor it to 1ms so a tight budget stays tight.
+		// Matches WithConnectTimeout; a zero or negative duration still keeps the
+		// OS default.
+		if d > 0 && ms == 0 {
+			ms = 1
+		}
+		c.connectTimeoutMs = ms
 	}
 }
 
