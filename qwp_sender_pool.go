@@ -144,10 +144,7 @@ func newQwpSenderPool(
 	for i := 0; i < minSize; i++ {
 		slot, err := p.createSlot(ctx, false)
 		if err != nil {
-			err := p.close(ctx)
-			if err != nil {
-				return nil, err
-			}
+			_ = p.close(ctx)
 			return nil, err
 		}
 		p.all = append(p.all, slot)
