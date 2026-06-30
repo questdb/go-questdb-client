@@ -206,6 +206,73 @@ func TestQwpSenderSteadyStateZeroAllocs(t *testing.T) {
 	}
 }
 
+// qwpPooledSteadyStateSetup wraps the steady-state qwpLineSender in a live
+// qwpPooledSender lease, driving the row build through the lease forwarders then
+// encoding + resetting the underlying sender directly (forwarders don't expose
+// the flush internals). Pins the lease layer BorrowSender adds on the hot path
+// (one live() atomic load + one interface hop per call) (M4).
+func qwpPooledSteadyStateSetup() (*qwpPooledSender, func()) {
+	ctx := context.Background()
+	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	s, _ := qwpSteadyStateSetup()
+	// Standalone slot/lease: the forwarders need only a live generation match.
+	slot := &qwpSenderSlot{delegate: s, slotIndex: -1}
+	gen := slot.generation.Add(1)
+	ps := &qwpPooledSender{slot: slot, gen: gen}
+
+	iter := func() {
+		for r := 0; r < 10; r++ {
+			if err := ps.Table("t").
+				Symbol("sym", "AAPL").
+				Int64Column("qty", int64(100+r)).
+				Float64Column("price", 150.5+float64(r)).
+				StringColumn("note", "test").
+				At(ctx, ts.Add(time.Duration(r)*time.Microsecond)); err != nil {
+				panic(err)
+			}
+		}
+		tables, _ := s.buildTableEncodeInfo()
+		s.encoder.encodeMultiTableWithDeltaDict(
+			tables,
+			s.globalSymbolList,
+			s.maxSentSymbolId,
+			s.batchMaxSymbolId,
+		)
+		s.resetAfterFlush()
+	}
+
+	// Warmup: 2 flushes through the lease to grow all backing buffers.
+	iter()
+	iter()
+	return ps, iter
+}
+
+// BenchmarkQwpPooledSenderSteadyState is the BorrowSender counterpart of
+// BenchmarkQwpSenderSteadyState: the same pipeline through a qwpPooledSender
+// lease. Target: 0 allocs/op, proving the forwarders add no allocation.
+func BenchmarkQwpPooledSenderSteadyState(b *testing.B) {
+	_, iter := qwpPooledSteadyStateSetup()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		iter()
+	}
+}
+
+// TestQwpPooledSenderSteadyStateZeroAllocs pins the pooled-lease hot path at
+// 0 allocs/op (the standalone pin doesn't cover the forwarders). See the
+// sibling pin for the -race caveat.
+func TestQwpPooledSenderSteadyStateZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
+	_, iter := qwpPooledSteadyStateSetup()
+	if allocs := testing.AllocsPerRun(100, iter); allocs > 0 {
+		t.Fatalf("pooled steady-state allocs/op = %g, want 0", allocs)
+	}
+}
+
 // qwpSteadyStateSetupWithNulls mirrors qwpSteadyStateSetup but
 // introduces nulls (by skipping column calls on select rows) and
 // adds a bool column. This exercises the nullable-column bitmap

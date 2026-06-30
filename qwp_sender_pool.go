@@ -363,6 +363,9 @@ func (p *qwpSenderPool) reapIdle() {
 		// removeFromAllLocked already shrinks p.all, so test it directly — do
 		// not also subtract len(toClose) or the reaped count is counted twice
 		// and the pool under-reaps to ~min+excess/2 per tick.
+		// Idle/age recycling is floored at minSize, so max_lifetime_ms is inert
+		// for min slots (M2): no evict-and-replace (recreating mid-outage could
+		// orphan unacked SF data); QWP self-reconnects anyway. See README.
 		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
 			p.removeFromAllLocked(slot)
 			if p.storeAndForward && slot.slotIndex >= 0 {

@@ -154,7 +154,7 @@ db, err := qdb.NewQuestDB(ctx, "ws::addr=localhost:9000;",
 | `query_pool_min` / `query_pool_max` | `WithQueryPoolMin` / `WithQueryPoolMax` | `1` / `4` | Query pool size bounds. |
 | `acquire_timeout_ms` | `WithAcquireTimeout` | `5000` | How long a borrow waits when the pool is at `max`. |
 | `idle_timeout_ms` | `WithIdleTimeout` | `60000` | Idle connection reap, never below `min` (`0` = never). |
-| `max_lifetime_ms` | `WithMaxLifetime` | `1800000` | Max connection age before recycling (`0` = no limit). |
+| `max_lifetime_ms` | `WithMaxLifetime` | `1800000` | Max age before an *above-`min`* idle connection is recycled by the reaper (`0` = no limit). Connections within the `min` floor are not age-recycled — with `min == max` this knob is inert (QWP self-reconnects on a dropped wire regardless). |
 | `housekeeper_interval_ms` | `WithHousekeeperInterval` | `5000` | Reaper sweep interval. |
 | `lazy_connect` | — | `off` | Tolerate a down server at startup (see below). |
 

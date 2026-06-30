@@ -49,13 +49,14 @@ func facadeWriteRows(t *testing.T, s LineSender, idBase int64, count int, tsBase
 	}
 }
 
-// TestQuestDBFacadeLazyConnectDownThenUp is the facade port of Java's
+// TestQwpIntegrationFacadeLazyConnectDownThenUp is the facade port of Java's
 // QuestDBServerRecoveryTest: with lazy_connect=true the handle builds while the
 // server is DOWN (async ingest + read pool min=0), buffers writes meanwhile,
 // then once the server is UP the ingest side reconnects and replays, and reads
 // connect lazily on the first borrow. Requires a fixture-launched (restartable)
 // server; skips against an external QDB_FUZZ_ADDR target.
-func TestQuestDBFacadeLazyConnectDownThenUp(t *testing.T) {
+// TestQwpIntegration* so the qwp-fuzz.yml server-bound -run filters select it (M3).
+func TestQwpIntegrationFacadeLazyConnectDownThenUp(t *testing.T) {
 	srv := fuzzServer(t)
 	if !srv.owns {
 		t.Skip("requires fixture-launched server (cannot pause a QDB_FUZZ_ADDR target)")
@@ -111,12 +112,12 @@ func TestQuestDBFacadeLazyConnectDownThenUp(t *testing.T) {
 	}
 }
 
-// TestQuestDBFacadeSfCrashRecoveryAcrossRestart exercises SF-in-pool crash
+// TestQwpIntegrationFacadeSfCrashRecoveryAcrossRestart exercises SF-in-pool crash
 // recovery (Hazard A/C/D/H end-to-end): a pooled SF sender writes, the server is
 // killed before close so unacked frames stay on disk, then a fresh facade on the
 // same sf_dir reattaches to the stranded slot and replays. Requires a
 // fixture-launched server; skips against an external target.
-func TestQuestDBFacadeSfCrashRecoveryAcrossRestart(t *testing.T) {
+func TestQwpIntegrationFacadeSfCrashRecoveryAcrossRestart(t *testing.T) {
 	srv := fuzzServer(t)
 	if !srv.owns {
 		t.Skip("requires fixture-launched server (cannot kill a QDB_FUZZ_ADDR target)")

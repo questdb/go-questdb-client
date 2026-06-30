@@ -31,10 +31,11 @@ import (
 	"time"
 )
 
-// TestQuestDBFacadeIntegrationRoundTrip drives the QuestDB facade against a real
+// TestQwpIntegrationFacadeRoundTrip drives the QuestDB facade against a real
 // server: borrow a sender, write rows, then borrow a query session and read
 // them back — proving the facade wires both pools to one cluster config.
-func TestQuestDBFacadeIntegrationRoundTrip(t *testing.T) {
+// TestQwpIntegration* so the qwp-fuzz.yml server-bound -run filters select it (M3).
+func TestQwpIntegrationFacadeRoundTrip(t *testing.T) {
 	qwpEnsureServer(t)
 	ctx := context.Background()
 	table := fmt.Sprintf("facade_rt_%d", time.Now().UnixNano())
@@ -98,9 +99,9 @@ func TestQuestDBFacadeIntegrationRoundTrip(t *testing.T) {
 	}
 }
 
-// TestQuestDBFacadeIntegrationLazyConnect proves lazy_connect builds against a
+// TestQwpIntegrationFacadeLazyConnect proves lazy_connect builds against a
 // (reachable) server without prewarming the read pool, then ingests and reads.
-func TestQuestDBFacadeIntegrationLazyConnect(t *testing.T) {
+func TestQwpIntegrationFacadeLazyConnect(t *testing.T) {
 	qwpEnsureServer(t)
 	ctx := context.Background()
 	table := fmt.Sprintf("facade_lazy_%d", time.Now().UnixNano())

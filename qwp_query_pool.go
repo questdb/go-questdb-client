@@ -167,11 +167,18 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 
 func (p *qwpQueryPool) giveBack(ctx context.Context, q *Query, broken bool) {
 	p.mu.Lock()
-	if p.closed || q.worker.generation.Load() != q.gen {
+	if q.worker.generation.Load() != q.gen {
 		p.mu.Unlock()
-		return
+		return // stale lease (already returned / re-borrowed) — never double-act
 	}
 	q.worker.generation.Add(1)
+	if p.closed {
+		// On loan at close (close() skips on-loan workers), so self-close now.
+		// Query.Close drained the active cursor first, so this can't race a read.
+		p.mu.Unlock()
+		_ = closeQueryClientGuarded(ctx, q.worker.client)
+		return
+	}
 	if broken {
 		p.removeFromAllLocked(q.worker)
 		p.mu.Unlock()
@@ -218,6 +225,8 @@ func (p *qwpQueryPool) reapIdle() {
 		poisoned := w.client.terminalError() != nil
 		// removeFromAllLocked already shrinks p.all; test it directly (don't
 		// also subtract len(toClose) — that double-counts and under-reaps).
+		// Idle/age recycling is floored at minSize, so max_lifetime_ms is inert
+		// for min workers (M2, see sender pool + README); poisoned reaps anyway.
 		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
 			p.removeFromAllLocked(w)
 			toClose = append(toClose, w)
@@ -257,14 +266,18 @@ func (p *qwpQueryPool) close(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
-	snapshot := append([]*qwpQueryWorker(nil), p.all...)
+	// Close only available workers: an on-loan one may have a live Batches()
+	// reading its aliased buffers, which a concurrent Close would free (M1,
+	// QwpQueryClient.Close UB). On-loan leases self-close via giveBack; a never-
+	// returned lease leaks, as in qwpSenderPool.close.
+	toClose := append([]*qwpQueryWorker(nil), p.available...)
 	p.all = nil
 	p.available = nil
 	p.broadcastLocked()
 	p.mu.Unlock()
 
 	var firstErr error
-	for _, w := range snapshot {
+	for _, w := range toClose {
 		if err := closeQueryClientGuarded(ctx, w.client); err != nil && firstErr == nil {
 			firstErr = err
 		}

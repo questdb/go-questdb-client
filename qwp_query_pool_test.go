@@ -189,7 +189,33 @@ func TestQwpQueryPoolClosedOps(t *testing.T) {
 		t.Errorf("borrow after close=%v, want errPoolClosed", err)
 	}
 	p.reapIdle()
-	_ = q.Close() // giveBack on a closed pool is a no-op
+	// On loan at close, so close() left it open; returning it self-closes (M1).
+	_ = q.Close()
+}
+
+// TestQwpQueryPoolCloseLeavesOnLoanWorker (M1): close() must not close a worker
+// still on loan (its client may have a live Batches() read); the lease self-
+// closes on return instead.
+func TestQwpQueryPoolCloseLeavesOnLoanWorker(t *testing.T) {
+	p := newQwpQueryPoolForTest(t, 1, 2)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	w := q.worker
+	if err := p.close(ctx); err != nil {
+		t.Fatalf("pool close: %v", err)
+	}
+	if w.client.closed.Load() {
+		t.Fatal("close() force-closed an on-loan worker (would race an in-flight Batches() read)")
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("lease close after pool close: %v", err)
+	}
+	if !w.client.closed.Load() {
+		t.Error("returning the on-loan lease after pool close did not self-close its client")
+	}
 }
 
 func TestQwpQueryPoolDoubleClose(t *testing.T) {
