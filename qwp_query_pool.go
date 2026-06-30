@@ -331,10 +331,13 @@ func (q *Query) live() bool {
 // batches. See QwpQueryClient.Query. Iterate Batches() and Close the returned
 // cursor (or rely on this handle's Close to drain it).
 func (q *Query) Query(ctx context.Context, sql string, opts ...QwpQueryOption) *QwpQuery {
-	if !q.live() {
-		// Use-after-close: return a cursor that surfaces the error from its
-		// first Batches() yield rather than a nil that panics the caller, and
-		// never touch the (possibly re-borrowed) worker.
+	if !q.live() || q.broken {
+		// Use-after-close, or a worker desynced by a prior abandoned drain
+		// (q.broken — live() does not cover it, since a broken lease must still
+		// be Close()d to evict the worker): return a cursor that surfaces the
+		// error from its first Batches() yield rather than a nil that panics the
+		// caller, and never submit on the (possibly re-borrowed or desynced)
+		// worker.
 		return staleQueryCursor()
 	}
 	if q.active != nil {
@@ -369,7 +372,9 @@ func staleQueryCursor() *QwpQuery {
 // Exec runs a non-SELECT statement and blocks until completion. See
 // QwpQueryClient.Exec.
 func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (ExecResult, error) {
-	if !q.live() {
+	if !q.live() || q.broken {
+		// Use-after-close, or a worker already desynced by a prior abandoned
+		// drain: refuse to submit (mirrors the Query top-level gate).
 		return ExecResult{}, errStaleLease
 	}
 	// Drain any cursor left open by Query first: the leased client's
@@ -381,6 +386,17 @@ func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (E
 			q.broken = true
 		}
 		q.active = nil
+	}
+	if q.broken {
+		// The drain abandoned before its terminal frame, leaving leftover
+		// RESULT_BATCH events on the single-stream wire that this Exec would
+		// misread as its own (the egress path does not demux by requestId).
+		// Mirror Query: refuse to submit on the desynced wire and surface
+		// errStaleLease — submitting anyway would both misreport the Exec
+		// result and leave the statement queued to execute server-side
+		// unobserved, so a caller retry could double-execute it. Close evicts
+		// the broken worker rather than recycling it.
+		return ExecResult{}, errStaleLease
 	}
 	res, err := q.worker.client.Exec(ctx, sql, opts...)
 	// A failover-exhausted failure means the client could not re-establish a

@@ -271,6 +271,57 @@ func TestQwpQueryLeaseReopenOverAbandonedDrain(t *testing.T) {
 	}
 }
 
+// TestQwpQueryLeaseExecOverAbandonedDrain is the Exec sibling of
+// TestQwpQueryLeaseReopenOverAbandonedDrain (item C1): Exec must NOT submit on a
+// wire it has just flagged desynced. A prior Query cursor whose cleanup drain
+// abandoned before its terminal frame leaves leftover events on the
+// single-stream wire; Exec drains it, detects drainFailed, marks the worker
+// broken, and must refuse to submit (errStaleLease) rather than misread the
+// leftover frames as its own result while the statement executes server-side
+// unobserved.
+func TestQwpQueryLeaseExecOverAbandonedDrain(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer q.Close()
+
+	c1 := q.Query(ctx, "select 1")
+	// Simulate a caller that broke out of Batches() early and whose cursor
+	// cleanup drain abandoned before the terminal frame.
+	c1.state.Store(qwpQueryStateDone)
+	c1.drainFailed.Store(true)
+
+	_, err = q.Exec(ctx, "insert into t values (1)")
+	if !errors.Is(err, errStaleLease) {
+		t.Errorf("Exec over an abandoned drain must return errStaleLease, got %v", err)
+	}
+	if !q.broken {
+		t.Error("Exec over an abandoned drain must mark the worker broken")
+	}
+	if q.active != nil {
+		t.Error("Exec must not leave a cursor active after refusing to submit")
+	}
+
+	// A second Query/Exec on the now-broken lease must also refuse via the
+	// top-level broken gate, not submit on the still-desynced wire.
+	c2 := q.Query(ctx, "select 2")
+	sawStale := false
+	for _, e := range c2.Batches() {
+		if errors.Is(e, errStaleLease) {
+			sawStale = true
+		}
+	}
+	if !sawStale {
+		t.Error("Query on a broken lease did not yield errStaleLease")
+	}
+	if _, e := q.Exec(ctx, "insert into t values (2)"); !errors.Is(e, errStaleLease) {
+		t.Errorf("Exec on a broken lease must return errStaleLease, got %v", e)
+	}
+}
+
 func TestQwpQueryLeaseExecError(t *testing.T) {
 	p := queryPoolWithIdle(t, 1, 2, 0)
 	q, err := p.borrow(context.Background())
