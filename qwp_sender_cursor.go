@@ -291,11 +291,6 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
 	loop.sendLoopSetEndpoints(conf.endpoints)
 	loop.sendLoopSetConnectionListener(conf.connectionListener, conf.connectionListenerInboxCapacity)
-	// Sync/Off connected synchronously at construction (transport != nil); fire
-	// the one-shot CONNECTED here. The async path fires it from connectWithBackoff.
-	if transport != nil {
-		loop.emitInitialConnected(initialBoundIdx)
-	}
 
 	s, err := newQwpCursorLineSender(
 		conf.autoFlushRows,
@@ -329,6 +324,14 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	// callback on the very first swap.
 	loop.sendLoopSetOnTransportSwap(s.applyServerBatchSizeLimit)
 	s.applyServerBatchSizeLimit(loop.transport.Load())
+	// Sync/Off connected synchronously at construction (transport != nil);
+	// fire the one-shot CONNECTED now that the sender is fully built, so a
+	// construction failure above never leaves a listener believing a sender
+	// connected that never came back. The async path (transport == nil) fires
+	// CONNECTED from connectWithBackoff instead.
+	if transport != nil {
+		loop.emitInitialConnected(initialBoundIdx)
+	}
 	loop.sendLoopStart()
 
 	// Orphan adoption (drain_orphans=on). At foreground startup,

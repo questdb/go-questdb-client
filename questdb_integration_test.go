@@ -76,7 +76,7 @@ func TestQuestDBFacadeIntegrationRoundTrip(t *testing.T) {
 		t.Fatalf("BorrowQuery: %v", err)
 	}
 	defer q.Close()
-	cursor := q.Query(ctx, "select count() from '"+table+"'")
+	cursor := q.Query(ctx, "select count() from "+table)
 	batches := 0
 	for batch, err := range cursor.Batches() {
 		if err != nil {

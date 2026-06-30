@@ -159,6 +159,19 @@ func (c *QwpQueryClient) io() *qwpEgressIO {
 	return c.ioPtr.Load()
 }
 
+// terminalError returns the bound I/O's latched transport-terminal error, or
+// nil if the client is healthy. A non-nil value means the client is poisoned —
+// every subsequent Query/Exec fails fast — so the pool lease should evict the
+// worker rather than recycle it. Used by the Query lease to detect a cursor
+// that ended in failover-exhaustion, whose terminal error surfaces to the
+// caller via Batches() and never reaches the lease handle directly.
+func (c *QwpQueryClient) terminalError() error {
+	if io := c.io(); io != nil {
+		return io.loadIoErr()
+	}
+	return nil
+}
+
 // publishGeneration swaps the bound transport + I/O + the connect-walk
 // metadata. Used by both the initial connect path and the failover
 // reconnect path so the publish ordering stays consistent across both.

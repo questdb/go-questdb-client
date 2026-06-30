@@ -87,7 +87,7 @@ type qwpSenderPool struct {
 // lock on every hand-out and every return; a lease carries the value it was
 // issued, so a stale lease (slot already re-borrowed) is detectable.
 type qwpSenderSlot struct {
-	delegate   LineSender
+	delegate   QwpSender
 	generation atomic.Uint64
 	slotIndex  int // SF slot index, or -1 in memory mode
 	createdAt  time.Time
@@ -144,7 +144,10 @@ func newQwpSenderPool(
 	for i := 0; i < minSize; i++ {
 		slot, err := p.createSlot(ctx, false)
 		if err != nil {
-			p.close(ctx)
+			err := p.close(ctx)
+			if err != nil {
+				return nil, err
+			}
 			return nil, err
 		}
 		p.all = append(p.all, slot)
@@ -273,6 +276,20 @@ func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broke
 	p.mu.Unlock()
 }
 
+// closeSlotGuarded closes a delegate, converting a panic into an error so a
+// faulting Close cannot strand the pool's SF slot accounting (closingSlots /
+// slotInUse) or skip sibling teardowns. qwpLineSender.Close is itself panic-
+// guarded on its I/O goroutines; this is defense-in-depth for the pool's own
+// invariants on the paths that bump closingSlots before the out-of-lock Close.
+func closeSlotGuarded(delegate LineSender, ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("qwp pool: delegate close panicked: %v", r)
+		}
+	}()
+	return delegate.Close(ctx)
+}
+
 // discardLocked evicts a broken slot from `all` and closes its delegate outside
 // the lock. Caller holds mu; discardLocked releases it.
 func (p *qwpSenderPool) discardLocked(ctx context.Context, slot *qwpSenderSlot) {
@@ -281,7 +298,7 @@ func (p *qwpSenderPool) discardLocked(ctx context.Context, slot *qwpSenderSlot) 
 		p.closingSlots++
 	}
 	p.mu.Unlock()
-	closeErr := slot.delegate.Close(ctx)
+	closeErr := closeSlotGuarded(slot.delegate, ctx)
 	p.mu.Lock()
 	p.reclaimSlotLocked(slot, closeErr)
 	p.broadcastLocked()
@@ -319,7 +336,7 @@ func (p *qwpSenderPool) reapIdle() {
 	p.mu.Unlock()
 
 	for _, slot := range toClose {
-		closeErr := slot.delegate.Close(context.Background())
+		closeErr := closeSlotGuarded(slot.delegate, context.Background())
 		p.mu.Lock()
 		p.reclaimSlotLocked(slot, closeErr)
 		p.mu.Unlock()
@@ -348,7 +365,7 @@ func (p *qwpSenderPool) close(ctx context.Context) error {
 
 	var firstErr error
 	for _, slot := range snapshot {
-		if err := slot.delegate.Close(ctx); err != nil && firstErr == nil {
+		if err := closeSlotGuarded(slot.delegate, ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -402,8 +419,15 @@ func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async b
 	if err != nil {
 		return nil, err
 	}
+	// The facade is ws/wss-only, so newLineSender always yields a QWP sender;
+	// asserting here lets a pooled lease forward the full QwpSender surface.
+	qwpDelegate, ok := delegate.(QwpSender)
+	if !ok {
+		_ = delegate.Close(ctx)
+		return nil, fmt.Errorf("qwp pool: delegate is %T, not a QwpSender", delegate)
+	}
 	now := time.Now()
-	return &qwpSenderSlot{delegate: delegate, slotIndex: slotIndex, createdAt: now, idleSince: now}, nil
+	return &qwpSenderSlot{delegate: qwpDelegate, slotIndex: slotIndex, createdAt: now, idleSince: now}, nil
 }
 
 // inRangeFence reports whether name is one of the pool's managed in-range slot
@@ -505,6 +529,12 @@ type qwpPooledSender struct {
 	gen    uint64
 	broken bool
 }
+
+// A borrowed lease must expose the full QWP surface so callers can type-assert it
+// to QwpSender — matching the Java client, whose borrowSender() returns the
+// complete Sender. BorrowSender returns the LineSender view; this keeps the
+// QwpSender forwarders below exhaustive at compile time.
+var _ QwpSender = (*qwpPooledSender)(nil)
 
 func (ps *qwpPooledSender) live() bool {
 	return ps.slot.generation.Load() == ps.gen
@@ -648,20 +678,257 @@ func (ps *qwpPooledSender) Flush(ctx context.Context) error {
 	return nil
 }
 
+// --- QwpSender interface: extended column types and accessors ---
+//
+// A borrowed sender is handed back as a LineSender, but the delegate is always a
+// QWP sender (the facade is ws/wss-only), so callers can type-assert the lease to
+// QwpSender and reach the binary-protocol-only column types — exactly as they do
+// with a standalone QWP sender. These forwarders mirror the LineSender ones: the
+// fluent setters no-op on a stale lease and return the lease; the row/flush
+// methods error with errStaleLease; the read-only accessors report a dead lease's
+// zero value rather than leaking the re-borrowed slot's state.
+
+func (ps *qwpPooledSender) ByteColumn(name string, val int8) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.ByteColumn(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) ShortColumn(name string, val int16) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.ShortColumn(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Int32Column(name string, val int32) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Int32Column(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Float32Column(name string, val float32) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Float32Column(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) CharColumn(name string, val rune) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.CharColumn(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) DateColumn(name string, val time.Time) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.DateColumn(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) TimestampNanosColumn(name string, val time.Time) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.TimestampNanosColumn(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) UuidColumn(name string, hi, lo uint64) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.UuidColumn(name, hi, lo)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) GeohashColumn(name string, hash uint64, precision int) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.GeohashColumn(name, hash, precision)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Int64Array1DColumn(name string, values []int64) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Int64Array1DColumn(name, values)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Int64Array2DColumn(name string, values [][]int64) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Int64Array2DColumn(name, values)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Int64Array3DColumn(name string, values [][][]int64) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Int64Array3DColumn(name, values)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Decimal64Column(name string, val Decimal) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Decimal64Column(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Decimal128Column(name string, val Decimal) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Decimal128Column(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Decimal256Column(name string, val Decimal) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Decimal256Column(name, val)
+	}
+	return ps
+}
+
+// AtNano closes the current row with a nanosecond designated timestamp. Like At,
+// a delegate error marks the slot broken so Close discards rather than recycles it.
+func (ps *qwpPooledSender) AtNano(ctx context.Context, ts time.Time) error {
+	if !ps.live() {
+		return errStaleLease
+	}
+	if err := ps.slot.delegate.AtNano(ctx, ts); err != nil {
+		ps.broken = true
+		return err
+	}
+	return nil
+}
+
+// FlushAndGetSequence mirrors Flush, additionally returning the published FSN.
+func (ps *qwpPooledSender) FlushAndGetSequence(ctx context.Context) (int64, error) {
+	if !ps.live() {
+		return 0, errStaleLease
+	}
+	fsn, err := ps.slot.delegate.FlushAndGetSequence(ctx)
+	if err != nil {
+		ps.broken = true
+		return fsn, err
+	}
+	return fsn, nil
+}
+
+// AwaitAckedFsn blocks until the delegate has acknowledged target. It does not
+// touch broken: a terminal error here also surfaces on the next producer call (or
+// the Close flush), which is where the slot is marked for discard.
+func (ps *qwpPooledSender) AwaitAckedFsn(ctx context.Context, target int64) error {
+	if !ps.live() {
+		return errStaleLease
+	}
+	return ps.slot.delegate.AwaitAckedFsn(ctx, target)
+}
+
+func (ps *qwpPooledSender) AckedFsn() int64 {
+	if !ps.live() {
+		return -1
+	}
+	return ps.slot.delegate.AckedFsn()
+}
+
+func (ps *qwpPooledSender) LastTerminalError() *SenderError {
+	if !ps.live() {
+		return nil
+	}
+	return ps.slot.delegate.LastTerminalError()
+}
+
+func (ps *qwpPooledSender) TotalServerErrors() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.TotalServerErrors()
+}
+
+func (ps *qwpPooledSender) DroppedErrorNotifications() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.DroppedErrorNotifications()
+}
+
+func (ps *qwpPooledSender) DroppedConnectionNotifications() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.DroppedConnectionNotifications()
+}
+
+func (ps *qwpPooledSender) TotalErrorNotificationsDelivered() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.TotalErrorNotificationsDelivered()
+}
+
+func (ps *qwpPooledSender) TotalReconnectAttempts() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.TotalReconnectAttempts()
+}
+
+func (ps *qwpPooledSender) TotalReconnectsSucceeded() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.TotalReconnectsSucceeded()
+}
+
+func (ps *qwpPooledSender) TotalFramesReplayed() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.TotalFramesReplayed()
+}
+
+func (ps *qwpPooledSender) TotalBackpressureStalls() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.TotalBackpressureStalls()
+}
+
+func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
+	if !ps.live() {
+		return nil
+	}
+	return ps.slot.delegate.BackgroundDrainers()
+}
+
 // Close returns the leased sender to the pool. It flushes pending rows first so
 // the next borrower starts clean; a flush failure marks the slot broken so it
 // is discarded rather than recycled. Idempotent — a stale lease no-ops.
-func (ps *qwpPooledSender) Close(ctx context.Context) error {
+//
+// The flush and return run on context.Background, not the caller's ctx: Flush
+// only publishes into the cursor engine (it never waits for the server ACK), so
+// a request-scoped ctx must not (a) leave pending rows un-published in a slot
+// the next borrower reuses, or (b) mark a healthy slot broken via a
+// context.Canceled / DeadlineExceeded. Both would thrash the pool under the
+// standard `ctx, cancel := ...; defer sender.Close(ctx)` pattern. The publish is
+// bounded by the engine's append deadline, not the caller's ctx.
+func (ps *qwpPooledSender) Close(_ context.Context) error {
 	if !ps.live() {
 		return nil
 	}
 	var flushErr error
+	ctx1 := context.Background()
 	if !ps.broken {
-		flushErr = ps.slot.delegate.Flush(ctx)
+		flushErr = ps.slot.delegate.Flush(ctx1)
 		if flushErr != nil {
 			ps.broken = true
 		}
 	}
-	ps.pool.giveBack(ctx, ps, ps.broken)
+	ps.pool.giveBack(ctx1, ps, ps.broken)
 	return flushErr
 }

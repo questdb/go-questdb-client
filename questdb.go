@@ -284,13 +284,19 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // always runs.
 func (db *QuestDB) Close(ctx context.Context) error {
 	db.closeOnce.Do(func() {
-		closeStep(func() error { db.housekeeper.stopAndJoin(); return nil })
+		hErr := closeStep(func() error { db.housekeeper.stopAndJoin(); return nil })
 		qErr := closeStep(func() error { return db.queryPool.close(ctx) })
 		sErr := closeStep(func() error { return db.senderPool.close(ctx) })
-		if sErr != nil {
+		// Every step ran; surface the most actionable error, preferring
+		// the sender pool (owns flocks/I/O) over the query pool over the
+		// housekeeper so a recovered panic in any step is not lost.
+		switch {
+		case sErr != nil:
 			db.closeErr = sErr
-		} else {
+		case qErr != nil:
 			db.closeErr = qErr
+		case hErr != nil:
+			db.closeErr = hErr
 		}
 	})
 	return db.closeErr

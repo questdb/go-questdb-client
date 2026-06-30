@@ -357,6 +357,16 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	if opts.authTimeoutMs > 0 {
 		httpTransport.ResponseHeaderTimeout = time.Duration(opts.authTimeoutMs) * time.Millisecond
 	}
+	// Bound the TLS handshake (wss): a host that accepts TCP but black-holes the
+	// handshake would otherwise hang until ctx. Prefer auth_timeout (the
+	// handshake+auth budget); fall back to connect_timeout so a config that sets
+	// only connect_timeout still bounds the handshake, not just the TCP connect.
+	switch {
+	case opts.authTimeoutMs > 0:
+		httpTransport.TLSHandshakeTimeout = time.Duration(opts.authTimeoutMs) * time.Millisecond
+	case opts.connectTimeoutMs > 0:
+		httpTransport.TLSHandshakeTimeout = time.Duration(opts.connectTimeoutMs) * time.Millisecond
+	}
 
 	if t.dumpWriter != nil {
 		// Dump mode: use an in-process pipe with a fake server. The
@@ -389,9 +399,9 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		}
 	}
 	// connect_timeout bounds the TCP connect. Skipped in dump mode, which
-	// installs its own pipe DialContext above. For wss the transport runs the
-	// TLS handshake after this dialer returns, so only the TCP connect is
-	// clamped — the handshake and upgrade stay under authTimeoutMs.
+	// installs its own pipe DialContext above. The TLS handshake (wss) is
+	// bounded by TLSHandshakeTimeout above (auth_timeout, else connect_timeout);
+	// the upgrade response read is bounded by auth_timeout via ResponseHeaderTimeout.
 	if t.dumpWriter == nil && opts.connectTimeoutMs > 0 {
 		httpTransport.DialContext = (&net.Dialer{
 			Timeout: time.Duration(opts.connectTimeoutMs) * time.Millisecond,

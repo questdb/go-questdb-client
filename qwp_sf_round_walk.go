@@ -327,22 +327,24 @@ func qwpSfRunSingleRound(
 			}
 		}
 
-		if params.OnEndpointFailed != nil {
-			params.OnEndpointFailed(idx, err)
-		}
-
 		// Classify the failure. Typed *QwpUpgradeRejectError carries
 		// the precise spec-relevant fields; everything else is a
 		// generic transport error.
 		var rej *QwpUpgradeRejectError
 		if errors.As(err, &rej) {
 			// AuthError (401 / 403): terminal per §6. Bypass failover.
+			// Suppress OnEndpointFailed: a terminal auth reject must
+			// surface as AUTH_FAILED only, not preceded by a transient
+			// endpoint-failure event (matches Java's QwpWebSocketSender).
 			if rej.StatusCode == 401 || rej.StatusCode == 403 {
 				return qwpSfSingleRoundResult{
 					Idx:      -1,
 					Attempts: attempts,
 					Terminal: rej,
 				}
+			}
+			if params.OnEndpointFailed != nil {
+				params.OnEndpointFailed(idx, err)
 			}
 			// X-QuestDB-Zone on a 421 reject is intentionally ignored
 			// on the SF-ingest path: the ingress walk does not route by
@@ -363,6 +365,9 @@ func qwpSfRunSingleRound(
 
 		// Non-upgrade-reject failure: TCP/TLS dial error,
 		// response-header timeout, etc. — all transient.
+		if params.OnEndpointFailed != nil {
+			params.OnEndpointFailed(idx, err)
+		}
 		params.Tracker.RecordTransportError(idx)
 		lastWasRoleReject = false
 	}

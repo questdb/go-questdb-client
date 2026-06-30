@@ -119,6 +119,69 @@ func TestQuestDBFacadeEndToEnd(t *testing.T) {
 	}
 }
 
+// TestQuestDBBorrowSenderExposesQwpSender pins the Java-parity contract that a
+// borrowed lease is the full sender: callers type-assert it to QwpSender and reach
+// the binary-protocol-only column types, exactly as with a standalone QWP sender.
+func TestQuestDBBorrowSenderExposesQwpSender(t *testing.T) {
+	ctx := context.Background()
+	gotData := make(chan struct{}, 1)
+	srv := newQuestDBTestServer(t, gotData)
+	defer srv.Close()
+
+	db, err := NewQuestDB(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer db.Close(ctx)
+
+	s, err := db.BorrowSender(ctx)
+	if err != nil {
+		t.Fatalf("BorrowSender: %v", err)
+	}
+	qs, ok := s.(QwpSender)
+	if !ok {
+		t.Fatalf("borrowed lease %T does not implement QwpSender", s)
+	}
+	// QWP-only column types, fluent through the lease, plus AtNano. Table/Symbol
+	// return LineSender (errors latch), so the QWP chain starts from a QWP method —
+	// the same idiom as a standalone QWP sender.
+	qs.Table("trades")
+	qs.Symbol("sym", "BTC")
+	if err := qs.
+		ByteColumn("flags", 7).
+		Int32Column("seq", 42).
+		UuidColumn("id", 1, 2).
+		AtNano(ctx, time.Unix(0, 1_700_000_000_000_000_000)); err != nil {
+		t.Fatalf("write via QwpSender lease: %v", err)
+	}
+	if _, err := qs.FlushAndGetSequence(ctx); err != nil {
+		t.Fatalf("FlushAndGetSequence: %v", err)
+	}
+	select {
+	case <-gotData:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never received the flushed batch")
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// After return, the lease is stale: QWP producer calls error, accessors report
+	// a dead lease's zero value instead of leaking the re-borrowed slot's state.
+	if err := qs.AtNano(ctx, time.Unix(0, 1)); err != errStaleLease {
+		t.Errorf("stale AtNano err=%v, want errStaleLease", err)
+	}
+	if got := qs.AckedFsn(); got != -1 {
+		t.Errorf("stale AckedFsn=%d, want -1", got)
+	}
+	if got := qs.TotalReconnectAttempts(); got != 0 {
+		t.Errorf("stale TotalReconnectAttempts=%d, want 0", got)
+	}
+	if got := qs.BackgroundDrainers(); got != nil {
+		t.Errorf("stale BackgroundDrainers=%v, want nil", got)
+	}
+}
+
 func TestQuestDBRejectsNonWsSchema(t *testing.T) {
 	for _, conf := range []string{"http::addr=localhost:9000;", "tcp::addr=localhost:9009;"} {
 		if _, err := Connect(context.Background(), conf); err == nil {

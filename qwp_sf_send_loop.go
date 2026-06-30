@@ -1410,7 +1410,11 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		attempt := l.reconnectAttempts.Load()
 		switch {
 		case !l.connectedOnce.Swap(true):
-			l.emitConn(SenderConnected, result.Idx, -1, attempt, nil)
+			// First successful connect in the sender's lifetime — not a
+			// reconnect, so AttemptNumber is 0 (matches the sync/off
+			// emitInitialConnected path and the SenderConnectionEvent
+			// contract: 0 = initial / not-a-reconnect).
+			l.emitConn(SenderConnected, result.Idx, -1, 0, nil)
 		case result.Idx == enteringPreviousIdx:
 			l.emitConn(SenderReconnected, result.Idx, -1, attempt, nil)
 		default:

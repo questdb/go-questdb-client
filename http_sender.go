@@ -114,6 +114,12 @@ type httpLineSender struct {
 
 	// Global transport is used unless a custom transport was provided.
 	globalTransport *globalHttpTransport
+
+	// ownedTransport is a private transport this sender created (the
+	// connect_timeout or insecure-skip-verify paths) and must close idle
+	// connections for on Close. Nil when using the global transport (refcounted)
+	// or a caller-supplied one (the caller owns it).
+	ownedTransport *http.Transport
 }
 
 type httpLineSenderV2 struct {
@@ -149,11 +155,14 @@ func newHttpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender,
 		transport = newHttpTransport()
 		transport.DisableKeepAlives = true
 		transport.TLSClientConfig.InsecureSkipVerify = true
+		s.ownedTransport = transport
 	} else if conf.connectTimeoutMs > 0 {
 		// connect_timeout needs a private transport: the shared global dialer
-		// must not be mutated for a single sender.
+		// must not be mutated for a single sender. Keep-alives stay on so
+		// setting a connect budget does not silently regress ILP-over-HTTP
+		// throughput versus the shared global transport.
 		transport = newHttpTransport()
-		transport.DisableKeepAlives = true
+		s.ownedTransport = transport
 	} else {
 		// Otherwise, use the global transport.
 		s.globalTransport = globalTransport
@@ -379,6 +388,13 @@ func (s *httpLineSender) Close(ctx context.Context) error {
 
 	if s.globalTransport != nil {
 		s.globalTransport.UnregisterClient()
+	}
+	// A private transport pools idle keep-alive connections that nothing else
+	// will reap; close them now so a short-lived sender does not strand sockets
+	// for IdleConnTimeout. The global transport is refcounted above; a
+	// caller-supplied transport is the caller's to close.
+	if s.ownedTransport != nil {
+		s.ownedTransport.CloseIdleConnections()
 	}
 
 	return err

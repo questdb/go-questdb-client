@@ -313,6 +313,13 @@ func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (E
 	if !q.live() {
 		return ExecResult{}, errStaleLease
 	}
+	// Drain any cursor left open by Query first: the leased client's
+	// dispatcher is single-stream, so an in-flight cursor would otherwise
+	// race the Exec submission for the next terminal frame.
+	if q.active != nil {
+		q.active.Close()
+		q.active = nil
+	}
 	res, err := q.worker.client.Exec(ctx, sql, opts...)
 	// A failover-exhausted failure means the client could not re-establish a
 	// connection within budget; evict the worker on return rather than recycle
@@ -336,6 +343,14 @@ func (q *Query) Close() error {
 	if q.active != nil {
 		q.active.Close()
 		q.active = nil
+	}
+	// A cursor that ended in failover-exhaustion (or any transport-terminal
+	// fault) latches the client's terminal error; detect it here so the
+	// poisoned worker is evicted, not recycled. The Query cursor path surfaces
+	// its terminal error to the caller via Batches(), not to this lease, so
+	// Exec's eager *QwpFailoverExhaustedError check does not cover it.
+	if !q.broken && q.worker.client.terminalError() != nil {
+		q.broken = true
 	}
 	q.closed = true
 	q.pool.giveBack(context.Background(), q, q.broken)
