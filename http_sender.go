@@ -34,6 +34,7 @@ import (
 	"io"
 	"math/big"
 	"math/rand"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -148,10 +149,23 @@ func newHttpLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender,
 		transport = newHttpTransport()
 		transport.DisableKeepAlives = true
 		transport.TLSClientConfig.InsecureSkipVerify = true
+	} else if conf.connectTimeoutMs > 0 {
+		// connect_timeout needs a private transport: the shared global dialer
+		// must not be mutated for a single sender.
+		transport = newHttpTransport()
+		transport.DisableKeepAlives = true
 	} else {
 		// Otherwise, use the global transport.
 		s.globalTransport = globalTransport
 		transport = globalTransport.transport
+	}
+	// Bound the TCP connect on the private transport (never a user-supplied one,
+	// which the caller owns). The TLS handshake stays under the transport's
+	// TLSHandshakeTimeout.
+	if conf.connectTimeoutMs > 0 && conf.httpTransport == nil {
+		transport.DialContext = (&net.Dialer{
+			Timeout: time.Duration(conf.connectTimeoutMs) * time.Millisecond,
+		}).DialContext
 	}
 
 	s.client = http.Client{

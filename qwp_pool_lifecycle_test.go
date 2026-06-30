@@ -1,0 +1,294 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb
+
+import (
+	"context"
+	"errors"
+	"math/big"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func senderPoolWithIdle(t *testing.T, extra string, min, max int, idle time.Duration) *qwpSenderPool {
+	t.Helper()
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";" + extra
+	p, err := newQwpSenderPool(context.Background(), conf, min, max,
+		500*time.Millisecond, idle, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+	return p
+}
+
+// TestQwpSenderPoolReapsToMin pins the reapIdle fix: a single sweep must shrink
+// the pool all the way to minSize (the earlier double-count bug reaped only
+// ~half the excess per sweep).
+func TestQwpSenderPoolReapsToMin(t *testing.T) {
+	p := senderPoolWithIdle(t, "", 1, 4, time.Millisecond)
+	ctx := context.Background()
+	var leases []LineSender
+	for i := 0; i < 4; i++ {
+		s, err := p.borrow(ctx)
+		if err != nil {
+			t.Fatalf("borrow %d: %v", i, err)
+		}
+		leases = append(leases, s)
+	}
+	if total, _, _ := p.poolSnapshot(); total != 4 {
+		t.Fatalf("grew to total=%d, want 4", total)
+	}
+	for _, s := range leases {
+		_ = s.Close(ctx)
+	}
+	time.Sleep(5 * time.Millisecond) // exceed idle
+	p.reapIdle()
+	if total, avail, _ := p.poolSnapshot(); total != 1 || avail != 1 {
+		t.Errorf("after reap total=%d avail=%d, want 1/1", total, avail)
+	}
+	// The freed SF/memory slots are reusable — a fresh borrow succeeds.
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow after reap: %v", err)
+	}
+	_ = s.Close(ctx)
+}
+
+// TestQwpSenderPoolSfStrandedSlotRecovered pins the critical Hazard-A fix:
+// a recovered in-range slot reserves its index, so a later growth borrow does
+// not re-allocate the live index and collide on the slot flock.
+func TestQwpSenderPoolSfStrandedSlotRecovered(t *testing.T) {
+	sfDir := t.TempDir()
+	ctx := context.Background()
+
+	// Phase 1: an async sender to a down host buffers a row durably into the
+	// slot dir default-2, then closes without the server ever acking it.
+	s1, err := LineSenderFromConf(ctx,
+		"ws::addr=127.0.0.1:1;sf_dir="+sfDir+";sender_id=default-2;"+
+			"initial_connect_retry=async;close_flush_timeout_millis=0;")
+	if err != nil {
+		t.Fatalf("phase 1 open: %v", err)
+	}
+	_ = s1.Table("t").Int64Column("v", 1).AtNow(ctx)
+	_ = s1.Flush(ctx)
+	time.Sleep(50 * time.Millisecond)
+	_ = s1.Close(ctx)
+	if !qwpSfIsCandidateOrphan(filepath.Join(sfDir, "default-2")) {
+		t.Skip("no stranded segment produced in this environment")
+	}
+
+	// Phase 2: a pool on the same sf_dir against an up server recovers slot 2.
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";sf_dir=" + sfDir + ";"
+	p, err := newQwpSenderPool(ctx, conf, 1, 4, 500*time.Millisecond, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("phase 2 build: %v", err)
+	}
+	defer p.close(ctx)
+
+	if total, _, _ := p.poolSnapshot(); total != 2 {
+		t.Fatalf("total=%d, want 2 (prewarm slot 0 + recovered slot 2)", total)
+	}
+	p.mu.Lock()
+	reserved := p.slotInUse[2]
+	p.mu.Unlock()
+	if !reserved {
+		t.Fatal("slotInUse[2] not reserved after recovery — Hazard A regression")
+	}
+	// Grow to max: indices 1 and 3 are allocated, never the live index 2, so no
+	// "slot already in use" collision.
+	var leases []LineSender
+	for i := 0; i < 2; i++ {
+		s, err := p.borrow(ctx)
+		if err != nil {
+			t.Fatalf("growth borrow %d collided with the recovered slot: %v", i, err)
+		}
+		leases = append(leases, s)
+	}
+	for _, s := range leases {
+		_ = s.Close(ctx)
+	}
+}
+
+// TestQwpSenderPoolBrokenSlotDiscarded pins the broken-slot path: a lease whose
+// write latched an error is discarded on Close, not recycled.
+func TestQwpSenderPoolBrokenSlotDiscarded(t *testing.T) {
+	p := senderPoolWithIdle(t, "", 1, 2, 0)
+	ctx := context.Background()
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	// An invalid table name latches an error surfaced by AtNow → lease broken.
+	if err := s.Table("bad\tname").Int64Column("v", 1).AtNow(ctx); err == nil {
+		t.Skip("validation did not reject the bad name in this build")
+	}
+	_ = s.Close(ctx)
+	if _, avail, _ := p.poolSnapshot(); avail != 0 {
+		t.Errorf("broken slot was returned to the pool (available=%d, want 0)", avail)
+	}
+}
+
+func TestQwpSenderPoolBorrowCtxCancelled(t *testing.T) {
+	p := senderPoolWithIdle(t, "", 0, 1, 0)
+	ctx := context.Background()
+	s, err := p.borrow(ctx) // take the only slot
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer s.Close(ctx)
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.borrow(cctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("borrow with cancelled ctx err=%v, want context.Canceled", err)
+	}
+}
+
+func queryPoolWithIdle(t *testing.T, min, max int, idle time.Duration) *qwpQueryPool {
+	t.Helper()
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		for {
+			if _, _, err := m.conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	})
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpQueryPool(context.Background(), conf, min, max, 500*time.Millisecond, idle, 0)
+	if err != nil {
+		t.Fatalf("newQwpQueryPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+	return p
+}
+
+func TestQwpQueryPoolReapsToMin(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 4, time.Millisecond)
+	ctx := context.Background()
+	var leases []*Query
+	for i := 0; i < 4; i++ {
+		q, err := p.borrow(ctx)
+		if err != nil {
+			t.Fatalf("borrow %d: %v", i, err)
+		}
+		leases = append(leases, q)
+	}
+	for _, q := range leases {
+		_ = q.Close()
+	}
+	time.Sleep(5 * time.Millisecond)
+	p.reapIdle()
+	if total, avail := p.poolSnapshot(); total != 1 || avail != 1 {
+		t.Errorf("after reap total=%d avail=%d, want 1/1", total, avail)
+	}
+}
+
+func TestQwpQueryPoolBorrowCtxCancelled(t *testing.T) {
+	p := queryPoolWithIdle(t, 0, 1, 0)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer q.Close()
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.borrow(cctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("borrow with cancelled ctx err=%v, want context.Canceled", err)
+	}
+}
+
+// testShopDecimal is a minimal ShopspringDecimal for the column-forward test.
+type testShopDecimal struct{}
+
+func (testShopDecimal) Coefficient() *big.Int { return big.NewInt(123) }
+func (testShopDecimal) Exponent() int32       { return -2 }
+
+// TestQwpPooledSenderForwardsAllColumns exercises every LineSender column
+// forward on the pooled lease (each forward delegates to the underlying sender).
+func TestQwpPooledSenderForwardsAllColumns(t *testing.T) {
+	p := senderPoolWithIdle(t, "", 1, 2, 0)
+	ctx := context.Background()
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer s.Close(ctx)
+	dec, _ := NewDecimal(big.NewInt(12345), 2)
+	ndArr, _ := NewNDArray[float64](2)
+	s.Table("t").
+		Symbol("sym", "v").
+		Int64Column("i", 1).
+		Long256Column("l", big.NewInt(2)).
+		TimestampColumn("ts", time.Now()).
+		Float64Column("f", 1.5).
+		DecimalColumn("dec", dec).
+		DecimalColumnFromString("decs", "1.23").
+		DecimalColumnShopspring("decss", testShopDecimal{}).
+		StringColumn("s", "x").
+		BoolColumn("b", true).
+		Float64Array1DColumn("a1", []float64{1, 2}).
+		Float64Array2DColumn("a2", [][]float64{{1}, {2}}).
+		Float64Array3DColumn("a3", [][][]float64{{{1}}}).
+		Float64ArrayNDColumn("aN", ndArr)
+	// Coverage of the forwards is the point; the row itself may be rejected.
+	_ = s.AtNow(ctx)
+	_ = s.Flush(ctx)
+}
+
+// TestQwpSenderPoolSfReapsToMin covers the SF reap path: reaping a slot frees
+// its on-disk slot index, which a later borrow reuses.
+func TestQwpSenderPoolSfReapsToMin(t *testing.T) {
+	p := senderPoolWithIdle(t, "sf_dir="+t.TempDir()+";", 1, 4, time.Millisecond)
+	ctx := context.Background()
+	var leases []LineSender
+	for i := 0; i < 4; i++ {
+		s, err := p.borrow(ctx)
+		if err != nil {
+			t.Fatalf("borrow %d: %v", i, err)
+		}
+		leases = append(leases, s)
+	}
+	for _, s := range leases {
+		_ = s.Close(ctx)
+	}
+	time.Sleep(5 * time.Millisecond)
+	p.reapIdle()
+	if total, _, leaked := p.poolSnapshot(); total != 1 || leaked != 0 {
+		t.Errorf("after SF reap total=%d leaked=%d, want 1/0", total, leaked)
+	}
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow after SF reap: %v", err)
+	}
+	_ = s.Close(ctx)
+}

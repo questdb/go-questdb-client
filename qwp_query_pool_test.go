@@ -1,0 +1,245 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+func newQwpQueryPoolForTest(t *testing.T, min, max int) *qwpQueryPool {
+	t.Helper()
+	// Keep each upgraded connection open until the client closes it, so
+	// borrow/return mechanics aren't disturbed by an early server close.
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		for {
+			if _, _, err := m.conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	})
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpQueryPool(context.Background(), conf, min, max,
+		500*time.Millisecond, 0, 0)
+	if err != nil {
+		t.Fatalf("newQwpQueryPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+	return p
+}
+
+func TestQwpQueryPoolBorrowReuse(t *testing.T) {
+	p := newQwpQueryPoolForTest(t, 1, 4)
+	if total, _ := p.poolSnapshot(); total != 1 {
+		t.Fatalf("prewarm: total=%d, want 1", total)
+	}
+	q, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	q2, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("re-borrow: %v", err)
+	}
+	defer q2.Close()
+	if total, _ := p.poolSnapshot(); total != 1 {
+		t.Errorf("after reuse: total=%d, want 1 (no growth)", total)
+	}
+}
+
+func TestQwpQueryPoolLazyMinZero(t *testing.T) {
+	p := newQwpQueryPoolForTest(t, 0, 2)
+	// min=0 (the lazy read pool): build prewarms nothing.
+	if total, _ := p.poolSnapshot(); total != 0 {
+		t.Fatalf("lazy pool prewarmed total=%d, want 0", total)
+	}
+	q, err := p.borrow(context.Background()) // connects on first borrow
+	if err != nil {
+		t.Fatalf("first borrow: %v", err)
+	}
+	defer q.Close()
+	if total, _ := p.poolSnapshot(); total != 1 {
+		t.Errorf("after first borrow: total=%d, want 1", total)
+	}
+}
+
+func TestQwpQueryPoolStaleLeaseExec(t *testing.T) {
+	p := newQwpQueryPoolForTest(t, 1, 2)
+	q, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	q.Close()
+	if _, err := q.Exec(context.Background(), "select 1"); !errors.Is(err, errStaleLease) {
+		t.Fatalf("stale Exec err=%v, want errStaleLease", err)
+	}
+}
+
+func TestQwpQueryPoolExhausted(t *testing.T) {
+	p := newQwpQueryPoolForTest(t, 0, 1)
+	q, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer q.Close()
+	if _, err := p.borrow(context.Background()); !errors.Is(err, errPoolExhausted) {
+		t.Fatalf("second borrow err=%v, want errPoolExhausted", err)
+	}
+}
+
+// TestQwpQueryPoolGiveBackBroken covers the broken-worker discard branch.
+func TestQwpQueryPoolGiveBackBroken(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	p.giveBack(ctx, q, true) // broken → worker evicted, not recycled
+	if total, avail := p.poolSnapshot(); avail != 0 || total != 0 {
+		t.Errorf("broken worker recycled: total=%d avail=%d, want 0/0", total, avail)
+	}
+}
+
+// TestQwpQueryLeaseStaleQuery covers the stale-lease cursor (Query on a closed
+// handle yields errStaleLease from Batches rather than a nil panic).
+func TestQwpQueryLeaseStaleQuery(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	_ = q.Close()
+	cur := q.Query(ctx, "select 1")
+	sawStale := false
+	for _, err := range cur.Batches() {
+		if errors.Is(err, errStaleLease) {
+			sawStale = true
+		}
+	}
+	if !sawStale {
+		t.Error("stale Query cursor did not yield errStaleLease")
+	}
+}
+
+func TestQwpQueryPoolPrewarmFailure(t *testing.T) {
+	_, err := newQwpQueryPool(context.Background(), "ws::addr=127.0.0.1:1;", 1, 2, 200*time.Millisecond, 0, 0)
+	if err == nil {
+		t.Error("query prewarm against a down server should fail the build")
+	}
+}
+
+func TestQwpQueryPoolBorrowCreateError(t *testing.T) {
+	ctx := context.Background()
+	p, err := newQwpQueryPool(ctx, "ws::addr=127.0.0.1:1;", 0, 1, 200*time.Millisecond, 0, 0)
+	if err != nil {
+		t.Fatalf("build (min=0 must not connect): %v", err)
+	}
+	defer p.close(ctx)
+	if _, err := p.borrow(ctx); err == nil {
+		t.Error("query borrow against a down server should fail")
+	}
+}
+
+func TestQwpQueryPoolConstructorErrors(t *testing.T) {
+	if _, err := newQwpQueryPool(context.Background(), "ws::addr=a:9000;", 3, 1, time.Second, 0, 0); err == nil {
+		t.Error("query pool min>max should error")
+	}
+}
+
+func TestQwpQueryPoolClosedOps(t *testing.T) {
+	ctx := context.Background()
+	p := queryPoolWithIdle(t, 1, 2, time.Second)
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	_ = p.close(ctx)
+	if _, err := p.borrow(ctx); !errors.Is(err, errPoolClosed) {
+		t.Errorf("borrow after close=%v, want errPoolClosed", err)
+	}
+	p.reapIdle()
+	_ = q.Close() // giveBack on a closed pool is a no-op
+}
+
+func TestQwpQueryPoolDoubleClose(t *testing.T) {
+	ctx := context.Background()
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	if err := p.close(ctx); err != nil {
+		t.Errorf("query close: %v", err)
+	}
+	if err := p.close(ctx); err != nil {
+		t.Errorf("query double close: %v", err)
+	}
+}
+
+func TestQwpQueryLeaseCloseIdempotent(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Errorf("first close: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Errorf("second (stale) close: %v", err)
+	}
+}
+
+func TestQwpQueryLeaseReopenClosesPrevious(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer q.Close()
+	_ = q.Query(ctx, "select 1")
+	_ = q.Query(ctx, "select 2") // active != nil → previous cursor closed
+}
+
+func TestQwpQueryLeaseExecError(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	q, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer q.Close()
+	ectx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := q.Exec(ectx, "drop table nope"); err == nil {
+		t.Error("Exec against a non-responding server should error")
+	}
+}

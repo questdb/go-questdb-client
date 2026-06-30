@@ -451,6 +451,17 @@ func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
 	}
 }
 
+// WithQwpQueryConnectTimeout bounds the TCP connect on each endpoint dial, so a
+// black-holed host is abandoned within d instead of riding the OS connect
+// timeout. It clamps only the TCP connect; the upgrade response read stays
+// under WithQwpQueryAuthTimeout. A zero or negative duration keeps the OS
+// connect timeout. Equivalent to the connect-string connect_timeout key.
+func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) {
+		c.connectTimeoutMs = int(d.Milliseconds())
+	}
+}
+
 // WithQwpQueryReplayExec opts Exec into transparent replay on
 // transport-terminal failure. Default false because non-idempotent
 // statements (INSERT / UPDATE / DELETE / DDL) might double-execute

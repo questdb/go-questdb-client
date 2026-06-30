@@ -289,6 +289,13 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	}
 	loop.sendLoopSetPolicyResolver(resolver)
 	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
+	loop.sendLoopSetEndpoints(conf.endpoints)
+	loop.sendLoopSetConnectionListener(conf.connectionListener, conf.connectionListenerInboxCapacity)
+	// Sync/Off connected synchronously at construction (transport != nil); fire
+	// the one-shot CONNECTED here. The async path fires it from connectWithBackoff.
+	if transport != nil {
+		loop.emitInitialConnected(initialBoundIdx)
+	}
 
 	s, err := newQwpCursorLineSender(
 		conf.autoFlushRows,
@@ -348,7 +355,12 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			maxDrainers = 4 // matches Java default
 		}
 		ownSlot := filepath.Base(slotPath)
-		orphans := qwpSfScanOrphans(conf.sfDir, ownSlot)
+		// Exclude this sender's own slot always, plus any slot the pool fences
+		// off as a live in-range sibling (Hazard G); nil fence on standalone.
+		orphans := qwpSfScanOrphans(conf.sfDir, func(name string) bool {
+			return name == ownSlot ||
+				(conf.orphanDrainExclude != nil && conf.orphanDrainExclude(name))
+		})
 		if len(orphans) > 0 {
 			pool := qwpSfNewDrainerPool(maxDrainers)
 			// Publish the pool onto the sender before submitting any
@@ -955,6 +967,14 @@ func (s *qwpLineSender) DroppedErrorNotifications() int64 {
 		return 0
 	}
 	return s.cursorSendLoop.sendLoopDispatcher().droppedNotifications()
+}
+
+// DroppedConnectionNotifications implements QwpSender.DroppedConnectionNotifications.
+func (s *qwpLineSender) DroppedConnectionNotifications() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopConnDispatcher().droppedNotifications()
 }
 
 // TotalErrorNotificationsDelivered implements

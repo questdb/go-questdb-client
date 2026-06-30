@@ -70,6 +70,7 @@ var ingressOnlyKeys = map[string]bool{
 	"auto_flush_interval":                   true,
 	"auto_flush_rows":                       true,
 	"close_flush_timeout_millis":            true,
+	"connection_listener_inbox_capacity":    true,
 	"drain_orphans":                         true,
 	"durable_ack_keepalive_interval_millis": true,
 	"error_inbox_capacity":                  true,
@@ -94,6 +95,22 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_durability":                         true,
 	"sf_max_bytes":                          true,
 	"sf_max_total_bytes":                    true,
+}
+
+// poolKeys are the facade-owned (Side.POOL) connect-string keys. They are
+// meaningful only to the QuestDB facade (questdb.go); both standalone clients
+// accept-but-ignore them on ws/wss so one cluster config validates through the
+// ingest and egress parsers alike. Kept in sync with QuestDB facade options.
+var poolKeys = map[string]bool{
+	"lazy_connect":            true,
+	"sender_pool_min":         true,
+	"sender_pool_max":         true,
+	"query_pool_min":          true,
+	"query_pool_max":          true,
+	"acquire_timeout_ms":      true,
+	"idle_timeout_ms":         true,
+	"max_lifetime_ms":         true,
+	"housekeeper_interval_ms": true,
 }
 
 func confFromStr(conf string) (*lineSenderConfig, error) {
@@ -253,6 +270,14 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				panic("add a case for " + k)
 			}
+		case "connect_timeout":
+			// COMMON key (Java parity): accepted on every schema so a shared
+			// connect string ports. Wired on HTTP and QWP; inert on TCP.
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.connectTimeoutMs = parsedVal
 		case "tls_verify":
 			switch v {
 			case "on":
@@ -524,6 +549,22 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 					k, parsedVal, qwpSfMinErrorInboxCapacity)
 			}
 			senderConf.errorInboxCapacity = parsedVal
+		case "connection_listener_inbox_capacity":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			// 0 is the "use the default capacity" sentinel; any other sub-floor
+			// value is a user-supplied undersized inbox and is rejected.
+			if parsedVal != 0 && parsedVal < qwpSfMinErrorInboxCapacity {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %d: must be >= %d",
+					k, parsedVal, qwpSfMinErrorInboxCapacity)
+			}
+			senderConf.connectionListenerInboxCapacity = parsedVal
 		case "request_durable_ack":
 			if senderConf.senderType != qwpSenderType {
 				// sf-client.md §4.6 mandates rejecting
@@ -567,13 +608,16 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
 		default:
-			if senderConf.senderType == qwpSenderType && egressOnlyKeys[k] {
+			if senderConf.senderType == qwpSenderType && (egressOnlyKeys[k] || poolKeys[k]) {
 				// Silently accepted on ingress so a single ws:: / wss::
 				// connect string can configure both Sender and
 				// QwpQueryClient. The Sender does not interpret the
 				// value — range/enum/type checks run on the egress side
 				// (qwp_query_conf.go). connect-string.md §16-20 and
 				// §Query client keys are the load-bearing spec text.
+				// poolKeys are facade-owned (Side.POOL): both standalone
+				// clients accept-but-ignore them so the QuestDB facade can
+				// validate one cluster config through both parsers.
 				continue
 			}
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)

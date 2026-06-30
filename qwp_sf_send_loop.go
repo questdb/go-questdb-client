@@ -170,6 +170,20 @@ type qwpSfSendLoop struct {
 	// Atomic pointer for the same reason as policyResolver.
 	dispatcher atomic.Pointer[qwpSfErrorDispatcher]
 
+	// connDispatcher delivers SenderConnectionEvent payloads to the
+	// user-supplied SenderConnectionListener, off the I/O goroutine.
+	// Non-nil; uses the loud default when no listener is configured.
+	connDispatcher atomic.Pointer[qwpDispatcher[*SenderConnectionEvent]]
+
+	// connectedOnce flips true on the first successful connect so the
+	// connect-event emitter can tell CONNECTED from RECONNECTED/FAILED_OVER.
+	connectedOnce atomic.Bool
+
+	// endpoints is the addr= list, indexed by the bound idx the round-walk
+	// returns, used to fill SenderConnectionEvent host:port. Set once before
+	// the I/O goroutine starts; read-only thereafter.
+	endpoints []qwpEndpoint
+
 	// fsnAtZero is the FSN that wireSeq=0 maps to on the current
 	// connection. After a reconnect it's set to engine.ackedFsn()+1
 	// so server-side ACK math stays aligned with the disk state.
@@ -344,6 +358,7 @@ func qwpSfNewSendLoop(
 	}
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
 	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
+	l.connDispatcher.Store(newQwpConnDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
 	l.transport.Store(transport)
 	// Seed the "nothing fully sent yet" / "nothing ACK'd yet" sentinels;
 	// positionCursorForStart and swapClient re-establish both on every
@@ -450,6 +465,58 @@ func (l *qwpSfSendLoop) sendLoopDispatcher() *qwpSfErrorDispatcher {
 	return l.dispatcher.Load()
 }
 
+// sendLoopSetConnectionListener replaces the connection-event listener and the
+// dispatcher inbox capacity. Mirrors sendLoopSetErrorHandler.
+func (l *qwpSfSendLoop) sendLoopSetConnectionListener(listener SenderConnectionListener, capacity int) {
+	if capacity <= 0 {
+		capacity = qwpSfDefaultErrorInboxCapacity
+	}
+	old := l.connDispatcher.Swap(newQwpConnDispatcher(listener, capacity))
+	if old != nil {
+		old.close()
+	}
+}
+
+// sendLoopSetEndpoints records the addr= list so connection events can carry
+// host:port for a bound index. Called once before sendLoopStart.
+func (l *qwpSfSendLoop) sendLoopSetEndpoints(endpoints []qwpEndpoint) {
+	l.endpoints = endpoints
+}
+
+// sendLoopConnDispatcher returns the current connection-event dispatcher.
+func (l *qwpSfSendLoop) sendLoopConnDispatcher() *qwpDispatcher[*SenderConnectionEvent] {
+	return l.connDispatcher.Load()
+}
+
+// emitConn builds and offers a connection event. idx/previousIdx are endpoint
+// indices (-1 when not applicable); host:port are filled from l.endpoints.
+func (l *qwpSfSendLoop) emitConn(kind SenderConnectionEventKind, idx, previousIdx int, attempt int64, cause error) {
+	e := &SenderConnectionEvent{
+		Kind:            kind,
+		AttemptNumber:   attempt,
+		Cause:           cause,
+		TimestampMillis: time.Now().UnixMilli(),
+	}
+	if idx >= 0 && idx < len(l.endpoints) {
+		e.Host = l.endpoints[idx].host
+		e.Port = l.endpoints[idx].port
+	}
+	if previousIdx >= 0 && previousIdx < len(l.endpoints) {
+		e.PreviousHost = l.endpoints[previousIdx].host
+		e.PreviousPort = l.endpoints[previousIdx].port
+	}
+	l.connDispatcher.Load().offer(e)
+}
+
+// emitInitialConnected fires the one-shot CONNECTED event for a sender that
+// connected synchronously at construction (InitialConnectOff/Sync). The async
+// path emits CONNECTED from connectWithBackoff instead.
+func (l *qwpSfSendLoop) emitInitialConnected(idx int) {
+	if l.connectedOnce.CompareAndSwap(false, true) {
+		l.emitConn(SenderConnected, idx, -1, 0, nil)
+	}
+}
+
 // sendLoopStart launches the I/O goroutine. Idempotent — a second
 // call panics.
 func (l *qwpSfSendLoop) sendLoopStart() {
@@ -478,6 +545,9 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 		_ = t.close()
 	}
 	if d := l.dispatcher.Load(); d != nil {
+		d.close()
+	}
+	if d := l.connDispatcher.Load(); d != nil {
 		d.close()
 	}
 	return l.checkErrorOrNil()
@@ -862,6 +932,7 @@ func (l *qwpSfSendLoop) run() {
 					l.silentConnStrikes.Load(), err.Error())
 				se := l.qwpSfBuildBudgetExhaustedSE(reason)
 				l.totalServerErrors.Add(1)
+				l.emitConn(SenderReconnectBudgetExhausted, -1, -1, 0, err)
 				l.recordFatalServerError(se)
 				l.dispatcher.Load().offer(se)
 				return
@@ -870,6 +941,8 @@ func (l *qwpSfSendLoop) run() {
 			// also sends frames and meets silence the strike count
 			// crosses the threshold and we HALT then.
 		}
+		// The wire dropped; announce the outage before the reconnect walk.
+		l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
 		// Reconnect with backoff.
 		ok := l.connectWithBackoff(err, "reconnect")
 		if !ok {
@@ -1297,6 +1370,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 	enteringPreviousIdx := l.previousIdx
 	l.previousIdx = -1
 
+	var round int64
 	params := qwpSfRoundWalkParams{
 		Factory:        l.reconnectFactory,
 		Tracker:        l.tracker,
@@ -1306,6 +1380,17 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		OnAttempt: func() {
 			l.reconnectAttempts.Add(1)
 			l.totalReconnectAttempts.Add(1)
+		},
+		OnEndpointFailed: func(idx int, derr error) {
+			l.emitConn(SenderEndpointAttemptFailed, idx, -1, l.reconnectAttempts.Load(), derr)
+		},
+		OnRoundExhausted: func() {
+			round++
+			l.connDispatcher.Load().offer(&SenderConnectionEvent{
+				Kind:            SenderAllEndpointsUnreachable,
+				RoundNumber:     round,
+				TimestampMillis: time.Now().UnixMilli(),
+			})
 		},
 	}
 	result := qwpSfRunRoundWalk(l.ctx, nil, params, enteringPreviousIdx)
@@ -1322,11 +1407,24 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 			return false
 		}
 		l.totalReconnects.Add(1)
+		attempt := l.reconnectAttempts.Load()
+		switch {
+		case !l.connectedOnce.Swap(true):
+			l.emitConn(SenderConnected, result.Idx, -1, attempt, nil)
+		case result.Idx == enteringPreviousIdx:
+			l.emitConn(SenderReconnected, result.Idx, -1, attempt, nil)
+		default:
+			l.emitConn(SenderFailedOver, result.Idx, enteringPreviousIdx, attempt, nil)
+		}
 		return true
 	}
 	if result.Terminal != nil {
 		se := l.qwpSfBuildUpgradeFailureSE(result.Terminal)
 		l.totalServerErrors.Add(1)
+		// Fire the terminal connection event before latching the producer-
+		// observable error, so a listener is notified no later than the
+		// producer learns via its next API call (matches Java's order).
+		l.emitConn(SenderAuthFailed, -1, -1, l.reconnectAttempts.Load(), result.Terminal)
 		l.recordFatalServerError(se)
 		l.dispatcher.Load().offer(se)
 		return false
@@ -1350,6 +1448,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		phase, result.Exhausted, initial)
 	se := l.qwpSfBuildBudgetExhaustedSE(reason)
 	l.totalServerErrors.Add(1)
+	l.emitConn(SenderReconnectBudgetExhausted, -1, -1, l.reconnectAttempts.Load(), result.Exhausted)
 	l.recordFatalServerError(se)
 	l.dispatcher.Load().offer(se)
 	return false

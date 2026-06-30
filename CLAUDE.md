@@ -177,9 +177,39 @@ is the supported recovery (matches Java).
 
 ### Connection pooling
 
-`sender_pool.go` (`LineSenderPool`) is **HTTP-only by design** — TCP/QWP configs
-are rejected with `errHttpOnlySender`. QWP has its own concurrency model and
-doesn't participate.
+`sender_pool.go` (`LineSenderPool`) is the legacy **HTTP-only** pool — TCP/QWP
+configs are rejected with `errHttpOnlySender`.
+
+QWP pooling lives behind the **`QuestDB` facade** (`questdb.go`), ported from the
+Java client (design doc: `design/questdb-facade.md`). `Connect` /
+`NewQuestDB(ctx, conf, opts...)` take one `ws`/`wss` cluster config and own two
+elastic pools — `qwpSenderPool` (`qwp_sender_pool.go`) and `qwpQueryPool`
+(`qwp_query_pool.go`) — plus a reaper (`qwp_pool_housekeeper.go`).
+`BorrowSender` leases a `LineSender`; `BorrowQuery` leases a `*Query` that
+delegates to the cursor/iterator API; `Close` on a lease returns it to the pool,
+the real disconnect waits for `QuestDB.Close`. Leases are **generation-stamped**
+so a stale handle can't corrupt a re-borrowed slot.
+
+- **`lazy_connect=true`** (facade-only `Side.POOL` key; standalone clients
+  accept-but-ignore it) tolerates a down server at startup: ingest gets
+  `initial_connect_retry=async` injected and the read pool defaults to
+  `query_pool_min=0` (connects on first borrow). `build()` rejects the two
+  conflicts (non-`async` `initial_connect_retry`; explicit `query_pool_min>0`).
+- **SF-in-pool** (`sf_dir` set): each slot gets `sender_id=<base>-<index>`
+  (`slotInUse` bitmap), every pooled sender fences the in-range slot set out of
+  orphan adoption (`lineSenderConfig.orphanDrainExclude` →
+  `qwpSfScanOrphans`'s exclusion predicate), and crash-stranded in-range slots
+  are recovered by binding an async self-recovering sender to each at
+  construction (no dedicated recoverer; build never blocks). Hazard checklist
+  A–I in the design doc §4.4 is the bar.
+- Pool/facade connect-string keys: `sender_pool_min/max`, `query_pool_min/max`,
+  `acquire_timeout_ms`, `idle_timeout_ms`, `max_lifetime_ms`,
+  `housekeeper_interval_ms`, `lazy_connect` (all in `poolKeys`, `conf_parse.go`).
+
+`connect_timeout` (COMMON key) bounds the TCP connect on HTTP + QWP dials (inert
+on TCP, Java parity); `WithConnectionListener` + `connection_listener_inbox_capacity`
+add a `SenderConnectionListener` event stream (`sender_connection_listener.go`)
+over the generic `qwpDispatcher[T]` (`qwp_dispatcher.go`).
 
 ## Testing
 

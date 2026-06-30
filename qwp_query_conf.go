@@ -110,6 +110,12 @@ type qwpQueryClientConfig struct {
 	// SERVER_INFO frame read (that uses serverInfoTimeout). Default
 	// qwpDefaultAuthTimeoutMs (15_000); must be > 0.
 	authTimeoutMs int
+	// connectTimeoutMs bounds the TCP connect (ms) on each endpoint dial,
+	// so a black-holed host is abandoned within budget instead of riding
+	// the OS connect timeout. Clamps only the TCP connect; the upgrade
+	// response read stays under authTimeoutMs. 0 (default) keeps the OS
+	// connect timeout. Connect-string key connect_timeout.
+	connectTimeoutMs int
 	// failoverEnabled toggles transparent reconnect-and-replay on
 	// transport-terminal failure mid-query. Default true; matches
 	// Java's failover=on default. When false, transport errors
@@ -520,6 +526,13 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 					"auth_timeout_ms must be > 0, got %d", n)
 			}
 			cfg.authTimeoutMs = n
+		case "connect_timeout":
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				return nil, NewInvalidConfigStrError(
+					"connect_timeout must be a positive int (milliseconds), got %q", v)
+			}
+			cfg.connectTimeoutMs = n
 		case "failover":
 			switch v {
 			case "on":
@@ -596,14 +609,16 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 					"invalid replay_exec %q, expected on or off", v)
 			}
 		default:
-			if ingressOnlyKeys[k] {
+			if ingressOnlyKeys[k] || poolKeys[k] {
 				// Silently accepted on egress so a single ws:: / wss::
 				// connect string can drive both Sender and
 				// QwpQueryClient. The QwpQueryClient does not
 				// interpret the value — range/enum/type checks run on
 				// the ingress side (conf_parse.go).
 				// connect-string.md §16-20 is the load-bearing spec
-				// text.
+				// text. poolKeys are facade-owned (Side.POOL): accepted
+				// but ignored here so the QuestDB facade validates one
+				// cluster config through both parsers.
 				continue
 			}
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)

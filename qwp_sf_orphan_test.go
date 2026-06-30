@@ -61,18 +61,18 @@ func TestQwpSfScanOrphansFindsCandidates(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "own-slot"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "own-slot", "sf-x.sfa"), []byte{}, 0o644))
 
-	orphans := qwpSfScanOrphans(root, "own-slot")
+	orphans := qwpSfScanOrphans(root, func(name string) bool { return name == "own-slot" })
 	require.Len(t, orphans, 1)
 	assert.Equal(t, filepath.Join(root, "orphan-1"), orphans[0])
 }
 
 func TestQwpSfScanOrphansEmptyDirReturnsNothing(t *testing.T) {
 	root := t.TempDir()
-	assert.Empty(t, qwpSfScanOrphans(root, ""))
+	assert.Empty(t, qwpSfScanOrphans(root, nil))
 }
 
 func TestQwpSfScanOrphansMissingDirReturnsNothing(t *testing.T) {
-	assert.Empty(t, qwpSfScanOrphans("/nonexistent/path", ""))
+	assert.Empty(t, qwpSfScanOrphans("/nonexistent/path", nil))
 }
 
 func TestQwpSfMarkSlotFailed(t *testing.T) {

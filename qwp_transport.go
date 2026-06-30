@@ -156,6 +156,13 @@ type qwpTransportOpts struct {
 	// pre-failover-spec behavior; sanitizeQwpConf seeds 15000 for
 	// QWP-configured callers.
 	authTimeoutMs int
+
+	// connectTimeoutMs bounds the TCP connect only (via a net.Dialer
+	// deadline), so a black-holed host is abandoned within this budget
+	// instead of riding the OS connect timeout. The TLS handshake and the
+	// upgrade response read stay under authTimeoutMs. Zero keeps the OS
+	// connect timeout. Mirrors the Java client's connect_timeout key.
+	connectTimeoutMs int
 }
 
 // qwpTransport wraps a WebSocket connection for sending QWP
@@ -380,6 +387,15 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 			InsecureSkipVerify: true,
 			MinVersion:         tls.VersionTLS12,
 		}
+	}
+	// connect_timeout bounds the TCP connect. Skipped in dump mode, which
+	// installs its own pipe DialContext above. For wss the transport runs the
+	// TLS handshake after this dialer returns, so only the TCP connect is
+	// clamped — the handshake and upgrade stay under authTimeoutMs.
+	if t.dumpWriter == nil && opts.connectTimeoutMs > 0 {
+		httpTransport.DialContext = (&net.Dialer{
+			Timeout: time.Duration(opts.connectTimeoutMs) * time.Millisecond,
+		}).DialContext
 	}
 	dialOpts.HTTPClient = &http.Client{Transport: httpTransport}
 

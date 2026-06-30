@@ -160,6 +160,12 @@ type QwpSender interface {
 	// raise WithErrorInboxCapacity or speed up the handler.
 	DroppedErrorNotifications() int64
 
+	// DroppedConnectionNotifications returns the cumulative count of
+	// SenderConnectionEvent payloads dropped because the listener's
+	// bounded inbox was full. Non-zero means the listener is too slow;
+	// raise WithConnectionListenerInboxCapacity or speed it up.
+	DroppedConnectionNotifications() int64
+
 	// TotalErrorNotificationsDelivered returns the cumulative count
 	// of SenderError payloads delivered to the user-supplied
 	// handler. Includes deliveries where the handler panicked

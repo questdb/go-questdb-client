@@ -147,6 +147,14 @@ type qwpSfRoundWalkParams struct {
 	// can bump observability counters (totalReconnectAttempts,
 	// per-attempt status, etc.).
 	OnAttempt func()
+	// OnEndpointFailed, when non-nil, fires after a dial fails for a real
+	// host reason (not a cancellation), with the failed endpoint index and
+	// the dial error. Drives the SenderEndpointAttemptFailed event.
+	OnEndpointFailed func(idx int, err error)
+	// OnRoundExhausted, when non-nil, fires once each time a full
+	// address-list sweep fails to bind any host. Drives the
+	// SenderAllEndpointsUnreachable event.
+	OnRoundExhausted func()
 }
 
 // qwpSfSingleRoundResult is the inner-loop return shape for one walk
@@ -319,6 +327,10 @@ func qwpSfRunSingleRound(
 			}
 		}
 
+		if params.OnEndpointFailed != nil {
+			params.OnEndpointFailed(idx, err)
+		}
+
 		// Classify the failure. Typed *QwpUpgradeRejectError carries
 		// the precise spec-relevant fields; everything else is a
 		// generic transport error.
@@ -409,8 +421,11 @@ func qwpSfRunRoundWalk(
 			}
 		}
 
-		// Round exhausted. Pay one round-boundary sleep or terminate
-		// if the budget is gone.
+		// Round exhausted: a full address-list sweep bound no host.
+		if params.OnRoundExhausted != nil {
+			params.OnRoundExhausted()
+		}
+		// Pay one round-boundary sleep or terminate if the budget is gone.
 		elapsed := time.Since(outageStart)
 		if elapsed >= params.MaxDuration {
 			return qwpSfRoundWalkResult{

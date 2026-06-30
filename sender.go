@@ -345,6 +345,12 @@ type lineSenderConfig struct {
 	zone          string          // QWP-only; honoured on egress, inert on ingest (no zone routing)
 	target        QwpTargetFilter // QWP-only; zero value = QwpTargetAny
 
+	// connectTimeoutMs bounds the TCP connect (ms). COMMON key: parsed on
+	// every schema for Java connect-string parity, but wired only on HTTP and
+	// QWP — the TCP ILP dial leaves it inert, matching the Java client. 0 keeps
+	// the OS connect timeout.
+	connectTimeoutMs int
+
 	// Retry/timeout-related fields
 	retryTimeout   time.Duration
 	minThroughput  int
@@ -405,6 +411,11 @@ type lineSenderConfig struct {
 	closeFlushTimeoutSet             bool               // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
 	drainOrphans                     bool               // default false (Phase 6)
 	maxBackgroundDrainers            int                // 0 -> 4 (Phase 6)
+	// orphanDrainExclude, when non-nil, fences additional slot names from
+	// orphan adoption beyond the sender's own slot. The QwpSender pool sets it
+	// to its in-range slot set so a pooled sender never adopts a live sibling's
+	// dir (Hazard G). nil for standalone senders. Internal; no connect-string key.
+	orphanDrainExclude func(slotName string) bool
 
 	// QWP server-error API (Phase 5). All fields are QWP-only.
 	errorHandler         SenderErrorHandler    // nil -> default loud handler
@@ -413,6 +424,10 @@ type lineSenderConfig struct {
 	errorPolicyPerCatSet bool                  // tracks whether *any* per-category override was set
 	errorPolicyGlobal    Policy                // PolicyAuto = unset
 	errorInboxCapacity   int                   // 0 -> qwpSfDefaultErrorInboxCapacity; sanitizer floors at qwpSfMinErrorInboxCapacity
+
+	// QWP connection-event listener (all fields QWP-only).
+	connectionListener              SenderConnectionListener // nil -> default loud listener
+	connectionListenerInboxCapacity int                      // 0 -> qwpSfDefaultErrorInboxCapacity
 }
 
 // LineSenderOption defines line sender config option.
@@ -499,6 +514,32 @@ func WithCloseTimeout(d time.Duration) LineSenderOption {
 func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.errorHandler = h
+	}
+}
+
+// WithConnectionListener registers a callback invoked asynchronously when the
+// QWP sender observes a connection-state transition (connect, disconnect,
+// reconnect, failover, terminal auth/budget failure). The listener runs on a
+// dedicated dispatcher goroutine; a slow listener cannot stall publishing, and
+// surplus events are dropped when the bounded inbox fills (visible via
+// QwpSender.DroppedConnectionNotifications()). Passing nil reverts to the
+// default loud listener. See SenderConnectionListener for the contract.
+//
+// Only available for the QWP sender.
+func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.connectionListener = l
+	}
+}
+
+// WithConnectionListenerInboxCapacity sets the bounded inbox depth for the
+// connection-event dispatcher. A non-positive value uses the default.
+// Equivalent to the connect-string connection_listener_inbox_capacity key.
+//
+// Only available for the QWP sender.
+func WithConnectionListenerInboxCapacity(capacity int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.connectionListenerInboxCapacity = capacity
 	}
 }
 
@@ -720,6 +761,19 @@ func WithQwpDumpWriter(w io.Writer) LineSenderOption {
 func WithAuthTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.authTimeoutMs = int(d / time.Millisecond)
+	}
+}
+
+// WithConnectTimeout bounds the TCP connect to a QuestDB endpoint, so a
+// black-holed or firewalled host is abandoned within d instead of riding the
+// much longer OS connect timeout. It clamps only the TCP connect; the TLS
+// handshake and the QWP upgrade response stay under WithAuthTimeout. A zero or
+// negative duration keeps the OS connect timeout. Honoured by the HTTP and QWP
+// senders; accepted but inert on TCP. Equivalent to the connect-string
+// connect_timeout key.
+func WithConnectTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.connectTimeoutMs = int(d / time.Millisecond)
 	}
 }
 
@@ -1436,6 +1490,9 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		conf.errorInboxCapacity != 0 {
 		return errors.New("server-error API settings are only available in the QWP client")
 	}
+	if conf.connectionListener != nil || conf.connectionListenerInboxCapacity != 0 {
+		return errors.New("connection listener settings are only available in the QWP client")
+	}
 	var name string
 	switch {
 	case conf.sfDir != "":
@@ -1485,6 +1542,7 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,
+		connectTimeoutMs:      conf.connectTimeoutMs,
 		// QWP has a single protocol version; advertise it.
 		// serverInfoTimeout stays zero: the ingest endpoint sends no
 		// SERVER_INFO frame and the client never expects one — it sends
