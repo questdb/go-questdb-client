@@ -308,15 +308,35 @@ func (q *Query) Query(ctx context.Context, sql string, opts ...QwpQueryOption) *
 		// Use-after-close: return a cursor that surfaces the error from its
 		// first Batches() yield rather than a nil that panics the caller, and
 		// never touch the (possibly re-borrowed) worker.
-		stale := &QwpQuery{pendingErr: errStaleLease}
-		stale.state.Store(qwpQueryStateDone)
-		return stale
+		return staleQueryCursor()
 	}
 	if q.active != nil {
+		// Drain the cursor left open by a prior Query first, then mirror
+		// Exec/Close: a drain that abandoned before the terminal frame leaves
+		// leftover events on the single-stream wire that a fresh query would
+		// misread as its own (the egress path does not demux by requestId).
+		// Mark the worker broken so Close evicts it, and refuse to submit on
+		// the desynced wire — surface the error from the cursor's first
+		// Batches() yield rather than serving wrong rows first.
 		q.active.Close()
+		desynced := q.active.drainFailed.Load()
+		q.active = nil
+		if desynced {
+			q.broken = true
+			return staleQueryCursor()
+		}
 	}
 	q.active = q.worker.client.Query(ctx, sql, opts...)
 	return q.active
+}
+
+// staleQueryCursor returns an already-done cursor whose first Batches() yield
+// surfaces errStaleLease, used when the lease is dead or the worker's wire is
+// desynced and must not serve another query.
+func staleQueryCursor() *QwpQuery {
+	stale := &QwpQuery{pendingErr: errStaleLease}
+	stale.state.Store(qwpQueryStateDone)
+	return stale
 }
 
 // Exec runs a non-SELECT statement and blocks until completion. See

@@ -230,6 +230,47 @@ func TestQwpQueryLeaseReopenClosesPrevious(t *testing.T) {
 	_ = q.Query(ctx, "select 2") // active != nil → previous cursor closed
 }
 
+// TestQwpQueryLeaseReopenOverAbandonedDrain covers the desync hazard: reopening
+// a lease whose previous cursor's cleanup drain abandoned before its terminal
+// frame must mark the worker broken (so Close evicts it instead of recycling a
+// wire-desynced worker) and refuse to submit the new query on the desynced wire
+// (so the caller gets errStaleLease, not silently the prior cursor's leftover
+// frames).
+func TestQwpQueryLeaseReopenOverAbandonedDrain(t *testing.T) {
+	p := queryPoolWithIdle(t, 1, 2, 0)
+	ctx := context.Background()
+	q, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer q.Close()
+
+	c1 := q.Query(ctx, "select 1")
+	// Simulate a caller that broke out of Batches() early and whose cursor
+	// cleanup drain abandoned before the terminal frame: the cursor is Done
+	// with drainFailed latched, leaving leftover events on the single-stream
+	// wire.
+	c1.state.Store(qwpQueryStateDone)
+	c1.drainFailed.Store(true)
+
+	c2 := q.Query(ctx, "select 2")
+	if !q.broken {
+		t.Error("reopening over an abandoned drain must mark the worker broken")
+	}
+	if q.active != nil {
+		t.Error("Query must refuse to submit on the desynced wire (active stays nil)")
+	}
+	sawStale := false
+	for _, err := range c2.Batches() {
+		if errors.Is(err, errStaleLease) {
+			sawStale = true
+		}
+	}
+	if !sawStale {
+		t.Error("desynced reopen cursor did not yield errStaleLease")
+	}
+}
+
 func TestQwpQueryLeaseExecError(t *testing.T) {
 	p := queryPoolWithIdle(t, 1, 2, 0)
 	q, err := p.borrow(context.Background())
