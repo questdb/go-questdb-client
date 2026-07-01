@@ -833,6 +833,11 @@ func WithRequestDurableAck(enabled bool) LineSenderOption {
 // sends to prod an idle server into flushing pending STATUS_DURABLE_ACK frames. A
 // zero or negative duration disables it. Inert unless WithRequestDurableAck(true);
 // default 200ms. Equivalent to the durable_ack_keepalive_interval_millis key.
+//
+// Disabling the keepalive is not recommended on an idle producer: the server
+// only flushes durable acks on inbound events, so a quiescent last frame may
+// have no ack to advance AckedFsn, leaving AwaitAckedFsn blocked (and Close's
+// drain wait reporting a spurious "data may be lost") until the next flush.
 func WithDurableAckKeepaliveInterval(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		ms := int(d / time.Millisecond)

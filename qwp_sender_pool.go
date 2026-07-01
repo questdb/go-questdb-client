@@ -327,6 +327,13 @@ type unackedReporter interface {
 	hasUnackedRows() bool
 }
 
+// rowDiscarder lets the pool drop a delegate's in-progress (un-At'd) row on the
+// lease-return path before flushing, without growing the public QwpSender
+// interface. Every pooled delegate is a *qwpLineSender, which implements it.
+type rowDiscarder interface {
+	discardOpenRow()
+}
+
 // slotHasUnackedRows reports whether an idle slot's delegate still has in-flight
 // rows the server has not acknowledged. Reaping such a memory-mode slot would
 // destroy those rows and cut short the reconnect/replay window that could still
@@ -1076,6 +1083,14 @@ func (ps *qwpPooledSender) Close(_ context.Context) error {
 	var flushErr error
 	ctx1 := context.Background()
 	if !ps.broken {
+		// Drop any in-progress row before flushing so the slot never returns
+		// dirty. Flush early-returns errFlushWithPendingMessage while a row
+		// is open (non-terminal, so the slot is kept), leaving hasTable /
+		// currentTable set and committed rows unflushed — poisoning the next
+		// borrower (C1). Mirrors closeCursor's standalone-path discard.
+		if rd, ok := ps.slot.delegate.(rowDiscarder); ok {
+			rd.discardOpenRow()
+		}
 		flushErr = ps.slot.delegate.Flush(ctx1)
 		if flushErr != nil {
 			// A benign latched fluent-API error (Flush clears it and resets row

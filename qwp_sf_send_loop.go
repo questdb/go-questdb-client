@@ -1215,9 +1215,15 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 	// while highestFullySent still trailed it; reconcile now that the
 	// watermark is published so a quiescent last frame — whose ACK has
 	// no later ACK to re-drive it — does not strand its acknowledgement.
-	// In durable mode the OK ACK never advances the engine (durableOnOk caps
-	// at the assigned sequence, not highestFullySent), so there is nothing
-	// to re-drive here.
+	//
+	// Durable mode is skipped here, but not because it is risk-free: its
+	// engine advance runs on the receiver goroutine (durableDrain, also
+	// clamped by highestFullySent), so the same last-frame strand is
+	// possible if a STATUS_DURABLE_ACK lands before this store. It cannot be
+	// re-driven from here — the durable tracker is receiver-owned, and
+	// calling durableDrain from the send goroutine would race it. The
+	// durable-ack keepalive re-elicits the ack and re-drives the drain
+	// instead; disabling it (interval <= 0) reopens that gap.
 	if !l.durableAckMode {
 		l.applyAckWatermark()
 	}

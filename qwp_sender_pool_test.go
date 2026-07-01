@@ -184,6 +184,46 @@ func TestQwpSenderPoolStaleLeaseErrors(t *testing.T) {
 	}
 }
 
+// TestQwpSenderPoolReturnMidRowLeavesCleanSlot is the C1 regression: a
+// lease returned with an in-progress row (Table/Symbol/*Column but no
+// finalizing At/AtNow) must not poison the next borrower. The return
+// path's Flush early-returns errFlushWithPendingMessage without
+// cancelling the open row, so before the fix the recycled slot kept
+// hasTable / currentTable set and the next Table() latched a stale
+// "table already set" naming a table the new borrower never touched.
+func TestQwpSenderPoolReturnMidRowLeavesCleanSlot(t *testing.T) {
+	// min == max == 1 forces the re-borrow to reuse the very slot just
+	// returned, so we exercise the recycled-slot path (not a fresh one).
+	p := newQwpSenderPoolForTest(t, "", 1, 1)
+	ctx := context.Background()
+
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	// Open a row and abandon it — the idiomatic early-return between
+	// Table and At.
+	s.Table("x").Symbol("k", "v")
+	// Parity with the standalone close path: the open row is silently
+	// dropped, so the return succeeds rather than surfacing
+	// errFlushWithPendingMessage.
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("close with open row: %v", err)
+	}
+
+	s2, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("re-borrow: %v", err)
+	}
+	defer s2.Close(ctx)
+	// A clean write on a different table must succeed. A dirty slot would
+	// have latched `table "x" already set` on Table("y") and surfaced it
+	// here on At().
+	if err := s2.Table("y").Int64Column("v", 1).At(ctx, time.Now()); err != nil {
+		t.Fatalf("write after mid-row return failed (slot returned dirty?): %v", err)
+	}
+}
+
 func TestQwpSenderPoolSfDistinctSlotDirs(t *testing.T) {
 	sfDir := t.TempDir()
 	p := newQwpSenderPoolForTest(t, "sf_dir="+sfDir+";", 2, 4)

@@ -1234,6 +1234,24 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 	return err
 }
 
+// discardOpenRow drops an in-progress row (opened via Table/Symbol/*Column
+// with no finalizing At/AtNow) so a subsequent Flush encodes only committed
+// rows and leaves the sender clean. Mirrors closeCursor's open-row handling.
+// Used by the pool's lease-return path (qwpPooledSender.Close, C1); the
+// standalone Flush deliberately keeps surfacing errFlushWithPendingMessage
+// instead. Producer-goroutine only.
+func (s *qwpLineSender) discardOpenRow() {
+	if !s.hasTable {
+		return
+	}
+	if s.currentTable != nil {
+		s.currentTable.cancelRow()
+	}
+	s.hasTable = false
+	s.currentTable = nil
+	s.cachedDesignatedTs = nil
+}
+
 // FlushAndGetSequence implements QwpSender.FlushAndGetSequence.
 // Flushes any pending rows and returns the published FSN — the
 // upper bound on any SenderError.ToFsn that could surface for this

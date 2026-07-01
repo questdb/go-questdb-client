@@ -327,6 +327,14 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 		"failover_max_duration_ms=60000",
 		"initial_credit=262144",
 		"max_batch_rows=10000",
+		// Egress query-client keys with an explicit case in
+		// parseQwpQueryConf. Before these were cross-registered the facade's
+		// dual-parse rejected them (M1).
+		"auth=Bearer xyz",
+		"client_id=reader-1",
+		"path=/exec",
+		"replay_exec=on",
+		"server_info_timeout_ms=1000",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
@@ -386,6 +394,15 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"sf_durability=memory",
 		"sf_max_bytes=4m",
 		"sf_max_total_bytes=10g",
+		// QWP ingest keys the egress parser must ignore. gorilla /
+		// in_flight_window are documented Java-parity knobs; token_x /
+		// token_y are legacy public-key fields the ingest client
+		// accepts-but-ignores. Before these were cross-registered the
+		// facade's dual-parse rejected them (M1).
+		"gorilla=off",
+		"in_flight_window=10",
+		"token_x=pub-x",
+		"token_y=pub-y",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
@@ -417,6 +434,57 @@ func TestConfSharedConnectString(t *testing.T) {
 	}
 	if _, err := parseQwpQueryConf(shared); err != nil {
 		t.Errorf("egress parser rejected the shared connect string: %v", err)
+	}
+}
+
+// TestConfFacadeDualParseAcceptsSharedQwpKeys is the regression for M1:
+// NewQuestDB / Connect validate the cluster string through BOTH parsers
+// up front (questdb.go), so any key one QWP client accepts must be
+// tolerated by the other or the facade rejects a documented-valid config.
+// gorilla / in_flight_window are Java-parity keys CLAUDE.md pins as "must
+// work here"; auth / client_id / path / replay_exec / server_info_timeout_ms
+// are egress query-pool knobs a facade user (which owns a query pool) sets.
+func TestConfFacadeDualParseAcceptsSharedQwpKeys(t *testing.T) {
+	// One string exercising every newly cross-registered key on both sides.
+	conf := "ws::addr=localhost:9000;" +
+		"gorilla=off;in_flight_window=10;token_x=x;token_y=y;" +
+		"auth=Bearer t;client_id=reader-1;path=/exec;replay_exec=on;server_info_timeout_ms=1000;"
+	if _, err := confFromStr(conf); err != nil {
+		t.Errorf("ingest parser (facade line 1) rejected %q: %v", conf, err)
+	}
+	if _, err := parseQwpQueryConf(conf); err != nil {
+		t.Errorf("egress parser (facade line 2) rejected %q: %v", conf, err)
+	}
+}
+
+// TestConfFacadeDualParseRejectsHttpOnlyKeys pins the deliberate flip
+// side of M1: protocol_version / request_timeout / retry_timeout /
+// request_min_throughput are HTTP-only. The raw ingest parser stores
+// them but sanitizeQwpConf rejects them for QWP, so they were NOT
+// cross-registered — the egress parser must keep rejecting them so the
+// facade dual-parse rejects a config that could never drive a QWP sender.
+func TestConfFacadeDualParseRejectsHttpOnlyKeys(t *testing.T) {
+	for _, kv := range []string{
+		"protocol_version=2",
+		"request_timeout=1000",
+		"retry_timeout=1000",
+		"request_min_throughput=1000",
+	} {
+		t.Run(kv, func(t *testing.T) {
+			conf := "ws::addr=localhost:9000;" + kv + ";"
+			// The real QWP ingest client rejects it via sanitizeQwpConf...
+			c, err := confFromStr(conf)
+			if err != nil {
+				t.Fatalf("raw ingest parse of %q failed unexpectedly: %v", conf, err)
+			}
+			if err := sanitizeQwpConf(c); err == nil {
+				t.Errorf("sanitizeQwpConf accepted HTTP-only %q on QWP", kv)
+			}
+			// ...and the egress parser rejects it too (symmetric reject).
+			if _, err := parseQwpQueryConf(conf); err == nil {
+				t.Errorf("egress parser accepted HTTP-only %q; want reject", kv)
+			}
+		})
 	}
 }
 

@@ -57,6 +57,13 @@ var egressOnlyKeys = map[string]bool{
 	"failover_max_duration_ms":    true,
 	"initial_credit":              true,
 	"max_batch_rows":              true,
+	// Egress query keys the ingress parser ignores so a shared ws:: / wss::
+	// string (notably the facade's) validates through both parsers.
+	"auth":                   true,
+	"client_id":              true,
+	"path":                   true,
+	"replay_exec":            true,
+	"server_info_timeout_ms": true,
 }
 
 // ingressOnlyKeys lists connect-string keys defined by the spec for
@@ -95,6 +102,18 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_durability":                         true,
 	"sf_max_bytes":                          true,
 	"sf_max_total_bytes":                    true,
+	// QWP ingest keys the egress parser ignores so a shared ws:: / wss::
+	// string (notably the facade's) validates through both parsers.
+	// gorilla / in_flight_window are the documented Java-parity knobs;
+	// token_x / token_y are legacy public-key fields the ingest client
+	// accepts-but-ignores. (The HTTP-only protocol_version / request_timeout
+	// / retry_timeout / request_min_throughput are deliberately absent: the
+	// QWP ingest client rejects them in sanitizeQwpConf, so both parsers
+	// rejecting them is the correct, symmetric behaviour.)
+	"gorilla":          true,
+	"in_flight_window": true,
+	"token_x":          true,
+	"token_y":          true,
 }
 
 // poolKeys are the facade-owned (Side.POOL) connect-string keys. They are
