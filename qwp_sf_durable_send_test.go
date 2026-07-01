@@ -27,10 +27,12 @@ package questdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,12 +168,11 @@ func TestQwpDurableAckKeepaliveDelivers(t *testing.T) {
 	}
 }
 
-// TestQwpDurableAckMismatchTerminal pins Hazard A: requesting durable-ack against
-// an endpoint that does not advertise it (a replica / non-primary) fails the
-// connect terminally rather than silently falling back to OK-only trimming.
-func TestQwpDurableAckMismatchTerminal(t *testing.T) {
-	ctx := context.Background()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// newQwpNonAdvertisingServer stands in for a replica / non-primary: it completes
+// the WebSocket upgrade WITHOUT the X-QWP-Durable-Ack advertisement, which a
+// durable-ack client must treat as a terminal mismatch.
+func newQwpNonAdvertisingServer(ctx context.Context) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1") // no X-QWP-Durable-Ack advertisement
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -184,19 +185,146 @@ func TestQwpDurableAckMismatchTerminal(t *testing.T) {
 			}
 		}
 	}))
-	defer srv.Close()
+}
 
-	addr := strings.TrimPrefix(srv.URL, "http://")
-	_, err := NewLineSender(ctx,
-		WithQwp(), WithAddress(addr),
-		WithRequestDurableAck(true),
-	)
+// assertDurableMismatchError pins the documented WithRequestDurableAck /
+// QwpDurableAckMismatchError contract: the connect fails with a *SenderError of
+// category PROTOCOL_VIOLATION, while the underlying *QwpDurableAckMismatchError
+// stays reachable via errors.As.
+func assertDurableMismatchError(t *testing.T, err error) {
+	t.Helper()
 	if err == nil {
 		t.Fatal("durable-ack against a non-advertising endpoint should fail to connect")
 	}
+	var se *SenderError
+	if !errors.As(err, &se) {
+		t.Fatalf("error = %v, want a *SenderError (per WithRequestDurableAck godoc)", err)
+	}
+	if se.Category != CategoryProtocolViolation {
+		t.Fatalf("category = %v, want PROTOCOL_VIOLATION", se.Category)
+	}
 	var mismatch *QwpDurableAckMismatchError
 	if !errors.As(err, &mismatch) {
-		t.Fatalf("error = %v, want *QwpDurableAckMismatchError", err)
+		t.Fatalf("error = %v, want the *QwpDurableAckMismatchError cause reachable", err)
+	}
+}
+
+// TestQwpDurableAckMismatchTerminal pins Hazard A: requesting durable-ack against
+// an endpoint that does not advertise it (a replica / non-primary) fails the
+// connect terminally rather than silently falling back to OK-only trimming. It
+// covers both the default (InitialConnectOff) and the Sync connect paths, which
+// historically returned a raw *QwpDurableAckMismatchError instead of the
+// documented *SenderError / PROTOCOL_VIOLATION (M1).
+func TestQwpDurableAckMismatchTerminal(t *testing.T) {
+	ctx := context.Background()
+	srv := newQwpNonAdvertisingServer(ctx)
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	t.Run("DefaultOffPath", func(t *testing.T) {
+		_, err := NewLineSender(ctx,
+			WithQwp(), WithAddress(addr),
+			WithRequestDurableAck(true),
+		)
+		assertDurableMismatchError(t, err)
+	})
+
+	t.Run("SyncPath", func(t *testing.T) {
+		_, err := LineSenderFromConf(ctx, fmt.Sprintf(
+			"ws::addr=%s;request_durable_ack=on;initial_connect_retry=sync;", addr))
+		assertDurableMismatchError(t, err)
+	})
+}
+
+// TestQwpDurableAckReconnectRequiresFreshDurable exercises the reconnect / reset /
+// replay / re-confirm path that durable-ack exists to make safe. The primary
+// OK-acks a batch (settled) but drops the connection BEFORE the durable upload
+// completes — the exact silent-data-loss window. On reconnect the batch is
+// replayed and MUST NOT be satisfied by the pre-drop OK or a stale watermark: only
+// a fresh STATUS_DURABLE_ACK on the new connection advances AckedFsn.
+func TestQwpDurableAckReconnectRequiresFreshDurable(t *testing.T) {
+	ctx := context.Background()
+	var connCount atomic.Int32
+	replayed := make(chan struct{})       // closed once conn 2 has read the replayed batch
+	releaseDurable := make(chan struct{}) // test closes this to let conn 2 durably ack
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if _, _, err := conn.Read(ctx); err != nil { // the flushed batch (wireSeq 0)
+			return
+		}
+		if connCount.Add(1) == 1 {
+			// Connection 1: settle the batch (OK), then drop WITHOUT a durable
+			// ack — the upload never completes on this connection.
+			_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
+			return
+		}
+		// Connection 2: the sender has reconnected and replayed the batch (again
+		// wireSeq 0 — nextWireSeq resets per connection). Signal the test, wait
+		// for the go-ahead, then OK + durably ack it.
+		close(replayed)
+		<-releaseDurable
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckDurable(ackTableEntry{"trades", 0}))
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	s, err := NewLineSender(ctx,
+		WithQwp(), WithAddress(addr),
+		WithRequestDurableAck(true),
+		WithDurableAckKeepaliveInterval(0),
+	)
+	if err != nil {
+		t.Fatalf("NewLineSender: %v", err)
+	}
+	defer s.Close(ctx)
+	qs := s.(QwpSender)
+
+	if err := s.Table("trades").Int64Column("v", 1).AtNow(ctx); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	// Wait until the reconnected connection has read the replayed batch.
+	select {
+	case <-replayed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("sender did not reconnect and replay the un-durably-acked batch")
+	}
+
+	// At this point conn 1's OK settled the batch and the connection dropped;
+	// conn 2 has replayed it but is blocked before its durable ack. The durable
+	// watermark must NOT have advanced — neither the pre-drop OK nor a watermark
+	// carried across the reconnect may satisfy the batch.
+	if got := qs.AckedFsn(); got >= 0 {
+		t.Fatalf("AckedFsn advanced to %d before any durable ack — a settled OK or "+
+			"a stale cross-reconnect watermark wrongly satisfied the replayed batch", got)
+	}
+
+	// Release the fresh durable ack on the reconnected connection; now — and only
+	// now — the watermark reaches the batch.
+	close(releaseDurable)
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := qs.AwaitAckedFsn(waitCtx, 0); err != nil {
+		t.Fatalf("AwaitAckedFsn(0) after fresh durable ack on reconnect: %v", err)
+	}
+	if n := qs.TotalDurableAcks(); n < 1 {
+		t.Errorf("TotalDurableAcks = %d, want >= 1", n)
 	}
 }
 

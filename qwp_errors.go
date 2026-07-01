@@ -104,7 +104,10 @@ func (e *QwpUpgradeRejectError) Error() string {
 // (X-QWP-Durable-Ack: enabled) on the upgrade — typically because it is a replica,
 // not a replication primary. It is terminal: the client must not fall back to
 // OK-only trimming, which would drop data the caller believes durable. Surfaces
-// to the producer as a *SenderError of category PROTOCOL_VIOLATION.
+// to the producer as a *SenderError of category PROTOCOL_VIOLATION on every
+// connect path (initial-off, initial-sync, and async reconnect); the underlying
+// *QwpDurableAckMismatchError stays reachable through that SenderError via
+// errors.As.
 type QwpDurableAckMismatchError struct {
 	Endpoint string
 }

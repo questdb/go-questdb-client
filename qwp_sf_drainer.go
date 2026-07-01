@@ -54,8 +54,17 @@ const (
 const qwpMaxDurableAckMismatchAttempts = 16
 
 // QwpBackgroundDrainerListener receives durable-ack drain outcomes for a crashed
-// sibling's store-and-forward slot. Both callbacks run on the drainer goroutine
-// and must not block. Either may be nil. Applied to every drainer via
+// sibling's store-and-forward slot. Callbacks must not block.
+//
+// Threading: the two callbacks are NOT confined to a single goroutine.
+// OnDurableAckUnavailable fires from a drainer's send-loop I/O goroutine (on a
+// reconnect endpoint failure), while OnDurableAckPersistentFailure fires from
+// the drainerRun goroutine — two different goroutines for the same drainer. The
+// same QwpBackgroundDrainerListener is also shared across every drainer, so with
+// multiple orphan slots the callbacks may fire concurrently. Implementations
+// must be thread-safe. A panic in a callback is recovered and logged (it does
+// not quarantine the slot or crash the host), mirroring the other listener
+// contracts. Either callback may be nil. Applied to every drainer via
 // WithBackgroundDrainerListener.
 type QwpBackgroundDrainerListener struct {
 	// OnDurableAckUnavailable fires each time a durable-ack drainer dials an
@@ -65,6 +74,25 @@ type QwpBackgroundDrainerListener struct {
 	// OnDurableAckPersistentFailure fires once when a drainer gives up after
 	// repeated durable-ack mismatches and quarantines the slot (.failed).
 	OnDurableAckPersistentFailure func(dir string, attempts int, elapsed time.Duration)
+}
+
+// qwpDrainerListenerCall invokes a user-supplied background-drainer callback
+// behind a panic guard (drop + log), matching the isolation the other three
+// listeners get for free via qwpDispatcher.deliver. Without it a panic in user
+// code unwinds into the drainer's send-loop / drainerRun goroutine, whose
+// top-level recover turns it into a terminal failure that quarantines an
+// otherwise-recoverable slot (a .failed sentinel) — an availability regression
+// driven purely by a user-code fault. fn is nil-safe.
+func qwpDrainerListenerCall(fn func()) {
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ERROR] qwp/sf drainer listener callback panicked: %v", r)
+		}
+	}()
+	fn()
 }
 
 // qwpSfDrainerPollInterval is how often the drainer wakes to
@@ -221,8 +249,9 @@ func (d *qwpSfOrphanDrainer) recordFailure(reason string) {
 // only from connectWithDurableAckRetry's exhausted branch).
 func (d *qwpSfOrphanDrainer) recordDurableGiveUp() {
 	attempts := int(d.mismatchAttempts.Load())
-	if d.listener.OnDurableAckPersistentFailure != nil {
-		d.listener.OnDurableAckPersistentFailure(d.slotPath, attempts, time.Since(d.startedAt))
+	if fn := d.listener.OnDurableAckPersistentFailure; fn != nil {
+		elapsed := time.Since(d.startedAt)
+		qwpDrainerListenerCall(func() { fn(d.slotPath, attempts, elapsed) })
 	}
 	d.recordFailure(fmt.Sprintf(
 		"durable-ack unavailable: no reachable endpoint advertised durable-ack after %d attempts", attempts))
@@ -237,8 +266,8 @@ func (d *qwpSfOrphanDrainer) onDurableMismatch(_ int, err error) {
 		return
 	}
 	attempt := int(d.mismatchAttempts.Add(1))
-	if d.listener.OnDurableAckUnavailable != nil {
-		d.listener.OnDurableAckUnavailable(d.slotPath, attempt)
+	if fn := d.listener.OnDurableAckUnavailable; fn != nil {
+		qwpDrainerListenerCall(func() { fn(d.slotPath, attempt) })
 	}
 	if attempt >= qwpMaxDurableAckMismatchAttempts {
 		d.durableMismatchGaveUp.Store(true)

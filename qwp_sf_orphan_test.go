@@ -224,6 +224,50 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, lastAttempts)
 }
 
+// TestQwpSfDrainerListenerPanicIsolated pins M2: a panic in a user-supplied
+// background-drainer callback is recovered rather than unwinding into the
+// drainer's goroutine (where the top-level recover would quarantine an
+// otherwise-recoverable slot).
+func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
+	t.Run("HelperRecovers", func(t *testing.T) {
+		qwpDrainerListenerCall(func() { panic("boom") }) // must not propagate
+		qwpDrainerListenerCall(nil)                       // nil-safe
+	})
+
+	t.Run("OnDurableAckUnavailablePanicContained", func(t *testing.T) {
+		d := qwpSfNewOrphanDrainer(
+			t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
+			nil, nil,
+			time.Second, time.Millisecond, 5*time.Millisecond,
+		)
+		d.durableAckMode = true
+		d.listener = QwpBackgroundDrainerListener{
+			OnDurableAckUnavailable: func(string, int) { panic("user callback boom") },
+		}
+		// onDurableMismatch runs on the drainer's send-loop I/O goroutine; a
+		// panic in the callback must be contained here, and the mismatch
+		// attempt must still be counted.
+		d.onDurableMismatch(0, &QwpDurableAckMismatchError{Endpoint: "replica:9000"})
+		assert.Equal(t, int64(1), d.mismatchAttempts.Load())
+	})
+
+	t.Run("OnDurableAckPersistentFailurePanicContained", func(t *testing.T) {
+		d := qwpSfNewOrphanDrainer(
+			t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
+			nil, nil,
+			time.Second, time.Millisecond, 5*time.Millisecond,
+		)
+		d.durableAckMode = true
+		d.listener = QwpBackgroundDrainerListener{
+			OnDurableAckPersistentFailure: func(string, int, time.Duration) { panic("give-up boom") },
+		}
+		// recordDurableGiveUp runs on the drainerRun goroutine; the panic must
+		// be contained and the slot still quarantined (.failed) as usual.
+		d.recordDurableGiveUp()
+		assert.Equal(t, qwpSfDrainOutcomeFailed, d.drainerOutcome())
+	})
+}
+
 func TestQwpSfDrainerSucceedsOnAlreadyDrainedSlot(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()

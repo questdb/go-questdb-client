@@ -270,6 +270,19 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		}
 	}
 	if err != nil {
+		// A terminal durable-ack mismatch on the InitialConnectOff / Sync
+		// connect paths arrives as a plain error (Off wraps rr.Terminal in
+		// fmt.Errorf; Sync via qwpSfConnectWithRetry). Upgrade it to the typed
+		// *SenderError of category PROTOCOL_VIOLATION that WithRequestDurableAck
+		// and QwpDurableAckMismatchError document — the async reconnect path
+		// already latches this via connectWithBackoff. The underlying
+		// *QwpDurableAckMismatchError is preserved as the SenderError cause, so
+		// errors.As reaches either type.
+		var mismatch *QwpDurableAckMismatchError
+		if errors.As(err, &mismatch) {
+			err = qwpSfUpgradeFailureSE(
+				engine.engineAckedFsn()+1, engine.enginePublishedFsn(), mismatch)
+		}
 		_ = engine.engineClose()
 		return nil, err
 	}

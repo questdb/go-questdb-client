@@ -1786,12 +1786,22 @@ func qwpSfIsProtocolUpgradeFailure(err error) bool {
 // already determined the err is one of those two via the helpers
 // above.
 func (l *qwpSfSendLoop) qwpSfBuildUpgradeFailureSE(err error) *SenderError {
+	return qwpSfUpgradeFailureSE(l.engine.engineAckedFsn()+1, l.engine.enginePublishedFsn(), err)
+}
+
+// qwpSfUpgradeFailureSE is the engine-independent core of the above so the
+// initial-connect (InitialConnectOff / InitialConnectSync) paths — which fail
+// before a send loop exists — can synthesize the SAME typed *SenderError the
+// async reconnect path latches, keeping the WithRequestDurableAck /
+// QwpDurableAckMismatchError PROTOCOL_VIOLATION contract uniform across all
+// three connect modes. err is preserved as the SenderError cause (Unwrap) so
+// errors.As still reaches the typed transport error. [from,to] is the unacked
+// FSN span (empty at initial connect).
+func qwpSfUpgradeFailureSE(from, to int64, err error) *SenderError {
 	cat := CategoryProtocolViolation
 	if qwpSfIsAuthFailure(err) {
 		cat = CategorySecurityError
 	}
-	from := l.engine.engineAckedFsn() + 1
-	to := l.engine.enginePublishedFsn()
 	if to < from {
 		to = from
 	}
@@ -1804,6 +1814,7 @@ func (l *qwpSfSendLoop) qwpSfBuildUpgradeFailureSE(err error) *SenderError {
 		FromFsn:          from,
 		ToFsn:            to,
 		DetectedAt:       time.Now(),
+		cause:            err,
 	}
 }
 

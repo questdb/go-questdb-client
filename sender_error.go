@@ -234,6 +234,26 @@ type SenderError struct {
 	// I/O goroutine. Use for ordering and ops timelines, not for
 	// correlation.
 	DetectedAt time.Time
+
+	// cause is the underlying transport-level error this SenderError was
+	// synthesized from, when there is one — a WebSocket upgrade rejection
+	// (*QwpUpgradeRejectError) or a durable-ack mismatch
+	// (*QwpDurableAckMismatchError). nil for server-ACK rejections, which
+	// carry no wrapped cause. Exposed via Unwrap so errors.As can still
+	// reach the typed cause while callers switch on the stable Category.
+	cause error
+}
+
+// Unwrap returns the underlying transport-level cause when this SenderError
+// was synthesized from one (a WebSocket upgrade rejection or a durable-ack
+// mismatch), else nil. It lets errors.As reach the typed cause — e.g.
+// var m *QwpDurableAckMismatchError; errors.As(err, &m) — while the
+// SenderError still carries the release-stable Category the API promises.
+func (e *SenderError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 // Error implements the error interface. The format is stable enough

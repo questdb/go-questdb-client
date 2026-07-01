@@ -160,6 +160,38 @@ func TestDurableTrackerDropChainsBehindOk(t *testing.T) {
 	}
 }
 
+// TestDurableTrackerEnqueueEmptyChainsFIFO exercises enqueueEmpty directly — the
+// DROP-in-durable path (a DROP_AND_CONTINUE rejection carries no table trailer, so
+// the send loop stashes it via enqueueEmpty rather than enqueueOk). It is trivially
+// durable on its own, but must still chain FIFO behind an unconfirmed OK ahead of
+// it so the watermark never advances past not-yet-durable data.
+func TestDurableTrackerEnqueueEmptyChainsFIFO(t *testing.T) {
+	tr := newQwpDurableTracker()
+	tr.enqueueOk(0, durableTrailer(tableEntry{"trades", 5})) // OK, needs trades@5
+	tr.enqueueEmpty(1)                                        // DROP: no trailer, trivially durable
+	// The empty drop must not advance past the still-unconfirmed OK ahead of it.
+	if got := tr.drain(); got != -1 {
+		t.Fatalf("empty drop drained ahead of uncovered OK = %d, want -1", got)
+	}
+	if !tr.hasPending() {
+		t.Fatal("both entries must remain pending until the OK is covered")
+	}
+	// Once the OK is covered, the OK then the chained empty both pop.
+	tr.applyDurable(durableTrailer(tableEntry{"trades", 5}))
+	if got := tr.drain(); got != 1 {
+		t.Fatalf("drain = %d, want 1 (OK then empty drop both pop)", got)
+	}
+	if tr.hasPending() {
+		t.Fatal("queue must be empty after draining both")
+	}
+	// A standalone empty batch (nothing ahead of it) is trivially durable and
+	// drains immediately.
+	tr.enqueueEmpty(2)
+	if got := tr.drain(); got != 2 {
+		t.Fatalf("standalone empty drain = %d, want 2 (trivially durable)", got)
+	}
+}
+
 func TestDurableTrackerDurableBeforeOk(t *testing.T) {
 	tr := newQwpDurableTracker()
 	// A durable frame can arrive before the OK for the same batch; the OK's
