@@ -456,6 +456,14 @@ func (p *qwpSenderPool) reapIdle() {
 // (giveBack sees p.closed). A lease that is never returned leaks its connection:
 // the caller must return every lease before QuestDB.Close.
 //
+// A BorrowSender whose slot build is still in flight is likewise not closed here
+// — the creating goroutine closes its just-built delegate itself once it acquires
+// p.mu and observes p.closed (see borrow). close() does not block for that, so the
+// "all resources released" postcondition is reached a beat after close() returns:
+// in SF mode the just-built slot's flock can linger briefly, and an immediate
+// reopen on the same sf_dir may momentarily observe it. This is covered by the
+// same contract — quiesce borrows and return every lease before Close.
+//
 // Slots close concurrently on context.Background(): each drain is bounded by
 // close_flush_timeout, so the caller's ctx must neither serialize the drains
 // (an N-slot outage would stall shutdown for N × the timeout) nor cancel them

@@ -220,6 +220,10 @@ func (d *qwpDispatcher[T]) close() {
 		return
 	}
 
+	// If the handler wedges forever, wg.Wait() never returns, so this watcher
+	// goroutine is abandoned along with loop() — the intentional cost of the
+	// "abandon rather than block Close" contract. It is a single parked goroutine
+	// holding only this closure, not a growing leak.
 	joined := make(chan struct{})
 	go func() {
 		d.wg.Wait()

@@ -78,7 +78,7 @@ func TestQwpIntegrationFacadeRoundTrip(t *testing.T) {
 	}
 	defer q.Close()
 	cursor := q.Query(ctx, "select count() from "+table)
-	batches := 0
+	batches, gotCount := 0, int64(-1)
 	for batch, err := range cursor.Batches() {
 		if err != nil {
 			t.Fatalf("query batch: %v", err)
@@ -86,10 +86,16 @@ func TestQwpIntegrationFacadeRoundTrip(t *testing.T) {
 		if batch.RowCount() != 1 {
 			t.Errorf("count() batch RowCount=%d, want 1", batch.RowCount())
 		}
+		// count() is one LONG cell; read it so the read path is asserted for
+		// content, not just shape (RowCount()==1 holds even for a wrong value).
+		gotCount = batch.Int64(0, 0)
 		batches++
 	}
 	if batches == 0 {
 		t.Fatal("query returned no batches")
+	}
+	if gotCount != rows {
+		t.Errorf("count() via query pool = %d, want %d", gotCount, rows)
 	}
 
 	// Cover the leased-handle Exec path: a DROP IF EXISTS on a missing table

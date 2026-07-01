@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -65,6 +66,119 @@ func TestQwpDispatcherUnit(t *testing.T) {
 	nilD.close()
 	if nilD.offer(&SenderConnectionEvent{}) {
 		t.Error("offer on nil dispatcher should return false")
+	}
+}
+
+// TestQwpDispatcherDeliversInOrder pins the single-consumer FIFO contract on the
+// generic dispatcher (the sibling qwpSfErrorDispatcher has this; the generic one
+// did not). AttemptNumber carries the ordering token.
+func TestQwpDispatcherDeliversInOrder(t *testing.T) {
+	var mu sync.Mutex
+	var got []int64
+	done := make(chan struct{}, 3)
+	d := newQwpConnDispatcher(func(e SenderConnectionEvent) {
+		mu.Lock()
+		got = append(got, e.AttemptNumber)
+		mu.Unlock()
+		done <- struct{}{}
+	}, 8)
+	defer d.close()
+
+	for i := int64(1); i <= 3; i++ {
+		if !d.offer(&SenderConnectionEvent{Kind: SenderReconnected, AttemptNumber: i}) {
+			t.Fatalf("offer %d dropped on a non-full inbox", i)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handler not invoked in time")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("delivered %d events, want 3", len(got))
+	}
+	for i, v := range got {
+		if v != int64(i+1) {
+			t.Errorf("delivery order got[%d]=%d, want %d", i, v, i+1)
+		}
+	}
+	if d.droppedNotifications() != 0 {
+		t.Errorf("dropped = %d, want 0", d.droppedNotifications())
+	}
+}
+
+// TestQwpDispatcherCloseDrainsLeftover asserts close() synchronously delivers an
+// item queued before the loop goroutine ever started — the not-started branch of
+// close() must drain rather than discard.
+func TestQwpDispatcherCloseDrainsLeftover(t *testing.T) {
+	var mu sync.Mutex
+	var got int64 = -1
+	d := newQwpConnDispatcher(func(e SenderConnectionEvent) {
+		mu.Lock()
+		got = e.AttemptNumber
+		mu.Unlock()
+	}, 4)
+
+	d.inbox <- &SenderConnectionEvent{Kind: SenderConnected, AttemptNumber: 42}
+	if d.started.Load() {
+		t.Fatal("test setup: dispatcher unexpectedly started")
+	}
+
+	d.close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got != 42 {
+		t.Fatalf("got = %d, want 42 — close did not synchronously drain the leftover", got)
+	}
+	if d.totalDelivered() != 1 {
+		t.Errorf("delivered = %d, want 1", d.totalDelivered())
+	}
+}
+
+// TestQwpDispatcherOfferCloseRaceNoLoss stresses the offer/close serialization
+// (mu-guarded closed-check + send): every offer that returns true must be
+// delivered, even when close races concurrent offers from many goroutines. The
+// inbox is sized above the offerer count so nothing is drop-oldest displaced, so
+// accepted == delivered exactly. Run under -race.
+func TestQwpDispatcherOfferCloseRaceNoLoss(t *testing.T) {
+	const iterations = 200
+	const offerers = 16
+	for iter := 0; iter < iterations; iter++ {
+		var delivered atomic.Int64
+		d := newQwpConnDispatcher(func(SenderConnectionEvent) {
+			delivered.Add(1)
+		}, offerers*2)
+
+		var accepted atomic.Int64
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for k := 0; k < offerers; k++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if d.offer(&SenderConnectionEvent{Kind: SenderConnected}) {
+					accepted.Add(1)
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			d.close()
+		}()
+		close(start)
+		wg.Wait()
+
+		if got, want := delivered.Load(), accepted.Load(); got != want {
+			t.Fatalf("iter %d: delivered=%d, accepted=%d (lost %d)", iter, got, want, want-got)
+		}
 	}
 }
 

@@ -88,8 +88,10 @@ func (h *qwpPoolHousekeeper) reapGuarded(fn func()) {
 // reap can't block Close forever.
 func (h *qwpPoolHousekeeper) stopAndJoin() {
 	close(h.stop)
+	t := time.NewTimer(2 * time.Second)
+	defer t.Stop()
 	select {
 	case <-h.done:
-	case <-time.After(2 * time.Second):
+	case <-t.C:
 	}
 }

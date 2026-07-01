@@ -336,6 +336,10 @@ func (d *qwpSfErrorDispatcher) close() {
 	// the budget. A handler wedged in a never-returning call keeps
 	// loop() parked in deliver() so wg.Done() never fires; the bound
 	// abandons that goroutine rather than inheriting its hang.
+	// If the handler wedges forever, wg.Wait() never returns, so this watcher
+	// goroutine is abandoned along with loop() — the intentional cost of the
+	// "abandon rather than block Close" contract. It is a single parked goroutine
+	// holding only this closure, not a growing leak.
 	joined := make(chan struct{})
 	go func() {
 		d.wg.Wait()

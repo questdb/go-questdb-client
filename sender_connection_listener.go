@@ -61,6 +61,9 @@ const (
 	SenderReconnectBudgetExhausted
 )
 
+// String returns the SCREAMING_SNAKE_CASE name of the kind (e.g. "CONNECTED"),
+// matching the Java client's enum names, or "UNKNOWN(<n>)" for an unrecognised
+// value.
 func (k SenderConnectionEventKind) String() string {
 	switch k {
 	case SenderConnected:
@@ -90,6 +93,8 @@ func (k SenderConnectionEventKind) String() string {
 // idiomatic encoding of Java's NO_PORT/NO_ATTEMPT_NUMBER/NO_ROUND_NUMBER
 // sentinels. TimestampMillis is set by the dispatcher at emit time.
 type SenderConnectionEvent struct {
+	// Kind classifies the connection-state transition this event describes and
+	// determines which of the remaining fields are meaningful.
 	Kind SenderConnectionEventKind
 	// Host/Port is the endpoint this event concerns. Empty/0 for
 	// SenderAllEndpointsUnreachable when no last-attempted endpoint is known.
@@ -111,6 +116,8 @@ type SenderConnectionEvent struct {
 	TimestampMillis int64
 }
 
+// String renders the event as a single-line, human-readable summary for logs,
+// omitting fields left at their zero value for the event's Kind.
 func (e SenderConnectionEvent) String() string {
 	s := "SenderConnectionEvent{kind=" + e.Kind.String()
 	if e.Host != "" {
@@ -146,12 +153,17 @@ func (e SenderConnectionEvent) String() string {
 //
 // # Delivery
 //
-// Success events (Connected, FailedOver, Reconnected) fire on each transition.
-// Failure events (EndpointAttemptFailed, AllEndpointsUnreachable) may be
-// coalesced under inbox pressure. Terminal events (AuthFailed,
-// ReconnectBudgetExhausted) fire before the producer-side typed error becomes
-// observable, so a listener can react before the producer learns via the next
-// API call. A panic from the listener is recovered and logged.
+// Delivery is best-effort: the bounded inbox is drop-oldest for every payload,
+// so under inbox pressure any queued event — success (Connected, FailedOver,
+// Reconnected), failure (EndpointAttemptFailed, AllEndpointsUnreachable), or
+// terminal (AuthFailed, ReconnectBudgetExhausted) — may be displaced before it
+// is delivered (visible via QwpSender.DroppedConnectionNotifications()). Failure
+// events are the likeliest to coalesce, as they can burst during a reconnect
+// walk; the sparser success and terminal events survive under normal operation.
+// A terminal event is emitted before the producer-side typed error becomes
+// observable, so a listener that receives it can react before the producer
+// learns via the next API call. A panic from the listener is recovered and
+// logged.
 type SenderConnectionListener func(SenderConnectionEvent)
 
 // defaultSenderConnectionListener is the loud-not-silent fallback used when no

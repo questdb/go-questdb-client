@@ -415,6 +415,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		noProgressBudget = qwpSfDefaultReconnectMaxDuration
 	}
 	lastProgressAcked := engine.engineAckedFsn()
+	lastProgressAcks := loop.sendLoopTotalAcks()
 	lastProgressAt := time.Now()
 	for {
 		acked := engine.engineAckedFsn()
@@ -442,18 +443,24 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		// bounded reconnect loop, resets the watchdog clock. A fresh
 		// connection thus always gets a full budget to produce its
 		// first ACK.
+		//
+		// In durable mode `acked` only advances on STATUS_DURABLE_ACK, so a
+		// healthy-but-slow durable pipeline (the server OK-acking frames while
+		// an object-storage upload lags) would otherwise trip the watchdog.
+		// Treat forward movement of the OK-ack counter as progress too, so only
+		// a slot with NO ack activity at all — the genuine wedge — is quarantined.
 		now := time.Now()
 		reconnecting, _, _ := loop.sendLoopReconnectStatus()
+		okAcks := loop.sendLoopTotalAcks()
+		progressed := acked > lastProgressAcked || reconnecting ||
+			(d.durableAckMode && okAcks > lastProgressAcks)
 		switch {
-		case acked > lastProgressAcked || reconnecting:
+		case progressed:
 			lastProgressAcked = acked
+			lastProgressAcks = okAcks
 			lastProgressAt = now
 		case now.Sub(lastProgressAt) >= noProgressBudget:
-			d.recordFailure(fmt.Sprintf(
-				"no drain progress: ackedFsn stuck at %d (target %d) for %s "+
-					"on a live connection — server accepted frames but is not "+
-					"ACKing (wedged server or incompatible build)",
-				acked, target, now.Sub(lastProgressAt)))
+			d.recordFailure(d.noProgressReason(acked, target, okAcks, now.Sub(lastProgressAt)))
 			return
 		}
 		select {
@@ -463,6 +470,27 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		case <-timer.C:
 		}
 	}
+}
+
+// noProgressReason builds the .failed sentinel reason for a stalled drain,
+// distinguishing a genuinely wedged connection (no ACKs at all) from a durable
+// pipeline that OK-acks frames but lags on STATUS_DURABLE_ACK — the two call for
+// very different operator remediation, and the latter is not a wedged/incompatible
+// server.
+func (d *qwpSfOrphanDrainer) noProgressReason(acked, target, okAcks int64, stuckFor time.Duration) string {
+	if d.durableAckMode && okAcks > 0 {
+		return fmt.Sprintf(
+			"no durable-ack progress: ackedFsn stuck at %d (target %d) for %s "+
+				"on a live connection — the server OK-acked frames but issued no "+
+				"STATUS_DURABLE_ACK (a stalled durable pipeline, e.g. a wedged "+
+				"object-storage upload, or an incompatible build)",
+			acked, target, stuckFor)
+	}
+	return fmt.Sprintf(
+		"no drain progress: ackedFsn stuck at %d (target %d) for %s on a live "+
+			"connection — server accepted frames but is not ACKing (wedged "+
+			"server or incompatible build)",
+		acked, target, stuckFor)
 }
 
 // qwpSfDrainerPool is a bounded thread pool that runs orphan

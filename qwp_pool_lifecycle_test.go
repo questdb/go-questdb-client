@@ -395,9 +395,16 @@ func TestQwpPooledSenderForwardsAllColumns(t *testing.T) {
 		Float64Array2DColumn("a2", [][]float64{{1}, {2}}).
 		Float64Array3DColumn("a3", [][][]float64{{{1}}}).
 		Float64ArrayNDColumn("aN", ndArr)
-	// Coverage of the forwards is the point; the row itself may be rejected.
-	_ = s.AtNow(ctx)
-	_ = s.Flush(ctx)
+	// Every forward must produce well-formed buffer state: a mis-wired forward
+	// (delegating to the wrong underlying method, or dropping the value) would
+	// latch a fluent error that surfaces on At/Flush. Asserting both succeed
+	// makes the test fail on such a regression rather than passing silently.
+	if err := s.AtNow(ctx); err != nil {
+		t.Fatalf("AtNow after all column forwards: %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush after all column forwards: %v", err)
+	}
 }
 
 // TestQwpSenderPoolSfReapsToMin covers the SF reap path: reaping a slot frees

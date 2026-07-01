@@ -141,9 +141,14 @@ func (t *qwpDurableTracker) drain() int64 {
 // highestFullySent catches up — mirroring the non-durable applyAckWatermark
 // clamp. Entries are enqueued in ascending wireSeq order, so the first entry
 // above the ceiling ends the scan and the returned value — the last popped
-// wireSeq — is therefore also the maximum popped. A non-conforming server
-// (negative or out-of-order seq) at worst makes the scan stop early and skip
-// an advance; it never over-advances or loses data.
+// wireSeq — is therefore also the maximum popped. This scan only guards its own
+// queue: a negative or out-of-order seq in t.pending at worst stops it early and
+// skips an advance. It does NOT harden against a server that gaps the OK-ack
+// sequence — one coalescing ACKs (a cumulative seq skipping frames, with a
+// trailer omitting the skipped tables) could let the drain advance past a
+// not-yet-durable frame. Immunity to that rests on the one-OK-ack-per-frame
+// invariant documented on durableOnOk (the Java per-frame ACK contract), not on
+// this function.
 func (t *qwpDurableTracker) drainUpTo(maxWireSeq int64) int64 {
 	highest := int64(-1)
 	i := 0

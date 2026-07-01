@@ -252,8 +252,20 @@ func TestQwpQueryLeaseReopenClosesPrevious(t *testing.T) {
 		t.Fatalf("borrow: %v", err)
 	}
 	defer q.Close()
-	_ = q.Query(ctx, "select 1")
-	_ = q.Query(ctx, "select 2") // active != nil → previous cursor closed
+	c1 := q.Query(ctx, "select 1")
+	c2 := q.Query(ctx, "select 2") // active != nil → previous cursor closed
+	if c1 == c2 {
+		t.Fatal("reopen returned the same cursor object; want a fresh one")
+	}
+	// Reopen must have closed the previous cursor: an un-iterated cursor's Close
+	// CASes its state Idle→Done, so a reopen that failed to close c1 would leave
+	// it Idle and this assertion would catch it.
+	if got := c1.state.Load(); got != qwpQueryStateDone {
+		t.Errorf("previous cursor state = %d after reopen, want Done (%d)", got, qwpQueryStateDone)
+	}
+	if q.active != c2 {
+		t.Error("lease.active does not track the reopened cursor")
+	}
 }
 
 // TestQwpQueryLeaseReopenOverAbandonedDrain covers the desync hazard: reopening
