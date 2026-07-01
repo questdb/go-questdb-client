@@ -491,9 +491,12 @@ func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
 
 // WithQwpQueryConnectTimeout bounds the TCP connect on each endpoint dial, so a
 // black-holed host is abandoned within d instead of riding the OS connect
-// timeout. It clamps only the TCP connect; the upgrade response read stays
-// under WithQwpQueryAuthTimeout. A zero or negative duration keeps the OS
-// connect timeout. Equivalent to the connect-string connect_timeout key.
+// timeout. The upgrade response read stays under WithQwpQueryAuthTimeout. The
+// TLS handshake (wss) prefers WithQwpQueryAuthTimeout, but falls back to this
+// timeout when the auth timeout is unset — so a config that sets only
+// connect_timeout still bounds the handshake, not just the TCP connect. A zero
+// or negative duration keeps the OS connect timeout. Equivalent to the
+// connect-string connect_timeout key.
 func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) {
 		ms := int(d.Milliseconds())

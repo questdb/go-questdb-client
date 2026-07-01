@@ -140,7 +140,10 @@ func (t *qwpDurableTracker) drain() int64 {
 // ack naming an in-flight frame is held back until the send completes and
 // highestFullySent catches up — mirroring the non-durable applyAckWatermark
 // clamp. Entries are enqueued in ascending wireSeq order, so the first entry
-// above the ceiling ends the scan.
+// above the ceiling ends the scan and the returned value — the last popped
+// wireSeq — is therefore also the maximum popped. A non-conforming server
+// (negative or out-of-order seq) at worst makes the scan stop early and skip
+// an advance; it never over-advances or loses data.
 func (t *qwpDurableTracker) drainUpTo(maxWireSeq int64) int64 {
 	highest := int64(-1)
 	i := 0

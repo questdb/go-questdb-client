@@ -138,6 +138,7 @@ func TestConfSizeSuffixRejected(t *testing.T) {
 		"-1m",     // negative with suffix
 		"1xb",     // unknown suffix
 		"1024kb extra", // trailing garbage
+		"9999999999999t", // n * (1<<40) overflows int64 (exercises the overflow guard)
 	}
 	for _, in := range cases {
 		t.Run(in, func(t *testing.T) {
@@ -194,6 +195,20 @@ func TestConfSenderIdRejectsDot(t *testing.T) {
 	}
 	if !strings.Contains(msg, ".") {
 		t.Errorf("error %q does not show the offending char", msg)
+	}
+}
+
+// TestConfSenderIdRejectsPathChars pins the path-traversal guard: sender_id is
+// used as a path segment under sf_dir, so separators, '..', dots, and spaces
+// must be rejected (Sender.java validateSenderId: letters, digits, '_', '-'
+// only). Calls the validator directly to cover chars a connect string can't
+// easily carry.
+func TestConfSenderIdRejectsPathChars(t *testing.T) {
+	bad := []string{"/", "..", "a/b", "a\\b", "a b", ".", "foo.bar", "../x"}
+	for _, id := range bad {
+		if err := validateSenderId(id); err == nil {
+			t.Errorf("validateSenderId(%q) = nil, want error", id)
+		}
 	}
 }
 

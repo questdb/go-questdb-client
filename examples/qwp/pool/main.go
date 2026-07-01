@@ -48,7 +48,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close(ctx)
+	defer func() {
+		if err := db.Close(ctx); err != nil {
+			log.Printf("questdb close: %v", err)
+		}
+	}()
 
 	// Ingest: borrow a sender, write rows, Close to return it to the pool.
 	// BorrowSender hands back the LineSender interface. Type-assert it to
@@ -86,7 +90,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer query.Close()
+	defer func() {
+		if err := query.Close(); err != nil {
+			log.Printf("query close: %v", err)
+		}
+	}()
 
 	cursor := query.Query(ctx, "select count() from trades")
 	defer cursor.Close()

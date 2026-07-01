@@ -178,9 +178,16 @@ func (d *qwpDispatcher[T]) deliver(e T) {
 	d.delivered.Add(1)
 	defer func() {
 		if r := recover(); r != nil {
+			// describe is library-owned and panic-safe today, but guard it
+			// anyway: loop() has no recover, so a second panic escaping this
+			// recovery block would crash the host — the exact guarantee this
+			// dispatcher exists to keep.
 			msg := ""
 			if d.describe != nil {
-				msg = d.describe(e)
+				func() {
+					defer func() { _ = recover() }()
+					msg = d.describe(e)
+				}()
 			}
 			log.Printf("[ERROR] %s: handler panicked on %s: %v", d.logPrefix, msg, r)
 		}

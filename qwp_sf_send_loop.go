@@ -1342,6 +1342,14 @@ func (l *qwpSfSendLoop) sendLoopSetDurableAck(enabled bool, keepalive time.Durat
 // durableOnOk stashes an OK ACK as a pending entry (durable mode) instead of
 // advancing the engine. wireSeq is capped at the highest assigned sequence so a
 // forged/replayed ACK cannot enqueue a sequence beyond what was sent.
+//
+// Load-bearing invariant: the server sends exactly one OK ACK per frame,
+// carrying that frame's per-table seqTxn trailer. Per-entry trim in
+// durableDrain relies on it — a server that coalesced OK ACKs (a cumulative
+// seq skipping frames, with a trailer omitting the skipped tables) could let
+// the drain advance past a not-yet-durable frame. This matches the server /
+// Java per-frame ACK contract; the non-durable path is immune (it ignores the
+// trailer entirely).
 func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) {
 	assigned := l.nextWireSeq.Load() - 1
 	if assigned < 0 {
@@ -1507,22 +1515,26 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			l.totalAcks.Add(1)
 			continue
 		}
-		// Record the server's cumulative ACK sequence, then reconcile it
-		// against highestFullySent. applyAckWatermark caps the advance at
-		// the last fully-sent frame, so a malformed, early, or forged
-		// server response can never move ackedFsn over an in-flight frame
-		// (a trim would munmap a segment the I/O thread is still reading)
-		// nor over a frame a wire failure dropped before delivery. The
-		// matching call on the send side re-drives the same reconciliation
-		// so an ACK that arrives before its frame's send completes is not
-		// stranded when no later ACK follows it.
-		l.serverAckedSeq.Store(seq)
 		l.totalAcks.Add(1)
 		if l.durableAckMode {
-			// Durable mode: stash the OK, wait for STATUS_DURABLE_ACK to trim.
-			// serverAckedSeq is still tracked above for reconnect targeting.
+			// Durable mode: stash the OK and wait for STATUS_DURABLE_ACK to
+			// trim. serverAckedSeq is deliberately not recorded here — the
+			// durable tracker owns advancement and reconnect targets
+			// engineAckedFsn()+1, so the non-durable watermark (whose only
+			// reader, applyAckWatermark, is guarded off below) would be dead
+			// state.
 			l.durableOnOk(seq, data[qwpAckTablesOffset(QwpStatusOK):])
 		} else {
+			// Record the server's cumulative ACK sequence, then reconcile it
+			// against highestFullySent. applyAckWatermark caps the advance at
+			// the last fully-sent frame, so a malformed, early, or forged
+			// server response can never move ackedFsn over an in-flight frame
+			// (a trim would munmap a segment the I/O thread is still reading)
+			// nor over a frame a wire failure dropped before delivery. The
+			// matching call on the send side re-drives the same reconciliation
+			// so an ACK that arrives before its frame's send completes is not
+			// stranded when no later ACK follows it.
+			l.serverAckedSeq.Store(seq)
 			l.applyAckWatermark()
 		}
 	}
