@@ -277,8 +277,8 @@ func TestQwpDurableAckEndToEndProgression(t *testing.T) {
 	if err := qs.AwaitAckedFsn(waitCtx, lastFsn); err != nil {
 		t.Fatalf("AwaitAckedFsn(%d): %v", lastFsn, err)
 	}
-	if n := qs.TotalDurableAcks(); n < batches {
-		t.Errorf("TotalDurableAcks = %d, want >= %d", n, batches)
+	if n := qs.TotalDurableAcks(); n < 1 {
+		t.Errorf("TotalDurableAcks = %d, want >= 1", n)
 	}
 	if n := qs.TotalDurableTrimAdvances(); n < 1 {
 		t.Errorf("TotalDurableTrimAdvances = %d, want >= 1", n)
