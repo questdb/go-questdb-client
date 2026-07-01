@@ -889,6 +889,13 @@ func (s *qwpLineSender) AckedFsn() int64 {
 	return s.cursorEngine.engineAckedFsn()
 }
 
+// hasUnackedRows reports whether the engine holds published rows the server has
+// not yet acknowledged. The pool uses it to keep an idle memory-mode slot alive
+// through a transient outage instead of reaping (and destroying) its in-RAM rows.
+func (s *qwpLineSender) hasUnackedRows() bool {
+	return s.cursorEngine.enginePublishedFsn() > s.cursorEngine.engineAckedFsn()
+}
+
 // AwaitAckedFsn implements QwpSender.AwaitAckedFsn. This is the
 // server-ACK confirmation primitive: Flush never blocks on ACKs
 // (Java decision #1), so callers wanting delivery confirmation pair

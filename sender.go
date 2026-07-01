@@ -534,7 +534,7 @@ func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 
 // WithConnectionListenerInboxCapacity sets the bounded inbox depth for the
 // connection-event dispatcher. Zero uses the default (256); any other value
-// below the minimum of 16 is rejected at construction. Equivalent to the
+// outside [16, 1<<20] is rejected at construction. Equivalent to the
 // connect-string connection_listener_inbox_capacity key.
 //
 // Only available for the QWP sender.
@@ -770,8 +770,9 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 // much longer OS connect timeout. It clamps only the TCP connect; the TLS
 // handshake and the QWP upgrade response stay under WithAuthTimeout. A zero or
 // negative duration keeps the OS connect timeout. Honoured by the HTTP and QWP
-// senders; accepted but inert on TCP. Equivalent to the connect-string
-// connect_timeout key.
+// senders; accepted but inert on TCP, and ignored when a custom http.Transport
+// is supplied (that transport is the caller's to configure). Equivalent to the
+// connect-string connect_timeout key.
 func WithConnectTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		ms := int(d / time.Millisecond)

@@ -70,6 +70,11 @@ func newQwpDispatcher[T any](handler func(T), describe func(T) string, valid fun
 	if capacity < 1 {
 		capacity = qwpSfDefaultErrorInboxCapacity
 	}
+	if capacity > qwpSfMaxErrorInboxCapacity {
+		// Guard against an unsanitized caller: the current instantiations pre-clamp
+		// (conf_parse), but the type invites reuse, and makechan panics on a huge size.
+		capacity = qwpSfMaxErrorInboxCapacity
+	}
 	if logPrefix == "" {
 		logPrefix = "qwp"
 	}

@@ -328,13 +328,90 @@ func TestConnectionListenerObservesReconnect(t *testing.T) {
 	_ = s.Flush(context.Background())
 
 	seen := map[SenderConnectionEventKind]bool{}
+	connectedCount := 0
 	deadline := time.After(8 * time.Second)
 	for !(seen[SenderConnected] && seen[SenderDisconnected] && seen[SenderReconnected]) {
 		select {
 		case e := <-events:
 			seen[e.Kind] = true
+			if e.Kind == SenderConnected {
+				connectedCount++
+			}
 		case <-deadline:
 			t.Fatalf("did not observe CONNECTED+DISCONNECTED+RECONNECTED; saw %v", seen)
 		}
+	}
+	// CONNECTED fires exactly once per sender lifetime; a reconnect is RECONNECTED,
+	// not a second CONNECTED. Drain briefly to catch a spurious extra.
+	drain := time.After(200 * time.Millisecond)
+	for {
+		select {
+		case e := <-events:
+			if e.Kind == SenderConnected {
+				connectedCount++
+			}
+		case <-drain:
+			if connectedCount != 1 {
+				t.Fatalf("CONNECTED fired %d times, want exactly 1", connectedCount)
+			}
+			return
+		}
+	}
+}
+
+// TestConnectionListenerDroppedCounter exercises the sender-level
+// DroppedConnectionNotifications() accessor at runtime (the compile-time
+// var _ QwpSender never calls it): a fast listener under normal operation drops
+// nothing, so it reports 0.
+func TestConnectionListenerDroppedCounter(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	s, err := NewLineSender(context.Background(),
+		WithQwp(), WithAddress(addr),
+		WithConnectionListener(func(SenderConnectionEvent) {}),
+	)
+	if err != nil {
+		t.Fatalf("NewLineSender: %v", err)
+	}
+	defer s.Close(context.Background())
+	qs := s.(QwpSender)
+	_ = s.Table("t").Int64Column("v", 1).AtNow(context.Background())
+	_ = s.Flush(context.Background())
+	if got := qs.DroppedConnectionNotifications(); got != 0 {
+		t.Errorf("DroppedConnectionNotifications=%d, want 0 (fast listener, no overflow)", got)
+	}
+}
+
+// TestConnectionListenerAsyncConnect asserts the async-connect path (used under
+// lazy_connect / initial_connect_retry=async) fires exactly one CONNECTED with
+// AttemptNumber 0 once the server the sender started against becomes reachable.
+func TestConnectionListenerAsyncConnect(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	events := make(chan SenderConnectionEvent, 16)
+	s, err := NewLineSender(context.Background(),
+		WithQwp(), WithAddress(addr),
+		WithInitialConnectMode(InitialConnectAsync),
+		WithConnectionListener(func(e SenderConnectionEvent) { events <- e }),
+	)
+	if err != nil {
+		t.Fatalf("NewLineSender: %v", err)
+	}
+	defer s.Close(context.Background())
+	_ = s.Table("t").Int64Column("v", 1).AtNow(context.Background())
+	_ = s.Flush(context.Background())
+
+	select {
+	case e := <-events:
+		if e.Kind != SenderConnected {
+			t.Fatalf("first async event = %s, want CONNECTED", e.Kind)
+		}
+		if e.AttemptNumber != 0 {
+			t.Errorf("async CONNECTED AttemptNumber = %d, want 0 (initial connect)", e.AttemptNumber)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("async connect never fired CONNECTED")
 	}
 }

@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"path/filepath"
 	"strconv"
@@ -69,6 +70,10 @@ type qwpSenderPool struct {
 
 	inFlightCreations int
 	closed            bool
+	// closing is set before the housekeeper is stopped so an about-to-start reap
+	// bails immediately instead of racing teardown. Distinct from closed, which
+	// close() sets after the housekeeper has joined.
+	closing atomic.Bool
 
 	baseConf           string
 	errorHandler       SenderErrorHandler
@@ -316,6 +321,21 @@ func slotTerminallyFailed(delegate QwpSender) bool {
 	return ok && tr.terminallyFailed()
 }
 
+// unackedReporter reports whether a delegate still holds published-but-unacked
+// rows. Every pooled delegate is a *qwpLineSender, which implements it.
+type unackedReporter interface {
+	hasUnackedRows() bool
+}
+
+// slotHasUnackedRows reports whether an idle slot's delegate still has in-flight
+// rows the server has not acknowledged. Reaping such a memory-mode slot would
+// destroy those rows and cut short the reconnect/replay window that could still
+// deliver them, so the reaper spares it.
+func slotHasUnackedRows(delegate QwpSender) bool {
+	ur, ok := delegate.(unackedReporter)
+	return ok && ur.hasUnackedRows()
+}
+
 // closeSlotGuarded closes a delegate, converting a panic into an error so a
 // faulting Close cannot strand the pool's SF slot accounting (closingSlots /
 // slotInUse) or skip sibling teardowns. qwpLineSender.Close is itself panic-
@@ -349,9 +369,16 @@ func (p *qwpSenderPool) discardLocked(slot *qwpSenderSlot) {
 	p.mu.Unlock()
 }
 
+// markClosing signals reapIdle to bail. Called before the housekeeper is
+// stopped so a not-yet-started reap does not run during the stop-and-join window.
+func (p *qwpSenderPool) markClosing() { p.closing.Store(true) }
+
 // reapIdle closes idle-expired / over-age slots from the available set, never
 // shrinking below minSize. Called by the housekeeper.
 func (p *qwpSenderPool) reapIdle() {
+	if p.closing.Load() {
+		return
+	}
 	now := time.Now()
 	var toClose []*qwpSenderSlot
 	p.mu.Lock()
@@ -374,7 +401,12 @@ func (p *qwpSenderPool) reapIdle() {
 		// Idle/age recycling is floored at minSize, so max_lifetime_ms is inert
 		// for min slots (M2): no evict-and-replace (recreating mid-outage could
 		// orphan unacked SF data); QWP self-reconnects anyway. See README.
-		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
+		// Spare an idle/over-age slot that still has unacked rows: reaping it in
+		// memory mode destroys them and cuts short the reconnect/replay window. A
+		// poisoned slot is exempt — its HALT is terminal, so the rows are already
+		// lost and holding the slot only wastes it.
+		hasUnacked := !poisoned && slotHasUnackedRows(slot.delegate)
+		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize && !hasUnacked) {
 			p.removeFromAllLocked(slot)
 			if p.storeAndForward && slot.slotIndex >= 0 {
 				p.closingSlots++
@@ -389,6 +421,12 @@ func (p *qwpSenderPool) reapIdle() {
 
 	for _, slot := range toClose {
 		closeErr := closeSlotGuarded(context.Background(), slot.delegate)
+		if closeErr != nil {
+			// Autonomous reap has no caller to return this to (the producer long
+			// since returned its lease), so surface it here — it may be the
+			// "data may be lost" drain timeout.
+			log.Printf("[WARN] qwp pool: reaping a slot failed to drain cleanly: %v", closeErr)
+		}
 		p.mu.Lock()
 		p.reclaimSlotLocked(slot, closeErr)
 		p.mu.Unlock()
@@ -408,7 +446,13 @@ func (p *qwpSenderPool) reapIdle() {
 // catch. An outstanding lease instead closes its own delegate when it is returned
 // (giveBack sees p.closed). A lease that is never returned leaks its connection:
 // the caller must return every lease before QuestDB.Close.
-func (p *qwpSenderPool) close(ctx context.Context) error {
+//
+// Slots close concurrently on context.Background(): each drain is bounded by
+// close_flush_timeout, so the caller's ctx must neither serialize the drains
+// (an N-slot outage would stall shutdown for N × the timeout) nor cancel them
+// (dropping undelivered memory-mode rows). Matches the lease-return and reap
+// paths (M2). The ctx argument is accepted for interface symmetry but unused.
+func (p *qwpSenderPool) close(_ context.Context) error {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -421,12 +465,25 @@ func (p *qwpSenderPool) close(ctx context.Context) error {
 	p.broadcastLocked()
 	p.mu.Unlock()
 
-	var firstErr error
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
 	for _, slot := range toClose {
-		if err := closeSlotGuarded(ctx, slot.delegate); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		wg.Add(1)
+		go func(delegate QwpSender) {
+			defer wg.Done()
+			if err := closeSlotGuarded(context.Background(), delegate); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+		}(slot.delegate)
 	}
+	wg.Wait()
 	return firstErr
 }
 
@@ -1007,7 +1064,10 @@ func (ps *qwpPooledSender) Close(_ context.Context) error {
 	if !ps.broken {
 		flushErr = ps.slot.delegate.Flush(ctx1)
 		if flushErr != nil {
-			ps.broken = true
+			// A benign latched fluent-API error (Flush clears it and resets row
+			// state) leaves a healthy connection; only a terminal fault forfeits
+			// the slot. Matches the in-use paths' markBrokenIfTerminal (M4).
+			ps.markBrokenIfTerminal()
 		}
 	}
 	ps.pool.giveBack(ctx1, ps, ps.broken)

@@ -156,7 +156,7 @@ db, err := qdb.NewQuestDB(ctx, "ws::addr=localhost:9000;",
 | `idle_timeout_ms` | `WithIdleTimeout` | `60000` | Idle connection reap, never below `min` (`0` = never). |
 | `max_lifetime_ms` | `WithMaxLifetime` | `1800000` | Max age before an *above-`min`* idle connection is recycled by the reaper (`0` = no limit). Connections within the `min` floor are not age-recycled — with `min == max` this knob is inert (QWP self-reconnects on a dropped wire regardless). |
 | `housekeeper_interval_ms` | `WithHousekeeperInterval` | `5000` | Reaper sweep interval. |
-| `lazy_connect` | — | `off` | Tolerate a down server at startup (see below). |
+| `lazy_connect` | `WithLazyConnect` | `off` | Tolerate a down server at startup (see below). |
 
 Unlike the Java client's facade, the Go `QuestDB` handle accepts the ingest
 error handler and connection listener directly via
@@ -174,9 +174,9 @@ connects lazily on first borrow.
 db, err := qdb.Connect(ctx, "ws::addr=localhost:9000;lazy_connect=true;")
 ```
 
-`lazy_connect` is a facade-only key; standalone clients accept but ignore it.
-`connect_timeout` (milliseconds) bounds the TCP connect on each dial and is
-common to both directions.
+`lazy_connect` (or the `WithLazyConnect` option) is facade-only; standalone
+clients accept but ignore the key. `connect_timeout` (milliseconds) bounds the
+TCP connect on each dial and is common to both directions.
 
 ## Other ways to connect
 

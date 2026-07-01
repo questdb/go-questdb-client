@@ -28,10 +28,14 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 func senderPoolWithIdle(t *testing.T, extra string, min, max int, idle time.Duration) *qwpSenderPool {
@@ -46,6 +50,92 @@ func senderPoolWithIdle(t *testing.T, extra string, min, max int, idle time.Dura
 	}
 	t.Cleanup(func() { p.close(context.Background()) })
 	return p
+}
+
+// TestQwpSenderPoolAcquireWaitWakesOnGiveBack asserts the success-wait path: a
+// borrow that blocks on an exhausted pool wakes and succeeds when another lease
+// is returned, rather than riding the acquire timeout out.
+func TestQwpSenderPoolAcquireWaitWakesOnGiveBack(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 2*time.Second, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	defer p.close(context.Background())
+	ctx := context.Background()
+
+	s1, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow s1: %v", err)
+	}
+
+	got := make(chan error, 1)
+	go func() {
+		s2, err := p.borrow(ctx) // blocks: max=1 and s1 is out
+		if err == nil {
+			_ = s2.Close(ctx)
+		}
+		got <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond) // let the waiter park
+	if err := s1.Close(ctx); err != nil {
+		t.Fatalf("close s1: %v", err)
+	}
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Errorf("waiting borrow should succeed on giveBack, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting borrow never woke on giveBack")
+	}
+}
+
+// TestQwpSenderPoolSparesUnackedSlot pins M1: an idle memory-mode slot that
+// still holds published-but-unacked rows is not reaped (which would destroy
+// them), even past idle_timeout, so the reconnect/replay window can deliver them.
+func TestQwpSenderPoolSparesUnackedSlot(t *testing.T) {
+	// Accepts the upgrade and reads frames but never ACKs → published > acked.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	// close_flush_timeout_millis keeps the final teardown from draining the
+	// unacked slot for the full default budget against the non-ACKing server.
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";close_flush_timeout_millis=100;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 2,
+		500*time.Millisecond, time.Millisecond /* idle */, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	defer p.close(context.Background())
+	ctx := context.Background()
+
+	s, err := p.borrow(ctx) // grows to 1
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	_ = s.Table("t").Int64Column("v", 1).AtNow(ctx)
+	_ = s.Close(ctx) // Close flushes (publishes); the server never ACKs → unacked
+
+	time.Sleep(10 * time.Millisecond) // exceed idle_timeout
+	p.reapIdle()
+	if total, _, _ := p.poolSnapshot(); total != 1 {
+		t.Errorf("unacked idle slot should be spared from reap: total=%d, want 1", total)
+	}
 }
 
 // TestQwpSenderPoolReapsOverAge drives the max_lifetime (over-age) reap branch

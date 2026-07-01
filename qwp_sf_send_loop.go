@@ -488,6 +488,17 @@ func (l *qwpSfSendLoop) sendLoopConnDispatcher() *qwpDispatcher[*SenderConnectio
 	return l.connDispatcher.Load()
 }
 
+// eventAttempt is the AttemptNumber to stamp on a connection event: 0 while the
+// sender has not connected once (contract: 0 = initial connect), the reconnect
+// counter afterward. Keeps failure/terminal events on the initial async connect
+// from reporting a spurious attempt >= 1.
+func (l *qwpSfSendLoop) eventAttempt() int64 {
+	if !l.connectedOnce.Load() {
+		return 0
+	}
+	return l.reconnectAttempts.Load()
+}
+
 // emitConn builds and offers a connection event. idx/previousIdx are endpoint
 // indices (-1 when not applicable); host:port are filled from l.endpoints.
 func (l *qwpSfSendLoop) emitConn(kind SenderConnectionEventKind, idx, previousIdx int, attempt int64, cause error) {
@@ -1382,15 +1393,13 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 			l.totalReconnectAttempts.Add(1)
 		},
 		OnEndpointFailed: func(idx int, derr error) {
-			l.emitConn(SenderEndpointAttemptFailed, idx, -1, l.reconnectAttempts.Load(), derr)
+			l.emitConn(SenderEndpointAttemptFailed, idx, -1, l.eventAttempt(), derr)
 		},
 		OnRoundExhausted: func() {
 			round++
 			l.connDispatcher.Load().offer(&SenderConnectionEvent{
-				Kind: SenderAllEndpointsUnreachable,
-				// Reconnect-path event: carry the attempt counter, like
-				// OnEndpointFailed (contract: 0 only for the initial connect).
-				AttemptNumber:   l.reconnectAttempts.Load(),
+				Kind:            SenderAllEndpointsUnreachable,
+				AttemptNumber:   l.eventAttempt(),
 				RoundNumber:     round,
 				TimestampMillis: time.Now().UnixMilli(),
 			})
@@ -1431,7 +1440,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		// Fire the terminal connection event before latching the producer-
 		// observable error, so a listener is notified no later than the
 		// producer learns via its next API call (matches Java's order).
-		l.emitConn(SenderAuthFailed, -1, -1, l.reconnectAttempts.Load(), result.Terminal)
+		l.emitConn(SenderAuthFailed, -1, -1, l.eventAttempt(), result.Terminal)
 		l.recordFatalServerError(se)
 		l.dispatcher.Load().offer(se)
 		return false

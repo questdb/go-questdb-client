@@ -81,6 +81,8 @@ type questDBConfig struct {
 	maxLifetimeSet                     bool
 	housekeeperInterval                time.Duration
 	housekeeperIntervalSet             bool
+	lazyConnect                        bool
+	lazyConnectSet                     bool
 	errorHandler                       SenderErrorHandler
 	connectionListener                 SenderConnectionListener
 }
@@ -129,6 +131,16 @@ func WithMaxLifetime(d time.Duration) QuestDBOption {
 // WithHousekeeperInterval sets the reaper sweep interval (default 5s).
 func WithHousekeeperInterval(d time.Duration) QuestDBOption {
 	return func(c *questDBConfig) { c.housekeeperInterval = d; c.housekeeperIntervalSet = true }
+}
+
+// WithLazyConnect tolerates the server being down at startup: ingest connects
+// asynchronously (writes buffer until the wire is up) and the read pool connects
+// lazily on first borrow (query_pool_min defaults to 0). Equivalent to the
+// lazy_connect connect-string key; an explicit setter wins over the key. It is
+// incompatible with a non-async initial_connect_retry or an explicit
+// query_pool_min > 0, which build() rejects.
+func WithLazyConnect(v bool) QuestDBOption {
+	return func(c *questDBConfig) { c.lazyConnect = v; c.lazyConnectSet = true }
 }
 
 // WithQuestDBErrorHandler applies an ingest SenderErrorHandler to every pooled
@@ -212,10 +224,13 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	}
 
 	// Resolve lazy_connect (Java parity): tolerate a down server at startup
-	// without disabling reads.
-	lazyConnect, err := poolBool(kv, "lazy_connect", false)
-	if err != nil {
-		return nil, err
+	// without disabling reads. Explicit option wins over the connect-string key.
+	lazyConnect := cfg.lazyConnect
+	if !cfg.lazyConnectSet {
+		lazyConnect, err = poolBool(kv, "lazy_connect", false)
+		if err != nil {
+			return nil, err
+		}
 	}
 	ingestConf := conf
 	queryMinDefault := qwpDefaultPoolMin
@@ -340,6 +355,10 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // instead.
 func (db *QuestDB) Close(ctx context.Context) error {
 	db.closeOnce.Do(func() {
+		// Signal the pools to stop reaping before joining the housekeeper, so a
+		// reap cannot start during the join window and outlive Close.
+		db.senderPool.markClosing()
+		db.queryPool.markClosing()
 		hErr := closeStep(func() error { db.housekeeper.stopAndJoin(); return nil })
 		qErr := closeStep(func() error { return db.queryPool.close(ctx) })
 		sErr := closeStep(func() error { return db.senderPool.close(ctx) })
