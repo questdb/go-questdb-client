@@ -1253,16 +1253,27 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // takes precedence, else an enqueue or terminal I/O failure. On a latch-only
 // error the committed rows are flushed regardless, and any terminal fault is
 // surfaced so the pool discards the slot instead of recycling a dead one.
-func (s *qwpLineSender) flushForReturn(ctx context.Context) error {
+//
+// The first return value, retained, reports whether committed rows are STILL
+// buffered un-enqueued after the attempt — the enqueue hit the backpressure
+// append deadline (e.g. the cursor ring saturated during an outage) or the
+// engine was closed, neither of which is a terminal send-loop HALT. Such a slot
+// is DIRTY: recycling it would ship this borrower's rows under the next
+// borrower's FSN (C1 borrower-isolation). The pool must discard it rather than
+// recycle. retained is only meaningful on the producer goroutine; the
+// error-handler path can't inspect producer state and reports false.
+func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err error) {
 	if s.closed.Load() {
-		return errClosedSenderFlush
+		return false, errClosedSenderFlush
 	}
 	if s.calledFromErrorHandler() {
 		// Running on the dispatcher goroutine (Close invoked from inside a
 		// SenderErrorHandler): touching producer state (lastErr / hasTable /
 		// pendingRowCount / buffers) would race the producer — the C3 hazard.
-		// Surface only the latched terminal error, like closeCursor does.
-		return s.cursorSendLoop.sendLoopCheckError()
+		// Surface only the latched terminal error, like closeCursor does. We
+		// can't safely read pendingRowCount here, so report retained=false and
+		// let markBrokenIfTerminal handle a poisoned slot.
+		return false, s.cursorSendLoop.sendLoopCheckError()
 	}
 	firstErr := s.lastErr
 	s.lastErr = nil
@@ -1292,7 +1303,10 @@ func (s *qwpLineSender) flushForReturn(ctx context.Context) error {
 			firstErr = err
 		}
 	}
-	return firstErr
+	// pendingRowCount > 0 here means enqueueCursor could not seal the
+	// committed rows (backpressure deadline / engine closed); enqueueCursor
+	// leaves them retained for a later flush. The slot is dirty.
+	return s.pendingRowCount > 0, firstErr
 }
 
 // FlushAndGetSequence implements QwpSender.FlushAndGetSequence.

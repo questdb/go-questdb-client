@@ -283,6 +283,146 @@ func TestQwpSenderPoolReturnLatchedErrorFlushesCommittedRow(t *testing.T) {
 	}
 }
 
+// TestQwpLineSenderFlushForReturnRetainsRowsOnEnqueueFailure is the unit half of
+// the C1 backpressure fix: when flushForReturn cannot enqueue the committed rows,
+// it must report retained=true and keep the rows buffered — never silently drop
+// them nor claim a clean return. A cancelled ctx makes engineAppendBlocking
+// return ctx.Err() before sealing the frame, exactly as a saturated ring whose
+// append deadline elapsed would. retained=true is the signal the pool uses to
+// discard the dirty slot instead of recycling it under the next borrower.
+func TestQwpLineSenderFlushForReturnRetainsRowsOnEnqueueFailure(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	if err := s.Table("t").Int64Column("v", 1).At(context.Background(), time.Unix(0, 1000)); err != nil {
+		t.Fatalf("At: %v", err)
+	}
+	if s.pendingRowCount != 1 {
+		t.Fatalf("pendingRowCount = %d, want 1", s.pendingRowCount)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	retained, err := s.flushForReturn(ctx)
+	if err == nil {
+		t.Fatal("flushForReturn: want error from the cancelled-ctx enqueue, got nil")
+	}
+	if !retained {
+		t.Fatal("flushForReturn: retained=false, want true — committed rows were left un-enqueued")
+	}
+	if s.pendingRowCount != 1 {
+		t.Fatalf("committed rows dropped: pendingRowCount = %d, want 1 (retained for retry)", s.pendingRowCount)
+	}
+}
+
+// TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot is the C1 end-to-end
+// regression the reviewer flagged as uncovered. A lease returned while the cursor
+// ring is saturated and the wire cannot drain (an outage) cannot flush its
+// committed rows on return: flushForReturn hits the backpressure append deadline
+// and RETAINS them. A backpressure timeout is not a terminal HALT, so
+// markBrokenIfTerminal leaves the slot healthy — and recycling it would encode
+// borrower A's retained rows into borrower B's next flush, shipping them under
+// B's FSN (and a second time once A retries the error). Close must instead
+// discard the dirty slot.
+func TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot(t *testing.T) {
+	// A server that completes the upgrade and drains frames off the wire but
+	// NEVER ACKs, so the ring's ACK-driven trim never advances and the ring
+	// fills — the outage condition that makes backpressure bite.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			// Deliberately no ACK: the ring can never trim.
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// Tiny single-segment ring + short append deadline so the ring saturates
+	// within a handful of flushes and each backpressure wait is ~50ms. Fast
+	// close so tearing the dirty slot down doesn't block on the dead wire.
+	// auto_flush=off so flushing is entirely under the test's control.
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + t.TempDir() +
+		";sf_max_bytes=8192;sf_max_total_bytes=8192;sf_append_deadline_millis=50" +
+		";close_flush_timeout_millis=1;auto_flush=off;"
+	// min == max == 1 forces the re-borrow to reuse the recycled slot — unless
+	// this Close discards it, which is exactly what we assert.
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 500*time.Millisecond, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+
+	ctx := context.Background()
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	ps := s.(*qwpPooledSender)
+	delegate := ps.slot.delegate.(*qwpLineSender)
+
+	// Fill the ring: commit + flush until a flush hits the backpressure deadline
+	// (ring full, can't drain against the non-ACKing server). That leaves the
+	// last committed row retained in the delegate's producer buffers.
+	var sawBackpressure bool
+	for i := 0; i < 2000; i++ {
+		if err := s.Table("t").Int64Column("v", int64(i)).At(ctx, time.Unix(0, int64(i+1)*1000)); err != nil {
+			t.Fatalf("At row %d: %v", i, err)
+		}
+		if err := s.Flush(ctx); err != nil {
+			if !errors.Is(err, ErrBackpressureTimeout) {
+				t.Fatalf("flush %d: unexpected error %v, want ErrBackpressureTimeout", i, err)
+			}
+			sawBackpressure = true
+			break
+		}
+	}
+	if !sawBackpressure {
+		t.Fatal("ring never saturated — test setup wrong (raise the flush count or shrink sf_max_total_bytes)")
+	}
+	if delegate.pendingRowCount == 0 {
+		t.Fatal("expected committed rows retained after the backpressure flush")
+	}
+	if ps.broken {
+		t.Fatal("backpressure is not a terminal HALT — the slot must not be broken yet")
+	}
+
+	// Return the lease. flushForReturn re-hits backpressure and retains the rows;
+	// Close must discard the dirty slot rather than recycle it.
+	if err := s.Close(ctx); err == nil {
+		t.Fatal("Close did not surface the backpressure error")
+	}
+	if !ps.broken {
+		t.Fatal("dirty slot (rows retained on backpressure) was NOT marked broken — it would be recycled carrying borrower A's rows (C1)")
+	}
+	if total, _, leaked := p.poolSnapshot(); total != 0 || leaked != 0 {
+		t.Fatalf("dirty slot not discarded: total=%d leaked=%d, want 0/0", total, leaked)
+	}
+
+	// Re-borrow: min=1 rebuilds a FRESH slot (a different delegate), clean.
+	s2, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("re-borrow after discard: %v", err)
+	}
+	defer s2.Close(ctx)
+	d2 := s2.(*qwpPooledSender).slot.delegate.(*qwpLineSender)
+	if d2 == delegate {
+		t.Fatal("re-borrow reused the discarded dirty delegate")
+	}
+	if d2.pendingRowCount != 0 {
+		t.Fatalf("re-borrowed slot has stale rows: pendingRowCount = %d, want 0", d2.pendingRowCount)
+	}
+}
+
 func TestQwpSenderPoolSfDistinctSlotDirs(t *testing.T) {
 	sfDir := t.TempDir()
 	p := newQwpSenderPoolForTest(t, "sf_dir="+sfDir+";", 2, 4)

@@ -331,9 +331,12 @@ type unackedReporter interface {
 // public QwpSender interface: it drops the in-progress (un-At'd) row, flushes
 // committed rows, and surfaces (without discarding those rows) a latched
 // fluent-API error — the C1-correct lease-return path, distinct from Flush.
+// The returned retained bool reports whether committed rows were left
+// un-enqueued (a backpressure-deadline / engine-closed failure, not a terminal
+// HALT); such a slot is dirty and must be discarded, not recycled.
 // Every pooled delegate is a *qwpLineSender, which implements it.
 type returnFlusher interface {
-	flushForReturn(ctx context.Context) error
+	flushForReturn(ctx context.Context) (retained bool, err error)
 }
 
 // slotHasUnackedRows reports whether an idle slot's delegate still has in-flight
@@ -1077,9 +1080,12 @@ func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 
 // Close returns the leased sender to the pool. It flushes committed rows first
 // (surfacing but not swallowing a latched fluent-API error) so the next
-// borrower starts clean; only a terminal fault marks the slot broken so it is
-// discarded rather than recycled — a benign latch or a ctx-bounded timeout
-// leaves a healthy slot to be reused. Idempotent — a stale lease no-ops.
+// borrower starts clean; the slot is marked broken (discarded rather than
+// recycled) on a terminal fault OR when the return flush left committed rows
+// un-enqueued (a backpressure-deadline / engine-closed failure — a dirty slot
+// that would leak this borrower's rows into the next; C1). A benign fluent-API
+// latch, whose committed rows still flushed cleanly, leaves a healthy slot to be
+// reused. Idempotent — a stale lease no-ops.
 //
 // The flush and return run on context.Background, not the caller's ctx: the
 // return flush only publishes into the cursor engine (it never waits for the
@@ -1104,7 +1110,22 @@ func (ps *qwpPooledSender) Close(_ context.Context) error {
 		// flushForReturn mirrors closeCursor: drop the open row, surface the
 		// latch, but still flush committed rows so the slot returns clean.
 		if fr, ok := ps.slot.delegate.(returnFlusher); ok {
-			flushErr = fr.flushForReturn(ctx1)
+			var retained bool
+			retained, flushErr = fr.flushForReturn(ctx1)
+			if retained {
+				// flushForReturn could not enqueue the committed rows — the
+				// cursor ring saturated and the append deadline elapsed (an
+				// outage, the exact condition that makes backpressure bite),
+				// or the engine was closed. Neither is a terminal send-loop
+				// HALT, so markBrokenIfTerminal below leaves the slot healthy;
+				// but the rows are RETAINED in the delegate's producer buffers.
+				// Recycling this dirty slot would encode borrower A's rows into
+				// borrower B's next flush — shipping them under B's FSN and,
+				// once A retries the backpressure error, a second time under A
+				// (C1 borrower-isolation / row misattribution). Discard it: A's
+				// flush already surfaced the error, so A retries cleanly.
+				ps.broken = true
+			}
 		} else {
 			flushErr = ps.slot.delegate.Flush(ctx1)
 		}
