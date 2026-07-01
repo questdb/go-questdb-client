@@ -326,6 +326,26 @@ func queryPoolWithIdle(t *testing.T, min, max int, idle time.Duration) *qwpQuery
 	return p
 }
 
+// queryPoolWithCancelResponder mirrors queryPoolWithIdle but backs each
+// connection with egressCancelResponder, which answers CANCEL frames with
+// a QUERY_ERROR(CANCELLED) terminal. Use it for tests that drive a cursor
+// cleanup drain (e.g. lease reopen), where the silent read-and-discard
+// server would leave the drain racing the cancel-ack watchdog against its
+// own ctx — both 5s — making the drain outcome (and any drainFailed latch)
+// nondeterministic.
+func queryPoolWithCancelResponder(t *testing.T, min, max int, idle time.Duration) *qwpQueryPool {
+	t.Helper()
+	srv := newQwpMockEgressServer(t, egressCancelResponder)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpQueryPool(context.Background(), conf, min, max, 500*time.Millisecond, idle, 0)
+	if err != nil {
+		t.Fatalf("newQwpQueryPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+	return p
+}
+
 func TestQwpQueryPoolReapsToMin(t *testing.T) {
 	p := queryPoolWithIdle(t, 1, 4, time.Millisecond)
 	ctx := context.Background()

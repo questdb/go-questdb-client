@@ -245,7 +245,13 @@ func TestQwpQueryLeaseCloseIdempotent(t *testing.T) {
 }
 
 func TestQwpQueryLeaseReopenClosesPrevious(t *testing.T) {
-	p := queryPoolWithIdle(t, 1, 2, 0)
+	// A CANCEL-responding server so reopening's cleanup drain of c1
+	// observes a terminal frame promptly and deterministically (clean
+	// drain, drainFailed stays false). The read-and-discard server would
+	// leave the drain racing the cancel-ack watchdog against its ctx —
+	// both 5s — so the reopen's desynced-vs-clean branch became a coin
+	// flip (flaky: passed on Go 1.23, failed on Go 1.24 in CI).
+	p := queryPoolWithCancelResponder(t, 1, 2, 0)
 	ctx := context.Background()
 	q, err := p.borrow(ctx)
 	if err != nil {
