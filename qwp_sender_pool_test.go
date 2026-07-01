@@ -186,11 +186,12 @@ func TestQwpSenderPoolStaleLeaseErrors(t *testing.T) {
 
 // TestQwpSenderPoolReturnMidRowLeavesCleanSlot is the C1 regression: a
 // lease returned with an in-progress row (Table/Symbol/*Column but no
-// finalizing At/AtNow) must not poison the next borrower. The return
-// path's Flush early-returns errFlushWithPendingMessage without
-// cancelling the open row, so before the fix the recycled slot kept
-// hasTable / currentTable set and the next Table() latched a stale
-// "table already set" naming a table the new borrower never touched.
+// finalizing At/AtNow) must not poison the next borrower. Routing the
+// return through Flush early-returned errFlushWithPendingMessage without
+// cancelling the open row, so the recycled slot kept hasTable /
+// currentTable set and the next Table() latched a stale "table already
+// set" naming a table the new borrower never touched. The return now goes
+// through flushForReturn, which drops the open row first.
 func TestQwpSenderPoolReturnMidRowLeavesCleanSlot(t *testing.T) {
 	// min == max == 1 forces the re-borrow to reuse the very slot just
 	// returned, so we exercise the recycled-slot path (not a fresh one).
@@ -221,6 +222,64 @@ func TestQwpSenderPoolReturnMidRowLeavesCleanSlot(t *testing.T) {
 	// here on At().
 	if err := s2.Table("y").Int64Column("v", 1).At(ctx, time.Now()); err != nil {
 		t.Fatalf("write after mid-row return failed (slot returned dirty?): %v", err)
+	}
+}
+
+// TestQwpSenderPoolReturnLatchedErrorFlushesCommittedRow is the C1
+// regression for the committed-row-plus-latch variant: a lease closed
+// after committing a row AND then latching a fluent-API error (e.g. an
+// illegal column name on untrusted input) must still flush the committed
+// row into the engine on return, not recycle the slot with it buffered.
+//
+// The delegate's Flush early-returns the latched error ahead of its
+// pending-rows branch, so routing the return through Flush left the
+// committed row in the recycled slot; the next borrower then silently
+// shipped it as a phantom/duplicate row (the reporter's exact repro). The
+// return path now goes through flushForReturn, which mirrors closeCursor:
+// capture the latch, drop the open row, but STILL flush committed rows.
+func TestQwpSenderPoolReturnLatchedErrorFlushesCommittedRow(t *testing.T) {
+	// min == max == 1 forces the re-borrow to reuse the very slot returned.
+	p := newQwpSenderPoolForTest(t, "", 1, 1)
+	ctx := context.Background()
+
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	delegate := s.(*qwpPooledSender).slot.delegate.(*qwpLineSender)
+
+	// Commit a good row, then latch a validation error on the next (open)
+	// row — an illegal '.' in the column name, the untrusted-input path.
+	if err := s.Table("t").Int64Column("v", 1).At(ctx, time.Unix(0, 1000)); err != nil {
+		t.Fatalf("commit row: %v", err)
+	}
+	if delegate.pendingRowCount != 1 {
+		t.Fatalf("pendingRowCount after commit = %d, want 1", delegate.pendingRowCount)
+	}
+	s.Table("t").Int64Column("bad.name", 2)
+
+	// Close surfaces the latched error (retain-on-error) but MUST still
+	// flush the committed row before recycling the slot.
+	if err := s.Close(ctx); err == nil {
+		t.Fatal("Close did not surface the latched illegal-column-name error")
+	}
+	if delegate.pendingRowCount != 0 {
+		t.Fatalf("committed row stranded on recycled slot: pendingRowCount = %d, want 0", delegate.pendingRowCount)
+	}
+
+	// Re-borrow the same slot: it must start clean — no leftover committed
+	// row waiting to ship on the new borrower's first flush.
+	s2, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("re-borrow: %v", err)
+	}
+	defer s2.Close(ctx)
+	d2 := s2.(*qwpPooledSender).slot.delegate.(*qwpLineSender)
+	if d2 != delegate {
+		t.Fatal("re-borrow did not reuse the same slot")
+	}
+	if d2.pendingRowCount != 0 {
+		t.Fatalf("re-borrowed slot has stale rows: pendingRowCount = %d, want 0", d2.pendingRowCount)
 	}
 }
 

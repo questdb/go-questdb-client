@@ -1234,22 +1234,65 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 	return err
 }
 
-// discardOpenRow drops an in-progress row (opened via Table/Symbol/*Column
-// with no finalizing At/AtNow) so a subsequent Flush encodes only committed
-// rows and leaves the sender clean. Mirrors closeCursor's open-row handling.
-// Used by the pool's lease-return path (qwpPooledSender.Close, C1); the
-// standalone Flush deliberately keeps surfacing errFlushWithPendingMessage
-// instead. Producer-goroutine only.
-func (s *qwpLineSender) discardOpenRow() {
-	if !s.hasTable {
-		return
+// flushForReturn readies the delegate for return to the pool: it captures and
+// clears any latched fluent-API error, drops any in-progress (un-At'd) row,
+// and — crucially — still flushes the committed rows into the cursor engine so
+// the slot returns clean. It mirrors closeCursor's producer-state handling
+// (capture latch, drop open row, enqueue pending rows) minus the teardown; the
+// slot stays live for the next borrower. Producer-goroutine only.
+//
+// The pool must route lease return through this, not Flush (C1):
+// FlushAndGetSequence early-returns a latched error ahead of its pending-rows
+// branch, so a lease closed with a committed row AND a latched error (e.g. one
+// illegal column name on untrusted input, after a good row) would leave that
+// committed row buffered in the recycled slot — the next borrower would then
+// silently ship it as a phantom/duplicate row. A latched error must surface
+// (retain-on-error) without suppressing the flush of already-committed rows.
+//
+// Returns the first error: the captured latch (the original user-facing cause)
+// takes precedence, else an enqueue or terminal I/O failure. On a latch-only
+// error the committed rows are flushed regardless, and any terminal fault is
+// surfaced so the pool discards the slot instead of recycling a dead one.
+func (s *qwpLineSender) flushForReturn(ctx context.Context) error {
+	if s.closed.Load() {
+		return errClosedSenderFlush
 	}
-	if s.currentTable != nil {
-		s.currentTable.cancelRow()
+	if s.calledFromErrorHandler() {
+		// Running on the dispatcher goroutine (Close invoked from inside a
+		// SenderErrorHandler): touching producer state (lastErr / hasTable /
+		// pendingRowCount / buffers) would race the producer — the C3 hazard.
+		// Surface only the latched terminal error, like closeCursor does.
+		return s.cursorSendLoop.sendLoopCheckError()
 	}
-	s.hasTable = false
-	s.currentTable = nil
-	s.cachedDesignatedTs = nil
+	firstErr := s.lastErr
+	s.lastErr = nil
+	if s.hasTable {
+		if s.currentTable != nil {
+			s.currentTable.cancelRow()
+		}
+		s.hasTable = false
+		s.currentTable = nil
+		s.cachedDesignatedTs = nil
+	}
+	if s.pendingRowCount > 0 {
+		if err := s.enqueueCursor(ctx); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			s.resetAfterFlush()
+		}
+	}
+	// Surface a terminal I/O error the send loop latched (in the background
+	// or during the enqueue above) so a poisoned slot is discarded, not
+	// recycled — parity with flushCursor's tail. A captured fluent latch
+	// takes precedence as the original user-facing cause.
+	if firstErr == nil {
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // FlushAndGetSequence implements QwpSender.FlushAndGetSequence.

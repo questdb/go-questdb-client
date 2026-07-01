@@ -327,11 +327,13 @@ type unackedReporter interface {
 	hasUnackedRows() bool
 }
 
-// rowDiscarder lets the pool drop a delegate's in-progress (un-At'd) row on the
-// lease-return path before flushing, without growing the public QwpSender
-// interface. Every pooled delegate is a *qwpLineSender, which implements it.
-type rowDiscarder interface {
-	discardOpenRow()
+// returnFlusher lets the pool flush a delegate for return without growing the
+// public QwpSender interface: it drops the in-progress (un-At'd) row, flushes
+// committed rows, and surfaces (without discarding those rows) a latched
+// fluent-API error — the C1-correct lease-return path, distinct from Flush.
+// Every pooled delegate is a *qwpLineSender, which implements it.
+type returnFlusher interface {
+	flushForReturn(ctx context.Context) error
 }
 
 // slotHasUnackedRows reports whether an idle slot's delegate still has in-flight
@@ -1065,12 +1067,15 @@ func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 	return ps.slot.delegate.BackgroundDrainers()
 }
 
-// Close returns the leased sender to the pool. It flushes pending rows first so
-// the next borrower starts clean; a flush failure marks the slot broken so it
-// is discarded rather than recycled. Idempotent — a stale lease no-ops.
+// Close returns the leased sender to the pool. It flushes committed rows first
+// (surfacing but not swallowing a latched fluent-API error) so the next
+// borrower starts clean; only a terminal fault marks the slot broken so it is
+// discarded rather than recycled — a benign latch or a ctx-bounded timeout
+// leaves a healthy slot to be reused. Idempotent — a stale lease no-ops.
 //
-// The flush and return run on context.Background, not the caller's ctx: Flush
-// only publishes into the cursor engine (it never waits for the server ACK), so
+// The flush and return run on context.Background, not the caller's ctx: the
+// return flush only publishes into the cursor engine (it never waits for the
+// server ACK), so
 // a request-scoped ctx must not (a) leave pending rows un-published in a slot
 // the next borrower reuses, or (b) mark a healthy slot broken via a
 // context.Canceled / DeadlineExceeded. Both would thrash the pool under the
@@ -1083,19 +1088,23 @@ func (ps *qwpPooledSender) Close(_ context.Context) error {
 	var flushErr error
 	ctx1 := context.Background()
 	if !ps.broken {
-		// Drop any in-progress row before flushing so the slot never returns
-		// dirty. Flush early-returns errFlushWithPendingMessage while a row
-		// is open (non-terminal, so the slot is kept), leaving hasTable /
-		// currentTable set and committed rows unflushed — poisoning the next
-		// borrower (C1). Mirrors closeCursor's standalone-path discard.
-		if rd, ok := ps.slot.delegate.(rowDiscarder); ok {
-			rd.discardOpenRow()
+		// Route the return through flushForReturn, NOT Flush. Flush both
+		// early-returns errFlushWithPendingMessage while a row is open and
+		// early-returns a latched fluent-API error ahead of its pending-rows
+		// branch — either way it leaves committed rows unflushed in a
+		// non-terminal (kept) slot, poisoning the next borrower (C1).
+		// flushForReturn mirrors closeCursor: drop the open row, surface the
+		// latch, but still flush committed rows so the slot returns clean.
+		if fr, ok := ps.slot.delegate.(returnFlusher); ok {
+			flushErr = fr.flushForReturn(ctx1)
+		} else {
+			flushErr = ps.slot.delegate.Flush(ctx1)
 		}
-		flushErr = ps.slot.delegate.Flush(ctx1)
 		if flushErr != nil {
-			// A benign latched fluent-API error (Flush clears it and resets row
-			// state) leaves a healthy connection; only a terminal fault forfeits
-			// the slot. Matches the in-use paths' markBrokenIfTerminal (M4).
+			// A benign latched fluent-API error (already cleared, committed
+			// rows already flushed) leaves a healthy connection; only a
+			// terminal fault forfeits the slot. Matches the in-use paths'
+			// markBrokenIfTerminal (M4).
 			ps.markBrokenIfTerminal()
 		}
 	}
