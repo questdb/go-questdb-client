@@ -283,11 +283,12 @@ type qwpSfSendLoop struct {
 	onEndpointFailed func(idx int, err error)
 
 	// progressDispatcher delivers ackedFsn advances to the user's
-	// SenderProgressHandler; nil when none is registered. lastProgressFsn is the
-	// highest FSN dispatched, advanced by CAS so only one goroutine fires per
-	// advance (applyAckWatermark runs on both the send and receive goroutines).
+	// SenderProgressHandler; nil when none is registered. progressDispatchMu
+	// guards lastProgressFsn's compare-store and the offer (both goroutines call
+	// dispatchProgress) so the delivered FSN stream stays strictly monotonic.
 	progressDispatcher atomic.Pointer[qwpDispatcher[int64]]
 	lastProgressFsn    atomic.Int64
+	progressDispatchMu sync.Mutex
 
 	// framesSentOnConn counts frames written to the wire on the
 	// current connection (reset on every connection swap). Paired
@@ -586,6 +587,9 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 		d.close()
 	}
 	if d := l.connDispatcher.Load(); d != nil {
+		d.close()
+	}
+	if d := l.progressDispatcher.Load(); d != nil {
 		d.close()
 	}
 	return l.checkErrorOrNil()
@@ -1287,30 +1291,33 @@ func (l *qwpSfSendLoop) applyAckWatermark() {
 }
 
 // sendLoopSetProgressHandler installs the ack-progress dispatcher. Call once
-// before sendLoopStart. A nil handler leaves progress dispatch off.
+// before sendLoopStart. A nil handler leaves progress dispatch off. Swap + close
+// (like sendLoopSetErrorHandler) so a repeated registration can't leak the old
+// dispatcher's goroutine.
 func (l *qwpSfSendLoop) sendLoopSetProgressHandler(handler SenderProgressHandler, capacity int) {
-	l.progressDispatcher.Store(newQwpProgressDispatcher(handler, capacity))
+	old := l.progressDispatcher.Swap(newQwpProgressDispatcher(handler, capacity))
+	if old != nil {
+		old.close()
+	}
 }
 
 // dispatchProgress delivers the engine's acked FSN to the progress handler when
-// it has advanced. The CAS makes the advance atomic across the send and receive
-// goroutines so the handler sees a strictly monotonic, non-duplicated stream.
+// it has advanced. The lock spans read-compare-store-offer so concurrent
+// dispatches from the send and receive goroutines can't reorder two advances
+// into a non-monotonic stream (offering outside it could).
 func (l *qwpSfSendLoop) dispatchProgress() {
 	d := l.progressDispatcher.Load()
 	if d == nil {
 		return
 	}
+	l.progressDispatchMu.Lock()
+	defer l.progressDispatchMu.Unlock()
 	fsn := l.engine.engineAckedFsn()
-	for {
-		prev := l.lastProgressFsn.Load()
-		if fsn <= prev {
-			return
-		}
-		if l.lastProgressFsn.CompareAndSwap(prev, fsn) {
-			d.offer(fsn)
-			return
-		}
+	if fsn <= l.lastProgressFsn.Load() {
+		return
 	}
+	l.lastProgressFsn.Store(fsn)
+	d.offer(fsn)
 }
 
 // sendLoopSetDurableAck enables durable-ack mode and installs the tracker. Call

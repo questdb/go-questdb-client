@@ -310,6 +310,10 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// synthesises a 1-host implicit tracker, matching the legacy
 	// behaviour single-host tests rely on.
 	connectCtx, cancelConnect := context.WithCancel(ctx)
+	// Panic-safety net: on a panic in qwpSfConnectWithRetry (recovered above) the
+	// inline cancelConnect() is skipped, orphaning the child ctx in the pool ctx
+	// until close. cancel is idempotent; the eager call still releases it normally.
+	defer cancelConnect()
 	d.connectCancel.Store(&cancelConnect)
 	transport, boundIdx, err := qwpSfConnectWithRetry(connectCtx, d.clientFactory, d.tracker,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff,

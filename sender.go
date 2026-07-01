@@ -798,12 +798,14 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 
 // WithConnectTimeout bounds the TCP connect to a QuestDB endpoint, so a
 // black-holed or firewalled host is abandoned within d instead of riding the
-// much longer OS connect timeout. It clamps only the TCP connect; the TLS
-// handshake and the QWP upgrade response stay under WithAuthTimeout. A zero or
-// negative duration keeps the OS connect timeout. Honoured by the HTTP and QWP
-// senders; accepted but inert on TCP, and ignored when a custom http.Transport
-// is supplied (that transport is the caller's to configure). Equivalent to the
-// connect-string connect_timeout key.
+// much longer OS connect timeout. The QWP upgrade response stays under
+// WithAuthTimeout. The TLS handshake prefers WithAuthTimeout, but falls back to
+// this timeout when WithAuthTimeout is unset — so a config that sets only
+// connect_timeout still bounds the handshake (wss), not just the TCP connect. A
+// zero or negative duration keeps the OS connect timeout. Honoured by the HTTP
+// and QWP senders; accepted but inert on TCP, and ignored when a custom
+// http.Transport is supplied (that transport is the caller's to configure).
+// Equivalent to the connect-string connect_timeout key.
 func WithConnectTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		ms := int(d / time.Millisecond)
@@ -833,7 +835,14 @@ func WithRequestDurableAck(enabled bool) LineSenderOption {
 // default 200ms. Equivalent to the durable_ack_keepalive_interval_millis key.
 func WithDurableAckKeepaliveInterval(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.durableAckKeepaliveMillis = int(d / time.Millisecond)
+		ms := int(d / time.Millisecond)
+		// A positive sub-ms interval must not truncate to 0: an explicit 0 disables
+		// the keepalive, so floor to 1ms (like WithConnectTimeout) — only a zero or
+		// negative d disables it, as documented.
+		if d > 0 && ms == 0 {
+			ms = 1
+		}
+		s.durableAckKeepaliveMillis = ms
 		s.durableAckKeepaliveMillisSet = true
 	}
 }

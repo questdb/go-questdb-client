@@ -224,9 +224,9 @@ func (d *qwpDispatcher[T]) close() {
 	case <-joined:
 	case <-timer.C:
 		d.abandon.Store(true)
-		log.Printf("[WARN] qwp/sf: handler still running after %s on close; "+
+		log.Printf("[WARN] %s: handler still running after %s on close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
-			qwpSfDispatcherCloseJoinTimeout)
+			d.logPrefix, qwpSfDispatcherCloseJoinTimeout)
 	}
 	// Whatever is still queued (abandoned by drain's timeout or unreached by a
 	// wedged handler) counts as dropped; re-delivering would defeat the bound.
