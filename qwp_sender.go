@@ -196,6 +196,15 @@ type QwpSender interface {
 	// park. Non-zero values mean the producer is outpacing the wire.
 	TotalBackpressureStalls() int64
 
+	// TotalDurableAcks returns the cumulative count of STATUS_DURABLE_ACK
+	// frames processed. Always 0 unless request_durable_ack is on.
+	TotalDurableAcks() int64
+
+	// TotalDurableTrimAdvances returns the cumulative count of times a
+	// durable ACK advanced the trim/replay/await watermark. Always 0
+	// unless request_durable_ack is on.
+	TotalDurableTrimAdvances() int64
+
 	// BackgroundDrainers returns a snapshot of the drainers the
 	// foreground sender has dispatched for orphan slot adoption.
 	// Returns nil when the sender was not configured with

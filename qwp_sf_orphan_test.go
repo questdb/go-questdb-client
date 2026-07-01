@@ -183,6 +183,47 @@ func TestQwpSfDrainerMarksFailedOnAuthRejection(t *testing.T) {
 	assert.Contains(t, string(body), "connect")
 }
 
+// TestQwpSfDrainerDurableAckMismatchQuarantines pins §5.8 / Hazard I: a
+// durable-ack drainer against an endpoint that does not advertise durable-ack
+// retries (its source is pinned), notifies the listener each attempt, and after
+// the cap quarantines the slot with a .failed sentinel — never trimming.
+func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{}) // does not advertise durable-ack
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+
+	var unavailable, persistent, lastAttempts int
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		qwpSfDurableDialFor(srv),
+		nil,
+		5*time.Second, time.Millisecond, 5*time.Millisecond,
+	)
+	drainer.durableAckMode = true
+	drainer.listener = QwpBackgroundDrainerListener{
+		OnDurableAckUnavailable:       func(string, int) { unavailable++ },
+		OnDurableAckPersistentFailure: func(_ string, attempts int, _ time.Duration) { persistent++; lastAttempts = attempts },
+	}
+	drainer.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "durable-ack")
+	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, unavailable, "one OnDurableAckUnavailable per mismatch up to the cap")
+	assert.Equal(t, 1, persistent, "OnDurableAckPersistentFailure fires exactly once")
+	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, lastAttempts)
+}
+
 func TestQwpSfDrainerSucceedsOnAlreadyDrainedSlot(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()

@@ -51,7 +51,7 @@ type qwpSfRoundWalkResult struct {
 	// Terminal is a non-nil typed reject when an Auth-error (401/403)
 	// halts the walk per failover.md §6. Callers convert it to a
 	// CategorySecurityError SenderError.
-	Terminal *QwpUpgradeRejectError
+	Terminal error
 	// Exhausted is non-nil when the wall-clock budget ran out. Wraps
 	// the last underlying dial error plus a per-host snapshot for
 	// diagnostics.
@@ -155,6 +155,12 @@ type qwpSfRoundWalkParams struct {
 	// address-list sweep fails to bind any host. Drives the
 	// SenderAllEndpointsUnreachable event.
 	OnRoundExhausted func()
+	// DurableMismatchTerminal controls how a *QwpDurableAckMismatchError is
+	// classified: true (foreground) makes it terminal (fail loud, no failover);
+	// false (background drainer, whose source data is pinned) treats it as a
+	// transient dial failure so the reconnect budget keeps retrying — a primary
+	// that is briefly unreachable must not permanently fail the orphan slot.
+	DurableMismatchTerminal bool
 }
 
 // qwpSfSingleRoundResult is the inner-loop return shape for one walk
@@ -179,7 +185,7 @@ type qwpSfSingleRoundResult struct {
 	Attempts int
 	// Terminal is set when the walk hits a 401/403 upgrade reject —
 	// per failover.md §6, auth errors short-circuit failover.
-	Terminal *QwpUpgradeRejectError
+	Terminal error
 	// Cancelled is ctx.Err() (or context.Canceled when cancelCh
 	// fired) when the walk was interrupted. Also non-nil for
 	// misconfigurations (nil tracker / factory) so callers route
@@ -236,6 +242,7 @@ func qwpSfRunSingleRound(
 		attempts          int
 		lastErr           error
 		lastWasRoleReject bool
+		pendingMismatch   *QwpDurableAckMismatchError
 	)
 
 	// Apply pending mid-stream demote before the first PickNext.
@@ -264,6 +271,13 @@ func qwpSfRunSingleRound(
 
 		idx := params.Tracker.PickNext()
 		if idx < 0 {
+			// Sweep exhausted. If a foreground durable-ack mismatch was seen
+			// and no endpoint in the sweep advertised durable-ack, surface it
+			// as terminal now (Java buildAndConnect: throw only after the whole
+			// sweep found no durable-advertising endpoint).
+			if pendingMismatch != nil {
+				return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingMismatch}
+			}
 			return qwpSfSingleRoundResult{
 				Idx:               -1,
 				Attempts:          attempts,
@@ -325,6 +339,26 @@ func qwpSfRunSingleRound(
 				}
 			default:
 			}
+		}
+
+		// Durable-ack mismatch: walk the rest of the sweep before deciding, since
+		// a later endpoint may be a durable-advertising primary (Java's
+		// buildAndConnect continues, then throws only if the whole sweep found
+		// none). For a foreground sender the remembered mismatch becomes terminal
+		// at sweep exhaustion (OK-only fallback would drop believed-durable data);
+		// a drainer leaves it unremembered and just keeps retrying within its
+		// budget (§5.8). Either way, demote the host so the sweep can terminate.
+		var mismatch *QwpDurableAckMismatchError
+		if errors.As(err, &mismatch) {
+			if params.DurableMismatchTerminal {
+				pendingMismatch = mismatch
+			}
+			if params.OnEndpointFailed != nil {
+				params.OnEndpointFailed(idx, err)
+			}
+			params.Tracker.RecordTransportError(idx)
+			lastWasRoleReject = false
+			continue
 		}
 
 		// Classify the failure. Typed *QwpUpgradeRejectError carries

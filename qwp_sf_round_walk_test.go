@@ -78,9 +78,95 @@ func newRoundWalkHealthyServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+// newRoundWalkDurableServer accepts the WS upgrade AND advertises durable-ack,
+// standing in for a replication primary.
+func newRoundWalkDurableServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+}
+
 // hostPortOf extracts host:port from an httptest URL.
 func hostPortOf(srv *httptest.Server) string {
 	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// TestRoundWalkBindsDurablePeerWhenFirstLacksDurableAck pins the Java
+// buildAndConnect contract: a foreground durable-ack sweep walks PAST an endpoint
+// that does not advertise durable-ack and binds a later durable-advertising
+// primary, rather than aborting the whole sweep on the first mismatch.
+func TestRoundWalkBindsDurablePeerWhenFirstLacksDurableAck(t *testing.T) {
+	plainSrv := newRoundWalkHealthyServer(t) // upgrades OK, no durable-ack header
+	defer plainSrv.Close()
+	durableSrv := newRoundWalkDurableServer(t)
+	defer durableSrv.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, plainSrv),
+		endpointForServer(t, durableSrv),
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	factory := qwpSfBuildEndpointFactory(endpoints, "ws", qwpTransportOpts{
+		endpointPath:      qwpWritePath,
+		requestDurableAck: true,
+	}, nil)
+	params := qwpSfRoundWalkParams{
+		Factory:                 factory,
+		Tracker:                 tracker,
+		Endpoints:               endpoints,
+		MaxDuration:             5 * time.Second,
+		InitialBackoff:          50 * time.Millisecond,
+		MaxBackoff:              500 * time.Millisecond,
+		DurableMismatchTerminal: true,
+	}
+	result := qwpSfRunRoundWalk(context.Background(), nil, params, -1)
+
+	require.Nil(t, result.Terminal, "a durable primary exists — the mismatch must not be terminal")
+	require.NotNil(t, result.Transport, "must walk past the non-durable host and bind the durable primary")
+	defer result.Transport.close()
+	assert.Equal(t, 1, result.Idx)
+}
+
+// TestRoundWalkTerminalWhenNoEndpointAdvertisesDurableAck: when the WHOLE sweep
+// lacks durable-ack, the remembered mismatch surfaces as terminal (fail closed).
+func TestRoundWalkTerminalWhenNoEndpointAdvertisesDurableAck(t *testing.T) {
+	a := newRoundWalkHealthyServer(t)
+	defer a.Close()
+	b := newRoundWalkHealthyServer(t)
+	defer b.Close()
+
+	endpoints := []qwpEndpoint{endpointForServer(t, a), endpointForServer(t, b)}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	factory := qwpSfBuildEndpointFactory(endpoints, "ws", qwpTransportOpts{
+		endpointPath:      qwpWritePath,
+		requestDurableAck: true,
+	}, nil)
+	params := qwpSfRoundWalkParams{
+		Factory:                 factory,
+		Tracker:                 tracker,
+		Endpoints:               endpoints,
+		MaxDuration:             2 * time.Second,
+		InitialBackoff:          20 * time.Millisecond,
+		MaxBackoff:              100 * time.Millisecond,
+		DurableMismatchTerminal: true,
+	}
+	result := qwpSfRunRoundWalk(context.Background(), nil, params, -1)
+
+	require.Nil(t, result.Transport)
+	var mismatch *QwpDurableAckMismatchError
+	require.ErrorAs(t, result.Terminal, &mismatch)
 }
 
 // endpointForServer parses an httptest URL into a qwpEndpoint.
@@ -238,7 +324,7 @@ func TestRoundWalkAuthErrorIsTerminal(t *testing.T) {
 
 	assert.Nil(t, result.Transport)
 	require.NotNil(t, result.Terminal, "401 must surface as Terminal QwpUpgradeRejectError")
-	assert.Equal(t, 401, result.Terminal.StatusCode)
+	assert.Equal(t, 401, result.Terminal.(*QwpUpgradeRejectError).StatusCode)
 	// Tracker should NOT have host 1 as Healthy — the walk bailed
 	// before reaching it.
 	snap := tracker.snapshot()
@@ -645,7 +731,7 @@ func TestRunSingleRoundAuthErrorShortCircuits(t *testing.T) {
 
 	assert.Nil(t, rr.Transport)
 	require.NotNil(t, rr.Terminal, "401 must short-circuit as Terminal")
-	assert.Equal(t, 401, rr.Terminal.StatusCode)
+	assert.Equal(t, 401, rr.Terminal.(*QwpUpgradeRejectError).StatusCode)
 	assert.Equal(t, 1, rr.Attempts, "walk must stop after the auth-failing host")
 	assert.NotEqual(t, qwpHostHealthy, tracker.snapshot()[1].state,
 		"walk must not have reached the healthy peer")

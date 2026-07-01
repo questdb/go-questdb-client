@@ -237,7 +237,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	switch conf.initialConnectMode {
 	case InitialConnectSync:
 		transport, initialBoundIdx, err = qwpSfConnectWithRetry(ctx, factory, tracker,
-			reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+			reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff, true, nil)
 	case InitialConnectAsync:
 		transport = nil
 	default: // InitialConnectOff
@@ -249,9 +249,10 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		// retry-with-backoff across multiple sweeps.
 		walkStart := time.Now()
 		rr := qwpSfRunSingleRound(ctx, nil, qwpSfRoundWalkParams{
-			Factory:   factory,
-			Tracker:   tracker,
-			Endpoints: conf.endpoints,
+			Factory:                 factory,
+			Tracker:                 tracker,
+			Endpoints:               conf.endpoints,
+			DurableMismatchTerminal: true,
 		}, -1)
 		switch {
 		case rr.Transport != nil:
@@ -291,6 +292,12 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
 	loop.sendLoopSetEndpoints(conf.endpoints)
 	loop.sendLoopSetConnectionListener(conf.connectionListener, conf.connectionListenerInboxCapacity)
+	durableKeepalive := qwpDurableAckKeepaliveDefault
+	if conf.durableAckKeepaliveMillisSet {
+		durableKeepalive = time.Duration(conf.durableAckKeepaliveMillis) * time.Millisecond
+	}
+	loop.sendLoopSetDurableAck(conf.requestDurableAck, durableKeepalive, true)
+	loop.sendLoopSetProgressHandler(conf.progressHandler, conf.errorInboxCapacity)
 
 	s, err := newQwpCursorLineSender(
 		conf.autoFlushRows,
@@ -381,6 +388,11 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 					tracker,
 					reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff,
 				)
+				// Set before submit (which starts the goroutine): a durable-ack
+				// sender's drainers must also trim only on STATUS_DURABLE_ACK.
+				drainer.durableAckMode = conf.requestDurableAck
+				drainer.durableKeepalive = durableKeepalive
+				drainer.listener = conf.backgroundDrainerListener
 				_ = pool.drainerPoolSubmit(ctx, drainer)
 			}
 		}
@@ -1031,6 +1043,22 @@ func (s *qwpLineSender) TotalFramesReplayed() int64 {
 		return 0
 	}
 	return s.cursorSendLoop.sendLoopTotalFramesReplayed()
+}
+
+// TotalDurableAcks implements QwpSender.TotalDurableAcks.
+func (s *qwpLineSender) TotalDurableAcks() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalDurableAcks()
+}
+
+// TotalDurableTrimAdvances implements QwpSender.TotalDurableTrimAdvances.
+func (s *qwpLineSender) TotalDurableTrimAdvances() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalDurableTrimAdvances()
 }
 
 // TotalBackpressureStalls implements QwpSender.TotalBackpressureStalls.

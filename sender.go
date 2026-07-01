@@ -405,17 +405,26 @@ type lineSenderConfig struct {
 	reconnectMaxDurationMillisSet    bool
 	reconnectInitialBackoffMillisSet bool
 	reconnectMaxBackoffMillisSet     bool
-	initialConnectMode               InitialConnectMode // default InitialConnectOff
-	initialConnectModeSet            bool               // true if user explicitly chose a mode (gates the reconnect_*-driven promotion)
-	closeFlushTimeoutMillis          int                // 0 -> 5000; -1 / negative -> fast close (skip drain)
-	closeFlushTimeoutSet             bool               // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
-	drainOrphans                     bool               // default false (Phase 6)
-	maxBackgroundDrainers            int                // 0 -> 4 (Phase 6)
+	initialConnectMode               InitialConnectMode           // default InitialConnectOff
+	initialConnectModeSet            bool                         // true if user explicitly chose a mode (gates the reconnect_*-driven promotion)
+	closeFlushTimeoutMillis          int                          // 0 -> 5000; -1 / negative -> fast close (skip drain)
+	closeFlushTimeoutSet             bool                         // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
+	drainOrphans                     bool                         // default false (Phase 6)
+	maxBackgroundDrainers            int                          // 0 -> 4 (Phase 6)
+	backgroundDrainerListener        QwpBackgroundDrainerListener // durable-ack drain outcomes
 	// orphanDrainExclude, when non-nil, fences additional slot names from
 	// orphan adoption beyond the sender's own slot. The QwpSender pool sets it
 	// to its in-range slot set so a pooled sender never adopts a live sibling's
 	// dir (Hazard G). nil for standalone senders. Internal; no connect-string key.
 	orphanDrainExclude func(slotName string) bool
+
+	// Durable-ack (request_durable_ack). QWP-only, Enterprise primary-replication
+	// QoS. When true, the send loop trims / replays / awaits on the server's
+	// STATUS_DURABLE_ACK frames (WAL data uploaded to object storage) instead of
+	// the ordinary OK ACK (WAL commit) — see design/qwp-cursor-durability.md.
+	requestDurableAck            bool
+	durableAckKeepaliveMillis    int  // paces the durable keepalive ping; <= 0 disables
+	durableAckKeepaliveMillisSet bool // distinguishes "unset" (-> default) from an explicit 0/negative
 
 	// QWP server-error API (Phase 5). All fields are QWP-only.
 	errorHandler         SenderErrorHandler    // nil -> default loud handler
@@ -428,6 +437,9 @@ type lineSenderConfig struct {
 	// QWP connection-event listener (all fields QWP-only).
 	connectionListener              SenderConnectionListener // nil -> default loud listener
 	connectionListenerInboxCapacity int                      // 0 -> qwpSfDefaultErrorInboxCapacity
+
+	// QWP ack-progress handler (QWP-only). nil -> no dispatch (opt-in).
+	progressHandler SenderProgressHandler
 }
 
 // LineSenderOption defines line sender config option.
@@ -529,6 +541,25 @@ func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.connectionListener = l
+	}
+}
+
+// WithProgressHandler registers a SenderProgressHandler invoked when the QWP
+// sender's acknowledged frame sequence advances. QWP-only; opt-in (no default).
+// Under WithRequestDurableAck the reported watermark is durable, not settled.
+func WithProgressHandler(h SenderProgressHandler) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.progressHandler = h
+	}
+}
+
+// WithBackgroundDrainerListener registers a QwpBackgroundDrainerListener applied
+// to every store-and-forward orphan drainer, surfacing durable-ack drain outcomes
+// (unavailable endpoint, persistent failure). QWP-only; effective with
+// drain_orphans and request_durable_ack on.
+func WithBackgroundDrainerListener(l QwpBackgroundDrainerListener) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.backgroundDrainerListener = l
 	}
 }
 
@@ -782,6 +813,28 @@ func WithConnectTimeout(d time.Duration) LineSenderOption {
 			ms = 1
 		}
 		s.connectTimeoutMs = ms
+	}
+}
+
+// WithRequestDurableAck opts in to Enterprise durable acknowledgement: the sender
+// trims store-and-forward data, replays, and reports AckedFsn on the server's
+// STATUS_DURABLE_ACK (WAL uploaded to object storage) rather than the ordinary OK
+// ACK (WAL commit). QWP-only; the bound endpoint must be a replication primary
+// advertising durable-ack, otherwise the connect fails terminally with a
+// *SenderError of category PROTOCOL_VIOLATION. Equivalent to the connect-string
+// request_durable_ack key. See design/qwp-cursor-durability.md.
+func WithRequestDurableAck(enabled bool) LineSenderOption {
+	return func(s *lineSenderConfig) { s.requestDurableAck = enabled }
+}
+
+// WithDurableAckKeepaliveInterval paces the keepalive ping a durable-ack sender
+// sends to prod an idle server into flushing pending STATUS_DURABLE_ACK frames. A
+// zero or negative duration disables it. Inert unless WithRequestDurableAck(true);
+// default 200ms. Equivalent to the durable_ack_keepalive_interval_millis key.
+func WithDurableAckKeepaliveInterval(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.durableAckKeepaliveMillis = int(d / time.Millisecond)
+		s.durableAckKeepaliveMillisSet = true
 	}
 }
 
@@ -1530,6 +1583,15 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "drain_orphans"
 	case conf.maxBackgroundDrainers != 0:
 		name = "max_background_drainers"
+	case conf.requestDurableAck:
+		name = "request_durable_ack"
+	case conf.durableAckKeepaliveMillisSet:
+		name = "durable_ack_keepalive_interval_millis"
+	case conf.progressHandler != nil:
+		name = "progress handler"
+	case conf.backgroundDrainerListener.OnDurableAckUnavailable != nil ||
+		conf.backgroundDrainerListener.OnDurableAckPersistentFailure != nil:
+		name = "background drainer listener"
 	case conf.reconnectMaxDurationMillisSet,
 		conf.reconnectInitialBackoffMillisSet,
 		conf.reconnectMaxBackoffMillisSet:
@@ -1562,6 +1624,7 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,
 		connectTimeoutMs:      conf.connectTimeoutMs,
+		requestDurableAck:     conf.requestDurableAck,
 		// QWP has a single protocol version; advertise it.
 		// serverInfoTimeout stays zero: the ingest endpoint sends no
 		// SERVER_INFO frame and the client never expects one — it sends

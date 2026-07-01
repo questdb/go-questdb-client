@@ -71,6 +71,12 @@ const (
 	// configured auto_flush_bytes is kept verbatim. Mirrors Java
 	// WebSocketClient.QWP_MAX_BATCH_SIZE_HEADER_NAME.
 	qwpHeaderMaxBatchSize = "X-QWP-Max-Batch-Size"
+	// qwpHeaderRequestDurableAck opts the client in to durable-ack on the
+	// upgrade; the server echoes qwpHeaderDurableAck=qwpDurableAckEnabledValue
+	// when it will emit STATUS_DURABLE_ACK frames (a replication primary).
+	qwpHeaderRequestDurableAck = "X-QWP-Request-Durable-Ack"
+	qwpHeaderDurableAck        = "X-QWP-Durable-Ack"
+	qwpDurableAckEnabledValue  = "enabled"
 )
 
 // qwpClientId is sent in X-QWP-Client-Id during the upgrade handshake.
@@ -163,6 +169,11 @@ type qwpTransportOpts struct {
 	// upgrade response read stay under authTimeoutMs. Zero keeps the OS
 	// connect timeout. Mirrors the Java client's connect_timeout key.
 	connectTimeoutMs int
+
+	// requestDurableAck sends the X-QWP-Request-Durable-Ack upgrade header and
+	// makes connect() reject an endpoint that does not advertise durable-ack.
+	// Ingest-only. See design/qwp-cursor-durability.md.
+	requestDurableAck bool
 }
 
 // qwpTransport wraps a WebSocket connection for sending QWP
@@ -205,6 +216,10 @@ type qwpTransport struct {
 	// successful connect; a rolling upgrade can leave neighbouring
 	// endpoints with different caps.
 	serverMaxBatchSize int32
+
+	// serverDurableAckEnabled is true when the endpoint advertised
+	// X-QWP-Durable-Ack: enabled on the upgrade. Set during connect().
+	serverDurableAckEnabled bool
 
 	// serverInfo holds the SERVER_INFO frame consumed during connect()
 	// when opts.serverInfoTimeout is > 0. Nil on connections that did
@@ -327,6 +342,9 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	}
 	if opts.authorization != "" {
 		dialOpts.HTTPHeader.Set("Authorization", opts.authorization)
+	}
+	if opts.requestDurableAck {
+		dialOpts.HTTPHeader.Set(qwpHeaderRequestDurableAck, "true")
 	}
 	if opts.acceptEncoding != "" {
 		dialOpts.HTTPHeader.Set(qwpHeaderAcceptEncoding, opts.acceptEncoding)
@@ -472,6 +490,15 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 			}
 			t.serverMaxBatchSize = int32(parsed)
 		}
+	}
+	t.serverDurableAckEnabled = strings.EqualFold(resp.Header.Get(qwpHeaderDurableAck), qwpDurableAckEnabledValue)
+	if opts.requestDurableAck && !t.serverDurableAckEnabled {
+		// Requested durable-ack but the endpoint (likely a replica) did not
+		// advertise it. Terminal: falling back to OK-only trimming would drop
+		// data the caller believes durable (design/qwp-cursor-durability.md).
+		conn.Close(websocket.StatusProtocolError, "durable-ack not supported")
+		t.conn = nil
+		return &QwpDurableAckMismatchError{Endpoint: url}
 	}
 	if t.recvBuf == nil {
 		t.recvBuf = make([]byte, 0, qwpDefaultInitRecvBufSize)
@@ -678,6 +705,39 @@ func validateAckTableEntries(tail []byte) error {
 		return fmt.Errorf("trailing %d bytes after %d table entries", len(tail)-off, tableCount)
 	}
 	return nil
+}
+
+// ping writes a WebSocket ping to prod the server. Used by the durable-ack
+// keepalive to make an idle server flush pending STATUS_DURABLE_ACK frames. The
+// ping frame is what matters; a slow/absent pong is not an error to the caller.
+func (t *qwpTransport) ping(ctx context.Context) error {
+	if t.conn == nil {
+		return fmt.Errorf("qwp: not connected")
+	}
+	return t.conn.Ping(ctx)
+}
+
+// qwpAckTablesOffset returns the byte offset of the per-table watermark trailer
+// within an OK or DURABLE_ACK frame.
+func qwpAckTablesOffset(status QwpStatusCode) int {
+	if status == QwpStatusDurableAck {
+		return qwpAckDurableTablesOff
+	}
+	return qwpAckOKTablesOffset
+}
+
+// qwpForEachAckTableEntry walks the per-table trailer of an OK / DURABLE_ACK
+// frame, calling fn(name, seqTxn) per entry. name aliases the frame buffer — copy
+// it if it must outlive the frame. Precondition: tail was validated by readAck.
+func qwpForEachAckTableEntry(tail []byte, fn func(name []byte, seqTxn int64)) {
+	tableCount := int(binary.LittleEndian.Uint16(tail[0:2]))
+	off := 2
+	for i := 0; i < tableCount; i++ {
+		nameLen := int(binary.LittleEndian.Uint16(tail[off : off+2]))
+		off += 2
+		fn(tail[off:off+nameLen], int64(binary.LittleEndian.Uint64(tail[off+nameLen:off+nameLen+8])))
+		off += nameLen + 8
+	}
 }
 
 // parseAckError extracts an error message from a non-OK, non-durable

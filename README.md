@@ -361,6 +361,12 @@ background send completes can still lose unacked rows. For server-ACK
 confirmation, pair `FlushAndGetSequence` (returns the published FSN) with
 `AwaitAckedFsn`.
 
+A server ACK means WAL commit by default. For Enterprise durable delivery,
+`request_durable_ack=on` (or `qdb.WithRequestDurableAck(true)`) advances the
+acknowledged watermark only after the batch is durably uploaded to object
+storage. It is QWP-only and requires a replication primary — the connect fails
+terminally against a replica.
+
 Backpressure is governed by the engine's segment ring and the append deadline
 (`sf_append_deadline_millis`), not a fixed in-flight count.
 `in_flight_window` / `qdb.WithInFlightWindow(n)` is retained for compatibility

@@ -1030,6 +1030,20 @@ func (ps *qwpPooledSender) TotalFramesReplayed() int64 {
 	return ps.slot.delegate.TotalFramesReplayed()
 }
 
+func (ps *qwpPooledSender) TotalDurableAcks() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.TotalDurableAcks()
+}
+
+func (ps *qwpPooledSender) TotalDurableTrimAdvances() int64 {
+	if !ps.live() {
+		return 0
+	}
+	return ps.slot.delegate.TotalDurableTrimAdvances()
+}
+
 func (ps *qwpPooledSender) TotalBackpressureStalls() int64 {
 	if !ps.live() {
 		return 0

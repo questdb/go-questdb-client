@@ -578,19 +578,12 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			switch v {
 			case "off", "false":
-				// The default. Non-durable, OK-driven trim is fully
-				// conformant (sf-client.md §9.2 / §19); nothing to wire.
+				// The default. Non-durable, OK-driven trim (sf-client.md §9.2).
 			case "on", "true":
-				// Durable-ack mode (sf-client.md §4.3 / §8.1 / §9.3 /
-				// §10 / §11) is a deferred opt-in, EE-only QoS feature:
-				// the cursor send loop OK-trims and silently ignores
-				// DURABLE_ACK frames (qwp_sf_send_loop.go). §19 makes
-				// the key normative so we accept it, but opting in is
-				// rejected with a clear deferred-feature message rather
-				// than the generic "unsupported option", mirroring
-				// sf_durability=flush.
-				return nil, NewInvalidConfigStrError(
-					"request_durable_ack=%s is not yet supported: durable-ack mode is not implemented in this client (deferred follow-up; use request_durable_ack=off)", v)
+				// Durable-ack mode: the cursor send loop trims / replays / awaits
+				// on STATUS_DURABLE_ACK instead of the OK ACK
+				// (design/qwp-cursor-durability.md).
+				senderConf.requestDurableAck = true
 			default:
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
@@ -599,16 +592,14 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			// Accepted for connect-string portability (sf-client.md
-			// §4.3 / §19) but inert: it only paces keepalive PINGs in
-			// durable-ack mode, which this client does not implement
-			// (see request_durable_ack). Validate the shape so a typo
-			// still errors helpfully; 0 / negative mean "disabled" per
-			// spec, so any int is in range.
-			if _, err := strconv.Atoi(v); err != nil {
+			// Paces the durable-ack keepalive ping; 0 / negative disable it.
+			ms, err := strconv.Atoi(v)
+			if err != nil {
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
+			senderConf.durableAckKeepaliveMillis = ms
+			senderConf.durableAckKeepaliveMillisSet = true
 		default:
 			if senderConf.senderType == qwpSenderType && (egressOnlyKeys[k] || poolKeys[k]) {
 				// Silently accepted on ingress so a single ws:: / wss::
