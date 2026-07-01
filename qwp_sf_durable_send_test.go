@@ -115,32 +115,67 @@ func TestQwpDurableAckGatesWatermark(t *testing.T) {
 	}
 }
 
-// TestQwpDurableAckKeepaliveDelivers exercises the keepalive-enabled path: the
-// server withholds the durable ack for several keepalive intervals (during which
-// pings fire), then confirms. The batch must still become durable without a
-// deadlock, proving the keepalive path does not stall the send loop.
-func TestQwpDurableAckKeepaliveDelivers(t *testing.T) {
-	ctx := context.Background()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// newQwpPingGatedDurableServer stands in for a durable-ack primary that flushes
+// the covering STATUS_DURABLE_ACK only AFTER it has observed a client ping, not
+// on a wall-clock timer. OnPingReceived (driven by conn.Read processing the
+// client's WebSocket ping control frames) signals pingSeen; a goroutine
+// withholds the durable ack until then. This makes a test's success contingent
+// on the keepalive ping actually firing — a regression that stopped emitting
+// pings makes AwaitAckedFsn strand and the test fail, rather than passing
+// trivially on a sleep. srvCtx bounds the withholding goroutine so a run where
+// no ping ever arrives (keepalive disabled) does not leak it.
+func newQwpPingGatedDurableServer(srvCtx context.Context) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
-		conn, err := websocket.Accept(w, r, nil)
+		pingSeen := make(chan struct{}, 1)
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			OnPingReceived: func(context.Context, []byte) bool {
+				select {
+				case pingSeen <- struct{}{}:
+				default:
+				}
+				return true // still return the pong
+			},
+		})
 		if err != nil {
 			return
 		}
 		defer conn.CloseNow()
-		if _, _, err := conn.Read(ctx); err != nil {
+		// Read the flushed batch so the OK ACK covers it.
+		if _, _, err := conn.Read(srvCtx); err != nil {
 			return
 		}
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
-		time.Sleep(120 * time.Millisecond) // several 20ms keepalive intervals
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckDurable(ackTableEntry{"trades", 0}))
+		_ = conn.Write(srvCtx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
+		// Release the durable ack only once a ping is observed. A separate
+		// goroutine writes it so this handler can stay in the read loop below,
+		// which is what processes the client's ping control frames and thus
+		// drives OnPingReceived.
+		go func() {
+			select {
+			case <-pingSeen:
+				_ = conn.Write(srvCtx, websocket.MessageBinary, buildAckDurable(ackTableEntry{"trades", 0}))
+			case <-srvCtx.Done():
+			}
+		}()
 		for {
-			if _, _, err := conn.Read(ctx); err != nil {
+			if _, _, err := conn.Read(srvCtx); err != nil {
 				return
 			}
 		}
 	}))
+}
+
+// TestQwpDurableAckKeepaliveDelivers exercises the keepalive-enabled path against
+// a server that withholds the durable ack until it observes a client ping. The
+// batch becomes durable ONLY because the keepalive ping fires (and elicits the
+// ack) — so this proves sendDurableKeepalive/qwpTransport.ping are actually
+// exercised, unlike a timer-gated server that would pass even if pings stopped.
+func TestQwpDurableAckKeepaliveDelivers(t *testing.T) {
+	ctx := context.Background()
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	srv := newQwpPingGatedDurableServer(srvCtx)
 	defer srv.Close()
 
 	addr := strings.TrimPrefix(srv.URL, "http://")
@@ -165,6 +200,47 @@ func TestQwpDurableAckKeepaliveDelivers(t *testing.T) {
 	defer cancel()
 	if err := qs.AwaitAckedFsn(waitCtx, 0); err != nil {
 		t.Fatalf("AwaitAckedFsn(0) with keepalive enabled: %v", err)
+	}
+}
+
+// TestQwpDurableAckKeepaliveDisabledStrands is the control for
+// TestQwpDurableAckKeepaliveDelivers: same ping-gated server, but the keepalive
+// is disabled (interval 0). With no ping to prod the server, the durable ack is
+// never sent and AwaitAckedFsn must time out — confirming it is the keepalive
+// ping, not some other mechanism, that drives durability in the sibling test.
+func TestQwpDurableAckKeepaliveDisabledStrands(t *testing.T) {
+	ctx := context.Background()
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	srv := newQwpPingGatedDurableServer(srvCtx)
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	s, err := NewLineSender(ctx,
+		WithQwp(), WithAddress(addr),
+		WithRequestDurableAck(true),
+		WithDurableAckKeepaliveInterval(0), // disabled: no ping will ever fire
+		WithCloseFlushTimeout(0),           // fast close: skip the (doomed) drain wait
+	)
+	if err != nil {
+		t.Fatalf("NewLineSender: %v", err)
+	}
+	defer s.Close(ctx)
+	qs := s.(QwpSender)
+
+	if err := s.Table("trades").Int64Column("v", 1).AtNow(ctx); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// The OK ACK arrives, but durable mode does not advance AckedFsn on it, and
+	// with the keepalive off nothing elicits the withheld STATUS_DURABLE_ACK.
+	waitCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+	defer cancel()
+	if err := qs.AwaitAckedFsn(waitCtx, 0); err == nil {
+		t.Fatal("AwaitAckedFsn(0) returned nil with the keepalive disabled and the durable ack withheld; " +
+			"the watermark must not advance without the durable ack")
 	}
 }
 

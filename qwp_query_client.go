@@ -733,6 +733,19 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 		// reconnect's top-of-function teardown) or an immediate failure (a
 		// fresh Query/Exec's submitQuery, a racing requestCancel's non-
 		// blocking notify).
+		//
+		// Latch the failure as this generation's terminal ioErr before
+		// tearing it down. shutdown() alone never sets ioErr, so without
+		// this the just-published (now-dead) generation's loadIoErr()
+		// stays nil — terminalError() then reports the client as healthy
+		// and a pooled worker is recycled onto a wedged connection where
+		// every subsequent submitQuery fails with "I/O goroutine shut
+		// down", failing all future borrows of that slot. Latching lets
+		// the Query lease's terminalError() eviction fire so the worker is
+		// discarded, not reused. setIoErr is first-writer-wins, so a
+		// submit that already observed a latched ioErr (a prior poison) is
+		// a harmless no-op.
+		result.io.setIoErr(fmt.Errorf("qwp query: replay submit failed: %w", err))
 		_ = result.io.shutdown(cleanupCtx)
 		_ = result.transport.close()
 		return nil, fmt.Errorf("qwp query: replay submit failed: %w", err)

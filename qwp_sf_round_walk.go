@@ -446,6 +446,23 @@ func qwpSfRunRoundWalk(
 			}
 		}
 		if rr.Terminal != nil {
+			// A terminal result short-circuits the multi-round reconnect
+			// budget: no round-boundary backoff, no BeginRound(true)
+			// re-sweep. For a 401/403 AuthError this is unambiguous. For a
+			// durable-ack mismatch (DurableMismatchTerminal foreground
+			// senders) it is a deliberate fail-closed choice: even when the
+			// durable primary is only transiently down and the sweep merely
+			// found a write-eligible NON-durable node, we stop here rather
+			// than keep retrying the primary within reconnect_max_duration.
+			// Continuing would risk silently downgrading believed-durable
+			// data to OK-only delivery during a primary-failover window, so
+			// durable senders HALT and rely on close+rebuild (SF replays
+			// from the durable watermark; memory mode loses the in-RAM tail —
+			// the accepted cost of the fail-closed guarantee). This mirrors
+			// Java's initial-connect buildAndConnect behaviour applied to
+			// reconnect. Revisiting it (retry the primary while the only
+			// blocker is a transient transport error) needs a matching Java
+			// change first — see PR #64 review M3.
 			return qwpSfRoundWalkResult{
 				Idx:      -1,
 				Attempts: totalAttempts,

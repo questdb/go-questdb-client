@@ -41,7 +41,9 @@ import (
 // It generalises the proven qwpSfErrorDispatcher machinery (drop-oldest,
 // lazy start, re-entrant-safe bounded close) over the payload type so the
 // connection-event listener reuses it without copying it. The error
-// dispatcher predates this type and is left as-is; it could migrate here.
+// dispatcher predates this type and still lives separately; it could migrate
+// here. Behaviour is kept in step by hand — notably the abandon guard below,
+// which qwpSfErrorDispatcher carries the twin of.
 type qwpDispatcher[T any] struct {
 	handler   func(T)
 	describe  func(T) string // used only in the panic-recovery log line

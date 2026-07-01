@@ -105,6 +105,15 @@ type qwpSfErrorDispatcher struct {
 	// when closed.
 	closed atomic.Bool
 
+	// abandon flips true when close() gives up joining a handler still
+	// running past qwpSfDispatcherCloseJoinTimeout. loop() and drain()
+	// then drop instead of deliver, so a wedged handler that finally
+	// returns cannot re-enter its select, pick a still-queued error, and
+	// fire the user callback *after* close() (and therefore Sender.Close)
+	// has already returned. Mirrors qwpDispatcher.abandon, which the
+	// generic dispatcher already carries; the two paths are kept in step.
+	abandon atomic.Bool
+
 	dropped   atomic.Int64
 	delivered atomic.Int64
 
@@ -217,6 +226,13 @@ func (d *qwpSfErrorDispatcher) loop() {
 			if e == nil {
 				continue
 			}
+			if d.abandon.Load() {
+				// close() gave up on this goroutine; do not deliver after
+				// Close has returned. Count it as dropped, matching the
+				// post-timeout inbox sweep in close().
+				d.dropped.Add(1)
+				continue
+			}
 			d.deliver(e)
 		case <-d.done:
 			d.drain()
@@ -239,6 +255,10 @@ func (d *qwpSfErrorDispatcher) drain() {
 		select {
 		case e := <-d.inbox:
 			if e == nil {
+				continue
+			}
+			if d.abandon.Load() {
+				d.dropped.Add(1)
 				continue
 			}
 			d.deliver(e)
@@ -350,6 +370,12 @@ func (d *qwpSfErrorDispatcher) close() {
 	select {
 	case <-joined:
 	case <-timer.C:
+		// Signal the abandoned loop/drain to drop rather than deliver.
+		// Without this, a handler that finally returns after the join
+		// timeout re-enters its select and — if inbox is non-empty and
+		// done is closed — Go may pick inbox and fire the user callback
+		// after close() (hence Sender.Close) has already returned.
+		d.abandon.Store(true)
 		log.Printf("[WARN] qwp/sf: error handler still running %s after close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
 			qwpSfDispatcherCloseJoinTimeout)
