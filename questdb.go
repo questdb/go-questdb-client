@@ -216,7 +216,8 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 
 	// Validate the single cluster config through both parsers up front, so a
 	// malformed string fails here even when a pool min is 0 and nothing connects.
-	if _, err := confFromStr(conf); err != nil {
+	senderConf, err := confFromStr(conf)
+	if err != nil {
 		return nil, err
 	}
 	if _, err := parseQwpQueryConf(conf); err != nil {
@@ -224,13 +225,14 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	}
 
 	// Resolve lazy_connect (Java parity): tolerate a down server at startup
-	// without disabling reads. Explicit option wins over the connect-string key.
-	lazyConnect := cfg.lazyConnect
-	if !cfg.lazyConnectSet {
-		lazyConnect, err = poolBool(kv, "lazy_connect", false)
-		if err != nil {
-			return nil, err
-		}
+	// without disabling reads. Explicit option wins over the connect-string key,
+	// but the key is still validated so a typo never rides silently.
+	lazyConnect, err := poolBool(kv, "lazy_connect", false)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.lazyConnectSet {
+		lazyConnect = cfg.lazyConnect
 	}
 	ingestConf := conf
 	queryMinDefault := qwpDefaultPoolMin
@@ -295,7 +297,13 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 		_ = sp.close(ctx)
 		return nil, err
 	}
-	hk := newQwpPoolHousekeeper(sp, qp, hkInterval)
+	// The join budget must cover a reaped slot's close-flush drain, so a reap
+	// in flight can never outlive QuestDB.Close.
+	closeFlush := qwpSfDefaultCloseFlushTimeout
+	if senderConf.closeFlushTimeoutSet {
+		closeFlush = max(time.Duration(senderConf.closeFlushTimeoutMillis)*time.Millisecond, 0)
+	}
+	hk := newQwpPoolHousekeeper(sp, qp, hkInterval, closeFlush+time.Second)
 	hk.start()
 	return &QuestDB{senderPool: sp, queryPool: qp, housekeeper: hk}, nil
 }
@@ -350,9 +358,10 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // SenderConnectionListener. Pooled callbacks are funnelled through one
 // serializing mutex (see serializeErrorHandler), so a Close that blocks on a
 // sibling dispatcher mid-delivery head-of-lines the others until each is
-// abandoned at its join timeout (~100ms apiece). It is bounded — no deadlock or
-// panic — but Close may stall. Hand the close off to a separate goroutine
-// instead.
+// abandoned at its join timeout (qwpSfDispatcherCloseJoinTimeout apiece; every
+// pooled sender owns two dispatchers, so the worst case scales with slot
+// count). It is bounded — no deadlock or panic — but Close may stall. Hand the
+// close off to a separate goroutine instead.
 func (db *QuestDB) Close(ctx context.Context) error {
 	db.closeOnce.Do(func() {
 		// Signal the pools to stop reaping before joining the housekeeper, so a
@@ -424,39 +433,44 @@ func poolBool(kv map[string]string, key string, dflt bool) (bool, error) {
 }
 
 // resolvePoolInt resolves a pool size: explicit option (set) > connect-string
-// key > default. Rejects a negative value or a non-integer key.
+// key > default. Rejects a negative value or a non-integer key — the key is
+// validated even when the option shadows it, so a config typo never rides
+// silently under an option that happens to be set.
 func resolvePoolInt(set bool, opt int, kv map[string]string, key string, dflt int) (int, error) {
-	if set {
-		if opt < 0 {
-			return 0, fmt.Errorf("%s must be >= 0", key)
-		}
-		return opt, nil
-	}
+	resolved := dflt
 	if v, ok := kv[key]; ok {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
 			return 0, fmt.Errorf("invalid %s %q (expected a non-negative int)", key, v)
 		}
-		return n, nil
+		resolved = n
 	}
-	return dflt, nil
-}
-
-// resolvePoolDur resolves a millisecond pool key into a Duration: explicit
-// option (set) > connect-string key > default.
-func resolvePoolDur(set bool, opt time.Duration, kv map[string]string, key string, dflt time.Duration) (time.Duration, error) {
 	if set {
 		if opt < 0 {
 			return 0, fmt.Errorf("%s must be >= 0", key)
 		}
 		return opt, nil
 	}
+	return resolved, nil
+}
+
+// resolvePoolDur resolves a millisecond pool key into a Duration: explicit
+// option (set) > connect-string key > default. Like resolvePoolInt, the key is
+// validated even when the option shadows it.
+func resolvePoolDur(set bool, opt time.Duration, kv map[string]string, key string, dflt time.Duration) (time.Duration, error) {
+	resolved := dflt
 	if v, ok := kv[key]; ok {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
 			return 0, fmt.Errorf("invalid %s %q (expected a non-negative int, milliseconds)", key, v)
 		}
-		return time.Duration(n) * time.Millisecond, nil
+		resolved = time.Duration(n) * time.Millisecond
 	}
-	return dflt, nil
+	if set {
+		if opt < 0 {
+			return 0, fmt.Errorf("%s must be >= 0", key)
+		}
+		return opt, nil
+	}
+	return resolved, nil
 }

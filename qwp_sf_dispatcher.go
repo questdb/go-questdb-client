@@ -144,6 +144,12 @@ func newQwpSfErrorDispatcher(handler SenderErrorHandler, capacity int) *qwpSfErr
 	if capacity < 1 {
 		capacity = qwpSfDefaultErrorInboxCapacity
 	}
+	if capacity > qwpSfMaxErrorInboxCapacity {
+		// Mirror newQwpDispatcher's ceiling: production capacities are pre-clamped
+		// in conf_parse, but guard the direct constructor so an unsanitized caller
+		// cannot panic makechan with a huge size.
+		capacity = qwpSfMaxErrorInboxCapacity
+	}
 	return &qwpSfErrorDispatcher{
 		handler: handler,
 		inbox:   make(chan *SenderError, capacity),

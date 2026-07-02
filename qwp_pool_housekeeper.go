@@ -35,18 +35,26 @@ import (
 // only reaps.
 type qwpPoolHousekeeper struct {
 	interval   time.Duration
+	joinBudget time.Duration
 	senderPool *qwpSenderPool
 	queryPool  *qwpQueryPool
 	stop       chan struct{}
 	done       chan struct{}
 }
 
-func newQwpPoolHousekeeper(sp *qwpSenderPool, qp *qwpQueryPool, interval time.Duration) *qwpPoolHousekeeper {
+// newQwpPoolHousekeeper builds the reaper. joinBudget bounds stopAndJoin and
+// must cover a reaped slot's worst-case Close (the close-flush drain), so a
+// reap in flight can never outlive QuestDB.Close.
+func newQwpPoolHousekeeper(sp *qwpSenderPool, qp *qwpQueryPool, interval, joinBudget time.Duration) *qwpPoolHousekeeper {
 	if interval <= 0 {
 		interval = qwpDefaultHousekeeperInterval
 	}
+	if joinBudget <= 0 {
+		joinBudget = qwpSfDefaultCloseFlushTimeout + time.Second
+	}
 	return &qwpPoolHousekeeper{
 		interval:   interval,
+		joinBudget: joinBudget,
 		senderPool: sp,
 		queryPool:  qp,
 		stop:       make(chan struct{}),
@@ -88,7 +96,7 @@ func (h *qwpPoolHousekeeper) reapGuarded(fn func()) {
 // reap can't block Close forever.
 func (h *qwpPoolHousekeeper) stopAndJoin() {
 	close(h.stop)
-	t := time.NewTimer(2 * time.Second)
+	t := time.NewTimer(h.joinBudget)
 	defer t.Stop()
 	select {
 	case <-h.done:

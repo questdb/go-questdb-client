@@ -37,7 +37,7 @@ import (
 // transport selection as the short forms.
 func TestConfQwpwsAlias(t *testing.T) {
 	cases := []struct {
-		schema string
+		schema  string
 		wantTLS tlsMode
 	}{
 		{"ws", tlsDisabled},
@@ -131,13 +131,13 @@ func TestConfSizeSuffix(t *testing.T) {
 func TestConfSizeSuffixRejected(t *testing.T) {
 	cases := []string{
 		"",
-		"k",       // suffix without a number
-		"abc",     // non-numeric
-		"1.5m",    // floats not supported
-		"-1",      // negative bare
-		"-1m",     // negative with suffix
-		"1xb",     // unknown suffix
-		"1024kb extra", // trailing garbage
+		"k",              // suffix without a number
+		"abc",            // non-numeric
+		"1.5m",           // floats not supported
+		"-1",             // negative bare
+		"-1m",            // negative with suffix
+		"1xb",            // unknown suffix
+		"1024kb extra",   // trailing garbage
 		"9999999999999t", // n * (1<<40) overflows int64 (exercises the overflow guard)
 	}
 	for _, in := range cases {
@@ -385,6 +385,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"auto_flush_interval=100",
 		"auto_flush_rows=1000",
 		"close_flush_timeout_millis=5000",
+		"connection_listener_inbox_capacity=256",
 		"drain_orphans=off",
 		"durable_ack_keepalive_interval_millis=200",
 		"error_inbox_capacity=256",

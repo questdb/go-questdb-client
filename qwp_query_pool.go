@@ -75,7 +75,7 @@ func newQwpQueryPool(
 	acquireTimeout, idleTimeout, maxLifetime time.Duration,
 ) (*qwpQueryPool, error) {
 	if minSize < 0 || maxSize < 1 || minSize > maxSize {
-		return nil, fmt.Errorf("qwp query pool: invalid sizes min=%d max=%d", minSize, maxSize)
+		return nil, fmt.Errorf("qwp query pool: invalid sizes min=%d max=%d (max defaults to %d when unset — raise query_pool_max alongside min)", minSize, maxSize, qwpDefaultPoolMax)
 	}
 	p := &qwpQueryPool{
 		notify:         make(chan struct{}),

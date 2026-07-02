@@ -99,6 +99,13 @@ func qwpDrainerListenerCall(fn func()) {
 // re-check whether the slot is fully drained.
 const qwpSfDrainerPollInterval = 50 * time.Millisecond
 
+// qwpSfDurableStallFactor scales the no-progress budget into the durable-stall
+// bound: how long a durable-ack drainer tolerates OK-ack/reconnect activity
+// with zero durable trim advance before quarantining. Generous (uploads are
+// slow) but finite, so a flapping never-durable endpoint cannot livelock the
+// drainer.
+const qwpSfDurableStallFactor = 4
+
 // qwpSfDrainerPoolCloseGrace bounds how long the pool's close()
 // waits for active drainers to exit cleanly before cancelling the
 // pool's master ctx to forcibly unwind blocking dials. Mirrors the
@@ -417,6 +424,13 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	lastProgressAcked := engine.engineAckedFsn()
 	lastProgressAcks := loop.sendLoopTotalAcks()
 	lastProgressAt := time.Now()
+	// Durable-stall clock: resets only on a genuine durable trim advance (or the
+	// pre-durable warm-up while acked is still at its start value). OK acks and
+	// reconnects defer the ordinary watchdog but not this one, so a flapping
+	// endpoint that accepts + OK-acks + drops without ever issuing
+	// STATUS_DURABLE_ACK cannot replay the same frames forever — without it,
+	// okAcks climbs on every cycle and the drainer never quarantines.
+	lastTrimAt := lastProgressAt
 	for {
 		acked := engine.engineAckedFsn()
 		d.ackedFsn.Store(acked)
@@ -456,9 +470,26 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			(d.durableAckMode && okAcks > lastProgressAcks)
 		switch {
 		case progressed:
+			// A durable trim advance (acked moves in durable mode) proves a
+			// durable-advertising primary is reachable and draining this slot, so
+			// forget accumulated durable-ack mismatches. Otherwise the lifetime
+			// counter climbs one per primary-flap reconnect (replica picked first
+			// in the sweep, then the primary rebinds and drains) and eventually
+			// trips qwpMaxDurableAckMismatchAttempts, falsely quarantining a slot
+			// that is actively draining durably.
+			if d.durableAckMode && acked > lastProgressAcked {
+				d.mismatchAttempts.Store(0)
+			}
+			if acked > lastProgressAcked {
+				lastTrimAt = now
+			}
 			lastProgressAcked = acked
 			lastProgressAcks = okAcks
 			lastProgressAt = now
+			if d.durableAckMode && now.Sub(lastTrimAt) >= qwpSfDurableStallFactor*noProgressBudget {
+				d.recordFailure(d.noProgressReason(acked, target, okAcks, now.Sub(lastTrimAt)))
+				return
+			}
 		case now.Sub(lastProgressAt) >= noProgressBudget:
 			d.recordFailure(d.noProgressReason(acked, target, okAcks, now.Sub(lastProgressAt)))
 			return

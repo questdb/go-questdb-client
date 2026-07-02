@@ -798,10 +798,9 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 
 // WithConnectTimeout bounds the TCP connect to a QuestDB endpoint, so a
 // black-holed or firewalled host is abandoned within d instead of riding the
-// much longer OS connect timeout. The QWP upgrade response stays under
-// WithAuthTimeout. The TLS handshake prefers WithAuthTimeout, but falls back to
-// this timeout when WithAuthTimeout is unset — so a config that sets only
-// connect_timeout still bounds the handshake (wss), not just the TCP connect. A
+// much longer OS connect timeout. The QWP upgrade response and TLS handshake
+// (wss) are bounded separately by WithAuthTimeout, which always has a value
+// (default 15s) — to tighten the handshake, set WithAuthTimeout too. A
 // zero or negative duration keeps the OS connect timeout. Honoured by the HTTP
 // and QWP senders; accepted but inert on TCP, and ignored when a custom
 // http.Transport is supplied (that transport is the caller's to configure).

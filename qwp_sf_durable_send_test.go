@@ -517,3 +517,125 @@ func TestQwpDurableAckEndToEndProgression(t *testing.T) {
 		prev = fsn
 	}
 }
+
+// TestQwpDurableAckDropChainsBehindPending pins Hazard D at the send-loop level:
+// a DROP_AND_CONTINUE rejection in durable mode enqueues an empty entry that
+// chains in FIFO order — the watermark must not pass the dropped frame until
+// every preceding OK batch is durable, then release both together.
+func TestQwpDurableAckDropChainsBehindPending(t *testing.T) {
+	ctx := context.Background()
+	sendDurable := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if _, _, err := conn.Read(ctx); err != nil { // batch 0: settled, not durable
+			return
+		}
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
+		if _, _, err := conn.Read(ctx); err != nil { // batch 1: rejected → dropped
+			return
+		}
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckError(QwpStatusParseError, 1, "bad batch"))
+		<-sendDurable
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckDurable(ackTableEntry{"trades", 0}))
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	s, err := NewLineSender(ctx,
+		WithQwp(), WithAddress(addr),
+		WithRequestDurableAck(true),
+		WithDurableAckKeepaliveInterval(0),
+		WithErrorPolicy(CategoryParseError, PolicyDropAndContinue),
+		WithErrorHandler(func(*SenderError) {}),
+	)
+	if err != nil {
+		t.Fatalf("NewLineSender: %v", err)
+	}
+	defer s.Close(ctx)
+	qs := s.(QwpSender)
+
+	for i := 0; i < 2; i++ {
+		if err := s.Table("trades").Int64Column("v", int64(i)).AtNow(ctx); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if _, err := qs.FlushAndGetSequence(ctx); err != nil {
+			t.Fatalf("flush %d: %v", i, err)
+		}
+	}
+
+	// Batch 1 was dropped, but its empty entry chains behind the pending OK for
+	// batch 0 — the watermark must hold below both.
+	time.Sleep(150 * time.Millisecond)
+	if got := qs.AckedFsn(); got >= 0 {
+		t.Fatalf("AckedFsn = %d after drop; must not advance past a pending OK batch", got)
+	}
+
+	close(sendDurable)
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := qs.AwaitAckedFsn(waitCtx, 1); err != nil {
+		t.Fatalf("AwaitAckedFsn(1) after covering durable ack: %v", err)
+	}
+}
+
+// TestQwpDurableAckMismatchAsyncConnectLatchesTerminal covers the async-connect
+// foreground path: the constructor returns immediately, the background dial
+// hits the durable-ack mismatch, and the terminal PROTOCOL_VIOLATION latches so
+// the producer observes it — no silent fallback to commit-only trimming.
+func TestQwpDurableAckMismatchAsyncConnectLatchesTerminal(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1") // no durable-ack advertisement
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	s, err := NewLineSender(ctx,
+		WithQwp(), WithAddress(addr),
+		WithRequestDurableAck(true),
+		WithInitialConnectMode(InitialConnectAsync),
+		WithErrorHandler(func(*SenderError) {}),
+	)
+	if err != nil {
+		t.Fatalf("NewLineSender (async): %v", err)
+	}
+	defer s.Close(ctx)
+	qs := s.(QwpSender)
+
+	deadline := time.After(10 * time.Second)
+	for {
+		se := qs.LastTerminalError()
+		if se != nil {
+			if se.Category != CategoryProtocolViolation {
+				t.Fatalf("terminal category = %s, want %s", se.Category, CategoryProtocolViolation)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("async durable-ack mismatch never latched a terminal error")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}

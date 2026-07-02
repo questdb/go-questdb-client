@@ -112,7 +112,7 @@ func newQwpSenderPool(
 	connectionListener SenderConnectionListener,
 ) (*qwpSenderPool, error) {
 	if minSize < 0 || maxSize < 1 || minSize > maxSize {
-		return nil, fmt.Errorf("qwp pool: invalid sizes min=%d max=%d", minSize, maxSize)
+		return nil, fmt.Errorf("qwp pool: invalid sizes min=%d max=%d (max defaults to %d when unset — raise sender_pool_max alongside min)", minSize, maxSize, qwpDefaultPoolMax)
 	}
 	template, err := confFromStr(conf)
 	if err != nil {
@@ -656,7 +656,7 @@ func (p *qwpSenderPool) poolSnapshot() (total, available, leaked int) {
 var (
 	errPoolClosed    = errors.New("qwp pool: handle is closed")
 	errPoolExhausted = errors.New("qwp pool: timed out waiting for a sender")
-	errStaleLease    = errors.New("qwp pool: sender used after it was returned to the pool")
+	errStaleLease    = errors.New("qwp pool: sender lease is no longer bound to its slot (returned, or the slot was evicted)")
 )
 
 // qwpPooledSender is the per-borrow lease handed to the caller. It forwards

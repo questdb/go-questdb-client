@@ -24,15 +24,21 @@
 
 package questdb
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestQwpPoolHousekeeperDefaultsAndGuard covers the zero-interval default and
 // the panic-guarded reap step. End-to-end reaping via the running goroutine is
 // covered by TestQuestDBHousekeeperReaps.
 func TestQwpPoolHousekeeperDefaultsAndGuard(t *testing.T) {
-	h := newQwpPoolHousekeeper(nil, nil, 0)
+	h := newQwpPoolHousekeeper(nil, nil, 0, 0)
 	if h.interval != qwpDefaultHousekeeperInterval {
 		t.Errorf("interval=%v, want default %v", h.interval, qwpDefaultHousekeeperInterval)
+	}
+	if want := qwpSfDefaultCloseFlushTimeout + time.Second; h.joinBudget != want {
+		t.Errorf("joinBudget=%v, want default %v", h.joinBudget, want)
 	}
 	h.reapGuarded(func() { panic("reap boom") }) // recovered, must not crash
 }

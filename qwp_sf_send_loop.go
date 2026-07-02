@@ -274,6 +274,7 @@ type qwpSfSendLoop struct {
 	durableAckMode           bool
 	durable                  *qwpDurableTracker
 	durableKeepaliveInterval time.Duration
+	warnedStrayDurable       atomic.Bool
 	// durableMismatchTerminal classifies a durable-ack mismatch: true (default,
 	// foreground) fails loud; false (drainer) retries within the reconnect budget.
 	durableMismatchTerminal bool
@@ -1121,8 +1122,10 @@ func drainResetTimer(t *time.Timer, d time.Duration) {
 }
 
 // sendDurableKeepalive pings the server iff there are pending durable batches, to
-// elicit their STATUS_DURABLE_ACK frames. The ping frame is what matters; the
-// pong is not awaited beyond the keepalive interval.
+// elicit their STATUS_DURABLE_ACK frames. The outbound ping frame is what
+// matters (it is the server's recv event); the pong wait is truncated to a
+// quarter interval so an idle→active transition doesn't stall the send
+// goroutine behind a slow echo.
 func (l *qwpSfSendLoop) sendDurableKeepalive(ctx context.Context) {
 	if !l.durable.hasPending() {
 		return
@@ -1131,7 +1134,7 @@ func (l *qwpSfSendLoop) sendDurableKeepalive(ctx context.Context) {
 	if tr == nil {
 		return
 	}
-	pctx, cancel := context.WithTimeout(ctx, l.durableKeepaliveInterval)
+	pctx, cancel := context.WithTimeout(ctx, l.durableKeepaliveInterval/4)
 	defer cancel()
 	_ = tr.ping(pctx)
 }
@@ -1356,6 +1359,7 @@ func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) {
 		return // ACK before any send
 	}
 	if seq > assigned {
+		log.Printf("[WARN] qwp/sf: server ACK wire seq %d exceeds highest sent %d, clamping", seq, assigned)
 		seq = assigned
 	}
 	l.durable.enqueueOk(seq, tail)
@@ -1406,6 +1410,8 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				l.totalDurableAcks.Add(1)
 				l.durable.applyDurable(data[qwpAckTablesOffset(status):])
 				l.durableDrain()
+			} else if l.warnedStrayDurable.CompareAndSwap(false, true) {
+				log.Printf("[WARN] qwp/sf: received STATUS_DURABLE_ACK frame without opt-in — ignoring")
 			}
 			continue
 		}

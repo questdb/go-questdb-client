@@ -153,10 +153,10 @@ type QwpQueryClient struct {
 	// ctx / type-mismatch error — not a transport-terminal one — so the
 	// pool lease has no other signal that the worker is desynced. The
 	// lease reads it via execDesynced() to evict rather than recycle the
-	// worker. Standalone clients ignore it (the user owns the client and
-	// the desync surfaces on their own next call). Latch-once: a desynced
-	// wire stays desynced until the worker is rebuilt, and an evicted
-	// worker is discarded, never reused.
+	// worker; Query/Exec also gate on it so a standalone client fails fast
+	// with errExecDesynced instead of reading another statement's leftover
+	// frames. Latch-once: a desynced wire stays desynced until the worker
+	// is rebuilt, and an evicted worker is discarded, never reused.
 	execDrainAbandoned atomic.Bool
 }
 
@@ -491,10 +491,9 @@ func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
 
 // WithQwpQueryConnectTimeout bounds the TCP connect on each endpoint dial, so a
 // black-holed host is abandoned within d instead of riding the OS connect
-// timeout. The upgrade response read stays under WithQwpQueryAuthTimeout. The
-// TLS handshake (wss) prefers WithQwpQueryAuthTimeout, but falls back to this
-// timeout when the auth timeout is unset — so a config that sets only
-// connect_timeout still bounds the handshake, not just the TCP connect. A zero
+// timeout. The upgrade response read and TLS handshake (wss) are bounded
+// separately by WithQwpQueryAuthTimeout, which always has a value (default
+// 15s) — to tighten the handshake, set the auth timeout too. A zero
 // or negative duration keeps the OS connect timeout. Equivalent to the
 // connect-string connect_timeout key.
 func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
@@ -604,6 +603,14 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 // close-before-submit apart from a close-mid-failover.
 var errClosedDuringFailover = errors.New(
 	"qwp query: client closed during failover")
+
+// errExecDesynced fails Query/Exec fast once an abandoned exec drain has left
+// the single-stream wire desynced (see execDrainAbandoned): submitting onto it
+// would read another statement's leftover frames as this one's response. The
+// transport never faulted, so without this gate the next call would misbehave
+// instead of erroring.
+var errExecDesynced = errors.New(
+	"qwp query: connection desynced by an abandoned statement drain; close and rebuild the client")
 
 // reconnectAndReplay tears down the current generation, demotes the
 // just-failed endpoint and walks the host tracker by (state, zone)
@@ -899,6 +906,11 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QwpQuery
 		q.state.Store(qwpQueryStateDone)
 		return q
 	}
+	if c.execDrainAbandoned.Load() {
+		q.pendingErr = errExecDesynced
+		q.state.Store(qwpQueryStateDone)
+		return q
+	}
 	req, err := c.buildRequest(sql, opts)
 	if err != nil {
 		q.pendingErr = err
@@ -932,6 +944,9 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QwpQuery
 func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (ExecResult, error) {
 	if c.closed.Load() {
 		return ExecResult{}, errors.New("qwp query: client is closed")
+	}
+	if c.execDrainAbandoned.Load() {
+		return ExecResult{}, errExecDesynced
 	}
 	req, err := c.buildRequest(sql, opts)
 	if err != nil {

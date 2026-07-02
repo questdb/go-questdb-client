@@ -168,7 +168,7 @@ func TestDurableTrackerDropChainsBehindOk(t *testing.T) {
 func TestDurableTrackerEnqueueEmptyChainsFIFO(t *testing.T) {
 	tr := newQwpDurableTracker()
 	tr.enqueueOk(0, durableTrailer(tableEntry{"trades", 5})) // OK, needs trades@5
-	tr.enqueueEmpty(1)                                        // DROP: no trailer, trivially durable
+	tr.enqueueEmpty(1)                                       // DROP: no trailer, trivially durable
 	// The empty drop must not advance past the still-unconfirmed OK ahead of it.
 	if got := tr.drain(); got != -1 {
 		t.Fatalf("empty drop drained ahead of uncovered OK = %d, want -1", got)
@@ -219,6 +219,9 @@ func TestDurableTrackerResetOnReconnect(t *testing.T) {
 }
 
 func TestDurableTrackerSteadyStateZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
 	tr := newQwpDurableTracker()
 	ok := durableTrailer(tableEntry{"trades", 1})
 	dur := durableTrailer(tableEntry{"trades", 1})
@@ -237,6 +240,6 @@ func TestDurableTrackerSteadyStateZeroAllocs(t *testing.T) {
 		seq++
 	})
 	if got != 0 {
-		t.Errorf("steady-state enqueue/apply/drain allocs = %v, want 0", got)
+		t.Fatalf("steady-state enqueue/apply/drain allocs = %v, want 0", got)
 	}
 }

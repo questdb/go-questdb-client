@@ -1261,7 +1261,8 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // is DIRTY: recycling it would ship this borrower's rows under the next
 // borrower's FSN (C1 borrower-isolation). The pool must discard it rather than
 // recycle. retained is only meaningful on the producer goroutine; the
-// error-handler path can't inspect producer state and reports false.
+// error-handler path can't inspect producer state, so it reports true —
+// unable to prove the slot clean, it errs on discard.
 func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err error) {
 	if s.closed.Load() {
 		return false, errClosedSenderFlush
@@ -1271,9 +1272,10 @@ func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err 
 		// SenderErrorHandler): touching producer state (lastErr / hasTable /
 		// pendingRowCount / buffers) would race the producer — the C3 hazard.
 		// Surface only the latched terminal error, like closeCursor does. We
-		// can't safely read pendingRowCount here, so report retained=false and
-		// let markBrokenIfTerminal handle a poisoned slot.
-		return false, s.cursorSendLoop.sendLoopCheckError()
+		// can't safely read pendingRowCount, so we can't prove the slot is
+		// clean either — report retained=true so the pool discards it instead
+		// of recycling a possibly-dirty slot under the next borrower (C1).
+		return true, s.cursorSendLoop.sendLoopCheckError()
 	}
 	firstErr := s.lastErr
 	s.lastErr = nil

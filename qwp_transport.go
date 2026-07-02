@@ -377,8 +377,9 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	}
 	// Bound the TLS handshake (wss): a host that accepts TCP but black-holes the
 	// handshake would otherwise hang until ctx. Prefer auth_timeout (the
-	// handshake+auth budget); fall back to connect_timeout so a config that sets
-	// only connect_timeout still bounds the handshake, not just the TCP connect.
+	// handshake+auth budget). Production configs always floor auth_timeout
+	// (ingest to 15s, egress rejects <= 0), so the connect_timeout fallback only
+	// covers direct qwpTransportOpts constructions that leave it zero.
 	switch {
 	case opts.authTimeoutMs > 0:
 		httpTransport.TLSHandshakeTimeout = time.Duration(opts.authTimeoutMs) * time.Millisecond
