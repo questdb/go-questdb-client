@@ -55,10 +55,11 @@ const (
 	SenderAllEndpointsUnreachable
 	// SenderAuthFailed is terminal: an auth/upgrade rejection halted the
 	// sender. Cause carries the typed error.
+	//
+	// There is deliberately no reconnect-budget-exhausted kind: a running
+	// sender retries transport outages indefinitely (Invariant B) and
+	// never terminates on a wall clock.
 	SenderAuthFailed
-	// SenderReconnectBudgetExhausted is terminal: the reconnect budget ran
-	// out. Cause carries the typed error.
-	SenderReconnectBudgetExhausted
 )
 
 // String returns the SCREAMING_SNAKE_CASE name of the kind (e.g. "CONNECTED"),
@@ -80,8 +81,6 @@ func (k SenderConnectionEventKind) String() string {
 		return "ALL_ENDPOINTS_UNREACHABLE"
 	case SenderAuthFailed:
 		return "AUTH_FAILED"
-	case SenderReconnectBudgetExhausted:
-		return "RECONNECT_BUDGET_EXHAUSTED"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", int(k))
 	}
@@ -141,7 +140,7 @@ func (e SenderConnectionEvent) String() string {
 // SenderConnectionListener is the user-supplied callback invoked when the QWP
 // ingress client observes a connection-state transition (initial connect,
 // failover, an endpoint attempt failing, the full address list being
-// unreachable, or a terminal auth/budget rejection). Registered via
+// unreachable, or a terminal auth rejection). Registered via
 // WithConnectionListener.
 //
 // # Threading
@@ -156,7 +155,7 @@ func (e SenderConnectionEvent) String() string {
 // Delivery is best-effort: the bounded inbox is drop-oldest for every payload,
 // so under inbox pressure any queued event — success (Connected, FailedOver,
 // Reconnected), failure (EndpointAttemptFailed, AllEndpointsUnreachable), or
-// terminal (AuthFailed, ReconnectBudgetExhausted) — may be displaced before it
+// terminal (AuthFailed) — may be displaced before it
 // is delivered (visible via QwpSender.DroppedConnectionNotifications()). Failure
 // events are the likeliest to coalesce, as they can burst during a reconnect
 // walk; the sparser success and terminal events survive under normal operation.
@@ -172,7 +171,7 @@ type SenderConnectionListener func(SenderConnectionEvent)
 func defaultSenderConnectionListener(e SenderConnectionEvent) {
 	level := "[INFO]"
 	switch e.Kind {
-	case SenderAuthFailed, SenderReconnectBudgetExhausted:
+	case SenderAuthFailed:
 		level = "[ERROR]"
 	case SenderDisconnected, SenderEndpointAttemptFailed, SenderAllEndpointsUnreachable:
 		level = "[WARN]"

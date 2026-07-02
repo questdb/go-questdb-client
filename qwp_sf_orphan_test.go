@@ -784,3 +784,110 @@ func TestQwpSfDrainerMarksFailedWhenConnectedButNeverAcked(t *testing.T) {
 	assert.False(t, qwpSfIsCandidateOrphan(dir),
 		"slot must be quarantined (not a re-adoption candidate) after the watchdog fires")
 }
+
+// TestQwpSfDrainerRetriesDownServerInsteadOfQuarantining pins Invariant B:
+// a transport outage that outlasts the former reconnect budget must not
+// quarantine the slot — the drainer keeps retrying with capped backoff and
+// drains once the server is reachable again.
+func TestQwpSfDrainerRetriesDownServerInsteadOfQuarantining(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+
+	var up atomic.Bool
+	factory := func(ctx context.Context, idx int) (*qwpTransport, error) {
+		if !up.Load() {
+			return nil, errors.New("dial tcp: connect: connection refused")
+		}
+		return qwpSfDialFor(srv)(ctx, idx)
+	}
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		factory,
+		nil,
+		50*time.Millisecond /* former budget */, time.Millisecond, 5*time.Millisecond,
+	)
+	done := make(chan struct{})
+	go func() { drainer.drainerRun(context.Background()); close(done) }()
+
+	// Outlast the former budget several times over: still retrying, no sentinel.
+	time.Sleep(300 * time.Millisecond)
+	assert.Equal(t, qwpSfDrainOutcomePending, drainer.drainerOutcome(),
+		"drainer must keep retrying a down server, not fail")
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "a down server must not drop .failed")
+
+	up.Store(true)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainer did not finish after the server came up")
+	}
+	assert.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome())
+}
+
+// TestQwpSfDrainerAllReplicaWindowRetriesAndFiresPrimaryUnavailable pins the
+// graceful-failover window: while every endpoint 421-role-rejects (all
+// replicas), the drainer fires OnPrimaryUnavailable per sweep, keeps retrying
+// without quarantining, and drains once a primary reappears.
+func TestQwpSfDrainerAllReplicaWindowRetriesAndFiresPrimaryUnavailable(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+
+	var promoted atomic.Bool
+	factory := func(ctx context.Context, idx int) (*qwpTransport, error) {
+		if !promoted.Load() {
+			return nil, &QwpUpgradeRejectError{StatusCode: 421, Role: "REPLICA"}
+		}
+		return qwpSfDialFor(srv)(ctx, idx)
+	}
+
+	var primaryUnavailable atomic.Int64
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		factory,
+		nil,
+		50*time.Millisecond, time.Millisecond, 5*time.Millisecond,
+	)
+	drainer.listener = QwpBackgroundDrainerListener{
+		OnPrimaryUnavailable: func(_ string, attempt int) { primaryUnavailable.Store(int64(attempt)) },
+	}
+	done := make(chan struct{})
+	go func() { drainer.drainerRun(context.Background()); close(done) }()
+
+	require.Eventually(t, func() bool { return primaryUnavailable.Load() >= 2 },
+		2*time.Second, 5*time.Millisecond,
+		"OnPrimaryUnavailable should fire once per all-replica sweep")
+	assert.Equal(t, qwpSfDrainOutcomePending, drainer.drainerOutcome(),
+		"an all-replica window must keep the drainer retrying")
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "an all-replica window must not drop .failed")
+
+	promoted.Store(true)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainer did not finish after a primary reappeared")
+	}
+	assert.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome())
+}

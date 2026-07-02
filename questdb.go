@@ -85,6 +85,7 @@ type questDBConfig struct {
 	lazyConnectSet                     bool
 	errorHandler                       SenderErrorHandler
 	connectionListener                 SenderConnectionListener
+	drainerListener                    QwpBackgroundDrainerListener
 }
 
 func defaultQuestDBConfig() *questDBConfig { return &questDBConfig{} }
@@ -153,6 +154,15 @@ func WithQuestDBErrorHandler(h SenderErrorHandler) QuestDBOption {
 // every pooled sender. See WithConnectionListener.
 func WithQuestDBConnectionListener(l SenderConnectionListener) QuestDBOption {
 	return func(c *questDBConfig) { c.connectionListener = l }
+}
+
+// WithQuestDBDrainerListener applies a QwpBackgroundDrainerListener to every
+// pooled sender, covering both orphan adoption (drain_orphans) and the pool's
+// crash-stranded-slot recovery senders. Callbacks may fire concurrently from
+// multiple drainers; implementations must be thread-safe (the standalone
+// WithBackgroundDrainerListener contract).
+func WithQuestDBDrainerListener(l QwpBackgroundDrainerListener) QuestDBOption {
+	return func(c *questDBConfig) { c.drainerListener = l }
 }
 
 // serializeErrorHandler wraps h so concurrent invocations from the pool's
@@ -306,7 +316,7 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	// Build both pools + the housekeeper, teardown-hardened: on any failure
 	// close what was already built, in reverse order (Hazard I at the facade).
 	sp, err := newQwpSenderPool(ctx, ingestConf, senderMin, senderMax,
-		acquire, idle, lifetime, errorHandler, connectionListener)
+		acquire, idle, lifetime, errorHandler, connectionListener, cfg.drainerListener)
 	if err != nil {
 		return nil, err
 	}

@@ -134,9 +134,9 @@ type qwpSfCursorEngine struct {
 	// terminalError is the (optional) snapshot getter wired in by the
 	// I/O send loop after it is constructed, alongside reconnectStatus.
 	// It returns the loop's latched terminal error — a *SenderError on a
-	// HALT, a plain error on a transport-fatal or reconnect-budget
-	// exhaustion — or nil while the loop is healthy or merely
-	// reconnecting. engineAppendBlocking polls it on every backpressure
+	// HALT, a plain error on a transport-fatal condition — or nil while
+	// the loop is healthy or merely reconnecting. engineAppendBlocking
+	// polls it on every backpressure
 	// spin iteration: a HALT stops the send loop draining the ring (ACK-
 	// driven trim ceases), so a producer parked on a full ring would
 	// otherwise wait out the whole appendDeadline and return the generic
@@ -491,7 +491,7 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 	timer := time.NewTimer(qwpSfEngineParkInterval)
 	defer timer.Stop()
 	for {
-		// A send-loop HALT (or reconnect-budget exhaustion) stops the
+		// A send-loop HALT stops the
 		// loop draining the ring: ACK-driven trim ceases, so the
 		// backpressure can never clear and the deadline would only ever
 		// expire. Surface the latched terminal error immediately instead

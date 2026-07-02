@@ -78,6 +78,7 @@ type qwpSenderPool struct {
 	baseConf           string
 	errorHandler       SenderErrorHandler
 	connectionListener SenderConnectionListener
+	drainerListener    QwpBackgroundDrainerListener
 
 	// Store-and-forward coordination (storeAndForward true iff sfDir != "").
 	storeAndForward bool
@@ -110,6 +111,7 @@ func newQwpSenderPool(
 	acquireTimeout, idleTimeout, maxLifetime time.Duration,
 	errorHandler SenderErrorHandler,
 	connectionListener SenderConnectionListener,
+	drainerListener QwpBackgroundDrainerListener,
 ) (*qwpSenderPool, error) {
 	if minSize < 0 || maxSize < 1 || minSize > maxSize {
 		return nil, fmt.Errorf("qwp pool: invalid sizes min=%d max=%d (max defaults to %d when unset — raise sender_pool_max alongside min)", minSize, maxSize, qwpDefaultPoolMax)
@@ -132,6 +134,7 @@ func newQwpSenderPool(
 		baseConf:           conf,
 		errorHandler:       errorHandler,
 		connectionListener: connectionListener,
+		drainerListener:    drainerListener,
 		storeAndForward:    template.sfDir != "",
 		sfDir:              template.sfDir,
 	}
@@ -568,6 +571,7 @@ func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async b
 	// config still apply to every pooled sender.
 	cfg.errorHandler = p.errorHandler
 	cfg.connectionListener = p.connectionListener
+	cfg.backgroundDrainerListener = p.drainerListener
 	if p.storeAndForward {
 		cfg.senderId = p.slotBase + "-" + strconv.Itoa(slotIndex)
 		cfg.orphanDrainExclude = p.inRangeFence

@@ -101,7 +101,7 @@ func TestConnectionListenerFiresConnected(t *testing.T) {
 // when no WithConnectionListener is set) across every kind, including the WARN
 // and ERROR branches and an unknown kind; it must classify and log without panic.
 func TestDefaultSenderConnectionListener(t *testing.T) {
-	for k := SenderConnected; k <= SenderReconnectBudgetExhausted+1; k++ {
+	for k := SenderConnected; k <= SenderAuthFailed+1; k++ {
 		defaultSenderConnectionListener(SenderConnectionEvent{Kind: k, Host: "h", Port: 9000})
 	}
 }
@@ -246,15 +246,18 @@ func TestConnectionListenerFiresFailedOver(t *testing.T) {
 	}
 }
 
-// TestConnectionListenerFiresUnreachableAndBudgetExhausted drives a server that
-// serves one connection then rejects every reconnect, with a tight reconnect
-// budget. The listener must observe the per-attempt failure, the full-sweep
-// failure, and the terminal budget exhaustion.
-func TestConnectionListenerFiresUnreachableAndBudgetExhausted(t *testing.T) {
+// TestConnectionListenerOutageOutlastsBudgetNeverTerminal drives a server that
+// serves one connection then rejects every reconnect for longer than the
+// configured reconnect_max_duration. Under Invariant B the running loop keeps
+// retrying — no terminal error latches, no terminal event fires — and it binds
+// again the moment the server recovers.
+func TestConnectionListenerOutageOutlastsBudgetNeverTerminal(t *testing.T) {
+	var rejecting atomic.Bool
+	rejecting.Store(true)
 	var connCount atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if connCount.Add(1) >= 2 {
-			w.WriteHeader(http.StatusServiceUnavailable) // transient reject on every reconnect
+		if connCount.Add(1) >= 2 && rejecting.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable) // transient reject while "down"
 			return
 		}
 		w.Header().Set(qwpHeaderVersion, "1")
@@ -263,28 +266,41 @@ func TestConnectionListenerFiresUnreachableAndBudgetExhausted(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
-		if _, _, err := conn.Read(context.Background()); err != nil {
-			return
+		var seq int64
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+			if connCount.Load() == 1 {
+				return // drop the first connection to force the outage
+			}
 		}
-		conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(0))
 	}))
 	defer srv.Close()
 
 	s, events := listenAndIngest(t, strings.TrimPrefix(srv.URL, "http://"),
-		WithReconnectPolicy(300*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond))
+		WithReconnectPolicy(200*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond))
 	defer s.Close(context.Background())
 
+	// The first post-disconnect sweep can exhaust before any dial (the
+	// mid-stream demote consumes the only host), so wait for the dial
+	// failure first and collect the sweep event along the way.
 	seen := map[SenderConnectionEventKind]bool{}
-	e := waitForKind(t, events, SenderReconnectBudgetExhausted, seen)
-	if e.Cause == nil {
-		t.Error("RECONNECT_BUDGET_EXHAUSTED event should carry a cause")
-	}
-	if !seen[SenderEndpointAttemptFailed] {
-		t.Error("expected ENDPOINT_ATTEMPT_FAILED before budget exhaustion")
-	}
+	waitForKind(t, events, SenderEndpointAttemptFailed, seen)
 	if !seen[SenderAllEndpointsUnreachable] {
-		t.Error("expected ALL_ENDPOINTS_UNREACHABLE before budget exhaustion")
+		waitForKind(t, events, SenderAllEndpointsUnreachable, seen)
 	}
+	// Outlast the configured max duration; the running loop must still be
+	// retrying rather than latching a terminal error.
+	time.Sleep(500 * time.Millisecond)
+	qs := s.(QwpSender)
+	if se := qs.LastTerminalError(); se != nil {
+		t.Fatalf("running loop went terminal during a transport outage: %v", se)
+	}
+	rejecting.Store(false)
+	waitForKind(t, events, SenderReconnected, seen)
 }
 
 // TestConnectionListenerObservesReconnect drives a server that drops the first
@@ -414,4 +430,48 @@ func TestConnectionListenerAsyncConnect(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("async connect never fired CONNECTED")
 	}
+}
+
+// TestAsyncInitialConnectOutlastsBudgetThenConnects pins Invariant B on the
+// async-initial-connect path (and thus lazy_connect pools): a server down for
+// longer than reconnect_max_duration must not latch a terminal error; the
+// sender connects once the server comes up.
+func TestAsyncInitialConnectOutlastsBudgetThenConnects(t *testing.T) {
+	var up atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !up.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		var seq int64
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+		}
+	}))
+	defer srv.Close()
+
+	s, events := listenAndIngest(t, strings.TrimPrefix(srv.URL, "http://"),
+		WithInitialConnectMode(InitialConnectAsync),
+		WithReconnectPolicy(200*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond))
+	defer s.Close(context.Background())
+
+	// Outlast the configured max duration; the async dial must still be
+	// retrying rather than latching a terminal error.
+	time.Sleep(500 * time.Millisecond)
+	qs := s.(QwpSender)
+	if se := qs.LastTerminalError(); se != nil {
+		t.Fatalf("async initial connect went terminal during a transport outage: %v", se)
+	}
+	up.Store(true)
+	waitForKind(t, events, SenderConnected, map[SenderConnectionEventKind]bool{})
 }

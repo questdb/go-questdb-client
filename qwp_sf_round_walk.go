@@ -135,7 +135,13 @@ type qwpSfRoundWalkParams struct {
 	// dial; endpoints[i] is purely diagnostic.
 	Endpoints []qwpEndpoint
 	// MaxDuration is the wall-clock outage budget
-	// (reconnect_max_duration_millis per failover.md §7).
+	// (reconnect_max_duration_millis per failover.md §7). <= 0 means
+	// unbounded: the walk retries until success, terminal error, or
+	// cancellation, and never returns Exhausted. The running send loop,
+	// async initial connect, and background drainers use unbounded mode
+	// (Invariant B: a store-and-forward client never gives up on a
+	// transient outage); only the blocking sync initial connect passes
+	// a positive budget.
 	MaxDuration time.Duration
 	// InitialBackoff is the smallest pre-jitter sleep at round
 	// exhaustion (reconnect_initial_backoff_millis).
@@ -153,8 +159,11 @@ type qwpSfRoundWalkParams struct {
 	OnEndpointFailed func(idx int, err error)
 	// OnRoundExhausted, when non-nil, fires once each time a full
 	// address-list sweep fails to bind any host. Drives the
-	// SenderAllEndpointsUnreachable event.
-	OnRoundExhausted func()
+	// SenderAllEndpointsUnreachable event. lastWasRoleReject reports
+	// whether the sweep's final failure was a role reject, so callers
+	// can distinguish an all-replica failover window (transient
+	// topology churn) from generic unreachability.
+	OnRoundExhausted func(lastWasRoleReject bool)
 	// DurableMismatchTerminal controls how a *QwpDurableAckMismatchError is
 	// classified: true (foreground) makes it terminal (fail loud, no failover);
 	// false (background drainer, whose source data is pinned) treats it as a
@@ -239,10 +248,11 @@ func qwpSfRunSingleRound(
 	}
 
 	var (
-		attempts          int
-		lastErr           error
-		lastWasRoleReject bool
-		pendingMismatch   *QwpDurableAckMismatchError
+		attempts              int
+		lastErr               error
+		lastWasRoleReject     bool
+		pendingMismatch       *QwpDurableAckMismatchError
+		pendingProtocolReject *QwpUpgradeRejectError
 	)
 
 	// Apply pending mid-stream demote before the first PickNext.
@@ -277,6 +287,15 @@ func qwpSfRunSingleRound(
 			// sweep found no durable-advertising endpoint).
 			if pendingMismatch != nil {
 				return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingMismatch}
+			}
+			// Same deferred-terminal shape for a protocol-level reject
+			// (404 wrong endpoint, 426 upgrade required): a single peer
+			// rejecting must not lock the walk out of a compatible
+			// sibling, but a sweep that saw one and bound nothing fails
+			// loud — replaying the handshake meets the same reject, and
+			// waiting cannot fix a misconfigured path or a pre-QWP server.
+			if pendingProtocolReject != nil {
+				return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingProtocolReject}
 			}
 			return qwpSfSingleRoundResult{
 				Idx:               -1,
@@ -377,6 +396,14 @@ func qwpSfRunSingleRound(
 					Terminal: rej,
 				}
 			}
+			// Protocol-level rejects (404 wrong endpoint, 426 upgrade
+			// required): remember for the sweep-exhaustion terminal above,
+			// then keep walking so a compatible sibling can still bind.
+			// Mirrors qwpSfIsProtocolUpgradeFailure and the sanctioned
+			// non-421-reject terminal.
+			if rej.StatusCode == 404 || rej.StatusCode == 426 {
+				pendingProtocolReject = rej
+			}
 			if params.OnEndpointFailed != nil {
 				params.OnEndpointFailed(idx, err)
 			}
@@ -386,7 +413,9 @@ func qwpSfRunSingleRound(
 			// every host stays Same anyway. The egress connect-walk
 			// consumes the same header in qwp_query_failover.go.
 			// 421 + non-empty role: role-reject (transient or topology).
-			// 421 without role, 404, 426, 503, etc.: generic transient.
+			// 421 without role, 503, and other statuses: generic transient
+			// (an LB or proxy blip during a restart must not kill an SF
+			// sender).
 			if rej.IsRoleReject() {
 				params.Tracker.RecordRoleReject(idx, rej.IsCatchupRole())
 				lastWasRoleReject = true
@@ -409,11 +438,13 @@ func qwpSfRunSingleRound(
 
 // qwpSfRunRoundWalk drives the failover.md §13.6 multi-round walk:
 // each round calls qwpSfRunSingleRound; on exhaustion it pays one
-// round-boundary sleep (equal-jitter exponential for transport
-// rounds, flat InitialBackoff for role-reject rounds per §3.2),
-// clamped to the remaining budget, then BeginRound(true) and
-// retries. Returns on success, terminal AuthError, budget
-// exhaustion, or cancellation.
+// equal-jitter exponential round-boundary sleep — role-reject rounds
+// included: an all-replica window must grow toward MaxBackoff like
+// any other outage, or every retry re-dials a fresh TLS handshake at
+// a fixed ~10/s per endpoint — clamped to the remaining budget when
+// one exists, then BeginRound(true) and retries. Returns on success,
+// terminal AuthError, budget exhaustion (bounded mode only), or
+// cancellation.
 //
 // The result enum tells the caller which exit path was taken; only
 // one of Transport / Terminal / Exhausted / Cancelled is non-nil.
@@ -479,11 +510,12 @@ func qwpSfRunRoundWalk(
 
 		// Round exhausted: a full address-list sweep bound no host.
 		if params.OnRoundExhausted != nil {
-			params.OnRoundExhausted()
+			params.OnRoundExhausted(rr.LastWasRoleReject)
 		}
 		// Pay one round-boundary sleep or terminate if the budget is gone.
+		bounded := params.MaxDuration > 0
 		elapsed := time.Since(outageStart)
-		if elapsed >= params.MaxDuration {
+		if bounded && elapsed >= params.MaxDuration {
 			return qwpSfRoundWalkResult{
 				Idx:      -1,
 				Attempts: totalAttempts,
@@ -491,29 +523,21 @@ func qwpSfRunRoundWalk(
 					params.Tracker, params.Endpoints, elapsed, totalAttempts, rr.LastError),
 			}
 		}
-		var sleep time.Duration
-		if rr.LastWasRoleReject {
-			// Role-reject: no exponential doubling. ComputeBackoff(0)
-			// surfaces as EqualJitter(InitialBackoff). Reset the
-			// counter so a subsequent transport-only round doesn't
-			// inherit a stale attempt count.
-			sleep = qwpSfComputeBackoff(0, params.InitialBackoff, params.MaxBackoff)
-			backoffAttempt = 0
-		} else {
-			sleep = qwpSfComputeBackoff(backoffAttempt, params.InitialBackoff, params.MaxBackoff)
-			backoffAttempt++
-		}
-		remaining := params.MaxDuration - elapsed
-		if remaining <= 0 {
-			return qwpSfRoundWalkResult{
-				Idx:      -1,
-				Attempts: totalAttempts,
-				Exhausted: buildExhaustedError(
-					params.Tracker, params.Endpoints, elapsed, totalAttempts, rr.LastError),
+		sleep := qwpSfComputeBackoff(backoffAttempt, params.InitialBackoff, params.MaxBackoff)
+		backoffAttempt++
+		if bounded {
+			remaining := params.MaxDuration - elapsed
+			if remaining <= 0 {
+				return qwpSfRoundWalkResult{
+					Idx:      -1,
+					Attempts: totalAttempts,
+					Exhausted: buildExhaustedError(
+						params.Tracker, params.Endpoints, elapsed, totalAttempts, rr.LastError),
+				}
 			}
-		}
-		if sleep > remaining {
-			sleep = remaining
+			if sleep > remaining {
+				sleep = remaining
+			}
 		}
 		// Sleep interruptible by ctx + cancelCh.
 		if !qwpSfSleepInterruptible(ctx, cancelCh, sleep) {

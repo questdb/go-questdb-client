@@ -149,7 +149,7 @@ Every agent receives:
 
 Launch the following agents in parallel.
 
-**Agent 1 — Correctness & bugs:** nil handling at API boundaries, edge cases, logic errors, off-by-one, operator precedence, error paths, integer overflow/truncation (buffer length math, FSN/sequence arithmetic, varint/length-prefix encoding), wrong wire bytes. Verify ILP encoding per protocol version (V1 text-only, V2 binary float64 + n-dim float arrays, V3 decimals) and QWP frame/codec correctness. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite.
+**Agent 1 — Correctness & bugs:** nil handling at API boundaries, edge cases, logic errors, off-by-one, operator precedence, error paths, integer overflow/truncation (buffer length math, FSN/sequence arithmetic, varint/length-prefix encoding), wrong wire bytes. Verify ILP encoding per protocol version (V1 text-only, V2 binary float64 + n-dim float arrays, V3 decimals) and QWP frame/codec correctness. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite. When the diff touches the SF sender, the send loop / background or orphan drainers (`qwp_sf_send_loop.go`, `qwp_sf_drainer.go`, `qwp_sf_orphan.go`), primary reconnect/failover (`qwp_sf_round_walk.go`), or pool startup (`lazy_connect` / `initial_connect_retry` / `qwpSenderPool` / `qwpQueryPool`), also verify the "Store-and-forward & pool startup invariants" checklist — a running send loop or drainer that propagates a transport error to the producer, imposes a reconnect time budget, or hard-fails on a transient outage is a Critical (data-loss) finding.
 
 **Agent 2 — Panic & crash surface:** A panic on a background goroutine aborts the host process with no recovery. Flag every reachable instance of:
 
@@ -274,10 +274,77 @@ A panic on a client-spawned goroutine aborts the host process. Check for:
 
 ### QWP protocol & error semantics
 - Cursor frames remain self-sufficient (full schema + symbol dictionary from id 0 every flush) so reconnect/replay from `engineAckedFsn()+1` and orphan adoption stay safe
-- `Flush` blocking contract preserved (blocks until `engineAckedFsn` catches `enginePublishedFsn`); auto-flush stays non-blocking via `enqueueCursor`; `FlushAndGetSequence` returns the published FSN upper bound
+- `Flush` contract preserved: publishes into the cursor engine and returns **without waiting for the server ACK** (backpressure via `engineAppendBlocking` may block, bounded by `sf_append_deadline_millis`); `FlushAndGetSequence` returns the published FSN upper bound; `AwaitAckedFsn` is the only ACK barrier
 - Error-policy precedence intact: `WithErrorPolicyResolver` → `WithErrorPolicy` → `on_*_error` → `on_server_error` → defaults; `PROTOCOL_VIOLATION`/`UNKNOWN` always HALT
 - HALT latches on the I/O loop and surfaces on the next producer call; no auto-resume (close+rebuild is the only recovery)
 - Disk-backed segment files under `sf_dir` stay on-disk-compatible with the Java `MmapSegment.java` layout
+
+### Store-and-forward & pool startup invariants (QWP)
+Apply this whenever the diff touches the SF sender, the cursor engine / send
+loop (`qwp_sf_send_loop.go`, `qwp_sf_engine.go`), the background or orphan
+drainers (`qwp_sf_drainer.go`, `qwp_sf_orphan.go`), primary reconnect/failover
+(`qwp_sf_round_walk.go`), `qwpSenderPool` / `qwpQueryPool` startup,
+`lazy_connect`, or `initial_connect_retry`. A violation here is a **Critical**
+finding: the whole point of store-and-forward is that a running producer never
+loses data and never hard-fails on a transient outage.
+
+**Send loop / drainer (steady state — once the sender or pool is running).**
+- Once running, the send loop and drainer goroutines ship buffered SF data to
+  the server. They MUST NOT propagate server / transport errors back to the
+  producer (`At`/`AtNow`/`Flush`, the pooled lease). The ONLY error a running
+  drain path may surface to the producer is **SF out of space** (the on-disk /
+  RAM backing buffer is full and can accept no more rows —
+  `ErrBackpressureTimeout` after `sf_append_deadline_millis`). Flag any other
+  failure class (connect-refused, DNS, unreachable/black-hole, TLS/cert, auth,
+  role-reject, upgrade/protocol timeout, reset) that can escape onto a producer
+  or borrow call.
+- Primary reconnect MUST be fully contained inside the send-loop/drainer
+  goroutine and MUST have **no time limit** — no
+  `reconnect_max_duration_millis`-style budget, no deadline, no "give up and
+  latch terminal after N ms". A budget that latches the sender terminal (or
+  reintroduces a budget-exhausted terminal event kind) on a long outage is a
+  Critical violation: it drops a producer that store-and-forward promised to
+  keep alive.
+  Flag any bounded reconnect loop, `time.Now().After(deadline)` /
+  `deadline`-gated retry, or terminal `*SenderError` reachable from the running
+  reconnect path.
+- The reconnect loop must retry with **exponential backoff** and handle every
+  connect failure class gracefully, without a hard fail — it keeps buffering
+  and keeps retrying until the wire is back. The per-attempt backoff may be
+  capped (`reconnect_max_backoff_millis`), but the RETRY LOOP ITSELF must be
+  unbounded. Flag a capped total retry duration or an attempt-count cap on the
+  steady-state path.
+- **Sanctioned terminals (orphan-slot drainer only).** The orphan drainer MAY
+  quarantine its slot (`.failed` sentinel, human-in-the-loop) on conditions
+  that are terminal by design: auth failure, a non-421 upgrade reject, and a
+  genuine cluster-wide durable-ack capability gap that exhausted its documented
+  settle budget (a cap counted ONLY in consecutive capability-gap sweeps, with
+  any wall-clock component anchored at the FIRST capability-gap error of the
+  episode). These are NOT violations of the no-budget rule above. Transient
+  classes (role reject, transport error) must never increment that budget or
+  burn its wall clock — a transient state consuming the terminal budget
+  (shared attempt counter, entry-anchored deadline) IS a Critical violation of
+  this checklist.
+
+**Pool startup — two modes; the mode decides who sees connectivity errors.**
+- `lazy_connect=true`: `NewQuestDB` / `Connect` MUST succeed with **no server
+  present**. The producing sender must work immediately (writes buffer via
+  SF / the cursor engine), and once the server comes up the read side must
+  also connect and read (reads are deferred, not disabled). Verify the build
+  does not fail-fast, the sender does not error on the first write while the
+  server is down, and a later `BorrowQuery` succeeds once the server is up.
+- `lazy_connect=false` (default): the build / initial connect MUST expose
+  connectivity problems to the caller — DNS errors, connect-refused /
+  unreachable, TLS/cert, authentication/authorization, and connect/upgrade
+  timeouts must all surface as a returned error at startup, not be swallowed.
+  Verify each of those failure classes reaches the user during initialization.
+- **In BOTH modes the boundary is the same:** connectivity errors are only
+  ever the caller's problem DURING initialization. Once the client has
+  connected and is past initialization, the running send loop/drainer reverts
+  to the steady-state contract above — it must NEVER expose transport problems,
+  NEVER impose a reconnect time budget, and NEVER hard-fail on a transient
+  outage. Anything that undermines the store-and-forward guarantee past init
+  is Critical.
 
 ### Performance
 - No new allocations on the pinned 0-alloc hot path (`Table`/`Symbol`/`*Column`/`At*`) — verify against `BenchmarkQwpSenderSteadyState`; new hot-path scratch must reuse a buffer on `qwpLineSender`

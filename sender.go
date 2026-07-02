@@ -319,10 +319,11 @@ const (
 	// returns from the constructor immediately with an unconnected
 	// sender. The producer goroutine can call Table()/At()/Flush()
 	// right away; rows accumulate in the cursor SF engine until the
-	// connection comes up. Connect-budget exhaustion or terminal
-	// upgrade failure is delivered through the configured
-	// SenderErrorHandler (and surfaced from any subsequent producer
-	// API call as a typed error).
+	// connection comes up. The dial retries indefinitely with capped
+	// backoff (Invariant B) — only a terminal upgrade failure (auth
+	// reject, durable-ack mismatch) is delivered through the
+	// configured SenderErrorHandler (and surfaced from any subsequent
+	// producer API call as a typed error).
 	InitialConnectAsync
 )
 
@@ -531,7 +532,7 @@ func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 
 // WithConnectionListener registers a callback invoked asynchronously when the
 // QWP sender observes a connection-state transition (connect, disconnect,
-// reconnect, failover, terminal auth/budget failure). The listener runs on a
+// reconnect, failover, terminal auth failure). The listener runs on a
 // dedicated dispatcher goroutine; a slow listener cannot stall publishing, and
 // surplus events are dropped when the bounded inbox fills (visible via
 // QwpSender.DroppedConnectionNotifications()). Passing nil reverts to the
@@ -684,13 +685,15 @@ func WithSfMaxTotalBytes(n int64) LineSenderOption {
 	}
 }
 
-// WithReconnectPolicy configures the per-outage reconnect cap and
-// backoff policy. maxDuration bounds the total time spent
-// reconnecting before the loop gives up; initialBackoff and
-// maxBackoff bound a backoff sleep between attempts (with jitter).
-// A zero or negative argument is treated as "leave the default" for
-// that knob — it does not register as an explicit user choice and so
-// does not trigger the initial_connect_retry promotion.
+// WithReconnectPolicy configures the reconnect backoff policy.
+// maxDuration bounds only the blocking sync initial connect
+// (InitialConnectSync); a running sender retries transport outages
+// indefinitely and never gives up on a wall clock (Invariant B).
+// initialBackoff and maxBackoff bound the equal-jitter exponential
+// backoff sleep between attempts. A zero or negative argument is
+// treated as "leave the default" for that knob — it does not register
+// as an explicit user choice and so does not trigger the
+// initial_connect_retry promotion.
 //
 // Only available for the QWP sender.
 func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) LineSenderOption {
@@ -1404,10 +1407,10 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.retryTimeout != 0 {
 		// connect-string.md does not list retry_timeout as a QWP key
 		// (it's HTTP-only) and Sender.java rejects it on the
-		// WebSocket protocol. The QWP analogue is the per-outage
-		// reconnect budget; point the user there.
+		// WebSocket protocol. The QWP analogue is the sync-initial-
+		// connect budget; point the user there.
 		return errors.New(
-			"retry_timeout is not supported for QWP; use reconnect_max_duration_millis for the per-outage budget")
+			"retry_timeout is not supported for QWP; use reconnect_max_duration_millis for the initial-connect budget")
 	}
 	if conf.httpTransport != nil {
 		return errors.New("httpTransport setting is not available in the QWP client")
@@ -1443,11 +1446,11 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	}
 	// Implicit promotion of initial_connect_retry. When the user tuned
 	// any reconnect_* knob but did not pick an initial-connect mode,
-	// promote to sync — the reconnect budget they wrote should also
-	// cover the *first* connect attempt. Otherwise the knob name reads
-	// as a generic retry budget but the underlying path only governs
-	// reconnects from an established connection, and the budget is
-	// silently dropped at startup. Mirrors the Java client's
+	// promote to sync — the budget they wrote should also cover the
+	// *first* connect attempt. reconnect_max_duration_millis bounds
+	// ONLY that sync initial connect (a running sender retries
+	// indefinitely, Invariant B), so without the promotion the knob
+	// would be silently inert. Mirrors the Java client's
 	// actualInitialConnectMode resolution in Sender.java.
 	//
 	// An explicit user choice (any value of initial_connect_retry, or

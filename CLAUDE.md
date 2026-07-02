@@ -92,6 +92,17 @@ encodes a batch into `qwpSfCursorEngine` via `engineAppendBlocking`; the
 symbol dictionary from id 0, every flush. This is what makes
 reconnect/replay/orphan-adoption safe across a fresh server connection.
 
+**Invariant B (store-and-forward robustness):** a running sender, async
+initial connect, and every background/orphan drainer retry transport outages
+and all-replica role-reject windows **indefinitely** with capped exponential
+backoff — no wall-clock give-up, no terminal latch, no `.failed` quarantine
+for transport-class failures. `reconnect_max_duration_millis` bounds only the
+blocking sync initial connect. Sanctioned terminals: auth reject, 404/426
+upgrade reject (at sweep exhaustion), durable-ack capability-gap settle
+exhaustion (capability-gap sweeps only; transport windows pause, role-reject
+sweeps reset). The only producer-visible error from a running drain path is
+SF-out-of-space backpressure. Enforced by the review-pr skill checklist.
+
 **The wire carries no schema id and no schema mode byte.** A table block is
 `table_name, row_count, col_count, inline columns, column data`; the inline
 column definitions are the authoritative schema, repeated on every frame. There

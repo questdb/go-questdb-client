@@ -956,21 +956,16 @@ func TestQwpSfSendLoopPreSendDropRejectionDoesNotAdvanceWatermark(t *testing.T) 
 		"pre-send DROP rejection must not bump totalAcks")
 }
 
-// TestQwpSfSendLoopSilentDropAfterFrameIsTerminal verifies that when
-// the server accepts the WS upgrade but silently disconnects after a
-// frame (without sending any ACK) on EVERY connection, the send loop
-// classifies it as a server version/config mismatch and fails fast
-// instead of entering a hot reconnect loop. Without this guard, every
-// dial succeeds and the receiver reset its backoff on each attempt —
-// burning thousands of ephemeral ports per second until
-// reconnectMaxDuration (5 minutes default) expired.
-//
-// The guard fires only after qwpSfMaxSilentConnStrikes consecutive
-// ACK-less connections — at least one full reconnect+replay cycle
-// that still met silence — so this server, which drops on every
-// connection, trips it. A single such drop reconnects instead; see
+// TestQwpSfSendLoopSilentDropRepeatedBacksOffNeverTerminal verifies
+// that when the server accepts the WS upgrade but silently disconnects
+// after a frame (without sending any ACK) on EVERY connection, the
+// send loop keeps retrying (Invariant B: a rolling-upgrade skew clears
+// once peers converge) while paying a growing per-strike backoff, so
+// the dial-send-drop cycle is throttled instead of hammering the
+// server — and it never latches a terminal error. A single such drop
+// reconnects immediately; see
 // TestQwpSfSendLoopSilentDropOnFirstConnReconnects.
-func TestQwpSfSendLoopSilentDropAfterFrameIsTerminal(t *testing.T) {
+func TestQwpSfSendLoopSilentDropRepeatedBacksOffNeverTerminal(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{silentDropAfterFrames: 1})
 	defer srv.Close()
 
@@ -989,23 +984,21 @@ func TestQwpSfSendLoopSilentDropAfterFrameIsTerminal(t *testing.T) {
 	_, err = engine.engineAppendBlocking(context.Background(), []byte("frame"))
 	require.NoError(t, err)
 
-	require.Eventually(t, func() bool {
-		return loop.sendLoopCheckError() != nil
-	}, 2*time.Second, 1*time.Millisecond, "loop should have failed fast")
-
-	gotErr := loop.sendLoopCheckError()
-	require.Error(t, gotErr)
-	assert.Contains(t, gotErr.Error(), "without ACKing",
-		"error should explain the no-ACK detection")
-
-	// The whole point: we must NOT hammer the server with thousands
-	// of reconnects. With qwpSfMaxSilentConnStrikes == 2 the loop
-	// gives up after exactly one reconnect+replay cycle that still
-	// met silence — i.e. one reconnect and two connections.
-	assert.LessOrEqual(t, loop.sendLoopTotalReconnects(), int64(1),
-		"expected at most one reconnect before terminal classification")
-	assert.LessOrEqual(t, srv.connCount.Load(), int64(2),
-		"server should have seen at most 2 connections")
+	// Let several strike cycles elapse: the loop must keep retrying and
+	// never latch a terminal error.
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		require.NoError(t, loop.sendLoopCheckError(),
+			"repeated ACK-less drops must not latch a terminal error")
+		time.Sleep(20 * time.Millisecond)
+	}
+	conns := srv.connCount.Load()
+	assert.GreaterOrEqual(t, conns, int64(3),
+		"loop should keep reconnecting through the silent drops")
+	// The growing per-strike backoff throttles the dial-send-drop cycle;
+	// without it this window would burn hundreds of connections.
+	assert.LessOrEqual(t, conns, int64(30),
+		"strike backoff should throttle the reconnect cycle")
 }
 
 // TestQwpSfSendLoopSilentDropOnFirstConnReconnects verifies that a
@@ -1178,12 +1171,14 @@ func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
 	assert.Contains(t, senderErr.ServerMessage, "401")
 }
 
-func TestQwpSfSendLoopReconnectBudgetExhausted(t *testing.T) {
+func TestQwpSfSendLoopOutageOutlastsBudgetKeepsRetrying(t *testing.T) {
 	// Healthy server first — get a successful ACK on the live
 	// connection so the disconnect, when it comes, is NOT classified
-	// as "no ACKs ever, must be a protocol mismatch" by run(). Then
-	// take the server down so reconnects fail with connection-refused
-	// and the per-outage budget actually gets exercised.
+	// as a silent-conn strike by run(). Then take the server down so
+	// every reconnect fails with connection-refused for far longer
+	// than the configured reconnect_max_duration. Invariant B: the
+	// running loop must keep walking with backoff and never latch a
+	// terminal error on a transport outage.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 
 	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
@@ -1194,7 +1189,7 @@ func TestQwpSfSendLoopReconnectBudgetExhausted(t *testing.T) {
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
-		100*time.Microsecond, 200*time.Millisecond /* short cap */, 10*time.Millisecond, 50*time.Millisecond)
+		100*time.Microsecond, 100*time.Millisecond /* former budget, now sync-init-only */, 5*time.Millisecond, 20*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
@@ -1211,14 +1206,16 @@ func TestQwpSfSendLoopReconnectBudgetExhausted(t *testing.T) {
 	close(srv.kill)
 	srv.Close()
 
-	require.Eventually(t, func() bool {
-		return loop.sendLoopCheckError() != nil
-	}, 5*time.Second, 10*time.Millisecond)
-	gotErr := loop.sendLoopCheckError()
-	require.Error(t, gotErr)
-	assert.Contains(t, gotErr.Error(), "reconnect failed")
-	// Should have made multiple attempts before giving up.
-	assert.GreaterOrEqual(t, loop.sendLoopTotalReconnectAttempts(), int64(1))
+	// Outlast the configured max duration several times over: the loop
+	// must keep attempting and never latch a terminal error.
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		require.NoError(t, loop.sendLoopCheckError(),
+			"running loop latched a terminal error during a transport outage")
+		time.Sleep(20 * time.Millisecond)
+	}
+	assert.GreaterOrEqual(t, loop.sendLoopTotalReconnectAttempts(), int64(3),
+		"expected the loop to keep walking past the former budget")
 }
 
 func TestQwpSfSendLoopNilFactoryIsTerminalOnFailure(t *testing.T) {

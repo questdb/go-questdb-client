@@ -100,7 +100,7 @@ func newQwpSenderPoolForTest(t *testing.T, extra string, min, max int) *qwpSende
 	addr := strings.TrimPrefix(srv.URL, "http://")
 	conf := "ws::addr=" + addr + ";" + extra
 	p, err := newQwpSenderPool(context.Background(), conf, min, max,
-		500*time.Millisecond, 0, 0, nil, nil)
+		500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot(t *testing.T) {
 		";close_flush_timeout_millis=1;auto_flush=off;"
 	// min == max == 1 forces the re-borrow to reuse the recycled slot — unless
 	// this Close discards it, which is exactly what we assert.
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 500*time.Millisecond, 0, 0, nil, nil)
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -605,7 +605,7 @@ func TestQwpSenderLeaseStaleAtFlush(t *testing.T) {
 
 func TestQwpSenderPoolBorrowCreateError(t *testing.T) {
 	ctx := context.Background()
-	p, err := newQwpSenderPool(ctx, "ws::addr=127.0.0.1:1;", 0, 1, 200*time.Millisecond, 0, 0, nil, nil)
+	p, err := newQwpSenderPool(ctx, "ws::addr=127.0.0.1:1;", 0, 1, 200*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
 	if err != nil {
 		t.Fatalf("build (min=0 must not connect): %v", err)
 	}
@@ -616,7 +616,7 @@ func TestQwpSenderPoolBorrowCreateError(t *testing.T) {
 }
 
 func TestQwpSenderPoolPrewarmFailure(t *testing.T) {
-	_, err := newQwpSenderPool(context.Background(), "ws::addr=127.0.0.1:1;", 1, 2, 200*time.Millisecond, 0, 0, nil, nil)
+	_, err := newQwpSenderPool(context.Background(), "ws::addr=127.0.0.1:1;", 1, 2, 200*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
 	if err == nil {
 		t.Error("prewarm against a down server should fail the build")
 	}
@@ -666,7 +666,7 @@ func TestQwpSenderPoolDiscardsBackgroundHaltedSlot(t *testing.T) {
 	srv, poison := poisonFirstConnQwpServer(t)
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil)
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -715,7 +715,7 @@ func TestQwpSenderPoolReapsBackgroundHaltedSlot(t *testing.T) {
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
 	// idle_timeout and max_lifetime off + min=1: only the poison check can reap.
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil)
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -735,13 +735,13 @@ func TestQwpSenderPoolReapsBackgroundHaltedSlot(t *testing.T) {
 
 func TestQwpSenderPoolConstructorErrors(t *testing.T) {
 	ctx := context.Background()
-	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;", 3, 1, time.Second, 0, 0, nil, nil); err == nil {
+	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;", 3, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}); err == nil {
 		t.Error("min>max should error")
 	}
-	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;init_buf_size=abc;", 0, 1, time.Second, 0, 0, nil, nil); err == nil {
+	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;init_buf_size=abc;", 0, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}); err == nil {
 		t.Error("malformed conf should error")
 	}
-	if _, err := newQwpSenderPool(ctx, "http::addr=a:9000;", 0, 1, time.Second, 0, 0, nil, nil); err == nil {
+	if _, err := newQwpSenderPool(ctx, "http::addr=a:9000;", 0, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}); err == nil {
 		t.Error("non-ws schema should error")
 	}
 }
@@ -793,7 +793,7 @@ func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 	srv, poison := poisonFirstConnQwpServer(t)
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";sf_dir=" + t.TempDir() + ";"
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil)
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}

@@ -141,10 +141,9 @@ type QwpSender interface {
 
 	// LastTerminalError returns a snapshot of the most recent
 	// terminal SenderError the I/O loop latched (server rejection,
-	// WS protocol violation, auth failure, reconnect-budget
-	// exhaustion). Returns nil if the sender has not gone terminal
-	// yet, or if it failed for a non-server reason (transport
-	// error before classification).
+	// WS protocol violation, auth failure). Returns nil if the
+	// sender has not gone terminal yet, or if it failed for a
+	// non-server reason (transport error before classification).
 	LastTerminalError() *SenderError
 
 	// TotalServerErrors returns the cumulative count of SenderError
@@ -234,8 +233,9 @@ type QwpBackgroundDrainer struct {
 	// recorded, or "" if no error has been recorded.
 	LastError string
 	// Failed is true if the drainer ended in the FAILED outcome
-	// (exhausted reconnect budget, auth failure, recovery error)
-	// and dropped a .failed sentinel in the slot.
+	// (auth failure, durable-ack settle exhaustion, recovery error,
+	// wedged no-progress connection) and dropped a .failed sentinel
+	// in the slot.
 	Failed bool
 }
 

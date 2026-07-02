@@ -234,6 +234,16 @@ func (c *QwpQueryClient) CurrentEndpoint() string {
 	return c.cfg.endpoints[idx].String()
 }
 
+// cleanupDrainTimeout returns the configured close-path drain bound
+// (query_close_timeout_ms / WithQwpQueryCloseTimeout); non-positive
+// (including hand-built zero-value configs) means the default.
+func (c *QwpQueryClient) cleanupDrainTimeout() time.Duration {
+	if c.cfg == nil || c.cfg.closeDrainTimeout <= 0 {
+		return qwpQueryCleanupDrainTimeout
+	}
+	return c.cfg.closeDrainTimeout
+}
+
 // QwpBindFunc populates the typed bind parameters for a single Query
 // or Exec call. The function is invoked on the caller's goroutine
 // before the query is submitted. Setters must be invoked in strictly
@@ -520,6 +530,14 @@ func WithQwpQueryReplayExec(enabled bool) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.replayExec = enabled }
 }
 
+// WithQwpQueryCloseTimeout bounds the close-path cleanup drain (cursor
+// Close, iterator break-out) before the connection is declared desynced.
+// Equivalent to the query_close_timeout_ms connect-string key; default 5s.
+// A non-positive argument leaves the default.
+func WithQwpQueryCloseTimeout(d time.Duration) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.closeDrainTimeout = d }
+}
+
 // WithQwpQueryTlsInsecureSkipVerify enables TLS but skips certificate
 // validation. Intended for testing only.
 func WithQwpQueryTlsInsecureSkipVerify() QwpQueryClientOption {
@@ -669,7 +687,7 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	// independent of the user's so the dispatcher's exit waits a fixed
 	// budget regardless of what the caller's deadline says.
 	cleanupCtx, cancel := context.WithTimeout(
-		context.Background(), qwpQueryCleanupDrainTimeout)
+		context.Background(), c.cleanupDrainTimeout())
 	defer cancel()
 	if oldIO := c.io(); oldIO != nil {
 		_ = oldIO.shutdown(cleanupCtx)
@@ -977,7 +995,7 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryO
 			// from reqId).
 			session.requestCancel()
 			cleanupCtx, cleanupCancel := context.WithTimeout(
-				context.Background(), qwpQueryCleanupDrainTimeout)
+				context.Background(), c.cleanupDrainTimeout())
 			if drainErr := drainUntilTerminal(cleanupCtx, c.io()); drainErr != nil {
 				// The drain abandoned before a terminal frame: leftover
 				// events stay queued on the single-stream wire. Latch so a
@@ -1025,7 +1043,7 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryO
 			ev.batch.release()
 			session.requestCancel()
 			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(), qwpQueryCleanupDrainTimeout)
+				context.Background(), c.cleanupDrainTimeout())
 			if drainErr := drainUntilTerminal(cleanupCtx, c.io()); drainErr != nil {
 				// Drain abandoned mid-result-set: leftover RESULT_BATCH /
 				// RESULT_END frames stay queued on the wire. Latch so a pool
@@ -1425,7 +1443,7 @@ func (q *QwpQuery) cancelAndDrainOnCleanupCtx() {
 		}
 	}
 	cleanupCtx, cancel := context.WithTimeout(
-		context.Background(), qwpQueryCleanupDrainTimeout)
+		context.Background(), q.client.cleanupDrainTimeout())
 	defer cancel()
 	if err := drainUntilTerminal(cleanupCtx, q.client.io()); err != nil {
 		q.drainFailed.Store(true)

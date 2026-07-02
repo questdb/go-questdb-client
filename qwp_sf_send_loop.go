@@ -51,24 +51,34 @@ const (
 	// time.Timer that often costs a sizable fraction of a core per idle
 	// sender, so the Go port parks 1ms. Parity of the constant is not
 	// parity of cost.
-	qwpSfDefaultParkInterval            = 1 * time.Millisecond
+	qwpSfDefaultParkInterval = 1 * time.Millisecond
+	// qwpSfDefaultReconnectMaxDuration bounds ONLY the blocking sync
+	// initial connect (qwpSfConnectWithRetry). The running loop, async
+	// initial connect, and drainers retry unbounded (Invariant B).
 	qwpSfDefaultReconnectMaxDuration    = 5 * time.Minute
 	qwpSfDefaultReconnectInitialBackoff = 100 * time.Millisecond
 	qwpSfDefaultReconnectMaxBackoff     = 5 * time.Second
 	qwpDurableAckKeepaliveDefault       = 200 * time.Millisecond
+	// qwpSfReconnectWarnThrottle rate-limits the running loop's outage
+	// WARN lines: a failover window can last minutes and is retried
+	// indefinitely, so per-attempt logging would flood.
+	qwpSfReconnectWarnThrottle = 5 * time.Second
 )
 
 // qwpSfMaxSilentConnStrikes is the number of consecutive ACK-less
-// connections the never-ACKed terminal heuristic in run() tolerates
-// before declaring the server incompatible and stopping retries. A
-// single connection that sends frames and is met with silence is
-// indistinguishable from a routine server restart or LB RST landing
-// in the window between a fresh sender's first frame and its first
-// ACK, so that strike triggers an ordinary reconnect+replay. Reaching
-// this many strikes means at least one full reconnect+replay cycle
-// has also met nothing but silence — strong evidence the server isn't
-// speaking our wire-format dialect. Go-only: there is no Java
-// counterpart.
+// connections after which run() starts warning that the server is
+// likely running an incompatible build. A single connection that
+// sends frames and is met with silence is indistinguishable from a
+// routine server restart or LB RST landing in the window between a
+// fresh sender's first frame and its first ACK; from this many
+// strikes on, at least one full reconnect+replay cycle has also met
+// nothing but silence. The condition stays non-terminal (Invariant B:
+// a rolling upgrade clears it once peers converge) — each strike pays
+// a growing backoff so the dial-send-drop cycle cannot hammer the
+// server, and the throttled WARN names the real condition so a
+// persistent client/server incompatibility is diagnosable. Go-only:
+// in Java the same skew surfaces as a version-mismatch connect error,
+// which its connectLoop likewise retries indefinitely.
 const qwpSfMaxSilentConnStrikes = 2
 
 // qwpSfReconnectFactory is invoked by the send loop on a wire
@@ -96,10 +106,10 @@ type qwpSfReconnectFactory func(ctx context.Context, idx int) (*qwpTransport, er
 //     engine.engineAcknowledge(fsnAtZero+N) so the segment
 //     manager can trim fully-acked segments.
 //  3. On wire failure, runs the configured reconnect policy:
-//     backoff with jitter up to reconnectMaxDuration, with
-//     auth-style failures (401/403/non-101 upgrade reject)
-//     treated as terminal. On reconnect success, repositions the
-//     cursor at ackedFsn+1 and replays.
+//     capped equal-jitter exponential backoff with no wall-clock
+//     limit (Invariant B), with auth-style failures (401/403/non-101
+//     upgrade reject) treated as terminal. On reconnect success,
+//     repositions the cursor at ackedFsn+1 and replays.
 //
 // No locks on the steady-state path. The producer goroutine writes
 // into the engine; the I/O goroutine reads. publishedFsn is the
@@ -135,6 +145,10 @@ type qwpSfSendLoop struct {
 	// matches the Java client's "no reconnect" mode).
 	reconnectFactory qwpSfReconnectFactory
 
+	// reconnectMaxDuration is retained for constructor parity but never
+	// consulted by the running loop: reconnect_max_duration_millis bounds
+	// only the blocking sync initial connect (qwpSfConnectWithRetry),
+	// never a running loop or drainer (Invariant B).
 	reconnectMaxDuration    time.Duration
 	reconnectInitialBackoff time.Duration
 	reconnectMaxBackoff     time.Duration
@@ -251,9 +265,9 @@ type qwpSfSendLoop struct {
 	// lastTerminalServerError is the typed-payload sibling to
 	// lastError. Set when recordFatalServerError is called with a
 	// fully-populated *SenderError (server-rejection path, WS
-	// terminal close, auth-terminal upgrade, reconnect-budget
-	// exhaustion). Independent of lastError so QwpSender accessors
-	// can return the typed payload without an errors.As walk.
+	// terminal close, auth-terminal upgrade). Independent of
+	// lastError so QwpSender accessors can return the typed payload
+	// without an errors.As walk.
 	lastTerminalServerError atomic.Pointer[SenderError]
 
 	// Counters.
@@ -301,12 +315,13 @@ type qwpSfSendLoop struct {
 	// silentConnStrikes counts consecutive connections that sent at
 	// least one frame and ended while totalAcks was still 0 — i.e.
 	// ACK-less drops on a sender that has never once been ACK'd. The
-	// silent-drop guard in run() declares the server incompatible
-	// (and stops retrying) once this reaches qwpSfMaxSilentConnStrikes;
-	// a lone restart/RST in the first-frame→first-ACK window stays
-	// below the threshold and reconnects+replays. No reset is needed:
-	// the guard's totalAcks == 0 precondition makes this counter
-	// unreachable — and thus frozen — the moment any ACK lands.
+	// silent-drop guard in run() pays a growing backoff per strike
+	// (throttling the dial-send-drop cycle) and, from
+	// qwpSfMaxSilentConnStrikes on, warns that the server is likely
+	// an incompatible build; it never terminates (Invariant B). No
+	// reset is needed: the guard's totalAcks == 0 precondition makes
+	// this counter unreachable — and thus frozen — the moment any ACK
+	// lands.
 	silentConnStrikes atomic.Int64
 
 	// Reconnect-loop status, exposed so engineAppendBlocking can
@@ -942,9 +957,8 @@ func (l *qwpSfSendLoop) run() {
 		}
 		// Detect "server up, accepts the WS upgrade, but doesn't speak
 		// our QWP protocol" — the dial succeeds every time, so plain
-		// reconnect-with-backoff would hammer the server in a hot
-		// loop until reconnectMaxDuration expires (5 min default),
-		// burning thousands of ephemeral ports per second.
+		// reconnect would hammer the server in a hot dial-send-drop
+		// cycle with no round-boundary backoff to pay.
 		//
 		// Gate on *lifetime* ACK history (totalAcks), not the per-
 		// connection counter: once any ACK has been observed across
@@ -953,52 +967,29 @@ func (l *qwpSfSendLoop) run() {
 		// transient outage (LB drain emitting WS 1001 GoingAway, TCP
 		// RST surfacing as 1006, proxy reset, graceful 1011/1012/
 		// 1013 — none of which are flagged terminal by
-		// qwpSfIsTerminalCloseCode) and reconnect is the right
-		// reaction. The never-ACK'd case is the terminal candidate
-		// here: the port-hammering signature is a fresh sender whose
-		// every dial succeeds and every frame is met with silence,
-		// repeatedly. The strike-count gate below decides when that
-		// pattern has repeated enough to be conclusive.
+		// qwpSfIsTerminalCloseCode) and immediate reconnect is the
+		// right reaction. Under Invariant B the never-ACK'd signature
+		// is NOT terminal — an in-flight rolling upgrade clears it —
+		// so each strike pays a growing backoff to throttle the cycle,
+		// and from qwpSfMaxSilentConnStrikes on a throttled WARN names
+		// the likely incompatible build so a persistent skew is
+		// diagnosable.
 		if l.framesSentOnConn.Load() > 0 && l.totalAcks.Load() == 0 {
-			// This connection finished the WS upgrade and the X-QWP-
-			// Version negotiation, sent frames, then closed without
-			// ACKing any of them — and no prior connection on this
-			// sender has ACK'd anything either.
-			//
-			// A single such strike is ambiguous: a routine server
-			// restart or LB RST landing in the window between a fresh
-			// sender's first frame and its first ACK produces the
-			// identical signature, so it counts as a strike and falls
-			// through to an ordinary reconnect+replay. Reaching
-			// qwpSfMaxSilentConnStrikes consecutive ACK-less
-			// connections — at least one full reconnect+replay cycle
-			// that still met nothing but silence — is conclusive
-			// evidence the server isn't speaking our wire-format
-			// dialect (most often: a server build older than this
-			// client's branch, even if both sides declared the same
-			// X-QWP-Version). At that point we fail terminally to
-			// avoid hammering the server with thousands of dial
-			// attempts per second until reconnectMaxDuration expires.
-			if l.silentConnStrikes.Add(1) >= qwpSfMaxSilentConnStrikes {
-				reason := fmt.Sprintf(
-					"server accepted the WebSocket upgrade but %d consecutive "+
-						"connection(s) disconnected without ACKing any of the "+
-						"frames we sent — server is likely running an incompatible "+
-						"build (won't retry): %s",
-					l.silentConnStrikes.Load(), err.Error())
-				se := l.qwpSfBuildBudgetExhaustedSE(reason)
-				l.totalServerErrors.Add(1)
-				// Announce the outage before the terminal event and stamp the
-				// real attempt count, matching the genuine budget-exhausted path.
-				l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
-				l.emitConn(SenderReconnectBudgetExhausted, -1, -1, l.eventAttempt(), err)
-				l.recordFatalServerError(se)
-				l.dispatcher.Load().offer(se)
+			strikes := l.silentConnStrikes.Add(1)
+			if strikes >= qwpSfMaxSilentConnStrikes {
+				log.Printf("[WARN] qwp/sf: %d consecutive connection(s) accepted "+
+					"the WebSocket upgrade, took our frames, then disconnected "+
+					"without ACKing any — the server is likely running an "+
+					"incompatible build; retrying with backoff (rolling-upgrade "+
+					"window): %v", strikes, err)
+			}
+			if !qwpSfSleepInterruptible(l.ctx, nil,
+				qwpSfComputeBackoff(int(strikes)-1, l.reconnectInitialBackoff, l.reconnectMaxBackoff)) {
 				return
 			}
-			// Fall through to reconnect+replay. If the next connection
-			// also sends frames and meets silence the strike count
-			// crosses the threshold and we HALT then.
+			if !l.running.Load() {
+				return
+			}
 		}
 		// The wire dropped; announce the outage before the reconnect walk.
 		l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
@@ -1646,13 +1637,17 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 }
 
 // connectWithBackoff runs the failover.md §13.6 round-walk through
-// qwpSfRunRoundWalk: each iteration demotes a just-failed host
-// (previousIdx), picks the highest-priority unattempted endpoint,
-// dials it, and classifies the outcome. Round-boundary sleep pays
-// equal-jitter exponential backoff for transport rounds and a
-// non-doubling InitialBackoff for role-reject rounds. Returns true
-// on a successful bind (caller resumes the pump loop), false on
-// terminal failure / budget exhaustion / shutdown.
+// qwpSfRunRoundWalk in unbounded mode: each iteration demotes a
+// just-failed host (previousIdx), picks the highest-priority
+// unattempted endpoint, dials it, and classifies the outcome.
+// Round-boundary sleep pays capped equal-jitter exponential backoff
+// for every round shape — role-reject rounds included. The walk
+// retries until success, a genuine terminal (auth, non-421 upgrade
+// reject, durable-ack mismatch), or shutdown; it never gives up on a
+// wall clock (Invariant B: reconnect_max_duration_millis bounds only
+// the blocking sync initial connect). Returns true on a successful
+// bind (caller resumes the pump loop), false on terminal failure /
+// shutdown.
 //
 // Shared between the reconnect path (phase="reconnect") and the
 // async-initial-connect path (phase="initial connect"); the phase
@@ -1682,10 +1677,13 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 	l.previousIdx = -1
 
 	var round int64
+	var lastWarnAt time.Time
 	params := qwpSfRoundWalkParams{
-		Factory:        l.reconnectFactory,
-		Tracker:        l.tracker,
-		MaxDuration:    l.reconnectMaxDuration,
+		Factory: l.reconnectFactory,
+		Tracker: l.tracker,
+		// Unbounded (Invariant B): the running loop and async initial
+		// connect retry until success, terminal, or shutdown.
+		MaxDuration:    0,
 		InitialBackoff: l.reconnectInitialBackoff,
 		MaxBackoff:     l.reconnectMaxBackoff,
 		OnAttempt: func() {
@@ -1698,7 +1696,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 				l.onEndpointFailed(idx, derr)
 			}
 		},
-		OnRoundExhausted: func() {
+		OnRoundExhausted: func(lastWasRoleReject bool) {
 			round++
 			l.connDispatcher.Load().offer(&SenderConnectionEvent{
 				Kind:            SenderAllEndpointsUnreachable,
@@ -1706,6 +1704,18 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 				RoundNumber:     round,
 				TimestampMillis: time.Now().UnixMilli(),
 			})
+			if now := time.Now(); now.Sub(lastWarnAt) >= qwpSfReconnectWarnThrottle {
+				lastWarnAt = now
+				if lastWasRoleReject {
+					log.Printf("[WARN] qwp/sf: %s round %d: every reachable endpoint "+
+						"is a replica (transient failover window); retrying with capped "+
+						"backoff — if this persists the configured address list may "+
+						"point at replicas only", phase, round)
+				} else {
+					log.Printf("[WARN] qwp/sf: %s round %d: no endpoint reachable; "+
+						"retrying with capped backoff", phase, round)
+				}
+			}
 		},
 		DurableMismatchTerminal: l.durableMismatchTerminal,
 	}
@@ -1764,18 +1774,11 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		l.recordFatal(fmt.Errorf("%s aborted: %w", phase, result.Cancelled))
 		return false
 	}
-	// Budget exhausted. Surface the underlying error chain to the
-	// dispatcher; reach into qwpSfBuildBudgetExhaustedSE so the
-	// SenderError carries the per-host snapshot. `initial` is the
-	// caller-supplied entry error (the mid-stream failure that
-	// triggered this connectWithBackoff); attach it as context.
-	reason := fmt.Sprintf("%s failed: %v (after entry error: %v)",
-		phase, result.Exhausted, initial)
-	se := l.qwpSfBuildBudgetExhaustedSE(reason)
-	l.totalServerErrors.Add(1)
-	l.emitConn(SenderReconnectBudgetExhausted, -1, -1, l.reconnectAttempts.Load(), result.Exhausted)
-	l.recordFatalServerError(se)
-	l.dispatcher.Load().offer(se)
+	// Unreachable: the walk runs unbounded, so it exits only via the
+	// three branches above. `initial` is retained in the message for
+	// the defensive latch.
+	l.recordFatal(fmt.Errorf("%s: round-walk returned no result (entry error: %v)",
+		phase, initial))
 	return false
 }
 
@@ -1950,27 +1953,6 @@ func (l *qwpSfSendLoop) qwpSfBuildProtocolViolationSE(code websocket.StatusCode,
 		AppliedPolicy:    PolicyHalt,
 		ServerStatusByte: NoStatusByte,
 		ServerMessage:    fmt.Sprintf("ws-close[%d]: %s", code, reason),
-		MessageSequence:  NoMessageSequence,
-		FromFsn:          from,
-		ToFsn:            to,
-		DetectedAt:       time.Now(),
-	}
-}
-
-// qwpSfBuildBudgetExhaustedSE constructs a typed *SenderError for
-// reconnect-budget exhaustion. Treated as a ProtocolViolation since
-// the wire is gone — the FSN span is the unacked window.
-func (l *qwpSfSendLoop) qwpSfBuildBudgetExhaustedSE(reason string) *SenderError {
-	from := l.engine.engineAckedFsn() + 1
-	to := l.engine.enginePublishedFsn()
-	if to < from {
-		to = from
-	}
-	return &SenderError{
-		Category:         CategoryProtocolViolation,
-		AppliedPolicy:    PolicyHalt,
-		ServerStatusByte: NoStatusByte,
-		ServerMessage:    reason,
 		MessageSequence:  NoMessageSequence,
 		FromFsn:          from,
 		ToFsn:            to,

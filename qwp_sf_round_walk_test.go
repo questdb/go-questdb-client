@@ -1129,3 +1129,53 @@ func TestInitialConnectStaysOnPrimaryAfterTopologyChange(t *testing.T) {
 	assert.Equal(t, int64(1), rejectHits.Load(),
 		"rejecting host must be touched only by the initial round-walk")
 }
+
+// TestRoundWalkRoleRejectBackoffGrows pins the 70c706a parity fix: an
+// all-replica window pays the same growing capped backoff as any other
+// outage. The former flat InitialBackoff retry re-dialed a fresh TLS
+// handshake ~10/s per endpoint for the whole window.
+func TestRoundWalkRoleRejectBackoffGrows(t *testing.T) {
+	factory := func(context.Context, int) (*qwpTransport, error) {
+		return nil, &QwpUpgradeRejectError{StatusCode: 421, Role: "REPLICA"}
+	}
+	tracker := newQwpHostTracker(1, "", qwpTargetAny)
+	rounds := 0
+	result := qwpSfRunRoundWalk(context.Background(), nil, qwpSfRoundWalkParams{
+		Factory:        factory,
+		Tracker:        tracker,
+		MaxDuration:    700 * time.Millisecond,
+		InitialBackoff: 20 * time.Millisecond,
+		MaxBackoff:     200 * time.Millisecond,
+		OnRoundExhausted: func(lastWasRoleReject bool) {
+			rounds++
+			require.True(t, lastWasRoleReject, "every sweep here ends on a role reject")
+		},
+	}, -1)
+	require.NotNil(t, result.Exhausted)
+	// The growing jittered schedule (20, 40, 80, 160, 200… ms) fits only a
+	// handful of rounds into the budget; the former flat 20ms schedule fit 20+.
+	assert.GreaterOrEqual(t, rounds, 2)
+	assert.LessOrEqual(t, rounds, 10, "role-reject rounds must pay growing backoff")
+}
+
+// TestRoundWalkUnboundedNeverExhausts pins the Invariant-B walk shape:
+// MaxDuration <= 0 retries indefinitely and exits only on success,
+// terminal, or cancellation — never Exhausted.
+func TestRoundWalkUnboundedNeverExhausts(t *testing.T) {
+	factory := func(context.Context, int) (*qwpTransport, error) {
+		return nil, errors.New("dial tcp: connect: connection refused")
+	}
+	tracker := newQwpHostTracker(1, "", qwpTargetAny)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	result := qwpSfRunRoundWalk(ctx, nil, qwpSfRoundWalkParams{
+		Factory:        factory,
+		Tracker:        tracker,
+		MaxDuration:    0,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     5 * time.Millisecond,
+	}, -1)
+	require.Nil(t, result.Exhausted, "unbounded walk must never report Exhausted")
+	require.NotNil(t, result.Cancelled, "only cancellation ends an unbounded walk against a down server")
+	assert.Greater(t, result.Attempts, 10, "walk should have kept attempting for the whole window")
+}

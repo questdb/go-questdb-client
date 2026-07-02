@@ -29,6 +29,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -450,5 +451,55 @@ func TestFirstCloseErrPrecedence(t *testing.T) {
 		if got := firstCloseErr(c.s, c.q, c.h); got != c.want {
 			t.Errorf("%s: firstCloseErr=%v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// TestQuestDBDrainerListenerAppliedToPooledSenders pins the facade half of the
+// drainer-listener surface: WithQuestDBDrainerListener reaches the orphan
+// drainers spawned by pooled senders. A durable-ack config against a
+// non-durable-advertising endpoint makes the adopted orphan's drainer fire
+// OnDurableAckUnavailable through the facade-registered listener.
+func TestQuestDBDrainerListenerAppliedToPooledSenders(t *testing.T) {
+	ctx := context.Background()
+	srv := newQuestDBTestServer(t, nil) // accepts upgrades; never advertises durable-ack
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	sfDir := t.TempDir()
+	orphan := filepath.Join(sfDir, "legacy-1") // outside the pool's in-range fence
+	{
+		engine, err := qwpSfNewCursorEngine(orphan, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+		if err != nil {
+			t.Fatalf("seed orphan: %v", err)
+		}
+		if _, err := engine.engineAppendBlocking(ctx, []byte("data")); err != nil {
+			t.Fatalf("seed orphan append: %v", err)
+		}
+		if err := engine.engineClose(); err != nil {
+			t.Fatalf("seed orphan close: %v", err)
+		}
+	}
+
+	fired := make(chan int, 64)
+	db, err := NewQuestDB(ctx,
+		"ws::addr="+addr+";sf_dir="+sfDir+";sender_id=pool;"+
+			"drain_orphans=on;request_durable_ack=on;lazy_connect=true;",
+		WithQuestDBDrainerListener(QwpBackgroundDrainerListener{
+			OnDurableAckUnavailable: func(_ string, attempt int) {
+				select {
+				case fired <- attempt:
+				default:
+				}
+			},
+		}))
+	if err != nil {
+		t.Fatalf("NewQuestDB: %v", err)
+	}
+	defer db.Close(ctx)
+
+	select {
+	case <-fired:
+	case <-time.After(10 * time.Second):
+		t.Fatal("facade-registered drainer listener never fired for the adopted orphan")
 	}
 }

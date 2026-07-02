@@ -151,6 +151,10 @@ type qwpQueryClientConfig struct {
 	// their statements are idempotent can opt in via
 	// WithQwpQueryReplayExec(true).
 	replayExec bool
+	// closeDrainTimeout bounds the close-path cleanup drain (Close,
+	// iterator break-out, Exec-on-SELECT misuse). query_close_timeout_ms;
+	// non-positive means the qwpQueryCleanupDrainTimeout default.
+	closeDrainTimeout time.Duration
 }
 
 // qwpCompressionRaw / qwpCompressionZstd / qwpCompressionAuto are the
@@ -227,6 +231,7 @@ func qwpQueryDefaultConfig() *qwpQueryClientConfig {
 		failoverMaxDuration:    qwpDefaultFailoverMaxDuration,
 		serverInfoTimeout:      qwpDefaultServerInfoTimeout,
 		authTimeoutMs:          qwpDefaultAuthTimeoutMs,
+		closeDrainTimeout:      qwpQueryCleanupDrainTimeout,
 	}
 }
 
@@ -472,6 +477,12 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid initial_credit %q: %v", v, err)
 			}
 			cfg.initialCredit = n
+		case "query_close_timeout_ms":
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			cfg.closeDrainTimeout = time.Duration(n) * time.Millisecond
 		case "compression":
 			switch v {
 			case qwpCompressionRaw, qwpCompressionZstd, qwpCompressionAuto:

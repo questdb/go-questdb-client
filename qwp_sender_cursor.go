@@ -393,11 +393,22 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			// the assignment past the loop would strand those goroutines
 			// and their connections.
 			s.drainerPool = pool
+			// Drainer dials get a finite default TCP-connect deadline when
+			// connect_timeout is unset: a black-holed SYN would otherwise
+			// ride the OS connect timeout on a goroutine only pool close can
+			// unwind. The foreground factory keeps the untimed default.
+			drainerFactory := factory
+			if opts.connectTimeoutMs <= 0 {
+				drainerOpts := opts
+				drainerOpts.connectTimeoutMs = qwpSfDrainerDefaultConnectTimeoutMs
+				drainerFactory = qwpSfBuildEndpointFactory(
+					conf.endpoints, scheme, drainerOpts, conf.dumpWriter)
+			}
 			for _, orphan := range orphans {
 				drainer := qwpSfNewOrphanDrainer(
 					orphan,
 					sfMaxBytes, sfMaxTotalBytes,
-					factory,
+					drainerFactory,
 					tracker,
 					reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff,
 				)

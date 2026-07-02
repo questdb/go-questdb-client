@@ -53,6 +53,12 @@ const (
 // DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS.
 const qwpMaxDurableAckMismatchAttempts = 16
 
+// qwpSfDrainerDefaultConnectTimeoutMs is the finite default TCP-connect
+// deadline for background-drainer dials when connect_timeout is unset.
+// An explicit connect_timeout overrides it for drainers too; the
+// foreground sender keeps the untimed OS default when unset.
+const qwpSfDrainerDefaultConnectTimeoutMs = 15_000
+
 // QwpBackgroundDrainerListener receives durable-ack drain outcomes for a crashed
 // sibling's store-and-forward slot. Callbacks must not block.
 //
@@ -74,6 +80,13 @@ type QwpBackgroundDrainerListener struct {
 	// OnDurableAckPersistentFailure fires once when a drainer gives up after
 	// repeated durable-ack mismatches and quarantines the slot (.failed).
 	OnDurableAckPersistentFailure func(dir string, attempts int, elapsed time.Duration)
+	// OnPrimaryUnavailable fires each time a full connect sweep found only
+	// role-rejecting endpoints (every reachable node is a replica or a
+	// catching-up primary). attempt is the cumulative all-replica sweep count.
+	// The window is transient — a replica gets promoted, a primary reappears —
+	// so the drainer keeps retrying indefinitely; this callback is
+	// observability only and never escalates.
+	OnPrimaryUnavailable func(dir string, attempt int)
 }
 
 // qwpDrainerListenerCall invokes a user-supplied background-drainer callback
@@ -137,11 +150,13 @@ var qwpSfDrainerPoolHardCloseGrace = 1 * time.Second
 //     publishedFsn taken at startup.
 //  4. Close everything in reverse order; release the lock.
 //
-// On terminal failure (auth-rejection, reconnect-budget exhaustion,
-// recovery error), the drainer drops a .failed sentinel into the
-// slot before exiting. Future scans skip the slot until an operator
-// clears the sentinel — bounded automatic retry, then human-in-
-// the-loop.
+// On terminal failure (auth-rejection, durable-ack settle-budget
+// exhaustion, recovery error, a wedged no-progress connection), the
+// drainer drops a .failed sentinel into the slot before exiting.
+// Future scans skip the slot until an operator clears the sentinel.
+// Transport outages and all-replica failover windows are NOT terminal:
+// the drainer retries them indefinitely with capped backoff
+// (Invariant B) — its source data is pinned on disk.
 type qwpSfOrphanDrainer struct {
 	slotPath        string
 	segmentSize     int64
@@ -163,6 +178,8 @@ type qwpSfOrphanDrainer struct {
 	durableKeepalive        time.Duration // durable keepalive-ping cadence
 	listener                QwpBackgroundDrainerListener
 	mismatchAttempts        atomic.Int64
+	roleRejectRounds        atomic.Int64
+	lastReplicaWarnUnixNano atomic.Int64
 	durableMismatchGaveUp   atomic.Bool
 	connectCancel           atomic.Pointer[context.CancelFunc]
 	startedAt               time.Time
@@ -264,6 +281,30 @@ func (d *qwpSfOrphanDrainer) recordDurableGiveUp() {
 		"durable-ack unavailable: no reachable endpoint advertised durable-ack after %d attempts", attempts))
 }
 
+// onRoundExhausted is the drainer connect-walk's sweep hook. An all-replica
+// sweep (lastWasRoleReject) proves topology churn: whatever node produced any
+// earlier durable-ack mismatches is no longer the primary the next sweep hits,
+// so the capability-gap episode restarts and the next gap gets the full settle
+// budget. The window itself is transient (Invariant B) — fire the
+// observability callback, warn throttled, and let the walk keep retrying.
+func (d *qwpSfOrphanDrainer) onRoundExhausted(lastWasRoleReject bool) {
+	if !lastWasRoleReject {
+		return
+	}
+	d.mismatchAttempts.Store(0)
+	attempt := int(d.roleRejectRounds.Add(1))
+	if fn := d.listener.OnPrimaryUnavailable; fn != nil {
+		qwpDrainerListenerCall(func() { fn(d.slotPath, attempt) })
+	}
+	now := time.Now().UnixNano()
+	if last := d.lastReplicaWarnUnixNano.Load(); now-last >= int64(qwpSfReconnectWarnThrottle) &&
+		d.lastReplicaWarnUnixNano.CompareAndSwap(last, now) {
+		log.Printf("[WARN] qwp/sf: drainer slot %s sweep %d: all endpoints are "+
+			"replicas (transient failover window), retrying with capped backoff",
+			d.slotPath, attempt)
+	}
+}
+
 // onDurableMismatch is the drainer's endpoint-failure hook: on a durable-ack
 // mismatch it counts the attempt, notifies the listener, and — once the cap is
 // hit — cancels the in-flight connect and asks the drainer to quarantine the slot.
@@ -292,7 +333,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// Convert a panic on this goroutine into the same terminal Failed
 	// outcome an explicit fault produces, so neither untrusted on-disk
 	// .sfa bytes (the CRC/recovery scan in qwpSfNewCursorEngine) nor
-	// user-supplied clientFactory code (invoked via qwpSfConnectWithRetry)
+	// user-supplied clientFactory code (invoked via qwpSfRunRoundWalk)
 	// can crash the host process — which would take down the foreground
 	// sender and every sibling drainer with it. Both run on this
 	// goroutine before the send loop's own recover is in play, so this
@@ -339,24 +380,46 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		d.outcome.Store(int32(qwpSfDrainOutcomeSuccess))
 		return
 	}
-	// Initial connect via the round-walk so the drainer immediately
-	// honours classifications the foreground tracker has already
-	// observed (e.g. host 0 is currently TopologyReject — start at
-	// host 1 instead). When d.tracker is nil, qwpSfConnectWithRetry
-	// synthesises a 1-host implicit tracker, matching the legacy
-	// behaviour single-host tests rely on.
+	// Initial connect via the round-walk, unbounded (Invariant B): a
+	// down server or an all-replica window is transient, so the walk
+	// retries with capped backoff until success, a genuine terminal
+	// (auth reject; durable settle-budget exhaustion via the
+	// onDurableMismatch cancel), or pool close. The walk also honours
+	// classifications the foreground tracker has already observed
+	// (e.g. host 0 is currently TopologyReject — start at host 1
+	// instead). When d.tracker is nil, a synthesized 1-host implicit
+	// tracker matches the legacy behaviour single-host tests rely on.
 	connectCtx, cancelConnect := context.WithCancel(ctx)
-	// Panic-safety net: on a panic in qwpSfConnectWithRetry (recovered above) the
+	// Panic-safety net: on a panic in the walk (recovered above) the
 	// inline cancelConnect() is skipped, orphaning the child ctx in the pool ctx
 	// until close. cancel is idempotent; the eager call still releases it normally.
 	defer cancelConnect()
 	d.connectCancel.Store(&cancelConnect)
-	transport, boundIdx, err := qwpSfConnectWithRetry(connectCtx, d.clientFactory, d.tracker,
-		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff,
-		!d.durableAckMode, d.onDurableMismatch)
+	initialBackoff := d.reconnectInitialBackoff
+	if initialBackoff <= 0 {
+		initialBackoff = qwpSfDefaultReconnectInitialBackoff
+	}
+	maxBackoff := d.reconnectMaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = qwpSfDefaultReconnectMaxBackoff
+	}
+	tracker := d.tracker
+	if tracker == nil {
+		tracker = newQwpHostTracker(1, "", qwpTargetAny)
+	}
+	result := qwpSfRunRoundWalk(connectCtx, nil, qwpSfRoundWalkParams{
+		Factory:                 d.clientFactory,
+		Tracker:                 tracker,
+		MaxDuration:             0,
+		InitialBackoff:          initialBackoff,
+		MaxBackoff:              maxBackoff,
+		OnEndpointFailed:        d.onDurableMismatch,
+		OnRoundExhausted:        d.onRoundExhausted,
+		DurableMismatchTerminal: !d.durableAckMode,
+	}, -1)
 	d.connectCancel.Store(nil)
 	cancelConnect()
-	if err != nil {
+	if result.Transport == nil {
 		// Gave up after repeated durable-ack mismatches: quarantine the slot.
 		if d.durableMismatchGaveUp.Load() {
 			d.recordDurableGiveUp()
@@ -369,10 +432,20 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
 			return
 		}
-		msg := err.Error()
-		d.recordFailure("initial connect: " + msg)
+		// Terminal (auth / non-retriable upgrade) — the only failure
+		// class the unbounded walk surfaces.
+		if result.Terminal != nil {
+			d.recordFailure("initial connect: " + result.Terminal.Error())
+			return
+		}
+		if result.Cancelled != nil {
+			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
+			return
+		}
+		d.recordFailure("initial connect: round-walk returned no result")
 		return
 	}
+	transport, boundIdx := result.Transport, result.Idx
 	loop := qwpSfNewSendLoop(engine, transport, d.clientFactory,
 		qwpSfDefaultParkInterval,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
@@ -401,23 +474,17 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// and accepts our frames but never ACKs and never drops the
 	// connection (wedged server, black-hole proxy, or a silently
 	// incompatible build that holds the socket open) keeps acked
-	// below target forever while sendLoopCheckError stays nil — the
-	// run()-level "frames sent, zero acks → terminal" heuristic only
-	// fires after the connection drops, which by definition never
-	// happens here. Without a bound the drainer spins on the poll
-	// interval forever and, on Close, exits Stopped (no .failed
-	// sentinel), so every future process start re-adopts the same
-	// wedged slot in full — an unbounded re-adoption livelock.
+	// below target forever while sendLoopCheckError stays nil.
+	// Without a bound the drainer spins on the poll interval forever
+	// and, on Close, exits Stopped (no .failed sentinel), so every
+	// future process start re-adopts the same wedged slot in full —
+	// an unbounded re-adoption livelock.
 	//
-	// Bound it with the same reconnectMaxDuration budget that bounds
-	// the connect round-walk (this mirrors the Java drainer's
-	// connect-phase deadline semantics — "give the cluster a budget
-	// to settle before quarantining the slot"): if acked makes no
-	// forward progress for that long while we are NOT inside a
-	// (separately bounded) reconnect, drop a .failed sentinel so the
-	// design's "bounded automatic retry, then human-in-the-loop"
-	// promise holds. A reconnect exhausting its own budget still
-	// surfaces ahead of this via sendLoopCheckError.
+	// This bounds only a LIVE-but-not-acking connection: transport
+	// outages never charge it (a reconnect window resets/pauses the
+	// clocks below), so a long server outage cannot quarantine the
+	// slot (Invariant B). reconnectMaxDuration is reused purely as the
+	// wedge-settle budget knob.
 	noProgressBudget := d.reconnectMaxDuration
 	if noProgressBudget <= 0 {
 		noProgressBudget = qwpSfDefaultReconnectMaxDuration
@@ -425,13 +492,15 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	lastProgressAcked := engine.engineAckedFsn()
 	lastProgressAcks := loop.sendLoopTotalAcks()
 	lastProgressAt := time.Now()
-	// Durable-stall clock: resets only on a genuine durable trim advance (or the
-	// pre-durable warm-up while acked is still at its start value). OK acks and
-	// reconnects defer the ordinary watchdog but not this one, so a flapping
-	// endpoint that accepts + OK-acks + drops without ever issuing
-	// STATUS_DURABLE_ACK cannot replay the same frames forever — without it,
-	// okAcks climbs on every cycle and the drainer never quarantines.
-	lastTrimAt := lastProgressAt
+	// Durable-stall clock: accumulates only live-connection time (a
+	// reconnect window pauses it without resetting what has already
+	// accumulated — anti-evasion: a flapping endpoint that accepts +
+	// OK-acks + drops without ever issuing STATUS_DURABLE_ACK cannot
+	// evade the bound by reconnect-cycling) and zeroes only on a
+	// genuine durable trim advance. Without it, okAcks climbs on every
+	// cycle and the drainer never quarantines.
+	durableStallElapsed := time.Duration(0)
+	lastStallSampleAt := lastProgressAt
 	for {
 		acked := engine.engineAckedFsn()
 		d.ackedFsn.Store(acked)
@@ -441,11 +510,15 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		}
 		// Check the mismatch cap before the generic wire error so a
 		// mismatch-driven give-up surfaces as such (and fires the listener),
-		// rather than being masked by a coincident reconnect-budget error.
+		// rather than being masked by a coincident terminal wire error.
 		if d.durableMismatchGaveUp.Load() {
 			d.recordDurableGiveUp()
 			return
 		}
+		// The running loop latches only genuine terminals (auth,
+		// protocol-violation close codes, corrupt segment, durable-ack
+		// mismatch) — transport outages reconnect indefinitely and never
+		// reach here.
 		if err := loop.sendLoopCheckError(); err != nil {
 			d.recordFailure("wire: " + err.Error())
 			return
@@ -467,6 +540,13 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		now := time.Now()
 		reconnecting, _, _ := loop.sendLoopReconnectStatus()
 		okAcks := loop.sendLoopTotalAcks()
+		// A transport window pauses the durable-stall clock: only
+		// live-connection time is charged, so a long outage cannot burn
+		// the settle budget (Invariant B).
+		if !reconnecting {
+			durableStallElapsed += now.Sub(lastStallSampleAt)
+		}
+		lastStallSampleAt = now
 		if acked > lastProgressAcked || reconnecting ||
 			(d.durableAckMode && okAcks > lastProgressAcks) {
 			// A durable trim advance (acked moves in durable mode) proves a
@@ -480,19 +560,19 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 				d.mismatchAttempts.Store(0)
 			}
 			if acked > lastProgressAcked {
-				lastTrimAt = now
+				durableStallElapsed = 0
 			}
 			lastProgressAcked = acked
 			lastProgressAcks = okAcks
 			lastProgressAt = now
 		}
 		// In durable mode the trim watermark moves only on STATUS_DURABLE_ACK,
-		// which can lag past one reconnect budget even after every frame is OK-acked
-		// and okAcks has plateaued, so gate quarantine on the wider durable-stall
-		// clock (lastTrimAt), not the no-progress budget on lastProgressAt.
+		// which can lag long after every frame is OK-acked and okAcks has
+		// plateaued, so gate quarantine on the wider durable-stall clock,
+		// not the no-progress budget on lastProgressAt.
 		if d.durableAckMode {
-			if now.Sub(lastTrimAt) >= qwpSfDurableStallFactor*noProgressBudget {
-				d.recordFailure(d.noProgressReason(acked, target, okAcks, now.Sub(lastTrimAt)))
+			if durableStallElapsed >= qwpSfDurableStallFactor*noProgressBudget {
+				d.recordFailure(d.noProgressReason(acked, target, okAcks, durableStallElapsed))
 				return
 			}
 		} else if now.Sub(lastProgressAt) >= noProgressBudget {
