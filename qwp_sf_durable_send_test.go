@@ -183,6 +183,85 @@ func TestQwpDurableAckSeqGapHalts(t *testing.T) {
 	}
 }
 
+// TestQwpDurableAckPreSendDropKeepsDensity pins the fix for the pre-send DROP
+// density hole. A DropAndContinue rejection processed while no frame has been
+// fully sent (highestFullySent < 0) must still advance the durable density
+// high-water mark; skipping it strands lastSeq behind so the next dense OK ack
+// trips a spurious PROTOCOL_VIOLATION gap HALT — which in memory mode drops the
+// in-RAM tail on the forced close+rebuild. The server rejects a phantom wire
+// seq 0 before the client sends anything, then OK-acks the real frame as seq 1
+// (the phantom consumed seq 0); the client must treat that as dense, not a gap.
+func TestQwpDurableAckPreSendDropKeepsDensity(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		// Phantom pre-send rejection of wire seq 0, before any client frame.
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckError(QwpStatusParseError, 0, "phantom pre-send reject"))
+		if _, _, err := conn.Read(ctx); err != nil { // the real frame (wire seq 0)
+			return
+		}
+		// The phantom rejection consumed seq 0, so the real frame is acked seq 1.
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(1, ackTableEntry{"trades", 0}))
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckDurable(ackTableEntry{"trades", 0}))
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	dropProcessed := make(chan struct{}, 1)
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	s, err := NewLineSender(ctx,
+		WithQwp(), WithAddress(addr),
+		WithRequestDurableAck(true),
+		WithDurableAckKeepaliveInterval(0),
+		WithErrorPolicy(CategoryParseError, PolicyDropAndContinue),
+		WithErrorHandler(func(e *SenderError) {
+			if e.Category == CategoryParseError {
+				select {
+				case dropProcessed <- struct{}{}:
+				default:
+				}
+			}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewLineSender: %v", err)
+	}
+	defer s.Close(ctx)
+	qs := s.(QwpSender)
+
+	// Wait until the pre-send rejection has been processed — highestFullySent is
+	// still -1 because nothing has been flushed yet — then send the real frame.
+	select {
+	case <-dropProcessed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-send DROP was never delivered to the error handler")
+	}
+
+	if err := s.Table("trades").Int64Column("v", 1).AtNow(ctx); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := qs.FlushAndGetSequence(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := qs.AwaitAckedFsn(waitCtx, 0); err != nil {
+		t.Fatalf("AwaitAckedFsn after a pre-send DROP: %v; the durable watermark must "+
+			"advance without a spurious sequence-gap HALT", err)
+	}
+}
+
 // newQwpPingGatedDurableServer stands in for a durable-ack primary that flushes
 // the covering STATUS_DURABLE_ACK only AFTER it has observed a client ping, not
 // on a wall-clock timer. OnPingReceived (driven by conn.Read processing the

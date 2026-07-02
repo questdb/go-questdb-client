@@ -1413,6 +1413,27 @@ func (l *qwpSfSendLoop) durableDrain() {
 	}
 }
 
+// durableRejectionSeqGap records a rejection's wire sequence in the durable
+// density tracker and returns a terminal PROTOCOL_VIOLATION if it skips forward
+// (a coalesced/dropped OK ack). A rejection consumes a wire sequence like an OK
+// ack, so both the pre-send and the normal rejection path must advance the
+// tracker's high-water mark; skipping it on either would strand lastSeq behind
+// and trip a spurious gap HALT on the next dense ack. No-op outside durable mode.
+func (l *qwpSfSendLoop) durableRejectionSeqGap(seq int64) *SenderError {
+	if !l.durableAckMode {
+		return nil
+	}
+	expected, gap := l.durable.seqGap(seq)
+	if !gap {
+		return nil
+	}
+	gapSE := l.qwpSfBuildDurableGapSE(seq, expected)
+	l.totalServerErrors.Add(1)
+	l.recordFatalServerError(gapSE)
+	l.dispatcher.Load().offer(gapSE)
+	return gapSE
+}
+
 // receiverLoop reads ACKs from the WebSocket and routes them to
 // the engine. Returns ctx.Err() on shutdown or the transport's
 // read error on wire failure.
@@ -1488,6 +1509,9 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				// on this connection to drop. Still surface the
 				// typed error so HALT latches and the handler fires.
 				// Mirrors handlePreSendRejection in the Java client.
+				if se := l.durableRejectionSeqGap(seq); se != nil {
+					return se
+				}
 				from := l.engine.engineAckedFsn() + 1
 				to := l.engine.enginePublishedFsn()
 				if to < from {
@@ -1517,17 +1541,8 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				cappedSeq = highestSent
 			}
 			fsn := l.fsnAtZero.Load() + cappedSeq
-			// A rejection consumes a wire sequence too; in durable mode a forward
-			// gap here means the server coalesced/dropped an OK ack for a sent
-			// frame, so HALT fail-closed before enqueueEmpty advances past it.
-			if l.durableAckMode {
-				if expected, gap := l.durable.seqGap(seq); gap {
-					gapSE := l.qwpSfBuildDurableGapSE(seq, expected)
-					l.totalServerErrors.Add(1)
-					l.recordFatalServerError(gapSE)
-					l.dispatcher.Load().offer(gapSE)
-					return gapSE
-				}
+			if se := l.durableRejectionSeqGap(seq); se != nil {
+				return se
 			}
 			se := &SenderError{
 				Category:         cat,

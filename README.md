@@ -58,6 +58,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 
 	qdb "github.com/questdb/go-questdb-client/v4"
 )
@@ -69,7 +70,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer db.Close(ctx)
+	defer func() {
+		if err := db.Close(ctx); err != nil {
+			log.Printf("questdb close: %v", err)
+		}
+	}()
 
 	// Ingest: borrow a sender, write rows, Close returns it to the pool.
 	sender, err := db.BorrowSender(ctx)
@@ -94,7 +99,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer query.Close()
+	defer func() {
+		if err := query.Close(); err != nil {
+			log.Printf("query close: %v", err)
+		}
+	}()
 
 	cursor := query.Query(ctx, "SELECT symbol, price FROM trades LIMIT 10")
 	defer cursor.Close()
@@ -157,6 +166,7 @@ db, err := qdb.NewQuestDB(ctx, "ws::addr=localhost:9000;",
 | `max_lifetime_ms` | `WithMaxLifetime` | `1800000` | Max age before an *above-`min`* idle connection is recycled by the reaper (`0` = no limit). Connections within the `min` floor are not age-recycled — with `min == max` this knob is inert (QWP self-reconnects on a dropped wire regardless). |
 | `housekeeper_interval_ms` | `WithHousekeeperInterval` | `5000` | Reaper sweep interval. |
 | `lazy_connect` | `WithLazyConnect` | `off` | Tolerate a down server at startup (see below). |
+| `connect_timeout` | `WithConnectTimeout` | OS default | Per-dial TCP connect timeout in milliseconds, common to ingest and query (`0` = keep the OS default). |
 
 Unlike the Java client's facade, the Go `QuestDB` handle accepts the ingest
 error handler and connection listener directly via
@@ -281,7 +291,13 @@ err = qs.
 `GeohashColumn`, `Int64Array1DColumn` / `2D` / `3D`, `Decimal64Column` /
 `Decimal128Column` / `Decimal256Column`, and `AtNano`, plus the
 acknowledgement and observability accessors (`AwaitAckedFsn`,
-`FlushAndGetSequence`, `TotalReconnectAttempts`, `LastTerminalError`, …).
+`FlushAndGetSequence`, `TotalReconnectAttempts`, `LastTerminalError`,
+`TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`).
+
+> This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`, and
+> `DroppedConnectionNotifications` to the `QwpSender` interface. Every built-in
+> transport is updated; this is source-breaking only for external code that
+> implements `QwpSender` directly (callers that type-assert to it are unaffected).
 
 ### N-dimensional arrays
 

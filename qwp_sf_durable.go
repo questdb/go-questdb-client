@@ -176,9 +176,12 @@ func (t *qwpDurableTracker) drain() int64 {
 // goroutine may still be reading out of an mmap'd segment: a forged/early durable
 // ack naming an in-flight frame is held back until the send completes and
 // highestFullySent catches up — mirroring the non-durable applyAckWatermark
-// clamp. Entries are enqueued in ascending wireSeq order, so the first entry
-// above the ceiling ends the scan and the returned value — the last popped
-// wireSeq — is therefore also the maximum popped. This scan only guards its own
+// clamp. Under the one-OK-ack-per-frame contract entries are enqueued in
+// ascending wireSeq order, so the first entry above the ceiling ends the scan
+// and the last popped wireSeq is the maximum popped. A contract-violating
+// out-of-order enqueue could make the returned value trail the true max, but
+// engineAcknowledge's monotonic clamp discards a low value, so it only ever
+// under-advances — never past a not-yet-durable frame. This scan only guards its own
 // queue: a negative or out-of-order seq in t.pending at worst stops it early and
 // skips an advance. It does NOT harden against a server that gaps the OK-ack
 // sequence — one coalescing ACKs (a cumulative seq skipping frames, with a

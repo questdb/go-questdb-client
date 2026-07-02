@@ -290,9 +290,18 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	}
 
 	// Every pooled sender invokes these callbacks on its own dispatcher goroutine,
-	// so serialize them across the pool to keep the single-goroutine contract.
+	// so serialize them across the pool to keep the single-goroutine contract. When
+	// the caller registers none, install the loud default here so the pool emits
+	// one serialized event stream instead of an independent default per slot — a
+	// standalone sender emits a single stream, and the pool should too.
 	errorHandler := serializeErrorHandler(cfg.errorHandler)
+	if errorHandler == nil {
+		errorHandler = serializeErrorHandler(defaultSenderErrorHandler)
+	}
 	connectionListener := serializeConnectionListener(cfg.connectionListener)
+	if connectionListener == nil {
+		connectionListener = serializeConnectionListener(defaultSenderConnectionListener)
+	}
 
 	// Build both pools + the housekeeper, teardown-hardened: on any failure
 	// close what was already built, in reverse order (Hazard I at the facade).
