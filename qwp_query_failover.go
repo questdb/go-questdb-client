@@ -317,6 +317,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			authorization:         cfg.effectiveAuthorization(),
 			maxBatchRows:          cfg.maxBatchRows,
 			acceptEncoding:        cfg.buildAcceptEncodingHeader(),
+			clientId:              cfg.clientID,
 			// QWP has a single protocol version; advertise it. The
 			// server always emits SERVER_INFO post-upgrade and the
 			// egress client reads it (serverInfoTimeout > 0).

@@ -135,7 +135,11 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 		if len(p.all)+p.inFlightCreations < p.maxSize {
 			p.inFlightCreations++
 			p.mu.Unlock()
-			w, err := p.createWorker(ctx)
+			// Bound the dial by the acquire deadline (sender-pool / HikariCP parity)
+			// so a black-holed server is abandoned within acquire_timeout_ms.
+			bctx, cancel := context.WithDeadline(ctx, deadline)
+			w, err := p.createWorker(bctx)
+			cancel()
 			p.mu.Lock()
 			p.inFlightCreations--
 			if err != nil {

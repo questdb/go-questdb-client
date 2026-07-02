@@ -55,7 +55,6 @@ const (
 	qwpSfDefaultReconnectMaxDuration    = 5 * time.Minute
 	qwpSfDefaultReconnectInitialBackoff = 100 * time.Millisecond
 	qwpSfDefaultReconnectMaxBackoff     = 5 * time.Second
-	qwpSfReconnectLogThrottleInterval   = 5 * time.Second // throttle "attempt N failed" logs
 	qwpDurableAckKeepaliveDefault       = 200 * time.Millisecond
 )
 
@@ -1372,20 +1371,28 @@ func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) *SenderError {
 		log.Printf("[WARN] qwp/sf: server ACK wire seq %d exceeds highest sent %d, clamping", seq, assigned)
 		seq = assigned
 	}
-	l.durable.enqueueOk(seq, tail)
+	if !l.durable.enqueueOk(seq, tail) {
+		return l.qwpSfBuildDurableCapSE(seq)
+	}
 	l.durableDrain()
 	return nil
 }
 
-// qwpSfBuildDurableGapSE builds the terminal PROTOCOL_VIOLATION surfaced when
-// the durable OK-ack sequence jumps forward (durableOnOk / the DROP path). The
-// unacked [ackedFsn+1, publishedFsn] span is attributed as lost.
-func (l *qwpSfSendLoop) qwpSfBuildDurableGapSE(gotSeq, expectedSeq int64) *SenderError {
-	from := l.engine.engineAckedFsn() + 1
-	to := l.engine.enginePublishedFsn()
+// durableUnackedSpan is the [ackedFsn+1, publishedFsn] window a terminal
+// durable-ack fault attributes as lost.
+func (l *qwpSfSendLoop) durableUnackedSpan() (from, to int64) {
+	from = l.engine.engineAckedFsn() + 1
+	to = l.engine.enginePublishedFsn()
 	if to < from {
 		to = from
 	}
+	return from, to
+}
+
+// qwpSfBuildDurableGapSE builds the terminal PROTOCOL_VIOLATION surfaced when
+// the durable OK-ack sequence jumps forward (durableOnOk / the DROP path).
+func (l *qwpSfSendLoop) qwpSfBuildDurableGapSE(gotSeq, expectedSeq int64) *SenderError {
+	from, to := l.durableUnackedSpan()
 	return &SenderError{
 		Category:         CategoryProtocolViolation,
 		AppliedPolicy:    PolicyHalt,
@@ -1393,6 +1400,25 @@ func (l *qwpSfSendLoop) qwpSfBuildDurableGapSE(gotSeq, expectedSeq int64) *Sende
 		ServerMessage: fmt.Sprintf("durable-ack OK sequence gap: got %d, expected %d — server "+
 			"coalesced or dropped an OK ack, leaving frames untracked for durable trimming", gotSeq, expectedSeq),
 		MessageSequence: gotSeq,
+		FromFsn:         from,
+		ToFsn:           to,
+		DetectedAt:      time.Now(),
+	}
+}
+
+// qwpSfBuildDurableCapSE builds the terminal PROTOCOL_VIOLATION surfaced when a
+// server streams more distinct table names than qwpDurableMaxTrackedTables, so
+// the tracker can no longer intern them and would otherwise trim on a truncated
+// table set.
+func (l *qwpSfSendLoop) qwpSfBuildDurableCapSE(seq int64) *SenderError {
+	from, to := l.durableUnackedSpan()
+	return &SenderError{
+		Category:         CategoryProtocolViolation,
+		AppliedPolicy:    PolicyHalt,
+		ServerStatusByte: NoStatusByte,
+		ServerMessage: fmt.Sprintf("durable-ack tracked-table cap (%d) exceeded at wire seq %d — "+
+			"server streamed more distinct table names than any real workload", qwpDurableMaxTrackedTables, seq),
+		MessageSequence: seq,
 		FromFsn:         from,
 		ToFsn:           to,
 		DetectedAt:      time.Now(),
@@ -1572,7 +1598,14 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// preceding OK batch is durable. Otherwise advance the engine
 			// directly. Bump totalAcks for parity with the success path.
 			if l.durableAckMode {
-				l.durable.enqueueEmpty(cappedSeq)
+				// Clamp to the highest assigned seq (as durableOnOk does) so the empty
+				// entry stays monotonic with the dense OK sequence; durableDrain's
+				// highestFullySent ceiling still gates the advance.
+				dropSeq := seq
+				if assigned := l.nextWireSeq.Load() - 1; dropSeq > assigned {
+					dropSeq = assigned
+				}
+				l.durable.enqueueEmpty(dropSeq)
 				l.durableDrain()
 			} else {
 				l.engine.engineAcknowledge(fsn)

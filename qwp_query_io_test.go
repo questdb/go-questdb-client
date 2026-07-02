@@ -237,6 +237,62 @@ func parseQueryRequest(t *testing.T, frame []byte) (int64, string, int64) {
 
 // --- Tests ---
 
+// A new query whose first RESULT_BATCH is a continuation (batch_seq > 0) must be
+// rejected, not decoded with the PRIOR query's held schema. The dispatcher calls
+// resetQuerySchema at the start of every query; without it, Q1's schema silently
+// decodes Q2's continuation into bogus rows on a reused pooled connection.
+// Revert-proof: dropping that reset turns the Error below into a leaked Batch.
+func TestQwpEgressIOResetQuerySchemaRejectsLeakedContinuation(t *testing.T) {
+	const q1ReqID = int64(21)
+	const q2ReqID = int64(22)
+
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		m.readBinary(ctx)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, q1ReqID, 0, "v", 100))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(q1ReqID, 0, 1)))
+
+		m.readBinary(ctx)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, q2ReqID, 1, "v", 999))
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+
+	io := newQwpEgressIO(tr, 2)
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT v FROM t", requestId: q1ReqID}); err != nil {
+		t.Fatalf("submitQuery q1: %v", err)
+	}
+	batchEv := takeEventOrFail(t, io, 2*time.Second)
+	if batchEv.kind != qwpEventKindBatch {
+		t.Fatalf("q1 first event = %v, want Batch (errMsg=%q)", batchEv.kind, batchEv.errMessage)
+	}
+	batchEv.batch.release()
+	if endEv := takeEventOrFail(t, io, 2*time.Second); endEv.kind != qwpEventKindEnd {
+		t.Fatalf("q1 second event = %v, want End", endEv.kind)
+	}
+
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT v FROM t2", requestId: q2ReqID}); err != nil {
+		t.Fatalf("submitQuery q2: %v", err)
+	}
+	ev := takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindTransportError {
+		t.Fatalf("q2 first event = %v, want TransportError (a leaked prior-query schema decoded the continuation as a bogus Batch)", ev.kind)
+	}
+	if !strings.Contains(ev.errMessage, "continuation") {
+		t.Errorf("q2 error = %q, want a continuation-before-schema decode error", ev.errMessage)
+	}
+}
+
 // TestQwpEgressIOHappyPathSelect drives a SELECT-style sequence: the
 // mock sends RESULT_BATCH + RESULT_BATCH + RESULT_END; the I/O loop
 // decodes and surfaces Batch, Batch, End in order.

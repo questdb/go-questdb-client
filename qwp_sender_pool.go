@@ -398,23 +398,31 @@ func (p *qwpSenderPool) reapIdle() {
 		return
 	}
 	toClose := p.selectReapVictims(time.Now())
-	for _, slot := range toClose {
-		closeErr := closeSlotGuarded(context.Background(), slot.delegate)
-		if closeErr != nil {
-			// Autonomous reap has no caller to return this to (the producer long
-			// since returned its lease), so surface it here — it may be the
-			// "data may be lost" drain timeout.
-			log.Printf("[WARN] qwp pool: reaping a slot failed to drain cleanly: %v", closeErr)
+	if len(toClose) == 0 {
+		return
+	}
+	// Close concurrently so an N-slot sweep during an outage is bounded by one
+	// close_flush_timeout, not N — otherwise it overruns the housekeeper join
+	// budget and the reap outlives QuestDB.Close, holding SF flocks past return.
+	var wg sync.WaitGroup
+	errs := make([]error, len(toClose))
+	for i, slot := range toClose {
+		wg.Add(1)
+		go func(i int, delegate QwpSender) {
+			defer wg.Done()
+			errs[i] = closeSlotGuarded(context.Background(), delegate)
+		}(i, slot.delegate)
+	}
+	wg.Wait()
+	p.mu.Lock()
+	for i, slot := range toClose {
+		if errs[i] != nil {
+			log.Printf("[WARN] qwp pool: reaping a slot failed to drain cleanly: %v", errs[i])
 		}
-		p.mu.Lock()
-		p.reclaimSlotLocked(slot, closeErr)
-		p.mu.Unlock()
+		p.reclaimSlotLocked(slot, errs[i])
 	}
-	if len(toClose) > 0 {
-		p.mu.Lock()
-		p.broadcastLocked()
-		p.mu.Unlock()
-	}
+	p.broadcastLocked()
+	p.mu.Unlock()
 }
 
 // selectReapVictims removes the idle-expired / over-age / poisoned slots from the
@@ -1132,10 +1140,11 @@ func (ps *qwpPooledSender) Close(_ context.Context) error {
 				// HALT, so markBrokenIfTerminal below leaves the slot healthy;
 				// but the rows are RETAINED in the delegate's producer buffers.
 				// Recycling this dirty slot would encode borrower A's rows into
-				// borrower B's next flush — shipping them under B's FSN and,
-				// once A retries the backpressure error, a second time under A
-				// (C1 borrower-isolation / row misattribution). Discard it: A's
-				// flush already surfaced the error, so A retries cleanly.
+				// borrower B's next flush, shipping them under B's FSN (C1
+				// borrower-isolation / row misattribution). Discard it so B is never
+				// poisoned; the discard-close still best-effort-drains A's own rows,
+				// and A's retry of the surfaced error is idempotent under server
+				// dedup (at-least-once).
 				ps.broken = true
 			}
 		} else {

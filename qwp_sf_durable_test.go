@@ -272,6 +272,30 @@ func TestDurableTrackerApplyDurableCapsUnknownTables(t *testing.T) {
 	}
 }
 
+// A server streaming distinct names in OK-ack trailers must not grow the intern
+// map past the cap: enqueueOk rejects the frame so the send loop HALTs fail-closed
+// rather than trimming on a truncated table set.
+func TestDurableTrackerEnqueueOkCapsOnOverflow(t *testing.T) {
+	tr := newQwpDurableTracker()
+	for i := 0; i < qwpDurableMaxTrackedTables-1; i++ {
+		k := "seed-" + strconv.Itoa(i)
+		tr.interned[k] = k
+	}
+	if !tr.enqueueOk(0, durableTrailer(tableEntry{"last-fit", 1})) {
+		t.Fatal("enqueueOk at the cap boundary must succeed")
+	}
+	before := len(tr.interned)
+	if tr.enqueueOk(1, durableTrailer(tableEntry{"overflow", 1})) {
+		t.Fatal("enqueueOk past the cap must return false")
+	}
+	if len(tr.interned) != before {
+		t.Fatalf("interned grew to %d past the cap, want %d", len(tr.interned), before)
+	}
+	if len(tr.pending) != 1 {
+		t.Fatalf("rejected overflow frame left %d pending entries, want 1", len(tr.pending))
+	}
+}
+
 func TestDurableTrackerSteadyStateZeroAllocs(t *testing.T) {
 	if raceEnabled {
 		t.Skip("zero-alloc invariant does not hold under -race")

@@ -467,10 +467,8 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		now := time.Now()
 		reconnecting, _, _ := loop.sendLoopReconnectStatus()
 		okAcks := loop.sendLoopTotalAcks()
-		progressed := acked > lastProgressAcked || reconnecting ||
-			(d.durableAckMode && okAcks > lastProgressAcks)
-		switch {
-		case progressed:
+		if acked > lastProgressAcked || reconnecting ||
+			(d.durableAckMode && okAcks > lastProgressAcks) {
 			// A durable trim advance (acked moves in durable mode) proves a
 			// durable-advertising primary is reachable and draining this slot, so
 			// forget accumulated durable-ack mismatches. Otherwise the lifetime
@@ -487,11 +485,17 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			lastProgressAcked = acked
 			lastProgressAcks = okAcks
 			lastProgressAt = now
-			if d.durableAckMode && now.Sub(lastTrimAt) >= qwpSfDurableStallFactor*noProgressBudget {
+		}
+		// In durable mode the trim watermark moves only on STATUS_DURABLE_ACK,
+		// which can lag past one reconnect budget even after every frame is OK-acked
+		// and okAcks has plateaued, so gate quarantine on the wider durable-stall
+		// clock (lastTrimAt), not the no-progress budget on lastProgressAt.
+		if d.durableAckMode {
+			if now.Sub(lastTrimAt) >= qwpSfDurableStallFactor*noProgressBudget {
 				d.recordFailure(d.noProgressReason(acked, target, okAcks, now.Sub(lastTrimAt)))
 				return
 			}
-		case now.Sub(lastProgressAt) >= noProgressBudget:
+		} else if now.Sub(lastProgressAt) >= noProgressBudget {
 			d.recordFailure(d.noProgressReason(acked, target, okAcks, now.Sub(lastProgressAt)))
 			return
 		}

@@ -144,11 +144,17 @@ func TestQuestDBTeardownOnQueryPoolFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	base := stableGoroutineCount()
 	_, err := NewQuestDB(context.Background(),
-		"ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";",
+		"ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";sender_pool_min=2;sender_pool_max=2;",
 		noopConnListener())
 	if err == nil {
 		t.Fatal("expected build to fail when the egress upgrade is rejected")
+	}
+	// The two prewarmed ingest senders must be torn down when the query pool build
+	// fails (Hazard I); a leaked send loop keeps the count above baseline.
+	if got := stableGoroutineCount(); got > base+2 {
+		t.Fatalf("sender pool leaked goroutines after query-pool failure: base=%d got=%d", base, got)
 	}
 }
 

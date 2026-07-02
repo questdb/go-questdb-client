@@ -1335,15 +1335,17 @@ func TestQwpQueryOnClosedClient(t *testing.T) {
 	}
 }
 
-// TestQwpQueryClientSendsEgressHeaders verifies that max_batch_rows
-// and the X-QWP-Accept-Encoding header omission (step-9 deferral)
-// propagate through the public client to the upgrade request.
+// TestQwpQueryClientSendsEgressHeaders verifies that max_batch_rows,
+// client_id, and the X-QWP-Accept-Encoding header omission (step-9
+// deferral) propagate through the public client to the upgrade request.
 func TestQwpQueryClientSendsEgressHeaders(t *testing.T) {
 	var sawMaxBatchRows string
 	var sawAcceptEnc string
+	var sawClientId string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawMaxBatchRows = r.Header.Get(qwpHeaderMaxBatchRows)
 		sawAcceptEnc = r.Header.Get(qwpHeaderAcceptEncoding)
+		sawClientId = r.Header.Get(qwpHeaderClientId)
 		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -1363,6 +1365,7 @@ func TestQwpQueryClientSendsEgressHeaders(t *testing.T) {
 	c, err := NewQwpQueryClient(ctx,
 		WithQwpQueryAddress(addr),
 		WithQwpQueryMaxBatchRows(1234),
+		WithQwpQueryClientID("acme-dashboard/2.0"),
 	)
 	if err != nil {
 		t.Fatalf("ctor: %v", err)
@@ -1374,6 +1377,9 @@ func TestQwpQueryClientSendsEgressHeaders(t *testing.T) {
 	}
 	if sawAcceptEnc != "" {
 		t.Errorf("X-QWP-Accept-Encoding=%q, want empty (default compression=raw omits the header)", sawAcceptEnc)
+	}
+	if sawClientId != "acme-dashboard/2.0" {
+		t.Errorf("X-QWP-Client-Id=%q, want acme-dashboard/2.0 (client_id override; default asserted in TestQwpTransportNegotiationHeaders)", sawClientId)
 	}
 }
 

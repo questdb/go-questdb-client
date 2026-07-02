@@ -614,6 +614,65 @@ func testQwpSfSendLoopReconnectAfterServerClose(t *testing.T, sfDir string) {
 	assert.Greater(t, loop.sendLoopFsnAtZero(), int64(0))
 }
 
+// TestQwpSfSendLoopProgressMonotonicAcrossReconnect pins that the ack-progress
+// stream stays strictly increasing across a mid-stream connection drop + replay.
+// lastProgressFsn is deliberately not reset on reconnect, so a replayed/re-acked
+// frame can never re-emit an FSN already reported.
+func TestQwpSfSendLoopProgressMonotonicAcrossReconnect(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 5})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+
+	var mu sync.Mutex
+	var progress []int64
+	regressedTo := int64(-1)
+	loop.sendLoopSetProgressHandler(func(fsn int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(progress) > 0 && fsn <= progress[len(progress)-1] {
+			regressedTo = fsn
+		}
+		progress = append(progress, fsn)
+	}, 64)
+
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	// Warm-up ACK first so the mid-burst drop is classified as transient (see
+	// testQwpSfSendLoopReconnectAfterServerClose for the RST rationale).
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("warm-up"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return loop.sendLoopTotalAcks() >= 1 },
+		time.Second, time.Millisecond, "warm-up frame should ACK before the burst")
+
+	for i := 0; i < 10; i++ {
+		_, err := engine.engineAppendBlocking(context.Background(), []byte(fmt.Sprintf("f-%d", i)))
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool { return engine.engineAckedFsn() >= 10 },
+		5*time.Second, time.Millisecond, "loop did not drain after reconnect")
+	require.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1))
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(progress) > 0 && progress[len(progress)-1] == 10
+	}, 5*time.Second, time.Millisecond, "progress stream did not reach fsn 10")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, int64(-1), regressedTo, "progress regressed across reconnect")
+}
+
 // TestQwpSfSendLoopReplayIsGapFree pins the single most important
 // correctness property of the cursor/SF architecture: after a
 // mid-flush connection drop, the union of frames the server receives

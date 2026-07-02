@@ -97,7 +97,6 @@ const (
 	qwpAckOKMinSize         = 11 // status(1) + sequence(8) + tableCount(2)
 	qwpAckDurableMinSize    = 3  // status(1) + tableCount(2)
 	qwpAckErrorHeaderSize   = 11 // status(1) + sequence(8) + msg_len(2)
-	qwpAckTableEntryHeader  = 10 // nameLen(2) + seqTxn(8)
 	qwpAckSequenceOffset    = 1  // status(1)
 	qwpAckOKTablesOffset    = 9  // status(1) + sequence(8)
 	qwpAckDurableTablesOff  = 1  // status(1)
@@ -135,6 +134,12 @@ type qwpTransportOpts struct {
 	// upgrade header. Egress-only. Zero omits the header and lets
 	// the server use its own cap.
 	maxBatchRows int
+
+	// clientId, when non-empty, overrides the default X-QWP-Client-Id
+	// upgrade header (qwpClientId). Egress-only: fed by the client_id
+	// connect-string key / WithQwpQueryClientID. Ingest senders leave
+	// it empty and always identify as qwpClientId.
+	clientId string
 
 	// maxVersion is the value advertised in the X-QWP-Max-Version
 	// handshake header. Zero means qwpVersion. QWP currently has a
@@ -334,10 +339,14 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	if advertisedMax == 0 {
 		advertisedMax = qwpVersion
 	}
+	clientId := opts.clientId
+	if clientId == "" {
+		clientId = qwpClientId
+	}
 	dialOpts := &websocket.DialOptions{
 		HTTPHeader: http.Header{
 			qwpHeaderMaxVersion: []string{fmt.Sprintf("%d", advertisedMax)},
-			qwpHeaderClientId:   []string{qwpClientId},
+			qwpHeaderClientId:   []string{clientId},
 		},
 	}
 	if opts.authorization != "" {

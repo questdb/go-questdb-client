@@ -29,12 +29,11 @@ import (
 	"sync/atomic"
 )
 
-// qwpDurableMaxTrackedTables caps the distinct table names the tracker will
-// track from server durable frames — far above any realistic per-sender table
-// count. A durable watermark for a table the client never wrote can never cover
-// a pending batch, so refusing to intern beyond the cap neutralizes a
-// misbehaving server that streams distinct unknown names to grow the maps
-// without bound, while never dropping a watermark a real batch depends on.
+// qwpDurableMaxTrackedTables caps the distinct table names intern will hold, far
+// above any realistic per-sender count. Enforced in intern (the shared choke
+// point for enqueueOk and applyDurable), it stops a server streaming distinct
+// unknown names from growing the maps without bound: applyDurable skips an
+// over-cap watermark, enqueueOk rejects the frame so durableOnOk HALTs.
 const qwpDurableMaxTrackedTables = 1 << 16
 
 // qwpDurableTracker is the durable-ack trim state machine
@@ -105,30 +104,47 @@ func (t *qwpDurableTracker) seqGap(seq int64) (expected int64, gap bool) {
 }
 
 // intern returns a stable string for b, allocating once per distinct table so a
-// repeated table name is neither re-allocated nor able to alias the frame buffer
-// (the watermarks key and the pending reference must outlive the frame).
-func (t *qwpDurableTracker) intern(b []byte) string {
+// repeated name neither re-allocates nor aliases the frame buffer (the watermarks
+// key and pending reference must outlive the frame). It reports false without
+// growing the map past qwpDurableMaxTrackedTables distinct names.
+func (t *qwpDurableTracker) intern(b []byte) (string, bool) {
 	if s, ok := t.interned[string(b)]; ok { // string(b) lookup does not allocate
-		return s
+		return s, true
+	}
+	if len(t.interned) >= qwpDurableMaxTrackedTables {
+		return "", false
 	}
 	s := string(b)
 	t.interned[s] = s
-	return s
+	return s, true
 }
 
 // enqueueOk stashes an OK / NACK frame's wire sequence and per-table entries.
-// tail is the frame's validated table trailer (empty for a NACK).
-func (t *qwpDurableTracker) enqueueOk(wireSeq int64, tail []byte) {
+// tail is the frame's validated table trailer (empty for a NACK). It returns
+// false without enqueuing when a trailer name overflows the intern cap, so the
+// caller HALTs fail-closed instead of trimming on a truncated table set.
+func (t *qwpDurableTracker) enqueueOk(wireSeq int64, tail []byte) bool {
 	e := t.acquire()
 	e.wireSeq = wireSeq
 	e.tables = e.tables[:0]
 	e.seqTxns = e.seqTxns[:0]
+	overflow := false
 	qwpForEachAckTableEntry(tail, func(name []byte, seqTxn int64) {
-		e.tables = append(e.tables, t.intern(name))
+		s, ok := t.intern(name)
+		if !ok {
+			overflow = true
+			return
+		}
+		e.tables = append(e.tables, s)
 		e.seqTxns = append(e.seqTxns, seqTxn)
 	})
+	if overflow {
+		t.release(e)
+		return false
+	}
 	t.pending = append(t.pending, e)
 	t.pendingLen.Store(int64(len(t.pending)))
+	return true
 }
 
 // enqueueEmpty stashes a wire sequence with no tables — a DROP_AND_CONTINUE
@@ -148,12 +164,9 @@ func (t *qwpDurableTracker) enqueueEmpty(wireSeq int64) {
 // max so a reordered or older cumulative frame cannot move one backward.
 func (t *qwpDurableTracker) applyDurable(tail []byte) {
 	qwpForEachAckTableEntry(tail, func(name []byte, seqTxn int64) {
-		key, ok := t.interned[string(name)] // string(b) lookup does not allocate
+		key, ok := t.intern(name)
 		if !ok {
-			if len(t.interned) >= qwpDurableMaxTrackedTables {
-				return
-			}
-			key = t.intern(name)
+			return // over the cap: this watermark can never cover a real batch
 		}
 		// Presence-checked so a first watermark of 0 is inserted (0 > 0 is false)
 		// and a reordered older frame never lowers an existing one.

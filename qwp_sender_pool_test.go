@@ -184,6 +184,43 @@ func TestQwpSenderPoolStaleLeaseErrors(t *testing.T) {
 	}
 }
 
+// TestQwpSenderPoolStaleLeaseCannotCorruptReborrow proves a stale handle whose
+// slot has been re-borrowed by a live lease cannot write into it (Hazard B): the
+// generation stamp inerts every stale-lease method, so the re-borrow's slot stays
+// clean. min == max == 1 forces the re-borrow onto the very slot just returned.
+func TestQwpSenderPoolStaleLeaseCannotCorruptReborrow(t *testing.T) {
+	p := newQwpSenderPoolForTest(t, "", 1, 1)
+	ctx := context.Background()
+
+	stale, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	if err := stale.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	live, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("re-borrow: %v", err)
+	}
+	defer live.Close(ctx)
+
+	// The stale handle's whole fluent chain inerts and enqueues nothing into the
+	// slot the live lease now owns.
+	if err := stale.Table("stale").Symbol("s", "x").Int64Column("v", 1).AtNow(ctx); !errors.Is(err, errStaleLease) {
+		t.Fatalf("stale AtNow err=%v, want errStaleLease", err)
+	}
+	// The live lease writes and flushes cleanly on that same slot — a leaked open
+	// row or table from the stale chain would surface here (e.g. "table already set").
+	if err := live.Table("good").Int64Column("v", 7).AtNow(ctx); err != nil {
+		t.Fatalf("live AtNow: %v", err)
+	}
+	if err := live.Flush(ctx); err != nil {
+		t.Fatalf("live flush: %v", err)
+	}
+}
+
 // TestQwpSenderPoolReturnMidRowLeavesCleanSlot is the C1 regression: a
 // lease returned with an in-progress row (Table/Symbol/*Column but no
 // finalizing At/AtNow) must not poison the next borrower. Routing the

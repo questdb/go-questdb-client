@@ -105,6 +105,84 @@ func TestQwpIntegrationFacadeRoundTrip(t *testing.T) {
 	}
 }
 
+// TestQwpIntegrationFacadeQueryWireReuse proves a query abandoned mid-iteration
+// does not leak leftover RESULT_BATCH frames into the next borrower on a reused
+// (max=1) query worker: the lease return drains the wire clean or evicts the
+// worker, so the follow-up query reads correct results.
+func TestQwpIntegrationFacadeQueryWireReuse(t *testing.T) {
+	qwpEnsureServer(t)
+	ctx := context.Background()
+	table := fmt.Sprintf("facade_reuse_%d", time.Now().UnixNano())
+	t.Cleanup(func() { qwpDropTable(t, table) })
+
+	// One pooled query worker so the follow-up borrow provably reuses (or
+	// evict-replaces) the same slot; max_batch_rows=1 makes the SELECT stream
+	// one row per batch, so an early break leaves many undrained batches + END.
+	db, err := NewQuestDB(ctx,
+		"ws::addr="+qwpTestAddr+";query_pool_min=1;query_pool_max=1;max_batch_rows=1;",
+		WithQuestDBConnectionListener(func(SenderConnectionEvent) {}))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer db.Close(ctx)
+
+	const rows = 20
+	s, err := db.BorrowSender(ctx)
+	if err != nil {
+		t.Fatalf("BorrowSender: %v", err)
+	}
+	for i := 0; i < rows; i++ {
+		if err := s.Table(table).Symbol("sym", "BTC").Int64Column("qty", int64(i)).AtNow(ctx); err != nil {
+			t.Fatalf("write row %d: %v", i, err)
+		}
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("sender close: %v", err)
+	}
+	qwpWaitForRows(t, table, rows)
+
+	// Start a multi-batch SELECT, then abandon after the first batch.
+	q1, err := db.BorrowQuery(ctx)
+	if err != nil {
+		t.Fatalf("BorrowQuery q1: %v", err)
+	}
+	got := 0
+	for _, berr := range q1.Query(ctx, "select qty from "+table).Batches() {
+		if berr != nil {
+			t.Fatalf("q1 batch: %v", berr)
+		}
+		got++
+		break // batches 2..N + END stay undrained on the wire
+	}
+	if got == 0 {
+		t.Fatal("q1 returned no batches")
+	}
+	if err := q1.Close(); err != nil {
+		t.Fatalf("q1 lease close: %v", err)
+	}
+
+	// Re-borrow the (reused or evict-replaced) worker and read the full count;
+	// a leaked frame from the abandoned q1 would corrupt this result.
+	q2, err := db.BorrowQuery(ctx)
+	if err != nil {
+		t.Fatalf("BorrowQuery q2: %v", err)
+	}
+	defer q2.Close()
+	gotCount := int64(-1)
+	for batch, berr := range q2.Query(ctx, "select count() from "+table).Batches() {
+		if berr != nil {
+			t.Fatalf("q2 batch: %v", berr)
+		}
+		gotCount = batch.Int64(0, 0)
+	}
+	if gotCount != rows {
+		t.Fatalf("count() after abandoned query = %d, want %d (leaked frames from the abandoned q1?)", gotCount, rows)
+	}
+}
+
 // TestQwpIntegrationFacadeLazyConnect proves lazy_connect builds against a
 // (reachable) server without prewarming the read pool, then ingests and reads.
 func TestQwpIntegrationFacadeLazyConnect(t *testing.T) {
