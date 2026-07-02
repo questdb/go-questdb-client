@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -639,4 +640,57 @@ func TestQwpCursorNoGoroutineLeakOnClose(t *testing.T) {
 	assert.LessOrEqualf(t, got, base+slack,
 		"goroutine count grew from %d to %d across %d cycles — Close "+
 			"is leaking cursor send-loop goroutines", base, got, cycles)
+}
+
+// TestQwpCursorNoGoroutineLeakOnCloseWithProgressHandler covers the leak the
+// plain test above cannot: a sender with a SenderProgressHandler lazily starts
+// the progress dispatcher's goroutine on the first ack advance, and
+// sendLoopClose must close that dispatcher too (not just the error and
+// connection ones). Before the fix it leaked one goroutine per closed sender
+// that saw an ack.
+func TestQwpCursorNoGoroutineLeakOnCloseWithProgressHandler(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	runCycle := func() {
+		engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+		require.NoError(t, err)
+		loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+			100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		var acks atomic.Int64
+		// Installed before start so the first ack advance offers into it and
+		// lazy-starts its loop() goroutine — the goroutine Close must join.
+		loop.sendLoopSetProgressHandler(func(int64) { acks.Add(1) }, 8)
+		loop.sendLoopStart()
+		s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 5*time.Second)
+		require.NoError(t, err)
+
+		require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+		require.NoError(t, s.Flush(context.Background()))
+		require.Eventually(t, func() bool {
+			return acks.Load() > 0
+		}, 2*time.Second, 1*time.Millisecond, "progress handler never fired")
+		_ = s.Close(context.Background())
+	}
+
+	runCycle()
+	base := stableGoroutineCount()
+
+	const cycles = 25
+	for i := 0; i < cycles; i++ {
+		runCycle()
+	}
+
+	const slack = 8
+	var got int
+	require.Eventually(t, func() bool {
+		got = stableGoroutineCount()
+		return got <= base+slack
+	}, 10*time.Second, 100*time.Millisecond,
+		"progress-dispatcher goroutine did not return to baseline")
+	assert.LessOrEqualf(t, got, base+slack,
+		"goroutine count grew from %d to %d across %d cycles — Close is "+
+			"leaking the progress-dispatcher goroutine", base, got, cycles)
 }

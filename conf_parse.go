@@ -57,6 +57,13 @@ var egressOnlyKeys = map[string]bool{
 	"failover_max_duration_ms":    true,
 	"initial_credit":              true,
 	"max_batch_rows":              true,
+	// Egress query keys the ingress parser ignores so a shared ws:: / wss::
+	// string (notably the facade's) validates through both parsers.
+	"auth":                   true,
+	"client_id":              true,
+	"path":                   true,
+	"replay_exec":            true,
+	"server_info_timeout_ms": true,
 }
 
 // ingressOnlyKeys lists connect-string keys defined by the spec for
@@ -70,6 +77,7 @@ var ingressOnlyKeys = map[string]bool{
 	"auto_flush_interval":                   true,
 	"auto_flush_rows":                       true,
 	"close_flush_timeout_millis":            true,
+	"connection_listener_inbox_capacity":    true,
 	"drain_orphans":                         true,
 	"durable_ack_keepalive_interval_millis": true,
 	"error_inbox_capacity":                  true,
@@ -94,6 +102,34 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_durability":                         true,
 	"sf_max_bytes":                          true,
 	"sf_max_total_bytes":                    true,
+	// QWP ingest keys the egress parser ignores so a shared ws:: / wss::
+	// string (notably the facade's) validates through both parsers.
+	// gorilla / in_flight_window are the documented Java-parity knobs;
+	// token_x / token_y are legacy public-key fields the ingest client
+	// accepts-but-ignores. (The HTTP-only protocol_version / request_timeout
+	// / retry_timeout / request_min_throughput are deliberately absent: the
+	// QWP ingest client rejects them in sanitizeQwpConf, so both parsers
+	// rejecting them is the correct, symmetric behaviour.)
+	"gorilla":          true,
+	"in_flight_window": true,
+	"token_x":          true,
+	"token_y":          true,
+}
+
+// poolKeys are the facade-owned (Side.POOL) connect-string keys. They are
+// meaningful only to the QuestDB facade (questdb.go); both standalone clients
+// accept-but-ignore them on ws/wss so one cluster config validates through the
+// ingest and egress parsers alike. Kept in sync with QuestDB facade options.
+var poolKeys = map[string]bool{
+	"lazy_connect":            true,
+	"sender_pool_min":         true,
+	"sender_pool_max":         true,
+	"query_pool_min":          true,
+	"query_pool_max":          true,
+	"acquire_timeout_ms":      true,
+	"idle_timeout_ms":         true,
+	"max_lifetime_ms":         true,
+	"housekeeper_interval_ms": true,
 }
 
 func confFromStr(conf string) (*lineSenderConfig, error) {
@@ -253,6 +289,14 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				panic("add a case for " + k)
 			}
+		case "connect_timeout":
+			// COMMON key (Java parity): accepted on every schema so a shared
+			// connect string ports. Wired on HTTP and QWP; inert on TCP.
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.connectTimeoutMs = parsedVal
 		case "tls_verify":
 			switch v {
 			case "on":
@@ -516,14 +560,32 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			// 0 is the "use the default capacity" sentinel, resolved at
 			// construction (qwpSfDefaultErrorInboxCapacity), matching the
-			// WithErrorInboxCapacity option path. Any other sub-floor value
-			// is a user-supplied undersized inbox and is rejected.
-			if parsedVal != 0 && parsedVal < qwpSfMinErrorInboxCapacity {
+			// WithErrorInboxCapacity option path. Any other out-of-range value
+			// is rejected: a sub-floor inbox is undersized, and an over-ceiling
+			// one would panic make(chan) at construction.
+			if parsedVal != 0 && (parsedVal < qwpSfMinErrorInboxCapacity || parsedVal > qwpSfMaxErrorInboxCapacity) {
 				return nil, NewInvalidConfigStrError(
-					"invalid %s value, %d: must be >= %d",
-					k, parsedVal, qwpSfMinErrorInboxCapacity)
+					"invalid %s value, %d: must be in [%d, %d]",
+					k, parsedVal, qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity)
 			}
 			senderConf.errorInboxCapacity = parsedVal
+		case "connection_listener_inbox_capacity":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			// 0 is the "use the default capacity" sentinel; any other out-of-range
+			// value is rejected (sub-floor undersized, over-ceiling would panic
+			// make(chan) at construction).
+			if parsedVal != 0 && (parsedVal < qwpSfMinErrorInboxCapacity || parsedVal > qwpSfMaxErrorInboxCapacity) {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %d: must be in [%d, %d]",
+					k, parsedVal, qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity)
+			}
+			senderConf.connectionListenerInboxCapacity = parsedVal
 		case "request_durable_ack":
 			if senderConf.senderType != qwpSenderType {
 				// sf-client.md §4.6 mandates rejecting
@@ -535,19 +597,12 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			switch v {
 			case "off", "false":
-				// The default. Non-durable, OK-driven trim is fully
-				// conformant (sf-client.md §9.2 / §19); nothing to wire.
+				// The default. Non-durable, OK-driven trim (sf-client.md §9.2).
 			case "on", "true":
-				// Durable-ack mode (sf-client.md §4.3 / §8.1 / §9.3 /
-				// §10 / §11) is a deferred opt-in, EE-only QoS feature:
-				// the cursor send loop OK-trims and silently ignores
-				// DURABLE_ACK frames (qwp_sf_send_loop.go). §19 makes
-				// the key normative so we accept it, but opting in is
-				// rejected with a clear deferred-feature message rather
-				// than the generic "unsupported option", mirroring
-				// sf_durability=flush.
-				return nil, NewInvalidConfigStrError(
-					"request_durable_ack=%s is not yet supported: durable-ack mode is not implemented in this client (deferred follow-up; use request_durable_ack=off)", v)
+				// Durable-ack mode: the cursor send loop trims / replays / awaits
+				// on STATUS_DURABLE_ACK instead of the OK ACK
+				// (design/qwp-cursor-durability.md).
+				senderConf.requestDurableAck = true
 			default:
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
@@ -556,24 +611,25 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			// Accepted for connect-string portability (sf-client.md
-			// §4.3 / §19) but inert: it only paces keepalive PINGs in
-			// durable-ack mode, which this client does not implement
-			// (see request_durable_ack). Validate the shape so a typo
-			// still errors helpfully; 0 / negative mean "disabled" per
-			// spec, so any int is in range.
-			if _, err := strconv.Atoi(v); err != nil {
+			// Paces the durable-ack keepalive ping; 0 / negative disable it.
+			ms, err := strconv.Atoi(v)
+			if err != nil {
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
+			senderConf.durableAckKeepaliveMillis = ms
+			senderConf.durableAckKeepaliveMillisSet = true
 		default:
-			if senderConf.senderType == qwpSenderType && egressOnlyKeys[k] {
+			if senderConf.senderType == qwpSenderType && (egressOnlyKeys[k] || poolKeys[k]) {
 				// Silently accepted on ingress so a single ws:: / wss::
 				// connect string can configure both Sender and
 				// QwpQueryClient. The Sender does not interpret the
 				// value — range/enum/type checks run on the egress side
 				// (qwp_query_conf.go). connect-string.md §16-20 and
 				// §Query client keys are the load-bearing spec text.
+				// poolKeys are facade-owned (Side.POOL): both standalone
+				// clients accept-but-ignore them so the QuestDB facade can
+				// validate one cluster config through both parsers.
 				continue
 			}
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)

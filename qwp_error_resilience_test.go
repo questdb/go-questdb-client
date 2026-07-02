@@ -951,8 +951,9 @@ func TestErrorApiResilience_DispatcherSwapMidFlight(t *testing.T) {
 	assert.LessOrEqual(t, totalDelivered, totalErrors,
 		"deliveries (%d) must not exceed total server errors (%d)",
 		totalDelivered, totalErrors)
-	assert.Equal(t, totalErrors, totalDelivered+dropped+0 /* lost-to-old-drain unaccounted */,
-		"every server error should be either delivered or dropped (or lost to old-dispatcher drain)")
+	assert.LessOrEqual(t, totalDelivered+dropped, totalErrors,
+		"delivered (%d) + dropped (%d) must not exceed total server errors (%d)",
+		totalDelivered, dropped, totalErrors)
 
 	// The new handler should have received SOMETHING (otherwise the
 	// swap didn't take effect).

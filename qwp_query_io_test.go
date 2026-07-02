@@ -122,6 +122,33 @@ func newQwpMockEgressServer(t *testing.T, handler func(*qwpMockEgressConn)) *htt
 	}))
 }
 
+// egressCancelResponder is a long-lived mock handler that replies to
+// every CANCEL frame with a QUERY_ERROR(CANCELLED) terminal frame for
+// the cancelled request, so a client-side cleanup drain observes a
+// terminal frame promptly instead of racing the cancel-ack watchdog
+// (qwpQueryCancelAckTimeout) against the drain ctx (both 5s). QUERY_-
+// REQUEST / CREDIT frames are read and ignored. Returns when the client
+// closes the connection. Reads on a background ctx and swallows the
+// read/write errors that a close races, so teardown never fails the test.
+func egressCancelResponder(m *qwpMockEgressConn) {
+	ctx := context.Background()
+	for {
+		typ, data, err := m.conn.Read(ctx)
+		if err != nil {
+			return
+		}
+		if typ != websocket.MessageBinary || len(data) < 9 {
+			continue
+		}
+		if data[0] == byte(qwpMsgKindCancel) {
+			reqID := int64(binary.LittleEndian.Uint64(data[1:]))
+			resp := writeQwpFrame(0, buildQueryErrorBody(
+				reqID, byte(qwpStatusCancelled), "cancelled", -1))
+			_ = m.conn.Write(ctx, websocket.MessageBinary, resp)
+		}
+	}
+}
+
 // connectEgress dials the mock server with qwpReadPath. It sets a
 // SERVER_INFO read timeout so the transport consumes the frame the mock
 // emits post-upgrade, matching the production egress connect path.

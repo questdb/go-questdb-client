@@ -99,6 +99,24 @@ func (e *QwpUpgradeRejectError) Error() string {
 	return b.String()
 }
 
+// QwpDurableAckMismatchError is returned by connect() when the client requested
+// durable-ack (request_durable_ack=on) but the endpoint did not advertise support
+// (X-QWP-Durable-Ack: enabled) on the upgrade — typically because it is a replica,
+// not a replication primary. It is terminal: the client must not fall back to
+// OK-only trimming, which would drop data the caller believes durable. Surfaces
+// to the producer as a *SenderError of category PROTOCOL_VIOLATION on every
+// connect path (initial-off, initial-sync, and async reconnect); the underlying
+// *QwpDurableAckMismatchError stays reachable through that SenderError via
+// errors.As.
+type QwpDurableAckMismatchError struct {
+	Endpoint string
+}
+
+func (e *QwpDurableAckMismatchError) Error() string {
+	return fmt.Sprintf("qwp: durable-ack requested but endpoint %q did not advertise support "+
+		"(X-QWP-Durable-Ack); a replication primary is required", e.Endpoint)
+}
+
 // Unwrap returns the underlying websocket.Dial error so errors.Is /
 // errors.As can reach the transport-level cause. Classification keys
 // off StatusCode via a top-level type assertion, so unwrapping does

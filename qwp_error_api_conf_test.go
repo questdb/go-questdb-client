@@ -57,8 +57,8 @@ func TestErrorApiConfStringHappyPath(t *testing.T) {
 			wantSchema: qdb.PolicyHalt,
 		},
 		{
-			conf:       "ws::addr=h:9000;on_parse_error=drop;",
-			wantParse:  qdb.PolicyDropAndContinue,
+			conf:      "ws::addr=h:9000;on_parse_error=drop;",
+			wantParse: qdb.PolicyDropAndContinue,
 		},
 		{
 			conf:       "ws::addr=h:9000;on_internal_error=halt;on_security_error=drop;on_write_error=halt;",
@@ -136,15 +136,19 @@ func TestErrorApiConfStringQwpOnly(t *testing.T) {
 	}
 }
 
-// TestErrorApiSanitizerRejectsTinyInbox asserts the sanitizer rejects
-// error_inbox_capacity values below the spec floor of 16.
+// TestErrorApiSanitizerRejectsTinyInbox asserts the parser rejects
+// inbox capacities outside [16, 1<<20]: sub-floor values are undersized,
+// and over-ceiling values would panic make(chan) at construction.
 func TestErrorApiSanitizerRejectsTinyInbox(t *testing.T) {
 	cases := []struct {
 		conf string
 		want string
 	}{
-		{"ws::addr=h:9000;error_inbox_capacity=1;", ">="},
-		{"ws::addr=h:9000;error_inbox_capacity=15;", ">="},
+		{"ws::addr=h:9000;error_inbox_capacity=1;", "must be in"},
+		{"ws::addr=h:9000;error_inbox_capacity=15;", "must be in"},
+		{"ws::addr=h:9000;error_inbox_capacity=1099511627776;", "must be in"},
+		{"ws::addr=h:9000;connection_listener_inbox_capacity=15;", "must be in"},
+		{"ws::addr=h:9000;connection_listener_inbox_capacity=1099511627776;", "must be in"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.conf, func(t *testing.T) {
@@ -163,6 +167,17 @@ func TestErrorApiSanitizerRejectsTinyInbox(t *testing.T) {
 func TestErrorApiSanitizerAcceptsAtFloor(t *testing.T) {
 	if _, err := qdb.ConfFromStr("ws::addr=h:9000;error_inbox_capacity=16;"); err != nil {
 		t.Fatalf("capacity=16 should pass, got %v", err)
+	}
+}
+
+// TestErrorApiSanitizerAcceptsAtCeiling asserts the ceiling value (1<<20)
+// passes for both inbox keys — the rejection is strictly above it.
+func TestErrorApiSanitizerAcceptsAtCeiling(t *testing.T) {
+	if _, err := qdb.ConfFromStr("ws::addr=h:9000;error_inbox_capacity=1048576;"); err != nil {
+		t.Fatalf("error_inbox_capacity=1048576 should pass, got %v", err)
+	}
+	if _, err := qdb.ConfFromStr("ws::addr=h:9000;connection_listener_inbox_capacity=1048576;"); err != nil {
+		t.Fatalf("connection_listener_inbox_capacity=1048576 should pass, got %v", err)
 	}
 }
 

@@ -42,6 +42,12 @@ const qwpSfDefaultErrorInboxCapacity = 256
 // capacities by the connect-string sanitizer per the spec.
 const qwpSfMinErrorInboxCapacity = 16
 
+// qwpSfMaxErrorInboxCapacity is the ceiling enforced on user-supplied
+// capacities. Without it a pathological value (e.g. 1<<60) reaches
+// make(chan, capacity) and panics "makechan: size out of range"; an inbox
+// this deep is already far beyond any real backpressure need.
+const qwpSfMaxErrorInboxCapacity = 1 << 20
+
 // qwpSfDispatcherDrainTimeout is the maximum time close() waits for
 // the dispatcher loop to finish draining queued errors before giving
 // up and abandoning anything still in the inbox.
@@ -99,6 +105,15 @@ type qwpSfErrorDispatcher struct {
 	// when closed.
 	closed atomic.Bool
 
+	// abandon flips true when close() gives up joining a handler still
+	// running past qwpSfDispatcherCloseJoinTimeout. loop() and drain()
+	// then drop instead of deliver, so a wedged handler that finally
+	// returns cannot re-enter its select, pick a still-queued error, and
+	// fire the user callback *after* close() (and therefore Sender.Close)
+	// has already returned. Mirrors qwpDispatcher.abandon, which the
+	// generic dispatcher already carries; the two paths are kept in step.
+	abandon atomic.Bool
+
 	dropped   atomic.Int64
 	delivered atomic.Int64
 
@@ -128,6 +143,12 @@ func newQwpSfErrorDispatcher(handler SenderErrorHandler, capacity int) *qwpSfErr
 	}
 	if capacity < 1 {
 		capacity = qwpSfDefaultErrorInboxCapacity
+	}
+	if capacity > qwpSfMaxErrorInboxCapacity {
+		// Mirror newQwpDispatcher's ceiling: production capacities are pre-clamped
+		// in conf_parse, but guard the direct constructor so an unsanitized caller
+		// cannot panic makechan with a huge size.
+		capacity = qwpSfMaxErrorInboxCapacity
 	}
 	return &qwpSfErrorDispatcher{
 		handler: handler,
@@ -211,6 +232,13 @@ func (d *qwpSfErrorDispatcher) loop() {
 			if e == nil {
 				continue
 			}
+			if d.abandon.Load() {
+				// close() gave up on this goroutine; do not deliver after
+				// Close has returned. Count it as dropped, matching the
+				// post-timeout inbox sweep in close().
+				d.dropped.Add(1)
+				continue
+			}
 			d.deliver(e)
 		case <-d.done:
 			d.drain()
@@ -233,6 +261,10 @@ func (d *qwpSfErrorDispatcher) drain() {
 		select {
 		case e := <-d.inbox:
 			if e == nil {
+				continue
+			}
+			if d.abandon.Load() {
+				d.dropped.Add(1)
 				continue
 			}
 			d.deliver(e)
@@ -330,6 +362,10 @@ func (d *qwpSfErrorDispatcher) close() {
 	// the budget. A handler wedged in a never-returning call keeps
 	// loop() parked in deliver() so wg.Done() never fires; the bound
 	// abandons that goroutine rather than inheriting its hang.
+	// If the handler wedges forever, wg.Wait() never returns, so this watcher
+	// goroutine is abandoned along with loop() — the intentional cost of the
+	// "abandon rather than block Close" contract. It is a single parked goroutine
+	// holding only this closure, not a growing leak.
 	joined := make(chan struct{})
 	go func() {
 		d.wg.Wait()
@@ -340,6 +376,12 @@ func (d *qwpSfErrorDispatcher) close() {
 	select {
 	case <-joined:
 	case <-timer.C:
+		// Signal the abandoned loop/drain to drop rather than deliver.
+		// Without this, a handler that finally returns after the join
+		// timeout re-enters its select and — if inbox is non-empty and
+		// done is closed — Go may pick inbox and fire the user callback
+		// after close() (hence Sender.Close) has already returned.
+		d.abandon.Store(true)
 		log.Printf("[WARN] qwp/sf: error handler still running %s after close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
 			qwpSfDispatcherCloseJoinTimeout)

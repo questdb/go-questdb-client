@@ -237,7 +237,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	switch conf.initialConnectMode {
 	case InitialConnectSync:
 		transport, initialBoundIdx, err = qwpSfConnectWithRetry(ctx, factory, tracker,
-			reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+			reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff, true, nil)
 	case InitialConnectAsync:
 		transport = nil
 	default: // InitialConnectOff
@@ -249,9 +249,10 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		// retry-with-backoff across multiple sweeps.
 		walkStart := time.Now()
 		rr := qwpSfRunSingleRound(ctx, nil, qwpSfRoundWalkParams{
-			Factory:   factory,
-			Tracker:   tracker,
-			Endpoints: conf.endpoints,
+			Factory:                 factory,
+			Tracker:                 tracker,
+			Endpoints:               conf.endpoints,
+			DurableMismatchTerminal: true,
 		}, -1)
 		switch {
 		case rr.Transport != nil:
@@ -269,6 +270,19 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		}
 	}
 	if err != nil {
+		// A terminal durable-ack mismatch on the InitialConnectOff / Sync
+		// connect paths arrives as a plain error (Off wraps rr.Terminal in
+		// fmt.Errorf; Sync via qwpSfConnectWithRetry). Upgrade it to the typed
+		// *SenderError of category PROTOCOL_VIOLATION that WithRequestDurableAck
+		// and QwpDurableAckMismatchError document — the async reconnect path
+		// already latches this via connectWithBackoff. The underlying
+		// *QwpDurableAckMismatchError is preserved as the SenderError cause, so
+		// errors.As reaches either type.
+		var mismatch *QwpDurableAckMismatchError
+		if errors.As(err, &mismatch) {
+			err = qwpSfUpgradeFailureSE(
+				engine.engineAckedFsn()+1, engine.enginePublishedFsn(), mismatch)
+		}
 		_ = engine.engineClose()
 		return nil, err
 	}
@@ -289,6 +303,14 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	}
 	loop.sendLoopSetPolicyResolver(resolver)
 	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
+	loop.sendLoopSetEndpoints(conf.endpoints)
+	loop.sendLoopSetConnectionListener(conf.connectionListener, conf.connectionListenerInboxCapacity)
+	durableKeepalive := qwpDurableAckKeepaliveDefault
+	if conf.durableAckKeepaliveMillisSet {
+		durableKeepalive = time.Duration(conf.durableAckKeepaliveMillis) * time.Millisecond
+	}
+	loop.sendLoopSetDurableAck(conf.requestDurableAck, durableKeepalive, true)
+	loop.sendLoopSetProgressHandler(conf.progressHandler, conf.errorInboxCapacity)
 
 	s, err := newQwpCursorLineSender(
 		conf.autoFlushRows,
@@ -322,6 +344,14 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	// callback on the very first swap.
 	loop.sendLoopSetOnTransportSwap(s.applyServerBatchSizeLimit)
 	s.applyServerBatchSizeLimit(loop.transport.Load())
+	// Sync/Off connected synchronously at construction (transport != nil);
+	// fire the one-shot CONNECTED now that the sender is fully built, so a
+	// construction failure above never leaves a listener believing a sender
+	// connected that never came back. The async path (transport == nil) fires
+	// CONNECTED from connectWithBackoff instead.
+	if transport != nil {
+		loop.emitInitialConnected(initialBoundIdx)
+	}
 	loop.sendLoopStart()
 
 	// Orphan adoption (drain_orphans=on). At foreground startup,
@@ -348,7 +378,12 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			maxDrainers = 4 // matches Java default
 		}
 		ownSlot := filepath.Base(slotPath)
-		orphans := qwpSfScanOrphans(conf.sfDir, ownSlot)
+		// Exclude this sender's own slot always, plus any slot the pool fences
+		// off as a live in-range sibling (Hazard G); nil fence on standalone.
+		orphans := qwpSfScanOrphans(conf.sfDir, func(name string) bool {
+			return name == ownSlot ||
+				(conf.orphanDrainExclude != nil && conf.orphanDrainExclude(name))
+		})
 		if len(orphans) > 0 {
 			pool := qwpSfNewDrainerPool(maxDrainers)
 			// Publish the pool onto the sender before submitting any
@@ -366,6 +401,11 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 					tracker,
 					reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff,
 				)
+				// Set before submit (which starts the goroutine): a durable-ack
+				// sender's drainers must also trim only on STATUS_DURABLE_ACK.
+				drainer.durableAckMode = conf.requestDurableAck
+				drainer.durableKeepalive = durableKeepalive
+				drainer.listener = conf.backgroundDrainerListener
 				_ = pool.drainerPoolSubmit(ctx, drainer)
 			}
 		}
@@ -874,6 +914,13 @@ func (s *qwpLineSender) AckedFsn() int64 {
 	return s.cursorEngine.engineAckedFsn()
 }
 
+// hasUnackedRows reports whether the engine holds published rows the server has
+// not yet acknowledged. The pool uses it to keep an idle memory-mode slot alive
+// through a transient outage instead of reaping (and destroying) its in-RAM rows.
+func (s *qwpLineSender) hasUnackedRows() bool {
+	return s.cursorEngine.enginePublishedFsn() > s.cursorEngine.engineAckedFsn()
+}
+
 // AwaitAckedFsn implements QwpSender.AwaitAckedFsn. This is the
 // server-ACK confirmation primitive: Flush never blocks on ACKs
 // (Java decision #1), so callers wanting delivery confirmation pair
@@ -941,6 +988,19 @@ func (s *qwpLineSender) LastTerminalError() *SenderError {
 	return s.cursorSendLoop.sendLoopLastTerminalServerError()
 }
 
+// terminallyFailed reports whether the background send loop has latched a
+// terminal error and exited. Unlike LastTerminalError (typed server HALTs only)
+// this also covers the untyped transport/segment-fault paths (recordFatal), so
+// it is the complete "this connection is poisoned" signal — the qwpLineSender
+// analogue of QwpQueryClient.terminalError. It never reports true during a
+// normal transient reconnect: lastError is latched only on the loop's terminal
+// exit and is never cleared. The pool uses it to discard a slot poisoned by a
+// background HALT instead of leaking it to the next borrower (M1) or recycling
+// it after a benign producer error (M4).
+func (s *qwpLineSender) terminallyFailed() bool {
+	return s.cursorSendLoop != nil && s.cursorSendLoop.sendLoopCheckError() != nil
+}
+
 // TotalServerErrors implements QwpSender.TotalServerErrors.
 func (s *qwpLineSender) TotalServerErrors() int64 {
 	if s.cursorSendLoop == nil {
@@ -955,6 +1015,14 @@ func (s *qwpLineSender) DroppedErrorNotifications() int64 {
 		return 0
 	}
 	return s.cursorSendLoop.sendLoopDispatcher().droppedNotifications()
+}
+
+// DroppedConnectionNotifications implements QwpSender.DroppedConnectionNotifications.
+func (s *qwpLineSender) DroppedConnectionNotifications() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopConnDispatcher().droppedNotifications()
 }
 
 // TotalErrorNotificationsDelivered implements
@@ -988,6 +1056,22 @@ func (s *qwpLineSender) TotalFramesReplayed() int64 {
 		return 0
 	}
 	return s.cursorSendLoop.sendLoopTotalFramesReplayed()
+}
+
+// TotalDurableAcks implements QwpSender.TotalDurableAcks.
+func (s *qwpLineSender) TotalDurableAcks() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalDurableAcks()
+}
+
+// TotalDurableTrimAdvances implements QwpSender.TotalDurableTrimAdvances.
+func (s *qwpLineSender) TotalDurableTrimAdvances() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalDurableTrimAdvances()
 }
 
 // TotalBackpressureStalls implements QwpSender.TotalBackpressureStalls.

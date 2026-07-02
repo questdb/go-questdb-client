@@ -319,6 +319,19 @@ func qwpSfDialFor(server *qwpSfTestServer) qwpSfReconnectFactory {
 	}
 }
 
+// qwpSfDurableDialFor is qwpSfDialFor with request_durable_ack set, so connect()
+// rejects a server that does not advertise durable-ack.
+func qwpSfDurableDialFor(server *qwpSfTestServer) qwpSfReconnectFactory {
+	return func(ctx context.Context, _ int) (*qwpTransport, error) {
+		var t qwpTransport
+		wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+		if err := t.connect(ctx, wsURL, qwpTransportOpts{endpointPath: qwpWritePath, requestDurableAck: true}); err != nil {
+			return nil, err
+		}
+		return &t, nil
+	}
+}
+
 // qwpSfDialAt builds a transport connected to a fixed httptest URL.
 func qwpSfDialAt(url string) qwpSfReconnectFactory {
 	return func(ctx context.Context, _ int) (*qwpTransport, error) {
@@ -1261,7 +1274,7 @@ func TestQwpSfConnectWithRetrySucceedsEventually(t *testing.T) {
 		return qwpSfDialFor(srv)(ctx, idx)
 	}
 	transport, _, err := qwpSfConnectWithRetry(context.Background(), factory, nil,
-		2*time.Second, 5*time.Millisecond, 50*time.Millisecond)
+		2*time.Second, 5*time.Millisecond, 50*time.Millisecond, true, nil)
 	require.NoError(t, err)
 	require.NotNil(t, transport)
 	_ = transport.close()
@@ -1275,7 +1288,7 @@ func TestQwpSfConnectWithRetryTerminalUpgrade(t *testing.T) {
 	defer srv.Close()
 
 	_, _, err := qwpSfConnectWithRetry(context.Background(), qwpSfDialFor(srv), nil,
-		200*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+		200*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond, true, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "WebSocket upgrade failed")
 }
@@ -1285,7 +1298,7 @@ func TestQwpSfConnectWithRetryBudgetExhausted(t *testing.T) {
 		return nil, errors.New("dial tcp: connection refused")
 	}
 	_, _, err := qwpSfConnectWithRetry(context.Background(), factory, nil,
-		100*time.Millisecond, 5*time.Millisecond, 30*time.Millisecond)
+		100*time.Millisecond, 5*time.Millisecond, 30*time.Millisecond, true, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "connect failed")
 }
@@ -1377,8 +1390,8 @@ func testQwpSfSendLoopDropAndContinue(t *testing.T, sfDir string) {
 	// frame only; subsequent frames get OK ACKs. We need the test
 	// server to support that mode — see opts.rejectFirstNFrames below.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:        QwpStatusSchemaMismatch,
-		rejectFirstNFrames:  1,
+		rejectStatus:       QwpStatusSchemaMismatch,
+		rejectFirstNFrames: 1,
 	})
 	defer srv.Close()
 
@@ -1441,12 +1454,12 @@ func testQwpSfSendLoopDropAndContinue(t *testing.T, sfDir string) {
 // jumps to FSN 3 and the test fails.
 func TestQwpSfSendLoopReceiverClampsForgedAckToFullySent(t *testing.T) {
 	const (
-		published    = 4  // FSN 0..3 live in the engine
-		fsnAtZero    = 0  // fresh connection: wireSeq 0 maps to FSN 0
-		started      = 4  // nextWireSeq: wireSeq 0..3 all begun
-		fullySent    = 2  // highestFullySent: FSN 0..2 on the wire
-		forgedSeq    = 3  // server ACKs the in-flight FSN 3
-		wantAckedFsn = 2  // clamp ceiling, NOT forgedSeq (3)
+		published    = 4 // FSN 0..3 live in the engine
+		fsnAtZero    = 0 // fresh connection: wireSeq 0 maps to FSN 0
+		started      = 4 // nextWireSeq: wireSeq 0..3 all begun
+		fullySent    = 2 // highestFullySent: FSN 0..2 on the wire
+		forgedSeq    = 3 // server ACKs the in-flight FSN 3
+		wantAckedFsn = 2 // clamp ceiling, NOT forgedSeq (3)
 	)
 
 	// run drives receiverLoop in isolation against a server that

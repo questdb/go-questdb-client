@@ -469,3 +469,49 @@ func TestQwpSfDispatcherCloseBoundedOnStuckHandler(t *testing.T) {
 		t.Errorf("dropped = %d, want 3 (queued items abandoned at bounded close)", got)
 	}
 }
+
+// TestQwpSfDispatcherAbandonDropsQueued pins the abandon guard (PR #64 review
+// M2). Once close() times out on a wedged handler it sets abandon; loop() and
+// drain() must then DROP any item still queued rather than deliver it —
+// otherwise a handler that finally returns re-enters its select, picks a queued
+// error, and fires the user callback after close() (hence Sender.Close) has
+// already returned. Both branches are exercised directly with abandon preset so
+// the drop is deterministic (no reliance on the close-vs-handler-return race,
+// which close()'s own inbox sweep usually wins). The sibling qwpDispatcher
+// carries the same guard (TestQwpDispatcherCloseAbandonsWedgedHandler).
+func TestQwpSfDispatcherAbandonDropsQueued(t *testing.T) {
+	// drain() is what loop() runs on done; with abandon set it must drop.
+	t.Run("drain", func(t *testing.T) {
+		var delivered atomic.Int64
+		d := newQwpSfErrorDispatcher(func(*SenderError) { delivered.Add(1) }, 8)
+		d.abandon.Store(true)
+		d.inbox <- &SenderError{Category: CategoryParseError, ToFsn: 1}
+		d.drain()
+		if got := delivered.Load(); got != 0 {
+			t.Errorf("delivered=%d; drain must drop under abandon, not deliver", got)
+		}
+		if got := d.droppedNotifications(); got != 1 {
+			t.Errorf("dropped=%d, want 1 (abandoned item counted as dropped)", got)
+		}
+	})
+	// loop(): with abandon set and done closed, the queued item is dropped
+	// whichever select branch (inbox or done→drain) the loop takes first.
+	t.Run("loop", func(t *testing.T) {
+		var delivered atomic.Int64
+		d := newQwpSfErrorDispatcher(func(*SenderError) { delivered.Add(1) }, 8)
+		d.abandon.Store(true)
+		d.inbox <- &SenderError{Category: CategoryParseError, ToFsn: 1}
+		close(d.done)
+		d.wg.Add(1)
+		exited := make(chan struct{})
+		go func() { d.loop(); close(exited) }()
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("loop did not exit after done closed")
+		}
+		if got := delivered.Load(); got != 0 {
+			t.Errorf("delivered=%d; loop must drop under abandon, not deliver", got)
+		}
+	})
+}

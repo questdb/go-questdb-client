@@ -51,7 +51,7 @@ type qwpSfRoundWalkResult struct {
 	// Terminal is a non-nil typed reject when an Auth-error (401/403)
 	// halts the walk per failover.md §6. Callers convert it to a
 	// CategorySecurityError SenderError.
-	Terminal *QwpUpgradeRejectError
+	Terminal error
 	// Exhausted is non-nil when the wall-clock budget ran out. Wraps
 	// the last underlying dial error plus a per-host snapshot for
 	// diagnostics.
@@ -147,6 +147,20 @@ type qwpSfRoundWalkParams struct {
 	// can bump observability counters (totalReconnectAttempts,
 	// per-attempt status, etc.).
 	OnAttempt func()
+	// OnEndpointFailed, when non-nil, fires after a dial fails for a real
+	// host reason (not a cancellation), with the failed endpoint index and
+	// the dial error. Drives the SenderEndpointAttemptFailed event.
+	OnEndpointFailed func(idx int, err error)
+	// OnRoundExhausted, when non-nil, fires once each time a full
+	// address-list sweep fails to bind any host. Drives the
+	// SenderAllEndpointsUnreachable event.
+	OnRoundExhausted func()
+	// DurableMismatchTerminal controls how a *QwpDurableAckMismatchError is
+	// classified: true (foreground) makes it terminal (fail loud, no failover);
+	// false (background drainer, whose source data is pinned) treats it as a
+	// transient dial failure so the reconnect budget keeps retrying — a primary
+	// that is briefly unreachable must not permanently fail the orphan slot.
+	DurableMismatchTerminal bool
 }
 
 // qwpSfSingleRoundResult is the inner-loop return shape for one walk
@@ -171,7 +185,7 @@ type qwpSfSingleRoundResult struct {
 	Attempts int
 	// Terminal is set when the walk hits a 401/403 upgrade reject —
 	// per failover.md §6, auth errors short-circuit failover.
-	Terminal *QwpUpgradeRejectError
+	Terminal error
 	// Cancelled is ctx.Err() (or context.Canceled when cancelCh
 	// fired) when the walk was interrupted. Also non-nil for
 	// misconfigurations (nil tracker / factory) so callers route
@@ -228,6 +242,7 @@ func qwpSfRunSingleRound(
 		attempts          int
 		lastErr           error
 		lastWasRoleReject bool
+		pendingMismatch   *QwpDurableAckMismatchError
 	)
 
 	// Apply pending mid-stream demote before the first PickNext.
@@ -256,6 +271,13 @@ func qwpSfRunSingleRound(
 
 		idx := params.Tracker.PickNext()
 		if idx < 0 {
+			// Sweep exhausted. If a foreground durable-ack mismatch was seen
+			// and no endpoint in the sweep advertised durable-ack, surface it
+			// as terminal now (Java buildAndConnect: throw only after the whole
+			// sweep found no durable-advertising endpoint).
+			if pendingMismatch != nil {
+				return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingMismatch}
+			}
 			return qwpSfSingleRoundResult{
 				Idx:               -1,
 				Attempts:          attempts,
@@ -319,18 +341,44 @@ func qwpSfRunSingleRound(
 			}
 		}
 
+		// Durable-ack mismatch: walk the rest of the sweep before deciding, since
+		// a later endpoint may be a durable-advertising primary (Java's
+		// buildAndConnect continues, then throws only if the whole sweep found
+		// none). For a foreground sender the remembered mismatch becomes terminal
+		// at sweep exhaustion (OK-only fallback would drop believed-durable data);
+		// a drainer leaves it unremembered and just keeps retrying within its
+		// budget (§5.8). Either way, demote the host so the sweep can terminate.
+		var mismatch *QwpDurableAckMismatchError
+		if errors.As(err, &mismatch) {
+			if params.DurableMismatchTerminal {
+				pendingMismatch = mismatch
+			}
+			if params.OnEndpointFailed != nil {
+				params.OnEndpointFailed(idx, err)
+			}
+			params.Tracker.RecordTransportError(idx)
+			lastWasRoleReject = false
+			continue
+		}
+
 		// Classify the failure. Typed *QwpUpgradeRejectError carries
 		// the precise spec-relevant fields; everything else is a
 		// generic transport error.
 		var rej *QwpUpgradeRejectError
 		if errors.As(err, &rej) {
 			// AuthError (401 / 403): terminal per §6. Bypass failover.
+			// Suppress OnEndpointFailed: a terminal auth reject must
+			// surface as AUTH_FAILED only, not preceded by a transient
+			// endpoint-failure event (matches Java's QwpWebSocketSender).
 			if rej.StatusCode == 401 || rej.StatusCode == 403 {
 				return qwpSfSingleRoundResult{
 					Idx:      -1,
 					Attempts: attempts,
 					Terminal: rej,
 				}
+			}
+			if params.OnEndpointFailed != nil {
+				params.OnEndpointFailed(idx, err)
 			}
 			// X-QuestDB-Zone on a 421 reject is intentionally ignored
 			// on the SF-ingest path: the ingress walk does not route by
@@ -351,6 +399,9 @@ func qwpSfRunSingleRound(
 
 		// Non-upgrade-reject failure: TCP/TLS dial error,
 		// response-header timeout, etc. — all transient.
+		if params.OnEndpointFailed != nil {
+			params.OnEndpointFailed(idx, err)
+		}
 		params.Tracker.RecordTransportError(idx)
 		lastWasRoleReject = false
 	}
@@ -395,6 +446,23 @@ func qwpSfRunRoundWalk(
 			}
 		}
 		if rr.Terminal != nil {
+			// A terminal result short-circuits the multi-round reconnect
+			// budget: no round-boundary backoff, no BeginRound(true)
+			// re-sweep. For a 401/403 AuthError this is unambiguous. For a
+			// durable-ack mismatch (DurableMismatchTerminal foreground
+			// senders) it is a deliberate fail-closed choice: even when the
+			// durable primary is only transiently down and the sweep merely
+			// found a write-eligible NON-durable node, we stop here rather
+			// than keep retrying the primary within reconnect_max_duration.
+			// Continuing would risk silently downgrading believed-durable
+			// data to OK-only delivery during a primary-failover window, so
+			// durable senders HALT and rely on close+rebuild (SF replays
+			// from the durable watermark; memory mode loses the in-RAM tail —
+			// the accepted cost of the fail-closed guarantee). This mirrors
+			// Java's initial-connect buildAndConnect behaviour applied to
+			// reconnect. Revisiting it (retry the primary while the only
+			// blocker is a transient transport error) needs a matching Java
+			// change first — see PR #64 review M3.
 			return qwpSfRoundWalkResult{
 				Idx:      -1,
 				Attempts: totalAttempts,
@@ -409,8 +477,11 @@ func qwpSfRunRoundWalk(
 			}
 		}
 
-		// Round exhausted. Pay one round-boundary sleep or terminate
-		// if the budget is gone.
+		// Round exhausted: a full address-list sweep bound no host.
+		if params.OnRoundExhausted != nil {
+			params.OnRoundExhausted()
+		}
+		// Pay one round-boundary sleep or terminate if the budget is gone.
 		elapsed := time.Since(outageStart)
 		if elapsed >= params.MaxDuration {
 			return qwpSfRoundWalkResult{

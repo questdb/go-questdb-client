@@ -142,13 +142,17 @@ func main() {
 				continue
 			}
 			if qwp, ok := sender.(qdb.QwpSender); ok {
-				reply(fmt.Sprintf("OK acked=%d sent=0 acks=0 reconnAttempts=%d reconnSucc=%d serverErrors=%d",
+				// Under request_durable_ack, AckedFsn (and AWAIT_ACKED) is the
+				// DURABLE watermark; durableAcks/durableTrim surface that activity.
+				reply(fmt.Sprintf("OK acked=%d sent=0 acks=0 reconnAttempts=%d reconnSucc=%d serverErrors=%d durableAcks=%d durableTrim=%d",
 					qwp.AckedFsn(),
 					qwp.TotalReconnectAttempts(),
 					qwp.TotalReconnectsSucceeded(),
-					qwp.TotalServerErrors()))
+					qwp.TotalServerErrors(),
+					qwp.TotalDurableAcks(),
+					qwp.TotalDurableTrimAdvances()))
 			} else {
-				reply("OK acked=-1 sent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0")
+				reply("OK acked=-1 sent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0 durableAcks=0 durableTrim=0")
 			}
 
 		case "CLOSE":

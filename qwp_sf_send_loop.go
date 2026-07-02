@@ -56,6 +56,7 @@ const (
 	qwpSfDefaultReconnectInitialBackoff = 100 * time.Millisecond
 	qwpSfDefaultReconnectMaxBackoff     = 5 * time.Second
 	qwpSfReconnectLogThrottleInterval   = 5 * time.Second // throttle "attempt N failed" logs
+	qwpDurableAckKeepaliveDefault       = 200 * time.Millisecond
 )
 
 // qwpSfMaxSilentConnStrikes is the number of consecutive ACK-less
@@ -170,6 +171,20 @@ type qwpSfSendLoop struct {
 	// Atomic pointer for the same reason as policyResolver.
 	dispatcher atomic.Pointer[qwpSfErrorDispatcher]
 
+	// connDispatcher delivers SenderConnectionEvent payloads to the
+	// user-supplied SenderConnectionListener, off the I/O goroutine.
+	// Non-nil; uses the loud default when no listener is configured.
+	connDispatcher atomic.Pointer[qwpDispatcher[*SenderConnectionEvent]]
+
+	// connectedOnce flips true on the first successful connect so the
+	// connect-event emitter can tell CONNECTED from RECONNECTED/FAILED_OVER.
+	connectedOnce atomic.Bool
+
+	// endpoints is the addr= list, indexed by the bound idx the round-walk
+	// returns, used to fill SenderConnectionEvent host:port. Set once before
+	// the I/O goroutine starts; read-only thereafter.
+	endpoints []qwpEndpoint
+
 	// fsnAtZero is the FSN that wireSeq=0 maps to on the current
 	// connection. After a reconnect it's set to engine.ackedFsn()+1
 	// so server-side ACK math stays aligned with the disk state.
@@ -243,12 +258,38 @@ type qwpSfSendLoop struct {
 	lastTerminalServerError atomic.Pointer[SenderError]
 
 	// Counters.
-	totalFramesSent        atomic.Int64
-	totalAcks              atomic.Int64
-	totalServerErrors      atomic.Int64
-	totalReconnects        atomic.Int64
-	totalReconnectAttempts atomic.Int64
-	totalFramesReplayed    atomic.Int64
+	totalFramesSent          atomic.Int64
+	totalAcks                atomic.Int64
+	totalServerErrors        atomic.Int64
+	totalReconnects          atomic.Int64
+	totalReconnectAttempts   atomic.Int64
+	totalFramesReplayed      atomic.Int64
+	totalDurableAcks         atomic.Int64
+	totalDurableTrimAdvances atomic.Int64
+
+	// Durable-ack (request_durable_ack). Set once before sendLoopStart, then
+	// read by the loop goroutines. durable is owned by the receiver goroutine;
+	// its pendingLen is atomic so the sender can gate the keepalive ping on it.
+	// See design/qwp-cursor-durability.md.
+	durableAckMode           bool
+	durable                  *qwpDurableTracker
+	durableKeepaliveInterval time.Duration
+	warnedStrayDurable       atomic.Bool
+	// durableMismatchTerminal classifies a durable-ack mismatch: true (default,
+	// foreground) fails loud; false (drainer) retries within the reconnect budget.
+	durableMismatchTerminal bool
+	// onEndpointFailed, when set (by a drainer), is invoked in addition to the
+	// connection-event emit whenever an endpoint dial fails, so the drainer can
+	// react to a durable-ack mismatch (fire its listener, count attempts).
+	onEndpointFailed func(idx int, err error)
+
+	// progressDispatcher delivers ackedFsn advances to the user's
+	// SenderProgressHandler; nil when none is registered. progressDispatchMu
+	// guards lastProgressFsn's compare-store and the offer (both goroutines call
+	// dispatchProgress) so the delivered FSN stream stays strictly monotonic.
+	progressDispatcher atomic.Pointer[qwpDispatcher[int64]]
+	lastProgressFsn    atomic.Int64
+	progressDispatchMu sync.Mutex
 
 	// framesSentOnConn counts frames written to the wire on the
 	// current connection (reset on every connection swap). Paired
@@ -344,12 +385,15 @@ func qwpSfNewSendLoop(
 	}
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
 	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
+	l.connDispatcher.Store(newQwpConnDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
 	l.transport.Store(transport)
 	// Seed the "nothing fully sent yet" / "nothing ACK'd yet" sentinels;
 	// positionCursorForStart and swapClient re-establish both on every
 	// (re)connect.
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
+	l.lastProgressFsn.Store(-1)
+	l.durableMismatchTerminal = true
 	// Wire the producer's per-publish doorbell. Set here (before
 	// sendLoopStart and before any producer append) so it satisfies
 	// the ring's "set once before producing starts" contract, and so
@@ -450,6 +494,69 @@ func (l *qwpSfSendLoop) sendLoopDispatcher() *qwpSfErrorDispatcher {
 	return l.dispatcher.Load()
 }
 
+// sendLoopSetConnectionListener replaces the connection-event listener and the
+// dispatcher inbox capacity. Mirrors sendLoopSetErrorHandler.
+func (l *qwpSfSendLoop) sendLoopSetConnectionListener(listener SenderConnectionListener, capacity int) {
+	if capacity <= 0 {
+		capacity = qwpSfDefaultErrorInboxCapacity
+	}
+	old := l.connDispatcher.Swap(newQwpConnDispatcher(listener, capacity))
+	if old != nil {
+		old.close()
+	}
+}
+
+// sendLoopSetEndpoints records the addr= list so connection events can carry
+// host:port for a bound index. Called once before sendLoopStart.
+func (l *qwpSfSendLoop) sendLoopSetEndpoints(endpoints []qwpEndpoint) {
+	l.endpoints = endpoints
+}
+
+// sendLoopConnDispatcher returns the current connection-event dispatcher.
+func (l *qwpSfSendLoop) sendLoopConnDispatcher() *qwpDispatcher[*SenderConnectionEvent] {
+	return l.connDispatcher.Load()
+}
+
+// eventAttempt is the AttemptNumber to stamp on a connection event: 0 while the
+// sender has not connected once (contract: 0 = initial connect), the reconnect
+// counter afterward. Keeps failure/terminal events on the initial async connect
+// from reporting a spurious attempt >= 1.
+func (l *qwpSfSendLoop) eventAttempt() int64 {
+	if !l.connectedOnce.Load() {
+		return 0
+	}
+	return l.reconnectAttempts.Load()
+}
+
+// emitConn builds and offers a connection event. idx/previousIdx are endpoint
+// indices (-1 when not applicable); host:port are filled from l.endpoints.
+func (l *qwpSfSendLoop) emitConn(kind SenderConnectionEventKind, idx, previousIdx int, attempt int64, cause error) {
+	e := &SenderConnectionEvent{
+		Kind:            kind,
+		AttemptNumber:   attempt,
+		Cause:           cause,
+		TimestampMillis: time.Now().UnixMilli(),
+	}
+	if idx >= 0 && idx < len(l.endpoints) {
+		e.Host = l.endpoints[idx].host
+		e.Port = l.endpoints[idx].port
+	}
+	if previousIdx >= 0 && previousIdx < len(l.endpoints) {
+		e.PreviousHost = l.endpoints[previousIdx].host
+		e.PreviousPort = l.endpoints[previousIdx].port
+	}
+	l.connDispatcher.Load().offer(e)
+}
+
+// emitInitialConnected fires the one-shot CONNECTED event for a sender that
+// connected synchronously at construction (InitialConnectOff/Sync). The async
+// path emits CONNECTED from connectWithBackoff instead.
+func (l *qwpSfSendLoop) emitInitialConnected(idx int) {
+	if l.connectedOnce.CompareAndSwap(false, true) {
+		l.emitConn(SenderConnected, idx, -1, 0, nil)
+	}
+}
+
 // sendLoopStart launches the I/O goroutine. Idempotent — a second
 // call panics.
 func (l *qwpSfSendLoop) sendLoopStart() {
@@ -478,6 +585,12 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 		_ = t.close()
 	}
 	if d := l.dispatcher.Load(); d != nil {
+		d.close()
+	}
+	if d := l.connDispatcher.Load(); d != nil {
+		d.close()
+	}
+	if d := l.progressDispatcher.Load(); d != nil {
 		d.close()
 	}
 	return l.checkErrorOrNil()
@@ -605,6 +718,14 @@ func (l *qwpSfSendLoop) sendLoopTotalFramesReplayed() int64 {
 	return l.totalFramesReplayed.Load()
 }
 
+func (l *qwpSfSendLoop) sendLoopTotalDurableAcks() int64 {
+	return l.totalDurableAcks.Load()
+}
+
+func (l *qwpSfSendLoop) sendLoopTotalDurableTrimAdvances() int64 {
+	return l.totalDurableTrimAdvances.Load()
+}
+
 // positionCursorForStart sets fsnAtZero, nextWireSeq,
 // highestFullySent, and the cursor (sendingSegment + sendOffset) to
 // the first unsent FSN. Must be called by the I/O goroutine before it
@@ -618,6 +739,12 @@ func (l *qwpSfSendLoop) positionCursorForStart() error {
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
 	l.framesSentOnConn.Store(0)
+	if l.durableAckMode {
+		// A (re)connection re-emits cumulative durable watermarks from scratch,
+		// and replay restarts from engineAckedFsn()+1 (the durable watermark), so
+		// drop stale per-table watermarks and pending entries.
+		l.durable.reset()
+	}
 	return l.positionCursorAt(replayStart)
 }
 
@@ -862,6 +989,10 @@ func (l *qwpSfSendLoop) run() {
 					l.silentConnStrikes.Load(), err.Error())
 				se := l.qwpSfBuildBudgetExhaustedSE(reason)
 				l.totalServerErrors.Add(1)
+				// Announce the outage before the terminal event and stamp the
+				// real attempt count, matching the genuine budget-exhausted path.
+				l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
+				l.emitConn(SenderReconnectBudgetExhausted, -1, -1, l.eventAttempt(), err)
 				l.recordFatalServerError(se)
 				l.dispatcher.Load().offer(se)
 				return
@@ -870,6 +1001,8 @@ func (l *qwpSfSendLoop) run() {
 			// also sends frames and meets silence the strike count
 			// crosses the threshold and we HALT then.
 		}
+		// The wire dropped; announce the outage before the reconnect walk.
+		l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
 		// Reconnect with backoff.
 		ok := l.connectWithBackoff(err, "reconnect")
 		if !ok {
@@ -937,6 +1070,16 @@ func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
 	// frame; it never gates steady-state latency.
 	timer := time.NewTimer(l.parkInterval)
 	defer timer.Stop()
+	// Durable keepalive: an idle opted-in client must prod the server, which only
+	// flushes pending STATUS_DURABLE_ACK frames on inbound events. A nil channel
+	// (disabled) blocks forever, so the case never fires.
+	var keepaliveC <-chan time.Time
+	var keepalive *time.Timer
+	if l.durableAckMode && l.durableKeepaliveInterval > 0 {
+		keepalive = time.NewTimer(l.durableKeepaliveInterval)
+		defer keepalive.Stop()
+		keepaliveC = keepalive.C
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil // clean shutdown
@@ -948,25 +1091,55 @@ func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if !didWork {
-			// Drain a possibly-fired timer before Reset (same
-			// dance as qwpSfSegmentManager.workerLoop). Wake on
-			// shutdown, a producer doorbell, or the fallback tick.
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
+		if didWork {
+			// A real frame already prods the server, so defer the next ping.
+			if keepalive != nil {
+				drainResetTimer(keepalive, l.durableKeepaliveInterval)
 			}
-			timer.Reset(l.parkInterval)
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-l.wakeup:
-			case <-timer.C:
-			}
+			continue
+		}
+		// Wake on shutdown, a producer doorbell, the fallback tick, or a
+		// keepalive tick.
+		drainResetTimer(timer, l.parkInterval)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-l.wakeup:
+		case <-timer.C:
+		case <-keepaliveC:
+			l.sendDurableKeepalive(ctx)
+			drainResetTimer(keepalive, l.durableKeepaliveInterval)
 		}
 	}
+}
+
+// drainResetTimer stops t, drains a possibly-fired tick, and re-arms it to d.
+func drainResetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+// sendDurableKeepalive pings the server iff there are pending durable batches, to
+// elicit their STATUS_DURABLE_ACK frames. The outbound ping frame is what
+// matters (it is the server's recv event); the pong wait is truncated to a
+// quarter interval so an idle→active transition doesn't stall the send
+// goroutine behind a slow echo.
+func (l *qwpSfSendLoop) sendDurableKeepalive(ctx context.Context) {
+	if !l.durable.hasPending() {
+		return
+	}
+	tr := l.transport.Load()
+	if tr == nil {
+		return
+	}
+	pctx, cancel := context.WithTimeout(ctx, l.durableKeepaliveInterval/4)
+	defer cancel()
+	_ = tr.ping(pctx)
 }
 
 // trySendOne sends at most one frame. Returns (true, nil) if it
@@ -1048,7 +1221,18 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 	// while highestFullySent still trailed it; reconcile now that the
 	// watermark is published so a quiescent last frame — whose ACK has
 	// no later ACK to re-drive it — does not strand its acknowledgement.
-	l.applyAckWatermark()
+	//
+	// Durable mode is skipped here, but not because it is risk-free: its
+	// engine advance runs on the receiver goroutine (durableDrain, also
+	// clamped by highestFullySent), so the same last-frame strand is
+	// possible if a STATUS_DURABLE_ACK lands before this store. It cannot be
+	// re-driven from here — the durable tracker is receiver-owned, and
+	// calling durableDrain from the send goroutine would race it. The
+	// durable-ack keepalive re-elicits the ack and re-drives the drain
+	// instead; disabling it (interval <= 0) reopens that gap.
+	if !l.durableAckMode {
+		l.applyAckWatermark()
+	}
 	l.sendOffset = frameEnd
 	l.totalFramesSent.Add(1)
 	l.framesSentOnConn.Add(1)
@@ -1115,6 +1299,139 @@ func (l *qwpSfSendLoop) applyAckWatermark() {
 		acked = sent
 	}
 	l.engine.engineAcknowledge(l.fsnAtZero.Load() + acked)
+	l.dispatchProgress()
+}
+
+// sendLoopSetProgressHandler installs the ack-progress dispatcher. Call once
+// before sendLoopStart. A nil handler leaves progress dispatch off. Swap + close
+// (like sendLoopSetErrorHandler) so a repeated registration can't leak the old
+// dispatcher's goroutine.
+func (l *qwpSfSendLoop) sendLoopSetProgressHandler(handler SenderProgressHandler, capacity int) {
+	old := l.progressDispatcher.Swap(newQwpProgressDispatcher(handler, capacity))
+	if old != nil {
+		old.close()
+	}
+}
+
+// dispatchProgress delivers the engine's acked FSN to the progress handler when
+// it has advanced. The lock spans read-compare-store-offer so concurrent
+// dispatches from the send and receive goroutines can't reorder two advances
+// into a non-monotonic stream (offering outside it could).
+func (l *qwpSfSendLoop) dispatchProgress() {
+	d := l.progressDispatcher.Load()
+	if d == nil {
+		return
+	}
+	l.progressDispatchMu.Lock()
+	defer l.progressDispatchMu.Unlock()
+	fsn := l.engine.engineAckedFsn()
+	if fsn <= l.lastProgressFsn.Load() {
+		return
+	}
+	l.lastProgressFsn.Store(fsn)
+	d.offer(fsn)
+}
+
+// sendLoopSetDurableAck enables durable-ack mode and installs the tracker. Call
+// once before sendLoopStart. keepalive <= 0 disables the durable keepalive ping.
+// mismatchTerminal is true for a foreground sender (a durable-ack mismatch is
+// terminal) and false for a drainer (it retries within the reconnect budget).
+func (l *qwpSfSendLoop) sendLoopSetDurableAck(enabled bool, keepalive time.Duration, mismatchTerminal bool) {
+	l.durableAckMode = enabled
+	l.durableKeepaliveInterval = keepalive
+	l.durableMismatchTerminal = mismatchTerminal
+	if enabled {
+		l.durable = newQwpDurableTracker()
+	}
+}
+
+// durableOnOk stashes an OK ACK as a pending entry (durable mode) instead of
+// advancing the engine. wireSeq is capped at the highest assigned sequence so a
+// forged/replayed ACK cannot enqueue a sequence beyond what was sent.
+//
+// Load-bearing invariant: the server sends exactly one OK ACK per frame,
+// carrying that frame's per-table seqTxn trailer. Per-entry trim in durableDrain
+// relies on it — a server that coalesced OK ACKs (a cumulative seq skipping
+// frames, with a trailer omitting the skipped tables) would leave the skipped
+// frames untracked and let the drain advance past not-yet-durable data. Rather
+// than trust the contract silently, seqGap detects the forward jump and this
+// returns a terminal PROTOCOL_VIOLATION so the sender HALTs (fail-closed) before
+// any un-durable frame is trimmed; close+rebuild then replays from the durable
+// watermark. Matches the server / Java per-frame ACK contract; the non-durable
+// path is immune (it ignores the trailer entirely). Returns nil when the ACK is
+// well-formed.
+func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) *SenderError {
+	assigned := l.nextWireSeq.Load() - 1
+	if assigned < 0 {
+		return nil // ACK before any send
+	}
+	if expected, gap := l.durable.seqGap(seq); gap {
+		return l.qwpSfBuildDurableGapSE(seq, expected)
+	}
+	if seq > assigned {
+		log.Printf("[WARN] qwp/sf: server ACK wire seq %d exceeds highest sent %d, clamping", seq, assigned)
+		seq = assigned
+	}
+	l.durable.enqueueOk(seq, tail)
+	l.durableDrain()
+	return nil
+}
+
+// qwpSfBuildDurableGapSE builds the terminal PROTOCOL_VIOLATION surfaced when
+// the durable OK-ack sequence jumps forward (durableOnOk / the DROP path). The
+// unacked [ackedFsn+1, publishedFsn] span is attributed as lost.
+func (l *qwpSfSendLoop) qwpSfBuildDurableGapSE(gotSeq, expectedSeq int64) *SenderError {
+	from := l.engine.engineAckedFsn() + 1
+	to := l.engine.enginePublishedFsn()
+	if to < from {
+		to = from
+	}
+	return &SenderError{
+		Category:         CategoryProtocolViolation,
+		AppliedPolicy:    PolicyHalt,
+		ServerStatusByte: NoStatusByte,
+		ServerMessage: fmt.Sprintf("durable-ack OK sequence gap: got %d, expected %d — server "+
+			"coalesced or dropped an OK ack, leaving frames untracked for durable trimming", gotSeq, expectedSeq),
+		MessageSequence: gotSeq,
+		FromFsn:         from,
+		ToFsn:           to,
+		DetectedAt:      time.Now(),
+	}
+}
+
+// durableDrain releases every pending batch now covered by the durable
+// watermarks and advances the engine to the highest such wire sequence. The
+// drain is capped at highestFullySent — the same munmap-safety clamp the
+// non-durable path applies in applyAckWatermark — so a forged/early durable ack
+// cannot advance the trim watermark onto a frame the send goroutine is still
+// reading out of an mmap'd segment.
+func (l *qwpSfSendLoop) durableDrain() {
+	if wireSeq := l.durable.drainUpTo(l.highestFullySent.Load()); wireSeq >= 0 {
+		l.engine.engineAcknowledge(l.fsnAtZero.Load() + wireSeq)
+		l.totalDurableTrimAdvances.Add(1)
+		l.dispatchProgress()
+	}
+}
+
+// durableRejectionSeqGap records a rejection's wire sequence in the durable
+// density tracker and returns a terminal PROTOCOL_VIOLATION if it skips forward
+// (a coalesced/dropped OK ack). A rejection consumes a wire sequence like an OK
+// ack, so both the pre-send and the normal rejection path must advance the
+// tracker's high-water mark; skipping it on either would strand lastSeq behind
+// and trip a spurious gap HALT on the next dense ack. No-op outside durable mode.
+func (l *qwpSfSendLoop) durableRejectionSeqGap(seq int64) *SenderError {
+	if !l.durableAckMode {
+		return nil
+	}
+	expected, gap := l.durable.seqGap(seq)
+	if !gap {
+		return nil
+	}
+	gapSE := l.qwpSfBuildDurableGapSE(seq, expected)
+	l.totalServerErrors.Add(1)
+	l.recordFatalServerError(gapSE)
+	l.dispatcher.Load().offer(gapSE)
+	return gapSE
 }
 
 // receiverLoop reads ACKs from the WebSocket and routes them to
@@ -1140,10 +1457,16 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			return err
 		}
 		if status == QwpStatusDurableAck {
-			// Per-table fsync confirmation. Cursor SF doesn't
-			// currently surface durable-ack progress to the
-			// producer, but receiving one is not an error — match
-			// the Java client and silently ignore.
+			// Per-table durable-upload watermark. In durable-ack mode it
+			// advances the trim/replay/await watermark; otherwise it is an
+			// informational frame the server must not have sent — ignore.
+			if l.durableAckMode {
+				l.totalDurableAcks.Add(1)
+				l.durable.applyDurable(data[qwpAckTablesOffset(status):])
+				l.durableDrain()
+			} else if l.warnedStrayDurable.CompareAndSwap(false, true) {
+				log.Printf("[WARN] qwp/sf: received STATUS_DURABLE_ACK frame without opt-in — ignoring")
+			}
 			continue
 		}
 		seq := parseAckSequence(data)
@@ -1186,6 +1509,9 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				// on this connection to drop. Still surface the
 				// typed error so HALT latches and the handler fires.
 				// Mirrors handlePreSendRejection in the Java client.
+				if se := l.durableRejectionSeqGap(seq); se != nil {
+					return se
+				}
 				from := l.engine.engineAckedFsn() + 1
 				to := l.engine.enginePublishedFsn()
 				if to < from {
@@ -1215,6 +1541,9 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				cappedSeq = highestSent
 			}
 			fsn := l.fsnAtZero.Load() + cappedSeq
+			if se := l.durableRejectionSeqGap(seq); se != nil {
+				return se
+			}
 			se := &SenderError{
 				Category:         cat,
 				AppliedPolicy:    pol,
@@ -1236,28 +1565,50 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				return se
 			}
 			l.dispatcher.Load().offer(se)
-			// PolicyDropAndContinue: advance past the rejected span
-			// via the same engine entry the success branch uses. The
-			// segment manager will trim the now-acked range on its
-			// next maintenance pass. Bump totalAcks for parity with
-			// the success path so producer-visible counters reflect
-			// "the server has resolved this batch".
-			l.engine.engineAcknowledge(fsn)
+			// PolicyDropAndContinue: advance past the rejected span. In
+			// durable mode a rejected batch never reaches the WAL, so no
+			// durable-ack ever covers it — stash an empty (trivially-durable)
+			// entry so the watermark advances past it, but only once every
+			// preceding OK batch is durable. Otherwise advance the engine
+			// directly. Bump totalAcks for parity with the success path.
+			if l.durableAckMode {
+				l.durable.enqueueEmpty(cappedSeq)
+				l.durableDrain()
+			} else {
+				l.engine.engineAcknowledge(fsn)
+				l.dispatchProgress()
+			}
 			l.totalAcks.Add(1)
 			continue
 		}
-		// Record the server's cumulative ACK sequence, then reconcile it
-		// against highestFullySent. applyAckWatermark caps the advance at
-		// the last fully-sent frame, so a malformed, early, or forged
-		// server response can never move ackedFsn over an in-flight frame
-		// (a trim would munmap a segment the I/O thread is still reading)
-		// nor over a frame a wire failure dropped before delivery. The
-		// matching call on the send side re-drives the same reconciliation
-		// so an ACK that arrives before its frame's send completes is not
-		// stranded when no later ACK follows it.
-		l.serverAckedSeq.Store(seq)
 		l.totalAcks.Add(1)
-		l.applyAckWatermark()
+		if l.durableAckMode {
+			// Durable mode: stash the OK and wait for STATUS_DURABLE_ACK to
+			// trim. serverAckedSeq is deliberately not recorded here — the
+			// durable tracker owns advancement and reconnect targets
+			// engineAckedFsn()+1, so the non-durable watermark (whose only
+			// reader, applyAckWatermark, is guarded off below) would be dead
+			// state. A sequence gap HALTs fail-closed (latch before dispatch so a
+			// handler that synchronously calls Flush observes the typed error).
+			if se := l.durableOnOk(seq, data[qwpAckTablesOffset(QwpStatusOK):]); se != nil {
+				l.totalServerErrors.Add(1)
+				l.recordFatalServerError(se)
+				l.dispatcher.Load().offer(se)
+				return se
+			}
+		} else {
+			// Record the server's cumulative ACK sequence, then reconcile it
+			// against highestFullySent. applyAckWatermark caps the advance at
+			// the last fully-sent frame, so a malformed, early, or forged
+			// server response can never move ackedFsn over an in-flight frame
+			// (a trim would munmap a segment the I/O thread is still reading)
+			// nor over a frame a wire failure dropped before delivery. The
+			// matching call on the send side re-drives the same reconciliation
+			// so an ACK that arrives before its frame's send completes is not
+			// stranded when no later ACK follows it.
+			l.serverAckedSeq.Store(seq)
+			l.applyAckWatermark()
+		}
 	}
 }
 
@@ -1297,6 +1648,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 	enteringPreviousIdx := l.previousIdx
 	l.previousIdx = -1
 
+	var round int64
 	params := qwpSfRoundWalkParams{
 		Factory:        l.reconnectFactory,
 		Tracker:        l.tracker,
@@ -1307,6 +1659,22 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 			l.reconnectAttempts.Add(1)
 			l.totalReconnectAttempts.Add(1)
 		},
+		OnEndpointFailed: func(idx int, derr error) {
+			l.emitConn(SenderEndpointAttemptFailed, idx, -1, l.eventAttempt(), derr)
+			if l.onEndpointFailed != nil {
+				l.onEndpointFailed(idx, derr)
+			}
+		},
+		OnRoundExhausted: func() {
+			round++
+			l.connDispatcher.Load().offer(&SenderConnectionEvent{
+				Kind:            SenderAllEndpointsUnreachable,
+				AttemptNumber:   l.eventAttempt(),
+				RoundNumber:     round,
+				TimestampMillis: time.Now().UnixMilli(),
+			})
+		},
+		DurableMismatchTerminal: l.durableMismatchTerminal,
 	}
 	result := qwpSfRunRoundWalk(l.ctx, nil, params, enteringPreviousIdx)
 
@@ -1322,11 +1690,33 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 			return false
 		}
 		l.totalReconnects.Add(1)
+		attempt := l.reconnectAttempts.Load()
+		switch {
+		case !l.connectedOnce.Swap(true):
+			// First successful connect in the sender's lifetime — not a
+			// reconnect, so AttemptNumber is 0 (matches the sync/off
+			// emitInitialConnected path and the SenderConnectionEvent
+			// contract: 0 = initial / not-a-reconnect).
+			l.emitConn(SenderConnected, result.Idx, -1, 0, nil)
+		case result.Idx == enteringPreviousIdx:
+			l.emitConn(SenderReconnected, result.Idx, -1, attempt, nil)
+		default:
+			l.emitConn(SenderFailedOver, result.Idx, enteringPreviousIdx, attempt, nil)
+		}
 		return true
 	}
 	if result.Terminal != nil {
 		se := l.qwpSfBuildUpgradeFailureSE(result.Terminal)
 		l.totalServerErrors.Add(1)
+		// Fire the terminal connection event before latching the producer-
+		// observable error, so a listener is notified no later than the
+		// producer learns via its next API call (matches Java's order). Only an
+		// actual auth reject maps to SenderAuthFailed; other terminal upgrade
+		// failures (e.g. a durable-ack mismatch) surface via the typed
+		// PROTOCOL_VIOLATION SenderError only.
+		if qwpSfIsAuthFailure(result.Terminal) {
+			l.emitConn(SenderAuthFailed, -1, -1, l.eventAttempt(), result.Terminal)
+		}
 		l.recordFatalServerError(se)
 		l.dispatcher.Load().offer(se)
 		return false
@@ -1350,6 +1740,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		phase, result.Exhausted, initial)
 	se := l.qwpSfBuildBudgetExhaustedSE(reason)
 	l.totalServerErrors.Add(1)
+	l.emitConn(SenderReconnectBudgetExhausted, -1, -1, l.reconnectAttempts.Load(), result.Exhausted)
 	l.recordFatalServerError(se)
 	l.dispatcher.Load().offer(se)
 	return false
@@ -1380,6 +1771,12 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
 	l.framesSentOnConn.Store(0)
+	if l.durableAckMode {
+		// A (re)connection re-emits cumulative durable watermarks from scratch,
+		// and replay restarts from engineAckedFsn()+1 (the durable watermark), so
+		// drop stale per-table watermarks and pending entries.
+		l.durable.reset()
+	}
 	pubAtSwap := l.engine.enginePublishedFsn()
 	if pubAtSwap >= replayStart {
 		l.replayTargetFsn = pubAtSwap
@@ -1473,12 +1870,22 @@ func qwpSfIsProtocolUpgradeFailure(err error) bool {
 // already determined the err is one of those two via the helpers
 // above.
 func (l *qwpSfSendLoop) qwpSfBuildUpgradeFailureSE(err error) *SenderError {
+	return qwpSfUpgradeFailureSE(l.engine.engineAckedFsn()+1, l.engine.enginePublishedFsn(), err)
+}
+
+// qwpSfUpgradeFailureSE is the engine-independent core of the above so the
+// initial-connect (InitialConnectOff / InitialConnectSync) paths — which fail
+// before a send loop exists — can synthesize the SAME typed *SenderError the
+// async reconnect path latches, keeping the WithRequestDurableAck /
+// QwpDurableAckMismatchError PROTOCOL_VIOLATION contract uniform across all
+// three connect modes. err is preserved as the SenderError cause (Unwrap) so
+// errors.As still reaches the typed transport error. [from,to] is the unacked
+// FSN span (empty at initial connect).
+func qwpSfUpgradeFailureSE(from, to int64, err error) *SenderError {
 	cat := CategoryProtocolViolation
 	if qwpSfIsAuthFailure(err) {
 		cat = CategorySecurityError
 	}
-	from := l.engine.engineAckedFsn() + 1
-	to := l.engine.enginePublishedFsn()
 	if to < from {
 		to = from
 	}
@@ -1491,6 +1898,7 @@ func (l *qwpSfSendLoop) qwpSfBuildUpgradeFailureSE(err error) *SenderError {
 		FromFsn:          from,
 		ToFsn:            to,
 		DetectedAt:       time.Now(),
+		cause:            err,
 	}
 }
 
@@ -1555,6 +1963,8 @@ func qwpSfConnectWithRetry(
 	factory qwpSfReconnectFactory,
 	tracker *qwpHostTracker,
 	maxDuration, initialBackoff, maxBackoff time.Duration,
+	durableMismatchTerminal bool,
+	onEndpointFailed func(idx int, err error),
 ) (*qwpTransport, int, error) {
 	if maxDuration <= 0 {
 		maxDuration = qwpSfDefaultReconnectMaxDuration
@@ -1569,11 +1979,13 @@ func qwpSfConnectWithRetry(
 		tracker = newQwpHostTracker(1, "", qwpTargetAny)
 	}
 	params := qwpSfRoundWalkParams{
-		Factory:        factory,
-		Tracker:        tracker,
-		MaxDuration:    maxDuration,
-		InitialBackoff: initialBackoff,
-		MaxBackoff:     maxBackoff,
+		Factory:                 factory,
+		Tracker:                 tracker,
+		MaxDuration:             maxDuration,
+		InitialBackoff:          initialBackoff,
+		MaxBackoff:              maxBackoff,
+		OnEndpointFailed:        onEndpointFailed,
+		DurableMismatchTerminal: durableMismatchTerminal,
 	}
 	result := qwpSfRunRoundWalk(ctx, nil, params, -1)
 	if result.Transport != nil {

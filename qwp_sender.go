@@ -160,6 +160,12 @@ type QwpSender interface {
 	// raise WithErrorInboxCapacity or speed up the handler.
 	DroppedErrorNotifications() int64
 
+	// DroppedConnectionNotifications returns the cumulative count of
+	// SenderConnectionEvent payloads dropped because the listener's
+	// bounded inbox was full. Non-zero means the listener is too slow;
+	// raise WithConnectionListenerInboxCapacity or speed it up.
+	DroppedConnectionNotifications() int64
+
 	// TotalErrorNotificationsDelivered returns the cumulative count
 	// of SenderError payloads delivered to the user-supplied
 	// handler. Includes deliveries where the handler panicked
@@ -189,6 +195,15 @@ type QwpSender interface {
 	// buffer space. One increment per blocking call, not per spin-
 	// park. Non-zero values mean the producer is outpacing the wire.
 	TotalBackpressureStalls() int64
+
+	// TotalDurableAcks returns the cumulative count of STATUS_DURABLE_ACK
+	// frames processed. Always 0 unless request_durable_ack is on.
+	TotalDurableAcks() int64
+
+	// TotalDurableTrimAdvances returns the cumulative count of times a
+	// durable ACK advanced the trim/replay/await watermark. Always 0
+	// unless request_durable_ack is on.
+	TotalDurableTrimAdvances() int64
 
 	// BackgroundDrainers returns a snapshot of the drainers the
 	// foreground sender has dispatched for orphan slot adoption.
@@ -1217,6 +1232,83 @@ func (s *qwpLineSender) AtNow(ctx context.Context) error {
 func (s *qwpLineSender) Flush(ctx context.Context) error {
 	_, err := s.FlushAndGetSequence(ctx)
 	return err
+}
+
+// flushForReturn readies the delegate for return to the pool: it captures and
+// clears any latched fluent-API error, drops any in-progress (un-At'd) row,
+// and — crucially — still flushes the committed rows into the cursor engine so
+// the slot returns clean. It mirrors closeCursor's producer-state handling
+// (capture latch, drop open row, enqueue pending rows) minus the teardown; the
+// slot stays live for the next borrower. Producer-goroutine only.
+//
+// The pool must route lease return through this, not Flush (C1):
+// FlushAndGetSequence early-returns a latched error ahead of its pending-rows
+// branch, so a lease closed with a committed row AND a latched error (e.g. one
+// illegal column name on untrusted input, after a good row) would leave that
+// committed row buffered in the recycled slot — the next borrower would then
+// silently ship it as a phantom/duplicate row. A latched error must surface
+// (retain-on-error) without suppressing the flush of already-committed rows.
+//
+// Returns the first error: the captured latch (the original user-facing cause)
+// takes precedence, else an enqueue or terminal I/O failure. On a latch-only
+// error the committed rows are flushed regardless, and any terminal fault is
+// surfaced so the pool discards the slot instead of recycling a dead one.
+//
+// The first return value, retained, reports whether committed rows are STILL
+// buffered un-enqueued after the attempt — the enqueue hit the backpressure
+// append deadline (e.g. the cursor ring saturated during an outage) or the
+// engine was closed, neither of which is a terminal send-loop HALT. Such a slot
+// is DIRTY: recycling it would ship this borrower's rows under the next
+// borrower's FSN (C1 borrower-isolation). The pool must discard it rather than
+// recycle. retained is only meaningful on the producer goroutine; the
+// error-handler path can't inspect producer state, so it reports true —
+// unable to prove the slot clean, it errs on discard.
+func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err error) {
+	if s.closed.Load() {
+		return false, errClosedSenderFlush
+	}
+	if s.calledFromErrorHandler() {
+		// Running on the dispatcher goroutine (Close invoked from inside a
+		// SenderErrorHandler): touching producer state (lastErr / hasTable /
+		// pendingRowCount / buffers) would race the producer — the C3 hazard.
+		// Surface only the latched terminal error, like closeCursor does. We
+		// can't safely read pendingRowCount, so we can't prove the slot is
+		// clean either — report retained=true so the pool discards it instead
+		// of recycling a possibly-dirty slot under the next borrower (C1).
+		return true, s.cursorSendLoop.sendLoopCheckError()
+	}
+	firstErr := s.lastErr
+	s.lastErr = nil
+	if s.hasTable {
+		if s.currentTable != nil {
+			s.currentTable.cancelRow()
+		}
+		s.hasTable = false
+		s.currentTable = nil
+		s.cachedDesignatedTs = nil
+	}
+	if s.pendingRowCount > 0 {
+		if err := s.enqueueCursor(ctx); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			s.resetAfterFlush()
+		}
+	}
+	// Surface a terminal I/O error the send loop latched (in the background
+	// or during the enqueue above) so a poisoned slot is discarded, not
+	// recycled — parity with flushCursor's tail. A captured fluent latch
+	// takes precedence as the original user-facing cause.
+	if firstErr == nil {
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			firstErr = err
+		}
+	}
+	// pendingRowCount > 0 here means enqueueCursor could not seal the
+	// committed rows (backpressure deadline / engine closed); enqueueCursor
+	// leaves them retained for a later flush. The slot is dirty.
+	return s.pendingRowCount > 0, firstErr
 }
 
 // FlushAndGetSequence implements QwpSender.FlushAndGetSequence.

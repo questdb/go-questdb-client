@@ -38,9 +38,14 @@ const qwpSfFailedSentinelName = ".failed"
 
 // qwpSfScanOrphans walks the group root sfDir and returns every
 // child directory that:
-//   - is not the caller's own slot (filtered by excludeSlotName)
+//   - is not excluded by the exclude predicate (a standalone sender
+//     excludes its own slot; the QwpSender pool fences its whole
+//     in-range slot set so live siblings are never adopted)
 //   - contains at least one *.sfa segment file
 //   - does NOT contain the .failed sentinel
+//
+// exclude is called with each child directory's base name; nil
+// excludes nothing.
 //
 // Lock state is intentionally not part of the candidate filter —
 // testing it requires actually opening + flocking the lock file,
@@ -49,7 +54,7 @@ const qwpSfFailedSentinelName = ".failed"
 // that fail; this keeps the scanner pure and read-only.
 //
 // Returns an empty list if sfDir doesn't exist or is empty.
-func qwpSfScanOrphans(sfDir, excludeSlotName string) []string {
+func qwpSfScanOrphans(sfDir string, exclude func(name string) bool) []string {
 	if sfDir == "" {
 		return nil
 	}
@@ -69,7 +74,7 @@ func qwpSfScanOrphans(sfDir, excludeSlotName string) []string {
 		if name == "." || name == ".." {
 			continue
 		}
-		if excludeSlotName != "" && name == excludeSlotName {
+		if exclude != nil && exclude(name) {
 			continue
 		}
 		slotPath := filepath.Join(sfDir, name)
