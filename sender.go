@@ -824,6 +824,13 @@ func WithConnectTimeout(d time.Duration) LineSenderOption {
 // advertising durable-ack, otherwise the connect fails terminally with a
 // *SenderError of category PROTOCOL_VIOLATION. Equivalent to the connect-string
 // request_durable_ack key. See design/qwp-cursor-durability.md.
+//
+// Because only a durable ack advances the watermark, a healthy connection whose
+// server keeps committing (OK) but has not yet uploaded (e.g. object storage is
+// wedged) does not advance AckedFsn: the data is safe on disk and buffering
+// continues, but AwaitAckedFsn blocks until its context and Close waits up to
+// close_flush_timeout before returning the "data may be lost" drain timeout. This
+// is fail-slow by design; do not treat a stalled AckedFsn as a client fault.
 func WithRequestDurableAck(enabled bool) LineSenderOption {
 	return func(s *lineSenderConfig) { s.requestDurableAck = enabled }
 }

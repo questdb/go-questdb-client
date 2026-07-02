@@ -232,7 +232,13 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 				slotIndex = p.allocateSlotIndexLocked()
 			}
 			p.mu.Unlock()
-			slot, err := p.createSlotAt(ctx, slotIndex, false)
+			// Bound the synchronous dial by the acquire deadline too, so a
+			// borrow against a slow/black-holed server is abandoned within
+			// acquire_timeout_ms rather than riding the connect / reconnect
+			// budget (HikariCP getConnection parity).
+			bctx, cancel := context.WithDeadline(ctx, deadline)
+			slot, err := p.createSlotAt(bctx, slotIndex, false)
+			cancel()
 			p.mu.Lock()
 			p.inFlightCreations--
 			if err != nil {
@@ -391,13 +397,37 @@ func (p *qwpSenderPool) reapIdle() {
 	if p.closing.Load() {
 		return
 	}
-	now := time.Now()
-	var toClose []*qwpSenderSlot
-	p.mu.Lock()
-	if p.closed {
+	toClose := p.selectReapVictims(time.Now())
+	for _, slot := range toClose {
+		closeErr := closeSlotGuarded(context.Background(), slot.delegate)
+		if closeErr != nil {
+			// Autonomous reap has no caller to return this to (the producer long
+			// since returned its lease), so surface it here — it may be the
+			// "data may be lost" drain timeout.
+			log.Printf("[WARN] qwp pool: reaping a slot failed to drain cleanly: %v", closeErr)
+		}
+		p.mu.Lock()
+		p.reclaimSlotLocked(slot, closeErr)
 		p.mu.Unlock()
-		return
 	}
+	if len(toClose) > 0 {
+		p.mu.Lock()
+		p.broadcastLocked()
+		p.mu.Unlock()
+	}
+}
+
+// selectReapVictims removes the idle-expired / over-age / poisoned slots from the
+// available set under the lock and returns them for off-lock closing. The lock is
+// released via defer so a panic in the selection can never strand it (the reap
+// runs behind a recover in the housekeeper).
+func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
+	}
+	var toClose []*qwpSenderSlot
 	kept := p.available[:0]
 	for _, slot := range p.available {
 		idleExpired := p.idleTimeout > 0 && now.Sub(slot.idleSince) >= p.idleTimeout
@@ -429,25 +459,7 @@ func (p *qwpSenderPool) reapIdle() {
 		kept = append(kept, slot)
 	}
 	p.available = kept
-	p.mu.Unlock()
-
-	for _, slot := range toClose {
-		closeErr := closeSlotGuarded(context.Background(), slot.delegate)
-		if closeErr != nil {
-			// Autonomous reap has no caller to return this to (the producer long
-			// since returned its lease), so surface it here — it may be the
-			// "data may be lost" drain timeout.
-			log.Printf("[WARN] qwp pool: reaping a slot failed to drain cleanly: %v", closeErr)
-		}
-		p.mu.Lock()
-		p.reclaimSlotLocked(slot, closeErr)
-		p.mu.Unlock()
-	}
-	if len(toClose) > 0 {
-		p.mu.Lock()
-		p.broadcastLocked()
-		p.mu.Unlock()
-	}
+	return toClose
 }
 
 // close shuts the pool down and disconnects its slots. Idempotent.
@@ -656,7 +668,7 @@ func (p *qwpSenderPool) poolSnapshot() (total, available, leaked int) {
 var (
 	errPoolClosed    = errors.New("qwp pool: handle is closed")
 	errPoolExhausted = errors.New("qwp pool: timed out waiting for a sender")
-	errStaleLease    = errors.New("qwp pool: sender lease is no longer bound to its slot (returned, or the slot was evicted)")
+	errStaleLease    = errors.New("qwp pool: lease is no longer bound to its slot (returned, or the slot was evicted)")
 )
 
 // qwpPooledSender is the per-borrow lease handed to the caller. It forwards

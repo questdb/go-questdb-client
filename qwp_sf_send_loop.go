@@ -989,7 +989,10 @@ func (l *qwpSfSendLoop) run() {
 					l.silentConnStrikes.Load(), err.Error())
 				se := l.qwpSfBuildBudgetExhaustedSE(reason)
 				l.totalServerErrors.Add(1)
-				l.emitConn(SenderReconnectBudgetExhausted, -1, -1, 0, err)
+				// Announce the outage before the terminal event and stamp the
+				// real attempt count, matching the genuine budget-exhausted path.
+				l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
+				l.emitConn(SenderReconnectBudgetExhausted, -1, -1, l.eventAttempt(), err)
 				l.recordFatalServerError(se)
 				l.dispatcher.Load().offer(se)
 				return
@@ -1347,16 +1350,23 @@ func (l *qwpSfSendLoop) sendLoopSetDurableAck(enabled bool, keepalive time.Durat
 // forged/replayed ACK cannot enqueue a sequence beyond what was sent.
 //
 // Load-bearing invariant: the server sends exactly one OK ACK per frame,
-// carrying that frame's per-table seqTxn trailer. Per-entry trim in
-// durableDrain relies on it — a server that coalesced OK ACKs (a cumulative
-// seq skipping frames, with a trailer omitting the skipped tables) could let
-// the drain advance past a not-yet-durable frame. This matches the server /
-// Java per-frame ACK contract; the non-durable path is immune (it ignores the
-// trailer entirely).
-func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) {
+// carrying that frame's per-table seqTxn trailer. Per-entry trim in durableDrain
+// relies on it — a server that coalesced OK ACKs (a cumulative seq skipping
+// frames, with a trailer omitting the skipped tables) would leave the skipped
+// frames untracked and let the drain advance past not-yet-durable data. Rather
+// than trust the contract silently, seqGap detects the forward jump and this
+// returns a terminal PROTOCOL_VIOLATION so the sender HALTs (fail-closed) before
+// any un-durable frame is trimmed; close+rebuild then replays from the durable
+// watermark. Matches the server / Java per-frame ACK contract; the non-durable
+// path is immune (it ignores the trailer entirely). Returns nil when the ACK is
+// well-formed.
+func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) *SenderError {
 	assigned := l.nextWireSeq.Load() - 1
 	if assigned < 0 {
-		return // ACK before any send
+		return nil // ACK before any send
+	}
+	if expected, gap := l.durable.seqGap(seq); gap {
+		return l.qwpSfBuildDurableGapSE(seq, expected)
 	}
 	if seq > assigned {
 		log.Printf("[WARN] qwp/sf: server ACK wire seq %d exceeds highest sent %d, clamping", seq, assigned)
@@ -1364,6 +1374,29 @@ func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) {
 	}
 	l.durable.enqueueOk(seq, tail)
 	l.durableDrain()
+	return nil
+}
+
+// qwpSfBuildDurableGapSE builds the terminal PROTOCOL_VIOLATION surfaced when
+// the durable OK-ack sequence jumps forward (durableOnOk / the DROP path). The
+// unacked [ackedFsn+1, publishedFsn] span is attributed as lost.
+func (l *qwpSfSendLoop) qwpSfBuildDurableGapSE(gotSeq, expectedSeq int64) *SenderError {
+	from := l.engine.engineAckedFsn() + 1
+	to := l.engine.enginePublishedFsn()
+	if to < from {
+		to = from
+	}
+	return &SenderError{
+		Category:         CategoryProtocolViolation,
+		AppliedPolicy:    PolicyHalt,
+		ServerStatusByte: NoStatusByte,
+		ServerMessage: fmt.Sprintf("durable-ack OK sequence gap: got %d, expected %d — server "+
+			"coalesced or dropped an OK ack, leaving frames untracked for durable trimming", gotSeq, expectedSeq),
+		MessageSequence: gotSeq,
+		FromFsn:         from,
+		ToFsn:           to,
+		DetectedAt:      time.Now(),
+	}
 }
 
 // durableDrain releases every pending batch now covered by the durable
@@ -1484,6 +1517,18 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				cappedSeq = highestSent
 			}
 			fsn := l.fsnAtZero.Load() + cappedSeq
+			// A rejection consumes a wire sequence too; in durable mode a forward
+			// gap here means the server coalesced/dropped an OK ack for a sent
+			// frame, so HALT fail-closed before enqueueEmpty advances past it.
+			if l.durableAckMode {
+				if expected, gap := l.durable.seqGap(seq); gap {
+					gapSE := l.qwpSfBuildDurableGapSE(seq, expected)
+					l.totalServerErrors.Add(1)
+					l.recordFatalServerError(gapSE)
+					l.dispatcher.Load().offer(gapSE)
+					return gapSE
+				}
+			}
 			se := &SenderError{
 				Category:         cat,
 				AppliedPolicy:    pol,
@@ -1528,8 +1573,14 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// durable tracker owns advancement and reconnect targets
 			// engineAckedFsn()+1, so the non-durable watermark (whose only
 			// reader, applyAckWatermark, is guarded off below) would be dead
-			// state.
-			l.durableOnOk(seq, data[qwpAckTablesOffset(QwpStatusOK):])
+			// state. A sequence gap HALTs fail-closed (latch before dispatch so a
+			// handler that synchronously calls Flush observes the typed error).
+			if se := l.durableOnOk(seq, data[qwpAckTablesOffset(QwpStatusOK):]); se != nil {
+				l.totalServerErrors.Add(1)
+				l.recordFatalServerError(se)
+				l.dispatcher.Load().offer(se)
+				return se
+			}
 		} else {
 			// Record the server's cumulative ACK sequence, then reconcile it
 			// against highestFullySent. applyAckWatermark caps the advance at

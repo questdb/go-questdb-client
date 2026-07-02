@@ -381,6 +381,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// transient (not terminal): the drainer retries, since its data is pinned.
 	loop.sendLoopSetDurableAck(d.durableAckMode, d.durableKeepalive, false)
 	loop.onEndpointFailed = d.onDurableMismatch
+	loop.sendLoopSetConnectionListener(silentSenderConnectionListener, 0)
 	// Share the foreground tracker; the loop carries its OWN
 	// previousIdx slot (failover.md §2.3 "per-caller previousIdx,
 	// not shared") so a mid-stream demote here doesn't corrupt

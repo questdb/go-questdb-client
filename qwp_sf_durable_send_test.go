@@ -115,6 +115,74 @@ func TestQwpDurableAckGatesWatermark(t *testing.T) {
 	}
 }
 
+// TestQwpDurableAckSeqGapHalts pins the fail-closed defense against a server that
+// coalesces or drops an OK ack in durable mode. Skipping a wire sequence would
+// leave the skipped frame with no pending entry, so a later durable ack could
+// trim past it — silent loss of data the API promises is durable. The client must
+// instead HALT with PROTOCOL_VIOLATION and never advance the watermark.
+func TestQwpDurableAckSeqGapHalts(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if _, _, err := conn.Read(ctx); err != nil { // frame wireSeq 0
+			return
+		}
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
+		if _, _, err := conn.Read(ctx); err != nil { // frame wireSeq 1
+			return
+		}
+		// Coalesced/dropped ack: OK for wireSeq 2, skipping 1 — the documented hole.
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(2, ackTableEntry{"trades", 2}))
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	s, err := NewLineSender(ctx,
+		WithQwp(), WithAddress(addr),
+		WithRequestDurableAck(true),
+		WithDurableAckKeepaliveInterval(0),
+	)
+	if err != nil {
+		t.Fatalf("NewLineSender: %v", err)
+	}
+	defer s.Close(ctx)
+	qs := s.(QwpSender)
+
+	for i := 0; i < 2; i++ {
+		if err := s.Table("trades").Int64Column("v", int64(i)).AtNow(ctx); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if _, err := qs.FlushAndGetSequence(ctx); err != nil {
+			t.Fatalf("flush %d: %v", i, err)
+		}
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	err = qs.AwaitAckedFsn(waitCtx, 0)
+	if err == nil {
+		t.Fatal("AwaitAckedFsn returned nil; expected a terminal durable-ack sequence-gap error")
+	}
+	var se *SenderError
+	if !errors.As(err, &se) || se.Category != CategoryProtocolViolation {
+		t.Fatalf("gap error = %v; want *SenderError of category PROTOCOL_VIOLATION", err)
+	}
+	if got := qs.AckedFsn(); got >= 0 {
+		t.Fatalf("AckedFsn advanced to %d despite the sequence gap; it must stay frozen", got)
+	}
+}
+
 // newQwpPingGatedDurableServer stands in for a durable-ack primary that flushes
 // the covering STATUS_DURABLE_ACK only AFTER it has observed a client ping, not
 // on a wall-clock timer. OnPingReceived (driven by conn.Read processing the

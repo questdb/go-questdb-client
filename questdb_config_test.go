@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -194,6 +195,50 @@ func TestQuestDBAllOptionsApplied(t *testing.T) {
 
 // TestQuestDBHousekeeperReaps drives the housekeeper goroutine end to end: with
 // a short interval + idle timeout, surplus pooled senders are reaped to min.
+// TestQuestDBReaperRaceVsBorrow drives BorrowSender/Close concurrently against a
+// housekeeper reaping on a 1ms cadence with idle_timeout_ms=1, so the
+// reap-vs-borrow and reap-vs-return interleavings — guarded by generation
+// stamping and the pool mutex — are exercised under -race, not just at
+// quiescence. sender_pool_max exceeds the goroutine count, so no borrow ever
+// waits at capacity; against a healthy server every borrow must succeed.
+func TestQuestDBReaperRaceVsBorrow(t *testing.T) {
+	srv := newQuestDBTestServer(t, nil)
+	defer srv.Close()
+	ctx := context.Background()
+	db, err := NewQuestDB(ctx,
+		"ws::addr="+strings.TrimPrefix(srv.URL, "http://")+
+			";sender_pool_min=0;sender_pool_max=12;idle_timeout_ms=1;housekeeper_interval_ms=1;",
+		noopConnListener())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	defer db.Close(ctx)
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				s, berr := db.BorrowSender(ctx)
+				if berr != nil {
+					errCh <- berr
+					return
+				}
+				_ = s.Close(ctx)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		t.Fatalf("borrow under reap race: %v", e)
+	}
+}
+
 func TestQuestDBHousekeeperReaps(t *testing.T) {
 	srv := newQuestDBTestServer(t, nil)
 	defer srv.Close()

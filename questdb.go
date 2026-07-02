@@ -220,6 +220,15 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	if err != nil {
 		return nil, err
 	}
+	// confFromStr validates individual keys but not the cross-field checks
+	// newLineSender runs via sanitizeQwpConf; apply them on a throwaway parse so
+	// an invalid ingest config (e.g. auto_flush_bytes > sf_max_bytes) is rejected
+	// here even when a pool min is 0 and no slot connects at build.
+	if probe, perr := confFromStr(conf); perr != nil {
+		return nil, perr
+	} else if serr := sanitizeQwpConf(probe); serr != nil {
+		return nil, serr
+	}
 	if _, err := parseQwpQueryConf(conf); err != nil {
 		return nil, err
 	}

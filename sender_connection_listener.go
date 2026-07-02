@@ -180,6 +180,12 @@ func defaultSenderConnectionListener(e SenderConnectionEvent) {
 	log.Printf("%s qwp: %s", level, e)
 }
 
+// silentSenderConnectionListener drops every event. Used by background drainers,
+// whose outcome is reported through QwpBackgroundDrainerListener; their raw
+// connection lifecycle would otherwise reach the loud default with no endpoint
+// context and masquerade as the foreground sender flapping.
+func silentSenderConnectionListener(SenderConnectionEvent) {}
+
 // newQwpConnDispatcher builds the off-I/O dispatcher that delivers connection
 // events to listener (or the loud default when nil).
 func newQwpConnDispatcher(listener SenderConnectionListener, capacity int) *qwpDispatcher[*SenderConnectionEvent] {

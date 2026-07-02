@@ -29,6 +29,14 @@ import (
 	"sync/atomic"
 )
 
+// qwpDurableMaxTrackedTables caps the distinct table names the tracker will
+// track from server durable frames — far above any realistic per-sender table
+// count. A durable watermark for a table the client never wrote can never cover
+// a pending batch, so refusing to intern beyond the cap neutralizes a
+// misbehaving server that streams distinct unknown names to grow the maps
+// without bound, while never dropping a watermark a real batch depends on.
+const qwpDurableMaxTrackedTables = 1 << 16
+
 // qwpDurableTracker is the durable-ack trim state machine
 // (design/qwp-cursor-durability.md §5.4). Under request_durable_ack, an OK ACK
 // no longer advances the trim/replay/await watermark; instead each OK-acked
@@ -45,6 +53,11 @@ type qwpDurableTracker struct {
 	pending    []*qwpPendingDurable
 	pool       []*qwpPendingDurable
 	pendingLen atomic.Int64
+	// lastSeq is the highest OK/DROP wire sequence enqueued on the current
+	// connection (-1 = none). Under the one-OK-ack-per-frame contract these
+	// arrive densely, so a forward jump means the server coalesced or dropped
+	// an OK ack and left frames untracked — seqGap catches it fail-closed.
+	lastSeq int64
 }
 
 // qwpPendingDurable is one OK-acked batch awaiting durable confirmation. An entry
@@ -70,7 +83,25 @@ func newQwpDurableTracker() *qwpDurableTracker {
 	return &qwpDurableTracker{
 		watermarks: make(map[string]int64),
 		interned:   make(map[string]string),
+		lastSeq:    -1,
 	}
+}
+
+// seqGap reports whether seq skips past the next expected per-frame wire
+// sequence — the signature of a server that coalesced or dropped an OK ack,
+// leaving the skipped frames without a pending entry and thus untracked for
+// durable trimming. It returns the expected sequence for diagnostics and, when
+// there is no gap, records seq as the high-water mark. A duplicate or reordered
+// seq (<= lastSeq) is left to the conservative drain (never over-advances).
+func (t *qwpDurableTracker) seqGap(seq int64) (expected int64, gap bool) {
+	expected = t.lastSeq + 1
+	if seq > expected {
+		return expected, true
+	}
+	if seq > t.lastSeq {
+		t.lastSeq = seq
+	}
+	return expected, false
 }
 
 // intern returns a stable string for b, allocating once per distinct table so a
@@ -117,10 +148,16 @@ func (t *qwpDurableTracker) enqueueEmpty(wireSeq int64) {
 // max so a reordered or older cumulative frame cannot move one backward.
 func (t *qwpDurableTracker) applyDurable(tail []byte) {
 	qwpForEachAckTableEntry(tail, func(name []byte, seqTxn int64) {
-		key := t.intern(name)
+		key, ok := t.interned[string(name)] // string(b) lookup does not allocate
+		if !ok {
+			if len(t.interned) >= qwpDurableMaxTrackedTables {
+				return
+			}
+			key = t.intern(name)
+		}
 		// Presence-checked so a first watermark of 0 is inserted (0 > 0 is false)
 		// and a reordered older frame never lowers an existing one.
-		if cur, ok := t.watermarks[key]; !ok || seqTxn > cur {
+		if cur, seen := t.watermarks[key]; !seen || seqTxn > cur {
 			t.watermarks[key] = seqTxn
 		}
 	})
@@ -177,6 +214,7 @@ func (t *qwpDurableTracker) reset() {
 	}
 	t.pending = t.pending[:0]
 	t.pendingLen.Store(0)
+	t.lastSeq = -1
 }
 
 func (t *qwpDurableTracker) hasPending() bool { return t.pendingLen.Load() > 0 }

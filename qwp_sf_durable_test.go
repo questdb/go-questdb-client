@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"encoding/binary"
+	"strconv"
 	"testing"
 )
 
@@ -215,6 +216,59 @@ func TestDurableTrackerResetOnReconnect(t *testing.T) {
 	tr.enqueueOk(0, durableTrailer(tableEntry{"t", 5}))
 	if got := tr.drain(); got != -1 {
 		t.Fatalf("stale watermark survived reset: drain = %d, want -1", got)
+	}
+}
+
+func TestDurableTrackerSeqGap(t *testing.T) {
+	tr := newQwpDurableTracker()
+	if _, gap := tr.seqGap(0); gap {
+		t.Fatal("first seq 0 must not be a gap")
+	}
+	if _, gap := tr.seqGap(1); gap {
+		t.Fatal("consecutive seq 1 must not be a gap")
+	}
+	// A forward jump is a gap; the expected sequence is reported for diagnostics.
+	if expected, gap := tr.seqGap(3); !gap || expected != 2 {
+		t.Fatalf("seq 3 after 1: gap=%v expected=%d, want true/2", gap, expected)
+	}
+	// The gap did not advance lastSeq, so a duplicate/reordered seq stays
+	// conservative (no gap, no over-advance).
+	if _, gap := tr.seqGap(1); gap {
+		t.Fatal("duplicate seq 1 must not be a gap")
+	}
+	// A first ack that itself skips frame 0 is a gap.
+	fresh := newQwpDurableTracker()
+	if expected, gap := fresh.seqGap(1); !gap || expected != 0 {
+		t.Fatalf("first seq 1: gap=%v expected=%d, want true/0", gap, expected)
+	}
+	// reset re-arms the detector for the next connection.
+	tr.reset()
+	if _, gap := tr.seqGap(0); gap {
+		t.Fatal("post-reset seq 0 must not be a gap")
+	}
+}
+
+// TestDurableTrackerApplyDurableCapsUnknownTables pins the malicious-server memory
+// bound: durable watermarks for tables the client never wrote (never interned via
+// enqueueOk) are tracked only up to qwpDurableMaxTrackedTables, while a real
+// table's durable-before-ok watermark is always honored.
+func TestDurableTrackerApplyDurableCapsUnknownTables(t *testing.T) {
+	tr := newQwpDurableTracker()
+	// A watermark for a written table is honored even before its OK arrives.
+	tr.enqueueOk(0, durableTrailer(tableEntry{"real", 1}))
+	tr.applyDurable(durableTrailer(tableEntry{"real", 1}))
+	if got := tr.drain(); got != 0 {
+		t.Fatalf("real-table durable drain = %d, want 0", got)
+	}
+	// Flooding distinct unknown names cannot grow the maps past the cap.
+	for i := 0; i < qwpDurableMaxTrackedTables+1000; i++ {
+		tr.applyDurable(durableTrailer(tableEntry{name: "junk-" + strconv.Itoa(i), seqTxn: 1}))
+	}
+	if len(tr.interned) > qwpDurableMaxTrackedTables {
+		t.Fatalf("interned grew to %d, want <= %d", len(tr.interned), qwpDurableMaxTrackedTables)
+	}
+	if len(tr.watermarks) > qwpDurableMaxTrackedTables {
+		t.Fatalf("watermarks grew to %d, want <= %d", len(tr.watermarks), qwpDurableMaxTrackedTables)
 	}
 }
 

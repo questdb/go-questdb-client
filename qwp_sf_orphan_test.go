@@ -222,6 +222,14 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, unavailable, "one OnDurableAckUnavailable per mismatch up to the cap")
 	assert.Equal(t, 1, persistent, "OnDurableAckPersistentFailure fires exactly once")
 	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, lastAttempts)
+
+	// Positively confirm the drainer never trimmed the un-uploaded data: its
+	// backing .sfa segment must survive quarantine (Hazard I — never unlink an
+	// un-durable segment). A regression that trimmed on the OK ack in durable
+	// drainer mode would delete it and still pass the assertions above.
+	segs, err := filepath.Glob(filepath.Join(dir, "*.sfa"))
+	require.NoError(t, err)
+	assert.NotEmpty(t, segs, "quarantine must leave the un-uploaded .sfa segment intact")
 }
 
 // TestQwpSfDrainerListenerPanicIsolated pins M2: a panic in a user-supplied
@@ -231,7 +239,7 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
 	t.Run("HelperRecovers", func(t *testing.T) {
 		qwpDrainerListenerCall(func() { panic("boom") }) // must not propagate
-		qwpDrainerListenerCall(nil)                       // nil-safe
+		qwpDrainerListenerCall(nil)                      // nil-safe
 	})
 
 	t.Run("OnDurableAckUnavailablePanicContained", func(t *testing.T) {

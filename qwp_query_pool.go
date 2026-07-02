@@ -222,13 +222,28 @@ func (p *qwpQueryPool) reapIdle() {
 	if p.closing.Load() {
 		return
 	}
-	now := time.Now()
-	var toClose []*qwpQueryWorker
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
+	toClose := p.selectReapVictims(time.Now())
+	for _, w := range toClose {
+		_ = closeQueryClientGuarded(context.Background(), w.client)
 	}
+	if len(toClose) > 0 {
+		p.mu.Lock()
+		p.broadcastLocked()
+		p.mu.Unlock()
+	}
+}
+
+// selectReapVictims removes the idle-expired / over-age / poisoned workers from
+// the available set under the lock and returns them for off-lock closing. The
+// lock is released via defer so a panic in the selection can never strand it (the
+// reap runs behind a recover in the housekeeper).
+func (p *qwpQueryPool) selectReapVictims(now time.Time) []*qwpQueryWorker {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
+	}
+	var toClose []*qwpQueryWorker
 	kept := p.available[:0]
 	for _, w := range p.available {
 		idleExpired := p.idleTimeout > 0 && now.Sub(w.idleSince) >= p.idleTimeout
@@ -249,16 +264,7 @@ func (p *qwpQueryPool) reapIdle() {
 		kept = append(kept, w)
 	}
 	p.available = kept
-	p.mu.Unlock()
-
-	for _, w := range toClose {
-		_ = closeQueryClientGuarded(context.Background(), w.client)
-	}
-	if len(toClose) > 0 {
-		p.mu.Lock()
-		p.broadcastLocked()
-		p.mu.Unlock()
-	}
+	return toClose
 }
 
 // closeQueryClientGuarded closes a worker's client, converting a panic into an
