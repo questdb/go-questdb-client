@@ -40,6 +40,7 @@ func TestQwpSfClassify(t *testing.T) {
 		{QwpStatusInternalError, CategoryInternalError},
 		{QwpStatusSecurityError, CategorySecurityError},
 		{QwpStatusWriteError, CategoryWriteError},
+		{QwpStatusNotWritable, CategoryNotWritable},
 		// OK / DurableAck never reach classify in production but they
 		// fall through to Unknown defensively.
 		{QwpStatusOK, CategoryUnknown},
@@ -61,13 +62,14 @@ func TestQwpSfDefaultPolicyFor(t *testing.T) {
 		c    Category
 		want Policy
 	}{
-		{CategorySchemaMismatch, PolicyDropAndContinue},
-		{CategoryWriteError, PolicyDropAndContinue},
-		{CategoryParseError, PolicyHalt},
-		{CategoryInternalError, PolicyHalt},
-		{CategorySecurityError, PolicyHalt},
-		{CategoryProtocolViolation, PolicyHalt},
-		{CategoryUnknown, PolicyHalt},
+		{CategoryWriteError, PolicyRetriable},
+		{CategoryInternalError, PolicyRetriable},
+		{CategoryUnknown, PolicyRetriable},
+		{CategoryNotWritable, PolicyRetriableOther},
+		{CategorySchemaMismatch, PolicyTerminal},
+		{CategoryParseError, PolicyTerminal},
+		{CategorySecurityError, PolicyTerminal},
+		{CategoryProtocolViolation, PolicyTerminal},
 	}
 	for _, tc := range tests {
 		if got := qwpSfDefaultPolicyFor(tc.c); got != tc.want {
@@ -111,52 +113,52 @@ func TestQwpSfIsTerminalCloseCode(t *testing.T) {
 func TestQwpSfPolicyResolverPrecedence(t *testing.T) {
 	t.Run("nil resolver falls through to spec defaults", func(t *testing.T) {
 		var r *qwpSfPolicyResolver
-		if got := r.resolve(CategorySchemaMismatch); got != PolicyDropAndContinue {
-			t.Errorf("nil resolver SchemaMismatch = %s, want DropAndContinue", got)
+		if got := r.resolve(CategoryWriteError); got != PolicyRetriable {
+			t.Errorf("nil resolver WriteError = %s, want Retriable", got)
 		}
 	})
 
 	t.Run("zero resolver falls through to spec defaults", func(t *testing.T) {
 		r := &qwpSfPolicyResolver{}
-		if got := r.resolve(CategoryParseError); got != PolicyHalt {
-			t.Errorf("zero resolver ParseError = %s, want Halt", got)
+		if got := r.resolve(CategoryParseError); got != PolicyTerminal {
+			t.Errorf("zero resolver ParseError = %s, want Terminal", got)
 		}
 	})
 
 	t.Run("global override beats spec default", func(t *testing.T) {
-		r := &qwpSfPolicyResolver{global: PolicyHalt}
-		if got := r.resolve(CategorySchemaMismatch); got != PolicyHalt {
-			t.Errorf("global=Halt SchemaMismatch = %s, want Halt", got)
+		r := &qwpSfPolicyResolver{global: PolicyTerminal}
+		if got := r.resolve(CategoryWriteError); got != PolicyTerminal {
+			t.Errorf("global=Terminal WriteError = %s, want Terminal", got)
 		}
 	})
 
 	t.Run("per-category beats global", func(t *testing.T) {
-		r := &qwpSfPolicyResolver{global: PolicyHalt}
-		r.perCat[CategorySchemaMismatch] = PolicyDropAndContinue
-		if got := r.resolve(CategorySchemaMismatch); got != PolicyDropAndContinue {
-			t.Errorf("per-cat beats global = %s, want DropAndContinue", got)
+		r := &qwpSfPolicyResolver{global: PolicyTerminal}
+		r.perCat[CategorySchemaMismatch] = PolicyRetriable
+		if got := r.resolve(CategorySchemaMismatch); got != PolicyRetriable {
+			t.Errorf("per-cat beats global = %s, want Retriable", got)
 		}
 	})
 
 	t.Run("programmatic resolver beats per-category", func(t *testing.T) {
 		r := &qwpSfPolicyResolver{}
-		r.perCat[CategoryParseError] = PolicyDropAndContinue
+		r.perCat[CategoryParseError] = PolicyRetriable
 		r.resolver = func(c Category) Policy {
 			if c == CategoryParseError {
-				return PolicyHalt
+				return PolicyTerminal
 			}
 			return PolicyAuto
 		}
-		if got := r.resolve(CategoryParseError); got != PolicyHalt {
-			t.Errorf("programmatic beats per-cat = %s, want Halt", got)
+		if got := r.resolve(CategoryParseError); got != PolicyTerminal {
+			t.Errorf("programmatic beats per-cat = %s, want Terminal", got)
 		}
 	})
 
 	t.Run("programmatic resolver returning Auto falls through", func(t *testing.T) {
 		r := &qwpSfPolicyResolver{}
-		r.perCat[CategoryWriteError] = PolicyHalt
+		r.perCat[CategoryWriteError] = PolicyTerminal
 		r.resolver = func(Category) Policy { return PolicyAuto }
-		if got := r.resolve(CategoryWriteError); got != PolicyHalt {
+		if got := r.resolve(CategoryWriteError); got != PolicyTerminal {
 			t.Errorf("programmatic Auto + per-cat=Halt = %s, want Halt", got)
 		}
 	})
@@ -165,40 +167,44 @@ func TestQwpSfPolicyResolverPrecedence(t *testing.T) {
 		// A per-category override is set, but the panic short-circuits
 		// to the spec default rather than falling through to it: a
 		// broken resolver must not silently defer to lower-precedence
-		// slots. SchemaMismatch's spec default is DropAndContinue.
+		// slots. WriteError's spec default is Retriable.
 		r := &qwpSfPolicyResolver{}
-		r.perCat[CategorySchemaMismatch] = PolicyHalt
+		r.perCat[CategoryWriteError] = PolicyTerminal
 		r.resolver = func(Category) Policy { panic("boom") }
-		if got := r.resolve(CategorySchemaMismatch); got != PolicyDropAndContinue {
-			t.Errorf("panicking resolver SchemaMismatch = %s, want DropAndContinue (spec default)", got)
+		if got := r.resolve(CategoryWriteError); got != PolicyRetriable {
+			t.Errorf("panicking resolver WriteError = %s, want Retriable (spec default)", got)
 		}
 	})
 
 	t.Run("panicking resolver does not crash the caller", func(t *testing.T) {
 		// The receiver goroutine invokes resolve directly; a panic that
 		// escapes would take down the host process. ParseError's spec
-		// default is Halt.
+		// default is Terminal.
 		r := &qwpSfPolicyResolver{}
 		r.resolver = func(Category) Policy { panic("boom") }
-		if got := r.resolve(CategoryParseError); got != PolicyHalt {
-			t.Errorf("panicking resolver ParseError = %s, want Halt (spec default)", got)
+		if got := r.resolve(CategoryParseError); got != PolicyTerminal {
+			t.Errorf("panicking resolver ParseError = %s, want Terminal (spec default)", got)
 		}
 	})
 
-	t.Run("ProtocolViolation forced Halt regardless", func(t *testing.T) {
-		r := &qwpSfPolicyResolver{global: PolicyDropAndContinue}
-		r.perCat[CategoryProtocolViolation] = PolicyDropAndContinue
-		r.resolver = func(Category) Policy { return PolicyDropAndContinue }
-		if got := r.resolve(CategoryProtocolViolation); got != PolicyHalt {
-			t.Errorf("ProtocolViolation = %s, want Halt (forced)", got)
+	t.Run("ProtocolViolation forced Terminal regardless", func(t *testing.T) {
+		r := &qwpSfPolicyResolver{global: PolicyRetriable}
+		r.perCat[CategoryProtocolViolation] = PolicyRetriable
+		r.resolver = func(Category) Policy { return PolicyRetriable }
+		if got := r.resolve(CategoryProtocolViolation); got != PolicyTerminal {
+			t.Errorf("ProtocolViolation = %s, want Terminal (forced)", got)
 		}
 	})
 
-	t.Run("Unknown forced Halt regardless", func(t *testing.T) {
-		r := &qwpSfPolicyResolver{global: PolicyDropAndContinue}
-		r.perCat[CategoryUnknown] = PolicyDropAndContinue
-		if got := r.resolve(CategoryUnknown); got != PolicyHalt {
-			t.Errorf("Unknown = %s, want Halt (forced)", got)
+	t.Run("Unknown forced Retriable regardless", func(t *testing.T) {
+		// Fail open: a status byte from a newer server must degrade to
+		// retry, not to a dead sender — even a user-configured Terminal
+		// is ignored.
+		r := &qwpSfPolicyResolver{global: PolicyTerminal}
+		r.perCat[CategoryUnknown] = PolicyTerminal
+		r.resolver = func(Category) Policy { return PolicyTerminal }
+		if got := r.resolve(CategoryUnknown); got != PolicyRetriable {
+			t.Errorf("Unknown = %s, want Retriable (forced fail-open)", got)
 		}
 	})
 }

@@ -398,6 +398,7 @@ type lineSenderConfig struct {
 	reconnectMaxDurationMillis    int    // 0 -> 300000 (5 min)
 	reconnectInitialBackoffMillis int    // 0 -> 100
 	reconnectMaxBackoffMillis     int    // 0 -> 5000
+	maxFrameRejections            int    // 0 -> 4 (poison-frame detector threshold)
 	// Per-key explicit-set flags for the three reconnect_* knobs.
 	// Used by sanitizeQwpConf to implement the implicit promotion of
 	// initial_connect_retry to "on" when the user tuned any reconnect
@@ -709,6 +710,26 @@ func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) 
 		if maxBackoff > 0 {
 			s.reconnectMaxBackoffMillis = int(maxBackoff / time.Millisecond)
 			s.reconnectMaxBackoffMillisSet = true
+		}
+	}
+}
+
+// WithMaxFrameRejections sets the poison-frame detector threshold:
+// consecutive server rejections (retriable NACK, or non-orderly close
+// after a send) of the SAME head-of-line frame, with no ack progress
+// in between, before the sender declares the frame poisoned and
+// latches a typed PROTOCOL_VIOLATION terminal instead of
+// reconnect-replaying forever. Retriable rejections below the
+// threshold recycle the connection and replay from the
+// store-and-forward log — no data is dropped either way. Default 4.
+// A non-positive argument leaves the default. Equivalent to the
+// max_frame_rejections connect-string key.
+//
+// Only available for the QWP sender.
+func WithMaxFrameRejections(n int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		if n > 0 {
+			s.maxFrameRejections = n
 		}
 	}
 }
@@ -1606,6 +1627,8 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "drain_orphans"
 	case conf.maxBackgroundDrainers != 0:
 		name = "max_background_drainers"
+	case conf.maxFrameRejections != 0:
+		name = "max_frame_rejections"
 	case conf.requestDurableAck:
 		name = "request_durable_ack"
 	case conf.durableAckKeepaliveMillisSet:

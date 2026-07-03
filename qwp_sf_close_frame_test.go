@@ -78,11 +78,14 @@ func closeAfterNFramesServer(t *testing.T, n int, code websocket.StatusCode, rea
 	}))
 }
 
-// TestQwpSfTerminalCloseCodeProducesProtocolViolation drives the send
-// loop against a server that closes with each terminal code; asserts
-// the loop produces a CategoryProtocolViolation+Halt SenderError and
-// does not enter reconnect.
-func TestQwpSfTerminalCloseCodeProducesProtocolViolation(t *testing.T) {
+// TestQwpSfCloseCodeRepeatPoisonEscalates drives the send loop against
+// a server that reads the head frame then closes with a nominally
+// protocol-violating code — on every connection. WS close codes carry
+// no policy semantics under NACK policy v2: each close is a transport
+// event that reconnects and replays, counting a poison strike at the
+// unmoved head FSN; at qwpSfDefaultMaxFrameRejections consecutive
+// strikes the loop latches the typed poisoned-frame terminal.
+func TestQwpSfCloseCodeRepeatPoisonEscalates(t *testing.T) {
 	codes := []struct {
 		code   websocket.StatusCode
 		reason string
@@ -108,7 +111,7 @@ func TestQwpSfTerminalCloseCodeProducesProtocolViolation(t *testing.T) {
 			require.NoError(t, err)
 
 			loop := qwpSfNewSendLoop(engine, transport, factory,
-				100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+				100*time.Microsecond, time.Second, time.Millisecond, 10*time.Millisecond)
 			loop.sendLoopStart()
 			defer func() { _ = loop.sendLoopClose() }()
 
@@ -117,34 +120,38 @@ func TestQwpSfTerminalCloseCodeProducesProtocolViolation(t *testing.T) {
 
 			require.Eventually(t, func() bool {
 				return loop.sendLoopCheckError() != nil
-			}, 3*time.Second, 1*time.Millisecond,
-				"loop did not record terminal error for close code %d", c.code)
+			}, 5*time.Second, 1*time.Millisecond,
+				"loop did not escalate the repeated close for code %d", c.code)
 
 			gotErr := loop.sendLoopCheckError()
 			var senderErr *SenderError
 			require.True(t, errors.As(gotErr, &senderErr),
 				"expected *SenderError, got %T: %v", gotErr, gotErr)
 			assert.Equal(t, CategoryProtocolViolation, senderErr.Category)
-			assert.Equal(t, PolicyHalt, senderErr.AppliedPolicy)
+			assert.Equal(t, PolicyTerminal, senderErr.AppliedPolicy)
 			assert.Equal(t, NoStatusByte, senderErr.ServerStatusByte)
-			assert.Contains(t, senderErr.ServerMessage, "ws-close[")
+			assert.Contains(t, senderErr.ServerMessage, "poisoned frame")
 
-			// The loop did not enter reconnect — the close code is
-			// terminal. Reconnect counter stays at zero.
-			assert.Equal(t, int64(0), loop.sendLoopTotalReconnects())
+			// Below the threshold every close reconnected + replayed; the
+			// watermark never moved and nothing was dropped.
+			assert.Equal(t, int64(qwpSfDefaultMaxFrameRejections-1),
+				loop.sendLoopTotalReconnects(),
+				"one reconnect per strike below the threshold")
+			assert.Equal(t, int64(-1), engine.engineAckedFsn())
 		})
 	}
 }
 
-// TestQwpSfTerminalCloseMultiFrameFsnSpan pins the non-degenerate
-// SenderError FSN span. Every other terminal-path test publishes a
-// single unacked frame, so FromFsn == ToFsn and the span is never
-// actually exercised. Here several frames are published and none are
-// ACKed when a terminal close arrives, so qwpSfBuildProtocolViolationSE
-// must report [FromFsn, ToFsn] = [ackedFsn+1, publishedFsn] with
-// FromFsn strictly < ToFsn — the multi-frame correlation window that
-// dead-lettering and AwaitAckedFsn callers rely on.
-func TestQwpSfTerminalCloseMultiFrameFsnSpan(t *testing.T) {
+// TestQwpSfPoisonTerminalMultiFrameFsnSpan pins the non-degenerate
+// SenderError FSN span on the poisoned-frame terminal. Every other
+// terminal-path test publishes a single unacked frame, so
+// FromFsn == ToFsn and the span is never actually exercised. Here
+// several frames are published and none are ACKed when the poison
+// detector escalates, so buildPoisonedFrameSE must report
+// [FromFsn, ToFsn] = [ackedFsn+1, publishedFsn] with FromFsn strictly
+// < ToFsn — the multi-frame correlation window that dead-lettering and
+// AwaitAckedFsn callers rely on.
+func TestQwpSfPoisonTerminalMultiFrameFsnSpan(t *testing.T) {
 	const nFrames = 4
 	httpSrv := closeAfterNFramesServer(t, nFrames,
 		websocket.StatusProtocolError, "bad framing")
@@ -155,8 +162,8 @@ func TestQwpSfTerminalCloseMultiFrameFsnSpan(t *testing.T) {
 	defer func() { _ = engine.engineClose() }()
 
 	// Publish every frame BEFORE the loop starts: publishedFsn is then
-	// a stable nFrames-1 by the time the close-frame SE is built, and
-	// the server reads exactly the nFrames the producer will send.
+	// a stable nFrames-1 by the time the poison SE is built, and the
+	// server reads exactly the nFrames each connection replays.
 	for i := 0; i < nFrames; i++ {
 		_, err := engine.engineAppendBlocking(context.Background(), []byte{byte(i)})
 		require.NoError(t, err)
@@ -170,21 +177,21 @@ func TestQwpSfTerminalCloseMultiFrameFsnSpan(t *testing.T) {
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, factory,
-		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		100*time.Microsecond, time.Second, time.Millisecond, 10*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
 	require.Eventually(t, func() bool {
 		return loop.sendLoopCheckError() != nil
-	}, 3*time.Second, 1*time.Millisecond,
-		"loop did not record the terminal close error")
+	}, 5*time.Second, 1*time.Millisecond,
+		"loop did not escalate the repeated close")
 
 	var se *SenderError
 	require.True(t, errors.As(loop.sendLoopCheckError(), &se),
 		"expected *SenderError, got %v", loop.sendLoopCheckError())
 	assert.Equal(t, CategoryProtocolViolation, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
-	assert.Contains(t, se.ServerMessage, "ws-close[")
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
+	assert.Contains(t, se.ServerMessage, "poisoned frame")
 	// The point of the test: a real multi-frame span.
 	assert.Equal(t, int64(0), se.FromFsn,
 		"FromFsn = ackedFsn+1 = 0 (nothing ACKed)")
@@ -193,8 +200,6 @@ func TestQwpSfTerminalCloseMultiFrameFsnSpan(t *testing.T) {
 	assert.Less(t, se.FromFsn, se.ToFsn,
 		"multi-frame span: FromFsn must be strictly < ToFsn (not the "+
 			"degenerate single-frame FromFsn == ToFsn case)")
-	assert.Equal(t, int64(0), loop.sendLoopTotalReconnects(),
-		"terminal close must not trigger reconnect")
 }
 
 // Non-terminal close-code reconnect is already covered by
@@ -250,7 +255,7 @@ func runUpgradeFailureScenario(t *testing.T, upgradeStatus int) *SenderError {
 func TestQwpSfAuthFailureProducesSecurityError(t *testing.T) {
 	se := runUpgradeFailureScenario(t, 401)
 	assert.Equal(t, CategorySecurityError, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 	assert.Equal(t, NoStatusByte, se.ServerStatusByte)
 	assert.True(t, strings.Contains(se.ServerMessage, "ws-upgrade-failed"),
 		"expected ws-upgrade-failed in message, got %q", se.ServerMessage)
@@ -261,5 +266,5 @@ func TestQwpSfAuthFailureProducesSecurityError(t *testing.T) {
 func TestQwpSfProtocolUpgradeFailureProducesProtocolViolation(t *testing.T) {
 	se := runUpgradeFailureScenario(t, 426)
 	assert.Equal(t, CategoryProtocolViolation, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 }

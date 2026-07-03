@@ -183,16 +183,14 @@ func TestQwpDurableAckSeqGapHalts(t *testing.T) {
 	}
 }
 
-// TestQwpDurableAckPreSendDropKeepsDensity pins the fix for the pre-send DROP
-// density hole. A DropAndContinue rejection processed while no frame has been
-// fully sent (highestFullySent < 0) must still advance the durable density
-// high-water mark; skipping it strands lastSeq behind so the next dense OK ack
-// trips a spurious PROTOCOL_VIOLATION gap HALT — which in memory mode drops the
-// in-RAM tail on the forced close+rebuild. The server rejects a phantom wire
-// seq 0 before the client sends anything, then OK-acks the real frame as seq 1
-// (the phantom consumed seq 0); the client must treat that as dense, not a gap.
-func TestQwpDurableAckPreSendDropKeepsDensity(t *testing.T) {
+// TestQwpDurableAckRetriableNackRecyclesAndReplays pins the durable-mode
+// NACK policy: a retriable rejection never touches the durable tracker or
+// the watermark — the connection recycles, the frame replays, and the
+// watermark advances only once the covering STATUS_DURABLE_ACK arrives on
+// the fresh connection.
+func TestQwpDurableAckRetriableNackRecyclesAndReplays(t *testing.T) {
 	ctx := context.Background()
+	var connCount atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
@@ -201,13 +199,20 @@ func TestQwpDurableAckPreSendDropKeepsDensity(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
-		// Phantom pre-send rejection of wire seq 0, before any client frame.
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckError(QwpStatusParseError, 0, "phantom pre-send reject"))
-		if _, _, err := conn.Read(ctx); err != nil { // the real frame (wire seq 0)
+		if connCount.Add(1) == 1 {
+			// Conn 1: NACK the head frame with a retriable status.
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+			_ = conn.Write(ctx, websocket.MessageBinary,
+				buildAckError(QwpStatusWriteError, 0, "transient write failure"))
 			return
 		}
-		// The phantom rejection consumed seq 0, so the real frame is acked seq 1.
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(1, ackTableEntry{"trades", 0}))
+		// Conn 2+: the replay drains normally, settled then durable.
+		if _, _, err := conn.Read(ctx); err != nil {
+			return
+		}
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
 		_ = conn.Write(ctx, websocket.MessageBinary, buildAckDurable(ackTableEntry{"trades", 0}))
 		for {
 			if _, _, err := conn.Read(ctx); err != nil {
@@ -217,17 +222,16 @@ func TestQwpDurableAckPreSendDropKeepsDensity(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dropProcessed := make(chan struct{}, 1)
+	sawRetriable := make(chan struct{}, 1)
 	addr := strings.TrimPrefix(srv.URL, "http://")
 	s, err := NewLineSender(ctx,
 		WithQwp(), WithAddress(addr),
 		WithRequestDurableAck(true),
 		WithDurableAckKeepaliveInterval(0),
-		WithErrorPolicy(CategoryParseError, PolicyDropAndContinue),
 		WithErrorHandler(func(e *SenderError) {
-			if e.Category == CategoryParseError {
+			if e.Category == CategoryWriteError && e.AppliedPolicy == PolicyRetriable {
 				select {
-				case dropProcessed <- struct{}{}:
+				case sawRetriable <- struct{}{}:
 				default:
 				}
 			}
@@ -239,14 +243,6 @@ func TestQwpDurableAckPreSendDropKeepsDensity(t *testing.T) {
 	defer s.Close(ctx)
 	qs := s.(QwpSender)
 
-	// Wait until the pre-send rejection has been processed — highestFullySent is
-	// still -1 because nothing has been flushed yet — then send the real frame.
-	select {
-	case <-dropProcessed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("pre-send DROP was never delivered to the error handler")
-	}
-
 	if err := s.Table("trades").Int64Column("v", 1).AtNow(ctx); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -257,78 +253,18 @@ func TestQwpDurableAckPreSendDropKeepsDensity(t *testing.T) {
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := qs.AwaitAckedFsn(waitCtx, 0); err != nil {
-		t.Fatalf("AwaitAckedFsn after a pre-send DROP: %v; the durable watermark must "+
-			"advance without a spurious sequence-gap HALT", err)
+		t.Fatalf("AwaitAckedFsn after retriable NACK + replay: %v", err)
 	}
-}
-
-// TestQwpDurableAckRejectionSeqGapHalts is the rejection-path analogue of
-// TestQwpDurableAckSeqGapHalts: a server rejection that skips a wire sequence (a
-// coalesced/dropped OK ack) must HALT fail-closed via durableRejectionSeqGap,
-// even when the rejection's own policy is DropAndContinue — otherwise the drop
-// would trim past a not-yet-durable frame.
-func TestQwpDurableAckRejectionSeqGapHalts(t *testing.T) {
-	ctx := context.Background()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(qwpHeaderVersion, "1")
-		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
-		conn, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.CloseNow()
-		if _, _, err := conn.Read(ctx); err != nil { // frame wireSeq 0
-			return
-		}
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
-		if _, _, err := conn.Read(ctx); err != nil { // frame wireSeq 1
-			return
-		}
-		// Rejection naming wireSeq 2, skipping 1 — the coalesced/dropped-ack hole.
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckError(QwpStatusParseError, 2, "gapped reject"))
-		for {
-			if _, _, err := conn.Read(ctx); err != nil {
-				return
-			}
-		}
-	}))
-	defer srv.Close()
-
-	addr := strings.TrimPrefix(srv.URL, "http://")
-	s, err := NewLineSender(ctx,
-		WithQwp(), WithAddress(addr),
-		WithRequestDurableAck(true),
-		WithDurableAckKeepaliveInterval(0),
-		// DropAndContinue would not HALT on its own; the seq-gap detection must.
-		WithErrorPolicy(CategoryParseError, PolicyDropAndContinue),
-	)
-	if err != nil {
-		t.Fatalf("NewLineSender: %v", err)
+	select {
+	case <-sawRetriable:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retriable NACK was never delivered to the error handler")
 	}
-	defer s.Close(ctx)
-	qs := s.(QwpSender)
-
-	for i := 0; i < 2; i++ {
-		if err := s.Table("trades").Int64Column("v", int64(i)).AtNow(ctx); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-		if _, err := qs.FlushAndGetSequence(ctx); err != nil {
-			t.Fatalf("flush %d: %v", i, err)
-		}
+	if got := connCount.Load(); got < 2 {
+		t.Fatalf("connCount = %d; the NACK must have recycled the connection", got)
 	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	err = qs.AwaitAckedFsn(waitCtx, 0)
-	if err == nil {
-		t.Fatal("AwaitAckedFsn returned nil; expected a terminal durable-ack sequence-gap error")
-	}
-	var se *SenderError
-	if !errors.As(err, &se) || se.Category != CategoryProtocolViolation {
-		t.Fatalf("gap error = %v; want *SenderError of category PROTOCOL_VIOLATION", err)
-	}
-	if got := qs.AckedFsn(); got >= 0 {
-		t.Fatalf("AckedFsn advanced to %d despite the rejection sequence gap; it must stay frozen", got)
+	if err := qs.LastTerminalError(); err != nil {
+		t.Fatalf("retriable NACK latched a terminal error: %v", err)
 	}
 }
 
@@ -735,13 +671,15 @@ func TestQwpDurableAckEndToEndProgression(t *testing.T) {
 	}
 }
 
-// TestQwpDurableAckDropChainsBehindPending pins Hazard D at the send-loop level:
-// a DROP_AND_CONTINUE rejection in durable mode enqueues an empty entry that
-// chains in FIFO order — the watermark must not pass the dropped frame until
-// every preceding OK batch is durable, then release both together.
-func TestQwpDurableAckDropChainsBehindPending(t *testing.T) {
+// TestQwpDurableAckRejectionNeverAdvancesWatermark pins Hazard D at the
+// send-loop level under NACK policy v2: a rejection in durable mode never
+// enqueues anything on the durable tracker and never advances the watermark
+// — the connection recycles and the rejected frame replays behind the
+// still-pending OK batch, releasing only once the covering durable ack
+// arrives.
+func TestQwpDurableAckRejectionNeverAdvancesWatermark(t *testing.T) {
 	ctx := context.Background()
-	sendDurable := make(chan struct{})
+	var connCount atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
@@ -750,16 +688,33 @@ func TestQwpDurableAckDropChainsBehindPending(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
-		if _, _, err := conn.Read(ctx); err != nil { // batch 0: settled, not durable
+		if connCount.Add(1) == 1 {
+			// Conn 1: settle batch 0 (no durable ack yet), then reject
+			// batch 1 with a retriable status — the recycle must not let
+			// the watermark move past either frame.
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+			_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+			_ = conn.Write(ctx, websocket.MessageBinary, buildAckError(QwpStatusWriteError, 1, "bad batch"))
 			return
 		}
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckOKWithTables(0, ackTableEntry{"trades", 0}))
-		if _, _, err := conn.Read(ctx); err != nil { // batch 1: rejected → dropped
-			return
+		// Conn 2+: both frames replay (the durable tracker reset on
+		// reconnect discards the unconfirmed conn-1 OK); settle and
+		// durably cover them.
+		var seq int64
+		for i := 0; i < 2; i++ {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+			_ = conn.Write(ctx, websocket.MessageBinary,
+				buildAckOKWithTables(seq, ackTableEntry{"trades", int64(i + 1)}))
+			seq++
 		}
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckError(QwpStatusParseError, 1, "bad batch"))
-		<-sendDurable
-		_ = conn.Write(ctx, websocket.MessageBinary, buildAckDurable(ackTableEntry{"trades", 0}))
+		_ = conn.Write(ctx, websocket.MessageBinary, buildAckDurable(ackTableEntry{"trades", 2}))
 		for {
 			if _, _, err := conn.Read(ctx); err != nil {
 				return
@@ -773,7 +728,6 @@ func TestQwpDurableAckDropChainsBehindPending(t *testing.T) {
 		WithQwp(), WithAddress(addr),
 		WithRequestDurableAck(true),
 		WithDurableAckKeepaliveInterval(0),
-		WithErrorPolicy(CategoryParseError, PolicyDropAndContinue),
 		WithErrorHandler(func(*SenderError) {}),
 	)
 	if err != nil {
@@ -791,18 +745,13 @@ func TestQwpDurableAckDropChainsBehindPending(t *testing.T) {
 		}
 	}
 
-	// Batch 1 was dropped, but its empty entry chains behind the pending OK for
-	// batch 0 — the watermark must hold below both.
-	time.Sleep(150 * time.Millisecond)
-	if got := qs.AckedFsn(); got >= 0 {
-		t.Fatalf("AckedFsn = %d after drop; must not advance past a pending OK batch", got)
-	}
-
-	close(sendDurable)
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := qs.AwaitAckedFsn(waitCtx, 1); err != nil {
-		t.Fatalf("AwaitAckedFsn(1) after covering durable ack: %v", err)
+		t.Fatalf("AwaitAckedFsn(1) after recycle + durable cover: %v", err)
+	}
+	if got := connCount.Load(); got < 2 {
+		t.Fatalf("connCount = %d; the rejection must have recycled the connection", got)
 	}
 }
 

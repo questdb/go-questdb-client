@@ -111,7 +111,7 @@ func TestErrorApiBuilderOption_WithErrorHandlerInvoked(t *testing.T) {
 	select {
 	case got := <-gotCh:
 		assert.Equal(t, CategoryParseError, got.Category)
-		assert.Equal(t, PolicyHalt, got.AppliedPolicy)
+		assert.Equal(t, PolicyTerminal, got.AppliedPolicy)
 	case <-time.After(3 * time.Second):
 		t.Fatal("user-supplied error handler was not invoked")
 	}
@@ -127,7 +127,7 @@ func TestErrorApiBuilderOption_WithErrorPolicyOverride(t *testing.T) {
 	ls, err := NewLineSender(context.Background(),
 		WithQwp(),
 		WithAddress(addrOf(srv)),
-		WithErrorPolicy(CategorySchemaMismatch, PolicyHalt),
+		WithErrorPolicy(CategorySchemaMismatch, PolicyTerminal),
 	)
 	require.NoError(t, err)
 	defer func() { _ = ls.Close(context.Background()) }()
@@ -149,7 +149,7 @@ func TestErrorApiBuilderOption_WithErrorPolicyOverride(t *testing.T) {
 	var se *SenderError
 	require.True(t, errors.As(err, &se))
 	assert.Equal(t, CategorySchemaMismatch, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 }
 
 // TestErrorApiBuilderOption_WithErrorPolicyResolver registers a
@@ -169,7 +169,7 @@ func TestErrorApiBuilderOption_WithErrorPolicyResolver(t *testing.T) {
 		WithAddress(addrOf(srv)),
 		WithErrorPolicyResolver(func(c Category) Policy {
 			if c == CategoryParseError {
-				return PolicyDropAndContinue
+				return PolicyRetriable
 			}
 			return PolicyAuto
 		}),
@@ -189,7 +189,7 @@ func TestErrorApiBuilderOption_WithErrorPolicyResolver(t *testing.T) {
 	select {
 	case got := <-gotCh:
 		assert.Equal(t, CategoryParseError, got.Category)
-		assert.Equal(t, PolicyDropAndContinue, got.AppliedPolicy,
+		assert.Equal(t, PolicyRetriable, got.AppliedPolicy,
 			"resolver should have flipped Halt → Drop")
 	case <-time.After(3 * time.Second):
 		t.Fatal("handler not invoked: resolver may not have wired through")
@@ -202,8 +202,12 @@ func TestErrorApiBuilderOption_WithErrorPolicyResolver(t *testing.T) {
 // capacity and floods a slow handler, asserting the drop counter
 // rises (i.e., the option actually sized the inbox).
 func TestErrorApiBuilderOption_WithErrorInboxCapacity(t *testing.T) {
+	// Pre-send retriable rejections never count poison strikes, so the
+	// server can emit one per connection indefinitely — an unbounded
+	// notification stream that overflows the bounded inbox while the
+	// handler is blocked.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus: QwpStatusSchemaMismatch, // Drop policy → no halt
+		unsolicitedRejectAtConnect: QwpStatusWriteError,
 	})
 	defer srv.Close()
 
@@ -213,6 +217,7 @@ func TestErrorApiBuilderOption_WithErrorInboxCapacity(t *testing.T) {
 		WithAddress(addrOf(srv)),
 		WithErrorHandler(func(e *SenderError) { <-release }),
 		WithErrorInboxCapacity(qwpSfMinErrorInboxCapacity),
+		WithReconnectPolicy(0, time.Millisecond, 5*time.Millisecond),
 	)
 	require.NoError(t, err)
 	qs := asQwp(t, ls)
@@ -221,13 +226,9 @@ func TestErrorApiBuilderOption_WithErrorInboxCapacity(t *testing.T) {
 		_ = ls.Close(context.Background())
 	}()
 
-	for i := 0; i < 200; i++ {
-		require.NoError(t, ls.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
-		require.NoError(t, ls.Flush(context.Background()))
-	}
 	require.Eventually(t, func() bool {
 		return qs.DroppedErrorNotifications() > 0
-	}, 5*time.Second, 10*time.Millisecond,
+	}, 10*time.Second, 10*time.Millisecond,
 		"DroppedErrorNotifications never increased: dropped=%d delivered=%d",
 		qs.DroppedErrorNotifications(), qs.TotalErrorNotificationsDelivered())
 }
@@ -247,7 +248,7 @@ func TestErrorApiBuilderOption_ProtocolViolationOverrideIgnored(t *testing.T) {
 		WithQwp(),
 		WithAddress(addr),
 		// Try to flip ProtocolViolation to Drop. Should be ignored.
-		WithErrorPolicy(CategoryProtocolViolation, PolicyDropAndContinue),
+		WithErrorPolicy(CategoryProtocolViolation, PolicyRetriable),
 	)
 	require.NoError(t, err)
 	qs := asQwp(t, ls)
@@ -262,7 +263,7 @@ func TestErrorApiBuilderOption_ProtocolViolationOverrideIgnored(t *testing.T) {
 	se := qs.LastTerminalError()
 	require.NotNil(t, se)
 	assert.Equal(t, CategoryProtocolViolation, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy,
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy,
 		"forced HALT for ProtocolViolation should ignore user override")
 }
 
@@ -277,7 +278,7 @@ func TestErrorApiBuilderOption_ForcedHaltCategoriesNotRecorded(t *testing.T) {
 	for _, c := range []Category{CategoryProtocolViolation, CategoryUnknown} {
 		t.Run(c.String(), func(t *testing.T) {
 			conf := newLineSenderConfig(qwpSenderType)
-			WithErrorPolicy(c, PolicyDropAndContinue)(conf)
+			WithErrorPolicy(c, PolicyRetriable)(conf)
 			assert.Equal(t, PolicyAuto, conf.errorPolicyPerCat[c],
 				"override for %s must not be recorded", c)
 			assert.False(t, conf.errorPolicyPerCatSet,
@@ -291,7 +292,7 @@ func TestErrorApiBuilderOption_ForcedHaltCategoriesNotRecorded(t *testing.T) {
 // =============================================================================
 
 // TestErrorApiConfString_OnParseErrorDrop builds a sender from a
-// connect string with on_parse_error=drop and asserts the loop
+// connect string with on_parse_error=retriable and asserts the loop
 // continues past PARSE_ERROR rejections instead of latching. End-to-
 // end test of the conf-string → resolver wiring path.
 func TestErrorApiConfString_OnParseErrorDrop(t *testing.T) {
@@ -301,7 +302,7 @@ func TestErrorApiConfString_OnParseErrorDrop(t *testing.T) {
 	})
 	defer srv.Close()
 
-	conf := "ws::addr=" + addrOf(srv) + ";on_parse_error=drop;"
+	conf := "ws::addr=" + addrOf(srv) + ";on_parse_error=retriable;"
 	ls, err := LineSenderFromConf(context.Background(), conf)
 	require.NoError(t, err)
 	qs := asQwp(t, ls)
@@ -311,7 +312,7 @@ func TestErrorApiConfString_OnParseErrorDrop(t *testing.T) {
 	require.NoError(t, ls.Flush(context.Background()))
 	require.NoError(t, ls.Table("t").Int64Column("v", 2).AtNow(context.Background()))
 	require.NoError(t, ls.Flush(context.Background()),
-		"second Flush should succeed because on_parse_error=drop continued past the rejection")
+		"second Flush should succeed because on_parse_error=retriable continued past the rejection")
 	// Flush no longer blocks on the server ACK (cursor path, commit
 	// 29a6f12), so the PARSE_ERROR rejection is processed by the send
 	// loop asynchronously. Wait for the counter to reflect it before
@@ -322,11 +323,11 @@ func TestErrorApiConfString_OnParseErrorDrop(t *testing.T) {
 	}, 3*time.Second, 1*time.Millisecond,
 		"the rejection must still bump the server-error counter")
 	assert.Nil(t, qs.LastTerminalError(),
-		"on_parse_error=drop must not latch terminal")
+		"on_parse_error=retriable must not latch terminal")
 }
 
 // TestErrorApiConfString_OnSchemaErrorHalt builds a sender from a
-// connect string with on_schema_error=halt and asserts that a
+// connect string with on_schema_error=terminal and asserts that a
 // SchemaMismatch (Drop by default) instead halts. End-to-end test of
 // the conf-string → resolver wiring path going the other direction
 // (default-Drop flipped to Halt).
@@ -334,7 +335,7 @@ func TestErrorApiConfString_OnSchemaErrorHalt(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusSchemaMismatch})
 	defer srv.Close()
 
-	conf := "ws::addr=" + addrOf(srv) + ";on_schema_error=halt;"
+	conf := "ws::addr=" + addrOf(srv) + ";on_schema_error=terminal;"
 	ls, err := LineSenderFromConf(context.Background(), conf)
 	require.NoError(t, err)
 	qs := asQwp(t, ls)
@@ -345,19 +346,19 @@ func TestErrorApiConfString_OnSchemaErrorHalt(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return qs.LastTerminalError() != nil
 	}, 3*time.Second, 1*time.Millisecond,
-		"on_schema_error=halt should latch the SchemaMismatch as terminal")
+		"on_schema_error=terminal should latch the SchemaMismatch as terminal")
 	assert.Equal(t, CategorySchemaMismatch, qs.LastTerminalError().Category)
 }
 
 // TestErrorApiConfString_OnServerErrorHaltGlobal sets the global
-// override on_server_error=halt and asserts a SchemaMismatch (default
+// override on_server_error=terminal and asserts a SchemaMismatch (default
 // Drop) latches as terminal — the global override takes effect since
 // no per-category override is set.
 func TestErrorApiConfString_OnServerErrorHaltGlobal(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusSchemaMismatch})
 	defer srv.Close()
 
-	conf := "ws::addr=" + addrOf(srv) + ";on_server_error=halt;"
+	conf := "ws::addr=" + addrOf(srv) + ";on_server_error=terminal;"
 	ls, err := LineSenderFromConf(context.Background(), conf)
 	require.NoError(t, err)
 	qs := asQwp(t, ls)
@@ -368,7 +369,7 @@ func TestErrorApiConfString_OnServerErrorHaltGlobal(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return qs.LastTerminalError() != nil
 	}, 3*time.Second, 1*time.Millisecond)
-	assert.Equal(t, PolicyHalt, qs.LastTerminalError().AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, qs.LastTerminalError().AppliedPolicy)
 }
 
 // TestErrorApiConfString_PerCategoryBeatsGlobal asserts the
@@ -381,7 +382,7 @@ func TestErrorApiConfString_PerCategoryBeatsGlobal(t *testing.T) {
 	defer srv.Close()
 
 	// Global=halt, per-category=drop. Per-category must win.
-	conf := "ws::addr=" + addrOf(srv) + ";on_server_error=halt;on_schema_error=drop;"
+	conf := "ws::addr=" + addrOf(srv) + ";on_server_error=terminal;on_schema_error=retriable;"
 	ls, err := LineSenderFromConf(context.Background(), conf)
 	require.NoError(t, err)
 	qs := asQwp(t, ls)
@@ -438,7 +439,7 @@ func TestErrorApiResilience_ReconnectThenHaltFsnCorrelation(t *testing.T) {
 	se := s.LastTerminalError()
 	require.NotNil(t, se)
 	assert.Equal(t, CategoryParseError, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 	// The rejected frame's FSN must be 1 — the second frame in the
 	// publish order. This is the entire point of FSN-correlation
 	// across reconnect: even though wireSeq on conn 2 starts at 0,
@@ -456,50 +457,44 @@ func TestErrorApiResilience_ReconnectThenHaltFsnCorrelation(t *testing.T) {
 // reconnect, then drop frame 1 on conn 2. Assert ackedFsn advances
 // to 1 (both drops counted as "resolved by server") and no terminal
 // error is latched.
-func TestErrorApiResilience_DropAcrossReconnect(t *testing.T) {
-	// Connection 1: drop frame 0 (rejectFirstNFrames=1), then close
-	// after reading frame 1 (closeAfterFrames=2). One ACK delivered,
-	// so the silent-drop guard does not fire and reconnect kicks in.
-	// Connection 2: rejectFromConn=2 means reject all frames on conn ≥ 2.
+func TestErrorApiResilience_RetriableNackRecyclesAcrossReconnect(t *testing.T) {
+	// Connection 1: NACK frame 0 with a retriable status
+	// (rejectFirstNFrames=1) — the loop recycles the connection.
+	// Connection 2: everything ACKs, so the replayed frame 0 and the
+	// subsequent frame 1 both drain via real server ACKs.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:       QwpStatusSchemaMismatch,
+		rejectStatus:       QwpStatusWriteError,
 		rejectFirstNFrames: 1,
-		closeAfterFrames:   2,
-		rejectFromConn:     2,
 	})
 	defer srv.Close()
 
 	s, engine, loop, cleanup := newCursorSenderForTest(t, srv, 0)
 	defer cleanup()
 
-	// Frame 0: dropped on conn 1 (Drop policy → ackedFsn advances to 0).
 	require.NoError(t, s.Table("t").Int64Column("v", 0).AtNow(context.Background()))
 	require.NoError(t, s.Flush(context.Background()))
-	require.Eventually(t, func() bool { return engine.engineAckedFsn() >= 0 },
-		2*time.Second, 1*time.Millisecond, "frame 0 must be drop-acked on conn 1")
-
-	// Frame 1: conn 1 reads it then closes (no ACK). The loop reconnects
-	// and replays frame 1 on conn 2, which drops it (ackedFsn → 1).
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.NoError(t, s.Flush(context.Background()))
 
 	require.Eventually(t, func() bool {
 		return engine.engineAckedFsn() >= 1
 	}, 5*time.Second, 1*time.Millisecond,
-		"engineAckedFsn = %d, expected >= 1 (frame 0 + frame 1 both dropped)",
+		"engineAckedFsn = %d, expected >= 1 (both frames drained via the replay)",
 		engine.engineAckedFsn())
 	assert.Nil(t, s.LastTerminalError(),
-		"Drop across reconnect should not latch terminal")
-	assert.GreaterOrEqual(t, loop.sendLoopTotalServerErrors(), int64(2),
-		"two drops should each bump the server-error counter")
+		"a retriable NACK must not latch terminal")
+	assert.GreaterOrEqual(t, loop.sendLoopTotalServerErrors(), int64(1),
+		"the NACK bumps the server-error counter")
 	assert.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1),
-		"reconnect must have happened between the two drops")
+		"the NACK recycles the connection")
+	assert.GreaterOrEqual(t, loop.sendLoopTotalFramesReplayed(), int64(1),
+		"the rejected frame replays instead of being dropped")
 }
 
 // TestErrorApiResilience_ReconnectThenAuthFailure exercises the
 // auth-on-reconnect terminal: the live conn gets killed mid-stream,
 // the reconnect factory points at an auth-rejecting server, and the
-// loop must surface CategorySecurityError + PolicyHalt without
+// loop must surface CategorySecurityError + PolicyTerminal without
 // retrying past the auth wall.
 func TestErrorApiResilience_ReconnectThenAuthFailure(t *testing.T) {
 	authSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{upgradeStatus: 401})
@@ -536,7 +531,7 @@ func TestErrorApiResilience_ReconnectThenAuthFailure(t *testing.T) {
 	se := loop.sendLoopLastTerminalServerError()
 	require.NotNil(t, se)
 	assert.Equal(t, CategorySecurityError, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 	assert.Equal(t, NoStatusByte, se.ServerStatusByte,
 		"upgrade failures carry no QWP status byte")
 	assert.Equal(t, NoMessageSequence, se.MessageSequence)
@@ -601,7 +596,7 @@ func TestErrorApiResilience_SfDiskHaltCloseReopenReplays(t *testing.T) {
 	require.NotNil(t, se2)
 	assert.Equal(t, CategoryParseError, se2.Category,
 		"replayed rejection should classify the same way")
-	assert.Equal(t, PolicyHalt, se2.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, se2.AppliedPolicy)
 }
 
 // TestErrorApiResilience_SfDiskDropPersistsAckedAcrossRestart drives
@@ -611,9 +606,9 @@ func TestErrorApiResilience_SfDiskHaltCloseReopenReplays(t *testing.T) {
 // segment file should be unlinked). This is the SF flip side of the
 // HALT replay test: drops are durable, halts are durable, but the
 // persistence semantics differ.
-func TestErrorApiResilience_SfDiskDropPersistsAckedAcrossRestart(t *testing.T) {
+func TestErrorApiResilience_SfDiskRetriableReplayPersistsAckedAcrossRestart(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:       QwpStatusSchemaMismatch, // default Drop
+		rejectStatus:       QwpStatusWriteError, // retriable: replay, never drop
 		rejectFirstNFrames: 1,
 	})
 	defer srv.Close()
@@ -622,12 +617,13 @@ func TestErrorApiResilience_SfDiskDropPersistsAckedAcrossRestart(t *testing.T) {
 	conf := strings.Join([]string{
 		"ws::addr=" + addrOf(srv),
 		"sf_dir=" + tmp,
-		"sender_id=drop-restart",
+		"sender_id=retriable-restart",
 		"sf_max_bytes=4096",
 		"close_flush_timeout_millis=2000;",
 	}, ";")
 
-	// === Sender 1: send frame 0 (rejected → dropped), close cleanly. ===
+	// === Sender 1: frame 0 is NACKed on conn 1, recycles, and the
+	// conn-2 replay is ACKed for real. Close cleanly. ===
 	ls1, err := LineSenderFromConf(context.Background(), conf)
 	require.NoError(t, err)
 	qs1 := asQwp(t, ls1)
@@ -635,24 +631,21 @@ func TestErrorApiResilience_SfDiskDropPersistsAckedAcrossRestart(t *testing.T) {
 	require.NoError(t, ls1.Table("t").Int64Column("v", 0).AtNow(context.Background()))
 	require.NoError(t, ls1.Flush(context.Background()))
 
-	// Wait for the drop to propagate so ackedFsn catches up to
-	// publishedFsn — only then does Close drain successfully.
 	require.Eventually(t, func() bool {
 		return qs1.AckedFsn() >= 0
-	}, 2*time.Second, 1*time.Millisecond,
-		"frame 0 should be acked-via-drop on sender 1")
-	assert.Nil(t, qs1.LastTerminalError(), "Drop should not latch terminal")
-	// Clean close — drain should complete because everything's
-	// acked-via-drop.
+	}, 5*time.Second, 1*time.Millisecond,
+		"frame 0 should be acked via the post-recycle replay")
+	assert.Nil(t, qs1.LastTerminalError(), "a retriable NACK must not latch terminal")
 	require.NoError(t, ls1.Close(context.Background()))
 
-	// Server frame counter saw the rejected frame.
+	// The server saw the frame at least twice: the rejected delivery
+	// plus the replay that was ACKed.
 	frames1 := srv.totalFramesReceived.Load()
-	require.GreaterOrEqual(t, frames1, int64(1))
+	require.GreaterOrEqual(t, frames1, int64(2),
+		"the rejected frame must have been replayed, not dropped")
 
-	// === Sender 2: same slot, send a fresh frame. The dropped frame
-	// must NOT replay (would surface as a duplicate frame on the
-	// server side). ===
+	// === Sender 2: same slot, send a fresh frame. The genuinely-acked
+	// frame must NOT replay again. ===
 	ls2, err := LineSenderFromConf(context.Background(), conf)
 	require.NoError(t, err)
 	qs2 := asQwp(t, ls2)
@@ -665,10 +658,10 @@ func TestErrorApiResilience_SfDiskDropPersistsAckedAcrossRestart(t *testing.T) {
 	}, 2*time.Second, 1*time.Millisecond)
 
 	// Server should have seen exactly one additional frame on
-	// sender 2 — the new one — not a replay of the dropped frame.
+	// sender 2 — the new one.
 	frames2 := srv.totalFramesReceived.Load()
 	assert.Equal(t, frames1+1, frames2,
-		"sender 2 should send only the new frame; dropped frame should NOT replay")
+		"sender 2 should send only the new frame; the acked frame must not replay")
 }
 
 // =============================================================================
@@ -685,18 +678,19 @@ func TestErrorApiPerCategoryStrict(t *testing.T) {
 		status     QwpStatusCode
 		wantCat    Category
 		wantPolicy Policy
-		dropPath   bool
+		retriable  bool
 	}{
-		{"SchemaMismatch", QwpStatusSchemaMismatch, CategorySchemaMismatch, PolicyDropAndContinue, true},
-		{"ParseError", QwpStatusParseError, CategoryParseError, PolicyHalt, false},
-		{"InternalError", QwpStatusInternalError, CategoryInternalError, PolicyHalt, false},
-		{"SecurityError", QwpStatusSecurityError, CategorySecurityError, PolicyHalt, false},
-		{"WriteError", QwpStatusWriteError, CategoryWriteError, PolicyDropAndContinue, true},
+		{"SchemaMismatch", QwpStatusSchemaMismatch, CategorySchemaMismatch, PolicyTerminal, false},
+		{"ParseError", QwpStatusParseError, CategoryParseError, PolicyTerminal, false},
+		{"InternalError", QwpStatusInternalError, CategoryInternalError, PolicyRetriable, true},
+		{"SecurityError", QwpStatusSecurityError, CategorySecurityError, PolicyTerminal, false},
+		{"WriteError", QwpStatusWriteError, CategoryWriteError, PolicyRetriable, true},
+		{"NotWritable", QwpStatusNotWritable, CategoryNotWritable, PolicyRetriableOther, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := qwpSfTestServerOpts{rejectStatus: tc.status}
-			if tc.dropPath {
+			if tc.retriable {
 				opts.rejectFirstNFrames = 1
 			}
 			srv := newQwpSfTestServer(t, opts)
@@ -779,37 +773,63 @@ func TestErrorApiResilience_LastTerminalErrorSurvivesClose(t *testing.T) {
 		"LastTerminalError snapshot must not change across Close")
 }
 
-// TestErrorApiResilience_TotalServerErrorsCounterStrict drives 3
-// drop-policy rejections back-to-back and asserts the counter is
-// exactly 3 (not >=3, exactly). Catches off-by-one and
-// double-counting bugs that the looser >= assertions in the existing
-// suite would miss.
+// TestErrorApiResilience_TotalServerErrorsCounterStrict drives exactly
+// 3 retriable-NACK recycle cycles and asserts the counter is exactly 3
+// (not >=3, exactly). Catches off-by-one and double-counting bugs that
+// the looser >= assertions in the existing suite would miss. The
+// custom server NACKs the first frame of connections 1..3 and ACKs
+// everything from connection 4 on, so each rejection maps 1:1 to one
+// recycle and the poison threshold (4) is never reached.
 func TestErrorApiResilience_TotalServerErrorsCounterStrict(t *testing.T) {
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:       QwpStatusSchemaMismatch,
-		rejectFirstNFrames: 3,
-	})
+	var connCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		myConn := connCount.Add(1)
+		var seq int64
+		first := true
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			if myConn <= 3 && first {
+				first = false
+				_ = conn.Write(context.Background(), websocket.MessageBinary,
+					buildAckError(QwpStatusWriteError, seq, "rejected"))
+				seq++
+				continue
+			}
+			_ = conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+		}
+	}))
 	defer srv.Close()
 
-	s, _, _, cleanup := newCursorSenderForTest(t, srv, 0)
-	defer cleanup()
+	ls, err := NewLineSender(context.Background(),
+		WithQwp(), WithAddress(strings.TrimPrefix(srv.URL, "http://")),
+		WithErrorHandler(func(*SenderError) {}),
+		WithReconnectPolicy(0, time.Millisecond, 5*time.Millisecond),
+	)
+	require.NoError(t, err)
+	s := asQwp(t, ls)
+	defer func() { _ = ls.Close(context.Background()) }()
 
-	for i := 0; i < 3; i++ {
-		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
-		require.NoError(t, s.Flush(context.Background()))
+	for i := 0; i < 4; i++ {
+		require.NoError(t, ls.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
+		require.NoError(t, ls.Flush(context.Background()))
 	}
-	// Send a 4th frame that should NOT be rejected — bookmarks the
-	// fact that the 3 prior rejections settled.
-	require.NoError(t, s.Table("t").Int64Column("v", 99).AtNow(context.Background()))
-	require.NoError(t, s.Flush(context.Background()))
 
 	require.Eventually(t, func() bool {
 		return s.AckedFsn() >= 3
-	}, 5*time.Second, 1*time.Millisecond, "all four frames should be acked")
+	}, 5*time.Second, 1*time.Millisecond, "all four frames should drain on conn 4")
 
 	assert.Equal(t, int64(3), s.TotalServerErrors(),
-		"exactly three drops should have happened, not more, not fewer")
-	assert.Nil(t, s.LastTerminalError(), "Drops should not latch terminal")
+		"exactly three retriable NACKs should have happened, not more, not fewer")
+	assert.Nil(t, s.LastTerminalError(), "retriable NACKs must not latch terminal")
 }
 
 // =============================================================================
@@ -894,9 +914,11 @@ func runHaltStressOnce(t *testing.T, iter, goroutines int) {
 //   - the counters (TotalErrorNotificationsDelivered and
 //     DroppedErrorNotifications) sum consistently with TotalServerErrors.
 func TestErrorApiResilience_DispatcherSwapMidFlight(t *testing.T) {
+	// Pre-send retriable rejections give an unbounded notification
+	// stream (one per recycle, no poison strikes), letting the test
+	// observe deliveries both before and after the handler swap.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:       QwpStatusSchemaMismatch,
-		rejectFirstNFrames: 50, // 50 drops on conn 1
+		unsolicitedRejectAtConnect: QwpStatusWriteError,
 	})
 	defer srv.Close()
 
@@ -909,14 +931,10 @@ func TestErrorApiResilience_DispatcherSwapMidFlight(t *testing.T) {
 		oldDelivered.Add(1)
 	}, qwpSfMinErrorInboxCapacity)
 
-	// Drive 25 rejections, then swap the handler.
-	for i := 0; i < 25; i++ {
-		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
-		require.NoError(t, s.Flush(context.Background()))
-	}
+	// Let ~25 recycle cycles fire, then swap the handler.
 	require.Eventually(t, func() bool {
 		return s.TotalServerErrors() >= 25
-	}, 5*time.Second, 1*time.Millisecond)
+	}, 10*time.Second, 1*time.Millisecond)
 
 	// Swap to a new handler.
 	var newDelivered atomic.Int64
@@ -924,14 +942,10 @@ func TestErrorApiResilience_DispatcherSwapMidFlight(t *testing.T) {
 		newDelivered.Add(1)
 	}, qwpSfMinErrorInboxCapacity)
 
-	// Drive 25 more rejections — these must reach the new handler.
-	for i := 25; i < 50; i++ {
-		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
-		require.NoError(t, s.Flush(context.Background()))
-	}
+	before := s.TotalServerErrors()
 	require.Eventually(t, func() bool {
-		return s.TotalServerErrors() >= 50
-	}, 5*time.Second, 1*time.Millisecond)
+		return s.TotalServerErrors() >= before+25
+	}, 10*time.Second, 1*time.Millisecond)
 
 	// Wait briefly for the new dispatcher to drain.
 	require.Eventually(t, func() bool {
@@ -1049,29 +1063,25 @@ func TestErrorApiResilience_ServerRestartReplaysCorrectly(t *testing.T) {
 // shutdown indefinitely. The cap is currently 100 ms; the test
 // asserts < 1 s for headroom.
 func TestErrorApiResilience_DispatcherDrainTimeoutCap(t *testing.T) {
+	// Pre-send retriable rejections queue one notification per recycle
+	// against the slow handler.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:       QwpStatusSchemaMismatch,
-		rejectFirstNFrames: 100,
+		unsolicitedRejectAtConnect: QwpStatusWriteError,
 	})
 	defer srv.Close()
 
 	s, _, loop, _ := newCursorSenderForTest(t, srv, 0)
 
-	// Slow handler: each call takes 50 ms. With 100 queued items,
-	// processing them all would take 5 s; the drain timeout (100 ms)
+	// Slow handler: each call takes 50 ms. With dozens of queued items,
+	// processing them all would take seconds; the drain timeout (100 ms)
 	// must cap that.
 	loop.sendLoopSetErrorHandler(func(e *SenderError) {
 		time.Sleep(50 * time.Millisecond)
-	}, 256) // generous capacity so most drops queue rather than getting dropped
+	}, 256) // generous capacity so notifications queue rather than getting dropped
 
-	// Drive 100 drops as fast as possible.
-	for i := 0; i < 100; i++ {
-		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
-		require.NoError(t, s.Flush(context.Background()))
-	}
 	require.Eventually(t, func() bool {
-		return s.TotalServerErrors() >= 100
-	}, 5*time.Second, 1*time.Millisecond)
+		return s.TotalServerErrors() >= 20
+	}, 10*time.Second, 1*time.Millisecond)
 
 	// Now close — the drain timeout must fire before the slow
 	// handler chews through all 100 queued items.
@@ -1089,63 +1099,68 @@ func TestErrorApiResilience_DispatcherDrainTimeoutCap(t *testing.T) {
 // HALT after partial Drop streak
 // =============================================================================
 
-// TestErrorApiResilience_DropStreakThenHalt models a realistic
-// scenario: many rows fail with WriteError (Drop policy), the loop
-// keeps draining, then a row hits ParseError (Halt policy) and the
-// loop latches. The Drop counter and Halt latch should be
-// independent; the FSN on the Halt should be > the FSNs of the
-// Drops.
-func TestErrorApiResilience_DropStreakThenHalt(t *testing.T) {
-	// Custom server: WriteError for first 3 frames, ParseError on
-	// frame 4. Switch by adding a custom handler — the existing
-	// fixture only supports one rejectStatus per server.
-	var nFrames atomic.Int32
-	srv := &qwpSfTestServer{kill: make(chan struct{})}
-	srv.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// TestErrorApiResilience_RetriableStreakThenTerminal models a
+// realistic scenario: the head frame fails with WriteError (retriable)
+// on three consecutive connections — each recycles and replays — then
+// the fourth delivery hits ParseError (terminal) and the loop latches.
+// The retriable counter and the terminal latch are independent, the
+// genuine terminal wins before the poison threshold, and the terminal
+// names the still-unacked head frame.
+func TestErrorApiResilience_RetriableStreakThenTerminal(t *testing.T) {
+	// Custom server: NACK the first frame of each connection —
+	// WriteError on conns 1..3, ParseError from conn 4.
+	var connCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer conn.CloseNow()
-		var localSeq int64
+		myConn := connCount.Add(1)
+		if _, _, err := conn.Read(context.Background()); err != nil {
+			return
+		}
+		status := QwpStatusWriteError
+		if myConn >= 4 {
+			status = QwpStatusParseError
+		}
+		_ = conn.Write(context.Background(), websocket.MessageBinary,
+			buildAckError(status, 0, "rejected"))
 		for {
-			_, _, err := conn.Read(context.Background())
-			if err != nil {
+			if _, _, err := conn.Read(context.Background()); err != nil {
 				return
 			}
-			n := nFrames.Add(1)
-			srv.totalFramesReceived.Add(1)
-			var status QwpStatusCode
-			if n <= 3 {
-				status = QwpStatusWriteError // Drop
-			} else {
-				status = QwpStatusParseError // Halt
-			}
-			_ = conn.Write(context.Background(), websocket.MessageBinary,
-				buildAckError(status, localSeq, "rejected"))
-			localSeq++
 		}
 	}))
 	defer srv.Close()
 
-	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 0)
-	defer cleanup()
+	ls, err := NewLineSender(context.Background(),
+		WithQwp(), WithAddress(strings.TrimPrefix(srv.URL, "http://")),
+		WithErrorHandler(func(*SenderError) {}),
+		WithReconnectPolicy(0, time.Millisecond, 5*time.Millisecond),
+	)
+	require.NoError(t, err)
+	s := asQwp(t, ls)
+	defer func() { _ = ls.Close(context.Background()) }()
 
-	for i := 0; i < 4; i++ {
-		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
-		_ = s.Flush(context.Background())
-	}
+	require.NoError(t, ls.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	_ = ls.Flush(context.Background())
+
 	require.Eventually(t, func() bool {
-		return loop.sendLoopCheckError() != nil
+		return s.LastTerminalError() != nil
 	}, 5*time.Second, 1*time.Millisecond)
 
 	se := s.LastTerminalError()
 	require.NotNil(t, se)
-	assert.Equal(t, CategoryParseError, se.Category, "last terminal should be the Halt, not a Drop")
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
-	assert.Equal(t, int64(3), se.FromFsn, "the Halted frame is FSN 3 (after 3 Drops at 0..2)")
+	assert.Equal(t, CategoryParseError, se.Category,
+		"the genuine terminal must win, not a retriable or the poison detector")
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
+	assert.NotContains(t, se.ServerMessage, "poisoned frame",
+		"the ParseError terminal fires at delivery 4, before a 4th retriable strike")
+	assert.Equal(t, int64(0), se.FromFsn,
+		"the terminal names the still-unacked head frame")
 
-	// 4 server errors total: 3 drops + 1 halt.
+	// 4 server errors total: 3 retriable NACKs + 1 terminal.
 	assert.Equal(t, int64(4), s.TotalServerErrors())
 }

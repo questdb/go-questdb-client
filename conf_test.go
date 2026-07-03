@@ -337,7 +337,7 @@ func TestParserPathologicalCases(t *testing.T) {
 		},
 		{
 			name:                   "duplicate on_server_error",
-			config:                 "ws::addr=localhost:9000;on_server_error=auto;on_server_error=halt;",
+			config:                 "ws::addr=localhost:9000;on_server_error=auto;on_server_error=terminal;",
 			expectedErrMsgContains: `duplicate key \"on_server_error\"`,
 		},
 	}
@@ -647,11 +647,11 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name:   "ws with on_server_error",
-			config: fmt.Sprintf("ws::addr=%s;on_server_error=halt;", addr),
+			config: fmt.Sprintf("ws::addr=%s;on_server_error=terminal;", addr),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithQwp(),
 				qdb.WithAddress(addr),
-				qdb.WithServerErrorPolicy(qdb.PolicyHalt),
+				qdb.WithServerErrorPolicy(qdb.PolicyTerminal),
 			},
 		},
 		{
@@ -1004,7 +1004,7 @@ func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
 		{"qwp_dump_writer", qdb.WithQwpDumpWriter(io.Discard), "QWP dump writer"},
 		{"error_handler", qdb.WithErrorHandler(func(*qdb.SenderError) {}), "server-error API"},
 		{"error_inbox_capacity", qdb.WithErrorInboxCapacity(64), "server-error API"},
-		{"server_error_policy", qdb.WithServerErrorPolicy(qdb.PolicyHalt), "server-error API"},
+		{"server_error_policy", qdb.WithServerErrorPolicy(qdb.PolicyTerminal), "server-error API"},
 	}
 	for _, transport := range []struct {
 		name string

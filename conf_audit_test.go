@@ -394,12 +394,12 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"max_background_drainers=4",
 		"max_buf_size=100m",
 		"max_name_len=127",
-		"on_internal_error=halt",
-		"on_parse_error=halt",
-		"on_schema_error=halt",
-		"on_security_error=halt",
+		"on_internal_error=terminal",
+		"on_parse_error=terminal",
+		"on_schema_error=terminal",
+		"on_security_error=terminal",
 		"on_server_error=auto",
-		"on_write_error=halt",
+		"on_write_error=terminal",
 		"reconnect_initial_backoff_millis=100",
 		"reconnect_max_backoff_millis=5000",
 		"reconnect_max_duration_millis=300000",
@@ -441,7 +441,7 @@ func TestConfSharedConnectString(t *testing.T) {
 		// ingress-only:
 		"sf_dir=/tmp/sf;sender_id=ingest-1;auto_flush_rows=500;" +
 		"reconnect_max_duration_millis=120000;" +
-		"on_schema_error=drop;" +
+		"on_schema_error=retriable;" +
 		// egress-only:
 		"compression=zstd;compression_level=3;" +
 		"failover_max_attempts=8;failover_max_duration_ms=30000;"

@@ -182,21 +182,41 @@ Orphan-slot adoption (SF mode, `drain_orphans=on`) is implemented in
 `qwp_sf_orphan.go` + `qwp_sf_drainer.go` + `qwp_sf_round_walk.go`; drainers run
 in dedicated goroutines and are visible via `QwpSender.BackgroundDrainers()`.
 
-### Error handling
+### Error handling (NACK policy v2 — no drop, no lists, no dead senders)
 
 QWP server rejections surface as `*SenderError` (`sender_error.go` is canonical
 for categories + policy enum). Two paths: async callback registered via
 `WithErrorHandler`, and producer-side typed error via `errors.As` after `Flush`
 / `FlushAndGetSequence`.
 
+**There is no drop policy** (design: `design/qwp-nack-policy-v2.md`). Three
+policies: `RETRIABLE` (WRITE_ERROR, INTERNAL_ERROR, UNKNOWN fail-open) recycles
+the connection and replays from `ackedFsn+1` through the wire-failure reconnect
+machinery — dispatch is informational, nothing dropped, no watermark advance;
+`RETRIABLE_OTHER` (NOT_WRITABLE, reserved wire byte 0x0C) same with endpoint
+rotation; `TERMINAL` (SCHEMA_MISMATCH, PARSE_ERROR, SECURITY_ERROR,
+PROTOCOL_VIOLATION) latches — reserved for rejections deterministic under
+byte-identical replay, bytes preserved in the SF log.
+
 Policy resolution precedence (highest first): `WithErrorPolicyResolver` →
 `WithErrorPolicy(category, ...)` → connect-string `on_*_error` →
-`on_server_error` → spec defaults. `PROTOCOL_VIOLATION` and `UNKNOWN` are never
-user-configurable — always HALT.
+`on_server_error` → spec defaults. `PROTOCOL_VIOLATION` is forced TERMINAL and
+`UNKNOWN` is forced RETRIABLE (fail open); user overrides for those two are
+ignored.
 
-A HALT latches the typed error on the I/O loop; `sendLoopCheckError()` surfaces
-it on the next producer call. The sender does not auto-resume — close + rebuild
-is the supported recovery (matches Java).
+**WS close codes carry no policy semantics** — every close is
+reconnect-eligible (`qwpSfIsTerminalCloseCode` is diagnostics-only). The
+guarded case — a frame that deterministically kills the connection without a
+NACK — is caught behaviorally by the **poison-frame detector**: a retriable
+NACK or non-orderly close (not 1000/1001) after at least one send, at the same
+head-of-line FSN with no ack progress, counts a strike; `max_frame_rejections`
+(default 4; `WithMaxFrameRejections`) consecutive strikes escalate to a typed
+PROTOCOL_VIOLATION terminal naming the FSN. Any ACK resets the counter.
+`ackedFsn` advances **only** on server OKs — never on any rejection.
+
+A TERMINAL latches the typed error on the I/O loop; `sendLoopCheckError()`
+surfaces it on the next producer call. The sender does not auto-resume — close
++ rebuild is the supported recovery (matches Java).
 
 ### Connection pooling
 

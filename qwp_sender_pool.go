@@ -87,7 +87,18 @@ type qwpSenderPool struct {
 	slotInUse       []bool // reservation bitmap for SF slot indices [0, maxSize)
 	closingSlots    int    // SF slots removed from `all` but still releasing their flock
 	leakedSlots     int    // SF slots permanently retired (close left the flock held)
+
+	// pendingLeaseTeardowns counts delegate teardowns currently running on
+	// returning borrowers' goroutines (giveBack's closed branch). close()
+	// counts these as outstanding so it does not return while a delegate is
+	// still being torn down on another goroutine. Guarded by mu.
+	pendingLeaseTeardowns int
 }
+
+// qwpPoolMaxCloseLeaseWait hard-caps close()'s outstanding-lease wait. The
+// acquire timeout is a BORROW policy and must never unbound SHUTDOWN: without
+// this cap a forgotten lease would hang close() for the whole acquire budget.
+const qwpPoolMaxCloseLeaseWait = 5 * time.Second
 
 // qwpSenderSlot is one reusable pool entry. generation is bumped under the pool
 // lock on every hand-out and every return; a lease carries the value it was
@@ -298,10 +309,19 @@ func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broke
 	ps.slot.generation.Add(1)
 	if p.closed {
 		// The pool was torn down while this slot was on loan, so close() left it
-		// for us. The producer is done now, so closing the delegate here cannot
-		// race a writer.
+		// for us: close() never tears down a borrowed delegate (a producer
+		// goroutine may be inside it mid-append — C1). The producer is done now,
+		// so closing the delegate here cannot race a writer. Track the teardown
+		// so a concurrent close() does not return while it is in flight.
+		p.removeFromAllLocked(ps.slot)
+		p.pendingLeaseTeardowns++
 		p.mu.Unlock()
 		_ = closeSlotGuarded(ctx, ps.slot.delegate)
+		p.mu.Lock()
+		p.pendingLeaseTeardowns--
+		p.reclaimSlotLocked(ps.slot, nil)
+		p.broadcastLocked()
+		p.mu.Unlock()
 		return
 	}
 	if broken {
@@ -502,8 +522,54 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 		return nil
 	}
 	p.closed = true
+	p.closing.Store(true)
+	// Wake parked borrowers so they observe the shutdown and error out.
+	p.broadcastLocked()
+
+	// Bounded graceful wait for outstanding leases: close() NEVER tears down
+	// a borrowed delegate — a producer goroutine may be inside it mid-append,
+	// and closing it here would flush and free buffers under that goroutine
+	// (C1). giveBack observing `closed` tears each delegate down on the
+	// returning borrower's goroutine instead (tracked via
+	// pendingLeaseTeardowns so this method does not return while a teardown
+	// is still in flight). The budget is the acquire timeout hard-capped at
+	// qwpPoolMaxCloseLeaseWait: a huge acquire timeout is a borrow policy,
+	// not a licence for close() to hang on a lease that never comes home.
+	waitBudget := p.acquireTimeout
+	if waitBudget > qwpPoolMaxCloseLeaseWait {
+		waitBudget = qwpPoolMaxCloseLeaseWait
+	}
+	deadline := time.Now().Add(waitBudget)
+	for {
+		outstanding := len(p.all) - len(p.available) + p.inFlightCreations + p.pendingLeaseTeardowns
+		if outstanding <= 0 {
+			break
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		ch := p.notify
+		p.mu.Unlock()
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ch:
+		case <-timer.C:
+		}
+		timer.Stop()
+		p.mu.Lock()
+	}
+	if leaked := len(p.all) - len(p.available); leaked > 0 {
+		// A logged leak is recoverable; a freed buffer under a live producer
+		// is not. The delegate is torn down whenever its lease finally
+		// returns (giveBack's closed branch).
+		log.Printf("[WARN] qwp pool: close() leaving %d borrowed sender(s) alive; "+
+			"each is torn down when its lease is closed", leaked)
+	}
 	toClose := append([]*qwpSenderSlot(nil), p.available...)
-	p.all = nil
+	for _, slot := range toClose {
+		p.removeFromAllLocked(slot)
+	}
 	p.available = nil
 	p.broadcastLocked()
 	p.mu.Unlock()

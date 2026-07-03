@@ -42,9 +42,10 @@ import (
 )
 
 // poisonFirstConnQwpServer accepts WS upgrades. The first connection — the
-// pool's prewarmed slot — is held idle and then closed with a terminal
-// protocol-violation code when the returned poison func is called, simulating a
-// background HALT of a slot with no lease watching. Every later connection (a
+// pool's prewarmed slot — is held idle and then rejected terminally when the
+// returned poison func is called, simulating a background HALT of a slot with
+// no lease watching: an unsolicited TERMINAL NACK (SECURITY_ERROR) latches the
+// idle slot's send loop even with nothing in flight. Every later connection (a
 // replacement slot) is served normally so a re-borrowed slot is healthy.
 func poisonFirstConnQwpServer(t *testing.T) (*httptest.Server, func()) {
 	t.Helper()
@@ -58,11 +59,20 @@ func poisonFirstConnQwpServer(t *testing.T) (*httptest.Server, func()) {
 		}
 		defer conn.CloseNow()
 		if conns.Add(1) == 1 {
-			// First (prewarm) connection: the client's receiver is reading, so a
-			// terminal close lands as a PROTOCOL_VIOLATION HALT even while idle.
+			// First (prewarm) connection: the client's receiver is reading, so
+			// an unsolicited terminal NACK lands as a SECURITY_ERROR latch even
+			// while idle (WS close codes carry no policy semantics anymore).
 			select {
 			case <-poison:
-				_ = conn.Close(websocket.StatusProtocolError, "poisoned")
+				_ = conn.Write(context.Background(), websocket.MessageBinary,
+					buildAckError(QwpStatusSecurityError, 0, "poisoned"))
+				// Keep reading so the client's close handshake completes
+				// promptly when the poisoned slot is discarded.
+				for {
+					if _, _, err := conn.Read(context.Background()); err != nil {
+						return
+					}
+				}
 			case <-r.Context().Done():
 			}
 			return
@@ -826,4 +836,104 @@ func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 		t.Fatalf("borrow after SF discard: %v", err)
 	}
 	_ = s2.Close(ctx)
+}
+
+// TestQwpSenderPoolCloseNeverTearsDownBorrowedDelegate pins C1: close()
+// must not close the delegate of a borrowed slot — a producer goroutine
+// may be inside it. close() waits boundedly (acquire timeout, capped),
+// leaks the lease with a log line, and the delegate stays fully usable
+// until the borrower returns it, at which point the returning goroutine
+// tears it down exactly once.
+func TestQwpSenderPoolCloseNeverTearsDownBorrowedDelegate(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2,
+		200*time.Millisecond /* acquire = close wait budget */, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+
+	s, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+
+	// A producer keeps appending on the borrowed lease while close() runs.
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = s.Table("t").Int64Column("v", 1).AtNow(context.Background())
+				_ = s.Flush(context.Background())
+			}
+		}
+	}()
+
+	start := time.Now()
+	if err := p.close(context.Background()); err != nil {
+		t.Logf("close: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 150*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("close took %s; want ~the 200ms lease-wait budget", elapsed)
+	}
+
+	// The borrowed delegate is untouched: the producer is still writing
+	// with no terminal error even though the pool is gone.
+	if slotTerminallyFailed(s.(*qwpPooledSender).slot.delegate) {
+		t.Fatal("close() poisoned the borrowed delegate")
+	}
+	close(stop)
+	<-done
+
+	// Returning the lease tears the delegate down on this goroutine.
+	if err := s.Close(context.Background()); err != nil {
+		t.Logf("lease close: %v", err)
+	}
+	// Duplicate close is a no-op (stale generation).
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("duplicate lease close: %v", err)
+	}
+}
+
+// TestQwpSenderPoolCloseUnblocksWhenLeaseReturns pins the graceful half
+// of the C1 protocol: a lease returned while close() is waiting lets
+// close() finish well before the wait budget, with the delegate torn
+// down by the returning goroutine (tracked, so close() does not return
+// mid-teardown).
+func TestQwpSenderPoolCloseUnblocksWhenLeaseReturns(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2,
+		5*time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+
+	s, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_ = s.Close(context.Background())
+	}()
+
+	start := time.Now()
+	if err := p.close(context.Background()); err != nil {
+		t.Logf("close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("close took %s; a returned lease must unblock it well before the 5s budget", elapsed)
+	}
+	total, avail, _ := p.poolSnapshot()
+	if total != 0 || avail != 0 {
+		t.Fatalf("post-close snapshot total=%d avail=%d, want 0/0", total, avail)
+	}
 }

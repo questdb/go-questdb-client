@@ -232,6 +232,12 @@ const (
 	// Egress-specific status codes (spec §15).
 	qwpStatusCancelled     QwpStatusCode = 0x0A // query terminated in response to CANCEL
 	qwpStatusLimitExceeded QwpStatusCode = 0x0B // a protocol limit was hit
+	// QwpStatusNotWritable is reserved: current servers signal a
+	// read-only / demoting node with a reconnect-eligible close instead
+	// of a mid-stream NACK. Mapped so a future server that NACKs it
+	// explicitly classifies as retriable-with-rotation on deployed
+	// client fleets.
+	QwpStatusNotWritable QwpStatusCode = 0x0C
 )
 
 // QWP sender defaults and limits.

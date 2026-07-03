@@ -310,6 +310,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		durableKeepalive = time.Duration(conf.durableAckKeepaliveMillis) * time.Millisecond
 	}
 	loop.sendLoopSetDurableAck(conf.requestDurableAck, durableKeepalive, true)
+	loop.sendLoopSetMaxFrameRejections(conf.maxFrameRejections)
 	loop.sendLoopSetProgressHandler(conf.progressHandler, conf.errorInboxCapacity)
 
 	s, err := newQwpCursorLineSender(
@@ -416,6 +417,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 				// sender's drainers must also trim only on STATUS_DURABLE_ACK.
 				drainer.durableAckMode = conf.requestDurableAck
 				drainer.durableKeepalive = durableKeepalive
+				drainer.maxFrameRejections = conf.maxFrameRejections
 				drainer.listener = conf.backgroundDrainerListener
 				_ = pool.drainerPoolSubmit(ctx, drainer)
 			}

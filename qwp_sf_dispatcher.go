@@ -423,15 +423,17 @@ func (d *qwpSfErrorDispatcher) totalDelivered() int64 {
 }
 
 // defaultSenderErrorHandler is the loud-not-silent fallback used when
-// the user has not registered a handler. ERROR for HALT, WARN for
-// DROP — both with the full structured payload. Per Java spec
-// § "Loud defaults — silence is forbidden".
+// the user has not registered a handler. ERROR for TERMINAL, WARN for
+// retriable (informational: the batch stays in the SF log and is
+// replayed after the connection recycles) — both with the full
+// structured payload. Per the spec § "Loud defaults — silence is
+// forbidden".
 func defaultSenderErrorHandler(e *SenderError) {
 	if e == nil {
 		return
 	}
 	level := "[ERROR]"
-	if e.AppliedPolicy == PolicyDropAndContinue {
+	if e.AppliedPolicy != PolicyTerminal {
 		level = "[WARN]"
 	}
 	log.Printf("%s qwp/sf: %s", level, e)

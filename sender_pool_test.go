@@ -280,7 +280,7 @@ func TestPoolFromOptionsRejectsQwpOnlyOptions(t *testing.T) {
 		opt  qdb.LineSenderOption
 	}{
 		{"WithErrorHandler", qdb.WithErrorHandler(func(*qdb.SenderError) {})},
-		{"WithServerErrorPolicy", qdb.WithServerErrorPolicy(qdb.PolicyHalt)},
+		{"WithServerErrorPolicy", qdb.WithServerErrorPolicy(qdb.PolicyTerminal)},
 		{"WithSfDir", qdb.WithSfDir(t.TempDir())},
 		{"WithDrainOrphans", qdb.WithDrainOrphans(true)},
 		{"WithRequestDurableAck", qdb.WithRequestDurableAck(true)},

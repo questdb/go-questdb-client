@@ -41,22 +41,23 @@ func TestErrorApiPerCategory(t *testing.T) {
 		status     QwpStatusCode
 		wantCat    Category
 		wantPolicy Policy
-		dropPath   bool // true if Policy == DropAndContinue (no terminal error)
+		retriable  bool // true → recycle + replay, no terminal error
 	}{
-		{"SchemaMismatch", QwpStatusSchemaMismatch, CategorySchemaMismatch, PolicyDropAndContinue, true},
-		{"ParseError", QwpStatusParseError, CategoryParseError, PolicyHalt, false},
-		{"InternalError", QwpStatusInternalError, CategoryInternalError, PolicyHalt, false},
-		{"SecurityError", QwpStatusSecurityError, CategorySecurityError, PolicyHalt, false},
-		{"WriteError", QwpStatusWriteError, CategoryWriteError, PolicyDropAndContinue, true},
-		{"Unknown(0xFE)", QwpStatusCode(0xFE), CategoryUnknown, PolicyHalt, false},
+		{"SchemaMismatch", QwpStatusSchemaMismatch, CategorySchemaMismatch, PolicyTerminal, false},
+		{"ParseError", QwpStatusParseError, CategoryParseError, PolicyTerminal, false},
+		{"InternalError", QwpStatusInternalError, CategoryInternalError, PolicyRetriable, true},
+		{"SecurityError", QwpStatusSecurityError, CategorySecurityError, PolicyTerminal, false},
+		{"WriteError", QwpStatusWriteError, CategoryWriteError, PolicyRetriable, true},
+		{"NotWritable", QwpStatusNotWritable, CategoryNotWritable, PolicyRetriableOther, true},
+		// Fail open: a status byte from a newer server degrades to retry.
+		{"Unknown(0xFE)", QwpStatusCode(0xFE), CategoryUnknown, PolicyRetriable, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := qwpSfTestServerOpts{rejectStatus: tc.status}
-			if tc.dropPath {
-				// Reject the first frame only; subsequent frames OK.
-				// Otherwise the loop would Drop forever and we'd never
-				// observe a clean continuation.
+			if tc.retriable {
+				// Reject the first frame of conn 1 only; the post-recycle
+				// replay on conn 2 drains, proving clean continuation.
 				opts.rejectFirstNFrames = 1
 			}
 			srv := newQwpSfTestServer(t, opts)
@@ -84,13 +85,13 @@ func TestErrorApiPerCategory(t *testing.T) {
 				t.Fatal("handler not invoked within deadline")
 			}
 
-			if tc.dropPath {
-				// Drop: ackedFsn advances past the rejected span;
-				// LastTerminalError stays nil.
+			if tc.retriable {
+				// Retriable: the recycle replays the frame and the conn-2
+				// ACK advances the watermark; LastTerminalError stays nil.
 				require.Eventually(t, func() bool {
 					return engine.engineAckedFsn() >= 0
 				}, 2*time.Second, 1*time.Millisecond)
-				assert.Nil(t, s.LastTerminalError(), "Drop should not latch terminal")
+				assert.Nil(t, s.LastTerminalError(), "a retriable NACK must not latch terminal")
 			} else {
 				// Halt: terminal latched; LastTerminalError non-nil.
 				require.Eventually(t, func() bool {
@@ -120,7 +121,7 @@ func TestErrorApiOverridePolicyViaResolver(t *testing.T) {
 	loop.sendLoopSetPolicyResolver(&qwpSfPolicyResolver{
 		resolver: func(c Category) Policy {
 			if c == CategoryParseError {
-				return PolicyDropAndContinue
+				return PolicyRetriable
 			}
 			return PolicyAuto
 		},
@@ -142,7 +143,7 @@ func TestErrorApiOverridePolicyViaResolver(t *testing.T) {
 
 // TestErrorApiOverridePolicyViaPerCategory uses the perCat slot to
 // flip SCHEMA_MISMATCH (default Drop) to Halt — mirrors the
-// connect-string on_schema_error=halt path.
+// connect-string on_schema_error=terminal path.
 func TestErrorApiOverridePolicyViaPerCategory(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		rejectStatus: QwpStatusSchemaMismatch,
@@ -153,7 +154,7 @@ func TestErrorApiOverridePolicyViaPerCategory(t *testing.T) {
 	defer cleanup()
 
 	r := &qwpSfPolicyResolver{}
-	r.perCat[CategorySchemaMismatch] = PolicyHalt
+	r.perCat[CategorySchemaMismatch] = PolicyTerminal
 	loop.sendLoopSetPolicyResolver(r)
 
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
@@ -166,7 +167,7 @@ func TestErrorApiOverridePolicyViaPerCategory(t *testing.T) {
 	se := s.LastTerminalError()
 	require.NotNil(t, se)
 	assert.Equal(t, CategorySchemaMismatch, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 }
 
 // TestErrorApiFsnSpanCorrelation drives a HALT rejection and asserts

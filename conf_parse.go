@@ -86,6 +86,7 @@ var ingressOnlyKeys = map[string]bool{
 	"initial_connect_retry":                 true,
 	"max_background_drainers":               true,
 	"max_buf_size":                          true,
+	"max_frame_rejections":                  true,
 	"max_name_len":                          true,
 	"on_internal_error":                     true,
 	"on_parse_error":                        true,
@@ -474,6 +475,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			senderConf.reconnectMaxBackoffMillis = parsedVal
 			senderConf.reconnectMaxBackoffMillisSet = true
+		case "max_frame_rejections":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal < 1 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be an int >= 1", k, v)
+			}
+			senderConf.maxFrameRejections = parsedVal
 		case "initial_connect_retry":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -647,10 +657,18 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 // only meaningful at the global layer.
 func parseErrorPolicyValue(k, v string, allowAuto bool) (Policy, error) {
 	switch v {
-	case "halt":
-		return PolicyHalt, nil
-	case "drop":
-		return PolicyDropAndContinue, nil
+	case "terminal":
+		return PolicyTerminal, nil
+	case "retriable":
+		return PolicyRetriable, nil
+	case "retriable_other":
+		return PolicyRetriableOther, nil
+	case "halt", "drop":
+		// NACK policy v2 removed the drop policy (no silent data loss)
+		// and renamed halt; fail loudly with a migration hint instead of
+		// silently reinterpreting an old config.
+		return PolicyAuto, NewInvalidConfigStrError(
+			"invalid %s value: %q was removed by NACK policy v2 — use 'terminal', 'retriable', or 'retriable_other'", k, v)
 	case "auto":
 		if allowAuto {
 			return PolicyAuto, nil
@@ -658,10 +676,10 @@ func parseErrorPolicyValue(k, v string, allowAuto bool) (Policy, error) {
 	}
 	if allowAuto {
 		return PolicyAuto, NewInvalidConfigStrError(
-			"invalid %s value, %q is not 'auto' / 'halt' / 'drop'", k, v)
+			"invalid %s value, %q is not 'auto' / 'terminal' / 'retriable' / 'retriable_other'", k, v)
 	}
 	return PolicyAuto, NewInvalidConfigStrError(
-		"invalid %s value, %q is not 'halt' / 'drop'", k, v)
+		"invalid %s value, %q is not 'terminal' / 'retriable' / 'retriable_other'", k, v)
 }
 
 // setPerCategoryPolicy parses v as a Policy and stores it on the

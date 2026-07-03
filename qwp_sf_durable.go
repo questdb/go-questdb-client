@@ -147,19 +147,6 @@ func (t *qwpDurableTracker) enqueueOk(wireSeq int64, tail []byte) bool {
 	return true
 }
 
-// enqueueEmpty stashes a wire sequence with no tables — a DROP_AND_CONTINUE
-// rejection, which carries no table trailer. It is trivially durable but still
-// chains in FIFO order, so it advances the watermark only once every preceding
-// OK batch is durable.
-func (t *qwpDurableTracker) enqueueEmpty(wireSeq int64) {
-	e := t.acquire()
-	e.wireSeq = wireSeq
-	e.tables = e.tables[:0]
-	e.seqTxns = e.seqTxns[:0]
-	t.pending = append(t.pending, e)
-	t.pendingLen.Store(int64(len(t.pending)))
-}
-
 // applyDurable advances the per-table watermarks from a durable frame, taking the
 // max so a reordered or older cumulative frame cannot move one backward.
 func (t *qwpDurableTracker) applyDurable(tail []byte) {

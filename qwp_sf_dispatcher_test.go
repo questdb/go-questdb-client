@@ -183,7 +183,7 @@ func TestQwpSfDispatcherCloseDrainsLeftover(t *testing.T) {
 		mu.Unlock()
 	}, 4)
 
-	want := &SenderError{Category: CategoryParseError, AppliedPolicy: PolicyHalt}
+	want := &SenderError{Category: CategoryParseError, AppliedPolicy: PolicyTerminal}
 	d.inbox <- want
 	if d.started.Load() {
 		t.Fatal("test setup: dispatcher unexpectedly started")
@@ -302,7 +302,7 @@ func TestQwpSfDispatcherNilHandlerUsesDefault(t *testing.T) {
 	defer d.close()
 	d.offer(&SenderError{
 		Category:      CategoryParseError,
-		AppliedPolicy: PolicyHalt,
+		AppliedPolicy: PolicyTerminal,
 	})
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -344,7 +344,7 @@ func TestQwpSfDispatcherCloseFromHandlerNoSelfJoin(t *testing.T) {
 		close(returned)
 	}, 4)
 
-	if !d.offer(&SenderError{Category: CategoryParseError, AppliedPolicy: PolicyHalt}) {
+	if !d.offer(&SenderError{Category: CategoryParseError, AppliedPolicy: PolicyTerminal}) {
 		t.Fatal("offer rejected on a fresh dispatcher")
 	}
 

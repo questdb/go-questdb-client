@@ -66,7 +66,9 @@ type Category byte
 
 const (
 	// CategoryUnknown is the zero value and the fallback for any
-	// status byte the client does not recognize. Forced HALT.
+	// status byte the client does not recognize. Forced RETRIABLE
+	// (fail open): a status byte from a newer server must degrade to
+	// retry, not to a dead sender.
 	CategoryUnknown Category = iota
 	// CategorySchemaMismatch: column type incompatible with existing
 	// table, missing column, NOT NULL violation, no such table.
@@ -80,16 +82,25 @@ const (
 	CategoryInternalError
 	// CategorySecurityError: authentication or authorization failure.
 	// Wire status 0x08, also produced by 401/403 on the WebSocket
-	// upgrade.
+	// upgrade. Mid-stream it can only mean ACL denial on a writable
+	// node — read-only refusals arrive as role-change closes.
 	CategorySecurityError
 	// CategoryWriteError: non-critical Cairo error, table not
 	// accepting writes. Wire status 0x09.
 	CategoryWriteError
-	// CategoryProtocolViolation: WebSocket-layer close frame with a
-	// terminal code (PROTOCOL_ERROR 1002, UNSUPPORTED_DATA 1003,
-	// INVALID_PAYLOAD_DATA 1007, POLICY_VIOLATION 1008,
-	// MESSAGE_TOO_BIG 1009, MANDATORY_EXTENSION 1010), or 404/426
-	// upgrade rejection. Forced HALT.
+	// CategoryNotWritable: the node cannot serve writes at all right
+	// now (read-only replica, demoting primary). Wire status 0x0C —
+	// reserved: current servers signal this state with a
+	// reconnect-eligible close instead of a mid-stream NACK, so the
+	// category is mapped for forward compatibility with servers that
+	// NACK it explicitly.
+	CategoryNotWritable
+	// CategoryProtocolViolation: a frame the server (or an
+	// intermediary) deterministically rejects — the poison-frame
+	// detector observed the same head-of-line frame fail
+	// max_frame_rejections consecutive times with no ack progress —
+	// or a 404/426 upgrade rejection / durable-ack capability
+	// mismatch. Forced TERMINAL.
 	CategoryProtocolViolation
 
 	numCategories // sentinel: must be last
@@ -111,6 +122,8 @@ func (c Category) String() string {
 		return "SECURITY_ERROR"
 	case CategoryWriteError:
 		return "WRITE_ERROR"
+	case CategoryNotWritable:
+		return "NOT_WRITABLE"
 	case CategoryProtocolViolation:
 		return "PROTOCOL_VIOLATION"
 	default:
@@ -123,8 +136,15 @@ func (c Category) String() string {
 // builder per-category errorPolicy → connect-string per-category
 // on_*_error → connect-string global on_server_error → spec defaults.
 //
-// CategoryProtocolViolation and CategoryUnknown are forced HALT; user
-// overrides for those categories are ignored.
+// There is no drop policy by design: the client never silently
+// discards data. A rejected batch is either replayed (PolicyRetriable
+// / PolicyRetriableOther) or halts the sender loudly with the bytes
+// preserved on disk (PolicyTerminal).
+//
+// CategoryProtocolViolation is forced TERMINAL and CategoryUnknown is
+// forced RETRIABLE (fail open: a status byte from a newer server must
+// degrade to retry, not to a dead sender); user overrides for those
+// categories are ignored.
 type Policy byte
 
 const (
@@ -133,16 +153,26 @@ const (
 	// on a delivered SenderError — the loop always resolves to a
 	// concrete policy before building the error.
 	PolicyAuto Policy = iota
-	// PolicyDropAndContinue: advance ackedFsn past the rejected
-	// span and keep draining. The data is dropped from the SF disk
-	// store; users wanting durability must dead-letter via
-	// SenderErrorHandler.
-	PolicyDropAndContinue
-	// PolicyHalt: latch the error as terminal. The next
+	// PolicyRetriable: recycle the connection and replay from the
+	// store-and-forward log — reconnect with capped exponential
+	// backoff and reposition at ackedFsn+1. No data is dropped and
+	// the producer keeps writing; delivery through SenderErrorHandler
+	// is informational. A frame that keeps being rejected with no ack
+	// progress escalates to PolicyTerminal via the poison-frame
+	// detector (max_frame_rejections).
+	PolicyRetriable
+	// PolicyRetriableOther: same replay semantics as PolicyRetriable,
+	// but the rejection says this node cannot serve writes at all
+	// (read-only replica / demoting primary), so the reconnect
+	// rotates to the next configured endpoint rather than waiting out
+	// a backoff against the same node.
+	PolicyRetriableOther
+	// PolicyTerminal: latch the error as terminal. The next
 	// producer-thread API call returns the SenderError; the sender
 	// does not drain further until the caller closes and rebuilds
-	// it.
-	PolicyHalt
+	// it. The rejected bytes remain in the store-and-forward log on
+	// disk — nothing is silently discarded.
+	PolicyTerminal
 )
 
 // String returns the canonical name of the policy. Stable across
@@ -151,10 +181,12 @@ func (p Policy) String() string {
 	switch p {
 	case PolicyAuto:
 		return "AUTO"
-	case PolicyDropAndContinue:
-		return "DROP_AND_CONTINUE"
-	case PolicyHalt:
-		return "HALT"
+	case PolicyRetriable:
+		return "RETRIABLE"
+	case PolicyRetriableOther:
+		return "RETRIABLE_OTHER"
+	case PolicyTerminal:
+		return "TERMINAL"
 	default:
 		return fmt.Sprintf("Policy(%d)", byte(p))
 	}

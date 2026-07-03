@@ -41,27 +41,27 @@ func TestErrorApiConfStringHappyPath(t *testing.T) {
 		wantParse  qdb.Policy
 	}{
 		{
-			conf:       "ws::addr=h:9000;on_server_error=halt;",
-			wantGlobal: qdb.PolicyHalt,
+			conf:       "ws::addr=h:9000;on_server_error=terminal;",
+			wantGlobal: qdb.PolicyTerminal,
 		},
 		{
-			conf:       "ws::addr=h:9000;on_server_error=drop;",
-			wantGlobal: qdb.PolicyDropAndContinue,
+			conf:       "ws::addr=h:9000;on_server_error=retriable;",
+			wantGlobal: qdb.PolicyRetriable,
 		},
 		{
 			conf:       "ws::addr=h:9000;on_server_error=auto;",
 			wantGlobal: qdb.PolicyAuto,
 		},
 		{
-			conf:       "ws::addr=h:9000;on_schema_error=halt;",
-			wantSchema: qdb.PolicyHalt,
+			conf:       "ws::addr=h:9000;on_schema_error=terminal;",
+			wantSchema: qdb.PolicyTerminal,
 		},
 		{
-			conf:      "ws::addr=h:9000;on_parse_error=drop;",
-			wantParse: qdb.PolicyDropAndContinue,
+			conf:      "ws::addr=h:9000;on_parse_error=retriable;",
+			wantParse: qdb.PolicyRetriable,
 		},
 		{
-			conf:       "ws::addr=h:9000;on_internal_error=halt;on_security_error=drop;on_write_error=halt;",
+			conf:       "ws::addr=h:9000;on_internal_error=terminal;on_security_error=retriable;on_write_error=terminal;",
 			wantGlobal: qdb.PolicyAuto,
 		},
 		{
@@ -91,7 +91,7 @@ func TestErrorApiConfStringInvalidValues(t *testing.T) {
 		{"ws::addr=h:9000;on_parse_error=foo;", "on_parse_error"},
 		{"ws::addr=h:9000;on_internal_error=banana;", "on_internal_error"},
 		{"ws::addr=h:9000;on_security_error=;", "on_security_error"},
-		{"ws::addr=h:9000;on_write_error=halts;", "on_write_error"},
+		{"ws::addr=h:9000;on_write_error=terminals;", "on_write_error"},
 		{"ws::addr=h:9000;error_inbox_capacity=-1;", "error_inbox_capacity"},
 	}
 	for _, tc := range cases {
@@ -111,12 +111,12 @@ func TestErrorApiConfStringInvalidValues(t *testing.T) {
 // HTTP and TCP transports.
 func TestErrorApiConfStringQwpOnly(t *testing.T) {
 	keys := []string{
-		"on_server_error=halt",
-		"on_schema_error=halt",
-		"on_parse_error=halt",
-		"on_internal_error=halt",
-		"on_security_error=halt",
-		"on_write_error=halt",
+		"on_server_error=terminal",
+		"on_schema_error=terminal",
+		"on_parse_error=terminal",
+		"on_internal_error=terminal",
+		"on_security_error=terminal",
+		"on_write_error=terminal",
 		"error_inbox_capacity=32",
 	}
 	prefixes := []string{"http", "tcp"}
@@ -208,7 +208,7 @@ func TestErrorApiWithErrorPolicyAutoClearsPerCatSet(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conf := qdb.NewLineSenderConfig(tc.st)
 			qdb.WithAddress("h:9000")(conf)
-			qdb.WithErrorPolicy(qdb.CategorySchemaMismatch, qdb.PolicyHalt)(conf)
+			qdb.WithErrorPolicy(qdb.CategorySchemaMismatch, qdb.PolicyTerminal)(conf)
 			qdb.WithErrorPolicy(qdb.CategorySchemaMismatch, qdb.PolicyAuto)(conf)
 			if err := qdb.SanitizeConf(conf); err != nil {
 				t.Fatalf("sanitizer should not reject net-Auto per-cat override, got %v", err)

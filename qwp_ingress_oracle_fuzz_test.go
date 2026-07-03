@@ -1042,7 +1042,7 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 //     the Java port doesn't guard.
 //   - Goes beyond the Java port: also captures one delivered
 //     *SenderError and asserts Category == CategoryWriteError and
-//     AppliedPolicy == PolicyDropAndContinue, so a misclassification
+//     AppliedPolicy == PolicyRetriable, so a misclassification
 //     (wrong status byte → wrong category) or a policy-resolution
 //     regression cannot pass silently behind the call-count alone.
 //   - Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
@@ -1252,7 +1252,7 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 				"expected WRITE_ERROR; msg=%q",
 				se.Category, byte(se.ServerStatusByte), se.ServerMessage)
 		}
-		if se.AppliedPolicy != PolicyDropAndContinue {
+		if se.AppliedPolicy != PolicyRetriable {
 			t.Fatalf("error handler: wrong policy: got %s, expected DROP_AND_CONTINUE",
 				se.AppliedPolicy)
 		}

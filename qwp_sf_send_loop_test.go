@@ -896,7 +896,7 @@ func TestQwpSfSendLoopPreSendHaltRejectionDoesNotFabricateFsn(t *testing.T) {
 	require.True(t, errors.As(gotErr, &senderErr),
 		"expected typed *SenderError, got %T: %v", gotErr, gotErr)
 	assert.Equal(t, CategoryParseError, senderErr.Category)
-	assert.Equal(t, PolicyHalt, senderErr.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, senderErr.AppliedPolicy)
 	// Engine is empty: ackedFsn=-1, publishedFsn=-1 →
 	// FromFsn = 0, ToFsn = max(0, -1) = 0.
 	assert.Equal(t, int64(0), senderErr.FromFsn)
@@ -910,19 +910,19 @@ func TestQwpSfSendLoopPreSendHaltRejectionDoesNotFabricateFsn(t *testing.T) {
 		"HALT must not trigger reconnect")
 }
 
-// TestQwpSfSendLoopPreSendDropRejectionDoesNotAdvanceWatermark
-// verifies that a DROP_AND_CONTINUE rejection arriving before any
-// frame has been sent on the current connection is dispatched but
-// does NOT call engineAcknowledge — the old code would have advanced
-// ackedFsn past the next-unsent batch (fsnAtZero == ackedFsn+1 right
-// after a swap), which would let the segment manager trim sealed
-// segments the I/O thread is about to replay.
-func TestQwpSfSendLoopPreSendDropRejectionDoesNotAdvanceWatermark(t *testing.T) {
-	// SchemaMismatch is DROP_AND_CONTINUE by default — this is the
-	// dangerous case where the old code's fabricated
-	// engineAcknowledge(fsnAtZero) silently advanced the watermark.
+// TestQwpSfSendLoopPreSendRetriableRejectionRecyclesWithoutAdvance
+// verifies that a RETRIABLE rejection arriving before any frame has
+// been sent on the current connection is dispatched informationally,
+// recycles the connection, and neither advances the watermark nor
+// counts a poison strike (nothing was sent, so the rejection cannot
+// implicate the head frame) nor latches a terminal error.
+func TestQwpSfSendLoopPreSendRetriableRejectionRecyclesWithoutAdvance(t *testing.T) {
+	// WriteError is RETRIABLE by default. The server sends the
+	// rejection before the client delivers anything, on every
+	// connection — the loop must keep recycling without ever
+	// escalating (pre-send rejections never strike).
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		unsolicitedRejectAtConnect: QwpStatusSchemaMismatch,
+		unsolicitedRejectAtConnect: QwpStatusWriteError,
 	})
 	defer srv.Close()
 
@@ -934,38 +934,35 @@ func TestQwpSfSendLoopPreSendDropRejectionDoesNotAdvanceWatermark(t *testing.T) 
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
-		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		100*time.Microsecond, time.Second, time.Millisecond, 5*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	// Wait for the receiver to process the unsolicited rejection.
+	// Wait for several recycle cycles.
 	require.Eventually(t, func() bool {
-		return loop.sendLoopTotalServerErrors() >= 1
+		return loop.sendLoopTotalServerErrors() >= 3
 	}, 2*time.Second, 1*time.Millisecond)
 
-	// DROP must not latch — loop stays running, no terminal error.
 	assert.NoError(t, loop.sendLoopCheckError(),
-		"DROP policy must not latch a terminal error")
-	// Critical: the engine watermark must be unchanged. The old code
-	// would have called engineAcknowledge(fsnAtZero) = engineAcknowledge(0),
-	// advancing ackedFsn from -1 to 0.
+		"pre-send retriable rejections must not latch a terminal error")
 	assert.Equal(t, int64(-1), engine.engineAckedFsn(),
-		"pre-send DROP rejection must not advance the engine's acked watermark")
-	// And no spurious totalAcks bump either — the old code added one.
+		"a rejection must never advance the engine's acked watermark")
 	assert.Equal(t, int64(0), loop.sendLoopTotalAcks(),
-		"pre-send DROP rejection must not bump totalAcks")
+		"a rejection must not bump totalAcks")
+	assert.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(2),
+		"each pre-send retriable rejection recycles the connection")
 }
 
-// TestQwpSfSendLoopSilentDropRepeatedBacksOffNeverTerminal verifies
-// that when the server accepts the WS upgrade but silently disconnects
-// after a frame (without sending any ACK) on EVERY connection, the
-// send loop keeps retrying (Invariant B: a rolling-upgrade skew clears
-// once peers converge) while paying a growing per-strike backoff, so
-// the dial-send-drop cycle is throttled instead of hammering the
-// server — and it never latches a terminal error. A single such drop
-// reconnects immediately; see
-// TestQwpSfSendLoopSilentDropOnFirstConnReconnects.
-func TestQwpSfSendLoopSilentDropRepeatedBacksOffNeverTerminal(t *testing.T) {
+// TestQwpSfSendLoopSilentDropRepeatedPoisonEscalates verifies the
+// poison-frame detector on the transport path: a server that accepts
+// the WS upgrade, takes the head frame, then non-orderly-drops the
+// connection without ACKing — on EVERY connection — deterministically
+// rejects that frame. Each drop counts a strike at the same head FSN;
+// at qwpSfDefaultMaxFrameRejections consecutive strikes the loop halts
+// with a typed PROTOCOL_VIOLATION naming the frame instead of
+// reconnect-looping forever. A single such drop reconnects instead;
+// see TestQwpSfSendLoopSilentDropOnFirstConnReconnects.
+func TestQwpSfSendLoopSilentDropRepeatedPoisonEscalates(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{silentDropAfterFrames: 1})
 	defer srv.Close()
 
@@ -977,28 +974,30 @@ func TestQwpSfSendLoopSilentDropRepeatedBacksOffNeverTerminal(t *testing.T) {
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
-		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		100*time.Microsecond, 5*time.Second, time.Millisecond, 10*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
 	_, err = engine.engineAppendBlocking(context.Background(), []byte("frame"))
 	require.NoError(t, err)
 
-	// Let several strike cycles elapse: the loop must keep retrying and
-	// never latch a terminal error.
-	deadline := time.Now().Add(600 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		require.NoError(t, loop.sendLoopCheckError(),
-			"repeated ACK-less drops must not latch a terminal error")
-		time.Sleep(20 * time.Millisecond)
-	}
-	conns := srv.connCount.Load()
-	assert.GreaterOrEqual(t, conns, int64(3),
-		"loop should keep reconnecting through the silent drops")
-	// The growing per-strike backoff throttles the dial-send-drop cycle;
-	// without it this window would burn hundreds of connections.
-	assert.LessOrEqual(t, conns, int64(30),
-		"strike backoff should throttle the reconnect cycle")
+	require.Eventually(t, func() bool {
+		return loop.sendLoopCheckError() != nil
+	}, 5*time.Second, time.Millisecond, "poison detector never escalated")
+
+	var se *SenderError
+	require.True(t, errors.As(loop.sendLoopCheckError(), &se))
+	assert.Equal(t, CategoryProtocolViolation, se.Category)
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
+	assert.Contains(t, se.ServerMessage, "poisoned frame")
+	assert.Contains(t, se.ServerMessage, "fsn=0")
+	// Exactly the threshold: one connection per strike, no extra dials
+	// after the escalation.
+	assert.Equal(t, int64(qwpSfDefaultMaxFrameRejections), srv.connCount.Load(),
+		"one connection per strike up to the threshold")
+	// The frame was never dropped: the watermark is untouched and the
+	// bytes remain in the engine.
+	assert.Equal(t, int64(-1), engine.engineAckedFsn())
 }
 
 // TestQwpSfSendLoopSilentDropOnFirstConnReconnects verifies that a
@@ -1056,20 +1055,17 @@ func TestQwpSfSendLoopSilentDropOnFirstConnReconnects(t *testing.T) {
 }
 
 // TestQwpSfSendLoopSilentDropAfterPriorAckReconnects pins the
-// regression for the silent-drop guard's false-positive failure
-// mode: once any ACK has been observed across this sender's
-// lifetime, a subsequent silent disconnect is a transient outage
-// (LB drain emitting WS 1001 GoingAway, TCP RST surfacing as 1006,
-// proxy reset, 1011/1012/1013 service restarts — none of which are
-// flagged terminal by qwpSfIsTerminalCloseCode), not an
-// incompatible-build mismatch. The loop must keep reconnecting
-// rather than latch a terminal SenderError.
-func TestQwpSfSendLoopSilentDropAfterPriorAckReconnects(t *testing.T) {
+// regression for the poison detector's below-threshold behavior after a
+// prior ACK: strikes 1..N-1 against a frame-eating endpoint reconnect
+// and replay (each drop is a transport event, not a first-sight
+// terminal), and only the Nth consecutive strike at the same head FSN
+// escalates to the typed poisoned-frame terminal — prior lifetime ACKs
+// do not shield a deterministically frame-eating endpoint.
+func TestQwpSfSendLoopSilentDropAfterPriorAckPoisonEscalatesAtThreshold(t *testing.T) {
 	goodSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer goodSrv.Close()
 	// silentSrv stands in for the LB / proxy that accepts the WS
-	// upgrade but drops every frame without ACKing — what the old
-	// per-connection heuristic mistook for "incompatible build".
+	// upgrade but eats every frame without ACKing.
 	silentSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{silentDropAfterFrames: 1})
 	defer silentSrv.Close()
 
@@ -1081,14 +1077,14 @@ func TestQwpSfSendLoopSilentDropAfterPriorAckReconnects(t *testing.T) {
 	require.NoError(t, err)
 
 	// Reconnect factory points at silentSrv: after goodSrv goes
-	// away, every reconnect lands on the silent-drop server.
+	// away, every reconnect lands on the frame-eating server.
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialAt(silentSrv.URL),
 		100*time.Microsecond, 30*time.Second, 1*time.Millisecond, 5*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	// Frame 0: goodSrv ACKs. After this, totalAcks >= 1 and the
-	// silent-drop guard's "never any ACK" precondition is gone.
+	// Frame 0: goodSrv ACKs, so the head FSN advances to 1 and the
+	// poison state is clear when the outage begins.
 	_, err = engine.engineAppendBlocking(context.Background(), []byte("warm-up"))
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
@@ -1098,28 +1094,27 @@ func TestQwpSfSendLoopSilentDropAfterPriorAckReconnects(t *testing.T) {
 	// Tear down goodSrv to force the loop into reconnect against silentSrv.
 	close(goodSrv.kill)
 
-	// Enqueue a frame that silentSrv will read and silently drop,
-	// driving the silent-drop guard's reconnect cycle. Without
-	// further work the loop would just park on a quiet silentSrv
-	// connection forever and we'd observe no reconnects either way.
+	// Enqueue the frame silentSrv will eat on every delivery.
 	_, err = engine.engineAppendBlocking(context.Background(), []byte("post-kill"))
 	require.NoError(t, err)
 
-	// Wait until the loop has accumulated several silent-drop
-	// reconnect cycles against silentSrv. Under the old heuristic
-	// the very first cycle would have latched a terminal
-	// "incompatible build" SenderError, capping connCount at 1.
+	// Below the threshold the loop reconnects and replays; at the
+	// threshold it latches the typed poisoned-frame terminal. The
+	// goodSrv kill counts one strike (non-orderly close after the
+	// warm-up send at head FSN 1), so silentSrv sees threshold-1
+	// deliveries before the escalation.
 	require.Eventually(t, func() bool {
-		return silentSrv.connCount.Load() >= 3
-	}, 2*time.Second, 1*time.Millisecond,
-		"loop should have reconnected to silentSrv multiple times")
+		return loop.sendLoopCheckError() != nil
+	}, 5*time.Second, time.Millisecond, "poison detector never escalated")
 
-	// The whole point: no terminal classification.
-	if gotErr := loop.sendLoopCheckError(); gotErr != nil {
-		t.Fatalf("loop unexpectedly went terminal after prior-ACK silent drop: %v", gotErr)
-	}
-	assert.Nil(t, loop.sendLoopLastTerminalServerError(),
-		"no terminal SenderError should be latched once totalAcks > 0")
+	require.GreaterOrEqual(t, silentSrv.connCount.Load(), int64(2),
+		"strikes below the threshold must reconnect and replay, not fail on first sight")
+	var se *SenderError
+	require.True(t, errors.As(loop.sendLoopCheckError(), &se))
+	assert.Equal(t, CategoryProtocolViolation, se.Category)
+	assert.Contains(t, se.ServerMessage, "poisoned frame")
+	assert.Equal(t, int64(0), engine.engineAckedFsn(),
+		"the eaten frame must remain unacked — nothing is dropped")
 }
 
 func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
@@ -1167,7 +1162,7 @@ func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
 	require.True(t, errors.As(gotErr, &senderErr),
 		"expected *SenderError, got %T: %v", gotErr, gotErr)
 	assert.Equal(t, CategorySecurityError, senderErr.Category)
-	assert.Equal(t, PolicyHalt, senderErr.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, senderErr.AppliedPolicy)
 	assert.Contains(t, senderErr.ServerMessage, "401")
 }
 
@@ -1387,7 +1382,7 @@ func TestQwpSfRecordFatalServerErrorPopulatesBothFields(t *testing.T) {
 	l := &qwpSfSendLoop{}
 	se := &SenderError{
 		Category:         CategoryParseError,
-		AppliedPolicy:    PolicyHalt,
+		AppliedPolicy:    PolicyTerminal,
 		ServerStatusByte: int(QwpStatusParseError),
 		ServerMessage:    "bad column",
 		MessageSequence:  9,
@@ -1411,8 +1406,8 @@ func TestQwpSfRecordFatalServerErrorPopulatesBothFields(t *testing.T) {
 // first failure wins, matching recordFatal's CAS semantics.
 func TestQwpSfRecordFatalServerErrorIdempotent(t *testing.T) {
 	l := &qwpSfSendLoop{}
-	first := &SenderError{Category: CategoryWriteError, AppliedPolicy: PolicyHalt}
-	second := &SenderError{Category: CategorySchemaMismatch, AppliedPolicy: PolicyHalt}
+	first := &SenderError{Category: CategoryWriteError, AppliedPolicy: PolicyTerminal}
+	second := &SenderError{Category: CategorySchemaMismatch, AppliedPolicy: PolicyTerminal}
 	l.recordFatalServerError(first)
 	l.recordFatalServerError(second)
 	require.Equal(t, first, l.sendLoopLastTerminalServerError())
@@ -1432,21 +1427,22 @@ func TestQwpSfRecordFatalServerErrorNilSafe(t *testing.T) {
 // frame instead of latching as terminal. The dispatcher receives the
 // notification; sendLoopCheckError returns nil; subsequent frames
 // continue draining.
-func TestQwpSfSendLoopDropAndContinue(t *testing.T) {
-	// Run over both engine backings so disk-backed DROP-and-advance —
+func TestQwpSfSendLoopRetriableNackRecyclesAndReplays(t *testing.T) {
+	// Run over both engine backings so the disk-backed recycle+replay —
 	// otherwise exercised only by the jar-gated fuzz workflow — is
 	// covered here too. "" selects a memory-backed engine; a TempDir
 	// selects disk-backed segments under that slot directory.
-	t.Run("memory", func(t *testing.T) { testQwpSfSendLoopDropAndContinue(t, "") })
-	t.Run("disk", func(t *testing.T) { testQwpSfSendLoopDropAndContinue(t, t.TempDir()) })
+	t.Run("memory", func(t *testing.T) { testQwpSfSendLoopRetriableNackRecyclesAndReplays(t, "") })
+	t.Run("disk", func(t *testing.T) { testQwpSfSendLoopRetriableNackRecyclesAndReplays(t, t.TempDir()) })
 }
 
-func testQwpSfSendLoopDropAndContinue(t *testing.T, sfDir string) {
-	// rejectStatus=SchemaMismatch (default Drop) for the very first
-	// frame only; subsequent frames get OK ACKs. We need the test
-	// server to support that mode — see opts.rejectFirstNFrames below.
+func testQwpSfSendLoopRetriableNackRecyclesAndReplays(t *testing.T, sfDir string) {
+	// rejectStatus=WriteError (RETRIABLE) for the very first frame of
+	// connection 1 only; connection 2 ACKs everything. The loop must
+	// recycle on the NACK and replay the rejected frame — no drop, no
+	// watermark advance on the rejection, no terminal.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:       QwpStatusSchemaMismatch,
+		rejectStatus:       QwpStatusWriteError,
 		rejectFirstNFrames: 1,
 	})
 	defer srv.Close()
@@ -1459,19 +1455,19 @@ func testQwpSfSendLoopDropAndContinue(t *testing.T, sfDir string) {
 	require.NoError(t, err)
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
-		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		100*time.Microsecond, time.Second, time.Millisecond, 10*time.Millisecond)
 
-	// Capture dispatched errors to assert they fired.
+	// Capture dispatched errors to assert the informational delivery.
 	var dispatched atomic.Int64
 	loop.sendLoopSetErrorHandler(func(e *SenderError) {
-		if e.Category == CategorySchemaMismatch && e.AppliedPolicy == PolicyDropAndContinue {
+		if e.Category == CategoryWriteError && e.AppliedPolicy == PolicyRetriable {
 			dispatched.Add(1)
 		}
 	}, 8)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	// First frame is rejected → dropped. Frames 1 and 2 (0-indexed) are OK.
+	// Frame 0 is NACKed on conn 1; all three drain via the conn-2 replay.
 	for i := 0; i < 3; i++ {
 		_, err := engine.engineAppendBlocking(context.Background(),
 			[]byte(fmt.Sprintf("f%d", i)))
@@ -1479,15 +1475,17 @@ func testQwpSfSendLoopDropAndContinue(t *testing.T, sfDir string) {
 	}
 	require.Eventually(t, func() bool {
 		return engine.engineAckedFsn() >= 2
-	}, 5*time.Second, 1*time.Millisecond, "ackedFsn did not advance past Drop")
+	}, 5*time.Second, 1*time.Millisecond, "replay did not drain all frames")
 
-	// No terminal error; reconnect did not trigger.
+	// No terminal error; the NACK recycled the connection exactly once.
 	require.NoError(t, loop.sendLoopCheckError())
-	require.Equal(t, int64(0), loop.sendLoopTotalReconnects())
-	// Dispatcher saw exactly one Drop-category SenderError.
+	require.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1))
+	// Dispatcher saw the informational retriable SenderError.
 	require.GreaterOrEqual(t, dispatched.Load(), int64(1))
-	// Counter bumped on the Drop path.
 	require.GreaterOrEqual(t, loop.sendLoopTotalServerErrors(), int64(1))
+	// The rejected frame was replayed, not dropped: the server received
+	// frame 0 at least twice across the two connections.
+	require.GreaterOrEqual(t, loop.sendLoopTotalFramesReplayed(), int64(1))
 }
 
 // TestQwpSfSendLoopReceiverClampsForgedAckToFullySent is the
@@ -1578,13 +1576,137 @@ func TestQwpSfSendLoopReceiverClampsForgedAckToFullySent(t *testing.T) {
 				"frame (FSN 2); FSN 3 is still mid-sendMessage")
 	})
 
-	t.Run("error ACK (drop-and-continue)", func(t *testing.T) {
-		// SchemaMismatch resolves to DropAndContinue by default, so the
-		// rejection path advances ackedFsn via engineAcknowledge(fsn) —
-		// exercising the second clamp site.
-		got := run(t, buildAckError(QwpStatusSchemaMismatch, forgedSeq, "forged"))
-		assert.Equal(t, int64(wantAckedFsn), got,
-			"rejection-path clamp must hold the watermark at the last "+
-				"fully-sent frame (FSN 2); FSN 3 is still mid-sendMessage")
+	t.Run("error ACK never advances the watermark", func(t *testing.T) {
+		// A rejection — forged or genuine — never advances ackedFsn
+		// under NACK policy v2: a retriable NACK recycles the
+		// connection and replays; the clamp only bounds the FSN named
+		// in the error report.
+		srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+			forgedAckAtConnect: buildAckError(QwpStatusWriteError, forgedSeq, "forged"),
+		})
+		defer srv.Close()
+
+		engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		defer func() { _ = engine.engineClose() }()
+		for i := 0; i < published; i++ {
+			_, err := engine.engineAppendBlocking(context.Background(),
+				[]byte(fmt.Sprintf("f%d", i)))
+			require.NoError(t, err)
+		}
+
+		transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+		require.NoError(t, err)
+
+		loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+			100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		loop.sendLoopSetErrorHandler(func(*SenderError) {}, 8)
+
+		loop.fsnAtZero.Store(fsnAtZero)
+		loop.nextWireSeq.Store(started)
+		loop.highestFullySent.Store(fullySent)
+		loop.running.Store(true)
+
+		done := make(chan struct{})
+		var loopErr error
+		go func() {
+			defer close(done)
+			loopErr = loop.receiverLoop(loop.ctx)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("receiver did not exit on the retriable rejection")
+		}
+		var retriable *qwpSfRetriableRejection
+		require.True(t, errors.As(loopErr, &retriable),
+			"receiver must surface the retriable-rejection sentinel, got %v", loopErr)
+		assert.Equal(t, int64(-1), engine.engineAckedFsn(),
+			"a rejection must never advance the watermark")
+
+		_ = loop.sendLoopClose()
 	})
+}
+
+// TestQwpSfMaxFrameRejectionsConfigHonoredEndToEnd pins the configurable
+// poison threshold: with max_frame_rejections=2 a retriable NACK of the
+// same head frame escalates to the typed terminal after exactly two
+// deliveries — one fewer recycle than the default threshold would allow.
+func TestQwpSfMaxFrameRejectionsConfigHonoredEndToEnd(t *testing.T) {
+	var connCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		connCount.Add(1)
+		var seq int64
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			_ = conn.Write(context.Background(), websocket.MessageBinary,
+				buildAckError(QwpStatusWriteError, seq, "rejected"))
+			seq++
+		}
+	}))
+	defer srv.Close()
+
+	ls, err := LineSenderFromConf(context.Background(),
+		"ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";"+
+			"max_frame_rejections=2;"+
+			"reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=5;"+
+			"initial_connect_retry=off;")
+	require.NoError(t, err)
+	qs := ls.(QwpSender)
+	defer func() { _ = ls.Close(context.Background()) }()
+
+	require.NoError(t, ls.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+	_ = ls.Flush(context.Background())
+
+	require.Eventually(t, func() bool {
+		return qs.LastTerminalError() != nil
+	}, 5*time.Second, time.Millisecond)
+
+	se := qs.LastTerminalError()
+	assert.Equal(t, CategoryProtocolViolation, se.Category)
+	assert.Contains(t, se.ServerMessage, "rejected 2 consecutive times")
+	assert.Equal(t, int64(2), connCount.Load(),
+		"exactly two deliveries at max_frame_rejections=2: the initial one plus one replay")
+}
+
+func TestMaxFrameRejectionsConfAndOption(t *testing.T) {
+	conf, err := confFromStr("ws::addr=h:9000;max_frame_rejections=7;")
+	require.NoError(t, err)
+	assert.Equal(t, 7, conf.maxFrameRejections)
+
+	for _, bad := range []string{"0", "-1", "abc"} {
+		_, err := confFromStr("ws::addr=h:9000;max_frame_rejections=" + bad + ";")
+		assert.Error(t, err, "max_frame_rejections=%s must be rejected", bad)
+	}
+	// QWP-only.
+	_, err = confFromStr("http::addr=h:9000;max_frame_rejections=2;")
+	assert.Error(t, err)
+
+	// Option path: positive applies, non-positive leaves the default.
+	c := newLineSenderConfig(qwpSenderType)
+	WithMaxFrameRejections(3)(c)
+	assert.Equal(t, 3, c.maxFrameRejections)
+	WithMaxFrameRejections(0)(c)
+	assert.Equal(t, 3, c.maxFrameRejections)
+
+	// The loop setter honours the value and ignores non-positive.
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+	loop := qwpSfNewSendLoop(engine, nil, func(context.Context, int) (*qwpTransport, error) {
+		return nil, errors.New("unused")
+	}, 0, 0, 0, 0)
+	assert.Equal(t, qwpSfDefaultMaxFrameRejections, loop.maxFrameRejections)
+	loop.sendLoopSetMaxFrameRejections(9)
+	assert.Equal(t, 9, loop.maxFrameRejections)
+	loop.sendLoopSetMaxFrameRejections(0)
+	assert.Equal(t, 9, loop.maxFrameRejections)
 }

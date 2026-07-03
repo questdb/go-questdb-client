@@ -176,6 +176,7 @@ type qwpSfOrphanDrainer struct {
 	reconnectMaxBackoff     time.Duration
 	durableAckMode          bool          // trim only on STATUS_DURABLE_ACK
 	durableKeepalive        time.Duration // durable keepalive-ping cadence
+	maxFrameRejections      int           // poison-frame threshold; 0 -> default
 	listener                QwpBackgroundDrainerListener
 	mismatchAttempts        atomic.Int64
 	roleRejectRounds        atomic.Int64
@@ -453,6 +454,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// recovered data is not deleted before it is durably uploaded. A mismatch is
 	// transient (not terminal): the drainer retries, since its data is pinned.
 	loop.sendLoopSetDurableAck(d.durableAckMode, d.durableKeepalive, false)
+	loop.sendLoopSetMaxFrameRejections(d.maxFrameRejections)
 	loop.onEndpointFailed = d.onDurableMismatch
 	loop.sendLoopSetConnectionListener(silentSenderConnectionListener, 0)
 	// Share the foreground tracker; the loop carries its OWN
