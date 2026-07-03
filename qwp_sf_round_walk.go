@@ -504,6 +504,16 @@ func qwpSfRunRoundWalk(
 	totalAttempts := 0
 	enteringPreviousIdx := previousIdx
 
+	// Floor the backoff knobs: an unbounded walk with a non-positive
+	// InitialBackoff would redial the whole address list with no pause and
+	// busy-spin. Current callers always supply them; this guards a future one.
+	if params.InitialBackoff <= 0 {
+		params.InitialBackoff = qwpSfDefaultReconnectInitialBackoff
+	}
+	if params.MaxBackoff <= 0 {
+		params.MaxBackoff = qwpSfDefaultReconnectMaxBackoff
+	}
+
 	if params.Tracker != nil && params.Tracker.Len() > 0 {
 		if params.Background {
 			// A background walk starts with a fresh walk-local cursor —

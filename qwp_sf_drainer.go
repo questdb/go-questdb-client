@@ -492,8 +492,9 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// This bounds only a LIVE-but-not-acking connection: transport
 	// outages never charge it (a reconnect window resets/pauses the
 	// clocks below), so a long server outage cannot quarantine the
-	// slot (Invariant B). reconnectMaxDuration is reused purely as the
-	// wedge-settle budget knob.
+	// slot (Invariant B). reconnectMaxDuration is reused as the
+	// wedge-settle budget knob: a smaller reconnect_max_duration_millis
+	// deliberately shortens it too.
 	noProgressBudget := d.reconnectMaxDuration
 	if noProgressBudget <= 0 {
 		noProgressBudget = qwpSfDefaultReconnectMaxDuration

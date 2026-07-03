@@ -106,8 +106,10 @@ func TestErrorApiPerCategory(t *testing.T) {
 }
 
 // TestErrorApiOverridePolicyViaResolver registers a programmatic
-// resolver that flips PARSE_ERROR (default Halt) to Drop, and asserts
-// the loop drops + continues instead of latching.
+// resolver that flips PARSE_ERROR (default Terminal) to Retriable, and
+// asserts the loop recycles + replays instead of latching. Without the
+// override PARSE_ERROR would latch, stranding ackedFsn at -1, so the
+// progress + no-terminal pair proves the override is applied.
 func TestErrorApiOverridePolicyViaResolver(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		rejectStatus:       QwpStatusParseError,
@@ -127,7 +129,7 @@ func TestErrorApiOverridePolicyViaResolver(t *testing.T) {
 		},
 	})
 
-	// Two frames: first rejected and dropped, second OK.
+	// Two frames: the first is NACKed then replayed, the second OK.
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.NoError(t, s.Flush(context.Background()))
 	require.NoError(t, s.Table("t").Int64Column("v", 2).AtNow(context.Background()))
@@ -136,17 +138,19 @@ func TestErrorApiOverridePolicyViaResolver(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return engine.engineAckedFsn() >= 1
 	}, 5*time.Second, 1*time.Millisecond,
-		"ackedFsn should advance past the dropped frame")
+		"ackedFsn should advance once the replayed frame is accepted")
 	assert.Nil(t, s.LastTerminalError(),
-		"resolver flipped Halt to Drop; no terminal error expected")
+		"resolver flipped Terminal to Retriable; no terminal error expected")
 }
 
-// TestErrorApiOverridePolicyViaPerCategory uses the perCat slot to
-// flip SCHEMA_MISMATCH (default Drop) to Halt — mirrors the
-// connect-string on_schema_error=terminal path.
+// TestErrorApiOverridePolicyViaPerCategory uses the perCat slot to flip
+// WRITE_ERROR (default Retriable) to Terminal — mirrors the connect-string
+// on_write_error=terminal path. The default would recycle forever, so a
+// terminal latch here proves the per-category override is actually applied
+// (an override equal to the default would pass even if ignored).
 func TestErrorApiOverridePolicyViaPerCategory(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus: QwpStatusSchemaMismatch,
+		rejectStatus: QwpStatusWriteError,
 	})
 	defer srv.Close()
 
@@ -154,7 +158,7 @@ func TestErrorApiOverridePolicyViaPerCategory(t *testing.T) {
 	defer cleanup()
 
 	r := &qwpSfPolicyResolver{}
-	r.perCat[CategorySchemaMismatch] = PolicyTerminal
+	r.perCat[CategoryWriteError] = PolicyTerminal
 	loop.sendLoopSetPolicyResolver(r)
 
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
@@ -163,10 +167,10 @@ func TestErrorApiOverridePolicyViaPerCategory(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return s.LastTerminalError() != nil
 	}, 2*time.Second, 1*time.Millisecond,
-		"Halt override should latch terminal")
+		"per-category terminal override should latch")
 	se := s.LastTerminalError()
 	require.NotNil(t, se)
-	assert.Equal(t, CategorySchemaMismatch, se.Category)
+	assert.Equal(t, CategoryWriteError, se.Category)
 	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 }
 

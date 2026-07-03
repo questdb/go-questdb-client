@@ -133,6 +133,13 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 		// briefly put live clients at maxSize+K. Intentional: query workers hold no
 		// flock/mmap (unlike SF sender slots), so a transient overshoot is harmless.
 		if len(p.all)+p.inFlightCreations < p.maxSize {
+			// A waiter woken by the acquire timer can reach here with the
+			// deadline already past; report pool exhaustion rather than
+			// starting a dial doomed by an expired context.
+			if time.Until(deadline) <= 0 {
+				p.mu.Unlock()
+				return nil, fmt.Errorf("%w after %s", errQueryPoolExhausted, p.acquireTimeout)
+			}
 			p.inFlightCreations++
 			p.mu.Unlock()
 			// Bound the dial by the acquire deadline (sender-pool / HikariCP parity)

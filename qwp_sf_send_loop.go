@@ -152,8 +152,11 @@ type qwpSfSendLoop struct {
 	// drainer (Invariant B). The running loop reuses it as the
 	// poison-frame episode budget: a rejection streak must last at
 	// least this long before strike-count overflow may escalate to the
-	// poisoned-frame terminal (see recordRejectionStrike). Floored to
-	// qwpSfDefaultReconnectMaxDuration by the constructor.
+	// poisoned-frame terminal (see recordRejectionStrike). Defaulted to
+	// qwpSfDefaultReconnectMaxDuration when non-positive, not floored: a
+	// smaller reconnect_max_duration_millis deliberately shortens this
+	// episode floor too (the knob does double duty with the sync-connect
+	// bound, documented on WithReconnectPolicy).
 	reconnectMaxDuration    time.Duration
 	reconnectInitialBackoff time.Duration
 	reconnectMaxBackoff     time.Duration
@@ -339,7 +342,10 @@ type qwpSfSendLoop struct {
 	// replay re-delivers already-OK'd predecessors, whose fresh OKs
 	// must not shield the rejected frame). rejectionRecycles counts
 	// consecutive rejection-driven connection recycles and paces them
-	// with capped equal-jitter backoff; any ack resets it. Written by
+	// with capped equal-jitter backoff; only an ack that advances past
+	// the retried frame resets it — a durable-mode replay re-OKs
+	// predecessors ahead of the rejected frame and must not reset the
+	// pacing (see noteAckProgress). Written by
 	// the receiver goroutine and by run() — never concurrently: run()
 	// touches them only after runOneConnection has joined both inner
 	// goroutines, and the next connection's goroutines start after
@@ -1556,6 +1562,20 @@ func (l *qwpSfSendLoop) clearPoisonUpTo(ackFsn int64) {
 	}
 }
 
+// noteAckProgress applies an OK ack's forward progress to both the poison
+// detector and the rejection-recycle pacing. It resets the recycle backoff
+// only when the ack advances to or past the frame the loop has been
+// retrying: a durable-mode reconnect replays OK'd-but-not-durable
+// predecessors (ackFsn < poisonFsn) ahead of the rejected frame, and letting
+// those replay-OKs reset the pacing would pin the backoff at its initial
+// value and hot-loop the recycle. Receiver-goroutine only.
+func (l *qwpSfSendLoop) noteAckProgress(ackFsn int64) {
+	if l.poisonFsn < 0 || ackFsn >= l.poisonFsn {
+		l.rejectionRecycles = 0
+	}
+	l.clearPoisonUpTo(ackFsn)
+}
+
 // buildPoisonedFrameSE builds the typed terminal for a poisoned frame: the
 // server (or an intermediary) has deterministically rejected the same frame
 // maxFrameRejections consecutive times across a full episode budget with no
@@ -1701,12 +1721,12 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			return &qwpSfRetriableRejection{msg: fmt.Sprintf(
 				"server NACK (%s, %s): %s", cat, pol, msg)}
 		}
-		// Any ACK is forward progress on this connection: reset the
-		// rejection-recycle pacing. Poison suspicion clears only once
-		// the acked FSN covers the suspected frame (clearPoisonUpTo) —
-		// in durable mode replay re-delivers already-OK'd predecessors,
-		// whose fresh OKs must not shield a later poisoned frame.
-		l.rejectionRecycles = 0
+		// Clear poison suspicion and reset the rejection-recycle pacing
+		// only once the acked FSN covers the frame the loop is retrying
+		// (noteAckProgress) — in durable mode replay re-delivers already-
+		// OK'd predecessors ahead of the rejected frame, whose fresh OKs
+		// must neither shield a later poisoned frame nor reset the recycle
+		// backoff into a ~initial-backoff hot loop.
 		l.totalAcks.Add(1)
 		if l.durableAckMode {
 			// Durable mode: stash the OK and wait for STATUS_DURABLE_ACK to
@@ -1722,7 +1742,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				l.dispatcher.Load().offer(se)
 				return se
 			}
-			l.clearPoisonUpTo(l.fsnAtZero.Load() + seq)
+			l.noteAckProgress(l.fsnAtZero.Load() + seq)
 		} else {
 			// Record the server's cumulative ACK sequence, then reconcile it
 			// against highestFullySent. applyAckWatermark caps the advance at
@@ -1735,7 +1755,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// stranded when no later ACK follows it.
 			l.serverAckedSeq.Store(seq)
 			l.applyAckWatermark()
-			l.clearPoisonUpTo(l.engine.engineAckedFsn())
+			l.noteAckProgress(l.engine.engineAckedFsn())
 		}
 	}
 }

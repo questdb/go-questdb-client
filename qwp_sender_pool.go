@@ -242,6 +242,13 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			return &qwpPooledSender{pool: p, slot: slot, gen: gen}, nil
 		}
 		if p.capUsedLocked() < p.maxSize {
+			// A waiter woken by the acquire timer can reach here with the
+			// deadline already past; report pool exhaustion rather than
+			// starting a dial doomed by an expired context.
+			if time.Until(deadline) <= 0 {
+				p.mu.Unlock()
+				return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
+			}
 			p.inFlightCreations++
 			slotIndex := -1
 			if p.storeAndForward {

@@ -118,16 +118,18 @@ func TestErrorApiBuilderOption_WithErrorHandlerInvoked(t *testing.T) {
 }
 
 // TestErrorApiBuilderOption_WithErrorPolicyOverride uses
-// WithErrorPolicy(SchemaMismatch, Halt) to flip the spec default
-// (Drop) to Halt, and asserts the next Flush surfaces *SenderError.
+// WithErrorPolicy(WriteError, Terminal) to flip the spec default
+// (Retriable) to Terminal, and asserts the next Flush surfaces
+// *SenderError. WriteError is chosen because its default is not terminal,
+// so the latch proves the override took effect rather than the default.
 func TestErrorApiBuilderOption_WithErrorPolicyOverride(t *testing.T) {
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusSchemaMismatch})
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusWriteError})
 	defer srv.Close()
 
 	ls, err := NewLineSender(context.Background(),
 		WithQwp(),
 		WithAddress(addrOf(srv)),
-		WithErrorPolicy(CategorySchemaMismatch, PolicyTerminal),
+		WithErrorPolicy(CategoryWriteError, PolicyTerminal),
 	)
 	require.NoError(t, err)
 	defer func() { _ = ls.Close(context.Background()) }()
@@ -140,21 +142,21 @@ func TestErrorApiBuilderOption_WithErrorPolicyOverride(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return asQwp(t, ls).LastTerminalError() != nil
 	}, 3*time.Second, 1*time.Millisecond,
-		"override SchemaMismatch=Halt should latch, but LastTerminalError stayed nil")
+		"override WriteError=Terminal should latch, but LastTerminalError stayed nil")
 
 	// AtNow surfaces the latched terminal error now that Table()
-	// polls the I/O loop's HALT latch on entry.
+	// polls the I/O loop's terminal latch on entry.
 	err = ls.Table("t").Int64Column("v", 2).AtNow(context.Background())
 	require.Error(t, err)
 	var se *SenderError
 	require.True(t, errors.As(err, &se))
-	assert.Equal(t, CategorySchemaMismatch, se.Category)
+	assert.Equal(t, CategoryWriteError, se.Category)
 	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 }
 
 // TestErrorApiBuilderOption_WithErrorPolicyResolver registers a
-// programmatic resolver that flips PARSE_ERROR (default Halt) to
-// Drop, and asserts the loop drops + continues past the rejection
+// programmatic resolver that flips PARSE_ERROR (default Terminal) to
+// Retriable, and asserts the loop recycles + replays past the rejection
 // instead of latching.
 func TestErrorApiBuilderOption_WithErrorPolicyResolver(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
@@ -180,7 +182,7 @@ func TestErrorApiBuilderOption_WithErrorPolicyResolver(t *testing.T) {
 	qs := asQwp(t, ls)
 	defer func() { _ = ls.Close(context.Background()) }()
 
-	// Two flushes: first rejected and dropped, second OK.
+	// Two flushes: the first is NACKed then replayed, the second OK.
 	require.NoError(t, ls.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.NoError(t, ls.Flush(context.Background()))
 	require.NoError(t, ls.Table("t").Int64Column("v", 2).AtNow(context.Background()))
@@ -190,12 +192,12 @@ func TestErrorApiBuilderOption_WithErrorPolicyResolver(t *testing.T) {
 	case got := <-gotCh:
 		assert.Equal(t, CategoryParseError, got.Category)
 		assert.Equal(t, PolicyRetriable, got.AppliedPolicy,
-			"resolver should have flipped Halt → Drop")
+			"resolver should have flipped Terminal → Retriable")
 	case <-time.After(3 * time.Second):
 		t.Fatal("handler not invoked: resolver may not have wired through")
 	}
 	assert.Nil(t, qs.LastTerminalError(),
-		"resolver flipped Halt→Drop; no terminal error expected")
+		"resolver flipped Terminal → Retriable; no terminal error expected")
 }
 
 // TestErrorApiBuilderOption_WithErrorInboxCapacity sets a small
@@ -234,11 +236,10 @@ func TestErrorApiBuilderOption_WithErrorInboxCapacity(t *testing.T) {
 }
 
 // TestErrorApiBuilderOption_ProtocolViolationOverrideIgnored asserts
-// that WithErrorPolicy(ProtocolViolation, DropAndContinue) is
-// silently ignored — ProtocolViolation is forced HALT regardless.
-// The forced behavior protects users who would otherwise lose
-// connection-gone errors; matching the spec contract documented on
-// the Policy enum.
+// that WithErrorPolicy(ProtocolViolation, Retriable) is silently
+// ignored — ProtocolViolation is forced TERMINAL regardless. The forced
+// behavior protects users who would otherwise lose connection-gone
+// errors; matching the spec contract documented on the Policy enum.
 func TestErrorApiBuilderOption_ProtocolViolationOverrideIgnored(t *testing.T) {
 	srv := closeFrameTestServer(t, websocket.StatusProtocolError, "bad framing")
 	defer srv.Close()
@@ -247,7 +248,7 @@ func TestErrorApiBuilderOption_ProtocolViolationOverrideIgnored(t *testing.T) {
 	ls, err := NewLineSender(context.Background(),
 		WithQwp(),
 		WithAddress(addr),
-		// Try to flip ProtocolViolation to Drop. Should be ignored.
+		// Try to flip ProtocolViolation to Retriable. Should be ignored.
 		WithErrorPolicy(CategoryProtocolViolation, PolicyRetriable),
 		// Tiny poison-episode floor so the repeated-close escalation
 		// lands at the strike threshold, keeping the test fast.
@@ -294,11 +295,12 @@ func TestErrorApiBuilderOption_ForcedHaltCategoriesNotRecorded(t *testing.T) {
 // Public-API end-to-end: connect-string keys
 // =============================================================================
 
-// TestErrorApiConfString_OnParseErrorDrop builds a sender from a
+// TestErrorApiConfString_OnParseErrorRetriable builds a sender from a
 // connect string with on_parse_error=retriable and asserts the loop
-// continues past PARSE_ERROR rejections instead of latching. End-to-
-// end test of the conf-string → resolver wiring path.
-func TestErrorApiConfString_OnParseErrorDrop(t *testing.T) {
+// continues past PARSE_ERROR rejections instead of latching (the default
+// for PARSE_ERROR is terminal, so this pins the conf-string → resolver
+// wiring, not just the default).
+func TestErrorApiConfString_OnParseErrorRetriable(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		rejectStatus:       QwpStatusParseError,
 		rejectFirstNFrames: 1,
@@ -329,16 +331,16 @@ func TestErrorApiConfString_OnParseErrorDrop(t *testing.T) {
 		"on_parse_error=retriable must not latch terminal")
 }
 
-// TestErrorApiConfString_OnSchemaErrorHalt builds a sender from a
-// connect string with on_schema_error=terminal and asserts that a
-// SchemaMismatch (Drop by default) instead halts. End-to-end test of
-// the conf-string → resolver wiring path going the other direction
-// (default-Drop flipped to Halt).
-func TestErrorApiConfString_OnSchemaErrorHalt(t *testing.T) {
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusSchemaMismatch})
+// TestErrorApiConfString_OnWriteErrorTerminal builds a sender from a
+// connect string with on_write_error=terminal and asserts that a
+// WRITE_ERROR — retriable by default, so it would otherwise recycle
+// forever — instead latches. Exercises the conf-string → resolver wiring
+// going the terminal direction against a non-terminal default.
+func TestErrorApiConfString_OnWriteErrorTerminal(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusWriteError})
 	defer srv.Close()
 
-	conf := "ws::addr=" + addrOf(srv) + ";on_schema_error=terminal;"
+	conf := "ws::addr=" + addrOf(srv) + ";on_write_error=terminal;"
 	ls, err := LineSenderFromConf(context.Background(), conf)
 	require.NoError(t, err)
 	qs := asQwp(t, ls)
@@ -349,16 +351,17 @@ func TestErrorApiConfString_OnSchemaErrorHalt(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return qs.LastTerminalError() != nil
 	}, 3*time.Second, 1*time.Millisecond,
-		"on_schema_error=terminal should latch the SchemaMismatch as terminal")
-	assert.Equal(t, CategorySchemaMismatch, qs.LastTerminalError().Category)
+		"on_write_error=terminal should latch the WriteError as terminal")
+	assert.Equal(t, CategoryWriteError, qs.LastTerminalError().Category)
 }
 
-// TestErrorApiConfString_OnServerErrorHaltGlobal sets the global
-// override on_server_error=terminal and asserts a SchemaMismatch (default
-// Drop) latches as terminal — the global override takes effect since
-// no per-category override is set.
+// TestErrorApiConfString_OnServerErrorHaltGlobal sets the global override
+// on_server_error=terminal and asserts a WRITE_ERROR (retriable by
+// default) latches as terminal — the global override takes effect since
+// no per-category override is set, and the non-terminal default makes the
+// override observable.
 func TestErrorApiConfString_OnServerErrorHaltGlobal(t *testing.T) {
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusSchemaMismatch})
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusWriteError})
 	defer srv.Close()
 
 	conf := "ws::addr=" + addrOf(srv) + ";on_server_error=terminal;"
@@ -384,7 +387,7 @@ func TestErrorApiConfString_PerCategoryBeatsGlobal(t *testing.T) {
 	})
 	defer srv.Close()
 
-	// Global=halt, per-category=drop. Per-category must win.
+	// Global=terminal, per-category=retriable. Per-category must win.
 	conf := "ws::addr=" + addrOf(srv) + ";on_server_error=terminal;on_schema_error=retriable;"
 	ls, err := LineSenderFromConf(context.Background(), conf)
 	require.NoError(t, err)
@@ -395,7 +398,7 @@ func TestErrorApiConfString_PerCategoryBeatsGlobal(t *testing.T) {
 	require.NoError(t, ls.Flush(context.Background()))
 	require.NoError(t, ls.Table("t").Int64Column("v", 2).AtNow(context.Background()))
 	require.NoError(t, ls.Flush(context.Background()),
-		"per-category drop must beat global halt")
+		"per-category retriable must beat global terminal")
 	assert.Nil(t, qs.LastTerminalError())
 }
 
@@ -602,13 +605,13 @@ func TestErrorApiResilience_SfDiskHaltCloseReopenReplays(t *testing.T) {
 	assert.Equal(t, PolicyTerminal, se2.AppliedPolicy)
 }
 
-// TestErrorApiResilience_SfDiskDropPersistsAckedAcrossRestart drives
-// a Drop-policy rejection through SF disk mode, closes cleanly, then
-// reopens the slot and asserts a NEW frame goes through normally —
-// the dropped frame must NOT replay (it was acked-via-drop, so the
-// segment file should be unlinked). This is the SF flip side of the
-// HALT replay test: drops are durable, halts are durable, but the
-// persistence semantics differ.
+// TestErrorApiResilience_SfDiskRetriableReplayPersistsAckedAcrossRestart
+// drives a RETRIABLE rejection (WriteError) through SF disk mode: the frame
+// is NACKed, recycled, and replayed until genuinely ACKed, then the sender
+// closes cleanly. A second sender reopens the slot, sends a NEW frame, and
+// the genuinely-acked frame must NOT replay (its segment was trimmed on the
+// real ACK). The SF flip side of the HALT replay test — both persist on
+// disk, but an acked frame is trimmed while a HALTed one is preserved.
 func TestErrorApiResilience_SfDiskRetriableReplayPersistsAckedAcrossRestart(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		rejectStatus:       QwpStatusWriteError, // retriable: replay, never drop

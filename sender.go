@@ -697,9 +697,14 @@ func WithSfMaxTotalBytes(n int64) LineSenderOption {
 }
 
 // WithReconnectPolicy configures the reconnect backoff policy.
-// maxDuration bounds only the blocking sync initial connect
+// maxDuration bounds the blocking sync initial connect
 // (InitialConnectSync); a running sender retries transport outages
-// indefinitely and never gives up on a wall clock (Invariant B).
+// indefinitely and never gives up on a wall clock (Invariant B). On a
+// running sender maxDuration additionally sets how long a rejection
+// window must persist before the poison-frame detector may escalate to a
+// terminal (and the background drainer's no-progress wedge budget), so a
+// small value shortens those floors — leave it at the default unless you
+// intend that.
 // initialBackoff and maxBackoff bound the equal-jitter exponential
 // backoff sleep between attempts. A zero or negative argument is
 // treated as "leave the default" for that knob — it does not register
