@@ -69,6 +69,7 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"math/rand"
@@ -1003,57 +1004,37 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 	}
 }
 
-// --- poison-rows / per-frame-drop scenario ---------------------------
+// --- poison-rows / NACK-policy scenario -------------------------------
 
-// TestQwpFuzzIngressOraclePoisonErrorHandler ports
-// QwpIngressOracleFuzzTest.testOraclePoisonRowsTriggerErrorHandler. It
-// pins the per-batch error contract:
+// TestQwpFuzzIngressOraclePoisonErrorHandler pins the NACK-policy-v2
+// error contract against a real server:
 //
-//  1. the async error handler fires for every poisoned chunk;
-//  2. rows from clean chunks land exactly per the oracle;
-//  3. no row from a poisoned chunk leaks — the WHOLE frame is dropped,
-//     including the well-formed rows next to the bad one (SF drops per
-//     frame, not per row).
+//  1. a retriable server NACK (WRITE_ERROR) recycles the connection and
+//     replays the frame — the async handler fires once per delivery,
+//     informationally;
+//  2. the same frame rejected max_frame_rejections (4) consecutive
+//     times escalates to a typed PROTOCOL_VIOLATION poisoned-frame
+//     terminal — exactly 4 retriable deliveries + 1 terminal per
+//     producer, and the next producer call errors typed;
+//  3. rows from clean chunks land exactly per the oracle; no row from
+//     the poisoned frame ever lands (the server rejects it atomically);
+//  4. nothing is silently dropped: the poisoned frame's bytes remain in
+//     the SF log after close.
 //
-// A poisoned chunk carries one row whose dec256 unscaled value is 2^192
-// (~6.3e57, 58 digits) — well past DECIMAL(50,6)'s 10^50 cap. The
-// server returns CategoryWriteError, whose spec-default policy is
-// DROP_AND_CONTINUE (qwp_sf_classify.go), so the producer keeps going
-// and the rejection surfaces only via the async handler. No server
-// bounce on purpose — the failure mode must be unambiguously the
-// per-frame rejection, not a transport blip.
-//
-// Faithful-port divergences (cf. the file header and the bounce port):
-//
-//   - The sender is built with NewLineSender(...) options rather than a
-//     connect string: Go has no conf+option combiner and WithErrorHandler
-//     is option-only. The options are 1:1 with the Java connect string
-//     (sf_dir, initial_connect_retry=true→sync, close_flush_timeout,
-//     error_inbox_capacity) plus the error handler.
-//   - reconnect_max_duration_millis is omitted (no outage in this
-//     scenario; the default budget is irrelevant).
-//   - Clean rows verified via the QWP query client (oracleAssert);
-//     poisoned-id absence via the fixture /exec count (mirrors Java's
-//     assertSql). Counts are CI-bounded; chunk size stays small enough
-//     to map to a single frame so the per-frame drop is deterministic.
-//   - errCalls >= poisoned-chunk count (inequality, like Java: tolerates
-//     the rare chunk that splits across more than one frame); upper
-//     bound 3x catches "handler fires N times per chunk" regressions
-//     the Java port doesn't guard.
-//   - Goes beyond the Java port: also captures one delivered
-//     *SenderError and asserts Category == CategoryWriteError and
-//     AppliedPolicy == PolicyRetriable, so a misclassification
-//     (wrong status byte → wrong category) or a policy-resolution
-//     regression cannot pass silently behind the call-count alone.
-//   - Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
+// Each producer sends its clean chunks first and one poisoned final
+// chunk carrying a row whose dec256 unscaled value is 2^192 (~6.3e57,
+// 58 digits) — well past DECIMAL(50,6)'s 10^50 cap, so the rejection is
+// deterministic under byte-identical replay: the exact case the
+// poison-frame detector exists for. No server bounce on purpose — the
+// failure mode must be unambiguously the per-frame rejection, not a
+// transport blip. Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
 func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	srv := fuzzServer(t)
 	r := newFuzzRand(t)
 
 	producerCount := 2 + r.Intn(2)        // 2..3
-	chunksPerProducer := 30 + r.Intn(30)  // 30..59
+	chunksPerProducer := 30 + r.Intn(30)  // 30..59 (last one poisoned)
 	chunkSize := 5 + r.Intn(6)            // 5..10 rows (maps to one frame)
-	const poisonChunkInN = 4              // ~25% of chunks poisoned
 	sfMaxBytes := oraclePickSfMaxBytes(r) // shared with the bounce port
 
 	// Constructible client-side? 2^192 is 58 digits — inside Decimal256's
@@ -1066,26 +1047,24 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	oracle := newOracleTable()
 	perProducerChunks := make([][][]*oracleRow, producerCount)
 	var poisonedIDs []string
-	totalPoisonedChunks := 0
 	var globalIdx int64
 	for p := 0; p < producerCount; p++ {
 		genR := rand.New(rand.NewSource(r.Int63()))
-		poisonR := rand.New(rand.NewSource(r.Int63()))
 		perProducerChunks[p] = make([][]*oracleRow, chunksPerProducer)
 		for c := 0; c < chunksPerProducer; c++ {
-			poisoned := poisonR.Intn(poisonChunkInN) == 0
-			if poisoned {
-				totalPoisonedChunks++
-			}
+			// The FINAL chunk of every producer is poisoned; all clean
+			// chunks precede it, so they are ACKed before the poisoned
+			// frame starts its NACK-replay-escalate cycle and the oracle
+			// converges deterministically.
+			poisoned := c == chunksPerProducer-1
 			chunk := make([]*oracleRow, chunkSize)
 			for rr := 0; rr < chunkSize; rr++ {
 				id := globalIdx
 				ts := oracleBaseTsMicros + globalIdx
 				row := oracleGenerateRow(genR, id, ts)
 				if poisoned {
-					// Force dec256 past the column cap. setSignedDecimal
-					// is unconditional in Java; overwrite whatever
-					// generateRow produced (skipped or not).
+					// Force dec256 past the column cap: deterministic
+					// server-side rejection under byte-identical replay.
 					row.set("dec256", oracleCell{kind: ocDec256, dec: u256(1, 0, 0, 0), scale: 6})
 					poisonedIDs = append(poisonedIDs, strconv.FormatInt(id, 10))
 				} else {
@@ -1097,6 +1076,7 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 			perProducerChunks[p][c] = chunk
 		}
 	}
+	totalPoisonedChunks := producerCount // one poisoned final chunk each
 	cleanRows := len(oracle.rows)
 	t.Logf("ingress oracle poison: producers=%d chunks/producer=%d chunkSize=%d "+
 		"poisonedChunks=%d cleanRows=%d sf_max_bytes=%d",
@@ -1176,12 +1156,41 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 					oraclePublish(t, qs, ctx, row)
 				}
 				// Explicit flush per chunk -> chunk == frame, so the
-				// per-frame drop is deterministic. DROP_AND_CONTINUE means
-				// Flush does NOT error on a poisoned chunk (no HALT latch).
+				// per-frame NACK is deterministic. Flush never waits for
+				// the ACK, so even the poisoned final chunk publishes
+				// cleanly; the NACK-replay-escalate cycle runs async.
 				if err := qs.Flush(ctx); err != nil {
 					errs[p] = fmt.Errorf("producer %d flush chunk %d: %w", p, c, err)
 					return
 				}
+			}
+			// The poisoned final frame is rejected deterministically:
+			// max_frame_rejections (4) retriable deliveries, then the
+			// typed poisoned-frame terminal latches.
+			deadline := time.Now().Add(60 * time.Second)
+			for qs.LastTerminalError() == nil {
+				if time.Now().After(deadline) {
+					errs[p] = fmt.Errorf("producer %d: poisoned frame never escalated to a terminal", p)
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			se := qs.LastTerminalError()
+			if se.Category != CategoryProtocolViolation || se.AppliedPolicy != PolicyTerminal {
+				errs[p] = fmt.Errorf("producer %d: terminal = %s/%s, want PROTOCOL_VIOLATION/TERMINAL (%s)",
+					p, se.Category, se.AppliedPolicy, se.ServerMessage)
+				return
+			}
+			if !strings.Contains(se.ServerMessage, "poisoned frame") {
+				errs[p] = fmt.Errorf("producer %d: terminal message %q lacks the poisoned-frame diagnosis",
+					p, se.ServerMessage)
+				return
+			}
+			// The next producer call surfaces the same typed payload.
+			var typed *SenderError
+			if err := qs.Flush(ctx); err == nil || !errors.As(err, &typed) {
+				errs[p] = fmt.Errorf("producer %d: post-terminal Flush = %v, want typed *SenderError", p, err)
+				return
 			}
 		}(p)
 	}
@@ -1192,8 +1201,9 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 		}
 	}
 
-	// Poisoned frames are dropped, so the table converges to exactly the
-	// clean-row count (globally-unique ts,id + DEDUP -> no dup inflation).
+	// Every clean chunk precedes the poisoned final frame, so the table
+	// converges to exactly the clean-row count (globally-unique ts,id +
+	// DEDUP -> no dup inflation).
 	srv.awaitRows(t, oracleTableName, cleanRows, 120*time.Second)
 
 	// (a) Clean rows: every clean-chunk row lands once; oracle drives a
@@ -1201,9 +1211,9 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	c := newBindFuzzClient(t, srv)
 	oracleAssert(t, c, oracle)
 
-	// (b) Poisoned rows: not a single id from any poisoned chunk leaked
-	// -- this pins the per-frame drop (good rows in a bad frame are gone
-	// too).
+	// (b) Poisoned rows: not a single id from any poisoned frame landed —
+	// the server rejects the whole frame atomically, and replay re-sends
+	// the same bytes, so the ids stay absent across all 4 deliveries.
 	if len(poisonedIDs) > 0 {
 		res, err := srv.execSQL("SELECT count() FROM '" + oracleTableName +
 			"' WHERE id IN (" + strings.Join(poisonedIDs, ",") + ")")
@@ -1214,62 +1224,65 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 			t.Fatalf("poisoned-id count: unexpected shape %v", res.Dataset)
 		}
 		if n, ok := toInt64(res.Dataset[0][0]); !ok || n != 0 {
-			t.Fatalf("poisoned rows leaked: %d ids from poisoned chunks present "+
-				"(expected 0) -- per-frame drop violated", n)
+			t.Fatalf("poisoned rows leaked: %d ids from poisoned frames present "+
+				"(expected 0) -- atomic frame rejection violated", n)
 		}
 	}
 
-	// (c) Async notifications: at least one per poisoned chunk reached a
-	// handler. Lower-bound inequality tolerates a chunk split across
-	// >1 frame; upper bound (3x) catches a regression that fires the
-	// handler many times per rejection (e.g. one per row in the frame
-	// instead of one per frame).
-	got := errCalls.Load()
-	if got < int64(totalPoisonedChunks) {
-		t.Fatalf("error handler fired %d times, expected >= %d (poisoned chunks)",
-			got, totalPoisonedChunks)
+	// (c) Async notifications: exactly max_frame_rejections (4) retriable
+	// deliveries plus 1 poisoned-frame terminal per producer. Poll until
+	// the dispatcher drains, then pin the exact count — an off-by-one
+	// here means a lost or double-fired delivery.
+	wantCalls := int64(totalPoisonedChunks * (qwpSfDefaultMaxFrameRejections + 1))
+	callsDeadline := time.Now().Add(30 * time.Second)
+	for errCalls.Load() < wantCalls && time.Now().Before(callsDeadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
-	if upper := int64(3 * totalPoisonedChunks); totalPoisonedChunks > 0 && got > upper {
-		t.Fatalf("error handler fired %d times, expected <= %d (3x poisoned chunks)",
-			got, upper)
+	time.Sleep(200 * time.Millisecond) // settle: catch over-delivery too
+	if got := errCalls.Load(); got != wantCalls {
+		t.Fatalf("error handler fired %d times, expected exactly %d "+
+			"(%d retriable deliveries + 1 poison terminal per producer)",
+			got, wantCalls, qwpSfDefaultMaxFrameRejections)
 	}
-	// Inspect at least one delivered payload: misclassifying the
-	// dec256 overflow into a non-WriteError category, or resolving
-	// its policy to anything other than DROP_AND_CONTINUE, must
-	// fail the test even though the call count alone would still
-	// match. (A HALT resolution would also surface as a Flush error
-	// above, but we assert the policy here explicitly so the
-	// contract is self-documenting.)
-	if totalPoisonedChunks > 0 {
-		firstErrMu.Lock()
-		se := firstErr
-		firstErrMu.Unlock()
-		if se == nil {
-			t.Fatalf("error handler fired %d times but no *SenderError captured", got)
-		}
-		if se.Category != CategoryWriteError {
-			t.Fatalf("error handler: wrong category: got %s (status=0x%02X), "+
-				"expected WRITE_ERROR; msg=%q",
-				se.Category, byte(se.ServerStatusByte), se.ServerMessage)
-		}
-		if se.AppliedPolicy != PolicyRetriable {
-			t.Fatalf("error handler: wrong policy: got %s, expected DROP_AND_CONTINUE",
-				se.AppliedPolicy)
-		}
+	// Inspect the first delivered payload: the dec256 overflow must
+	// classify as WRITE_ERROR with the retriable policy — a
+	// misclassification cannot pass silently behind the call count.
+	firstErrMu.Lock()
+	se := firstErr
+	firstErrMu.Unlock()
+	if se == nil {
+		t.Fatal("error handler fired but no *SenderError captured")
 	}
-	t.Logf("poison: poisonedChunks=%d handlerCalls=%d", totalPoisonedChunks, got)
+	if se.Category != CategoryWriteError {
+		t.Fatalf("error handler: wrong category: got %s (status=0x%02X), "+
+			"expected WRITE_ERROR; msg=%q",
+			se.Category, byte(se.ServerStatusByte), se.ServerMessage)
+	}
+	if se.AppliedPolicy != PolicyRetriable {
+		t.Fatalf("error handler: wrong policy: got %s, expected RETRIABLE",
+			se.AppliedPolicy)
+	}
+	t.Logf("poison: poisonedChunks=%d handlerCalls=%d", totalPoisonedChunks, errCalls.Load())
 
-	// Clean close ACKed/handled every frame; the SF cursor unlinks
-	// rotated segments. Java's slotCapFor: sf_max_bytes + 256 KiB.
-	capBytes := sfMaxBytes + 256*1024
+	// Nothing is silently dropped: the poisoned frame's bytes survive the
+	// close in each producer's SF log (close cannot drain a terminal
+	// sender). Segments are preallocated to sf_max_bytes, and the pinned
+	// unacked tail keeps its segment plus the active successor alive, so
+	// the dir stays within two segments plus slack while fully-acked
+	// older segments are still trimmed.
+	capBytes := 2*sfMaxBytes + 256*1024
 	for p, dir := range sfDirs {
 		sz, err := oracleSfDirSize(dir)
 		if err != nil {
 			t.Fatalf("producer %d sf_dir %q: walk failed: %v", p, dir, err)
 		}
+		if sz == 0 {
+			t.Fatalf("producer %d sf_dir %q empty after close: the poisoned "+
+				"frame's bytes must remain on disk (no silent loss)", p, dir)
+		}
 		if sz > capBytes {
-			t.Fatalf("producer %d sf_dir %q not purged after clean close: %d bytes (cap %d)",
-				p, dir, sz, capBytes)
+			t.Fatalf("producer %d sf_dir %q holds %d bytes (cap %d): acked "+
+				"segments were not trimmed", p, dir, sz, capBytes)
 		}
 	}
 }
