@@ -111,8 +111,8 @@ func TestQwpQueryPoolExhausted(t *testing.T) {
 		t.Fatalf("borrow: %v", err)
 	}
 	defer q.Close()
-	if _, err := p.borrow(context.Background()); !errors.Is(err, errPoolExhausted) {
-		t.Fatalf("second borrow err=%v, want errPoolExhausted", err)
+	if _, err := p.borrow(context.Background()); !errors.Is(err, errQueryPoolExhausted) {
+		t.Fatalf("second borrow err=%v, want errQueryPoolExhausted", err)
 	}
 }
 
@@ -124,7 +124,7 @@ func TestQwpQueryPoolGiveBackBroken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
-	p.giveBack(ctx, q, true) // broken → worker evicted, not recycled
+	p.giveBack(q, true) // broken → worker evicted, not recycled
 	if total, avail := p.poolSnapshot(); avail != 0 || total != 0 {
 		t.Errorf("broken worker recycled: total=%d avail=%d, want 0/0", total, avail)
 	}
@@ -189,11 +189,11 @@ func TestQwpQueryPoolClosedOps(t *testing.T) {
 		t.Errorf("borrow after close=%v, want errPoolClosed", err)
 	}
 	p.reapIdle()
-	// On loan at close, so close() left it open; returning it self-closes (M1).
+	// On loan at close, so close() left it open; returning it self-closes.
 	_ = q.Close()
 }
 
-// TestQwpQueryPoolCloseLeavesOnLoanWorker (M1): close() must not close a worker
+// TestQwpQueryPoolCloseLeavesOnLoanWorker: close() must not close a worker
 // still on loan (its client may have a live Batches() read); the lease self-
 // closes on return instead.
 func TestQwpQueryPoolCloseLeavesOnLoanWorker(t *testing.T) {
@@ -247,7 +247,7 @@ func TestQwpQueryLeaseCloseIdempotent(t *testing.T) {
 func TestQwpQueryLeaseReopenClosesPrevious(t *testing.T) {
 	// A CANCEL-responding server so reopening's cleanup drain of c1
 	// observes a terminal frame promptly and deterministically (clean
-	// drain, drainFailed stays false). The read-and-discard server would
+	// drain, no desync latch). The read-and-discard server would
 	// leave the drain racing the cancel-ack watchdog against its ctx —
 	// both 5s — so the reopen's desynced-vs-clean branch became a coin
 	// flip (flaky: passed on Go 1.23, failed on Go 1.24 in CI).
@@ -278,8 +278,8 @@ func TestQwpQueryLeaseReopenClosesPrevious(t *testing.T) {
 // a lease whose previous cursor's cleanup drain abandoned before its terminal
 // frame must mark the worker broken (so Close evicts it instead of recycling a
 // wire-desynced worker) and refuse to submit the new query on the desynced wire
-// (so the caller gets errStaleLease, not silently the prior cursor's leftover
-// frames).
+// (so the caller gets errQueryLeaseUnusable, not silently the prior cursor's
+// leftover frames).
 func TestQwpQueryLeaseReopenOverAbandonedDrain(t *testing.T) {
 	p := queryPoolWithIdle(t, 1, 2, 0)
 	ctx := context.Background()
@@ -292,10 +292,10 @@ func TestQwpQueryLeaseReopenOverAbandonedDrain(t *testing.T) {
 	c1 := q.Query(ctx, "select 1")
 	// Simulate a caller that broke out of Batches() early and whose cursor
 	// cleanup drain abandoned before the terminal frame: the cursor is Done
-	// with drainFailed latched, leaving leftover events on the single-stream
-	// wire.
+	// with the client-level desync flag latched, leaving leftover events on
+	// the single-stream wire.
 	c1.state.Store(qwpQueryStateDone)
-	c1.drainFailed.Store(true)
+	q.worker.client.execDrainAbandoned.Store(true)
 
 	c2 := q.Query(ctx, "select 2")
 	if !q.broken {
@@ -304,25 +304,25 @@ func TestQwpQueryLeaseReopenOverAbandonedDrain(t *testing.T) {
 	if q.active != nil {
 		t.Error("Query must refuse to submit on the desynced wire (active stays nil)")
 	}
-	sawStale := false
+	sawUnusable := false
 	for _, err := range c2.Batches() {
-		if errors.Is(err, errStaleLease) {
-			sawStale = true
+		if errors.Is(err, errQueryLeaseUnusable) {
+			sawUnusable = true
 		}
 	}
-	if !sawStale {
-		t.Error("desynced reopen cursor did not yield errStaleLease")
+	if !sawUnusable {
+		t.Error("desynced reopen cursor did not yield errQueryLeaseUnusable")
 	}
 }
 
 // TestQwpQueryLeaseExecOverAbandonedDrain is the Exec sibling of
-// TestQwpQueryLeaseReopenOverAbandonedDrain (item C1): Exec must NOT submit on a
+// TestQwpQueryLeaseReopenOverAbandonedDrain: Exec must NOT submit on a
 // wire it has just flagged desynced. A prior Query cursor whose cleanup drain
 // abandoned before its terminal frame leaves leftover events on the
-// single-stream wire; Exec drains it, detects drainFailed, marks the worker
-// broken, and must refuse to submit (errStaleLease) rather than misread the
-// leftover frames as its own result while the statement executes server-side
-// unobserved.
+// single-stream wire; Exec drains it, detects the client-level desync latch,
+// marks the worker broken, and must refuse to submit (errQueryLeaseUnusable)
+// rather than misread the leftover frames as its own result while the statement
+// executes server-side unobserved.
 func TestQwpQueryLeaseExecOverAbandonedDrain(t *testing.T) {
 	p := queryPoolWithIdle(t, 1, 2, 0)
 	ctx := context.Background()
@@ -336,11 +336,11 @@ func TestQwpQueryLeaseExecOverAbandonedDrain(t *testing.T) {
 	// Simulate a caller that broke out of Batches() early and whose cursor
 	// cleanup drain abandoned before the terminal frame.
 	c1.state.Store(qwpQueryStateDone)
-	c1.drainFailed.Store(true)
+	q.worker.client.execDrainAbandoned.Store(true)
 
 	_, err = q.Exec(ctx, "insert into t values (1)")
-	if !errors.Is(err, errStaleLease) {
-		t.Errorf("Exec over an abandoned drain must return errStaleLease, got %v", err)
+	if !errors.Is(err, errQueryLeaseUnusable) {
+		t.Errorf("Exec over an abandoned drain must return errQueryLeaseUnusable, got %v", err)
 	}
 	if !q.broken {
 		t.Error("Exec over an abandoned drain must mark the worker broken")
@@ -352,21 +352,21 @@ func TestQwpQueryLeaseExecOverAbandonedDrain(t *testing.T) {
 	// A second Query/Exec on the now-broken lease must also refuse via the
 	// top-level broken gate, not submit on the still-desynced wire.
 	c2 := q.Query(ctx, "select 2")
-	sawStale := false
+	sawUnusable := false
 	for _, e := range c2.Batches() {
-		if errors.Is(e, errStaleLease) {
-			sawStale = true
+		if errors.Is(e, errQueryLeaseUnusable) {
+			sawUnusable = true
 		}
 	}
-	if !sawStale {
-		t.Error("Query on a broken lease did not yield errStaleLease")
+	if !sawUnusable {
+		t.Error("Query on a broken lease did not yield errQueryLeaseUnusable")
 	}
-	if _, e := q.Exec(ctx, "insert into t values (2)"); !errors.Is(e, errStaleLease) {
-		t.Errorf("Exec on a broken lease must return errStaleLease, got %v", e)
+	if _, e := q.Exec(ctx, "insert into t values (2)"); !errors.Is(e, errQueryLeaseUnusable) {
+		t.Errorf("Exec on a broken lease must return errQueryLeaseUnusable, got %v", e)
 	}
 }
 
-// TestQwpQueryLeaseEvictsOnExecInternalDrainAbandoned (item C1, Exec-path
+// TestQwpQueryLeaseEvictsOnExecInternalDrainAbandoned (Exec-path
 // analogue) covers the gap where Exec's OWN internal cleanup drain (its
 // ctx-error path or SELECT-via-Exec path) abandons before a terminal frame on
 // an otherwise-healthy transport. That latches QwpQueryClient.execDrainAbandoned
@@ -374,8 +374,8 @@ func TestQwpQueryLeaseExecOverAbandonedDrain(t *testing.T) {
 // transport never faulted), so before this fix the desynced worker was recycled
 // and the next borrower misread the leftover frames as its own result. The lease
 // must instead evict the worker on return. The abandoned drain is simulated by
-// latching the client flag directly (as the sibling tests simulate drainFailed),
-// since reproducing the real 5s qwpQueryCleanupDrainTimeout would be slow/flaky.
+// latching the client flag directly (like the sibling tests), since reproducing
+// the real 5s qwpQueryCleanupDrainTimeout would be slow/flaky.
 func TestQwpQueryLeaseEvictsOnExecInternalDrainAbandoned(t *testing.T) {
 	p := queryPoolWithIdle(t, 1, 2, 0)
 	ctx := context.Background()
@@ -436,7 +436,7 @@ func poisonQueryWorker(t *testing.T, w *qwpQueryWorker) {
 
 // TestQwpQueryPoolBorrowDiscardsTerminalWorker (item #5): a worker that latched
 // a terminal transport error while idle is discarded on borrow and replaced,
-// never handed to the borrower (mirrors the sender pool's M1).
+// never handed to the borrower (mirrors the sender pool).
 func TestQwpQueryPoolBorrowDiscardsTerminalWorker(t *testing.T) {
 	p := newQwpQueryPoolForTest(t, 1, 2)
 	ctx := context.Background()

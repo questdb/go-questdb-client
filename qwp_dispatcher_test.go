@@ -242,6 +242,51 @@ func TestQwpDispatcherCloseAbandonsWedgedHandler(t *testing.T) {
 	}
 }
 
+// TestQwpDispatcherReentrantCloseCountsAbandonedAsDropped pins the accounting
+// on the re-entrant close path: close() called by the handler returns before
+// close()'s own leftovers sweep (the handler owns the loop goroutine), so when
+// loop() unwinds into drain() and the drain deadline fires, whatever is still
+// queued must be counted as dropped rather than stranded uncounted. The hard
+// invariant is delivered + dropped == offered.
+func TestQwpDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
+	const extra = 12
+	var d *qwpDispatcher[*SenderConnectionEvent]
+	queued := make(chan struct{})
+	var once sync.Once
+	d = newQwpConnDispatcher(func(SenderConnectionEvent) {
+		once.Do(func() {
+			<-queued
+			d.close() // re-entrant: returns without the close-side sweep
+		})
+		// Slow enough that drain()'s deadline fires with items still queued.
+		time.Sleep(qwpSfDispatcherDrainTimeout + 20*time.Millisecond)
+	}, extra+4)
+
+	if !d.offer(&SenderConnectionEvent{Kind: SenderConnected}) {
+		t.Fatal("first offer rejected")
+	}
+	for i := 0; i < extra; i++ {
+		if !d.offer(&SenderConnectionEvent{Kind: SenderConnected}) {
+			t.Fatalf("offer %d rejected before close", i)
+		}
+	}
+	close(queued)
+
+	joined := make(chan struct{})
+	go func() { d.wg.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatcher loop never exited after re-entrant close")
+	}
+
+	delivered, dropped := d.totalDelivered(), d.droppedNotifications()
+	if got, want := delivered+dropped, int64(extra+1); got != want {
+		t.Fatalf("delivered(%d) + dropped(%d) = %d, want %d — items abandoned on the "+
+			"re-entrant close path went uncounted", delivered, dropped, got, want)
+	}
+}
+
 // TestQwpDispatcherReentrantClose exercises the loopGoid guard: a handler that
 // calls close() on the loop goroutine must return immediately (recognising it is
 // the loop goroutine) instead of self-joining via wg.Wait — which would stall

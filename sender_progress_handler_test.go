@@ -26,9 +26,12 @@ package questdb
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,5 +95,60 @@ func TestSenderProgressHandlerFires(t *testing.T) {
 	}
 	if last != 1 {
 		t.Fatalf("final progress = %d, want 1", last)
+	}
+}
+
+// TestSenderProgressHandlerCloseFromCallbackConcurrentProducer pins the
+// dispatcher-goroutine guard on the progress path: a handler-invoked Close()
+// runs on the progress dispatcher goroutine and must not touch producer state
+// while a producer goroutine keeps writing. Pre-fix the guard matched only the
+// error dispatcher, so this raced the producer's table buffers.
+func TestSenderProgressHandlerCloseFromCallbackConcurrentProducer(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	// autoFlushRows=1: every row flushes, the server ACKs, and the first
+	// ackedFsn advance fires the handler.
+	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 1)
+	defer cleanup()
+
+	closed := make(chan struct{})
+	var once sync.Once
+	loop.sendLoopSetProgressHandler(func(int64) {
+		once.Do(func() {
+			_ = s.Close(context.Background())
+			close(closed)
+		})
+	}, 16)
+
+	var prodPanic atomic.Value
+	prodDone := make(chan struct{})
+	go func() {
+		defer close(prodDone)
+		defer func() {
+			if r := recover(); r != nil {
+				prodPanic.Store(fmt.Sprintf("%v", r))
+			}
+		}()
+		ctx := context.Background()
+		for i := 0; i < 100000; i++ {
+			if err := s.Table(fmt.Sprintf("t%d", i)).Int64Column("v", int64(i)).AtNow(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("progress handler never fired / Close() never returned")
+	}
+	select {
+	case <-prodDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("producer goroutine did not stop after Close()")
+	}
+	if p := prodPanic.Load(); p != nil {
+		t.Fatalf("producer crashed racing a progress-handler-invoked Close(): %v", p)
 	}
 }

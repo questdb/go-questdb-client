@@ -26,13 +26,16 @@ package questdb
 
 import (
 	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // qwpPoolHousekeeper periodically reaps idle / over-age slots from both pools.
-// One per QuestDB handle. Unlike Java's it drives no SF recovery (the Go sender
+// One per QuestDB handle. It drives no SF recovery (the Go sender
 // self-recovers; the pool binds recovery senders at construction, §4.4) — it
-// only reaps.
+// only reaps. interval 0 disables it: start() spawns nothing and stopAndJoin
+// returns immediately.
 type qwpPoolHousekeeper struct {
 	interval   time.Duration
 	joinBudget time.Duration
@@ -40,13 +43,16 @@ type qwpPoolHousekeeper struct {
 	queryPool  *qwpQueryPool
 	stop       chan struct{}
 	done       chan struct{}
+	started    atomic.Bool
+	stopOnce   sync.Once
 }
 
-// newQwpPoolHousekeeper builds the reaper. joinBudget bounds stopAndJoin and
-// must cover a reaped slot's worst-case Close (the close-flush drain), so a
-// reap in flight can never outlive QuestDB.Close.
+// newQwpPoolHousekeeper builds the reaper. interval 0 means disabled; a
+// negative interval falls back to the default. joinBudget bounds stopAndJoin
+// and must cover a reaped slot's worst-case Close (the close-flush drain), so
+// a reap in flight can never outlive QuestDB.Close.
 func newQwpPoolHousekeeper(sp *qwpSenderPool, qp *qwpQueryPool, interval, joinBudget time.Duration) *qwpPoolHousekeeper {
-	if interval <= 0 {
+	if interval < 0 {
 		interval = qwpDefaultHousekeeperInterval
 	}
 	if joinBudget <= 0 {
@@ -63,7 +69,12 @@ func newQwpPoolHousekeeper(sp *qwpSenderPool, qp *qwpQueryPool, interval, joinBu
 }
 
 func (h *qwpPoolHousekeeper) start() {
-	go h.run()
+	if h.interval == 0 {
+		return
+	}
+	if h.started.CompareAndSwap(false, true) {
+		go h.run()
+	}
 }
 
 func (h *qwpPoolHousekeeper) run() {
@@ -93,9 +104,14 @@ func (h *qwpPoolHousekeeper) reapGuarded(fn func()) {
 }
 
 // stopAndJoin signals the daemon and waits for it to exit, bounded so a stuck
-// reap can't block Close forever.
+// reap can't block Close forever. Idempotent, and an immediate no-op when the
+// housekeeper is disabled (never started) — waiting on done there would sleep
+// out the whole join budget for a goroutine that does not exist.
 func (h *qwpPoolHousekeeper) stopAndJoin() {
-	close(h.stop)
+	h.stopOnce.Do(func() { close(h.stop) })
+	if !h.started.Load() {
+		return
+	}
 	t := time.NewTimer(h.joinBudget)
 	defer t.Stop()
 	select {

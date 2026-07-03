@@ -1239,7 +1239,7 @@ func TestQwpQueryClientCloseTwiceOK(t *testing.T) {
 	}
 }
 
-// TestQwpQueryClientCloseShortCtxNoReaderRace guards M2: Close(ctx) with
+// TestQwpQueryClientCloseShortCtxNoReaderRace guards the reader-race invariant: Close(ctx) with
 // an already-cancelled ctx must not race the reader goroutine over the
 // transport's conn. shutdown(ctx) returns via ctx.Done() before doneCh
 // fires (the reader has not joined), so the transport teardown that
@@ -2174,5 +2174,137 @@ func TestQwpQueryBindsResetAcrossCalls(t *testing.T) {
 	// encode different things).
 	if bytes.Contains(payload2, payload1) {
 		t.Fatalf("q2 payload contains q1 payload — scratch not reset")
+	}
+}
+
+// TestQwpQueryCursorDrainAbandonDesyncsClient drives the production desync
+// path on a standalone client: after the iterator break-out sends CANCEL, the
+// server keeps streaming RESULT_BATCH frames past the configured cleanup-drain
+// deadline (WithQwpQueryCloseTimeout), so the cursor's bounded drain abandons
+// before a terminal frame. The single-stream wire still carries the first
+// query's leftover frames — there is no requestId demux on the event path —
+// so the next Query/Exec must fail fast with errExecDesynced instead of
+// consuming those frames as its own result.
+func TestQwpQueryCursorDrainAbandonDesyncsClient(t *testing.T) {
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		req := m.readBinary(ctx)
+		reqID, _, _ := parseQueryRequest(t, req)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID, 0, "v", 1))
+		for {
+			frame := m.readBinary(ctx)
+			if frame[0] == byte(qwpMsgKindCancel) {
+				break
+			}
+		}
+		// Stream steadily and never send a terminal frame, so the client's
+		// bounded cleanup drain expires mid-stream while the frequent frames
+		// keep resetting the cancel-ack watchdog (no transport poisoning —
+		// this must stay a pure desync). Writes race the client teardown at
+		// the end of the test, so swallow errors instead of failing from
+		// this goroutine.
+		for seq := uint64(1); ; seq++ {
+			frame := buildOneRowInt64Batch(t, reqID, seq, "v", int64(seq))
+			if err := m.conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+				return
+			}
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := NewQwpQueryClient(ctx,
+		WithQwpQueryAddress(strings.TrimPrefix(srv.URL, "http://")),
+		WithQwpQueryCloseTimeout(300*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewQwpQueryClient: %v", err)
+	}
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer closeCancel()
+		_ = c.Close(closeCtx)
+	}()
+
+	q1 := c.Query(ctx, "SELECT 1")
+	for _, err := range q1.Batches() {
+		if err != nil {
+			t.Fatalf("q1 iter err: %v", err)
+		}
+		break // break-out → CANCEL + bounded cleanup drain, which the server outlasts
+	}
+	q1.Close()
+
+	if !c.execDesynced() {
+		t.Fatal("abandoned cursor cleanup drain did not latch the client desync flag")
+	}
+
+	q2 := c.Query(ctx, "SELECT 2")
+	var q2Rows int
+	var q2Err error
+	for _, err := range q2.Batches() {
+		if err != nil {
+			q2Err = err
+			continue
+		}
+		q2Rows++
+	}
+	if q2Rows != 0 {
+		t.Fatalf("q2 consumed %d leftover batches from q1; want fail-fast with no rows", q2Rows)
+	}
+	if !errors.Is(q2Err, errExecDesynced) {
+		t.Fatalf("q2 err=%v, want errExecDesynced", q2Err)
+	}
+	if _, err := c.Exec(ctx, "INSERT INTO t VALUES (1)"); !errors.Is(err, errExecDesynced) {
+		t.Fatalf("Exec err=%v, want errExecDesynced", err)
+	}
+}
+
+// TestQwpQueryCloseTimeoutReachesCancelAckWatchdog pins the config plumbing:
+// query_close_timeout_ms must bound not only the consumer-side cleanup drain
+// but also the dispatcher-side post-CANCEL silence watchdog, which would
+// otherwise poison the connection at the 5s default while the user-configured
+// drain is still legitimately waiting.
+func TestQwpQueryCloseTimeoutReachesCancelAckWatchdog(t *testing.T) {
+	idle := func(m *qwpMockEgressConn) {
+		for {
+			if _, _, err := m.conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}
+
+	srv := newQwpMockEgressServer(t, idle)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c, err := NewQwpQueryClient(ctx,
+		WithQwpQueryAddress(strings.TrimPrefix(srv.URL, "http://")),
+		WithQwpQueryCloseTimeout(30*time.Second))
+	if err != nil {
+		t.Fatalf("NewQwpQueryClient: %v", err)
+	}
+	defer func() { _ = c.Close(context.Background()) }()
+	if got := c.io().cancelAckTimeout; got != 30*time.Second {
+		t.Errorf("cancelAckTimeout = %v, want the configured 30s", got)
+	}
+
+	srv2 := newQwpMockEgressServer(t, idle)
+	defer srv2.Close()
+	c2, err := NewQwpQueryClient(ctx,
+		WithQwpQueryAddress(strings.TrimPrefix(srv2.URL, "http://")))
+	if err != nil {
+		t.Fatalf("NewQwpQueryClient (default): %v", err)
+	}
+	defer func() { _ = c2.Close(context.Background()) }()
+	if got := c2.io().cancelAckTimeout; got != qwpQueryCancelAckTimeout {
+		t.Errorf("default cancelAckTimeout = %v, want %v", got, qwpQueryCancelAckTimeout)
 	}
 }

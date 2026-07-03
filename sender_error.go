@@ -30,26 +30,27 @@
 //  1. Asynchronously, to a registered SenderErrorHandler:
 //
 //     opts := []questdb.LineSenderOption{
-//         questdb.WithQwp(),
-//         questdb.WithErrorHandler(func(e *questdb.SenderError) {
-//             log.Printf("dead-lettering FSN [%d,%d]: %v", e.FromFsn, e.ToFsn, e)
-//             // ... persist e for replay or alerting ...
-//         }),
+//     questdb.WithQwp(),
+//     questdb.WithErrorHandler(func(e *questdb.SenderError) {
+//     log.Printf("dead-lettering FSN [%d,%d]: %v", e.FromFsn, e.ToFsn, e)
+//     // ... persist e for replay or alerting ...
+//     }),
 //     }
 //
-//  2. Synchronously, on the next producer-thread API call after a HALT
-//     policy has been latched:
+//  2. Synchronously, on the next producer-thread API call after a
+//     terminal rejection has been latched:
 //
 //     if err := s.Flush(ctx); err != nil {
-//         var se *questdb.SenderError
-//         if errors.As(err, &se) {
-//             // unpack se.Category, se.ServerMessage, se.FromFsn, ...
-//         }
+//     var se *questdb.SenderError
+//     if errors.As(err, &se) {
+//     // unpack se.Category, se.ServerMessage, se.FromFsn, ...
+//     }
 //     }
 //
 // Both paths deliver the same payload. The producer-side typed error is
-// the FSN's-eye-view of "what was rejected"; the async handler is the
-// dead-letter channel for DROP_AND_CONTINUE batches.
+// the FSN's-eye-view of "what was rejected"; the async handler carries
+// retriable rejections too (informational — the batch is replayed, not
+// dropped).
 package questdb
 
 import (
@@ -207,8 +208,8 @@ const (
 // SenderError is the immutable description of a server-side rejection
 // of an asynchronously published QWP batch. It is delivered to user
 // code via the registered SenderErrorHandler (async) and as the typed
-// error returned from the next producer-thread API call after a HALT
-// (sync). Both paths carry the same payload.
+// error returned from the next producer-thread API call after a
+// terminal latch (sync). Both paths carry the same payload.
 //
 // SenderError implements the error interface, so it can be passed
 // directly through error-returning APIs and unwrapped via errors.As:
@@ -225,8 +226,10 @@ type SenderError struct {
 	Category Category
 
 	// AppliedPolicy is what the loop actually did about the
-	// rejection — DROP_AND_CONTINUE means the data was dropped
-	// from disk; HALT means a terminal latch is in place.
+	// rejection — PolicyRetriable / PolicyRetriableOther means the
+	// connection was recycled and the batch is replayed (nothing
+	// dropped); PolicyTerminal means a terminal latch is in place
+	// with the bytes preserved in the store-and-forward log.
 	AppliedPolicy Policy
 
 	// ServerStatusByte is the raw QWP status byte (e.g. 0x03 for
@@ -391,6 +394,9 @@ func (e *QwpError) Error() string {
 //
 // Deprecated: exists solely for the QwpError shim; removed with it.
 func (e *SenderError) As(target any) bool {
+	if e == nil {
+		return false
+	}
 	qe, ok := target.(**QwpError)
 	if !ok {
 		return false

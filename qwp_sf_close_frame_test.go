@@ -110,8 +110,11 @@ func TestQwpSfCloseCodeRepeatPoisonEscalates(t *testing.T) {
 			transport, err := factory(context.Background(), 0)
 			require.NoError(t, err)
 
+			// 1ms reconnectMaxDuration: the poison-episode floor stays
+			// below the paced inter-strike backoff, so escalation lands
+			// exactly at the strike threshold.
 			loop := qwpSfNewSendLoop(engine, transport, factory,
-				100*time.Microsecond, time.Second, time.Millisecond, 10*time.Millisecond)
+				100*time.Microsecond, time.Millisecond, time.Millisecond, 10*time.Millisecond)
 			loop.sendLoopStart()
 			defer func() { _ = loop.sendLoopClose() }()
 
@@ -176,8 +179,10 @@ func TestQwpSfPoisonTerminalMultiFrameFsnSpan(t *testing.T) {
 	transport, err := factory(context.Background(), 0)
 	require.NoError(t, err)
 
+	// 1ms reconnectMaxDuration: episode floor below the paced
+	// inter-strike backoff, so escalation lands at the threshold.
 	loop := qwpSfNewSendLoop(engine, transport, factory,
-		100*time.Microsecond, time.Second, time.Millisecond, 10*time.Millisecond)
+		100*time.Microsecond, time.Millisecond, time.Millisecond, 10*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 

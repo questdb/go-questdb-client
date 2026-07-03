@@ -289,6 +289,9 @@ func TestPoolFromOptionsRejectsQwpOnlyOptions(t *testing.T) {
 		{"WithBackgroundDrainerListener", qdb.WithBackgroundDrainerListener(qdb.QwpBackgroundDrainerListener{
 			OnDurableAckUnavailable: func(string, int) {},
 		})},
+		{"WithBackgroundDrainerListenerPrimaryOnly", qdb.WithBackgroundDrainerListener(qdb.QwpBackgroundDrainerListener{
+			OnPrimaryUnavailable: func(string, int) {},
+		})},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

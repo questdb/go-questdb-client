@@ -172,7 +172,7 @@ type qwpTransportOpts struct {
 	// deadline), so a black-holed host is abandoned within this budget
 	// instead of riding the OS connect timeout. The TLS handshake and the
 	// upgrade response read stay under authTimeoutMs. Zero keeps the OS
-	// connect timeout. Mirrors the Java client's connect_timeout key.
+	// connect timeout. Exposed as the connect_timeout connect-string key.
 	connectTimeoutMs int
 
 	// requestDurableAck sends the X-QWP-Request-Durable-Ack upgrade header and

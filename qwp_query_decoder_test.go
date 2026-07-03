@@ -1496,7 +1496,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 	})
 
 	t.Run("H7a_CellCountAmplificationRejected", func(t *testing.T) {
-		// M3 regression. An all-null column is nearly free on the wire (a
+		// Cell-count amplification regression. An all-null column is nearly free on the wire (a
 		// rowCount/8 null bitmap, zstd-compressible to almost nothing) yet
 		// forces a rowCount-sized index array. row_count and column_count
 		// are each individually within their caps here, but their product

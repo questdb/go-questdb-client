@@ -27,7 +27,9 @@ package questdb
 import (
 	"encoding/binary"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 )
 
 type tableEntry struct {
@@ -265,6 +267,112 @@ func TestDurableTrackerEnqueueOkCapsOnOverflow(t *testing.T) {
 	}
 	if len(tr.pending) != 1 {
 		t.Fatalf("rejected overflow frame left %d pending entries, want 1", len(tr.pending))
+	}
+}
+
+// TestDurableTrackerHeadCursorCompaction pins the amortized-O(1) pop path: a
+// partial drain advances the head cursor without copying, the queue compacts
+// once the head passes the midpoint, and no entry is lost or reordered along
+// the way.
+func TestDurableTrackerHeadCursorCompaction(t *testing.T) {
+	tr := newQwpDurableTracker()
+	const n = 10
+	for i := 0; i < n; i++ {
+		tr.enqueueOk(int64(i), durableTrailer(tableEntry{"t", int64(i)}))
+	}
+	// Cover the first 3 only: head advances to 3 (<= n/2, no compaction).
+	tr.applyDurable(durableTrailer(tableEntry{"t", 2}))
+	if got := tr.drain(); got != 2 {
+		t.Fatalf("first drain = %d, want 2", got)
+	}
+	if tr.head != 3 || len(tr.pending) != n {
+		t.Fatalf("after popping 3 of %d: head=%d len=%d, want head=3 len=%d (no compaction yet)",
+			n, tr.head, len(tr.pending), n)
+	}
+	// Cover through 6: head reaches 7 > len/2, so the queue compacts.
+	tr.applyDurable(durableTrailer(tableEntry{"t", 6}))
+	if got := tr.drain(); got != 6 {
+		t.Fatalf("second drain = %d, want 6", got)
+	}
+	if tr.head != 0 || len(tr.pending) != 3 {
+		t.Fatalf("after popping 7 of %d: head=%d len=%d, want compacted head=0 len=3",
+			n, tr.head, len(tr.pending))
+	}
+	if !tr.hasPending() {
+		t.Fatal("3 entries must remain pending")
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"t", n - 1}))
+	if got := tr.drain(); got != n-1 {
+		t.Fatalf("final drain = %d, want %d", got, n-1)
+	}
+	if tr.hasPending() || tr.head != 0 || len(tr.pending) != 0 {
+		t.Fatalf("queue not empty after full drain: head=%d len=%d", tr.head, len(tr.pending))
+	}
+}
+
+// TestDurableTrackerFreelistCapped pins the peak-memory bound: entries released
+// past qwpDurablePoolCap are dropped for the GC instead of pinned forever.
+func TestDurableTrackerFreelistCapped(t *testing.T) {
+	tr := newQwpDurableTracker()
+	const n = qwpDurablePoolCap + 50
+	for i := 0; i < n; i++ {
+		tr.enqueueOk(int64(i), durableTrailer(tableEntry{"t", int64(i)}))
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"t", n - 1}))
+	if got := tr.drain(); got != n-1 {
+		t.Fatalf("drain = %d, want %d", got, n-1)
+	}
+	if len(tr.pool) > qwpDurablePoolCap {
+		t.Fatalf("freelist grew to %d, want <= %d", len(tr.pool), qwpDurablePoolCap)
+	}
+}
+
+// TestDurableTrackerConcurrentAccess exercises the tracker's internal mutex
+// under -race: one goroutine plays the receiver (seqGap/enqueueOk/applyDurable)
+// while another re-drives drains and resets — the cross-goroutine pattern the
+// lock exists to make safe. Assertions are structural (no race, no panic,
+// consistent emptiness after a final drain).
+func TestDurableTrackerConcurrentAccess(t *testing.T) {
+	tr := newQwpDurableTracker()
+	trailer := durableTrailer(tableEntry{"t", 1 << 30})
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for seq := int64(0); ; seq++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tr.seqGap(seq)
+			tr.enqueueOk(seq, trailer)
+			tr.applyDurable(trailer)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tr.drainUpTo(1 << 40)
+			tr.hasPending()
+			if i%1000 == 999 {
+				tr.reset()
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	tr.drain()
+	if tr.hasPending() != (len(tr.pending)-tr.head > 0) {
+		t.Fatalf("hasPending=%v inconsistent with pending len %d head %d",
+			tr.hasPending(), len(tr.pending), tr.head)
 	}
 }
 

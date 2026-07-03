@@ -393,7 +393,7 @@ but is a **no-op**.
 When the server rejects a published QWP batch, the rejection surfaces as a
 `*qdb.SenderError` carrying a stable `Category` (`SCHEMA_MISMATCH`,
 `PARSE_ERROR`, `INTERNAL_ERROR`, `SECURITY_ERROR`, `WRITE_ERROR`,
-`PROTOCOL_VIOLATION`, `UNKNOWN`), the server message, and the
+`NOT_WRITABLE`, `PROTOCOL_VIOLATION`, `UNKNOWN`), the server message, and the
 `[FromFsn, ToFsn]` span — join that span against `FlushAndGetSequence` to
 identify the rejected rows. There are two delivery paths, same payload:
 
@@ -406,7 +406,8 @@ db, err := qdb.NewQuestDB(ctx, "ws::addr=localhost:9000;",
 			e.FromFsn, e.ToFsn, e.Category, e.ServerMessage)
 	}))
 
-// Sync — after a HALT, the typed error surfaces on the next producer call.
+// Sync — after a terminal rejection, the typed error surfaces on the next
+// producer call.
 if err := sender.Flush(ctx); err != nil {
 	var se *qdb.SenderError
 	if errors.As(err, &se) {
@@ -415,16 +416,28 @@ if err := sender.Flush(ctx); err != nil {
 }
 ```
 
-Each `Category` resolves to a `Policy` — `HALT` (latch the error; close and
-rebuild the sender to continue) or `DROP_AND_CONTINUE` (drop the rejected span
-and keep going). Resolution precedence, highest first: `WithErrorPolicyResolver`
-→ `WithErrorPolicy(category, policy)` → connect-string `on_<category>_error` →
-`on_server_error` → spec defaults. `PROTOCOL_VIOLATION` and `UNKNOWN` are always
-`HALT`. Connect-string equivalents take `halt` / `drop` (and `auto` for the
-global key):
+Nothing is ever silently dropped. Each `Category` resolves to a `Policy`:
+
+- `RETRIABLE` / `RETRIABLE_OTHER` — recycle the connection and replay from the
+  store-and-forward log; the rejected bytes stay on disk and the producer keeps
+  writing. Dispatch to the handler is informational. `RETRIABLE_OTHER`
+  (`NOT_WRITABLE`) additionally rotates to the next endpoint. A frame rejected
+  repeatedly with no ack progress escalates to `TERMINAL` via the poison-frame
+  detector (`max_frame_rejections`, default 4).
+- `TERMINAL` — latch the error; the next producer call returns it and the sender
+  stops draining until you close and rebuild it. The rejected bytes remain on
+  disk.
+
+Resolution precedence, highest first: `WithErrorPolicyResolver` →
+`WithErrorPolicy(category, policy)` → connect-string `on_<category>_error` →
+`on_server_error` → spec defaults. `PROTOCOL_VIOLATION` is forced `TERMINAL` and
+`UNKNOWN` is forced `RETRIABLE` (fail open, so a status byte from a newer server
+degrades to retry rather than killing the sender); overrides for those two are
+ignored. Connect-string equivalents take `terminal` / `retriable` /
+`retriable_other` (and `auto` for the global key):
 
 ```text
-ws::addr=localhost:9000;on_server_error=halt;on_schema_error=drop;on_write_error=drop;
+ws::addr=localhost:9000;on_server_error=retriable;on_schema_error=terminal;
 ```
 
 ### Store-and-forward
@@ -450,17 +463,19 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | `sf_max_bytes` | 4 MiB | Per-segment file size. |
 | `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
-| `reconnect_max_duration_millis` | 300000 | Per-outage cap on reconnect retries. |
+| `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as the poison-frame episode budget (`max_frame_rejections`). |
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
 | `initial_connect_retry` | `off` | `off` = terminal on first failure; `on`/`sync` = retry, blocking the constructor; `async` = retry on the I/O goroutine, constructor returns immediately. |
 | `close_flush_timeout_millis` | 5000 | `Close` waits this long for ACKs; `0` / `-1` skips the drain. |
 | `drain_orphans` | `off` | When `on`, scan `<sf_dir>/*` and adopt sibling slots holding unacked data. |
 | `max_background_drainers` | 4 | Cap on concurrent orphan drainers. |
+| `max_frame_rejections` | 4 | Consecutive same-frame rejections (over the episode budget) before the poison-frame detector latches a `TERMINAL`. |
 
 The same options are available programmatically: `WithSfDir`, `WithSenderId`,
 `WithSfMaxBytes`, `WithSfMaxTotalBytes`, `WithReconnectPolicy`,
-`WithInitialConnectRetry`, `WithInitialConnectMode`, `WithCloseFlushTimeout`.
+`WithInitialConnectRetry`, `WithInitialConnectMode`, `WithCloseFlushTimeout`,
+`WithMaxFrameRejections`.
 
 Without `sf_dir`, unacknowledged data lives in process memory and is lost if the
 process dies; the reconnect loop still spans transient outages.

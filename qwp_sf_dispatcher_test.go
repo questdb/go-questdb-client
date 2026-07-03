@@ -470,8 +470,8 @@ func TestQwpSfDispatcherCloseBoundedOnStuckHandler(t *testing.T) {
 	}
 }
 
-// TestQwpSfDispatcherAbandonDropsQueued pins the abandon guard (PR #64 review
-// M2). Once close() times out on a wedged handler it sets abandon; loop() and
+// TestQwpSfDispatcherAbandonDropsQueued pins the abandon guard.
+// Once close() times out on a wedged handler it sets abandon; loop() and
 // drain() must then DROP any item still queued rather than deliver it —
 // otherwise a handler that finally returns re-enters its select, picks a queued
 // error, and fires the user callback after close() (hence Sender.Close) has
@@ -514,4 +514,47 @@ func TestQwpSfDispatcherAbandonDropsQueued(t *testing.T) {
 			t.Errorf("delivered=%d; loop must drop under abandon, not deliver", got)
 		}
 	})
+}
+
+// TestQwpSfDispatcherReentrantCloseCountsAbandonedAsDropped is the
+// qwpSfErrorDispatcher twin of the generic dispatcher's re-entrant-close
+// accounting test: close() from the handler returns before its own leftovers
+// sweep, so drain()'s deadline give-up must count the still-queued items as
+// dropped. Hard invariant: delivered + dropped == offered.
+func TestQwpSfDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
+	const extra = 12
+	var d *qwpSfErrorDispatcher
+	queued := make(chan struct{})
+	var once sync.Once
+	d = newQwpSfErrorDispatcher(func(*SenderError) {
+		once.Do(func() {
+			<-queued
+			d.close() // re-entrant: returns without the close-side sweep
+		})
+		time.Sleep(qwpSfDispatcherDrainTimeout + 20*time.Millisecond)
+	}, extra+4)
+
+	if !d.offer(&SenderError{Category: CategoryParseError, ToFsn: 0}) {
+		t.Fatal("first offer rejected")
+	}
+	for i := 0; i < extra; i++ {
+		if !d.offer(&SenderError{Category: CategoryParseError, ToFsn: int64(i + 1)}) {
+			t.Fatalf("offer %d rejected before close", i)
+		}
+	}
+	close(queued)
+
+	joined := make(chan struct{})
+	go func() { d.wg.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatcher loop never exited after re-entrant close")
+	}
+
+	delivered, dropped := d.totalDelivered(), d.droppedNotifications()
+	if got, want := delivered+dropped, int64(extra+1); got != want {
+		t.Fatalf("delivered(%d) + dropped(%d) = %d, want %d — items abandoned on the "+
+			"re-entrant close path went uncounted", delivered, dropped, got, want)
+	}
 }

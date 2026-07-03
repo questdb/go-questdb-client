@@ -147,6 +147,53 @@ type qwpHostEntry struct {
 	attempted bool
 }
 
+// qwpRoundCursor holds walk-local attempted bits for a background round
+// walk (orphan drainers). Background walkers consult the shared
+// tracker's host classifications (state / zone tier) read-only for
+// prioritization and still record dial outcomes into shared state, but
+// they must not consume the shared round slots nor clear them via
+// BeginRound: sweep exhaustion is load-bearing for terminal decisions
+// (durable-ack mismatch, protocol upgrade rejects), so a walker whose
+// attempted bits were contaminated by a concurrent walker could go
+// terminal without ever dialing a healthy sibling. Owned by a single
+// walk goroutine; not safe for concurrent use.
+type qwpRoundCursor struct {
+	attempted []bool
+}
+
+func newQwpRoundCursor(numHosts int) *qwpRoundCursor {
+	return &qwpRoundCursor{attempted: make([]bool, numHosts)}
+}
+
+// reset clears the cursor's attempted bits — the background walk's
+// round boundary, standing in for the shared tracker's BeginRound.
+func (c *qwpRoundCursor) reset() {
+	for i := range c.attempted {
+		c.attempted[i] = false
+	}
+}
+
+// markAttempted consumes the round slot for idx: the cursor's when the
+// walk is background (cursor non-nil), the shared entry's otherwise.
+// Callers hold t.mu.
+func (c *qwpRoundCursor) markAttempted(idx int, shared *qwpHostEntry) {
+	if c == nil {
+		shared.attempted = true
+		return
+	}
+	c.attempted[idx] = true
+}
+
+// isAttempted reports whether idx's round slot is consumed, from the
+// cursor when non-nil, from the shared entry otherwise. Callers hold
+// t.mu.
+func (c *qwpRoundCursor) isAttempted(idx int, shared *qwpHostEntry) bool {
+	if c == nil {
+		return shared.attempted
+	}
+	return c.attempted[idx]
+}
+
 // qwpHostTracker implements the failover.md §2 host-health model:
 // each configured `addr=` entry carries a `(state, zone_tier)`
 // classification and a per-round `attempted` bit. PickNext returns
@@ -156,7 +203,10 @@ type qwpHostEntry struct {
 // orphan drainers, etc.); per-caller demotion state (e.g. the
 // `previousIdx` slot used to drive RecordMidStreamFailure on the
 // next iteration) lives on the *caller*, not on the tracker. See
-// failover.md §2.3 "Per-caller previousIdx, not shared".
+// failover.md §2.3 "Per-caller previousIdx, not shared". The shared
+// `attempted` round slots belong to foreground walks alone (at most
+// one runs at a time); background walkers bring their own
+// qwpRoundCursor — see its doc for why.
 //
 // All methods are safe for concurrent use; a single internal mutex
 // serializes every operation. The public API is not required to be
@@ -245,6 +295,13 @@ func (t *qwpHostTracker) Len() int {
 // caller is responsible for invoking the appropriate Record* method
 // before the next selection so the same host isn't returned again.
 func (t *qwpHostTracker) PickNext() int {
+	return t.pickNext(nil)
+}
+
+// pickNext is PickNext with an optional round cursor: a non-nil cursor
+// supplies the attempted bits (background walk) while state / zone
+// classifications still come from shared state.
+func (t *qwpHostTracker) pickNext(cursor *qwpRoundCursor) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	best := -1
@@ -252,7 +309,7 @@ func (t *qwpHostTracker) PickNext() int {
 	bestZonePri := 0
 	for i := range t.hosts {
 		h := &t.hosts[i]
-		if h.attempted {
+		if cursor.isAttempted(i, h) {
 			continue
 		}
 		sp := h.state.priority()
@@ -289,13 +346,20 @@ func (t *qwpHostTracker) IsRoundExhausted() bool {
 // silent no-op so callers can pass a stored previousIdx without a
 // defensive bounds check.
 func (t *qwpHostTracker) RecordSuccess(idx int) {
+	t.recordSuccess(idx, nil)
+}
+
+// recordSuccess is RecordSuccess with an optional round cursor: the
+// classification update always lands in shared state, while a non-nil
+// cursor absorbs the attempted bit (background walk).
+func (t *qwpHostTracker) recordSuccess(idx int, cursor *qwpRoundCursor) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if idx < 0 || idx >= len(t.hosts) {
 		return
 	}
 	t.hosts[idx].state = qwpHostHealthy
-	t.hosts[idx].attempted = true
+	cursor.markAttempted(idx, &t.hosts[idx])
 }
 
 // RecordRoleReject classifies a 421 + role response. When
@@ -306,6 +370,12 @@ func (t *qwpHostTracker) RecordSuccess(idx int) {
 // lowest priority until the operator confirms cluster health.
 // Both outcomes consume the round slot.
 func (t *qwpHostTracker) RecordRoleReject(idx int, transient bool) {
+	t.recordRoleReject(idx, transient, nil)
+}
+
+// recordRoleReject is RecordRoleReject with an optional round cursor;
+// see recordSuccess for the split.
+func (t *qwpHostTracker) recordRoleReject(idx int, transient bool, cursor *qwpRoundCursor) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if idx < 0 || idx >= len(t.hosts) {
@@ -316,7 +386,7 @@ func (t *qwpHostTracker) RecordRoleReject(idx int, transient bool) {
 	} else {
 		t.hosts[idx].state = qwpHostTopologyReject
 	}
-	t.hosts[idx].attempted = true
+	cursor.markAttempted(idx, &t.hosts[idx])
 }
 
 // RecordTransportError marks a host as TransportError after a
@@ -324,13 +394,19 @@ func (t *qwpHostTracker) RecordRoleReject(idx int, transient bool) {
 // slot. Mid-stream send/recv failures (after a successful upgrade)
 // go through RecordMidStreamFailure instead.
 func (t *qwpHostTracker) RecordTransportError(idx int) {
+	t.recordTransportError(idx, nil)
+}
+
+// recordTransportError is RecordTransportError with an optional round
+// cursor; see recordSuccess for the split.
+func (t *qwpHostTracker) recordTransportError(idx int, cursor *qwpRoundCursor) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if idx < 0 || idx >= len(t.hosts) {
 		return
 	}
 	t.hosts[idx].state = qwpHostTransportError
-	t.hosts[idx].attempted = true
+	cursor.markAttempted(idx, &t.hosts[idx])
 }
 
 // RecordMidStreamFailure demotes a Healthy host to TransportError

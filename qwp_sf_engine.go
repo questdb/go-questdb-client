@@ -646,7 +646,7 @@ func (e *qwpSfCursorEngine) engineClose() error {
 	// acquires appendMu after us bails before touching the ring;
 	// acquiring it here drains any append currently in flight. Held
 	// across segmentRingClose so the active segment is nil'd + munmapped
-	// with no producer dereferencing it (C3: a SenderErrorHandler's
+	// with no producer dereferencing it (a SenderErrorHandler's
 	// Close() racing a producer parked in engineAppendBlocking's
 	// backpressure spin). appendMu is never held by the manager
 	// goroutine, so joining it under the lock cannot deadlock.

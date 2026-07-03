@@ -249,6 +249,9 @@ func TestErrorApiBuilderOption_ProtocolViolationOverrideIgnored(t *testing.T) {
 		WithAddress(addr),
 		// Try to flip ProtocolViolation to Drop. Should be ignored.
 		WithErrorPolicy(CategoryProtocolViolation, PolicyRetriable),
+		// Tiny poison-episode floor so the repeated-close escalation
+		// lands at the strike threshold, keeping the test fast.
+		WithReconnectPolicy(time.Millisecond, time.Millisecond, 5*time.Millisecond),
 	)
 	require.NoError(t, err)
 	qs := asQwp(t, ls)

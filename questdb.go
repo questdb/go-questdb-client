@@ -33,7 +33,7 @@ import (
 	"time"
 )
 
-// Pool defaults — match the Java QuestDBBuilder defaults.
+// Pool sizing defaults.
 const (
 	qwpDefaultPoolMin             = 1
 	qwpDefaultPoolMax             = 4
@@ -91,45 +91,54 @@ type questDBConfig struct {
 func defaultQuestDBConfig() *questDBConfig { return &questDBConfig{} }
 
 // WithSenderPoolMin sets the warm/minimum ingest pool size (default 1).
+// Equivalent to the sender_pool_min connect-string key; the option wins.
 func WithSenderPoolMin(n int) QuestDBOption {
 	return func(c *questDBConfig) { c.senderPoolMin = n; c.senderPoolMinSet = true }
 }
 
 // WithSenderPoolMax sets the maximum ingest pool size (default 4).
+// Equivalent to the sender_pool_max connect-string key; the option wins.
 func WithSenderPoolMax(n int) QuestDBOption {
 	return func(c *questDBConfig) { c.senderPoolMax = n; c.senderPoolMaxSet = true }
 }
 
 // WithQueryPoolMin sets the warm/minimum query pool size (default 1; 0 with
-// lazy_connect).
+// lazy_connect). Equivalent to the query_pool_min connect-string key; the
+// option wins.
 func WithQueryPoolMin(n int) QuestDBOption {
 	return func(c *questDBConfig) { c.queryPoolMin = n; c.queryPoolMinSet = true }
 }
 
-// WithQueryPoolMax sets the maximum query pool size (default 4).
+// WithQueryPoolMax sets the maximum query pool size (default 4). Equivalent to
+// the query_pool_max connect-string key; the option wins.
 func WithQueryPoolMax(n int) QuestDBOption {
 	return func(c *questDBConfig) { c.queryPoolMax = n; c.queryPoolMaxSet = true }
 }
 
 // WithAcquireTimeout bounds how long BorrowSender/BorrowQuery block when the
-// pool is exhausted (default 5s).
+// pool is exhausted (default 5s; must be positive). Equivalent to the
+// acquire_timeout_ms connect-string key; the option wins.
 func WithAcquireTimeout(d time.Duration) QuestDBOption {
 	return func(c *questDBConfig) { c.acquireTimeout = d; c.acquireTimeoutSet = true }
 }
 
 // WithIdleTimeout sets how long an above-min slot may stay idle before the
-// housekeeper reaps it (default 60s; 0 disables idle reaping).
+// housekeeper reaps it (default 60s; 0 disables idle reaping). Equivalent to
+// the idle_timeout_ms connect-string key; the option wins.
 func WithIdleTimeout(d time.Duration) QuestDBOption {
 	return func(c *questDBConfig) { c.idleTimeout = d; c.idleTimeoutSet = true }
 }
 
 // WithMaxLifetime sets the maximum age of a pooled slot before recycling
-// (default 30m; 0 disables age recycling).
+// (default 30m; 0 disables age recycling). Equivalent to the max_lifetime_ms
+// connect-string key; the option wins.
 func WithMaxLifetime(d time.Duration) QuestDBOption {
 	return func(c *questDBConfig) { c.maxLifetime = d; c.maxLifetimeSet = true }
 }
 
-// WithHousekeeperInterval sets the reaper sweep interval (default 5s).
+// WithHousekeeperInterval sets the reaper sweep interval (default 5s). 0
+// disables the housekeeper entirely — no idle/age reaping runs. Equivalent to
+// the housekeeper_interval_ms connect-string key; the option wins.
 func WithHousekeeperInterval(d time.Duration) QuestDBOption {
 	return func(c *questDBConfig) { c.housekeeperInterval = d; c.housekeeperIntervalSet = true }
 }
@@ -156,12 +165,12 @@ func WithQuestDBConnectionListener(l SenderConnectionListener) QuestDBOption {
 	return func(c *questDBConfig) { c.connectionListener = l }
 }
 
-// WithQuestDBDrainerListener applies a QwpBackgroundDrainerListener to every
-// pooled sender, covering both orphan adoption (drain_orphans) and the pool's
-// crash-stranded-slot recovery senders. Callbacks may fire concurrently from
-// multiple drainers; implementations must be thread-safe (the standalone
+// WithQuestDBBackgroundDrainerListener applies a QwpBackgroundDrainerListener
+// to every pooled sender, covering both orphan adoption (drain_orphans) and the
+// pool's crash-stranded-slot recovery senders. Callbacks may fire concurrently
+// from multiple drainers; implementations must be thread-safe (the standalone
 // WithBackgroundDrainerListener contract).
-func WithQuestDBDrainerListener(l QwpBackgroundDrainerListener) QuestDBOption {
+func WithQuestDBBackgroundDrainerListener(l QwpBackgroundDrainerListener) QuestDBOption {
 	return func(c *questDBConfig) { c.drainerListener = l }
 }
 
@@ -225,25 +234,23 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	kv := cs.KeyValuePairs
 
 	// Validate the single cluster config through both parsers up front, so a
-	// malformed string fails here even when a pool min is 0 and nothing connects.
+	// malformed string fails here even when a pool min is 0 and nothing
+	// connects. sanitizeQwpConf adds the cross-field checks newLineSender runs
+	// (e.g. auto_flush_bytes > sf_max_bytes); its normalizations are harmless
+	// here — senderConf is only read below, the pools re-parse the string per
+	// slot.
 	senderConf, err := confFromStr(conf)
 	if err != nil {
 		return nil, err
 	}
-	// confFromStr validates individual keys but not the cross-field checks
-	// newLineSender runs via sanitizeQwpConf; apply them on a throwaway parse so
-	// an invalid ingest config (e.g. auto_flush_bytes > sf_max_bytes) is rejected
-	// here even when a pool min is 0 and no slot connects at build.
-	if probe, perr := confFromStr(conf); perr != nil {
-		return nil, perr
-	} else if serr := sanitizeQwpConf(probe); serr != nil {
+	if serr := sanitizeQwpConf(senderConf); serr != nil {
 		return nil, serr
 	}
 	if _, err := parseQwpQueryConf(conf); err != nil {
 		return nil, err
 	}
 
-	// Resolve lazy_connect (Java parity): tolerate a down server at startup
+	// Resolve lazy_connect: tolerate a down server at startup
 	// without disabling reads. Explicit option wins over the connect-string key,
 	// but the key is still validated so a typo never rides silently.
 	lazyConnect, err := poolBool(kv, "lazy_connect", false)
@@ -285,6 +292,12 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	acquire, err := resolvePoolDur(cfg.acquireTimeoutSet, cfg.acquireTimeout, kv, "acquire_timeout_ms", qwpDefaultAcquireTimeout)
 	if err != nil {
 		return nil, err
+	}
+	if acquire <= 0 {
+		// Both pools derive the creation-path dial deadline from it, so 0 would
+		// pre-expire every borrow that has to build a slot (under lazy_connect
+		// the read pool would never connect at all).
+		return nil, fmt.Errorf("acquire_timeout_ms must be positive, got %d", acquire/time.Millisecond)
 	}
 	idle, err := resolvePoolDur(cfg.idleTimeoutSet, cfg.idleTimeout, kv, "idle_timeout_ms", qwpDefaultIdleTimeout)
 	if err != nil {
@@ -337,7 +350,7 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 }
 
 // validateLazyConnect rejects the two configurations that contradict
-// lazy_connect's non-blocking startup, mirroring Java's resolveLazyConnect.
+// lazy_connect's non-blocking startup.
 func validateLazyConnect(kv map[string]string, cfg *questDBConfig) error {
 	if mode, ok := kv["initial_connect_retry"]; ok && !strings.EqualFold(mode, "async") {
 		return fmt.Errorf("conflicting configuration: lazy_connect=true needs a non-blocking startup, "+

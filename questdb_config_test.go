@@ -85,6 +85,49 @@ func TestQuestDBPoolConfigPrecedence(t *testing.T) {
 	db.Close(ctx)
 }
 
+// TestQuestDBRejectsZeroAcquireTimeout pins the acquire_timeout_ms > 0
+// contract: both pools derive the creation-path dial deadline from it, so an
+// explicit 0 would pre-expire every slot-building borrow (and under
+// lazy_connect leave the read pool permanently unusable).
+func TestQuestDBRejectsZeroAcquireTimeout(t *testing.T) {
+	ctx := context.Background()
+	_, err := NewQuestDB(ctx, "ws::addr=127.0.0.1:1;lazy_connect=true;acquire_timeout_ms=0;",
+		noopConnListener())
+	if err == nil || !strings.Contains(err.Error(), "acquire_timeout_ms must be positive") {
+		t.Errorf("acquire_timeout_ms=0: err=%v, want positive-value rejection", err)
+	}
+	_, err = NewQuestDB(ctx, "ws::addr=127.0.0.1:1;lazy_connect=true;",
+		noopConnListener(), WithAcquireTimeout(0))
+	if err == nil || !strings.Contains(err.Error(), "acquire_timeout_ms must be positive") {
+		t.Errorf("WithAcquireTimeout(0): err=%v, want positive-value rejection", err)
+	}
+}
+
+// TestQuestDBHousekeeperIntervalZeroDisables pins housekeeper_interval_ms=0 =
+// disabled: no reaper goroutine starts and Close does not sleep out the join
+// budget waiting for one.
+func TestQuestDBHousekeeperIntervalZeroDisables(t *testing.T) {
+	ctx := context.Background()
+	db, err := NewQuestDB(ctx, "ws::addr=127.0.0.1:1;lazy_connect=true;housekeeper_interval_ms=0;",
+		noopConnListener())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if db.housekeeper.interval != 0 {
+		t.Errorf("interval=%v, want 0 (disabled)", db.housekeeper.interval)
+	}
+	if db.housekeeper.started.Load() {
+		t.Error("disabled housekeeper started its goroutine")
+	}
+	begin := time.Now()
+	if err := db.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if elapsed := time.Since(begin); elapsed > 3*time.Second {
+		t.Errorf("Close took %v; a disabled housekeeper must not consume the join budget", elapsed)
+	}
+}
+
 func TestResolvePoolErrors(t *testing.T) {
 	if _, err := resolvePoolInt(false, 0, map[string]string{"x": "abc"}, "x", 4); err == nil {
 		t.Error("non-int connect-string value should error")

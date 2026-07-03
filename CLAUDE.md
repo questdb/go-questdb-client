@@ -170,12 +170,13 @@ Durable-ack (`request_durable_ack` / `WithRequestDurableAck`, QWP-only) shifts t
 trim/replay/await watermark from the WAL-commit OK ACK to the server's
 `STATUS_DURABLE_ACK` (object-storage upload), so under it `AckedFsn` /
 `AwaitAckedFsn` / `Close`-drain confirm **durability**, not just commit. The trim
-state machine is `qwpDurableTracker` (`qwp_sf_durable.go`); the send loop stashes
-each OK ack and releases it only once covering durable frames arrive (all
-receiver-goroutine-owned). A dropped/coalesced OK-ack sequence HALTs fail-closed
-(`durableRejectionSeqGap` / `durableOnOk`), and connecting to a non-durable
-endpoint fails with a `PROTOCOL_VIOLATION` `*QwpDurableAckMismatchError` rather
-than silently falling back. An idle `durable_ack_keepalive_interval_millis` ping
+state machine is `qwpDurableTracker` (`qwp_sf_durable.go`, mutex-guarded so the
+receiver and the send-side last-frame re-drive can both touch it); the send loop
+stashes each OK ack and releases it only once covering durable frames arrive. A
+dropped/coalesced OK-ack sequence HALTs fail-closed (`qwpDurableTracker.seqGap` /
+`durableOnOk`), and connecting to a non-durable endpoint fails with a
+`PROTOCOL_VIOLATION` `*QwpDurableAckMismatchError` rather than silently falling
+back. An idle `durable_ack_keepalive_interval_millis` ping
 re-elicits pending durable frames; design: `design/qwp-cursor-durability.md`.
 
 Orphan-slot adoption (SF mode, `drain_orphans=on`) is implemented in

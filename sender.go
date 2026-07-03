@@ -347,8 +347,8 @@ type lineSenderConfig struct {
 	target        QwpTargetFilter // QWP-only; zero value = QwpTargetAny
 
 	// connectTimeoutMs bounds the TCP connect (ms). COMMON key: parsed on
-	// every schema for Java connect-string parity, but wired only on HTTP and
-	// QWP — the TCP ILP dial leaves it inert, matching the Java client. 0 keeps
+	// every schema for connect-string portability, but wired only on HTTP and
+	// QWP — the TCP ILP dial leaves it inert. 0 keeps
 	// the OS connect timeout.
 	connectTimeoutMs int
 
@@ -503,10 +503,17 @@ func WithInFlightWindow(window int) LineSenderOption {
 // negative means "fast close".
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		if d >= time.Millisecond {
-			s.closeFlushTimeoutSet = true
-			s.closeFlushTimeoutMillis = int(d / time.Millisecond)
+		if d <= 0 {
+			return
 		}
+		ms := int(d / time.Millisecond)
+		// A positive sub-millisecond duration must not truncate to the
+		// "no override" case — floor it to 1ms, like WithConnectTimeout.
+		if ms == 0 {
+			ms = 1
+		}
+		s.closeFlushTimeoutSet = true
+		s.closeFlushTimeoutMillis = ms
 	}
 }
 
@@ -518,11 +525,12 @@ func WithCloseTimeout(d time.Duration) LineSenderOption {
 // QwpSender.DroppedErrorNotifications()).
 //
 // Passing nil reverts to the default loud-not-silent handler that
-// logs ERROR for HALT and WARN for DROP.
+// logs ERROR for a terminal rejection and WARN for a retriable one
+// (informational: the batch is replayed after the connection recycles).
 //
 // The handler may call Close() or Flush() on the sender (e.g. to shut
-// down on a HALT) without deadlocking — see SenderErrorHandler for the
-// re-entrancy contract.
+// down on a terminal rejection) without deadlocking — see
+// SenderErrorHandler for the re-entrancy contract.
 //
 // Only available for the QWP sender.
 func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
@@ -583,18 +591,20 @@ func WithConnectionListenerInboxCapacity(capacity int) LineSenderOption {
 // registered via WithErrorPolicyResolver still wins over both.
 //
 // PolicyAuto removes any prior override (falls through to next
-// layer). CategoryProtocolViolation and CategoryUnknown are always
-// HALT: an override for either is ignored and not recorded, matching
-// the connect-string form, which has no on_protocol_violation_error /
-// on_unknown_error key and rejects those outright.
+// layer). CategoryProtocolViolation is forced TERMINAL and
+// CategoryUnknown is forced RETRIABLE (fail open): an override for
+// either is ignored and not recorded, matching the connect-string
+// form, which has no on_protocol_violation_error / on_unknown_error
+// key and rejects those outright.
 //
 // Only available for the QWP sender.
 func WithErrorPolicy(c Category, p Policy) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		// PROTOCOL_VIOLATION and UNKNOWN are never user-configurable.
 		// Refusing the override here keeps the per-category slot from
-		// ever holding a latent non-HALT policy, so the forced HALT does
-		// not depend on resolve() checking these two categories first.
+		// ever holding a latent contrary policy, so the forced TERMINAL /
+		// forced RETRIABLE does not depend on resolve() checking these
+		// two categories first.
 		if int(c) >= len(s.errorPolicyPerCat) ||
 			c == CategoryProtocolViolation || c == CategoryUnknown {
 			return
@@ -615,8 +625,8 @@ func WithErrorPolicy(c Category, p Policy) LineSenderOption {
 // Returning PolicyAuto from the resolver falls through to the next
 // layer (per-category map, then global, then spec default).
 //
-// CategoryProtocolViolation and CategoryUnknown are forced HALT and
-// bypass the resolver entirely.
+// CategoryProtocolViolation (forced TERMINAL) and CategoryUnknown
+// (forced RETRIABLE, fail open) bypass the resolver entirely.
 //
 // Only available for the QWP sender.
 func WithErrorPolicyResolver(r func(Category) Policy) LineSenderOption {
@@ -973,8 +983,9 @@ func WithMaxBackgroundDrainers(n int) LineSenderOption {
 // policy (connect-string on_server_error) → spec defaults.
 //
 // PolicyAuto (the zero value) leaves the global layer unset, falling
-// through to the spec defaults. CategoryProtocolViolation and
-// CategoryUnknown are always HALT regardless of this setting.
+// through to the spec defaults. CategoryProtocolViolation stays forced
+// TERMINAL and CategoryUnknown forced RETRIABLE (fail open) regardless
+// of this setting.
 //
 // Only available for the QWP sender.
 func WithServerErrorPolicy(p Policy) LineSenderOption {
@@ -1471,8 +1482,7 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	// *first* connect attempt. reconnect_max_duration_millis bounds
 	// ONLY that sync initial connect (a running sender retries
 	// indefinitely, Invariant B), so without the promotion the knob
-	// would be silently inert. Mirrors the Java client's
-	// actualInitialConnectMode resolution in Sender.java.
+	// would be silently inert.
 	//
 	// An explicit user choice (any value of initial_connect_retry, or
 	// either of the With* setters) wins unconditionally — including
@@ -1596,6 +1606,15 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	return nil
 }
 
+// drainerListenerConfigured reports whether any QwpBackgroundDrainerListener
+// callback is set. Must cover every field of the struct so a new callback
+// cannot slip past rejectQwpOnlyOptions unnoticed.
+func drainerListenerConfigured(l QwpBackgroundDrainerListener) bool {
+	return l.OnDurableAckUnavailable != nil ||
+		l.OnDurableAckPersistentFailure != nil ||
+		l.OnPrimaryUnavailable != nil
+}
+
 // rejectQwpOnlyOptions surfaces an error when a QWP-only option was
 // set on a non-QWP sender. The connect-string parser already rejects
 // each of these keys on non-ws/wss schemas; this mirrors the gate
@@ -1635,8 +1654,7 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "durable_ack_keepalive_interval_millis"
 	case conf.progressHandler != nil:
 		name = "progress handler"
-	case conf.backgroundDrainerListener.OnDurableAckUnavailable != nil ||
-		conf.backgroundDrainerListener.OnDurableAckPersistentFailure != nil:
+	case drainerListenerConfigured(conf.backgroundDrainerListener):
 		name = "background drainer listener"
 	case conf.reconnectMaxDurationMillisSet,
 		conf.reconnectInitialBackoffMillisSet,

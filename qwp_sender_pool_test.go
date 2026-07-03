@@ -118,6 +118,127 @@ func newQwpSenderPoolForTest(t *testing.T, extra string, min, max int) *qwpSende
 	return p
 }
 
+// TestQwpPooledSenderForwardsEveryColumnType pins the pooled lease forwarding
+// table: every LineSender + QwpSender column method must reach the delegate
+// with the right arguments, and every accessor must delegate too. It builds the
+// identical row through a pooled lease and a standalone sender of identical
+// config and asserts byte-for-byte identical buffer state — a forwarder that
+// called the wrong delegate method, or dropped the call, would change the
+// encoded width or the pending-row count.
+func TestQwpPooledSenderForwardsEveryColumnType(t *testing.T) {
+	ctx := context.Background()
+	pool := newQwpSenderPoolForTest(t, "", 1, 1)
+	lease, err := pool.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer lease.Close(ctx)
+	qs, ok := lease.(QwpSender)
+	if !ok {
+		t.Fatal("pooled lease does not satisfy QwpSender")
+	}
+
+	// Reference sender built through the same connect-string form the pool
+	// uses, so its config (protocol version, gorilla, etc.) — and therefore
+	// its encoding — is identical.
+	refSrv := newQwpTestServer(t)
+	defer refSrv.Close()
+	refLS, err := LineSenderFromConf(ctx, "ws::addr="+strings.TrimPrefix(refSrv.URL, "http://")+";")
+	if err != nil {
+		t.Fatalf("build reference sender: %v", err)
+	}
+	defer refLS.Close(ctx)
+	ref := refLS.(QwpSender)
+
+	ts := time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)
+	dec := NewDecimalFromInt64(12345, 2)
+	// The QwpSender-only setters return QwpSender while the LineSender setters
+	// return LineSender, so a single chain would narrow the type; drive each
+	// through the latch as a separate statement instead.
+	buildRow := func(s QwpSender) error {
+		s.Table("types")
+		s.Symbol("sym", "v")
+		s.Int64Column("i64", 42)
+		s.Float64Column("f64", 3.14)
+		s.StringColumn("str", "hello")
+		s.BoolColumn("b", true)
+		s.TimestampColumn("ts", ts)
+		s.ByteColumn("i8", -7)
+		s.ShortColumn("i16", 300)
+		s.Int32Column("i32", 70000)
+		s.Float32Column("f32", 1.5)
+		s.CharColumn("ch", 'Z')
+		s.DateColumn("date", ts)
+		s.TimestampNanosColumn("tsn", ts)
+		s.UuidColumn("uuid", 0x1122, 0x3344)
+		s.GeohashColumn("geo", 0xABC, 12)
+		s.Float64Array1DColumn("fa1", []float64{1, 2})
+		s.Int64Array1DColumn("ia1", []int64{3, 4})
+		s.Int64Array2DColumn("ia2", [][]int64{{5}, {6}})
+		s.Int64Array3DColumn("ia3", [][][]int64{{{7}}})
+		s.Decimal64Column("d64", dec)
+		s.Decimal128Column("d128", dec)
+		s.Decimal256Column("d256", dec)
+		return s.AtNano(ctx, ts)
+	}
+	if err := buildRow(qs); err != nil {
+		t.Fatalf("build row via pooled lease: %v", err)
+	}
+	if err := buildRow(ref); err != nil {
+		t.Fatalf("build row via reference sender: %v", err)
+	}
+
+	if got, want := MsgCount(lease), MsgCount(refLS); got != want || got != 1 {
+		t.Fatalf("MsgCount lease=%d ref=%d, want both 1", got, want)
+	}
+	if got, want := BufLen(lease), BufLen(refLS); got != want || got == 0 {
+		t.Fatalf("BufLen lease=%d ref=%d — a forwarder reached the wrong delegate method or dropped a column", got, want)
+	}
+
+	// End-to-end: the whole typed row round-trips through the pooled lease.
+	seq, err := qs.FlushAndGetSequence(ctx)
+	if err != nil {
+		t.Fatalf("FlushAndGetSequence: %v", err)
+	}
+	if err := qs.AwaitAckedFsn(ctx, seq); err != nil {
+		t.Fatalf("AwaitAckedFsn: %v", err)
+	}
+
+	// Accessor forwarders must reach the delegate and report a clean sender.
+	if e := qs.LastTerminalError(); e != nil {
+		t.Errorf("LastTerminalError = %v, want nil", e)
+	}
+	if n := qs.TotalServerErrors(); n != 0 {
+		t.Errorf("TotalServerErrors = %d, want 0", n)
+	}
+	if n := qs.DroppedErrorNotifications(); n != 0 {
+		t.Errorf("DroppedErrorNotifications = %d, want 0", n)
+	}
+	if n := qs.DroppedConnectionNotifications(); n != 0 {
+		t.Errorf("DroppedConnectionNotifications = %d, want 0", n)
+	}
+	if n := qs.TotalDurableAcks(); n != 0 {
+		t.Errorf("TotalDurableAcks = %d, want 0", n)
+	}
+	if n := qs.TotalDurableTrimAdvances(); n != 0 {
+		t.Errorf("TotalDurableTrimAdvances = %d, want 0", n)
+	}
+	if n := qs.TotalBackpressureStalls(); n != 0 {
+		t.Errorf("TotalBackpressureStalls = %d, want 0", n)
+	}
+	if d := qs.BackgroundDrainers(); d != nil {
+		t.Errorf("BackgroundDrainers = %v, want nil (no sf_dir)", d)
+	}
+	if fsn := qs.AckedFsn(); fsn < seq {
+		t.Errorf("AckedFsn = %d, want >= %d", fsn, seq)
+	}
+	// These have no deterministic value but must not panic on a lease.
+	_ = qs.TotalErrorNotificationsDelivered()
+	_ = qs.TotalReconnectAttempts()
+	_ = qs.TotalReconnectsSucceeded()
+	_ = qs.TotalFramesReplayed()
+}
+
 func TestQwpSenderPoolBorrowReuse(t *testing.T) {
 	p := newQwpSenderPoolForTest(t, "", 1, 4)
 	if total, _, _ := p.poolSnapshot(); total != 1 {
@@ -231,7 +352,7 @@ func TestQwpSenderPoolStaleLeaseCannotCorruptReborrow(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolReturnMidRowLeavesCleanSlot is the C1 regression: a
+// TestQwpSenderPoolReturnMidRowLeavesCleanSlot is the regression: a
 // lease returned with an in-progress row (Table/Symbol/*Column but no
 // finalizing At/AtNow) must not poison the next borrower. Routing the
 // return through Flush early-returned errFlushWithPendingMessage without
@@ -272,7 +393,7 @@ func TestQwpSenderPoolReturnMidRowLeavesCleanSlot(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolReturnLatchedErrorFlushesCommittedRow is the C1
+// TestQwpSenderPoolReturnLatchedErrorFlushesCommittedRow is the
 // regression for the committed-row-plus-latch variant: a lease closed
 // after committing a row AND then latching a fluent-API error (e.g. an
 // illegal column name on untrusted input) must still flush the committed
@@ -331,7 +452,7 @@ func TestQwpSenderPoolReturnLatchedErrorFlushesCommittedRow(t *testing.T) {
 }
 
 // TestQwpLineSenderFlushForReturnRetainsRowsOnEnqueueFailure is the unit half of
-// the C1 backpressure fix: when flushForReturn cannot enqueue the committed rows,
+// the backpressure fix: when flushForReturn cannot enqueue the committed rows,
 // it must report retained=true and keep the rows buffered — never silently drop
 // them nor claim a clean return. A cancelled ctx makes engineAppendBlocking
 // return ctx.Err() before sealing the frame, exactly as a saturated ring whose
@@ -364,8 +485,8 @@ func TestQwpLineSenderFlushForReturnRetainsRowsOnEnqueueFailure(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot is the C1 end-to-end
-// regression the reviewer flagged as uncovered. A lease returned while the cursor
+// TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot is the end-to-end
+// regression for the backpressure discard path. A lease returned while the cursor
 // ring is saturated and the wire cannot drain (an outage) cannot flush its
 // committed rows on return: flushForReturn hits the backpressure append deadline
 // and RETAINS them. A backpressure timeout is not a terminal HALT, so
@@ -449,7 +570,7 @@ func TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot(t *testing.T) {
 		t.Fatal("Close did not surface the backpressure error")
 	}
 	if !ps.broken {
-		t.Fatal("dirty slot (rows retained on backpressure) was NOT marked broken — it would be recycled carrying borrower A's rows (C1)")
+		t.Fatal("dirty slot (rows retained on backpressure) was NOT marked broken — it would be recycled carrying borrower A's rows")
 	}
 	if total, _, leaked := p.poolSnapshot(); total != 0 || leaked != 0 {
 		t.Fatalf("dirty slot not discarded: total=%d leaked=%d, want 0/0", total, leaked)
@@ -632,7 +753,7 @@ func TestQwpSenderPoolPrewarmFailure(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolBenignErrorDoesNotBreakSlot covers M4: a benign fluent-API
+// TestQwpSenderPoolBenignErrorDoesNotBreakSlot covers the benign-error path: a benign fluent-API
 // validation latch (illegal table name) must NOT mark the slot broken. The
 // underlying connection is healthy, so the borrower recovers on the same slot
 // and the slot is recycled on return rather than torn down — discarding it would
@@ -668,7 +789,7 @@ func TestQwpSenderPoolBenignErrorDoesNotBreakSlot(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolDiscardsBackgroundHaltedSlot covers M1: a slot whose
+// TestQwpSenderPoolDiscardsBackgroundHaltedSlot covers the background-HALT path: a slot whose
 // background send loop terminally HALTs while it sits idle in the pool must not
 // be handed to the next borrower. borrow discards it and builds a fresh slot, so
 // borrower isolation holds even during incident recovery.
@@ -716,7 +837,7 @@ func TestQwpSenderPoolDiscardsBackgroundHaltedSlot(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolReapsBackgroundHaltedSlot covers M1's reapIdle arm: a slot
+// TestQwpSenderPoolReapsBackgroundHaltedSlot covers the reapIdle arm: a slot
 // poisoned by a background HALT is reaped even when the pool is at minSize, so
 // the housekeeper clears poisoned slots proactively rather than leaving every
 // borrow to discard one.
@@ -784,11 +905,11 @@ func TestQwpSenderPoolFlushSurfacesLatchedError(t *testing.T) {
 	s.Table("bad\tname").Int64Column("v", 1)
 	// The latched fluent-API validation error must surface on the next Flush.
 	// A require.Error-style guard (not t.Skip) so a validation regression fails
-	// loudly instead of silently skipping (M8).
+	// loudly instead of silently skipping.
 	if err := s.Flush(ctx); err == nil {
 		t.Fatal("Flush did not surface the latched illegal-table-name error")
 	}
-	// The benign latch must not have poisoned the slot (M4).
+	// The benign latch must not have poisoned the slot.
 	if s.(*qwpPooledSender).broken {
 		t.Error("a surfaced validation latch marked the slot broken")
 	}
@@ -798,7 +919,7 @@ func TestQwpSenderPoolFlushSurfacesLatchedError(t *testing.T) {
 // the giveBack-broken path: a lease broken by a genuine terminal HALT has its
 // on-disk slot index reclaimed (not leaked) and reused. The break must be a real
 // terminal error now that a benign validation latch no longer marks the slot
-// broken (M4).
+// broken.
 func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 	srv, poison := poisonFirstConnQwpServer(t)
 	t.Cleanup(srv.Close)
@@ -838,7 +959,52 @@ func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 	_ = s2.Close(ctx)
 }
 
-// TestQwpSenderPoolCloseNeverTearsDownBorrowedDelegate pins C1: close()
+// TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting pins the SF slot
+// accounting on the lease-returned-after-close path: reclaimSlotLocked's
+// closingSlots decrement must be matched by an increment when giveBack's
+// closed branch takes the teardown, or closingSlots goes negative and
+// capUsedLocked undercounts forever after.
+func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + t.TempDir() + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 2,
+		100*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+
+	ctx := context.Background()
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	// Close with the lease outstanding: close() leaves the borrowed slot for
+	// giveBack (bounded 100ms wait), which then runs the teardown itself.
+	if err := p.close(ctx); err != nil {
+		t.Fatalf("pool close: %v", err)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("lease close: %v", err)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closingSlots != 0 {
+		t.Errorf("closingSlots=%d after the lease-return teardown, want 0", p.closingSlots)
+	}
+	if p.pendingLeaseTeardowns != 0 {
+		t.Errorf("pendingLeaseTeardowns=%d, want 0", p.pendingLeaseTeardowns)
+	}
+	for i, used := range p.slotInUse {
+		if used {
+			t.Errorf("slotInUse[%d] still reserved after teardown", i)
+		}
+	}
+}
+
+// TestQwpSenderPoolCloseNeverTearsDownBorrowedDelegate pins the invariant: close()
 // must not close the delegate of a borrowed slot — a producer goroutine
 // may be inside it. close() waits boundedly (acquire timeout, capped),
 // leaks the lease with a log line, and the delegate stays fully usable
@@ -902,7 +1068,7 @@ func TestQwpSenderPoolCloseNeverTearsDownBorrowedDelegate(t *testing.T) {
 }
 
 // TestQwpSenderPoolCloseUnblocksWhenLeaseReturns pins the graceful half
-// of the C1 protocol: a lease returned while close() is waiting lets
+// of the lease-return protocol: a lease returned while close() is waiting lets
 // close() finish well before the wait budget, with the delegate torn
 // down by the returning goroutine (tracked, so close() does not return
 // mid-teardown).

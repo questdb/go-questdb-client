@@ -159,6 +159,8 @@ func qwpStatusName(status QwpStatusCode) string {
 		return "SECURITY_ERROR"
 	case QwpStatusWriteError:
 		return "WRITE_ERROR"
+	case QwpStatusNotWritable:
+		return "NOT_WRITABLE"
 	case qwpStatusCancelled:
 		return "CANCELLED"
 	case qwpStatusLimitExceeded:

@@ -455,8 +455,8 @@ func TestFirstCloseErrPrecedence(t *testing.T) {
 }
 
 // TestQuestDBDrainerListenerAppliedToPooledSenders pins the facade half of the
-// drainer-listener surface: WithQuestDBDrainerListener reaches the orphan
-// drainers spawned by pooled senders. A durable-ack config against a
+// drainer-listener surface: WithQuestDBBackgroundDrainerListener reaches the
+// orphan drainers spawned by pooled senders. A durable-ack config against a
 // non-durable-advertising endpoint makes the adopted orphan's drainer fire
 // OnDurableAckUnavailable through the facade-registered listener.
 func TestQuestDBDrainerListenerAppliedToPooledSenders(t *testing.T) {
@@ -484,7 +484,7 @@ func TestQuestDBDrainerListenerAppliedToPooledSenders(t *testing.T) {
 	db, err := NewQuestDB(ctx,
 		"ws::addr="+addr+";sf_dir="+sfDir+";sender_id=pool;"+
 			"drain_orphans=on;request_durable_ack=on;lazy_connect=true;",
-		WithQuestDBDrainerListener(QwpBackgroundDrainerListener{
+		WithQuestDBBackgroundDrainerListener(QwpBackgroundDrainerListener{
 			OnDurableAckUnavailable: func(_ string, attempt int) {
 				select {
 				case fired <- attempt:

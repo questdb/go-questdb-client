@@ -34,7 +34,7 @@ import (
 // TestQwpIntegrationFacadeRoundTrip drives the QuestDB facade against a real
 // server: borrow a sender, write rows, then borrow a query session and read
 // them back — proving the facade wires both pools to one cluster config.
-// TestQwpIntegration* so the qwp-fuzz.yml server-bound -run filters select it (M3).
+// TestQwpIntegration* so the qwp-fuzz.yml server-bound -run filters select it.
 func TestQwpIntegrationFacadeRoundTrip(t *testing.T) {
 	qwpEnsureServer(t)
 	ctx := context.Background()

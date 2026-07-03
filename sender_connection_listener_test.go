@@ -26,9 +26,11 @@ package questdb
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -429,6 +431,181 @@ func TestConnectionListenerAsyncConnect(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("async connect never fired CONNECTED")
+	}
+}
+
+// TestConnectionListenerFlushCloseFromCallbackSkipsProducerState pins the
+// dispatcher-goroutine guard on the connection-listener path: Flush() and
+// Close() invoked from inside a listener run on the listener's dispatcher
+// goroutine and must not touch producer-staged rows — the same producer-state contract
+// TestQwpSenderCloseFromErrorHandlerSkipsProducerState pins for the error
+// handler. Pre-fix the guard matched only the error dispatcher, so a
+// listener-side Flush flushed the staged rows from the wrong goroutine.
+func TestConnectionListenerFlushCloseFromCallbackSkipsProducerState(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	s, engine, loop, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+
+	ctx := context.Background()
+	producerReady := make(chan struct{})
+	listenerDone := make(chan struct{})
+	var once sync.Once
+	loop.sendLoopSetConnectionListener(func(SenderConnectionEvent) {
+		once.Do(func() {
+			<-producerReady
+			_, _ = s.FlushAndGetSequence(ctx)
+			_ = s.Close(ctx)
+			close(listenerDone)
+		})
+	}, 16)
+
+	// Stage rows the listener-side Flush/Close must not publish.
+	if err := s.Table("t").Int64Column("v", 1).AtNow(ctx); err != nil {
+		t.Fatalf("AtNow: %v", err)
+	}
+	if err := s.Table("t").Int64Column("v", 2).AtNow(ctx); err != nil {
+		t.Fatalf("AtNow: %v", err)
+	}
+	if s.pendingRowCount != 2 {
+		t.Fatalf("staged pendingRowCount=%d, want 2", s.pendingRowCount)
+	}
+	fsnBefore := engine.enginePublishedFsn()
+
+	loop.sendLoopConnDispatcher().offer(&SenderConnectionEvent{Kind: SenderDisconnected})
+	close(producerReady)
+
+	select {
+	case <-listenerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener never ran Flush()+Close()")
+	}
+	if s.pendingRowCount != 2 {
+		t.Errorf("listener-side Flush()/Close() flushed producer rows: pendingRowCount=%d, want 2",
+			s.pendingRowCount)
+	}
+	if got := engine.enginePublishedFsn(); got != fsnBefore {
+		t.Errorf("listener-side Flush()/Close() published staged rows: fsn %d -> %d", fsnBefore, got)
+	}
+}
+
+// TestConnectionListenerCloseFromCallbackConcurrentProducer is the -race
+// companion: a listener-invoked Close() runs concurrently with a producer
+// goroutine still building rows. Pre-fix the re-entrancy guard matched only
+// the error dispatcher, so this Close touched producer state from the
+// connection dispatcher goroutine — a data race up to Go's fatal
+// concurrent-map error.
+func TestConnectionListenerCloseFromCallbackConcurrentProducer(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 1)
+	defer cleanup()
+
+	closed := make(chan struct{})
+	var once sync.Once
+	loop.sendLoopSetConnectionListener(func(SenderConnectionEvent) {
+		once.Do(func() {
+			_ = s.Close(context.Background())
+			close(closed)
+		})
+	}, 16)
+
+	var prodPanic atomic.Value
+	prodDone := make(chan struct{})
+	go func() {
+		defer close(prodDone)
+		defer func() {
+			if r := recover(); r != nil {
+				prodPanic.Store(fmt.Sprintf("%v", r))
+			}
+		}()
+		ctx := context.Background()
+		for i := 0; i < 100000; i++ {
+			// A fresh table per row keeps the tableBuffers map churning,
+			// maximizing overlap with a producer-state-touching close.
+			if err := s.Table(fmt.Sprintf("t%d", i)).Int64Column("v", int64(i)).AtNow(ctx); err != nil {
+				return // closed-sender or terminal error: producer stops cleanly
+			}
+		}
+	}()
+
+	loop.sendLoopConnDispatcher().offer(&SenderConnectionEvent{Kind: SenderDisconnected})
+
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("listener never fired / Close() never returned")
+	}
+	select {
+	case <-prodDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("producer goroutine did not stop after Close()")
+	}
+	if p := prodPanic.Load(); p != nil {
+		t.Fatalf("producer crashed racing a listener-invoked Close(): %v", p)
+	}
+}
+
+// TestConnectionListenerFlushFromCallbackConcurrentProducer mirrors the Close
+// variant for Flush: a listener hammering Flush() on the dispatcher goroutine
+// must only surface latched errors, never racing the concurrent producer's
+// staged rows.
+func TestConnectionListenerFlushFromCallbackConcurrentProducer(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 1)
+	defer cleanup()
+
+	flushed := make(chan struct{})
+	var once sync.Once
+	loop.sendLoopSetConnectionListener(func(SenderConnectionEvent) {
+		once.Do(func() {
+			for i := 0; i < 100; i++ {
+				_ = s.Flush(context.Background())
+			}
+			close(flushed)
+		})
+	}, 16)
+
+	var prodPanic atomic.Value
+	prodDone := make(chan struct{})
+	go func() {
+		defer close(prodDone)
+		defer func() {
+			if r := recover(); r != nil {
+				prodPanic.Store(fmt.Sprintf("%v", r))
+			}
+		}()
+		ctx := context.Background()
+		for i := 0; ; i++ {
+			select {
+			case <-flushed:
+				return
+			default:
+			}
+			if err := s.Table(fmt.Sprintf("t%d", i%64)).Int64Column("v", int64(i)).AtNow(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
+	loop.sendLoopConnDispatcher().offer(&SenderConnectionEvent{Kind: SenderDisconnected})
+
+	select {
+	case <-flushed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("listener never finished its Flush() loop")
+	}
+	select {
+	case <-prodDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("producer goroutine did not stop")
+	}
+	if p := prodPanic.Load(); p != nil {
+		t.Fatalf("producer crashed racing listener-invoked Flush(): %v", p)
 	}
 }
 

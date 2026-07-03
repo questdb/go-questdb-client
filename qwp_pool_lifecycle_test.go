@@ -94,7 +94,7 @@ func TestQwpSenderPoolAcquireWaitWakesOnGiveBack(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolSparesUnackedSlot pins M1: an idle memory-mode slot that
+// TestQwpSenderPoolSparesUnackedSlot pins the invariant: an idle memory-mode slot that
 // still holds published-but-unacked rows is not reaped (which would destroy
 // them), even past idle_timeout, so the reconnect/replay window can deliver them.
 func TestQwpSenderPoolSparesUnackedSlot(t *testing.T) {
@@ -259,7 +259,7 @@ func TestQwpSenderPoolSfStrandedSlotRecovered(t *testing.T) {
 
 // TestQwpSenderPoolBrokenSlotDiscarded pins the broken-slot path: a lease broken
 // by a genuine terminal HALT is discarded on Close, not recycled. A benign
-// validation latch no longer breaks the slot (M4), so the break is driven by a
+// validation latch no longer breaks the slot, so the break is driven by a
 // real protocol-violation close here.
 func TestQwpSenderPoolBrokenSlotDiscarded(t *testing.T) {
 	srv, poison := poisonFirstConnQwpServer(t)
@@ -331,7 +331,7 @@ func queryPoolWithIdle(t *testing.T, min, max int, idle time.Duration) *qwpQuery
 // a QUERY_ERROR(CANCELLED) terminal. Use it for tests that drive a cursor
 // cleanup drain (e.g. lease reopen), where the silent read-and-discard
 // server would leave the drain racing the cancel-ack watchdog against its
-// own ctx — both 5s — making the drain outcome (and any drainFailed latch)
+// own ctx — both 5s — making the drain outcome (and any desync latch)
 // nondeterministic.
 func queryPoolWithCancelResponder(t *testing.T, min, max int, idle time.Duration) *qwpQueryPool {
 	t.Helper()

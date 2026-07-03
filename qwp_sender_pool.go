@@ -43,7 +43,7 @@ import (
 // for the caller's lifetime; Close returns it. It keeps minSize warm, grows to
 // maxSize on demand, and reaps idle/over-age slots back to minSize.
 //
-// Store-and-forward (sf_dir set) is supported with one Java-faithful twist
+// Store-and-forward (sf_dir set) is supported with one twist
 // (design §4.4): each slot gets a distinct sender_id <base>-<index> so
 // concurrent senders never collide on a slot dir (Hazard A), and every pooled
 // sender fences the pool's whole in-range slot set out of orphan adoption so a
@@ -57,8 +57,10 @@ type qwpSenderPool struct {
 	mu sync.Mutex
 	// notify is closed to wake every acquire waiter; recreated under mu after
 	// each broadcast. The cond-via-channel idiom gives acquire a timed wait
-	// (sync.Cond has none).
-	notify chan struct{}
+	// (sync.Cond has none). waiters counts goroutines parked on notify so a
+	// broadcast with nobody listening skips the close+realloc.
+	notify  chan struct{}
+	waiters int
 
 	all       []*qwpSenderSlot
 	available []*qwpSenderSlot
@@ -229,7 +231,7 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			// on reconnect, incompatible-server strike). Handing such a poisoned
 			// slot to the next borrower would fail it through no fault of its own
 			// and break borrower isolation precisely during incident recovery, so
-			// discard it and look for another (M1).
+			// discard it and look for another.
 			if slotTerminallyFailed(slot.delegate) {
 				p.discardLocked(slot) // releases p.mu
 				p.mu.Lock()
@@ -263,6 +265,10 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			}
 			if p.closed {
 				p.freeSlotIndexLocked(slotIndex)
+				// Wake close()'s outstanding-count wait: inFlightCreations just
+				// dropped, and without a broadcast close() would sleep out its
+				// full budget (mirrors the error branch above).
+				p.broadcastLocked()
 				p.mu.Unlock()
 				// Disconnect off-lock with a panic guard and a background ctx — a
 				// cancelled caller ctx must not cut this close short, matching every
@@ -280,6 +286,7 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			p.mu.Unlock()
 			return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
 		}
+		p.waiters++
 		ch := p.notify
 		p.mu.Unlock()
 		timer := time.NewTimer(remaining)
@@ -288,10 +295,14 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
+			p.mu.Lock()
+			p.waiters--
+			p.mu.Unlock()
 			return nil, ctx.Err()
 		}
 		timer.Stop()
 		p.mu.Lock()
+		p.waiters--
 	}
 }
 
@@ -310,10 +321,15 @@ func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broke
 	if p.closed {
 		// The pool was torn down while this slot was on loan, so close() left it
 		// for us: close() never tears down a borrowed delegate (a producer
-		// goroutine may be inside it mid-append — C1). The producer is done now,
+		// goroutine may be inside it mid-append). The producer is done now,
 		// so closing the delegate here cannot race a writer. Track the teardown
-		// so a concurrent close() does not return while it is in flight.
+		// so a concurrent close() does not return while it is in flight, and
+		// count the SF slot as closing so reclaimSlotLocked's decrement below
+		// stays balanced.
 		p.removeFromAllLocked(ps.slot)
+		if p.storeAndForward && ps.slot.slotIndex >= 0 {
+			p.closingSlots++
+		}
 		p.pendingLeaseTeardowns++
 		p.mu.Unlock()
 		_ = closeSlotGuarded(ctx, ps.slot.delegate)
@@ -343,7 +359,7 @@ type terminalReporter interface {
 
 // slotTerminallyFailed reports whether a slot's delegate has latched a terminal
 // error (a background HALT). A poisoned slot must never be handed to a borrower
-// (M1) nor recycled after a producer error (M4) — it is discarded and rebuilt
+// nor recycled after a producer error — it is discarded and rebuilt
 // instead. Mirrors the Query lease's client.terminalError() check.
 func slotTerminallyFailed(delegate QwpSender) bool {
 	tr, ok := delegate.(terminalReporter)
@@ -359,7 +375,7 @@ type unackedReporter interface {
 // returnFlusher lets the pool flush a delegate for return without growing the
 // public QwpSender interface: it drops the in-progress (un-At'd) row, flushes
 // committed rows, and surfaces (without discarding those rows) a latched
-// fluent-API error — the C1-correct lease-return path, distinct from Flush.
+// fluent-API error — the correct lease-return path, distinct from Flush.
 // The returned retained bool reports whether committed rows were left
 // un-enqueued (a backpressure-deadline / engine-closed failure, not a terminal
 // HALT); such a slot is dirty and must be discarded, not recycled.
@@ -397,14 +413,20 @@ func closeSlotGuarded(ctx context.Context, delegate LineSender) (err error) {
 // that a cancelled caller ctx must not cut short, matching reapIdle and the
 // borrow closed-race close site (the discarded slot is terminally failed, so
 // its drain returns immediately regardless).
+//
+// The off-lock close is counted in pendingLeaseTeardowns: the slot is already
+// out of `all`, so without it close()'s outstanding count would not see this
+// teardown and could return while the delegate still holds its SF flock.
 func (p *qwpSenderPool) discardLocked(slot *qwpSenderSlot) {
 	p.removeFromAllLocked(slot)
 	if p.storeAndForward && slot.slotIndex >= 0 {
 		p.closingSlots++
 	}
+	p.pendingLeaseTeardowns++
 	p.mu.Unlock()
 	closeErr := closeSlotGuarded(context.Background(), slot.delegate)
 	p.mu.Lock()
+	p.pendingLeaseTeardowns--
 	p.reclaimSlotLocked(slot, closeErr)
 	p.broadcastLocked()
 	p.mu.Unlock()
@@ -466,13 +488,13 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 		// A slot poisoned by a background HALT is useless to a borrower, so reap
 		// it even at minSize (borrow re-creates a fresh slot on demand). This
 		// proactively clears poisoned slots so a wave of borrowers does not have
-		// to discard them one by one during incident recovery (M1).
+		// to discard them one by one during incident recovery.
 		poisoned := slotTerminallyFailed(slot.delegate)
 		// removeFromAllLocked already shrinks p.all, so test it directly — do
 		// not also subtract len(toClose) or the reaped count is counted twice
 		// and the pool under-reaps to ~min+excess/2 per tick.
 		// Idle/age recycling is floored at minSize, so max_lifetime_ms is inert
-		// for min slots (M2): no evict-and-replace (recreating mid-outage could
+		// for min slots: no evict-and-replace (recreating mid-outage could
 		// orphan unacked SF data); QWP self-reconnects anyway. See README.
 		// Spare an idle/over-age slot that still has unacked rows: reaping it in
 		// memory mode destroys them and cuts short the reconnect/replay window. A
@@ -514,7 +536,7 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 // close_flush_timeout, so the caller's ctx must neither serialize the drains
 // (an N-slot outage would stall shutdown for N × the timeout) nor cancel them
 // (dropping undelivered memory-mode rows). Matches the lease-return and reap
-// paths (M2). The ctx argument is accepted for interface symmetry but unused.
+// paths. The ctx argument is accepted for interface symmetry but unused.
 func (p *qwpSenderPool) close(_ context.Context) error {
 	p.mu.Lock()
 	if p.closed {
@@ -528,8 +550,8 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 
 	// Bounded graceful wait for outstanding leases: close() NEVER tears down
 	// a borrowed delegate — a producer goroutine may be inside it mid-append,
-	// and closing it here would flush and free buffers under that goroutine
-	// (C1). giveBack observing `closed` tears each delegate down on the
+	// and closing it here would flush and free buffers under that
+	// goroutine. giveBack observing `closed` tears each delegate down on the
 	// returning borrower's goroutine instead (tracked via
 	// pendingLeaseTeardowns so this method does not return while a teardown
 	// is still in flight). The budget is the acquire timeout hard-capped at
@@ -549,6 +571,7 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 		if remaining <= 0 {
 			break
 		}
+		p.waiters++
 		ch := p.notify
 		p.mu.Unlock()
 		timer := time.NewTimer(remaining)
@@ -558,6 +581,7 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 		}
 		timer.Stop()
 		p.mu.Lock()
+		p.waiters--
 	}
 	if leaked := len(p.all) - len(p.available); leaked > 0 {
 		// A logged leak is recoverable; a freed buffer under a live producer
@@ -704,7 +728,7 @@ func (p *qwpSenderPool) freeSlotIndexLocked(idx int) {
 // close completed. Caller holds mu.
 //
 // Hazard F (a retired, never-reused index) does NOT manifest in Go's model the
-// way it does in Java: the Go sender's Close synchronously joins the I/O
+// way a thread pool would: the Go sender's Close synchronously joins the I/O
 // goroutine (sendLoopClose's wg.Wait) and then releases the slot flock in
 // engineClose, so by the time Close returns — error or not — the flock is
 // released. A close error here is benign (e.g. a drain-timeout on a slot reaped
@@ -730,8 +754,14 @@ func (p *qwpSenderPool) removeFromAllLocked(slot *qwpSenderSlot) {
 	}
 }
 
-// broadcastLocked wakes every acquire waiter. Caller holds mu.
+// broadcastLocked wakes every parked waiter (borrow at capacity, close's
+// outstanding-count wait). No-op when nobody is parked — a waiter registers in
+// p.waiters and captures p.notify under the same mu hold, so it can never miss
+// a broadcast this skips. Caller holds mu.
 func (p *qwpSenderPool) broadcastLocked() {
+	if p.waiters == 0 {
+		return
+	}
 	close(p.notify)
 	p.notify = make(chan struct{})
 }
@@ -762,8 +792,7 @@ type qwpPooledSender struct {
 }
 
 // A borrowed lease must expose the full QWP surface so callers can type-assert it
-// to QwpSender — matching the Java client, whose borrowSender() returns the
-// complete Sender. BorrowSender returns the LineSender view; this keeps the
+// to QwpSender. BorrowSender returns the LineSender view; this keeps the
 // QwpSender forwarders below exhaustive at compile time.
 var _ QwpSender = (*qwpPooledSender)(nil)
 
@@ -883,7 +912,7 @@ func (ps *qwpPooledSender) Float64ArrayNDColumn(name string, values *NdArray[flo
 // ctx-bounded flush timeout leaves a perfectly healthy connection, so it must be
 // recycled, not discarded — discarding would tear down (and, in SF mode,
 // re-flock/re-mmap) a warm slot on ordinary malformed input, churning the pool
-// on a stream with sporadic bad records (M4).
+// on a stream with sporadic bad records.
 func (ps *qwpPooledSender) markBrokenIfTerminal() {
 	if slotTerminallyFailed(ps.slot.delegate) {
 		ps.broken = true
@@ -1173,7 +1202,7 @@ func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 // borrower starts clean; the slot is marked broken (discarded rather than
 // recycled) on a terminal fault OR when the return flush left committed rows
 // un-enqueued (a backpressure-deadline / engine-closed failure — a dirty slot
-// that would leak this borrower's rows into the next; C1). A benign fluent-API
+// that would leak this borrower's rows into the next). A benign fluent-API
 // latch, whose committed rows still flushed cleanly, leaves a healthy slot to be
 // reused. Idempotent — a stale lease no-ops.
 //
@@ -1196,7 +1225,7 @@ func (ps *qwpPooledSender) Close(_ context.Context) error {
 		// early-returns errFlushWithPendingMessage while a row is open and
 		// early-returns a latched fluent-API error ahead of its pending-rows
 		// branch — either way it leaves committed rows unflushed in a
-		// non-terminal (kept) slot, poisoning the next borrower (C1).
+		// non-terminal (kept) slot, poisoning the next borrower.
 		// flushForReturn mirrors closeCursor: drop the open row, surface the
 		// latch, but still flush committed rows so the slot returns clean.
 		if fr, ok := ps.slot.delegate.(returnFlusher); ok {
@@ -1210,8 +1239,8 @@ func (ps *qwpPooledSender) Close(_ context.Context) error {
 				// HALT, so markBrokenIfTerminal below leaves the slot healthy;
 				// but the rows are RETAINED in the delegate's producer buffers.
 				// Recycling this dirty slot would encode borrower A's rows into
-				// borrower B's next flush, shipping them under B's FSN (C1
-				// borrower-isolation / row misattribution). Discard it so B is never
+				// borrower B's next flush, shipping them under B's FSN
+				// (borrower-isolation / row misattribution). Discard it so B is never
 				// poisoned; the discard-close still best-effort-drains A's own rows,
 				// and A's retry of the surfaced error is idempotent under server
 				// dedup (at-least-once).
@@ -1224,7 +1253,7 @@ func (ps *qwpPooledSender) Close(_ context.Context) error {
 			// A benign latched fluent-API error (already cleared, committed
 			// rows already flushed) leaves a healthy connection; only a
 			// terminal fault forfeits the slot. Matches the in-use paths'
-			// markBrokenIfTerminal (M4).
+			// markBrokenIfTerminal.
 			ps.markBrokenIfTerminal()
 		}
 	}

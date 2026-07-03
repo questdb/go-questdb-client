@@ -443,7 +443,7 @@ func assertDurableMismatchError(t *testing.T, err error) {
 // connect terminally rather than silently falling back to OK-only trimming. It
 // covers both the default (InitialConnectOff) and the Sync connect paths, which
 // historically returned a raw *QwpDurableAckMismatchError instead of the
-// documented *SenderError / PROTOCOL_VIOLATION (M1).
+// documented *SenderError / PROTOCOL_VIOLATION.
 func TestQwpDurableAckMismatchTerminal(t *testing.T) {
 	ctx := context.Background()
 	srv := newQwpNonAdvertisingServer(ctx)

@@ -32,16 +32,23 @@ import "strconv"
 //
 // # Settled vs durable
 //
-// By default ackedFsn is a SETTLED watermark (the server committed the batch to
-// its WAL), and a DROP_AND_CONTINUE rejection advances it past the dropped span
-// exactly like a commit — so on its own it does not prove the data survived, and
-// must be cross-referenced with a SenderErrorHandler to see drops. Under
-// request_durable_ack=on it is a DURABLE watermark: it advances only after the
-// data is uploaded to object storage.
+// By default ackedFsn is a SETTLED watermark: it advances only on server OK
+// ACKs (the server committed the batch to its WAL) — a rejection never
+// advances it; a rejected batch is either replayed or halts the sender with
+// the bytes preserved. Under request_durable_ack=on it is a DURABLE
+// watermark: it advances only after the data is uploaded to object storage.
 //
 // Registered via WithProgressHandler. Unlike the error / connection listeners it
 // has no loud default — progress is high-frequency, so it is opt-in and does
 // nothing when unset.
+//
+// # Calling back into the sender
+//
+// The handler may call Close() or Flush() on the sender without deadlocking.
+// Because it runs on the dispatcher goroutine, not the producer goroutine,
+// those calls deliberately do NOT touch in-progress producer state: they
+// surface only a latched terminal error and will not flush rows the producer
+// has staged but not yet flushed itself. Same contract as SenderErrorHandler.
 type SenderProgressHandler func(ackedFsn int64)
 
 // newQwpProgressDispatcher builds the off-loop dispatcher that delivers ackedFsn

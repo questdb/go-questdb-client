@@ -45,8 +45,11 @@ func newCursorSenderForTest(t *testing.T, srv *qwpSfTestServer, autoFlushRows in
 	require.NoError(t, err)
 	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
+	// 1ms reconnectMaxDuration keeps the poison-episode floor below the
+	// paced inter-strike backoff, so rejection-streak tests escalate at
+	// exactly the strike threshold instead of the 5-minute default.
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
-		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		100*time.Microsecond, time.Millisecond, 10*time.Millisecond, 100*time.Millisecond)
 	loop.sendLoopStart()
 	// 5s closeFlushTimeout matches the Java default; long enough
 	// that drain-waits in tests don't flake under heavy parallel
@@ -290,7 +293,7 @@ func TestQwpCursorSenderTableEntrySurfacesTerminalError(t *testing.T) {
 	require.Error(t, err, "AtNow must surface the latched terminal error from Table()")
 }
 
-// TestQwpCursorFlushResetsAfterEnqueueDespiteEagerError reproduces M7.
+// TestQwpCursorFlushResetsAfterEnqueueDespiteEagerError reproduces the reset-after-enqueue bug.
 // FlushAndGetSequence first publishes the pending rows into the cursor
 // engine (durable — an FSN is assigned and the frame is queued for
 // replay) and only then eagerly samples the send loop's latched error.
@@ -368,7 +371,7 @@ func TestQwpCursorFlushResetsAfterEnqueueDespiteEagerError(t *testing.T) {
 	// Wait until the batch's append has parked on backpressure. The park
 	// only happens after the in-enqueue error check has passed and the
 	// frame has been encoded, so latching now lands the HALT in exactly
-	// the post-publish window M7 describes.
+	// the post-publish window.
 	require.Eventually(t, func() bool {
 		return engine.engineTotalBackpressureStalls() > baselineStalls
 	}, 5*time.Second, 100*time.Microsecond,

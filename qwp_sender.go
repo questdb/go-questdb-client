@@ -147,8 +147,8 @@ type QwpSender interface {
 	LastTerminalError() *SenderError
 
 	// TotalServerErrors returns the cumulative count of SenderError
-	// payloads the I/O loop has built (DROP and HALT combined).
-	// Includes batches where the user handler dropped the
+	// payloads the I/O loop has built (retriable and terminal
+	// combined). Includes batches where the user handler dropped the
 	// notification due to inbox overflow.
 	TotalServerErrors() int64
 
@@ -1241,7 +1241,7 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // (capture latch, drop open row, enqueue pending rows) minus the teardown; the
 // slot stays live for the next borrower. Producer-goroutine only.
 //
-// The pool must route lease return through this, not Flush (C1):
+// The pool must route lease return through this, not Flush:
 // FlushAndGetSequence early-returns a latched error ahead of its pending-rows
 // branch, so a lease closed with a committed row AND a latched error (e.g. one
 // illegal column name on untrusted input, after a good row) would leave that
@@ -1259,22 +1259,22 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // append deadline (e.g. the cursor ring saturated during an outage) or the
 // engine was closed, neither of which is a terminal send-loop HALT. Such a slot
 // is DIRTY: recycling it would ship this borrower's rows under the next
-// borrower's FSN (C1 borrower-isolation). The pool must discard it rather than
-// recycle. retained is only meaningful on the producer goroutine; the
-// error-handler path can't inspect producer state, so it reports true —
+// borrower's FSN (borrower-isolation). The pool must discard it rather than
+// recycle. retained is only meaningful on the producer goroutine; a call from
+// a dispatcher goroutine can't inspect producer state, so it reports true —
 // unable to prove the slot clean, it errs on discard.
 func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err error) {
 	if s.closed.Load() {
 		return false, errClosedSenderFlush
 	}
-	if s.calledFromErrorHandler() {
-		// Running on the dispatcher goroutine (Close invoked from inside a
-		// SenderErrorHandler): touching producer state (lastErr / hasTable /
-		// pendingRowCount / buffers) would race the producer — the C3 hazard.
+	if s.calledFromDispatcherGoroutine() {
+		// Running on a dispatcher goroutine (Close invoked from inside a
+		// user callback): touching producer state (lastErr / hasTable /
+		// pendingRowCount / buffers) would race the producer.
 		// Surface only the latched terminal error, like closeCursor does. We
 		// can't safely read pendingRowCount, so we can't prove the slot is
 		// clean either — report retained=true so the pool discards it instead
-		// of recycling a possibly-dirty slot under the next borrower (C1).
+		// of recycling a possibly-dirty slot under the next borrower.
 		return true, s.cursorSendLoop.sendLoopCheckError()
 	}
 	firstErr := s.lastErr
@@ -1327,14 +1327,15 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	if s.closed.Load() {
 		return -1, errClosedSenderFlush
 	}
-	if s.calledFromErrorHandler() {
-		// Flush() invoked from inside a SenderErrorHandler runs on the
-		// dispatcher goroutine. The handler's documented use of Flush()
+	if s.calledFromDispatcherGoroutine() {
+		// Flush() invoked from inside a user callback (error handler,
+		// connection listener, or progress handler) runs on that
+		// dispatcher goroutine. The callback's documented use of Flush()
 		// is to surface the latched terminal error promptly (it is
-		// latched before the handler runs). We must not read or flush
+		// latched before the error handler runs). We must not read or flush
 		// producer-owned state (hasTable / pendingRowCount / tableBuffers
 		// / the encoder) from this goroutine — that races the producer,
-		// the C3 producer-state hazard. Surface any latched error and
+		// the producer-state hazard. Surface any latched error and
 		// return the published FSN without touching producer state.
 		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 			return -1, err
@@ -1352,9 +1353,9 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	// with no latched error performs no producer-state write at all and
 	// stays a pure read — several goroutines sampling a quiescent
 	// (post-HALT) sender to observe the latched terminal error therefore
-	// race only on read-only state. The calledFromErrorHandler path above
+	// race only on read-only state. The calledFromDispatcherGoroutine path above
 	// skips this: lastErr is producer-owned, and reading it from the
-	// dispatcher goroutine races the producer (the C3 hazard).
+	// dispatcher goroutine races the producer.
 	if err := s.lastErr; err != nil {
 		s.lastErr = nil
 		if s.currentTable != nil {

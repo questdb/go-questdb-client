@@ -55,7 +55,7 @@ func facadeWriteRows(t *testing.T, s LineSender, idBase int64, count int, tsBase
 // then once the server is UP the ingest side reconnects and replays, and reads
 // connect lazily on the first borrow. Requires a fixture-launched (restartable)
 // server; skips against an external QDB_FUZZ_ADDR target.
-// TestQwpIntegration* so the qwp-fuzz.yml server-bound -run filters select it (M3).
+// TestQwpIntegration* so the qwp-fuzz.yml server-bound -run filters select it.
 func TestQwpIntegrationFacadeLazyConnectDownThenUp(t *testing.T) {
 	srv := fuzzServer(t)
 	if !srv.owns {

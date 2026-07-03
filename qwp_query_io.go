@@ -307,9 +307,11 @@ type qwpEgressIO struct {
 	sendBuf qwpWireBuffer
 
 	// cancelAckTimeout is the post-CANCEL silence bound receiveLoop's
-	// watchdog enforces. Defaults to qwpQueryCancelAckTimeout; set once
-	// at construction (before start) so the dispatcher reads it without
-	// synchronization. Tests shrink it to keep the wedged-peer case fast.
+	// watchdog enforces. Set once at construction (before start) so the
+	// dispatcher reads it without synchronization: the configured
+	// close-drain timeout (query_close_timeout_ms) when positive, else
+	// the qwpQueryCancelAckTimeout default. Tests shrink it (a direct
+	// pre-start assignment) to keep the wedged-peer case fast.
 	cancelAckTimeout time.Duration
 
 	// Per-query state, accessed only from the dispatcher.
@@ -357,10 +359,15 @@ type qwpReaderEvent struct {
 
 // newQwpEgressIO constructs an I/O controller attached to an already-
 // connected transport. bufferPoolSize is the depth of the decode pool;
-// must be >= 1.
-func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
+// must be >= 1. cancelAckTimeout bounds the post-CANCEL silence
+// watchdog; non-positive selects the qwpQueryCancelAckTimeout default,
+// keeping it in step with the close-path drain it backstops.
+func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int, cancelAckTimeout time.Duration) *qwpEgressIO {
 	if bufferPoolSize < 1 {
 		panic("qwp: bufferPoolSize must be >= 1")
+	}
+	if cancelAckTimeout <= 0 {
+		cancelAckTimeout = qwpQueryCancelAckTimeout
 	}
 	ioCtx, ioCancel := context.WithCancel(context.Background())
 	io := &qwpEgressIO{
@@ -375,7 +382,7 @@ func newQwpEgressIO(tr *qwpTransport, bufferPoolSize int) *qwpEgressIO {
 		shutdownCh: make(chan struct{}),
 		doneCh:     make(chan struct{}),
 
-		cancelAckTimeout: qwpQueryCancelAckTimeout,
+		cancelAckTimeout: cancelAckTimeout,
 	}
 	io.readBufPool.New = func() any {
 		b := make([]byte, 0, 64*1024)
@@ -1258,4 +1265,3 @@ func (io *qwpEgressIO) poisonAndEmitError(msg string) {
 		errMessage: msg,
 	})
 }
-

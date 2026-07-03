@@ -344,7 +344,7 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 		"max_batch_rows=10000",
 		// Egress query-client keys with an explicit case in
 		// parseQwpQueryConf. Before these were cross-registered the facade's
-		// dual-parse rejected them (M1).
+		// dual-parse rejected them.
 		"auth=Bearer xyz",
 		"client_id=reader-1",
 		"path=/exec",
@@ -414,7 +414,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		// in_flight_window are documented Java-parity knobs; token_x /
 		// token_y are legacy public-key fields the ingest client
 		// accepts-but-ignores. Before these were cross-registered the
-		// facade's dual-parse rejected them (M1).
+		// facade's dual-parse rejected them.
 		"gorilla=off",
 		"in_flight_window=10",
 		"token_x=pub-x",
@@ -453,7 +453,7 @@ func TestConfSharedConnectString(t *testing.T) {
 	}
 }
 
-// TestConfFacadeDualParseAcceptsSharedQwpKeys is the regression for M1:
+// TestConfFacadeDualParseAcceptsSharedQwpKeys is the regression:
 // NewQuestDB / Connect validate the cluster string through BOTH parsers
 // up front (questdb.go), so any key one QWP client accepts must be
 // tolerated by the other or the facade rejects a documented-valid config.
@@ -474,7 +474,7 @@ func TestConfFacadeDualParseAcceptsSharedQwpKeys(t *testing.T) {
 }
 
 // TestConfFacadeDualParseRejectsHttpOnlyKeys pins the deliberate flip
-// side of M1: protocol_version / request_timeout / retry_timeout /
+// side: protocol_version / request_timeout / retry_timeout /
 // request_min_throughput are HTTP-only. The raw ingest parser stores
 // them but sanitizeQwpConf rejects them for QWP, so they were NOT
 // cross-registered — the egress parser must keep rejecting them so the
@@ -588,22 +588,14 @@ func TestConfMemoryModeHonoursCloseFlushTimeout(t *testing.T) {
 	}
 }
 
-// TestWithCloseTimeoutSubMillisecondIsNoOverride pins that the
-// deprecated alias honours its documented "d <= 0 is treated as no
-// override" semantics for sub-millisecond positive durations too.
-// Without this gate, d=500µs satisfies d > 0, truncates to 0 ms,
-// sets closeFlushTimeoutSet=true, and routes into the fast-close
-// branch (qwp_sender_cursor.go:167, sender.go:1493), contradicting
-// the doc. Callers who actually want fast-close must opt in via
+// TestWithCloseTimeoutSubMillisecondFloorsToOneMs pins the deprecated alias's
+// boundary semantics: d <= 0 is "no override" as documented, while a positive
+// sub-millisecond duration must not silently truncate to 0 (which would route
+// into the fast-close branch) — it floors to 1ms, exactly like
+// WithConnectTimeout. Callers who actually want fast-close opt in via
 // WithCloseFlushTimeout.
-func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
-	for _, d := range []time.Duration{
-		0,
-		-1 * time.Second,
-		1 * time.Nanosecond,
-		500 * time.Microsecond,
-		999 * time.Microsecond,
-	} {
+func TestWithCloseTimeoutSubMillisecondFloorsToOneMs(t *testing.T) {
+	for _, d := range []time.Duration{0, -1 * time.Second} {
 		t.Run(d.String(), func(t *testing.T) {
 			c := newLineSenderConfig(qwpSenderType)
 			WithCloseTimeout(d)(c)
@@ -615,12 +607,26 @@ func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
 			}
 		})
 	}
-	// Sanity: the smallest representable positive value, 1ms, must
-	// still override (the gate is inclusive at the ms boundary).
+	for _, d := range []time.Duration{
+		1 * time.Nanosecond,
+		500 * time.Microsecond,
+		999 * time.Microsecond,
+		time.Millisecond,
+	} {
+		t.Run(d.String(), func(t *testing.T) {
+			c := newLineSenderConfig(qwpSenderType)
+			WithCloseTimeout(d)(c)
+			if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
+				t.Errorf("WithCloseTimeout(%s): set=%v millis=%d; want set=true millis=1",
+					d, c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
+			}
+		})
+	}
+	// Above the boundary, plain truncation applies.
 	c := newLineSenderConfig(qwpSenderType)
-	WithCloseTimeout(time.Millisecond)(c)
-	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
-		t.Errorf("WithCloseTimeout(1ms): set=%v millis=%d; want set=true millis=1",
+	WithCloseTimeout(2500 * time.Microsecond)(c)
+	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 2 {
+		t.Errorf("WithCloseTimeout(2.5ms): set=%v millis=%d; want set=true millis=2",
 			c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
 	}
 }

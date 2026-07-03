@@ -232,7 +232,7 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 	assert.NotEmpty(t, segs, "quarantine must leave the un-uploaded .sfa segment intact")
 }
 
-// TestQwpSfDrainerListenerPanicIsolated pins M2: a panic in a user-supplied
+// TestQwpSfDrainerListenerPanicIsolated pins the isolation invariant: a panic in a user-supplied
 // background-drainer callback is recovered rather than unwinding into the
 // drainer's goroutine (where the top-level recover would quarantine an
 // otherwise-recoverable slot).
@@ -252,10 +252,11 @@ func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
 		d.listener = QwpBackgroundDrainerListener{
 			OnDurableAckUnavailable: func(string, int) { panic("user callback boom") },
 		}
-		// onDurableMismatch runs on the drainer's send-loop I/O goroutine; a
-		// panic in the callback must be contained here, and the mismatch
-		// attempt must still be counted.
-		d.onDurableMismatch(0, &QwpDurableAckMismatchError{Endpoint: "replica:9000"})
+		// onRoundExhausted runs on the goroutine driving the connect walk
+		// (the drainerRun goroutine or the send-loop I/O goroutine); a
+		// panic in the callback must be contained there, and the
+		// capability-gap sweep must still be counted.
+		d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true})
 		assert.Equal(t, int64(1), d.mismatchAttempts.Load())
 	})
 

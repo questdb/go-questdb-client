@@ -29,11 +29,11 @@ import (
 	"time"
 )
 
-// TestQwpPoolHousekeeperDefaultsAndGuard covers the zero-interval default and
-// the panic-guarded reap step. End-to-end reaping via the running goroutine is
-// covered by TestQuestDBHousekeeperReaps.
+// TestQwpPoolHousekeeperDefaultsAndGuard covers the negative-interval default
+// and the panic-guarded reap step. End-to-end reaping via the running goroutine
+// is covered by TestQuestDBHousekeeperReaps.
 func TestQwpPoolHousekeeperDefaultsAndGuard(t *testing.T) {
-	h := newQwpPoolHousekeeper(nil, nil, 0, 0)
+	h := newQwpPoolHousekeeper(nil, nil, -1, 0)
 	if h.interval != qwpDefaultHousekeeperInterval {
 		t.Errorf("interval=%v, want default %v", h.interval, qwpDefaultHousekeeperInterval)
 	}
@@ -41,4 +41,21 @@ func TestQwpPoolHousekeeperDefaultsAndGuard(t *testing.T) {
 		t.Errorf("joinBudget=%v, want default %v", h.joinBudget, want)
 	}
 	h.reapGuarded(func() { panic("reap boom") }) // recovered, must not crash
+}
+
+// TestQwpPoolHousekeeperDisabled pins interval 0 = disabled: start spawns no
+// goroutine and stopAndJoin returns immediately (not after the join budget)
+// and stays idempotent.
+func TestQwpPoolHousekeeperDisabled(t *testing.T) {
+	h := newQwpPoolHousekeeper(nil, nil, 0, 10*time.Second)
+	h.start()
+	if h.started.Load() {
+		t.Fatal("disabled housekeeper must not start its goroutine")
+	}
+	begin := time.Now()
+	h.stopAndJoin()
+	h.stopAndJoin() // idempotent
+	if elapsed := time.Since(begin); elapsed > time.Second {
+		t.Fatalf("stopAndJoin on a disabled housekeeper took %v; want immediate return", elapsed)
+	}
 }

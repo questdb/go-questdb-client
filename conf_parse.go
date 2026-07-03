@@ -106,7 +106,7 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_max_total_bytes":                    true,
 	// QWP ingest keys the egress parser ignores so a shared ws:: / wss::
 	// string (notably the facade's) validates through both parsers.
-	// gorilla / in_flight_window are the documented Java-parity knobs;
+	// gorilla / in_flight_window are the documented portability knobs;
 	// token_x / token_y are legacy public-key fields the ingest client
 	// accepts-but-ignores. (The HTTP-only protocol_version / request_timeout
 	// / retry_timeout / request_min_throughput are deliberately absent: the
@@ -292,7 +292,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				panic("add a case for " + k)
 			}
 		case "connect_timeout":
-			// COMMON key (Java parity): accepted on every schema so a shared
+			// COMMON key: accepted on every schema so a shared
 			// connect string ports. Wired on HTTP and QWP; inert on TCP.
 			parsedVal, err := strconv.Atoi(v)
 			if err != nil || parsedVal <= 0 {

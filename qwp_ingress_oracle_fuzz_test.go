@@ -1,3 +1,5 @@
+//go:build !windows
+
 /*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
@@ -21,8 +23,6 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-
-//go:build !windows
 
 package questdb
 
@@ -84,11 +84,11 @@ import (
 )
 
 const (
-	oracleTableName     = "qwp_oracle_fuzz"
-	oracleColumnSkip    = 8  // ~12% of rows skip a base column
-	oracleNewColumn     = 16 // ~6% of rows inject an extra column
-	oracleNonASCII      = 4  // ~25% of string/symbol values get a non-ASCII suffix
-	oracleBaseTsMicros  = int64(1_700_000_000_000_000)
+	oracleTableName    = "qwp_oracle_fuzz"
+	oracleColumnSkip   = 8  // ~12% of rows skip a base column
+	oracleNewColumn    = 16 // ~6% of rows inject an extra column
+	oracleNonASCII     = 4  // ~25% of string/symbol values get a non-ASCII suffix
+	oracleBaseTsMicros = int64(1_700_000_000_000_000)
 )
 
 // oracleCreateSQL is the DEDUP target-table DDL shared by the ingress
@@ -699,8 +699,8 @@ func TestQwpFuzzIngressOracleMultiSender(t *testing.T) {
 	srv := fuzzServer(t)
 	r := newFuzzRand(t)
 
-	producerCount := 2 + r.Intn(3)        // 2..4
-	rowsPerProducer := 250 + r.Intn(350)  // 250..599 (bounded for CI)
+	producerCount := 2 + r.Intn(3)       // 2..4
+	rowsPerProducer := 250 + r.Intn(350) // 250..599 (bounded for CI)
 	batchSizes := make([]int, producerCount)
 	for p := range batchSizes {
 		batchSizes[p] = 10 + r.Intn(60) // 10..69
@@ -1124,6 +1124,12 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 				WithInitialConnectRetry(true), // initial_connect_retry=true (sync)
 				WithCloseFlushTimeout(120*time.Second),
 				WithErrorInboxCapacity(4096),
+				// Keep the poison-episode floor (reconnect_max_duration
+				// doubles as it) below the paced inter-strike backoff so
+				// the poisoned frame escalates exactly at
+				// max_frame_rejections deliveries, not after the default
+				// 5-minute settle window.
+				WithReconnectPolicy(50*time.Millisecond, 25*time.Millisecond, 100*time.Millisecond),
 				WithErrorHandler(func(e *SenderError) {
 					errCalls.Add(1)
 					if e == nil {

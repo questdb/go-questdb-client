@@ -210,7 +210,7 @@ func TestQwpSenderSteadyStateZeroAllocs(t *testing.T) {
 // qwpPooledSender lease, driving the row build through the lease forwarders then
 // encoding + resetting the underlying sender directly (forwarders don't expose
 // the flush internals). Pins the lease layer BorrowSender adds on the hot path
-// (one live() atomic load + one interface hop per call) (M4).
+// (one live() atomic load + one interface hop per call).
 func qwpPooledSteadyStateSetup() (*qwpPooledSender, func()) {
 	ctx := context.Background()
 	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)

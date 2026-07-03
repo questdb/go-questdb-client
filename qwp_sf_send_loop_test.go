@@ -70,6 +70,13 @@ type qwpSfTestServerOpts struct {
 	// server resumes ACKing — the case the never-ACKed terminal
 	// heuristic must NOT mistake for an incompatible build.
 	silentDropUntilConn int
+	// orderlyCloseAfterFrames > 0 → read N frames then close the
+	// WebSocket with an orderly GOING_AWAY (1001) without ACKing,
+	// scoped to connections with myConnID < orderlyCloseUntilConn.
+	// Models a rolling-restart / role-handoff drain: the server asks
+	// us to go elsewhere, so it must NOT count a poison strike.
+	orderlyCloseAfterFrames int
+	orderlyCloseUntilConn   int
 	// silentAcks → read frames forever and never write any ACK
 	// back. Connection stays alive so the send loop does not go
 	// terminal; the producer's Close drain-wait is what surfaces
@@ -263,6 +270,12 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			}
 			if silentDropActive &&
 				localFramesReceived >= opts.silentDropAfterFrames {
+				return
+			}
+			if opts.orderlyCloseAfterFrames > 0 &&
+				myConnID < int64(opts.orderlyCloseUntilConn) &&
+				localFramesReceived >= opts.orderlyCloseAfterFrames {
+				_ = conn.Close(websocket.StatusGoingAway, "restart")
 				return
 			}
 			if opts.silentAcks {
@@ -973,8 +986,12 @@ func TestQwpSfSendLoopSilentDropRepeatedPoisonEscalates(t *testing.T) {
 	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
 
+	// reconnectMaxDuration doubles as the poison-episode floor; 1ms is
+	// always elapsed by the strike threshold (every rejection recycle
+	// pays at least one initial-backoff sleep), so escalation lands
+	// exactly at maxFrameRejections strikes.
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
-		100*time.Microsecond, 5*time.Second, time.Millisecond, 10*time.Millisecond)
+		100*time.Microsecond, time.Millisecond, time.Millisecond, 10*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
@@ -1077,9 +1094,11 @@ func TestQwpSfSendLoopSilentDropAfterPriorAckPoisonEscalatesAtThreshold(t *testi
 	require.NoError(t, err)
 
 	// Reconnect factory points at silentSrv: after goodSrv goes
-	// away, every reconnect lands on the frame-eating server.
+	// away, every reconnect lands on the frame-eating server. The 1ms
+	// reconnectMaxDuration keeps the poison-episode floor below the
+	// paced inter-strike backoff so escalation lands at the threshold.
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialAt(silentSrv.URL),
-		100*time.Microsecond, 30*time.Second, 1*time.Millisecond, 5*time.Millisecond)
+		100*time.Microsecond, time.Millisecond, 1*time.Millisecond, 5*time.Millisecond)
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
@@ -1115,6 +1134,52 @@ func TestQwpSfSendLoopSilentDropAfterPriorAckPoisonEscalatesAtThreshold(t *testi
 	assert.Contains(t, se.ServerMessage, "poisoned frame")
 	assert.Equal(t, int64(0), engine.engineAckedFsn(),
 		"the eaten frame must remain unacked — nothing is dropped")
+}
+
+// TestQwpSfSendLoopOrderlyCloseNeverPoisons pins that an orderly close
+// (GOING_AWAY / NORMAL_CLOSURE) after the head frame is sent never counts a
+// poison strike, no matter how many times it repeats: a rolling restart or
+// role-change handoff is the server asking us to go elsewhere, not a verdict on
+// the bytes. Far more than max_frame_rejections orderly closes must still leave
+// the sender healthy, reconnecting and replaying.
+func TestQwpSfSendLoopOrderlyCloseNeverPoisons(t *testing.T) {
+	// The first many connections read the head frame then orderly-close
+	// without ACKing; a later connection ACKs normally.
+	const orderlyRounds = 12 // >> the default max_frame_rejections (4)
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		orderlyCloseAfterFrames: 1,
+		orderlyCloseUntilConn:   orderlyRounds,
+	})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+
+	// A 1ms episode budget would let a non-orderly strike escalate quickly;
+	// the point is that orderly closes never strike at all.
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Millisecond, 1*time.Millisecond, 5*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, 5*time.Second, time.Millisecond,
+		"frame should eventually ACK after the orderly-close rounds end")
+
+	require.GreaterOrEqual(t, srv.connCount.Load(), int64(orderlyRounds),
+		"every orderly close should have driven a fresh reconnect")
+	assert.Nil(t, loop.sendLoopCheckError(),
+		"orderly closes must never latch a terminal error")
+	assert.Nil(t, loop.sendLoopLastTerminalServerError(),
+		"orderly closes must never escalate to a poisoned-frame terminal")
 }
 
 func TestQwpSfSendLoopUpgradeAuthFailureIsTerminal(t *testing.T) {
@@ -1654,9 +1719,13 @@ func TestQwpSfMaxFrameRejectionsConfigHonoredEndToEnd(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// reconnect_max_duration_millis=1 keeps the poison-episode floor
+	// below the paced inter-strike backoff, so escalation lands exactly
+	// at the configured strike threshold.
 	ls, err := LineSenderFromConf(context.Background(),
 		"ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";"+
 			"max_frame_rejections=2;"+
+			"reconnect_max_duration_millis=1;"+
 			"reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=5;"+
 			"initial_connect_retry=off;")
 	require.NoError(t, err)

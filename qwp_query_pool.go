@@ -41,7 +41,7 @@ import (
 // minSize == 0 is the lazy read pool used by lazy_connect: build prewarms no
 // clients (so a down server never fails the facade build), and the first
 // borrow create+connects on demand — the Go QwpQueryClient connects in its
-// constructor, which is exactly Java's create+connect on first borrow.
+// constructor: create + connect on first borrow.
 type qwpQueryPool struct {
 	mu     sync.Mutex
 	notify chan struct{}
@@ -115,7 +115,7 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 			// exhaustion on a background reconnect) while it sits idle, with no
 			// lease watching. Handing such a poisoned worker to the next borrower
 			// would fail their first query through no fault of their own, so
-			// discard it and look for another (mirrors the sender pool's M1).
+			// discard it and look for another (mirrors the sender pool).
 			if w.client.terminalError() != nil {
 				// Background: this worker is already terminally failed, so its
 				// close is incidental teardown a cancelled borrow ctx must not
@@ -160,7 +160,7 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			p.mu.Unlock()
-			return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
+			return nil, fmt.Errorf("%w after %s", errQueryPoolExhausted, p.acquireTimeout)
 		}
 		ch := p.notify
 		p.mu.Unlock()
@@ -177,33 +177,38 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 	}
 }
 
-func (p *qwpQueryPool) giveBack(ctx context.Context, q *Query, broken bool) {
+// giveBack returns a lease's worker to the pool (or closes it, when the pool is
+// already shut down or the worker is broken). The close paths run on
+// context.Background(): they are incidental teardown of a worker nobody will
+// reuse, which a caller deadline must not cut short. Returns the close error,
+// if any — recycling a healthy worker never fails.
+func (p *qwpQueryPool) giveBack(q *Query, broken bool) error {
 	p.mu.Lock()
 	if q.worker.generation.Load() != q.gen {
 		p.mu.Unlock()
-		return // stale lease (already returned / re-borrowed) — never double-act
+		return nil // stale lease (already returned / re-borrowed) — never double-act
 	}
 	q.worker.generation.Add(1)
 	if p.closed {
 		// On loan at close (close() skips on-loan workers), so self-close now.
 		// Query.Close drained the active cursor first, so this can't race a read.
 		p.mu.Unlock()
-		_ = closeQueryClientGuarded(ctx, q.worker.client)
-		return
+		return closeQueryClientGuarded(context.Background(), q.worker.client)
 	}
 	if broken {
 		p.removeFromAllLocked(q.worker)
 		p.mu.Unlock()
-		_ = closeQueryClientGuarded(ctx, q.worker.client)
+		err := closeQueryClientGuarded(context.Background(), q.worker.client)
 		p.mu.Lock()
 		p.broadcastLocked()
 		p.mu.Unlock()
-		return
+		return err
 	}
 	q.worker.idleSince = time.Now()
 	p.available = append(p.available, q.worker)
 	p.broadcastLocked()
 	p.mu.Unlock()
+	return nil
 }
 
 // discardWorkerLocked evicts a worker from `all` and closes its client outside
@@ -227,14 +232,25 @@ func (p *qwpQueryPool) reapIdle() {
 		return
 	}
 	toClose := p.selectReapVictims(time.Now())
+	if len(toClose) == 0 {
+		return
+	}
+	// Close concurrently so an N-worker sweep is bounded by one close budget,
+	// not N — a sequential sweep of wedged connections would overrun the
+	// housekeeper join budget and outlive QuestDB.Close (matches the sender
+	// pool's reap).
+	var wg sync.WaitGroup
 	for _, w := range toClose {
-		_ = closeQueryClientGuarded(context.Background(), w.client)
+		wg.Add(1)
+		go func(client *QwpQueryClient) {
+			defer wg.Done()
+			_ = closeQueryClientGuarded(context.Background(), client)
+		}(w.client)
 	}
-	if len(toClose) > 0 {
-		p.mu.Lock()
-		p.broadcastLocked()
-		p.mu.Unlock()
-	}
+	wg.Wait()
+	p.mu.Lock()
+	p.broadcastLocked()
+	p.mu.Unlock()
 }
 
 // selectReapVictims removes the idle-expired / over-age / poisoned workers from
@@ -254,12 +270,12 @@ func (p *qwpQueryPool) selectReapVictims(now time.Time) []*qwpQueryWorker {
 		overAge := p.maxLifetime > 0 && now.Sub(w.createdAt) >= p.maxLifetime
 		// A worker poisoned by a background transport-terminal failure is useless
 		// to a borrower, so reap it even at minSize (borrow re-creates a fresh
-		// worker on demand), mirroring the sender pool's M1 reap.
+		// worker on demand), mirroring the sender pool's reap.
 		poisoned := w.client.terminalError() != nil
 		// removeFromAllLocked already shrinks p.all; test it directly (don't
 		// also subtract len(toClose) — that double-counts and under-reaps).
 		// Idle/age recycling is floored at minSize, so max_lifetime_ms is inert
-		// for min workers (M2, see sender pool + README); poisoned reaps anyway.
+		// for min workers (see sender pool + README); poisoned reaps anyway.
 		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
 			p.removeFromAllLocked(w)
 			toClose = append(toClose, w)
@@ -284,7 +300,7 @@ func closeQueryClientGuarded(ctx context.Context, client *QwpQueryClient) (err e
 }
 
 // close shuts the pool down. Like the sender pool it closes only available
-// workers concurrently on context.Background() (M2), so a caller ctx neither
+// workers concurrently on context.Background(), so a caller ctx neither
 // serializes the closes nor cancels them mid-drain. The ctx argument is accepted
 // for interface symmetry but unused.
 func (p *qwpQueryPool) close(_ context.Context) error {
@@ -295,8 +311,8 @@ func (p *qwpQueryPool) close(_ context.Context) error {
 	}
 	p.closed = true
 	// Close only available workers: an on-loan one may have a live Batches()
-	// reading its aliased buffers, which a concurrent Close would free (M1,
-	// QwpQueryClient.Close UB). On-loan leases self-close via giveBack; a never-
+	// reading its aliased buffers, which a concurrent Close would free —
+	// undefined behaviour. On-loan leases self-close via giveBack; a never-
 	// returned lease leaks, as in qwpSenderPool.close.
 	toClose := append([]*qwpQueryWorker(nil), p.available...)
 	p.all = nil
@@ -363,6 +379,21 @@ func (p *qwpQueryPool) poolSnapshot() (total, available int) {
 	return len(p.all), len(p.available)
 }
 
+var (
+	// errQueryPoolExhausted is the query-pool counterpart of
+	// errPoolExhausted, so a borrow timeout names the pool the caller
+	// actually exhausted rather than misreporting a sender wait.
+	errQueryPoolExhausted = errors.New("qwp pool: timed out waiting for a query connection")
+	// errQueryLeaseUnusable fails a live lease whose worker can no longer
+	// serve statements: its connection latched a transport-terminal error,
+	// or an abandoned drain left the wire desynced. Distinct from
+	// errStaleLease (handle already returned / slot evicted) so callers can
+	// tell "you gave this handle back" from "close this lease and borrow a
+	// fresh one".
+	errQueryLeaseUnusable = errors.New(
+		"qwp pool: query lease's connection is no longer usable (terminally failed or desynced); close the lease and borrow a fresh one")
+)
+
 // Query is a query session leased from the QuestDB facade via BorrowQuery. It
 // delegates to the leased QwpQueryClient's cursor/iterator API; Close returns
 // the client to the pool (draining any in-flight cursor first). The real
@@ -381,30 +412,35 @@ func (q *Query) live() bool {
 	return !q.closed && q.worker.generation.Load() == q.gen
 }
 
-// leaseUnusable reports whether the lease must not submit another statement: it
-// is dead/stale, already broken, or its worker latched a transport-terminal
-// error while idle (which it marks broken so Close evicts the worker rather than
-// submitting once on the dead wire first). Mirrors the borrow-time gate.
-func (q *Query) leaseUnusable() bool {
+// leaseErr reports why the lease must not submit another statement:
+// errStaleLease when the handle is dead (returned, or the slot was evicted),
+// errQueryLeaseUnusable when the lease is live but its worker is broken or
+// latched a transport-terminal error while idle (which marks it broken so Close
+// evicts the worker rather than submitting once on the dead wire first). Nil
+// when the lease may submit.
+func (q *Query) leaseErr() error {
 	if !q.live() {
-		return true
+		return errStaleLease
 	}
 	if !q.broken && q.worker.client.terminalError() != nil {
 		q.broken = true
 	}
-	return q.broken
+	if q.broken {
+		return errQueryLeaseUnusable
+	}
+	return nil
 }
 
 // Query submits a SELECT-style statement and returns a cursor over its result
 // batches. See QwpQueryClient.Query. Iterate Batches() and Close the returned
 // cursor (or rely on this handle's Close to drain it).
 func (q *Query) Query(ctx context.Context, sql string, opts ...QwpQueryOption) *QwpQuery {
-	if q.leaseUnusable() {
-		// Use-after-close, a worker desynced by a prior abandoned drain, or an
-		// idle worker that latched a transport-terminal error: return a cursor
-		// that surfaces the error from its first Batches() yield rather than a nil
-		// that panics the caller, and never submit on the dead/desynced worker.
-		return staleQueryCursor()
+	if err := q.leaseErr(); err != nil {
+		// Use-after-close, a broken worker, or an idle worker that latched a
+		// transport-terminal error: return a cursor that surfaces the error
+		// from its first Batches() yield rather than a nil that panics the
+		// caller, and never submit on the dead/desynced worker.
+		return failedQueryCursor(err)
 	}
 	if q.active != nil {
 		// Drain the cursor left open by a prior Query first, then mirror
@@ -415,55 +451,51 @@ func (q *Query) Query(ctx context.Context, sql string, opts ...QwpQueryOption) *
 		// the desynced wire — surface the error from the cursor's first
 		// Batches() yield rather than serving wrong rows first.
 		q.active.Close()
-		desynced := q.active.drainFailed.Load()
 		q.active = nil
-		if desynced {
+		if q.worker.client.execDesynced() {
 			q.broken = true
-			return staleQueryCursor()
+			return failedQueryCursor(errQueryLeaseUnusable)
 		}
 	}
 	q.active = q.worker.client.Query(ctx, sql, opts...)
 	return q.active
 }
 
-// staleQueryCursor returns an already-done cursor whose first Batches() yield
-// surfaces errStaleLease, used when the lease is dead or the worker's wire is
-// desynced and must not serve another query.
-func staleQueryCursor() *QwpQuery {
-	stale := &QwpQuery{pendingErr: errStaleLease}
-	stale.state.Store(qwpQueryStateDone)
-	return stale
+// failedQueryCursor returns an already-done cursor whose first Batches() yield
+// surfaces err, used when the lease is dead or the worker's wire is desynced
+// and must not serve another query.
+func failedQueryCursor(err error) *QwpQuery {
+	failed := &QwpQuery{pendingErr: err}
+	failed.state.Store(qwpQueryStateDone)
+	return failed
 }
 
 // Exec runs a non-SELECT statement and blocks until completion. See
 // QwpQueryClient.Exec.
 func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (ExecResult, error) {
-	if q.leaseUnusable() {
-		// Use-after-close, a worker desynced by a prior abandoned drain, or an
-		// idle worker that latched a transport-terminal error: refuse to submit
-		// (mirrors the Query top-level gate).
-		return ExecResult{}, errStaleLease
+	if err := q.leaseErr(); err != nil {
+		// Use-after-close, a broken worker, or an idle worker that latched a
+		// transport-terminal error: refuse to submit (mirrors the Query
+		// top-level gate).
+		return ExecResult{}, err
 	}
 	// Drain any cursor left open by Query first: the leased client's
 	// dispatcher is single-stream, so an in-flight cursor would otherwise
 	// race the Exec submission for the next terminal frame.
 	if q.active != nil {
 		q.active.Close()
-		if q.active.drainFailed.Load() {
-			q.broken = true
-		}
 		q.active = nil
 	}
-	if q.broken {
+	if q.worker.client.execDesynced() {
 		// The drain abandoned before its terminal frame, leaving leftover
 		// RESULT_BATCH events on the single-stream wire that this Exec would
 		// misread as its own (the egress path does not demux by requestId).
-		// Mirror Query: refuse to submit on the desynced wire and surface
-		// errStaleLease — submitting anyway would both misreport the Exec
-		// result and leave the statement queued to execute server-side
-		// unobserved, so a caller retry could double-execute it. Close evicts
-		// the broken worker rather than recycling it.
-		return ExecResult{}, errStaleLease
+		// Mirror Query: mark the worker broken so Close evicts it, and refuse
+		// to submit on the desynced wire — submitting anyway would both
+		// misreport the Exec result and leave the statement queued to execute
+		// server-side unobserved, so a caller retry could double-execute it.
+		q.broken = true
+		return ExecResult{}, errQueryLeaseUnusable
 	}
 	res, err := q.worker.client.Exec(ctx, sql, opts...)
 	// A failover-exhausted failure means the client could not re-establish a
@@ -490,20 +522,22 @@ func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (E
 }
 
 // Close returns the leased client to the pool, draining any cursor left open by
-// Query first. Idempotent; the underlying client stays connected for reuse.
+// Query first. Idempotent; the underlying client normally stays connected for
+// reuse and Close returns nil — the real disconnect happens at QuestDB.Close.
+//
+// Close deliberately takes no context, unlike the sender lease's Close(ctx):
+// the pool return itself never blocks, and the only wait — draining an open
+// cursor — runs on an internal budget bounded by query_close_timeout_ms, which
+// a caller deadline must not cut short (an interrupted drain would desync the
+// worker's wire and force an eviction). A non-nil error is possible only when
+// the worker is not recycled — it is broken and evicted, or the pool has
+// already shut down — and its client's own Close fails.
 func (q *Query) Close() error {
 	if !q.live() {
 		return nil
 	}
 	if q.active != nil {
 		q.active.Close()
-		// A drain that abandoned before the terminal frame leaves leftover
-		// events on the wire that the next borrower would consume as its own
-		// (the egress path does not demux by requestId), so evict rather than
-		// recycle.
-		if q.active.drainFailed.Load() {
-			q.broken = true
-		}
 		q.active = nil
 	}
 	// A cursor that ended in failover-exhaustion (or any transport-terminal
@@ -514,13 +548,13 @@ func (q *Query) Close() error {
 	if !q.broken && q.worker.client.terminalError() != nil {
 		q.broken = true
 	}
-	// An Exec whose internal cleanup drain abandoned on a healthy transport
-	// leaves the wire desynced without latching terminalError(); evict so the
-	// leftover frames cannot leak into the next borrower (see execDesynced).
+	// A cleanup drain that abandoned on a healthy transport — the cursor drain
+	// just above, or an earlier Exec-internal one — leaves the wire desynced
+	// without latching terminalError(); evict so the leftover frames cannot
+	// leak into the next borrower (see execDesynced).
 	if !q.broken && q.worker.client.execDesynced() {
 		q.broken = true
 	}
 	q.closed = true
-	q.pool.giveBack(context.Background(), q, q.broken)
-	return nil
+	return q.pool.giveBack(q, q.broken)
 }

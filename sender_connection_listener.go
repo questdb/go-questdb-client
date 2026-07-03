@@ -30,7 +30,7 @@ import (
 )
 
 // SenderConnectionEventKind classifies a QWP ingress connection-state
-// transition. Mirrors the Java client's SenderConnectionEvent.Kind.
+// transition.
 type SenderConnectionEventKind int
 
 const (
@@ -63,7 +63,7 @@ const (
 )
 
 // String returns the SCREAMING_SNAKE_CASE name of the kind (e.g. "CONNECTED"),
-// matching the Java client's enum names, or "UNKNOWN(<n>)" for an unrecognised
+// or "UNKNOWN(<n>)" for an unrecognised
 // value.
 func (k SenderConnectionEventKind) String() string {
 	switch k {
@@ -89,8 +89,8 @@ func (k SenderConnectionEventKind) String() string {
 // SenderConnectionEvent describes one connection-state transition observed by
 // the QWP ingress client. Fields not applicable to a given Kind take their
 // zero value (Host=="", Port==0, AttemptNumber==0, Cause==nil) — Go's
-// idiomatic encoding of Java's NO_PORT/NO_ATTEMPT_NUMBER/NO_ROUND_NUMBER
-// sentinels. TimestampMillis is set by the dispatcher at emit time.
+// encoding of the "not applicable" sentinels. TimestampMillis is set
+// by the dispatcher at emit time.
 type SenderConnectionEvent struct {
 	// Kind classifies the connection-state transition this event describes and
 	// determines which of the remaining fields are meaningful.
@@ -163,11 +163,23 @@ func (e SenderConnectionEvent) String() string {
 // observable, so a listener that receives it can react before the producer
 // learns via the next API call. A panic from the listener is recovered and
 // logged.
+//
+// # Calling back into the sender
+//
+// The listener may call Close() or Flush() on the sender — e.g. to shut down
+// on SenderAuthFailed — without deadlocking. Because the listener runs on the
+// dispatcher goroutine, not the producer goroutine, those calls deliberately
+// do NOT touch in-progress producer state: they surface only a latched
+// terminal error and will not flush rows the producer has staged but not yet
+// flushed itself (those may be mid-assembly on the producer goroutine).
+// Close() still tears down the wire, drains already-published frames up to
+// close_flush_timeout, and releases resources. Same contract as
+// SenderErrorHandler.
 type SenderConnectionListener func(SenderConnectionEvent)
 
 // defaultSenderConnectionListener is the loud-not-silent fallback used when no
 // listener is registered: every transition is logged, terminal/failure kinds
-// loudly. Per the Java client's DefaultSenderConnectionListener.
+// loudly.
 func defaultSenderConnectionListener(e SenderConnectionEvent) {
 	level := "[INFO]"
 	switch e.Kind {

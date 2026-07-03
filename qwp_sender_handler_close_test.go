@@ -36,8 +36,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestQwpSfEngineCloseDuringBackpressuredAppendNoCrash is the C3
-// regression for the engine-level crash (Hazard A in the review).
+// TestQwpSfEngineCloseDuringBackpressuredAppendNoCrash is the
+// regression for the engine-level crash (Hazard A).
 //
 // A SenderErrorHandler is documented as allowed to call Close(). When a
 // HALT stalls the wire, the send loop stops draining, the cursor ring
@@ -109,8 +109,8 @@ func TestQwpSfEngineCloseDuringBackpressuredAppendNoCrash(t *testing.T) {
 			"error once the engine is closed, got: %v", prodErr)
 }
 
-// TestQwpSenderCloseFromErrorHandlerSkipsProducerState is the C3
-// regression for the producer-state data race (Hazard B in the review).
+// TestQwpSenderCloseFromErrorHandlerSkipsProducerState is the
+// regression for the producer-state data race (Hazard B).
 //
 // The SenderErrorHandler runs on the dispatcher goroutine. The producer
 // goroutine owns the table buffers, the encoder, hasTable and

@@ -889,7 +889,7 @@ func TestInitialConnectOffFailsWhenAllRejected(t *testing.T) {
 }
 
 // TestQwpMemoryModeMultiHostFailsOverToHealthy is the regression test
-// for review C2: memory mode (no sf_dir) must honour the multi-host
+// that memory mode (no sf_dir) must honour the multi-host
 // addr= list exactly as SF mode does. The README's headline failover
 // example (ws::addr=node-a,node-b,node-c;) is memory mode, so a dead
 // first endpoint must not hard-fail the constructor — the sender has
@@ -928,7 +928,7 @@ func TestQwpMemoryModeMultiHostFailsOverToHealthy(t *testing.T) {
 		"the healthy peer must have received the row — proving the bind landed on host 1")
 }
 
-// TestQwpMemoryModeThreadsFailoverConfig pins the rest of review C2:
+// TestQwpMemoryModeThreadsFailoverConfig pins the remaining case:
 // memory mode must thread the multi-host failover tracker AND the
 // user's reconnect budget into the send loop, not discard them. The
 // pre-fix memory path installed no tracker (so reconnect could never
@@ -1146,9 +1146,9 @@ func TestRoundWalkRoleRejectBackoffGrows(t *testing.T) {
 		MaxDuration:    700 * time.Millisecond,
 		InitialBackoff: 20 * time.Millisecond,
 		MaxBackoff:     200 * time.Millisecond,
-		OnRoundExhausted: func(lastWasRoleReject bool) {
+		OnRoundExhausted: func(outcome qwpSfSweepOutcome) {
 			rounds++
-			require.True(t, lastWasRoleReject, "every sweep here ends on a role reject")
+			require.True(t, outcome.allReplica(), "every sweep here is all-replica")
 		},
 	}, -1)
 	require.NotNil(t, result.Exhausted)

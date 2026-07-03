@@ -54,7 +54,11 @@ const (
 	qwpSfDefaultParkInterval = 1 * time.Millisecond
 	// qwpSfDefaultReconnectMaxDuration bounds ONLY the blocking sync
 	// initial connect (qwpSfConnectWithRetry). The running loop, async
-	// initial connect, and drainers retry unbounded (Invariant B).
+	// initial connect, and drainers retry unbounded (Invariant B). It
+	// doubles as the settle budget wherever a "give the condition time
+	// to resolve" knob is needed: the poison-frame detector's episode
+	// floor (recordRejectionStrike) and the drainer's no-progress
+	// wedge budget.
 	qwpSfDefaultReconnectMaxDuration    = 5 * time.Minute
 	qwpSfDefaultReconnectInitialBackoff = 100 * time.Millisecond
 	qwpSfDefaultReconnectMaxBackoff     = 5 * time.Second
@@ -65,15 +69,17 @@ const (
 	qwpSfReconnectWarnThrottle = 5 * time.Second
 )
 
-// qwpSfDefaultMaxFrameRejections is the poison-frame detector
+// qwpSfDefaultMaxFrameRejections is the poison-frame detector strike
 // threshold: consecutive server-active rejections (retriable NACK, or
 // non-orderly close after at least one send on the connection) of the
-// SAME head-of-line frame, with no ack progress in between, before the
-// loop declares the frame poisoned and halts with a typed
-// PROTOCOL_VIOLATION terminal. Below the threshold a retriable
-// rejection recycles the connection and replays from ackedFsn+1 — no
-// data is dropped either way. Configurable via max_frame_rejections /
-// WithMaxFrameRejections.
+// SAME frame, with no covering ack in between. Strikes alone do not
+// escalate: declaring the frame poisoned (a typed PROTOCOL_VIOLATION
+// terminal) additionally requires the rejection episode to have lasted
+// at least reconnectMaxDuration, so a transient server-side rejection
+// window cannot burn every strike in a second and kill the sender —
+// below either bar the loop keeps recycling the connection with paced
+// backoff and replays from ackedFsn+1. No data is dropped either way.
+// Configurable via max_frame_rejections / WithMaxFrameRejections.
 const qwpSfDefaultMaxFrameRejections = 4
 
 // qwpSfReconnectFactory is invoked by the send loop on a wire
@@ -140,10 +146,14 @@ type qwpSfSendLoop struct {
 	// matches the Java client's "no reconnect" mode).
 	reconnectFactory qwpSfReconnectFactory
 
-	// reconnectMaxDuration is retained for constructor parity but never
-	// consulted by the running loop: reconnect_max_duration_millis bounds
-	// only the blocking sync initial connect (qwpSfConnectWithRetry),
-	// never a running loop or drainer (Invariant B).
+	// reconnectMaxDuration never bounds the running loop's reconnect
+	// walk: reconnect_max_duration_millis limits only the blocking sync
+	// initial connect (qwpSfConnectWithRetry), never a running loop or
+	// drainer (Invariant B). The running loop reuses it as the
+	// poison-frame episode budget: a rejection streak must last at
+	// least this long before strike-count overflow may escalate to the
+	// poisoned-frame terminal (see recordRejectionStrike). Floored to
+	// qwpSfDefaultReconnectMaxDuration by the constructor.
 	reconnectMaxDuration    time.Duration
 	reconnectInitialBackoff time.Duration
 	reconnectMaxBackoff     time.Duration
@@ -167,8 +177,8 @@ type qwpSfSendLoop struct {
 	// (the I/O goroutine).
 	previousIdx int
 
-	// policyResolver chooses Halt vs DropAndContinue per Category.
-	// Non-nil; defaults are baked in via qwpSfDefaultPolicyFor.
+	// policyResolver chooses Terminal vs Retriable / RetriableOther per
+	// Category. Non-nil; defaults are baked in via qwpSfDefaultPolicyFor.
 	// Atomic pointer because setters can run concurrently with the
 	// receiver goroutine that reads it on every classified rejection.
 	policyResolver atomic.Pointer[qwpSfPolicyResolver]
@@ -286,17 +296,23 @@ type qwpSfSendLoop struct {
 	// durableMismatchTerminal classifies a durable-ack mismatch: true (default,
 	// foreground) fails loud; false (drainer) retries within the reconnect budget.
 	durableMismatchTerminal bool
-	// onEndpointFailed, when set (by a drainer), is invoked in addition to the
-	// connection-event emit whenever an endpoint dial fails, so the drainer can
-	// react to a durable-ack mismatch (fire its listener, count attempts).
-	onEndpointFailed func(idx int, err error)
+	// onRoundExhausted, when set (by a drainer), is invoked by
+	// connectWithBackoff once per exhausted reconnect sweep with the
+	// sweep's aggregate outcome, so the drainer's per-sweep durable-ack
+	// settle accounting covers mid-drain reconnect windows exactly like
+	// its initial connect walk. Set before sendLoopStart.
+	onRoundExhausted func(qwpSfSweepOutcome)
+	// backgroundWalks marks this loop's reconnect walks as background
+	// (drainers): attempted hosts land in a walk-local cursor, never in
+	// the shared tracker's round slots. Set before sendLoopStart.
+	backgroundWalks bool
 
 	// progressDispatcher delivers ackedFsn advances to the user's
 	// SenderProgressHandler; nil when none is registered. progressDispatchMu
 	// guards lastProgressFsn's compare-store and the offer (both goroutines call
 	// dispatchProgress) so the delivered FSN stream stays strictly monotonic.
 	progressDispatcher atomic.Pointer[qwpDispatcher[int64]]
-	lastProgressFsn    atomic.Int64
+	lastProgressFsn    int64
 	progressDispatchMu sync.Mutex
 
 	// framesSentOnConn counts frames written to the wire on the
@@ -306,21 +322,32 @@ type qwpSfSendLoop struct {
 	// this connection actually sent it.
 	framesSentOnConn atomic.Int64
 
-	// Poison-frame detector state. poisonFsn is the head-of-line FSN
-	// (ackedFsn+1) observed at the most recent server-active rejection
-	// (retriable NACK, or non-orderly close after at least one send on
-	// the connection); poisonStrikes counts consecutive rejections at
-	// that same FSN with no ack progress in between. Any ACK resets
-	// both. At maxFrameRejections strikes the frame is declared
-	// poisoned: the server (or an intermediary) deterministically
-	// rejects these exact bytes, so replay cannot succeed and the loop
-	// halts with a typed PROTOCOL_VIOLATION terminal instead of
-	// reconnect-looping forever. Written by the receiver goroutine and
-	// by run() — never concurrently: run() touches them only after
-	// runOneConnection has joined both inner goroutines, and the next
-	// connection's goroutines start after run()'s writes.
-	poisonFsn     int64
-	poisonStrikes int
+	// Poison-frame detector state. poisonFsn is the FSN implicated by
+	// the most recent server-active rejection (retriable NACK, or
+	// non-orderly close after at least one send on the connection): the
+	// NACKed frame itself when the server named a wire sequence, the
+	// head-of-line frame (ackedFsn+1) otherwise. poisonStrikes counts
+	// consecutive rejections of that same FSN; poisonFirstStrikeAt
+	// anchors the episode. Declaring the frame poisoned — the server
+	// (or an intermediary) deterministically rejects these exact bytes,
+	// so replay cannot succeed and the loop halts with a typed
+	// PROTOCOL_VIOLATION terminal — requires BOTH maxFrameRejections
+	// consecutive strikes AND an episode at least reconnectMaxDuration
+	// long; a strike burst inside a transient rejection window keeps
+	// recycling with paced backoff instead of killing the sender. An
+	// ack covering poisonFsn resets the detector (in durable mode
+	// replay re-delivers already-OK'd predecessors, whose fresh OKs
+	// must not shield the rejected frame). rejectionRecycles counts
+	// consecutive rejection-driven connection recycles and paces them
+	// with capped equal-jitter backoff; any ack resets it. Written by
+	// the receiver goroutine and by run() — never concurrently: run()
+	// touches them only after runOneConnection has joined both inner
+	// goroutines, and the next connection's goroutines start after
+	// run()'s writes.
+	poisonFsn           int64
+	poisonStrikes       int
+	poisonFirstStrikeAt time.Time
+	rejectionRecycles   int
 	// maxFrameRejections is the poison-strike threshold
 	// (max_frame_rejections; default qwpSfDefaultMaxFrameRejections).
 	// Set before sendLoopStart, read-only afterwards.
@@ -399,6 +426,7 @@ func qwpSfNewSendLoop(
 		replayTargetFsn:         -1,
 		previousIdx:             -1,
 		poisonFsn:               -1,
+		lastProgressFsn:         -1,
 		maxFrameRejections:      qwpSfDefaultMaxFrameRejections,
 	}
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
@@ -410,7 +438,6 @@ func qwpSfNewSendLoop(
 	// (re)connect.
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
-	l.lastProgressFsn.Store(-1)
 	l.durableMismatchTerminal = true
 	// Wire the producer's per-publish doorbell. Set here (before
 	// sendLoopStart and before any producer append) so it satisfies
@@ -677,7 +704,8 @@ func (l *qwpSfSendLoop) sendLoopLastTerminalServerError() *SenderError {
 }
 
 // sendLoopTotalServerErrors returns the cumulative count of
-// SenderError payloads built by the loop (DROP and HALT combined).
+// SenderError payloads built by the loop (retriable and terminal
+// combined).
 func (l *qwpSfSendLoop) sendLoopTotalServerErrors() int64 {
 	return l.totalServerErrors.Load()
 }
@@ -936,45 +964,70 @@ func (l *qwpSfSendLoop) run() {
 			l.recordFatal(err)
 			return
 		}
-		if qwpSfIsTerminalUpgradeError(err) {
-			se := l.qwpSfBuildUpgradeFailureSE(err)
-			l.totalServerErrors.Add(1)
-			l.recordFatalServerError(se)
-			l.dispatcher.Load().offer(se)
-			return
-		}
-		// WS close codes carry no policy semantics: policy travels only
-		// in QWP NACK frames (a server rejecting bytes NACKs before it
-		// closes). Every close is therefore a transport event and
-		// reconnect-eligible. The one guarded case is a frame that
-		// deterministically kills the connection without a NACK (e.g.
-		// an intermediary's frame-size limit, or a server build that
-		// silently drops our dialect). That is caught behaviorally, not
-		// by code list: a non-orderly close arriving after this
-		// connection already sent the head frame counts a poison
-		// strike; maxFrameRejections consecutive strikes at the same
-		// head FSN with no ack progress escalate to a typed terminal.
-		// Orderly closes (NORMAL_CLOSURE role-change handoff,
-		// GOING_AWAY restart drain) never count strikes — they are the
-		// server asking us to go elsewhere, not a verdict on the bytes.
-		// A retriable NACK already counted its strike at the rejection
-		// site in receiverLoop, so its recycle skips the accounting.
+		// Classify the retriable-rejection sentinel BEFORE any upgrade
+		// sniffing: the sentinel embeds free-form server NACK text and
+		// the upgrade helpers fall back to substring matching
+		// ("forbidden", "got 401", ...), so a NACK message containing
+		// such text would otherwise latch a spurious terminal auth
+		// error. The sentinel's strike was already counted at the
+		// rejection site in receiverLoop, so its recycle skips the
+		// accounting below.
 		var retriable *qwpSfRetriableRejection
-		if !errors.As(err, &retriable) {
-			code := websocket.CloseStatus(err)
-			orderly := code == websocket.StatusNormalClosure ||
-				code == websocket.StatusGoingAway
-			if !orderly && l.framesSentOnConn.Load() > 0 && l.recordHeadRejectionStrike() {
-				se := l.buildPoisonedFrameSE(err.Error())
+		rejectionRecycle := errors.As(err, &retriable)
+		if !rejectionRecycle {
+			if qwpSfIsTerminalUpgradeError(err) {
+				se := l.qwpSfBuildUpgradeFailureSE(err)
 				l.totalServerErrors.Add(1)
-				l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
 				l.recordFatalServerError(se)
 				l.dispatcher.Load().offer(se)
 				return
 			}
+			// WS close codes carry no policy semantics: policy travels only
+			// in QWP NACK frames (a server rejecting bytes NACKs before it
+			// closes). Every close is therefore a transport event and
+			// reconnect-eligible. The one guarded case is a frame that
+			// deterministically kills the connection without a NACK (e.g.
+			// an intermediary's frame-size limit, or a server build that
+			// silently drops our dialect). That is caught behaviorally, not
+			// by code list: a non-orderly close arriving after this
+			// connection already sent the head frame counts a poison
+			// strike against the head FSN; strike-count overflow plus a
+			// full episode budget escalate to a typed terminal (see
+			// recordRejectionStrike). Orderly closes (NORMAL_CLOSURE
+			// role-change handoff, GOING_AWAY restart drain) never count
+			// strikes — they are the server asking us to go elsewhere,
+			// not a verdict on the bytes.
+			code := websocket.CloseStatus(err)
+			orderly := code == websocket.StatusNormalClosure ||
+				code == websocket.StatusGoingAway
+			if !orderly && l.framesSentOnConn.Load() > 0 {
+				if l.recordRejectionStrike(l.engine.engineAckedFsn() + 1) {
+					se := l.buildPoisonedFrameSE(err.Error())
+					l.totalServerErrors.Add(1)
+					l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
+					l.recordFatalServerError(se)
+					l.dispatcher.Load().offer(se)
+					return
+				}
+				rejectionRecycle = true
+			}
 		}
 		// The wire dropped; announce the outage before the reconnect walk.
 		l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
+		// A rejection-driven recycle pays escalating capped equal-jitter
+		// backoff before redialing. connectWithBackoff alone cannot pace
+		// it: against a reachable server its first dial binds instantly,
+		// so a persistent rejection window (e.g. a WRITE_ERROR burst)
+		// would otherwise hot-loop send→NACK→reconnect with no growth.
+		// Any ack resets the counter.
+		if rejectionRecycle {
+			pause := qwpSfComputeBackoff(l.rejectionRecycles,
+				l.reconnectInitialBackoff, l.reconnectMaxBackoff)
+			if !qwpSfSleepInterruptible(l.ctx, nil, pause) {
+				return
+			}
+			l.rejectionRecycles++
+		}
 		// Reconnect with backoff.
 		ok := l.connectWithBackoff(err, "reconnect")
 		if !ok {
@@ -1023,11 +1076,35 @@ func (l *qwpSfSendLoop) runOneConnection() error {
 	go runGuarded("receiver loop", l.receiverLoop)
 	inner.Wait()
 	close(errCh)
-	var first error
+	// Both goroutines report exactly one result each. When the server
+	// NACKs and then closes, the sender's wire error can land on errCh
+	// ahead of the receiver's classified result — surfacing the raw
+	// transport error would make run() count a second poison strike for
+	// the same rejection (and lose a typed terminal). Prefer the
+	// receiver's classification: the retriable-rejection sentinel first,
+	// then a typed *SenderError; otherwise keep first-error semantics.
+	var first, retriableErr, typedErr error
 	for e := range errCh {
-		if e.err != nil && first == nil {
+		if e.err == nil {
+			continue
+		}
+		if first == nil {
 			first = e.err
 		}
+		var retriable *qwpSfRetriableRejection
+		if retriableErr == nil && errors.As(e.err, &retriable) {
+			retriableErr = e.err
+		}
+		var se *SenderError
+		if typedErr == nil && errors.As(e.err, &se) {
+			typedErr = e.err
+		}
+	}
+	if retriableErr != nil {
+		return retriableErr
+	}
+	if typedErr != nil {
+		return typedErr
 	}
 	return first
 }
@@ -1193,16 +1270,12 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 	// while highestFullySent still trailed it; reconcile now that the
 	// watermark is published so a quiescent last frame — whose ACK has
 	// no later ACK to re-drive it — does not strand its acknowledgement.
-	//
-	// Durable mode is skipped here, but not because it is risk-free: its
-	// engine advance runs on the receiver goroutine (durableDrain, also
-	// clamped by highestFullySent), so the same last-frame strand is
-	// possible if a STATUS_DURABLE_ACK lands before this store. It cannot be
-	// re-driven from here — the durable tracker is receiver-owned, and
-	// calling durableDrain from the send goroutine would race it. The
-	// durable-ack keepalive re-elicits the ack and re-drives the drain
-	// instead; disabling it (interval <= 0) reopens that gap.
-	if !l.durableAckMode {
+	// Durable mode has the same strand (durableDrain is clamped by
+	// highestFullySent too, for the same munmap safety), so it gets the
+	// same send-side re-drive.
+	if l.durableAckMode {
+		l.durableDrain()
+	} else {
 		l.applyAckWatermark()
 	}
 	l.sendOffset = frameEnd
@@ -1297,26 +1370,46 @@ func (l *qwpSfSendLoop) dispatchProgress() {
 	l.progressDispatchMu.Lock()
 	defer l.progressDispatchMu.Unlock()
 	fsn := l.engine.engineAckedFsn()
-	if fsn <= l.lastProgressFsn.Load() {
+	if fsn <= l.lastProgressFsn {
 		return
 	}
-	l.lastProgressFsn.Store(fsn)
+	l.lastProgressFsn = fsn
 	d.offer(fsn)
 }
 
-// sendLoopSetDurableAck enables durable-ack mode and installs the tracker. Call
-// once before sendLoopStart. keepalive <= 0 disables the durable keepalive ping.
-// mismatchTerminal is true for a foreground sender (a durable-ack mismatch is
-// terminal) and false for a drainer (it retries within the reconnect budget).
-// sendLoopSetMaxFrameRejections overrides the poison-frame detector
-// threshold (max_frame_rejections). Non-positive keeps the default.
-// Must be called before sendLoopStart.
+// sendLoopSetMaxFrameRejections overrides the poison-frame detector's
+// strike threshold (max_frame_rejections). Non-positive keeps the
+// default. Must be called before sendLoopStart.
 func (l *qwpSfSendLoop) sendLoopSetMaxFrameRejections(n int) {
 	if n > 0 {
 		l.maxFrameRejections = n
 	}
 }
 
+// sendLoopSetOnRoundExhausted installs a hook fired once per exhausted
+// reconnect sweep (a full address-list walk that bound no host) with
+// the sweep's aggregate outcome, in addition to the loop's own
+// SenderAllEndpointsUnreachable event and throttled WARN. A drainer
+// uses it to run its per-sweep durable-ack settle accounting during
+// mid-drain reconnect windows. Must be called before sendLoopStart;
+// pass nil to clear.
+func (l *qwpSfSendLoop) sendLoopSetOnRoundExhausted(fn func(qwpSfSweepOutcome)) {
+	l.onRoundExhausted = fn
+}
+
+// sendLoopSetBackgroundWalks marks this loop's reconnect walks as
+// background: attempted hosts are tracked in a walk-local cursor
+// instead of the shared tracker's round slots (see qwpRoundCursor).
+// Set by drainers, whose walks run concurrently with the foreground
+// sender's. Must be called before sendLoopStart.
+func (l *qwpSfSendLoop) sendLoopSetBackgroundWalks(background bool) {
+	l.backgroundWalks = background
+}
+
+// sendLoopSetDurableAck enables durable-ack mode and installs the tracker. Call
+// once before sendLoopStart. keepalive <= 0 disables the durable keepalive ping.
+// mismatchTerminal is true for a foreground sender (a durable-ack mismatch is
+// terminal) and false for a drainer (it retries within the reconnect budget).
 func (l *qwpSfSendLoop) sendLoopSetDurableAck(enabled bool, keepalive time.Duration, mismatchTerminal bool) {
 	l.durableAckMode = enabled
 	l.durableKeepaliveInterval = keepalive
@@ -1338,7 +1431,7 @@ func (l *qwpSfSendLoop) sendLoopSetDurableAck(enabled bool, keepalive time.Durat
 // than trust the contract silently, seqGap detects the forward jump and this
 // returns a terminal PROTOCOL_VIOLATION so the sender HALTs (fail-closed) before
 // any un-durable frame is trimmed; close+rebuild then replays from the durable
-// watermark. Matches the server / Java per-frame ACK contract; the non-durable
+// watermark. Matches the server's per-frame ACK contract; the non-durable
 // path is immune (it ignores the trailer entirely). Returns nil when the ACK is
 // well-formed.
 func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) *SenderError {
@@ -1429,27 +1522,46 @@ type qwpSfRetriableRejection struct{ msg string }
 
 func (e *qwpSfRetriableRejection) Error() string { return e.msg }
 
-// recordHeadRejectionStrike records a server-active rejection (retriable
-// NACK, or non-orderly close after at least one send on this connection) at
-// the current head-of-line frame. Returns true when the same head FSN has now
-// been rejected maxFrameRejections consecutive times with no ack progress in
-// between — the frame is poisoned and replay is deterministic.
-func (l *qwpSfSendLoop) recordHeadRejectionStrike() bool {
-	head := l.engine.engineAckedFsn() + 1
-	if head == l.poisonFsn {
-		l.poisonStrikes++
-	} else {
-		l.poisonFsn = head
+// recordRejectionStrike records a server-active rejection (retriable NACK, or
+// non-orderly close after at least one send on this connection) against fsn —
+// the NACKed frame when the server named a wire sequence, the head-of-line
+// frame otherwise. Returns true when the frame is deemed poisoned: the same
+// FSN has been rejected maxFrameRejections consecutive times with no covering
+// ack, AND the episode has lasted at least reconnectMaxDuration. The duration
+// floor keeps a transient server-side rejection window (e.g. a WRITE_ERROR
+// burst during recovery) from burning every strike in a second and killing
+// the sender; below it the loop keeps recycling with paced backoff — a loud
+// stall, never a terminal, never a drop.
+func (l *qwpSfSendLoop) recordRejectionStrike(fsn int64) bool {
+	if fsn != l.poisonFsn {
+		l.poisonFsn = fsn
 		l.poisonStrikes = 1
+		l.poisonFirstStrikeAt = time.Now()
+	} else {
+		l.poisonStrikes++
 	}
-	return l.poisonStrikes >= l.maxFrameRejections
+	return l.poisonStrikes >= l.maxFrameRejections &&
+		time.Since(l.poisonFirstStrikeAt) >= l.reconnectMaxDuration
+}
+
+// clearPoisonUpTo resets the poison detector once an ack covers the
+// suspected frame. A lower ack (durable-mode replay re-OK-ing frames
+// behind the poisoned one) leaves the episode intact so fresh OKs for
+// predecessors cannot indefinitely defer escalation. Receiver-goroutine
+// only.
+func (l *qwpSfSendLoop) clearPoisonUpTo(ackFsn int64) {
+	if l.poisonFsn >= 0 && ackFsn >= l.poisonFsn {
+		l.poisonFsn = -1
+		l.poisonStrikes = 0
+	}
 }
 
 // buildPoisonedFrameSE builds the typed terminal for a poisoned frame: the
-// server (or an intermediary) has deterministically rejected the head-of-line
-// frame maxFrameRejections consecutive times with no ack progress, so
-// replaying it cannot succeed and retrying would loop forever. The rejected
-// bytes remain in the SF log on disk — nothing is silently discarded.
+// server (or an intermediary) has deterministically rejected the same frame
+// maxFrameRejections consecutive times across a full episode budget with no
+// covering ack, so replaying it cannot succeed and retrying would loop
+// forever. The rejected bytes remain in the SF log on disk — nothing is
+// silently discarded.
 func (l *qwpSfSendLoop) buildPoisonedFrameSE(lastRejection string) *SenderError {
 	from := l.engine.engineAckedFsn() + 1
 	to := l.engine.enginePublishedFsn()
@@ -1462,7 +1574,7 @@ func (l *qwpSfSendLoop) buildPoisonedFrameSE(lastRejection string) *SenderError 
 		ServerStatusByte: NoStatusByte,
 		ServerMessage: fmt.Sprintf("frame at fsn=%d rejected %d consecutive times with "+
 			"no ack progress — poisoned frame, replay cannot succeed (last: %s)",
-			from, l.poisonStrikes, lastRejection),
+			l.poisonFsn, l.poisonStrikes, lastRejection),
 		MessageSequence: NoMessageSequence,
 		FromFsn:         from,
 		ToFsn:           to,
@@ -1524,13 +1636,13 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			cat := qwpSfClassify(status)
 			pol := l.policyResolver.Load().resolve(cat)
 			var from, to int64
-			if highestSent < 0 {
-				// Pre-send rejection: no frame has finished sending on
-				// this connection yet, so the server-named wireSeq does
-				// not correspond to any frame we delivered. Attribute
-				// the failure to the unacked [ackedFsn+1, publishedFsn]
-				// window. Mirrors handlePreSendRejection in the Java
-				// client.
+			if highestSent < 0 || seq < 0 {
+				// Pre-send rejection (no frame has finished sending on
+				// this connection, so the server-named wireSeq does not
+				// correspond to any frame we delivered), or a NACK
+				// carrying the legal -1 no-sequence sentinel: nothing to
+				// attribute, so report the unacked
+				// [ackedFsn+1, publishedFsn] window.
 				from = l.engine.engineAckedFsn() + 1
 				to = l.engine.enginePublishedFsn()
 				if to < from {
@@ -1568,9 +1680,14 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// recycle the wire through the same reconnect machinery a
 			// transport failure uses. A pre-send rejection cannot
 			// implicate the head frame (nothing was sent on this
-			// connection), so it never counts a poison strike.
+			// connection), so it never counts a poison strike. Strikes
+			// key on `from`: the NACKed frame when attributable, the
+			// head-of-line frame otherwise — in durable mode replay
+			// re-sends already-OK'd predecessors ahead of the rejected
+			// frame, so head-of-line keying would restart the episode on
+			// every recycle.
 			l.dispatcher.Load().offer(se)
-			if highestSent >= 0 && l.recordHeadRejectionStrike() {
+			if highestSent >= 0 && l.recordRejectionStrike(from) {
 				poison := l.buildPoisonedFrameSE(fmt.Sprintf(
 					"server NACK status=0x%02X (%s): %s", byte(status), cat, msg))
 				l.totalServerErrors.Add(1)
@@ -1584,10 +1701,12 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			return &qwpSfRetriableRejection{msg: fmt.Sprintf(
 				"server NACK (%s, %s): %s", cat, pol, msg)}
 		}
-		// Any ACK means the server accepted the current head of the
-		// replay stream — clear poison-frame suspicion.
-		l.poisonFsn = -1
-		l.poisonStrikes = 0
+		// Any ACK is forward progress on this connection: reset the
+		// rejection-recycle pacing. Poison suspicion clears only once
+		// the acked FSN covers the suspected frame (clearPoisonUpTo) —
+		// in durable mode replay re-delivers already-OK'd predecessors,
+		// whose fresh OKs must not shield a later poisoned frame.
+		l.rejectionRecycles = 0
 		l.totalAcks.Add(1)
 		if l.durableAckMode {
 			// Durable mode: stash the OK and wait for STATUS_DURABLE_ACK to
@@ -1603,6 +1722,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				l.dispatcher.Load().offer(se)
 				return se
 			}
+			l.clearPoisonUpTo(l.fsnAtZero.Load() + seq)
 		} else {
 			// Record the server's cumulative ACK sequence, then reconcile it
 			// against highestFullySent. applyAckWatermark caps the advance at
@@ -1615,6 +1735,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// stranded when no later ACK follows it.
 			l.serverAckedSeq.Store(seq)
 			l.applyAckWatermark()
+			l.clearPoisonUpTo(l.engine.engineAckedFsn())
 		}
 	}
 }
@@ -1675,11 +1796,8 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		},
 		OnEndpointFailed: func(idx int, derr error) {
 			l.emitConn(SenderEndpointAttemptFailed, idx, -1, l.eventAttempt(), derr)
-			if l.onEndpointFailed != nil {
-				l.onEndpointFailed(idx, derr)
-			}
 		},
-		OnRoundExhausted: func(lastWasRoleReject bool) {
+		OnRoundExhausted: func(outcome qwpSfSweepOutcome) {
 			round++
 			l.connDispatcher.Load().offer(&SenderConnectionEvent{
 				Kind:            SenderAllEndpointsUnreachable,
@@ -1689,7 +1807,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 			})
 			if now := time.Now(); now.Sub(lastWarnAt) >= qwpSfReconnectWarnThrottle {
 				lastWarnAt = now
-				if lastWasRoleReject {
+				if outcome.allReplica() {
 					log.Printf("[WARN] qwp/sf: %s round %d: every reachable endpoint "+
 						"is a replica (transient failover window); retrying with capped "+
 						"backoff — if this persists the configured address list may "+
@@ -1699,8 +1817,12 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 						"retrying with capped backoff", phase, round)
 				}
 			}
+			if fn := l.onRoundExhausted; fn != nil {
+				fn(outcome)
+			}
 		},
 		DurableMismatchTerminal: l.durableMismatchTerminal,
+		Background:              l.backgroundWalks,
 	}
 	result := qwpSfRunRoundWalk(l.ctx, nil, params, enteringPreviousIdx)
 
@@ -1736,7 +1858,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		l.totalServerErrors.Add(1)
 		// Fire the terminal connection event before latching the producer-
 		// observable error, so a listener is notified no later than the
-		// producer learns via its next API call (matches Java's order). Only an
+		// producer learns via its next API call. Only an
 		// actual auth reject maps to SenderAuthFailed; other terminal upgrade
 		// failures (e.g. a durable-ack mismatch) surface via the typed
 		// PROTOCOL_VIOLATION SenderError only.

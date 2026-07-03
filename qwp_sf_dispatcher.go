@@ -269,7 +269,22 @@ func (d *qwpSfErrorDispatcher) drain() {
 			}
 			d.deliver(e)
 		case <-deadline.C:
-			return
+			// Deadline elapsed with items still queued (a slow handler).
+			// Count the leftovers as dropped here: on a re-entrant close
+			// (a handler calling Close on this goroutine) this drain is the
+			// only sweep that runs — close() returned before its own
+			// leftovers sweep — so skipping the count would strand them
+			// invisible to droppedNotifications. Mirrors qwpDispatcher.drain.
+			for {
+				select {
+				case e := <-d.inbox:
+					if e != nil {
+						d.dropped.Add(1)
+					}
+				default:
+					return
+				}
+			}
 		default:
 			return
 		}
@@ -401,6 +416,16 @@ func (d *qwpSfErrorDispatcher) close() {
 			return
 		}
 	}
+}
+
+// loopGoroutineId returns the goid of the running dispatch goroutine, or 0
+// when it is not (or never) running. Nil-safe. Used by the sender's
+// re-entrancy guard to detect Close/Flush calls made from inside a handler.
+func (d *qwpSfErrorDispatcher) loopGoroutineId() int64 {
+	if d == nil {
+		return 0
+	}
+	return d.loopGoid.Load()
 }
 
 // droppedNotifications returns the cumulative count of inbox-overflow

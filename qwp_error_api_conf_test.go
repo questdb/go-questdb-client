@@ -25,6 +25,7 @@
 package questdb_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -104,6 +105,37 @@ func TestErrorApiConfStringInvalidValues(t *testing.T) {
 				t.Fatalf("error = %v, want to contain %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestErrorApiConfStringV1PoliciesRejected pins the source-breaking migration:
+// the v1 policy values (halt / drop) are rejected with a hint pointing at the
+// v2 names, on the global key and every per-category key, rather than silently
+// reinterpreted.
+func TestErrorApiConfStringV1PoliciesRejected(t *testing.T) {
+	keys := []string{
+		"on_server_error", "on_schema_error", "on_parse_error",
+		"on_internal_error", "on_security_error", "on_write_error",
+	}
+	for _, k := range keys {
+		for _, v := range []string{"halt", "drop"} {
+			conf := fmt.Sprintf("ws::addr=h:9000;%s=%s;", k, v)
+			t.Run(conf, func(t *testing.T) {
+				_, err := qdb.ConfFromStr(conf)
+				if err == nil {
+					t.Fatalf("ConfFromStr(%q) should reject the removed v1 policy", conf)
+				}
+				msg := err.Error()
+				if !strings.Contains(msg, k) {
+					t.Fatalf("error = %v, want to name the key %q", err, k)
+				}
+				for _, want := range []string{"terminal", "retriable", "retriable_other"} {
+					if !strings.Contains(msg, want) {
+						t.Fatalf("error = %v, want migration hint naming %q", err, want)
+					}
+				}
+			})
+		}
 	}
 }
 

@@ -311,7 +311,10 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	}
 	loop.sendLoopSetDurableAck(conf.requestDurableAck, durableKeepalive, true)
 	loop.sendLoopSetMaxFrameRejections(conf.maxFrameRejections)
-	loop.sendLoopSetProgressHandler(conf.progressHandler, conf.errorInboxCapacity)
+	// The progress inbox has no dedicated sizing knob; give it the shared
+	// dispatcher default rather than borrowing error_inbox_capacity, which
+	// users tune for error bursts, not the (coalescing) progress stream.
+	loop.sendLoopSetProgressHandler(conf.progressHandler, qwpSfDefaultErrorInboxCapacity)
 
 	s, err := newQwpCursorLineSender(
 		conf.autoFlushRows,
@@ -746,38 +749,48 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 	return s.encodeInfoBuf, nil
 }
 
-// calledFromErrorHandler reports whether the current goroutine is the
-// error dispatcher's loop goroutine — i.e. we are running inside a
-// user SenderErrorHandler invocation. The handler is documented as
-// allowed to call Close() / Flush(); when it does, those calls run off
-// the producer goroutine. The producer owns lastErr / hasTable /
-// currentTable / pendingRowCount / the tableBuffers map / the
-// dirtyTables list / the encoder with no happens-before against this
+// calledFromDispatcherGoroutine reports whether the current goroutine is one of
+// the sender's callback dispatcher goroutines — i.e. we are running inside a
+// user SenderErrorHandler, SenderConnectionListener, or SenderProgressHandler
+// invocation. Callbacks are documented as allowed to call Close() / Flush();
+// when they do, those calls run off the producer goroutine. The producer owns
+// lastErr / hasTable / currentTable / pendingRowCount / the tableBuffers map /
+// the dirtyTables list / the encoder with no happens-before against this
 // goroutine, so the Close()/Flush() paths must NOT touch that state —
 // doing so races a producer mid-At(): buildTableEncodeInfo ranges
 // dirtyTables while Table() appends to it, and Table() writes the
 // tableBuffers map, either of which corrupts state (a racing slice
 // range/append, or Go's fatal "concurrent map iteration and map write").
 //
-// Cheap on the common path: loopGoid is 0 whenever the dispatcher
-// goroutine is not running (no server error has ever been delivered),
-// so the runtime.Stack cost of qwpGoid() is only paid once an error has
-// actually spun the dispatcher up. The g != 0 guard keeps a goid parse
-// failure from matching the loopGoid==0 "not running" sentinel.
-func (s *qwpLineSender) calledFromErrorHandler() bool {
+// Cheap on the common path: each loopGoid is 0 whenever that dispatcher
+// goroutine is not running (nothing has ever been delivered on it), so the
+// runtime.Stack cost of qwpGoid() is only paid once a dispatcher has actually
+// spun up. The g != 0 guard keeps a goid parse failure from matching the
+// loopGoid==0 "not running" sentinel.
+func (s *qwpLineSender) calledFromDispatcherGoroutine() bool {
 	if s.cursorSendLoop == nil {
 		return false
 	}
-	d := s.cursorSendLoop.sendLoopDispatcher()
-	if d == nil {
-		return false
+	loopIds := [3]int64{
+		s.cursorSendLoop.sendLoopDispatcher().loopGoroutineId(),
+		s.cursorSendLoop.sendLoopConnDispatcher().loopGoroutineId(),
+		s.cursorSendLoop.progressDispatcher.Load().loopGoroutineId(),
 	}
-	lg := d.loopGoid.Load()
-	if lg == 0 {
-		return false
+	g := int64(0)
+	for _, lg := range loopIds {
+		if lg == 0 {
+			continue
+		}
+		if g == 0 {
+			if g = qwpGoid(); g == 0 {
+				return false
+			}
+		}
+		if g == lg {
+			return true
+		}
 	}
-	g := qwpGoid()
-	return g != 0 && g == lg
+	return false
 }
 
 // closeCursor drains the cursor engine and closes the send loop.
@@ -794,10 +807,11 @@ func (s *qwpLineSender) calledFromErrorHandler() bool {
 //     recovery path and must treat the timeout as fatal.
 //   - closeFlushTimeout <= 0: skip the drain entirely (fast close).
 func (s *qwpLineSender) closeCursor(ctx context.Context) error {
-	// A Close() invoked from inside a SenderErrorHandler runs on the
+	// A Close() invoked from inside a user callback (SenderErrorHandler,
+	// SenderConnectionListener, or SenderProgressHandler) runs on that
 	// dispatcher goroutine, not the producer goroutine. Flushing pending
 	// rows or even reading lastErr / hasTable / pendingRowCount here
-	// would race a producer still mid-Table()/At() (the C3
+	// would race a producer still mid-Table()/At() (the
 	// producer-state race). Skip every producer-state access in that
 	// case and run only the goroutine-safe teardown below (drain wait,
 	// send-loop close, engine close, drainer pool). The producer
@@ -806,7 +820,7 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	// handed off and remain its own to retry (SF mode replays whatever
 	// was already persisted on the next open).
 	var firstErr error
-	if !s.calledFromErrorHandler() {
+	if !s.calledFromDispatcherGoroutine() {
 		// Surface any latched fluent-API error (e.g. validation failure
 		// on Symbol/*Column/Table) so Close() doesn't silently swallow
 		// it — mirrors the HTTP sender's flush0, which drains
@@ -1008,8 +1022,8 @@ func (s *qwpLineSender) LastTerminalError() *SenderError {
 // analogue of QwpQueryClient.terminalError. It never reports true during a
 // normal transient reconnect: lastError is latched only on the loop's terminal
 // exit and is never cleared. The pool uses it to discard a slot poisoned by a
-// background HALT instead of leaking it to the next borrower (M1) or recycling
-// it after a benign producer error (M4).
+// background HALT instead of leaking it to the next borrower or recycling
+// it after a benign producer error.
 func (s *qwpLineSender) terminallyFailed() bool {
 	return s.cursorSendLoop != nil && s.cursorSendLoop.sendLoopCheckError() != nil
 }
