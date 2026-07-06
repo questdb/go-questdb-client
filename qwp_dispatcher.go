@@ -196,20 +196,20 @@ func (d *qwpDispatcher[T]) drain() {
 func (d *qwpDispatcher[T]) deliver(e T) {
 	d.delivered.Add(1)
 	defer func() {
-		if r := recover(); r != nil {
-			// describe is library-owned and panic-safe today, but guard it
-			// anyway: loop() has no recover, so a second panic escaping this
-			// recovery block would crash the host — the exact guarantee this
-			// dispatcher exists to keep.
-			msg := ""
-			if d.describe != nil {
-				func() {
-					defer func() { _ = recover() }()
-					msg = d.describe(e)
-				}()
-			}
-			qwpEffectiveLogger(d.logger).Error(d.logPrefix+": handler panicked", "on", msg, "panic", r)
+		r := recover()
+		if r == nil {
+			return
 		}
+		// loop() has no recover, so a second panic while reporting the
+		// handler panic — from describe or a user-supplied logger — would
+		// escape and crash the host, defeating the guarantee this
+		// dispatcher exists to keep.
+		defer func() { _ = recover() }()
+		msg := ""
+		if d.describe != nil {
+			msg = d.describe(e)
+		}
+		qwpEffectiveLogger(d.logger).Error(d.logPrefix+": handler panicked", "on", msg, "panic", r)
 	}()
 	d.handler(e)
 }

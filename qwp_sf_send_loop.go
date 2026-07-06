@@ -669,17 +669,26 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 	case <-timer.C:
 		// Wedged in I/O the ctx cannot reach (a disk-backed segment mmap
 		// page-fault on hung storage). Abandon rather than hang Close: the
-		// goroutine lives until its syscall returns and releases the transport via
-		// its own defer, so we must NOT swap the transport out or close the
-		// dispatchers it may still touch. Mirrors the orphan drainer pool's
-		// hard-close abandon.
+		// goroutine lives until its syscall returns and releases the transport
+		// via its own defer, so we must NOT swap the transport out. The
+		// dispatchers are still safe to close — offer() on a closed dispatcher is
+		// a no-op — which bounds the leak to the single wedged goroutine.
 		qwpEffectiveLogger(l.logger).Warn("qwp/sf: send loop still running after close; "+
 			"abandoning (wedged in un-cancellable disk I/O)", "grace", qwpSfSendLoopCloseGrace)
+		l.closeDispatchers()
 		return l.checkErrorOrNil()
 	}
 	if t := l.transport.Swap(nil); t != nil {
 		_ = t.close()
 	}
+	l.closeDispatchers()
+	return l.checkErrorOrNil()
+}
+
+// closeDispatchers stops the error, connection, and progress dispatcher
+// goroutines. Safe even on the wedged-I/O abandon path: offer() on a closed
+// dispatcher is a no-op, so a still-running send loop cannot fault on them.
+func (l *qwpSfSendLoop) closeDispatchers() {
 	if d := l.dispatcher.Load(); d != nil {
 		d.close()
 	}
@@ -689,7 +698,6 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 	if d := l.progressDispatcher.Load(); d != nil {
 		d.close()
 	}
-	return l.checkErrorOrNil()
 }
 
 // sendLoopCheckError returns the first terminal error the I/O

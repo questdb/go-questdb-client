@@ -31,6 +31,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -323,6 +324,16 @@ func (m *qwpSfSegmentManager) workerLoop() {
 	defer close(m.done)
 	timer := time.NewTimer(m.pollInterval)
 	defer timer.Stop()
+	// This goroutine drives no untrusted input, so a panic here is not a
+	// known reachable path; recover anyway — an uncaught panic on it would
+	// crash the host. The deferred close(m.done)/worker.Done still run and
+	// signal shutdown.
+	defer func() {
+		if r := recover(); r != nil {
+			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager worker panicked",
+				"detail", fmt.Sprintf("%v\n%s", r, debug.Stack()))
+		}
+	}()
 	for {
 		// Refill the reusable ring snapshot so we don't hold the mutex
 		// through the (potentially slow) syscalls during creation /

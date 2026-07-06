@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -242,6 +243,29 @@ func TestQwpSfDispatcherOfferCloseRaceNoLoss(t *testing.T) {
 				iter, got, want, want-got)
 		}
 	}
+}
+
+// TestQwpSfDispatcherHandlerAndLoggerPanicDoesNotCrash pins that a handler
+// panic AND a panicking recovery-path logger together do not escape
+// deliver()/loop() and crash the host.
+func TestQwpSfDispatcherHandlerAndLoggerPanicDoesNotCrash(t *testing.T) {
+	var calls atomic.Int64
+	d := newQwpSfErrorDispatcher(func(*SenderError) {
+		calls.Add(1)
+		panic("boom")
+	}, 4)
+	d.logger = slog.New(panicOnHandleSlog{})
+	for i := 0; i < 3; i++ {
+		d.offer(&SenderError{Category: CategoryParseError})
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if calls.Load() < 3 {
+		t.Fatalf("dispatcher stopped after logger panic: calls=%d", calls.Load())
+	}
+	d.close()
 }
 
 // TestQwpSfDispatcherPanicCaught asserts a panicking handler is

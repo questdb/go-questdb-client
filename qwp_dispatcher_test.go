@@ -25,11 +25,23 @@
 package questdb
 
 import (
+	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// panicOnHandleSlog is an slog.Handler whose Handle always panics — a stand-in
+// for a buggy user-supplied logger. It proves deliver() contains a panic from
+// the recovery-path logger, not only from the handler itself.
+type panicOnHandleSlog struct{}
+
+func (panicOnHandleSlog) Enabled(context.Context, slog.Level) bool  { return true }
+func (panicOnHandleSlog) Handle(context.Context, slog.Record) error { panic("logger boom") }
+func (h panicOnHandleSlog) WithAttrs([]slog.Attr) slog.Handler      { return h }
+func (h panicOnHandleSlog) WithGroup(string) slog.Handler           { return h }
 
 // TestQwpDispatcherUnit covers the generic dispatcher: delivery, panic-recovery,
 // counters, nil-guards, and offer on a nil/closed dispatcher.
@@ -67,6 +79,29 @@ func TestQwpDispatcherUnit(t *testing.T) {
 	if nilD.offer(&SenderConnectionEvent{}) {
 		t.Error("offer on nil dispatcher should return false")
 	}
+}
+
+// TestQwpDispatcherHandlerAndLoggerPanicDoesNotCrash pins the guarantee that a
+// user handler panic AND a panicking recovery-path logger together do not
+// escape deliver()/loop() and crash the host.
+func TestQwpDispatcherHandlerAndLoggerPanicDoesNotCrash(t *testing.T) {
+	var delivered atomic.Int64
+	d := newQwpConnDispatcher(func(SenderConnectionEvent) {
+		delivered.Add(1)
+		panic("handler boom")
+	}, 4)
+	d.logger = slog.New(panicOnHandleSlog{})
+	for i := 0; i < 3; i++ {
+		d.offer(&SenderConnectionEvent{Kind: SenderConnected})
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for d.totalDelivered() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if d.totalDelivered() < 3 {
+		t.Fatalf("dispatcher stopped after logger panic: delivered=%d", d.totalDelivered())
+	}
+	d.close()
 }
 
 // TestQwpDispatcherDeliversInOrder pins the single-consumer FIFO contract on the

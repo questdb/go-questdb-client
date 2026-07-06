@@ -303,19 +303,16 @@ func (d *qwpSfErrorDispatcher) drain() {
 func (d *qwpSfErrorDispatcher) deliver(e *SenderError) {
 	d.delivered.Add(1)
 	defer func() {
-		if r := recover(); r != nil {
-			// e.Error() is library-owned and panic-safe today, but format it
-			// under a nested recover anyway: loop() has no recover, so a second
-			// panic escaping this recovery block would crash the host — matching
-			// the generic qwpDispatcher.deliver hardening.
-			msg := ""
-			func() {
-				defer func() { _ = recover() }()
-				msg = e.Error()
-			}()
-			qwpEffectiveLogger(d.logger).Error("qwp/sf: error handler panicked",
-				"error", msg, "panic", r)
+		r := recover()
+		if r == nil {
+			return
 		}
+		// loop() has no recover, so a second panic while reporting the
+		// handler panic — from e.Error() or a user-supplied logger — would
+		// escape and crash the host. Mirrors qwpDispatcher.deliver.
+		defer func() { _ = recover() }()
+		qwpEffectiveLogger(d.logger).Error("qwp/sf: error handler panicked",
+			"error", e.Error(), "panic", r)
 	}()
 	d.handler(e)
 }

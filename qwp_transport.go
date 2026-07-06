@@ -617,9 +617,10 @@ func (t *qwpTransport) sendMessage(ctx context.Context, data []byte) error {
 //   - DURABLE_ACK frames are unsolicited per-table watermarks. They
 //     are validated and returned to the caller with status
 //     QwpStatusDurableAck — the caller decides what to do with them
-//     (the cursor send loop ignores them and reads on). Servers only
-//     emit them when the client opts in via the X-QWP-Request-Durable-
-//     Ack header, which this transport does not set.
+//     (in durable mode the cursor send loop advances the trim watermark
+//     from them; otherwise it ignores them, warning once). The server
+//     emits them only when the client sets the X-QWP-Request-Durable-Ack
+//     header, which the transport does when request_durable_ack is set.
 //
 //   - Error ACKs are exactly qwpAckErrorHeaderSize + msg_len bytes.
 //
