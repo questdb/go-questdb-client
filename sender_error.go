@@ -99,9 +99,10 @@ const (
 	// CategoryProtocolViolation: a frame the server (or an
 	// intermediary) deterministically rejects — the poison-frame
 	// detector observed the same head-of-line frame fail
-	// max_frame_rejections consecutive times with no ack progress —
-	// or a 404/426 upgrade rejection / durable-ack capability
-	// mismatch. Forced TERMINAL.
+	// max_frame_rejections consecutive times with no ack progress,
+	// over an episode at least the reconnect max-duration long — or a
+	// 404/426 upgrade rejection / durable-ack capability mismatch.
+	// Forced TERMINAL.
 	CategoryProtocolViolation
 
 	numCategories // sentinel: must be last
@@ -162,11 +163,12 @@ const (
 	// progress escalates to PolicyTerminal via the poison-frame
 	// detector (max_frame_rejections).
 	PolicyRetriable
-	// PolicyRetriableOther: same replay semantics as PolicyRetriable,
-	// but the rejection says this node cannot serve writes at all
-	// (read-only replica / demoting primary), so the reconnect
-	// rotates to the next configured endpoint rather than waiting out
-	// a backoff against the same node.
+	// PolicyRetriableOther: same recycle-and-replay semantics as
+	// PolicyRetriable, used for a rejection that says this node cannot
+	// serve writes at all (read-only replica / demoting primary). The
+	// reconnect demotes the current node like any transport failure, so
+	// on a multi-endpoint cluster it naturally repicks another endpoint
+	// first.
 	PolicyRetriableOther
 	// PolicyTerminal: latch the error as terminal. The next
 	// producer-thread API call returns the SenderError; the sender

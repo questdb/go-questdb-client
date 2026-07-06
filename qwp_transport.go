@@ -688,6 +688,11 @@ func (t *qwpTransport) readAck(ctx context.Context) (QwpStatusCode, []byte, erro
 // the buffer exactly. Returns nil on success or a descriptive error
 // for any truncation, lying-length entry, empty table name, or
 // trailing garbage.
+//
+// qwpMaxAckTableNameLen bounds a single table name in an ACK trailer, far above
+// any real QuestDB table name.
+const qwpMaxAckTableNameLen = 255
+
 func validateAckTableEntries(tail []byte) error {
 	if len(tail) < 2 {
 		return fmt.Errorf("missing table count")
@@ -705,6 +710,13 @@ func validateAckTableEntries(tail []byte) error {
 		// never zero bytes.
 		if nameLen == 0 {
 			return fmt.Errorf("empty table name in entry %d", i)
+		}
+		// nameLen is a uint16 (up to 64 KiB). Real table names are short;
+		// bound it so a hostile server cannot stream distinct max-length
+		// names to pin gigabytes of interned strings before the durable
+		// tracker's distinct-name count cap trips.
+		if nameLen > qwpMaxAckTableNameLen {
+			return fmt.Errorf("table name in entry %d too long: %d bytes (max %d)", i, nameLen, qwpMaxAckTableNameLen)
 		}
 		if len(tail) < off+nameLen+8 {
 			return fmt.Errorf("truncated table entry %d (body)", i)

@@ -325,6 +325,13 @@ type qwpSfSendLoop struct {
 	// this connection actually sent it.
 	framesSentOnConn atomic.Int64
 
+	// acksOnConn counts server acks received on the current connection
+	// (reset on every connection swap). run() paces a recycle whose
+	// connection sent frames but got nothing back, so a server that
+	// upgrades and then closes without acking cannot hot-loop
+	// dial→replay→close with no backoff.
+	acksOnConn atomic.Int64
+
 	// Poison-frame detector state. poisonFsn is the FSN implicated by
 	// the most recent server-active rejection (retriable NACK, or
 	// non-orderly close after at least one send on the connection): the
@@ -791,6 +798,7 @@ func (l *qwpSfSendLoop) positionCursorForStart() error {
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
 	l.framesSentOnConn.Store(0)
+	l.acksOnConn.Store(0)
 	if l.durableAckMode {
 		// A (re)connection re-emits cumulative durable watermarks from scratch,
 		// and replay restarts from engineAckedFsn()+1 (the durable watermark), so
@@ -920,6 +928,10 @@ func (l *qwpSfSendLoop) run() {
 	// and its later swap sees nil; close() guards a nil conn and pins
 	// one result via closeOnce.
 	defer func() {
+		// This defer runs after the top-level recover (LIFO), so a panic
+		// here would escape it; contain it locally. No close() panic is
+		// known — defense in depth on the unwind path.
+		defer func() { _ = recover() }()
 		if t := l.transport.Swap(nil); t != nil {
 			_ = t.close()
 		}
@@ -1006,8 +1018,9 @@ func (l *qwpSfSendLoop) run() {
 			code := websocket.CloseStatus(err)
 			orderly := code == websocket.StatusNormalClosure ||
 				code == websocket.StatusGoingAway
-			if !orderly && l.framesSentOnConn.Load() > 0 {
-				if l.recordRejectionStrike(l.engine.engineAckedFsn() + 1) {
+			sentSomething := l.framesSentOnConn.Load() > 0
+			if !orderly && sentSomething {
+				if l.recordRejectionStrike(l.highestOkAckedFsn() + 1) {
 					se := l.buildPoisonedFrameSE(err.Error())
 					l.totalServerErrors.Add(1)
 					l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
@@ -1015,6 +1028,12 @@ func (l *qwpSfSendLoop) run() {
 					l.dispatcher.Load().offer(se)
 					return
 				}
+				rejectionRecycle = true
+			} else if sentSomething && l.acksOnConn.Load() == 0 {
+				// Orderly close (or any close before the first ack) after we
+				// sent frames but got nothing back: pace the recycle without a
+				// strike, so a server that upgrades and then closes without
+				// acking cannot hot-loop dial→replay→close at full rate.
 				rejectionRecycle = true
 			}
 		}
@@ -1025,7 +1044,7 @@ func (l *qwpSfSendLoop) run() {
 		// it: against a reachable server its first dial binds instantly,
 		// so a persistent rejection window (e.g. a WRITE_ERROR burst)
 		// would otherwise hot-loop send→NACK→reconnect with no growth.
-		// Any ack resets the counter.
+		// An ack covering the retried frame resets the counter.
 		if rejectionRecycle {
 			pause := qwpSfComputeBackoff(l.rejectionRecycles,
 				l.reconnectInitialBackoff, l.reconnectMaxBackoff)
@@ -1445,6 +1464,9 @@ func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) *SenderError {
 	if assigned < 0 {
 		return nil // ACK before any send
 	}
+	if seq < 0 {
+		return nil // OK acks name a real wire sequence; -1 is the NACK-only no-seq sentinel
+	}
 	if expected, gap := l.durable.seqGap(seq); gap {
 		return l.qwpSfBuildDurableGapSE(seq, expected)
 	}
@@ -1527,6 +1549,25 @@ func (l *qwpSfSendLoop) durableDrain() {
 type qwpSfRetriableRejection struct{ msg string }
 
 func (e *qwpSfRetriableRejection) Error() string { return e.msg }
+
+// highestOkAckedFsn is the FSN of the last frame the server OK-acked on the
+// current connection (the baseline when none yet). The poison detector keys its
+// head-of-line anchor on this + 1. In durable mode the engine watermark tracks
+// durable uploads, not OK acks, so a reconnect replays OK'd-but-not-yet-durable
+// frames; anchoring on the durable watermark would let those replay-OKs reset
+// the detector — and the recycle backoff — every cycle, defeating both. The
+// durable tracker's OK high-water is used instead, clamped to what was actually
+// sent so a forged ahead-of-send ack cannot push the anchor past a real frame.
+func (l *qwpSfSendLoop) highestOkAckedFsn() int64 {
+	if !l.durableAckMode {
+		return l.engine.engineAckedFsn()
+	}
+	last := l.durable.lastOkSeq()
+	if assigned := l.nextWireSeq.Load() - 1; last > assigned {
+		last = assigned
+	}
+	return l.fsnAtZero.Load() + last
+}
 
 // recordRejectionStrike records a server-active rejection (retriable NACK, or
 // non-orderly close after at least one send on this connection) against fsn —
@@ -1655,26 +1696,31 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			_, _, msg := parseAckErrorPayload(data)
 			cat := qwpSfClassify(status)
 			pol := l.policyResolver.Load().resolve(cat)
-			var from, to int64
+			// from/to bound the reported (informational) span; anchor is the
+			// frame a poison strike keys on. They coincide for a server-named
+			// wireSeq but differ head-of-line: the report spans the whole
+			// unacked replay window while the strike keys on the first
+			// not-yet-OK'd frame so replay re-OKs of predecessors cannot
+			// restart the episode.
+			var from, to, anchor int64
 			if highestSent < 0 || seq < 0 {
 				// Pre-send rejection (no frame has finished sending on
 				// this connection, so the server-named wireSeq does not
 				// correspond to any frame we delivered), or a NACK
-				// carrying the legal -1 no-sequence sentinel: nothing to
-				// attribute, so report the unacked
-				// [ackedFsn+1, publishedFsn] window.
+				// carrying the legal -1 no-sequence sentinel.
 				from = l.engine.engineAckedFsn() + 1
 				to = l.engine.enginePublishedFsn()
 				if to < from {
 					to = from
 				}
+				anchor = l.highestOkAckedFsn() + 1
 			} else {
 				cappedSeq := seq
 				if cappedSeq > highestSent {
 					cappedSeq = highestSent
 				}
 				fsn := l.fsnAtZero.Load() + cappedSeq
-				from, to = fsn, fsn
+				from, to, anchor = fsn, fsn, fsn
 			}
 			se := &SenderError{
 				Category:         cat,
@@ -1707,7 +1753,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// frame, so head-of-line keying would restart the episode on
 			// every recycle.
 			l.dispatcher.Load().offer(se)
-			if highestSent >= 0 && l.recordRejectionStrike(from) {
+			if highestSent >= 0 && l.recordRejectionStrike(anchor) {
 				poison := l.buildPoisonedFrameSE(fmt.Sprintf(
 					"server NACK status=0x%02X (%s): %s", byte(status), cat, msg))
 				l.totalServerErrors.Add(1)
@@ -1728,6 +1774,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 		// must neither shield a later poisoned frame nor reset the recycle
 		// backoff into a ~initial-backoff hot loop.
 		l.totalAcks.Add(1)
+		l.acksOnConn.Add(1)
 		if l.durableAckMode {
 			// Durable mode: stash the OK and wait for STATUS_DURABLE_ACK to
 			// trim. serverAckedSeq is deliberately not recorded here — the
@@ -1742,7 +1789,10 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				l.dispatcher.Load().offer(se)
 				return se
 			}
-			l.noteAckProgress(l.fsnAtZero.Load() + seq)
+			// Key progress on the highest OK-acked frame (clamped to what was
+			// sent), not the raw server seq: a forged ahead-of-send ack must
+			// not clear the poison detector for frames never delivered.
+			l.noteAckProgress(l.highestOkAckedFsn())
 		} else {
 			// Record the server's cumulative ACK sequence, then reconcile it
 			// against highestFullySent. applyAckWatermark caps the advance at
@@ -1932,6 +1982,7 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
 	l.framesSentOnConn.Store(0)
+	l.acksOnConn.Store(0)
 	if l.durableAckMode {
 		// A (re)connection re-emits cumulative durable watermarks from scratch,
 		// and replay restarts from engineAckedFsn()+1 (the durable watermark), so

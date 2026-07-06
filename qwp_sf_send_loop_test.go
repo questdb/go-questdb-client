@@ -1069,10 +1069,10 @@ func TestQwpSfSendLoopRetriableNackRepeatedPoisonEscalates(t *testing.T) {
 // signature of a routine server restart or LB RST landing in the
 // window between a fresh sender's first frame and its first ACK —
 // reconnects, replays the unacked frame, and recovers once the server
-// ACKs. A repeated ACK-less pattern (>= qwpSfMaxSilentConnStrikes
-// connections, i.e. at least one full reconnect+replay cycle that
-// still met silence) is what trips the terminal classification; that
-// case is TestQwpSfSendLoopSilentDropAfterFrameIsTerminal.
+// ACKs. A repeated same-frame rejection pattern (max_frame_rejections
+// strikes over the episode budget) is what trips the poison-frame
+// terminal; that case is
+// TestQwpSfSendLoopSilentDropRepeatedPoisonEscalates.
 func TestQwpSfSendLoopSilentDropOnFirstConnReconnects(t *testing.T) {
 	// Conn 1 reads one frame then closes without ACKing (the
 	// transient restart/RST); conn 2+ ACK normally.
@@ -1118,9 +1118,10 @@ func TestQwpSfSendLoopSilentDropOnFirstConnReconnects(t *testing.T) {
 		"the unacked frame should have been replayed on the new connection")
 }
 
-// TestQwpSfSendLoopSilentDropAfterPriorAckReconnects pins the
-// regression for the poison detector's below-threshold behavior after a
-// prior ACK: strikes 1..N-1 against a frame-eating endpoint reconnect
+// TestQwpSfSendLoopSilentDropAfterPriorAckPoisonEscalatesAtThreshold
+// pins the regression for the poison detector's below-threshold
+// behavior after a prior ACK: strikes 1..N-1 against a frame-eating
+// endpoint reconnect
 // and replay (each drop is a transport event, not a first-sight
 // terminal), and only the Nth consecutive strike at the same head FSN
 // escalates to the typed poisoned-frame terminal — prior lifetime ACKs
@@ -1620,6 +1621,57 @@ func TestQwpSfSendLoopNoteAckProgressPacing(t *testing.T) {
 	l.noteAckProgress(50)
 	require.Equal(t, 0, l.rejectionRecycles)
 	require.Equal(t, int64(-1), l.poisonFsn)
+}
+
+// TestQwpSfSendLoopRecordRejectionStrikeDualCondition pins that poison
+// escalation requires BOTH the strike count AND the episode-duration floor
+// (reconnectMaxDuration). Reaching the strike count while the episode is younger
+// than the floor keeps recycling rather than terminating, so a transient
+// rejection burst cannot kill the sender in a second.
+func TestQwpSfSendLoopRecordRejectionStrikeDualCondition(t *testing.T) {
+	t.Run("StrikeCountAloneDoesNotEscalate", func(t *testing.T) {
+		l := &qwpSfSendLoop{poisonFsn: -1, maxFrameRejections: 2, reconnectMaxDuration: time.Hour}
+		require.False(t, l.recordRejectionStrike(5)) // strike 1
+		require.False(t, l.recordRejectionStrike(5)) // strike 2 >= threshold, episode < 1h
+		require.False(t, l.recordRejectionStrike(5)) // strike 3, still < 1h
+	})
+
+	t.Run("EscalatesOnceBothMet", func(t *testing.T) {
+		l := &qwpSfSendLoop{poisonFsn: -1, maxFrameRejections: 2, reconnectMaxDuration: 0}
+		require.False(t, l.recordRejectionStrike(5)) // strike 1 < threshold
+		require.True(t, l.recordRejectionStrike(5))  // strike 2 >= threshold, episode >= 0
+	})
+
+	t.Run("DifferentHeadFsnRestartsTheEpisode", func(t *testing.T) {
+		l := &qwpSfSendLoop{poisonFsn: -1, maxFrameRejections: 2, reconnectMaxDuration: 0}
+		l.recordRejectionStrike(5)
+		require.False(t, l.recordRejectionStrike(9))
+		require.Equal(t, 1, l.poisonStrikes)
+		require.Equal(t, int64(9), l.poisonFsn)
+	})
+}
+
+// TestQwpSfSendLoopHighestOkAckedFsnDurable pins that in durable mode the poison
+// detector's head-of-line anchor keys on the highest OK-acked frame (the durable
+// tracker's OK high-water), not the durable watermark. Anchoring on the durable
+// watermark would put the anchor at the reconnect replay start, so replay re-OKs
+// of OK'd-but-not-yet-durable predecessors would reset the detector every cycle.
+func TestQwpSfSendLoopHighestOkAckedFsnDurable(t *testing.T) {
+	l := &qwpSfSendLoop{durableAckMode: true, durable: newQwpDurableTracker()}
+	l.fsnAtZero.Store(10)
+	l.nextWireSeq.Store(6) // wire seqs 0..5 assigned; highest assigned = 5
+
+	for seq := int64(0); seq <= 3; seq++ {
+		l.durable.seqGap(seq) // OK-acks advance lastSeq
+	}
+	require.Equal(t, int64(13), l.highestOkAckedFsn()) // fsnAtZero(10) + lastOkSeq(3)
+
+	// A dense ack beyond the highest sent sequence is clamped so a forged
+	// ahead-of-send ack cannot push the anchor past a real frame.
+	for seq := int64(4); seq <= 6; seq++ {
+		l.durable.seqGap(seq)
+	}
+	require.Equal(t, int64(15), l.highestOkAckedFsn()) // clamped to fsnAtZero(10) + assigned(5)
 }
 
 // TestQwpSfSendLoopReceiverClampsForgedAckToFullySent is the

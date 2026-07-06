@@ -190,10 +190,15 @@ type qwpSfOrphanDrainer struct {
 	connectCancel           atomic.Pointer[context.CancelFunc]
 	startedAt               time.Time
 	stopRequested           atomic.Bool
-	targetFsn               atomic.Int64 // -1 until startup observes publishedFsn
-	ackedFsn                atomic.Int64 // mirrors engine.ackedFsn for visibility
-	outcome                 atomic.Int32
-	lastErrorMessage        atomic.Pointer[string]
+	stopOnce                sync.Once
+	// stopCh is closed by drainerRequestStop so a polite stop unwinds an
+	// in-flight connect walk promptly (as the walk's cancelCh) instead of
+	// waiting out the pool-close hard-cancel grace.
+	stopCh           chan struct{}
+	targetFsn        atomic.Int64 // -1 until startup observes publishedFsn
+	ackedFsn         atomic.Int64 // mirrors engine.ackedFsn for visibility
+	outcome          atomic.Int32
+	lastErrorMessage atomic.Pointer[string]
 }
 
 // qwpSfNewOrphanDrainer constructs a drainer for the given slot.
@@ -224,6 +229,7 @@ func qwpSfNewOrphanDrainer(
 	d.targetFsn.Store(-1)
 	d.ackedFsn.Store(-1)
 	d.outcome.Store(int32(qwpSfDrainOutcomePending))
+	d.stopCh = make(chan struct{})
 	return d
 }
 
@@ -264,6 +270,7 @@ func (d *qwpSfOrphanDrainer) drainerAckedFsn() int64 {
 // own when the slot fully drains.
 func (d *qwpSfOrphanDrainer) drainerRequestStop() {
 	d.stopRequested.Store(true)
+	d.stopOnce.Do(func() { close(d.stopCh) })
 }
 
 func (d *qwpSfOrphanDrainer) recordFailure(reason string) {
@@ -300,7 +307,7 @@ func (d *qwpSfOrphanDrainer) recordDurableGiveUp() {
 // budget pauses with the outage (Invariant B) — and the walk keeps retrying
 // with capped backoff throughout.
 func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
-	if outcome.SawDurableMismatch {
+	if outcome.SawDurableMismatch && !outcome.SawTransportError {
 		attempt := int(d.mismatchAttempts.Add(1))
 		if fn := d.listener.OnDurableAckUnavailable; fn != nil {
 			qwpDrainerListenerCall(func() { fn(d.slotPath, attempt) })
@@ -412,7 +419,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	if tracker == nil {
 		tracker = newQwpHostTracker(1, "", qwpTargetAny)
 	}
-	result := qwpSfRunRoundWalk(connectCtx, nil, qwpSfRoundWalkParams{
+	result := qwpSfRunRoundWalk(connectCtx, d.stopCh, qwpSfRoundWalkParams{
 		Factory:                 d.clientFactory,
 		Tracker:                 tracker,
 		MaxDuration:             0,
@@ -525,10 +532,9 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			d.recordDurableGiveUp()
 			return
 		}
-		// The running loop latches only genuine terminals (auth,
-		// protocol-violation close codes, corrupt segment, durable-ack
-		// mismatch) — transport outages reconnect indefinitely and never
-		// reach here.
+		// The running loop latches only genuine terminals (auth, a
+		// poisoned frame, corrupt segment, durable-ack mismatch) —
+		// transport outages reconnect indefinitely and never reach here.
 		if err := loop.sendLoopCheckError(); err != nil {
 			d.recordFailure("wire: " + err.Error())
 			return

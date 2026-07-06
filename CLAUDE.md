@@ -97,7 +97,9 @@ initial connect, and every background/orphan drainer retry transport outages
 and all-replica role-reject windows **indefinitely** with capped exponential
 backoff — no wall-clock give-up, no terminal latch, no `.failed` quarantine
 for transport-class failures. `reconnect_max_duration_millis` bounds only the
-blocking sync initial connect. Sanctioned terminals: auth reject, 404/426
+blocking sync initial connect; on a running sender it does not bound reconnect —
+it doubles as the poison-frame episode floor and the drainer no-progress wedge
+budget. Sanctioned terminals: auth reject, 404/426
 upgrade reject (at sweep exhaustion), durable-ack capability-gap settle
 exhaustion (capability-gap sweeps only; transport windows pause, role-reject
 sweeps reset). The only producer-visible error from a running drain path is
@@ -210,10 +212,18 @@ reconnect-eligible (`qwpSfIsTerminalCloseCode` is diagnostics-only). The
 guarded case — a frame that deterministically kills the connection without a
 NACK — is caught behaviorally by the **poison-frame detector**: a retriable
 NACK or non-orderly close (not 1000/1001) after at least one send, at the same
-head-of-line FSN with no ack progress, counts a strike; `max_frame_rejections`
-(default 4; `WithMaxFrameRejections`) consecutive strikes escalate to a typed
-PROTOCOL_VIOLATION terminal naming the FSN. Any ACK resets the counter.
-`ackedFsn` advances **only** on server OKs — never on any rejection.
+head-of-line FSN with no ack progress, counts a strike. Escalation to a typed
+PROTOCOL_VIOLATION terminal naming the FSN requires **both**
+`max_frame_rejections` (default 4; `WithMaxFrameRejections`) consecutive strikes
+**and** an episode lasting at least `reconnect_max_duration_millis` — the
+duration floor stops a transient rejection burst from burning every strike in a
+second; below it the sender keeps recycling with capped backoff (a loud stall,
+never a terminal). An ack **covering** the poisoned FSN resets the counter; a
+lower ack (durable-mode replay re-OK-ing predecessors) does not. In durable mode
+the head-of-line anchor is the highest OK-acked frame, not the durable
+watermark, so replay re-OKs cannot reset the episode (`highestOkAckedFsn`).
+`ackedFsn` advances **only** on server OKs (durable acks under
+`request_durable_ack`) — never on any rejection.
 
 A TERMINAL latches the typed error on the I/O loop; `sendLoopCheckError()`
 surfaces it on the next producer call. The sender does not auto-resume — close

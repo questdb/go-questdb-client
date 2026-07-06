@@ -521,15 +521,18 @@ func qwpSfRunRoundWalk(
 			if params.cursor == nil {
 				params.cursor = newQwpRoundCursor(params.Tracker.Len())
 			}
-		} else if params.Tracker.IsRoundExhausted() {
-			// Stale round slots from a previous foreground walk
-			// (RecordSuccess leaves the bound host attempted): without a
-			// fresh round the first sweep would exhaust after zero dials,
-			// firing a spurious all-endpoints-unreachable event and paying
-			// a round-boundary sleep before the first dial. The §2.3
-			// mid-stream demote still runs after this reset (inside the
-			// first single round), so the just-failed host re-enters the
-			// round already downgraded, never as the priority pick.
+		} else {
+			// A foreground (re)connect always starts a fresh round.
+			// RecordSuccess from a prior bind leaves that host's attempted
+			// slot consumed, so a partially-attempted round (bound host
+			// attempted, siblings not) would skip the bound host here: a
+			// reconnect after a drop on it could then sweep only the OTHER
+			// hosts and — if one is a 404/426 or durable-mismatch peer whose
+			// terminal is deferred to sweep exhaustion — latch that terminal
+			// without ever redialing the healthy host. BeginRound(true) clears
+			// the stale slots (keeping the sticky-Healthy pin); the §2.3
+			// mid-stream demote inside the first single round still downgrades
+			// the just-failed host so it is tried last, not first.
 			params.Tracker.BeginRound(true)
 		}
 	}

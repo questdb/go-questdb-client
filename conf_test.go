@@ -262,7 +262,7 @@ func TestParserHappyCases(t *testing.T) {
 			expected: qdb.ConfigData{
 				Schema: "ws",
 				KeyValuePairs: map[string]string{
-					"addr":              addr,
+					"addr":             addr,
 					"in_flight_window": "4",
 				},
 			},
@@ -876,8 +876,8 @@ func TestQwpFailoverSanitizeErrors(t *testing.T) {
 // TestQwpSanitizeRejectsRetryTimeout pins that retry_timeout, though
 // the parser accepts it for any schema, is rejected by the QWP
 // sanitizer: it is an HTTP-ILP retry knob with no QWP analogue
-// (reconnect_max_duration_millis governs the per-outage budget
-// instead). Guards the parser happy-case in TestHappyCasesFromConf,
+// (reconnect_max_duration_millis governs the sync initial-connect
+// budget instead). Guards the parser happy-case in TestHappyCasesFromConf,
 // which deliberately omits the ws+retry_timeout pairing.
 func TestQwpSanitizeRejectsRetryTimeout(t *testing.T) {
 	c, err := qdb.ConfFromStr("ws::addr=localhost:9000;retry_timeout=5000;")

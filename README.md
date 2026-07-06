@@ -227,6 +227,17 @@ distinct binary protocol rather than a version of ILP, so the
 connect-string keys, see the
 [connect string reference](https://questdb.io/docs/connect/clients/connect-string/).
 
+### Authentication
+
+Basic auth and bearer tokens work the same way across every transport — pass
+them in the connect string (use `wss`/`https`/`tcps` so credentials travel over
+TLS), or via the `WithBasicAuth` / `WithBearerToken` options:
+
+```go
+db, err := qdb.Connect(ctx, "wss::addr=host:9000;username=admin;password=secret;")
+db, err := qdb.Connect(ctx, "wss::addr=host:9000;token=<bearer>;")
+```
+
 ## Ingestion
 
 A `LineSender` (pooled or standalone) builds rows with a fluent API:
@@ -459,7 +470,7 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | Key | Default | Effect |
 |---|---|---|
 | `sf_dir` | unset | Group root. Setting it activates SF. |
-| `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_.` only. |
+| `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_` only (no `.` or path separators). |
 | `sf_max_bytes` | 4 MiB | Per-segment file size. |
 | `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
@@ -471,11 +482,14 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | `drain_orphans` | `off` | When `on`, scan `<sf_dir>/*` and adopt sibling slots holding unacked data. |
 | `max_background_drainers` | 4 | Cap on concurrent orphan drainers. |
 | `max_frame_rejections` | 4 | Consecutive same-frame rejections (over the episode budget) before the poison-frame detector latches a `TERMINAL`. |
+| `request_durable_ack` | `off` | Advance the acknowledged watermark only after object-storage upload, not just WAL commit (see above). |
+| `durable_ack_keepalive_interval_millis` | 200 | Idle ping that re-elicits pending durable acks; `<= 0` disables (an idle producer can then stall `AwaitAckedFsn`). |
 
 The same options are available programmatically: `WithSfDir`, `WithSenderId`,
 `WithSfMaxBytes`, `WithSfMaxTotalBytes`, `WithReconnectPolicy`,
 `WithInitialConnectRetry`, `WithInitialConnectMode`, `WithCloseFlushTimeout`,
-`WithMaxFrameRejections`.
+`WithMaxFrameRejections`, `WithRequestDurableAck`,
+`WithDurableAckKeepaliveInterval`.
 
 Without `sf_dir`, unacknowledged data lives in process memory and is lost if the
 process dies; the reconnect loop still spans transient outages.
@@ -599,10 +613,11 @@ Watch connection-state transitions with `WithQuestDBConnectionListener`
 (facade) or `WithConnectionListener` (standalone): the
 `SenderConnectionEvent.Kind` is one of `SenderConnected`, `SenderDisconnected`,
 `SenderReconnected`, `SenderFailedOver`, `SenderEndpointAttemptFailed`,
-`SenderAllEndpointsUnreachable`, `SenderAuthFailed`, or
-`SenderReconnectBudgetExhausted`. On the query side, a mid-stream reconnect
-yields a non-fatal `*QwpFailoverReset` (discard accumulated rows and continue);
-an exhausted failover budget yields `*QwpFailoverExhaustedError`.
+`SenderAllEndpointsUnreachable`, or `SenderAuthFailed`. There is deliberately no
+budget-exhausted kind: a running sender retries transport outages indefinitely
+(Invariant B). On the query side, a mid-stream reconnect yields a non-fatal
+`*QwpFailoverReset` (discard accumulated rows and continue); an exhausted
+failover budget yields `*QwpFailoverExhaustedError`.
 
 For full configuration, see the
 [client failover guide](https://questdb.io/docs/high-availability/client-failover/configuration/).

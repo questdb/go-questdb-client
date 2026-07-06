@@ -734,11 +734,21 @@ func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) 
 // after a send) of the SAME head-of-line frame, with no ack progress
 // in between, before the sender declares the frame poisoned and
 // latches a typed PROTOCOL_VIOLATION terminal instead of
-// reconnect-replaying forever. Retriable rejections below the
-// threshold recycle the connection and replay from the
-// store-and-forward log — no data is dropped either way. Default 4.
-// A non-positive argument leaves the default. Equivalent to the
-// max_frame_rejections connect-string key.
+// reconnect-replaying forever.
+//
+// Escalation also requires the rejection episode to have lasted at
+// least the reconnect max-duration (WithReconnectPolicy /
+// reconnect_max_duration_millis, default 5m): both the strike count
+// AND the episode-duration floor must be met. The floor keeps a brief
+// transient rejection window (e.g. a WRITE_ERROR burst during a server
+// recovery) from burning every strike in a second and killing the
+// sender — below it the sender keeps recycling and replaying, a loud
+// stall rather than a terminal. Lowering the threshold alone does not
+// escalate faster than that floor; lower the reconnect max-duration
+// too. Retriable rejections below either bar recycle the connection
+// and replay from the store-and-forward log — no data is dropped.
+// Default 4. A non-positive argument leaves the default. Equivalent to
+// the max_frame_rejections connect-string key.
 //
 // Only available for the QWP sender.
 func WithMaxFrameRejections(n int) LineSenderOption {

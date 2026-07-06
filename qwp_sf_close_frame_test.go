@@ -54,13 +54,13 @@ func closeFrameTestServer(t *testing.T, code websocket.StatusCode, reason string
 }
 
 // closeAfterNFramesServer accepts the WS upgrade, reads exactly n
-// frames (never ACKing any), then closes with the given terminal
-// code. Consuming every frame the producer sends before closing
-// keeps senderLoop from producing a write error that would race the
-// receiver's close-frame error in runOneConnection's first-error
-// aggregation — so the resulting terminal SenderError is always the
-// close-code one, with a deterministic [ackedFsn+1, publishedFsn]
-// FSN span.
+// frames (never ACKing any), then closes with the given (non-orderly)
+// code. Consuming every frame the producer sends before closing keeps
+// senderLoop from producing a write error that would race the
+// receiver's close error in runOneConnection's first-error aggregation
+// — so a repeated close deterministically escalates through the
+// poison-frame detector, whose terminal SenderError carries a
+// [ackedFsn+1, publishedFsn] FSN span.
 func closeAfterNFramesServer(t *testing.T, n int, code websocket.StatusCode, reason string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

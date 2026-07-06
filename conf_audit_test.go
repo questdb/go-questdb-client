@@ -348,6 +348,7 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 		"auth=Bearer xyz",
 		"client_id=reader-1",
 		"path=/exec",
+		"query_close_timeout_ms=5000",
 		"replay_exec=on",
 		"server_info_timeout_ms=1000",
 	}
@@ -393,6 +394,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"initial_connect_retry=off",
 		"max_background_drainers=4",
 		"max_buf_size=100m",
+		"max_frame_rejections=4",
 		"max_name_len=127",
 		"on_internal_error=terminal",
 		"on_parse_error=terminal",

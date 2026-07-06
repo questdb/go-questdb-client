@@ -159,7 +159,7 @@ func TestQwpSfPolicyResolverPrecedence(t *testing.T) {
 		r.perCat[CategoryWriteError] = PolicyTerminal
 		r.resolver = func(Category) Policy { return PolicyAuto }
 		if got := r.resolve(CategoryWriteError); got != PolicyTerminal {
-			t.Errorf("programmatic Auto + per-cat=Halt = %s, want Halt", got)
+			t.Errorf("programmatic Auto + per-cat=Terminal = %s, want Terminal", got)
 		}
 	})
 

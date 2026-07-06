@@ -305,6 +305,42 @@ func TestRoundWalk426IsTransient(t *testing.T) {
 	assert.Equal(t, 1, result.Idx)
 }
 
+// TestRoundWalkReconnectRedialsBoundHostPastDeferredTerminalSibling is the
+// regression for a stale attempted-bit skipping the previously-bound host on
+// reconnect. RecordSuccess leaves the bound host's round slot consumed; a
+// reconnect walk must start a fresh round so that host is a candidate again.
+// Otherwise a sweep that finds only a 404/426 (or durable-mismatch) sibling —
+// whose terminal is deferred to sweep exhaustion — latches that terminal
+// without ever redialing the healthy host, permanently dropping a sender that
+// should have reconnected (Invariant B).
+func TestRoundWalkReconnectRedialsBoundHostPastDeferredTerminalSibling(t *testing.T) {
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	tracker.recordSuccess(0, nil) // host 0 bound on the prior connection
+
+	dialed := make(map[int]int)
+	factory := func(_ context.Context, idx int) (*qwpTransport, error) {
+		dialed[idx]++
+		if idx == 0 {
+			return &qwpTransport{}, nil // healthy host, binds if dialed
+		}
+		return nil, &QwpUpgradeRejectError{StatusCode: 404} // misconfigured sibling
+	}
+	params := qwpSfRoundWalkParams{
+		Factory:        factory,
+		Tracker:        tracker,
+		MaxDuration:    0, // unbounded, like the running loop
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+	}
+	// previousIdx=0: reconnecting after a mid-stream drop on the bound host.
+	result := qwpSfRunRoundWalk(context.Background(), nil, params, 0)
+
+	require.Nil(t, result.Terminal, "must not latch a terminal while a healthy host is redialable")
+	require.NotNil(t, result.Transport, "must redial and bind the healthy host")
+	assert.Equal(t, 0, result.Idx)
+	assert.Positive(t, dialed[0], "healthy host 0 must be redialed")
+}
+
 // TestRoundWalkAuthErrorIsTerminal verifies that 401/403 short-
 // circuits the walk — even if other peers might be reachable, the
 // failover-loop spec treats AuthError as cluster-wide.

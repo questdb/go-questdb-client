@@ -35,13 +35,13 @@ type qwpTypeCode byte
 // QWP column type codes. Each type has a specific wire encoding
 // defined in the QWP protocol specification.
 const (
-	qwpTypeBoolean       qwpTypeCode = 0x01 // bit-packed, 1 bit per value
-	qwpTypeByte          qwpTypeCode = 0x02 // int8, 1 byte
-	qwpTypeShort         qwpTypeCode = 0x03 // int16, 2 bytes LE
-	qwpTypeInt           qwpTypeCode = 0x04 // int32, 4 bytes LE
-	qwpTypeLong          qwpTypeCode = 0x05 // int64, 8 bytes LE
-	qwpTypeFloat         qwpTypeCode = 0x06 // IEEE 754 float32, 4 bytes LE
-	qwpTypeDouble        qwpTypeCode = 0x07 // IEEE 754 float64, 8 bytes LE
+	qwpTypeBoolean qwpTypeCode = 0x01 // bit-packed, 1 bit per value
+	qwpTypeByte    qwpTypeCode = 0x02 // int8, 1 byte
+	qwpTypeShort   qwpTypeCode = 0x03 // int16, 2 bytes LE
+	qwpTypeInt     qwpTypeCode = 0x04 // int32, 4 bytes LE
+	qwpTypeLong    qwpTypeCode = 0x05 // int64, 8 bytes LE
+	qwpTypeFloat   qwpTypeCode = 0x06 // IEEE 754 float32, 4 bytes LE
+	qwpTypeDouble  qwpTypeCode = 0x07 // IEEE 754 float64, 8 bytes LE
 	// 0x08 was TYPE_STRING in an earlier revision of the QWP spec; it
 	// has been removed in favor of TYPE_VARCHAR (0x0F), which uses the
 	// same wire encoding. Do not reuse this code.
@@ -202,10 +202,10 @@ const QwpCapZone = qwpCapZone
 
 // QWP message header layout.
 const (
-	qwpHeaderSize              = 12
-	qwpHeaderOffsetFlags       = 5
-	qwpHeaderOffsetTableCount  = 6
-	qwpHeaderOffsetPayloadLen  = 8
+	qwpHeaderSize             = 12
+	qwpHeaderOffsetFlags      = 5
+	qwpHeaderOffsetTableCount = 6
+	qwpHeaderOffsetPayloadLen = 8
 )
 
 // QWP header flag bits.

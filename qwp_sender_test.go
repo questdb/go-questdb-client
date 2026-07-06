@@ -1682,8 +1682,8 @@ func TestQwpSenderServerError(t *testing.T) {
 			if err != nil {
 				return
 			}
-			// Return PARSE_ERROR (default Halt). WRITE_ERROR is now
-			// default Drop and would not surface a terminal Flush
+			// Return PARSE_ERROR (default TERMINAL). WRITE_ERROR is
+			// default RETRIABLE and would not surface a terminal Flush
 			// error.
 			errMsg := "bad message"
 			ack := make([]byte, 11+len(errMsg))
@@ -1885,8 +1885,8 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 		defer conn.CloseNow()
 
 		// Read the first message, then return a PARSE_ERROR
-		// (default Halt). WRITE_ERROR is now default Drop and would
-		// not poison the sender.
+		// (default TERMINAL). WRITE_ERROR is default RETRIABLE and
+		// would not poison the sender.
 		_, _, err = conn.Read(context.Background())
 		if err != nil {
 			return

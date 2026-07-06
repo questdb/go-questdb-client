@@ -38,7 +38,7 @@ def _connect_string(http_port: int, sf_dir: Path, *,
 
 
 @pytest.mark.go_client
-@pytest.mark.xfail(reason="request_durable_ack=on not yet implemented in Go client")
+@pytest.mark.xfail(reason="durable-ack e2e needs an enterprise server that advertises it; the connect string here does not set request_durable_ack=on")
 def test_kill9_primary_failover_no_data_loss(server_factory, go_sidecar,
                                               obj_store: ObjStore, scenario_dir: Path) -> None:
     """Kill -9 P1 mid-flight, verify P2 has every row."""
@@ -71,7 +71,7 @@ def test_kill9_primary_failover_no_data_loss(server_factory, go_sidecar,
 
 
 @pytest.mark.go_client
-@pytest.mark.xfail(reason="request_durable_ack=on not yet implemented in Go client")
+@pytest.mark.xfail(reason="durable-ack e2e needs an enterprise server that advertises it; the connect string here does not set request_durable_ack=on")
 def test_failover_during_active_send(server_factory, go_sidecar,
                                      obj_store: ObjStore, scenario_dir: Path) -> None:
     """Kill P1 while the sender is still pushing batches."""
@@ -108,7 +108,7 @@ def test_failover_during_active_send(server_factory, go_sidecar,
 
 
 @pytest.mark.go_client
-@pytest.mark.xfail(reason="request_durable_ack=on not yet implemented in Go client")
+@pytest.mark.xfail(reason="durable-ack e2e needs an enterprise server that advertises it; the connect string here does not set request_durable_ack=on")
 def test_two_failovers_in_one_scenario(server_factory, go_sidecar,
                                        obj_store: ObjStore, scenario_dir: Path) -> None:
     """Multiple failovers in a row — no row should be lost."""

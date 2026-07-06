@@ -67,7 +67,7 @@ type qwpDurableTracker struct {
 	pool    []*qwpPendingDurable
 	// pendingLen mirrors len(pending) - head for the lock-free hasPending gate.
 	pendingLen atomic.Int64
-	// lastSeq is the highest OK/DROP wire sequence enqueued on the current
+	// lastSeq is the highest OK wire sequence enqueued on the current
 	// connection (-1 = none). Under the one-OK-ack-per-frame contract these
 	// arrive densely, so a forward jump means the server coalesced or dropped
 	// an OK ack and left frames untracked — seqGap catches it fail-closed.
@@ -75,7 +75,7 @@ type qwpDurableTracker struct {
 }
 
 // qwpPendingDurable is one OK-acked batch awaiting durable confirmation. An entry
-// with no tables (an empty batch or a dropped NACK) is trivially durable.
+// with no tables (an empty batch) is trivially durable.
 type qwpPendingDurable struct {
 	wireSeq int64
 	tables  []string
@@ -136,10 +136,10 @@ func (t *qwpDurableTracker) intern(b []byte) (string, bool) {
 	return s, true
 }
 
-// enqueueOk stashes an OK / NACK frame's wire sequence and per-table entries.
-// tail is the frame's validated table trailer (empty for a NACK). It returns
-// false without enqueuing when a trailer name overflows the intern cap, so the
-// caller HALTs fail-closed instead of trimming on a truncated table set.
+// enqueueOk stashes an OK frame's wire sequence and per-table entries. tail is
+// the frame's validated table trailer. It returns false without enqueuing when a
+// trailer name overflows the intern cap, so the caller HALTs fail-closed instead
+// of trimming on a truncated table set.
 func (t *qwpDurableTracker) enqueueOk(wireSeq int64, tail []byte) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -214,6 +214,7 @@ func (t *qwpDurableTracker) drainUpTo(maxWireSeq int64) int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	highest := int64(-1)
+	startHead := t.head
 	for t.head < len(t.pending) {
 		e := t.pending[t.head]
 		if e.wireSeq > maxWireSeq || !e.coveredBy(t.watermarks) {
@@ -227,7 +228,7 @@ func (t *qwpDurableTracker) drainUpTo(maxWireSeq int64) int64 {
 		t.pending[t.head] = nil
 		t.head++
 	}
-	if highest >= 0 {
+	if t.head != startHead {
 		if t.head == len(t.pending) {
 			t.pending = t.pending[:0]
 			t.head = 0
@@ -260,6 +261,16 @@ func (t *qwpDurableTracker) reset() {
 }
 
 func (t *qwpDurableTracker) hasPending() bool { return t.pendingLen.Load() > 0 }
+
+// lastOkSeq is the highest OK wire sequence enqueued on the current connection,
+// or -1 before the first OK. The send loop keys the poison detector on it (via
+// highestOkAckedFsn) because the engine watermark tracks durable uploads, not
+// OK acks.
+func (t *qwpDurableTracker) lastOkSeq() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastSeq
+}
 
 // acquire pops a pooled entry or allocates one. Caller holds mu.
 func (t *qwpDurableTracker) acquire() *qwpPendingDurable {

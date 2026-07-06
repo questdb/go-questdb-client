@@ -277,6 +277,54 @@ func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
 	})
 }
 
+// TestQwpSfDrainerSettleBudgetPausesOnMixedSweep pins that a reconnect sweep
+// which saw both a durable-ack mismatch (a reachable non-durable node) and a
+// transport error (the durable primary transiently down) neither charges nor
+// resets the capability-gap settle budget: the primary may merely be rebooting,
+// so the budget must pause with the outage (Invariant B) rather than quarantine
+// a recoverable slot. Only a pure capability-gap sweep charges.
+func TestQwpSfDrainerSettleBudgetPausesOnMixedSweep(t *testing.T) {
+	newDrainer := func() *qwpSfOrphanDrainer {
+		d := qwpSfNewOrphanDrainer(
+			t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
+			nil, nil,
+			time.Second, time.Millisecond, 5*time.Millisecond,
+		)
+		d.durableAckMode = true
+		return d
+	}
+
+	t.Run("MixedSweepNeitherChargesNorQuarantines", func(t *testing.T) {
+		d := newDrainer()
+		for i := 0; i < qwpMaxDurableAckMismatchAttempts+5; i++ {
+			d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true, SawTransportError: true})
+		}
+		assert.Equal(t, int64(0), d.mismatchAttempts.Load())
+		assert.False(t, d.durableMismatchGaveUp.Load())
+		assert.False(t, d.stopRequested.Load())
+	})
+
+	t.Run("PureCapabilityGapStillCharges", func(t *testing.T) {
+		d := newDrainer()
+		d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true})
+		assert.Equal(t, int64(1), d.mismatchAttempts.Load())
+	})
+
+	t.Run("PureTransportSweepDoesNotResetTheCharge", func(t *testing.T) {
+		d := newDrainer()
+		d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true}) // charge to 1
+		d.onRoundExhausted(qwpSfSweepOutcome{SawTransportError: true})  // pause, no reset
+		assert.Equal(t, int64(1), d.mismatchAttempts.Load())
+	})
+
+	t.Run("AllReplicaSweepResetsTheCharge", func(t *testing.T) {
+		d := newDrainer()
+		d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true}) // charge to 1
+		d.onRoundExhausted(qwpSfSweepOutcome{SawRoleReject: true})      // topology churn: reset
+		assert.Equal(t, int64(0), d.mismatchAttempts.Load())
+	})
+}
+
 func TestQwpSfDrainerSucceedsOnAlreadyDrainedSlot(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()

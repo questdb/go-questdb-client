@@ -457,10 +457,10 @@ func (e *qwpSfCursorEngine) engineFindSegmentContaining(fsn int64) *qwpSfSegment
 // passing a tighter deadline than e.appendDeadline get their
 // deadline respected.
 //
-// A send-loop HALT latched while the producer is parked here (the wire
-// failed terminally, or the reconnect budget ran out) short-circuits
-// the spin: the loop has stopped draining the ring, so the deadline
-// would only ever expire. engineAppendBlocking returns the latched
+// A send-loop HALT latched while the producer is parked here (a
+// sanctioned terminal — auth, poisoned frame, protocol violation)
+// short-circuits the spin: the loop has stopped draining the ring, so
+// the deadline would only ever expire. engineAppendBlocking returns the latched
 // terminal error directly via the engineSetTerminalErrorGetter hook, so
 // the parked producer fails fast with the real cause instead of a
 // generic backpressure timeout.
