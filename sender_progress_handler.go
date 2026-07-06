@@ -26,9 +26,11 @@ package questdb
 
 import "strconv"
 
-// SenderProgressHandler is invoked, on a dedicated dispatcher goroutine, each
-// time the QWP sender's acknowledged frame sequence number advances. ackedFsn is
-// strictly monotonic across calls.
+// SenderProgressHandler is invoked, on a dedicated dispatcher goroutine, as the
+// QWP sender's acknowledged frame sequence number advances. Delivery is strictly
+// monotonic but may coalesce: under a delivery backlog the bounded dispatcher
+// drops older values, so the handler sees a monotonic subset of advances —
+// always including the latest, not necessarily every intermediate one.
 //
 // # Settled vs durable
 //

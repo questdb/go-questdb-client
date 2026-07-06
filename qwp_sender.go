@@ -1316,9 +1316,8 @@ func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err 
 // upper bound on any SenderError.ToFsn that could surface for this
 // batch.
 //
-// It does NOT wait for the server ACK (Java decision #1 in
-// design/qwp-cursor-durability.md — "flush() never waits for ACK;
-// ACKs are async"): it returns once the batch is published into the
+// It does NOT wait for the server ACK (flush() never waits for ACK;
+// ACKs are async): it returns once the batch is published into the
 // cursor engine (in-RAM for memory mode, on-disk for SF) and the
 // send loop delivers + replays it in the background. Callers
 // wanting server-ACK confirmation pair the returned FSN with

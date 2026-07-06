@@ -28,7 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -101,13 +101,13 @@ type QwpBackgroundDrainerListener struct {
 // top-level recover turns it into a terminal failure that quarantines an
 // otherwise-recoverable slot (a .failed sentinel) — an availability regression
 // driven purely by a user-code fault. fn is nil-safe.
-func qwpDrainerListenerCall(fn func()) {
+func qwpDrainerListenerCall(logger *slog.Logger, fn func()) {
 	if fn == nil {
 		return
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[ERROR] qwp/sf drainer listener callback panicked: %v", r)
+			qwpEffectiveLogger(logger).Error("qwp/sf drainer listener callback panicked", "panic", r)
 		}
 	}()
 	fn()
@@ -182,6 +182,7 @@ type qwpSfOrphanDrainer struct {
 	durableAckMode          bool          // trim only on STATUS_DURABLE_ACK
 	durableKeepalive        time.Duration // durable keepalive-ping cadence
 	maxFrameRejections      int           // poison-frame threshold; 0 -> default
+	logger                  *slog.Logger  // nil -> slog.Default() via qwpEffectiveLogger
 	listener                QwpBackgroundDrainerListener
 	mismatchAttempts        atomic.Int64
 	roleRejectRounds        atomic.Int64
@@ -288,7 +289,7 @@ func (d *qwpSfOrphanDrainer) recordDurableGiveUp() {
 	attempts := int(d.mismatchAttempts.Load())
 	if fn := d.listener.OnDurableAckPersistentFailure; fn != nil {
 		elapsed := time.Since(d.startedAt)
-		qwpDrainerListenerCall(func() { fn(d.slotPath, attempts, elapsed) })
+		qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempts, elapsed) })
 	}
 	d.recordFailure(fmt.Sprintf(
 		"durable-ack unavailable: no reachable endpoint advertised durable-ack after %d attempts", attempts))
@@ -310,7 +311,7 @@ func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
 	if outcome.SawDurableMismatch && !outcome.SawTransportError {
 		attempt := int(d.mismatchAttempts.Add(1))
 		if fn := d.listener.OnDurableAckUnavailable; fn != nil {
-			qwpDrainerListenerCall(func() { fn(d.slotPath, attempt) })
+			qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempt) })
 		}
 		if attempt >= qwpMaxDurableAckMismatchAttempts {
 			d.durableMismatchGaveUp.Store(true)
@@ -327,14 +328,17 @@ func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
 	d.mismatchAttempts.Store(0)
 	attempt := int(d.roleRejectRounds.Add(1))
 	if fn := d.listener.OnPrimaryUnavailable; fn != nil {
-		qwpDrainerListenerCall(func() { fn(d.slotPath, attempt) })
+		qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempt) })
 	}
 	now := time.Now().UnixNano()
 	if last := d.lastReplicaWarnUnixNano.Load(); now-last >= int64(qwpSfReconnectWarnThrottle) &&
 		d.lastReplicaWarnUnixNano.CompareAndSwap(last, now) {
-		log.Printf("[WARN] qwp/sf: drainer slot %s sweep %d: all endpoints are "+
-			"replicas (transient failover window), retrying with capped backoff",
-			d.slotPath, attempt)
+		// Shadows the OnPrimaryUnavailable listener callback (dispatched
+		// alongside this); throttled Debug so it adds a trace for deep
+		// debugging without duplicating the callback for the default case.
+		qwpEffectiveLogger(d.logger).Debug("qwp/sf: drainer sweep found only replicas "+
+			"(transient failover window), retrying with capped backoff",
+			"slot", d.slotPath, "sweep", attempt)
 	}
 }
 
@@ -362,7 +366,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
 			msg := fmt.Sprintf("qwp/sf: orphan drainer panicked: %v\n%s", r, debug.Stack())
-			log.Printf("[ERROR] %s", msg)
+			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer panicked", "detail", msg)
 			d.recordFailure(msg)
 		}
 	}()
@@ -382,6 +386,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
 		return
 	}
+	engine.engineSetLogger(qwpEffectiveLogger(d.logger))
 	defer func() { _ = engine.engineClose() }()
 
 	target := engine.enginePublishedFsn()
@@ -461,6 +466,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	loop := qwpSfNewSendLoop(engine, transport, d.clientFactory,
 		qwpSfDefaultParkInterval,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
+	loop.logger = qwpEffectiveLogger(d.logger)
 	// A durable-ack drainer trims the orphan slot only on STATUS_DURABLE_ACK, so
 	// recovered data is not deleted before it is durably uploaded. A mismatch is
 	// transient (not terminal): the drainer retries, since its data is pinned.
@@ -565,14 +571,18 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		lastStallSampleAt = now
 		if acked > lastProgressAcked || reconnecting ||
 			(d.durableAckMode && okAcks > lastProgressAcks) {
-			// A durable trim advance (acked moves in durable mode) proves a
-			// durable-advertising primary is reachable and draining this slot, so
-			// forget accumulated durable-ack mismatches. Otherwise the lifetime
-			// counter climbs one per primary-flap reconnect (replica picked first
-			// in the sweep, then the primary rebinds and drains) and eventually
-			// trips qwpMaxDurableAckMismatchAttempts, falsely quarantining a slot
-			// that is actively draining durably.
-			if d.durableAckMode && acked > lastProgressAcked {
+			// Forward progress of either the durable trim watermark or the OK-ack
+			// counter proves the sender bound a durable-advertising primary and is
+			// draining this slot — an OK ack cannot arrive unless the durable-ack
+			// handshake succeeded — so forget accumulated capability-gap mismatches.
+			// Otherwise the lifetime counter climbs one per primary-flap reconnect
+			// (replica picked first in the sweep, then the primary rebinds and OK-acks
+			// but drops before uploading) and eventually trips
+			// qwpMaxDurableAckMismatchAttempts, falsely quarantining a slot whose
+			// durable primary was reached. A durable primary reached but slow to
+			// upload is caught by the separate durable-stall watchdog, not this
+			// counter.
+			if d.durableAckMode && (acked > lastProgressAcked || okAcks > lastProgressAcks) {
 				d.mismatchAttempts.Store(0)
 			}
 			if acked > lastProgressAcked {
@@ -644,6 +654,7 @@ type qwpSfDrainerPool struct {
 	sem           chan struct{}
 	closed        atomic.Bool
 	wg            sync.WaitGroup
+	logger        *slog.Logger // nil -> slog.Default() via qwpEffectiveLogger
 
 	// ctx is the master context handed to every drainerRun call.
 	// Cancelled in drainerPoolClose so dials and other ctx-aware
@@ -802,10 +813,10 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 			// returns, but close() must not block on un-cancellable
 			// I/O. The slot it holds stays a valid orphan a future
 			// sender re-adopts. Surface the abandoned count for ops.
-			log.Printf("[WARN] qwp/sf: %d orphan drainer(s) still running %s "+
-				"after close; abandoning (wedged in un-cancellable disk I/O). "+
-				"Their slots remain adoptable on a future sender start.",
-				p.activeCount(), qwpSfDrainerPoolCloseGrace+qwpSfDrainerPoolHardCloseGrace)
+			qwpEffectiveLogger(p.logger).Warn("qwp/sf: orphan drainer(s) still running after close; "+
+				"abandoning (wedged in un-cancellable disk I/O). Their slots remain adoptable on a future sender start.",
+				"count", p.activeCount(),
+				"grace", qwpSfDrainerPoolCloseGrace+qwpSfDrainerPoolHardCloseGrace)
 		}
 	}
 	// Release the master ctx even on the clean-exit path so the

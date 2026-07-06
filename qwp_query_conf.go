@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -155,6 +156,10 @@ type qwpQueryClientConfig struct {
 	// iterator break-out, Exec-on-SELECT misuse). query_close_timeout_ms;
 	// non-positive means the qwpQueryCleanupDrainTimeout default.
 	closeDrainTimeout time.Duration
+	// logger sinks the query client's diagnostics. nil -> slog.Default()
+	// via qwpEffectiveLogger. Not connect-string-expressible; set via
+	// WithQwpQueryClientLogger or by the facade pool.
+	logger *slog.Logger
 }
 
 // qwpCompressionRaw / qwpCompressionZstd / qwpCompressionAuto are the

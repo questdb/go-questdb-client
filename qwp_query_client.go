@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -361,6 +362,12 @@ func WithQwpQueryBearerToken(token string) QwpQueryClientOption {
 // sent on the WebSocket upgrade. Empty uses the module default.
 func WithQwpQueryClientID(id string) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.clientID = id }
+}
+
+// WithQwpQueryClientLogger sets the *slog.Logger the query client emits
+// diagnostics through, replacing the slog.Default() fallback. See WithLogger.
+func WithQwpQueryClientLogger(l *slog.Logger) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) { c.logger = l }
 }
 
 // WithQwpQueryBufferPoolSize overrides the decode buffer pool depth.

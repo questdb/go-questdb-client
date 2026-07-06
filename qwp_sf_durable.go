@@ -42,8 +42,8 @@ const qwpDurableMaxTrackedTables = 1 << 16
 // of being held for the sender's lifetime.
 const qwpDurablePoolCap = 256
 
-// qwpDurableTracker is the durable-ack trim state machine
-// (design/qwp-cursor-durability.md §5.4). Under request_durable_ack, an OK ACK
+// qwpDurableTracker is the durable-ack trim state machine. Under
+// request_durable_ack, an OK ACK
 // no longer advances the trim/replay/await watermark; instead each OK-acked
 // batch is stashed (enqueueOk) with the per-table (name, seqTxn) it committed,
 // and released only once the server's cumulative STATUS_DURABLE_ACK frames

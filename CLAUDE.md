@@ -157,8 +157,8 @@ should use `WithCloseFlushTimeout` directly.
 Flush semantics: `Flush` / `FlushAndGetSequence` **never wait for the server
 ACK** — they return once the batch is published into the cursor engine (in-RAM
 for memory mode, on-disk for SF) and the send loop delivers + replays it in the
-background. This matches the Java spec (`design/qwp-cursor-durability.md`
-decision #1: "flush() never waits for ACK; ACKs are async") and is uniform
+background. This matches the Java spec ("flush() never waits for ACK; ACKs are
+async") and is uniform
 across both the pending-rows and zero-pending branches and auto-flush — all
 route through `enqueueCursor`; explicit `Flush` only additionally surfaces a
 latched send-loop error eagerly. (`Flush` was an ACK barrier
@@ -179,7 +179,7 @@ dropped/coalesced OK-ack sequence HALTs fail-closed (`qwpDurableTracker.seqGap` 
 `durableOnOk`), and connecting to a non-durable endpoint fails with a
 `PROTOCOL_VIOLATION` `*QwpDurableAckMismatchError` rather than silently falling
 back. An idle `durable_ack_keepalive_interval_millis` ping
-re-elicits pending durable frames; design: `design/qwp-cursor-durability.md`.
+re-elicits pending durable frames.
 
 Orphan-slot adoption (SF mode, `drain_orphans=on`) is implemented in
 `qwp_sf_orphan.go` + `qwp_sf_drainer.go` + `qwp_sf_round_walk.go`; drainers run
@@ -192,7 +192,7 @@ for categories + policy enum). Two paths: async callback registered via
 `WithErrorHandler`, and producer-side typed error via `errors.As` after `Flush`
 / `FlushAndGetSequence`.
 
-**There is no drop policy** (design: `design/qwp-nack-policy-v2.md`). Three
+**There is no drop policy** by design. Three
 policies: `RETRIABLE` (WRITE_ERROR, INTERNAL_ERROR, UNKNOWN fail-open) recycles
 the connection and replays from `ackedFsn+1` through the wire-failure reconnect
 machinery — dispatch is informational, nothing dropped, no watermark advance;
@@ -235,7 +235,7 @@ surfaces it on the next producer call. The sender does not auto-resume — close
 configs are rejected with `errHttpOnlySender`.
 
 QWP pooling lives behind the **`QuestDB` facade** (`questdb.go`), ported from the
-Java client (design doc: `design/questdb-facade.md`). `Connect` /
+Java client. `Connect` /
 `NewQuestDB(ctx, conf, opts...)` take one `ws`/`wss` cluster config and own two
 elastic pools — `qwpSenderPool` (`qwp_sender_pool.go`) and `qwpQueryPool`
 (`qwp_query_pool.go`) — plus a reaper (`qwp_pool_housekeeper.go`).

@@ -110,7 +110,7 @@ func newQwpSenderPoolForTest(t *testing.T, extra string, min, max int) *qwpSende
 	addr := strings.TrimPrefix(srv.URL, "http://")
 	conf := "ws::addr=" + addr + ";" + extra
 	p, err := newQwpSenderPool(context.Background(), conf, min, max,
-		500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+		500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -524,7 +524,7 @@ func TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot(t *testing.T) {
 		";close_flush_timeout_millis=1;auto_flush=off;"
 	// min == max == 1 forces the re-borrow to reuse the recycled slot — unless
 	// this Close discards it, which is exactly what we assert.
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -734,20 +734,33 @@ func TestQwpSenderLeaseStaleAtFlush(t *testing.T) {
 	}
 }
 
-func TestQwpSenderPoolBorrowCreateError(t *testing.T) {
+// TestQwpSenderPoolBorrowGrowsAsyncWhenServerDown: a growth borrow while the
+// server is down must NOT hard-fail (Invariant B). The pool is already running,
+// so the growth slot connects asynchronously and buffers writes until the wire
+// comes up; only the min-prewarm at build follows the configured connect mode.
+func TestQwpSenderPoolBorrowGrowsAsyncWhenServerDown(t *testing.T) {
 	ctx := context.Background()
-	p, err := newQwpSenderPool(ctx, "ws::addr=127.0.0.1:1;", 0, 1, 200*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	p, err := newQwpSenderPool(ctx, "ws::addr=127.0.0.1:1;close_flush_timeout_millis=100;",
+		0, 1, 200*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("build (min=0 must not connect): %v", err)
 	}
 	defer p.close(ctx)
-	if _, err := p.borrow(ctx); err == nil {
-		t.Error("borrow against a down server should fail")
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("growth borrow against a down server must buffer, not fail (Invariant B): %v", err)
+	}
+	defer s.Close(ctx)
+	if err := s.Table("t").Int64Column("v", 1).At(ctx, time.Now()); err != nil {
+		t.Fatalf("At should buffer while the server is down, not error: %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush should buffer via the cursor engine while down, not error: %v", err)
 	}
 }
 
 func TestQwpSenderPoolPrewarmFailure(t *testing.T) {
-	_, err := newQwpSenderPool(context.Background(), "ws::addr=127.0.0.1:1;", 1, 2, 200*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	_, err := newQwpSenderPool(context.Background(), "ws::addr=127.0.0.1:1;", 1, 2, 200*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err == nil {
 		t.Error("prewarm against a down server should fail the build")
 	}
@@ -797,7 +810,7 @@ func TestQwpSenderPoolDiscardsBackgroundHaltedSlot(t *testing.T) {
 	srv, poison := poisonFirstConnQwpServer(t)
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -846,7 +859,7 @@ func TestQwpSenderPoolReapsBackgroundHaltedSlot(t *testing.T) {
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
 	// idle_timeout and max_lifetime off + min=1: only the poison check can reap.
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -866,13 +879,13 @@ func TestQwpSenderPoolReapsBackgroundHaltedSlot(t *testing.T) {
 
 func TestQwpSenderPoolConstructorErrors(t *testing.T) {
 	ctx := context.Background()
-	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;", 3, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}); err == nil {
+	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;", 3, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil); err == nil {
 		t.Error("min>max should error")
 	}
-	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;init_buf_size=abc;", 0, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}); err == nil {
+	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;init_buf_size=abc;", 0, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil); err == nil {
 		t.Error("malformed conf should error")
 	}
-	if _, err := newQwpSenderPool(ctx, "http::addr=a:9000;", 0, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}); err == nil {
+	if _, err := newQwpSenderPool(ctx, "http::addr=a:9000;", 0, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil); err == nil {
 		t.Error("non-ws schema should error")
 	}
 }
@@ -924,7 +937,7 @@ func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 	srv, poison := poisonFirstConnQwpServer(t)
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";sf_dir=" + t.TempDir() + ";"
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -970,7 +983,7 @@ func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
 		";sf_dir=" + t.TempDir() + ";close_flush_timeout_millis=0;"
 	p, err := newQwpSenderPool(context.Background(), conf, 0, 2,
-		100*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+		100*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -1015,7 +1028,7 @@ func TestQwpSenderPoolCloseNeverTearsDownBorrowedDelegate(t *testing.T) {
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
 	p, err := newQwpSenderPool(context.Background(), conf, 1, 2,
-		200*time.Millisecond /* acquire = close wait budget */, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+		200*time.Millisecond /* acquire = close wait budget */, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -1077,7 +1090,7 @@ func TestQwpSenderPoolCloseUnblocksWhenLeaseReturns(t *testing.T) {
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
 	p, err := newQwpSenderPool(context.Background(), conf, 1, 2,
-		5*time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+		5*time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}

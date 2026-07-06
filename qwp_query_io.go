@@ -29,7 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -207,6 +207,11 @@ type qwpRequest struct {
 type qwpEgressIO struct {
 	transport *qwpTransport
 	decoder   qwpQueryDecoder
+
+	// logger sinks the egress I/O goroutines' own diagnostics (a panic in
+	// the reader or dispatcher). nil -> slog.Default() via
+	// qwpEffectiveLogger; the query client sets it from its config.
+	logger *slog.Logger
 
 	// buffers is the free-buffer pool. The dispatcher takes one
 	// before decoding a RESULT_BATCH; the user returns it via
@@ -679,7 +684,7 @@ func (io *qwpEgressIO) readerRun() {
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("qwp: egress reader panicked: %v\n%s", r, debug.Stack())
-			log.Printf("[ERROR] %v", err)
+			qwpEffectiveLogger(io.logger).Error("qwp: egress reader panicked", "error", err)
 			io.setIoErr(err)
 		}
 	}()
@@ -763,7 +768,7 @@ func (io *qwpEgressIO) dispatcherRun() {
 	defer func() {
 		if r := recover(); r != nil {
 			msg := fmt.Sprintf("qwp: egress dispatcher panicked: %v\n%s", r, debug.Stack())
-			log.Printf("[ERROR] %s", msg)
+			qwpEffectiveLogger(io.logger).Error("qwp: egress dispatcher panicked", "detail", msg)
 			io.poisonAndEmitError(msg)
 		}
 	}()

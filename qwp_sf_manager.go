@@ -27,7 +27,7 @@ package questdb
 import (
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -71,6 +71,12 @@ type qwpSfSegmentManager struct {
 	// (sf-<gen:016x>.sfa). Per-process, not per-ring; recovery skips
 	// the counter past existing on-disk segments at register time.
 	fileGeneration atomic.Uint64
+
+	// logger sinks the cap-reached backpressure diagnostic. The manager's
+	// worker goroutine reads it, so it is an atomic.Pointer the engine's
+	// constructor callers set race-free after the worker has started. nil
+	// (the zero value) -> slog.Default() via qwpEffectiveLogger.
+	logger atomic.Pointer[slog.Logger]
 
 	mu              sync.Mutex
 	rings           []qwpSfManagerRingEntry
@@ -374,18 +380,17 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 			}
 			m.mu.Unlock()
 			if shouldLog {
+				logger := qwpEffectiveLogger(m.logger.Load())
 				if memoryMode {
-					log.Printf("[WARN] qwp/sf: in-memory segment cap reached "+
-						"(%d/%d bytes used, segment size %d); spare provisioning "+
-						"paused — producers block until in-flight segments are "+
-						"ACK'd and trimmed",
-						observedTotal, m.maxTotalBytes, m.segmentSizeBytes)
+					logger.Warn("qwp/sf: in-memory segment cap reached; spare provisioning "+
+						"paused — producers block until in-flight segments are ACK'd and trimmed",
+						"usedBytes", observedTotal, "maxBytes", m.maxTotalBytes,
+						"segmentSize", m.segmentSizeBytes)
 				} else {
-					log.Printf("[WARN] qwp/sf: disk cap reached for %q "+
-						"(%d/%d bytes used, segment size %d); spare provisioning "+
-						"paused — producers block until in-flight segments are "+
-						"ACK'd and trimmed",
-						e.dir, observedTotal, m.maxTotalBytes, m.segmentSizeBytes)
+					logger.Warn("qwp/sf: disk cap reached; spare provisioning "+
+						"paused — producers block until in-flight segments are ACK'd and trimmed",
+						"dir", e.dir, "usedBytes", observedTotal, "maxBytes", m.maxTotalBytes,
+						"segmentSize", m.segmentSizeBytes)
 				}
 			}
 		} else {

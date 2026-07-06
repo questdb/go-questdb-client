@@ -46,7 +46,7 @@ func newQwpQueryPoolForTest(t *testing.T, min, max int) *qwpQueryPool {
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
 	p, err := newQwpQueryPool(context.Background(), conf, min, max,
-		500*time.Millisecond, 0, 0)
+		500*time.Millisecond, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("newQwpQueryPool: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestQwpQueryLeaseStaleQuery(t *testing.T) {
 }
 
 func TestQwpQueryPoolPrewarmFailure(t *testing.T) {
-	_, err := newQwpQueryPool(context.Background(), "ws::addr=127.0.0.1:1;", 1, 2, 200*time.Millisecond, 0, 0)
+	_, err := newQwpQueryPool(context.Background(), "ws::addr=127.0.0.1:1;", 1, 2, 200*time.Millisecond, 0, 0, nil)
 	if err == nil {
 		t.Error("query prewarm against a down server should fail the build")
 	}
@@ -161,7 +161,7 @@ func TestQwpQueryPoolPrewarmFailure(t *testing.T) {
 
 func TestQwpQueryPoolBorrowCreateError(t *testing.T) {
 	ctx := context.Background()
-	p, err := newQwpQueryPool(ctx, "ws::addr=127.0.0.1:1;", 0, 1, 200*time.Millisecond, 0, 0)
+	p, err := newQwpQueryPool(ctx, "ws::addr=127.0.0.1:1;", 0, 1, 200*time.Millisecond, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("build (min=0 must not connect): %v", err)
 	}
@@ -172,7 +172,7 @@ func TestQwpQueryPoolBorrowCreateError(t *testing.T) {
 }
 
 func TestQwpQueryPoolConstructorErrors(t *testing.T) {
-	if _, err := newQwpQueryPool(context.Background(), "ws::addr=a:9000;", 3, 1, time.Second, 0, 0); err == nil {
+	if _, err := newQwpQueryPool(context.Background(), "ws::addr=a:9000;", 3, 1, time.Second, 0, 0, nil); err == nil {
 		t.Error("query pool min>max should error")
 	}
 }

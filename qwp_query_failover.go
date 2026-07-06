@@ -390,6 +390,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 		// client struct allows swapping `tr` independently across
 		// reconnects without disturbing the IO goroutine's view.
 		io := newQwpEgressIO(tr, cfg.bufferPoolSize, cfg.closeDrainTimeout)
+		io.logger = cfg.logger
 		io.start()
 		tracker.RecordSuccess(idx)
 		return &qwpConnectResult{

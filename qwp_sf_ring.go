@@ -27,7 +27,6 @@ package questdb
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -112,9 +111,9 @@ type qwpSfSegmentRing struct {
 	// mu protects sealedSegments and serialises against close. It also
 	// covers the producer's mutation when adding a sealed segment to
 	// the list.
-	mu              sync.Mutex
-	sealedSegments  []*qwpSfSegment
-	closed          bool
+	mu             sync.Mutex
+	sealedSegments []*qwpSfSegment
+	closed         bool
 
 	// managerWakeup is invoked by the producer on rotation or
 	// high-water-mark crossings to ask the manager to provision a
@@ -215,8 +214,12 @@ func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, e
 				// Bad-content .sfa (bad magic/version/header/baseSeq):
 				// a stray or hand-damaged file with no recoverable
 				// frames behind it. Skip rather than fail the whole
-				// recovery, but log so the skip is never silent.
-				log.Printf("[WARN] qwp/sf: skipping corrupt segment during recovery: %v", err)
+				// recovery, but log so the skip is never silent. This
+				// runs during on-disk recovery inside the engine
+				// constructor, before the per-sender logger is wired, so
+				// it goes to slog.Default() (an app that configures global
+				// slog still captures it).
+				qwpEffectiveLogger(nil).Warn("qwp/sf: skipping corrupt segment during recovery", "error", err)
 				continue
 			}
 			// A syscall/I-O failure (EMFILE/ENFILE/ENOMEM/EACCES/EIO)

@@ -611,8 +611,7 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				// The default. Non-durable, OK-driven trim (sf-client.md §9.2).
 			case "on", "true":
 				// Durable-ack mode: the cursor send loop trims / replays / awaits
-				// on STATUS_DURABLE_ACK instead of the OK ACK
-				// (design/qwp-cursor-durability.md).
+				// on STATUS_DURABLE_ACK instead of the OK ACK.
 				senderConf.requestDurableAck = true
 			default:
 				return nil, NewInvalidConfigStrError(

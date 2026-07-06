@@ -44,7 +44,7 @@ func senderPoolWithIdle(t *testing.T, extra string, min, max int, idle time.Dura
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";" + extra
 	p, err := newQwpSenderPool(context.Background(), conf, min, max,
-		500*time.Millisecond, idle, 0, nil, nil, QwpBackgroundDrainerListener{})
+		500*time.Millisecond, idle, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestQwpSenderPoolAcquireWaitWakesOnGiveBack(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 2*time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 2*time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestQwpSenderPoolSparesUnackedSlot(t *testing.T) {
 	// unacked slot for the full default budget against the non-ACKing server.
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";close_flush_timeout_millis=100;"
 	p, err := newQwpSenderPool(context.Background(), conf, 0, 2,
-		500*time.Millisecond, time.Millisecond /* idle */, 0, nil, nil, QwpBackgroundDrainerListener{})
+		500*time.Millisecond, time.Millisecond /* idle */, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestQwpSenderPoolReapsOverAge(t *testing.T) {
 	defer srv.Close()
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
 	p, err := newQwpSenderPool(context.Background(), conf, 0, 2,
-		500*time.Millisecond, 0 /* idle off */, time.Millisecond /* max_lifetime */, nil, nil, QwpBackgroundDrainerListener{})
+		500*time.Millisecond, 0 /* idle off */, time.Millisecond /* max_lifetime */, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestQwpSenderPoolSfStrandedSlotRecovered(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";sf_dir=" + sfDir + ";"
-	p, err := newQwpSenderPool(ctx, conf, 1, 4, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	p, err := newQwpSenderPool(ctx, conf, 1, 4, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("phase 2 build: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestQwpSenderPoolBrokenSlotDiscarded(t *testing.T) {
 	srv, poison := poisonFirstConnQwpServer(t)
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
-	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{})
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 2, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -318,7 +318,7 @@ func queryPoolWithIdle(t *testing.T, min, max int, idle time.Duration) *qwpQuery
 	})
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
-	p, err := newQwpQueryPool(context.Background(), conf, min, max, 500*time.Millisecond, idle, 0)
+	p, err := newQwpQueryPool(context.Background(), conf, min, max, 500*time.Millisecond, idle, 0, nil)
 	if err != nil {
 		t.Fatalf("newQwpQueryPool: %v", err)
 	}
@@ -338,7 +338,7 @@ func queryPoolWithCancelResponder(t *testing.T, min, max int, idle time.Duration
 	srv := newQwpMockEgressServer(t, egressCancelResponder)
 	t.Cleanup(srv.Close)
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
-	p, err := newQwpQueryPool(context.Background(), conf, min, max, 500*time.Millisecond, idle, 0)
+	p, err := newQwpQueryPool(context.Background(), conf, min, max, 500*time.Millisecond, idle, 0, nil)
 	if err != nil {
 		t.Fatalf("newQwpQueryPool: %v", err)
 	}

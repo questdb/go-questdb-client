@@ -25,7 +25,7 @@
 package questdb
 
 import (
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +41,7 @@ type qwpPoolHousekeeper struct {
 	joinBudget time.Duration
 	senderPool *qwpSenderPool
 	queryPool  *qwpQueryPool
+	logger     *slog.Logger // nil -> slog.Default() via qwpEffectiveLogger
 	stop       chan struct{}
 	done       chan struct{}
 	started    atomic.Bool
@@ -58,11 +59,16 @@ func newQwpPoolHousekeeper(sp *qwpSenderPool, qp *qwpQueryPool, interval, joinBu
 	if joinBudget <= 0 {
 		joinBudget = qwpSfDefaultCloseFlushTimeout + time.Second
 	}
+	var logger *slog.Logger
+	if sp != nil {
+		logger = sp.logger
+	}
 	return &qwpPoolHousekeeper{
 		interval:   interval,
 		joinBudget: joinBudget,
 		senderPool: sp,
 		queryPool:  qp,
+		logger:     logger,
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 	}
@@ -97,7 +103,7 @@ func (h *qwpPoolHousekeeper) run() {
 func (h *qwpPoolHousekeeper) reapGuarded(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[WARN] qwp pool housekeeper: reap step panicked: %v", r)
+			qwpEffectiveLogger(h.logger).Warn("qwp pool housekeeper: reap step panicked", "panic", r)
 		}
 	}()
 	fn()

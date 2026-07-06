@@ -110,8 +110,8 @@ func TestQwpCursorSenderFlushNoRowsIsCheap(t *testing.T) {
 // TestQwpCursorSenderFlushWithPendingRowsDoesNotWaitForAck pins the
 // headline cursor-mode contract change: Flush / FlushAndGetSequence
 // publish the pending batch and return WITHOUT blocking on the server
-// ACK (design/qwp-cursor-durability.md decision #1: "flush() never waits
-// for ACK; ACKs are async"). TestQwpCursorSenderFlushNoRowsIsCheap covers
+// ACK (flush() never waits for ACK; ACKs are async).
+// TestQwpCursorSenderFlushNoRowsIsCheap covers
 // the zero-pending fast path; this exercises the pending-rows branch —
 // the one that actually encodes and enqueues a frame — against a server
 // that accepts frames but never ACKs. The proof has two halves: the call

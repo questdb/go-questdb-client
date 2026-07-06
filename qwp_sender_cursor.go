@@ -197,6 +197,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	if err != nil {
 		return nil, err
 	}
+	engine.engineSetLogger(qwpEffectiveLogger(conf.logger))
 
 	// Failover plumbing (failover.md §2 / §13.6). The tracker is
 	// shared across every caller drawing from this addr= list: the
@@ -290,21 +291,34 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
 		reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+	loop.logger = qwpEffectiveLogger(conf.logger)
 	loop.sendLoopSetHostTracker(tracker, initialBoundIdx)
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	engine.engineSetTerminalErrorGetter(loop.sendLoopCheckError)
 	// Wire the user-configured server-error API knobs (Phase 5)
 	// before sendLoopStart so they're visible from the receiver
-	// goroutine the moment it starts.
+	// goroutine the moment it starts. When the caller registered no handler
+	// or listener, install the loud default bound to the configured logger
+	// (native-client "silence is forbidden") rather than leaving the
+	// dispatcher's slog.Default()-only fallback.
 	resolver := &qwpSfPolicyResolver{
 		resolver: conf.errorPolicyResolver,
 		perCat:   conf.errorPolicyPerCat,
 		global:   conf.errorPolicyGlobal,
+		logger:   loop.logger,
 	}
 	loop.sendLoopSetPolicyResolver(resolver)
-	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
+	errorHandler := conf.errorHandler
+	if errorHandler == nil {
+		errorHandler = newDefaultSenderErrorHandler(loop.logger)
+	}
+	loop.sendLoopSetErrorHandler(errorHandler, conf.errorInboxCapacity)
 	loop.sendLoopSetEndpoints(conf.endpoints)
-	loop.sendLoopSetConnectionListener(conf.connectionListener, conf.connectionListenerInboxCapacity)
+	connectionListener := conf.connectionListener
+	if connectionListener == nil {
+		connectionListener = newDefaultSenderConnectionListener(loop.logger)
+	}
+	loop.sendLoopSetConnectionListener(connectionListener, conf.connectionListenerInboxCapacity)
 	durableKeepalive := qwpDurableAckKeepaliveDefault
 	if conf.durableAckKeepaliveMillisSet {
 		durableKeepalive = time.Duration(conf.durableAckKeepaliveMillis) * time.Millisecond
@@ -396,6 +410,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			// pool and shuts down the drainers already submitted; leaving
 			// the assignment past the loop would strand those goroutines
 			// and their connections.
+			pool.logger = loop.logger
 			s.drainerPool = pool
 			// Drainer dials get a finite default TCP-connect deadline when
 			// connect_timeout is unset: a black-holed SYN would otherwise
@@ -421,6 +436,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 				drainer.durableAckMode = conf.requestDurableAck
 				drainer.durableKeepalive = durableKeepalive
 				drainer.maxFrameRejections = conf.maxFrameRejections
+				drainer.logger = loop.logger
 				drainer.listener = conf.backgroundDrainerListener
 				_ = pool.drainerPoolSubmit(ctx, drainer)
 			}
@@ -473,8 +489,8 @@ func qwpSfBuildEndpointFactory(endpoints []qwpEndpoint, scheme string, opts qwpT
 // failure observed during the append window so a terminal error
 // reaches the producer immediately instead of on its next call.
 // Mirrors Java: flushAndGetSequence() = flushPendingRows() +
-// checkError() (design/qwp-cursor-durability.md decision #1 —
-// "flush() never waits for ACK; ACKs are async"). Callers wanting
+// checkError() — flush() never waits for ACK; ACKs are async.
+// Callers wanting
 // server-ACK confirmation pair FlushAndGetSequence with
 // AwaitAckedFsn.
 //
@@ -499,9 +515,8 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 
 // enqueueCursor encodes the pending rows as a self-sufficient QWP
 // frame and appends it to the cursor engine. It does NOT wait for
-// the server ACK (Java decision #1 in
-// design/qwp-cursor-durability.md: "flush() never waits for ACK;
-// ACKs are async") — the frame is durable once appended (in-RAM
+// the server ACK (flush() never waits for ACK; ACKs are async) —
+// the frame is durable once appended (in-RAM
 // for memory mode, on-disk for SF) and the send loop drains +
 // replays it in the background. Shared by the auto-flush trigger
 // and by flushCursor (explicit Flush()), so the user goroutine is
@@ -669,6 +684,15 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 		// hold their rows. Bring the aggregate counters back in line with
 		// the surviving buffers; the caller must not reset on error.
 		s.recomputePendingFromBuffers()
+		// Any table already dropped for being irreducibly over-cap was reset
+		// before this transient failure, so its rows will not reappear on the
+		// retry the transient error invites. Join the typed drop error so that
+		// notification is surfaced now rather than silently lost.
+		if len(oversize) > 0 {
+			return errors.Join(
+				s.oversizeTableError(worstKind, worstCap, worstSize, oversize, droppedRows),
+				txErr)
+		}
 		return txErr
 	}
 

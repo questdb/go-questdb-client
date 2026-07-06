@@ -80,9 +80,8 @@ func newQwpSenderForTest(t *testing.T, serverURL string) *qwpLineSender {
 }
 
 // flushAndAwaitAck flushes pending rows and blocks until the server
-// has ACKed them. Flush no longer waits for the ACK (Java decision
-// #1 — see design/qwp-cursor-durability.md), so tests that assert
-// server-side receipt must use this FlushAndGetSequence +
+// has ACKed them. Flush no longer waits for the ACK, so tests that
+// assert server-side receipt must use this FlushAndGetSequence +
 // AwaitAckedFsn barrier instead of relying on Flush alone.
 func flushAndAwaitAck(t *testing.T, s *qwpLineSender) {
 	t.Helper()
@@ -1654,8 +1653,7 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 	// Cursor mode emits self-sufficient frames: every batch carries
 	// the full symbol dict from id 0. So the second message also
 	// has deltaStart=0 (NOT 2), with all three symbols repeated.
-	// This is the documented "self-sufficient frames" decision (see
-	// design/qwp-cursor-durability.md decision #14).
+	// This is the documented "self-sufficient frames" decision.
 	msg2 := messages[1]
 	off = qwpHeaderSize
 	deltaStart2, n, _ := qwpReadVarint(msg2[off:])

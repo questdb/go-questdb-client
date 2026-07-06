@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +87,7 @@ type questDBConfig struct {
 	errorHandler                       SenderErrorHandler
 	connectionListener                 SenderConnectionListener
 	drainerListener                    QwpBackgroundDrainerListener
+	logger                             *slog.Logger
 }
 
 func defaultQuestDBConfig() *questDBConfig { return &questDBConfig{} }
@@ -174,6 +176,12 @@ func WithQuestDBBackgroundDrainerListener(l QwpBackgroundDrainerListener) QuestD
 	return func(c *questDBConfig) { c.drainerListener = l }
 }
 
+// WithQuestDBLogger sets the *slog.Logger applied to both pools and every
+// pooled sender and query session. See WithLogger.
+func WithQuestDBLogger(l *slog.Logger) QuestDBOption {
+	return func(c *questDBConfig) { c.logger = l }
+}
+
 // serializeErrorHandler wraps h so concurrent invocations from the pool's
 // per-sender dispatchers are serialized, preserving the single-goroutine
 // delivery contract a single sender's handler enjoys. Returns nil unchanged.
@@ -246,7 +254,8 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	if serr := sanitizeQwpConf(senderConf); serr != nil {
 		return nil, serr
 	}
-	if _, err := parseQwpQueryConf(conf); err != nil {
+	queryConf, err := parseQwpQueryConf(conf)
+	if err != nil {
 		return nil, err
 	}
 
@@ -317,34 +326,37 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	// the caller registers none, install the loud default here so the pool emits
 	// one serialized event stream instead of an independent default per slot — a
 	// standalone sender emits a single stream, and the pool should too.
+	logger := qwpEffectiveLogger(cfg.logger)
 	errorHandler := serializeErrorHandler(cfg.errorHandler)
 	if errorHandler == nil {
-		errorHandler = serializeErrorHandler(defaultSenderErrorHandler)
+		errorHandler = serializeErrorHandler(newDefaultSenderErrorHandler(logger))
 	}
 	connectionListener := serializeConnectionListener(cfg.connectionListener)
 	if connectionListener == nil {
-		connectionListener = serializeConnectionListener(defaultSenderConnectionListener)
+		connectionListener = serializeConnectionListener(newDefaultSenderConnectionListener(logger))
 	}
 
 	// Build both pools + the housekeeper, teardown-hardened: on any failure
 	// close what was already built, in reverse order (Hazard I at the facade).
 	sp, err := newQwpSenderPool(ctx, ingestConf, senderMin, senderMax,
-		acquire, idle, lifetime, errorHandler, connectionListener, cfg.drainerListener)
+		acquire, idle, lifetime, errorHandler, connectionListener, cfg.drainerListener, logger)
 	if err != nil {
 		return nil, err
 	}
-	qp, err := newQwpQueryPool(ctx, conf, queryMin, queryMax, acquire, idle, lifetime)
+	qp, err := newQwpQueryPool(ctx, conf, queryMin, queryMax, acquire, idle, lifetime, logger)
 	if err != nil {
 		_ = sp.close(ctx)
 		return nil, err
 	}
-	// The join budget must cover a reaped slot's close-flush drain, so a reap
-	// in flight can never outlive QuestDB.Close.
+	// The join budget must cover one reap sweep's worst case so a reap in flight
+	// can never outlive QuestDB.Close. A sweep reaps the sender pool then the
+	// query pool sequentially, so the budget sums the sender close-flush drain
+	// and the query close-drain (query_close_timeout_ms).
 	closeFlush := qwpSfDefaultCloseFlushTimeout
 	if senderConf.closeFlushTimeoutSet {
 		closeFlush = max(time.Duration(senderConf.closeFlushTimeoutMillis)*time.Millisecond, 0)
 	}
-	hk := newQwpPoolHousekeeper(sp, qp, hkInterval, closeFlush+time.Second)
+	hk := newQwpPoolHousekeeper(sp, qp, hkInterval, closeFlush+queryConf.closeDrainTimeout+time.Second)
 	hk.start()
 	return &QuestDB{senderPool: sp, queryPool: qp, housekeeper: hk}, nil
 }
@@ -495,6 +507,11 @@ func resolvePoolInt(set bool, opt int, kv map[string]string, key string, dflt in
 	return resolved, nil
 }
 
+// qwpMaxDurationMillis is the largest millisecond count that still fits a
+// time.Duration (int64 nanoseconds); a larger value would wrap to a nonsensical
+// duration instead of the magnitude the user asked for.
+const qwpMaxDurationMillis = int64(9223372036854775807) / int64(time.Millisecond)
+
 // resolvePoolDur resolves a millisecond pool key into a Duration: explicit
 // option (set) > connect-string key > default. Like resolvePoolInt, the key is
 // validated even when the option shadows it.
@@ -504,6 +521,9 @@ func resolvePoolDur(set bool, opt time.Duration, kv map[string]string, key strin
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
 			return 0, fmt.Errorf("invalid %s %q (expected a non-negative int, milliseconds)", key, v)
+		}
+		if int64(n) > qwpMaxDurationMillis {
+			return 0, fmt.Errorf("invalid %s %q (milliseconds value is out of range)", key, v)
 		}
 		resolved = time.Duration(n) * time.Millisecond
 	}

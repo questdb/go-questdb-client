@@ -238,8 +238,8 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 // otherwise-recoverable slot).
 func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
 	t.Run("HelperRecovers", func(t *testing.T) {
-		qwpDrainerListenerCall(func() { panic("boom") }) // must not propagate
-		qwpDrainerListenerCall(nil)                      // nil-safe
+		qwpDrainerListenerCall(nil, func() { panic("boom") }) // must not propagate
+		qwpDrainerListenerCall(nil, nil)                      // nil-safe
 	})
 
 	t.Run("OnDurableAckUnavailablePanicContained", func(t *testing.T) {

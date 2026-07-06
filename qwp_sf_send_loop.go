@@ -29,7 +29,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -291,7 +291,6 @@ type qwpSfSendLoop struct {
 	// Durable-ack (request_durable_ack). Set once before sendLoopStart, then
 	// read by the loop goroutines. durable is owned by the receiver goroutine;
 	// its pendingLen is atomic so the sender can gate the keepalive ping on it.
-	// See design/qwp-cursor-durability.md.
 	durableAckMode           bool
 	durable                  *qwpDurableTracker
 	durableKeepaliveInterval time.Duration
@@ -365,6 +364,11 @@ type qwpSfSendLoop struct {
 	// (max_frame_rejections; default qwpSfDefaultMaxFrameRejections).
 	// Set before sendLoopStart, read-only afterwards.
 	maxFrameRejections int
+
+	// logger sinks the loop's own diagnostics and is propagated to the
+	// error/connection dispatchers it owns. nil -> slog.Default() via
+	// qwpEffectiveLogger; set from the config before sendLoopStart.
+	logger *slog.Logger
 
 	// Reconnect-loop status, exposed so engineAppendBlocking can
 	// distinguish "wire publishing but slow" from "wire is in the
@@ -538,7 +542,9 @@ func (l *qwpSfSendLoop) sendLoopSetErrorHandler(handler SenderErrorHandler, capa
 	if capacity <= 0 {
 		capacity = qwpSfDefaultErrorInboxCapacity
 	}
-	old := l.dispatcher.Swap(newQwpSfErrorDispatcher(handler, capacity))
+	d := newQwpSfErrorDispatcher(handler, capacity)
+	d.logger = l.logger
+	old := l.dispatcher.Swap(d)
 	if old != nil {
 		old.close()
 	}
@@ -558,7 +564,9 @@ func (l *qwpSfSendLoop) sendLoopSetConnectionListener(listener SenderConnectionL
 	if capacity <= 0 {
 		capacity = qwpSfDefaultErrorInboxCapacity
 	}
-	old := l.connDispatcher.Swap(newQwpConnDispatcher(listener, capacity))
+	d := newQwpConnDispatcher(listener, capacity)
+	d.logger = l.logger
+	old := l.connDispatcher.Swap(d)
 	if old != nil {
 		old.close()
 	}
@@ -633,12 +641,42 @@ func (l *qwpSfSendLoop) sendLoopStart() {
 	go l.run()
 }
 
-// sendLoopClose stops the I/O goroutine and waits for it to exit.
-// Idempotent. Safe to call from any goroutine.
+// qwpSfSendLoopCloseGrace bounds how long sendLoopClose waits for the I/O
+// goroutine to exit after cancelling its context. cancel() unwinds every
+// ctx-aware blocking op at once, so a goroutine still alive past this grace is
+// wedged in un-cancellable I/O — a disk-backed segment mmap page-fault on hung
+// storage. var (not const) so package tests can dial it down.
+var qwpSfSendLoopCloseGrace = 5 * time.Second
+
+// sendLoopClose stops the I/O goroutine and waits for it to exit, bounded by
+// qwpSfSendLoopCloseGrace so a goroutine wedged in un-cancellable disk I/O
+// cannot hang Close forever. Idempotent. Safe to call from any goroutine.
 func (l *qwpSfSendLoop) sendLoopClose() error {
 	l.running.Store(false)
 	l.cancel()
-	l.wg.Wait()
+	joined := make(chan struct{})
+	go func() {
+		l.wg.Wait()
+		close(joined)
+	}()
+	timer := time.NewTimer(qwpSfSendLoopCloseGrace)
+	defer timer.Stop()
+	select {
+	case <-joined:
+		// run() exited: its own defers already released the transport, and both
+		// inner goroutines were joined before it returned, so reclaiming the
+		// remaining resources below cannot race the wire loop.
+	case <-timer.C:
+		// Wedged in I/O the ctx cannot reach (a disk-backed segment mmap
+		// page-fault on hung storage). Abandon rather than hang Close: the
+		// goroutine lives until its syscall returns and releases the transport via
+		// its own defer, so we must NOT swap the transport out or close the
+		// dispatchers it may still touch. Mirrors the orphan drainer pool's
+		// hard-close abandon.
+		qwpEffectiveLogger(l.logger).Warn("qwp/sf: send loop still running after close; "+
+			"abandoning (wedged in un-cancellable disk I/O)", "grace", qwpSfSendLoopCloseGrace)
+		return l.checkErrorOrNil()
+	}
 	if t := l.transport.Swap(nil); t != nil {
 		_ = t.close()
 	}
@@ -948,7 +986,7 @@ func (l *qwpSfSendLoop) run() {
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("qwp/sf: send loop panicked: %v\n%s", r, debug.Stack())
-			log.Printf("[ERROR] %v", err)
+			qwpEffectiveLogger(l.logger).Error("qwp/sf: send loop panicked", "error", err)
 			l.recordFatal(err)
 		}
 	}()
@@ -1091,7 +1129,7 @@ func (l *qwpSfSendLoop) runOneConnection() error {
 		defer func() {
 			if r := recover(); r != nil {
 				err := fmt.Errorf("qwp/sf: %s panicked: %v\n%s", name, r, debug.Stack())
-				log.Printf("[ERROR] %v", err)
+				qwpEffectiveLogger(l.logger).Error("qwp/sf: connection goroutine panicked", "goroutine", name, "error", err)
 				errCh <- loopErr{err}
 			}
 		}()
@@ -1445,8 +1483,7 @@ func (l *qwpSfSendLoop) sendLoopSetDurableAck(enabled bool, keepalive time.Durat
 }
 
 // durableOnOk stashes an OK ACK as a pending entry (durable mode) instead of
-// advancing the engine. wireSeq is capped at the highest assigned sequence so a
-// forged/replayed ACK cannot enqueue a sequence beyond what was sent.
+// advancing the engine.
 //
 // Load-bearing invariant: the server sends exactly one OK ACK per frame,
 // carrying that frame's per-table seqTxn trailer. Per-entry trim in durableDrain
@@ -1467,12 +1504,16 @@ func (l *qwpSfSendLoop) durableOnOk(seq int64, tail []byte) *SenderError {
 	if seq < 0 {
 		return nil // OK acks name a real wire sequence; -1 is the NACK-only no-seq sentinel
 	}
+	// An OK ack naming a wire sequence beyond the highest frame we sent is a
+	// protocol violation: the server cannot commit a frame it never received.
+	// Checked before seqGap so a forged value neither raises the gap-detection
+	// floor nor gets enqueued with this frame's trailer under a clamped wireSeq
+	// (which could trim a real, not-yet-durable frame against the wrong table set).
+	if seq > assigned {
+		return l.qwpSfBuildDurableOverrunSE(seq, assigned)
+	}
 	if expected, gap := l.durable.seqGap(seq); gap {
 		return l.qwpSfBuildDurableGapSE(seq, expected)
-	}
-	if seq > assigned {
-		log.Printf("[WARN] qwp/sf: server ACK wire seq %d exceeds highest sent %d, clamping", seq, assigned)
-		seq = assigned
 	}
 	if !l.durable.enqueueOk(seq, tail) {
 		return l.qwpSfBuildDurableCapSE(seq)
@@ -1502,6 +1543,24 @@ func (l *qwpSfSendLoop) qwpSfBuildDurableGapSE(gotSeq, expectedSeq int64) *Sende
 		ServerStatusByte: NoStatusByte,
 		ServerMessage: fmt.Sprintf("durable-ack OK sequence gap: got %d, expected %d — server "+
 			"coalesced or dropped an OK ack, leaving frames untracked for durable trimming", gotSeq, expectedSeq),
+		MessageSequence: gotSeq,
+		FromFsn:         from,
+		ToFsn:           to,
+		DetectedAt:      time.Now(),
+	}
+}
+
+// qwpSfBuildDurableOverrunSE builds the terminal PROTOCOL_VIOLATION surfaced when
+// an OK ack names a wire sequence beyond the highest frame sent — the server
+// acknowledged a frame it could not have received.
+func (l *qwpSfSendLoop) qwpSfBuildDurableOverrunSE(gotSeq, assigned int64) *SenderError {
+	from, to := l.durableUnackedSpan()
+	return &SenderError{
+		Category:         CategoryProtocolViolation,
+		AppliedPolicy:    PolicyTerminal,
+		ServerStatusByte: NoStatusByte,
+		ServerMessage: fmt.Sprintf("durable-ack OK sequence %d exceeds highest sent %d — server "+
+			"acked a frame that was never delivered", gotSeq, assigned),
 		MessageSequence: gotSeq,
 		FromFsn:         from,
 		ToFsn:           to,
@@ -1674,7 +1733,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				l.durable.applyDurable(data[qwpAckTablesOffset(status):])
 				l.durableDrain()
 			} else if l.warnedStrayDurable.CompareAndSwap(false, true) {
-				log.Printf("[WARN] qwp/sf: received STATUS_DURABLE_ACK frame without opt-in — ignoring")
+				qwpEffectiveLogger(l.logger).Warn("qwp/sf: received STATUS_DURABLE_ACK frame without opt-in — ignoring")
 			}
 			continue
 		}
@@ -1761,9 +1820,13 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				l.dispatcher.Load().offer(poison)
 				return poison
 			}
-			log.Printf("[WARN] qwp/sf: server rejected wire seq %d (category=%s, policy=%s, "+
-				"status=0x%02X) — recycling connection, will replay from fsn %d",
-				seq, cat, pol, byte(status), l.engine.engineAckedFsn()+1)
+			// The rejection is already dispatched as a *SenderError above (and
+			// logged by the default handler when the user registered none), so
+			// this recycle trace is Debug: hidden by default, available for
+			// deep debugging without double-logging every retriable NACK.
+			qwpEffectiveLogger(l.logger).Debug("qwp/sf: server rejected frame — recycling connection",
+				"seq", seq, "category", cat, "policy", pol,
+				"status", byte(status), "replayFromFsn", l.engine.engineAckedFsn()+1)
 			return &qwpSfRetriableRejection{msg: fmt.Sprintf(
 				"server NACK (%s, %s): %s", cat, pol, msg)}
 		}
@@ -1803,6 +1866,18 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// matching call on the send side re-drives the same reconciliation
 			// so an ACK that arrives before its frame's send completes is not
 			// stranded when no later ACK follows it.
+			//
+			// Cap the recorded sequence at the highest assigned wire seq: the raw
+			// value persists and is re-applied on the send side after every send,
+			// so an unclamped ahead-of-send ack would advance ackedFsn as each
+			// later frame is put on the wire — before the server ever acks it —
+			// and a drop in that window would replay past the lost frames. A
+			// compliant server only acks what it received (seq <= assigned), so
+			// this is inert for it and defends against a forged/buggy one, mirroring
+			// durableOnOk's clamp.
+			if assigned := l.nextWireSeq.Load() - 1; seq > assigned {
+				seq = assigned
+			}
 			l.serverAckedSeq.Store(seq)
 			l.applyAckWatermark()
 			l.noteAckProgress(l.engine.engineAckedFsn())
@@ -1875,17 +1950,19 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 				RoundNumber:     round,
 				TimestampMillis: time.Now().UnixMilli(),
 			})
+			// The all-endpoints-unreachable transition is already dispatched as a
+			// SenderConnectionEvent above (and logged by the default listener when
+			// the user registered none), so this is a throttled Debug trace that
+			// adds only the replica-only-vs-no-endpoint reason — hidden by default,
+			// available for deep debugging without shadowing the event.
 			if now := time.Now(); now.Sub(lastWarnAt) >= qwpSfReconnectWarnThrottle {
 				lastWarnAt = now
+				reason := "no endpoint reachable"
 				if outcome.allReplica() {
-					log.Printf("[WARN] qwp/sf: %s round %d: every reachable endpoint "+
-						"is a replica (transient failover window); retrying with capped "+
-						"backoff — if this persists the configured address list may "+
-						"point at replicas only", phase, round)
-				} else {
-					log.Printf("[WARN] qwp/sf: %s round %d: no endpoint reachable; "+
-						"retrying with capped backoff", phase, round)
+					reason = "every reachable endpoint is a replica (transient failover window)"
 				}
+				qwpEffectiveLogger(l.logger).Debug("qwp/sf: reconnect round exhausted; retrying with capped backoff",
+					"phase", phase, "round", round, "reason", reason)
 			}
 			if fn := l.onRoundExhausted; fn != nil {
 				fn(outcome)

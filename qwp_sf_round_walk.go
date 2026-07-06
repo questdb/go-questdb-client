@@ -186,10 +186,13 @@ type qwpSfRoundWalkParams struct {
 // qwpSfSweepOutcome aggregates the failure classes one exhausted
 // address-list sweep observed, so round-boundary hooks can classify
 // the sweep as a whole rather than by its (ordering-dependent) final
-// dial. A durable-ack capability gap outranks a role reject outranks
-// a transport error: any mismatch marks a capability-gap sweep, while
-// an all-replica sweep requires every real failure to be a role
-// reject.
+// dial. A durable-ack capability gap and a protocol reject are
+// persistent classes distinct from a transient transport error: an
+// all-replica window requires every real failure to be a role reject,
+// and a deferred durable-mismatch / protocol-reject terminal fires
+// only when no transient transport error coexisted (Invariant B: an
+// outage of the intended host must not be escalated to a terminal
+// because a different peer is misconfigured or mid-upgrade).
 type qwpSfSweepOutcome struct {
 	// SawDurableMismatch: at least one dial reached an endpoint that
 	// does not advertise durable-ack (*QwpDurableAckMismatchError).
@@ -197,8 +200,14 @@ type qwpSfSweepOutcome struct {
 	// SawRoleReject: at least one dial was 421-rejected with a role
 	// header (replica or catching-up primary).
 	SawRoleReject bool
-	// SawTransportError: at least one dial failed for any other real
-	// reason (TCP/TLS error, non-role upgrade reject, 404/426).
+	// SawProtocolReject: at least one dial was rejected with a 404
+	// (wrong endpoint) or 426 (upgrade required) — a persistent
+	// misconfiguration or a peer mid-upgrade, not a transient
+	// transport error.
+	SawProtocolReject bool
+	// SawTransportError: at least one dial failed for a transient real
+	// reason (TCP/TLS error, response-header timeout, 421-without-role,
+	// 503).
 	SawTransportError bool
 }
 
@@ -208,7 +217,7 @@ type qwpSfSweepOutcome struct {
 // reappears), so callers reset settle budgets and fire
 // OnPrimaryUnavailable rather than treating it as an outage.
 func (o qwpSfSweepOutcome) allReplica() bool {
-	return o.SawRoleReject && !o.SawDurableMismatch && !o.SawTransportError
+	return o.SawRoleReject && !o.SawDurableMismatch && !o.SawTransportError && !o.SawProtocolReject
 }
 
 // qwpSfSingleRoundResult is the inner-loop return shape for one walk
@@ -323,21 +332,24 @@ func qwpSfRunSingleRound(
 
 		idx := params.Tracker.pickNext(cursor)
 		if idx < 0 {
-			// Sweep exhausted. If a foreground durable-ack mismatch was seen
-			// and no endpoint in the sweep advertised durable-ack, surface it
-			// as terminal now: fail only after the whole sweep found no
-			// durable-advertising endpoint.
-			if pendingMismatch != nil {
-				return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingMismatch}
-			}
-			// Same deferred-terminal shape for a protocol-level reject
-			// (404 wrong endpoint, 426 upgrade required): a single peer
-			// rejecting must not lock the walk out of a compatible
-			// sibling, but a sweep that saw one and bound nothing fails
-			// loud — replaying the handshake meets the same reject, and
-			// waiting cannot fix a misconfigured path or a pre-QWP server.
-			if pendingProtocolReject != nil {
-				return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingProtocolReject}
+			// Sweep exhausted. A deferred durable-ack mismatch or protocol-level
+			// reject (404 wrong endpoint, 426 upgrade required) becomes terminal
+			// only when it was the sweep's *sole* failure class: a single peer
+			// rejecting must not lock the walk out of a compatible sibling, and a
+			// sweep that found nothing but rejects fails loud — replaying the
+			// handshake meets the same reject and waiting cannot fix a
+			// misconfigured path, a pre-QWP server, or an all-replica cluster.
+			// But a coexisting transient transport error means a healthy endpoint
+			// may simply be mid-restart, so keep retrying with backoff (mirrors
+			// allReplica()) rather than latching a terminal that would drop a
+			// running sender the outage was about to release (Invariant B).
+			if !outcome.SawTransportError {
+				if pendingMismatch != nil {
+					return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingMismatch}
+				}
+				if pendingProtocolReject != nil {
+					return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingProtocolReject}
+				}
 			}
 			return qwpSfSingleRoundResult{
 				Idx:       -1,
@@ -437,16 +449,22 @@ func qwpSfRunSingleRound(
 					Terminal: rej,
 				}
 			}
-			// Protocol-level rejects (404 wrong endpoint, 426 upgrade
-			// required): remember for the sweep-exhaustion terminal above,
-			// then keep walking so a compatible sibling can still bind.
-			// Mirrors qwpSfIsProtocolUpgradeFailure and the sanctioned
-			// non-421-reject terminal.
-			if rej.StatusCode == 404 || rej.StatusCode == 426 {
-				pendingProtocolReject = rej
-			}
 			if params.OnEndpointFailed != nil {
 				params.OnEndpointFailed(idx, err)
+			}
+			// Protocol-level rejects (404 wrong endpoint, 426 upgrade
+			// required): remember for the sweep-exhaustion terminal above,
+			// demote the host so a compatible sibling can still bind, and
+			// classify the sweep as a protocol reject — NOT a transient
+			// transport error. A mixed sweep that also hit a real transport
+			// outage then keeps retrying; the deferred terminal fires only
+			// once the outage clears and the reject is the sole failure class
+			// (Invariant B). Mirrors the sanctioned non-421-reject terminal.
+			if rej.StatusCode == 404 || rej.StatusCode == 426 {
+				pendingProtocolReject = rej
+				params.Tracker.recordTransportError(idx, cursor)
+				outcome.SawProtocolReject = true
+				continue
 			}
 			// X-QuestDB-Zone on a 421 reject is intentionally ignored
 			// on the SF-ingest path: the ingress walk does not route by

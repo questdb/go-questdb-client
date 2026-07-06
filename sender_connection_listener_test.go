@@ -103,8 +103,9 @@ func TestConnectionListenerFiresConnected(t *testing.T) {
 // when no WithConnectionListener is set) across every kind, including the WARN
 // and ERROR branches and an unknown kind; it must classify and log without panic.
 func TestDefaultSenderConnectionListener(t *testing.T) {
+	listener := newDefaultSenderConnectionListener(nil)
 	for k := SenderConnected; k <= SenderAuthFailed+1; k++ {
-		defaultSenderConnectionListener(SenderConnectionEvent{Kind: k, Host: "h", Port: 9000})
+		listener(SenderConnectionEvent{Kind: k, Host: "h", Port: 9000})
 	}
 }
 

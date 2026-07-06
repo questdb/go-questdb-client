@@ -305,6 +305,31 @@ func TestRoundWalk426IsTransient(t *testing.T) {
 	assert.Equal(t, 1, result.Idx)
 }
 
+// TestRoundWalkProtocolRejectDefersToTransientTransportError is the C1
+// regression: a sweep that hit both a 404/426 protocol reject and a transient
+// transport error must NOT latch the deferred protocol-reject terminal. The
+// transport-errored host may be mid-restart, and terminating on the sibling's
+// misconfiguration would drop a running sender the outage was about to release
+// (Invariant B). The bounded walk exhausts its budget — keeps retrying — instead.
+func TestRoundWalkProtocolRejectDefersToTransientTransportError(t *testing.T) {
+	notFoundSrv := newRoundWalkRejectServer(t, 404, http.Header{})
+	defer notFoundSrv.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, notFoundSrv), // persistent 404 reject
+		{host: "127.0.0.1", port: 1},      // transient transport error (down host)
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	result := runWalkAgainst(t, endpoints, tracker, -1,
+		300*time.Millisecond, 20*time.Millisecond, 50*time.Millisecond)
+
+	require.Nil(t, result.Transport, "no endpoint is bindable in this sweep")
+	require.Nil(t, result.Terminal,
+		"a 404 coexisting with a transient transport error must not terminate (Invariant B)")
+	require.NotNil(t, result.Exhausted,
+		"the bounded walk must exhaust its budget and keep retrying, not latch a terminal")
+}
+
 // TestRoundWalkReconnectRedialsBoundHostPastDeferredTerminalSibling is the
 // regression for a stale attempted-bit skipping the previously-bound host on
 // reconnect. RecordSuccess leaves the bound host's round slot consumed; a

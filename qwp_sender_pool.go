@@ -28,7 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"path/filepath"
 	"strconv"
@@ -81,6 +81,7 @@ type qwpSenderPool struct {
 	errorHandler       SenderErrorHandler
 	connectionListener SenderConnectionListener
 	drainerListener    QwpBackgroundDrainerListener
+	logger             *slog.Logger
 
 	// Store-and-forward coordination (storeAndForward true iff sfDir != "").
 	storeAndForward bool
@@ -125,6 +126,7 @@ func newQwpSenderPool(
 	errorHandler SenderErrorHandler,
 	connectionListener SenderConnectionListener,
 	drainerListener QwpBackgroundDrainerListener,
+	logger *slog.Logger,
 ) (*qwpSenderPool, error) {
 	if minSize < 0 || maxSize < 1 || minSize > maxSize {
 		return nil, fmt.Errorf("qwp pool: invalid sizes min=%d max=%d (max defaults to %d when unset — raise sender_pool_max alongside min)", minSize, maxSize, qwpDefaultPoolMax)
@@ -148,6 +150,7 @@ func newQwpSenderPool(
 		errorHandler:       errorHandler,
 		connectionListener: connectionListener,
 		drainerListener:    drainerListener,
+		logger:             logger,
 		storeAndForward:    template.sfDir != "",
 		sfDir:              template.sfDir,
 	}
@@ -249,18 +252,27 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 				p.mu.Unlock()
 				return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
 			}
+			// Honor a cancelled borrow ctx explicitly: the async growth build no
+			// longer surfaces it via a synchronous dial.
+			if err := ctx.Err(); err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
 			p.inFlightCreations++
 			slotIndex := -1
 			if p.storeAndForward {
 				slotIndex = p.allocateSlotIndexLocked()
 			}
 			p.mu.Unlock()
-			// Bound the synchronous dial by the acquire deadline too, so a
-			// borrow against a slow/black-holed server is abandoned within
-			// acquire_timeout_ms rather than riding the connect / reconnect
-			// budget (HikariCP getConnection parity).
+			// Grow asynchronously: the pool is already running, so a growth
+			// borrow during a transient outage must not hard-fail — it buffers
+			// via store-and-forward and connects in the background (Invariant B).
+			// Only the min-prewarm at build follows the configured connect mode
+			// (a down server there is a startup error). The deadline still bounds
+			// slot construction (SF segment open) so a black-holed filesystem
+			// can't pin the borrow past acquire_timeout_ms.
 			bctx, cancel := context.WithDeadline(ctx, deadline)
-			slot, err := p.createSlotAt(bctx, slotIndex, false)
+			slot, err := p.createSlotAt(bctx, slotIndex, true)
 			cancel()
 			p.mu.Lock()
 			p.inFlightCreations--
@@ -271,16 +283,26 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 				return nil, err
 			}
 			if p.closed {
-				p.freeSlotIndexLocked(slotIndex)
-				// Wake close()'s outstanding-count wait: inFlightCreations just
-				// dropped, and without a broadcast close() would sleep out its
-				// full budget (mirrors the error branch above).
-				p.broadcastLocked()
+				// close() left this just-built slot for us. Track the teardown and
+				// keep the SF slot counted as closing so close()'s outstanding-count
+				// wait cannot return while the delegate — and its SF flock — is still
+				// closing, then free the index only after the close completes. Mirrors
+				// giveBack's closed branch; freeing the index before the off-lock close
+				// briefly stranded the flock on an index a reopen could reuse.
+				if p.storeAndForward && slot.slotIndex >= 0 {
+					p.closingSlots++
+				}
+				p.pendingLeaseTeardowns++
 				p.mu.Unlock()
 				// Disconnect off-lock with a panic guard and a background ctx — a
 				// cancelled caller ctx must not cut this close short, matching every
 				// other close site in the pool.
 				_ = closeSlotGuarded(context.Background(), slot.delegate)
+				p.mu.Lock()
+				p.pendingLeaseTeardowns--
+				p.reclaimSlotLocked(slot, nil)
+				p.broadcastLocked()
+				p.mu.Unlock()
 				return nil, errPoolClosed
 			}
 			p.all = append(p.all, slot)
@@ -469,7 +491,7 @@ func (p *qwpSenderPool) reapIdle() {
 	p.mu.Lock()
 	for i, slot := range toClose {
 		if errs[i] != nil {
-			log.Printf("[WARN] qwp pool: reaping a slot failed to drain cleanly: %v", errs[i])
+			qwpEffectiveLogger(p.logger).Warn("qwp pool: reaping a slot failed to drain cleanly", "error", errs[i])
 		}
 		p.reclaimSlotLocked(slot, errs[i])
 	}
@@ -594,8 +616,8 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 		// A logged leak is recoverable; a freed buffer under a live producer
 		// is not. The delegate is torn down whenever its lease finally
 		// returns (giveBack's closed branch).
-		log.Printf("[WARN] qwp pool: close() leaving %d borrowed sender(s) alive; "+
-			"each is torn down when its lease is closed", leaked)
+		qwpEffectiveLogger(p.logger).Warn("qwp pool: close() leaving borrowed sender(s) alive; "+
+			"each is torn down when its lease is closed", "leaked", leaked)
 	}
 	toClose := append([]*qwpSenderSlot(nil), p.available...)
 	for _, slot := range toClose {
@@ -669,6 +691,7 @@ func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async b
 	cfg.errorHandler = p.errorHandler
 	cfg.connectionListener = p.connectionListener
 	cfg.backgroundDrainerListener = p.drainerListener
+	cfg.logger = p.logger
 	if p.storeAndForward {
 		cfg.senderId = p.slotBase + "-" + strconv.Itoa(slotIndex)
 		cfg.orphanDrainExclude = p.inRangeFence

@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,6 +60,7 @@ type qwpQueryPool struct {
 	closing           atomic.Bool // set before the housekeeper stops; reapIdle bails
 
 	baseConf string
+	logger   *slog.Logger
 }
 
 type qwpQueryWorker struct {
@@ -73,6 +75,7 @@ func newQwpQueryPool(
 	conf string,
 	minSize, maxSize int,
 	acquireTimeout, idleTimeout, maxLifetime time.Duration,
+	logger *slog.Logger,
 ) (*qwpQueryPool, error) {
 	if minSize < 0 || maxSize < 1 || minSize > maxSize {
 		return nil, fmt.Errorf("qwp query pool: invalid sizes min=%d max=%d (max defaults to %d when unset — raise query_pool_max alongside min)", minSize, maxSize, qwpDefaultPoolMax)
@@ -85,6 +88,7 @@ func newQwpQueryPool(
 		idleTimeout:    idleTimeout,
 		maxLifetime:    maxLifetime,
 		baseConf:       conf,
+		logger:         logger,
 	}
 	for i := 0; i < minSize; i++ {
 		w, err := p.createWorker(ctx)
@@ -155,6 +159,10 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 				return nil, err
 			}
 			if p.closed {
+				// inFlightCreations dropped just above; wake close()'s
+				// outstanding-lease wait so it re-checks. The just-built worker was
+				// never handed out, so closing it off-lock races nothing.
+				p.broadcastLocked()
 				p.mu.Unlock()
 				_ = closeQueryClientGuarded(context.Background(), w.client)
 				return nil, errPoolClosed
@@ -199,8 +207,15 @@ func (p *qwpQueryPool) giveBack(q *Query, broken bool) error {
 	if p.closed {
 		// On loan at close (close() skips on-loan workers), so self-close now.
 		// Query.Close drained the active cursor first, so this can't race a read.
+		// Drop the worker from p.all and wake close()'s outstanding-lease wait so
+		// it does not return while this teardown is still in flight.
 		p.mu.Unlock()
-		return closeQueryClientGuarded(context.Background(), q.worker.client)
+		err := closeQueryClientGuarded(context.Background(), q.worker.client)
+		p.mu.Lock()
+		p.removeFromAllLocked(q.worker)
+		p.broadcastLocked()
+		p.mu.Unlock()
+		return err
 	}
 	if broken {
 		p.removeFromAllLocked(q.worker)
@@ -306,10 +321,10 @@ func closeQueryClientGuarded(ctx context.Context, client *QwpQueryClient) (err e
 	return client.Close(ctx)
 }
 
-// close shuts the pool down. Like the sender pool it closes only available
-// workers concurrently on context.Background(), so a caller ctx neither
-// serializes the closes nor cancels them mid-drain. The ctx argument is accepted
-// for interface symmetry but unused.
+// close shuts the pool down. It bounded-waits for outstanding leases to return
+// (mirroring the sender pool) then closes the available workers concurrently on
+// context.Background(), so a caller ctx neither serializes the closes nor cancels
+// them mid-drain. The ctx argument is accepted for interface symmetry but unused.
 func (p *qwpQueryPool) close(_ context.Context) error {
 	p.mu.Lock()
 	if p.closed {
@@ -317,10 +332,43 @@ func (p *qwpQueryPool) close(_ context.Context) error {
 		return nil
 	}
 	p.closed = true
+	p.broadcastLocked()
+
 	// Close only available workers: an on-loan one may have a live Batches()
 	// reading its aliased buffers, which a concurrent Close would free —
-	// undefined behaviour. On-loan leases self-close via giveBack; a never-
-	// returned lease leaks, as in qwpSenderPool.close.
+	// undefined behaviour. On-loan leases self-close via giveBack, which drops
+	// them from p.all and wakes this wait. Bounded-wait for those returns
+	// (mirrors qwpSenderPool.close) so QuestDB.Close does not return while a query
+	// connection is still live, capped so a never-returned lease cannot hang
+	// shutdown forever.
+	waitBudget := p.acquireTimeout
+	if waitBudget > qwpPoolMaxCloseLeaseWait {
+		waitBudget = qwpPoolMaxCloseLeaseWait
+	}
+	deadline := time.Now().Add(waitBudget)
+	for {
+		outstanding := len(p.all) - len(p.available) + p.inFlightCreations
+		if outstanding <= 0 {
+			break
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		ch := p.notify
+		p.mu.Unlock()
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ch:
+		case <-timer.C:
+		}
+		timer.Stop()
+		p.mu.Lock()
+	}
+	if leaked := len(p.all) - len(p.available); leaked > 0 {
+		qwpEffectiveLogger(p.logger).Warn("qwp query pool: close() leaving borrowed query client(s) alive; "+
+			"each is closed when its lease is returned", "leaked", leaked)
+	}
 	toClose := append([]*qwpQueryWorker(nil), p.available...)
 	p.all = nil
 	p.available = nil
@@ -357,7 +405,15 @@ func (p *qwpQueryPool) createWorker(ctx context.Context) (w *qwpQueryWorker, err
 			err = fmt.Errorf("qwp query pool: client build panicked: %v", r)
 		}
 	}()
-	client, cerr := QwpQueryClientFromConf(ctx, p.baseConf)
+	// Parse and inject the logger (funcs/handlers aren't connect-string-
+	// expressible) before building, so every pooled query client emits
+	// through the facade's configured sink.
+	cfg, cerr := parseQwpQueryConf(p.baseConf)
+	if cerr != nil {
+		return nil, cerr
+	}
+	cfg.logger = p.logger
+	client, cerr := newQwpQueryClient(ctx, cfg)
 	if cerr != nil {
 		return nil, cerr
 	}

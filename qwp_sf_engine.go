@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -382,6 +383,17 @@ func (e *qwpSfCursorEngine) engineAcknowledge(seq int64) {
 // engineAckedFsn returns the highest FSN safe to send.
 func (e *qwpSfCursorEngine) engineAckedFsn() int64 {
 	return e.ring.segmentRingAckedFsn()
+}
+
+// engineSetLogger points the segment manager's cap-reached backpressure
+// diagnostic at the configured logger. The manager's worker goroutine is
+// already running by the time the caller has a logger, so the store is
+// through an atomic.Pointer; a nil logger leaves the slog.Default() fallback.
+func (e *qwpSfCursorEngine) engineSetLogger(l *slog.Logger) {
+	if e == nil || e.manager == nil {
+		return
+	}
+	e.manager.logger.Store(l)
 }
 
 // engineAckNotify returns a channel closed the next time ackedFsn

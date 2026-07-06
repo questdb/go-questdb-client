@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -423,7 +424,7 @@ type lineSenderConfig struct {
 	// Durable-ack (request_durable_ack). QWP-only, Enterprise primary-replication
 	// QoS. When true, the send loop trims / replays / awaits on the server's
 	// STATUS_DURABLE_ACK frames (WAL data uploaded to object storage) instead of
-	// the ordinary OK ACK (WAL commit) — see design/qwp-cursor-durability.md.
+	// the ordinary OK ACK (WAL commit).
 	requestDurableAck            bool
 	durableAckKeepaliveMillis    int  // paces the durable keepalive ping; <= 0 disables
 	durableAckKeepaliveMillisSet bool // distinguishes "unset" (-> default) from an explicit 0/negative
@@ -442,6 +443,10 @@ type lineSenderConfig struct {
 
 	// QWP ack-progress handler (QWP-only). nil -> no dispatch (opt-in).
 	progressHandler SenderProgressHandler
+
+	// Diagnostics sink. nil -> slog.Default() (see qwp_log.go). Applies to
+	// every transport, but only the QWP paths currently emit through it.
+	logger *slog.Logger
 }
 
 // LineSenderOption defines line sender config option.
@@ -551,6 +556,20 @@ func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.connectionListener = l
+	}
+}
+
+// WithLogger sets the *slog.Logger the client emits diagnostics through,
+// replacing the slog.Default() fallback. Genuine problems (panics in user
+// callbacks, leaked pool leases, protocol anomalies) and, when no handler or
+// listener is registered, server rejections and connection transitions log at
+// Warn/Error; high-frequency chatter (replayed rejections, transient failover
+// windows) logs at Debug and is hidden unless the handler's level is lowered.
+// Pass a logger backed by slog.DiscardHandler to silence the client entirely,
+// or one wired to the application's logging stack to route it there.
+func WithLogger(l *slog.Logger) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.logger = l
 	}
 }
 
@@ -872,7 +891,7 @@ func WithConnectTimeout(d time.Duration) LineSenderOption {
 // ACK (WAL commit). QWP-only; the bound endpoint must be a replication primary
 // advertising durable-ack, otherwise the connect fails terminally with a
 // *SenderError of category PROTOCOL_VIOLATION. Equivalent to the connect-string
-// request_durable_ack key. See design/qwp-cursor-durability.md.
+// request_durable_ack key.
 //
 // Because only a durable ack advances the watermark, a healthy connection whose
 // server keeps committing (OK) but has not yet uploaded (e.g. object storage is

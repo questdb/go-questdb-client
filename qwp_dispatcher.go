@@ -25,7 +25,7 @@
 package questdb
 
 import (
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +49,10 @@ type qwpDispatcher[T any] struct {
 	describe  func(T) string // used only in the panic-recovery log line
 	valid     func(T) bool   // nil → every item is valid
 	logPrefix string         // log tag for the panic-recovery line (e.g. "qwp/conn")
+	// logger sinks the dispatcher's own diagnostics (a panicking handler, a
+	// handler wedged past the close timeout). nil -> slog.Default() via
+	// qwpEffectiveLogger; the owning send loop sets it at construction.
+	logger *slog.Logger
 
 	inbox chan T
 	done  chan struct{}
@@ -204,7 +208,7 @@ func (d *qwpDispatcher[T]) deliver(e T) {
 					msg = d.describe(e)
 				}()
 			}
-			log.Printf("[ERROR] %s: handler panicked on %s: %v", d.logPrefix, msg, r)
+			qwpEffectiveLogger(d.logger).Error(d.logPrefix+": handler panicked", "on", msg, "panic", r)
 		}
 	}()
 	d.handler(e)
@@ -250,9 +254,9 @@ func (d *qwpDispatcher[T]) close() {
 	case <-joined:
 	case <-timer.C:
 		d.abandon.Store(true)
-		log.Printf("[WARN] %s: handler still running after %s on close; "+
+		qwpEffectiveLogger(d.logger).Warn(d.logPrefix+": handler still running after close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
-			d.logPrefix, qwpSfDispatcherCloseJoinTimeout)
+			"timeout", qwpSfDispatcherCloseJoinTimeout)
 	}
 	// Whatever is still queued (abandoned by drain's timeout or unreached by a
 	// wedged handler) counts as dropped; re-delivering would defeat the bound.

@@ -25,7 +25,7 @@
 package questdb
 
 import (
-	"log"
+	"log/slog"
 
 	"github.com/coder/websocket"
 )
@@ -124,6 +124,9 @@ type qwpSfPolicyResolver struct {
 	resolver func(Category) Policy
 	perCat   [numCategories]Policy
 	global   Policy
+	// logger sinks the resolver panic-guard diagnostic. nil ->
+	// slog.Default() via qwpEffectiveLogger.
+	logger *slog.Logger
 }
 
 // callResolver invokes the user-supplied resolver under a panic guard.
@@ -141,7 +144,8 @@ type qwpSfPolicyResolver struct {
 func (r *qwpSfPolicyResolver) callResolver(c Category) (pol Policy) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			log.Printf("[ERROR] qwp/sf: error policy resolver panicked on category %s: %v", c, rec)
+			qwpEffectiveLogger(r.logger).Error("qwp/sf: error policy resolver panicked",
+				"category", c, "panic", rec)
 			pol = qwpSfDefaultPolicyFor(c)
 		}
 	}()

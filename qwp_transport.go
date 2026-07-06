@@ -177,7 +177,7 @@ type qwpTransportOpts struct {
 
 	// requestDurableAck sends the X-QWP-Request-Durable-Ack upgrade header and
 	// makes connect() reject an endpoint that does not advertise durable-ack.
-	// Ingest-only. See design/qwp-cursor-durability.md.
+	// Ingest-only.
 	requestDurableAck bool
 }
 
@@ -505,7 +505,7 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	if opts.requestDurableAck && !t.serverDurableAckEnabled {
 		// Requested durable-ack but the endpoint (likely a replica) did not
 		// advertise it. Terminal: falling back to OK-only trimming would drop
-		// data the caller believes durable (design/qwp-cursor-durability.md).
+		// data the caller believes durable.
 		conn.Close(websocket.StatusProtocolError, "durable-ack not supported")
 		t.conn = nil
 		return &QwpDurableAckMismatchError{Endpoint: url}

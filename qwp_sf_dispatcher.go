@@ -25,7 +25,7 @@
 package questdb
 
 import (
-	"log"
+	"log/slog"
 	"runtime"
 	"strconv"
 	"sync"
@@ -76,6 +76,12 @@ const qwpSfDispatcherCloseJoinTimeout = 2 * qwpSfDispatcherDrainTimeout
 // goroutine cost.
 type qwpSfErrorDispatcher struct {
 	handler SenderErrorHandler
+
+	// logger sinks the dispatcher's own diagnostics (a panicking handler,
+	// a handler wedged past the close timeout). nil -> slog.Default() via
+	// qwpEffectiveLogger; the owning send loop sets it to the configured
+	// logger at construction.
+	logger *slog.Logger
 
 	// inbox is the bounded delivery channel. Capacity is set at
 	// construction; never resized.
@@ -139,7 +145,7 @@ type qwpSfErrorDispatcher struct {
 // silent-default constructor are allowed smaller buffers).
 func newQwpSfErrorDispatcher(handler SenderErrorHandler, capacity int) *qwpSfErrorDispatcher {
 	if handler == nil {
-		handler = defaultSenderErrorHandler
+		handler = newDefaultSenderErrorHandler(nil)
 	}
 	if capacity < 1 {
 		capacity = qwpSfDefaultErrorInboxCapacity
@@ -298,7 +304,17 @@ func (d *qwpSfErrorDispatcher) deliver(e *SenderError) {
 	d.delivered.Add(1)
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[ERROR] qwp/sf: error handler panicked on %s: %v", e, r)
+			// e.Error() is library-owned and panic-safe today, but format it
+			// under a nested recover anyway: loop() has no recover, so a second
+			// panic escaping this recovery block would crash the host — matching
+			// the generic qwpDispatcher.deliver hardening.
+			msg := ""
+			func() {
+				defer func() { _ = recover() }()
+				msg = e.Error()
+			}()
+			qwpEffectiveLogger(d.logger).Error("qwp/sf: error handler panicked",
+				"error", msg, "panic", r)
 		}
 	}()
 	d.handler(e)
@@ -397,9 +413,9 @@ func (d *qwpSfErrorDispatcher) close() {
 		// done is closed — Go may pick inbox and fire the user callback
 		// after close() (hence Sender.Close) has already returned.
 		d.abandon.Store(true)
-		log.Printf("[WARN] qwp/sf: error handler still running %s after close; "+
+		qwpEffectiveLogger(d.logger).Warn("qwp/sf: error handler still running after close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
-			qwpSfDispatcherCloseJoinTimeout)
+			"timeout", qwpSfDispatcherCloseJoinTimeout)
 	}
 
 	// Sweep whatever remains queued — items drain() abandoned via its
@@ -447,21 +463,25 @@ func (d *qwpSfErrorDispatcher) totalDelivered() int64 {
 	return d.delivered.Load()
 }
 
-// defaultSenderErrorHandler is the loud-not-silent fallback used when
-// the user has not registered a handler. ERROR for TERMINAL, WARN for
-// retriable (informational: the batch stays in the SF log and is
-// replayed after the connection recycles) — both with the full
-// structured payload. Per the spec § "Loud defaults — silence is
-// forbidden".
-func defaultSenderErrorHandler(e *SenderError) {
-	if e == nil {
-		return
+// newDefaultSenderErrorHandler builds the loud-not-silent fallback used when
+// the user registers no SenderErrorHandler: Error for a TERMINAL rejection,
+// Warn for a retriable one (informational — the batch stays in the SF log and
+// replays after the connection recycles), both with the full structured
+// payload. Loud by design (native-client "silence is forbidden"): a server
+// rejection must never vanish just because no handler was registered. The
+// caller's logger controls the sink; nil resolves to slog.Default().
+func newDefaultSenderErrorHandler(logger *slog.Logger) SenderErrorHandler {
+	l := qwpEffectiveLogger(logger)
+	return func(e *SenderError) {
+		if e == nil {
+			return
+		}
+		if e.AppliedPolicy == PolicyTerminal {
+			l.Error("qwp/sf: server rejection", "error", e)
+		} else {
+			l.Warn("qwp/sf: server rejection", "error", e)
+		}
 	}
-	level := "[ERROR]"
-	if e.AppliedPolicy != PolicyTerminal {
-		level = "[WARN]"
-	}
-	log.Printf("%s qwp/sf: %s", level, e)
 }
 
 // qwpGoid returns the numeric ID of the calling goroutine, or 0 if it

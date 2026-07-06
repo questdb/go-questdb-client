@@ -174,7 +174,7 @@ func TestSenderIdOptionAcceptsValid(t *testing.T) {
 }
 
 // Durable-ack connect-string keys: request_durable_ack /
-// durable_ack_keepalive_interval_millis (design/qwp-cursor-durability.md).
+// durable_ack_keepalive_interval_millis.
 func TestSfConfDurableAckOffParses(t *testing.T) {
 	for _, v := range []string{"off", "false"} {
 		t.Run(v, func(t *testing.T) {

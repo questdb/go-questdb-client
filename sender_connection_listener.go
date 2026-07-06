@@ -26,7 +26,7 @@ package questdb
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 )
 
 // SenderConnectionEventKind classifies a QWP ingress connection-state
@@ -37,8 +37,8 @@ const (
 	// SenderConnected is the first successful connect of the sender's
 	// lifetime — fired once, before any data is sent.
 	SenderConnected SenderConnectionEventKind = iota
-	// SenderDisconnected fires once per outage when the active wire drops
-	// and the reconnect loop is about to start.
+	// SenderDisconnected fires once per outage when the active wire drops,
+	// before the sender either reconnects or (on a poison-frame terminal) halts.
 	SenderDisconnected
 	// SenderReconnected fires when a reconnect succeeds against the same
 	// endpoint that was previously active.
@@ -89,8 +89,8 @@ func (k SenderConnectionEventKind) String() string {
 // SenderConnectionEvent describes one connection-state transition observed by
 // the QWP ingress client. Fields not applicable to a given Kind take their
 // zero value (Host=="", Port==0, AttemptNumber==0, Cause==nil) — Go's
-// encoding of the "not applicable" sentinels. TimestampMillis is set
-// by the dispatcher at emit time.
+// encoding of the "not applicable" sentinels. TimestampMillis is stamped
+// at emit time on the sender's I/O goroutine.
 type SenderConnectionEvent struct {
 	// Kind classifies the connection-state transition this event describes and
 	// determines which of the remaining fields are meaningful.
@@ -108,8 +108,9 @@ type SenderConnectionEvent struct {
 	// RoundNumber is the count of full address-list sweeps; 0 when not
 	// applicable.
 	RoundNumber int64
-	// Cause is the classified failure for failure/terminal kinds; nil for
-	// success events (Connected/Reconnected/FailedOver).
+	// Cause is the classified failure for endpoint-attempt and terminal kinds;
+	// nil for success events (Connected/Reconnected/FailedOver) and for
+	// AllEndpointsUnreachable, which aggregates a whole sweep with no single cause.
 	Cause error
 	// TimestampMillis is the wall-clock emit time (Unix epoch milliseconds).
 	TimestampMillis int64
@@ -177,18 +178,24 @@ func (e SenderConnectionEvent) String() string {
 // SenderErrorHandler.
 type SenderConnectionListener func(SenderConnectionEvent)
 
-// defaultSenderConnectionListener is the loud-not-silent fallback used when no
-// listener is registered: every transition is logged, terminal/failure kinds
-// loudly.
-func defaultSenderConnectionListener(e SenderConnectionEvent) {
-	level := "[INFO]"
-	switch e.Kind {
-	case SenderAuthFailed:
-		level = "[ERROR]"
-	case SenderDisconnected, SenderEndpointAttemptFailed, SenderAllEndpointsUnreachable:
-		level = "[WARN]"
+// newDefaultSenderConnectionListener builds the loud-not-silent fallback used
+// when no listener is registered: every transition is logged, terminal/failure
+// kinds loudly (Error for an auth failure, Warn for a disconnect or an
+// endpoint/all-endpoints reachability failure, Info otherwise). Loud by design
+// so a flapping or unreachable server is never silent. The caller's logger
+// controls the sink; nil resolves to slog.Default().
+func newDefaultSenderConnectionListener(logger *slog.Logger) SenderConnectionListener {
+	l := qwpEffectiveLogger(logger)
+	return func(e SenderConnectionEvent) {
+		switch e.Kind {
+		case SenderAuthFailed:
+			l.Error("qwp: connection event", "event", e)
+		case SenderDisconnected, SenderEndpointAttemptFailed, SenderAllEndpointsUnreachable:
+			l.Warn("qwp: connection event", "event", e)
+		default:
+			l.Info("qwp: connection event", "event", e)
+		}
 	}
-	log.Printf("%s qwp: %s", level, e)
 }
 
 // silentSenderConnectionListener drops every event. Used by background drainers,
@@ -201,7 +208,7 @@ func silentSenderConnectionListener(SenderConnectionEvent) {}
 // events to listener (or the loud default when nil).
 func newQwpConnDispatcher(listener SenderConnectionListener, capacity int) *qwpDispatcher[*SenderConnectionEvent] {
 	if listener == nil {
-		listener = defaultSenderConnectionListener
+		listener = newDefaultSenderConnectionListener(nil)
 	}
 	return newQwpDispatcher(
 		func(e *SenderConnectionEvent) { listener(*e) },
