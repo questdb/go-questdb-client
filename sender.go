@@ -829,7 +829,15 @@ func WithRequestDurableAck(enabled bool) LineSenderOption {
 // Only available for the QWP sender.
 func WithDurableAckKeepalive(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.durableAckKeepaliveMillis = int(d / time.Millisecond)
+		ms := int(d / time.Millisecond)
+		if ms == 0 && d > 0 {
+			// A positive sub-millisecond duration must not truncate to 0:
+			// 0 disables the keepalive, the opposite of the caller's intent.
+			// Floor it to the 1ms minimum the millisecond-granularity wire
+			// config can express. Zero / negative still disable (ms <= 0).
+			ms = 1
+		}
+		s.durableAckKeepaliveMillis = ms
 		s.durableAckKeepaliveMillisSet = true
 	}
 }
@@ -1514,6 +1522,10 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "zone"
 	case conf.target != qwpTargetAny:
 		name = "target"
+	case conf.requestDurableAck:
+		name = "request_durable_ack"
+	case conf.durableAckKeepaliveMillisSet:
+		name = "durable_ack_keepalive_interval_millis"
 	default:
 		return nil
 	}

@@ -124,16 +124,19 @@ def _signal_name(returncode) -> str:
 
 
 def test_roundtrip_post_switch_write_no_crash_no_replica_writes(
-    server_factory, go_sidecar: GoSidecar, scenario_dir: Path, log_dir: Path
+    server_factory, go_sidecar: GoSidecar, scenario_dir: Path, log_dir: Path, monkeypatch
 ) -> None:
     crash_dir = _crash_artifact_dir()
     sf_dir = scenario_dir / "sf"
     sf_dir.mkdir(parents=True, exist_ok=True)
 
     # Preserve any native crash stack outside the auto-cleaned scenario tree.
+    # Use monkeypatch so the process-wide env change is restored at teardown and
+    # does not leak the crash-file redirect into every server forked by later
+    # tests in the session.
     error_file = crash_dir / "hs_err_p1_%p.log"
     fork_opts = os.environ.get("JAVA_OPTS_FORK", "-Xmx512m")
-    os.environ["JAVA_OPTS_FORK"] = f"{fork_opts} -XX:ErrorFile={error_file}"
+    monkeypatch.setenv("JAVA_OPTS_FORK", f"{fork_opts} -XX:ErrorFile={error_file}")
 
     p1 = server_factory("p1")
     p1_ports = p1.start(min_http=True)

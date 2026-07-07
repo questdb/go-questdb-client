@@ -61,6 +61,15 @@ const (
 	// PING cadence when request_durable_ack=on and the interval is not set
 	// explicitly. Matches the Java client's 200ms default.
 	qwpSfDefaultDurableAckKeepalive = 200 * time.Millisecond
+	// qwpSfMaxKeepalivePingTimeouts is how many consecutive durable-ack
+	// keepalive PONG timeouts are tolerated before the connection is
+	// presumed half-open and the sender escalates to reconnect. A live
+	// server always answers the PING (coder/websocket auto-PONGs from its
+	// Read loop), so a healthy idle wire never trips this; only a peer that
+	// has silently vanished (partition / VM freeze, no TCP RST) does — where
+	// the receiver's deadline-less Read would otherwise block forever,
+	// stalling AwaitAckedFsn on a dead wire.
+	qwpSfMaxKeepalivePingTimeouts = 3
 )
 
 // qwpSfMaxSilentConnStrikes is the number of consecutive ACK-less
@@ -997,6 +1006,11 @@ func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
 	// interval (a just-sent frame already prodded the server). Local to
 	// this call, so it resets naturally when senderLoop restarts on a swap.
 	lastActivity := time.Now()
+	// pingTimeouts counts consecutive keepalive PONG timeouts; any activity
+	// or a successful PING resets it. Reaching qwpSfMaxKeepalivePingTimeouts
+	// presumes the wire half-open and escalates to reconnect. Local, so it
+	// resets on every connection.
+	pingTimeouts := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil // clean shutdown
@@ -1010,6 +1024,7 @@ func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
 		}
 		if didWork {
 			lastActivity = time.Now()
+			pingTimeouts = 0
 			continue
 		}
 		// Idle. In durable-ack mode, while OKs still await durable
@@ -1020,8 +1035,28 @@ func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
 		if l.durableAckMode && l.durableAckKeepaliveInterval > 0 &&
 			l.durableTracker.pendingLen() > 0 &&
 			time.Since(lastActivity) >= l.durableAckKeepaliveInterval {
-			if perr := l.sendKeepalivePing(ctx); perr != nil {
+			timedOut, perr := l.sendKeepalivePing(ctx)
+			if perr != nil {
 				return perr
+			}
+			if timedOut && l.reconnectFactory != nil {
+				// A live server always answers the PING, so a run of
+				// timeouts on an idle wire means the peer vanished without
+				// a TCP RST (half-open). Escalate to reconnect once the run
+				// is conclusive — run() routes this error through
+				// connectWithBackoff to fail over to a live peer, instead
+				// of AwaitAckedFsn stalling on the receiver's deadline-less
+				// Read. Gated on a reconnect factory: with none, there is
+				// nowhere to fail over, so keep the benign behavior.
+				pingTimeouts++
+				if pingTimeouts >= qwpSfMaxKeepalivePingTimeouts {
+					return fmt.Errorf(
+						"qwp/sf: durable-ack keepalive: %d consecutive PONG "+
+							"timeouts, connection presumed half-open",
+						pingTimeouts)
+				}
+			} else {
+				pingTimeouts = 0
 			}
 			lastActivity = time.Now()
 		}
@@ -1045,36 +1080,41 @@ func (l *qwpSfSendLoop) senderLoop(ctx context.Context) error {
 }
 
 // sendKeepalivePing sends one durable-ack keepalive PING on the active
-// transport. A PONG timeout is benign — the PING frame was written, which
-// is the point (it nudges the server to flush pending DURABLE_ACK frames)
-// — so only a real transport error (which the ping's bounded context did
-// not cause) is propagated to trigger reconnect; the receiver's readAck
-// would surface the same fault regardless.
-func (l *qwpSfSendLoop) sendKeepalivePing(ctx context.Context) error {
+// transport and reports the outcome. A single PONG timeout is benign — the
+// PING frame was written, which is the point (it nudges the server to flush
+// pending DURABLE_ACK frames) — so it is returned as timedOut=true, err=nil
+// rather than as a transport failure. The caller escalates a *run* of
+// consecutive timeouts (qwpSfMaxKeepalivePingTimeouts) to reconnect: a live
+// server always answers a PING, so repeated timeouts on an otherwise-idle
+// wire mean the peer has silently vanished (half-open, no TCP RST), and the
+// receiver's deadline-less Read cannot detect that on its own. A real
+// transport error is returned as err != nil.
+func (l *qwpSfSendLoop) sendKeepalivePing(ctx context.Context) (timedOut bool, err error) {
 	transport := l.transport.Load()
 	if transport == nil {
-		return nil
+		return false, nil
 	}
-	// Bound the PONG wait so a dead connection cannot wedge the sender —
-	// the receiver drives reconnect in that case. Cap at 1s (matches the
-	// Java client's sendPing(1000)) but never exceed the keepalive cadence.
+	// Bound the PONG wait so a dead connection cannot wedge the sender.
+	// Cap at 1s (matches the Java client's sendPing(1000)) but never exceed
+	// the keepalive cadence.
 	pingWait := l.durableAckKeepaliveInterval
 	if pingWait > time.Second {
 		pingWait = time.Second
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, pingWait)
 	defer cancel()
-	if err := transport.ping(pingCtx); err != nil {
+	if perr := transport.ping(pingCtx); perr != nil {
 		if pingCtx.Err() != nil && ctx.Err() == nil {
-			// PONG deadline: the PING was still written. Not a failure.
-			return nil
+			// PONG deadline: the PING was still written. Benign in
+			// isolation; the caller counts consecutive occurrences.
+			return true, nil
 		}
 		if ctx.Err() != nil {
-			return nil // clean shutdown
+			return false, nil // clean shutdown
 		}
-		return err
+		return false, perr
 	}
-	return nil
+	return false, nil
 }
 
 // trySendOne sends at most one frame. Returns (true, nil) if it

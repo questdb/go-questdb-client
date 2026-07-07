@@ -174,7 +174,7 @@ def _durable_acked_rows(stats) -> int:
 def _quiesce_and_watermark(
     p1_ports,
     go_sidecar: GoSidecar,
-    stop_flag: threading.Event,
+    pause_flag: threading.Event,
     ingest_index_ref: list,
     table: str,
     step: int,
@@ -186,17 +186,18 @@ def _quiesce_and_watermark(
     exact-count oracle must equal.
 
     Protocol:
-      1. Set stop_flag so the background ingest thread stops sending.
+      1. Set pause_flag so the background ingest thread stops sending (but the
+         thread stays alive so the caller can resume it).
       2. Flush the sidecar (drains any in-flight frames to the server).
       3. Confirm await_role(REPLICA) -- role must be settled before we count.
       4. Poll count_rows until unchanged for _QUIESCE_STABLE_WINDOW_S.
       5. Return that stable count as watermark_expected.
 
     After the apex assertion (caller's responsibility) the caller should clear
-    stop_flag to resume ingest for the next chain leg.
+    pause_flag to resume ingest for the next chain leg.
     """
-    LOG.info("quiesce step=%d: setting stop flag, pausing ingest", step)
-    stop_flag.set()
+    LOG.info("quiesce step=%d: setting pause flag, pausing ingest", step)
+    pause_flag.set()
 
     try:
         go_sidecar.flush()
@@ -246,10 +247,16 @@ def _quiesce_and_watermark(
         time.sleep(_QUIESCE_POLL_INTERVAL_S)
 
     if watermark == -1:
-        # Timed out waiting for stability -- use the last seen count. Conservative:
-        # the oracle's intent is to verify no EXCESS rows, so this is safe.
-        watermark = last_count
-        LOG.warning("quiesce step=%d: stability timeout; using last_count=%d as watermark", step, watermark)
+        # Never reached a stable count within the deadline. The exact-count
+        # oracle downstream is a strict `==`, so proceeding with an unstable
+        # last_count would either false-fail or mask a boundary-race excess.
+        # Fail fast instead: an unstable watermark is a broken measurement, not
+        # a conservative one.
+        raise AssertionError(
+            f"quiesce step={step}: table never quiesced to a stable row count "
+            f"within the deadline (last_count={last_count}). Cannot capture a "
+            f"trustworthy watermark for the exact-count oracle."
+        )
 
     return watermark
 
@@ -469,14 +476,19 @@ def _assert_copy_from_write_rejection(http_port: int, table: str, step: int) -> 
             f"REPLICA: {exc!r}. Expected a clean refusal with 'replica access is read-only'."
         ) from exc
 
-    # The upload must be refused: either a non-2xx status, or a 2xx whose body carries
-    # the read-only refusal. The status check must be parenthesised -- `200 <= status <
-    # 300 is False` chains as `... and (300 is False)`, always False, silently disabling
-    # the status leg.
-    assert not (200 <= status < 300) or "replica access is read-only" in resp_body.lower(), (
+    # The upload must be refused WITH EVIDENCE of the read-only gate: the
+    # canonical "read-only" reason must appear in the body. Accepting any non-2xx
+    # status on its own is too loose -- a 404 (path changed), 500 (unrelated
+    # fault), or 401 would pass and mask a broken read-only gate. Requiring the
+    # reason covers every acceptable case (a 2xx import-report carrying the error
+    # or a non-2xx error body) and rejects both a silent 2xx accept and a bare
+    # non-2xx with no read-only evidence. Mirrors the /exec check, which pins the
+    # refusal reason rather than trusting the status alone.
+    assert "read-only" in resp_body.lower(), (
         f"copy_from_write_rejection step={step}: CSV upload to settled REPLICA returned HTTP "
-        f"{status} and body did not contain 'replica access is read-only'. body={resp_body!r}. "
-        f"The engine-level getWriter gate must refuse the import path."
+        f"{status} without a 'replica access is read-only' refusal reason in the body. "
+        f"body={resp_body!r}. The engine-level getWriter gate must refuse the import path with "
+        f"the read-only reason -- a bare non-2xx or a silent 2xx is not acceptable evidence."
     )
     LOG.info(
         "copy_from_write_rejection step=%d: REPLICA refused import with HTTP %d (OK)", step, status
@@ -507,12 +519,16 @@ def _ingest_loop(
     go_sidecar: GoSidecar,
     table: str,
     stop_flag: threading.Event,
+    pause_flag: threading.Event,
     index_counter: list,  # [current_index] -- mutable single-element list
     error_holder: list,   # [exception | None]
     send_failures: list,  # [count, last_exc_repr] -- surfaced send-path failures
 ) -> None:
     """Background thread that continuously sends single-row frames via the QWP
-    sidecar. Respects stop_flag: when set, finishes the current send and exits.
+    sidecar. Respects stop_flag (permanent exit) and pause_flag (temporary
+    quiesce): when pause_flag is set the loop stops sending but keeps spinning,
+    so a subsequent pause_flag.clear() resumes ingest on the SAME thread (a
+    dead Python thread cannot be restarted). Only stop_flag exits the loop.
     Stores any thread-fatal exception in error_holder[0].
 
     SEND-path failures are NOT swallowed silently. A send can legitimately be
@@ -525,6 +541,11 @@ def _ingest_loop(
     growth and trips the growth floor)."""
     try:
         while not stop_flag.is_set():
+            if pause_flag.is_set():
+                # Quiesced for a watermark capture: hold off sending but keep
+                # the thread alive so ingest can resume on pause_flag.clear().
+                time.sleep(0.02)
+                continue
             idx = index_counter[0]
             try:
                 go_sidecar.send(table, count=1, start_index=idx)
@@ -591,13 +612,14 @@ def _run_switch_fuzz_chain(
     LOG.info("baseline rows sent and flushed: %d (single-row frames)", baseline_rows)
 
     stop_flag = threading.Event()
+    pause_flag = threading.Event()  # quiesce/resume, distinct from stop_flag
     index_counter = [baseline_rows]  # next row index to send
     error_holder: list = [None]
     send_failures: list = [0, None]
 
     ingest_thread = threading.Thread(
         target=_ingest_loop,
-        args=(go_sidecar, _TABLE, stop_flag, index_counter, error_holder, send_failures),
+        args=(go_sidecar, _TABLE, stop_flag, pause_flag, index_counter, error_holder, send_failures),
         name=f"ingest-{label}",
         daemon=True,
     )
@@ -644,8 +666,14 @@ def _run_switch_fuzz_chain(
             qwep_for_probes = go_egress_sidecar
             LOG.info("egress QWeP sidecar connected (availability plane)")
         except Exception as exc:
-            qwep_for_probes = None
-            LOG.warning("egress QWeP sidecar failed to connect: %s -- skipping QWeP probes", exc)
+            # The QWeP availability-plane witness is required: silently skipping
+            # it would let a broken egress / QwpQueryClient path pass green. The
+            # connect runs on a settled PRIMARY before the chain, so a failure
+            # here is a real setup fault, not a transient switch-window blip.
+            raise AssertionError(
+                f"egress QWeP sidecar failed to connect on settled PRIMARY: {exc!r}. "
+                f"The availability-plane probe cannot be skipped."
+            ) from exc
 
         for step in range(chain_len):
             # ---- LIVE PLANE: submit P->R, probe during switch, quiesce at apex ----
@@ -660,7 +688,12 @@ def _run_switch_fuzz_chain(
             # floor have a real non-(-1) lower bound.
             published = go_sidecar.flush()
             if published >= 0:
-                go_sidecar.await_acked(published, _DURABLE_ACK_AWAIT_TIMEOUT_MS)
+                assert go_sidecar.await_acked(published, _DURABLE_ACK_AWAIT_TIMEOUT_MS), (
+                    f"pre-switch durable-ack barrier step={step}: rows published up to "
+                    f"FSN={published} were not durably acked within {_DURABLE_ACK_AWAIT_TIMEOUT_MS} ms "
+                    f"while still PRIMARY. The durable watermark must advance before the demote so the "
+                    f"acked-loss oracle has a real (non -1) lower bound."
+                )
 
             lc.submit_switch(
                 p1_ports.min_http,
@@ -677,7 +710,7 @@ def _run_switch_fuzz_chain(
 
             # ---- QUIESCED COUNT PLANE: pause ingest, capture watermark, assert == ----
             watermark_expected = _quiesce_and_watermark(
-                p1_ports, go_sidecar, stop_flag, index_counter, _TABLE, step
+                p1_ports, go_sidecar, pause_flag, index_counter, _TABLE, step
             )
 
             actual_count = count_rows(port=p1_ports.pg, table=_TABLE)
@@ -719,8 +752,10 @@ def _run_switch_fuzz_chain(
             _assert_copy_from_write_rejection(p1_ports.http, _TABLE, step)
             _assert_ilp_udp_write_rejection_documented(step)
 
-            # Resume ingest for the next leg (R->P + next P->R).
-            stop_flag.clear()
+            # Resume ingest for the next leg (R->P + next P->R). The ingest
+            # thread is still alive (pause_flag, not stop_flag), so clearing
+            # the pause resumes it.
+            pause_flag.clear()
             LOG.info("chain step=%d: ingest resumed after REPLICA apex assertion", step)
 
             # ---- LIVE PLANE: submit R->P, probe during switch ----
@@ -1006,7 +1041,12 @@ def test_switch_fuzz_pitr(
     go_sidecar.send(_TABLE, count=pre_pitr_rows, start_index=0)
     published = go_sidecar.flush()
     if published >= 0:
-        go_sidecar.await_acked(published, _DURABLE_ACK_AWAIT_TIMEOUT_MS)
+        assert go_sidecar.await_acked(published, _DURABLE_ACK_AWAIT_TIMEOUT_MS), (
+            f"PITR source-primary drain: rows published up to FSN={published} were not "
+            f"durably acked within {_DURABLE_ACK_AWAIT_TIMEOUT_MS} ms. PITR recovery reads the "
+            f"object store, so a row that never became durable would be missing after recovery "
+            f"and silently weaken the #092 guard."
+        )
     time.sleep(2.0)  # belt-and-braces slack for any async index/cleanup tail
     LOG.info("PITR variant: %d rows sent and durably acked to source primary", pre_pitr_rows)
 
@@ -1043,44 +1083,49 @@ def test_switch_fuzz_pitr(
         classpath=build_classpath(),
         name="p1-pitr-recovered",
     )
-    LOG.info("PITR variant: Phase 2 -- booting PITR-recovered primary")
-    pitr_ports = pitr_server.start(min_http=True, ready_timeout=180.0)
-    assert pitr_ports.min_http is not None, "PITR-recovered server: min_http port not reported"
-    LOG.info("PITR variant: recovered primary ready at %s", pitr_ports)
-
-    # Connect a LIVE QWP client to the recovered primary.
-    sf_dir_pitr = scenario_dir / "sf_pitr"
-    sf_dir_pitr.mkdir(parents=True, exist_ok=True)
-    pitr_connect_str = (
-        f"ws::addr=127.0.0.1:{pitr_ports.http}"
-        ";username=admin;password=quest"
-        f";sf_dir={sf_dir_pitr}"
-        ";request_durable_ack=on"
-        ";reconnect_max_duration_millis=60000"
-        ";close_flush_timeout_millis=5000;"
-    )
-    go_sidecar.connect(pitr_connect_str)
-
-    # Start live ingest on the recovered primary (fresh index from 0).
+    # The recovered primary is a DIRECT ForkedEntServer (no server_factory
+    # fixture teardown net), so the boot -> connect -> ingest-setup window must
+    # run INSIDE the try/finally: a failure here (boot timeout, connect refusal)
+    # must still stop the JVM instead of leaking it into later tests.
     pitr_stop_flag = threading.Event()
-    pitr_index_counter = [0]
-    pitr_error_holder: list = [None]
-    pitr_send_failures: list = [0, None]
-
-    pitr_ingest_thread = threading.Thread(
-        target=_ingest_loop,
-        args=(go_sidecar, _TABLE, pitr_stop_flag, pitr_index_counter, pitr_error_holder,
-              pitr_send_failures),
-        name="pitr-ingest",
-        daemon=True,
-    )
-    pitr_ingest_thread.start()
-    time.sleep(0.5)  # let a few rows arrive before the first switch
-    LOG.info("PITR variant: live ingest started on recovered primary")
-
+    pitr_pause_flag = threading.Event()
+    pitr_ingest_thread = None
     qwep_for_probes = None
-
     try:
+        LOG.info("PITR variant: Phase 2 -- booting PITR-recovered primary")
+        pitr_ports = pitr_server.start(min_http=True, ready_timeout=180.0)
+        assert pitr_ports.min_http is not None, "PITR-recovered server: min_http port not reported"
+        LOG.info("PITR variant: recovered primary ready at %s", pitr_ports)
+
+        # Connect a LIVE QWP client to the recovered primary.
+        sf_dir_pitr = scenario_dir / "sf_pitr"
+        sf_dir_pitr.mkdir(parents=True, exist_ok=True)
+        pitr_connect_str = (
+            f"ws::addr=127.0.0.1:{pitr_ports.http}"
+            ";username=admin;password=quest"
+            f";sf_dir={sf_dir_pitr}"
+            ";request_durable_ack=on"
+            ";reconnect_max_duration_millis=60000"
+            ";close_flush_timeout_millis=5000;"
+        )
+        go_sidecar.connect(pitr_connect_str)
+
+        # Start live ingest on the recovered primary (fresh index from 0).
+        pitr_index_counter = [0]
+        pitr_error_holder: list = [None]
+        pitr_send_failures: list = [0, None]
+
+        pitr_ingest_thread = threading.Thread(
+            target=_ingest_loop,
+            args=(go_sidecar, _TABLE, pitr_stop_flag, pitr_pause_flag, pitr_index_counter,
+                  pitr_error_holder, pitr_send_failures),
+            name="pitr-ingest",
+            daemon=True,
+        )
+        pitr_ingest_thread.start()
+        time.sleep(0.5)  # let a few rows arrive before the first switch
+        LOG.info("PITR variant: live ingest started on recovered primary")
+
         qwep_connect = (
             f"ws::addr=127.0.0.1:{pitr_ports.http}"
             ";username=admin;password=quest"
@@ -1092,8 +1137,13 @@ def test_switch_fuzz_pitr(
             qwep_for_probes = go_egress_sidecar
             LOG.info("PITR variant: egress QWeP sidecar connected")
         except Exception as exc:
-            qwep_for_probes = None
-            LOG.warning("PITR variant: egress QWeP sidecar failed to connect: %s -- skipping QWeP probes", exc)
+            # Required witness: a silent skip would let a broken egress path pass
+            # green. The recovered primary is settled here, so a connect failure
+            # is a real setup fault.
+            raise AssertionError(
+                f"PITR variant: egress QWeP sidecar failed to connect on the recovered "
+                f"primary: {exc!r}. The availability-plane probe cannot be skipped."
+            ) from exc
 
         # First switch: P->R with live ingest.
         LOG.info("PITR variant: first switch P->R")
@@ -1103,7 +1153,11 @@ def test_switch_fuzz_pitr(
         # inbound ack.
         pitr_published = go_sidecar.flush()
         if pitr_published >= 0:
-            go_sidecar.await_acked(pitr_published, _DURABLE_ACK_AWAIT_TIMEOUT_MS)
+            assert go_sidecar.await_acked(pitr_published, _DURABLE_ACK_AWAIT_TIMEOUT_MS), (
+                f"PITR pre-switch durable-ack barrier: rows published up to FSN={pitr_published} "
+                f"were not durably acked within {_DURABLE_ACK_AWAIT_TIMEOUT_MS} ms while still "
+                f"PRIMARY, so the acked-loss oracle would have no real lower bound."
+            )
 
         lc.submit_switch(
             pitr_ports.min_http,
@@ -1121,7 +1175,7 @@ def test_switch_fuzz_pitr(
         # QUIESCED PLANE: pause ingest, capture watermark, assert count == watermark.
         # This is the #092 guard: if count < watermark_expected, UDP ingest was dropped.
         pitr_watermark = _quiesce_and_watermark(
-            pitr_ports, go_sidecar, pitr_stop_flag, pitr_index_counter, _TABLE,
+            pitr_ports, go_sidecar, pitr_pause_flag, pitr_index_counter, _TABLE,
             step=0,
         )
 
@@ -1171,7 +1225,8 @@ def test_switch_fuzz_pitr(
 
     finally:
         pitr_stop_flag.set()
-        pitr_ingest_thread.join(timeout=5.0)
+        if pitr_ingest_thread is not None:
+            pitr_ingest_thread.join(timeout=5.0)
         try:
             go_egress_sidecar.close()
         except Exception:
@@ -1321,31 +1376,35 @@ def test_switch_fuzz_live_replica_failover(
             name=f"failover-b-c{cycle}",
         )
 
-        a_ports = a.start(min_http=True)
-        b_ports = b.start(min_http=True)
-        assert a_ports.min_http is not None, (
-            f"cycle {cycle}: node A (primary) min_http port not reported"
-        )
-        assert b_ports.min_http is not None, (
-            f"cycle {cycle}: node B (replica) min_http port not reported; "
-            f"the replica+min_http combination must bind the min-http listener"
-        )
-        LOG.info("live_replica_failover: cycle=%d a_ports=%s b_ports=%s",
-                 cycle, a_ports, b_ports)
-
-        sf_cycle_dir = scenario_dir / "sf" / f"c{cycle}_a"
-        sf_cycle_dir.mkdir(parents=True, exist_ok=True)
-
-        connect_str_a = (
-            f"ws::addr=127.0.0.1:{a_ports.http}"
-            ";username=admin;password=quest"
-            f";sf_dir={sf_cycle_dir}"
-            ";request_durable_ack=on"
-            ";reconnect_max_duration_millis=60000"
-            ";close_flush_timeout_millis=5000;"
-        )
-
+        # a and b are DIRECT ForkedEntServer instances (no server_factory
+        # teardown net), so their start() must run INSIDE the try whose except
+        # stops them -- otherwise a boot failure or a min_http assert leaks the
+        # JVM(s) into later cycles/tests.
         try:
+            a_ports = a.start(min_http=True)
+            b_ports = b.start(min_http=True)
+            assert a_ports.min_http is not None, (
+                f"cycle {cycle}: node A (primary) min_http port not reported"
+            )
+            assert b_ports.min_http is not None, (
+                f"cycle {cycle}: node B (replica) min_http port not reported; "
+                f"the replica+min_http combination must bind the min-http listener"
+            )
+            LOG.info("live_replica_failover: cycle=%d a_ports=%s b_ports=%s",
+                     cycle, a_ports, b_ports)
+
+            sf_cycle_dir = scenario_dir / "sf" / f"c{cycle}_a"
+            sf_cycle_dir.mkdir(parents=True, exist_ok=True)
+
+            connect_str_a = (
+                f"ws::addr=127.0.0.1:{a_ports.http}"
+                ";username=admin;password=quest"
+                f";sf_dir={sf_cycle_dir}"
+                ";request_durable_ack=on"
+                ";reconnect_max_duration_millis=60000"
+                ";close_flush_timeout_millis=5000;"
+            )
+
             go_sidecar.connect(connect_str_a)
             go_sidecar.send(_FAILOVER_TABLE, count=initial_rows, start_index=0)
             go_sidecar.flush()

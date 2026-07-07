@@ -28,6 +28,7 @@
 /examples/qwp/sf/sf
 /system_test/enterprise_e2e/sidecar/sidecar
 /system_test/enterprise_e2e/sidecar/go-e2e-sidecar
+/system_test/enterprise_e2e/egress_sidecar/egress_sidecar
 /system_test/enterprise_e2e/egress_sidecar/go-e2e-egress-sidecar
 /system_test/enterprise_e2e/crash-artifacts/
 
