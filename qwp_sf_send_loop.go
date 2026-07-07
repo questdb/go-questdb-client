@@ -70,6 +70,16 @@ const (
 	// the receiver's deadline-less Read would otherwise block forever,
 	// stalling AwaitAckedFsn on a dead wire.
 	qwpSfMaxKeepalivePingTimeouts = 3
+	// qwpSfDurableAckPingTimeout bounds how long a single keepalive PING
+	// waits for its PONG before counting as a timeout. It matches the Java
+	// client's sendPing(1000) and is deliberately DECOUPLED from the
+	// keepalive cadence: the PONG round-trip is a function of network RTT,
+	// not of how often we ping, and the sender pings sequentially so a wait
+	// longer than the cadence cannot overlap the next ping. Tying it to the
+	// cadence (as an earlier revision did) made any link whose RTT exceeded
+	// the interval — a 200ms default reaches transcontinental/satellite hops
+	// — time out every healthy PONG and spuriously escalate to reconnect.
+	qwpSfDurableAckPingTimeout = 1 * time.Second
 )
 
 // qwpSfMaxSilentConnStrikes is the number of consecutive ACK-less
@@ -1095,13 +1105,13 @@ func (l *qwpSfSendLoop) sendKeepalivePing(ctx context.Context) (timedOut bool, e
 		return false, nil
 	}
 	// Bound the PONG wait so a dead connection cannot wedge the sender.
-	// Cap at 1s (matches the Java client's sendPing(1000)) but never exceed
-	// the keepalive cadence.
-	pingWait := l.durableAckKeepaliveInterval
-	if pingWait > time.Second {
-		pingWait = time.Second
-	}
-	pingCtx, cancel := context.WithTimeout(ctx, pingWait)
+	// Fixed at qwpSfDurableAckPingTimeout (Java sendPing(1000) parity),
+	// independent of the keepalive cadence: the PONG wait tracks network
+	// RTT, not ping frequency, and the sequential sender loop never overlaps
+	// pings, so a wait longer than the interval is safe. Coupling it to the
+	// cadence would false-time-out every healthy PONG on a link whose RTT
+	// exceeds the interval and spuriously escalate to reconnect.
+	pingCtx, cancel := context.WithTimeout(ctx, qwpSfDurableAckPingTimeout)
 	defer cancel()
 	if perr := transport.ping(pingCtx); perr != nil {
 		if pingCtx.Err() != nil && ctx.Err() == nil {

@@ -77,7 +77,7 @@ import psycopg
 import pytest
 
 from lib import lifecycle as lc
-from lib.pg_query import count_rows
+from lib.pg_query import count_rows, wait_for_dense_sequence
 from lib.probes import (
     HTTP_PROBE_BOUND_MS,
     PG_PROBE_BOUND_MS,
@@ -146,21 +146,24 @@ def _seed_for_iteration(base: int, i: int) -> int:
     return (base * 0x9E3779B97F4A7C15 + i) & 0xFFFFFFFFFFFFFFFF
 
 
-def _durable_acked_rows(stats) -> int:
-    """Number of rows the sidecar has DURABLY acked, derived from the durable
-    watermark the sidecar surfaces as ``stats().acked`` (the client's
-    ``getAckedFsn()``).
+def _durable_acked_frames(stats) -> int:
+    """Lower bound on the number of rows the sidecar has DURABLY acked, derived
+    from the durable watermark the sidecar surfaces as ``stats().acked`` (the
+    client's ``getAckedFsn()``).
 
     With ``request_durable_ack=on`` the server advances this watermark solely on
     ``STATUS_DURABLE_ACK`` frames -- after the row is persisted -- so every row
-    counted here MUST be present in the table. It is NOT ``stats().acks``
-    (getTotalAcks(), a transport-frame counter that also ticks on
-    DROP_AND_CONTINUE rejections and is no persistence promise).
+    in a durably-acked frame MUST be present in the table. It is NOT
+    ``stats().acks`` (getTotalAcks(), a transport-frame counter that also ticks
+    on DROP_AND_CONTINUE rejections and is no persistence promise).
 
-    The watermark is a 0-based frame sequence number (FSN). Every frame in these
-    runs carries exactly one row (baseline + ingest loop both send single-row
-    frames), so the number of durably acked rows is ``acked + 1`` once a frame
-    has been acked, and ``0`` when the watermark is still ``-1``.
+    The watermark is a 0-based *frame* sequence number (FSN), NOT a row count:
+    the QWP client batches many rows into one frame (auto-flush by row-count or
+    interval), so ``acked + 1`` counts durably-acked FRAMES and is a strict
+    LOWER BOUND on durably-acked rows (>= 1 row per acked frame). That makes it
+    valid for the ``count_rows >= floor`` loss direction and the ``> 0`` growth
+    floor, but it is NOT a row-exact oracle -- use ``wait_for_dense_sequence``
+    against the sent-index counter for that (see the drain-barrier check).
     """
     acked_fsn = stats.acked
     return acked_fsn + 1 if acked_fsn >= 0 else 0
@@ -726,22 +729,26 @@ def _run_switch_fuzz_chain(
             LOG.info("exact-count apex step=%d: count_rows=%d == watermark_expected=%d (OK)",
                      step, actual_count, watermark_expected)
 
-            # ---- ACKED-ROW-LOSS RECONCILIATION (loss direction) ----
-            # The == oracle covers the EXCESS direction. The LOSS direction (a
-            # durably-acked row gone MISSING) is reconciled against the DURABLE
-            # WATERMARK (getAckedFsn(), stats().acked) -- NOT stats().acks. Every
-            # frame carries one row, so the watermark maps to a durable ROW count.
-            acked_rows = _durable_acked_rows(go_sidecar.stats())
-            assert actual_count >= acked_rows, (
-                f"ACKED-ROW LOSS at step={step}: count_rows={actual_count} < durable_acked_rows={acked_rows}. "
-                f"The sidecar durably acked {acked_rows} rows (request_durable_ack=on, so each was "
-                f"persisted before the durable watermark advanced), but only {actual_count} are present "
-                f"on the settled REPLICA -- {acked_rows - actual_count} durably-acked row(s) went missing "
-                f"across the switch. A durable ack is a persistence promise, so a missing durably-acked "
-                f"row is data loss."
+            # ---- ACKED-FRAME-LOSS RECONCILIATION (coarse loss floor) ----
+            # The == oracle covers the EXCESS direction. For the LOSS direction a
+            # durably-acked FRAME going missing is reconciled against the DURABLE
+            # WATERMARK (getAckedFsn(), stats().acked) -- NOT stats().acks. The
+            # watermark counts frames, and each durably-acked frame holds >= 1
+            # persisted row, so count_rows < acked_frames is unambiguous data
+            # loss. This is only a coarse floor (frames <= rows); the row-exact
+            # durability oracle runs at the drain barrier below
+            # (wait_for_dense_sequence over the sent-index counter).
+            acked_frames = _durable_acked_frames(go_sidecar.stats())
+            assert actual_count >= acked_frames, (
+                f"ACKED-FRAME LOSS at step={step}: count_rows={actual_count} < durable_acked_frames={acked_frames}. "
+                f"The sidecar durably acked {acked_frames} frame(s) (request_durable_ack=on, so each was "
+                f"persisted before the durable watermark advanced), each holding >= 1 row, but only "
+                f"{actual_count} rows are present on the settled REPLICA -- at least "
+                f"{acked_frames - actual_count} durably-acked row(s) went missing across the switch. "
+                f"A durable ack is a persistence promise, so a missing durably-acked row is data loss."
             )
-            LOG.info("acked reconciliation step=%d: count_rows=%d >= durable_acked_rows=%d (no acked-row loss)",
-                     step, actual_count, acked_rows)
+            LOG.info("acked reconciliation step=%d: count_rows=%d >= durable_acked_frames=%d (no acked-frame loss)",
+                     step, actual_count, acked_frames)
 
             # Write-rejection oracle: INSERT on settled REPLICA must be cleanly
             # rejected on every client write path -- pg-wire and web-http /exec
@@ -801,6 +808,26 @@ def _run_switch_fuzz_chain(
             )
             LOG.info("drain barrier: durable ack reached FSN=%d after the chain", final_published)
 
+        # ---- ROW-EXACT DURABILITY ORACLE (out-of-band absolute check) ----
+        # The per-apex == oracle is self-referential (watermark_expected is
+        # derived from count_rows), and the acked-frame floor above is coarse
+        # (frames <= rows). This is the absolute oracle: the ingest loop only
+        # advances index_counter on a SUCCESSFUL send, so every index in
+        # 0..index_counter[0]-1 was accepted by the client, and the drain
+        # barrier just proved everything published is durable. Every one of
+        # those rows MUST therefore be present and dense on the settled PRIMARY.
+        # A durably-acked row that silently vanished across the switch chain
+        # (a reconnect/replay bug, or a trim that advanced ackedFsn past a
+        # not-yet-durable row) surfaces here as a gap the frame floor cannot
+        # see. wait_for_dense_sequence polls (tolerating replication lag) and
+        # is duplicate-tolerant (QWP SF replay is at-least-once).
+        wait_for_dense_sequence(
+            port=p1_ports.pg, table=_TABLE,
+            expected_count=index_counter[0], timeout_s=60.0,
+        )
+        LOG.info("row-exact oracle: all %d sent row indices present and dense on the settled PRIMARY",
+                 index_counter[0])
+
         # ---- GROWTH FLOOR: kill the vacuous zero-ingest pass ----
         # Every oracle above is conditional on ingest having happened. Require real
         # progress on TWO planes: the send counter advanced past the baseline, and
@@ -808,12 +835,12 @@ def _run_switch_fuzz_chain(
         # The floor anchors "ingest happened" on non-zero durable-watermark progress
         # (not on exceeding the baseline: with request_durable_ack=on the watermark
         # legitimately LAGS the table contents).
-        final_acked_rows = _durable_acked_rows(go_sidecar.stats())
+        final_acked_frames = _durable_acked_frames(go_sidecar.stats())
         final_count = count_rows(port=p1_ports.pg, table=_TABLE)
         sends_attempted = index_counter[0] - baseline_rows
         LOG.info(
-            "growth floor: baseline_rows=%d sends_attempted=%d final_count=%d final_acked_rows=%d send_failures=%d",
-            baseline_rows, sends_attempted, final_count, final_acked_rows, send_failures[0],
+            "growth floor: baseline_rows=%d sends_attempted=%d final_count=%d final_acked_frames=%d send_failures=%d",
+            baseline_rows, sends_attempted, final_count, final_acked_frames, send_failures[0],
         )
         assert sends_attempted > 0, (
             f"ZERO-INGEST ITERATION (vacuous pass) for chain_len={chain_len}: the background "
@@ -821,9 +848,9 @@ def _run_switch_fuzz_chain(
             f"(index_counter={index_counter[0]}). Every count/acked oracle is vacuous when "
             f"the table never grew. send_failures={send_failures[0]} last_send_error={send_failures[1]!r}"
         )
-        assert final_acked_rows > 0, (
+        assert final_acked_frames > 0, (
             f"NO DURABLE INGEST (vacuous pass) for chain_len={chain_len}: the sidecar durably "
-            f"acked ZERO rows ({sends_attempted} sends attempted, final_count={final_count}). "
+            f"acked ZERO frames ({sends_attempted} sends attempted, final_count={final_count}). "
             f"With request_durable_ack=on, an iteration that never received a single durable ack "
             f"has a dead ingest path. send_failures={send_failures[0]} last_send_error={send_failures[1]!r}"
         )
@@ -1189,27 +1216,45 @@ def test_switch_fuzz_pitr(
         LOG.info("PITR variant: #092 guard PASSED -- count_rows=%d == watermark_expected=%d",
                  pitr_actual, pitr_watermark)
 
-        # ACKED-ROW-LOSS RECONCILIATION + GROWTH FLOOR: every durably-acked send
-        # must be present on the recovered+settled REPLICA, and the recovered
-        # primary must have ingested past its fresh baseline of 0.
-        pitr_acked_rows = _durable_acked_rows(go_sidecar.stats())
-        assert pitr_actual >= pitr_acked_rows, (
-            f"PITR ACKED-ROW LOSS: count_rows={pitr_actual} < durable_acked_rows={pitr_acked_rows} on the "
-            f"recovered+settled REPLICA -- {pitr_acked_rows - pitr_actual} durably-acked row(s) went "
+        # ACKED-FRAME-LOSS RECONCILIATION + GROWTH FLOOR: a coarse floor (the
+        # durable watermark counts frames, not rows -- see _durable_acked_frames)
+        # that every durably-acked frame survived, and that the recovered primary
+        # ingested past its fresh baseline of 0. The row-exact check is below.
+        pitr_acked_frames = _durable_acked_frames(go_sidecar.stats())
+        assert pitr_actual >= pitr_acked_frames, (
+            f"PITR ACKED-FRAME LOSS: count_rows={pitr_actual} < durable_acked_frames={pitr_acked_frames} on the "
+            f"recovered+settled REPLICA -- at least {pitr_acked_frames - pitr_actual} durably-acked row(s) went "
             f"missing across the PITR-restore boot + first switch. A durable ack is a persistence "
             f"promise; a missing durably-acked row is data loss. send_failures={pitr_send_failures[0]} "
             f"last_send_error={pitr_send_failures[1]!r}"
         )
-        assert pitr_acked_rows > 0, (
-            f"PITR ZERO-INGEST (vacuous pass): the recovered primary durably acked no rows "
-            f"(durable_acked_rows={pitr_acked_rows}, sends_attempted={pitr_index_counter[0]}), so the "
+        assert pitr_acked_frames > 0, (
+            f"PITR ZERO-INGEST (vacuous pass): the recovered primary durably acked no frames "
+            f"(durable_acked_frames={pitr_acked_frames}, sends_attempted={pitr_index_counter[0]}), so the "
             f"#092 == guard proved nothing about ingest survival across the PITR-restore boot. "
             f"send_failures={pitr_send_failures[0]} last_send_error={pitr_send_failures[1]!r}"
         )
         LOG.info(
-            "PITR variant: acked reconciliation + growth floor PASSED -- count_rows=%d >= durable_acked_rows=%d > 0",
-            pitr_actual, pitr_acked_rows,
+            "PITR variant: acked reconciliation + growth floor PASSED -- count_rows=%d >= durable_acked_frames=%d > 0",
+            pitr_actual, pitr_acked_frames,
         )
+
+        # ROW-EXACT DURABILITY ORACLE (dense-prefix check): the #092 == guard
+        # only compares two counts (watermark captured from count_rows), so it
+        # is blind to a same-count set with a HOLE -- e.g. row 5 missing but a
+        # higher index present. The sent indices are always a gap-free prefix
+        # (the ingest loop advances the counter only on a successful send), and
+        # durability is FIFO, so the pitr_watermark durably-present rows MUST be
+        # the dense prefix 0..pitr_watermark-1. Checking density over the proven
+        # count (not the all-sent counter, which may include not-yet-durable
+        # rows a PITR boot can legitimately drop) adds hole-detection without
+        # risking a false failure.
+        wait_for_dense_sequence(
+            port=pitr_ports.pg, table=_TABLE,
+            expected_count=pitr_watermark, timeout_s=60.0,
+        )
+        LOG.info("PITR variant: row-exact oracle PASSED -- durable prefix of %d rows present and dense",
+                 pitr_watermark)
 
         # Write-rejection on settled REPLICA (pg-wire + web-http /exec).
         _assert_write_rejection(pitr_ports.pg, _TABLE, step=0)
@@ -1289,7 +1334,6 @@ def test_switch_fuzz_live_replica_failover(
     a replica) converges on B's total rows -- the headline onward-convergence
     invariant -- then asserts both nodes shut down cleanly."""
     from lib.obj_store import make_obj_store
-    from lib.pg_query import wait_for_dense_sequence
     from lib.server import ForkedEntServer
     from lib.shutdown import assert_clean_shutdown
 
