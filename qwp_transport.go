@@ -61,6 +61,13 @@ const (
 	qwpHeaderVersion        = "X-QWP-Version"
 	qwpHeaderAcceptEncoding = "X-QWP-Accept-Encoding"
 	qwpHeaderMaxBatchRows   = "X-QWP-Max-Batch-Rows"
+	// qwpHeaderRequestDurableAck is the upgrade request header the client
+	// sets (value "true") to opt into durable-ack mode; the server echoes
+	// qwpHeaderDurableAck: enabled to confirm it will emit DURABLE_ACK
+	// frames. Mirrors Java WebSocketClient's X-QWP-Request-Durable-Ack /
+	// X-QWP-Durable-Ack pair.
+	qwpHeaderRequestDurableAck = "X-QWP-Request-Durable-Ack"
+	qwpHeaderDurableAck        = "X-QWP-Durable-Ack"
 	// qwpHeaderMaxBatchSize is the server-advertised hard cap on a
 	// single DATA_BATCH wire frame (bytes), echoed in the WebSocket
 	// upgrade response. Used to clamp the producer's
@@ -77,6 +84,11 @@ const (
 // Follows the lang/version convention used by other QuestDB clients
 // (e.g. java/1.0.2).
 const qwpClientId = "go/4.3.0"
+
+// qwpDurableAckEnabledValue is the X-QWP-Durable-Ack response header value
+// a server sends to confirm it will emit DURABLE_ACK frames. Compared
+// case-insensitively (matches Java's equalsIgnoreCase("enabled")).
+const qwpDurableAckEnabledValue = "enabled"
 
 // QWP ACK response sizes (spec §13). All ACKs share a fixed header
 // shape, but their tails vary:
@@ -156,6 +168,13 @@ type qwpTransportOpts struct {
 	// pre-failover-spec behavior; sanitizeQwpConf seeds 15000 for
 	// QWP-configured callers.
 	authTimeoutMs int
+
+	// requestDurableAck opts into durable-ack mode (ingest-only). When
+	// set, connect() sends the X-QWP-Request-Durable-Ack: true upgrade
+	// header and REQUIRES the server to echo X-QWP-Durable-Ack: enabled —
+	// a completed upgrade without the echo is a terminal
+	// *QwpDurableAckMismatchError (the server cannot honour durability).
+	requestDurableAck bool
 }
 
 // qwpTransport wraps a WebSocket connection for sending QWP
@@ -187,6 +206,13 @@ type qwpTransport struct {
 	// connect(); 0 before connect() has succeeded. Egress callers
 	// branch on this to decide whether to expect a SERVER_INFO frame.
 	negotiatedVersion byte
+
+	// serverDurableAckEnabled records whether the server echoed
+	// X-QWP-Durable-Ack: enabled on the upgrade. Only meaningful when the
+	// caller set opts.requestDurableAck; connect() has already rejected a
+	// requested-but-unconfirmed upgrade, so for a durable-ack sender this
+	// is always true on a live transport.
+	serverDurableAckEnabled bool
 
 	// serverMaxBatchSize is the server-advertised hard cap on a
 	// single DATA_BATCH wire frame (bytes), parsed from the
@@ -327,6 +353,9 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	if opts.maxBatchRows > 0 {
 		dialOpts.HTTPHeader.Set(qwpHeaderMaxBatchRows, fmt.Sprintf("%d", opts.maxBatchRows))
 	}
+	if opts.requestDurableAck {
+		dialOpts.HTTPHeader.Set(qwpHeaderRequestDurableAck, "true")
+	}
 
 	// Build the http.Transport so we can install ResponseHeaderTimeout
 	// per failover.md §1 (auth_timeout_ms bounds the upgrade response
@@ -420,6 +449,20 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	if err != nil || negotiated < 1 || negotiated > int(advertisedMax) {
 		conn.Close(websocket.StatusProtocolError, "version mismatch")
 		return fmt.Errorf("qwp: server selected protocol version %q, client supports up to %d", serverVersion, advertisedMax)
+	}
+
+	// Durable-ack negotiation. A durable-ack sender requires the server to
+	// echo X-QWP-Durable-Ack: enabled; a completed upgrade without it means
+	// the server cannot honour durability, so the OK-driven trim this
+	// sender suppresses would never be replaced by a DURABLE_ACK and rows
+	// could sit in SF forever. Fail fast with a terminal, typed error
+	// (mirrors Java's QwpDurableAckMismatchException) so the failover loop
+	// does not burn its budget retrying an incapable cluster.
+	t.serverDurableAckEnabled = strings.EqualFold(
+		strings.TrimSpace(resp.Header.Get(qwpHeaderDurableAck)), qwpDurableAckEnabledValue)
+	if opts.requestDurableAck && !t.serverDurableAckEnabled {
+		conn.Close(websocket.StatusProtocolError, "durable-ack not supported")
+		return &QwpDurableAckMismatchError{URL: url}
 	}
 
 	// Raise — but do not remove — the default read limit. QWP ACKs are
@@ -654,6 +697,38 @@ func validateAckTableEntries(tail []byte) error {
 	return nil
 }
 
+// parseAckTableEntries parses the per-table (name, seqTxn) watermark
+// trailer of an OK or DURABLE_ACK frame into a slice. `tail` must start at
+// the tableCount uint16: data[qwpAckOKTablesOffset:] for an OK frame,
+// data[qwpAckDurableTablesOff:] for a DURABLE_ACK frame.
+//
+// Precondition: `tail` has already passed validateAckTableEntries (readAck
+// runs it before returning the frame), so every declared length is sound
+// and the walk needs no bounds re-checking beyond the loop guard. Returns
+// nil when the frame carried no table entries. Used by the durable-ack
+// receiver path (qwp_sf_send_loop.go) to feed qwpSfDurableTracker.
+func parseAckTableEntries(tail []byte) []qwpAckTableEntry {
+	if len(tail) < 2 {
+		return nil
+	}
+	tableCount := int(binary.LittleEndian.Uint16(tail[0:2]))
+	if tableCount == 0 {
+		return nil
+	}
+	out := make([]qwpAckTableEntry, 0, tableCount)
+	off := 2
+	for i := 0; i < tableCount; i++ {
+		nameLen := int(binary.LittleEndian.Uint16(tail[off : off+2]))
+		off += 2
+		name := string(tail[off : off+nameLen])
+		off += nameLen
+		seqTxn := int64(binary.LittleEndian.Uint64(tail[off : off+8]))
+		off += 8
+		out = append(out, qwpAckTableEntry{name: name, seqTxn: seqTxn})
+	}
+	return out
+}
+
 // parseAckError extracts an error message from a non-OK, non-durable
 // ACK payload. The layout is:
 //
@@ -692,6 +767,21 @@ func (t *qwpTransport) close() error {
 		t.closeErr = t.conn.Close(websocket.StatusNormalClosure, "")
 	})
 	return t.closeErr
+}
+
+// ping sends a WebSocket PING and waits for the matching PONG (or ctx).
+// The durable-ack keepalive uses it to prod an otherwise-idle server into
+// flushing pending DURABLE_ACK frames (the OSS server flushes them on
+// inbound events). A PONG timeout (ctx deadline exceeded) is benign — the
+// PING frame was already written, which is what nudges the server — so the
+// caller treats only a non-deadline error as a transport failure. The PONG
+// is delivered via the receiver goroutine's Read; coder/websocket makes
+// Ping safe to call concurrently with Read/Write.
+func (t *qwpTransport) ping(ctx context.Context) error {
+	if t.conn == nil {
+		return fmt.Errorf("qwp: not connected")
+	}
+	return t.conn.Ping(ctx)
 }
 
 // --- fake server for dump mode ---

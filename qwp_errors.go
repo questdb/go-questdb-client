@@ -122,6 +122,26 @@ func (e *QwpUpgradeRejectError) IsCatchupRole() bool {
 	return strings.EqualFold(e.Role, "PRIMARY_CATCHUP")
 }
 
+// QwpDurableAckMismatchError is returned by qwpTransport.connect when the
+// caller opted into durable-ack (request_durable_ack=on) but the server
+// completed the WebSocket upgrade WITHOUT echoing
+// X-QWP-Durable-Ack: enabled. It is a terminal condition: a durable-ack
+// sender suppresses OK-driven trim, so against a server that never emits
+// DURABLE_ACK frames the store-and-forward log would grow without bound
+// and AwaitAckedFsn would never complete. The failover round-walk treats
+// it as terminal (fail-fast, does not burn the reconnect budget),
+// mirroring the Java client's QwpDurableAckMismatchException.
+type QwpDurableAckMismatchError struct {
+	// URL is the endpoint that upgraded without durable-ack support.
+	URL string
+}
+
+func (e *QwpDurableAckMismatchError) Error() string {
+	return fmt.Sprintf(
+		"qwp: WebSocket upgrade failed: server does not support durable ack "+
+			"but request_durable_ack=on was requested [%s]", e.URL)
+}
+
 // qwpStatusName returns a human-readable name for a QWP status code.
 // Used by (*SenderError).Error() to format the wire-byte component of
 // rejection messages.

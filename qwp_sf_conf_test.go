@@ -172,32 +172,37 @@ func TestSenderIdOptionAcceptsValid(t *testing.T) {
 	}
 }
 
-// Durable-ack mode is a deferred opt-in feature, but sf-client.md §19
-// makes its connect-string keys normative: the parser MUST recognise
-// request_durable_ack / durable_ack_keepalive_interval_millis so a
-// user porting a Java connect string gets a clear deferred-feature
-// message, not the generic "unsupported option".
+// Durable-ack mode (sf-client.md §9.3 / §10): the parser recognises
+// request_durable_ack / durable_ack_keepalive_interval_millis and threads
+// them onto the config so newQwpCursorLineSenderFromConf can negotiate
+// durable-ack on the upgrade.
 func TestSfConfDurableAckOffParses(t *testing.T) {
 	for _, v := range []string{"off", "false"} {
 		t.Run(v, func(t *testing.T) {
-			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=" + v + ";")
+			conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=" + v + ";")
 			require.NoError(t, err)
+			assert.False(t, conf.requestDurableAck, "request_durable_ack=%s must leave the flag off", v)
 		})
 	}
 }
 
-func TestSfConfRejectsDurableAckOptIn(t *testing.T) {
+func TestSfConfAcceptsDurableAckOptIn(t *testing.T) {
 	for _, v := range []string{"on", "true"} {
 		t.Run(v, func(t *testing.T) {
-			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=" + v + ";")
-			require.Error(t, err)
-			// Must name the feature and that it is deferred -- not the
-			// generic "unsupported option" the review flagged.
-			assert.Contains(t, err.Error(), "not implemented")
-			assert.Contains(t, err.Error(), "deferred")
-			assert.NotContains(t, err.Error(), "unsupported option")
+			conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=" + v + ";")
+			require.NoError(t, err)
+			assert.True(t, conf.requestDurableAck, "request_durable_ack=%s must set the flag", v)
 		})
 	}
+}
+
+// The keepalive interval is not just parsed but threaded onto the config
+// (0 / negative disable the PING; a value seeds the cadence).
+func TestSfConfDurableAckKeepaliveThreaded(t *testing.T) {
+	conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=on;durable_ack_keepalive_interval_millis=500;")
+	require.NoError(t, err)
+	assert.True(t, conf.durableAckKeepaliveMillisSet)
+	assert.Equal(t, 500, conf.durableAckKeepaliveMillis)
 }
 
 func TestSfConfRejectsBadDurableAckValue(t *testing.T) {

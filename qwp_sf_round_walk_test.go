@@ -238,7 +238,7 @@ func TestRoundWalkAuthErrorIsTerminal(t *testing.T) {
 
 	assert.Nil(t, result.Transport)
 	require.NotNil(t, result.Terminal, "401 must surface as Terminal QwpUpgradeRejectError")
-	assert.Equal(t, 401, result.Terminal.StatusCode)
+	assert.Equal(t, 401, result.Terminal.(*QwpUpgradeRejectError).StatusCode)
 	// Tracker should NOT have host 1 as Healthy — the walk bailed
 	// before reaching it.
 	snap := tracker.snapshot()
@@ -645,7 +645,7 @@ func TestRunSingleRoundAuthErrorShortCircuits(t *testing.T) {
 
 	assert.Nil(t, rr.Transport)
 	require.NotNil(t, rr.Terminal, "401 must short-circuit as Terminal")
-	assert.Equal(t, 401, rr.Terminal.StatusCode)
+	assert.Equal(t, 401, rr.Terminal.(*QwpUpgradeRejectError).StatusCode)
 	assert.Equal(t, 1, rr.Attempts, "walk must stop after the auth-failing host")
 	assert.NotEqual(t, qwpHostHealthy, tracker.snapshot()[1].state,
 		"walk must not have reached the healthy peer")

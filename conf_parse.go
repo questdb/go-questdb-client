@@ -536,18 +536,16 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			switch v {
 			case "off", "false":
 				// The default. Non-durable, OK-driven trim is fully
-				// conformant (sf-client.md §9.2 / §19); nothing to wire.
+				// conformant (sf-client.md §9.2 / §19).
+				senderConf.requestDurableAck = false
 			case "on", "true":
 				// Durable-ack mode (sf-client.md §4.3 / §8.1 / §9.3 /
-				// §10 / §11) is a deferred opt-in, EE-only QoS feature:
-				// the cursor send loop OK-trims and silently ignores
-				// DURABLE_ACK frames (qwp_sf_send_loop.go). §19 makes
-				// the key normative so we accept it, but opting in is
-				// rejected with a clear deferred-feature message rather
-				// than the generic "unsupported option", mirroring
-				// sf_durability=flush.
-				return nil, NewInvalidConfigStrError(
-					"request_durable_ack=%s is not yet supported: durable-ack mode is not implemented in this client (deferred follow-up; use request_durable_ack=off)", v)
+				// §10 / §11): the client negotiates durable-ack on the
+				// WebSocket upgrade and trims/replays off DURABLE_ACK
+				// frames instead of OK, so a kill-9 between OK and the
+				// object-store upload does not lose rows. See
+				// qwp_sf_durable.go + the receiver in qwp_sf_send_loop.go.
+				senderConf.requestDurableAck = true
 			default:
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
@@ -556,16 +554,17 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			// Accepted for connect-string portability (sf-client.md
-			// §4.3 / §19) but inert: it only paces keepalive PINGs in
-			// durable-ack mode, which this client does not implement
-			// (see request_durable_ack). Validate the shape so a typo
-			// still errors helpfully; 0 / negative mean "disabled" per
-			// spec, so any int is in range.
-			if _, err := strconv.Atoi(v); err != nil {
+			// Paces the durable-ack keepalive PING (sf-client.md §4.3 /
+			// §11): while OKs await durable confirmation on an otherwise
+			// idle connection, a periodic PING prods the server to flush
+			// pending DURABLE_ACK frames. 0 / negative mean "disabled".
+			parsed, err := strconv.Atoi(v)
+			if err != nil {
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
+			senderConf.durableAckKeepaliveMillis = parsed
+			senderConf.durableAckKeepaliveMillisSet = true
 		default:
 			if senderConf.senderType == qwpSenderType && egressOnlyKeys[k] {
 				// Silently accepted on ingress so a single ws:: / wss::

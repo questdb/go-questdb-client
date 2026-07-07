@@ -48,10 +48,12 @@ type qwpSfRoundWalkResult struct {
 	// Attempts counts dial attempts during this walk (success
 	// returns the number of attempts including the successful one).
 	Attempts int
-	// Terminal is a non-nil typed reject when an Auth-error (401/403)
-	// halts the walk per failover.md §6. Callers convert it to a
-	// CategorySecurityError SenderError.
-	Terminal *QwpUpgradeRejectError
+	// Terminal is a non-nil error when the walk hits a fail-fast
+	// condition that must not be retried: an Auth-error (401/403,
+	// *QwpUpgradeRejectError) per failover.md §6, or a durable-ack
+	// capability mismatch (*QwpDurableAckMismatchError). Callers convert
+	// it to a terminal SenderError (SecurityError / ProtocolViolation).
+	Terminal error
 	// Exhausted is non-nil when the wall-clock budget ran out. Wraps
 	// the last underlying dial error plus a per-host snapshot for
 	// diagnostics.
@@ -169,9 +171,10 @@ type qwpSfSingleRoundResult struct {
 	// Attempts is the dial count consumed during this round
 	// (success inclusive).
 	Attempts int
-	// Terminal is set when the walk hits a 401/403 upgrade reject —
-	// per failover.md §6, auth errors short-circuit failover.
-	Terminal *QwpUpgradeRejectError
+	// Terminal is set when the walk hits a fail-fast condition — a
+	// 401/403 upgrade reject (auth errors short-circuit failover per
+	// failover.md §6) or a durable-ack capability mismatch.
+	Terminal error
 	// Cancelled is ctx.Err() (or context.Canceled when cancelCh
 	// fired) when the walk was interrupted. Also non-nil for
 	// misconfigurations (nil tracker / factory) so callers route
@@ -316,6 +319,20 @@ func qwpSfRunSingleRound(
 					Attempts:  attempts,
 				}
 			default:
+			}
+		}
+
+		// Durable-ack capability mismatch: the upgrade completed but the
+		// server won't emit DURABLE_ACK frames. Terminal — a durable-ack
+		// sender can never make progress against it, and every endpoint
+		// in a cluster shares the same server build, so retrying other
+		// hosts only burns the budget. Fail fast (mirrors Java).
+		var dam *QwpDurableAckMismatchError
+		if errors.As(err, &dam) {
+			return qwpSfSingleRoundResult{
+				Idx:      -1,
+				Attempts: attempts,
+				Terminal: dam,
 			}
 		}
 

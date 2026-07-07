@@ -289,6 +289,21 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	}
 	loop.sendLoopSetPolicyResolver(resolver)
 	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
+	// Durable-ack keepalive cadence (default 200ms; an explicit <= 0
+	// disables the PING). Resolved once at function scope so it is shared
+	// by the foreground loop here and the orphan drainers spawned below —
+	// both must trim/replay off DURABLE_ACK when durable-ack is on.
+	durableAckKeepalive := qwpSfDefaultDurableAckKeepalive
+	if conf.durableAckKeepaliveMillisSet {
+		durableAckKeepalive = time.Duration(conf.durableAckKeepaliveMillis) * time.Millisecond
+	}
+	if conf.requestDurableAck {
+		// The transport already negotiated durable-ack on the upgrade
+		// (opts.requestDurableAck made connect() require the server's
+		// X-QWP-Durable-Ack echo). Switch the loop over before it starts
+		// so the receiver trims off DURABLE_ACK from the very first frame.
+		loop.sendLoopSetDurableAck(durableAckKeepalive)
+	}
 
 	s, err := newQwpCursorLineSender(
 		conf.autoFlushRows,
@@ -366,6 +381,12 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 					tracker,
 					reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff,
 				)
+				if conf.requestDurableAck {
+					// The adopted slot must trim/replay off DURABLE_ACK too,
+					// or a failover loses the orphan's un-durable rows. Set
+					// before submit so the drainer goroutine sees it.
+					drainer.drainerSetDurableAck(durableAckKeepalive)
+				}
 				_ = pool.drainerPoolSubmit(ctx, drainer)
 			}
 		}
@@ -980,6 +1001,14 @@ func (s *qwpLineSender) TotalReconnectsSucceeded() int64 {
 		return 0
 	}
 	return s.cursorSendLoop.sendLoopTotalReconnects()
+}
+
+// TotalDurableAcks implements QwpSender.TotalDurableAcks.
+func (s *qwpLineSender) TotalDurableAcks() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalDurableAcks()
 }
 
 // TotalFramesReplayed implements QwpSender.TotalFramesReplayed.

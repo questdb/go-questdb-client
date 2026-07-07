@@ -178,6 +178,13 @@ type QwpSender interface {
 	// recovery.
 	TotalReconnectsSucceeded() int64
 
+	// TotalDurableAcks returns the cumulative count of DURABLE_ACK
+	// frames processed. Always 0 unless the sender was created with
+	// request_durable_ack=on (WithRequestDurableAck); in that mode it
+	// climbs as the server confirms rows durable, and is a heartbeat
+	// that durability — not just OK receipt — is progressing.
+	TotalDurableAcks() int64
+
 	// TotalFramesReplayed returns the cumulative count of frames
 	// re-emitted on a post-reconnect catch-up — i.e. frames whose
 	// FSN was already on the wire before the drop. Useful for

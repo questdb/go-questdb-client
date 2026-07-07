@@ -406,6 +406,13 @@ type lineSenderConfig struct {
 	drainOrphans                     bool               // default false (Phase 6)
 	maxBackgroundDrainers            int                // 0 -> 4 (Phase 6)
 
+	// Durable-ack mode (QWP-only, sf-client.md §9.3 / §10). When
+	// requestDurableAck is set the client negotiates durable-ack on the
+	// upgrade and trims/replays off DURABLE_ACK frames instead of OK.
+	requestDurableAck            bool
+	durableAckKeepaliveMillis    int  // 0 -> default 200ms; <=0 (explicit) disables the keepalive PING
+	durableAckKeepaliveMillisSet bool // true if the user set the interval explicitly
+
 	// QWP server-error API (Phase 5). All fields are QWP-only.
 	errorHandler         SenderErrorHandler    // nil -> default loud handler
 	errorPolicyResolver  func(Category) Policy // nil -> per-category map / global / spec defaults
@@ -791,6 +798,39 @@ func WithSfAppendDeadline(d time.Duration) LineSenderOption {
 func WithDrainOrphans(enabled bool) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.drainOrphans = enabled
+	}
+}
+
+// WithRequestDurableAck opts into durable-ack mode. The client negotiates
+// durable-ack on the WebSocket upgrade (and fails fast if the server does
+// not support it) and advances its trim/replay watermark — and hence
+// AwaitAckedFsn — off DURABLE_ACK frames instead of OK. In this mode an
+// OK (rows committed to the primary's local WAL) no longer lets the
+// store-and-forward log drop the bytes; only a DURABLE_ACK (rows uploaded
+// to the shared object store) does. This closes the kill-between-OK-and-
+// upload data-loss window that plain OK-driven trim leaves open. Defaults
+// to disabled. Equivalent to the connect-string request_durable_ack key.
+//
+// Only available for the QWP sender.
+func WithRequestDurableAck(enabled bool) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.requestDurableAck = enabled
+	}
+}
+
+// WithDurableAckKeepalive sets the interval at which the client sends a
+// WebSocket PING while OKs are awaiting durable confirmation on an
+// otherwise idle connection — prodding the server to flush pending
+// DURABLE_ACK frames so AwaitAckedFsn does not stall behind an idle wire.
+// Only meaningful with WithRequestDurableAck. A zero or negative duration
+// disables the keepalive; the default is 200ms. Equivalent to the
+// connect-string durable_ack_keepalive_interval_millis key.
+//
+// Only available for the QWP sender.
+func WithDurableAckKeepalive(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.durableAckKeepaliveMillis = int(d / time.Millisecond)
+		s.durableAckKeepaliveMillisSet = true
 	}
 }
 
@@ -1493,6 +1533,10 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		// but inert on ingestion and honoured on the egress connect-walk
 		// instead.
 		maxVersion: qwpVersion,
+		// Durable-ack opt-in: sets the X-QWP-Request-Durable-Ack upgrade
+		// header and makes connect() require the server's
+		// X-QWP-Durable-Ack: enabled echo.
+		requestDurableAck: conf.requestDurableAck,
 	}
 	// QWP auth: Basic (username:password) or Bearer (token).
 	// Matches the Java client's buildWebSocketAuthHeader().

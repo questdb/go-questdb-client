@@ -104,7 +104,13 @@ type qwpSfOrphanDrainer struct {
 	reconnectMaxDuration    time.Duration
 	reconnectInitialBackoff time.Duration
 	reconnectMaxBackoff     time.Duration
-	stopRequested           atomic.Bool
+	// durableAckMode makes the drainer's send loop honour durable-ack
+	// exactly like the foreground loop: it trims/replays the adopted slot
+	// off DURABLE_ACK frames, not OK. Without this a drainer OK-trims the
+	// orphan's rows before they are durable and a failover loses them.
+	durableAckMode      bool
+	durableAckKeepalive time.Duration
+	stopRequested       atomic.Bool
 	targetFsn               atomic.Int64 // -1 until startup observes publishedFsn
 	ackedFsn                atomic.Int64 // mirrors engine.ackedFsn for visibility
 	outcome                 atomic.Int32
@@ -140,6 +146,15 @@ func qwpSfNewOrphanDrainer(
 	d.ackedFsn.Store(-1)
 	d.outcome.Store(int32(qwpSfDrainOutcomePending))
 	return d
+}
+
+// drainerSetDurableAck switches the drainer's send loop into durable-ack
+// mode (trim/replay off DURABLE_ACK, not OK). Must be called before the
+// drainer is submitted to the pool, i.e. before drainerRun starts — the
+// fields are read by the drainer goroutine without synchronisation.
+func (d *qwpSfOrphanDrainer) drainerSetDurableAck(keepalive time.Duration) {
+	d.durableAckMode = true
+	d.durableAckKeepalive = keepalive
 }
 
 // drainerOutcome returns the terminal state of the drainer's run,
@@ -268,6 +283,12 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// not shared") so a mid-stream demote here doesn't corrupt
 	// foreground's bookkeeping.
 	loop.sendLoopSetHostTracker(d.tracker, boundIdx)
+	if d.durableAckMode {
+		// Honour durable-ack for the adopted slot too: trim/replay off
+		// DURABLE_ACK, not OK, so the orphan's un-durable rows survive a
+		// primary failover instead of being OK-trimmed before upload.
+		loop.sendLoopSetDurableAck(d.durableAckKeepalive)
+	}
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	// Wired for parity with the foreground loop; the drainer replays an
 	// adopted slot and never appends, so the getter is never consulted
