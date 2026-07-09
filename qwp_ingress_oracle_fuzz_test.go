@@ -1004,29 +1004,30 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 	}
 }
 
-// --- poison-rows / NACK-policy scenario -------------------------------
+// --- deterministic-terminal / NACK-policy scenario --------------------
 
 // TestQwpFuzzIngressOraclePoisonErrorHandler pins the NACK-policy-v2
-// error contract against a real server:
+// error contract for a deterministic terminal rejection against a real
+// server:
 //
-//  1. a retriable server NACK (WRITE_ERROR) recycles the connection and
-//     replays the frame — the async handler fires once per delivery,
-//     informationally;
-//  2. the same frame rejected max_frame_rejections (4) consecutive
-//     times escalates to a typed PROTOCOL_VIOLATION poisoned-frame
-//     terminal — exactly 4 retriable deliveries + 1 terminal per
-//     producer, and the next producer call errors typed;
+//  1. a frame the server rejects deterministically (a dec256 overflow)
+//     latches a typed SCHEMA_MISMATCH terminal on the first delivery —
+//     no retriable replay, and the async handler fires exactly once per
+//     producer;
+//  2. the next producer call surfaces the same typed error;
 //  3. rows from clean chunks land exactly per the oracle; no row from
-//     the poisoned frame ever lands (the server rejects it atomically);
-//  4. nothing is silently dropped: the poisoned frame's bytes remain in
+//     the rejected frame ever lands (the server rejects it atomically);
+//  4. nothing is silently dropped: the rejected frame's bytes remain in
 //     the SF log after close.
 //
-// Each producer sends its clean chunks first and one poisoned final
-// chunk carrying a row whose dec256 unscaled value is 2^192 (~6.3e57,
-// 58 digits) — well past DECIMAL(50,6)'s 10^50 cap, so the rejection is
-// deterministic under byte-identical replay: the exact case the
-// poison-frame detector exists for. No server bounce on purpose — the
-// failure mode must be unambiguously the per-frame rejection, not a
+// Each producer sends its clean chunks first and one final chunk
+// carrying a row whose dec256 unscaled value is 2^192 (~6.3e57, 58
+// digits) — well past DECIMAL(50,6)'s 10^50 cap. That overflow is
+// deterministic under byte-identical replay, so the server classifies it
+// as a SCHEMA_MISMATCH terminal (retrying identical bytes could never
+// succeed); the retriable-loop poison-frame detector is covered
+// separately by the send-loop unit tests. No server bounce on purpose —
+// the failure mode must be unambiguously the per-frame rejection, not a
 // transport blip. Reproducible via QWP_FUZZ_SEED (shared newFuzzRand).
 func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	srv := fuzzServer(t)
@@ -1052,10 +1053,10 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 		genR := rand.New(rand.NewSource(r.Int63()))
 		perProducerChunks[p] = make([][]*oracleRow, chunksPerProducer)
 		for c := 0; c < chunksPerProducer; c++ {
-			// The FINAL chunk of every producer is poisoned; all clean
-			// chunks precede it, so they are ACKed before the poisoned
-			// frame starts its NACK-replay-escalate cycle and the oracle
-			// converges deterministically.
+			// The FINAL chunk of every producer carries the overflow; all
+			// clean chunks precede it, so they are ACKed before the
+			// overflow frame is rejected and the oracle converges
+			// deterministically.
 			poisoned := c == chunksPerProducer-1
 			chunk := make([]*oracleRow, chunkSize)
 			for rr := 0; rr < chunkSize; rr++ {
@@ -1124,11 +1125,9 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 				WithInitialConnectRetry(true), // initial_connect_retry=true (sync)
 				WithCloseFlushTimeout(120*time.Second),
 				WithErrorInboxCapacity(4096),
-				// Keep the poison-episode floor (reconnect_max_duration
-				// doubles as it) below the paced inter-strike backoff so
-				// the poisoned frame escalates exactly at
-				// max_frame_rejections deliveries, not after the default
-				// 5-minute settle window.
+				// Fast reconnect timing so the test does not idle on the
+				// default backoff windows; the overflow frame latches a
+				// terminal directly, so no episode floor is exercised.
 				WithReconnectPolicy(50*time.Millisecond, 25*time.Millisecond, 100*time.Millisecond),
 				WithErrorHandler(func(e *SenderError) {
 					errCalls.Add(1)
@@ -1163,32 +1162,32 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 				}
 				// Explicit flush per chunk -> chunk == frame, so the
 				// per-frame NACK is deterministic. Flush never waits for
-				// the ACK, so even the poisoned final chunk publishes
-				// cleanly; the NACK-replay-escalate cycle runs async.
+				// the ACK, so even the final overflow chunk publishes
+				// cleanly; the reject-and-latch runs async.
 				if err := qs.Flush(ctx); err != nil {
 					errs[p] = fmt.Errorf("producer %d flush chunk %d: %w", p, c, err)
 					return
 				}
 			}
-			// The poisoned final frame is rejected deterministically:
-			// max_frame_rejections (4) retriable deliveries, then the
-			// typed poisoned-frame terminal latches.
+			// The final overflow frame is rejected deterministically: the
+			// server returns a SCHEMA_MISMATCH terminal on the first
+			// delivery, which the client latches at once.
 			deadline := time.Now().Add(60 * time.Second)
 			for qs.LastTerminalError() == nil {
 				if time.Now().After(deadline) {
-					errs[p] = fmt.Errorf("producer %d: poisoned frame never escalated to a terminal", p)
+					errs[p] = fmt.Errorf("producer %d: overflow frame never latched a terminal", p)
 					return
 				}
 				time.Sleep(5 * time.Millisecond)
 			}
 			se := qs.LastTerminalError()
-			if se.Category != CategoryProtocolViolation || se.AppliedPolicy != PolicyTerminal {
-				errs[p] = fmt.Errorf("producer %d: terminal = %s/%s, want PROTOCOL_VIOLATION/TERMINAL (%s)",
+			if se.Category != CategorySchemaMismatch || se.AppliedPolicy != PolicyTerminal {
+				errs[p] = fmt.Errorf("producer %d: terminal = %s/%s, want SCHEMA_MISMATCH/TERMINAL (%s)",
 					p, se.Category, se.AppliedPolicy, se.ServerMessage)
 				return
 			}
-			if !strings.Contains(se.ServerMessage, "poisoned frame") {
-				errs[p] = fmt.Errorf("producer %d: terminal message %q lacks the poisoned-frame diagnosis",
+			if !strings.Contains(se.ServerMessage, "overflow") {
+				errs[p] = fmt.Errorf("producer %d: terminal message %q lacks the decimal-overflow diagnosis",
 					p, se.ServerMessage)
 				return
 			}
@@ -1217,9 +1216,9 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	c := newBindFuzzClient(t, srv)
 	oracleAssert(t, c, oracle)
 
-	// (b) Poisoned rows: not a single id from any poisoned frame landed —
-	// the server rejects the whole frame atomically, and replay re-sends
-	// the same bytes, so the ids stay absent across all 4 deliveries.
+	// (b) Rejected rows: not a single id from any overflow frame landed —
+	// the server rejects the whole frame atomically, so those ids never
+	// appear.
 	if len(poisonedIDs) > 0 {
 		res, err := srv.execSQL("SELECT count() FROM '" + oracleTableName +
 			"' WHERE id IN (" + strings.Join(poisonedIDs, ",") + ")")
@@ -1235,11 +1234,12 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 		}
 	}
 
-	// (c) Async notifications: exactly max_frame_rejections (4) retriable
-	// deliveries plus 1 poisoned-frame terminal per producer. Poll until
-	// the dispatcher drains, then pin the exact count — an off-by-one
-	// here means a lost or double-fired delivery.
-	wantCalls := int64(totalPoisonedChunks * (qwpSfDefaultMaxFrameRejections + 1))
+	// (c) Async notifications: exactly one terminal per producer. A dec256
+	// overflow is deterministic under byte-identical replay, so the server
+	// rejects it with a SCHEMA_MISMATCH terminal that the client latches on
+	// the first delivery — no retriable replay, one handler call. Poll until
+	// the dispatcher drains, then pin the exact count.
+	wantCalls := int64(totalPoisonedChunks)
 	callsDeadline := time.Now().Add(30 * time.Second)
 	for errCalls.Load() < wantCalls && time.Now().Before(callsDeadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -1247,25 +1247,24 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	time.Sleep(200 * time.Millisecond) // settle: catch over-delivery too
 	if got := errCalls.Load(); got != wantCalls {
 		t.Fatalf("error handler fired %d times, expected exactly %d "+
-			"(%d retriable deliveries + 1 poison terminal per producer)",
-			got, wantCalls, qwpSfDefaultMaxFrameRejections)
+			"(one SCHEMA_MISMATCH terminal per producer)", got, wantCalls)
 	}
-	// Inspect the first delivered payload: the dec256 overflow must
-	// classify as WRITE_ERROR with the retriable policy — a
-	// misclassification cannot pass silently behind the call count.
+	// Inspect the first delivered payload: the dec256 overflow must classify
+	// as a SCHEMA_MISMATCH terminal — a misclassification cannot pass
+	// silently behind the call count.
 	firstErrMu.Lock()
 	se := firstErr
 	firstErrMu.Unlock()
 	if se == nil {
 		t.Fatal("error handler fired but no *SenderError captured")
 	}
-	if se.Category != CategoryWriteError {
+	if se.Category != CategorySchemaMismatch {
 		t.Fatalf("error handler: wrong category: got %s (status=0x%02X), "+
-			"expected WRITE_ERROR; msg=%q",
+			"expected SCHEMA_MISMATCH; msg=%q",
 			se.Category, byte(se.ServerStatusByte), se.ServerMessage)
 	}
-	if se.AppliedPolicy != PolicyRetriable {
-		t.Fatalf("error handler: wrong policy: got %s, expected RETRIABLE",
+	if se.AppliedPolicy != PolicyTerminal {
+		t.Fatalf("error handler: wrong policy: got %s, expected TERMINAL",
 			se.AppliedPolicy)
 	}
 	t.Logf("poison: poisonedChunks=%d handlerCalls=%d", totalPoisonedChunks, errCalls.Load())
