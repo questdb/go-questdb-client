@@ -88,9 +88,14 @@ encodes a batch into `qwpSfCursorEngine` via `engineAppendBlocking`; the
 `qwpSfSendLoop` goroutine drains it to the WebSocket, parses ACKs, advances
 `engineAckedFsn`, and owns reconnect + replay from `engineAckedFsn() + 1`.
 
-**Cursor frames are self-sufficient** — full schema definitions plus the full
-symbol dictionary from id 0, every flush. This is what makes
-reconnect/replay/orphan-adoption safe across a fresh server connection.
+**Cursor frames carry a self-sufficient schema** — full inline column
+definitions on every frame — which keeps reconnect/replay/orphan-adoption
+schema-safe against a fresh server connection. The symbol dictionary is
+**delta-encoded** (each id sent once per connection); a reconnect re-registers
+the whole dictionary via a send-loop catch-up frame before replay, and SF mode
+persists it to a per-slot `.symbol-dict` side-file so a recovered /
+orphan-drained slot can rebuild it. See "Delta symbol dictionary" below and
+`design/qwp-delta-symbol-dict.md`.
 
 **Invariant B (store-and-forward robustness):** a running sender, async
 initial connect, and every background/orphan drainer retry transport outages
@@ -117,16 +122,33 @@ schema from the first `RESULT_BATCH` of a query (`batch_seq == 0`) into
 batches; `qwpEgressIO.dispatcherRun` calls `resetQuerySchema` at the start of
 every query so a schema never leaks across query boundaries.
 
-Symbol-dict tracking (`maxSentSymbolId`, `batchMaxSymbolId`) is still in place,
-and both fields are load-bearing. The encoder always passes `-1` as the
-`maxSentId` arg of `encodeMultiTableWithDeltaDict` to force "full dict from id
-0", but `batchMaxSymbolId` is the separate `batchMaxId` arg and bounds the dict
-actually written: `writeDeltaDict` emits `globalDict[0..batchMaxSymbolId]`, so
-dropping it would silently truncate the symbol dict. `maxSentSymbolId` is the
-cross-flush high-water mark that `resetAfterFlush` rewinds `batchMaxSymbolId` to
-(never to `-1`), so a later batch reusing only earlier symbols still writes the
-full dict its rows reference. Both are also read by tests and external
-observers, but that is incidental to their wire role.
+**Delta symbol dictionary** (`design/qwp-delta-symbol-dict.md`). The dict is
+delta-encoded: `symbolDeltaBaseline()` returns `maxSentSymbolId` (delta mode) or
+`-1` (full-dict fallback), passed as the encoder's `maxSentId`, so each frame
+carries only ids above the sent watermark. `deltaDictEnabled` (on the producer
+and the send loop) comes from `engineDeltaDictEnabled()` — always in memory
+mode, SF only when the per-slot `.symbol-dict` side-file (`qwp_sf_symbol_dict.go`)
+opened; otherwise the sender falls back to full self-sufficient frames
+(`maxSentId=-1`), byte-identical to the old behaviour. `maxSentSymbolId` is
+monotonic (never reset — it survives the wire boundary); `batchMaxSymbolId` is
+the `batchMaxId` arg bounding `writeDeltaDict`, rewound by `resetAfterFlush` to
+`maxSentSymbolId` (never `-1`). Both `enqueueCursor` and the per-table split
+`enqueueCursorSplit` emit deltas and advance the baseline **per frame** — the
+split path MUST stay delta, since a full-dict frame there would be skipped by the
+send-loop mirror and gap the reconnect catch-up.
+
+On reconnect the fresh server has an empty dictionary, so the send loop keeps an
+I/O-goroutine-owned mirror of every symbol it has sent (`sentDictBytes` /
+`sentDictCount`, extended by `accumulateSentDict` after each send) and
+re-registers the whole dictionary via table-less **catch-up frame(s)**
+(`setWireBaselineWithCatchUp` → `sendDictCatchUp`, split by the server batch cap)
+before replay. Catch-up frames occupy wire seqs `0..k-1` mapping to already-acked
+FSNs (`fsnAtZero = replayStart - k`), so ack alignment holds and — being
+table-less — they are trivially durable; they bump `nextWireSeq` /
+`highestFullySent` but never `framesSentOnConn` (the poison-strike gate). SF mode
+write-ahead persists a frame's new symbols before publishing it; a host-crash
+tear (frame delta start > recovered dict size) is caught pre-send by the
+**torn-dict guard**, a terminal `PROTOCOL_VIOLATION` ("resend required").
 
 `WithInFlightWindow(n)` / `in_flight_window=n` is **retained but a no-op** in
 the cursor architecture — backpressure is governed by the engine's segment-ring
