@@ -253,6 +253,24 @@ type qwpSfSendLoop struct {
 	// to -1 once we cross the boundary. Producer-only state.
 	replayTargetFsn int64
 
+	// deltaDictEnabled mirrors the engine's setting. When true the loop
+	// maintains the sent-dictionary mirror below and, on every (re)connect,
+	// re-registers the whole dictionary via a catch-up frame before replay so
+	// the fresh server can resolve the non-self-sufficient delta frames.
+	deltaDictEnabled bool
+	// sentDictBytes mirrors — as concatenated [len varint][utf8] in global-id
+	// order — every symbol the loop has sent; sentDictCount is how many. It is
+	// the source for the reconnect catch-up frame. Written by the send
+	// goroutine (accumulateSentDict) and read by the catch-up sender; the two
+	// never run concurrently (catch-up runs between connections, when no send
+	// goroutine is alive), and it is seeded once at construction from a
+	// recovered slot's persisted dictionary.
+	sentDictBytes []byte
+	sentDictCount int
+	// catchUpBuf is a reusable scratch buffer for building catch-up frames;
+	// sendMessage copies synchronously, so it is safe to reuse across chunks.
+	catchUpBuf []byte
+
 	// running gates the outer reconnect loop. close() flips it to
 	// false; inner goroutines observe it via ctx.Done.
 	running atomic.Bool
@@ -445,6 +463,7 @@ func qwpSfNewSendLoop(
 		poisonFsn:               -1,
 		lastProgressFsn:         -1,
 		maxFrameRejections:      qwpSfDefaultMaxFrameRejections,
+		deltaDictEnabled:        engine.engineDeltaDictEnabled(),
 	}
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
 	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
@@ -455,6 +474,13 @@ func qwpSfNewSendLoop(
 	// (re)connect.
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
+	// Recovery / orphan-drain: seed the sent-dict mirror from the slot's
+	// persisted dictionary so the first connection re-registers the whole
+	// dictionary (a catch-up frame) before replaying the recovered delta
+	// frames. Empty for a fresh memory-mode sender.
+	if l.deltaDictEnabled {
+		l.seedSentDictFromPersisted(engine.enginePersistedSymbolDict())
+	}
 	l.durableMismatchTerminal = true
 	// Wire the producer's per-publish doorbell. Set here (before
 	// sendLoopStart and before any producer append) so it satisfies
@@ -839,8 +865,6 @@ func (l *qwpSfSendLoop) sendLoopTotalDurableTrimAdvances() int64 {
 // corrupt frame header; see positionCursorAt.
 func (l *qwpSfSendLoop) positionCursorForStart() error {
 	replayStart := l.engine.engineAckedFsn() + 1
-	l.fsnAtZero.Store(replayStart)
-	l.nextWireSeq.Store(0)
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
 	l.framesSentOnConn.Store(0)
@@ -851,6 +875,7 @@ func (l *qwpSfSendLoop) positionCursorForStart() error {
 		// drop stale per-table watermarks and pending entries.
 		l.durable.reset()
 	}
+	l.setWireBaselineWithCatchUp(replayStart)
 	return l.positionCursorAt(replayStart)
 }
 
@@ -1308,6 +1333,19 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 		return false, errors.New("qwp/sf: transport gone mid-loop")
 	}
 	payload := base[l.sendOffset+qwpSfFrameHeaderSize : frameEnd]
+	if l.deltaDictEnabled {
+		// Torn-dictionary guard. A delta frame's start id normally never
+		// exceeds the dictionary coverage established so far (replayed frames
+		// overlap the catch-up dict; fresh frames extend it contiguously). A
+		// gap means the persisted dictionary was torn — almost always by a
+		// host/power crash that kept the segment frames but lost recently
+		// written dictionary entries. Sending would corrupt the table (the
+		// server null-pads the missing ids), so fail terminally; the
+		// unreplayable data must be resent.
+		if start := qwpFrameDeltaStart(payload); start > l.sentDictCount {
+			return false, l.qwpSfBuildTornDictSE(start, l.sentDictCount)
+		}
+	}
 	// wireSeq/fsnSent for this frame derive from nextWireSeq, which
 	// the send goroutine advances here before the wire write. A wire
 	// failure thus leaves nextWireSeq advanced for a frame that never
@@ -1337,6 +1375,12 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 	// the segment while the payload slice we handed sendMessage still
 	// points into it.
 	l.highestFullySent.Store(wireSeq)
+	if l.deltaDictEnabled {
+		// Mirror the symbols this frame introduced so a later reconnect can
+		// re-register the whole dictionary. Idempotent on replay: a frame
+		// whose delta we already hold advances nothing.
+		l.accumulateSentDict(payload)
+	}
 	// An ACK for this frame may already have landed and been held back
 	// while highestFullySent still trailed it; reconcile now that the
 	// watermark is published so a quiescent last frame — whose ACK has
@@ -2062,8 +2106,6 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 		_ = old.close()
 	}
 	replayStart := l.engine.engineAckedFsn() + 1
-	l.fsnAtZero.Store(replayStart)
-	l.nextWireSeq.Store(0)
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
 	l.framesSentOnConn.Store(0)
@@ -2074,6 +2116,7 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 		// drop stale per-table watermarks and pending entries.
 		l.durable.reset()
 	}
+	l.setWireBaselineWithCatchUp(replayStart)
 	pubAtSwap := l.engine.enginePublishedFsn()
 	if pubAtSwap >= replayStart {
 		l.replayTargetFsn = pubAtSwap
@@ -2087,6 +2130,239 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 		(*cb)(newTransport)
 	}
 	return nil
+}
+
+// setWireBaselineWithCatchUp sets the wire-sequence baseline for a fresh
+// connection. When the sent-dict mirror is non-empty it first emits a
+// full-dictionary catch-up frame (or several, under a small batch cap) so the
+// fresh server — whose dictionary starts empty — can resolve the
+// non-self-sufficient delta frames that replay next. The catch-up frames
+// occupy wire seqs 0..k-1, which map to already-acked FSNs (harmless
+// re-acks), so the first real replay frame still lands on replayStart.
+//
+// Caller must have reset highestFullySent / serverAckedSeq / framesSentOnConn
+// / acksOnConn and the durable tracker first. Runs on the goroutine that owns
+// the (re)connect (no send goroutine alive), so it is the sole socket writer.
+// A catch-up send failure means the just-bound transport is already broken;
+// that is not fatal — reset to the plain baseline so the first real send
+// surfaces the wire failure and run()'s reconnect redoes the catch-up.
+func (l *qwpSfSendLoop) setWireBaselineWithCatchUp(replayStart int64) {
+	transport := l.transport.Load()
+	if transport != nil && l.deltaDictEnabled && l.sentDictCount > 0 {
+		l.nextWireSeq.Store(0)
+		if k, err := l.sendDictCatchUp(l.ctx, transport); err == nil {
+			l.fsnAtZero.Store(replayStart - int64(k))
+			return
+		}
+		l.highestFullySent.Store(-1)
+	}
+	l.fsnAtZero.Store(replayStart)
+	l.nextWireSeq.Store(0)
+}
+
+// sendDictCatchUp re-registers the whole sent dictionary on a freshly
+// connected server, split into as many table-less frames as the server's
+// batch cap requires so no single frame exceeds it. Each chunk carries a
+// contiguous id range, in order, so the server accumulates them exactly as it
+// would the original per-frame deltas. Returns the number of frames sent (each
+// consumed a wire sequence). A too-large single entry goes in its own frame
+// and, if truly over the wire cap, surfaces as a server close handled by the
+// reconnect/poison machinery.
+func (l *qwpSfSendLoop) sendDictCatchUp(ctx context.Context, transport *qwpTransport) (int, error) {
+	budget := l.catchUpBudget(transport)
+	framesSent := 0
+	chunkStartId := 0
+	chunkStart := 0 // byte offset of the chunk's first entry in sentDictBytes
+	chunkSymbols := 0
+	chunkBytes := 0
+	for p := 0; p < len(l.sentDictBytes); {
+		entryStart := p
+		el, n, err := qwpReadVarint(l.sentDictBytes[p:])
+		if err != nil {
+			break // malformed mirror — never happens for frames we built
+		}
+		entryEnd := p + n + int(el)
+		if entryEnd > len(l.sentDictBytes) {
+			break
+		}
+		entryBytes := entryEnd - entryStart
+		if chunkSymbols > 0 && chunkBytes+entryBytes > budget {
+			if err := l.sendCatchUpChunk(ctx, transport, chunkStartId, chunkSymbols,
+				l.sentDictBytes[chunkStart:chunkStart+chunkBytes]); err != nil {
+				return framesSent, err
+			}
+			framesSent++
+			chunkStartId += chunkSymbols
+			chunkStart, chunkSymbols, chunkBytes = entryStart, 0, 0
+		}
+		chunkSymbols++
+		chunkBytes += entryBytes
+		p = entryEnd
+	}
+	if chunkSymbols > 0 {
+		if err := l.sendCatchUpChunk(ctx, transport, chunkStartId, chunkSymbols,
+			l.sentDictBytes[chunkStart:chunkStart+chunkBytes]); err != nil {
+			return framesSent, err
+		}
+		framesSent++
+	}
+	return framesSent, nil
+}
+
+// sendCatchUpChunk sends one table-less frame carrying dictionary ids
+// [deltaStart .. deltaStart+deltaCount). It consumes a wire sequence and
+// advances the fully-sent ceiling — safe because the catch-up FSNs are
+// already acked and non-segment-backed — but does NOT count toward the
+// poison-strike gate (framesSentOnConn), so a drop right after catch-up,
+// before any real frame, strikes nothing.
+func (l *qwpSfSendLoop) sendCatchUpChunk(ctx context.Context, transport *qwpTransport, deltaStart, deltaCount int, symbols []byte) error {
+	frame := l.buildCatchUpFrame(deltaStart, deltaCount, symbols)
+	wireSeq := l.nextWireSeq.Load()
+	if err := transport.sendMessage(ctx, frame); err != nil {
+		return err
+	}
+	l.nextWireSeq.Store(wireSeq + 1)
+	l.highestFullySent.Store(wireSeq)
+	l.totalFramesSent.Add(1)
+	return nil
+}
+
+// buildCatchUpFrame assembles a table-less QWP message into the reusable
+// catchUpBuf: the 12-byte header (tableCount=0), the delta start/count
+// varints, then the symbol bytes verbatim.
+func (l *qwpSfSendLoop) buildCatchUpFrame(deltaStart, deltaCount int, symbols []byte) []byte {
+	buf := l.catchUpBuf[:0]
+	var hdr [qwpHeaderSize]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], qwpMagic)
+	hdr[4] = qwpVersion
+	hdr[qwpHeaderOffsetFlags] = qwpFlagDeltaSymbolDict | qwpFlagGorilla
+	buf = append(buf, hdr[:]...)
+	var vb [qwpMaxVarintLen]byte
+	buf = append(buf, vb[:qwpPutVarint(vb[:], uint64(deltaStart))]...)
+	buf = append(buf, vb[:qwpPutVarint(vb[:], uint64(deltaCount))]...)
+	buf = append(buf, symbols...)
+	binary.LittleEndian.PutUint32(buf[qwpHeaderOffsetPayloadLen:qwpHeaderOffsetPayloadLen+4],
+		uint32(len(buf)-qwpHeaderSize))
+	l.catchUpBuf = buf
+	return buf
+}
+
+// catchUpBudget is the symbol-bytes budget per catch-up frame: the server's
+// advertised batch cap (or the protocol hard cap when none is advertised),
+// less the header and the two delta-section varints.
+func (l *qwpSfSendLoop) catchUpBudget(transport *qwpTransport) int {
+	capBytes := int(transport.serverMaxBatchSize)
+	if capBytes <= 0 {
+		capBytes = qwpMaxBatchSize
+	}
+	if b := capBytes - qwpHeaderSize - 16; b > 1 {
+		return b
+	}
+	return 1
+}
+
+// accumulateSentDict extends the sent-dict mirror with the symbols a just-sent
+// frame introduced. Only a delta that extends exactly from the current tip
+// adds symbols; a replayed or empty-delta frame is skipped (idempotent on
+// replay).
+func (l *qwpSfSendLoop) accumulateSentDict(payload []byte) {
+	deltaStart, deltaCount, symbols, ok := qwpParseDeltaDict(payload)
+	if !ok || deltaCount <= 0 || deltaStart != l.sentDictCount {
+		return
+	}
+	l.sentDictBytes = append(l.sentDictBytes, symbols...)
+	l.sentDictCount += deltaCount
+}
+
+// seedSentDictFromPersisted seeds the mirror from a recovered slot's persisted
+// dictionary so the first connection re-registers the whole dictionary before
+// replaying the recovered delta frames. No-op in memory mode.
+func (l *qwpSfSendLoop) seedSentDictFromPersisted(pd *qwpSfSymbolDict) {
+	if pd == nil {
+		return
+	}
+	symbols := pd.loadedSymbols()
+	for _, name := range symbols {
+		var vb [qwpMaxVarintLen]byte
+		l.sentDictBytes = append(l.sentDictBytes, vb[:qwpPutVarint(vb[:], uint64(len(name)))]...)
+		l.sentDictBytes = append(l.sentDictBytes, name...)
+	}
+	l.sentDictCount = len(symbols)
+}
+
+// qwpSfBuildTornDictSE builds the terminal PROTOCOL_VIOLATION surfaced when a
+// recovered delta frame references ids beyond the recovered dictionary — a
+// host-crash tear caught before it can corrupt the target table.
+func (l *qwpSfSendLoop) qwpSfBuildTornDictSE(deltaStart, dictSize int) *SenderError {
+	from := l.engine.engineAckedFsn() + 1
+	to := l.engine.enginePublishedFsn()
+	if to < from {
+		to = from
+	}
+	return &SenderError{
+		Category:         CategoryProtocolViolation,
+		AppliedPolicy:    PolicyTerminal,
+		ServerStatusByte: NoStatusByte,
+		ServerMessage: fmt.Sprintf("recovered store-and-forward symbol dictionary is incomplete "+
+			"(likely a host crash): frame delta start %d exceeds recovered dictionary size %d; "+
+			"cannot replay without corrupting data — resend required", deltaStart, dictSize),
+		FromFsn:    from,
+		ToFsn:      to,
+		DetectedAt: time.Now(),
+	}
+}
+
+// qwpIsDeltaFrame reports whether msg is a well-formed QWP message carrying a
+// delta symbol-dict section.
+func qwpIsDeltaFrame(msg []byte) bool {
+	return len(msg) >= qwpHeaderSize &&
+		binary.LittleEndian.Uint32(msg[:4]) == qwpMagic &&
+		msg[qwpHeaderOffsetFlags]&qwpFlagDeltaSymbolDict != 0
+}
+
+// qwpFrameDeltaStart returns a QWP message's symbol-dict delta start id, or -1
+// when it carries no delta section (used by the torn-dict guard).
+func qwpFrameDeltaStart(msg []byte) int {
+	if !qwpIsDeltaFrame(msg) {
+		return -1
+	}
+	start, _, err := qwpReadVarint(msg[qwpHeaderSize:])
+	if err != nil {
+		return -1
+	}
+	return int(start)
+}
+
+// qwpParseDeltaDict returns a QWP message's delta section — the start id, the
+// symbol count, and the raw [len varint][utf8] symbol bytes (excluding any
+// table blocks that follow). ok is false for a non-delta or malformed message.
+func qwpParseDeltaDict(msg []byte) (deltaStart, deltaCount int, symbols []byte, ok bool) {
+	if !qwpIsDeltaFrame(msg) {
+		return 0, 0, nil, false
+	}
+	p := qwpHeaderSize
+	start, n, err := qwpReadVarint(msg[p:])
+	if err != nil {
+		return 0, 0, nil, false
+	}
+	p += n
+	count, n, err := qwpReadVarint(msg[p:])
+	if err != nil {
+		return 0, 0, nil, false
+	}
+	p += n
+	region := p
+	for i := uint64(0); i < count; i++ {
+		el, m, verr := qwpReadVarint(msg[p:])
+		if verr != nil {
+			return 0, 0, nil, false
+		}
+		p += m + int(el)
+		if p > len(msg) {
+			return 0, 0, nil, false
+		}
+	}
+	return int(start), int(count), msg[region:p], true
 }
 
 // qwpSfIsTerminalUpgradeError reports whether err indicates any

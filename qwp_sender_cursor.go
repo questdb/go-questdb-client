@@ -107,6 +107,7 @@ func newQwpCursorLineSender(
 	// lifetime) so the byte-trigger clamp and the flush-time drop guard
 	// bound batches to what a single segment can actually hold.
 	s.maxFrameBytes = cursorEngine.engineMaxFrameBytes()
+	s.wireDeltaDict(cursorEngine)
 	// Seed effectiveAutoFlushBytes via the same clamp the transport-swap
 	// callback applies, with no transport yet (server cap unknown). With
 	// no server cap this yields min(autoFlushBytes, maxFrameBytes*9/10),
@@ -513,32 +514,76 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 	return s.cursorSendLoop.sendLoopCheckError()
 }
 
-// enqueueCursor encodes the pending rows as a self-sufficient QWP
-// frame and appends it to the cursor engine. It does NOT wait for
-// the server ACK (flush() never waits for ACK; ACKs are async) —
-// the frame is durable once appended (in-RAM
-// for memory mode, on-disk for SF) and the send loop drains +
-// replays it in the background. Shared by the auto-flush trigger
-// and by flushCursor (explicit Flush()), so the user goroutine is
-// never blocked on a server round-trip.
+// symbolDeltaBaseline is the encoder's maxSentId argument: the id below which
+// the server already holds every dictionary entry. In delta mode it is the
+// producer's monotonic sent watermark, so a frame carries only ids above it;
+// in full-dict mode it is -1 so every frame re-ships the dictionary from id 0.
+func (s *qwpLineSender) symbolDeltaBaseline() int {
+	if s.deltaDictEnabled {
+		return s.maxSentSymbolId
+	}
+	return -1
+}
+
+// persistNewSymbols write-ahead persists the symbols a frame introduces
+// ([maxSentSymbolId+1 .. batchMaxSymbolId]) to the slot's .symbol-dict BEFORE
+// the frame is published, so a recovered / orphan-drained slot can rebuild the
+// dictionary the delta frame references. No-op unless SF + delta mode with new
+// symbols. Not fsync'd — a host-crash tear is caught by the send loop's replay
+// guard, not here.
+func (s *qwpLineSender) persistNewSymbols() error {
+	if s.persistedSymbolDict == nil {
+		return nil
+	}
+	from := s.maxSentSymbolId + 1
+	to := s.batchMaxSymbolId
+	if to < from {
+		return nil
+	}
+	return s.persistedSymbolDict.appendSymbols(s.globalSymbolList[from : to+1])
+}
+
+// wireDeltaDict resolves delta symbol-dict mode from the engine (always in
+// memory mode, SF only when the persisted dictionary opened) and, on recovery,
+// reseeds the global dictionary from disk so newly ingested symbols continue
+// above the recovered ids and the delta baseline resumes at the recovered tip.
+func (s *qwpLineSender) wireDeltaDict(engine *qwpSfCursorEngine) {
+	s.deltaDictEnabled = engine.engineDeltaDictEnabled()
+	s.persistedSymbolDict = engine.enginePersistedSymbolDict()
+	if s.deltaDictEnabled && engine.engineWasRecoveredFromDisk() {
+		s.seedSymbolDictFromPersisted()
+	}
+}
+
+// seedSymbolDictFromPersisted repopulates the global dictionary from a
+// recovered slot's persisted .symbol-dict. Ids are assigned in the same
+// ascending order they were persisted (id == position), reproducing the exact
+// id→name map the recovered delta frames reference, and the delta baseline
+// resumes at the recovered tip so newly ingested symbols continue above it.
+func (s *qwpLineSender) seedSymbolDictFromPersisted() {
+	for _, name := range s.persistedSymbolDict.loadedSymbols() {
+		id := int32(len(s.globalSymbolList))
+		s.globalSymbolList = append(s.globalSymbolList, name)
+		s.globalSymbols[name] = id
+	}
+	s.maxSentSymbolId = len(s.globalSymbolList) - 1
+}
+
+// enqueueCursor encodes the pending rows as one QWP frame and appends it to
+// the cursor engine. It does NOT wait for the server ACK (flush() never waits;
+// ACKs are async) — the frame is durable once appended (in-RAM for memory
+// mode, on-disk for SF) and the send loop drains + replays it in the
+// background. Shared by the auto-flush trigger and by flushCursor (explicit
+// Flush()), so the user goroutine is never blocked on a server round-trip.
 //
-// Self-sufficient = full schema definitions for every table + full
-// symbol-dict delta from id 0 (Java decision #14). The frame must
-// replay correctly against any fresh server connection (post-
-// reconnect, post-restart, drainer adopting an orphan slot) — refs
-// to schema/symbol IDs the new server has never seen would be
-// unrecoverable.
-//
-// Schema-side: every table block carries its full inline column
-// definitions. There is no producer-side schema registry to advance.
-//
-// Symbol-side: the dict uses a delta encoding (varint-prefixed
-// length, then names). We always pass `-1` as the encoder's maxSentId
-// so the delta starts at id 0 (self-sufficient frame), and
-// batchMaxSymbolId — passed as batchMaxId — bounds how much of
-// globalSymbolList goes out (ids 0..batchMaxSymbolId). maxSentSymbolId
-// carries the high-water mark across flushes so resetAfterFlush can
-// rewind batchMaxSymbolId to it. Both fields do real work here.
+// Schema-side: every table block carries its full inline column definitions,
+// so schemas replay correctly against any fresh server connection with no
+// producer-side registry. Symbol-side: the dict is delta-encoded from
+// symbolDeltaBaseline() — in full-dict mode -1 (self-sufficient, ids 0..
+// batchMaxSymbolId), in delta mode the sent watermark so only new ids go out,
+// with a send-loop catch-up frame re-registering the whole dictionary on
+// reconnect. In SF + delta mode the new ids are persisted before the append so
+// recovery / orphan-drain can rebuild them.
 func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 		return err
@@ -561,7 +606,7 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	encoded := s.encoder.encodeMultiTableWithDeltaDict(
 		tables,
 		s.globalSymbolList,
-		-1, // self-sufficient: full dict from id 0
+		s.symbolDeltaBaseline(),
 		s.batchMaxSymbolId,
 	)
 	// Flush-time cap check. The per-row guard in atWithTimestamp bounds
@@ -582,6 +627,9 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	// flushPendingRowsSplit.
 	if kind, _ := s.frameCapExceeded(len(encoded)); kind != qwpFrameCapNone {
 		return s.enqueueCursorSplit(ctx, tables)
+	}
+	if err := s.persistNewSymbols(); err != nil {
+		return err
 	}
 	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
 		return err
@@ -619,18 +667,23 @@ func (s *qwpLineSender) frameCapExceeded(frameLen int) (qwpFrameCapKind, int64) 
 }
 
 // enqueueCursorSplit is enqueueCursor's over-cap fallback: it re-encodes
-// each pending table as its own self-sufficient single-table frame and
-// appends every table whose frame fits a wire cap. A combined frame that
-// overruns a cap only because it aggregates many tables flushes in full
-// this way — one frame per table. Only a table whose own frame is still
-// over-cap is irreducible: re-encoding it on the next flush would fail
-// identically forever and wedge the sender, so its rows are dropped and
-// named in a typed error while every other table goes out. Mirrors Java
-// QwpWebSocketSender.flushPendingRowsSplit.
+// each pending table as its own single-table frame and appends every table
+// whose frame fits a wire cap. A combined frame that overruns a cap only
+// because it aggregates many tables flushes in full this way — one frame per
+// table. Only a table whose own frame is still over-cap is irreducible:
+// re-encoding it on the next flush would fail identically forever and wedge
+// the sender, so its rows are dropped and named in a typed error while every
+// other table goes out. Mirrors Java QwpWebSocketSender.flushPendingRowsSplit.
 //
-// Each single-table frame carries the full symbol dict from id 0 and the
-// full inline schema, exactly like the combined frame, so it replays
-// against a fresh server connection on its own.
+// Each frame carries its full inline schema. The symbol dict follows the same
+// delta rule as enqueueCursor (symbolDeltaBaseline): the first appended frame
+// ships the batch's new ids and advances the sent watermark, so later frames
+// carry an empty delta referencing ids that frame already registered. The
+// baseline MUST advance per-frame here, not once at the end — otherwise every
+// per-table frame would re-ship the whole batch delta. It must also stay a
+// delta (not -1): a full-dict frame here would be skipped by the send-loop
+// mirror, so the reconnect catch-up would under-register and a later delta
+// frame would dangle a symbol id on a fresh server.
 //
 // The retain-on-error contract holds per table: a table is reset only
 // once its frame is in a segment, so a transient engineAppendBlocking
@@ -652,7 +705,7 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 			continue
 		}
 		frame := s.encoder.encodeTableWithDeltaDict(
-			tb, s.globalSymbolList, -1, s.batchMaxSymbolId)
+			tb, s.globalSymbolList, s.symbolDeltaBaseline(), s.batchMaxSymbolId)
 		if kind, capVal := s.frameCapExceeded(len(frame)); kind != qwpFrameCapNone {
 			// Irreducible: a single table over the cap can never be sent.
 			// Drop it; the other tables are unaffected.
@@ -664,6 +717,10 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 			tb.reset()
 			continue
 		}
+		if err := s.persistNewSymbols(); err != nil {
+			txErr = err
+			break
+		}
 		if _, err := s.cursorEngine.engineAppendBlocking(ctx, frame); err != nil {
 			// Transient: retain this table and the unprocessed tail for
 			// the next flush. Tables already appended stay reset so they
@@ -671,12 +728,13 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 			txErr = err
 			break
 		}
+		// Advance the sent watermark per-frame so the next per-table frame's
+		// delta starts above the ids this one just registered.
+		if s.batchMaxSymbolId > s.maxSentSymbolId {
+			s.maxSentSymbolId = s.batchMaxSymbolId
+		}
 		appended++
 		tb.reset()
-	}
-
-	if appended > 0 && s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
 	}
 
 	if txErr != nil {

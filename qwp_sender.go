@@ -286,13 +286,24 @@ type qwpLineSender struct {
 	maxSentSymbolId int
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
+	// deltaDictEnabled makes each frame carry only the symbol ids above
+	// maxSentSymbolId (a delta), rather than the full dictionary from id 0.
+	// Set from the engine at construction: always in memory mode, and in SF
+	// mode only when the persisted dictionary opened. When false the sender
+	// emits full self-sufficient frames (baseline -1). See symbolDeltaBaseline.
+	deltaDictEnabled bool
+	// persistedSymbolDict is the engine's .symbol-dict side-file (SF + delta
+	// mode only; nil otherwise). New symbols are appended to it before the
+	// referencing frame is published, so a recovered / orphan-drained slot can
+	// rebuild the dictionary its non-self-sufficient delta frames reference.
+	persistedSymbolDict *qwpSfSymbolDict
 
-	// Schemas are intentionally NOT tracked on the cursor wire path.
-	// Every frame is self-sufficient: it carries the full inline column
-	// definitions and the full symbol dict from id 0. There is no
-	// per-connection schema registry on the client side and no
-	// schema-change detection; the server reads the inline column
-	// definitions on every frame regardless.
+	// Schemas are intentionally NOT tracked on the cursor wire path. Every
+	// frame's schema stays self-sufficient: it carries the full inline column
+	// definitions, with no per-connection schema registry and no schema-change
+	// detection. The symbol dictionary, in contrast, is delta-encoded when
+	// deltaDictEnabled — a reconnect re-registers it via a send-loop catch-up
+	// frame before replay (full-dict frames when disabled).
 
 	// Row state.
 	hasTable bool
@@ -470,6 +481,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 	engine.engineSetTerminalErrorGetter(loop.sendLoopCheckError)
 	s.cursorEngine = engine
 	s.cursorSendLoop = loop
+	s.wireDeltaDict(engine)
 	// The memory-mode segment is the fixed qwpSfDefaultMaxBytes; record
 	// the largest frame it can hold so the byte-trigger clamp and the
 	// flush-time drop guard bound batches to it.

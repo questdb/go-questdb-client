@@ -1650,20 +1650,19 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 		t.Fatalf("msg1 deltaCount = %d, want 2", deltaCount)
 	}
 
-	// Cursor mode emits self-sufficient frames: every batch carries
-	// the full symbol dict from id 0. So the second message also
-	// has deltaStart=0 (NOT 2), with all three symbols repeated.
-	// This is the documented "self-sufficient frames" decision.
+	// Memory mode delta-encodes the symbol dict: on one connection each
+	// symbol id is registered once, so the second message carries only the
+	// new id (GOOG) as a delta starting at 2 — not the whole dict from 0.
 	msg2 := messages[1]
 	off = qwpHeaderSize
 	deltaStart2, n, _ := qwpReadVarint(msg2[off:])
 	off += n
-	if deltaStart2 != 0 {
-		t.Fatalf("msg2 deltaStart = %d, want 0 (cursor mode is self-sufficient)", deltaStart2)
+	if deltaStart2 != 2 {
+		t.Fatalf("msg2 deltaStart = %d, want 2 (delta above the sent watermark)", deltaStart2)
 	}
 	deltaCount2, _, _ := qwpReadVarint(msg2[off:])
-	if deltaCount2 != 3 {
-		t.Fatalf("msg2 deltaCount = %d, want 3 (full dict re-sent)", deltaCount2)
+	if deltaCount2 != 1 {
+		t.Fatalf("msg2 deltaCount = %d, want 1 (only the new symbol)", deltaCount2)
 	}
 }
 

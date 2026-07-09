@@ -107,6 +107,15 @@ type qwpSfCursorEngine struct {
 	// writer) is gone.
 	watermark *qwpSfAckWatermark
 
+	// persistedSymbolDict is the engine-owned .symbol-dict side-file
+	// (disk mode only; nil in memory mode and when it could not open). It
+	// lets a recovered / orphan-drained slot re-register the whole symbol
+	// dictionary on the fresh server before replaying its non-self-
+	// sufficient delta frames. Opened in the constructor alongside the
+	// watermark, closed in engineClose. nil in disk mode disables delta
+	// encoding for the slot (the sender keeps full self-sufficient frames).
+	persistedSymbolDict *qwpSfSymbolDict
+
 	appendDeadline time.Duration
 
 	// recoveredFromDisk is true when the constructor recovered an
@@ -216,6 +225,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		lock              *qwpSfSlotLock
 		ring              *qwpSfSegmentRing
 		watermark         *qwpSfAckWatermark
+		persistedDict     *qwpSfSymbolDict
 		recoveredFromDisk bool
 		err               error
 	)
@@ -250,6 +260,9 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		}
 		if watermark != nil {
 			_ = watermark.close()
+		}
+		if persistedDict != nil {
+			_ = persistedDict.close()
 		}
 		if lock != nil {
 			_ = lock.close()
@@ -311,6 +324,10 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// unmappable file never takes the engine down — we just
 			// fall back to the bare lowestBase-1 seed.
 			watermark = qwpSfAckWatermarkOpen(sfDir)
+			// Load the persisted symbol dictionary so this recovered slot's
+			// delta frames can be re-registered on a fresh server before
+			// they replay. nil on open failure → delta disabled for the slot.
+			persistedDict = qwpSfSymbolDictOpen(sfDir)
 			watermarkFsn := watermark.read() // nil-safe → INVALID
 			candidate := baseSeed
 			if watermarkFsn > candidate {
@@ -347,6 +364,10 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// behind it.
 			qwpSfAckWatermarkRemoveOrphan(sfDir)
 			watermark = qwpSfAckWatermarkOpen(sfDir)
+			// Same stale-side-file hygiene for the symbol dictionary: a
+			// fresh slot starts with an empty dictionary.
+			qwpSfSymbolDictRemoveOrphan(sfDir)
+			persistedDict = qwpSfSymbolDictOpen(sfDir)
 			initialPath = filepath.Join(sfDir, "sf-initial.sfa")
 			initial, err = qwpSfCreateSegment(initialPath, 0, segmentSizeBytes)
 		}
@@ -359,15 +380,16 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		return nil, err
 	}
 	e := &qwpSfCursorEngine{
-		sfDir:             sfDir,
-		segmentSizeBytes:  segmentSizeBytes,
-		manager:           mgr,
-		ownsManager:       false,
-		slotLock:          lock,
-		ring:              ring,
-		watermark:         watermark,
-		appendDeadline:    appendDeadline,
-		recoveredFromDisk: recoveredFromDisk,
+		sfDir:               sfDir,
+		segmentSizeBytes:    segmentSizeBytes,
+		manager:             mgr,
+		ownsManager:         false,
+		slotLock:            lock,
+		ring:                ring,
+		watermark:           watermark,
+		persistedSymbolDict: persistedDict,
+		appendDeadline:      appendDeadline,
+		recoveredFromDisk:   recoveredFromDisk,
 	}
 	ok = true
 	return e, nil
@@ -433,6 +455,23 @@ func (e *qwpSfCursorEngine) engineMaxFrameBytes() int64 {
 // fresh-disk engines return false.
 func (e *qwpSfCursorEngine) engineWasRecoveredFromDisk() bool {
 	return e.recoveredFromDisk
+}
+
+// engineDeltaDictEnabled reports whether the sender may delta-encode the
+// symbol dictionary on this engine. Always true in memory mode (a reconnect
+// replays from the in-process ring and the send loop re-registers the whole
+// dictionary via a catch-up frame). In disk mode it requires the persisted
+// dictionary to have opened, since delta frames are not self-sufficient and
+// recovery / orphan-drain must rebuild the dictionary from disk. false in disk
+// mode → the sender falls back to full self-sufficient frames.
+func (e *qwpSfCursorEngine) engineDeltaDictEnabled() bool {
+	return e.sfDir == "" || e.persistedSymbolDict != nil
+}
+
+// enginePersistedSymbolDict returns the engine's .symbol-dict side-file, or
+// nil in memory mode (and in disk mode if it failed to open).
+func (e *qwpSfCursorEngine) enginePersistedSymbolDict() *qwpSfSymbolDict {
+	return e.persistedSymbolDict
 }
 
 // enginePublishedFsn returns the highest FSN whose frame is fully
@@ -692,14 +731,20 @@ func (e *qwpSfCursorEngine) engineClose() error {
 			firstErr = err
 		}
 	}
+	if e.persistedSymbolDict != nil {
+		if err := e.persistedSymbolDict.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	if fullyDrained {
 		if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		// A watermark with no segments behind it would only confuse
-		// the next session's recovery seed — drop it, matching the
+		// A watermark or dictionary with no segments behind it would only
+		// confuse the next session's recovery seed — drop them, matching the
 		// .sfa unlink and the fresh-slot removeOrphan above.
 		qwpSfAckWatermarkRemoveOrphan(e.sfDir)
+		qwpSfSymbolDictRemoveOrphan(e.sfDir)
 	}
 	if e.slotLock != nil {
 		if err := e.slotLock.close(); err != nil && firstErr == nil {
