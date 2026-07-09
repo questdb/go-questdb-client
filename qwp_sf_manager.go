@@ -79,6 +79,12 @@ type qwpSfSegmentManager struct {
 	// (the zero value) -> slog.Default() via qwpEffectiveLogger.
 	logger atomic.Pointer[slog.Logger]
 
+	// workerPanic holds the detail of a worker-goroutine panic. Once set, spare
+	// provisioning and trim have stopped, so producers would otherwise stall in
+	// backpressure forever; engineTerminalError surfaces it as a terminal on the
+	// next append instead.
+	workerPanic atomic.Pointer[string]
+
 	mu              sync.Mutex
 	rings           []qwpSfManagerRingEntry
 	totalBytes      int64
@@ -326,12 +332,16 @@ func (m *qwpSfSegmentManager) workerLoop() {
 	defer timer.Stop()
 	// This goroutine drives no untrusted input, so a panic here is not a
 	// known reachable path; recover anyway — an uncaught panic on it would
-	// crash the host. The deferred close(m.done)/worker.Done still run and
-	// signal shutdown.
+	// crash the host. Provisioning and trim are now dead, so latch the failure:
+	// engineTerminalError surfaces it to producers on their next append rather
+	// than letting them stall in backpressure forever with no signal. The
+	// deferred close(m.done)/worker.Done still run and signal shutdown.
 	defer func() {
 		if r := recover(); r != nil {
+			detail := fmt.Sprintf("%v\n%s", r, debug.Stack())
+			m.workerPanic.Store(&detail)
 			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager worker panicked",
-				"detail", fmt.Sprintf("%v\n%s", r, debug.Stack()))
+				"detail", detail)
 		}
 	}()
 	for {
@@ -360,6 +370,15 @@ func (m *qwpSfSegmentManager) workerLoop() {
 		case <-timer.C:
 		}
 	}
+}
+
+// managerWorkerError returns a terminal error when the worker goroutine has
+// panicked and stopped provisioning/trimming, or nil while it is healthy.
+func (m *qwpSfSegmentManager) managerWorkerError() error {
+	if d := m.workerPanic.Load(); d != nil {
+		return fmt.Errorf("qwp/sf: segment manager worker stopped: %s", *d)
+	}
+	return nil
 }
 
 // serviceRing performs one round of spare provisioning and trim for

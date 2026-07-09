@@ -800,7 +800,6 @@ func parseConfigStr(conf string) (configData, error) {
 			KeyValuePairs: map[string]string{},
 		}
 
-		nextRune   rune
 		isEscaping bool
 	)
 
@@ -819,74 +818,89 @@ func parseConfigStr(conf string) (configData, error) {
 		conf += ";"
 	}
 
-	keyValueStr := []rune(conf)
-	for idx, rune := range keyValueStr {
-		if idx < len(conf)-1 {
-			nextRune = keyValueStr[idx+1]
-		} else {
-			nextRune = 0
+	// Reject duplicate keys (case-sensitive) for parity with Rust and
+	// the per-field checks in Java; otherwise dups would silently LWW.
+	// `addr` is the documented exception: the failover spec (§1)
+	// allows `addr=h1;addr=h2` as an alternative spelling of
+	// `addr=h1,h2`. Both forms accumulate into a single
+	// comma-joined value so downstream parsers see one shape.
+	commitPair := func() error {
+		if value.Len() == 0 {
+			return NewInvalidConfigStrError("empty value for key %q", key)
 		}
-		switch rune {
+		keyStr := key.String()
+		if existing, exists := result.KeyValuePairs[keyStr]; exists {
+			if keyStr == "addr" {
+				result.KeyValuePairs[keyStr] = existing + "," + value.String()
+			} else {
+				return NewInvalidConfigStrError("duplicate key %q", keyStr)
+			}
+		} else {
+			result.KeyValuePairs[keyStr] = value.String()
+		}
+		key.Reset()
+		value.Reset()
+		isKey = true
+		return nil
+	}
+
+	// Byte-wise iteration: the delimiters ';' and '=' are ASCII and
+	// UTF-8 continuation bytes are all >= 0x80, so multi-byte runes in
+	// keys and values pass through the builders untouched.
+	for idx := 0; idx < len(conf); idx++ {
+		var nextByte byte
+		if idx < len(conf)-1 {
+			nextByte = conf[idx+1]
+		}
+		switch b := conf[idx]; b {
 		case ';':
 			if isKey {
-				if nextRune == 0 {
+				if nextByte == 0 {
 					return result, NewInvalidConfigStrError("unexpected end of string")
 				}
 				return result, NewInvalidConfigStrError("invalid key character ';'")
 			}
 
-			if !isEscaping && nextRune == ';' {
+			if !isEscaping && nextByte == ';' {
 				isEscaping = true
 				continue
 			}
 
 			if isEscaping {
-				value.WriteRune(rune)
+				value.WriteByte(b)
 				isEscaping = false
 				continue
 			}
 
-			if value.Len() == 0 {
-				return result, NewInvalidConfigStrError("empty value for key %q", key)
+			if err := commitPair(); err != nil {
+				return result, err
 			}
-
-			// Reject duplicate keys (case-sensitive) for parity with Rust and
-			// the per-field checks in Java; otherwise dups would silently LWW.
-			// `addr` is the documented exception: the failover spec (§1)
-			// allows `addr=h1;addr=h2` as an alternative spelling of
-			// `addr=h1,h2`. Both forms accumulate into a single
-			// comma-joined value so downstream parsers see one shape.
-			keyStr := key.String()
-			if existing, exists := result.KeyValuePairs[keyStr]; exists {
-				if keyStr == "addr" {
-					result.KeyValuePairs[keyStr] = existing + "," + value.String()
-				} else {
-					return result, NewInvalidConfigStrError("duplicate key %q", keyStr)
-				}
-			} else {
-				result.KeyValuePairs[keyStr] = value.String()
-			}
-
-			key.Reset()
-			value.Reset()
-			isKey = true
 		case '=':
 			if isKey {
 				isKey = false
 			} else {
-				value.WriteRune(rune)
+				value.WriteByte(b)
 			}
 		default:
 			if isKey {
-				key.WriteRune(rune)
+				key.WriteByte(b)
 			} else {
-				value.WriteRune(rune)
+				value.WriteByte(b)
 			}
 		}
 	}
 
 	if isEscaping {
 		return result, NewInvalidConfigStrError("unescaped ';'")
+	}
+
+	// A conf ending in ";;" spends its final ';' as the escaped
+	// character, leaving the last pair complete but unterminated —
+	// commit it instead of silently dropping it.
+	if !isKey {
+		if err := commitPair(); err != nil {
+			return result, err
+		}
 	}
 
 	return result, nil

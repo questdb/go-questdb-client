@@ -330,6 +330,33 @@ func TestRoundWalkProtocolRejectDefersToTransientTransportError(t *testing.T) {
 		"the bounded walk must exhaust its budget and keep retrying, not latch a terminal")
 }
 
+// TestRoundWalkProtocolRejectDefersToRoleReject pins that a 404/426 protocol
+// reject coexisting with a 421 role reject does not latch a terminal: a
+// role-rejecting replica is promotable and may become a compatible primary, so
+// the walk keeps retrying (Invariant B) rather than dropping a running sender.
+func TestRoundWalkProtocolRejectDefersToRoleReject(t *testing.T) {
+	notFoundSrv := newRoundWalkRejectServer(t, 404, http.Header{})
+	defer notFoundSrv.Close()
+	roleSrv := newRoundWalkRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"PRIMARY_CATCHUP"},
+	})
+	defer roleSrv.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, notFoundSrv), // persistent 404 protocol reject
+		endpointForServer(t, roleSrv),     // 421 role reject (promotable replica)
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	result := runWalkAgainst(t, endpoints, tracker, -1,
+		200*time.Millisecond, 10*time.Millisecond, 30*time.Millisecond)
+
+	require.Nil(t, result.Transport, "no endpoint is bindable in this sweep")
+	require.Nil(t, result.Terminal,
+		"a 404 coexisting with a 421 role reject must not terminate (the replica may be promoted)")
+	require.NotNil(t, result.Exhausted,
+		"the bounded walk must exhaust and keep retrying, not latch a terminal")
+}
+
 // TestRoundWalkReconnectRedialsBoundHostPastDeferredTerminalSibling is the
 // regression for a stale attempted-bit skipping the previously-bound host on
 // reconnect. RecordSuccess leaves the bound host's round slot consumed; a

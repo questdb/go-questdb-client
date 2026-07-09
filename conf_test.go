@@ -353,6 +353,178 @@ func TestParserPathologicalCases(t *testing.T) {
 	}
 }
 
+// Regression: the parser indexed a []rune slice with a byte-length
+// lookahead guard, so any multi-byte UTF-8 in the post-'::' portion
+// panicked with index out of range instead of parsing.
+func TestParserNonASCIIValues(t *testing.T) {
+	testCases := []parseConfigTestCase{
+		{
+			name:   "accented password",
+			config: "ws::addr=host;password=héllo;",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr":     "host",
+					"password": "héllo",
+				},
+			},
+		},
+		{
+			name:   "multi-byte value in final pair without trailing semicolon",
+			config: "ws::addr=host;password=héllo",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr":     "host",
+					"password": "héllo",
+				},
+			},
+		},
+		{
+			name:   "CJK token",
+			config: "http::addr=localhost:9000;token=秘密トークン;",
+			expected: qdb.ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr":  "localhost:9000",
+					"token": "秘密トークン",
+				},
+			},
+		},
+		{
+			name:   "emoji password and CJK username",
+			config: "https::addr=localhost:9000;username=用户;password=🔑key🔑;",
+			expected: qdb.ConfigData{
+				Schema: "https",
+				KeyValuePairs: map[string]string{
+					"addr":     "localhost:9000",
+					"username": "用户",
+					"password": "🔑key🔑",
+				},
+			},
+		},
+		{
+			name:   "escaped semicolon between multi-byte runes",
+			config: "ws::addr=host;password=é;;λ;",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr":     "host",
+					"password": "é;λ",
+				},
+			},
+		},
+		{
+			name:   "multi-byte key",
+			config: "ws::addr=host;clé=v;",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr": "host",
+					"clé":  "v",
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := qdb.ParseConfigStr(tc.config)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+// Regression: a conf string ending in ";;" spends its final ';' as the
+// escaped character, so the last pair used to end the loop uncommitted
+// and was silently dropped. It must commit with a trailing ';' in the
+// value; every other escape shape and malformed tail keeps its
+// historical behavior.
+func TestParserTrailingEscapedSemicolon(t *testing.T) {
+	testCases := []parseConfigTestCase{
+		{
+			name:   "escaped semicolon at end of string commits the pair",
+			config: "tcp::addr=h;token=abc;;",
+			expected: qdb.ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  "h",
+					"token": "abc;",
+				},
+			},
+		},
+		{
+			name:   "escaped semicolon as whole value at end of string",
+			config: "tcp::addr=h;token=;;",
+			expected: qdb.ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  "h",
+					"token": ";",
+				},
+			},
+		},
+		{
+			name:   "escaped semicolon mid-value",
+			config: "tcp::addr=h;token=ab;;c;",
+			expected: qdb.ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  "h",
+					"token": "ab;c",
+				},
+			},
+		},
+		{
+			name:   "escaped semicolon at end of value with terminator",
+			config: "tcp::addr=h;token=abc;;;",
+			expected: qdb.ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  "h",
+					"token": "abc;",
+				},
+			},
+		},
+		{
+			name:                   "duplicate key committed by the trailing escape is rejected",
+			config:                 "tcp::addr=h;token=a;token=b;;",
+			expectedErrMsgContains: `duplicate key \"token\"`,
+		},
+		{
+			name:                   "dangling key with terminator is rejected",
+			config:                 "tcp::addr=h;token;",
+			expectedErrMsgContains: "unexpected end of string",
+		},
+		{
+			name:                   "dangling key without terminator is rejected",
+			config:                 "tcp::addr=h;token",
+			expectedErrMsgContains: "unexpected end of string",
+		},
+		{
+			name:                   "empty value is rejected",
+			config:                 "tcp::addr=h;token=;",
+			expectedErrMsgContains: "empty value",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := qdb.ParseConfigStr(tc.config)
+			if tc.expectedErrMsgContains != "" {
+				var expected *qdb.InvalidConfigStrError
+				assert.Error(t, err)
+				assert.ErrorAs(t, err, &expected)
+				assert.Contains(t, err.Error(), tc.expectedErrMsgContains)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
 func TestParserKeysAreCaseSensitive(t *testing.T) {
 	// Same key bytes in different case are distinct, matching the Rust
 	// client. The lowercase `addr` is recognized; the uppercase `ADDR`

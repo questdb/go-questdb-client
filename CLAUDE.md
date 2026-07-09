@@ -34,9 +34,10 @@ go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 go test -v ./...
 
 # Single suite — testify suites dispatch via the top-level
-# Test*Suite entry point plus the method name.
+# Test*Suite entry point plus the method name. The QWP live-server
+# tests are plain TestQwpIntegration* functions, not a testify suite.
 go test -v -run TestIntegrationSuite/TestE2EValidWrites .
-go test -v -run TestQwpIntegrationSuite .
+go test -v -run TestQwpIntegration .
 
 # Allocation-tracked benchmark on the QWP hot path.
 go test -v -bench BenchmarkQwpSenderSteadyState -benchmem -run ^$ .
@@ -107,8 +108,10 @@ it doubles as the poison-frame episode floor and the drainer no-progress wedge
 budget. Sanctioned terminals: auth reject, 404/426
 upgrade reject (at sweep exhaustion), durable-ack capability-gap settle
 exhaustion (capability-gap sweeps only; transport windows pause, role-reject
-sweeps reset). The only producer-visible error from a running drain path is
-SF-out-of-space backpressure. Enforced by the review-pr skill checklist.
+sweeps reset), poison-frame escalation (strikes + episode floor), and — on
+drainers — a failed slot recovery / engine open or a no-progress wedge past the
+budget (both `.failed` quarantines). The only producer-visible error from a
+running drain path is SF-out-of-space backpressure. Enforced by the review-pr skill checklist.
 
 **The wire carries no schema id and no schema mode byte.** A table block is
 `table_name, row_count, col_count, inline columns, column data`; the inline

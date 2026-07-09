@@ -340,6 +340,89 @@ func TestQwpSenderSymbolDictionary(t *testing.T) {
 	}
 }
 
+// TestQwpSenderErrorOversizedSymbolValue verifies that an over-cap
+// symbol value is rejected at Symbol() — before interning. Symbol bytes
+// live in the global dictionary, not the row, so without this guard the
+// per-row batch-cap check never sees them; the entry would get a
+// permanent id, every dict delta covering it would be over-cap, and all
+// future new-symbol batches would be dropped while the watermark never
+// passes it.
+func TestQwpSenderErrorOversizedSymbolValue(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	huge := strings.Repeat("x", qwpMaxSymbolValueLen+1)
+	err := s.Table("t").
+		Symbol("sym", huge).
+		Int64Column("v", 1).
+		AtNow(context.Background())
+	if err == nil {
+		t.Fatal("AtNow: want oversized symbol value error, got nil")
+	}
+	if !strings.Contains(err.Error(), "symbol value length") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The oversized value must never reach the dictionary.
+	if len(s.globalSymbols) != 0 || len(s.globalSymbolList) != 0 {
+		t.Fatalf("oversized value interned [map=%d, list=%d], want empty",
+			len(s.globalSymbols), len(s.globalSymbolList))
+	}
+
+	// The error latched and drained at AtNow; subsequent valid rows
+	// must still flow all the way to the server.
+	if err := s.Table("t").
+		Symbol("sym", "ok").
+		Int64Column("v", 2).
+		AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow after rejected symbol value: %v", err)
+	}
+	flushAndAwaitAck(t, s)
+	if s.maxSentSymbolId != 0 {
+		t.Fatalf("maxSentSymbolId = %d, want 0", s.maxSentSymbolId)
+	}
+}
+
+func TestQwpSenderSymbolValueAtLimit(t *testing.T) {
+	// newQwpTestServer keeps coder/websocket's default 32 KiB read
+	// limit, far below the frame an at-limit dict entry produces;
+	// raise it so the mock accepts what a real server would.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		conn.SetReadLimit(qwpMaxFrameReadLimit)
+		var seq int64
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+		}
+	}))
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	atLimit := strings.Repeat("y", qwpMaxSymbolValueLen)
+	if err := s.Table("t").
+		Symbol("sym", atLimit).
+		Int64Column("v", 1).
+		AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow with at-limit symbol value: %v", err)
+	}
+	flushAndAwaitAck(t, s)
+	if s.maxSentSymbolId != 0 {
+		t.Fatalf("maxSentSymbolId = %d, want 0", s.maxSentSymbolId)
+	}
+}
+
 func TestQwpSenderAllColumnTypes(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()

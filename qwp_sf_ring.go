@@ -452,10 +452,18 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 }
 
 // segmentRingClose releases all segments and marks the ring closed.
-// Subsequent installHotSpare calls return qwpSfErrRingClosed; the
-// active segment is closed last so any reader that captured a
-// reference can finish reading before unmap.
+// Subsequent installHotSpare calls return qwpSfErrRingClosed. Segment
+// ordering here provides no reader synchronization — a reader holding an
+// address() reference is unprotected regardless of order — so the caller must
+// ensure the send loop has joined before closing, or pass leakMappings via
+// segmentRingCloseInternal when it may still be reading (the send-loop-abandon
+// path, where a goroutine wedged in an un-cancellable page fault may still be
+// dereferencing a segment).
 func (r *qwpSfSegmentRing) segmentRingClose() error {
+	return r.segmentRingCloseInternal(false)
+}
+
+func (r *qwpSfSegmentRing) segmentRingCloseInternal(leakMappings bool) error {
 	r.mu.Lock()
 	r.closed = true
 	sealed := r.sealedSegments
@@ -464,12 +472,12 @@ func (r *qwpSfSegmentRing) segmentRingClose() error {
 
 	var firstErr error
 	if a := r.active.Swap(nil); a != nil {
-		if err := a.close(); err != nil && firstErr == nil {
+		if err := a.closeInternal(leakMappings); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	if hs := r.hotSpare.Swap(nil); hs != nil {
-		if err := hs.close(); err != nil && firstErr == nil {
+		if err := hs.closeInternal(leakMappings); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -477,7 +485,7 @@ func (r *qwpSfSegmentRing) segmentRingClose() error {
 		if s == nil {
 			continue
 		}
-		if err := s.close(); err != nil && firstErr == nil {
+		if err := s.closeInternal(leakMappings); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

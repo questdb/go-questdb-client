@@ -803,6 +803,20 @@ func (t *qwpTransport) close() error {
 	return t.closeErr
 }
 
+// closeNow closes the WebSocket immediately, skipping the graceful close-frame
+// handshake, which can block for seconds against a dead or wedged peer. Shares
+// closeOnce with close, so a later graceful close is a no-op. Used on the
+// send-loop abandon path where Close must not block.
+func (t *qwpTransport) closeNow() error {
+	if t.conn == nil {
+		return nil
+	}
+	t.closeOnce.Do(func() {
+		t.closeErr = t.conn.CloseNow()
+	})
+	return t.closeErr
+}
+
 // --- fake server for dump mode ---
 
 // wsAcceptGUID is the magic GUID appended to the client key for the

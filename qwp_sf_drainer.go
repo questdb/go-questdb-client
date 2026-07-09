@@ -387,7 +387,17 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		return
 	}
 	engine.engineSetLogger(qwpEffectiveLogger(d.logger))
-	defer func() { _ = engine.engineClose() }()
+	// Declared here so the engine-close defer (which runs after the send-loop
+	// close defer below, LIFO) can leak the segment mmaps when the send loop was
+	// abandoned wedged in disk I/O rather than unmap them under that goroutine.
+	var loop *qwpSfSendLoop
+	defer func() {
+		if loop != nil && loop.sendLoopAbandoned() {
+			_ = engine.engineCloseLeakSegments()
+		} else {
+			_ = engine.engineClose()
+		}
+	}()
 
 	target := engine.enginePublishedFsn()
 	d.targetFsn.Store(target)
@@ -463,7 +473,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		return
 	}
 	transport, boundIdx := result.Transport, result.Idx
-	loop := qwpSfNewSendLoop(engine, transport, d.clientFactory,
+	loop = qwpSfNewSendLoop(engine, transport, d.clientFactory,
 		qwpSfDefaultParkInterval,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
 	loop.logger = qwpEffectiveLogger(d.logger)

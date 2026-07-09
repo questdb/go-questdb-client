@@ -339,11 +339,13 @@ func qwpSfRunSingleRound(
 			// sweep that found nothing but rejects fails loud — replaying the
 			// handshake meets the same reject and waiting cannot fix a
 			// misconfigured path, a pre-QWP server, or an all-replica cluster.
-			// But a coexisting transient transport error means a healthy endpoint
-			// may simply be mid-restart, so keep retrying with backoff (mirrors
-			// allReplica()) rather than latching a terminal that would drop a
-			// running sender the outage was about to release (Invariant B).
-			if !outcome.SawTransportError {
+			// A coexisting transient transport error (a healthy endpoint
+			// mid-restart) or a 421 role reject (a promotable replica that may
+			// become a compatible primary) means the reject is not yet proven
+			// permanent, so keep retrying with backoff rather than latching a
+			// terminal that would drop a running sender the window was about to
+			// release (Invariant B).
+			if !outcome.SawTransportError && !outcome.SawRoleReject {
 				if pendingMismatch != nil {
 					return qwpSfSingleRoundResult{Idx: -1, Attempts: attempts, Terminal: pendingMismatch}
 				}

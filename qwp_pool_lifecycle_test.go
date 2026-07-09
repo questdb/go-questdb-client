@@ -32,6 +32,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -451,6 +452,223 @@ func TestQwpSenderPoolSfReapsToMin(t *testing.T) {
 	s, err := p.borrow(ctx)
 	if err != nil {
 		t.Fatalf("borrow after SF reap: %v", err)
+	}
+	_ = s.Close(ctx)
+}
+
+// TestQwpSenderPoolCloseWaitsForReapTeardown pins FIX 1: a reap teardown in
+// flight must be counted in close()'s outstanding wait, so close() cannot return
+// while a reaped slot is still releasing its delegate (and, in SF mode, its
+// flock). Without the fix, reap victims — removed from all+available — are
+// invisible to the wait formula and close() returns early.
+func TestQwpSenderPoolCloseWaitsForReapTeardown(t *testing.T) {
+	release := make(chan struct{})
+	var entered sync.WaitGroup
+	entered.Add(1)
+	var once sync.Once
+	reapCloseHook = func() {
+		once.Do(entered.Done)
+		<-release // hold the reap teardown in flight
+	}
+	t.Cleanup(func() { reapCloseHook = nil })
+
+	// min=0 so the single grown slot is reapable; long acquire timeout so the
+	// close-wait budget is not the thing that unblocks close().
+	p := senderPoolWithIdle(t, "", 0, 2, time.Millisecond)
+	ctx := context.Background()
+	s, err := p.borrow(ctx) // grow to 1
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	_ = s.Close(ctx) // return it → idle in available, reapable past idle_timeout
+	time.Sleep(5 * time.Millisecond)
+
+	// Kick a reap that will block in the hook with the victim already removed
+	// from all+available and its teardown in flight.
+	go p.reapIdle()
+	entered.Wait()
+
+	closeReturned := make(chan struct{})
+	go func() {
+		_ = p.close(ctx)
+		close(closeReturned)
+	}()
+
+	select {
+	case <-closeReturned:
+		close(release)
+		t.Fatal("close() returned while a reap teardown was still in flight")
+	case <-time.After(200 * time.Millisecond):
+		// Good: close() is still waiting on the counted reap teardown.
+	}
+	close(release) // let the teardown finish
+	select {
+	case <-closeReturned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("close() did not return after the reap teardown completed")
+	}
+}
+
+// TestQwpQueryPoolCloseWaitsForReapTeardown is the query-pool counterpart of
+// TestQwpSenderPoolCloseWaitsForReapTeardown (FIX 1): the query pool's close()
+// must count in-flight reap teardowns via pendingTeardowns.
+func TestQwpQueryPoolCloseWaitsForReapTeardown(t *testing.T) {
+	release := make(chan struct{})
+	var entered sync.WaitGroup
+	entered.Add(1)
+	var once sync.Once
+	queryReapCloseHook = func() {
+		once.Do(entered.Done)
+		<-release
+	}
+	t.Cleanup(func() { queryReapCloseHook = nil })
+
+	p := queryPoolWithIdle(t, 0, 2, time.Millisecond)
+	ctx := context.Background()
+	q, err := p.borrow(ctx) // grow to 1
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	_ = q.Close()
+	time.Sleep(5 * time.Millisecond)
+
+	go p.reapIdle()
+	entered.Wait()
+
+	closeReturned := make(chan struct{})
+	go func() {
+		_ = p.close(ctx)
+		close(closeReturned)
+	}()
+
+	select {
+	case <-closeReturned:
+		close(release)
+		t.Fatal("query close() returned while a reap teardown was still in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-closeReturned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("query close() did not return after the reap teardown completed")
+	}
+}
+
+// panicOnFlushDelegate is a QwpSender whose flushForReturn panics, exercising
+// the lease Close panic guard (FIX 4). Only flushForReturn is ever called on it
+// by qwpPooledSender.Close, so the embedded interface is left nil.
+type panicOnFlushDelegate struct {
+	QwpSender
+}
+
+func (panicOnFlushDelegate) flushForReturn(context.Context) (bool, error) {
+	panic("boom in flushForReturn")
+}
+
+// TestQwpPooledSenderCloseRecoversFlushPanic pins FIX 4: a panic in
+// flushForReturn during a lease Close must not skip giveBack and strand the slot
+// on-loan forever — the slot is discarded (not recycled) and returned, and Close
+// surfaces the panic as an error rather than propagating it.
+func TestQwpPooledSenderCloseRecoversFlushPanic(t *testing.T) {
+	p := senderPoolWithIdle(t, "", 1, 2, 0)
+	ctx := context.Background()
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	ps := s.(*qwpPooledSender)
+	realDelegate := ps.slot.delegate
+	// Swap in a delegate whose flushForReturn panics, then close the lease.
+	ps.slot.delegate = panicOnFlushDelegate{}
+
+	err = ps.Close(ctx)
+	if err == nil {
+		t.Fatal("Close returned nil; want the recovered panic surfaced as an error")
+	}
+	if !strings.Contains(err.Error(), "panicked") {
+		t.Errorf("Close error = %v, want a panic-surfaced error", err)
+	}
+	// The slot must have been given back (broken → discarded), not stranded
+	// on-loan: total drops to 0 and the index (memory mode: none) is freed.
+	if total, _, _ := p.poolSnapshot(); total != 0 {
+		t.Errorf("slot stranded on-loan after flush panic: total=%d, want 0", total)
+	}
+	// Restore the real delegate so the pool's Cleanup close tears it down.
+	_ = closeSlotGuarded(context.Background(), realDelegate)
+}
+
+// TestQwpSenderPoolGrowthBorrowBoundedByAcquireDeadline pins FIX 5: a growth
+// build that outruns the acquire deadline is abandoned — borrow returns the
+// timeout instead of blocking on the build — and the late-completing slot is
+// handed back to the pool through settleGrowthBuild (landing in available), with
+// inFlightCreations kept exact across the whole episode.
+func TestQwpSenderPoolGrowthBorrowBoundedByAcquireDeadline(t *testing.T) {
+	release := make(chan struct{})
+	var entered sync.WaitGroup
+	entered.Add(1)
+	var once sync.Once
+	createSlotHook = func() {
+		once.Do(entered.Done)
+		<-release // wedge the build past the acquire deadline
+	}
+	t.Cleanup(func() { createSlotHook = nil })
+
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";"
+	// min=0 so the borrow must grow; short acquire timeout so the wedged build
+	// is abandoned quickly.
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		100*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	t.Cleanup(func() { p.close(context.Background()) })
+	ctx := context.Background()
+
+	start := time.Now()
+	_, err = p.borrow(ctx)
+	elapsed := time.Since(start)
+	entered.Wait() // the build is now wedged in the hook
+	if !errors.Is(err, errPoolExhausted) {
+		close(release)
+		t.Fatalf("borrow err=%v, want errPoolExhausted (abandoned at the deadline)", err)
+	}
+	if elapsed > time.Second {
+		close(release)
+		t.Fatalf("borrow blocked %s past the 100ms acquire timeout on the wedged build", elapsed)
+	}
+
+	// The abandoned build stays counted in inFlightCreations until it completes.
+	p.mu.Lock()
+	inFlight := p.inFlightCreations
+	p.mu.Unlock()
+	if inFlight != 1 {
+		t.Errorf("inFlightCreations=%d while the abandoned build is in flight, want 1", inFlight)
+	}
+
+	// Let the build finish; settleGrowthBuild hands the slot to available and
+	// decrements inFlightCreations.
+	close(release)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		total, avail, _ := p.poolSnapshot()
+		p.mu.Lock()
+		inFlight := p.inFlightCreations
+		p.mu.Unlock()
+		if total == 1 && avail == 1 && inFlight == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("late build never settled: total=%d avail=%d inFlight=%d, want 1/1/0", total, avail, inFlight)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The settled slot is usable.
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow the settled slot: %v", err)
 	}
 	_ = s.Close(ctx)
 }

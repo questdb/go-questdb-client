@@ -48,6 +48,12 @@ type qwpSfTestServerOpts struct {
 	// closeAfterFrames > 0 → close the connection after receiving N
 	// total frames (across reconnects). Used to exercise reconnect.
 	closeAfterFrames int
+	// closeReasonAfterFrames, when non-empty, makes the closeAfterFrames
+	// drop an orderly StatusNormalClosure carrying this reason text
+	// instead of a bare RST. Models a peer whose close reason contains an
+	// auth-sniff substring ("forbidden", "401", ...) that must NOT be
+	// misclassified as a terminal reject on a running sender.
+	closeReasonAfterFrames string
 	// rejectStatus, when non-zero, causes the server to respond
 	// with an error ACK carrying the given status. Used to exercise
 	// terminal-server-error.
@@ -254,6 +260,9 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			if opts.closeAfterFrames > 0 &&
 				myConnID == 1 &&
 				localFramesReceived >= opts.closeAfterFrames {
+				if opts.closeReasonAfterFrames != "" {
+					_ = conn.Close(websocket.StatusNormalClosure, opts.closeReasonAfterFrames)
+				}
 				return
 			}
 			// silentDropAfterFrames applies to EVERY connection: read N
@@ -574,6 +583,47 @@ func TestQwpSfSendLoopReconnectAfterServerClose(t *testing.T) {
 	// selects disk-backed segments under that slot directory.
 	t.Run("memory", func(t *testing.T) { testQwpSfSendLoopReconnectAfterServerClose(t, "") })
 	t.Run("disk", func(t *testing.T) { testQwpSfSendLoopReconnectAfterServerClose(t, t.TempDir()) })
+}
+
+// TestQwpSfSendLoopCloseReasonNotTerminal pins that a peer close whose reason
+// text contains an auth-sniff substring ("forbidden") does not latch a terminal
+// on a running sender: close codes carry no policy semantics, so the sender must
+// reconnect and drain rather than die on peer-controlled text.
+func TestQwpSfSendLoopCloseReasonNotTerminal(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		closeAfterFrames:       5,
+		closeReasonAfterFrames: "writes forbidden: node demoted to replica",
+	})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Second, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	// Warm-up so lifetime totalAcks > 0 before the drop (see the reconnect test).
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("warm-up"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return loop.sendLoopTotalAcks() >= 1
+	}, time.Second, time.Millisecond)
+
+	for i := 0; i < 10; i++ {
+		_, err := engine.engineAppendBlocking(context.Background(), []byte(fmt.Sprintf("f-%d", i)))
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= 10
+	}, 5*time.Second, time.Millisecond, "sender did not reconnect+drain after close-reason")
+	require.NoError(t, loop.sendLoopCheckError(),
+		"a close-reason substring must not latch a terminal on a running sender")
 }
 
 func testQwpSfSendLoopReconnectAfterServerClose(t *testing.T, sfDir string) {

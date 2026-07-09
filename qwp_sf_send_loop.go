@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -52,6 +53,12 @@ const (
 	// sender, so the Go port parks 1ms. Parity of the constant is not
 	// parity of cost.
 	qwpSfDefaultParkInterval = 1 * time.Millisecond
+	// qwpSfSentDictWarnBytes is the sent-dict mirror size past which the loop
+	// logs a one-time high-cardinality-symbol warning. The whole dictionary is
+	// re-registered on every reconnect, so an unbounded symbol space (a UUID
+	// used as a symbol) grows this without bound; the threshold is generous so
+	// legitimate high-cardinality use does not trip it.
+	qwpSfSentDictWarnBytes = 1 << 28
 	// qwpSfDefaultReconnectMaxDuration bounds ONLY the blocking sync
 	// initial connect (qwpSfConnectWithRetry). The running loop, async
 	// initial connect, and drainers retry unbounded (Invariant B). It
@@ -63,6 +70,13 @@ const (
 	qwpSfDefaultReconnectInitialBackoff = 100 * time.Millisecond
 	qwpSfDefaultReconnectMaxBackoff     = 5 * time.Second
 	qwpDurableAckKeepaliveDefault       = 200 * time.Millisecond
+	// qwpSfDurableAckPingTimeout bounds the keepalive ping's pong wait. It is
+	// decoupled from the keepalive cadence: deriving it from a short interval
+	// would cancel a legitimate ping write mid-flight, which coder/websocket
+	// turns into a connection close — a spurious reconnect. A healthy pong
+	// returns in well under this; only a genuinely half-open connection waits
+	// the full timeout.
+	qwpSfDurableAckPingTimeout = 1 * time.Second
 	// qwpSfReconnectWarnThrottle rate-limits the running loop's outage
 	// WARN lines: a failover window can last minutes and is retried
 	// indefinitely, so per-attempt logging would flood.
@@ -267,6 +281,9 @@ type qwpSfSendLoop struct {
 	// recovered slot's persisted dictionary.
 	sentDictBytes []byte
 	sentDictCount int
+	// dictSizeWarned is set once the sent-dict mirror crosses the size warning
+	// threshold, so the high-cardinality-symbol diagnostic logs at most once.
+	dictSizeWarned bool
 	// catchUpBuf is a reusable scratch buffer for building catch-up frames;
 	// sendMessage copies synchronously, so it is safe to reuse across chunks.
 	catchUpBuf []byte
@@ -274,6 +291,11 @@ type qwpSfSendLoop struct {
 	// running gates the outer reconnect loop. close() flips it to
 	// false; inner goroutines observe it via ctx.Done.
 	running atomic.Bool
+
+	// abandoned is set when sendLoopClose gives up waiting for an I/O
+	// goroutine wedged in un-cancellable disk I/O. The engine teardown must
+	// then leak the segment mmaps rather than unmap them under that goroutine.
+	abandoned atomic.Bool
 
 	// ctx is the loop's master context; cancel() forces both
 	// inner goroutines out of any blocking transport calls.
@@ -694,13 +716,23 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 		// remaining resources below cannot race the wire loop.
 	case <-timer.C:
 		// Wedged in I/O the ctx cannot reach (a disk-backed segment mmap
-		// page-fault on hung storage). Abandon rather than hang Close: the
-		// goroutine lives until its syscall returns and releases the transport
-		// via its own defer, so we must NOT swap the transport out. The
-		// dispatchers are still safe to close — offer() on a closed dispatcher is
-		// a no-op — which bounds the leak to the single wedged goroutine.
+		// page-fault on hung storage). Abandon rather than hang Close. The
+		// engine teardown must now leak the segment mmaps: unmapping them under
+		// the wedged goroutine, which is mid-dereference of the mapping, would
+		// fault the host process when storage resolves.
+		l.abandoned.Store(true)
 		qwpEffectiveLogger(l.logger).Warn("qwp/sf: send loop still running after close; "+
 			"abandoning (wedged in un-cancellable disk I/O)", "grace", qwpSfSendLoopCloseGrace)
+		// Release the WebSocket now rather than waiting on the wedged
+		// goroutine's defer (which may never run): the goroutine holds its own
+		// local transport reference, so swapping the atomic cannot strand it,
+		// and closeNow avoids the graceful-close handshake blocking on a dead
+		// peer. This reclaims the fd and the server-side connection.
+		if t := l.transport.Swap(nil); t != nil {
+			_ = t.closeNow()
+		}
+		// Dispatchers are safe to close on this path — offer() on a closed
+		// dispatcher is a no-op — which bounds the leak to the wedged goroutine.
 		l.closeDispatchers()
 		return l.checkErrorOrNil()
 	}
@@ -709,6 +741,13 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 	}
 	l.closeDispatchers()
 	return l.checkErrorOrNil()
+}
+
+// sendLoopAbandoned reports whether sendLoopClose gave up on a wedged I/O
+// goroutine. When true the engine must be torn down with engineCloseLeakSegments
+// so the still-live goroutine's mmap references stay valid.
+func (l *qwpSfSendLoop) sendLoopAbandoned() bool {
+	return l.abandoned.Load()
 }
 
 // closeDispatchers stops the error, connection, and progress dispatcher
@@ -1043,9 +1082,12 @@ func (l *qwpSfSendLoop) run() {
 		// Already-terminal SenderErrors come back here from
 		// receiverLoop's classify branch — route them through
 		// recordFatalServerError (idempotent) so the typed payload is
-		// preserved end-to-end.
+		// preserved end-to-end. The connection is going down for good, so
+		// announce the disconnect the taxonomy promises for a terminal halt
+		// (the emit-then-return terminal paths below never reach this branch).
 		var alreadyTyped *SenderError
 		if errors.As(err, &alreadyTyped) {
+			l.emitConn(SenderDisconnected, l.previousIdx, -1, 0, err)
 			l.recordFatalServerError(alreadyTyped)
 			return
 		}
@@ -1064,7 +1106,14 @@ func (l *qwpSfSendLoop) run() {
 		var retriable *qwpSfRetriableRejection
 		rejectionRecycle := errors.As(err, &retriable)
 		if !rejectionRecycle {
-			if qwpSfIsTerminalUpgradeError(err) {
+			// A WebSocket close embeds the peer's free-form reason text, which
+			// the upgrade sniff's substring fallback ("forbidden", "got 401",
+			// ...) would misread as a terminal auth reject. Close codes carry no
+			// policy semantics — every close is reconnect-eligible — so skip the
+			// sniff for a close and let the poison/close analysis below handle
+			// it. A genuine upgrade reject arrives typed (via the reconnect
+			// walk), never as a close.
+			if websocket.CloseStatus(err) == -1 && qwpSfIsTerminalUpgradeError(err) {
 				se := l.qwpSfBuildUpgradeFailureSE(err)
 				l.totalServerErrors.Add(1)
 				l.recordFatalServerError(se)
@@ -1271,9 +1320,9 @@ func drainResetTimer(t *time.Timer, d time.Duration) {
 
 // sendDurableKeepalive pings the server iff there are pending durable batches, to
 // elicit their STATUS_DURABLE_ACK frames. The outbound ping frame is what
-// matters (it is the server's recv event); the pong wait is truncated to a
-// quarter interval so an idle→active transition doesn't stall the send
-// goroutine behind a slow echo.
+// matters (it is the server's recv event); the pong wait is bounded by a fixed
+// timeout decoupled from the cadence so a short keepalive interval cannot cancel
+// the ping write mid-flight and trip a spurious reconnect.
 func (l *qwpSfSendLoop) sendDurableKeepalive(ctx context.Context) {
 	if !l.durable.hasPending() {
 		return
@@ -1282,7 +1331,7 @@ func (l *qwpSfSendLoop) sendDurableKeepalive(ctx context.Context) {
 	if tr == nil {
 		return
 	}
-	pctx, cancel := context.WithTimeout(ctx, l.durableKeepaliveInterval/4)
+	pctx, cancel := context.WithTimeout(ctx, qwpSfDurableAckPingTimeout)
 	defer cancel()
 	_ = tr.ping(pctx)
 }
@@ -1333,17 +1382,28 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 		return false, errors.New("qwp/sf: transport gone mid-loop")
 	}
 	payload := base[l.sendOffset+qwpSfFrameHeaderSize : frameEnd]
-	if l.deltaDictEnabled {
-		// Torn-dictionary guard. A delta frame's start id normally never
-		// exceeds the dictionary coverage established so far (replayed frames
-		// overlap the catch-up dict; fresh frames extend it contiguously). A
-		// gap means the persisted dictionary was torn — almost always by a
-		// host/power crash that kept the segment frames but lost recently
-		// written dictionary entries. Sending would corrupt the table (the
-		// server null-pads the missing ids), so fail terminally; the
-		// unreplayable data must be resent.
-		if start := qwpFrameDeltaStart(payload); start > l.sentDictCount {
-			return false, l.qwpSfBuildTornDictSE(start, l.sentDictCount)
+	// Torn-dictionary guard, run unconditionally (delta mode AND full-dict
+	// fallback). A frame is consistent with the coverage established so far only
+	// when its delta range extends the mirror from its exact tip (a fresh frame)
+	// or lies wholly within it (a replayed frame). A gap (start past the tip) or
+	// a partial overlap (starts inside but runs past the tip) means the persisted
+	// dictionary was torn from its frames — a host/power crash, or a recovered
+	// slot whose dictionary could not be trusted and was dropped. Sending would
+	// corrupt the table (the server null-pads the missing ids), so fail
+	// terminally; the unreplayable data must be resent. In full-dict fallback the
+	// mirror stays empty (count 0) and self-sufficient frames carry start 0, so
+	// they pass while any residual delta frame fails loudly.
+	if start, count, ok := qwpFrameDeltaRange(payload); ok {
+		if start != l.sentDictCount && start+count > l.sentDictCount {
+			// Count, latch, and dispatch at the origin, mirroring every other
+			// terminal-SE site: run()'s alreadyTyped branch only re-latches
+			// (idempotent), so without this a WithErrorHandler user and
+			// TotalServerErrors never learn the sender died on a torn dictionary.
+			se := l.qwpSfBuildTornDictSE(start, l.sentDictCount)
+			l.totalServerErrors.Add(1)
+			l.recordFatalServerError(se)
+			l.dispatcher.Load().offer(se)
+			return false, se
 		}
 	}
 	// wireSeq/fsnSent for this frame derive from nextWireSeq, which
@@ -2272,6 +2332,13 @@ func (l *qwpSfSendLoop) accumulateSentDict(payload []byte) {
 	}
 	l.sentDictBytes = append(l.sentDictBytes, symbols...)
 	l.sentDictCount += deltaCount
+	if !l.dictSizeWarned && len(l.sentDictBytes) >= qwpSfSentDictWarnBytes {
+		l.dictSizeWarned = true
+		qwpEffectiveLogger(l.logger).Warn("qwp/sf: symbol dictionary is very large; "+
+			"the whole dictionary is re-registered on every reconnect — check for "+
+			"unbounded-cardinality symbol values (e.g. a UUID used as a symbol)",
+			"bytes", len(l.sentDictBytes), "symbols", l.sentDictCount)
+	}
 }
 
 // seedSentDictFromPersisted seeds the mirror from a recovered slot's persisted
@@ -2288,6 +2355,10 @@ func (l *qwpSfSendLoop) seedSentDictFromPersisted(pd *qwpSfSymbolDict) {
 		l.sentDictBytes = append(l.sentDictBytes, name...)
 	}
 	l.sentDictCount = len(symbols)
+	// The mirror seed is the second and last consumer of the recovered entries
+	// (the producer's global dictionary seeded first, at construction), so the
+	// copy can be dropped now.
+	pd.releaseLoaded()
 }
 
 // qwpSfBuildTornDictSE builds the terminal PROTOCOL_VIOLATION surfaced when a
@@ -2304,7 +2375,7 @@ func (l *qwpSfSendLoop) qwpSfBuildTornDictSE(deltaStart, dictSize int) *SenderEr
 		AppliedPolicy:    PolicyTerminal,
 		ServerStatusByte: NoStatusByte,
 		ServerMessage: fmt.Sprintf("recovered store-and-forward symbol dictionary is incomplete "+
-			"(likely a host crash): frame delta start %d exceeds recovered dictionary size %d; "+
+			"(likely a host crash): frame delta start %d is inconsistent with recovered dictionary size %d; "+
 			"cannot replay without corrupting data — resend required", deltaStart, dictSize),
 		FromFsn:    from,
 		ToFsn:      to,
@@ -2320,17 +2391,24 @@ func qwpIsDeltaFrame(msg []byte) bool {
 		msg[qwpHeaderOffsetFlags]&qwpFlagDeltaSymbolDict != 0
 }
 
-// qwpFrameDeltaStart returns a QWP message's symbol-dict delta start id, or -1
-// when it carries no delta section (used by the torn-dict guard).
-func qwpFrameDeltaStart(msg []byte) int {
+// qwpFrameDeltaRange returns a QWP message's symbol-dict delta range as
+// [start, start+count). ok is false for a non-delta or malformed frame, or for
+// implausibly large values (a corrupt length prefix) — the torn-dict guard then
+// skips the frame, the same as a non-delta frame. Bounding both varints below
+// MaxInt32 keeps start+count from overflowing int and negative.
+func qwpFrameDeltaRange(msg []byte) (start, count int, ok bool) {
 	if !qwpIsDeltaFrame(msg) {
-		return -1
+		return 0, 0, false
 	}
-	start, _, err := qwpReadVarint(msg[qwpHeaderSize:])
-	if err != nil {
-		return -1
+	s, n, err := qwpReadVarint(msg[qwpHeaderSize:])
+	if err != nil || s > math.MaxInt32 {
+		return 0, 0, false
 	}
-	return int(start)
+	c, _, err := qwpReadVarint(msg[qwpHeaderSize+n:])
+	if err != nil || c > math.MaxInt32 {
+		return 0, 0, false
+	}
+	return int(s), int(c), true
 }
 
 // qwpParseDeltaDict returns a QWP message's delta section — the start id, the
@@ -2354,7 +2432,7 @@ func qwpParseDeltaDict(msg []byte) (deltaStart, deltaCount int, symbols []byte, 
 	region := p
 	for i := uint64(0); i < count; i++ {
 		el, m, verr := qwpReadVarint(msg[p:])
-		if verr != nil {
+		if verr != nil || el > uint64(len(msg)) {
 			return 0, 0, nil, false
 		}
 		p += m + int(el)

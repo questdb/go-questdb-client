@@ -257,11 +257,14 @@ func TestNonHttpSchemasNotSupported(t *testing.T) {
 // programmatic option path is rejected on a non-QWP transport — matching the
 // connect-string branch and the Java client, which throws rather than silently
 // dropping a durability request. Rejection is at config validation, pre-dial.
+// Like the connect-string key, the disabling form is rejected too.
 func TestNewLineSenderRejectsDurableAckOnNonQwp(t *testing.T) {
-	_, err := qdb.NewLineSender(context.Background(), qdb.WithTcp(),
-		qdb.WithAddress("localhost:9009"), qdb.WithRequestDurableAck(true))
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "request_durable_ack")
+	for _, enabled := range []bool{true, false} {
+		_, err := qdb.NewLineSender(context.Background(), qdb.WithTcp(),
+			qdb.WithAddress("localhost:9009"), qdb.WithRequestDurableAck(enabled))
+		require.Error(t, err, "enabled=%v", enabled)
+		assert.ErrorContains(t, err, "request_durable_ack")
+	}
 }
 
 func TestPoolFromOptionsRejectsQwp(t *testing.T) {
@@ -284,6 +287,7 @@ func TestPoolFromOptionsRejectsQwpOnlyOptions(t *testing.T) {
 		{"WithSfDir", qdb.WithSfDir(t.TempDir())},
 		{"WithDrainOrphans", qdb.WithDrainOrphans(true)},
 		{"WithRequestDurableAck", qdb.WithRequestDurableAck(true)},
+		{"WithRequestDurableAckFalse", qdb.WithRequestDurableAck(false)},
 		{"WithDurableAckKeepaliveInterval", qdb.WithDurableAckKeepaliveInterval(time.Second)},
 		{"WithProgressHandler", qdb.WithProgressHandler(func(int64) {})},
 		{"WithBackgroundDrainerListener", qdb.WithBackgroundDrainerListener(qdb.QwpBackgroundDrainerListener{

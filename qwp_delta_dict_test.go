@@ -279,7 +279,10 @@ func TestQwpDeltaDictParseHelpers(t *testing.T) {
 	binary.LittleEndian.PutUint32(buf[qwpHeaderOffsetPayloadLen:qwpHeaderOffsetPayloadLen+4],
 		uint32(len(buf)-qwpHeaderSize))
 
-	require.Equal(t, 2, qwpFrameDeltaStart(buf))
+	rStart, rCount, rOk := qwpFrameDeltaRange(buf)
+	require.True(t, rOk)
+	require.Equal(t, 2, rStart)
+	require.Equal(t, 2, rCount)
 	start, count, symbols, ok := qwpParseDeltaDict(buf)
 	require.True(t, ok)
 	require.Equal(t, 2, start)
@@ -288,9 +291,11 @@ func TestQwpDeltaDictParseHelpers(t *testing.T) {
 
 	nodelta := append([]byte(nil), buf...)
 	nodelta[qwpHeaderOffsetFlags] = 0
-	require.Equal(t, -1, qwpFrameDeltaStart(nodelta))
+	_, _, rOk = qwpFrameDeltaRange(nodelta)
+	require.False(t, rOk)
 	_, _, _, ok = qwpParseDeltaDict(nodelta)
 	require.False(t, ok)
 
-	require.Equal(t, -1, qwpFrameDeltaStart([]byte{1, 2, 3}))
+	_, _, rOk = qwpFrameDeltaRange([]byte{1, 2, 3})
+	require.False(t, rOk)
 }

@@ -25,27 +25,24 @@
 // Package questdb provides the QuestDB ingestion clients.
 //
 // SenderError is the QWP cursor-SF server-error payload. It surfaces in
-// two ways:
+// two ways. Asynchronously, to a registered SenderErrorHandler:
 //
-//  1. Asynchronously, to a registered SenderErrorHandler:
+//	opts := []questdb.LineSenderOption{
+//		questdb.WithQwp(),
+//		questdb.WithErrorHandler(func(e *questdb.SenderError) {
+//			log.Printf("server rejected FSN [%d,%d]: %v", e.FromFsn, e.ToFsn, e)
+//		}),
+//	}
 //
-//     opts := []questdb.LineSenderOption{
-//     questdb.WithQwp(),
-//     questdb.WithErrorHandler(func(e *questdb.SenderError) {
-//     log.Printf("dead-lettering FSN [%d,%d]: %v", e.FromFsn, e.ToFsn, e)
-//     // ... persist e for replay or alerting ...
-//     }),
-//     }
+// And synchronously, on the next producer-thread API call after a
+// terminal rejection has been latched:
 //
-//  2. Synchronously, on the next producer-thread API call after a
-//     terminal rejection has been latched:
-//
-//     if err := s.Flush(ctx); err != nil {
-//     var se *questdb.SenderError
-//     if errors.As(err, &se) {
-//     // unpack se.Category, se.ServerMessage, se.FromFsn, ...
-//     }
-//     }
+//	if err := s.Flush(ctx); err != nil {
+//		var se *questdb.SenderError
+//		if errors.As(err, &se) {
+//			// unpack se.Category, se.ServerMessage, se.FromFsn, ...
+//		}
+//	}
 //
 // Both paths deliver the same payload. The producer-side typed error is
 // the FSN's-eye-view of "what was rejected"; the async handler carries
@@ -60,9 +57,10 @@ import (
 
 // Category classifies a QWP server-side rejection. Categories align 1:1
 // with stable wire status bytes (SchemaMismatch / ParseError /
-// InternalError / SecurityError / WriteError) plus ProtocolViolation
-// (WebSocket close-frame violations) and Unknown (forward-compat for
-// new server status bytes).
+// InternalError / SecurityError / WriteError / NotWritable) plus
+// ProtocolViolation (client-latched, no wire status byte: poison-frame
+// escalation, 404/426 upgrade rejection, durable-ack capability
+// mismatch) and Unknown (forward-compat for new server status bytes).
 type Category byte
 
 const (

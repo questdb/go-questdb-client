@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -321,4 +322,69 @@ func TestQuestDBHousekeeperReaps(t *testing.T) {
 	}
 	total, _, _ := db.senderPool.poolSnapshot()
 	t.Errorf("housekeeper did not reap to min: total=%d", total)
+}
+
+// TestQuestDBSchemaGate pins FIX 6: the facade must accept every schema both
+// conf parsers accept — ws, wss, and the qwpws/qwpwss long forms — and still
+// reject non-ws schemas. lazy_connect keeps the build non-blocking on the
+// down address so only the schema gate is exercised.
+func TestQuestDBSchemaGate(t *testing.T) {
+	ctx := context.Background()
+	for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+		conf := schema + "::addr=127.0.0.1:1;lazy_connect=true;"
+		if strings.HasSuffix(schema, "wss") || schema == "wss" {
+			// The wss/qwpwss TLS dial to a down host must not block the build;
+			// unsafe_off skips cert verification so lazy_connect stays non-blocking.
+			conf += "tls_verify=unsafe_off;"
+		}
+		db, err := NewQuestDB(ctx, conf, noopConnListener())
+		if err != nil {
+			t.Errorf("schema %q rejected by the facade gate: %v", schema, err)
+			continue
+		}
+		db.Close(ctx)
+	}
+	for _, schema := range []string{"http", "https", "tcp", "tcps"} {
+		if _, err := NewQuestDB(ctx, schema+"::addr=127.0.0.1:1;", noopConnListener()); err == nil {
+			t.Errorf("schema %q accepted by the facade gate, want rejection", schema)
+		}
+	}
+}
+
+// TestQuestDBExportedErrorSentinels pins FIX 2: the pool/lease error sentinels
+// are exported and errors.Is-matchable so facade callers can branch on them. The
+// exported names alias the same values the internal call sites return.
+func TestQuestDBExportedErrorSentinels(t *testing.T) {
+	pairs := []struct {
+		exported, internal error
+	}{
+		{ErrPoolClosed, errPoolClosed},
+		{ErrSenderPoolExhausted, errPoolExhausted},
+		{ErrStaleLease, errStaleLease},
+		{ErrQueryPoolExhausted, errQueryPoolExhausted},
+		{ErrQueryLeaseUnusable, errQueryLeaseUnusable},
+		{ErrQueryDesynced, errExecDesynced},
+	}
+	for _, p := range pairs {
+		if !errors.Is(p.internal, p.exported) {
+			t.Errorf("errors.Is(%v, exported) = false; exported sentinel must alias the internal one", p.internal)
+		}
+	}
+
+	// End-to-end: a borrow on a closed sender pool surfaces ErrPoolClosed, and a
+	// stale lease surfaces ErrStaleLease.
+	ctx := context.Background()
+	p := senderPoolWithIdle(t, "", 1, 2, 0)
+	s, err := p.borrow(ctx)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	_ = s.Close(ctx) // returns the lease → stale
+	if err := s.Flush(ctx); !errors.Is(err, ErrStaleLease) {
+		t.Errorf("stale lease Flush err=%v, want ErrStaleLease", err)
+	}
+	_ = p.close(ctx)
+	if _, err := p.borrow(ctx); !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("borrow after close err=%v, want ErrPoolClosed", err)
+	}
 }

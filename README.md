@@ -430,14 +430,14 @@ if err := sender.Flush(ctx); err != nil {
 Nothing is ever silently dropped. Each `Category` resolves to a `Policy`:
 
 - `RETRIABLE` / `RETRIABLE_OTHER` — recycle the connection and replay from the
-  store-and-forward log; the rejected bytes stay on disk and the producer keeps
-  writing. Dispatch to the handler is informational. `RETRIABLE_OTHER`
-  (`NOT_WRITABLE`) additionally rotates to the next endpoint. A frame rejected
-  repeatedly with no ack progress escalates to `TERMINAL` via the poison-frame
-  detector (`max_frame_rejections`, default 4).
+  local buffer (in RAM for memory mode, on disk when `sf_dir` is set); nothing
+  is dropped and the producer keeps writing. Dispatch to the handler is
+  informational. `RETRIABLE_OTHER` (`NOT_WRITABLE`) additionally rotates to the
+  next endpoint. A frame rejected repeatedly with no ack progress escalates to
+  `TERMINAL` via the poison-frame detector (`max_frame_rejections`, default 4).
 - `TERMINAL` — latch the error; the next producer call returns it and the sender
-  stops draining until you close and rebuild it. The rejected bytes remain on
-  disk.
+  stops draining until you close and rebuild it. The rejected bytes remain in
+  the local buffer (on disk when `sf_dir` is set).
 
 Resolution precedence, highest first: `WithErrorPolicyResolver` →
 `WithErrorPolicy(category, policy)` → connect-string `on_<category>_error` →

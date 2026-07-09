@@ -535,7 +535,12 @@ func (s *qwpLineSender) persistNewSymbols() error {
 	if s.persistedSymbolDict == nil {
 		return nil
 	}
-	from := s.maxSentSymbolId + 1
+	// Start from what is actually on disk, not maxSentSymbolId: an append that
+	// succeeds while the following engine append fails leaves maxSentSymbolId
+	// behind the persisted count, and re-deriving the range from it would
+	// re-append the same symbols. Entry position is the symbol id, so duplicates
+	// would misalign every later id on recovery.
+	from := s.persistedSymbolDict.size()
 	to := s.batchMaxSymbolId
 	if to < from {
 		return nil
@@ -955,9 +960,17 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopClose(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	// Close the engine (closes ring, manager if owned, and slot lock).
-	if err := s.cursorEngine.engineClose(); err != nil && firstErr == nil {
-		firstErr = err
+	// Close the engine (closes ring, manager if owned, and slot lock). If the
+	// send loop was abandoned wedged in disk I/O, leak the segment mmaps rather
+	// than unmap them under the still-live goroutine.
+	var engineCloseErr error
+	if s.cursorSendLoop.sendLoopAbandoned() {
+		engineCloseErr = s.cursorEngine.engineCloseLeakSegments()
+	} else {
+		engineCloseErr = s.cursorEngine.engineClose()
+	}
+	if engineCloseErr != nil && firstErr == nil {
+		firstErr = engineCloseErr
 	}
 	// Stop the drainer pool last — drainers may still be using the
 	// reconnect factory (which captures the foreground's address +

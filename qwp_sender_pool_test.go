@@ -616,6 +616,13 @@ func TestQwpSenderPoolInRangeFence(t *testing.T) {
 		"other-0":     false, // foreign — drainable
 		"defaultx-0":  false, // not the base prefix
 		"default-abc": false, // non-numeric
+		// Non-canonical numeric suffixes: the pool only ever mints canonical
+		// strconv.Itoa names, so a foreign dir with a leading zero or sign must
+		// stay drainable, not be fenced by Atoi's tolerance (FIX 7 / Hazard G).
+		"default-00":  false,
+		"default-007": false,
+		"default-+1":  false,
+		"default--1":  false,
 	}
 	for name, want := range cases {
 		if got := p.inRangeFence(name); got != want {

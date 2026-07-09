@@ -44,6 +44,14 @@ const (
 	qwpDefaultHousekeeperInterval = 5 * time.Second
 )
 
+// ErrQueryDesynced is returned by a Query lease's Query / Exec (surfaced from a
+// cursor's first Batches yield for Query) when the leased connection's
+// single-stream wire was left desynced by an abandoned statement drain. The
+// lease's Close evicts such a worker; the caller should close the lease and
+// borrow a fresh one. Match it with errors.Is. It is the exported name for the
+// query client's internal desync sentinel; the two are the same error value.
+var ErrQueryDesynced = errExecDesynced
+
 // QuestDB is a high-level handle to a QuestDB cluster reached over QWP for both
 // ingest and query. It owns elastic connection pools for both directions; one
 // ws/wss config string (one addr server list) drives the whole cluster.
@@ -236,7 +244,12 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	if err != nil {
 		return nil, err
 	}
-	if cs.Schema != "ws" && cs.Schema != "wss" {
+	// Accept the qwpws/qwpwss long forms too: both conf parsers the facade
+	// invokes below treat them as aliases for ws/wss, so the gate must not
+	// reject a string those parsers (and the standalone clients) accept.
+	switch cs.Schema {
+	case "ws", "wss", "qwpws", "qwpwss":
+	default:
 		return nil, fmt.Errorf("qwp facade: configuration must use the ws or wss schema, got %q", cs.Schema)
 	}
 	kv := cs.KeyValuePairs

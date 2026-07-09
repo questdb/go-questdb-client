@@ -426,6 +426,7 @@ type lineSenderConfig struct {
 	// STATUS_DURABLE_ACK frames (WAL data uploaded to object storage) instead of
 	// the ordinary OK ACK (WAL commit).
 	requestDurableAck            bool
+	requestDurableAckSet         bool // set on any WithRequestDurableAck call, even false — trips the QWP-only gate
 	durableAckKeepaliveMillis    int  // paces the durable keepalive ping; <= 0 disables
 	durableAckKeepaliveMillisSet bool // distinguishes "unset" (-> default) from an explicit 0/negative
 
@@ -816,9 +817,13 @@ func WithInitialConnectMode(mode InitialConnectMode) LineSenderOption {
 // WithCloseFlushTimeout bounds Close()'s wait for the cursor
 // engine's ackedFsn to catch up to publishedFsn. A zero or
 // negative duration skips the drain entirely (fast close).
-// Defaults to 5 seconds.
+// Defaults to 5 seconds. Applies in both memory and
+// store-and-forward modes: rows still unacked when the timeout
+// expires may be lost (memory mode) or left on disk for replay
+// (sf_dir set). Equivalent to the connect-string
+// close_flush_timeout_millis key.
 //
-// Only meaningful for the QWP sender in cursor mode (sf_dir set).
+// Only available for the QWP sender.
 func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.closeFlushTimeoutSet = true
@@ -888,9 +893,9 @@ func WithConnectTimeout(d time.Duration) LineSenderOption {
 // WithRequestDurableAck opts in to Enterprise durable acknowledgement: the sender
 // trims store-and-forward data, replays, and reports AckedFsn on the server's
 // STATUS_DURABLE_ACK (WAL uploaded to object storage) rather than the ordinary OK
-// ACK (WAL commit). QWP-only; the bound endpoint must be a replication primary
-// advertising durable-ack, otherwise the connect fails terminally with a
-// *SenderError of category PROTOCOL_VIOLATION. Equivalent to the connect-string
+// ACK (WAL commit). The bound endpoint must be a replication primary advertising
+// durable-ack, otherwise the connect fails terminally with a *SenderError of
+// category PROTOCOL_VIOLATION. Equivalent to the connect-string
 // request_durable_ack key.
 //
 // Because only a durable ack advances the watermark, a healthy connection whose
@@ -899,19 +904,30 @@ func WithConnectTimeout(d time.Duration) LineSenderOption {
 // continues, but AwaitAckedFsn blocks until its context and Close waits up to
 // close_flush_timeout before returning the "data may be lost" drain timeout. This
 // is fail-slow by design; do not treat a stalled AckedFsn as a client fault.
+//
+// Only available for the QWP sender: any call, even
+// WithRequestDurableAck(false), fails construction on other transports —
+// matching the connect-string key.
 func WithRequestDurableAck(enabled bool) LineSenderOption {
-	return func(s *lineSenderConfig) { s.requestDurableAck = enabled }
+	return func(s *lineSenderConfig) {
+		s.requestDurableAck = enabled
+		s.requestDurableAckSet = true
+	}
 }
 
 // WithDurableAckKeepaliveInterval paces the keepalive ping a durable-ack sender
 // sends to prod an idle server into flushing pending STATUS_DURABLE_ACK frames. A
-// zero or negative duration disables it. Inert unless WithRequestDurableAck(true);
-// default 200ms. Equivalent to the durable_ack_keepalive_interval_millis key.
+// zero or negative duration disables it; default 200ms. Takes effect only under
+// WithRequestDurableAck(true). Equivalent to the
+// durable_ack_keepalive_interval_millis key.
 //
 // Disabling the keepalive is not recommended on an idle producer: the server
 // only flushes durable acks on inbound events, so a quiescent last frame may
 // have no ack to advance AckedFsn, leaving AwaitAckedFsn blocked (and Close's
 // drain wait reporting a spurious "data may be lost") until the next flush.
+//
+// Only available for the QWP sender: any call, even a disabling one, fails
+// construction on other transports.
 func WithDurableAckKeepaliveInterval(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		ms := int(d / time.Millisecond)
@@ -1682,7 +1698,7 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "max_background_drainers"
 	case conf.maxFrameRejections != 0:
 		name = "max_frame_rejections"
-	case conf.requestDurableAck:
+	case conf.requestDurableAckSet:
 		name = "request_durable_ack"
 	case conf.durableAckKeepaliveMillisSet:
 		name = "durable_ack_keepalive_interval_millis"

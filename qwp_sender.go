@@ -570,6 +570,10 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		s.lastErr = err
 		return s
 	}
+	if err := qwpValidateSymbolValue(val); err != nil {
+		s.lastErr = err
+		return s
+	}
 
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeSymbol, true)
 	if err != nil {

@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -91,6 +92,11 @@ const (
 	// or corrupt length prefix cannot drive a runaway allocation. Symbols are
 	// short; this ceiling is generous.
 	qwpSfSymbolDictMaxEntryLen = 1 << 20
+	// qwpSfSymbolDictMaxFileSize bounds the whole-file read at open so a torn
+	// or foreign file cannot drive a multi-GB allocation on a background
+	// recovery/drainer goroutine. Even pathological high-cardinality symbol use
+	// stays far below this.
+	qwpSfSymbolDictMaxFileSize = 1 << 30
 )
 
 // qwpSfSymbolDictOpen opens (creating if absent) the dictionary file in
@@ -113,6 +119,40 @@ func qwpSfSymbolDictOpen(slotDir string) *qwpSfSymbolDict {
 	return qwpSfSymbolDictOpenFresh(path)
 }
 
+// qwpSfSymbolDictOpenRecovered opens the dictionary for a slot recovered from
+// disk. Unlike qwpSfSymbolDictOpen it NEVER recreates: a recovered slot's
+// segments hold delta frames that reference the dictionary's ids by position,
+// so silently truncating a corrupt or version-mismatched file would restart the
+// id space and re-register the wrong id→name map. It returns:
+//
+//   - (dict, nil) when the file exists and parses,
+//   - (nil, nil)  when the file is absent — the caller falls back to full
+//     self-sufficient frames for the recovered segments,
+//   - (nil, err)  when the file exists but is corrupt/unreadable/wrong-version,
+//     which the caller propagates as a fatal recovery error (a sanctioned
+//     terminal: quarantine rather than replay against a mismatched dictionary).
+func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
+	if slotDir == "" {
+		return nil, nil
+	}
+	path := filepath.Join(slotDir, qwpSfSymbolDictFileName)
+	st, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if st.Size() < qwpSfSymbolDictHeaderSize {
+		return nil, fmt.Errorf("qwp/sf: recovered symbol dictionary %s is truncated (%d bytes)", path, st.Size())
+	}
+	d := qwpSfSymbolDictOpenExisting(path, st.Size())
+	if d == nil {
+		return nil, fmt.Errorf("qwp/sf: recovered symbol dictionary %s is corrupt or unreadable", path)
+	}
+	return d, nil
+}
+
 // qwpSfSymbolDictRemoveOrphan best-effort removes a stale dictionary file.
 // Used at fresh-start (a dict with no segments behind it is meaningless) and at
 // fully-drained close (nothing references it any more). No-op for memory mode.
@@ -124,6 +164,9 @@ func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 }
 
 func qwpSfSymbolDictOpenExisting(path string, fileLen int64) *qwpSfSymbolDict {
+	if fileLen > qwpSfSymbolDictMaxFileSize {
+		return nil
+	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		return nil
@@ -133,7 +176,7 @@ func qwpSfSymbolDictOpenExisting(path string, fileLen int64) *qwpSfSymbolDict {
 		_ = f.Close()
 		return nil
 	}
-	if binary.LittleEndian.Uint32(buf[:4]) != qwpSfSymbolDictMagic {
+	if binary.LittleEndian.Uint32(buf[:4]) != qwpSfSymbolDictMagic || buf[4] != qwpSfSymbolDictVersion {
 		_ = f.Close()
 		return nil
 	}
@@ -213,6 +256,16 @@ func (d *qwpSfSymbolDict) loadedSymbols() []string {
 		return nil
 	}
 	return d.loaded
+}
+
+// releaseLoaded drops the recovered-entry copy once both the producer's global
+// dictionary and the send loop's catch-up mirror have been seeded from it, so a
+// large recovered dictionary is not retained for the slot's whole lifetime.
+func (d *qwpSfSymbolDict) releaseLoaded() {
+	if d == nil {
+		return
+	}
+	d.loaded = nil
 }
 
 // size is the number of symbols the dictionary holds (highest id + 1).

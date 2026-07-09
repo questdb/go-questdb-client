@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,6 +57,86 @@ func TestQwpSfSymbolDictAppendPersistsAcrossReopen(t *testing.T) {
 	require.Equal(t, 4, third.size())
 	require.Equal(t, "TSLA", third.loadedSymbols()[3])
 	require.NoError(t, third.close())
+}
+
+func TestQwpSfSymbolDictOpenRecoveredAbsentReturnsNil(t *testing.T) {
+	dir := t.TempDir()
+	d, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.Nil(t, d, "absent dictionary on a recovered slot degrades to full-dict fallback")
+}
+
+func TestQwpSfSymbolDictOpenRecoveredValid(t *testing.T) {
+	dir := t.TempDir()
+	d := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, d.appendSymbols([]string{"AAPL", "GOOG"}))
+	require.NoError(t, d.close())
+
+	re, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.NotNil(t, re)
+	require.Equal(t, []string{"AAPL", "GOOG"}, re.loadedSymbols())
+	require.NoError(t, re.close())
+}
+
+// TestQwpSfSymbolDictOpenRecoveredCorruptFailsLoud pins that a recovered slot's
+// corrupt dictionary is a hard error and the file is preserved, never
+// truncated — recreating it would restart the id space the surviving segments
+// reference by position and silently corrupt replayed data.
+func TestQwpSfSymbolDictOpenRecoveredCorruptFailsLoud(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	garbage := []byte{9, 9, 9, 9, 9, 9, 9, 9, 42}
+	require.NoError(t, os.WriteFile(path, garbage, 0o644))
+
+	d, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.Error(t, err)
+	require.Nil(t, d)
+
+	got, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	require.Equal(t, garbage, got, "corrupt recovered dictionary must not be truncated")
+}
+
+// TestQwpSfSymbolDictVersionMismatch pins that an unknown version byte is
+// treated like bad magic: recreated on a fresh open, but a hard error on a
+// recovered slot.
+func TestQwpSfSymbolDictVersionMismatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	hdr := make([]byte, qwpSfSymbolDictHeaderSize+2)
+	binary.LittleEndian.PutUint32(hdr[:4], qwpSfSymbolDictMagic)
+	hdr[4] = qwpSfSymbolDictVersion + 1
+	hdr[8], hdr[9] = 1, 'x'
+	require.NoError(t, os.WriteFile(path, hdr, 0o644))
+
+	_, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.Error(t, err, "wrong version on a recovered slot must fail loud")
+
+	d := qwpSfSymbolDictOpen(dir)
+	require.NotNil(t, d)
+	require.Equal(t, 0, d.size(), "wrong version recreated empty on a fresh open")
+	require.NoError(t, d.close())
+}
+
+// TestQwpSfSymbolDictOversizedFileRejected pins that a file past the read
+// ceiling is refused before it can drive a multi-GB allocation. A sparse
+// truncate keeps the test cheap.
+func TestQwpSfSymbolDictOversizedFileRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	require.NoError(t, err)
+	var hdr [qwpSfSymbolDictHeaderSize]byte
+	binary.LittleEndian.PutUint32(hdr[:4], qwpSfSymbolDictMagic)
+	hdr[4] = qwpSfSymbolDictVersion
+	_, err = f.WriteAt(hdr[:], 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(qwpSfSymbolDictMaxFileSize+1))
+	require.NoError(t, f.Close())
+
+	_, err = qwpSfSymbolDictOpenRecovered(dir)
+	require.Error(t, err, "oversized dictionary must be rejected before the read")
 }
 
 func TestQwpSfSymbolDictBadMagicRecreatedEmpty(t *testing.T) {

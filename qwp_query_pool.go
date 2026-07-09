@@ -59,6 +59,13 @@ type qwpQueryPool struct {
 	closed            bool
 	closing           atomic.Bool // set before the housekeeper stops; reapIdle bails
 
+	// pendingTeardowns counts client teardowns running off-lock after the
+	// worker has already left `all` (giveBack's broken branch, discardWorkerLocked,
+	// reap victims). close() adds it to the outstanding count so it does not
+	// return while a query connection is still winding down. Guarded by mu.
+	// Mirrors qwpSenderPool.pendingLeaseTeardowns.
+	pendingTeardowns int
+
 	baseConf string
 	logger   *slog.Logger
 }
@@ -218,10 +225,16 @@ func (p *qwpQueryPool) giveBack(q *Query, broken bool) error {
 		return err
 	}
 	if broken {
+		// Drop from `all` before the off-lock close but count the teardown so
+		// close()'s outstanding wait still sees it (the closed branch above keeps
+		// the worker in `all` across its close, which the formula already covers;
+		// this branch removes first, so it needs the explicit counter).
 		p.removeFromAllLocked(q.worker)
+		p.pendingTeardowns++
 		p.mu.Unlock()
 		err := closeQueryClientGuarded(context.Background(), q.worker.client)
 		p.mu.Lock()
+		p.pendingTeardowns--
 		p.broadcastLocked()
 		p.mu.Unlock()
 		return err
@@ -239,15 +252,24 @@ func (p *qwpQueryPool) giveBack(q *Query, broken bool) error {
 // discardLocked).
 func (p *qwpQueryPool) discardWorkerLocked(ctx context.Context, w *qwpQueryWorker) {
 	p.removeFromAllLocked(w)
+	// The worker is out of `all`, so count the off-lock close in the outstanding
+	// wait or close() could return while this teardown is still in flight.
+	p.pendingTeardowns++
 	p.mu.Unlock()
 	_ = closeQueryClientGuarded(ctx, w.client)
 	p.mu.Lock()
+	p.pendingTeardowns--
 	p.broadcastLocked()
 	p.mu.Unlock()
 }
 
 // markClosing signals reapIdle to bail before the housekeeper is stopped.
 func (p *qwpQueryPool) markClosing() { p.closing.Store(true) }
+
+// queryReapCloseHook, when non-nil, is invoked at the start of each reap-victim
+// close goroutine. Test seam only (mirrors reapCloseHook): it lets a test hold a
+// reap teardown in flight to assert close() waits for it. Nil in production.
+var queryReapCloseHook func()
 
 func (p *qwpQueryPool) reapIdle() {
 	if p.closing.Load() {
@@ -266,11 +288,17 @@ func (p *qwpQueryPool) reapIdle() {
 		wg.Add(1)
 		go func(client *QwpQueryClient) {
 			defer wg.Done()
+			if queryReapCloseHook != nil {
+				queryReapCloseHook()
+			}
 			_ = closeQueryClientGuarded(context.Background(), client)
 		}(w.client)
 	}
 	wg.Wait()
 	p.mu.Lock()
+	// Balance the per-victim increments in selectReapVictims now the teardowns
+	// have completed, so close()'s outstanding wait no longer counts them.
+	p.pendingTeardowns -= len(toClose)
 	p.broadcastLocked()
 	p.mu.Unlock()
 }
@@ -300,6 +328,10 @@ func (p *qwpQueryPool) selectReapVictims(now time.Time) []*qwpQueryWorker {
 		// for min workers (see sender pool + README); poisoned reaps anyway.
 		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
 			p.removeFromAllLocked(w)
+			// Count the off-lock reap teardown so close()'s outstanding wait
+			// cannot return while a reaped client is still winding down (the
+			// victim is already out of `all`). Decremented in reapIdle after close.
+			p.pendingTeardowns++
 			toClose = append(toClose, w)
 			continue
 		}
@@ -347,7 +379,7 @@ func (p *qwpQueryPool) close(_ context.Context) error {
 	}
 	deadline := time.Now().Add(waitBudget)
 	for {
-		outstanding := len(p.all) - len(p.available) + p.inFlightCreations
+		outstanding := len(p.all) - len(p.available) + p.inFlightCreations + p.pendingTeardowns
 		if outstanding <= 0 {
 			break
 		}
@@ -442,19 +474,26 @@ func (p *qwpQueryPool) poolSnapshot() (total, available int) {
 	return len(p.all), len(p.available)
 }
 
+// ErrQueryPoolExhausted is returned by BorrowQuery when the query pool is at
+// query_pool_max and no connection frees up within acquire_timeout_ms. The
+// query-pool counterpart of ErrSenderPoolExhausted, so a borrow timeout names
+// the pool the caller actually exhausted. Match it with errors.Is.
+var ErrQueryPoolExhausted = errors.New("qwp pool: timed out waiting for a query connection")
+
+// ErrQueryLeaseUnusable is returned by a live Query lease's Query / Exec once
+// its worker can no longer serve statements: the connection latched a
+// transport-terminal error, or an abandoned drain left the single-stream wire
+// desynced. Distinct from ErrStaleLease (the handle was already returned or its
+// slot evicted) so callers can tell "you gave this handle back" from "close this
+// lease and borrow a fresh one". Match it with errors.Is.
+var ErrQueryLeaseUnusable = errors.New(
+	"qwp pool: query lease's connection is no longer usable (terminally failed or desynced); close the lease and borrow a fresh one")
+
+// Internal aliases so existing call sites keep compiling; errors.Is works
+// against either name since they are the same error value.
 var (
-	// errQueryPoolExhausted is the query-pool counterpart of
-	// errPoolExhausted, so a borrow timeout names the pool the caller
-	// actually exhausted rather than misreporting a sender wait.
-	errQueryPoolExhausted = errors.New("qwp pool: timed out waiting for a query connection")
-	// errQueryLeaseUnusable fails a live lease whose worker can no longer
-	// serve statements: its connection latched a transport-terminal error,
-	// or an abandoned drain left the wire desynced. Distinct from
-	// errStaleLease (handle already returned / slot evicted) so callers can
-	// tell "you gave this handle back" from "close this lease and borrow a
-	// fresh one".
-	errQueryLeaseUnusable = errors.New(
-		"qwp pool: query lease's connection is no longer usable (terminally failed or desynced); close the lease and borrow a fresh one")
+	errQueryPoolExhausted = ErrQueryPoolExhausted
+	errQueryLeaseUnusable = ErrQueryLeaseUnusable
 )
 
 // Query is a query session leased from the QuestDB facade via BorrowQuery. It

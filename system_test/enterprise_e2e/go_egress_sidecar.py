@@ -114,19 +114,25 @@ class EgressGoSidecar:
             LOG.warning("egress sidecar %s pre-READY: %r", self.name, line)
 
     def stop(self) -> None:
-        if self.process is None or self.process.poll() is not None:
+        if self.process is None:
             return
-        try:
-            self._send("EXIT")
-        except (BrokenPipeError, OSError):
-            pass
-        try:
-            self.process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            LOG.warning("egress sidecar %s did not exit after EXIT, escalating to SIGKILL",
-                        self.name)
-            self.process.kill()
-            self.process.wait(timeout=5)
+        if self.process.poll() is None:
+            try:
+                self._send("EXIT")
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                self.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                LOG.warning("egress sidecar %s did not exit after EXIT, escalating to SIGKILL",
+                            self.name)
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=5)
+        for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if pipe is not None:
+                pipe.close()
 
     # ---- protocol verbs ----
 
@@ -181,7 +187,7 @@ class EgressGoSidecar:
         if line is None:
             raise RuntimeError("egress sidecar produced no reply (timeout or EOF)")
         line = line.strip()
-        if line.startswith("OK"):
+        if line == "OK" or line.startswith("OK "):
             return line.split()[1:]
         if line.startswith("ERR"):
             raise GoSidecarError(line[len("ERR "):])
