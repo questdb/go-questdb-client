@@ -141,15 +141,14 @@ type QwpSender interface {
 
 	// LastTerminalError returns a snapshot of the most recent
 	// terminal SenderError the I/O loop latched (server rejection,
-	// WS protocol violation, auth failure, reconnect-budget
-	// exhaustion). Returns nil if the sender has not gone terminal
-	// yet, or if it failed for a non-server reason (transport
-	// error before classification).
+	// WS protocol violation, auth failure). Returns nil if the
+	// sender has not gone terminal yet, or if it failed for a
+	// non-server reason (transport error before classification).
 	LastTerminalError() *SenderError
 
 	// TotalServerErrors returns the cumulative count of SenderError
-	// payloads the I/O loop has built (DROP and HALT combined).
-	// Includes batches where the user handler dropped the
+	// payloads the I/O loop has built (retriable and terminal
+	// combined). Includes batches where the user handler dropped the
 	// notification due to inbox overflow.
 	TotalServerErrors() int64
 
@@ -159,6 +158,12 @@ type QwpSender interface {
 	// Non-zero means the handler is too slow for the error rate;
 	// raise WithErrorInboxCapacity or speed up the handler.
 	DroppedErrorNotifications() int64
+
+	// DroppedConnectionNotifications returns the cumulative count of
+	// SenderConnectionEvent payloads dropped because the listener's
+	// bounded inbox was full. Non-zero means the listener is too slow;
+	// raise WithConnectionListenerInboxCapacity or speed it up.
+	DroppedConnectionNotifications() int64
 
 	// TotalErrorNotificationsDelivered returns the cumulative count
 	// of SenderError payloads delivered to the user-supplied
@@ -190,6 +195,15 @@ type QwpSender interface {
 	// park. Non-zero values mean the producer is outpacing the wire.
 	TotalBackpressureStalls() int64
 
+	// TotalDurableAcks returns the cumulative count of STATUS_DURABLE_ACK
+	// frames processed. Always 0 unless request_durable_ack is on.
+	TotalDurableAcks() int64
+
+	// TotalDurableTrimAdvances returns the cumulative count of times a
+	// durable ACK advanced the trim/replay/await watermark. Always 0
+	// unless request_durable_ack is on.
+	TotalDurableTrimAdvances() int64
+
 	// BackgroundDrainers returns a snapshot of the drainers the
 	// foreground sender has dispatched for orphan slot adoption.
 	// Returns nil when the sender was not configured with
@@ -219,8 +233,9 @@ type QwpBackgroundDrainer struct {
 	// recorded, or "" if no error has been recorded.
 	LastError string
 	// Failed is true if the drainer ended in the FAILED outcome
-	// (exhausted reconnect budget, auth failure, recovery error)
-	// and dropped a .failed sentinel in the slot.
+	// (auth failure, durable-ack settle exhaustion, recovery error,
+	// wedged no-progress connection) and dropped a .failed sentinel
+	// in the slot.
 	Failed bool
 }
 
@@ -271,13 +286,24 @@ type qwpLineSender struct {
 	maxSentSymbolId int
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
+	// deltaDictEnabled makes each frame carry only the symbol ids above
+	// maxSentSymbolId (a delta), rather than the full dictionary from id 0.
+	// Set from the engine at construction: always in memory mode, and in SF
+	// mode only when the persisted dictionary opened. When false the sender
+	// emits full self-sufficient frames (baseline -1). See symbolDeltaBaseline.
+	deltaDictEnabled bool
+	// persistedSymbolDict is the engine's .symbol-dict side-file (SF + delta
+	// mode only; nil otherwise). New symbols are appended to it before the
+	// referencing frame is published, so a recovered / orphan-drained slot can
+	// rebuild the dictionary its non-self-sufficient delta frames reference.
+	persistedSymbolDict *qwpSfSymbolDict
 
-	// Schemas are intentionally NOT tracked on the cursor wire path.
-	// Every frame is self-sufficient: it carries the full inline column
-	// definitions and the full symbol dict from id 0. There is no
-	// per-connection schema registry on the client side and no
-	// schema-change detection; the server reads the inline column
-	// definitions on every frame regardless.
+	// Schemas are intentionally NOT tracked on the cursor wire path. Every
+	// frame's schema stays self-sufficient: it carries the full inline column
+	// definitions, with no per-connection schema registry and no schema-change
+	// detection. The symbol dictionary, in contrast, is delta-encoded when
+	// deltaDictEnabled — a reconnect re-registers it via a send-loop catch-up
+	// frame before replay (full-dict frames when disabled).
 
 	// Row state.
 	hasTable bool
@@ -455,6 +481,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 	engine.engineSetTerminalErrorGetter(loop.sendLoopCheckError)
 	s.cursorEngine = engine
 	s.cursorSendLoop = loop
+	s.wireDeltaDict(engine)
 	// The memory-mode segment is the fixed qwpSfDefaultMaxBytes; record
 	// the largest frame it can hold so the byte-trigger clamp and the
 	// flush-time drop guard bound batches to it.
@@ -540,6 +567,10 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		return s
 	}
 	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
+		s.lastErr = err
+		return s
+	}
+	if err := qwpValidateSymbolValue(val); err != nil {
 		s.lastErr = err
 		return s
 	}
@@ -1219,14 +1250,90 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 	return err
 }
 
+// flushForReturn readies the delegate for return to the pool: it captures and
+// clears any latched fluent-API error, drops any in-progress (un-At'd) row,
+// and — crucially — still flushes the committed rows into the cursor engine so
+// the slot returns clean. It mirrors closeCursor's producer-state handling
+// (capture latch, drop open row, enqueue pending rows) minus the teardown; the
+// slot stays live for the next borrower. Producer-goroutine only.
+//
+// The pool must route lease return through this, not Flush:
+// FlushAndGetSequence early-returns a latched error ahead of its pending-rows
+// branch, so a lease closed with a committed row AND a latched error (e.g. one
+// illegal column name on untrusted input, after a good row) would leave that
+// committed row buffered in the recycled slot — the next borrower would then
+// silently ship it as a phantom/duplicate row. A latched error must surface
+// (retain-on-error) without suppressing the flush of already-committed rows.
+//
+// Returns the first error: the captured latch (the original user-facing cause)
+// takes precedence, else an enqueue or terminal I/O failure. On a latch-only
+// error the committed rows are flushed regardless, and any terminal fault is
+// surfaced so the pool discards the slot instead of recycling a dead one.
+//
+// The first return value, retained, reports whether committed rows are STILL
+// buffered un-enqueued after the attempt — the enqueue hit the backpressure
+// append deadline (e.g. the cursor ring saturated during an outage) or the
+// engine was closed, neither of which is a terminal send-loop HALT. Such a slot
+// is DIRTY: recycling it would ship this borrower's rows under the next
+// borrower's FSN (borrower-isolation). The pool must discard it rather than
+// recycle. retained is only meaningful on the producer goroutine; a call from
+// a dispatcher goroutine can't inspect producer state, so it reports true —
+// unable to prove the slot clean, it errs on discard.
+func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err error) {
+	if s.closed.Load() {
+		return false, errClosedSenderFlush
+	}
+	if s.calledFromDispatcherGoroutine() {
+		// Running on a dispatcher goroutine (Close invoked from inside a
+		// user callback): touching producer state (lastErr / hasTable /
+		// pendingRowCount / buffers) would race the producer.
+		// Surface only the latched terminal error, like closeCursor does. We
+		// can't safely read pendingRowCount, so we can't prove the slot is
+		// clean either — report retained=true so the pool discards it instead
+		// of recycling a possibly-dirty slot under the next borrower.
+		return true, s.cursorSendLoop.sendLoopCheckError()
+	}
+	firstErr := s.lastErr
+	s.lastErr = nil
+	if s.hasTable {
+		if s.currentTable != nil {
+			s.currentTable.cancelRow()
+		}
+		s.hasTable = false
+		s.currentTable = nil
+		s.cachedDesignatedTs = nil
+	}
+	if s.pendingRowCount > 0 {
+		if err := s.enqueueCursor(ctx); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			s.resetAfterFlush()
+		}
+	}
+	// Surface a terminal I/O error the send loop latched (in the background
+	// or during the enqueue above) so a poisoned slot is discarded, not
+	// recycled — parity with flushCursor's tail. A captured fluent latch
+	// takes precedence as the original user-facing cause.
+	if firstErr == nil {
+		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
+			firstErr = err
+		}
+	}
+	// pendingRowCount > 0 here means enqueueCursor could not seal the
+	// committed rows (backpressure deadline / engine closed); enqueueCursor
+	// leaves them retained for a later flush. The slot is dirty.
+	return s.pendingRowCount > 0, firstErr
+}
+
 // FlushAndGetSequence implements QwpSender.FlushAndGetSequence.
 // Flushes any pending rows and returns the published FSN — the
 // upper bound on any SenderError.ToFsn that could surface for this
 // batch.
 //
-// It does NOT wait for the server ACK (Java decision #1 in
-// design/qwp-cursor-durability.md — "flush() never waits for ACK;
-// ACKs are async"): it returns once the batch is published into the
+// It does NOT wait for the server ACK (flush() never waits for ACK;
+// ACKs are async): it returns once the batch is published into the
 // cursor engine (in-RAM for memory mode, on-disk for SF) and the
 // send loop delivers + replays it in the background. Callers
 // wanting server-ACK confirmation pair the returned FSN with
@@ -1235,14 +1342,15 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	if s.closed.Load() {
 		return -1, errClosedSenderFlush
 	}
-	if s.calledFromErrorHandler() {
-		// Flush() invoked from inside a SenderErrorHandler runs on the
-		// dispatcher goroutine. The handler's documented use of Flush()
+	if s.calledFromDispatcherGoroutine() {
+		// Flush() invoked from inside a user callback (error handler,
+		// connection listener, or progress handler) runs on that
+		// dispatcher goroutine. The callback's documented use of Flush()
 		// is to surface the latched terminal error promptly (it is
-		// latched before the handler runs). We must not read or flush
+		// latched before the error handler runs). We must not read or flush
 		// producer-owned state (hasTable / pendingRowCount / tableBuffers
 		// / the encoder) from this goroutine — that races the producer,
-		// the C3 producer-state hazard. Surface any latched error and
+		// the producer-state hazard. Surface any latched error and
 		// return the published FSN without touching producer state.
 		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 			return -1, err
@@ -1260,9 +1368,9 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	// with no latched error performs no producer-state write at all and
 	// stays a pure read — several goroutines sampling a quiescent
 	// (post-HALT) sender to observe the latched terminal error therefore
-	// race only on read-only state. The calledFromErrorHandler path above
+	// race only on read-only state. The calledFromDispatcherGoroutine path above
 	// skips this: lastErr is producer-owned, and reading it from the
-	// dispatcher goroutine races the producer (the C3 hazard).
+	// dispatcher goroutine races the producer.
 	if err := s.lastErr; err != nil {
 		s.lastErr = nil
 		if s.currentTable != nil {

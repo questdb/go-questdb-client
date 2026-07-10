@@ -1,0 +1,403 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb
+
+import (
+	"encoding/binary"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+)
+
+type tableEntry struct {
+	name   string
+	seqTxn int64
+}
+
+// durableTrailer builds the per-table trailer (tableCount + [nameLen name seqTxn]*)
+// that qwpForEachAckTableEntry walks.
+func durableTrailer(entries ...tableEntry) []byte {
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf, uint16(len(entries)))
+	for _, e := range entries {
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(e.name)))
+		buf = append(buf, e.name...)
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(e.seqTxn))
+	}
+	return buf
+}
+
+// TestDurableTrackerDrainUpToCeiling pins the munmap-safety clamp: a covered
+// entry whose wire sequence exceeds the fully-sent ceiling is held back (so a
+// forged/early durable ack cannot trim a frame still being sent), then released
+// once the ceiling rises — no stranding.
+func TestDurableTrackerDrainUpToCeiling(t *testing.T) {
+	tr := newQwpDurableTracker()
+	tr.enqueueOk(0, durableTrailer(tableEntry{"trades", 0}))
+	tr.enqueueOk(1, durableTrailer(tableEntry{"trades", 1}))
+	// Both batches are durably covered...
+	tr.applyDurable(durableTrailer(tableEntry{"trades", 1}))
+	// ...but only frame 0 is fully sent: frame 1 must stay pending.
+	if got := tr.drainUpTo(0); got != 0 {
+		t.Fatalf("drainUpTo(0) = %d, want 0", got)
+	}
+	if !tr.hasPending() {
+		t.Fatal("covered-but-unsent entry must remain pending under the ceiling")
+	}
+	// Ceiling rises to admit frame 1.
+	if got := tr.drainUpTo(1); got != 1 {
+		t.Fatalf("drainUpTo(1) = %d, want 1", got)
+	}
+	if tr.hasPending() {
+		t.Fatal("entry should drain once the ceiling admits it")
+	}
+}
+
+func TestDurableTrackerBasicCoverage(t *testing.T) {
+	tr := newQwpDurableTracker()
+	tr.enqueueOk(0, durableTrailer(tableEntry{"trades", 5}))
+	if got := tr.drain(); got != -1 {
+		t.Fatalf("drain before durable = %d, want -1", got)
+	}
+	if !tr.hasPending() {
+		t.Fatal("expected pending after OK, before durable")
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"trades", 5}))
+	if got := tr.drain(); got != 0 {
+		t.Fatalf("drain after covering durable = %d, want 0", got)
+	}
+	if tr.hasPending() {
+		t.Fatal("expected no pending after full drain")
+	}
+}
+
+func TestDurableTrackerPerTableMaxAndFIFO(t *testing.T) {
+	tr := newQwpDurableTracker()
+	tr.enqueueOk(0, durableTrailer(tableEntry{"t", 5}))
+	tr.enqueueOk(1, durableTrailer(tableEntry{"t", 7}))
+	// Durable up to 6: seq0 (t@5) covered, seq1 (t@7) not; FIFO stops at seq1.
+	tr.applyDurable(durableTrailer(tableEntry{"t", 6}))
+	if got := tr.drain(); got != 0 {
+		t.Fatalf("drain = %d, want 0 (stop at uncovered seq1)", got)
+	}
+	// An older cumulative frame must not lower the watermark.
+	tr.applyDurable(durableTrailer(tableEntry{"t", 3}))
+	if got := tr.drain(); got != -1 {
+		t.Fatalf("stale durable drained %d, want -1", got)
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"t", 7}))
+	if got := tr.drain(); got != 1 {
+		t.Fatalf("drain = %d, want 1", got)
+	}
+}
+
+func TestDurableTrackerAbsentTableNotCovered(t *testing.T) {
+	tr := newQwpDurableTracker()
+	// seqTxn 0 on an absent table must NOT be treated as covered (Go map miss
+	// yields 0, not Java's -1 sentinel).
+	tr.enqueueOk(0, durableTrailer(tableEntry{"never_durable", 0}))
+	if got := tr.drain(); got != -1 {
+		t.Fatalf("absent-table drain = %d, want -1", got)
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"never_durable", 0}))
+	if got := tr.drain(); got != 0 {
+		t.Fatalf("after durable(0) drain = %d, want 0", got)
+	}
+}
+
+func TestDurableTrackerMultiTableBatch(t *testing.T) {
+	tr := newQwpDurableTracker()
+	tr.enqueueOk(0, durableTrailer(tableEntry{"a", 3}, tableEntry{"b", 4}))
+	tr.applyDurable(durableTrailer(tableEntry{"a", 3}))
+	if got := tr.drain(); got != -1 {
+		t.Fatalf("one-of-two durable drain = %d, want -1", got)
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"b", 4}))
+	if got := tr.drain(); got != 0 {
+		t.Fatalf("both-durable drain = %d, want 0", got)
+	}
+}
+
+func TestDurableTrackerEmptyBatchTriviallyDurable(t *testing.T) {
+	tr := newQwpDurableTracker()
+	tr.enqueueOk(7, durableTrailer()) // empty OK trailer
+	if got := tr.drain(); got != 7 {
+		t.Fatalf("empty batch drain = %d, want 7 (trivially durable)", got)
+	}
+}
+
+// TestDurableTrackerEmptyOkChainsBehindOk pins the FIFO chain for an OK
+// carrying an empty trailer: trivially durable on its own, it must still
+// chain behind an unconfirmed OK ahead of it so the watermark never
+// advances past not-yet-durable data.
+func TestDurableTrackerEmptyOkChainsBehindOk(t *testing.T) {
+	tr := newQwpDurableTracker()
+	tr.enqueueOk(0, durableTrailer(tableEntry{"t", 5})) // OK, needs t@5
+	tr.enqueueOk(1, durableTrailer())                   // empty trailer, trivially durable
+	// The empty entry must not advance past the still-unconfirmed OK ahead of it.
+	if got := tr.drain(); got != -1 {
+		t.Fatalf("empty OK drained ahead of uncovered OK = %d, want -1", got)
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"t", 5}))
+	if got := tr.drain(); got != 1 {
+		t.Fatalf("drain = %d, want 1 (both pop once covered)", got)
+	}
+}
+
+func TestDurableTrackerDurableBeforeOk(t *testing.T) {
+	tr := newQwpDurableTracker()
+	// A durable frame can arrive before the OK for the same batch; the OK's
+	// drain-on-enqueue must release it immediately.
+	tr.applyDurable(durableTrailer(tableEntry{"t", 5}))
+	tr.enqueueOk(3, durableTrailer(tableEntry{"t", 5}))
+	if got := tr.drain(); got != 3 {
+		t.Fatalf("durable-before-ok drain = %d, want 3", got)
+	}
+}
+
+func TestDurableTrackerResetOnReconnect(t *testing.T) {
+	tr := newQwpDurableTracker()
+	tr.enqueueOk(0, durableTrailer(tableEntry{"t", 5}))
+	tr.applyDurable(durableTrailer(tableEntry{"t", 5}))
+	tr.reset()
+	if tr.hasPending() {
+		t.Fatal("pending survived reset")
+	}
+	// A durable frame from the old connection must not satisfy a re-sent batch.
+	tr.enqueueOk(0, durableTrailer(tableEntry{"t", 5}))
+	if got := tr.drain(); got != -1 {
+		t.Fatalf("stale watermark survived reset: drain = %d, want -1", got)
+	}
+}
+
+func TestDurableTrackerSeqGap(t *testing.T) {
+	tr := newQwpDurableTracker()
+	if _, gap := tr.seqGap(0); gap {
+		t.Fatal("first seq 0 must not be a gap")
+	}
+	if _, gap := tr.seqGap(1); gap {
+		t.Fatal("consecutive seq 1 must not be a gap")
+	}
+	// A forward jump is a gap; the expected sequence is reported for diagnostics.
+	if expected, gap := tr.seqGap(3); !gap || expected != 2 {
+		t.Fatalf("seq 3 after 1: gap=%v expected=%d, want true/2", gap, expected)
+	}
+	// The gap did not advance lastSeq, so a duplicate/reordered seq stays
+	// conservative (no gap, no over-advance).
+	if _, gap := tr.seqGap(1); gap {
+		t.Fatal("duplicate seq 1 must not be a gap")
+	}
+	// A first ack that itself skips frame 0 is a gap.
+	fresh := newQwpDurableTracker()
+	if expected, gap := fresh.seqGap(1); !gap || expected != 0 {
+		t.Fatalf("first seq 1: gap=%v expected=%d, want true/0", gap, expected)
+	}
+	// reset re-arms the detector for the next connection.
+	tr.reset()
+	if _, gap := tr.seqGap(0); gap {
+		t.Fatal("post-reset seq 0 must not be a gap")
+	}
+}
+
+// TestDurableTrackerApplyDurableCapsUnknownTables pins the malicious-server memory
+// bound: durable watermarks for tables the client never wrote (never interned via
+// enqueueOk) are tracked only up to qwpDurableMaxTrackedTables, while a real
+// table's durable-before-ok watermark is always honored.
+func TestDurableTrackerApplyDurableCapsUnknownTables(t *testing.T) {
+	tr := newQwpDurableTracker()
+	// A watermark for a written table is honored even before its OK arrives.
+	tr.enqueueOk(0, durableTrailer(tableEntry{"real", 1}))
+	tr.applyDurable(durableTrailer(tableEntry{"real", 1}))
+	if got := tr.drain(); got != 0 {
+		t.Fatalf("real-table durable drain = %d, want 0", got)
+	}
+	// Flooding distinct unknown names cannot grow the maps past the cap.
+	for i := 0; i < qwpDurableMaxTrackedTables+1000; i++ {
+		tr.applyDurable(durableTrailer(tableEntry{name: "junk-" + strconv.Itoa(i), seqTxn: 1}))
+	}
+	if len(tr.interned) > qwpDurableMaxTrackedTables {
+		t.Fatalf("interned grew to %d, want <= %d", len(tr.interned), qwpDurableMaxTrackedTables)
+	}
+	if len(tr.watermarks) > qwpDurableMaxTrackedTables {
+		t.Fatalf("watermarks grew to %d, want <= %d", len(tr.watermarks), qwpDurableMaxTrackedTables)
+	}
+}
+
+// A server streaming distinct names in OK-ack trailers must not grow the intern
+// map past the cap: enqueueOk rejects the frame so the send loop HALTs fail-closed
+// rather than trimming on a truncated table set.
+func TestDurableTrackerEnqueueOkCapsOnOverflow(t *testing.T) {
+	tr := newQwpDurableTracker()
+	for i := 0; i < qwpDurableMaxTrackedTables-1; i++ {
+		k := "seed-" + strconv.Itoa(i)
+		tr.interned[k] = k
+	}
+	if !tr.enqueueOk(0, durableTrailer(tableEntry{"last-fit", 1})) {
+		t.Fatal("enqueueOk at the cap boundary must succeed")
+	}
+	before := len(tr.interned)
+	if tr.enqueueOk(1, durableTrailer(tableEntry{"overflow", 1})) {
+		t.Fatal("enqueueOk past the cap must return false")
+	}
+	if len(tr.interned) != before {
+		t.Fatalf("interned grew to %d past the cap, want %d", len(tr.interned), before)
+	}
+	if len(tr.pending) != 1 {
+		t.Fatalf("rejected overflow frame left %d pending entries, want 1", len(tr.pending))
+	}
+}
+
+// TestDurableTrackerHeadCursorCompaction pins the amortized-O(1) pop path: a
+// partial drain advances the head cursor without copying, the queue compacts
+// once the head passes the midpoint, and no entry is lost or reordered along
+// the way.
+func TestDurableTrackerHeadCursorCompaction(t *testing.T) {
+	tr := newQwpDurableTracker()
+	const n = 10
+	for i := 0; i < n; i++ {
+		tr.enqueueOk(int64(i), durableTrailer(tableEntry{"t", int64(i)}))
+	}
+	// Cover the first 3 only: head advances to 3 (<= n/2, no compaction).
+	tr.applyDurable(durableTrailer(tableEntry{"t", 2}))
+	if got := tr.drain(); got != 2 {
+		t.Fatalf("first drain = %d, want 2", got)
+	}
+	if tr.head != 3 || len(tr.pending) != n {
+		t.Fatalf("after popping 3 of %d: head=%d len=%d, want head=3 len=%d (no compaction yet)",
+			n, tr.head, len(tr.pending), n)
+	}
+	// Cover through 6: head reaches 7 > len/2, so the queue compacts.
+	tr.applyDurable(durableTrailer(tableEntry{"t", 6}))
+	if got := tr.drain(); got != 6 {
+		t.Fatalf("second drain = %d, want 6", got)
+	}
+	if tr.head != 0 || len(tr.pending) != 3 {
+		t.Fatalf("after popping 7 of %d: head=%d len=%d, want compacted head=0 len=3",
+			n, tr.head, len(tr.pending))
+	}
+	if !tr.hasPending() {
+		t.Fatal("3 entries must remain pending")
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"t", n - 1}))
+	if got := tr.drain(); got != n-1 {
+		t.Fatalf("final drain = %d, want %d", got, n-1)
+	}
+	if tr.hasPending() || tr.head != 0 || len(tr.pending) != 0 {
+		t.Fatalf("queue not empty after full drain: head=%d len=%d", tr.head, len(tr.pending))
+	}
+}
+
+// TestDurableTrackerFreelistCapped pins the peak-memory bound: entries released
+// past qwpDurablePoolCap are dropped for the GC instead of pinned forever.
+func TestDurableTrackerFreelistCapped(t *testing.T) {
+	tr := newQwpDurableTracker()
+	const n = qwpDurablePoolCap + 50
+	for i := 0; i < n; i++ {
+		tr.enqueueOk(int64(i), durableTrailer(tableEntry{"t", int64(i)}))
+	}
+	tr.applyDurable(durableTrailer(tableEntry{"t", n - 1}))
+	if got := tr.drain(); got != n-1 {
+		t.Fatalf("drain = %d, want %d", got, n-1)
+	}
+	if len(tr.pool) > qwpDurablePoolCap {
+		t.Fatalf("freelist grew to %d, want <= %d", len(tr.pool), qwpDurablePoolCap)
+	}
+}
+
+// TestDurableTrackerConcurrentAccess exercises the tracker's internal mutex
+// under -race: one goroutine plays the receiver (seqGap/enqueueOk/applyDurable)
+// while another re-drives drains and resets — the cross-goroutine pattern the
+// lock exists to make safe. Assertions are structural (no race, no panic,
+// consistent emptiness after a final drain).
+func TestDurableTrackerConcurrentAccess(t *testing.T) {
+	tr := newQwpDurableTracker()
+	trailer := durableTrailer(tableEntry{"t", 1 << 30})
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for seq := int64(0); ; seq++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tr.seqGap(seq)
+			tr.enqueueOk(seq, trailer)
+			tr.applyDurable(trailer)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tr.drainUpTo(1 << 40)
+			tr.hasPending()
+			if i%1000 == 999 {
+				tr.reset()
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	tr.drain()
+	if tr.hasPending() != (len(tr.pending)-tr.head > 0) {
+		t.Fatalf("hasPending=%v inconsistent with pending len %d head %d",
+			tr.hasPending(), len(tr.pending), tr.head)
+	}
+}
+
+func TestDurableTrackerSteadyStateZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
+	tr := newQwpDurableTracker()
+	ok := durableTrailer(tableEntry{"trades", 1})
+	dur := durableTrailer(tableEntry{"trades", 1})
+	var seq int64
+	// Warm up the pool, intern cache, and map so steady state is allocation-free.
+	for i := 0; i < 100; i++ {
+		tr.enqueueOk(seq, ok)
+		tr.applyDurable(dur)
+		tr.drain()
+		seq++
+	}
+	got := testing.AllocsPerRun(1000, func() {
+		tr.enqueueOk(seq, ok)
+		tr.applyDurable(dur)
+		tr.drain()
+		seq++
+	})
+	if got != 0 {
+		t.Fatalf("steady-state enqueue/apply/drain allocs = %v, want 0", got)
+	}
+}

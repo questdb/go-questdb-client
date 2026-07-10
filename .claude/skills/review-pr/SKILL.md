@@ -19,8 +19,8 @@ You are a senior QuestDB engineer performing a blocking code review. `go-questdb
   - Inputs: which values break this? Empty buffers, zero-length strings, boundary integers, max-length symbols, names containing the disallowed-character set, NaN/Inf floats, nil slices/maps, zero-value timestamps.
   - Encoding: how does the code behave with invalid UTF-8, embedded NUL bytes, oversized lengths, or a string that needs escaping in ILP vs QWP framing?
   - Concurrency: what happens under concurrent calls to the same sender, an auto-flush firing during a fluent call, the QWP send-loop goroutine racing the producer, a context cancelled mid-flush, `Close()` racing an in-flight flush?
-  - Failure modes: connection dropping mid-flush, partial write, TLS handshake failure, auth rejection, server-side QWP rejection (`*SenderError`), reconnect + replay from `engineAckedFsn()+1`, HALT latching, disk-backed segment-file (`sf_dir`) I/O errors.
-  - Callers: what happens when a caller ignores the returned `error`, reuses a sender after a latched/HALT error instead of rebuilding it, type-asserts `LineSender` to `QwpSender` when the transport is HTTP, or shares one sender across goroutines without synchronization?
+  - Failure modes: connection dropping mid-flush, partial write, TLS handshake failure, auth rejection, server-side QWP rejection (`*SenderError`, retriable recycle+replay vs terminal latch), reconnect + replay from `engineAckedFsn()+1`, poison-frame escalation, disk-backed segment-file (`sf_dir`) I/O errors.
+  - Callers: what happens when a caller ignores the returned `error`, reuses a sender after a latched terminal error instead of rebuilding it, type-asserts `LineSender` to `QwpSender` when the transport is HTTP, or shares one sender across goroutines without synchronization?
 - **Check what's missing**, not just what's there. Missing tests, missing error handling, missing edge cases, missing doc comments on exported API changes, a new ILP column type that didn't update all six concrete structs or the `export_test.go` switch helpers, a new config key not added to `conf_parse.go`.
 - **Verify every claim.** If the PR title says "fix", verify the bug existed and the fix is correct. If it says "improve performance", look for a benchmark or reason about the algorithmic change — and check `BenchmarkQwpSenderSteadyState` still holds 0 allocs/op. If it says "simplify", verify the new code is actually simpler and drops no behavior. Treat the PR description as an unverified hypothesis.
 - **Read the full context of changed files** when the diff alone is ambiguous. Use Read/Grep/Glob to inspect surrounding code, callers, and related tests.
@@ -71,7 +71,7 @@ Before launching review agents, produce a structured change surface map. This st
 For every modified or added function, method, interface method, struct field, or exported constant/var, write:
 
 - **Symbol:** fully-qualified name (e.g., `(*qwpLineSender).Flush`, `httpLineSenderV2.column`, `LineSenderFromConf`)
-- **Before:** signature, return type, error behavior (returned `error` vs latched `*SenderError` vs HALT), panic behavior, receiver mutation (which fields mutated; pointer vs value receiver), ordering/idempotency/replay guarantees, allocation behavior (hot path vs setup path), goroutine/channel interaction, context handling, lock acquisition
+- **Before:** signature, return type, error behavior (returned `error` vs latched `*SenderError` vs retriable recycle), panic behavior, receiver mutation (which fields mutated; pointer vs value receiver), ordering/idempotency/replay guarantees, allocation behavior (hot path vs setup path), goroutine/channel interaction, context handling, lock acquisition
 - **After:** same fields
 - **Delta:** one line stating what semantically changed
 
@@ -104,8 +104,8 @@ For each changed symbol, walk this checklist and write one line per item, statin
 - Lock acquisition order and which mutexes are held on return; which channels are read/written and who owns closing them; goroutine spawn/join/leak on every path including error returns
 - Context cancellation / deadline propagation (the `ctx` threaded through `NewLineSender`, `Flush`, `engineAppendBlocking`)
 - Allocation on the hot path (`Table`→`Symbol`→`*Column`→`At` build path, flush, QWP encode) vs setup path (construction, conf parsing) — the hot path is pinned at 0 allocs/op
-- Buffer state on error: does a failed call leave the buffer half-written? Does the sender require close+rebuild after a HALT (matches Java; the sender does not auto-resume)?
-- Error-policy resolution precedence (highest first): `WithErrorPolicyResolver` → `WithErrorPolicy(category, …)` → connect-string `on_*_error` → `on_server_error` → spec defaults; `PROTOCOL_VIOLATION` and `UNKNOWN` are never user-configurable (always HALT)
+- Buffer state on error: does a failed call leave the buffer half-written? Does the sender require close+rebuild after a terminal latch (matches Java; the sender does not auto-resume)?
+- Error-policy resolution precedence (highest first): `WithErrorPolicyResolver` → `WithErrorPolicy(category, …)` → connect-string `on_*_error` → `on_server_error` → spec defaults; `PROTOCOL_VIOLATION` forced TERMINAL and `UNKNOWN` forced RETRIABLE (fail open) — never user-configurable
 - Wire format: any change to the ILP bytes produced (per protocol version V1/V2/V3) or the QWP frame structure/codec accepted by the server
 - `LineSenderPool` is HTTP-only by design — does the change wrongly let a TCP/QWP config through, or break `errHttpOnlySender`?
 
@@ -149,7 +149,7 @@ Every agent receives:
 
 Launch the following agents in parallel.
 
-**Agent 1 — Correctness & bugs:** nil handling at API boundaries, edge cases, logic errors, off-by-one, operator precedence, error paths, integer overflow/truncation (buffer length math, FSN/sequence arithmetic, varint/length-prefix encoding), wrong wire bytes. Verify ILP encoding per protocol version (V1 text-only, V2 binary float64 + n-dim float arrays, V3 decimals) and QWP frame/codec correctness. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite.
+**Agent 1 — Correctness & bugs:** nil handling at API boundaries, edge cases, logic errors, off-by-one, operator precedence, error paths, integer overflow/truncation (buffer length math, FSN/sequence arithmetic, varint/length-prefix encoding), wrong wire bytes. Verify ILP encoding per protocol version (V1 text-only, V2 binary float64 + n-dim float arrays, V3 decimals) and QWP frame/codec correctness. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite. When the diff touches the SF sender, the send loop / background or orphan drainers (`qwp_sf_send_loop.go`, `qwp_sf_drainer.go`, `qwp_sf_orphan.go`), primary reconnect/failover (`qwp_sf_round_walk.go`), or pool startup (`lazy_connect` / `initial_connect_retry` / `qwpSenderPool` / `qwpQueryPool`), also verify the "Store-and-forward & pool startup invariants" checklist — a running send loop or drainer that propagates a transport error to the producer, imposes a reconnect time budget, or hard-fails on a transient outage is a Critical (data-loss) finding.
 
 **Agent 2 — Panic & crash surface:** A panic on a background goroutine aborts the host process with no recovery. Flag every reachable instance of:
 
@@ -167,7 +167,7 @@ Every fallible operation must return `error`, not swallow it. Every client-spawn
 
 **Agent 4 — Concurrency & data races:** race conditions on `qwpLineSender` / sender fields, missing synchronization, the producer vs `qwpSfSendLoop` handoff, drainer goroutines vs engine state, `engineAppendBlocking` deadline/backpressure correctness, `sync.Mutex`/`RWMutex` ordering and double-unlock, channel direction/ownership/close discipline, context cancellation racing in-flight flush, `Close()` racing a concurrent `Flush`. Confirm whether `go test -race` would cover the changed paths. For every callsite from 2.5b, check whether the symbol is now reachable from a goroutine/context where the previous synchronization assumptions don't hold.
 
-**Agent 5 — Resource management & leaks:** goroutine leaks on every path (including early `error` returns and HALT) — every spawned goroutine must have a join/cancel/exit story; connection/socket cleanup on error and reconnect; `Close()` idempotency and that it drains/stops drainers and the send loop; channel close discipline (no leaked blocked senders/receivers); disk-backed segment-file (`*.sfa`) creation/cleanup/locking under `sf_dir` on error paths; context-cancellation propagation freeing resources; buffer/scratch lifecycle. Walk every callsite from 2.5b that constructs or owns a changed type and verify cleanup on all paths (success, `error` early return, panic-unwind, `Close`).
+**Agent 5 — Resource management & leaks:** goroutine leaks on every path (including early `error` returns and terminal latches) — every spawned goroutine must have a join/cancel/exit story; connection/socket cleanup on error and reconnect; `Close()` idempotency and that it drains/stops drainers and the send loop; channel close discipline (no leaked blocked senders/receivers); disk-backed segment-file (`*.sfa`) creation/cleanup/locking under `sf_dir` on error paths; context-cancellation propagation freeing resources; buffer/scratch lifecycle. Walk every callsite from 2.5b that constructs or owns a changed type and verify cleanup on all paths (success, `error` early return, panic-unwind, `Close`).
 
 **Agent 6 — Performance & allocations:** unnecessary allocations on the hot path (`Table`/`Symbol`/`*Column`/`At*` build, flush, QWP encode), excessive copying, inefficient serialization, redundant syscalls, buffer growth strategy. **The `Table`→`Symbol`→`Column`→`At` pipeline is pinned at 0 allocs/op by `BenchmarkQwpSenderSteadyState` / `TestQwpSenderSteadyStateZeroAllocs`** — any new hot-path allocation must move to a reusable scratch buffer on `qwpLineSender` (see the `encodeInfoBuf` pattern). For each new loop on the data path, analyze scaling at realistic volume (millions of rows per flush, hundreds of columns, thousands of symbols); flag any O(n²). Setup-path allocations (construction, conf parsing) are acceptable; data-path allocations are not.
 
@@ -188,10 +188,10 @@ Cross-reference 2.5d: every cross-context exposure should have a test exercising
 
 - Does this caller pass inputs the new behavior handles incorrectly?
 - Does this caller depend on a contract from the implicit contract list (2.5c) the change broke?
-- Is this caller in a context (the send-loop or drainer goroutine, auto-flush, holding a mutex, an `error`/HALT path, a hot loop, a `WithErrorHandler` callback, TLS handshake, `Close()`, panic-unwind, the conf parser) where the new behavior misbehaves even with valid inputs?
+- Is this caller in a context (the send-loop or drainer goroutine, auto-flush, holding a mutex, an `error`/terminal path, a hot loop, a `WithErrorHandler` callback, TLS handshake, `Close()`, panic-unwind, the conf parser) where the new behavior misbehaves even with valid inputs?
 - For changed interface methods: do all seven `LineSender` implementations still satisfy the new contract? Does the `export_test.go` switch stay exhaustive?
 - For changed config keys: does `conf_parse.go` stay the single source of truth, and does the `With*` option path agree?
-- For changed buffer/sender/cursor state machines: do all callers respect the new state transitions (buffer cleared after error before reuse; sender rebuilt after HALT; cursor frame still self-sufficient for replay)?
+- For changed buffer/sender/cursor state machines: do all callers respect the new state transitions (buffer cleared after error before reuse; sender rebuilt after a terminal latch; cursor frame still self-sufficient for replay)?
 
 This agent's output is structured per callsite, not per failure mode. Each callsite gets a verdict: SAFE / BROKEN / NEEDS VERIFICATION. Every BROKEN entry is a P0 finding regardless of whether the file is in the diff. Not optional even when the diff is small — small diffs to widely-used symbols (`buffer.column*`, `Flush`, interface methods, the cursor engine) have the largest blast radius.
 
@@ -215,7 +215,7 @@ For each finding in the draft report:
 1. **Read the actual source code** at the exact lines cited. Do not rely on the agent's description alone.
 2. **Trace the full code path:** follow callers and interface dispatch. A method called on a `LineSender` value may dispatch to any of the seven implementations — check the one(s) actually reachable.
 3. **Check the right implementation(s):** if a finding involves an interface method, confirm it against every implementation the callsite can dispatch to, not just one.
-4. **For leak claims:** trace every goroutine to its exit, every connection/file to its close, every channel to its close, on ALL paths (success, `error` early return, HALT, panic-unwind, `Close()`). Before claiming a leak between acquisition and cleanup, verify the intervening code can actually fail.
+4. **For leak claims:** trace every goroutine to its exit, every connection/file to its close, every channel to its close, on ALL paths (success, `error` early return, terminal latch, panic-unwind, `Close()`). Before claiming a leak between acquisition and cleanup, verify the intervening code can actually fail.
 5. **For panic claims:** verify the panic site is actually reachable. Trace control flow backwards — a preceding validation guard (including name-validation rejecting the disallowed-character set), match arm, or early return may make it unreachable.
 6. **For goroutine-crash claims:** confirm the panic is reachable on a *client-spawned* goroutine with no top-level `recover`, from contract-honoring input. If a documented validation guard upstream rejects the triggering input, drop it; if the goroutine is the validation boundary, it IS reachable — flag it.
 7. **For numeric overflow claims:** check reachability at realistic scale — buffers up to a few hundred MB, millions of rows per flush, columns in the tens to low hundreds, symbol cardinality in the thousands, FSNs growing monotonically over a long-lived sender. If overflow needs values beyond that scale, drop it.
@@ -244,7 +244,7 @@ Review the diff for:
 - Logic errors, off-by-one, incorrect bounds, wrong operator precedence
 - Integer overflow/truncation (buffer size math, length prefixes/varints, FSN/sequence arithmetic)
 - Correct ILP wire format per protocol version (V1 text-only, V2 binary float64 + n-dim arrays, V3 decimals) and correct QWP frame/codec bytes
-- **Reachability expansion:** for each changed symbol, list the goroutines, error/HALT paths, mutex-held states, and transports it can now appear in but didn't before. Verify it works in each.
+- **Reachability expansion:** for each changed symbol, list the goroutines, error/terminal paths, mutex-held states, and transports it can now appear in but didn't before. Verify it works in each.
 
 ### Panic & crash surface
 A panic on a client-spawned goroutine aborts the host process. Check for:
@@ -274,10 +274,92 @@ A panic on a client-spawned goroutine aborts the host process. Check for:
 
 ### QWP protocol & error semantics
 - Cursor frames remain self-sufficient (full schema + symbol dictionary from id 0 every flush) so reconnect/replay from `engineAckedFsn()+1` and orphan adoption stay safe
-- `Flush` blocking contract preserved (blocks until `engineAckedFsn` catches `enginePublishedFsn`); auto-flush stays non-blocking via `enqueueCursor`; `FlushAndGetSequence` returns the published FSN upper bound
-- Error-policy precedence intact: `WithErrorPolicyResolver` → `WithErrorPolicy` → `on_*_error` → `on_server_error` → defaults; `PROTOCOL_VIOLATION`/`UNKNOWN` always HALT
-- HALT latches on the I/O loop and surfaces on the next producer call; no auto-resume (close+rebuild is the only recovery)
+- `Flush` contract preserved: publishes into the cursor engine and returns **without waiting for the server ACK** (backpressure via `engineAppendBlocking` may block, bounded by `sf_append_deadline_millis`); `FlushAndGetSequence` returns the published FSN upper bound; `AwaitAckedFsn` is the only ACK barrier
+- Error-policy precedence intact: `WithErrorPolicyResolver` → `WithErrorPolicy` → `on_*_error` → `on_server_error` → defaults; `PROTOCOL_VIOLATION` forced TERMINAL, `UNKNOWN` forced RETRIABLE (fail open)
+- **Mid-stream server NACKs (no drop policy).** The NACK policy must mirror
+  the connect-time tiering. A rejection category that a transient cluster
+  state can produce (`WRITE_ERROR`, `INTERNAL_ERROR`, `UNKNOWN` — and any
+  future status byte) is RETRIABLE: recycle the wire and replay from
+  `ackedFsn+1`. It must NEVER drop the batch and NEVER latch a terminal /
+  quarantine a slot on first sight. Only rejections deterministic under
+  byte-identical replay (`SCHEMA_MISMATCH`, `PARSE_ERROR`, `SECURITY_ERROR`
+  on a writable node) may go TERMINAL. A client that advances the ack
+  watermark past a NACKed frame is silently losing data — Critical. A frame
+  repeatedly rejected with no ack progress must escalate through the
+  poison-frame detector (`max_frame_rejections` consecutive strikes at the
+  same head FSN), not through a WS close-code list — close codes carry no
+  policy semantics. `UNKNOWN` must fail OPEN (retry), never closed
+  (terminal): a status byte from a newer server must degrade to retry, not
+  to a dead sender.
+- TERMINAL latches on the I/O loop and surfaces on the next producer call; no auto-resume (close+rebuild is the only recovery)
 - Disk-backed segment files under `sf_dir` stay on-disk-compatible with the Java `MmapSegment.java` layout
+
+### Store-and-forward & pool startup invariants (QWP)
+Apply this whenever the diff touches the SF sender, the cursor engine / send
+loop (`qwp_sf_send_loop.go`, `qwp_sf_engine.go`), the background or orphan
+drainers (`qwp_sf_drainer.go`, `qwp_sf_orphan.go`), primary reconnect/failover
+(`qwp_sf_round_walk.go`), `qwpSenderPool` / `qwpQueryPool` startup,
+`lazy_connect`, or `initial_connect_retry`. A violation here is a **Critical**
+finding: the whole point of store-and-forward is that a running producer never
+loses data and never hard-fails on a transient outage.
+
+**Send loop / drainer (steady state — once the sender or pool is running).**
+- Once running, the send loop and drainer goroutines ship buffered SF data to
+  the server. They MUST NOT propagate server / transport errors back to the
+  producer (`At`/`AtNow`/`Flush`, the pooled lease). The ONLY error a running
+  drain path may surface to the producer is **SF out of space** (the on-disk /
+  RAM backing buffer is full and can accept no more rows —
+  `ErrBackpressureTimeout` after `sf_append_deadline_millis`). Flag any other
+  failure class (connect-refused, DNS, unreachable/black-hole, TLS/cert, auth,
+  role-reject, upgrade/protocol timeout, reset) that can escape onto a producer
+  or borrow call.
+- Primary reconnect MUST be fully contained inside the send-loop/drainer
+  goroutine and MUST have **no time limit** — no
+  `reconnect_max_duration_millis`-style budget, no deadline, no "give up and
+  latch terminal after N ms". A budget that latches the sender terminal (or
+  reintroduces a budget-exhausted terminal event kind) on a long outage is a
+  Critical violation: it drops a producer that store-and-forward promised to
+  keep alive.
+  Flag any bounded reconnect loop, `time.Now().After(deadline)` /
+  `deadline`-gated retry, or terminal `*SenderError` reachable from the running
+  reconnect path.
+- The reconnect loop must retry with **exponential backoff** and handle every
+  connect failure class gracefully, without a hard fail — it keeps buffering
+  and keeps retrying until the wire is back. The per-attempt backoff may be
+  capped (`reconnect_max_backoff_millis`), but the RETRY LOOP ITSELF must be
+  unbounded. Flag a capped total retry duration or an attempt-count cap on the
+  steady-state path.
+- **Sanctioned terminals (orphan-slot drainer only).** The orphan drainer MAY
+  quarantine its slot (`.failed` sentinel, human-in-the-loop) on conditions
+  that are terminal by design: auth failure, a non-421 upgrade reject, and a
+  genuine cluster-wide durable-ack capability gap that exhausted its documented
+  settle budget (a cap counted ONLY in consecutive capability-gap sweeps, with
+  any wall-clock component anchored at the FIRST capability-gap error of the
+  episode). These are NOT violations of the no-budget rule above. Transient
+  classes (role reject, transport error) must never increment that budget or
+  burn its wall clock — a transient state consuming the terminal budget
+  (shared attempt counter, entry-anchored deadline) IS a Critical violation of
+  this checklist.
+
+**Pool startup — two modes; the mode decides who sees connectivity errors.**
+- `lazy_connect=true`: `NewQuestDB` / `Connect` MUST succeed with **no server
+  present**. The producing sender must work immediately (writes buffer via
+  SF / the cursor engine), and once the server comes up the read side must
+  also connect and read (reads are deferred, not disabled). Verify the build
+  does not fail-fast, the sender does not error on the first write while the
+  server is down, and a later `BorrowQuery` succeeds once the server is up.
+- `lazy_connect=false` (default): the build / initial connect MUST expose
+  connectivity problems to the caller — DNS errors, connect-refused /
+  unreachable, TLS/cert, authentication/authorization, and connect/upgrade
+  timeouts must all surface as a returned error at startup, not be swallowed.
+  Verify each of those failure classes reaches the user during initialization.
+- **In BOTH modes the boundary is the same:** connectivity errors are only
+  ever the caller's problem DURING initialization. Once the client has
+  connected and is past initialization, the running send loop/drainer reverts
+  to the steady-state contract above — it must NEVER expose transport problems,
+  NEVER impose a reconnect time budget, and NEVER hard-fail on a transient
+  outage. Anything that undermines the store-and-forward guarantee past init
+  is Critical.
 
 ### Performance
 - No new allocations on the pinned 0-alloc hot path (`Table`/`Symbol`/`*Column`/`At*`) — verify against `BenchmarkQwpSenderSteadyState`; new hot-path scratch must reuse a buffer on `qwpLineSender`

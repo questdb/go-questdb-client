@@ -90,10 +90,27 @@ func SanitizeConf(c *LineSenderConfig) error {
 	return nil
 }
 
+// unwrapPooledQwp reaches the delegate behind a facade pool lease so the
+// switch helpers below can dispatch on the concrete sender type. A stale lease
+// no longer owns its slot, so inspecting the delegate would read a re-borrowed
+// slot's state — panic with a clear message instead (test-helper contract,
+// mirroring the "unexpected struct" arms).
+func unwrapPooledQwp(s LineSender) LineSender {
+	ps, ok := s.(*qwpPooledSender)
+	if !ok {
+		return s
+	}
+	if !ps.live() {
+		panic("stale qwpPooledSender lease: slot returned or re-borrowed")
+	}
+	return ps.slot.delegate
+}
+
 func Messages(s LineSender) []byte {
 	if ps, ok := s.(*pooledSender); ok {
 		s = ps.wrapped
 	}
+	s = unwrapPooledQwp(s)
 	if hs, ok := s.(*httpLineSender); ok {
 		return hs.Messages()
 	}
@@ -122,6 +139,7 @@ func MsgCount(s LineSender) int {
 	if ps, ok := s.(*pooledSender); ok {
 		s = ps.wrapped
 	}
+	s = unwrapPooledQwp(s)
 	if hs, ok := s.(*httpLineSender); ok {
 		return hs.MsgCount()
 	}
@@ -150,6 +168,7 @@ func BufLen(s LineSender) int {
 	if ps, ok := s.(*pooledSender); ok {
 		s = ps.wrapped
 	}
+	s = unwrapPooledQwp(s)
 	if hs, ok := s.(*httpLineSender); ok {
 		return hs.BufLen()
 	}
@@ -182,6 +201,7 @@ func ProtocolVersion(s LineSender) protocolVersion {
 	if ps, ok := s.(*pooledSender); ok {
 		s = ps.wrapped
 	}
+	s = unwrapPooledQwp(s)
 	if _, ok := s.(*httpLineSender); ok {
 		return ProtocolVersion1
 	}

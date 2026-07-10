@@ -37,7 +37,7 @@ import (
 // transport selection as the short forms.
 func TestConfQwpwsAlias(t *testing.T) {
 	cases := []struct {
-		schema string
+		schema  string
 		wantTLS tlsMode
 	}{
 		{"ws", tlsDisabled},
@@ -131,13 +131,14 @@ func TestConfSizeSuffix(t *testing.T) {
 func TestConfSizeSuffixRejected(t *testing.T) {
 	cases := []string{
 		"",
-		"k",       // suffix without a number
-		"abc",     // non-numeric
-		"1.5m",    // floats not supported
-		"-1",      // negative bare
-		"-1m",     // negative with suffix
-		"1xb",     // unknown suffix
-		"1024kb extra", // trailing garbage
+		"k",              // suffix without a number
+		"abc",            // non-numeric
+		"1.5m",           // floats not supported
+		"-1",             // negative bare
+		"-1m",            // negative with suffix
+		"1xb",            // unknown suffix
+		"1024kb extra",   // trailing garbage
+		"9999999999999t", // n * (1<<40) overflows int64 (exercises the overflow guard)
 	}
 	for _, in := range cases {
 		t.Run(in, func(t *testing.T) {
@@ -194,6 +195,20 @@ func TestConfSenderIdRejectsDot(t *testing.T) {
 	}
 	if !strings.Contains(msg, ".") {
 		t.Errorf("error %q does not show the offending char", msg)
+	}
+}
+
+// TestConfSenderIdRejectsPathChars pins the path-traversal guard: sender_id is
+// used as a path segment under sf_dir, so separators, '..', dots, and spaces
+// must be rejected (Sender.java validateSenderId: letters, digits, '_', '-'
+// only). Calls the validator directly to cover chars a connect string can't
+// easily carry.
+func TestConfSenderIdRejectsPathChars(t *testing.T) {
+	bad := []string{"/", "..", "a/b", "a\\b", "a b", ".", "foo.bar", "../x"}
+	for _, id := range bad {
+		if err := validateSenderId(id); err == nil {
+			t.Errorf("validateSenderId(%q) = nil, want error", id)
+		}
 	}
 }
 
@@ -327,6 +342,15 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 		"failover_max_duration_ms=60000",
 		"initial_credit=262144",
 		"max_batch_rows=10000",
+		// Egress query-client keys with an explicit case in
+		// parseQwpQueryConf. Before these were cross-registered the facade's
+		// dual-parse rejected them.
+		"auth=Bearer xyz",
+		"client_id=reader-1",
+		"path=/exec",
+		"query_close_timeout_ms=5000",
+		"replay_exec=on",
+		"server_info_timeout_ms=1000",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
@@ -362,6 +386,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"auto_flush_interval=100",
 		"auto_flush_rows=1000",
 		"close_flush_timeout_millis=5000",
+		"connection_listener_inbox_capacity=256",
 		"drain_orphans=off",
 		"durable_ack_keepalive_interval_millis=200",
 		"error_inbox_capacity=256",
@@ -369,13 +394,14 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"initial_connect_retry=off",
 		"max_background_drainers=4",
 		"max_buf_size=100m",
+		"max_frame_rejections=4",
 		"max_name_len=127",
-		"on_internal_error=halt",
-		"on_parse_error=halt",
-		"on_schema_error=halt",
-		"on_security_error=halt",
+		"on_internal_error=terminal",
+		"on_parse_error=terminal",
+		"on_schema_error=terminal",
+		"on_security_error=terminal",
 		"on_server_error=auto",
-		"on_write_error=halt",
+		"on_write_error=terminal",
 		"reconnect_initial_backoff_millis=100",
 		"reconnect_max_backoff_millis=5000",
 		"reconnect_max_duration_millis=300000",
@@ -386,6 +412,15 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"sf_durability=memory",
 		"sf_max_bytes=4m",
 		"sf_max_total_bytes=10g",
+		// QWP ingest keys the egress parser must ignore. gorilla /
+		// in_flight_window are documented Java-parity knobs; token_x /
+		// token_y are legacy public-key fields the ingest client
+		// accepts-but-ignores. Before these were cross-registered the
+		// facade's dual-parse rejected them.
+		"gorilla=off",
+		"in_flight_window=10",
+		"token_x=pub-x",
+		"token_y=pub-y",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
@@ -408,7 +443,7 @@ func TestConfSharedConnectString(t *testing.T) {
 		// ingress-only:
 		"sf_dir=/tmp/sf;sender_id=ingest-1;auto_flush_rows=500;" +
 		"reconnect_max_duration_millis=120000;" +
-		"on_schema_error=drop;" +
+		"on_schema_error=retriable;" +
 		// egress-only:
 		"compression=zstd;compression_level=3;" +
 		"failover_max_attempts=8;failover_max_duration_ms=30000;"
@@ -417,6 +452,57 @@ func TestConfSharedConnectString(t *testing.T) {
 	}
 	if _, err := parseQwpQueryConf(shared); err != nil {
 		t.Errorf("egress parser rejected the shared connect string: %v", err)
+	}
+}
+
+// TestConfFacadeDualParseAcceptsSharedQwpKeys is the regression:
+// NewQuestDB / Connect validate the cluster string through BOTH parsers
+// up front (questdb.go), so any key one QWP client accepts must be
+// tolerated by the other or the facade rejects a documented-valid config.
+// gorilla / in_flight_window are Java-parity keys CLAUDE.md pins as "must
+// work here"; auth / client_id / path / replay_exec / server_info_timeout_ms
+// are egress query-pool knobs a facade user (which owns a query pool) sets.
+func TestConfFacadeDualParseAcceptsSharedQwpKeys(t *testing.T) {
+	// One string exercising every newly cross-registered key on both sides.
+	conf := "ws::addr=localhost:9000;" +
+		"gorilla=off;in_flight_window=10;token_x=x;token_y=y;" +
+		"auth=Bearer t;client_id=reader-1;path=/exec;replay_exec=on;server_info_timeout_ms=1000;"
+	if _, err := confFromStr(conf); err != nil {
+		t.Errorf("ingest parser (facade line 1) rejected %q: %v", conf, err)
+	}
+	if _, err := parseQwpQueryConf(conf); err != nil {
+		t.Errorf("egress parser (facade line 2) rejected %q: %v", conf, err)
+	}
+}
+
+// TestConfFacadeDualParseRejectsHttpOnlyKeys pins the deliberate flip
+// side: protocol_version / request_timeout / retry_timeout /
+// request_min_throughput are HTTP-only. The raw ingest parser stores
+// them but sanitizeQwpConf rejects them for QWP, so they were NOT
+// cross-registered — the egress parser must keep rejecting them so the
+// facade dual-parse rejects a config that could never drive a QWP sender.
+func TestConfFacadeDualParseRejectsHttpOnlyKeys(t *testing.T) {
+	for _, kv := range []string{
+		"protocol_version=2",
+		"request_timeout=1000",
+		"retry_timeout=1000",
+		"request_min_throughput=1000",
+	} {
+		t.Run(kv, func(t *testing.T) {
+			conf := "ws::addr=localhost:9000;" + kv + ";"
+			// The real QWP ingest client rejects it via sanitizeQwpConf...
+			c, err := confFromStr(conf)
+			if err != nil {
+				t.Fatalf("raw ingest parse of %q failed unexpectedly: %v", conf, err)
+			}
+			if err := sanitizeQwpConf(c); err == nil {
+				t.Errorf("sanitizeQwpConf accepted HTTP-only %q on QWP", kv)
+			}
+			// ...and the egress parser rejects it too (symmetric reject).
+			if _, err := parseQwpQueryConf(conf); err == nil {
+				t.Errorf("egress parser accepted HTTP-only %q; want reject", kv)
+			}
+		})
 	}
 }
 
@@ -504,22 +590,14 @@ func TestConfMemoryModeHonoursCloseFlushTimeout(t *testing.T) {
 	}
 }
 
-// TestWithCloseTimeoutSubMillisecondIsNoOverride pins that the
-// deprecated alias honours its documented "d <= 0 is treated as no
-// override" semantics for sub-millisecond positive durations too.
-// Without this gate, d=500µs satisfies d > 0, truncates to 0 ms,
-// sets closeFlushTimeoutSet=true, and routes into the fast-close
-// branch (qwp_sender_cursor.go:167, sender.go:1493), contradicting
-// the doc. Callers who actually want fast-close must opt in via
+// TestWithCloseTimeoutSubMillisecondFloorsToOneMs pins the deprecated alias's
+// boundary semantics: d <= 0 is "no override" as documented, while a positive
+// sub-millisecond duration must not silently truncate to 0 (which would route
+// into the fast-close branch) — it floors to 1ms, exactly like
+// WithConnectTimeout. Callers who actually want fast-close opt in via
 // WithCloseFlushTimeout.
-func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
-	for _, d := range []time.Duration{
-		0,
-		-1 * time.Second,
-		1 * time.Nanosecond,
-		500 * time.Microsecond,
-		999 * time.Microsecond,
-	} {
+func TestWithCloseTimeoutSubMillisecondFloorsToOneMs(t *testing.T) {
+	for _, d := range []time.Duration{0, -1 * time.Second} {
 		t.Run(d.String(), func(t *testing.T) {
 			c := newLineSenderConfig(qwpSenderType)
 			WithCloseTimeout(d)(c)
@@ -531,12 +609,26 @@ func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
 			}
 		})
 	}
-	// Sanity: the smallest representable positive value, 1ms, must
-	// still override (the gate is inclusive at the ms boundary).
+	for _, d := range []time.Duration{
+		1 * time.Nanosecond,
+		500 * time.Microsecond,
+		999 * time.Microsecond,
+		time.Millisecond,
+	} {
+		t.Run(d.String(), func(t *testing.T) {
+			c := newLineSenderConfig(qwpSenderType)
+			WithCloseTimeout(d)(c)
+			if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
+				t.Errorf("WithCloseTimeout(%s): set=%v millis=%d; want set=true millis=1",
+					d, c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
+			}
+		})
+	}
+	// Above the boundary, plain truncation applies.
 	c := newLineSenderConfig(qwpSenderType)
-	WithCloseTimeout(time.Millisecond)(c)
-	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
-		t.Errorf("WithCloseTimeout(1ms): set=%v millis=%d; want set=true millis=1",
+	WithCloseTimeout(2500 * time.Microsecond)(c)
+	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 2 {
+		t.Errorf("WithCloseTimeout(2.5ms): set=%v millis=%d; want set=true millis=2",
 			c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
 	}
 }

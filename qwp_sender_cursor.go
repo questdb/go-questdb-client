@@ -107,6 +107,7 @@ func newQwpCursorLineSender(
 	// lifetime) so the byte-trigger clamp and the flush-time drop guard
 	// bound batches to what a single segment can actually hold.
 	s.maxFrameBytes = cursorEngine.engineMaxFrameBytes()
+	s.wireDeltaDict(cursorEngine)
 	// Seed effectiveAutoFlushBytes via the same clamp the transport-swap
 	// callback applies, with no transport yet (server cap unknown). With
 	// no server cap this yields min(autoFlushBytes, maxFrameBytes*9/10),
@@ -197,6 +198,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	if err != nil {
 		return nil, err
 	}
+	engine.engineSetLogger(qwpEffectiveLogger(conf.logger))
 
 	// Failover plumbing (failover.md §2 / §13.6). The tracker is
 	// shared across every caller drawing from this addr= list: the
@@ -237,7 +239,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	switch conf.initialConnectMode {
 	case InitialConnectSync:
 		transport, initialBoundIdx, err = qwpSfConnectWithRetry(ctx, factory, tracker,
-			reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+			reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff, true, nil)
 	case InitialConnectAsync:
 		transport = nil
 	default: // InitialConnectOff
@@ -249,9 +251,10 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		// retry-with-backoff across multiple sweeps.
 		walkStart := time.Now()
 		rr := qwpSfRunSingleRound(ctx, nil, qwpSfRoundWalkParams{
-			Factory:   factory,
-			Tracker:   tracker,
-			Endpoints: conf.endpoints,
+			Factory:                 factory,
+			Tracker:                 tracker,
+			Endpoints:               conf.endpoints,
+			DurableMismatchTerminal: true,
 		}, -1)
 		switch {
 		case rr.Transport != nil:
@@ -269,6 +272,19 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		}
 	}
 	if err != nil {
+		// A terminal durable-ack mismatch on the InitialConnectOff / Sync
+		// connect paths arrives as a plain error (Off wraps rr.Terminal in
+		// fmt.Errorf; Sync via qwpSfConnectWithRetry). Upgrade it to the typed
+		// *SenderError of category PROTOCOL_VIOLATION that WithRequestDurableAck
+		// and QwpDurableAckMismatchError document — the async reconnect path
+		// already latches this via connectWithBackoff. The underlying
+		// *QwpDurableAckMismatchError is preserved as the SenderError cause, so
+		// errors.As reaches either type.
+		var mismatch *QwpDurableAckMismatchError
+		if errors.As(err, &mismatch) {
+			err = qwpSfUpgradeFailureSE(
+				engine.engineAckedFsn()+1, engine.enginePublishedFsn(), mismatch)
+		}
 		_ = engine.engineClose()
 		return nil, err
 	}
@@ -276,19 +292,44 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
 		reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+	loop.logger = qwpEffectiveLogger(conf.logger)
 	loop.sendLoopSetHostTracker(tracker, initialBoundIdx)
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	engine.engineSetTerminalErrorGetter(loop.sendLoopCheckError)
 	// Wire the user-configured server-error API knobs (Phase 5)
 	// before sendLoopStart so they're visible from the receiver
-	// goroutine the moment it starts.
+	// goroutine the moment it starts. When the caller registered no handler
+	// or listener, install the loud default bound to the configured logger
+	// (native-client "silence is forbidden") rather than leaving the
+	// dispatcher's slog.Default()-only fallback.
 	resolver := &qwpSfPolicyResolver{
 		resolver: conf.errorPolicyResolver,
 		perCat:   conf.errorPolicyPerCat,
 		global:   conf.errorPolicyGlobal,
+		logger:   loop.logger,
 	}
 	loop.sendLoopSetPolicyResolver(resolver)
-	loop.sendLoopSetErrorHandler(conf.errorHandler, conf.errorInboxCapacity)
+	errorHandler := conf.errorHandler
+	if errorHandler == nil {
+		errorHandler = newDefaultSenderErrorHandler(loop.logger)
+	}
+	loop.sendLoopSetErrorHandler(errorHandler, conf.errorInboxCapacity)
+	loop.sendLoopSetEndpoints(conf.endpoints)
+	connectionListener := conf.connectionListener
+	if connectionListener == nil {
+		connectionListener = newDefaultSenderConnectionListener(loop.logger)
+	}
+	loop.sendLoopSetConnectionListener(connectionListener, conf.connectionListenerInboxCapacity)
+	durableKeepalive := qwpDurableAckKeepaliveDefault
+	if conf.durableAckKeepaliveMillisSet {
+		durableKeepalive = time.Duration(conf.durableAckKeepaliveMillis) * time.Millisecond
+	}
+	loop.sendLoopSetDurableAck(conf.requestDurableAck, durableKeepalive, true)
+	loop.sendLoopSetMaxFrameRejections(conf.maxFrameRejections)
+	// The progress inbox has no dedicated sizing knob; give it the shared
+	// dispatcher default rather than borrowing error_inbox_capacity, which
+	// users tune for error bursts, not the (coalescing) progress stream.
+	loop.sendLoopSetProgressHandler(conf.progressHandler, qwpSfDefaultErrorInboxCapacity)
 
 	s, err := newQwpCursorLineSender(
 		conf.autoFlushRows,
@@ -322,6 +363,14 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	// callback on the very first swap.
 	loop.sendLoopSetOnTransportSwap(s.applyServerBatchSizeLimit)
 	s.applyServerBatchSizeLimit(loop.transport.Load())
+	// Sync/Off connected synchronously at construction (transport != nil);
+	// fire the one-shot CONNECTED now that the sender is fully built, so a
+	// construction failure above never leaves a listener believing a sender
+	// connected that never came back. The async path (transport == nil) fires
+	// CONNECTED from connectWithBackoff instead.
+	if transport != nil {
+		loop.emitInitialConnected(initialBoundIdx)
+	}
 	loop.sendLoopStart()
 
 	// Orphan adoption (drain_orphans=on). At foreground startup,
@@ -348,7 +397,12 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			maxDrainers = 4 // matches Java default
 		}
 		ownSlot := filepath.Base(slotPath)
-		orphans := qwpSfScanOrphans(conf.sfDir, ownSlot)
+		// Exclude this sender's own slot always, plus any slot the pool fences
+		// off as a live in-range sibling (Hazard G); nil fence on standalone.
+		orphans := qwpSfScanOrphans(conf.sfDir, func(name string) bool {
+			return name == ownSlot ||
+				(conf.orphanDrainExclude != nil && conf.orphanDrainExclude(name))
+		})
 		if len(orphans) > 0 {
 			pool := qwpSfNewDrainerPool(maxDrainers)
 			// Publish the pool onto the sender before submitting any
@@ -357,15 +411,34 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			// pool and shuts down the drainers already submitted; leaving
 			// the assignment past the loop would strand those goroutines
 			// and their connections.
+			pool.logger = loop.logger
 			s.drainerPool = pool
+			// Drainer dials get a finite default TCP-connect deadline when
+			// connect_timeout is unset: a black-holed SYN would otherwise
+			// ride the OS connect timeout on a goroutine only pool close can
+			// unwind. The foreground factory keeps the untimed default.
+			drainerFactory := factory
+			if opts.connectTimeoutMs <= 0 {
+				drainerOpts := opts
+				drainerOpts.connectTimeoutMs = qwpSfDrainerDefaultConnectTimeoutMs
+				drainerFactory = qwpSfBuildEndpointFactory(
+					conf.endpoints, scheme, drainerOpts, conf.dumpWriter)
+			}
 			for _, orphan := range orphans {
 				drainer := qwpSfNewOrphanDrainer(
 					orphan,
 					sfMaxBytes, sfMaxTotalBytes,
-					factory,
+					drainerFactory,
 					tracker,
 					reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff,
 				)
+				// Set before submit (which starts the goroutine): a durable-ack
+				// sender's drainers must also trim only on STATUS_DURABLE_ACK.
+				drainer.durableAckMode = conf.requestDurableAck
+				drainer.durableKeepalive = durableKeepalive
+				drainer.maxFrameRejections = conf.maxFrameRejections
+				drainer.logger = loop.logger
+				drainer.listener = conf.backgroundDrainerListener
 				_ = pool.drainerPoolSubmit(ctx, drainer)
 			}
 		}
@@ -417,8 +490,8 @@ func qwpSfBuildEndpointFactory(endpoints []qwpEndpoint, scheme string, opts qwpT
 // failure observed during the append window so a terminal error
 // reaches the producer immediately instead of on its next call.
 // Mirrors Java: flushAndGetSequence() = flushPendingRows() +
-// checkError() (design/qwp-cursor-durability.md decision #1 —
-// "flush() never waits for ACK; ACKs are async"). Callers wanting
+// checkError() — flush() never waits for ACK; ACKs are async.
+// Callers wanting
 // server-ACK confirmation pair FlushAndGetSequence with
 // AwaitAckedFsn.
 //
@@ -441,33 +514,81 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 	return s.cursorSendLoop.sendLoopCheckError()
 }
 
-// enqueueCursor encodes the pending rows as a self-sufficient QWP
-// frame and appends it to the cursor engine. It does NOT wait for
-// the server ACK (Java decision #1 in
-// design/qwp-cursor-durability.md: "flush() never waits for ACK;
-// ACKs are async") — the frame is durable once appended (in-RAM
-// for memory mode, on-disk for SF) and the send loop drains +
-// replays it in the background. Shared by the auto-flush trigger
-// and by flushCursor (explicit Flush()), so the user goroutine is
-// never blocked on a server round-trip.
+// symbolDeltaBaseline is the encoder's maxSentId argument: the id below which
+// the server already holds every dictionary entry. In delta mode it is the
+// producer's monotonic sent watermark, so a frame carries only ids above it;
+// in full-dict mode it is -1 so every frame re-ships the dictionary from id 0.
+func (s *qwpLineSender) symbolDeltaBaseline() int {
+	if s.deltaDictEnabled {
+		return s.maxSentSymbolId
+	}
+	return -1
+}
+
+// persistNewSymbols write-ahead persists the symbols a frame introduces
+// ([maxSentSymbolId+1 .. batchMaxSymbolId]) to the slot's .symbol-dict BEFORE
+// the frame is published, so a recovered / orphan-drained slot can rebuild the
+// dictionary the delta frame references. No-op unless SF + delta mode with new
+// symbols. Not fsync'd — a host-crash tear is caught by the send loop's replay
+// guard, not here.
+func (s *qwpLineSender) persistNewSymbols() error {
+	if s.persistedSymbolDict == nil {
+		return nil
+	}
+	// Start from what is actually on disk, not maxSentSymbolId: an append that
+	// succeeds while the following engine append fails leaves maxSentSymbolId
+	// behind the persisted count, and re-deriving the range from it would
+	// re-append the same symbols. Entry position is the symbol id, so duplicates
+	// would misalign every later id on recovery.
+	from := s.persistedSymbolDict.size()
+	to := s.batchMaxSymbolId
+	if to < from {
+		return nil
+	}
+	return s.persistedSymbolDict.appendSymbols(s.globalSymbolList[from : to+1])
+}
+
+// wireDeltaDict resolves delta symbol-dict mode from the engine (always in
+// memory mode, SF only when the persisted dictionary opened) and, on recovery,
+// reseeds the global dictionary from disk so newly ingested symbols continue
+// above the recovered ids and the delta baseline resumes at the recovered tip.
+func (s *qwpLineSender) wireDeltaDict(engine *qwpSfCursorEngine) {
+	s.deltaDictEnabled = engine.engineDeltaDictEnabled()
+	s.persistedSymbolDict = engine.enginePersistedSymbolDict()
+	if s.deltaDictEnabled && engine.engineWasRecoveredFromDisk() {
+		s.seedSymbolDictFromPersisted()
+	}
+}
+
+// seedSymbolDictFromPersisted repopulates the global dictionary from a
+// recovered slot's persisted .symbol-dict. Ids are assigned in the same
+// ascending order they were persisted (id == position), reproducing the exact
+// id→name map the recovered delta frames reference, and the delta baseline
+// resumes at the recovered tip so newly ingested symbols continue above it.
+func (s *qwpLineSender) seedSymbolDictFromPersisted() {
+	for _, name := range s.persistedSymbolDict.loadedSymbols() {
+		id := int32(len(s.globalSymbolList))
+		s.globalSymbolList = append(s.globalSymbolList, name)
+		s.globalSymbols[name] = id
+	}
+	s.maxSentSymbolId = len(s.globalSymbolList) - 1
+}
+
+// enqueueCursor encodes the pending rows as one QWP frame and appends it to
+// the cursor engine. It does NOT wait for the server ACK (flush() never waits;
+// ACKs are async) — the frame is durable once appended (in-RAM for memory
+// mode, on-disk for SF) and the send loop drains + replays it in the
+// background. Shared by the auto-flush trigger and by flushCursor (explicit
+// Flush()), so the user goroutine is never blocked on a server round-trip.
 //
-// Self-sufficient = full schema definitions for every table + full
-// symbol-dict delta from id 0 (Java decision #14). The frame must
-// replay correctly against any fresh server connection (post-
-// reconnect, post-restart, drainer adopting an orphan slot) — refs
-// to schema/symbol IDs the new server has never seen would be
-// unrecoverable.
-//
-// Schema-side: every table block carries its full inline column
-// definitions. There is no producer-side schema registry to advance.
-//
-// Symbol-side: the dict uses a delta encoding (varint-prefixed
-// length, then names). We always pass `-1` as the encoder's maxSentId
-// so the delta starts at id 0 (self-sufficient frame), and
-// batchMaxSymbolId — passed as batchMaxId — bounds how much of
-// globalSymbolList goes out (ids 0..batchMaxSymbolId). maxSentSymbolId
-// carries the high-water mark across flushes so resetAfterFlush can
-// rewind batchMaxSymbolId to it. Both fields do real work here.
+// Schema-side: every table block carries its full inline column definitions,
+// so schemas replay correctly against any fresh server connection with no
+// producer-side registry. Symbol-side: the dict is delta-encoded from
+// symbolDeltaBaseline() — in full-dict mode -1 (self-sufficient, ids 0..
+// batchMaxSymbolId), in delta mode the sent watermark so only new ids go out,
+// with a send-loop catch-up frame re-registering the whole dictionary on
+// reconnect. In SF + delta mode the new ids are persisted before the append so
+// recovery / orphan-drain can rebuild them.
 func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 		return err
@@ -490,7 +611,7 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	encoded := s.encoder.encodeMultiTableWithDeltaDict(
 		tables,
 		s.globalSymbolList,
-		-1, // self-sufficient: full dict from id 0
+		s.symbolDeltaBaseline(),
 		s.batchMaxSymbolId,
 	)
 	// Flush-time cap check. The per-row guard in atWithTimestamp bounds
@@ -511,6 +632,9 @@ func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	// flushPendingRowsSplit.
 	if kind, _ := s.frameCapExceeded(len(encoded)); kind != qwpFrameCapNone {
 		return s.enqueueCursorSplit(ctx, tables)
+	}
+	if err := s.persistNewSymbols(); err != nil {
+		return err
 	}
 	if _, err := s.cursorEngine.engineAppendBlocking(ctx, encoded); err != nil {
 		return err
@@ -548,18 +672,23 @@ func (s *qwpLineSender) frameCapExceeded(frameLen int) (qwpFrameCapKind, int64) 
 }
 
 // enqueueCursorSplit is enqueueCursor's over-cap fallback: it re-encodes
-// each pending table as its own self-sufficient single-table frame and
-// appends every table whose frame fits a wire cap. A combined frame that
-// overruns a cap only because it aggregates many tables flushes in full
-// this way — one frame per table. Only a table whose own frame is still
-// over-cap is irreducible: re-encoding it on the next flush would fail
-// identically forever and wedge the sender, so its rows are dropped and
-// named in a typed error while every other table goes out. Mirrors Java
-// QwpWebSocketSender.flushPendingRowsSplit.
+// each pending table as its own single-table frame and appends every table
+// whose frame fits a wire cap. A combined frame that overruns a cap only
+// because it aggregates many tables flushes in full this way — one frame per
+// table. Only a table whose own frame is still over-cap is irreducible:
+// re-encoding it on the next flush would fail identically forever and wedge
+// the sender, so its rows are dropped and named in a typed error while every
+// other table goes out. Mirrors Java QwpWebSocketSender.flushPendingRowsSplit.
 //
-// Each single-table frame carries the full symbol dict from id 0 and the
-// full inline schema, exactly like the combined frame, so it replays
-// against a fresh server connection on its own.
+// Each frame carries its full inline schema. The symbol dict follows the same
+// delta rule as enqueueCursor (symbolDeltaBaseline): the first appended frame
+// ships the batch's new ids and advances the sent watermark, so later frames
+// carry an empty delta referencing ids that frame already registered. The
+// baseline MUST advance per-frame here, not once at the end — otherwise every
+// per-table frame would re-ship the whole batch delta. It must also stay a
+// delta (not -1): a full-dict frame here would be skipped by the send-loop
+// mirror, so the reconnect catch-up would under-register and a later delta
+// frame would dangle a symbol id on a fresh server.
 //
 // The retain-on-error contract holds per table: a table is reset only
 // once its frame is in a segment, so a transient engineAppendBlocking
@@ -581,7 +710,7 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 			continue
 		}
 		frame := s.encoder.encodeTableWithDeltaDict(
-			tb, s.globalSymbolList, -1, s.batchMaxSymbolId)
+			tb, s.globalSymbolList, s.symbolDeltaBaseline(), s.batchMaxSymbolId)
 		if kind, capVal := s.frameCapExceeded(len(frame)); kind != qwpFrameCapNone {
 			// Irreducible: a single table over the cap can never be sent.
 			// Drop it; the other tables are unaffected.
@@ -593,6 +722,10 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 			tb.reset()
 			continue
 		}
+		if err := s.persistNewSymbols(); err != nil {
+			txErr = err
+			break
+		}
 		if _, err := s.cursorEngine.engineAppendBlocking(ctx, frame); err != nil {
 			// Transient: retain this table and the unprocessed tail for
 			// the next flush. Tables already appended stay reset so they
@@ -600,12 +733,13 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 			txErr = err
 			break
 		}
+		// Advance the sent watermark per-frame so the next per-table frame's
+		// delta starts above the ids this one just registered.
+		if s.batchMaxSymbolId > s.maxSentSymbolId {
+			s.maxSentSymbolId = s.batchMaxSymbolId
+		}
 		appended++
 		tb.reset()
-	}
-
-	if appended > 0 && s.batchMaxSymbolId > s.maxSentSymbolId {
-		s.maxSentSymbolId = s.batchMaxSymbolId
 	}
 
 	if txErr != nil {
@@ -613,6 +747,15 @@ func (s *qwpLineSender) enqueueCursorSplit(ctx context.Context, tables []*qwpTab
 		// hold their rows. Bring the aggregate counters back in line with
 		// the surviving buffers; the caller must not reset on error.
 		s.recomputePendingFromBuffers()
+		// Any table already dropped for being irreducibly over-cap was reset
+		// before this transient failure, so its rows will not reappear on the
+		// retry the transient error invites. Join the typed drop error so that
+		// notification is surfaced now rather than silently lost.
+		if len(oversize) > 0 {
+			return errors.Join(
+				s.oversizeTableError(worstKind, worstCap, worstSize, oversize, droppedRows),
+				txErr)
+		}
 		return txErr
 	}
 
@@ -693,38 +836,48 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 	return s.encodeInfoBuf, nil
 }
 
-// calledFromErrorHandler reports whether the current goroutine is the
-// error dispatcher's loop goroutine — i.e. we are running inside a
-// user SenderErrorHandler invocation. The handler is documented as
-// allowed to call Close() / Flush(); when it does, those calls run off
-// the producer goroutine. The producer owns lastErr / hasTable /
-// currentTable / pendingRowCount / the tableBuffers map / the
-// dirtyTables list / the encoder with no happens-before against this
+// calledFromDispatcherGoroutine reports whether the current goroutine is one of
+// the sender's callback dispatcher goroutines — i.e. we are running inside a
+// user SenderErrorHandler, SenderConnectionListener, or SenderProgressHandler
+// invocation. Callbacks are documented as allowed to call Close() / Flush();
+// when they do, those calls run off the producer goroutine. The producer owns
+// lastErr / hasTable / currentTable / pendingRowCount / the tableBuffers map /
+// the dirtyTables list / the encoder with no happens-before against this
 // goroutine, so the Close()/Flush() paths must NOT touch that state —
 // doing so races a producer mid-At(): buildTableEncodeInfo ranges
 // dirtyTables while Table() appends to it, and Table() writes the
 // tableBuffers map, either of which corrupts state (a racing slice
 // range/append, or Go's fatal "concurrent map iteration and map write").
 //
-// Cheap on the common path: loopGoid is 0 whenever the dispatcher
-// goroutine is not running (no server error has ever been delivered),
-// so the runtime.Stack cost of qwpGoid() is only paid once an error has
-// actually spun the dispatcher up. The g != 0 guard keeps a goid parse
-// failure from matching the loopGoid==0 "not running" sentinel.
-func (s *qwpLineSender) calledFromErrorHandler() bool {
+// Cheap on the common path: each loopGoid is 0 whenever that dispatcher
+// goroutine is not running (nothing has ever been delivered on it), so the
+// runtime.Stack cost of qwpGoid() is only paid once a dispatcher has actually
+// spun up. The g != 0 guard keeps a goid parse failure from matching the
+// loopGoid==0 "not running" sentinel.
+func (s *qwpLineSender) calledFromDispatcherGoroutine() bool {
 	if s.cursorSendLoop == nil {
 		return false
 	}
-	d := s.cursorSendLoop.sendLoopDispatcher()
-	if d == nil {
-		return false
+	loopIds := [3]int64{
+		s.cursorSendLoop.sendLoopDispatcher().loopGoroutineId(),
+		s.cursorSendLoop.sendLoopConnDispatcher().loopGoroutineId(),
+		s.cursorSendLoop.progressDispatcher.Load().loopGoroutineId(),
 	}
-	lg := d.loopGoid.Load()
-	if lg == 0 {
-		return false
+	g := int64(0)
+	for _, lg := range loopIds {
+		if lg == 0 {
+			continue
+		}
+		if g == 0 {
+			if g = qwpGoid(); g == 0 {
+				return false
+			}
+		}
+		if g == lg {
+			return true
+		}
 	}
-	g := qwpGoid()
-	return g != 0 && g == lg
+	return false
 }
 
 // closeCursor drains the cursor engine and closes the send loop.
@@ -741,10 +894,11 @@ func (s *qwpLineSender) calledFromErrorHandler() bool {
 //     recovery path and must treat the timeout as fatal.
 //   - closeFlushTimeout <= 0: skip the drain entirely (fast close).
 func (s *qwpLineSender) closeCursor(ctx context.Context) error {
-	// A Close() invoked from inside a SenderErrorHandler runs on the
+	// A Close() invoked from inside a user callback (SenderErrorHandler,
+	// SenderConnectionListener, or SenderProgressHandler) runs on that
 	// dispatcher goroutine, not the producer goroutine. Flushing pending
 	// rows or even reading lastErr / hasTable / pendingRowCount here
-	// would race a producer still mid-Table()/At() (the C3
+	// would race a producer still mid-Table()/At() (the
 	// producer-state race). Skip every producer-state access in that
 	// case and run only the goroutine-safe teardown below (drain wait,
 	// send-loop close, engine close, drainer pool). The producer
@@ -753,7 +907,7 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	// handed off and remain its own to retry (SF mode replays whatever
 	// was already persisted on the next open).
 	var firstErr error
-	if !s.calledFromErrorHandler() {
+	if !s.calledFromDispatcherGoroutine() {
 		// Surface any latched fluent-API error (e.g. validation failure
 		// on Symbol/*Column/Table) so Close() doesn't silently swallow
 		// it — mirrors the HTTP sender's flush0, which drains
@@ -806,9 +960,17 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopClose(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	// Close the engine (closes ring, manager if owned, and slot lock).
-	if err := s.cursorEngine.engineClose(); err != nil && firstErr == nil {
-		firstErr = err
+	// Close the engine (closes ring, manager if owned, and slot lock). If the
+	// send loop was abandoned wedged in disk I/O, leak the segment mmaps rather
+	// than unmap them under the still-live goroutine.
+	var engineCloseErr error
+	if s.cursorSendLoop.sendLoopAbandoned() {
+		engineCloseErr = s.cursorEngine.engineCloseLeakSegments()
+	} else {
+		engineCloseErr = s.cursorEngine.engineClose()
+	}
+	if engineCloseErr != nil && firstErr == nil {
+		firstErr = engineCloseErr
 	}
 	// Stop the drainer pool last — drainers may still be using the
 	// reconnect factory (which captures the foreground's address +
@@ -872,6 +1034,13 @@ func (s *qwpLineSender) drainTimeoutError() error {
 // AckedFsn implements QwpSender.AckedFsn.
 func (s *qwpLineSender) AckedFsn() int64 {
 	return s.cursorEngine.engineAckedFsn()
+}
+
+// hasUnackedRows reports whether the engine holds published rows the server has
+// not yet acknowledged. The pool uses it to keep an idle memory-mode slot alive
+// through a transient outage instead of reaping (and destroying) its in-RAM rows.
+func (s *qwpLineSender) hasUnackedRows() bool {
+	return s.cursorEngine.enginePublishedFsn() > s.cursorEngine.engineAckedFsn()
 }
 
 // AwaitAckedFsn implements QwpSender.AwaitAckedFsn. This is the
@@ -941,6 +1110,19 @@ func (s *qwpLineSender) LastTerminalError() *SenderError {
 	return s.cursorSendLoop.sendLoopLastTerminalServerError()
 }
 
+// terminallyFailed reports whether the background send loop has latched a
+// terminal error and exited. Unlike LastTerminalError (typed server HALTs only)
+// this also covers the untyped transport/segment-fault paths (recordFatal), so
+// it is the complete "this connection is poisoned" signal — the qwpLineSender
+// analogue of QwpQueryClient.terminalError. It never reports true during a
+// normal transient reconnect: lastError is latched only on the loop's terminal
+// exit and is never cleared. The pool uses it to discard a slot poisoned by a
+// background HALT instead of leaking it to the next borrower or recycling
+// it after a benign producer error.
+func (s *qwpLineSender) terminallyFailed() bool {
+	return s.cursorSendLoop != nil && s.cursorSendLoop.sendLoopCheckError() != nil
+}
+
 // TotalServerErrors implements QwpSender.TotalServerErrors.
 func (s *qwpLineSender) TotalServerErrors() int64 {
 	if s.cursorSendLoop == nil {
@@ -955,6 +1137,14 @@ func (s *qwpLineSender) DroppedErrorNotifications() int64 {
 		return 0
 	}
 	return s.cursorSendLoop.sendLoopDispatcher().droppedNotifications()
+}
+
+// DroppedConnectionNotifications implements QwpSender.DroppedConnectionNotifications.
+func (s *qwpLineSender) DroppedConnectionNotifications() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopConnDispatcher().droppedNotifications()
 }
 
 // TotalErrorNotificationsDelivered implements
@@ -988,6 +1178,22 @@ func (s *qwpLineSender) TotalFramesReplayed() int64 {
 		return 0
 	}
 	return s.cursorSendLoop.sendLoopTotalFramesReplayed()
+}
+
+// TotalDurableAcks implements QwpSender.TotalDurableAcks.
+func (s *qwpLineSender) TotalDurableAcks() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalDurableAcks()
+}
+
+// TotalDurableTrimAdvances implements QwpSender.TotalDurableTrimAdvances.
+func (s *qwpLineSender) TotalDurableTrimAdvances() int64 {
+	if s.cursorSendLoop == nil {
+		return 0
+	}
+	return s.cursorSendLoop.sendLoopTotalDurableTrimAdvances()
 }
 
 // TotalBackpressureStalls implements QwpSender.TotalBackpressureStalls.

@@ -61,18 +61,18 @@ func TestQwpSfScanOrphansFindsCandidates(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "own-slot"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "own-slot", "sf-x.sfa"), []byte{}, 0o644))
 
-	orphans := qwpSfScanOrphans(root, "own-slot")
+	orphans := qwpSfScanOrphans(root, func(name string) bool { return name == "own-slot" })
 	require.Len(t, orphans, 1)
 	assert.Equal(t, filepath.Join(root, "orphan-1"), orphans[0])
 }
 
 func TestQwpSfScanOrphansEmptyDirReturnsNothing(t *testing.T) {
 	root := t.TempDir()
-	assert.Empty(t, qwpSfScanOrphans(root, ""))
+	assert.Empty(t, qwpSfScanOrphans(root, nil))
 }
 
 func TestQwpSfScanOrphansMissingDirReturnsNothing(t *testing.T) {
-	assert.Empty(t, qwpSfScanOrphans("/nonexistent/path", ""))
+	assert.Empty(t, qwpSfScanOrphans("/nonexistent/path", nil))
 }
 
 func TestQwpSfMarkSlotFailed(t *testing.T) {
@@ -181,6 +181,148 @@ func TestQwpSfDrainerMarksFailedOnAuthRejection(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
 	require.NoError(t, err)
 	assert.Contains(t, string(body), "connect")
+}
+
+// TestQwpSfDrainerDurableAckMismatchQuarantines pins §5.8 / Hazard I: a
+// durable-ack drainer against an endpoint that does not advertise durable-ack
+// retries (its source is pinned), notifies the listener each attempt, and after
+// the cap quarantines the slot with a .failed sentinel — never trimming.
+func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{}) // does not advertise durable-ack
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+
+	var unavailable, persistent, lastAttempts int
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		qwpSfDurableDialFor(srv),
+		nil,
+		5*time.Second, time.Millisecond, 5*time.Millisecond,
+	)
+	drainer.durableAckMode = true
+	drainer.listener = QwpBackgroundDrainerListener{
+		OnDurableAckUnavailable:       func(string, int) { unavailable++ },
+		OnDurableAckPersistentFailure: func(_ string, attempts int, _ time.Duration) { persistent++; lastAttempts = attempts },
+	}
+	drainer.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "durable-ack")
+	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, unavailable, "one OnDurableAckUnavailable per mismatch up to the cap")
+	assert.Equal(t, 1, persistent, "OnDurableAckPersistentFailure fires exactly once")
+	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, lastAttempts)
+
+	// Positively confirm the drainer never trimmed the un-uploaded data: its
+	// backing .sfa segment must survive quarantine (Hazard I — never unlink an
+	// un-durable segment). A regression that trimmed on the OK ack in durable
+	// drainer mode would delete it and still pass the assertions above.
+	segs, err := filepath.Glob(filepath.Join(dir, "*.sfa"))
+	require.NoError(t, err)
+	assert.NotEmpty(t, segs, "quarantine must leave the un-uploaded .sfa segment intact")
+}
+
+// TestQwpSfDrainerListenerPanicIsolated pins the isolation invariant: a panic in a user-supplied
+// background-drainer callback is recovered rather than unwinding into the
+// drainer's goroutine (where the top-level recover would quarantine an
+// otherwise-recoverable slot).
+func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
+	t.Run("HelperRecovers", func(t *testing.T) {
+		qwpDrainerListenerCall(nil, func() { panic("boom") }) // must not propagate
+		qwpDrainerListenerCall(nil, nil)                      // nil-safe
+	})
+
+	t.Run("OnDurableAckUnavailablePanicContained", func(t *testing.T) {
+		d := qwpSfNewOrphanDrainer(
+			t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
+			nil, nil,
+			time.Second, time.Millisecond, 5*time.Millisecond,
+		)
+		d.durableAckMode = true
+		d.listener = QwpBackgroundDrainerListener{
+			OnDurableAckUnavailable: func(string, int) { panic("user callback boom") },
+		}
+		// onRoundExhausted runs on the goroutine driving the connect walk
+		// (the drainerRun goroutine or the send-loop I/O goroutine); a
+		// panic in the callback must be contained there, and the
+		// capability-gap sweep must still be counted.
+		d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true})
+		assert.Equal(t, int64(1), d.mismatchAttempts.Load())
+	})
+
+	t.Run("OnDurableAckPersistentFailurePanicContained", func(t *testing.T) {
+		d := qwpSfNewOrphanDrainer(
+			t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
+			nil, nil,
+			time.Second, time.Millisecond, 5*time.Millisecond,
+		)
+		d.durableAckMode = true
+		d.listener = QwpBackgroundDrainerListener{
+			OnDurableAckPersistentFailure: func(string, int, time.Duration) { panic("give-up boom") },
+		}
+		// recordDurableGiveUp runs on the drainerRun goroutine; the panic must
+		// be contained and the slot still quarantined (.failed) as usual.
+		d.recordDurableGiveUp()
+		assert.Equal(t, qwpSfDrainOutcomeFailed, d.drainerOutcome())
+	})
+}
+
+// TestQwpSfDrainerSettleBudgetPausesOnMixedSweep pins that a reconnect sweep
+// which saw both a durable-ack mismatch (a reachable non-durable node) and a
+// transport error (the durable primary transiently down) neither charges nor
+// resets the capability-gap settle budget: the primary may merely be rebooting,
+// so the budget must pause with the outage (Invariant B) rather than quarantine
+// a recoverable slot. Only a pure capability-gap sweep charges.
+func TestQwpSfDrainerSettleBudgetPausesOnMixedSweep(t *testing.T) {
+	newDrainer := func() *qwpSfOrphanDrainer {
+		d := qwpSfNewOrphanDrainer(
+			t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
+			nil, nil,
+			time.Second, time.Millisecond, 5*time.Millisecond,
+		)
+		d.durableAckMode = true
+		return d
+	}
+
+	t.Run("MixedSweepNeitherChargesNorQuarantines", func(t *testing.T) {
+		d := newDrainer()
+		for i := 0; i < qwpMaxDurableAckMismatchAttempts+5; i++ {
+			d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true, SawTransportError: true})
+		}
+		assert.Equal(t, int64(0), d.mismatchAttempts.Load())
+		assert.False(t, d.durableMismatchGaveUp.Load())
+		assert.False(t, d.stopRequested.Load())
+	})
+
+	t.Run("PureCapabilityGapStillCharges", func(t *testing.T) {
+		d := newDrainer()
+		d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true})
+		assert.Equal(t, int64(1), d.mismatchAttempts.Load())
+	})
+
+	t.Run("PureTransportSweepDoesNotResetTheCharge", func(t *testing.T) {
+		d := newDrainer()
+		d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true}) // charge to 1
+		d.onRoundExhausted(qwpSfSweepOutcome{SawTransportError: true})  // pause, no reset
+		assert.Equal(t, int64(1), d.mismatchAttempts.Load())
+	})
+
+	t.Run("AllReplicaSweepResetsTheCharge", func(t *testing.T) {
+		d := newDrainer()
+		d.onRoundExhausted(qwpSfSweepOutcome{SawDurableMismatch: true}) // charge to 1
+		d.onRoundExhausted(qwpSfSweepOutcome{SawRoleReject: true})      // topology churn: reset
+		assert.Equal(t, int64(0), d.mismatchAttempts.Load())
+	})
 }
 
 func TestQwpSfDrainerSucceedsOnAlreadyDrainedSlot(t *testing.T) {
@@ -690,4 +832,111 @@ func TestQwpSfDrainerMarksFailedWhenConnectedButNeverAcked(t *testing.T) {
 	// re-adoption candidate: a future process start won't re-adopt it.
 	assert.False(t, qwpSfIsCandidateOrphan(dir),
 		"slot must be quarantined (not a re-adoption candidate) after the watchdog fires")
+}
+
+// TestQwpSfDrainerRetriesDownServerInsteadOfQuarantining pins Invariant B:
+// a transport outage that outlasts the former reconnect budget must not
+// quarantine the slot — the drainer keeps retrying with capped backoff and
+// drains once the server is reachable again.
+func TestQwpSfDrainerRetriesDownServerInsteadOfQuarantining(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+
+	var up atomic.Bool
+	factory := func(ctx context.Context, idx int) (*qwpTransport, error) {
+		if !up.Load() {
+			return nil, errors.New("dial tcp: connect: connection refused")
+		}
+		return qwpSfDialFor(srv)(ctx, idx)
+	}
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		factory,
+		nil,
+		50*time.Millisecond /* former budget */, time.Millisecond, 5*time.Millisecond,
+	)
+	done := make(chan struct{})
+	go func() { drainer.drainerRun(context.Background()); close(done) }()
+
+	// Outlast the former budget several times over: still retrying, no sentinel.
+	time.Sleep(300 * time.Millisecond)
+	assert.Equal(t, qwpSfDrainOutcomePending, drainer.drainerOutcome(),
+		"drainer must keep retrying a down server, not fail")
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "a down server must not drop .failed")
+
+	up.Store(true)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainer did not finish after the server came up")
+	}
+	assert.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome())
+}
+
+// TestQwpSfDrainerAllReplicaWindowRetriesAndFiresPrimaryUnavailable pins the
+// graceful-failover window: while every endpoint 421-role-rejects (all
+// replicas), the drainer fires OnPrimaryUnavailable per sweep, keeps retrying
+// without quarantining, and drains once a primary reappears.
+func TestQwpSfDrainerAllReplicaWindowRetriesAndFiresPrimaryUnavailable(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+
+	var promoted atomic.Bool
+	factory := func(ctx context.Context, idx int) (*qwpTransport, error) {
+		if !promoted.Load() {
+			return nil, &QwpUpgradeRejectError{StatusCode: 421, Role: "REPLICA"}
+		}
+		return qwpSfDialFor(srv)(ctx, idx)
+	}
+
+	var primaryUnavailable atomic.Int64
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		factory,
+		nil,
+		50*time.Millisecond, time.Millisecond, 5*time.Millisecond,
+	)
+	drainer.listener = QwpBackgroundDrainerListener{
+		OnPrimaryUnavailable: func(_ string, attempt int) { primaryUnavailable.Store(int64(attempt)) },
+	}
+	done := make(chan struct{})
+	go func() { drainer.drainerRun(context.Background()); close(done) }()
+
+	require.Eventually(t, func() bool { return primaryUnavailable.Load() >= 2 },
+		2*time.Second, 5*time.Millisecond,
+		"OnPrimaryUnavailable should fire once per all-replica sweep")
+	assert.Equal(t, qwpSfDrainOutcomePending, drainer.drainerOutcome(),
+		"an all-replica window must keep the drainer retrying")
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "an all-replica window must not drop .failed")
+
+	promoted.Store(true)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainer did not finish after a primary reappeared")
+	}
+	assert.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome())
 }

@@ -25,6 +25,7 @@
 package questdb_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -41,27 +42,27 @@ func TestErrorApiConfStringHappyPath(t *testing.T) {
 		wantParse  qdb.Policy
 	}{
 		{
-			conf:       "ws::addr=h:9000;on_server_error=halt;",
-			wantGlobal: qdb.PolicyHalt,
+			conf:       "ws::addr=h:9000;on_server_error=terminal;",
+			wantGlobal: qdb.PolicyTerminal,
 		},
 		{
-			conf:       "ws::addr=h:9000;on_server_error=drop;",
-			wantGlobal: qdb.PolicyDropAndContinue,
+			conf:       "ws::addr=h:9000;on_server_error=retriable;",
+			wantGlobal: qdb.PolicyRetriable,
 		},
 		{
 			conf:       "ws::addr=h:9000;on_server_error=auto;",
 			wantGlobal: qdb.PolicyAuto,
 		},
 		{
-			conf:       "ws::addr=h:9000;on_schema_error=halt;",
-			wantSchema: qdb.PolicyHalt,
+			conf:       "ws::addr=h:9000;on_schema_error=terminal;",
+			wantSchema: qdb.PolicyTerminal,
 		},
 		{
-			conf:       "ws::addr=h:9000;on_parse_error=drop;",
-			wantParse:  qdb.PolicyDropAndContinue,
+			conf:      "ws::addr=h:9000;on_parse_error=retriable;",
+			wantParse: qdb.PolicyRetriable,
 		},
 		{
-			conf:       "ws::addr=h:9000;on_internal_error=halt;on_security_error=drop;on_write_error=halt;",
+			conf:       "ws::addr=h:9000;on_internal_error=terminal;on_security_error=retriable;on_write_error=terminal;",
 			wantGlobal: qdb.PolicyAuto,
 		},
 		{
@@ -91,7 +92,7 @@ func TestErrorApiConfStringInvalidValues(t *testing.T) {
 		{"ws::addr=h:9000;on_parse_error=foo;", "on_parse_error"},
 		{"ws::addr=h:9000;on_internal_error=banana;", "on_internal_error"},
 		{"ws::addr=h:9000;on_security_error=;", "on_security_error"},
-		{"ws::addr=h:9000;on_write_error=halts;", "on_write_error"},
+		{"ws::addr=h:9000;on_write_error=terminals;", "on_write_error"},
 		{"ws::addr=h:9000;error_inbox_capacity=-1;", "error_inbox_capacity"},
 	}
 	for _, tc := range cases {
@@ -107,16 +108,47 @@ func TestErrorApiConfStringInvalidValues(t *testing.T) {
 	}
 }
 
+// TestErrorApiConfStringV1PoliciesRejected pins the source-breaking migration:
+// the v1 policy values (halt / drop) are rejected with a hint pointing at the
+// v2 names, on the global key and every per-category key, rather than silently
+// reinterpreted.
+func TestErrorApiConfStringV1PoliciesRejected(t *testing.T) {
+	keys := []string{
+		"on_server_error", "on_schema_error", "on_parse_error",
+		"on_internal_error", "on_security_error", "on_write_error",
+	}
+	for _, k := range keys {
+		for _, v := range []string{"halt", "drop"} {
+			conf := fmt.Sprintf("ws::addr=h:9000;%s=%s;", k, v)
+			t.Run(conf, func(t *testing.T) {
+				_, err := qdb.ConfFromStr(conf)
+				if err == nil {
+					t.Fatalf("ConfFromStr(%q) should reject the removed v1 policy", conf)
+				}
+				msg := err.Error()
+				if !strings.Contains(msg, k) {
+					t.Fatalf("error = %v, want to name the key %q", err, k)
+				}
+				for _, want := range []string{"terminal", "retriable", "retriable_other"} {
+					if !strings.Contains(msg, want) {
+						t.Fatalf("error = %v, want migration hint naming %q", err, want)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestErrorApiConfStringQwpOnly asserts each new key is rejected for
 // HTTP and TCP transports.
 func TestErrorApiConfStringQwpOnly(t *testing.T) {
 	keys := []string{
-		"on_server_error=halt",
-		"on_schema_error=halt",
-		"on_parse_error=halt",
-		"on_internal_error=halt",
-		"on_security_error=halt",
-		"on_write_error=halt",
+		"on_server_error=terminal",
+		"on_schema_error=terminal",
+		"on_parse_error=terminal",
+		"on_internal_error=terminal",
+		"on_security_error=terminal",
+		"on_write_error=terminal",
 		"error_inbox_capacity=32",
 	}
 	prefixes := []string{"http", "tcp"}
@@ -136,15 +168,19 @@ func TestErrorApiConfStringQwpOnly(t *testing.T) {
 	}
 }
 
-// TestErrorApiSanitizerRejectsTinyInbox asserts the sanitizer rejects
-// error_inbox_capacity values below the spec floor of 16.
+// TestErrorApiSanitizerRejectsTinyInbox asserts the parser rejects
+// inbox capacities outside [16, 1<<20]: sub-floor values are undersized,
+// and over-ceiling values would panic make(chan) at construction.
 func TestErrorApiSanitizerRejectsTinyInbox(t *testing.T) {
 	cases := []struct {
 		conf string
 		want string
 	}{
-		{"ws::addr=h:9000;error_inbox_capacity=1;", ">="},
-		{"ws::addr=h:9000;error_inbox_capacity=15;", ">="},
+		{"ws::addr=h:9000;error_inbox_capacity=1;", "must be in"},
+		{"ws::addr=h:9000;error_inbox_capacity=15;", "must be in"},
+		{"ws::addr=h:9000;error_inbox_capacity=1099511627776;", "must be in"},
+		{"ws::addr=h:9000;connection_listener_inbox_capacity=15;", "must be in"},
+		{"ws::addr=h:9000;connection_listener_inbox_capacity=1099511627776;", "must be in"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.conf, func(t *testing.T) {
@@ -163,6 +199,17 @@ func TestErrorApiSanitizerRejectsTinyInbox(t *testing.T) {
 func TestErrorApiSanitizerAcceptsAtFloor(t *testing.T) {
 	if _, err := qdb.ConfFromStr("ws::addr=h:9000;error_inbox_capacity=16;"); err != nil {
 		t.Fatalf("capacity=16 should pass, got %v", err)
+	}
+}
+
+// TestErrorApiSanitizerAcceptsAtCeiling asserts the ceiling value (1<<20)
+// passes for both inbox keys — the rejection is strictly above it.
+func TestErrorApiSanitizerAcceptsAtCeiling(t *testing.T) {
+	if _, err := qdb.ConfFromStr("ws::addr=h:9000;error_inbox_capacity=1048576;"); err != nil {
+		t.Fatalf("error_inbox_capacity=1048576 should pass, got %v", err)
+	}
+	if _, err := qdb.ConfFromStr("ws::addr=h:9000;connection_listener_inbox_capacity=1048576;"); err != nil {
+		t.Fatalf("connection_listener_inbox_capacity=1048576 should pass, got %v", err)
 	}
 }
 
@@ -193,7 +240,7 @@ func TestErrorApiWithErrorPolicyAutoClearsPerCatSet(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conf := qdb.NewLineSenderConfig(tc.st)
 			qdb.WithAddress("h:9000")(conf)
-			qdb.WithErrorPolicy(qdb.CategorySchemaMismatch, qdb.PolicyHalt)(conf)
+			qdb.WithErrorPolicy(qdb.CategorySchemaMismatch, qdb.PolicyTerminal)(conf)
 			qdb.WithErrorPolicy(qdb.CategorySchemaMismatch, qdb.PolicyAuto)(conf)
 			if err := qdb.SanitizeConf(conf); err != nil {
 				t.Fatalf("sanitizer should not reject net-Auto per-cat override, got %v", err)

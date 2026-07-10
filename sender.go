@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -319,10 +320,11 @@ const (
 	// returns from the constructor immediately with an unconnected
 	// sender. The producer goroutine can call Table()/At()/Flush()
 	// right away; rows accumulate in the cursor SF engine until the
-	// connection comes up. Connect-budget exhaustion or terminal
-	// upgrade failure is delivered through the configured
-	// SenderErrorHandler (and surfaced from any subsequent producer
-	// API call as a typed error).
+	// connection comes up. The dial retries indefinitely with capped
+	// backoff (Invariant B) — only a terminal upgrade failure (auth
+	// reject, durable-ack mismatch) is delivered through the
+	// configured SenderErrorHandler (and surfaced from any subsequent
+	// producer API call as a typed error).
 	InitialConnectAsync
 )
 
@@ -344,6 +346,12 @@ type lineSenderConfig struct {
 	authTimeoutMs int             // QWP-only; 0 -> 15000 (15s) at sanitize time
 	zone          string          // QWP-only; honoured on egress, inert on ingest (no zone routing)
 	target        QwpTargetFilter // QWP-only; zero value = QwpTargetAny
+
+	// connectTimeoutMs bounds the TCP connect (ms). COMMON key: parsed on
+	// every schema for connect-string portability, but wired only on HTTP and
+	// QWP — the TCP ILP dial leaves it inert. 0 keeps
+	// the OS connect timeout.
+	connectTimeoutMs int
 
 	// Retry/timeout-related fields
 	retryTimeout   time.Duration
@@ -391,6 +399,7 @@ type lineSenderConfig struct {
 	reconnectMaxDurationMillis    int    // 0 -> 300000 (5 min)
 	reconnectInitialBackoffMillis int    // 0 -> 100
 	reconnectMaxBackoffMillis     int    // 0 -> 5000
+	maxFrameRejections            int    // 0 -> 4 (poison-frame detector threshold)
 	// Per-key explicit-set flags for the three reconnect_* knobs.
 	// Used by sanitizeQwpConf to implement the implicit promotion of
 	// initial_connect_retry to "on" when the user tuned any reconnect
@@ -399,12 +408,27 @@ type lineSenderConfig struct {
 	reconnectMaxDurationMillisSet    bool
 	reconnectInitialBackoffMillisSet bool
 	reconnectMaxBackoffMillisSet     bool
-	initialConnectMode               InitialConnectMode // default InitialConnectOff
-	initialConnectModeSet            bool               // true if user explicitly chose a mode (gates the reconnect_*-driven promotion)
-	closeFlushTimeoutMillis          int                // 0 -> 5000; -1 / negative -> fast close (skip drain)
-	closeFlushTimeoutSet             bool               // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
-	drainOrphans                     bool               // default false (Phase 6)
-	maxBackgroundDrainers            int                // 0 -> 4 (Phase 6)
+	initialConnectMode               InitialConnectMode           // default InitialConnectOff
+	initialConnectModeSet            bool                         // true if user explicitly chose a mode (gates the reconnect_*-driven promotion)
+	closeFlushTimeoutMillis          int                          // 0 -> 5000; -1 / negative -> fast close (skip drain)
+	closeFlushTimeoutSet             bool                         // true if user explicitly set the value (so 0 means "fast close" rather than "use default")
+	drainOrphans                     bool                         // default false (Phase 6)
+	maxBackgroundDrainers            int                          // 0 -> 4 (Phase 6)
+	backgroundDrainerListener        QwpBackgroundDrainerListener // durable-ack drain outcomes
+	// orphanDrainExclude, when non-nil, fences additional slot names from
+	// orphan adoption beyond the sender's own slot. The QwpSender pool sets it
+	// to its in-range slot set so a pooled sender never adopts a live sibling's
+	// dir (Hazard G). nil for standalone senders. Internal; no connect-string key.
+	orphanDrainExclude func(slotName string) bool
+
+	// Durable-ack (request_durable_ack). QWP-only, Enterprise primary-replication
+	// QoS. When true, the send loop trims / replays / awaits on the server's
+	// STATUS_DURABLE_ACK frames (WAL data uploaded to object storage) instead of
+	// the ordinary OK ACK (WAL commit).
+	requestDurableAck            bool
+	requestDurableAckSet         bool // set on any WithRequestDurableAck call, even false — trips the QWP-only gate
+	durableAckKeepaliveMillis    int  // paces the durable keepalive ping; <= 0 disables
+	durableAckKeepaliveMillisSet bool // distinguishes "unset" (-> default) from an explicit 0/negative
 
 	// QWP server-error API (Phase 5). All fields are QWP-only.
 	errorHandler         SenderErrorHandler    // nil -> default loud handler
@@ -413,6 +437,17 @@ type lineSenderConfig struct {
 	errorPolicyPerCatSet bool                  // tracks whether *any* per-category override was set
 	errorPolicyGlobal    Policy                // PolicyAuto = unset
 	errorInboxCapacity   int                   // 0 -> qwpSfDefaultErrorInboxCapacity; sanitizer floors at qwpSfMinErrorInboxCapacity
+
+	// QWP connection-event listener (all fields QWP-only).
+	connectionListener              SenderConnectionListener // nil -> default loud listener
+	connectionListenerInboxCapacity int                      // 0 -> qwpSfDefaultErrorInboxCapacity
+
+	// QWP ack-progress handler (QWP-only). nil -> no dispatch (opt-in).
+	progressHandler SenderProgressHandler
+
+	// Diagnostics sink. nil -> slog.Default() (see qwp_log.go). Applies to
+	// every transport, but only the QWP paths currently emit through it.
+	logger *slog.Logger
 }
 
 // LineSenderOption defines line sender config option.
@@ -474,10 +509,17 @@ func WithInFlightWindow(window int) LineSenderOption {
 // negative means "fast close".
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		if d >= time.Millisecond {
-			s.closeFlushTimeoutSet = true
-			s.closeFlushTimeoutMillis = int(d / time.Millisecond)
+		if d <= 0 {
+			return
 		}
+		ms := int(d / time.Millisecond)
+		// A positive sub-millisecond duration must not truncate to the
+		// "no override" case — floor it to 1ms, like WithConnectTimeout.
+		if ms == 0 {
+			ms = 1
+		}
+		s.closeFlushTimeoutSet = true
+		s.closeFlushTimeoutMillis = ms
 	}
 }
 
@@ -489,16 +531,77 @@ func WithCloseTimeout(d time.Duration) LineSenderOption {
 // QwpSender.DroppedErrorNotifications()).
 //
 // Passing nil reverts to the default loud-not-silent handler that
-// logs ERROR for HALT and WARN for DROP.
+// logs ERROR for a terminal rejection and WARN for a retriable one
+// (informational: the batch is replayed after the connection recycles).
 //
 // The handler may call Close() or Flush() on the sender (e.g. to shut
-// down on a HALT) without deadlocking — see SenderErrorHandler for the
-// re-entrancy contract.
+// down on a terminal rejection) without deadlocking — see
+// SenderErrorHandler for the re-entrancy contract.
 //
 // Only available for the QWP sender.
 func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.errorHandler = h
+	}
+}
+
+// WithConnectionListener registers a callback invoked asynchronously when the
+// QWP sender observes a connection-state transition (connect, disconnect,
+// reconnect, failover, terminal auth failure). The listener runs on a
+// dedicated dispatcher goroutine; a slow listener cannot stall publishing, and
+// surplus events are dropped when the bounded inbox fills (visible via
+// QwpSender.DroppedConnectionNotifications()). Passing nil reverts to the
+// default loud listener. See SenderConnectionListener for the contract.
+//
+// Only available for the QWP sender.
+func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.connectionListener = l
+	}
+}
+
+// WithLogger sets the *slog.Logger the client emits diagnostics through,
+// replacing the slog.Default() fallback. Genuine problems (panics in user
+// callbacks, leaked pool leases, protocol anomalies) and, when no handler or
+// listener is registered, server rejections and connection transitions log at
+// Warn/Error; high-frequency chatter (replayed rejections, transient failover
+// windows) logs at Debug and is hidden unless the handler's level is lowered.
+// Pass a logger backed by slog.DiscardHandler to silence the client entirely,
+// or one wired to the application's logging stack to route it there.
+func WithLogger(l *slog.Logger) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.logger = l
+	}
+}
+
+// WithProgressHandler registers a SenderProgressHandler invoked when the QWP
+// sender's acknowledged frame sequence advances. QWP-only; opt-in (no default).
+// Under WithRequestDurableAck the reported watermark is durable, not settled.
+func WithProgressHandler(h SenderProgressHandler) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.progressHandler = h
+	}
+}
+
+// WithBackgroundDrainerListener registers a QwpBackgroundDrainerListener applied
+// to every store-and-forward orphan drainer, surfacing durable-ack drain outcomes
+// (unavailable endpoint, persistent failure). QWP-only; effective with
+// drain_orphans and request_durable_ack on.
+func WithBackgroundDrainerListener(l QwpBackgroundDrainerListener) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.backgroundDrainerListener = l
+	}
+}
+
+// WithConnectionListenerInboxCapacity sets the bounded inbox depth for the
+// connection-event dispatcher. Zero uses the default (256); any other value
+// outside [16, 1<<20] is rejected at construction. Equivalent to the
+// connect-string connection_listener_inbox_capacity key.
+//
+// Only available for the QWP sender.
+func WithConnectionListenerInboxCapacity(capacity int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.connectionListenerInboxCapacity = capacity
 	}
 }
 
@@ -508,18 +611,20 @@ func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 // registered via WithErrorPolicyResolver still wins over both.
 //
 // PolicyAuto removes any prior override (falls through to next
-// layer). CategoryProtocolViolation and CategoryUnknown are always
-// HALT: an override for either is ignored and not recorded, matching
-// the connect-string form, which has no on_protocol_violation_error /
-// on_unknown_error key and rejects those outright.
+// layer). CategoryProtocolViolation is forced TERMINAL and
+// CategoryUnknown is forced RETRIABLE (fail open): an override for
+// either is ignored and not recorded, matching the connect-string
+// form, which has no on_protocol_violation_error / on_unknown_error
+// key and rejects those outright.
 //
 // Only available for the QWP sender.
 func WithErrorPolicy(c Category, p Policy) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		// PROTOCOL_VIOLATION and UNKNOWN are never user-configurable.
 		// Refusing the override here keeps the per-category slot from
-		// ever holding a latent non-HALT policy, so the forced HALT does
-		// not depend on resolve() checking these two categories first.
+		// ever holding a latent contrary policy, so the forced TERMINAL /
+		// forced RETRIABLE does not depend on resolve() checking these
+		// two categories first.
 		if int(c) >= len(s.errorPolicyPerCat) ||
 			c == CategoryProtocolViolation || c == CategoryUnknown {
 			return
@@ -540,8 +645,8 @@ func WithErrorPolicy(c Category, p Policy) LineSenderOption {
 // Returning PolicyAuto from the resolver falls through to the next
 // layer (per-category map, then global, then spec default).
 //
-// CategoryProtocolViolation and CategoryUnknown are forced HALT and
-// bypass the resolver entirely.
+// CategoryProtocolViolation (forced TERMINAL) and CategoryUnknown
+// (forced RETRIABLE, fail open) bypass the resolver entirely.
 //
 // Only available for the QWP sender.
 func WithErrorPolicyResolver(r func(Category) Policy) LineSenderOption {
@@ -611,13 +716,20 @@ func WithSfMaxTotalBytes(n int64) LineSenderOption {
 	}
 }
 
-// WithReconnectPolicy configures the per-outage reconnect cap and
-// backoff policy. maxDuration bounds the total time spent
-// reconnecting before the loop gives up; initialBackoff and
-// maxBackoff bound a backoff sleep between attempts (with jitter).
-// A zero or negative argument is treated as "leave the default" for
-// that knob — it does not register as an explicit user choice and so
-// does not trigger the initial_connect_retry promotion.
+// WithReconnectPolicy configures the reconnect backoff policy.
+// maxDuration bounds the blocking sync initial connect
+// (InitialConnectSync); a running sender retries transport outages
+// indefinitely and never gives up on a wall clock (Invariant B). On a
+// running sender maxDuration additionally sets how long a rejection
+// window must persist before the poison-frame detector may escalate to a
+// terminal (and the background drainer's no-progress wedge budget), so a
+// small value shortens those floors — leave it at the default unless you
+// intend that.
+// initialBackoff and maxBackoff bound the equal-jitter exponential
+// backoff sleep between attempts. A zero or negative argument is
+// treated as "leave the default" for that knob — it does not register
+// as an explicit user choice and so does not trigger the
+// initial_connect_retry promotion.
 //
 // Only available for the QWP sender.
 func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) LineSenderOption {
@@ -633,6 +745,36 @@ func WithReconnectPolicy(maxDuration, initialBackoff, maxBackoff time.Duration) 
 		if maxBackoff > 0 {
 			s.reconnectMaxBackoffMillis = int(maxBackoff / time.Millisecond)
 			s.reconnectMaxBackoffMillisSet = true
+		}
+	}
+}
+
+// WithMaxFrameRejections sets the poison-frame detector threshold:
+// consecutive server rejections (retriable NACK, or non-orderly close
+// after a send) of the SAME head-of-line frame, with no ack progress
+// in between, before the sender declares the frame poisoned and
+// latches a typed PROTOCOL_VIOLATION terminal instead of
+// reconnect-replaying forever.
+//
+// Escalation also requires the rejection episode to have lasted at
+// least the reconnect max-duration (WithReconnectPolicy /
+// reconnect_max_duration_millis, default 5m): both the strike count
+// AND the episode-duration floor must be met. The floor keeps a brief
+// transient rejection window (e.g. a WRITE_ERROR burst during a server
+// recovery) from burning every strike in a second and killing the
+// sender — below it the sender keeps recycling and replaying, a loud
+// stall rather than a terminal. Lowering the threshold alone does not
+// escalate faster than that floor; lower the reconnect max-duration
+// too. Retriable rejections below either bar recycle the connection
+// and replay from the store-and-forward log — no data is dropped.
+// Default 4. A non-positive argument leaves the default. Equivalent to
+// the max_frame_rejections connect-string key.
+//
+// Only available for the QWP sender.
+func WithMaxFrameRejections(n int) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		if n > 0 {
+			s.maxFrameRejections = n
 		}
 	}
 }
@@ -675,9 +817,13 @@ func WithInitialConnectMode(mode InitialConnectMode) LineSenderOption {
 // WithCloseFlushTimeout bounds Close()'s wait for the cursor
 // engine's ackedFsn to catch up to publishedFsn. A zero or
 // negative duration skips the drain entirely (fast close).
-// Defaults to 5 seconds.
+// Defaults to 5 seconds. Applies in both memory and
+// store-and-forward modes: rows still unacked when the timeout
+// expires may be lost (memory mode) or left on disk for replay
+// (sf_dir set). Equivalent to the connect-string
+// close_flush_timeout_millis key.
 //
-// Only meaningful for the QWP sender in cursor mode (sf_dir set).
+// Only available for the QWP sender.
 func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.closeFlushTimeoutSet = true
@@ -720,6 +866,79 @@ func WithQwpDumpWriter(w io.Writer) LineSenderOption {
 func WithAuthTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.authTimeoutMs = int(d / time.Millisecond)
+	}
+}
+
+// WithConnectTimeout bounds the TCP connect to a QuestDB endpoint, so a
+// black-holed or firewalled host is abandoned within d instead of riding the
+// much longer OS connect timeout. The QWP upgrade response and TLS handshake
+// (wss) are bounded separately by WithAuthTimeout, which always has a value
+// (default 15s) — to tighten the handshake, set WithAuthTimeout too. A
+// zero or negative duration keeps the OS connect timeout. Honoured by the HTTP
+// and QWP senders; accepted but inert on TCP, and ignored when a custom
+// http.Transport is supplied (that transport is the caller's to configure).
+// Equivalent to the connect-string connect_timeout key.
+func WithConnectTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		ms := int(d / time.Millisecond)
+		// A positive sub-millisecond budget must not truncate to 0, which means
+		// "keep the OS default" — floor it to 1ms so a tight budget stays tight.
+		if d > 0 && ms == 0 {
+			ms = 1
+		}
+		s.connectTimeoutMs = ms
+	}
+}
+
+// WithRequestDurableAck opts in to Enterprise durable acknowledgement: the sender
+// trims store-and-forward data, replays, and reports AckedFsn on the server's
+// STATUS_DURABLE_ACK (WAL uploaded to object storage) rather than the ordinary OK
+// ACK (WAL commit). The bound endpoint must be a replication primary advertising
+// durable-ack, otherwise the connect fails terminally with a *SenderError of
+// category PROTOCOL_VIOLATION. Equivalent to the connect-string
+// request_durable_ack key.
+//
+// Because only a durable ack advances the watermark, a healthy connection whose
+// server keeps committing (OK) but has not yet uploaded (e.g. object storage is
+// wedged) does not advance AckedFsn: the data is safe on disk and buffering
+// continues, but AwaitAckedFsn blocks until its context and Close waits up to
+// close_flush_timeout before returning the "data may be lost" drain timeout. This
+// is fail-slow by design; do not treat a stalled AckedFsn as a client fault.
+//
+// Only available for the QWP sender: any call, even
+// WithRequestDurableAck(false), fails construction on other transports —
+// matching the connect-string key.
+func WithRequestDurableAck(enabled bool) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.requestDurableAck = enabled
+		s.requestDurableAckSet = true
+	}
+}
+
+// WithDurableAckKeepaliveInterval paces the keepalive ping a durable-ack sender
+// sends to prod an idle server into flushing pending STATUS_DURABLE_ACK frames. A
+// zero or negative duration disables it; default 200ms. Takes effect only under
+// WithRequestDurableAck(true). Equivalent to the
+// durable_ack_keepalive_interval_millis key.
+//
+// Disabling the keepalive is not recommended on an idle producer: the server
+// only flushes durable acks on inbound events, so a quiescent last frame may
+// have no ack to advance AckedFsn, leaving AwaitAckedFsn blocked (and Close's
+// drain wait reporting a spurious "data may be lost") until the next flush.
+//
+// Only available for the QWP sender: any call, even a disabling one, fails
+// construction on other transports.
+func WithDurableAckKeepaliveInterval(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		ms := int(d / time.Millisecond)
+		// A positive sub-ms interval must not truncate to 0: an explicit 0 disables
+		// the keepalive, so floor to 1ms (like WithConnectTimeout) — only a zero or
+		// negative d disables it, as documented.
+		if d > 0 && ms == 0 {
+			ms = 1
+		}
+		s.durableAckKeepaliveMillis = ms
+		s.durableAckKeepaliveMillisSet = true
 	}
 }
 
@@ -814,8 +1033,9 @@ func WithMaxBackgroundDrainers(n int) LineSenderOption {
 // policy (connect-string on_server_error) → spec defaults.
 //
 // PolicyAuto (the zero value) leaves the global layer unset, falling
-// through to the spec defaults. CategoryProtocolViolation and
-// CategoryUnknown are always HALT regardless of this setting.
+// through to the spec defaults. CategoryProtocolViolation stays forced
+// TERMINAL and CategoryUnknown forced RETRIABLE (fail open) regardless
+// of this setting.
 //
 // Only available for the QWP sender.
 func WithServerErrorPolicy(p Policy) LineSenderOption {
@@ -1269,10 +1489,10 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.retryTimeout != 0 {
 		// connect-string.md does not list retry_timeout as a QWP key
 		// (it's HTTP-only) and Sender.java rejects it on the
-		// WebSocket protocol. The QWP analogue is the per-outage
-		// reconnect budget; point the user there.
+		// WebSocket protocol. The QWP analogue is the sync-initial-
+		// connect budget; point the user there.
 		return errors.New(
-			"retry_timeout is not supported for QWP; use reconnect_max_duration_millis for the per-outage budget")
+			"retry_timeout is not supported for QWP; use reconnect_max_duration_millis for the initial-connect budget")
 	}
 	if conf.httpTransport != nil {
 		return errors.New("httpTransport setting is not available in the QWP client")
@@ -1308,12 +1528,11 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	}
 	// Implicit promotion of initial_connect_retry. When the user tuned
 	// any reconnect_* knob but did not pick an initial-connect mode,
-	// promote to sync — the reconnect budget they wrote should also
-	// cover the *first* connect attempt. Otherwise the knob name reads
-	// as a generic retry budget but the underlying path only governs
-	// reconnects from an established connection, and the budget is
-	// silently dropped at startup. Mirrors the Java client's
-	// actualInitialConnectMode resolution in Sender.java.
+	// promote to sync — the budget they wrote should also cover the
+	// *first* connect attempt. reconnect_max_duration_millis bounds
+	// ONLY that sync initial connect (a running sender retries
+	// indefinitely, Invariant B), so without the promotion the knob
+	// would be silently inert.
 	//
 	// An explicit user choice (any value of initial_connect_retry, or
 	// either of the With* setters) wins unconditionally — including
@@ -1393,11 +1612,22 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 		return fmt.Errorf("max_background_drainers must be >= 0: %d", conf.maxBackgroundDrainers)
 	}
 	// Server-error API knobs (Phase 5). User-supplied
-	// errorInboxCapacity must be ≥ qwpSfMinErrorInboxCapacity (16);
-	// 0 falls back to the default at construction.
-	if conf.errorInboxCapacity != 0 && conf.errorInboxCapacity < qwpSfMinErrorInboxCapacity {
-		return fmt.Errorf("error_inbox_capacity must be >= %d: %d",
-			qwpSfMinErrorInboxCapacity, conf.errorInboxCapacity)
+	// errorInboxCapacity must be in [qwpSfMinErrorInboxCapacity (16),
+	// qwpSfMaxErrorInboxCapacity]; 0 falls back to the default at construction.
+	// The ceiling guards make(chan, capacity) from a "makechan: size out of
+	// range" panic on a pathological value.
+	if conf.errorInboxCapacity != 0 && (conf.errorInboxCapacity < qwpSfMinErrorInboxCapacity ||
+		conf.errorInboxCapacity > qwpSfMaxErrorInboxCapacity) {
+		return fmt.Errorf("error_inbox_capacity must be in [%d, %d]: %d",
+			qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity, conf.errorInboxCapacity)
+	}
+	// Same bounds for the connection listener inbox; the connect-string parser
+	// enforces the floor but WithConnectionListenerInboxCapacity reaches here
+	// directly.
+	if conf.connectionListenerInboxCapacity != 0 && (conf.connectionListenerInboxCapacity < qwpSfMinErrorInboxCapacity ||
+		conf.connectionListenerInboxCapacity > qwpSfMaxErrorInboxCapacity) {
+		return fmt.Errorf("connection_listener_inbox_capacity must be in [%d, %d]: %d",
+			qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity, conf.connectionListenerInboxCapacity)
 	}
 
 	return nil
@@ -1426,6 +1656,15 @@ func sanitizeHttpConf(conf *lineSenderConfig) error {
 	return nil
 }
 
+// drainerListenerConfigured reports whether any QwpBackgroundDrainerListener
+// callback is set. Must cover every field of the struct so a new callback
+// cannot slip past rejectQwpOnlyOptions unnoticed.
+func drainerListenerConfigured(l QwpBackgroundDrainerListener) bool {
+	return l.OnDurableAckUnavailable != nil ||
+		l.OnDurableAckPersistentFailure != nil ||
+		l.OnPrimaryUnavailable != nil
+}
+
 // rejectQwpOnlyOptions surfaces an error when a QWP-only option was
 // set on a non-QWP sender. The connect-string parser already rejects
 // each of these keys on non-ws/wss schemas; this mirrors the gate
@@ -1435,6 +1674,9 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		conf.errorPolicyPerCatSet || conf.errorPolicyGlobal != PolicyAuto ||
 		conf.errorInboxCapacity != 0 {
 		return errors.New("server-error API settings are only available in the QWP client")
+	}
+	if conf.connectionListener != nil || conf.connectionListenerInboxCapacity != 0 {
+		return errors.New("connection listener settings are only available in the QWP client")
 	}
 	var name string
 	switch {
@@ -1454,6 +1696,16 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "drain_orphans"
 	case conf.maxBackgroundDrainers != 0:
 		name = "max_background_drainers"
+	case conf.maxFrameRejections != 0:
+		name = "max_frame_rejections"
+	case conf.requestDurableAckSet:
+		name = "request_durable_ack"
+	case conf.durableAckKeepaliveMillisSet:
+		name = "durable_ack_keepalive_interval_millis"
+	case conf.progressHandler != nil:
+		name = "progress handler"
+	case drainerListenerConfigured(conf.backgroundDrainerListener):
+		name = "background drainer listener"
 	case conf.reconnectMaxDurationMillisSet,
 		conf.reconnectInitialBackoffMillisSet,
 		conf.reconnectMaxBackoffMillisSet:
@@ -1485,6 +1737,8 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,
+		connectTimeoutMs:      conf.connectTimeoutMs,
+		requestDurableAck:     conf.requestDurableAck,
 		// QWP has a single protocol version; advertise it.
 		// serverInfoTimeout stays zero: the ingest endpoint sends no
 		// SERVER_INFO frame and the client never expects one — it sends

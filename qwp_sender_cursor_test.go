@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,8 +45,11 @@ func newCursorSenderForTest(t *testing.T, srv *qwpSfTestServer, autoFlushRows in
 	require.NoError(t, err)
 	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
 	require.NoError(t, err)
+	// 1ms reconnectMaxDuration keeps the poison-episode floor below the
+	// paced inter-strike backoff, so rejection-streak tests escalate at
+	// exactly the strike threshold instead of the 5-minute default.
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
-		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		100*time.Microsecond, time.Millisecond, 10*time.Millisecond, 100*time.Millisecond)
 	loop.sendLoopStart()
 	// 5s closeFlushTimeout matches the Java default; long enough
 	// that drain-waits in tests don't flake under heavy parallel
@@ -106,8 +110,8 @@ func TestQwpCursorSenderFlushNoRowsIsCheap(t *testing.T) {
 // TestQwpCursorSenderFlushWithPendingRowsDoesNotWaitForAck pins the
 // headline cursor-mode contract change: Flush / FlushAndGetSequence
 // publish the pending batch and return WITHOUT blocking on the server
-// ACK (design/qwp-cursor-durability.md decision #1: "flush() never waits
-// for ACK; ACKs are async"). TestQwpCursorSenderFlushNoRowsIsCheap covers
+// ACK (flush() never waits for ACK; ACKs are async).
+// TestQwpCursorSenderFlushNoRowsIsCheap covers
 // the zero-pending fast path; this exercises the pending-rows branch —
 // the one that actually encodes and enqueues a frame — against a server
 // that accepts frames but never ACKs. The proof has two halves: the call
@@ -289,7 +293,7 @@ func TestQwpCursorSenderTableEntrySurfacesTerminalError(t *testing.T) {
 	require.Error(t, err, "AtNow must surface the latched terminal error from Table()")
 }
 
-// TestQwpCursorFlushResetsAfterEnqueueDespiteEagerError reproduces M7.
+// TestQwpCursorFlushResetsAfterEnqueueDespiteEagerError reproduces the reset-after-enqueue bug.
 // FlushAndGetSequence first publishes the pending rows into the cursor
 // engine (durable — an FSN is assigned and the frame is queued for
 // replay) and only then eagerly samples the send loop's latched error.
@@ -367,7 +371,7 @@ func TestQwpCursorFlushResetsAfterEnqueueDespiteEagerError(t *testing.T) {
 	// Wait until the batch's append has parked on backpressure. The park
 	// only happens after the in-enqueue error check has passed and the
 	// frame has been encoded, so latching now lands the HALT in exactly
-	// the post-publish window M7 describes.
+	// the post-publish window.
 	require.Eventually(t, func() bool {
 		return engine.engineTotalBackpressureStalls() > baselineStalls
 	}, 5*time.Second, 100*time.Microsecond,
@@ -639,4 +643,57 @@ func TestQwpCursorNoGoroutineLeakOnClose(t *testing.T) {
 	assert.LessOrEqualf(t, got, base+slack,
 		"goroutine count grew from %d to %d across %d cycles — Close "+
 			"is leaking cursor send-loop goroutines", base, got, cycles)
+}
+
+// TestQwpCursorNoGoroutineLeakOnCloseWithProgressHandler covers the leak the
+// plain test above cannot: a sender with a SenderProgressHandler lazily starts
+// the progress dispatcher's goroutine on the first ack advance, and
+// sendLoopClose must close that dispatcher too (not just the error and
+// connection ones). Before the fix it leaked one goroutine per closed sender
+// that saw an ack.
+func TestQwpCursorNoGoroutineLeakOnCloseWithProgressHandler(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	runCycle := func() {
+		engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+		require.NoError(t, err)
+		loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+			100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
+		var acks atomic.Int64
+		// Installed before start so the first ack advance offers into it and
+		// lazy-starts its loop() goroutine — the goroutine Close must join.
+		loop.sendLoopSetProgressHandler(func(int64) { acks.Add(1) }, 8)
+		loop.sendLoopStart()
+		s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 5*time.Second)
+		require.NoError(t, err)
+
+		require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+		require.NoError(t, s.Flush(context.Background()))
+		require.Eventually(t, func() bool {
+			return acks.Load() > 0
+		}, 2*time.Second, 1*time.Millisecond, "progress handler never fired")
+		_ = s.Close(context.Background())
+	}
+
+	runCycle()
+	base := stableGoroutineCount()
+
+	const cycles = 25
+	for i := 0; i < cycles; i++ {
+		runCycle()
+	}
+
+	const slack = 8
+	var got int
+	require.Eventually(t, func() bool {
+		got = stableGoroutineCount()
+		return got <= base+slack
+	}, 10*time.Second, 100*time.Millisecond,
+		"progress-dispatcher goroutine did not return to baseline")
+	assert.LessOrEqualf(t, got, base+slack,
+		"goroutine count grew from %d to %d across %d cycles — Close is "+
+			"leaking the progress-dispatcher goroutine", base, got, cycles)
 }

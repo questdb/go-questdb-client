@@ -1222,6 +1222,28 @@ func qwpValidateTableName(name string, limit int) error {
 	return nil
 }
 
+// qwpMaxSymbolValueLen caps a symbol value's UTF-8 byte length. Symbol
+// bytes live in the global dictionary, not the row (the row carries a
+// 4-byte id), so the per-row batch-cap guard in atWithTimestamp never
+// sees them — yet writeDeltaDict ships the contiguous id range, so a
+// dict entry too large for the frame caps could never leave the sender
+// and would wedge every future new-symbol batch behind it. The bound is
+// qwpSfSymbolDictMaxEntryLen: the .symbol-dict loader treats any longer
+// entry as torn and stops there, so persisting one would poison SF
+// recovery of the whole slot. It also sits comfortably under the frame
+// caps a delta must fit (4 MiB default segment, 16 MiB protocol batch).
+const qwpMaxSymbolValueLen = qwpSfSymbolDictMaxEntryLen
+
+// qwpValidateSymbolValue bounds a symbol value before it is interned
+// into the global dictionary; ids are assigned permanently, so an
+// over-cap value must be rejected up front.
+func qwpValidateSymbolValue(val string) error {
+	if len(val) > qwpMaxSymbolValueLen {
+		return fmt.Errorf("qwp: symbol value length %d exceeds limit %d", len(val), qwpMaxSymbolValueLen)
+	}
+	return nil
+}
+
 // qwpValidateColumnName validates a column name using the same
 // rules as the existing ILP buffer.
 func qwpValidateColumnName(name string, limit int) error {

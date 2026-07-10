@@ -30,6 +30,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -172,11 +173,8 @@ func TestSenderIdOptionAcceptsValid(t *testing.T) {
 	}
 }
 
-// Durable-ack mode is a deferred opt-in feature, but sf-client.md §19
-// makes its connect-string keys normative: the parser MUST recognise
-// request_durable_ack / durable_ack_keepalive_interval_millis so a
-// user porting a Java connect string gets a clear deferred-feature
-// message, not the generic "unsupported option".
+// Durable-ack connect-string keys: request_durable_ack /
+// durable_ack_keepalive_interval_millis.
 func TestSfConfDurableAckOffParses(t *testing.T) {
 	for _, v := range []string{"off", "false"} {
 		t.Run(v, func(t *testing.T) {
@@ -186,18 +184,17 @@ func TestSfConfDurableAckOffParses(t *testing.T) {
 	}
 }
 
-func TestSfConfRejectsDurableAckOptIn(t *testing.T) {
+func TestSfConfDurableAckOptInParses(t *testing.T) {
 	for _, v := range []string{"on", "true"} {
 		t.Run(v, func(t *testing.T) {
-			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=" + v + ";")
-			require.Error(t, err)
-			// Must name the feature and that it is deferred -- not the
-			// generic "unsupported option" the review flagged.
-			assert.Contains(t, err.Error(), "not implemented")
-			assert.Contains(t, err.Error(), "deferred")
-			assert.NotContains(t, err.Error(), "unsupported option")
+			c, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;request_durable_ack=" + v + ";")
+			require.NoError(t, err)
+			assert.True(t, c.requestDurableAck)
 		})
 	}
+	c, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;")
+	require.NoError(t, err)
+	assert.False(t, c.requestDurableAck, "default is off")
 }
 
 func TestSfConfRejectsBadDurableAckValue(t *testing.T) {
@@ -225,12 +222,13 @@ func TestSfConfRejectsDurableAckKeysOnNonQwp(t *testing.T) {
 }
 
 func TestSfConfDurableAckKeepaliveParses(t *testing.T) {
-	// 0 and negative mean "disabled" per sf-client.md §4.3, so any
-	// int is in range; only a non-int is rejected.
-	for _, v := range []string{"200", "0", "-1"} {
-		t.Run(v, func(t *testing.T) {
-			_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;durable_ack_keepalive_interval_millis=" + v + ";")
+	// 0 and negative disable the ping, so any int is in range; only a non-int errors.
+	for _, v := range []int{200, 0, -1} {
+		t.Run(strconv.Itoa(v), func(t *testing.T) {
+			c, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;durable_ack_keepalive_interval_millis=" + strconv.Itoa(v) + ";")
 			require.NoError(t, err)
+			assert.True(t, c.durableAckKeepaliveMillisSet)
+			assert.Equal(t, v, c.durableAckKeepaliveMillis)
 		})
 	}
 	_, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;durable_ack_keepalive_interval_millis=soon;")

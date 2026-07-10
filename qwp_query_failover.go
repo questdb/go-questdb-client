@@ -317,12 +317,14 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			authorization:         cfg.effectiveAuthorization(),
 			maxBatchRows:          cfg.maxBatchRows,
 			acceptEncoding:        cfg.buildAcceptEncodingHeader(),
+			clientId:              cfg.clientID,
 			// QWP has a single protocol version; advertise it. The
 			// server always emits SERVER_INFO post-upgrade and the
 			// egress client reads it (serverInfoTimeout > 0).
 			maxVersion:        qwpVersion,
 			serverInfoTimeout: cfg.serverInfoTimeout,
 			authTimeoutMs:     cfg.authTimeoutMs,
+			connectTimeoutMs:  cfg.connectTimeoutMs,
 		}
 		attempts++
 		if err := tr.connect(ctx, wsURL, opts); err != nil {
@@ -387,7 +389,8 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 		// transport pointer and publish. The atomic pointer in the
 		// client struct allows swapping `tr` independently across
 		// reconnects without disturbing the IO goroutine's view.
-		io := newQwpEgressIO(tr, cfg.bufferPoolSize)
+		io := newQwpEgressIO(tr, cfg.bufferPoolSize, cfg.closeDrainTimeout)
+		io.logger = cfg.logger
 		io.start()
 		tracker.RecordSuccess(idx)
 		return &qwpConnectResult{

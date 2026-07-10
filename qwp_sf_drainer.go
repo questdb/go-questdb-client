@@ -28,7 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -47,9 +47,82 @@ const (
 	qwpSfDrainOutcomeStopped
 )
 
+// qwpMaxDurableAckMismatchAttempts is the durable-ack settle budget: how
+// many exhausted connect sweeps that met a capability gap (an endpoint
+// not advertising durable-ack) a drainer tolerates before quarantining
+// the slot with a .failed sentinel. Counted per sweep, not per dial, so
+// a wide address list cannot burn the budget in one walk; an
+// all-replica sweep resets it (see onRoundExhausted).
+const qwpMaxDurableAckMismatchAttempts = 16
+
+// qwpSfDrainerDefaultConnectTimeoutMs is the finite default TCP-connect
+// deadline for background-drainer dials when connect_timeout is unset.
+// An explicit connect_timeout overrides it for drainers too; the
+// foreground sender keeps the untimed OS default when unset.
+const qwpSfDrainerDefaultConnectTimeoutMs = 15_000
+
+// QwpBackgroundDrainerListener receives durable-ack drain outcomes for a crashed
+// sibling's store-and-forward slot. Callbacks must not block.
+//
+// Threading: the callbacks are NOT confined to a single goroutine.
+// OnDurableAckUnavailable and OnPrimaryUnavailable fire from whichever
+// goroutine runs the connect walk — the drainerRun goroutine for the initial
+// connect, the drainer's send-loop I/O goroutine for mid-drain reconnects —
+// while OnDurableAckPersistentFailure fires from the drainerRun goroutine. The
+// same QwpBackgroundDrainerListener is also shared across every drainer, so with
+// multiple orphan slots the callbacks may fire concurrently. Implementations
+// must be thread-safe. A panic in a callback is recovered and logged (it does
+// not quarantine the slot or crash the host), mirroring the other listener
+// contracts. Any callback may be nil. Applied to every drainer via
+// WithBackgroundDrainerListener.
+type QwpBackgroundDrainerListener struct {
+	// OnDurableAckUnavailable fires once per exhausted connect sweep in which
+	// a durable-ack drainer met an endpoint that does not advertise
+	// durable-ack. attempt is the cumulative count of such sweeps; the drainer
+	// keeps retrying (its source is pinned on disk) until the settle budget
+	// (qwpMaxDurableAckMismatchAttempts) is exhausted.
+	OnDurableAckUnavailable func(dir string, attempt int)
+	// OnDurableAckPersistentFailure fires once when a drainer gives up after
+	// repeated durable-ack mismatches and quarantines the slot (.failed).
+	OnDurableAckPersistentFailure func(dir string, attempts int, elapsed time.Duration)
+	// OnPrimaryUnavailable fires each time a full connect sweep found only
+	// role-rejecting endpoints (every reachable node is a replica or a
+	// catching-up primary). attempt is the cumulative all-replica sweep count.
+	// The window is transient — a replica gets promoted, a primary reappears —
+	// so the drainer keeps retrying indefinitely; this callback is
+	// observability only and never escalates.
+	OnPrimaryUnavailable func(dir string, attempt int)
+}
+
+// qwpDrainerListenerCall invokes a user-supplied background-drainer callback
+// behind a panic guard (drop + log), matching the isolation the other three
+// listeners get for free via qwpDispatcher.deliver. Without it a panic in user
+// code unwinds into the drainer's send-loop / drainerRun goroutine, whose
+// top-level recover turns it into a terminal failure that quarantines an
+// otherwise-recoverable slot (a .failed sentinel) — an availability regression
+// driven purely by a user-code fault. fn is nil-safe.
+func qwpDrainerListenerCall(logger *slog.Logger, fn func()) {
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			qwpEffectiveLogger(logger).Error("qwp/sf drainer listener callback panicked", "panic", r)
+		}
+	}()
+	fn()
+}
+
 // qwpSfDrainerPollInterval is how often the drainer wakes to
 // re-check whether the slot is fully drained.
 const qwpSfDrainerPollInterval = 50 * time.Millisecond
+
+// qwpSfDurableStallFactor scales the no-progress budget into the durable-stall
+// bound: how long a durable-ack drainer tolerates OK-ack/reconnect activity
+// with zero durable trim advance before quarantining. Generous (uploads are
+// slow) but finite, so a flapping never-durable endpoint cannot livelock the
+// drainer.
+const qwpSfDurableStallFactor = 4
 
 // qwpSfDrainerPoolCloseGrace bounds how long the pool's close()
 // waits for active drainers to exit cleanly before cancelling the
@@ -82,11 +155,13 @@ var qwpSfDrainerPoolHardCloseGrace = 1 * time.Second
 //     publishedFsn taken at startup.
 //  4. Close everything in reverse order; release the lock.
 //
-// On terminal failure (auth-rejection, reconnect-budget exhaustion,
-// recovery error), the drainer drops a .failed sentinel into the
-// slot before exiting. Future scans skip the slot until an operator
-// clears the sentinel — bounded automatic retry, then human-in-
-// the-loop.
+// On terminal failure (auth-rejection, durable-ack settle-budget
+// exhaustion, recovery error, a wedged no-progress connection), the
+// drainer drops a .failed sentinel into the slot before exiting.
+// Future scans skip the slot until an operator clears the sentinel.
+// Transport outages and all-replica failover windows are NOT terminal:
+// the drainer retries them indefinitely with capped backoff
+// (Invariant B) — its source data is pinned on disk.
 type qwpSfOrphanDrainer struct {
 	slotPath        string
 	segmentSize     int64
@@ -104,11 +179,27 @@ type qwpSfOrphanDrainer struct {
 	reconnectMaxDuration    time.Duration
 	reconnectInitialBackoff time.Duration
 	reconnectMaxBackoff     time.Duration
+	durableAckMode          bool          // trim only on STATUS_DURABLE_ACK
+	durableKeepalive        time.Duration // durable keepalive-ping cadence
+	maxFrameRejections      int           // poison-frame threshold; 0 -> default
+	logger                  *slog.Logger  // nil -> slog.Default() via qwpEffectiveLogger
+	listener                QwpBackgroundDrainerListener
+	mismatchAttempts        atomic.Int64
+	roleRejectRounds        atomic.Int64
+	lastReplicaWarnUnixNano atomic.Int64
+	durableMismatchGaveUp   atomic.Bool
+	connectCancel           atomic.Pointer[context.CancelFunc]
+	startedAt               time.Time
 	stopRequested           atomic.Bool
-	targetFsn               atomic.Int64 // -1 until startup observes publishedFsn
-	ackedFsn                atomic.Int64 // mirrors engine.ackedFsn for visibility
-	outcome                 atomic.Int32
-	lastErrorMessage        atomic.Pointer[string]
+	stopOnce                sync.Once
+	// stopCh is closed by drainerRequestStop so a polite stop unwinds an
+	// in-flight connect walk promptly (as the walk's cancelCh) instead of
+	// waiting out the pool-close hard-cancel grace.
+	stopCh           chan struct{}
+	targetFsn        atomic.Int64 // -1 until startup observes publishedFsn
+	ackedFsn         atomic.Int64 // mirrors engine.ackedFsn for visibility
+	outcome          atomic.Int32
+	lastErrorMessage atomic.Pointer[string]
 }
 
 // qwpSfNewOrphanDrainer constructs a drainer for the given slot.
@@ -139,6 +230,7 @@ func qwpSfNewOrphanDrainer(
 	d.targetFsn.Store(-1)
 	d.ackedFsn.Store(-1)
 	d.outcome.Store(int32(qwpSfDrainOutcomePending))
+	d.stopCh = make(chan struct{})
 	return d
 }
 
@@ -179,6 +271,7 @@ func (d *qwpSfOrphanDrainer) drainerAckedFsn() int64 {
 // own when the slot fully drains.
 func (d *qwpSfOrphanDrainer) drainerRequestStop() {
 	d.stopRequested.Store(true)
+	d.stopOnce.Do(func() { close(d.stopCh) })
 }
 
 func (d *qwpSfOrphanDrainer) recordFailure(reason string) {
@@ -187,13 +280,76 @@ func (d *qwpSfOrphanDrainer) recordFailure(reason string) {
 	d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
 }
 
+// recordDurableGiveUp quarantines the slot after the durable-ack mismatch cap was
+// hit, firing OnDurableAckPersistentFailure. Scoped to a genuine mismatch-driven
+// give-up (durableMismatchGaveUp) — a non-mismatch terminal failure that merely
+// followed an earlier mismatch must NOT fire it: the callback fires only from
+// the durable-ack retry's exhausted branch.
+func (d *qwpSfOrphanDrainer) recordDurableGiveUp() {
+	attempts := int(d.mismatchAttempts.Load())
+	if fn := d.listener.OnDurableAckPersistentFailure; fn != nil {
+		elapsed := time.Since(d.startedAt)
+		qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempts, elapsed) })
+	}
+	d.recordFailure(fmt.Sprintf(
+		"durable-ack unavailable: no reachable endpoint advertised durable-ack after %d attempts", attempts))
+}
+
+// onRoundExhausted is the drainer's per-sweep hook, fired both by the initial
+// connect walk and by the send loop's mid-drain reconnect walks. The
+// durable-ack settle budget charges exhausted sweeps, not dials: a
+// capability-gap sweep (any dial met an endpoint without durable-ack) counts
+// one attempt, notifies the listener with the cumulative count, and — at the
+// cap — cancels any in-flight connect and asks the drainer to quarantine the
+// slot. An all-replica sweep proves topology churn: whatever node produced
+// earlier mismatches is no longer the primary the next sweep hits, so the
+// capability-gap episode restarts and the next gap gets the full settle
+// budget. Sweeps that saw a transport failure neither charge nor reset — the
+// budget pauses with the outage (Invariant B) — and the walk keeps retrying
+// with capped backoff throughout.
+func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
+	if outcome.SawDurableMismatch && !outcome.SawTransportError {
+		attempt := int(d.mismatchAttempts.Add(1))
+		if fn := d.listener.OnDurableAckUnavailable; fn != nil {
+			qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempt) })
+		}
+		if attempt >= qwpMaxDurableAckMismatchAttempts {
+			d.durableMismatchGaveUp.Store(true)
+			if c := d.connectCancel.Load(); c != nil {
+				(*c)()
+			}
+			d.drainerRequestStop()
+		}
+		return
+	}
+	if !outcome.allReplica() {
+		return
+	}
+	d.mismatchAttempts.Store(0)
+	attempt := int(d.roleRejectRounds.Add(1))
+	if fn := d.listener.OnPrimaryUnavailable; fn != nil {
+		qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempt) })
+	}
+	now := time.Now().UnixNano()
+	if last := d.lastReplicaWarnUnixNano.Load(); now-last >= int64(qwpSfReconnectWarnThrottle) &&
+		d.lastReplicaWarnUnixNano.CompareAndSwap(last, now) {
+		// Shadows the OnPrimaryUnavailable listener callback (dispatched
+		// alongside this); throttled Debug so it adds a trace for deep
+		// debugging without duplicating the callback for the default case.
+		qwpEffectiveLogger(d.logger).Debug("qwp/sf: drainer sweep found only replicas "+
+			"(transient failover window), retrying with capped backoff",
+			"slot", d.slotPath, "sweep", attempt)
+	}
+}
+
 // drainerRun is the drainer goroutine entry point. Runs to
 // completion (or terminal failure), then sets outcome and exits.
 func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
+	d.startedAt = time.Now()
 	// Convert a panic on this goroutine into the same terminal Failed
 	// outcome an explicit fault produces, so neither untrusted on-disk
 	// .sfa bytes (the CRC/recovery scan in qwpSfNewCursorEngine) nor
-	// user-supplied clientFactory code (invoked via qwpSfConnectWithRetry)
+	// user-supplied clientFactory code (invoked via qwpSfRunRoundWalk)
 	// can crash the host process — which would take down the foreground
 	// sender and every sibling drainer with it. Both run on this
 	// goroutine before the send loop's own recover is in play, so this
@@ -210,7 +366,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
 			msg := fmt.Sprintf("qwp/sf: orphan drainer panicked: %v\n%s", r, debug.Stack())
-			log.Printf("[ERROR] %s", msg)
+			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer panicked", "detail", msg)
 			d.recordFailure(msg)
 		}
 	}()
@@ -230,7 +386,18 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
 		return
 	}
-	defer func() { _ = engine.engineClose() }()
+	engine.engineSetLogger(qwpEffectiveLogger(d.logger))
+	// Declared here so the engine-close defer (which runs after the send-loop
+	// close defer below, LIFO) can leak the segment mmaps when the send loop was
+	// abandoned wedged in disk I/O rather than unmap them under that goroutine.
+	var loop *qwpSfSendLoop
+	defer func() {
+		if loop != nil && loop.sendLoopAbandoned() {
+			_ = engine.engineCloseLeakSegments()
+		} else {
+			_ = engine.engineClose()
+		}
+	}()
 
 	target := engine.enginePublishedFsn()
 	d.targetFsn.Store(target)
@@ -240,15 +407,51 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		d.outcome.Store(int32(qwpSfDrainOutcomeSuccess))
 		return
 	}
-	// Initial connect via the round-walk so the drainer immediately
-	// honours classifications the foreground tracker has already
-	// observed (e.g. host 0 is currently TopologyReject — start at
-	// host 1 instead). When d.tracker is nil, qwpSfConnectWithRetry
-	// synthesises a 1-host implicit tracker, matching the legacy
-	// behaviour single-host tests rely on.
-	transport, boundIdx, err := qwpSfConnectWithRetry(ctx, d.clientFactory, d.tracker,
-		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
-	if err != nil {
+	// Initial connect via the round-walk, unbounded (Invariant B): a
+	// down server or an all-replica window is transient, so the walk
+	// retries with capped backoff until success, a genuine terminal
+	// (auth reject; durable settle-budget exhaustion via the
+	// onRoundExhausted cancel), or pool close. The walk also honours
+	// classifications the foreground tracker has already observed
+	// (e.g. host 0 is currently TopologyReject — start at host 1
+	// instead). When d.tracker is nil, a synthesized 1-host implicit
+	// tracker matches the legacy behaviour single-host tests rely on.
+	connectCtx, cancelConnect := context.WithCancel(ctx)
+	// Panic-safety net: on a panic in the walk (recovered above) the
+	// inline cancelConnect() is skipped, orphaning the child ctx in the pool ctx
+	// until close. cancel is idempotent; the eager call still releases it normally.
+	defer cancelConnect()
+	d.connectCancel.Store(&cancelConnect)
+	initialBackoff := d.reconnectInitialBackoff
+	if initialBackoff <= 0 {
+		initialBackoff = qwpSfDefaultReconnectInitialBackoff
+	}
+	maxBackoff := d.reconnectMaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = qwpSfDefaultReconnectMaxBackoff
+	}
+	tracker := d.tracker
+	if tracker == nil {
+		tracker = newQwpHostTracker(1, "", qwpTargetAny)
+	}
+	result := qwpSfRunRoundWalk(connectCtx, d.stopCh, qwpSfRoundWalkParams{
+		Factory:                 d.clientFactory,
+		Tracker:                 tracker,
+		MaxDuration:             0,
+		InitialBackoff:          initialBackoff,
+		MaxBackoff:              maxBackoff,
+		OnRoundExhausted:        d.onRoundExhausted,
+		DurableMismatchTerminal: !d.durableAckMode,
+		Background:              true,
+	}, -1)
+	d.connectCancel.Store(nil)
+	cancelConnect()
+	if result.Transport == nil {
+		// Gave up after repeated durable-ack mismatches: quarantine the slot.
+		if d.durableMismatchGaveUp.Load() {
+			d.recordDurableGiveUp()
+			return
+		}
 		// Pool close (or caller cancellation) during the dial:
 		// don't drop a .failed sentinel — the slot is still
 		// drainable on a future sender start.
@@ -256,17 +459,38 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
 			return
 		}
-		msg := err.Error()
-		d.recordFailure("initial connect: " + msg)
+		// Terminal (auth / non-retriable upgrade) — the only failure
+		// class the unbounded walk surfaces.
+		if result.Terminal != nil {
+			d.recordFailure("initial connect: " + result.Terminal.Error())
+			return
+		}
+		if result.Cancelled != nil {
+			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
+			return
+		}
+		d.recordFailure("initial connect: round-walk returned no result")
 		return
 	}
-	loop := qwpSfNewSendLoop(engine, transport, d.clientFactory,
+	transport, boundIdx := result.Transport, result.Idx
+	loop = qwpSfNewSendLoop(engine, transport, d.clientFactory,
 		qwpSfDefaultParkInterval,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
+	loop.logger = qwpEffectiveLogger(d.logger)
+	// A durable-ack drainer trims the orphan slot only on STATUS_DURABLE_ACK, so
+	// recovered data is not deleted before it is durably uploaded. A mismatch is
+	// transient (not terminal): the drainer retries, since its data is pinned.
+	loop.sendLoopSetDurableAck(d.durableAckMode, d.durableKeepalive, false)
+	loop.sendLoopSetMaxFrameRejections(d.maxFrameRejections)
+	loop.sendLoopSetOnRoundExhausted(d.onRoundExhausted)
+	loop.sendLoopSetConnectionListener(silentSenderConnectionListener, 0)
 	// Share the foreground tracker; the loop carries its OWN
 	// previousIdx slot (failover.md §2.3 "per-caller previousIdx,
 	// not shared") so a mid-stream demote here doesn't corrupt
-	// foreground's bookkeeping.
+	// foreground's bookkeeping, and its reconnect walks run as
+	// background (walk-local round cursor) so they can't consume or
+	// clear the foreground walker's round slots.
+	loop.sendLoopSetBackgroundWalks(true)
 	loop.sendLoopSetHostTracker(d.tracker, boundIdx)
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
 	// Wired for parity with the foreground loop; the drainer replays an
@@ -282,29 +506,34 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// and accepts our frames but never ACKs and never drops the
 	// connection (wedged server, black-hole proxy, or a silently
 	// incompatible build that holds the socket open) keeps acked
-	// below target forever while sendLoopCheckError stays nil — the
-	// run()-level "frames sent, zero acks → terminal" heuristic only
-	// fires after the connection drops, which by definition never
-	// happens here. Without a bound the drainer spins on the poll
-	// interval forever and, on Close, exits Stopped (no .failed
-	// sentinel), so every future process start re-adopts the same
-	// wedged slot in full — an unbounded re-adoption livelock.
+	// below target forever while sendLoopCheckError stays nil.
+	// Without a bound the drainer spins on the poll interval forever
+	// and, on Close, exits Stopped (no .failed sentinel), so every
+	// future process start re-adopts the same wedged slot in full —
+	// an unbounded re-adoption livelock.
 	//
-	// Bound it with the same reconnectMaxDuration budget that bounds
-	// the connect round-walk (this mirrors the Java drainer's
-	// connect-phase deadline semantics — "give the cluster a budget
-	// to settle before quarantining the slot"): if acked makes no
-	// forward progress for that long while we are NOT inside a
-	// (separately bounded) reconnect, drop a .failed sentinel so the
-	// design's "bounded automatic retry, then human-in-the-loop"
-	// promise holds. A reconnect exhausting its own budget still
-	// surfaces ahead of this via sendLoopCheckError.
+	// This bounds only a LIVE-but-not-acking connection: transport
+	// outages never charge it (a reconnect window resets/pauses the
+	// clocks below), so a long server outage cannot quarantine the
+	// slot (Invariant B). reconnectMaxDuration is reused as the
+	// wedge-settle budget knob: a smaller reconnect_max_duration_millis
+	// deliberately shortens it too.
 	noProgressBudget := d.reconnectMaxDuration
 	if noProgressBudget <= 0 {
 		noProgressBudget = qwpSfDefaultReconnectMaxDuration
 	}
 	lastProgressAcked := engine.engineAckedFsn()
+	lastProgressAcks := loop.sendLoopTotalAcks()
 	lastProgressAt := time.Now()
+	// Durable-stall clock: accumulates only live-connection time (a
+	// reconnect window pauses it without resetting what has already
+	// accumulated — anti-evasion: a flapping endpoint that accepts +
+	// OK-acks + drops without ever issuing STATUS_DURABLE_ACK cannot
+	// evade the bound by reconnect-cycling) and zeroes only on a
+	// genuine durable trim advance. Without it, okAcks climbs on every
+	// cycle and the drainer never quarantines.
+	durableStallElapsed := time.Duration(0)
+	lastStallSampleAt := lastProgressAt
 	for {
 		acked := engine.engineAckedFsn()
 		d.ackedFsn.Store(acked)
@@ -312,6 +541,16 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			d.outcome.Store(int32(qwpSfDrainOutcomeSuccess))
 			return
 		}
+		// Check the mismatch cap before the generic wire error so a
+		// mismatch-driven give-up surfaces as such (and fires the listener),
+		// rather than being masked by a coincident terminal wire error.
+		if d.durableMismatchGaveUp.Load() {
+			d.recordDurableGiveUp()
+			return
+		}
+		// The running loop latches only genuine terminals (auth, a
+		// poisoned frame, corrupt segment, durable-ack mismatch) —
+		// transport outages reconnect indefinitely and never reach here.
 		if err := loop.sendLoopCheckError(); err != nil {
 			d.recordFailure("wire: " + err.Error())
 			return
@@ -324,18 +563,56 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		// bounded reconnect loop, resets the watchdog clock. A fresh
 		// connection thus always gets a full budget to produce its
 		// first ACK.
+		//
+		// In durable mode `acked` only advances on STATUS_DURABLE_ACK, so a
+		// healthy-but-slow durable pipeline (the server OK-acking frames while
+		// an object-storage upload lags) would otherwise trip the watchdog.
+		// Treat forward movement of the OK-ack counter as progress too, so only
+		// a slot with NO ack activity at all — the genuine wedge — is quarantined.
 		now := time.Now()
 		reconnecting, _, _ := loop.sendLoopReconnectStatus()
-		switch {
-		case acked > lastProgressAcked || reconnecting:
+		okAcks := loop.sendLoopTotalAcks()
+		// A transport window pauses the durable-stall clock: only
+		// live-connection time is charged, so a long outage cannot burn
+		// the settle budget (Invariant B).
+		if !reconnecting {
+			durableStallElapsed += now.Sub(lastStallSampleAt)
+		}
+		lastStallSampleAt = now
+		if acked > lastProgressAcked || reconnecting ||
+			(d.durableAckMode && okAcks > lastProgressAcks) {
+			// Forward progress of either the durable trim watermark or the OK-ack
+			// counter proves the sender bound a durable-advertising primary and is
+			// draining this slot — an OK ack cannot arrive unless the durable-ack
+			// handshake succeeded — so forget accumulated capability-gap mismatches.
+			// Otherwise the lifetime counter climbs one per primary-flap reconnect
+			// (replica picked first in the sweep, then the primary rebinds and OK-acks
+			// but drops before uploading) and eventually trips
+			// qwpMaxDurableAckMismatchAttempts, falsely quarantining a slot whose
+			// durable primary was reached. A durable primary reached but slow to
+			// upload is caught by the separate durable-stall watchdog, not this
+			// counter.
+			if d.durableAckMode && (acked > lastProgressAcked || okAcks > lastProgressAcks) {
+				d.mismatchAttempts.Store(0)
+			}
+			if acked > lastProgressAcked {
+				durableStallElapsed = 0
+			}
 			lastProgressAcked = acked
+			lastProgressAcks = okAcks
 			lastProgressAt = now
-		case now.Sub(lastProgressAt) >= noProgressBudget:
-			d.recordFailure(fmt.Sprintf(
-				"no drain progress: ackedFsn stuck at %d (target %d) for %s "+
-					"on a live connection — server accepted frames but is not "+
-					"ACKing (wedged server or incompatible build)",
-				acked, target, now.Sub(lastProgressAt)))
+		}
+		// In durable mode the trim watermark moves only on STATUS_DURABLE_ACK,
+		// which can lag long after every frame is OK-acked and okAcks has
+		// plateaued, so gate quarantine on the wider durable-stall clock,
+		// not the no-progress budget on lastProgressAt.
+		if d.durableAckMode {
+			if durableStallElapsed >= qwpSfDurableStallFactor*noProgressBudget {
+				d.recordFailure(d.noProgressReason(acked, target, okAcks, durableStallElapsed))
+				return
+			}
+		} else if now.Sub(lastProgressAt) >= noProgressBudget {
+			d.recordFailure(d.noProgressReason(acked, target, okAcks, now.Sub(lastProgressAt)))
 			return
 		}
 		select {
@@ -345,6 +622,27 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		case <-timer.C:
 		}
 	}
+}
+
+// noProgressReason builds the .failed sentinel reason for a stalled drain,
+// distinguishing a genuinely wedged connection (no ACKs at all) from a durable
+// pipeline that OK-acks frames but lags on STATUS_DURABLE_ACK — the two call for
+// very different operator remediation, and the latter is not a wedged/incompatible
+// server.
+func (d *qwpSfOrphanDrainer) noProgressReason(acked, target, okAcks int64, stuckFor time.Duration) string {
+	if d.durableAckMode && okAcks > 0 {
+		return fmt.Sprintf(
+			"no durable-ack progress: ackedFsn stuck at %d (target %d) for %s "+
+				"on a live connection — the server OK-acked frames but issued no "+
+				"STATUS_DURABLE_ACK (a stalled durable pipeline, e.g. a wedged "+
+				"object-storage upload, or an incompatible build)",
+			acked, target, stuckFor)
+	}
+	return fmt.Sprintf(
+		"no drain progress: ackedFsn stuck at %d (target %d) for %s on a live "+
+			"connection — server accepted frames but is not ACKing (wedged "+
+			"server or incompatible build)",
+		acked, target, stuckFor)
 }
 
 // qwpSfDrainerPool is a bounded thread pool that runs orphan
@@ -366,6 +664,7 @@ type qwpSfDrainerPool struct {
 	sem           chan struct{}
 	closed        atomic.Bool
 	wg            sync.WaitGroup
+	logger        *slog.Logger // nil -> slog.Default() via qwpEffectiveLogger
 
 	// ctx is the master context handed to every drainerRun call.
 	// Cancelled in drainerPoolClose so dials and other ctx-aware
@@ -524,10 +823,10 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 			// returns, but close() must not block on un-cancellable
 			// I/O. The slot it holds stays a valid orphan a future
 			// sender re-adopts. Surface the abandoned count for ops.
-			log.Printf("[WARN] qwp/sf: %d orphan drainer(s) still running %s "+
-				"after close; abandoning (wedged in un-cancellable disk I/O). "+
-				"Their slots remain adoptable on a future sender start.",
-				p.activeCount(), qwpSfDrainerPoolCloseGrace+qwpSfDrainerPoolHardCloseGrace)
+			qwpEffectiveLogger(p.logger).Warn("qwp/sf: orphan drainer(s) still running after close; "+
+				"abandoning (wedged in un-cancellable disk I/O). Their slots remain adoptable on a future sender start.",
+				"count", p.activeCount(),
+				"grace", qwpSfDrainerPoolCloseGrace+qwpSfDrainerPoolHardCloseGrace)
 		}
 	}
 	// Release the master ctx even on the clean-exit path so the

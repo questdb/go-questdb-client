@@ -35,7 +35,7 @@ import (
 func TestSenderErrorImplementsError(t *testing.T) {
 	se := &SenderError{
 		Category:         CategoryParseError,
-		AppliedPolicy:    PolicyHalt,
+		AppliedPolicy:    PolicyTerminal,
 		ServerStatusByte: int(QwpStatusParseError),
 		ServerMessage:    "bad column type",
 		MessageSequence:  42,
@@ -45,7 +45,7 @@ func TestSenderErrorImplementsError(t *testing.T) {
 	}
 	var err error = se
 	s := err.Error()
-	for _, want := range []string{"PARSE_ERROR", "bad column type", "0x05", "HALT", "fsn=[100,100]", "seq=42"} {
+	for _, want := range []string{"PARSE_ERROR", "bad column type", "0x05", "TERMINAL", "fsn=[100,100]", "seq=42"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("error string missing %q: %s", want, s)
 		}
@@ -55,14 +55,14 @@ func TestSenderErrorImplementsError(t *testing.T) {
 func TestSenderErrorNoMessage(t *testing.T) {
 	se := &SenderError{
 		Category:         CategoryWriteError,
-		AppliedPolicy:    PolicyDropAndContinue,
+		AppliedPolicy:    PolicyRetriable,
 		ServerStatusByte: int(QwpStatusWriteError),
 		MessageSequence:  1,
 		FromFsn:          5,
 		ToFsn:            5,
 	}
 	s := se.Error()
-	for _, want := range []string{"WRITE_ERROR", "DROP_AND_CONTINUE", "fsn=[5,5]"} {
+	for _, want := range []string{"WRITE_ERROR", "RETRIABLE", "fsn=[5,5]"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("error string missing %q: %s", want, s)
 		}
@@ -75,7 +75,7 @@ func TestSenderErrorNoMessage(t *testing.T) {
 func TestSenderErrorProtocolViolationNoStatus(t *testing.T) {
 	se := &SenderError{
 		Category:         CategoryProtocolViolation,
-		AppliedPolicy:    PolicyHalt,
+		AppliedPolicy:    PolicyTerminal,
 		ServerStatusByte: NoStatusByte,
 		MessageSequence:  NoMessageSequence,
 		ServerMessage:    "ws-close[1002]: bad framing",
@@ -96,7 +96,7 @@ func TestSenderErrorProtocolViolationNoStatus(t *testing.T) {
 }
 
 func TestSenderErrorIsErrorsAsTarget(t *testing.T) {
-	se := &SenderError{Category: CategoryParseError, AppliedPolicy: PolicyHalt}
+	se := &SenderError{Category: CategoryParseError, AppliedPolicy: PolicyTerminal}
 	var err error = se
 	var got *SenderError
 	if !errors.As(err, &got) {
@@ -125,6 +125,7 @@ func TestCategoryString(t *testing.T) {
 		{CategoryInternalError, "INTERNAL_ERROR"},
 		{CategorySecurityError, "SECURITY_ERROR"},
 		{CategoryWriteError, "WRITE_ERROR"},
+		{CategoryNotWritable, "NOT_WRITABLE"},
 		{CategoryProtocolViolation, "PROTOCOL_VIOLATION"},
 		{Category(99), "Category(99)"},
 	}
@@ -141,8 +142,9 @@ func TestPolicyString(t *testing.T) {
 		want string
 	}{
 		{PolicyAuto, "AUTO"},
-		{PolicyDropAndContinue, "DROP_AND_CONTINUE"},
-		{PolicyHalt, "HALT"},
+		{PolicyRetriable, "RETRIABLE"},
+		{PolicyRetriableOther, "RETRIABLE_OTHER"},
+		{PolicyTerminal, "TERMINAL"},
 		{Policy(7), "Policy(7)"},
 	}
 	for _, tc := range tests {

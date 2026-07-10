@@ -57,6 +57,14 @@ var egressOnlyKeys = map[string]bool{
 	"failover_max_duration_ms":    true,
 	"initial_credit":              true,
 	"max_batch_rows":              true,
+	// Egress query keys the ingress parser ignores so a shared ws:: / wss::
+	// string (notably the facade's) validates through both parsers.
+	"auth":                   true,
+	"client_id":              true,
+	"path":                   true,
+	"query_close_timeout_ms": true,
+	"replay_exec":            true,
+	"server_info_timeout_ms": true,
 }
 
 // ingressOnlyKeys lists connect-string keys defined by the spec for
@@ -70,6 +78,7 @@ var ingressOnlyKeys = map[string]bool{
 	"auto_flush_interval":                   true,
 	"auto_flush_rows":                       true,
 	"close_flush_timeout_millis":            true,
+	"connection_listener_inbox_capacity":    true,
 	"drain_orphans":                         true,
 	"durable_ack_keepalive_interval_millis": true,
 	"error_inbox_capacity":                  true,
@@ -77,6 +86,7 @@ var ingressOnlyKeys = map[string]bool{
 	"initial_connect_retry":                 true,
 	"max_background_drainers":               true,
 	"max_buf_size":                          true,
+	"max_frame_rejections":                  true,
 	"max_name_len":                          true,
 	"on_internal_error":                     true,
 	"on_parse_error":                        true,
@@ -94,6 +104,34 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_durability":                         true,
 	"sf_max_bytes":                          true,
 	"sf_max_total_bytes":                    true,
+	// QWP ingest keys the egress parser ignores so a shared ws:: / wss::
+	// string (notably the facade's) validates through both parsers.
+	// gorilla / in_flight_window are the documented portability knobs;
+	// token_x / token_y are legacy public-key fields the ingest client
+	// accepts-but-ignores. (The HTTP-only protocol_version / request_timeout
+	// / retry_timeout / request_min_throughput are deliberately absent: the
+	// QWP ingest client rejects them in sanitizeQwpConf, so both parsers
+	// rejecting them is the correct, symmetric behaviour.)
+	"gorilla":          true,
+	"in_flight_window": true,
+	"token_x":          true,
+	"token_y":          true,
+}
+
+// poolKeys are the facade-owned (Side.POOL) connect-string keys. They are
+// meaningful only to the QuestDB facade (questdb.go); both standalone clients
+// accept-but-ignore them on ws/wss so one cluster config validates through the
+// ingest and egress parsers alike. Kept in sync with QuestDB facade options.
+var poolKeys = map[string]bool{
+	"lazy_connect":            true,
+	"sender_pool_min":         true,
+	"sender_pool_max":         true,
+	"query_pool_min":          true,
+	"query_pool_max":          true,
+	"acquire_timeout_ms":      true,
+	"idle_timeout_ms":         true,
+	"max_lifetime_ms":         true,
+	"housekeeper_interval_ms": true,
 }
 
 func confFromStr(conf string) (*lineSenderConfig, error) {
@@ -253,6 +291,14 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				panic("add a case for " + k)
 			}
+		case "connect_timeout":
+			// COMMON key: accepted on every schema so a shared
+			// connect string ports. Wired on HTTP and QWP; inert on TCP.
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal <= 0 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
+			}
+			senderConf.connectTimeoutMs = parsedVal
 		case "tls_verify":
 			switch v {
 			case "on":
@@ -429,6 +475,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			senderConf.reconnectMaxBackoffMillis = parsedVal
 			senderConf.reconnectMaxBackoffMillisSet = true
+		case "max_frame_rejections":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil || parsedVal < 1 {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q must be an int >= 1", k, v)
+			}
+			senderConf.maxFrameRejections = parsedVal
 		case "initial_connect_retry":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -516,14 +571,32 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			// 0 is the "use the default capacity" sentinel, resolved at
 			// construction (qwpSfDefaultErrorInboxCapacity), matching the
-			// WithErrorInboxCapacity option path. Any other sub-floor value
-			// is a user-supplied undersized inbox and is rejected.
-			if parsedVal != 0 && parsedVal < qwpSfMinErrorInboxCapacity {
+			// WithErrorInboxCapacity option path. Any other out-of-range value
+			// is rejected: a sub-floor inbox is undersized, and an over-ceiling
+			// one would panic make(chan) at construction.
+			if parsedVal != 0 && (parsedVal < qwpSfMinErrorInboxCapacity || parsedVal > qwpSfMaxErrorInboxCapacity) {
 				return nil, NewInvalidConfigStrError(
-					"invalid %s value, %d: must be >= %d",
-					k, parsedVal, qwpSfMinErrorInboxCapacity)
+					"invalid %s value, %d: must be in [%d, %d]",
+					k, parsedVal, qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity)
 			}
 			senderConf.errorInboxCapacity = parsedVal
+		case "connection_listener_inbox_capacity":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
+			}
+			// 0 is the "use the default capacity" sentinel; any other out-of-range
+			// value is rejected (sub-floor undersized, over-ceiling would panic
+			// make(chan) at construction).
+			if parsedVal != 0 && (parsedVal < qwpSfMinErrorInboxCapacity || parsedVal > qwpSfMaxErrorInboxCapacity) {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %d: must be in [%d, %d]",
+					k, parsedVal, qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity)
+			}
+			senderConf.connectionListenerInboxCapacity = parsedVal
 		case "request_durable_ack":
 			if senderConf.senderType != qwpSenderType {
 				// sf-client.md §4.6 mandates rejecting
@@ -535,19 +608,11 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 			switch v {
 			case "off", "false":
-				// The default. Non-durable, OK-driven trim is fully
-				// conformant (sf-client.md §9.2 / §19); nothing to wire.
+				// The default. Non-durable, OK-driven trim (sf-client.md §9.2).
 			case "on", "true":
-				// Durable-ack mode (sf-client.md §4.3 / §8.1 / §9.3 /
-				// §10 / §11) is a deferred opt-in, EE-only QoS feature:
-				// the cursor send loop OK-trims and silently ignores
-				// DURABLE_ACK frames (qwp_sf_send_loop.go). §19 makes
-				// the key normative so we accept it, but opting in is
-				// rejected with a clear deferred-feature message rather
-				// than the generic "unsupported option", mirroring
-				// sf_durability=flush.
-				return nil, NewInvalidConfigStrError(
-					"request_durable_ack=%s is not yet supported: durable-ack mode is not implemented in this client (deferred follow-up; use request_durable_ack=off)", v)
+				// Durable-ack mode: the cursor send loop trims / replays / awaits
+				// on STATUS_DURABLE_ACK instead of the OK ACK.
+				senderConf.requestDurableAck = true
 			default:
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not 'on' / 'off' / 'true' / 'false'", k, v)
@@ -556,24 +621,25 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			// Accepted for connect-string portability (sf-client.md
-			// §4.3 / §19) but inert: it only paces keepalive PINGs in
-			// durable-ack mode, which this client does not implement
-			// (see request_durable_ack). Validate the shape so a typo
-			// still errors helpfully; 0 / negative mean "disabled" per
-			// spec, so any int is in range.
-			if _, err := strconv.Atoi(v); err != nil {
+			// Paces the durable-ack keepalive ping; 0 / negative disable it.
+			ms, err := strconv.Atoi(v)
+			if err != nil {
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
+			senderConf.durableAckKeepaliveMillis = ms
+			senderConf.durableAckKeepaliveMillisSet = true
 		default:
-			if senderConf.senderType == qwpSenderType && egressOnlyKeys[k] {
+			if senderConf.senderType == qwpSenderType && (egressOnlyKeys[k] || poolKeys[k]) {
 				// Silently accepted on ingress so a single ws:: / wss::
 				// connect string can configure both Sender and
 				// QwpQueryClient. The Sender does not interpret the
 				// value — range/enum/type checks run on the egress side
 				// (qwp_query_conf.go). connect-string.md §16-20 and
 				// §Query client keys are the load-bearing spec text.
+				// poolKeys are facade-owned (Side.POOL): both standalone
+				// clients accept-but-ignore them so the QuestDB facade can
+				// validate one cluster config through both parsers.
 				continue
 			}
 			return nil, NewInvalidConfigStrError("unsupported option %q", k)
@@ -590,10 +656,18 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 // only meaningful at the global layer.
 func parseErrorPolicyValue(k, v string, allowAuto bool) (Policy, error) {
 	switch v {
-	case "halt":
-		return PolicyHalt, nil
-	case "drop":
-		return PolicyDropAndContinue, nil
+	case "terminal":
+		return PolicyTerminal, nil
+	case "retriable":
+		return PolicyRetriable, nil
+	case "retriable_other":
+		return PolicyRetriableOther, nil
+	case "halt", "drop":
+		// NACK policy v2 removed the drop policy (no silent data loss)
+		// and renamed halt; fail loudly with a migration hint instead of
+		// silently reinterpreting an old config.
+		return PolicyAuto, NewInvalidConfigStrError(
+			"invalid %s value: %q was removed by NACK policy v2 — use 'terminal', 'retriable', or 'retriable_other'", k, v)
 	case "auto":
 		if allowAuto {
 			return PolicyAuto, nil
@@ -601,10 +675,10 @@ func parseErrorPolicyValue(k, v string, allowAuto bool) (Policy, error) {
 	}
 	if allowAuto {
 		return PolicyAuto, NewInvalidConfigStrError(
-			"invalid %s value, %q is not 'auto' / 'halt' / 'drop'", k, v)
+			"invalid %s value, %q is not 'auto' / 'terminal' / 'retriable' / 'retriable_other'", k, v)
 	}
 	return PolicyAuto, NewInvalidConfigStrError(
-		"invalid %s value, %q is not 'halt' / 'drop'", k, v)
+		"invalid %s value, %q is not 'terminal' / 'retriable' / 'retriable_other'", k, v)
 }
 
 // setPerCategoryPolicy parses v as a Policy and stores it on the
@@ -726,7 +800,6 @@ func parseConfigStr(conf string) (configData, error) {
 			KeyValuePairs: map[string]string{},
 		}
 
-		nextRune   rune
 		isEscaping bool
 	)
 
@@ -745,74 +818,89 @@ func parseConfigStr(conf string) (configData, error) {
 		conf += ";"
 	}
 
-	keyValueStr := []rune(conf)
-	for idx, rune := range keyValueStr {
-		if idx < len(conf)-1 {
-			nextRune = keyValueStr[idx+1]
-		} else {
-			nextRune = 0
+	// Reject duplicate keys (case-sensitive) for parity with Rust and
+	// the per-field checks in Java; otherwise dups would silently LWW.
+	// `addr` is the documented exception: the failover spec (§1)
+	// allows `addr=h1;addr=h2` as an alternative spelling of
+	// `addr=h1,h2`. Both forms accumulate into a single
+	// comma-joined value so downstream parsers see one shape.
+	commitPair := func() error {
+		if value.Len() == 0 {
+			return NewInvalidConfigStrError("empty value for key %q", key)
 		}
-		switch rune {
+		keyStr := key.String()
+		if existing, exists := result.KeyValuePairs[keyStr]; exists {
+			if keyStr == "addr" {
+				result.KeyValuePairs[keyStr] = existing + "," + value.String()
+			} else {
+				return NewInvalidConfigStrError("duplicate key %q", keyStr)
+			}
+		} else {
+			result.KeyValuePairs[keyStr] = value.String()
+		}
+		key.Reset()
+		value.Reset()
+		isKey = true
+		return nil
+	}
+
+	// Byte-wise iteration: the delimiters ';' and '=' are ASCII and
+	// UTF-8 continuation bytes are all >= 0x80, so multi-byte runes in
+	// keys and values pass through the builders untouched.
+	for idx := 0; idx < len(conf); idx++ {
+		var nextByte byte
+		if idx < len(conf)-1 {
+			nextByte = conf[idx+1]
+		}
+		switch b := conf[idx]; b {
 		case ';':
 			if isKey {
-				if nextRune == 0 {
+				if nextByte == 0 {
 					return result, NewInvalidConfigStrError("unexpected end of string")
 				}
 				return result, NewInvalidConfigStrError("invalid key character ';'")
 			}
 
-			if !isEscaping && nextRune == ';' {
+			if !isEscaping && nextByte == ';' {
 				isEscaping = true
 				continue
 			}
 
 			if isEscaping {
-				value.WriteRune(rune)
+				value.WriteByte(b)
 				isEscaping = false
 				continue
 			}
 
-			if value.Len() == 0 {
-				return result, NewInvalidConfigStrError("empty value for key %q", key)
+			if err := commitPair(); err != nil {
+				return result, err
 			}
-
-			// Reject duplicate keys (case-sensitive) for parity with Rust and
-			// the per-field checks in Java; otherwise dups would silently LWW.
-			// `addr` is the documented exception: the failover spec (§1)
-			// allows `addr=h1;addr=h2` as an alternative spelling of
-			// `addr=h1,h2`. Both forms accumulate into a single
-			// comma-joined value so downstream parsers see one shape.
-			keyStr := key.String()
-			if existing, exists := result.KeyValuePairs[keyStr]; exists {
-				if keyStr == "addr" {
-					result.KeyValuePairs[keyStr] = existing + "," + value.String()
-				} else {
-					return result, NewInvalidConfigStrError("duplicate key %q", keyStr)
-				}
-			} else {
-				result.KeyValuePairs[keyStr] = value.String()
-			}
-
-			key.Reset()
-			value.Reset()
-			isKey = true
 		case '=':
 			if isKey {
 				isKey = false
 			} else {
-				value.WriteRune(rune)
+				value.WriteByte(b)
 			}
 		default:
 			if isKey {
-				key.WriteRune(rune)
+				key.WriteByte(b)
 			} else {
-				value.WriteRune(rune)
+				value.WriteByte(b)
 			}
 		}
 	}
 
 	if isEscaping {
 		return result, NewInvalidConfigStrError("unescaped ';'")
+	}
+
+	// A conf ending in ";;" spends its final ';' as the escaped
+	// character, leaving the last pair complete but unterminated —
+	// commit it instead of silently dropping it.
+	if !isKey {
+		if err := commitPair(); err != nil {
+			return result, err
+		}
 	}
 
 	return result, nil

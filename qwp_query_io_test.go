@@ -122,6 +122,33 @@ func newQwpMockEgressServer(t *testing.T, handler func(*qwpMockEgressConn)) *htt
 	}))
 }
 
+// egressCancelResponder is a long-lived mock handler that replies to
+// every CANCEL frame with a QUERY_ERROR(CANCELLED) terminal frame for
+// the cancelled request, so a client-side cleanup drain observes a
+// terminal frame promptly instead of racing the cancel-ack watchdog
+// (qwpQueryCancelAckTimeout) against the drain ctx (both 5s). QUERY_-
+// REQUEST / CREDIT frames are read and ignored. Returns when the client
+// closes the connection. Reads on a background ctx and swallows the
+// read/write errors that a close races, so teardown never fails the test.
+func egressCancelResponder(m *qwpMockEgressConn) {
+	ctx := context.Background()
+	for {
+		typ, data, err := m.conn.Read(ctx)
+		if err != nil {
+			return
+		}
+		if typ != websocket.MessageBinary || len(data) < 9 {
+			continue
+		}
+		if data[0] == byte(qwpMsgKindCancel) {
+			reqID := int64(binary.LittleEndian.Uint64(data[1:]))
+			resp := writeQwpFrame(0, buildQueryErrorBody(
+				reqID, byte(qwpStatusCancelled), "cancelled", -1))
+			_ = m.conn.Write(ctx, websocket.MessageBinary, resp)
+		}
+	}
+}
+
 // connectEgress dials the mock server with qwpReadPath. It sets a
 // SERVER_INFO read timeout so the transport consumes the frame the mock
 // emits post-upgrade, matching the production egress connect path.
@@ -210,6 +237,62 @@ func parseQueryRequest(t *testing.T, frame []byte) (int64, string, int64) {
 
 // --- Tests ---
 
+// A new query whose first RESULT_BATCH is a continuation (batch_seq > 0) must be
+// rejected, not decoded with the PRIOR query's held schema. The dispatcher calls
+// resetQuerySchema at the start of every query; without it, Q1's schema silently
+// decodes Q2's continuation into bogus rows on a reused pooled connection.
+// Revert-proof: dropping that reset turns the Error below into a leaked Batch.
+func TestQwpEgressIOResetQuerySchemaRejectsLeakedContinuation(t *testing.T) {
+	const q1ReqID = int64(21)
+	const q2ReqID = int64(22)
+
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		m.readBinary(ctx)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, q1ReqID, 0, "v", 100))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(q1ReqID, 0, 1)))
+
+		m.readBinary(ctx)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, q2ReqID, 1, "v", 999))
+	})
+	defer srv.Close()
+
+	tr := connectEgress(t, srv.URL)
+	defer tr.close()
+
+	io := newQwpEgressIO(tr, 2, 0)
+	io.start()
+	defer shutdownIO(t, io)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT v FROM t", requestId: q1ReqID}); err != nil {
+		t.Fatalf("submitQuery q1: %v", err)
+	}
+	batchEv := takeEventOrFail(t, io, 2*time.Second)
+	if batchEv.kind != qwpEventKindBatch {
+		t.Fatalf("q1 first event = %v, want Batch (errMsg=%q)", batchEv.kind, batchEv.errMessage)
+	}
+	batchEv.batch.release()
+	if endEv := takeEventOrFail(t, io, 2*time.Second); endEv.kind != qwpEventKindEnd {
+		t.Fatalf("q1 second event = %v, want End", endEv.kind)
+	}
+
+	if err := io.submitQuery(ctx, qwpRequest{sql: "SELECT v FROM t2", requestId: q2ReqID}); err != nil {
+		t.Fatalf("submitQuery q2: %v", err)
+	}
+	ev := takeEventOrFail(t, io, 2*time.Second)
+	if ev.kind != qwpEventKindTransportError {
+		t.Fatalf("q2 first event = %v, want TransportError (a leaked prior-query schema decoded the continuation as a bogus Batch)", ev.kind)
+	}
+	if !strings.Contains(ev.errMessage, "continuation") {
+		t.Errorf("q2 error = %q, want a continuation-before-schema decode error", ev.errMessage)
+	}
+}
+
 // TestQwpEgressIOHappyPathSelect drives a SELECT-style sequence: the
 // mock sends RESULT_BATCH + RESULT_BATCH + RESULT_END; the I/O loop
 // decodes and surfaces Batch, Batch, End in order.
@@ -242,7 +325,7 @@ func TestQwpEgressIOHappyPathSelect(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 4)
+	io := newQwpEgressIO(tr, 4, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -274,7 +357,7 @@ func TestQwpEgressIOExecDone(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -312,7 +395,7 @@ func TestQwpEgressIOQueryError(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -368,7 +451,7 @@ func TestQwpEgressIOCancel(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -444,7 +527,7 @@ func TestQwpEgressIOCancelAckWatchdog(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	// Shrink the watchdog so the wedge resolves quickly; 500ms still
 	// leaves ample room for the mock to read the CANCEL off loopback
 	// before the timer tears the connection down.
@@ -517,7 +600,7 @@ func TestQwpEgressIOShutdownUnblocksRead(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -551,7 +634,7 @@ func TestQwpEgressIOShutdownUnblocksRead(t *testing.T) {
 // loop's ACK parsers are length-validated before use — but all of them
 // share the same recover idiom this guards.
 func TestQwpEgressReaderRecoversPanic(t *testing.T) {
-	io := newQwpEgressIO(&qwpTransport{conn: nil}, 2)
+	io := newQwpEgressIO(&qwpTransport{conn: nil}, 2, 0)
 	io.start()
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -604,7 +687,7 @@ func TestQwpEgressIOPoolBackpressure(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 1) // pool of size 1
+	io := newQwpEgressIO(tr, 1, 0) // pool of size 1
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -682,7 +765,7 @@ func TestQwpEgressIOInPlaceDecodeAliasing(t *testing.T) {
 
 	// Pool size 2: the dispatcher can decode batch 1 into a
 	// different buffer while batch 0 is still held by the user.
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -776,7 +859,7 @@ func TestQwpEgressIOCreditReplenish(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -836,7 +919,7 @@ func TestQwpEgressIOUnknownMsgKind(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 1)
+	io := newQwpEgressIO(tr, 1, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -886,7 +969,7 @@ func TestQwpEgressIOPoisonReclaimsReader(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 1)
+	io := newQwpEgressIO(tr, 1, 0)
 	io.start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -970,7 +1053,7 @@ func TestQwpEgressIOCacheResetBetweenQueries(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -1033,7 +1116,7 @@ func TestQwpEgressIOCacheResetTruncatedPoisons(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 1)
+	io := newQwpEgressIO(tr, 1, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -1077,7 +1160,7 @@ func TestQwpEgressIOConcurrentCancelAndShutdown(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1127,7 +1210,7 @@ func TestQwpEgressIODecodeFailure(t *testing.T) {
 	defer tr.close()
 
 	const poolSize = 2
-	io := newQwpEgressIO(tr, poolSize)
+	io := newQwpEgressIO(tr, poolSize, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -1180,7 +1263,7 @@ func TestQwpEgressIODecodeFailurePoisons(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -1242,7 +1325,7 @@ func TestQwpEgressIOReleaseAfterShutdown(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1355,7 +1438,7 @@ func runReleaseClosePoolRaceOnce(t *testing.T, iter int) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 
 	// Pull both pool buffers out so we can release them — what the
@@ -1415,7 +1498,7 @@ func TestQwpEgressIOTakeEventWakesOnShutdown(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 
 	submitCtx, submitCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1486,7 +1569,7 @@ func TestQwpEgressIOShutdownPreservesQueuedEvents(t *testing.T) {
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1732,7 +1815,7 @@ func TestQwpEgressIOShutdownUnblocksStuckWrite(t *testing.T) {
 	tr, clientConn := newStalledTransport(t, preSend)
 	t.Cleanup(func() { _ = clientConn.Close() })
 
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 
 	// Let the reader pull the pre-sent frame off the wire and park on
@@ -1854,7 +1937,7 @@ func TestQwpEgressIOCacheResetMidQuery(t *testing.T) {
 
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -1940,7 +2023,7 @@ func TestQwpEgressIOCreditStarvationNeverReleases(t *testing.T) {
 
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
-	io := newQwpEgressIO(tr, 1) // pool of size 1
+	io := newQwpEgressIO(tr, 1, 0) // pool of size 1
 	io.start()
 	defer shutdownIO(t, io)
 
@@ -2034,7 +2117,7 @@ func TestQwpEgressIOBindPath(t *testing.T) {
 
 	tr := connectEgress(t, srv.URL)
 	defer tr.close()
-	io := newQwpEgressIO(tr, 2)
+	io := newQwpEgressIO(tr, 2, 0)
 	io.start()
 	defer shutdownIO(t, io)
 

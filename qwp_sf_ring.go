@@ -27,7 +27,6 @@ package questdb
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -112,9 +111,9 @@ type qwpSfSegmentRing struct {
 	// mu protects sealedSegments and serialises against close. It also
 	// covers the producer's mutation when adding a sealed segment to
 	// the list.
-	mu              sync.Mutex
-	sealedSegments  []*qwpSfSegment
-	closed          bool
+	mu             sync.Mutex
+	sealedSegments []*qwpSfSegment
+	closed         bool
 
 	// managerWakeup is invoked by the producer on rotation or
 	// high-water-mark crossings to ask the manager to provision a
@@ -215,8 +214,12 @@ func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, e
 				// Bad-content .sfa (bad magic/version/header/baseSeq):
 				// a stray or hand-damaged file with no recoverable
 				// frames behind it. Skip rather than fail the whole
-				// recovery, but log so the skip is never silent.
-				log.Printf("[WARN] qwp/sf: skipping corrupt segment during recovery: %v", err)
+				// recovery, but log so the skip is never silent. This
+				// runs during on-disk recovery inside the engine
+				// constructor, before the per-sender logger is wired, so
+				// it goes to slog.Default() (an app that configures global
+				// slog still captures it).
+				qwpEffectiveLogger(nil).Warn("qwp/sf: skipping corrupt segment during recovery", "error", err)
 				continue
 			}
 			// A syscall/I-O failure (EMFILE/ENFILE/ENOMEM/EACCES/EIO)
@@ -449,10 +452,18 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 }
 
 // segmentRingClose releases all segments and marks the ring closed.
-// Subsequent installHotSpare calls return qwpSfErrRingClosed; the
-// active segment is closed last so any reader that captured a
-// reference can finish reading before unmap.
+// Subsequent installHotSpare calls return qwpSfErrRingClosed. Segment
+// ordering here provides no reader synchronization — a reader holding an
+// address() reference is unprotected regardless of order — so the caller must
+// ensure the send loop has joined before closing, or pass leakMappings via
+// segmentRingCloseInternal when it may still be reading (the send-loop-abandon
+// path, where a goroutine wedged in an un-cancellable page fault may still be
+// dereferencing a segment).
 func (r *qwpSfSegmentRing) segmentRingClose() error {
+	return r.segmentRingCloseInternal(false)
+}
+
+func (r *qwpSfSegmentRing) segmentRingCloseInternal(leakMappings bool) error {
 	r.mu.Lock()
 	r.closed = true
 	sealed := r.sealedSegments
@@ -461,12 +472,12 @@ func (r *qwpSfSegmentRing) segmentRingClose() error {
 
 	var firstErr error
 	if a := r.active.Swap(nil); a != nil {
-		if err := a.close(); err != nil && firstErr == nil {
+		if err := a.closeInternal(leakMappings); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	if hs := r.hotSpare.Swap(nil); hs != nil {
-		if err := hs.close(); err != nil && firstErr == nil {
+		if err := hs.closeInternal(leakMappings); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -474,7 +485,7 @@ func (r *qwpSfSegmentRing) segmentRingClose() error {
 		if s == nil {
 			continue
 		}
-		if err := s.close(); err != nil && firstErr == nil {
+		if err := s.closeInternal(leakMappings); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

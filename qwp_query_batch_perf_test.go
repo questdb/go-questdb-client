@@ -157,8 +157,8 @@ func perfMultiColInt64Batch(rows, cols int) *QwpColumnBatch {
 
 // BenchmarkBatchMultiColRowMajor: row-major full-batch scan via the
 // (col, row) batch surface. Column index varies inside the inner loop,
-// so b.layouts[c] is rebound every cell — the workload the original
-// review comment described.
+// so b.layouts[c] is rebound every cell — the row-major access
+// pattern this benchmark targets.
 func BenchmarkBatchMultiColRowMajor(b *testing.B) {
 	batch := perfMultiColInt64Batch(perfRows, perfCols)
 	b.ReportAllocs()

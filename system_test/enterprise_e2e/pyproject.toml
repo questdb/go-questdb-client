@@ -19,6 +19,7 @@ addopts = [
 ]
 markers = [
     "go_client: Go client e2e tests against Enterprise QuestDB",
+    "fuzz: randomized fuzz tests; iteration count via QDB_E2E_FUZZ_ITERS (run with -m fuzz)",
 ]
 log_cli = true
 log_cli_level = "INFO"

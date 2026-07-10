@@ -262,7 +262,7 @@ func TestParserHappyCases(t *testing.T) {
 			expected: qdb.ConfigData{
 				Schema: "ws",
 				KeyValuePairs: map[string]string{
-					"addr":              addr,
+					"addr":             addr,
 					"in_flight_window": "4",
 				},
 			},
@@ -337,7 +337,7 @@ func TestParserPathologicalCases(t *testing.T) {
 		},
 		{
 			name:                   "duplicate on_server_error",
-			config:                 "ws::addr=localhost:9000;on_server_error=auto;on_server_error=halt;",
+			config:                 "ws::addr=localhost:9000;on_server_error=auto;on_server_error=terminal;",
 			expectedErrMsgContains: `duplicate key \"on_server_error\"`,
 		},
 	}
@@ -349,6 +349,178 @@ func TestParserPathologicalCases(t *testing.T) {
 			assert.Error(t, err)
 			assert.ErrorAs(t, err, &expected)
 			assert.Contains(t, err.Error(), tc.expectedErrMsgContains)
+		})
+	}
+}
+
+// Regression: the parser indexed a []rune slice with a byte-length
+// lookahead guard, so any multi-byte UTF-8 in the post-'::' portion
+// panicked with index out of range instead of parsing.
+func TestParserNonASCIIValues(t *testing.T) {
+	testCases := []parseConfigTestCase{
+		{
+			name:   "accented password",
+			config: "ws::addr=host;password=héllo;",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr":     "host",
+					"password": "héllo",
+				},
+			},
+		},
+		{
+			name:   "multi-byte value in final pair without trailing semicolon",
+			config: "ws::addr=host;password=héllo",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr":     "host",
+					"password": "héllo",
+				},
+			},
+		},
+		{
+			name:   "CJK token",
+			config: "http::addr=localhost:9000;token=秘密トークン;",
+			expected: qdb.ConfigData{
+				Schema: "http",
+				KeyValuePairs: map[string]string{
+					"addr":  "localhost:9000",
+					"token": "秘密トークン",
+				},
+			},
+		},
+		{
+			name:   "emoji password and CJK username",
+			config: "https::addr=localhost:9000;username=用户;password=🔑key🔑;",
+			expected: qdb.ConfigData{
+				Schema: "https",
+				KeyValuePairs: map[string]string{
+					"addr":     "localhost:9000",
+					"username": "用户",
+					"password": "🔑key🔑",
+				},
+			},
+		},
+		{
+			name:   "escaped semicolon between multi-byte runes",
+			config: "ws::addr=host;password=é;;λ;",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr":     "host",
+					"password": "é;λ",
+				},
+			},
+		},
+		{
+			name:   "multi-byte key",
+			config: "ws::addr=host;clé=v;",
+			expected: qdb.ConfigData{
+				Schema: "ws",
+				KeyValuePairs: map[string]string{
+					"addr": "host",
+					"clé":  "v",
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := qdb.ParseConfigStr(tc.config)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+// Regression: a conf string ending in ";;" spends its final ';' as the
+// escaped character, so the last pair used to end the loop uncommitted
+// and was silently dropped. It must commit with a trailing ';' in the
+// value; every other escape shape and malformed tail keeps its
+// historical behavior.
+func TestParserTrailingEscapedSemicolon(t *testing.T) {
+	testCases := []parseConfigTestCase{
+		{
+			name:   "escaped semicolon at end of string commits the pair",
+			config: "tcp::addr=h;token=abc;;",
+			expected: qdb.ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  "h",
+					"token": "abc;",
+				},
+			},
+		},
+		{
+			name:   "escaped semicolon as whole value at end of string",
+			config: "tcp::addr=h;token=;;",
+			expected: qdb.ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  "h",
+					"token": ";",
+				},
+			},
+		},
+		{
+			name:   "escaped semicolon mid-value",
+			config: "tcp::addr=h;token=ab;;c;",
+			expected: qdb.ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  "h",
+					"token": "ab;c",
+				},
+			},
+		},
+		{
+			name:   "escaped semicolon at end of value with terminator",
+			config: "tcp::addr=h;token=abc;;;",
+			expected: qdb.ConfigData{
+				Schema: "tcp",
+				KeyValuePairs: map[string]string{
+					"addr":  "h",
+					"token": "abc;",
+				},
+			},
+		},
+		{
+			name:                   "duplicate key committed by the trailing escape is rejected",
+			config:                 "tcp::addr=h;token=a;token=b;;",
+			expectedErrMsgContains: `duplicate key \"token\"`,
+		},
+		{
+			name:                   "dangling key with terminator is rejected",
+			config:                 "tcp::addr=h;token;",
+			expectedErrMsgContains: "unexpected end of string",
+		},
+		{
+			name:                   "dangling key without terminator is rejected",
+			config:                 "tcp::addr=h;token",
+			expectedErrMsgContains: "unexpected end of string",
+		},
+		{
+			name:                   "empty value is rejected",
+			config:                 "tcp::addr=h;token=;",
+			expectedErrMsgContains: "empty value",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := qdb.ParseConfigStr(tc.config)
+			if tc.expectedErrMsgContains != "" {
+				var expected *qdb.InvalidConfigStrError
+				assert.Error(t, err)
+				assert.ErrorAs(t, err, &expected)
+				assert.Contains(t, err.Error(), tc.expectedErrMsgContains)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, actual)
 		})
 	}
 }
@@ -647,11 +819,11 @@ func TestHappyCasesFromConf(t *testing.T) {
 		},
 		{
 			name:   "ws with on_server_error",
-			config: fmt.Sprintf("ws::addr=%s;on_server_error=halt;", addr),
+			config: fmt.Sprintf("ws::addr=%s;on_server_error=terminal;", addr),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithQwp(),
 				qdb.WithAddress(addr),
-				qdb.WithServerErrorPolicy(qdb.PolicyHalt),
+				qdb.WithServerErrorPolicy(qdb.PolicyTerminal),
 			},
 		},
 		{
@@ -876,8 +1048,8 @@ func TestQwpFailoverSanitizeErrors(t *testing.T) {
 // TestQwpSanitizeRejectsRetryTimeout pins that retry_timeout, though
 // the parser accepts it for any schema, is rejected by the QWP
 // sanitizer: it is an HTTP-ILP retry knob with no QWP analogue
-// (reconnect_max_duration_millis governs the per-outage budget
-// instead). Guards the parser happy-case in TestHappyCasesFromConf,
+// (reconnect_max_duration_millis governs the sync initial-connect
+// budget instead). Guards the parser happy-case in TestHappyCasesFromConf,
 // which deliberately omits the ws+retry_timeout pairing.
 func TestQwpSanitizeRejectsRetryTimeout(t *testing.T) {
 	c, err := qdb.ConfFromStr("ws::addr=localhost:9000;retry_timeout=5000;")
@@ -1004,7 +1176,7 @@ func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
 		{"qwp_dump_writer", qdb.WithQwpDumpWriter(io.Discard), "QWP dump writer"},
 		{"error_handler", qdb.WithErrorHandler(func(*qdb.SenderError) {}), "server-error API"},
 		{"error_inbox_capacity", qdb.WithErrorInboxCapacity(64), "server-error API"},
-		{"server_error_policy", qdb.WithServerErrorPolicy(qdb.PolicyHalt), "server-error API"},
+		{"server_error_policy", qdb.WithServerErrorPolicy(qdb.PolicyTerminal), "server-error API"},
 	}
 	for _, transport := range []struct {
 		name string

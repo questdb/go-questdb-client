@@ -60,7 +60,7 @@ func TestQwpSenderLastTerminalErrorAndCounters(t *testing.T) {
 	se := s.LastTerminalError()
 	require.NotNil(t, se, "LastTerminalError should be non-nil after halt")
 	assert.Equal(t, CategoryParseError, se.Category)
-	assert.Equal(t, PolicyHalt, se.AppliedPolicy)
+	assert.Equal(t, PolicyTerminal, se.AppliedPolicy)
 	assert.Equal(t, int(QwpStatusParseError), se.ServerStatusByte)
 	assert.GreaterOrEqual(t, s.TotalServerErrors(), int64(1))
 
@@ -101,13 +101,14 @@ func TestQwpSenderFlushAndGetSequenceHappyPath(t *testing.T) {
 	assert.Equal(t, fsn2, fsn3, "empty FlushAndGetSequence should not advance FSN")
 }
 
-// TestQwpSenderHandlerInvokedOnDrop wires a custom error handler via
-// the loop setter, drives a Drop-policy rejection, and asserts the
-// handler observes the SenderError before LastTerminalError stays nil
-// (Drop does not latch a terminal error).
-func TestQwpSenderHandlerInvokedOnDrop(t *testing.T) {
+// TestQwpSenderHandlerInvokedOnRetriable wires a custom error handler
+// via the loop setter, drives a retriable rejection, and asserts the
+// handler observes the informational SenderError while
+// LastTerminalError stays nil (a retriable NACK recycles the
+// connection; it never latches).
+func TestQwpSenderHandlerInvokedOnRetriable(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:       QwpStatusSchemaMismatch, // default Drop
+		rejectStatus:       QwpStatusWriteError, // retriable
 		rejectFirstNFrames: 1,
 	})
 	defer srv.Close()
@@ -134,24 +135,24 @@ func TestQwpSenderHandlerInvokedOnDrop(t *testing.T) {
 
 	select {
 	case se := <-gotCh:
-		assert.Equal(t, CategorySchemaMismatch, se.Category)
-		assert.Equal(t, PolicyDropAndContinue, se.AppliedPolicy)
+		assert.Equal(t, CategoryWriteError, se.Category)
+		assert.Equal(t, PolicyRetriable, se.AppliedPolicy)
 	case <-time.After(3 * time.Second):
 		t.Fatal("handler not invoked within deadline")
 	}
-	// Drop does NOT latch terminal.
+	// A retriable NACK does NOT latch terminal.
 	assert.Nil(t, s.LastTerminalError())
-	// totalServerErrors saw the Drop.
 	assert.GreaterOrEqual(t, s.TotalServerErrors(), int64(1))
 	assert.GreaterOrEqual(t, s.TotalErrorNotificationsDelivered(), int64(1))
 }
 
 // TestQwpSenderInboxOverflowBumpsCounter asserts that flooding a slow
 // handler bumps DroppedErrorNotifications without stalling the I/O
-// path.
+// path. Pre-send retriable rejections give an unbounded notification
+// stream (one per recycle, no poison strikes).
 func TestQwpSenderInboxOverflowBumpsCounter(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus: QwpStatusSchemaMismatch,
+		unsolicitedRejectAtConnect: QwpStatusWriteError,
 	})
 	defer srv.Close()
 
@@ -164,13 +165,9 @@ func TestQwpSenderInboxOverflowBumpsCounter(t *testing.T) {
 	}, qwpSfMinErrorInboxCapacity)
 	defer close(release)
 
-	for i := 0; i < 200; i++ {
-		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
-		require.NoError(t, s.Flush(context.Background()))
-	}
 	require.Eventually(t, func() bool {
 		return s.DroppedErrorNotifications() > 0
-	}, 5*time.Second, 10*time.Millisecond,
+	}, 10*time.Second, 10*time.Millisecond,
 		"DroppedErrorNotifications never increased: dropped=%d delivered=%d",
 		s.DroppedErrorNotifications(), s.TotalErrorNotificationsDelivered())
 }

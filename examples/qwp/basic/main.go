@@ -50,8 +50,11 @@ func main() {
 		qdb.WithQwp(),
 		qdb.WithAddress("localhost:9000"),
 		qdb.WithErrorHandler(func(e *qdb.SenderError) {
-			// Dead-letter / alert here. This runs on a dedicated
-			// goroutine, never the producer goroutine.
+			// Alert / record metrics here; this runs on a dedicated
+			// goroutine, never the producer goroutine. Retriable
+			// rejections are informational — the sender reconnects
+			// and replays them automatically; terminal ones latch
+			// and surface on the next producer call.
 			log.Printf("server rejected fsn=[%d,%d] table=%s category=%s: %s",
 				e.FromFsn, e.ToFsn, e.TableName, e.Category, e.ServerMessage)
 		}),
