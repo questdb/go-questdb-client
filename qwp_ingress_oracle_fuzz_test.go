@@ -1017,11 +1017,12 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 //
 // A poisoned chunk carries one row whose dec256 unscaled value is 2^192
 // (~6.3e57, 58 digits) — well past DECIMAL(50,6)'s 10^50 cap. The
-// server returns CategoryWriteError, whose spec-default policy is
-// DROP_AND_CONTINUE (qwp_sf_classify.go), so the producer keeps going
-// and the rejection surfaces only via the async handler. No server
-// bounce on purpose — the failure mode must be unambiguously the
-// per-frame rejection, not a transport blip.
+// server rejects it as SCHEMA_MISMATCH (a deterministic data-shape
+// rejection), whose spec-default policy is DROP_AND_CONTINUE
+// (qwp_sf_classify.go), so the producer keeps going and the rejection
+// surfaces only via the async handler. No server bounce on purpose —
+// the failure mode must be unambiguously the per-frame rejection, not
+// a transport blip.
 //
 // Faithful-port divergences (cf. the file header and the bounce port):
 //
@@ -1041,7 +1042,7 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 //     bound 3x catches "handler fires N times per chunk" regressions
 //     the Java port doesn't guard.
 //   - Goes beyond the Java port: also captures one delivered
-//     *SenderError and asserts Category == CategoryWriteError and
+//     *SenderError and asserts Category == CategorySchemaMismatch and
 //     AppliedPolicy == PolicyDropAndContinue, so a misclassification
 //     (wrong status byte → wrong category) or a policy-resolution
 //     regression cannot pass silently behind the call-count alone.
@@ -1233,13 +1234,14 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 		t.Fatalf("error handler fired %d times, expected <= %d (3x poisoned chunks)",
 			got, upper)
 	}
-	// Inspect at least one delivered payload: misclassifying the
-	// dec256 overflow into a non-WriteError category, or resolving
-	// its policy to anything other than DROP_AND_CONTINUE, must
-	// fail the test even though the call count alone would still
-	// match. (A HALT resolution would also surface as a Flush error
-	// above, but we assert the policy here explicitly so the
-	// contract is self-documenting.)
+	// Inspect at least one delivered payload: the server reports the
+	// dec256 overflow as SCHEMA_MISMATCH (a deterministic data-shape
+	// rejection); misclassifying it, or resolving its policy to
+	// anything other than DROP_AND_CONTINUE, must fail the test even
+	// though the call count alone would still match. (A HALT
+	// resolution would also surface as a Flush error above, but we
+	// assert the policy here explicitly so the contract is
+	// self-documenting.)
 	if totalPoisonedChunks > 0 {
 		firstErrMu.Lock()
 		se := firstErr
@@ -1247,9 +1249,9 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 		if se == nil {
 			t.Fatalf("error handler fired %d times but no *SenderError captured", got)
 		}
-		if se.Category != CategoryWriteError {
+		if se.Category != CategorySchemaMismatch {
 			t.Fatalf("error handler: wrong category: got %s (status=0x%02X), "+
-				"expected WRITE_ERROR; msg=%q",
+				"expected SCHEMA_MISMATCH; msg=%q",
 				se.Category, byte(se.ServerStatusByte), se.ServerMessage)
 		}
 		if se.AppliedPolicy != PolicyDropAndContinue {

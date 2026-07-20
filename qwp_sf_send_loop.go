@@ -1152,9 +1152,19 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// status byte, resolve the policy, surface a typed
 			// SenderError. Halt latches and exits the receiver loop;
 			// DropAndContinue advances ackedFsn past the rejected
-			// span and keeps draining (the bytes on disk are the
-			// bytes the server rejected — reconnect/replay cannot
-			// fix them; only dropping moves us past them).
+			// span (the bytes on disk are the bytes the server
+			// rejected — replaying them cannot help; only dropping
+			// moves us past them) and then recycles the wire. The
+			// recycle is required for progress: after emitting an
+			// error frame the server silently refuses every further
+			// frame on the connection (its ordered pipeline is
+			// broken — committing a later frame would advance data
+			// past the gap its ack watermark stopped at), so
+			// draining here would wait forever on acks that cannot
+			// arrive. The reconnect path replays the refused tail
+			// from the advanced watermark on a fresh connection.
+			// Mirrors the Java client's post-rejection connection
+			// recycle.
 			//
 			// Sanity clamp: do not trust a rejection wireSeq beyond the
 			// frames whose sendMessage has fully returned. Without this
@@ -1185,6 +1195,9 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				// the watermark advance entirely; there is nothing
 				// on this connection to drop. Still surface the
 				// typed error so HALT latches and the handler fires.
+				// Non-halt policies recycle the wire: the error frame
+				// broke the connection's ordered pipeline, so any
+				// frame sent on it now would be silently refused.
 				// Mirrors handlePreSendRejection in the Java client.
 				from := l.engine.engineAckedFsn() + 1
 				to := l.engine.enginePublishedFsn()
@@ -1208,7 +1221,9 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 					return se
 				}
 				l.dispatcher.Load().offer(se)
-				continue
+				return fmt.Errorf(
+					"qwp/sf: pre-send server rejection (%v, status=0x%x): recycling connection",
+					cat, int(status))
 			}
 			cappedSeq := seq
 			if cappedSeq > highestSent {
@@ -1241,10 +1256,21 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// segment manager will trim the now-acked range on its
 			// next maintenance pass. Bump totalAcks for parity with
 			// the success path so producer-visible counters reflect
-			// "the server has resolved this batch".
+			// "the server has resolved this batch" — the bump also
+			// keeps the silent-connection terminal heuristic in run()
+			// from counting rejection recycles as ACK-less strikes.
 			l.engine.engineAcknowledge(fsn)
 			l.totalAcks.Add(1)
-			continue
+			// Recycle the wire (see the classify comment above): the
+			// server refuses the pipelined tail after an error frame,
+			// so the reconnect path must replay it — starting past
+			// the just-dropped frame — on a fresh connection. A plain
+			// error (no terminal error recorded) routes run() to
+			// connectWithBackoff, the same paced path a transport
+			// failure takes.
+			return fmt.Errorf(
+				"qwp/sf: server rejected wire seq %d (%v, status=0x%x): recycling connection to replay past the dropped frame",
+				seq, cat, int(status))
 		}
 		// Record the server's cumulative ACK sequence, then reconcile it
 		// against highestFullySent. applyAckWatermark caps the advance at
