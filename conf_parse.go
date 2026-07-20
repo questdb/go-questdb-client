@@ -105,7 +105,7 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_append_deadline_millis":             true,
 	"sf_dir":                                true,
 	"sf_durability":                         true,
-	"sf_max_bytes":                          true,
+	"sf_max_segment_bytes":                          true,
 	"sf_max_total_bytes":                    true,
 	"transaction":                           true,
 	"user":                                  true,
@@ -332,19 +332,19 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, err
 			}
 			senderConf.senderId = v
-		case "sf_max_bytes":
+		case "sf_max_segment_bytes":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
 			// 0 is the "use the default segment size" sentinel, resolved
 			// at construction (qwpSfDefaultMaxBytes), matching the
-			// WithSfMaxBytes option path. parseSizeBytes already rejects
+			// WithSfMaxSegmentBytes option path. parseSizeBytes already rejects
 			// negative and non-numeric input.
 			parsedVal, err := parseSizeBytes(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative size", k, v)
 			}
-			senderConf.sfMaxBytes = parsedVal
+			senderConf.sfMaxSegmentBytes = parsedVal
 		case "sf_max_total_bytes":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)

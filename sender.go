@@ -365,7 +365,7 @@ type lineSenderConfig struct {
 	// autoFlushBytesSet records whether the user explicitly set
 	// auto_flush_bytes (vs. the seeded qwpDefaultAutoFlushBytes).
 	// sanitizeQwpConf uses it to reject only a user-written
-	// auto_flush_bytes > sf_max_bytes contradiction; a defaulted trigger
+	// auto_flush_bytes > sf_max_segment_bytes contradiction; a defaulted trigger
 	// over a smaller user-chosen segment is left for the runtime clamp.
 	autoFlushBytesSet bool
 
@@ -382,7 +382,7 @@ type lineSenderConfig struct {
 	// loop.
 	sfDir                         string
 	senderId                      string // empty -> "default" at construction
-	sfMaxBytes                    int64  // per-segment size (bytes); 0 -> 4 MiB
+	sfMaxSegmentBytes                    int64  // per-segment size (bytes); 0 -> 4 MiB
 	sfMaxTotalBytes               int64  // total cap (bytes); 0 -> 10 GiB
 	sfDurability                  string // empty / "memory" only; reserved future "flush" / "append"
 	sfAppendDeadlineMillis        int    // 0 -> 30000
@@ -568,14 +568,14 @@ func WithSenderId(id string) LineSenderOption {
 	}
 }
 
-// WithSfMaxBytes sets the per-segment cap (bytes) for the cursor
+// WithSfMaxSegmentBytes sets the per-segment cap (bytes) for the cursor
 // engine. Defaults to 4 MiB. Lower values rotate segments more
 // aggressively; higher values amortize the rotation overhead.
 //
 // Only available for the QWP sender.
-func WithSfMaxBytes(n int64) LineSenderOption {
+func WithSfMaxSegmentBytes(n int64) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.sfMaxBytes = n
+		s.sfMaxSegmentBytes = n
 	}
 }
 
@@ -1295,8 +1295,8 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 		if conf.senderId != "" {
 			return errors.New("sender_id requires sf_dir to be set")
 		}
-		if conf.sfMaxBytes != 0 || conf.sfMaxTotalBytes != 0 || conf.sfDurability != "" || conf.sfAppendDeadlineMillis != 0 {
-			return errors.New("sf_max_bytes / sf_max_total_bytes / sf_durability / sf_append_deadline_millis require sf_dir to be set")
+		if conf.sfMaxSegmentBytes != 0 || conf.sfMaxTotalBytes != 0 || conf.sfDurability != "" || conf.sfAppendDeadlineMillis != 0 {
+			return errors.New("sf_max_segment_bytes / sf_max_total_bytes / sf_durability / sf_append_deadline_millis require sf_dir to be set")
 		}
 		if conf.drainOrphans || conf.maxBackgroundDrainers != 0 {
 			return errors.New("drain_orphans / max_background_drainers require sf_dir to be set")
@@ -1326,31 +1326,31 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	// 0 is the use-default sentinel for both (resolved to
 	// qwpSfDefaultMaxBytes / qwpSfDefaultMaxTotalBytes at construction),
 	// so only a negative value is rejected here.
-	if conf.sfMaxBytes < 0 {
-		return fmt.Errorf("sf_max_bytes must be >= 0: %d", conf.sfMaxBytes)
+	if conf.sfMaxSegmentBytes < 0 {
+		return fmt.Errorf("sf_max_segment_bytes must be >= 0: %d", conf.sfMaxSegmentBytes)
 	}
 	if conf.sfMaxTotalBytes < 0 {
 		return fmt.Errorf("sf_max_total_bytes must be >= 0: %d", conf.sfMaxTotalBytes)
 	}
-	if conf.sfMaxBytes > 0 && conf.sfMaxTotalBytes > 0 && conf.sfMaxTotalBytes < conf.sfMaxBytes {
-		return fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_bytes (%d)",
-			conf.sfMaxTotalBytes, conf.sfMaxBytes)
+	if conf.sfMaxSegmentBytes > 0 && conf.sfMaxTotalBytes > 0 && conf.sfMaxTotalBytes < conf.sfMaxSegmentBytes {
+		return fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_segment_bytes (%d)",
+			conf.sfMaxTotalBytes, conf.sfMaxSegmentBytes)
 	}
 	// Reject an explicit auto_flush_bytes that exceeds an explicit
-	// sf_max_bytes. The byte trigger would let a batch grow until its
+	// sf_max_segment_bytes. The byte trigger would let a batch grow until its
 	// encoded frame can no longer fit a single segment, and such a frame
 	// can never be flushed — it is dropped at the flush boundary. Gated
 	// on autoFlushBytesSet so a *defaulted* 8 MiB trigger over a smaller
 	// user-chosen segment is left to the runtime clamp (which lowers the
 	// effective trigger to fit); only a user-written contradiction is a
-	// hard error. sf_max_bytes is the per-segment cap, so the frame must
+	// hard error. sf_max_segment_bytes is the per-segment cap, so the frame must
 	// actually fit in slightly less than this (header overhead), but the
 	// trigger clamp already keeps the encoded frame under the segment;
 	// this check just rejects the self-evidently impossible pairing up front.
-	if conf.autoFlushBytesSet && conf.sfMaxBytes > 0 && int64(conf.autoFlushBytes) > conf.sfMaxBytes {
+	if conf.autoFlushBytesSet && conf.sfMaxSegmentBytes > 0 && int64(conf.autoFlushBytes) > conf.sfMaxSegmentBytes {
 		return fmt.Errorf(
-			"auto_flush_bytes (%d) must not exceed sf_max_bytes (%d): a batch that fills the byte trigger could not fit in a single segment",
-			conf.autoFlushBytes, conf.sfMaxBytes)
+			"auto_flush_bytes (%d) must not exceed sf_max_segment_bytes (%d): a batch that fills the byte trigger could not fit in a single segment",
+			conf.autoFlushBytes, conf.sfMaxSegmentBytes)
 	}
 	if conf.maxBackgroundDrainers < 0 {
 		return fmt.Errorf("max_background_drainers must be >= 0: %d", conf.maxBackgroundDrainers)
@@ -1405,8 +1405,8 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "sf_dir"
 	case conf.senderId != "":
 		name = "sender_id"
-	case conf.sfMaxBytes != 0:
-		name = "sf_max_bytes"
+	case conf.sfMaxSegmentBytes != 0:
+		name = "sf_max_segment_bytes"
 	case conf.sfMaxTotalBytes != 0:
 		name = "sf_max_total_bytes"
 	case conf.sfDurability != "":

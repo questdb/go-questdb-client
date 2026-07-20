@@ -779,11 +779,11 @@ func TestQwpFuzzIngressOracleMultiSender(t *testing.T) {
 
 // --- bounce-torture scenario -----------------------------------------
 
-// oraclePickSfMaxBytes mirrors Java pickSfMaxBytes: small segments force
+// oraclePickSfMaxSegmentBytes mirrors Java pickSfMaxSegmentBytes: small segments force
 // frequent rotation (stresses purge bookkeeping), large segments resemble
 // the production default. The chosen value also scales the post-close
 // slot-purge bound.
-func oraclePickSfMaxBytes(r *rand.Rand) int64 {
+func oraclePickSfMaxSegmentBytes(r *rand.Rand) int64 {
 	pool := []int64{256 * 1024, 1024 * 1024, 4 * 1024 * 1024}
 	return pool[r.Intn(len(pool))]
 }
@@ -871,7 +871,7 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 	producerCount := 2 + r.Intn(3)       // 2..4
 	rowsPerProducer := 300 + r.Intn(400) // 300..699 (CI-bounded)
 	bounces := 2 + r.Intn(3)             // 2..4
-	sfMaxBytes := oraclePickSfMaxBytes(r)
+	sfMaxSegmentBytes := oraclePickSfMaxSegmentBytes(r)
 	batchSizes := make([]int, producerCount)
 	autoFlush := make([]int, producerCount)
 	for p := 0; p < producerCount; p++ {
@@ -880,8 +880,8 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 	}
 	bRnd := rand.New(rand.NewSource(r.Int63()))
 	totalRows := producerCount * rowsPerProducer
-	t.Logf("ingress oracle bounce: producers=%d rows/producer=%d total=%d bounces=%d sf_max_bytes=%d",
-		producerCount, rowsPerProducer, totalRows, bounces, sfMaxBytes)
+	t.Logf("ingress oracle bounce: producers=%d rows/producer=%d total=%d bounces=%d sf_max_segment_bytes=%d",
+		producerCount, rowsPerProducer, totalRows, bounces, sfMaxSegmentBytes)
 
 	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
 	defer srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
@@ -930,8 +930,8 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 				"ws::addr=%s;sf_dir=%s;initial_connect_retry=async;"+
 					"reconnect_max_duration_millis=120000;"+
 					"close_flush_timeout_millis=120000;"+
-					"sf_max_bytes=%d;auto_flush_rows=%d;",
-				srv.wsAddr(), sfDirs[p], sfMaxBytes, autoFlush[p])
+					"sf_max_segment_bytes=%d;auto_flush_rows=%d;",
+				srv.wsAddr(), sfDirs[p], sfMaxSegmentBytes, autoFlush[p])
 			qs, closeSender := oracleSenderFromConf(t, conf)
 			defer closeSender()
 			ctx := context.Background()
@@ -989,8 +989,8 @@ func TestQwpFuzzIngressOracleMultiSenderBounce(t *testing.T) {
 
 	// Clean close ACKed every frame; the SF cursor unlinks rotated
 	// segments. A small residue (lock, ack-watermark, active header) is
-	// normal — Java's slotCapFor is sf_max_bytes + 256 KiB.
-	capBytes := sfMaxBytes + 256*1024
+	// normal — Java's slotCapFor is sf_max_segment_bytes + 256 KiB.
+	capBytes := sfMaxSegmentBytes + 256*1024
 	for p, dir := range sfDirs {
 		sz, err := oracleSfDirSize(dir)
 		if err != nil {
@@ -1054,7 +1054,7 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	chunksPerProducer := 30 + r.Intn(30)  // 30..59
 	chunkSize := 5 + r.Intn(6)            // 5..10 rows (maps to one frame)
 	const poisonChunkInN = 4              // ~25% of chunks poisoned
-	sfMaxBytes := oraclePickSfMaxBytes(r) // shared with the bounce port
+	sfMaxSegmentBytes := oraclePickSfMaxSegmentBytes(r) // shared with the bounce port
 
 	// Constructible client-side? 2^192 is 58 digits — inside Decimal256's
 	// 76-digit envelope, so NewDecimal accepts it and the rejection is
@@ -1099,8 +1099,8 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	}
 	cleanRows := len(oracle.rows)
 	t.Logf("ingress oracle poison: producers=%d chunks/producer=%d chunkSize=%d "+
-		"poisonedChunks=%d cleanRows=%d sf_max_bytes=%d",
-		producerCount, chunksPerProducer, chunkSize, totalPoisonedChunks, cleanRows, sfMaxBytes)
+		"poisonedChunks=%d cleanRows=%d sf_max_segment_bytes=%d",
+		producerCount, chunksPerProducer, chunkSize, totalPoisonedChunks, cleanRows, sfMaxSegmentBytes)
 
 	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
 	defer srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
@@ -1140,7 +1140,7 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 				WithQwp(),
 				WithAddress(srv.wsAddr()),
 				WithSfDir(sfDirs[p]),
-				WithSfMaxBytes(sfMaxBytes),
+				WithSfMaxSegmentBytes(sfMaxSegmentBytes),
 				WithInitialConnectRetry(true), // initial_connect_retry=true (sync)
 				WithCloseFlushTimeout(120*time.Second),
 				WithErrorInboxCapacity(4096),
@@ -1260,8 +1260,8 @@ func TestQwpFuzzIngressOraclePoisonErrorHandler(t *testing.T) {
 	t.Logf("poison: poisonedChunks=%d handlerCalls=%d", totalPoisonedChunks, got)
 
 	// Clean close ACKed/handled every frame; the SF cursor unlinks
-	// rotated segments. Java's slotCapFor: sf_max_bytes + 256 KiB.
-	capBytes := sfMaxBytes + 256*1024
+	// rotated segments. Java's slotCapFor: sf_max_segment_bytes + 256 KiB.
+	capBytes := sfMaxSegmentBytes + 256*1024
 	for p, dir := range sfDirs {
 		sz, err := oracleSfDirSize(dir)
 		if err != nil {
@@ -1312,15 +1312,15 @@ func TestQwpFuzzIngressOracleSenderRestartReplay(t *testing.T) {
 	producerCount := 2 + r.Intn(2)       // 2..3
 	rowsPerProducer := 300 + r.Intn(400) // 300..699 (CI-bounded)
 	bounces := 1 + r.Intn(2)             // 1..2
-	sfMaxBytes := oraclePickSfMaxBytes(r)
+	sfMaxSegmentBytes := oraclePickSfMaxSegmentBytes(r)
 	lifetimeSeeds := make([]int64, producerCount)
 	for p := 0; p < producerCount; p++ {
 		lifetimeSeeds[p] = r.Int63()
 	}
 	bRnd := rand.New(rand.NewSource(r.Int63()))
 	totalRows := producerCount * rowsPerProducer
-	t.Logf("ingress oracle restart-replay: producers=%d rows/producer=%d total=%d bounces=%d sf_max_bytes=%d",
-		producerCount, rowsPerProducer, totalRows, bounces, sfMaxBytes)
+	t.Logf("ingress oracle restart-replay: producers=%d rows/producer=%d total=%d bounces=%d sf_max_segment_bytes=%d",
+		producerCount, rowsPerProducer, totalRows, bounces, sfMaxSegmentBytes)
 
 	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
 	defer srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
@@ -1388,8 +1388,8 @@ func TestQwpFuzzIngressOracleSenderRestartReplay(t *testing.T) {
 			loopConf := fmt.Sprintf(
 				"ws::addr=%s;sf_dir=%s;initial_connect_retry=async;"+
 					"reconnect_max_duration_millis=120000;"+
-					"sf_max_bytes=%d;close_flush_timeout_millis=0;",
-				srv.wsAddr(), sfDirs[p], sfMaxBytes)
+					"sf_max_segment_bytes=%d;close_flush_timeout_millis=0;",
+				srv.wsAddr(), sfDirs[p], sfMaxSegmentBytes)
 			written := 0
 			for written < len(rows) {
 				chunk := 30 + lifeR.Intn(200) // 30..229 rows per sender
@@ -1421,8 +1421,8 @@ func TestQwpFuzzIngressOracleSenderRestartReplay(t *testing.T) {
 			drainConf := fmt.Sprintf(
 				"ws::addr=%s;sf_dir=%s;initial_connect_retry=async;"+
 					"reconnect_max_duration_millis=120000;"+
-					"sf_max_bytes=%d;close_flush_timeout_millis=120000;",
-				srv.wsAddr(), sfDirs[p], sfMaxBytes)
+					"sf_max_segment_bytes=%d;close_flush_timeout_millis=120000;",
+				srv.wsAddr(), sfDirs[p], sfMaxSegmentBytes)
 			qs, err := openSender(p, drainConf)
 			if err != nil {
 				errs[p] = err
@@ -1468,7 +1468,7 @@ func TestQwpFuzzIngressOracleSenderRestartReplay(t *testing.T) {
 	c := newBindFuzzClient(t, srv)
 	oracleAssert(t, c, oracle)
 
-	capBytes := sfMaxBytes + 256*1024
+	capBytes := sfMaxSegmentBytes + 256*1024
 	for p, dir := range sfDirs {
 		sz, err := oracleSfDirSize(dir)
 		if err != nil {
@@ -1536,10 +1536,10 @@ func TestQwpFuzzIngressOracleAsyncConnectQueues(t *testing.T) {
 	r := newFuzzRand(t)
 	producerCount := 2 + r.Intn(2)       // 2..3
 	rowsPerProducer := 250 + r.Intn(400) // 250..649 (CI-bounded)
-	sfMaxBytes := oraclePickSfMaxBytes(r)
+	sfMaxSegmentBytes := oraclePickSfMaxSegmentBytes(r)
 	totalRows := producerCount * rowsPerProducer
-	t.Logf("ingress oracle async-connect: producers=%d rows/producer=%d total=%d sf_max_bytes=%d",
-		producerCount, rowsPerProducer, totalRows, sfMaxBytes)
+	t.Logf("ingress oracle async-connect: producers=%d rows/producer=%d total=%d sf_max_segment_bytes=%d",
+		producerCount, rowsPerProducer, totalRows, sfMaxSegmentBytes)
 
 	srv.mustExec(t, "DROP TABLE IF EXISTS '"+oracleTableName+"'")
 	srv.mustExec(t, oracleCreateSQL)
@@ -1593,9 +1593,9 @@ func TestQwpFuzzIngressOracleAsyncConnectQueues(t *testing.T) {
 					"reconnect_max_duration_millis=120000;"+
 					"reconnect_initial_backoff_millis=20;"+
 					"reconnect_max_backoff_millis=200;"+
-					"sf_max_bytes=%d;"+
+					"sf_max_segment_bytes=%d;"+
 					"close_flush_timeout_millis=120000;",
-				srv.wsAddr(), sfDirs[p], sfMaxBytes)
+				srv.wsAddr(), sfDirs[p], sfMaxSegmentBytes)
 
 			// Time the constructor: async mode must return promptly
 			// even when no server listens — the whole point.
@@ -1727,7 +1727,7 @@ func TestQwpFuzzIngressOracleAsyncConnectQueues(t *testing.T) {
 	c := newBindFuzzClient(t, srv)
 	oracleAssert(t, c, oracle)
 
-	capBytes := sfMaxBytes + 256*1024
+	capBytes := sfMaxSegmentBytes + 256*1024
 	for p, dir := range sfDirs {
 		sz, err := oracleSfDirSize(dir)
 		if err != nil {

@@ -937,7 +937,7 @@ func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
 	}{
 		{"sf_dir", qdb.WithSfDir("/tmp/sf"), "sf_dir"},
 		{"sender_id", qdb.WithSenderId("ingest-1"), "sender_id"},
-		{"sf_max_bytes", qdb.WithSfMaxBytes(1 << 20), "sf_max_bytes"},
+		{"sf_max_segment_bytes", qdb.WithSfMaxSegmentBytes(1 << 20), "sf_max_segment_bytes"},
 		{"sf_max_total_bytes", qdb.WithSfMaxTotalBytes(1 << 30), "sf_max_total_bytes"},
 		{"sf_durability", qdb.WithSfDurability("memory"), "sf_durability"},
 		{"sf_append_deadline", qdb.WithSfAppendDeadline(10 * time.Second), "sf_append_deadline_millis"},

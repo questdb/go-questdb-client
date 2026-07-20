@@ -563,7 +563,7 @@ func TestErrorApiResilience_SfDiskHaltCloseReopenReplays(t *testing.T) {
 		"ws::addr=" + addrOf(srv),
 		"sf_dir=" + tmp,
 		"sender_id=halt-replay",
-		"sf_max_bytes=4096",
+		"sf_max_segment_bytes=4096",
 		"close_flush_timeout_millis=100;", // short — the loop will halt, not drain
 	}, ";")
 
@@ -623,7 +623,7 @@ func TestErrorApiResilience_SfDiskDropPersistsAckedAcrossRestart(t *testing.T) {
 		"ws::addr=" + addrOf(srv),
 		"sf_dir=" + tmp,
 		"sender_id=drop-restart",
-		"sf_max_bytes=4096",
+		"sf_max_segment_bytes=4096",
 		"close_flush_timeout_millis=2000;",
 	}, ";")
 

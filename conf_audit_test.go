@@ -156,7 +156,7 @@ func TestConfSizeSuffixAppliedToKeys(t *testing.T) {
 		"max_buf_size=10m;" +
 		"auto_flush_bytes=4m;" +
 		"sf_dir=/tmp/sf;sender_id=t;" +
-		"sf_max_bytes=4m;" +
+		"sf_max_segment_bytes=4m;" +
 		"sf_max_total_bytes=1g;")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -170,8 +170,8 @@ func TestConfSizeSuffixAppliedToKeys(t *testing.T) {
 	if c.autoFlushBytes != 4<<20 {
 		t.Errorf("autoFlushBytes=%d, want %d", c.autoFlushBytes, 4<<20)
 	}
-	if c.sfMaxBytes != int64(4<<20) {
-		t.Errorf("sfMaxBytes=%d, want %d", c.sfMaxBytes, 4<<20)
+	if c.sfMaxSegmentBytes != int64(4<<20) {
+		t.Errorf("sfMaxSegmentBytes=%d, want %d", c.sfMaxSegmentBytes, 4<<20)
 	}
 	if c.sfMaxTotalBytes != int64(1<<30) {
 		t.Errorf("sfMaxTotalBytes=%d, want %d", c.sfMaxTotalBytes, 1<<30)
@@ -389,7 +389,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"sf_append_deadline_millis=30000",
 		"sf_dir=/tmp/sf",
 		"sf_durability=memory",
-		"sf_max_bytes=4m",
+		"sf_max_segment_bytes=4m",
 		"sf_max_total_bytes=10g",
 		"transaction=on",
 	}

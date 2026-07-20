@@ -577,7 +577,7 @@ the lock releases automatically when the process exits.
 |---|---|---|
 | `sf_dir` | unset | Group root. Setting it activates SF. |
 | `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_.` only. |
-| `sf_max_bytes` | 4 MiB | Per-segment file size. |
+| `sf_max_segment_bytes` | 4 MiB | Per-segment file size. |
 | `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
 | `sf_durability` | `memory` | Reserved; `flush` / `append` are deferred follow-ups. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
@@ -590,7 +590,7 @@ the lock releases automatically when the process exits.
 | `max_background_drainers` | 4 | Cap on concurrent orphan drainers. |
 
 The same options are available programmatically:
-`WithSfDir`, `WithSenderId`, `WithSfMaxBytes`, `WithSfMaxTotalBytes`,
+`WithSfDir`, `WithSenderId`, `WithSfMaxSegmentBytes`, `WithSfMaxTotalBytes`,
 `WithReconnectPolicy`, `WithInitialConnectRetry`,
 `WithInitialConnectMode`, `WithCloseFlushTimeout`.
 
