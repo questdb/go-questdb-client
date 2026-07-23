@@ -457,10 +457,12 @@ func TestErrorApiResilience_ReconnectThenHaltFsnCorrelation(t *testing.T) {
 // to 1 (both drops counted as "resolved by server") and no terminal
 // error is latched.
 func TestErrorApiResilience_DropAcrossReconnect(t *testing.T) {
-	// Connection 1: drop frame 0 (rejectFirstNFrames=1), then close
-	// after reading frame 1 (closeAfterFrames=2). One ACK delivered,
-	// so the silent-drop guard does not fire and reconnect kicks in.
-	// Connection 2: rejectFromConn=2 means reject all frames on conn ≥ 2.
+	// Connection 1: NACK frame 0 (rejectFirstNFrames=1); the drop
+	// recycles the connection. Connection 2+: rejectFromConn=2 rejects
+	// every frame, so the replayed frame 1 is dropped there too.
+	// closeAfterFrames=2 is a backstop: if frame 1 races onto conn 1
+	// before the recycle tears it down, the server closes the
+	// connection and frame 1 replays on conn 2 all the same.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		rejectStatus:       QwpStatusSchemaMismatch,
 		rejectFirstNFrames: 1,
@@ -478,8 +480,8 @@ func TestErrorApiResilience_DropAcrossReconnect(t *testing.T) {
 	require.Eventually(t, func() bool { return engine.engineAckedFsn() >= 0 },
 		2*time.Second, 1*time.Millisecond, "frame 0 must be drop-acked on conn 1")
 
-	// Frame 1: conn 1 reads it then closes (no ACK). The loop reconnects
-	// and replays frame 1 on conn 2, which drops it (ackedFsn → 1).
+	// Frame 1: goes out on conn 2 (the drop on conn 1 recycled the
+	// connection), which rejects it too → dropped, ackedFsn → 1.
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.NoError(t, s.Flush(context.Background()))
 
@@ -896,7 +898,7 @@ func runHaltStressOnce(t *testing.T, iter, goroutines int) {
 func TestErrorApiResilience_DispatcherSwapMidFlight(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		rejectStatus:       QwpStatusSchemaMismatch,
-		rejectFirstNFrames: 50, // 50 drops on conn 1
+		rejectFirstNFrames: 50, // 50 drops, one per connection
 	})
 	defer srv.Close()
 
@@ -1046,41 +1048,45 @@ func TestErrorApiResilience_ServerRestartReplaysCorrectly(t *testing.T) {
 // within a bounded time (the dispatcher's drain timeout caps the
 // wait). Without this cap, a malicious or buggy handler could stall
 // shutdown indefinitely. The cap is currently 100 ms; the test
-// asserts < 1 s for headroom.
+// asserts < 750 ms for headroom.
 func TestErrorApiResilience_DispatcherDrainTimeoutCap(t *testing.T) {
+	// rejectFromConn: 1 → every connection NACKs its first frame.
+	// Each Drop rejection recycles the connection (the error frame
+	// breaks its ordered pipeline), so queueing N errors takes N
+	// connections.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
-		rejectStatus:       QwpStatusSchemaMismatch,
-		rejectFirstNFrames: 100,
+		rejectStatus:   QwpStatusSchemaMismatch,
+		rejectFromConn: 1,
 	})
 	defer srv.Close()
 
 	s, _, loop, _ := newCursorSenderForTest(t, srv, 0)
 
-	// Slow handler: each call takes 50 ms. With 100 queued items,
-	// processing them all would take 5 s; the drain timeout (100 ms)
-	// must cap that.
+	// Slow handler: each call takes 50 ms. With 25 queued items,
+	// processing them all would take 1.25 s; the drain timeout
+	// (100 ms) must cap that.
 	loop.sendLoopSetErrorHandler(func(e *SenderError) {
 		time.Sleep(50 * time.Millisecond)
 	}, 256) // generous capacity so most drops queue rather than getting dropped
 
-	// Drive 100 drops as fast as possible.
-	for i := 0; i < 100; i++ {
+	// Drive 25 drops as fast as possible.
+	for i := 0; i < 25; i++ {
 		require.NoError(t, s.Table("t").Int64Column("v", int64(i)).AtNow(context.Background()))
 		require.NoError(t, s.Flush(context.Background()))
 	}
 	require.Eventually(t, func() bool {
-		return s.TotalServerErrors() >= 100
-	}, 5*time.Second, 1*time.Millisecond)
+		return s.TotalServerErrors() >= 25
+	}, 10*time.Second, 1*time.Millisecond)
 
 	// Now close — the drain timeout must fire before the slow
-	// handler chews through all 100 queued items.
+	// handler chews through all 25 queued items.
 	start := time.Now()
 	_ = s.Close(context.Background())
 	elapsed := time.Since(start)
 
-	// Allow generous headroom but assert we're not blocked for the
-	// full 5 s the slow handler would otherwise need.
-	assert.Less(t, elapsed, 2*time.Second,
+	// Allow generous headroom but assert well under the 1.25 s the
+	// slow handler would otherwise need.
+	assert.Less(t, elapsed, 750*time.Millisecond,
 		"close should not wait for a slow handler past the drain timeout")
 }
 
@@ -1089,16 +1095,22 @@ func TestErrorApiResilience_DispatcherDrainTimeoutCap(t *testing.T) {
 // =============================================================================
 
 // TestErrorApiResilience_DropStreakThenHalt models a realistic
-// scenario: many rows fail with WriteError (Drop policy), the loop
-// keeps draining, then a row hits ParseError (Halt policy) and the
-// loop latches. The Drop counter and Halt latch should be
+// scenario: several rows fail with WriteError (Drop policy) — each
+// drop recycling the connection and replaying the tail — then a row
+// hits ParseError (Halt policy) and the loop stops with a terminal
+// error. The Drop counter and the terminal error should be
 // independent; the FSN on the Halt should be > the FSNs of the
 // Drops.
 func TestErrorApiResilience_DropStreakThenHalt(t *testing.T) {
-	// Custom server: WriteError for first 3 frames, ParseError on
-	// frame 4. Switch by adding a custom handler — the existing
-	// fixture only supports one rejectStatus per server.
-	var nFrames atomic.Int32
+	// Custom server: WriteError for the first 3 rejected frames,
+	// ParseError on the 4th. One error response per connection —
+	// the error frame breaks the connection's ordered pipeline, so
+	// the server drains further frames without responding (the
+	// client recycles and replays them on a fresh connection),
+	// matching the real server's unresolved-sequence refusal. The
+	// custom handler exists because the fixture only supports one
+	// rejectStatus per server.
+	var nRejects atomic.Int32
 	srv := &qwpSfTestServer{kill: make(chan struct{})}
 	srv.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(qwpHeaderVersion, "1")
@@ -1107,23 +1119,29 @@ func TestErrorApiResilience_DropStreakThenHalt(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
-		var localSeq int64
+		responded := false
 		for {
 			_, _, err := conn.Read(context.Background())
 			if err != nil {
 				return
 			}
-			n := nFrames.Add(1)
 			srv.totalFramesReceived.Add(1)
+			if responded {
+				// Pipeline broken by the error frame: refuse silently.
+				continue
+			}
+			n := nRejects.Add(1)
 			var status QwpStatusCode
 			if n <= 3 {
 				status = QwpStatusWriteError // Drop
 			} else {
 				status = QwpStatusParseError // Halt
 			}
+			// Each connection's first frame is the replay head, so the
+			// rejection always names wire seq 0.
 			_ = conn.Write(context.Background(), websocket.MessageBinary,
-				buildAckError(status, localSeq, "rejected"))
-			localSeq++
+				buildAckError(status, 0, "rejected"))
+			responded = true
 		}
 	}))
 	defer srv.Close()

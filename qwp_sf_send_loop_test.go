@@ -76,10 +76,13 @@ type qwpSfTestServerOpts struct {
 	// the missing ACKs. Used by close-drain-timeout tests.
 	silentAcks bool
 	// rejectFirstNFrames > 0, in combination with rejectStatus,
-	// causes only the first N frames on the very first connection to
-	// receive an error ACK; everything after gets OK. Used to test
-	// DROP-and-continue semantics where the loop must keep draining
-	// past the rejected span.
+	// caps rejection at N error ACKs total, at most one per
+	// connection: an error frame breaks the connection's ordered
+	// pipeline, so the frames behind it are refused silently (read,
+	// never answered) until the client recycles the connection; once
+	// N rejections have been issued, frames get OK. Used to test
+	// DROP-and-continue semantics where the loop drops the rejected
+	// span and replays the tail on a fresh connection.
 	rejectFirstNFrames int
 	// rejectFromConn > 0, in combination with rejectStatus, causes
 	// only connections with myConnID >= rejectFromConn to issue
@@ -120,6 +123,9 @@ type qwpSfTestServer struct {
 	*httptest.Server
 	totalFramesReceived atomic.Int64
 	connCount           atomic.Int64
+	// rejectsIssued counts error ACKs issued under the
+	// rejectFirstNFrames cap, across all connections.
+	rejectsIssued atomic.Int64
 	// kill is closed by tests that want to actively tear down every
 	// in-flight WS connection. httptest.Server.Close (and even
 	// CloseClientConnections) do not force-close hijacked
@@ -206,6 +212,10 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 		myConnID := s.connCount.Add(1)
 		var localSeq int64
 		var localFramesReceived int
+		// Set once this connection has issued its rejectFirstNFrames
+		// error ACK; the rest of the connection's frames are then
+		// refused silently (broken ordered pipeline).
+		errorSentOnConn := false
 		if opts.unsolicitedRejectAtConnect != 0 {
 			// Send a single rejection ACK with sequence 0 BEFORE the
 			// client has had a chance to send anything. The receiver
@@ -271,14 +281,16 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			if opts.rejectStatus != 0 {
 				// Default behavior with no gating: reject every frame.
 				rejectThisFrame := true
-				// rejectFirstNFrames gates rejection to the first N
-				// frames of conn 1 (and silently passes on conn 2+).
+				// rejectFirstNFrames caps rejection at N error ACKs
+				// total, one per connection; after a connection's
+				// error ACK its pipelined tail is refused silently
+				// (the client recycles and replays it on a fresh
+				// connection).
 				if opts.rejectFirstNFrames > 0 {
-					if myConnID == 1 {
-						rejectThisFrame = localFramesReceived <= opts.rejectFirstNFrames
-					} else {
-						rejectThisFrame = false
+					if errorSentOnConn {
+						continue
 					}
+					rejectThisFrame = s.rejectsIssued.Load() < int64(opts.rejectFirstNFrames)
 				}
 				// rejectFromConn additively re-enables rejection on
 				// conn N+. Combined with rejectFirstNFrames, this models
@@ -291,6 +303,10 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 					}
 				}
 				if rejectThisFrame {
+					if opts.rejectFirstNFrames > 0 {
+						s.rejectsIssued.Add(1)
+						errorSentOnConn = true
+					}
 					_ = conn.Write(context.Background(), websocket.MessageBinary,
 						buildAckError(opts.rejectStatus, localSeq, "rejected"))
 					localSeq++
@@ -1402,7 +1418,10 @@ func testQwpSfSendLoopDropAndContinue(t *testing.T, sfDir string) {
 	loop.sendLoopStart()
 	defer func() { _ = loop.sendLoopClose() }()
 
-	// First frame is rejected → dropped. Frames 1 and 2 (0-indexed) are OK.
+	// First frame is rejected → dropped, and the rejection breaks the
+	// connection's ordered pipeline, so the loop recycles the wire and
+	// replays frames 1 and 2 (0-indexed) on a fresh connection, where
+	// they get OK ACKs.
 	for i := 0; i < 3; i++ {
 		_, err := engine.engineAppendBlocking(context.Background(),
 			[]byte(fmt.Sprintf("f%d", i)))
@@ -1412,9 +1431,11 @@ func testQwpSfSendLoopDropAndContinue(t *testing.T, sfDir string) {
 		return engine.engineAckedFsn() >= 2
 	}, 5*time.Second, 1*time.Millisecond, "ackedFsn did not advance past Drop")
 
-	// No terminal error; reconnect did not trigger.
+	// No terminal error; the drop recycled the connection instead.
 	require.NoError(t, loop.sendLoopCheckError())
-	require.Equal(t, int64(0), loop.sendLoopTotalReconnects())
+	require.GreaterOrEqual(t, loop.sendLoopTotalReconnects(), int64(1),
+		"a Drop rejection must recycle the connection: the server refuses "+
+			"every frame after an error frame, so the tail replays on a fresh one")
 	// Dispatcher saw exactly one Drop-category SenderError.
 	require.GreaterOrEqual(t, dispatched.Load(), int64(1))
 	// Counter bumped on the Drop path.
