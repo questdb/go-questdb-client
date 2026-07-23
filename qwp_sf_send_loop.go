@@ -1266,8 +1266,10 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// so the reconnect path must replay it — starting past
 			// the just-dropped frame — on a fresh connection. A plain
 			// error (no terminal error recorded) routes run() to
-			// connectWithBackoff, the same paced path a transport
-			// failure takes.
+			// connectWithBackoff, the same reconnect path a transport
+			// failure takes; backoff pacing engages only if the dial
+			// itself fails, so a healthy server is redialed
+			// immediately.
 			return fmt.Errorf(
 				"qwp/sf: server rejected wire seq %d (%v, status=0x%x): recycling connection to replay past the dropped frame",
 				seq, cat, int(status))

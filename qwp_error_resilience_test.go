@@ -457,10 +457,12 @@ func TestErrorApiResilience_ReconnectThenHaltFsnCorrelation(t *testing.T) {
 // to 1 (both drops counted as "resolved by server") and no terminal
 // error is latched.
 func TestErrorApiResilience_DropAcrossReconnect(t *testing.T) {
-	// Connection 1: drop frame 0 (rejectFirstNFrames=1), then close
-	// after reading frame 1 (closeAfterFrames=2). One ACK delivered,
-	// so the silent-drop guard does not fire and reconnect kicks in.
-	// Connection 2: rejectFromConn=2 means reject all frames on conn ≥ 2.
+	// Connection 1: NACK frame 0 (rejectFirstNFrames=1); the drop
+	// recycles the connection. Connection 2+: rejectFromConn=2 rejects
+	// every frame, so the replayed frame 1 is dropped there too.
+	// closeAfterFrames=2 is a backstop: if frame 1 races onto conn 1
+	// before the recycle tears it down, the server closes the
+	// connection and frame 1 replays on conn 2 all the same.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		rejectStatus:       QwpStatusSchemaMismatch,
 		rejectFirstNFrames: 1,
@@ -478,8 +480,8 @@ func TestErrorApiResilience_DropAcrossReconnect(t *testing.T) {
 	require.Eventually(t, func() bool { return engine.engineAckedFsn() >= 0 },
 		2*time.Second, 1*time.Millisecond, "frame 0 must be drop-acked on conn 1")
 
-	// Frame 1: conn 1 reads it then closes (no ACK). The loop reconnects
-	// and replays frame 1 on conn 2, which drops it (ackedFsn → 1).
+	// Frame 1: goes out on conn 2 (the drop on conn 1 recycled the
+	// connection), which rejects it too → dropped, ackedFsn → 1.
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.NoError(t, s.Flush(context.Background()))
 
@@ -896,7 +898,7 @@ func runHaltStressOnce(t *testing.T, iter, goroutines int) {
 func TestErrorApiResilience_DispatcherSwapMidFlight(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		rejectStatus:       QwpStatusSchemaMismatch,
-		rejectFirstNFrames: 50, // 50 drops on conn 1
+		rejectFirstNFrames: 50, // 50 drops, one per connection
 	})
 	defer srv.Close()
 
