@@ -340,10 +340,11 @@ type lineSenderConfig struct {
 	// Non-QWP transports leave endpoints nil and continue using address
 	// directly — sanitizeHttp/sanitizeTcp reject comma-form addr at
 	// validation time since neither transport supports multi-host yet.
-	endpoints     []qwpEndpoint
-	authTimeoutMs int             // QWP-only; 0 -> 15000 (15s) at sanitize time
-	zone          string          // QWP-only; honoured on egress, inert on ingest (no zone routing)
-	target        QwpTargetFilter // QWP-only; zero value = QwpTargetAny
+	endpoints        []qwpEndpoint
+	authTimeoutMs    int             // QWP-only; 0 -> 15000 (15s) at sanitize time
+	connectTimeoutMs int             // QWP-only; 0 leaves TCP connect bounded by the OS
+	zone             string          // QWP-only; honoured on egress, inert on ingest (no zone routing)
+	target           QwpTargetFilter // QWP-only; zero value = QwpTargetAny
 
 	// Retry/timeout-related fields
 	retryTimeout   time.Duration
@@ -1269,6 +1270,9 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if conf.authTimeoutMs <= 0 {
 		conf.authTimeoutMs = 15_000
 	}
+	if conf.connectTimeoutMs < 0 {
+		return errors.New("connect_timeout must be >= 0")
+	}
 	// Implicit promotion of initial_connect_retry. When the user tuned
 	// any reconnect_* knob but did not pick an initial-connect mode,
 	// promote to sync — the reconnect budget they wrote should also
@@ -1429,6 +1433,8 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "QWP dump writer"
 	case conf.authTimeoutMs != 0:
 		name = "auth_timeout_ms"
+	case conf.connectTimeoutMs != 0:
+		name = "connect_timeout"
 	case conf.zone != "":
 		name = "zone"
 	case conf.target != qwpTargetAny:
@@ -1444,6 +1450,7 @@ func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (Line
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,
+		connectTimeoutMs:      conf.connectTimeoutMs,
 		// QWP has a single protocol version; advertise it.
 		// serverInfoTimeout stays zero: the ingest endpoint sends no
 		// SERVER_INFO frame and the client never expects one — it sends

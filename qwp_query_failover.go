@@ -323,6 +323,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			maxVersion:        qwpVersion,
 			serverInfoTimeout: cfg.serverInfoTimeout,
 			authTimeoutMs:     cfg.authTimeoutMs,
+			connectTimeoutMs:  cfg.connectTimeoutMs,
 		}
 		attempts++
 		if err := tr.connect(ctx, wsURL, opts); err != nil {

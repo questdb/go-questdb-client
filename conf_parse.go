@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -380,6 +381,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
 			}
 			senderConf.authTimeoutMs = parsedVal
+		case "connect_timeout":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := parseConnectTimeoutMillis(v)
+			if err != nil {
+				return nil, err
+			}
+			senderConf.connectTimeoutMs = parsedVal
 		case "zone":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -746,6 +756,21 @@ func parseSizeBytes(v string) (int64, error) {
 		return 0, fmt.Errorf("size %q overflows int64", v)
 	}
 	return n * mult, nil
+}
+
+func parseConnectTimeoutMillis(value string) (int, error) {
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 0, NewInvalidConfigStrError(
+			"invalid connect_timeout value, %q must be a positive int (milliseconds)", value)
+	}
+	const maxDurationMillis = math.MaxInt64 / int64(time.Millisecond)
+	if int64(parsed) > maxDurationMillis {
+		return 0, NewInvalidConfigStrError(
+			"invalid connect_timeout value, %q exceeds the maximum of %d milliseconds",
+			value, maxDurationMillis)
+	}
+	return parsed, nil
 }
 
 // validateSenderId enforces the same character set the Java client

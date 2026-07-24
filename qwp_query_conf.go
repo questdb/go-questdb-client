@@ -106,6 +106,9 @@ type qwpQueryClientConfig struct {
 	// SERVER_INFO frame read (that uses serverInfoTimeout). Default
 	// qwpDefaultAuthTimeoutMs (15_000); must be > 0.
 	authTimeoutMs int
+	// connectTimeoutMs bounds each TCP connect attempt. Zero leaves the
+	// connect bounded by the OS; an explicit config value must be > 0.
+	connectTimeoutMs int
 	// failoverEnabled toggles transparent reconnect-and-replay on
 	// transport-terminal failure mid-query. Default true; matches
 	// Java's failover=on default. When false, transport errors
@@ -320,6 +323,10 @@ func (c *qwpQueryClientConfig) validate() error {
 		return fmt.Errorf(
 			"qwp query: auth_timeout_ms must be > 0, got %d", c.authTimeoutMs)
 	}
+	if c.connectTimeoutMs < 0 {
+		return fmt.Errorf(
+			"qwp query: connect_timeout must be >= 0, got %d", c.connectTimeoutMs)
+	}
 	if c.target > qwpTargetReplica {
 		return fmt.Errorf("qwp query: invalid target %d (expected any, primary, or replica)",
 			byte(c.target))
@@ -504,6 +511,12 @@ func parseQwpQueryConf(conf string) (*qwpQueryClientConfig, error) {
 					"auth_timeout_ms must be > 0, got %d", n)
 			}
 			cfg.authTimeoutMs = n
+		case "connect_timeout":
+			n, err := parseConnectTimeoutMillis(v)
+			if err != nil {
+				return nil, err
+			}
+			cfg.connectTimeoutMs = n
 		case "failover":
 			switch v {
 			case "on":

@@ -426,6 +426,55 @@ func TestConfSharedConnectString(t *testing.T) {
 	}
 }
 
+// TestConfQwpAcceptsConnectTimeout pins connect_timeout as a shared
+// QWP key. It bounds the TCP connect phase in milliseconds in both the
+// ingress sender and query client, matching the Java QWP clients.
+func TestConfQwpAcceptsConnectTimeout(t *testing.T) {
+	for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+		conf := schema + "::addr=localhost:9000;connect_timeout=2500;"
+		t.Run("ingress/"+schema, func(t *testing.T) {
+			cfg, err := confFromStr(conf)
+			if err != nil {
+				t.Fatalf("QWP ingress rejected connect_timeout: %v", err)
+			}
+			if cfg.connectTimeoutMs != 2500 {
+				t.Errorf("ingress connectTimeoutMs=%d, want 2500", cfg.connectTimeoutMs)
+			}
+		})
+		t.Run("egress/"+schema, func(t *testing.T) {
+			cfg, err := parseQwpQueryConf(conf)
+			if err != nil {
+				t.Fatalf("QWP egress rejected connect_timeout: %v", err)
+			}
+			if cfg.connectTimeoutMs != 2500 {
+				t.Errorf("egress connectTimeoutMs=%d, want 2500", cfg.connectTimeoutMs)
+			}
+		})
+	}
+}
+
+func TestConfQwpRejectsInvalidConnectTimeout(t *testing.T) {
+	for _, value := range []string{
+		"0",
+		"-1",
+		"not-an-int",
+		"9223372036855", // overflows time.Duration when converted from milliseconds
+		"9223372036854775808",
+	} {
+		conf := "ws::addr=localhost:9000;connect_timeout=" + value + ";"
+		t.Run("ingress/"+value, func(t *testing.T) {
+			if _, err := confFromStr(conf); err == nil {
+				t.Fatalf("QWP ingress accepted connect_timeout=%s", value)
+			}
+		})
+		t.Run("egress/"+value, func(t *testing.T) {
+			if _, err := parseQwpQueryConf(conf); err == nil {
+				t.Fatalf("QWP egress accepted connect_timeout=%s", value)
+			}
+		})
+	}
+}
+
 // TestConfQwpRejectsRetryTimeout pins the fix for the silent-drop
 // audit finding: retry_timeout is HTTP-only (legacy ILP doc) and is
 // not listed in connect-string.md, and Sender.java:3412 rejects it
