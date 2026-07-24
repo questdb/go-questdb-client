@@ -714,6 +714,7 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 		WithQwpQueryCompression(qwpCompressionZstd),
 		WithQwpQueryCompressionLevel(9),
 		WithQwpQueryFailoverMaxDuration(7 * time.Second),
+		WithQwpQueryConnectTimeout(3 * time.Second),
 	} {
 		opt(cfg)
 	}
@@ -752,6 +753,9 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 	}
 	if cfg.failoverMaxDuration != 7*time.Second {
 		t.Errorf("failoverMaxDuration=%v, want 7s", cfg.failoverMaxDuration)
+	}
+	if cfg.connectTimeoutMs != 3000 {
+		t.Errorf("connectTimeoutMs=%d, want 3000", cfg.connectTimeoutMs)
 	}
 }
 

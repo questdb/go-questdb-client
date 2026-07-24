@@ -691,6 +691,18 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 	}
 }
 
+// WithConnectTimeout bounds each TCP connect attempt made by the QWP
+// transport. Zero leaves the connect bounded by the operating system;
+// negative durations are rejected at construction. Equivalent to the
+// connect-string connect_timeout key.
+//
+// Only available for the QWP sender.
+func WithConnectTimeout(d time.Duration) LineSenderOption {
+	return func(s *lineSenderConfig) {
+		s.connectTimeoutMs = int(d / time.Millisecond)
+	}
+}
+
 // WithZone sets the failover zone hint used for endpoint locality.
 // It is silently stored but inert on the ingestion path, which is
 // zone-blind — it never receives SERVER_INFO. The egress (query) path

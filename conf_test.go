@@ -590,6 +590,15 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
+			name:   "ws with connect_timeout",
+			config: fmt.Sprintf("ws::addr=%s;connect_timeout=7000;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithConnectTimeout(7 * time.Second),
+			},
+		},
+		{
 			name:   "ws with target=primary",
 			config: fmt.Sprintf("ws::addr=%s;target=primary;", addr),
 			expectedOpts: []qdb.LineSenderOption{
@@ -949,6 +958,7 @@ func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
 		{"close_flush_timeout", qdb.WithCloseFlushTimeout(5 * time.Second), "close_flush_timeout_millis"},
 		{"close_timeout_alias", qdb.WithCloseTimeout(5 * time.Second), "close_flush_timeout_millis"},
 		{"auth_timeout", qdb.WithAuthTimeout(5 * time.Second), "auth_timeout_ms"},
+		{"connect_timeout", qdb.WithConnectTimeout(5 * time.Second), "connect_timeout"},
 		{"zone", qdb.WithZone("eu-west-1a"), "zone"},
 		{"target", qdb.WithTarget(qdb.QwpTargetPrimary), "target"},
 		{"qwp_dump_writer", qdb.WithQwpDumpWriter(io.Discard), "QWP dump writer"},

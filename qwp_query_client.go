@@ -444,6 +444,17 @@ func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
 	}
 }
 
+// WithQwpQueryConnectTimeout bounds each TCP connect attempt. It does
+// not cover the TLS handshake, WebSocket upgrade-response read (see
+// WithQwpQueryAuthTimeout), or SERVER_INFO read. Zero leaves the
+// connect bounded by the operating system; negative durations are
+// rejected by validate().
+func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) {
+		c.connectTimeoutMs = int(d.Milliseconds())
+	}
+}
+
 // WithQwpQueryReplayExec opts Exec into transparent replay on
 // transport-terminal failure. Default false because non-idempotent
 // statements (INSERT / UPDATE / DELETE / DDL) might double-execute
