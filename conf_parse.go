@@ -578,16 +578,20 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			}
 		case "transaction":
 			// Transactional ingestion is a WebSocket-only ingress feature
-			// (Sender.java). This client does not implement it; the key is
-			// accepted on QWP as a validated no-op so a connect string
-			// shared with a transaction-aware client still parses. Rejected
-			// on the legacy ILP transports, which never carry it.
+			// (Sender.java). This client does not implement it, so an
+			// explicit opt-in must fail instead of silently producing
+			// ordinary writes. Rejected on the legacy ILP transports,
+			// which never carry it.
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
 			switch v {
-			case "on", "off":
-				// Accepted; this client has no transactional mode to toggle.
+			case "off":
+				// The default; this client has no transactional mode to
+				// disable.
+			case "on":
+				return nil, NewInvalidConfigStrError(
+					"transaction=on is not yet supported: transactional ingestion is not implemented in this client (use transaction=off)")
 			default:
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not 'on' or 'off'", k, v)

@@ -609,17 +609,11 @@ func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
 	}
 }
 
-// TestConfQwpIngressAcceptsExtraIngressKeys pins that the ingress-only
-// QWP keys the Java client (Sender.java) accepts but the doc Key index
-// omits — transaction, connection_listener_inbox_capacity — parse on the
-// QWP ingress sender. This client implements neither feature, so they are
-// validated no-ops; accepting them is what lets a connect string shared
-// with a transaction-aware client still load here. The UDP-only keys
-// max_datagram_size / multicast_ttl are excluded: QWP rejects them (see
-// TestConfQwpRejectsUdpKeys).
+// TestConfQwpIngressAcceptsExtraIngressKeys pins that the supported
+// values of ingress-only QWP keys the Java client accepts but the doc
+// Key index omits parse on the QWP ingress sender.
 func TestConfQwpIngressAcceptsExtraIngressKeys(t *testing.T) {
 	kvs := []string{
-		"transaction=on",
 		"transaction=off",
 		"connection_listener_inbox_capacity=64",
 	}
@@ -628,6 +622,23 @@ func TestConfQwpIngressAcceptsExtraIngressKeys(t *testing.T) {
 			conf := "ws::addr=localhost:9000;" + kv + ";"
 			if _, err := confFromStr(conf); err != nil {
 				t.Errorf("QWP ingress rejected %q: %v", kv, err)
+			}
+		})
+	}
+}
+
+// TestConfQwpIngressRejectsTransactionOn ensures callers cannot request
+// transactional ingestion and silently receive ordinary writes while
+// transactional mode remains unimplemented.
+func TestConfQwpIngressRejectsTransactionOn(t *testing.T) {
+	for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+		t.Run(schema, func(t *testing.T) {
+			_, err := confFromStr(schema + "::addr=localhost:9000;transaction=on;")
+			if err == nil {
+				t.Fatal("transaction=on must be rejected until transactional ingestion is implemented")
+			}
+			if !strings.Contains(err.Error(), "not yet supported") {
+				t.Errorf("error %q does not explain that transactional ingestion is unsupported", err)
 			}
 		})
 	}
