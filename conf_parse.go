@@ -610,9 +610,14 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
-			if _, err := strconv.Atoi(v); err != nil {
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not a valid int", k, v)
+			}
+			if parsedVal < 1 {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %d: must be >= 1", k, parsedVal)
 			}
 		case "max_datagram_size", "multicast_ttl":
 			// UDP-only ingress keys (Sender.java accepts them on every

@@ -664,6 +664,7 @@ func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
 func TestConfQwpIngressAcceptsExtraIngressKeys(t *testing.T) {
 	kvs := []string{
 		"transaction=off",
+		"connection_listener_inbox_capacity=1",
 		"connection_listener_inbox_capacity=64",
 	}
 	for _, kv := range kvs {
@@ -765,6 +766,19 @@ func TestConfTransactionRejectedOnHttpAndTcp(t *testing.T) {
 					t.Errorf("error %q does not explain the QWP-only gating", err.Error())
 				}
 			})
+		}
+	}
+}
+
+func TestConfQwpIngressRejectsInvalidConnectionListenerInboxCapacity(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		_, err := confFromStr(
+			"ws::addr=localhost:9000;connection_listener_inbox_capacity=" + value + ";")
+		if err == nil {
+			t.Fatalf("connection_listener_inbox_capacity=%s must be rejected", value)
+		}
+		if !strings.Contains(err.Error(), "must be >= 1") {
+			t.Errorf("error %q does not report the >= 1 requirement", err)
 		}
 	}
 }
