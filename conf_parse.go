@@ -68,10 +68,9 @@ var egressOnlyKeys = map[string]bool{
 // shared ws:: / wss:: connect string works in both directions. The set
 // is the connect-string.md §Key index ingress keys plus the
 // ingress-only keys the Java client (Sender.java) accepts that the doc
-// Key index omits: transaction, connection_listener_inbox_capacity, and
-// the user / pass auth aliases. The auth aliases are interpreted by the
-// ingress parser (username / password equivalents) but ignored on
-// egress, matching QwpQueryClient.fromConfig. The UDP-only keys
+// Key index omits: transaction and connection_listener_inbox_capacity.
+// The user / pass auth aliases are shared keys, canonicalized to
+// username / password by parseConfigStr. The UDP-only keys
 // max_datagram_size and multicast_ttl are deliberately absent: QWP is
 // the WebSocket transport, so both QWP parsers reject them. Same SSOT as
 // egressOnlyKeys.
@@ -96,7 +95,6 @@ var ingressOnlyKeys = map[string]bool{
 	"on_security_error":                     true,
 	"on_server_error":                       true,
 	"on_write_error":                        true,
-	"pass":                                  true,
 	"reconnect_initial_backoff_millis":      true,
 	"reconnect_max_backoff_millis":          true,
 	"reconnect_max_duration_millis":         true,
@@ -108,7 +106,6 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_max_segment_bytes":                          true,
 	"sf_max_total_bytes":                    true,
 	"transaction":                           true,
-	"user":                                  true,
 }
 
 func confFromStr(conf string) (*lineSenderConfig, error) {
@@ -783,6 +780,7 @@ func parseConfigStr(conf string) (configData, error) {
 		result = configData{
 			KeyValuePairs: map[string]string{},
 		}
+		seenKeys = map[string]bool{}
 
 		nextRune   rune
 		isEscaping bool
@@ -834,19 +832,23 @@ func parseConfigStr(conf string) (configData, error) {
 				return result, NewInvalidConfigStrError("empty value for key %q", key)
 			}
 
-			// Reject duplicate keys (case-sensitive) for parity with Rust and
-			// the per-field checks in Java; otherwise dups would silently LWW.
+			// Reject duplicate raw keys (case-sensitive) for parity with Rust
+			// and the per-field checks in Java. Deprecated aliases are
+			// canonicalized after this raw-duplicate check, so an
+			// alias/canonical pair is allowed and resolves last-write-wins.
 			// `addr` is the documented exception: the failover spec (§1)
 			// allows `addr=h1;addr=h2` as an alternative spelling of
 			// `addr=h1,h2`. Both forms accumulate into a single
 			// comma-joined value so downstream parsers see one shape.
-			keyStr := key.String()
-			if existing, exists := result.KeyValuePairs[keyStr]; exists {
-				if keyStr == "addr" {
-					result.KeyValuePairs[keyStr] = existing + "," + value.String()
-				} else {
-					return result, NewInvalidConfigStrError("duplicate key %q", keyStr)
-				}
+			rawKey := key.String()
+			if seenKeys[rawKey] && rawKey != "addr" {
+				return result, NewInvalidConfigStrError("duplicate key %q", rawKey)
+			}
+			seenKeys[rawKey] = true
+
+			keyStr := canonicalConfigKey(rawKey)
+			if existing, exists := result.KeyValuePairs[keyStr]; exists && keyStr == "addr" {
+				result.KeyValuePairs[keyStr] = existing + "," + value.String()
 			} else {
 				result.KeyValuePairs[keyStr] = value.String()
 			}
@@ -874,4 +876,15 @@ func parseConfigStr(conf string) (configData, error) {
 	}
 
 	return result, nil
+}
+
+func canonicalConfigKey(key string) string {
+	switch key {
+	case "user":
+		return "username"
+	case "pass":
+		return "password"
+	default:
+		return key
+	}
 }

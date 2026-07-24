@@ -747,10 +747,9 @@ func TestConfQwpRejectsTokenXY(t *testing.T) {
 }
 
 // TestConfUserPassAliases pins user / pass as the deprecated aliases of
-// username / password (Sender.java). The ingress parser interprets them
-// as credentials; the egress parser silently ignores them (matching
-// QwpQueryClient.fromConfig, which interprets only username / password),
-// so a connect string carrying the aliases loads on both sides.
+// username / password (Sender.java). Both QWP directions interpret them
+// as Basic Auth credentials so a shared connect string behaves the same
+// for ingestion and queries.
 func TestConfUserPassAliases(t *testing.T) {
 	conf := "ws::addr=localhost:9000;user=alice;pass=secret;"
 
@@ -765,8 +764,60 @@ func TestConfUserPassAliases(t *testing.T) {
 		t.Errorf("httpPass=%q, want %q", c.httpPass, "secret")
 	}
 
-	if _, err := parseQwpQueryConf(conf); err != nil {
-		t.Errorf("egress rejected user/pass aliases: %v", err)
+	q, err := parseQwpQueryConf(conf)
+	if err != nil {
+		t.Fatalf("egress rejected user/pass aliases: %v", err)
+	}
+	if q.httpUser != "alice" {
+		t.Errorf("egress httpUser=%q, want %q", q.httpUser, "alice")
+	}
+	if q.httpPass != "secret" {
+		t.Errorf("egress httpPass=%q, want %q", q.httpPass, "secret")
+	}
+}
+
+// TestConfAuthAliasesAreCanonicalizedLastWriteWins ensures conflicting
+// deprecated aliases cannot make authentication depend on Go's
+// randomized map iteration order. Both spellings canonicalize to the
+// same key as the string is parsed, so the last value wins like Java's
+// ConfigView.
+func TestConfAuthAliasesAreCanonicalizedLastWriteWins(t *testing.T) {
+	configs := []struct {
+		conf     string
+		wantUser string
+		wantPass string
+	}{
+		{
+			conf:     "ws::addr=localhost:9000;user=alias-user;pass=alias-pass;username=canonical-user;password=canonical-pass;",
+			wantUser: "canonical-user",
+			wantPass: "canonical-pass",
+		},
+		{
+			conf:     "ws::addr=localhost:9000;username=canonical-user;password=canonical-pass;user=alias-user;pass=alias-pass;",
+			wantUser: "alias-user",
+			wantPass: "alias-pass",
+		},
+	}
+	for _, tc := range configs {
+		for i := 0; i < 2000; i++ {
+			ingress, err := confFromStr(tc.conf)
+			if err != nil {
+				t.Fatalf("ingress parse: %v", err)
+			}
+			if ingress.httpUser != tc.wantUser || ingress.httpPass != tc.wantPass {
+				t.Fatalf("ingress iteration %d selected credentials %q/%q, want %s/%s",
+					i, ingress.httpUser, ingress.httpPass, tc.wantUser, tc.wantPass)
+			}
+
+			egress, err := parseQwpQueryConf(tc.conf)
+			if err != nil {
+				t.Fatalf("egress parse: %v", err)
+			}
+			if egress.httpUser != tc.wantUser || egress.httpPass != tc.wantPass {
+				t.Fatalf("egress iteration %d selected credentials %q/%q, want %s/%s",
+					i, egress.httpUser, egress.httpPass, tc.wantUser, tc.wantPass)
+			}
+		}
 	}
 }
 
