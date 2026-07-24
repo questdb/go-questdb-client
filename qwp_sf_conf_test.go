@@ -43,7 +43,7 @@ func TestSfConfParseAcceptsAllKnobs(t *testing.T) {
 		"ws::addr=localhost:9000",
 		"sf_dir=/tmp/sf",
 		"sender_id=my-sender",
-		"sf_max_bytes=8388608",
+		"sf_max_segment_bytes=8388608",
 		"sf_max_total_bytes=21474836480",
 		"sf_durability=memory",
 		"sf_append_deadline_millis=20000",
@@ -60,7 +60,7 @@ func TestSfConfParseAcceptsAllKnobs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp/sf", conf.sfDir)
 	assert.Equal(t, "my-sender", conf.senderId)
-	assert.Equal(t, int64(8388608), conf.sfMaxBytes)
+	assert.Equal(t, int64(8388608), conf.sfMaxSegmentBytes)
 	assert.Equal(t, int64(21474836480), conf.sfMaxTotalBytes)
 	assert.Equal(t, "memory", conf.sfDurability)
 	assert.Equal(t, 20000, conf.sfAppendDeadlineMillis)
@@ -240,7 +240,7 @@ func TestSfConfDurableAckKeepaliveParses(t *testing.T) {
 
 func TestSfConfRejectsNegativeNumbers(t *testing.T) {
 	cases := []string{
-		"sf_max_bytes=-1",
+		"sf_max_segment_bytes=-1",
 		"sf_max_total_bytes=-1",
 		"sf_append_deadline_millis=0",
 		"reconnect_initial_backoff_millis=0",
@@ -255,55 +255,55 @@ func TestSfConfRejectsNegativeNumbers(t *testing.T) {
 	}
 }
 
-// TestSfConfMaxBytesZeroMeansDefault pins that sf_max_bytes=0 and
+// TestSfConfMaxBytesZeroMeansDefault pins that sf_max_segment_bytes=0 and
 // sf_max_total_bytes=0 are accepted as the "use the default" sentinel,
 // parsing to 0 and resolving to qwpSfDefaultMaxBytes /
 // qwpSfDefaultMaxTotalBytes at construction. This matches the
-// WithSfMaxBytes(0) / WithSfMaxTotalBytes(0) option path and the
+// WithSfMaxSegmentBytes(0) / WithSfMaxTotalBytes(0) option path and the
 // error_inbox_capacity=0 convention.
 func TestSfConfMaxBytesZeroMeansDefault(t *testing.T) {
-	conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_bytes=0;sf_max_total_bytes=0;")
+	conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_segment_bytes=0;sf_max_total_bytes=0;")
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), conf.sfMaxBytes)
+	assert.Equal(t, int64(0), conf.sfMaxSegmentBytes)
 	assert.Equal(t, int64(0), conf.sfMaxTotalBytes)
 
-	// Builder parity: WithSfMaxBytes(0) / WithSfMaxTotalBytes(0) also
+	// Builder parity: WithSfMaxSegmentBytes(0) / WithSfMaxTotalBytes(0) also
 	// pass sanitization as the use-default sentinel.
 	optConf := newLineSenderConfig(qwpSenderType)
 	WithAddress("localhost:9000")(optConf)
 	WithSfDir("/tmp/sf")(optConf)
-	WithSfMaxBytes(0)(optConf)
+	WithSfMaxSegmentBytes(0)(optConf)
 	WithSfMaxTotalBytes(0)(optConf)
 	require.NoError(t, sanitizeQwpConf(optConf))
 }
 
-// TestSfConfRejectsAutoFlushBytesAboveSfMaxBytes pins the sanitize-time
+// TestSfConfRejectsAutoFlushBytesAboveSfMaxSegmentBytes pins the sanitize-time
 // validation: an explicitly-set auto_flush_bytes that exceeds an
-// explicitly-set sf_max_bytes is rejected, because the byte trigger
+// explicitly-set sf_max_segment_bytes is rejected, because the byte trigger
 // would let a batch grow until its encoded frame can no longer fit a
 // single segment — an un-flushable pairing. The check is at sanitize,
 // not parse, so it runs for both the connect-string and option paths.
-func TestSfConfRejectsAutoFlushBytesAboveSfMaxBytes(t *testing.T) {
+func TestSfConfRejectsAutoFlushBytesAboveSfMaxSegmentBytes(t *testing.T) {
 	conf, err := confFromStr(
-		"ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_bytes=1048576;auto_flush_bytes=2097152;")
+		"ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_segment_bytes=1048576;auto_flush_bytes=2097152;")
 	require.NoError(t, err, "parser accepts both values; the contradiction is caught at sanitize")
 	require.True(t, conf.autoFlushBytesSet)
 
 	err = sanitizeQwpConf(conf)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "auto_flush_bytes")
-	require.Contains(t, err.Error(), "sf_max_bytes")
+	require.Contains(t, err.Error(), "sf_max_segment_bytes")
 }
 
-// TestSfConfRejectsAutoFlushBytesAboveSfMaxBytesViaOptions covers the
+// TestSfConfRejectsAutoFlushBytesAboveSfMaxSegmentBytesViaOptions covers the
 // functional-option set-site: WithAutoFlushBytes must record the
 // explicit-set flag so the same sanitize guard fires.
-func TestSfConfRejectsAutoFlushBytesAboveSfMaxBytesViaOptions(t *testing.T) {
+func TestSfConfRejectsAutoFlushBytesAboveSfMaxSegmentBytesViaOptions(t *testing.T) {
 	conf := newLineSenderConfig(qwpSenderType)
 	for _, opt := range []LineSenderOption{
 		WithAddress("localhost:9000"),
 		WithSfDir("/tmp/sf"),
-		WithSfMaxBytes(1 << 20),
+		WithSfMaxSegmentBytes(1 << 20),
 		WithAutoFlushBytes(2 << 20),
 	} {
 		opt(conf)
@@ -313,32 +313,32 @@ func TestSfConfRejectsAutoFlushBytesAboveSfMaxBytesViaOptions(t *testing.T) {
 	err := sanitizeQwpConf(conf)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "auto_flush_bytes")
-	require.Contains(t, err.Error(), "sf_max_bytes")
+	require.Contains(t, err.Error(), "sf_max_segment_bytes")
 }
 
 // TestSfConfAcceptsDefaultedAutoFlushBytesOverSmallSegment is the
-// no-footgun case: lowering sf_max_bytes while leaving auto_flush_bytes
+// no-footgun case: lowering sf_max_segment_bytes while leaving auto_flush_bytes
 // at its 8 MiB default is NOT a user-written contradiction, so sanitize
 // must accept it — the runtime clamp lowers the effective trigger to
 // fit the smaller segment. Rejecting here would force users to hand-tune
 // auto_flush_bytes every time they shrink a segment.
 func TestSfConfAcceptsDefaultedAutoFlushBytesOverSmallSegment(t *testing.T) {
-	conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_bytes=1048576;")
+	conf, err := confFromStr("ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_segment_bytes=1048576;")
 	require.NoError(t, err)
 	require.False(t, conf.autoFlushBytesSet, "auto_flush_bytes left at default")
 	require.Equal(t, qwpDefaultAutoFlushBytes, conf.autoFlushBytes)
-	require.Greater(t, int64(conf.autoFlushBytes), conf.sfMaxBytes,
+	require.Greater(t, int64(conf.autoFlushBytes), conf.sfMaxSegmentBytes,
 		"precondition: the defaulted trigger exceeds the chosen segment")
 
 	require.NoError(t, sanitizeQwpConf(conf),
 		"a defaulted trigger over a smaller segment is handled by the clamp, not rejected")
 }
 
-// TestSfConfAcceptsAutoFlushBytesBelowSfMaxBytes pins that a valid
+// TestSfConfAcceptsAutoFlushBytesBelowSfMaxSegmentBytes pins that a valid
 // explicit pairing (trigger at or below the segment) sanitizes cleanly.
-func TestSfConfAcceptsAutoFlushBytesBelowSfMaxBytes(t *testing.T) {
+func TestSfConfAcceptsAutoFlushBytesBelowSfMaxSegmentBytes(t *testing.T) {
 	conf, err := confFromStr(
-		"ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_bytes=4194304;auto_flush_bytes=2097152;")
+		"ws::addr=localhost:9000;sf_dir=/tmp/sf;sf_max_segment_bytes=4194304;auto_flush_bytes=2097152;")
 	require.NoError(t, err)
 	require.NoError(t, sanitizeQwpConf(conf))
 }
@@ -514,7 +514,7 @@ func TestSfOptionsWithReconnectPolicyMixedZeroOnlySetsPositive(t *testing.T) {
 func TestSanitizeQwpConfRejectsSfKeysWithoutSfDir(t *testing.T) {
 	cases := []func(c *lineSenderConfig){
 		func(c *lineSenderConfig) { c.senderId = "x" },
-		func(c *lineSenderConfig) { c.sfMaxBytes = 1 << 20 },
+		func(c *lineSenderConfig) { c.sfMaxSegmentBytes = 1 << 20 },
 		func(c *lineSenderConfig) { c.sfMaxTotalBytes = 1 << 30 },
 		func(c *lineSenderConfig) { c.sfDurability = "memory" },
 		func(c *lineSenderConfig) { c.sfAppendDeadlineMillis = 5000 },
@@ -537,7 +537,7 @@ func TestSanitizeQwpConfRejectsTotalLessThanSegment(t *testing.T) {
 	conf := newLineSenderConfig(qwpSenderType)
 	conf.address = "localhost:9000"
 	conf.sfDir = "/tmp/sf"
-	conf.sfMaxBytes = 1 << 20
+	conf.sfMaxSegmentBytes = 1 << 20
 	conf.sfMaxTotalBytes = 1 << 18
 	err := sanitizeQwpConf(conf)
 	require.Error(t, err)
@@ -557,7 +557,7 @@ func TestSfConfEndToEnd(t *testing.T) {
 		"ws::addr=" + addr,
 		"sf_dir=" + tmp,
 		"sender_id=test-slot",
-		"sf_max_bytes=4096",
+		"sf_max_segment_bytes=4096",
 		"sf_max_total_bytes=" + fmt.Sprintf("%d", int64(64*1024)),
 		"close_flush_timeout_millis=5000;",
 	}, ";")

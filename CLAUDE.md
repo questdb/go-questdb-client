@@ -17,7 +17,8 @@ Go client library for QuestDB ingestion. Three transports:
 
 Module path: `github.com/questdb/go-questdb-client/v4` — the `/v4` segment is
 load-bearing when importing within this repo. Minimum Go: 1.23 (go.mod pins
-`go 1.23` with a `1.24.4` toolchain).
+`go 1.23` with no `toolchain` directive; CI's `1.23.x`/`1.24.x` matrix runs
+under `GOTOOLCHAIN=local`).
 
 ## Commands
 
@@ -88,92 +89,20 @@ encodes a batch into `qwpSfCursorEngine` via `engineAppendBlocking`; the
 `qwpSfSendLoop` goroutine drains it to the WebSocket, parses ACKs, advances
 `engineAckedFsn`, and owns reconnect + replay from `engineAckedFsn() + 1`.
 
-**Cursor frames are self-sufficient** — full schema definitions plus the full
-symbol dictionary from id 0, every flush. This is what makes
-reconnect/replay/orphan-adoption safe across a fresh server connection.
-
-**The wire carries no schema id and no schema mode byte.** A table block is
-`table_name, row_count, col_count, inline columns, column data`; the inline
-column definitions are the authoritative schema, repeated on every frame. There
-is no `nextSchemaId` accumulator on the sender, no per-table `schemaId` field on
-the table buffer, no schema-change detection, and no reference mode. (QWP once
-carried a mode byte + schema id plus a schema-reference optimisation; it was
-removed across the server and all clients.) On egress, the decoder parses the
-schema from the first `RESULT_BATCH` of a query (`batch_seq == 0`) into
-`qwpQueryDecoder.querySchema` and reuses it for that query's continuation
-batches; `qwpEgressIO.dispatcherRun` calls `resetQuerySchema` at the start of
-every query so a schema never leaks across query boundaries.
-
-Symbol-dict tracking (`maxSentSymbolId`, `batchMaxSymbolId`) is still in place,
-and both fields are load-bearing. The encoder always passes `-1` as the
-`maxSentId` arg of `encodeMultiTableWithDeltaDict` to force "full dict from id
-0", but `batchMaxSymbolId` is the separate `batchMaxId` arg and bounds the dict
-actually written: `writeDeltaDict` emits `globalDict[0..batchMaxSymbolId]`, so
-dropping it would silently truncate the symbol dict. `maxSentSymbolId` is the
-cross-flush high-water mark that `resetAfterFlush` rewinds `batchMaxSymbolId` to
-(never to `-1`), so a later batch reusing only earlier symbols still writes the
-full dict its rows reference. Both are also read by tests and external
-observers, but that is incidental to their wire role.
-
-`WithInFlightWindow(n)` / `in_flight_window=n` is **retained but a no-op** in
-the cursor architecture — backpressure is governed by the engine's segment-ring
-+ `engineAppendBlocking` deadline.
-
-### Java-parity QWP knobs (not in connect-string.md)
-
-These connect-string keys are recognised by the Java client
-(`Sender.java`) but are not listed in the
-[native-client spec](https://github.com/questdb/questdb-enterprise/blob/main/questdb/docs/qwp/connect-string.md).
-We accept them for Java-parity portability — a connect string that
-works on the Java client must work here. None should ever be
-considered for removal without a matching change in Java:
-
-- `gorilla=on|off` — gates the Gorilla timestamp encoding in
-  `qwp_encoder.go` (FLAG_GORILLA). Default `on`.
-- `in_flight_window=N` — see the "retained but a no-op" note above.
-
-`close_timeout=N` (millisecond integer) was a v4.0–v4.5 Go-only key
-for the memory-mode close path. The cursor architecture unified
-memory and SF onto `close_flush_timeout_millis`, which the spec
-also defines. The parser now rejects `close_timeout=` with a
-migration hint pointing at `close_flush_timeout_millis`.
-`WithCloseTimeout(d)` is retained as a deprecated alias that routes
-positive durations through `close_flush_timeout_millis`; new code
-should use `WithCloseFlushTimeout` directly.
-
-Flush semantics: `Flush` / `FlushAndGetSequence` **never wait for the server
-ACK** — they return once the batch is published into the cursor engine (in-RAM
-for memory mode, on-disk for SF) and the send loop delivers + replays it in the
-background. This matches the Java spec (`design/qwp-cursor-durability.md`
-decision #1: "flush() never waits for ACK; ACKs are async") and is uniform
-across both the pending-rows and zero-pending branches and auto-flush — all
-route through `enqueueCursor`; explicit `Flush` only additionally surfaces a
-latched send-loop error eagerly. (`Flush` was an ACK barrier
-through v4.2.0; that contract was dropped when the cursor/SF architecture made
-local persistence, not the ACK, the durability guarantee.) `FlushAndGetSequence` returns the
-published FSN — the upper bound of any `SenderError.ToFsn` for that batch;
-**pair it with `AwaitAckedFsn` for server-ACK confirmation** (the dedicated
-primitive now that `Flush` no longer blocks on ACKs).
-
-Orphan-slot adoption (SF mode, `drain_orphans=on`) is implemented in
-`qwp_sf_orphan.go` + `qwp_sf_drainer.go` + `qwp_sf_round_walk.go`; drainers run
-in dedicated goroutines and are visible via `QwpSender.BackgroundDrainers()`.
+**`Flush` / `FlushAndGetSequence` never wait for the server ACK** — they return
+once the batch is published to the cursor engine (in-RAM for memory mode,
+on-disk for SF); delivery and replay to the server run in the background. For
+server-ACK confirmation, pair `FlushAndGetSequence` with `AwaitAckedFsn`.
 
 ### Error handling
 
 QWP server rejections surface as `*SenderError` (`sender_error.go` is canonical
-for categories + policy enum). Two paths: async callback registered via
-`WithErrorHandler`, and producer-side typed error via `errors.As` after `Flush`
-/ `FlushAndGetSequence`.
-
-Policy resolution precedence (highest first): `WithErrorPolicyResolver` →
-`WithErrorPolicy(category, ...)` → connect-string `on_*_error` →
-`on_server_error` → spec defaults. `PROTOCOL_VIOLATION` and `UNKNOWN` are never
-user-configurable — always HALT.
-
-A HALT latches the typed error on the I/O loop; `sendLoopCheckError()` surfaces
-it on the next producer call. The sender does not auto-resume — close + rebuild
-is the supported recovery (matches Java).
+for the categories + policy enum). `PROTOCOL_VIOLATION` and `UNKNOWN` are never
+user-configurable — always HALT. A HALT records the typed error on the I/O loop
+and surfaces it on the next producer call; the sender does not auto-resume, so
+close + rebuild is the supported recovery. Policy precedence, highest first:
+`WithErrorPolicyResolver` → `WithErrorPolicy` → connect-string `on_*_error` →
+`on_server_error` → spec defaults.
 
 ### Connection pooling
 
@@ -185,10 +114,6 @@ doesn't participate.
 
 QWP unit tests use `httptest.Server` to stand in for the QuestDB WebSocket
 endpoint (`newQwpTestServer` in `qwp_sender_test.go`). ILP unit tests are pure.
-
-`*_integration_test.go` files need Docker — they spin up real QuestDB via
-testcontainers-go; HTTP/TCP suites sometimes launch haproxy via
-`test/haproxy.cfg`.
 
 Cross-language conformance: `interop_test.go` +
 `test/interop/questdb-client-test` (submodule) — ILP vectors shared across

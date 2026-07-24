@@ -34,7 +34,7 @@ import "os"
 // extends the file to the new logical size, so the call returns
 // success as if the spec's sparse-fallback path were taken — blocks
 // remain sparse, SIGBUS risk per sf-client.md §6 applies. Operators
-// on these targets must size sf_max_bytes conservatively against
+// on these targets must size sf_max_segment_bytes conservatively against
 // free space.
 //
 // Add a platform-specific implementation here if QuestDB Go ever

@@ -257,17 +257,6 @@ func TestParserHappyCases(t *testing.T) {
 			},
 		},
 		{
-			name:   "ws with in_flight_window",
-			config: fmt.Sprintf("ws::addr=%s;in_flight_window=4;", addr),
-			expected: qdb.ConfigData{
-				Schema: "ws",
-				KeyValuePairs: map[string]string{
-					"addr":              addr,
-					"in_flight_window": "4",
-				},
-			},
-		},
-		{
 			// failover.md §1: `addr=h1;addr=h2` is an alternative
 			// spelling of `addr=h1,h2`. The parser MUST accumulate
 			// both forms into a single comma-joined value.
@@ -559,15 +548,6 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name:   "ws with in_flight_window",
-			config: fmt.Sprintf("ws::addr=%s;in_flight_window=4;", addr),
-			expectedOpts: []qdb.LineSenderOption{
-				qdb.WithQwp(),
-				qdb.WithAddress(addr),
-				qdb.WithInFlightWindow(4),
-			},
-		},
-		{
 			// retry_timeout is intentionally NOT paired with ws here: the
 			// parser maps it to WithRetryTimeout for any schema, but the
 			// QWP sanitizer rejects it (see TestQwpSanitizeRejectsRetryTimeout),
@@ -601,30 +581,21 @@ func TestHappyCasesFromConf(t *testing.T) {
 			},
 		},
 		{
-			name:   "ws with gorilla=off",
-			config: fmt.Sprintf("ws::addr=%s;gorilla=off;", addr),
-			expectedOpts: []qdb.LineSenderOption{
-				qdb.WithQwp(),
-				qdb.WithAddress(addr),
-				qdb.WithGorilla(false),
-			},
-		},
-		{
-			name:   "ws with gorilla=on",
-			config: fmt.Sprintf("ws::addr=%s;gorilla=on;", addr),
-			expectedOpts: []qdb.LineSenderOption{
-				qdb.WithQwp(),
-				qdb.WithAddress(addr),
-				qdb.WithGorilla(true),
-			},
-		},
-		{
 			name:   "ws with auth_timeout_ms",
 			config: fmt.Sprintf("ws::addr=%s;auth_timeout_ms=7000;", addr),
 			expectedOpts: []qdb.LineSenderOption{
 				qdb.WithQwp(),
 				qdb.WithAddress(addr),
 				qdb.WithAuthTimeout(7 * time.Second),
+			},
+		},
+		{
+			name:   "ws with connect_timeout",
+			config: fmt.Sprintf("ws::addr=%s;connect_timeout=7000;", addr),
+			expectedOpts: []qdb.LineSenderOption{
+				qdb.WithQwp(),
+				qdb.WithAddress(addr),
+				qdb.WithConnectTimeout(7 * time.Second),
 			},
 		},
 		{
@@ -741,14 +712,9 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			expectedErrMsgContains: "invalid auto_flush_interval",
 		},
 		{
-			name:                   "invalid gorilla value",
-			config:                 "ws::addr=localhost:1111;gorilla=maybe;",
-			expectedErrMsgContains: "not 'on' or 'off'",
-		},
-		{
 			name:                   "in_flight_window on HTTP",
 			config:                 "http::addr=localhost:1111;in_flight_window=4;",
-			expectedErrMsgContains: "in_flight_window is only supported for QWP senders",
+			expectedErrMsgContains: "unsupported option",
 		},
 		{
 			// close_timeout was a Go-only legacy key; the Java client
@@ -758,11 +724,6 @@ func TestPathologicalCasesFromConf(t *testing.T) {
 			name:                   "close_timeout rejected with migration hint",
 			config:                 "tcp::addr=localhost:1111;close_timeout=1000;",
 			expectedErrMsgContains: "close_timeout is no longer supported",
-		},
-		{
-			name:                   "gorilla on TCP",
-			config:                 "tcp::addr=localhost:1111;gorilla=off;",
-			expectedErrMsgContains: "gorilla is only supported for QWP senders",
 		},
 		{
 			name:                   "unsupported option",
@@ -985,7 +946,7 @@ func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
 	}{
 		{"sf_dir", qdb.WithSfDir("/tmp/sf"), "sf_dir"},
 		{"sender_id", qdb.WithSenderId("ingest-1"), "sender_id"},
-		{"sf_max_bytes", qdb.WithSfMaxBytes(1 << 20), "sf_max_bytes"},
+		{"sf_max_segment_bytes", qdb.WithSfMaxSegmentBytes(1 << 20), "sf_max_segment_bytes"},
 		{"sf_max_total_bytes", qdb.WithSfMaxTotalBytes(1 << 30), "sf_max_total_bytes"},
 		{"sf_durability", qdb.WithSfDurability("memory"), "sf_durability"},
 		{"sf_append_deadline", qdb.WithSfAppendDeadline(10 * time.Second), "sf_append_deadline_millis"},
@@ -996,9 +957,8 @@ func TestQwpOnlyOptionsRejectedOnHttpAndTcp(t *testing.T) {
 		{"initial_connect_retry", qdb.WithInitialConnectRetry(true), "initial_connect_retry"},
 		{"close_flush_timeout", qdb.WithCloseFlushTimeout(5 * time.Second), "close_flush_timeout_millis"},
 		{"close_timeout_alias", qdb.WithCloseTimeout(5 * time.Second), "close_flush_timeout_millis"},
-		{"gorilla", qdb.WithGorilla(false), "gorilla"},
-		{"in_flight_window", qdb.WithInFlightWindow(8), "in_flight_window"},
 		{"auth_timeout", qdb.WithAuthTimeout(5 * time.Second), "auth_timeout_ms"},
+		{"connect_timeout", qdb.WithConnectTimeout(5 * time.Second), "connect_timeout"},
 		{"zone", qdb.WithZone("eu-west-1a"), "zone"},
 		{"target", qdb.WithTarget(qdb.QwpTargetPrimary), "target"},
 		{"qwp_dump_writer", qdb.WithQwpDumpWriter(io.Discard), "QWP dump writer"},

@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +49,7 @@ type configData struct {
 // only.
 var egressOnlyKeys = map[string]bool{
 	"buffer_pool_size":            true,
+	"client_id":                   true,
 	"compression":                 true,
 	"compression_level":           true,
 	"failover":                    true,
@@ -57,19 +59,29 @@ var egressOnlyKeys = map[string]bool{
 	"failover_max_duration_ms":    true,
 	"initial_credit":              true,
 	"max_batch_rows":              true,
+	"path":                        true,
+	"replay_exec":                 true,
+	"server_info_timeout_ms":      true,
 }
 
-// ingressOnlyKeys lists connect-string keys defined by the spec for
-// the ingress LineSender only. The egress QwpQueryClient silently
-// accepts them so a shared connect string works in both directions.
-// Same SSOT as egressOnlyKeys; the lists are kept in sync with
-// connect-string.md §Key index.
+// ingressOnlyKeys lists connect-string keys the ingress LineSender
+// interprets and the egress QwpQueryClient silently accepts, so a
+// shared ws:: / wss:: connect string works in both directions. The set
+// is the connect-string.md §Key index ingress keys plus the
+// ingress-only keys the Java client (Sender.java) accepts that the doc
+// Key index omits: transaction and connection_listener_inbox_capacity.
+// The user / pass auth aliases are shared keys, canonicalized to
+// username / password by parseConfigStr. The UDP-only keys
+// max_datagram_size and multicast_ttl are deliberately absent: QWP is
+// the WebSocket transport, so both QWP parsers reject them. Same SSOT as
+// egressOnlyKeys.
 var ingressOnlyKeys = map[string]bool{
 	"auto_flush":                            true,
 	"auto_flush_bytes":                      true,
 	"auto_flush_interval":                   true,
 	"auto_flush_rows":                       true,
 	"close_flush_timeout_millis":            true,
+	"connection_listener_inbox_capacity":    true,
 	"drain_orphans":                         true,
 	"durable_ack_keepalive_interval_millis": true,
 	"error_inbox_capacity":                  true,
@@ -92,8 +104,9 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_append_deadline_millis":             true,
 	"sf_dir":                                true,
 	"sf_durability":                         true,
-	"sf_max_bytes":                          true,
+	"sf_max_segment_bytes":                  true,
 	"sf_max_total_bytes":                    true,
+	"transaction":                           true,
 }
 
 func confFromStr(conf string) (*lineSenderConfig, error) {
@@ -152,7 +165,8 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		switch k {
 		case "addr":
 			senderConf.address = v
-		case "username":
+		case "username", "user":
+			// user is the deprecated alias of username (Sender.java).
 			switch senderConf.senderType {
 			case httpSenderType, qwpSenderType:
 				senderConf.httpUser = v
@@ -161,7 +175,8 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				panic("add a case for " + k)
 			}
-		case "password":
+		case "password", "pass":
+			// pass is the deprecated alias of password (Sender.java).
 			if senderConf.senderType != httpSenderType && senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for HTTP and QWP senders", k)
 			}
@@ -175,10 +190,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				panic("add a case for " + k)
 			}
-		case "token_x":
-		case "token_y":
-			// Some clients require public key.
-			// But since Go sender doesn't need it, we ignore the values.
+		case "token_x", "token_y":
+			// TCP ILP public-key auth components (ECDSA P-256 X/Y). They
+			// are not part of the QWP connect-string vocabulary, so reject
+			// them on QWP for symmetry with the egress QwpQueryClient, which
+			// also rejects them. On the legacy ILP transports this client
+			// does not need the public key, so the values are ignored.
+			if senderConf.senderType == qwpSenderType {
+				return nil, NewInvalidConfigStrError("unsupported option %q", k)
+			}
 			continue
 		case "auto_flush":
 			// Resolved in the deterministic pre-pass above so map
@@ -267,6 +287,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		case "tls_roots_password":
 			return nil, NewInvalidConfigStrError("tls_roots_password is not available in the go client")
 		case "protocol_version":
+			if senderConf.senderType == qwpSenderType {
+				// protocol_version is not part of the QWP connect-string
+				// vocabulary -- the version is negotiated at the WebSocket
+				// upgrade. Reject any value (including "auto") so a ws:: string
+				// carrying it is surfaced as malformed, matching the egress
+				// QwpQueryClient and the other language clients.
+				return nil, NewInvalidConfigStrError(
+					"protocol_version is not supported for QWP; the protocol version is negotiated during the WebSocket upgrade")
+			}
 			if v != "auto" {
 				version, err := strconv.Atoi(v)
 				if err != nil {
@@ -278,15 +307,6 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				}
 				senderConf.protocolVersion = pVersion
 			}
-		case "in_flight_window":
-			if senderConf.senderType != qwpSenderType {
-				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
-			}
-			parsedVal, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, NewInvalidConfigStrError("invalid %s value, %q is not a valid int", k, v)
-			}
-			senderConf.inFlightWindow = parsedVal
 		case "close_timeout":
 			// Java client never accepted close_timeout — only
 			// close_flush_timeout_millis (Sender.java §3071). The
@@ -297,18 +317,6 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			// going through the generic "unsupported option" path.
 			return nil, NewInvalidConfigStrError(
 				"close_timeout is no longer supported; use close_flush_timeout_millis instead")
-		case "gorilla":
-			if senderConf.senderType != qwpSenderType {
-				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
-			}
-			switch v {
-			case "on":
-				senderConf.gorillaDisabled = false
-			case "off":
-				senderConf.gorillaDisabled = true
-			default:
-				return nil, NewInvalidConfigStrError("invalid gorilla value, %q is not 'on' or 'off'", v)
-			}
 		case "sf_dir":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -322,19 +330,19 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, err
 			}
 			senderConf.senderId = v
-		case "sf_max_bytes":
+		case "sf_max_segment_bytes":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
 			}
 			// 0 is the "use the default segment size" sentinel, resolved
 			// at construction (qwpSfDefaultMaxBytes), matching the
-			// WithSfMaxBytes option path. parseSizeBytes already rejects
+			// WithSfMaxSegmentBytes option path. parseSizeBytes already rejects
 			// negative and non-numeric input.
 			parsedVal, err := parseSizeBytes(v)
 			if err != nil {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a non-negative size", k, v)
 			}
-			senderConf.sfMaxBytes = parsedVal
+			senderConf.sfMaxSegmentBytes = parsedVal
 		case "sf_max_total_bytes":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -373,6 +381,15 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError("invalid %s value, %q must be a positive int (milliseconds)", k, v)
 			}
 			senderConf.authTimeoutMs = parsedVal
+		case "connect_timeout":
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := parseConnectTimeoutMillis(v)
+			if err != nil {
+				return nil, err
+			}
+			senderConf.connectTimeoutMs = parsedVal
 		case "zone":
 			if senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
@@ -566,6 +583,59 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 				return nil, NewInvalidConfigStrError(
 					"invalid %s value, %q is not a valid int (milliseconds)", k, v)
 			}
+		case "transaction":
+			// Transactional ingestion is a WebSocket-only ingress feature
+			// (Sender.java). This client does not implement it, so an
+			// explicit opt-in must fail instead of silently producing
+			// ordinary writes. Rejected on the legacy ILP transports,
+			// which never carry it.
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			switch v {
+			case "off":
+				// The default; this client has no transactional mode to
+				// disable.
+			case "on":
+				return nil, NewInvalidConfigStrError(
+					"transaction=on is not yet supported: transactional ingestion is not implemented in this client (use transaction=off)")
+			default:
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not 'on' or 'off'", k, v)
+			}
+		case "connection_listener_inbox_capacity":
+			// WebSocket-only ingress key (Sender.java). This client exposes
+			// no connection-listener inbox; accepted on QWP as a validated
+			// no-op for connect-string portability, rejected on legacy ILP.
+			if senderConf.senderType != qwpSenderType {
+				return nil, NewInvalidConfigStrError("%s is only supported for QWP senders", k)
+			}
+			parsedVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not a valid int", k, v)
+			}
+			if parsedVal < 1 {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %d: must be >= 1", k, parsedVal)
+			}
+		case "max_datagram_size", "multicast_ttl":
+			// UDP-only ingress keys (Sender.java accepts them on every
+			// transport). QWP is the WebSocket transport, where these keys
+			// never apply, so reject them on a ws:: / wss:: connect string,
+			// mirroring the egress QwpQueryClient and the protocol_version /
+			// retry_timeout rejects. On the legacy ILP transports this client
+			// has no UDP path either, so the key is inert there; the value is
+			// shape-validated so a typo still errors, and the key is accepted
+			// so a connect string shared across those transports parses.
+			if senderConf.senderType == qwpSenderType {
+				return nil, NewInvalidConfigStrError(
+					"%s is not supported for QWP; it applies to the UDP transport only", k)
+			}
+			if _, err := strconv.Atoi(v); err != nil {
+				return nil, NewInvalidConfigStrError(
+					"invalid %s value, %q is not a valid int", k, v)
+			}
 		default:
 			if senderConf.senderType == qwpSenderType && egressOnlyKeys[k] {
 				// Silently accepted on ingress so a single ws:: / wss::
@@ -693,6 +763,21 @@ func parseSizeBytes(v string) (int64, error) {
 	return n * mult, nil
 }
 
+func parseConnectTimeoutMillis(value string) (int, error) {
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 0, NewInvalidConfigStrError(
+			"invalid connect_timeout value, %q must be a positive int (milliseconds)", value)
+	}
+	const maxDurationMillis = math.MaxInt64 / int64(time.Millisecond)
+	if int64(parsed) > maxDurationMillis {
+		return 0, NewInvalidConfigStrError(
+			"invalid connect_timeout value, %q exceeds the maximum of %d milliseconds",
+			value, maxDurationMillis)
+	}
+	return parsed, nil
+}
+
 // validateSenderId enforces the same character set the Java client
 // allows for sender_id: ASCII letters, digits, '-', '_'. Matches
 // Sender.java validateSenderId (no '.', no path separators, no
@@ -725,6 +810,7 @@ func parseConfigStr(conf string) (configData, error) {
 		result = configData{
 			KeyValuePairs: map[string]string{},
 		}
+		seenKeys = map[string]bool{}
 
 		nextRune   rune
 		isEscaping bool
@@ -776,19 +862,23 @@ func parseConfigStr(conf string) (configData, error) {
 				return result, NewInvalidConfigStrError("empty value for key %q", key)
 			}
 
-			// Reject duplicate keys (case-sensitive) for parity with Rust and
-			// the per-field checks in Java; otherwise dups would silently LWW.
+			// Reject duplicate raw keys (case-sensitive) for parity with Rust
+			// and the per-field checks in Java. Deprecated aliases are
+			// canonicalized after this raw-duplicate check, so an
+			// alias/canonical pair is allowed and resolves last-write-wins.
 			// `addr` is the documented exception: the failover spec (§1)
 			// allows `addr=h1;addr=h2` as an alternative spelling of
 			// `addr=h1,h2`. Both forms accumulate into a single
 			// comma-joined value so downstream parsers see one shape.
-			keyStr := key.String()
-			if existing, exists := result.KeyValuePairs[keyStr]; exists {
-				if keyStr == "addr" {
-					result.KeyValuePairs[keyStr] = existing + "," + value.String()
-				} else {
-					return result, NewInvalidConfigStrError("duplicate key %q", keyStr)
-				}
+			rawKey := key.String()
+			if seenKeys[rawKey] && rawKey != "addr" {
+				return result, NewInvalidConfigStrError("duplicate key %q", rawKey)
+			}
+			seenKeys[rawKey] = true
+
+			keyStr := canonicalConfigKey(rawKey)
+			if existing, exists := result.KeyValuePairs[keyStr]; exists && keyStr == "addr" {
+				result.KeyValuePairs[keyStr] = existing + "," + value.String()
 			} else {
 				result.KeyValuePairs[keyStr] = value.String()
 			}
@@ -816,4 +906,15 @@ func parseConfigStr(conf string) (configData, error) {
 	}
 
 	return result, nil
+}
+
+func canonicalConfigKey(key string) string {
+	switch key {
+	case "user":
+		return "username"
+	case "pass":
+		return "password"
+	default:
+		return key
+	}
 }

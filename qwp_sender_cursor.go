@@ -98,7 +98,6 @@ func newQwpCursorLineSender(
 		autoFlushInterval: autoFlushInterval,
 		autoFlushBytes:    autoFlushBytes,
 		maxBufSize:        maxBufSize,
-		inFlightWindow:    1,
 		closeTimeout:      closeFlushTimeout,
 		cursorEngine:      cursorEngine,
 		cursorSendLoop:    cursorSendLoop,
@@ -144,9 +143,9 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	if senderId == "" {
 		senderId = qwpSfDefaultSenderId
 	}
-	sfMaxBytes := conf.sfMaxBytes
-	if sfMaxBytes <= 0 {
-		sfMaxBytes = qwpSfDefaultMaxBytes
+	sfMaxSegmentBytes := conf.sfMaxSegmentBytes
+	if sfMaxSegmentBytes <= 0 {
+		sfMaxSegmentBytes = qwpSfDefaultMaxBytes
 	}
 	sfMaxTotalBytes := conf.sfMaxTotalBytes
 	if sfMaxTotalBytes <= 0 {
@@ -155,11 +154,11 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			sfMaxTotalBytes = qwpSfDefaultMemoryMaxTotalBytes
 		}
 	}
-	if sfMaxTotalBytes < sfMaxBytes {
+	if sfMaxTotalBytes < sfMaxSegmentBytes {
 		// Caught earlier in sanitizeQwpConf, but defend in depth
 		// since defaults could in principle skew this.
-		return nil, fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_bytes (%d)",
-			sfMaxTotalBytes, sfMaxBytes)
+		return nil, fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_segment_bytes (%d)",
+			sfMaxTotalBytes, sfMaxSegmentBytes)
 	}
 	appendDeadline := time.Duration(conf.sfAppendDeadlineMillis) * time.Millisecond
 	if appendDeadline <= 0 {
@@ -193,7 +192,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 
 	// Build the cursor engine first — it owns the slot lock and on-disk
 	// recovery.
-	engine, err := qwpSfNewCursorEngine(slotPath, sfMaxBytes, sfMaxTotalBytes, appendDeadline)
+	engine, err := qwpSfNewCursorEngine(slotPath, sfMaxSegmentBytes, sfMaxTotalBytes, appendDeadline)
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +303,6 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		return nil, err
 	}
 	s.fileNameLimit = conf.fileNameLimit
-	s.encoder.gorillaDisabled = conf.gorillaDisabled
 	// Pre-size the encoder buffer for the microbatch role: the cursor
 	// engine copies each frame on append so one encoder slot suffices,
 	// but a large auto_flush_bytes warrants a bigger initial buffer to
@@ -361,7 +359,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			for _, orphan := range orphans {
 				drainer := qwpSfNewOrphanDrainer(
 					orphan,
-					sfMaxBytes, sfMaxTotalBytes,
+					sfMaxSegmentBytes, sfMaxTotalBytes,
 					factory,
 					tracker,
 					reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff,
@@ -660,7 +658,7 @@ func (s *qwpLineSender) oversizeTableError(kind qwpFrameCapKind, capVal int64, m
 			tables, msgSize, capVal, droppedRows)
 	default: // qwpFrameCapSegment
 		return fmt.Errorf(
-			"qwp: batch too large to fit one cursor segment, even split per table [oversizeTables=%v, messageSize=%d, maxFrameBytes=%d, droppedRows=%d]; send fewer rows per flush (or raise sf_max_bytes)",
+			"qwp: batch too large to fit one cursor segment, even split per table [oversizeTables=%v, messageSize=%d, maxFrameBytes=%d, droppedRows=%d]; send fewer rows per flush (or raise sf_max_segment_bytes)",
 			tables, msgSize, capVal, droppedRows)
 	}
 }

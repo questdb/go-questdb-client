@@ -37,7 +37,7 @@ import (
 // transport selection as the short forms.
 func TestConfQwpwsAlias(t *testing.T) {
 	cases := []struct {
-		schema string
+		schema  string
 		wantTLS tlsMode
 	}{
 		{"ws", tlsDisabled},
@@ -131,12 +131,12 @@ func TestConfSizeSuffix(t *testing.T) {
 func TestConfSizeSuffixRejected(t *testing.T) {
 	cases := []string{
 		"",
-		"k",       // suffix without a number
-		"abc",     // non-numeric
-		"1.5m",    // floats not supported
-		"-1",      // negative bare
-		"-1m",     // negative with suffix
-		"1xb",     // unknown suffix
+		"k",            // suffix without a number
+		"abc",          // non-numeric
+		"1.5m",         // floats not supported
+		"-1",           // negative bare
+		"-1m",          // negative with suffix
+		"1xb",          // unknown suffix
 		"1024kb extra", // trailing garbage
 	}
 	for _, in := range cases {
@@ -156,7 +156,7 @@ func TestConfSizeSuffixAppliedToKeys(t *testing.T) {
 		"max_buf_size=10m;" +
 		"auto_flush_bytes=4m;" +
 		"sf_dir=/tmp/sf;sender_id=t;" +
-		"sf_max_bytes=4m;" +
+		"sf_max_segment_bytes=4m;" +
 		"sf_max_total_bytes=1g;")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -170,8 +170,8 @@ func TestConfSizeSuffixAppliedToKeys(t *testing.T) {
 	if c.autoFlushBytes != 4<<20 {
 		t.Errorf("autoFlushBytes=%d, want %d", c.autoFlushBytes, 4<<20)
 	}
-	if c.sfMaxBytes != int64(4<<20) {
-		t.Errorf("sfMaxBytes=%d, want %d", c.sfMaxBytes, 4<<20)
+	if c.sfMaxSegmentBytes != int64(4<<20) {
+		t.Errorf("sfMaxSegmentBytes=%d, want %d", c.sfMaxSegmentBytes, 4<<20)
 	}
 	if c.sfMaxTotalBytes != int64(1<<30) {
 		t.Errorf("sfMaxTotalBytes=%d, want %d", c.sfMaxTotalBytes, 1<<30)
@@ -318,6 +318,7 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 	// interpret them, so even invalid values must pass.
 	kvs := []string{
 		"buffer_pool_size=8",
+		"client_id=dashboard",
 		"compression=zstd",
 		"compression_level=22",
 		"failover=off",
@@ -327,6 +328,9 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 		"failover_max_duration_ms=60000",
 		"initial_credit=262144",
 		"max_batch_rows=10000",
+		"path=/read/v2",
+		"replay_exec=on",
+		"server_info_timeout_ms=750",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
@@ -362,6 +366,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"auto_flush_interval=100",
 		"auto_flush_rows=1000",
 		"close_flush_timeout_millis=5000",
+		"connection_listener_inbox_capacity=64",
 		"drain_orphans=off",
 		"durable_ack_keepalive_interval_millis=200",
 		"error_inbox_capacity=256",
@@ -384,8 +389,9 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"sf_append_deadline_millis=30000",
 		"sf_dir=/tmp/sf",
 		"sf_durability=memory",
-		"sf_max_bytes=4m",
+		"sf_max_segment_bytes=4m",
 		"sf_max_total_bytes=10g",
+		"transaction=on",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
@@ -417,6 +423,55 @@ func TestConfSharedConnectString(t *testing.T) {
 	}
 	if _, err := parseQwpQueryConf(shared); err != nil {
 		t.Errorf("egress parser rejected the shared connect string: %v", err)
+	}
+}
+
+// TestConfQwpAcceptsConnectTimeout pins connect_timeout as a shared
+// QWP key. It bounds the TCP connect phase in milliseconds in both the
+// ingress sender and query client, matching the Java QWP clients.
+func TestConfQwpAcceptsConnectTimeout(t *testing.T) {
+	for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+		conf := schema + "::addr=localhost:9000;connect_timeout=2500;"
+		t.Run("ingress/"+schema, func(t *testing.T) {
+			cfg, err := confFromStr(conf)
+			if err != nil {
+				t.Fatalf("QWP ingress rejected connect_timeout: %v", err)
+			}
+			if cfg.connectTimeoutMs != 2500 {
+				t.Errorf("ingress connectTimeoutMs=%d, want 2500", cfg.connectTimeoutMs)
+			}
+		})
+		t.Run("egress/"+schema, func(t *testing.T) {
+			cfg, err := parseQwpQueryConf(conf)
+			if err != nil {
+				t.Fatalf("QWP egress rejected connect_timeout: %v", err)
+			}
+			if cfg.connectTimeoutMs != 2500 {
+				t.Errorf("egress connectTimeoutMs=%d, want 2500", cfg.connectTimeoutMs)
+			}
+		})
+	}
+}
+
+func TestConfQwpRejectsInvalidConnectTimeout(t *testing.T) {
+	for _, value := range []string{
+		"0",
+		"-1",
+		"not-an-int",
+		"9223372036855", // overflows time.Duration when converted from milliseconds
+		"9223372036854775808",
+	} {
+		conf := "ws::addr=localhost:9000;connect_timeout=" + value + ";"
+		t.Run("ingress/"+value, func(t *testing.T) {
+			if _, err := confFromStr(conf); err == nil {
+				t.Fatalf("QWP ingress accepted connect_timeout=%s", value)
+			}
+		})
+		t.Run("egress/"+value, func(t *testing.T) {
+			if _, err := parseQwpQueryConf(conf); err == nil {
+				t.Fatalf("QWP egress accepted connect_timeout=%s", value)
+			}
+		})
 	}
 }
 
@@ -459,6 +514,68 @@ func TestConfQwpRejectsWithRetryTimeoutOption(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "retry_timeout") {
 		t.Errorf("error %q does not name retry_timeout", err.Error())
+	}
+}
+
+// TestConfQwpIngressRejectsNonQwpKeys pins that the legacy ILP HTTP keys
+// absent from the QWP connect-string vocabulary (connect-string.md Key
+// index) are rejected by the QWP ingress sender. retry_timeout has its own
+// dedicated test above (with the migration-hint assertion); this covers
+// request_timeout, request_min_throughput, and a concrete protocol_version.
+func TestConfQwpIngressRejectsNonQwpKeys(t *testing.T) {
+	keys := []string{
+		"request_timeout=10000",
+		"request_min_throughput=102400",
+		"protocol_version=2",
+		"protocol_version=auto",
+	}
+	for _, kv := range keys {
+		t.Run(kv, func(t *testing.T) {
+			_, err := LineSenderFromConf(context.Background(),
+				"ws::addr=localhost:9000;"+kv+";")
+			if err == nil {
+				t.Fatalf("expected error: %q must not be accepted on QWP ingress", kv)
+			}
+		})
+	}
+}
+
+// TestConfQwpIngressAcceptsNonQwpKeysOnHttp proves the rejection is
+// schema-scoped: the same keys remain valid on the legacy ILP http:: schema.
+func TestConfQwpIngressAcceptsNonQwpKeysOnHttp(t *testing.T) {
+	keys := []string{
+		"request_timeout=10000",
+		"request_min_throughput=102400",
+		"retry_timeout=10000",
+		"protocol_version=2",
+		"protocol_version=auto",
+	}
+	for _, kv := range keys {
+		t.Run(kv, func(t *testing.T) {
+			if _, err := confFromStr("http::addr=localhost:9000;" + kv + ";"); err != nil {
+				t.Fatalf("http:: must accept %q: %v", kv, err)
+			}
+		})
+	}
+}
+
+// TestConfQwpEgressRejectsNonQwpKeys is the egress side: the QwpQueryClient
+// parser rejects the same legacy ILP keys. Unlike the ingress, the egress has
+// no protocol_version=auto pass-through, so even that value is rejected.
+func TestConfQwpEgressRejectsNonQwpKeys(t *testing.T) {
+	keys := []string{
+		"request_timeout=10000",
+		"request_min_throughput=102400",
+		"retry_timeout=10000",
+		"protocol_version=2",
+		"protocol_version=auto",
+	}
+	for _, kv := range keys {
+		t.Run(kv, func(t *testing.T) {
+			if _, err := parseQwpQueryConf("ws::addr=localhost:9000;" + kv + ";"); err == nil {
+				t.Fatalf("expected error: %q must not be accepted on QWP egress", kv)
+			}
+		})
 	}
 }
 
@@ -538,6 +655,232 @@ func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
 	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
 		t.Errorf("WithCloseTimeout(1ms): set=%v millis=%d; want set=true millis=1",
 			c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
+	}
+}
+
+// TestConfQwpIngressAcceptsExtraIngressKeys pins that the supported
+// values of ingress-only QWP keys the Java client accepts but the doc
+// Key index omits parse on the QWP ingress sender.
+func TestConfQwpIngressAcceptsExtraIngressKeys(t *testing.T) {
+	kvs := []string{
+		"transaction=off",
+		"connection_listener_inbox_capacity=1",
+		"connection_listener_inbox_capacity=64",
+	}
+	for _, kv := range kvs {
+		t.Run(kv, func(t *testing.T) {
+			conf := "ws::addr=localhost:9000;" + kv + ";"
+			if _, err := confFromStr(conf); err != nil {
+				t.Errorf("QWP ingress rejected %q: %v", kv, err)
+			}
+		})
+	}
+}
+
+// TestConfQwpIngressRejectsTransactionOn ensures callers cannot request
+// transactional ingestion and silently receive ordinary writes while
+// transactional mode remains unimplemented.
+func TestConfQwpIngressRejectsTransactionOn(t *testing.T) {
+	for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+		t.Run(schema, func(t *testing.T) {
+			_, err := confFromStr(schema + "::addr=localhost:9000;transaction=on;")
+			if err == nil {
+				t.Fatal("transaction=on must be rejected until transactional ingestion is implemented")
+			}
+			if !strings.Contains(err.Error(), "not yet supported") {
+				t.Errorf("error %q does not explain that transactional ingestion is unsupported", err)
+			}
+		})
+	}
+}
+
+// TestConfQwpRejectsUdpKeys pins that the UDP-only ingress keys
+// max_datagram_size / multicast_ttl are rejected on the QWP path by
+// BOTH clients. The unified config API drives the QWP WebSocket
+// transport, where UDP datagram knobs never apply, so a ws:: / wss::
+// connect string carrying them is surfaced as malformed -- mirroring the
+// protocol_version / retry_timeout rejects. The error names the offending
+// key and explains the UDP-only scope.
+func TestConfQwpRejectsUdpKeys(t *testing.T) {
+	for _, k := range []string{"max_datagram_size", "multicast_ttl"} {
+		kv := k + "=1400"
+		for _, schema := range []string{"ws", "wss", "qwpws", "qwpwss"} {
+			t.Run("ingress/"+schema+"/"+k, func(t *testing.T) {
+				_, err := confFromStr(schema + "::addr=localhost:9000;" + kv + ";")
+				if err == nil {
+					t.Fatalf("QWP ingress must reject %q on %s::", kv, schema)
+				}
+				msg := err.Error()
+				if !strings.Contains(msg, k) {
+					t.Errorf("error %q does not name %s", msg, k)
+				}
+				if !strings.Contains(msg, "UDP") {
+					t.Errorf("error %q does not explain the UDP-only scope", msg)
+				}
+			})
+		}
+		t.Run("egress/"+k, func(t *testing.T) {
+			if _, err := parseQwpQueryConf("ws::addr=localhost:9000;" + kv + ";"); err == nil {
+				t.Fatalf("QWP egress must reject %q", kv)
+			}
+		})
+	}
+}
+
+// TestConfUdpKeysAcceptedOnHttpAndTcp pins that the rejection is
+// QWP-scoped: on the legacy ILP transports this client has no UDP path
+// either, so max_datagram_size / multicast_ttl stay inert validated
+// no-ops -- a valid value parses, and a malformed one still errors via
+// the shape check.
+func TestConfUdpKeysAcceptedOnHttpAndTcp(t *testing.T) {
+	for _, schema := range []string{"http", "https", "tcp", "tcps"} {
+		for _, kv := range []string{"max_datagram_size=1400", "multicast_ttl=1"} {
+			t.Run("accept/"+schema+"/"+kv, func(t *testing.T) {
+				if _, err := confFromStr(schema + "::addr=localhost:9000;" + kv + ";"); err != nil {
+					t.Errorf("%s:: must accept %q: %v", schema, kv, err)
+				}
+			})
+		}
+		t.Run("rejectMalformed/"+schema, func(t *testing.T) {
+			if _, err := confFromStr(schema + "::addr=localhost:9000;max_datagram_size=abc;"); err == nil {
+				t.Errorf("%s:: must reject a non-int max_datagram_size", schema)
+			}
+		})
+	}
+}
+
+// TestConfTransactionRejectedOnHttpAndTcp pins the Java gating
+// (Sender.java: "transaction is only supported for WebSocket
+// transport"). transaction and connection_listener_inbox_capacity are
+// WebSocket-only ingress keys; the legacy ILP transports never carry
+// them, so the parser rejects them there.
+func TestConfTransactionRejectedOnHttpAndTcp(t *testing.T) {
+	for _, kv := range []string{"transaction=on", "connection_listener_inbox_capacity=64"} {
+		for _, schema := range []string{"http", "tcp"} {
+			t.Run(schema+"/"+kv, func(t *testing.T) {
+				_, err := confFromStr(schema + "::addr=localhost:9000;" + kv + ";")
+				if err == nil {
+					t.Fatalf("%s:: must reject %q", schema, kv)
+				}
+				if !strings.Contains(err.Error(), "only supported for QWP") {
+					t.Errorf("error %q does not explain the QWP-only gating", err.Error())
+				}
+			})
+		}
+	}
+}
+
+func TestConfQwpIngressRejectsInvalidConnectionListenerInboxCapacity(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		_, err := confFromStr(
+			"ws::addr=localhost:9000;connection_listener_inbox_capacity=" + value + ";")
+		if err == nil {
+			t.Fatalf("connection_listener_inbox_capacity=%s must be rejected", value)
+		}
+		if !strings.Contains(err.Error(), "must be >= 1") {
+			t.Errorf("error %q does not report the >= 1 requirement", err)
+		}
+	}
+}
+
+// TestConfQwpRejectsTokenXY pins that the TCP ILP public-key auth keys
+// token_x / token_y are rejected on the QWP path by BOTH clients. They
+// are absent from the QWP connect-string vocabulary; the egress parser
+// already rejected them, and the ingress parser now matches so the two
+// QWP clients treat a shared string symmetrically. The legacy ILP
+// transports still accept (and ignore) them — covered by the TCP case
+// in conf_test.go.
+func TestConfQwpRejectsTokenXY(t *testing.T) {
+	for _, kv := range []string{"token_x=xyz", "token_y=xyz"} {
+		t.Run("ingress/"+kv, func(t *testing.T) {
+			if _, err := confFromStr("ws::addr=localhost:9000;" + kv + ";"); err == nil {
+				t.Fatalf("QWP ingress must reject %q", kv)
+			}
+		})
+		t.Run("egress/"+kv, func(t *testing.T) {
+			if _, err := parseQwpQueryConf("ws::addr=localhost:9000;" + kv + ";"); err == nil {
+				t.Fatalf("QWP egress must reject %q", kv)
+			}
+		})
+	}
+	// The same keys remain accepted (and ignored) on the legacy ILP tcp:: schema.
+	if _, err := confFromStr("tcp::addr=localhost:9000;username=u;token=t;token_x=xyz;token_y=xyz;"); err != nil {
+		t.Errorf("tcp:: must still accept token_x/token_y: %v", err)
+	}
+}
+
+// TestConfUserPassAliases pins user / pass as the deprecated aliases of
+// username / password (Sender.java). Both QWP directions interpret them
+// as Basic Auth credentials so a shared connect string behaves the same
+// for ingestion and queries.
+func TestConfUserPassAliases(t *testing.T) {
+	conf := "ws::addr=localhost:9000;user=alice;pass=secret;"
+
+	c, err := confFromStr(conf)
+	if err != nil {
+		t.Fatalf("ingress rejected user/pass aliases: %v", err)
+	}
+	if c.httpUser != "alice" {
+		t.Errorf("httpUser=%q, want %q", c.httpUser, "alice")
+	}
+	if c.httpPass != "secret" {
+		t.Errorf("httpPass=%q, want %q", c.httpPass, "secret")
+	}
+
+	q, err := parseQwpQueryConf(conf)
+	if err != nil {
+		t.Fatalf("egress rejected user/pass aliases: %v", err)
+	}
+	if q.httpUser != "alice" {
+		t.Errorf("egress httpUser=%q, want %q", q.httpUser, "alice")
+	}
+	if q.httpPass != "secret" {
+		t.Errorf("egress httpPass=%q, want %q", q.httpPass, "secret")
+	}
+}
+
+// TestConfAuthAliasesAreCanonicalizedLastWriteWins ensures conflicting
+// deprecated aliases cannot make authentication depend on Go's
+// randomized map iteration order. Both spellings canonicalize to the
+// same key as the string is parsed, so the last value wins like Java's
+// ConfigView.
+func TestConfAuthAliasesAreCanonicalizedLastWriteWins(t *testing.T) {
+	configs := []struct {
+		conf     string
+		wantUser string
+		wantPass string
+	}{
+		{
+			conf:     "ws::addr=localhost:9000;user=alias-user;pass=alias-pass;username=canonical-user;password=canonical-pass;",
+			wantUser: "canonical-user",
+			wantPass: "canonical-pass",
+		},
+		{
+			conf:     "ws::addr=localhost:9000;username=canonical-user;password=canonical-pass;user=alias-user;pass=alias-pass;",
+			wantUser: "alias-user",
+			wantPass: "alias-pass",
+		},
+	}
+	for _, tc := range configs {
+		for i := 0; i < 2000; i++ {
+			ingress, err := confFromStr(tc.conf)
+			if err != nil {
+				t.Fatalf("ingress parse: %v", err)
+			}
+			if ingress.httpUser != tc.wantUser || ingress.httpPass != tc.wantPass {
+				t.Fatalf("ingress iteration %d selected credentials %q/%q, want %s/%s",
+					i, ingress.httpUser, ingress.httpPass, tc.wantUser, tc.wantPass)
+			}
+
+			egress, err := parseQwpQueryConf(tc.conf)
+			if err != nil {
+				t.Fatalf("egress parse: %v", err)
+			}
+			if egress.httpUser != tc.wantUser || egress.httpPass != tc.wantPass {
+				t.Fatalf("egress iteration %d selected credentials %q/%q, want %s/%s",
+					i, egress.httpUser, egress.httpPass, tc.wantUser, tc.wantPass)
+			}
+		}
 	}
 }
 

@@ -280,13 +280,6 @@ func WithQwpQueryEndpointPath(path string) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.endpointPath = path }
 }
 
-// WithQwpQueryAuth sets the raw Authorization HTTP header value sent
-// on the WebSocket upgrade. Mutually exclusive with
-// WithQwpQueryBasicAuth and WithQwpQueryBearerToken.
-func WithQwpQueryAuth(authHeader string) QwpQueryClientOption {
-	return func(c *qwpQueryClientConfig) { c.authorization = authHeader }
-}
-
 // WithQwpQueryBasicAuth enables HTTP Basic authentication. The server
 // validates against the same user store that the Postgres wire
 // protocol uses — a user created via CREATE USER ... WITH PASSWORD ...
@@ -448,6 +441,17 @@ func WithQwpQueryZone(zone string) QwpQueryClientOption {
 func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) {
 		c.authTimeoutMs = int(d.Milliseconds())
+	}
+}
+
+// WithQwpQueryConnectTimeout bounds each TCP connect attempt. It does
+// not cover the TLS handshake, WebSocket upgrade-response read (see
+// WithQwpQueryAuthTimeout), or SERVER_INFO read. Zero leaves the
+// connect bounded by the operating system; negative durations are
+// rejected by validate().
+func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
+	return func(c *qwpQueryClientConfig) {
+		c.connectTimeoutMs = int(d.Milliseconds())
 	}
 }
 
@@ -715,12 +719,9 @@ func probeZstdAvailable() error {
 }
 
 // effectiveAuthorization computes the Authorization header value
-// from the config, resolving the three mutually-exclusive auth modes
+// from the config, resolving the two mutually-exclusive auth modes
 // into a single header string.
 func (c *qwpQueryClientConfig) effectiveAuthorization() string {
-	if c.authorization != "" {
-		return c.authorization
-	}
 	if c.httpUser != "" && c.httpPass != "" {
 		creds := c.httpUser + ":" + c.httpPass
 		return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
