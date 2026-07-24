@@ -104,7 +104,7 @@ var ingressOnlyKeys = map[string]bool{
 	"sf_append_deadline_millis":             true,
 	"sf_dir":                                true,
 	"sf_durability":                         true,
-	"sf_max_segment_bytes":                          true,
+	"sf_max_segment_bytes":                  true,
 	"sf_max_total_bytes":                    true,
 	"transaction":                           true,
 }

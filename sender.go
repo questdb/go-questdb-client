@@ -383,7 +383,7 @@ type lineSenderConfig struct {
 	// loop.
 	sfDir                         string
 	senderId                      string // empty -> "default" at construction
-	sfMaxSegmentBytes                    int64  // per-segment size (bytes); 0 -> 4 MiB
+	sfMaxSegmentBytes             int64  // per-segment size (bytes); 0 -> 4 MiB
 	sfMaxTotalBytes               int64  // total cap (bytes); 0 -> 10 GiB
 	sfDurability                  string // empty / "memory" only; reserved future "flush" / "append"
 	sfAppendDeadlineMillis        int    // 0 -> 30000
