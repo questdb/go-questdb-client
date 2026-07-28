@@ -451,6 +451,13 @@ func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
 // rejected by validate().
 func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) {
+		if d < 0 {
+			// A sub-millisecond negative truncates to 0 under
+			// d.Milliseconds() and would read as the zero (OS-default)
+			// case, so map every negative to a value validate() rejects.
+			c.connectTimeoutMs = -1
+			return
+		}
 		c.connectTimeoutMs = int(d.Milliseconds())
 	}
 }

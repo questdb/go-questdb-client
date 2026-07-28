@@ -2550,3 +2550,30 @@ func TestQwpSenderObservabilityCounters(t *testing.T) {
 		t.Fatalf("BackgroundDrainers after clean flush = %v, want nil", got)
 	}
 }
+
+// TestQwpConnectTimeoutNegative pins that a negative duration keeps
+// connectTimeoutMs negative so sanitizeQwpConf rejects it. A
+// sub-millisecond negative truncates to 0 under d/time.Millisecond and
+// would otherwise read as the valid zero (OS-default) case, bypassing
+// the construction-time check.
+func TestQwpConnectTimeoutNegative(t *testing.T) {
+	for _, d := range []time.Duration{
+		-500 * time.Microsecond, // truncates to 0 ms
+		-1 * time.Nanosecond,    // truncates to 0 ms
+		-5 * time.Millisecond,   // already negative in ms
+	} {
+		cfg := newLineSenderConfig(qwpSenderType)
+		WithConnectTimeout(d)(cfg)
+		if cfg.connectTimeoutMs >= 0 {
+			t.Errorf("connectTimeoutMs=%d for d=%v, want negative so sanitizeQwpConf rejects it",
+				cfg.connectTimeoutMs, d)
+		}
+	}
+
+	// A zero duration stays the valid zero (OS-default) case.
+	cfg := newLineSenderConfig(qwpSenderType)
+	WithConnectTimeout(0)(cfg)
+	if cfg.connectTimeoutMs != 0 {
+		t.Errorf("connectTimeoutMs=%d for a zero duration, want 0", cfg.connectTimeoutMs)
+	}
+}

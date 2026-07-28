@@ -699,6 +699,13 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 // Only available for the QWP sender.
 func WithConnectTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
+		if d < 0 {
+			// A sub-millisecond negative truncates to 0 and would read
+			// as the zero (OS-default) case, so map every negative to a
+			// value the construction-time check rejects.
+			s.connectTimeoutMs = -1
+			return
+		}
 		s.connectTimeoutMs = int(d / time.Millisecond)
 	}
 }

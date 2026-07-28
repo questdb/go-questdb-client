@@ -759,6 +759,32 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 	}
 }
 
+// TestQwpQueryConnectTimeoutNegative pins that a negative duration keeps
+// connectTimeoutMs negative so validate() rejects it. A sub-millisecond
+// negative truncates to 0 under d.Milliseconds() and would otherwise read
+// as the valid zero (OS-default) case, bypassing validation.
+func TestQwpQueryConnectTimeoutNegative(t *testing.T) {
+	for _, d := range []time.Duration{
+		-500 * time.Microsecond, // truncates to 0 ms
+		-1 * time.Nanosecond,    // truncates to 0 ms
+		-5 * time.Millisecond,   // already negative in ms
+	} {
+		cfg := qwpQueryDefaultConfig()
+		WithQwpQueryConnectTimeout(d)(cfg)
+		if cfg.connectTimeoutMs >= 0 {
+			t.Errorf("connectTimeoutMs=%d for d=%v, want negative so validate() rejects it",
+				cfg.connectTimeoutMs, d)
+		}
+	}
+
+	// A zero duration stays the valid zero (OS-default) case.
+	cfg := qwpQueryDefaultConfig()
+	WithQwpQueryConnectTimeout(0)(cfg)
+	if cfg.connectTimeoutMs != 0 {
+		t.Errorf("connectTimeoutMs=%d for a zero duration, want 0", cfg.connectTimeoutMs)
+	}
+}
+
 // --- Mock server integration tests for the public API ---
 
 // newMockQueryClient stands up the egress mock server, dials it with a
