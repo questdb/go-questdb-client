@@ -165,8 +165,9 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 		switch k {
 		case "addr":
 			senderConf.address = v
-		case "username", "user":
-			// user is the deprecated alias of username (Sender.java).
+		case "username":
+			// The `user` alias is canonicalized to `username` by
+			// parseConfigStr, so this case handles both spellings.
 			switch senderConf.senderType {
 			case httpSenderType, qwpSenderType:
 				senderConf.httpUser = v
@@ -175,8 +176,9 @@ func confFromStr(conf string) (*lineSenderConfig, error) {
 			default:
 				panic("add a case for " + k)
 			}
-		case "password", "pass":
-			// pass is the deprecated alias of password (Sender.java).
+		case "password":
+			// The `pass` alias is canonicalized to `password` by
+			// parseConfigStr, so this case handles both spellings.
 			if senderConf.senderType != httpSenderType && senderConf.senderType != qwpSenderType {
 				return nil, NewInvalidConfigStrError("%s is only supported for HTTP and QWP senders", k)
 			}
