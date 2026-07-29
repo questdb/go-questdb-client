@@ -360,11 +360,6 @@ type qwpLineSender struct {
 	// Maximum length for table and column names.
 	fileNameLimit int
 
-	// inFlightWindow is retained as a config knob for backwards
-	// compat but is a no-op in cursor mode — the engine handles
-	// concurrency via its own backpressure model.
-	inFlightWindow int
-
 	// cursorEngine + cursorSendLoop are set on every sender. The
 	// engine is memory-backed when sf_dir is empty and disk-backed
 	// otherwise. The send loop owns the WebSocket connection;
@@ -393,15 +388,12 @@ type qwpLineSender struct {
 // newQwpLineSender creates a new QWP sender backed by an
 // in-memory cursor engine. The send loop establishes the
 // WebSocket connection synchronously; on failure, the constructor
-// returns the dial / upgrade error directly. inFlightWindow is
-// accepted for backwards compatibility but is a no-op (the cursor
-// engine handles concurrency via its own backpressure model). If
-// dumpWriter is non-nil, outgoing bytes are recorded across every
-// transport instance the send loop creates (initial connect plus
-// reconnects).
-func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
+// returns the dial / upgrade error directly. If dumpWriter is
+// non-nil, outgoing bytes are recorded across every transport
+// instance the send loop creates (initial connect plus reconnects).
+func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer) (*qwpLineSender, error) {
 	s, err := newQwpLineSenderUnstarted(ctx, address, opts,
-		autoFlushRows, autoFlushInterval, dumpWriter, inFlightWindow...)
+		autoFlushRows, autoFlushInterval, dumpWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -416,12 +408,7 @@ func newQwpLineSender(ctx context.Context, address string, opts qwpTransportOpts
 // the very first received frame races against the post-construction
 // setters and could be classified with the default resolver / handled
 // by the default handler instead of the user-configured ones.
-func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTransportOpts, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer, inFlightWindow ...int) (*qwpLineSender, error) {
-	window := 1
-	if len(inFlightWindow) > 0 && inFlightWindow[0] > 1 {
-		window = inFlightWindow[0]
-	}
-
+func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTransportOpts, autoFlushRows int, autoFlushInterval time.Duration, dumpWriter io.Writer) (*qwpLineSender, error) {
 	s := &qwpLineSender{
 		tableBuffers:      make(map[string]*qwpTableBuffer),
 		globalSymbols:     make(map[string]int32),
@@ -429,7 +416,6 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 		batchMaxSymbolId:  -1,
 		autoFlushRows:     autoFlushRows,
 		autoFlushInterval: autoFlushInterval,
-		inFlightWindow:    window,
 		closeTimeout:      5 * time.Second,
 	}
 	s.encoder.wb.preallocate(qwpDefaultMicrobatchBufSize)

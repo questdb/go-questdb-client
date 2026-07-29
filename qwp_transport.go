@@ -156,6 +156,10 @@ type qwpTransportOpts struct {
 	// pre-failover-spec behavior; sanitizeQwpConf seeds 15000 for
 	// QWP-configured callers.
 	authTimeoutMs int
+
+	// connectTimeoutMs, when > 0, bounds the TCP connect phase. Zero
+	// leaves the connect bounded by the OS.
+	connectTimeoutMs int
 }
 
 // qwpTransport wraps a WebSocket connection for sending QWP
@@ -349,6 +353,12 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	}
 	if opts.authTimeoutMs > 0 {
 		httpTransport.ResponseHeaderTimeout = time.Duration(opts.authTimeoutMs) * time.Millisecond
+	}
+	if opts.connectTimeoutMs > 0 {
+		dialer := &net.Dialer{
+			Timeout: time.Duration(opts.connectTimeoutMs) * time.Millisecond,
+		}
+		httpTransport.DialContext = dialer.DialContext
 	}
 
 	if t.dumpWriter != nil {

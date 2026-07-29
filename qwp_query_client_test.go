@@ -141,18 +141,6 @@ func TestQwpQueryClientFromConfHappyPath(t *testing.T) {
 			},
 		},
 		{
-			name: "auth_header",
-			conf: "ws::addr=a:1;auth=Bearer abc;",
-			chk: func(t *testing.T, c *qwpQueryClientConfig) {
-				if c.authorization != "Bearer abc" {
-					t.Errorf("authorization=%q", c.authorization)
-				}
-				if got := c.effectiveAuthorization(); got != "Bearer abc" {
-					t.Errorf("effectiveAuthorization=%q", got)
-				}
-			},
-		},
-		{
 			name: "bearer_token",
 			conf: "ws::addr=a:1;token=xyz;",
 			chk: func(t *testing.T, c *qwpQueryClientConfig) {
@@ -246,8 +234,9 @@ func TestQwpQueryClientFromConfErrors(t *testing.T) {
 		{"buffer_pool_zero", "ws::addr=a:1;buffer_pool_size=0;", "buffer pool size must be >= 1"},
 		{"max_batch_rows_negative", "ws::addr=a:1;max_batch_rows=-1;", "max batch rows must be >= 0"},
 		{"max_batch_rows_too_big", "ws::addr=a:1;max_batch_rows=99999999;", "exceeds client cap"},
-		{"mutually_exclusive_auth", "ws::addr=a:1;auth=X;token=Y;", "mutually exclusive"},
+		{"mutually_exclusive_basic_token", "ws::addr=a:1;username=u;password=p;token=Y;", "mutually exclusive"},
 		{"basic_missing_password", "ws::addr=a:1;username=u;", "both username and password"},
+		{"auth_key_removed", "ws::addr=a:1;auth=Bearer abc;", "unsupported option"},
 		{"unknown_key", "ws::addr=a:1;weird=1;", "unsupported option"},
 		{"tls_on_ws", "ws::addr=a:1;tls_verify=on;", "tls_verify requires"},
 		{"tls_bad", "wss::addr=a:1;tls_verify=off;", "invalid tls_verify"},
@@ -725,6 +714,7 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 		WithQwpQueryCompression(qwpCompressionZstd),
 		WithQwpQueryCompressionLevel(9),
 		WithQwpQueryFailoverMaxDuration(7 * time.Second),
+		WithQwpQueryConnectTimeout(3 * time.Second),
 	} {
 		opt(cfg)
 	}
@@ -763,6 +753,35 @@ func TestQwpQueryClientOptionsApply(t *testing.T) {
 	}
 	if cfg.failoverMaxDuration != 7*time.Second {
 		t.Errorf("failoverMaxDuration=%v, want 7s", cfg.failoverMaxDuration)
+	}
+	if cfg.connectTimeoutMs != 3000 {
+		t.Errorf("connectTimeoutMs=%d, want 3000", cfg.connectTimeoutMs)
+	}
+}
+
+// TestQwpQueryConnectTimeoutNegative pins that a negative duration keeps
+// connectTimeoutMs negative so validate() rejects it. A sub-millisecond
+// negative truncates to 0 under d.Milliseconds() and would otherwise read
+// as the valid zero (OS-default) case, bypassing validation.
+func TestQwpQueryConnectTimeoutNegative(t *testing.T) {
+	for _, d := range []time.Duration{
+		-500 * time.Microsecond, // truncates to 0 ms
+		-1 * time.Nanosecond,    // truncates to 0 ms
+		-5 * time.Millisecond,   // already negative in ms
+	} {
+		cfg := qwpQueryDefaultConfig()
+		WithQwpQueryConnectTimeout(d)(cfg)
+		if cfg.connectTimeoutMs >= 0 {
+			t.Errorf("connectTimeoutMs=%d for d=%v, want negative so validate() rejects it",
+				cfg.connectTimeoutMs, d)
+		}
+	}
+
+	// A zero duration stays the valid zero (OS-default) case.
+	cfg := qwpQueryDefaultConfig()
+	WithQwpQueryConnectTimeout(0)(cfg)
+	if cfg.connectTimeoutMs != 0 {
+		t.Errorf("connectTimeoutMs=%d for a zero duration, want 0", cfg.connectTimeoutMs)
 	}
 }
 
