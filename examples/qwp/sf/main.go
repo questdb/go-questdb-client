@@ -42,7 +42,7 @@ func main() {
 	// sf_dir is the SF group root — one or more sender instances can
 	// share it, each living under <sf_dir>/<sender_id>/.
 	//   sender_id          : per-sender slot name (default "default")
-	//   sf_max_bytes       : per-segment file size (default 4 MiB)
+	//   sf_max_segment_bytes       : per-segment file size (default 4 MiB)
 	//   sf_max_total_bytes : disk cap for THIS sender's slot (default 10 GiB)
 	//   close_flush_timeout_millis : how long Close() waits for ACKs
 	//                                before proceeding (default 5000;
@@ -52,7 +52,7 @@ func main() {
 	conf := "ws::addr=localhost:9000;" +
 		"sf_dir=/var/lib/questdb-sf;" +
 		"sender_id=trades-feed;" +
-		"sf_max_bytes=8388608;" +
+		"sf_max_segment_bytes=8388608;" +
 		"sf_max_total_bytes=1073741824;" + // 1 GiB
 		"close_flush_timeout_millis=5000;" +
 		"drain_orphans=on;"

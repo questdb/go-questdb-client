@@ -17,7 +17,8 @@ Go client library for QuestDB ingestion. Three transports:
 
 Module path: `github.com/questdb/go-questdb-client/v4` — the `/v4` segment is
 load-bearing when importing within this repo. Minimum Go: 1.23 (go.mod pins
-`go 1.23` with a `1.24.4` toolchain).
+`go 1.23` with no `toolchain` directive; CI's `1.23.x`/`1.24.x` matrix runs
+under `GOTOOLCHAIN=local`).
 
 ## Commands
 
@@ -153,23 +154,6 @@ write-ahead persists a frame's new symbols before publishing it; a host-crash
 tear (frame delta start > recovered dict size) is caught pre-send by the
 **torn-dict guard**, a terminal `PROTOCOL_VIOLATION` ("resend required").
 
-`WithInFlightWindow(n)` / `in_flight_window=n` is **retained but a no-op** in
-the cursor architecture — backpressure is governed by the engine's segment-ring
-+ `engineAppendBlocking` deadline.
-
-### Java-parity QWP knobs (not in connect-string.md)
-
-These connect-string keys are recognised by the Java client
-(`Sender.java`) but are not listed in the
-[native-client spec](https://github.com/questdb/questdb-enterprise/blob/main/questdb/docs/qwp/connect-string.md).
-We accept them for Java-parity portability — a connect string that
-works on the Java client must work here. None should ever be
-considered for removal without a matching change in Java:
-
-- `gorilla=on|off` — gates the Gorilla timestamp encoding in
-  `qwp_encoder.go` (FLAG_GORILLA). Default `on`.
-- `in_flight_window=N` — see the "retained but a no-op" note above.
-
 `close_timeout=N` (millisecond integer) was a v4.0–v4.5 Go-only key
 for the memory-mode close path. The cursor architecture unified
 memory and SF onto `close_flush_timeout_millis`, which the spec
@@ -210,7 +194,7 @@ Orphan-slot adoption (SF mode, `drain_orphans=on`) is implemented in
 `qwp_sf_orphan.go` + `qwp_sf_drainer.go` + `qwp_sf_round_walk.go`; drainers run
 in dedicated goroutines and are visible via `QwpSender.BackgroundDrainers()`.
 
-### Error handling (NACK policy v2 — no drop, no lists, no dead senders)
+### Error handling (no drop, no lists, no dead senders)
 
 QWP server rejections surface as `*SenderError` (`sender_error.go` is canonical
 for categories + policy enum). Two paths: async callback registered via
@@ -294,10 +278,6 @@ over the generic `qwpDispatcher[T]` (`qwp_dispatcher.go`).
 
 QWP unit tests use `httptest.Server` to stand in for the QuestDB WebSocket
 endpoint (`newQwpTestServer` in `qwp_sender_test.go`). ILP unit tests are pure.
-
-`*_integration_test.go` files need Docker — they spin up real QuestDB via
-testcontainers-go; HTTP/TCP suites sometimes launch haproxy via
-`test/haproxy.cfg`.
 
 Cross-language conformance: `interop_test.go` +
 `test/interop/questdb-client-test` (submodule) — ILP vectors shared across

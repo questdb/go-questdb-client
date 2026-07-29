@@ -672,7 +672,7 @@ func TestQwpDurableAckEndToEndProgression(t *testing.T) {
 }
 
 // TestQwpDurableAckRejectionNeverAdvancesWatermark pins Hazard D at the
-// send-loop level under NACK policy v2: a rejection in durable mode never
+// send-loop level under the NACK policy: a rejection in durable mode never
 // enqueues anything on the durable tracker and never advances the watermark
 // — the connection recycles and the rejected frame replays behind the
 // still-pending OK batch, releasing only once the covering durable ack

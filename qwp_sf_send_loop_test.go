@@ -1814,7 +1814,7 @@ func TestQwpSfSendLoopReceiverClampsForgedAckToFullySent(t *testing.T) {
 
 	t.Run("error ACK never advances the watermark", func(t *testing.T) {
 		// A rejection — forged or genuine — never advances ackedFsn
-		// under NACK policy v2: a retriable NACK recycles the
+		// under the NACK policy: a retriable NACK recycles the
 		// connection and replays; the clamp only bounds the FSN named
 		// in the error report.
 		srv := newQwpSfTestServer(t, qwpSfTestServerOpts{

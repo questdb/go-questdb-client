@@ -373,16 +373,14 @@ type lineSenderConfig struct {
 	// autoFlushBytesSet records whether the user explicitly set
 	// auto_flush_bytes (vs. the seeded qwpDefaultAutoFlushBytes).
 	// sanitizeQwpConf uses it to reject only a user-written
-	// auto_flush_bytes > sf_max_bytes contradiction; a defaulted trigger
+	// auto_flush_bytes > sf_max_segment_bytes contradiction; a defaulted trigger
 	// over a smaller user-chosen segment is left for the runtime clamp.
 	autoFlushBytesSet bool
 
 	protocolVersion protocolVersion
 
 	// QWP-specific fields
-	inFlightWindow  int       // retained for config compatibility; a no-op in the cursor architecture (see WithInFlightWindow). Seeded to qwpDefaultInFlightWindow by newLineSenderConfig
-	dumpWriter      io.Writer // if set, record outgoing bytes (unexported)
-	gorillaDisabled bool      // false (default) = Gorilla timestamp encoding enabled
+	dumpWriter io.Writer // if set, record outgoing bytes (unexported)
 
 	// QWP store-and-forward (cursor) fields. Setting sfDir selects
 	// disk-backed segments: flushed batches are persisted to mmap'd
@@ -392,7 +390,7 @@ type lineSenderConfig struct {
 	// loop.
 	sfDir                         string
 	senderId                      string // empty -> "default" at construction
-	sfMaxBytes                    int64  // per-segment size (bytes); 0 -> 4 MiB
+	sfMaxSegmentBytes             int64  // per-segment size (bytes); 0 -> 4 MiB
 	sfMaxTotalBytes               int64  // total cap (bytes); 0 -> 10 GiB
 	sfDurability                  string // empty / "memory" only; reserved future "flush" / "append"
 	sfAppendDeadlineMillis        int    // 0 -> 30000
@@ -471,24 +469,6 @@ func WithTcp() LineSenderOption {
 func WithQwp() LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.senderType = qwpSenderType
-	}
-}
-
-// WithInFlightWindow is retained for backward compatibility but is a
-// no-op. In the QWP cursor architecture, backpressure is governed by
-// the engine's segment ring and the append deadline, not by a fixed
-// in-flight batch count. Flush never waits for the server ACK, so
-// there is no synchronous mode to opt into. Connect strings carrying
-// in_flight_window still parse; the value is ignored.
-//
-// Only available for the QWP sender.
-//
-// Deprecated: the in-flight window has no effect and there is no
-// replacement — backpressure is automatic. To confirm server ACKs,
-// pair FlushAndGetSequence with AwaitAckedFsn.
-func WithInFlightWindow(window int) LineSenderOption {
-	return func(s *lineSenderConfig) {
-		s.inFlightWindow = window
 	}
 }
 
@@ -693,14 +673,14 @@ func WithSenderId(id string) LineSenderOption {
 	}
 }
 
-// WithSfMaxBytes sets the per-segment cap (bytes) for the cursor
+// WithSfMaxSegmentBytes sets the per-segment cap (bytes) for the cursor
 // engine. Defaults to 4 MiB. Lower values rotate segments more
 // aggressively; higher values amortize the rotation overhead.
 //
 // Only available for the QWP sender.
-func WithSfMaxBytes(n int64) LineSenderOption {
+func WithSfMaxSegmentBytes(n int64) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.sfMaxBytes = n
+		s.sfMaxSegmentBytes = n
 	}
 }
 
@@ -831,19 +811,6 @@ func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
 	}
 }
 
-// WithGorilla enables or disables Gorilla delta-of-delta encoding for
-// timestamp columns. Defaults to enabled. When disabled, FLAG_GORILLA
-// is cleared on every message and timestamp columns are sent as raw
-// int64 little-endian values with no encoding-flag prefix.
-//
-// Mirrors QwpWebSocketSender.setGorillaEnabled in the Java client
-// (default true there as well). Only available for the QWP sender.
-func WithGorilla(enabled bool) LineSenderOption {
-	return func(s *lineSenderConfig) {
-		s.gorillaDisabled = !enabled
-	}
-}
-
 // WithQwpDumpWriter returns an option that records all outgoing TCP
 // bytes to w. When no server address is configured, an in-process
 // fake WebSocket acceptor is used so the dump includes the full HTTP
@@ -873,13 +840,20 @@ func WithAuthTimeout(d time.Duration) LineSenderOption {
 // black-holed or firewalled host is abandoned within d instead of riding the
 // much longer OS connect timeout. The QWP upgrade response and TLS handshake
 // (wss) are bounded separately by WithAuthTimeout, which always has a value
-// (default 15s) — to tighten the handshake, set WithAuthTimeout too. A
-// zero or negative duration keeps the OS connect timeout. Honoured by the HTTP
-// and QWP senders; accepted but inert on TCP, and ignored when a custom
-// http.Transport is supplied (that transport is the caller's to configure).
-// Equivalent to the connect-string connect_timeout key.
+// (default 15s) — to tighten the handshake, set WithAuthTimeout too. Zero keeps
+// the OS connect timeout; negative durations are rejected at construction.
+// Honoured by the HTTP and QWP senders; accepted but inert on TCP, and ignored
+// when a custom http.Transport is supplied (that transport is the caller's to
+// configure). Equivalent to the connect-string connect_timeout key.
 func WithConnectTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
+		if d < 0 {
+			// A sub-millisecond negative truncates to 0 and would read as the
+			// zero (OS-default) case, so map every negative to a value the
+			// construction-time check rejects.
+			s.connectTimeoutMs = -1
+			return
+		}
 		ms := int(d / time.Millisecond)
 		// A positive sub-millisecond budget must not truncate to 0, which means
 		// "keep the OS default" — floor it to 1ms so a tight budget stays tight.
@@ -1381,7 +1355,6 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			autoFlushRows:     qwpDefaultAutoFlushRows,
 			autoFlushInterval: qwpDefaultAutoFlushInterval,
 			autoFlushBytes:    qwpDefaultAutoFlushBytes,
-			inFlightWindow:    qwpDefaultInFlightWindow,
 			initBufSize:       defaultInitBufferSize,
 			maxBufSize:        defaultMaxBufferSize,
 			fileNameLimit:     defaultFileNameLimit,
@@ -1504,9 +1477,6 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	if (conf.httpUser != "" || conf.httpPass != "") && conf.httpToken != "" {
 		return errors.New("both basic and token authentication cannot be used")
 	}
-	if conf.inFlightWindow < 0 {
-		return fmt.Errorf("in-flight window is negative: %d", conf.inFlightWindow)
-	}
 	if conf.protocolVersion != protocolVersionUnset {
 		return errors.New("protocol_version setting is not available in the QWP client")
 	}
@@ -1525,6 +1495,9 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	}
 	if conf.authTimeoutMs <= 0 {
 		conf.authTimeoutMs = 15_000
+	}
+	if conf.connectTimeoutMs < 0 {
+		return errors.New("connect_timeout must be >= 0")
 	}
 	// Implicit promotion of initial_connect_retry. When the user tuned
 	// any reconnect_* knob but did not pick an initial-connect mode,
@@ -1551,8 +1524,8 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 		if conf.senderId != "" {
 			return errors.New("sender_id requires sf_dir to be set")
 		}
-		if conf.sfMaxBytes != 0 || conf.sfMaxTotalBytes != 0 || conf.sfDurability != "" || conf.sfAppendDeadlineMillis != 0 {
-			return errors.New("sf_max_bytes / sf_max_total_bytes / sf_durability / sf_append_deadline_millis require sf_dir to be set")
+		if conf.sfMaxSegmentBytes != 0 || conf.sfMaxTotalBytes != 0 || conf.sfDurability != "" || conf.sfAppendDeadlineMillis != 0 {
+			return errors.New("sf_max_segment_bytes / sf_max_total_bytes / sf_durability / sf_append_deadline_millis require sf_dir to be set")
 		}
 		if conf.drainOrphans || conf.maxBackgroundDrainers != 0 {
 			return errors.New("drain_orphans / max_background_drainers require sf_dir to be set")
@@ -1582,31 +1555,31 @@ func sanitizeQwpConf(conf *lineSenderConfig) error {
 	// 0 is the use-default sentinel for both (resolved to
 	// qwpSfDefaultMaxBytes / qwpSfDefaultMaxTotalBytes at construction),
 	// so only a negative value is rejected here.
-	if conf.sfMaxBytes < 0 {
-		return fmt.Errorf("sf_max_bytes must be >= 0: %d", conf.sfMaxBytes)
+	if conf.sfMaxSegmentBytes < 0 {
+		return fmt.Errorf("sf_max_segment_bytes must be >= 0: %d", conf.sfMaxSegmentBytes)
 	}
 	if conf.sfMaxTotalBytes < 0 {
 		return fmt.Errorf("sf_max_total_bytes must be >= 0: %d", conf.sfMaxTotalBytes)
 	}
-	if conf.sfMaxBytes > 0 && conf.sfMaxTotalBytes > 0 && conf.sfMaxTotalBytes < conf.sfMaxBytes {
-		return fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_bytes (%d)",
-			conf.sfMaxTotalBytes, conf.sfMaxBytes)
+	if conf.sfMaxSegmentBytes > 0 && conf.sfMaxTotalBytes > 0 && conf.sfMaxTotalBytes < conf.sfMaxSegmentBytes {
+		return fmt.Errorf("sf_max_total_bytes (%d) must be >= sf_max_segment_bytes (%d)",
+			conf.sfMaxTotalBytes, conf.sfMaxSegmentBytes)
 	}
 	// Reject an explicit auto_flush_bytes that exceeds an explicit
-	// sf_max_bytes. The byte trigger would let a batch grow until its
+	// sf_max_segment_bytes. The byte trigger would let a batch grow until its
 	// encoded frame can no longer fit a single segment, and such a frame
 	// can never be flushed — it is dropped at the flush boundary. Gated
 	// on autoFlushBytesSet so a *defaulted* 8 MiB trigger over a smaller
 	// user-chosen segment is left to the runtime clamp (which lowers the
 	// effective trigger to fit); only a user-written contradiction is a
-	// hard error. sf_max_bytes is the per-segment cap, so the frame must
+	// hard error. sf_max_segment_bytes is the per-segment cap, so the frame must
 	// actually fit in slightly less than this (header overhead), but the
 	// trigger clamp already keeps the encoded frame under the segment;
 	// this check just rejects the self-evidently impossible pairing up front.
-	if conf.autoFlushBytesSet && conf.sfMaxBytes > 0 && int64(conf.autoFlushBytes) > conf.sfMaxBytes {
+	if conf.autoFlushBytesSet && conf.sfMaxSegmentBytes > 0 && int64(conf.autoFlushBytes) > conf.sfMaxSegmentBytes {
 		return fmt.Errorf(
-			"auto_flush_bytes (%d) must not exceed sf_max_bytes (%d): a batch that fills the byte trigger could not fit in a single segment",
-			conf.autoFlushBytes, conf.sfMaxBytes)
+			"auto_flush_bytes (%d) must not exceed sf_max_segment_bytes (%d): a batch that fills the byte trigger could not fit in a single segment",
+			conf.autoFlushBytes, conf.sfMaxSegmentBytes)
 	}
 	if conf.maxBackgroundDrainers < 0 {
 		return fmt.Errorf("max_background_drainers must be >= 0: %d", conf.maxBackgroundDrainers)
@@ -1684,8 +1657,8 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "sf_dir"
 	case conf.senderId != "":
 		name = "sender_id"
-	case conf.sfMaxBytes != 0:
-		name = "sf_max_bytes"
+	case conf.sfMaxSegmentBytes != 0:
+		name = "sf_max_segment_bytes"
 	case conf.sfMaxTotalBytes != 0:
 		name = "sf_max_total_bytes"
 	case conf.sfDurability != "":
@@ -1714,14 +1687,12 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "initial_connect_retry"
 	case conf.closeFlushTimeoutSet:
 		name = "close_flush_timeout_millis"
-	case conf.gorillaDisabled:
-		name = "gorilla"
 	case conf.dumpWriter != nil:
 		name = "QWP dump writer"
-	case conf.inFlightWindow != 0:
-		name = "in_flight_window"
 	case conf.authTimeoutMs != 0:
 		name = "auth_timeout_ms"
+	case conf.connectTimeoutMs != 0:
+		name = "connect_timeout"
 	case conf.zone != "":
 		name = "zone"
 	case conf.target != qwpTargetAny:

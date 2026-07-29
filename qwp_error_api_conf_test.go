@@ -108,11 +108,11 @@ func TestErrorApiConfStringInvalidValues(t *testing.T) {
 	}
 }
 
-// TestErrorApiConfStringV1PoliciesRejected pins the source-breaking migration:
-// the v1 policy values (halt / drop) are rejected with a hint pointing at the
-// v2 names, on the global key and every per-category key, rather than silently
+// TestErrorApiConfStringRejectsHaltAndDrop pins that 'halt' and 'drop' — not
+// policies this client has — are rejected with a hint naming the real policies,
+// on the global key and every per-category key, rather than silently
 // reinterpreted.
-func TestErrorApiConfStringV1PoliciesRejected(t *testing.T) {
+func TestErrorApiConfStringRejectsHaltAndDrop(t *testing.T) {
 	keys := []string{
 		"on_server_error", "on_schema_error", "on_parse_error",
 		"on_internal_error", "on_security_error", "on_write_error",
@@ -123,7 +123,7 @@ func TestErrorApiConfStringV1PoliciesRejected(t *testing.T) {
 			t.Run(conf, func(t *testing.T) {
 				_, err := qdb.ConfFromStr(conf)
 				if err == nil {
-					t.Fatalf("ConfFromStr(%q) should reject the removed v1 policy", conf)
+					t.Fatalf("ConfFromStr(%q) should reject an invalid policy value", conf)
 				}
 				msg := err.Error()
 				if !strings.Contains(msg, k) {
@@ -131,7 +131,7 @@ func TestErrorApiConfStringV1PoliciesRejected(t *testing.T) {
 				}
 				for _, want := range []string{"terminal", "retriable", "retriable_other"} {
 					if !strings.Contains(msg, want) {
-						t.Fatalf("error = %v, want migration hint naming %q", err, want)
+						t.Fatalf("error = %v, want the hint to name %q", err, want)
 					}
 				}
 			})

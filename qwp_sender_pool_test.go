@@ -520,7 +520,7 @@ func TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot(t *testing.T) {
 	// auto_flush=off so flushing is entirely under the test's control.
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
 		";sf_dir=" + t.TempDir() +
-		";sf_max_bytes=8192;sf_max_total_bytes=8192;sf_append_deadline_millis=50" +
+		";sf_max_segment_bytes=8192;sf_max_total_bytes=8192;sf_append_deadline_millis=50" +
 		";close_flush_timeout_millis=1;auto_flush=off;"
 	// min == max == 1 forces the re-borrow to reuse the recycled slot — unless
 	// this Close discards it, which is exactly what we assert.

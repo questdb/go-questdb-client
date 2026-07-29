@@ -81,7 +81,7 @@ func closeAfterNFramesServer(t *testing.T, n int, code websocket.StatusCode, rea
 // TestQwpSfCloseCodeRepeatPoisonEscalates drives the send loop against
 // a server that reads the head frame then closes with a nominally
 // protocol-violating code — on every connection. WS close codes carry
-// no policy semantics under NACK policy v2: each close is a transport
+// no policy semantics: each close is a transport
 // event that reconnects and replays, counting a poison strike at the
 // unmoved head FSN; at qwpSfDefaultMaxFrameRejections consecutive
 // strikes the loop latches the typed poisoned-frame terminal.

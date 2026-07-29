@@ -333,13 +333,6 @@ func WithQwpQueryEndpointPath(path string) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.endpointPath = path }
 }
 
-// WithQwpQueryAuth sets the raw Authorization HTTP header value sent
-// on the WebSocket upgrade. Mutually exclusive with
-// WithQwpQueryBasicAuth and WithQwpQueryBearerToken.
-func WithQwpQueryAuth(authHeader string) QwpQueryClientOption {
-	return func(c *qwpQueryClientConfig) { c.authorization = authHeader }
-}
-
 // WithQwpQueryBasicAuth enables HTTP Basic authentication. The server
 // validates against the same user store that the Postgres wire
 // protocol uses — a user created via CREATE USER ... WITH PASSWORD ...
@@ -514,16 +507,22 @@ func WithQwpQueryAuthTimeout(d time.Duration) QwpQueryClientOption {
 // black-holed host is abandoned within d instead of riding the OS connect
 // timeout. The upgrade response read and TLS handshake (wss) are bounded
 // separately by WithQwpQueryAuthTimeout, which always has a value (default
-// 15s) — to tighten the handshake, set the auth timeout too. A zero
-// or negative duration keeps the OS connect timeout. Equivalent to the
-// connect-string connect_timeout key.
+// 15s) — to tighten the handshake, set the auth timeout too. Zero keeps the OS
+// connect timeout; negative durations are rejected by validate(). Equivalent
+// to the connect-string connect_timeout key.
 func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) {
+		if d < 0 {
+			// A sub-millisecond negative truncates to 0 under d.Milliseconds()
+			// and would read as the zero (OS-default) case, so map every
+			// negative to a value validate() rejects.
+			c.connectTimeoutMs = -1
+			return
+		}
 		ms := int(d.Milliseconds())
 		// A positive sub-millisecond budget must not truncate to 0, which means
 		// "keep the OS default" — floor it to 1ms so a tight budget stays tight.
-		// Matches WithConnectTimeout; a zero or negative duration still keeps the
-		// OS default.
+		// Matches WithConnectTimeout.
 		if d > 0 && ms == 0 {
 			ms = 1
 		}
@@ -824,12 +823,9 @@ func probeZstdAvailable() error {
 }
 
 // effectiveAuthorization computes the Authorization header value
-// from the config, resolving the three mutually-exclusive auth modes
+// from the config, resolving the two mutually-exclusive auth modes
 // into a single header string.
 func (c *qwpQueryClientConfig) effectiveAuthorization() string {
-	if c.authorization != "" {
-		return c.authorization
-	}
 	if c.httpUser != "" && c.httpPass != "" {
 		creds := c.httpUser + ":" + c.httpPass
 		return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))

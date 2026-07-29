@@ -1835,7 +1835,7 @@ func TestQwpSenderAsyncBasic(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1899,7 +1899,7 @@ func TestQwpSenderAsyncMultipleFlushes(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil, 3)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1933,7 +1933,7 @@ func TestQwpSenderAsyncCloseAutoFlush(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1977,7 +1977,7 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil, 2)
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2041,8 +2041,8 @@ func TestQwpAsyncAutoFlushNonBlocking(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	// window=4, autoFlushRows=10
-	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 10, 0, nil, 4)
+	// autoFlushRows=10
+	s, err := newQwpLineSender(context.Background(), wsURL, qwpTransportOpts{endpointPath: qwpWritePath}, 10, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2628,5 +2628,32 @@ func TestQwpSenderObservabilityCounters(t *testing.T) {
 	}
 	if got := qs.BackgroundDrainers(); got != nil {
 		t.Fatalf("BackgroundDrainers after clean flush = %v, want nil", got)
+	}
+}
+
+// TestQwpConnectTimeoutNegative pins that a negative duration keeps
+// connectTimeoutMs negative so sanitizeQwpConf rejects it. A
+// sub-millisecond negative truncates to 0 under d/time.Millisecond and
+// would otherwise read as the valid zero (OS-default) case, bypassing
+// the construction-time check.
+func TestQwpConnectTimeoutNegative(t *testing.T) {
+	for _, d := range []time.Duration{
+		-500 * time.Microsecond, // truncates to 0 ms
+		-1 * time.Nanosecond,    // truncates to 0 ms
+		-5 * time.Millisecond,   // already negative in ms
+	} {
+		cfg := newLineSenderConfig(qwpSenderType)
+		WithConnectTimeout(d)(cfg)
+		if cfg.connectTimeoutMs >= 0 {
+			t.Errorf("connectTimeoutMs=%d for d=%v, want negative so sanitizeQwpConf rejects it",
+				cfg.connectTimeoutMs, d)
+		}
+	}
+
+	// A zero duration stays the valid zero (OS-default) case.
+	cfg := newLineSenderConfig(qwpSenderType)
+	WithConnectTimeout(0)(cfg)
+	if cfg.connectTimeoutMs != 0 {
+		t.Errorf("connectTimeoutMs=%d for a zero duration, want 0", cfg.connectTimeoutMs)
 	}
 }

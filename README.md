@@ -396,8 +396,6 @@ terminally against a replica.
 
 Backpressure is governed by the engine's segment ring and the append deadline
 (`sf_append_deadline_millis`), not a fixed in-flight count.
-`in_flight_window` / `qdb.WithInFlightWindow(n)` is retained for compatibility
-but is a **no-op**.
 
 ### Error handling
 
@@ -471,7 +469,7 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 |---|---|---|
 | `sf_dir` | unset | Group root. Setting it activates SF. |
 | `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_` only (no `.` or path separators). |
-| `sf_max_bytes` | 4 MiB | Per-segment file size. |
+| `sf_max_segment_bytes` | 4 MiB | Per-segment file size. |
 | `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
 | `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as the poison-frame episode budget (`max_frame_rejections`). |
@@ -486,7 +484,7 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | `durable_ack_keepalive_interval_millis` | 200 | Idle ping that re-elicits pending durable acks; `<= 0` disables (an idle producer can then stall `AwaitAckedFsn`). |
 
 The same options are available programmatically: `WithSfDir`, `WithSenderId`,
-`WithSfMaxBytes`, `WithSfMaxTotalBytes`, `WithReconnectPolicy`,
+`WithSfMaxSegmentBytes`, `WithSfMaxTotalBytes`, `WithReconnectPolicy`,
 `WithInitialConnectRetry`, `WithInitialConnectMode`, `WithCloseFlushTimeout`,
 `WithMaxFrameRejections`, `WithRequestDurableAck`,
 `WithDurableAckKeepaliveInterval`.
