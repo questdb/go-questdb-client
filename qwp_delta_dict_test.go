@@ -137,6 +137,83 @@ func TestQwpDeltaDictNoCatchUpWhenNothingSent(t *testing.T) {
 		"connection 1 (empty mirror) must not emit a catch-up frame")
 }
 
+// TestQwpDeltaDictSplitPathStaysDeltaAcrossReconnect covers the per-table split
+// path (enqueueCursorSplit) with symbol columns — the case no other test
+// exercised. When one over-cap batch splits into a frame per table, the symbol
+// dictionary must stay delta-encoded: the first split frame ships only the
+// batch's new ids (above the already-sent watermark, never the whole
+// dictionary) and advances the watermark, so every later split frame carries an
+// empty delta instead of re-shipping the batch. A full-dict frame here would be
+// skipped by the send-loop mirror and gap the reconnect catch-up, so the test
+// also drops the connection after the split and checks the catch-up rebuilds the
+// whole dictionary — including the split-path ids.
+func TestQwpDeltaDictSplitPathStaysDeltaAcrossReconnect(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{recordFrames: true, closeAfterFrames: 3})
+	defer srv.Close()
+
+	s, engine, _, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+	require.True(t, s.deltaDictEnabled, "memory mode must delta-encode")
+
+	ctx := context.Background()
+
+	// Send one symbol first so the dictionary watermark sits past id 0 when the
+	// split batch runs — that is what makes "ships only the new ids" observable.
+	require.NoError(t, s.Table("t0").Symbol("sym", "OLD").Int64Column("v", 0).AtNow(ctx))
+	require.NoError(t, s.Flush(ctx))
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
+	}, 3*time.Second, 5*time.Millisecond)
+
+	// A two-table batch forced over a small cap so enqueueCursorSplit re-encodes
+	// each table as its own frame. The combined frame is 70 bytes; each
+	// single-table frame is well under 60, so both fit once split.
+	s.serverMaxBatchSize.Store(60)
+	require.NoError(t, s.Table("t1").Symbol("sym", "AAA").Int64Column("v", 1).AtNow(ctx))
+	require.NoError(t, s.Table("t2").Symbol("sym", "BBB").Int64Column("v", 2).AtNow(ctx))
+	require.NoError(t, s.Flush(ctx))
+
+	// conn1 receives [OLD, split-t1, split-t2] before the drop at frame 3.
+	require.Eventually(t, func() bool {
+		return len(srv.recordedFrames()[1]) >= 3
+	}, 3*time.Second, 5*time.Millisecond, "split did not produce two per-table frames")
+	conn1 := srv.recordedFrames()[1]
+	require.Len(t, conn1, 3)
+
+	// The first split frame ships only the batch's new ids, starting above the
+	// OLD watermark (start=1) — never the whole dictionary, which would start at 0.
+	start1, count1, _, ok1 := qwpParseDeltaDict([]byte(conn1[1]))
+	require.True(t, ok1)
+	require.Equal(t, 1, start1, "split frame must not re-ship already-sent ids")
+	require.Equal(t, 2, count1, "the first split frame ships the batch's two new ids")
+
+	// The second split frame carries an empty delta: the baseline advanced
+	// per-frame, so it references the ids the first frame already registered
+	// rather than re-shipping the batch delta.
+	_, count2, _, ok2 := qwpParseDeltaDict([]byte(conn1[2]))
+	require.True(t, ok2)
+	require.Equal(t, 0, count2, "later split frames must not re-ship the batch delta")
+
+	require.Equal(t, []string{"OLD", "AAA", "BBB"}, reconstructConnDict(conn1))
+
+	// The drop after the split forces a reconnect onto a fresh (empty-dict)
+	// server; a follow-up flush drives it. The catch-up must re-register the
+	// whole dictionary, including the split-path ids, or the replayed delta
+	// frames would dangle a symbol id on the fresh server.
+	require.NoError(t, s.Table("t3").Symbol("sym", "CCC").Int64Column("v", 3).AtNow(ctx))
+	require.NoError(t, s.Flush(ctx))
+
+	var conn2 []string
+	require.Eventually(t, func() bool {
+		conn2 = reconstructConnDict(srv.recordedFrames()[2])
+		return len(conn2) >= 3 &&
+			conn2[0] == "OLD" && conn2[1] == "AAA" && conn2[2] == "BBB"
+	}, 3*time.Second, 5*time.Millisecond, "conn2 dict = %v", conn2)
+
+	require.True(t, connSawTableLessFrame(srv.recordedFrames()[2]),
+		"connection 2 must re-register the dictionary with a catch-up frame")
+}
+
 // TestQwpDeltaDictSeedFromPersisted checks the recovery seeding: the producer
 // resumes its global dictionary and delta baseline at the recovered tip, and
 // the send loop rebuilds a catch-up frame carrying the same symbols in id
