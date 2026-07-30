@@ -155,6 +155,21 @@ func TestQwpDeltaDictSeedFromPersisted(t *testing.T) {
 	defer pd.close()
 	require.Equal(t, []string{"a", "b", "c"}, pd.loadedSymbols())
 
+	// Seed the two recovered-dict consumers in the cursor sender's construction
+	// order: the send loop's wire mirror first (the send loop is built before the
+	// producer), then the producer's global dictionary. The mirror seed must
+	// leave the recovered entries in place so the producer, built next, still
+	// sees the full set — a regression guard for the SF-recovery seed ordering.
+	var l qwpSfSendLoop
+	l.deltaDictEnabled = true
+	l.seedSentDictFromPersisted(pd)
+	require.Equal(t, 3, l.sentDictCount)
+	require.Equal(t, []string{"a", "b", "c"}, pd.loadedSymbols(),
+		"the mirror seed must not drop the recovered entries before the producer seeds")
+
+	frame := l.buildCatchUpFrame(0, l.sentDictCount, l.sentDictBytes)
+	require.Equal(t, []string{"a", "b", "c"}, reconstructConnDict([]string{string(frame)}))
+
 	s := &qwpLineSender{
 		globalSymbols:       map[string]int32{},
 		maxSentSymbolId:     -1,
@@ -165,14 +180,6 @@ func TestQwpDeltaDictSeedFromPersisted(t *testing.T) {
 	require.Equal(t, int32(0), s.globalSymbols["a"])
 	require.Equal(t, int32(2), s.globalSymbols["c"])
 	require.Equal(t, 2, s.maxSentSymbolId, "baseline resumes at the recovered tip")
-
-	var l qwpSfSendLoop
-	l.deltaDictEnabled = true
-	l.seedSentDictFromPersisted(pd)
-	require.Equal(t, 3, l.sentDictCount)
-
-	frame := l.buildCatchUpFrame(0, l.sentDictCount, l.sentDictBytes)
-	require.Equal(t, []string{"a", "b", "c"}, reconstructConnDict([]string{string(frame)}))
 }
 
 // TestQwpDeltaDictSfPersistsSymbols verifies the SF write-ahead persistence:

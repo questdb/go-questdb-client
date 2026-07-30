@@ -258,16 +258,6 @@ func (d *qwpSfSymbolDict) loadedSymbols() []string {
 	return d.loaded
 }
 
-// releaseLoaded drops the recovered-entry copy once both the producer's global
-// dictionary and the send loop's catch-up mirror have been seeded from it, so a
-// large recovered dictionary is not retained for the slot's whole lifetime.
-func (d *qwpSfSymbolDict) releaseLoaded() {
-	if d == nil {
-		return
-	}
-	d.loaded = nil
-}
-
 // size is the number of symbols the dictionary holds (highest id + 1).
 func (d *qwpSfSymbolDict) size() int {
 	if d == nil {
@@ -288,6 +278,12 @@ func (d *qwpSfSymbolDict) close() error {
 		return nil
 	}
 	d.closed = true
+	// Drop the recovered-entry copy at teardown. The send-loop mirror and the
+	// producer's global dictionary both read it during construction and leave it
+	// in place (each is a consumer; neither can tell it is the last), so the copy
+	// lives until the dict is closed — the slot's whole lifetime for a running
+	// sender, the drain for an orphan drainer.
+	d.loaded = nil
 	if d.file != nil {
 		err := d.file.Close()
 		d.file = nil

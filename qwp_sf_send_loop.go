@@ -2367,10 +2367,11 @@ func (l *qwpSfSendLoop) seedSentDictFromPersisted(pd *qwpSfSymbolDict) {
 		l.sentDictBytes = append(l.sentDictBytes, name...)
 	}
 	l.sentDictCount = len(symbols)
-	// The mirror seed is the second and last consumer of the recovered entries
-	// (the producer's global dictionary seeded first, at construction), so the
-	// copy can be dropped now.
-	pd.releaseLoaded()
+	// The recovered entries are left in place: on the ingest path the producer's
+	// global-dictionary seed reads the same set next, at construction (the send
+	// loop is built before the producer). The copy is dropped when the dict is
+	// closed (qwpSfSymbolDict.close), never here — releasing it now would leave a
+	// later-built producer with an empty dictionary.
 }
 
 // qwpSfBuildTornDictSE builds the terminal PROTOCOL_VIOLATION surfaced when a
