@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -183,7 +184,7 @@ func TestQwpSfDispatcherCloseDrainsLeftover(t *testing.T) {
 		mu.Unlock()
 	}, 4)
 
-	want := &SenderError{Category: CategoryParseError, AppliedPolicy: PolicyHalt}
+	want := &SenderError{Category: CategoryParseError, AppliedPolicy: PolicyTerminal}
 	d.inbox <- want
 	if d.started.Load() {
 		t.Fatal("test setup: dispatcher unexpectedly started")
@@ -244,6 +245,29 @@ func TestQwpSfDispatcherOfferCloseRaceNoLoss(t *testing.T) {
 	}
 }
 
+// TestQwpSfDispatcherHandlerAndLoggerPanicDoesNotCrash pins that a handler
+// panic AND a panicking recovery-path logger together do not escape
+// deliver()/loop() and crash the host.
+func TestQwpSfDispatcherHandlerAndLoggerPanicDoesNotCrash(t *testing.T) {
+	var calls atomic.Int64
+	d := newQwpSfErrorDispatcher(func(*SenderError) {
+		calls.Add(1)
+		panic("boom")
+	}, 4)
+	d.logger = slog.New(panicOnHandleSlog{})
+	for i := 0; i < 3; i++ {
+		d.offer(&SenderError{Category: CategoryParseError})
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if calls.Load() < 3 {
+		t.Fatalf("dispatcher stopped after logger panic: calls=%d", calls.Load())
+	}
+	d.close()
+}
+
 // TestQwpSfDispatcherPanicCaught asserts a panicking handler is
 // recovered and does not stop the dispatcher.
 func TestQwpSfDispatcherPanicCaught(t *testing.T) {
@@ -302,7 +326,7 @@ func TestQwpSfDispatcherNilHandlerUsesDefault(t *testing.T) {
 	defer d.close()
 	d.offer(&SenderError{
 		Category:      CategoryParseError,
-		AppliedPolicy: PolicyHalt,
+		AppliedPolicy: PolicyTerminal,
 	})
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -344,7 +368,7 @@ func TestQwpSfDispatcherCloseFromHandlerNoSelfJoin(t *testing.T) {
 		close(returned)
 	}, 4)
 
-	if !d.offer(&SenderError{Category: CategoryParseError, AppliedPolicy: PolicyHalt}) {
+	if !d.offer(&SenderError{Category: CategoryParseError, AppliedPolicy: PolicyTerminal}) {
 		t.Fatal("offer rejected on a fresh dispatcher")
 	}
 
@@ -467,5 +491,94 @@ func TestQwpSfDispatcherCloseBoundedOnStuckHandler(t *testing.T) {
 	// The three queued-but-undelivered items were abandoned as dropped.
 	if got := d.droppedNotifications(); got != 3 {
 		t.Errorf("dropped = %d, want 3 (queued items abandoned at bounded close)", got)
+	}
+}
+
+// TestQwpSfDispatcherAbandonDropsQueued pins the abandon guard.
+// Once close() times out on a wedged handler it sets abandon; loop() and
+// drain() must then DROP any item still queued rather than deliver it —
+// otherwise a handler that finally returns re-enters its select, picks a queued
+// error, and fires the user callback after close() (hence Sender.Close) has
+// already returned. Both branches are exercised directly with abandon preset so
+// the drop is deterministic (no reliance on the close-vs-handler-return race,
+// which close()'s own inbox sweep usually wins). The sibling qwpDispatcher
+// carries the same guard (TestQwpDispatcherCloseAbandonsWedgedHandler).
+func TestQwpSfDispatcherAbandonDropsQueued(t *testing.T) {
+	// drain() is what loop() runs on done; with abandon set it must drop.
+	t.Run("drain", func(t *testing.T) {
+		var delivered atomic.Int64
+		d := newQwpSfErrorDispatcher(func(*SenderError) { delivered.Add(1) }, 8)
+		d.abandon.Store(true)
+		d.inbox <- &SenderError{Category: CategoryParseError, ToFsn: 1}
+		d.drain()
+		if got := delivered.Load(); got != 0 {
+			t.Errorf("delivered=%d; drain must drop under abandon, not deliver", got)
+		}
+		if got := d.droppedNotifications(); got != 1 {
+			t.Errorf("dropped=%d, want 1 (abandoned item counted as dropped)", got)
+		}
+	})
+	// loop(): with abandon set and done closed, the queued item is dropped
+	// whichever select branch (inbox or done→drain) the loop takes first.
+	t.Run("loop", func(t *testing.T) {
+		var delivered atomic.Int64
+		d := newQwpSfErrorDispatcher(func(*SenderError) { delivered.Add(1) }, 8)
+		d.abandon.Store(true)
+		d.inbox <- &SenderError{Category: CategoryParseError, ToFsn: 1}
+		close(d.done)
+		d.wg.Add(1)
+		exited := make(chan struct{})
+		go func() { d.loop(); close(exited) }()
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("loop did not exit after done closed")
+		}
+		if got := delivered.Load(); got != 0 {
+			t.Errorf("delivered=%d; loop must drop under abandon, not deliver", got)
+		}
+	})
+}
+
+// TestQwpSfDispatcherReentrantCloseCountsAbandonedAsDropped is the
+// qwpSfErrorDispatcher twin of the generic dispatcher's re-entrant-close
+// accounting test: close() from the handler returns before its own leftovers
+// sweep, so drain()'s deadline give-up must count the still-queued items as
+// dropped. Hard invariant: delivered + dropped == offered.
+func TestQwpSfDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
+	const extra = 12
+	var d *qwpSfErrorDispatcher
+	queued := make(chan struct{})
+	var once sync.Once
+	d = newQwpSfErrorDispatcher(func(*SenderError) {
+		once.Do(func() {
+			<-queued
+			d.close() // re-entrant: returns without the close-side sweep
+		})
+		time.Sleep(qwpSfDispatcherDrainTimeout + 20*time.Millisecond)
+	}, extra+4)
+
+	if !d.offer(&SenderError{Category: CategoryParseError, ToFsn: 0}) {
+		t.Fatal("first offer rejected")
+	}
+	for i := 0; i < extra; i++ {
+		if !d.offer(&SenderError{Category: CategoryParseError, ToFsn: int64(i + 1)}) {
+			t.Fatalf("offer %d rejected before close", i)
+		}
+	}
+	close(queued)
+
+	joined := make(chan struct{})
+	go func() { d.wg.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatcher loop never exited after re-entrant close")
+	}
+
+	delivered, dropped := d.totalDelivered(), d.droppedNotifications()
+	if got, want := delivered+dropped, int64(extra+1); got != want {
+		t.Fatalf("delivered(%d) + dropped(%d) = %d, want %d — items abandoned on the "+
+			"re-entrant close path went uncounted", delivered, dropped, got, want)
 	}
 }

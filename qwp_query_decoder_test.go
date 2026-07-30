@@ -681,9 +681,9 @@ func TestQwpDecoderRoundTripDecimal128(t *testing.T) {
 		t.Fatalf("getOrCreateColumn: %v", err)
 	}
 	type d128 struct {
-		scale     uint32
-		hi, lo    uint64
-		signedHi  int64
+		scale    uint32
+		hi, lo   uint64
+		signedHi int64
 	}
 	cases := []d128{
 		{scale: 4, hi: 0x0102030405060708, lo: 0xCAFEBABEDEADBEEF, signedHi: 0x0102030405060708},
@@ -751,7 +751,7 @@ func TestQwpDecoderRoundTripDecimal256(t *testing.T) {
 		t.Fatalf("getOrCreateColumn: %v", err)
 	}
 	type d256 struct {
-		scale       uint32
+		scale          uint32
 		w0, w1, w2, w3 uint64
 	}
 	cases := []d256{
@@ -1162,10 +1162,10 @@ func writeMinimalResultBatch() []byte {
 	// Body
 	buf.WriteByte(byte(qwpMsgKindResultBatch))
 	_ = binary.Write(&buf, binary.LittleEndian, uint64(1)) // requestId
-	putVarintBytes(&buf, 0)                                 // batch_seq
-	putVarintBytes(&buf, 0)                                 // name_len
-	putVarintBytes(&buf, 0)                                 // row_count
-	putVarintBytes(&buf, 0)                                 // column_count
+	putVarintBytes(&buf, 0)                                // batch_seq
+	putVarintBytes(&buf, 0)                                // name_len
+	putVarintBytes(&buf, 0)                                // row_count
+	putVarintBytes(&buf, 0)                                // column_count
 	// Patch payloadLength at offset 8.
 	out := buf.Bytes()
 	binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
@@ -1236,10 +1236,10 @@ func writeStringResultBatch(nonNull int, totalBytes int32) []byte {
 	// Body
 	buf.WriteByte(byte(qwpMsgKindResultBatch))
 	_ = binary.Write(&buf, binary.LittleEndian, uint64(7))
-	putVarintBytes(&buf, 0)                          // batch_seq
-	putVarintBytes(&buf, 0)                          // table_name_len
-	putVarintBytes(&buf, uint64(nonNull))            // row_count
-	putVarintBytes(&buf, 1)                          // column_count
+	putVarintBytes(&buf, 0)               // batch_seq
+	putVarintBytes(&buf, 0)               // table_name_len
+	putVarintBytes(&buf, uint64(nonNull)) // row_count
+	putVarintBytes(&buf, 1)               // column_count
 	// Schema: column "s" : VARCHAR (egress may send STRING 0x08 but
 	// the encoder-side tests use VARCHAR so the shared offsets+bytes
 	// layout is exercised).
@@ -1496,7 +1496,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 	})
 
 	t.Run("H7a_CellCountAmplificationRejected", func(t *testing.T) {
-		// M3 regression. An all-null column is nearly free on the wire (a
+		// Cell-count amplification regression. An all-null column is nearly free on the wire (a
 		// rowCount/8 null bitmap, zstd-compressible to almost nothing) yet
 		// forces a rowCount-sized index array. row_count and column_count
 		// are each individually within their caps here, but their product
@@ -1646,7 +1646,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		putVarintBytes(&buf, 1)
 		buf.WriteByte('s')
 		buf.WriteByte(0x08) // STRING — unsupported
-		buf.WriteByte(0)   // null flag = 0
+		buf.WriteByte(0)    // null flag = 0
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
@@ -1743,9 +1743,9 @@ func TestQwpDecoderHardening(t *testing.T) {
 		_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
 		buf.WriteByte(byte(qwpMsgKindResultBatch))
 		_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
-		putVarintBytes(&buf, 0)                             // batch_seq
-		putVarintBytes(&buf, 0)                             // table_name_len
-		putVarintBytes(&buf, 0)                             // row_count
+		putVarintBytes(&buf, 0)                               // batch_seq
+		putVarintBytes(&buf, 0)                               // table_name_len
+		putVarintBytes(&buf, 0)                               // row_count
 		putVarintBytes(&buf, uint64(qwpMaxColumnsPerTable)+1) // col_count
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
@@ -1767,7 +1767,7 @@ func TestQwpDecoderHardening(t *testing.T) {
 		_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
 		buf.WriteByte(byte(qwpMsgKindResultBatch))
 		_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
-		putVarintBytes(&buf, 0)                         // batch_seq
+		putVarintBytes(&buf, 0)                            // batch_seq
 		putVarintBytes(&buf, uint64(qwpMaxTableNameLen)+1) // name_len
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
@@ -1789,10 +1789,10 @@ func TestQwpDecoderHardening(t *testing.T) {
 		_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
 		buf.WriteByte(byte(qwpMsgKindResultBatch))
 		_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
-		putVarintBytes(&buf, 0) // batch_seq
-		putVarintBytes(&buf, 0) // table_name_len
-		putVarintBytes(&buf, 0) // row_count
-		putVarintBytes(&buf, 1) // col_count = 1
+		putVarintBytes(&buf, 0)                             // batch_seq
+		putVarintBytes(&buf, 0)                             // table_name_len
+		putVarintBytes(&buf, 0)                             // row_count
+		putVarintBytes(&buf, 1)                             // col_count = 1
 		putVarintBytes(&buf, uint64(qwpMaxColumnNameLen)+1) // col name_len
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
@@ -1815,9 +1815,9 @@ func TestQwpDecoderHardening(t *testing.T) {
 		_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
 		buf.WriteByte(byte(qwpMsgKindResultBatch))
 		_ = binary.Write(&buf, binary.LittleEndian, uint64(1))
-		putVarintBytes(&buf, 0)                 // batch_seq
-		putVarintBytes(&buf, 0)                 // delta_start
-		putVarintBytes(&buf, uint64(1)<<32)     // delta_count = 2^32 (overflows uint32)
+		putVarintBytes(&buf, 0)             // batch_seq
+		putVarintBytes(&buf, 0)             // delta_start
+		putVarintBytes(&buf, uint64(1)<<32) // delta_count = 2^32 (overflows uint32)
 		out := buf.Bytes()
 		binary.LittleEndian.PutUint32(out[qwpHeaderOffsetPayloadLen:], uint32(len(out)-qwpHeaderSize))
 
@@ -3064,5 +3064,33 @@ func TestQwpColumnBatchCopyAllZstdSurvivesPoolReuse(t *testing.T) {
 	if got := snap.String(0, 1); got != "world" {
 		t.Fatalf("snap[1] after reuse = %q, want %q",
 			got, "world")
+	}
+}
+
+// TestQwpDecoderResetQuerySchemaBlocksLeak pins the "schema never leaks across
+// query boundaries" property. resetQuerySchema (which dispatcherRun calls at the
+// start of every query) must drop the prior query's held schema so a
+// continuation batch cannot decode against it: the decode path gates a
+// batch_seq > 0 batch on querySchemaValid, and after a reset that gate is closed.
+func TestQwpDecoderResetQuerySchemaBlocksLeak(t *testing.T) {
+	dec := newTestQueryDecoder()
+	var batch QwpColumnBatch
+
+	schemaFrame := encodeSingleColumnBatch(t, "v", qwpTypeLong, false,
+		[]func(*qwpColumnBuffer){func(c *qwpColumnBuffer) { c.addLong(1) }})
+	if err := dec.decode(schemaFrame, &batch); err != nil {
+		t.Fatalf("decode schema batch: %v", err)
+	}
+	if !dec.querySchemaValid || dec.querySchema == nil {
+		t.Fatal("schema batch should leave a held, valid query schema")
+	}
+
+	dec.resetQuerySchema()
+
+	if dec.querySchemaValid {
+		t.Fatal("resetQuerySchema left querySchemaValid set; a continuation batch could reuse the prior query's schema")
+	}
+	if dec.querySchema != nil {
+		t.Fatal("resetQuerySchema left the prior schema slice held")
 	}
 }

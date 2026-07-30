@@ -131,13 +131,14 @@ func TestConfSizeSuffix(t *testing.T) {
 func TestConfSizeSuffixRejected(t *testing.T) {
 	cases := []string{
 		"",
-		"k",            // suffix without a number
-		"abc",          // non-numeric
-		"1.5m",         // floats not supported
-		"-1",           // negative bare
-		"-1m",          // negative with suffix
-		"1xb",          // unknown suffix
-		"1024kb extra", // trailing garbage
+		"k",              // suffix without a number
+		"abc",            // non-numeric
+		"1.5m",           // floats not supported
+		"-1",             // negative bare
+		"-1m",            // negative with suffix
+		"1xb",            // unknown suffix
+		"1024kb extra",   // trailing garbage
+		"9999999999999t", // n * (1<<40) overflows int64 (exercises the overflow guard)
 	}
 	for _, in := range cases {
 		t.Run(in, func(t *testing.T) {
@@ -194,6 +195,20 @@ func TestConfSenderIdRejectsDot(t *testing.T) {
 	}
 	if !strings.Contains(msg, ".") {
 		t.Errorf("error %q does not show the offending char", msg)
+	}
+}
+
+// TestConfSenderIdRejectsPathChars pins the path-traversal guard: sender_id is
+// used as a path segment under sf_dir, so separators, '..', dots, and spaces
+// must be rejected (Sender.java validateSenderId: letters, digits, '_', '-'
+// only). Calls the validator directly to cover chars a connect string can't
+// easily carry.
+func TestConfSenderIdRejectsPathChars(t *testing.T) {
+	bad := []string{"/", "..", "a/b", "a\\b", "a b", ".", "foo.bar", "../x"}
+	for _, id := range bad {
+		if err := validateSenderId(id); err == nil {
+			t.Errorf("validateSenderId(%q) = nil, want error", id)
+		}
 	}
 }
 
@@ -328,9 +343,9 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 		"failover_max_duration_ms=60000",
 		"initial_credit=262144",
 		"max_batch_rows=10000",
-		"path=/read/v2",
+		"path=/exec",
 		"replay_exec=on",
-		"server_info_timeout_ms=750",
+		"server_info_timeout_ms=1000",
 	}
 	for _, kv := range kvs {
 		t.Run(kv, func(t *testing.T) {
@@ -366,7 +381,7 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"auto_flush_interval=100",
 		"auto_flush_rows=1000",
 		"close_flush_timeout_millis=5000",
-		"connection_listener_inbox_capacity=64",
+		"connection_listener_inbox_capacity=256",
 		"drain_orphans=off",
 		"durable_ack_keepalive_interval_millis=200",
 		"error_inbox_capacity=256",
@@ -374,13 +389,14 @@ func TestConfEgressSilentlyAcceptsIngressKeys(t *testing.T) {
 		"initial_connect_retry=off",
 		"max_background_drainers=4",
 		"max_buf_size=100m",
+		"max_frame_rejections=4",
 		"max_name_len=127",
-		"on_internal_error=halt",
-		"on_parse_error=halt",
-		"on_schema_error=halt",
-		"on_security_error=halt",
+		"on_internal_error=terminal",
+		"on_parse_error=terminal",
+		"on_schema_error=terminal",
+		"on_security_error=terminal",
 		"on_server_error=auto",
-		"on_write_error=halt",
+		"on_write_error=terminal",
 		"reconnect_initial_backoff_millis=100",
 		"reconnect_max_backoff_millis=5000",
 		"reconnect_max_duration_millis=300000",
@@ -414,7 +430,7 @@ func TestConfSharedConnectString(t *testing.T) {
 		// ingress-only:
 		"sf_dir=/tmp/sf;sender_id=ingest-1;auto_flush_rows=500;" +
 		"reconnect_max_duration_millis=120000;" +
-		"on_schema_error=drop;" +
+		"on_schema_error=retriable;" +
 		// egress-only:
 		"compression=zstd;compression_level=3;" +
 		"failover_max_attempts=8;failover_max_duration_ms=30000;"
@@ -621,22 +637,14 @@ func TestConfMemoryModeHonoursCloseFlushTimeout(t *testing.T) {
 	}
 }
 
-// TestWithCloseTimeoutSubMillisecondIsNoOverride pins that the
-// deprecated alias honours its documented "d <= 0 is treated as no
-// override" semantics for sub-millisecond positive durations too.
-// Without this gate, d=500µs satisfies d > 0, truncates to 0 ms,
-// sets closeFlushTimeoutSet=true, and routes into the fast-close
-// branch (qwp_sender_cursor.go:167, sender.go:1493), contradicting
-// the doc. Callers who actually want fast-close must opt in via
+// TestWithCloseTimeoutSubMillisecondFloorsToOneMs pins the deprecated alias's
+// boundary semantics: d <= 0 is "no override" as documented, while a positive
+// sub-millisecond duration must not silently truncate to 0 (which would route
+// into the fast-close branch) — it floors to 1ms, exactly like
+// WithConnectTimeout. Callers who actually want fast-close opt in via
 // WithCloseFlushTimeout.
-func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
-	for _, d := range []time.Duration{
-		0,
-		-1 * time.Second,
-		1 * time.Nanosecond,
-		500 * time.Microsecond,
-		999 * time.Microsecond,
-	} {
+func TestWithCloseTimeoutSubMillisecondFloorsToOneMs(t *testing.T) {
+	for _, d := range []time.Duration{0, -1 * time.Second} {
 		t.Run(d.String(), func(t *testing.T) {
 			c := newLineSenderConfig(qwpSenderType)
 			WithCloseTimeout(d)(c)
@@ -648,12 +656,26 @@ func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
 			}
 		})
 	}
-	// Sanity: the smallest representable positive value, 1ms, must
-	// still override (the gate is inclusive at the ms boundary).
+	for _, d := range []time.Duration{
+		1 * time.Nanosecond,
+		500 * time.Microsecond,
+		999 * time.Microsecond,
+		time.Millisecond,
+	} {
+		t.Run(d.String(), func(t *testing.T) {
+			c := newLineSenderConfig(qwpSenderType)
+			WithCloseTimeout(d)(c)
+			if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
+				t.Errorf("WithCloseTimeout(%s): set=%v millis=%d; want set=true millis=1",
+					d, c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
+			}
+		})
+	}
+	// Above the boundary, plain truncation applies.
 	c := newLineSenderConfig(qwpSenderType)
-	WithCloseTimeout(time.Millisecond)(c)
-	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 1 {
-		t.Errorf("WithCloseTimeout(1ms): set=%v millis=%d; want set=true millis=1",
+	WithCloseTimeout(2500 * time.Microsecond)(c)
+	if !c.closeFlushTimeoutSet || c.closeFlushTimeoutMillis != 2 {
+		t.Errorf("WithCloseTimeout(2.5ms): set=%v millis=%d; want set=true millis=2",
 			c.closeFlushTimeoutSet, c.closeFlushTimeoutMillis)
 	}
 }
@@ -664,7 +686,6 @@ func TestWithCloseTimeoutSubMillisecondIsNoOverride(t *testing.T) {
 func TestConfQwpIngressAcceptsExtraIngressKeys(t *testing.T) {
 	kvs := []string{
 		"transaction=off",
-		"connection_listener_inbox_capacity=1",
 		"connection_listener_inbox_capacity=64",
 	}
 	for _, kv := range kvs {
@@ -771,14 +792,16 @@ func TestConfTransactionRejectedOnHttpAndTcp(t *testing.T) {
 }
 
 func TestConfQwpIngressRejectsInvalidConnectionListenerInboxCapacity(t *testing.T) {
-	for _, value := range []string{"0", "-1"} {
+	// 0 is the "use the default capacity" sentinel; any other value must fall
+	// in [qwpSfMinErrorInboxCapacity, qwpSfMaxErrorInboxCapacity].
+	for _, value := range []string{"1", "-1"} {
 		_, err := confFromStr(
 			"ws::addr=localhost:9000;connection_listener_inbox_capacity=" + value + ";")
 		if err == nil {
 			t.Fatalf("connection_listener_inbox_capacity=%s must be rejected", value)
 		}
-		if !strings.Contains(err.Error(), "must be >= 1") {
-			t.Errorf("error %q does not report the >= 1 requirement", err)
+		if !strings.Contains(err.Error(), "must be in [") {
+			t.Errorf("error %q does not report the valid range", err)
 		}
 	}
 }

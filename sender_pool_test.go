@@ -253,6 +253,20 @@ func TestNonHttpSchemasNotSupported(t *testing.T) {
 	}
 }
 
+// TestNewLineSenderRejectsDurableAckOnNonQwp pins that request_durable_ack via the
+// programmatic option path is rejected on a non-QWP transport — matching the
+// connect-string branch and the Java client, which throws rather than silently
+// dropping a durability request. Rejection is at config validation, pre-dial.
+// Like the connect-string key, the disabling form is rejected too.
+func TestNewLineSenderRejectsDurableAckOnNonQwp(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		_, err := qdb.NewLineSender(context.Background(), qdb.WithTcp(),
+			qdb.WithAddress("localhost:9009"), qdb.WithRequestDurableAck(enabled))
+		require.Error(t, err, "enabled=%v", enabled)
+		assert.ErrorContains(t, err, "request_durable_ack")
+	}
+}
+
 func TestPoolFromOptionsRejectsQwp(t *testing.T) {
 	p, err := qdb.PoolFromOptions(qdb.WithQwp(), qdb.WithAddress("localhost:9000"))
 	require.NoError(t, err)
@@ -269,9 +283,19 @@ func TestPoolFromOptionsRejectsQwpOnlyOptions(t *testing.T) {
 		opt  qdb.LineSenderOption
 	}{
 		{"WithErrorHandler", qdb.WithErrorHandler(func(*qdb.SenderError) {})},
-		{"WithServerErrorPolicy", qdb.WithServerErrorPolicy(qdb.PolicyHalt)},
+		{"WithServerErrorPolicy", qdb.WithServerErrorPolicy(qdb.PolicyTerminal)},
 		{"WithSfDir", qdb.WithSfDir(t.TempDir())},
 		{"WithDrainOrphans", qdb.WithDrainOrphans(true)},
+		{"WithRequestDurableAck", qdb.WithRequestDurableAck(true)},
+		{"WithRequestDurableAckFalse", qdb.WithRequestDurableAck(false)},
+		{"WithDurableAckKeepaliveInterval", qdb.WithDurableAckKeepaliveInterval(time.Second)},
+		{"WithProgressHandler", qdb.WithProgressHandler(func(int64) {})},
+		{"WithBackgroundDrainerListener", qdb.WithBackgroundDrainerListener(qdb.QwpBackgroundDrainerListener{
+			OnDurableAckUnavailable: func(string, int) {},
+		})},
+		{"WithBackgroundDrainerListenerPrimaryOnly", qdb.WithBackgroundDrainerListener(qdb.QwpBackgroundDrainerListener{
+			OnPrimaryUnavailable: func(string, int) {},
+		})},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

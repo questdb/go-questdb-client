@@ -116,6 +116,20 @@ func main() {
 				}
 			}
 
+		case "FLUSH_DEFER":
+			if sender == nil {
+				reply("ERR no active sender; call CONNECT first")
+				continue
+			}
+			// Deferred-commit framing (transaction=on / FLAG_DEFER_COMMIT)
+			// is not implemented in the Go client. Reply with a clear,
+			// typed error so the transaction-atomicity e2e tests fail
+			// deterministically on this verb rather than an opaque
+			// "unknown verb" — and flip green once transactions land. In
+			// practice those tests fail earlier still, at CONNECT, because
+			// transaction=on is itself rejected by the config parser.
+			reply("ERR FLUSH_DEFER unsupported: deferred-commit transactions (transaction=on) are not implemented in the Go client")
+
 		case "AWAIT_ACKED":
 			if sender == nil {
 				reply("ERR no active sender; call CONNECT first")

@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -106,6 +107,15 @@ type qwpSfCursorEngine struct {
 	// writer) is gone.
 	watermark *qwpSfAckWatermark
 
+	// persistedSymbolDict is the engine-owned .symbol-dict side-file
+	// (disk mode only; nil in memory mode and when it could not open). It
+	// lets a recovered / orphan-drained slot re-register the whole symbol
+	// dictionary on the fresh server before replaying its non-self-
+	// sufficient delta frames. Opened in the constructor alongside the
+	// watermark, closed in engineClose. nil in disk mode disables delta
+	// encoding for the slot (the sender keeps full self-sufficient frames).
+	persistedSymbolDict *qwpSfSymbolDict
+
 	appendDeadline time.Duration
 
 	// recoveredFromDisk is true when the constructor recovered an
@@ -134,9 +144,9 @@ type qwpSfCursorEngine struct {
 	// terminalError is the (optional) snapshot getter wired in by the
 	// I/O send loop after it is constructed, alongside reconnectStatus.
 	// It returns the loop's latched terminal error — a *SenderError on a
-	// HALT, a plain error on a transport-fatal or reconnect-budget
-	// exhaustion — or nil while the loop is healthy or merely
-	// reconnecting. engineAppendBlocking polls it on every backpressure
+	// HALT, a plain error on a transport-fatal condition — or nil while
+	// the loop is healthy or merely reconnecting. engineAppendBlocking
+	// polls it on every backpressure
 	// spin iteration: a HALT stops the send loop draining the ring (ACK-
 	// driven trim ceases), so a producer parked on a full ring would
 	// otherwise wait out the whole appendDeadline and return the generic
@@ -215,6 +225,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		lock              *qwpSfSlotLock
 		ring              *qwpSfSegmentRing
 		watermark         *qwpSfAckWatermark
+		persistedDict     *qwpSfSymbolDict
 		recoveredFromDisk bool
 		err               error
 	)
@@ -249,6 +260,9 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		}
 		if watermark != nil {
 			_ = watermark.close()
+		}
+		if persistedDict != nil {
+			_ = persistedDict.close()
 		}
 		if lock != nil {
 			_ = lock.close()
@@ -310,6 +324,27 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// unmappable file never takes the engine down — we just
 			// fall back to the bare lowestBase-1 seed.
 			watermark = qwpSfAckWatermarkOpen(sfDir)
+			// Load the persisted symbol dictionary so this recovered slot's
+			// delta frames can be re-registered on a fresh server before they
+			// replay. A recovered slot's dictionary is NEVER recreated: its
+			// segments reference the dictionary's ids by position, so truncating
+			// a corrupt/mismatched file would restart the id space and re-register
+			// the wrong names. A corrupt file therefore fails the open loudly (a
+			// sanctioned terminal), and an absent file leaves persistedDict nil.
+			persistedDict, err = qwpSfSymbolDictOpenRecovered(sfDir)
+			if err != nil {
+				return nil, err
+			}
+			// Absent dictionary with recovered frames: those frames may be
+			// delta-encoded and reference ids we can no longer re-register.
+			// Leaving persistedDict nil disables delta so the producer emits full
+			// self-sufficient frames, and the send loop's guard rejects any
+			// recovered delta frame rather than replaying it against a gap. When
+			// the ring holds no frames there is nothing to alias against, so a
+			// fresh dictionary is safe and keeps delta encoding available.
+			if persistedDict == nil && ring.segmentRingPublishedFsn() < 0 {
+				persistedDict = qwpSfSymbolDictOpenFresh(filepath.Join(sfDir, qwpSfSymbolDictFileName))
+			}
 			watermarkFsn := watermark.read() // nil-safe → INVALID
 			candidate := baseSeed
 			if watermarkFsn > candidate {
@@ -346,6 +381,10 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// behind it.
 			qwpSfAckWatermarkRemoveOrphan(sfDir)
 			watermark = qwpSfAckWatermarkOpen(sfDir)
+			// Same stale-side-file hygiene for the symbol dictionary: a
+			// fresh slot starts with an empty dictionary.
+			qwpSfSymbolDictRemoveOrphan(sfDir)
+			persistedDict = qwpSfSymbolDictOpen(sfDir)
 			initialPath = filepath.Join(sfDir, "sf-initial.sfa")
 			initial, err = qwpSfCreateSegment(initialPath, 0, segmentSizeBytes)
 		}
@@ -358,15 +397,16 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		return nil, err
 	}
 	e := &qwpSfCursorEngine{
-		sfDir:             sfDir,
-		segmentSizeBytes:  segmentSizeBytes,
-		manager:           mgr,
-		ownsManager:       false,
-		slotLock:          lock,
-		ring:              ring,
-		watermark:         watermark,
-		appendDeadline:    appendDeadline,
-		recoveredFromDisk: recoveredFromDisk,
+		sfDir:               sfDir,
+		segmentSizeBytes:    segmentSizeBytes,
+		manager:             mgr,
+		ownsManager:         false,
+		slotLock:            lock,
+		ring:                ring,
+		watermark:           watermark,
+		persistedSymbolDict: persistedDict,
+		appendDeadline:      appendDeadline,
+		recoveredFromDisk:   recoveredFromDisk,
 	}
 	ok = true
 	return e, nil
@@ -382,6 +422,17 @@ func (e *qwpSfCursorEngine) engineAcknowledge(seq int64) {
 // engineAckedFsn returns the highest FSN safe to send.
 func (e *qwpSfCursorEngine) engineAckedFsn() int64 {
 	return e.ring.segmentRingAckedFsn()
+}
+
+// engineSetLogger points the segment manager's cap-reached backpressure
+// diagnostic at the configured logger. The manager's worker goroutine is
+// already running by the time the caller has a logger, so the store is
+// through an atomic.Pointer; a nil logger leaves the slog.Default() fallback.
+func (e *qwpSfCursorEngine) engineSetLogger(l *slog.Logger) {
+	if e == nil || e.manager == nil {
+		return
+	}
+	e.manager.logger.Store(l)
 }
 
 // engineAckNotify returns a channel closed the next time ackedFsn
@@ -423,6 +474,23 @@ func (e *qwpSfCursorEngine) engineWasRecoveredFromDisk() bool {
 	return e.recoveredFromDisk
 }
 
+// engineDeltaDictEnabled reports whether the sender may delta-encode the
+// symbol dictionary on this engine. Always true in memory mode (a reconnect
+// replays from the in-process ring and the send loop re-registers the whole
+// dictionary via a catch-up frame). In disk mode it requires the persisted
+// dictionary to have opened, since delta frames are not self-sufficient and
+// recovery / orphan-drain must rebuild the dictionary from disk. false in disk
+// mode → the sender falls back to full self-sufficient frames.
+func (e *qwpSfCursorEngine) engineDeltaDictEnabled() bool {
+	return e.sfDir == "" || e.persistedSymbolDict != nil
+}
+
+// enginePersistedSymbolDict returns the engine's .symbol-dict side-file, or
+// nil in memory mode (and in disk mode if it failed to open).
+func (e *qwpSfCursorEngine) enginePersistedSymbolDict() *qwpSfSymbolDict {
+	return e.persistedSymbolDict
+}
+
 // enginePublishedFsn returns the highest FSN whose frame is fully
 // written and visible to consumers (the I/O thread). -1 when nothing
 // has been appended yet.
@@ -457,10 +525,10 @@ func (e *qwpSfCursorEngine) engineFindSegmentContaining(fsn int64) *qwpSfSegment
 // passing a tighter deadline than e.appendDeadline get their
 // deadline respected.
 //
-// A send-loop HALT latched while the producer is parked here (the wire
-// failed terminally, or the reconnect budget ran out) short-circuits
-// the spin: the loop has stopped draining the ring, so the deadline
-// would only ever expire. engineAppendBlocking returns the latched
+// A send-loop HALT latched while the producer is parked here (a
+// sanctioned terminal — auth, poisoned frame, protocol violation)
+// short-circuits the spin: the loop has stopped draining the ring, so
+// the deadline would only ever expire. engineAppendBlocking returns the latched
 // terminal error directly via the engineSetTerminalErrorGetter hook, so
 // the parked producer fails fast with the real cause instead of a
 // generic backpressure timeout.
@@ -491,7 +559,7 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 	timer := time.NewTimer(qwpSfEngineParkInterval)
 	defer timer.Stop()
 	for {
-		// A send-loop HALT (or reconnect-budget exhaustion) stops the
+		// A send-loop HALT stops the
 		// loop draining the ring: ACK-driven trim ceases, so the
 		// backpressure can never clear and the deadline would only ever
 		// expire. Surface the latched terminal error immediately instead
@@ -592,7 +660,17 @@ func (e *qwpSfCursorEngine) engineSetTerminalErrorGetter(getter func() error) {
 // parked — never on the steady-state hot path.
 func (e *qwpSfCursorEngine) engineTerminalError() error {
 	if g := e.terminalError.Load(); g != nil {
-		return (*g)()
+		if err := (*g)(); err != nil {
+			return err
+		}
+	}
+	// A dead manager worker stops the provisioning/trim that would clear
+	// backpressure, so surface it here rather than letting the producer spin to
+	// the deadline behind a generic timeout.
+	if e.manager != nil {
+		if err := e.manager.managerWorkerError(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -638,6 +716,19 @@ func (e *qwpSfCursorEngine) formatBackpressureTimeout() error {
 // watermark if fully drained, release the slot lock LAST (so the
 // kernel-held flock outlives any other cleanup work).
 func (e *qwpSfCursorEngine) engineClose() error {
+	return e.engineCloseInternal(false)
+}
+
+// engineCloseLeakSegments tears the engine down like engineClose but leaves the
+// segment mmaps mapped, for the caller whose send loop was abandoned wedged in
+// an un-cancellable page fault: unmapping under that goroutine would fault the
+// host process. The address space leaks until process exit; every other
+// resource (fds, watermark, slot lock) is released normally.
+func (e *qwpSfCursorEngine) engineCloseLeakSegments() error {
+	return e.engineCloseInternal(true)
+}
+
+func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	if !e.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -646,7 +737,7 @@ func (e *qwpSfCursorEngine) engineClose() error {
 	// acquires appendMu after us bails before touching the ring;
 	// acquiring it here drains any append currently in flight. Held
 	// across segmentRingClose so the active segment is nil'd + munmapped
-	// with no producer dereferencing it (C3: a SenderErrorHandler's
+	// with no producer dereferencing it (a SenderErrorHandler's
 	// Close() racing a producer parked in engineAppendBlocking's
 	// backpressure spin). appendMu is never held by the manager
 	// goroutine, so joining it under the lock cannot deadlock.
@@ -666,7 +757,7 @@ func (e *qwpSfCursorEngine) engineClose() error {
 	if e.ownsManager {
 		e.manager.segmentManagerClose()
 	}
-	if err := e.ring.segmentRingClose(); err != nil && firstErr == nil {
+	if err := e.ring.segmentRingCloseInternal(leakSegments); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	// Close the watermark mmap/fd after the manager (the sole writer
@@ -680,14 +771,20 @@ func (e *qwpSfCursorEngine) engineClose() error {
 			firstErr = err
 		}
 	}
+	if e.persistedSymbolDict != nil {
+		if err := e.persistedSymbolDict.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	if fullyDrained {
 		if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		// A watermark with no segments behind it would only confuse
-		// the next session's recovery seed — drop it, matching the
+		// A watermark or dictionary with no segments behind it would only
+		// confuse the next session's recovery seed — drop them, matching the
 		// .sfa unlink and the fresh-slot removeOrphan above.
 		qwpSfAckWatermarkRemoveOrphan(e.sfDir)
+		qwpSfSymbolDictRemoveOrphan(e.sfDir)
 	}
 	if e.slotLock != nil {
 		if err := e.slotLock.close(); err != nil && firstErr == nil {

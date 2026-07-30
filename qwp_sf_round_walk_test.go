@@ -78,9 +78,95 @@ func newRoundWalkHealthyServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+// newRoundWalkDurableServer accepts the WS upgrade AND advertises durable-ack,
+// standing in for a replication primary.
+func newRoundWalkDurableServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+}
+
 // hostPortOf extracts host:port from an httptest URL.
 func hostPortOf(srv *httptest.Server) string {
 	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// TestRoundWalkBindsDurablePeerWhenFirstLacksDurableAck pins the Java
+// buildAndConnect contract: a foreground durable-ack sweep walks PAST an endpoint
+// that does not advertise durable-ack and binds a later durable-advertising
+// primary, rather than aborting the whole sweep on the first mismatch.
+func TestRoundWalkBindsDurablePeerWhenFirstLacksDurableAck(t *testing.T) {
+	plainSrv := newRoundWalkHealthyServer(t) // upgrades OK, no durable-ack header
+	defer plainSrv.Close()
+	durableSrv := newRoundWalkDurableServer(t)
+	defer durableSrv.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, plainSrv),
+		endpointForServer(t, durableSrv),
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	factory := qwpSfBuildEndpointFactory(endpoints, "ws", qwpTransportOpts{
+		endpointPath:      qwpWritePath,
+		requestDurableAck: true,
+	}, nil)
+	params := qwpSfRoundWalkParams{
+		Factory:                 factory,
+		Tracker:                 tracker,
+		Endpoints:               endpoints,
+		MaxDuration:             5 * time.Second,
+		InitialBackoff:          50 * time.Millisecond,
+		MaxBackoff:              500 * time.Millisecond,
+		DurableMismatchTerminal: true,
+	}
+	result := qwpSfRunRoundWalk(context.Background(), nil, params, -1)
+
+	require.Nil(t, result.Terminal, "a durable primary exists — the mismatch must not be terminal")
+	require.NotNil(t, result.Transport, "must walk past the non-durable host and bind the durable primary")
+	defer result.Transport.close()
+	assert.Equal(t, 1, result.Idx)
+}
+
+// TestRoundWalkTerminalWhenNoEndpointAdvertisesDurableAck: when the WHOLE sweep
+// lacks durable-ack, the remembered mismatch surfaces as terminal (fail closed).
+func TestRoundWalkTerminalWhenNoEndpointAdvertisesDurableAck(t *testing.T) {
+	a := newRoundWalkHealthyServer(t)
+	defer a.Close()
+	b := newRoundWalkHealthyServer(t)
+	defer b.Close()
+
+	endpoints := []qwpEndpoint{endpointForServer(t, a), endpointForServer(t, b)}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	factory := qwpSfBuildEndpointFactory(endpoints, "ws", qwpTransportOpts{
+		endpointPath:      qwpWritePath,
+		requestDurableAck: true,
+	}, nil)
+	params := qwpSfRoundWalkParams{
+		Factory:                 factory,
+		Tracker:                 tracker,
+		Endpoints:               endpoints,
+		MaxDuration:             2 * time.Second,
+		InitialBackoff:          20 * time.Millisecond,
+		MaxBackoff:              100 * time.Millisecond,
+		DurableMismatchTerminal: true,
+	}
+	result := qwpSfRunRoundWalk(context.Background(), nil, params, -1)
+
+	require.Nil(t, result.Transport)
+	var mismatch *QwpDurableAckMismatchError
+	require.ErrorAs(t, result.Terminal, &mismatch)
 }
 
 // endpointForServer parses an httptest URL into a qwpEndpoint.
@@ -219,6 +305,94 @@ func TestRoundWalk426IsTransient(t *testing.T) {
 	assert.Equal(t, 1, result.Idx)
 }
 
+// TestRoundWalkProtocolRejectDefersToTransientTransportError is the C1
+// regression: a sweep that hit both a 404/426 protocol reject and a transient
+// transport error must NOT latch the deferred protocol-reject terminal. The
+// transport-errored host may be mid-restart, and terminating on the sibling's
+// misconfiguration would drop a running sender the outage was about to release
+// (Invariant B). The bounded walk exhausts its budget — keeps retrying — instead.
+func TestRoundWalkProtocolRejectDefersToTransientTransportError(t *testing.T) {
+	notFoundSrv := newRoundWalkRejectServer(t, 404, http.Header{})
+	defer notFoundSrv.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, notFoundSrv), // persistent 404 reject
+		{host: "127.0.0.1", port: 1},      // transient transport error (down host)
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	result := runWalkAgainst(t, endpoints, tracker, -1,
+		300*time.Millisecond, 20*time.Millisecond, 50*time.Millisecond)
+
+	require.Nil(t, result.Transport, "no endpoint is bindable in this sweep")
+	require.Nil(t, result.Terminal,
+		"a 404 coexisting with a transient transport error must not terminate (Invariant B)")
+	require.NotNil(t, result.Exhausted,
+		"the bounded walk must exhaust its budget and keep retrying, not latch a terminal")
+}
+
+// TestRoundWalkProtocolRejectDefersToRoleReject pins that a 404/426 protocol
+// reject coexisting with a 421 role reject does not latch a terminal: a
+// role-rejecting replica is promotable and may become a compatible primary, so
+// the walk keeps retrying (Invariant B) rather than dropping a running sender.
+func TestRoundWalkProtocolRejectDefersToRoleReject(t *testing.T) {
+	notFoundSrv := newRoundWalkRejectServer(t, 404, http.Header{})
+	defer notFoundSrv.Close()
+	roleSrv := newRoundWalkRejectServer(t, 421, http.Header{
+		"X-QuestDB-Role": []string{"PRIMARY_CATCHUP"},
+	})
+	defer roleSrv.Close()
+
+	endpoints := []qwpEndpoint{
+		endpointForServer(t, notFoundSrv), // persistent 404 protocol reject
+		endpointForServer(t, roleSrv),     // 421 role reject (promotable replica)
+	}
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	result := runWalkAgainst(t, endpoints, tracker, -1,
+		200*time.Millisecond, 10*time.Millisecond, 30*time.Millisecond)
+
+	require.Nil(t, result.Transport, "no endpoint is bindable in this sweep")
+	require.Nil(t, result.Terminal,
+		"a 404 coexisting with a 421 role reject must not terminate (the replica may be promoted)")
+	require.NotNil(t, result.Exhausted,
+		"the bounded walk must exhaust and keep retrying, not latch a terminal")
+}
+
+// TestRoundWalkReconnectRedialsBoundHostPastDeferredTerminalSibling is the
+// regression for a stale attempted-bit skipping the previously-bound host on
+// reconnect. RecordSuccess leaves the bound host's round slot consumed; a
+// reconnect walk must start a fresh round so that host is a candidate again.
+// Otherwise a sweep that finds only a 404/426 (or durable-mismatch) sibling —
+// whose terminal is deferred to sweep exhaustion — latches that terminal
+// without ever redialing the healthy host, permanently dropping a sender that
+// should have reconnected (Invariant B).
+func TestRoundWalkReconnectRedialsBoundHostPastDeferredTerminalSibling(t *testing.T) {
+	tracker := newQwpHostTracker(2, "", qwpTargetAny)
+	tracker.recordSuccess(0, nil) // host 0 bound on the prior connection
+
+	dialed := make(map[int]int)
+	factory := func(_ context.Context, idx int) (*qwpTransport, error) {
+		dialed[idx]++
+		if idx == 0 {
+			return &qwpTransport{}, nil // healthy host, binds if dialed
+		}
+		return nil, &QwpUpgradeRejectError{StatusCode: 404} // misconfigured sibling
+	}
+	params := qwpSfRoundWalkParams{
+		Factory:        factory,
+		Tracker:        tracker,
+		MaxDuration:    0, // unbounded, like the running loop
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+	}
+	// previousIdx=0: reconnecting after a mid-stream drop on the bound host.
+	result := qwpSfRunRoundWalk(context.Background(), nil, params, 0)
+
+	require.Nil(t, result.Terminal, "must not latch a terminal while a healthy host is redialable")
+	require.NotNil(t, result.Transport, "must redial and bind the healthy host")
+	assert.Equal(t, 0, result.Idx)
+	assert.Positive(t, dialed[0], "healthy host 0 must be redialed")
+}
+
 // TestRoundWalkAuthErrorIsTerminal verifies that 401/403 short-
 // circuits the walk — even if other peers might be reachable, the
 // failover-loop spec treats AuthError as cluster-wide.
@@ -238,7 +412,7 @@ func TestRoundWalkAuthErrorIsTerminal(t *testing.T) {
 
 	assert.Nil(t, result.Transport)
 	require.NotNil(t, result.Terminal, "401 must surface as Terminal QwpUpgradeRejectError")
-	assert.Equal(t, 401, result.Terminal.StatusCode)
+	assert.Equal(t, 401, result.Terminal.(*QwpUpgradeRejectError).StatusCode)
 	// Tracker should NOT have host 1 as Healthy — the walk bailed
 	// before reaching it.
 	snap := tracker.snapshot()
@@ -645,7 +819,7 @@ func TestRunSingleRoundAuthErrorShortCircuits(t *testing.T) {
 
 	assert.Nil(t, rr.Transport)
 	require.NotNil(t, rr.Terminal, "401 must short-circuit as Terminal")
-	assert.Equal(t, 401, rr.Terminal.StatusCode)
+	assert.Equal(t, 401, rr.Terminal.(*QwpUpgradeRejectError).StatusCode)
 	assert.Equal(t, 1, rr.Attempts, "walk must stop after the auth-failing host")
 	assert.NotEqual(t, qwpHostHealthy, tracker.snapshot()[1].state,
 		"walk must not have reached the healthy peer")
@@ -803,7 +977,7 @@ func TestInitialConnectOffFailsWhenAllRejected(t *testing.T) {
 }
 
 // TestQwpMemoryModeMultiHostFailsOverToHealthy is the regression test
-// for review C2: memory mode (no sf_dir) must honour the multi-host
+// that memory mode (no sf_dir) must honour the multi-host
 // addr= list exactly as SF mode does. The README's headline failover
 // example (ws::addr=node-a,node-b,node-c;) is memory mode, so a dead
 // first endpoint must not hard-fail the constructor — the sender has
@@ -842,7 +1016,7 @@ func TestQwpMemoryModeMultiHostFailsOverToHealthy(t *testing.T) {
 		"the healthy peer must have received the row — proving the bind landed on host 1")
 }
 
-// TestQwpMemoryModeThreadsFailoverConfig pins the rest of review C2:
+// TestQwpMemoryModeThreadsFailoverConfig pins the remaining case:
 // memory mode must thread the multi-host failover tracker AND the
 // user's reconnect budget into the send loop, not discard them. The
 // pre-fix memory path installed no tracker (so reconnect could never
@@ -1042,4 +1216,54 @@ func TestInitialConnectStaysOnPrimaryAfterTopologyChange(t *testing.T) {
 	// stickiness property has regressed.
 	assert.Equal(t, int64(1), rejectHits.Load(),
 		"rejecting host must be touched only by the initial round-walk")
+}
+
+// TestRoundWalkRoleRejectBackoffGrows pins the 70c706a parity fix: an
+// all-replica window pays the same growing capped backoff as any other
+// outage. The former flat InitialBackoff retry re-dialed a fresh TLS
+// handshake ~10/s per endpoint for the whole window.
+func TestRoundWalkRoleRejectBackoffGrows(t *testing.T) {
+	factory := func(context.Context, int) (*qwpTransport, error) {
+		return nil, &QwpUpgradeRejectError{StatusCode: 421, Role: "REPLICA"}
+	}
+	tracker := newQwpHostTracker(1, "", qwpTargetAny)
+	rounds := 0
+	result := qwpSfRunRoundWalk(context.Background(), nil, qwpSfRoundWalkParams{
+		Factory:        factory,
+		Tracker:        tracker,
+		MaxDuration:    700 * time.Millisecond,
+		InitialBackoff: 20 * time.Millisecond,
+		MaxBackoff:     200 * time.Millisecond,
+		OnRoundExhausted: func(outcome qwpSfSweepOutcome) {
+			rounds++
+			require.True(t, outcome.allReplica(), "every sweep here is all-replica")
+		},
+	}, -1)
+	require.NotNil(t, result.Exhausted)
+	// The growing jittered schedule (20, 40, 80, 160, 200… ms) fits only a
+	// handful of rounds into the budget; the former flat 20ms schedule fit 20+.
+	assert.GreaterOrEqual(t, rounds, 2)
+	assert.LessOrEqual(t, rounds, 10, "role-reject rounds must pay growing backoff")
+}
+
+// TestRoundWalkUnboundedNeverExhausts pins the Invariant-B walk shape:
+// MaxDuration <= 0 retries indefinitely and exits only on success,
+// terminal, or cancellation — never Exhausted.
+func TestRoundWalkUnboundedNeverExhausts(t *testing.T) {
+	factory := func(context.Context, int) (*qwpTransport, error) {
+		return nil, errors.New("dial tcp: connect: connection refused")
+	}
+	tracker := newQwpHostTracker(1, "", qwpTargetAny)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	result := qwpSfRunRoundWalk(ctx, nil, qwpSfRoundWalkParams{
+		Factory:        factory,
+		Tracker:        tracker,
+		MaxDuration:    0,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     5 * time.Millisecond,
+	}, -1)
+	require.Nil(t, result.Exhausted, "unbounded walk must never report Exhausted")
+	require.NotNil(t, result.Cancelled, "only cancellation ends an unbounded walk against a down server")
+	assert.Greater(t, result.Attempts, 10, "walk should have kept attempting for the whole window")
 }

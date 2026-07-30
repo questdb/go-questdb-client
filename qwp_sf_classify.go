@@ -25,7 +25,7 @@
 package questdb
 
 import (
-	"log"
+	"log/slog"
 
 	"github.com/coder/websocket"
 )
@@ -50,50 +50,50 @@ func qwpSfClassify(status QwpStatusCode) Category {
 		return CategorySecurityError
 	case QwpStatusWriteError:
 		return CategoryWriteError
+	case QwpStatusNotWritable:
+		return CategoryNotWritable
 	default:
 		return CategoryUnknown
 	}
 }
 
-// qwpSfDefaultPolicyFor is the spec default Policy for each Category,
-// used when the user has not overridden the slot via builder option or
-// connect-string. CategoryProtocolViolation and CategoryUnknown are
-// forced HALT and the resolver enforces this independent of user
+// qwpSfDefaultPolicyFor is the default Category → Policy mapping, used
+// when the user has not overridden the slot via builder option or
+// connect-string. There is no drop policy: a rejection is either
+// replayed (RETRIABLE / RETRIABLE_OTHER — the bytes stay in the SF
+// log, the connection is recycled, replay resumes from ackedFsn+1) or
+// halts the sender loudly (TERMINAL — reserved for rejections that are
+// deterministic under byte-identical replay; the bytes stay on disk).
+// CategoryProtocolViolation is forced TERMINAL and CategoryUnknown is
+// forced RETRIABLE; the resolver enforces both independent of user
 // overrides.
-//
-// Reasoning per the spec § "Default category → policy":
-//   - SchemaMismatch / WriteError → DropAndContinue: replay reproduces
-//     the same rejection; halting blocks unrelated tables on the same
-//     connection.
-//   - ParseError → Halt: almost certainly a client bug; halt preserves
-//     the on-disk frames for postmortem.
-//   - InternalError / SecurityError → Halt: catch-all server fault or
-//     misconfig; loud failure wanted, no retryable bit available.
-//   - ProtocolViolation / Unknown → Halt: connection is gone or the
-//     status byte is not one we can interpret — never silently drop.
 func qwpSfDefaultPolicyFor(c Category) Policy {
 	switch c {
-	case CategorySchemaMismatch, CategoryWriteError:
-		return PolicyDropAndContinue
-	case CategoryParseError, CategoryInternalError, CategorySecurityError:
-		return PolicyHalt
-	case CategoryProtocolViolation, CategoryUnknown:
-		return PolicyHalt
+	case CategoryWriteError, // transient server state (disk pressure, suspended table)
+		CategoryInternalError, // transient by definition; deterministic repeats poison-escalate
+		CategoryUnknown:       // fail open: status byte from a newer server
+		return PolicyRetriable
+	case CategoryNotWritable: // read-only replica / demoting primary: rotate endpoints
+		return PolicyRetriableOther
+	case CategorySchemaMismatch, // deterministic: same bytes, same mismatch
+		CategoryParseError,    // deterministic: malformed bytes never parse
+		CategorySecurityError: // ACL denial on a writable node (read-only refusals arrive as role-change closes)
+		return PolicyTerminal
+	case CategoryProtocolViolation:
+		return PolicyTerminal
 	default:
-		return PolicyHalt
+		return PolicyTerminal
 	}
 }
 
-// qwpSfIsTerminalCloseCode reports whether a WebSocket close code is
-// terminal — replaying the same bytes will produce the same close, so
-// reconnect cannot fix it. Translates to CategoryProtocolViolation.
-//
-// Reserved codes 1004/1005/1006/1015 are deliberately not classified
-// terminal: when they arrive in practice they signal abnormal
-// disconnect rather than the server's reasoned rejection of payload
-// bytes, so reconnect is the right reaction.
-//
-// Mirror of Java CursorWebSocketSendLoop.isTerminalCloseCode.
+// qwpSfIsTerminalCloseCode reports whether a WebSocket close code
+// nominally signals a protocol-layer violation per RFC 6455. NO LONGER
+// consulted by the policy path: WS close codes carry no policy
+// semantics (policy travels only in QWP NACK frames), every close is
+// reconnect-eligible, and a frame that deterministically kills the
+// connection is caught behaviorally by the poison-frame detector
+// (max_frame_rejections) rather than by this code list. Retained for
+// diagnostics and tests.
 func qwpSfIsTerminalCloseCode(code websocket.StatusCode) bool {
 	switch code {
 	case websocket.StatusProtocolError,
@@ -116,13 +116,17 @@ func qwpSfIsTerminalCloseCode(code websocket.StatusCode) bool {
 //  3. global (connect-string on_server_error)
 //  4. spec default (qwpSfDefaultPolicyFor)
 //
-// CategoryProtocolViolation and CategoryUnknown bypass user overrides
-// and always resolve to PolicyHalt — silently ignoring user-set
-// non-Halt slots for those two categories.
+// CategoryProtocolViolation and CategoryUnknown bypass user overrides —
+// ProtocolViolation always resolves to PolicyTerminal and Unknown to
+// PolicyRetriable (fail open) — silently ignoring user-set slots for
+// those two categories.
 type qwpSfPolicyResolver struct {
 	resolver func(Category) Policy
 	perCat   [numCategories]Policy
 	global   Policy
+	// logger sinks the resolver panic-guard diagnostic. nil ->
+	// slog.Default() via qwpEffectiveLogger.
+	logger *slog.Logger
 }
 
 // callResolver invokes the user-supplied resolver under a panic guard.
@@ -130,7 +134,7 @@ type qwpSfPolicyResolver struct {
 // WithErrorPolicyResolver callback would otherwise crash the host. A
 // panic is treated as a user bug: recover, log, and fall back to the
 // spec default for the category. That default is always a concrete
-// Halt / DropAndContinue (never PolicyAuto), so resolve's
+// policy (never PolicyAuto), so resolve's
 // `!= PolicyAuto` check short-circuits the rest of the precedence chain
 // — a broken resolver yields the safe spec policy rather than silently
 // deferring to lower-precedence slots. A clean return is propagated
@@ -140,7 +144,8 @@ type qwpSfPolicyResolver struct {
 func (r *qwpSfPolicyResolver) callResolver(c Category) (pol Policy) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			log.Printf("[ERROR] qwp/sf: error policy resolver panicked on category %s: %v", c, rec)
+			qwpEffectiveLogger(r.logger).Error("qwp/sf: error policy resolver panicked",
+				"category", c, "panic", rec)
 			pol = qwpSfDefaultPolicyFor(c)
 		}
 	}()
@@ -149,12 +154,17 @@ func (r *qwpSfPolicyResolver) callResolver(c Category) (pol Policy) {
 
 // resolve returns the Policy to apply for the given Category.
 // PolicyAuto is never returned — every category resolves to a concrete
-// Halt or DropAndContinue choice.
+// Retriable / RetriableOther / Terminal choice.
 func (r *qwpSfPolicyResolver) resolve(c Category) Policy {
-	// Forced HALT for unknown / protocol-violation regardless of user
-	// configuration — silence forbidden, no DROP for the unintelligible.
-	if c == CategoryProtocolViolation || c == CategoryUnknown {
-		return PolicyHalt
+	// Forced regardless of user configuration: a poison-escalated /
+	// protocol-level violation is deterministic (TERMINAL); an
+	// unintelligible status byte fails open to retry so a newer server
+	// cannot kill deployed senders (RETRIABLE).
+	if c == CategoryProtocolViolation {
+		return PolicyTerminal
+	}
+	if c == CategoryUnknown {
+		return PolicyRetriable
 	}
 	if r != nil {
 		if r.resolver != nil {

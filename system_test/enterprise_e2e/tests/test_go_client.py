@@ -24,6 +24,7 @@ LOG = logging.getLogger(__name__)
 
 
 def _connect_string(http_port: int, sf_dir: Path, *,
+                    request_durable_ack: bool = True,
                     reconnect_max_ms: int = 60_000,
                     close_flush_timeout_ms: int = 5_000) -> str:
     parts = [
@@ -34,11 +35,12 @@ def _connect_string(http_port: int, sf_dir: Path, *,
         f"reconnect_max_duration_millis={reconnect_max_ms}",
         f"close_flush_timeout_millis={close_flush_timeout_ms}",
     ]
+    if request_durable_ack:
+        parts.append("request_durable_ack=on")
     return ";".join(parts) + ";"
 
 
 @pytest.mark.go_client
-@pytest.mark.xfail(reason="request_durable_ack=on not yet implemented in Go client")
 def test_kill9_primary_failover_no_data_loss(server_factory, go_sidecar,
                                               obj_store: ObjStore, scenario_dir: Path) -> None:
     """Kill -9 P1 mid-flight, verify P2 has every row."""
@@ -71,7 +73,6 @@ def test_kill9_primary_failover_no_data_loss(server_factory, go_sidecar,
 
 
 @pytest.mark.go_client
-@pytest.mark.xfail(reason="request_durable_ack=on not yet implemented in Go client")
 def test_failover_during_active_send(server_factory, go_sidecar,
                                      obj_store: ObjStore, scenario_dir: Path) -> None:
     """Kill P1 while the sender is still pushing batches."""
@@ -108,7 +109,6 @@ def test_failover_during_active_send(server_factory, go_sidecar,
 
 
 @pytest.mark.go_client
-@pytest.mark.xfail(reason="request_durable_ack=on not yet implemented in Go client")
 def test_two_failovers_in_one_scenario(server_factory, go_sidecar,
                                        obj_store: ObjStore, scenario_dir: Path) -> None:
     """Multiple failovers in a row — no row should be lost."""
@@ -157,9 +157,10 @@ def test_two_failovers_in_one_scenario(server_factory, go_sidecar,
 @pytest.mark.go_client
 def test_ok_trim_loses_rows_without_durable_ack(server_factory, go_sidecar,
                                                  obj_store: ObjStore, scenario_dir: Path) -> None:
-    """Go client doesn't support durable-ack yet; SF trims on OK. Killing
-    P1 between OK and WAL upload, then wiping everything, should lose rows.
-    This is the expected negative case that proves the harness works."""
+    """The negative control: with request_durable_ack=off the SF trims on
+    OK, so killing P1 between OK and WAL upload and wiping everything
+    should lose rows. This proves the failover tests above pass *because
+    of* durable-ack, not by luck — and that the harness detects loss."""
     table = "go_trades_no_durable"
     sf_dir = scenario_dir / "sf"
     row_count = 50
@@ -167,7 +168,7 @@ def test_ok_trim_loses_rows_without_durable_ack(server_factory, go_sidecar,
     p1 = server_factory("p1")
     p1_ports = p1.start()
 
-    go_sidecar.connect(_connect_string(p1_ports.http, sf_dir))
+    go_sidecar.connect(_connect_string(p1_ports.http, sf_dir, request_durable_ack=False))
     go_sidecar.send(table, count=row_count, start_index=0)
     fsn = go_sidecar.flush()
     go_sidecar.await_acked(fsn, timeout_ms=30_000)

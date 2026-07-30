@@ -457,13 +457,25 @@ func (s *qwpSfSegment) msync() error {
 // a failed mmap during qwpSfOpenSegment); fields that were never
 // initialised are nil and we skip them.
 func (s *qwpSfSegment) close() error {
+	return s.closeInternal(false)
+}
+
+// closeInternal releases the segment. With leakMapping the mmap is deliberately
+// left mapped and s.buf untouched, so a send-loop goroutine wedged in an
+// un-cancellable page fault against this mapping keeps a valid address to fault
+// against instead of hitting an unmapped page (an unrecoverable host SIGSEGV).
+// The file descriptor is still closed — a closed fd does not invalidate an
+// existing mapping — so only the address space is leaked, until process exit.
+func (s *qwpSfSegment) closeInternal(leakMapping bool) error {
 	var firstErr error
-	if !s.memoryBacked && s.buf != nil {
+	if !s.memoryBacked && s.buf != nil && !leakMapping {
 		if err := qwpSfMunmap(s.buf); err != nil {
 			firstErr = err
 		}
 	}
-	s.buf = nil
+	if !leakMapping {
+		s.buf = nil
+	}
 	if s.file != nil {
 		if err := s.file.Close(); err != nil && firstErr == nil {
 			firstErr = err

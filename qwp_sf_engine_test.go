@@ -200,7 +200,7 @@ func TestQwpSfEngineBackpressureTimeoutReconnecting(t *testing.T) {
 // must surface as the terminal error, fast — not as a backpressure
 // timeout after the full append deadline. The engine polls the wired
 // terminal-error getter on every spin iteration so the parked producer
-// fails fast with the real cause (M2).
+// fails fast with the real cause.
 func TestQwpSfEngineBackpressureTerminalErrorFailFast(t *testing.T) {
 	const segSize int64 = 96 // 24 header + 72 payload; three 24B frames fill it
 	// A long deadline makes the fail-fast unambiguous: without the

@@ -35,7 +35,7 @@ import (
 )
 
 // TestQwpSplitFlushSegmentCapSendsFitTablesDropsOversize is the core
-// per-table-split regression test (review item M6): a multi-table batch
+// per-table-split regression test: a multi-table batch
 // whose combined frame overruns the per-segment cap must NOT destroy
 // every table's rows. enqueueCursor falls back to a per-table split that
 // flushes each table whose own frame fits and drops only the table that

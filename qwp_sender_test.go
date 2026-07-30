@@ -80,9 +80,8 @@ func newQwpSenderForTest(t *testing.T, serverURL string) *qwpLineSender {
 }
 
 // flushAndAwaitAck flushes pending rows and blocks until the server
-// has ACKed them. Flush no longer waits for the ACK (Java decision
-// #1 — see design/qwp-cursor-durability.md), so tests that assert
-// server-side receipt must use this FlushAndGetSequence +
+// has ACKed them. Flush no longer waits for the ACK, so tests that
+// assert server-side receipt must use this FlushAndGetSequence +
 // AwaitAckedFsn barrier instead of relying on Flush alone.
 func flushAndAwaitAck(t *testing.T, s *qwpLineSender) {
 	t.Helper()
@@ -338,6 +337,89 @@ func TestQwpSenderSymbolDictionary(t *testing.T) {
 	// After flush, maxSentSymbolId should be updated.
 	if s.maxSentSymbolId != 1 {
 		t.Fatalf("maxSentSymbolId = %d, want 1", s.maxSentSymbolId)
+	}
+}
+
+// TestQwpSenderErrorOversizedSymbolValue verifies that an over-cap
+// symbol value is rejected at Symbol() — before interning. Symbol bytes
+// live in the global dictionary, not the row, so without this guard the
+// per-row batch-cap check never sees them; the entry would get a
+// permanent id, every dict delta covering it would be over-cap, and all
+// future new-symbol batches would be dropped while the watermark never
+// passes it.
+func TestQwpSenderErrorOversizedSymbolValue(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	huge := strings.Repeat("x", qwpMaxSymbolValueLen+1)
+	err := s.Table("t").
+		Symbol("sym", huge).
+		Int64Column("v", 1).
+		AtNow(context.Background())
+	if err == nil {
+		t.Fatal("AtNow: want oversized symbol value error, got nil")
+	}
+	if !strings.Contains(err.Error(), "symbol value length") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The oversized value must never reach the dictionary.
+	if len(s.globalSymbols) != 0 || len(s.globalSymbolList) != 0 {
+		t.Fatalf("oversized value interned [map=%d, list=%d], want empty",
+			len(s.globalSymbols), len(s.globalSymbolList))
+	}
+
+	// The error latched and drained at AtNow; subsequent valid rows
+	// must still flow all the way to the server.
+	if err := s.Table("t").
+		Symbol("sym", "ok").
+		Int64Column("v", 2).
+		AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow after rejected symbol value: %v", err)
+	}
+	flushAndAwaitAck(t, s)
+	if s.maxSentSymbolId != 0 {
+		t.Fatalf("maxSentSymbolId = %d, want 0", s.maxSentSymbolId)
+	}
+}
+
+func TestQwpSenderSymbolValueAtLimit(t *testing.T) {
+	// newQwpTestServer keeps coder/websocket's default 32 KiB read
+	// limit, far below the frame an at-limit dict entry produces;
+	// raise it so the mock accepts what a real server would.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		conn.SetReadLimit(qwpMaxFrameReadLimit)
+		var seq int64
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+			conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq))
+			seq++
+		}
+	}))
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	atLimit := strings.Repeat("y", qwpMaxSymbolValueLen)
+	if err := s.Table("t").
+		Symbol("sym", atLimit).
+		Int64Column("v", 1).
+		AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow with at-limit symbol value: %v", err)
+	}
+	flushAndAwaitAck(t, s)
+	if s.maxSentSymbolId != 0 {
+		t.Fatalf("maxSentSymbolId = %d, want 0", s.maxSentSymbolId)
 	}
 }
 
@@ -1651,21 +1733,19 @@ func TestQwpSenderSymbolDictAcrossFlushes(t *testing.T) {
 		t.Fatalf("msg1 deltaCount = %d, want 2", deltaCount)
 	}
 
-	// Cursor mode emits self-sufficient frames: every batch carries
-	// the full symbol dict from id 0. So the second message also
-	// has deltaStart=0 (NOT 2), with all three symbols repeated.
-	// This is the documented "self-sufficient frames" decision (see
-	// design/qwp-cursor-durability.md decision #14).
+	// Memory mode delta-encodes the symbol dict: on one connection each
+	// symbol id is registered once, so the second message carries only the
+	// new id (GOOG) as a delta starting at 2 — not the whole dict from 0.
 	msg2 := messages[1]
 	off = qwpHeaderSize
 	deltaStart2, n, _ := qwpReadVarint(msg2[off:])
 	off += n
-	if deltaStart2 != 0 {
-		t.Fatalf("msg2 deltaStart = %d, want 0 (cursor mode is self-sufficient)", deltaStart2)
+	if deltaStart2 != 2 {
+		t.Fatalf("msg2 deltaStart = %d, want 2 (delta above the sent watermark)", deltaStart2)
 	}
 	deltaCount2, _, _ := qwpReadVarint(msg2[off:])
-	if deltaCount2 != 3 {
-		t.Fatalf("msg2 deltaCount = %d, want 3 (full dict re-sent)", deltaCount2)
+	if deltaCount2 != 1 {
+		t.Fatalf("msg2 deltaCount = %d, want 1 (only the new symbol)", deltaCount2)
 	}
 }
 
@@ -1682,8 +1762,8 @@ func TestQwpSenderServerError(t *testing.T) {
 			if err != nil {
 				return
 			}
-			// Return PARSE_ERROR (default Halt). WRITE_ERROR is now
-			// default Drop and would not surface a terminal Flush
+			// Return PARSE_ERROR (default TERMINAL). WRITE_ERROR is
+			// default RETRIABLE and would not surface a terminal Flush
 			// error.
 			errMsg := "bad message"
 			ack := make([]byte, 11+len(errMsg))
@@ -1885,8 +1965,8 @@ func TestQwpAsyncSenderTerminalOnFlushFailure(t *testing.T) {
 		defer conn.CloseNow()
 
 		// Read the first message, then return a PARSE_ERROR
-		// (default Halt). WRITE_ERROR is now default Drop and would
-		// not poison the sender.
+		// (default TERMINAL). WRITE_ERROR is default RETRIABLE and
+		// would not poison the sender.
 		_, _, err = conn.Read(context.Background())
 		if err != nil {
 			return
