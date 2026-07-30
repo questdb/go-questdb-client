@@ -365,10 +365,10 @@ type qwpSfSendLoop struct {
 	framesSentOnConn atomic.Int64
 
 	// acksOnConn counts server acks received on the current connection
-	// (reset on every connection swap). run() paces a recycle whose
-	// connection sent frames but got nothing back, so a server that
-	// upgrades and then closes without acking cannot hot-loop
-	// dial→replay→close with no backoff.
+	// (reset on every connection swap), catch-up-frame acks included.
+	// connMadeNoRealProgress pairs it with framesSentOnConn so an ack that
+	// only covered the reconnect dictionary catch-up does not read as
+	// progress and skip the recycle pacing.
 	acksOnConn atomic.Int64
 
 	// Poison-frame detector state. poisonFsn is the FSN implicated by
@@ -1149,14 +1149,14 @@ func (l *qwpSfSendLoop) run() {
 					return
 				}
 				rejectionRecycle = true
-			} else if l.acksOnConn.Load() == 0 {
-				// A close before this connection produced any ack — whether or
-				// not we sent anything — paces the recycle without a strike, so a
-				// server that accepts the connection and then immediately closes
-				// it (an upgrade-then-close, or an idle producer against a
-				// flapping endpoint) cannot hot-loop dial→close→dial at full
-				// rate. The backoff resets on the first ack that reaches a
-				// retried frame.
+			} else if l.connMadeNoRealProgress() {
+				// A close on a connection that moved no real row data — no ack
+				// at all, or (the idle-producer case) an ack that only covered
+				// the reconnect dictionary catch-up frame — paces the recycle
+				// with capped backoff, so a server that accepts the connection
+				// and then immediately closes it cannot hot-loop
+				// dial→catch-up→close at full rate. The backoff resets on the
+				// first ack that reaches a real retried frame.
 				rejectionRecycle = true
 			}
 		}
@@ -1182,6 +1182,18 @@ func (l *qwpSfSendLoop) run() {
 			return
 		}
 	}
+}
+
+// connMadeNoRealProgress reports whether the just-dropped connection moved no
+// real row data: it received no ack, or it sent no real data frame at all.
+// framesSentOnConn is bumped only by segment-backed frames, never by the
+// reconnect dictionary catch-up, and the server acks that catch-up on every
+// reconnect — so acksOnConn alone would read a catch-up ack as progress and let
+// an idle producer against a flapping endpoint hot-loop dial→catch-up→close
+// with no backoff. run() pairs the two counters here so only a real data frame
+// that gets acked counts as progress and resets the recycle backoff.
+func (l *qwpSfSendLoop) connMadeNoRealProgress() bool {
+	return l.acksOnConn.Load() == 0 || l.framesSentOnConn.Load() == 0
 }
 
 // runOneConnection runs the send + receive goroutines for the

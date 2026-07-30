@@ -1673,6 +1673,34 @@ func TestQwpSfSendLoopNoteAckProgressPacing(t *testing.T) {
 	require.Equal(t, int64(-1), l.poisonFsn)
 }
 
+// TestQwpSfSendLoopConnProgressIgnoresCatchUpAck pins that a reconnect
+// dictionary catch-up ack does not, by itself, count as connection progress.
+// The catch-up frame is re-sent and acked on every reconnect but moves no rows;
+// framesSentOnConn stays zero until a real data frame goes out. An idle producer
+// against a flapping endpoint would otherwise see the catch-up ack (acksOnConn
+// > 0) as progress and skip the recycle pacing, hot-looping dial→catch-up→close.
+func TestQwpSfSendLoopConnProgressIgnoresCatchUpAck(t *testing.T) {
+	l := &qwpSfSendLoop{}
+
+	// Idle connection, nothing acked: no progress, pace the recycle.
+	require.True(t, l.connMadeNoRealProgress())
+
+	// Only the catch-up frame was acked; no real data frame went out. This is
+	// the flapping-endpoint case the fix guards — still no progress.
+	l.acksOnConn.Store(2)
+	l.framesSentOnConn.Store(0)
+	require.True(t, l.connMadeNoRealProgress())
+
+	// A real data frame was sent and acked: genuine progress, reconnect
+	// promptly with no extra backoff.
+	l.framesSentOnConn.Store(1)
+	require.False(t, l.connMadeNoRealProgress())
+
+	// A real data frame was sent but nothing acked yet: no progress, pace.
+	l.acksOnConn.Store(0)
+	require.True(t, l.connMadeNoRealProgress())
+}
+
 // TestQwpSfSendLoopRecordRejectionStrikeDualCondition pins that poison
 // escalation requires BOTH the strike count AND the episode-duration floor
 // (reconnectMaxDuration). Reaching the strike count while the episode is younger
