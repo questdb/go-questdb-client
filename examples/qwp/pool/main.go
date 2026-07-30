@@ -78,7 +78,21 @@ func main() {
 	if err := qwpSender.AtNano(ctx, time.Now()); err != nil {
 		log.Fatal(err)
 	}
-	if err := qwpSender.Flush(ctx); err != nil {
+	// This example reads the row straight back with a count query below, so it
+	// must confirm the write committed first. Flush publishes the batch to the
+	// background send loop but does NOT wait for the server ACK, so a plain
+	// Flush here can let the SELECT run before the row lands and print a count
+	// of 0. FlushAndGetSequence returns this batch's frame sequence;
+	// AwaitAckedFsn blocks until the server acknowledges it. A write-only app
+	// does not need the wait — Flush alone is enough.
+	fsn, err := qwpSender.FlushAndGetSequence(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ackCtx, cancelAck := context.WithTimeout(ctx, 10*time.Second)
+	err = qwpSender.AwaitAckedFsn(ackCtx, fsn)
+	cancelAck()
+	if err != nil {
 		log.Fatal(err)
 	}
 	if err := qwpSender.Close(ctx); err != nil {
