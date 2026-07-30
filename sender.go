@@ -1691,8 +1691,6 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 		name = "QWP dump writer"
 	case conf.authTimeoutMs != 0:
 		name = "auth_timeout_ms"
-	case conf.connectTimeoutMs != 0:
-		name = "connect_timeout"
 	case conf.zone != "":
 		name = "zone"
 	case conf.target != qwpTargetAny:

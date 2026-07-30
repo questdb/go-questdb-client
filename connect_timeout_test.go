@@ -216,3 +216,53 @@ func TestConnectTimeoutHttpCustomTransportNotMutated(t *testing.T) {
 		t.Error("custom DialContext was not invoked — connect_timeout replaced it")
 	}
 }
+
+// TestConnectTimeoutAcceptedThroughFullConstruction pins that connect_timeout
+// reaches a working sender through the whole construction path, not just the
+// connect-string parser. It is a COMMON key: HTTP wires it to a private dialer,
+// TCP leaves it inert, and neither may reject it. The guard is against
+// re-adding connect_timeout to rejectQwpOnlyOptions, which makes the parser
+// accept the key while sender construction rejects it — the contradiction the
+// earlier build had, where the same conf string parsed but failed to build.
+//
+// The other HTTP connect_timeout tests build via newHttpLineSender directly,
+// which skips the sanitizer where the bug lived; these go through the public
+// entry points so the sanitizer runs.
+func TestConnectTimeoutAcceptedThroughFullConstruction(t *testing.T) {
+	ctx := context.Background()
+
+	// HTTP end to end through the public conf-string API: parse, sanitize,
+	// build. protocol_version=2 skips the version-detect request so no network
+	// is touched. This is the exact form that previously parsed but failed to
+	// build with "connect_timeout is only available in the QWP client".
+	t.Run("http/conf-string", func(t *testing.T) {
+		s, err := LineSenderFromConf(ctx,
+			"http::addr=localhost:9000;protocol_version=2;connect_timeout=5000;")
+		if err != nil {
+			t.Fatalf("HTTP conf-string rejected connect_timeout: %v", err)
+		}
+		_ = s.Close(ctx)
+	})
+
+	// HTTP through the option path, mirroring TestQwpOnlyOptionsRejectedOnHttpAndTcp
+	// but asserting acceptance. WithProtocolVersion(2) skips the dial.
+	t.Run("http/option", func(t *testing.T) {
+		s, err := NewLineSender(ctx, WithHttp(), WithAddress("localhost:9000"),
+			WithProtocolVersion(2), WithConnectTimeout(5*time.Second))
+		if err != nil {
+			t.Fatalf("HTTP option path rejected connect_timeout: %v", err)
+		}
+		_ = s.Close(ctx)
+	})
+
+	// TCP tolerates the key (inert, matching the Java client). The sanitizer
+	// must accept it; assert that directly since full TCP construction dials.
+	t.Run("tcp/sanitizer", func(t *testing.T) {
+		conf := newLineSenderConfig(tcpSenderType)
+		WithAddress("localhost:9009")(conf)
+		WithConnectTimeout(5 * time.Second)(conf)
+		if err := sanitizeTcpConf(conf); err != nil {
+			t.Fatalf("TCP sanitizer rejected connect_timeout: %v", err)
+		}
+	})
+}
