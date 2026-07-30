@@ -1430,20 +1430,23 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 		}
 		return false, err
 	}
-	// The frame is fully on the wire. Publish highestFullySent only
-	// now, after sendMessage returns: this is what lets the receiver
-	// safely let an ACK advance ackedFsn over this frame. Until this
-	// store the receiver clamps any ACK naming this sequence down to
-	// the previous frame, so the segment manager cannot trim (munmap)
-	// the segment while the payload slice we handed sendMessage still
-	// points into it.
-	l.highestFullySent.Store(wireSeq)
+	// The frame is fully on the wire. Mirror the symbols it introduced
+	// before publishing highestFullySent: payload points into the mmap'd
+	// segment, and publishing highestFullySent is what lets the receiver
+	// advance ackedFsn over this frame — which in turn lets the segment
+	// manager trim (munmap) the segment. Both reads of payload (the
+	// sendMessage above and accumulateSentDict here) must complete before
+	// that store, or accumulateSentDict could dereference an unmapped page.
 	if l.deltaDictEnabled {
-		// Mirror the symbols this frame introduced so a later reconnect can
-		// re-register the whole dictionary. Idempotent on replay: a frame
-		// whose delta we already hold advances nothing.
+		// Re-register the whole dictionary on a later reconnect. Idempotent
+		// on replay: a frame whose delta we already hold advances nothing.
 		l.accumulateSentDict(payload)
 	}
+	// Publish highestFullySent only now, after every read of payload. Until
+	// this store the receiver clamps any ACK naming this sequence down to
+	// the previous frame, so an early/forged ACK cannot advance ackedFsn
+	// over the in-flight frame and the segment stays mapped.
+	l.highestFullySent.Store(wireSeq)
 	// An ACK for this frame may already have landed and been held back
 	// while highestFullySent still trailed it; reconcile now that the
 	// watermark is published so a quiescent last frame — whose ACK has
