@@ -114,6 +114,12 @@ type qwpSenderSlot struct {
 	idleSince  time.Time
 }
 
+// qwpMaxPoolSize caps sender_pool_max. A larger value is a misconfiguration: in
+// SF mode the pool allocates a maxSize-entry slot table and stats every slot
+// dir in [0, maxSize) at construction, so an outsized value (e.g. 100000000)
+// would allocate a huge slice and hang the launch.
+const qwpMaxPoolSize = 10000
+
 // newQwpSenderPool parses the cluster config, prewarms minSize senders, and (in
 // SF mode) recovers any crash-stranded in-range slots on async senders. Returns
 // an error only on a malformed config or a failed eager prewarm; SF recovery
@@ -130,6 +136,9 @@ func newQwpSenderPool(
 ) (*qwpSenderPool, error) {
 	if minSize < 0 || maxSize < 1 || minSize > maxSize {
 		return nil, fmt.Errorf("qwp pool: invalid sizes min=%d max=%d (max defaults to %d when unset — raise sender_pool_max alongside min)", minSize, maxSize, qwpDefaultPoolMax)
+	}
+	if maxSize > qwpMaxPoolSize {
+		return nil, fmt.Errorf("qwp pool: sender_pool_max=%d exceeds the maximum %d; a pool this large is a misconfiguration (SF mode would allocate a %d-entry slot table and stat that many slot dirs at startup)", maxSize, qwpMaxPoolSize, maxSize)
 	}
 	template, err := confFromStr(conf)
 	if err != nil {

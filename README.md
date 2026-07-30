@@ -167,6 +167,8 @@ db, err := qdb.NewQuestDB(ctx, "ws::addr=localhost:9000;",
 | `housekeeper_interval_ms` | `WithHousekeeperInterval` | `5000` | Reaper sweep interval. |
 | `lazy_connect` | `WithLazyConnect` | `off` | Tolerate a down server at startup (see below). |
 | `connect_timeout` | `WithConnectTimeout` | OS default | Per-dial TCP connect timeout in milliseconds, common to ingest and query (`0` = keep the OS default). |
+| `query_close_timeout_ms` | `WithQwpQueryCloseTimeout` | `5000` | How long a query lease's `Close` waits to drain an abandoned statement's cursor before evicting the connection. |
+| `connection_listener_inbox_capacity` | `WithConnectionListenerInboxCapacity` | `256` | Bounded inbox depth for the `SenderConnectionListener` event stream (floor `16`). |
 
 Unlike the Java client's facade, the Go `QuestDB` handle accepts the ingest
 error handler and connection listener directly via
@@ -472,7 +474,7 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | `sf_max_segment_bytes` | 4 MiB | Per-segment file size. |
 | `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
-| `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as the poison-frame episode budget (`max_frame_rejections`). |
+| `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as (a) the poison-frame episode budget (`max_frame_rejections`) and (b) a background drainer's no-progress / durable-stall watchdog — the time a live-but-stalled adopted slot is given before it is quarantined. Setting it small speeds up the initial connect and shrinks (a); the drainer watchdog (b) is floored at 30s (×4 in durable mode) so a small value can't wrongly quarantine a slow-but-healthy slot. |
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
 | `initial_connect_retry` | `off` | `off` = terminal on first failure; `on`/`sync` = retry, blocking the constructor; `async` = retry on the I/O goroutine, constructor returns immediately. |

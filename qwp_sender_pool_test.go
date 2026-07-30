@@ -889,6 +889,9 @@ func TestQwpSenderPoolConstructorErrors(t *testing.T) {
 	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;", 3, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil); err == nil {
 		t.Error("min>max should error")
 	}
+	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;", 0, qwpMaxPoolSize+1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil); err == nil {
+		t.Errorf("sender_pool_max above the %d cap should error", qwpMaxPoolSize)
+	}
 	if _, err := newQwpSenderPool(ctx, "ws::addr=a:9000;init_buf_size=abc;", 0, 1, time.Second, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil); err == nil {
 		t.Error("malformed conf should error")
 	}

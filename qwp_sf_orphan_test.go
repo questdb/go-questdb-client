@@ -787,6 +787,11 @@ func TestSfConfDrainOrphansEndToEnd(t *testing.T) {
 // The watchdog must quarantine the slot with a .failed sentinel after
 // reconnectMaxDuration of zero ACK progress on a live connection.
 func TestQwpSfDrainerMarksFailedWhenConnectedButNeverAcked(t *testing.T) {
+	// The 300ms budget below is deliberately sub-floor to keep the watchdog
+	// fast; lower the production floor (30s) for the duration of this test.
+	defer func(orig time.Duration) { qwpSfMinNoProgressBudget = orig }(qwpSfMinNoProgressBudget)
+	qwpSfMinNoProgressBudget = 10 * time.Millisecond
+
 	// silentAcks: read frames forever, never ACK, keep the
 	// connection open — exactly the wedged-but-connected scenario.
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{silentAcks: true})
@@ -939,4 +944,23 @@ func TestQwpSfDrainerAllReplicaWindowRetriesAndFiresPrimaryUnavailable(t *testin
 		t.Fatal("drainer did not finish after a primary reappeared")
 	}
 	assert.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome())
+}
+
+func TestQwpSfDrainerNoProgressBudgetFloor(t *testing.T) {
+	// A tiny reconnect_max_duration (set to fail the blocking initial connect
+	// fast) must not shrink the live-connection no-progress watchdog below the
+	// floor, or a healthy-but-slow adopted slot could be quarantined early.
+	d := &qwpSfOrphanDrainer{reconnectMaxDuration: time.Millisecond}
+	assert.Equal(t, qwpSfMinNoProgressBudget, d.noProgressBudget(),
+		"a sub-floor reconnectMaxDuration must be raised to the floor")
+
+	// A value above the floor is honored exactly.
+	d = &qwpSfOrphanDrainer{reconnectMaxDuration: 10 * time.Minute}
+	assert.Equal(t, 10*time.Minute, d.noProgressBudget(),
+		"a reconnectMaxDuration above the floor is used as-is")
+
+	// Unset (zero) falls back to the default, which is above the floor.
+	d = &qwpSfOrphanDrainer{}
+	assert.Equal(t, qwpSfDefaultReconnectMaxDuration, d.noProgressBudget(),
+		"an unset reconnectMaxDuration falls back to the default")
 }

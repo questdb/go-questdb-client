@@ -1149,11 +1149,14 @@ func (l *qwpSfSendLoop) run() {
 					return
 				}
 				rejectionRecycle = true
-			} else if sentSomething && l.acksOnConn.Load() == 0 {
-				// Orderly close (or any close before the first ack) after we
-				// sent frames but got nothing back: pace the recycle without a
-				// strike, so a server that upgrades and then closes without
-				// acking cannot hot-loop dial→replay→close at full rate.
+			} else if l.acksOnConn.Load() == 0 {
+				// A close before this connection produced any ack — whether or
+				// not we sent anything — paces the recycle without a strike, so a
+				// server that accepts the connection and then immediately closes
+				// it (an upgrade-then-close, or an idle producer against a
+				// flapping endpoint) cannot hot-loop dial→close→dial at full
+				// rate. The backoff resets on the first ack that reaches a
+				// retried frame.
 				rejectionRecycle = true
 			}
 		}
@@ -1527,7 +1530,13 @@ func (l *qwpSfSendLoop) applyAckWatermark() {
 // (like sendLoopSetErrorHandler) so a repeated registration can't leak the old
 // dispatcher's goroutine.
 func (l *qwpSfSendLoop) sendLoopSetProgressHandler(handler SenderProgressHandler, capacity int) {
-	old := l.progressDispatcher.Swap(newQwpProgressDispatcher(handler, capacity))
+	d := newQwpProgressDispatcher(handler, capacity)
+	if d != nil {
+		// nil when handler is nil (no dispatch) — unlike the error and
+		// connection dispatchers, which are never nil.
+		d.logger = l.logger
+	}
+	old := l.progressDispatcher.Swap(d)
 	if old != nil {
 		old.close()
 	}

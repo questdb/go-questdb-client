@@ -124,6 +124,13 @@ const qwpSfDrainerPollInterval = 50 * time.Millisecond
 // drainer.
 const qwpSfDurableStallFactor = 4
 
+// qwpSfMinNoProgressBudget floors the drainer's live-connection no-progress
+// watchdog so a small reconnect_max_duration_millis (set to fail the blocking
+// initial connect fast) cannot also shrink the watchdog and quarantine a
+// healthy-but-slow adopted slot. Durable mode scales it by qwpSfDurableStallFactor.
+// A var, not a const, only so tests can lower it to keep the watchdog fast.
+var qwpSfMinNoProgressBudget = 30 * time.Second
+
 // qwpSfDrainerPoolCloseGrace bounds how long the pool's close()
 // waits for active drainers to exit cleanly before cancelling the
 // pool's master ctx to forcibly unwind blocking dials. Mirrors the
@@ -232,6 +239,23 @@ func qwpSfNewOrphanDrainer(
 	d.outcome.Store(int32(qwpSfDrainOutcomePending))
 	d.stopCh = make(chan struct{})
 	return d
+}
+
+// noProgressBudget is the live-connection no-progress watchdog budget: how long
+// a bound-but-not-advancing drain is tolerated before quarantine. It derives
+// from reconnectMaxDuration (the default when unset) but never drops below
+// qwpSfMinNoProgressBudget, so bounding the blocking initial connect with a
+// small reconnect_max_duration_millis cannot also wrongly quarantine a
+// slow-but-healthy slot. Durable mode scales the result by qwpSfDurableStallFactor.
+func (d *qwpSfOrphanDrainer) noProgressBudget() time.Duration {
+	budget := d.reconnectMaxDuration
+	if budget <= 0 {
+		budget = qwpSfDefaultReconnectMaxDuration
+	}
+	if budget < qwpSfMinNoProgressBudget {
+		budget = qwpSfMinNoProgressBudget
+	}
+	return budget
 }
 
 // drainerOutcome returns the terminal state of the drainer's run,
@@ -515,13 +539,11 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// This bounds only a LIVE-but-not-acking connection: transport
 	// outages never charge it (a reconnect window resets/pauses the
 	// clocks below), so a long server outage cannot quarantine the
-	// slot (Invariant B). reconnectMaxDuration is reused as the
-	// wedge-settle budget knob: a smaller reconnect_max_duration_millis
-	// deliberately shortens it too.
-	noProgressBudget := d.reconnectMaxDuration
-	if noProgressBudget <= 0 {
-		noProgressBudget = qwpSfDefaultReconnectMaxDuration
-	}
+	// slot (Invariant B). The budget derives from reconnectMaxDuration but is
+	// floored (see noProgressBudget), so a small reconnect_max_duration_millis
+	// set to bound the blocking initial connect cannot also quarantine a
+	// slow-but-healthy slot here.
+	noProgressBudget := d.noProgressBudget()
 	lastProgressAcked := engine.engineAckedFsn()
 	lastProgressAcks := loop.sendLoopTotalAcks()
 	lastProgressAt := time.Now()

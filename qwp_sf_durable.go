@@ -105,8 +105,16 @@ func newQwpDurableTracker() *qwpDurableTracker {
 // sequence — the signature of a server that coalesced or dropped an OK ack,
 // leaving the skipped frames without a pending entry and thus untracked for
 // durable trimming. It returns the expected sequence for diagnostics and, when
-// there is no gap, records seq as the high-water mark. A duplicate or reordered
-// seq (<= lastSeq) is left to the conservative drain (never over-advances).
+// there is no gap, records seq as the high-water mark.
+//
+// A duplicate or reordered seq (<= lastSeq) is not a forward gap, so it is left
+// to the conservative drain, which never over-advances. The consequence if a
+// contract-violating server keeps re-sending a low or duplicate seq: the
+// durable trim can stall at the head of the pending queue (the expected seq
+// never arrives) and the acknowledged watermark stops advancing. Because the
+// watermark only ever under-advances, no data is lost or double-trimmed; the
+// untrimmed backlog instead surfaces as ordinary SF-out-of-space backpressure
+// on the producer — the sanctioned failure mode, not a crash or corruption.
 func (t *qwpDurableTracker) seqGap(seq int64) (expected int64, gap bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
