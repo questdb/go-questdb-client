@@ -85,11 +85,12 @@ type qwpSfSegmentManager struct {
 	// next append instead.
 	workerPanic atomic.Pointer[string]
 
-	mu              sync.Mutex
-	rings           []qwpSfManagerRingEntry
-	totalBytes      int64
-	lastDiskFullLog time.Time
-	closed          bool
+	mu                 sync.Mutex
+	rings              []qwpSfManagerRingEntry
+	totalBytes         int64
+	lastDiskFullLog    time.Time
+	lastMaintenanceLog time.Time
+	closed             bool
 
 	// wakeup is a single-slot channel. wakeWorker pushes into it
 	// non-blockingly; the worker drains in select to coalesce signals.
@@ -434,6 +435,9 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 			} else {
 				path = m.nextSparePath(e.dir)
 				spare, err = qwpSfCreateSegment(path, e.ring.nextSeqHint(), m.segmentSizeBytes)
+				if err == nil && e.ring.manifest != nil {
+					err = spare.markManifestRequired()
+				}
 			}
 			if err == nil {
 				// Install + commit atomically under the manager lock.
@@ -464,6 +468,9 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 					}
 				}
 			} else if path != "" {
+				if spare != nil {
+					_ = spare.close()
+				}
 				// Defense-in-depth: qwpSfCreateSegment already best-
 				// effort removes the file on its own failure paths
 				// (truncate fail, mmap fail). If a future change
@@ -493,16 +500,72 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 	// 3. Trim any segments that the ring says are fully acked. For
 	//    memory-mode rings, "trim" is just close (the slice is GC'd) —
 	//    no file to unlink.
-	trim := e.ring.drainTrimmable()
+	trim := e.ring.peekTrimmable()
+	if len(trim) == 0 {
+		return
+	}
+	if !memoryMode {
+		if err := e.watermark.sync(); err != nil {
+			m.recordServiceError(e.dir, err)
+			return
+		}
+		if err := qwpSfSyncDir(e.dir); err != nil {
+			m.recordServiceError(e.dir, fmt.Errorf("pre-trim directory fsync: %w", err))
+			return
+		}
+		newHead := e.ring.headAfterTrim(len(trim))
+		active := e.ring.getActiveSegment()
+		if active == nil {
+			m.recordServiceError(e.dir, errors.New("ring has no active segment during trim"))
+			return
+		}
+		if e.ring.manifest == nil {
+			m.recordServiceError(e.dir, errors.New("disk ring has no SF manifest during trim"))
+			return
+		}
+		if err := e.ring.manifest.update(newHead, active.segmentBaseSeq()); err != nil {
+			m.recordServiceError(e.dir, err)
+			return
+		}
+	}
+	trim = e.ring.drainTrimBatch(len(trim))
+	var trimErr error
+	var trimmedBytes int64
 	for _, s := range trim {
 		path := s.segmentPath()
 		sz := s.segmentSize()
-		_ = s.close()
-		if path != "" {
-			_ = os.Remove(path)
+		if err := s.close(); err != nil && trimErr == nil {
+			trimErr = err
 		}
-		m.mu.Lock()
-		m.totalBytes -= sz
-		m.mu.Unlock()
+		if path != "" {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && trimErr == nil {
+				trimErr = err
+			}
+		}
+		trimmedBytes += sz
+	}
+	if !memoryMode {
+		if err := qwpSfSyncDir(e.dir); err != nil && trimErr == nil {
+			trimErr = fmt.Errorf("post-trim directory fsync: %w", err)
+		}
+	}
+	if trimErr != nil {
+		m.recordServiceError(e.dir, trimErr)
+	}
+	m.mu.Lock()
+	m.totalBytes -= trimmedBytes
+	m.mu.Unlock()
+}
+
+func (m *qwpSfSegmentManager) recordServiceError(dir string, err error) {
+	now := time.Now()
+	m.mu.Lock()
+	shouldLog := now.Sub(m.lastMaintenanceLog) >= qwpSfManagerDiskFullLogThrottle
+	if shouldLog {
+		m.lastMaintenanceLog = now
+	}
+	m.mu.Unlock()
+	if shouldLog {
+		qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager maintenance failed; will retry", "dir", dir, "error", err)
 	}
 }

@@ -395,7 +395,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		}
 	}()
 
-	engine, err := qwpSfNewCursorEngine(d.slotPath, d.segmentSize, d.sfMaxTotalBytes, qwpSfEngineDefaultAppendDeadline)
+	engine, err := qwpSfNewCursorEngineForDrainer(d.slotPath, d.segmentSize, d.sfMaxTotalBytes, qwpSfEngineDefaultAppendDeadline)
 	if err != nil {
 		// Lock contention is expected (a sibling drainer or the
 		// foreground sender holds it) — exit silently, no .failed.

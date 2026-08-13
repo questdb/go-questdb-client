@@ -66,6 +66,52 @@ func TestQwpSfScanOrphansFindsCandidates(t *testing.T) {
 	assert.Equal(t, filepath.Join(root, "orphan-1"), orphans[0])
 }
 
+func TestQwpSfManifestOnlySlotIsCandidateButQuarantineRootIsNot(t *testing.T) {
+	root := t.TempDir()
+	slot := filepath.Join(root, "manifest-only")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	m, err := qwpSfManifestCreate(slot, 0, 1)
+	require.NoError(t, err)
+	require.NoError(t, m.close())
+	assert.True(t, qwpSfIsCandidateOrphan(slot))
+
+	quarantineRoot := filepath.Join(root, "quarantined")
+	require.NoError(t, os.MkdirAll(filepath.Join(quarantineRoot, "sender-1"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(quarantineRoot, "sender-1", "sf-initial.sfa"), []byte("preserved"), 0o644))
+	assert.False(t, qwpSfIsCandidateOrphan(quarantineRoot))
+}
+
+func TestQwpSfDrainerHandlesManifestOnlySlots(t *testing.T) {
+	t.Run("data-boundaries-mark-failed-with-reason", func(t *testing.T) {
+		slot := t.TempDir()
+		m, err := qwpSfManifestCreate(slot, 0, 1)
+		require.NoError(t, err)
+		require.NoError(t, m.close())
+
+		d := qwpSfNewOrphanDrainer(slot, 4096, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+		d.drainerRun(context.Background())
+		assert.Equal(t, qwpSfDrainOutcomeFailed, d.drainerOutcome())
+		body, err := os.ReadFile(filepath.Join(slot, qwpSfFailedSentinelName))
+		require.NoError(t, err)
+		assert.Contains(t, string(body), "sf-manifest.bin references durable data")
+	})
+
+	t.Run("collapsed-boundaries-clean-up", func(t *testing.T) {
+		slot := t.TempDir()
+		m, err := qwpSfManifestCreate(slot, 4, 4)
+		require.NoError(t, err)
+		require.NoError(t, m.close())
+
+		d := qwpSfNewOrphanDrainer(slot, 4096, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+		d.drainerRun(context.Background())
+		assert.Equal(t, qwpSfDrainOutcomeSuccess, d.drainerOutcome())
+		_, err = os.Stat(filepath.Join(slot, qwpSfManifestFileName))
+		assert.True(t, os.IsNotExist(err))
+		_, err = os.Stat(filepath.Join(slot, qwpSfFailedSentinelName))
+		assert.True(t, os.IsNotExist(err))
+	})
+}
+
 func TestQwpSfScanOrphansEmptyDirReturnsNothing(t *testing.T) {
 	root := t.TempDir()
 	assert.Empty(t, qwpSfScanOrphans(root, nil))

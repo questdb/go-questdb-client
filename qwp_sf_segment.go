@@ -50,10 +50,11 @@ import (
 //	                                                              [payloadLen bytes]
 //	crc32c covers (payloadLen, payload).
 const (
-	qwpSfFileMagic       uint32 = 0x31304653 // 'SF01' little-endian on disk
-	qwpSfFrameHeaderSize int64  = 8          // u32 crc + u32 payloadLen
-	qwpSfHeaderSize      int64  = 24         // total file header
-	qwpSfSegmentVersion  byte   = 1
+	qwpSfFileMagic            uint32 = 0x31304653 // 'SF01' little-endian on disk
+	qwpSfFrameHeaderSize      int64  = 8          // u32 crc + u32 payloadLen
+	qwpSfHeaderSize           int64  = 24         // total file header
+	qwpSfSegmentVersion       byte   = 1
+	qwpSfManifestRequiredFlag byte   = 0x01
 )
 
 // qwpSfCrcTable is the CRC32C (Castagnoli) polynomial table shared
@@ -78,16 +79,15 @@ var qwpSfErrLockBusy = errors.New("qwp/sf: lock busy")
 var qwpSfErrSegmentFull = errors.New("qwp/sf: segment full")
 
 // qwpSfErrSegmentCorrupt marks a segment file whose *content* is not a
-// valid SF segment: a file shorter than the header, bad magic, an
-// unsupported version, or a negative baseSeq. qwpSfOpenSegment wraps
-// these with this sentinel so qwpSfOpenRing can tell them apart from
+// valid SF segment: a file shorter than the header, bad magic, or a
+// negative baseSeq. qwpSfOpenSegment wraps these with this sentinel so
+// qwpSfRecoverRing can tell them apart from
 // syscall/I-O failures (open/stat/mmap returning EMFILE/ENFILE/ENOMEM/
 // EACCES/EIO), which it propagates unwrapped. The distinction is
-// load-bearing for crash recovery: a corrupt file holds no recoverable
-// frames and is skipped, whereas an I-O failure means an otherwise-valid
-// segment is merely unreadable right now (the system is under pressure),
-// so recovery must refuse to start rather than silently amputate the
-// durable-but-unacked log.
+// load-bearing for crash recovery: corruption quarantine is deferred until
+// manifest boundaries prove the file is not part of the committed chain. An
+// I/O failure means an otherwise-valid segment is merely unreadable right now,
+// so recovery aborts without quarantining anything.
 //
 //lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 var qwpSfErrSegmentCorrupt = errors.New("qwp/sf: corrupt segment file")
@@ -151,7 +151,8 @@ type qwpSfSegment struct {
 	// segments and for cleanly partially-filled segments (uninitialised
 	// tail). Set only by qwpSfOpenSegment; visible to recovery callers
 	// for diagnostics. Final after construction.
-	tornTailBytes int64
+	tornTailBytes     int64
+	tornTailSanitized bool
 }
 
 // qwpSfCreateSegment creates a fresh segment file at path,
@@ -238,21 +239,19 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 // it RW, validates the header magic / version, then scans frames
 // forward verifying each CRC. The first bad CRC (or a frame whose
 // declared length runs past the file end) is treated as a torn tail;
-// both cursors are positioned at the start of that frame. Returns the
-// segment ready for further appends.
+// both cursors are positioned at the start of that frame. Recovery durably
+// zeroes a validated active tail before making the segment appendable.
 //
 // If recovery observes a torn tail (bytes at the bail-out position
 // are non-zero, indicating an attempted-but-failed frame write), the
 // byte count is exposed via tornTailBytes() so operators can detect
 // silent truncation from corruption or partial writes.
 //
-// Errors are classified for the recovery caller (qwpSfOpenRing): a
-// bad-content file (short file, bad magic, unsupported version,
-// negative baseSeq) is wrapped with qwpSfErrSegmentCorrupt and is safe
-// to skip; a syscall/I-O failure from stat/open/mmap (EMFILE, ENFILE,
-// ENOMEM, EACCES, EIO, ...) is propagated unwrapped, because the file
-// may be a perfectly valid segment that is merely unreadable under
-// resource pressure and must not be silently dropped from the log.
+// Errors are classified for qwpSfRecoverRing. Short files, bad magic, and
+// negative baseSeq are corruption evidence whose quarantine is deferred until
+// the manifest decision tree validates the surviving chain. Unsupported
+// versions and syscall/I-O failures are operational errors: the bytes may be
+// intact and must not be quarantined by this client build.
 func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	st, err := os.Stat(path)
 	if err != nil {
@@ -281,7 +280,7 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	if version != qwpSfSegmentVersion {
 		_ = qwpSfMunmap(buf)
 		_ = f.Close()
-		return nil, fmt.Errorf("%w: unsupported version in %s: %d", qwpSfErrSegmentCorrupt, path, version)
+		return nil, fmt.Errorf("qwp/sf: unsupported segment version in %s: %d", path, version)
 	}
 	baseSeq := int64(binary.LittleEndian.Uint64(buf[8:16]))
 	// FSNs are non-negative by construction. A negative baseSeq on disk
@@ -319,7 +318,7 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 func (s *qwpSfSegment) writeHeader(baseSeq int64) {
 	binary.LittleEndian.PutUint32(s.buf[0:4], qwpSfFileMagic)
 	s.buf[4] = qwpSfSegmentVersion
-	s.buf[5] = 0 // flags
+	s.buf[5] = 0                                 // flags
 	binary.LittleEndian.PutUint16(s.buf[6:8], 0) // reserved
 	binary.LittleEndian.PutUint64(s.buf[8:16], uint64(baseSeq))
 	binary.LittleEndian.PutUint64(s.buf[16:24], uint64(time.Now().UnixMicro()))
@@ -385,6 +384,50 @@ func (s *qwpSfSegment) rebaseSeq(newBaseSeq int64) error {
 	}
 	s.baseSeq = newBaseSeq
 	binary.LittleEndian.PutUint64(s.buf[8:16], uint64(newBaseSeq))
+	return nil
+}
+
+func (s *qwpSfSegment) segmentManifestRequired() bool {
+	return s != nil && !s.memoryBacked && len(s.buf) >= int(qwpSfHeaderSize) && s.buf[5]&qwpSfManifestRequiredFlag != 0
+}
+
+func (s *qwpSfSegment) markManifestRequired() error {
+	if s == nil || s.memoryBacked {
+		return nil
+	}
+	s.buf[5] |= qwpSfManifestRequiredFlag
+	return s.syncHeader()
+}
+
+func (s *qwpSfSegment) syncHeader() error {
+	if s == nil || s.memoryBacked {
+		return nil
+	}
+	if err := qwpSfMsync(s.buf, qwpSfHeaderSize); err != nil {
+		return fmt.Errorf("qwp/sf: msync segment header %s: %w", s.path, err)
+	}
+	if err := s.file.Sync(); err != nil {
+		return fmt.Errorf("qwp/sf: fsync segment header %s: %w", s.path, err)
+	}
+	return nil
+}
+
+func (s *qwpSfSegment) sanitizeTornTail() error {
+	if s == nil || s.memoryBacked || s.tornTailBytes == 0 || s.tornTailSanitized {
+		return nil
+	}
+	if s.appendCursor != s.sizeBytes-s.tornTailBytes {
+		return fmt.Errorf("qwp/sf: torn-tail cursor mismatch in %s: cursor=%d expected=%d", s.path, s.appendCursor, s.sizeBytes-s.tornTailBytes)
+	}
+	clear(s.buf[s.appendCursor:s.sizeBytes])
+	if err := qwpSfMsync(s.buf, s.sizeBytes); err != nil {
+		return fmt.Errorf("qwp/sf: msync sanitized torn tail %s: %w", s.path, err)
+	}
+	if err := s.file.Sync(); err != nil {
+		return fmt.Errorf("qwp/sf: fsync sanitized torn tail %s: %w", s.path, err)
+	}
+	s.tornTailSanitized = true
+	s.tornTailBytes = 0
 	return nil
 }
 
@@ -552,12 +595,8 @@ func qwpSfDetectTornTail(buf []byte, lastGood, fileSize int64) int64 {
 	if lastGood >= fileSize {
 		return 0
 	}
-	probe := qwpSfFrameHeaderSize
-	if fileSize-lastGood < probe {
-		probe = fileSize - lastGood
-	}
-	for i := int64(0); i < probe; i++ {
-		if buf[lastGood+i] != 0 {
+	for i := lastGood; i < fileSize; i++ {
+		if buf[i] != 0 {
 			return fileSize - lastGood
 		}
 	}

@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -188,6 +189,36 @@ type qwpSfCursorEngine struct {
 // process is using the slot), or if recovery encounters an
 // inconsistent on-disk state.
 func qwpSfNewCursorEngine(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
+	return qwpSfNewCursorEngineWithRecoveryPolicy(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, true)
+}
+
+func qwpSfNewCursorEngineForDrainer(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
+	return qwpSfNewCursorEngineWithRecoveryPolicy(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, false)
+}
+
+func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, recoverForeground bool) (*qwpSfCursorEngine, error) {
+	for attempt := 0; ; attempt++ {
+		e, err := qwpSfNewCursorEngineOnce(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline)
+		if err == nil || sfDir == "" || !recoverForeground {
+			return e, err
+		}
+		if errors.Is(err, qwpSfErrSanitizedResidue) && attempt == 0 {
+			qwpEffectiveLogger(nil).Error("qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
+			continue
+		}
+		if errors.Is(err, qwpSfErrRecoveryFailClosed) && attempt <= 1 {
+			quarantined, quarantineErr := qwpSfQuarantineSlot(sfDir)
+			if quarantineErr != nil {
+				return nil, fmt.Errorf("%w; additionally could not quarantine slot: %v", err, quarantineErr)
+			}
+			qwpEffectiveLogger(nil).Error("qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
+			continue
+		}
+		return nil, err
+	}
+}
+
+func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
 	mgr, err := qwpSfNewSegmentManager(segmentSizeBytes, qwpSfManagerDefaultPoll, maxTotalBytes)
 	if err != nil {
 		return nil, err
@@ -279,7 +310,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	// overlapping FSNs already on disk and corrupting ACK
 	// translation, trim, and replay.
 	if !memoryMode {
-		ring, err = qwpSfOpenRing(sfDir, segmentSizeBytes)
+		ring, _, err = qwpSfRecoverRing(sfDir, segmentSizeBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -320,10 +351,13 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			//     lowestBase is higher, watermark is stale; max picks
 			//     lowestBase-1.
 			//
-			// open() returns nil on any setup failure so a missing /
-			// unmappable file never takes the engine down — we just
-			// fall back to the bare lowestBase-1 seed.
-			watermark = qwpSfAckWatermarkOpen(sfDir)
+			watermark, err = qwpSfAckWatermarkOpenRequired(sfDir)
+			if err != nil || watermark == nil {
+				if err == nil {
+					err = errors.New("watermark open returned nil")
+				}
+				return nil, fmt.Errorf("qwp/sf: could not open required ack watermark: %w", err)
+			}
 			// Load the persisted symbol dictionary so this recovered slot's
 			// delta frames can be re-registered on a fresh server before they
 			// replay. A recovered slot's dictionary is NEVER recreated: its
@@ -380,7 +414,13 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// file) rather than honouring an FSN with no segments
 			// behind it.
 			qwpSfAckWatermarkRemoveOrphan(sfDir)
-			watermark = qwpSfAckWatermarkOpen(sfDir)
+			if !qwpSfManifestRemove(sfDir) {
+				return nil, fmt.Errorf("qwp/sf: could not remove stale manifest in %s", sfDir)
+			}
+			watermark, err = qwpSfAckWatermarkOpenRequired(sfDir)
+			if err != nil {
+				return nil, err
+			}
 			// Same stale-side-file hygiene for the symbol dictionary: a
 			// fresh slot starts with an empty dictionary.
 			qwpSfSymbolDictRemoveOrphan(sfDir)
@@ -391,7 +431,30 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		if err != nil {
 			return nil, err
 		}
-		ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
+		if !memoryMode {
+			if err := initial.syncHeader(); err != nil {
+				_ = initial.close()
+				return nil, err
+			}
+			if err := qwpSfSyncDir(sfDir); err != nil {
+				_ = initial.close()
+				return nil, fmt.Errorf("qwp/sf: fsync fresh slot directory: %w", err)
+			}
+			manifest, createErr := qwpSfManifestCreate(sfDir, 0, 0)
+			if createErr != nil {
+				_ = initial.close()
+				return nil, createErr
+			}
+			if err := initial.markManifestRequired(); err != nil {
+				_ = manifest.close()
+				_ = initial.close()
+				return nil, err
+			}
+			ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
+			ring.manifest = manifest
+		} else {
+			ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
+		}
 	}
 	if err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark); err != nil {
 		return nil, err
@@ -552,6 +615,9 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 	if fsn == qwpSfPayloadTooLarge {
 		return 0, qwpSfErrPayloadTooLarge
 	}
+	if fsn == qwpSfRotationFailed {
+		return 0, e.ring.rotationError()
+	}
 	// First miss → record one stall (not one per spin) and start the
 	// deadline clock.
 	e.backpressureStalls.Add(1)
@@ -586,6 +652,9 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 		}
 		if fsn == qwpSfPayloadTooLarge {
 			return 0, qwpSfErrPayloadTooLarge
+		}
+		if fsn == qwpSfRotationFailed {
+			return 0, e.ring.rotationError()
 		}
 	}
 }
@@ -753,6 +822,21 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 			e.ring.segmentRingAckedFsn() >= e.ring.segmentRingPublishedFsn())
 
 	var firstErr error
+	drainCleanupAllowed := fullyDrained
+	if fullyDrained {
+		e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
+		if err := e.watermark.sync(); err != nil {
+			firstErr = err
+			drainCleanupAllowed = false
+		}
+		active := e.ring.getActiveSegment()
+		if drainCleanupAllowed && active != nil && e.ring.manifest != nil {
+			if err := e.ring.manifest.update(active.segmentBaseSeq(), active.segmentBaseSeq()); err != nil {
+				firstErr = err
+				drainCleanupAllowed = false
+			}
+		}
+	}
 	e.manager.segmentManagerDeregister(e.ring)
 	if e.ownsManager {
 		e.manager.segmentManagerClose()
@@ -776,15 +860,31 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 			firstErr = err
 		}
 	}
-	if fullyDrained {
-		if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil && firstErr == nil {
-			firstErr = err
+	if drainCleanupAllowed {
+		if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			drainCleanupAllowed = false
 		}
-		// A watermark or dictionary with no segments behind it would only
-		// confuse the next session's recovery seed — drop them, matching the
-		// .sfa unlink and the fresh-slot removeOrphan above.
-		qwpSfAckWatermarkRemoveOrphan(e.sfDir)
-		qwpSfSymbolDictRemoveOrphan(e.sfDir)
+		if drainCleanupAllowed && !qwpSfManifestRemove(e.sfDir) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("qwp/sf: remove drained manifest in %s", e.sfDir)
+			}
+			drainCleanupAllowed = false
+		}
+		if drainCleanupAllowed {
+			if err := qwpSfSyncDir(e.sfDir); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				drainCleanupAllowed = false
+			}
+		}
+		if drainCleanupAllowed {
+			qwpSfAckWatermarkRemoveOrphan(e.sfDir)
+			qwpSfSymbolDictRemoveOrphan(e.sfDir)
+		}
 	}
 	if e.slotLock != nil {
 		if err := e.slotLock.close(); err != nil && firstErr == nil {
@@ -796,8 +896,8 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 
 // qwpSfUnlinkAllSegmentFiles unlinks every .sfa file under dir.
 // Called only on clean shutdown when the ring confirms every
-// published FSN has been acked. Best-effort: returns the first error
-// encountered but continues iterating.
+// published FSN has been acked. Files are removed in cleanup rank order and
+// removal stops at the first failure, leaving the manifest in place.
 func qwpSfUnlinkAllSegmentFiles(dir string) error {
 	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
@@ -809,15 +909,27 @@ func qwpSfUnlinkAllSegmentFiles(dir string) error {
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	var paths []string
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".sfa") {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
-		if rmErr := os.Remove(path); rmErr != nil && firstErr == nil {
-			firstErr = rmErr
+		paths = append(paths, filepath.Join(dir, e.Name()))
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		bi, bj := filepath.Base(paths[i]), filepath.Base(paths[j])
+		if bi == "sf-initial.sfa" {
+			return bj != "sf-initial.sfa"
+		}
+		if bj == "sf-initial.sfa" {
+			return false
+		}
+		return bi < bj
+	})
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
 	}
-	return firstErr
+	return nil
 }

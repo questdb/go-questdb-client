@@ -36,7 +36,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// writeForeignAckWatermark hand-writes the 16 normative bytes a
+// writeForeignAckWatermark hand-writes the normative dual-slot bytes a
 // different client (e.g. the Java reference's AckWatermark.java) would
 // leave on disk: magic 'AKW1' little-endian at offset 0, reserved 0
 // at offset 4, the FSN little-endian at offset 8. Used to prove the Go
@@ -45,9 +45,7 @@ import (
 func writeForeignAckWatermark(t *testing.T, slotDir string, fsn int64) {
 	t.Helper()
 	buf := make([]byte, qwpSfAckWatermarkFileSize)
-	binary.LittleEndian.PutUint32(buf[0:4], qwpSfAckWatermarkMagic)
-	// bytes[4:8] reserved == 0
-	binary.LittleEndian.PutUint64(buf[8:16], uint64(fsn))
+	qwpSfEncodeDualRecord(buf[qwpSfDualRecordSlotSize:qwpSfDualRecordSlotSize+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, 1, fsn, 0)
 	path := filepath.Join(slotDir, qwpSfAckWatermarkFileName)
 	require.NoError(t, os.WriteFile(path, buf, 0o644))
 }
@@ -86,13 +84,14 @@ func TestQwpSfAckWatermarkPersistGateAndFormat(t *testing.T) {
 	assert.Equal(t, int64(9), w.read())
 	require.NoError(t, w.close())
 
-	// On-disk bytes must match the normative little-endian layout so a
-	// Java drainer can read them.
+	// Generation 2 is in slot 0; generation 1 remains intact in slot 1.
 	b := readAckWatermarkFileBytes(t, dir)
-	require.Len(t, b, 16)
+	require.Len(t, b, int(qwpSfAckWatermarkFileSize))
 	assert.Equal(t, qwpSfAckWatermarkMagic, binary.LittleEndian.Uint32(b[0:4]))
-	assert.Equal(t, uint32(0), binary.LittleEndian.Uint32(b[4:8]), "reserved must be zero")
-	assert.Equal(t, int64(9), int64(binary.LittleEndian.Uint64(b[8:16])))
+	assert.Equal(t, qwpSfDualRecordVersion, binary.LittleEndian.Uint32(b[4:8]))
+	assert.Equal(t, int64(2), int64(binary.LittleEndian.Uint64(b[8:16])))
+	assert.Equal(t, int64(9), int64(binary.LittleEndian.Uint64(b[16:24])))
+	assert.Equal(t, qwpSfAckWatermarkMagic, binary.LittleEndian.Uint32(b[qwpSfDualRecordSlotSize:qwpSfDualRecordSlotSize+4]))
 
 	// Reopen preserves the value (magic already stamped).
 	w2 := qwpSfAckWatermarkOpen(dir)
@@ -133,7 +132,7 @@ func TestQwpSfAckWatermarkBadMagicIsInvalid(t *testing.T) {
 
 func TestQwpSfAckWatermarkWrongSizeRecreated(t *testing.T) {
 	dir := t.TempDir()
-	// A truncated/garbage 4-byte file: mmapping its full 16 bytes would
+	// A truncated/garbage 4-byte file: mmapping its full 8192 bytes would
 	// SIGBUS, so open() must recreate it at FILE_SIZE.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfAckWatermarkFileName),
 		[]byte{1, 2, 3, 4}, 0o644))
@@ -146,6 +145,35 @@ func TestQwpSfAckWatermarkWrongSizeRecreated(t *testing.T) {
 	st, err := os.Stat(filepath.Join(dir, qwpSfAckWatermarkFileName))
 	require.NoError(t, err)
 	assert.Equal(t, qwpSfAckWatermarkFileSize, st.Size())
+}
+
+func TestQwpSfAckWatermarkLegacy16ByteFileIsReset(t *testing.T) {
+	dir := t.TempDir()
+	legacy := make([]byte, 16)
+	binary.LittleEndian.PutUint32(legacy[0:4], qwpSfAckWatermarkMagic)
+	binary.LittleEndian.PutUint64(legacy[8:16], 42)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfAckWatermarkFileName), legacy, 0o644))
+
+	w := qwpSfAckWatermarkOpen(dir)
+	require.NotNil(t, w)
+	defer func() { _ = w.close() }()
+	assert.Equal(t, qwpSfAckWatermarkInvalid, w.read())
+	st, err := os.Stat(filepath.Join(dir, qwpSfAckWatermarkFileName))
+	require.NoError(t, err)
+	assert.Equal(t, qwpSfDualRecordFileSize, st.Size())
+}
+
+func TestQwpSfEngineRecoveryRequiresAckWatermark(t *testing.T) {
+	dir := t.TempDir()
+	seg := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+	createRecoveryManifest(t, dir, 0, 0, seg)
+	require.NoError(t, seg.close())
+	require.NoError(t, os.Mkdir(filepath.Join(dir, qwpSfAckWatermarkFileName), 0o755))
+
+	engine, err := qwpSfNewCursorEngineForDrainer(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.Error(t, err)
+	assert.Nil(t, engine)
+	assert.Contains(t, err.Error(), "could not open required ack watermark")
 }
 
 func TestQwpSfAckWatermarkClosedAndNilSafe(t *testing.T) {
@@ -276,11 +304,15 @@ func TestQwpSfEngineWatermarkPersistedByManager(t *testing.T) {
 		// watermark through to disk in the normative format.
 		require.Eventually(t, func() bool {
 			b, err := os.ReadFile(filepath.Join(dir, qwpSfAckWatermarkFileName))
-			if err != nil || len(b) != 16 {
+			if err != nil || int64(len(b)) != qwpSfAckWatermarkFileSize {
 				return false
 			}
-			return binary.LittleEndian.Uint32(b[0:4]) == qwpSfAckWatermarkMagic &&
-				int64(binary.LittleEndian.Uint64(b[8:16])) == 4
+			valid := func(rec qwpSfDualRecord) bool { return rec.first >= -1 }
+			r0, ok0 := qwpSfDecodeDualRecord(b[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+			off := int(qwpSfDualRecordSlotSize)
+			r1, ok1 := qwpSfDecodeDualRecord(b[off:off+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+			rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
+			return ok && rec.first == 4
 		}, 2*time.Second, 5*time.Millisecond)
 
 		require.NoError(t, e.engineClose())

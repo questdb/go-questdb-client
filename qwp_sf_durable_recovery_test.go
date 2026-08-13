@@ -26,7 +26,6 @@ package questdb
 
 import (
 	"context"
-	"encoding/binary"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -49,10 +48,15 @@ func readPersistedDurableWatermark(t *testing.T, slotDir string) (int64, bool) {
 	if err != nil || int64(len(b)) < qwpSfAckWatermarkFileSize {
 		return qwpSfAckWatermarkInvalid, false
 	}
-	if binary.LittleEndian.Uint32(b[qwpSfAckWatermarkMagicOffset:qwpSfAckWatermarkMagicOffset+4]) != qwpSfAckWatermarkMagic {
+	valid := func(rec qwpSfDualRecord) bool { return rec.first >= -1 }
+	r0, ok0 := qwpSfDecodeDualRecord(b[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+	off := int(qwpSfDualRecordSlotSize)
+	r1, ok1 := qwpSfDecodeDualRecord(b[off:off+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+	rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
+	if !ok {
 		return qwpSfAckWatermarkInvalid, false
 	}
-	return int64(binary.LittleEndian.Uint64(b[qwpSfAckWatermarkFsnOffset : qwpSfAckWatermarkFsnOffset+8])), true
+	return rec.first, true
 }
 
 // TestQwpDurableAckSfCrashRecoveryReplaysTail composes request_durable_ack +

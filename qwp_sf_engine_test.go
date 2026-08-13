@@ -121,7 +121,32 @@ func TestQwpSfEngineFullDrainUnlinksFiles(t *testing.T) {
 	for _, en := range entries {
 		assert.NotEqual(t, ".sfa", filepath.Ext(en.Name()),
 			"unexpected leftover segment file %s", en.Name())
+		assert.NotEqual(t, qwpSfManifestFileName, en.Name())
+		assert.NotEqual(t, qwpSfAckWatermarkFileName, en.Name())
 	}
+}
+
+func TestQwpSfEngineTrimAdvancesManifest(t *testing.T) {
+	dir := t.TempDir()
+	const segSize int64 = 72
+	e, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = e.engineClose() }()
+
+	require.Eventually(t, func() bool { return !e.ring.needsHotSpare() }, time.Second, time.Millisecond)
+	for i := 0; i < 3; i++ {
+		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
+		require.NoError(t, err)
+	}
+	e.engineAcknowledge(1)
+	require.Eventually(t, func() bool { return e.ring.sealedSegmentCount() == 0 }, time.Second, time.Millisecond)
+
+	m, err := qwpSfManifestOpen(dir)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	defer m.close()
+	assert.Equal(t, int64(2), m.headBase)
+	assert.Equal(t, int64(2), m.activeBase)
 }
 
 func TestQwpSfEngineBackpressureTimeout(t *testing.T) {

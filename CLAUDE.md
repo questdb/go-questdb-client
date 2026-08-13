@@ -90,6 +90,26 @@ encodes a batch into `qwpSfCursorEngine` via `engineAppendBlocking`; the
 `qwpSfSendLoop` goroutine drains it to the WebSocket, parses ACKs, advances
 `engineAckedFsn`, and owns reconnect + replay from `engineAckedFsn() + 1`.
 
+Disk slots are manifest-backed. `sf-manifest.bin` is an 8192-byte dual-slot
+CRC-32C record containing the committed oldest and active segment bases;
+`.ack-watermark` uses the same dual-slot shape for the cumulative ACK FSN.
+Segment flag `0x01` records that the manifest is required. Recovery validates
+the complete chain against those boundaries before quarantining any corrupt
+file: a missing load-bearing head or tail fails closed, while a proven stale or
+stray file can be removed or renamed with `.corrupt`. A foreground sender
+preserves a fail-closed slot under `<sf_dir>/quarantined/<sender_id>-<time>` and
+starts a fresh slot; an orphan drainer writes the reason to `.failed` instead.
+Legacy unflagged Go slots migrate in place on first recovery. Downgrading after
+that migration is unsupported.
+
+The slot side files are `sf-manifest.bin`, `.ack-watermark`, `.symbol-dict`,
+and `.lock`; creation debris may appear as `sf-manifest.bin.corrupt`, and a
+drainer terminal adds `.failed`. Segment and manifest control points are
+durable even with `sf_durability=memory`: initial creation, rotation, each trim
+batch, and a fully drained close use header/manifest fsync plus directory
+barriers. Frame publication and ordinary ACK cadence remain syscall-free;
+watermark sync occurs only when it covers a trim or final drain.
+
 **Cursor frames carry a self-sufficient schema** — full inline column
 definitions on every frame — which keeps reconnect/replay/orphan-adoption
 schema-safe against a fresh server connection. The symbol dictionary is

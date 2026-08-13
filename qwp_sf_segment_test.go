@@ -209,8 +209,9 @@ func TestQwpSfSegmentRecoveryRejectsBadVersion(t *testing.T) {
 
 	seg, err := qwpSfOpenSegment(path)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported version")
-	assert.ErrorIs(t, err, qwpSfErrSegmentCorrupt)
+	assert.Contains(t, err.Error(), "unsupported segment version")
+	assert.NotErrorIs(t, err, qwpSfErrSegmentCorrupt,
+		"a newer client may have written intact frames; do not quarantine them as corruption")
 	assert.Nil(t, seg)
 }
 
