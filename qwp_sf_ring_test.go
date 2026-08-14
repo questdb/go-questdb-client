@@ -199,9 +199,11 @@ func TestQwpSfRingTrimsAckedSegments(t *testing.T) {
 	lastSeqInFirst := sealed[0].segmentBaseSeq() + sealed[0].segmentFrameCount() - 1
 	r.acknowledge(lastSeqInFirst)
 
-	trim := r.drainTrimmable()
+	trim := r.peekTrimmable()
 	require.Len(t, trim, 1)
 	assert.Equal(t, sealed[0], trim[0])
+	trim = r.drainTrimBatch(len(trim))
+	require.Len(t, trim, 1)
 	assert.Len(t, r.getSealedSegments(), 0)
 	for _, s := range trim {
 		_ = s.close()

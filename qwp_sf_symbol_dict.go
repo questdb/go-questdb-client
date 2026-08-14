@@ -108,18 +108,23 @@ const (
 	// recovery/drainer goroutine. Even pathological high-cardinality symbol use
 	// stays far below this.
 	qwpSfSymbolDictMaxFileSize = 1 << 30
+	// Bound the initial []string allocation independently of the byte-region
+	// limit. A checksum-valid foreign file can encode one empty symbol per byte;
+	// preallocating that claimed count would multiply a 1 GiB file into a
+	// many-gigabyte pointer array before parsing proves the entries.
+	qwpSfSymbolDictMaxPreallocEntries = 1 << 16
 )
 
 var (
-	// qwpSfErrSymbolDictLegacyFormat is operational, not a recovery
-	// fail-closed verdict: the bytes may be healthy for an older Go client and
-	// must not be auto-quarantined or recreated.
+	// qwpSfErrSymbolDictAmbiguousFormat is operational, not a recovery
+	// fail-closed verdict: the bytes may be healthy legacy data or a torn first
+	// chunk and must not be auto-quarantined or recreated.
 	//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
-	qwpSfErrSymbolDictLegacyFormat = errors.New("qwp/sf: legacy flat .symbol-dict format")
-	qwpSfSymbolDictCRCTable        = crc32.MakeTable(crc32.Castagnoli)
-	qwpSfSymbolDictStat            = os.Stat
-	qwpSfSymbolDictTruncate        = func(f *os.File, size int64) error { return f.Truncate(size) }
-	qwpSfSymbolDictWriteAt         = func(f *os.File, p []byte, off int64) (int, error) { return f.WriteAt(p, off) }
+	qwpSfErrSymbolDictAmbiguousFormat = errors.New("qwp/sf: ambiguous .symbol-dict format")
+	qwpSfSymbolDictCRCTable           = crc32.MakeTable(crc32.Castagnoli)
+	qwpSfSymbolDictStat               = os.Stat
+	qwpSfSymbolDictTruncate           = func(f *os.File, size int64) error { return f.Truncate(size) }
+	qwpSfSymbolDictWriteAt            = func(f *os.File, p []byte, off int64) (int, error) { return f.WriteAt(p, off) }
 )
 
 // qwpSfSymbolDictOpen opens (creating if absent) the dictionary file in
@@ -219,8 +224,8 @@ func qwpSfSymbolDictOpenExisting(path string, fileLen int64) (*qwpSfSymbolDict, 
 	if validChunks == 0 && fileLen > qwpSfSymbolDictHeaderSize {
 		_ = f.Close()
 		if qwpSfSymbolDictLegacyEntryCount(buf[qwpSfSymbolDictHeaderSize:]) > 0 {
-			return nil, fmt.Errorf("%w; drain this slot with go-questdb-client <= v4.x, or delete %s to fall back to full-dict frames (safe only if the slot holds no unacked delta frames), or remove the slot after draining",
-				qwpSfErrSymbolDictLegacyFormat, path)
+			return nil, fmt.Errorf("%w: body is ambiguous between the legacy flat format and a torn first chunk; if written by an older client, drain this slot with go-questdb-client <= v4.x; otherwise restore the file, or delete %s to fall back to full-dict frames (safe only if the slot holds no unacked delta frames), or remove the slot after draining",
+				qwpSfErrSymbolDictAmbiguousFormat, path)
 		}
 		return nil, nil
 	}
@@ -282,7 +287,11 @@ func qwpSfSymbolDictParseEntries(region []byte, expected uint64) ([]string, bool
 	if expected > uint64(len(region)) {
 		return nil, false
 	}
-	entries := make([]string, 0, int(expected))
+	prealloc := expected
+	if prealloc > qwpSfSymbolDictMaxPreallocEntries {
+		prealloc = qwpSfSymbolDictMaxPreallocEntries
+	}
+	entries := make([]string, 0, int(prealloc))
 	pos := 0
 	for uint64(len(entries)) < expected {
 		entryLen, next, ok := qwpSfSymbolDictReadVarint(region, pos, len(region))

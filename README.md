@@ -494,6 +494,12 @@ The same options are available programmatically: `WithSfDir`, `WithSenderId`,
 Without `sf_dir`, unacknowledged data lives in process memory and is lost if the
 process dies; the reconnect loop still spans transient outages.
 
+SF terminal cleanup retries transient local-storage failures indefinitely while
+the process remains alive. A persistent disk fault therefore keeps that slot's
+flock—and, for a pooled sender, its capacity reservation—until storage recovers
+or the process exits; releasing either earlier could let a new owner race files
+whose durable cleanup did not finish.
+
 ## Querying
 
 The query side streams columnar result batches over the same WebSocket

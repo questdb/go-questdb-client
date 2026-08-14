@@ -191,14 +191,15 @@ type qwpSfCursorEngine struct {
 	// exactly one caller -- Close or the manager worker -- ownership of that
 	// cleanup. The deferred fields are written before handoff and then read by
 	// the worker without taking engine locks.
-	closeCompleted          atomic.Bool
-	terminalCleanupClaimed  atomic.Bool
-	terminalResourcesClosed atomic.Bool
-	deferredCleanupOwned    atomic.Bool
-	closeRetryOwnerStarted  atomic.Bool
-	deferredFullyDrained    atomic.Bool
-	deferredLeakSegments    atomic.Bool
-	deferredClose           func()
+	closeCompleted            atomic.Bool
+	terminalCleanupClaimed    atomic.Bool
+	terminalResourcesClosed   atomic.Bool
+	drainedFileCleanupPending atomic.Bool
+	deferredCleanupOwned      atomic.Bool
+	closeRetryOwnerStarted    atomic.Bool
+	deferredFullyDrained      atomic.Bool
+	deferredLeakSegments      atomic.Bool
+	deferredClose             func()
 
 	// appendMu serializes the producer's ring-append path against
 	// engineClose's segment teardown. The producer's only entry into
@@ -871,15 +872,17 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	if e.closeCompleted.Load() || e.deferredCleanupOwned.Load() || e.terminalCleanupClaimed.Load() {
 		return nil
 	}
-	// Capture drain state BEFORE closing the ring — once the ring is
-	// closed, its accessors aren't safe to read. The active segment
-	// is never trimmed by drainTrimmable (only sealed segments are),
-	// so when everything published has been acked we have to unlink
-	// the residual .sfa files here.
-	fullyDrained := e.sfDir != "" &&
-		(e.ring.segmentRingPublishedFsn() < 0 ||
-			e.ring.segmentRingAckedFsn() >= e.ring.segmentRingPublishedFsn())
-	e.deferredFullyDrained.Store(fullyDrained)
+	// Capture drain state exactly once, BEFORE closing the ring. Retries use the
+	// stored decision: even today's watermark accessors are atomic-only, but a
+	// retry must not rely on that remaining true after segmentRingClose has
+	// unmapped and detached the ring's segments.
+	if firstClose {
+		publishedFsn := e.ring.segmentRingPublishedFsn()
+		fullyDrained := e.sfDir != "" &&
+			(publishedFsn < 0 || e.ring.segmentRingAckedFsn() >= publishedFsn)
+		e.deferredFullyDrained.Store(fullyDrained)
+	}
+	fullyDrained := e.deferredFullyDrained.Load()
 	// Mapping leaks are a one-way safety decision: a retrying normal close must
 	// never downgrade an earlier abandoned-send-loop close and unmap memory that
 	// the abandoned goroutine may still dereference.
@@ -943,6 +946,13 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 		(*hook)()
 	}
 	if e.terminalResourcesClosed.Load() {
+		if e.drainedFileCleanupPending.Load() {
+			if err := e.engineFinishDrainedFileCleanup(); err != nil {
+				e.terminalCleanupClaimed.Store(false)
+				return err
+			}
+			e.drainedFileCleanupPending.Store(false)
+		}
 		if e.slotLock != nil {
 			if err := e.slotLock.close(); err != nil {
 				e.terminalCleanupClaimed.Store(false)
@@ -991,33 +1001,18 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 			firstErr = err
 		}
 	}
-	if drainCleanupAllowed {
-		if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			drainCleanupAllowed = false
-		}
-		if drainCleanupAllowed && !qwpSfManifestRemove(e.sfDir) {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("qwp/sf: remove drained manifest in %s", e.sfDir)
-			}
-			drainCleanupAllowed = false
-		}
-		if drainCleanupAllowed {
-			if err := qwpSfSyncDir(e.sfDir); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				drainCleanupAllowed = false
-			}
-		}
-		if drainCleanupAllowed {
-			qwpSfAckWatermarkRemoveOrphan(e.sfDir)
-			qwpSfSymbolDictRemoveOrphan(e.sfDir)
-		}
-	}
 	e.terminalResourcesClosed.Store(true)
+	if drainCleanupAllowed {
+		e.drainedFileCleanupPending.Store(true)
+		if err := e.engineFinishDrainedFileCleanup(); err != nil {
+			e.terminalCleanupClaimed.Store(false)
+			if firstErr != nil {
+				return errors.Join(firstErr, err)
+			}
+			return err
+		}
+		e.drainedFileCleanupPending.Store(false)
+	}
 	if e.slotLock != nil {
 		if err := e.slotLock.close(); err != nil {
 			if firstErr == nil {
@@ -1030,6 +1025,25 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 	}
 	e.closeCompleted.Store(true)
 	return firstErr
+}
+
+// engineFinishDrainedFileCleanup removes only fully-acked on-disk state. It is
+// deliberately separate from resource closure so a partial unlink, manifest
+// removal, or directory-sync failure remains retryable without touching the
+// already-closed ring mappings and side-file descriptors.
+func (e *qwpSfCursorEngine) engineFinishDrainedFileCleanup() error {
+	if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil {
+		return err
+	}
+	if !qwpSfManifestRemove(e.sfDir) {
+		return fmt.Errorf("qwp/sf: remove drained manifest in %s", e.sfDir)
+	}
+	if err := qwpSfSyncDir(e.sfDir); err != nil {
+		return err
+	}
+	qwpSfAckWatermarkRemoveOrphan(e.sfDir)
+	qwpSfSymbolDictRemoveOrphan(e.sfDir)
+	return nil
 }
 
 // engineCompleteDeferredClose is invoked by the manager after it is provably
@@ -1049,11 +1063,11 @@ func (e *qwpSfCursorEngine) engineCompleteDeferredClose() {
 		// reporting the error so even a panicking user logger cannot leave the
 		// slot without a cleanup owner.
 		e.engineStartCloseRetryOwner(logger)
-		qwpSfLogCloseRetry(logger, slog.LevelError, "qwp/sf: deferred engine close failed",
+		qwpSfLogGuarded(logger, slog.LevelError, "qwp/sf: deferred engine close failed",
 			"slot", e.sfDir, "error", err, "closeCompleted", e.closeCompleted.Load())
 		return
 	}
-	qwpSfLogCloseRetry(logger, slog.LevelInfo, "qwp/sf: deferred engine close completed",
+	qwpSfLogGuarded(logger, slog.LevelInfo, "qwp/sf: deferred engine close completed",
 		"slot", e.sfDir, "closeCompleted", e.closeCompleted.Load())
 }
 
@@ -1091,10 +1105,13 @@ func (e *qwpSfCursorEngine) engineRunCloseRetryAttempt() (err error) {
 	return e.engineRetryCloseIfNeeded()
 }
 
-// engineStartCloseRetryOwner supplies terminal cleanup ownership to paths that
-// cannot expose a retryable object to the caller (construction unwind,
+// engineStartCloseRetryOwner supplies terminal cleanup ownership after a close
+// path can no longer retry inline (foreground close, construction unwind,
 // drainer exit, and pool shutdown). The per-engine goroutine exits as soon as
-// the flock is released.
+// the flock is released. It deliberately has no retry deadline: releasing the
+// flock or pool slot while durable cleanup is incomplete would let another
+// owner race the retained files. A persistent local-storage fault therefore
+// keeps the slot reserved until the fault is corrected or the process exits.
 func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 	if e == nil || e.closeCompleted.Load() || !e.closeRetryOwnerStarted.CompareAndSwap(false, true) {
 		return
@@ -1106,7 +1123,7 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 		defer func() {
 			if r := recover(); r != nil {
 				e.closeRetryOwnerStarted.Store(false)
-				qwpSfLogCloseRetry(logger, slog.LevelError, "qwp/sf: terminal cleanup retry owner panicked",
+				qwpSfLogGuarded(logger, slog.LevelError, "qwp/sf: terminal cleanup retry owner panicked",
 					"slot", e.sfDir, "panic", r, "stack", string(debug.Stack()))
 				if !e.closeCompleted.Load() {
 					e.engineStartCloseRetryOwner(logger)
@@ -1120,7 +1137,7 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 				now := time.Now()
 				if qwpSfShouldLogCloseRetry(lastWarn, now) {
 					lastWarn = now
-					qwpSfLogCloseRetry(logger, slog.LevelWarn, "qwp/sf: terminal cleanup retry failed; slot lock remains held",
+					qwpSfLogGuarded(logger, slog.LevelWarn, "qwp/sf: terminal cleanup retry failed; slot lock remains held",
 						"slot", e.sfDir, "error", retryErr)
 				}
 			}
@@ -1132,7 +1149,7 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 	}()
 }
 
-func qwpSfLogCloseRetry(logger *slog.Logger, level slog.Level, message string, args ...any) {
+func qwpSfLogGuarded(logger *slog.Logger, level slog.Level, message string, args ...any) {
 	defer func() { _ = recover() }()
 	qwpEffectiveLogger(logger).Log(context.Background(), level, message, args...)
 }

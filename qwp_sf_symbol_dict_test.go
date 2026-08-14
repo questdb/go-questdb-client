@@ -346,7 +346,7 @@ func TestQwpSfSymbolDictZeroValidChunksKeepsCorruptDisposition(t *testing.T) {
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
 	require.Nil(t, d)
 	require.Error(t, err)
-	require.NotErrorIs(t, err, qwpSfErrSymbolDictLegacyFormat)
+	require.NotErrorIs(t, err, qwpSfErrSymbolDictAmbiguousFormat)
 	got, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
 	require.Equal(t, contents, got, "recovery must preserve a corrupt first chunk")
@@ -359,6 +359,22 @@ func TestQwpSfSymbolDictZeroValidChunksKeepsCorruptDisposition(t *testing.T) {
 	got, readErr = os.ReadFile(path)
 	require.NoError(t, readErr)
 	require.Equal(t, qwpSfTestSymbolDictHeader(), got, "fresh open keeps recreate-on-corrupt behavior")
+}
+
+func TestQwpSfSymbolDictTornFirstChunkReportsAmbiguousFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	chunk := qwpSfTestSymbolDictChunk("x")
+	contents := append(qwpSfTestSymbolDictHeader(), chunk[:len(chunk)-qwpSfSymbolDictCRCSize]...)
+	require.NoError(t, os.WriteFile(path, contents, 0o644))
+
+	d, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.Nil(t, d)
+	require.ErrorIs(t, err, qwpSfErrSymbolDictAmbiguousFormat)
+	require.ErrorContains(t, err, "ambiguous between the legacy flat format and a torn first chunk")
+	got, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	require.Equal(t, contents, got, "ambiguous first chunk must remain byte-identical")
 }
 
 func TestQwpSfSymbolDictFreshOpenPropagatesStatFailure(t *testing.T) {
@@ -446,7 +462,8 @@ func TestQwpSfSymbolDictLegacyFlatFormatFailsClosed(t *testing.T) {
 		t.Run(open.name, func(t *testing.T) {
 			d, err := open.fn(dir)
 			require.Nil(t, d)
-			require.ErrorIs(t, err, qwpSfErrSymbolDictLegacyFormat)
+			require.ErrorIs(t, err, qwpSfErrSymbolDictAmbiguousFormat)
+			require.ErrorContains(t, err, "ambiguous between the legacy flat format and a torn first chunk")
 			require.ErrorContains(t, err, "safe only if the slot holds no unacked delta frames")
 			got, readErr := os.ReadFile(path)
 			require.NoError(t, readErr)
@@ -469,7 +486,7 @@ func TestQwpSfSymbolDictLegacyEngineOpenDoesNotQuarantine(t *testing.T) {
 
 	recovered, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.Nil(t, recovered)
-	require.ErrorIs(t, err, qwpSfErrSymbolDictLegacyFormat)
+	require.ErrorIs(t, err, qwpSfErrSymbolDictAmbiguousFormat)
 	_, statErr := os.Stat(filepath.Join(filepath.Dir(dir), "quarantined"))
 	require.True(t, os.IsNotExist(statErr), "operational legacy error must not auto-quarantine the slot")
 	got, readErr := os.ReadFile(path)
@@ -494,7 +511,7 @@ func TestQwpSfSymbolDictLegacyDrainerMarksFailedWithRemediation(t *testing.T) {
 	require.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
 	failed, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
 	require.NoError(t, err)
-	require.Contains(t, string(failed), "legacy flat .symbol-dict format")
+	require.Contains(t, string(failed), "ambiguous between the legacy flat format and a torn first chunk")
 	require.Contains(t, string(failed), "safe only if the slot holds no unacked delta frames")
 	got, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)

@@ -26,6 +26,8 @@ package questdb
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,6 +36,42 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestQwpSfManagerServiceErrorSurvivesPanickingLogger(t *testing.T) {
+	mgr, err := qwpSfNewSegmentManager(4096, time.Millisecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	mgr.logger.Store(slog.New(panicOnHandleSlog{}))
+
+	require.NotPanics(t, func() {
+		mgr.recordServiceError("slot", errors.New("injected maintenance failure"))
+	})
+}
+
+func TestQwpSfManagerWorkerPanicStillSignalsExitWithPanickingLogger(t *testing.T) {
+	dir := t.TempDir()
+	first, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, 4096)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(first, 4096)
+	defer func() { _ = ring.segmentRingClose() }()
+
+	mgr, err := qwpSfNewSegmentManager(4096, time.Millisecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	mgr.logger.Store(slog.New(panicOnHandleSlog{}))
+	require.NoError(t, mgr.segmentManagerRegister(ring, dir))
+
+	createHook := func(string) { panic("injected spare-create panic") }
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	t.Cleanup(func() { qwpSfTestSegmentCreateHook.Store(nil) })
+	mgr.segmentManagerStart()
+
+	select {
+	case <-mgr.done:
+	case <-time.After(time.Second):
+		t.Fatal("manager worker did not signal exit after panic")
+	}
+	require.NotNil(t, mgr.workerPanic.Load())
+	require.True(t, mgr.segmentManagerClose())
+}
 
 func TestQwpSfManagerProvisionsSpare(t *testing.T) {
 	const segSize int64 = 4096

@@ -34,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -47,10 +48,17 @@ const (
 	qwpSfDualRecordFileSize  int64  = 8192
 )
 
-// qwpSfManifestSync is a test seam for manifest durability failures. Production
-// always calls os.File.Sync; tests replace it briefly to exercise the live
-// rotation retry path without corrupting or closing the manifest descriptor.
-var qwpSfManifestSync = func(f *os.File) error { return f.Sync() }
+// qwpSfManifestSync is a test seam for manifest durability failures. A nil
+// pointer means production os.File.Sync. Tests publish a temporary hook
+// atomically because manifest updates also run on the live manager worker.
+var qwpSfManifestSync atomic.Pointer[func(f *os.File) error]
+
+func qwpSfManifestSyncFile(f *os.File) error {
+	if hook := qwpSfManifestSync.Load(); hook != nil {
+		return (*hook)(f)
+	}
+	return f.Sync()
+}
 
 type qwpSfDualRecord struct {
 	generation int64
@@ -214,7 +222,7 @@ func (m *qwpSfManifest) update(newHead, newActive int64) error {
 		}
 		return fmt.Errorf("qwp/sf: write manifest generation %d: %w", next, err)
 	}
-	if err := qwpSfManifestSync(m.file); err != nil {
+	if err := qwpSfManifestSyncFile(m.file); err != nil {
 		return fmt.Errorf("qwp/sf: fsync manifest: %w", err)
 	}
 	m.generation = next

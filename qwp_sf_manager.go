@@ -433,7 +433,7 @@ func (m *qwpSfSegmentManager) workerLoop() {
 		if r := recover(); r != nil {
 			detail := fmt.Sprintf("%v\n%s", r, debug.Stack())
 			m.workerPanic.Store(&detail)
-			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager worker panicked",
+			qwpSfLogGuarded(m.logger.Load(), slog.LevelError, "qwp/sf: segment manager worker panicked",
 				"detail", detail)
 		}
 		m.workerGoid.Store(0)
@@ -491,7 +491,7 @@ func (m *qwpSfSegmentManager) runDeferredCleanup(cleanup func(), message string)
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: "+message, "panic", r, "stack", string(debug.Stack()))
+			qwpSfLogGuarded(m.logger.Load(), slog.LevelError, "qwp/sf: "+message, "panic", r, "stack", string(debug.Stack()))
 		}
 	}()
 	cleanup()
@@ -748,6 +748,6 @@ func (m *qwpSfSegmentManager) recordServiceError(dir string, err error) {
 	}
 	m.mu.Unlock()
 	if shouldLog {
-		qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager maintenance failed; will retry", "dir", dir, "error", err)
+		qwpSfLogGuarded(m.logger.Load(), slog.LevelError, "qwp/sf: segment manager maintenance failed; will retry", "dir", dir, "error", err)
 	}
 }

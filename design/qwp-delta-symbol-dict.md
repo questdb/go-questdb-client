@@ -287,8 +287,9 @@ mmap.
   the entry region. Id = entry position across all chunks. Header 8 bytes.
 - **`open(slotDir) (*qwpSfSymbolDict, error)`** — load the complete CRC-proven
   prefix and physically truncate any untrusted trailing chunk. Recreate an
-  ordinary invalid fresh-slot file, but preserve and reject a legacy flat body
-  with `qwpSfErrSymbolDictLegacyFormat`; recovery never recreates an existing
+  ordinary invalid fresh-slot file, but preserve and reject a body that is
+  ambiguous between legacy-flat data and a torn first chunk with
+  `qwpSfErrSymbolDictAmbiguousFormat`; recovery never recreates an existing
   file. A failed tail truncate is a retriable operational error.
 - **`appendSymbols(names)`** — write one complete chunk per frame delta in one
   positioned write. **No fsync** (matches SF: process-crash durable via page

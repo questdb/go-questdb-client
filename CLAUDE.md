@@ -118,11 +118,12 @@ test-only shared-manager path, to the current ring service pass).
 flock. Facade-pool slots whose close is deferred stay reserved and count
 against capacity; the housekeeper and the borrow-at-capacity path re-probe them
 and restore the index after completion (so `housekeeper_interval_ms=0` does not
-leak capacity). Go deliberately has no global flock-release retry daemon: an
-ownerless close error is retried by a later `Close`; construction unwind,
-orphan drainers, and pool shutdown install a per-engine terminal retry owner so
-the flock is not left without a recovery path. Pool shutdown reports an error
-while any slot cleanup remains pending.
+leak capacity). Every incomplete terminal close installs a per-engine retry
+owner, including foreground close, construction unwind, orphan drainers, and
+pool shutdown. Cleanup retries have no deadline: a persistent local-disk fault
+keeps the flock and any pool capacity reservation until storage recovers or the
+process exits, because releasing ownership early could race retained files.
+Pool shutdown reports an error while any slot cleanup remains pending.
 
 **Cursor frames carry a self-sufficient schema** — full inline column
 definitions on every frame — which keeps reconnect/replay/orphan-adoption

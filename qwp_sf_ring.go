@@ -65,7 +65,7 @@ var qwpSfErrRingClosed = errors.New("qwp/sf: ring closed")
 //   - I/O goroutine: publishedFsn (read-only), acknowledge (single
 //     writer), nextSealedAfter, firstSealed, findSegmentContaining.
 //   - Segment-manager goroutine: needsHotSpare, installHotSpare,
-//     drainTrimmable on its own cadence.
+//     peekTrimmable + drainTrimBatch on its own cadence.
 //
 // Backpressure model: appendOrFsn returns qwpSfBackpressureNoSpare
 // when the active is full and no spare is available. The caller (the
@@ -410,31 +410,6 @@ func (r *qwpSfSegmentRing) headAfterTrim(trimCount int) int64 {
 	return -1
 }
 
-// drainTrimmable removes and returns sealed segments whose every
-// frame has been ACK'd (i.e. baseSeq + frameCount - 1 <= ackedFsn).
-// Caller takes ownership and is responsible for close() + unlinking
-// the file. Called by the segment manager off the hot path. Returns
-// nil when nothing is eligible (avoids slice allocation in the
-// steady state where most polls are no-ops).
-func (r *qwpSfSegmentRing) drainTrimmable() []*qwpSfSegment {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	acked := r.ackedFsn.Load()
-	var out []*qwpSfSegment
-	// Sealed segments are in baseSeq order, oldest first; once we hit
-	// one that isn't fully acked, none of the later ones can be either.
-	for len(r.sealedSegments) > 0 {
-		s := r.sealedSegments[0]
-		lastSeq := s.segmentBaseSeq() + s.segmentFrameCount() - 1
-		if lastSeq > acked {
-			break
-		}
-		out = append(out, s)
-		r.sealedSegments = r.sealedSegments[1:]
-	}
-	return out
-}
-
 func (r *qwpSfSegmentRing) drainTrimBatch(count int) []*qwpSfSegment {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -518,7 +493,7 @@ func (r *qwpSfSegmentRing) firstSealed() *qwpSfSegment {
 // sealedSegmentCount returns the number of sealed segments under the
 // ring mutex. Thread-safe sibling of getSealedSegments for callers
 // (e.g. tests) that observe the ring while the segment manager
-// concurrently trims via drainTrimmable.
+// concurrently trims via drainTrimBatch.
 func (r *qwpSfSegmentRing) sealedSegmentCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

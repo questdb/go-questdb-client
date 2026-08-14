@@ -124,6 +124,25 @@ func TestQwpSfRecoveryManifestOnlyBoundaries(t *testing.T) {
 	})
 }
 
+func TestQwpSfRecoveryCollapsedManifestWithCorruptActiveFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 4, "unacked")
+	createRecoveryManifest(t, dir, 4, 4, active)
+	closeRecoverySegments(t, active)
+	path := filepath.Join(dir, "sf-active.sfa")
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{0}, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, err = qwpSfRecoverRing(dir, 4096)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.ErrorContains(t, err, "references durable data")
+	_, statErr := os.Stat(path)
+	require.NoError(t, statErr, "fail-closed recovery must preserve the corrupt active")
+}
+
 func TestQwpSfRecoveryMigratesLegacyAndStampsManifestFlag(t *testing.T) {
 	dir := t.TempDir()
 	seg := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
@@ -361,6 +380,51 @@ func TestQwpSfRecoverySanitizesActiveTail(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(dir, "sf-initial.sfa"))
 	require.NoError(t, err)
 	assert.Equal(t, make([]byte, len(b)-int(off)), b[off:])
+}
+
+func TestQwpSfRecoveryQuarantinesTornEmptyActiveBeforeReplacement(t *testing.T) {
+	const baseSeq int64 = 7
+	dir := t.TempDir()
+	active := createRecoverySegment(t, dir, "sf-active.sfa", baseSeq)
+	createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
+	closeRecoverySegments(t, active)
+	path := filepath.Join(dir, "sf-active.sfa")
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+20)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	require.NotNil(t, ring)
+	defer ring.segmentRingClose()
+	require.Equal(t, baseSeq, ring.getActiveSegment().segmentBaseSeq())
+	require.Zero(t, ring.getActiveSegment().segmentFrameCount())
+	require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
+	require.Equal(t, baseSeq-1, ring.segmentRingPublishedFsn())
+
+	corrupt, err := os.ReadFile(path + ".corrupt")
+	require.NoError(t, err)
+	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
+}
+
+func TestQwpSfQuarantinePathPreservesEarlierEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-active.sfa")
+	require.NoError(t, os.WriteFile(path, []byte("new evidence"), 0o644))
+	require.NoError(t, os.WriteFile(path+".corrupt", []byte("old evidence"), 0o644))
+
+	target, err := qwpSfQuarantinePath(path)
+	require.NoError(t, err)
+	require.Equal(t, path+".corrupt-1", target)
+	oldEvidence, err := os.ReadFile(path + ".corrupt")
+	require.NoError(t, err)
+	require.Equal(t, []byte("old evidence"), oldEvidence)
+	newEvidence, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new evidence"), newEvidence)
 }
 
 func TestQwpSfForegroundFailClosedQuarantinesAndStartsFresh(t *testing.T) {

@@ -534,9 +534,10 @@ before, and here it takes it only after its loop has exited, so no deadlock).
 
 Add accessor `engineCloseCompleted() bool`.
 
-Deliberate simplifications vs Java, to record in comments: no background
-flock-release retry daemon (a failed release is recovered by a later `Close()`
-call, the pool reprobe below, or process exit); no
+Deliberate simplifications vs Java, to record in comments: no global
+flock-release retry daemon; each incomplete terminal close installs a bounded-
+scope per-engine owner that retries without a deadline because releasing the
+flock while cleanup is incomplete would race retained files. There is no
 `reclaimLogicalSlotLock` split (Go has no separate logical-lock file); the
 sync-interval sealed-segment sync (Java `finishClose` step 1) is out of scope
 with `sf_durability=memory`.
@@ -545,11 +546,13 @@ with `sf_durability=memory`.
 
 - **Sender close** (`qwp_sender_cursor.go` close path): after
   `engineClose*`, check `engineCloseCompleted()`. Incomplete → keep the engine
-  referenced and WARN ("slot lock retained until the manager worker exits");
-  do not treat it as a close failure.
+  referenced, install its terminal-cleanup retry owner, and WARN that the owner
+  started; do not claim that a manager worker which may already have exited
+  will release the lock.
 - **Drainer** (`qwp_sf_drainer.go:414-424` close defer): incomplete close →
-  log and exit; the retained flock keeps the slot un-adoptable (scans skip
-  locked slots silently), which is exactly the safe state. Note the
+  install the terminal-cleanup retry owner, log, and exit; the retained flock
+  keeps the slot un-adoptable (scans skip locked slots silently), which is
+  exactly the safe state. Note the
   interaction in a comment: `drainerPoolClose`'s 3s+1s abandon budget may
   abandon a drainer whose deferred cleanup later completes on the worker —
   that is fine, the worker goroutine is process-lifetime bounded.
@@ -660,11 +663,11 @@ Disposition:
    (Go ≤ v4.x, or pre-merge Java) or a chunked file whose first chunk tore.
    Run the legacy flat parser (today's `:185-198`) as a *probe only*: if it
    yields ≥ 1 entry, return a new typed error,
-   `qwpSfErrSymbolDictLegacyFormat`, whose message carries the remediation:
-   *"legacy flat .symbol-dict format; drain this slot with go-questdb-client
-   ≤ v4.x, or delete <slot>/.symbol-dict to fall back to full-dict frames
-   (safe only if the slot holds no unacked delta frames), or remove the slot
-   after draining"*. If the flat probe also yields nothing, keep today's
+   `qwpSfErrSymbolDictAmbiguousFormat`, whose message says the body may be
+   legacy-flat data or a torn first chunk and carries remediation for both:
+   use Go ≤ v4.x only when an older client wrote it; otherwise restore the
+   file, or delete it to fall back to full-dict frames only when the slot has no
+   unacked delta frames. If the flat probe also yields nothing, keep today's
    corrupt-dict behavior. **Never silently trust a flat parse** — a torn
    first-chunk Java file can flat-parse into garbage symbols, and registering
    those corrupts replayed rows silently; fail-closed is the review's explicit
@@ -672,7 +675,7 @@ Disposition:
 
 Wiring of the new error: `qwpSfSymbolDictOpenRecovered`
 (`qwp_sf_engine.go:334-337` caller) already treats a dict error as a fatal
-recovery error — keep that; classify `qwpSfErrSymbolDictLegacyFormat` as
+recovery error — keep that; classify `qwpSfErrSymbolDictAmbiguousFormat` as
 **operational** (not `qwpSfErrRecoveryFailClosed`): the bytes are healthy for
 an older client, so the slot must not be auto-quarantined by the Fix-1 sender
 policy; startup fails with the remediation message. Drainers `.failed` the
@@ -709,7 +712,7 @@ instead of only at replay.
   chunk, CRC flip, zero count, zero bytes, entries under/overrun, over-long
   varint), asserting prefix-trust + physical truncation and that a truncate
   failure surfaces as an error.
-- Legacy flat file with entries → `qwpSfErrSymbolDictLegacyFormat`, file left
+- Legacy flat file with entries → `qwpSfErrSymbolDictAmbiguousFormat`, file left
   byte-identical (no truncate, no recreate) on both `OpenRecovered` and
   fresh `Open`; drainer marks `.failed` with the message; sender startup fails
   without quarantining the slot.

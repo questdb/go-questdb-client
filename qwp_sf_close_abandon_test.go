@@ -123,6 +123,44 @@ func TestQwpSenderForegroundCloseStartsTerminalCleanupRetryOwner(t *testing.T) {
 	require.NoError(t, lock.close())
 }
 
+func TestQwpSenderForegroundCloseRetriesDrainedFileCleanup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, nil,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected reconnect")
+		}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+
+	unlinkCalls := atomic.Int32{}
+	unlinkHook := func(string) {
+		if unlinkCalls.Add(1) == 1 {
+			panic("injected first segment unlink failure")
+		}
+	}
+	qwpSfTestBeforeSegmentUnlinkHook.Store(&unlinkHook)
+	t.Cleanup(func() {
+		qwpSfTestBeforeSegmentUnlinkHook.Store(nil)
+		_ = engine.engineClose()
+	})
+
+	err = sender.Close(context.Background())
+	require.ErrorContains(t, err, "terminal cleanup panicked")
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond,
+		"foreground Close must retry partially completed drained-file cleanup")
+	require.GreaterOrEqual(t, unlinkCalls.Load(), int32(2))
+
+	_, err = os.Stat(filepath.Join(dir, "sf-initial.sfa"))
+	require.True(t, os.IsNotExist(err), "retry must remove the residual segment")
+	_, err = os.Stat(filepath.Join(dir, qwpSfManifestFileName))
+	require.True(t, os.IsNotExist(err), "retry must remove the residual manifest")
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
 func TestQwpEngineTerminalRetryOwnerCompletesFailedDeferredCleanup(t *testing.T) {
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)

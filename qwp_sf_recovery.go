@@ -210,9 +210,42 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		} else if path != "" {
 			return nil, nil, fmt.Errorf("%w: %s", qwpSfErrSanitizedResidue, path)
 		}
+		// A frame-zero tear leaves no recoverable frame in the active segment,
+		// but the bytes remain useful forensic evidence. Preserve them under the
+		// established .corrupt name and create a clean active at the same
+		// manifest-committed base instead of zeroing the only copy in place.
+		replacedTornActive := false
+		if activeSeg.segmentFrameCount() == 0 && activeSeg.segmentTornTailBytes() > 0 {
+			torn := activeSeg
+			path := torn.segmentPath()
+			if err := torn.close(); err != nil {
+				return nil, nil, err
+			}
+			if _, err := qwpSfQuarantinePath(path); err != nil {
+				return nil, nil, err
+			}
+			replacement, err := qwpSfCreateSegment(path, active, maxBytesPerSegment)
+			if err != nil {
+				return nil, nil, fmt.Errorf("qwp/sf: replace quarantined torn active %s: %w", path, err)
+			}
+			for i, seg := range all {
+				if seg == torn {
+					all[i] = replacement
+					break
+				}
+			}
+			chain[len(chain)-1] = replacement
+			activeSeg = replacement
+			replacedTornActive = true
+		}
 		for _, seg := range chain {
 			if err := seg.markManifestRequired(); err != nil {
 				return nil, nil, err
+			}
+		}
+		if replacedTornActive {
+			if err := qwpSfSyncDir(sfDir); err != nil {
+				return nil, nil, fmt.Errorf("qwp/sf: sync torn-active replacement directory %s: %w", sfDir, err)
 			}
 		}
 	} else {
@@ -318,10 +351,10 @@ func qwpSfFindActive(all []*qwpSfSegment, activeBase int64) *qwpSfSegment {
 			clean = seg
 		}
 	}
-	if torn != nil {
-		return torn
+	if clean != nil {
+		return clean
 	}
-	return clean
+	return torn
 }
 
 func qwpSfChooseEmptyInitial(all []*qwpSfSegment) *qwpSfSegment {
@@ -377,11 +410,28 @@ func qwpSfDiscardOpened(all []*qwpSfSegment, keep map[*qwpSfSegment]struct{}) er
 
 func qwpSfQuarantinePaths(paths []string) {
 	for _, path := range paths {
-		_ = os.Remove(path + ".corrupt")
-		if err := os.Rename(path, path+".corrupt"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if _, err := qwpSfQuarantinePath(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			qwpEffectiveLogger(nil).Warn("qwp/sf: could not quarantine corrupt segment", "path", path, "error", err)
 		}
 	}
+}
+
+func qwpSfQuarantinePath(path string) (string, error) {
+	target := path + ".corrupt"
+	for suffix := 1; ; suffix++ {
+		_, err := os.Stat(target)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("qwp/sf: inspect segment quarantine target %s: %w", target, err)
+		}
+		target = fmt.Sprintf("%s.corrupt-%d", path, suffix)
+	}
+	if err := os.Rename(path, target); err != nil {
+		return "", fmt.Errorf("qwp/sf: quarantine segment %s: %w", path, err)
+	}
+	return target, nil
 }
 
 func qwpSfQuarantineSlot(slotDir string) (string, error) {

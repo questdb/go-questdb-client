@@ -820,6 +820,13 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	for _, slot := range toClose {
 		p.reclaimSlotLocked(slot, firstErr)
 	}
+	p.mu.Unlock()
+	// A deferred close may have completed between reclaimSlotLocked and this
+	// report. Reprobe once so the first Close does not return a stale
+	// "cleanup(s) still pending" error; the idempotent-close path already does
+	// the same before reporting.
+	p.reprobeRetiredSlots()
+	p.mu.Lock()
 	pending := p.leakedSlots
 	p.mu.Unlock()
 	if pending > 0 {

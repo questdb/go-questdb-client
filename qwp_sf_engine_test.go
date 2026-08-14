@@ -138,16 +138,16 @@ func TestQwpSfSenderRotationManifestFailureRetainsRowsForRetry(t *testing.T) {
 	require.Equal(t, 1, s.pendingRowCount)
 
 	injected := errors.New("injected manifest fsync failure")
-	originalSync := qwpSfManifestSync
 	syncCalls := 0
-	qwpSfManifestSync = func(f *os.File) error {
+	syncHook := func(f *os.File) error {
 		syncCalls++
 		if syncCalls == 1 {
 			return injected
 		}
-		return originalSync(f)
+		return f.Sync()
 	}
-	t.Cleanup(func() { qwpSfManifestSync = originalSync })
+	qwpSfManifestSync.Store(&syncHook)
+	t.Cleanup(func() { qwpSfManifestSync.Store(nil) })
 
 	err = s.Flush(context.Background())
 	require.ErrorIs(t, err, injected)
