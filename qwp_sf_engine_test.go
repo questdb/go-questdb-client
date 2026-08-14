@@ -206,6 +206,84 @@ func TestQwpSfEngineFullDrainUnlinksFiles(t *testing.T) {
 	}
 }
 
+func TestQwpSfEngineFullDrainBarrierFailureRetainsSlot(t *testing.T) {
+	for _, barrier := range []string{"watermark-sync", "manifest-sync"} {
+		t.Run(barrier, func(t *testing.T) {
+			dir := t.TempDir()
+			sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "acked")
+			active := createRecoverySegment(t, dir, "sf-active.sfa", 1)
+			createRecoveryManifest(t, dir, 0, 1, sealed, active)
+			closeRecoverySegments(t, sealed, active)
+
+			engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+			require.NoError(t, err)
+			resetHook := func() {}
+			t.Cleanup(func() {
+				resetHook()
+				_ = engine.engineClose()
+			})
+			// Stop the manager before ACKing so it cannot trim the sealed segment
+			// or collapse the manifest ahead of the close path under test.
+			require.True(t, engine.manager.segmentManagerClose())
+			engine.engineAcknowledge(0)
+			require.Equal(t, int64(0), engine.enginePublishedFsn())
+			require.Equal(t, int64(0), engine.engineAckedFsn())
+
+			before, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			beforeNames := make([]string, 0, len(before))
+			for _, entry := range before {
+				beforeNames = append(beforeNames, entry.Name())
+			}
+
+			injected := errors.New("injected " + barrier + " failure")
+			switch barrier {
+			case "watermark-sync":
+				hook := func(*os.File) error { return injected }
+				qwpSfAckWatermarkSync.Store(&hook)
+				resetHook = func() { qwpSfAckWatermarkSync.Store(nil) }
+			case "manifest-sync":
+				hook := func(*os.File) error { return injected }
+				qwpSfManifestSync.Store(&hook)
+				resetHook = func() { qwpSfManifestSync.Store(nil) }
+			}
+			err = engine.engineClose()
+			require.ErrorIs(t, err, injected)
+			require.False(t, engine.engineCloseCompleted())
+			require.False(t, engine.terminalResourcesClosed.Load())
+
+			after, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			afterNames := make([]string, 0, len(after))
+			for _, entry := range after {
+				afterNames = append(afterNames, entry.Name())
+			}
+			require.ElementsMatch(t, beforeNames, afterNames, "failed barrier must not unlink slot files")
+			for _, name := range beforeNames {
+				require.FileExists(t, filepath.Join(dir, name))
+			}
+			_, err = qwpSfAcquireSlotLock(dir)
+			require.Error(t, err, "failed barrier must retain the slot flock")
+
+			resetHook()
+			require.NoError(t, engine.engineClose(), "later Close must retry and converge")
+			require.True(t, engine.engineCloseCompleted())
+			for _, name := range beforeNames {
+				if filepath.Ext(name) == ".sfa" ||
+					name == qwpSfManifestFileName ||
+					name == qwpSfAckWatermarkFileName ||
+					name == qwpSfSymbolDictFileName {
+					_, statErr := os.Stat(filepath.Join(dir, name))
+					require.True(t, os.IsNotExist(statErr), "later Close retained drained file %s", name)
+				}
+			}
+			lock, err := qwpSfAcquireSlotLock(dir)
+			require.NoError(t, err, "later Close must release the slot flock")
+			require.NoError(t, lock.close())
+		})
+	}
+}
+
 func TestQwpSfEngineTrimAdvancesManifest(t *testing.T) {
 	dir := t.TempDir()
 	const segSize int64 = 72

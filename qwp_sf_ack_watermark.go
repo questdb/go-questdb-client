@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -46,6 +47,18 @@ const qwpSfAckWatermarkInvalid int64 = math.MinInt64
 // an existing correctly-sized watermark.
 var qwpSfAckWatermarkWriteAt = func(f *os.File, p []byte, off int64) (int, error) {
 	return f.WriteAt(p, off)
+}
+
+// qwpSfAckWatermarkSync is a test seam for close/trim durability-barrier
+// failures. A nil pointer means production os.File.Sync. Tests publish hooks
+// atomically because sync also runs on the live manager worker.
+var qwpSfAckWatermarkSync atomic.Pointer[func(f *os.File) error]
+
+func qwpSfAckWatermarkSyncFile(f *os.File) error {
+	if hook := qwpSfAckWatermarkSync.Load(); hook != nil {
+		return (*hook)(f)
+	}
+	return f.Sync()
 }
 
 // qwpSfAckWatermark uses the Java-compatible dual-slot record. Stores only
@@ -205,7 +218,7 @@ func (w *qwpSfAckWatermark) sync() error {
 	if err := qwpSfMsync(w.buf, int64(len(w.buf))); err != nil {
 		return fmt.Errorf("qwp/sf: msync ack watermark: %w", err)
 	}
-	if err := w.file.Sync(); err != nil {
+	if err := qwpSfAckWatermarkSyncFile(w.file); err != nil {
 		return fmt.Errorf("qwp/sf: fsync ack watermark: %w", err)
 	}
 	return nil
