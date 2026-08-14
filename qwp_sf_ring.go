@@ -270,21 +270,29 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 			r.rotationErr.Store(&qwpSfRingError{err: syncErr})
 			return qwpSfRotationFailed
 		}
-		// Mutate sealedSegments under the same mutex used by the
-		// snapshot accessors — the I/O thread reads through that
-		// path and must not see a half-resized slice.
+		// Snapshot the current head under the sealed-list mutex, but do not
+		// hold it across the manifest fsync. The send loop takes this mutex
+		// to walk sealed segments and must remain able to send while a
+		// durability syscall is slow. A concurrent trim may advance the
+		// manifest head after this snapshot; manifest.update's monotonic
+		// clamp prevents this stale-low head from moving it backwards.
+		headBase := active.segmentBaseSeq()
 		r.mu.Lock()
-		if r.manifest != nil {
-			headBase := active.segmentBaseSeq()
-			if len(r.sealedSegments) > 0 {
-				headBase = r.sealedSegments[0].segmentBaseSeq()
-			}
-			if updateErr := r.manifest.update(headBase, actualBase); updateErr != nil {
-				r.mu.Unlock()
+		manifest := r.manifest
+		if len(r.sealedSegments) > 0 {
+			headBase = r.sealedSegments[0].segmentBaseSeq()
+		}
+		r.mu.Unlock()
+		if manifest != nil {
+			if updateErr := manifest.update(headBase, actualBase); updateErr != nil {
 				r.rotationErr.Store(&qwpSfRingError{err: updateErr})
 				return qwpSfRotationFailed
 			}
 		}
+
+		// Publish the sealed-list mutation atomically to its readers after
+		// the durable topology update succeeds.
+		r.mu.Lock()
 		r.sealedSegments = append(r.sealedSegments, active)
 		r.mu.Unlock()
 		r.rotationErr.Store(nil)

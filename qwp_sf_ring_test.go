@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -114,6 +115,72 @@ func TestQwpSfRingRotatesIntoHotSpare(t *testing.T) {
 	assert.Equal(t, first, sealed[0])
 	// Hot spare should be cleared.
 	assert.True(t, r.needsHotSpare())
+}
+
+func TestQwpSfRingManifestSyncDoesNotBlockSendLookup(t *testing.T) {
+	dir := t.TempDir()
+	const segSize int64 = 4096
+
+	active, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segSize)
+	require.NoError(t, err)
+	manifest, err := qwpSfManifestCreate(dir, 0, 0)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(active, segSize)
+	ring.manifest = manifest
+	defer func() { _ = ring.segmentRingClose() }()
+
+	// Leave 16 bytes free. The next 9-byte payload needs 17 bytes with its
+	// frame header, so it must rotate.
+	filler := make([]byte, segSize-qwpSfHeaderSize-qwpSfFrameHeaderSize-16)
+	require.Equal(t, int64(0), ring.appendOrFsn(filler))
+	spare, err := qwpSfCreateSegment(filepath.Join(dir, "sf-spare.sfa"), ring.nextSeqHint(), segSize)
+	require.NoError(t, err)
+	require.NoError(t, ring.installHotSpare(spare))
+
+	syncEntered := make(chan struct{})
+	releaseSync := make(chan struct{})
+	syncHook := func(f *os.File) error {
+		close(syncEntered)
+		<-releaseSync
+		return f.Sync()
+	}
+	qwpSfManifestSync.Store(&syncHook)
+	t.Cleanup(func() { qwpSfManifestSync.Store(nil) })
+
+	rotationDone := make(chan int64, 1)
+	go func() {
+		rotationDone <- ring.appendOrFsn(make([]byte, 9))
+	}()
+
+	select {
+	case <-syncEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not reach manifest sync")
+	}
+
+	lookupDone := make(chan *qwpSfSegment, 1)
+	go func() {
+		lookupDone <- ring.findSegmentContaining(0)
+	}()
+
+	var found *qwpSfSegment
+	lookupReturned := false
+	select {
+	case found = <-lookupDone:
+		lookupReturned = true
+	case <-time.After(time.Second):
+	}
+	close(releaseSync)
+	if !lookupReturned {
+		found = <-lookupDone
+	}
+	fsn := <-rotationDone
+
+	require.True(t, lookupReturned, "send lookup blocked on manifest fsync")
+	require.Same(t, active, found)
+	require.Equal(t, int64(1), fsn)
+	require.Same(t, spare, ring.getActiveSegment())
+	require.Equal(t, 1, ring.sealedSegmentCount())
 }
 
 // TestQwpSfRingBackupWakeupRearmsPerActiveSegment pins the contract
