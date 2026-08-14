@@ -30,6 +30,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -126,6 +127,27 @@ func TestQwpSfAckWatermarkHonoursForeignBytes(t *testing.T) {
 	defer func() { _ = w.close() }()
 	assert.Equal(t, int64(42), w.read(),
 		"a watermark written by another client must be read byte-for-byte")
+}
+
+func TestQwpSfAckWatermarkExistingBlockReservationFailureStopsOpen(t *testing.T) {
+	dir := t.TempDir()
+	writeForeignAckWatermark(t, dir, 42)
+
+	originalWriteAt := qwpSfAckWatermarkWriteAt
+	writeCalls := 0
+	qwpSfAckWatermarkWriteAt = func(*os.File, []byte, int64) (int, error) {
+		writeCalls++
+		return 0, syscall.ENOSPC
+	}
+	t.Cleanup(func() { qwpSfAckWatermarkWriteAt = originalWriteAt })
+
+	w, err := qwpSfAckWatermarkOpenRequired(dir)
+	if w != nil {
+		_ = w.close()
+	}
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	require.Nil(t, w)
+	require.Equal(t, 1, writeCalls)
 }
 
 func TestQwpSfAckWatermarkBadMagicIsInvalid(t *testing.T) {

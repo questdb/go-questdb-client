@@ -27,6 +27,7 @@ package questdb
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -40,6 +41,12 @@ const (
 )
 
 const qwpSfAckWatermarkInvalid int64 = math.MinInt64
+
+// qwpSfAckWatermarkWriteAt is a test seam for block-forcing write failures on
+// an existing correctly-sized watermark.
+var qwpSfAckWatermarkWriteAt = func(f *os.File, p []byte, off int64) (int, error) {
+	return f.WriteAt(p, off)
+}
 
 // qwpSfAckWatermark uses the Java-compatible dual-slot record. Stores only
 // dirty the mapping; sync is a separate control-point barrier used before trim
@@ -82,6 +89,28 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 		if err := qwpSfAllocate(f, qwpSfDualRecordFileSize); err != nil {
 			_ = f.Close()
 			return nil, err
+		}
+	} else {
+		// Preserve the existing dual-slot records while forcing real blocks
+		// underneath every page that will be mapped. A correctly-sized foreign
+		// or fallback-created file may be sparse; storing through its mapping on
+		// a full disk would SIGBUS the process. qwpSfAllocate cannot help here
+		// because it intentionally does nothing when size == current size. The
+		// write-back allocates the holes now and surfaces ENOSPC on the open path.
+		var preserved [qwpSfAckWatermarkFileSize]byte
+		if _, err := io.ReadFull(f, preserved[:]); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("qwp/sf: read existing ack watermark %s: %w", path, err)
+		}
+		n, err := qwpSfAckWatermarkWriteAt(f, preserved[:], 0)
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("qwp/sf: reserve blocks for existing ack watermark %s: %w", path, err)
+		}
+		if n != len(preserved) {
+			_ = f.Close()
+			return nil, fmt.Errorf("qwp/sf: reserve blocks for existing ack watermark %s: wrote %d of %d bytes: %w",
+				path, n, len(preserved), io.ErrShortWrite)
 		}
 	}
 	buf, err := qwpSfMmapRW(f, qwpSfDualRecordFileSize)
