@@ -872,11 +872,13 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	if e.closeCompleted.Load() || e.deferredCleanupOwned.Load() || e.terminalCleanupClaimed.Load() {
 		return nil
 	}
-	// Capture drain state exactly once, BEFORE closing the ring. Retries use the
-	// stored decision: even today's watermark accessors are atomic-only, but a
-	// retry must not rely on that remaining true after segmentRingClose has
-	// unmapped and detached the ring's segments.
-	if firstClose {
+	// Capture drain state while terminal resources are still open, BEFORE
+	// closing the ring. Do not gate this on firstClose: the goroutine that wins
+	// the closed CAS may be preempted before appendMu, allowing a concurrent
+	// non-first caller to reach this serialized teardown section first. Once
+	// resources are closed, retries use the stored decision and never touch the
+	// detached ring.
+	if !e.terminalResourcesClosed.Load() {
 		publishedFsn := e.ring.segmentRingPublishedFsn()
 		fullyDrained := e.sfDir != "" &&
 			(publishedFsn < 0 || e.ring.segmentRingAckedFsn() >= publishedFsn)

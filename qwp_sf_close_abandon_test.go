@@ -371,6 +371,32 @@ func TestQwpEngineDeferredCleanupPanicTransfersToRetryOwner(t *testing.T) {
 	require.NoError(t, lock.close())
 }
 
+func TestQwpEngineNonFirstCloseComputesDrainStateBeforeCleanup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = engine.engineClose() })
+	segmentPath := filepath.Join(dir, "sf-initial.sfa")
+	manifestPath := filepath.Join(dir, qwpSfManifestFileName)
+	require.FileExists(t, segmentPath)
+	require.FileExists(t, manifestPath)
+
+	// Model the exact concurrent-close window: another goroutine won the
+	// closed CAS, then was preempted before appendMu. This non-first caller is
+	// therefore the first one to reach the serialized teardown section.
+	engine.closed.Store(true)
+	require.NoError(t, engine.engineClose())
+	require.True(t, engine.engineCloseCompleted())
+
+	_, err = os.Stat(segmentPath)
+	require.True(t, os.IsNotExist(err), "drained close must remove the segment")
+	_, err = os.Stat(manifestPath)
+	require.True(t, os.IsNotExist(err), "drained close must remove the manifest")
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
 func TestQwpEngineDoubleCloseDuringUnlinkRunsOneCleanup(t *testing.T) {
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
