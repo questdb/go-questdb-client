@@ -47,6 +47,11 @@ const (
 	qwpSfDualRecordFileSize  int64  = 8192
 )
 
+// qwpSfManifestSync is a test seam for manifest durability failures. Production
+// always calls os.File.Sync; tests replace it briefly to exercise the live
+// rotation retry path without corrupting or closing the manifest descriptor.
+var qwpSfManifestSync = func(f *os.File) error { return f.Sync() }
+
 type qwpSfDualRecord struct {
 	generation int64
 	first      int64
@@ -209,7 +214,7 @@ func (m *qwpSfManifest) update(newHead, newActive int64) error {
 		}
 		return fmt.Errorf("qwp/sf: write manifest generation %d: %w", next, err)
 	}
-	if err := m.file.Sync(); err != nil {
+	if err := qwpSfManifestSync(m.file); err != nil {
 		return fmt.Errorf("qwp/sf: fsync manifest: %w", err)
 	}
 	m.generation = next

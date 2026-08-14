@@ -119,6 +119,17 @@ func newQwpSenderPoolForTest(t *testing.T, extra string, min, max int) *qwpSende
 	return p
 }
 
+func TestQwpSenderPoolMemoryBuildCleanupDoesNotConsumeCapacity(t *testing.T) {
+	p := &qwpSenderPool{maxSize: 1}
+	slot := &qwpSenderSlot{slotIndex: -1, cleanup: &qwpLineSender{}}
+
+	p.reclaimFailedBuild(slot, -1, errors.New("injected memory build failure"))
+
+	require.Zero(t, p.closingSlots)
+	require.Zero(t, p.leakedSlots)
+	require.Zero(t, p.capUsedLocked())
+}
+
 // TestQwpPooledSenderForwardsEveryColumnType pins the pooled lease forwarding
 // table: every LineSender + QwpSender column method must reach the delegate
 // with the right arguments, and every accessor must delegate too. It builds the

@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -47,6 +48,12 @@ const qwpSfEngineDefaultAppendDeadline = 30 * time.Second
 // retries while waiting for the manager to free space. Mirrors
 // Java's 50µs LockSupport.parkNanos.
 const qwpSfEngineParkInterval = 50 * time.Microsecond
+
+const qwpSfCloseRetryLogThrottle = 30 * time.Second
+
+// qwpSfCloseRetryInterval is variable so panic/retry tests do not need to wait
+// through production's one-second terminal-cleanup cadence.
+var qwpSfCloseRetryInterval = time.Second
 
 // ErrBackpressureTimeout is the sentinel a producer call
 // (At / AtNow / Flush / FlushAndGetSequence) wraps when the
@@ -900,7 +907,20 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	if !e.terminalCleanupClaimed.CompareAndSwap(false, true) {
 		return nil
 	}
-	return e.engineFinishClose(fullyDrained, effectiveLeakSegments)
+	return e.engineFinishCloseGuarded(fullyDrained, effectiveLeakSegments)
+}
+
+// engineFinishCloseGuarded converts a terminal-cleanup panic into a retryable
+// error. Callers invoke it only after successfully claiming
+// terminalCleanupClaimed, so this recovery owns the claim it releases.
+func (e *qwpSfCursorEngine) engineFinishCloseGuarded(fullyDrained, leakSegments bool) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.terminalCleanupClaimed.Store(false)
+			err = fmt.Errorf("qwp/sf: terminal cleanup panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return e.engineFinishClose(fullyDrained, leakSegments)
 }
 
 // engineFinishClose performs terminal cleanup after manager quiescence is
@@ -1008,14 +1028,21 @@ func (e *qwpSfCursorEngine) engineCompleteDeferredClose() {
 		return
 	}
 	e.appendMu.Lock()
-	err := e.engineFinishClose(e.deferredFullyDrained.Load(), e.deferredLeakSegments.Load())
+	err := e.engineFinishCloseGuarded(e.deferredFullyDrained.Load(), e.deferredLeakSegments.Load())
 	e.appendMu.Unlock()
-	logger := qwpEffectiveLogger(e.manager.logger.Load())
+	logger := e.manager.logger.Load()
 	if err != nil {
-		logger.Error("qwp/sf: deferred engine close failed", "slot", e.sfDir, "error", err, "closeCompleted", e.closeCompleted.Load())
+		// The manager has finished its one-shot handoff. If terminal cleanup
+		// failed or panicked, replace it with the engine-owned retry loop before
+		// reporting the error so even a panicking user logger cannot leave the
+		// slot without a cleanup owner.
+		e.engineStartCloseRetryOwner(logger)
+		qwpSfLogCloseRetry(logger, slog.LevelError, "qwp/sf: deferred engine close failed",
+			"slot", e.sfDir, "error", err, "closeCompleted", e.closeCompleted.Load())
 		return
 	}
-	logger.Info("qwp/sf: deferred engine close completed", "slot", e.sfDir, "closeCompleted", e.closeCompleted.Load())
+	qwpSfLogCloseRetry(logger, slog.LevelInfo, "qwp/sf: deferred engine close completed",
+		"slot", e.sfDir, "closeCompleted", e.closeCompleted.Load())
 }
 
 func (e *qwpSfCursorEngine) engineCloseCompleted() bool {
@@ -1039,6 +1066,19 @@ func (e *qwpSfCursorEngine) engineRetryCloseIfNeeded() error {
 	return e.engineCloseInternal(e.deferredLeakSegments.Load())
 }
 
+// engineRunCloseRetryAttempt contains panics outside terminal cleanup itself,
+// including manager-handoff diagnostics. It deliberately does not touch
+// terminalCleanupClaimed: engineFinishCloseGuarded releases that bit only when
+// this attempt successfully acquired it.
+func (e *qwpSfCursorEngine) engineRunCloseRetryAttempt() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("qwp/sf: terminal cleanup retry panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return e.engineRetryCloseIfNeeded()
+}
+
 // engineStartCloseRetryOwner supplies terminal cleanup ownership to paths that
 // cannot expose a retryable object to the caller (construction unwind,
 // drainer exit, and pool shutdown). The per-engine goroutine exits as soon as
@@ -1048,19 +1088,45 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 		return
 	}
 	go func() {
+		// Each attempt and every diagnostic below has its own panic boundary.
+		// Keep this outer boundary as the final crash story: relinquish the
+		// goroutine-owner marker and replace the owner if cleanup is incomplete.
+		defer func() {
+			if r := recover(); r != nil {
+				e.closeRetryOwnerStarted.Store(false)
+				qwpSfLogCloseRetry(logger, slog.LevelError, "qwp/sf: terminal cleanup retry owner panicked",
+					"slot", e.sfDir, "panic", r, "stack", string(debug.Stack()))
+				if !e.closeCompleted.Load() {
+					e.engineStartCloseRetryOwner(logger)
+				}
+			}
+		}()
+		var lastWarn time.Time
 		for !e.closeCompleted.Load() {
-			if e.engineCloseRetryable() {
-				if err := e.engineRetryCloseIfNeeded(); err != nil {
-					qwpEffectiveLogger(logger).Warn("qwp/sf: terminal cleanup retry failed; slot lock remains held",
-						"slot", e.sfDir, "error", err)
+			retryErr := e.engineRunCloseRetryAttempt()
+			if retryErr != nil {
+				now := time.Now()
+				if qwpSfShouldLogCloseRetry(lastWarn, now) {
+					lastWarn = now
+					qwpSfLogCloseRetry(logger, slog.LevelWarn, "qwp/sf: terminal cleanup retry failed; slot lock remains held",
+						"slot", e.sfDir, "error", retryErr)
 				}
 			}
 			if e.closeCompleted.Load() {
 				return
 			}
-			time.Sleep(time.Second)
+			time.Sleep(qwpSfCloseRetryInterval)
 		}
 	}()
+}
+
+func qwpSfLogCloseRetry(logger *slog.Logger, level slog.Level, message string, args ...any) {
+	defer func() { _ = recover() }()
+	qwpEffectiveLogger(logger).Log(context.Background(), level, message, args...)
+}
+
+func qwpSfShouldLogCloseRetry(last, now time.Time) bool {
+	return last.IsZero() || now.Sub(last) >= qwpSfCloseRetryLogThrottle
 }
 
 // qwpSfUnlinkAllSegmentFiles unlinks every .sfa file under dir.

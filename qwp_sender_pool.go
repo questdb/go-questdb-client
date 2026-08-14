@@ -326,12 +326,7 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 				p.mu.Lock()
 				p.inFlightCreations--
 				if err != nil {
-					if slot != nil && slot.cleanup != nil {
-						p.closingSlots++
-						p.reclaimSlotLocked(slot, err)
-					} else {
-						p.freeSlotIndexLocked(slotIndex)
-					}
+					p.reclaimFailedBuild(slot, slotIndex, err)
 					p.broadcastLocked()
 					p.mu.Unlock()
 					return nil, err
@@ -419,12 +414,7 @@ func (p *qwpSenderPool) settleGrowthBuild(resultCh <-chan *qwpSenderSlot, errCh 
 	p.mu.Lock()
 	p.inFlightCreations--
 	if err != nil {
-		if slot != nil && slot.cleanup != nil {
-			p.closingSlots++
-			p.reclaimSlotLocked(slot, err)
-		} else {
-			p.freeSlotIndexLocked(slotIndex)
-		}
+		p.reclaimFailedBuild(slot, slotIndex, err)
 		p.broadcastLocked()
 		p.mu.Unlock()
 		return
@@ -857,15 +847,25 @@ func (p *qwpSenderPool) createSlot(ctx context.Context, async bool) (*qwpSenderS
 	}
 	slot, err := p.createSlotAt(ctx, slotIndex, async)
 	if err != nil {
-		if slot != nil && slot.cleanup != nil {
-			p.closingSlots++
-			p.reclaimSlotLocked(slot, err)
-		} else {
-			p.freeSlotIndexLocked(slotIndex)
-		}
+		p.reclaimFailedBuild(slot, slotIndex, err)
 		return nil, err
 	}
 	return slot, nil
+}
+
+// reclaimFailedBuild releases the capacity reservation left by a failed slot
+// build. Only disk-backed SF slots participate in closingSlots: memory-mode
+// senders can report deferred cleanup, but they own no slot index or flock and
+// therefore must not consume pool capacity while that cleanup completes.
+// Callers serialize this with the pool mutex once the pool is published; the
+// construction-only createSlot path calls it before publication.
+func (p *qwpSenderPool) reclaimFailedBuild(slot *qwpSenderSlot, slotIndex int, buildErr error) {
+	if p.storeAndForward && slot != nil && slot.slotIndex >= 0 && slot.cleanup != nil {
+		p.closingSlots++
+		p.reclaimSlotLocked(slot, buildErr)
+		return
+	}
+	p.freeSlotIndexLocked(slotIndex)
 }
 
 // createSlotAt builds a sender bound to slotIndex (-1 in memory mode). It parses

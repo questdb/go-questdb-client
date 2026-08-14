@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -107,6 +108,83 @@ func TestQwpEngineTerminalRetryOwnerCompletesFailedDeferredCleanup(t *testing.T)
 	require.GreaterOrEqual(t, calls.Load(), int32(2))
 }
 
+func TestQwpEngineTerminalRetryOwnerRecoversPanicAndCompletes(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+
+	flockCalls := atomic.Int32{}
+	flockHook := func() error {
+		if flockCalls.Add(1) == 1 {
+			return errors.New("injected first release failure")
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	require.Error(t, engine.engineClose())
+
+	finishCalls := atomic.Int32{}
+	finishHook := func() {
+		if finishCalls.Add(1) == 1 {
+			panic("injected terminal cleanup panic")
+		}
+	}
+	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
+	originalInterval := qwpSfCloseRetryInterval
+	qwpSfCloseRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		qwpSfTestBeforeFlockReleaseHook.Store(nil)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		qwpSfCloseRetryInterval = originalInterval
+	})
+
+	engine.engineStartCloseRetryOwner(nil)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond)
+	require.GreaterOrEqual(t, finishCalls.Load(), int32(2))
+	require.GreaterOrEqual(t, flockCalls.Load(), int32(2))
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpEngineTerminalRetryOwnerSurvivesPanickingLogger(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+
+	flockCalls := atomic.Int32{}
+	flockHook := func() error {
+		if flockCalls.Add(1) <= 2 {
+			return errors.New("injected release failure")
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	originalInterval := qwpSfCloseRetryInterval
+	qwpSfCloseRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		qwpSfTestBeforeFlockReleaseHook.Store(nil)
+		qwpSfCloseRetryInterval = originalInterval
+	})
+
+	require.Error(t, engine.engineClose())
+	engine.engineStartCloseRetryOwner(slog.New(panicOnHandleSlog{}))
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond)
+	require.GreaterOrEqual(t, flockCalls.Load(), int32(3))
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSfCloseRetryLogThrottle(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	require.True(t, qwpSfShouldLogCloseRetry(time.Time{}, now))
+	require.False(t, qwpSfShouldLogCloseRetry(now, now.Add(qwpSfCloseRetryLogThrottle-time.Nanosecond)))
+	require.True(t, qwpSfShouldLogCloseRetry(now, now.Add(qwpSfCloseRetryLogThrottle)))
+}
+
 // TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits reproduces the close
 // race at the real worker I/O boundary. A manager blocked in spare creation
 // must retain every worker-reachable resource and the flock; its exit path
@@ -160,6 +238,64 @@ func TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits(t *testing.T) {
 	require.NoError(t, lock.close())
 	// A retry after deferred cleanup converges without a second teardown.
 	require.NoError(t, engine.engineClose())
+}
+
+func TestQwpEngineDeferredCleanupPanicTransfersToRetryOwner(t *testing.T) {
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	finishCalls := atomic.Int32{}
+	finishHook := func() {
+		if finishCalls.Add(1) == 1 {
+			panic("injected deferred cleanup panic")
+		}
+	}
+	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
+	oldGrace := qwpSfManagerCloseGrace
+	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldInterval := qwpSfCloseRetryInterval
+	qwpSfCloseRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		qwpSfManagerCloseGrace = oldGrace
+		qwpSfCloseRetryInterval = oldInterval
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	require.NoError(t, engine.engineClose())
+	require.False(t, engine.engineCloseCompleted())
+	close(release)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, time.Millisecond)
+	require.GreaterOrEqual(t, finishCalls.Load(), int32(2))
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
 }
 
 func TestQwpEngineDoubleCloseDuringUnlinkRunsOneCleanup(t *testing.T) {

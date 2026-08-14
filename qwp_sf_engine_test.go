@@ -88,6 +88,84 @@ func TestQwpSfEngineDiskModeWritesAndRecovers(t *testing.T) {
 	assert.Equal(t, int64(4), e2.enginePublishedFsn())
 }
 
+func TestQwpSfEngineRecoveredEmptyActiveTailPreservesUnackedSegmentsOnClose(t *testing.T) {
+	dir := t.TempDir()
+	sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 1)
+	createRecoveryManifest(t, dir, 0, 1, sealed, active)
+	closeRecoverySegments(t, sealed, active)
+
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), e.enginePublishedFsn())
+	require.Equal(t, int64(-1), e.engineAckedFsn())
+	require.NoError(t, e.engineClose())
+
+	for _, name := range []string{"sf-initial.sfa", "sf-active.sfa"} {
+		_, err := os.Stat(filepath.Join(dir, name))
+		require.NoError(t, err, "%s must survive while FSN 0 is unacknowledged", name)
+	}
+	_, err = os.Stat(filepath.Join(dir, qwpSfManifestFileName))
+	require.NoError(t, err, "the manifest must survive with the unacknowledged chain")
+}
+
+func TestQwpSfSenderRotationManifestFailureRetainsRowsForRetry(t *testing.T) {
+	dir := t.TempDir()
+	const segSize int64 = 4096
+
+	active, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segSize)
+	require.NoError(t, err)
+	manifest, err := qwpSfManifestCreate(dir, 0, 0)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(active, segSize)
+	ring.manifest = manifest
+	defer func() { _ = ring.segmentRingClose() }()
+
+	// Leave too little room for even the smallest encoded QWP row, forcing the
+	// producer-visible Flush below through the live rotation path.
+	filler := make([]byte, segSize-qwpSfHeaderSize-qwpSfFrameHeaderSize-16)
+	firstFsn := ring.appendOrFsn(filler)
+	require.Equal(t, int64(0), firstFsn)
+
+	spare, err := qwpSfCreateSegment(filepath.Join(dir, "sf-spare.sfa"), ring.nextSeqHint(), segSize)
+	require.NoError(t, err)
+	require.NoError(t, ring.installHotSpare(spare))
+
+	e := &qwpSfCursorEngine{ring: ring, appendDeadline: time.Second}
+	s, err := newQwpCursorLineSender(0, 0, 0, 0, e, &qwpSfSendLoop{}, time.Second)
+	require.NoError(t, err)
+	require.NoError(t, s.Table("t").Int64Column("v", 42).AtNow(context.Background()))
+	require.Equal(t, 1, s.pendingRowCount)
+
+	injected := errors.New("injected manifest fsync failure")
+	originalSync := qwpSfManifestSync
+	syncCalls := 0
+	qwpSfManifestSync = func(f *os.File) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return injected
+		}
+		return originalSync(f)
+	}
+	t.Cleanup(func() { qwpSfManifestSync = originalSync })
+
+	err = s.Flush(context.Background())
+	require.ErrorIs(t, err, injected)
+	require.Equal(t, 1, s.pendingRowCount, "an unappended row must remain pending")
+	require.Equal(t, int64(0), ring.segmentRingPublishedFsn())
+	require.Equal(t, int64(1), ring.nextSeqHint())
+	require.Same(t, active, ring.getActiveSegment())
+	require.Zero(t, ring.sealedSegmentCount())
+
+	fsn, err := s.FlushAndGetSequence(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), fsn)
+	require.Zero(t, s.pendingRowCount)
+	require.Equal(t, int64(1), ring.segmentRingPublishedFsn())
+	require.Same(t, spare, ring.getActiveSegment())
+	require.Equal(t, 1, ring.sealedSegmentCount())
+}
+
 func TestQwpSfEngineSlotLockBlocksDouble(t *testing.T) {
 	dir := t.TempDir()
 	e1, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)

@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"encoding/binary"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -103,6 +104,17 @@ func TestQwpSfAckWatermarkPersistGateAndFormat(t *testing.T) {
 	assert.False(t, w2.persistIfAdvanced(-1))
 	assert.True(t, w2.persistIfAdvanced(10))
 	assert.Equal(t, int64(10), w2.read())
+}
+
+func TestQwpSfAckWatermarkRejectsGenerationWraparound(t *testing.T) {
+	dir := t.TempDir()
+	w := qwpSfAckWatermarkOpen(dir)
+	require.NotNil(t, w)
+	defer func() { _ = w.close() }()
+
+	w.generation = math.MaxInt64
+	assert.False(t, w.persistIfAdvanced(0))
+	assert.Equal(t, qwpSfAckWatermarkInvalid, w.read())
 }
 
 func TestQwpSfAckWatermarkHonoursForeignBytes(t *testing.T) {
