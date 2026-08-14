@@ -25,10 +25,12 @@
 package questdb
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -270,6 +272,50 @@ func TestQwpSfRecoveryRotationCrashWindow(t *testing.T) {
 			assert.Equal(t, int64(0), ring.segmentRingPublishedFsn())
 		})
 	}
+}
+
+func TestQwpSfRecoveryFullyTrimmedEmptyActiveKeepsSequenceDomain(t *testing.T) {
+	const (
+		baseSeq     int64 = 7
+		segmentSize int64 = 4096
+	)
+	dir := t.TempDir()
+	activePath := filepath.Join(dir, "sf-active.sfa")
+	active := createRecoverySegment(t, dir, "sf-active.sfa", baseSeq)
+	createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
+	closeRecoverySegments(t, active)
+
+	engine, err := qwpSfNewCursorEngine(dir, segmentSize, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+	require.Equal(t, baseSeq-1, engine.enginePublishedFsn())
+	require.Equal(t, baseSeq-1, engine.engineAckedFsn())
+	require.Equal(t, baseSeq, engine.ring.nextSeqHint())
+
+	require.Eventually(t, func() bool {
+		return engine.ring.hotSpare.Load() != nil
+	}, time.Second, time.Millisecond)
+
+	// Fill the recovered active almost to its end, then append once more to
+	// rotate it into the sealed chain.
+	filler := make([]byte, segmentSize-qwpSfHeaderSize-qwpSfFrameHeaderSize-4)
+	fsn, err := engine.engineAppendBlocking(context.Background(), filler)
+	require.NoError(t, err)
+	require.Equal(t, baseSeq, fsn)
+	fsn, err = engine.engineAppendBlocking(context.Background(), []byte("next"))
+	require.NoError(t, err)
+	require.Equal(t, baseSeq+1, fsn)
+
+	engine.engineAcknowledge(baseSeq)
+	require.Equal(t, baseSeq, engine.engineAckedFsn())
+	awaitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	sender := &qwpLineSender{cursorEngine: engine, cursorSendLoop: &qwpSfSendLoop{}}
+	require.NoError(t, sender.AwaitAckedFsn(awaitCtx, baseSeq))
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(activePath)
+		return os.IsNotExist(err)
+	}, time.Second, time.Millisecond, "the acknowledged segment at the recovered base must trim")
 }
 
 func TestQwpSfRecoveryLegacyBaseZeroQuarantinesCorruptStray(t *testing.T) {

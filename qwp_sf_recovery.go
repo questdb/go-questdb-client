@@ -276,11 +276,11 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 	ring := qwpSfNewSegmentRing(activeSeg, maxBytesPerSegment)
 	ring.sealedSegments = append(ring.sealedSegments, chain[:len(chain)-1]...)
 	// The ring constructor derives publishedFsn from the active segment alone.
-	// Recovery may retain an empty active tail after a completed rotation, in
-	// which case nextSeq is still the FSN immediately after the sealed chain.
-	if len(ring.sealedSegments) > 0 {
-		ring.publishedFsn.Store(ring.nextSeq.Load() - 1)
-	}
+	// Recovery may retain an empty active segment after a completed rotation and
+	// full trim, with no sealed segments left. Its positive base still records
+	// the historical sequence frontier, so derive publishedFsn from nextSeq for
+	// every recovered chain. A genuinely fresh base-zero ring remains at -1.
+	ring.publishedFsn.Store(ring.nextSeq.Load() - 1)
 	ring.manifest = manifest
 	// Ownership of chain and manifest transferred to the ring.
 	all = nil
