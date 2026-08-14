@@ -96,8 +96,7 @@ schema-safe against a fresh server connection. The symbol dictionary is
 **delta-encoded** (each id sent once per connection); a reconnect re-registers
 the whole dictionary via a send-loop catch-up frame before replay, and SF mode
 persists it to a per-slot `.symbol-dict` side-file so a recovered /
-orphan-drained slot can rebuild it. See "Delta symbol dictionary" below and
-`design/qwp-delta-symbol-dict.md`.
+orphan-drained slot can rebuild it. See "Delta symbol dictionary" below.
 
 **Invariant B (store-and-forward robustness):** a running sender, async
 initial connect, and every background/orphan drainer retry transport outages
@@ -126,20 +125,19 @@ schema from the first `RESULT_BATCH` of a query (`batch_seq == 0`) into
 batches; `qwpEgressIO.dispatcherRun` calls `resetQuerySchema` at the start of
 every query so a schema never leaks across query boundaries.
 
-**Delta symbol dictionary** (`design/qwp-delta-symbol-dict.md`). The dict is
+**Delta symbol dictionary.** The dict is
 delta-encoded: `symbolDeltaBaseline()` returns `maxSentSymbolId` (delta mode) or
 `-1` (full-dict fallback), passed as the encoder's `maxSentId`, so each frame
-carries only ids above the sent watermark. `deltaDictEnabled` (on the producer
-and the send loop) comes from `engineDeltaDictEnabled()` — always in memory
-mode, SF only when the per-slot `.symbol-dict` side-file (`qwp_sf_symbol_dict.go`)
-opened; otherwise the sender falls back to full self-sufficient frames
-(`maxSentId=-1`), byte-identical to the old behaviour. `maxSentSymbolId` is
-monotonic (never reset — it survives the wire boundary); `batchMaxSymbolId` is
-the `batchMaxId` arg bounding `writeDeltaDict`, rewound by `resetAfterFlush` to
-`maxSentSymbolId` (never `-1`). Both `enqueueCursor` and the per-table split
-`enqueueCursorSplit` emit deltas and advance the baseline **per frame** — the
-split path MUST stay delta, since a full-dict frame there would be skipped by the
-send-loop mirror and gap the reconnect catch-up.
+carries only ids above the sent watermark. The producer's `deltaDictEnabled`
+comes from `engineDeltaDictEnabled()` — always in memory mode, SF only when the
+per-slot `.symbol-dict` side-file (`qwp_sf_symbol_dict.go`) opened; otherwise
+new frames fall back to a full self-sufficient dictionary (`maxSentId=-1`).
+`maxSentSymbolId` is monotonic (never reset — it survives the wire boundary);
+`batchMaxSymbolId` is the `batchMaxId` arg bounding `writeDeltaDict`, rewound by
+`resetAfterFlush` to `maxSentSymbolId` (never `-1`). Both `enqueueCursor` and the
+per-table split `enqueueCursorSplit` advance the baseline **per published
+frame**. The send-loop mirror independently tracks every frame, accepts a
+partially overlapping dictionary, and appends only its unseen suffix.
 
 On reconnect the fresh server has an empty dictionary, so the send loop keeps an
 I/O-goroutine-owned mirror of every symbol it has sent (`sentDictBytes` /
@@ -150,9 +148,13 @@ before replay. Catch-up frames occupy wire seqs `0..k-1` mapping to already-acke
 FSNs (`fsnAtZero = replayStart - k`), so ack alignment holds and — being
 table-less — they are trivially durable; they bump `nextWireSeq` /
 `highestFullySent` but never `framesSentOnConn` (the poison-strike gate). SF mode
-write-ahead persists a frame's new symbols before publishing it; a host-crash
-tear (frame delta start > recovered dict size) is caught pre-send by the
-**torn-dict guard**, a terminal `PROTOCOL_VIOLATION` ("resend required").
+write-ahead persists a frame's new symbols before publishing it. During SF
+recovery, construction folds the trusted side-file prefix with all surviving
+frames before either the producer or send loop observes the engine; the same
+recovered snapshot seeds both consumers, and any provable suffix heals the
+side-file. A true host-crash gap (frame delta start > recovered dictionary size)
+is caught pre-send by the **torn-dict guard**, a terminal
+`PROTOCOL_VIOLATION` ("resend required").
 
 `close_timeout=N` (millisecond integer) was a v4.0–v4.5 Go-only key
 for the memory-mode close path. The cursor architecture unified
