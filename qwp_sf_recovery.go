@@ -275,6 +275,12 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 
 	ring := qwpSfNewSegmentRing(activeSeg, maxBytesPerSegment)
 	ring.sealedSegments = append(ring.sealedSegments, chain[:len(chain)-1]...)
+	// The ring constructor derives publishedFsn from the active segment alone.
+	// Recovery may retain an empty active tail after a completed rotation, in
+	// which case nextSeq is still the FSN immediately after the sealed chain.
+	if len(ring.sealedSegments) > 0 {
+		ring.publishedFsn.Store(ring.nextSeq.Load() - 1)
+	}
 	ring.manifest = manifest
 	// Ownership of chain and manifest transferred to the ring.
 	all = nil

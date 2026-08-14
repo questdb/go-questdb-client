@@ -243,6 +243,7 @@ func TestQwpSfRecoveryRotationCrashWindow(t *testing.T) {
 			defer ring.segmentRingClose()
 			assert.Equal(t, int64(1), ring.getActiveSegment().segmentBaseSeq())
 			assert.Equal(t, 1, ring.sealedSegmentCount())
+			assert.Equal(t, int64(0), ring.segmentRingPublishedFsn())
 		})
 	}
 }
