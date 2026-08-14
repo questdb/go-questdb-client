@@ -33,6 +33,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -311,10 +312,17 @@ func TestQwpSenderSymbolDictionary(t *testing.T) {
 	s := newQwpSenderForTest(t, srv.URL)
 	defer s.Close(context.Background())
 
-	// Add symbols.
-	s.Table("t").Symbol("sym", "AAPL").Int64Column("v", 1).AtNow(context.Background())
-	s.Table("t").Symbol("sym", "MSFT").Int64Column("v", 2).AtNow(context.Background())
-	s.Table("t").Symbol("sym", "AAPL").Int64Column("v", 3).AtNow(context.Background())
+	// The dictionary is sender-wide: values registered through different
+	// SYMBOL columns and tables share one dense id space.
+	s.Table("table_a").
+		Symbol("sym_a", "AAPL").
+		Symbol("sym_b", "MSFT").
+		Int64Column("v", 1).
+		AtNow(context.Background())
+	s.Table("table_b").
+		Symbol("other_sym", "AAPL").
+		Int64Column("v", 2).
+		AtNow(context.Background())
 
 	// Should have 2 unique symbols.
 	if len(s.globalSymbols) != 2 {
@@ -421,6 +429,120 @@ func TestQwpSenderSymbolValueAtLimit(t *testing.T) {
 	if s.maxSentSymbolId != 0 {
 		t.Fatalf("maxSentSymbolId = %d, want 0", s.maxSentSymbolId)
 	}
+}
+
+// TestQwpSenderSymbolDictionaryLimit pins the Java-compatible, sender-wide
+// one-million-entry dictionary cap. The first over-cap distinct value is
+// rejected before it receives an id or mutates the row, while an already-
+// registered value remains usable at the limit.
+func TestQwpSenderSymbolDictionaryLimit(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	s := newQwpSenderForTest(t, srv.URL)
+	defer s.Close(context.Background())
+
+	// Keep the fixture cheap: only the slice length participates in the cap;
+	// the existing value at id 0 is the sole entry this test writes on wire.
+	s.globalSymbolList = make([]string, qwpMaxSymbolDictionarySize)
+	s.globalSymbolList[0] = "known"
+	s.globalSymbols["known"] = 0
+	// Model a dictionary whose full range has already been published. The
+	// fixture leaves the middle strings empty to keep setup cheap, so pinning
+	// the watermark also prevents resetAfterFlush from correctly reclaiming
+	// that artificial unused suffix.
+	s.maxSentSymbolId = qwpMaxSymbolDictionarySize - 1
+	s.batchMaxSymbolId = s.maxSentSymbolId
+	s.cursorSendLoop.sentDictCount = qwpMaxSymbolDictionarySize
+
+	err := s.Table("table_a").
+		Symbol("sym_a", "one-too-many").
+		Int64Column("v", 1).
+		AtNow(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "global symbol dictionary is full") {
+		t.Fatalf("AtNow: got %v, want dictionary-full error", err)
+	}
+	if len(s.globalSymbolList) != qwpMaxSymbolDictionarySize {
+		t.Fatalf("dictionary size = %d, want %d", len(s.globalSymbolList), qwpMaxSymbolDictionarySize)
+	}
+	if _, ok := s.globalSymbols["one-too-many"]; ok {
+		t.Fatal("over-cap symbol received an id")
+	}
+
+	// The row error was drained by AtNow. Reusing an existing id from another
+	// table and SYMBOL column at the exact cap remains valid, proving both the
+	// limit and the lookup are sender-global rather than per table/column.
+	if err := s.Table("table_b").
+		Symbol("sym_b", "known").
+		Int64Column("v", 2).
+		AtNow(context.Background()); err != nil {
+		t.Fatalf("AtNow with existing symbol at cap: %v", err)
+	}
+	flushAndAwaitAck(t, s)
+	if len(s.globalSymbolList) != qwpMaxSymbolDictionarySize {
+		t.Fatalf("dictionary grew after existing value: %d", len(s.globalSymbolList))
+	}
+}
+
+func TestQwpSenderReclaimsOnlyUnpublishedSymbolIDs(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		s := &qwpLineSender{
+			globalSymbols: map[string]int32{
+				"sent":      0,
+				"abandoned": 1,
+			},
+			globalSymbolList: []string{"sent", "abandoned"},
+			maxSentSymbolId:  0,
+			batchMaxSymbolId: 1,
+			deltaDictEnabled: true,
+		}
+
+		s.resetAfterFlush()
+
+		if got := s.globalSymbolList; !reflect.DeepEqual(got, []string{"sent"}) {
+			t.Fatalf("globalSymbolList = %v, want [sent]", got)
+		}
+		if _, ok := s.globalSymbols["abandoned"]; ok {
+			t.Fatal("unpublished symbol id was not reclaimed")
+		}
+		if s.batchMaxSymbolId != 0 {
+			t.Fatalf("batchMaxSymbolId = %d, want 0", s.batchMaxSymbolId)
+		}
+	})
+
+	t.Run("persisted_floor", func(t *testing.T) {
+		d := qwpSfSymbolDictOpen(t.TempDir())
+		if d == nil {
+			t.Fatal("open persisted dictionary")
+		}
+		defer d.close()
+		if err := d.appendSymbols([]string{"sent", "durable"}); err != nil {
+			t.Fatal(err)
+		}
+		s := &qwpLineSender{
+			globalSymbols: map[string]int32{
+				"sent":      0,
+				"durable":   1,
+				"abandoned": 2,
+			},
+			globalSymbolList:    []string{"sent", "durable", "abandoned"},
+			maxSentSymbolId:     0,
+			batchMaxSymbolId:    2,
+			deltaDictEnabled:    true,
+			persistedSymbolDict: d,
+		}
+
+		s.resetAfterFlush()
+
+		if got := s.globalSymbolList; !reflect.DeepEqual(got, []string{"sent", "durable"}) {
+			t.Fatalf("globalSymbolList = %v, want [sent durable]", got)
+		}
+		if _, ok := s.globalSymbols["abandoned"]; ok {
+			t.Fatal("id above persisted floor was not reclaimed")
+		}
+		if got := s.globalSymbols["durable"]; got != 1 {
+			t.Fatalf("durable id = %d, want 1", got)
+		}
+	})
 }
 
 func TestQwpSenderAllColumnTypes(t *testing.T) {

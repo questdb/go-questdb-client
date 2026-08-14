@@ -238,6 +238,11 @@ const (
 	// explicitly classifies as retriable-with-rotation on deployed
 	// client fleets.
 	QwpStatusNotWritable QwpStatusCode = 0x0C
+	// QwpStatusDictionaryGap means a delta symbol dictionary starts above
+	// the server's per-connection dictionary coverage. The verdict depends
+	// on connection state rather than the frame bytes, so recycling the wire,
+	// re-registering the dictionary, and replaying is safe.
+	QwpStatusDictionaryGap QwpStatusCode = 0x0D
 )
 
 // QWP sender defaults and limits.
@@ -246,6 +251,13 @@ const (
 // unless marked Go-only. The Java analogue is noted on each constant so
 // the two clients can be kept in lockstep.
 const (
+	// qwpMaxSymbolDictionarySize mirrors the Java client's ingress limit for
+	// one sender-wide symbol dictionary (shared across every table and SYMBOL
+	// column). Refuse the next distinct value before assigning an id so a
+	// dictionary above the compatibility baseline cannot make reconnect
+	// catch-up fail forever and strand already-buffered SF frames.
+	qwpMaxSymbolDictionarySize = 1_000_000
+
 	// qwpDefaultAutoFlushInterval is the time trigger for auto-flush.
 	// Java: QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100 ms.
 	qwpDefaultAutoFlushInterval = 100 * time.Millisecond

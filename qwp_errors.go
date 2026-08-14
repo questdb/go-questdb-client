@@ -161,6 +161,8 @@ func qwpStatusName(status QwpStatusCode) string {
 		return "WRITE_ERROR"
 	case QwpStatusNotWritable:
 		return "NOT_WRITABLE"
+	case QwpStatusDictionaryGap:
+		return "DICTIONARY_GAP"
 	case qwpStatusCancelled:
 		return "CANCELLED"
 	case qwpStatusLimitExceeded:

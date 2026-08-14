@@ -127,6 +127,7 @@ func TestCategoryString(t *testing.T) {
 		{CategoryWriteError, "WRITE_ERROR"},
 		{CategoryNotWritable, "NOT_WRITABLE"},
 		{CategoryProtocolViolation, "PROTOCOL_VIOLATION"},
+		{CategoryDictionaryGap, "DICTIONARY_GAP"},
 		{Category(99), "Category(99)"},
 	}
 	for _, tc := range tests {
@@ -166,6 +167,8 @@ func TestQwpStatusName(t *testing.T) {
 		{QwpStatusInternalError, "INTERNAL_ERROR"},
 		{QwpStatusSecurityError, "SECURITY_ERROR"},
 		{QwpStatusWriteError, "WRITE_ERROR"},
+		{QwpStatusNotWritable, "NOT_WRITABLE"},
+		{QwpStatusDictionaryGap, "DICTIONARY_GAP"},
 		{QwpStatusCode(42), "UNKNOWN(42)"},
 	}
 	for _, tc := range tests {

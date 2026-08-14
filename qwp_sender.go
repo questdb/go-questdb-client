@@ -561,14 +561,27 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		return s
 	}
 
+	// Look up the global id before mutating either the row or the dictionary.
+	// The Java compatibility contract caps the sender-wide dictionary at one
+	// million entries (shared across tables and columns). Letting the producer
+	// allocate id 1,000,000 would make reconnect catch-up fail against that
+	// baseline and could strand an otherwise deliverable SF backlog.
+	id, ok := s.globalSymbols[val]
+	if !ok && len(s.globalSymbolList) >= qwpMaxSymbolDictionarySize {
+		s.lastErr = fmt.Errorf(
+			"qwp: global symbol dictionary is full: the QWP protocol caps a sender's distinct symbol values at %d; rows using already-registered values remain valid; close and rebuild the sender to start a fresh dictionary, or use varchar columns for unbounded-cardinality data",
+			qwpMaxSymbolDictionarySize,
+		)
+		return s
+	}
+
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeSymbol, true)
 	if err != nil {
 		s.lastErr = err
 		return s
 	}
 
-	// Look up or assign global symbol ID.
-	id, ok := s.globalSymbols[val]
+	// Assign a dense global symbol ID only after every rejection point above.
 	if !ok {
 		id = int32(len(s.globalSymbolList))
 		s.globalSymbols[val] = id
@@ -1415,6 +1428,7 @@ func (s *qwpLineSender) resetAfterFlush() {
 	s.dirtyTables = s.dirtyTables[:0]
 	s.pendingRowCount = 0
 	s.pendingBytes = 0
+	s.reclaimUnsentSymbolIDs()
 	s.batchMaxSymbolId = s.maxSentSymbolId
 	// Defense in depth: tb.reset() keeps the column structure but
 	// sets committedColumnCount=0, so a post-flush cancelRow would
@@ -1428,6 +1442,46 @@ func (s *qwpLineSender) resetAfterFlush() {
 		s.flushDeadline = time.Now().Add(s.autoFlushInterval)
 	} else {
 		s.flushDeadline = time.Time{}
+	}
+}
+
+// reclaimUnsentSymbolIDs returns ids that belonged only to a batch discarded
+// before publication. Delta frames always start at maxSentSymbolId+1, so
+// retaining an abandoned suffix would make the next new-symbol batch encode it
+// again and potentially repeat the same over-cap rejection forever.
+//
+// Reuse is safe only above both durable anchors: a published frame has bound
+// every id through maxSentSymbolId in the send-loop mirror, and an SF
+// write-ahead append may have persisted ids even when the following frame
+// publish failed. Full-dictionary mode is excluded because frames already on
+// the ring can independently bind the same ids.
+func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
+	if !s.deltaDictEnabled {
+		return
+	}
+	floor := s.maxSentSymbolId + 1
+	if s.persistedSymbolDict != nil {
+		if durable := s.persistedSymbolDict.size(); durable > floor {
+			floor = durable
+		}
+	}
+	if floor < 0 {
+		floor = 0
+	}
+	if floor >= len(s.globalSymbolList) {
+		return
+	}
+	s.globalSymbolList = s.globalSymbolList[:floor]
+	// Rebuild rather than deleting the discarded strings one by one. Recovery
+	// deliberately preserves duplicate positional entries; in that case the
+	// reverse map must keep the highest surviving id, matching Java.
+	if s.globalSymbols == nil {
+		s.globalSymbols = make(map[string]int32, len(s.globalSymbolList))
+	} else {
+		clear(s.globalSymbols)
+	}
+	for id, symbol := range s.globalSymbolList {
+		s.globalSymbols[symbol] = int32(id)
 	}
 }
 

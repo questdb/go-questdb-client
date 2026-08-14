@@ -692,6 +692,7 @@ func TestErrorApiPerCategoryStrict(t *testing.T) {
 		{"SecurityError", QwpStatusSecurityError, CategorySecurityError, PolicyTerminal, false},
 		{"WriteError", QwpStatusWriteError, CategoryWriteError, PolicyRetriable, true},
 		{"NotWritable", QwpStatusNotWritable, CategoryNotWritable, PolicyRetriableOther, true},
+		{"DictionaryGap", QwpStatusDictionaryGap, CategoryDictionaryGap, PolicyRetriable, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
