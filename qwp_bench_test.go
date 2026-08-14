@@ -143,6 +143,9 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 		globalSymbols:    make(map[string]int32),
 		maxSentSymbolId:  -1,
 		batchMaxSymbolId: -1,
+		// Memory mode always runs delta, so the pin must cover the
+		// reclaimUnsentSymbolIDs path resetAfterFlush takes in production.
+		deltaDictEnabled: true,
 	}
 
 	s.globalSymbols["AAPL"] = 0
@@ -164,9 +167,13 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 		s.encoder.encodeMultiTableWithDeltaDict(
 			tables,
 			s.globalSymbolList,
-			s.maxSentSymbolId,
+			s.symbolDeltaBaseline(),
 			s.batchMaxSymbolId,
 		)
+		// Mirror enqueueCursor's post-append watermark advance.
+		if s.batchMaxSymbolId > s.maxSentSymbolId {
+			s.maxSentSymbolId = s.batchMaxSymbolId
+		}
 		s.resetAfterFlush()
 	}
 

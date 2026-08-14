@@ -543,6 +543,30 @@ func TestQwpSenderReclaimsOnlyUnpublishedSymbolIDs(t *testing.T) {
 			t.Fatalf("durable id = %d, want 1", got)
 		}
 	})
+
+	// Full-dict frames on the ring bind ids independently, so reclaim must
+	// not run: reusing a trimmed id would desync the send-loop mirror.
+	t.Run("full_dict_retains", func(t *testing.T) {
+		s := &qwpLineSender{
+			globalSymbols: map[string]int32{
+				"sent":      0,
+				"abandoned": 1,
+			},
+			globalSymbolList: []string{"sent", "abandoned"},
+			maxSentSymbolId:  0,
+			batchMaxSymbolId: 1,
+			deltaDictEnabled: false,
+		}
+
+		s.resetAfterFlush()
+
+		if got := s.globalSymbolList; !reflect.DeepEqual(got, []string{"sent", "abandoned"}) {
+			t.Fatalf("globalSymbolList = %v, want [sent abandoned]", got)
+		}
+		if got := s.globalSymbols["abandoned"]; got != 1 {
+			t.Fatalf("abandoned id = %d, want 1", got)
+		}
+	})
 }
 
 func TestQwpSenderAllColumnTypes(t *testing.T) {

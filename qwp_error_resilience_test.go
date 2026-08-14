@@ -753,6 +753,54 @@ func TestErrorApiPerCategoryStrict(t *testing.T) {
 	}
 }
 
+// TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay pins the
+// DICTIONARY_GAP contract on a frame that carries symbols: the NACK recycles
+// the connection, the fresh connection is re-registered via a table-less
+// catch-up frame before replay, and the batch lands with a gap-free
+// dictionary — nothing dropped, no terminal.
+func TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		recordFrames:       true,
+		rejectStatus:       QwpStatusDictionaryGap,
+		rejectFirstNFrames: 1,
+	})
+	defer srv.Close()
+
+	s, engine, loop, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+	require.True(t, s.deltaDictEnabled, "memory mode must delta-encode")
+
+	gotCh := make(chan *SenderError, 4)
+	loop.sendLoopSetErrorHandler(func(e *SenderError) {
+		select {
+		case gotCh <- e:
+		default:
+		}
+	}, qwpSfMinErrorInboxCapacity)
+
+	require.NoError(t, s.Table("t").Symbol("sym", "AAPL").Int64Column("v", 1).AtNow(context.Background()))
+	_ = s.Flush(context.Background())
+
+	select {
+	case got := <-gotCh:
+		assert.Equal(t, CategoryDictionaryGap, got.Category)
+		assert.Equal(t, PolicyRetriable, got.AppliedPolicy)
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler not invoked within deadline")
+	}
+
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
+	}, 5*time.Second, time.Millisecond, "NACKed symbol frame was not replayed to an ACK")
+	assert.Nil(t, s.LastTerminalError(), "DICTIONARY_GAP must recycle, not latch")
+
+	conn2 := srv.recordedFrames()[2]
+	require.True(t, connSawTableLessFrame(conn2),
+		"the recycled connection must re-register the dictionary via a catch-up frame")
+	require.Equal(t, []string{"AAPL"}, reconstructConnDict(conn2),
+		"replay onto the fresh connection must leave a gap-free dictionary")
+}
+
 // TestErrorApiResilience_LastTerminalErrorSurvivesClose latches a HALT,
 // closes the sender, and asserts LastTerminalError still returns the
 // snapshot afterward. Useful for diagnostics that want to inspect

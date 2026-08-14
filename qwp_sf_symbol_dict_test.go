@@ -136,6 +136,32 @@ func TestQwpSfSymbolDictRecoveredLegacyFormatIsUntrustedAndPreserved(t *testing.
 	require.Equal(t, buf, got, "recovery must preserve untrusted content for inspection or an older client")
 }
 
+// TestQwpSfSymbolDictRecoveredEntryCountBounded pins the crafted-file
+// allocation guard: a CRC-valid chunk of empty-string entries amplifies ~16x
+// into string headers, so recovery must refuse an over-bound entry count
+// rather than parse it.
+func TestQwpSfSymbolDictRecoveredEntryCountBounded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	buf := make([]byte, qwpSfSymbolDictHeaderSize)
+	binary.LittleEndian.PutUint32(buf[:4], qwpSfSymbolDictMagic)
+	buf[4] = qwpSfSymbolDictVersion
+	count := qwpSfSymbolDictMaxRecoveredEntries + 1
+	var vb [qwpMaxVarintLen]byte
+	chunk := append([]byte(nil), vb[:qwpPutVarint(vb[:], uint64(count))]...)
+	chunk = append(chunk, vb[:qwpPutVarint(vb[:], uint64(count))]...)
+	chunk = append(chunk, make([]byte, count)...) // one 0x00 varint per empty entry
+	entriesEnd := len(chunk)
+	var crcb [qwpSfSymbolDictCRCSize]byte
+	binary.LittleEndian.PutUint32(crcb[:], crc32.Checksum(chunk[:entriesEnd], qwpSfCrcTable))
+	chunk = append(chunk, crcb[:]...)
+	require.NoError(t, os.WriteFile(path, append(buf, chunk...), 0o644))
+
+	d, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.Nil(t, d, "over-bound entry count must fall back, not allocate")
+}
+
 func TestQwpSfSymbolDictOpenRecoveredAbsentReturnsNil(t *testing.T) {
 	dir := t.TempDir()
 	d, err := qwpSfSymbolDictOpenRecovered(dir)

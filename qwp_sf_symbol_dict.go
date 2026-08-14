@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -107,11 +106,16 @@ const (
 	// or corrupt length prefix cannot drive a runaway allocation. Symbols are
 	// short; this ceiling is generous.
 	qwpSfSymbolDictMaxEntryLen = 1 << 20
-	// qwpSfSymbolDictMaxFileSize bounds the whole-file read at open so a torn
-	// or foreign file cannot drive a multi-GB allocation on a background
-	// recovery/drainer goroutine. Even pathological high-cardinality symbol use
-	// stays far below this.
+	// qwpSfSymbolDictMaxFileSize bounds the whole-file read buffer at open;
+	// the parsed entry count is bounded separately by
+	// qwpSfSymbolDictMaxRecoveredEntries (empty-string entries amplify ~16x
+	// in string headers, so the byte cap alone cannot bound the allocation).
 	qwpSfSymbolDictMaxFileSize = 1 << 30
+	// qwpSfSymbolDictMaxRecoveredEntries caps recovery parsing so a crafted
+	// CRC-valid file cannot drive an unbounded []string allocation on a
+	// recovery/drainer goroutine. Far above the admission cap: an over-cap
+	// slot from an older client must keep every positional id.
+	qwpSfSymbolDictMaxRecoveredEntries = 4 * qwpMaxSymbolDictionarySize
 )
 
 // qwpSfSymbolDictOpen opens (creating if absent) the dictionary file in
@@ -202,9 +206,9 @@ func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
 	return d, nil
 }
 
-// qwpSfSymbolDictRemoveOrphan best-effort removes a stale dictionary file.
-// Used at fresh-start (a dict with no segments behind it is meaningless) and at
-// fully-drained close (nothing references it any more). No-op for memory mode.
+// qwpSfSymbolDictRemoveOrphan best-effort removes a stale dictionary file at
+// fully-drained close (nothing references it any more; fresh slots instead
+// truncate in place via qwpSfSymbolDictOpenClean). No-op for memory mode.
 func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 	if slotDir == "" {
 		return
@@ -212,11 +216,17 @@ func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 	_ = os.Remove(filepath.Join(slotDir, qwpSfSymbolDictFileName))
 }
 
+// qwpSfSymbolDictOpenExisting is the error-agnostic form for callers that
+// treat every failure the same way (recreate fresh).
 func qwpSfSymbolDictOpenExisting(path string, fileLen int64) *qwpSfSymbolDict {
 	d, _ := qwpSfSymbolDictOpenExistingDetailed(path, fileLen)
 	return d
 }
 
+// qwpSfSymbolDictOpenExistingDetailed opens an existing side-file, loading its
+// CRC-proven chunk prefix and truncating any untrusted tail. Failures split
+// into errQwpSfSymbolDictUnusable (proven content damage — recovery may fall
+// back to the frame fold) and transient I/O errors (retryable; propagated).
 func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymbolDict, error) {
 	if fileLen > qwpSfSymbolDictMaxFileSize {
 		return nil, errQwpSfSymbolDictUnusable
@@ -269,13 +279,11 @@ func qwpSfParseChunkedSymbolDict(buf []byte) (loaded []string, pos, chunks int) 
 	for pos < len(buf) {
 		chunkStart := pos
 		entryCount, n, err := qwpReadVarint(buf[pos:])
-		// Recovery is deliberately not capped at the producer's one-million
-		// admission limit. An older Go sender (before that check existed), or a
-		// slot written against a newer server, may already contain more entries;
-		// every one is an existing value and must retain its positional id. This
-		// mirrors Java's uncapped addRecoveredSymbol path. The wire uses int32 ids,
-		// so that remains the structural ceiling.
-		if err != nil || entryCount == 0 || entryCount > uint64(math.MaxInt32-len(loaded)) {
+		// Not capped at the one-million admission limit — an existing over-cap
+		// entry must retain its positional id. Bounded only by
+		// qwpSfSymbolDictMaxRecoveredEntries (crafted-file allocation guard).
+		if err != nil || entryCount == 0 ||
+			entryCount > uint64(qwpSfSymbolDictMaxRecoveredEntries-len(loaded)) {
 			break
 		}
 		pos += n
@@ -399,7 +407,8 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 }
 
 // loadedSymbols returns the entries recovered at open, in id order (entry i is
-// symbol id i). Empty when nothing was recovered.
+// symbol id i). Empty when nothing was recovered. Open-time snapshot only:
+// later appendSymbols advance size() but never extend this list.
 func (d *qwpSfSymbolDict) loadedSymbols() []string {
 	if d == nil {
 		return nil
