@@ -187,6 +187,15 @@ table-less — they are trivially durable; they bump `nextWireSeq` /
 write-ahead persists a frame's new symbols before publishing it; a host-crash
 tear (frame delta start > recovered dict size) is caught pre-send by the
 **torn-dict guard**, a terminal `PROTOCOL_VIOLATION` ("resend required").
+The `.symbol-dict` body is byte-compatible with merged Java: each append is one
+`[entryCount][entryBytes][entries][crc32c]` chunk, with CRC-32C covering both
+header varints and the complete entry region. Recovery trusts only whole valid
+chunks and physically truncates a torn tail. Pre-upgrade Go files used an
+unchunked flat body under the same version byte, so they cannot be migrated by
+guessing: startup preserves the file and reports a remediation error. Drain the
+slot with go-questdb-client v4.x, or delete `.symbol-dict` only when the slot has
+no unacked delta frames, or remove the slot after draining. The upgrade is
+one-way; downgrade after writing the chunked format is unsupported.
 
 `close_timeout=N` (millisecond integer) was a v4.0–v4.5 Go-only key
 for the memory-mode close path. The cursor architecture unified

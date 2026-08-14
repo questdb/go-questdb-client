@@ -26,7 +26,9 @@ package questdb
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -44,28 +46,33 @@ import (
 // before those frames replay. This file is that dictionary. Unlike the
 // ack-watermark — a discardable optimisation guarded by a max() clamp — it is
 // load-bearing: a surviving frame that references an id missing from it is
-// unrecoverable, so it degrades to full self-sufficient frames when it cannot
-// open (open returns nil) rather than risking a gap.
+// unrecoverable. Proven absence/corruption degrades to full self-sufficient
+// frames, while ambiguous legacy bytes and operational I/O failures abort
+// startup without destroying the file.
 //
-// On-disk layout (little-endian):
+// On-disk layout (little-endian), byte-compatible with the Java client:
 //
 //	offset 0: u32 magic = 'SYD1'
 //	offset 4: u8  version = 1
 //	offset 5: 3 bytes reserved (zero)
-//	offset 8: entries, each [len: varint][utf8 bytes], ascending global-id order
+//	offset 8: chunks, each
+//	          [entryCount: uvarint][entryBytes: uvarint][entries][crc32c: u32]
+//	          where entries is entryCount repetitions of [len: uvarint][utf8]
+//	          occupying exactly entryBytes bytes, and CRC-32C covers both
+//	          header varints plus the entries region.
 //
-// Symbol id i is the i-th entry (ids are dense from 0), so no id is stored.
+// One appendSymbols call writes one chunk. Symbol id i is the i-th entry across
+// all chunks (ids are dense from 0), so no id is stored.
 //
 // Durability: the producer appends the symbols a frame introduces BEFORE that
 // frame is published to the ring, but does NOT fsync — matching the rest of
 // store-and-forward (page-cache, not disk, durable). This ordering suffices for
 // a process crash (the page cache survives, so the dictionary stays a superset
 // of every recoverable frame's references). It does NOT survive a host/power
-// crash that tears the dictionary relative to its frames — that case is caught
-// at replay by the send loop's guard, which fails loudly (resend required)
-// rather than transmitting a gapped frame. A torn trailing entry from a crash
-// mid-append is self-healing: open stops at the first incomplete entry and the
-// next append overwrites it.
+// crash that tears the dictionary relative to its frames — per-chunk CRC-32C
+// stops recovery at the first untrusted chunk, and the send loop's guard fails
+// loudly if a surviving frame references beyond that trusted prefix. A torn
+// trailing chunk is physically truncated before the next append.
 //
 // Single-writer (the producer goroutine). loaded is read once at open to seed
 // recovery/orphan-drain; the engine owns close. The mutex serialises append
@@ -88,6 +95,10 @@ const (
 	qwpSfSymbolDictMagic      uint32 = 0x31445953 // 'SYD1' little-endian
 	qwpSfSymbolDictHeaderSize int64  = 8
 	qwpSfSymbolDictVersion    byte   = 1
+	qwpSfSymbolDictCRCSize           = 4
+	// Java rejects a persisted-dictionary varint after shift exceeds 35,
+	// allowing at most six bytes including the terminating byte.
+	qwpSfSymbolDictMaxVarintLen = 6
 	// qwpSfSymbolDictMaxEntryLen bounds one symbol's decoded length so a torn
 	// or corrupt length prefix cannot drive a runaway allocation. Symbols are
 	// short; this ceiling is generous.
@@ -99,24 +110,44 @@ const (
 	qwpSfSymbolDictMaxFileSize = 1 << 30
 )
 
+var (
+	// qwpSfErrSymbolDictLegacyFormat is operational, not a recovery
+	// fail-closed verdict: the bytes may be healthy for an older Go client and
+	// must not be auto-quarantined or recreated.
+	//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
+	qwpSfErrSymbolDictLegacyFormat = errors.New("qwp/sf: legacy flat .symbol-dict format")
+	qwpSfSymbolDictCRCTable        = crc32.MakeTable(crc32.Castagnoli)
+	qwpSfSymbolDictStat            = os.Stat
+	qwpSfSymbolDictTruncate        = func(f *os.File, size int64) error { return f.Truncate(size) }
+	qwpSfSymbolDictWriteAt         = func(f *os.File, p []byte, off int64) (int, error) { return f.WriteAt(p, off) }
+)
+
 // qwpSfSymbolDictOpen opens (creating if absent) the dictionary file in
-// slotDir. An existing file's complete entries are loaded into memory; a
-// missing/invalid file is (re)created with a fresh header. Returns nil on any
-// unrecoverable I/O failure — the caller then falls back to full self-
-// sufficient frames for the slot, so a broken side-file degrades gracefully.
-func qwpSfSymbolDictOpen(slotDir string) *qwpSfSymbolDict {
+// slotDir. An existing chunked file's valid prefix is loaded; an ordinary
+// invalid file is recreated. A legacy flat file is never recreated because it
+// may be the only id-to-name map for unacked delta frames.
+func qwpSfSymbolDictOpen(slotDir string) (*qwpSfSymbolDict, error) {
 	if slotDir == "" {
-		return nil
+		return nil, nil
 	}
 	path := filepath.Join(slotDir, qwpSfSymbolDictFileName)
-	if st, err := os.Stat(path); err == nil && st.Size() >= qwpSfSymbolDictHeaderSize {
-		if d := qwpSfSymbolDictOpenExisting(path, st.Size()); d != nil {
-			return d
+	st, statErr := qwpSfSymbolDictStat(path)
+	if statErr == nil {
+		if st.Size() >= qwpSfSymbolDictHeaderSize {
+			d, openErr := qwpSfSymbolDictOpenExisting(path, st.Size())
+			if openErr != nil {
+				return nil, openErr
+			}
+			if d != nil {
+				return d, nil
+			}
+			// A header/parse failure on an existing file means it cannot be
+			// trusted for delta replay; start clean.
 		}
-		// A header/parse failure on an existing file means it cannot be
-		// trusted for delta replay; start clean.
+	} else if !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("qwp/sf: could not stat symbol dictionary %s: %w", path, statErr)
 	}
-	return qwpSfSymbolDictOpenFresh(path)
+	return qwpSfSymbolDictOpenFresh(path), nil
 }
 
 // qwpSfSymbolDictOpenRecovered opens the dictionary for a slot recovered from
@@ -146,7 +177,10 @@ func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
 	if st.Size() < qwpSfSymbolDictHeaderSize {
 		return nil, fmt.Errorf("qwp/sf: recovered symbol dictionary %s is truncated (%d bytes)", path, st.Size())
 	}
-	d := qwpSfSymbolDictOpenExisting(path, st.Size())
+	d, err := qwpSfSymbolDictOpenExisting(path, st.Size())
+	if err != nil {
+		return nil, err
+	}
 	if d == nil {
 		return nil, fmt.Errorf("qwp/sf: recovered symbol dictionary %s is corrupt or unreadable", path)
 	}
@@ -163,45 +197,143 @@ func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 	_ = os.Remove(filepath.Join(slotDir, qwpSfSymbolDictFileName))
 }
 
-func qwpSfSymbolDictOpenExisting(path string, fileLen int64) *qwpSfSymbolDict {
+func qwpSfSymbolDictOpenExisting(path string, fileLen int64) (*qwpSfSymbolDict, error) {
 	if fileLen > qwpSfSymbolDictMaxFileSize {
-		return nil
+		return nil, nil
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	buf := make([]byte, fileLen)
 	if _, err := io.ReadFull(f, buf); err != nil {
 		_ = f.Close()
-		return nil
+		return nil, err
 	}
 	if binary.LittleEndian.Uint32(buf[:4]) != qwpSfSymbolDictMagic || buf[4] != qwpSfSymbolDictVersion {
 		_ = f.Close()
-		return nil
+		return nil, nil
 	}
-	// Parse complete entries after the header, stopping at the first torn or
-	// oversized trailing entry so a crash mid-append self-heals.
-	pos := int(qwpSfSymbolDictHeaderSize)
-	var loaded []string
-	for pos < len(buf) {
-		n, adv, verr := qwpReadVarint(buf[pos:])
-		if verr != nil {
-			break
+
+	loaded, validLen, validChunks := qwpSfSymbolDictScanChunks(buf)
+	if validChunks == 0 && fileLen > qwpSfSymbolDictHeaderSize {
+		_ = f.Close()
+		if qwpSfSymbolDictLegacyEntryCount(buf[qwpSfSymbolDictHeaderSize:]) > 0 {
+			return nil, fmt.Errorf("%w; drain this slot with go-questdb-client <= v4.x, or delete %s to fall back to full-dict frames (safe only if the slot holds no unacked delta frames), or remove the slot after draining",
+				qwpSfErrSymbolDictLegacyFormat, path)
 		}
-		start := pos + adv
-		if n > qwpSfSymbolDictMaxEntryLen || start+int(n) > len(buf) {
-			break
+		return nil, nil
+	}
+	if validLen < len(buf) {
+		if err := qwpSfSymbolDictTruncate(f, int64(validLen)); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("qwp/sf: could not drop torn/stale symbol dictionary tail %s: %w", path, err)
 		}
-		loaded = append(loaded, string(buf[start:start+int(n)]))
-		pos = start + int(n)
 	}
 	return &qwpSfSymbolDict{
 		file:         f,
-		appendOffset: int64(pos),
+		appendOffset: int64(validLen),
 		count:        len(loaded),
 		loaded:       loaded,
+	}, nil
+}
+
+// qwpSfSymbolDictScanChunks returns the symbols in the CRC-proven prefix, its
+// physical end offset, and the number of valid chunks. The first malformed,
+// torn, inconsistent, or checksum-failing chunk ends the trusted prefix.
+func qwpSfSymbolDictScanChunks(buf []byte) (loaded []string, validLen int, validChunks int) {
+	validLen = int(qwpSfSymbolDictHeaderSize)
+	pos := validLen
+	for pos < len(buf) {
+		chunkStart := pos
+		entryCount, next, ok := qwpSfSymbolDictReadVarint(buf, pos, len(buf))
+		if !ok {
+			break
+		}
+		entryBytes, entriesStart, ok := qwpSfSymbolDictReadVarint(buf, next, len(buf))
+		if !ok || entryCount == 0 || entryBytes == 0 {
+			break
+		}
+		if entryCount > uint64(^uint(0)>>1)-uint64(len(loaded)) || entryBytes > uint64(len(buf)-entriesStart) {
+			break
+		}
+		chunkEnd := entriesStart + int(entryBytes)
+		if chunkEnd > len(buf)-qwpSfSymbolDictCRCSize {
+			break
+		}
+		storedCRC := binary.LittleEndian.Uint32(buf[chunkEnd : chunkEnd+qwpSfSymbolDictCRCSize])
+		if crc32.Checksum(buf[chunkStart:chunkEnd], qwpSfSymbolDictCRCTable) != storedCRC {
+			break
+		}
+		entries, ok := qwpSfSymbolDictParseEntries(buf[entriesStart:chunkEnd], entryCount)
+		if !ok {
+			break
+		}
+		loaded = append(loaded, entries...)
+		pos = chunkEnd + qwpSfSymbolDictCRCSize
+		validLen = pos
+		validChunks++
 	}
+	return loaded, validLen, validChunks
+}
+
+func qwpSfSymbolDictParseEntries(region []byte, expected uint64) ([]string, bool) {
+	// Every entry occupies at least its one-byte length varint.
+	if expected > uint64(len(region)) {
+		return nil, false
+	}
+	entries := make([]string, 0, int(expected))
+	pos := 0
+	for uint64(len(entries)) < expected {
+		entryLen, next, ok := qwpSfSymbolDictReadVarint(region, pos, len(region))
+		if !ok || entryLen > qwpSfSymbolDictMaxEntryLen || entryLen > uint64(len(region)-next) {
+			return nil, false
+		}
+		end := next + int(entryLen)
+		entries = append(entries, string(region[next:end]))
+		pos = end
+	}
+	return entries, pos == len(region)
+}
+
+// qwpSfSymbolDictReadVarint decodes canonical unsigned LEB128 within
+// [pos, limit). Persisted dictionary varints are deliberately stricter than
+// general QWP wire varints to match the Java file format's six-byte ceiling.
+func qwpSfSymbolDictReadVarint(buf []byte, pos, limit int) (uint64, int, bool) {
+	var value uint64
+	for i := 0; i < qwpSfSymbolDictMaxVarintLen && pos+i < limit; i++ {
+		b := buf[pos+i]
+		value |= uint64(b&0x7f) << (7 * i)
+		if b&0x80 == 0 {
+			if i > 0 && b == 0 {
+				return 0, 0, false
+			}
+			return value, pos + i + 1, true
+		}
+	}
+	return 0, 0, false
+}
+
+// qwpSfSymbolDictLegacyEntryCount probes the pre-upgrade flat body without
+// trusting it. Any complete legacy entry makes the version-1 file ambiguous:
+// it may be healthy legacy data or a torn first chunk, so callers fail closed
+// and preserve the bytes for explicit migration.
+func qwpSfSymbolDictLegacyEntryCount(body []byte) int {
+	count := 0
+	pos := 0
+	for pos < len(body) {
+		entryLen, n, err := qwpReadVarint(body[pos:])
+		if err != nil {
+			break
+		}
+		start := pos + n
+		if entryLen > qwpSfSymbolDictMaxEntryLen || entryLen > uint64(len(body)-start) {
+			break
+		}
+		count++
+		pos = start + int(entryLen)
+	}
+	return count
 }
 
 func qwpSfSymbolDictOpenFresh(path string) *qwpSfSymbolDict {
@@ -235,14 +367,38 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 		return nil
 	}
 	d.scratch = d.scratch[:0]
+	var vb [binary.MaxVarintLen64]byte
+	entriesLen := 0
 	for _, name := range names {
-		var vb [qwpMaxVarintLen]byte
-		n := qwpPutVarint(vb[:], uint64(len(name)))
+		if len(name) > qwpSfSymbolDictMaxEntryLen {
+			return fmt.Errorf("qwp/sf: symbol dictionary entry exceeds %d bytes", qwpSfSymbolDictMaxEntryLen)
+		}
+		wireLen := binary.PutUvarint(vb[:], uint64(len(name))) + len(name)
+		entriesLen += wireLen
+	}
+	// Reuse the existing scratch capacity on the flush path. The capacity hint
+	// covers both header varints and the CRC; the encoded bytes themselves use
+	// canonical varints.
+	if cap(d.scratch) < entriesLen+2*binary.MaxVarintLen64+qwpSfSymbolDictCRCSize {
+		d.scratch = make([]byte, 0, entriesLen+2*binary.MaxVarintLen64+qwpSfSymbolDictCRCSize)
+	}
+	n := binary.PutUvarint(vb[:], uint64(len(names)))
+	d.scratch = append(d.scratch, vb[:n]...)
+	n = binary.PutUvarint(vb[:], uint64(entriesLen))
+	d.scratch = append(d.scratch, vb[:n]...)
+	for _, name := range names {
+		n = binary.PutUvarint(vb[:], uint64(len(name)))
 		d.scratch = append(d.scratch, vb[:n]...)
 		d.scratch = append(d.scratch, name...)
 	}
-	if _, err := d.file.WriteAt(d.scratch, d.appendOffset); err != nil {
+	crc := crc32.Checksum(d.scratch, qwpSfSymbolDictCRCTable)
+	d.scratch = binary.LittleEndian.AppendUint32(d.scratch, crc)
+	written, err := qwpSfSymbolDictWriteAt(d.file, d.scratch, d.appendOffset)
+	if err != nil {
 		return err
+	}
+	if written != len(d.scratch) {
+		return io.ErrShortWrite
 	}
 	d.appendOffset += int64(len(d.scratch))
 	d.count += len(names)

@@ -447,7 +447,10 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// Same stale-side-file hygiene for the symbol dictionary: a
 			// fresh slot starts with an empty dictionary.
 			qwpSfSymbolDictRemoveOrphan(sfDir)
-			persistedDict = qwpSfSymbolDictOpen(sfDir)
+			persistedDict, err = qwpSfSymbolDictOpen(sfDir)
+			if err != nil {
+				return nil, err
+			}
 			initialPath = filepath.Join(sfDir, "sf-initial.sfa")
 			initial, err = qwpSfCreateSegment(initialPath, 0, segmentSizeBytes)
 		}

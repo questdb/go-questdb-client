@@ -63,7 +63,8 @@ func buildTestDeltaFrame(deltaStart int, syms []string) []byte {
 // recovery.
 func TestQwpPersistNewSymbolsNoDuplicateOnRetry(t *testing.T) {
 	dir := t.TempDir()
-	d := qwpSfSymbolDictOpen(dir)
+	d, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.NotNil(t, d)
 
 	s := &qwpLineSender{
@@ -82,7 +83,8 @@ func TestQwpPersistNewSymbolsNoDuplicateOnRetry(t *testing.T) {
 	require.Equal(t, 3, d.size(), "retry must not duplicate persisted symbols")
 	require.NoError(t, d.close())
 
-	re := qwpSfSymbolDictOpen(dir)
+	re, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.Equal(t, []string{"AAPL", "GOOG", "MSFT"}, re.loadedSymbols())
 	require.NoError(t, re.close())
 }

@@ -230,17 +230,23 @@ per-ring service-pass barrier.
 
 ### High under cross-client recovery: `.symbol-dict` version 1 is incompatible
 
-Go's version-1 format is:
+**Addressed on 2026-08-14:** Go now writes and strictly reads Java's chunked
+CRC-32C format. A legacy flat body is preserved and rejected with explicit
+drain/delete remediation; it is operational rather than an auto-quarantine
+verdict. Hand-computed golden bytes pin both Go reading the Java layout and Go
+writing that layout; the tests do not execute the Java client itself.
+
+Before this correction, Go's version-1 format was:
 
 ```text
 [magic u32][version u8][reserved 3]
 repeated [symbolLength varint][UTF-8 bytes]
 ```
 
-See `qwp_sf_symbol_dict.go:50-68` and its recovery parser at
-`qwp_sf_symbol_dict.go:166-204`.
+The historical implementation is preserved at baseline commit `4f2723e` in
+`qwp_sf_symbol_dict.go` and its recovery parser.
 
-Current Java's version-1 format is chunked and checksummed:
+Java's version-1 format is chunked and checksummed:
 
 ```text
 [magic u32][version u8][reserved 3]
@@ -265,7 +271,7 @@ remain byte-compatible with the merged Java format:
 
 - `design/qwp-delta-symbol-dict.md:511-512`
 
-#### Required correction
+#### Required correction (completed)
 
 Adopt the current Java chunked CRC-32C format. Since the existing Go files use
 the same version number, the migration must distinguish old Go bytes from current

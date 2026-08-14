@@ -264,6 +264,12 @@ dictionary lets such a slot rebuild what its frames reference.
 
 ### 6.1 `PersistedSymbolDict` → new file `qwp_sf_symbol_dict.go`
 
+> **Format addendum (2026-08-14).** The original flat-body design below was
+> superseded when Java PR #66 merged. The implemented Go format is the merged
+> Java chunked CRC-32C format described here; older flat version-1 bodies are
+> preserved and rejected with an explicit migration error because they cannot
+> be distinguished safely from a torn first chunk.
+
 Clone the shape of `qwp_sf_ack_watermark.go` (`qwpSfAckWatermark`), which is
 already a tested Java-parity per-slot side-file. Differences: the dict **grows**
 (append-only) rather than being a fixed 16-byte mmap, so use buffered `pwrite`
@@ -275,24 +281,26 @@ mmap.
   in `qwpSfScanOrphans`/`qwpSfHasAnySegmentFile` (`qwp_sf_orphan.go:99,116`) and
   `qwpSfUnlinkAllSegmentFiles` skip it automatically — same as `.ack-watermark`.
 - **Format (LE):** `magic u32 = 'SYD1'(0x31445953)`, `version u8 = 1`, 3 reserved
-  bytes, then entries `[len varint][utf8]` in ascending id order. Id = entry
-  position (ids dense from 0), so no id stored. Header 8 bytes.
-- **`open(slotDir) *qwpSfSymbolDict`** — parse an existing file's complete
-  entries (self-heal a torn trailing entry: stop at the first incomplete
-  record; the next append overwrites it); (re)create fresh on
-  missing/bad-magic/parse-failure. Return `nil` on unrecoverable I/O failure →
-  caller disables delta for the slot (§4). Load complete entries into an
-  in-memory buffer for one-shot seeding.
-- **`appendSymbol(name)`** — write `[len varint][utf8]` at the append offset.
-  **No fsync** (matches SF: process-crash durable via page cache, not
-  host-crash durable). Assigns the next dense id implicitly.
+  bytes, then chunks `[entryCount varint][entryBytes varint][entries][crc32c
+  u32]`. `entries` is exactly `entryCount` repetitions of `[len
+  varint][utf8]` occupying `entryBytes`; CRC-32C covers both header varints and
+  the entry region. Id = entry position across all chunks. Header 8 bytes.
+- **`open(slotDir) (*qwpSfSymbolDict, error)`** — load the complete CRC-proven
+  prefix and physically truncate any untrusted trailing chunk. Recreate an
+  ordinary invalid fresh-slot file, but preserve and reject a legacy flat body
+  with `qwpSfErrSymbolDictLegacyFormat`; recovery never recreates an existing
+  file. A failed tail truncate is a retriable operational error.
+- **`appendSymbols(names)`** — write one complete chunk per frame delta in one
+  positioned write. **No fsync** (matches SF: process-crash durable via page
+  cache, not host-crash durable). Advance the append offset and dense symbol
+  count only after the full write.
 - **`loadedSymbols() []string`** / **`size() int`** — for seeding.
 - **`removeOrphan(slotDir)`** / **`close()`** — mirror
   `qwpSfAckWatermarkRemoveOrphan` (`:206`) / `close` (`:277`).
 
-Single-writer (producer goroutine). Unlike the ack watermark it is **not**
-mutex-shared with the segment-manager tick (the manager never writes the dict),
-so no mutex is required — but confirm no other goroutine touches it.
+Single-writer (producer goroutine). The manager never writes the dictionary;
+its mutex only serialises append against close so a racing shutdown cannot
+write through a closed or reused descriptor.
 
 ### 6.2 Engine wiring (`qwp_sf_engine.go`)
 
@@ -508,8 +516,8 @@ across reconnect with high symbol cardinality (Java's
   the live send loop when wiring the catch-up path.
 - **Optional, out of scope:** a `delta_symbol_dict=on|off` safety valve. Java has
   none; adding one diverges from parity. Defer unless a reason emerges.
-- **Java PR #66 is still OPEN.** Track it for post-review changes before/after
-  landing this; keep the Go behavior byte-compatible with the merged Java form.
+- **Java PR #66 subsequently merged.** The addendum in §6.1 records the final
+  chunked CRC-32C format now implemented by Go.
 
 ## 11. Deep-review deltas (vs. the pre-review draft)
 
