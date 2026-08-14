@@ -110,6 +110,20 @@ batch, and a fully drained close use header/manifest fsync plus directory
 barriers. Frame publication and ordinary ACK cadence remain syscall-free;
 watermark sync occurs only when it covers a trim or final drain.
 
+Close treats manager-worker quiescence as a cleanup barrier. A timed-out
+manager join does not release worker-reachable mappings, side files, or the
+slot flock: terminal cleanup is transferred to the worker exit (or, for the
+test-only shared-manager path, to the current ring service pass).
+`engineCloseCompleted()` becomes true only after that cleanup releases the
+flock. Facade-pool slots whose close is deferred stay reserved and count
+against capacity; the housekeeper and the borrow-at-capacity path re-probe them
+and restore the index after completion (so `housekeeper_interval_ms=0` does not
+leak capacity). Go deliberately has no global flock-release retry daemon: an
+ownerless close error is retried by a later `Close`; construction unwind,
+orphan drainers, and pool shutdown install a per-engine terminal retry owner so
+the flock is not left without a recovery path. Pool shutdown reports an error
+while any slot cleanup remains pending.
+
 **Cursor frames carry a self-sufficient schema** — full inline column
 definitions on every frame — which keeps reconnect/replay/orphan-adoption
 schema-safe against a fresh server connection. The symbol dictionary is

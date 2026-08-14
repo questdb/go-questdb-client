@@ -455,8 +455,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 	factory := qwpSfBuildReconnectFactory(address, opts, dumpWriter)
 	transport, err := factory(ctx, 0)
 	if err != nil {
-		_ = engine.engineClose()
-		return nil, err
+		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err, nil)
 	}
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
@@ -1435,6 +1434,13 @@ func (s *qwpLineSender) resetAfterFlush() {
 
 func (s *qwpLineSender) Close(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
+		// The first Close may have safely handed engine cleanup to the manager
+		// worker, which can then hit a transient durability or flock-release
+		// error. Preserve the public double-close contract once cleanup is owned
+		// or complete, but let an otherwise ownerless terminal cleanup converge.
+		if s.cursorEngine != nil && s.cursorEngine.engineCloseRetryable() {
+			return s.cursorEngine.engineRetryCloseIfNeeded()
+		}
 		return errDoubleSenderClose
 	}
 	// All wire I/O goes through the cursor engine + send loop,

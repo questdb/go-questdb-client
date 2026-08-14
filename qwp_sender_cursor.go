@@ -29,7 +29,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,6 +43,10 @@ const qwpSfDefaultSenderId = "default"
 // qwpSfDefaultMaxBytes is the default per-segment cap. Mirrors
 // Java's 4 MiB.
 const qwpSfDefaultMaxBytes int64 = 4 * 1024 * 1024
+
+// qwpSfTestAfterEngineCreateHook injects a construction failure after the
+// engine owns its manager and slot lock. Production leaves it nil.
+var qwpSfTestAfterEngineCreateHook atomic.Pointer[func() error]
 
 // qwpSfDefaultMaxTotalBytes is the default total cap when sf_dir
 // is set. Mirrors Java's 10 GiB SF default.
@@ -198,6 +204,11 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		return nil, err
 	}
 	engine.engineSetLogger(qwpEffectiveLogger(conf.logger))
+	if hook := qwpSfTestAfterEngineCreateHook.Load(); hook != nil {
+		if hookErr := (*hook)(); hookErr != nil {
+			return nil, qwpSfCloseEngineAfterBuildFailure(engine, hookErr, conf.logger)
+		}
+	}
 
 	// Failover plumbing (failover.md §2 / §13.6). The tracker is
 	// shared across every caller drawing from this addr= list: the
@@ -284,8 +295,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			err = qwpSfUpgradeFailureSE(
 				engine.engineAckedFsn()+1, engine.enginePublishedFsn(), mismatch)
 		}
-		_ = engine.engineClose()
-		return nil, err
+		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err, conf.logger)
 	}
 
 	loop := qwpSfNewSendLoop(engine, transport, factory,
@@ -340,8 +350,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	)
 	if err != nil {
 		_ = loop.sendLoopClose()
-		_ = engine.engineClose()
-		return nil, err
+		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err, conf.logger)
 	}
 	s.fileNameLimit = conf.fileNameLimit
 	// Pre-size the encoder buffer for the microbatch role: the cursor
@@ -970,6 +979,11 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	if engineCloseErr != nil && firstErr == nil {
 		firstErr = engineCloseErr
 	}
+	if !s.cursorEngine.engineCloseCompleted() {
+		qwpEffectiveLogger(s.cursorEngine.manager.logger.Load()).Warn(
+			"qwp/sf: slot lock retained until the manager worker exits",
+			"slot", s.cursorEngine.engineSfDir())
+	}
 	// Stop the drainer pool last — drainers may still be using the
 	// reconnect factory (which captures the foreground's address +
 	// auth) and we want their wire shutdowns to overlap with the
@@ -978,6 +992,54 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 		s.drainerPool.drainerPoolClose()
 	}
 	return firstErr
+}
+
+// closeCompleted lets the facade pool distinguish a completed delegate close
+// from a safe deferred close that still retains its SF slot flock.
+func (s *qwpLineSender) closeCompleted() bool {
+	return s == nil || s.cursorEngine == nil || s.cursorEngine.engineCloseCompleted()
+}
+
+func (s *qwpLineSender) retryCloseIfNeeded() error {
+	if s == nil || s.cursorEngine == nil {
+		return nil
+	}
+	return s.cursorEngine.engineRetryCloseIfNeeded()
+}
+
+func (s *qwpLineSender) ensureCloseRetryOwner(logger *slog.Logger) {
+	if s != nil && s.cursorEngine != nil {
+		s.cursorEngine.engineStartCloseRetryOwner(logger)
+	}
+}
+
+type qwpSfBuildCleanupError struct {
+	cause  error
+	engine *qwpSfCursorEngine
+}
+
+func (e *qwpSfBuildCleanupError) Error() string { return e.cause.Error() }
+func (e *qwpSfBuildCleanupError) Unwrap() error { return e.cause }
+func (e *qwpSfBuildCleanupError) closeCompleted() bool {
+	return e.engine.engineCloseCompleted()
+}
+func (e *qwpSfBuildCleanupError) retryCloseIfNeeded() error {
+	return e.engine.engineRetryCloseIfNeeded()
+}
+func (e *qwpSfBuildCleanupError) ensureCloseRetryOwner(logger *slog.Logger) {
+	e.engine.engineStartCloseRetryOwner(logger)
+}
+
+func qwpSfCloseEngineAfterBuildFailure(engine *qwpSfCursorEngine, cause error, logger *slog.Logger) error {
+	closeErr := engine.engineClose()
+	if !engine.engineCloseCompleted() {
+		engine.engineStartCloseRetryOwner(logger)
+		return &qwpSfBuildCleanupError{cause: cause, engine: engine}
+	}
+	if closeErr != nil {
+		return errors.Join(cause, closeErr)
+	}
+	return cause
 }
 
 // waitCursorDrain blocks until ackedFsn ≥ publishedFsn, the

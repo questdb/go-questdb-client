@@ -466,11 +466,12 @@ func TestQwpSenderPoolCloseWaitsForReapTeardown(t *testing.T) {
 	var entered sync.WaitGroup
 	entered.Add(1)
 	var once sync.Once
-	reapCloseHook = func() {
+	hook := func() {
 		once.Do(entered.Done)
 		<-release // hold the reap teardown in flight
 	}
-	t.Cleanup(func() { reapCloseHook = nil })
+	reapCloseHook.Store(&hook)
+	t.Cleanup(func() { reapCloseHook.Store(nil) })
 
 	// min=0 so the single grown slot is reapable; long acquire timeout so the
 	// close-wait budget is not the thing that unblocks close().
@@ -517,11 +518,12 @@ func TestQwpQueryPoolCloseWaitsForReapTeardown(t *testing.T) {
 	var entered sync.WaitGroup
 	entered.Add(1)
 	var once sync.Once
-	queryReapCloseHook = func() {
+	hook := func() {
 		once.Do(entered.Done)
 		<-release
 	}
-	t.Cleanup(func() { queryReapCloseHook = nil })
+	queryReapCloseHook.Store(&hook)
+	t.Cleanup(func() { queryReapCloseHook.Store(nil) })
 
 	p := queryPoolWithIdle(t, 0, 2, time.Millisecond)
 	ctx := context.Background()
@@ -608,11 +610,12 @@ func TestQwpSenderPoolGrowthBorrowBoundedByAcquireDeadline(t *testing.T) {
 	var entered sync.WaitGroup
 	entered.Add(1)
 	var once sync.Once
-	createSlotHook = func() {
+	hook := func() {
 		once.Do(entered.Done)
 		<-release // wedge the build past the acquire deadline
 	}
-	t.Cleanup(func() { createSlotHook = nil })
+	createSlotHook.Store(&hook)
+	t.Cleanup(func() { createSlotHook.Store(nil) })
 
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)

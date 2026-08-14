@@ -421,6 +421,12 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		} else {
 			_ = engine.engineClose()
 		}
+		if !engine.engineCloseCompleted() {
+			engine.engineStartCloseRetryOwner(d.logger)
+			qwpEffectiveLogger(d.logger).Error(
+				"qwp/sf: orphan drainer close incomplete; a terminal cleanup owner will retain and retry the slot lock release",
+				"slot", d.slotPath)
+		}
 	}()
 
 	target := engine.enginePublishedFsn()

@@ -178,6 +178,14 @@ between proven stray files and load-bearing corruption.
 
 ### High: close releases the slot before manager quiescence
 
+**Status (2026-08-13): addressed by the Fix 2 implementation; commit pending.**
+Manager entries now carry shared per-ring service state, close either proves
+quiescence or transfers terminal cleanup to the worker, and the slot flock is
+retained until `engineCloseCompleted()` is published. The facade pool retires
+and re-probes capacity for a deferred close; shutdown and construction unwind
+also preserve that ownership and report incomplete cleanup. Duplicate Close is
+idempotent while a handoff or terminal cleanup is already owned.
+
 `segmentManagerClose` sets `closed`, waits at most five seconds for the worker,
 then returns without reporting whether the worker stopped:
 

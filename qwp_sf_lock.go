@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
 // qwpSfLockFileName is the per-slot lock file name. One lock file per
@@ -77,6 +78,10 @@ type qwpSfSlotLock struct {
 	lockPath string
 	file     *os.File
 }
+
+// qwpSfTestBeforeFlockReleaseHook injects a retryable release failure before
+// the lock fd is closed. Production leaves it nil.
+var qwpSfTestBeforeFlockReleaseHook atomic.Pointer[func() error]
 
 // qwpSfAcquireSlotLock creates slotDir if needed, opens
 // `<slotDir>/.lock`, and acquires an exclusive flock on it. On
@@ -162,6 +167,11 @@ func (l *qwpSfSlotLock) slotPath() string {
 func (l *qwpSfSlotLock) close() error {
 	if l == nil || l.file == nil {
 		return nil
+	}
+	if hook := qwpSfTestBeforeFlockReleaseHook.Load(); hook != nil {
+		if err := (*hook)(); err != nil {
+			return err
+		}
 	}
 	err := l.file.Close()
 	l.file = nil

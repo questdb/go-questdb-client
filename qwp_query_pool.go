@@ -269,7 +269,7 @@ func (p *qwpQueryPool) markClosing() { p.closing.Store(true) }
 // queryReapCloseHook, when non-nil, is invoked at the start of each reap-victim
 // close goroutine. Test seam only (mirrors reapCloseHook): it lets a test hold a
 // reap teardown in flight to assert close() waits for it. Nil in production.
-var queryReapCloseHook func()
+var queryReapCloseHook atomic.Pointer[func()]
 
 func (p *qwpQueryPool) reapIdle() {
 	if p.closing.Load() {
@@ -288,8 +288,8 @@ func (p *qwpQueryPool) reapIdle() {
 		wg.Add(1)
 		go func(client *QwpQueryClient) {
 			defer wg.Done()
-			if queryReapCloseHook != nil {
-				queryReapCloseHook()
+			if hook := queryReapCloseHook.Load(); hook != nil {
+				(*hook)()
 			}
 			_ = closeQueryClientGuarded(context.Background(), client)
 		}(w.client)

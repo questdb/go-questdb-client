@@ -26,7 +26,10 @@ package questdb
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,6 +52,209 @@ func TestQwpSfSegmentCloseLeakMappingKeepsBuf(t *testing.T) {
 
 	// Release the deliberately-leaked mapping so the test does not leak it.
 	require.NoError(t, qwpSfMunmap(seg.buf))
+}
+
+func TestQwpSenderRepeatedCloseRetriesFlockRelease(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	injected := errors.New("injected flock release failure")
+	calls := 0
+	flockHook := func() error {
+		calls++
+		if calls == 1 {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	t.Cleanup(func() { qwpSfTestBeforeFlockReleaseHook.Store(nil) })
+
+	require.ErrorIs(t, engine.engineClose(), injected)
+	require.False(t, engine.engineCloseCompleted())
+	_, err = qwpSfAcquireSlotLock(dir)
+	require.Error(t, err, "failed release must retain the flock")
+
+	// Model the public sender after its first Close has already run: the repeat
+	// call must reach ownerless engine cleanup instead of returning the ordinary
+	// double-close error.
+	sender := &qwpLineSender{cursorEngine: engine}
+	sender.closed.Store(true)
+	require.NoError(t, sender.Close(context.Background()))
+	require.True(t, engine.engineCloseCompleted())
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpEngineTerminalRetryOwnerCompletesFailedDeferredCleanup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	calls := atomic.Int32{}
+	flockHook := func() error {
+		if calls.Add(1) == 1 {
+			return errors.New("injected first release failure")
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	t.Cleanup(func() { qwpSfTestBeforeFlockReleaseHook.Store(nil) })
+
+	require.Error(t, engine.engineClose())
+	engine.engineStartCloseRetryOwner(nil)
+	require.Eventually(t, engine.engineCloseCompleted, 2*time.Second, 10*time.Millisecond)
+	require.GreaterOrEqual(t, calls.Load(), int32(2))
+}
+
+// TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits reproduces the close
+// race at the real worker I/O boundary. A manager blocked in spare creation
+// must retain every worker-reachable resource and the flock; its exit path
+// performs terminal cleanup after the operation is released.
+func TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits(t *testing.T) {
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace
+	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	t.Cleanup(func() {
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace = oldGrace
+	})
+
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	require.NoError(t, engine.engineClose())
+	require.False(t, engine.engineCloseCompleted())
+	// Duplicate close while the owned-manager handoff is pending must be an
+	// idempotent observation, not a second registration or a panic.
+	require.NoError(t, engine.engineClose())
+	_, err = qwpSfAcquireSlotLock(dir)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "slot already in use")
+	_, err = os.Stat(filepath.Join(dir, "sf-initial.sfa"))
+	require.NoError(t, err, "close must not remove segment files while the worker can touch the slot")
+
+	close(release)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, time.Millisecond)
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+	// A retry after deferred cleanup converges without a second teardown.
+	require.NoError(t, engine.engineClose())
+}
+
+func TestQwpEngineDoubleCloseDuringUnlinkRunsOneCleanup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var finishCalls atomic.Int32
+	finishHook := func() { finishCalls.Add(1) }
+	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
+	unlinkHook := func(path string) {
+		if filepath.Base(path) != "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestBeforeSegmentUnlinkHook.Store(&unlinkHook)
+	t.Cleanup(func() {
+		qwpSfTestBeforeSegmentUnlinkHook.Store(nil)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- engine.engineClose() }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("close did not reach segment unlink")
+	}
+	require.NoError(t, engine.engineClose(), "concurrent close must observe claimed cleanup")
+	close(release)
+	require.NoError(t, <-done)
+	require.True(t, engine.engineCloseCompleted())
+	require.Equal(t, int32(1), finishCalls.Load(), "terminal cleanup ran more than once")
+}
+
+// TestQwpSharedManagerDefersOnlyTheBusyRing pins the test-only shared-manager
+// path: one ring hands cleanup to its current service pass while the manager
+// remains alive to service its sibling.
+func TestQwpSharedManagerDefersOnlyTheBusyRing(t *testing.T) {
+	const segSize int64 = 4096
+	mgr, err := qwpSfNewSegmentManager(segSize, 100*time.Microsecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	mgr.segmentManagerStart()
+	defer mgr.segmentManagerClose()
+
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace
+	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	t.Cleanup(func() {
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace = oldGrace
+	})
+
+	busy, err := qwpSfNewCursorEngineWithManager(dir, segSize, mgr, time.Second)
+	require.NoError(t, err)
+	sibling, err := qwpSfNewCursorEngineWithManager("", segSize, mgr, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = sibling.engineClose() }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter busy ring service")
+	}
+
+	require.NoError(t, busy.engineClose())
+	require.False(t, busy.engineCloseCompleted())
+	close(release)
+	require.Eventually(t, busy.engineCloseCompleted, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !sibling.ring.needsHotSpare() }, time.Second, time.Millisecond)
 }
 
 // TestQwpSfSegmentCloseUnmaps pins the normal close still unmaps and nils buf.
@@ -95,6 +301,32 @@ func TestQwpEngineSurfacesManagerWorkerPanic(t *testing.T) {
 	got := engine.engineTerminalError()
 	require.Error(t, got)
 	require.Contains(t, got.Error(), "segment manager worker stopped")
+}
+
+// A panicked worker has exited its ring loop, so engine close must clean up
+// inline rather than treating the five-second join timeout as uncertainty.
+func TestQwpEngineCloseAfterManagerWorkerPanicReleasesSlot(t *testing.T) {
+	dir := t.TempDir()
+	createHook := func(path string) {
+		if filepath.Base(path) != "sf-initial.sfa" {
+			panic("injected spare-create panic")
+		}
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	t.Cleanup(func() { qwpSfTestSegmentCreateHook.Store(nil) })
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	select {
+	case <-engine.manager.done:
+	case <-time.After(time.Second):
+		t.Fatal("manager worker did not exit after injected panic")
+	}
+	require.Error(t, engine.engineTerminalError())
+	require.NoError(t, engine.engineClose())
+	require.True(t, engine.engineCloseCompleted())
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
 }
 
 // TestQwpSendLoopCloseAbandonSignalsAndReleasesTransport pins that a send loop

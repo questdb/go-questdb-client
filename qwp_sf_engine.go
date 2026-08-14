@@ -59,6 +59,14 @@ const qwpSfEngineParkInterval = 50 * time.Microsecond
 var ErrBackpressureTimeout = errors.New(
 	"qwp/sf: cursor ring backpressured — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)")
 
+// qwpSfTestBeforeSegmentUnlinkHook is a test seam for holding terminal cleanup
+// after quiescence while a concurrent Close arrives. Production leaves it nil.
+var qwpSfTestBeforeSegmentUnlinkHook atomic.Pointer[func(path string)]
+
+// qwpSfTestEngineFinishCloseHook counts terminal-cleanup entry independently
+// of how many segment files that cleanup unlinks. Production leaves it nil.
+var qwpSfTestEngineFinishCloseHook atomic.Pointer[func()]
+
 // qwpSfErrEngineClosed is returned by engineAppendBlocking when the
 // engine is closed underneath an in-flight or backpressure-parked
 // append. The canonical trigger is a SenderErrorHandler calling
@@ -92,10 +100,11 @@ type qwpSfCursorEngine struct {
 	sfDir            string
 	segmentSizeBytes int64
 
-	manager     *qwpSfSegmentManager
-	ownsManager bool
-	slotLock    *qwpSfSlotLock
-	ring        *qwpSfSegmentRing
+	manager      *qwpSfSegmentManager
+	managerEntry *qwpSfManagerRingEntry
+	ownsManager  bool
+	slotLock     *qwpSfSlotLock
+	ring         *qwpSfSegmentRing
 
 	// watermark is the engine-owned mmap'd .ack-watermark file
 	// (sf-client.md §5.4). nil in memory mode and when the file
@@ -161,6 +170,20 @@ type qwpSfCursorEngine struct {
 	// closed is set by engineClose. atomic.Bool so tests / status
 	// accessors can sample it from any goroutine.
 	closed atomic.Bool
+
+	// closeCompleted is published only after terminal cleanup has released the
+	// slot flock (or immediately in memory mode). terminalCleanupClaimed gives
+	// exactly one caller -- Close or the manager worker -- ownership of that
+	// cleanup. The deferred fields are written before handoff and then read by
+	// the worker without taking engine locks.
+	closeCompleted          atomic.Bool
+	terminalCleanupClaimed  atomic.Bool
+	terminalResourcesClosed atomic.Bool
+	deferredCleanupOwned    atomic.Bool
+	closeRetryOwnerStarted  atomic.Bool
+	deferredFullyDrained    atomic.Bool
+	deferredLeakSegments    atomic.Bool
+	deferredClose           func()
 
 	// appendMu serializes the producer's ring-append path against
 	// engineClose's segment teardown. The producer's only entry into
@@ -456,13 +479,15 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
 		}
 	}
-	if err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark); err != nil {
+	managerEntry, err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark)
+	if err != nil {
 		return nil, err
 	}
 	e := &qwpSfCursorEngine{
 		sfDir:               sfDir,
 		segmentSizeBytes:    segmentSizeBytes,
 		manager:             mgr,
+		managerEntry:        managerEntry,
 		ownsManager:         false,
 		slotLock:            lock,
 		ring:                ring,
@@ -471,6 +496,9 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		appendDeadline:      appendDeadline,
 		recoveredFromDisk:   recoveredFromDisk,
 	}
+	// Bind once: manager handoff retains the engine through this closure until
+	// terminal cleanup has run.
+	e.deferredClose = e.engineCompleteDeferredClose
 	ok = true
 	return e, nil
 }
@@ -798,7 +826,13 @@ func (e *qwpSfCursorEngine) engineCloseLeakSegments() error {
 }
 
 func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
-	if !e.closed.CompareAndSwap(false, true) {
+	firstClose := e.closed.CompareAndSwap(false, true)
+	if !firstClose && (e.closeCompleted.Load() || e.deferredCleanupOwned.Load()) {
+		return nil
+	}
+	// A worker exit or another retry already owns terminal cleanup. Retain every
+	// resource until that owner publishes completion.
+	if e.terminalCleanupClaimed.Load() {
 		return nil
 	}
 	// Serialize the manager + ring teardown against the producer's
@@ -812,6 +846,9 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	// goroutine, so joining it under the lock cannot deadlock.
 	e.appendMu.Lock()
 	defer e.appendMu.Unlock()
+	if e.closeCompleted.Load() || e.deferredCleanupOwned.Load() || e.terminalCleanupClaimed.Load() {
+		return nil
+	}
 	// Capture drain state BEFORE closing the ring — once the ring is
 	// closed, its accessors aren't safe to read. The active segment
 	// is never trimmed by drainTrimmable (only sealed segments are),
@@ -820,7 +857,66 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	fullyDrained := e.sfDir != "" &&
 		(e.ring.segmentRingPublishedFsn() < 0 ||
 			e.ring.segmentRingAckedFsn() >= e.ring.segmentRingPublishedFsn())
+	e.deferredFullyDrained.Store(fullyDrained)
+	// Mapping leaks are a one-way safety decision: a retrying normal close must
+	// never downgrade an earlier abandoned-send-loop close and unmap memory that
+	// the abandoned goroutine may still dereference.
+	if leakSegments {
+		e.deferredLeakSegments.Store(true)
+	}
+	effectiveLeakSegments := e.deferredLeakSegments.Load()
 
+	entry := e.manager.segmentManagerDeregister(e.ring)
+	if entry != nil {
+		e.managerEntry = entry
+	}
+	quiescent := false
+	if e.ownsManager {
+		quiescent = e.manager.segmentManagerClose()
+	} else {
+		quiescent = e.manager.awaitRingQuiescence(e.managerEntry)
+	}
+	if !quiescent {
+		var handedOff bool
+		e.deferredCleanupOwned.Store(true)
+		if e.ownsManager {
+			handedOff = e.manager.deferOwnedCleanupUntilWorkerExit(e.deferredClose)
+		} else {
+			handedOff = e.manager.deferUntilRingQuiescent(e.managerEntry, e.deferredClose)
+		}
+		if !handedOff {
+			e.deferredCleanupOwned.Store(false)
+		}
+		if handedOff {
+			qwpEffectiveLogger(e.manager.logger.Load()).Error(
+				"qwp/sf: close handed to the manager worker's exit path; the slot stays locked until it completes",
+				"slot", e.sfDir)
+			return nil
+		}
+	}
+	if !e.terminalCleanupClaimed.CompareAndSwap(false, true) {
+		return nil
+	}
+	return e.engineFinishClose(fullyDrained, effectiveLeakSegments)
+}
+
+// engineFinishClose performs terminal cleanup after manager quiescence is
+// proven. The terminalCleanupClaimed CAS, not appendMu, excludes another
+// cleanup owner; callers nevertheless hold appendMu to fence producers.
+func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) error {
+	if hook := qwpSfTestEngineFinishCloseHook.Load(); hook != nil {
+		(*hook)()
+	}
+	if e.terminalResourcesClosed.Load() {
+		if e.slotLock != nil {
+			if err := e.slotLock.close(); err != nil {
+				e.terminalCleanupClaimed.Store(false)
+				return err
+			}
+		}
+		e.closeCompleted.Store(true)
+		return nil
+	}
 	var firstErr error
 	drainCleanupAllowed := fullyDrained
 	if fullyDrained {
@@ -836,20 +932,20 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 				drainCleanupAllowed = false
 			}
 		}
-	}
-	e.manager.segmentManagerDeregister(e.ring)
-	if e.ownsManager {
-		e.manager.segmentManagerClose()
+		// These durability barriers precede every destructive cleanup step.
+		// On failure retain the ring, side files, and flock so a later Close can
+		// retry from intact state.
+		if !drainCleanupAllowed {
+			e.terminalCleanupClaimed.Store(false)
+			return firstErr
+		}
 	}
 	if err := e.ring.segmentRingCloseInternal(leakSegments); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	// Close the watermark mmap/fd after the manager (the sole writer
-	// through it) is gone but before the slot lock is released. With
-	// ownsManager set, segmentManagerClose above has already joined
-	// the worker goroutine, so no persistIfAdvanced can race this
-	// close; the watermark's own mutex covers the residual
-	// shared-manager (test-only) case.
+	// Close the watermark mmap/fd only after the owned manager has exited or the
+	// shared-manager entry is past its service pass, and before releasing the
+	// slot lock. No manager write can race this close.
 	if e.watermark != nil {
 		if err := e.watermark.close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -886,12 +982,82 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 			qwpSfSymbolDictRemoveOrphan(e.sfDir)
 		}
 	}
+	e.terminalResourcesClosed.Store(true)
 	if e.slotLock != nil {
-		if err := e.slotLock.close(); err != nil && firstErr == nil {
-			firstErr = err
+		if err := e.slotLock.close(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			qwpEffectiveLogger(e.manager.logger.Load()).Error("qwp/sf: could not release slot lock after close", "slot", e.sfDir, "error", err)
+			e.terminalCleanupClaimed.Store(false)
+			return firstErr
 		}
 	}
+	e.closeCompleted.Store(true)
 	return firstErr
+}
+
+// engineCompleteDeferredClose is invoked by the manager after it is provably
+// past the worker loop or the affected ring's service pass.
+func (e *qwpSfCursorEngine) engineCompleteDeferredClose() {
+	e.deferredCleanupOwned.Store(false)
+	if !e.terminalCleanupClaimed.CompareAndSwap(false, true) {
+		return
+	}
+	e.appendMu.Lock()
+	err := e.engineFinishClose(e.deferredFullyDrained.Load(), e.deferredLeakSegments.Load())
+	e.appendMu.Unlock()
+	logger := qwpEffectiveLogger(e.manager.logger.Load())
+	if err != nil {
+		logger.Error("qwp/sf: deferred engine close failed", "slot", e.sfDir, "error", err, "closeCompleted", e.closeCompleted.Load())
+		return
+	}
+	logger.Info("qwp/sf: deferred engine close completed", "slot", e.sfDir, "closeCompleted", e.closeCompleted.Load())
+}
+
+func (e *qwpSfCursorEngine) engineCloseCompleted() bool {
+	return e != nil && e.closeCompleted.Load()
+}
+
+// engineCloseRetryable reports an incomplete close whose cleanup has no owner.
+// It is false while the manager worker or another Close is responsible, which
+// lets pool reprobes stay non-blocking during a legitimately stuck service
+// pass. A true result means an earlier cleanup attempt failed and may be
+// retried inline.
+func (e *qwpSfCursorEngine) engineCloseRetryable() bool {
+	return e != nil && e.closed.Load() && !e.closeCompleted.Load() &&
+		!e.deferredCleanupOwned.Load() && !e.terminalCleanupClaimed.Load()
+}
+
+func (e *qwpSfCursorEngine) engineRetryCloseIfNeeded() error {
+	if !e.engineCloseRetryable() {
+		return nil
+	}
+	return e.engineCloseInternal(e.deferredLeakSegments.Load())
+}
+
+// engineStartCloseRetryOwner supplies terminal cleanup ownership to paths that
+// cannot expose a retryable object to the caller (construction unwind,
+// drainer exit, and pool shutdown). The per-engine goroutine exits as soon as
+// the flock is released.
+func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
+	if e == nil || e.closeCompleted.Load() || !e.closeRetryOwnerStarted.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		for !e.closeCompleted.Load() {
+			if e.engineCloseRetryable() {
+				if err := e.engineRetryCloseIfNeeded(); err != nil {
+					qwpEffectiveLogger(logger).Warn("qwp/sf: terminal cleanup retry failed; slot lock remains held",
+						"slot", e.sfDir, "error", err)
+				}
+			}
+			if e.closeCompleted.Load() {
+				return
+			}
+			time.Sleep(time.Second)
+		}
+	}()
 }
 
 // qwpSfUnlinkAllSegmentFiles unlinks every .sfa file under dir.
@@ -927,6 +1093,9 @@ func qwpSfUnlinkAllSegmentFiles(dir string) error {
 		return bi < bj
 	})
 	for _, path := range paths {
+		if hook := qwpSfTestBeforeSegmentUnlinkHook.Load(); hook != nil {
+			(*hook)(path)
+		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

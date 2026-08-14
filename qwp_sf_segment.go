@@ -155,6 +155,10 @@ type qwpSfSegment struct {
 	tornTailSanitized bool
 }
 
+// qwpSfTestSegmentCreateHook is a test seam for holding the manager inside a
+// worker-reachable filesystem operation. Production leaves it nil.
+var qwpSfTestSegmentCreateHook atomic.Pointer[func(path string)]
+
 // qwpSfCreateSegment creates a fresh segment file at path,
 // pre-allocating exactly sizeBytes and mmapping it RW. The 24-byte
 // header is written in-place; the cursor lands at qwpSfHeaderSize.
@@ -174,6 +178,9 @@ type qwpSfSegment struct {
 func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, error) {
 	if sizeBytes < qwpSfHeaderSize+qwpSfFrameHeaderSize+1 {
 		return nil, fmt.Errorf("qwp/sf: sizeBytes too small for header + one minimal frame: %d", sizeBytes)
+	}
+	if hook := qwpSfTestSegmentCreateHook.Load(); hook != nil {
+		(*hook)(path)
 	}
 	// O_TRUNC discards any prior content at the same path — segment
 	// files are write-once-then-fixed, so reusing a stale file is

@@ -43,10 +43,17 @@ import (
 const (
 	qwpSfManagerDefaultPoll         = 1 * time.Millisecond // poll cadence
 	qwpSfManagerDiskFullLogThrottle = 30 * time.Second     // throttle disk-full WARNs
-	// qwpSfManagerCloseGrace bounds how long close() waits for the
-	// worker goroutine to exit cleanly. Mirrors Java's 5-second join.
-	qwpSfManagerCloseGrace = 5 * time.Second
 )
+
+// qwpSfManagerCloseGrace bounds how long close() waits for the worker
+// goroutine or an individual ring service pass to quiesce. It is a variable so
+// the timeout paths can be tested without sleeping for five seconds.
+var qwpSfManagerCloseGrace = 5 * time.Second
+
+// qwpSfTestBeforeTrimAccountingHook is a test seam for the narrow race between
+// draining a trim batch and reconciling manager byte accounting. Production
+// leaves it nil.
+var qwpSfTestBeforeTrimAccountingHook atomic.Pointer[func(*qwpSfManagerRingEntry)]
 
 // qwpSfUnlimitedTotalBytes disables the per-engine total-bytes cap.
 const qwpSfUnlimitedTotalBytes int64 = math.MaxInt64
@@ -86,7 +93,7 @@ type qwpSfSegmentManager struct {
 	workerPanic atomic.Pointer[string]
 
 	mu                 sync.Mutex
-	rings              []qwpSfManagerRingEntry
+	rings              []*qwpSfManagerRingEntry
 	totalBytes         int64
 	lastDiskFullLog    time.Time
 	lastMaintenanceLog time.Time
@@ -96,31 +103,88 @@ type qwpSfSegmentManager struct {
 	// non-blockingly; the worker drains in select to coalesce signals.
 	wakeup chan struct{}
 	// done is closed when the worker goroutine exits.
-	done   chan struct{}
-	worker sync.WaitGroup
+	done chan struct{}
+
+	// workerGoid is used only to avoid self-waiting in the test-only shared
+	// manager close path.
+	workerGoid atomic.Int64
+
+	// Protected by mu. workerLoopExited means the worker is past the ring loop
+	// and can no longer touch any registered ring. An owned engine may hand its
+	// terminal cleanup to the worker's finite exit block after a close timeout.
+	workerLoopExited       bool
+	workerReaped           bool
+	ownedEngineExitCleanup func()
 
 	// ringSnapshot is workerLoop's reusable copy of rings. Each tick
 	// refills it from rings under mu, then releases mu before the
 	// per-ring service pass so the slow segment syscalls run without
 	// the lock held. Owned solely by workerLoop; the locked refill is
 	// its only synchronization.
-	ringSnapshot []qwpSfManagerRingEntry
+	ringSnapshot []*qwpSfManagerRingEntry
 }
+
+const (
+	qwpSfManagerRingRegistered int32 = iota
+	qwpSfManagerRingInService
+	qwpSfManagerRingDeregisteredInService
+	qwpSfManagerRingDeregistered
+)
 
 // qwpSfManagerRingEntry holds a registered ring and the directory
 // its segments live in (nil for memory-mode rings).
 type qwpSfManagerRingEntry struct {
 	ring *qwpSfSegmentRing
 	dir  string
+	// accountedBytes is this entry's contribution to manager.totalBytes.
+	// Protected by manager.mu; unlike ring.totalSegmentBytes it deliberately
+	// retains a drained batch until the service pass commits its accounting.
+	accountedBytes int64
 	// watermark is the engine-owned .ack-watermark for this slot, or
 	// nil in memory mode / when the file could not be opened. The
 	// manager writes through it on every tick where ackedFsn
 	// advanced; it never closes it (the owning engine does, in
-	// engineClose, after the manager has stopped). The pointer is
-	// copied by value into the per-tick ring snapshot, but the
-	// persist state (lastPersistedAck) lives behind the pointer on
-	// the watermark itself, so the snapshot copy is harmless.
+	// engineClose, after this entry is quiescent). Entries are shared
+	// pointers so close and the worker observe one state machine.
 	watermark *qwpSfAckWatermark
+	state     atomic.Int32
+	cleanup   atomic.Pointer[func()]
+}
+
+func (e *qwpSfManagerRingEntry) isInService() bool {
+	if e == nil {
+		return false
+	}
+	s := e.state.Load()
+	return s == qwpSfManagerRingInService || s == qwpSfManagerRingDeregisteredInService
+}
+
+func (e *qwpSfManagerRingEntry) deregister() {
+	if e == nil {
+		return
+	}
+	for {
+		s := e.state.Load()
+		switch s {
+		case qwpSfManagerRingRegistered:
+			if e.state.CompareAndSwap(s, qwpSfManagerRingDeregistered) {
+				return
+			}
+		case qwpSfManagerRingInService:
+			if e.state.CompareAndSwap(s, qwpSfManagerRingDeregisteredInService) {
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (e *qwpSfManagerRingEntry) finishService() {
+	if e.state.CompareAndSwap(qwpSfManagerRingDeregisteredInService, qwpSfManagerRingDeregistered) {
+		return
+	}
+	e.state.CompareAndSwap(qwpSfManagerRingInService, qwpSfManagerRingRegistered)
 }
 
 // qwpSfNewSegmentManager constructs a manager with the given
@@ -155,7 +219,6 @@ func (m *qwpSfSegmentManager) segmentManagerStart() {
 		panic("qwp/sf: segment manager already closed")
 	}
 	m.mu.Unlock()
-	m.worker.Add(1)
 	go m.workerLoop()
 }
 
@@ -165,14 +228,17 @@ func (m *qwpSfSegmentManager) segmentManagerStart() {
 // trims segments — but already-installed spares stay with their
 // rings (the rings close them on their own segmentRingClose).
 //
-// Idempotent; safe to call from any goroutine.
-func (m *qwpSfSegmentManager) segmentManagerClose() {
+// Returns true only when the worker is provably past its ring loop. Idempotent;
+// safe to call from any goroutine other than the worker itself.
+func (m *qwpSfSegmentManager) segmentManagerClose() bool {
 	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return
+	if !m.closed {
+		m.closed = true
 	}
-	m.closed = true
+	if m.workerReaped {
+		m.mu.Unlock()
+		return true
+	}
 	m.mu.Unlock()
 	// Wake the worker so it observes closed and exits promptly.
 	select {
@@ -180,36 +246,61 @@ func (m *qwpSfSegmentManager) segmentManagerClose() {
 	default:
 	}
 	// Bound the wait so a stuck worker can't deadlock close().
-	doneCh := make(chan struct{})
-	go func() {
-		m.worker.Wait()
-		close(doneCh)
-	}()
 	graceTimer := time.NewTimer(qwpSfManagerCloseGrace)
-	defer graceTimer.Stop()
 	select {
-	case <-doneCh:
+	case <-m.done:
+		graceTimer.Stop()
+		m.mu.Lock()
+		m.workerReaped = true
+		m.mu.Unlock()
+		return true
 	case <-graceTimer.C:
 	}
+	m.mu.Lock()
+	exited := m.workerLoopExited
+	m.mu.Unlock()
+	if !exited {
+		return false
+	}
+	// The loop is past every ring. A second bounded wait only avoids
+	// reporting quiescence while a previously handed-off cleanup is running.
+	graceTimer.Reset(qwpSfManagerCloseGrace)
+	select {
+	case <-m.done:
+		if !graceTimer.Stop() {
+			select {
+			case <-graceTimer.C:
+			default:
+			}
+		}
+	case <-graceTimer.C:
+	}
+	m.mu.Lock()
+	m.workerReaped = true
+	m.mu.Unlock()
+	return true
 }
 
 // segmentManagerDeregister stops tracking the given ring. Pending
 // spares for the ring are NOT created after this returns, but
 // already-installed spares stay with the ring. Idempotent; safe to
 // call from any goroutine.
-func (m *qwpSfSegmentManager) segmentManagerDeregister(ring *qwpSfSegmentRing) {
+func (m *qwpSfSegmentManager) segmentManagerDeregister(ring *qwpSfSegmentRing) *qwpSfManagerRingEntry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i, e := range m.rings {
 		if e.ring == ring {
+			e.deregister()
 			// Reverse the ring's contribution to totalBytes.
-			m.totalBytes -= ring.totalSegmentBytes()
+			m.totalBytes -= e.accountedBytes
+			e.accountedBytes = 0
 			// O(N) remove preserving order — register order matters
 			// for log ordering, not correctness.
 			m.rings = append(m.rings[:i], m.rings[i+1:]...)
-			return
+			return e
 		}
 	}
+	return nil
 }
 
 // segmentManagerRegister registers a ring with no ack-watermark
@@ -217,7 +308,8 @@ func (m *qwpSfSegmentManager) segmentManagerDeregister(ring *qwpSfSegmentRing) {
 // tests). Recovery for such a slot seeds from the segment-derived
 // lowestBase-1 only.
 func (m *qwpSfSegmentManager) segmentManagerRegister(ring *qwpSfSegmentRing, dir string) error {
-	return m.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	_, err := m.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	return err
 }
 
 // segmentManagerRegisterWithWatermark registers a ring for ongoing
@@ -228,19 +320,20 @@ func (m *qwpSfSegmentManager) segmentManagerRegister(ring *qwpSfSegmentRing, dir
 // tick; the manager never closes it. The ring MUST already have its
 // initial active segment in place. Wires the ring's "I need a spare"
 // callback so the producer can preempt the polling tick.
-func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSegmentRing, dir string, watermark *qwpSfAckWatermark) error {
+func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSegmentRing, dir string, watermark *qwpSfAckWatermark) (*qwpSfManagerRingEntry, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return errors.New("qwp/sf: segment manager closed")
+		return nil, errors.New("qwp/sf: segment manager closed")
 	}
-	m.rings = append(m.rings, qwpSfManagerRingEntry{ring: ring, dir: dir, watermark: watermark})
+	entry := &qwpSfManagerRingEntry{ring: ring, dir: dir, watermark: watermark, accountedBytes: ring.totalSegmentBytes()}
+	m.rings = append(m.rings, entry)
 	// Account for bytes the ring already owns when it joins. A
 	// recovered ring (post-restart, orphan adoption) can come up
 	// at-or-above the cap; without this seed, totalBytes stays at 0
 	// and the per-tick cap check would let the manager keep
 	// provisioning new spares on top of the recovered set.
-	m.totalBytes += ring.totalSegmentBytes()
+	m.totalBytes += entry.accountedBytes
 	m.mu.Unlock()
 	if dir != "" {
 		// Skip the file-generation counter past whatever's already on
@@ -263,7 +356,7 @@ func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSeg
 		}
 	}
 	ring.setManagerWakeup(m.wakeWorker)
-	return nil
+	return entry, nil
 }
 
 // wakeWorker pushes a non-blocking wakeup so the worker processes
@@ -327,8 +420,7 @@ func (m *qwpSfSegmentManager) nextSparePath(dir string) string {
 // segments. Sleeps pollInterval between iterations; pre-empted by a
 // wakeWorker signal from the producer.
 func (m *qwpSfSegmentManager) workerLoop() {
-	defer m.worker.Done()
-	defer close(m.done)
+	m.workerGoid.Store(qwpGoid())
 	timer := time.NewTimer(m.pollInterval)
 	defer timer.Stop()
 	// This goroutine drives no untrusted input, so a panic here is not a
@@ -344,6 +436,14 @@ func (m *qwpSfSegmentManager) workerLoop() {
 			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager worker panicked",
 				"detail", detail)
 		}
+		m.workerGoid.Store(0)
+		m.mu.Lock()
+		m.workerLoopExited = true
+		cleanup := m.ownedEngineExitCleanup
+		m.ownedEngineExitCleanup = nil
+		m.mu.Unlock()
+		m.runDeferredCleanup(cleanup, "deferred owned-engine cleanup failed on manager-worker exit")
+		close(m.done)
 	}()
 	for {
 		// Refill the reusable ring snapshot so we don't hold the mutex
@@ -357,7 +457,19 @@ func (m *qwpSfSegmentManager) workerLoop() {
 		m.ringSnapshot = append(m.ringSnapshot[:0], m.rings...)
 		m.mu.Unlock()
 		for _, e := range m.ringSnapshot {
-			m.serviceRing(e)
+			if !e.state.CompareAndSwap(qwpSfManagerRingRegistered, qwpSfManagerRingInService) {
+				continue
+			}
+			func() {
+				defer func() {
+					e.finishService()
+					cleanup := e.cleanup.Swap(nil)
+					if cleanup != nil {
+						m.runDeferredCleanup(*cleanup, "deferred ring cleanup failed after manager service")
+					}
+				}()
+				m.serviceRing(e)
+			}()
 		}
 		if !timer.Stop() {
 			select {
@@ -373,6 +485,66 @@ func (m *qwpSfSegmentManager) workerLoop() {
 	}
 }
 
+func (m *qwpSfSegmentManager) runDeferredCleanup(cleanup func(), message string) {
+	if cleanup == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: "+message, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	cleanup()
+}
+
+// deferOwnedCleanupUntilWorkerExit transfers terminal engine cleanup to the
+// owned manager's exit block. false is an exact proof that the worker is
+// already past its loop, so the caller may clean up inline.
+func (m *qwpSfSegmentManager) deferOwnedCleanupUntilWorkerExit(cleanup func()) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.workerLoopExited || m.workerReaped {
+		return false
+	}
+	if m.ownedEngineExitCleanup != nil {
+		return true
+	}
+	m.ownedEngineExitCleanup = cleanup
+	return true
+}
+
+func (m *qwpSfSegmentManager) awaitRingQuiescence(entry *qwpSfManagerRingEntry) bool {
+	if entry == nil || m.workerGoid.Load() == 0 || m.workerGoid.Load() == qwpGoid() {
+		return true
+	}
+	deadline := time.Now().Add(qwpSfManagerCloseGrace)
+	for entry.isInService() {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
+// deferUntilRingQuiescent transfers cleanup to the current service pass with
+// no ownerless gap. A false result means the pass finished and the caller
+// reclaimed ownership; true means the worker owns it or already took it.
+func (m *qwpSfSegmentManager) deferUntilRingQuiescent(entry *qwpSfManagerRingEntry, cleanup func()) bool {
+	if entry == nil || !entry.isInService() {
+		return false
+	}
+	f := cleanup
+	ptr := &f
+	if entry.cleanup.CompareAndSwap(nil, ptr) {
+		if entry.isInService() {
+			return true
+		}
+		return !entry.cleanup.CompareAndSwap(ptr, nil)
+	}
+	return true
+}
+
 // managerWorkerError returns a terminal error when the worker goroutine has
 // panicked and stopped provisioning/trimming, or nil while it is healthy.
 func (m *qwpSfSegmentManager) managerWorkerError() error {
@@ -385,7 +557,7 @@ func (m *qwpSfSegmentManager) managerWorkerError() error {
 // serviceRing performs one round of spare provisioning and trim for
 // a single ring. Cheap when the ring already has a spare and no
 // trimmable sealed segments — the common steady-state case.
-func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
+func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	memoryMode := e.dir == ""
 	if e.ring.needsHotSpare() {
 		// Snapshot totalBytes under lock — register/deregister can
@@ -457,6 +629,7 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 					installErr := e.ring.installHotSpare(spare)
 					if installErr == nil {
 						m.totalBytes += m.segmentSizeBytes
+						e.accountedBytes += m.segmentSizeBytes
 						installed = true
 					}
 				}
@@ -552,8 +725,17 @@ func (m *qwpSfSegmentManager) serviceRing(e qwpSfManagerRingEntry) {
 	if trimErr != nil {
 		m.recordServiceError(e.dir, trimErr)
 	}
+	if hook := qwpSfTestBeforeTrimAccountingHook.Load(); hook != nil {
+		(*hook)(e)
+	}
 	m.mu.Lock()
-	m.totalBytes -= trimmedBytes
+	// Deregistration removes entry.accountedBytes, which still includes this
+	// batch until the accounting commit. If it won the race, the zero value here
+	// proves there is nothing left to subtract; otherwise commit both totals.
+	if state := e.state.Load(); state != qwpSfManagerRingDeregisteredInService && state != qwpSfManagerRingDeregistered {
+		m.totalBytes -= trimmedBytes
+		e.accountedBytes -= trimmedBytes
+	}
 	m.mu.Unlock()
 }
 

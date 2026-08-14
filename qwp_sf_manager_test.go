@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -155,6 +156,83 @@ func TestQwpSfManagerRegisterAfterCloseRejects(t *testing.T) {
 	defer func() { _ = r.segmentRingClose() }()
 	err = mgr.segmentManagerRegister(r, "")
 	require.Error(t, err)
+}
+
+func TestQwpSfManagerDeferredOwnedCleanupRefusesAfterWorkerExit(t *testing.T) {
+	mgr, err := qwpSfNewSegmentManager(4096, time.Millisecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	mgr.segmentManagerStart()
+	require.True(t, mgr.segmentManagerClose())
+	called := false
+	require.False(t, mgr.deferOwnedCleanupUntilWorkerExit(func() { called = true }))
+	require.False(t, called, "caller retains inline cleanup ownership")
+}
+
+func TestQwpSfManagerDeregisterDuringTrimKeepsSharedByteAccounting(t *testing.T) {
+	const segSize int64 = 72
+	mgr, err := qwpSfNewSegmentManager(segSize, 100*time.Microsecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	mgr.segmentManagerStart()
+	defer mgr.segmentManagerClose()
+
+	e1, err := qwpSfNewCursorEngineWithManager("", segSize, mgr, time.Second)
+	require.NoError(t, err)
+	e2, err := qwpSfNewCursorEngineWithManager("", segSize, mgr, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = e2.engineClose() }()
+	require.Eventually(t, func() bool {
+		return !e1.ring.needsHotSpare() && !e2.ring.needsHotSpare()
+	}, time.Second, time.Millisecond)
+
+	for i := 0; i < 3; i++ {
+		_, err := e1.engineAppendBlocking(context.Background(), make([]byte, 16))
+		require.NoError(t, err)
+	}
+	sealed := e1.ring.firstSealed()
+	require.NotNil(t, sealed)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	trimHook := func(entry *qwpSfManagerRingEntry) {
+		if entry.ring != e1.ring {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestBeforeTrimAccountingHook.Store(&trimHook)
+	oldGrace := qwpSfManagerCloseGrace
+	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestBeforeTrimAccountingHook.Store(nil)
+		qwpSfManagerCloseGrace = oldGrace
+	})
+
+	e1.engineAcknowledge(sealed.segmentBaseSeq() + sealed.segmentFrameCount() - 1)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not reach trim accounting hook")
+	}
+	require.NoError(t, e1.engineClose())
+	require.False(t, e1.engineCloseCompleted())
+	close(release)
+	released = true
+	require.Eventually(t, e1.engineCloseCompleted, time.Second, time.Millisecond)
+
+	mgr.mu.Lock()
+	got := mgr.totalBytes
+	mgr.mu.Unlock()
+	require.Equal(t, e2.ring.totalSegmentBytes(), got,
+		"deregistered ring must leave exactly the sibling contribution")
 }
 
 func TestQwpSfManagerScanMaxGenerationOnEmptyDir(t *testing.T) {
