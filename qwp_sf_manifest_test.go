@@ -67,6 +67,12 @@ func TestQwpSfDualRecordJavaGoldenBytes(t *testing.T) {
 			got := make([]byte, qwpSfDualRecordSize)
 			qwpSfEncodeDualRecord(got, tc.magic, tc.generation, tc.first, tc.second)
 			assert.Equal(t, want, got)
+
+			rec, ok := qwpSfDecodeDualRecord(want, tc.magic, func(qwpSfDualRecord) bool { return true })
+			require.True(t, ok, "Java golden must decode")
+			assert.Equal(t, tc.generation, rec.generation)
+			assert.Equal(t, tc.first, rec.first)
+			assert.Equal(t, tc.second, rec.second)
 		})
 	}
 }

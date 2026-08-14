@@ -67,6 +67,25 @@ func TestQwpSfSymbolDictAppendPersistsAcrossReopen(t *testing.T) {
 	require.NoError(t, third.close())
 }
 
+func TestQwpSfSymbolDictAppendSymbolsZeroAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("zero-alloc invariant does not hold under -race")
+	}
+	dir := t.TempDir()
+	d, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
+	defer func() { _ = d.close() }()
+
+	names := []string{"new-symbol"}
+	require.NoError(t, d.appendSymbols(names)) // warm scratch and syscall paths
+	allocs := testing.AllocsPerRun(100, func() {
+		if err := d.appendSymbols(names); err != nil {
+			panic(err)
+		}
+	})
+	require.Zero(t, allocs, "appendSymbols allocated on its warmed flush path")
+}
+
 func TestQwpSfSymbolDictOpenRecoveredAbsentReturnsNil(t *testing.T) {
 	dir := t.TempDir()
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
