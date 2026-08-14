@@ -980,8 +980,10 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 		firstErr = engineCloseErr
 	}
 	if !s.cursorEngine.engineCloseCompleted() {
-		qwpEffectiveLogger(s.cursorEngine.manager.logger.Load()).Warn(
-			"qwp/sf: slot lock retained until the manager worker exits",
+		logger := qwpEffectiveLogger(s.cursorEngine.manager.logger.Load())
+		s.ensureCloseRetryOwner(logger)
+		logger.Warn(
+			"qwp/sf: foreground close incomplete; terminal cleanup retry owner started",
 			"slot", s.cursorEngine.engineSfDir())
 	}
 	// Stop the drainer pool last — drainers may still be using the

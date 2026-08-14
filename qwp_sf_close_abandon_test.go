@@ -88,6 +88,41 @@ func TestQwpSenderRepeatedCloseRetriesFlockRelease(t *testing.T) {
 	require.NoError(t, lock.close())
 }
 
+func TestQwpSenderForegroundCloseStartsTerminalCleanupRetryOwner(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, nil,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected reconnect")
+		}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+
+	injected := errors.New("injected first flock release failure")
+	calls := atomic.Int32{}
+	flockHook := func() error {
+		if calls.Add(1) == 1 {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	t.Cleanup(func() {
+		qwpSfTestBeforeFlockReleaseHook.Store(nil)
+		_ = engine.engineClose()
+	})
+
+	require.ErrorIs(t, sender.Close(context.Background()), injected)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond,
+		"foreground Close must leave an owner retrying terminal cleanup")
+	require.GreaterOrEqual(t, calls.Load(), int32(2))
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
 func TestQwpEngineTerminalRetryOwnerCompletesFailedDeferredCleanup(t *testing.T) {
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
