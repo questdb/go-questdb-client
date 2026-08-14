@@ -109,9 +109,9 @@ const (
 	// stays far below this.
 	qwpSfSymbolDictMaxFileSize = 1 << 30
 	// Bound the initial []string allocation independently of the byte-region
-	// limit. A checksum-valid foreign file can encode one empty symbol per byte;
-	// preallocating that claimed count would multiply a 1 GiB file into a
-	// many-gigabyte pointer array before parsing proves the entries.
+	// limit. The final length is separately bounded by
+	// qwpMaxSymbolDictionarySize; this smaller initial capacity avoids eagerly
+	// reserving the full bounded maximum for a malformed chunk.
 	qwpSfSymbolDictMaxPreallocEntries = 1 << 16
 )
 
@@ -220,7 +220,11 @@ func qwpSfSymbolDictOpenExisting(path string, fileLen int64) (*qwpSfSymbolDict, 
 		return nil, nil
 	}
 
-	loaded, validLen, validChunks := qwpSfSymbolDictScanChunks(buf)
+	loaded, validLen, validChunks, entryLimitExceeded := qwpSfSymbolDictScanChunks(buf)
+	if entryLimitExceeded {
+		_ = f.Close()
+		return nil, fmt.Errorf("qwp/sf: symbol dictionary %s exceeds the %d-entry limit", path, qwpMaxSymbolDictionarySize)
+	}
 	if validChunks == 0 && fileLen > qwpSfSymbolDictHeaderSize {
 		_ = f.Close()
 		if qwpSfSymbolDictLegacyEntryCount(buf[qwpSfSymbolDictHeaderSize:]) > 0 {
@@ -244,9 +248,10 @@ func qwpSfSymbolDictOpenExisting(path string, fileLen int64) (*qwpSfSymbolDict, 
 }
 
 // qwpSfSymbolDictScanChunks returns the symbols in the CRC-proven prefix, its
-// physical end offset, and the number of valid chunks. The first malformed,
-// torn, inconsistent, or checksum-failing chunk ends the trusted prefix.
-func qwpSfSymbolDictScanChunks(buf []byte) (loaded []string, validLen int, validChunks int) {
+// physical end offset, the number of valid chunks, and whether a checksum-valid
+// chunk would exceed the protocol entry ceiling. The first malformed, torn,
+// inconsistent, or checksum-failing chunk ends the trusted prefix.
+func qwpSfSymbolDictScanChunks(buf []byte) (loaded []string, validLen int, validChunks int, entryLimitExceeded bool) {
 	validLen = int(qwpSfSymbolDictHeaderSize)
 	pos := validLen
 	for pos < len(buf) {
@@ -259,7 +264,10 @@ func qwpSfSymbolDictScanChunks(buf []byte) (loaded []string, validLen int, valid
 		if !ok || entryCount == 0 || entryBytes == 0 {
 			break
 		}
-		if entryCount > uint64(^uint(0)>>1)-uint64(len(loaded)) || entryBytes > uint64(len(buf)-entriesStart) {
+		// Every entry consumes at least its one-byte length varint. Reject an
+		// internally impossible count as a malformed tail before classifying a
+		// checksum-valid but genuinely oversized dictionary.
+		if entryCount > entryBytes || entryCount > uint64(^uint(0)>>1)-uint64(len(loaded)) || entryBytes > uint64(len(buf)-entriesStart) {
 			break
 		}
 		chunkEnd := entriesStart + int(entryBytes)
@@ -270,6 +278,9 @@ func qwpSfSymbolDictScanChunks(buf []byte) (loaded []string, validLen int, valid
 		if crc32.Checksum(buf[chunkStart:chunkEnd], qwpSfSymbolDictCRCTable) != storedCRC {
 			break
 		}
+		if entryCount > uint64(qwpMaxSymbolDictionarySize-len(loaded)) {
+			return loaded, validLen, validChunks, true
+		}
 		entries, ok := qwpSfSymbolDictParseEntries(buf[entriesStart:chunkEnd], entryCount)
 		if !ok {
 			break
@@ -279,10 +290,13 @@ func qwpSfSymbolDictScanChunks(buf []byte) (loaded []string, validLen int, valid
 		validLen = pos
 		validChunks++
 	}
-	return loaded, validLen, validChunks
+	return loaded, validLen, validChunks, false
 }
 
 func qwpSfSymbolDictParseEntries(region []byte, expected uint64) ([]string, bool) {
+	if expected > qwpMaxSymbolDictionarySize {
+		return nil, false
+	}
 	// Every entry occupies at least its one-byte length varint.
 	if expected > uint64(len(region)) {
 		return nil, false

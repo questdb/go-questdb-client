@@ -149,6 +149,39 @@ func TestQwpSfSymbolDictOversizedFileRejected(t *testing.T) {
 	require.Error(t, err, "oversized dictionary must be rejected before the read")
 }
 
+func TestQwpSfSymbolDictEntryCountCeiling(t *testing.T) {
+	const maxEntries = qwpMaxSymbolDictionarySize
+
+	// Exactly the protocol ceiling remains valid, including the densest legal
+	// encoding: one zero-length symbol per byte.
+	entries, ok := qwpSfSymbolDictParseEntries(make([]byte, maxEntries), maxEntries)
+	require.True(t, ok)
+	require.Len(t, entries, maxEntries)
+
+	// One entry beyond the ceiling must be rejected before growing a []string
+	// to the attacker-controlled count.
+	entries, ok = qwpSfSymbolDictParseEntries(make([]byte, maxEntries+1), maxEntries+1)
+	require.False(t, ok)
+	require.Nil(t, entries)
+
+	// The ceiling is cumulative across chunks. Because both chunks have valid
+	// CRCs, recovery must fail closed and preserve the file rather than treating
+	// the second chunk as a torn tail and truncating it.
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	contents := qwpSfTestSymbolDictHeader()
+	contents = append(contents, qwpSfTestEmptySymbolChunk(maxEntries/2)...)
+	contents = append(contents, qwpSfTestEmptySymbolChunk(maxEntries-maxEntries/2+1)...)
+	require.NoError(t, os.WriteFile(path, contents, 0o644))
+
+	d, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.Nil(t, d)
+	require.ErrorContains(t, err, "exceeds the 1000000-entry limit")
+	got, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	require.Equal(t, contents, got, "checksum-valid oversized dictionary must remain byte-identical")
+}
+
 func TestQwpSfSymbolDictBadMagicRecreatedEmpty(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfSymbolDictFileName),
@@ -534,6 +567,13 @@ func qwpSfTestSymbolDictChunk(entries ...string) []byte {
 	body := binary.AppendUvarint(nil, uint64(len(entries)))
 	body = binary.AppendUvarint(body, uint64(len(entryRegion)))
 	body = append(body, entryRegion...)
+	return qwpSfTestChecksummedChunk(body)
+}
+
+func qwpSfTestEmptySymbolChunk(count int) []byte {
+	body := binary.AppendUvarint(nil, uint64(count))
+	body = binary.AppendUvarint(body, uint64(count))
+	body = append(body, make([]byte, count)...)
 	return qwpSfTestChecksummedChunk(body)
 }
 

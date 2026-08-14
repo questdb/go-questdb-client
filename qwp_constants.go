@@ -288,6 +288,12 @@ const (
 	// client does not enforce a hard cap.
 	qwpMaxColumnsPerTable = 2048
 
+	// qwpMaxSymbolDictionarySize is the protocol ceiling for a sender's
+	// global SYMBOL dictionary. The server rejects a delta whose resulting
+	// dictionary exceeds this count; mirrors Java
+	// QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE.
+	qwpMaxSymbolDictionarySize = 1_000_000
+
 	// qwpMaxBindsPerQuery caps bind parameters per QUERY_REQUEST. The
 	// server bounds binds by MAX_COLUMNS_PER_TABLE (2048) and the Java
 	// client enforces the same value (QwpBindValues.advance), so a bind
