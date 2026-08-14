@@ -151,6 +151,8 @@ func TestQwpSfSenderRotationManifestFailureRetainsRowsForRetry(t *testing.T) {
 
 	err = s.Flush(context.Background())
 	require.ErrorIs(t, err, injected)
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.NotErrorIs(t, err, ErrBackpressureTimeout)
 	require.Equal(t, 1, s.pendingRowCount, "an unappended row must remain pending")
 	require.Equal(t, int64(0), ring.segmentRingPublishedFsn())
 	require.Equal(t, int64(1), ring.nextSeqHint())

@@ -229,6 +229,10 @@ type LineSender interface {
 	// method also sends the accumulated messages.
 	//
 	// If ts.IsZero(), no timestamp is sent to the server.
+	//
+	// For QWP store-and-forward senders, an auto-flush failure matching
+	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
+	// unappended rows remain pending and may be retried on the same sender.
 	At(ctx context.Context, ts time.Time) error
 
 	// AtNow omits designated timestamp value and finalizes the ILP
@@ -238,6 +242,10 @@ type LineSender interface {
 	// If the underlying buffer reaches configured capacity or the
 	// number of buffered messages exceeds the auto-flush trigger, this
 	// method also sends the accumulated messages.
+	//
+	// For QWP store-and-forward senders, an auto-flush failure matching
+	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
+	// unappended rows remain pending and may be retried on the same sender.
 	AtNow(ctx context.Context) error
 
 	// Flush sends the accumulated messages via the underlying
@@ -249,6 +257,10 @@ type LineSender interface {
 	// batches followed by a Flush call. The optimal batch size may
 	// vary from one thousand to few thousand messages depending on
 	// the message size.
+	//
+	// For QWP store-and-forward senders, an error matching
+	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
+	// unappended rows remain pending and may be retried on the same sender.
 	Flush(ctx context.Context) error
 
 	// Close closes the underlying HTTP client.

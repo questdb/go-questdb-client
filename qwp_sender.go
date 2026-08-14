@@ -109,6 +109,10 @@ type QwpSender interface {
 	// A table's designated timestamp resolution is fixed by its first
 	// row: mixing At and AtNano on rows of the same table within one
 	// flush returns a type-conflict error.
+	//
+	// An auto-flush failure matching [ErrBackpressureTimeout] or
+	// [ErrSfDurability] is non-terminal: the unappended rows remain pending and
+	// may be retried on the same sender.
 	AtNano(ctx context.Context, ts time.Time) error
 
 	// AckedFsn returns the highest server-acknowledged frame
@@ -137,6 +141,10 @@ type QwpSender interface {
 	// returned FSN is the upper bound of any SenderError.ToFsn that
 	// could surface for this batch. Use AwaitAckedFsn for ack
 	// confirmation.
+	//
+	// An error matching [ErrBackpressureTimeout] or [ErrSfDurability] is
+	// non-terminal: the unappended rows remain pending and may be retried on
+	// the same sender.
 	FlushAndGetSequence(ctx context.Context) (int64, error)
 
 	// LastTerminalError returns a snapshot of the most recent
