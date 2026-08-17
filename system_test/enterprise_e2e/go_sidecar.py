@@ -4,9 +4,9 @@ Go sidecar driver for the Enterprise e2e suite.
 The Go client under test is exercised out-of-process: ``sidecar/main.go``
 is compiled into the ``go-e2e-sidecar`` binary (see the CI pipeline and
 the README) and driven over a line-based stdin/stdout protocol that
-mirrors the Enterprise Java sidecar (``lib/sidecar.py``): ``CONNECT``,
-``SEND``, ``FLUSH``, ``FLUSH_DEFER``, ``AWAIT_ACKED``, ``STATS``,
-``CLOSE``, ``EXIT``.
+mirrors the Enterprise sidecar protocol (``lib/sidecar.py``): ``CONNECT``,
+``SEND`` (with an optional symbol-cardinality argument), ``FLUSH``,
+``FLUSH_DEFER``, ``AWAIT_ACKED``, ``STATS``, ``CLOSE``, ``EXIT``.
 
 This lives in its own module (rather than inline in ``conftest.py``) so
 tests that need a *second* sender — the sender-crash recovery and
@@ -150,8 +150,27 @@ class GoSidecar:
         self._send(f"CONNECT {connect_string}")
         self._expect_ok()
 
-    def send(self, table: str, count: int, start_index: int = 0) -> None:
-        self._send(f"SEND {table} {count} {start_index}")
+    def send(
+        self,
+        table: str,
+        count: int,
+        start_index: int = 0,
+        *,
+        symbol_cardinality: Optional[int] = None,
+    ) -> None:
+        """Send ``count`` rows beginning at ``start_index``.
+
+        By default each row uses ``tag=test_<index>``. When
+        ``symbol_cardinality`` is set, tags cycle through that many values.
+        This lets failover tests register a complete dictionary before a
+        primary move and then send only bare references to those IDs.
+        """
+        command = f"SEND {table} {count} {start_index}"
+        if symbol_cardinality is not None:
+            if symbol_cardinality <= 0:
+                raise ValueError("symbol_cardinality must be positive")
+            command += f" {symbol_cardinality}"
+        self._send(command)
         self._expect_ok()
 
     def flush(self) -> int:

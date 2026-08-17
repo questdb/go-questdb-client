@@ -26,6 +26,7 @@ from lib import lifecycle as lc
 from lib.pg_query import count_rows, wait_for_dense_sequence
 
 from go_sidecar import GoSidecar, GoSidecarError
+from symbol_oracle import wait_for_symbol_mapping
 
 LOG = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ _TABLE = "go_demotion_mid_stream"
 _INITIAL_ROWS = 30
 _WINDOW_ROWS = 40
 _POST_ROWS = 20
+_SYMBOL_CARDINALITY = 8
 _INGEST_BATCH = 10
 _INGEST_BATCH_INTERVAL_S = 0.2
 _DURABLE_ACK_AWAIT_TIMEOUT_MS = 60_000
@@ -63,7 +65,12 @@ def _ingest_unaware(go_sidecar: GoSidecar, *, count: int, start_index: int) -> i
     IS the regression this guards (e.g. a demoted node NACKing SECURITY_ERROR
     instead of a role-change close)."""
     try:
-        go_sidecar.send(_TABLE, count=count, start_index=start_index)
+        go_sidecar.send(
+            _TABLE,
+            count=count,
+            start_index=start_index,
+            symbol_cardinality=_SYMBOL_CARDINALITY,
+        )
         return go_sidecar.flush()
     except GoSidecarError as e:
         raise AssertionError(
@@ -155,6 +162,7 @@ def test_graceful_demotion_mid_stream_sender_survives(
     go_sidecar.connect(connect_str)
 
     # Settled baseline: initial rows durably acked on A, B converged.
+    assert _INITIAL_ROWS >= _SYMBOL_CARDINALITY
     initial_fsn = _ingest_range_unaware(go_sidecar, start_index=0, total=_INITIAL_ROWS)
     assert go_sidecar.await_acked(initial_fsn, _DURABLE_ACK_AWAIT_TIMEOUT_MS), (
         f"initial batch was not durably acked by A [publishedFsn={initial_fsn}]"
@@ -212,4 +220,17 @@ def test_graceful_demotion_mid_stream_sender_survives(
     # demote was replayed and must land exactly once.
     wait_for_dense_sequence(port=b_ports.pg, table=_TABLE,
                             expected_count=total, timeout_s=120.0)
+    # The initial batches registered every symbol ID and are below the durable
+    # ACK watermark before the demote. Every later row therefore references an
+    # existing ID without carrying its name. B can decode those rows only if
+    # reconnect catch-up rebuilt the dictionary on its fresh connection. Check
+    # every row so NULLs and a shifted-but-cardinality-preserving dictionary
+    # cannot hide behind the dense-v oracle above.
+    wait_for_symbol_mapping(
+        port=b_ports.pg,
+        table=_TABLE,
+        expected_count=total,
+        symbol_cardinality=_SYMBOL_CARDINALITY,
+        timeout_s=120.0,
+    )
     LOG.info("recovered: sender rode the mid-stream demote; B holds [0..%d) exactly once", total)
