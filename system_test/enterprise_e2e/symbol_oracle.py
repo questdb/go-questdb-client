@@ -19,11 +19,12 @@ def wait_for_symbol_mapping(
     user: str = "admin",
     password: str = "quest",
 ) -> list[tuple[int, str | None]]:
-    """Wait until every row has the symbol implied by its ``v`` value.
+    """Wait until every row carries the symbol its ``v`` value implies.
 
-    The Go sidecar emits ``tag=test_<v % symbol_cardinality>`` in bounded
-    dictionary mode. Comparing every row, rather than counts grouped by tag,
-    catches NULL values and a dictionary shifted onto neighbouring IDs.
+    In bounded dictionary mode the Go sidecar writes
+    ``tag=test_<v % symbol_cardinality>``. Checking each row individually,
+    instead of counting rows per tag, catches both NULL tags and a dictionary
+    whose IDs have all shifted by the same amount.
     """
     if symbol_cardinality <= 0:
         raise ValueError("symbol_cardinality must be positive")

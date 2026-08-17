@@ -35,11 +35,11 @@ import (
 	"sync"
 )
 
-// errQwpSfSymbolDictUnusable marks content proven unusable for recovery (a
-// short/oversized file or bad magic/version), as distinct from a transient
-// stat/open/read/truncate failure. Recovery may fall back to the surviving
-// frames for the former but must leave a potentially valid file intact and
-// retry the latter.
+// errQwpSfSymbolDictUnusable says the file's content cannot be used: it is too
+// short or too long, or its magic or version is wrong. That is a different
+// situation from a stat/open/read/truncate error, which may well go away on a
+// later attempt. Recovery falls back to the surviving frames for unusable
+// content, but leaves a possibly good file alone and retries an I/O error.
 var errQwpSfSymbolDictUnusable = errors.New("qwp/sf: unusable symbol dictionary")
 
 // qwpSfSymbolDict is the append-only, per-slot persistence of the global
@@ -50,11 +50,11 @@ var errQwpSfSymbolDictUnusable = errors.New("qwp/sf: unusable symbol dictionary"
 // Delta-encoded SF frames are NOT self-sufficient: a frame carries only the
 // symbols it introduces, so recovering (process restart) or draining (orphan
 // adoption) a slot must re-register the whole dictionary on the fresh server
-// before those frames replay. This file is that dictionary. Unlike the
-// ack-watermark — a discardable optimisation guarded by a max() clamp — its
-// trusted prefix is load-bearing whenever surviving frames do not themselves
-// prove the missing ids. Recovery folds both sources and fails before replay if
-// neither establishes contiguous coverage.
+// before those frames replay. This file is that dictionary. The ack-watermark
+// next to it is only an optimisation and can be thrown away, but this file
+// cannot: whenever the surviving frames do not spell out an id themselves, its
+// trusted entries are the only remaining source. Recovery reads both, and if
+// together they still leave a hole, it fails before any replay starts.
 //
 // On-disk layout (little-endian):
 //
@@ -73,12 +73,13 @@ var errQwpSfSymbolDictUnusable = errors.New("qwp/sf: unusable symbol dictionary"
 // store-and-forward (page-cache, not disk, durable). This ordering suffices for
 // a process crash (the page cache survives, so the dictionary stays a superset
 // of every recoverable frame's references). It does NOT survive a host/power
-// crash that tears the dictionary relative to its frames. Each append is one
-// Java-compatible CRC-32C chunk: recovery trusts only the checksum-valid prefix
-// and then folds surviving frames to rebuild and heal any provable suffix. A
-// remaining gap is rejected before connection (with a send-loop guard as
-// defense in depth), turning a detectable tear into "resend required" instead
-// of silently shifting the dense id-to-symbol mapping.
+// crash that leaves the dictionary out of step with its frames. Each append is
+// one CRC-32C chunk, in the same format the Java client writes: recovery keeps
+// only the run of chunks whose checksums match, then reads the surviving frames
+// to rebuild whatever ids came after that and writes them back. If a hole is
+// still left, recovery fails before connecting (and the send loop checks again
+// before each frame goes out), so a detectable tear turns into "resend
+// required" rather than quietly shifting every id to a different symbol.
 //
 // Single-writer (the producer goroutine). loaded is read once at open to seed
 // recovery/orphan-drain; the engine owns close. The mutex serialises append
@@ -106,15 +107,17 @@ const (
 	// or corrupt length prefix cannot drive a runaway allocation. Symbols are
 	// short; this ceiling is generous.
 	qwpSfSymbolDictMaxEntryLen = 1 << 20
-	// qwpSfSymbolDictMaxFileSize bounds the whole-file read buffer at open;
-	// the parsed entry count is bounded separately by
-	// qwpSfSymbolDictMaxRecoveredEntries (empty-string entries amplify ~16x
-	// in string headers, so the byte cap alone cannot bound the allocation).
+	// qwpSfSymbolDictMaxFileSize limits the buffer open() reads the file into.
+	// The number of entries needs its own limit, qwpSfSymbolDictMaxRecoveredEntries:
+	// one empty-string entry is a single byte on disk but about 16 bytes of
+	// string header in memory, so a byte limit alone says little about how much
+	// gets allocated.
 	qwpSfSymbolDictMaxFileSize = 1 << 30
-	// qwpSfSymbolDictMaxRecoveredEntries caps recovery parsing so a crafted
-	// CRC-valid file cannot drive an unbounded []string allocation on a
-	// recovery/drainer goroutine. Far above the admission cap: an over-cap
-	// slot from an older client must keep every positional id.
+	// qwpSfSymbolDictMaxRecoveredEntries limits how many entries recovery will
+	// parse, so a hand-crafted file with valid checksums cannot make a recovery
+	// or drainer goroutine allocate an arbitrarily large []string. Set well
+	// above qwpMaxSymbolDictionarySize, because a slot written by an older
+	// client may hold more than that and every id still has to keep its place.
 	qwpSfSymbolDictMaxRecoveredEntries = 4 * qwpMaxSymbolDictionarySize
 )
 
@@ -138,11 +141,12 @@ func qwpSfSymbolDictOpen(slotDir string) *qwpSfSymbolDict {
 	return qwpSfSymbolDictOpenFresh(path)
 }
 
-// qwpSfSymbolDictOpenClean starts a fresh slot with an empty side-file. Unlike
-// qwpSfSymbolDictOpen, it never inherits entries left by a previous lifecycle:
-// an existing file must be successfully truncated or construction fails. If
-// the file was provably absent and cannot be created, nil is a safe degraded
-// result because there is no stale id mapping for a later recovery to trust.
+// qwpSfSymbolDictOpenClean starts a fresh slot with an empty side-file. It
+// never takes over entries a previous run left behind: if a file is already
+// there it must be truncated, and construction fails if that does not work.
+// When there was no file to begin with and one cannot be created, returning nil
+// is safe — the slot then runs on full self-sufficient frames, and there are no
+// stale entries on disk for a later recovery to believe.
 func qwpSfSymbolDictOpenClean(slotDir string) (*qwpSfSymbolDict, error) {
 	if slotDir == "" {
 		return nil, nil
@@ -166,18 +170,18 @@ func qwpSfSymbolDictOpenClean(slotDir string) (*qwpSfSymbolDict, error) {
 // qwpSfSymbolDictOpenRecovered opens the dictionary for a slot recovered from
 // disk. Unlike qwpSfSymbolDictOpen it NEVER recreates: a recovered slot's
 // segments hold delta frames that reference the dictionary's ids by position,
-// so silently truncating a corrupt or version-mismatched file would restart the
-// id space and re-register the wrong id→name map. The engine subsequently
-// folds surviving frames over any trusted prefix and decides whether replay is
-// provably safe. It returns:
+// so quietly truncating a corrupt or version-mismatched file would restart the
+// ids at 0 and give them the wrong names. The engine then reads the surviving
+// frames on top of whatever this returns and decides whether replay is safe.
+// It returns:
 //
-//   - (dict, nil) when the header is valid; only its CRC-proven chunk prefix is
-//     loaded and any torn/corrupt suffix is truncated,
-//   - (nil, nil) when the file is absent or its content is provably unusable
-//     (short, bad magic/version, or over the defensive read bound); the original
-//     file is preserved and frame analysis determines recoverability,
-//   - (nil, err) for transient stat/open/read failures or when an untrusted tail
-//     cannot be truncated; the caller propagates the recovery failure.
+//   - (dict, nil) when the header is valid. Only the run of chunks whose
+//     checksums match is loaded, and anything after it is truncated.
+//   - (nil, nil) when the file is absent, or its content cannot be used (too
+//     short, bad magic or version, or larger than the read limit). The file is
+//     left as it is, and the frame scan decides whether the slot is recoverable.
+//   - (nil, err) when stat/open/read fails, or the untrusted tail cannot be
+//     truncated. The caller turns that into a recovery failure.
 func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
 	if slotDir == "" {
 		return nil, nil
@@ -191,9 +195,9 @@ func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
 		return nil, err
 	}
 	if st.Size() < qwpSfSymbolDictHeaderSize {
-		// Proven content damage, not an I/O outage. Leave the stub intact and
-		// let the recovered-frame fold decide whether the slot is still
-		// self-sufficient.
+		// The content is damaged; this is not an I/O outage that might clear
+		// up. Leave the stub on disk and let the frame scan decide whether the
+		// slot can still be recovered.
 		return nil, nil
 	}
 	d, openErr := qwpSfSymbolDictOpenExistingDetailed(path, st.Size())
@@ -206,9 +210,10 @@ func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
 	return d, nil
 }
 
-// qwpSfSymbolDictRemoveOrphan best-effort removes a stale dictionary file at
-// fully-drained close (nothing references it any more; fresh slots instead
-// truncate in place via qwpSfSymbolDictOpenClean). No-op for memory mode.
+// qwpSfSymbolDictRemoveOrphan removes a stale dictionary file, best-effort, at
+// a fully-drained close when nothing refers to it any more. A fresh slot does
+// not come through here; it truncates the file in place via
+// qwpSfSymbolDictOpenClean. No-op for memory mode.
 func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 	if slotDir == "" {
 		return
@@ -216,17 +221,18 @@ func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 	_ = os.Remove(filepath.Join(slotDir, qwpSfSymbolDictFileName))
 }
 
-// qwpSfSymbolDictOpenExisting is the error-agnostic form for callers that
-// treat every failure the same way (recreate fresh).
+// qwpSfSymbolDictOpenExisting drops the error, for callers that react the same
+// way to every failure: recreate the file from scratch.
 func qwpSfSymbolDictOpenExisting(path string, fileLen int64) *qwpSfSymbolDict {
 	d, _ := qwpSfSymbolDictOpenExistingDetailed(path, fileLen)
 	return d
 }
 
-// qwpSfSymbolDictOpenExistingDetailed opens an existing side-file, loading its
-// CRC-proven chunk prefix and truncating any untrusted tail. Failures split
-// into errQwpSfSymbolDictUnusable (proven content damage — recovery may fall
-// back to the frame fold) and transient I/O errors (retryable; propagated).
+// qwpSfSymbolDictOpenExistingDetailed opens an existing side-file, loads the
+// run of chunks whose checksums match, and truncates whatever follows. Failures
+// come in two kinds: errQwpSfSymbolDictUnusable for damaged content, which lets
+// recovery fall back to reading the surviving frames, and plain I/O errors,
+// which may succeed on a later attempt and are returned as they are.
 func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymbolDict, error) {
 	if fileLen > qwpSfSymbolDictMaxFileSize {
 		return nil, errQwpSfSymbolDictUnusable
@@ -246,17 +252,19 @@ func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymb
 	}
 	loaded, pos, chunks := qwpSfParseChunkedSymbolDict(buf)
 	if len(buf) > int(qwpSfSymbolDictHeaderSize) && chunks == 0 {
-		// The pre-checksum Go prototype used the same version byte and a flat
-		// entry stream, so it cannot be distinguished safely from a corrupted
-		// first Java chunk. Do not accept structural plausibility as integrity:
-		// preserve the file and let the frame fold prove recovery from scratch.
+		// An earlier Go prototype wrote a flat entry stream with no checksums
+		// under this same version byte, and there is no reliable way to tell
+		// such a file apart from one whose first chunk is corrupt. Content that
+		// merely parses is not content that can be trusted, so keep the file
+		// and let the frame scan rebuild the dictionary from nothing.
 		_ = f.Close()
 		return nil, errQwpSfSymbolDictUnusable
 	}
-	// A later append may be shorter than the torn tail. Merely writing at pos
-	// would then leave the tail's suffix in place, and a subsequent recovery
-	// could parse that suffix as one or more real entries (shifting every id
-	// above it). Drop all untrusted bytes before exposing the append handle.
+	// Cut the file back to the last trusted byte before handing out a handle
+	// that can append. The next append may be shorter than the tail being
+	// replaced, and writing at pos alone would leave the rest of that tail on
+	// disk, where a later recovery could read it as real entries and shift
+	// every id after it.
 	if int64(pos) < fileLen {
 		if err := f.Truncate(int64(pos)); err != nil {
 			_ = f.Close()
@@ -271,17 +279,20 @@ func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymb
 	}, nil
 }
 
-// qwpSfParseChunkedSymbolDict validates the Java-compatible per-append chunk
-// stream and returns only its CRC-proven prefix. pos is the first untrusted byte
-// (or len(buf)); chunks is the number of complete chunks accepted.
+// qwpSfParseChunkedSymbolDict reads the one-chunk-per-append stream, in the
+// format the Java client also writes, and returns the entries from the leading
+// chunks whose checksums match. pos is the first byte that could not be
+// trusted (or len(buf)); chunks is how many complete chunks were accepted.
 func qwpSfParseChunkedSymbolDict(buf []byte) (loaded []string, pos, chunks int) {
 	pos = int(qwpSfSymbolDictHeaderSize)
 	for pos < len(buf) {
 		chunkStart := pos
 		entryCount, n, err := qwpReadVarint(buf[pos:])
-		// Not capped at the one-million admission limit — an existing over-cap
-		// entry must retain its positional id. Bounded only by
-		// qwpSfSymbolDictMaxRecoveredEntries (crafted-file allocation guard).
+		// Deliberately not held to qwpMaxSymbolDictionarySize: a file that
+		// already holds more entries than that must keep every one of them at
+		// its own position. The only limit here is
+		// qwpSfSymbolDictMaxRecoveredEntries, which caps the allocation a
+		// hand-crafted file can ask for.
 		if err != nil || entryCount == 0 ||
 			entryCount > uint64(qwpSfSymbolDictMaxRecoveredEntries-len(loaded)) {
 			break
@@ -384,8 +395,8 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 	var hdr [2 * qwpMaxVarintLen]byte
 	hdrLen := qwpPutVarint(hdr[:], uint64(len(names)))
 	hdrLen += qwpPutVarint(hdr[hdrLen:], uint64(entriesLen))
-	// Prepend the two varints in-place and reserve the trailing CRC. copy
-	// has memmove semantics, so the overlapping shift is safe.
+	// Shift the entries right to make room for the two varints in front and
+	// the CRC at the end. copy handles overlapping slices correctly.
 	d.scratch = append(d.scratch, make([]byte, hdrLen+qwpSfSymbolDictCRCSize)...)
 	copy(d.scratch[hdrLen:hdrLen+entriesLen], d.scratch[:entriesLen])
 	copy(d.scratch[:hdrLen], hdr[:hdrLen])
@@ -407,8 +418,9 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 }
 
 // loadedSymbols returns the entries recovered at open, in id order (entry i is
-// symbol id i). Empty when nothing was recovered. Open-time snapshot only:
-// later appendSymbols advance size() but never extend this list.
+// symbol id i). Empty when nothing was recovered. It reflects what was on disk
+// at open and nothing else: a later appendSymbols raises size() but leaves this
+// list alone.
 func (d *qwpSfSymbolDict) loadedSymbols() []string {
 	if d == nil {
 		return nil

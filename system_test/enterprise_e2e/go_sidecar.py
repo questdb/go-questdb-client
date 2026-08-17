@@ -161,9 +161,9 @@ class GoSidecar:
         """Send ``count`` rows beginning at ``start_index``.
 
         By default each row uses ``tag=test_<index>``. When
-        ``symbol_cardinality`` is set, tags cycle through that many values.
-        This lets failover tests register a complete dictionary before a
-        primary move and then send only bare references to those IDs.
+        ``symbol_cardinality`` is set, tags cycle through that many values, so
+        a failover test can get the whole dictionary registered before a
+        primary move and then send rows that only refer to those IDs by number.
         """
         command = f"SEND {table} {count} {start_index}"
         if symbol_cardinality is not None:

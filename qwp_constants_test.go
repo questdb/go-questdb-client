@@ -66,9 +66,8 @@ func TestQwpStatusCodes(t *testing.T) {
 }
 
 func TestQwpSymbolDictionarySizeMatchesJavaClient(t *testing.T) {
-	// Java QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE. Keep this compatibility pin
-	// explicit: a Go sender must not accept an id that a server supported by the
-	// Java client baseline can reject.
+	// Must equal Java's QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE: a Go sender
+	// must not hand out an id that a server built to the Java limit rejects.
 	if qwpMaxSymbolDictionarySize != 1_000_000 {
 		t.Fatalf("symbol dictionary cap = %d, want 1000000", qwpMaxSymbolDictionarySize)
 	}

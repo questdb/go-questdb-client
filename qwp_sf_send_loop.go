@@ -267,20 +267,23 @@ type qwpSfSendLoop struct {
 	// to -1 once we cross the boundary. Producer-only state.
 	replayTargetFsn int64
 
-	// hasReplayDictionaryDependency is true when replay can begin with a
-	// non-zero delta start. Such a replay needs the mirror catch-up on every
-	// fresh connection. Delta-producing engines need it from the outset; a
-	// full-dict fallback latches it if it encounters a recovered non-zero delta.
-	// Recovery pre-folds surviving frames, so the initial value distinguishes
-	// self-sufficient start-zero frames from a true replay dependency.
+	// hasReplayDictionaryDependency is true when a replay can start with a
+	// frame whose delta begins above id 0, meaning it refers to symbols the
+	// server was told about earlier. Such a replay needs the mirror sent to
+	// every fresh connection first. An engine that delta-encodes needs this
+	// from the start; in full-dictionary mode it turns on as soon as a
+	// recovered frame with a non-zero delta start shows up. The engine
+	// constructor has already scanned the surviving frames, so the initial
+	// value tells a slot whose frames all start at 0 apart from one that
+	// really does depend on earlier registrations.
 	hasReplayDictionaryDependency bool
 	// sentDictBytes mirrors — as concatenated [len varint][utf8] in global-id
 	// order — every symbol the loop has sent; sentDictCount is how many. It is
 	// the source for the reconnect catch-up frame. Written by the send
 	// goroutine (accumulateSentDict) and read by the catch-up sender; the two
 	// never run concurrently (catch-up runs between connections, when no send
-	// goroutine is alive), and it is seeded once at construction from the
-	// engine's recovered dictionary snapshot.
+	// goroutine is alive), and it is filled in once at construction from the
+	// symbol list the engine recovered.
 	sentDictBytes []byte
 	sentDictCount int
 	// dictSizeWarned is set once the sent-dict mirror crosses the size warning
@@ -499,10 +502,10 @@ func qwpSfNewSendLoop(
 	// (re)connect.
 	l.highestFullySent.Store(-1)
 	l.serverAckedSeq.Store(-1)
-	// Recovery / orphan-drain: seed the sent-dict mirror from the exact
-	// dictionary snapshot reconstructed from the side-file's trusted prefix
-	// plus surviving frames. The first connection can therefore re-register
-	// the whole dictionary before replay. Empty for a fresh sender.
+	// Recovery / orphan-drain: fill the sent-dict mirror from the symbol list
+	// the engine rebuilt out of the side-file's trusted prefix and the
+	// surviving frames, so the first connection can be sent the whole
+	// dictionary before replay. Empty for a fresh sender.
 	l.seedSentDictFromSymbols(engine.engineRecoveredSymbols())
 	l.durableMismatchTerminal = true
 	// Wire the producer's per-publish doorbell. Set here (before
@@ -1398,18 +1401,18 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 		return false, errors.New("qwp/sf: transport gone mid-loop")
 	}
 	payload := base[l.sendOffset+qwpSfFrameHeaderSize : frameEnd]
-	// Torn-dictionary guard, run unconditionally (delta mode AND full-dict
-	// fallback). A frame is consistent with the coverage established so far only
-	// when its delta starts at or below the mirror tip. A partial overlap is
-	// valid: the server re-registers the covered prefix and appends the unseen
-	// tail, which accumulateSentDict mirrors after the send. Only a true gap
-	// (start past the tip) references ids the fresh server was never given. That
-	// means the persisted dictionary was torn from its frames — a host/power
+	// Torn-dictionary guard, run in both delta and full-dictionary mode. A
+	// frame fits what the server already knows as long as its delta starts at
+	// or below the end of the mirror. Starting below is fine: the server
+	// re-registers the ids it already has and takes the rest, and
+	// accumulateSentDict records that tail after the send. Starting past the
+	// end is not: those ids were never given to the server. That happens when
+	// the persisted dictionary and its frames came apart — a host or power
 	// crash, or a recovered slot whose dictionary could not be trusted and was
-	// dropped. Sending would corrupt data on older servers that null-padded the
-	// hole, so fail terminally before it reaches the wire. Full-dict frames start
-	// at 0 and therefore rebuild an empty mirror contiguously even when the
-	// persisted side-file is unavailable.
+	// left unused. Older servers filled such a hole with nulls and wrote wrong
+	// data, so stop the sender here instead of putting the frame on the wire.
+	// Full-dictionary frames always start at 0, so they build up an empty
+	// mirror without holes even when the side-file is unavailable.
 	deltaStart, _, hasDelta := qwpFrameDeltaRange(payload)
 	if hasDelta {
 		if deltaStart > l.sentDictCount {
@@ -1453,11 +1456,12 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 	// sendMessage above and accumulateSentDict here) must complete before
 	// that store, or accumulateSentDict could dereference an unmapped page.
 	if hasDelta {
-		// What the producer emits and what recovered frames require are separate
-		// concerns. Track every delta even in full-dict fallback: a slot can lose
-		// its side-file while retaining a contiguous delta sequence on disk.
-		// Once a non-zero start appears, every later fresh connection needs the
-		// reconstructed prefix before replay begins.
+		// Record every delta, including in full-dictionary mode: what the
+		// producer writes now and what the recovered frames need are two
+		// different things, and a slot can lose its side-file while still
+		// holding a hole-free run of delta frames on disk. Once a frame with a
+		// non-zero start goes out, every fresh connection from here on needs
+		// the earlier ids before replay begins.
 		if deltaStart > 0 {
 			l.hasReplayDictionaryDependency = true
 		}
@@ -2226,13 +2230,13 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 }
 
 // setWireBaselineWithCatchUp sets the wire-sequence baseline for a fresh
-// connection. When replay depends on prior registrations and the sent-dict
-// mirror is non-empty, it first emits a full-dictionary catch-up frame (or
-// several, under a small batch cap) so the fresh server — whose dictionary
-// starts empty — can resolve the non-self-sufficient delta frames that replay
-// next. The catch-up frames
-// occupy wire seqs 0..k-1, which map to already-acked FSNs (harmless
-// re-acks), so the first real replay frame still lands on replayStart.
+// connection. When the frames about to replay refer to symbols registered on
+// an earlier connection and the sent-dict mirror is non-empty, it first sends a
+// full-dictionary catch-up frame (or several, under a small batch cap) so the
+// fresh server — whose dictionary starts empty — can make sense of the delta
+// frames that replay next. The catch-up frames occupy wire seqs 0..k-1, which
+// map to already-acked FSNs (harmless re-acks), so the first real replay frame
+// still lands on replayStart.
 //
 // Caller must have reset highestFullySent / serverAckedSeq / framesSentOnConn
 // / acksOnConn and the durable tracker first. Runs on the goroutine that owns
@@ -2355,11 +2359,12 @@ func (l *qwpSfSendLoop) catchUpBudget(transport *qwpTransport) int {
 	return 1
 }
 
-// accumulateSentDict extends the sent-dict mirror with the symbols a just-sent
-// frame introduced. A delta starting at the current tip appends in full; a
-// partial overlap skips the already-held prefix and appends only its unseen
-// tail. A wholly replayed or empty delta is a no-op, and a true gap is rejected
-// by trySendOne before this function runs.
+// accumulateSentDict adds the symbols a just-sent frame carried to the
+// sent-dict mirror. A delta starting right where the mirror ends is appended
+// whole; one starting further back skips the entries the mirror already has and
+// appends the rest. A delta that adds nothing new, or an empty one, does
+// nothing. A delta starting past the end of the mirror never gets here —
+// trySendOne stops the sender on it first.
 func (l *qwpSfSendLoop) accumulateSentDict(payload []byte) {
 	deltaStart, deltaCount, symbols, ok := qwpParseDeltaDict(payload)
 	if !ok || deltaCount <= 0 || deltaStart > l.sentDictCount {
@@ -2369,9 +2374,9 @@ func (l *qwpSfSendLoop) accumulateSentDict(payload []byte) {
 	if deltaEnd <= l.sentDictCount {
 		return
 	}
-	// Skip entries the mirror already holds. qwpParseDeltaDict validated the
-	// complete region, but retain the bounds checks here so this helper stays
-	// fail-closed if its contract changes later.
+	// Step over the entries the mirror already holds. qwpParseDeltaDict has
+	// already validated the whole region; the bounds checks here keep this
+	// loop safe on its own if that ever changes.
 	for skip := l.sentDictCount - deltaStart; skip > 0; skip-- {
 		entryLen, n, err := qwpReadVarint(symbols)
 		if err != nil || entryLen > uint64(len(symbols)-n) {
@@ -2390,8 +2395,8 @@ func (l *qwpSfSendLoop) accumulateSentDict(payload []byte) {
 	}
 }
 
-// seedSentDictFromSymbols builds the reconnect mirror from the exact
-// positional dictionary the recovery fold also hands to the producer.
+// seedSentDictFromSymbols builds the reconnect mirror from the same id-ordered
+// symbol list that recovery hands to the producer.
 func (l *qwpSfSendLoop) seedSentDictFromSymbols(symbols []string) {
 	for _, name := range symbols {
 		var vb [qwpMaxVarintLen]byte

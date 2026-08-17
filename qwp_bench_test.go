@@ -143,8 +143,9 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 		globalSymbols:    make(map[string]int32),
 		maxSentSymbolId:  -1,
 		batchMaxSymbolId: -1,
-		// Memory mode always runs delta, so the pin must cover the
-		// reclaimUnsentSymbolIDs path resetAfterFlush takes in production.
+		// Memory mode always delta-encodes, so the benchmark must take the
+		// same resetAfterFlush path (including reclaimUnsentSymbolIDs) that
+		// production takes.
 		deltaDictEnabled: true,
 	}
 
@@ -170,7 +171,8 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 			s.symbolDeltaBaseline(),
 			s.batchMaxSymbolId,
 		)
-		// Mirror enqueueCursor's post-append watermark advance.
+		// Advance the sent watermark the same way enqueueCursor does
+		// after appending a frame.
 		if s.batchMaxSymbolId > s.maxSentSymbolId {
 			s.maxSentSymbolId = s.batchMaxSymbolId
 		}

@@ -753,11 +753,11 @@ func TestErrorApiPerCategoryStrict(t *testing.T) {
 	}
 }
 
-// TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay pins the
-// DICTIONARY_GAP contract on a frame that carries symbols: the NACK recycles
-// the connection, the fresh connection is re-registered via a table-less
-// catch-up frame before replay, and the batch lands with a gap-free
-// dictionary — nothing dropped, no terminal.
+// TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay pins what
+// DICTIONARY_GAP does to a frame carrying symbols: the NACK makes the client
+// reconnect, send the dictionary on the new connection in a table-less
+// catch-up frame, and replay. The batch lands with every symbol present, no
+// rows dropped and the sender still running.
 func TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
 		recordFrames:       true,
@@ -792,13 +792,13 @@ func TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
 	}, 5*time.Second, time.Millisecond, "NACKed symbol frame was not replayed to an ACK")
-	assert.Nil(t, s.LastTerminalError(), "DICTIONARY_GAP must recycle, not latch")
+	assert.Nil(t, s.LastTerminalError(), "DICTIONARY_GAP must reconnect, not stop the sender")
 
 	conn2 := srv.recordedFrames()[2]
 	require.True(t, connSawTableLessFrame(conn2),
-		"the recycled connection must re-register the dictionary via a catch-up frame")
+		"the new connection must be sent the dictionary in a catch-up frame")
 	require.Equal(t, []string{"AAPL"}, reconstructConnDict(conn2),
-		"replay onto the fresh connection must leave a gap-free dictionary")
+		"replay onto the new connection must leave every symbol registered")
 }
 
 // TestErrorApiResilience_LastTerminalErrorSurvivesClose latches a HALT,

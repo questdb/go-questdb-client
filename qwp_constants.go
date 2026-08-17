@@ -238,10 +238,10 @@ const (
 	// explicitly classifies as retriable-with-rotation on deployed
 	// client fleets.
 	QwpStatusNotWritable QwpStatusCode = 0x0C
-	// QwpStatusDictionaryGap means a delta symbol dictionary starts above
-	// the server's per-connection dictionary coverage. The verdict depends
-	// on connection state rather than the frame bytes, so recycling the wire,
-	// re-registering the dictionary, and replaying is safe.
+	// QwpStatusDictionaryGap means a frame's symbol-dictionary delta starts
+	// above the last symbol id this connection registered. The frame bytes
+	// are fine; only the connection is missing symbols. Reconnecting,
+	// re-sending the dictionary, and replaying fixes it.
 	QwpStatusDictionaryGap QwpStatusCode = 0x0D
 )
 
@@ -251,11 +251,14 @@ const (
 // unless marked Go-only. The Java analogue is noted on each constant so
 // the two clients can be kept in lockstep.
 const (
-	// qwpMaxSymbolDictionarySize mirrors the Java client's ingress limit for
-	// one sender-wide symbol dictionary (shared across every table and SYMBOL
-	// column). Refuse the next distinct value before assigning an id so a
-	// dictionary above the compatibility baseline cannot make reconnect
-	// catch-up fail forever and strand already-buffered SF frames.
+	// qwpMaxSymbolDictionarySize is the largest symbol dictionary a sender may
+	// build. The dictionary is sender-wide: every table and SYMBOL column
+	// shares it. Java: QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE.
+	//
+	// A distinct value beyond this limit is refused before it gets an id. A
+	// server built to the same limit would reject the reconnect catch-up frame
+	// for an oversized dictionary, and every buffered SF frame behind it would
+	// then be undeliverable.
 	qwpMaxSymbolDictionarySize = 1_000_000
 
 	// qwpDefaultAutoFlushInterval is the time trigger for auto-flush.

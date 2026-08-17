@@ -561,11 +561,11 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		return s
 	}
 
-	// Look up the global id before mutating either the row or the dictionary.
-	// The Java compatibility contract caps the sender-wide dictionary at one
-	// million entries (shared across tables and columns). Letting the producer
-	// allocate id 1,000,000 would make reconnect catch-up fail against that
-	// baseline and could strand an otherwise deliverable SF backlog.
+	// Look up the id first, and reject an over-limit new value before either
+	// the row or the dictionary changes. The dictionary is shared by all
+	// tables and columns and is capped at qwpMaxSymbolDictionarySize; handing
+	// out an id past that cap would make the reconnect catch-up frame
+	// unacceptable to the server and leave the buffered SF frames undeliverable.
 	id, ok := s.globalSymbols[val]
 	if !ok && len(s.globalSymbolList) >= qwpMaxSymbolDictionarySize {
 		s.lastErr = fmt.Errorf(
@@ -581,7 +581,7 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		return s
 	}
 
-	// Assign a dense global symbol ID only after every rejection point above.
+	// Assign the next global symbol id only once nothing above can fail.
 	if !ok {
 		id = int32(len(s.globalSymbolList))
 		s.globalSymbols[val] = id
@@ -1445,16 +1445,19 @@ func (s *qwpLineSender) resetAfterFlush() {
 	}
 }
 
-// reclaimUnsentSymbolIDs returns ids that belonged only to a batch discarded
-// before publication. Delta frames always start at maxSentSymbolId+1, so
-// retaining an abandoned suffix would make the next new-symbol batch encode it
-// again and potentially repeat the same over-cap rejection forever.
+// reclaimUnsentSymbolIDs gives back the ids that only a discarded batch ever
+// used, so the next batch can reuse them. Delta frames always start at
+// maxSentSymbolId+1, so keeping the ids of a batch that was never published
+// would make the next batch with new symbols re-encode them, and an id that
+// went over the dictionary cap would keep going over it on every retry.
 //
-// Reuse is safe only above both durable anchors: a published frame has bound
-// every id through maxSentSymbolId in the send-loop mirror, and an SF
-// write-ahead append may have persisted ids even when the following frame
-// publish failed. Full-dictionary mode is excluded because frames already on
-// the ring can independently bind the same ids.
+// An id may only be reused when nothing else can already name it, which means
+// staying above two marks. maxSentSymbolId covers ids a published frame has
+// already handed to the send-loop mirror. The persisted dictionary's size
+// covers ids written to the SF side-file, which happens before the frame is
+// published, so those exist even if the publish failed. Full-dictionary mode
+// reclaims nothing: every queued frame spells out its own dictionary, so an id
+// reused here would name a different string than one of those frames does.
 func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
 	if !s.deltaDictEnabled {
 		return
@@ -1472,9 +1475,11 @@ func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
 		return
 	}
 	s.globalSymbolList = s.globalSymbolList[:floor]
-	// Rebuild rather than deleting the discarded strings one by one. Recovery
-	// deliberately preserves duplicate positional entries; in that case the
-	// reverse map must keep the highest surviving id, matching Java.
+	// Rebuild the whole map instead of deleting the dropped strings one by
+	// one. Recovery keeps every position even when two of them hold the same
+	// string, and deleting by name would then remove an entry that is still
+	// in use. Rebuilding leaves each name pointing at its highest surviving
+	// id, which is what Java does.
 	if s.globalSymbols == nil {
 		s.globalSymbols = make(map[string]int32, len(s.globalSymbolList))
 	} else {

@@ -29,26 +29,27 @@ import (
 	"fmt"
 )
 
-// qwpSfRecoveredDictAnalysis is the engine-construction-time fold of every
-// surviving SF frame. symbols contains the persisted dictionary prefix followed
-// by the contiguous suffix the frames themselves still define. Both the
-// producer and the send loop seed from this exact slice so they cannot assign
-// different strings to the same recovered id.
+// qwpSfRecoveredDictAnalysis is what the engine constructor learns by reading
+// every surviving SF frame. symbols holds the side-file's trusted entries
+// followed by the further ids the frames themselves spell out. The producer and
+// the send loop both start from this one slice, so a recovered id cannot end up
+// with two different names.
 type qwpSfRecoveredDictAnalysis struct {
 	symbols             []string
 	maxReplayDeltaStart int
 }
 
-// qwpSfAnalyzeRecoveredDict reconstructs as much of a recovered slot's global
-// symbol dictionary as its surviving frames prove. The segment CRC scan has
-// already validated every payload; this pass validates the QWP delta structure
-// and folds only the previously-uncovered tail of each range.
+// qwpSfAnalyzeRecoveredDict rebuilds as much of a recovered slot's symbol
+// dictionary as the surviving frames can account for. The segment CRC scan has
+// already checked every payload, so this pass only checks the delta structure
+// and picks up the ids each frame adds beyond what is already known.
 //
-// A gap in a frame that will replay is unrecoverable: ids below deltaStart were
-// introduced by frames that have already been trimmed and no longer exist in
-// either the persisted prefix or the surviving log. A gap confined to already-
-// ACKed frames is harmless when no later replay frame depends on it; a later
-// self-sufficient delta starting at zero begins a new provable epoch.
+// A frame that still has to be sent and starts above the known ids is a dead
+// end: the ids below its start came from frames that were ACKed and trimmed
+// away, and neither the side-file nor the remaining frames hold them any more.
+// The same hole in an already-ACKed frame does no harm as long as no frame
+// waiting to be sent needs it, and a later frame that carries the dictionary
+// from id 0 starts the count over from something known to be complete.
 func qwpSfAnalyzeRecoveredDict(
 	ring *qwpSfSegmentRing,
 	ackedFsn int64,
@@ -79,9 +80,11 @@ func qwpSfAnalyzeRecoveredDict(
 		}
 
 		if gap {
-			// Only a self-sufficient frame can reset an already-ACKed gap.
-			// An unacked gapped frame still reaches the fresh server first, so
-			// a later reset cannot make that replay order safe.
+			// Only a frame carrying the dictionary from id 0 clears a hole,
+			// and only when the hole was in an already-ACKed frame. If a
+			// frame still waiting to be sent has the hole, it reaches the
+			// fresh server ahead of any such reset, so the reset cannot
+			// rescue it.
 			if deltaStart != 0 || gapAffectsReplay {
 				if fsn > ackedFsn {
 					gapAffectsReplay = true
@@ -105,10 +108,10 @@ func qwpSfAnalyzeRecoveredDict(
 			return nil
 		}
 
-		// Skip the overlap already supplied by the side-file or an earlier
-		// frame, then append the one contiguous unseen tail. The parser has
-		// validated the whole entry region, but keep the local checks so this
-		// fold remains fail-closed if that helper's contract changes.
+		// Step over the entries the side-file or an earlier frame already
+		// supplied, then take the ids this frame adds on top. qwpParseDeltaDict
+		// has already validated the whole entry region; the bounds checks here
+		// keep this loop safe on its own if that ever changes.
 		p := entries
 		for skip := coverage - deltaStart; skip > 0; skip-- {
 			entryLen, n, err := qwpReadVarint(p)
@@ -140,8 +143,9 @@ func qwpSfAnalyzeRecoveredDict(
 }
 
 // qwpSfWalkRecoveredFrames visits every CRC-validated frame in FSN order. It
-// runs before the ring is registered with the manager or exposed to a producer,
-// so direct access to the sealed list and active segment is race-free.
+// runs before the ring is registered with the manager or handed to a producer,
+// so reading the sealed list and the active segment directly cannot race with
+// anything.
 func qwpSfWalkRecoveredFrames(ring *qwpSfSegmentRing, visit func(fsn int64, payload []byte) error) error {
 	if ring == nil {
 		return nil

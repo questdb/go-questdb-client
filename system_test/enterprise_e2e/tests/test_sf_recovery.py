@@ -75,12 +75,12 @@ def _connect_string(http_port: int, sf_dir: Path, *, extra: str = "") -> str:
 def test_sender_kill9_sf_recovery_replays(
     server_factory, go_sidecar: GoSidecar, scenario_dir: Path, log_dir: Path
 ) -> None:
-    """SIGKILL the sender with a bare-symbol-ID frame still in SF.
+    """SIGKILL the sender while a frame that names no symbols is still in SF.
 
-    The seed frame registers the complete dictionary and is durably ACKed
-    before the replay frame is published. The restarted process therefore
-    has to recover the persisted dictionary and catch it up on its fresh
-    connection before replay; the data frame itself carries no symbol names.
+    The first flush registers the whole dictionary and is durably ACKed before
+    the second frame is published, so that second frame refers to symbol IDs by
+    number only. The restarted process therefore has to read the dictionary
+    back off disk and send it on its new connection before it can replay.
     """
     table = "go_trades_sender_kill"
     seed_rows = 16
@@ -113,9 +113,9 @@ def test_sender_kill9_sf_recovery_replays(
         f"expected a persisted symbol dictionary at {dict_file} after the seed flush"
     )
 
-    # Every symbol is already registered, so this frame's delta is empty. A
-    # fresh process/connection can decode it only by loading .symbol-dict and
-    # sending reconnect catch-up before replay.
+    # Every symbol is registered already, so this frame carries no symbol names
+    # at all. A new process on a new connection can only make sense of it after
+    # reading .symbol-dict and sending the dictionary ahead of the replay.
     go_sidecar.send(
         table,
         count=replay_rows,

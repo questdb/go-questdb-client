@@ -220,12 +220,12 @@ def test_graceful_demotion_mid_stream_sender_survives(
     # demote was replayed and must land exactly once.
     wait_for_dense_sequence(port=b_ports.pg, table=_TABLE,
                             expected_count=total, timeout_s=120.0)
-    # The initial batches registered every symbol ID and are below the durable
-    # ACK watermark before the demote. Every later row therefore references an
-    # existing ID without carrying its name. B can decode those rows only if
-    # reconnect catch-up rebuilt the dictionary on its fresh connection. Check
-    # every row so NULLs and a shifted-but-cardinality-preserving dictionary
-    # cannot hide behind the dense-v oracle above.
+    # The initial batches registered every symbol ID and were durably ACKed
+    # before the demote, so every row after them refers to an ID by number and
+    # never carries its name. B can only make sense of those rows if the client
+    # re-sent the dictionary on its new connection. Check every row: the dense-v
+    # check above would still pass with NULL tags, or with every tag shifted to
+    # a neighbouring ID.
     wait_for_symbol_mapping(
         port=b_ports.pg,
         table=_TABLE,

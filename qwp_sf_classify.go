@@ -73,7 +73,7 @@ func qwpSfDefaultPolicyFor(c Category) Policy {
 	switch c {
 	case CategoryWriteError, // transient server state (disk pressure, suspended table)
 		CategoryInternalError, // transient by definition; deterministic repeats poison-escalate
-		CategoryDictionaryGap, // connection state: catch up the dictionary and replay
+		CategoryDictionaryGap, // the connection is missing symbols: resend the dictionary and replay
 		CategoryUnknown:       // fail open: status byte from a newer server
 		return PolicyRetriable
 	case CategoryNotWritable: // read-only replica / demoting primary: rotate endpoints

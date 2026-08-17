@@ -115,22 +115,26 @@ type qwpSfCursorEngine struct {
 	// watermark, closed in engineClose. nil in disk mode disables delta
 	// encoding for the slot (the sender keeps full self-sufficient frames).
 	persistedSymbolDict *qwpSfSymbolDict
-	// recoveredSymbols is the complete positional dictionary proved by the
-	// persisted prefix plus surviving frames during engine construction. Both
-	// producer and send loop seed from this exact immutable slice. nil for a
-	// fresh slot and memory mode.
+	// recoveredSymbols is the symbol list, in id order, that the constructor
+	// rebuilt for a recovered slot: the side-file's trusted prefix followed by
+	// whatever the surviving frames themselves spell out. The producer and the
+	// send loop both start from this one slice and neither modifies it, so an
+	// id can never get two different names. nil for a fresh slot and in memory
+	// mode.
 	recoveredSymbols []string
-	// recoveredMaxReplayDeltaStart is the largest delta start among frames
-	// above the recovered ACK watermark. A positive value means replay depends
-	// on registrations that must be caught up on every fresh connection.
+	// recoveredMaxReplayDeltaStart is the highest delta start found among the
+	// frames still waiting to be sent. Anything above zero means those frames
+	// refer to symbols registered earlier, so a fresh connection has to be sent
+	// the dictionary before replay begins.
 	recoveredMaxReplayDeltaStart int
 
 	appendDeadline time.Duration
 
 	// recoveredFromDisk is true when the constructor recovered an
 	// existing on-disk slot rather than starting fresh. Diagnostic
-	// accessor for tests and observability. Cursor schemas remain
-	// self-sufficient; symbol ids instead resume from recoveredSymbols.
+	// accessor for tests and observability. Cursor frames carry their own
+	// schema, so nothing has to be restored for that; symbol ids do carry
+	// over, and they come from recoveredSymbols.
 	recoveredFromDisk bool
 
 	// backpressureStalls counts how many times appendBlocking
@@ -337,19 +341,21 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// delta frames can be re-registered on a fresh server before they
 			// replay. A recovered slot's dictionary is NEVER recreated: its
 			// segments reference the dictionary's ids by position, so truncating
-			// a corrupt/mismatched header would restart the id space and re-register
-			// the wrong names. Bad/legacy content is preserved but supplies no
-			// prefix; a checksummed torn suffix supplies only its trusted prefix,
-			// and transient I/O errors fail construction for a later retry.
+			// a corrupt/mismatched header would restart the ids at 0 and give
+			// them the wrong names. Content that cannot be trusted is left on
+			// disk and contributes nothing; a file whose tail is torn
+			// contributes the part its checksums cover. An I/O error fails
+			// construction so the caller can retry later.
 			persistedDict, err = qwpSfSymbolDictOpenRecovered(sfDir)
 			if err != nil {
 				return nil, err
 			}
-			// A missing/unusable dictionary disables new producer deltas, but the
-			// construction-time frame fold below may still prove and rebuild a
-			// contiguous recovered dictionary for replay. When the ring holds no
-			// frames there is nothing to alias against, so a fresh dictionary is
-			// safe and keeps delta encoding available.
+			// A missing or untrusted dictionary stops the producer from writing
+			// new delta frames, but the scan below may still rebuild the
+			// dictionary the waiting frames need out of the frames themselves.
+			// When the ring holds no frames there are no ids to clash with, so
+			// starting a fresh dictionary is safe and keeps delta encoding
+			// available.
 			if persistedDict == nil && ring.segmentRingPublishedFsn() < 0 {
 				persistedDict = qwpSfSymbolDictOpenFresh(filepath.Join(sfDir, qwpSfSymbolDictFileName))
 			}
@@ -374,11 +380,12 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 				ring.acknowledge(seed)
 			}
 
-			// Fold the surviving frames before either producer or send loop can
-			// observe the engine. A lost/torn side-file can still be recovered
-			// when the remaining frames define a contiguous dictionary sequence;
-			// both consumers must then seed from the same result so ids cannot be
-			// reused for different strings.
+			// Scan the surviving frames while the engine is still private to
+			// the constructor. When the side-file is missing or torn, the
+			// frames themselves can still spell out the dictionary, as long as
+			// they cover every id without a hole. Producer and send loop both
+			// start from this one result, so an id cannot end up naming two
+			// different strings.
 			prefix := []string(nil)
 			if persistedDict != nil {
 				prefix = persistedDict.loadedSymbols()
@@ -391,12 +398,13 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			recoveredSymbols = analysis.symbols
 			recoveredMaxStart = analysis.maxReplayDeltaStart
 
-			// A CRC-valid prefix may be shorter than the suffix surviving frames
-			// still carry. Heal it immediately, before those source frames can be
-			// ACKed and trimmed. If the side-file is no longer writable, degrade
-			// this session to full self-sufficient frames; the recovered in-memory
-			// dictionary still keeps ids stable and no referencing delta is
-			// published without durable coverage.
+			// The side-file may cover fewer ids than the frames do. Write the
+			// difference back now, while those frames are still around — once
+			// they are ACKed and trimmed, the only copy of those symbols is
+			// gone. If the side-file can no longer be written, run this session
+			// with full self-sufficient frames; the in-memory dictionary still
+			// holds the recovered ids, and no delta frame that depends on them
+			// gets published without a durable copy behind it.
 			if persistedDict != nil && len(recoveredSymbols) > persistedDict.size() {
 				from := persistedDict.size()
 				if appendErr := persistedDict.appendSymbols(recoveredSymbols[from:]); appendErr != nil {
@@ -540,17 +548,19 @@ func (e *qwpSfCursorEngine) enginePersistedSymbolDict() *qwpSfSymbolDict {
 	return e.persistedSymbolDict
 }
 
-// engineRecoveredSymbols returns the immutable positional dictionary rebuilt
-// during disk recovery from the side-file prefix plus surviving frame deltas.
-// nil for a fresh slot and memory mode. The send loop and foreground producer
-// both read it during construction, before either goroutine starts.
+// engineRecoveredSymbols returns the symbol list, in id order, that disk
+// recovery rebuilt from the side-file's trusted prefix plus the surviving
+// frames. nil for a fresh slot and in memory mode. The send loop and the
+// producer both read it while the sender is being built, before either
+// goroutine starts, and neither one modifies it.
 func (e *qwpSfCursorEngine) engineRecoveredSymbols() []string {
 	return e.recoveredSymbols
 }
 
-// engineRecoveredMaxReplayDeltaStart reports whether the unacked recovery
-// range contains a non-self-sufficient delta. A positive value requires a
-// dictionary catch-up on every fresh connection before replay.
+// engineRecoveredMaxReplayDeltaStart returns the highest delta start among the
+// recovered frames still waiting to be sent. Anything above zero means one of
+// them refers to symbols registered earlier, so every fresh connection must be
+// sent the dictionary before replay begins.
 func (e *qwpSfCursorEngine) engineRecoveredMaxReplayDeltaStart() int {
 	return e.recoveredMaxReplayDeltaStart
 }

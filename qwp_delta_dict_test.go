@@ -232,9 +232,9 @@ func TestQwpDeltaDictSeedFromPersisted(t *testing.T) {
 	defer pd.close()
 	require.Equal(t, []string{"a", "b", "c"}, pd.loadedSymbols())
 
-	// Seed the two recovered-dict consumers from the same positional snapshot,
-	// in the cursor sender's construction order: send-loop mirror first, then
-	// producer. Neither consumer may mutate the shared snapshot.
+	// Fill both users of the recovered dictionary from the same id-ordered
+	// list, in the order the cursor sender builds them: send-loop mirror first,
+	// then producer. Neither one may modify the list they share.
 	recovered := pd.loadedSymbols()
 	var l qwpSfSendLoop
 	l.seedSentDictFromSymbols(recovered)
@@ -344,16 +344,17 @@ func TestQwpDeltaDictTornDictSE(t *testing.T) {
 	require.Contains(t, se.ServerMessage, "resend required")
 }
 
-// TestQwpDeltaDictMirrorAccumulatesPartialOverlap covers a legal replay shape:
-// a frame may re-register ids below the mirror tip and extend beyond it. The
-// mirror must skip the covered prefix and retain the new tail for reconnect
-// catch-up; dropping the whole frame would leave the next connection short.
+// TestQwpDeltaDictMirrorAccumulatesPartialOverlap covers a shape replay is
+// allowed to produce: a frame that repeats ids the mirror already holds and
+// carries on past them. The mirror must skip the repeated ones and keep the new
+// ones for the next reconnect; ignoring the whole frame would leave the next
+// connection short.
 func TestQwpDeltaDictMirrorAccumulatesPartialOverlap(t *testing.T) {
 	var l qwpSfSendLoop
 	l.accumulateSentDict(buildTestDeltaFrame(0, []string{"a", "b"}))
 	require.Equal(t, 2, l.sentDictCount)
 
-	// id 1 overlaps with the held "b"; ids 2 and 3 are new.
+	// id 1 repeats the "b" the mirror already holds; ids 2 and 3 are new.
 	l.accumulateSentDict(buildTestDeltaFrame(1, []string{"b", "c", "d"}))
 	require.Equal(t, 4, l.sentDictCount)
 

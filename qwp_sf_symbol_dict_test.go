@@ -83,7 +83,7 @@ func TestQwpSfSymbolDictUsesJavaCompatibleChecksummedChunks(t *testing.T) {
 	stored := binary.LittleEndian.Uint32(buf[entriesEnd : entriesEnd+qwpSfSymbolDictCRCSize])
 	require.Equal(t, crc32.Checksum(buf[chunkStart:entriesEnd], qwpSfCrcTable), stored)
 	require.Equal(t, entriesEnd+qwpSfSymbolDictCRCSize, len(buf),
-		"one append must produce exactly one Java-format chunk")
+		"one append must produce exactly one chunk, in the Java client's format")
 }
 
 func TestQwpSfSymbolDictCRCRejectsCorruptChunkAndKeepsPrefix(t *testing.T) {
@@ -98,8 +98,9 @@ func TestQwpSfSymbolDictCRCRejectsCorruptChunkAndKeepsPrefix(t *testing.T) {
 	require.NoError(t, err)
 	firstEnd := qwpTestSymbolDictChunkEnd(t, buf, int(qwpSfSymbolDictHeaderSize))
 	secondEntries := qwpTestSymbolDictEntriesStart(t, buf, firstEnd)
-	// Skip the entry-length varint and corrupt one UTF-8 byte without updating
-	// the stored checksum. Length-only recovery would silently trust it.
+	// Step past the entry-length varint and change one UTF-8 byte, leaving the
+	// stored checksum as it was. A reader that only checked lengths would
+	// accept this without noticing.
 	_, adv, err := qwpReadVarint(buf[secondEntries:])
 	require.NoError(t, err)
 	buf[secondEntries+adv] ^= 0x20
@@ -130,16 +131,17 @@ func TestQwpSfSymbolDictRecoveredLegacyFormatIsUntrustedAndPreserved(t *testing.
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
 	require.NoError(t, err)
 	require.Nil(t, d,
-		"a checksum-free body is indistinguishable from a corrupt first chunk and must not seed ids")
+		"a body with no checksums looks just like a corrupt first chunk, so it must not supply ids")
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.Equal(t, buf, got, "recovery must preserve untrusted content for inspection or an older client")
+	require.Equal(t, buf, got, "recovery must keep the file so it can be inspected or read by an older client")
 }
 
-// TestQwpSfSymbolDictRecoveredEntryCountBounded pins the crafted-file
-// allocation guard: a CRC-valid chunk of empty-string entries amplifies ~16x
-// into string headers, so recovery must refuse an over-bound entry count
-// rather than parse it.
+// TestQwpSfSymbolDictRecoveredEntryCountBounded pins the limit that keeps a
+// hand-crafted file from making recovery allocate too much. A chunk of
+// empty-string entries passes its checksum and costs one byte each on disk, but
+// about 16 bytes each as Go strings, so recovery must reject an entry count
+// over the limit instead of parsing it.
 func TestQwpSfSymbolDictRecoveredEntryCountBounded(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
@@ -159,7 +161,7 @@ func TestQwpSfSymbolDictRecoveredEntryCountBounded(t *testing.T) {
 
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
 	require.NoError(t, err)
-	require.Nil(t, d, "over-bound entry count must fall back, not allocate")
+	require.Nil(t, d, "an entry count over the limit must be refused, not allocated")
 }
 
 func TestQwpSfSymbolDictOpenRecoveredAbsentReturnsNil(t *testing.T) {
@@ -204,10 +206,11 @@ func TestQwpSfSymbolDictOpenRecoveredValid(t *testing.T) {
 	require.NoError(t, re.close())
 }
 
-// TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack pins the Java-compatible
-// disposition: proven bad content disables delta for this recovery while the
-// file stays intact for forensics. The engine's frame fold separately decides
-// whether the surviving slot can be rebuilt safely.
+// TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack pins what happens to
+// damaged content, matching the Java client: this recovery goes without delta
+// encoding and the file is left on disk so it can be inspected. Whether the
+// slot can still be rebuilt is decided separately, by the engine's scan of the
+// surviving frames.
 func TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
@@ -224,8 +227,9 @@ func TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack(t *testing.T) {
 }
 
 // TestQwpSfSymbolDictVersionMismatch pins that an unknown version byte is
-// treated like bad magic: left intact with full-dict fallback on recovery, but
-// recreated on a fresh open where no segment can reference its ids.
+// treated like bad magic. On recovery the file is left alone and the slot runs
+// on full dictionaries; on a fresh open it is recreated, since no segment can
+// be referring to its ids.
 func TestQwpSfSymbolDictVersionMismatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
@@ -240,7 +244,7 @@ func TestQwpSfSymbolDictVersionMismatch(t *testing.T) {
 	require.Nil(t, recovered)
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.Equal(t, hdr, got, "recovery must leave the unknown-version file intact")
+	require.Equal(t, hdr, got, "recovery must leave a file with an unknown version alone")
 
 	d := qwpSfSymbolDictOpen(dir)
 	require.NotNil(t, d)
@@ -266,11 +270,11 @@ func TestQwpSfSymbolDictOversizedFileRejected(t *testing.T) {
 
 	recovered, err := qwpSfSymbolDictOpenRecovered(dir)
 	require.NoError(t, err)
-	require.Nil(t, recovered, "oversized content must fall back before the read")
+	require.Nil(t, recovered, "a file over the size limit must be refused before it is read")
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	require.Equal(t, int64(qwpSfSymbolDictMaxFileSize+1), info.Size(),
-		"recovery must not truncate an oversized forensic artifact")
+		"recovery must not truncate an oversized file it refused to read")
 }
 
 func TestQwpSfSymbolDictBadMagicRecreatedEmpty(t *testing.T) {
@@ -321,10 +325,11 @@ func TestQwpSfSymbolDictTornTrailingEntrySelfHeals(t *testing.T) {
 	cleanInfo, err := os.Stat(filepath.Join(dir, qwpSfSymbolDictFileName))
 	require.NoError(t, err)
 
-	// Append a torn trailing record. Its suffix deliberately forms a valid
-	// one-byte entry if a later, shorter append only overwrites the leading 5:
-	// [5, 1, 'G'] -> append empty [0] -> [0, 1, 'G']. Without truncating at
-	// reopen, the following recovery invents a ghost symbol "G".
+	// Append a torn trailing record, chosen so that its tail turns into a valid
+	// one-byte entry if a later, shorter append overwrites only the leading 5:
+	// [5, 1, 'G'] with an empty symbol [0] written over the 5 becomes
+	// [0, 1, 'G']. Unless reopen truncates first, the next recovery reads a
+	// symbol "G" that was never written.
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
 	require.NoError(t, err)
@@ -338,8 +343,8 @@ func TestQwpSfSymbolDictTornTrailingEntrySelfHeals(t *testing.T) {
 	trimmedInfo, err := os.Stat(path)
 	require.NoError(t, err)
 	require.Equal(t, cleanInfo.Size(), trimmedInfo.Size(), "reopen must truncate the torn tail")
-	// An empty symbol is shorter than the torn record and exposes stale residue
-	// unless reopen truncated first.
+	// An empty symbol is shorter than the torn record, so it leaves the old
+	// bytes behind unless reopen truncated first.
 	require.NoError(t, re.appendSymbols([]string{""}))
 	require.NoError(t, re.close())
 

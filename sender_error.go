@@ -103,12 +103,11 @@ const (
 	// 404/426 upgrade rejection / durable-ack capability mismatch.
 	// Forced TERMINAL.
 	CategoryProtocolViolation
-	// CategoryDictionaryGap: a delta symbol dictionary began above the
-	// server's per-connection dictionary coverage. Wire status 0x0D. This
-	// depends on server connection state, not on the frame bytes, so the
-	// connection is recycled and the dictionary is caught up before replay.
-	// Appended after the client-originated category to preserve the numeric
-	// values of the existing public Category constants.
+	// CategoryDictionaryGap: a frame's symbol-dictionary delta started above
+	// the last symbol id this connection registered. Wire status 0x0D. The
+	// frame bytes are fine; only the connection is missing symbols, so the
+	// client reconnects, sends the dictionary, and replays. Listed last so the
+	// existing public Category constants keep their numeric values.
 	CategoryDictionaryGap
 
 	numCategories // sentinel: must be last

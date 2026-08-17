@@ -312,8 +312,8 @@ func TestQwpSenderSymbolDictionary(t *testing.T) {
 	s := newQwpSenderForTest(t, srv.URL)
 	defer s.Close(context.Background())
 
-	// The dictionary is sender-wide: values registered through different
-	// SYMBOL columns and tables share one dense id space.
+	// One dictionary serves the whole sender: values added through different
+	// SYMBOL columns and different tables all draw from the same id space.
 	s.Table("table_a").
 		Symbol("sym_a", "AAPL").
 		Symbol("sym_b", "MSFT").
@@ -431,25 +431,25 @@ func TestQwpSenderSymbolValueAtLimit(t *testing.T) {
 	}
 }
 
-// TestQwpSenderSymbolDictionaryLimit pins the Java-compatible, sender-wide
-// one-million-entry dictionary cap. The first over-cap distinct value is
-// rejected before it receives an id or mutates the row, while an already-
-// registered value remains usable at the limit.
+// TestQwpSenderSymbolDictionaryLimit pins the one-million-entry limit on the
+// sender-wide dictionary, matching the Java client. The first new value past
+// the limit is rejected before it gets an id or changes the row, while a value
+// already in the dictionary still works once the limit is reached.
 func TestQwpSenderSymbolDictionaryLimit(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
 	s := newQwpSenderForTest(t, srv.URL)
 	defer s.Close(context.Background())
 
-	// Keep the fixture cheap: only the slice length participates in the cap;
-	// the existing value at id 0 is the sole entry this test writes on wire.
+	// Only the slice length matters for the limit, so leave the entries empty
+	// rather than filling a million strings. The value at id 0 is the only one
+	// this test actually sends.
 	s.globalSymbolList = make([]string, qwpMaxSymbolDictionarySize)
 	s.globalSymbolList[0] = "known"
 	s.globalSymbols["known"] = 0
-	// Model a dictionary whose full range has already been published. The
-	// fixture leaves the middle strings empty to keep setup cheap, so pinning
-	// the watermark also prevents resetAfterFlush from correctly reclaiming
-	// that artificial unused suffix.
+	// Act as if every id has already been sent. That is also what stops
+	// resetAfterFlush from reclaiming the empty entries above, which it would
+	// otherwise be right to do — they are an artifact of the cheap setup.
 	s.maxSentSymbolId = qwpMaxSymbolDictionarySize - 1
 	s.batchMaxSymbolId = s.maxSentSymbolId
 	s.cursorSendLoop.sentDictCount = qwpMaxSymbolDictionarySize
@@ -468,9 +468,10 @@ func TestQwpSenderSymbolDictionaryLimit(t *testing.T) {
 		t.Fatal("over-cap symbol received an id")
 	}
 
-	// The row error was drained by AtNow. Reusing an existing id from another
-	// table and SYMBOL column at the exact cap remains valid, proving both the
-	// limit and the lookup are sender-global rather than per table/column.
+	// AtNow already returned the row error. Using an existing value from a
+	// different table and SYMBOL column still works at the limit, which shows
+	// that both the limit and the lookup span the sender rather than one table
+	// or column.
 	if err := s.Table("table_b").
 		Symbol("sym_b", "known").
 		Int64Column("v", 2).
@@ -544,8 +545,9 @@ func TestQwpSenderReclaimsOnlyUnpublishedSymbolIDs(t *testing.T) {
 		}
 	})
 
-	// Full-dict frames on the ring bind ids independently, so reclaim must
-	// not run: reusing a trimmed id would desync the send-loop mirror.
+	// Full-dictionary frames already queued define their own ids, so nothing
+	// may be reclaimed here: a reused id would no longer match what the
+	// send-loop mirror holds.
 	t.Run("full_dict_retains", func(t *testing.T) {
 		s := &qwpLineSender{
 			globalSymbols: map[string]int32{
