@@ -30,6 +30,7 @@ import pytest
 from lib.pg_query import execute_ddl, wait_for_dense_sequence
 
 from go_sidecar import GoSidecar
+from symbol_oracle import wait_for_symbol_mapping
 
 LOG = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ pytestmark = [pytest.mark.go_client]
 
 # Go slot dir for sender_id=primary: <sf_dir>/<sender_id> (no -0 level).
 _SENDER_ID = "primary"
+_SYMBOL_CARDINALITY = 8
 
 
 def _dedup_ddl(table: str) -> str:
@@ -46,6 +48,7 @@ def _dedup_ddl(table: str) -> str:
     # sender crash (request_durable_ack prevents loss, not duplicates).
     return (
         f'CREATE TABLE "{table}" ('
+        "tag SYMBOL, "
         "v LONG, "
         "timestamp TIMESTAMP"
         ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
@@ -72,12 +75,17 @@ def _connect_string(http_port: int, sf_dir: Path, *, extra: str = "") -> str:
 def test_sender_kill9_sf_recovery_replays(
     server_factory, go_sidecar: GoSidecar, scenario_dir: Path, log_dir: Path
 ) -> None:
-    """SIGKILL the sender mid-flight, then bring up a fresh sender on the
-    same slot. The new process must recover the on-disk SF segments and
-    replay them to the still-alive primary; DEDUP collapses any frames the
-    first sender already delivered."""
+    """SIGKILL the sender while a frame that names no symbols is still in SF.
+
+    The first flush registers the whole dictionary and is durably ACKed before
+    the second frame is published, so that second frame refers to symbol IDs by
+    number only. The restarted process therefore has to read the dictionary
+    back off disk and send it on its new connection before it can replay.
+    """
     table = "go_trades_sender_kill"
-    row_count = 100
+    seed_rows = 16
+    replay_rows = 100
+    row_count = seed_rows + replay_rows
     sf_dir = scenario_dir / "sf"
 
     p1 = server_factory("p1")
@@ -86,12 +94,43 @@ def test_sender_kill9_sf_recovery_replays(
 
     cs = _connect_string(p1_ports.http, sf_dir)
     go_sidecar.connect(cs)
-    go_sidecar.send(table, count=row_count, start_index=0)
+    go_sidecar.send(
+        table,
+        count=seed_rows,
+        start_index=0,
+        symbol_cardinality=_SYMBOL_CARDINALITY,
+    )
+    seed_fsn = go_sidecar.flush()
+    assert go_sidecar.await_acked(seed_fsn, 60_000), (
+        f"seed dictionary frame was not durably acked [publishedFsn={seed_fsn}]"
+    )
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=seed_rows, timeout_s=60.0)
+
+    slot_dir = sf_dir / _SENDER_ID
+    dict_file = slot_dir / ".symbol-dict"
+    assert dict_file.is_file() and dict_file.stat().st_size > 0, (
+        f"expected a persisted symbol dictionary at {dict_file} after the seed flush"
+    )
+
+    # Every symbol is registered already, so this frame carries no symbol names
+    # at all. A new process on a new connection can only make sense of it after
+    # reading .symbol-dict and sending the dictionary ahead of the replay.
+    go_sidecar.send(
+        table,
+        count=replay_rows,
+        start_index=seed_rows,
+        symbol_cardinality=_SYMBOL_CARDINALITY,
+    )
     flushed_fsn = go_sidecar.flush()
-    LOG.info("first sender flushed up to fsn=%d before SIGKILL", flushed_fsn)
-    # Small settle so some frames have left the wire and P1 has OK'd them —
-    # the more interesting recovery path (warm cursor) than a cold replay.
-    time.sleep(0.5)
+    assert flushed_fsn > seed_fsn
+    LOG.info("seed fsn=%d acked; bare-ID replay frame fsn=%d published before SIGKILL",
+             seed_fsn, flushed_fsn)
+    pre_kill = go_sidecar.stats()
+    assert pre_kill.acked < flushed_fsn, (
+        f"bare-ID frame was already durably acked before SIGKILL "
+        f"[acked={pre_kill.acked}, published={flushed_fsn}]; recovery path not exercised"
+    )
 
     go_sidecar.kill_9()
     assert go_sidecar.process is not None
@@ -99,7 +138,6 @@ def test_sender_kill9_sf_recovery_replays(
 
     # Sanity: the slot dir should still hold .sfa segments, else the test
     # isn't exercising recovery. Go slot dir is <sf_dir>/<sender_id>.
-    slot_dir = sf_dir / _SENDER_ID
     sfa_files = list(slot_dir.glob("sf-*.sfa")) if slot_dir.exists() else []
     assert sfa_files, (
         f"expected un-trimmed .sfa segments in {slot_dir} after SIGKILL; "
@@ -108,6 +146,9 @@ def test_sender_kill9_sf_recovery_replays(
     )
     LOG.info("recovery surface: %d .sfa file(s) survived SIGKILL in %s",
              len(sfa_files), slot_dir)
+    assert dict_file.is_file() and dict_file.stat().st_size > 0, (
+        f"persisted dictionary disappeared across SIGKILL: {dict_file}"
+    )
 
     sidecar2 = GoSidecar(log_dir=log_dir, name="go-sidecar-restart")
     sidecar2.start()
@@ -117,6 +158,13 @@ def test_sender_kill9_sf_recovery_replays(
         # cursor, reconnects to P1, and replays every recovered frame.
         wait_for_dense_sequence(port=p1_ports.pg, table=table,
                                 expected_count=row_count, timeout_s=60.0)
+        wait_for_symbol_mapping(
+            port=p1_ports.pg,
+            table=table,
+            expected_count=row_count,
+            symbol_cardinality=_SYMBOL_CARDINALITY,
+            timeout_s=60.0,
+        )
     finally:
         sidecar2.stop()
 
@@ -126,7 +174,7 @@ def test_sender_repeated_sigkill_no_state_corruption(
 ) -> None:
     """Multi-cycle SIGKILL torture. Kill-and-restart the sender N times
     against the same primary and slot; the on-disk slot state must stay
-    consistent through every recovery. ``sf_max_bytes`` forces frequent
+    consistent through every recovery. ``sf_max_segment_bytes`` forces frequent
     rotation so each cycle leaves multiple sealed segments behind, and the
     final dense oracle checks the union [0..N) across all cycles."""
     table = "go_trades_multi_cycle"
@@ -143,7 +191,7 @@ def test_sender_repeated_sigkill_no_state_corruption(
     p1_ports = p1.start()
     execute_ddl(port=p1_ports.pg, ddl=_dedup_ddl(table))
 
-    cs = _connect_string(p1_ports.http, sf_dir, extra="sf_max_bytes=8192;")
+    cs = _connect_string(p1_ports.http, sf_dir, extra="sf_max_segment_bytes=8192;")
 
     fixture_consumed = False
     for cycle in range(cycles):
@@ -204,7 +252,7 @@ def test_partial_ack_sealed_segment_replay_dedup_collapses(
     p1_ports = p1.start()
     execute_ddl(port=p1_ports.pg, ddl=_dedup_ddl(table))
 
-    cs = _connect_string(p1_ports.http, sf_dir, extra="sf_max_bytes=32768;")
+    cs = _connect_string(p1_ports.http, sf_dir, extra="sf_max_segment_bytes=32768;")
     go_sidecar.connect(cs)
     # Many smaller flushes -> many frames -> exercise the
     # multiple-frames-per-segment path that makes partial-ack possible.

@@ -57,7 +57,8 @@ import (
 
 // Category classifies a QWP server-side rejection. Categories align 1:1
 // with stable wire status bytes (SchemaMismatch / ParseError /
-// InternalError / SecurityError / WriteError / NotWritable) plus
+// InternalError / SecurityError / WriteError / NotWritable /
+// DictionaryGap) plus
 // ProtocolViolation (client-latched, no wire status byte: poison-frame
 // escalation, 404/426 upgrade rejection, durable-ack capability
 // mismatch) and Unknown (forward-compat for new server status bytes).
@@ -102,6 +103,12 @@ const (
 	// 404/426 upgrade rejection / durable-ack capability mismatch.
 	// Forced TERMINAL.
 	CategoryProtocolViolation
+	// CategoryDictionaryGap: a frame's symbol-dictionary delta started above
+	// the last symbol id this connection registered. Wire status 0x0D. The
+	// frame bytes are fine; only the connection is missing symbols, so the
+	// client reconnects, sends the dictionary, and replays. Listed last so the
+	// existing public Category constants keep their numeric values.
+	CategoryDictionaryGap
 
 	numCategories // sentinel: must be last
 )
@@ -126,6 +133,8 @@ func (c Category) String() string {
 		return "NOT_WRITABLE"
 	case CategoryProtocolViolation:
 		return "PROTOCOL_VIOLATION"
+	case CategoryDictionaryGap:
+		return "DICTIONARY_GAP"
 	default:
 		return fmt.Sprintf("Category(%d)", byte(c))
 	}

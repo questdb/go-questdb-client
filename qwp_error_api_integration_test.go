@@ -49,6 +49,7 @@ func TestErrorApiPerCategory(t *testing.T) {
 		{"SecurityError", QwpStatusSecurityError, CategorySecurityError, PolicyTerminal, false},
 		{"WriteError", QwpStatusWriteError, CategoryWriteError, PolicyRetriable, true},
 		{"NotWritable", QwpStatusNotWritable, CategoryNotWritable, PolicyRetriableOther, true},
+		{"DictionaryGap", QwpStatusDictionaryGap, CategoryDictionaryGap, PolicyRetriable, true},
 		// Fail open: a status byte from a newer server degrades to retry.
 		{"Unknown(0xFE)", QwpStatusCode(0xFE), CategoryUnknown, PolicyRetriable, true},
 	}

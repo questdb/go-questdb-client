@@ -71,6 +71,7 @@ func TestQwpPersistNewSymbolsNoDuplicateOnRetry(t *testing.T) {
 		globalSymbolList:    []string{"AAPL", "GOOG", "MSFT"},
 		batchMaxSymbolId:    2,
 		maxSentSymbolId:     -1,
+		deltaDictEnabled:    true,
 	}
 
 	require.NoError(t, s.persistNewSymbols())
@@ -87,16 +88,97 @@ func TestQwpPersistNewSymbolsNoDuplicateOnRetry(t *testing.T) {
 	require.NoError(t, re.close())
 }
 
-// TestQwpEngineRecoveryMissingDictDisablesDelta pins C1a/C1d: a slot recovered
-// with published frames but no side-file falls back to full self-sufficient
-// frames (delta disabled) rather than enabling delta over an empty dictionary
-// and aliasing the recovered ids.
-func TestQwpEngineRecoveryMissingDictDisablesDelta(t *testing.T) {
+func TestQwpPersistFailureDisablesProducerDeltaForRetry(t *testing.T) {
+	d := qwpSfSymbolDictOpen(t.TempDir())
+	require.NotNil(t, d)
+	// Close the underlying file but keep the dictionary object in use, so the
+	// next write fails the way a disk problem mid-run would.
+	require.NoError(t, d.file.Close())
+	s := &qwpLineSender{
+		persistedSymbolDict: d,
+		globalSymbolList:    []string{"AAPL"},
+		batchMaxSymbolId:    0,
+		maxSentSymbolId:     -1,
+		deltaDictEnabled:    true,
+	}
+
+	err := s.persistNewSymbols()
+	require.ErrorContains(t, err, "switched to full-dictionary mode")
+	require.False(t, s.deltaDictEnabled)
+	require.Equal(t, 0, d.size(), "failed write must not advance the durable id count")
+	// The caller still holds the rows. Its retry must skip the broken
+	// side-file and encode a self-sufficient frame instead of failing again.
+	require.NoError(t, s.persistNewSymbols())
+	_ = d.close()
+}
+
+// TestQwpSplitPersistFailureRetainsBatchForFullDictRetry pins what happens
+// when writing the symbols to the side-file fails on the per-table split path.
+// The write fails on the split's first frame, the flush reports the switch to
+// full-dictionary mode, and the WHOLE batch stays with the caller. The retry
+// splits again, this time with self-sufficient frames, and every row reaches
+// the server with no missing ids in its dictionary.
+func TestQwpSplitPersistFailureRetainsBatchForFullDictRetry(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{recordFrames: true})
+	defer srv.Close()
+
+	slot := filepath.Join(t.TempDir(), "slot0")
+	engine, err := qwpSfNewCursorEngine(slot, 1<<16, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Millisecond, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+	s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 5*time.Second)
+	require.NoError(t, err)
+	defer func() { _ = s.Close(context.Background()) }()
+	require.True(t, s.deltaDictEnabled, "SF with an open side-file must delta-encode")
+	require.NotNil(t, s.persistedSymbolDict)
+
+	ctx := context.Background()
+	require.NoError(t, s.Table("t1").Symbol("sym", "AAA").Int64Column("v", 1).AtNow(ctx))
+	require.NoError(t, s.Table("t2").Symbol("sym", "BBB").Int64Column("v", 2).AtNow(ctx))
+	// The combined two-table frame overruns the cap so the flush takes
+	// enqueueCursorSplit; each single-table frame fits on its own.
+	s.serverMaxBatchSize.Store(60)
+	// Close the side-file's underlying file but keep the dictionary object in
+	// use, so writing its symbols fails before any frame is appended.
+	require.NoError(t, s.persistedSymbolDict.file.Close())
+
+	err = s.Flush(ctx)
+	require.ErrorContains(t, err, "switched to full-dictionary mode")
+	require.False(t, s.deltaDictEnabled)
+	require.Equal(t, 2, s.pendingRowCount, "the failed split must retain the whole batch")
+
+	require.NoError(t, s.Flush(ctx))
+	require.Equal(t, 0, s.pendingRowCount)
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
+	}, 3*time.Second, 5*time.Millisecond, "retried split frames did not drain")
+
+	conn1 := srv.recordedFrames()[1]
+	require.Len(t, conn1, 2, "retry must re-split into one frame per table")
+	require.Equal(t, []string{"AAA", "BBB"}, reconstructConnDict(conn1),
+		"full-dict retry frames must rebuild a gap-free dictionary")
+}
+
+// TestQwpEngineRecoveryMissingDictDisablesProducerDeltaButReplaysContiguousFrames
+// pins that what the producer may write and what the send loop must track are
+// two separate things. A missing side-file stops NEW delta frames, but the send
+// loop still mirrors a recovered run of delta frames that starts at id 0 and
+// has no holes. If the mirror followed the producer's mode instead, it would
+// stay empty and the second frame would be rejected as torn.
+func TestQwpEngineRecoveryMissingDictDisablesProducerDeltaButReplaysContiguousFrames(t *testing.T) {
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
-	// Append (but never ack) a frame so the segments survive as a recovery.
+	// Append (but never ack) two delta frames that between them cover ids 0
+	// and 1 with no hole, so the segments are left behind for recovery.
 	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(0, []string{"AAPL"}))
+	require.NoError(t, err)
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(1, []string{"MSFT"}))
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, engine.enginePublishedFsn(), int64(0))
 	require.NoError(t, engine.engineClose())
@@ -109,13 +191,139 @@ func TestQwpEngineRecoveryMissingDictDisablesDelta(t *testing.T) {
 	defer func() { _ = re.engineClose() }()
 	require.True(t, re.engineWasRecoveredFromDisk())
 	require.False(t, re.engineDeltaDictEnabled(),
-		"recovered frames with no dictionary must fall back to full-dict mode")
+		"new producer frames must fall back to full-dict mode")
+	require.Equal(t, []string{"AAPL", "MSFT"}, re.engineRecoveredSymbols(),
+		"surviving frames must rebuild the producer dictionary in id order")
+	producer := &qwpLineSender{
+		globalSymbols:       make(map[string]int32),
+		maxSentSymbolId:     -1,
+		batchMaxSymbolId:    -1,
+		tableBuffers:        make(map[string]*qwpTableBuffer),
+		deltaDictEnabled:    true, // wireDeltaDict overwrites this
+		persistedSymbolDict: nil,
+	}
+	producer.wireDeltaDict(re)
+	require.Equal(t, int32(0), producer.globalSymbols["AAPL"])
+	require.Equal(t, int32(1), producer.globalSymbols["MSFT"])
+	require.Equal(t, 1, producer.maxSentSymbolId,
+		"new ids must carry on above the recovered ones, not restart at 0")
+
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(re, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Millisecond, time.Millisecond, 10*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	require.Eventually(t, func() bool {
+		return re.engineAckedFsn() >= re.enginePublishedFsn()
+	}, 5*time.Second, time.Millisecond, "contiguous recovered deltas did not drain")
+	require.NoError(t, loop.sendLoopCheckError())
+	// Wait for the loop to stop before reading fields its I/O goroutine owns.
+	require.NoError(t, loop.sendLoopClose())
+	require.Equal(t, 2, loop.sentDictCount)
+	require.True(t, loop.hasReplayDictionaryDependency,
+		"a recovered slot with no side-file must still send the dictionary on reconnect")
 }
 
-// TestQwpEngineRecoveryCorruptDictFailsLoud pins C1c: a recovered slot with a
-// corrupt side-file fails the engine open (a sanctioned terminal) rather than
-// truncating the dictionary and restarting the id space.
-func TestQwpEngineRecoveryCorruptDictFailsLoud(t *testing.T) {
+func TestQwpEngineRecoveryHealsChecksummedDictFromSurvivingFrames(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	pd := engine.enginePersistedSymbolDict()
+	require.NotNil(t, pd)
+	require.NoError(t, pd.appendSymbols([]string{"AAPL"}))
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(0, []string{"AAPL"}))
+	require.NoError(t, err)
+	require.NoError(t, pd.appendSymbols([]string{"MSFT"}))
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(1, []string{"MSFT"}))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+
+	// Corrupt the second chunk's contents so its checksum no longer matches.
+	// Open then keeps only the first chunk, and recovery reads id 1 back out of
+	// frame 1 and writes it to the side-file before replay.
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	buf, err := os.ReadFile(path)
+	require.NoError(t, err)
+	firstEnd := qwpTestSymbolDictChunkEnd(t, buf, int(qwpSfSymbolDictHeaderSize))
+	secondEntries := qwpTestSymbolDictEntriesStart(t, buf, firstEnd)
+	_, adv, err := qwpReadVarint(buf[secondEntries:])
+	require.NoError(t, err)
+	buf[secondEntries+adv] ^= 0x20
+	require.NoError(t, os.WriteFile(path, buf, 0o644))
+
+	recovered, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	require.Equal(t, []string{"AAPL", "MSFT"}, recovered.engineRecoveredSymbols())
+	require.True(t, recovered.engineDeltaDictEnabled())
+	require.Equal(t, 2, recovered.enginePersistedSymbolDict().size(),
+		"the ids recovered from frames must be written back before those frames are trimmed")
+	require.NoError(t, recovered.engineClose())
+
+	reopened := qwpSfSymbolDictOpen(dir)
+	require.NotNil(t, reopened)
+	require.Equal(t, []string{"AAPL", "MSFT"}, reopened.loadedSymbols())
+	require.NoError(t, reopened.close())
+}
+
+// TestQwpAnalyzeRecoveredDictAckedGapReset pins both outcomes of a hole in the
+// recovered dictionary. A hole in a frame that is already acked is cleared by a
+// later frame that carries the dictionary from id 0. The same hole in a frame
+// still waiting to be sent is fatal, because that frame goes out first and
+// nothing later can undo the order.
+func TestQwpAnalyzeRecoveredDictAckedGapReset(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	// fsn 0 leaves a hole: it starts at id 5 with nothing known yet. fsn 1
+	// starts over from id 0, and fsn 2 continues straight on from it.
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(5, []string{"X"}))
+	require.NoError(t, err)
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(0, []string{"A"}))
+	require.NoError(t, err)
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(1, []string{"B"}))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+
+	ring, err := qwpSfOpenRing(dir, 4096)
+	require.NoError(t, err)
+	defer func() { _ = ring.segmentRingClose() }()
+
+	// With the holed frame acked, the restart at fsn 1 covers everything that
+	// still has to be sent.
+	analysis, err := qwpSfAnalyzeRecoveredDict(ring, 0, nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"A", "B"}, analysis.symbols)
+	require.Equal(t, 1, analysis.maxReplayDeltaStart)
+
+	// Same frames, none acked: the holed frame is replayed first, so the
+	// restart that follows it comes too late.
+	_, err = qwpSfAnalyzeRecoveredDict(ring, -1, nil)
+	require.ErrorContains(t, err, "resend required")
+}
+
+func TestQwpEngineRecoveryMissingDictRejectsUnackedGap(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(2, []string{"X"}))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+	require.NoError(t, os.Remove(filepath.Join(dir, qwpSfSymbolDictFileName)))
+
+	recovered, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.ErrorContains(t, err, "resend required")
+	require.Nil(t, recovered)
+}
+
+// TestQwpEngineRecoveryCorruptDictFallsBackToSurvivingFrames pins the two
+// halves of how a damaged side-file is handled: the bad content stays on disk
+// so it can be inspected, and the slot still opens as long as the surviving
+// frames rebuild the dictionary on their own.
+func TestQwpEngineRecoveryCorruptDictFallsBackToSurvivingFrames(t *testing.T) {
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
@@ -128,8 +336,11 @@ func TestQwpEngineRecoveryCorruptDictFailsLoud(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte{9, 9, 9, 9, 9, 9, 9, 9, 1, 'x'}, 0o644))
 
 	re, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
-	require.Error(t, err, "corrupt dictionary on a recovered slot must fail the open")
-	require.Nil(t, re)
+	require.NoError(t, err)
+	require.NotNil(t, re)
+	require.False(t, re.engineDeltaDictEnabled())
+	require.Equal(t, []string{"AAPL"}, re.engineRecoveredSymbols())
+	require.NoError(t, re.engineClose())
 
 	got, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
@@ -178,10 +389,11 @@ func TestQwpSendLoopTornDictGuardGap(t *testing.T) {
 	assert.GreaterOrEqual(t, loop.sendLoopTotalServerErrors(), int64(1))
 }
 
-// TestQwpSendLoopTornDictGuardPartialOverlap pins the guard fires on a partial
-// overlap — a frame that starts inside the mirror but extends past its tip —
-// which the exact-tip accumulate would otherwise silently drop.
-func TestQwpSendLoopTornDictGuardPartialOverlap(t *testing.T) {
+// TestQwpSendLoopPartialOverlapExtendsMirror pins that a frame repeating ids
+// the mirror already holds is sent, and that only the ids beyond them are added
+// to the mirror. Rejecting such a frame as torn, or ignoring it in
+// accumulateSentDict, would leave the next connection without those extra ids.
+func TestQwpSendLoopPartialOverlapExtendsMirror(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
@@ -200,11 +412,20 @@ func TestQwpSendLoopTornDictGuardPartialOverlap(t *testing.T) {
 	// First frame extends the mirror to count 2.
 	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(0, []string{"A", "B"}))
 	require.NoError(t, err)
-	// Second frame starts at 1 (inside) but runs to 4 (past the tip): torn.
-	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(1, []string{"C", "D", "E"}))
+	// The second frame covers ids 1 through 3. Id 1 repeats what the mirror
+	// already has; ids 2 and 3 are new.
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(1, []string{"B", "C", "D"}))
 	require.NoError(t, err)
 
-	requireTornDictTerminal(t, loop)
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
+	}, 5*time.Second, time.Millisecond, "partial-overlap frame did not drain")
+	require.NoError(t, loop.sendLoopCheckError())
+	require.NoError(t, loop.sendLoopClose())
+	require.Equal(t, 4, loop.sentDictCount)
+	catchUp := loop.buildCatchUpFrame(0, loop.sentDictCount, loop.sentDictBytes)
+	require.Equal(t, []string{"A", "B", "C", "D"},
+		reconstructConnDict([]string{string(catchUp)}))
 }
 
 func requireTornDictTerminal(t *testing.T, loop *qwpSfSendLoop) {

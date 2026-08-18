@@ -55,11 +55,21 @@ func TestQwpStatusCodes(t *testing.T) {
 		{QwpStatusWriteError, 0x09},
 		{qwpStatusCancelled, 0x0A},
 		{qwpStatusLimitExceeded, 0x0B},
+		{QwpStatusNotWritable, 0x0C},
+		{QwpStatusDictionaryGap, 0x0D},
 	}
 	for _, c := range cases {
 		if byte(c.code) != c.want {
 			t.Errorf("status 0x%02X, want 0x%02X", byte(c.code), c.want)
 		}
+	}
+}
+
+func TestQwpSymbolDictionarySizeMatchesJavaClient(t *testing.T) {
+	// Must equal Java's QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE: a Go sender
+	// must not hand out an id that a server built to the Java limit rejects.
+	if qwpMaxSymbolDictionarySize != 1_000_000 {
+		t.Fatalf("symbol dictionary cap = %d, want 1000000", qwpMaxSymbolDictionarySize)
 	}
 }
 

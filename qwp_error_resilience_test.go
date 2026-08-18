@@ -692,6 +692,7 @@ func TestErrorApiPerCategoryStrict(t *testing.T) {
 		{"SecurityError", QwpStatusSecurityError, CategorySecurityError, PolicyTerminal, false},
 		{"WriteError", QwpStatusWriteError, CategoryWriteError, PolicyRetriable, true},
 		{"NotWritable", QwpStatusNotWritable, CategoryNotWritable, PolicyRetriableOther, true},
+		{"DictionaryGap", QwpStatusDictionaryGap, CategoryDictionaryGap, PolicyRetriable, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -750,6 +751,54 @@ func TestErrorApiPerCategoryStrict(t *testing.T) {
 			assert.Contains(t, s2, "rejected")
 		})
 	}
+}
+
+// TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay pins what
+// DICTIONARY_GAP does to a frame carrying symbols: the NACK makes the client
+// reconnect, send the dictionary on the new connection in a table-less
+// catch-up frame, and replay. The batch lands with every symbol present, no
+// rows dropped and the sender still running.
+func TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		recordFrames:       true,
+		rejectStatus:       QwpStatusDictionaryGap,
+		rejectFirstNFrames: 1,
+	})
+	defer srv.Close()
+
+	s, engine, loop, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+	require.True(t, s.deltaDictEnabled, "memory mode must delta-encode")
+
+	gotCh := make(chan *SenderError, 4)
+	loop.sendLoopSetErrorHandler(func(e *SenderError) {
+		select {
+		case gotCh <- e:
+		default:
+		}
+	}, qwpSfMinErrorInboxCapacity)
+
+	require.NoError(t, s.Table("t").Symbol("sym", "AAPL").Int64Column("v", 1).AtNow(context.Background()))
+	_ = s.Flush(context.Background())
+
+	select {
+	case got := <-gotCh:
+		assert.Equal(t, CategoryDictionaryGap, got.Category)
+		assert.Equal(t, PolicyRetriable, got.AppliedPolicy)
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler not invoked within deadline")
+	}
+
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
+	}, 5*time.Second, time.Millisecond, "NACKed symbol frame was not replayed to an ACK")
+	assert.Nil(t, s.LastTerminalError(), "DICTIONARY_GAP must reconnect, not stop the sender")
+
+	conn2 := srv.recordedFrames()[2]
+	require.True(t, connSawTableLessFrame(conn2),
+		"the new connection must be sent the dictionary in a catch-up frame")
+	require.Equal(t, []string{"AAPL"}, reconstructConnDict(conn2),
+		"replay onto the new connection must leave every symbol registered")
 }
 
 // TestErrorApiResilience_LastTerminalErrorSurvivesClose latches a HALT,
