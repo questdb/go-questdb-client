@@ -25,7 +25,6 @@
 package questdb
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -33,7 +32,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -86,11 +84,141 @@ func TestQwpSfSymbolDictAppendSymbolsZeroAllocs(t *testing.T) {
 	require.Zero(t, allocs, "appendSymbols allocated on its warmed flush path")
 }
 
+func TestQwpSfSymbolDictUsesJavaCompatibleChecksummedChunks(t *testing.T) {
+	dir := t.TempDir()
+	d, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
+	require.NotNil(t, d)
+	require.NoError(t, d.appendSymbols([]string{"AAPL", "東京"}))
+	require.NoError(t, d.close())
+
+	buf, err := os.ReadFile(filepath.Join(dir, qwpSfSymbolDictFileName))
+	require.NoError(t, err)
+	pos := int(qwpSfSymbolDictHeaderSize)
+	chunkStart := pos
+	count, n, err := qwpReadVarint(buf[pos:])
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), count)
+	pos += n
+	entryBytes, n, err := qwpReadVarint(buf[pos:])
+	require.NoError(t, err)
+	pos += n
+	entriesEnd := pos + int(entryBytes)
+	require.LessOrEqual(t, entriesEnd+qwpSfSymbolDictCRCSize, len(buf))
+	stored := binary.LittleEndian.Uint32(buf[entriesEnd : entriesEnd+qwpSfSymbolDictCRCSize])
+	require.Equal(t, crc32.Checksum(buf[chunkStart:entriesEnd], qwpSfCrcTable), stored)
+	require.Equal(t, entriesEnd+qwpSfSymbolDictCRCSize, len(buf),
+		"one append must produce exactly one chunk, in the Java client's format")
+}
+
+func TestQwpSfSymbolDictCRCRejectsCorruptChunkAndKeepsPrefix(t *testing.T) {
+	dir := t.TempDir()
+	d, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
+	require.NoError(t, d.appendSymbols([]string{"first"}))
+	require.NoError(t, d.appendSymbols([]string{"second"}))
+	require.NoError(t, d.close())
+
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	buf, err := os.ReadFile(path)
+	require.NoError(t, err)
+	firstEnd := qwpTestSymbolDictChunkEnd(t, buf, int(qwpSfSymbolDictHeaderSize))
+	secondEntries := qwpTestSymbolDictEntriesStart(t, buf, firstEnd)
+	// Step past the entry-length varint and change one UTF-8 byte, leaving the
+	// stored checksum as it was. A reader that only checked lengths would
+	// accept this without noticing.
+	_, adv, err := qwpReadVarint(buf[secondEntries:])
+	require.NoError(t, err)
+	buf[secondEntries+adv] ^= 0x20
+	require.NoError(t, os.WriteFile(path, buf, 0o644))
+
+	re, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
+	require.NotNil(t, re)
+	require.Equal(t, []string{"first"}, re.loadedSymbols())
+	require.NoError(t, re.close())
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(firstEnd), info.Size(), "corrupt suffix must be truncated")
+}
+
+func TestQwpSfSymbolDictRecoveredLegacyFormatIsUntrustedAndPreserved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	buf := make([]byte, qwpSfSymbolDictHeaderSize)
+	binary.LittleEndian.PutUint32(buf[:4], qwpSfSymbolDictMagic)
+	buf[4] = qwpSfSymbolDictVersion
+	var vb [qwpMaxVarintLen]byte
+	for _, symbol := range []string{"old-a", "old-b"} {
+		buf = append(buf, vb[:qwpPutVarint(vb[:], uint64(len(symbol)))]...)
+		buf = append(buf, symbol...)
+	}
+	require.NoError(t, os.WriteFile(path, buf, 0o644))
+
+	d, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.Nil(t, d,
+		"a body with no checksums looks just like a corrupt first chunk, so it must not supply ids")
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, buf, got, "recovery must keep the file so it can be inspected or read by an older client")
+}
+
+// TestQwpSfSymbolDictRecoveredEntryCountBounded pins the limit that keeps a
+// hand-crafted file from making recovery allocate too much. A chunk of
+// empty-string entries passes its checksum and costs one byte each on disk, but
+// about 16 bytes each as Go strings, so recovery must reject an entry count
+// over the limit instead of parsing it.
+func TestQwpSfSymbolDictRecoveredEntryCountBounded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	buf := make([]byte, qwpSfSymbolDictHeaderSize)
+	binary.LittleEndian.PutUint32(buf[:4], qwpSfSymbolDictMagic)
+	buf[4] = qwpSfSymbolDictVersion
+	count := qwpSfSymbolDictMaxRecoveredEntries + 1
+	var vb [qwpMaxVarintLen]byte
+	chunk := append([]byte(nil), vb[:qwpPutVarint(vb[:], uint64(count))]...)
+	chunk = append(chunk, vb[:qwpPutVarint(vb[:], uint64(count))]...)
+	chunk = append(chunk, make([]byte, count)...) // one 0x00 varint per empty entry
+	entriesEnd := len(chunk)
+	var crcb [qwpSfSymbolDictCRCSize]byte
+	binary.LittleEndian.PutUint32(crcb[:], crc32.Checksum(chunk[:entriesEnd], qwpSfCrcTable))
+	chunk = append(chunk, crcb[:]...)
+	require.NoError(t, os.WriteFile(path, append(buf, chunk...), 0o644))
+
+	d, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.Nil(t, d, "an entry count over the limit must be refused, not allocated")
+}
+
 func TestQwpSfSymbolDictOpenRecoveredAbsentReturnsNil(t *testing.T) {
 	dir := t.TempDir()
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
 	require.NoError(t, err)
 	require.Nil(t, d, "absent dictionary on a recovered slot degrades to full-dict fallback")
+}
+
+func TestQwpSfSymbolDictOpenCleanDoesNotInheritExistingIDs(t *testing.T) {
+	dir := t.TempDir()
+	old, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
+	require.NotNil(t, old)
+	require.NoError(t, old.appendSymbols([]string{"stale-a", "stale-b"}))
+	require.NoError(t, old.close())
+
+	clean, err := qwpSfSymbolDictOpenClean(dir)
+	require.NoError(t, err)
+	require.NotNil(t, clean)
+	require.Zero(t, clean.size())
+	require.Empty(t, clean.loadedSymbols())
+	require.NoError(t, clean.appendSymbols([]string{"new-a"}))
+	require.NoError(t, clean.close())
+
+	reopened, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.NotNil(t, reopened)
+	require.Equal(t, []string{"new-a"}, reopened.loadedSymbols())
+	require.NoError(t, reopened.close())
 }
 
 func TestQwpSfSymbolDictOpenRecoveredValid(t *testing.T) {
@@ -107,18 +235,19 @@ func TestQwpSfSymbolDictOpenRecoveredValid(t *testing.T) {
 	require.NoError(t, re.close())
 }
 
-// TestQwpSfSymbolDictOpenRecoveredCorruptFailsLoud pins that a recovered slot's
-// corrupt dictionary is a hard error and the file is preserved, never
-// truncated — recreating it would restart the id space the surviving segments
-// reference by position and silently corrupt replayed data.
-func TestQwpSfSymbolDictOpenRecoveredCorruptFailsLoud(t *testing.T) {
+// TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack pins what happens to
+// damaged content, matching the Java client: this recovery goes without delta
+// encoding and the file is left on disk so it can be inspected. Whether the
+// slot can still be rebuilt is decided separately, by the engine's scan of the
+// surviving frames.
+func TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
 	garbage := []byte{9, 9, 9, 9, 9, 9, 9, 9, 42}
 	require.NoError(t, os.WriteFile(path, garbage, 0o644))
 
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
-	require.Error(t, err)
+	require.NoError(t, err)
 	require.Nil(t, d)
 
 	got, readErr := os.ReadFile(path)
@@ -127,8 +256,9 @@ func TestQwpSfSymbolDictOpenRecoveredCorruptFailsLoud(t *testing.T) {
 }
 
 // TestQwpSfSymbolDictVersionMismatch pins that an unknown version byte is
-// treated like bad magic: recreated on a fresh open, but a hard error on a
-// recovered slot.
+// treated like bad magic. On recovery the file is left alone and the slot runs
+// on full dictionaries; on a fresh open it is recreated, since no segment can
+// be referring to its ids.
 func TestQwpSfSymbolDictVersionMismatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
@@ -138,8 +268,12 @@ func TestQwpSfSymbolDictVersionMismatch(t *testing.T) {
 	hdr[8], hdr[9] = 1, 'x'
 	require.NoError(t, os.WriteFile(path, hdr, 0o644))
 
-	_, err := qwpSfSymbolDictOpenRecovered(dir)
-	require.Error(t, err, "wrong version on a recovered slot must fail loud")
+	recovered, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.Nil(t, recovered)
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, hdr, got, "recovery must leave a file with an unknown version alone")
 
 	d, openErr := qwpSfSymbolDictOpen(dir)
 	require.NoError(t, openErr)
@@ -164,41 +298,13 @@ func TestQwpSfSymbolDictOversizedFileRejected(t *testing.T) {
 	require.NoError(t, f.Truncate(qwpSfSymbolDictMaxFileSize+1))
 	require.NoError(t, f.Close())
 
-	_, err = qwpSfSymbolDictOpenRecovered(dir)
-	require.Error(t, err, "oversized dictionary must be rejected before the read")
-}
-
-func TestQwpSfSymbolDictEntryCountCeiling(t *testing.T) {
-	const maxEntries = qwpMaxSymbolDictionarySize
-
-	// Exactly the protocol ceiling remains valid, including the densest legal
-	// encoding: one zero-length symbol per byte.
-	entries, ok := qwpSfSymbolDictParseEntries(make([]byte, maxEntries), maxEntries)
-	require.True(t, ok)
-	require.Len(t, entries, maxEntries)
-
-	// One entry beyond the ceiling must be rejected before growing a []string
-	// to the attacker-controlled count.
-	entries, ok = qwpSfSymbolDictParseEntries(make([]byte, maxEntries+1), maxEntries+1)
-	require.False(t, ok)
-	require.Nil(t, entries)
-
-	// The ceiling is cumulative across chunks. Because both chunks have valid
-	// CRCs, recovery must fail closed and preserve the file rather than treating
-	// the second chunk as a torn tail and truncating it.
-	dir := t.TempDir()
-	path := filepath.Join(dir, qwpSfSymbolDictFileName)
-	contents := qwpSfTestSymbolDictHeader()
-	contents = append(contents, qwpSfTestEmptySymbolChunk(maxEntries/2)...)
-	contents = append(contents, qwpSfTestEmptySymbolChunk(maxEntries-maxEntries/2+1)...)
-	require.NoError(t, os.WriteFile(path, contents, 0o644))
-
-	d, err := qwpSfSymbolDictOpenRecovered(dir)
-	require.Nil(t, d)
-	require.ErrorContains(t, err, "exceeds the 1000000-entry limit")
-	got, readErr := os.ReadFile(path)
-	require.NoError(t, readErr)
-	require.Equal(t, contents, got, "checksum-valid oversized dictionary must remain byte-identical")
+	recovered, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.Nil(t, recovered, "a file over the size limit must be refused before it is read")
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(qwpSfSymbolDictMaxFileSize+1), info.Size(),
+		"recovery must not truncate an oversized file it refused to read")
 }
 
 func TestQwpSfSymbolDictBadMagicRecreatedEmpty(t *testing.T) {
@@ -251,12 +357,18 @@ func TestQwpSfSymbolDictTornTrailingChunkSelfHeals(t *testing.T) {
 	require.NoError(t, d.appendSymbols([]string{"one", "two"}))
 	require.NoError(t, d.close())
 
-	// Append a torn trailing chunk: count=1, entryBytes=2, entry="x", but
-	// omit the CRC, mimicking a crash mid-append.
+	cleanInfo, err := os.Stat(filepath.Join(dir, qwpSfSymbolDictFileName))
+	require.NoError(t, err)
+
+	// Append a torn trailing record, chosen so that its tail turns into a valid
+	// one-byte entry if a later, shorter append overwrites only the leading 5:
+	// [5, 1, 'G'] with an empty symbol [0] written over the 5 becomes
+	// [0, 1, 'G']. Unless reopen truncates first, the next recovery reads a
+	// symbol "G" that was never written.
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
 	require.NoError(t, err)
-	_, err = f.Write([]byte{1, 2, 1, 'x'})
+	_, err = f.Write([]byte{5, 1, 'G'})
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
@@ -264,14 +376,18 @@ func TestQwpSfSymbolDictTornTrailingChunkSelfHeals(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, re.size(), "torn tail ignored")
 	require.Equal(t, []string{"one", "two"}, re.loadedSymbols())
-	// The next append overwrites the torn tail, keeping the file consistent.
-	require.NoError(t, re.appendSymbols([]string{"three"}))
+	trimmedInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, cleanInfo.Size(), trimmedInfo.Size(), "reopen must truncate the torn tail")
+	// An empty symbol is shorter than the torn record, so it leaves the old
+	// bytes behind unless reopen truncated first.
+	require.NoError(t, re.appendSymbols([]string{""}))
 	require.NoError(t, re.close())
 
 	re2, err := qwpSfSymbolDictOpen(dir)
 	require.NoError(t, err)
 	require.Equal(t, 3, re2.size())
-	require.Equal(t, []string{"one", "two", "three"}, re2.loadedSymbols())
+	require.Equal(t, []string{"one", "two", ""}, re2.loadedSymbols())
 	require.NoError(t, re2.close())
 }
 
@@ -396,9 +512,8 @@ func TestQwpSfSymbolDictZeroValidChunksKeepsCorruptDisposition(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, contents, 0o644))
 
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
-	require.Nil(t, d)
-	require.Error(t, err)
-	require.NotErrorIs(t, err, qwpSfErrSymbolDictAmbiguousFormat)
+	require.NoError(t, err)
+	require.Nil(t, d, "a corrupt first chunk supplies no ids")
 	got, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
 	require.Equal(t, contents, got, "recovery must preserve a corrupt first chunk")
@@ -411,22 +526,6 @@ func TestQwpSfSymbolDictZeroValidChunksKeepsCorruptDisposition(t *testing.T) {
 	got, readErr = os.ReadFile(path)
 	require.NoError(t, readErr)
 	require.Equal(t, qwpSfTestSymbolDictHeader(), got, "fresh open keeps recreate-on-corrupt behavior")
-}
-
-func TestQwpSfSymbolDictTornFirstChunkReportsAmbiguousFormat(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, qwpSfSymbolDictFileName)
-	chunk := qwpSfTestSymbolDictChunk("x")
-	contents := append(qwpSfTestSymbolDictHeader(), chunk[:len(chunk)-qwpSfSymbolDictCRCSize]...)
-	require.NoError(t, os.WriteFile(path, contents, 0o644))
-
-	d, err := qwpSfSymbolDictOpenRecovered(dir)
-	require.Nil(t, d)
-	require.ErrorIs(t, err, qwpSfErrSymbolDictAmbiguousFormat)
-	require.ErrorContains(t, err, "ambiguous between the legacy flat format and a torn first chunk")
-	got, readErr := os.ReadFile(path)
-	require.NoError(t, readErr)
-	require.Equal(t, contents, got, "ambiguous first chunk must remain byte-identical")
 }
 
 func TestQwpSfSymbolDictFreshOpenPropagatesStatFailure(t *testing.T) {
@@ -498,78 +597,6 @@ func TestQwpSfSymbolDictTruncateFailureIsOperational(t *testing.T) {
 	require.Equal(t, contents, got, "failed truncation must preserve the file for retry")
 }
 
-func TestQwpSfSymbolDictLegacyFlatFormatFailsClosed(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, qwpSfSymbolDictFileName)
-	legacy := append(qwpSfTestSymbolDictHeader(), 0x01, 'x', 0x00)
-	require.NoError(t, os.WriteFile(path, legacy, 0o644))
-
-	for _, open := range []struct {
-		name string
-		fn   func(string) (*qwpSfSymbolDict, error)
-	}{
-		{name: "recovered", fn: qwpSfSymbolDictOpenRecovered},
-		{name: "fresh-open", fn: qwpSfSymbolDictOpen},
-	} {
-		t.Run(open.name, func(t *testing.T) {
-			d, err := open.fn(dir)
-			require.Nil(t, d)
-			require.ErrorIs(t, err, qwpSfErrSymbolDictAmbiguousFormat)
-			require.ErrorContains(t, err, "ambiguous between the legacy flat format and a torn first chunk")
-			require.ErrorContains(t, err, "safe only if the slot holds no unacked delta frames")
-			got, readErr := os.ReadFile(path)
-			require.NoError(t, readErr)
-			require.Equal(t, legacy, got, "legacy dictionary must remain byte-identical")
-		})
-	}
-}
-
-func TestQwpSfSymbolDictLegacyEngineOpenDoesNotQuarantine(t *testing.T) {
-	dir := t.TempDir()
-	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
-	require.NoError(t, err)
-	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(0, []string{"x"}))
-	require.NoError(t, err)
-	require.NoError(t, engine.engineClose())
-
-	path := filepath.Join(dir, qwpSfSymbolDictFileName)
-	legacy := append(qwpSfTestSymbolDictHeader(), 0x01, 'x')
-	require.NoError(t, os.WriteFile(path, legacy, 0o644))
-
-	recovered, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
-	require.Nil(t, recovered)
-	require.ErrorIs(t, err, qwpSfErrSymbolDictAmbiguousFormat)
-	_, statErr := os.Stat(filepath.Join(filepath.Dir(dir), "quarantined"))
-	require.True(t, os.IsNotExist(statErr), "operational legacy error must not auto-quarantine the slot")
-	got, readErr := os.ReadFile(path)
-	require.NoError(t, readErr)
-	require.Equal(t, legacy, got)
-}
-
-func TestQwpSfSymbolDictLegacyDrainerMarksFailedWithRemediation(t *testing.T) {
-	dir := t.TempDir()
-	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
-	require.NoError(t, err)
-	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(0, []string{"x"}))
-	require.NoError(t, err)
-	require.NoError(t, engine.engineClose())
-
-	path := filepath.Join(dir, qwpSfSymbolDictFileName)
-	legacy := append(qwpSfTestSymbolDictHeader(), 0x01, 'x')
-	require.NoError(t, os.WriteFile(path, legacy, 0o644))
-
-	drainer := qwpSfNewOrphanDrainer(dir, 4096, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
-	drainer.drainerRun(context.Background())
-	require.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
-	failed, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
-	require.NoError(t, err)
-	require.Contains(t, string(failed), "ambiguous between the legacy flat format and a torn first chunk")
-	require.Contains(t, string(failed), "safe only if the slot holds no unacked delta frames")
-	got, readErr := os.ReadFile(path)
-	require.NoError(t, readErr)
-	require.Equal(t, legacy, got)
-}
-
 func qwpSfTestSymbolDictHeader() []byte {
 	header := make([]byte, qwpSfSymbolDictHeaderSize)
 	binary.LittleEndian.PutUint32(header[:4], qwpSfSymbolDictMagic)
@@ -589,14 +616,27 @@ func qwpSfTestSymbolDictChunk(entries ...string) []byte {
 	return qwpSfTestChecksummedChunk(body)
 }
 
-func qwpSfTestEmptySymbolChunk(count int) []byte {
-	body := binary.AppendUvarint(nil, uint64(count))
-	body = binary.AppendUvarint(body, uint64(count))
-	body = append(body, make([]byte, count)...)
-	return qwpSfTestChecksummedChunk(body)
-}
-
 func qwpSfTestChecksummedChunk(body []byte) []byte {
 	chunk := append([]byte(nil), body...)
-	return binary.LittleEndian.AppendUint32(chunk, crc32.Checksum(body, crc32.MakeTable(crc32.Castagnoli)))
+	return binary.LittleEndian.AppendUint32(chunk, crc32.Checksum(body, qwpSfCrcTable))
+}
+
+func qwpTestSymbolDictEntriesStart(t *testing.T, buf []byte, chunkStart int) int {
+	t.Helper()
+	_, n, err := qwpReadVarint(buf[chunkStart:])
+	require.NoError(t, err)
+	pos := chunkStart + n
+	_, n, err = qwpReadVarint(buf[pos:])
+	require.NoError(t, err)
+	return pos + n
+}
+
+func qwpTestSymbolDictChunkEnd(t *testing.T, buf []byte, chunkStart int) int {
+	t.Helper()
+	_, n, err := qwpReadVarint(buf[chunkStart:])
+	require.NoError(t, err)
+	pos := chunkStart + n
+	entryBytes, n, err := qwpReadVarint(buf[pos:])
+	require.NoError(t, err)
+	return pos + n + int(entryBytes) + qwpSfSymbolDictCRCSize
 }

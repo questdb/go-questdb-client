@@ -737,10 +737,10 @@ instead of only at replay.
   fail-closed recovery contract, the slot-directory file table
   (+`sf-manifest.bin`, `sf-manifest.bin.corrupt`, `quarantined/`), the new
   close/quiescence contract (`closeCompleted`, deferred cleanup), the chunked
-  dict format, and the control-point fsync policy. Add an addendum to
-  `design/qwp-delta-symbol-dict.md` (§on-disk format superseded by the merged
-  Java chunked format). Update `design/qwp-implementation-review.md` findings
-  with "addressed by <commit>" notes as each lands.
+  dict format, and the control-point fsync policy. CLAUDE.md §QWP carries the
+  on-disk dictionary format; the merged Java chunked format is the reference.
+  Update `design/qwp-implementation-review.md` findings with
+  "addressed by <commit>" notes as each lands.
 - **Invariant B**: nothing here adds a terminal to a *running* sender's
   transport path. New terminals are confined to construction/recovery
   (sanctioned: build-time errors, drainer `.failed` on recovery, the existing

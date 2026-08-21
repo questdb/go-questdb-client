@@ -234,14 +234,12 @@ func TestQwpDeltaDictSeedFromPersisted(t *testing.T) {
 	defer pd.close()
 	require.Equal(t, []string{"a", "b", "c"}, pd.loadedSymbols())
 
-	// Seed the two recovered-dict consumers in the cursor sender's construction
-	// order: the send loop's wire mirror first (the send loop is built before the
-	// producer), then the producer's global dictionary. The mirror seed must
-	// leave the recovered entries in place so the producer, built next, still
-	// sees the full set — a regression guard for the SF-recovery seed ordering.
+	// Fill both users of the recovered dictionary from the same id-ordered
+	// list, in the order the cursor sender builds them: send-loop mirror first,
+	// then producer. Neither one may modify the list they share.
+	recovered := pd.loadedSymbols()
 	var l qwpSfSendLoop
-	l.deltaDictEnabled = true
-	l.seedSentDictFromPersisted(pd)
+	l.seedSentDictFromSymbols(recovered)
 	require.Equal(t, 3, l.sentDictCount)
 	require.Equal(t, []string{"a", "b", "c"}, pd.loadedSymbols(),
 		"the mirror seed must not drop the recovered entries before the producer seeds")
@@ -254,7 +252,7 @@ func TestQwpDeltaDictSeedFromPersisted(t *testing.T) {
 		maxSentSymbolId:     -1,
 		persistedSymbolDict: pd,
 	}
-	s.seedSymbolDictFromPersisted()
+	s.seedSymbolDictFromRecovered(recovered)
 	require.Equal(t, []string{"a", "b", "c"}, s.globalSymbolList)
 	require.Equal(t, int32(0), s.globalSymbols["a"])
 	require.Equal(t, int32(2), s.globalSymbols["c"])
@@ -325,7 +323,7 @@ func TestQwpDeltaDictTornDictGuardFires(t *testing.T) {
 	_, err = engine.engineAppendBlocking(context.Background(), frame)
 	require.NoError(t, err)
 
-	l := &qwpSfSendLoop{engine: engine, deltaDictEnabled: true, sentDictCount: 1}
+	l := &qwpSfSendLoop{engine: engine, sentDictCount: 1}
 	l.transport.Store(&qwpTransport{})
 
 	sent, sendErr := l.trySendOne(context.Background())
@@ -347,6 +345,25 @@ func TestQwpDeltaDictTornDictSE(t *testing.T) {
 	require.Equal(t, CategoryProtocolViolation, se.Category)
 	require.Equal(t, PolicyTerminal, se.AppliedPolicy)
 	require.Contains(t, se.ServerMessage, "resend required")
+}
+
+// TestQwpDeltaDictMirrorAccumulatesPartialOverlap covers a shape replay is
+// allowed to produce: a frame that repeats ids the mirror already holds and
+// carries on past them. The mirror must skip the repeated ones and keep the new
+// ones for the next reconnect; ignoring the whole frame would leave the next
+// connection short.
+func TestQwpDeltaDictMirrorAccumulatesPartialOverlap(t *testing.T) {
+	var l qwpSfSendLoop
+	l.accumulateSentDict(buildTestDeltaFrame(0, []string{"a", "b"}))
+	require.Equal(t, 2, l.sentDictCount)
+
+	// id 1 repeats the "b" the mirror already holds; ids 2 and 3 are new.
+	l.accumulateSentDict(buildTestDeltaFrame(1, []string{"b", "c", "d"}))
+	require.Equal(t, 4, l.sentDictCount)
+
+	frame := l.buildCatchUpFrame(0, l.sentDictCount, l.sentDictBytes)
+	require.Equal(t, []string{"a", "b", "c", "d"},
+		reconstructConnDict([]string{string(frame)}))
 }
 
 func TestQwpDeltaDictParseHelpers(t *testing.T) {

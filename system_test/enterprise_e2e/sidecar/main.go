@@ -76,12 +76,25 @@ func main() {
 			if len(parts) > 3 {
 				startIndex, _ = strconv.Atoi(parts[3])
 			}
+			symbolCardinality := 0
+			if len(parts) > 4 {
+				var err error
+				symbolCardinality, err = strconv.Atoi(parts[4])
+				if err != nil || symbolCardinality <= 0 {
+					reply("ERR symbol cardinality must be a positive integer")
+					continue
+				}
+			}
 			var lastErr error
 			for i := 0; i < count; i++ {
 				idx := startIndex + i
+				symbolIdx := idx
+				if symbolCardinality > 0 {
+					symbolIdx %= symbolCardinality
+				}
 				err := sender.
 					Table(table).
-					Symbol("tag", fmt.Sprintf("test_%d", idx)).
+					Symbol("tag", fmt.Sprintf("test_%d", symbolIdx)).
 					Int64Column("v", int64(idx)).
 					At(context.Background(), time.Now())
 				if err != nil {

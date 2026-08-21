@@ -568,14 +568,27 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		return s
 	}
 
+	// Look up the id first, and reject an over-limit new value before either
+	// the row or the dictionary changes. The dictionary is shared by all
+	// tables and columns and is capped at qwpMaxSymbolDictionarySize; handing
+	// out an id past that cap would make the reconnect catch-up frame
+	// unacceptable to the server and leave the buffered SF frames undeliverable.
+	id, ok := s.globalSymbols[val]
+	if !ok && len(s.globalSymbolList) >= qwpMaxSymbolDictionarySize {
+		s.lastErr = fmt.Errorf(
+			"qwp: global symbol dictionary is full: the QWP protocol caps a sender's distinct symbol values at %d; rows using already-registered values remain valid; close and rebuild the sender to start a fresh dictionary, or use varchar columns for unbounded-cardinality data",
+			qwpMaxSymbolDictionarySize,
+		)
+		return s
+	}
+
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeSymbol, true)
 	if err != nil {
 		s.lastErr = err
 		return s
 	}
 
-	// Look up or assign global symbol ID.
-	id, ok := s.globalSymbols[val]
+	// Assign the next global symbol id only once nothing above can fail.
 	if !ok {
 		id = int32(len(s.globalSymbolList))
 		s.globalSymbols[val] = id
@@ -1422,6 +1435,7 @@ func (s *qwpLineSender) resetAfterFlush() {
 	s.dirtyTables = s.dirtyTables[:0]
 	s.pendingRowCount = 0
 	s.pendingBytes = 0
+	s.reclaimUnsentSymbolIDs()
 	s.batchMaxSymbolId = s.maxSentSymbolId
 	// Defense in depth: tb.reset() keeps the column structure but
 	// sets committedColumnCount=0, so a post-flush cancelRow would
@@ -1435,6 +1449,51 @@ func (s *qwpLineSender) resetAfterFlush() {
 		s.flushDeadline = time.Now().Add(s.autoFlushInterval)
 	} else {
 		s.flushDeadline = time.Time{}
+	}
+}
+
+// reclaimUnsentSymbolIDs gives back the ids that only a discarded batch ever
+// used, so the next batch can reuse them. Delta frames always start at
+// maxSentSymbolId+1, so keeping the ids of a batch that was never published
+// would make the next batch with new symbols re-encode them, and an id that
+// went over the dictionary cap would keep going over it on every retry.
+//
+// An id may only be reused when nothing else can already name it, which means
+// staying above two marks. maxSentSymbolId covers ids a published frame has
+// already handed to the send-loop mirror. The persisted dictionary's size
+// covers ids written to the SF side-file, which happens before the frame is
+// published, so those exist even if the publish failed. Full-dictionary mode
+// reclaims nothing: every queued frame spells out its own dictionary, so an id
+// reused here would name a different string than one of those frames does.
+func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
+	if !s.deltaDictEnabled {
+		return
+	}
+	floor := s.maxSentSymbolId + 1
+	if s.persistedSymbolDict != nil {
+		if durable := s.persistedSymbolDict.size(); durable > floor {
+			floor = durable
+		}
+	}
+	if floor < 0 {
+		floor = 0
+	}
+	if floor >= len(s.globalSymbolList) {
+		return
+	}
+	s.globalSymbolList = s.globalSymbolList[:floor]
+	// Rebuild the whole map instead of deleting the dropped strings one by
+	// one. Recovery keeps every position even when two of them hold the same
+	// string, and deleting by name would then remove an entry that is still
+	// in use. Rebuilding leaves each name pointing at its highest surviving
+	// id, which is what Java does.
+	if s.globalSymbols == nil {
+		s.globalSymbols = make(map[string]int32, len(s.globalSymbolList))
+	} else {
+		clear(s.globalSymbols)
+	}
+	for id, symbol := range s.globalSymbolList {
+		s.globalSymbols[symbol] = int32(id)
 	}
 }
 

@@ -267,9 +267,8 @@ accepted it with the wrong ID map:
 
 This can produce incorrect dictionary registration or a replay rejection when a
 Java-created slot is adopted by Go. It also violates the explicit requirement to
-remain byte-compatible with the merged Java format:
-
-- `design/qwp-delta-symbol-dict.md:511-512`
+remain byte-compatible with the merged Java format, whose reference
+implementation is `PersistedSymbolDict.java` in the Java client.
 
 #### Required correction (completed)
 

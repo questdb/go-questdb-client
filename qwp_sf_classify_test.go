@@ -41,6 +41,7 @@ func TestQwpSfClassify(t *testing.T) {
 		{QwpStatusSecurityError, CategorySecurityError},
 		{QwpStatusWriteError, CategoryWriteError},
 		{QwpStatusNotWritable, CategoryNotWritable},
+		{QwpStatusDictionaryGap, CategoryDictionaryGap},
 		// OK / DurableAck never reach classify in production but they
 		// fall through to Unknown defensively.
 		{QwpStatusOK, CategoryUnknown},
@@ -65,6 +66,7 @@ func TestQwpSfDefaultPolicyFor(t *testing.T) {
 		{CategoryWriteError, PolicyRetriable},
 		{CategoryInternalError, PolicyRetriable},
 		{CategoryUnknown, PolicyRetriable},
+		{CategoryDictionaryGap, PolicyRetriable},
 		{CategoryNotWritable, PolicyRetriableOther},
 		{CategorySchemaMismatch, PolicyTerminal},
 		{CategoryParseError, PolicyTerminal},
