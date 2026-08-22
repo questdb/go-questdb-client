@@ -240,10 +240,19 @@ type QwpBackgroundDrainer struct {
 	// LastError is the most recent error message the drainer
 	// recorded, or "" if no error has been recorded.
 	LastError string
-	// Failed is true if the drainer ended in the FAILED outcome
-	// (auth failure, durable-ack settle exhaustion, recovery error,
-	// wedged no-progress connection) and dropped a .failed sentinel
-	// in the slot.
+	// Failed is true if the drainer ended in the FAILED outcome — it
+	// gave up on this slot for this run (auth failure, durable-ack
+	// settle exhaustion, a wedged no-progress connection, a slot whose
+	// recovery proved inconsistent, a panic).
+	//
+	// It does not by itself mean the slot is out of service. Those
+	// give-ups drop a permanent .failed sentinel that disqualifies the
+	// slot from every later adoption, but a local I/O fault while
+	// opening it — a full disk, an exhausted fd table, a mount that went
+	// away — fails the run without one: the fault says nothing about the
+	// slot's bytes, so the data and the eligibility both survive and the
+	// next foreground scan adopts the slot again. The presence of the
+	// sentinel file in Dir is what tells the two apart.
 	Failed bool
 }
 
