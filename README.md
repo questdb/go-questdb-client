@@ -305,12 +305,14 @@ err = qs.
 `Decimal128Column` / `Decimal256Column`, and `AtNano`, plus the
 acknowledgement and observability accessors (`AwaitAckedFsn`,
 `FlushAndGetSequence`, `TotalReconnectAttempts`, `LastTerminalError`,
-`TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`).
+`TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`,
+`QuarantinedSlotPath`).
 
-> This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`, and
-> `DroppedConnectionNotifications` to the `QwpSender` interface. Every built-in
-> transport is updated; this is source-breaking only for external code that
-> implements `QwpSender` directly (callers that type-assert to it are unaffected).
+> This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`,
+> `DroppedConnectionNotifications`, and `QuarantinedSlotPath` to the `QwpSender`
+> interface. Every built-in transport is updated; this is source-breaking only
+> for external code that implements `QwpSender` directly (callers that
+> type-assert to it are unaffected).
 
 ### N-dimensional arrays
 
