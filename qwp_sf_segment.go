@@ -257,9 +257,17 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 //
 // Errors are classified for qwpSfRecoverRing. Short files, bad magic, and
 // negative baseSeq are corruption evidence whose quarantine is deferred until
-// the manifest decision tree validates the surviving chain. Unsupported
-// versions and syscall/I-O failures are operational errors: the bytes may be
-// intact and must not be quarantined by this client build.
+// the manifest decision tree validates the surviving chain. Syscall and I/O
+// failures are operational errors: the bytes may be intact and the same slot
+// recovers once the fault clears.
+//
+// An unsupported version fails the whole slot closed. It is not corruption —
+// the frames may be perfectly good ones a newer client wrote — so renaming the
+// file to .corrupt and migrating the rest of the chain would drop rows that are
+// still on disk. It is not operational either, because no later attempt by this
+// build can read it. Failing closed is what preserves the entire slot under
+// <sf_dir>/quarantined/ and lets the foreground sender start a fresh one, so
+// ingestion continues and a newer client can still be pointed at the bytes.
 func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	st, err := os.Stat(path)
 	if err != nil {
@@ -288,7 +296,8 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	if version != qwpSfSegmentVersion {
 		_ = qwpSfMunmap(buf)
 		_ = f.Close()
-		return nil, fmt.Errorf("qwp/sf: unsupported segment version in %s: %d", path, version)
+		return nil, qwpSfFailClosed("unsupported segment version in %s: %d (this build writes version %d)",
+			path, version, qwpSfSegmentVersion)
 	}
 	baseSeq := int64(binary.LittleEndian.Uint64(buf[8:16]))
 	// FSNs are non-negative by construction. A negative baseSeq on disk

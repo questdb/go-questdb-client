@@ -33,6 +33,7 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1062,19 +1063,12 @@ func TestQwpSfDrainerOpenFailureSurvivesPanickingLogger(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	path := filepath.Join(dir, "sf-initial.sfa")
-	seg, err := qwpSfCreateSegment(path, 0, 4096)
-	require.NoError(t, err)
-	_, err = seg.tryAppend([]byte("row"))
-	require.NoError(t, err)
-	require.NoError(t, seg.close())
-	// An unsupported segment version is an operational failure, not proof that
-	// the slot is inconsistent, so the drainer logs it and leaves the slot for
-	// a later scan — the branch this test needs to reach.
-	raw, err := os.ReadFile(path)
-	require.NoError(t, err)
-	raw[4] = 0xFE
-	require.NoError(t, os.WriteFile(path, raw, 0o644))
+	// A full disk is an operational failure, not proof that the slot is
+	// inconsistent, so the drainer logs it and leaves the slot for a later scan
+	// — the branch this test needs to reach.
+	originalReserve := qwpSfReserveNewBlocksFn
+	qwpSfReserveNewBlocksFn = func(*os.File, int64, int64) error { return syscall.ENOSPC }
+	t.Cleanup(func() { qwpSfReserveNewBlocksFn = originalReserve })
 
 	drainer := qwpSfNewOrphanDrainer(
 		dir, 4096, qwpSfUnlimitedTotalBytes,
@@ -1087,6 +1081,6 @@ func TestQwpSfDrainerOpenFailureSurvivesPanickingLogger(t *testing.T) {
 	drainer.drainerRun(context.Background())
 
 	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
-	_, err = os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
-	assert.True(t, os.IsNotExist(err), "an operational open failure must leave the slot eligible")
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "an operational open failure must leave the slot eligible")
 }

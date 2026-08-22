@@ -214,6 +214,8 @@ func TestQwpSfSegmentRecoveryRejectsBadVersion(t *testing.T) {
 	assert.Contains(t, err.Error(), "unsupported segment version")
 	assert.NotErrorIs(t, err, qwpSfErrSegmentCorrupt,
 		"a newer client may have written intact frames; do not quarantine them as corruption")
+	assert.ErrorIs(t, err, qwpSfErrRecoveryFailClosed,
+		"no later attempt by this build can read the file, so the slot must be preserved whole rather than retried forever")
 	assert.Nil(t, seg)
 }
 

@@ -509,6 +509,39 @@ func TestQwpSfQuarantinePathPreservesEarlierEvidence(t *testing.T) {
 	require.Equal(t, []byte("new evidence"), newEvidence)
 }
 
+// TestQwpSfForegroundStartsFreshOverUnreadableSegmentVersion pins that a
+// segment this build cannot read costs the sender nothing permanent. Nothing
+// later can make the file readable here, so leaving the slot in place would
+// mean every NewLineSender on it fails forever with no way back. Preserving the
+// slot whole keeps the bytes for a client that does understand them, and the
+// sender comes up on a fresh slot and keeps ingesting.
+func TestQwpSfForegroundStartsFreshOverUnreadableSegmentVersion(t *testing.T) {
+	root := t.TempDir()
+	slot := filepath.Join(root, "sender-a")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	seg := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "a")
+	closeRecoverySegments(t, seg)
+	path := filepath.Join(slot, "sf-initial.sfa")
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	raw[4] = qwpSfSegmentVersion + 1
+	require.NoError(t, os.WriteFile(path, raw, 0o644))
+
+	engine, err := qwpSfNewCursorEngine(slot, 4096, qwpSfUnlimitedTotalBytes, 0)
+	require.NoError(t, err)
+	require.NotNil(t, engine)
+	assert.False(t, engine.engineWasRecoveredFromDisk())
+	require.NoError(t, engine.engineClose())
+
+	entries, err := os.ReadDir(filepath.Join(root, "quarantined"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	preserved, err := os.ReadFile(filepath.Join(root, "quarantined", entries[0].Name(), "sf-initial.sfa"))
+	require.NoError(t, err)
+	assert.Equal(t, qwpSfSegmentVersion+1, preserved[4],
+		"the unreadable segment must be preserved byte-for-byte, not rewritten or renamed as corruption")
+}
+
 func TestQwpSfForegroundFailClosedQuarantinesAndStartsFresh(t *testing.T) {
 	root := t.TempDir()
 	slot := filepath.Join(root, "sender-a")
