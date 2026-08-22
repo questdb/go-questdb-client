@@ -515,7 +515,10 @@ func TestQwpQueryPoolCloseSurvivesPanickingLogger(t *testing.T) {
 
 	locked := make(chan struct{})
 	go func() {
+		// Taking the lock at all is the assertion: a handler that panicked
+		// while it was held would leave it owned by a dead goroutine.
 		p.mu.Lock()
+		_ = len(p.all)
 		p.mu.Unlock()
 		close(locked)
 	}()

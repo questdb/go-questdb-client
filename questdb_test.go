@@ -626,7 +626,10 @@ type closeMuProbeHandler struct {
 
 func (closeMuProbeHandler) Enabled(context.Context, slog.Level) bool { return true }
 func (h closeMuProbeHandler) Handle(context.Context, slog.Record) error {
+	// Acquiring the lock at all is the probe: it proves closeMu is free while
+	// the re-probe runs, which is what a user handler calling Close needs.
 	h.db.closeMu.Lock()
+	_ = h.db.closeErr
 	h.db.closeMu.Unlock()
 	select {
 	case <-h.hit:
