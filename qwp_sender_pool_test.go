@@ -1715,3 +1715,43 @@ func TestQwpSenderPoolReprobeSurvivesPanickingLogger(t *testing.T) {
 	require.Empty(t, p.retiredSlots)
 	require.False(t, p.slotInUse[0], "the freed slot index must go back into circulation")
 }
+
+// TestQwpSenderPoolReapVictimSelectionIsAllOrNothing pins that the reap's
+// accounting cannot be interrupted part-way. selectReapVictims calls into each
+// delegate to classify it, and reclaimSlotLocked -- reached only from reapIdle,
+// with the victim list this function returns -- is the sole decrement of
+// closingSlots. A fault after earlier victims were counted but before the list
+// is returned would raise that count with nothing left to bring it down, and
+// close() would then report ErrSfCleanupPending on every call forever, so the
+// documented retry-until-it-clears contract would never terminate.
+func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
+	p := &qwpSenderPool{
+		storeAndForward: true,
+		maxSize:         3,
+		minSize:         0,
+		idleTimeout:     time.Nanosecond,
+		slotInUse:       make([]bool, 3),
+		notify:          make(chan struct{}),
+	}
+	stale := time.Now().Add(-time.Hour)
+	// A nil delegate satisfies neither classifier interface, so it classifies
+	// cleanly as an idle victim; a zero-value sender does satisfy them and
+	// faults when they are called. Ordering the victim first is what puts the
+	// fault after the accounting the old shape performed inline.
+	victim := &qwpSenderSlot{slotIndex: 0, idleSince: stale}
+	faulting := &qwpSenderSlot{slotIndex: 1, idleSince: stale, delegate: &qwpLineSender{}}
+	p.all = []*qwpSenderSlot{victim, faulting}
+	p.available = []*qwpSenderSlot{victim, faulting}
+
+	func() {
+		defer func() { require.NotNil(t, recover(), "the classifier must fault for this test") }()
+		_ = p.selectReapVictims(time.Now())
+	}()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Zero(t, p.closingSlots,
+		"a fault during classification must not leave a slot counted as closing")
+	require.Zero(t, p.pendingLeaseTeardowns,
+		"nor as a teardown close() will wait for")
+}

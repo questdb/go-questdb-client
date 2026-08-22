@@ -713,9 +713,6 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 		// proactively clears poisoned slots so a wave of borrowers does not have
 		// to discard them one by one during incident recovery.
 		poisoned := slotTerminallyFailed(slot.delegate)
-		// removeFromAllLocked already shrinks p.all, so test it directly — do
-		// not also subtract len(toClose) or the reaped count is counted twice
-		// and the pool under-reaps to ~min+excess/2 per tick.
 		// Idle/age recycling is floored at minSize, so max_lifetime_ms is inert
 		// for min slots: no evict-and-replace (recreating mid-outage could
 		// orphan unacked SF data); QWP self-reconnects anyway. See README.
@@ -724,22 +721,35 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 		// poisoned slot is exempt — its HALT is terminal, so the rows are already
 		// lost and holding the slot only wastes it.
 		hasUnacked := !poisoned && slotHasUnackedRows(slot.delegate)
-		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize && !hasUnacked) {
-			p.removeFromAllLocked(slot)
-			if p.storeAndForward && slot.slotIndex >= 0 {
-				p.closingSlots++
-			}
-			// Count the off-lock reap teardown so close()'s outstanding wait
-			// cannot return while a reaped slot is still releasing its delegate
-			// (and, in SF mode, its flock). The victim is already out of `all`, so
-			// as with discardLocked the formula would otherwise miss it entirely;
-			// capUsedLocked separately tracks closingSlots, so this does not
-			// double-count there. Decremented in reapIdle after the close.
-			p.pendingLeaseTeardowns++
+		// len(p.all) shrinks only in the mutation pass below, so the minSize
+		// floor subtracts the victims chosen so far to match reaping them one
+		// at a time.
+		if poisoned || ((idleExpired || overAge) && len(p.all)-len(toClose) > p.minSize && !hasUnacked) {
 			toClose = append(toClose, slot)
 			continue
 		}
 		kept = append(kept, slot)
+	}
+	// Classification is finished, so the accounting below cannot be interrupted
+	// part-way. Both predicates above call into the delegate; a fault in one
+	// after earlier victims had already been counted would leave closingSlots
+	// raised with the victim list discarded. reclaimSlotLocked is the sole
+	// decrement and only reapIdle reaches it, so that count would never come
+	// back down -- and close() would report ErrSfCleanupPending on every call
+	// forever, which is the one outcome the documented "retry until it clears"
+	// contract cannot survive.
+	for _, slot := range toClose {
+		p.removeFromAllLocked(slot)
+		if p.storeAndForward && slot.slotIndex >= 0 {
+			p.closingSlots++
+		}
+		// Count the off-lock reap teardown so close()'s outstanding wait
+		// cannot return while a reaped slot is still releasing its delegate
+		// (and, in SF mode, its flock). The victim is already out of `all`, so
+		// as with discardLocked the formula would otherwise miss it entirely;
+		// capUsedLocked separately tracks closingSlots, so this does not
+		// double-count there. Decremented in reapIdle after the close.
+		p.pendingLeaseTeardowns++
 	}
 	p.available = kept
 	return toClose
