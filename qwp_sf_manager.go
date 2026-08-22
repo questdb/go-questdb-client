@@ -735,13 +735,18 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	//    complete. Their bytes are still charged to the slot, so this is what
 	//    gives the ring its capacity back.
 	deferredBytes, deferredErr := m.retryDeferredTrimWork(e)
+	// Those bytes left the disk the moment their unlink succeeded, and the
+	// retry list no longer holds them, so credit them here rather than at the
+	// end of the pass. Several exits below this point return early, and each
+	// one that skipped the credit would charge the slot for files that are
+	// gone -- permanently, since nothing revisits them.
+	m.commitTrimAccounting(e, deferredBytes)
 
 	// 4. Trim any segments that the ring says are fully acked. For
 	//    memory-mode rings, "trim" is just close (the slice is GC'd) —
 	//    no file to unlink.
 	trim := e.ring.peekTrimmable()
 	if len(trim) == 0 {
-		m.commitTrimAccounting(e, deferredBytes)
 		if deferredErr != nil {
 			m.recordServiceError(e, deferredErr)
 			return
@@ -778,7 +783,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	}
 	trim = e.ring.drainTrimBatch(len(trim))
 	trimErr := deferredErr
-	trimmedBytes := deferredBytes
+	trimmedBytes := int64(0)
 	for _, s := range trim {
 		path := s.segmentPath()
 		sz := s.segmentSize()

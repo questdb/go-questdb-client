@@ -306,6 +306,50 @@ func TestQwpSfManagerNextSparePathIncrements(t *testing.T) {
 	assert.Equal(t, filepath.Join(dir, "sf-0000000000000001.sfa"), b)
 }
 
+// A trim pass that gives up partway through still has to credit the bytes an
+// earlier pass's leftover unlinks just reclaimed: those files are gone and off
+// the retry list, so nothing else will ever account for them. Losing them
+// charges the slot forever, which stops spare provisioning and, at
+// deregistration, pushes the manager total negative and loosens the cap for
+// every other slot that manager serves.
+func TestQwpSfManagerCreditsReclaimedBytesWhenTrimAborts(t *testing.T) {
+	dir := t.TempDir()
+	m, err := qwpSfNewSegmentManager(4096, time.Hour, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+
+	const segSize int64 = 72
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	r := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = r.segmentRingClose() }()
+	spare, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	require.NoError(t, r.installHotSpare(spare))
+	payload := make([]byte, 16)
+	for i := 0; i < 3; i++ {
+		require.GreaterOrEqual(t, r.appendOrFsn(payload), int64(0))
+	}
+	sealed := r.getSealedSegments()
+	require.Len(t, sealed, 1)
+	r.acknowledge(sealed[0].segmentBaseSeq() + sealed[0].segmentFrameCount() - 1)
+
+	// A disk-mode entry whose ring carries no manifest aborts the pass at the
+	// "disk ring has no SF manifest during trim" check, after the leftover
+	// unlink has already run.
+	e := &qwpSfManagerRingEntry{dir: dir, ring: r, accountedBytes: 4096}
+	m.totalBytes = 4096
+	e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{
+		path: filepath.Join(dir, "sf-already-gone.sfa"), sizeBytes: 4096,
+	})
+
+	m.serviceRing(e)
+
+	require.Equal(t, 1, e.maintenanceFailures, "the pass aborted before trimming")
+	assert.Empty(t, e.pendingUnlinks, "the reclaimed unlink is off the retry list")
+	assert.Zero(t, e.accountedBytes, "the slot gets the reclaimed bytes back")
+	assert.Zero(t, m.totalBytes, "and so does the manager total")
+}
+
 // TestQwpSfManagerHoldsBytesForAFailedTrimUnlink pins the accounting rule that
 // keeps a slot inside its cap when deletes stop working. A trimmed segment
 // whose file is still on disk gives no capacity back, so crediting its bytes
