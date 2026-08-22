@@ -487,8 +487,11 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// dictionary the waiting frames need out of the frames themselves.
 			// When the ring holds no frames there are no ids to clash with, so
 			// starting a fresh dictionary is safe and keeps delta encoding
-			// available.
-			if persistedDict == nil && ring.segmentRingPublishedFsn() < 0 {
+			// available. The test is the frames themselves: a recovered chain
+			// that was fully trimmed holds none while still reporting the
+			// published sequence it reached, and a sender there would otherwise
+			// send a full symbol dictionary on every frame for its whole life.
+			if persistedDict == nil && !ring.segmentRingHoldsFrames() {
 				persistedDict = qwpSfSymbolDictOpenFresh(filepath.Join(sfDir, qwpSfSymbolDictFileName))
 			}
 			watermarkFsn := watermark.read() // nil-safe → INVALID

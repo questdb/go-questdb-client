@@ -439,6 +439,24 @@ func (r *qwpSfSegmentRing) peekTrimmable() []*qwpSfSegment {
 	return out
 }
 
+// segmentRingHoldsFrames reports whether any segment in the ring carries a
+// frame. A recovered chain whose frames were all acked and trimmed sits at a
+// positive base with nothing in it, so its published sequence says where the
+// slot got to, not whether it holds rows.
+func (r *qwpSfSegmentRing) segmentRingHoldsFrames() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.sealedSegments {
+		if s.segmentFrameCount() > 0 {
+			return true
+		}
+	}
+	if active := r.active.Load(); active != nil {
+		return active.segmentFrameCount() > 0
+	}
+	return false
+}
+
 func (r *qwpSfSegmentRing) headAfterTrim(trimCount int) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
