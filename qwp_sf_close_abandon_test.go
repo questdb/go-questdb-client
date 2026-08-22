@@ -718,3 +718,42 @@ func TestQwpCloseDrainPanicLeaksMappingsAndStopsSendLoop(t *testing.T) {
 		require.NoError(t, lock.close())
 	})
 }
+
+// TestQwpSenderConstructionPanicReleasesSlotLock pins that a fault during
+// sender construction hands the engine to a cleanup owner. The engine takes the
+// slot flock, the segment mappings and the side-file descriptors before the
+// sender exists, and a panic between the two returns no slot at all to the
+// pool's recover — so nothing downstream can install a retry owner, and the
+// flock would be held until the process exits while close() reported success.
+func TestQwpSenderConstructionPanicReleasesSlotLock(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	sfDir := t.TempDir()
+	slot := filepath.Join(sfDir, "boom")
+
+	boom := func() error { panic("construction boom") }
+	qwpSfTestAfterEngineCreateHook.Store(&boom)
+	t.Cleanup(func() { qwpSfTestAfterEngineCreateHook.Store(nil) })
+
+	conf := strings.Join([]string{
+		"ws::addr=" + strings.TrimPrefix(srv.URL, "http://"),
+		"sf_dir=" + sfDir,
+		"sender_id=boom",
+		"close_flush_timeout_millis=50;",
+	}, ";")
+	func() {
+		defer func() { require.NotNil(t, recover(), "the injected fault must unwind") }()
+		_, _ = LineSenderFromConf(context.Background(), conf)
+	}()
+	qwpSfTestAfterEngineCreateHook.Store(nil)
+
+	require.Eventually(t, func() bool {
+		lock, err := qwpSfAcquireSlotLock(slot)
+		if err != nil {
+			return false
+		}
+		require.NoError(t, lock.close())
+		return true
+	}, 5*time.Second, 10*time.Millisecond,
+		"a construction fault must not strand the slot flock")
+}

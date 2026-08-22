@@ -205,8 +205,30 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		return nil, err
 	}
 	engine.engineSetLogger(qwpEffectiveLogger(conf.logger))
+	// The engine holds the slot flock, the segment mappings and the side-file
+	// descriptors from here on, and nothing else references it until the sender
+	// below takes ownership. Every error return in between hands it to a
+	// cleanup owner explicitly; this covers the unwind they cannot -- a panic
+	// in the connect walk, the send-loop construction or the orphan setup.
+	// Without it the pool's recover sees a nil slot, so it installs no retry
+	// owner either, and the flock is held until the process exits while close()
+	// reports a clean shutdown.
+	engineOwnedHere := true
+	var builtSender *qwpLineSender
+	defer func() {
+		if !engineOwnedHere {
+			return
+		}
+		if builtSender != nil {
+			_ = builtSender.closeCursor(ctx)
+			return
+		}
+		_ = qwpSfCloseEngineAfterBuildFailure(engine,
+			errors.New("qwp/sf: sender construction did not complete"), conf.logger)
+	}()
 	if hook := qwpSfTestAfterEngineCreateHook.Load(); hook != nil {
 		if hookErr := (*hook)(); hookErr != nil {
+			engineOwnedHere = false
 			return nil, qwpSfCloseEngineAfterBuildFailure(engine, hookErr, conf.logger)
 		}
 	}
@@ -296,6 +318,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			err = qwpSfUpgradeFailureSE(
 				engine.engineAckedFsn()+1, engine.enginePublishedFsn(), mismatch)
 		}
+		engineOwnedHere = false
 		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err, conf.logger)
 	}
 
@@ -351,8 +374,14 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	)
 	if err != nil {
 		_ = loop.sendLoopClose()
+		engineOwnedHere = false
 		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err, conf.logger)
 	}
+	// The sender owns the engine and the send loop now, so the guard above
+	// switches to closing it rather than the bare engine. The work still ahead
+	// -- the byte-trigger clamp and the one-shot CONNECTED, which reaches a
+	// user listener -- runs under that guard too.
+	builtSender = s
 	s.fileNameLimit = conf.fileNameLimit
 	// Pre-size the encoder buffer for the microbatch role: the cursor
 	// engine copies each frame on append so one encoder slot suffices,
@@ -398,6 +427,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		defer func() {
 			if !setupOK {
 				_ = s.closeCursor(ctx)
+				engineOwnedHere = false // this defer ran first; the outer guard is done
 			}
 		}()
 		maxDrainers := conf.maxBackgroundDrainers
@@ -453,6 +483,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		setupOK = true
 	}
 
+	engineOwnedHere = false
 	return s, nil
 }
 
