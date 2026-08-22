@@ -410,7 +410,7 @@ func (d *qwpSfErrorDispatcher) close() {
 		// done is closed — Go may pick inbox and fire the user callback
 		// after close() (hence Sender.Close) has already returned.
 		d.abandon.Store(true)
-		qwpEffectiveLogger(d.logger).Warn("qwp/sf: error handler still running after close; "+
+		qwpSfLogGuarded(d.logger, slog.LevelWarn, "qwp/sf: error handler still running after close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
 			"timeout", qwpSfDispatcherCloseJoinTimeout)
 	}

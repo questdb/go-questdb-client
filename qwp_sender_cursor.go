@@ -566,7 +566,7 @@ func (s *qwpLineSender) persistNewSymbols() error {
 		if s.cursorSendLoop != nil {
 			logger = s.cursorSendLoop.logger
 		}
-		qwpEffectiveLogger(logger).Warn(
+		qwpSfLogGuarded(logger, slog.LevelWarn,
 			"qwp/sf: symbol dictionary persistence failed; switching to full-dictionary frames",
 			"error", err)
 		return fmt.Errorf("qwp/sf: persist symbol dictionary: %w; sender switched to full-dictionary mode, retry the flush", err)

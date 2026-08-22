@@ -365,7 +365,7 @@ func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
 		// Shadows the OnPrimaryUnavailable listener callback (dispatched
 		// alongside this); throttled Debug so it adds a trace for deep
 		// debugging without duplicating the callback for the default case.
-		qwpEffectiveLogger(d.logger).Debug("qwp/sf: drainer sweep found only replicas "+
+		qwpSfLogGuarded(d.logger, slog.LevelDebug, "qwp/sf: drainer sweep found only replicas "+
 			"(transient failover window), retrying with capped backoff",
 			"slot", d.slotPath, "sweep", attempt)
 	}
@@ -871,7 +871,7 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 			// returns, but close() must not block on un-cancellable
 			// I/O. The slot it holds stays a valid orphan a future
 			// sender re-adopts. Surface the abandoned count for ops.
-			qwpEffectiveLogger(p.logger).Warn("qwp/sf: orphan drainer(s) still running after close; "+
+			qwpSfLogGuarded(p.logger, slog.LevelWarn, "qwp/sf: orphan drainer(s) still running after close; "+
 				"abandoning (wedged in un-cancellable disk I/O). Their slots remain adoptable on a future sender start.",
 				"count", p.activeCount(),
 				"grace", qwpSfDrainerPoolCloseGrace.load()+qwpSfDrainerPoolHardCloseGrace.load())

@@ -725,7 +725,7 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 		// the wedged goroutine, which is mid-dereference of the mapping, would
 		// fault the host process when storage resolves.
 		l.abandoned.Store(true)
-		qwpEffectiveLogger(l.logger).Warn("qwp/sf: send loop still running after close; "+
+		qwpSfLogGuarded(l.logger, slog.LevelWarn, "qwp/sf: send loop still running after close; "+
 			"abandoning (wedged in un-cancellable disk I/O)", "grace", qwpSfSendLoopCloseGrace.load())
 		// Release the WebSocket now rather than waiting on the wedged
 		// goroutine's defer (which may never run): the goroutine holds its own
@@ -1882,7 +1882,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 				l.durable.applyDurable(data[qwpAckTablesOffset(status):])
 				l.durableDrain()
 			} else if l.warnedStrayDurable.CompareAndSwap(false, true) {
-				qwpEffectiveLogger(l.logger).Warn("qwp/sf: received STATUS_DURABLE_ACK frame without opt-in — ignoring")
+				qwpSfLogGuarded(l.logger, slog.LevelWarn, "qwp/sf: received STATUS_DURABLE_ACK frame without opt-in — ignoring")
 			}
 			continue
 		}
@@ -1973,7 +1973,7 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 			// logged by the default handler when the user registered none), so
 			// this recycle trace is Debug: hidden by default, available for
 			// deep debugging without double-logging every retriable NACK.
-			qwpEffectiveLogger(l.logger).Debug("qwp/sf: server rejected frame — recycling connection",
+			qwpSfLogGuarded(l.logger, slog.LevelDebug, "qwp/sf: server rejected frame — recycling connection",
 				"seq", seq, "category", cat, "policy", pol,
 				"status", byte(status), "replayFromFsn", l.engine.engineAckedFsn()+1)
 			return &qwpSfRetriableRejection{msg: fmt.Sprintf(
@@ -2110,7 +2110,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 				if outcome.allReplica() {
 					reason = "every reachable endpoint is a replica (transient failover window)"
 				}
-				qwpEffectiveLogger(l.logger).Debug("qwp/sf: reconnect round exhausted; retrying with capped backoff",
+				qwpSfLogGuarded(l.logger, slog.LevelDebug, "qwp/sf: reconnect round exhausted; retrying with capped backoff",
 					"phase", phase, "round", round, "reason", reason)
 			}
 			if fn := l.onRoundExhausted; fn != nil {
@@ -2388,7 +2388,7 @@ func (l *qwpSfSendLoop) accumulateSentDict(payload []byte) {
 	l.sentDictCount = deltaEnd
 	if !l.dictSizeWarned && len(l.sentDictBytes) >= qwpSfSentDictWarnBytes {
 		l.dictSizeWarned = true
-		qwpEffectiveLogger(l.logger).Warn("qwp/sf: symbol dictionary is very large; "+
+		qwpSfLogGuarded(l.logger, slog.LevelWarn, "qwp/sf: symbol dictionary is very large; "+
 			"the whole dictionary is re-registered on every reconnect — check for "+
 			"unbounded-cardinality symbol values (e.g. a UUID used as a symbol)",
 			"bytes", len(l.sentDictBytes), "symbols", l.sentDictCount)

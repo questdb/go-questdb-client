@@ -315,7 +315,7 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 		// otherwise one slot recovers under a foreground sender and the same
 		// slot is abandoned under a drainer.
 		if errors.Is(err, qwpSfErrSanitizedResidue) && attempt == 0 {
-			qwpEffectiveLogger(nil).Error("qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
+			qwpSfLogGuarded(nil, slog.LevelError, "qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
 			continue
 		}
 		// Quarantine-and-start-fresh is a foreground-only policy: a drainer
@@ -329,7 +329,7 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 			if quarantineErr != nil {
 				return nil, fmt.Errorf("%w; additionally could not quarantine slot: %v", err, quarantineErr)
 			}
-			qwpEffectiveLogger(nil).Error("qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
+			qwpSfLogGuarded(nil, slog.LevelError, "qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
 			quarantinedPath = quarantined
 			continue
 		}
@@ -562,7 +562,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			if persistedDict != nil && len(recoveredSymbols) > persistedDict.size() {
 				from := persistedDict.size()
 				if appendErr := persistedDict.appendSymbols(recoveredSymbols[from:]); appendErr != nil {
-					qwpEffectiveLogger(nil).Warn(
+					qwpSfLogGuarded(nil, slog.LevelWarn,
 						"qwp/sf: could not heal recovered symbol dictionary; falling back to full-dictionary frames",
 						"error", appendErr)
 					_ = persistedDict.close()

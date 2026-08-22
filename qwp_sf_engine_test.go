@@ -30,6 +30,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -991,4 +993,45 @@ func TestQwpSfTerminalCleanupHasExactlyOneOwner(t *testing.T) {
 	require.True(t, e.engineCloseCompleted())
 	require.False(t, e.engineTryClaimTerminalCleanup())
 	require.False(t, e.engineCloseRetryable())
+}
+
+// TestQwpEveryProductionLogCallIsPanicGuarded keeps the rule mechanically
+// checkable. The logger is the application's slog handler, which is free to
+// panic: qwpEffectiveLogger(nil) resolves to slog.Default(), so "no logger
+// configured" is not "no user code". Every production log call therefore runs
+// through qwpSfLogGuarded, because the step behind a log call is regularly the
+// one that matters -- latching a fatal error, reporting on a channel, releasing
+// a transport, or assigning a fallback policy.
+//
+// The two exceptions are the dispatchers' own handler-panic reports, which
+// already carry an inner recover of their own.
+func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
+	allowed := map[string]bool{
+		"qwp_dispatcher.go":    true, // deliver()'s handler-panic report
+		"qwp_sf_dispatcher.go": true, // ditto
+	}
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+	unguarded := map[string][]int{}
+	call := regexp.MustCompile(`qwpEffectiveLogger\([^)]*\)\.(Warn|Error|Info|Debug|Log)\(`)
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") || allowed[f] {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		require.NoError(t, err)
+		inGuard := false
+		for i, line := range strings.Split(string(src), "\n") {
+			if strings.HasPrefix(line, "func qwpSfLogGuarded(") {
+				inGuard = true // the helper's own delegation to the handler
+			} else if strings.HasPrefix(line, "}") {
+				inGuard = false
+			}
+			if !inGuard && call.MatchString(line) {
+				unguarded[f] = append(unguarded[f], i+1)
+			}
+		}
+	}
+	require.Empty(t, unguarded,
+		"these log calls reach the user's slog handler unguarded; route them through qwpSfLogGuarded")
 }
