@@ -207,8 +207,9 @@ func TestQwpSfQuarantineCreationDebrisReportsAnUnrenameableManifest(t *testing.T
 
 	err := qwpSfQuarantineCreationDebris(path)
 	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed,
-		"the failure must be fail-closed so the caller preserves the whole slot")
-	require.ErrorContains(t, err, "operation not permitted")
+		"a permanent fault must be fail-closed so the caller preserves the whole slot")
+	require.ErrorIs(t, err, syscall.EPERM,
+		"and the cause must stay reachable for a caller that inspects it")
 	preserved, readErr := os.ReadFile(path)
 	require.NoError(t, readErr, "the manifest must still be there for the slot's quarantine")
 	require.Equal(t, "unusable", string(preserved))
@@ -229,7 +230,7 @@ func TestQwpSfUnrenameableManifestDoesNotBrickTheSlot(t *testing.T) {
 
 	original := qwpSfManifestQuarantineRename.load()
 	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
-	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.ENOSPC })
+	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.EROFS })
 
 	engine, err := qwpSfNewCursorEngine(slot, 4096, qwpSfUnlimitedTotalBytes, 0)
 	require.NoError(t, err, "the sender must still be constructible")
@@ -240,4 +241,29 @@ func TestQwpSfUnrenameableManifestDoesNotBrickTheSlot(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "the whole slot must be preserved instead")
 	require.NotEmpty(t, engine.engineQuarantinedSlotPath())
+}
+
+// TestQwpSfTransientQuarantineFaultIsNotFailClosed pins the other half. A full
+// disk or an exhausted fd table says nothing about the slot's bytes, and
+// fail-closed is a permanent verdict: a foreground sender would move a legacy
+// slot's undelivered rows into quarantined/, where nothing scans for them
+// again, and a drainer would write the .failed sentinel that disqualifies the
+// slot from every later adoption.
+func TestQwpSfTransientQuarantineFaultIsNotFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfManifestFileName)
+	require.NoError(t, os.WriteFile(path, []byte("unusable"), 0o644))
+
+	original := qwpSfManifestQuarantineRename.load()
+	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
+	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.ENOSPC })
+
+	err := qwpSfQuarantineCreationDebris(path)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed,
+		"a transient fault must not condemn the slot")
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	preserved, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	require.Equal(t, "unusable", string(preserved))
 }

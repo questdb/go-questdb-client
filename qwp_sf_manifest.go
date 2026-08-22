@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 )
 
 const (
@@ -273,22 +274,55 @@ var qwpSfManifestQuarantineRename = qwpSfSwappable(os.Rename)
 // carries the manifest-required flag -- a slot whose manifest is gone fails
 // closed rather than falling back to the legacy path.
 //
-// The failure is reported as fail-closed so the caller preserves the whole
-// slot under <sf_dir>/quarantined/ and starts a fresh one. Returning a plain
-// error instead strands the sender for good: the recovery policy only
-// quarantines on qwpSfErrRecoveryFailClosed, so every later construction for
-// that sender_id fails identically and ingestion stops until an operator
-// removes the file by hand. The slot-level quarantine is a rename in the
-// PARENT directory, so whatever is wrong with this one -- a full disk that
-// cannot afford the longer .corrupt name, a name already too long -- does not
-// block it.
+// What the failure is reported as depends on whether the fault says anything
+// about the slot. A permanent one -- a read-only mount, a name that cannot be
+// formed -- means no later attempt will do better, so it is fail-closed: the
+// caller preserves the whole slot under <sf_dir>/quarantined/ and starts a
+// fresh one, which is a rename in the PARENT directory and so is not blocked
+// by whatever is wrong with this one. Returning a plain error there strands the
+// sender for good, because the recovery policy only quarantines on
+// qwpSfErrRecoveryFailClosed and every later construction fails identically.
+//
+// A transient one -- a full disk, an exhausted fd table, an I/O error -- says
+// nothing about the bytes, and fail-closed is far too strong for it: a
+// foreground sender would move a legacy slot's undelivered rows into
+// quarantined/, where nothing scans for them again, and a drainer would write
+// the permanent .failed sentinel that disqualifies the slot from every later
+// adoption. Those faults are reported as an ordinary error, so the next
+// attempt retries once the disk or the fd table recovers.
+//
+// Either way the cause stays reachable with errors.Is.
 func qwpSfQuarantineCreationDebris(path string) error {
 	corrupt, err := qwpSfQuarantineTargetPath(path)
 	if err != nil {
-		return qwpSfFailClosed("could not choose a quarantine name for invalid %s: %v", path, err)
+		return qwpSfManifestQuarantineError("could not choose a quarantine name for invalid "+path, err)
 	}
 	if err := qwpSfManifestQuarantineRename.load()(path, corrupt); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return qwpSfFailClosed("could not quarantine invalid %s: %v", path, err)
+		return qwpSfManifestQuarantineError("could not quarantine invalid "+path, err)
 	}
 	return nil
+}
+
+// qwpSfManifestQuarantineError classifies a failure to set the manifest aside.
+// Only a fault that no retry can clear justifies condemning the slot.
+func qwpSfManifestQuarantineError(what string, cause error) error {
+	if qwpSfIsTransientFileFault(cause) {
+		return fmt.Errorf("qwp/sf: %s: %w", what, cause)
+	}
+	return fmt.Errorf("%w: %s: %w", qwpSfErrRecoveryFailClosed, what, cause)
+}
+
+// qwpSfIsTransientFileFault reports whether a filesystem error is one a later
+// attempt could get past. Anything unrecognised counts as transient: treating
+// an unknown fault as proof that the slot is inconsistent is the expensive
+// mistake, since that verdict is permanent.
+func qwpSfIsTransientFileFault(err error) bool {
+	switch {
+	case errors.Is(err, syscall.EROFS),
+		errors.Is(err, syscall.ENAMETOOLONG),
+		errors.Is(err, syscall.EACCES),
+		errors.Is(err, syscall.EPERM):
+		return false
+	}
+	return true
 }
