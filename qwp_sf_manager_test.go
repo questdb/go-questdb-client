@@ -244,14 +244,14 @@ func TestQwpSfManagerDeregisterDuringTrimKeepsSharedByteAccounting(t *testing.T)
 		<-release
 	}
 	qwpSfTestBeforeTrimAccountingHook.Store(&trimHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
 	t.Cleanup(func() {
 		if !released {
 			close(release)
 		}
 		qwpSfTestBeforeTrimAccountingHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
+		qwpSfManagerCloseGrace.store(oldGrace)
 	})
 
 	e1.engineAcknowledge(sealed.segmentBaseSeq() + sealed.segmentFrameCount() - 1)

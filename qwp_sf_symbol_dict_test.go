@@ -538,9 +538,9 @@ func TestQwpSfSymbolDictFreshOpenPropagatesStatFailure(t *testing.T) {
 	legacy := append(qwpSfTestSymbolDictHeader(), 0x01, 'x')
 	require.NoError(t, os.WriteFile(path, legacy, 0o644))
 
-	originalStat := qwpSfSymbolDictStat
-	qwpSfSymbolDictStat = func(string) (os.FileInfo, error) { return nil, errors.New("injected stat failure") }
-	t.Cleanup(func() { qwpSfSymbolDictStat = originalStat })
+	originalStat := qwpSfSymbolDictStat.load()
+	qwpSfSymbolDictStat.store(func(string) (os.FileInfo, error) { return nil, errors.New("injected stat failure") })
+	t.Cleanup(func() { qwpSfSymbolDictStat.store(originalStat) })
 
 	d, err := qwpSfSymbolDictOpen(dir)
 	require.Nil(t, d)
@@ -556,16 +556,16 @@ func TestQwpSfSymbolDictShortWriteRetryDoesNotAdvance(t *testing.T) {
 	require.NoError(t, err)
 	initialOffset := d.appendOffset
 
-	originalWriteAt := qwpSfSymbolDictWriteAt
+	originalWriteAt := qwpSfSymbolDictWriteAt.load()
 	shortWrite := true
-	qwpSfSymbolDictWriteAt = func(f *os.File, p []byte, off int64) (int, error) {
+	qwpSfSymbolDictWriteAt.store(func(f *os.File, p []byte, off int64) (int, error) {
 		if shortWrite {
 			shortWrite = false
 			return originalWriteAt(f, p[:len(p)-1], off)
 		}
 		return originalWriteAt(f, p, off)
-	}
-	t.Cleanup(func() { qwpSfSymbolDictWriteAt = originalWriteAt })
+	})
+	t.Cleanup(func() { qwpSfSymbolDictWriteAt.store(originalWriteAt) })
 
 	err = d.appendSymbols([]string{"AAPL", "MSFT"})
 	require.ErrorIs(t, err, io.ErrShortWrite)
@@ -589,9 +589,9 @@ func TestQwpSfSymbolDictTruncateFailureIsOperational(t *testing.T) {
 	contents := append(append([]byte(nil), prefix...), 0x80)
 	require.NoError(t, os.WriteFile(path, contents, 0o644))
 
-	originalTruncate := qwpSfSymbolDictTruncate
-	qwpSfSymbolDictTruncate = func(*os.File, int64) error { return errors.New("injected truncate failure") }
-	t.Cleanup(func() { qwpSfSymbolDictTruncate = originalTruncate })
+	originalTruncate := qwpSfSymbolDictTruncate.load()
+	qwpSfSymbolDictTruncate.store(func(*os.File, int64) error { return errors.New("injected truncate failure") })
+	t.Cleanup(func() { qwpSfSymbolDictTruncate.store(originalTruncate) })
 
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
 	require.Nil(t, d)

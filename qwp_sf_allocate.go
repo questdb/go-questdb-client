@@ -36,7 +36,7 @@ import (
 // filesystem, then restore the original in a t.Cleanup. Mirrors the Java
 // client's FilesFacade seam, where ENOSPC at allocate is fault-injected
 // through a test facade (see MmapSegment.create's facade overload).
-var qwpSfReserveNewBlocksFn = qwpSfReserveNewBlocks
+var qwpSfReserveNewBlocksFn = qwpSfSwappable(qwpSfReserveNewBlocks)
 
 // qwpSfAllocate extends f to at least size bytes and reserves real
 // disk blocks for the newly-extended range. Mirrors the Java client's
@@ -92,7 +92,7 @@ func qwpSfAllocate(f *os.File, size int64) error {
 		return nil
 	}
 	newBytes := target - currentSize
-	if err := qwpSfReserveNewBlocksFn(f, currentSize, newBytes); err != nil {
+	if err := qwpSfReserveNewBlocksFn.load()(f, currentSize, newBytes); err != nil {
 		return err
 	}
 	// Unified EOF advancement. On Linux when fallocate succeeded the

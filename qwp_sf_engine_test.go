@@ -599,3 +599,32 @@ func TestQwpSfEngineBackpressureSurfacesMaintenanceFailure(t *testing.T) {
 	e.managerEntry.entryMaintenanceSucceeded()
 	assert.NoError(t, e.managerEntry.entryMaintenanceError())
 }
+
+// TestQwpSfSwappableVarSurvivesConcurrentSwap pins the property the swappable
+// vars exist for. A test replacing one of these while a production goroutine
+// reads it is a data race on a plain var, and the goroutines that read them —
+// the close-retry owner above all — are ones a test has no way to join before
+// t.Cleanup puts the original back. Run under -race this fails the moment the
+// value stops going through an atomic.
+func TestQwpSfSwappableVarSurvivesConcurrentSwap(t *testing.T) {
+	v := qwpSfSwappable(time.Second)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = v.load()
+			}
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		v.store(time.Duration(i) * time.Millisecond)
+	}
+	close(stop)
+	<-done
+	require.Equal(t, 999*time.Millisecond, v.load())
+}

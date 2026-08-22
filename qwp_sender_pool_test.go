@@ -1060,14 +1060,14 @@ func TestQwpSenderPoolReprobesDeferredClose(t *testing.T) {
 		<-release
 	}
 	qwpSfTestSegmentCreateHook.Store(&createHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
 	t.Cleanup(func() {
 		if !released {
 			close(release)
 		}
 		qwpSfTestSegmentCreateHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
+		qwpSfManagerCloseGrace.store(oldGrace)
 	})
 
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
@@ -1141,14 +1141,14 @@ func TestQwpSenderPoolCloseReportsDeferredSlotAndRetryConverges(t *testing.T) {
 		<-release
 	}
 	qwpSfTestSegmentCreateHook.Store(&createHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
 	t.Cleanup(func() {
 		if !released {
 			close(release)
 		}
 		qwpSfTestSegmentCreateHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
+		qwpSfManagerCloseGrace.store(oldGrace)
 	})
 
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
@@ -1222,15 +1222,15 @@ func TestQwpSenderPoolBuildFailureRetiresSlotUntilDeferredCleanup(t *testing.T) 
 	}
 	qwpSfTestSegmentCreateHook.Store(&createHook)
 	qwpSfTestAfterEngineCreateHook.Store(&afterEngineHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
 	t.Cleanup(func() {
 		if !released {
 			close(release)
 		}
 		qwpSfTestSegmentCreateHook.Store(nil)
 		qwpSfTestAfterEngineCreateHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
+		qwpSfManagerCloseGrace.store(oldGrace)
 	})
 
 	_, err = p.borrow(context.Background())
@@ -1287,15 +1287,15 @@ func TestQwpSenderPoolRecoveryBuildFailureRetiresSlotUntilDeferredCleanup(t *tes
 	}
 	qwpSfTestSegmentCreateHook.Store(&createHook)
 	qwpSfTestAfterEngineCreateHook.Store(&afterEngineHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
 	t.Cleanup(func() {
 		if !released {
 			close(release)
 		}
 		qwpSfTestSegmentCreateHook.Store(nil)
 		qwpSfTestAfterEngineCreateHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
+		qwpSfManagerCloseGrace.store(oldGrace)
 	})
 
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +

@@ -453,9 +453,9 @@ const qwpSfZeroFillChunk = 64 << 10
 // qwpSfSegmentWriteAt is a test seam for block-forcing write failures on
 // the torn-tail sanitize path: tests swap it to inject ENOSPC without
 // having to fill a filesystem, then restore the original in a t.Cleanup.
-var qwpSfSegmentWriteAt = func(f *os.File, p []byte, off int64) (int, error) {
+var qwpSfSegmentWriteAt = qwpSfSwappable(func(f *os.File, p []byte, off int64) (int, error) {
 	return f.WriteAt(p, off)
-}
+})
 
 // reserveTailBlocks zeroes [from, to) through the file descriptor, so the
 // range is backed by real disk blocks before anything stores into it via
@@ -481,7 +481,7 @@ func (s *qwpSfSegment) reserveTailBlocks(from, to int64) error {
 		if n > chunk {
 			n = chunk
 		}
-		written, err := qwpSfSegmentWriteAt(s.file, zeros[:n], off)
+		written, err := qwpSfSegmentWriteAt.load()(s.file, zeros[:n], off)
 		if err != nil {
 			return fmt.Errorf("qwp/sf: reserve blocks for torn tail %s at offset %d: %w", s.path, off, err)
 		}

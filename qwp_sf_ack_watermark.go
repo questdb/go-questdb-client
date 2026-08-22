@@ -45,9 +45,9 @@ const qwpSfAckWatermarkInvalid int64 = math.MinInt64
 
 // qwpSfAckWatermarkWriteAt is a test seam for block-forcing write failures on
 // an existing correctly-sized watermark.
-var qwpSfAckWatermarkWriteAt = func(f *os.File, p []byte, off int64) (int, error) {
+var qwpSfAckWatermarkWriteAt = qwpSfSwappable(func(f *os.File, p []byte, off int64) (int, error) {
 	return f.WriteAt(p, off)
-}
+})
 
 // qwpSfAckWatermarkSync is a test seam for close/trim durability-barrier
 // failures. A nil pointer means production qwpSfFsync. Tests publish hooks
@@ -115,7 +115,7 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 			_ = f.Close()
 			return nil, fmt.Errorf("qwp/sf: read existing ack watermark %s: %w", path, err)
 		}
-		n, err := qwpSfAckWatermarkWriteAt(f, preserved[:], 0)
+		n, err := qwpSfAckWatermarkWriteAt.load()(f, preserved[:], 0)
 		if err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("qwp/sf: reserve blocks for existing ack watermark %s: %w", path, err)

@@ -94,11 +94,11 @@ func TestQwpSfAllocateZeroOnFreshFile(t *testing.T) {
 // so the package-level swap is race-free.
 func withInjectedReserveFailure(t *testing.T) {
 	t.Helper()
-	orig := qwpSfReserveNewBlocksFn
-	t.Cleanup(func() { qwpSfReserveNewBlocksFn = orig })
-	qwpSfReserveNewBlocksFn = func(_ *os.File, _, _ int64) error {
+	orig := qwpSfReserveNewBlocksFn.load()
+	t.Cleanup(func() { qwpSfReserveNewBlocksFn.store(orig) })
+	qwpSfReserveNewBlocksFn.store(func(_ *os.File, _, _ int64) error {
 		return fmt.Errorf("qwp/sf: fallocate fault-injected: %w", syscall.ENOSPC)
-	}
+	})
 }
 
 // TestQwpSfAllocateSurfacesReserveFailure pins item 3 of qwpSfAllocate's

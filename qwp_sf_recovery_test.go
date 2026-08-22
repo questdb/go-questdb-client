@@ -464,10 +464,10 @@ func TestQwpSfRecoveryKeepsTornActiveWhenReplacementCannotBeCreated(t *testing.T
 	require.NoError(t, f.Sync())
 	require.NoError(t, f.Close())
 
-	originalReserve := qwpSfReserveNewBlocksFn
-	qwpSfReserveNewBlocksFn = func(*os.File, int64, int64) error { return syscall.ENOSPC }
+	originalReserve := qwpSfReserveNewBlocksFn.load()
+	qwpSfReserveNewBlocksFn.store(func(*os.File, int64, int64) error { return syscall.ENOSPC })
 	_, _, err = qwpSfRecoverRing(dir, 4096)
-	qwpSfReserveNewBlocksFn = originalReserve
+	qwpSfReserveNewBlocksFn.store(originalReserve)
 	require.ErrorIs(t, err, syscall.ENOSPC)
 
 	// The torn file is still where the manifest says the active segment is, and

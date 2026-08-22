@@ -133,13 +133,13 @@ func TestQwpSfAckWatermarkExistingBlockReservationFailureStopsOpen(t *testing.T)
 	dir := t.TempDir()
 	writeForeignAckWatermark(t, dir, 42)
 
-	originalWriteAt := qwpSfAckWatermarkWriteAt
+	originalWriteAt := qwpSfAckWatermarkWriteAt.load()
 	writeCalls := 0
-	qwpSfAckWatermarkWriteAt = func(*os.File, []byte, int64) (int, error) {
+	qwpSfAckWatermarkWriteAt.store(func(*os.File, []byte, int64) (int, error) {
 		writeCalls++
 		return 0, syscall.ENOSPC
-	}
-	t.Cleanup(func() { qwpSfAckWatermarkWriteAt = originalWriteAt })
+	})
+	t.Cleanup(func() { qwpSfAckWatermarkWriteAt.store(originalWriteAt) })
 
 	w, err := qwpSfAckWatermarkOpenRequired(dir)
 	if w != nil {

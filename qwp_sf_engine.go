@@ -51,9 +51,30 @@ const qwpSfEngineParkInterval = 50 * time.Microsecond
 
 const qwpSfCloseRetryLogThrottle = 30 * time.Second
 
-// qwpSfCloseRetryInterval is variable so panic/retry tests do not need to wait
+// qwpSfSwappableVar holds a value that tests replace while production
+// goroutines are reading it. As a plain var every such swap is a data race:
+// the close-retry owner, the manager worker and the send loop all read theirs
+// from goroutines a test has no way to join before t.Cleanup puts the original
+// back. Routing them through an atomic makes the race detector quiet for the
+// right reason instead of by luck, and keeps one test calling t.Parallel from
+// breaking an unrelated one.
+type qwpSfSwappableVar[T any] struct {
+	v atomic.Pointer[T]
+}
+
+func qwpSfSwappable[T any](initial T) *qwpSfSwappableVar[T] {
+	s := &qwpSfSwappableVar[T]{}
+	s.v.Store(&initial)
+	return s
+}
+
+func (s *qwpSfSwappableVar[T]) load() T { return *s.v.Load() }
+
+func (s *qwpSfSwappableVar[T]) store(value T) { s.v.Store(&value) }
+
+// qwpSfCloseRetryInterval is swappable so panic/retry tests do not need to wait
 // through production's one-second terminal-cleanup cadence.
-var qwpSfCloseRetryInterval = time.Second
+var qwpSfCloseRetryInterval = qwpSfSwappable(time.Second)
 
 // ErrBackpressureTimeout is the sentinel a producer call
 // (At / AtNow / Flush / FlushAndGetSequence) wraps when the
@@ -1294,7 +1315,7 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 			if e.closeCompleted.Load() {
 				return
 			}
-			time.Sleep(qwpSfCloseRetryInterval)
+			time.Sleep(qwpSfCloseRetryInterval.load())
 		}
 	}()
 }

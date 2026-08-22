@@ -1066,9 +1066,9 @@ func TestQwpSfDrainerOpenFailureSurvivesPanickingLogger(t *testing.T) {
 	// A full disk is an operational failure, not proof that the slot is
 	// inconsistent, so the drainer logs it and leaves the slot for a later scan
 	// — the branch this test needs to reach.
-	originalReserve := qwpSfReserveNewBlocksFn
-	qwpSfReserveNewBlocksFn = func(*os.File, int64, int64) error { return syscall.ENOSPC }
-	t.Cleanup(func() { qwpSfReserveNewBlocksFn = originalReserve })
+	originalReserve := qwpSfReserveNewBlocksFn.load()
+	qwpSfReserveNewBlocksFn.store(func(*os.File, int64, int64) error { return syscall.ENOSPC })
+	t.Cleanup(func() { qwpSfReserveNewBlocksFn.store(originalReserve) })
 
 	drainer := qwpSfNewOrphanDrainer(
 		dir, 4096, qwpSfUnlimitedTotalBytes,

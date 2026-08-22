@@ -54,7 +54,7 @@ const (
 // qwpSfManagerCloseGrace bounds how long close() waits for the worker
 // goroutine or an individual ring service pass to quiesce. It is a variable so
 // the timeout paths can be tested without sleeping for five seconds.
-var qwpSfManagerCloseGrace = 5 * time.Second
+var qwpSfManagerCloseGrace = qwpSfSwappable(5 * time.Second)
 
 // qwpSfTestBeforeTrimAccountingHook is a test seam for the narrow race between
 // draining a trim batch and reconciling manager byte accounting. Production
@@ -285,7 +285,7 @@ func (m *qwpSfSegmentManager) segmentManagerClose() bool {
 	default:
 	}
 	// Bound the wait so a stuck worker can't deadlock close().
-	graceTimer := time.NewTimer(qwpSfManagerCloseGrace)
+	graceTimer := time.NewTimer(qwpSfManagerCloseGrace.load())
 	select {
 	case <-m.done:
 		graceTimer.Stop()
@@ -303,7 +303,7 @@ func (m *qwpSfSegmentManager) segmentManagerClose() bool {
 	}
 	// The loop is past every ring. A second bounded wait only avoids
 	// reporting quiescence while a previously handed-off cleanup is running.
-	graceTimer.Reset(qwpSfManagerCloseGrace)
+	graceTimer.Reset(qwpSfManagerCloseGrace.load())
 	select {
 	case <-m.done:
 		if !graceTimer.Stop() {
@@ -556,7 +556,7 @@ func (m *qwpSfSegmentManager) awaitRingQuiescence(entry *qwpSfManagerRingEntry) 
 	if entry == nil || m.workerGoid.Load() == 0 || m.workerGoid.Load() == qwpGoid() {
 		return true
 	}
-	deadline := time.Now().Add(qwpSfManagerCloseGrace)
+	deadline := time.Now().Add(qwpSfManagerCloseGrace.load())
 	for entry.isInService() {
 		if !time.Now().Before(deadline) {
 			return false

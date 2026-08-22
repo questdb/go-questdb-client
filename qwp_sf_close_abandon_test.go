@@ -203,12 +203,12 @@ func TestQwpEngineTerminalRetryOwnerRecoversPanicAndCompletes(t *testing.T) {
 		}
 	}
 	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
-	originalInterval := qwpSfCloseRetryInterval
-	qwpSfCloseRetryInterval = 10 * time.Millisecond
+	originalInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
 	t.Cleanup(func() {
 		qwpSfTestBeforeFlockReleaseHook.Store(nil)
 		qwpSfTestEngineFinishCloseHook.Store(nil)
-		qwpSfCloseRetryInterval = originalInterval
+		qwpSfCloseRetryInterval.store(originalInterval)
 	})
 
 	engine.engineStartCloseRetryOwner(nil)
@@ -234,11 +234,11 @@ func TestQwpEngineTerminalRetryOwnerSurvivesPanickingLogger(t *testing.T) {
 		return nil
 	}
 	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
-	originalInterval := qwpSfCloseRetryInterval
-	qwpSfCloseRetryInterval = 10 * time.Millisecond
+	originalInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
 	t.Cleanup(func() {
 		qwpSfTestBeforeFlockReleaseHook.Store(nil)
-		qwpSfCloseRetryInterval = originalInterval
+		qwpSfCloseRetryInterval.store(originalInterval)
 	})
 
 	require.Error(t, engine.engineClose())
@@ -278,11 +278,11 @@ func TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits(t *testing.T) {
 		<-release
 	}
 	qwpSfTestSegmentCreateHook.Store(&createHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
 	t.Cleanup(func() {
 		qwpSfTestSegmentCreateHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
+		qwpSfManagerCloseGrace.store(oldGrace)
 	})
 
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
@@ -335,15 +335,15 @@ func TestQwpEngineDeferredCleanupPanicTransfersToRetryOwner(t *testing.T) {
 		}
 	}
 	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
-	oldInterval := qwpSfCloseRetryInterval
-	qwpSfCloseRetryInterval = 10 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	oldInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
 	t.Cleanup(func() {
 		qwpSfTestSegmentCreateHook.Store(nil)
 		qwpSfTestEngineFinishCloseHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
-		qwpSfCloseRetryInterval = oldInterval
+		qwpSfManagerCloseGrace.store(oldGrace)
+		qwpSfCloseRetryInterval.store(oldInterval)
 		select {
 		case <-release:
 		default:
@@ -466,11 +466,11 @@ func TestQwpSharedManagerDefersOnlyTheBusyRing(t *testing.T) {
 		<-release
 	}
 	qwpSfTestSegmentCreateHook.Store(&createHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
 	t.Cleanup(func() {
 		qwpSfTestSegmentCreateHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
+		qwpSfManagerCloseGrace.store(oldGrace)
 	})
 
 	busy, err := qwpSfNewCursorEngineWithManager(dir, segSize, mgr, time.Second)
@@ -583,9 +583,9 @@ func TestQwpSendLoopCloseAbandonSignalsAndReleasesTransport(t *testing.T) {
 	// Done, so the join never completes and sendLoopClose must abandon.
 	loop.wg.Add(1)
 
-	old := qwpSfSendLoopCloseGrace
-	qwpSfSendLoopCloseGrace = 20 * time.Millisecond
-	defer func() { qwpSfSendLoopCloseGrace = old }()
+	old := qwpSfSendLoopCloseGrace.load()
+	qwpSfSendLoopCloseGrace.store(20 * time.Millisecond)
+	defer func() { qwpSfSendLoopCloseGrace.store(old) }()
 
 	require.NoError(t, loop.sendLoopClose())
 	require.True(t, loop.sendLoopAbandoned(), "wedged join must abandon")

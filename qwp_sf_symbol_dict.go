@@ -133,9 +133,9 @@ const (
 // failures a real disk produces rarely: a stat outage, a refused truncate, and
 // a short write.
 var (
-	qwpSfSymbolDictStat     = os.Stat
-	qwpSfSymbolDictTruncate = func(f *os.File, size int64) error { return f.Truncate(size) }
-	qwpSfSymbolDictWriteAt  = func(f *os.File, p []byte, off int64) (int, error) { return f.WriteAt(p, off) }
+	qwpSfSymbolDictStat     = qwpSfSwappable(os.Stat)
+	qwpSfSymbolDictTruncate = qwpSfSwappable(func(f *os.File, size int64) error { return f.Truncate(size) })
+	qwpSfSymbolDictWriteAt  = qwpSfSwappable(func(f *os.File, p []byte, off int64) (int, error) { return f.WriteAt(p, off) })
 )
 
 // qwpSfSymbolDictOpen opens (creating if absent) the dictionary file in
@@ -150,7 +150,7 @@ func qwpSfSymbolDictOpen(slotDir string) (*qwpSfSymbolDict, error) {
 		return nil, nil
 	}
 	path := filepath.Join(slotDir, qwpSfSymbolDictFileName)
-	st, statErr := qwpSfSymbolDictStat(path)
+	st, statErr := qwpSfSymbolDictStat.load()(path)
 	if statErr == nil {
 		if st.Size() >= qwpSfSymbolDictHeaderSize {
 			if d := qwpSfSymbolDictOpenExisting(path, st.Size()); d != nil {
@@ -176,7 +176,7 @@ func qwpSfSymbolDictOpenClean(slotDir string) (*qwpSfSymbolDict, error) {
 		return nil, nil
 	}
 	path := filepath.Join(slotDir, qwpSfSymbolDictFileName)
-	_, statErr := qwpSfSymbolDictStat(path)
+	_, statErr := qwpSfSymbolDictStat.load()(path)
 	existed := statErr == nil
 	if statErr != nil && !os.IsNotExist(statErr) {
 		return nil, fmt.Errorf("qwp/sf: inspect fresh symbol dictionary %s: %w", path, statErr)
@@ -290,7 +290,7 @@ func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymb
 	// disk, where a later recovery could read it as real entries and shift
 	// every id after it.
 	if int64(pos) < fileLen {
-		if err := qwpSfSymbolDictTruncate(f, int64(pos)); err != nil {
+		if err := qwpSfSymbolDictTruncate.load()(f, int64(pos)); err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("qwp/sf: could not drop torn/stale symbol dictionary tail %s: %w", path, err)
 		}
@@ -459,7 +459,7 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 	}
 	d.scratch = binary.LittleEndian.AppendUint32(
 		d.scratch, crc32.Checksum(d.scratch, qwpSfCrcTable))
-	written, err := qwpSfSymbolDictWriteAt(d.file, d.scratch, d.appendOffset)
+	written, err := qwpSfSymbolDictWriteAt.load()(d.file, d.scratch, d.appendOffset)
 	if err != nil {
 		return err
 	}

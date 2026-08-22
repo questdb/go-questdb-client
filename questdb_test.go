@@ -153,12 +153,12 @@ func TestQuestDBCloseReprobesRetainedSlotLocks(t *testing.T) {
 		<-release
 	}
 	qwpSfTestSegmentCreateHook.Store(&createHook)
-	oldGrace := qwpSfManagerCloseGrace
-	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
 	t.Cleanup(func() {
 		releaseOnce.Do(func() { close(release) })
 		qwpSfTestSegmentCreateHook.Store(nil)
-		qwpSfManagerCloseGrace = oldGrace
+		qwpSfManagerCloseGrace.store(oldGrace)
 	})
 
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +

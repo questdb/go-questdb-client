@@ -314,13 +314,13 @@ func TestQwpSfSegmentSanitizeTornTailReservesBlocksThroughDescriptor(t *testing.
 	const segSize int64 = 4096
 	writeTornSegment(t, path, segSize)
 
-	original := qwpSfSegmentWriteAt
+	original := qwpSfSegmentWriteAt.load()
 	var covered []int64
-	qwpSfSegmentWriteAt = func(f *os.File, p []byte, off int64) (int, error) {
+	qwpSfSegmentWriteAt.store(func(f *os.File, p []byte, off int64) (int, error) {
 		covered = append(covered, off, off+int64(len(p)))
 		return original(f, p, off)
-	}
-	t.Cleanup(func() { qwpSfSegmentWriteAt = original })
+	})
+	t.Cleanup(func() { qwpSfSegmentWriteAt.store(original) })
 
 	seg, err := qwpSfOpenSegment(path)
 	require.NoError(t, err)
@@ -345,11 +345,11 @@ func TestQwpSfSegmentSanitizeTornTailSurfacesFullDisk(t *testing.T) {
 	path := filepath.Join(dir, "sf-torntail-enospc.sfa")
 	writeTornSegment(t, path, 4096)
 
-	original := qwpSfSegmentWriteAt
-	qwpSfSegmentWriteAt = func(*os.File, []byte, int64) (int, error) {
+	original := qwpSfSegmentWriteAt.load()
+	qwpSfSegmentWriteAt.store(func(*os.File, []byte, int64) (int, error) {
 		return 0, syscall.ENOSPC
-	}
-	t.Cleanup(func() { qwpSfSegmentWriteAt = original })
+	})
+	t.Cleanup(func() { qwpSfSegmentWriteAt.store(original) })
 
 	seg, err := qwpSfOpenSegment(path)
 	require.NoError(t, err)
