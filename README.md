@@ -138,7 +138,7 @@ SQL — plus a background housekeeper that closes idle and over-age connections.
 | `qdb.NewQuestDB(ctx, conf, opts...)` | `*QuestDB` | Same, with pool-tuning options. |
 | `db.BorrowSender(ctx)` | `LineSender` | Lease a sender; `Close` flushes and returns it to the pool. |
 | `db.BorrowQuery(ctx)` | `*Query` | Lease a query session; `Close` returns it. |
-| `db.Close(ctx)` | `error` | Shut down both pools and disconnect every underlying client. Idempotent. |
+| `db.Close(ctx)` | `error` | Shut down both pools and disconnect every underlying client. Idempotent. Returns an error wrapping `qdb.ErrSfCleanupPending` while a store-and-forward slot's cleanup is still retrying — a "not yet", not a failure: call it again later (see [Store-and-forward](#store-and-forward)). |
 
 The schema must be `ws` or `wss` — the pooled facade is QWP-only. A borrowed
 sender or query session is single-threaded; the handle itself is safe to share.
@@ -498,7 +498,23 @@ SF terminal cleanup retries transient local-storage failures indefinitely while
 the process remains alive. A persistent disk fault therefore keeps that slot's
 flock—and, for a pooled sender, its capacity reservation—until storage recovers
 or the process exits; releasing either earlier could let a new owner race files
-whose durable cleanup did not finish.
+whose durable cleanup did not finish. While any slot's cleanup is still
+outstanding, `db.Close(ctx)` returns an error wrapping `qdb.ErrSfCleanupPending`
+and a standalone sender's `Close` returns nil; neither means the slot's lock is
+gone. Call `db.Close(ctx)` again later — it re-probes every time and returns nil
+once the last lock is released.
+
+#### Local errors from the SF path
+
+Two sentinels report local storage rather than the server, and neither is
+terminal: the rows stay pending and the same call can be retried.
+
+| Error | Raised by | Meaning |
+|---|---|---|
+| `qdb.ErrBackpressureTimeout` | `At` / `AtNow` / `Flush` | The engine had no room within `sf_append_deadline_millis`. The wire is not draining, or `sf_max_total_bytes` is too small. |
+| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` | Local storage would not commit: a segment rotation that could not write its header or manifest, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
+
+Match them with `errors.Is`.
 
 #### Quarantined slots
 
