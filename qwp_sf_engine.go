@@ -1123,9 +1123,18 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	if !quiescent {
 		e.deferredCleanupOwned.Store(true)
 		defer func() {
-			if !ownershipSettled {
-				e.deferredCleanupOwned.Store(false)
+			if ownershipSettled {
+				return
 			}
+			e.deferredCleanupOwned.Store(false)
+			// managerTornDown goes back with it. Reaching here means the
+			// worker is provably NOT past its ring loop, and leaving the
+			// teardown marker up would satisfy engineTryClaimTerminalCleanup
+			// exactly: the next claimant would close the ring and release the
+			// flock while the worker is still writing in the slot directory.
+			// Cleared, engineRetryCloseIfNeeded re-drives the whole close
+			// instead, which re-derives quiescence before deciding anything.
+			e.managerTornDown.Store(false)
 		}()
 	}
 	// The manager teardown is now behind us and its outcome is recorded, so

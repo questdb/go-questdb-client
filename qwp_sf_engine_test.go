@@ -1097,6 +1097,8 @@ func TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine(t *tes
 
 	require.False(t, e.deferredCleanupOwned.Load(),
 		"a fault before the handoff must not leave the engine owned by nobody")
+	require.False(t, e.managerTornDown.Load(),
+		"nor claimable, since the worker is provably still in the slot")
 
 	close(release)
 	released = true
