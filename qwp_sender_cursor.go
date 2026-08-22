@@ -999,7 +999,13 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 		firstErr = engineCloseErr
 	}
 	if !s.cursorEngine.engineCloseCompleted() {
-		logger := qwpEffectiveLogger(s.cursorEngine.manager.logger.Load())
+		// A hand-built engine in tests can carry no manager, so read the
+		// configured logger only when one is there.
+		var configured *slog.Logger
+		if s.cursorEngine.manager != nil {
+			configured = s.cursorEngine.manager.logger.Load()
+		}
+		logger := qwpEffectiveLogger(configured)
 		s.ensureCloseRetryOwner(logger)
 		logger.Warn(
 			"qwp/sf: foreground close incomplete; terminal cleanup retry owner started",

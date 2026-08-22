@@ -1151,8 +1151,13 @@ func (e *qwpSfCursorEngine) engineFinishDrainedFileCleanup() error {
 // engineCompleteDeferredClose is invoked by the manager after it is provably
 // past the worker loop or the affected ring's service pass.
 func (e *qwpSfCursorEngine) engineCompleteDeferredClose() {
+	// Claim terminal cleanup before dropping the deferred-ownership marker.
+	// Both markers stay up across the claim, so a repeated Close sampling them
+	// never sees an ownerless engine while this handoff is about to run the
+	// cleanup itself.
+	claimed := e.terminalCleanupClaimed.CompareAndSwap(false, true)
 	e.deferredCleanupOwned.Store(false)
-	if !e.terminalCleanupClaimed.CompareAndSwap(false, true) {
+	if !claimed {
 		return
 	}
 	e.appendMu.Lock()
@@ -1177,21 +1182,54 @@ func (e *qwpSfCursorEngine) engineCloseCompleted() bool {
 	return e != nil && e.closeCompleted.Load()
 }
 
-// engineCloseRetryable reports an incomplete close whose cleanup has no owner.
-// It is false while the manager worker or another Close is responsible, which
-// lets pool reprobes stay non-blocking during a legitimately stuck service
-// pass. A true result means an earlier cleanup attempt failed and may be
-// retried inline.
-func (e *qwpSfCursorEngine) engineCloseRetryable() bool {
-	return e != nil && e.closed.Load() && !e.closeCompleted.Load() &&
-		!e.deferredCleanupOwned.Load() && !e.terminalCleanupClaimed.Load()
+// engineTryClaimTerminalCleanup takes ownership of an incomplete close whose
+// cleanup has no owner. It fails while the manager worker or another claimant
+// is responsible, which lets pool reprobes stay non-blocking during a
+// legitimately stuck service pass. Success transfers the terminalCleanupClaimed
+// claim to the caller, which must run it through engineFinishClaimedClose;
+// engineFinishCloseGuarded releases the claim again if the attempt fails.
+func (e *qwpSfCursorEngine) engineTryClaimTerminalCleanup() bool {
+	if e == nil || !e.closed.Load() || e.closeCompleted.Load() || e.deferredCleanupOwned.Load() {
+		return false
+	}
+	return e.terminalCleanupClaimed.CompareAndSwap(false, true)
 }
 
+// engineCloseRetryable claims terminal cleanup for a repeated Close, and is
+// the gate that lets such a Close proceed instead of reporting a double close.
+// The claim is what makes the decision race-free: the sampling of the
+// ownership markers and the claim on them happen as one atomic step, so of two
+// concurrent Close calls exactly one runs the retry. The engine's own retry
+// owner is an owner too, so a Close alongside a running retry-owner goroutine
+// leaves the work to it.
+func (e *qwpSfCursorEngine) engineCloseRetryable() bool {
+	if e == nil || e.closeRetryOwnerStarted.Load() {
+		return false
+	}
+	return e.engineTryClaimTerminalCleanup()
+}
+
+// engineFinishClaimedClose runs the terminal cleanup owned by a successful
+// claim. The retry resumes at engineFinishClose with the drain decision the
+// first attempt recorded, which is the part of the close that outlives a failed
+// attempt; the manager teardown ahead of it is already done by the time cleanup
+// becomes ownerless.
+func (e *qwpSfCursorEngine) engineFinishClaimedClose() error {
+	e.appendMu.Lock()
+	defer e.appendMu.Unlock()
+	return e.engineFinishCloseGuarded(e.deferredFullyDrained.Load(), e.deferredLeakSegments.Load())
+}
+
+// engineRetryCloseIfNeeded runs one cleanup attempt for the engine's retry
+// owner and for pool reprobes. It claims through
+// engineTryClaimTerminalCleanup directly: the retry-owner goroutine holds
+// closeRetryOwnerStarted for its whole lifetime, so the gate that keeps a
+// repeated Close away from it must not keep the owner away from its own work.
 func (e *qwpSfCursorEngine) engineRetryCloseIfNeeded() error {
-	if !e.engineCloseRetryable() {
+	if !e.engineTryClaimTerminalCleanup() {
 		return nil
 	}
-	return e.engineCloseInternal(e.deferredLeakSegments.Load())
+	return e.engineFinishClaimedClose()
 }
 
 // engineRunCloseRetryAttempt contains panics outside terminal cleanup itself,

@@ -1504,9 +1504,12 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 		// The first Close may have safely handed engine cleanup to the manager
 		// worker, which can then hit a transient durability or flock-release
 		// error. Preserve the public double-close contract once cleanup is owned
-		// or complete, but let an otherwise ownerless terminal cleanup converge.
+		// or complete, but let an otherwise ownerless terminal cleanup finish.
+		// engineCloseRetryable claims that ownership, so concurrent repeated
+		// Close calls cannot both run the retry: the loser sees an owned
+		// cleanup and reports the double close.
 		if s.cursorEngine != nil && s.cursorEngine.engineCloseRetryable() {
-			return s.cursorEngine.engineRetryCloseIfNeeded()
+			return s.cursorEngine.engineFinishClaimedClose()
 		}
 		return errDoubleSenderClose
 	}
