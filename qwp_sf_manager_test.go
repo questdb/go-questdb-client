@@ -541,11 +541,15 @@ func TestQwpSfSpareProvisioningFailureSurfacesAsDurability(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = e.engineClose() })
 
-	// Fail every barrier from here on, then drop the spare so the manager has
-	// to mint a replacement and hit it.
+	// Fail every barrier from here on. The manager keeps trying to mint a
+	// spare and keeps failing, and a run of failures latches the durability
+	// error producers read -- which is the whole point: the alternative is a
+	// silent stall reported to the caller as a full buffer.
 	fail.Store(true)
 	require.Eventually(t, func() bool {
-		return e.managerEntry != nil && e.managerEntry.maintenanceFailures > 0
-	}, 5*time.Second, time.Millisecond,
-		"a failing slot directory barrier must be recorded, not discarded")
+		return errors.Is(e.managerEntry.entryMaintenanceError(), ErrSfDurability)
+	}, 10*time.Second, time.Millisecond,
+		"a failing slot directory barrier must surface as ErrSfDurability, not be discarded")
+	require.ErrorIs(t, e.managerEntry.entryMaintenanceError(), injected,
+		"and must name the barrier failure that caused it")
 }
