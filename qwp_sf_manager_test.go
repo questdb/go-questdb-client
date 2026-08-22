@@ -562,3 +562,73 @@ func TestQwpSfSpareProvisioningFailureSurfacesAsDurability(t *testing.T) {
 	require.ErrorIs(t, e.managerEntry.entryMaintenanceError(), injected,
 		"and must name the barrier failure that caused it")
 }
+
+// TestQwpSfServicePassCarriesEveryFailureItAccumulated pins the joins on the
+// mid-pass exits. A reviewer showed that reverting all five — and even
+// dropping both carried errors from them — left the whole suite green, so the
+// diagnostics they exist to preserve were unguarded.
+//
+// The case that matters is a slot failing in more than one way at once: the
+// error an operator reads names the exit that fired, and without the joins it
+// never mentions the spare that could not be minted, which is what actually
+// stopped rotation.
+func TestQwpSfServicePassCarriesEveryFailureItAccumulated(t *testing.T) {
+	dir := t.TempDir()
+	// Two distinct faults, so the carried one is distinguishable from the one
+	// belonging to the exit that fires. The spare mint's barrier is carried;
+	// the watermark sync is the exit.
+	spareFault := errors.New("injected spare barrier failure")
+	syncFault := errors.New("injected watermark sync failure")
+	var fail atomic.Bool
+	hook := func(string) error {
+		if fail.Load() {
+			return spareFault
+		}
+		return nil
+	}
+	qwpSfTestDirSyncHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(nil) })
+	syncHook := func(*os.File) error {
+		if fail.Load() {
+			return syncFault
+		}
+		return nil
+	}
+	qwpSfAckWatermarkSync.Store(&syncHook)
+	t.Cleanup(func() { qwpSfAckWatermarkSync.Store(nil) })
+
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		fail.Store(false)
+		_ = e.engineClose()
+	})
+
+	// Rotate first, so the pass has a sealed segment to trim and reaches a
+	// mid-pass exit rather than the no-trim one. Rotation needs a spare, so
+	// this has to happen before the barrier starts failing.
+	payload := make([]byte, 512)
+	var fsn int64
+	require.Eventually(t, func() bool {
+		var appendErr error
+		fsn, appendErr = e.engineAppendBlocking(context.Background(), payload)
+		require.NoError(t, appendErr)
+		e.ring.mu.Lock()
+		sealed := len(e.ring.sealedSegments)
+		e.ring.mu.Unlock()
+		return sealed > 0
+	}, 10*time.Second, time.Millisecond, "the ring must rotate at least once")
+	e.ring.acknowledge(fsn)
+	fail.Store(true)
+
+	// The spare mint fails first and is carried; the pre-trim barrier then
+	// fails and is the exit. Both must be in what the producer sees.
+	require.Eventually(t, func() bool {
+		return errors.Is(e.managerEntry.entryMaintenanceError(), ErrSfDurability)
+	}, 10*time.Second, time.Millisecond)
+	got := e.managerEntry.entryMaintenanceError()
+	require.ErrorIs(t, got, syncFault, "the exit's own failure must be reachable")
+	require.ErrorIs(t, got, spareFault,
+		"and so must the spare failure the pass carried into it")
+	require.ErrorIs(t, got, ErrSfDurability, "reaching the producer as durability")
+}
