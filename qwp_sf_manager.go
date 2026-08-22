@@ -644,15 +644,22 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			}
 			m.mu.Unlock()
 			if shouldLog {
-				logger := qwpEffectiveLogger(m.logger.Load())
+				// Guarded like every other log this goroutine writes: the
+				// worker's recover is final, so a panicking user handler here
+				// would stop provisioning and trimming for every slot this
+				// manager serves, and the producer would be told
+				// "segment manager worker stopped" for what is a logging bug.
+				logger := m.logger.Load()
 				if memoryMode {
-					logger.Warn("qwp/sf: in-memory segment cap reached; spare provisioning "+
-						"paused — producers block until in-flight segments are ACK'd and trimmed",
+					qwpSfLogGuarded(logger, slog.LevelWarn,
+						"qwp/sf: in-memory segment cap reached; spare provisioning "+
+							"paused — producers block until in-flight segments are ACK'd and trimmed",
 						"usedBytes", observedTotal, "maxBytes", m.maxTotalBytes,
 						"segmentSize", m.segmentSizeBytes)
 				} else {
-					logger.Warn("qwp/sf: disk cap reached; spare provisioning "+
-						"paused — producers block until in-flight segments are ACK'd and trimmed",
+					qwpSfLogGuarded(logger, slog.LevelWarn,
+						"qwp/sf: disk cap reached; spare provisioning "+
+							"paused — producers block until in-flight segments are ACK'd and trimmed",
 						"dir", e.dir, "usedBytes", observedTotal, "maxBytes", m.maxTotalBytes,
 						"segmentSize", m.segmentSizeBytes)
 				}

@@ -306,6 +306,39 @@ func TestQwpSfManagerNextSparePathIncrements(t *testing.T) {
 	assert.Equal(t, filepath.Join(dir, "sf-0000000000000001.sfa"), b)
 }
 
+// The manager worker's recover is final: it records the panic and the worker
+// never comes back, so provisioning and trimming stop for every slot that
+// manager serves and producers are told "segment manager worker stopped". A
+// user-supplied slog handler must not be able to cause that, so the cap-reached
+// warnings go through the same guard as every other log on this goroutine.
+func TestQwpSfManagerCapWarningSurvivesPanickingLogger(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		dir  string
+	}{
+		{name: "memory"},
+		{name: "disk", dir: t.TempDir()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := qwpSfNewSegmentManager(4096, time.Hour, 4096)
+			require.NoError(t, err)
+			m.logger.Store(slog.New(panicOnHandleSlog{}))
+
+			seg, err := qwpSfCreateInMemorySegment(0, 4096)
+			require.NoError(t, err)
+			r := qwpSfNewSegmentRing(seg, 4096)
+			defer func() { _ = r.segmentRingClose() }()
+			require.True(t, r.needsHotSpare())
+
+			// Already at the cap, so provisioning is skipped and the warning
+			// is written.
+			m.totalBytes = 4096
+			e := &qwpSfManagerRingEntry{dir: tc.dir, ring: r}
+			require.NotPanics(t, func() { m.serviceRing(e) })
+		})
+	}
+}
+
 // A trim pass that gives up partway through still has to credit the bytes an
 // earlier pass's leftover unlinks just reclaimed: those files are gone and off
 // the retry list, so nothing else will ever account for them. Losing them
