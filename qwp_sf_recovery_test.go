@@ -1229,3 +1229,31 @@ func TestQwpSfLegacyMigrationRefusesATornSegmentBelowASynthesizedHead(t *testing
 	_, statErr := os.Stat(filepath.Join(dir, "sf-initial.sfa"))
 	require.NoError(t, statErr, "and its bytes must still be on disk")
 }
+
+// TestQwpSfFramefulDuplicateAtTheActiveBaseIsPreserved pins the preserve set,
+// the one branch where a segment carrying frames at or above the committed
+// head survives without being adopted into the chain. Two independent
+// mutations — never consulting the set, and never populating it — deleted such
+// a file with the whole suite green, so the branch whose comment says it keeps
+// the no-frame-destroyed guarantee "resting on the code" was resting on
+// nothing.
+func TestQwpSfFramefulDuplicateAtTheActiveBaseIsPreserved(t *testing.T) {
+	dir := t.TempDir()
+	sealed := createRecoverySegment(t, dir, "sf-a.sfa", 0, "f0", "f1", "f2")
+	active := createRecoverySegment(t, dir, "sf-b.sfa", 3, "f3")
+	dup := createRecoverySegment(t, dir, "sf-c.sfa", 3, "dup3") // frameful, same base
+	createRecoveryManifest(t, dir, 0, 3, sealed, active, dup)
+	closeRecoverySegments(t, sealed, active, dup)
+
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	require.NotNil(t, ring)
+	defer ring.segmentRingClose()
+
+	dupPath := filepath.Join(dir, "sf-c.sfa")
+	_, statErr := os.Stat(dupPath + ".corrupt")
+	require.NoError(t, statErr,
+		"a frameful duplicate at the committed active base must be preserved")
+	_, statErr = os.Stat(dupPath)
+	require.True(t, os.IsNotExist(statErr), "and moved out of the .sfa namespace")
+}
