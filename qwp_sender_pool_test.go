@@ -1980,3 +1980,76 @@ func TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved(t *testing.T) {
 		return p.leakedSlots == 0 && !p.slotInUse[0]
 	}, 10*time.Second, 10*time.Millisecond, "the index must come back once cleanup finishes")
 }
+
+// TestQwpSenderPoolPanicAfterSenderBuiltKeepsSlotReserved covers the other two
+// construction unwind paths. The reporter used to be carried out only when the
+// sender did not exist yet, so a fault after it was built — or inside the
+// orphan setup, whose own defer ran first — still reached the pool as a bare
+// panic. The pool then freed the slot index while the retry owner held that
+// directory's flock, which is the collision the reservation bitmap exists to
+// prevent.
+func TestQwpSenderPoolPanicAfterSenderBuiltKeepsSlotReserved(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	// Fault after the sender exists: the transport-swap callback runs there.
+	boom := func() {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+		}
+		panic("post-sender boom")
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpTestAfterSenderBuiltHook.Store(&boom)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpTestAfterSenderBuiltHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	_, err = p.borrow(context.Background())
+	require.ErrorContains(t, err, "sender build panicked")
+
+	p.mu.Lock()
+	reserved, leaked := p.slotInUse[0], p.leakedSlots
+	p.mu.Unlock()
+	require.True(t, reserved, "the index must stay reserved while the flock is held")
+	require.Equal(t, 1, leaked, "the slot must be retired, not freed")
+
+	close(release)
+	released = true
+	require.Eventually(t, func() bool {
+		p.reprobeRetiredSlots()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.leakedSlots == 0 && !p.slotInUse[0]
+	}, 10*time.Second, 10*time.Millisecond, "the index must come back once cleanup finishes")
+}

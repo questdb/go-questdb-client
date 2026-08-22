@@ -220,27 +220,43 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		if !engineOwnedHere {
 			return
 		}
-		if builtSender != nil {
-			_ = builtSender.closeCursor(context.Background())
+		// Only ever reached while unwinding: every return past this point
+		// clears engineOwnedHere first. Recovering here rather than relying on
+		// that audit holding means a future return that forgets cannot be
+		// turned into a panic with a nil cause.
+		r := recover()
+		if r == nil {
 			return
 		}
-		// The send loop is built before the sender is, and by then it owns a
-		// bound WebSocket and three dispatcher goroutines. Closing only the
-		// engine would leave the socket fd, the server-side connection and
-		// those goroutines alive for the process lifetime.
-		if builtLoop != nil {
-			_ = builtLoop.sendLoopClose()
-		}
-		cleanupErr := qwpSfCloseEngineAfterBuildFailure(engine,
-			errors.New("qwp/sf: sender construction did not complete"), conf.logger)
-		// Carry the cleanup reporter out with the panic. The pool's recover
-		// sees only an error and a nil slot otherwise, so it frees the slot
-		// index while this engine's retry owner still holds that directory's
-		// flock -- and a later borrow re-picks the index and fails to open it.
 		var reporter closeLifecycleReporter
-		if errors.As(cleanupErr, &reporter) {
-			panic(qwpSfBuildPanic{cause: recover(), reporter: reporter})
+		if builtSender != nil {
+			_ = builtSender.closeCursor(context.Background())
+			// Once the sender exists it is the reporter.
+			if !builtSender.closeCompleted() {
+				reporter = builtSender
+			}
+		} else {
+			// The send loop is built before the sender is, and by then it owns
+			// a bound WebSocket and three dispatcher goroutines. Closing only
+			// the engine would leave the socket fd, the server-side connection
+			// and those goroutines alive for the process lifetime.
+			if builtLoop != nil {
+				_ = builtLoop.sendLoopClose()
+			}
+			cleanupErr := qwpSfCloseEngineAfterBuildFailure(engine,
+				errors.New("qwp/sf: sender construction did not complete"), conf.logger)
+			_ = errors.As(cleanupErr, &reporter)
 		}
+		// Carry the cleanup reporter out with the panic whenever the slot's
+		// lock is still held. The pool's recover sees only an error and a nil
+		// slot otherwise, so it frees the slot index while this engine's retry
+		// owner still holds that directory's flock, and a later borrow
+		// re-picks the index and fails to open it. Memory mode has no slot and
+		// no lock, so the panic goes out unwrapped.
+		if reporter != nil && engine.engineSfDir() != "" {
+			panic(qwpSfBuildPanic{cause: r, reporter: reporter})
+		}
+		panic(r)
 	}()
 	if hook := qwpSfTestAfterEngineCreateHook.Load(); hook != nil {
 		if hookErr := (*hook)(); hookErr != nil {
@@ -419,6 +435,9 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	// sendLoopStart so the I/O goroutine sees the installed
 	// callback on the very first swap.
 	loop.sendLoopSetOnTransportSwap(s.applyServerBatchSizeLimit)
+	if hook := qwpTestAfterSenderBuiltHook.Load(); hook != nil {
+		(*hook)()
+	}
 	s.applyServerBatchSizeLimit(loop.transport.Load())
 	// Sync/Off connected synchronously at construction (transport != nil);
 	// fire the one-shot CONNECTED now that the sender is fully built, so a
@@ -445,13 +464,22 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	if conf.drainOrphans {
 		setupOK := false
 		defer func() {
-			if !setupOK {
-				// context.Background(), not the caller's ctx: a ctx whose
-				// deadline expired during the connect walk would cut the
-				// drain to nothing and abandon published frames.
-				_ = s.closeCursor(context.Background())
-				engineOwnedHere = false // this defer ran first; the outer guard is done
+			if setupOK {
+				return
 			}
+			// A panic is left entirely to the outer guard: it closes the
+			// sender and hands the cleanup reporter to the pool, which this
+			// defer cannot do. Closing here as well would run the drain twice
+			// during an unwind.
+			if r := recover(); r != nil {
+				panic(r)
+			}
+			// A clean error return leaves the outer guard nothing to do, so
+			// close here and disarm it. context.Background(), not the caller's
+			// ctx: a ctx whose deadline expired during the connect walk would
+			// cut the drain to nothing and abandon published frames.
+			_ = s.closeCursor(context.Background())
+			engineOwnedHere = false
 		}()
 		maxDrainers := conf.maxBackgroundDrainers
 		if maxDrainers <= 0 {
@@ -1117,6 +1145,11 @@ var qwpTestCloseDrainHook atomic.Pointer[func()]
 // sender does. Test seam only: it reaches the window where a fault must release
 // the loop's transport and dispatchers as well as the engine. Nil in production.
 var qwpTestAfterSendLoopBuiltHook atomic.Pointer[func()]
+
+// qwpTestAfterSenderBuiltHook fires once the sender exists but before
+// construction returns it. Test seam only: it reaches the other unwind branch,
+// where the sender itself is the cleanup reporter. Nil in production.
+var qwpTestAfterSenderBuiltHook atomic.Pointer[func()]
 
 // closeSendLoopGuarded stops the send loop and reports whether the I/O
 // goroutine is provably done with the segment mappings. A panic here leaves
