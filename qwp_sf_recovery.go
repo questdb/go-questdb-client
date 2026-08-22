@@ -305,14 +305,6 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain: a corrupt segment of unknown identity could belong to it")
 		}
 		if len(data) > 0 {
-			start := data[0].segmentBaseSeq()
-			if start != 0 {
-				for _, seg := range all {
-					if seg.segmentFrameCount() == 0 && seg.segmentTornTailBytes() > 0 && seg.segmentBaseSeq() < start {
-						return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain based at %d: segment at base %d lost its frames to a torn write and sits below that head, so its range cannot be shown already-acked", start, seg.segmentBaseSeq())
-					}
-				}
-			}
 			if err := qwpSfValidateContiguous(data); err != nil {
 				return nil, nil, err
 			}
@@ -336,6 +328,26 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			chain = append(chain, activeSeg)
 		}
 		head := chain[0].segmentBaseSeq()
+		// A torn segment below the head this migration is about to commit is
+		// the one thing that can make the head a lie. segmentFrameCount stops
+		// at the first bad CRC, so such a file reports zero frames while
+		// physically carrying rows -- and once head is committed, recovery
+		// treats everything below it as delivered and unlinks it.
+		//
+		// The check has to run against the FINAL head, not against the chain
+		// the frameful branch found: when no segment survives with frames the
+		// head comes from qwpSfChooseEmptyInitial instead, which skips torn
+		// candidates and so can pick a base above the damaged file. Nothing on
+		// this path is committed evidence, so the migration fails closed
+		// rather than deciding on its own synthesized boundary.
+		if head != 0 {
+			for _, seg := range all {
+				if seg.segmentFrameCount() == 0 && seg.segmentTornTailBytes() > 0 &&
+					seg.segmentBaseSeq() < head {
+					return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain based at %d: segment at base %d lost its frames to a torn write and sits below that head, so its range cannot be shown already-acked", head, seg.segmentBaseSeq())
+				}
+			}
+		}
 		manifest, err = qwpSfManifestCreate(sfDir, head, activeSeg.segmentBaseSeq())
 		if err != nil {
 			return nil, nil, err

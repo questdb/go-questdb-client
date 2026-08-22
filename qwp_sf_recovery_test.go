@@ -1200,3 +1200,32 @@ func TestQwpSfTornSegmentAtTheCommittedHeadIsPreserved(t *testing.T) {
 	require.NoError(t, statErr,
 		"a torn segment at the committed head must be preserved, not unlinked")
 }
+
+// TestQwpSfLegacyMigrationRefusesATornSegmentBelowASynthesizedHead pins the
+// legacy path's most dangerous shape. segmentFrameCount stops at the first bad
+// CRC, so a segment whose frame 0 is damaged reports zero frames while
+// physically holding rows. If the migration commits a head above it, every
+// later recovery treats it as delivered and unlinks it — silently, with the
+// open reporting success.
+//
+// The guard has to run against the FINAL head. When no segment survives with
+// frames, the head comes from qwpSfChooseEmptyInitial, which skips torn
+// candidates and so can land above the damaged file — the case a guard scoped
+// to the frameful branch never sees.
+func TestQwpSfLegacyMigrationRefusesATornSegmentBelowASynthesizedHead(t *testing.T) {
+	dir := t.TempDir()
+	// Damaged and frameless, at base 0. No manifest: a legacy slot.
+	torn := openTornEmptySegment(t, dir, "sf-initial.sfa", 0)
+	closeRecoverySegments(t, torn)
+	// A clean empty segment at a higher base, which the head selection prefers
+	// because it skips torn candidates.
+	spare := reopenEmptySegment(t, dir, "sf-0000000000000001.sfa", 3)
+	closeRecoverySegments(t, spare)
+
+	_, _, err := qwpSfRecoverRing(dir, 4096)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed,
+		"a torn segment below the synthesized head must fail the migration closed")
+
+	_, statErr := os.Stat(filepath.Join(dir, "sf-initial.sfa"))
+	require.NoError(t, statErr, "and its bytes must still be on disk")
+}
