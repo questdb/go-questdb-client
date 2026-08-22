@@ -491,15 +491,21 @@ func (db *QuestDB) Close(ctx context.Context) error {
 	result := firstCloseErr(sErr, queryErr, housekeepErr)
 	db.closeMu.Lock()
 	defer db.closeMu.Unlock()
-	// Concurrent callers can both be in the re-probe, and a slower one's
-	// observation is older than a faster one's. Record only a result that
-	// stops reporting the sentinel, so the recorded value moves in the one
-	// direction the contract promises and a caller cannot be told the locks
-	// came back. Each caller still returns what it observed itself.
-	if !errors.Is(result, ErrSfCleanupPending) || !errors.Is(db.closeErr, ErrSfCleanupPending) {
-		db.closeErr = result
-	}
+	db.closeErr = betterCloseResult(db.closeErr, result)
 	return result
+}
+
+// betterCloseResult picks which of two Close results to remember. Concurrent
+// callers can both be inside the re-probe, and a slower one's observation is
+// older than a faster one's -- recording it would tell a later caller that the
+// slot locks came back, which the contract says cannot happen. A result that
+// still reports retained locks therefore never replaces one that does not.
+// Anything else, including a real teardown failure, is recorded as observed.
+func betterCloseResult(current, observed error) error {
+	if errors.Is(observed, ErrSfCleanupPending) && !errors.Is(current, ErrSfCleanupPending) {
+		return current
+	}
+	return observed
 }
 
 // firstCloseErr selects the most actionable teardown error, preferring the

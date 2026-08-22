@@ -641,31 +641,36 @@ func (h closeMuProbeHandler) Handle(context.Context, slog.Record) error {
 func (h closeMuProbeHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h closeMuProbeHandler) WithGroup(string) slog.Handler      { return h }
 
-// TestQuestDBCloseRecordedResultOnlyImproves pins that the recorded Close
-// result never goes back to reporting retained slot locks. Concurrent callers
-// can both be inside the re-probe, and a slower one's observation is older —
-// recording it would tell a later caller the locks came back, which the
-// documented contract says cannot happen.
-func TestQuestDBCloseRecordedResultOnlyImproves(t *testing.T) {
-	db := &QuestDB{}
-	db.closeOnce.Do(func() {})
-	db.senderPool = &qwpSenderPool{closed: true, notify: make(chan struct{})}
+// TestBetterCloseResultNeverReintroducesPendingLocks pins the rule that decides
+// which Close result is remembered. Concurrent callers can both be inside the
+// re-probe, and a slower one's observation is older -- recording it would tell
+// a later caller that the slot locks came back, which the contract says cannot
+// happen.
+//
+// This is a truth table on purpose. The rule was first written as an inline
+// condition with one negation too many, which made it a no-op in exactly the
+// case it existed to block, and no test driving Close could tell: once a clean
+// result is recorded, Close short-circuits before ever reaching the re-probe.
+func TestBetterCloseResultNeverReintroducesPendingLocks(t *testing.T) {
+	pending := fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
+	otherPending := fmt.Errorf("%w (2 slot(s))", ErrSfCleanupPending)
+	teardown := errors.New("teardown failed")
 
-	// A clean re-probe records nil.
-	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
-	require.NoError(t, db.Close(context.Background()))
-	db.closeMu.Lock()
-	require.NoError(t, db.closeErr, "a clean re-probe must be recorded")
-	db.closeMu.Unlock()
-
-	// A stale prober landing afterwards must not re-raise the sentinel.
-	db.closeMu.Lock()
-	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
-	db.closeMu.Unlock()
-	stale := &qwpSenderPool{closed: true, notify: make(chan struct{}), storeAndForward: true,
-		slotInUse: []bool{true}, leakedSlots: 1,
-		retiredSlots: []*qwpSenderSlot{{slotIndex: 0, cleanup: &neverDoneSlot{}}}}
-	db.senderPool = stale
-	require.ErrorIs(t, db.Close(context.Background()), ErrSfCleanupPending,
-		"the caller still sees what it observed")
+	for _, tc := range []struct {
+		name              string
+		current, observed error
+		want              error
+	}{
+		{"stale pending must not replace clean", nil, pending, nil},
+		{"stale pending must not replace a teardown error", teardown, pending, teardown},
+		{"pending replaces pending", pending, otherPending, otherPending},
+		{"clean replaces pending", pending, nil, nil},
+		{"teardown replaces pending", pending, teardown, teardown},
+		{"clean replaces clean", nil, nil, nil},
+		{"teardown is always recorded", nil, teardown, teardown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, betterCloseResult(tc.current, tc.observed))
+		})
+	}
 }
