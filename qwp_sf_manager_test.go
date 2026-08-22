@@ -471,3 +471,47 @@ func TestQwpSfSpareCreationSyncsSlotDirectory(t *testing.T) {
 
 	require.False(t, e.ring.needsHotSpare(), "the manager should have provisioned a spare")
 }
+
+// TestQwpSfDeferredOwnedCleanupRefusesASecondEngine pins that the manager's
+// single cleanup slot cannot be claimed twice. Reporting a handoff that was not
+// taken would leave the second engine's cleanup with no owner at all: it clears
+// its own ownership marker on the strength of the answer, and the worker exit
+// only ever runs the one cleanup it holds.
+func TestQwpSfDeferredOwnedCleanupRefusesASecondEngine(t *testing.T) {
+	mgr, err := qwpSfNewSegmentManager(4096, time.Millisecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	mgr.segmentManagerStart()
+	t.Cleanup(func() { mgr.segmentManagerClose() })
+
+	firstRan := make(chan struct{})
+	require.True(t, mgr.deferOwnedCleanupUntilWorkerExit(func() { close(firstRan) }),
+		"the first engine's cleanup must be accepted")
+
+	secondRan := false
+	require.False(t, mgr.deferOwnedCleanupUntilWorkerExit(func() { secondRan = true }),
+		"a second engine must be told to clean up inline, not that it was handed off")
+
+	require.True(t, mgr.segmentManagerClose())
+	select {
+	case <-firstRan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the accepted cleanup never ran")
+	}
+	require.False(t, secondRan, "the refused cleanup must not run on the worker exit")
+}
+
+// TestQwpSfManagerCloseWithoutStartDoesNotWait pins the never-started fast path
+// against the close grace, so a regression shows up as a failure rather than as
+// a slow test.
+func TestQwpSfManagerCloseWithoutStartDoesNotWait(t *testing.T) {
+	mgr, err := qwpSfNewSegmentManager(4096, time.Millisecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	old := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(2 * time.Second)
+	t.Cleanup(func() { qwpSfManagerCloseGrace.store(old) })
+
+	start := time.Now()
+	require.True(t, mgr.segmentManagerClose())
+	require.Less(t, time.Since(start), time.Second,
+		"a manager with no worker must not wait on a channel nothing will close")
+}

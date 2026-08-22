@@ -27,9 +27,12 @@ package questdb
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func newQwpQueryPoolForTest(t *testing.T, min, max int) *qwpQueryPool {
@@ -476,5 +479,49 @@ func TestQwpQueryPoolReapsTerminalWorker(t *testing.T) {
 
 	if total, avail := p.poolSnapshot(); total != 0 || avail != 0 {
 		t.Errorf("poisoned worker not reaped: total=%d avail=%d, want 0/0", total, avail)
+	}
+}
+
+// TestQwpQueryPoolCloseSurvivesPanickingLogger pins both halves of where the
+// query pool's leak warning runs. A panicking application handler must not hold
+// p.mu for the process lifetime, and must not skip the teardown of every
+// available client's WebSocket — the count is taken under the lock and the log
+// runs after the unlock, behind the panic guard.
+func TestQwpQueryPoolCloseSurvivesPanickingLogger(t *testing.T) {
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		for {
+			if _, _, err := m.conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	})
+	t.Cleanup(srv.Close)
+	ctx := context.Background()
+	p, err := newQwpQueryPool(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";",
+		2, 2, 200*time.Millisecond, 0, 0, slog.New(panicOnHandleSlog{}))
+	require.NoError(t, err)
+
+	// One lease stays out so close takes the leak-warning branch.
+	leased, err := p.borrow(ctx)
+	require.NoError(t, err)
+	defer leased.Close()
+
+	panicked := false
+	func() {
+		defer func() { panicked = recover() != nil }()
+		_ = p.close(ctx)
+	}()
+	require.False(t, panicked, "a panicking handler must not escape close()")
+
+	locked := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		p.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the query pool lock is still held after the logger panicked")
 	}
 }
