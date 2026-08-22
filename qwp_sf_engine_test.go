@@ -1072,7 +1072,10 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 					return true
 				}
 				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || !levelMethods[sel.Sel.Name] {
+				// Every slog level method takes at least a message. Requiring
+				// one argument keeps error.Error(), which shares the name and
+				// takes none, from being mistaken for a log call.
+				if !ok || !levelMethods[sel.Sel.Name] || len(call.Args) == 0 {
 					return true
 				}
 				// A level method on a logger this file just produced, on a
@@ -1086,6 +1089,12 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 					reaches = reaches || loggerLocals[recv.Name] || isLoggerName(recv.Name)
 				case *ast.SelectorExpr:
 					reaches = reaches || isLoggerName(recv.Sel.Name)
+				case *ast.CallExpr:
+					// The shape the manager and the engine use: a logger read
+					// out of an atomic or an accessor, m.logger.Load() and
+					// e.engineLogger(). A receiver that is itself a call was
+					// invisible until a reviewer mutated one.
+					reaches = reaches || callExprYieldsLogger(recv)
 				}
 				if !reaches {
 					return true
@@ -1120,12 +1129,35 @@ func containsStringLiteral(expr ast.Expr, want string) bool {
 	return found
 }
 
+// callExprYieldsLogger reports whether a call expression reads out a logger:
+// either the function is spelled like one, or the value it is called on is.
+func callExprYieldsLogger(call *ast.CallExpr) bool {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return isLoggerName(fn.Name)
+	case *ast.SelectorExpr:
+		if isLoggerName(fn.Sel.Name) {
+			return true
+		}
+		if inner, ok := fn.X.(*ast.SelectorExpr); ok {
+			return isLoggerName(inner.Sel.Name)
+		}
+		if inner, ok := fn.X.(*ast.Ident); ok {
+			return isLoggerName(inner.Name)
+		}
+	}
+	return false
+}
+
 // isLoggerName reports whether an identifier is spelled like a *slog.Logger.
 // A type-checked answer would be exact; this is the approximation that costs
 // no build step, and the package spells every logger it holds this way.
 func isLoggerName(name string) bool {
 	lower := strings.ToLower(name)
-	return lower == "l" || lower == "lg" || strings.Contains(lower, "logger")
+	// Deliberately not "l": that is the receiver name for *qwpSfSendLoop and
+	// several other types in this package, so matching it produced false
+	// positives on their own methods.
+	return lower == "lg" || strings.Contains(lower, "logger")
 }
 
 // callsAny reports whether expr is a call to any of the named functions,
