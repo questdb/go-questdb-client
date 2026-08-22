@@ -1464,8 +1464,7 @@ func TestQwpSenderPoolCloseLeakWarningRunsOffTheLock(t *testing.T) {
 
 	locked := make(chan struct{})
 	go func() {
-		p.mu.Lock()
-		p.mu.Unlock()
+		p.poolSnapshot() // takes p.mu
 		close(locked)
 	}()
 	select {

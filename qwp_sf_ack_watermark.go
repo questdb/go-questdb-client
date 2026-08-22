@@ -193,6 +193,8 @@ func qwpSfAckWatermarkReserveBlocks(f *os.File, path string, image []byte) error
 // so a sender or drainer runs without it, at the cost of duplicate rows on
 // replay against a table that does not dedupe. Failing instead would stop a
 // drainer on a full disk, and draining that slot is what frees the disk.
+//
+//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 var qwpSfErrAckWatermarkUnbacked = errors.New("qwp/sf: storage will not back the ack watermark")
 
 // qwpSfAckWatermarkAllocate reserves the file's blocks up front, reporting a
