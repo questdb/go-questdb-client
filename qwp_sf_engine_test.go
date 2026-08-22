@@ -30,6 +30,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -832,4 +835,95 @@ func TestQwpSfDrainedUnlinkLeavesEveryCrashPointRecoverable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestQwpSfTerminalCleanupHasExactlyOneOwner pins what engineFinishClose says
+// keeps two cleanup owners apart: the terminalCleanupClaimed CAS, not appendMu.
+// The distinction is the whole property. Every entry point does hold appendMu,
+// so a second owner would be serialized either way — but serialized means it
+// runs the cleanup again once the first one lets go, unlinking files and
+// releasing a lock that is no longer its own. Refused means it does not run at
+// all.
+//
+// The claim is taken before appendMu, so the test can ask for it from inside a
+// cleanup that is holding both and require the answer to come back promptly and
+// negative. Queuing instead of refusing is a failure, not a slow pass.
+func TestQwpSfTerminalCleanupHasExactlyOneOwner(t *testing.T) {
+	dir := t.TempDir()
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = e.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+
+	// A failing flock release keeps terminal cleanup incomplete and ownerless
+	// after every attempt, which is the state repeated Close calls, the retry
+	// owner and pool reprobes all race to take over.
+	failRelease := func() error { return syscall.EIO }
+	qwpSfTestBeforeFlockReleaseHook.Store(&failRelease)
+	t.Cleanup(func() { qwpSfTestBeforeFlockReleaseHook.Store(nil) })
+
+	var (
+		entries    atomic.Int64
+		inFlight   atomic.Int32
+		overlapped atomic.Bool
+		refusals   atomic.Int64
+		queued     atomic.Bool
+	)
+	hook := func() {
+		entries.Add(1)
+		if inFlight.Add(1) > 1 {
+			overlapped.Store(true)
+		}
+		rival := make(chan bool, 1)
+		go func() { rival <- e.engineTryClaimTerminalCleanup() }()
+		select {
+		case claimed := <-rival:
+			if claimed {
+				overlapped.Store(true)
+			} else {
+				refusals.Add(1)
+			}
+		case <-time.After(2 * time.Second):
+			queued.Store(true)
+		}
+		inFlight.Add(-1)
+	}
+	qwpSfTestEngineFinishCloseHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestEngineFinishCloseHook.Store(nil) })
+
+	require.Error(t, e.engineClose(), "the injected release failure must fail the close")
+	require.False(t, e.engineCloseCompleted())
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				if i%2 == 0 {
+					// The repeated-Close path, as qwpLineSender.Close takes it.
+					if e.engineCloseRetryable() {
+						_ = e.engineFinishClaimedClose()
+					}
+					continue
+				}
+				// The retry owner's and the pool reprobe's path.
+				_ = e.engineRetryCloseIfNeeded()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	require.False(t, queued.Load(), "a rival owner must be refused, not queued behind appendMu")
+	require.False(t, overlapped.Load(), "terminal cleanup must have exactly one owner at a time")
+	require.Positive(t, entries.Load(), "the retries must actually reach terminal cleanup")
+	require.Equal(t, entries.Load(), refusals.Load(), "every rival claim must be refused")
+
+	// With the fault cleared, one attempt finishes and the claim stays taken:
+	// a completed close is not up for adoption either.
+	qwpSfTestBeforeFlockReleaseHook.Store(nil)
+	require.NoError(t, e.engineRetryCloseIfNeeded())
+	require.True(t, e.engineCloseCompleted())
+	require.False(t, e.engineTryClaimTerminalCleanup())
+	require.False(t, e.engineCloseRetryable())
 }
