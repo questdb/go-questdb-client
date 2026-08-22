@@ -277,6 +277,13 @@ type LineSender interface {
 	// to acquire it, with an error naming this process as the holder. Retry
 	// the open until it succeeds. Pooled senders expose the same condition
 	// through QuestDB.Close as ErrSfCleanupPending.
+	//
+	// A second Close reports a double-close error, with one QWP-only
+	// exception: when store-and-forward cleanup has been left with no owner
+	// at all, a repeated Close takes ownership, finishes the cleanup and
+	// reports its outcome. That is what lets a caller gating shutdown on a
+	// released slot lock reach one. Every other implementation reports the
+	// double close unconditionally.
 	Close(ctx context.Context) error
 }
 
