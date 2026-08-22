@@ -799,8 +799,15 @@ func TestQwpSfRecoveryTornActiveMoveAsideFailure(t *testing.T) {
 	dir, path := tornActiveSlot(t, baseSeq)
 
 	originalLink := qwpSfTornActiveLink.load()
-	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
 	originalRename := qwpSfTornActiveRename.load()
+	// Restore through t.Cleanup: a fault inside qwpSfRecoverRing would
+	// otherwise leave both seams returning errors for the rest of the package
+	// run, failing every later recovery test for the wrong reason.
+	t.Cleanup(func() {
+		qwpSfTornActiveLink.store(originalLink)
+		qwpSfTornActiveRename.store(originalRename)
+	})
+	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
 	qwpSfTornActiveRename.store(func(from, to string) error {
 		if strings.HasSuffix(from, ".sfa") {
 			return syscall.EIO
@@ -830,11 +837,17 @@ func TestQwpSfRecoveryTornActiveRollbackFailure(t *testing.T) {
 	dir, path := tornActiveSlot(t, baseSeq)
 
 	originalLink := qwpSfTornActiveLink.load()
-	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
 	originalRename := qwpSfTornActiveRename.load()
+	// Restore through t.Cleanup for the same reason as the sibling test above.
+	t.Cleanup(func() {
+		qwpSfTornActiveLink.store(originalLink)
+		qwpSfTornActiveRename.store(originalRename)
+	})
+	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
 	qwpSfTornActiveRename.store(func(from, to string) error {
-		if strings.HasSuffix(from, ".sfa") && !strings.HasSuffix(from, qwpSfTornActiveTempSuffix) {
-			// The move-aside is the only rename allowed through.
+		// The move-aside is the only rename allowed through. A .sfa.replacing
+		// source is the install, which must fail; so must the rollback.
+		if strings.HasSuffix(from, ".sfa") {
 			return originalRename(from, to)
 		}
 		return syscall.EIO
