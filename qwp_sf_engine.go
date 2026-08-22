@@ -1300,8 +1300,19 @@ func qwpSfShouldLogCloseRetry(last, now time.Time) bool {
 
 // qwpSfUnlinkAllSegmentFiles unlinks every .sfa file under dir.
 // Called only on clean shutdown when the ring confirms every
-// published FSN has been acked. Files are removed in cleanup rank order and
-// removal stops at the first failure, leaving the manifest in place.
+// published FSN has been acked. Removal stops at the first failure, leaving
+// the manifest in place.
+//
+// Files go oldest first: sf-initial.sfa (the legacy base-0 segment), then the
+// sf-<generation>.sfa files in generation order. The caller has already
+// committed the manifest at headBase == activeBase == the newest segment's
+// base, and recovery skips every segment below headBase, so the active
+// segment is the one file it still requires. Removing it last leaves every
+// crash point recoverable: either the active segment is still there and the
+// chain starts at headBase, or the directory is empty and the collapsed
+// manifest is removed on its own. The sort needs the explicit sf-initial.sfa
+// case because plain name order would put that oldest file last -- "i" sorts
+// after the hex digits of every rotated name.
 func qwpSfUnlinkAllSegmentFiles(dir string) error {
 	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
