@@ -337,19 +337,24 @@ func TestQwpSfRecoveryFullyTrimmedEmptyActiveKeepsSequenceDomain(t *testing.T) {
 	}, time.Second, time.Millisecond, "the acknowledged segment at the recovered base must trim")
 }
 
-func TestQwpSfRecoveryLegacyBaseZeroQuarantinesCorruptStray(t *testing.T) {
+func TestQwpSfRecoveryLegacyBaseZeroRefusesCorruptStray(t *testing.T) {
+	// A legacy slot has no committed boundaries, so nothing shows the corrupt
+	// file's frames already delivered — not even when the surviving chain
+	// starts at base 0 and therefore owns the head. Recovery refuses to migrate
+	// and leaves the bytes exactly where they are.
 	dir := t.TempDir()
 	seg := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
 	require.NoError(t, seg.close())
 	stray := filepath.Join(dir, "sf-stray.sfa")
 	require.NoError(t, os.WriteFile(stray, []byte("bad"), 0o644))
 
-	ring, _, err := qwpSfRecoverRing(dir, 4096)
-	require.NoError(t, err)
-	require.NotNil(t, ring)
-	defer ring.segmentRingClose()
-	_, err = os.Stat(stray + ".corrupt")
-	require.NoError(t, err)
+	_, _, err := qwpSfRecoverRing(dir, 4096)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	assert.Contains(t, err.Error(), "corrupt segment of unknown identity")
+	_, statErr := os.Stat(stray)
+	require.NoError(t, statErr)
+	_, statErr = os.Stat(stray + ".corrupt")
+	require.True(t, os.IsNotExist(statErr))
 }
 
 func TestQwpSfRecoveryRejectsLegacyTornEmptyBelowPositiveHead(t *testing.T) {

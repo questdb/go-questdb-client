@@ -147,7 +147,9 @@ producer-visible error from a running drain path is SF-out-of-space backpressure
 Drainer quarantine is reserved for a slot proved inconsistent
 (`qwpSfErrRecoveryFailClosed`). A local I/O fault while opening a slot — a full
 disk, an exhausted fd table, a vanished mount — leaves no `.failed` sentinel,
-so the next foreground scan adopts the slot again.
+so the next foreground scan adopts the slot again. Legacy (manifest-less) slots
+fail closed on any corrupt segment: with no committed boundaries nothing can
+show its frames delivered.
 
 **A table block is self-describing** — the inline column definitions are its
 authoritative schema. On egress, the decoder parses the schema from the first

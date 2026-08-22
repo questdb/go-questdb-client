@@ -473,10 +473,11 @@ func TestQwpSfRingOpenExistingQuarantinesCorruptFirstFrame(t *testing.T) {
 
 func TestQwpSfRingOpenExistingSkipsCorruptStrayFile(t *testing.T) {
 	// A stray / hand-damaged .sfa (bad magic, no recoverable frames)
-	// must not take recovery down — it is skipped and the valid
-	// segments still recover. This is the skippable half of the
-	// open-error classification.
+	// must not take recovery down when the manifest's committed boundaries
+	// prove it dead — it is quarantined and the valid segments still recover.
+	// This is the skippable half of the open-error classification.
 	dir := t.TempDir()
+	var segs []*qwpSfSegment
 	for _, base := range []int64{0, 5} {
 		path := filepath.Join(dir, "sf-"+formatHex16(uint64(base))+".sfa")
 		seg, err := qwpSfCreateSegment(path, base, 4096)
@@ -485,8 +486,10 @@ func TestQwpSfRingOpenExistingSkipsCorruptStrayFile(t *testing.T) {
 			_, err := seg.tryAppend([]byte{byte(base), byte(i)})
 			require.NoError(t, err)
 		}
-		require.NoError(t, seg.close())
+		segs = append(segs, seg)
 	}
+	createRecoveryManifest(t, dir, 0, 5, segs...)
+	closeRecoverySegments(t, segs...)
 	// A zero-filled .sfa has magic 0x00000000 → qwpSfErrSegmentCorrupt.
 	stray := filepath.Join(dir, "sf-stray.sfa")
 	require.NoError(t, os.WriteFile(stray, make([]byte, 4096), 0o644))
@@ -502,6 +505,8 @@ func TestQwpSfRingOpenExistingSkipsCorruptStrayFile(t *testing.T) {
 	assert.Equal(t, int64(5), active.segmentBaseSeq())
 	assert.Len(t, r.getSealedSegments(), 1)
 	assert.Equal(t, int64(10), r.nextSeqHint())
+	_, statErr := os.Stat(stray + ".corrupt")
+	require.NoError(t, statErr)
 }
 
 func TestQwpSfRingOpenExistingFailsOnUnreadableSegment(t *testing.T) {

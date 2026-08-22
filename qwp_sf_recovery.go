@@ -249,12 +249,18 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			}
 		}
 	} else {
+		// A legacy slot has no committed boundaries, so the files themselves are
+		// the only evidence of the chain's extent and a corrupt segment of
+		// unknown identity could be its head, an interior link, or the unsent
+		// tail. Nothing here can show its frames already delivered, so the whole
+		// legacy branch fails closed instead of quarantining the file and
+		// migrating a chain that may be missing rows.
+		if len(corruptPaths) > 0 {
+			return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain: a corrupt segment of unknown identity could belong to it")
+		}
 		if len(data) > 0 {
 			start := data[0].segmentBaseSeq()
 			if start != 0 {
-				if len(corruptPaths) > 0 {
-					return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain based at %d: a corrupt segment of unknown identity could be its head", start)
-				}
 				for _, seg := range all {
 					if seg.segmentFrameCount() == 0 && seg.segmentTornTailBytes() > 0 && seg.segmentBaseSeq() < start {
 						return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain based at %d: segment at base %d lost its frames to a torn write and sits below that head, so its range cannot be shown already-acked", start, seg.segmentBaseSeq())
@@ -276,7 +282,6 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 					return nil, nil, err
 				}
 				all = nil
-				qwpSfQuarantinePaths(corruptPaths)
 				success = true
 				return nil, nil, nil
 			}
