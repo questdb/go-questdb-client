@@ -646,7 +646,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			} else {
 				path = m.nextSparePath(e.dir)
 				spare, err = qwpSfCreateSegment(path, e.ring.nextSeqHint(), m.segmentSizeBytes)
-				if err == nil && e.ring.manifest != nil {
+				if err == nil && e.ring.ringManifest() != nil {
 					err = spare.markManifestRequired()
 				}
 			}
@@ -734,11 +734,12 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			m.recordServiceError(e, errors.New("ring has no active segment during trim"))
 			return
 		}
-		if e.ring.manifest == nil {
+		manifest := e.ring.ringManifest()
+		if manifest == nil {
 			m.recordServiceError(e, errors.New("disk ring has no SF manifest during trim"))
 			return
 		}
-		if err := e.ring.manifest.update(newHead, active.segmentBaseSeq()); err != nil {
+		if err := manifest.update(newHead, active.segmentBaseSeq()); err != nil {
 			m.recordServiceError(e, err)
 			return
 		}

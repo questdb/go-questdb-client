@@ -355,6 +355,11 @@ func (r *qwpSfSegmentRing) segmentRingCloseInternal(leakMappings bool) error {
 	r.closed = true
 	sealed := r.sealedSegments
 	r.sealedSegments = nil
+	// Detach the manifest under the same mutex that publishes it, so the
+	// manager's service pass either sees a live manifest it may still update or
+	// sees none at all, and never reads the field while this close writes it.
+	manifest := r.manifest
+	r.manifest = nil
 	r.mu.Unlock()
 
 	var firstErr error
@@ -376,13 +381,22 @@ func (r *qwpSfSegmentRing) segmentRingCloseInternal(leakMappings bool) error {
 			firstErr = err
 		}
 	}
-	if r.manifest != nil {
-		if err := r.manifest.close(); err != nil && firstErr == nil {
+	if manifest != nil {
+		if err := manifest.close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		r.manifest = nil
 	}
 	return firstErr
+}
+
+// ringManifest returns the ring's manifest, or nil once the ring is closed.
+// The field is published by recovery/construction and cleared by
+// segmentRingCloseInternal, both under r.mu; every cross-goroutine read goes
+// through here.
+func (r *qwpSfSegmentRing) ringManifest() *qwpSfManifest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.manifest
 }
 
 func (r *qwpSfSegmentRing) rotationError() error {

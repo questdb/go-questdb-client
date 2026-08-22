@@ -230,6 +230,7 @@ type qwpSfCursorEngine struct {
 	closeCompleted            atomic.Bool
 	terminalCleanupClaimed    atomic.Bool
 	terminalResourcesClosed   atomic.Bool
+	managerTornDown           atomic.Bool
 	drainedFileCleanupPending atomic.Bool
 	deferredCleanupOwned      atomic.Bool
 	closeRetryOwnerStarted    atomic.Bool
@@ -1029,6 +1030,13 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	} else {
 		quiescent = e.manager.awaitRingQuiescence(entry)
 	}
+	// The manager teardown is now behind us and its outcome is recorded, so
+	// terminal cleanup is safe for whoever ends up owning it. This marker, not
+	// closed, is what a claimant needs: closed is published in this function's
+	// first line, tens of lines and one appendMu acquisition before the ring is
+	// deregistered, and a claim taken inside that window would release the slot
+	// lock while the manager worker still writes to the slot directory.
+	e.managerTornDown.Store(true)
 	if !quiescent {
 		var handedOff bool
 		e.deferredCleanupOwned.Store(true)
@@ -1099,8 +1107,9 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 			drainCleanupAllowed = false
 		}
 		active := e.ring.getActiveSegment()
-		if drainCleanupAllowed && active != nil && e.ring.manifest != nil {
-			if err := e.ring.manifest.update(active.segmentBaseSeq(), active.segmentBaseSeq()); err != nil {
+		manifest := e.ring.ringManifest()
+		if drainCleanupAllowed && active != nil && manifest != nil {
+			if err := manifest.update(active.segmentBaseSeq(), active.segmentBaseSeq()); err != nil {
 				firstErr = err
 				drainCleanupAllowed = false
 			}
@@ -1219,8 +1228,12 @@ func (e *qwpSfCursorEngine) engineCloseCompleted() bool {
 // legitimately stuck service pass. Success transfers the terminalCleanupClaimed
 // claim to the caller, which must run it through engineFinishClaimedClose;
 // engineFinishCloseGuarded releases the claim again if the attempt fails.
+//
+// The gate is managerTornDown, the condition engineFinishClose assumes: an
+// engine whose manager teardown has not run yet has no ownerless cleanup to
+// take over, only a close still on its way through engineCloseInternal.
 func (e *qwpSfCursorEngine) engineTryClaimTerminalCleanup() bool {
-	if e == nil || !e.closed.Load() || e.closeCompleted.Load() || e.deferredCleanupOwned.Load() {
+	if e == nil || !e.managerTornDown.Load() || e.closeCompleted.Load() || e.deferredCleanupOwned.Load() {
 		return false
 	}
 	return e.terminalCleanupClaimed.CompareAndSwap(false, true)

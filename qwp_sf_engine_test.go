@@ -690,3 +690,43 @@ func TestQwpSfSwappableVarSurvivesConcurrentSwap(t *testing.T) {
 	<-done
 	require.Equal(t, 999*time.Millisecond, v.load())
 }
+
+// TestQwpSfEngineCloseRetryWaitsForManagerTeardown pins the ownership rule that
+// keeps a repeated Close from releasing the slot while the manager worker still
+// writes to it. engineCloseInternal publishes closed in its first line but only
+// deregisters the ring and stops the worker after it wins appendMu, so a Close
+// arriving inside that window would otherwise find an apparently closed engine
+// with no cleanup owner, take the claim, and unlink files and drop the flock
+// under a live worker that keeps minting segments into the same directory.
+//
+// The window is opened here the way a producer mid-rotation opens it: appendMu
+// is held while the first Close runs.
+func TestQwpSfEngineCloseRetryWaitsForManagerTeardown(t *testing.T) {
+	dir := t.TempDir()
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = e.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+
+	e.appendMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- e.engineClose() }()
+	require.Eventually(t, e.closed.Load, time.Second, 100*time.Microsecond,
+		"first Close must reach the closed CAS")
+
+	require.False(t, e.managerTornDown.Load())
+	require.False(t, e.engineCloseRetryable(),
+		"a second Close must not claim cleanup while the manager teardown is still ahead of the first")
+	require.False(t, e.terminalCleanupClaimed.Load(),
+		"a rejected claim must leave the claim bit free for the first Close")
+
+	e.appendMu.Unlock()
+	require.NoError(t, <-done)
+	require.True(t, e.engineCloseCompleted())
+	require.True(t, e.managerTornDown.Load())
+
+	e.manager.mu.Lock()
+	managerClosed := e.manager.closed
+	e.manager.mu.Unlock()
+	require.True(t, managerClosed, "the manager must be shut down once Close reports completion")
+}
