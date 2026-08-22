@@ -166,6 +166,23 @@ type qwpSfManagerRingEntry struct {
 	// the stalled ring would otherwise produce. Cleared by the next pass that
 	// completes its maintenance.
 	maintenanceError atomic.Pointer[error]
+	// pendingUnlinks holds trimmed segments whose file is still on disk because
+	// the unlink failed. Their bytes stay charged to the slot until the file is
+	// really gone, and every later pass retries them: crediting a failed delete
+	// would keep handing the ring capacity for space it never got back, letting
+	// the slot grow past its cap while the disk fills. Worker goroutine only.
+	pendingUnlinks []qwpSfPendingUnlink
+	// dirSyncPending records that a post-trim directory fsync failed, so the
+	// unlinks that pass did complete are not durable yet. Retried by later
+	// passes for the same reason as pendingUnlinks. Worker goroutine only.
+	dirSyncPending bool
+}
+
+// qwpSfPendingUnlink is one trimmed segment file that could not be removed,
+// with the bytes still charged to the manager on its behalf.
+type qwpSfPendingUnlink struct {
+	path      string
+	sizeBytes int64
 }
 
 // entryMaintenanceError returns the published local-storage maintenance
@@ -182,8 +199,13 @@ func (e *qwpSfManagerRingEntry) entryMaintenanceError() error {
 }
 
 // entryMaintenanceSucceeded ends the current failure run. Worker goroutine only.
+// Deferred work left over from an earlier pass keeps the run alive: a slot whose
+// deletes keep failing has nothing new to trim on the passes in between, and
+// clearing the run there would let failures and successes alternate forever
+// without ever reaching the threshold that tells the producer its disk is
+// refusing writes.
 func (e *qwpSfManagerRingEntry) entryMaintenanceSucceeded() {
-	if e.maintenanceFailures == 0 {
+	if e.maintenanceFailures == 0 || len(e.pendingUnlinks) > 0 || e.dirSyncPending {
 		return
 	}
 	e.maintenanceFailures = 0
@@ -709,11 +731,21 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	//    mode / open failed) is a no-op.
 	e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
 
-	// 3. Trim any segments that the ring says are fully acked. For
+	// 3. Retry the unlinks and the directory fsync an earlier pass could not
+	//    complete. Their bytes are still charged to the slot, so this is what
+	//    gives the ring its capacity back.
+	deferredBytes, deferredErr := m.retryDeferredTrimWork(e)
+
+	// 4. Trim any segments that the ring says are fully acked. For
 	//    memory-mode rings, "trim" is just close (the slice is GC'd) —
 	//    no file to unlink.
 	trim := e.ring.peekTrimmable()
 	if len(trim) == 0 {
+		m.commitTrimAccounting(e, deferredBytes)
+		if deferredErr != nil {
+			m.recordServiceError(e, deferredErr)
+			return
+		}
 		// Nothing acked is waiting to be reclaimed, so whatever stopped an
 		// earlier pass no longer holds anything back.
 		e.entryMaintenanceSucceeded()
@@ -745,8 +777,8 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		}
 	}
 	trim = e.ring.drainTrimBatch(len(trim))
-	var trimErr error
-	var trimmedBytes int64
+	trimErr := deferredErr
+	trimmedBytes := deferredBytes
 	for _, s := range trim {
 		path := s.segmentPath()
 		sz := s.segmentSize()
@@ -754,15 +786,27 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			trimErr = err
 		}
 		if path != "" {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && trimErr == nil {
-				trimErr = err
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				// The file is still occupying the slot, so hold its bytes and
+				// retry it rather than freeing capacity for space nothing gave
+				// back.
+				e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{path: path, sizeBytes: sz})
+				if trimErr == nil {
+					trimErr = err
+				}
+				continue
 			}
 		}
 		trimmedBytes += sz
 	}
 	if !memoryMode {
-		if err := qwpSfSyncDir(e.dir); err != nil && trimErr == nil {
-			trimErr = fmt.Errorf("post-trim directory fsync: %w", err)
+		if err := qwpSfSyncDir(e.dir); err != nil {
+			e.dirSyncPending = true
+			if trimErr == nil {
+				trimErr = fmt.Errorf("post-trim directory fsync: %w", err)
+			}
+		} else {
+			e.dirSyncPending = false
 		}
 	}
 	if trimErr != nil {
@@ -772,6 +816,48 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	}
 	if hook := qwpSfTestBeforeTrimAccountingHook.Load(); hook != nil {
 		(*hook)(e)
+	}
+	m.commitTrimAccounting(e, trimmedBytes)
+}
+
+// retryDeferredTrimWork re-attempts the unlinks and the directory fsync that
+// earlier passes could not complete, and returns the bytes reclaimed by the
+// files that are now gone. Worker goroutine only.
+func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (int64, error) {
+	if len(e.pendingUnlinks) == 0 && !e.dirSyncPending {
+		return 0, nil
+	}
+	var freed int64
+	var firstErr error
+	kept := e.pendingUnlinks[:0]
+	for _, pending := range e.pendingUnlinks {
+		if err := os.Remove(pending.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			kept = append(kept, pending)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("retry unlink of trimmed segment: %w", err)
+			}
+			continue
+		}
+		freed += pending.sizeBytes
+		e.dirSyncPending = true
+	}
+	e.pendingUnlinks = kept
+	if e.dirSyncPending && e.dir != "" {
+		if err := qwpSfSyncDir(e.dir); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("retry post-trim directory fsync: %w", err)
+			}
+		} else {
+			e.dirSyncPending = false
+		}
+	}
+	return freed, firstErr
+}
+
+// commitTrimAccounting returns reclaimed bytes to the manager's cap.
+func (m *qwpSfSegmentManager) commitTrimAccounting(e *qwpSfManagerRingEntry, trimmedBytes int64) {
+	if trimmedBytes == 0 {
+		return
 	}
 	m.mu.Lock()
 	// Deregistration removes entry.accountedBytes, which still includes this

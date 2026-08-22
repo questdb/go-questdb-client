@@ -305,3 +305,51 @@ func TestQwpSfManagerNextSparePathIncrements(t *testing.T) {
 	assert.Equal(t, filepath.Join(dir, "sf-0000000000000000.sfa"), a)
 	assert.Equal(t, filepath.Join(dir, "sf-0000000000000001.sfa"), b)
 }
+
+// TestQwpSfManagerHoldsBytesForAFailedTrimUnlink pins the accounting rule that
+// keeps a slot inside its cap when deletes stop working. A trimmed segment
+// whose file is still on disk gives no capacity back, so crediting its bytes
+// would let the manager keep provisioning on top of files it never removed and
+// grow the slot past sf_max_total_bytes while the disk fills.
+//
+// It also pins what the producer is told. Passes between failures find nothing
+// new to trim, and a plain success there would clear the failure run every
+// other tick, so the run would never reach the threshold and all a producer
+// would ever see is a backpressure timeout blaming the server.
+//
+// A non-empty directory at the segment's path is what makes the failure
+// deterministic: os.Remove refuses it on every platform and for every user,
+// including root.
+func TestQwpSfManagerHoldsBytesForAFailedTrimUnlink(t *testing.T) {
+	dir := t.TempDir()
+	stuck := filepath.Join(dir, "sf-stuck.sfa")
+	require.NoError(t, os.MkdirAll(filepath.Join(stuck, "occupant"), 0o755))
+
+	m, err := qwpSfNewSegmentManager(4096, time.Hour, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	m.segmentManagerStart()
+	defer m.segmentManagerClose()
+
+	e := &qwpSfManagerRingEntry{dir: dir}
+	e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{path: stuck, sizeBytes: 4096})
+
+	freed, retryErr := m.retryDeferredTrimWork(e)
+	require.Error(t, retryErr)
+	assert.Zero(t, freed, "bytes stay charged while the file is still on disk")
+	assert.Len(t, e.pendingUnlinks, 1, "a failed unlink is retried, not forgotten")
+
+	e.maintenanceFailures = qwpSfManagerMaintenanceFailureThreshold - 1
+	e.entryMaintenanceSucceeded()
+	assert.Equal(t, qwpSfManagerMaintenanceFailureThreshold-1, e.maintenanceFailures,
+		"an empty trim list does not end a failure run that still owes an unlink")
+	m.recordServiceError(e, retryErr)
+	require.ErrorIs(t, e.entryMaintenanceError(), ErrSfDurability)
+
+	require.NoError(t, os.RemoveAll(filepath.Join(stuck, "occupant")))
+	freed, retryErr = m.retryDeferredTrimWork(e)
+	require.NoError(t, retryErr)
+	assert.Equal(t, int64(4096), freed, "the bytes come back once the file is gone")
+	assert.Empty(t, e.pendingUnlinks)
+	e.entryMaintenanceSucceeded()
+	assert.NoError(t, e.entryMaintenanceError())
+}
