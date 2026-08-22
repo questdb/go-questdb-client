@@ -107,12 +107,20 @@ type qwpSenderPool struct {
 
 // ErrSfCleanupPending is the sentinel a store-and-forward pool close wraps when
 // every teardown step ran but one or more slots have not finished releasing
-// their slot lock. It is not a failure: the engine's terminal-cleanup retry
-// owner keeps retrying with no deadline, so calling Close again re-probes and
-// stops reporting this sentinel once the last lock is gone. (A teardown error
-// from the same close is remembered and keeps being reported alongside it.)
-// Match it with errors.Is to tell this apart from a teardown that genuinely
-// failed, and retry rather than give up.
+// their slot lock. It is not a failure: cleanup is either still in flight on
+// the goroutine that started it or owned by a per-engine retry owner that keeps
+// going with no deadline, so calling Close again re-probes and stops reporting
+// this sentinel once the last lock is gone. (A teardown error from the same
+// close is remembered and keeps being reported alongside it.) Match it with
+// errors.Is to tell this apart from a teardown that genuinely failed, and retry
+// rather than give up.
+//
+// A failed Connect / NewQuestDB / NewLineSender can also wrap it, from the
+// teardown of what the build had already created. There is no handle to call
+// Close on in that case: the retry owner still releases the lock on its own,
+// but an immediate rebuild on the same sf_dir and sender_id may fail naming
+// this process as the holder, so retry the build rather than treating the
+// sentinel as fatal.
 var ErrSfCleanupPending = errors.New("qwp pool: SF slot cleanup still pending; slot locks retained")
 
 // qwpPoolCloseResult combines the teardown error with the current
