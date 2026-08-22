@@ -43,9 +43,11 @@ import (
 // clean segment where a torn one held no recoverable frame, and removes files
 // proven stale -- but every file that holds a frame the manifest still accounts
 // for is either left exactly as it was or preserved under another name.
-// TestQwpSfFailedRecoveryPreservesEveryRequiredFrame pins the failed half;
-// on the success path qwpSfDiscardOpened quarantines instead of unlinking
-// anything that still carries frames or a torn tail.
+// TestQwpSfFailedRecoveryPreservesEveryRequiredFrame pins the failed half. On
+// the success path the committed head is what licenses a removal:
+// qwpSfDiscardOpened unlinks a segment only below that boundary, where the
+// manifest proves its frames delivered, and quarantines anything at or above
+// it that still carries frames or a torn tail.
 var (
 	//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 	qwpSfErrRecoveryFailClosed = errors.New("qwp/sf: recovery failed closed")
@@ -432,10 +434,11 @@ func qwpSfSanitizeSealedResidue(chain []*qwpSfSegment) (string, error) {
 	return first, nil
 }
 
-// qwpSfDiscardOpened releases every opened segment outside keep. A file the
-// chain does not need is unlinked; one that still carries bytes -- a torn tail,
-// or a member of preserve -- is quarantined under a .corrupt name instead, so
-// no recovery path ever destroys bytes it cannot prove delivered.
+// qwpSfDiscardOpened releases every opened segment outside keep. A file below
+// the committed head is unlinked: the manifest proves its frames delivered. One
+// that still carries bytes the boundaries do not account for -- a torn tail, or
+// a member of preserve -- is quarantined under a .corrupt name instead, so no
+// recovery path destroys bytes it cannot prove delivered.
 func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]struct{}) error {
 	for _, seg := range all {
 		if _, ok := keep[seg]; ok {

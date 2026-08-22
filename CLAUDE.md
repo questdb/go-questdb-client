@@ -147,8 +147,9 @@ backpressure (`ErrBackpressureTimeout`) and local-storage durability failures
 run of failed slot maintenance). Both are non-terminal: the rows stay pending
 and the same call can be retried.
 
-Drainer quarantine is likewise reserved for a slot proved inconsistent
-(`qwpSfErrRecoveryFailClosed`). A local I/O fault while opening a slot — a full
+Drainer quarantine covers a slot proved inconsistent
+(`qwpSfErrRecoveryFailClosed`) plus the drainer's own give-ups — auth reject,
+durable-ack settle exhaustion, the no-progress watchdog, and a panic. A local I/O fault while opening a slot — a full
 disk, an exhausted fd table, a vanished mount — leaves no `.failed` sentinel,
 so the next foreground scan adopts the slot again. Legacy (manifest-less) slots
 fail closed on any corrupt segment that could still hold frames: with no

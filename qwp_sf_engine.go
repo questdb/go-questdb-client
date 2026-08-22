@@ -1453,8 +1453,8 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 }
 
 // engineLogger reads the configured logger through the manager. A hand-built
-// engine in tests can carry no manager, and every close path below runs on such
-// an engine too.
+// engine in tests can carry no manager, and the close paths that log run on
+// such an engine too.
 func (e *qwpSfCursorEngine) engineLogger() *slog.Logger {
 	if e == nil || e.manager == nil {
 		return nil

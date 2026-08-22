@@ -276,10 +276,12 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 		// nothing -- the manifest still names the previous active, and the new
 		// empty segment is discarded as a stray. The ordering these barriers
 		// buy is scoped to what qwpSfFsync promises: a crashed or restarted
-		// process, and on Linux a kernel crash, but not a power cut on darwin,
-		// where the flush stops at the kernel. Together they are what
+		// process, and on Linux a kernel crash. On darwin fsync(2) does not
+		// force the drive's own write cache (see qwp_sf_fsync_darwin.go), so a
+		// power cut can still reorder them. Together they are what
 		// BenchmarkQwpSfRotationBarriers measures, and what puts rotation at
-		// the tail of BenchmarkQwpSfPublish's latency distribution.
+		// the tail of BenchmarkQwpSfPublish's latency distribution: about 47us
+		// on an APFS SSD, on however many flushes rotate.
 		if syncErr := spare.syncHeader(); syncErr != nil {
 			r.rotationErr.Store(&qwpSfRingError{err: syncErr})
 			return qwpSfRotationFailed

@@ -38,11 +38,13 @@ import (
 // the segment and manifest formats they share on disk.
 //
 // os.File.Sync is not that call on darwin: it issues fcntl(F_FULLFSYNC), which
-// additionally asks the drive to empty its own write cache. That is around
-// twenty times more expensive — 5.8ms against 284µs, measured on an APFS SSD —
+// additionally asks the drive to empty its own write cache. That is two orders
+// of magnitude more expensive — 4.6ms against 27µs, measured on an APFS SSD —
 // and segment rotation performs two such flushes on the producer's goroutine
 // while it holds appendMu, so the difference lands straight on the caller's
-// flush latency at roughly one flush in a hundred.
+// flush latency. How often depends on row width: roughly one flush in a
+// hundred for narrow rows, and every flush once a batch fills a segment on its
+// own, which a few hundred columns will do.
 //
 // What the weaker call gives up is a power cut between the fsync and the drive
 // destaging its cache. Store-and-forward is a client-side buffer whose promise
