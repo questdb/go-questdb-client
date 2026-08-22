@@ -43,6 +43,12 @@ import (
 const (
 	qwpSfManagerDefaultPoll         = 1 * time.Millisecond // poll cadence
 	qwpSfManagerDiskFullLogThrottle = 30 * time.Second     // throttle disk-full WARNs
+
+	// qwpSfManagerMaintenanceFailureThreshold is how many consecutive failed
+	// maintenance passes a ring tolerates before its entry publishes the
+	// failure to producers. Passes run on the manager poll tick, so a run this
+	// long is a storage fault rather than one unlucky syscall.
+	qwpSfManagerMaintenanceFailureThreshold = 3
 )
 
 // qwpSfManagerCloseGrace bounds how long close() waits for the worker
@@ -149,6 +155,39 @@ type qwpSfManagerRingEntry struct {
 	watermark *qwpSfAckWatermark
 	state     atomic.Int32
 	cleanup   atomic.Pointer[func()]
+	// maintenanceFailures counts the current run of consecutive service passes
+	// that could not complete their durability work. Touched only on the
+	// manager's worker goroutine.
+	maintenanceFailures int
+	// maintenanceError publishes that run once it reaches
+	// qwpSfManagerMaintenanceFailureThreshold. Producers read it through
+	// engineTerminalError, so a slot whose trim has stopped reports the disk
+	// fault that stopped it instead of the generic backpressure timeout that
+	// the stalled ring would otherwise produce. Cleared by the next pass that
+	// completes its maintenance.
+	maintenanceError atomic.Pointer[error]
+}
+
+// entryMaintenanceError returns the published local-storage maintenance
+// failure for this ring, or nil while maintenance is healthy or the failures
+// are still short of a run.
+func (e *qwpSfManagerRingEntry) entryMaintenanceError() error {
+	if e == nil {
+		return nil
+	}
+	if p := e.maintenanceError.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// entryMaintenanceSucceeded ends the current failure run. Worker goroutine only.
+func (e *qwpSfManagerRingEntry) entryMaintenanceSucceeded() {
+	if e.maintenanceFailures == 0 {
+		return
+	}
+	e.maintenanceFailures = 0
+	e.maintenanceError.Store(nil)
 }
 
 func (e *qwpSfManagerRingEntry) isInService() bool {
@@ -675,29 +714,32 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	//    no file to unlink.
 	trim := e.ring.peekTrimmable()
 	if len(trim) == 0 {
+		// Nothing acked is waiting to be reclaimed, so whatever stopped an
+		// earlier pass no longer holds anything back.
+		e.entryMaintenanceSucceeded()
 		return
 	}
 	if !memoryMode {
 		if err := e.watermark.sync(); err != nil {
-			m.recordServiceError(e.dir, err)
+			m.recordServiceError(e, err)
 			return
 		}
 		if err := qwpSfSyncDir(e.dir); err != nil {
-			m.recordServiceError(e.dir, fmt.Errorf("pre-trim directory fsync: %w", err))
+			m.recordServiceError(e, fmt.Errorf("pre-trim directory fsync: %w", err))
 			return
 		}
 		newHead := e.ring.headAfterTrim(len(trim))
 		active := e.ring.getActiveSegment()
 		if active == nil {
-			m.recordServiceError(e.dir, errors.New("ring has no active segment during trim"))
+			m.recordServiceError(e, errors.New("ring has no active segment during trim"))
 			return
 		}
 		if e.ring.manifest == nil {
-			m.recordServiceError(e.dir, errors.New("disk ring has no SF manifest during trim"))
+			m.recordServiceError(e, errors.New("disk ring has no SF manifest during trim"))
 			return
 		}
 		if err := e.ring.manifest.update(newHead, active.segmentBaseSeq()); err != nil {
-			m.recordServiceError(e.dir, err)
+			m.recordServiceError(e, err)
 			return
 		}
 	}
@@ -723,7 +765,9 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		}
 	}
 	if trimErr != nil {
-		m.recordServiceError(e.dir, trimErr)
+		m.recordServiceError(e, trimErr)
+	} else {
+		e.entryMaintenanceSucceeded()
 	}
 	if hook := qwpSfTestBeforeTrimAccountingHook.Load(); hook != nil {
 		(*hook)(e)
@@ -739,7 +783,24 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	m.mu.Unlock()
 }
 
-func (m *qwpSfSegmentManager) recordServiceError(dir string, err error) {
+// recordServiceError notes one failed maintenance pass for a ring. Maintenance
+// keeps retrying on every tick, so a lone failure stays a log line. Once the
+// failures form a run of qwpSfManagerMaintenanceFailureThreshold, the entry
+// publishes the error: at that point trim has stopped for long enough that the
+// ring fills, and the producer that ends up parked on it needs to be told its
+// disk is refusing writes rather than being handed the backpressure timeout's
+// "server slow / disconnected" reading. Worker goroutine only.
+func (m *qwpSfSegmentManager) recordServiceError(e *qwpSfManagerRingEntry, err error) {
+	dir := ""
+	if e != nil {
+		dir = e.dir
+		e.maintenanceFailures++
+		if e.maintenanceFailures >= qwpSfManagerMaintenanceFailureThreshold {
+			sticky := fmt.Errorf("%w: slot maintenance has failed %d consecutive times: %w",
+				ErrSfDurability, e.maintenanceFailures, err)
+			e.maintenanceError.Store(&sticky)
+		}
+	}
 	now := time.Now()
 	m.mu.Lock()
 	shouldLog := now.Sub(m.lastMaintenanceLog) >= qwpSfManagerDiskFullLogThrottle

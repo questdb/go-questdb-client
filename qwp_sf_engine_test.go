@@ -555,3 +555,46 @@ func TestQwpSfEngineDrainedCleanupToleratesMissingSlotDir(t *testing.T) {
 	require.NoError(t, e.engineClose())
 	assert.True(t, e.engineCloseCompleted())
 }
+
+// A slot whose maintenance keeps failing reports the storage fault to the
+// producer parked on the ring it can no longer trim, instead of the generic
+// backpressure timeout that blames a slow or disconnected server.
+func TestQwpSfEngineBackpressureSurfacesMaintenanceFailure(t *testing.T) {
+	const segSize int64 = 96 // 24 header + 72 payload; three 24B frames fill it
+	// A long deadline makes the fail-fast unambiguous: without the maintenance
+	// check the call would block ~30s.
+	e, err := qwpSfNewCursorEngine("", segSize, segSize, 30*time.Second)
+	require.NoError(t, err)
+	defer func() { _ = e.engineClose() }()
+
+	for i := 0; i < 3; i++ {
+		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
+		require.NoError(t, err, "iteration %d", i)
+	}
+	// Stop the worker so the failure run below is this test's alone.
+	require.True(t, e.manager.segmentManagerClose())
+
+	diskErr := errors.New("update sf-manifest.bin: no space left on device")
+	for i := 1; i < qwpSfManagerMaintenanceFailureThreshold; i++ {
+		e.manager.recordServiceError(e.managerEntry, diskErr)
+		require.NoError(t, e.managerEntry.entryMaintenanceError(),
+			"a short run of failures is a log line, not a producer-visible error")
+	}
+	e.manager.recordServiceError(e.managerEntry, diskErr)
+
+	start := time.Now()
+	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrSfDurability),
+		"the parked producer must classify this as a local durability failure, got: %v", err)
+	assert.True(t, errors.Is(err, diskErr), "the filesystem error must stay matchable")
+	assert.False(t, errors.Is(err, ErrBackpressureTimeout),
+		"a disk that refuses writes must not read as a slow or disconnected server")
+	assert.Less(t, elapsed, 5*time.Second)
+
+	// Maintenance recovering ends the run.
+	e.managerEntry.entryMaintenanceSucceeded()
+	assert.NoError(t, e.managerEntry.entryMaintenanceError())
+}

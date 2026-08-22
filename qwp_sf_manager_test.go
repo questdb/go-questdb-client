@@ -43,7 +43,7 @@ func TestQwpSfManagerServiceErrorSurvivesPanickingLogger(t *testing.T) {
 	mgr.logger.Store(slog.New(panicOnHandleSlog{}))
 
 	require.NotPanics(t, func() {
-		mgr.recordServiceError("slot", errors.New("injected maintenance failure"))
+		mgr.recordServiceError(&qwpSfManagerRingEntry{dir: "slot"}, errors.New("injected maintenance failure"))
 	})
 }
 

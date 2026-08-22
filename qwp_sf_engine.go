@@ -67,12 +67,14 @@ var ErrBackpressureTimeout = errors.New(
 	"qwp/sf: cursor ring backpressured — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)")
 
 // ErrSfDurability is the sentinel a QWP store-and-forward producer call wraps
-// when a segment rotation cannot durably commit its header or manifest update.
-// The failed append has not been assigned an FSN and remains pending in the
-// sender, so callers may correct the transient local-storage failure and retry
-// the same operation. Match it with errors.Is; the underlying filesystem error
-// remains matchable as well.
-var ErrSfDurability = errors.New("qwp/sf: could not durably commit segment rotation")
+// when the slot's local storage cannot durably commit the state the sender
+// needs: a segment rotation's header or manifest update, or the background
+// maintenance that persists the ack watermark and trims acked segments. The
+// failed append has not been assigned an FSN and remains pending in the
+// sender, so callers may correct the local-storage failure and retry the same
+// operation. Match it with errors.Is; the underlying filesystem error remains
+// matchable as well.
+var ErrSfDurability = errors.New("qwp/sf: could not durably commit store-and-forward state")
 
 // qwpSfTestBeforeSegmentUnlinkHook is a test seam for holding terminal cleanup
 // after quiescence while a concurrent Close arrives. Production leaves it nil.
@@ -115,7 +117,9 @@ type qwpSfCursorEngine struct {
 	sfDir            string
 	segmentSizeBytes int64
 
-	manager      *qwpSfSegmentManager
+	manager *qwpSfSegmentManager
+	// managerEntry is written once, by the constructor, and read from both the
+	// producer goroutine (engineTerminalError) and close.
 	managerEntry *qwpSfManagerRingEntry
 	ownsManager  bool
 	slotLock     *qwpSfSlotLock
@@ -874,6 +878,12 @@ func (e *qwpSfCursorEngine) engineTerminalError() error {
 			return err
 		}
 	}
+	// Same reasoning for a slot whose maintenance keeps failing: the trim that
+	// would free ring space cannot commit, so the backpressure is local storage
+	// refusing writes, not a slow or disconnected server.
+	if err := e.managerEntry.entryMaintenanceError(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -975,15 +985,18 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	}
 	effectiveLeakSegments := e.deferredLeakSegments.Load()
 
+	// The entry stays a local: e.managerEntry is written once, by the
+	// constructor, and read by the producer through engineTerminalError. A
+	// second write here would race that read.
 	entry := e.manager.segmentManagerDeregister(e.ring)
-	if entry != nil {
-		e.managerEntry = entry
+	if entry == nil {
+		entry = e.managerEntry
 	}
 	quiescent := false
 	if e.ownsManager {
 		quiescent = e.manager.segmentManagerClose()
 	} else {
-		quiescent = e.manager.awaitRingQuiescence(e.managerEntry)
+		quiescent = e.manager.awaitRingQuiescence(entry)
 	}
 	if !quiescent {
 		var handedOff bool
@@ -991,7 +1004,7 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 		if e.ownsManager {
 			handedOff = e.manager.deferOwnedCleanupUntilWorkerExit(e.deferredClose)
 		} else {
-			handedOff = e.manager.deferUntilRingQuiescent(e.managerEntry, e.deferredClose)
+			handedOff = e.manager.deferUntilRingQuiescent(entry, e.deferredClose)
 		}
 		if !handedOff {
 			e.deferredCleanupOwned.Store(false)

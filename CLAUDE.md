@@ -141,10 +141,14 @@ blocking sync initial connect; on a running sender it does not bound reconnect
 (it also serves as the poison-frame episode floor and the drainer no-progress
 budget). The sanctioned terminals — auth reject, upgrade reject, durable-ack
 capability-gap exhaustion, poison-frame escalation, and drainer slot-recovery
-failure — are enumerated and enforced by the review-pr skill checklist. The only
-producer-visible error from a running drain path is SF-out-of-space backpressure.
+failure — are enumerated and enforced by the review-pr skill checklist. The
+producer-visible errors from a running drain path are all local: SF-out-of-space
+backpressure (`ErrBackpressureTimeout`) and local-storage durability failures
+(`ErrSfDurability` — a rotation that cannot commit its header or manifest, or a
+run of failed slot maintenance). Both are non-terminal: the rows stay pending
+and the same call can be retried.
 
-Drainer quarantine is reserved for a slot proved inconsistent
+Drainer quarantine is likewise reserved for a slot proved inconsistent
 (`qwpSfErrRecoveryFailClosed`). A local I/O fault while opening a slot — a full
 disk, an exhausted fd table, a vanished mount — leaves no `.failed` sentinel,
 so the next foreground scan adopts the slot again. Legacy (manifest-less) slots
