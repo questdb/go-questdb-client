@@ -469,17 +469,28 @@ func (db *QuestDB) Close(ctx context.Context) error {
 		db.closeMu.Unlock()
 	})
 	db.closeMu.Lock()
-	defer db.closeMu.Unlock()
 	if !errors.Is(db.closeErr, ErrSfCleanupPending) {
-		return db.closeErr
+		err := db.closeErr
+		db.closeMu.Unlock()
+		return err
 	}
+	queryErr, housekeepErr := db.closeQueryErr, db.closeHousekeepErr
+	db.closeMu.Unlock()
 	// Retained slot locks are the one Close result that can still change:
 	// qwpSenderPool.close is idempotent and re-probes its retired slots, and it
 	// replays the teardown error from the first pass, so recomputing here
 	// cannot lose a real failure. The query pool and the housekeeper are done
 	// for good, so their errors come from the recorded values.
+	//
+	// The re-probe runs off closeMu. It logs through the application's slog
+	// handler, and while qwpSfLogGuarded contains a panicking handler it cannot
+	// contain a blocking one -- a handler that calls Close would deadlock on
+	// this non-reentrant mutex. Holding the lock across pool teardown would
+	// also serialize concurrent callers behind filesystem work.
 	sErr := closeStep(func() error { return db.senderPool.close(ctx) })
-	db.closeErr = firstCloseErr(sErr, db.closeQueryErr, db.closeHousekeepErr)
+	db.closeMu.Lock()
+	defer db.closeMu.Unlock()
+	db.closeErr = firstCloseErr(sErr, queryErr, housekeepErr)
 	return db.closeErr
 }
 

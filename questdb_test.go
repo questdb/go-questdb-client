@@ -27,6 +27,8 @@ package questdb
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -574,3 +576,64 @@ func TestQuestDBDrainerListenerAppliedToPooledSenders(t *testing.T) {
 		t.Fatal("facade-registered drainer listener never fired for the adopted orphan")
 	}
 }
+
+// TestQuestDBCloseReprobeDoesNotHoldCloseMu pins that the retained-slot-lock
+// re-probe runs off closeMu. That path logs through the application's slog
+// handler, and qwpSfLogGuarded contains a handler that panics but not one that
+// blocks — a handler calling Close while the lock is held would deadlock on a
+// non-reentrant mutex, and concurrent callers would serialize behind pool
+// teardown either way.
+func TestQuestDBCloseReprobeDoesNotHoldCloseMu(t *testing.T) {
+	db := &QuestDB{}
+	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
+	db.closeOnce.Do(func() {}) // mark the one-shot teardown as already run
+
+	// The re-probe restores a retired slot's capacity and logs that through the
+	// application's handler. This handler reaches back for closeMu, which is
+	// exactly what a user handler calling Close does; holding the lock across
+	// the re-probe deadlocks on it.
+	reentered := make(chan struct{})
+	db.senderPool = &qwpSenderPool{
+		closed:          true,
+		storeAndForward: true,
+		notify:          make(chan struct{}),
+		slotInUse:       []bool{true},
+		leakedSlots:     1,
+		retiredSlots:    []*qwpSenderSlot{{slotIndex: 0}}, // no reporter: counts as closed
+		logger:          slog.New(closeMuProbeHandler{db: db, hit: reentered}),
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- db.Close(context.Background()) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close deadlocked: closeMu is held across the re-probe")
+	}
+	select {
+	case <-reentered:
+	default:
+		t.Fatal("the re-probe never reached the logger; the test proves nothing")
+	}
+}
+
+// closeMuProbeHandler takes db.closeMu from inside a log call, standing in for
+// an application handler that calls Close.
+type closeMuProbeHandler struct {
+	db  *QuestDB
+	hit chan struct{}
+}
+
+func (closeMuProbeHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h closeMuProbeHandler) Handle(context.Context, slog.Record) error {
+	h.db.closeMu.Lock()
+	h.db.closeMu.Unlock()
+	select {
+	case <-h.hit:
+	default:
+		close(h.hit)
+	}
+	return nil
+}
+func (h closeMuProbeHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h closeMuProbeHandler) WithGroup(string) slog.Handler      { return h }
