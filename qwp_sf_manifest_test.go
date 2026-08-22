@@ -205,8 +205,39 @@ func TestQwpSfQuarantineCreationDebrisReportsAnUnrenameableManifest(t *testing.T
 	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
 	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.EPERM })
 
-	require.ErrorIs(t, qwpSfQuarantineCreationDebris(path), syscall.EPERM)
-	preserved, err := os.ReadFile(path)
-	require.NoError(t, err, "the manifest must still be there for the slot's quarantine")
+	err := qwpSfQuarantineCreationDebris(path)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed,
+		"the failure must be fail-closed so the caller preserves the whole slot")
+	require.ErrorContains(t, err, "operation not permitted")
+	preserved, readErr := os.ReadFile(path)
+	require.NoError(t, readErr, "the manifest must still be there for the slot's quarantine")
 	require.Equal(t, "unusable", string(preserved))
+}
+
+// TestQwpSfUnrenameableManifestDoesNotBrickTheSlot is the consequence that
+// matters. A plain error out of the manifest quarantine is not fail-closed, so
+// the recovery policy neither quarantines the slot nor starts a fresh one, and
+// every later construction for that sender_id fails identically — ingestion
+// stops until an operator deletes the file by hand.
+func TestQwpSfUnrenameableManifestDoesNotBrickTheSlot(t *testing.T) {
+	root := t.TempDir()
+	slot := filepath.Join(root, "wedged")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	// A manifest of the wrong size, which qwpSfManifestOpen sets aside.
+	require.NoError(t, os.WriteFile(filepath.Join(slot, qwpSfManifestFileName),
+		[]byte("too short"), 0o644))
+
+	original := qwpSfManifestQuarantineRename.load()
+	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
+	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.ENOSPC })
+
+	engine, err := qwpSfNewCursorEngine(slot, 4096, qwpSfUnlimitedTotalBytes, 0)
+	require.NoError(t, err, "the sender must still be constructible")
+	require.NotNil(t, engine)
+	t.Cleanup(func() { _ = engine.engineClose() })
+
+	entries, err := os.ReadDir(filepath.Join(root, "quarantined"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the whole slot must be preserved instead")
+	require.NotEmpty(t, engine.engineQuarantinedSlotPath())
 }

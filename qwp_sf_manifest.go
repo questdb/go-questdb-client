@@ -267,21 +267,28 @@ var qwpSfManifestQuarantineRename = qwpSfSwappable(os.Rename)
 // The target name is probed the same way segment quarantine probes it, so an
 // earlier quarantine's evidence survives.
 //
-// A rename that cannot succeed is reported rather than escalated to a delete.
-// Unlinking needs write and search on the same directory the rename needs, so
-// a directory that refuses one refuses the other -- there is no filesystem
-// state where deleting is the way forward. And it would not help if there
-// were: every segment this client writes carries the manifest-required flag,
-// so a slot whose manifest is gone fails closed rather than falling back to
-// the legacy path. Deleting would cost the boundary record and change nothing
-// else.
+// A rename that cannot succeed is neither ignored nor escalated to a delete.
+// Deleting is never the way forward: it costs the boundary record, and it
+// would not even unblock the slot, because every segment this client writes
+// carries the manifest-required flag -- a slot whose manifest is gone fails
+// closed rather than falling back to the legacy path.
+//
+// The failure is reported as fail-closed so the caller preserves the whole
+// slot under <sf_dir>/quarantined/ and starts a fresh one. Returning a plain
+// error instead strands the sender for good: the recovery policy only
+// quarantines on qwpSfErrRecoveryFailClosed, so every later construction for
+// that sender_id fails identically and ingestion stops until an operator
+// removes the file by hand. The slot-level quarantine is a rename in the
+// PARENT directory, so whatever is wrong with this one -- a full disk that
+// cannot afford the longer .corrupt name, a name already too long -- does not
+// block it.
 func qwpSfQuarantineCreationDebris(path string) error {
 	corrupt, err := qwpSfQuarantineTargetPath(path)
 	if err != nil {
-		return err
+		return qwpSfFailClosed("could not choose a quarantine name for invalid %s: %v", path, err)
 	}
 	if err := qwpSfManifestQuarantineRename.load()(path, corrupt); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("qwp/sf: could not quarantine invalid %s: %w", path, err)
+		return qwpSfFailClosed("could not quarantine invalid %s: %v", path, err)
 	}
 	return nil
 }
