@@ -488,10 +488,18 @@ func (db *QuestDB) Close(ctx context.Context) error {
 	// this non-reentrant mutex. Holding the lock across pool teardown would
 	// also serialize concurrent callers behind filesystem work.
 	sErr := closeStep(func() error { return db.senderPool.close(ctx) })
+	result := firstCloseErr(sErr, queryErr, housekeepErr)
 	db.closeMu.Lock()
 	defer db.closeMu.Unlock()
-	db.closeErr = firstCloseErr(sErr, queryErr, housekeepErr)
-	return db.closeErr
+	// Concurrent callers can both be in the re-probe, and a slower one's
+	// observation is older than a faster one's. Record only a result that
+	// stops reporting the sentinel, so the recorded value moves in the one
+	// direction the contract promises and a caller cannot be told the locks
+	// came back. Each caller still returns what it observed itself.
+	if !errors.Is(result, ErrSfCleanupPending) || !errors.Is(db.closeErr, ErrSfCleanupPending) {
+		db.closeErr = result
+	}
+	return result
 }
 
 // firstCloseErr selects the most actionable teardown error, preferring the
