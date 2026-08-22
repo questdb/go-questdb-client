@@ -150,6 +150,65 @@ func TestQwpSfAckWatermarkExistingBlockReservationFailureStopsOpen(t *testing.T)
 	require.Equal(t, 1, writeCalls)
 }
 
+// TestQwpSfAckWatermarkNewBlockReservationFailureStopsOpen pins that a file
+// this call creates gets the same block-forcing write as one it finds. On a
+// filesystem with no reservation primitive -- NFS, SMB, overlayfs, or the
+// generic-unix build -- qwpSfAllocate reports success having reserved nothing,
+// so without the write the fresh file is sparse. The manager goroutine stores
+// through that mapping, and on a full disk that is a SIGBUS with no error to
+// report and no goroutine to report it on.
+func TestQwpSfAckWatermarkNewBlockReservationFailureStopsOpen(t *testing.T) {
+	dir := t.TempDir()
+
+	originalWriteAt := qwpSfAckWatermarkWriteAt.load()
+	writeCalls := 0
+	qwpSfAckWatermarkWriteAt.store(func(*os.File, []byte, int64) (int, error) {
+		writeCalls++
+		return 0, syscall.ENOSPC
+	})
+	t.Cleanup(func() { qwpSfAckWatermarkWriteAt.store(originalWriteAt) })
+
+	w, err := qwpSfAckWatermarkOpenRequired(dir)
+	if w != nil {
+		_ = w.close()
+	}
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	require.Nil(t, w)
+	require.Equal(t, 1, writeCalls)
+}
+
+// TestQwpSfAckWatermarkResetBlockReservationFailureStopsOpen covers the third
+// way in: a correctly sized file whose records are both unreadable is
+// truncated and rebuilt, which leaves it as freshly allocated as the create
+// path and needing the same write.
+func TestQwpSfAckWatermarkResetBlockReservationFailureStopsOpen(t *testing.T) {
+	dir := t.TempDir()
+	buf := make([]byte, qwpSfAckWatermarkFileSize)
+	binary.LittleEndian.PutUint32(buf[0:4], 0xDEADBEEF)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfAckWatermarkFileName), buf, 0o644))
+
+	originalWriteAt := qwpSfAckWatermarkWriteAt.load()
+	writeCalls := 0
+	qwpSfAckWatermarkWriteAt.store(func(f *os.File, p []byte, off int64) (int, error) {
+		writeCalls++
+		if writeCalls == 1 {
+			// The pre-mmap write for the file as found must still succeed, or
+			// the reset below is never reached.
+			return originalWriteAt(f, p, off)
+		}
+		return 0, syscall.ENOSPC
+	})
+	t.Cleanup(func() { qwpSfAckWatermarkWriteAt.store(originalWriteAt) })
+
+	w, err := qwpSfAckWatermarkOpenRequired(dir)
+	if w != nil {
+		_ = w.close()
+	}
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	require.Nil(t, w)
+	require.Equal(t, 2, writeCalls)
+}
+
 func TestQwpSfAckWatermarkBadMagicIsInvalid(t *testing.T) {
 	dir := t.TempDir()
 	buf := make([]byte, qwpSfAckWatermarkFileSize)

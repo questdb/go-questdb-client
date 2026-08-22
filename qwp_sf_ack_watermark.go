@@ -98,33 +98,22 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 	if err != nil {
 		return nil, fmt.Errorf("qwp/sf: open ack watermark %s: %w", path, err)
 	}
+	// image is what goes back through the descriptor to force real blocks under
+	// every page that will be mapped: the existing dual-slot records where there
+	// are any, zeros for a file this call creates.
+	var image [qwpSfAckWatermarkFileSize]byte
 	if !existing {
 		if err := qwpSfAllocate(f, qwpSfDualRecordFileSize); err != nil {
 			_ = f.Close()
 			return nil, err
 		}
-	} else {
-		// Preserve the existing dual-slot records while forcing real blocks
-		// underneath every page that will be mapped. A correctly-sized foreign
-		// or fallback-created file may be sparse; storing through its mapping on
-		// a full disk would SIGBUS the process. qwpSfAllocate cannot help here
-		// because it intentionally does nothing when size == current size. The
-		// write-back allocates the holes now and surfaces ENOSPC on the open path.
-		var preserved [qwpSfAckWatermarkFileSize]byte
-		if _, err := io.ReadFull(f, preserved[:]); err != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("qwp/sf: read existing ack watermark %s: %w", path, err)
-		}
-		n, err := qwpSfAckWatermarkWriteAt.load()(f, preserved[:], 0)
-		if err != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("qwp/sf: reserve blocks for existing ack watermark %s: %w", path, err)
-		}
-		if n != len(preserved) {
-			_ = f.Close()
-			return nil, fmt.Errorf("qwp/sf: reserve blocks for existing ack watermark %s: wrote %d of %d bytes: %w",
-				path, n, len(preserved), io.ErrShortWrite)
-		}
+	} else if _, err := io.ReadFull(f, image[:]); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("qwp/sf: read existing ack watermark %s: %w", path, err)
+	}
+	if err := qwpSfAckWatermarkReserveBlocks(f, path, image[:]); err != nil {
+		_ = f.Close()
+		return nil, err
 	}
 	buf, err := qwpSfMmapRW(f, qwpSfDualRecordFileSize)
 	if err != nil {
@@ -147,6 +136,11 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 			_ = f.Close()
 			return nil, err
 		}
+		var reset [qwpSfAckWatermarkFileSize]byte
+		if err := qwpSfAckWatermarkReserveBlocks(f, path, reset[:]); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 		buf, err = qwpSfMmapRW(f, qwpSfDualRecordFileSize)
 		if err != nil {
 			_ = f.Close()
@@ -164,6 +158,32 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 		w.fsn = rec.first
 	}
 	return w, nil
+}
+
+// qwpSfAckWatermarkReserveBlocks writes image back through the descriptor so
+// every page the mapping will touch is backed by a real block. Storing through
+// a sparse mapping on a full disk raises SIGBUS, and this file is stored to
+// from the segment manager's goroutine, where that would take the process down
+// with no error to report.
+//
+// The write is needed on every path, not only for a file that was already
+// there. qwpSfAllocate reports success without reserving anything whenever the
+// filesystem has no reservation primitive it can use -- NFS, SMB and overlayfs
+// take its sparse fallback, and the generic-unix build has no primitive at all
+// -- and it deliberately does nothing for a file that is already the right
+// size, which is what an existing (possibly foreign, possibly sparse) one is.
+// Writing the image allocates the holes now, so a full disk surfaces as ENOSPC
+// from the open instead of as a signal later.
+func qwpSfAckWatermarkReserveBlocks(f *os.File, path string, image []byte) error {
+	n, err := qwpSfAckWatermarkWriteAt.load()(f, image, 0)
+	if err != nil {
+		return fmt.Errorf("qwp/sf: reserve blocks for ack watermark %s: %w", path, err)
+	}
+	if n != len(image) {
+		return fmt.Errorf("qwp/sf: reserve blocks for ack watermark %s: wrote %d of %d bytes: %w",
+			path, n, len(image), io.ErrShortWrite)
+	}
+	return nil
 }
 
 func qwpSfAckWatermarkRemoveOrphan(slotDir string) {
