@@ -189,29 +189,24 @@ func TestQwpSfQuarantineCreationDebrisPreservesEvidence(t *testing.T) {
 	require.Equal(t, "second evidence", string(second))
 }
 
-// TestQwpSfQuarantineCreationDebrisFallsBackToRemoval pins that an unusable
-// manifest cannot brick a slot. Both callers turn a failure here into a hard
-// error out of recovery, and it is not a fail-closed error, so the engine
-// neither quarantines the slot nor retries — a directory that is readable but
-// not renameable would fail every later open identically. Preserving the copy
-// is preferred; making progress is required.
-func TestQwpSfQuarantineCreationDebrisFallsBackToRemoval(t *testing.T) {
+// TestQwpSfQuarantineCreationDebrisReportsAnUnrenameableManifest pins that a
+// rename that cannot succeed is reported rather than escalated to a delete.
+// This runs before recovery has decided whether the slot fails closed, and the
+// manifest is the boundary record that explains the segments it is preserved
+// with — so removing it is never the way forward. It would not help anyway:
+// every segment this client writes carries the manifest-required flag, so a
+// slot whose manifest is gone fails closed rather than degrading.
+func TestQwpSfQuarantineCreationDebrisReportsAnUnrenameableManifest(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfManifestFileName)
 	require.NoError(t, os.WriteFile(path, []byte("unusable"), 0o644))
-	// An earlier quarantine that must survive whatever happens next.
-	require.NoError(t, os.WriteFile(path+".corrupt", []byte("earlier evidence"), 0o644))
 
 	original := qwpSfManifestQuarantineRename.load()
 	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
 	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.EPERM })
 
-	require.NoError(t, qwpSfQuarantineCreationDebris(path),
-		"an un-renameable manifest must still let recovery proceed")
-	_, err := os.Stat(path)
-	require.True(t, os.IsNotExist(err), "the unusable manifest must be gone")
-	preserved, err := os.ReadFile(path + ".corrupt")
-	require.NoError(t, err)
-	require.Equal(t, "earlier evidence", string(preserved),
-		"the fallback must not destroy an earlier quarantine")
+	require.ErrorIs(t, qwpSfQuarantineCreationDebris(path), syscall.EPERM)
+	preserved, err := os.ReadFile(path)
+	require.NoError(t, err, "the manifest must still be there for the slot's quarantine")
+	require.Equal(t, "unusable", string(preserved))
 }
