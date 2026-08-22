@@ -1022,6 +1022,16 @@ func (e *qwpSfCursorEngine) engineCloseLeakSegments() error {
 }
 
 func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
+	// Publish the leak decision first. It is a one-way latch, so recording it
+	// on a path that then returns early is harmless -- and every later reader
+	// needs it, including a retry owner that picks this close up after a fault.
+	// Deciding it further down, past the closed CAS and three early returns,
+	// leaves a window where an abandoned-send-loop close has faulted without
+	// ever saying so, and the retry then unmaps segments the abandoned
+	// goroutine may still dereference.
+	if leakSegments {
+		e.deferredLeakSegments.Store(true)
+	}
 	firstClose := e.closed.CompareAndSwap(false, true)
 	if !firstClose && (e.closeCompleted.Load() || e.deferredCleanupOwned.Load()) {
 		return nil
@@ -1068,12 +1078,9 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 		e.deferredFullyDrained.Store(fullyDrained)
 	}
 	fullyDrained := e.deferredFullyDrained.Load()
-	// Mapping leaks are a one-way safety decision: a retrying normal close must
-	// never downgrade an earlier abandoned-send-loop close and unmap memory that
-	// the abandoned goroutine may still dereference.
-	if leakSegments {
-		e.deferredLeakSegments.Store(true)
-	}
+	// A retrying normal close reads the latch rather than its own argument, so
+	// it cannot downgrade an earlier abandoned-send-loop close and unmap memory
+	// that the abandoned goroutine may still dereference.
 	effectiveLeakSegments := e.deferredLeakSegments.Load()
 
 	// The entry stays a local: e.managerEntry is written once, by the
