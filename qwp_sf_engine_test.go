@@ -175,8 +175,9 @@ func TestQwpSfEngineSlotLockBlocksDouble(t *testing.T) {
 	defer func() { _ = e1.engineClose() }()
 
 	_, err = qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "slot already in use")
+	require.ErrorIs(t, err, qwpSfErrLockBusy)
+	assert.Contains(t, err.Error(), "held by this process",
+		"both engines are ours; pointing at another process would send the reader hunting for one that does not exist")
 }
 
 func TestQwpSfEngineFullDrainUnlinksFiles(t *testing.T) {

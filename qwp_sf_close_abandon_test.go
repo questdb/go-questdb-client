@@ -299,8 +299,7 @@ func TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits(t *testing.T) {
 	// idempotent observation, not a second registration or a panic.
 	require.NoError(t, engine.engineClose())
 	_, err = qwpSfAcquireSlotLock(dir)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "slot already in use")
+	require.ErrorIs(t, err, qwpSfErrLockBusy)
 	_, err = os.Stat(filepath.Join(dir, "sf-initial.sfa"))
 	require.NoError(t, err, "close must not remove segment files while the worker can touch the slot")
 

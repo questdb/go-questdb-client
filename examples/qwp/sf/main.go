@@ -61,11 +61,16 @@ func main() {
 		log.Fatal(err)
 	}
 	defer func() {
-		// Close() drains the engine (waiting up to
+		// Close() drains the engine, waiting up to
 		// close_flush_timeout_millis for the server to ACK every
-		// frame) and releases the slot lock. Anything still on disk
-		// will be replayed by the next process to start with the
-		// same sf_dir + sender_id.
+		// frame. Anything still on disk will be replayed by the next
+		// process to start with the same sf_dir + sender_id.
+		//
+		// Close() can return before the slot lock is released: when
+		// the segment manager is still busy, the release finishes on
+		// a background goroutine that keeps retrying it. Reopening
+		// the same slot immediately may fail with a lock error naming
+		// this process; retry the open until it succeeds.
 		if err := sender.Close(ctx); err != nil {
 			log.Fatal(err)
 		}

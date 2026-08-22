@@ -267,6 +267,16 @@ type LineSender interface {
 	//
 	// If auto-flush is enabled, the client will flush any remaining buffered
 	// messages before closing itself.
+	//
+	// A QWP store-and-forward sender does not always finish releasing its
+	// slot directory's lock before Close returns. When the segment manager
+	// has not gone quiet, cleanup transfers to that worker and a retry owner
+	// keeps working on it in the background with no deadline. Close returns
+	// nil in that case, so a nil result does not on its own mean the slot
+	// lock is gone: reopening the same sf_dir + sender_id right away can fail
+	// to acquire it, with an error naming this process as the holder. Retry
+	// the open until it succeeds. Pooled senders expose the same condition
+	// through QuestDB.Close as ErrSfCleanupPending.
 	Close(ctx context.Context) error
 }
 

@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -399,7 +398,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	if err != nil {
 		// Lock contention is expected (a sibling drainer or the
 		// foreground sender holds it) — exit silently, no .failed.
-		if errors.Is(err, qwpSfErrLockBusy) || strings.Contains(err.Error(), "slot already in use") {
+		if errors.Is(err, qwpSfErrLockBusy) {
 			d.outcome.Store(int32(qwpSfDrainOutcomeLockedByOther))
 			return
 		}

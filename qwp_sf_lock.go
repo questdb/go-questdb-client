@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -104,9 +105,22 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 		holder := qwpSfReadHolder(pidPath)
 		_ = f.Close()
 		if errors.Is(err, qwpSfErrLockBusy) {
+			if holder == qwpSfSelfHolder() {
+				// Close hands terminal cleanup to the segment manager worker
+				// whenever the manager has not gone quiet, and returns before a
+				// retry owner has released the flock. Reopening the slot in that
+				// window is the common way to land here, and blaming another
+				// process would send the reader hunting for one that does not
+				// exist.
+				return nil, fmt.Errorf(
+					"%w: slot lock is recorded as held by this process [slot=%s, holder=%s]; "+
+						"a sender for this slot has not finished releasing it — Close can return "+
+						"while a background retry owner still holds the lock. Retry the open",
+					qwpSfErrLockBusy, slotDir, holder)
+			}
 			return nil, fmt.Errorf(
-				"qwp/sf: slot already in use by another process [slot=%s, holder=%s]",
-				slotDir, holder)
+				"%w: slot already in use by another process [slot=%s, holder=%s]",
+				qwpSfErrLockBusy, slotDir, holder)
 		}
 		return nil, err
 	}
@@ -116,6 +130,12 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 		lockPath: lockPath,
 		file:     f,
 	}, nil
+}
+
+// qwpSfSelfHolder renders this process in the same shape qwpSfReadHolder
+// returns, so a busy lock whose sidecar names us is recognisable.
+func qwpSfSelfHolder() string {
+	return "pid=" + strconv.Itoa(os.Getpid())
 }
 
 // qwpSfReadHolder reads the PID payload of an existing .lock.pid

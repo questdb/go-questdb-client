@@ -121,7 +121,10 @@ reserved and count against capacity until re-probed, so
 error wrapping `ErrSfCleanupPending` while any slot cleanup is still pending.
 That report is a "not yet", not a verdict: `QuestDB.Close` re-probes the sender
 pool on every later call and returns nil once the last slot lock is gone, which
-is the only re-check left once the housekeeper has stopped.
+is the only re-check left once the housekeeper has stopped. A standalone
+sender's `Close` returns nil in the same situation, so **a nil `Close` does not
+by itself mean the slot lock is released** — reopening the same slot can fail,
+naming this process as the holder.
 
 **Cursor frames carry a self-sufficient schema** — full inline column
 definitions on every frame — which keeps reconnect/replay/orphan-adoption
