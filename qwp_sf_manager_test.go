@@ -30,6 +30,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -429,4 +430,44 @@ func TestQwpSfManagerHoldsBytesForAFailedTrimUnlink(t *testing.T) {
 	assert.Empty(t, e.pendingUnlinks)
 	e.entryMaintenanceSucceeded()
 	assert.NoError(t, e.entryMaintenanceError())
+}
+
+// TestQwpSfSpareCreationSyncsSlotDirectory pins the durability barrier that
+// makes a minted spare findable after a crash. A rotation commits the spare's
+// base into the manifest as the active one; if the spare's directory entry is
+// not durable by then, a crash leaves the manifest naming a base with no
+// segment at it. Recovery refuses such a slot, so a single lost name costs
+// every undelivered row in it.
+func TestQwpSfSpareCreationSyncsSlotDirectory(t *testing.T) {
+	dir := t.TempDir()
+	var mu sync.Mutex
+	synced := map[string]int{}
+	hook := func(d string) {
+		mu.Lock()
+		synced[d]++
+		mu.Unlock()
+	}
+	qwpSfTestDirSyncHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(nil) })
+
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = e.engineClose() })
+
+	// The fresh slot's own creation barrier.
+	mu.Lock()
+	afterCreate := synced[dir]
+	mu.Unlock()
+	require.GreaterOrEqual(t, afterCreate, 1, "creating a slot must sync its directory")
+
+	// Wait for the manager to mint a spare and confirm it synced the directory
+	// before that spare can be promoted.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return synced[dir] > afterCreate
+	}, 3*time.Second, time.Millisecond,
+		"minting a spare must make its name durable before a rotation can commit it")
+
+	require.False(t, e.ring.needsHotSpare(), "the manager should have provisioned a spare")
 }

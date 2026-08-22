@@ -699,6 +699,20 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 				if err == nil && e.ring.ringManifest() != nil {
 					err = spare.markManifestRequired()
 				}
+				if err == nil {
+					// The spare's name has to be durable before a rotation can
+					// commit its base as the manifest's active one. fsync on
+					// the file does not carry the directory entry of a file
+					// this new, so without this barrier a crash can leave the
+					// manifest naming an active base with no segment at it --
+					// which recovery refuses, quarantining the whole slot and
+					// every undelivered row in it. The barrier runs here, on
+					// the provisioning goroutine, so it costs the producer's
+					// flush nothing.
+					if syncErr := qwpSfSyncSlotDir(e.dir); syncErr != nil {
+						err = fmt.Errorf("qwp/sf: fsync slot directory after minting spare %s: %w", path, syncErr)
+					}
+				}
 			}
 			if err == nil {
 				// Install + commit atomically under the manager lock.
@@ -789,7 +803,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			m.recordServiceError(e, err)
 			return
 		}
-		if err := qwpSfSyncDir(e.dir); err != nil {
+		if err := qwpSfSyncSlotDir(e.dir); err != nil {
 			m.recordServiceError(e, fmt.Errorf("pre-trim directory fsync: %w", err))
 			return
 		}
@@ -833,7 +847,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		trimmedBytes += sz
 	}
 	if !memoryMode {
-		if err := qwpSfSyncDir(e.dir); err != nil {
+		if err := qwpSfSyncSlotDir(e.dir); err != nil {
 			e.dirSyncPending = true
 			if trimErr == nil {
 				trimErr = fmt.Errorf("post-trim directory fsync: %w", err)
@@ -876,7 +890,7 @@ func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (i
 	}
 	e.pendingUnlinks = kept
 	if e.dirSyncPending && e.dir != "" {
-		if err := qwpSfSyncDir(e.dir); err != nil {
+		if err := qwpSfSyncSlotDir(e.dir); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("retry post-trim directory fsync: %w", err)
 			}

@@ -275,7 +275,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			}
 		}
 		if replacedTornActive {
-			if err := qwpSfSyncDir(sfDir); err != nil {
+			if err := qwpSfSyncSlotDir(sfDir); err != nil {
 				return nil, nil, fmt.Errorf("qwp/sf: sync torn-active replacement directory %s: %w", sfDir, err)
 			}
 		}
@@ -631,10 +631,10 @@ func qwpSfQuarantineSlot(slotDir string) (string, error) {
 	if err := os.Rename(slotDir, target); err != nil {
 		return "", fmt.Errorf("qwp/sf: quarantine slot %s as %s: %w", slotDir, target, err)
 	}
-	if err := qwpSfSyncDir(parent); err != nil {
+	if err := qwpSfSyncSlotDir(parent); err != nil {
 		return "", fmt.Errorf("qwp/sf: fsync slot parent after quarantine: %w", err)
 	}
-	if err := qwpSfSyncDir(quarantineDir); err != nil {
+	if err := qwpSfSyncSlotDir(quarantineDir); err != nil {
 		return "", fmt.Errorf("qwp/sf: fsync quarantine directory: %w", err)
 	}
 	return target, nil

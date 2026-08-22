@@ -101,6 +101,20 @@ var ErrSfDurability = errors.New("qwp/sf: could not durably commit store-and-for
 // after quiescence while a concurrent Close arrives. Production leaves it nil.
 var qwpSfTestBeforeSegmentUnlinkHook atomic.Pointer[func(path string)]
 
+// qwpSfSyncSlotDir makes a slot directory's namespace durable, so a file this
+// slot created is findable after a crash. Every control point that publishes or
+// retires a name in the slot goes through it.
+func qwpSfSyncSlotDir(dir string) error {
+	if hook := qwpSfTestDirSyncHook.Load(); hook != nil {
+		(*hook)(dir)
+	}
+	return qwpSfSyncDir(dir)
+}
+
+// qwpSfTestDirSyncHook observes every directory barrier. Test seam only: it
+// lets a test pin which control points make a name durable. Nil in production.
+var qwpSfTestDirSyncHook atomic.Pointer[func(dir string)]
+
 // qwpSfTestAfterManagerTeardownHook fires immediately after a close publishes
 // managerTornDown, which is where a rival claimant lands in the narrowest
 // window a second Close can hit. Test seam only.
@@ -603,7 +617,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 				_ = initial.close()
 				return nil, err
 			}
-			if err := qwpSfSyncDir(sfDir); err != nil {
+			if err := qwpSfSyncSlotDir(sfDir); err != nil {
 				_ = initial.close()
 				return nil, fmt.Errorf("qwp/sf: fsync fresh slot directory: %w", err)
 			}
@@ -1247,7 +1261,7 @@ func (e *qwpSfCursorEngine) engineFinishDrainedFileCleanup() error {
 	// the manifest removal above treat it the same way. Returning the open
 	// error instead would leave the retry owner failing identically forever,
 	// holding the flock fd and (in the pool) the slot's index reservation.
-	if err := qwpSfSyncDir(e.sfDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := qwpSfSyncSlotDir(e.sfDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	qwpSfAckWatermarkRemoveOrphan(e.sfDir)

@@ -138,7 +138,7 @@ func qwpSfManifestCreate(dir string, headBase, activeBase int64) (*qwpSfManifest
 	if err := m.update(headBase, activeBase); err != nil {
 		return nil, err
 	}
-	if err := qwpSfSyncDir(dir); err != nil {
+	if err := qwpSfSyncSlotDir(dir); err != nil {
 		return nil, fmt.Errorf("qwp/sf: fsync manifest directory %s: %w", dir, err)
 	}
 	ok = true
