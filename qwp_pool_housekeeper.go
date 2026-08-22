@@ -103,7 +103,11 @@ func (h *qwpPoolHousekeeper) run() {
 func (h *qwpPoolHousekeeper) reapGuarded(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			qwpEffectiveLogger(h.logger).Warn("qwp pool housekeeper: reap step panicked", "panic", r)
+			// The daemon loop has no recover of its own, and a recover()
+			// cannot catch a second panic raised while this one unwinds. A
+			// user's slog handler must not be able to turn a survivable reap
+			// panic into a dead process.
+			qwpSfLogGuarded(h.logger, slog.LevelWarn, "qwp pool housekeeper: reap step panicked", "panic", r)
 		}
 	}()
 	fn()

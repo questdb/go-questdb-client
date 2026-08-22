@@ -1043,7 +1043,7 @@ func (p *qwpSenderPool) reprobeRetiredSlots() {
 	}
 	p.mu.Unlock()
 	if restored > 0 {
-		qwpEffectiveLogger(p.logger).Info("qwp pool: restored SF capacity after deferred slot cleanup", "slots", restored)
+		qwpSfLogGuarded(p.logger, slog.LevelInfo, "qwp pool: restored SF capacity after deferred slot cleanup", "slots", restored)
 	}
 }
 

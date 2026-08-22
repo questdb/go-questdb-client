@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1050,4 +1051,42 @@ func TestQwpSfDrainerLocalIOErrorLeavesSlotEligible(t *testing.T) {
 		"a transient local fault must not disqualify the slot forever")
 	assert.True(t, qwpSfIsCandidateOrphan(slot),
 		"the slot must still be adopted by the next scan")
+}
+
+// TestQwpSfDrainerOpenFailureSurvivesPanickingLogger pins that reporting an
+// operational open failure cannot kill the process. Each drainer runs on its
+// own goroutine whose only recover is the one at the top of drainerRun, and
+// this report reaches a user-supplied slog handler that is free to panic.
+func TestQwpSfDrainerOpenFailureSurvivesPanickingLogger(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-initial.sfa")
+	seg, err := qwpSfCreateSegment(path, 0, 4096)
+	require.NoError(t, err)
+	_, err = seg.tryAppend([]byte("row"))
+	require.NoError(t, err)
+	require.NoError(t, seg.close())
+	// An unsupported segment version is an operational failure, not proof that
+	// the slot is inconsistent, so the drainer logs it and leaves the slot for
+	// a later scan — the branch this test needs to reach.
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	raw[4] = 0xFE
+	require.NoError(t, os.WriteFile(path, raw, 0o644))
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	drainer.logger = slog.New(panicOnHandleSlog{})
+
+	drainer.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	_, err = os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(err), "an operational open failure must leave the slot eligible")
 }

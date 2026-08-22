@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1419,4 +1420,29 @@ func TestQwpSenderPoolCloseUnblocksWhenLeaseReturns(t *testing.T) {
 	if total != 0 || avail != 0 {
 		t.Fatalf("post-close snapshot total=%d avail=%d, want 0/0", total, avail)
 	}
+}
+
+// TestQwpSenderPoolReprobeSurvivesPanickingLogger pins that restoring capacity
+// after a deferred slot cleanup cannot kill the process. reprobeRetiredSlots
+// runs on the housekeeper daemon and on the borrow path, neither of which has
+// a recover, and the "restored capacity" line reaches a user-supplied slog
+// handler that is free to panic.
+func TestQwpSenderPoolReprobeSurvivesPanickingLogger(t *testing.T) {
+	p := &qwpSenderPool{
+		logger:          slog.New(panicOnHandleSlog{}),
+		storeAndForward: true,
+		slotInUse:       []bool{true},
+		leakedSlots:     1,
+		// A slot with no cleanup reporter counts as closed, which is what puts
+		// the reprobe on its capacity-restoring path.
+		retiredSlots: []*qwpSenderSlot{{slotIndex: 0}},
+	}
+
+	p.reprobeRetiredSlots()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Zero(t, p.leakedSlots)
+	require.Empty(t, p.retiredSlots)
+	require.False(t, p.slotInUse[0], "the freed slot index must go back into circulation")
 }

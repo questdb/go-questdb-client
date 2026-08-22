@@ -389,7 +389,10 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
 			msg := fmt.Sprintf("qwp/sf: orphan drainer panicked: %v\n%s", r, debug.Stack())
-			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer panicked", "detail", msg)
+			// A recover() cannot catch a second panic raised while this one is
+			// still unwinding, so the report of a panic must not be able to
+			// raise one. A user's slog handler can.
+			qwpSfLogGuarded(d.logger, slog.LevelError, "qwp/sf: orphan drainer panicked", "detail", msg)
 			d.recordFailure(msg)
 		}
 	}()
@@ -414,7 +417,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		if errors.Is(err, qwpSfErrRecoveryFailClosed) {
 			qwpSfMarkSlotFailed(d.slotPath, "engine open: "+msg)
 		} else {
-			qwpEffectiveLogger(d.logger).Error(
+			qwpSfLogGuarded(d.logger, slog.LevelError,
 				"qwp/sf: orphan drainer could not open the slot; leaving it eligible for a later scan",
 				"slot", d.slotPath, "error", err)
 		}
@@ -434,7 +437,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		}
 		if !engine.engineCloseCompleted() {
 			engine.engineStartCloseRetryOwner(d.logger)
-			qwpEffectiveLogger(d.logger).Error(
+			qwpSfLogGuarded(d.logger, slog.LevelError,
 				"qwp/sf: orphan drainer close incomplete; a terminal cleanup owner will retain and retry the slot lock release",
 				"slot", d.slotPath)
 		}
