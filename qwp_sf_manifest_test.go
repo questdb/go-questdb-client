@@ -30,6 +30,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -186,4 +187,31 @@ func TestQwpSfQuarantineCreationDebrisPreservesEvidence(t *testing.T) {
 	second, err := os.ReadFile(path + ".corrupt-1")
 	require.NoError(t, err)
 	require.Equal(t, "second evidence", string(second))
+}
+
+// TestQwpSfQuarantineCreationDebrisFallsBackToRemoval pins that an unusable
+// manifest cannot brick a slot. Both callers turn a failure here into a hard
+// error out of recovery, and it is not a fail-closed error, so the engine
+// neither quarantines the slot nor retries — a directory that is readable but
+// not renameable would fail every later open identically. Preserving the copy
+// is preferred; making progress is required.
+func TestQwpSfQuarantineCreationDebrisFallsBackToRemoval(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfManifestFileName)
+	require.NoError(t, os.WriteFile(path, []byte("unusable"), 0o644))
+	// An earlier quarantine that must survive whatever happens next.
+	require.NoError(t, os.WriteFile(path+".corrupt", []byte("earlier evidence"), 0o644))
+
+	original := qwpSfManifestQuarantineRename.load()
+	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
+	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.EPERM })
+
+	require.NoError(t, qwpSfQuarantineCreationDebris(path),
+		"an un-renameable manifest must still let recovery proceed")
+	_, err := os.Stat(path)
+	require.True(t, os.IsNotExist(err), "the unusable manifest must be gone")
+	preserved, err := os.ReadFile(path + ".corrupt")
+	require.NoError(t, err)
+	require.Equal(t, "earlier evidence", string(preserved),
+		"the fallback must not destroy an earlier quarantine")
 }

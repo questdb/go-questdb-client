@@ -261,13 +261,30 @@ func qwpSfManifestRemove(dir string) bool {
 // quarantine directory already missing the boundary record that explains it.
 // The target name is probed the same way segment quarantine probes it, so an
 // earlier quarantine's evidence survives.
+// qwpSfManifestQuarantineRename is the rename qwpSfQuarantineCreationDebris
+// uses. Production holds os.Rename; tests replace it to reach the removal
+// fallback, which no real filesystem can be talked into on demand.
+var qwpSfManifestQuarantineRename = qwpSfSwappable(os.Rename)
+
 func qwpSfQuarantineCreationDebris(path string) error {
 	corrupt, err := qwpSfQuarantineTargetPath(path)
-	if err != nil {
-		return err
+	if err == nil {
+		if renameErr := qwpSfManifestQuarantineRename.load()(path, corrupt); renameErr == nil || errors.Is(renameErr, os.ErrNotExist) {
+			return nil
+		} else {
+			err = renameErr
+		}
 	}
-	if err := os.Rename(path, corrupt); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("qwp/sf: could not quarantine invalid %s: %w", path, err)
+	// The rename is the outcome worth having, but it must not be the only way
+	// to make progress. Both callers turn a failure here into a hard error out
+	// of recovery, and it is not a fail-closed error, so the engine neither
+	// quarantines the slot nor retries -- every later open of the slot fails
+	// the same way. A directory that is readable but not writable would brick
+	// the slot rather than degrade. Removing the unusable manifest lets
+	// recovery proceed down the legacy path; the segments, which hold the
+	// rows, are untouched either way.
+	if removeErr := os.Remove(path); removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("qwp/sf: could not quarantine or remove invalid %s: %w", path, err)
 }
