@@ -268,9 +268,90 @@ func TestQwpSfRecoveryCollapsedManifestWithCorruptActiveFailsClosed(t *testing.T
 
 	_, _, err = qwpSfRecoverRing(dir, 4096)
 	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
-	require.ErrorContains(t, err, "references durable data")
+	require.ErrorContains(t, err, "may carry frames")
 	_, statErr := os.Stat(path)
 	require.NoError(t, statErr, "fail-closed recovery must preserve the corrupt active")
+}
+
+// writeFramefulCorrupt writes an unreadable segment file that recovery cannot
+// prove frameless: it is long enough to hold a header and carries non-zero
+// bytes, so its identity in the chain stays unknown.
+func writeFramefulCorrupt(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	body := make([]byte, 4096)
+	for i := range body {
+		body[i] = 0xab
+	}
+	require.NoError(t, os.WriteFile(path, body, 0o644))
+	return path
+}
+
+// writeFramelessResidue writes what a crash during qwpSfCreateSegment leaves
+// behind: a full-size file whose header never reached the disk, so every byte
+// in it is zero.
+func writeFramelessResidue(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0o644))
+	return path
+}
+
+// A legacy slot carries no committed boundaries, but a file proven to hold no
+// frames cannot be a link in its chain, so it does not block the migration.
+func TestQwpSfRecoveryMigratesLegacyChainPastFramelessResidue(t *testing.T) {
+	dir := t.TempDir()
+	seg := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a", "b")
+	closeRecoverySegments(t, seg)
+	residue := writeFramelessResidue(t, dir, "sf-spare.sfa")
+
+	ring, manifest, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	require.NotNil(t, ring)
+	require.NotNil(t, manifest)
+	defer func() { require.NoError(t, ring.segmentRingClose()) }()
+	assert.Equal(t, int64(2), ring.getActiveSegment().segmentFrameCount())
+
+	_, statErr := os.Stat(residue)
+	assert.True(t, os.IsNotExist(statErr), "frameless residue must not stay under an .sfa name")
+	_, statErr = os.Stat(residue + ".corrupt")
+	assert.NoError(t, statErr, "frameless residue is preserved aside")
+}
+
+// Every file unreadable and one of them possibly carrying frames is a slot
+// whose rows cannot be shown delivered, with or without a manifest to bound it.
+func TestQwpSfRecoveryAllUnreadableWithoutManifestFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	seg := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "unacked")
+	closeRecoverySegments(t, seg)
+	path := filepath.Join(dir, "sf-initial.sfa")
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{0}, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, err = qwpSfRecoverRing(dir, 4096)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.ErrorContains(t, err, "may carry frames")
+	_, statErr := os.Stat(path)
+	require.NoError(t, statErr, "fail-closed recovery must preserve the unreadable segment")
+}
+
+// Nothing but frameless residue is an empty slot: it starts fresh and the bytes
+// are preserved aside rather than fed to a chain.
+func TestQwpSfRecoveryFramelessResidueOnlyIsEmptySlot(t *testing.T) {
+	dir := t.TempDir()
+	residue := writeFramelessResidue(t, dir, "sf-initial.sfa")
+
+	ring, manifest, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	assert.Nil(t, ring)
+	assert.Nil(t, manifest)
+	_, statErr := os.Stat(residue)
+	assert.True(t, os.IsNotExist(statErr))
+	_, statErr = os.Stat(residue + ".corrupt")
+	assert.NoError(t, statErr)
 }
 
 func TestQwpSfRecoveryMigratesLegacyAndStampsManifestFlag(t *testing.T) {
@@ -347,7 +428,7 @@ func TestQwpSfRecoveryLegacyPositiveHeadWithCorruptUnknownFailsClosed(t *testing
 	dir := t.TempDir()
 	seg := createRecoverySegment(t, dir, "sf-0002.sfa", 2, "a")
 	require.NoError(t, seg.close())
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-unknown.sfa"), []byte("bad"), 0o644))
+	writeFramefulCorrupt(t, dir, "sf-unknown.sfa")
 
 	_, _, err := qwpSfRecoverRing(dir, 4096)
 	require.True(t, errors.Is(err, qwpSfErrRecoveryFailClosed))
@@ -512,8 +593,7 @@ func TestQwpSfRecoveryLegacyBaseZeroRefusesCorruptStray(t *testing.T) {
 	dir := t.TempDir()
 	seg := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
 	require.NoError(t, seg.close())
-	stray := filepath.Join(dir, "sf-stray.sfa")
-	require.NoError(t, os.WriteFile(stray, []byte("bad"), 0o644))
+	stray := writeFramefulCorrupt(t, dir, "sf-stray.sfa")
 
 	_, _, err := qwpSfRecoverRing(dir, 4096)
 	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)

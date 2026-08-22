@@ -115,16 +115,15 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		return nil, nil, err
 	}
 	if len(all) == 0 {
-		if len(corruptPaths) > 0 {
-			if manifest != nil {
-				return nil, nil, qwpSfFailClosed("every SF segment is corrupt but sf-manifest.bin references durable data")
-			}
-			qwpSfQuarantinePaths(corruptPaths)
-			success = true
-			return nil, nil, nil
+		// With every file unreadable, one that could be carrying frames is the
+		// whole chain as far as recovery can tell -- manifest or not, nothing
+		// here can show its frames delivered, so the slot fails closed and the
+		// caller preserves it.
+		if len(framefulCorrupt) > 0 {
+			return nil, nil, qwpSfFailClosed("every SF segment file is unreadable and one of them may carry frames: %s", strings.Join(framefulCorrupt, ", "))
 		}
 		if manifest != nil && manifest.headBase != manifest.activeBase {
-			return nil, nil, qwpSfFailClosed("sf-manifest.bin references durable data but no segment files exist")
+			return nil, nil, qwpSfFailClosed("sf-manifest.bin references durable data but no segment file carries frames")
 		}
 		if manifest != nil {
 			qwpEffectiveLogger(nil).Warn("qwp/sf: removing collapsed manifest with no segment files", "dir", sfDir)
@@ -136,6 +135,10 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 				return nil, nil, fmt.Errorf("qwp/sf: remove collapsed manifest in %s", sfDir)
 			}
 		}
+		// What is left provably carries no frames -- the residue of a crash
+		// during segment creation -- so the bytes are preserved aside for
+		// forensics and the slot starts fresh.
+		qwpSfQuarantinePaths(corruptPaths)
 		success = true
 		return nil, nil, nil
 	}
@@ -263,12 +266,14 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		}
 	} else {
 		// A legacy slot has no committed boundaries, so the files themselves are
-		// the only evidence of the chain's extent and a corrupt segment of
-		// unknown identity could be its head, an interior link, or the unsent
-		// tail. Nothing here can show its frames already delivered, so the whole
-		// legacy branch fails closed instead of quarantining the file and
-		// migrating a chain that may be missing rows.
-		if len(corruptPaths) > 0 {
+		// the only evidence of the chain's extent and a corrupt segment that may
+		// carry frames could be its head, an interior link, or the unsent tail.
+		// Nothing here can show its frames already delivered, so the whole legacy
+		// branch fails closed instead of quarantining the file and migrating a
+		// chain that may be missing rows. A file proven frameless holds no
+		// position in the chain, so it does not block the migration; the common
+		// tail preserves it aside.
+		if len(framefulCorrupt) > 0 {
 			return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain: a corrupt segment of unknown identity could belong to it")
 		}
 		if len(data) > 0 {
