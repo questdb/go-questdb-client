@@ -641,67 +641,54 @@ func (h closeMuProbeHandler) Handle(context.Context, slog.Record) error {
 func (h closeMuProbeHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h closeMuProbeHandler) WithGroup(string) slog.Handler      { return h }
 
-// TestBetterCloseResultNeverReintroducesPendingLocks pins the rule that decides
-// which Close result is remembered. Concurrent callers can both be inside the
-// re-probe, and a slower one's observation is older -- recording it would tell
-// a later caller that the slot locks came back, which the contract says cannot
-// happen.
+// TestQuestDBCloseRecordsTheNewestProbe pins which of two concurrent re-probes
+// is remembered. The pending count is not monotone -- a lease returned after
+// close raises it again -- so no rule over the result values can tell which
+// observation is newer. The probe sequence can: one that started later saw
+// later state.
 //
-// This is a truth table on purpose. The rule was first written as an inline
-// condition with one negation too many, which made it a no-op in exactly the
-// case it existed to block, and no test driving Close could tell: once a clean
-// result is recorded, Close short-circuits before ever reaching the re-probe.
-func TestBetterCloseResultNeverReintroducesPendingLocks(t *testing.T) {
-	pending := fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
-	otherPending := fmt.Errorf("%w (2 slot(s))", ErrSfCleanupPending)
-	teardown := errors.New("teardown failed")
-
-	for _, tc := range []struct {
-		name              string
-		current, observed error
-		want              error
-	}{
-		{"stale pending must not replace clean", nil, pending, nil},
-		// A teardown error is not a clean result. Keeping it over a pending
-		// observation drops the sentinel, and Close short-circuits on a
-		// non-pending recorded value -- so the re-probe would never run again
-		// and the retained lock would never be reported as released.
-		{"pending alongside a teardown error is recorded", teardown, pending, pending},
-		{"pending replaces pending", pending, otherPending, otherPending},
-		{"clean replaces pending", pending, nil, nil},
-		{"teardown replaces pending", pending, teardown, teardown},
-		{"clean replaces clean", nil, nil, nil},
-		{"teardown is always recorded", nil, teardown, teardown},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, betterCloseResult(tc.current, tc.observed))
-		})
-	}
-}
-
-// TestQuestDBCloseKeepsARecordedCleanResult covers the call site, not just the
-// rule. The unit test above pins betterCloseResult; it cannot tell whether
-// Close actually consults it, and a reviewer showed the call could be replaced
-// with a plain assignment without any test noticing.
-func TestQuestDBCloseKeepsARecordedCleanResult(t *testing.T) {
+// The window is real and was previously guarded by a rule over values, whose
+// regression test a reviewer showed could be satisfied by a plain assignment.
+// This drives the actual call site with two callers.
+func TestQuestDBCloseRecordsTheNewestProbe(t *testing.T) {
 	db := &QuestDB{}
 	db.closeOnce.Do(func() {})
 	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
 
-	// First Close re-probes a pool with nothing retained and records clean.
-	db.senderPool = &qwpSenderPool{closed: true, notify: make(chan struct{})}
-	require.NoError(t, db.Close(context.Background()))
-	db.closeMu.Lock()
-	require.NoError(t, db.closeErr, "a clean re-probe must be recorded")
-	db.closeMu.Unlock()
+	// The first caller's probe observes a retained lock, then parks before
+	// recording. The second observes a clean pool and records over it.
+	held := make(chan struct{})
+	release := make(chan struct{})
+	hook := func(seq uint64) {
+		if seq == 1 {
+			close(held)
+			<-release
+		}
+	}
+	qwpTestCloseReprobeHook.Store(&hook)
+	t.Cleanup(func() { qwpTestCloseReprobeHook.Store(nil) })
 
-	// A stale observation arriving afterwards must not be recorded over it.
-	// Reached directly, because Close short-circuits on a clean recorded value.
+	db.senderPool = &qwpSenderPool{
+		closed: true, notify: make(chan struct{}), storeAndForward: true,
+		slotInUse: []bool{true}, leakedSlots: 1,
+		retiredSlots: []*qwpSenderSlot{{slotIndex: 0, cleanup: &neverDoneSlot{}}},
+	}
+	stale := make(chan error, 1)
+	go func() { stale <- db.Close(context.Background()) }()
+	select {
+	case <-held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first probe never reached the record window")
+	}
+
+	db.senderPool = &qwpSenderPool{closed: true, notify: make(chan struct{})}
+	require.NoError(t, db.Close(context.Background()), "the newer probe observes a clean pool")
+
+	close(release)
+	require.ErrorIs(t, <-stale, ErrSfCleanupPending, "the older caller still returns what it saw")
+
 	db.closeMu.Lock()
-	stale := fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
-	db.closeErr = betterCloseResult(db.closeErr, stale)
-	recorded := db.closeErr
-	db.closeMu.Unlock()
-	require.NoError(t, recorded,
-		"a stale pending observation must not be recorded over a clean result")
+	defer db.closeMu.Unlock()
+	require.NoError(t, db.closeErr,
+		"the older probe must not record over the newer one's result")
 }

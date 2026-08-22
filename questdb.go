@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,7 +73,15 @@ type QuestDB struct {
 	// under closeOnce, but a later Close still re-probes the sender pool when
 	// the first pass reported retained slot locks, so the recorded result is
 	// not immutable.
-	closeMu           sync.Mutex
+	closeMu sync.Mutex
+	// closeProbeSeq numbers each retained-lock re-probe, and closeRecordedSeq
+	// is the highest-numbered one whose result has been recorded. Concurrent
+	// callers can both be inside a re-probe, and the pending count is not
+	// monotone -- a lease returned after close raises it again -- so no rule
+	// over the result values themselves can tell which observation is newer.
+	// The sequence can: a probe that started later observed later state.
+	closeProbeSeq     uint64
+	closeRecordedSeq  uint64
 	closeErr          error
 	closeQueryErr     error
 	closeHousekeepErr error
@@ -475,6 +484,8 @@ func (db *QuestDB) Close(ctx context.Context) error {
 		return err
 	}
 	queryErr, housekeepErr := db.closeQueryErr, db.closeHousekeepErr
+	db.closeProbeSeq++
+	seq := db.closeProbeSeq
 	db.closeMu.Unlock()
 	// Retained slot locks are the one Close result that can still change:
 	// qwpSenderPool.close is idempotent and re-probes its retired slots, and it
@@ -489,30 +500,22 @@ func (db *QuestDB) Close(ctx context.Context) error {
 	// also serialize concurrent callers behind filesystem work.
 	sErr := closeStep(func() error { return db.senderPool.close(ctx) })
 	result := firstCloseErr(sErr, queryErr, housekeepErr)
+	if hook := qwpTestCloseReprobeHook.Load(); hook != nil {
+		(*hook)(seq)
+	}
 	db.closeMu.Lock()
 	defer db.closeMu.Unlock()
-	db.closeErr = betterCloseResult(db.closeErr, result)
+	if seq >= db.closeRecordedSeq {
+		db.closeRecordedSeq = seq
+		db.closeErr = result
+	}
 	return result
 }
 
-// betterCloseResult picks which of two Close results to remember. Concurrent
-// callers can both be inside the re-probe, and a slower one's observation is
-// older than a faster one's -- recording it would tell a later caller that the
-// slot locks came back, which the contract says cannot happen. A result that
-// still reports retained locks therefore never replaces a recorded clean one.
-// Anything else is recorded as observed.
-func betterCloseResult(current, observed error) error {
-	// Only a recorded clean result outranks a pending observation. Anything
-	// else records what was observed, including a teardown error that arrives
-	// alongside a still-pending lock: keeping the older value there would drop
-	// the sentinel, and Close short-circuits on a non-pending recorded value,
-	// so the re-probe would never run again and the lock would never be
-	// reported as released.
-	if current == nil && errors.Is(observed, ErrSfCleanupPending) {
-		return nil
-	}
-	return observed
-}
+// qwpTestCloseReprobeHook fires after a re-probe has its result and before it
+// is recorded. Test seam only: it holds one caller in the window where a second
+// can overtake it. Nil in production.
+var qwpTestCloseReprobeHook atomic.Pointer[func(seq uint64)]
 
 // firstCloseErr selects the most actionable teardown error, preferring the
 // sender pool (owns flocks/I/O) over the query pool over the housekeeper so a
