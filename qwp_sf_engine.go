@@ -256,10 +256,16 @@ type qwpSfCursorEngine struct {
 	// exactly one caller -- Close or the manager worker -- ownership of that
 	// cleanup. The deferred fields are written before handoff and then read by
 	// the worker without taking engine locks.
-	closeCompleted            atomic.Bool
-	terminalCleanupClaimed    atomic.Bool
-	terminalResourcesClosed   atomic.Bool
-	managerTornDown           atomic.Bool
+	closeCompleted          atomic.Bool
+	terminalCleanupClaimed  atomic.Bool
+	terminalResourcesClosed atomic.Bool
+	managerTornDown         atomic.Bool
+	// closeInFlight counts the goroutines currently inside
+	// engineCloseInternal. It is what separates "a close is still running" --
+	// where a second Close must stand aside -- from "a close aborted before it
+	// tore the manager down", where nothing owns the cleanup and a second
+	// Close is the only thing that can finish it.
+	closeInFlight             atomic.Int64
 	drainedFileCleanupPending atomic.Bool
 	deferredCleanupOwned      atomic.Bool
 	closeRetryOwnerStarted    atomic.Bool
@@ -1043,6 +1049,8 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	if leakSegments {
 		e.deferredLeakSegments.Store(true)
 	}
+	e.closeInFlight.Add(1)
+	defer e.closeInFlight.Add(-1)
 	firstClose := e.closed.CompareAndSwap(false, true)
 	if !firstClose && (e.closeCompleted.Load() || e.deferredCleanupOwned.Load()) {
 		return nil
@@ -1372,6 +1380,22 @@ func (e *qwpSfCursorEngine) engineCloseRetryable() bool {
 		return false
 	}
 	return e.engineTryClaimTerminalCleanup()
+}
+
+// engineCloseNeedsRedrive reports a close that aborted before the manager
+// teardown. There is no terminal cleanup to claim in that state --
+// managerTornDown is the condition engineFinishClose assumes -- so the only
+// way back to a released slot lock is to run the whole close again. A
+// standalone sender has no pool guard to install a retry owner for it, so a
+// repeated Close is the caller's only route, which is what LineSender.Close
+// promises.
+//
+// closeInFlight is what separates this from a close that is merely still
+// running, where a second Close must stand aside and report the double close.
+func (e *qwpSfCursorEngine) engineCloseNeedsRedrive() bool {
+	return e != nil && !e.closeRetryOwnerStarted.Load() &&
+		e.closed.Load() && e.closeInFlight.Load() == 0 &&
+		!e.managerTornDown.Load() && !e.closeCompleted.Load()
 }
 
 // engineFinishClaimedClose runs the terminal cleanup owned by a successful

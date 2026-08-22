@@ -1530,6 +1530,13 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 		// the retry only once cleanup is genuinely ownerless: a Close arriving
 		// while another one is still tearing the manager down, or while a
 		// claimant holds the cleanup, reports the double close instead.
+		// A close that aborted before the manager teardown has no cleanup to
+		// claim, only a close to run again; one that got past it has a claim
+		// to finish. Both leave the slot lock held, and a standalone sender
+		// has nothing else that will release it.
+		if s.cursorEngine.engineCloseNeedsRedrive() {
+			return s.cursorEngine.engineRetryCloseIfNeeded()
+		}
 		if s.cursorEngine != nil && s.cursorEngine.engineCloseRetryable() {
 			return s.cursorEngine.engineFinishClaimedClose()
 		}

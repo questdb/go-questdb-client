@@ -811,3 +811,44 @@ func TestQwpSenderConstructionPanicClosesTheSendLoop(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond,
 		"the send loop's WebSocket must not outlive a failed construction")
 }
+
+// TestQwpSenderRepeatedCloseRedrivesAnAbortedClose pins the escape hatch
+// LineSender.Close documents. A close that faults before the manager teardown
+// leaves no terminal cleanup to claim and, on a standalone sender, no pool
+// guard to install a retry owner — so the slot lock is held and a repeated
+// Close is the caller's only way to get it back.
+func TestQwpSenderRepeatedCloseRedrivesAnAbortedClose(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	sfDir := t.TempDir()
+	conf := strings.Join([]string{
+		"ws::addr=" + strings.TrimPrefix(srv.URL, "http://"),
+		"sf_dir=" + sfDir,
+		"sender_id=abort",
+		"close_flush_timeout_millis=50;",
+	}, ";")
+	ls, err := LineSenderFromConf(context.Background(), conf)
+	require.NoError(t, err)
+	s := ls.(*qwpLineSender)
+	require.NoError(t, ls.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+
+	// The state a close leaves behind when it faults inside the manager
+	// teardown: the engine is marked closed, nothing is in flight, and the
+	// teardown marker was never published — so there is no claim to take and
+	// no retry owner was installed.
+	require.NoError(t, s.cursorSendLoop.sendLoopClose())
+	s.cursorEngine.closed.Store(true)
+	s.closed.Store(true)
+	require.False(t, s.cursorEngine.managerTornDown.Load())
+	require.False(t, s.cursorEngine.closeRetryOwnerStarted.Load())
+
+	require.True(t, s.cursorEngine.engineCloseNeedsRedrive(),
+		"an aborted close must be recognised as needing a re-drive")
+	require.NoError(t, ls.Close(context.Background()),
+		"a repeated Close must finish the cleanup, not report a double close")
+	require.True(t, s.cursorEngine.engineCloseCompleted())
+
+	lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(sfDir, "abort"))
+	require.NoError(t, lockErr, "the slot flock must be released")
+	require.NoError(t, lock.close())
+}
