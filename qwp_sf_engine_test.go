@@ -1035,3 +1035,78 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 	require.Empty(t, unguarded,
 		"these log calls reach the user's slog handler unguarded; route them through qwpSfLogGuarded")
 }
+
+// TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine pins the
+// window between publishing deferred cleanup ownership and actually taking the
+// handoff. A fault there used to leave deferredCleanupOwned set with nothing
+// behind it, which refuses every later claim: engineRetryCloseIfNeeded then
+// returns nil rather than an error, so the retry owner spins for the process
+// lifetime holding the flock and never logs a reason.
+func TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine(t *testing.T) {
+	dir := t.TempDir()
+
+	// Hold the manager worker inside spare creation so the close grace expires
+	// and the teardown is not quiescent -- the only state that publishes
+	// deferred cleanup ownership.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, 0)
+	require.NoError(t, err)
+	_, err = e.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	// Fault exactly in the window: after the manager teardown marker, before
+	// the handoff decision.
+	boom := func() { panic("teardown boom") }
+	qwpSfTestAfterManagerTeardownHook.Store(&boom)
+	t.Cleanup(func() { qwpSfTestAfterManagerTeardownHook.Store(nil) })
+
+	func() {
+		defer func() { require.NotNil(t, recover(), "the injected fault must unwind") }()
+		_ = e.engineClose()
+	}()
+	qwpSfTestAfterManagerTeardownHook.Store(nil)
+
+	require.False(t, e.deferredCleanupOwned.Load(),
+		"a fault before the handoff must not leave the engine owned by nobody")
+
+	close(release)
+	released = true
+
+	// Cleanup is claimable again, so a retry finishes the close and frees the lock.
+	require.Eventually(t, func() bool {
+		return e.engineRetryCloseIfNeeded() == nil && e.engineCloseCompleted()
+	}, 3*time.Second, time.Millisecond)
+	require.True(t, e.engineCloseCompleted())
+	lock, lockErr := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, lockErr, "the slot flock must be released")
+	require.NoError(t, lock.close())
+}

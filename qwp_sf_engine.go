@@ -1102,8 +1102,20 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	// cleanup looks both safe and unowned while the manager worker is still
 	// writing in the slot directory: a second Close landing there would take
 	// the claim and release the slot lock underneath it.
+	// Ownership is published before the handoff is taken, so a fault in between
+	// would leave the marker set with nothing behind it: every later claim is
+	// refused, engineRetryCloseIfNeeded returns nil rather than an error, and
+	// the retry owner spins at its interval for the process lifetime without
+	// ever logging. ownershipSettled records that the handoff decision below
+	// was actually reached; any other unwind drops the marker again.
+	ownershipSettled := false
 	if !quiescent {
 		e.deferredCleanupOwned.Store(true)
+		defer func() {
+			if !ownershipSettled {
+				e.deferredCleanupOwned.Store(false)
+			}
+		}()
 	}
 	// The manager teardown is now behind us and its outcome is recorded, so
 	// terminal cleanup is safe for whoever ends up owning it. This marker, not
@@ -1122,6 +1134,7 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 		} else {
 			handedOff = e.manager.deferUntilRingQuiescent(entry, e.deferredClose)
 		}
+		ownershipSettled = true
 		if !handedOff {
 			e.deferredCleanupOwned.Store(false)
 		}
