@@ -193,7 +193,12 @@ func TestQwpEngineTerminalRetryOwnerRecoversPanicAndCompletes(t *testing.T) {
 		}
 		return nil
 	}
+	// Every hook is restored by a t.Cleanup registered before the next
+	// assertion. An assertion between the two calls Goexit on failure, which
+	// would leave a fault-injecting hook installed for every later test in the
+	// package and fail them for a reason none of them can see.
 	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	t.Cleanup(func() { qwpSfTestBeforeFlockReleaseHook.Store(nil) })
 	require.Error(t, engine.engineClose())
 
 	finishCalls := atomic.Int32{}
@@ -203,13 +208,10 @@ func TestQwpEngineTerminalRetryOwnerRecoversPanicAndCompletes(t *testing.T) {
 		}
 	}
 	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
+	t.Cleanup(func() { qwpSfTestEngineFinishCloseHook.Store(nil) })
 	originalInterval := qwpSfCloseRetryInterval.load()
 	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
-	t.Cleanup(func() {
-		qwpSfTestBeforeFlockReleaseHook.Store(nil)
-		qwpSfTestEngineFinishCloseHook.Store(nil)
-		qwpSfCloseRetryInterval.store(originalInterval)
-	})
+	t.Cleanup(func() { qwpSfCloseRetryInterval.store(originalInterval) })
 
 	engine.engineStartCloseRetryOwner(nil)
 	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond)
