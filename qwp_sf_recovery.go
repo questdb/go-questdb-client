@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -208,7 +209,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		}
 		if activeSeg == nil {
 			if len(chain) == 0 && head == active && len(framefulCorrupt) == 0 {
-				if err := qwpSfDiscardOpened(all, nil, nil); err != nil {
+				if err := qwpSfDiscardOpened(all, nil, nil, math.MinInt64); err != nil {
 					return nil, nil, err
 				}
 				all = nil
@@ -323,7 +324,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		} else {
 			activeSeg = qwpSfChooseEmptyInitial(all)
 			if activeSeg == nil {
-				if err := qwpSfDiscardOpened(all, nil, nil); err != nil {
+				if err := qwpSfDiscardOpened(all, nil, nil, math.MinInt64); err != nil {
 					return nil, nil, err
 				}
 				all = nil
@@ -350,7 +351,13 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 	for _, seg := range chain {
 		keep[seg] = struct{}{}
 	}
-	if err := qwpSfDiscardOpened(all, keep, preserve); err != nil {
+	// Everything the chain starts at is delivered. Without a manifest nothing
+	// is proven, so nothing is treated as delivered.
+	discardHead := int64(math.MinInt64)
+	if manifest != nil {
+		discardHead = manifest.headBase
+	}
+	if err := qwpSfDiscardOpened(all, keep, preserve, discardHead); err != nil {
 		return nil, nil, err
 	}
 	qwpSfQuarantinePaths(corruptPaths)
@@ -450,14 +457,21 @@ func qwpSfSanitizeSealedResidue(chain []*qwpSfSegment) (string, error) {
 // that still carries bytes the boundaries do not account for -- a torn tail, or
 // a member of preserve -- is quarantined under a .corrupt name instead, so no
 // recovery path destroys bytes it cannot prove delivered.
-func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]struct{}) error {
+func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]struct{}, head int64) error {
 	for _, seg := range all {
 		if _, ok := keep[seg]; ok {
 			continue
 		}
 		path := seg.segmentPath()
 		_, wanted := preserve[seg]
-		wanted = wanted || seg.segmentTornTailBytes() > 0
+		// A torn tail is only worth preserving above the committed head. Below
+		// it the manifest proves every frame delivered, so the tail bytes are
+		// accounted for -- quarantining them leaves a segment-sized .corrupt
+		// file that nothing reclaims and that sf_max_total_bytes does not
+		// count, so a slot that repeatedly tears mid-append starves the very
+		// budget meant to bound it.
+		wanted = wanted || (seg.segmentTornTailBytes() > 0 &&
+			seg.segmentBaseSeq()+seg.segmentFrameCount() > head)
 		if err := seg.close(); err != nil {
 			return err
 		}

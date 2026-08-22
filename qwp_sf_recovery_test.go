@@ -1136,3 +1136,37 @@ func TestQwpSfCollapsedSlotQuarantinesCorruptFiles(t *testing.T) {
 	_, err = os.Stat(corrupt)
 	require.True(t, os.IsNotExist(err), "it must not stay under its .sfa name")
 }
+
+// TestQwpSfStaleTornSegmentIsUnlinkedNotQuarantined pins that a torn tail
+// below the committed head is unlinked. The manifest proves every frame in
+// such a segment delivered, so its tail bytes are accounted for — preserving
+// them leaves a segment-sized .corrupt file that nothing ever reclaims and
+// that sf_max_total_bytes does not count, so a slot that repeatedly tears
+// mid-append starves the budget meant to bound it.
+func TestQwpSfStaleTornSegmentIsUnlinkedNotQuarantined(t *testing.T) {
+	dir := t.TempDir()
+	stale := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a", "b")
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 2, "c")
+	createRecoveryManifest(t, dir, 2, 2, stale, active)
+	closeRecoverySegments(t, stale, active)
+
+	// Tear the stale segment's tail. It is entirely below the committed head.
+	stalePath := filepath.Join(dir, "sf-initial.sfa")
+	f, err := os.OpenFile(stalePath, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+2048)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	require.NotNil(t, ring)
+	defer ring.segmentRingClose()
+
+	_, err = os.Stat(stalePath)
+	require.True(t, os.IsNotExist(err), "a delivered segment must be unlinked")
+	_, err = os.Stat(stalePath + ".corrupt")
+	require.True(t, os.IsNotExist(err),
+		"and must not leave debris outside the sf_max_total_bytes budget")
+}
