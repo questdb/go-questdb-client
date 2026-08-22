@@ -1031,18 +1031,29 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 	var unguarded []string
 	for _, pkg := range pkgs {
 		for name, file := range pkg.Files {
-			// Names bound to a *slog.Logger, so a hoisted local is caught too.
+			// Names bound to a *slog.Logger, so a hoisted local is caught
+			// too. Both an assignment and a var declaration bind one.
 			loggerLocals := map[string]bool{}
-			ast.Inspect(file, func(n ast.Node) bool {
-				assign, ok := n.(*ast.AssignStmt)
-				if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
-					return true
+			bind := func(lhs, rhs ast.Expr) {
+				if !callsAny(rhs, "qwpEffectiveLogger", "slog.Default", "slog.New") {
+					return
 				}
-				if !callsAny(assign.Rhs[0], "qwpEffectiveLogger", "slog.Default", "slog.New") {
-					return true
-				}
-				if id, ok := assign.Lhs[0].(*ast.Ident); ok {
+				if id, ok := lhs.(*ast.Ident); ok {
 					loggerLocals[id.Name] = true
+				}
+			}
+			ast.Inspect(file, func(n ast.Node) bool {
+				switch d := n.(type) {
+				case *ast.AssignStmt:
+					if len(d.Lhs) == 1 && len(d.Rhs) == 1 {
+						bind(d.Lhs[0], d.Rhs[0])
+					}
+				case *ast.ValueSpec:
+					for i := range d.Values {
+						if i < len(d.Names) {
+							bind(d.Names[i], d.Values[i])
+						}
+					}
 				}
 				return true
 			})
@@ -1060,11 +1071,17 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 				if !ok || !levelMethods[sel.Sel.Name] {
 					return true
 				}
-				// A level method on a logger this file just produced, or on a
-				// local it bound to one.
+				// A level method on a logger this file just produced, on a
+				// name it bound to one, or on anything spelled like a logger.
+				// The last case catches the shape the pool, the send loop and
+				// the manager all use: a *slog.Logger in a struct field,
+				// called as p.logger.Warn(...).
 				reaches := callsAny(sel.X, "qwpEffectiveLogger", "slog.Default")
-				if id, ok := sel.X.(*ast.Ident); ok && loggerLocals[id.Name] {
-					reaches = true
+				switch recv := sel.X.(type) {
+				case *ast.Ident:
+					reaches = reaches || loggerLocals[recv.Name] || isLoggerName(recv.Name)
+				case *ast.SelectorExpr:
+					reaches = reaches || isLoggerName(recv.Sel.Name)
 				}
 				if reaches {
 					unguarded = append(unguarded,
@@ -1074,8 +1091,17 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 			})
 		}
 	}
+	require.NotEmpty(t, pkgs, "the scan must actually parse the package")
 	require.Empty(t, unguarded,
 		"these log calls reach the user's slog handler unguarded; route them through qwpSfLogGuarded")
+}
+
+// isLoggerName reports whether an identifier is spelled like a *slog.Logger.
+// A type-checked answer would be exact; this is the approximation that costs
+// no build step, and the package spells every logger it holds this way.
+func isLoggerName(name string) bool {
+	lower := strings.ToLower(name)
+	return lower == "l" || lower == "lg" || strings.Contains(lower, "logger")
 }
 
 // callsAny reports whether expr is a call to any of the named functions,
