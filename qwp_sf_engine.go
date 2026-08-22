@@ -1172,7 +1172,18 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 		}
 		// These durability barriers precede every destructive cleanup step.
 		// On failure retain the ring, side files, and flock so a later Close can
-		// retry from intact state.
+		// retry from intact state: the barriers write through those very
+		// handles, so closing them would leave nothing to retry with.
+		//
+		// What that retention costs is worth stating, because it is far more
+		// than what the path past the barriers holds. Returning here leaves
+		// the whole ring mapped -- every segment in the slot, up to
+		// sf_max_total_bytes of address space -- plus the watermark and the
+		// symbol dictionary, and the retry owner comes back to it once a
+		// second for as long as the process runs. Past the barriers the ring
+		// is closed and only the slot lock's file descriptor is still held.
+		// A local disk that never recovers therefore pins the slot's whole
+		// mapping, not a single descriptor.
 		if !drainCleanupAllowed {
 			e.terminalCleanupClaimed.Store(false)
 			return firstErr
