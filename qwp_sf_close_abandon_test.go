@@ -28,6 +28,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +37,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
 
@@ -756,4 +759,55 @@ func TestQwpSenderConstructionPanicReleasesSlotLock(t *testing.T) {
 		return true
 	}, 5*time.Second, 10*time.Millisecond,
 		"a construction fault must not strand the slot flock")
+}
+
+// TestQwpSenderConstructionPanicClosesTheSendLoop pins that a fault after the
+// send loop is built also releases it. By then the loop owns a bound WebSocket
+// and three dispatcher goroutines; closing only the engine leaves the socket
+// fd, the server-side connection and those goroutines alive for the process
+// lifetime.
+func TestQwpSenderConstructionPanicClosesTheSendLoop(t *testing.T) {
+	sfDir := t.TempDir()
+
+	// The server's read loop returns when the client's socket closes, so a
+	// leaked transport keeps this handler alive.
+	var handlersLive atomic.Int64
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		handlersLive.Add(1)
+		defer handlersLive.Add(-1)
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv2.Close()
+
+	// Fault in the window where the loop exists but the sender does not.
+	boom := func() { panic("post-loop boom") }
+	qwpTestAfterSendLoopBuiltHook.Store(&boom)
+	t.Cleanup(func() { qwpTestAfterSendLoopBuiltHook.Store(nil) })
+
+	conf := strings.Join([]string{
+		"ws::addr=" + strings.TrimPrefix(srv2.URL, "http://"),
+		"sf_dir=" + sfDir,
+		"sender_id=loop-boom",
+		"close_flush_timeout_millis=50;",
+	}, ";")
+	func() {
+		defer func() { require.NotNil(t, recover(), "the injected fault must unwind") }()
+		_, _ = LineSenderFromConf(context.Background(), conf)
+	}()
+	qwpTestAfterSendLoopBuiltHook.Store(nil)
+
+	require.Eventually(t, func() bool {
+		return handlersLive.Load() == 0
+	}, 5*time.Second, 20*time.Millisecond,
+		"the send loop's WebSocket must not outlive a failed construction")
 }

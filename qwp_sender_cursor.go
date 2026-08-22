@@ -215,13 +215,21 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	// reports a clean shutdown.
 	engineOwnedHere := true
 	var builtSender *qwpLineSender
+	var builtLoop *qwpSfSendLoop
 	defer func() {
 		if !engineOwnedHere {
 			return
 		}
 		if builtSender != nil {
-			_ = builtSender.closeCursor(ctx)
+			_ = builtSender.closeCursor(context.Background())
 			return
+		}
+		// The send loop is built before the sender is, and by then it owns a
+		// bound WebSocket and three dispatcher goroutines. Closing only the
+		// engine would leave the socket fd, the server-side connection and
+		// those goroutines alive for the process lifetime.
+		if builtLoop != nil {
+			_ = builtLoop.sendLoopClose()
 		}
 		_ = qwpSfCloseEngineAfterBuildFailure(engine,
 			errors.New("qwp/sf: sender construction did not complete"), conf.logger)
@@ -325,6 +333,10 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
 		reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff)
+	builtLoop = loop
+	if hook := qwpTestAfterSendLoopBuiltHook.Load(); hook != nil {
+		(*hook)()
+	}
 	loop.logger = qwpEffectiveLogger(conf.logger)
 	loop.sendLoopSetHostTracker(tracker, initialBoundIdx)
 	engine.engineSetReconnectStatusGetter(loop.sendLoopReconnectStatus)
@@ -426,7 +438,10 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		setupOK := false
 		defer func() {
 			if !setupOK {
-				_ = s.closeCursor(ctx)
+				// context.Background(), not the caller's ctx: a ctx whose
+				// deadline expired during the connect walk would cut the
+				// drain to nothing and abandon published frames.
+				_ = s.closeCursor(context.Background())
 				engineOwnedHere = false // this defer ran first; the outer guard is done
 			}
 		}()
@@ -1089,6 +1104,11 @@ func (s *qwpLineSender) closeCursorDrainGuarded(ctx context.Context) (firstErr e
 // only: it lets a test fault that phase and assert the teardown below it still
 // runs. Nil in production.
 var qwpTestCloseDrainHook atomic.Pointer[func()]
+
+// qwpTestAfterSendLoopBuiltHook fires once the send loop exists but before the
+// sender does. Test seam only: it reaches the window where a fault must release
+// the loop's transport and dispatchers as well as the engine. Nil in production.
+var qwpTestAfterSendLoopBuiltHook atomic.Pointer[func()]
 
 // closeSendLoopGuarded stops the send loop and reports whether the I/O
 // goroutine is provably done with the segment mappings. A panic here leaves
