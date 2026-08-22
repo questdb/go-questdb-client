@@ -212,6 +212,15 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 					return nil, nil, err
 				}
 				all = nil
+				// The slot collapses to a fresh one in this same directory, so
+				// set the corrupt files aside first. Left under their .sfa
+				// names, one of them is sf-initial.sfa, which the fresh slot
+				// creates with O_TRUNC -- destroying in place the very bytes
+				// this package promises to preserve -- and the rest are
+				// re-evaluated on the next open, where a transient open
+				// failure reclassifies one as possibly frameful and fails the
+				// now-populated slot closed.
+				qwpSfQuarantinePaths(corruptPaths)
 				if err := manifest.close(); err != nil {
 					return nil, nil, err
 				}
@@ -318,6 +327,8 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 					return nil, nil, err
 				}
 				all = nil
+				// Same reasoning as the manifest-backed collapse above.
+				qwpSfQuarantinePaths(corruptPaths)
 				success = true
 				return nil, nil, nil
 			}

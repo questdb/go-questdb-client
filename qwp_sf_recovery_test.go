@@ -1104,3 +1104,35 @@ func TestQwpSfFailedRecoveryPreservesEveryRequiredFrame(t *testing.T) {
 		})
 	}
 }
+
+// TestQwpSfCollapsedSlotQuarantinesCorruptFiles pins that the two exits which
+// collapse a slot and start fresh still set the corrupt files aside. The fresh
+// slot is built in the same directory, and qwpSfCreateSegment opens
+// sf-initial.sfa with O_TRUNC — so a corrupt file left under that name is
+// destroyed in place, which is the one thing recovery promises never to do.
+func TestQwpSfCollapsedSlotQuarantinesCorruptFiles(t *testing.T) {
+	dir := t.TempDir()
+	// A slot whose committed boundaries meet above every segment on disk: the
+	// sealed segment is below head, so the chain is empty and no active segment
+	// is found -- the collapse exit. A provably frameless corrupt file sits
+	// alongside it, on the name the fresh slot is about to create with O_TRUNC.
+	sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a", "b")
+	createRecoveryManifest(t, dir, 2, 2, sealed)
+	closeRecoverySegments(t, sealed)
+	// A separate corrupt file, so the slot still has one openable segment and
+	// recovery reaches the collapse exit rather than the all-unreadable one.
+	corrupt := filepath.Join(dir, "sf-00000001.sfa")
+	require.NoError(t, os.WriteFile(corrupt, make([]byte, 4096), 0o644))
+
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	if ring != nil {
+		ring.segmentRingClose()
+	}
+
+	preserved, err := os.ReadFile(corrupt + ".corrupt")
+	require.NoError(t, err, "the corrupt file must be set aside before the slot restarts")
+	require.Len(t, preserved, 4096)
+	_, err = os.Stat(corrupt)
+	require.True(t, os.IsNotExist(err), "it must not stay under its .sfa name")
+}
