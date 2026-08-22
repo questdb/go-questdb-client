@@ -1040,6 +1040,14 @@ func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
 	}
 }
 
+// qwpPoolTestUnhurriedAcquire is the acquire timeout for tests whose borrow
+// waits on a hook or on deferred slot cleanup rather than on the clock. It has
+// to outlast whatever the borrow is waiting for, or a loaded machine turns the
+// assertion into a timeout error and the test fails for a reason it does not
+// test. It is a ceiling, not a delay: nothing waits for it when the work it is
+// waiting on completes.
+const qwpPoolTestUnhurriedAcquire = 30 * time.Second
+
 // TestQwpSenderPoolReprobesDeferredClose restores an SF slot index only after
 // the delegate's manager worker has completed deferred terminal cleanup.
 func TestQwpSenderPoolReprobesDeferredClose(t *testing.T) {
@@ -1073,7 +1081,7 @@ func TestQwpSenderPoolReprobesDeferredClose(t *testing.T) {
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
 		";sf_dir=" + t.TempDir() + ";close_flush_timeout_millis=0;"
 	p, err := newQwpSenderPool(context.Background(), conf, 1, 1,
-		100*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
 	}
@@ -1203,7 +1211,7 @@ func TestQwpSenderPoolBuildFailureRetiresSlotUntilDeferredCleanup(t *testing.T) 
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
 		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
 	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
-		100*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = p.close(context.Background()) })
 
