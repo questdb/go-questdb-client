@@ -499,11 +499,17 @@ func (db *QuestDB) Close(ctx context.Context) error {
 // callers can both be inside the re-probe, and a slower one's observation is
 // older than a faster one's -- recording it would tell a later caller that the
 // slot locks came back, which the contract says cannot happen. A result that
-// still reports retained locks therefore never replaces one that does not.
-// Anything else, including a real teardown failure, is recorded as observed.
+// still reports retained locks therefore never replaces a recorded clean one.
+// Anything else is recorded as observed.
 func betterCloseResult(current, observed error) error {
-	if errors.Is(observed, ErrSfCleanupPending) && !errors.Is(current, ErrSfCleanupPending) {
-		return current
+	// Only a recorded clean result outranks a pending observation. Anything
+	// else records what was observed, including a teardown error that arrives
+	// alongside a still-pending lock: keeping the older value there would drop
+	// the sentinel, and Close short-circuits on a non-pending recorded value,
+	// so the re-probe would never run again and the lock would never be
+	// reported as released.
+	if current == nil && errors.Is(observed, ErrSfCleanupPending) {
+		return nil
 	}
 	return observed
 }

@@ -662,7 +662,11 @@ func TestBetterCloseResultNeverReintroducesPendingLocks(t *testing.T) {
 		want              error
 	}{
 		{"stale pending must not replace clean", nil, pending, nil},
-		{"stale pending must not replace a teardown error", teardown, pending, teardown},
+		// A teardown error is not a clean result. Keeping it over a pending
+		// observation drops the sentinel, and Close short-circuits on a
+		// non-pending recorded value -- so the re-probe would never run again
+		// and the retained lock would never be reported as released.
+		{"pending alongside a teardown error is recorded", teardown, pending, pending},
 		{"pending replaces pending", pending, otherPending, otherPending},
 		{"clean replaces pending", pending, nil, nil},
 		{"teardown replaces pending", pending, teardown, teardown},
@@ -673,4 +677,31 @@ func TestBetterCloseResultNeverReintroducesPendingLocks(t *testing.T) {
 			require.Equal(t, tc.want, betterCloseResult(tc.current, tc.observed))
 		})
 	}
+}
+
+// TestQuestDBCloseKeepsARecordedCleanResult covers the call site, not just the
+// rule. The unit test above pins betterCloseResult; it cannot tell whether
+// Close actually consults it, and a reviewer showed the call could be replaced
+// with a plain assignment without any test noticing.
+func TestQuestDBCloseKeepsARecordedCleanResult(t *testing.T) {
+	db := &QuestDB{}
+	db.closeOnce.Do(func() {})
+	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
+
+	// First Close re-probes a pool with nothing retained and records clean.
+	db.senderPool = &qwpSenderPool{closed: true, notify: make(chan struct{})}
+	require.NoError(t, db.Close(context.Background()))
+	db.closeMu.Lock()
+	require.NoError(t, db.closeErr, "a clean re-probe must be recorded")
+	db.closeMu.Unlock()
+
+	// A stale observation arriving afterwards must not be recorded over it.
+	// Reached directly, because Close short-circuits on a clean recorded value.
+	db.closeMu.Lock()
+	stale := fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
+	db.closeErr = betterCloseResult(db.closeErr, stale)
+	recorded := db.closeErr
+	db.closeMu.Unlock()
+	require.NoError(t, recorded,
+		"a stale pending observation must not be recorded over a clean result")
 }
