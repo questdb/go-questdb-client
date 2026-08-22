@@ -712,7 +712,16 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 		return nil
 	}
 	var toClose []*qwpSenderSlot
-	kept := p.available[:0]
+	// Build the survivors into a fresh slice rather than filtering in place.
+	// The classification below calls into each delegate and can fault, and an
+	// in-place filter publishes p.available only at the end -- so an aborted
+	// loop leaves the slice header at its old length over a backing array that
+	// has already been rewritten. A kept slot then appears twice, and borrow
+	// hands one delegate to two producers; a victim disappears from available
+	// while staying in p.all, where nothing closes it and close() still reports
+	// a clean shutdown with its flock held. One allocation per housekeeper tick
+	// buys the whole loop its all-or-nothing property.
+	kept := make([]*qwpSenderSlot, 0, len(p.available))
 	for _, slot := range p.available {
 		idleExpired := p.idleTimeout > 0 && now.Sub(slot.idleSince) >= p.idleTimeout
 		overAge := p.maxLifetime > 0 && now.Sub(slot.createdAt) >= p.maxLifetime

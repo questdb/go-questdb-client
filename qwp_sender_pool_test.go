@@ -1729,19 +1729,20 @@ func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
 		storeAndForward: true,
 		maxSize:         3,
 		minSize:         0,
-		idleTimeout:     time.Nanosecond,
+		idleTimeout:     time.Hour,
 		slotInUse:       make([]bool, 3),
 		notify:          make(chan struct{}),
 	}
-	stale := time.Now().Add(-time.Hour)
+	stale := time.Now().Add(-2 * time.Hour)
 	// A nil delegate satisfies neither classifier interface, so it classifies
 	// cleanly as an idle victim; a zero-value sender does satisfy them and
 	// faults when they are called. Ordering the victim first is what puts the
 	// fault after the accounting the old shape performed inline.
 	victim := &qwpSenderSlot{slotIndex: 0, idleSince: stale}
-	faulting := &qwpSenderSlot{slotIndex: 1, idleSince: stale, delegate: &qwpLineSender{}}
-	p.all = []*qwpSenderSlot{victim, faulting}
-	p.available = []*qwpSenderSlot{victim, faulting}
+	keeper := &qwpSenderSlot{slotIndex: 1, idleSince: time.Now()} // fresh: kept
+	faulting := &qwpSenderSlot{slotIndex: 2, idleSince: stale, delegate: &qwpLineSender{}}
+	p.all = []*qwpSenderSlot{victim, keeper, faulting}
+	p.available = []*qwpSenderSlot{victim, keeper, faulting}
 
 	func() {
 		defer func() { require.NotNil(t, recover(), "the classifier must fault for this test") }()
@@ -1754,6 +1755,22 @@ func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
 		"a fault during classification must not leave a slot counted as closing")
 	require.Zero(t, p.pendingLeaseTeardowns,
 		"nor as a teardown close() will wait for")
+
+	// The available set must survive the fault intact. Filtering in place and
+	// publishing only at the end leaves the backing array rewritten under an
+	// unchanged slice header: a kept slot appears twice -- handed to two
+	// borrowers at once, two producers on one delegate -- and a victim vanishes
+	// from available while staying in p.all, where nothing can ever close it
+	// and close() still reports a clean shutdown.
+	require.Equal(t, []*qwpSenderSlot{victim, keeper, faulting}, p.available,
+		"a fault during classification must leave the available set untouched")
+	seen := map[*qwpSenderSlot]int{}
+	for _, slot := range p.available {
+		seen[slot]++
+	}
+	for slot, n := range seen {
+		require.Equal(t, 1, n, "slot %p appears %d times in p.available", slot, n)
+	}
 }
 
 // TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock pins that a failed
