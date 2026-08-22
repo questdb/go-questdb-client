@@ -1889,6 +1889,15 @@ func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
 	defer p.mu.Unlock()
 	require.Equal(t, []*qwpSenderSlot{done, pending, faulting}, p.retiredSlots,
 		"a faulting probe must not publish a half-rewritten retired list")
+	// The accounting must be all-or-nothing with the list. Applying a
+	// decrement for an earlier slot while keeping that slot retired means the
+	// next probe decrements it again: leakedSlots walks to zero, where close()
+	// reports a clean shutdown over held flocks, and then negative, where it
+	// reports a count that never returns to zero.
+	require.Equal(t, 3, p.leakedSlots,
+		"a faulting probe must not apply capacity accounting it did not finish")
+	require.Equal(t, []bool{true, true, true}, p.slotInUse,
+		"nor free an index whose slot is still retired")
 }
 
 // neverDoneSlot reports a cleanup that has not finished.

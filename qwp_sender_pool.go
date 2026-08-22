@@ -1109,22 +1109,33 @@ func (p *qwpSenderPool) reprobeRetiredSlotsLocked() int {
 	if len(p.retiredSlots) == 0 {
 		return 0
 	}
+	// Classify first, account second, exactly as selectReapVictims does and
+	// for the same reason. slotCloseCompleted calls into the delegate. With
+	// the accounting inside the loop, a fault on a later slot leaves the
+	// earlier slots' decrements applied while the retired list is preserved
+	// whole -- so the next probe decrements them again. leakedSlots walks down
+	// past zero, at which point close() reports a clean shutdown with those
+	// flocks still held, and then negative, at which point close() reports a
+	// pending count that can never return to zero and capUsedLocked admits
+	// creations past maxSize.
 	kept := make([]*qwpSenderSlot, 0, len(p.retiredSlots))
-	restored := 0
+	done := make([]*qwpSenderSlot, 0, len(p.retiredSlots))
 	for _, slot := range p.retiredSlots {
-		if !slotCloseCompleted(slot) {
-			kept = append(kept, slot)
+		if slotCloseCompleted(slot) {
+			done = append(done, slot)
 			continue
 		}
+		kept = append(kept, slot)
+	}
+	for _, slot := range done {
 		p.leakedSlots--
 		p.freeSlotIndexLocked(slot.slotIndex)
-		restored++
 	}
 	p.retiredSlots = kept
-	if restored > 0 {
+	if len(done) > 0 {
 		p.broadcastLocked()
 	}
-	return restored
+	return len(done)
 }
 
 func (p *qwpSenderPool) removeFromAllLocked(slot *qwpSenderSlot) {
