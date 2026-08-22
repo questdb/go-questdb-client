@@ -1094,34 +1094,6 @@ func containsStringLiteral(expr ast.Expr, want string) bool {
 	return found
 }
 
-// callsAny reports whether expr is a call to any of the named functions,
-// looking through the receiver chain so a nested call is still seen.
-func callsAny(expr ast.Expr, names ...string) bool {
-	found := false
-	ast.Inspect(expr, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		var got string
-		switch fn := call.Fun.(type) {
-		case *ast.Ident:
-			got = fn.Name
-		case *ast.SelectorExpr:
-			if pkg, ok := fn.X.(*ast.Ident); ok {
-				got = pkg.Name + "." + fn.Sel.Name
-			}
-		}
-		for _, want := range names {
-			if got == want {
-				found = true
-			}
-		}
-		return true
-	})
-	return found
-}
-
 // TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine pins the
 // window between publishing deferred cleanup ownership and actually taking the
 // handoff. A fault there used to leave deferredCleanupOwned set with nothing
