@@ -27,6 +27,7 @@ package questdb
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -92,6 +93,16 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			return nil, nil, fmt.Errorf("qwp/sf: open segment %s during recovery: %w", path, openErr)
 		}
 		all = append(all, seg)
+	}
+	// A corrupt file's identity is unknown -- segment names carry a generation,
+	// not a base -- so wherever the tail of the chain has to be proved, one that
+	// could be carrying frames blocks the proof. One that provably carries none
+	// does not: it cannot be the missing tail, whatever position it holds.
+	var framefulCorrupt []string
+	for _, path := range corruptPaths {
+		if qwpSfCorruptMayHoldFrames(path) {
+			framefulCorrupt = append(framefulCorrupt, path)
+		}
 	}
 
 	manifest, err = qwpSfManifestOpen(sfDir)
@@ -170,7 +181,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			}
 		}
 		if activeSeg == nil {
-			if len(chain) == 0 && head == active && len(corruptPaths) == 0 {
+			if len(chain) == 0 && head == active && len(framefulCorrupt) == 0 {
 				if err := qwpSfDiscardOpened(all, nil); err != nil {
 					return nil, nil, err
 				}
@@ -188,9 +199,9 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			return nil, nil, qwpSfFailClosed("missing expected SF active segment at base %d", active)
 		}
 		if len(chain) == 0 {
-			if head != active || activeSeg.segmentFrameCount() != 0 || len(corruptPaths) > 0 {
+			if head != active || activeSeg.segmentFrameCount() != 0 || len(framefulCorrupt) > 0 {
 				suffix := ""
-				if len(corruptPaths) > 0 {
+				if len(framefulCorrupt) > 0 {
 					suffix = " (a corrupt segment prevents proving the empty state)"
 				}
 				return nil, nil, qwpSfFailClosed("missing SF chain between committed boundaries%s", suffix)
@@ -199,7 +210,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		} else if chain[len(chain)-1] != activeSeg {
 			last := chain[len(chain)-1]
 			chainEnd := last.segmentBaseSeq() + last.segmentFrameCount()
-			if len(corruptPaths) == 0 && activeSeg.segmentFrameCount() == 0 && activeSeg.segmentBaseSeq() == chainEnd {
+			if len(framefulCorrupt) == 0 && activeSeg.segmentFrameCount() == 0 && activeSeg.segmentBaseSeq() == chainEnd {
 				chain = append(chain, activeSeg)
 			} else {
 				return nil, nil, qwpSfFailClosed("missing expected SF active/tail segment at base %d", active)
@@ -408,6 +419,44 @@ func qwpSfDiscardOpened(all []*qwpSfSegment, keep map[*qwpSfSegment]struct{}) er
 		}
 	}
 	return nil
+}
+
+// qwpSfCorruptMayHoldFrames reports whether a segment file that failed to open
+// could still be carrying frames. A file too short to hold a header, or one
+// holding nothing but zero bytes, provably carries none: the frame scan stops
+// at the first zero length prefix, so a frame always leaves a non-zero byte
+// behind. A zero-filled file is the ordinary residue of a crash during
+// qwpSfCreateSegment, whose header lives in the mapping until a later flush,
+// and the manager mints a spare on roughly every rotation.
+//
+// Anything else -- and any file this cannot read -- is treated as a possible
+// frame carrier, since recovery must not talk itself out of a slot's evidence
+// on the strength of a failed syscall.
+func qwpSfCorruptMayHoldFrames(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer func() { _ = f.Close() }()
+	st, err := f.Stat()
+	if err != nil {
+		return true
+	}
+	if st.Size() < qwpSfHeaderSize {
+		return false
+	}
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := f.Read(buf)
+		for _, b := range buf[:n] {
+			if b != 0 {
+				return true
+			}
+		}
+		if err != nil {
+			return !errors.Is(err, io.EOF)
+		}
+	}
 }
 
 func qwpSfQuarantinePaths(paths []string) {

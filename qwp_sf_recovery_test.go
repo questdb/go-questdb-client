@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -145,17 +146,49 @@ func TestQwpSfRecoveryRefusesMissingChainBetweenCommittedBoundaries(t *testing.T
 
 // TestQwpSfRecoveryRefusesEmptyChainWhileASegmentIsCorrupt covers the same
 // refusal in the case where the boundaries themselves say the slot is empty. A
-// corrupt file could be the missing chain, so the empty state cannot be proved.
+// corrupt file holding data could be the missing chain, so the empty state
+// cannot be proved.
 func TestQwpSfRecoveryRefusesEmptyChainWhileASegmentIsCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	active := createRecoverySegment(t, dir, "sf-active.sfa", 5)
 	createRecoveryManifest(t, dir, 5, 5, active)
 	closeRecoverySegments(t, active)
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-bad.sfa"), make([]byte, 4096), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-bad.sfa"), bytes.Repeat([]byte{0xab}, 4096), 0o644))
 
 	_, _, err := qwpSfRecoverRing(dir, 4096)
 	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
 	assert.Contains(t, err.Error(), "a corrupt segment prevents proving the empty state")
+}
+
+// TestQwpSfRecoveryAcceptsEmptyChainBesideAFramelessStray is the other half of
+// that rule. A file that provably holds no frame -- shorter than a header, or
+// nothing but zeros -- cannot be the missing chain, so it takes nothing away
+// from the proof and the slot recovers. Both shapes are ordinary crash residue:
+// qwpSfCreateSegment leaves the header in the mapping until a later flush, and
+// the manager mints a spare on roughly every rotation.
+func TestQwpSfRecoveryAcceptsEmptyChainBesideAFramelessStray(t *testing.T) {
+	for _, stray := range [][]byte{{}, make([]byte, 4096)} {
+		name := "zero-length"
+		if len(stray) > 0 {
+			name = "zero-filled"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			active := createRecoverySegment(t, dir, "sf-active.sfa", 5)
+			createRecoveryManifest(t, dir, 5, 5, active)
+			closeRecoverySegments(t, active)
+			strayPath := filepath.Join(dir, "sf-stray.sfa")
+			require.NoError(t, os.WriteFile(strayPath, stray, 0o644))
+
+			ring, _, err := qwpSfRecoverRing(dir, 4096)
+			require.NoError(t, err)
+			require.NotNil(t, ring)
+			defer ring.segmentRingClose()
+			assert.Equal(t, int64(5), ring.getActiveSegment().segmentBaseSeq())
+			_, statErr := os.Stat(strayPath + ".corrupt")
+			require.NoError(t, statErr, "the stray is still quarantined, just not fatal")
+		})
+	}
 }
 
 func TestQwpSfRecoveryFailsClosedWhenManifestNewestIsCorrupt(t *testing.T) {
@@ -386,22 +419,31 @@ func TestQwpSfRecoveryCleanDrainCrashWindowRemovesStaleFiles(t *testing.T) {
 }
 
 func TestQwpSfRecoveryRotationCrashWindow(t *testing.T) {
-	for _, corrupt := range []bool{false, true} {
-		name := "clean"
-		if corrupt {
-			name = "corrupt-unknown"
-		}
-		t.Run(name, func(t *testing.T) {
+	// The active segment sits one base past the end of a chain the manifest
+	// fully accounts for, so the tail is proved by the files that are readable.
+	// Only a stray that could itself be carrying frames puts that proof in
+	// doubt; a zero-length one -- what a crash inside qwpSfCreateSegment leaves
+	// behind -- does not, and must not cost the slot.
+	for _, tc := range []struct {
+		name       string
+		stray      []byte
+		failClosed bool
+	}{
+		{name: "clean"},
+		{name: "corrupt-unknown", stray: bytes.Repeat([]byte{0xab}, 4096), failClosed: true},
+		{name: "zero-length-stray", stray: []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
 			active := createRecoverySegment(t, dir, "sf-active.sfa", 1)
 			createRecoveryManifest(t, dir, 0, 1, sealed, active)
 			closeRecoverySegments(t, sealed, active)
-			if corrupt {
-				require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-unknown.sfa"), []byte("bad"), 0o644))
+			if tc.stray != nil {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-unknown.sfa"), tc.stray, 0o644))
 			}
 			ring, _, err := qwpSfRecoverRing(dir, 4096)
-			if corrupt {
+			if tc.failClosed {
 				require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
 				return
 			}
