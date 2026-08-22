@@ -1170,3 +1170,33 @@ func TestQwpSfStaleTornSegmentIsUnlinkedNotQuarantined(t *testing.T) {
 	require.True(t, os.IsNotExist(err),
 		"and must not leave debris outside the sf_max_total_bytes budget")
 }
+
+// TestQwpSfTornSegmentAtTheCommittedHeadIsPreserved pins the boundary that
+// decides whether recovery may unlink a torn tail. head is always some
+// segment's base, so a segment AT the head is the start of what the slot still
+// owes — not something the manifest has accounted for. And frameCount stops at
+// the first bad CRC, so a torn segment whose first frame is damaged reports
+// zero: judging it on base+frameCount alone puts it at base and destroys any
+// valid frames sitting physically behind the damage.
+func TestQwpSfTornSegmentAtTheCommittedHeadIsPreserved(t *testing.T) {
+	dir := t.TempDir()
+	// A clean empty active at the committed base, plus a torn frameless
+	// segment at the same base. qwpSfFindActive prefers the clean one, so the
+	// torn file goes to qwpSfDiscardOpened.
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 2)
+	createRecoveryManifest(t, dir, 2, 2, active)
+	closeRecoverySegments(t, active)
+	torn := openTornEmptySegment(t, dir, "sf-torn.sfa", 2)
+	require.NoError(t, torn.markManifestRequired())
+	closeRecoverySegments(t, torn)
+	tornPath := filepath.Join(dir, "sf-torn.sfa")
+
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	require.NotNil(t, ring)
+	defer ring.segmentRingClose()
+
+	_, statErr := os.Stat(tornPath + ".corrupt")
+	require.NoError(t, statErr,
+		"a torn segment at the committed head must be preserved, not unlinked")
+}

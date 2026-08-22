@@ -351,12 +351,12 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 	for _, seg := range chain {
 		keep[seg] = struct{}{}
 	}
-	// Everything the chain starts at is delivered. Without a manifest nothing
-	// is proven, so nothing is treated as delivered.
-	discardHead := int64(math.MinInt64)
-	if manifest != nil {
-		discardHead = manifest.headBase
-	}
+	// The committed head is the boundary below which every frame is proven
+	// delivered. Both branches above have a manifest by now -- the legacy one
+	// just minted it -- but that legacy head is derived from the files that
+	// happened to survive, not from anything committed, which is why the
+	// unlink rule below also requires the segment to sit strictly below it.
+	discardHead := manifest.headBase
 	if err := qwpSfDiscardOpened(all, keep, preserve, discardHead); err != nil {
 		return nil, nil, err
 	}
@@ -456,7 +456,10 @@ func qwpSfSanitizeSealedResidue(chain []*qwpSfSegment) (string, error) {
 // the committed head is unlinked: the manifest proves its frames delivered. One
 // that still carries bytes the boundaries do not account for -- a torn tail, or
 // a member of preserve -- is quarantined under a .corrupt name instead, so no
-// recovery path destroys bytes it cannot prove delivered.
+// recovery path destroys bytes it cannot prove delivered. head is the committed
+// boundary below which the manifest accounts for every frame; the collapse
+// exits, which are about to remove the manifest entirely, pass a head that
+// treats nothing as delivered.
 func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]struct{}, head int64) error {
 	for _, seg := range all {
 		if _, ok := keep[seg]; ok {
@@ -464,14 +467,25 @@ func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]st
 		}
 		path := seg.segmentPath()
 		_, wanted := preserve[seg]
-		// A torn tail is only worth preserving above the committed head. Below
-		// it the manifest proves every frame delivered, so the tail bytes are
-		// accounted for -- quarantining them leaves a segment-sized .corrupt
-		// file that nothing reclaims and that sf_max_total_bytes does not
-		// count, so a slot that repeatedly tears mid-append starves the very
-		// budget meant to bound it.
+		// A torn tail is only worth unlinking when the committed head proves
+		// every byte in it delivered. Two conditions have to hold, and the
+		// second alone is not enough.
+		//
+		// A segment AT the head is retained territory, not delivered
+		// territory: head is always some segment's base, so base == head is
+		// the start of what the slot still owes. And frameCount counts frames
+		// up to the first bad CRC, so a torn segment whose first frame is
+		// damaged reports zero -- base+frameCount then lands at base, and
+		// valid frames physically behind the damage would be destroyed.
+		//
+		// Below the head the manifest accounts for every frame, so the tail
+		// bytes are accounted for too. Quarantining those leaves a
+		// segment-sized .corrupt file that nothing reclaims and
+		// sf_max_total_bytes does not count, so a slot that repeatedly tears
+		// mid-append starves the budget meant to bound it.
 		wanted = wanted || (seg.segmentTornTailBytes() > 0 &&
-			seg.segmentBaseSeq()+seg.segmentFrameCount() > head)
+			(seg.segmentBaseSeq() >= head ||
+				seg.segmentBaseSeq()+seg.segmentFrameCount() > head))
 		if err := seg.close(); err != nil {
 			return err
 		}
