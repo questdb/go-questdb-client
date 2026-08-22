@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"math"
 	"os"
 	"sync/atomic"
@@ -419,12 +420,69 @@ func (s *qwpSfSegment) syncHeader() error {
 	return nil
 }
 
+// qwpSfZeroFillChunk bounds the scratch buffer reserveTailBlocks writes
+// through the file descriptor.
+const qwpSfZeroFillChunk = 64 << 10
+
+// qwpSfSegmentWriteAt is a test seam for block-forcing write failures on
+// the torn-tail sanitize path: tests swap it to inject ENOSPC without
+// having to fill a filesystem, then restore the original in a t.Cleanup.
+var qwpSfSegmentWriteAt = func(f *os.File, p []byte, off int64) (int, error) {
+	return f.WriteAt(p, off)
+}
+
+// reserveTailBlocks zeroes [from, to) through the file descriptor, so the
+// range is backed by real disk blocks before anything stores into it via
+// the mapping. The range can sit over a hole: qwpSfAllocate falls back to
+// a sparse extend on filesystems whose reservation primitive reports
+// EOPNOTSUPP, and the "other unix" build has no primitive at all. A store
+// into an unbacked page of a full disk raises SIGBUS, which kills the
+// process outright and is beyond the reach of recover(); the pwrite here
+// allocates the same blocks up front and reports a full disk as an
+// ordinary ENOSPC error the caller can surface. Mirrors the write-back
+// qwpSfAckWatermarkOpenRequired does for an existing watermark file.
+func (s *qwpSfSegment) reserveTailBlocks(from, to int64) error {
+	if to <= from {
+		return nil
+	}
+	chunk := to - from
+	if chunk > qwpSfZeroFillChunk {
+		chunk = qwpSfZeroFillChunk
+	}
+	zeros := make([]byte, chunk)
+	for off := from; off < to; {
+		n := to - off
+		if n > chunk {
+			n = chunk
+		}
+		written, err := qwpSfSegmentWriteAt(s.file, zeros[:n], off)
+		if err != nil {
+			return fmt.Errorf("qwp/sf: reserve blocks for torn tail %s at offset %d: %w", s.path, off, err)
+		}
+		if int64(written) != n {
+			return fmt.Errorf("qwp/sf: reserve blocks for torn tail %s at offset %d: wrote %d of %d bytes: %w",
+				s.path, off, written, n, io.ErrShortWrite)
+		}
+		off += n
+	}
+	return nil
+}
+
 func (s *qwpSfSegment) sanitizeTornTail() error {
 	if s == nil || s.memoryBacked || s.tornTailBytes == 0 || s.tornTailSanitized {
 		return nil
 	}
 	if s.appendCursor != s.sizeBytes-s.tornTailBytes {
 		return fmt.Errorf("qwp/sf: torn-tail cursor mismatch in %s: cursor=%d expected=%d", s.path, s.appendCursor, s.sizeBytes-s.tornTailBytes)
+	}
+	// Order matters. The descriptor write allocates the blocks, so the
+	// clear() below — and every later tryAppend into the same range,
+	// which is exactly the segment's appendable region — stores into
+	// pages that are already backed. The clear() also keeps the mapping
+	// in step with the file on platforms that do not guarantee coherence
+	// between a mapped view and descriptor I/O.
+	if err := s.reserveTailBlocks(s.appendCursor, s.sizeBytes); err != nil {
+		return err
 	}
 	clear(s.buf[s.appendCursor:s.sizeBytes])
 	if err := qwpSfMsync(s.buf, s.sizeBytes); err != nil {

@@ -30,6 +30,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -244,6 +245,77 @@ func TestQwpSfSegmentRecoveryHandlesTornTail(t *testing.T) {
 	// future appends overwrite it.
 	expected := qwpSfHeaderSize + qwpSfFrameHeaderSize + int64(len("good frame"))
 	assert.Equal(t, expected, seg.publishedOffset())
+}
+
+func writeTornSegment(t *testing.T, path string, size int64) {
+	t.Helper()
+	seg, err := qwpSfCreateSegment(path, 0, size)
+	require.NoError(t, err)
+	_, err = seg.tryAppend([]byte("good frame"))
+	require.NoError(t, err)
+	buf := seg.address()
+	off := seg.publishedOffset()
+	binary.LittleEndian.PutUint32(buf[off:off+4], 0xDEADBEEF)
+	binary.LittleEndian.PutUint32(buf[off+4:off+8], 0x1000)
+	require.NoError(t, seg.close())
+}
+
+func TestQwpSfSegmentSanitizeTornTailReservesBlocksThroughDescriptor(t *testing.T) {
+	// The tail may sit over a hole on a filesystem where qwpSfAllocate
+	// took its sparse fallback. Zeroing it through the descriptor
+	// allocates the blocks and turns a full disk into an ENOSPC error;
+	// a store through the mapping would raise SIGBUS instead, which no
+	// recover() can catch.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-torntail-reserve.sfa")
+	const segSize int64 = 4096
+	writeTornSegment(t, path, segSize)
+
+	original := qwpSfSegmentWriteAt
+	var covered []int64
+	qwpSfSegmentWriteAt = func(f *os.File, p []byte, off int64) (int, error) {
+		covered = append(covered, off, off+int64(len(p)))
+		return original(f, p, off)
+	}
+	t.Cleanup(func() { qwpSfSegmentWriteAt = original })
+
+	seg, err := qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	defer func() { _ = seg.close() }()
+	cursor := seg.publishedOffset()
+	require.Greater(t, seg.segmentTornTailBytes(), int64(0))
+
+	require.NoError(t, seg.sanitizeTornTail())
+
+	require.Equal(t, []int64{cursor, segSize}, covered,
+		"the descriptor write must cover the whole appendable tail, which is what later appends store into")
+	assert.Zero(t, seg.segmentTornTailBytes())
+	onDisk, err := os.ReadFile(path)
+	require.NoError(t, err)
+	for i := cursor; i < segSize; i++ {
+		require.Zero(t, onDisk[i], "byte %d of the sanitized tail is not zero", i)
+	}
+}
+
+func TestQwpSfSegmentSanitizeTornTailSurfacesFullDisk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-torntail-enospc.sfa")
+	writeTornSegment(t, path, 4096)
+
+	original := qwpSfSegmentWriteAt
+	qwpSfSegmentWriteAt = func(*os.File, []byte, int64) (int, error) {
+		return 0, syscall.ENOSPC
+	}
+	t.Cleanup(func() { qwpSfSegmentWriteAt = original })
+
+	seg, err := qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	defer func() { _ = seg.close() }()
+
+	err = seg.sanitizeTornTail()
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	assert.Greater(t, seg.segmentTornTailBytes(), int64(0),
+		"a tail that could not be zeroed stays flagged so the next recovery retries it")
 }
 
 func TestQwpSfSegmentRecoveryHandlesCleanPartialFill(t *testing.T) {
