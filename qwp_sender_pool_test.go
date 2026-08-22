@@ -1431,6 +1431,42 @@ func TestQwpSenderPoolCloseUnblocksWhenLeaseReturns(t *testing.T) {
 	}
 }
 
+// TestQwpSenderPoolCloseLeakWarningRunsOffTheLock pins that the "leaving
+// borrowed sender(s) alive" warning reaches the user's slog handler only after
+// the pool lock is released. closeStep recovers a panicking handler, so the
+// process survives it -- but a panic thrown while p.mu was held would leave
+// that lock owned by a dead goroutine, and every later borrow, return,
+// reprobe and repeat Close would wait on it forever.
+func TestQwpSenderPoolCloseLeakWarningRunsOffTheLock(t *testing.T) {
+	p := &qwpSenderPool{
+		logger:         slog.New(panicOnHandleSlog{}),
+		acquireTimeout: time.Millisecond,
+		notify:         make(chan struct{}),
+	}
+	// One slot in `all` and none available is a borrowed lease, which is what
+	// makes close() report a leak.
+	p.all = []*qwpSenderSlot{{slotIndex: -1}}
+
+	panicked := false
+	func() {
+		defer func() { panicked = recover() != nil }()
+		_ = p.close(context.Background())
+	}()
+	require.True(t, panicked, "the test needs the handler's panic to escape close()")
+
+	locked := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		p.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pool lock is still held after the logger panicked")
+	}
+}
+
 // TestQwpSenderPoolReprobeSurvivesPanickingLogger pins that restoring capacity
 // after a deferred slot cleanup cannot kill the process. reprobeRetiredSlots
 // runs on the housekeeper daemon and on the borrow path, neither of which has

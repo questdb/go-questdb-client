@@ -809,13 +809,14 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 		p.mu.Lock()
 		p.waiters--
 	}
-	if leaked := len(p.all) - len(p.available); leaked > 0 {
-		// A logged leak is recoverable; a freed buffer under a live producer
-		// is not. The delegate is torn down whenever its lease finally
-		// returns (giveBack's closed branch).
-		qwpEffectiveLogger(p.logger).Warn("qwp pool: close() leaving borrowed sender(s) alive; "+
-			"each is torn down when its lease is closed", "leaked", leaked)
-	}
+	// A logged leak is recoverable; a freed buffer under a live producer is
+	// not. The delegate is torn down whenever its lease finally returns
+	// (giveBack's closed branch). Count under the lock, log after the unlock
+	// below: the logger is the user's slog handler, and a panicking one here
+	// would leave p.mu held forever -- closeStep's recover keeps the process
+	// alive, so every later borrow, return, reprobe and repeat close would
+	// then wait on that lock, including the repeat-Close retry.
+	leaked := len(p.all) - len(p.available)
 	toClose := append([]*qwpSenderSlot(nil), p.available...)
 	for _, slot := range toClose {
 		p.removeFromAllLocked(slot)
@@ -826,6 +827,10 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	p.available = nil
 	p.broadcastLocked()
 	p.mu.Unlock()
+	if leaked > 0 {
+		qwpEffectiveLogger(p.logger).Warn("qwp pool: close() leaving borrowed sender(s) alive; "+
+			"each is torn down when its lease is closed", "leaked", leaked)
+	}
 
 	var (
 		wg       sync.WaitGroup
