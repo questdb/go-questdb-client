@@ -535,15 +535,16 @@ func TestQwpSfSpareProvisioningFailureSurfacesAsDurability(t *testing.T) {
 		return nil
 	}
 	qwpSfTestDirSyncHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(nil) })
 
 	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, 0)
 	require.NoError(t, err)
-	// t.Cleanup is LIFO, so the engine must be registered BEFORE the hook is
-	// cleared -- otherwise engineClose runs while every directory barrier is
-	// still failing, its drained-file cleanup fails, no retry owner is
-	// installed, and the ring mappings and flock leak for the rest of the
-	// binary while t.TempDir deletes the directory underneath them.
-	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(nil) })
+	// The close has to run with the injected failure switched off. Otherwise
+	// every directory barrier still fails, engineFinishDrainedFileCleanup
+	// fails with it, the terminal-cleanup claim is released, no retry owner is
+	// installed, and the ring mappings and the slot flock leak for the rest of
+	// the binary while t.TempDir deletes the directory underneath them.
+	// (t.Cleanup is LIFO, so this runs before the hook is cleared either way.)
 	t.Cleanup(func() {
 		fail.Store(false)
 		_ = e.engineClose()
