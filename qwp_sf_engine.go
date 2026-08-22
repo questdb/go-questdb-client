@@ -454,10 +454,19 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			//     lowestBase-1.
 			//
 			watermark, err = qwpSfAckWatermarkOpenRequired(sfDir)
-			if err != nil || watermark == nil {
-				if err == nil {
-					err = errors.New("watermark open returned nil")
-				}
+			if errors.Is(err, qwpSfErrAckWatermarkUnbacked) {
+				// A full disk is the ordinary way to get here, and draining
+				// this slot is what gives the disk its space back, so the
+				// engine opens without the watermark rather than refusing the
+				// slot. The seed then comes from the surviving segments alone,
+				// which can re-send frames a previous session already got
+				// acked.
+				qwpSfLogGuarded(nil, slog.LevelWarn,
+					"qwp/sf: opening a recovered slot without its ack watermark; already-acked frames may replay",
+					"dir", sfDir, "error", err)
+				watermark, err = nil, nil
+			}
+			if err != nil {
 				return nil, fmt.Errorf("qwp/sf: could not open required ack watermark: %w", err)
 			}
 			// Load the persisted symbol dictionary so this recovered slot's
@@ -557,6 +566,12 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 				return nil, fmt.Errorf("qwp/sf: could not remove stale manifest in %s", sfDir)
 			}
 			watermark, err = qwpSfAckWatermarkOpenRequired(sfDir)
+			if errors.Is(err, qwpSfErrAckWatermarkUnbacked) {
+				qwpSfLogGuarded(nil, slog.LevelWarn,
+					"qwp/sf: opening a fresh slot without its ack watermark; a later recovery falls back to the surviving segments",
+					"dir", sfDir, "error", err)
+				watermark, err = nil, nil
+			}
 			if err != nil {
 				return nil, err
 			}

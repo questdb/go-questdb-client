@@ -40,6 +40,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// A full disk is the ordinary reason storage will not put blocks behind the
+// ack watermark, and for a drainer that slot's rows are what would free the
+// disk. The engine opens without the watermark instead of refusing the slot;
+// the cost is that already-acked frames can replay.
+func TestQwpSfEngineOpensWithoutAnUnbackableAckWatermark(t *testing.T) {
+	original := qwpSfAckWatermarkWriteAt.load()
+	qwpSfAckWatermarkWriteAt.store(func(*os.File, []byte, int64) (int, error) {
+		return 0, syscall.ENOSPC
+	})
+	t.Cleanup(func() { qwpSfAckWatermarkWriteAt.store(original) })
+
+	dir := t.TempDir()
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err, "a watermark storage cannot back must not stop the slot")
+	require.NotNil(t, e)
+	defer func() { _ = e.engineClose() }()
+	assert.Nil(t, e.watermark, "the engine runs without the watermark")
+
+	fsn, appendErr := e.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, appendErr)
+	assert.Equal(t, int64(0), fsn)
+}
+
 func TestQwpSfEngineMemoryModeAppend(t *testing.T) {
 	e, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)

@@ -103,7 +103,7 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 	// are any, zeros for a file this call creates.
 	var image [qwpSfAckWatermarkFileSize]byte
 	if !existing {
-		if err := qwpSfAllocate(f, qwpSfDualRecordFileSize); err != nil {
+		if err := qwpSfAckWatermarkAllocate(f, path); err != nil {
 			_ = f.Close()
 			return nil, err
 		}
@@ -132,7 +132,7 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 		if err != nil {
 			return nil, fmt.Errorf("qwp/sf: reset ack watermark %s: %w", path, err)
 		}
-		if err := qwpSfAllocate(f, qwpSfDualRecordFileSize); err != nil {
+		if err := qwpSfAckWatermarkAllocate(f, path); err != nil {
 			_ = f.Close()
 			return nil, err
 		}
@@ -177,11 +177,29 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 func qwpSfAckWatermarkReserveBlocks(f *os.File, path string, image []byte) error {
 	n, err := qwpSfAckWatermarkWriteAt.load()(f, image, 0)
 	if err != nil {
-		return fmt.Errorf("qwp/sf: reserve blocks for ack watermark %s: %w", path, err)
+		return fmt.Errorf("%w: reserve blocks for ack watermark %s: %w", qwpSfErrAckWatermarkUnbacked, path, err)
 	}
 	if n != len(image) {
-		return fmt.Errorf("qwp/sf: reserve blocks for ack watermark %s: wrote %d of %d bytes: %w",
-			path, n, len(image), io.ErrShortWrite)
+		return fmt.Errorf("%w: reserve blocks for ack watermark %s: wrote %d of %d bytes: %w",
+			qwpSfErrAckWatermarkUnbacked, path, n, len(image), io.ErrShortWrite)
+	}
+	return nil
+}
+
+// qwpSfErrAckWatermarkUnbacked marks the one failure class the caller may carry
+// on without: storage would not put real blocks behind the file, so the mapping
+// cannot be stored into safely. The watermark is an optimisation -- it saves a
+// recovered slot from re-sending frames a previous session already got acked --
+// so a sender or drainer runs without it, at the cost of duplicate rows on
+// replay against a table that does not dedupe. Failing instead would stop a
+// drainer on a full disk, and draining that slot is what frees the disk.
+var qwpSfErrAckWatermarkUnbacked = errors.New("qwp/sf: storage will not back the ack watermark")
+
+// qwpSfAckWatermarkAllocate reserves the file's blocks up front, reporting a
+// refusal in the same skippable class as the write-back.
+func qwpSfAckWatermarkAllocate(f *os.File, path string) error {
+	if err := qwpSfAllocate(f, qwpSfDualRecordFileSize); err != nil {
+		return fmt.Errorf("%w: allocate ack watermark %s: %w", qwpSfErrAckWatermarkUnbacked, path, err)
 	}
 	return nil
 }
