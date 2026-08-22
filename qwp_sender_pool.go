@@ -1082,12 +1082,26 @@ func (p *qwpSenderPool) pendingLockedSlotsLocked() int {
 // on manager quiescence or filesystem I/O. It runs on housekeeper ticks and the
 // borrow-at-capacity path, including when the housekeeper is disabled.
 func (p *qwpSenderPool) reprobeRetiredSlots() {
-	p.mu.Lock()
-	if len(p.retiredSlots) == 0 {
-		p.mu.Unlock()
-		return
+	restored := p.reprobeRetiredSlotsLocked()
+	if restored > 0 {
+		qwpSfLogGuarded(p.logger, slog.LevelInfo, "qwp pool: restored SF capacity after deferred slot cleanup", "slots", restored)
 	}
-	kept := p.retiredSlots[:0]
+}
+
+// reprobeRetiredSlotsLocked observes the retired slots under p.mu and returns
+// how many gave their capacity back. The lock is released via defer, and the
+// survivors go into a fresh slice: slotCloseCompleted calls into the delegate,
+// so a fault here must neither strand the pool mutex -- which would deadlock
+// every later borrow, return, reap and repeat close, including the re-probe the
+// ErrSfCleanupPending contract tells callers to keep making -- nor publish a
+// half-rewritten retired list.
+func (p *qwpSenderPool) reprobeRetiredSlotsLocked() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.retiredSlots) == 0 {
+		return 0
+	}
+	kept := make([]*qwpSenderSlot, 0, len(p.retiredSlots))
 	restored := 0
 	for _, slot := range p.retiredSlots {
 		if !slotCloseCompleted(slot) {
@@ -1102,10 +1116,7 @@ func (p *qwpSenderPool) reprobeRetiredSlots() {
 	if restored > 0 {
 		p.broadcastLocked()
 	}
-	p.mu.Unlock()
-	if restored > 0 {
-		qwpSfLogGuarded(p.logger, slog.LevelInfo, "qwp pool: restored SF capacity after deferred slot cleanup", "slots", restored)
-	}
+	return restored
 }
 
 func (p *qwpSenderPool) removeFromAllLocked(slot *qwpSenderSlot) {

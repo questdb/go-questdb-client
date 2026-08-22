@@ -1833,3 +1833,60 @@ func TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock(t *testing.T) {
 	close(release)
 	released = true
 }
+
+// TestQwpSenderPoolReprobeSurvivesAFaultingSlot pins that a fault while probing
+// a retired slot neither strands the pool mutex nor publishes a half-rewritten
+// retired list. slotCloseCompleted calls into the delegate, and this runs on
+// the housekeeper and on the borrow-at-capacity path — a stranded p.mu
+// deadlocks every later borrow, return, reap and repeat close, which is exactly
+// the re-probe the ErrSfCleanupPending contract tells callers to keep making.
+func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
+	p := &qwpSenderPool{
+		storeAndForward: true,
+		maxSize:         3,
+		slotInUse:       []bool{true, true, true},
+		leakedSlots:     3,
+		notify:          make(chan struct{}),
+	}
+	done := &qwpSenderSlot{slotIndex: 0}                               // no reporter: completed
+	pending := &qwpSenderSlot{slotIndex: 1, cleanup: &neverDoneSlot{}} // still held
+	faulting := &qwpSenderSlot{slotIndex: 2, cleanup: panicOnProbeSlot{}}
+	p.retiredSlots = []*qwpSenderSlot{done, pending, faulting}
+
+	func() {
+		defer func() { require.NotNil(t, recover(), "the probe must fault for this test") }()
+		p.reprobeRetiredSlots()
+	}()
+
+	locked := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		_ = len(p.retiredSlots)
+		p.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pool lock is still held after the probe faulted")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Equal(t, []*qwpSenderSlot{done, pending, faulting}, p.retiredSlots,
+		"a faulting probe must not publish a half-rewritten retired list")
+}
+
+// neverDoneSlot reports a cleanup that has not finished.
+type neverDoneSlot struct{}
+
+func (*neverDoneSlot) closeCompleted() bool               { return false }
+func (*neverDoneSlot) retryCloseIfNeeded() error          { return nil }
+func (*neverDoneSlot) ensureCloseRetryOwner(*slog.Logger) {}
+
+// panicOnProbeSlot stands in for a delegate whose state check faults.
+type panicOnProbeSlot struct{}
+
+func (panicOnProbeSlot) closeCompleted() bool               { panic("probe boom") }
+func (panicOnProbeSlot) retryCloseIfNeeded() error          { return nil }
+func (panicOnProbeSlot) ensureCloseRetryOwner(*slog.Logger) {}
