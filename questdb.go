@@ -367,7 +367,12 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	}
 	qp, err := newQwpQueryPool(ctx, conf, queryMin, queryMax, acquire, idle, lifetime, logger)
 	if err != nil {
-		_ = sp.close(ctx)
+		// Join rather than drop: sp is about to become unreachable, so a
+		// retained slot lock (ErrSfCleanupPending) has no other way to reach
+		// the caller. See newQwpSenderPool's prewarm unwind.
+		if closeErr := sp.close(ctx); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
 		return nil, err
 	}
 	// The join budget must cover one reap sweep's worst case so a reap in flight
@@ -435,9 +440,10 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // which is a "not yet", not a failure. Because the housekeeper is already
 // stopped by then, nothing else re-checks those slots — so a Close that
 // returned ErrSfCleanupPending re-probes the sender pool on every later call
-// and returns nil once the last slot lock is gone. A caller gating shutdown on
-// a clean Close should therefore retry it while errors.Is(err,
-// ErrSfCleanupPending) holds, rather than treat the first result as final.
+// and stops reporting that sentinel once the last slot lock is gone. A caller
+// gating shutdown on a clean Close should therefore retry it while
+// errors.Is(err, ErrSfCleanupPending) holds, rather than treat the first
+// result as final.
 //
 // Avoid calling Close from inside a pooled SenderErrorHandler or
 // SenderConnectionListener. Pooled callbacks are funnelled through one

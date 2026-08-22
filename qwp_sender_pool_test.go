@@ -242,6 +242,9 @@ func TestQwpPooledSenderForwardsEveryColumnType(t *testing.T) {
 	if d := qs.BackgroundDrainers(); d != nil {
 		t.Errorf("BackgroundDrainers = %v, want nil (no sf_dir)", d)
 	}
+	if path := qs.QuarantinedSlotPath(); path != "" {
+		t.Errorf("QuarantinedSlotPath = %q, want empty (nothing was set aside)", path)
+	}
 	if fsn := qs.AckedFsn(); fsn < seq {
 		t.Errorf("AckedFsn = %d, want >= %d", fsn, seq)
 	}
@@ -752,6 +755,144 @@ func TestQwpSenderLeaseStaleAtFlush(t *testing.T) {
 	if got := qs.AckedFsn(); got != -1 {
 		t.Errorf("stale AckedFsn=%d, want -1", got)
 	}
+	// A stale lease must not read the re-borrowed slot's quarantine path.
+	if path := qs.QuarantinedSlotPath(); path != "" {
+		t.Errorf("stale QuarantinedSlotPath=%q, want empty", path)
+	}
+}
+
+// TestQwpPooledSenderReportsQuarantinedSlotPath pins the live half of the
+// forwarder: a pooled sender that had to set its slot aside must say where the
+// bytes went, exactly as a standalone one does. Reading the log cannot be the
+// only way to find them.
+func TestQwpPooledSenderReportsQuarantinedSlotPath(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfRoot := t.TempDir()
+	slot := filepath.Join(sfRoot, qwpSfDefaultSenderId+"-0")
+	writeFailClosedSlot(t, slot)
+
+	ctx := context.Background()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfRoot + ";close_flush_timeout_millis=200;"
+	p, err := newQwpSenderPool(ctx, conf, 1, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(ctx) })
+
+	lease, err := p.borrow(ctx)
+	require.NoError(t, err)
+	defer lease.Close(ctx)
+	qs, ok := lease.(QwpSender)
+	require.True(t, ok)
+
+	entries, err := os.ReadDir(filepath.Join(sfRoot, "quarantined"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, filepath.Join(sfRoot, "quarantined", entries[0].Name()), qs.QuarantinedSlotPath())
+}
+
+// TestQwpSenderQuarantinedSlotPathStandalone pins the same answer on a
+// standalone sender, which is the form the README documents.
+func TestQwpSenderQuarantinedSlotPathStandalone(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfRoot := t.TempDir()
+	writeFailClosedSlot(t, filepath.Join(sfRoot, "solo"))
+
+	ctx := context.Background()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfRoot + ";sender_id=solo;close_flush_timeout_millis=200;"
+	ls, err := LineSenderFromConf(ctx, conf)
+	require.NoError(t, err)
+	defer ls.Close(ctx)
+	qs, ok := ls.(QwpSender)
+	require.True(t, ok)
+
+	entries, err := os.ReadDir(filepath.Join(sfRoot, "quarantined"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, filepath.Join(sfRoot, "quarantined", entries[0].Name()), qs.QuarantinedSlotPath())
+
+	// A sender that opened a slot it could read set nothing aside.
+	clean, err := LineSenderFromConf(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+
+		";sf_dir="+t.TempDir()+";close_flush_timeout_millis=200;")
+	require.NoError(t, err)
+	defer clean.Close(ctx)
+	require.Equal(t, "", clean.(QwpSender).QuarantinedSlotPath())
+}
+
+// TestQwpSenderPoolCloseSurvivesPanickingLoggerAndReleasesSlots pins that a
+// buggy user slog handler cannot turn close() into a no-op. The leak warning
+// fires after the available slots are already out of p.all and counted in
+// closingSlots, so a panic there would skip every teardown -- leaving each
+// flock held with no retry owner and no retired slot to re-probe, while later
+// close() calls happily report success.
+func TestQwpSenderPoolCloseSurvivesPanickingLoggerAndReleasesSlots(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	ctx := context.Background()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=200;"
+	// A short acquire timeout keeps close()'s wait for the never-returned lease
+	// short; the leak branch it then takes is what this test is about.
+	p, err := newQwpSenderPool(ctx, conf, 2, 2, 200*time.Millisecond, 0, 0,
+		nil, nil, QwpBackgroundDrainerListener{}, slog.New(panicOnHandleSlog{}))
+	require.NoError(t, err)
+
+	// One lease stays out so close() takes the leak-warning branch.
+	leaked, err := p.borrow(ctx)
+	require.NoError(t, err)
+	defer leaked.Close(ctx)
+
+	require.NoError(t, p.close(ctx))
+
+	// The returned slot's flock must be gone; the borrowed one's is released
+	// when its lease returns.
+	lock, err := qwpSfAcquireSlotLock(filepath.Join(sfDir, qwpSfDefaultSenderId+"-0"))
+	require.NoError(t, err, "close() skipped the teardown of an available slot")
+	require.NoError(t, lock.close())
+}
+
+// TestQwpSenderPoolCloseReportsPendingWhileTeardownHoldsFlock pins that close()
+// counts the teardowns still in flight off-lock. A lease returning concurrently
+// with close() is inside delegate.Close holding its slot flock, and close()'s
+// lease wait is capped well below the drain it is racing -- reporting nil there
+// would tell a caller the locks are gone while one is still held.
+func TestQwpSenderPoolCloseReportsPendingWhileTeardownHoldsFlock(t *testing.T) {
+	p := &qwpSenderPool{
+		storeAndForward: true,
+		maxSize:         1,
+		slotInUse:       make([]bool, 1),
+		notify:          make(chan struct{}),
+	}
+	// Stand in for a giveBack teardown that has left p.all and is inside its
+	// off-lock delegate.Close, still holding the slot flock.
+	p.closingSlots = 1
+
+	err := p.close(context.Background())
+	require.ErrorIs(t, err, ErrSfCleanupPending,
+		"an in-flight teardown still holding its flock must not report a clean shutdown")
+
+	// Once that teardown lands, a repeat close stops reporting it.
+	p.mu.Lock()
+	p.closingSlots = 0
+	p.mu.Unlock()
+	require.NoError(t, p.close(context.Background()))
+}
+
+// writeFailClosedSlot lays down a manifest-backed slot whose committed active
+// segment is unreadable, which recovery refuses; a foreground sender preserves
+// such a slot under <sf_dir>/quarantined/ and starts fresh.
+func writeFailClosedSlot(t *testing.T, slot string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	s0 := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "a")
+	s1 := createRecoverySegment(t, slot, "sf-active.sfa", 1, "b")
+	createRecoveryManifest(t, slot, 0, 1, s0, s1)
+	closeRecoverySegments(t, s0, s1)
+	require.NoError(t, os.WriteFile(filepath.Join(slot, "sf-active.sfa"), make([]byte, 4096), 0o644))
 }
 
 // TestQwpSenderPoolBorrowGrowsAsyncWhenServerDown: a growth borrow while the
@@ -1270,6 +1411,80 @@ func TestQwpSenderPoolBuildFailureRetiresSlotUntilDeferredCleanup(t *testing.T) 
 	}, 2*time.Second, time.Millisecond)
 }
 
+// TestQwpSenderPoolRetiredSlotCapacityReturnsToBorrow is the end-to-end half of
+// the retirement contract: with max=1 and no housekeeper at all, the pool has
+// exactly one slot, that slot is retired with its flock still held, and the next
+// borrow has to get it back on its own. It borrows for real rather than calling
+// reprobeRetiredSlots by hand, which is what a user with
+// housekeeper_interval_ms=0 actually does.
+func TestQwpSenderPoolRetiredSlotCapacityReturnsToBorrow(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	afterEngineHook := func() error {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			return errors.New("manager did not enter spare creation")
+		}
+		return errors.New("injected post-engine build failure")
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpSfTestAfterEngineCreateHook.Store(&afterEngineHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfTestAfterEngineCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	_, err = p.borrow(context.Background())
+	require.ErrorContains(t, err, "injected post-engine build failure")
+	p.mu.Lock()
+	require.Equal(t, 1, p.leakedSlots, "the failed build must retire the slot, not free it")
+	require.Equal(t, 1, p.capUsedLocked(), "a retired slot still counts against capacity")
+	p.mu.Unlock()
+
+	// Let the deferred cleanup finish, then borrow for real. The pool is at
+	// capacity until the borrow's own reprobe observes the released flock.
+	qwpSfTestSegmentCreateHook.Store(nil)
+	qwpSfTestAfterEngineCreateHook.Store(nil)
+	close(release)
+	released = true
+
+	lease, err := p.borrow(context.Background())
+	require.NoError(t, err, "a borrow must recover the retired slot's capacity without a housekeeper")
+	require.NoError(t, lease.Close(context.Background()))
+	p.mu.Lock()
+	require.Zero(t, p.leakedSlots)
+	p.mu.Unlock()
+}
+
 func TestQwpSenderPoolRecoveryBuildFailureRetiresSlotUntilDeferredCleanup(t *testing.T) {
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)
@@ -1439,12 +1654,14 @@ func TestQwpSenderPoolCloseUnblocksWhenLeaseReturns(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolCloseLeakWarningRunsOffTheLock pins that the "leaving
-// borrowed sender(s) alive" warning reaches the user's slog handler only after
-// the pool lock is released. closeStep recovers a panicking handler, so the
-// process survives it -- but a panic thrown while p.mu was held would leave
-// that lock owned by a dead goroutine, and every later borrow, return,
-// reprobe and repeat Close would wait on it forever.
+// TestQwpSenderPoolCloseLeakWarningRunsOffTheLock pins both halves of where the
+// "leaving borrowed sender(s) alive" warning runs. It reaches the user's slog
+// handler only after the pool lock is released, because a panic thrown while
+// p.mu was held would leave that lock owned by a dead goroutine and every later
+// borrow, return, reprobe and repeat Close would wait on it forever. And the
+// call is panic-guarded, because by that point the available slots are already
+// out of p.all and counted in closingSlots -- an escaping panic would skip
+// every teardown below and retain each flock with no owner at all.
 func TestQwpSenderPoolCloseLeakWarningRunsOffTheLock(t *testing.T) {
 	p := &qwpSenderPool{
 		logger:         slog.New(panicOnHandleSlog{}),
@@ -1460,7 +1677,7 @@ func TestQwpSenderPoolCloseLeakWarningRunsOffTheLock(t *testing.T) {
 		defer func() { panicked = recover() != nil }()
 		_ = p.close(context.Background())
 	}()
-	require.True(t, panicked, "the test needs the handler's panic to escape close()")
+	require.False(t, panicked, "a panicking handler must not escape close() and skip the teardown")
 
 	locked := make(chan struct{})
 	go func() {

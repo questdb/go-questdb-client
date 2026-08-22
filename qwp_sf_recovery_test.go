@@ -128,6 +128,14 @@ func TestQwpSfFindActivePrefersCleanSegmentOverTorn(t *testing.T) {
 
 	assert.Nil(t, qwpSfFindActive([]*qwpSfSegment{torn, clean}, base+1),
 		"a segment at another base is not a candidate")
+
+	// A second torn candidate is not a clean one. Recording it as the clean
+	// choice would hand back a torn segment for the preserve-and-replace dance
+	// while the usable clean file at the same base is removed as a stray.
+	torn2 := openTornEmptySegment(t, dir, "sf-torn2.sfa", base)
+	defer closeRecoverySegments(t, torn2)
+	assert.Same(t, clean, qwpSfFindActive([]*qwpSfSegment{torn, torn2, clean}, base))
+	assert.Same(t, torn, qwpSfFindActive([]*qwpSfSegment{torn, torn2}, base))
 }
 
 // TestQwpSfRecoveryRefusesMissingChainBetweenCommittedBoundaries pins that a
@@ -741,8 +749,15 @@ func TestQwpSfRecoveryKeepsTornActiveWhenInstallRenameFails(t *testing.T) {
 			require.NoError(t, f.Sync())
 			require.NoError(t, f.Close())
 
+			// Fail only the install rename, identified by its source: the
+			// fallback's move-aside and its rollback go through the same seam.
 			originalRename := qwpSfTornActiveRename.load()
-			qwpSfTornActiveRename.store(func(string, string) error { return syscall.EIO })
+			qwpSfTornActiveRename.store(func(from, to string) error {
+				if strings.HasSuffix(from, qwpSfTornActiveTempSuffix) {
+					return syscall.EIO
+				}
+				return originalRename(from, to)
+			})
 			originalLink := qwpSfTornActiveLink.load()
 			if tc.linkFails {
 				qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
@@ -773,6 +788,99 @@ func TestQwpSfRecoveryKeepsTornActiveWhenInstallRenameFails(t *testing.T) {
 			require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
 		})
 	}
+}
+
+// TestQwpSfRecoveryTornActiveMoveAsideFailure covers the exit taken when the
+// filesystem has no hard links AND the move-aside rename fails: nothing has
+// been touched yet, so the torn segment must still be at the committed active
+// base and the unused replacement must be gone.
+func TestQwpSfRecoveryTornActiveMoveAsideFailure(t *testing.T) {
+	const baseSeq int64 = 3
+	dir, path := tornActiveSlot(t, baseSeq)
+
+	originalLink := qwpSfTornActiveLink.load()
+	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
+	originalRename := qwpSfTornActiveRename.load()
+	qwpSfTornActiveRename.store(func(from, to string) error {
+		if strings.HasSuffix(from, ".sfa") {
+			return syscall.EIO
+		}
+		return originalRename(from, to)
+	})
+	_, _, err := qwpSfRecoverRing(dir, 4096)
+	qwpSfTornActiveLink.store(originalLink)
+	qwpSfTornActiveRename.store(originalRename)
+	require.ErrorIs(t, err, syscall.EIO)
+
+	torn, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, byte(1), torn[qwpSfHeaderSize+20],
+		"the committed active base must still hold the torn segment")
+	_, err = os.Stat(path + qwpSfTornActiveTempSuffix)
+	require.True(t, os.IsNotExist(err), "the unused replacement must not be left behind")
+}
+
+// TestQwpSfRecoveryTornActiveRollbackFailure covers the one exit that cannot
+// put a file back at the committed active base: no hard links, the install
+// rename fails, and so does the rollback. The torn bytes survive under the
+// preserved name and the error has to say so, because the next recovery fails
+// closed on a missing active segment.
+func TestQwpSfRecoveryTornActiveRollbackFailure(t *testing.T) {
+	const baseSeq int64 = 3
+	dir, path := tornActiveSlot(t, baseSeq)
+
+	originalLink := qwpSfTornActiveLink.load()
+	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
+	originalRename := qwpSfTornActiveRename.load()
+	qwpSfTornActiveRename.store(func(from, to string) error {
+		if strings.HasSuffix(from, ".sfa") && !strings.HasSuffix(from, qwpSfTornActiveTempSuffix) {
+			// The move-aside is the only rename allowed through.
+			return originalRename(from, to)
+		}
+		return syscall.EIO
+	})
+	_, _, err := qwpSfRecoverRing(dir, 4096)
+	qwpSfTornActiveLink.store(originalLink)
+	qwpSfTornActiveRename.store(originalRename)
+	require.ErrorIs(t, err, syscall.EIO)
+	require.Contains(t, err.Error(), "no file is left at the committed active base")
+
+	_, err = os.Stat(path)
+	require.True(t, os.IsNotExist(err), "the rollback failed, so nothing is at the active base")
+	corrupt, err := os.ReadFile(path + ".corrupt")
+	require.NoError(t, err)
+	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20],
+		"the torn bytes must survive under the preserved name the error names")
+
+	// The committed boundaries decide what the next recovery makes of the
+	// emptied slot. Here head == active, so it committed no frames and the slot
+	// collapses to a fresh one; the preserved copy stays the record of the bytes.
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	if ring != nil {
+		ring.segmentRingClose()
+	}
+	_, err = os.Stat(path + ".corrupt")
+	require.NoError(t, err, "the preserved copy must survive the fresh start")
+}
+
+// tornActiveSlot builds a one-segment manifest-backed slot whose committed
+// active segment carries a torn tail, and returns the slot dir and that
+// segment's path.
+func tornActiveSlot(t *testing.T, baseSeq int64) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	active := createRecoverySegment(t, dir, "sf-active.sfa", baseSeq)
+	createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
+	closeRecoverySegments(t, active)
+	path := filepath.Join(dir, "sf-active.sfa")
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+20)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	return dir, path
 }
 
 func TestQwpSfQuarantinePathPreservesEarlierEvidence(t *testing.T) {

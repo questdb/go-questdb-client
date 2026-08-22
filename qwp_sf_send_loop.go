@@ -1062,7 +1062,7 @@ func (l *qwpSfSendLoop) run() {
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("qwp/sf: send loop panicked: %v\n%s", r, debug.Stack())
-			qwpEffectiveLogger(l.logger).Error("qwp/sf: send loop panicked", "error", err)
+			qwpSfLogGuarded(l.logger, slog.LevelError, "qwp/sf: send loop panicked", "error", err)
 			l.recordFatal(err)
 		}
 	}()
@@ -1230,7 +1230,7 @@ func (l *qwpSfSendLoop) runOneConnection() error {
 		defer func() {
 			if r := recover(); r != nil {
 				err := fmt.Errorf("qwp/sf: %s panicked: %v\n%s", name, r, debug.Stack())
-				qwpEffectiveLogger(l.logger).Error("qwp/sf: connection goroutine panicked", "goroutine", name, "error", err)
+				qwpSfLogGuarded(l.logger, slog.LevelError, "qwp/sf: connection goroutine panicked", "goroutine", name, "error", err)
 				errCh <- loopErr{err}
 			}
 		}()

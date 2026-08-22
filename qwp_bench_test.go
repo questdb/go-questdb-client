@@ -641,8 +641,19 @@ func BenchmarkQwpSfRotationBarriers(b *testing.B) {
 		return active
 	}
 
+	// A rotation always syncs a header it has just rewritten: the promoted
+	// spare is rebased onto the new active sequence first. Dirty the header the
+	// same way here, or the msync+fsync has nothing to write back after the
+	// first iteration and the sub-benchmark measures a no-op barrier.
+	dirtyHeader := func(i int) {
+		if err := seg.rebaseSeq(int64(i + 1)); err != nil {
+			b.Fatal(err)
+		}
+	}
+
 	b.Run("header", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
+			dirtyHeader(i)
 			if err := seg.syncHeader(); err != nil {
 				b.Fatal(err)
 			}
@@ -657,6 +668,7 @@ func BenchmarkQwpSfRotationBarriers(b *testing.B) {
 	})
 	b.Run("both", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
+			dirtyHeader(i)
 			if err := seg.syncHeader(); err != nil {
 				b.Fatal(err)
 			}

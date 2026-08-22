@@ -397,15 +397,21 @@ func (p *qwpQueryPool) close(_ context.Context) error {
 		timer.Stop()
 		p.mu.Lock()
 	}
-	if leaked := len(p.all) - len(p.available); leaked > 0 {
-		qwpEffectiveLogger(p.logger).Warn("qwp query pool: close() leaving borrowed query client(s) alive; "+
-			"each is closed when its lease is returned", "leaked", leaked)
-	}
+	// Count under the lock, log after the unlock below, and go through
+	// qwpSfLogGuarded: the logger is the user's slog handler, so a slow or
+	// panicking one here would hold p.mu for the process lifetime -- every
+	// borrow, return, reap and repeat close waits on that lock -- and would
+	// also skip the teardown of every available client's WebSocket.
+	leaked := len(p.all) - len(p.available)
 	toClose := append([]*qwpQueryWorker(nil), p.available...)
 	p.all = nil
 	p.available = nil
 	p.broadcastLocked()
 	p.mu.Unlock()
+	if leaked > 0 {
+		qwpSfLogGuarded(p.logger, slog.LevelWarn, "qwp query pool: close() leaving borrowed query client(s) alive; "+
+			"each is closed when its lease is returned", "leaked", leaked)
+	}
 
 	var (
 		wg       sync.WaitGroup

@@ -42,7 +42,9 @@ import (
 // clean segment where a torn one held no recoverable frame, and removes files
 // proven stale -- but every file that holds a frame the manifest still accounts
 // for is either left exactly as it was or preserved under another name.
-// TestQwpSfFailedRecoveryPreservesEveryRequiredFrame pins that.
+// TestQwpSfFailedRecoveryPreservesEveryRequiredFrame pins the failed half;
+// on the success path qwpSfDiscardOpened quarantines instead of unlinking
+// anything that still carries frames or a torn tail.
 var (
 	//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 	qwpSfErrRecoveryFailClosed = errors.New("qwp/sf: recovery failed closed")
@@ -160,6 +162,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 
 	var chain []*qwpSfSegment
 	var activeSeg *qwpSfSegment
+	var preserve map[*qwpSfSegment]struct{}
 	if manifest != nil {
 		head, active := manifest.headBase, manifest.activeBase
 		activeSeg = qwpSfFindActive(all, active)
@@ -176,6 +179,18 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 				return nil, nil, qwpSfFailClosed("segment exists beyond committed SF active boundary")
 			}
 			if base == active && seg != activeSeg {
+				// A duplicate at the committed active base that the chain does
+				// not adopt. Rotation always assigns a strictly greater base,
+				// so a frameful one is not reachable today; preserving it
+				// rather than unlinking it keeps the no-frame-destroyed
+				// guarantee at the top of this file resting on the code
+				// instead of on that argument.
+				if seg.segmentFrameCount() > 0 {
+					if preserve == nil {
+						preserve = make(map[*qwpSfSegment]struct{}, 1)
+					}
+					preserve[seg] = struct{}{}
+				}
 				continue
 			}
 			chain = append(chain, seg)
@@ -190,7 +205,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		}
 		if activeSeg == nil {
 			if len(chain) == 0 && head == active && len(framefulCorrupt) == 0 {
-				if err := qwpSfDiscardOpened(all, nil); err != nil {
+				if err := qwpSfDiscardOpened(all, nil, nil); err != nil {
 					return nil, nil, err
 				}
 				all = nil
@@ -296,7 +311,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		} else {
 			activeSeg = qwpSfChooseEmptyInitial(all)
 			if activeSeg == nil {
-				if err := qwpSfDiscardOpened(all, nil); err != nil {
+				if err := qwpSfDiscardOpened(all, nil, nil); err != nil {
 					return nil, nil, err
 				}
 				all = nil
@@ -321,7 +336,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 	for _, seg := range chain {
 		keep[seg] = struct{}{}
 	}
-	if err := qwpSfDiscardOpened(all, keep); err != nil {
+	if err := qwpSfDiscardOpened(all, keep, preserve); err != nil {
 		return nil, nil, err
 	}
 	qwpSfQuarantinePaths(corruptPaths)
@@ -368,9 +383,13 @@ func qwpSfFindActive(all []*qwpSfSegment, activeBase int64) *qwpSfSegment {
 		if seg.segmentFrameCount() > 0 {
 			return seg
 		}
-		if seg.segmentTornTailBytes() > 0 && torn == nil {
-			torn = seg
-		} else if clean == nil {
+		if seg.segmentTornTailBytes() > 0 {
+			if torn == nil {
+				torn = seg
+			}
+			continue
+		}
+		if clean == nil {
 			clean = seg
 		}
 	}
@@ -412,17 +431,22 @@ func qwpSfSanitizeSealedResidue(chain []*qwpSfSegment) (string, error) {
 	return first, nil
 }
 
-func qwpSfDiscardOpened(all []*qwpSfSegment, keep map[*qwpSfSegment]struct{}) error {
+// qwpSfDiscardOpened releases every opened segment outside keep. A file the
+// chain does not need is unlinked; one that still carries bytes -- a torn tail,
+// or a member of preserve -- is quarantined under a .corrupt name instead, so
+// no recovery path ever destroys bytes it cannot prove delivered.
+func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]struct{}) error {
 	for _, seg := range all {
 		if _, ok := keep[seg]; ok {
 			continue
 		}
 		path := seg.segmentPath()
-		torn := seg.segmentTornTailBytes() > 0
+		_, wanted := preserve[seg]
+		wanted = wanted || seg.segmentTornTailBytes() > 0
 		if err := seg.close(); err != nil {
 			return err
 		}
-		if torn {
+		if wanted {
 			qwpSfQuarantinePaths([]string{path})
 		} else if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			qwpEffectiveLogger(nil).Warn("qwp/sf: could not remove validated extra segment", "path", path, "error", err)
@@ -486,7 +510,10 @@ const qwpSfTornActiveTempSuffix = ".replacing"
 
 // Filesystem seams for the torn-active swap. Production always holds os.Link
 // and os.Rename; tests replace one to reach a failure exit that no real
-// filesystem can be talked into on demand.
+// filesystem can be talked into on demand. Every rename on this path goes
+// through the seam -- the install, the no-hard-link fallback that moves the
+// torn file aside, and that fallback's rollback -- so a test can fail exactly
+// one of them by looking at the source path.
 var (
 	qwpSfTornActiveLink   = qwpSfSwappable(os.Link)
 	qwpSfTornActiveRename = qwpSfSwappable(os.Rename)
@@ -496,7 +523,7 @@ var (
 // established .corrupt name and puts a clean, empty segment at the same
 // manifest-committed base in its place. Returns the segment now at path.
 //
-// Every failure exit leaves a segment file at path, because the next startup
+// Failure exits aim to leave a segment file at path, because the next startup
 // refuses a slot whose committed active segment is missing and neither
 // .corrupt nor .replacing ends in .sfa for a directory scan to find. Two steps
 // arrange that. The replacement is built at a temporary path and only swapped
@@ -508,12 +535,29 @@ var (
 // throughout, and a crash between the two steps costs at most a stray link.
 //
 // Where hard links are unavailable the fallback renames the torn file aside
-// and rolls that rename back if the install fails, which leaves the same end
-// states with a crash window between the renames.
+// and rolls that rename back if the install fails. That is the one exit that
+// can leave the committed active base unoccupied: if both the install rename
+// and the rollback rename fail, the torn bytes survive under the preserved
+// name and the returned error says so. What the next recovery makes of the
+// emptied slot follows the committed boundaries -- a manifest that committed
+// frames fails closed, one whose head equals its active collapses and starts
+// fresh -- and either way the preserved copy is the record of the bytes.
 func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qwpSfSegment, error) {
 	tmp := path + qwpSfTornActiveTempSuffix
 	replacement, err := qwpSfCreateSegment(tmp, baseSeq, maxBytesPerSegment)
 	if err != nil {
+		return nil, fmt.Errorf("qwp/sf: build replacement for torn active %s: %w", path, err)
+	}
+	// The replacement's header must be durable before its name is installed
+	// over the committed active base. The install rename below can reach the
+	// disk first otherwise, and a crash in that window leaves a durable
+	// directory entry over a zero-filled file: the next recovery reads it as
+	// corrupt, qwpSfCorruptMayHoldFrames says it holds no frames, no active
+	// segment survives, and the whole slot -- including the sealed segments'
+	// undelivered rows, intact on disk -- is quarantined.
+	if err := replacement.syncHeader(); err != nil {
+		_ = replacement.close()
+		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("qwp/sf: build replacement for torn active %s: %w", path, err)
 	}
 	// Closed before the swap so the reopen below owns the only mapping, and so
@@ -531,7 +575,7 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 	linked := true
 	if err := qwpSfTornActiveLink.load()(path, preserved); err != nil {
 		linked = false
-		if err := os.Rename(path, preserved); err != nil {
+		if err := qwpSfTornActiveRename.load()(path, preserved); err != nil {
 			_ = os.Remove(tmp)
 			return nil, fmt.Errorf("qwp/sf: quarantine segment %s: %w", path, err)
 		}
@@ -540,7 +584,7 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 		_ = os.Remove(tmp)
 		if linked {
 			_ = os.Remove(preserved)
-		} else if rollbackErr := os.Rename(preserved, path); rollbackErr != nil {
+		} else if rollbackErr := qwpSfTornActiveRename.load()(preserved, path); rollbackErr != nil {
 			return nil, fmt.Errorf(
 				"qwp/sf: install replacement for torn active %s: %w (the torn segment is preserved at %s and no file is left at the committed active base)",
 				path, err, preserved)

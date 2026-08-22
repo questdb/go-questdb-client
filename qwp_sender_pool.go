@@ -109,8 +109,10 @@ type qwpSenderPool struct {
 // every teardown step ran but one or more slots have not finished releasing
 // their slot lock. It is not a failure: the engine's terminal-cleanup retry
 // owner keeps retrying with no deadline, so calling Close again re-probes and
-// returns nil once the last lock is gone. Match it with errors.Is to tell this
-// apart from a teardown that genuinely failed, and retry rather than give up.
+// stops reporting this sentinel once the last lock is gone. (A teardown error
+// from the same close is remembered and keeps being reported alongside it.)
+// Match it with errors.Is to tell this apart from a teardown that genuinely
+// failed, and retry rather than give up.
 var ErrSfCleanupPending = errors.New("qwp pool: SF slot cleanup still pending; slot locks retained")
 
 // qwpPoolCloseResult combines the teardown error with the current
@@ -207,7 +209,15 @@ func newQwpSenderPool(
 	for i := 0; i < minSize; i++ {
 		slot, err := p.createSlot(ctx, false)
 		if err != nil {
-			_ = p.close(ctx)
+			// Join the unwind close's error rather than drop it: it can be
+			// ErrSfCleanupPending, and this pool is about to become
+			// unreachable, so this is the only place the caller can learn
+			// that a slot lock survives the failed build and that an
+			// immediate retry on the same sf_dir may name this process as
+			// the holder. The engine's own retry owner keeps releasing it.
+			if closeErr := p.close(ctx); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			return nil, err
 		}
 		p.all = append(p.all, slot)
@@ -679,7 +689,7 @@ func (p *qwpSenderPool) reapIdle() {
 	p.broadcastLocked()
 	p.mu.Unlock()
 	for _, err := range reapErrs {
-		qwpEffectiveLogger(p.logger).Warn("qwp pool: reaping a slot failed to drain cleanly", "error", err)
+		qwpSfLogGuarded(p.logger, slog.LevelWarn, "qwp pool: reaping a slot failed to drain cleanly", "error", err)
 	}
 }
 
@@ -749,9 +759,9 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 // manager quiescence is retained in retiredSlots with a terminal retry owner;
 // close reports that pending flock instead of claiming complete shutdown, as an
 // error wrapping ErrSfCleanupPending. Calling close again re-probes those slots
-// and returns nil once the last lock is gone, so a caller gating shutdown on a
-// clean close has a way to reach one; a teardown error from the first pass is
-// remembered and reported by every later call as well.
+// and stops reporting it once the last lock is gone, so a caller gating
+// shutdown on a clean close has a way to reach one; a teardown error from the
+// first pass is remembered and reported by every later call as well.
 //
 // Slots close concurrently on context.Background(): each drain is bounded by
 // close_flush_timeout, so the caller's ctx must neither serialize the drains
@@ -765,7 +775,7 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 		p.mu.Unlock()
 		p.reprobeRetiredSlots()
 		p.mu.Lock()
-		pending := p.leakedSlots
+		pending := p.pendingLockedSlotsLocked()
 		p.mu.Unlock()
 		return qwpPoolCloseResult(teardownErr, pending)
 	}
@@ -815,7 +825,11 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	// below: the logger is the user's slog handler, and a panicking one here
 	// would leave p.mu held forever -- closeStep's recover keeps the process
 	// alive, so every later borrow, return, reprobe and repeat close would
-	// then wait on that lock, including the repeat-Close retry.
+	// then wait on that lock, including the repeat-Close retry. The log goes
+	// through qwpSfLogGuarded for the same reason the site matters: the slots
+	// below are already out of p.all and counted in closingSlots, so a
+	// panicking handler that skipped the teardown loop would retain every
+	// flock with no retry owner and no retiredSlots entry to re-probe.
 	leaked := len(p.all) - len(p.available)
 	toClose := append([]*qwpSenderSlot(nil), p.available...)
 	for _, slot := range toClose {
@@ -828,7 +842,7 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	p.broadcastLocked()
 	p.mu.Unlock()
 	if leaked > 0 {
-		qwpEffectiveLogger(p.logger).Warn("qwp pool: close() leaving borrowed sender(s) alive; "+
+		qwpSfLogGuarded(p.logger, slog.LevelWarn, "qwp pool: close() leaving borrowed sender(s) alive; "+
 			"each is torn down when its lease is closed", "leaked", leaked)
 	}
 
@@ -863,7 +877,7 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	// the same before reporting.
 	p.reprobeRetiredSlots()
 	p.mu.Lock()
-	pending := p.leakedSlots
+	pending := p.pendingLockedSlotsLocked()
 	p.mu.Unlock()
 	return qwpPoolCloseResult(firstErr, pending)
 }
@@ -1002,8 +1016,10 @@ func (p *qwpSenderPool) freeSlotIndexLocked(idx int) {
 
 // reclaimSlotLocked returns an SF slot index only after the delegate confirms
 // terminal engine cleanup released its flock. A close timeout may have handed
-// cleanup to the manager worker; such a slot stays reserved and counts against
-// capacity until the housekeeper observes completion.
+// cleanup to the manager worker; such a slot is retired -- still reserved, and
+// still counted against capacity -- until a reprobe observes completion.
+// reprobeRetiredSlots runs on housekeeper ticks AND on the borrow-at-capacity
+// path, so housekeeper_interval_ms=0 does not leak the capacity.
 func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
 	_ = closeErr
 	if !p.storeAndForward || slot.slotIndex < 0 {
@@ -1019,6 +1035,19 @@ func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
 		return
 	}
 	p.freeSlotIndexLocked(slot.slotIndex)
+}
+
+// pendingLockedSlotsLocked counts the SF slots whose flock this pool still
+// holds: the ones retired with a deferred cleanup owner, plus the ones whose
+// off-lock delegate.Close is still in flight. A concurrent lease return or a
+// reap can be inside closeSlotGuarded while close() reports its result, and
+// that delegate holds its flock for the whole call — close()'s lease wait is
+// capped at qwpPoolMaxCloseLeaseWait while a drain is bounded by the (possibly
+// larger) close_flush_timeout, so the two overlap at the default settings.
+// Counting closingSlots keeps such a shutdown reporting ErrSfCleanupPending
+// until the teardown lands and reclaimSlotLocked has had its say.
+func (p *qwpSenderPool) pendingLockedSlotsLocked() int {
+	return p.leakedSlots + p.closingSlots
 }
 
 // reprobeRetiredSlots observes completion and restores capacity. Cleanup itself

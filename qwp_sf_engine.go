@@ -1105,7 +1105,7 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 			e.deferredCleanupOwned.Store(false)
 		}
 		if handedOff {
-			qwpEffectiveLogger(e.manager.logger.Load()).Error(
+			qwpSfLogGuarded(e.engineLogger(), slog.LevelError,
 				"qwp/sf: close handed to the manager worker's exit path; the slot stays locked until it completes",
 				"slot", e.sfDir)
 			return nil
@@ -1222,7 +1222,7 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 			if firstErr == nil {
 				firstErr = err
 			}
-			qwpEffectiveLogger(e.manager.logger.Load()).Error("qwp/sf: could not release slot lock after close", "slot", e.sfDir, "error", err)
+			qwpSfLogGuarded(e.engineLogger(), slog.LevelError, "qwp/sf: could not release slot lock after close", "slot", e.sfDir, "error", err)
 			e.terminalCleanupClaimed.Store(false)
 			return firstErr
 		}
@@ -1270,7 +1270,7 @@ func (e *qwpSfCursorEngine) engineCompleteDeferredClose() {
 	e.appendMu.Lock()
 	err := e.engineFinishCloseGuarded(e.deferredFullyDrained.Load(), e.deferredLeakSegments.Load())
 	e.appendMu.Unlock()
-	logger := e.manager.logger.Load()
+	logger := e.engineLogger()
 	if err != nil {
 		// The manager has finished its one-shot handoff. If terminal cleanup
 		// failed or panicked, replace it with the engine-owned retry loop before
@@ -1337,6 +1337,17 @@ func (e *qwpSfCursorEngine) engineFinishClaimedClose() error {
 // closeRetryOwnerStarted for its whole lifetime, so the gate that keeps a
 // repeated Close away from it must not keep the owner away from its own work.
 func (e *qwpSfCursorEngine) engineRetryCloseIfNeeded() error {
+	// A close that faulted ahead of the manager teardown -- a panic in the
+	// drain wait or the send-loop shutdown that closeCursor runs before
+	// engineClose, recovered by the pool's closeSlotGuarded -- leaves nothing
+	// for a terminal-cleanup claim to take over: managerTornDown is the
+	// condition engineFinishClose assumes, and it is still false. Re-drive the
+	// whole close instead. engineCloseInternal is idempotent and safe to enter
+	// concurrently with another close, and it reaches the same claim once the
+	// manager is provably down.
+	if e != nil && !e.managerTornDown.Load() && !e.closeCompleted.Load() {
+		return e.engineCloseInternal(e.deferredLeakSegments.Load())
+	}
 	if !e.engineTryClaimTerminalCleanup() {
 		return nil
 	}
@@ -1398,6 +1409,16 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 			time.Sleep(qwpSfCloseRetryInterval.load())
 		}
 	}()
+}
+
+// engineLogger reads the configured logger through the manager. A hand-built
+// engine in tests can carry no manager, and every close path below runs on such
+// an engine too.
+func (e *qwpSfCursorEngine) engineLogger() *slog.Logger {
+	if e == nil || e.manager == nil {
+		return nil
+	}
+	return e.manager.logger.Load()
 }
 
 func qwpSfLogGuarded(logger *slog.Logger, level slog.Level, message string, args ...any) {

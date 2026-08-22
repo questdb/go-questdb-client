@@ -727,6 +727,48 @@ func TestQwpSfSwappableVarSurvivesConcurrentSwap(t *testing.T) {
 // under a live worker that keeps minting segments into the same directory.
 //
 // The window is opened here the way a producer mid-rotation opens it: appendMu
+// TestQwpSfEngineRetryOwnerDrivesACloseThatNeverStarted pins the recovery from
+// a close that faulted ahead of the engine teardown -- a panic in the drain
+// wait or the send-loop shutdown, recovered by the pool's closeSlotGuarded. The
+// manager teardown never ran, so there is no ownerless terminal cleanup for a
+// claim to take over; without re-driving the close the retry owner would spin
+// at 1 Hz forever and the slot flock would never be released.
+func TestQwpSfEngineRetryOwnerDrivesACloseThatNeverStarted(t *testing.T) {
+	dir := t.TempDir()
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = e.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+
+	// Nothing has entered engineClose, which is exactly the post-panic state.
+	require.False(t, e.managerTornDown.Load())
+	require.False(t, e.engineTryClaimTerminalCleanup(),
+		"cleanup is not ownerless yet -- the manager teardown has not run")
+
+	require.NoError(t, e.engineRetryCloseIfNeeded())
+	require.True(t, e.engineCloseCompleted(),
+		"the retry has to drive the whole close, not wait for a claim that can never come")
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err, "the slot flock must be released")
+	require.NoError(t, lock.close())
+}
+
+// TestQwpSfManagerCloseWithoutStartIsQuiescent pins that a manager whose worker
+// was never launched reports quiescence at once. Waiting on m.done would burn
+// the whole close grace and then hand cleanup to a goroutine that will never
+// run it, leaving the engine with a deferred owner that never completes.
+func TestQwpSfManagerCloseWithoutStartIsQuiescent(t *testing.T) {
+	m, err := qwpSfNewSegmentManager(4096, time.Second, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	start := time.Now()
+	require.True(t, m.segmentManagerClose())
+	require.Less(t, time.Since(start), qwpSfManagerCloseGrace.load(),
+		"close must not wait on a worker that was never started")
+	require.False(t, m.deferOwnedCleanupUntilWorkerExit(func() {}),
+		"there is no worker exit to defer to")
+}
+
 // is held while the first Close runs.
 func TestQwpSfEngineCloseRetryWaitsForManagerTeardown(t *testing.T) {
 	dir := t.TempDir()

@@ -131,15 +131,17 @@ const qwpSfDurableStallFactor = 4
 // watchdog so a small reconnect_max_duration_millis (set to fail the blocking
 // initial connect fast) cannot also shrink the watchdog and quarantine a
 // healthy-but-slow adopted slot. Durable mode scales it by qwpSfDurableStallFactor.
-// A var, not a const, only so tests can lower it to keep the watchdog fast.
-var qwpSfMinNoProgressBudget = 30 * time.Second
+// Swappable only so tests can lower it to keep the watchdog fast; drainer
+// goroutines no test can join read it.
+var qwpSfMinNoProgressBudget = qwpSfSwappable(30 * time.Second)
 
 // qwpSfDrainerPoolCloseGrace bounds how long the pool's close()
 // waits for active drainers to exit cleanly before cancelling the
 // pool's master ctx to forcibly unwind blocking dials. Mirrors the
-// Java 3-second grace. var (not const) so package tests can dial
-// it down without paying the full 3 s.
-var qwpSfDrainerPoolCloseGrace = 3 * time.Second
+// Java 3-second grace. Swappable so package tests can dial it down
+// without paying the full 3 s; drainer goroutines no test can join
+// read it.
+var qwpSfDrainerPoolCloseGrace = qwpSfSwappable(3 * time.Second)
 
 // qwpSfDrainerPoolHardCloseGrace bounds how long the pool's close()
 // waits AFTER cancelling the master ctx. Cancellation unwinds
@@ -149,8 +151,8 @@ var qwpSfDrainerPoolCloseGrace = 3 * time.Second
 // of a possibly-huge slot, hung NFS) makes no ctx checks. Such a
 // drainer is abandoned rather than blocking close() on un-cancellable
 // I/O; the slot it holds stays a valid orphan for a future sender to
-// re-adopt. var (not const) so package tests can dial it down.
-var qwpSfDrainerPoolHardCloseGrace = 1 * time.Second
+// re-adopt. Swappable so package tests can dial it down.
+var qwpSfDrainerPoolHardCloseGrace = qwpSfSwappable(1 * time.Second)
 
 // qwpSfOrphanDrainer empties one orphan slot and exits. Owned by
 // qwpSfDrainerPool; one instance per slot.
@@ -255,8 +257,8 @@ func (d *qwpSfOrphanDrainer) noProgressBudget() time.Duration {
 	if budget <= 0 {
 		budget = qwpSfDefaultReconnectMaxDuration
 	}
-	if budget < qwpSfMinNoProgressBudget {
-		budget = qwpSfMinNoProgressBudget
+	if floor := qwpSfMinNoProgressBudget.load(); budget < floor {
+		budget = floor
 	}
 	return budget
 }
@@ -846,7 +848,7 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 		p.wg.Wait()
 		close(doneCh)
 	}()
-	graceTimer := time.NewTimer(qwpSfDrainerPoolCloseGrace)
+	graceTimer := time.NewTimer(qwpSfDrainerPoolCloseGrace.load())
 	defer graceTimer.Stop()
 	select {
 	case <-doneCh:
@@ -857,7 +859,7 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 		// those ctx-aware blocking calls, then wait a bounded second
 		// grace.
 		p.cancel()
-		hardTimer := time.NewTimer(qwpSfDrainerPoolHardCloseGrace)
+		hardTimer := time.NewTimer(qwpSfDrainerPoolHardCloseGrace.load())
 		defer hardTimer.Stop()
 		select {
 		case <-doneCh:
@@ -872,7 +874,7 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 			qwpEffectiveLogger(p.logger).Warn("qwp/sf: orphan drainer(s) still running after close; "+
 				"abandoning (wedged in un-cancellable disk I/O). Their slots remain adoptable on a future sender start.",
 				"count", p.activeCount(),
-				"grace", qwpSfDrainerPoolCloseGrace+qwpSfDrainerPoolHardCloseGrace)
+				"grace", qwpSfDrainerPoolCloseGrace.load()+qwpSfDrainerPoolHardCloseGrace.load())
 		}
 	}
 	// Release the master ctx even on the clean-exit path so the

@@ -147,7 +147,7 @@ type qwpSfPolicyResolver struct {
 func (r *qwpSfPolicyResolver) callResolver(c Category) (pol Policy) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			qwpEffectiveLogger(r.logger).Error("qwp/sf: error policy resolver panicked",
+			qwpSfLogGuarded(r.logger, slog.LevelError, "qwp/sf: error policy resolver panicked",
 				"category", c, "panic", rec)
 			pol = qwpSfDefaultPolicyFor(c)
 		}

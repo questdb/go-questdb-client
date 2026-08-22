@@ -31,6 +31,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 )
@@ -920,6 +921,54 @@ func (s *qwpLineSender) calledFromDispatcherGoroutine() bool {
 //     recovery path and must treat the timeout as fatal.
 //   - closeFlushTimeout <= 0: skip the drain entirely (fast close).
 func (s *qwpLineSender) closeCursor(ctx context.Context) error {
+	// Every step ahead of the engine teardown runs behind a panic boundary so
+	// the teardown itself always runs. A fault in the pending-row encode, the
+	// drain wait or the send-loop shutdown would otherwise unwind out of Close
+	// with the engine untouched: no manager teardown, so no terminal cleanup a
+	// later claim could take over, and the drainer pool below never stopped.
+	// The pool's closeSlotGuarded recovers such a panic, which turns a stranded
+	// engine into a slot whose flock nothing ever releases.
+	firstErr := s.closeCursorDrainGuarded(ctx)
+	// Close the engine (closes ring, manager if owned, and slot lock). If the
+	// send loop was abandoned wedged in disk I/O, leak the segment mmaps rather
+	// than unmap them under the still-live goroutine.
+	var engineCloseErr error
+	if s.cursorSendLoop.sendLoopAbandoned() {
+		engineCloseErr = s.cursorEngine.engineCloseLeakSegments()
+	} else {
+		engineCloseErr = s.cursorEngine.engineClose()
+	}
+	if engineCloseErr != nil && firstErr == nil {
+		firstErr = engineCloseErr
+	}
+	if !s.cursorEngine.engineCloseCompleted() {
+		logger := qwpEffectiveLogger(s.cursorEngine.engineLogger())
+		s.ensureCloseRetryOwner(logger)
+		qwpSfLogGuarded(s.cursorEngine.engineLogger(), slog.LevelWarn,
+			"qwp/sf: foreground close incomplete; terminal cleanup retry owner started",
+			"slot", s.cursorEngine.engineSfDir())
+	}
+	// Stop the drainer pool last — drainers may still be using the
+	// reconnect factory (which captures the foreground's address +
+	// auth) and we want their wire shutdowns to overlap with the
+	// engine teardown rather than serialize after it.
+	if s.drainerPool != nil {
+		s.drainerPool.drainerPoolClose()
+	}
+	return firstErr
+}
+
+// closeCursorDrainGuarded encodes the pending rows, waits for the drain and
+// stops the send loop, converting a panic in any of them into the returned
+// error so closeCursor still reaches the engine teardown.
+func (s *qwpLineSender) closeCursorDrainGuarded(ctx context.Context) (firstErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("qwp: close drain panicked: %v\n%s", r, debug.Stack())
+			}
+		}
+	}()
 	// A Close() invoked from inside a user callback (SenderErrorHandler,
 	// SenderConnectionListener, or SenderProgressHandler) runs on that
 	// dispatcher goroutine, not the producer goroutine. Flushing pending
@@ -932,7 +981,6 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	// error on its next call; its un-flushed in-progress rows were never
 	// handed off and remain its own to retry (SF mode replays whatever
 	// was already persisted on the next open).
-	var firstErr error
 	if !s.calledFromDispatcherGoroutine() {
 		// Surface any latched fluent-API error (e.g. validation failure
 		// on Symbol/*Column/Table) so Close() doesn't silently swallow
@@ -986,38 +1034,6 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopClose(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	// Close the engine (closes ring, manager if owned, and slot lock). If the
-	// send loop was abandoned wedged in disk I/O, leak the segment mmaps rather
-	// than unmap them under the still-live goroutine.
-	var engineCloseErr error
-	if s.cursorSendLoop.sendLoopAbandoned() {
-		engineCloseErr = s.cursorEngine.engineCloseLeakSegments()
-	} else {
-		engineCloseErr = s.cursorEngine.engineClose()
-	}
-	if engineCloseErr != nil && firstErr == nil {
-		firstErr = engineCloseErr
-	}
-	if !s.cursorEngine.engineCloseCompleted() {
-		// A hand-built engine in tests can carry no manager, so read the
-		// configured logger only when one is there.
-		var configured *slog.Logger
-		if s.cursorEngine.manager != nil {
-			configured = s.cursorEngine.manager.logger.Load()
-		}
-		logger := qwpEffectiveLogger(configured)
-		s.ensureCloseRetryOwner(logger)
-		logger.Warn(
-			"qwp/sf: foreground close incomplete; terminal cleanup retry owner started",
-			"slot", s.cursorEngine.engineSfDir())
-	}
-	// Stop the drainer pool last — drainers may still be using the
-	// reconnect factory (which captures the foreground's address +
-	// auth) and we want their wire shutdowns to overlap with the
-	// engine teardown rather than serialize after it.
-	if s.drainerPool != nil {
-		s.drainerPool.drainerPoolClose()
-	}
 	return firstErr
 }
 
@@ -1061,6 +1077,12 @@ func qwpSfCloseEngineAfterBuildFailure(engine *qwpSfCursorEngine, cause error, l
 	closeErr := engine.engineClose()
 	if !engine.engineCloseCompleted() {
 		engine.engineStartCloseRetryOwner(logger)
+		// The incomplete branch is exactly where closeErr carries the real
+		// durability or flock-release failure, so it belongs in the reported
+		// cause alongside the build error.
+		if closeErr != nil {
+			cause = errors.Join(cause, closeErr)
+		}
 		return &qwpSfBuildCleanupError{cause: cause, engine: engine}
 	}
 	if closeErr != nil {

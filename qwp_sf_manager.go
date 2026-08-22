@@ -115,6 +115,11 @@ type qwpSfSegmentManager struct {
 	// manager close path.
 	workerGoid atomic.Int64
 
+	// Protected by mu. started means segmentManagerStart launched the worker,
+	// so m.done has a goroutine that will eventually close it. Without the
+	// worker, close must not wait on m.done and no cleanup may be handed to it.
+	started bool
+
 	// Protected by mu. workerLoopExited means the worker is past the ring loop
 	// and can no longer touch any registered ring. An owned engine may hand its
 	// terminal cleanup to the worker's finite exit block after a close timeout.
@@ -279,6 +284,7 @@ func (m *qwpSfSegmentManager) segmentManagerStart() {
 		m.mu.Unlock()
 		panic("qwp/sf: segment manager already closed")
 	}
+	m.started = true
 	m.mu.Unlock()
 	go m.workerLoop()
 }
@@ -289,14 +295,25 @@ func (m *qwpSfSegmentManager) segmentManagerStart() {
 // trims segments — but already-installed spares stay with their
 // rings (the rings close them on their own segmentRingClose).
 //
-// Returns true only when the worker is provably past its ring loop. Idempotent;
-// safe to call from any goroutine other than the worker itself.
+// Returns true only when no worker can still touch the slot: either one was
+// never started, or the one that was is provably past its ring loop.
+// Idempotent; safe to call from any goroutine other than the worker itself.
 func (m *qwpSfSegmentManager) segmentManagerClose() bool {
 	m.mu.Lock()
 	if !m.closed {
 		m.closed = true
 	}
 	if m.workerReaped {
+		m.mu.Unlock()
+		return true
+	}
+	if !m.started {
+		// No worker was ever launched, so m.done stays open forever. Waiting on
+		// it would burn the whole grace and then report a non-quiescent manager,
+		// handing cleanup to a goroutine that will never run it. Nothing can be
+		// mid-service either: quiescence is immediate and provable.
+		m.workerReaped = true
+		m.workerLoopExited = true
 		m.mu.Unlock()
 		return true
 	}
@@ -559,16 +576,20 @@ func (m *qwpSfSegmentManager) runDeferredCleanup(cleanup func(), message string)
 }
 
 // deferOwnedCleanupUntilWorkerExit transfers terminal engine cleanup to the
-// owned manager's exit block. false is an exact proof that the worker is
-// already past its loop, so the caller may clean up inline.
+// owned manager's exit block. true means the worker owns it now. false means
+// nothing was handed off -- the worker is past its loop, was never started, or
+// its one cleanup slot is already taken -- so the caller cleans up inline.
 func (m *qwpSfSegmentManager) deferOwnedCleanupUntilWorkerExit(cleanup func()) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.workerLoopExited || m.workerReaped {
+	if !m.started || m.workerLoopExited || m.workerReaped {
 		return false
 	}
 	if m.ownedEngineExitCleanup != nil {
-		return true
+		// The slot is already taken by another engine's cleanup, so this one
+		// was not handed off. Reporting true here would claim a handoff that
+		// never happened and leave the caller's cleanup with no owner at all.
+		return false
 	}
 	m.ownedEngineExitCleanup = cleanup
 	return true

@@ -451,9 +451,9 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 // is cancelled holds every slot occupied, so a cap-violating drainer
 // (if the semaphore were missing) would show up as a (cap+1)th entry.
 func TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	defer func() { qwpSfDrainerPoolCloseGrace = prevGrace }()
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	defer func() { qwpSfDrainerPoolCloseGrace.store(prevGrace) }()
 
 	const (
 		maxConcurrent = 2
@@ -537,9 +537,9 @@ func TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime(t *testing.T) {
 // master ctx after the polite-stop grace; the dial unwinds; the
 // drainer goroutine exits.
 func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	defer func() { qwpSfDrainerPoolCloseGrace = prevGrace }()
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	defer func() { qwpSfDrainerPoolCloseGrace.store(prevGrace) }()
 
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
@@ -605,13 +605,13 @@ func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
 // the post-cancel hard grace both elapse, close abandons the
 // straggler and returns; the slot stays adoptable.
 func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	prevHard := qwpSfDrainerPoolHardCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	qwpSfDrainerPoolHardCloseGrace = 50 * time.Millisecond
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	prevHard := qwpSfDrainerPoolHardCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	qwpSfDrainerPoolHardCloseGrace.store(50 * time.Millisecond)
 	defer func() {
-		qwpSfDrainerPoolCloseGrace = prevGrace
-		qwpSfDrainerPoolHardCloseGrace = prevHard
+		qwpSfDrainerPoolCloseGrace.store(prevGrace)
+		qwpSfDrainerPoolHardCloseGrace.store(prevHard)
 	}()
 
 	dir := t.TempDir()
@@ -847,8 +847,8 @@ func TestSfConfDrainOrphansEndToEnd(t *testing.T) {
 func TestQwpSfDrainerMarksFailedWhenConnectedButNeverAcked(t *testing.T) {
 	// The 300ms budget below is deliberately sub-floor to keep the watchdog
 	// fast; lower the production floor (30s) for the duration of this test.
-	defer func(orig time.Duration) { qwpSfMinNoProgressBudget = orig }(qwpSfMinNoProgressBudget)
-	qwpSfMinNoProgressBudget = 10 * time.Millisecond
+	defer func(orig time.Duration) { qwpSfMinNoProgressBudget.store(orig) }(qwpSfMinNoProgressBudget.load())
+	qwpSfMinNoProgressBudget.store(10 * time.Millisecond)
 
 	// silentAcks: read frames forever, never ACK, keep the
 	// connection open — exactly the wedged-but-connected scenario.
@@ -1009,7 +1009,7 @@ func TestQwpSfDrainerNoProgressBudgetFloor(t *testing.T) {
 	// fast) must not shrink the live-connection no-progress watchdog below the
 	// floor, or a healthy-but-slow adopted slot could be quarantined early.
 	d := &qwpSfOrphanDrainer{reconnectMaxDuration: time.Millisecond}
-	assert.Equal(t, qwpSfMinNoProgressBudget, d.noProgressBudget(),
+	assert.Equal(t, qwpSfMinNoProgressBudget.load(), d.noProgressBudget(),
 		"a sub-floor reconnectMaxDuration must be raised to the floor")
 
 	// A value above the floor is honored exactly.

@@ -503,8 +503,8 @@ or the process exits; releasing either earlier could let a new owner race files
 whose durable cleanup did not finish. While any slot's cleanup is still
 outstanding, `db.Close(ctx)` returns an error wrapping `qdb.ErrSfCleanupPending`
 and a standalone sender's `Close` returns nil; neither means the slot's lock is
-gone. Call `db.Close(ctx)` again later — it re-probes every time and returns nil
-once the last lock is released.
+gone. Call `db.Close(ctx)` again later — it re-probes every time and stops
+reporting `ErrSfCleanupPending` once the last lock is released.
 
 #### Local errors from the SF path
 
@@ -513,8 +513,8 @@ terminal: the rows stay pending and the same call can be retried.
 
 | Error | Raised by | Meaning |
 |---|---|---|
-| `qdb.ErrBackpressureTimeout` | `At` / `AtNow` / `Flush` | The engine had no room within `sf_append_deadline_millis`. The wire is not draining, or `sf_max_total_bytes` is too small. |
-| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` | Local storage would not commit: a segment rotation that could not write its header or manifest, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
+| `qdb.ErrBackpressureTimeout` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | The engine had no room within `sf_append_deadline_millis`. The wire is not draining, or `sf_max_total_bytes` is too small. |
+| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | Local storage would not commit: a segment rotation that could not write its header or manifest, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
 
 Match them with `errors.Is`.
 
@@ -534,8 +534,14 @@ if qs, ok := sender.(qdb.QwpSender); ok {
 ```
 
 An individual unreadable segment file is preserved the same way, renamed in
-place to `<name>.sfa.corrupt`. A background drainer moves nothing: it writes the
-reason to a `.failed` file inside the slot and leaves the bytes where they are.
+place to `<name>.sfa.corrupt`. A background drainer moves nothing and leaves the
+bytes where they are. When it gives up on the slot itself — auth failure,
+durable-ack settle exhaustion, a wedged no-progress connection, a slot whose
+recovery proved inconsistent — it writes the reason to a `.failed` file inside
+the slot, which disqualifies that slot from every later adoption. A local I/O
+fault while opening the slot (a full disk, an exhausted fd table, a mount that
+went away) says nothing about the slot's bytes, so it leaves no sentinel and the
+next foreground scan adopts the slot again.
 
 Nothing in the client ever reclaims any of this, and none of it counts against
 `sf_max_total_bytes` — it is the only copy of those rows, so deleting it is the
