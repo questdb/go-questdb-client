@@ -168,6 +168,68 @@ func TestQwpSfSenderRotationManifestFailureRetainsRowsForRetry(t *testing.T) {
 	require.Equal(t, 1, ring.sealedSegmentCount())
 }
 
+// TestQwpSfSenderRotationFailureInsideAtRetainsRowsForRetry is the auto-flush
+// counterpart of the Flush case above, and the likelier one in practice: a
+// producer that never calls Flush meets a rotation that cannot commit from
+// inside At/AtNow. The promise that the rows stay pending rests on autoFlush
+// skipping resetAfterFlush when the enqueue fails, which nothing else pins.
+func TestQwpSfSenderRotationFailureInsideAtRetainsRowsForRetry(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	const segSize int64 = 4096
+
+	active, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segSize)
+	require.NoError(t, err)
+	manifest, err := qwpSfManifestCreate(dir, 0, 0)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(active, segSize)
+	ring.manifest = manifest
+	defer func() { _ = ring.segmentRingClose() }()
+
+	// Leave too little room for even the smallest encoded QWP row, so the row
+	// below has to rotate.
+	filler := make([]byte, segSize-qwpSfHeaderSize-qwpSfFrameHeaderSize-16)
+	require.Equal(t, int64(0), ring.appendOrFsn(filler))
+
+	spare, err := qwpSfCreateSegment(filepath.Join(dir, "sf-spare.sfa"), ring.nextSeqHint(), segSize)
+	require.NoError(t, err)
+	require.NoError(t, ring.installHotSpare(spare))
+
+	e := &qwpSfCursorEngine{ring: ring, appendDeadline: time.Second}
+	// One row per auto-flush, so AtNow itself carries the enqueue.
+	s, err := newQwpCursorLineSender(1, 0, 0, 0, e, &qwpSfSendLoop{}, time.Second)
+	require.NoError(t, err)
+
+	injected := errors.New("injected manifest fsync failure")
+	syncCalls := 0
+	syncHook := func(f *os.File) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return injected
+		}
+		return f.Sync()
+	}
+	qwpSfManifestSync.Store(&syncHook)
+	t.Cleanup(func() { qwpSfManifestSync.Store(nil) })
+
+	err = s.Table("t").Int64Column("v", 42).AtNow(ctx)
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.ErrorIs(t, err, injected)
+	require.NotErrorIs(t, err, ErrBackpressureTimeout)
+	require.Equal(t, 1, s.pendingRowCount,
+		"a row the auto-flush could not append must stay pending, not be counted as flushed")
+	require.Equal(t, int64(0), ring.segmentRingPublishedFsn())
+	require.Same(t, active, ring.getActiveSegment())
+
+	// The very same row goes through once the disk accepts the commit.
+	fsn, err := s.FlushAndGetSequence(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), fsn)
+	require.Zero(t, s.pendingRowCount)
+	require.Equal(t, int64(1), ring.segmentRingPublishedFsn())
+	require.Same(t, spare, ring.getActiveSegment())
+}
+
 func TestQwpSfEngineSlotLockBlocksDouble(t *testing.T) {
 	dir := t.TempDir()
 	e1, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)

@@ -1175,13 +1175,22 @@ func TestQwpSenderPoolCloseReportsDeferredSlotAndRetryConverges(t *testing.T) {
 
 	close(release)
 	released = true
-	require.Eventually(t, func() bool {
-		p.reprobeRetiredSlots()
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.leakedSlots == 0
-	}, 2*time.Second, time.Millisecond)
-	require.NoError(t, p.close(context.Background()))
+	// Only close() re-probes here. The pool is already closed, so nothing else
+	// is left to notice the cleanup finishing, and a caller waiting for a clean
+	// shutdown would wait forever on a cached answer.
+	var closeErr error
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		closeErr = p.close(context.Background())
+		if closeErr == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	require.NoError(t, closeErr, "a repeat close must observe the slot cleanup finishing")
+	p.mu.Lock()
+	require.Zero(t, p.leakedSlots, "the re-probe must give the slot's capacity back")
+	p.mu.Unlock()
 	lock, err := qwpSfAcquireSlotLock(lockPath)
 	require.NoError(t, err)
 	require.NoError(t, lock.close())

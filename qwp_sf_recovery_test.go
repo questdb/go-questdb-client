@@ -66,6 +66,98 @@ func closeRecoverySegments(t *testing.T, segments ...*qwpSfSegment) {
 	}
 }
 
+// openTornEmptySegment builds a segment holding no frames whose tail carries an
+// attempted-but-failed write, then reopens it so recovery's torn-tail detection
+// has run.
+func openTornEmptySegment(t *testing.T, dir, name string, base int64) *qwpSfSegment {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	seg, err := qwpSfCreateSegment(path, base, 4096)
+	require.NoError(t, err)
+	require.NoError(t, seg.close())
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+20)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	reopened, err := qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	require.Zero(t, reopened.segmentFrameCount())
+	require.NotZero(t, reopened.segmentTornTailBytes())
+	return reopened
+}
+
+func reopenEmptySegment(t *testing.T, dir, name string, base int64) *qwpSfSegment {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	seg, err := qwpSfCreateSegment(path, base, 4096)
+	require.NoError(t, err)
+	require.NoError(t, seg.close())
+	reopened, err := qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	require.Zero(t, reopened.segmentTornTailBytes())
+	return reopened
+}
+
+func TestQwpSfFindActivePrefersCleanSegmentOverTorn(t *testing.T) {
+	const base int64 = 5
+	dir := t.TempDir()
+	torn := openTornEmptySegment(t, dir, "sf-torn.sfa", base)
+	clean := reopenEmptySegment(t, dir, "sf-clean.sfa", base)
+	defer closeRecoverySegments(t, torn, clean)
+
+	// A clean empty segment at the committed base can be appended to as it
+	// stands, while a torn one first has to be quarantined and replaced. Which
+	// of the two the directory listing happened to return first must not decide
+	// it.
+	assert.Same(t, clean, qwpSfFindActive([]*qwpSfSegment{torn, clean}, base))
+	assert.Same(t, clean, qwpSfFindActive([]*qwpSfSegment{clean, torn}, base))
+
+	// A torn one is still adopted when it is the only candidate: recovery then
+	// preserves its bytes and puts a replacement at the same base.
+	assert.Same(t, torn, qwpSfFindActive([]*qwpSfSegment{torn}, base))
+
+	// A segment that actually holds frames outranks both.
+	withFrames := createRecoverySegment(t, dir, "sf-frames.sfa", base, "a")
+	defer closeRecoverySegments(t, withFrames)
+	assert.Same(t, withFrames, qwpSfFindActive([]*qwpSfSegment{torn, clean, withFrames}, base))
+
+	assert.Nil(t, qwpSfFindActive([]*qwpSfSegment{torn, clean}, base+1),
+		"a segment at another base is not a candidate")
+}
+
+// TestQwpSfRecoveryRefusesMissingChainBetweenCommittedBoundaries pins that a
+// slot whose committed frames are simply not on disk is refused rather than
+// opened. Coming up regardless would drop those rows silently, which is the one
+// thing the manifest's committed boundaries exist to prevent.
+func TestQwpSfRecoveryRefusesMissingChainBetweenCommittedBoundaries(t *testing.T) {
+	dir := t.TempDir()
+	// The manifest commits a chain from base 0 up to an active at base 5, but
+	// the only file present is the empty active. Everything in between is gone.
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 5)
+	createRecoveryManifest(t, dir, 0, 5, active)
+	closeRecoverySegments(t, active)
+
+	_, _, err := qwpSfRecoverRing(dir, 4096)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	assert.Contains(t, err.Error(), "missing SF chain between committed boundaries")
+}
+
+// TestQwpSfRecoveryRefusesEmptyChainWhileASegmentIsCorrupt covers the same
+// refusal in the case where the boundaries themselves say the slot is empty. A
+// corrupt file could be the missing chain, so the empty state cannot be proved.
+func TestQwpSfRecoveryRefusesEmptyChainWhileASegmentIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 5)
+	createRecoveryManifest(t, dir, 5, 5, active)
+	closeRecoverySegments(t, active)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-bad.sfa"), make([]byte, 4096), 0o644))
+
+	_, _, err := qwpSfRecoverRing(dir, 4096)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	assert.Contains(t, err.Error(), "a corrupt segment prevents proving the empty state")
+}
+
 func TestQwpSfRecoveryFailsClosedWhenManifestNewestIsCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	s0 := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
