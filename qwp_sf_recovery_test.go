@@ -27,9 +27,12 @@ package questdb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -778,4 +781,125 @@ func TestQwpSfEngineQuarantinedSlotPathEmptyWithoutQuarantine(t *testing.T) {
 	require.NotNil(t, engine)
 	defer func() { _ = engine.engineClose() }()
 	assert.Equal(t, "", engine.engineQuarantinedSlotPath())
+}
+
+// snapshotFrameBearingSegments maps the content hash of every readable .sfa
+// file in dir that holds at least one frame to its name.
+func snapshotFrameBearingSegments(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sfa") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		seg, openErr := qwpSfOpenSegment(path)
+		if openErr != nil {
+			continue
+		}
+		frames := seg.segmentFrameCount()
+		require.NoError(t, seg.close())
+		if frames == 0 {
+			continue
+		}
+		raw, err := os.ReadFile(path)
+		require.NoError(t, err)
+		out[fmt.Sprintf("%x", sha256.Sum256(raw))] = entry.Name()
+	}
+	return out
+}
+
+// snapshotAllContents hashes every regular file in dir, whatever its name, so
+// a file that recovery preserved under a different one still counts.
+func snapshotAllContents(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		require.NoError(t, err)
+		out[fmt.Sprintf("%x", sha256.Sum256(raw))] = entry.Name()
+	}
+	return out
+}
+
+// TestQwpSfFailedRecoveryPreservesEveryRequiredFrame pins the invariant this
+// file opens with. Recovery mutates the slot well before it knows it will
+// succeed -- zeroing dead bytes, flagging headers, creating and removing the
+// manifest, removing files it proves stale -- so "we failed closed" is only
+// safe if none of that can reach a frame the boundaries still account for. A
+// fail-closed slot is handed to an operator or to a newer client, and both are
+// reading the bytes that are left.
+//
+// Each case is a slot that fails closed for a different reason. The check is
+// content, not names: preserving a file by renaming it to .corrupt is allowed,
+// losing or rewriting its bytes is not.
+func TestQwpSfFailedRecoveryPreservesEveryRequiredFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, dir string)
+	}{
+		{
+			name: "active-segment-unreadable",
+			build: func(t *testing.T, dir string) {
+				s0 := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+				s1 := createRecoverySegment(t, dir, "sf-0001.sfa", 1, "b")
+				createRecoveryManifest(t, dir, 0, 1, s0, s1)
+				closeRecoverySegments(t, s0, s1)
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-0001.sfa"),
+					bytes.Repeat([]byte{0xab}, 4096), 0o644))
+			},
+		},
+		{
+			name: "frames-beyond-the-committed-active-boundary",
+			build: func(t *testing.T, dir string) {
+				s0 := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+				beyond := createRecoverySegment(t, dir, "sf-0009.sfa", 9, "later")
+				createRecoveryManifest(t, dir, 0, 0, s0, beyond)
+				closeRecoverySegments(t, s0, beyond)
+			},
+		},
+		{
+			name: "legacy-slot-with-a-corrupt-stray",
+			build: func(t *testing.T, dir string) {
+				seg := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+				closeRecoverySegments(t, seg)
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-stray.sfa"),
+					bytes.Repeat([]byte{0xcd}, 4096), 0o644))
+			},
+		},
+		{
+			name: "empty-chain-beside-a-corrupt-file-that-could-hold-frames",
+			build: func(t *testing.T, dir string) {
+				s0 := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+				active := createRecoverySegment(t, dir, "sf-0005.sfa", 5)
+				createRecoveryManifest(t, dir, 5, 5, s0, active)
+				closeRecoverySegments(t, s0, active)
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-bad.sfa"),
+					bytes.Repeat([]byte{0xab}, 4096), 0o644))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.build(t, dir)
+			before := snapshotFrameBearingSegments(t, dir)
+			require.NotEmpty(t, before, "the fixture must contain frames worth preserving")
+
+			_, _, err := qwpSfRecoverRing(dir, 4096)
+			require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+
+			after := snapshotAllContents(t, dir)
+			for hash, name := range before {
+				require.Contains(t, after, hash,
+					"failed recovery lost the bytes of %s, which the committed boundaries still account for", name)
+			}
+		})
+	}
 }

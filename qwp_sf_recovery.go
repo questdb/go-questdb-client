@@ -35,9 +35,14 @@ import (
 	"time"
 )
 
-// Failed recovery never mutates committed chain bytes. The only durable
-// mutations before success are zeroing bytes already proved to be dead by the
-// committed boundaries, or preserve-by-rename quarantine.
+// No recovery path, failed or otherwise, destroys a frame the committed
+// boundaries still require. Recovery does mutate the slot before it knows it
+// will succeed -- it zeroes bytes the boundaries prove dead, flags chain
+// headers as manifest-required, creates or removes the manifest, installs a
+// clean segment where a torn one held no recoverable frame, and removes files
+// proven stale -- but every file that holds a frame the manifest still accounts
+// for is either left exactly as it was or preserved under another name.
+// TestQwpSfFailedRecoveryPreservesEveryRequiredFrame pins that.
 var (
 	//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 	qwpSfErrRecoveryFailClosed = errors.New("qwp/sf: recovery failed closed")
