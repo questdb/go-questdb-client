@@ -1837,15 +1837,21 @@ func TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock(t *testing.T) {
 	// t.TempDir's RemoveAll otherwise races the retry owner, which is still
 	// unmapping and unlinking inside the slot -- on Linux that surfaces as an
 	// unlinkat failure in the cleanup rather than as anything about this test.
+	// The condition runs on testify's polling goroutine, where t.FailNow is
+	// invalid -- it calls runtime.Goexit, the condition never returns, and the
+	// real error is replaced by a timeout. Collect the close error and assert
+	// it back on the test goroutine.
 	slot := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
+	var closeErr error
 	require.Eventually(t, func() bool {
 		lock, lockErr := qwpSfAcquireSlotLock(slot)
 		if lockErr != nil {
 			return false
 		}
-		require.NoError(t, lock.close())
+		closeErr = lock.close()
 		return true
 	}, 10*time.Second, 10*time.Millisecond, "the retired slot's cleanup must finish")
+	require.NoError(t, closeErr)
 }
 
 // TestQwpSenderPoolReprobeSurvivesAFaultingSlot pins that a fault while probing
