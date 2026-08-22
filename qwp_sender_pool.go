@@ -952,6 +952,14 @@ func (p *qwpSenderPool) reclaimFailedBuild(slot *qwpSenderSlot, slotIndex int, b
 func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async bool) (slot *qwpSenderSlot, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			// A panic that left an engine behind carries its cleanup reporter,
+			// so the slot keeps its index reserved and is retired rather than
+			// freed while that engine's retry owner still holds the flock.
+			if bp, ok := r.(qwpSfBuildPanic); ok {
+				slot = &qwpSenderSlot{cleanup: bp.reporter, slotIndex: slotIndex}
+				err = fmt.Errorf("qwp pool: sender build panicked: %v", bp.cause)
+				return
+			}
 			err = fmt.Errorf("qwp pool: sender build panicked: %v", r)
 		}
 	}()

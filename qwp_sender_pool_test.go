@@ -1904,3 +1904,79 @@ type panicOnProbeSlot struct{}
 func (panicOnProbeSlot) closeCompleted() bool               { panic("probe boom") }
 func (panicOnProbeSlot) retryCloseIfNeeded() error          { return nil }
 func (panicOnProbeSlot) ensureCloseRetryOwner(*slog.Logger) {}
+
+// TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved pins that a panic
+// during a pooled build does not put the slot index back into circulation
+// while the engine it left behind still holds that directory's flock. The
+// build guard installs a retry owner, but the pool's recover sees only an
+// error — freeing the index lets a later borrow re-pick it and fail to open a
+// slot this process is still holding, which is the reservation bitmap's whole
+// purpose.
+func TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+
+	// Hold the manager worker so the engine's close cannot complete, then
+	// fault the build after the engine exists.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	boom := func() {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+		}
+		panic("pooled build boom")
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpTestAfterSendLoopBuiltHook.Store(&boom)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpTestAfterSendLoopBuiltHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	_, err = p.borrow(context.Background())
+	require.ErrorContains(t, err, "sender build panicked")
+
+	p.mu.Lock()
+	reserved := p.slotInUse[0]
+	leaked := p.leakedSlots
+	p.mu.Unlock()
+	require.True(t, reserved,
+		"the index must stay reserved while the engine's retry owner holds its flock")
+	require.Equal(t, 1, leaked, "the slot must be retired, not freed")
+
+	close(release)
+	released = true
+	require.Eventually(t, func() bool {
+		p.reprobeRetiredSlots()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.leakedSlots == 0 && !p.slotInUse[0]
+	}, 10*time.Second, 10*time.Millisecond, "the index must come back once cleanup finishes")
+}

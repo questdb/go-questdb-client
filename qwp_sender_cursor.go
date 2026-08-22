@@ -231,8 +231,16 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		if builtLoop != nil {
 			_ = builtLoop.sendLoopClose()
 		}
-		_ = qwpSfCloseEngineAfterBuildFailure(engine,
+		cleanupErr := qwpSfCloseEngineAfterBuildFailure(engine,
 			errors.New("qwp/sf: sender construction did not complete"), conf.logger)
+		// Carry the cleanup reporter out with the panic. The pool's recover
+		// sees only an error and a nil slot otherwise, so it frees the slot
+		// index while this engine's retry owner still holds that directory's
+		// flock -- and a later borrow re-picks the index and fails to open it.
+		var reporter closeLifecycleReporter
+		if errors.As(cleanupErr, &reporter) {
+			panic(qwpSfBuildPanic{cause: recover(), reporter: reporter})
+		}
 	}()
 	if hook := qwpSfTestAfterEngineCreateHook.Load(); hook != nil {
 		if hookErr := (*hook)(); hookErr != nil {
@@ -1156,6 +1164,14 @@ func (s *qwpLineSender) ensureCloseRetryOwner(logger *slog.Logger) {
 	if s != nil && s.cursorEngine != nil {
 		s.cursorEngine.engineStartCloseRetryOwner(logger)
 	}
+}
+
+// qwpSfBuildPanic re-raises a construction panic with the cleanup reporter for
+// the engine it left behind, so the recover that catches it can reserve the
+// slot the engine's retry owner is still working on.
+type qwpSfBuildPanic struct {
+	cause    any
+	reporter closeLifecycleReporter
 }
 
 type qwpSfBuildCleanupError struct {
