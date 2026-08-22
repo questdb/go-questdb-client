@@ -534,3 +534,24 @@ func TestQwpSfDrainerEngineRetriesSanitizedResidue(t *testing.T) {
 	t.Cleanup(func() { _ = engine.engineClose() })
 	assert.Equal(t, int64(1), engine.enginePublishedFsn())
 }
+
+// Terminal cleanup completes when the slot directory has disappeared under the
+// engine. The unlinks and the manifest removal already treat "gone" as done;
+// so must the directory fsync, or the retry owner keeps the flock and (in the
+// pool) the slot's index reservation forever.
+func TestQwpSfEngineDrainedCleanupToleratesMissingSlotDir(t *testing.T) {
+	dir := t.TempDir()
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	fsn, err := e.engineAppendBlocking(context.Background(), []byte("hi"))
+	require.NoError(t, err)
+	e.engineAcknowledge(fsn)
+	// Stop the worker so it cannot drop a fresh hot spare into the directory
+	// while the test is removing it.
+	require.True(t, e.manager.segmentManagerClose())
+
+	require.NoError(t, os.RemoveAll(dir))
+
+	require.NoError(t, e.engineClose())
+	assert.True(t, e.engineCloseCompleted())
+}

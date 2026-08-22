@@ -1122,7 +1122,12 @@ func (e *qwpSfCursorEngine) engineFinishDrainedFileCleanup() error {
 	if !qwpSfManifestRemove(e.sfDir) {
 		return fmt.Errorf("qwp/sf: remove drained manifest in %s", e.sfDir)
 	}
-	if err := qwpSfSyncDir(e.sfDir); err != nil {
+	// A slot directory that is already gone is the end state this cleanup works
+	// toward, and there is no namespace left to make durable — the unlinks and
+	// the manifest removal above treat it the same way. Returning the open
+	// error instead would leave the retry owner failing identically forever,
+	// holding the flock fd and (in the pool) the slot's index reservation.
+	if err := qwpSfSyncDir(e.sfDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	qwpSfAckWatermarkRemoveOrphan(e.sfDir)
