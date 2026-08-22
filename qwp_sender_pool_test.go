@@ -1755,3 +1755,64 @@ func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
 	require.Zero(t, p.pendingLeaseTeardowns,
 		"nor as a teardown close() will wait for")
 }
+
+// TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock pins that a failed
+// build does not silently swallow a slot lock it could not release. The pool
+// being constructed is dropped unreachable on that path, so the error it
+// returns is the caller's only notice that a rebuild on the same sf_dir and
+// sender_id may fail naming this process as the holder.
+func TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+
+	// Hold the manager worker inside spare creation so the prewarmed slot's
+	// close cannot prove quiescence and retains its flock, then fail the build.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	buildErr := errors.New("injected prewarm failure")
+	afterEngineHook := func() error {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			return errors.New("manager did not enter spare creation")
+		}
+		return buildErr
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpSfTestAfterEngineCreateHook.Store(&afterEngineHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfTestAfterEngineCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	_, err := newQwpSenderPool(context.Background(), conf, 1, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, buildErr, "the build failure must survive the join")
+	require.ErrorIs(t, err, ErrSfCleanupPending,
+		"a slot lock the failed build could not release must reach the caller")
+
+	close(release)
+	released = true
+}
