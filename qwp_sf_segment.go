@@ -403,13 +403,30 @@ func (s *qwpSfSegment) markManifestRequired() error {
 	if s == nil || s.memoryBacked {
 		return nil
 	}
+	// The flag is already on disk once it is set, and recovery re-runs this
+	// over the whole chain on every open, not only on the one that migrates a
+	// legacy slot. Re-flushing a header that already carries the flag buys
+	// nothing and costs one fsync per segment: on a 10 GB slot of 4 MB
+	// segments that is ~2560 flushes standing between a restart and the first
+	// row it can send.
+	if s.segmentManifestRequired() {
+		return nil
+	}
 	s.buf[5] |= qwpSfManifestRequiredFlag
 	return s.syncHeader()
 }
 
+// qwpSfTestSegmentSyncHeaderHook counts header flushes, so tests can pin that a
+// restart does not re-flush a chain that already carries the flag. Production
+// leaves it nil.
+var qwpSfTestSegmentSyncHeaderHook atomic.Pointer[func(path string)]
+
 func (s *qwpSfSegment) syncHeader() error {
 	if s == nil || s.memoryBacked {
 		return nil
+	}
+	if hook := qwpSfTestSegmentSyncHeaderHook.Load(); hook != nil {
+		(*hook)(s.path)
 	}
 	if err := qwpSfMsync(s.buf, qwpSfHeaderSize); err != nil {
 		return fmt.Errorf("qwp/sf: msync segment header %s: %w", s.path, err)

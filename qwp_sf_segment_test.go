@@ -30,6 +30,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -258,6 +259,27 @@ func writeTornSegment(t *testing.T, path string, size int64) {
 	binary.LittleEndian.PutUint32(buf[off:off+4], 0xDEADBEEF)
 	binary.LittleEndian.PutUint32(buf[off+4:off+8], 0x1000)
 	require.NoError(t, seg.close())
+}
+
+func TestQwpSfSegmentMarkManifestRequiredSkipsRedundantFlush(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-flag.sfa")
+	seg, err := qwpSfCreateSegment(path, 0, 4096)
+	require.NoError(t, err)
+	defer func() { _ = seg.close() }()
+
+	var flushes atomic.Int64
+	hook := func(string) { flushes.Add(1) }
+	qwpSfTestSegmentSyncHeaderHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestSegmentSyncHeaderHook.Store(nil) })
+
+	require.NoError(t, seg.markManifestRequired())
+	require.True(t, seg.segmentManifestRequired())
+	require.Equal(t, int64(1), flushes.Load(), "setting the flag must reach the disk")
+
+	require.NoError(t, seg.markManifestRequired())
+	require.Equal(t, int64(1), flushes.Load(),
+		"a flag already on disk must not cost a second flush")
 }
 
 func TestQwpSfSegmentSanitizeTornTailReservesBlocksThroughDescriptor(t *testing.T) {

@@ -29,6 +29,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,6 +161,34 @@ func TestQwpSfRecoveryMigratesLegacyAndStampsManifestFlag(t *testing.T) {
 	require.NotNil(t, ring)
 	defer ring.segmentRingClose()
 	assert.Equal(t, int64(0), ring.getActiveSegment().segmentBaseSeq())
+}
+
+// TestQwpSfRecoveryDoesNotReflushMigratedHeaders pins that the manifest-required
+// stamp costs a flush only on the restart that actually migrates the slot.
+// Recovery re-runs it over the whole chain every time, so a slot of thousands
+// of segments would otherwise pay thousands of flushes before it can send its
+// first row — in exactly the situation where a fast restart matters most.
+func TestQwpSfRecoveryDoesNotReflushMigratedHeaders(t *testing.T) {
+	dir := t.TempDir()
+	s0 := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+	s1 := createRecoverySegment(t, dir, "sf-0001.sfa", 1, "b")
+	require.NoError(t, s0.close())
+	require.NoError(t, s1.close())
+
+	// The first recovery migrates the legacy slot and stamps every segment.
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	require.NoError(t, ring.segmentRingClose())
+
+	var flushes atomic.Int64
+	hook := func(string) { flushes.Add(1) }
+	qwpSfTestSegmentSyncHeaderHook.Store(&hook)
+	ring, _, err = qwpSfRecoverRing(dir, 4096)
+	qwpSfTestSegmentSyncHeaderHook.Store(nil)
+	require.NoError(t, err)
+	require.NoError(t, ring.segmentRingClose())
+
+	assert.Zero(t, flushes.Load(), "a chain that already carries the flag must not be re-flushed")
 }
 
 func TestQwpSfRecoverySanitizesSealedResidueThenRetries(t *testing.T) {
