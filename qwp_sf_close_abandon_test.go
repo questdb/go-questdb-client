@@ -30,6 +30,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -648,4 +649,72 @@ func TestQwpSendLoopCloseAbandonSignalsAndReleasesTransport(t *testing.T) {
 	require.Nil(t, loop.transport.Load(), "transport released on abandon")
 
 	loop.wg.Done() // let the internal join goroutine finish
+}
+
+// TestQwpCloseDrainPanicLeaksMappingsAndStopsSendLoop pins the contract that
+// decides between unmapping the segment ring and leaking it. A fault in the
+// drain phase must still stop the send loop, so the I/O goroutine is provably
+// done with the mappings and the WebSocket is released; a fault in the
+// send-loop stop leaves that unproven, so the teardown must leak the mappings
+// rather than unmap them under a goroutine that may still be dereferencing
+// them. Unmapping there faults the host process, which no recover can catch.
+func TestQwpCloseDrainPanicLeaksMappingsAndStopsSendLoop(t *testing.T) {
+	newSender := func(t *testing.T, sfDir string) (*qwpLineSender, func()) {
+		t.Helper()
+		srv := newQwpTestServer(t)
+		conf := strings.Join([]string{
+			"ws::addr=" + strings.TrimPrefix(srv.URL, "http://"),
+			"sf_dir=" + sfDir,
+			"sender_id=drain-panic",
+			"close_flush_timeout_millis=100;",
+		}, ";")
+		ls, err := LineSenderFromConf(context.Background(), conf)
+		require.NoError(t, err)
+		require.NoError(t, ls.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+		return ls.(*qwpLineSender), srv.Close
+	}
+
+	t.Run("drain panic stops the loop and unmaps", func(t *testing.T) {
+		sfDir := t.TempDir()
+		s, stopSrv := newSender(t, sfDir)
+		defer stopSrv()
+
+		boom := func() { panic("drain boom") }
+		qwpTestCloseDrainHook.Store(&boom)
+		t.Cleanup(func() { qwpTestCloseDrainHook.Store(nil) })
+
+		err := s.Close(context.Background())
+		require.ErrorContains(t, err, "close drain panicked")
+
+		// The send loop is stopped, so leaking the mappings is unnecessary.
+		require.False(t, s.cursorSendLoop.running.Load(),
+			"a drain fault must not leave the I/O goroutine running")
+		require.True(t, s.cursorEngine.engineCloseCompleted(),
+			"the teardown must still complete and release the slot lock")
+		lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(sfDir, "drain-panic"))
+		require.NoError(t, lockErr, "the slot flock must be released")
+		require.NoError(t, lock.close())
+	})
+
+	t.Run("send-loop stop panic leaks the mappings", func(t *testing.T) {
+		sfDir := t.TempDir()
+		s, stopSrv := newSender(t, sfDir)
+		defer stopSrv()
+
+		boom := func() { panic("send loop close boom") }
+		qwpTestCloseSendLoopHook.Store(&boom)
+		t.Cleanup(func() { qwpTestCloseSendLoopHook.Store(nil) })
+
+		err := s.Close(context.Background())
+		require.ErrorContains(t, err, "send loop close panicked")
+
+		// The I/O goroutine was never joined, so every segment stays mapped.
+		require.True(t, s.cursorEngine.deferredLeakSegments.Load(),
+			"an unjoined send loop must leave the segment mappings in place")
+		require.True(t, s.cursorEngine.engineCloseCompleted(),
+			"the rest of the teardown still runs and releases the slot lock")
+		lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(sfDir, "drain-panic"))
+		require.NoError(t, lockErr, "the slot flock must be released")
+		require.NoError(t, lock.close())
+	})
 }

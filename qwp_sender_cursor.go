@@ -928,12 +928,24 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	// later claim could take over, and the drainer pool below never stopped.
 	// The pool's closeSlotGuarded recovers such a panic, which turns a stranded
 	// engine into a slot whose flock nothing ever releases.
+	//
+	// The send loop is stopped on its own boundary rather than inside the drain
+	// one, so a fault in the pending-row encode or the drain wait still joins
+	// the I/O goroutine and releases its WebSocket.
 	firstErr := s.closeCursorDrainGuarded(ctx)
-	// Close the engine (closes ring, manager if owned, and slot lock). If the
-	// send loop was abandoned wedged in disk I/O, leak the segment mmaps rather
-	// than unmap them under the still-live goroutine.
+	loopStopped, loopErr := s.closeSendLoopGuarded()
+	if loopErr != nil && firstErr == nil {
+		firstErr = loopErr
+	}
+	// Close the engine (closes ring, manager if owned, and slot lock). The
+	// segment mmaps may only be unmapped once no goroutine can still be
+	// dereferencing them. Two states say otherwise: a send loop abandoned
+	// wedged in disk I/O, and a sendLoopClose that faulted before it could
+	// prove the I/O goroutine joined. Both leak the address space instead,
+	// which is bounded by process exit; unmapping under a live reader faults
+	// the host.
 	var engineCloseErr error
-	if s.cursorSendLoop.sendLoopAbandoned() {
+	if !loopStopped || s.cursorSendLoop.sendLoopAbandoned() {
 		engineCloseErr = s.cursorEngine.engineCloseLeakSegments()
 	} else {
 		engineCloseErr = s.cursorEngine.engineClose()
@@ -958,17 +970,26 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	return firstErr
 }
 
-// closeCursorDrainGuarded encodes the pending rows, waits for the drain and
-// stops the send loop, converting a panic in any of them into the returned
-// error so closeCursor still reaches the engine teardown.
+// closeCursorDrainGuarded encodes the pending rows and waits for the drain,
+// converting a panic in either into the returned error so closeCursor still
+// reaches the send-loop stop and the engine teardown.
 func (s *qwpLineSender) closeCursorDrainGuarded(ctx context.Context) (firstErr error) {
 	defer func() {
 		if r := recover(); r != nil {
+			// Log unconditionally: a latched fluent-API error already occupies
+			// firstErr in the common case, and a fault here would otherwise
+			// leave no record at all.
+			err := fmt.Errorf("qwp: close drain panicked: %v\n%s", r, debug.Stack())
+			qwpSfLogGuarded(s.cursorEngine.engineLogger(), slog.LevelError,
+				"qwp: close drain panicked", "error", err)
 			if firstErr == nil {
-				firstErr = fmt.Errorf("qwp: close drain panicked: %v\n%s", r, debug.Stack())
+				firstErr = err
 			}
 		}
 	}()
+	if hook := qwpTestCloseDrainHook.Load(); hook != nil {
+		(*hook)()
+	}
 	// A Close() invoked from inside a user callback (SenderErrorHandler,
 	// SenderConnectionListener, or SenderProgressHandler) runs on that
 	// dispatcher goroutine, not the producer goroutine. Flushing pending
@@ -1030,12 +1051,37 @@ func (s *qwpLineSender) closeCursorDrainGuarded(ctx context.Context) (firstErr e
 			firstErr = err
 		}
 	}
-	// Stop the send loop (closes its current transport).
-	if err := s.cursorSendLoop.sendLoopClose(); err != nil && firstErr == nil {
-		firstErr = err
-	}
 	return firstErr
 }
+
+// qwpTestCloseDrainHook fires at the top of the guarded drain phase. Test seam
+// only: it lets a test fault that phase and assert the teardown below it still
+// runs. Nil in production.
+var qwpTestCloseDrainHook atomic.Pointer[func()]
+
+// closeSendLoopGuarded stops the send loop and reports whether the I/O
+// goroutine is provably done with the segment mappings. A panic here leaves
+// that unproven, so it reports false and the engine teardown leaks the
+// mappings rather than unmapping them under a possibly live reader.
+func (s *qwpLineSender) closeSendLoopGuarded() (stopped bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stopped = false
+			err = fmt.Errorf("qwp: send loop close panicked: %v\n%s", r, debug.Stack())
+			qwpSfLogGuarded(s.cursorEngine.engineLogger(), slog.LevelError,
+				"qwp: send loop close panicked", "error", err)
+		}
+	}()
+	if hook := qwpTestCloseSendLoopHook.Load(); hook != nil {
+		(*hook)()
+	}
+	return true, s.cursorSendLoop.sendLoopClose()
+}
+
+// qwpTestCloseSendLoopHook fires just before the send-loop stop. Test seam
+// only: it reaches the state where the I/O goroutine is not provably joined.
+// Nil in production.
+var qwpTestCloseSendLoopHook atomic.Pointer[func()]
 
 // closeCompleted lets the facade pool distinguish a completed delegate close
 // from a safe deferred close that still retains its SF slot flock.
