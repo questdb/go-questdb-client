@@ -812,31 +812,32 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		return
 	}
 	if !memoryMode {
-		// Every exit below joins spareErr in. A pass that could not mint a
-		// spare AND could not trim is the case an operator most needs to read
-		// correctly: the trim failure is what they see, but the provisioning
-		// failure is what stopped rotation.
+		// Every exit below joins both carried errors in. A pass that could not
+		// mint a spare, or could not finish an earlier trim, AND then fails
+		// here is the case an operator most needs to read correctly: the
+		// failure they see is this one, but the reason rotation stopped is the
+		// carried one.
 		if err := e.watermark.sync(); err != nil {
-			m.recordServiceError(e, errors.Join(spareErr, err))
+			m.recordServiceError(e, errors.Join(spareErr, deferredErr, err))
 			return
 		}
 		if err := qwpSfSyncSlotDir(e.dir); err != nil {
-			m.recordServiceError(e, errors.Join(spareErr, fmt.Errorf("pre-trim directory fsync: %w", err)))
+			m.recordServiceError(e, errors.Join(spareErr, deferredErr, fmt.Errorf("pre-trim directory fsync: %w", err)))
 			return
 		}
 		newHead := e.ring.headAfterTrim(len(trim))
 		active := e.ring.getActiveSegment()
 		if active == nil {
-			m.recordServiceError(e, errors.Join(spareErr, errors.New("ring has no active segment during trim")))
+			m.recordServiceError(e, errors.Join(spareErr, deferredErr, errors.New("ring has no active segment during trim")))
 			return
 		}
 		manifest := e.ring.ringManifest()
 		if manifest == nil {
-			m.recordServiceError(e, errors.Join(spareErr, errors.New("disk ring has no SF manifest during trim")))
+			m.recordServiceError(e, errors.Join(spareErr, deferredErr, errors.New("disk ring has no SF manifest during trim")))
 			return
 		}
 		if err := manifest.update(newHead, active.segmentBaseSeq()); err != nil {
-			m.recordServiceError(e, errors.Join(spareErr, err))
+			m.recordServiceError(e, errors.Join(spareErr, deferredErr, err))
 			return
 		}
 	}
