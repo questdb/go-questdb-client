@@ -266,6 +266,17 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 			// than silent corruption.
 			return qwpSfPayloadTooLarge
 		}
+		// The rotation's two durability barriers -- this header fsync and the
+		// manifest fsync below -- run in this order, on the producer's flush,
+		// and cannot be overlapped. The header carries the base sequence the
+		// manifest is about to commit as the active one, so a power loss that
+		// lands the manifest record without the header leaves the slot with no
+		// segment at its committed active base, which recovery refuses: the
+		// whole slot is quarantined over a lost write. The reverse gap costs
+		// nothing -- the manifest still names the previous active, and the new
+		// empty segment is discarded as a stray. Together they are what
+		// BenchmarkQwpSfRotationBarriers measures, and what puts rotation at
+		// the tail of BenchmarkQwpSfPublish's latency distribution.
 		if syncErr := spare.syncHeader(); syncErr != nil {
 			r.rotationErr.Store(&qwpSfRingError{err: syncErr})
 			return qwpSfRotationFailed

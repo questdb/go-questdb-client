@@ -26,6 +26,8 @@ package questdb
 
 import (
 	"context"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 )
@@ -543,4 +545,124 @@ func BenchmarkQwpGorillaDecode(b *testing.B) {
 			}
 		})
 	}
+}
+
+// BenchmarkQwpSfPublish measures the disk side of a store-and-forward flush:
+// the engine append that copies a frame into the mapped active segment, and,
+// on the flush that fills a segment, the rotation that follows it. Segment and
+// payload sizes are production-shaped, so rotations land at their natural rate
+// -- roughly one flush in a few thousand at the default 4 MiB segment.
+//
+// Every frame is acknowledged immediately so the segment manager keeps trimming
+// and the benchmark stays inside its byte cap however long it runs.
+//
+// The mean hides what matters here: a rotation costs three orders of magnitude
+// more than a plain append, so it moves the tail and barely moves the average.
+// At the default 4 MiB segment and 512-byte frames a rotation falls on about
+// one append in eight thousand, which is why the reported tail is p99.9 --
+// along with max, which also catches an append that had to wait for the manager
+// to install the next spare.
+func BenchmarkQwpSfPublish(b *testing.B) {
+	const (
+		segmentBytes int64 = 4 << 20
+		totalBytes   int64 = 64 << 20
+		payloadBytes       = 512
+	)
+	ctx := context.Background()
+	e, err := qwpSfNewCursorEngine(b.TempDir(), segmentBytes, totalBytes, 5*time.Second)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = e.engineClose() }()
+
+	payload := make([]byte, payloadBytes)
+	// Warmup: reach a steady state where the manager is keeping a hot spare
+	// installed, so the measured loop pays for rotations rather than for the
+	// first spare's provisioning.
+	for i := 0; i < 64; i++ {
+		fsn, err := e.engineAppendBlocking(ctx, payload)
+		if err != nil {
+			b.Fatal(err)
+		}
+		e.engineAcknowledge(fsn)
+	}
+
+	latencies := make([]time.Duration, b.N)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		fsn, err := e.engineAppendBlocking(ctx, payload)
+		latencies[i] = time.Since(start)
+		if err != nil {
+			b.Fatal(err)
+		}
+		e.engineAcknowledge(fsn)
+	}
+	b.StopTimer()
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		p999 := latencies[(len(latencies)*999)/1000]
+		b.ReportMetric(float64(p999.Nanoseconds()), "p99.9-ns/op")
+		b.ReportMetric(float64(latencies[len(latencies)-1].Nanoseconds()), "max-ns/op")
+	}
+}
+
+// BenchmarkQwpSfRotationBarriers isolates what a rotation adds to the flush it
+// lands on: two fsyncs, on two different files, that the producer waits through
+// while holding the engine's append mutex.
+//
+// They run in this order and cannot be overlapped. The promoted spare's header
+// carries the base sequence the manifest is about to commit as the active one,
+// so a crash that lands the manifest record without the header leaves the slot
+// with no segment at its committed active base — which recovery refuses,
+// costing the whole slot. The reverse gap is harmless: the manifest still names
+// the previous active, and the new empty segment is discarded as a stray.
+//
+// The sub-benchmarks measure each barrier alone and then the pair as a producer
+// pays for it.
+func BenchmarkQwpSfRotationBarriers(b *testing.B) {
+	dir := b.TempDir()
+	seg, err := qwpSfCreateSegment(filepath.Join(dir, "sf-bench.sfa"), 0, 1<<20)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = seg.close() }()
+	manifest, err := qwpSfManifestCreate(dir, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = manifest.close() }()
+
+	// The manifest skips the write and the fsync when neither boundary moved,
+	// so every measured update has to name a new active base.
+	active := int64(0)
+	nextActive := func() int64 {
+		active++
+		return active
+	}
+
+	b.Run("header", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if err := seg.syncHeader(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("manifest", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if err := manifest.update(0, nextActive()); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("both", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if err := seg.syncHeader(); err != nil {
+				b.Fatal(err)
+			}
+			if err := manifest.update(0, nextActive()); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
