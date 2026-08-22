@@ -117,6 +117,84 @@ func TestQwpSfRingRotatesIntoHotSpare(t *testing.T) {
 	assert.True(t, r.needsHotSpare())
 }
 
+func TestQwpSfRingHeadAfterTrim(t *testing.T) {
+	const segSize int64 = 64
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	r := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = r.segmentRingClose() }()
+
+	payload := make([]byte, 16)
+	// Two rotations leave two sealed segments behind a fresh active one.
+	for len(r.getSealedSegments()) < 2 {
+		if r.needsHotSpare() {
+			spare, err := qwpSfCreateInMemorySegment(0, segSize)
+			require.NoError(t, err)
+			require.NoError(t, r.installHotSpare(spare))
+		}
+		require.GreaterOrEqual(t, r.appendOrFsn(payload), int64(0))
+	}
+	sealed := r.getSealedSegments()
+	active := r.getActiveSegment()
+
+	// Trimming a prefix of the sealed list puts the head at the first
+	// segment left standing; trimming all of it puts the head at the active
+	// segment, which the batch never contains.
+	assert.Equal(t, sealed[0].segmentBaseSeq(), r.headAfterTrim(0))
+	assert.Equal(t, sealed[1].segmentBaseSeq(), r.headAfterTrim(1))
+	assert.Equal(t, active.segmentBaseSeq(), r.headAfterTrim(2))
+	assert.NotEqual(t, sealed[1].segmentBaseSeq(), r.headAfterTrim(2))
+}
+
+// A trim batch covering the whole sealed list reads its new head off the
+// active segment, so rotation must never leave the outgoing segment sitting
+// in both places at once: committing its base as the manifest head and then
+// unlinking the file leaves the manifest naming a segment that is gone.
+func TestQwpSfRingRotationKeepsActiveOutOfSealedList(t *testing.T) {
+	const segSize int64 = 64
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	r := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = r.segmentRingClose() }()
+
+	payload := make([]byte, 16)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20000; i++ {
+			if r.needsHotSpare() {
+				spare, spareErr := qwpSfCreateInMemorySegment(0, segSize)
+				if spareErr != nil {
+					return
+				}
+				if r.installHotSpare(spare) != nil {
+					return
+				}
+			}
+			r.appendOrFsn(payload)
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		r.mu.Lock()
+		active := r.active.Load()
+		sealedHoldsActive := false
+		for _, s := range r.sealedSegments {
+			if s == active {
+				sealedHoldsActive = true
+				break
+			}
+		}
+		r.mu.Unlock()
+		require.False(t, sealedHoldsActive, "the active segment is inside a trimmable batch")
+	}
+}
+
 func TestQwpSfRingManifestSyncDoesNotBlockSendLookup(t *testing.T) {
 	dir := t.TempDir()
 	const segSize int64 = 4096

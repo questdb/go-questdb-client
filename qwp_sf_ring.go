@@ -302,12 +302,20 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 		}
 
 		// Publish the sealed-list mutation atomically to its readers after
-		// the durable topology update succeeds.
+		// the durable topology update succeeds. Promoting the spare belongs
+		// in the same locked section: while the old segment sits in the
+		// sealed list and is still what r.active points at, a trim that takes
+		// the whole sealed list reads headAfterTrim's fallback and gets the
+		// base of a segment inside its own batch. It commits that base as the
+		// manifest head -- the monotonic clamp permits it, since the base
+		// moves forward -- and then unlinks the file, leaving the manifest
+		// naming a head segment that no longer exists, which recovery refuses
+		// with "missing expected SF head segment".
 		r.mu.Lock()
 		r.sealedSegments = append(r.sealedSegments, active)
+		r.active.Store(spare)
 		r.mu.Unlock()
 		r.rotationErr.Store(nil)
-		r.active.Store(spare)
 		r.hotSpare.Store(nil)
 		// The freshly promoted active has no spare behind it yet, so
 		// re-arm its one-shot backup wakeup: a later high-water-mark
