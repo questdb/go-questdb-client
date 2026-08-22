@@ -1230,20 +1230,21 @@ func TestErrorApiResilience_RetriableStreakThenTerminal(t *testing.T) {
 func TestQwpReconnectSurvivesPanickingDebugHandler(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
-	conf := strings.Join([]string{
-		"ws::addr=127.0.0.1:1", // nothing listens; every round is exhausted
-		"sf_dir=" + tmp,
-		"sender_id=panic-debug",
-		"initial_connect_retry=async",
-		"reconnect_max_backoff_millis=10",
-		"close_flush_timeout_millis=50;",
-	}, ";")
-	ls, err := LineSenderFromConf(ctx, conf)
+	// The handler goes in at construction: the send loop reads its logger from
+	// its own goroutine, so assigning it afterwards would be a data race.
+	ls, err := NewLineSender(ctx,
+		WithQwp(),
+		WithAddress("127.0.0.1:1"), // nothing listens; every round is exhausted
+		WithSfDir(tmp),
+		WithSenderId("panic-debug"),
+		WithInitialConnectMode(InitialConnectAsync),
+		WithCloseFlushTimeout(50*time.Millisecond),
+		WithLogger(slog.New(panicOnHandleSlog{})),
+	)
 	require.NoError(t, err)
 	defer ls.Close(ctx)
 
 	s := ls.(*qwpLineSender)
-	s.cursorSendLoop.logger = slog.New(panicOnHandleSlog{})
 
 	// Rows keep buffering into the engine while the wire is down.
 	for i := 0; i < 3; i++ {
