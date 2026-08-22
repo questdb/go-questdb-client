@@ -626,6 +626,72 @@ func TestQwpSfRecoveryKeepsTornActiveWhenReplacementCannotBeCreated(t *testing.T
 	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
 }
 
+// TestQwpSfRecoveryKeepsTornActiveWhenInstallRenameFails covers the last exit
+// from the swap. Once the torn file has been set aside, a failed install leaves
+// the committed active base empty unless the function puts something back --
+// and neither .corrupt nor .replacing ends in .sfa, so no later directory scan
+// would ever find those bytes again. The slot would be refused, quarantined or
+// marked failed, over a rename.
+//
+// Both preservation strategies are exercised: the hard link, where path is
+// never vacated at all, and the rename fallback for filesystems without links,
+// which has to roll its rename back.
+func TestQwpSfRecoveryKeepsTornActiveWhenInstallRenameFails(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		linkFails bool
+	}{
+		{name: "hard-link"},
+		{name: "rename-fallback", linkFails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const baseSeq int64 = 7
+			dir := t.TempDir()
+			active := createRecoverySegment(t, dir, "sf-active.sfa", baseSeq)
+			createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
+			closeRecoverySegments(t, active)
+			path := filepath.Join(dir, "sf-active.sfa")
+			f, err := os.OpenFile(path, os.O_WRONLY, 0)
+			require.NoError(t, err)
+			_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+20)
+			require.NoError(t, err)
+			require.NoError(t, f.Sync())
+			require.NoError(t, f.Close())
+
+			originalRename := qwpSfTornActiveRename.load()
+			qwpSfTornActiveRename.store(func(string, string) error { return syscall.EIO })
+			originalLink := qwpSfTornActiveLink.load()
+			if tc.linkFails {
+				qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
+			}
+			_, _, err = qwpSfRecoverRing(dir, 4096)
+			qwpSfTornActiveRename.store(originalRename)
+			qwpSfTornActiveLink.store(originalLink)
+			require.ErrorIs(t, err, syscall.EIO)
+
+			torn, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, byte(1), torn[qwpSfHeaderSize+20],
+				"the committed active base must still hold the torn segment")
+			_, err = os.Stat(path + ".corrupt")
+			require.True(t, os.IsNotExist(err), "a failed swap leaves no half-filed evidence")
+			_, err = os.Stat(path + qwpSfTornActiveTempSuffix)
+			require.True(t, os.IsNotExist(err), "the unused replacement must not be left behind")
+
+			// The next recovery simply tries again.
+			ring, _, err := qwpSfRecoverRing(dir, 4096)
+			require.NoError(t, err)
+			require.NotNil(t, ring)
+			defer ring.segmentRingClose()
+			require.Equal(t, baseSeq, ring.getActiveSegment().segmentBaseSeq())
+			require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
+			corrupt, err := os.ReadFile(path + ".corrupt")
+			require.NoError(t, err)
+			require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
+		})
+	}
+}
+
 func TestQwpSfQuarantinePathPreservesEarlierEvidence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sf-active.sfa")

@@ -474,20 +474,32 @@ func qwpSfQuarantinePaths(paths []string) {
 // reused by the next attempt.
 const qwpSfTornActiveTempSuffix = ".replacing"
 
+// Filesystem seams for the torn-active swap. Production always holds os.Link
+// and os.Rename; tests replace one to reach a failure exit that no real
+// filesystem can be talked into on demand.
+var (
+	qwpSfTornActiveLink   = qwpSfSwappable(os.Link)
+	qwpSfTornActiveRename = qwpSfSwappable(os.Rename)
+)
+
 // qwpSfReplaceTornActive preserves the bytes of a torn active segment under the
 // established .corrupt name and puts a clean, empty segment at the same
 // manifest-committed base in its place. Returns the segment now at path.
 //
-// The replacement is built at a temporary path and only then swapped in.
-// Quarantining first would mean a failure to create the replacement leaves
-// nothing at the active segment's path, and the next startup refuses a slot
-// whose committed active segment is missing. The obvious way to fail there is a
-// full disk, which is also the obvious reason the slot is being recovered in
-// the first place — so a disk that fills up and empties again would cost the
-// whole slot, permanently, with no path back. Building first keeps the torn
-// file in place under its own name through every failure before the swap, so
-// the next recovery simply tries again. What remains is a crash between the two
-// renames, which needs no free space and cannot be retried into existence.
+// Every failure exit leaves a segment file at path, because the next startup
+// refuses a slot whose committed active segment is missing and neither
+// .corrupt nor .replacing ends in .sfa for a directory scan to find. Two steps
+// arrange that. The replacement is built at a temporary path and only swapped
+// in once it exists, so a full disk -- the obvious way to fail here, and the
+// obvious reason the slot is being recovered at all -- leaves the torn file
+// under its own name and the next recovery simply tries again. And the
+// preserved copy is made by hard-linking the torn file aside, so the install
+// rename replaces path's directory entry over a name that is occupied
+// throughout, and a crash between the two steps costs at most a stray link.
+//
+// Where hard links are unavailable the fallback renames the torn file aside
+// and rolls that rename back if the install fails, which leaves the same end
+// states with a crash window between the renames.
 func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qwpSfSegment, error) {
 	tmp := path + qwpSfTornActiveTempSuffix
 	replacement, err := qwpSfCreateSegment(tmp, baseSeq, maxBytesPerSegment)
@@ -501,32 +513,58 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("qwp/sf: build replacement for torn active %s: %w", path, err)
 	}
-	if _, err := qwpSfQuarantinePath(path); err != nil {
+	preserved, err := qwpSfQuarantineTargetPath(path)
+	if err != nil {
 		_ = os.Remove(tmp)
 		return nil, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	linked := true
+	if err := qwpSfTornActiveLink.load()(path, preserved); err != nil {
+		linked = false
+		if err := os.Rename(path, preserved); err != nil {
+			_ = os.Remove(tmp)
+			return nil, fmt.Errorf("qwp/sf: quarantine segment %s: %w", path, err)
+		}
+	}
+	if err := qwpSfTornActiveRename.load()(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		if linked {
+			_ = os.Remove(preserved)
+		} else if rollbackErr := os.Rename(preserved, path); rollbackErr != nil {
+			return nil, fmt.Errorf(
+				"qwp/sf: install replacement for torn active %s: %w (the torn segment is preserved at %s and no file is left at the committed active base)",
+				path, err, preserved)
+		}
 		return nil, fmt.Errorf("qwp/sf: install replacement for torn active %s: %w", path, err)
 	}
 	return qwpSfOpenSegment(path)
 }
 
 func qwpSfQuarantinePath(path string) (string, error) {
+	target, err := qwpSfQuarantineTargetPath(path)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(path, target); err != nil {
+		return "", fmt.Errorf("qwp/sf: quarantine segment %s: %w", path, err)
+	}
+	return target, nil
+}
+
+// qwpSfQuarantineTargetPath picks a free .corrupt name for path, probing for a
+// numbered suffix so an earlier quarantine's evidence is never overwritten.
+func qwpSfQuarantineTargetPath(path string) (string, error) {
 	target := path + ".corrupt"
 	for suffix := 1; ; suffix++ {
 		_, err := os.Stat(target)
 		if errors.Is(err, os.ErrNotExist) {
-			break
+			return target, nil
 		}
 		if err != nil {
 			return "", fmt.Errorf("qwp/sf: inspect segment quarantine target %s: %w", target, err)
 		}
 		target = fmt.Sprintf("%s.corrupt-%d", path, suffix)
 	}
-	if err := os.Rename(path, target); err != nil {
-		return "", fmt.Errorf("qwp/sf: quarantine segment %s: %w", path, err)
-	}
-	return target, nil
 }
 
 func qwpSfQuarantineSlot(slotDir string) (string, error) {
