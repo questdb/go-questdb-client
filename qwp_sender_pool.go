@@ -957,7 +957,7 @@ func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async b
 			// freed while that engine's retry owner still holds the flock.
 			if bp, ok := r.(qwpSfBuildPanic); ok {
 				slot = &qwpSenderSlot{cleanup: bp.reporter, slotIndex: slotIndex}
-				err = fmt.Errorf("qwp pool: sender build panicked: %v", bp.cause)
+				err = fmt.Errorf("qwp pool: sender build panicked: %v\n%s", bp.cause, bp.stack)
 				return
 			}
 			err = fmt.Errorf("qwp pool: sender build panicked: %v", r)

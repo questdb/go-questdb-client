@@ -228,6 +228,11 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		if r == nil {
 			return
 		}
+		// Capture the stack here: the guard always re-panics, and Go prints
+		// the stack of the re-panic, so the frames where the fault actually
+		// happened are otherwise gone. For a standalone sender that traceback
+		// is the only diagnostic the caller gets.
+		stack := debug.Stack()
 		var reporter closeLifecycleReporter
 		if builtSender != nil {
 			_ = builtSender.closeCursor(context.Background())
@@ -254,9 +259,9 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		// re-picks the index and fails to open it. Memory mode has no slot and
 		// no lock, so the panic goes out unwrapped.
 		if reporter != nil && engine.engineSfDir() != "" {
-			panic(qwpSfBuildPanic{cause: r, reporter: reporter})
+			panic(qwpSfBuildPanic{cause: r, stack: stack, reporter: reporter})
 		}
-		panic(r)
+		panic(fmt.Errorf("qwp: sender construction panicked: %v\n%s", r, stack))
 	}()
 	if hook := qwpSfTestAfterEngineCreateHook.Load(); hook != nil {
 		if hookErr := (*hook)(); hookErr != nil {
@@ -1204,7 +1209,15 @@ func (s *qwpLineSender) ensureCloseRetryOwner(logger *slog.Logger) {
 // slot the engine's retry owner is still working on.
 type qwpSfBuildPanic struct {
 	cause    any
+	stack    []byte
 	reporter closeLifecycleReporter
+}
+
+// String renders the original cause and the stack where it happened, so the
+// runtime prints something readable if this reaches a caller that does not
+// unwrap it.
+func (p qwpSfBuildPanic) String() string {
+	return fmt.Sprintf("qwp: sender construction panicked: %v\n%s", p.cause, p.stack)
 }
 
 type qwpSfBuildCleanupError struct {
