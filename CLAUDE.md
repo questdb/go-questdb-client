@@ -144,6 +144,11 @@ capability-gap exhaustion, poison-frame escalation, and drainer slot-recovery
 failure — are enumerated and enforced by the review-pr skill checklist. The only
 producer-visible error from a running drain path is SF-out-of-space backpressure.
 
+Drainer quarantine is reserved for a slot proved inconsistent
+(`qwpSfErrRecoveryFailClosed`). A local I/O fault while opening a slot — a full
+disk, an exhausted fd table, a vanished mount — leaves no `.failed` sentinel,
+so the next foreground scan adopts the slot again.
+
 **A table block is self-describing** — the inline column definitions are its
 authoritative schema. On egress, the decoder parses the schema from the first
 `RESULT_BATCH` of a query and reuses it for that query's continuation batches,

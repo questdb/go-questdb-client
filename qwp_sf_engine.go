@@ -249,12 +249,23 @@ func qwpSfNewCursorEngineForDrainer(sfDir string, segmentSizeBytes, maxTotalByte
 func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, recoverForeground bool) (*qwpSfCursorEngine, error) {
 	for attempt := 0; ; attempt++ {
 		e, err := qwpSfNewCursorEngineOnce(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline)
-		if err == nil || sfDir == "" || !recoverForeground {
+		if err == nil || sfDir == "" {
 			return e, err
 		}
+		// The residue retry is the second half of a recovery step that already
+		// completed: the sanitization is on disk and the same bytes recover on
+		// the very next pass. Every caller takes it, drainers included —
+		// otherwise one slot recovers under a foreground sender and the same
+		// slot is abandoned under a drainer.
 		if errors.Is(err, qwpSfErrSanitizedResidue) && attempt == 0 {
 			qwpEffectiveLogger(nil).Error("qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
 			continue
+		}
+		// Quarantine-and-start-fresh is a foreground-only policy: a drainer
+		// exists to deliver the slot's rows, so it reports the failure and
+		// leaves the bytes where they are.
+		if !recoverForeground {
+			return nil, err
 		}
 		if errors.Is(err, qwpSfErrRecoveryFailClosed) && attempt <= 1 {
 			quarantined, quarantineErr := qwpSfQuarantineSlot(sfDir)

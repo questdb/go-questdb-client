@@ -29,6 +29,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1009,4 +1010,44 @@ func TestQwpSfDrainerNoProgressBudgetFloor(t *testing.T) {
 	d = &qwpSfOrphanDrainer{}
 	assert.Equal(t, qwpSfDefaultReconnectMaxDuration, d.noProgressBudget(),
 		"an unset reconnectMaxDuration falls back to the default")
+}
+
+// The .failed sentinel is permanent — nothing in the client removes it — so a
+// local I/O fault must not earn one. The slot keeps its data and stays
+// eligible for the next foreground scan; only a recovery that proves the slot
+// inconsistent quarantines it.
+func TestQwpSfDrainerLocalIOErrorLeavesSlotEligible(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based permission denial is not portable to Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits; cannot induce EACCES")
+	}
+	slot := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(slot, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+	segments, err := filepath.Glob(filepath.Join(slot, "*.sfa"))
+	require.NoError(t, err)
+	require.NotEmpty(t, segments)
+	for _, path := range segments {
+		require.NoError(t, os.Chmod(path, 0o000))
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	}
+
+	d := qwpSfNewOrphanDrainer(slot, segSize, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+	d.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, d.drainerOutcome())
+	assert.Contains(t, d.drainerLastError(), "permission denied")
+	_, statErr := os.Stat(filepath.Join(slot, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr),
+		"a transient local fault must not disqualify the slot forever")
+	assert.True(t, qwpSfIsCandidateOrphan(slot),
+		"the slot must still be adopted by the next scan")
 }

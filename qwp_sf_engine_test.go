@@ -515,3 +515,22 @@ func TestQwpSfCursorEngineConstructorPanicReleasesSlotLock(t *testing.T) {
 		"slot flock must be released after a constructor panic")
 	require.NoError(t, lock.close())
 }
+
+// A drainer's recovery takes the sanitized-residue retry too. The
+// sanitization is already durable when the error is raised, so the same bytes
+// recover on the very next pass — a slot that a foreground sender recovers
+// must not be abandoned just because a drainer reached it first.
+func TestQwpSfDrainerEngineRetriesSanitizedResidue(t *testing.T) {
+	dir := t.TempDir()
+	s0 := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+	s1 := createRecoverySegment(t, dir, "sf-0001.sfa", 1, "b")
+	createRecoveryManifest(t, dir, 0, 1, s0, s1)
+	off := s0.publishedOffset()
+	s0.buf[off+20] = 0x7f // all-zero bad header with non-zero payload farther on
+	closeRecoverySegments(t, s0, s1)
+
+	engine, err := qwpSfNewCursorEngineForDrainer(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = engine.engineClose() })
+	assert.Equal(t, int64(1), engine.enginePublishedFsn())
+}

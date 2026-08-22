@@ -403,10 +403,22 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			d.outcome.Store(int32(qwpSfDrainOutcomeLockedByOther))
 			return
 		}
-		// Recovery / disk error — surface as failure with sentinel.
+		// Recovery / disk error. The .failed sentinel is permanent — nothing in
+		// the client ever removes it — so it is reserved for a slot recovery
+		// proved inconsistent, where every future adoption would fail the same
+		// way. A local I/O fault (a full disk, an exhausted fd table, a mount
+		// that went away) says nothing about the bytes: the slot keeps its data
+		// and its eligibility, and the next foreground scan adopts it again
+		// once the fault clears.
 		msg := err.Error()
 		d.lastErrorMessage.Store(&msg)
-		qwpSfMarkSlotFailed(d.slotPath, "engine open: "+msg)
+		if errors.Is(err, qwpSfErrRecoveryFailClosed) {
+			qwpSfMarkSlotFailed(d.slotPath, "engine open: "+msg)
+		} else {
+			qwpEffectiveLogger(d.logger).Error(
+				"qwp/sf: orphan drainer could not open the slot; leaving it eligible for a later scan",
+				"slot", d.slotPath, "error", err)
+		}
 		d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
 		return
 	}
