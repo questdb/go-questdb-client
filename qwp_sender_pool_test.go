@@ -1832,6 +1832,20 @@ func TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock(t *testing.T) {
 
 	close(release)
 	released = true
+
+	// Wait for the deferred cleanup to finish before the test returns.
+	// t.TempDir's RemoveAll otherwise races the retry owner, which is still
+	// unmapping and unlinking inside the slot -- on Linux that surfaces as an
+	// unlinkat failure in the cleanup rather than as anything about this test.
+	slot := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
+	require.Eventually(t, func() bool {
+		lock, lockErr := qwpSfAcquireSlotLock(slot)
+		if lockErr != nil {
+			return false
+		}
+		require.NoError(t, lock.close())
+		return true
+	}, 10*time.Second, 10*time.Millisecond, "the retired slot's cleanup must finish")
 }
 
 // TestQwpSenderPoolReprobeSurvivesAFaultingSlot pins that a fault while probing
