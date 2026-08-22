@@ -97,6 +97,34 @@ type qwpSenderPool struct {
 	// counts these as outstanding so it does not return while a delegate is
 	// still being torn down on another goroutine. Guarded by mu.
 	pendingLeaseTeardowns int
+
+	// closeTeardownErr is the first close() pass's teardown error, kept so a
+	// repeat close() — which only re-probes the retired slots — reports it
+	// again instead of silently downgrading a real failure to nil. Guarded by
+	// mu, written once.
+	closeTeardownErr error
+}
+
+// ErrSfCleanupPending is the sentinel a store-and-forward pool close wraps when
+// every teardown step ran but one or more slots have not finished releasing
+// their slot lock. It is not a failure: the engine's terminal-cleanup retry
+// owner keeps retrying with no deadline, so calling Close again re-probes and
+// returns nil once the last lock is gone. Match it with errors.Is to tell this
+// apart from a teardown that genuinely failed, and retry rather than give up.
+var ErrSfCleanupPending = errors.New("qwp pool: SF slot cleanup still pending; slot locks retained")
+
+// qwpPoolCloseResult combines the teardown error with the current
+// retained-lock count. Shared by close()'s first pass and its idempotent
+// re-probe so both report the same shape.
+func qwpPoolCloseResult(teardownErr error, pending int) error {
+	if pending == 0 {
+		return teardownErr
+	}
+	pendingErr := fmt.Errorf("%w (%d slot(s))", ErrSfCleanupPending, pending)
+	if teardownErr != nil {
+		return errors.Join(teardownErr, pendingErr)
+	}
+	return pendingErr
 }
 
 // qwpPoolMaxCloseLeaseWait hard-caps close()'s outstanding-lease wait. The
@@ -719,7 +747,11 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 // A BorrowSender whose slot build is still in flight is likewise closed by the
 // creating goroutine after it observes p.closed. Any close that cannot yet prove
 // manager quiescence is retained in retiredSlots with a terminal retry owner;
-// close reports that pending flock instead of claiming complete shutdown.
+// close reports that pending flock instead of claiming complete shutdown, as an
+// error wrapping ErrSfCleanupPending. Calling close again re-probes those slots
+// and returns nil once the last lock is gone, so a caller gating shutdown on a
+// clean close has a way to reach one; a teardown error from the first pass is
+// remembered and reported by every later call as well.
 //
 // Slots close concurrently on context.Background(): each drain is bounded by
 // close_flush_timeout, so the caller's ctx must neither serialize the drains
@@ -729,15 +761,13 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 func (p *qwpSenderPool) close(_ context.Context) error {
 	p.mu.Lock()
 	if p.closed {
+		teardownErr := p.closeTeardownErr
 		p.mu.Unlock()
 		p.reprobeRetiredSlots()
 		p.mu.Lock()
 		pending := p.leakedSlots
 		p.mu.Unlock()
-		if pending > 0 {
-			return fmt.Errorf("qwp pool: %d SF slot cleanup(s) still pending; slot locks retained", pending)
-		}
-		return nil
+		return qwpPoolCloseResult(teardownErr, pending)
 	}
 	p.closed = true
 	p.closing.Store(true)
@@ -820,6 +850,7 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	for _, slot := range toClose {
 		p.reclaimSlotLocked(slot, firstErr)
 	}
+	p.closeTeardownErr = firstErr
 	p.mu.Unlock()
 	// A deferred close may have completed between reclaimSlotLocked and this
 	// report. Reprobe once so the first Close does not return a stale
@@ -829,14 +860,7 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	p.mu.Lock()
 	pending := p.leakedSlots
 	p.mu.Unlock()
-	if pending > 0 {
-		pendingErr := fmt.Errorf("qwp pool: %d SF slot cleanup(s) still pending; slot locks retained", pending)
-		if firstErr != nil {
-			return errors.Join(firstErr, pendingErr)
-		}
-		return pendingErr
-	}
-	return firstErr
+	return qwpPoolCloseResult(firstErr, pending)
 }
 
 // createSlot allocates an SF slot index when needed and builds a slot.

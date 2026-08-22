@@ -1164,9 +1164,8 @@ func TestQwpSenderPoolCloseReportsDeferredSlotAndRetryConverges(t *testing.T) {
 	}
 
 	err = p.close(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "slot cleanup(s) still pending") {
-		t.Fatalf("pool close must report retained flock, got %v", err)
-	}
+	require.ErrorIs(t, err, ErrSfCleanupPending,
+		"pool close must report the retained flock under a sentinel a caller can match")
 	lockPath := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
 	_, err = qwpSfAcquireSlotLock(lockPath)
 	if err == nil {

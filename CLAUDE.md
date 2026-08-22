@@ -118,7 +118,10 @@ reservation until storage recovers or the process exits, because releasing
 ownership early could race retained files. Deferred-close pool slots stay
 reserved and count against capacity until re-probed, so
 `housekeeper_interval_ms=0` does not leak capacity, and pool shutdown reports an
-error while any slot cleanup is still pending.
+error wrapping `ErrSfCleanupPending` while any slot cleanup is still pending.
+That report is a "not yet", not a verdict: `QuestDB.Close` re-probes the sender
+pool on every later call and returns nil once the last slot lock is gone, which
+is the only re-check left once the housekeeper has stopped.
 
 **Cursor frames carry a self-sufficient schema** — full inline column
 definitions on every frame — which keeps reconnect/replay/orphan-adoption

@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -66,7 +67,15 @@ type QuestDB struct {
 	queryPool   *qwpQueryPool
 	housekeeper *qwpPoolHousekeeper
 	closeOnce   sync.Once
-	closeErr    error
+
+	// closeMu guards the fields below. Close runs its teardown exactly once
+	// under closeOnce, but a later Close still re-probes the sender pool when
+	// the first pass reported retained slot locks, so the recorded result is
+	// not immutable.
+	closeMu           sync.Mutex
+	closeErr          error
+	closeQueryErr     error
+	closeHousekeepErr error
 }
 
 // QuestDBOption configures the QuestDB facade. An explicit option always wins
@@ -420,6 +429,16 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // sender pool (which owns the flocks/mmaps/I/O goroutines) is closed last and
 // always runs.
 //
+// A store-and-forward sender whose cleanup has not finished by the time the
+// pool tears down keeps its slot lock while a retry owner works in the
+// background. Close reports that as an error wrapping [ErrSfCleanupPending],
+// which is a "not yet", not a failure. Because the housekeeper is already
+// stopped by then, nothing else re-checks those slots — so a Close that
+// returned ErrSfCleanupPending re-probes the sender pool on every later call
+// and returns nil once the last slot lock is gone. A caller gating shutdown on
+// a clean Close should therefore retry it while errors.Is(err,
+// ErrSfCleanupPending) holds, rather than treat the first result as final.
+//
 // Avoid calling Close from inside a pooled SenderErrorHandler or
 // SenderConnectionListener. Pooled callbacks are funnelled through one
 // serializing mutex (see serializeErrorHandler), so a Close that blocks on a
@@ -438,8 +457,23 @@ func (db *QuestDB) Close(ctx context.Context) error {
 		qErr := closeStep(func() error { return db.queryPool.close(ctx) })
 		sErr := closeStep(func() error { return db.senderPool.close(ctx) })
 		// Every step ran; surface the most actionable error.
+		db.closeMu.Lock()
+		db.closeQueryErr, db.closeHousekeepErr = qErr, hErr
 		db.closeErr = firstCloseErr(sErr, qErr, hErr)
+		db.closeMu.Unlock()
 	})
+	db.closeMu.Lock()
+	defer db.closeMu.Unlock()
+	if !errors.Is(db.closeErr, ErrSfCleanupPending) {
+		return db.closeErr
+	}
+	// Retained slot locks are the one Close result that can still change:
+	// qwpSenderPool.close is idempotent and re-probes its retired slots, and it
+	// replays the teardown error from the first pass, so recomputing here
+	// cannot lose a real failure. The query pool and the housekeeper are done
+	// for good, so their errors come from the recorded values.
+	sErr := closeStep(func() error { return db.senderPool.close(ctx) })
+	db.closeErr = firstCloseErr(sErr, db.closeQueryErr, db.closeHousekeepErr)
 	return db.closeErr
 }
 

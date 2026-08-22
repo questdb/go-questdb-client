@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/require"
 )
 
 // newQuestDBTestServer serves both QWP directions from one address like a real
@@ -120,6 +121,76 @@ func TestQuestDBFacadeEndToEnd(t *testing.T) {
 	if err := q.Close(); err != nil {
 		t.Fatalf("query close: %v", err)
 	}
+}
+
+// TestQuestDBCloseReprobesRetainedSlotLocks pins that a Close reporting
+// retained store-and-forward slot locks is a "not yet", not a verdict. The
+// housekeeper is already stopped by then, so Close itself is the only thing
+// left that can re-check those slots; a caller gating shutdown on a clean
+// Close would otherwise wait forever on a cached error.
+func TestQuestDBCloseReprobesRetainedSlotLocks(t *testing.T) {
+	ctx := context.Background()
+	gotData := make(chan struct{}, 1)
+	srv := newQuestDBTestServer(t, gotData)
+	defer srv.Close()
+
+	sfDir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	// Park the manager worker inside spare-segment creation so it cannot go
+	// quiet, which is what makes the engine hand its cleanup off and keep the
+	// slot lock past Close.
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace
+	qwpSfManagerCloseGrace = 20 * time.Millisecond
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace = oldGrace
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	db, err := NewQuestDB(ctx, conf, WithSenderPoolMin(1), WithSenderPoolMax(1))
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager never entered spare-segment creation")
+	}
+
+	require.ErrorIs(t, db.Close(ctx), ErrSfCleanupPending)
+	require.ErrorIs(t, db.Close(ctx), ErrSfCleanupPending,
+		"the lock is still held, so a repeat Close must keep saying so")
+
+	releaseOnce.Do(func() { close(release) })
+	var closeErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		closeErr = db.Close(ctx)
+		if closeErr == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	require.NoError(t, closeErr, "Close never observed the slot cleanup finishing")
+
+	// A nil Close now really does mean the lock is gone.
+	lock, err := qwpSfAcquireSlotLock(filepath.Join(sfDir, qwpSfDefaultSenderId+"-0"))
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
 }
 
 // TestQuestDBBorrowSenderExposesQwpSender pins the Java-parity contract that a
