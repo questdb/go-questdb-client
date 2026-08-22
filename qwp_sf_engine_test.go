@@ -1013,9 +1013,13 @@ func TestQwpSfTerminalCleanupHasExactlyOneOwner(t *testing.T) {
 // The two exceptions are the dispatchers' own handler-panic reports, which
 // already carry an inner recover of their own.
 func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
-	allowed := map[string]bool{
-		"qwp_dispatcher.go":    true, // deliver()'s handler-panic report
-		"qwp_sf_dispatcher.go": true, // ditto
+	// The two exceptions are the dispatchers' own handler-panic reports, which
+	// already carry an inner recover. They are named by line rather than by
+	// file: a whole-file exemption hid an unguarded default error handler in
+	// one of them for a full round.
+	allowed := map[string]string{
+		"qwp_dispatcher.go":    "handler panicked",
+		"qwp_sf_dispatcher.go": "error handler panicked",
 	}
 	levelMethods := map[string]bool{
 		"Warn": true, "Error": true, "Info": true, "Debug": true, "Log": true,
@@ -1024,8 +1028,8 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go") && !allowed[fi.Name()]
-	}, 0)
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, parser.ParseComments)
 	require.NoError(t, err)
 
 	var unguarded []string
@@ -1083,10 +1087,17 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 				case *ast.SelectorExpr:
 					reaches = reaches || isLoggerName(recv.Sel.Name)
 				}
-				if reaches {
-					unguarded = append(unguarded,
-						fmt.Sprintf("%s:%d", filepath.Base(name), fset.Position(call.Pos()).Line))
+				if !reaches {
+					return true
 				}
+				// The exempt call is identified by the message it logs, so the
+				// rest of its file stays checked.
+				if msg, ok := allowed[filepath.Base(name)]; ok && len(call.Args) > 0 &&
+					containsStringLiteral(call.Args[0], msg) {
+					return true
+				}
+				unguarded = append(unguarded,
+					fmt.Sprintf("%s:%d", filepath.Base(name), fset.Position(call.Pos()).Line))
 				return true
 			})
 		}
@@ -1094,6 +1105,19 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 	require.NotEmpty(t, pkgs, "the scan must actually parse the package")
 	require.Empty(t, unguarded,
 		"these log calls reach the user's slog handler unguarded; route them through qwpSfLogGuarded")
+}
+
+// containsStringLiteral reports whether expr contains a string literal with the
+// given substring, looking through concatenation so a prefixed message counts.
+func containsStringLiteral(expr ast.Expr, want string) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.BasicLit); ok && strings.Contains(lit.Value, want) {
+			found = true
+		}
+		return true
+	})
+	return found
 }
 
 // isLoggerName reports whether an identifier is spelled like a *slog.Logger.

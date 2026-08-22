@@ -468,16 +468,19 @@ func (d *qwpSfErrorDispatcher) totalDelivered() int64 {
 // rejection must never vanish just because no handler was registered. The
 // caller's logger controls the sink; nil resolves to slog.Default().
 func newDefaultSenderErrorHandler(logger *slog.Logger) SenderErrorHandler {
-	l := qwpEffectiveLogger(logger)
 	return func(e *SenderError) {
 		if e == nil {
 			return
 		}
+		// Guarded like every other production log call. The dispatcher that
+		// delivers this already recovers a panicking handler, so this is
+		// defense in depth -- but the rule holds for every site, which is what
+		// makes it mechanically checkable.
+		level := slog.LevelWarn
 		if e.AppliedPolicy == PolicyTerminal {
-			l.Error("qwp/sf: server rejection", "error", e)
-		} else {
-			l.Warn("qwp/sf: server rejection", "error", e)
+			level = slog.LevelError
 		}
+		qwpSfLogGuarded(logger, level, "qwp/sf: server rejection", "error", e)
 	}
 }
 
