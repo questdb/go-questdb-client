@@ -212,7 +212,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		}
 		// A frame-zero tear leaves no recoverable frame in the active segment,
 		// but the bytes remain useful forensic evidence. Preserve them under the
-		// established .corrupt name and create a clean active at the same
+		// established .corrupt name and put a clean active at the same
 		// manifest-committed base instead of zeroing the only copy in place.
 		replacedTornActive := false
 		if activeSeg.segmentFrameCount() == 0 && activeSeg.segmentTornTailBytes() > 0 {
@@ -221,12 +221,9 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			if err := torn.close(); err != nil {
 				return nil, nil, err
 			}
-			if _, err := qwpSfQuarantinePath(path); err != nil {
-				return nil, nil, err
-			}
-			replacement, err := qwpSfCreateSegment(path, active, maxBytesPerSegment)
+			replacement, err := qwpSfReplaceTornActive(path, active, maxBytesPerSegment)
 			if err != nil {
-				return nil, nil, fmt.Errorf("qwp/sf: replace quarantined torn active %s: %w", path, err)
+				return nil, nil, err
 			}
 			for i, seg := range all {
 				if seg == torn {
@@ -419,6 +416,50 @@ func qwpSfQuarantinePaths(paths []string) {
 			qwpEffectiveLogger(nil).Warn("qwp/sf: could not quarantine corrupt segment", "path", path, "error", err)
 		}
 	}
+}
+
+// qwpSfTornActiveTempSuffix names the half-built replacement for a torn active
+// segment. It deliberately does not end in .sfa, so no directory scan —
+// recovery, the segment manager, the orphan sweep — can mistake a partial file
+// for a segment. A leftover from a crash mid-replacement is truncated and
+// reused by the next attempt.
+const qwpSfTornActiveTempSuffix = ".replacing"
+
+// qwpSfReplaceTornActive preserves the bytes of a torn active segment under the
+// established .corrupt name and puts a clean, empty segment at the same
+// manifest-committed base in its place. Returns the segment now at path.
+//
+// The replacement is built at a temporary path and only then swapped in.
+// Quarantining first would mean a failure to create the replacement leaves
+// nothing at the active segment's path, and the next startup refuses a slot
+// whose committed active segment is missing. The obvious way to fail there is a
+// full disk, which is also the obvious reason the slot is being recovered in
+// the first place — so a disk that fills up and empties again would cost the
+// whole slot, permanently, with no path back. Building first keeps the torn
+// file in place under its own name through every failure before the swap, so
+// the next recovery simply tries again. What remains is a crash between the two
+// renames, which needs no free space and cannot be retried into existence.
+func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qwpSfSegment, error) {
+	tmp := path + qwpSfTornActiveTempSuffix
+	replacement, err := qwpSfCreateSegment(tmp, baseSeq, maxBytesPerSegment)
+	if err != nil {
+		return nil, fmt.Errorf("qwp/sf: build replacement for torn active %s: %w", path, err)
+	}
+	// Closed before the swap so the reopen below owns the only mapping, and so
+	// the segment records the path it ends up at rather than the temporary name
+	// every later diagnostic would then report.
+	if err := replacement.close(); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("qwp/sf: build replacement for torn active %s: %w", path, err)
+	}
+	if _, err := qwpSfQuarantinePath(path); err != nil {
+		_ = os.Remove(tmp)
+		return nil, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("qwp/sf: install replacement for torn active %s: %w", path, err)
+	}
+	return qwpSfOpenSegment(path)
 }
 
 func qwpSfQuarantinePath(path string) (string, error) {

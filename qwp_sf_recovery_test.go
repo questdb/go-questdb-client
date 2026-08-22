@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -439,6 +440,53 @@ func TestQwpSfRecoveryQuarantinesTornEmptyActiveBeforeReplacement(t *testing.T) 
 	require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
 	require.Equal(t, baseSeq-1, ring.segmentRingPublishedFsn())
 
+	corrupt, err := os.ReadFile(path + ".corrupt")
+	require.NoError(t, err)
+	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
+}
+
+// TestQwpSfRecoveryKeepsTornActiveWhenReplacementCannotBeCreated pins that a
+// full disk during the replacement costs nothing permanent. Quarantining the
+// torn file first would leave the slot with no segment at its committed active
+// base, which the next startup refuses — so a disk that fills up and empties
+// again would cost the whole slot.
+func TestQwpSfRecoveryKeepsTornActiveWhenReplacementCannotBeCreated(t *testing.T) {
+	const baseSeq int64 = 7
+	dir := t.TempDir()
+	active := createRecoverySegment(t, dir, "sf-active.sfa", baseSeq)
+	createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
+	closeRecoverySegments(t, active)
+	path := filepath.Join(dir, "sf-active.sfa")
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+20)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+
+	originalReserve := qwpSfReserveNewBlocksFn
+	qwpSfReserveNewBlocksFn = func(*os.File, int64, int64) error { return syscall.ENOSPC }
+	_, _, err = qwpSfRecoverRing(dir, 4096)
+	qwpSfReserveNewBlocksFn = originalReserve
+	require.ErrorIs(t, err, syscall.ENOSPC)
+
+	// The torn file is still where the manifest says the active segment is, and
+	// nothing was filed away as evidence yet.
+	torn, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, byte(1), torn[qwpSfHeaderSize+20])
+	_, err = os.Stat(path + ".corrupt")
+	require.True(t, os.IsNotExist(err), "nothing may be quarantined until the replacement exists")
+	_, err = os.Stat(path + qwpSfTornActiveTempSuffix)
+	require.True(t, os.IsNotExist(err), "the half-built replacement must not be left behind")
+
+	// With space back, the same slot recovers.
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	require.NotNil(t, ring)
+	defer ring.segmentRingClose()
+	require.Equal(t, baseSeq, ring.getActiveSegment().segmentBaseSeq())
+	require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
 	corrupt, err := os.ReadFile(path + ".corrupt")
 	require.NoError(t, err)
 	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
