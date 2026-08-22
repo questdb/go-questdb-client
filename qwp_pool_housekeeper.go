@@ -33,7 +33,7 @@ import (
 
 // qwpPoolHousekeeper periodically reaps idle / over-age slots from both pools.
 // One per QuestDB handle. It drives no SF recovery (the Go sender
-// self-recovers; the pool binds recovery senders at construction, §4.4) — it
+// self-recovers; the pool binds recovery senders at construction) — it
 // only reaps. interval 0 disables it: start() spawns nothing and stopAndJoin
 // returns immediately.
 type qwpPoolHousekeeper struct {

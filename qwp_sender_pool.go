@@ -43,13 +43,13 @@ import (
 // for the caller's lifetime; Close returns it. It keeps minSize warm, grows to
 // maxSize on demand, and reaps idle/over-age slots back to minSize.
 //
-// Store-and-forward (sf_dir set) is supported with one twist
-// (design §4.4): each slot gets a distinct sender_id <base>-<index> so
-// concurrent senders never collide on a slot dir (Hazard A), and every pooled
-// sender fences the pool's whole in-range slot set out of orphan adoption so a
-// live sibling is never drained (Hazard G). Crash-stranded in-range slots are
-// recovered by binding a normal async sender to each at construction (the Go
-// sender self-recovers its dir) — no dedicated recoverer, build never blocks.
+// Store-and-forward (sf_dir set) is supported with one twist: each slot
+// gets a distinct sender_id <base>-<index> so concurrent senders never
+// collide on a slot dir (Hazard A), and every pooled sender fences the
+// pool's whole in-range slot set out of orphan adoption so a live sibling is
+// never drained (Hazard G). Crash-stranded in-range slots are recovered by
+// binding a normal async sender to each at construction (the Go sender
+// self-recovers its dir) — no dedicated recoverer, build never blocks.
 //
 // Leases are generation-stamped: a stale handle from a returned-then-reborrowed
 // slot cannot write into or double-return a different borrow (Hazard B).
