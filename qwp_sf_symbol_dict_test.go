@@ -72,6 +72,10 @@ func TestQwpSfSymbolDictAppendSymbolsZeroAllocs(t *testing.T) {
 	dir := t.TempDir()
 	d, err := qwpSfSymbolDictOpen(dir)
 	require.NoError(t, err)
+	// A dictionary that could not be created comes back as (nil, nil), and
+	// every method on it is a nil-safe no-op. Measuring that would report zero
+	// allocations for a run that appended nothing.
+	require.NotNil(t, d)
 	defer func() { _ = d.close() }()
 
 	names := []string{"new-symbol"}
