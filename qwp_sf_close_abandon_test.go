@@ -314,6 +314,60 @@ func TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits(t *testing.T) {
 	require.NoError(t, engine.engineClose())
 }
 
+// A second Close decides whether cleanup is ownerless from two markers:
+// managerTornDown and deferredCleanupOwned. Between them lies the narrowest
+// window in the close path, and a claim taken there releases the slot lock
+// while the manager worker is still writing in the slot directory. The hook
+// below stands in for that second Close, at the exact instant the teardown
+// marker is published.
+func TestQwpEngineCleanupCannotBeClaimedWhileTheWorkerRuns(t *testing.T) {
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	var rivalClaimed atomic.Bool
+	teardownHook := func() { rivalClaimed.Store(engine.engineTryClaimTerminalCleanup()) }
+	qwpSfTestAfterManagerTeardownHook.Store(&teardownHook)
+	t.Cleanup(func() { qwpSfTestAfterManagerTeardownHook.Store(nil) })
+
+	require.NoError(t, engine.engineClose())
+	require.False(t, rivalClaimed.Load(),
+		"cleanup must never look ownerless while the manager worker is still running")
+	require.False(t, engine.engineCloseCompleted())
+
+	close(release)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, time.Millisecond)
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
 func TestQwpEngineDeferredCleanupPanicTransfersToRetryOwner(t *testing.T) {
 	dir := t.TempDir()
 	entered := make(chan struct{})

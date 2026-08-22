@@ -101,6 +101,11 @@ var ErrSfDurability = errors.New("qwp/sf: could not durably commit store-and-for
 // after quiescence while a concurrent Close arrives. Production leaves it nil.
 var qwpSfTestBeforeSegmentUnlinkHook atomic.Pointer[func(path string)]
 
+// qwpSfTestAfterManagerTeardownHook fires immediately after a close publishes
+// managerTornDown, which is where a rival claimant lands in the narrowest
+// window a second Close can hit. Test seam only.
+var qwpSfTestAfterManagerTeardownHook atomic.Pointer[func()]
+
 // qwpSfTestEngineFinishCloseHook counts terminal-cleanup entry independently
 // of how many segment files that cleanup unlinks. Production leaves it nil.
 var qwpSfTestEngineFinishCloseHook atomic.Pointer[func()]
@@ -1070,6 +1075,15 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	} else {
 		quiescent = e.manager.awaitRingQuiescence(entry)
 	}
+	// A worker that did not go quiescent leaves cleanup to the handoff below,
+	// so ownership is published before the teardown marker. A claimant decides
+	// on exactly these two markers, and the other order leaves a window where
+	// cleanup looks both safe and unowned while the manager worker is still
+	// writing in the slot directory: a second Close landing there would take
+	// the claim and release the slot lock underneath it.
+	if !quiescent {
+		e.deferredCleanupOwned.Store(true)
+	}
 	// The manager teardown is now behind us and its outcome is recorded, so
 	// terminal cleanup is safe for whoever ends up owning it. This marker, not
 	// closed, is what a claimant needs: closed is published in this function's
@@ -1077,9 +1091,11 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	// deregistered, and a claim taken inside that window would release the slot
 	// lock while the manager worker still writes to the slot directory.
 	e.managerTornDown.Store(true)
+	if hook := qwpSfTestAfterManagerTeardownHook.Load(); hook != nil {
+		(*hook)()
+	}
 	if !quiescent {
 		var handedOff bool
-		e.deferredCleanupOwned.Store(true)
 		if e.ownsManager {
 			handedOff = e.manager.deferOwnedCleanupUntilWorkerExit(e.deferredClose)
 		} else {
