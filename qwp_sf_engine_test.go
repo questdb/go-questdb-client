@@ -1005,18 +1005,26 @@ func TestQwpSfTerminalCleanupHasExactlyOneOwner(t *testing.T) {
 // one that matters -- latching a fatal error, reporting on a channel, releasing
 // a transport, or assigning a fallback policy.
 //
-// The check parses the package rather than matching text: a regex over lines
-// misses a call whose logger argument contains a nested call, one split across
-// lines, and one hoisted into a local -- all three of which already occur in
-// this codebase, so a one-line refactor would defeat it silently.
+// The check is default-deny: any call to a slog level method that takes at
+// least one argument is a finding unless it is one of the two exemptions
+// below. It deliberately does NOT try to decide whether the receiver is a
+// logger. Four rounds of review widened a receiver matcher one shape at a time
+// -- a nested call argument, a call split over lines, a struct field, a
+// parameter, a var declaration, an atomic Load -- and each round a reviewer
+// found another shape it could not see, ending with plain slog.Warn(...). The
+// set of expressions that can have type *slog.Logger is unbounded and their
+// spelling is unconstrained, so no name-based rule can be sound. Over-flagging
+// is the safe direction: a false positive costs one guarded call, a false
+// negative costs the host process.
 //
-// The two exceptions are the dispatchers' own handler-panic reports, which
-// already carry an inner recover of their own.
+// The zero-argument requirement is what keeps error.Error() out. Every slog
+// level method takes a message; error's does not.
+//
+// The two exemptions are the dispatchers' own handler-panic reports, which
+// already carry an inner recover. They are named by the message they log, so
+// the rest of each file stays checked -- a whole-file exemption hid an
+// unguarded default error handler for a full round.
 func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
-	// The two exceptions are the dispatchers' own handler-panic reports, which
-	// already carry an inner recover. They are named by line rather than by
-	// file: a whole-file exemption hid an unguarded default error handler in
-	// one of them for a full round.
 	allowed := map[string]string{
 		"qwp_dispatcher.go":    "handler panicked",
 		"qwp_sf_dispatcher.go": "error handler panicked",
@@ -1029,89 +1037,46 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
 		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, parser.ParseComments)
+	}, 0)
 	require.NoError(t, err)
+	require.NotEmpty(t, pkgs, "the scan must actually parse the package")
 
-	var unguarded []string
+	var unguarded, considered []string
 	for _, pkg := range pkgs {
 		for name, file := range pkg.Files {
-			// Names bound to a *slog.Logger, so a hoisted local is caught
-			// too. Both an assignment and a var declaration bind one.
-			loggerLocals := map[string]bool{}
-			bind := func(lhs, rhs ast.Expr) {
-				if !callsAny(rhs, "qwpEffectiveLogger", "slog.Default", "slog.New") {
-					return
-				}
-				if id, ok := lhs.(*ast.Ident); ok {
-					loggerLocals[id.Name] = true
-				}
-			}
+			base := filepath.Base(name)
 			ast.Inspect(file, func(n ast.Node) bool {
-				switch d := n.(type) {
-				case *ast.AssignStmt:
-					if len(d.Lhs) == 1 && len(d.Rhs) == 1 {
-						bind(d.Lhs[0], d.Rhs[0])
+				fn, ok := n.(*ast.FuncDecl)
+				if !ok {
+					return true
+				}
+				if fn.Name.Name == "qwpSfLogGuarded" {
+					return false // the helper's own delegation to the handler
+				}
+				ast.Inspect(fn, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
 					}
-				case *ast.ValueSpec:
-					for i := range d.Values {
-						if i < len(d.Names) {
-							bind(d.Names[i], d.Values[i])
-						}
+					sel, ok := call.Fun.(*ast.SelectorExpr)
+					if !ok || !levelMethods[sel.Sel.Name] || len(call.Args) == 0 {
+						return true
 					}
-				}
-				return true
-			})
-			inGuard := false
-			ast.Inspect(file, func(n ast.Node) bool {
-				if fn, ok := n.(*ast.FuncDecl); ok {
-					inGuard = fn.Name.Name == "qwpSfLogGuarded"
+					where := fmt.Sprintf("%s:%d", base, fset.Position(call.Pos()).Line)
+					considered = append(considered, where)
+					if msg, ok := allowed[base]; ok && containsStringLiteral(call.Args[0], msg) {
+						return true
+					}
+					unguarded = append(unguarded, where)
 					return true
-				}
-				call, ok := n.(*ast.CallExpr)
-				if !ok || inGuard {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				// Every slog level method takes at least a message. Requiring
-				// one argument keeps error.Error(), which shares the name and
-				// takes none, from being mistaken for a log call.
-				if !ok || !levelMethods[sel.Sel.Name] || len(call.Args) == 0 {
-					return true
-				}
-				// A level method on a logger this file just produced, on a
-				// name it bound to one, or on anything spelled like a logger.
-				// The last case catches the shape the pool, the send loop and
-				// the manager all use: a *slog.Logger in a struct field,
-				// called as p.logger.Warn(...).
-				reaches := callsAny(sel.X, "qwpEffectiveLogger", "slog.Default")
-				switch recv := sel.X.(type) {
-				case *ast.Ident:
-					reaches = reaches || loggerLocals[recv.Name] || isLoggerName(recv.Name)
-				case *ast.SelectorExpr:
-					reaches = reaches || isLoggerName(recv.Sel.Name)
-				case *ast.CallExpr:
-					// The shape the manager and the engine use: a logger read
-					// out of an atomic or an accessor, m.logger.Load() and
-					// e.engineLogger(). A receiver that is itself a call was
-					// invisible until a reviewer mutated one.
-					reaches = reaches || callExprYieldsLogger(recv)
-				}
-				if !reaches {
-					return true
-				}
-				// The exempt call is identified by the message it logs, so the
-				// rest of its file stays checked.
-				if msg, ok := allowed[filepath.Base(name)]; ok && len(call.Args) > 0 &&
-					containsStringLiteral(call.Args[0], msg) {
-					return true
-				}
-				unguarded = append(unguarded,
-					fmt.Sprintf("%s:%d", filepath.Base(name), fset.Position(call.Pos()).Line))
-				return true
+				})
+				return false
 			})
 		}
 	}
-	require.NotEmpty(t, pkgs, "the scan must actually parse the package")
+	// A positive control: parsing the package is not enough, the matcher has to
+	// have run over real level-method calls.
+	require.NotEmpty(t, considered, "the level-method matcher never fired")
 	require.Empty(t, unguarded,
 		"these log calls reach the user's slog handler unguarded; route them through qwpSfLogGuarded")
 }
@@ -1127,37 +1092,6 @@ func containsStringLiteral(expr ast.Expr, want string) bool {
 		return true
 	})
 	return found
-}
-
-// callExprYieldsLogger reports whether a call expression reads out a logger:
-// either the function is spelled like one, or the value it is called on is.
-func callExprYieldsLogger(call *ast.CallExpr) bool {
-	switch fn := call.Fun.(type) {
-	case *ast.Ident:
-		return isLoggerName(fn.Name)
-	case *ast.SelectorExpr:
-		if isLoggerName(fn.Sel.Name) {
-			return true
-		}
-		if inner, ok := fn.X.(*ast.SelectorExpr); ok {
-			return isLoggerName(inner.Sel.Name)
-		}
-		if inner, ok := fn.X.(*ast.Ident); ok {
-			return isLoggerName(inner.Name)
-		}
-	}
-	return false
-}
-
-// isLoggerName reports whether an identifier is spelled like a *slog.Logger.
-// A type-checked answer would be exact; this is the approximation that costs
-// no build step, and the package spells every logger it holds this way.
-func isLoggerName(name string) bool {
-	lower := strings.ToLower(name)
-	// Deliberately not "l": that is the receiver name for *qwpSfSendLoop and
-	// several other types in this package, so matching it produced false
-	// positives on their own methods.
-	return lower == "lg" || strings.Contains(lower, "logger")
 }
 
 // callsAny reports whether expr is a call to any of the named functions,
