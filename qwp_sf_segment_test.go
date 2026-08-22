@@ -261,6 +261,25 @@ func writeTornSegment(t *testing.T, path string, size int64) {
 	require.NoError(t, seg.close())
 }
 
+// TestQwpSfFsyncReportsFailure pins that the platform fsync helper both works
+// on a healthy file and reports a failure rather than returning nil. The darwin
+// build calls the syscall directly, where an unchecked errno would silently
+// turn every durability barrier in the slot into a no-op.
+func TestQwpSfFsyncReportsFailure(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "fsync")
+	require.NoError(t, err)
+	_, err = f.WriteString("durable")
+	require.NoError(t, err)
+	require.NoError(t, qwpSfFsync(f))
+
+	require.NoError(t, f.Close())
+	err = qwpSfFsync(f)
+	require.Error(t, err, "a closed file must report, not silently succeed")
+	var pathErr *os.PathError
+	require.ErrorAs(t, err, &pathErr, "failures keep os.File.Sync's error shape")
+	require.Equal(t, f.Name(), pathErr.Path)
+}
+
 func TestQwpSfSegmentMarkManifestRequiredSkipsRedundantFlush(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sf-flag.sfa")

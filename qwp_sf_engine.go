@@ -957,8 +957,18 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	// across segmentRingClose so the active segment is nil'd + munmapped
 	// with no producer dereferencing it (a SenderErrorHandler's
 	// Close() racing a producer parked in engineAppendBlocking's
-	// backpressure spin). appendMu is never held by the manager
-	// goroutine, so joining it under the lock cannot deadlock.
+	// backpressure spin).
+	//
+	// The manager goroutine does take appendMu, in
+	// engineCompleteDeferredClose, and the teardown below waits on that
+	// goroutine while holding the lock. The two cannot overlap for one
+	// engine: the deferred completion runs only for an engine whose earlier
+	// close handed cleanup off, and it publishes terminalCleanupClaimed
+	// before it clears deferredCleanupOwned, so a close sampling those
+	// markers above always finds one of them set and returns before reaching
+	// this lock. Every wait on the manager is bounded by the close grace in
+	// any case, so an unforeseen overlap costs a stalled close, not a hung
+	// one.
 	e.appendMu.Lock()
 	defer e.appendMu.Unlock()
 	if e.closeCompleted.Load() || e.deferredCleanupOwned.Load() || e.terminalCleanupClaimed.Load() {

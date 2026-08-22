@@ -50,7 +50,7 @@ var qwpSfAckWatermarkWriteAt = func(f *os.File, p []byte, off int64) (int, error
 }
 
 // qwpSfAckWatermarkSync is a test seam for close/trim durability-barrier
-// failures. A nil pointer means production os.File.Sync. Tests publish hooks
+// failures. A nil pointer means production qwpSfFsync. Tests publish hooks
 // atomically because sync also runs on the live manager worker.
 var qwpSfAckWatermarkSync atomic.Pointer[func(f *os.File) error]
 
@@ -58,7 +58,7 @@ func qwpSfAckWatermarkSyncFile(f *os.File) error {
 	if hook := qwpSfAckWatermarkSync.Load(); hook != nil {
 		return (*hook)(f)
 	}
-	return f.Sync()
+	return qwpSfFsync(f)
 }
 
 // qwpSfAckWatermark uses the Java-compatible dual-slot record. Stores only

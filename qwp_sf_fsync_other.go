@@ -1,5 +1,3 @@
-//go:build !windows
-
 /*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
@@ -24,15 +22,16 @@
  *
  ******************************************************************************/
 
+//go:build !darwin
+
 package questdb
 
 import "os"
 
-func qwpSfSyncDir(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return qwpSfFsync(f)
+// qwpSfFsync flushes f's data and metadata to stable storage. Everywhere but
+// darwin os.File.Sync already is the plain platform primitive — fsync(2) on
+// Linux and the other unixes, FlushFileBuffers on Windows — so it is called
+// directly. See qwp_sf_fsync_darwin.go for why darwin needs its own.
+func qwpSfFsync(f *os.File) error {
+	return f.Sync()
 }

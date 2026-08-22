@@ -431,7 +431,7 @@ func (s *qwpSfSegment) syncHeader() error {
 	if err := qwpSfMsync(s.buf, qwpSfHeaderSize); err != nil {
 		return fmt.Errorf("qwp/sf: msync segment header %s: %w", s.path, err)
 	}
-	if err := s.file.Sync(); err != nil {
+	if err := qwpSfFsync(s.file); err != nil {
 		return fmt.Errorf("qwp/sf: fsync segment header %s: %w", s.path, err)
 	}
 	return nil
@@ -505,7 +505,7 @@ func (s *qwpSfSegment) sanitizeTornTail() error {
 	if err := qwpSfMsync(s.buf, s.sizeBytes); err != nil {
 		return fmt.Errorf("qwp/sf: msync sanitized torn tail %s: %w", s.path, err)
 	}
-	if err := s.file.Sync(); err != nil {
+	if err := qwpSfFsync(s.file); err != nil {
 		return fmt.Errorf("qwp/sf: fsync sanitized torn tail %s: %w", s.path, err)
 	}
 	s.tornTailSanitized = true

@@ -49,7 +49,7 @@ const (
 )
 
 // qwpSfManifestSync is a test seam for manifest durability failures. A nil
-// pointer means production os.File.Sync. Tests publish a temporary hook
+// pointer means production qwpSfFsync. Tests publish a temporary hook
 // atomically because manifest updates also run on the live manager worker.
 var qwpSfManifestSync atomic.Pointer[func(f *os.File) error]
 
@@ -57,7 +57,7 @@ func qwpSfManifestSyncFile(f *os.File) error {
 	if hook := qwpSfManifestSync.Load(); hook != nil {
 		return (*hook)(f)
 	}
-	return f.Sync()
+	return qwpSfFsync(f)
 }
 
 type qwpSfDualRecord struct {
