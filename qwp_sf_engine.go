@@ -106,14 +106,18 @@ var qwpSfTestBeforeSegmentUnlinkHook atomic.Pointer[func(path string)]
 // retires a name in the slot goes through it.
 func qwpSfSyncSlotDir(dir string) error {
 	if hook := qwpSfTestDirSyncHook.Load(); hook != nil {
-		(*hook)(dir)
+		if err := (*hook)(dir); err != nil {
+			return err
+		}
 	}
 	return qwpSfSyncDir(dir)
 }
 
-// qwpSfTestDirSyncHook observes every directory barrier. Test seam only: it
-// lets a test pin which control points make a name durable. Nil in production.
-var qwpSfTestDirSyncHook atomic.Pointer[func(dir string)]
+// qwpSfTestDirSyncHook observes every directory barrier and may fail one. Test
+// seam only: it lets a test pin which control points make a name durable, and
+// inject the storage faults that no real filesystem can be talked into on
+// demand. A nil return falls through to the real barrier. Nil in production.
+var qwpSfTestDirSyncHook atomic.Pointer[func(dir string) error]
 
 // qwpSfTestAfterManagerTeardownHook fires immediately after a close publishes
 // managerTornDown, which is where a rival claimant lands in the narrowest

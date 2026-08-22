@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -442,10 +443,11 @@ func TestQwpSfSpareCreationSyncsSlotDirectory(t *testing.T) {
 	dir := t.TempDir()
 	var mu sync.Mutex
 	synced := map[string]int{}
-	hook := func(d string) {
+	hook := func(d string) error {
 		mu.Lock()
 		synced[d]++
 		mu.Unlock()
+		return nil
 	}
 	qwpSfTestDirSyncHook.Store(&hook)
 	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(nil) })
@@ -514,4 +516,36 @@ func TestQwpSfManagerCloseWithoutStartDoesNotWait(t *testing.T) {
 	require.True(t, mgr.segmentManagerClose())
 	require.Less(t, time.Since(start), time.Second,
 		"a manager with no worker must not wait on a channel nothing will close")
+}
+
+// TestQwpSfSpareProvisioningFailureSurfacesAsDurability pins that a slot
+// directory barrier that will not succeed reaches the producer as what it is.
+// The spare is unlinked and retried every tick, so rotation never resumes and
+// the producer blocks — reporting that as ErrBackpressureTimeout would tell an
+// operator the buffer is full when the real cause is local storage. A later
+// clean trim in the same pass must not clear it either.
+func TestQwpSfSpareProvisioningFailureSurfacesAsDurability(t *testing.T) {
+	dir := t.TempDir()
+	injected := errors.New("injected directory barrier failure")
+	var fail atomic.Bool
+	hook := func(string) error {
+		if fail.Load() {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestDirSyncHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(nil) })
+
+	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = e.engineClose() })
+
+	// Fail every barrier from here on, then drop the spare so the manager has
+	// to mint a replacement and hit it.
+	fail.Store(true)
+	require.Eventually(t, func() bool {
+		return e.managerEntry != nil && e.managerEntry.maintenanceFailures > 0
+	}, 5*time.Second, time.Millisecond,
+		"a failing slot directory barrier must be recorded, not discarded")
 }

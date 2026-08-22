@@ -641,6 +641,10 @@ func (m *qwpSfSegmentManager) managerWorkerError() error {
 // trimmable sealed segments — the common steady-state case.
 func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	memoryMode := e.dir == ""
+	// A spare this pass could not provision. Carried to the end so the trim
+	// still runs -- on a full disk the trim is what frees the space -- and so
+	// the pass cannot report success over it.
+	var spareErr error
 	if e.ring.needsHotSpare() {
 		// Snapshot totalBytes under lock — register/deregister can
 		// mutate it from caller goroutines. Heavy provisioning I/O
@@ -744,6 +748,15 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 					}
 				}
 			} else if path != "" {
+				// The provisioning failure has to reach someone. Silently
+				// unlinking and retrying next tick leaves a slot whose spare
+				// never installs, so rotation stops and the producer is told
+				// the buffer is full -- ErrBackpressureTimeout, "SF out of
+				// space" -- for what is actually a local storage fault. It is
+				// carried to the end of the pass rather than reported here so
+				// the trim below still runs: on a full disk the trim is what
+				// frees the space the spare needs.
+				spareErr = err
 				if spare != nil {
 					_ = spare.close()
 				}
@@ -789,8 +802,8 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	//    no file to unlink.
 	trim := e.ring.peekTrimmable()
 	if len(trim) == 0 {
-		if deferredErr != nil {
-			m.recordServiceError(e, deferredErr)
+		if joined := errors.Join(spareErr, deferredErr); joined != nil {
+			m.recordServiceError(e, joined)
 			return
 		}
 		// Nothing acked is waiting to be reclaimed, so whatever stopped an
@@ -824,7 +837,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		}
 	}
 	trim = e.ring.drainTrimBatch(len(trim))
-	trimErr := deferredErr
+	trimErr := errors.Join(spareErr, deferredErr)
 	trimmedBytes := int64(0)
 	for _, s := range trim {
 		path := s.segmentPath()
