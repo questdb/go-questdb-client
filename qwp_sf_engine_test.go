@@ -28,9 +28,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1003,6 +1005,11 @@ func TestQwpSfTerminalCleanupHasExactlyOneOwner(t *testing.T) {
 // one that matters -- latching a fatal error, reporting on a channel, releasing
 // a transport, or assigning a fallback policy.
 //
+// The check parses the package rather than matching text: a regex over lines
+// misses a call whose logger argument contains a nested call, one split across
+// lines, and one hoisted into a local -- all three of which already occur in
+// this codebase, so a one-line refactor would defeat it silently.
+//
 // The two exceptions are the dispatchers' own handler-panic reports, which
 // already carry an inner recover of their own.
 func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
@@ -1010,30 +1017,93 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 		"qwp_dispatcher.go":    true, // deliver()'s handler-panic report
 		"qwp_sf_dispatcher.go": true, // ditto
 	}
-	files, err := filepath.Glob("*.go")
+	levelMethods := map[string]bool{
+		"Warn": true, "Error": true, "Info": true, "Debug": true, "Log": true,
+		"WarnContext": true, "ErrorContext": true, "InfoContext": true, "DebugContext": true,
+	}
+
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go") && !allowed[fi.Name()]
+	}, 0)
 	require.NoError(t, err)
-	unguarded := map[string][]int{}
-	call := regexp.MustCompile(`qwpEffectiveLogger\([^)]*\)\.(Warn|Error|Info|Debug|Log)\(`)
-	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") || allowed[f] {
-			continue
-		}
-		src, err := os.ReadFile(f)
-		require.NoError(t, err)
-		inGuard := false
-		for i, line := range strings.Split(string(src), "\n") {
-			if strings.HasPrefix(line, "func qwpSfLogGuarded(") {
-				inGuard = true // the helper's own delegation to the handler
-			} else if strings.HasPrefix(line, "}") {
-				inGuard = false
-			}
-			if !inGuard && call.MatchString(line) {
-				unguarded[f] = append(unguarded[f], i+1)
-			}
+
+	var unguarded []string
+	for _, pkg := range pkgs {
+		for name, file := range pkg.Files {
+			// Names bound to a *slog.Logger, so a hoisted local is caught too.
+			loggerLocals := map[string]bool{}
+			ast.Inspect(file, func(n ast.Node) bool {
+				assign, ok := n.(*ast.AssignStmt)
+				if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+					return true
+				}
+				if !callsAny(assign.Rhs[0], "qwpEffectiveLogger", "slog.Default", "slog.New") {
+					return true
+				}
+				if id, ok := assign.Lhs[0].(*ast.Ident); ok {
+					loggerLocals[id.Name] = true
+				}
+				return true
+			})
+			inGuard := false
+			ast.Inspect(file, func(n ast.Node) bool {
+				if fn, ok := n.(*ast.FuncDecl); ok {
+					inGuard = fn.Name.Name == "qwpSfLogGuarded"
+					return true
+				}
+				call, ok := n.(*ast.CallExpr)
+				if !ok || inGuard {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || !levelMethods[sel.Sel.Name] {
+					return true
+				}
+				// A level method on a logger this file just produced, or on a
+				// local it bound to one.
+				reaches := callsAny(sel.X, "qwpEffectiveLogger", "slog.Default")
+				if id, ok := sel.X.(*ast.Ident); ok && loggerLocals[id.Name] {
+					reaches = true
+				}
+				if reaches {
+					unguarded = append(unguarded,
+						fmt.Sprintf("%s:%d", filepath.Base(name), fset.Position(call.Pos()).Line))
+				}
+				return true
+			})
 		}
 	}
 	require.Empty(t, unguarded,
 		"these log calls reach the user's slog handler unguarded; route them through qwpSfLogGuarded")
+}
+
+// callsAny reports whether expr is a call to any of the named functions,
+// looking through the receiver chain so a nested call is still seen.
+func callsAny(expr ast.Expr, names ...string) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		var got string
+		switch fn := call.Fun.(type) {
+		case *ast.Ident:
+			got = fn.Name
+		case *ast.SelectorExpr:
+			if pkg, ok := fn.X.(*ast.Ident); ok {
+				got = pkg.Name + "." + fn.Sel.Name
+			}
+		}
+		for _, want := range names {
+			if got == want {
+				found = true
+			}
+		}
+		return true
+	})
+	return found
 }
 
 // TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine pins the

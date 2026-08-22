@@ -185,16 +185,19 @@ type SenderConnectionListener func(SenderConnectionEvent)
 // so a flapping or unreachable server is never silent. The caller's logger
 // controls the sink; nil resolves to slog.Default().
 func newDefaultSenderConnectionListener(logger *slog.Logger) SenderConnectionListener {
-	l := qwpEffectiveLogger(logger)
 	return func(e SenderConnectionEvent) {
+		// Guarded like every other production log call. The dispatcher that
+		// delivers this already recovers a panicking listener, so this is
+		// defense in depth rather than the only boundary -- but it keeps the
+		// rule uniform, which is what makes it checkable.
+		level := slog.LevelInfo
 		switch e.Kind {
 		case SenderAuthFailed:
-			l.Error("qwp: connection event", "event", e)
+			level = slog.LevelError
 		case SenderDisconnected, SenderEndpointAttemptFailed, SenderAllEndpointsUnreachable:
-			l.Warn("qwp: connection event", "event", e)
-		default:
-			l.Info("qwp: connection event", "event", e)
+			level = slog.LevelWarn
 		}
+		qwpSfLogGuarded(logger, level, "qwp: connection event", "event", e)
 	}
 }
 
