@@ -1126,7 +1126,12 @@ func (s *qwpLineSender) closeSendLoopGuarded() (stopped bool, err error) {
 	if hook := qwpTestCloseSendLoopHook.Load(); hook != nil {
 		(*hook)()
 	}
-	return true, s.cursorSendLoop.sendLoopClose()
+	closeErr := s.cursorSendLoop.sendLoopClose()
+	// sendLoopClose returns normally on its own grace timeout, having only
+	// marked the goroutine abandoned -- so a plain "it returned" is not the
+	// proof this reports. Read the abandon flag, or the answer is right only
+	// because the caller happens to check it as well.
+	return !s.cursorSendLoop.sendLoopAbandoned(), closeErr
 }
 
 // qwpTestCloseSendLoopHook fires just before the send-loop stop. Test seam
