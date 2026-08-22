@@ -291,6 +291,15 @@ func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
 		qwpDrainerListenerCall(nil, nil)                      // nil-safe
 	})
 
+	t.Run("PanickingLoggerContained", func(t *testing.T) {
+		// The handler that reports the caught panic is user code too, so a
+		// panic there must not reach the drainer's goroutine either.
+		logger := slog.New(panicOnHandleSlog{})
+		require.NotPanics(t, func() {
+			qwpDrainerListenerCall(logger, func() { panic("boom") })
+		})
+	})
+
 	t.Run("OnDurableAckUnavailablePanicContained", func(t *testing.T) {
 		d := qwpSfNewOrphanDrainer(
 			t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,

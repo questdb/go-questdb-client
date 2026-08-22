@@ -106,7 +106,11 @@ func qwpDrainerListenerCall(logger *slog.Logger, fn func()) {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			qwpEffectiveLogger(logger).Error("qwp/sf drainer listener callback panicked", "panic", r)
+			// The report goes through the guarded logger too. The user's slog
+			// handler is user code exactly like the callback, and a panic
+			// while reporting the first panic would produce the outcome this
+			// guard exists to prevent.
+			qwpSfLogGuarded(logger, slog.LevelError, "qwp/sf drainer listener callback panicked", "panic", r)
 		}
 	}()
 	fn()
