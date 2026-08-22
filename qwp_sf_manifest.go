@@ -254,15 +254,20 @@ func qwpSfManifestRemove(dir string) bool {
 	return err == nil || errors.Is(err, os.ErrNotExist)
 }
 
+// qwpSfQuarantineCreationDebris sets an unusable manifest aside under a
+// .corrupt name. It runs from qwpSfManifestOpen, before recovery has decided
+// whether the slot as a whole fails closed, so it must not destroy anything: a
+// slot that is about to be preserved whole would otherwise arrive at the
+// quarantine directory already missing the boundary record that explains it.
+// The target name is probed the same way segment quarantine probes it, so an
+// earlier quarantine's evidence survives.
 func qwpSfQuarantineCreationDebris(path string) error {
-	corrupt := path + ".corrupt"
-	_ = os.Remove(corrupt)
-	if err := os.Rename(path, corrupt); err == nil {
-		return nil
+	corrupt, err := qwpSfQuarantineTargetPath(path)
+	if err != nil {
+		return err
 	}
-	if err := os.Remove(path); err == nil || errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else {
-		return fmt.Errorf("qwp/sf: could not quarantine or remove invalid %s: %w", path, err)
+	if err := os.Rename(path, corrupt); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("qwp/sf: could not quarantine invalid %s: %w", path, err)
 	}
+	return nil
 }

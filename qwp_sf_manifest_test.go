@@ -160,3 +160,30 @@ func TestQwpSfManifestQuarantinesCreationDebris(t *testing.T) {
 		})
 	}
 }
+
+// TestQwpSfQuarantineCreationDebrisPreservesEvidence pins that setting an
+// unusable manifest aside never destroys anything. It runs from
+// qwpSfManifestOpen, before recovery has decided whether the slot fails closed,
+// so a slot that is about to be preserved whole must still carry the boundary
+// record that explains it — and an earlier quarantine's copy must survive too.
+func TestQwpSfQuarantineCreationDebrisPreservesEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfManifestFileName)
+	require.NoError(t, os.WriteFile(path, []byte("first evidence"), 0o644))
+	require.NoError(t, qwpSfQuarantineCreationDebris(path))
+
+	first, err := os.ReadFile(path + ".corrupt")
+	require.NoError(t, err)
+	require.Equal(t, "first evidence", string(first))
+
+	// A second pass must not overwrite the first copy.
+	require.NoError(t, os.WriteFile(path, []byte("second evidence"), 0o644))
+	require.NoError(t, qwpSfQuarantineCreationDebris(path))
+
+	first, err = os.ReadFile(path + ".corrupt")
+	require.NoError(t, err)
+	require.Equal(t, "first evidence", string(first), "an earlier quarantine must survive")
+	second, err := os.ReadFile(path + ".corrupt-1")
+	require.NoError(t, err)
+	require.Equal(t, "second evidence", string(second))
+}
