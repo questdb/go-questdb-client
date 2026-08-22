@@ -1370,15 +1370,23 @@ func qwpSfShouldLogCloseRetry(last, now time.Time) bool {
 // the manifest in place.
 //
 // Files go oldest first: sf-initial.sfa (the legacy base-0 segment), then the
-// sf-<generation>.sfa files in generation order. The caller has already
-// committed the manifest at headBase == activeBase == the newest segment's
-// base, and recovery skips every segment below headBase, so the active
-// segment is the one file it still requires. Removing it last leaves every
-// crash point recoverable: either the active segment is still there and the
-// chain starts at headBase, or the directory is empty and the collapsed
-// manifest is removed on its own. The sort needs the explicit sf-initial.sfa
-// case because plain name order would put that oldest file last -- "i" sorts
-// after the hex digits of every rotated name.
+// sf-<generation>.sfa files in generation order. The sort needs the explicit
+// sf-initial.sfa case because plain name order would put that oldest file last
+// -- "i" sorts after the hex digits of every rotated name.
+//
+// The caller has already committed the manifest at headBase == activeBase ==
+// the active segment's base, and recovery skips every segment below headBase,
+// so the active segment is the one file it still requires. Every crash point
+// in this sweep leaves a directory recovery accepts, in one of three ways.
+// Before the active segment is reached, it is still there and the chain starts
+// at headBase. After it, what can remain is the hot spare the manager minted
+// most recently -- its generation is higher, so it sorts after the active
+// segment and outlives it -- which holds no frames and is either read as the
+// active segment at that same base or leaves the committed boundaries with no
+// chain to find; both recover as an empty slot. Last, an empty directory,
+// whose collapsed manifest is removed on its own.
+//
+// TestQwpSfDrainedUnlinkLeavesEveryCrashPointRecoverable walks the prefixes.
 func qwpSfUnlinkAllSegmentFiles(dir string) error {
 	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {

@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -729,4 +730,106 @@ func TestQwpSfEngineCloseRetryWaitsForManagerTeardown(t *testing.T) {
 	managerClosed := e.manager.closed
 	e.manager.mu.Unlock()
 	require.True(t, managerClosed, "the manager must be shut down once Close reports completion")
+}
+
+// buildDrainedSlot lays out a slot as a fully-acked close leaves it just
+// before the unlink sweep: a sealed segment below the committed head, the
+// active segment at head == active, and the hot spare the manager minted for
+// the next rotation. spareBase picks between the two shapes that spare can
+// have — one base above an active segment holding frames, or the same base as
+// an active segment a rotation just installed.
+func buildDrainedSlot(t *testing.T, spareBase int64) string {
+	t.Helper()
+	dir := t.TempDir()
+	var activePayloads []string
+	if spareBase > 1 {
+		activePayloads = []string{"b"}
+	}
+	sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+	active := createRecoverySegment(t, dir, "sf-0000000000000001.sfa", 1, activePayloads...)
+	spare := createRecoverySegment(t, dir, "sf-0000000000000002.sfa", spareBase)
+	createRecoveryManifest(t, dir, 1, 1, sealed, active, spare)
+	closeRecoverySegments(t, sealed, active, spare)
+	return dir
+}
+
+// TestQwpSfDrainedUnlinkLeavesEveryCrashPointRecoverable pins the crash-safety
+// argument qwpSfUnlinkAllSegmentFiles' ordering rests on. The sweep runs after
+// the manifest has collapsed to head == active, and a crash can stop it between
+// any two unlinks, so every prefix of the removal order has to leave a
+// directory the next recovery accepts — never one it fails closed on, which
+// would quarantine a slot whose rows were all acknowledged.
+//
+// The order is taken from the production function rather than restated here,
+// so a change to the sort is a change to what this test walks.
+func TestQwpSfDrainedUnlinkLeavesEveryCrashPointRecoverable(t *testing.T) {
+	// The argument starts from what the drained close commits before it sweeps,
+	// so take that from a real one rather than trusting the fixture below to
+	// mirror it.
+	t.Run("premise", func(t *testing.T) {
+		dir := t.TempDir()
+		e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		var fsn int64
+		for i := 0; i < 3; i++ {
+			fsn, err = e.engineAppendBlocking(context.Background(), []byte("frame"))
+			require.NoError(t, err)
+		}
+		e.engineAcknowledge(fsn)
+		activeBase := e.engineActiveSegment().segmentBaseSeq()
+
+		var head, active int64
+		var swept []string
+		observer := func(path string) {
+			if len(swept) == 0 {
+				m, openErr := qwpSfManifestOpen(dir)
+				require.NoError(t, openErr)
+				require.NotNil(t, m, "the sweep runs with the manifest still on disk")
+				head, active = m.headBase, m.activeBase
+				require.NoError(t, m.close())
+			}
+			swept = append(swept, filepath.Base(path))
+		}
+		qwpSfTestBeforeSegmentUnlinkHook.Store(&observer)
+		t.Cleanup(func() { qwpSfTestBeforeSegmentUnlinkHook.Store(nil) })
+		require.NoError(t, e.engineClose())
+		qwpSfTestBeforeSegmentUnlinkHook.Store(nil)
+
+		require.NotEmpty(t, swept, "a fully acked close must reach the unlink sweep")
+		assert.Equal(t, activeBase, head, "the sweep starts from a manifest collapsed onto the active base")
+		assert.Equal(t, activeBase, active)
+	})
+
+	for _, spareBase := range []int64{2, 1} {
+		name := "spare-above-active"
+		if spareBase == 1 {
+			name = "spare-at-active"
+		}
+		t.Run(name, func(t *testing.T) {
+			var order []string
+			recorder := func(path string) { order = append(order, filepath.Base(path)) }
+			qwpSfTestBeforeSegmentUnlinkHook.Store(&recorder)
+			t.Cleanup(func() { qwpSfTestBeforeSegmentUnlinkHook.Store(nil) })
+			require.NoError(t, qwpSfUnlinkAllSegmentFiles(buildDrainedSlot(t, spareBase)))
+			qwpSfTestBeforeSegmentUnlinkHook.Store(nil)
+			require.Equal(t, []string{"sf-initial.sfa", "sf-0000000000000001.sfa", "sf-0000000000000002.sfa"}, order,
+				"oldest first, and the hot spare outlives the active segment it was minted after")
+
+			for k := 0; k <= len(order); k++ {
+				t.Run(fmt.Sprintf("crash-after-%d", k), func(t *testing.T) {
+					dir := buildDrainedSlot(t, spareBase)
+					for _, removed := range order[:k] {
+						require.NoError(t, os.Remove(filepath.Join(dir, removed)))
+					}
+					ring, _, err := qwpSfRecoverRing(dir, 4096)
+					require.NoError(t, err, "a crash mid-sweep must leave a recoverable slot")
+					require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+					if ring != nil {
+						defer ring.segmentRingClose()
+						assert.Equal(t, int64(1), ring.getActiveSegment().segmentBaseSeq())
+					}
+				})
+			}
+		})
+	}
 }
