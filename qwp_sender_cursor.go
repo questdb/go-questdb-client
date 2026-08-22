@@ -1291,6 +1291,11 @@ func (s *qwpLineSender) TotalBackpressureStalls() int64 {
 	return s.cursorEngine.engineTotalBackpressureStalls()
 }
 
+// QuarantinedSlotPath implements QwpSender.QuarantinedSlotPath.
+func (s *qwpLineSender) QuarantinedSlotPath() string {
+	return s.cursorEngine.engineQuarantinedSlotPath()
+}
+
 // BackgroundDrainers implements QwpSender.BackgroundDrainers.
 func (s *qwpLineSender) BackgroundDrainers() []QwpBackgroundDrainer {
 	if s.drainerPool == nil {

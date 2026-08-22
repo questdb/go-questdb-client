@@ -212,6 +212,18 @@ type QwpSender interface {
 	// unless request_durable_ack is on.
 	TotalDurableTrimAdvances() int64
 
+	// QuarantinedSlotPath returns the directory holding the bytes of a
+	// store-and-forward slot this sender refused at startup, or "" when
+	// it opened a slot it could read (and always in memory mode).
+	//
+	// A slot whose recovery proves it inconsistent is preserved whole
+	// under <sf_dir>/quarantined/<sender_id>-<nanos>/ and the sender
+	// starts fresh, so ingestion continues while the unsent rows stay on
+	// disk. Nothing in the client ever removes that copy or counts it
+	// against sf_max_total_bytes — it is the only copy of those rows, so
+	// reclaiming it is the operator's call.
+	QuarantinedSlotPath() string
+
 	// BackgroundDrainers returns a snapshot of the drainers the
 	// foreground sender has dispatched for orphan slot adoption.
 	// Returns nil when the sender was not configured with

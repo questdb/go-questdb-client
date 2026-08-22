@@ -763,4 +763,19 @@ func TestQwpSfForegroundFailClosedQuarantinesAndStartsFresh(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.False(t, qwpSfIsCandidateOrphan(quarantineRoot))
+
+	// Nothing reclaims that copy, so the sender has to be able to say where it
+	// put it — reading the log must not be the only way to find the rows.
+	assert.Equal(t, filepath.Join(quarantineRoot, entries[0].Name()), engine.engineQuarantinedSlotPath())
+}
+
+// TestQwpSfEngineQuarantinedSlotPathEmptyWithoutQuarantine pins the other
+// answer: a slot that recovered normally set nothing aside.
+func TestQwpSfEngineQuarantinedSlotPathEmptyWithoutQuarantine(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, 0)
+	require.NoError(t, err)
+	require.NotNil(t, engine)
+	defer func() { _ = engine.engineClose() }()
+	assert.Equal(t, "", engine.engineQuarantinedSlotPath())
 }

@@ -187,6 +187,12 @@ type qwpSfCursorEngine struct {
 	// over, and they come from recoveredSymbols.
 	recoveredFromDisk bool
 
+	// quarantinedPath is where the constructor preserved a slot whose
+	// recovery failed closed, before starting this engine on a fresh one.
+	// Empty when nothing was set aside. Written once, before the engine is
+	// handed to its caller.
+	quarantinedPath string
+
 	// backpressureStalls counts how many times appendBlocking
 	// observed qwpSfBackpressureNoSpare on its first try and had to
 	// wait. One increment per blocking-call (not per spin).
@@ -273,9 +279,15 @@ func qwpSfNewCursorEngineForDrainer(sfDir string, segmentSizeBytes, maxTotalByte
 }
 
 func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, recoverForeground bool) (*qwpSfCursorEngine, error) {
+	// Where the bytes of a slot this build refused went, carried onto the fresh
+	// engine so the caller can find them without reading the log.
+	quarantinedPath := ""
 	for attempt := 0; ; attempt++ {
 		e, err := qwpSfNewCursorEngineOnce(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline)
 		if err == nil || sfDir == "" {
+			if e != nil {
+				e.quarantinedPath = quarantinedPath
+			}
 			return e, err
 		}
 		// The residue retry is the second half of a recovery step that already
@@ -299,6 +311,7 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 				return nil, fmt.Errorf("%w; additionally could not quarantine slot: %v", err, quarantineErr)
 			}
 			qwpEffectiveLogger(nil).Error("qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
+			quarantinedPath = quarantined
 			continue
 		}
 		return nil, err
@@ -673,6 +686,15 @@ func (e *qwpSfCursorEngine) engineMaxFrameBytes() int64 {
 // fresh-disk engines return false.
 func (e *qwpSfCursorEngine) engineWasRecoveredFromDisk() bool {
 	return e.recoveredFromDisk
+}
+
+// engineQuarantinedSlotPath returns the directory holding the slot this engine
+// refused and set aside, or "" when it started on a slot it could read.
+func (e *qwpSfCursorEngine) engineQuarantinedSlotPath() string {
+	if e == nil {
+		return ""
+	}
+	return e.quarantinedPath
 }
 
 // engineDeltaDictEnabled reports whether the sender may delta-encode the

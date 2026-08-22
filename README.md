@@ -500,6 +500,29 @@ flock—and, for a pooled sender, its capacity reservation—until storage recov
 or the process exits; releasing either earlier could let a new owner race files
 whose durable cleanup did not finish.
 
+#### Quarantined slots
+
+If a slot's on-disk state proves inconsistent, the sender does not delete it and
+does not try to salvage it. It preserves the whole slot directory under
+`<sf_dir>/quarantined/<sender_id>-<nanos>/`, starts fresh on an empty slot so
+ingestion continues, and reports where the bytes went:
+
+```go
+if qs, ok := sender.(qdb.QwpSender); ok {
+	if path := qs.QuarantinedSlotPath(); path != "" {
+		log.Printf("unsent rows preserved at %s", path)
+	}
+}
+```
+
+An individual unreadable segment file is preserved the same way, renamed in
+place to `<name>.sfa.corrupt`. A background drainer moves nothing: it writes the
+reason to a `.failed` file inside the slot and leaves the bytes where they are.
+
+Nothing in the client ever reclaims any of this, and none of it counts against
+`sf_max_total_bytes` — it is the only copy of those rows, so deleting it is the
+operator's call. Left unattended, a crash loop can park one slot copy per cycle.
+
 ## Querying
 
 The query side streams columnar result batches over the same WebSocket

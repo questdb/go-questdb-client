@@ -1511,6 +1511,13 @@ func (ps *qwpPooledSender) TotalBackpressureStalls() int64 {
 	return ps.slot.delegate.TotalBackpressureStalls()
 }
 
+func (ps *qwpPooledSender) QuarantinedSlotPath() string {
+	if !ps.live() {
+		return ""
+	}
+	return ps.slot.delegate.QuarantinedSlotPath()
+}
+
 func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 	if !ps.live() {
 		return nil
