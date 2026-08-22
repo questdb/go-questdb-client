@@ -330,7 +330,14 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 				return nil, fmt.Errorf("%w; additionally could not quarantine slot: %v", err, quarantineErr)
 			}
 			qwpSfLogGuarded(nil, slog.LevelError, "qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
-			quarantinedPath = quarantined
+			// Keep the first preserved directory. The loop can quarantine
+			// twice, and only the first copy holds the rows the caller came
+			// looking for -- the second is whatever the fresh slot managed to
+			// write before failing again. Reporting the later one would send
+			// the caller to a near-empty directory.
+			if quarantinedPath == "" {
+				quarantinedPath = quarantined
+			}
 			continue
 		}
 		return nil, err
