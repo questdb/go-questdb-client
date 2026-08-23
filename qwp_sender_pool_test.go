@@ -1723,34 +1723,37 @@ func TestQwpSenderPoolReprobeSurvivesPanickingLogger(t *testing.T) {
 // closingSlots. A fault after earlier victims were counted but before the list
 // is returned would raise that count with nothing left to bring it down, and
 // close() would then report ErrSfCleanupPending on every call forever, so the
-// documented retry-until-it-clears contract would never terminate.
+// documented retry-until-it-clears contract would never terminate. The fault
+// is recovered at the operation boundary and poisons the pool: the state is
+// byte-for-byte unchanged, and every later borrow, lease return and close
+// reports the terminal error instead of lending on — a faulting classifier is
+// a client bug, and a pool that kept lending after one could hand a single
+// delegate to two goroutines.
 func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
 	p := &qwpSenderPool{
 		storeAndForward: true,
 		maxSize:         3,
 		minSize:         0,
 		idleTimeout:     time.Hour,
+		acquireTimeout:  50 * time.Millisecond,
 		slotInUse:       make([]bool, 3),
 		notify:          make(chan struct{}),
 	}
 	stale := time.Now().Add(-2 * time.Hour)
 	// A nil delegate satisfies neither classifier interface, so it classifies
 	// cleanly as an idle victim; a zero-value sender does satisfy them and
-	// faults when they are called. Ordering the victim first is what puts the
-	// fault after the accounting the old shape performed inline.
+	// faults when they are called. Ordering the victim first puts the fault
+	// after victims have already been counted into the partition's deltas.
 	victim := &qwpSenderSlot{slotIndex: 0, idleSince: stale}
 	keeper := &qwpSenderSlot{slotIndex: 1, idleSince: time.Now()} // fresh: kept
 	faulting := &qwpSenderSlot{slotIndex: 2, idleSince: stale, delegate: &qwpLineSender{}}
 	p.all = []*qwpSenderSlot{victim, keeper, faulting}
 	p.available = []*qwpSenderSlot{victim, keeper, faulting}
 
-	func() {
-		defer func() { require.NotNil(t, recover(), "the classifier must fault for this test") }()
-		_ = p.selectReapVictims(time.Now())
-	}()
+	require.Empty(t, p.selectReapVictims(time.Now()),
+		"a faulted classification must select no victims")
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	require.Zero(t, p.closingSlots,
 		"a fault during classification must not leave a slot counted as closing")
 	require.Zero(t, p.pendingLeaseTeardowns,
@@ -1771,6 +1774,48 @@ func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
 	for slot, n := range seen {
 		require.Equal(t, 1, n, "slot %p appears %d times in p.available", slot, n)
 	}
+	require.ErrorIs(t, p.poisonedErr, ErrPoolPoisoned)
+	p.mu.Unlock()
+
+	// The poison is loud on every producer-facing surface.
+	_, err := p.borrow(context.Background())
+	require.ErrorIs(t, err, ErrPoolPoisoned, "borrow must refuse on a poisoned pool")
+	require.ErrorIs(t, p.close(context.Background()), ErrPoolPoisoned,
+		"close must report the poison verdict")
+
+	// A second fault does not overwrite the first recorded error.
+	p.mu.Lock()
+	first := p.poisonedErr
+	p.poisonLocked("second fault", "boom")
+	require.Same(t, first, p.poisonedErr)
+	p.mu.Unlock()
+}
+
+// TestQwpSenderPoolPoisonSurfacesOnLeaseReturn pins that returning a lease to
+// a poisoned pool reports the terminal error: the recycle itself still
+// completes (the pool's bookkeeping is intact), but the producer must learn
+// the pool is dead rather than borrow-and-fail later.
+func TestQwpSenderPoolPoisonSurfacesOnLeaseReturn(t *testing.T) {
+	p := &qwpSenderPool{
+		maxSize:        1,
+		acquireTimeout: 50 * time.Millisecond,
+		notify:         make(chan struct{}),
+	}
+	slot := &qwpSenderSlot{}
+	p.all = []*qwpSenderSlot{slot}
+	gen := slot.generation.Add(1)
+	ps := &qwpPooledSender{pool: p, slot: slot, gen: gen}
+
+	p.mu.Lock()
+	p.poisonLocked("test", "boom")
+	p.mu.Unlock()
+
+	err := p.giveBack(context.Background(), ps, false)
+	require.ErrorIs(t, err, ErrPoolPoisoned)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Equal(t, []*qwpSenderSlot{slot}, p.available,
+		"the return itself must still complete")
 }
 
 // TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock pins that a failed
@@ -1860,10 +1905,16 @@ func TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock(t *testing.T) {
 // the housekeeper and on the borrow-at-capacity path — a stranded p.mu
 // deadlocks every later borrow, return, reap and repeat close, which is exactly
 // the re-probe the ErrSfCleanupPending contract tells callers to keep making.
+// The fault is recovered at the operation boundary and poisons the pool: a
+// probe that faulted once would fault again, and the decrements it half-built
+// must never be applied — a repeat probe applying them twice walks leakedSlots
+// negative, where close() reports a clean shutdown over held flocks and
+// capUsedLocked admits creations past maxSize.
 func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
 	p := &qwpSenderPool{
 		storeAndForward: true,
 		maxSize:         3,
+		acquireTimeout:  50 * time.Millisecond,
 		slotInUse:       []bool{true, true, true},
 		leakedSlots:     3,
 		notify:          make(chan struct{}),
@@ -1873,10 +1924,7 @@ func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
 	faulting := &qwpSenderSlot{slotIndex: 2, cleanup: panicOnProbeSlot{}}
 	p.retiredSlots = []*qwpSenderSlot{done, pending, faulting}
 
-	func() {
-		defer func() { require.NotNil(t, recover(), "the probe must fault for this test") }()
-		p.reprobeRetiredSlots()
-	}()
+	p.reprobeRetiredSlots()
 
 	locked := make(chan struct{})
 	go func() {
@@ -1904,6 +1952,8 @@ func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
 		"a faulting probe must not apply capacity accounting it did not finish")
 	require.Equal(t, []bool{true, true, true}, p.slotInUse,
 		"nor free an index whose slot is still retired")
+	require.ErrorIs(t, p.poisonedErr, ErrPoolPoisoned,
+		"a faulting probe must record the terminal pool error")
 }
 
 // neverDoneSlot reports a cleanup that has not finished.

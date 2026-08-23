@@ -103,6 +103,12 @@ type qwpSenderPool struct {
 	// again instead of silently downgrading a real failure to nil. Guarded by
 	// mu, written once.
 	closeTeardownErr error
+
+	// poisonedErr is the terminal pool error recorded by the first panic in a
+	// slot-classification pass (see poisonLocked). Once set, borrow refuses,
+	// giveBack and close report it, and the reap/reprobe passes stand down.
+	// Guarded by mu, written once.
+	poisonedErr error
 }
 
 // ErrSfCleanupPending is the sentinel a store-and-forward pool close wraps when
@@ -123,10 +129,17 @@ type qwpSenderPool struct {
 // sentinel as fatal.
 var ErrSfCleanupPending = errors.New("qwp pool: SF slot cleanup still pending; slot locks retained")
 
-// qwpPoolCloseResult combines the teardown error with the current
-// retained-lock count. Shared by close()'s first pass and its idempotent
-// re-probe so both report the same shape.
-func qwpPoolCloseResult(teardownErr error, pending int) error {
+// qwpPoolCloseResult combines the teardown error, the pool's poisoned verdict
+// and the current retained-lock count. Shared by close()'s first pass and its
+// idempotent re-probe so both report the same shape.
+func qwpPoolCloseResult(teardownErr, poisonErr error, pending int) error {
+	if poisonErr != nil {
+		if teardownErr != nil {
+			teardownErr = errors.Join(poisonErr, teardownErr)
+		} else {
+			teardownErr = poisonErr
+		}
+	}
 	if pending == 0 {
 		return teardownErr
 	}
@@ -290,6 +303,10 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			p.mu.Unlock()
 			return nil, errPoolClosed
 		}
+		if err := p.poisonedErr; err != nil {
+			p.mu.Unlock()
+			return nil, err
+		}
 		// A disabled housekeeper must not make successfully deferred cleanup a
 		// permanent capacity loss. Retry/reprobe retired slots outside p.mu before
 		// deciding the pool is full; if cleanup is still owned, the helper is a
@@ -301,6 +318,10 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			if p.closed {
 				p.mu.Unlock()
 				return nil, errPoolClosed
+			}
+			if err := p.poisonedErr; err != nil {
+				p.mu.Unlock()
+				return nil, err
 			}
 		}
 		if n := len(p.available); n > 0 {
@@ -490,11 +511,17 @@ func (p *qwpSenderPool) settleGrowthBuild(resultCh <-chan *qwpSenderSlot, errCh 
 // lease is stale (already returned and possibly re-borrowed) or the pool is
 // closed — this is what makes lease Close idempotent under a concurrent
 // re-borrow (Hazard B). Broken slots are discarded instead of recycled.
-func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broken bool) {
+// giveBack returns a lease's slot to the pool. Its error is the pool's
+// poisoned verdict (see poisonLocked), surfaced so a producer returning a
+// lease learns the pool is dead; the return itself still completes — the slot
+// is recycled, discarded or torn down exactly as when the pool is healthy,
+// since the poisoned state left the pool's bookkeeping intact.
+func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broken bool) error {
 	p.mu.Lock()
+	poisonErr := p.poisonedErr
 	if ps.slot.generation.Load() != ps.gen {
 		p.mu.Unlock()
-		return // stale lease (already returned / re-borrowed) — never double-act
+		return poisonErr // stale lease (already returned / re-borrowed) — never double-act
 	}
 	// Invalidate this lease so a duplicate Close is dropped above.
 	ps.slot.generation.Add(1)
@@ -518,16 +545,17 @@ func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broke
 		p.reclaimSlotLocked(ps.slot, nil)
 		p.broadcastLocked()
 		p.mu.Unlock()
-		return
+		return poisonErr
 	}
 	if broken {
 		p.discardLocked(ps.slot)
-		return // discardLocked unlocks
+		return poisonErr // discardLocked unlocks
 	}
 	ps.slot.idleSince = time.Now()
 	p.available = append(p.available, ps.slot)
 	p.broadcastLocked()
 	p.mu.Unlock()
+	return poisonErr
 }
 
 // terminalReporter lets the pool detect a delegate whose background send loop
@@ -701,27 +729,106 @@ func (p *qwpSenderPool) reapIdle() {
 	}
 }
 
-// selectReapVictims removes the idle-expired / over-age / poisoned slots from the
-// available set under the lock and returns them for off-lock closing. The lock is
-// released via defer so a panic in the selection can never strand it (the reap
-// runs behind a recover in the housekeeper).
+// qwpSlotPartition is the outcome of classifying one of the pool's slot lists:
+// the slots that stay, the slots that leave, and the counter deltas the
+// departure implies. Classification — which calls into each delegate and can
+// fault — builds the whole partition before any pool state is written;
+// applySlotPartitionLocked then publishes it in one uninterruptible step.
+type qwpSlotPartition struct {
+	kept    []*qwpSenderSlot
+	removed []*qwpSenderSlot
+	// Counter deltas the removals imply, computed during classification so the
+	// apply step is pure assignments.
+	closingSlotsDelta          int
+	pendingLeaseTeardownsDelta int
+	leakedSlotsDelta           int
+	// removeFromAll drops each removed slot from p.all; freeSlotIndexes returns
+	// each removed slot's SF index to circulation.
+	removeFromAll   bool
+	freeSlotIndexes bool
+}
+
+// applySlotPartitionLocked publishes a classified partition: it installs the
+// kept list into *target, drops or releases the removed slots as the partition
+// directs, and applies the counter deltas. Both classify-then-apply sites (the
+// idle reap and the retired-slot reprobe) go through here, so the
+// all-or-nothing update discipline lives in one function instead of being
+// hand-copied per site. The body is slice-header and integer assignments plus
+// bounds-checked bitmap writes — nothing in it can panic — so once
+// classification has finished, the pool's state takes the whole partition or,
+// if classification faulted before reaching here, none of it. Caller holds mu.
+func (p *qwpSenderPool) applySlotPartitionLocked(target *[]*qwpSenderSlot, part qwpSlotPartition) {
+	for _, slot := range part.removed {
+		if part.removeFromAll {
+			p.removeFromAllLocked(slot)
+		}
+		if part.freeSlotIndexes {
+			p.freeSlotIndexLocked(slot.slotIndex)
+		}
+	}
+	p.closingSlots += part.closingSlotsDelta
+	p.pendingLeaseTeardowns += part.pendingLeaseTeardownsDelta
+	p.leakedSlots += part.leakedSlotsDelta
+	*target = part.kept
+}
+
+// poisonLocked records the first classification panic as the pool's terminal
+// error. A faulting classification predicate is a client bug, and the pool
+// cannot tell which of its slots the fault has made untrustworthy — a pool
+// that kept lending after one could hand a single delegate to two goroutines.
+// Poisoning converts that residual risk from silent corruption into a loud
+// outage: borrow refuses, giveBack and close report the error, and the
+// reap/reprobe passes stand down. Caller holds mu.
+func (p *qwpSenderPool) poisonLocked(op string, panicValue any) {
+	if p.poisonedErr == nil {
+		p.poisonedErr = fmt.Errorf("%w: %s panicked: %v", ErrPoolPoisoned, op, panicValue)
+	}
+}
+
+// selectReapVictims removes the idle-expired / over-age / poisoned slots from
+// the available set under the lock and returns them for off-lock closing.
+// Classification and apply are split: classifyReapVictimsLocked builds the
+// whole partition without writing any pool state, and applySlotPartitionLocked
+// publishes it in one step that cannot fault. A panic during classification
+// therefore leaves the pool byte-for-byte unchanged; it is recovered there and
+// poisons the pool (see poisonLocked). The lock is released via defer so no
+// exit can strand it.
 func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed || p.poisonedErr != nil {
 		return nil
 	}
-	var toClose []*qwpSenderSlot
-	// Build the survivors into a fresh slice rather than filtering in place.
-	// The classification below calls into each delegate and can fault, and an
-	// in-place filter publishes p.available only at the end -- so an aborted
-	// loop leaves the slice header at its old length over a backing array that
-	// has already been rewritten. A kept slot then appears twice, and borrow
-	// hands one delegate to two producers; a victim disappears from available
-	// while staying in p.all, where nothing closes it and close() still reports
-	// a clean shutdown with its flock held. One allocation per housekeeper tick
-	// buys the whole loop its all-or-nothing property.
-	kept := make([]*qwpSenderSlot, 0, len(p.available))
+	part, ok := p.classifyReapVictimsLocked(now)
+	if !ok {
+		return nil
+	}
+	p.applySlotPartitionLocked(&p.available, part)
+	return part.removed
+}
+
+// classifyReapVictimsLocked partitions the available set into keepers and reap
+// victims. It calls into each delegate and writes no pool state: a panic in a
+// predicate is recovered here, poisons the pool, and returns ok=false with the
+// half-built partition discarded. The counter deltas are computed alongside
+// the victim list — closingSlots for an SF slot leaving `all` while its flock
+// is still held, and pendingLeaseTeardowns so close()'s outstanding wait sees
+// the off-lock reap close (the victim is already out of `all`, so the formula
+// would otherwise miss it; capUsedLocked tracks closingSlots separately, so
+// nothing double-counts). reapIdle decrements both after the close lands.
+// Caller holds mu.
+func (p *qwpSenderPool) classifyReapVictimsLocked(now time.Time) (part qwpSlotPartition, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.poisonLocked("reap-victim classification", r)
+		}
+	}()
+	// The survivors go into a fresh slice rather than an in-place filter, so
+	// p.available stays untouched until the apply step publishes the whole
+	// partition. One allocation per housekeeper tick buys the all-or-nothing
+	// property.
+	part.kept = make([]*qwpSenderSlot, 0, len(p.available))
+	part.removeFromAll = true
 	for _, slot := range p.available {
 		idleExpired := p.idleTimeout > 0 && now.Sub(slot.idleSince) >= p.idleTimeout
 		overAge := p.maxLifetime > 0 && now.Sub(slot.createdAt) >= p.maxLifetime
@@ -738,38 +845,20 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 		// poisoned slot is exempt — its HALT is terminal, so the rows are already
 		// lost and holding the slot only wastes it.
 		hasUnacked := !poisoned && slotHasUnackedRows(slot.delegate)
-		// len(p.all) shrinks only in the mutation pass below, so the minSize
-		// floor subtracts the victims chosen so far to match reaping them one
-		// at a time.
-		if poisoned || ((idleExpired || overAge) && len(p.all)-len(toClose) > p.minSize && !hasUnacked) {
-			toClose = append(toClose, slot)
+		// The apply step shrinks len(p.all) only after classification, so the
+		// minSize floor subtracts the victims chosen so far to match reaping
+		// them one at a time.
+		if poisoned || ((idleExpired || overAge) && len(p.all)-len(part.removed) > p.minSize && !hasUnacked) {
+			part.removed = append(part.removed, slot)
+			if p.storeAndForward && slot.slotIndex >= 0 {
+				part.closingSlotsDelta++
+			}
+			part.pendingLeaseTeardownsDelta++
 			continue
 		}
-		kept = append(kept, slot)
+		part.kept = append(part.kept, slot)
 	}
-	// Classification is finished, so the accounting below cannot be interrupted
-	// part-way. Both predicates above call into the delegate; a fault in one
-	// after earlier victims had already been counted would leave closingSlots
-	// raised with the victim list discarded. reclaimSlotLocked is the sole
-	// decrement and only reapIdle reaches it, so that count would never come
-	// back down -- and close() would report ErrSfCleanupPending on every call
-	// forever, which is the one outcome the documented "retry until it clears"
-	// contract cannot survive.
-	for _, slot := range toClose {
-		p.removeFromAllLocked(slot)
-		if p.storeAndForward && slot.slotIndex >= 0 {
-			p.closingSlots++
-		}
-		// Count the off-lock reap teardown so close()'s outstanding wait
-		// cannot return while a reaped slot is still releasing its delegate
-		// (and, in SF mode, its flock). The victim is already out of `all`, so
-		// as with discardLocked the formula would otherwise miss it entirely;
-		// capUsedLocked separately tracks closingSlots, so this does not
-		// double-count there. Decremented in reapIdle after the close.
-		p.pendingLeaseTeardowns++
-	}
-	p.available = kept
-	return toClose
+	return part, true
 }
 
 // close shuts the pool down and disconnects its slots. Idempotent.
@@ -803,8 +892,9 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 		p.reprobeRetiredSlots()
 		p.mu.Lock()
 		pending := p.pendingLockedSlotsLocked()
+		poisonErr := p.poisonedErr
 		p.mu.Unlock()
-		return qwpPoolCloseResult(teardownErr, pending)
+		return qwpPoolCloseResult(teardownErr, poisonErr, pending)
 	}
 	p.closed = true
 	p.closing.Store(true)
@@ -905,8 +995,9 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	p.reprobeRetiredSlots()
 	p.mu.Lock()
 	pending := p.pendingLockedSlotsLocked()
+	poisonErr := p.poisonedErr
 	p.mu.Unlock()
-	return qwpPoolCloseResult(firstErr, pending)
+	return qwpPoolCloseResult(firstErr, poisonErr, pending)
 }
 
 // createSlot allocates an SF slot index when needed and builds a slot.
@@ -1097,45 +1188,58 @@ func (p *qwpSenderPool) reprobeRetiredSlots() {
 }
 
 // reprobeRetiredSlotsLocked observes the retired slots under p.mu and returns
-// how many gave their capacity back. The lock is released via defer, and the
-// survivors go into a fresh slice: slotCloseCompleted calls into the delegate,
-// so a fault here must neither strand the pool mutex -- which would deadlock
-// every later borrow, return, reap and repeat close, including the re-probe the
-// ErrSfCleanupPending contract tells callers to keep making -- nor publish a
-// half-rewritten retired list.
+// how many gave their capacity back. The lock is released via defer, so a
+// fault cannot strand the pool mutex -- which would deadlock every later
+// borrow, return, reap and repeat close, including the re-probe the
+// ErrSfCleanupPending contract tells callers to keep making. Classification
+// and apply are split exactly as in selectReapVictims: the partition is built
+// whole, then published by applySlotPartitionLocked in one step that cannot
+// fault, so a panic in a predicate leaves the retired list and the counters
+// untouched (and poisons the pool).
 func (p *qwpSenderPool) reprobeRetiredSlotsLocked() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.retiredSlots) == 0 {
+	if p.poisonedErr != nil || len(p.retiredSlots) == 0 {
 		return 0
 	}
-	// Classify first, account second, exactly as selectReapVictims does and
-	// for the same reason. slotCloseCompleted calls into the delegate. With
-	// the accounting inside the loop, a fault on a later slot leaves the
-	// earlier slots' decrements applied while the retired list is preserved
-	// whole -- so the next probe decrements them again. leakedSlots walks down
-	// past zero, at which point close() reports a clean shutdown with those
-	// flocks still held, and then negative, at which point close() reports a
-	// pending count that can never return to zero and capUsedLocked admits
-	// creations past maxSize.
-	kept := make([]*qwpSenderSlot, 0, len(p.retiredSlots))
-	done := make([]*qwpSenderSlot, 0, len(p.retiredSlots))
-	for _, slot := range p.retiredSlots {
-		if slotCloseCompleted(slot) {
-			done = append(done, slot)
-			continue
-		}
-		kept = append(kept, slot)
+	part, ok := p.classifyRetiredSlotsLocked()
+	if !ok {
+		return 0
 	}
-	for _, slot := range done {
-		p.leakedSlots--
-		p.freeSlotIndexLocked(slot.slotIndex)
-	}
-	p.retiredSlots = kept
-	if len(done) > 0 {
+	p.applySlotPartitionLocked(&p.retiredSlots, part)
+	if len(part.removed) > 0 {
 		p.broadcastLocked()
 	}
-	return len(done)
+	return len(part.removed)
+}
+
+// classifyRetiredSlotsLocked partitions the retired list into slots whose
+// deferred cleanup has completed (removed: capacity restored, index freed,
+// leakedSlots decremented) and slots still owed (kept). slotCloseCompleted
+// calls into the delegate, so this writes no pool state: a panic is recovered
+// here, poisons the pool, and returns ok=false with the half-built partition
+// discarded. The deltas ride in the partition — applied only once the whole
+// list has classified, so a fault on a later slot can never leave earlier
+// slots' decrements applied with the retired list preserved whole, which the
+// next probe would decrement again, walking leakedSlots negative. Caller
+// holds mu.
+func (p *qwpSenderPool) classifyRetiredSlotsLocked() (part qwpSlotPartition, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.poisonLocked("retired-slot reprobe classification", r)
+		}
+	}()
+	part.kept = make([]*qwpSenderSlot, 0, len(p.retiredSlots))
+	part.freeSlotIndexes = true
+	for _, slot := range p.retiredSlots {
+		if slotCloseCompleted(slot) {
+			part.removed = append(part.removed, slot)
+			part.leakedSlotsDelta--
+			continue
+		}
+		part.kept = append(part.kept, slot)
+	}
+	return part, true
 }
 
 func (p *qwpSenderPool) removeFromAllLocked(slot *qwpSenderSlot) {
@@ -1170,6 +1274,17 @@ func (p *qwpSenderPool) poolSnapshot() (total, available, leaked int) {
 // ErrPoolClosed is returned by BorrowSender / BorrowQuery (and the underlying
 // pools) once QuestDB.Close has run. Match it with errors.Is.
 var ErrPoolClosed = errors.New("qwp pool: handle is closed")
+
+// ErrPoolPoisoned is the sentinel wrapped by BorrowSender, a lease's Close and
+// QuestDB.Close after a panic inside the ingest pool's slot classification (the
+// idle reap or the retired-slot reprobe). Such a panic is a client bug: the
+// classification left the pool's state unchanged, but the predicate that
+// faulted once would fault again, and a pool that kept lending after one could
+// hand a single sender to two goroutines. The pool records the first panic as
+// a terminal error and stops lending — a loud outage instead of silent
+// corruption. There is no recovery short of rebuilding the QuestDB handle.
+// Match it with errors.Is; the wrapping error carries the panic value.
+var ErrPoolPoisoned = errors.New("qwp pool: poisoned by a panic during slot classification; the pool no longer lends senders")
 
 // ErrSenderPoolExhausted is returned by BorrowSender when the ingest pool is at
 // sender_pool_max and no sender frees up within acquire_timeout_ms. The returned
@@ -1649,7 +1764,7 @@ func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
 			ps.broken = true
-			ps.pool.giveBack(ctx1, ps, true)
+			_ = ps.pool.giveBack(ctx1, ps, true)
 			retErr = fmt.Errorf("qwp pool: delegate close panicked: %v", r)
 		}
 	}()
@@ -1690,6 +1805,9 @@ func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 			ps.markBrokenIfTerminal()
 		}
 	}
-	ps.pool.giveBack(ctx1, ps, ps.broken)
-	return flushErr
+	poolErr := ps.pool.giveBack(ctx1, ps, ps.broken)
+	if flushErr != nil {
+		return flushErr
+	}
+	return poolErr
 }
