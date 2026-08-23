@@ -684,7 +684,7 @@ func (io *qwpEgressIO) readerRun() {
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("qwp: egress reader panicked: %v\n%s", r, debug.Stack())
-			qwpSfLogGuarded(io.logger, slog.LevelError, "qwp: egress reader panicked", "error", err)
+			qwpEffectiveLogger(io.logger).Error("qwp: egress reader panicked", "error", err)
 			io.setIoErr(err)
 		}
 	}()
@@ -768,7 +768,7 @@ func (io *qwpEgressIO) dispatcherRun() {
 	defer func() {
 		if r := recover(); r != nil {
 			msg := fmt.Sprintf("qwp: egress dispatcher panicked: %v\n%s", r, debug.Stack())
-			qwpSfLogGuarded(io.logger, slog.LevelError, "qwp: egress dispatcher panicked", "detail", msg)
+			qwpEffectiveLogger(io.logger).Error("qwp: egress dispatcher panicked", "detail", msg)
 			io.poisonAndEmitError(msg)
 		}
 	}()

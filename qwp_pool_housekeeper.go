@@ -107,7 +107,7 @@ func (h *qwpPoolHousekeeper) reapGuarded(fn func()) {
 			// cannot catch a second panic raised while this one unwinds. A
 			// user's slog handler must not be able to turn a survivable reap
 			// panic into a dead process.
-			qwpSfLogGuarded(h.logger, slog.LevelWarn, "qwp pool housekeeper: reap step panicked", "panic", r)
+			qwpEffectiveLogger(h.logger).Warn("qwp pool housekeeper: reap step panicked", "panic", r)
 		}
 	}()
 	fn()

@@ -110,7 +110,7 @@ func qwpDrainerListenerCall(logger *slog.Logger, fn func()) {
 			// handler is user code exactly like the callback, and a panic
 			// while reporting the first panic would produce the outcome this
 			// guard exists to prevent.
-			qwpSfLogGuarded(logger, slog.LevelError, "qwp/sf drainer listener callback panicked", "panic", r)
+			qwpEffectiveLogger(logger).Error("qwp/sf drainer listener callback panicked", "panic", r)
 		}
 	}()
 	fn()
@@ -365,7 +365,7 @@ func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
 		// Shadows the OnPrimaryUnavailable listener callback (dispatched
 		// alongside this); throttled Debug so it adds a trace for deep
 		// debugging without duplicating the callback for the default case.
-		qwpSfLogGuarded(d.logger, slog.LevelDebug, "qwp/sf: drainer sweep found only replicas "+
+		qwpEffectiveLogger(d.logger).Debug("qwp/sf: drainer sweep found only replicas "+
 			"(transient failover window), retrying with capped backoff",
 			"slot", d.slotPath, "sweep", attempt)
 	}
@@ -398,7 +398,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			// A recover() cannot catch a second panic raised while this one is
 			// still unwinding, so the report of a panic must not be able to
 			// raise one. A user's slog handler can.
-			qwpSfLogGuarded(d.logger, slog.LevelError, "qwp/sf: orphan drainer panicked", "detail", msg)
+			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer panicked", "detail", msg)
 			d.recordFailure(msg)
 		}
 	}()
@@ -423,8 +423,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		if errors.Is(err, qwpSfErrRecoveryFailClosed) {
 			qwpSfMarkSlotFailed(d.slotPath, "engine open: "+msg)
 		} else {
-			qwpSfLogGuarded(d.logger, slog.LevelError,
-				"qwp/sf: orphan drainer could not open the slot; leaving it eligible for a later scan",
+			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer could not open the slot; leaving it eligible for a later scan",
 				"slot", d.slotPath, "error", err)
 		}
 		d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
@@ -443,8 +442,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		}
 		if !engine.engineCloseCompleted() {
 			engine.engineStartCloseRetryOwner(d.logger)
-			qwpSfLogGuarded(d.logger, slog.LevelError,
-				"qwp/sf: orphan drainer close incomplete; a terminal cleanup owner will retain and retry the slot lock release",
+			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer close incomplete; a terminal cleanup owner will retain and retry the slot lock release",
 				"slot", d.slotPath)
 		}
 	}()
@@ -871,7 +869,7 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 			// returns, but close() must not block on un-cancellable
 			// I/O. The slot it holds stays a valid orphan a future
 			// sender re-adopts. Surface the abandoned count for ops.
-			qwpSfLogGuarded(p.logger, slog.LevelWarn, "qwp/sf: orphan drainer(s) still running after close; "+
+			qwpEffectiveLogger(p.logger).Warn("qwp/sf: orphan drainer(s) still running after close; "+
 				"abandoning (wedged in un-cancellable disk I/O). Their slots remain adoptable on a future sender start.",
 				"count", p.activeCount(),
 				"grace", qwpSfDrainerPoolCloseGrace.load()+qwpSfDrainerPoolHardCloseGrace.load())

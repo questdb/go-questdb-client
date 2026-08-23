@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"context"
 	"log/slog"
 	"runtime"
 	"strconv"
@@ -410,7 +411,7 @@ func (d *qwpSfErrorDispatcher) close() {
 		// done is closed — Go may pick inbox and fire the user callback
 		// after close() (hence Sender.Close) has already returned.
 		d.abandon.Store(true)
-		qwpSfLogGuarded(d.logger, slog.LevelWarn, "qwp/sf: error handler still running after close; "+
+		qwpEffectiveLogger(d.logger).Warn("qwp/sf: error handler still running after close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
 			"timeout", qwpSfDispatcherCloseJoinTimeout)
 	}
@@ -472,15 +473,14 @@ func newDefaultSenderErrorHandler(logger *slog.Logger) SenderErrorHandler {
 		if e == nil {
 			return
 		}
-		// Guarded like every other production log call. The dispatcher that
-		// delivers this already recovers a panicking handler, so this is
-		// defense in depth -- but the rule holds for every site, which is what
-		// makes it mechanically checkable.
+		// The resolved logger carries the panic-guarded handler, and the
+		// dispatcher that delivers this already recovers a panicking handler,
+		// so this is defense in depth.
 		level := slog.LevelWarn
 		if e.AppliedPolicy == PolicyTerminal {
 			level = slog.LevelError
 		}
-		qwpSfLogGuarded(logger, level, "qwp/sf: server rejection", "error", e)
+		qwpEffectiveLogger(logger).Log(context.Background(), level, "qwp/sf: server rejection", "error", e)
 	}
 }
 

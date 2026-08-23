@@ -582,7 +582,10 @@ func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 // or one wired to the application's logging stack to route it there.
 func WithLogger(l *slog.Logger) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.logger = l
+		// Guarded at the door: every logger the client stores is wrapped in
+		// the panic-guarded handler (see qwp_log.go), so a panicking handler
+		// can never take down the goroutine behind a log call.
+		s.logger = qwpGuardLogger(l)
 	}
 }
 

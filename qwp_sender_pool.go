@@ -725,7 +725,7 @@ func (p *qwpSenderPool) reapIdle() {
 	p.broadcastLocked()
 	p.mu.Unlock()
 	for _, err := range reapErrs {
-		qwpSfLogGuarded(p.logger, slog.LevelWarn, "qwp pool: reaping a slot failed to drain cleanly", "error", err)
+		qwpEffectiveLogger(p.logger).Warn("qwp pool: reaping a slot failed to drain cleanly", "error", err)
 	}
 }
 
@@ -939,14 +939,14 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	// A logged leak is recoverable; a freed buffer under a live producer is
 	// not. The delegate is torn down whenever its lease finally returns
 	// (giveBack's closed branch). Count under the lock, log after the unlock
-	// below: the logger is the user's slog handler, and a panicking one here
-	// would leave p.mu held forever -- closeStep's recover keeps the process
-	// alive, so every later borrow, return, reprobe and repeat close would
-	// then wait on that lock, including the repeat-Close retry. The log goes
-	// through qwpSfLogGuarded for the same reason the site matters: the slots
-	// below are already out of p.all and counted in closingSlots, so a
-	// panicking handler that skipped the teardown loop would retain every
-	// flock with no retry owner and no retiredSlots entry to re-probe.
+	// below: the logger is the user's slog handler, and while the guarded
+	// handler absorbs a panicking one, a merely slow one here would hold p.mu
+	// for the whole call -- every later borrow, return, reprobe and repeat
+	// close would wait on that lock, including the repeat-Close retry. The
+	// off-lock placement matters for the same reason the site does: the slots
+	// below are already out of p.all and counted in closingSlots, so skipping
+	// the teardown loop would retain every flock with no retry owner and no
+	// retiredSlots entry to re-probe.
 	leaked := len(p.all) - len(p.available)
 	toClose := append([]*qwpSenderSlot(nil), p.available...)
 	for _, slot := range toClose {
@@ -959,7 +959,7 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 	p.broadcastLocked()
 	p.mu.Unlock()
 	if leaked > 0 {
-		qwpSfLogGuarded(p.logger, slog.LevelWarn, "qwp pool: close() leaving borrowed sender(s) alive; "+
+		qwpEffectiveLogger(p.logger).Warn("qwp pool: close() leaving borrowed sender(s) alive; "+
 			"each is torn down when its lease is closed", "leaked", leaked)
 	}
 
@@ -1183,7 +1183,7 @@ func (p *qwpSenderPool) pendingLockedSlotsLocked() int {
 func (p *qwpSenderPool) reprobeRetiredSlots() {
 	restored := p.reprobeRetiredSlotsLocked()
 	if restored > 0 {
-		qwpSfLogGuarded(p.logger, slog.LevelInfo, "qwp pool: restored SF capacity after deferred slot cleanup", "slots", restored)
+		qwpEffectiveLogger(p.logger).Info("qwp pool: restored SF capacity after deferred slot cleanup", "slots", restored)
 	}
 }
 

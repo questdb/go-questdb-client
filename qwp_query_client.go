@@ -360,7 +360,9 @@ func WithQwpQueryClientID(id string) QwpQueryClientOption {
 // WithQwpQueryClientLogger sets the *slog.Logger the query client emits
 // diagnostics through, replacing the slog.Default() fallback. See WithLogger.
 func WithQwpQueryClientLogger(l *slog.Logger) QwpQueryClientOption {
-	return func(c *qwpQueryClientConfig) { c.logger = l }
+	// Guarded at the door, like WithLogger: only panic-guarded loggers are
+	// stored (see qwp_log.go).
+	return func(c *qwpQueryClientConfig) { c.logger = qwpGuardLogger(l) }
 }
 
 // WithQwpQueryBufferPoolSize overrides the decode buffer pool depth.

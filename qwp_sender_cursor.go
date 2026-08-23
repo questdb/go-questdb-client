@@ -653,8 +653,7 @@ func (s *qwpLineSender) persistNewSymbols() error {
 		if s.cursorSendLoop != nil {
 			logger = s.cursorSendLoop.logger
 		}
-		qwpSfLogGuarded(logger, slog.LevelWarn,
-			"qwp/sf: symbol dictionary persistence failed; switching to full-dictionary frames",
+		qwpEffectiveLogger(logger).Warn("qwp/sf: symbol dictionary persistence failed; switching to full-dictionary frames",
 			"error", err)
 		return fmt.Errorf("qwp/sf: persist symbol dictionary: %w; sender switched to full-dictionary mode, retry the flush", err)
 	}
@@ -1043,8 +1042,7 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) error {
 	if !s.cursorEngine.engineCloseCompleted() {
 		logger := qwpEffectiveLogger(s.cursorEngine.engineLogger())
 		s.ensureCloseRetryOwner(logger)
-		qwpSfLogGuarded(s.cursorEngine.engineLogger(), slog.LevelWarn,
-			"qwp/sf: foreground close incomplete; terminal cleanup retry owner started",
+		qwpEffectiveLogger(s.cursorEngine.engineLogger()).Warn("qwp/sf: foreground close incomplete; terminal cleanup retry owner started",
 			"slot", s.cursorEngine.engineSfDir())
 	}
 	// Stop the drainer pool last — drainers may still be using the
@@ -1067,8 +1065,7 @@ func (s *qwpLineSender) closeCursorDrainGuarded(ctx context.Context) (firstErr e
 			// firstErr in the common case, and a fault here would otherwise
 			// leave no record at all.
 			err := fmt.Errorf("qwp: close drain panicked: %v\n%s", r, debug.Stack())
-			qwpSfLogGuarded(s.cursorEngine.engineLogger(), slog.LevelError,
-				"qwp: close drain panicked", "error", err)
+			qwpEffectiveLogger(s.cursorEngine.engineLogger()).Error("qwp: close drain panicked", "error", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1165,8 +1162,7 @@ func (s *qwpLineSender) closeSendLoopGuarded() (stopped bool, err error) {
 		if r := recover(); r != nil {
 			stopped = false
 			err = fmt.Errorf("qwp: send loop close panicked: %v\n%s", r, debug.Stack())
-			qwpSfLogGuarded(s.cursorEngine.engineLogger(), slog.LevelError,
-				"qwp: send loop close panicked", "error", err)
+			qwpEffectiveLogger(s.cursorEngine.engineLogger()).Error("qwp: send loop close panicked", "error", err)
 		}
 	}()
 	if hook := qwpTestCloseSendLoopHook.Load(); hook != nil {

@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 )
@@ -186,10 +187,9 @@ type SenderConnectionListener func(SenderConnectionEvent)
 // controls the sink; nil resolves to slog.Default().
 func newDefaultSenderConnectionListener(logger *slog.Logger) SenderConnectionListener {
 	return func(e SenderConnectionEvent) {
-		// Guarded like every other production log call. The dispatcher that
-		// delivers this already recovers a panicking listener, so this is
-		// defense in depth rather than the only boundary -- but it keeps the
-		// rule uniform, which is what makes it checkable.
+		// The resolved logger carries the panic-guarded handler, and the
+		// dispatcher that delivers this already recovers a panicking listener,
+		// so this is defense in depth rather than the only boundary.
 		level := slog.LevelInfo
 		switch e.Kind {
 		case SenderAuthFailed:
@@ -197,7 +197,7 @@ func newDefaultSenderConnectionListener(logger *slog.Logger) SenderConnectionLis
 		case SenderDisconnected, SenderEndpointAttemptFailed, SenderAllEndpointsUnreachable:
 			level = slog.LevelWarn
 		}
-		qwpSfLogGuarded(logger, level, "qwp: connection event", "event", e)
+		qwpEffectiveLogger(logger).Log(context.Background(), level, "qwp: connection event", "event", e)
 	}
 }
 

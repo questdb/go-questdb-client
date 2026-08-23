@@ -580,7 +580,7 @@ func TestQuestDBDrainerListenerAppliedToPooledSenders(t *testing.T) {
 
 // TestQuestDBCloseReprobeDoesNotHoldCloseMu pins that the retained-slot-lock
 // re-probe runs off closeMu. That path logs through the application's slog
-// handler, and qwpSfLogGuarded contains a handler that panics but not one that
+// handler, and the guarded handler contains one that panics but not one that
 // blocks — a handler calling Close while the lock is held would deadlock on a
 // non-reentrant mutex, and concurrent callers would serialize behind pool
 // teardown either way.

@@ -205,7 +205,9 @@ func WithQuestDBBackgroundDrainerListener(l QwpBackgroundDrainerListener) QuestD
 // WithQuestDBLogger sets the *slog.Logger applied to both pools and every
 // pooled sender and query session. See WithLogger.
 func WithQuestDBLogger(l *slog.Logger) QuestDBOption {
-	return func(c *questDBConfig) { c.logger = l }
+	// Guarded at the door, like WithLogger: only panic-guarded loggers are
+	// stored (see qwp_log.go).
+	return func(c *questDBConfig) { c.logger = qwpGuardLogger(l) }
 }
 
 // serializeErrorHandler wraps h so concurrent invocations from the pool's
@@ -512,7 +514,7 @@ func (db *QuestDB) Close(ctx context.Context) error {
 	// for good, so their errors come from the recorded values.
 	//
 	// The re-probe runs off closeMu. It logs through the application's slog
-	// handler, and while qwpSfLogGuarded contains a panicking handler it cannot
+	// handler, and while the guarded handler contains a panicking one it cannot
 	// contain a blocking one -- a handler that calls Close would deadlock on
 	// this non-reentrant mutex. Holding the lock across pool teardown would
 	// also serialize concurrent callers behind filesystem work.

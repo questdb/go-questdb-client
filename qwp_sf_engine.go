@@ -328,7 +328,7 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 		// otherwise one slot recovers under a foreground sender and the same
 		// slot is abandoned under a drainer.
 		if errors.Is(err, qwpSfErrSanitizedResidue) && attempt == 0 {
-			qwpSfLogGuarded(nil, slog.LevelError, "qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
+			qwpEffectiveLogger(nil).Error("qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
 			continue
 		}
 		// Quarantine-and-start-fresh is a foreground-only policy: a drainer
@@ -342,7 +342,7 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 			if quarantineErr != nil {
 				return nil, fmt.Errorf("%w; additionally could not quarantine slot: %v", err, quarantineErr)
 			}
-			qwpSfLogGuarded(nil, slog.LevelError, "qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
+			qwpEffectiveLogger(nil).Error("qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
 			// Keep the first preserved directory. The loop can quarantine
 			// twice, and only the first copy holds the rows the caller came
 			// looking for -- the second is whatever the fresh slot managed to
@@ -500,8 +500,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 				// slot. The seed then comes from the surviving segments alone,
 				// which can re-send frames a previous session already got
 				// acked.
-				qwpSfLogGuarded(nil, slog.LevelWarn,
-					"qwp/sf: opening a recovered slot without its ack watermark; already-acked frames may replay",
+				qwpEffectiveLogger(nil).Warn("qwp/sf: opening a recovered slot without its ack watermark; already-acked frames may replay",
 					"dir", sfDir, "error", err)
 				watermark, err = nil, nil
 			}
@@ -582,8 +581,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			if persistedDict != nil && len(recoveredSymbols) > persistedDict.size() {
 				from := persistedDict.size()
 				if appendErr := persistedDict.appendSymbols(recoveredSymbols[from:]); appendErr != nil {
-					qwpSfLogGuarded(nil, slog.LevelWarn,
-						"qwp/sf: could not heal recovered symbol dictionary; falling back to full-dictionary frames",
+					qwpEffectiveLogger(nil).Warn("qwp/sf: could not heal recovered symbol dictionary; falling back to full-dictionary frames",
 						"error", appendErr)
 					_ = persistedDict.close()
 					persistedDict = nil
@@ -609,8 +607,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			}
 			watermark, err = qwpSfAckWatermarkOpenRequired(sfDir)
 			if errors.Is(err, qwpSfErrAckWatermarkUnbacked) {
-				qwpSfLogGuarded(nil, slog.LevelWarn,
-					"qwp/sf: opening a fresh slot without its ack watermark; a later recovery falls back to the surviving segments",
+				qwpEffectiveLogger(nil).Warn("qwp/sf: opening a fresh slot without its ack watermark; a later recovery falls back to the surviving segments",
 					"dir", sfDir, "error", err)
 				watermark, err = nil, nil
 			}
@@ -1173,8 +1170,7 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 			e.deferredCleanupOwned.Store(false)
 		}
 		if handedOff {
-			qwpSfLogGuarded(e.engineLogger(), slog.LevelError,
-				"qwp/sf: close handed to the manager worker's exit path; the slot stays locked until it completes",
+			qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: close handed to the manager worker's exit path; the slot stays locked until it completes",
 				"slot", e.sfDir)
 			return nil
 		}
@@ -1290,7 +1286,7 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 			if firstErr == nil {
 				firstErr = err
 			}
-			qwpSfLogGuarded(e.engineLogger(), slog.LevelError, "qwp/sf: could not release slot lock after close", "slot", e.sfDir, "error", err)
+			qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: could not release slot lock after close", "slot", e.sfDir, "error", err)
 			e.terminalCleanupClaimed.Store(false)
 			return firstErr
 		}
@@ -1345,11 +1341,11 @@ func (e *qwpSfCursorEngine) engineCompleteDeferredClose() {
 		// reporting the error so even a panicking user logger cannot leave the
 		// slot without a cleanup owner.
 		e.engineStartCloseRetryOwner(logger)
-		qwpSfLogGuarded(logger, slog.LevelError, "qwp/sf: deferred engine close failed",
+		qwpEffectiveLogger(logger).Error("qwp/sf: deferred engine close failed",
 			"slot", e.sfDir, "error", err, "closeCompleted", e.closeCompleted.Load())
 		return
 	}
-	qwpSfLogGuarded(logger, slog.LevelInfo, "qwp/sf: deferred engine close completed",
+	qwpEffectiveLogger(logger).Info("qwp/sf: deferred engine close completed",
 		"slot", e.sfDir, "closeCompleted", e.closeCompleted.Load())
 }
 
@@ -1469,7 +1465,7 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 		defer func() {
 			if r := recover(); r != nil {
 				e.closeRetryOwnerStarted.Store(false)
-				qwpSfLogGuarded(logger, slog.LevelError, "qwp/sf: terminal cleanup retry owner panicked",
+				qwpEffectiveLogger(logger).Error("qwp/sf: terminal cleanup retry owner panicked",
 					"slot", e.sfDir, "panic", r, "stack", string(debug.Stack()))
 				if !e.closeCompleted.Load() {
 					e.engineStartCloseRetryOwner(logger)
@@ -1483,7 +1479,7 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 				now := time.Now()
 				if qwpSfShouldLogCloseRetry(lastWarn, now) {
 					lastWarn = now
-					qwpSfLogGuarded(logger, slog.LevelWarn, "qwp/sf: terminal cleanup retry failed; slot lock remains held",
+					qwpEffectiveLogger(logger).Warn("qwp/sf: terminal cleanup retry failed; slot lock remains held",
 						"slot", e.sfDir, "error", retryErr)
 				}
 			}
@@ -1503,11 +1499,6 @@ func (e *qwpSfCursorEngine) engineLogger() *slog.Logger {
 		return nil
 	}
 	return e.manager.logger.Load()
-}
-
-func qwpSfLogGuarded(logger *slog.Logger, level slog.Level, message string, args ...any) {
-	defer func() { _ = recover() }()
-	qwpEffectiveLogger(logger).Log(context.Background(), level, message, args...)
 }
 
 func qwpSfShouldLogCloseRetry(last, now time.Time) bool {

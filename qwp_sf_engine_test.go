@@ -997,42 +997,22 @@ func TestQwpSfTerminalCleanupHasExactlyOneOwner(t *testing.T) {
 	require.False(t, e.engineCloseRetryable())
 }
 
-// TestQwpEveryProductionLogCallIsPanicGuarded keeps the rule mechanically
-// checkable. The logger is the application's slog handler, which is free to
-// panic: qwpEffectiveLogger(nil) resolves to slog.Default(), so "no logger
-// configured" is not "no user code". Every production log call therefore runs
-// through qwpSfLogGuarded, because the step behind a log call is regularly the
-// one that matters -- latching a fatal error, reporting on a channel, releasing
-// a transport, or assigning a fallback policy.
+// TestQwpLoggerConstructionIsConfinedToQwpLog keeps the panic-guard rule
+// checkable with a rule that can be complete. The guard lives on the handler
+// (qwpGuardedHandler), installed once wherever a logger enters the client, so
+// every stored or resolved logger is guarded and every call site may log
+// directly. Producing an UNguarded logger therefore requires constructing
+// one — and constructing a *slog.Logger requires calling slog.New or
+// slog.Default. This test resolves each production file's import of log/slog
+// (under any local name) and asserts those two constructors are called only
+// in qwp_log.go, where both uses immediately wrap the handler.
 //
-// The check is default-deny: any call to a slog level method that takes at
-// least one argument is a finding unless it is one of the two exemptions
-// below. It deliberately does NOT try to decide whether the receiver is a
-// logger. Four rounds of review widened a receiver matcher one shape at a time
-// -- a nested call argument, a call split over lines, a struct field, a
-// parameter, a var declaration, an atomic Load -- and each round a reviewer
-// found another shape it could not see, ending with plain slog.Warn(...). The
-// set of expressions that can have type *slog.Logger is unbounded and their
-// spelling is unconstrained, so no name-based rule can be sound. Over-flagging
-// is the safe direction: a false positive costs one guarded call, a false
-// negative costs the host process.
-//
-// The zero-argument requirement is what keeps error.Error() out. Every slog
-// level method takes a message; error's does not.
-//
-// The two exemptions are the dispatchers' own handler-panic reports, which
-// already carry an inner recover. They are named by the message they log, so
-// the rest of each file stays checked -- a whole-file exemption hid an
-// unguarded default error handler for a full round.
-func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
-	allowed := map[string]string{
-		"qwp_dispatcher.go":    "handler panicked",
-		"qwp_sf_dispatcher.go": "error handler panicked",
-	}
-	levelMethods := map[string]bool{
-		"Warn": true, "Error": true, "Info": true, "Debug": true, "Log": true,
-		"WarnContext": true, "ErrorContext": true, "InfoContext": true, "DebugContext": true,
-	}
+// The earlier enforcement tried to spot unguarded call sites by how the
+// logger was spelled and lost four rounds in a row — the set of expressions
+// that can hold a logger is unbounded, so no spelling-based rule over call
+// sites can be sound. Constructor calls are a finite, resolvable set.
+func TestQwpLoggerConstructionIsConfinedToQwpLog(t *testing.T) {
+	constructors := map[string]bool{"New": true, "Default": true}
 
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
@@ -1041,59 +1021,53 @@ func TestQwpEveryProductionLogCallIsPanicGuarded(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, pkgs, "the scan must actually parse the package")
 
-	var unguarded, considered []string
+	var violations, considered []string
 	for _, pkg := range pkgs {
 		for name, file := range pkg.Files {
 			base := filepath.Base(name)
+			// Resolve the local name log/slog is imported under in THIS
+			// file, so an aliased import cannot dodge the check.
+			slogName := ""
+			for _, imp := range file.Imports {
+				if imp.Path.Value != `"log/slog"` {
+					continue
+				}
+				slogName = "slog"
+				if imp.Name != nil {
+					slogName = imp.Name.Name
+				}
+			}
+			if slogName == "" || slogName == "_" {
+				continue
+			}
 			ast.Inspect(file, func(n ast.Node) bool {
-				fn, ok := n.(*ast.FuncDecl)
+				call, ok := n.(*ast.CallExpr)
 				if !ok {
 					return true
 				}
-				if fn.Name.Name == "qwpSfLogGuarded" {
-					return false // the helper's own delegation to the handler
-				}
-				ast.Inspect(fn, func(n ast.Node) bool {
-					call, ok := n.(*ast.CallExpr)
-					if !ok {
-						return true
-					}
-					sel, ok := call.Fun.(*ast.SelectorExpr)
-					if !ok || !levelMethods[sel.Sel.Name] || len(call.Args) == 0 {
-						return true
-					}
-					where := fmt.Sprintf("%s:%d", base, fset.Position(call.Pos()).Line)
-					considered = append(considered, where)
-					if msg, ok := allowed[base]; ok && containsStringLiteral(call.Args[0], msg) {
-						return true
-					}
-					unguarded = append(unguarded, where)
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || !constructors[sel.Sel.Name] {
 					return true
-				})
-				return false
+				}
+				ident, ok := sel.X.(*ast.Ident)
+				if !ok || ident.Name != slogName || ident.Obj != nil {
+					return true
+				}
+				where := fmt.Sprintf("%s:%d %s.%s", base, fset.Position(call.Pos()).Line, slogName, sel.Sel.Name)
+				considered = append(considered, where)
+				if base != "qwp_log.go" {
+					violations = append(violations, where)
+				}
+				return true
 			})
 		}
 	}
-	// A positive control: parsing the package is not enough, the matcher has to
-	// have run over real level-method calls.
-	require.NotEmpty(t, considered, "the level-method matcher never fired")
-	require.Empty(t, unguarded,
-		"these log calls reach the user's slog handler unguarded; route them through qwpSfLogGuarded")
+	// A positive control: qwp_log.go's own constructor calls must have been
+	// seen, or the matcher never ran.
+	require.NotEmpty(t, considered, "the constructor matcher never fired")
+	require.Empty(t, violations,
+		"these sites construct a logger outside qwp_log.go; such a logger has no guarded handler — route it through qwpGuardLogger / qwpEffectiveLogger instead")
 }
-
-// containsStringLiteral reports whether expr contains a string literal with the
-// given substring, looking through concatenation so a prefixed message counts.
-func containsStringLiteral(expr ast.Expr, want string) bool {
-	found := false
-	ast.Inspect(expr, func(n ast.Node) bool {
-		if lit, ok := n.(*ast.BasicLit); ok && strings.Contains(lit.Value, want) {
-			found = true
-		}
-		return true
-	})
-	return found
-}
-
 // TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine pins the
 // window between publishing deferred cleanup ownership and actually taking the
 // handoff. A fault there used to leave deferredCleanupOwned set with nothing

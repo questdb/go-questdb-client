@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -99,7 +98,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		if openErr != nil {
 			if errors.Is(openErr, qwpSfErrSegmentCorrupt) {
 				corruptPaths = append(corruptPaths, path)
-				qwpSfLogGuarded(nil, slog.LevelWarn, "qwp/sf: deferring corrupt segment quarantine until recovery boundaries validate", "path", path, "error", openErr)
+				qwpEffectiveLogger(nil).Warn("qwp/sf: deferring corrupt segment quarantine until recovery boundaries validate", "path", path, "error", openErr)
 				continue
 			}
 			return nil, nil, fmt.Errorf("qwp/sf: open segment %s during recovery: %w", path, openErr)
@@ -133,7 +132,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			return nil, nil, qwpSfFailClosed("sf-manifest.bin references durable data but no segment file carries frames")
 		}
 		if manifest != nil {
-			qwpSfLogGuarded(nil, slog.LevelWarn, "qwp/sf: removing collapsed manifest with no segment files", "dir", sfDir)
+			qwpEffectiveLogger(nil).Warn("qwp/sf: removing collapsed manifest with no segment files", "dir", sfDir)
 			if err := manifest.close(); err != nil {
 				return nil, nil, err
 			}
@@ -553,7 +552,7 @@ func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]st
 		if wanted {
 			qwpSfQuarantinePaths([]string{path})
 		} else if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			qwpSfLogGuarded(nil, slog.LevelWarn, "qwp/sf: could not remove validated extra segment", "path", path, "error", err)
+			qwpEffectiveLogger(nil).Warn("qwp/sf: could not remove validated extra segment", "path", path, "error", err)
 		}
 	}
 	return nil
@@ -600,7 +599,7 @@ func qwpSfCorruptMayHoldFrames(path string) bool {
 func qwpSfQuarantinePaths(paths []string) {
 	for _, path := range paths {
 		if _, err := qwpSfQuarantinePath(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			qwpSfLogGuarded(nil, slog.LevelWarn, "qwp/sf: could not quarantine corrupt segment", "path", path, "error", err)
+			qwpEffectiveLogger(nil).Warn("qwp/sf: could not quarantine corrupt segment", "path", path, "error", err)
 		}
 	}
 }

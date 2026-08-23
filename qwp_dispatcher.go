@@ -254,7 +254,7 @@ func (d *qwpDispatcher[T]) close() {
 	case <-joined:
 	case <-timer.C:
 		d.abandon.Store(true)
-		qwpSfLogGuarded(d.logger, slog.LevelWarn, d.logPrefix+": handler still running after close; "+
+		qwpEffectiveLogger(d.logger).Warn(d.logPrefix+": handler still running after close; "+
 			"abandoning dispatcher goroutine and dropping queued notifications",
 			"timeout", qwpSfDispatcherCloseJoinTimeout)
 	}

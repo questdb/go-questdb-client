@@ -511,7 +511,7 @@ func (m *qwpSfSegmentManager) workerLoop() {
 		if r := recover(); r != nil {
 			detail := fmt.Sprintf("%v\n%s", r, debug.Stack())
 			m.workerPanic.Store(&detail)
-			qwpSfLogGuarded(m.logger.Load(), slog.LevelError, "qwp/sf: segment manager worker panicked",
+			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager worker panicked",
 				"detail", detail)
 		}
 		m.workerGoid.Store(0)
@@ -569,7 +569,7 @@ func (m *qwpSfSegmentManager) runDeferredCleanup(cleanup func(), message string)
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			qwpSfLogGuarded(m.logger.Load(), slog.LevelError, "qwp/sf: "+message, "panic", r, "stack", string(debug.Stack()))
+			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: "+message, "panic", r, "stack", string(debug.Stack()))
 		}
 	}()
 	cleanup()
@@ -708,23 +708,21 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			}
 			m.mu.Unlock()
 			if shouldLog {
-				// Guarded like every other log this goroutine writes: the
-				// worker's recover is final, so a panicking user handler here
+				// The guarded handler matters especially on this goroutine: the
+				// worker.'s recover is final, so a panicking user handler here
 				// would stop provisioning and trimming for every slot this
 				// manager serves, and the producer would be told
 				// "segment manager worker stopped" for what is a logging bug.
 				logger := m.logger.Load()
 				if memoryMode {
-					qwpSfLogGuarded(logger, slog.LevelWarn,
-						"qwp/sf: in-memory segment cap reached; spare provisioning "+
-							"paused — producers block until in-flight segments are ACK'd and trimmed",
+					qwpEffectiveLogger(logger).Warn("qwp/sf: in-memory segment cap reached; spare provisioning "+
+						"paused — producers block until in-flight segments are ACK'd and trimmed",
 						"usedBytes", observedTotal, "maxBytes", m.maxTotalBytes,
 						"segmentSize", m.segmentSizeBytes)
 				} else {
-					qwpSfLogGuarded(logger, slog.LevelWarn,
-						"qwp/sf: disk cap reached; spare provisioning "+
-							"paused — producers block until in-flight segments are ACK'd and trimmed"+
-							" (quarantined .corrupt bytes count against the cap; deleting them regains space)",
+					qwpEffectiveLogger(logger).Warn("qwp/sf: disk cap reached; spare provisioning "+
+						"paused — producers block until in-flight segments are ACK'd and trimmed"+
+						" (quarantined .corrupt bytes count against the cap; deleting them regains space)",
 						"dir", e.dir, "usedBytes", observedTotal, "quarantinedBytes", quarantined,
 						"maxBytes", m.maxTotalBytes, "segmentSize", m.segmentSizeBytes)
 				}
@@ -1001,6 +999,6 @@ func (m *qwpSfSegmentManager) recordServiceError(e *qwpSfManagerRingEntry, err e
 	}
 	m.mu.Unlock()
 	if shouldLog {
-		qwpSfLogGuarded(m.logger.Load(), slog.LevelError, "qwp/sf: segment manager maintenance failed; will retry", "dir", dir, "error", err)
+		qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager maintenance failed; will retry", "dir", dir, "error", err)
 	}
 }
