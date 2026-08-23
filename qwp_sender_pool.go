@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"math/big"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -672,7 +673,7 @@ func slotHasUnackedRows(delegate QwpSender) bool {
 func closeSlotGuarded(ctx context.Context, delegate LineSender) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("qwp pool: delegate close panicked: %v", r)
+			err = fmt.Errorf("qwp pool: delegate close panicked: %v\n%s", r, debug.Stack())
 		}
 	}()
 	return delegate.Close(ctx)
@@ -992,30 +993,25 @@ func (p *qwpSenderPool) close(_ context.Context) error {
 			"each is torn down when its lease is closed", "leaked", leaked)
 	}
 
-	var (
-		wg       sync.WaitGroup
-		errMu    sync.Mutex
-		firstErr error
-	)
-	for _, slot := range toClose {
+	var wg sync.WaitGroup
+	errs := make([]error, len(toClose))
+	for i, slot := range toClose {
 		wg.Add(1)
-		go func(delegate QwpSender) {
+		go func(i int, delegate QwpSender) {
 			defer wg.Done()
-			if err := closeSlotGuarded(context.Background(), delegate); err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
-			}
-		}(slot.delegate)
+			errs[i] = closeSlotGuarded(context.Background(), delegate)
+		}(i, slot.delegate)
 	}
 	wg.Wait()
-	p.mu.Lock()
-	for _, slot := range toClose {
-		p.reclaimSlotLocked(slot, firstErr)
+	var teardownErr error
+	for _, closeErr := range errs {
+		teardownErr = qwpAppendCloseError(teardownErr, closeErr)
 	}
-	p.closeTeardownErr = firstErr
+	p.mu.Lock()
+	for i, slot := range toClose {
+		p.reclaimSlotLocked(slot, errs[i])
+	}
+	p.closeTeardownErr = teardownErr
 	close(p.closeDone)
 	p.broadcastLocked()
 	p.mu.Unlock()
@@ -1136,7 +1132,7 @@ func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async b
 	// asserting here lets a pooled lease forward the full QwpSender surface.
 	qwpDelegate, ok := delegate.(QwpSender)
 	if !ok {
-		_ = delegate.Close(ctx)
+		_ = closeSlotGuarded(ctx, delegate)
 		return nil, fmt.Errorf("qwp pool: delegate is %T, not a QwpSender", delegate)
 	}
 	now := time.Now()

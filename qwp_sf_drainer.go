@@ -429,23 +429,28 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
 		return
 	}
-	engine.engineSetLogger(qwpEffectiveLogger(d.logger))
-	// Declared here so the engine-close defer (which runs after the send-loop
-	// close defer below, LIFO) can leak the segment mmaps when the send loop was
-	// abandoned wedged in disk I/O rather than unmap them under that goroutine.
+	// Install engine ownership immediately. A loop acquired below adds its own
+	// obligation after this one, so LIFO still stops the wire before deciding
+	// whether the mappings are safe to unmap. This must precede even logger
+	// setup and test seams: either can run user/fault-injection code.
 	var loop *qwpSfSendLoop
+	loopStopped := true
 	defer func() {
-		if loop != nil && loop.sendLoopAbandoned() {
-			_ = engine.engineCloseLeakSegments()
-		} else {
-			_ = engine.engineClose()
+		leakMappings := loop != nil && (!loopStopped || loop.sendLoopAbandoned())
+		closeErr := closeEngineGuarded(engine, leakMappings, d.logger)
+		if closeErr != nil {
+			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer engine close failed",
+				"slot", d.slotPath, "error", closeErr)
 		}
 		if !engine.engineCloseCompleted() {
-			engine.engineStartCloseRetryOwner(d.logger)
 			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer close incomplete; a terminal cleanup owner will retain and retry the slot lock release",
 				"slot", d.slotPath)
 		}
 	}()
+	engine.engineSetLogger(qwpEffectiveLogger(d.logger))
+	if hook := qwpSfTestAfterDrainerEngineOpenHook.Load(); hook != nil {
+		(*hook)(engine)
+	}
 
 	target := engine.enginePublishedFsn()
 	d.targetFsn.Store(target)
@@ -524,6 +529,14 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	loop = qwpSfNewSendLoop(engine, transport, d.clientFactory,
 		qwpSfDefaultParkInterval,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
+	defer func() {
+		var loopErr error
+		loopStopped, loopErr = closeBuiltSendLoopGuarded(loop, d.logger)
+		if loopErr != nil {
+			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer send loop close failed",
+				"slot", d.slotPath, "error", loopErr)
+		}
+	}()
 	loop.logger = qwpEffectiveLogger(d.logger)
 	// A durable-ack drainer trims the orphan slot only on STATUS_DURABLE_ACK, so
 	// recovered data is not deleted before it is durably uploaded. A mismatch is
@@ -546,7 +559,6 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// here (no engineAppendBlocking caller to park).
 	engine.engineSetTerminalErrorGetter(loop.sendLoopCheckError)
 	loop.sendLoopStart()
-	defer func() { _ = loop.sendLoopClose() }()
 
 	timer := time.NewTicker(qwpSfDrainerPollInterval)
 	defer timer.Stop()
@@ -836,11 +848,19 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 	if !p.closed.CompareAndSwap(false, true) {
 		return
 	}
+	// Install cancellation before any operation that can fault. Once closed is
+	// published no later caller may enter this body, so normal fallthrough is
+	// not a safe owner for the only signal that unwinds blocking drainer I/O.
+	defer p.cancel()
+	if hook := qwpTestDrainerPoolCloseHook.Load(); hook != nil {
+		(*hook)()
+	}
 	p.mu.Lock()
-	for _, d := range p.active {
+	active := append([]*qwpSfOrphanDrainer(nil), p.active...)
+	p.mu.Unlock()
+	for _, d := range active {
 		d.drainerRequestStop()
 	}
-	p.mu.Unlock()
 	doneCh := make(chan struct{})
 	go func() {
 		p.wg.Wait()
@@ -875,7 +895,13 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 				"grace", qwpSfDrainerPoolCloseGrace.load()+qwpSfDrainerPoolHardCloseGrace.load())
 		}
 	}
-	// Release the master ctx even on the clean-exit path so the
-	// underlying timer goroutine doesn't linger.
-	p.cancel()
 }
+
+// qwpTestDrainerPoolCloseHook fires after the pool has published closed and
+// installed its cancellation obligation. Test seam only: it proves a panic in
+// the remaining close body still cancels the master context. Nil in production.
+var qwpTestDrainerPoolCloseHook atomic.Pointer[func()]
+
+// qwpSfTestAfterDrainerEngineOpenHook exposes the engine only to lifecycle
+// tests that must join its retry owner before allowing TempDir cleanup.
+var qwpSfTestAfterDrainerEngineOpenHook atomic.Pointer[func(*qwpSfCursorEngine)]

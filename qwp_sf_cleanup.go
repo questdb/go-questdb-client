@@ -91,6 +91,7 @@ type qwpSfCleanupState struct {
 	generation          uint64
 	drainKnown          bool
 	fullyDrained        bool
+	barriersCommitted   bool
 	leakMappings        bool
 	resourcesClosed     bool
 	drainedFilesPending bool
@@ -276,15 +277,15 @@ func (c *qwpSfCleanupControl) tryClaim(owner qwpSfCleanupOwner, respectRetryOwne
 // close. It consumes the claimed generation after appendMu has been acquired
 // and returns a distinct running token. The same claim cannot start twice, and
 // no caller can validate one field before a rollback and another after it.
-func (c *qwpSfCleanupControl) startTerminal(token qwpSfCleanupToken) (qwpSfCleanupToken, bool, bool, bool, bool, bool) {
+func (c *qwpSfCleanupControl) startTerminal(token qwpSfCleanupToken) (qwpSfCleanupToken, bool, bool, bool, bool, bool, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.tokenCurrentLocked(token, qwpSfCleanupClaimed) || !c.state.drainKnown {
-		return qwpSfCleanupToken{}, false, false, false, false, false
+		return qwpSfCleanupToken{}, false, false, false, false, false, false
 	}
 	runToken := c.transitionLocked(qwpSfCleanupRunning, token.owner)
-	return runToken, c.state.fullyDrained, c.state.leakMappings,
-		c.state.resourcesClosed, c.state.drainedFilesPending, true
+	return runToken, c.state.fullyDrained, c.state.barriersCommitted,
+		c.state.leakMappings, c.state.resourcesClosed, c.state.drainedFilesPending, true
 }
 
 func (c *qwpSfCleanupControl) abandonClaim(token qwpSfCleanupToken, err error) bool {
@@ -297,6 +298,20 @@ func (c *qwpSfCleanupControl) abandonClaim(token qwpSfCleanupToken, err error) b
 		c.state.firstErr = err
 	}
 	c.transitionLocked(qwpSfCleanupRetryable, qwpSfCleanupOwnerNone)
+	return true
+}
+
+// checkpointDrainBarriers records that the fully-drained durability barriers
+// (watermark sync and the collapsed manifest update) are committed. A retry
+// generation skips them: they write through side files a partially completed
+// pass may already have closed, and re-running them then fails spuriously.
+func (c *qwpSfCleanupControl) checkpointDrainBarriers(token qwpSfCleanupToken) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.tokenCurrentLocked(token, qwpSfCleanupRunning) {
+		return false
+	}
+	c.state.barriersCommitted = true
 	return true
 }
 

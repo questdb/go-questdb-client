@@ -324,6 +324,48 @@ func (s blockingPoolCloseSender) Close(context.Context) error {
 	return nil
 }
 
+type resultPoolCloseSender struct {
+	QwpSender
+	err    error
+	panic  any
+	closed *atomic.Int32
+}
+
+func (s resultPoolCloseSender) Close(context.Context) error {
+	s.closed.Add(1)
+	if s.panic != nil {
+		panic(s.panic)
+	}
+	return s.err
+}
+
+func TestQwpSenderPoolCloseRunsEveryDelegateAndJoinsErrorsInSlotOrder(t *testing.T) {
+	firstErr := errors.New("slot zero close failure")
+	thirdErr := errors.New("slot two close failure")
+	closed := atomic.Int32{}
+	p := &qwpSenderPool{
+		notify:         make(chan struct{}),
+		maxSize:        3,
+		acquireTimeout: time.Second,
+	}
+	p.all = []*qwpSenderSlot{
+		{delegate: resultPoolCloseSender{err: firstErr, closed: &closed}, slotIndex: -1},
+		{delegate: resultPoolCloseSender{panic: "slot one close panic", closed: &closed}, slotIndex: -1},
+		{delegate: resultPoolCloseSender{err: thirdErr, closed: &closed}, slotIndex: -1},
+	}
+	p.available = append([]*qwpSenderSlot(nil), p.all...)
+
+	err := p.close(context.Background())
+	require.Equal(t, int32(3), closed.Load(), "one delegate fault must not skip its siblings")
+	require.ErrorIs(t, err, firstErr)
+	require.ErrorContains(t, err, "slot one close panic")
+	require.ErrorIs(t, err, thirdErr)
+	require.Less(t, strings.Index(err.Error(), firstErr.Error()), strings.Index(err.Error(), "slot one close panic"),
+		"joined diagnostics must follow stable slot order, not goroutine completion order")
+	require.Less(t, strings.Index(err.Error(), "slot one close panic"), strings.Index(err.Error(), thirdErr.Error()),
+		"joined diagnostics must follow stable slot order, not goroutine completion order")
+}
+
 // TestQwpSenderPoolConcurrentCloseWaitsForFirstTeardown exercises close
 // directly, without the facade's sync.Once. A later caller must not take a
 // success snapshot until the first-pass delegate teardown has completed.

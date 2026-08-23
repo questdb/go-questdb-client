@@ -133,7 +133,7 @@ func TestQwpSfCleanupStaleTokenCannotComplete(t *testing.T) {
 	require.True(t, c.recordDrain(token, false))
 	claim, ok := c.managerReadyAndClaim(token, qwpSfCleanupOwnerClose)
 	require.True(t, ok)
-	run, _, _, _, _, ok := c.startTerminal(claim)
+	run, _, _, _, _, _, ok := c.startTerminal(claim)
 	require.True(t, ok)
 	require.True(t, c.complete(run))
 	require.False(t, c.complete(run), "a terminal generation must complete at most once")

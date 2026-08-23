@@ -706,6 +706,13 @@ var qwpSfSendLoopCloseGrace = qwpSfSwappable(5 * time.Second)
 func (l *qwpSfSendLoop) sendLoopClose() error {
 	l.running.Store(false)
 	l.cancel()
+	// Cancellation is an installed obligation, not normal fallthrough. Fault
+	// injection happens only after both stop signals are visible so the outer
+	// phase guard may conservatively leak mappings while this goroutine still
+	// finishes shutting down instead of staying alive indefinitely.
+	if hook := qwpTestCloseSendLoopHook.Load(); hook != nil {
+		(*hook)()
+	}
 	joined := make(chan struct{})
 	go func() {
 		l.wg.Wait()

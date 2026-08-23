@@ -139,6 +139,9 @@ const (
 	qwpSfCleanupTestAfterManagerHandoff
 	qwpSfCleanupTestAfterTerminalClaim
 	qwpSfCleanupTestDuringTerminalCleanup
+	qwpSfCleanupTestRingClosePhase
+	qwpSfCleanupTestWatermarkClosePhase
+	qwpSfCleanupTestSymbolDictClosePhase
 )
 
 // qwpSfTestCleanupHook injects faults at ownership boundaries without adding a
@@ -278,6 +281,10 @@ type qwpSfCursorEngine struct {
 	// retryability, completion and the drain/leak inputs carried across retries.
 	// Its mutex is never held across appendMu, manager waits or resource IO.
 	cleanup qwpSfCleanupControl
+	// closeRetryWG makes the engine-owned retry goroutine explicitly joinable
+	// by lifecycle tests. A restarted owner increments before the panicked
+	// generation decrements, so one Wait covers the chain.
+	closeRetryWG sync.WaitGroup
 
 	// appendMu serializes the producer's ring-append path against
 	// engineClose's segment teardown. The producer's only entry into
@@ -360,12 +367,11 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 	}
 }
 
-func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
+func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (result *qwpSfCursorEngine, err error) {
 	mgr, err := qwpSfNewSegmentManager(segmentSizeBytes, qwpSfManagerDefaultPoll, maxTotalBytes)
 	if err != nil {
 		return nil, err
 	}
-	mgr.segmentManagerStart()
 	// Close the manager (joining its worker goroutine) on any failure
 	// exit of the inner constructor — error return AND panic. The inner
 	// constructor's own deferred guard releases the slot flock on the
@@ -374,9 +380,17 @@ func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int6
 	ok := false
 	defer func() {
 		if !ok {
-			mgr.segmentManagerClose()
+			cleanupErr := qwpSfRunConstructionCleanupPhase(qwpSfConstructionCleanupManager, "segment manager", func() error {
+				mgr.segmentManagerClose()
+				return nil
+			})
+			if cleanupErr != nil {
+				err = qwpAppendCloseError(err, cleanupErr)
+				result = nil
+			}
 		}
 	}()
+	mgr.segmentManagerStart()
 	e, err := qwpSfNewCursorEngineWithManager(sfDir, segmentSizeBytes, mgr, appendDeadline)
 	if err != nil {
 		return nil, err
@@ -389,7 +403,7 @@ func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int6
 // qwpSfNewCursorEngineWithManager creates an engine that shares the
 // given segment manager (must already be started). The caller
 // retains ownership of the manager; engineClose will not stop it.
-func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegmentManager, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
+func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegmentManager, appendDeadline time.Duration) (result *qwpSfCursorEngine, err error) {
 	if appendDeadline <= 0 {
 		appendDeadline = qwpSfEngineDefaultAppendDeadline
 	}
@@ -399,10 +413,11 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		ring              *qwpSfSegmentRing
 		watermark         *qwpSfAckWatermark
 		persistedDict     *qwpSfSymbolDict
+		initial           *qwpSfSegment
+		manifest          *qwpSfManifest
 		recoveredSymbols  []string
 		recoveredMaxStart int
 		recoveredFromDisk bool
-		err               error
 	)
 	if !memoryMode {
 		// Acquire the slot lock BEFORE touching any *.sfa files.
@@ -429,23 +444,42 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	// needs no deregister here — and cleanup touches no manager state,
 	// which keeps it safe to run on the unwind of a registration panic.
 	ok := false
-	cleanup := func() {
+	cleanup := func() error {
+		var cleanupErr error
 		if ring != nil {
-			_ = ring.segmentRingClose()
+			cleanupErr = qwpAppendCloseError(cleanupErr,
+				qwpSfRunConstructionCleanupPhase(qwpSfConstructionCleanupRing, "segment ring", ring.segmentRingClose))
+		} else {
+			if initial != nil {
+				cleanupErr = qwpAppendCloseError(cleanupErr,
+					qwpSfRunConstructionCleanupPhase(qwpSfConstructionCleanupInitial, "initial segment", initial.close))
+			}
+			if manifest != nil {
+				cleanupErr = qwpAppendCloseError(cleanupErr,
+					qwpSfRunConstructionCleanupPhase(qwpSfConstructionCleanupManifest, "segment manifest", manifest.close))
+			}
 		}
 		if watermark != nil {
-			_ = watermark.close()
+			cleanupErr = qwpAppendCloseError(cleanupErr,
+				qwpSfRunConstructionCleanupPhase(qwpSfConstructionCleanupWatermark, "ack watermark", watermark.close))
 		}
 		if persistedDict != nil {
-			_ = persistedDict.close()
+			cleanupErr = qwpAppendCloseError(cleanupErr,
+				qwpSfRunConstructionCleanupPhase(qwpSfConstructionCleanupSymbolDict, "symbol dictionary", persistedDict.close))
 		}
 		if lock != nil {
-			_ = lock.close()
+			cleanupErr = qwpAppendCloseError(cleanupErr,
+				qwpSfRunConstructionCleanupPhase(qwpSfConstructionCleanupSlotLock, "slot lock", lock.close))
 		}
+		return cleanupErr
 	}
 	defer func() {
 		if !ok {
-			cleanup()
+			cleanupErr := cleanup()
+			if cleanupErr != nil {
+				err = qwpAppendCloseError(err, cleanupErr)
+				result = nil
+			}
 		}
 	}()
 	// Disk mode: try to recover any *.sfa files left behind by a
@@ -593,7 +627,6 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		}
 	}
 	if ring == nil {
-		var initial *qwpSfSegment
 		var initialPath string
 		if memoryMode {
 			initial, err = qwpSfCreateInMemorySegment(0, segmentSizeBytes)
@@ -634,27 +667,33 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		}
 		if !memoryMode {
 			if err := initial.syncHeader(); err != nil {
-				_ = initial.close()
 				return nil, err
 			}
 			if err := qwpSfSyncSlotDir(sfDir); err != nil {
-				_ = initial.close()
 				return nil, fmt.Errorf("qwp/sf: fsync fresh slot directory: %w", err)
 			}
-			manifest, createErr := qwpSfManifestCreate(sfDir, 0, 0)
+			var createErr error
+			manifest, createErr = qwpSfManifestCreate(sfDir, 0, 0)
 			if createErr != nil {
-				_ = initial.close()
 				return nil, createErr
 			}
 			if err := initial.markManifestRequired(); err != nil {
-				_ = manifest.close()
-				_ = initial.close()
 				return nil, err
+			}
+			if hook := qwpSfTestBeforeFreshRingAdoptHook.Load(); hook != nil {
+				if hookErr := (*hook)(); hookErr != nil {
+					return nil, hookErr
+				}
 			}
 			ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
 			ring.manifest = manifest
 		} else {
 			ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
+		}
+	}
+	if hook := qwpSfTestBeforeEngineRegisterHook.Load(); hook != nil {
+		if hookErr := (*hook)(); hookErr != nil {
+			return nil, hookErr
 		}
 	}
 	managerEntry, err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark)
@@ -679,6 +718,38 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	ok = true
 	return e, nil
 }
+
+type qwpSfConstructionCleanupPoint uint8
+
+const (
+	qwpSfConstructionCleanupRing qwpSfConstructionCleanupPoint = iota
+	qwpSfConstructionCleanupInitial
+	qwpSfConstructionCleanupManifest
+	qwpSfConstructionCleanupWatermark
+	qwpSfConstructionCleanupSymbolDict
+	qwpSfConstructionCleanupSlotLock
+	qwpSfConstructionCleanupManager
+)
+
+// qwpSfRunConstructionCleanupPhase keeps constructor cleanup fault injection
+// inside the same continuation boundary as the real release. The hook fires
+// after the release attempt so tests do not intentionally leak mappings or fds.
+func qwpSfRunConstructionCleanupPhase(point qwpSfConstructionCleanupPoint, name string, fn func() error) error {
+	return qwpRunCleanupPhaseGuarded(name, func() error {
+		err := fn()
+		if hook := qwpSfTestConstructionCleanupHook.Load(); hook != nil {
+			(*hook)(point)
+		}
+		return err
+	})
+}
+
+// qwpSfTestBeforeEngineRegisterHook forces the fully-acquired constructor down
+// its unwind path. qwpSfTestConstructionCleanupHook injects a panic at one
+// cleanup phase so tests can verify every later obligation still runs.
+var qwpSfTestBeforeEngineRegisterHook atomic.Pointer[func() error]
+var qwpSfTestBeforeFreshRingAdoptHook atomic.Pointer[func() error]
+var qwpSfTestConstructionCleanupHook atomic.Pointer[func(qwpSfConstructionCleanupPoint)]
 
 // engineAcknowledge records a server ACK for cumulative FSN seq.
 // Triggers background trim of any sealed segments whose every frame
@@ -1194,17 +1265,18 @@ func (e *qwpSfCursorEngine) engineFinishCloseGuarded(claim qwpSfCleanupToken) (e
 	qwpSfRunCleanupTestHook(qwpSfCleanupTestAfterTerminalClaim)
 	var (
 		fullyDrained        bool
+		barriersCommitted   bool
 		leakSegments        bool
 		resourcesClosed     bool
 		drainedFilesPending bool
 		ok                  bool
 	)
-	run, fullyDrained, leakSegments, resourcesClosed, drainedFilesPending, ok = e.cleanup.startTerminal(claim)
+	run, fullyDrained, barriersCommitted, leakSegments, resourcesClosed, drainedFilesPending, ok = e.cleanup.startTerminal(claim)
 	if !ok {
 		return nil
 	}
 	started = true
-	completed, finishErr := e.engineFinishClose(run, fullyDrained, leakSegments, resourcesClosed, drainedFilesPending)
+	completed, finishErr := e.engineFinishClose(run, fullyDrained, barriersCommitted, leakSegments, resourcesClosed, drainedFilesPending)
 	if completed {
 		e.cleanup.complete(run)
 	} else {
@@ -1217,7 +1289,7 @@ func (e *qwpSfCursorEngine) engineFinishCloseGuarded(claim qwpSfCleanupToken) (e
 // manager quiescence has been proven and revalidated. The caller holds
 // appendMu to fence producers, but the generation token -- not appendMu -- is
 // what prevents a serialized second owner from running cleanup again.
-func (e *qwpSfCursorEngine) engineFinishClose(run qwpSfCleanupToken, fullyDrained, leakSegments, resourcesClosed, drainedFilesPending bool) (bool, error) {
+func (e *qwpSfCursorEngine) engineFinishClose(run qwpSfCleanupToken, fullyDrained, barriersCommitted, leakSegments, resourcesClosed, drainedFilesPending bool) (bool, error) {
 	if hook := qwpSfTestEngineFinishCloseHook.Load(); hook != nil {
 		(*hook)()
 	}
@@ -1240,7 +1312,7 @@ func (e *qwpSfCursorEngine) engineFinishClose(run qwpSfCleanupToken, fullyDraine
 	}
 	var firstErr error
 	drainCleanupAllowed := fullyDrained
-	if fullyDrained {
+	if fullyDrained && !barriersCommitted {
 		e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
 		if err := e.watermark.sync(); err != nil {
 			firstErr = err
@@ -1271,22 +1343,44 @@ func (e *qwpSfCursorEngine) engineFinishClose(run qwpSfCleanupToken, fullyDraine
 		if !drainCleanupAllowed {
 			return false, firstErr
 		}
+		// The barriers write through the watermark and the ring's manifest,
+		// which the close phases below shut. Checkpoint them in the state
+		// record so a retry generation entering after a phase fault does not
+		// re-run them against closed side files and stall on a spurious error.
+		if !e.cleanup.checkpointDrainBarriers(run) {
+			return false, errors.New("qwp/sf: stale cleanup token after drain barriers")
+		}
 	}
-	if err := e.ring.segmentRingCloseInternal(leakSegments); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	firstErr = qwpAppendCloseError(firstErr,
+		qwpRunCleanupPhaseGuarded("segment ring", func() error {
+			qwpSfRunCleanupTestHook(qwpSfCleanupTestRingClosePhase)
+			return e.ring.segmentRingCloseInternal(leakSegments)
+		}))
 	// Close the watermark mmap/fd only after the owned manager has exited or the
 	// shared-manager entry is past its service pass, and before releasing the
 	// slot lock. No manager write can race this close.
 	if e.watermark != nil {
-		if err := e.watermark.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		firstErr = qwpAppendCloseError(firstErr,
+			qwpRunCleanupPhaseGuarded("ack watermark", func() error {
+				qwpSfRunCleanupTestHook(qwpSfCleanupTestWatermarkClosePhase)
+				return e.watermark.close()
+			}))
 	}
 	if e.persistedSymbolDict != nil {
-		if err := e.persistedSymbolDict.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		firstErr = qwpAppendCloseError(firstErr,
+			qwpRunCleanupPhaseGuarded("symbol dictionary", func() error {
+				qwpSfRunCleanupTestHook(qwpSfCleanupTestSymbolDictClosePhase)
+				return e.persistedSymbolDict.close()
+			}))
+	}
+	// A phase panic is stronger than an ordinary close error: the affected
+	// resource may not have finished releasing. All sibling phases above were
+	// still attempted, but retain the flock and make the generation retryable;
+	// the next pass skips the checkpointed barriers and re-attempts each
+	// idempotent resource close before release.
+	var phasePanic *qwpCleanupPanicError
+	if errors.As(firstErr, &phasePanic) {
+		return false, firstErr
 	}
 	if !e.cleanup.checkpointResourcesClosed(run, drainCleanupAllowed) {
 		return false, errors.New("qwp/sf: stale cleanup token after terminal resource close")
@@ -1304,9 +1398,7 @@ func (e *qwpSfCursorEngine) engineFinishClose(run qwpSfCleanupToken, fullyDraine
 	}
 	if e.slotLock != nil {
 		if err := e.slotLock.close(); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			firstErr = qwpAppendCloseError(firstErr, err)
 			qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: could not release slot lock after close", "slot", e.sfDir, "error", err)
 			return false, firstErr
 		}
@@ -1408,7 +1500,9 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 	if e == nil || !e.cleanup.startRetryOwner() {
 		return
 	}
+	e.closeRetryWG.Add(1)
 	go func() {
+		defer e.closeRetryWG.Done()
 		// Each attempt and every diagnostic below has its own panic boundary.
 		// Keep this outer boundary as the final crash story: relinquish the
 		// goroutine-owner marker and replace the owner if cleanup is incomplete.
