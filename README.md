@@ -504,7 +504,11 @@ whose durable cleanup did not finish. While any slot's cleanup is still
 outstanding, `db.Close(ctx)` returns an error wrapping `qdb.ErrSfCleanupPending`
 and a standalone sender's `Close` returns nil; neither means the slot's lock is
 gone. Call `db.Close(ctx)` again later — it re-probes every time and stops
-reporting `ErrSfCleanupPending` once the last lock is released.
+reporting `ErrSfCleanupPending` once the last lock is released. A nil result
+covers everything handed back to the pool by that point: a lease returned
+*after* a nil `Close` adds new cleanup work, so a later `Close` can report
+`ErrSfCleanupPending` again, and one more call clears it. Retrying until nil
+remains the correct shutdown gate either way.
 
 #### Local errors from the SF path
 

@@ -276,7 +276,10 @@ type LineSender interface {
 	// lock is gone: reopening the same sf_dir + sender_id right away can fail
 	// to acquire it, with an error naming this process as the holder. Retry
 	// the open until it succeeds. Pooled senders expose the same condition
-	// through QuestDB.Close as ErrSfCleanupPending.
+	// through QuestDB.Close as ErrSfCleanupPending; a nil QuestDB.Close covers
+	// the leases returned by that point, so a lease returned afterwards can
+	// make a later QuestDB.Close report pending again, and one more call
+	// clears it (retry until nil).
 	//
 	// A second Close reports a double-close error, with one QWP-only
 	// exception: when store-and-forward cleanup has been left with no owner

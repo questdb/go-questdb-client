@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -691,4 +692,60 @@ func TestQuestDBCloseRecordsTheNewestProbe(t *testing.T) {
 	defer db.closeMu.Unlock()
 	require.NoError(t, db.closeErr,
 		"the older probe must not record over the newer one's result")
+}
+
+// flippableDoneSlot is a cleanup reporter whose completion can be switched on
+// while probes are in flight, standing in for a deferred slot cleanup that
+// finishes at an arbitrary moment.
+type flippableDoneSlot struct{ done atomic.Bool }
+
+func (s *flippableDoneSlot) closeCompleted() bool               { return s.done.Load() }
+func (s *flippableDoneSlot) retryCloseIfNeeded() error          { return nil }
+func (s *flippableDoneSlot) ensureCloseRetryOwner(*slog.Logger) {}
+
+// TestQuestDBConcurrentCloseReprobes drives the real two-caller race on the
+// re-probe path: many goroutines calling Close concurrently on an SF facade
+// with a slot in deferred cleanup, with the cleanup completing mid-storm. The
+// seam-hooked test above pins one ordering; this one exercises the memory
+// model under -race. Every result must be coherent — nil or a pending report,
+// nothing else — and once every caller has returned and the cleanup has
+// landed, one more Close reports nil.
+func TestQuestDBConcurrentCloseReprobes(t *testing.T) {
+	db := &QuestDB{}
+	db.closeOnce.Do(func() {})
+	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
+	cleanup := &flippableDoneSlot{}
+	db.senderPool = &qwpSenderPool{
+		closed: true, notify: make(chan struct{}), storeAndForward: true,
+		slotInUse: []bool{true}, leakedSlots: 1,
+		retiredSlots: []*qwpSenderSlot{{slotIndex: 0, cleanup: cleanup}},
+	}
+
+	const callers = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if i == callers/2 {
+				cleanup.done.Store(true)
+			}
+			errs[i] = db.Close(context.Background())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			require.ErrorIs(t, err, ErrSfCleanupPending,
+				"caller %d must see either nil or a pending report", i)
+		}
+	}
+	cleanup.done.Store(true)
+	require.NoError(t, db.Close(context.Background()),
+		"with every caller returned and cleanup landed, Close must clear")
 }

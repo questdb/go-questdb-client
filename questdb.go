@@ -454,6 +454,13 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // errors.Is(err, ErrSfCleanupPending) holds, rather than treat the first
 // result as final.
 //
+// A nil result covers everything handed back to the pool by the time that
+// call probed: a lease returned after a nil Close adds new cleanup work, so a
+// later Close can report ErrSfCleanupPending again, and one more call clears
+// it once that cleanup lands. The pending-lock count is not monotone, and no
+// Close result pretends otherwise; retrying until nil remains the correct
+// shutdown gate under that reading.
+//
 // Avoid calling Close from inside a pooled SenderErrorHandler or
 // SenderConnectionListener. Pooled callbacks are funnelled through one
 // serializing mutex (see serializeErrorHandler), so a Close that blocks on a
@@ -487,6 +494,17 @@ func (db *QuestDB) Close(ctx context.Context) error {
 	db.closeProbeSeq++
 	seq := db.closeProbeSeq
 	db.closeMu.Unlock()
+	// Close's result splits into a stable part and a volatile part, and the
+	// two are handled differently on purpose. Stable: the query-pool error,
+	// the housekeeper error and the first pass's teardown error are recorded
+	// once under closeOnce and never rewritten — those teardowns ran exactly
+	// once, so no later observation can improve on them. Volatile: the
+	// pending-lock count is not monotone (a lease returned after close adds
+	// new cleanup work), so it is always probed fresh here and cached only
+	// under a newer probe sequence below — no comparison of old and new
+	// values can impose an ordering the numbers do not have, so "newest
+	// observation wins" is the only rule that works.
+	//
 	// Retained slot locks are the one Close result that can still change:
 	// qwpSenderPool.close is idempotent and re-probes its retired slots, and it
 	// replays the teardown error from the first pass, so recomputing here
