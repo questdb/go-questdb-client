@@ -48,10 +48,9 @@ func readPersistedDurableWatermark(t *testing.T, slotDir string) (int64, bool) {
 	if err != nil || int64(len(b)) < qwpSfAckWatermarkFileSize {
 		return qwpSfAckWatermarkInvalid, false
 	}
-	valid := func(rec qwpSfDualRecord) bool { return rec.first >= -1 }
-	r0, ok0 := qwpSfDecodeDualRecord(b[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+	r0, ok0 := qwpSfDecodeDualRecord(b[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
 	off := int(qwpSfDualRecordSlotSize)
-	r1, ok1 := qwpSfDecodeDualRecord(b[off:off+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+	r1, ok1 := qwpSfDecodeDualRecord(b[off:off+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
 	rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
 	if !ok {
 		return qwpSfAckWatermarkInvalid, false

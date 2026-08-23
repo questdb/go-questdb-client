@@ -45,10 +45,9 @@ import (
 // proven stale -- but every file that holds a frame the manifest still accounts
 // for is either left exactly as it was or preserved under another name.
 // TestQwpSfFailedRecoveryPreservesEveryRequiredFrame pins the failed half. On
-// the success path the committed head is what licenses a removal:
-// qwpSfDiscardOpened unlinks a segment only below that boundary, where the
-// manifest proves its frames delivered, and quarantines anything at or above
-// it that still carries frames or a torn tail.
+// the success path the committed head is what licenses a removal. The recovery
+// plan selects unlink only below that boundary, and revalidateUnlink repeats
+// the proof immediately before os.Remove.
 var (
 	//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 	qwpSfErrRecoveryFailClosed = errors.New("qwp/sf: recovery failed closed")
@@ -56,12 +55,72 @@ var (
 	qwpSfErrSanitizedResidue = errors.New("qwp/sf: sanitized sealed-segment residue; retry recovery once")
 )
 
+type qwpSfManifestProvenance uint8
+
+const (
+	qwpSfManifestMissing qwpSfManifestProvenance = iota
+	qwpSfManifestCommitted
+	qwpSfManifestSynthesized
+	qwpSfManifestInvalid
+)
+
+type qwpSfRecoveryAction uint8
+
+const (
+	qwpSfRecoveryKeep qwpSfRecoveryAction = iota
+	qwpSfRecoverySanitizeSealed
+	qwpSfRecoverySanitizeActive
+	qwpSfRecoveryQuarantine
+	qwpSfRecoveryUnlink
+	qwpSfRecoveryReplace
+	qwpSfRecoveryFailClosed
+)
+
+// qwpSfRecoveryFilePlan is the immutable evidence and selected action for one
+// directory entry. Recovery never infers an unlink from the state left behind
+// by an earlier mutation: the base/frame/torn/format facts are captured while
+// inspecting the slot, and the action carries the fact that licenses it.
+type qwpSfRecoveryFilePlan struct {
+	path             string
+	segment          *qwpSfSegment
+	baseSeq          int64
+	validFrames      int64
+	tornTailBytes    int64
+	manifestRequired bool
+	mayHoldFrames    bool
+	action           qwpSfRecoveryAction
+	license          string
+}
+
+// qwpSfRecoveryPlan separates recovery's read-only classification from its
+// namespace and mapped-file mutations. manifestProvenance describes the
+// boundary record observed during inspection; it changes to synthesized only
+// after apply durably creates that record.
+type qwpSfRecoveryPlan struct {
+	sfDir                  string
+	maxBytesPerSegment     int64
+	manifestProvenance     qwpSfManifestProvenance
+	manifest               *qwpSfManifest
+	invalidManifestPath    string
+	headBase               int64
+	activeBase             int64
+	all                    []*qwpSfSegment
+	files                  []qwpSfRecoveryFilePlan
+	chain                  []*qwpSfSegment
+	activeSeg              *qwpSfSegment
+	synthesizeManifest     bool
+	removeManifest         bool
+	collapsed              bool
+	retryAfterSanitizePath string
+	failClosedErr          error
+}
+
 func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, error) {
 	ring, _, err := qwpSfRecoverRing(sfDir, maxBytesPerSegment)
 	return ring, err
 }
 
-func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRing, _ *qwpSfManifest, retErr error) {
+func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, *qwpSfManifest, error) {
 	if _, err := os.Stat(sfDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil, nil
@@ -74,8 +133,8 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 	}
 
 	var all []*qwpSfSegment
-	var corruptPaths []string
 	var manifest *qwpSfManifest
+	var plan *qwpSfRecoveryPlan
 	success := false
 	defer func() {
 		if success {
@@ -89,6 +148,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		}
 	}()
 
+	files := make([]qwpSfRecoveryFilePlan, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sfa") {
 			continue
@@ -97,56 +157,91 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		seg, openErr := qwpSfOpenSegment(path)
 		if openErr != nil {
 			if errors.Is(openErr, qwpSfErrSegmentCorrupt) {
-				corruptPaths = append(corruptPaths, path)
+				mayHoldFrames := qwpSfCorruptMayHoldFrames(path)
+				files = append(files, qwpSfRecoveryFilePlan{
+					path:          path,
+					mayHoldFrames: mayHoldFrames,
+					action:        qwpSfRecoveryQuarantine,
+					license:       "the unreadable bytes are preserved under a non-segment name",
+				})
 				qwpEffectiveLogger(nil).Warn("qwp/sf: deferring corrupt segment quarantine until recovery boundaries validate", "path", path, "error", openErr)
 				continue
 			}
 			return nil, nil, fmt.Errorf("qwp/sf: open segment %s during recovery: %w", path, openErr)
 		}
 		all = append(all, seg)
-	}
-	// A corrupt file's identity is unknown -- segment names carry a generation,
-	// not a base -- so wherever the tail of the chain has to be proved, one that
-	// could be carrying frames blocks the proof. One that provably carries none
-	// does not: it cannot be the missing tail, whatever position it holds.
-	var framefulCorrupt []string
-	for _, path := range corruptPaths {
-		if qwpSfCorruptMayHoldFrames(path) {
-			framefulCorrupt = append(framefulCorrupt, path)
-		}
+		files = append(files, qwpSfRecoveryFilePlan{
+			path:             path,
+			segment:          seg,
+			baseSeq:          seg.segmentBaseSeq(),
+			validFrames:      seg.segmentFrameCount(),
+			tornTailBytes:    seg.segmentTornTailBytes(),
+			manifestRequired: seg.segmentManifestRequired(),
+			mayHoldFrames:    seg.segmentFrameCount() > 0 || seg.segmentTornTailBytes() > 0,
+			action:           qwpSfRecoveryKeep,
+			license:          "selected recovery-chain member",
+		})
 	}
 
-	manifest, err = qwpSfManifestOpen(sfDir)
+	var invalidManifest bool
+	manifest, invalidManifest, err = qwpSfManifestInspect(sfDir)
 	if err != nil {
 		return nil, nil, err
 	}
+	plan = qwpSfBuildRecoveryPlan(sfDir, maxBytesPerSegment, all, files, manifest, invalidManifest)
+	ring, recoveredManifest, err := qwpSfApplyRecoveryPlan(plan)
+	manifest = plan.manifest
+	if err != nil {
+		return nil, nil, err
+	}
+	// Ownership of the retained chain and manifest transferred to the ring. All
+	// other segments were closed by the action executor.
+	all = nil
+	success = true
+	return ring, recoveredManifest, nil
+}
+
+func qwpSfBuildRecoveryPlan(
+	sfDir string,
+	maxBytesPerSegment int64,
+	all []*qwpSfSegment,
+	files []qwpSfRecoveryFilePlan,
+	manifest *qwpSfManifest,
+	invalidManifest bool,
+) *qwpSfRecoveryPlan {
+	p := &qwpSfRecoveryPlan{
+		sfDir:              sfDir,
+		maxBytesPerSegment: maxBytesPerSegment,
+		manifest:           manifest,
+		all:                all,
+		files:              files,
+	}
+	switch {
+	case manifest != nil:
+		p.manifestProvenance = qwpSfManifestCommitted
+		p.headBase = manifest.headBase
+		p.activeBase = manifest.activeBase
+	case invalidManifest:
+		p.manifestProvenance = qwpSfManifestInvalid
+		p.invalidManifestPath = filepath.Join(sfDir, qwpSfManifestFileName)
+	default:
+		p.manifestProvenance = qwpSfManifestMissing
+	}
+
+	framefulCorrupt := p.framefulCorruptPaths()
 	if len(all) == 0 {
-		// With every file unreadable, one that could be carrying frames is the
-		// whole chain as far as recovery can tell -- manifest or not, nothing
-		// here can show its frames delivered, so the slot fails closed and the
-		// caller preserves it.
 		if len(framefulCorrupt) > 0 {
-			return nil, nil, qwpSfFailClosed("every SF segment file is unreadable and one of them may carry frames: %s", strings.Join(framefulCorrupt, ", "))
+			return p.failClosed(qwpSfFailClosed(
+				"every SF segment file is unreadable and one of them may carry frames: %s",
+				strings.Join(framefulCorrupt, ", ")))
 		}
 		if manifest != nil && manifest.headBase != manifest.activeBase {
-			return nil, nil, qwpSfFailClosed("sf-manifest.bin references durable data but no segment file carries frames")
+			return p.failClosed(qwpSfFailClosed(
+				"sf-manifest.bin references durable data but no segment file carries frames"))
 		}
-		if manifest != nil {
-			qwpEffectiveLogger(nil).Warn("qwp/sf: removing collapsed manifest with no segment files", "dir", sfDir)
-			if err := manifest.close(); err != nil {
-				return nil, nil, err
-			}
-			manifest = nil
-			if err := qwpSfRemoveManifestAndSyncDir(sfDir); err != nil {
-				return nil, nil, err
-			}
-		}
-		// What is left provably carries no frames -- the residue of a crash
-		// during segment creation -- so the bytes are preserved aside for
-		// forensics and the slot starts fresh.
-		qwpSfQuarantinePaths(corruptPaths)
-		success = true
-		return nil, nil, nil
+		p.collapsed = true
+		p.removeManifest = manifest != nil
+		return p
 	}
 
 	data := make([]*qwpSfSegment, 0, len(all))
@@ -158,243 +253,470 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		requiresManifest = requiresManifest || seg.segmentManifestRequired()
 	}
 	sort.Slice(data, func(i, j int) bool {
-		return uint64(data[i].segmentBaseSeq()) < uint64(data[j].segmentBaseSeq())
+		if data[i].segmentBaseSeq() != data[j].segmentBaseSeq() {
+			return data[i].segmentBaseSeq() < data[j].segmentBaseSeq()
+		}
+		return data[i].segmentPath() < data[j].segmentPath()
 	})
 	if manifest == nil && requiresManifest {
-		return nil, nil, qwpSfFailClosed("new-format SF segment exists but sf-manifest.bin is missing")
+		return p.failClosed(qwpSfFailClosed(
+			"new-format SF segment exists but sf-manifest.bin is missing"))
 	}
 
-	var chain []*qwpSfSegment
-	var activeSeg *qwpSfSegment
 	var preserve map[*qwpSfSegment]struct{}
-	// Whether the head boundary the common tail hands to qwpSfDiscardOpened
-	// was read from a manifest committed on disk. The legacy branch mints its
-	// manifest below from whatever files survived, and a head with no
-	// committed provenance licenses no torn-file deletion (see
-	// qwpSfDiscardOpened).
-	headCommitted := manifest != nil
 	if manifest != nil {
-		head, active := manifest.headBase, manifest.activeBase
-		activeSeg = qwpSfFindActive(all, active)
-		for _, seg := range data {
-			base := seg.segmentBaseSeq()
-			end := base + seg.segmentFrameCount()
-			if base < head {
-				if end > head {
-					return nil, nil, qwpSfFailClosed("segment overlaps committed SF head boundary")
-				}
-				continue
-			}
-			if base > active {
-				return nil, nil, qwpSfFailClosed("segment exists beyond committed SF active boundary")
-			}
-			if base == active && seg != activeSeg {
-				// A duplicate at the committed active base that the chain does
-				// not adopt. Rotation always assigns a strictly greater base,
-				// so a frameful one is not reachable today; preserving it
-				// rather than unlinking it keeps the no-frame-destroyed
-				// guarantee at the top of this file resting on the code
-				// instead of on that argument.
-				if seg.segmentFrameCount() > 0 {
-					if preserve == nil {
-						preserve = make(map[*qwpSfSegment]struct{}, 1)
-					}
-					preserve[seg] = struct{}{}
-				}
-				continue
-			}
-			chain = append(chain, seg)
-		}
-		if len(chain) > 0 {
-			if err := qwpSfValidateContiguous(chain); err != nil {
-				return nil, nil, err
-			}
-			if chain[0].segmentBaseSeq() != head {
-				return nil, nil, qwpSfFailClosed("missing expected SF head segment at base %d", head)
-			}
-		}
-		if activeSeg == nil {
-			if len(chain) == 0 && head == active && len(framefulCorrupt) == 0 {
-				if err := qwpSfDiscardOpened(all, nil, nil, qwpSfHeadNothingDelivered, false); err != nil {
-					return nil, nil, err
-				}
-				all = nil
-				// The slot collapses to a fresh one in this same directory, so
-				// set the corrupt files aside first. Left under their .sfa
-				// names, one of them is sf-initial.sfa, which the fresh slot
-				// creates with O_TRUNC -- destroying in place the very bytes
-				// this package promises to preserve -- and the rest are
-				// re-evaluated on the next open, where a transient open
-				// failure reclassifies one as possibly frameful and fails the
-				// now-populated slot closed.
-				qwpSfQuarantinePaths(corruptPaths)
-				// Commit every segment unlink/quarantine before making the
-				// manifest disappear in its own epoch. A missing manifest is safe
-				// only once no manifest-required segment name can survive.
-				if err := qwpSfSyncSlotDir(sfDir); err != nil {
-					return nil, nil, fmt.Errorf("qwp/sf: sync clean-drain segment cleanup directory %s: %w", sfDir, err)
-				}
-				if err := manifest.close(); err != nil {
-					return nil, nil, err
-				}
-				manifest = nil
-				if err := qwpSfRemoveManifestAndSyncDir(sfDir); err != nil {
-					return nil, nil, err
-				}
-				success = true
-				return nil, nil, nil
-			}
-			return nil, nil, qwpSfFailClosed("missing expected SF active segment at base %d", active)
-		}
-		if len(chain) == 0 {
-			if head != active || activeSeg.segmentFrameCount() != 0 || len(framefulCorrupt) > 0 {
-				suffix := ""
-				if len(framefulCorrupt) > 0 {
-					suffix = " (a corrupt segment prevents proving the empty state)"
-				}
-				return nil, nil, qwpSfFailClosed("missing SF chain between committed boundaries%s", suffix)
-			}
-			chain = append(chain, activeSeg)
-		} else if chain[len(chain)-1] != activeSeg {
-			last := chain[len(chain)-1]
-			chainEnd := last.segmentBaseSeq() + last.segmentFrameCount()
-			if len(framefulCorrupt) == 0 && activeSeg.segmentFrameCount() == 0 && activeSeg.segmentBaseSeq() == chainEnd {
-				chain = append(chain, activeSeg)
-			} else {
-				return nil, nil, qwpSfFailClosed("missing expected SF active/tail segment at base %d", active)
-			}
-		}
-		if path, err := qwpSfSanitizeSealedResidue(chain); err != nil {
-			return nil, nil, err
-		} else if path != "" {
-			return nil, nil, fmt.Errorf("%w: %s", qwpSfErrSanitizedResidue, path)
-		}
-		// A frame-zero tear leaves no recoverable frame in the active segment,
-		// but the bytes remain useful forensic evidence. Preserve them under the
-		// established .corrupt name and put a clean active at the same
-		// manifest-committed base instead of zeroing the only copy in place.
-		if activeSeg.segmentFrameCount() == 0 && activeSeg.segmentTornTailBytes() > 0 {
-			torn := activeSeg
-			path := torn.segmentPath()
-			if err := torn.close(); err != nil {
-				return nil, nil, err
-			}
-			replacement, err := qwpSfReplaceTornActive(path, active, maxBytesPerSegment)
-			if err != nil {
-				return nil, nil, err
-			}
-			for i, seg := range all {
-				if seg == torn {
-					all[i] = replacement
-					break
-				}
-			}
-			chain[len(chain)-1] = replacement
-			activeSeg = replacement
-		}
-		for _, seg := range chain {
-			if err := seg.markManifestRequired(); err != nil {
-				return nil, nil, err
-			}
+		if err := p.planCommittedChain(data, framefulCorrupt, &preserve); err != nil {
+			return p.failClosed(err)
 		}
 	} else {
-		// A legacy slot has no committed boundaries, so the files themselves are
-		// the only evidence of the chain's extent and a corrupt segment that may
-		// carry frames could be its head, an interior link, or the unsent tail.
-		// Nothing here can show its frames already delivered, so the whole legacy
-		// branch fails closed instead of quarantining the file and migrating a
-		// chain that may be missing rows. A file proven frameless holds no
-		// position in the chain, so it does not block the migration; the common
-		// tail preserves it aside.
-		if len(framefulCorrupt) > 0 {
-			return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain: a corrupt segment of unknown identity could belong to it")
+		if err := p.planLegacyChain(data, framefulCorrupt); err != nil {
+			return p.failClosed(err)
 		}
-		if len(data) > 0 {
-			if err := qwpSfValidateContiguous(data); err != nil {
-				return nil, nil, err
+	}
+	if p.failClosedErr != nil {
+		return p
+	}
+
+	keep := make(map[*qwpSfSegment]struct{}, len(p.chain))
+	for _, seg := range p.chain {
+		keep[seg] = struct{}{}
+		p.setSegmentAction(seg, qwpSfRecoveryKeep, "selected member of the validated contiguous chain")
+	}
+	if err := p.planDiscardActions(keep, preserve); err != nil {
+		return p.failClosed(err)
+	}
+	p.planSanitizationActions()
+	return p
+}
+
+func (p *qwpSfRecoveryPlan) planCommittedChain(
+	data []*qwpSfSegment,
+	framefulCorrupt []string,
+	preserve *map[*qwpSfSegment]struct{},
+) error {
+	head, active := p.headBase, p.activeBase
+	p.activeSeg = qwpSfFindActive(p.all, active)
+	for _, seg := range data {
+		base := seg.segmentBaseSeq()
+		end, err := qwpSfSegmentEnd(seg)
+		if err != nil {
+			return err
+		}
+		if base < head {
+			if end > head {
+				return qwpSfFailClosed("segment overlaps committed SF head boundary")
 			}
-			chain = append(chain, data...)
-			activeSeg = chain[len(chain)-1]
-			if _, err := qwpSfSanitizeSealedResidue(chain); err != nil {
-				return nil, nil, err
+			continue
+		}
+		if base > active {
+			return qwpSfFailClosed("segment exists beyond committed SF active boundary")
+		}
+		if base == active && seg != p.activeSeg {
+			if seg.segmentFrameCount() > 0 {
+				if *preserve == nil {
+					*preserve = make(map[*qwpSfSegment]struct{}, 1)
+				}
+				(*preserve)[seg] = struct{}{}
 			}
+			continue
+		}
+		p.chain = append(p.chain, seg)
+	}
+	if len(p.chain) > 0 {
+		if err := qwpSfValidateContiguous(p.chain); err != nil {
+			return err
+		}
+		if p.chain[0].segmentBaseSeq() != head {
+			return qwpSfFailClosed("missing expected SF head segment at base %d", head)
+		}
+	}
+	if p.activeSeg == nil {
+		if len(p.chain) == 0 && head == active && len(framefulCorrupt) == 0 {
+			p.collapsed = true
+			p.removeManifest = true
+			return nil
+		}
+		return qwpSfFailClosed("missing expected SF active segment at base %d", active)
+	}
+	if len(p.chain) == 0 {
+		if head != active || p.activeSeg.segmentFrameCount() != 0 || len(framefulCorrupt) > 0 {
+			suffix := ""
+			if len(framefulCorrupt) > 0 {
+				suffix = " (a corrupt segment prevents proving the empty state)"
+			}
+			return qwpSfFailClosed("missing SF chain between committed boundaries%s", suffix)
+		}
+		p.chain = append(p.chain, p.activeSeg)
+	} else if p.chain[len(p.chain)-1] != p.activeSeg {
+		last := p.chain[len(p.chain)-1]
+		chainEnd, err := qwpSfSegmentEnd(last)
+		if err != nil {
+			return err
+		}
+		if len(framefulCorrupt) == 0 && p.activeSeg.segmentFrameCount() == 0 && p.activeSeg.segmentBaseSeq() == chainEnd {
+			p.chain = append(p.chain, p.activeSeg)
 		} else {
-			activeSeg = qwpSfChooseEmptyInitial(all)
-			if activeSeg == nil {
-				if err := qwpSfDiscardOpened(all, nil, nil, qwpSfHeadNothingDelivered, false); err != nil {
-					return nil, nil, err
-				}
-				all = nil
-				// Same reasoning as the manifest-backed collapse above.
-				qwpSfQuarantinePaths(corruptPaths)
-				success = true
-				return nil, nil, nil
-			}
-			chain = append(chain, activeSeg)
+			return qwpSfFailClosed("missing expected SF active/tail segment at base %d", active)
 		}
-		head := chain[0].segmentBaseSeq()
-		// A torn segment below the head this migration is about to commit is
-		// the one thing that can make the head a lie. segmentFrameCount stops
-		// at the first bad CRC, so such a file reports zero frames while
-		// physically carrying rows -- and once head is committed, recovery
-		// treats everything below it as delivered and unlinks it.
-		//
-		// The check has to run against the FINAL head, not against the chain
-		// the frameful branch found: when no segment survives with frames the
-		// head comes from qwpSfChooseEmptyInitial instead, which skips torn
-		// candidates and so can pick a base above the damaged file. Nothing on
-		// this path is committed evidence, so the migration fails closed
-		// rather than deciding on its own synthesized boundary.
-		if head != 0 {
-			for _, seg := range all {
-				if seg.segmentFrameCount() == 0 && seg.segmentTornTailBytes() > 0 &&
-					seg.segmentBaseSeq() < head {
-					return nil, nil, qwpSfFailClosed("cannot migrate the legacy SF chain based at %d: segment at base %d lost its frames to a torn write and sits below that head, so its range cannot be shown already-acked", head, seg.segmentBaseSeq())
-				}
+	}
+	return nil
+}
+
+func (p *qwpSfRecoveryPlan) planLegacyChain(data []*qwpSfSegment, framefulCorrupt []string) error {
+	if len(framefulCorrupt) > 0 {
+		return qwpSfFailClosed(
+			"cannot migrate the legacy SF chain: a corrupt segment of unknown identity could belong to it")
+	}
+	if len(data) > 0 {
+		if err := qwpSfValidateContiguous(data); err != nil {
+			return err
+		}
+		p.chain = append(p.chain, data...)
+		p.activeSeg = p.chain[len(p.chain)-1]
+	} else {
+		p.activeSeg = qwpSfChooseEmptyInitial(p.all)
+		if p.activeSeg == nil {
+			p.collapsed = true
+			return nil
+		}
+		p.chain = append(p.chain, p.activeSeg)
+	}
+	p.headBase = p.chain[0].segmentBaseSeq()
+	p.activeBase = p.activeSeg.segmentBaseSeq()
+	if p.headBase != 0 {
+		for _, seg := range p.all {
+			if seg.segmentFrameCount() == 0 && seg.segmentTornTailBytes() > 0 &&
+				seg.segmentBaseSeq() < p.headBase {
+				return qwpSfFailClosed(
+					"cannot migrate the legacy SF chain based at %d: segment at base %d lost its frames to a torn write and sits below that head, so its range cannot be shown already-acked",
+					p.headBase, seg.segmentBaseSeq())
 			}
 		}
-		manifest, err = qwpSfManifestCreate(sfDir, head, activeSeg.segmentBaseSeq())
+	}
+	p.synthesizeManifest = true
+	return nil
+}
+
+func (p *qwpSfRecoveryPlan) planDiscardActions(
+	keep, preserve map[*qwpSfSegment]struct{},
+) error {
+	if !p.collapsed && len(keep) > 0 {
+		anchored := false
+		for seg := range keep {
+			if seg.segmentBaseSeq() == p.headBase {
+				anchored = true
+				break
+			}
+		}
+		if !anchored {
+			return qwpSfFailClosed(
+				"head %d matches the base of no kept segment; refusing to release any file under an unverified boundary",
+				p.headBase)
+		}
+	}
+	for _, seg := range p.all {
+		if _, ok := keep[seg]; ok {
+			continue
+		}
+		file := p.fileForSegment(seg)
+		if file == nil {
+			return errors.New("qwp/sf: recovery plan lost an opened segment")
+		}
+		end, err := qwpSfSegmentEnd(seg)
+		if err != nil {
+			return err
+		}
+		_, explicitlyPreserved := preserve[seg]
+		mustPreserve := explicitlyPreserved || (file.tornTailBytes > 0 &&
+			(file.baseSeq >= p.headBase || end > p.headBase))
+		if mustPreserve {
+			file.action = qwpSfRecoveryQuarantine
+			file.license = "bytes are not proven delivered; preserve them outside the segment namespace"
+			continue
+		}
+		if file.mayHoldFrames && p.manifestProvenance != qwpSfManifestCommitted {
+			return qwpSfFailClosed(
+				"segment at base %d may hold frames and no committed boundary licenses its deletion",
+				file.baseSeq)
+		}
+		if file.mayHoldFrames && (file.baseSeq >= p.headBase || end > p.headBase) {
+			return qwpSfFailClosed(
+				"segment at base %d is not wholly below committed head %d; refusing deletion",
+				file.baseSeq, p.headBase)
+		}
+		file.action = qwpSfRecoveryUnlink
+		if file.mayHoldFrames {
+			file.license = "committed head proves the complete segment delivered"
+		} else {
+			file.license = "validated scan proves the file holds no frame or torn tail"
+		}
+	}
+	return nil
+}
+
+func (p *qwpSfRecoveryPlan) planSanitizationActions() {
+	if len(p.chain) == 0 {
+		return
+	}
+	for _, seg := range p.chain[:len(p.chain)-1] {
+		if seg.segmentTornTailBytes() == 0 {
+			continue
+		}
+		p.setSegmentAction(seg, qwpSfRecoverySanitizeSealed,
+			"the validated frame boundary makes the sealed tail append-ineligible residue")
+		if p.retryAfterSanitizePath == "" {
+			p.retryAfterSanitizePath = seg.segmentPath()
+		}
+	}
+	if p.activeSeg.segmentFrameCount() == 0 && p.activeSeg.segmentTornTailBytes() > 0 &&
+		p.manifestProvenance == qwpSfManifestCommitted {
+		p.setSegmentAction(p.activeSeg, qwpSfRecoveryReplace,
+			"committed active base requires a clean appendable segment while torn bytes remain preserved")
+	} else if p.activeSeg.segmentTornTailBytes() > 0 {
+		p.setSegmentAction(p.activeSeg, qwpSfRecoverySanitizeActive,
+			"validated active cursor licenses descriptor-first zeroing of its appendable tail")
+	}
+}
+
+func (p *qwpSfRecoveryPlan) failClosed(err error) *qwpSfRecoveryPlan {
+	p.failClosedErr = err
+	for i := range p.files {
+		p.files[i].action = qwpSfRecoveryFailClosed
+		p.files[i].license = err.Error()
+	}
+	return p
+}
+
+func (p *qwpSfRecoveryPlan) framefulCorruptPaths() []string {
+	var paths []string
+	for i := range p.files {
+		file := &p.files[i]
+		if file.segment == nil && file.mayHoldFrames {
+			paths = append(paths, file.path)
+		}
+	}
+	return paths
+}
+
+func (p *qwpSfRecoveryPlan) fileForSegment(seg *qwpSfSegment) *qwpSfRecoveryFilePlan {
+	for i := range p.files {
+		if p.files[i].segment == seg {
+			return &p.files[i]
+		}
+	}
+	return nil
+}
+
+func (p *qwpSfRecoveryPlan) setSegmentAction(seg *qwpSfSegment, action qwpSfRecoveryAction, license string) {
+	if file := p.fileForSegment(seg); file != nil {
+		file.action = action
+		file.license = license
+	}
+}
+
+func qwpSfSegmentEnd(seg *qwpSfSegment) (int64, error) {
+	base, frames := seg.segmentBaseSeq(), seg.segmentFrameCount()
+	if frames > math.MaxInt64-base {
+		return 0, qwpSfFailClosed(
+			"segment range overflows FSN space: baseSeq=%d frameCount=%d", base, frames)
+	}
+	return base + frames, nil
+}
+
+func qwpSfApplyRecoveryPlan(p *qwpSfRecoveryPlan) (*qwpSfSegmentRing, *qwpSfManifest, error) {
+	if p.failClosedErr != nil {
+		return nil, nil, p.failClosedErr
+	}
+	if p.invalidManifestPath != "" {
+		if err := qwpSfQuarantineCreationDebris(p.invalidManifestPath); err != nil {
+			return nil, nil, err
+		}
+		p.invalidManifestPath = ""
+	}
+	if p.synthesizeManifest {
+		manifest, err := qwpSfManifestCreate(p.sfDir, p.headBase, p.activeBase)
 		if err != nil {
 			return nil, nil, err
 		}
-		for _, seg := range chain {
-			if err := seg.markManifestRequired(); err != nil {
+		p.manifest = manifest
+		p.manifestProvenance = qwpSfManifestSynthesized
+	}
+
+	if p.retryAfterSanitizePath != "" {
+		if err := p.markChainManifestRequired(); err != nil {
+			return nil, nil, err
+		}
+		for i := range p.files {
+			file := &p.files[i]
+			if file.action == qwpSfRecoverySanitizeSealed {
+				if err := file.segment.sanitizeTornTail(); err != nil {
+					return nil, nil, err
+				}
+			}
+		}
+		return nil, nil, fmt.Errorf("%w: %s", qwpSfErrSanitizedResidue, p.retryAfterSanitizePath)
+	}
+
+	if err := p.applyReplacement(); err != nil {
+		return nil, nil, err
+	}
+	if err := p.markChainManifestRequired(); err != nil {
+		return nil, nil, err
+	}
+	if err := p.applyDirectoryActions(); err != nil {
+		return nil, nil, err
+	}
+	if p.activeSeg != nil {
+		if file := p.fileForSegment(p.activeSeg); file != nil && file.action == qwpSfRecoverySanitizeActive {
+			if err := p.activeSeg.sanitizeTornTail(); err != nil {
 				return nil, nil, err
 			}
 		}
 	}
 
-	keep := make(map[*qwpSfSegment]struct{}, len(chain))
-	for _, seg := range chain {
-		keep[seg] = struct{}{}
+	if p.removeManifest {
+		if err := qwpSfSyncSlotDir(p.sfDir); err != nil {
+			return nil, nil, fmt.Errorf("qwp/sf: sync recovery cleanup directory %s: %w", p.sfDir, err)
+		}
+		if err := p.manifest.close(); err != nil {
+			return nil, nil, err
+		}
+		p.manifest = nil
+		if err := qwpSfRemoveManifestAndSyncDir(p.sfDir); err != nil {
+			return nil, nil, err
+		}
 	}
-	// The committed head is the boundary below which every frame is proven
-	// delivered. Both branches above have a manifest by now -- the legacy one
-	// just minted it -- but that legacy head is derived from the files that
-	// happened to survive, not from anything committed, which is why the
-	// unlink rule below also requires the segment to sit strictly below it.
-	discardHead := manifest.headBase
-	if err := qwpSfDiscardOpened(all, keep, preserve, discardHead, headCommitted); err != nil {
-		return nil, nil, err
+	if p.collapsed || p.activeSeg == nil {
+		return nil, p.manifest, nil
 	}
-	qwpSfQuarantinePaths(corruptPaths)
-	if err := activeSeg.sanitizeTornTail(); err != nil {
-		return nil, nil, err
+	// Recovery may be retrying after a prior process installed a replacement or
+	// completed another namespace mutation whose directory barrier failed. The
+	// clean files alone cannot reveal that pending epoch. Commit the slot
+	// namespace unconditionally before exposing any recovered mmap for append.
+	if err := qwpSfSyncSlotDir(p.sfDir); err != nil {
+		return nil, nil, fmt.Errorf("qwp/sf: sync recovered slot before exposing ring %s: %w", p.sfDir, err)
 	}
 
-	ring := qwpSfNewSegmentRing(activeSeg, maxBytesPerSegment)
-	ring.sealedSegments = append(ring.sealedSegments, chain[:len(chain)-1]...)
-	// The ring constructor derives publishedFsn from the active segment alone.
-	// Recovery may retain an empty active segment after a completed rotation and
-	// full trim, with no sealed segments left. Its positive base still records
-	// the historical sequence frontier, so derive publishedFsn from nextSeq for
-	// every recovered chain. A genuinely fresh base-zero ring remains at -1.
+	ring := qwpSfNewSegmentRing(p.activeSeg, p.maxBytesPerSegment)
+	ring.sealedSegments = append(ring.sealedSegments, p.chain[:len(p.chain)-1]...)
 	ring.publishedFsn.Store(ring.nextSeq.Load() - 1)
-	ring.manifest = manifest
-	// Ownership of chain and manifest transferred to the ring.
-	all = nil
-	success = true
-	return ring, manifest, nil
+	ring.manifest = p.manifest
+	return ring, p.manifest, nil
+}
+
+func (p *qwpSfRecoveryPlan) applyReplacement() error {
+	if p.activeSeg == nil {
+		return nil
+	}
+	file := p.fileForSegment(p.activeSeg)
+	if file == nil || file.action != qwpSfRecoveryReplace {
+		return nil
+	}
+	torn := p.activeSeg
+	if err := torn.close(); err != nil {
+		return err
+	}
+	replacement, err := qwpSfReplaceTornActive(file.path, p.activeBase, p.maxBytesPerSegment)
+	if err != nil {
+		return err
+	}
+	for i, seg := range p.all {
+		if seg == torn {
+			p.all[i] = replacement
+			break
+		}
+	}
+	for i, seg := range p.chain {
+		if seg == torn {
+			p.chain[i] = replacement
+			break
+		}
+	}
+	file.segment = replacement
+	file.baseSeq = replacement.segmentBaseSeq()
+	file.validFrames = replacement.segmentFrameCount()
+	file.tornTailBytes = replacement.segmentTornTailBytes()
+	file.manifestRequired = replacement.segmentManifestRequired()
+	file.mayHoldFrames = false
+	file.action = qwpSfRecoveryKeep
+	file.license = "clean replacement installed at the committed active base"
+	p.activeSeg = replacement
+	return nil
+}
+
+func (p *qwpSfRecoveryPlan) markChainManifestRequired() error {
+	for _, seg := range p.chain {
+		if err := seg.markManifestRequired(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *qwpSfRecoveryPlan) applyDirectoryActions() error {
+	for i := range p.files {
+		file := &p.files[i]
+		switch file.action {
+		case qwpSfRecoveryUnlink:
+			if file.segment != nil {
+				if err := file.segment.close(); err != nil {
+					return err
+				}
+			}
+			if err := p.revalidateUnlink(file); err != nil {
+				return err
+			}
+			if err := os.Remove(file.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("qwp/sf: apply recovery unlink %s: %w", file.path, err)
+			}
+		case qwpSfRecoveryQuarantine:
+			if file.segment != nil {
+				if err := file.segment.close(); err != nil {
+					return err
+				}
+			}
+			if _, err := qwpSfQuarantinePath(file.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("qwp/sf: apply recovery quarantine %s: %w", file.path, err)
+			}
+		}
+	}
+	return nil
+}
+
+// revalidateUnlink runs immediately before os.Remove. It deliberately repeats
+// the licensing check instead of trusting the planner: a future planner branch
+// can select a bad action, but it still cannot turn that mistake into deletion.
+func (p *qwpSfRecoveryPlan) revalidateUnlink(file *qwpSfRecoveryFilePlan) error {
+	if file.action != qwpSfRecoveryUnlink {
+		return qwpSfFailClosed("recovery delete-site received a non-unlink action for %s", file.path)
+	}
+	if !file.mayHoldFrames {
+		return nil
+	}
+	if p.manifestProvenance != qwpSfManifestCommitted || p.manifest == nil ||
+		p.manifest.headBase != p.headBase || p.manifest.activeBase != p.activeBase {
+		return qwpSfFailClosed("committed recovery boundary changed before deleting %s", file.path)
+	}
+	if !p.collapsed {
+		anchored := false
+		for _, seg := range p.chain {
+			if seg.segmentBaseSeq() == p.headBase {
+				anchored = true
+				break
+			}
+		}
+		if !anchored {
+			return qwpSfFailClosed("head %d matches no kept segment immediately before deleting %s", p.headBase, file.path)
+		}
+	}
+	end, err := qwpSfSegmentEnd(file.segment)
+	if err != nil {
+		return err
+	}
+	if file.baseSeq >= p.headBase || end > p.headBase {
+		return qwpSfFailClosed("segment %s is not wholly below committed head %d", file.path, p.headBase)
+	}
+	return nil
 }
 
 func qwpSfFailClosed(format string, args ...any) error {
@@ -402,34 +724,42 @@ func qwpSfFailClosed(format string, args ...any) error {
 }
 
 func qwpSfValidateContiguous(chain []*qwpSfSegment) error {
-	for i := 1; i < len(chain); i++ {
-		prev, curr := chain[i-1], chain[i]
-		expected := prev.segmentBaseSeq() + prev.segmentFrameCount()
-		if curr.segmentBaseSeq() != expected {
-			return qwpSfFailClosed("FSN gap in recovered segments: prev baseSeq=%d frameCount=%d expected next baseSeq=%d but got %d", prev.segmentBaseSeq(), prev.segmentFrameCount(), expected, curr.segmentBaseSeq())
+	for i, seg := range chain {
+		end, err := qwpSfSegmentEnd(seg)
+		if err != nil {
+			return err
+		}
+		if i+1 < len(chain) && chain[i+1].segmentBaseSeq() != end {
+			return qwpSfFailClosed("FSN gap in recovered segments: prev baseSeq=%d frameCount=%d expected next baseSeq=%d but got %d", seg.segmentBaseSeq(), seg.segmentFrameCount(), end, chain[i+1].segmentBaseSeq())
 		}
 	}
 	return nil
 }
 
 func qwpSfFindActive(all []*qwpSfSegment, activeBase int64) *qwpSfSegment {
-	var torn, clean *qwpSfSegment
+	var frames, torn, clean *qwpSfSegment
 	for _, seg := range all {
 		if seg.segmentBaseSeq() != activeBase {
 			continue
 		}
 		if seg.segmentFrameCount() > 0 {
-			return seg
+			if frames == nil || seg.segmentPath() < frames.segmentPath() {
+				frames = seg
+			}
+			continue
 		}
 		if seg.segmentTornTailBytes() > 0 {
-			if torn == nil {
+			if torn == nil || seg.segmentPath() < torn.segmentPath() {
 				torn = seg
 			}
 			continue
 		}
-		if clean == nil {
+		if clean == nil || seg.segmentPath() < clean.segmentPath() {
 			clean = seg
 		}
+	}
+	if frames != nil {
+		return frames
 	}
 	if clean != nil {
 		return clean
@@ -451,110 +781,6 @@ func qwpSfChooseEmptyInitial(all []*qwpSfSegment) *qwpSfSegment {
 		}
 	}
 	return first
-}
-
-func qwpSfSanitizeSealedResidue(chain []*qwpSfSegment) (string, error) {
-	first := ""
-	for _, seg := range chain[:len(chain)-1] {
-		if seg.segmentTornTailBytes() == 0 {
-			continue
-		}
-		if first == "" {
-			first = seg.segmentPath()
-		}
-		if err := seg.sanitizeTornTail(); err != nil {
-			return "", err
-		}
-	}
-	return first, nil
-}
-
-// qwpSfHeadNothingDelivered is the head boundary the collapse exits pass to
-// qwpSfDiscardOpened: the manifest is about to be removed entirely, no
-// committed boundary remains, and no file may be treated as delivered.
-const qwpSfHeadNothingDelivered int64 = math.MinInt64
-
-// qwpSfDiscardOpened releases every opened segment outside keep. A file below
-// the committed head is unlinked: the manifest proves its frames delivered. One
-// that still carries bytes the boundaries do not account for -- a torn tail, or
-// a member of preserve -- is quarantined under a .corrupt name instead, so no
-// recovery path destroys bytes it cannot prove delivered. head is the boundary
-// below which the manifest accounts for every frame; the collapse exits pass
-// qwpSfHeadNothingDelivered. headCommitted reports whether head was read from
-// a manifest that already existed on disk; the legacy migration, which mints
-// its manifest from whatever files survived, passes false.
-//
-// The boundary is re-verified here, at the one place that deletes, before any
-// removal. Every branch that reaches this function establishes separately
-// that its head lines up with the base of a retained segment, and history
-// shows a branch can get that wrong -- so a head that matches no kept base
-// (and is not the explicit nothing-delivered sentinel) fails closed: a future
-// branch that computes a bad head gets a refusal instead of a deletion.
-//
-// A synthesized head licenses no torn-file deletion below it. Below a
-// COMMITTED head the manifest accounts for every frame, torn bytes included;
-// a head derived from surviving files proves nothing, and segmentFrameCount
-// stops at the first bad CRC, so a torn file below such a head can still hold
-// undelivered rows. The legacy branch refuses this shape before it gets here;
-// this check makes the delete site refuse it independently.
-func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]struct{}, head int64, headCommitted bool) error {
-	if head != qwpSfHeadNothingDelivered {
-		anchored := false
-		for seg := range keep {
-			if seg.segmentBaseSeq() == head {
-				anchored = true
-				break
-			}
-		}
-		if !anchored {
-			return qwpSfFailClosed("head %d matches the base of no kept segment; refusing to release any file under an unverified boundary", head)
-		}
-		if !headCommitted {
-			for _, seg := range all {
-				if _, ok := keep[seg]; ok {
-					continue
-				}
-				if seg.segmentTornTailBytes() > 0 && seg.segmentBaseSeq() < head {
-					return qwpSfFailClosed("segment at base %d lost frames to a torn write and sits below the synthesized head %d, so its range cannot be shown already-acked", seg.segmentBaseSeq(), head)
-				}
-			}
-		}
-	}
-	for _, seg := range all {
-		if _, ok := keep[seg]; ok {
-			continue
-		}
-		path := seg.segmentPath()
-		_, wanted := preserve[seg]
-		// A torn tail is only worth unlinking when the committed head proves
-		// every byte in it delivered. Two conditions have to hold, and the
-		// second alone is not enough.
-		//
-		// A segment AT the head is retained territory, not delivered
-		// territory: head is always some segment's base, so base == head is
-		// the start of what the slot still owes. And frameCount counts frames
-		// up to the first bad CRC, so a torn segment whose first frame is
-		// damaged reports zero -- base+frameCount then lands at base, and
-		// valid frames physically behind the damage would be destroyed.
-		//
-		// Below the head the manifest accounts for every frame, so the tail
-		// bytes are accounted for too. Quarantining those leaves a
-		// segment-sized .corrupt file that nothing reclaims and
-		// sf_max_total_bytes does not count, so a slot that repeatedly tears
-		// mid-append starves the budget meant to bound it.
-		wanted = wanted || (seg.segmentTornTailBytes() > 0 &&
-			(seg.segmentBaseSeq() >= head ||
-				seg.segmentBaseSeq()+seg.segmentFrameCount() > head))
-		if err := seg.close(); err != nil {
-			return err
-		}
-		if wanted {
-			qwpSfQuarantinePaths([]string{path})
-		} else if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			qwpEffectiveLogger(nil).Warn("qwp/sf: could not remove validated extra segment", "path", path, "error", err)
-		}
-	}
-	return nil
 }
 
 // qwpSfCorruptMayHoldFrames reports whether a segment file that failed to open

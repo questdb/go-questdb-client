@@ -66,6 +66,13 @@ type qwpSfDualRecord struct {
 	second     int64
 }
 
+// qwpSfErrGenerationOverflow is shared by the two Java-compatible dual-slot
+// files. Callers add the file kind so operators can identify which control
+// point exhausted its generation space while errors.Is retains one contract.
+//
+//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
+var qwpSfErrGenerationOverflow = errors.New("qwp/sf: dual-record generation overflow")
+
 func qwpSfEncodeDualRecord(dst []byte, magic uint32, generation, first, second int64) {
 	clear(dst[:qwpSfDualRecordSize])
 	binary.LittleEndian.PutUint32(dst[0:4], magic)
@@ -146,32 +153,45 @@ func qwpSfManifestCreate(dir string, headBase, activeBase int64) (*qwpSfManifest
 }
 
 func qwpSfManifestOpen(dir string) (*qwpSfManifest, error) {
+	manifest, invalid, err := qwpSfManifestInspect(dir)
+	if err != nil || !invalid {
+		return manifest, err
+	}
+	if err := qwpSfQuarantineCreationDebris(filepath.Join(dir, qwpSfManifestFileName)); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// qwpSfManifestInspect reads and validates the manifest without changing the
+// directory. Recovery uses it while building its complete action plan: an
+// invalid manifest is evidence to record, not a rename to perform before the
+// segment chain has been classified. qwpSfManifestOpen retains the historical
+// open-and-quarantine behavior for callers that are not constructing a plan.
+func qwpSfManifestInspect(dir string) (*qwpSfManifest, bool, error) {
 	path := filepath.Join(dir, qwpSfManifestFileName)
 	st, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: stat manifest %s: %w", path, err)
+		return nil, false, fmt.Errorf("qwp/sf: stat manifest %s: %w", path, err)
 	}
 	if st.Size() != qwpSfDualRecordFileSize {
-		if err := qwpSfQuarantineCreationDebris(path); err != nil {
-			return nil, err
-		}
-		return nil, nil
+		return nil, true, nil
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: open manifest %s: %w", path, err)
+		return nil, false, fmt.Errorf("qwp/sf: open manifest %s: %w", path, err)
 	}
 	var raw [2][qwpSfDualRecordSize]byte
 	if _, err := io.ReadFull(io.NewSectionReader(f, 0, qwpSfDualRecordSize), raw[0][:]); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("qwp/sf: read manifest slot 0: %w", err)
+		return nil, false, fmt.Errorf("qwp/sf: read manifest slot 0: %w", err)
 	}
 	if _, err := io.ReadFull(io.NewSectionReader(f, qwpSfDualRecordSlotSize, qwpSfDualRecordSize), raw[1][:]); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("qwp/sf: read manifest slot 1: %w", err)
+		return nil, false, fmt.Errorf("qwp/sf: read manifest slot 1: %w", err)
 	}
 	valid := func(rec qwpSfDualRecord) bool { return rec.first >= 0 && rec.second >= rec.first }
 	r0, ok0 := qwpSfDecodeDualRecord(raw[0][:], qwpSfManifestMagic, valid)
@@ -179,12 +199,9 @@ func qwpSfManifestOpen(dir string) (*qwpSfManifest, error) {
 	rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
 	if !ok {
 		_ = f.Close()
-		if err := qwpSfQuarantineCreationDebris(path); err != nil {
-			return nil, err
-		}
-		return nil, nil
+		return nil, true, nil
 	}
-	return &qwpSfManifest{file: f, generation: rec.generation, headBase: rec.first, activeBase: rec.second}, nil
+	return &qwpSfManifest{file: f, generation: rec.generation, headBase: rec.first, activeBase: rec.second}, false, nil
 }
 
 func (m *qwpSfManifest) update(newHead, newActive int64) error {
@@ -211,7 +228,7 @@ func (m *qwpSfManifest) update(newHead, newActive int64) error {
 		return nil
 	}
 	if m.generation == math.MaxInt64 {
-		return errors.New("qwp/sf: manifest generation overflow")
+		return fmt.Errorf("qwp/sf: manifest generation overflow: %w", qwpSfErrGenerationOverflow)
 	}
 	next := m.generation + 1
 	qwpSfEncodeDualRecord(m.scratch[:], qwpSfManifestMagic, next, newHead, newActive)

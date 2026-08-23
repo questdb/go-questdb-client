@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -131,6 +132,39 @@ func TestQwpSfManagerTrimsAckedSegments(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return r.sealedSegmentCount() == 0
 	}, 1*time.Second, 1*time.Millisecond)
+}
+
+func TestQwpSfManagerWatermarkOverflowDoesNotLicenseTrim(t *testing.T) {
+	dir := t.TempDir()
+	sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "acked")
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 1)
+	createRecoveryManifest(t, dir, 0, 1, sealed, active)
+	closeRecoverySegments(t, sealed, active)
+
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	require.True(t, engine.manager.segmentManagerClose())
+	t.Cleanup(func() {
+		engine.watermark.mu.Lock()
+		engine.watermark.generation = 0
+		engine.watermark.mu.Unlock()
+		_ = engine.engineClose()
+	})
+
+	engine.engineAcknowledge(0)
+	require.Equal(t, 1, engine.ring.sealedSegmentCount())
+	engine.watermark.mu.Lock()
+	engine.watermark.generation = math.MaxInt64
+	engine.watermark.mu.Unlock()
+	engine.managerEntry.maintenanceFailures = qwpSfManagerMaintenanceFailureThreshold - 1
+
+	engine.manager.serviceRing(engine.managerEntry)
+
+	err = engine.managerEntry.entryMaintenanceError()
+	require.ErrorIs(t, err, qwpSfErrGenerationOverflow)
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.Equal(t, 1, engine.ring.sealedSegmentCount(), "overflow must leave the trim candidate in the ring")
+	require.FileExists(t, filepath.Join(dir, "sf-initial.sfa"), "overflow must preserve the segment on disk")
 }
 
 func TestQwpSfManagerProvisionsDiskSpare(t *testing.T) {

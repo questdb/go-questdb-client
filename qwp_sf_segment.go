@@ -154,6 +154,12 @@ type qwpSfSegment struct {
 	// for diagnostics. Final after construction.
 	tornTailBytes     int64
 	tornTailSanitized bool
+	// manifestRequiredSynced is process-local evidence that this object has
+	// completed the durability barrier for an observed manifest-required flag.
+	// A reopened object starts false even when the mapped flag is set: another
+	// process may have died after pwrite made the flag page-cache-visible but
+	// before its msync/fsync completed.
+	manifestRequiredSynced bool
 }
 
 // qwpSfTestSegmentCreateHook is a test seam for holding the manager inside a
@@ -412,23 +418,47 @@ func (s *qwpSfSegment) markManifestRequired() error {
 	if s == nil || s.memoryBacked {
 		return nil
 	}
-	// The flag is already on disk once it is set, and recovery re-runs this
-	// over the whole chain on every open, not only on the one that migrates a
-	// legacy slot. Re-flushing a header that already carries the flag buys
-	// nothing and costs one fsync per segment: on a 10 GB slot of 4 MB
-	// segments that is ~2560 flushes standing between a restart and the first
-	// row it can send.
 	if s.segmentManifestRequired() {
+		if s.manifestRequiredSynced {
+			return nil
+		}
+		// Visibility in a reopened mapping is not durability evidence: pwrite
+		// updates the shared page cache before fsync, and that cache outlives a
+		// process. Revalidate the barrier once per opened object before recovery
+		// trusts an already-set flag.
+		if err := s.syncHeader(); err != nil {
+			return err
+		}
+		s.manifestRequiredSynced = true
 		return nil
 	}
-	s.buf[5] |= qwpSfManifestRequiredFlag
-	return s.syncHeader()
+	previous := [1]byte{s.buf[5]}
+	flag := [1]byte{s.buf[5] | qwpSfManifestRequiredFlag}
+	if err := s.writeRecoveryAt(flag[:], 5, "mark manifest-required"); err != nil {
+		return err
+	}
+	if err := s.syncHeader(); err != nil {
+		// writeRecoveryAt successfully established backing before it changed the
+		// mapping, so restoring the old byte cannot fault. Keeping the shared
+		// page-cache view unflagged makes another object retry. A process that
+		// dies before this rollback can leave the new flag visible, so reopened
+		// objects independently resync every observed flag above.
+		s.restoreRecoveryMappingAfterFailedSync(previous[:], 5)
+		return err
+	}
+	s.manifestRequiredSynced = true
+	return nil
 }
 
-// qwpSfTestSegmentSyncHeaderHook counts header flushes, so tests can pin that a
-// restart does not re-flush a chain that already carries the flag. Production
+// qwpSfTestSegmentSyncHeaderHook counts header flushes, so tests can pin one
+// cross-process revalidation barrier per reopened flagged segment and no
+// redundant barrier on repeated calls through the same object. Production
 // leaves it nil.
 var qwpSfTestSegmentSyncHeaderHook atomic.Pointer[func(path string)]
+
+// qwpSfTestSegmentSyncHeaderErrorHook injects a header-sync failure after the
+// descriptor mutation and before msync. Production leaves it nil.
+var qwpSfTestSegmentSyncHeaderErrorHook atomic.Pointer[func(path string) error]
 
 func (s *qwpSfSegment) syncHeader() error {
 	if s == nil || s.memoryBacked {
@@ -437,11 +467,16 @@ func (s *qwpSfSegment) syncHeader() error {
 	if hook := qwpSfTestSegmentSyncHeaderHook.Load(); hook != nil {
 		(*hook)(s.path)
 	}
+	if hook := qwpSfTestSegmentSyncHeaderErrorHook.Load(); hook != nil {
+		if err := (*hook)(s.path); err != nil {
+			return fmt.Errorf("%w: qwp/sf: sync segment header %s: %w", ErrSfDurability, s.path, err)
+		}
+	}
 	if err := qwpSfMsync(s.buf, qwpSfHeaderSize); err != nil {
-		return fmt.Errorf("qwp/sf: msync segment header %s: %w", s.path, err)
+		return fmt.Errorf("%w: qwp/sf: msync segment header %s: %w", ErrSfDurability, s.path, err)
 	}
 	if err := qwpSfFsync(s.file); err != nil {
-		return fmt.Errorf("qwp/sf: fsync segment header %s: %w", s.path, err)
+		return fmt.Errorf("%w: qwp/sf: fsync segment header %s: %w", ErrSfDurability, s.path, err)
 	}
 	return nil
 }
@@ -450,24 +485,55 @@ func (s *qwpSfSegment) syncHeader() error {
 // through the file descriptor.
 const qwpSfZeroFillChunk = 64 << 10
 
-// qwpSfSegmentWriteAt is a test seam for block-forcing write failures on
-// the torn-tail sanitize path: tests swap it to inject ENOSPC without
-// having to fill a filesystem, then restore the original in a t.Cleanup.
+// qwpSfSegmentWriteAt is the descriptor-write seam for recovery mutation.
+// Tests swap it to inject ENOSPC and short writes without filling a filesystem.
 var qwpSfSegmentWriteAt = qwpSfSwappable(func(f *os.File, p []byte, off int64) (int, error) {
 	return f.WriteAt(p, off)
 })
 
-// reserveTailBlocks zeroes [from, to) through the file descriptor, so the
-// range is backed by real disk blocks before anything stores into it via
-// the mapping. The range can sit over a hole: qwpSfAllocate falls back to
-// a sparse extend on filesystems whose reservation primitive reports
-// EOPNOTSUPP, and the "other unix" build has no primitive at all. A store
-// into an unbacked page of a full disk raises SIGBUS, which kills the
-// process outright and is beyond the reach of recover(); the pwrite here
-// allocates the same blocks up front and reports a full disk as an
-// ordinary ENOSPC error the caller can surface. Mirrors the write-back
-// qwpSfAckWatermarkOpenRequired does for an existing watermark file.
-func (s *qwpSfSegment) reserveTailBlocks(from, to int64) error {
+// writeRecoveryAt is the only way recovery changes an existing segment's
+// mapped bytes. The descriptor write comes first so the kernel either backs the
+// affected page or returns an ordinary I/O error. The mapped view is updated
+// only after a complete write, keeping platforms without descriptor/mmap cache
+// coherence in step without exposing an unbacked-page store.
+func (s *qwpSfSegment) writeRecoveryAt(data []byte, off int64, op string) error {
+	if s == nil || s.memoryBacked || len(data) == 0 {
+		return nil
+	}
+	if s.file == nil || off < 0 || off > s.sizeBytes-int64(len(data)) {
+		return fmt.Errorf("%w: qwp/sf: %s outside segment bounds %s at offset %d length %d",
+			ErrSfDurability, op, s.path, off, len(data))
+	}
+	written, err := qwpSfSegmentWriteAt.load()(s.file, data, off)
+	if err != nil {
+		return fmt.Errorf("%w: qwp/sf: %s %s at offset %d: %w",
+			ErrSfDurability, op, s.path, off, err)
+	}
+	if written != len(data) {
+		return fmt.Errorf("%w: qwp/sf: %s %s at offset %d: wrote %d of %d bytes: %w",
+			ErrSfDurability, op, s.path, off, written, len(data), io.ErrShortWrite)
+	}
+	copy(s.buf[off:off+int64(len(data))], data)
+	return nil
+}
+
+// restoreRecoveryMappingAfterFailedSync rolls back only the shared mapped view
+// after writeRecoveryAt succeeded but the durability barrier did not. The
+// successful descriptor write is the precondition: it established backing for
+// every page this method touches, so the rollback itself cannot SIGBUS. The old
+// value need not become durable; it only prevents a same-host reopen from
+// mistaking a dirty, unsynced new value for committed state.
+func (s *qwpSfSegment) restoreRecoveryMappingAfterFailedSync(data []byte, off int64) {
+	copy(s.buf[off:off+int64(len(data))], data)
+}
+
+// reserveTailBlocks zeroes [from, to) through the file descriptor while
+// preserving one non-zero byte as durable retry evidence. The range can sit
+// over a hole: qwpSfAllocate falls back to a sparse extend on filesystems whose
+// reservation primitive reports EOPNOTSUPP, and the "other unix" build has no
+// primitive at all. A store into an unbacked page of a full disk raises SIGBUS,
+// which kills the process outright and is beyond the reach of recover().
+func (s *qwpSfSegment) reserveTailBlocks(from, to, markerOff int64, marker byte) error {
 	if to <= from {
 		return nil
 	}
@@ -481,15 +547,40 @@ func (s *qwpSfSegment) reserveTailBlocks(from, to int64) error {
 		if n > chunk {
 			n = chunk
 		}
-		written, err := qwpSfSegmentWriteAt.load()(s.file, zeros[:n], off)
-		if err != nil {
-			return fmt.Errorf("qwp/sf: reserve blocks for torn tail %s at offset %d: %w", s.path, off, err)
+		markerIndex := int64(-1)
+		if markerOff >= off && markerOff < off+n {
+			markerIndex = markerOff - off
+			zeros[markerIndex] = marker
 		}
-		if int64(written) != n {
-			return fmt.Errorf("qwp/sf: reserve blocks for torn tail %s at offset %d: wrote %d of %d bytes: %w",
-				s.path, off, written, n, io.ErrShortWrite)
+		if err := s.writeRecoveryAt(zeros[:n], off, "reserve blocks for torn tail"); err != nil {
+			if markerIndex >= 0 {
+				zeros[markerIndex] = 0
+			}
+			return err
+		}
+		if markerIndex >= 0 {
+			zeros[markerIndex] = 0
 		}
 		off += n
+	}
+	return nil
+}
+
+// qwpSfTestSegmentSanitizeTailSyncErrorHook injects a failure at one of the
+// named torn-tail durability phases. Production leaves it nil.
+var qwpSfTestSegmentSanitizeTailSyncErrorHook atomic.Pointer[func(path, phase string) error]
+
+func (s *qwpSfSegment) syncSanitizedTail(phase string) error {
+	if hook := qwpSfTestSegmentSanitizeTailSyncErrorHook.Load(); hook != nil {
+		if err := (*hook)(s.path, phase); err != nil {
+			return fmt.Errorf("qwp/sf: sync %s torn tail %s: %w", phase, s.path, err)
+		}
+	}
+	if err := qwpSfMsync(s.buf, s.sizeBytes); err != nil {
+		return fmt.Errorf("qwp/sf: msync %s torn tail %s: %w", phase, s.path, err)
+	}
+	if err := qwpSfFsync(s.file); err != nil {
+		return fmt.Errorf("qwp/sf: fsync %s torn tail %s: %w", phase, s.path, err)
 	}
 	return nil
 }
@@ -501,21 +592,42 @@ func (s *qwpSfSegment) sanitizeTornTail() error {
 	if s.appendCursor != s.sizeBytes-s.tornTailBytes {
 		return fmt.Errorf("qwp/sf: torn-tail cursor mismatch in %s: cursor=%d expected=%d", s.path, s.appendCursor, s.sizeBytes-s.tornTailBytes)
 	}
-	// Order matters. The descriptor write allocates the blocks, so the
-	// clear() below — and every later tryAppend into the same range,
-	// which is exactly the segment's appendable region — stores into
-	// pages that are already backed. The clear() also keeps the mapping
-	// in step with the file on platforms that do not guarantee coherence
-	// between a mapped view and descriptor I/O.
-	if err := s.reserveTailBlocks(s.appendCursor, s.sizeBytes); err != nil {
+	markerOff := int64(-1)
+	var marker byte
+	for off := s.appendCursor; off < s.sizeBytes; off++ {
+		if s.buf[off] != 0 {
+			markerOff = off
+			marker = s.buf[off]
+			break
+		}
+	}
+	if markerOff < 0 {
+		return fmt.Errorf("qwp/sf: torn tail in %s has no non-zero retry marker", s.path)
+	}
+	// First make the original non-zero evidence durable. Then zero and back the
+	// whole tail through the descriptor while preserving that byte, and sync the
+	// result. A later-chunk failure or process death therefore leaves recovery a
+	// durable reason to retry, never a deceptively clean sparse tail.
+	if err := s.syncSanitizedTail("pending-marker"); err != nil {
 		return err
 	}
-	clear(s.buf[s.appendCursor:s.sizeBytes])
-	if err := qwpSfMsync(s.buf, s.sizeBytes); err != nil {
-		return fmt.Errorf("qwp/sf: msync sanitized torn tail %s: %w", s.path, err)
+	if err := s.reserveTailBlocks(s.appendCursor, s.sizeBytes, markerOff, marker); err != nil {
+		return err
 	}
-	if err := qwpSfFsync(s.file); err != nil {
-		return fmt.Errorf("qwp/sf: fsync sanitized torn tail %s: %w", s.path, err)
+	if err := s.syncSanitizedTail("backed-tail"); err != nil {
+		return err
+	}
+	// Only after every appendable byte is durably backed may the retry marker be
+	// cleared. If this last barrier fails, restore the marker in the shared view.
+	// A process death before that rollback can expose a clean tail, but the
+	// preceding backed-tail barrier has already made mmap append safe.
+	zero := [1]byte{}
+	if err := s.writeRecoveryAt(zero[:], markerOff, "clear torn-tail retry marker"); err != nil {
+		return err
+	}
+	if err := s.syncSanitizedTail("cleared-marker"); err != nil {
+		s.restoreRecoveryMappingAfterFailedSync([]byte{marker}, markerOff)
+		return err
 	}
 	s.tornTailSanitized = true
 	s.tornTailBytes = 0

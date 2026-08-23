@@ -868,7 +868,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	//    write is gated on advance, so a steady ackedFsn doesn't
 	//    dirty the mapped page every tick. nil watermark (memory
 	//    mode / open failed) is a no-op.
-	e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
+	_, watermarkErr := e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
 
 	// 3. Retry the unlinks and the directory fsync an earlier pass could not
 	//    complete. Their bytes are still charged to the slot, so this is what
@@ -886,7 +886,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	//    no file to unlink.
 	trim := e.ring.peekTrimmable()
 	if len(trim) == 0 {
-		if joined := errors.Join(spareErr, deferredErr); joined != nil {
+		if joined := errors.Join(spareErr, deferredErr, watermarkErr); joined != nil {
 			m.recordServiceError(e, joined)
 			return
 		}
@@ -896,6 +896,13 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		return
 	}
 	if !memoryMode {
+		// A failed watermark advance cannot license deletion of newly acked
+		// segments. Deferred work above was licensed by an earlier successful
+		// barrier and remains safe to finish, but this trim must wait.
+		if watermarkErr != nil {
+			m.recordServiceError(e, errors.Join(spareErr, deferredErr, watermarkErr))
+			return
+		}
 		// Every exit below joins both carried errors in. A pass that could not
 		// mint a spare, or could not finish an earlier trim, AND then fails
 		// here is the case an operator most needs to read correctly: the

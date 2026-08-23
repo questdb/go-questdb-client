@@ -30,6 +30,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -381,12 +382,35 @@ func TestQwpSfRecoveryMigratesLegacyAndStampsManifestFlag(t *testing.T) {
 	assert.Equal(t, int64(0), ring.getActiveSegment().segmentBaseSeq())
 }
 
-// TestQwpSfRecoveryDoesNotReflushMigratedHeaders pins that the manifest-required
-// stamp costs a flush only on the restart that actually migrates the slot.
-// Recovery re-runs it over the whole chain every time, so a slot of thousands
-// of segments would otherwise pay thousands of flushes before it can send its
-// first row — in exactly the situation where a fast restart matters most.
-func TestQwpSfRecoveryDoesNotReflushMigratedHeaders(t *testing.T) {
+func TestQwpSfRecoveryRejectsOverflowingLegacyTerminalRangeBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-initial.sfa")
+	seg := createRecoverySegment(t, dir, "sf-initial.sfa", math.MaxInt64, "a")
+	require.NoError(t, seg.close())
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	ring, manifest, err := qwpSfRecoverRing(dir, 4096)
+	if ring != nil {
+		_ = ring.segmentRingClose()
+	}
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.Nil(t, ring)
+	require.Nil(t, manifest)
+	require.ErrorContains(t, err, "segment range overflows FSN space")
+	after, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	require.Equal(t, before, after, "range validation must precede header stamping or sanitation")
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfManifestFileName))
+	require.True(t, os.IsNotExist(statErr), "range validation must precede manifest synthesis")
+}
+
+// TestQwpSfRecoveryResyncsMigratedHeadersOncePerOpen pins the deliberate
+// restart cost of cross-process durability validation. A mapped flag may come
+// from a process that died after pwrite but before fsync, so every reopened
+// flagged segment receives one barrier before recovery trusts it. Repeated
+// calls on the same segment object remain free.
+func TestQwpSfRecoveryResyncsMigratedHeadersOncePerOpen(t *testing.T) {
 	dir := t.TempDir()
 	s0 := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
 	s1 := createRecoverySegment(t, dir, "sf-0001.sfa", 1, "b")
@@ -400,13 +424,16 @@ func TestQwpSfRecoveryDoesNotReflushMigratedHeaders(t *testing.T) {
 
 	var flushes atomic.Int64
 	hook := func(string) { flushes.Add(1) }
+	originalHook := qwpSfTestSegmentSyncHeaderHook.Load()
 	qwpSfTestSegmentSyncHeaderHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestSegmentSyncHeaderHook.Store(originalHook) })
 	ring, _, err = qwpSfRecoverRing(dir, 4096)
-	qwpSfTestSegmentSyncHeaderHook.Store(nil)
+	qwpSfTestSegmentSyncHeaderHook.Store(originalHook)
 	require.NoError(t, err)
 	require.NoError(t, ring.segmentRingClose())
 
-	assert.Zero(t, flushes.Load(), "a chain that already carries the flag must not be re-flushed")
+	assert.Equal(t, int64(2), flushes.Load(),
+		"each reopened flagged segment must be resynced exactly once")
 }
 
 func TestQwpSfRecoverySanitizesSealedResidueThenRetries(t *testing.T) {
@@ -430,6 +457,108 @@ func TestQwpSfRecoverySanitizesSealedResidueThenRetries(t *testing.T) {
 	require.NotNil(t, ring)
 	defer ring.segmentRingClose()
 	assert.Equal(t, int64(1), ring.segmentRingPublishedFsn())
+}
+
+func TestQwpSfRecoverySanitizesSealedResidueEquivalently(t *testing.T) {
+	for _, manifestBacked := range []bool{false, true} {
+		name := "legacy"
+		if manifestBacked {
+			name = "manifest"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+			active := createRecoverySegment(t, dir, "sf-0001.sfa", 1, "b")
+			if manifestBacked {
+				createRecoveryManifest(t, dir, 0, 1, sealed, active)
+			}
+			off := sealed.publishedOffset()
+			sealed.buf[off+20] = 0x7f
+			closeRecoverySegments(t, sealed, active)
+
+			_, _, err := qwpSfRecoverRing(dir, 4096)
+			require.ErrorIs(t, err, qwpSfErrSanitizedResidue,
+				"both provenance paths must stop after applying the same sealed-tail sanitization action")
+
+			onDisk, err := os.ReadFile(filepath.Join(dir, "sf-initial.sfa"))
+			require.NoError(t, err)
+			assert.Equal(t, make([]byte, len(onDisk)-int(off)), onDisk[off:])
+
+			ring, recoveredManifest, err := qwpSfRecoverRing(dir, 4096)
+			require.NoError(t, err)
+			require.NotNil(t, ring)
+			defer ring.segmentRingClose()
+			require.NotNil(t, recoveredManifest,
+				"legacy recovery must have synthesized the same durable boundary before applying mutations")
+			assert.Equal(t, int64(1), ring.segmentRingPublishedFsn())
+		})
+	}
+}
+
+func TestQwpSfRecoveryActionPlanIsIndependentOfFileOrder(t *testing.T) {
+	dir := t.TempDir()
+	stale := createRecoverySegment(t, dir, "sf-stale.sfa", 0, "f0", "f1")
+	sealed := createRecoverySegment(t, dir, "sf-sealed.sfa", 2, "f2")
+	sealedTail := sealed.publishedOffset()
+	sealed.buf[sealedTail+20] = 1
+	require.NoError(t, sealed.close())
+	sealed, err := qwpSfOpenSegment(sealed.segmentPath())
+	require.NoError(t, err)
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 3, "f3")
+	duplicate := createRecoverySegment(t, dir, "sf-duplicate.sfa", 3, "duplicate")
+	torn := openTornEmptySegment(t, dir, "sf-torn.sfa", 3)
+	empty := createRecoverySegment(t, dir, "sf-empty.sfa", 4)
+	segments := []*qwpSfSegment{stale, sealed, active, duplicate, torn, empty}
+	t.Cleanup(func() { closeRecoverySegments(t, segments...) })
+
+	expected := map[string]qwpSfRecoveryAction{
+		"sf-stale.sfa":     qwpSfRecoveryUnlink,
+		"sf-sealed.sfa":    qwpSfRecoverySanitizeSealed,
+		"sf-active.sfa":    qwpSfRecoveryKeep,
+		"sf-duplicate.sfa": qwpSfRecoveryQuarantine,
+		"sf-torn.sfa":      qwpSfRecoveryQuarantine,
+		"sf-empty.sfa":     qwpSfRecoveryUnlink,
+	}
+	manifest := &qwpSfManifest{generation: 1, headBase: 2, activeBase: 3}
+
+	var visitPermutations func(int)
+	permuted := append([]*qwpSfSegment(nil), segments...)
+	seen := 0
+	visitPermutations = func(at int) {
+		if at == len(permuted) {
+			seen++
+			facts := make([]qwpSfRecoveryFilePlan, 0, len(permuted))
+			for _, seg := range permuted {
+				facts = append(facts, qwpSfRecoveryFilePlan{
+					path:             seg.segmentPath(),
+					segment:          seg,
+					baseSeq:          seg.segmentBaseSeq(),
+					validFrames:      seg.segmentFrameCount(),
+					tornTailBytes:    seg.segmentTornTailBytes(),
+					manifestRequired: seg.segmentManifestRequired(),
+					mayHoldFrames:    seg.segmentFrameCount() > 0 || seg.segmentTornTailBytes() > 0,
+					action:           qwpSfRecoveryKeep,
+				})
+			}
+			plan := qwpSfBuildRecoveryPlan(dir, 4096, permuted, facts, manifest, false)
+			require.NoError(t, plan.failClosedErr)
+			require.Equal(t, qwpSfManifestCommitted, plan.manifestProvenance)
+			require.Equal(t, filepath.Join(dir, "sf-sealed.sfa"), plan.retryAfterSanitizePath)
+			for _, file := range plan.files {
+				require.Equal(t, expected[filepath.Base(file.path)], file.action,
+					"unexpected action for %s in permutation %d", file.path, seen)
+				require.NotEmpty(t, file.license)
+			}
+			return
+		}
+		for i := at; i < len(permuted); i++ {
+			permuted[at], permuted[i] = permuted[i], permuted[at]
+			visitPermutations(at + 1)
+			permuted[at], permuted[i] = permuted[i], permuted[at]
+		}
+	}
+	visitPermutations(0)
+	require.Equal(t, 720, seen)
 }
 
 func TestQwpSfRecoveryLegacyPositiveHeadWithCorruptUnknownFailsClosed(t *testing.T) {
@@ -668,6 +797,55 @@ func TestQwpSfRecoveryQuarantinesTornEmptyActiveBeforeReplacement(t *testing.T) 
 	corrupt, err := os.ReadFile(path + ".corrupt")
 	require.NoError(t, err)
 	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
+}
+
+func TestQwpSfRecoveryRetryCommitsInstalledTornActiveNamespace(t *testing.T) {
+	const baseSeq int64 = 7
+	dir, path := tornActiveSlot(t, baseSeq)
+	originalDirSync := qwpSfTestDirSyncHook.Load()
+	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(originalDirSync) })
+
+	injectedInstall := errors.New("injected installed-replacement barrier failure")
+	barriers := 0
+	failSecond := func(string) error {
+		barriers++
+		if barriers == 2 {
+			return injectedInstall
+		}
+		return nil
+	}
+	qwpSfTestDirSyncHook.Store(&failSecond)
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	if ring != nil {
+		_ = ring.segmentRingClose()
+	}
+	require.ErrorIs(t, err, injectedInstall)
+	require.Equal(t, 2, barriers, "fault must follow the replacement install rename")
+	require.FileExists(t, path, "the clean replacement is visible after the failed barrier")
+	require.FileExists(t, path+".corrupt", "the torn bytes remain preserved")
+
+	injectedRetry := errors.New("injected retry namespace barrier failure")
+	retryBarriers := 0
+	failRetry := func(string) error {
+		retryBarriers++
+		return injectedRetry
+	}
+	qwpSfTestDirSyncHook.Store(&failRetry)
+	ring, _, err = qwpSfRecoverRing(dir, 4096)
+	if ring != nil {
+		_ = ring.segmentRingClose()
+	}
+	require.ErrorIs(t, err, injectedRetry,
+		"retry must not expose the installed inode until its namespace is durable")
+	require.Equal(t, 1, retryBarriers)
+
+	qwpSfTestDirSyncHook.Store(originalDirSync)
+	ring, _, err = qwpSfRecoverRing(dir, 4096)
+	require.NoError(t, err)
+	require.NotNil(t, ring)
+	defer func() { _ = ring.segmentRingClose() }()
+	require.Equal(t, baseSeq, ring.getActiveSegment().segmentBaseSeq())
+	require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
 }
 
 // TestQwpSfRecoveryKeepsTornActiveWhenReplacementCannotBeCreated pins that a
@@ -1292,21 +1470,32 @@ func TestQwpSfQuarantineTargetPathBoundsName(t *testing.T) {
 	require.NoError(t, os.Rename(filepath.Join(dir, longA), next))
 }
 
-// TestQwpSfDiscardRefusesAnUnanchoredHead pins the boundary verification at
-// the one place that deletes. Every branch of qwpSfRecoverRing establishes
-// separately that the head it computes lines up with the base of a retained
-// segment, and history shows a branch can get that wrong — so
-// qwpSfDiscardOpened re-verifies it before removing anything: a head that
-// matches no kept base (and is not the explicit nothing-delivered sentinel)
-// is refused with a fail-closed error, and every file stays on disk.
+// TestQwpSfDiscardRefusesAnUnanchoredHead pins the executor's independent
+// boundary verification. A planner bug may select unlink under a head that
+// matches no retained segment, but the delete site must still refuse it.
 func TestQwpSfDiscardRefusesAnUnanchoredHead(t *testing.T) {
 	dir := t.TempDir()
 	kept := createRecoverySegment(t, dir, "sf-kept.sfa", 2, "c")
 	extra := createRecoverySegment(t, dir, "sf-extra.sfa", 0, "a")
 	defer closeRecoverySegments(t, kept, extra)
 
-	keep := map[*qwpSfSegment]struct{}{kept: {}}
-	err := qwpSfDiscardOpened([]*qwpSfSegment{kept, extra}, keep, nil, 1, true)
+	manifest := &qwpSfManifest{headBase: 1, activeBase: 2}
+	file := &qwpSfRecoveryFilePlan{
+		path:          extra.segmentPath(),
+		segment:       extra,
+		baseSeq:       extra.segmentBaseSeq(),
+		validFrames:   extra.segmentFrameCount(),
+		mayHoldFrames: true,
+		action:        qwpSfRecoveryUnlink,
+	}
+	plan := &qwpSfRecoveryPlan{
+		manifestProvenance: qwpSfManifestCommitted,
+		manifest:           manifest,
+		headBase:           1,
+		activeBase:         2,
+		chain:              []*qwpSfSegment{kept},
+	}
+	err := plan.revalidateUnlink(file)
 	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed,
 		"a head matching no kept segment base must be refused, not acted on")
 
@@ -1332,9 +1521,22 @@ func TestQwpSfDiscardRefusesTornDeletionUnderAnUncommittedHead(t *testing.T) {
 		kept := createRecoverySegment(t, dir, "sf-kept.sfa", 3, "c")
 		torn := openTornEmptySegment(t, dir, "sf-torn.sfa", 0)
 		defer closeRecoverySegments(t, kept, torn)
-		keep := map[*qwpSfSegment]struct{}{kept: {}}
 
-		err := qwpSfDiscardOpened([]*qwpSfSegment{kept, torn}, keep, nil, 3, false)
+		file := &qwpSfRecoveryFilePlan{
+			path:          torn.segmentPath(),
+			segment:       torn,
+			baseSeq:       torn.segmentBaseSeq(),
+			tornTailBytes: torn.segmentTornTailBytes(),
+			mayHoldFrames: true,
+			action:        qwpSfRecoveryUnlink,
+		}
+		plan := &qwpSfRecoveryPlan{
+			manifestProvenance: qwpSfManifestSynthesized,
+			headBase:           3,
+			activeBase:         3,
+			chain:              []*qwpSfSegment{kept},
+		}
+		err := plan.revalidateUnlink(file)
 		require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
 		_, statErr := os.Stat(filepath.Join(dir, "sf-torn.sfa"))
 		require.NoError(t, statErr, "the torn file must stay exactly where it was")
@@ -1345,9 +1547,25 @@ func TestQwpSfDiscardRefusesTornDeletionUnderAnUncommittedHead(t *testing.T) {
 		kept := createRecoverySegment(t, dir, "sf-kept.sfa", 3, "c")
 		torn := openTornEmptySegment(t, dir, "sf-torn.sfa", 0)
 		defer closeRecoverySegments(t, kept)
-		keep := map[*qwpSfSegment]struct{}{kept: {}}
 
-		require.NoError(t, qwpSfDiscardOpened([]*qwpSfSegment{kept, torn}, keep, nil, 3, true))
+		manifest := &qwpSfManifest{headBase: 3, activeBase: 3}
+		files := []qwpSfRecoveryFilePlan{{
+			path:          torn.segmentPath(),
+			segment:       torn,
+			baseSeq:       torn.segmentBaseSeq(),
+			tornTailBytes: torn.segmentTornTailBytes(),
+			mayHoldFrames: true,
+			action:        qwpSfRecoveryUnlink,
+		}}
+		plan := &qwpSfRecoveryPlan{
+			manifestProvenance: qwpSfManifestCommitted,
+			manifest:           manifest,
+			headBase:           3,
+			activeBase:         3,
+			chain:              []*qwpSfSegment{kept},
+			files:              files,
+		}
+		require.NoError(t, plan.applyDirectoryActions())
 		_, statErr := os.Stat(filepath.Join(dir, "sf-torn.sfa"))
 		require.True(t, os.IsNotExist(statErr),
 			"a committed head proves the torn file delivered, so it is unlinked")

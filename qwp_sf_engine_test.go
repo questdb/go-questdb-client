@@ -31,6 +31,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -301,7 +302,7 @@ func TestQwpSfEngineFullDrainUnlinksFiles(t *testing.T) {
 }
 
 func TestQwpSfEngineFullDrainBarrierFailureRetainsSlot(t *testing.T) {
-	for _, barrier := range []string{"watermark-sync", "manifest-sync"} {
+	for _, barrier := range []string{"watermark-overflow", "watermark-sync", "manifest-sync"} {
 		t.Run(barrier, func(t *testing.T) {
 			dir := t.TempDir()
 			sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "acked")
@@ -332,6 +333,16 @@ func TestQwpSfEngineFullDrainBarrierFailureRetainsSlot(t *testing.T) {
 
 			injected := errors.New("injected " + barrier + " failure")
 			switch barrier {
+			case "watermark-overflow":
+				engine.watermark.mu.Lock()
+				engine.watermark.generation = math.MaxInt64
+				engine.watermark.mu.Unlock()
+				injected = qwpSfErrGenerationOverflow
+				resetHook = func() {
+					engine.watermark.mu.Lock()
+					engine.watermark.generation = 0
+					engine.watermark.mu.Unlock()
+				}
 			case "watermark-sync":
 				hook := func(*os.File) error { return injected }
 				qwpSfAckWatermarkSync.Store(&hook)
@@ -824,7 +835,9 @@ func buildDrainedSlot(t *testing.T, spareBase int64) string {
 	closeRecoverySegments(t, sealed, active, spare)
 	watermark, err := qwpSfAckWatermarkOpenRequired(dir)
 	require.NoError(t, err)
-	require.True(t, watermark.persistIfAdvanced(spareBase-1))
+	advanced, err := watermark.persistIfAdvanced(spareBase - 1)
+	require.NoError(t, err)
+	require.True(t, advanced)
 	require.NoError(t, watermark.sync())
 	require.NoError(t, watermark.close())
 	return dir

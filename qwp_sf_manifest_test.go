@@ -38,6 +38,12 @@ import (
 )
 
 func TestQwpSfDualRecordJavaGoldenBytes(t *testing.T) {
+	// Provenance: these literal vectors entered the Go client in commit
+	// 02cab4f0 while porting QuestDB Java's SfManifest and AckWatermark
+	// dual-slot contract, recorded in that commit's
+	// design/qwp-sf-hardening-plan.md sections 1.1 and 1.2. Keep the bytes
+	// literal: regenerating them with qwpSfEncodeDualRecord would make this a
+	// self-consistency test instead of an independent cross-client format pin.
 	tests := []struct {
 		name                      string
 		magic                     uint32
@@ -114,6 +120,7 @@ func TestQwpSfManifestRejectsGenerationOverflow(t *testing.T) {
 	m.generation = math.MaxInt64
 	err = m.update(0, 1)
 	require.ErrorContains(t, err, "manifest generation overflow")
+	require.ErrorIs(t, err, qwpSfErrGenerationOverflow)
 	require.Equal(t, int64(0), m.activeBase)
 }
 

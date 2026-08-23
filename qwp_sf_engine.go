@@ -1317,10 +1317,15 @@ func (e *qwpSfCursorEngine) engineFinishClose(run qwpSfCleanupToken, fullyDraine
 	var firstErr error
 	drainCleanupAllowed := fullyDrained
 	if fullyDrained && !barriersCommitted {
-		e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
-		if err := e.watermark.sync(); err != nil {
+		if _, err := e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn()); err != nil {
 			firstErr = err
 			drainCleanupAllowed = false
+		}
+		if drainCleanupAllowed {
+			if err := e.watermark.sync(); err != nil {
+				firstErr = err
+				drainCleanupAllowed = false
+			}
 		}
 		active := e.ring.getActiveSegment()
 		manifest := e.ring.ringManifest()

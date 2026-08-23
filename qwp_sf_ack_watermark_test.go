@@ -79,10 +79,18 @@ func TestQwpSfAckWatermarkPersistGateAndFormat(t *testing.T) {
 	w := qwpSfAckWatermarkOpen(dir)
 	require.NotNil(t, w)
 
-	assert.True(t, w.persistIfAdvanced(7), "first advance writes")
-	assert.False(t, w.persistIfAdvanced(7), "same value does not re-write")
-	assert.False(t, w.persistIfAdvanced(3), "a regression never writes")
-	assert.True(t, w.persistIfAdvanced(9), "a higher value writes")
+	advanced, err := w.persistIfAdvanced(7)
+	require.NoError(t, err)
+	assert.True(t, advanced, "first advance writes")
+	advanced, err = w.persistIfAdvanced(7)
+	require.NoError(t, err)
+	assert.False(t, advanced, "same value does not re-write")
+	advanced, err = w.persistIfAdvanced(3)
+	require.NoError(t, err)
+	assert.False(t, advanced, "a regression never writes")
+	advanced, err = w.persistIfAdvanced(9)
+	require.NoError(t, err)
+	assert.True(t, advanced, "a higher value writes")
 	assert.Equal(t, int64(9), w.read())
 	require.NoError(t, w.close())
 
@@ -100,10 +108,14 @@ func TestQwpSfAckWatermarkPersistGateAndFormat(t *testing.T) {
 	require.NotNil(t, w2)
 	defer func() { _ = w2.close() }()
 	assert.Equal(t, int64(9), w2.read())
-	// lastPersistedAck resets per session, but the gate still honours
-	// the on-disk value's monotonicity once we advance past it.
-	assert.False(t, w2.persistIfAdvanced(-1))
-	assert.True(t, w2.persistIfAdvanced(10))
+	// The write gate is seeded from the selected durable record, so an equal or
+	// regressing value remains a no-op after reopen.
+	advanced, err = w2.persistIfAdvanced(-1)
+	require.NoError(t, err)
+	assert.False(t, advanced)
+	advanced, err = w2.persistIfAdvanced(10)
+	require.NoError(t, err)
+	assert.True(t, advanced)
 	assert.Equal(t, int64(10), w2.read())
 }
 
@@ -114,8 +126,57 @@ func TestQwpSfAckWatermarkRejectsGenerationWraparound(t *testing.T) {
 	defer func() { _ = w.close() }()
 
 	w.generation = math.MaxInt64
-	assert.False(t, w.persistIfAdvanced(0))
+	advanced, err := w.persistIfAdvanced(0)
+	require.ErrorContains(t, err, "ack watermark generation overflow")
+	require.ErrorIs(t, err, qwpSfErrGenerationOverflow)
+	assert.False(t, advanced)
 	assert.Equal(t, qwpSfAckWatermarkInvalid, w.read())
+}
+
+func TestQwpSfAckWatermarkMaxGenerationAllowsReopenedNoOps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfAckWatermarkFileName)
+	image := make([]byte, qwpSfAckWatermarkFileSize)
+	off := int(qwpSfDualRecordSlotSize) // MaxInt64 is odd, so it belongs in slot 1.
+	qwpSfEncodeDualRecord(image[off:off+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, math.MaxInt64, 41, 0)
+	require.NoError(t, os.WriteFile(path, image, 0o644))
+
+	w, err := qwpSfAckWatermarkOpenRequired(dir)
+	require.NoError(t, err)
+	require.NotNil(t, w)
+	defer func() { _ = w.close() }()
+
+	advanced, err := w.persistIfAdvanced(41)
+	require.NoError(t, err, "equal durable FSN is a no-op, not an overflow")
+	assert.False(t, advanced)
+	advanced, err = w.persistIfAdvanced(40)
+	require.NoError(t, err, "regressing durable FSN is a no-op, not an overflow")
+	assert.False(t, advanced)
+	advanced, err = w.persistIfAdvanced(42)
+	require.ErrorIs(t, err, qwpSfErrGenerationOverflow, "only a true advance overflows")
+	assert.False(t, advanced)
+}
+
+func TestQwpSfAckWatermarkFallsBackFromCorruptNewestRecordOnMmapOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfAckWatermarkFileName)
+	image := make([]byte, qwpSfAckWatermarkFileSize)
+	// Generation 1 belongs in slot 1 and is the older committed value.
+	oldOff := int(qwpSfDualRecordSlotSize)
+	qwpSfEncodeDualRecord(image[oldOff:oldOff+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, 1, 41, 0)
+	// Generation 2 belongs in slot 0. Corrupt only its CRC so the real open
+	// path must reject it and select generation 1 from the mapped file.
+	qwpSfEncodeDualRecord(image[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, 2, 42, 0)
+	image[qwpSfDualRecordSize-1] ^= 0xff
+	require.NoError(t, os.WriteFile(path, image, 0o644))
+
+	w, err := qwpSfAckWatermarkOpenRequired(dir)
+	require.NoError(t, err)
+	require.NotNil(t, w)
+	defer func() { _ = w.close() }()
+	require.NotEmpty(t, w.buf, "open must exercise the mmap-backed path")
+	assert.Equal(t, int64(1), w.generation)
+	assert.Equal(t, int64(41), w.read())
 }
 
 func TestQwpSfAckWatermarkHonoursForeignBytes(t *testing.T) {
@@ -127,6 +188,27 @@ func TestQwpSfAckWatermarkHonoursForeignBytes(t *testing.T) {
 	defer func() { _ = w.close() }()
 	assert.Equal(t, int64(42), w.read(),
 		"a watermark written by another client must be read byte-for-byte")
+}
+
+func TestQwpSfAckWatermarkValidityPredicate(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		first  int64
+		second int64
+		valid  bool
+	}{
+		{name: "empty-prefix", first: -1, second: 0, valid: true},
+		{name: "acked-prefix", first: 42, second: 0, valid: true},
+		{name: "reserved-field-is-not-a-boundary", first: 42, second: math.MinInt64, valid: true},
+		{name: "below-empty-prefix", first: -2, second: 0, valid: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.valid, qwpSfAckWatermarkRecordValid(qwpSfDualRecord{
+				first:  tc.first,
+				second: tc.second,
+			}))
+		})
+	}
 }
 
 func TestQwpSfAckWatermarkExistingBlockReservationFailureStopsOpen(t *testing.T) {
@@ -273,16 +355,22 @@ func TestQwpSfAckWatermarkClosedAndNilSafe(t *testing.T) {
 	dir := t.TempDir()
 	w := qwpSfAckWatermarkOpen(dir)
 	require.NotNil(t, w)
-	require.True(t, w.persistIfAdvanced(5))
+	advanced, err := w.persistIfAdvanced(5)
+	require.NoError(t, err)
+	require.True(t, advanced)
 	require.NoError(t, w.close())
 
 	assert.Equal(t, qwpSfAckWatermarkInvalid, w.read(), "read after close is INVALID")
-	assert.False(t, w.persistIfAdvanced(99), "persist after close is a no-op")
+	advanced, err = w.persistIfAdvanced(99)
+	require.NoError(t, err)
+	assert.False(t, advanced, "persist after close is a no-op")
 	assert.NoError(t, w.close(), "close is idempotent")
 
 	var nilW *qwpSfAckWatermark
 	assert.Equal(t, qwpSfAckWatermarkInvalid, nilW.read())
-	assert.False(t, nilW.persistIfAdvanced(1))
+	advanced, err = nilW.persistIfAdvanced(1)
+	require.NoError(t, err)
+	assert.False(t, advanced)
 	assert.NoError(t, nilW.close())
 
 	assert.Nil(t, qwpSfAckWatermarkOpen(""), "empty slot dir yields no watermark")
@@ -292,11 +380,13 @@ func TestQwpSfAckWatermarkRemoveOrphan(t *testing.T) {
 	dir := t.TempDir()
 	w := qwpSfAckWatermarkOpen(dir)
 	require.NotNil(t, w)
-	require.True(t, w.persistIfAdvanced(1))
+	advanced, err := w.persistIfAdvanced(1)
+	require.NoError(t, err)
+	require.True(t, advanced)
 	require.NoError(t, w.close())
 
 	path := filepath.Join(dir, qwpSfAckWatermarkFileName)
-	_, err := os.Stat(path)
+	_, err = os.Stat(path)
 	require.NoError(t, err)
 
 	qwpSfAckWatermarkRemoveOrphan(dir)
@@ -400,10 +490,9 @@ func TestQwpSfEngineWatermarkPersistedByManager(t *testing.T) {
 			if err != nil || int64(len(b)) != qwpSfAckWatermarkFileSize {
 				return false
 			}
-			valid := func(rec qwpSfDualRecord) bool { return rec.first >= -1 }
-			r0, ok0 := qwpSfDecodeDualRecord(b[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+			r0, ok0 := qwpSfDecodeDualRecord(b[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
 			off := int(qwpSfDualRecordSlotSize)
-			r1, ok1 := qwpSfDecodeDualRecord(b[off:off+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+			r1, ok1 := qwpSfDecodeDualRecord(b[off:off+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
 			rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
 			return ok && rec.first == 4
 		}, 2*time.Second, 5*time.Millisecond)

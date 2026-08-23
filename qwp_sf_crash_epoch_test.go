@@ -434,11 +434,12 @@ func TestQwpSfTornActiveReplacementCrashEpochsRecover(t *testing.T) {
 			require.NoError(t, ring.segmentRingClose())
 			restore()
 			require.True(t, recordedTemp)
-			require.Len(t, events, 5, "create, preserve, barrier, install, barrier")
+			require.Len(t, events, 6, "create, preserve, barrier, install, barrier, pre-exposure barrier")
 			require.Equal(t, tc.preserveOpKind, events[1].op.kind)
 			require.True(t, events[2].barrier)
 			require.Equal(t, qwpSfCrashRename, events[3].op.kind)
 			require.True(t, events[4].barrier)
+			require.True(t, events[5].barrier)
 
 			qwpSfAssertCrashFileEpochs(t, initial, events)
 		})

@@ -120,10 +120,9 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	valid := func(rec qwpSfDualRecord) bool { return rec.first >= -1 }
-	r0, ok0 := qwpSfDecodeDualRecord(buf[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+	r0, ok0 := qwpSfDecodeDualRecord(buf[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
 	off1 := int(qwpSfDualRecordSlotSize)
-	r1, ok1 := qwpSfDecodeDualRecord(buf[off1:off1+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, valid)
+	r1, ok1 := qwpSfDecodeDualRecord(buf[off1:off1+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
 	rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
 	if existing && !ok {
 		_ = qwpSfMunmap(buf)
@@ -156,8 +155,17 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 	if ok {
 		w.generation = rec.generation
 		w.fsn = rec.first
+		w.lastPersistedAck = rec.first
 	}
 	return w, nil
+}
+
+// qwpSfAckWatermarkRecordValid is deliberately narrower than the manifest's
+// predicate: first is the acknowledged FSN and -1 is the valid empty-prefix
+// watermark. The second field is reserved by the Java format and does not
+// participate in record validity.
+func qwpSfAckWatermarkRecordValid(rec qwpSfDualRecord) bool {
+	return rec.first >= -1
 }
 
 // qwpSfAckWatermarkReserveBlocks writes image back through the descriptor so
@@ -224,26 +232,26 @@ func (w *qwpSfAckWatermark) read() int64 {
 	return w.fsn
 }
 
-func (w *qwpSfAckWatermark) persistIfAdvanced(fsn int64) bool {
+func (w *qwpSfAckWatermark) persistIfAdvanced(fsn int64) (bool, error) {
 	if w == nil {
-		return false
+		return false, nil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed || fsn < -1 || fsn <= w.lastPersistedAck {
-		return false
+		return false, nil
+	}
+	if w.generation == math.MaxInt64 {
+		return false, fmt.Errorf("qwp/sf: ack watermark generation overflow: %w", qwpSfErrGenerationOverflow)
 	}
 	next := w.generation + 1
-	if next <= 0 {
-		return false
-	}
 	qwpSfEncodeDualRecord(w.scratch[:], qwpSfAckWatermarkMagic, next, fsn, 0)
 	off := int((next & 1) * qwpSfDualRecordSlotSize)
 	copy(w.buf[off:off+qwpSfDualRecordSize], w.scratch[:])
 	w.generation = next
 	w.fsn = fsn
 	w.lastPersistedAck = fsn
-	return true
+	return true, nil
 }
 
 func (w *qwpSfAckWatermark) sync() error {

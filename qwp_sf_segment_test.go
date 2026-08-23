@@ -27,9 +27,15 @@ package questdb
 import (
 	"encoding/binary"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"hash/crc32"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -303,6 +309,296 @@ func TestQwpSfSegmentMarkManifestRequiredSkipsRedundantFlush(t *testing.T) {
 		"a flag already on disk must not cost a second flush")
 }
 
+func TestQwpSfSegmentMarkManifestRequiredWritesDescriptorBeforeMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(*os.File, []byte, int64) (int, error)
+		cause error
+	}{
+		{
+			name: "enospc",
+			write: func(*os.File, []byte, int64) (int, error) {
+				return 0, syscall.ENOSPC
+			},
+			cause: syscall.ENOSPC,
+		},
+		{
+			name: "short-write",
+			write: func(*os.File, []byte, int64) (int, error) {
+				return 0, nil
+			},
+			cause: io.ErrShortWrite,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "sf-flag.sfa")
+			seg, err := qwpSfCreateSegment(path, 0, 4096)
+			require.NoError(t, err)
+			defer func() { _ = seg.close() }()
+			mappedBefore := append([]byte(nil), seg.buf[:qwpSfHeaderSize]...)
+			diskBefore, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			original := qwpSfSegmentWriteAt.load()
+			called := false
+			qwpSfSegmentWriteAt.store(func(f *os.File, p []byte, off int64) (int, error) {
+				called = true
+				require.Equal(t, int64(5), off)
+				require.Equal(t, []byte{qwpSfManifestRequiredFlag}, p)
+				return tc.write(f, p, off)
+			})
+			t.Cleanup(func() { qwpSfSegmentWriteAt.store(original) })
+
+			err = seg.markManifestRequired()
+			require.ErrorIs(t, err, tc.cause)
+			require.ErrorIs(t, err, ErrSfDurability)
+			require.True(t, called, "the recovery metadata mutation must go through the descriptor seam")
+			assert.Equal(t, mappedBefore, seg.buf[:qwpSfHeaderSize],
+				"a failed descriptor write must not mutate the mapped page")
+			diskAfter, readErr := os.ReadFile(path)
+			require.NoError(t, readErr)
+			assert.Equal(t, diskBefore, diskAfter, "the injected failure must preserve the on-disk bytes")
+		})
+	}
+}
+
+func TestQwpSfSegmentMarkManifestRequiredRetriesAfterSyncFailureAndReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sf-flag.sfa")
+	seg, err := qwpSfCreateSegment(path, 0, 4096)
+	require.NoError(t, err)
+
+	injected := errors.New("injected header sync failure")
+	failSync := func(string) error { return injected }
+	qwpSfTestSegmentSyncHeaderErrorHook.Store(&failSync)
+	t.Cleanup(func() { qwpSfTestSegmentSyncHeaderErrorHook.Store(nil) })
+
+	err = seg.markManifestRequired()
+	require.ErrorIs(t, err, injected)
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.False(t, seg.segmentManifestRequired(),
+		"failed durability must restore the backed shared mapping so any reopen retries")
+	require.NoError(t, seg.close())
+
+	seg, err = qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	defer func() { _ = seg.close() }()
+	require.False(t, seg.segmentManifestRequired(),
+		"the same-host page-cache view must not preserve an unsynced success marker")
+
+	var syncAttempts atomic.Int64
+	countSync := func(string) { syncAttempts.Add(1) }
+	qwpSfTestSegmentSyncHeaderHook.Store(&countSync)
+	t.Cleanup(func() { qwpSfTestSegmentSyncHeaderHook.Store(nil) })
+	qwpSfTestSegmentSyncHeaderErrorHook.Store(nil)
+
+	require.NoError(t, seg.markManifestRequired())
+	require.Equal(t, int64(1), syncAttempts.Load(),
+		"a reopened segment must retry the descriptor write and durability barrier")
+}
+
+func TestQwpSfSegmentMarkManifestRequiredResyncsFlagAfterProcessDeath(t *testing.T) {
+	const helperEnv = "QWP_SF_TEST_DIE_AFTER_MANIFEST_FLAG_WRITE"
+	if path := os.Getenv(helperEnv); path != "" {
+		seg, err := qwpSfOpenSegment(path)
+		if err != nil {
+			os.Exit(70)
+		}
+		dieBeforeSync := func(string) error {
+			os.Exit(71)
+			return nil
+		}
+		qwpSfTestSegmentSyncHeaderErrorHook.Store(&dieBeforeSync)
+		_ = seg.markManifestRequired()
+		os.Exit(72)
+	}
+
+	path := filepath.Join(t.TempDir(), "sf-flag-process-death.sfa")
+	seg, err := qwpSfCreateSegment(path, 0, 4096)
+	require.NoError(t, err)
+	require.NoError(t, seg.close())
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestQwpSfSegmentMarkManifestRequiredResyncsFlagAfterProcessDeath$")
+	cmd.Env = append(os.Environ(), helperEnv+"="+path)
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr, "helper unexpectedly succeeded: %s", output)
+	require.Equal(t, 71, exitErr.ExitCode(), "helper missed the post-write/pre-sync crash point: %s", output)
+
+	seg, err = qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	defer func() { _ = seg.close() }()
+	require.True(t, seg.segmentManifestRequired(),
+		"the next process must exercise the page-cache-visible unsynced flag")
+	var syncs atomic.Int64
+	countSync := func(string) { syncs.Add(1) }
+	qwpSfTestSegmentSyncHeaderHook.Store(&countSync)
+	t.Cleanup(func() { qwpSfTestSegmentSyncHeaderHook.Store(nil) })
+
+	require.NoError(t, seg.markManifestRequired())
+	require.Equal(t, int64(1), syncs.Load(),
+		"a reopened flagged header must be resynced before recovery trusts it")
+}
+
+func TestQwpSfRecoverySegmentBufferMutationsAreCentralized(t *testing.T) {
+	for _, path := range []string{
+		"qwp_sf_recovery.go",
+		"qwp_sf_recovered_dict.go",
+		"qwp_sf_segment.go",
+	} {
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		require.NoError(t, err)
+		for _, violation := range qwpSfTestRecoveryBufferMutationViolations(fset, file, path) {
+			t.Errorf("%s:%d: %s mutates a segment mmap buffer directly; use writeRecoveryAt",
+				violation.path, violation.line, violation.function)
+		}
+	}
+}
+
+func TestQwpSfRecoverySegmentBufferMutationGuardDetectsAliases(t *testing.T) {
+	const source = `package questdb
+func bad(segment *qwpSfSegment) {
+	buf := segment.address()
+	clear(buf[1:])
+	buf[0] = 1
+}
+func writeHeader(segment *qwpSfSegment) {
+	segment.buf[4] = 1
+}`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "guard_fixture.go", source, 0)
+	require.NoError(t, err)
+	violations := qwpSfTestRecoveryBufferMutationViolations(fset, file, "guard_fixture.go")
+	require.Len(t, violations, 3,
+		"aliases and a same-named non-method must not bypass the approved receiver methods")
+}
+
+type qwpSfTestBufferMutationViolation struct {
+	path     string
+	function string
+	line     int
+}
+
+func qwpSfTestRecoveryBufferMutationViolations(
+	fset *token.FileSet,
+	file *ast.File,
+	path string,
+) []qwpSfTestBufferMutationViolation {
+	var violations []qwpSfTestBufferMutationViolation
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || qwpSfTestApprovedSegmentMutationMethod(path, fn) {
+			continue
+		}
+		aliases := make(map[string]bool)
+		record := func(node ast.Node) {
+			violations = append(violations, qwpSfTestBufferMutationViolation{
+				path: path, function: fn.Name.Name, line: fset.Position(node.Pos()).Line,
+			})
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			switch n := node.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range n.Lhs {
+					if qwpSfTestWritesIntoBuf(lhs, aliases) {
+						record(lhs)
+					}
+				}
+				for i, rhs := range n.Rhs {
+					if !qwpSfTestExprAliasesSegmentBuf(rhs, aliases) {
+						continue
+					}
+					if i < len(n.Lhs) {
+						if ident, ok := n.Lhs[i].(*ast.Ident); ok {
+							aliases[ident.Name] = true
+						}
+					}
+				}
+			case *ast.ValueSpec:
+				for i, value := range n.Values {
+					if i < len(n.Names) && qwpSfTestExprAliasesSegmentBuf(value, aliases) {
+						aliases[n.Names[i].Name] = true
+					}
+				}
+			case *ast.CallExpr:
+				if len(n.Args) == 0 || !qwpSfTestExprAliasesSegmentBuf(n.Args[0], aliases) {
+					break
+				}
+				mutates := false
+				switch called := n.Fun.(type) {
+				case *ast.Ident:
+					mutates = called.Name == "copy" || called.Name == "clear"
+				case *ast.SelectorExpr:
+					mutates = strings.HasPrefix(called.Sel.Name, "Put")
+				}
+				if mutates {
+					record(n)
+				}
+			}
+			return true
+		})
+	}
+	return violations
+}
+
+func qwpSfTestApprovedSegmentMutationMethod(path string, fn *ast.FuncDecl) bool {
+	if filepath.Base(path) != "qwp_sf_segment.go" || fn.Recv == nil || len(fn.Recv.List) != 1 {
+		return false
+	}
+	receiver := fn.Recv.List[0].Type
+	if pointer, ok := receiver.(*ast.StarExpr); ok {
+		receiver = pointer.X
+	}
+	name, ok := receiver.(*ast.Ident)
+	if !ok || name.Name != "qwpSfSegment" {
+		return false
+	}
+	switch fn.Name.Name {
+	case "writeHeader", "rebaseSeq", "tryAppend", "writeRecoveryAt", "restoreRecoveryMappingAfterFailedSync":
+		return true
+	default:
+		return false
+	}
+}
+
+func qwpSfTestWritesIntoBuf(expr ast.Expr, aliases map[string]bool) bool {
+	switch expr.(type) {
+	case *ast.IndexExpr, *ast.SliceExpr:
+		return qwpSfTestExprAliasesSegmentBuf(expr, aliases)
+	default:
+		return false
+	}
+}
+
+func qwpSfTestExprAliasesSegmentBuf(expr ast.Expr, aliases map[string]bool) bool {
+	found := false
+	ast.Inspect(expr, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.Ident:
+			if aliases[n.Name] {
+				found = true
+				return false
+			}
+		case *ast.SelectorExpr:
+			if n.Sel.Name == "buf" {
+				found = true
+				return false
+			}
+		case *ast.CallExpr:
+			if selector, ok := n.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "address" {
+				found = true
+				return false
+			}
+		}
+		if found {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
 func TestQwpSfSegmentSanitizeTornTailReservesBlocksThroughDescriptor(t *testing.T) {
 	// The tail may sit over a hole on a filesystem where qwpSfAllocate
 	// took its sparse fallback. Zeroing it through the descriptor
@@ -330,8 +626,8 @@ func TestQwpSfSegmentSanitizeTornTailReservesBlocksThroughDescriptor(t *testing.
 
 	require.NoError(t, seg.sanitizeTornTail())
 
-	require.Equal(t, []int64{cursor, segSize}, covered,
-		"the descriptor write must cover the whole appendable tail, which is what later appends store into")
+	require.Equal(t, []int64{cursor, segSize, cursor, cursor + 1}, covered,
+		"the descriptor writes must cover the appendable tail before clearing its retry marker")
 	assert.Zero(t, seg.segmentTornTailBytes())
 	onDisk, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -359,6 +655,74 @@ func TestQwpSfSegmentSanitizeTornTailSurfacesFullDisk(t *testing.T) {
 	require.ErrorIs(t, err, syscall.ENOSPC)
 	assert.Greater(t, seg.segmentTornTailBytes(), int64(0),
 		"a tail that could not be zeroed stays flagged so the next recovery retries it")
+}
+
+func TestQwpSfSegmentSanitizeTornTailPreservesRetryEvidenceAfterPartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sf-torntail-partial.sfa")
+	const segSize = qwpSfHeaderSize + 3*qwpSfZeroFillChunk
+	writeTornSegment(t, path, segSize)
+
+	original := qwpSfSegmentWriteAt.load()
+	tailWrites := 0
+	qwpSfSegmentWriteAt.store(func(f *os.File, p []byte, off int64) (int, error) {
+		tailWrites++
+		if tailWrites == 2 {
+			return 0, syscall.ENOSPC
+		}
+		return original(f, p, off)
+	})
+	t.Cleanup(func() { qwpSfSegmentWriteAt.store(original) })
+
+	seg, err := qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	require.Greater(t, seg.segmentTornTailBytes(), int64(qwpSfZeroFillChunk))
+	err = seg.sanitizeTornTail()
+	require.ErrorIs(t, err, syscall.ENOSPC)
+	require.GreaterOrEqual(t, tailWrites, 2, "fault must occur after an earlier chunk succeeded")
+	require.NoError(t, seg.close())
+	qwpSfSegmentWriteAt.store(original)
+
+	seg, err = qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	defer func() { _ = seg.close() }()
+	require.Greater(t, seg.segmentTornTailBytes(), int64(0),
+		"reopen must retain a durable sanitation-pending signal after partial zeroing")
+	require.NoError(t, seg.sanitizeTornTail(), "the preserved signal must make sanitation retryable")
+	require.Zero(t, seg.segmentTornTailBytes())
+}
+
+func TestQwpSfSegmentSanitizeTornTailRestoresMarkerAfterFinalSyncFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sf-torntail-final-sync.sfa")
+	writeTornSegment(t, path, 4096)
+
+	injected := errors.New("injected final sanitation sync failure")
+	failFinal := func(_ string, phase string) error {
+		if phase == "cleared-marker" {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestSegmentSanitizeTailSyncErrorHook.Store(&failFinal)
+	t.Cleanup(func() { qwpSfTestSegmentSanitizeTailSyncErrorHook.Store(nil) })
+
+	seg, err := qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	err = seg.sanitizeTornTail()
+	require.ErrorIs(t, err, injected)
+	require.Greater(t, seg.segmentTornTailBytes(), int64(0))
+	require.NotZero(t, seg.buf[seg.appendCursor],
+		"a failed final barrier must restore the shared retry marker")
+	require.NoError(t, seg.close())
+	qwpSfTestSegmentSanitizeTailSyncErrorHook.Store(nil)
+
+	seg, err = qwpSfOpenSegment(path)
+	require.NoError(t, err)
+	defer func() { _ = seg.close() }()
+	require.Greater(t, seg.segmentTornTailBytes(), int64(0),
+		"reopen must retry after the failed marker-clear barrier")
+	require.NoError(t, seg.sanitizeTornTail())
+	require.Zero(t, seg.segmentTornTailBytes())
 }
 
 func TestQwpSfSegmentRecoveryHandlesCleanPartialFill(t *testing.T) {
