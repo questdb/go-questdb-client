@@ -639,6 +639,37 @@ func (m *qwpSfSegmentManager) managerWorkerError() error {
 // serviceRing performs one round of spare provisioning and trim for
 // a single ring. Cheap when the ring already has a spare and no
 // trimmable sealed segments — the common steady-state case.
+// qwpSfQuarantinedBytes sums the sizes of the .corrupt files recovery has set
+// aside in the slot directory (including numbered .corrupt-N copies). They
+// are preserved evidence — the only copy of rows the client could not prove
+// delivered — so the client never deletes them; counting them against
+// sf_max_total_bytes is what keeps the never-delete rule and the disk budget
+// from pulling against each other. Memory mode (dir == "") has nothing on
+// disk and reports zero, as does a directory that cannot be read: the scan
+// informs a provisioning decision, and a transient read failure must not
+// block minting on its own.
+func qwpSfQuarantinedBytes(dir string) int64 {
+	if dir == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.Contains(entry.Name(), ".corrupt") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		total += info.Size()
+	}
+	return total
+}
+
 func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	memoryMode := e.dir == ""
 	// A spare this pass could not provision. Carried to the end so the trim
@@ -653,7 +684,15 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		m.mu.Lock()
 		observedTotal := m.totalBytes
 		m.mu.Unlock()
-		if observedTotal+m.segmentSizeBytes > m.maxTotalBytes {
+		// Quarantined .corrupt files count against sf_max_total_bytes:
+		// preserved evidence the client never reclaims must not be exempt
+		// from the budget that bounds the slot's disk use, or a slot that
+		// repeatedly tears mid-append would grow without bound. The scan
+		// runs off m.mu, only when a mint is being considered, and rereads
+		// the directory each time so an operator deleting the evidence is
+		// noticed on the next pass and minting resumes.
+		quarantined := qwpSfQuarantinedBytes(e.dir)
+		if observedTotal+quarantined+m.segmentSizeBytes > m.maxTotalBytes {
 			// Disk/memory cap reached: skip provisioning. Producers
 			// will block on engineAppendBlocking until in-flight
 			// segments are ACK'd and trimmed, so this state is exactly
@@ -684,9 +723,10 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 				} else {
 					qwpSfLogGuarded(logger, slog.LevelWarn,
 						"qwp/sf: disk cap reached; spare provisioning "+
-							"paused — producers block until in-flight segments are ACK'd and trimmed",
-						"dir", e.dir, "usedBytes", observedTotal, "maxBytes", m.maxTotalBytes,
-						"segmentSize", m.segmentSizeBytes)
+							"paused — producers block until in-flight segments are ACK'd and trimmed"+
+							" (quarantined .corrupt bytes count against the cap; deleting them regains space)",
+						"dir", e.dir, "usedBytes", observedTotal, "quarantinedBytes", quarantined,
+						"maxBytes", m.maxTotalBytes, "segmentSize", m.segmentSizeBytes)
 				}
 			}
 		} else {

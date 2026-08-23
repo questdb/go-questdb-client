@@ -96,11 +96,18 @@ Disk slots are manifest-backed: `sf-manifest.bin` holds the committed oldest
 and active segment bases, `.ack-watermark` the cumulative ACK FSN. Recovery
 validates the complete segment chain against those committed boundaries before
 quarantining anything — a head or tail the manifest says is required fails
-closed, while a file proven stale or stray may be removed or renamed. A
+closed, while a file proven stale or stray may be removed or renamed. The
+delete site (`qwpSfDiscardOpened`) re-verifies the boundary it is handed: a
+head that matches no kept segment base (and is not the explicit
+nothing-delivered sentinel) fails closed instead of deleting, and a head the
+legacy migration synthesized licenses no torn-file deletion below it. A
 foreground sender preserves a fail-closed slot under `<sf_dir>/quarantined/` and
 starts a fresh slot; an orphan drainer writes the reason to a `.failed` sentinel
 instead. Legacy unflagged Go slots migrate in place on first recovery, and
-downgrading after that migration is unsupported.
+downgrading after that migration is unsupported. Quarantined `.corrupt` files
+inside a live slot count against `sf_max_total_bytes` — when they exhaust the
+budget no new segment is minted and the producer sees `ErrBackpressureTimeout`;
+the operator regains space by deleting the evidence, the client never does.
 
 Segment and manifest control points are durable even with
 `sf_durability=memory`: initial creation, rotation, each trim batch, and a fully

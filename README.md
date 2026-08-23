@@ -474,7 +474,7 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | `sf_dir` | unset | Group root. Setting it activates SF. |
 | `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_` only (no `.` or path separators). |
 | `sf_max_segment_bytes` | 4 MiB | Per-segment file size. |
-| `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
+| `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. Includes quarantined `.corrupt` files in the slot — deleting them regains space. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
 | `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as (a) the poison-frame episode budget (`max_frame_rejections`) and (b) a background drainer's no-progress / durable-stall watchdog — the time a live-but-stalled adopted slot is given before it is quarantined. Setting it small speeds up the initial connect and shrinks (a); the drainer watchdog (b) is floored at 30s (×4 in durable mode) so a small value can't wrongly quarantine a slow-but-healthy slot. |
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
@@ -547,9 +547,15 @@ fault while opening the slot (a full disk, an exhausted fd table, a mount that
 went away) says nothing about the slot's bytes, so it leaves no sentinel and the
 next foreground scan adopts the slot again.
 
-Nothing in the client ever reclaims any of this, and none of it counts against
-`sf_max_total_bytes` — it is the only copy of those rows, so deleting it is the
-operator's call. Left unattended, a crash loop can park one slot copy per cycle.
+Nothing in the client ever reclaims any of this — it is the only copy of those
+rows, so deleting it is the operator's call. Left unattended, a crash loop can
+park one slot copy per cycle. `.corrupt` files inside a live slot do count
+against `sf_max_total_bytes`: when quarantined bytes exhaust the budget, no new
+segment is minted and the producer sees `qdb.ErrBackpressureTimeout` — the same
+non-terminal, retry-the-call contract as running out of space for live data.
+Deleting the `.corrupt` files regains the space and minting resumes. The
+whole-slot copies under `quarantined/` sit outside any slot's budget and remain
+purely operator-owned.
 
 ## Querying
 

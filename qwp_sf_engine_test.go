@@ -1170,3 +1170,42 @@ func TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine(t *tes
 	require.NoError(t, lockErr, "the slot flock must be released")
 	require.NoError(t, lock.close())
 }
+
+// TestQwpSfQuarantinedBytesCountAgainstTheBudget pins part two of the
+// never-delete rule's budget story. Quarantined .corrupt files are preserved
+// evidence the client never reclaims, so they count against
+// sf_max_total_bytes: when they exhaust the budget, no new segment is minted
+// and the producer sees the same non-terminal ErrBackpressureTimeout as when
+// live data fills the cap. The operator regains the space by deleting the
+// evidence, and minting resumes.
+func TestQwpSfQuarantinedBytesCountAgainstTheBudget(t *testing.T) {
+	const segSize int64 = 96 // 24 header + 72 payload region
+	dir := t.TempDir()
+	// Budget for two segments: the active plus one spare. A segment-sized
+	// .corrupt file eats the spare's share.
+	corrupt := filepath.Join(dir, "sf-dead.sfa.corrupt")
+	require.NoError(t, os.WriteFile(corrupt, make([]byte, segSize), 0o644))
+
+	e, err := qwpSfNewCursorEngine(dir, segSize, 2*segSize, 60*time.Millisecond)
+	require.NoError(t, err)
+	defer func() { _ = e.engineClose() }()
+
+	// Fill the active segment: capacity = 96-24 = 72, each frame 8+16 = 24.
+	for i := 0; i < 3; i++ {
+		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
+		require.NoError(t, err, "iteration %d", i)
+	}
+	// The next append needs a rotation, and the quarantined bytes leave no
+	// budget for a spare.
+	_, err = e.engineAppendBlocking(context.Background(), make([]byte, 16))
+	require.ErrorIs(t, err, ErrBackpressureTimeout,
+		"quarantined bytes at the cap must backpressure the producer")
+
+	// Deleting the evidence is the operator's move, and it is sufficient.
+	require.NoError(t, os.Remove(corrupt))
+	require.Eventually(t, func() bool {
+		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
+		return err == nil
+	}, 5*time.Second, 10*time.Millisecond,
+		"minting must resume once the .corrupt files are gone")
+}

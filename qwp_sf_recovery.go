@@ -168,6 +168,12 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 	var chain []*qwpSfSegment
 	var activeSeg *qwpSfSegment
 	var preserve map[*qwpSfSegment]struct{}
+	// Whether the head boundary the common tail hands to qwpSfDiscardOpened
+	// was read from a manifest committed on disk. The legacy branch mints its
+	// manifest below from whatever files survived, and a head with no
+	// committed provenance licenses no torn-file deletion (see
+	// qwpSfDiscardOpened).
+	headCommitted := manifest != nil
 	if manifest != nil {
 		head, active := manifest.headBase, manifest.activeBase
 		activeSeg = qwpSfFindActive(all, active)
@@ -210,7 +216,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		}
 		if activeSeg == nil {
 			if len(chain) == 0 && head == active && len(framefulCorrupt) == 0 {
-				if err := qwpSfDiscardOpened(all, nil, nil, math.MinInt64); err != nil {
+				if err := qwpSfDiscardOpened(all, nil, nil, qwpSfHeadNothingDelivered, false); err != nil {
 					return nil, nil, err
 				}
 				all = nil
@@ -317,7 +323,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		} else {
 			activeSeg = qwpSfChooseEmptyInitial(all)
 			if activeSeg == nil {
-				if err := qwpSfDiscardOpened(all, nil, nil, math.MinInt64); err != nil {
+				if err := qwpSfDiscardOpened(all, nil, nil, qwpSfHeadNothingDelivered, false); err != nil {
 					return nil, nil, err
 				}
 				all = nil
@@ -370,7 +376,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 	// happened to survive, not from anything committed, which is why the
 	// unlink rule below also requires the segment to sit strictly below it.
 	discardHead := manifest.headBase
-	if err := qwpSfDiscardOpened(all, keep, preserve, discardHead); err != nil {
+	if err := qwpSfDiscardOpened(all, keep, preserve, discardHead, headCommitted); err != nil {
 		return nil, nil, err
 	}
 	qwpSfQuarantinePaths(corruptPaths)
@@ -465,15 +471,57 @@ func qwpSfSanitizeSealedResidue(chain []*qwpSfSegment) (string, error) {
 	return first, nil
 }
 
+// qwpSfHeadNothingDelivered is the head boundary the collapse exits pass to
+// qwpSfDiscardOpened: the manifest is about to be removed entirely, no
+// committed boundary remains, and no file may be treated as delivered.
+const qwpSfHeadNothingDelivered int64 = math.MinInt64
+
 // qwpSfDiscardOpened releases every opened segment outside keep. A file below
 // the committed head is unlinked: the manifest proves its frames delivered. One
 // that still carries bytes the boundaries do not account for -- a torn tail, or
 // a member of preserve -- is quarantined under a .corrupt name instead, so no
-// recovery path destroys bytes it cannot prove delivered. head is the committed
-// boundary below which the manifest accounts for every frame; the collapse
-// exits, which are about to remove the manifest entirely, pass a head that
-// treats nothing as delivered.
-func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]struct{}, head int64) error {
+// recovery path destroys bytes it cannot prove delivered. head is the boundary
+// below which the manifest accounts for every frame; the collapse exits pass
+// qwpSfHeadNothingDelivered. headCommitted reports whether head was read from
+// a manifest that already existed on disk; the legacy migration, which mints
+// its manifest from whatever files survived, passes false.
+//
+// The boundary is re-verified here, at the one place that deletes, before any
+// removal. Every branch that reaches this function establishes separately
+// that its head lines up with the base of a retained segment, and history
+// shows a branch can get that wrong -- so a head that matches no kept base
+// (and is not the explicit nothing-delivered sentinel) fails closed: a future
+// branch that computes a bad head gets a refusal instead of a deletion.
+//
+// A synthesized head licenses no torn-file deletion below it. Below a
+// COMMITTED head the manifest accounts for every frame, torn bytes included;
+// a head derived from surviving files proves nothing, and segmentFrameCount
+// stops at the first bad CRC, so a torn file below such a head can still hold
+// undelivered rows. The legacy branch refuses this shape before it gets here;
+// this check makes the delete site refuse it independently.
+func qwpSfDiscardOpened(all []*qwpSfSegment, keep, preserve map[*qwpSfSegment]struct{}, head int64, headCommitted bool) error {
+	if head != qwpSfHeadNothingDelivered {
+		anchored := false
+		for seg := range keep {
+			if seg.segmentBaseSeq() == head {
+				anchored = true
+				break
+			}
+		}
+		if !anchored {
+			return qwpSfFailClosed("head %d matches the base of no kept segment; refusing to release any file under an unverified boundary", head)
+		}
+		if !headCommitted {
+			for _, seg := range all {
+				if _, ok := keep[seg]; ok {
+					continue
+				}
+				if seg.segmentTornTailBytes() > 0 && seg.segmentBaseSeq() < head {
+					return qwpSfFailClosed("segment at base %d lost frames to a torn write and sits below the synthesized head %d, so its range cannot be shown already-acked", seg.segmentBaseSeq(), head)
+				}
+			}
+		}
+	}
 	for _, seg := range all {
 		if _, ok := keep[seg]; ok {
 			continue

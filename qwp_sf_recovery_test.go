@@ -1291,3 +1291,65 @@ func TestQwpSfQuarantineTargetPathBoundsName(t *testing.T) {
 	require.LessOrEqual(t, len(filepath.Base(next)), qwpSfQuarantineNameMaxLen)
 	require.NoError(t, os.Rename(filepath.Join(dir, longA), next))
 }
+
+// TestQwpSfDiscardRefusesAnUnanchoredHead pins the boundary verification at
+// the one place that deletes. Every branch of qwpSfRecoverRing establishes
+// separately that the head it computes lines up with the base of a retained
+// segment, and history shows a branch can get that wrong — so
+// qwpSfDiscardOpened re-verifies it before removing anything: a head that
+// matches no kept base (and is not the explicit nothing-delivered sentinel)
+// is refused with a fail-closed error, and every file stays on disk.
+func TestQwpSfDiscardRefusesAnUnanchoredHead(t *testing.T) {
+	dir := t.TempDir()
+	kept := createRecoverySegment(t, dir, "sf-kept.sfa", 2, "c")
+	extra := createRecoverySegment(t, dir, "sf-extra.sfa", 0, "a")
+	defer closeRecoverySegments(t, kept, extra)
+
+	keep := map[*qwpSfSegment]struct{}{kept: {}}
+	err := qwpSfDiscardOpened([]*qwpSfSegment{kept, extra}, keep, nil, 1, true)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed,
+		"a head matching no kept segment base must be refused, not acted on")
+
+	_, statErr := os.Stat(filepath.Join(dir, "sf-kept.sfa"))
+	require.NoError(t, statErr)
+	_, statErr = os.Stat(filepath.Join(dir, "sf-extra.sfa"))
+	require.NoError(t, statErr, "no file may be removed under a refused boundary")
+	_, statErr = os.Stat(filepath.Join(dir, "sf-extra.sfa.corrupt"))
+	require.True(t, os.IsNotExist(statErr), "nor renamed")
+}
+
+// TestQwpSfDiscardRefusesTornDeletionUnderAnUncommittedHead pins the second
+// discard-site verification. A head read from a committed manifest proves
+// every frame below it delivered, so a torn file wholly below it may be
+// unlinked. A head the legacy migration synthesized from surviving files
+// proves nothing — segmentFrameCount stops at the first bad CRC, so a torn
+// file below such a head can still hold undelivered rows — and the delete
+// site refuses that shape even when the branch that computed the head fails
+// to.
+func TestQwpSfDiscardRefusesTornDeletionUnderAnUncommittedHead(t *testing.T) {
+	t.Run("uncommitted-head-refuses", func(t *testing.T) {
+		dir := t.TempDir()
+		kept := createRecoverySegment(t, dir, "sf-kept.sfa", 3, "c")
+		torn := openTornEmptySegment(t, dir, "sf-torn.sfa", 0)
+		defer closeRecoverySegments(t, kept, torn)
+		keep := map[*qwpSfSegment]struct{}{kept: {}}
+
+		err := qwpSfDiscardOpened([]*qwpSfSegment{kept, torn}, keep, nil, 3, false)
+		require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+		_, statErr := os.Stat(filepath.Join(dir, "sf-torn.sfa"))
+		require.NoError(t, statErr, "the torn file must stay exactly where it was")
+	})
+
+	t.Run("committed-head-unlinks", func(t *testing.T) {
+		dir := t.TempDir()
+		kept := createRecoverySegment(t, dir, "sf-kept.sfa", 3, "c")
+		torn := openTornEmptySegment(t, dir, "sf-torn.sfa", 0)
+		defer closeRecoverySegments(t, kept)
+		keep := map[*qwpSfSegment]struct{}{kept: {}}
+
+		require.NoError(t, qwpSfDiscardOpened([]*qwpSfSegment{kept, torn}, keep, nil, 3, true))
+		_, statErr := os.Stat(filepath.Join(dir, "sf-torn.sfa"))
+		require.True(t, os.IsNotExist(statErr),
+			"a committed head proves the torn file delivered, so it is unlinked")
+	})
+}
