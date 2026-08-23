@@ -70,7 +70,10 @@ func main() {
 		// the segment manager is still busy, the release finishes on
 		// a background goroutine that keeps retrying it. Reopening
 		// the same slot immediately may fail with a lock error naming
-		// this process; retry the open until it succeeds.
+		// this process; retry the open until it succeeds. This is specific
+		// to a standalone sender: pooled SF applications can retry
+		// QuestDB.Close while ErrSfCleanupPending matches, and a nil result
+		// there proves every pool-managed slot is unlocked.
 		if err := sender.Close(ctx); err != nil {
 			log.Fatal(err)
 		}

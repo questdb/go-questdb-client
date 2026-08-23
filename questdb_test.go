@@ -27,7 +27,6 @@ package questdb
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -578,120 +577,53 @@ func TestQuestDBDrainerListenerAppliedToPooledSenders(t *testing.T) {
 	}
 }
 
-// TestQuestDBCloseReprobeDoesNotHoldCloseMu pins that the retained-slot-lock
-// re-probe runs off closeMu. That path logs through the application's slog
-// handler, and the guarded handler contains one that panics but not one that
-// blocks — a handler calling Close while the lock is held would deadlock on a
-// non-reentrant mutex, and concurrent callers would serialize behind pool
-// teardown either way.
-func TestQuestDBCloseReprobeDoesNotHoldCloseMu(t *testing.T) {
-	db := &QuestDB{}
-	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
-	db.closeOnce.Do(func() {}) // mark the one-shot teardown as already run
-
-	// The re-probe restores a retired slot's capacity and logs that through the
-	// application's handler. This handler reaches back for closeMu, which is
-	// exactly what a user handler calling Close does; holding the lock across
-	// the re-probe deadlocks on it.
-	reentered := make(chan struct{})
-	db.senderPool = &qwpSenderPool{
+func closedSfPoolWithRetiredSlot(cleanup closeLifecycleReporter) *qwpSenderPool {
+	closeDone := make(chan struct{})
+	close(closeDone)
+	return &qwpSenderPool{
 		closed:          true,
+		closeStarted:    true,
+		closeDone:       closeDone,
 		storeAndForward: true,
 		notify:          make(chan struct{}),
-		slotInUse:       []bool{true},
-		leakedSlots:     1,
-		retiredSlots:    []*qwpSenderSlot{{slotIndex: 0}}, // no reporter: counts as closed
-		logger:          slog.New(closeMuProbeHandler{db: db, hit: reentered}),
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- db.Close(context.Background()) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Close deadlocked: closeMu is held across the re-probe")
-	}
-	select {
-	case <-reentered:
-	default:
-		t.Fatal("the re-probe never reached the logger; the test proves nothing")
+		sfSlots:         []qwpSfSlotLifecycle{{state: qwpSfSlotRetired}},
+		retiredSlots:    []*qwpSenderSlot{{slotIndex: 0, cleanup: cleanup}},
 	}
 }
 
-// closeMuProbeHandler takes db.closeMu from inside a log call, standing in for
-// an application handler that calls Close.
-type closeMuProbeHandler struct {
+type closeReentryHandler struct {
 	db  *QuestDB
-	hit chan struct{}
+	hit chan error
 }
 
-func (closeMuProbeHandler) Enabled(context.Context, slog.Level) bool { return true }
-func (h closeMuProbeHandler) Handle(context.Context, slog.Record) error {
-	// Acquiring the lock at all is the probe: it proves closeMu is free while
-	// the re-probe runs, which is what a user handler calling Close needs.
-	h.db.closeMu.Lock()
-	_ = h.db.closeErr
-	h.db.closeMu.Unlock()
+func (*closeReentryHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *closeReentryHandler) Handle(context.Context, slog.Record) error {
 	select {
-	case <-h.hit:
+	case h.hit <- h.db.Close(context.Background()):
 	default:
-		close(h.hit)
 	}
 	return nil
 }
-func (h closeMuProbeHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h closeMuProbeHandler) WithGroup(string) slog.Handler      { return h }
+func (h *closeReentryHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *closeReentryHandler) WithGroup(string) slog.Handler      { return h }
 
-// TestQuestDBCloseRecordsTheNewestProbe pins which of two concurrent re-probes
-// is remembered. The pending count is not monotone -- a lease returned after
-// close raises it again -- so no rule over the result values can tell which
-// observation is newer. The probe sequence can: one that started later saw
-// later state.
-//
-// The window is real and was previously guarded by a rule over values, whose
-// regression test a reviewer showed could be satisfied by a plain assignment.
-// This drives the actual call site with two callers.
-func TestQuestDBCloseRecordsTheNewestProbe(t *testing.T) {
+// The fresh lifecycle probe and its configured logger run without a facade
+// result mutex. A logger that re-enters Close therefore observes the already
+// freed ledger instead of deadlocking on cached-result bookkeeping.
+func TestQuestDBCloseReprobeAllowsLoggerReentry(t *testing.T) {
 	db := &QuestDB{}
 	db.closeOnce.Do(func() {})
-	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
+	db.senderPool = closedSfPoolWithRetiredSlot(nil)
+	reentered := make(chan error, 1)
+	db.senderPool.logger = slog.New(&closeReentryHandler{db: db, hit: reentered})
 
-	// The first caller's probe observes a retained lock, then parks before
-	// recording. The second observes a clean pool and records over it.
-	held := make(chan struct{})
-	release := make(chan struct{})
-	hook := func(seq uint64) {
-		if seq == 1 {
-			close(held)
-			<-release
-		}
-	}
-	qwpTestCloseReprobeHook.Store(&hook)
-	t.Cleanup(func() { qwpTestCloseReprobeHook.Store(nil) })
-
-	db.senderPool = &qwpSenderPool{
-		closed: true, notify: make(chan struct{}), storeAndForward: true,
-		slotInUse: []bool{true}, leakedSlots: 1,
-		retiredSlots: []*qwpSenderSlot{{slotIndex: 0, cleanup: &neverDoneSlot{}}},
-	}
-	stale := make(chan error, 1)
-	go func() { stale <- db.Close(context.Background()) }()
+	require.NoError(t, db.Close(context.Background()))
 	select {
-	case <-held:
+	case err := <-reentered:
+		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("the first probe never reached the record window")
+		t.Fatal("the lifecycle re-probe never reached the configured logger")
 	}
-
-	db.senderPool = &qwpSenderPool{closed: true, notify: make(chan struct{})}
-	require.NoError(t, db.Close(context.Background()), "the newer probe observes a clean pool")
-
-	close(release)
-	require.ErrorIs(t, <-stale, ErrSfCleanupPending, "the older caller still returns what it saw")
-
-	db.closeMu.Lock()
-	defer db.closeMu.Unlock()
-	require.NoError(t, db.closeErr,
-		"the older probe must not record over the newer one's result")
 }
 
 // flippableDoneSlot is a cleanup reporter whose completion can be switched on
@@ -713,12 +645,12 @@ func (s *flippableDoneSlot) ensureCloseRetryOwner(*slog.Logger) {}
 func TestQuestDBConcurrentCloseReprobes(t *testing.T) {
 	db := &QuestDB{}
 	db.closeOnce.Do(func() {})
-	db.closeErr = fmt.Errorf("%w (1 slot(s))", ErrSfCleanupPending)
 	cleanup := &flippableDoneSlot{}
-	db.senderPool = &qwpSenderPool{
-		closed: true, notify: make(chan struct{}), storeAndForward: true,
-		slotInUse: []bool{true}, leakedSlots: 1,
-		retiredSlots: []*qwpSenderSlot{{slotIndex: 0, cleanup: cleanup}},
+	db.senderPool = closedSfPoolWithRetiredSlot(cleanup)
+
+	for i := 0; i < 4; i++ {
+		require.ErrorIs(t, db.Close(context.Background()), ErrSfCleanupPending,
+			"Close must stay pending while the lifecycle ledger is non-free")
 	}
 
 	const callers = 8
@@ -743,9 +675,16 @@ func TestQuestDBConcurrentCloseReprobes(t *testing.T) {
 		if err != nil {
 			require.ErrorIs(t, err, ErrSfCleanupPending,
 				"caller %d must see either nil or a pending report", i)
+			continue
 		}
+		db.senderPool.mu.Lock()
+		pending := db.senderPool.sfSlotObligationCountLocked()
+		db.senderPool.mu.Unlock()
+		require.Zero(t, pending, "caller %d returned nil before every lifecycle record was free", i)
 	}
 	cleanup.done.Store(true)
 	require.NoError(t, db.Close(context.Background()),
 		"with every caller returned and cleanup landed, Close must clear")
+	require.NoError(t, db.Close(context.Background()),
+		"a clean Close is stable because the closed pool admits no new obligations")
 }

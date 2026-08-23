@@ -238,10 +238,10 @@ func TestQwpSenderPoolSfStrandedSlotRecovered(t *testing.T) {
 		t.Fatalf("total=%d, want 2 (prewarm slot 0 + recovered slot 2)", total)
 	}
 	p.mu.Lock()
-	reserved := p.slotInUse[2]
+	state := p.sfSlots[2].state
 	p.mu.Unlock()
-	if !reserved {
-		t.Fatal("slotInUse[2] not reserved after recovery — Hazard A regression")
+	if state != qwpSfSlotAvailable {
+		t.Fatalf("recovered slot 2 state=%s, want available — Hazard A regression", state)
 	}
 	// Grow to max: indices 1 and 3 are allocated, never the live index 2, so no
 	// "slot already in use" collision.

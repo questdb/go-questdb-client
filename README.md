@@ -57,8 +57,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	qdb "github.com/questdb/go-questdb-client/v4"
 )
@@ -71,8 +73,16 @@ func main() {
 		panic(err)
 	}
 	defer func() {
-		if err := db.Close(ctx); err != nil {
-			log.Printf("questdb close: %v", err)
+		for {
+			err := db.Close(ctx)
+			if errors.Is(err, qdb.ErrSfCleanupPending) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				log.Printf("questdb close: %v", err)
+			}
+			return
 		}
 	}()
 
@@ -138,7 +148,7 @@ SQL — plus a background housekeeper that closes idle and over-age connections.
 | `qdb.NewQuestDB(ctx, conf, opts...)` | `*QuestDB` | Same, with pool-tuning options. |
 | `db.BorrowSender(ctx)` | `LineSender` | Lease a sender; `Close` flushes and returns it to the pool. |
 | `db.BorrowQuery(ctx)` | `*Query` | Lease a query session; `Close` returns it. |
-| `db.Close(ctx)` | `error` | Shut down both pools and disconnect every underlying client. Idempotent. Returns an error wrapping `qdb.ErrSfCleanupPending` while a store-and-forward slot's cleanup is still retrying — a "not yet", not a failure: call it again later (see [Store-and-forward](#store-and-forward)). |
+| `db.Close(ctx)` | `error` | Shut down both pools and disconnect every underlying client. Idempotent. In SF mode, an outstanding lease, construction, or cleanup returns an error wrapping `qdb.ErrSfCleanupPending`: return leases and retry. Once it returns nil, every pool-managed slot is unlocked and later calls remain nil (see [Store-and-forward](#store-and-forward)). |
 
 The schema must be `ws` or `wss` — the pooled facade is QWP-only. A borrowed
 sender or query session is single-threaded; the handle itself is safe to share.
@@ -500,15 +510,20 @@ SF terminal cleanup retries transient local-storage failures indefinitely while
 the process remains alive. A persistent disk fault therefore keeps that slot's
 flock—and, for a pooled sender, its capacity reservation—until storage recovers
 or the process exits; releasing either earlier could let a new owner race files
-whose durable cleanup did not finish. While any slot's cleanup is still
-outstanding, `db.Close(ctx)` returns an error wrapping `qdb.ErrSfCleanupPending`
-and a standalone sender's `Close` returns nil; neither means the slot's lock is
-gone. Call `db.Close(ctx)` again later — it re-probes every time and stops
-reporting `ErrSfCleanupPending` once the last lock is released. A nil result
-covers everything handed back to the pool by that point: a lease returned
-*after* a nil `Close` adds new cleanup work, so a later `Close` can report
-`ErrSfCleanupPending` again, and one more call clears it. Retrying until nil
-remains the correct shutdown gate either way.
+whose durable cleanup did not finish.
+
+For a pooled sender, every reserved SF index is a shutdown obligation from the
+start of construction until its flock is released. An outstanding lease,
+in-flight construction, active teardown, or deferred cleanup therefore makes
+`db.Close(ctx)` return an error wrapping `qdb.ErrSfCleanupPending`. Return every
+lease and call `db.Close(ctx)` again later: it takes a fresh lifecycle snapshot
+on every call and stops reporting the sentinel only when every record is free.
+At that point no closed-pool operation can create another obligation, so a nil
+result proves every pool-managed slot is unlocked and later calls remain nil.
+
+A standalone SF sender has no pool lifecycle ledger. Its `Close` may still
+return nil while engine cleanup releases the slot lock in the background;
+reopening the same `sf_dir` + `sender_id` should retry a temporary lock error.
 
 #### Local errors from the SF path
 

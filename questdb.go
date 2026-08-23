@@ -32,7 +32,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -69,22 +68,11 @@ type QuestDB struct {
 	housekeeper *qwpPoolHousekeeper
 	closeOnce   sync.Once
 
-	// closeMu guards the fields below. Close runs its teardown exactly once
-	// under closeOnce, but a later Close still re-probes the sender pool when
-	// the first pass reported retained slot locks, so the recorded result is
-	// not immutable.
-	closeMu sync.Mutex
-	// closeProbeSeq numbers each retained-lock re-probe, and closeRecordedSeq
-	// is the highest-numbered one whose result has been recorded. Concurrent
-	// callers can both be inside a re-probe, and the pending count is not
-	// monotone -- a lease returned after close raises it again -- so no rule
-	// over the result values themselves can tell which observation is newer.
-	// The sequence can: a probe that started later observed later state.
-	closeProbeSeq     uint64
-	closeRecordedSeq  uint64
-	closeErr          error
-	closeQueryErr     error
-	closeHousekeepErr error
+	// These fields contain only stable one-time teardown results. The volatile
+	// SF lifecycle snapshot is read from senderPool on every Close call.
+	closeSenderFallbackErr error
+	closeQueryErr          error
+	closeHousekeepErr      error
 }
 
 // QuestDBOption configures the QuestDB facade. An explicit option always wins
@@ -445,23 +433,18 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // sender pool (which owns the flocks/mmaps/I/O goroutines) is closed last and
 // always runs.
 //
-// A store-and-forward sender whose cleanup has not finished by the time the
-// pool tears down keeps its slot lock while a retry owner works in the
-// background. Close reports that as an error wrapping [ErrSfCleanupPending],
-// which is a "not yet", not a failure. Because the housekeeper is already
-// stopped by then, nothing else re-checks those slots — so a Close that
-// returned ErrSfCleanupPending re-probes the sender pool on every later call
-// and stops reporting that sentinel once the last slot lock is gone. A caller
-// gating shutdown on a clean Close should therefore retry it while
-// errors.Is(err, ErrSfCleanupPending) holds, rather than treat the first
-// result as final.
+// In store-and-forward mode, every reserved slot remains a shutdown obligation
+// from construction until its flock has been released. After a bounded wait,
+// an outstanding lease, in-flight construction, active teardown, or deferred
+// cleanup makes Close return an error wrapping [ErrSfCleanupPending]. That is a
+// "not yet" status: return outstanding leases and retry Close while
+// errors.Is(err, ErrSfCleanupPending) holds. Every call takes a fresh lifecycle
+// snapshot after re-probing retired slots.
 //
-// A nil result covers everything handed back to the pool by the time that
-// call probed: a lease returned after a nil Close adds new cleanup work, so a
-// later Close can report ErrSfCleanupPending again, and one more call clears
-// it once that cleanup lands. The pending-lock count is not monotone, and no
-// Close result pretends otherwise; retrying until nil remains the correct
-// shutdown gate under that reading.
+// Once Close returns nil, every pool-managed SF slot is free and no operation
+// can later acquire or retain its flock. Later Close calls therefore remain
+// nil. Stable errors from the one-time teardown remain reportable on every
+// call and are never replaced by a volatile snapshot.
 //
 // Avoid calling Close from inside a pooled SenderErrorHandler or
 // SenderConnectionListener. Pooled callbacks are funnelled through one
@@ -479,63 +462,22 @@ func (db *QuestDB) Close(ctx context.Context) error {
 		db.queryPool.markClosing()
 		hErr := closeStep(func() error { db.housekeeper.stopAndJoin(); return nil })
 		qErr := closeStep(func() error { return db.queryPool.close(ctx) })
-		sErr := closeStep(func() error { return db.senderPool.close(ctx) })
-		// Every step ran; surface the most actionable error.
-		db.closeMu.Lock()
+		firstSenderResult := closeStep(func() error { return db.senderPool.close(ctx) })
 		db.closeQueryErr, db.closeHousekeepErr = qErr, hErr
-		db.closeErr = firstCloseErr(sErr, qErr, hErr)
-		db.closeMu.Unlock()
+		// qwpSenderPool remembers ordinary teardown/poison errors itself. Keep
+		// only a facade fallback for a panic recovered outside the pool before
+		// it could record that stable result; never cache CleanupPending here.
+		if db.senderPool.stableCloseResult() == nil && firstSenderResult != nil &&
+			!errors.Is(firstSenderResult, ErrSfCleanupPending) {
+			db.closeSenderFallbackErr = firstSenderResult
+		}
 	})
-	db.closeMu.Lock()
-	if !errors.Is(db.closeErr, ErrSfCleanupPending) {
-		err := db.closeErr
-		db.closeMu.Unlock()
-		return err
-	}
-	queryErr, housekeepErr := db.closeQueryErr, db.closeHousekeepErr
-	db.closeProbeSeq++
-	seq := db.closeProbeSeq
-	db.closeMu.Unlock()
-	// Close's result splits into a stable part and a volatile part, and the
-	// two are handled differently on purpose. Stable: the query-pool error,
-	// the housekeeper error and the first pass's teardown error are recorded
-	// once under closeOnce and never rewritten — those teardowns ran exactly
-	// once, so no later observation can improve on them. Volatile: the
-	// pending-lock count is not monotone (a lease returned after close adds
-	// new cleanup work), so it is always probed fresh here and cached only
-	// under a newer probe sequence below — no comparison of old and new
-	// values can impose an ordering the numbers do not have, so "newest
-	// observation wins" is the only rule that works.
-	//
-	// Retained slot locks are the one Close result that can still change:
-	// qwpSenderPool.close is idempotent and re-probes its retired slots, and it
-	// replays the teardown error from the first pass, so recomputing here
-	// cannot lose a real failure. The query pool and the housekeeper are done
-	// for good, so their errors come from the recorded values.
-	//
-	// The re-probe runs off closeMu. It logs through the application's slog
-	// handler, and while the guarded handler contains a panicking one it cannot
-	// contain a blocking one -- a handler that calls Close would deadlock on
-	// this non-reentrant mutex. Holding the lock across pool teardown would
-	// also serialize concurrent callers behind filesystem work.
 	sErr := closeStep(func() error { return db.senderPool.close(ctx) })
-	result := firstCloseErr(sErr, queryErr, housekeepErr)
-	if hook := qwpTestCloseReprobeHook.Load(); hook != nil {
-		(*hook)(seq)
+	if db.closeSenderFallbackErr != nil {
+		sErr = errors.Join(db.closeSenderFallbackErr, sErr)
 	}
-	db.closeMu.Lock()
-	defer db.closeMu.Unlock()
-	if seq >= db.closeRecordedSeq {
-		db.closeRecordedSeq = seq
-		db.closeErr = result
-	}
-	return result
+	return firstCloseErr(sErr, db.closeQueryErr, db.closeHousekeepErr)
 }
-
-// qwpTestCloseReprobeHook fires after a re-probe has its result and before it
-// is recorded. Test seam only: it holds one caller in the window where a second
-// can overtake it. Nil in production.
-var qwpTestCloseReprobeHook atomic.Pointer[func(seq uint64)]
 
 // firstCloseErr selects the most actionable teardown error, preferring the
 // sender pool (owns flocks/I/O) over the query pool over the housekeeper so a

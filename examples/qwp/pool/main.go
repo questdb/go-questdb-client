@@ -34,6 +34,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -49,8 +50,19 @@ func main() {
 		log.Fatal(err)
 	}
 	defer func() {
-		if err := db.Close(ctx); err != nil {
-			log.Printf("questdb close: %v", err)
+		// In SF mode an outstanding lease, construction, or cleanup is a
+		// shutdown obligation. Return every lease and retry this "not yet"
+		// status; nil is the stable proof that every pooled slot is unlocked.
+		for {
+			err := db.Close(ctx)
+			if errors.Is(err, qdb.ErrSfCleanupPending) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				log.Printf("questdb close: %v", err)
+			}
+			return
 		}
 	}()
 
