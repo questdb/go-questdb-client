@@ -344,7 +344,7 @@ func TestQwpSfEngineFullDrainBarrierFailureRetainsSlot(t *testing.T) {
 			err = engine.engineClose()
 			require.ErrorIs(t, err, injected)
 			require.False(t, engine.engineCloseCompleted())
-			require.False(t, engine.terminalResourcesClosed.Load())
+			require.False(t, engine.cleanup.snapshot().resourcesClosed)
 
 			after, err := os.ReadDir(dir)
 			require.NoError(t, err)
@@ -745,7 +745,7 @@ func TestQwpSfEngineRetryOwnerDrivesACloseThatNeverStarted(t *testing.T) {
 	require.NoError(t, err)
 
 	// Nothing has entered engineClose, which is exactly the post-panic state.
-	require.False(t, e.managerTornDown.Load())
+	require.False(t, cleanupManagerTornDown(e))
 	require.False(t, e.engineTryClaimTerminalCleanup(),
 		"cleanup is not ownerless yet -- the manager teardown has not run")
 
@@ -787,16 +787,16 @@ func TestQwpSfEngineCloseRetryWaitsForManagerTeardown(t *testing.T) {
 	require.Eventually(t, e.closed.Load, time.Second, 100*time.Microsecond,
 		"first Close must reach the closed CAS")
 
-	require.False(t, e.managerTornDown.Load())
+	require.False(t, cleanupManagerTornDown(e))
 	require.False(t, e.engineCloseRetryable(),
 		"a second Close must not claim cleanup while the manager teardown is still ahead of the first")
-	require.False(t, e.terminalCleanupClaimed.Load(),
+	require.NotEqual(t, qwpSfCleanupClaimed, e.cleanup.snapshot().phase,
 		"a rejected claim must leave the claim bit free for the first Close")
 
 	e.appendMu.Unlock()
 	require.NoError(t, <-done)
 	require.True(t, e.engineCloseCompleted())
-	require.True(t, e.managerTornDown.Load())
+	require.True(t, cleanupManagerTornDown(e))
 
 	e.manager.mu.Lock()
 	managerClosed := e.manager.closed
@@ -1068,6 +1068,7 @@ func TestQwpLoggerConstructionIsConfinedToQwpLog(t *testing.T) {
 	require.Empty(t, violations,
 		"these sites construct a logger outside qwp_log.go; such a logger has no guarded handler — route it through qwpGuardLogger / qwpEffectiveLogger instead")
 }
+
 // TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine pins the
 // window between publishing deferred cleanup ownership and actually taking the
 // handoff. A fault there used to leave deferredCleanupOwned set with nothing
@@ -1127,9 +1128,9 @@ func TestQwpSfCloseFaultBetweenOwnershipAndHandoffLeavesNoOwnerlessEngine(t *tes
 	}()
 	qwpSfTestAfterManagerTeardownHook.Store(nil)
 
-	require.False(t, e.deferredCleanupOwned.Load(),
+	require.NotEqual(t, qwpSfCleanupManagerOwned, e.cleanup.snapshot().phase,
 		"a fault before the handoff must not leave the engine owned by nobody")
-	require.False(t, e.managerTornDown.Load(),
+	require.False(t, cleanupManagerTornDown(e),
 		"nor claimable, since the worker is provably still in the slot")
 
 	close(release)

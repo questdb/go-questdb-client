@@ -125,7 +125,7 @@ type qwpSfSegmentManager struct {
 	// terminal cleanup to the worker's finite exit block after a close timeout.
 	workerLoopExited       bool
 	workerReaped           bool
-	ownedEngineExitCleanup func()
+	ownedEngineExitCleanup *qwpSfManagerCleanupHandoff
 
 	// ringSnapshot is workerLoop's reusable copy of rings. Each tick
 	// refills it from rings under mu, then releases mu before the
@@ -141,6 +141,23 @@ const (
 	qwpSfManagerRingDeregisteredInService
 	qwpSfManagerRingDeregistered
 )
+
+type qwpSfManagerHandoffResult uint8
+
+const (
+	qwpSfManagerHandoffQuiescent qwpSfManagerHandoffResult = iota
+	qwpSfManagerHandoffAccepted
+	qwpSfManagerHandoffBusy
+)
+
+// qwpSfManagerCleanupHandoff is the exact capability installed for one engine
+// cleanup generation. accepted lets an unwinding foreground caller distinguish
+// "panic before registration" from "the manager owns this exact callback now"
+// without inferring ownership from a reusable boolean marker.
+type qwpSfManagerCleanupHandoff struct {
+	cleanup  func()
+	accepted atomic.Bool
+}
 
 // qwpSfManagerRingEntry holds a registered ring and the directory
 // its segments live in (nil for memory-mode rings).
@@ -159,7 +176,7 @@ type qwpSfManagerRingEntry struct {
 	// pointers so close and the worker observe one state machine.
 	watermark *qwpSfAckWatermark
 	state     atomic.Int32
-	cleanup   atomic.Pointer[func()]
+	cleanup   atomic.Pointer[qwpSfManagerCleanupHandoff]
 	// maintenanceFailures counts the current run of consecutive service passes
 	// that could not complete their durability work. Touched only on the
 	// manager's worker goroutine.
@@ -543,7 +560,7 @@ func (m *qwpSfSegmentManager) workerLoop() {
 					e.finishService()
 					cleanup := e.cleanup.Swap(nil)
 					if cleanup != nil {
-						m.runDeferredCleanup(*cleanup, "deferred ring cleanup failed after manager service")
+						m.runDeferredCleanup(cleanup, "deferred ring cleanup failed after manager service")
 					}
 				}()
 				m.serviceRing(e)
@@ -563,8 +580,8 @@ func (m *qwpSfSegmentManager) workerLoop() {
 	}
 }
 
-func (m *qwpSfSegmentManager) runDeferredCleanup(cleanup func(), message string) {
-	if cleanup == nil {
+func (m *qwpSfSegmentManager) runDeferredCleanup(handoff *qwpSfManagerCleanupHandoff, message string) {
+	if handoff == nil || handoff.cleanup == nil {
 		return
 	}
 	defer func() {
@@ -572,7 +589,7 @@ func (m *qwpSfSegmentManager) runDeferredCleanup(cleanup func(), message string)
 			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: "+message, "panic", r, "stack", string(debug.Stack()))
 		}
 	}()
-	cleanup()
+	handoff.cleanup()
 }
 
 // deferOwnedCleanupUntilWorkerExit transfers terminal engine cleanup to the
@@ -580,19 +597,25 @@ func (m *qwpSfSegmentManager) runDeferredCleanup(cleanup func(), message string)
 // nothing was handed off -- the worker is past its loop, was never started, or
 // its one cleanup slot is already taken -- so the caller cleans up inline.
 func (m *qwpSfSegmentManager) deferOwnedCleanupUntilWorkerExit(cleanup func()) bool {
+	handoff := &qwpSfManagerCleanupHandoff{cleanup: cleanup}
+	return m.deferOwnedCleanupHandoffUntilWorkerExit(handoff) == qwpSfManagerHandoffAccepted
+}
+
+func (m *qwpSfSegmentManager) deferOwnedCleanupHandoffUntilWorkerExit(handoff *qwpSfManagerCleanupHandoff) qwpSfManagerHandoffResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.started || m.workerLoopExited || m.workerReaped {
-		return false
+		return qwpSfManagerHandoffQuiescent
 	}
 	if m.ownedEngineExitCleanup != nil {
 		// The slot is already taken by another engine's cleanup, so this one
 		// was not handed off. Reporting true here would claim a handoff that
 		// never happened and leave the caller's cleanup with no owner at all.
-		return false
+		return qwpSfManagerHandoffBusy
 	}
-	m.ownedEngineExitCleanup = cleanup
-	return true
+	m.ownedEngineExitCleanup = handoff
+	handoff.accepted.Store(true)
+	return qwpSfManagerHandoffAccepted
 }
 
 func (m *qwpSfSegmentManager) awaitRingQuiescence(entry *qwpSfManagerRingEntry) bool {
@@ -609,22 +632,24 @@ func (m *qwpSfSegmentManager) awaitRingQuiescence(entry *qwpSfManagerRingEntry) 
 	return true
 }
 
-// deferUntilRingQuiescent transfers cleanup to the current service pass with
-// no ownerless gap. A false result means the pass finished and the caller
-// reclaimed ownership; true means the worker owns it or already took it.
-func (m *qwpSfSegmentManager) deferUntilRingQuiescent(entry *qwpSfManagerRingEntry, cleanup func()) bool {
+func (m *qwpSfSegmentManager) deferHandoffUntilRingQuiescent(entry *qwpSfManagerRingEntry, handoff *qwpSfManagerCleanupHandoff) qwpSfManagerHandoffResult {
 	if entry == nil || !entry.isInService() {
-		return false
+		return qwpSfManagerHandoffQuiescent
 	}
-	f := cleanup
-	ptr := &f
-	if entry.cleanup.CompareAndSwap(nil, ptr) {
+	if entry.cleanup.CompareAndSwap(nil, handoff) {
 		if entry.isInService() {
-			return true
+			handoff.accepted.Store(true)
+			return qwpSfManagerHandoffAccepted
 		}
-		return !entry.cleanup.CompareAndSwap(ptr, nil)
+		if entry.cleanup.CompareAndSwap(handoff, nil) {
+			return qwpSfManagerHandoffQuiescent
+		}
+		// The worker took this exact capability between the state check and
+		// rollback CAS. It is accepted even if its callback already ran.
+		handoff.accepted.Store(true)
+		return qwpSfManagerHandoffAccepted
 	}
-	return true
+	return qwpSfManagerHandoffBusy
 }
 
 // managerWorkerError returns a terminal error when the worker goroutine has

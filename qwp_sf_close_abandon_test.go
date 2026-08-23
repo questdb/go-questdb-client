@@ -712,7 +712,7 @@ func TestQwpCloseDrainPanicLeaksMappingsAndStopsSendLoop(t *testing.T) {
 		require.ErrorContains(t, err, "send loop close panicked")
 
 		// The I/O goroutine was never joined, so every segment stays mapped.
-		require.True(t, s.cursorEngine.deferredLeakSegments.Load(),
+		require.True(t, s.cursorEngine.cleanup.snapshot().leakMappings,
 			"an unjoined send loop must leave the segment mappings in place")
 		require.True(t, s.cursorEngine.engineCloseCompleted(),
 			"the rest of the teardown still runs and releases the slot lock")
@@ -839,8 +839,8 @@ func TestQwpSenderRepeatedCloseRedrivesAnAbortedClose(t *testing.T) {
 	require.NoError(t, s.cursorSendLoop.sendLoopClose())
 	s.cursorEngine.closed.Store(true)
 	s.closed.Store(true)
-	require.False(t, s.cursorEngine.managerTornDown.Load())
-	require.False(t, s.cursorEngine.closeRetryOwnerStarted.Load())
+	require.False(t, cleanupManagerTornDown(s.cursorEngine))
+	require.False(t, s.cursorEngine.cleanup.snapshot().retryOwnerStarted)
 
 	require.True(t, s.cursorEngine.engineCloseNeedsRedrive(),
 		"an aborted close must be recognised as needing a re-drive")

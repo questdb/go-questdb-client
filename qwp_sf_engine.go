@@ -122,14 +122,34 @@ func qwpSfSyncSlotDir(dir string) error {
 // demand. A nil return falls through to the real barrier. Nil in production.
 var qwpSfTestDirSyncHook atomic.Pointer[func(dir string) error]
 
-// qwpSfTestAfterManagerTeardownHook fires immediately after a close publishes
-// managerTornDown, which is where a rival claimant lands in the narrowest
-// window a second Close can hit. Test seam only.
+// qwpSfTestAfterManagerTeardownHook fires after a close has obtained its
+// manager-quiescence result but before it publishes the corresponding cleanup
+// transition. Test seam only.
 var qwpSfTestAfterManagerTeardownHook atomic.Pointer[func()]
 
 // qwpSfTestEngineFinishCloseHook counts terminal-cleanup entry independently
 // of how many segment files that cleanup unlinks. Production leaves it nil.
 var qwpSfTestEngineFinishCloseHook atomic.Pointer[func()]
+
+type qwpSfCleanupTestPoint uint8
+
+const (
+	qwpSfCleanupTestBeforeManagerStop qwpSfCleanupTestPoint = iota
+	qwpSfCleanupTestBeforeManagerHandoff
+	qwpSfCleanupTestAfterManagerHandoff
+	qwpSfCleanupTestAfterTerminalClaim
+	qwpSfCleanupTestDuringTerminalCleanup
+)
+
+// qwpSfTestCleanupHook injects faults at ownership boundaries without adding a
+// separate global seam for every phase. Production leaves it nil.
+var qwpSfTestCleanupHook atomic.Pointer[func(qwpSfCleanupTestPoint)]
+
+func qwpSfRunCleanupTestHook(point qwpSfCleanupTestPoint) {
+	if hook := qwpSfTestCleanupHook.Load(); hook != nil {
+		(*hook)(point)
+	}
+}
 
 // qwpSfErrEngineClosed is returned by engineAppendBlocking when the
 // engine is closed underneath an in-flight or backpressure-parked
@@ -254,27 +274,10 @@ type qwpSfCursorEngine struct {
 	// accessors can sample it from any goroutine.
 	closed atomic.Bool
 
-	// closeCompleted is published only after terminal cleanup has released the
-	// slot flock (or immediately in memory mode). terminalCleanupClaimed gives
-	// exactly one caller -- Close or the manager worker -- ownership of that
-	// cleanup. The deferred fields are written before handoff and then read by
-	// the worker without taking engine locks.
-	closeCompleted          atomic.Bool
-	terminalCleanupClaimed  atomic.Bool
-	terminalResourcesClosed atomic.Bool
-	managerTornDown         atomic.Bool
-	// closeInFlight counts the goroutines currently inside
-	// engineCloseInternal. It is what separates "a close is still running" --
-	// where a second Close must stand aside -- from "a close aborted before it
-	// tore the manager down", where nothing owns the cleanup and a second
-	// Close is the only thing that can finish it.
-	closeInFlight             atomic.Int64
-	drainedFileCleanupPending atomic.Bool
-	deferredCleanupOwned      atomic.Bool
-	closeRetryOwnerStarted    atomic.Bool
-	deferredFullyDrained      atomic.Bool
-	deferredLeakSegments      atomic.Bool
-	deferredClose             func()
+	// cleanup is the sole authority for manager quiescence, terminal ownership,
+	// retryability, completion and the drain/leak inputs carried across retries.
+	// Its mutex is never held across appendMu, manager waits or resource IO.
+	cleanup qwpSfCleanupControl
 
 	// appendMu serializes the producer's ring-append path against
 	// engineClose's segment teardown. The producer's only entry into
@@ -673,9 +676,6 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		appendDeadline:               appendDeadline,
 		recoveredFromDisk:            recoveredFromDisk,
 	}
-	// Bind once: manager handoff retains the engine through this closure until
-	// terminal cleanup has run.
-	e.deferredClose = e.engineCompleteDeferredClose
 	ok = true
 	return e, nil
 }
@@ -1039,27 +1039,45 @@ func (e *qwpSfCursorEngine) engineCloseLeakSegments() error {
 }
 
 func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
-	// Publish the leak decision first. It is a one-way latch, so recording it
-	// on a path that then returns early is harmless -- and every later reader
-	// needs it, including a retry owner that picks this close up after a fault.
-	// Deciding it further down, past the closed CAS and three early returns,
-	// leaves a window where an abandoned-send-loop close has faulted without
-	// ever saying so, and the retry then unmaps segments the abandoned
-	// goroutine may still dereference.
-	if leakSegments {
-		e.deferredLeakSegments.Store(true)
+	_, err := e.engineCloseWithOwner(leakSegments, qwpSfCleanupOwnerClose, false)
+	return err
+}
+
+// engineCloseWithOwner obtains one state-machine action, then performs it
+// without holding the cleanup mutex. acted is false when another close,
+// manager callback or retry owner already owns the protocol, or cleanup is
+// complete. repeated public Close uses respectRetryOwner so its decision and
+// the retry-owner gate are one locked observation.
+func (e *qwpSfCursorEngine) engineCloseWithOwner(leakSegments bool, owner qwpSfCleanupOwner, respectRetryOwner bool) (acted bool, err error) {
+	if e == nil {
+		return false, nil
 	}
-	e.closeInFlight.Add(1)
-	defer e.closeInFlight.Add(-1)
-	firstClose := e.closed.CompareAndSwap(false, true)
-	if !firstClose && (e.closeCompleted.Load() || e.deferredCleanupOwned.Load()) {
-		return nil
+	e.closed.Store(true)
+	token, action := e.cleanup.begin(leakSegments, owner, respectRetryOwner)
+	switch action {
+	case qwpSfCleanupNoAction:
+		return false, nil
+	case qwpSfCleanupFinish:
+		e.appendMu.Lock()
+		defer e.appendMu.Unlock()
+		return true, e.engineFinishCloseGuarded(token)
+	case qwpSfCleanupDriveManager:
+		return true, e.engineDriveClose(token, owner)
+	default:
+		panic("qwp/sf: unknown cleanup action")
 	}
-	// A worker exit or another retry already owns terminal cleanup. Retain every
-	// resource until that owner publishes completion.
-	if e.terminalCleanupClaimed.Load() {
-		return nil
-	}
+}
+
+func (e *qwpSfCursorEngine) engineDriveClose(token qwpSfCleanupToken, owner qwpSfCleanupOwner) (err error) {
+	// Until a quiescence or handoff transition consumes token, any panic leaves
+	// manager safety unproven. Roll back to open so a later retry re-drives the
+	// manager instead of inferring safety from stale observations.
+	rollback := true
+	defer func() {
+		if rollback {
+			e.cleanup.rollbackStopping(token)
+		}
+	}()
 	// Serialize the manager + ring teardown against the producer's
 	// append path. closed is now true, so any tryAppendOrFsn that
 	// acquires appendMu after us bails before touching the ring;
@@ -1069,38 +1087,17 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	// Close() racing a producer parked in engineAppendBlocking's
 	// backpressure spin).
 	//
-	// The manager goroutine does take appendMu, in
-	// engineCompleteDeferredClose, and the teardown below waits on that
-	// goroutine while holding the lock. The two cannot overlap for one
-	// engine: the deferred completion runs only for an engine whose earlier
-	// close handed cleanup off, and it publishes terminalCleanupClaimed
-	// before it clears deferredCleanupOwned, so a close sampling those
-	// markers above always finds one of them set and returns before reaching
-	// this lock. Every wait on the manager is bounded by the close grace in
-	// any case, so an unforeseen overlap costs a stalled close, not a hung
-	// one.
 	e.appendMu.Lock()
 	defer e.appendMu.Unlock()
-	if e.closeCompleted.Load() || e.deferredCleanupOwned.Load() || e.terminalCleanupClaimed.Load() {
+	// Capture drain state while terminal resources are still open, BEFORE
+	// closing the ring. The state record carries this and the monotonic leak
+	// decision across every retry generation.
+	publishedFsn := e.ring.segmentRingPublishedFsn()
+	fullyDrained := e.sfDir != "" &&
+		(publishedFsn < 0 || e.ring.segmentRingAckedFsn() >= publishedFsn)
+	if !e.cleanup.recordDrain(token, fullyDrained) {
 		return nil
 	}
-	// Capture drain state while terminal resources are still open, BEFORE
-	// closing the ring. Do not gate this on firstClose: the goroutine that wins
-	// the closed CAS may be preempted before appendMu, allowing a concurrent
-	// non-first caller to reach this serialized teardown section first. Once
-	// resources are closed, retries use the stored decision and never touch the
-	// detached ring.
-	if !e.terminalResourcesClosed.Load() {
-		publishedFsn := e.ring.segmentRingPublishedFsn()
-		fullyDrained := e.sfDir != "" &&
-			(publishedFsn < 0 || e.ring.segmentRingAckedFsn() >= publishedFsn)
-		e.deferredFullyDrained.Store(fullyDrained)
-	}
-	fullyDrained := e.deferredFullyDrained.Load()
-	// A retrying normal close reads the latch rather than its own argument, so
-	// it cannot downgrade an earlier abandoned-send-loop close and unmap memory
-	// that the abandoned goroutine may still dereference.
-	effectiveLeakSegments := e.deferredLeakSegments.Load()
 
 	// The entry stays a local: e.managerEntry is written once, by the
 	// constructor, and read by the producer through engineTerminalError. A
@@ -1111,112 +1108,135 @@ func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
 	}
 	quiescent := false
 	if e.ownsManager {
+		qwpSfRunCleanupTestHook(qwpSfCleanupTestBeforeManagerStop)
 		quiescent = e.manager.segmentManagerClose()
 	} else {
+		qwpSfRunCleanupTestHook(qwpSfCleanupTestBeforeManagerStop)
 		quiescent = e.manager.awaitRingQuiescence(entry)
 	}
-	// A worker that did not go quiescent leaves cleanup to the handoff below,
-	// so ownership is published before the teardown marker. A claimant decides
-	// on exactly these two markers, and the other order leaves a window where
-	// cleanup looks both safe and unowned while the manager worker is still
-	// writing in the slot directory: a second Close landing there would take
-	// the claim and release the slot lock underneath it.
-	// Ownership is published before the handoff is taken, so a fault in between
-	// would leave the marker set with nothing behind it: every later claim is
-	// refused, engineRetryCloseIfNeeded returns nil rather than an error, and
-	// the retry owner spins at its interval for the process lifetime without
-	// ever logging. ownershipSettled records that the handoff decision below
-	// was actually reached; any other unwind drops the marker again.
-	ownershipSettled := false
-	if !quiescent {
-		e.deferredCleanupOwned.Store(true)
-		defer func() {
-			if ownershipSettled {
-				return
-			}
-			// managerTornDown goes down first. Reaching here means the worker
-			// is provably NOT past its ring loop, and a claimant needs both
-			// markers to agree: teardown published, ownership free. Clearing
-			// ownership first would put the engine in exactly that state for
-			// the instant between the two stores, and a claimant winning the
-			// CAS there would close the ring and release the flock while the
-			// worker is still writing in the slot directory. This order
-			// refuses the claim at every instant, and
-			// engineRetryCloseIfNeeded then re-drives the whole close, which
-			// re-derives quiescence before deciding anything.
-			e.managerTornDown.Store(false)
-			e.deferredCleanupOwned.Store(false)
-		}()
-	}
-	// The manager teardown is now behind us and its outcome is recorded, so
-	// terminal cleanup is safe for whoever ends up owning it. This marker, not
-	// closed, is what a claimant needs: closed is published in this function's
-	// first line, tens of lines and one appendMu acquisition before the ring is
-	// deregistered, and a claim taken inside that window would release the slot
-	// lock while the manager worker still writes to the slot directory.
-	e.managerTornDown.Store(true)
 	if hook := qwpSfTestAfterManagerTeardownHook.Load(); hook != nil {
 		(*hook)()
 	}
-	if !quiescent {
-		var handedOff bool
-		if e.ownsManager {
-			handedOff = e.manager.deferOwnedCleanupUntilWorkerExit(e.deferredClose)
-		} else {
-			handedOff = e.manager.deferUntilRingQuiescent(entry, e.deferredClose)
-		}
-		ownershipSettled = true
-		if !handedOff {
-			e.deferredCleanupOwned.Store(false)
-		}
-		if handedOff {
-			qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: close handed to the manager worker's exit path; the slot stays locked until it completes",
-				"slot", e.sfDir)
+	if quiescent {
+		claim, ok := e.cleanup.managerReadyAndClaim(token, owner)
+		rollback = false
+		if !ok {
 			return nil
 		}
+		return e.engineFinishCloseGuarded(claim)
 	}
-	if !e.terminalCleanupClaimed.CompareAndSwap(false, true) {
+
+	handoffToken, ok := e.cleanup.prepareManagerHandoff(token)
+	rollback = false
+	if !ok {
 		return nil
 	}
-	return e.engineFinishCloseGuarded(fullyDrained, effectiveLeakSegments)
+	handoffResult := e.engineRegisterManagerHandoff(entry, handoffToken)
+	if handoffResult == qwpSfManagerHandoffAccepted {
+		qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: close handed to the manager worker's exit path; the slot stays locked until it completes",
+			"slot", e.sfDir)
+		return nil
+	}
+	if handoffResult == qwpSfManagerHandoffBusy {
+		e.cleanup.abortManagerHandoff(handoffToken)
+		return errors.New("qwp/sf: manager cleanup handoff slot is busy; cleanup will retry")
+	}
+	claim, ok := e.cleanup.managerHandoffDeclinedAndClaim(handoffToken, owner)
+	if !ok {
+		return nil
+	}
+	return e.engineFinishCloseGuarded(claim)
 }
 
-// engineFinishCloseGuarded converts a terminal-cleanup panic into a retryable
-// error. Callers invoke it only after successfully claiming
-// terminalCleanupClaimed, so this recovery owns the claim it releases.
-func (e *qwpSfCursorEngine) engineFinishCloseGuarded(fullyDrained, leakSegments bool) (err error) {
+// engineRegisterManagerHandoff makes the handoff transition retryable when a
+// fault occurs before the manager has accepted the callback. Once the manager
+// returns true, its exact generation token stays authoritative even if later
+// diagnostics panic; the callback will either be pending or already running.
+func (e *qwpSfCursorEngine) engineRegisterManagerHandoff(entry *qwpSfManagerRingEntry, token qwpSfCleanupToken) (result qwpSfManagerHandoffResult) {
+	registrationReturned := false
+	callback := func() { e.engineCompleteDeferredClose(token) }
+	handoff := &qwpSfManagerCleanupHandoff{cleanup: callback}
 	defer func() {
-		if r := recover(); r != nil {
-			e.terminalCleanupClaimed.Store(false)
-			err = fmt.Errorf("qwp/sf: terminal cleanup panicked: %v\n%s", r, debug.Stack())
+		if !registrationReturned && !handoff.accepted.Load() {
+			e.cleanup.abortManagerHandoff(token)
 		}
 	}()
-	return e.engineFinishClose(fullyDrained, leakSegments)
+	qwpSfRunCleanupTestHook(qwpSfCleanupTestBeforeManagerHandoff)
+	if e.ownsManager {
+		result = e.manager.deferOwnedCleanupHandoffUntilWorkerExit(handoff)
+	} else {
+		result = e.manager.deferHandoffUntilRingQuiescent(entry, handoff)
+	}
+	registrationReturned = true
+	if result == qwpSfManagerHandoffAccepted {
+		qwpSfRunCleanupTestHook(qwpSfCleanupTestAfterManagerHandoff)
+	}
+	return result
 }
 
-// engineFinishClose performs terminal cleanup after manager quiescence is
-// proven. The terminalCleanupClaimed CAS, not appendMu, excludes another
-// cleanup owner; callers nevertheless hold appendMu to fence producers.
-func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) error {
+// engineFinishCloseGuarded consumes a claim after appendMu acquisition, then
+// converts any terminal-cleanup panic into a retryable state transition. The
+// claimed and running tokens differ, so one claim generation can enter
+// engineFinishClose at most once.
+func (e *qwpSfCursorEngine) engineFinishCloseGuarded(claim qwpSfCleanupToken) (err error) {
+	var run qwpSfCleanupToken
+	started := false
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("qwp/sf: terminal cleanup panicked: %v\n%s", r, debug.Stack())
+			if started {
+				e.cleanup.retry(run, err)
+			} else {
+				e.cleanup.abandonClaim(claim, err)
+			}
+		}
+	}()
+	qwpSfRunCleanupTestHook(qwpSfCleanupTestAfterTerminalClaim)
+	var (
+		fullyDrained        bool
+		leakSegments        bool
+		resourcesClosed     bool
+		drainedFilesPending bool
+		ok                  bool
+	)
+	run, fullyDrained, leakSegments, resourcesClosed, drainedFilesPending, ok = e.cleanup.startTerminal(claim)
+	if !ok {
+		return nil
+	}
+	started = true
+	completed, finishErr := e.engineFinishClose(run, fullyDrained, leakSegments, resourcesClosed, drainedFilesPending)
+	if completed {
+		e.cleanup.complete(run)
+	} else {
+		e.cleanup.retry(run, finishErr)
+	}
+	return finishErr
+}
+
+// engineFinishClose performs terminal cleanup for a running generation after
+// manager quiescence has been proven and revalidated. The caller holds
+// appendMu to fence producers, but the generation token -- not appendMu -- is
+// what prevents a serialized second owner from running cleanup again.
+func (e *qwpSfCursorEngine) engineFinishClose(run qwpSfCleanupToken, fullyDrained, leakSegments, resourcesClosed, drainedFilesPending bool) (bool, error) {
 	if hook := qwpSfTestEngineFinishCloseHook.Load(); hook != nil {
 		(*hook)()
 	}
-	if e.terminalResourcesClosed.Load() {
-		if e.drainedFileCleanupPending.Load() {
+	qwpSfRunCleanupTestHook(qwpSfCleanupTestDuringTerminalCleanup)
+	if resourcesClosed {
+		if drainedFilesPending {
 			if err := e.engineFinishDrainedFileCleanup(); err != nil {
-				e.terminalCleanupClaimed.Store(false)
-				return err
+				return false, err
 			}
-			e.drainedFileCleanupPending.Store(false)
+			if !e.cleanup.markDrainedFilesComplete(run) {
+				return false, errors.New("qwp/sf: stale cleanup token after drained-file cleanup")
+			}
 		}
 		if e.slotLock != nil {
 			if err := e.slotLock.close(); err != nil {
-				e.terminalCleanupClaimed.Store(false)
-				return err
+				return false, err
 			}
 		}
-		e.closeCompleted.Store(true)
-		return nil
+		return true, nil
 	}
 	var firstErr error
 	drainCleanupAllowed := fullyDrained
@@ -1249,8 +1269,7 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 		// A local disk that never recovers therefore pins the slot's whole
 		// mapping, not a single descriptor.
 		if !drainCleanupAllowed {
-			e.terminalCleanupClaimed.Store(false)
-			return firstErr
+			return false, firstErr
 		}
 	}
 	if err := e.ring.segmentRingCloseInternal(leakSegments); err != nil && firstErr == nil {
@@ -1269,17 +1288,19 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 			firstErr = err
 		}
 	}
-	e.terminalResourcesClosed.Store(true)
+	if !e.cleanup.checkpointResourcesClosed(run, drainCleanupAllowed) {
+		return false, errors.New("qwp/sf: stale cleanup token after terminal resource close")
+	}
 	if drainCleanupAllowed {
-		e.drainedFileCleanupPending.Store(true)
 		if err := e.engineFinishDrainedFileCleanup(); err != nil {
-			e.terminalCleanupClaimed.Store(false)
 			if firstErr != nil {
-				return errors.Join(firstErr, err)
+				return false, errors.Join(firstErr, err)
 			}
-			return err
+			return false, err
 		}
-		e.drainedFileCleanupPending.Store(false)
+		if !e.cleanup.markDrainedFilesComplete(run) {
+			return false, errors.New("qwp/sf: stale cleanup token after drained-file cleanup")
+		}
 	}
 	if e.slotLock != nil {
 		if err := e.slotLock.close(); err != nil {
@@ -1287,12 +1308,10 @@ func (e *qwpSfCursorEngine) engineFinishClose(fullyDrained, leakSegments bool) e
 				firstErr = err
 			}
 			qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: could not release slot lock after close", "slot", e.sfDir, "error", err)
-			e.terminalCleanupClaimed.Store(false)
-			return firstErr
+			return false, firstErr
 		}
 	}
-	e.closeCompleted.Store(true)
-	return firstErr
+	return true, firstErr
 }
 
 // engineFinishDrainedFileCleanup removes only fully-acked on-disk state. It is
@@ -1320,19 +1339,15 @@ func (e *qwpSfCursorEngine) engineFinishDrainedFileCleanup() error {
 }
 
 // engineCompleteDeferredClose is invoked by the manager after it is provably
-// past the worker loop or the affected ring's service pass.
-func (e *qwpSfCursorEngine) engineCompleteDeferredClose() {
-	// Claim terminal cleanup before dropping the deferred-ownership marker.
-	// Both markers stay up across the claim, so a repeated Close sampling them
-	// never sees an ownerless engine while this handoff is about to run the
-	// cleanup itself.
-	claimed := e.terminalCleanupClaimed.CompareAndSwap(false, true)
-	e.deferredCleanupOwned.Store(false)
-	if !claimed {
+// past the worker loop or the affected ring's service pass. Only the exact
+// handoff generation installed in the manager can claim terminal cleanup.
+func (e *qwpSfCursorEngine) engineCompleteDeferredClose(handoff qwpSfCleanupToken) {
+	claim, ok := e.cleanup.managerClaim(handoff)
+	if !ok {
 		return
 	}
 	e.appendMu.Lock()
-	err := e.engineFinishCloseGuarded(e.deferredFullyDrained.Load(), e.deferredLeakSegments.Load())
+	err := e.engineFinishCloseGuarded(claim)
 	e.appendMu.Unlock()
 	logger := e.engineLogger()
 	if err != nil {
@@ -1342,102 +1357,37 @@ func (e *qwpSfCursorEngine) engineCompleteDeferredClose() {
 		// slot without a cleanup owner.
 		e.engineStartCloseRetryOwner(logger)
 		qwpEffectiveLogger(logger).Error("qwp/sf: deferred engine close failed",
-			"slot", e.sfDir, "error", err, "closeCompleted", e.closeCompleted.Load())
+			"slot", e.sfDir, "error", err, "closeCompleted", e.engineCloseCompleted())
 		return
 	}
 	qwpEffectiveLogger(logger).Info("qwp/sf: deferred engine close completed",
-		"slot", e.sfDir, "closeCompleted", e.closeCompleted.Load())
+		"slot", e.sfDir, "closeCompleted", e.engineCloseCompleted())
 }
 
 func (e *qwpSfCursorEngine) engineCloseCompleted() bool {
-	return e != nil && e.closeCompleted.Load()
-}
-
-// engineTryClaimTerminalCleanup takes ownership of an incomplete close whose
-// cleanup has no owner. It fails while the manager worker or another claimant
-// is responsible, which lets pool reprobes stay non-blocking during a
-// legitimately stuck service pass. Success transfers the terminalCleanupClaimed
-// claim to the caller, which must run it through engineFinishClaimedClose;
-// engineFinishCloseGuarded releases the claim again if the attempt fails.
-//
-// The gate is managerTornDown, the condition engineFinishClose assumes: an
-// engine whose manager teardown has not run yet has no ownerless cleanup to
-// take over, only a close still on its way through engineCloseInternal.
-func (e *qwpSfCursorEngine) engineTryClaimTerminalCleanup() bool {
-	if e == nil || !e.managerTornDown.Load() || e.closeCompleted.Load() || e.deferredCleanupOwned.Load() {
-		return false
-	}
-	return e.terminalCleanupClaimed.CompareAndSwap(false, true)
-}
-
-// engineCloseRetryable claims terminal cleanup for a repeated Close, and is
-// the gate that lets such a Close proceed instead of reporting a double close.
-// The claim is what makes the decision race-free: the sampling of the
-// ownership markers and the claim on them happen as one atomic step, so of two
-// concurrent Close calls exactly one runs the retry. The engine's own retry
-// owner is an owner too, so a Close alongside a running retry-owner goroutine
-// leaves the work to it.
-func (e *qwpSfCursorEngine) engineCloseRetryable() bool {
-	if e == nil || e.closeRetryOwnerStarted.Load() {
-		return false
-	}
-	return e.engineTryClaimTerminalCleanup()
-}
-
-// engineCloseNeedsRedrive reports a close that aborted before the manager
-// teardown. There is no terminal cleanup to claim in that state --
-// managerTornDown is the condition engineFinishClose assumes -- so the only
-// way back to a released slot lock is to run the whole close again. A
-// standalone sender has no pool guard to install a retry owner for it, so a
-// repeated Close is the caller's only route, which is what LineSender.Close
-// promises.
-//
-// closeInFlight is what separates this from a close that is merely still
-// running, where a second Close must stand aside and report the double close.
-func (e *qwpSfCursorEngine) engineCloseNeedsRedrive() bool {
-	return e != nil && !e.closeRetryOwnerStarted.Load() &&
-		e.closed.Load() && e.closeInFlight.Load() == 0 &&
-		!e.managerTornDown.Load() && !e.closeCompleted.Load()
-}
-
-// engineFinishClaimedClose runs the terminal cleanup owned by a successful
-// claim. The retry resumes at engineFinishClose with the drain decision the
-// first attempt recorded, which is the part of the close that outlives a failed
-// attempt; the manager teardown ahead of it is already done by the time cleanup
-// becomes ownerless.
-func (e *qwpSfCursorEngine) engineFinishClaimedClose() error {
-	e.appendMu.Lock()
-	defer e.appendMu.Unlock()
-	return e.engineFinishCloseGuarded(e.deferredFullyDrained.Load(), e.deferredLeakSegments.Load())
+	return e != nil && e.cleanup.completed()
 }
 
 // engineRetryCloseIfNeeded runs one cleanup attempt for the engine's retry
-// owner and for pool reprobes. It claims through
-// engineTryClaimTerminalCleanup directly: the retry-owner goroutine holds
-// closeRetryOwnerStarted for its whole lifetime, so the gate that keeps a
-// repeated Close away from it must not keep the owner away from its own work.
+// owner and for pool reprobes. Both ignore the scheduler-owner marker and race
+// only for the generation claim in the cleanup record.
 func (e *qwpSfCursorEngine) engineRetryCloseIfNeeded() error {
-	// A close that faulted ahead of the manager teardown -- a panic in the
-	// drain wait or the send-loop shutdown that closeCursor runs before
-	// engineClose, recovered by the pool's closeSlotGuarded -- leaves nothing
-	// for a terminal-cleanup claim to take over: managerTornDown is the
-	// condition engineFinishClose assumes, and it is still false. Re-drive the
-	// whole close instead. engineCloseInternal is idempotent and safe to enter
-	// concurrently with another close, and it reaches the same claim once the
-	// manager is provably down.
-	if e != nil && !e.managerTornDown.Load() && !e.closeCompleted.Load() {
-		return e.engineCloseInternal(e.deferredLeakSegments.Load())
-	}
-	if !e.engineTryClaimTerminalCleanup() {
-		return nil
-	}
-	return e.engineFinishClaimedClose()
+	_, err := e.engineCloseWithOwner(false, qwpSfCleanupOwnerRetry, false)
+	return err
+}
+
+// engineRetryRepeatedClose makes the public double-close decision and cleanup
+// claim as one state read. It returns acted=false while a close, manager
+// callback or retry goroutine owns the protocol, and acted=true when this call
+// either re-drives manager teardown or consumes a retryable terminal claim.
+func (e *qwpSfCursorEngine) engineRetryRepeatedClose() (acted bool, err error) {
+	return e.engineCloseWithOwner(false, qwpSfCleanupOwnerClose, true)
 }
 
 // engineRunCloseRetryAttempt contains panics outside terminal cleanup itself,
 // including manager-handoff diagnostics. It deliberately does not touch
-// terminalCleanupClaimed: engineFinishCloseGuarded releases that bit only when
-// this attempt successfully acquired it.
+// the cleanup state: engineFinishCloseGuarded changes only the token generation
+// this attempt successfully acquired.
 func (e *qwpSfCursorEngine) engineRunCloseRetryAttempt() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1455,7 +1405,7 @@ func (e *qwpSfCursorEngine) engineRunCloseRetryAttempt() (err error) {
 // owner race the retained files. A persistent local-storage fault therefore
 // keeps the slot reserved until the fault is corrected or the process exits.
 func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
-	if e == nil || e.closeCompleted.Load() || !e.closeRetryOwnerStarted.CompareAndSwap(false, true) {
+	if e == nil || !e.cleanup.startRetryOwner() {
 		return
 	}
 	go func() {
@@ -1464,16 +1414,16 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 		// goroutine-owner marker and replace the owner if cleanup is incomplete.
 		defer func() {
 			if r := recover(); r != nil {
-				e.closeRetryOwnerStarted.Store(false)
+				restart := e.cleanup.retryOwnerPanicked()
 				qwpEffectiveLogger(logger).Error("qwp/sf: terminal cleanup retry owner panicked",
 					"slot", e.sfDir, "panic", r, "stack", string(debug.Stack()))
-				if !e.closeCompleted.Load() {
+				if restart {
 					e.engineStartCloseRetryOwner(logger)
 				}
 			}
 		}()
 		var lastWarn time.Time
-		for !e.closeCompleted.Load() {
+		for !e.engineCloseCompleted() {
 			retryErr := e.engineRunCloseRetryAttempt()
 			if retryErr != nil {
 				now := time.Now()
@@ -1483,7 +1433,7 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 						"slot", e.sfDir, "error", retryErr)
 				}
 			}
-			if e.closeCompleted.Load() {
+			if e.engineCloseCompleted() {
 				return
 			}
 			time.Sleep(qwpSfCloseRetryInterval.load())
