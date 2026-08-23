@@ -104,9 +104,13 @@ var ErrSfDurability = errors.New("qwp/sf: could not durably commit store-and-for
 // after quiescence while a concurrent Close arrives. Production leaves it nil.
 var qwpSfTestBeforeSegmentUnlinkHook atomic.Pointer[func(path string)]
 
-// qwpSfSyncSlotDir makes a slot directory's namespace durable, so a file this
-// slot created is findable after a crash. Every control point that publishes or
-// retires a name in the slot goes through it.
+// qwpSfSyncSlotDir is the platform directory-barrier abstraction. On Unix it
+// makes the slot namespace durable, so a file this slot created is findable
+// after an OS crash. Windows has no supported unprivileged directory-fsync
+// equivalent; its platform implementation is an explicit no-op and the public
+// durability contract documents that weaker guarantee. Every control point
+// that publishes or retires a correctness-relevant name still goes through
+// this function so the epoch ordering remains visible and testable.
 func qwpSfSyncSlotDir(dir string) error {
 	if hook := qwpSfTestDirSyncHook.Load(); hook != nil {
 		if err := (*hook)(dir); err != nil {
@@ -638,8 +642,8 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// file) rather than honouring an FSN with no segments
 			// behind it.
 			qwpSfAckWatermarkRemoveOrphan(sfDir)
-			if !qwpSfManifestRemove(sfDir) {
-				return nil, fmt.Errorf("qwp/sf: could not remove stale manifest in %s", sfDir)
+			if err := qwpSfManifestRemove(sfDir); err != nil {
+				return nil, err
 			}
 			watermark, err = qwpSfAckWatermarkOpenRequired(sfDir)
 			if errors.Is(err, qwpSfErrAckWatermarkUnbacked) {
@@ -1411,20 +1415,16 @@ func (e *qwpSfCursorEngine) engineFinishClose(run qwpSfCleanupToken, fullyDraine
 // removal, or directory-sync failure remains retryable without touching the
 // already-closed ring mappings and side-file descriptors.
 func (e *qwpSfCursorEngine) engineFinishDrainedFileCleanup() error {
-	if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil {
+	if err := qwpSfUnlinkSegmentsAndSyncDir(e.sfDir); err != nil {
 		return err
 	}
-	if !qwpSfManifestRemove(e.sfDir) {
-		return fmt.Errorf("qwp/sf: remove drained manifest in %s", e.sfDir)
-	}
-	// A slot directory that is already gone is the end state this cleanup works
-	// toward, and there is no namespace left to make durable — the unlinks and
-	// the manifest removal above treat it the same way. Returning the open
-	// error instead would leave the retry owner failing identically forever,
-	// holding the flock fd and (in the pool) the slot's index reservation.
-	if err := qwpSfSyncSlotDir(e.sfDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := qwpSfRemoveManifestAndSyncDir(e.sfDir); err != nil {
 		return err
 	}
+	// Watermark and symbol-dictionary residue is harmless without segments and
+	// a manifest: a restart ignores/removes it before creating the next slot.
+	// Durably emptying the directory is therefore not part of the close
+	// contract, and these best-effort side-file removals need no third barrier.
 	qwpSfAckWatermarkRemoveOrphan(e.sfDir)
 	qwpSfSymbolDictRemoveOrphan(e.sfDir)
 	return nil
@@ -1549,7 +1549,39 @@ func qwpSfShouldLogCloseRetry(last, now time.Time) bool {
 	return last.IsZero() || now.Sub(last) >= qwpSfCloseRetryLogThrottle
 }
 
-// qwpSfUnlinkAllSegmentFiles unlinks every .sfa file under dir.
+// qwpSfUnlinkSegmentsAndSyncDir unlinks every .sfa file under dir and commits
+// their absence as one durability epoch. The manifest must not be removed
+// until this helper succeeds: its separate epoch is the proof that a missing
+// manifest cannot become durable while a manifest-required segment survives.
+func qwpSfUnlinkSegmentsAndSyncDir(dir string) error {
+	if err := qwpSfUnlinkAllSegmentFiles(dir); err != nil {
+		return err
+	}
+	// A slot directory that is already gone is the end state this cleanup works
+	// toward, and there is no namespace left to make durable. Treating it as
+	// success also prevents the retry owner from retaining the flock forever.
+	if err := qwpSfSyncSlotDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("qwp/sf: sync slot directory after unlinking drained segments in %s: %w", dir, err)
+	}
+	return nil
+}
+
+// qwpSfRemoveManifestAndSyncDir removes a manifest only after the caller has
+// committed every namespace mutation the manifest depended on, then commits
+// the manifest's own absence as a new durability epoch.
+func qwpSfRemoveManifestAndSyncDir(dir string) error {
+	if err := qwpSfManifestRemove(dir); err != nil {
+		return err
+	}
+	if err := qwpSfSyncSlotDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("qwp/sf: sync slot directory after removing manifest in %s: %w", dir, err)
+	}
+	return nil
+}
+
+// qwpSfUnlinkAllSegmentFiles performs the unlink portion of the drained
+// segment epoch. Callers use qwpSfUnlinkSegmentsAndSyncDir rather than invoking
+// it directly so the namespace mutations cannot escape without their barrier.
 // Called only on clean shutdown when the ring confirms every
 // published FSN has been acked. Removal stops at the first failure, leaving
 // the manifest in place.
@@ -1571,7 +1603,8 @@ func qwpSfShouldLogCloseRetry(last, now time.Time) bool {
 // chain to find; both recover as an empty slot. Last, an empty directory,
 // whose collapsed manifest is removed on its own.
 //
-// TestQwpSfDrainedUnlinkLeavesEveryCrashPointRecoverable walks the prefixes.
+// TestQwpSfDrainedCleanupCrashEpochsRecover enumerates every persisted subset
+// and ordering permitted inside the epoch.
 func qwpSfUnlinkAllSegmentFiles(dir string) error {
 	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {

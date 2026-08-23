@@ -137,8 +137,8 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 				return nil, nil, err
 			}
 			manifest = nil
-			if !qwpSfManifestRemove(sfDir) {
-				return nil, nil, fmt.Errorf("qwp/sf: remove collapsed manifest in %s", sfDir)
+			if err := qwpSfRemoveManifestAndSyncDir(sfDir); err != nil {
+				return nil, nil, err
 			}
 		}
 		// What is left provably carries no frames -- the residue of a crash
@@ -228,12 +228,18 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 				// failure reclassifies one as possibly frameful and fails the
 				// now-populated slot closed.
 				qwpSfQuarantinePaths(corruptPaths)
+				// Commit every segment unlink/quarantine before making the
+				// manifest disappear in its own epoch. A missing manifest is safe
+				// only once no manifest-required segment name can survive.
+				if err := qwpSfSyncSlotDir(sfDir); err != nil {
+					return nil, nil, fmt.Errorf("qwp/sf: sync clean-drain segment cleanup directory %s: %w", sfDir, err)
+				}
 				if err := manifest.close(); err != nil {
 					return nil, nil, err
 				}
 				manifest = nil
-				if !qwpSfManifestRemove(sfDir) {
-					return nil, nil, fmt.Errorf("qwp/sf: remove clean-drain manifest in %s", sfDir)
+				if err := qwpSfRemoveManifestAndSyncDir(sfDir); err != nil {
+					return nil, nil, err
 				}
 				success = true
 				return nil, nil, nil
@@ -267,7 +273,6 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 		// but the bytes remain useful forensic evidence. Preserve them under the
 		// established .corrupt name and put a clean active at the same
 		// manifest-committed base instead of zeroing the only copy in place.
-		replacedTornActive := false
 		if activeSeg.segmentFrameCount() == 0 && activeSeg.segmentTornTailBytes() > 0 {
 			torn := activeSeg
 			path := torn.segmentPath()
@@ -286,16 +291,10 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (_ *qwpSfSegmentRi
 			}
 			chain[len(chain)-1] = replacement
 			activeSeg = replacement
-			replacedTornActive = true
 		}
 		for _, seg := range chain {
 			if err := seg.markManifestRequired(); err != nil {
 				return nil, nil, err
-			}
-		}
-		if replacedTornActive {
-			if err := qwpSfSyncSlotDir(sfDir); err != nil {
-				return nil, nil, fmt.Errorf("qwp/sf: sync torn-active replacement directory %s: %w", sfDir, err)
 			}
 		}
 	} else {
@@ -683,6 +682,21 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 			return nil, fmt.Errorf("qwp/sf: quarantine segment %s: %w", path, err)
 		}
 	}
+	// The torn bytes need a durable name before the clean replacement may take
+	// over the manifest-committed active path. Link/rename preservation and the
+	// install therefore belong to separate namespace epochs.
+	if err := qwpSfSyncSlotDir(filepath.Dir(path)); err != nil {
+		_ = os.Remove(tmp)
+		if linked {
+			_ = os.Remove(preserved)
+		} else if rollbackErr := qwpSfTornActiveRename.load()(preserved, path); rollbackErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("qwp/sf: sync preserved torn-active segment %s: %w", preserved, err),
+				fmt.Errorf("qwp/sf: restore torn active %s after failed preservation barrier: %w", path, rollbackErr),
+			)
+		}
+		return nil, fmt.Errorf("qwp/sf: sync preserved torn-active segment %s: %w", preserved, err)
+	}
 	if err := qwpSfTornActiveRename.load()(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		if linked {
@@ -693,6 +707,9 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 				path, err, preserved)
 		}
 		return nil, fmt.Errorf("qwp/sf: install replacement for torn active %s: %w", path, err)
+	}
+	if err := qwpSfSyncSlotDir(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("qwp/sf: sync installed torn-active replacement %s: %w", path, err)
 	}
 	return qwpSfOpenSegment(path)
 }

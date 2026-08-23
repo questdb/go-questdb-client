@@ -249,9 +249,16 @@ func (m *qwpSfManifest) close() error {
 	return err
 }
 
-func qwpSfManifestRemove(dir string) bool {
-	err := os.Remove(filepath.Join(dir, qwpSfManifestFileName))
-	return err == nil || errors.Is(err, os.ErrNotExist)
+// qwpSfManifestRemoveFile is a test seam for preserving the filesystem cause
+// returned by the manifest unlink. Production always holds os.Remove.
+var qwpSfManifestRemoveFile = qwpSfSwappable(os.Remove)
+
+func qwpSfManifestRemove(dir string) error {
+	path := filepath.Join(dir, qwpSfManifestFileName)
+	if err := qwpSfManifestRemoveFile.load()(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("qwp/sf: remove manifest %s: %w", path, err)
+	}
+	return nil
 }
 
 // qwpSfManifestQuarantineRename is the rename qwpSfQuarantineCreationDebris
@@ -294,6 +301,18 @@ func qwpSfQuarantineCreationDebris(path string) error {
 	}
 	if err := qwpSfManifestQuarantineRename.load()(path, corrupt); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return qwpSfManifestQuarantineError("could not quarantine invalid "+path, err)
+	}
+	// Commit the evidence-preserving name before recovery returns to a path
+	// that may create a replacement manifest. Without this barrier the rename
+	// and that dependent creation occupy one durability epoch.
+	if err := qwpSfSyncSlotDir(filepath.Dir(path)); err != nil {
+		if rollbackErr := qwpSfManifestQuarantineRename.load()(corrupt, path); rollbackErr != nil {
+			return errors.Join(
+				qwpSfManifestQuarantineError("could not sync quarantine of invalid "+path, err),
+				qwpSfManifestQuarantineError("could not restore invalid manifest after failed quarantine barrier "+path, rollbackErr),
+			)
+		}
+		return qwpSfManifestQuarantineError("could not sync quarantine of invalid "+path, err)
 	}
 	return nil
 }

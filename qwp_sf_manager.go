@@ -61,6 +61,27 @@ var qwpSfManagerCloseGrace = qwpSfSwappable(5 * time.Second)
 // leaves it nil.
 var qwpSfTestBeforeTrimAccountingHook atomic.Pointer[func(*qwpSfManagerRingEntry)]
 
+func qwpSfSyncSpareCreationEpoch(dir, path string) error {
+	if err := qwpSfSyncSlotDir(dir); err != nil {
+		return fmt.Errorf("qwp/sf: fsync slot directory after minting spare %s: %w", path, err)
+	}
+	return nil
+}
+
+func qwpSfSyncPreTrimEpoch(dir string) error {
+	if err := qwpSfSyncSlotDir(dir); err != nil {
+		return fmt.Errorf("pre-trim directory fsync: %w", err)
+	}
+	return nil
+}
+
+func qwpSfSyncPostTrimEpoch(dir string) error {
+	if err := qwpSfSyncSlotDir(dir); err != nil {
+		return fmt.Errorf("post-trim directory fsync: %w", err)
+	}
+	return nil
+}
+
 // qwpSfUnlimitedTotalBytes disables the per-engine total-bytes cap.
 const qwpSfUnlimitedTotalBytes int64 = math.MaxInt64
 
@@ -776,8 +797,8 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 					// every undelivered row in it. The barrier runs here, on
 					// the provisioning goroutine, so it costs the producer's
 					// flush nothing.
-					if syncErr := qwpSfSyncSlotDir(e.dir); syncErr != nil {
-						err = fmt.Errorf("qwp/sf: fsync slot directory after minting spare %s: %w", path, syncErr)
+					if syncErr := qwpSfSyncSpareCreationEpoch(e.dir, path); syncErr != nil {
+						err = syncErr
 					}
 				}
 			}
@@ -884,8 +905,8 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			m.recordServiceError(e, errors.Join(spareErr, deferredErr, err))
 			return
 		}
-		if err := qwpSfSyncSlotDir(e.dir); err != nil {
-			m.recordServiceError(e, errors.Join(spareErr, deferredErr, fmt.Errorf("pre-trim directory fsync: %w", err)))
+		if err := qwpSfSyncPreTrimEpoch(e.dir); err != nil {
+			m.recordServiceError(e, errors.Join(spareErr, deferredErr, err))
 			return
 		}
 		newHead := e.ring.headAfterTrim(len(trim))
@@ -928,10 +949,10 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		trimmedBytes += sz
 	}
 	if !memoryMode {
-		if err := qwpSfSyncSlotDir(e.dir); err != nil {
+		if err := qwpSfSyncPostTrimEpoch(e.dir); err != nil {
 			e.dirSyncPending = true
 			if trimErr == nil {
-				trimErr = fmt.Errorf("post-trim directory fsync: %w", err)
+				trimErr = err
 			}
 		} else {
 			e.dirSyncPending = false
@@ -971,9 +992,9 @@ func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (i
 	}
 	e.pendingUnlinks = kept
 	if e.dirSyncPending && e.dir != "" {
-		if err := qwpSfSyncSlotDir(e.dir); err != nil {
+		if err := qwpSfSyncPostTrimEpoch(e.dir); err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("retry post-trim directory fsync: %w", err)
+				firstErr = fmt.Errorf("retry %w", err)
 			}
 		} else {
 			e.dirSyncPending = false

@@ -512,6 +512,15 @@ flock—and, for a pooled sender, its capacity reservation—until storage recov
 or the process exits; releasing either earlier could let a new owner race files
 whose durable cleanup did not finish.
 
+On Unix, SF namespace changes are separated into directory-sync epochs: a
+dependent manifest update/removal is not allowed to become durable before the
+segment names it depends on. This protects recovery across an OS crash within
+the platform `fsync` guarantee. Windows exposes no documented, unprivileged
+equivalent of directory `fsync`; on Windows SF protects process-restart recovery
+but does not promise host-crash ordering for file creation, rename, and removal.
+Residual `.ack-watermark` and `.symbol-dict` files after a fully drained close
+are harmless restart debris and are not part of the durably-empty contract.
+
 For a pooled sender, every reserved SF index is a shutdown obligation from the
 start of construction until its flock is released. An outstanding lease,
 in-flight construction, active teardown, or deferred cleanup therefore makes

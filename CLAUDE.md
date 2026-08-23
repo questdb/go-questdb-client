@@ -111,9 +111,14 @@ the operator regains space by deleting the evidence, the client never does.
 
 Segment and manifest control points are durable even with
 `sf_durability=memory`: initial creation, rotation, each trim batch, and a fully
-drained close use header/manifest fsync plus directory barriers. Frame
-publication and ordinary ACK cadence stay syscall-free; watermark sync happens
-only when it covers a trim or final drain.
+drained close use header/manifest fsync plus directory barriers. A drained close
+commits segment absence, then manifest absence, as separate epochs; watermark
+and symbol-dictionary residue is harmless without either and need not be made
+durably absent. Frame publication and ordinary ACK cadence stay syscall-free;
+watermark sync happens only when it covers a trim or final drain. On Windows,
+where no supported unprivileged directory-fsync equivalent is documented, the
+directory barrier is explicitly a no-op: SF covers process-restart recovery but
+does not claim Unix-style host-crash namespace ordering.
 
 Close treats manager-worker quiescence as a cleanup barrier: a timed-out
 manager join does not release worker-reachable mappings, side files, or the slot

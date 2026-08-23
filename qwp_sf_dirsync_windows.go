@@ -26,4 +26,12 @@
 
 package questdb
 
+// Windows documents how to open a directory handle with
+// FILE_FLAG_BACKUP_SEMANTICS, but does not document FlushFileBuffers as a
+// supported directory-handle operation; FlushFileBuffers on a volume requires
+// administrative privilege. There is therefore no supported unprivileged
+// equivalent of Unix directory fsync available to this client. SF still
+// recovers across process restarts, but it does not promise that namespace
+// mutations separated here survive a Windows host crash in that order. Keep
+// this explicit no-op aligned with the platform qualification in README.md.
 func qwpSfSyncDir(string) error { return nil }

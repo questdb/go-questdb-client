@@ -822,19 +822,125 @@ func buildDrainedSlot(t *testing.T, spareBase int64) string {
 	spare := createRecoverySegment(t, dir, "sf-0000000000000002.sfa", spareBase)
 	createRecoveryManifest(t, dir, 1, 1, sealed, active, spare)
 	closeRecoverySegments(t, sealed, active, spare)
+	watermark, err := qwpSfAckWatermarkOpenRequired(dir)
+	require.NoError(t, err)
+	require.True(t, watermark.persistIfAdvanced(spareBase-1))
+	require.NoError(t, watermark.sync())
+	require.NoError(t, watermark.close())
 	return dir
 }
 
-// TestQwpSfDrainedUnlinkLeavesEveryCrashPointRecoverable pins the crash-safety
-// argument qwpSfUnlinkAllSegmentFiles' ordering rests on. The sweep runs after
-// the manifest has collapsed to head == active, and a crash can stop it between
-// any two unlinks, so every prefix of the removal order has to leave a
-// directory the next recovery accepts — never one it fails closed on, which
-// would quarantine a slot whose rows were all acknowledged.
-//
-// The order is taken from the production function rather than restated here,
-// so a change to the sort is a change to what this test walks.
-func TestQwpSfDrainedUnlinkLeavesEveryCrashPointRecoverable(t *testing.T) {
+type qwpSfCrashNamespaceFile struct {
+	data []byte
+	mode os.FileMode
+}
+
+type qwpSfCrashNamespaceEvent struct {
+	remove  string
+	barrier bool
+}
+
+func qwpSfSnapshotCrashNamespace(t *testing.T, dir string) map[string]qwpSfCrashNamespaceFile {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	files := make(map[string]qwpSfCrashNamespaceFile, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, readErr := os.ReadFile(path)
+		require.NoError(t, readErr)
+		info, statErr := entry.Info()
+		require.NoError(t, statErr)
+		files[entry.Name()] = qwpSfCrashNamespaceFile{data: data, mode: info.Mode().Perm()}
+	}
+	return files
+}
+
+func qwpSfPermuteCrashOps(ops []string, visit func([]string)) {
+	if len(ops) == 0 {
+		visit(nil)
+		return
+	}
+	var walk func(int)
+	walk = func(at int) {
+		if at == len(ops) {
+			visit(append([]string(nil), ops...))
+			return
+		}
+		for i := at; i < len(ops); i++ {
+			ops[at], ops[i] = ops[i], ops[at]
+			walk(at + 1)
+			ops[at], ops[i] = ops[i], ops[at]
+		}
+	}
+	walk(0)
+}
+
+func qwpSfVisitCrashEpochOrders(epoch []string, visit func([]string)) {
+	for subset := 0; subset < 1<<len(epoch); subset++ {
+		selected := make([]string, 0, len(epoch))
+		for i, op := range epoch {
+			if subset&(1<<i) != 0 {
+				selected = append(selected, op)
+			}
+		}
+		qwpSfPermuteCrashOps(selected, visit)
+	}
+}
+
+func qwpSfMaterializeCrashNamespace(t *testing.T, initial map[string]qwpSfCrashNamespaceFile, durableOps []string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, file := range initial {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), file.data, file.mode))
+	}
+	for _, name := range durableOps {
+		err := os.Remove(filepath.Join(dir, name))
+		require.True(t, err == nil || errors.Is(err, os.ErrNotExist), "apply durable remove %s: %v", name, err)
+	}
+	return dir
+}
+
+func qwpSfAssertDrainedCrashStateRecoverable(
+	t *testing.T,
+	initial map[string]qwpSfCrashNamespaceFile,
+	durableOps []string,
+) {
+	t.Helper()
+	dir := qwpSfMaterializeCrashNamespace(t, initial, durableOps)
+	ring, _, err := qwpSfRecoverRing(dir, 4096)
+	if errors.Is(err, qwpSfErrRecoveryFailClosed) {
+		t.Fatalf("allowed durable state failed closed after operations %v: %v", durableOps, err)
+	}
+	if err != nil {
+		return // Environmental errors are retryable and preserve the slot.
+	}
+	if ring != nil {
+		defer func() { require.NoError(t, ring.segmentRingClose()) }()
+		if ring.segmentRingHoldsFrames() {
+			watermark, openErr := qwpSfAckWatermarkOpenRequired(dir)
+			require.NoError(t, openErr)
+			require.NotNil(t, watermark)
+			acked := watermark.read()
+			require.NoError(t, watermark.close())
+			require.GreaterOrEqual(t, acked, ring.segmentRingPublishedFsn(),
+				"every surviving frame belongs to the already-acknowledged prefix")
+		}
+	}
+	_, failedErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.True(t, errors.Is(failedErr, os.ErrNotExist), "recovery wrote .failed for acknowledged data: %v", failedErr)
+}
+
+// TestQwpSfDrainedCleanupCrashEpochsRecover pins the durability epochs of a
+// fully drained close. Metadata calls issued since the last directory barrier
+// may become durable in any subset and order; a successful barrier commits all
+// earlier calls before a dependent epoch starts. Every allowed persisted state
+// must therefore recover as empty/already-acked or remain retryable, never fail
+// closed over rows the server already acknowledged.
+func TestQwpSfDrainedCleanupCrashEpochsRecover(t *testing.T) {
 	// The argument starts from what the drained close commits before it sweeps,
 	// so take that from a real one rather than trusting the fixture below to
 	// mirror it.
@@ -878,30 +984,61 @@ func TestQwpSfDrainedUnlinkLeavesEveryCrashPointRecoverable(t *testing.T) {
 			name = "spare-at-active"
 		}
 		t.Run(name, func(t *testing.T) {
-			var order []string
-			recorder := func(path string) { order = append(order, filepath.Base(path)) }
-			qwpSfTestBeforeSegmentUnlinkHook.Store(&recorder)
-			t.Cleanup(func() { qwpSfTestBeforeSegmentUnlinkHook.Store(nil) })
-			require.NoError(t, qwpSfUnlinkAllSegmentFiles(buildDrainedSlot(t, spareBase)))
-			qwpSfTestBeforeSegmentUnlinkHook.Store(nil)
-			require.Equal(t, []string{"sf-initial.sfa", "sf-0000000000000001.sfa", "sf-0000000000000002.sfa"}, order,
-				"oldest first, and the hot spare outlives the active segment it was minted after")
-
-			for k := 0; k <= len(order); k++ {
-				t.Run(fmt.Sprintf("crash-after-%d", k), func(t *testing.T) {
-					dir := buildDrainedSlot(t, spareBase)
-					for _, removed := range order[:k] {
-						require.NoError(t, os.Remove(filepath.Join(dir, removed)))
-					}
-					ring, _, err := qwpSfRecoverRing(dir, 4096)
-					require.NoError(t, err, "a crash mid-sweep must leave a recoverable slot")
-					require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed)
-					if ring != nil {
-						defer ring.segmentRingClose()
-						assert.Equal(t, int64(1), ring.getActiveSegment().segmentBaseSeq())
-					}
-				})
+			dir := buildDrainedSlot(t, spareBase)
+			initial := qwpSfSnapshotCrashNamespace(t, dir)
+			var events []qwpSfCrashNamespaceEvent
+			manifestRemoved := false
+			unlinkRecorder := func(path string) {
+				events = append(events, qwpSfCrashNamespaceEvent{remove: filepath.Base(path)})
 			}
+			barrierRecorder := func(syncDir string) error {
+				require.Equal(t, dir, syncDir)
+				if !manifestRemoved {
+					_, statErr := os.Stat(filepath.Join(dir, qwpSfManifestFileName))
+					if errors.Is(statErr, os.ErrNotExist) {
+						events = append(events, qwpSfCrashNamespaceEvent{remove: qwpSfManifestFileName})
+						manifestRemoved = true
+					} else {
+						require.NoError(t, statErr)
+					}
+				}
+				events = append(events, qwpSfCrashNamespaceEvent{barrier: true})
+				return nil
+			}
+			qwpSfTestBeforeSegmentUnlinkHook.Store(&unlinkRecorder)
+			qwpSfTestDirSyncHook.Store(&barrierRecorder)
+			t.Cleanup(func() { qwpSfTestBeforeSegmentUnlinkHook.Store(nil) })
+			t.Cleanup(func() { qwpSfTestDirSyncHook.Store(nil) })
+			require.NoError(t, (&qwpSfCursorEngine{sfDir: dir}).engineFinishDrainedFileCleanup())
+			qwpSfTestBeforeSegmentUnlinkHook.Store(nil)
+			qwpSfTestDirSyncHook.Store(nil)
+			require.True(t, manifestRemoved, "cleanup must remove the manifest")
+
+			committed := make([]string, 0, 4)
+			epoch := make([]string, 0, 4)
+			caseNo := 0
+			for _, event := range events {
+				if event.remove != "" {
+					epoch = append(epoch, event.remove)
+					qwpSfVisitCrashEpochOrders(epoch, func(order []string) {
+						durable := append(append([]string(nil), committed...), order...)
+						t.Run(fmt.Sprintf("state-%03d", caseNo), func(t *testing.T) {
+							qwpSfAssertDrainedCrashStateRecoverable(t, initial, durable)
+						})
+						caseNo++
+					})
+					continue
+				}
+				require.True(t, event.barrier)
+				committed = append(committed, epoch...)
+				epoch = epoch[:0]
+				durable := append([]string(nil), committed...)
+				t.Run(fmt.Sprintf("state-%03d-after-barrier", caseNo), func(t *testing.T) {
+					qwpSfAssertDrainedCrashStateRecoverable(t, initial, durable)
+				})
+				caseNo++
+			}
+			require.Empty(t, epoch)
 		})
 	}
 }

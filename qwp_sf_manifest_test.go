@@ -227,6 +227,34 @@ func TestQwpSfQuarantineFaultIsRetriableNeverFailClosed(t *testing.T) {
 	}
 }
 
+func TestQwpSfManifestRemovePreservesFilesystemCause(t *testing.T) {
+	injected := syscall.EROFS
+	original := qwpSfManifestRemoveFile.load()
+	qwpSfManifestRemoveFile.store(func(string) error { return injected })
+	t.Cleanup(func() { qwpSfManifestRemoveFile.store(original) })
+
+	err := qwpSfManifestRemove(t.TempDir())
+	require.ErrorIs(t, err, injected)
+	require.ErrorContains(t, err, qwpSfManifestFileName)
+}
+
+func TestQwpSfManifestQuarantineSyncFaultIsRetriable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfManifestFileName)
+	require.NoError(t, os.WriteFile(path, []byte("unusable"), 0o644))
+	injected := syscall.EIO
+	hook := func(string) error { return injected }
+	qwpSfTestDirSyncHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(nil) })
+
+	err := qwpSfQuarantineCreationDebris(path)
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.ErrorIs(t, err, injected)
+	require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.FileExists(t, path)
+	require.NoFileExists(t, path+".corrupt")
+}
+
 // TestQwpSfQuarantineFaultFailsConstructionUntilHealed pins the foreground
 // consequence of retry-always: while the fault persists, constructing a sender
 // on that slot fails with a retriable error and moves nothing — no slot
