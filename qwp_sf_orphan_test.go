@@ -203,6 +203,42 @@ func TestQwpSfDrainerSkipsLockedSlot(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "drainer wrongly created .failed on lock contention")
 }
 
+// TestQwpSfDrainerLocalIOFaultLeavesNoFailedSentinel pins the drainer half of
+// retry-always: a local filesystem fault while opening the slot — here, a
+// manifest-debris quarantine rename refused with ENOSPC — says nothing about
+// the slot's bytes. The run fails, but the slot keeps its data and its
+// eligibility: no .failed sentinel, so the next foreground scan adopts it
+// again once the fault clears.
+func TestQwpSfDrainerLocalIOFaultLeavesNoFailedSentinel(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	// A manifest of the wrong size, which engine open tries to set aside.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfManifestFileName),
+		[]byte("too short"), 0o644))
+
+	original := qwpSfManifestQuarantineRename.load()
+	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
+	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.ENOSPC })
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		nil,
+		200*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond,
+	)
+	drainer.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	_, err := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(err),
+		"a local I/O fault must leave the slot eligible for a later adoption")
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfManifestFileName))
+	require.NoError(t, err)
+	assert.Equal(t, "too short", string(body), "the boundary record must stay in place")
+}
+
 func TestQwpSfDrainerMarksFailedOnAuthRejection(t *testing.T) {
 	authSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{upgradeStatus: 401})
 	defer authSrv.Close()

@@ -149,11 +149,17 @@ and the same call can be retried.
 
 Drainer quarantine covers a slot proved inconsistent
 (`qwpSfErrRecoveryFailClosed`) plus the drainer's own give-ups — auth reject,
-durable-ack settle exhaustion, the no-progress watchdog, and a panic. A local I/O fault while opening a slot — a full
-disk, an exhausted fd table, a vanished mount — leaves no `.failed` sentinel,
-so the next foreground scan adopts the slot again. Legacy (manifest-less) slots
-fail closed on any corrupt segment that could still hold frames: with no
-committed boundaries nothing can show them delivered.
+durable-ack settle exhaustion, the no-progress watchdog, and a panic.
+**Local-storage analog of Invariant B: an environmental fault never condemns a
+slot — fail-closed comes only from what the slot's bytes prove.** A local I/O
+fault while opening a slot — a full disk, a read-only mount, an exhausted fd
+table, a vanished mount — leaves no `.failed` sentinel and quarantines
+nothing: a drainer run just fails and the next foreground scan adopts the slot
+again, while a foreground construction fails with a retriable error wrapping
+`ErrSfDurability` and succeeds once the fault clears, all rows intact.
+Availability waits on the operator; preservation wins by design. Legacy
+(manifest-less) slots fail closed on any corrupt segment that could still hold
+frames: with no committed boundaries nothing can show them delivered.
 
 **A table block is self-describing** — the inline column definitions are its
 authoritative schema. On egress the decoder parses the schema from a query's

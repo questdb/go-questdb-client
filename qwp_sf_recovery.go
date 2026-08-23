@@ -27,6 +27,7 @@ package questdb
 import (
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"math"
@@ -663,7 +664,7 @@ func qwpSfQuarantinePath(path string) (string, error) {
 // qwpSfQuarantineTargetPath picks a free .corrupt name for path, probing for a
 // numbered suffix so an earlier quarantine's evidence is never overwritten.
 func qwpSfQuarantineTargetPath(path string) (string, error) {
-	target := path + ".corrupt"
+	target := qwpSfBoundedSuffixPath(path, ".corrupt")
 	for suffix := 1; ; suffix++ {
 		_, err := os.Stat(target)
 		if errors.Is(err, os.ErrNotExist) {
@@ -672,8 +673,31 @@ func qwpSfQuarantineTargetPath(path string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("qwp/sf: inspect segment quarantine target %s: %w", target, err)
 		}
-		target = fmt.Sprintf("%s.corrupt-%d", path, suffix)
+		target = qwpSfBoundedSuffixPath(path, fmt.Sprintf(".corrupt-%d", suffix))
 	}
+}
+
+// qwpSfQuarantineNameMaxLen bounds the file-name component of a quarantine
+// target, with margin under the 255-byte limit common across filesystems, so
+// the quarantine rename cannot fail with ENAMETOOLONG over a name the client
+// itself formed.
+const qwpSfQuarantineNameMaxLen = 200
+
+// qwpSfBoundedSuffixPath appends suffix to path's file name, truncating the
+// stem when the combined component would exceed qwpSfQuarantineNameMaxLen
+// bytes. A truncated stem is tagged with a checksum of the full name so two
+// long names that share a prefix cannot collapse onto the same target.
+func qwpSfBoundedSuffixPath(path, suffix string) string {
+	dir, name := filepath.Split(path)
+	if len(name)+len(suffix) <= qwpSfQuarantineNameMaxLen {
+		return dir + name + suffix
+	}
+	tag := fmt.Sprintf("-%08x", crc32.ChecksumIEEE([]byte(name)))
+	keep := qwpSfQuarantineNameMaxLen - len(suffix) - len(tag)
+	if keep < 0 {
+		keep = 0
+	}
+	return dir + name[:keep] + tag + suffix
 }
 
 func qwpSfQuarantineSlot(slotDir string) (string, error) {

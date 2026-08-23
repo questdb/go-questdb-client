@@ -1257,3 +1257,37 @@ func TestQwpSfFramefulDuplicateAtTheActiveBaseIsPreserved(t *testing.T) {
 	_, statErr = os.Stat(dupPath)
 	require.True(t, os.IsNotExist(statErr), "and moved out of the .sfa namespace")
 }
+
+// TestQwpSfQuarantineTargetPathBoundsName pins that a quarantine target's
+// file-name component stays under qwpSfQuarantineNameMaxLen bytes, so the
+// quarantine rename cannot fail with ENAMETOOLONG over a name the client
+// itself formed, and that two long names differing late in the stem still get
+// distinct targets.
+func TestQwpSfQuarantineTargetPathBoundsName(t *testing.T) {
+	dir := t.TempDir()
+	longA := strings.Repeat("a", 240) + ".sfa"
+	longB := strings.Repeat("a", 239) + "b.sfa"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, longA), []byte("A"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, longB), []byte("B"), 0o644))
+
+	targetA, err := qwpSfQuarantineTargetPath(filepath.Join(dir, longA))
+	require.NoError(t, err)
+	targetB, err := qwpSfQuarantineTargetPath(filepath.Join(dir, longB))
+	require.NoError(t, err)
+
+	require.LessOrEqual(t, len(filepath.Base(targetA)), qwpSfQuarantineNameMaxLen)
+	require.LessOrEqual(t, len(filepath.Base(targetB)), qwpSfQuarantineNameMaxLen)
+	require.NotEqual(t, targetA, targetB,
+		"long names differing only late in the stem must not collide")
+
+	require.NoError(t, os.Rename(filepath.Join(dir, longA), targetA),
+		"the bounded target must be a legal name on the filesystem")
+
+	// The probe still finds a free numbered name once the first is taken.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, longA), []byte("A2"), 0o644))
+	next, err := qwpSfQuarantineTargetPath(filepath.Join(dir, longA))
+	require.NoError(t, err)
+	require.NotEqual(t, targetA, next)
+	require.LessOrEqual(t, len(filepath.Base(next)), qwpSfQuarantineNameMaxLen)
+	require.NoError(t, os.Rename(filepath.Join(dir, longA), next))
+}

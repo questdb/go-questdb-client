@@ -93,8 +93,11 @@ var ErrBackpressureTimeout = errors.New(
 // maintenance that persists the ack watermark and trims acked segments. The
 // failed append has not been assigned an FSN and remains pending in the
 // sender, so callers may correct the local-storage failure and retry the same
-// operation. Match it with errors.Is; the underlying filesystem error remains
-// matchable as well.
+// operation. Sender construction wraps the same sentinel when a local
+// filesystem fault keeps slot recovery from setting a broken boundary record
+// aside: the slot and its rows are left exactly as they were, and the same
+// construction succeeds once the fault clears. Match it with errors.Is; the
+// underlying filesystem error remains matchable as well.
 var ErrSfDurability = errors.New("qwp/sf: could not durably commit store-and-forward state")
 
 // qwpSfTestBeforeSegmentUnlinkHook is a test seam for holding terminal cleanup

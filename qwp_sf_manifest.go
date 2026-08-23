@@ -35,7 +35,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 )
 
 const (
@@ -274,24 +273,20 @@ var qwpSfManifestQuarantineRename = qwpSfSwappable(os.Rename)
 // carries the manifest-required flag -- a slot whose manifest is gone fails
 // closed rather than falling back to the legacy path.
 //
-// What the failure is reported as depends on whether the fault says anything
-// about the slot. A permanent one -- a read-only mount, a name that cannot be
-// formed -- means no later attempt will do better, so it is fail-closed: the
-// caller preserves the whole slot under <sf_dir>/quarantined/ and starts a
-// fresh one, which is a rename in the PARENT directory and so is not blocked
-// by whatever is wrong with this one. Returning a plain error there strands the
-// sender for good, because the recovery policy only quarantines on
-// qwpSfErrRecoveryFailClosed and every later construction fails identically.
+// A rename failure is always reported as a retriable local-storage error,
+// never as fail-closed. Fail-closed is a permanent verdict — a foreground
+// sender moves the slot's rows into quarantined/, where nothing scans for
+// them again, and a drainer writes the .failed sentinel that disqualifies
+// the slot from every later adoption — so it may only follow from what the
+// slot's bytes say. A rename failure is an environmental fault, and no
+// environmental fault is provably permanent: full disks empty, read-only
+// mounts get remounted, permissions get fixed. Reporting it retriably means
+// construction for that sender_id fails until the fault clears and then
+// succeeds with every row intact; ingestion availability waits on the
+// operator, and preservation wins that tradeoff by design.
 //
-// A transient one -- a full disk, an exhausted fd table, an I/O error -- says
-// nothing about the bytes, and fail-closed is far too strong for it: a
-// foreground sender would move a legacy slot's undelivered rows into
-// quarantined/, where nothing scans for them again, and a drainer would write
-// the permanent .failed sentinel that disqualifies the slot from every later
-// adoption. Those faults are reported as an ordinary error, so the next
-// attempt retries once the disk or the fd table recovers.
-//
-// Either way the cause stays reachable with errors.Is.
+// The error wraps ErrSfDurability, and the filesystem cause stays reachable
+// with errors.Is.
 func qwpSfQuarantineCreationDebris(path string) error {
 	corrupt, err := qwpSfQuarantineTargetPath(path)
 	if err != nil {
@@ -303,26 +298,12 @@ func qwpSfQuarantineCreationDebris(path string) error {
 	return nil
 }
 
-// qwpSfManifestQuarantineError classifies a failure to set the manifest aside.
-// Only a fault that no retry can clear justifies condemning the slot.
+// qwpSfManifestQuarantineError reports a failure to set the manifest aside
+// as a retriable local-storage fault. It wraps ErrSfDurability — the same
+// local-storage-sick, retry-the-call class the producer path uses — and keeps
+// the filesystem cause reachable with errors.Is. It never returns
+// qwpSfErrRecoveryFailClosed: that verdict is reserved for what the slot's
+// bytes prove, and a rename failure proves nothing about them.
 func qwpSfManifestQuarantineError(what string, cause error) error {
-	if qwpSfIsTransientFileFault(cause) {
-		return fmt.Errorf("qwp/sf: %s: %w", what, cause)
-	}
-	return fmt.Errorf("%w: %s: %w", qwpSfErrRecoveryFailClosed, what, cause)
-}
-
-// qwpSfIsTransientFileFault reports whether a filesystem error is one a later
-// attempt could get past. Anything unrecognised counts as transient: treating
-// an unknown fault as proof that the slot is inconsistent is the expensive
-// mistake, since that verdict is permanent.
-func qwpSfIsTransientFileFault(err error) bool {
-	switch {
-	case errors.Is(err, syscall.EROFS),
-		errors.Is(err, syscall.ENAMETOOLONG),
-		errors.Is(err, syscall.EACCES),
-		errors.Is(err, syscall.EPERM):
-		return false
-	}
-	return true
+	return fmt.Errorf("%w: %s: %w", ErrSfDurability, what, cause)
 }
