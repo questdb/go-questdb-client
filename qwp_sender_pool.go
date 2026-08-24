@@ -1327,29 +1327,24 @@ func (p *qwpSenderPool) ensureCloseRetryOwnerGuardedLocked(slot *qwpSenderSlot) 
 	slot.cleanup.ensureCloseRetryOwner(p.logger)
 }
 
-// reprobeRetiredSlots observes completion and restores capacity. Cleanup itself
-// has an engine-owned retry goroutine, so this function never blocks a borrower
-// on manager quiescence or filesystem I/O. It runs on housekeeper ticks and the
-// borrow-at-capacity path, including when the housekeeper is disabled.
+// reprobeRetiredSlots checks whether cleanup has finished for retired slots.
+// It unlocks the pool before logging restored capacity.
 func (p *qwpSenderPool) reprobeRetiredSlots() {
-	restored := p.reprobeRetiredSlotsLocked()
+	p.mu.Lock()
+	restored := func() int {
+		defer p.mu.Unlock()
+		return p.reprobeRetiredSlotsLocked()
+	}()
 	if restored > 0 {
 		qwpEffectiveLogger(p.logger).Info("qwp pool: restored SF capacity after deferred slot cleanup", "slots", restored)
 	}
 }
 
-// reprobeRetiredSlotsLocked observes the retired slots under p.mu and returns
-// how many gave their capacity back. The lock is released via defer, so a
-// fault cannot strand the pool mutex -- which would deadlock every later
-// borrow, return, reap and repeat close, including the re-probe the
-// ErrSfCleanupPending contract tells callers to keep making. Classification
-// and apply are split exactly as in selectReapVictims: the partition is built
-// whole, then published by applySlotPartitionLocked in one step that cannot
-// fault, so a panic in a predicate leaves the retired list and lifecycle
-// records untouched (and poisons the pool).
+// reprobeRetiredSlotsLocked checks retired slots and returns the number that
+// are ready to reuse. The caller must hold p.mu. This function does not lock or
+// unlock it. It checks every slot before changing pool state. If a check panics,
+// it poisons the pool and changes nothing.
 func (p *qwpSenderPool) reprobeRetiredSlotsLocked() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.poisonedErr != nil || len(p.retiredSlots) == 0 {
 		return 0
 	}

@@ -27,6 +27,9 @@ package questdb
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -127,6 +130,72 @@ func TestQwpSenderPoolMemoryBuildCleanupDoesNotConsumeCapacity(t *testing.T) {
 	p.reclaimFailedBuild(slot, -1, errors.New("injected memory build failure"))
 
 	require.Zero(t, p.capUsedLocked())
+}
+
+func TestQwpSenderPoolReprobeRetiredSlotsLockedDoesNotAcquireMutex(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "qwp_sender_pool.go", nil, 0)
+	require.NoError(t, err)
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || fn.Name.Name != "reprobeRetiredSlotsLocked" {
+			continue
+		}
+		receiver, ok := fn.Recv.List[0].Names[0], false
+		switch recvType := fn.Recv.List[0].Type.(type) {
+		case *ast.StarExpr:
+			ident, isIdent := recvType.X.(*ast.Ident)
+			ok = isIdent && ident.Name == "qwpSenderPool"
+		case *ast.Ident:
+			ok = recvType.Name == "qwpSenderPool"
+		}
+		if !ok {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			method, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || method.Sel.Name != "Lock" {
+				return true
+			}
+			field, ok := method.X.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			ident, isIdent := field.X.(*ast.Ident)
+			if isIdent && ident.Name == receiver.Name && field.Sel.Name == "mu" {
+				t.Errorf("%s: %s acquires p.mu; this helper must require the caller's lock",
+					fset.Position(call.Pos()), fn.Name.Name)
+			}
+			return true
+		})
+	}
+}
+
+func TestQwpSenderPoolReprobeRetiredSlotsLockedUsesCallersLock(t *testing.T) {
+	p := &qwpSenderPool{
+		storeAndForward: true,
+		sfSlots:         []qwpSfSlotLifecycle{{state: qwpSfSlotRetired}},
+		retiredSlots:    []*qwpSenderSlot{{slotIndex: 0}},
+	}
+
+	p.mu.Lock()
+	capacityBefore := p.capUsedLocked()
+	restored := p.reprobeRetiredSlotsLocked()
+	capacityAfter := p.capUsedLocked()
+	callerStillHoldsLock := !p.mu.TryLock()
+	p.mu.Unlock()
+
+	require.True(t, callerStillHoldsLock, "the locked helper must not release the caller's mutex")
+	require.Equal(t, 1, restored)
+	require.Equal(t, 1, capacityBefore)
+	require.Zero(t, capacityAfter)
+	require.Empty(t, p.retiredSlots)
+	require.Equal(t, qwpSfSlotFree, p.sfSlots[0].state)
 }
 
 func TestQwpSfSlotLifecycleTransitionTable(t *testing.T) {
@@ -2026,6 +2095,9 @@ func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
 	faulting := &qwpSenderSlot{slotIndex: 2, idleSince: stale, delegate: &qwpLineSender{}}
 	p.all = []*qwpSenderSlot{victim, keeper, faulting}
 	p.available = []*qwpSenderSlot{victim, keeper, faulting}
+	p.mu.Lock()
+	capacityBefore := p.capUsedLocked()
+	p.mu.Unlock()
 
 	require.Empty(t, p.selectReapVictims(time.Now()),
 		"a faulted classification must select no victims")
@@ -2037,6 +2109,8 @@ func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
 	}
 	require.Zero(t, p.pendingLeaseTeardowns,
 		"nor as a teardown close() will wait for")
+	require.Equal(t, capacityBefore, p.capUsedLocked(),
+		"nor change lifecycle-derived pool capacity")
 
 	// The available set must survive the fault intact. Filtering in place and
 	// publishing only at the end leaves the backing array rewritten under an
@@ -2204,6 +2278,9 @@ func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
 	pending := &qwpSenderSlot{slotIndex: 1, cleanup: &neverDoneSlot{}} // still held
 	faulting := &qwpSenderSlot{slotIndex: 2, cleanup: panicOnProbeSlot{}}
 	p.retiredSlots = []*qwpSenderSlot{done, pending, faulting}
+	p.mu.Lock()
+	capacityBefore := p.capUsedLocked()
+	p.mu.Unlock()
 
 	p.reprobeRetiredSlots()
 
@@ -2229,6 +2306,8 @@ func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
 		require.Equal(t, qwpSfSlotRetired, p.sfSlots[i].state,
 			"a faulting probe must not change lifecycle state %d", i)
 	}
+	require.Equal(t, capacityBefore, p.capUsedLocked(),
+		"a faulting probe must not change lifecycle-derived pool capacity")
 	require.ErrorIs(t, p.poisonedErr, ErrPoolPoisoned,
 		"a faulting probe must record the terminal pool error")
 }
