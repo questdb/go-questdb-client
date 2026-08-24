@@ -779,15 +779,6 @@ func (e *qwpSfCursorEngine) engineAckedFsn() int64 {
 	return e.ring.segmentRingAckedFsn()
 }
 
-// engineSetLogger changes the segment manager's diagnostic logger. The atomic
-// pointer makes concurrent reads safe. A nil logger uses slog.Default().
-func (e *qwpSfCursorEngine) engineSetLogger(l *slog.Logger) {
-	if e == nil || e.manager == nil {
-		return
-	}
-	e.manager.logger.Store(l)
-}
-
 // engineAckNotify returns a channel closed the next time ackedFsn
 // advances. Lets AwaitAckedFsn block until a server ACK lands instead
 // of polling. See qwpSfSegmentRing.segmentRingAckNotify for the

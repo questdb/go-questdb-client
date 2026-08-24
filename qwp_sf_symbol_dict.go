@@ -254,13 +254,6 @@ func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 	_ = os.Remove(filepath.Join(slotDir, qwpSfSymbolDictFileName))
 }
 
-// qwpSfSymbolDictOpenExisting drops the error, for callers that react the same
-// way to every failure: recreate the file from scratch.
-func qwpSfSymbolDictOpenExisting(path string, fileLen int64) *qwpSfSymbolDict {
-	d, _ := qwpSfSymbolDictOpenExistingDetailed(path, fileLen)
-	return d
-}
-
 // qwpSfSymbolDictOpenExistingDetailed opens an existing side-file, loads the
 // run of chunks whose checksums match, and truncates whatever follows. Failures
 // come in two kinds: errQwpSfSymbolDictUnusable for damaged content, which lets

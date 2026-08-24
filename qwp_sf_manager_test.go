@@ -513,7 +513,7 @@ func TestQwpSfManagerQuarantineScanFailureDoesNotUndercount(t *testing.T) {
 func TestQwpSfManagerCappedTicksBoundQuarantineScans(t *testing.T) {
 	const (
 		segSize    int64 = 4096
-		entryCount       = 2560
+		entryCount int   = 2560
 	)
 	dir := t.TempDir()
 	for i := 0; i < entryCount; i++ {
@@ -736,7 +736,7 @@ func TestQwpSfManagerRejectedSpareCleanupFailureStaysAccounted(t *testing.T) {
 func BenchmarkQwpSfManagerCappedSteadyState(b *testing.B) {
 	const (
 		segSize    int64 = 4096
-		entryCount       = 2560
+		entryCount int   = 2560
 	)
 	dir := b.TempDir()
 	for i := 0; i < entryCount; i++ {

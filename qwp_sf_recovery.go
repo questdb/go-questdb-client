@@ -825,14 +825,6 @@ func qwpSfCorruptMayHoldFrames(path string) bool {
 	}
 }
 
-func qwpSfQuarantinePaths(recoveryContext qwpSfRecoveryContext, paths []string) {
-	for _, path := range paths {
-		if _, err := qwpSfQuarantinePath(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			qwpEffectiveLogger(recoveryContext.logger).Warn("qwp/sf: could not quarantine corrupt segment", "path", path, "error", err)
-		}
-	}
-}
-
 // qwpSfTornActiveTempSuffix names the half-built replacement for a torn active
 // segment. It deliberately does not end in .sfa, so no directory scan —
 // recovery, the segment manager, the orphan sweep — can mistake a partial file
