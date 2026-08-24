@@ -316,11 +316,11 @@ err = qs.
 acknowledgement and observability accessors (`AwaitAckedFsn`,
 `FlushAndGetSequence`, `TotalReconnectAttempts`, `LastTerminalError`,
 `TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`,
-`QuarantinedSlotPath`).
+`QuarantinedSlotPath`, `SlotLockReleased`).
 
 > This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`,
-> `DroppedConnectionNotifications`, and `QuarantinedSlotPath` to the `QwpSender`
-> interface. Every built-in transport is updated; this is source-breaking only
+> `DroppedConnectionNotifications`, `QuarantinedSlotPath`, and
+> `SlotLockReleased` to the `QwpSender` interface. Every built-in transport is updated; this is source-breaking only
 > for external code that implements `QwpSender` directly (callers that
 > type-assert to it are unaffected).
 
@@ -531,8 +531,21 @@ At that point no closed-pool operation can create another obligation, so a nil
 result proves every pool-managed slot is unlocked and later calls remain nil.
 
 A standalone SF sender has no pool lifecycle ledger. Its `Close` may still
-return nil while engine cleanup releases the slot lock in the background;
-reopening the same `sf_dir` + `sender_id` should retry a temporary lock error.
+return nil while engine cleanup releases the slot lock in the background, so a
+nil result does not on its own mean the slot is free. Ask
+`QwpSender.SlotLockReleased()` instead, and gate a reopen of the same `sf_dir` +
+`sender_id` on it:
+
+```go
+qs, _ := sender.(qdb.QwpSender)
+_ = sender.Close(ctx)
+for !qs.SlotLockReleased() {
+	time.Sleep(10 * time.Millisecond)
+}
+```
+
+Those background retries have no deadline, so bound that loop if your shutdown
+path cannot wait on a disk that may never come back.
 
 #### Local errors from the SF path
 

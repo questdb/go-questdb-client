@@ -268,25 +268,26 @@ type LineSender interface {
 	// If auto-flush is enabled, the client will flush any remaining buffered
 	// messages before closing itself.
 	//
-	// A QWP store-and-forward sender does not always finish releasing its
-	// slot directory's lock before Close returns. When the segment manager
-	// has not gone quiet, cleanup transfers to that worker and a retry owner
-	// keeps working on it in the background with no deadline. Close returns
-	// nil in that case, so a nil result does not on its own mean the slot
-	// lock is gone: reopening the same sf_dir + sender_id right away can fail
-	// to acquire it, with an error naming this process as the holder. Retry
-	// the open until it succeeds. Pooled senders expose the same condition
-	// through QuestDB.Close as ErrSfCleanupPending. The pool also treats every
-	// outstanding lease and in-flight construction as pending. Return every
-	// lease and retry QuestDB.Close while that sentinel matches; once it returns
-	// nil, every pool-managed slot is unlocked and later calls remain nil.
+	// A QWP store-and-forward sender does not always finish releasing its slot
+	// directory's lock before Close returns. If the segment manager is still
+	// busy, the release passes to a background goroutine that keeps retrying it
+	// with no deadline, and Close returns nil meanwhile. So a nil result does
+	// not on its own mean the slot lock is gone. Poll [QwpSender.SlotLockReleased]
+	// for that, and gate a reopen of the same sf_dir + sender_id on it: reopening
+	// earlier fails to take the lock, with an error naming this process as the
+	// holder.
 	//
-	// A second Close reports a double-close error, with one QWP-only
-	// exception: when store-and-forward cleanup has been left with no owner
-	// at all, a repeated Close takes ownership, finishes the cleanup and
-	// reports its outcome. That is what lets a caller gating shutdown on a
-	// released slot lock reach one. Every other implementation reports the
-	// double close unconditionally.
+	// Pooled senders report the same thing through QuestDB.Close, which also
+	// counts every outstanding lease and in-flight construction as pending.
+	// Return every lease and keep calling QuestDB.Close while
+	// [ErrSfCleanupPending] matches. Once it returns nil, every pool-managed
+	// slot is unlocked, and later calls stay nil.
+	//
+	// A second Close reports a double-close error, so do not use it to ask
+	// whether the first one finished; that is what SlotLockReleased is for. A
+	// lease from QuestDB.BorrowSender behaves differently: closing it a second
+	// time does nothing and returns nil, because the lease borrows a pooled slot
+	// rather than owning it.
 	Close(ctx context.Context) error
 }
 

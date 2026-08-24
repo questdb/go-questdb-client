@@ -1863,6 +1863,13 @@ func (ps *qwpPooledSender) TotalBackpressureStalls() int64 {
 	return ps.slot.delegate.TotalBackpressureStalls()
 }
 
+func (ps *qwpPooledSender) SlotLockReleased() bool {
+	if !ps.live() {
+		return true
+	}
+	return ps.slot.delegate.SlotLockReleased()
+}
+
 func (ps *qwpPooledSender) QuarantinedSlotPath() string {
 	if !ps.live() {
 		return ""

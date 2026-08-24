@@ -97,6 +97,14 @@ type qwpSfCleanupState struct {
 	drainedFilesPending bool
 	firstErr            error
 	retryOwnerStarted   bool
+
+	// readersQuiesced says that whoever owned the send loop has stopped it, or
+	// decided to leave its mappings alone. Terminal cleanup unmaps the segment
+	// files, and the send loop reads them through slice headers it took
+	// earlier, so a claim taken before this is published can pull memory out
+	// from under a live reader. The engine cannot work this out for itself:
+	// only the caller that owns the loop knows.
+	readersQuiesced bool
 }
 
 // qwpSfCleanupControl owns the state and its dedicated mutex. Callers hold the
@@ -165,6 +173,46 @@ func (c *qwpSfCleanupControl) begin(leakMappings bool, owner qwpSfCleanupOwner, 
 		c.state.leakMappings = true
 	}
 	if respectRetryOwner && c.state.retryOwnerStarted {
+		return qwpSfCleanupToken{}, qwpSfCleanupNoAction
+	}
+	switch c.state.phase {
+	case qwpSfCleanupOpen:
+		return c.transitionLocked(qwpSfCleanupStoppingManager, owner), qwpSfCleanupDriveManager
+	case qwpSfCleanupReady, qwpSfCleanupRetryable:
+		return c.transitionLocked(qwpSfCleanupClaimed, owner), qwpSfCleanupFinish
+	default:
+		return qwpSfCleanupToken{}, qwpSfCleanupNoAction
+	}
+}
+
+// markReadersQuiesced is published by the one caller that owns the send loop,
+// before it asks for any cleanup of its own. It is one-way: a slot never gains
+// new readers once its loop has stopped.
+//
+// leakMappings travels with it because the two are one fact, not two. A loop
+// that was abandoned mid-read is quiesced only in the sense that nobody will
+// wait for it; its mappings must still be left alone. Published separately,
+// there is a window where the record says the readers are done but not that
+// their mappings are untouchable, and a claim taken in that window unmaps
+// memory a live reader is still walking.
+func (c *qwpSfCleanupControl) markReadersQuiesced(leakMappings bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if leakMappings {
+		c.state.leakMappings = true
+	}
+	c.state.readersQuiesced = true
+}
+
+// beginRepeatClose is begin for a caller that did not stop the send loop
+// itself, which is what a repeated public Close is. It refuses until the owner
+// of the loop has published quiescence. Reading that fact and taking the claim
+// under one lock is the point: apart, a caller can see quiescence that a
+// rollback has since undone.
+func (c *qwpSfCleanupControl) beginRepeatClose(owner qwpSfCleanupOwner) (qwpSfCleanupToken, qwpSfCleanupAction) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.state.readersQuiesced || c.state.retryOwnerStarted {
 		return qwpSfCleanupToken{}, qwpSfCleanupNoAction
 	}
 	switch c.state.phase {

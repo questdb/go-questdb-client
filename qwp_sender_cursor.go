@@ -1085,6 +1085,12 @@ func closeEngineGuarded(engine *qwpSfCursorEngine, leakMappings bool, logger *sl
 	if engine == nil {
 		return nil
 	}
+	// Every caller of this function has already stopped its send loop or
+	// decided to leave the mappings alone, and leakMappings carries which.
+	// Publishing both together lets a later caller who did neither -- a
+	// repeated Close -- take cleanup over safely: it can never see the readers
+	// reported as done without also seeing that their mappings are off limits.
+	engine.engineMarkReadersQuiesced(leakMappings)
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("qwp: engine close panicked: %v\n%s", r, debug.Stack())
@@ -1546,6 +1552,19 @@ func (s *qwpLineSender) TotalBackpressureStalls() int64 {
 		return 0
 	}
 	return s.cursorEngine.engineTotalBackpressureStalls()
+}
+
+// SlotLockReleased implements QwpSender.SlotLockReleased.
+func (s *qwpLineSender) SlotLockReleased() bool {
+	// Nothing was ever taken in memory mode, and an engine that has not been
+	// closed still holds what it took.
+	if s == nil || s.cursorEngine == nil || s.cursorEngine.engineSfDir() == "" {
+		return true
+	}
+	if !s.closed.Load() {
+		return false
+	}
+	return s.cursorEngine.engineCloseCompleted()
 }
 
 // QuarantinedSlotPath implements QwpSender.QuarantinedSlotPath.

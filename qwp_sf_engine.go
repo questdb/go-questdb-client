@@ -1139,6 +1139,12 @@ func (e *qwpSfCursorEngine) engineCloseWithOwner(leakSegments bool, owner qwpSfC
 	}
 	e.closed.Store(true)
 	token, action := e.cleanup.begin(leakSegments, owner, respectRetryOwner)
+	return e.runCleanupAction(token, action, owner)
+}
+
+// runCleanupAction performs the action a claim decision handed back, without
+// holding the cleanup mutex.
+func (e *qwpSfCursorEngine) runCleanupAction(token qwpSfCleanupToken, action qwpSfCleanupAction, owner qwpSfCleanupOwner) (acted bool, err error) {
 	switch action {
 	case qwpSfCleanupNoAction:
 		return false, nil
@@ -1483,12 +1489,28 @@ func (e *qwpSfCursorEngine) engineRetryCloseIfNeeded() error {
 	return err
 }
 
+// engineMarkReadersQuiesced records that the caller owning the send loop has
+// stopped it, along with whether its mappings must be left alone. Terminal
+// cleanup is refused to callers who did not do that themselves until this is
+// published.
+func (e *qwpSfCursorEngine) engineMarkReadersQuiesced(leakMappings bool) {
+	if e != nil {
+		e.cleanup.markReadersQuiesced(leakMappings)
+	}
+}
+
 // engineRetryRepeatedClose makes the public double-close decision and cleanup
 // claim as one state read. It returns acted=false while a close, manager
-// callback or retry goroutine owns the protocol, and acted=true when this call
-// either re-drives manager teardown or consumes a retryable terminal claim.
+// callback or retry goroutine owns the protocol, or while the send loop has not
+// been shown to have stopped, and acted=true when this call either re-drives
+// manager teardown or consumes a retryable terminal claim.
 func (e *qwpSfCursorEngine) engineRetryRepeatedClose() (acted bool, err error) {
-	return e.engineCloseWithOwner(false, qwpSfCleanupOwnerClose, true)
+	if e == nil {
+		return false, nil
+	}
+	e.closed.Store(true)
+	token, action := e.cleanup.beginRepeatClose(qwpSfCleanupOwnerClose)
+	return e.runCleanupAction(token, action, qwpSfCleanupOwnerClose)
 }
 
 // engineRunCloseRetryAttempt contains panics outside terminal cleanup itself,

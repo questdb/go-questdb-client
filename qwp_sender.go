@@ -224,6 +224,34 @@ type QwpSender interface {
 	// reclaiming it is the operator's call.
 	QuarantinedSlotPath() string
 
+	// SlotLockReleased reports whether this sender has finished with its
+	// store-and-forward slot directory, so that another owner may take it.
+	//
+	// Close does not always finish releasing the slot lock before it returns.
+	// When the segment manager is still busy, the release passes to a
+	// background goroutine that keeps retrying it with no deadline, and Close
+	// returns nil meanwhile. Poll this to find out when the slot is free:
+	//
+	//	_ = sender.Close(ctx)
+	//	for !sender.SlotLockReleased() {
+	//		time.Sleep(10 * time.Millisecond)
+	//	}
+	//
+	// Those retries have no deadline, so put a bound on that loop if the
+	// process cannot wait on storage that may never come back. Reopening the
+	// same sf_dir + sender_id before this reports true fails to take the lock,
+	// with an error naming this process as the holder.
+	//
+	// Always true in memory mode, where there is no slot to hold. In
+	// store-and-forward mode it is false while the sender is open, since an
+	// open sender is using its slot, and turns true once the lock is gone.
+	//
+	// A live pooled lease reports the slot it currently borrows. A lease that
+	// has been returned reports true, because it no longer borrows anything --
+	// the slot went back to the pool and its lock is the pool's to release, so
+	// wait on QuestDB.Close for that, not on this.
+	SlotLockReleased() bool
+
 	// BackgroundDrainers returns a snapshot of the drainers the
 	// foreground sender has dispatched for orphan slot adoption.
 	// Returns nil when the sender was not configured with
@@ -1524,10 +1552,13 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
 		// The first Close may have safely handed engine cleanup to the manager
 		// worker, which can then hit a transient durability or flock-release
-		// error. Preserve the public double-close contract while another owner is
-		// active or cleanup is complete, but let an ownerless aborted/retryable
-		// cleanup finish. The state machine decides and claims in one locked
-		// operation, so a retry owner cannot start between two marker probes.
+		// error. Preserve the public double-close contract while cleanup is
+		// complete, but let an ownerless aborted/retryable cleanup finish.
+		//
+		// engineRetryRepeatedClose refuses while the send loop may still be
+		// reading the segment mappings that terminal cleanup unmaps. So a Close
+		// arriving while the first one is still draining reports the double
+		// close and touches nothing, and one arriving after it can take over.
 		if acted, err := s.cursorEngine.engineRetryRepeatedClose(); acted {
 			return err
 		}

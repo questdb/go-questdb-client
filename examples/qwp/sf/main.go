@@ -66,16 +66,25 @@ func main() {
 		// frame. Anything still on disk will be replayed by the next
 		// process to start with the same sf_dir + sender_id.
 		//
-		// Close() can return before the slot lock is released: when
-		// the segment manager is still busy, the release finishes on
-		// a background goroutine that keeps retrying it. Reopening
-		// the same slot immediately may fail with a lock error naming
-		// this process; retry the open until it succeeds. This is specific
-		// to a standalone sender: pooled SF applications can retry
-		// QuestDB.Close while ErrSfCleanupPending matches, and a nil result
-		// there proves every pool-managed slot is unlocked.
+		// Close() can return before the slot lock is released: if the
+		// segment manager is still busy, a background goroutine
+		// finishes the release and keeps retrying until it works. So a
+		// shutdown that has to know the slot is free asks the sender
+		// rather than reading Close's result. Those retries have no
+		// deadline, hence the time bound below: this process should not
+		// hang on a disk that may never come back.
 		if err := sender.Close(ctx); err != nil {
-			log.Fatal(err)
+			log.Printf("sender close: %v", err)
+		}
+		if qs, ok := sender.(qdb.QwpSender); ok {
+			deadline := time.Now().Add(30 * time.Second)
+			for !qs.SlotLockReleased() {
+				if !time.Now().Before(deadline) {
+					log.Printf("sender close: slot lock still held at shutdown")
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 		}
 	}()
 
