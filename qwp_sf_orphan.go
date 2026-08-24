@@ -96,7 +96,11 @@ func qwpSfIsCandidateOrphan(slotPath string) bool {
 	if _, err := os.Stat(filepath.Join(slotPath, qwpSfFailedSentinelName)); err == nil {
 		return false
 	}
-	return qwpSfHasAnySegmentFile(slotPath)
+	if qwpSfHasAnySegmentFile(slotPath) {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(slotPath, qwpSfManifestFileName))
+	return err == nil
 }
 
 // qwpSfMarkSlotFailed drops a .failed file in slotPath with the

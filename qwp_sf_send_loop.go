@@ -698,7 +698,7 @@ func (l *qwpSfSendLoop) sendLoopStart() {
 // ctx-aware blocking op at once, so a goroutine still alive past this grace is
 // wedged in un-cancellable I/O — a disk-backed segment mmap page-fault on hung
 // storage. var (not const) so package tests can dial it down.
-var qwpSfSendLoopCloseGrace = 5 * time.Second
+var qwpSfSendLoopCloseGrace = qwpSfSwappable(5 * time.Second)
 
 // sendLoopClose stops the I/O goroutine and waits for it to exit, bounded by
 // qwpSfSendLoopCloseGrace so a goroutine wedged in un-cancellable disk I/O
@@ -706,12 +706,19 @@ var qwpSfSendLoopCloseGrace = 5 * time.Second
 func (l *qwpSfSendLoop) sendLoopClose() error {
 	l.running.Store(false)
 	l.cancel()
+	// Cancellation is an installed obligation, not normal fallthrough. Fault
+	// injection happens only after both stop signals are visible so the outer
+	// phase guard may conservatively leak mappings while this goroutine still
+	// finishes shutting down instead of staying alive indefinitely.
+	if hook := qwpTestCloseSendLoopHook.Load(); hook != nil {
+		(*hook)()
+	}
 	joined := make(chan struct{})
 	go func() {
 		l.wg.Wait()
 		close(joined)
 	}()
-	timer := time.NewTimer(qwpSfSendLoopCloseGrace)
+	timer := time.NewTimer(qwpSfSendLoopCloseGrace.load())
 	defer timer.Stop()
 	select {
 	case <-joined:
@@ -726,7 +733,7 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 		// fault the host process when storage resolves.
 		l.abandoned.Store(true)
 		qwpEffectiveLogger(l.logger).Warn("qwp/sf: send loop still running after close; "+
-			"abandoning (wedged in un-cancellable disk I/O)", "grace", qwpSfSendLoopCloseGrace)
+			"abandoning (wedged in un-cancellable disk I/O)", "grace", qwpSfSendLoopCloseGrace.load())
 		// Release the WebSocket now rather than waiting on the wedged
 		// goroutine's defer (which may never run): the goroutine holds its own
 		// local transport reference, so swapping the atomic cannot strand it,

@@ -27,10 +27,13 @@ package questdb
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -64,6 +67,52 @@ func TestQwpSfScanOrphansFindsCandidates(t *testing.T) {
 	orphans := qwpSfScanOrphans(root, func(name string) bool { return name == "own-slot" })
 	require.Len(t, orphans, 1)
 	assert.Equal(t, filepath.Join(root, "orphan-1"), orphans[0])
+}
+
+func TestQwpSfManifestOnlySlotIsCandidateButQuarantineRootIsNot(t *testing.T) {
+	root := t.TempDir()
+	slot := filepath.Join(root, "manifest-only")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	m, err := qwpSfManifestCreate(slot, 0, 1)
+	require.NoError(t, err)
+	require.NoError(t, m.close())
+	assert.True(t, qwpSfIsCandidateOrphan(slot))
+
+	quarantineRoot := filepath.Join(root, "quarantined")
+	require.NoError(t, os.MkdirAll(filepath.Join(quarantineRoot, "sender-1"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(quarantineRoot, "sender-1", "sf-initial.sfa"), []byte("preserved"), 0o644))
+	assert.False(t, qwpSfIsCandidateOrphan(quarantineRoot))
+}
+
+func TestQwpSfDrainerHandlesManifestOnlySlots(t *testing.T) {
+	t.Run("data-boundaries-mark-failed-with-reason", func(t *testing.T) {
+		slot := t.TempDir()
+		m, err := qwpSfManifestCreate(slot, 0, 1)
+		require.NoError(t, err)
+		require.NoError(t, m.close())
+
+		d := qwpSfNewOrphanDrainer(slot, 4096, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+		d.drainerRun(context.Background())
+		assert.Equal(t, qwpSfDrainOutcomeFailed, d.drainerOutcome())
+		body, err := os.ReadFile(filepath.Join(slot, qwpSfFailedSentinelName))
+		require.NoError(t, err)
+		assert.Contains(t, string(body), "sf-manifest.bin references durable data")
+	})
+
+	t.Run("collapsed-boundaries-clean-up", func(t *testing.T) {
+		slot := t.TempDir()
+		m, err := qwpSfManifestCreate(slot, 4, 4)
+		require.NoError(t, err)
+		require.NoError(t, m.close())
+
+		d := qwpSfNewOrphanDrainer(slot, 4096, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+		d.drainerRun(context.Background())
+		assert.Equal(t, qwpSfDrainOutcomeSuccess, d.drainerOutcome())
+		_, err = os.Stat(filepath.Join(slot, qwpSfManifestFileName))
+		assert.True(t, os.IsNotExist(err))
+		_, err = os.Stat(filepath.Join(slot, qwpSfFailedSentinelName))
+		assert.True(t, os.IsNotExist(err))
+	})
 }
 
 func TestQwpSfScanOrphansEmptyDirReturnsNothing(t *testing.T) {
@@ -154,6 +203,42 @@ func TestQwpSfDrainerSkipsLockedSlot(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "drainer wrongly created .failed on lock contention")
 }
 
+// TestQwpSfDrainerLocalIOFaultLeavesNoFailedSentinel pins the drainer half of
+// retry-always: a local filesystem fault while opening the slot — here, a
+// manifest-debris quarantine rename refused with ENOSPC — says nothing about
+// the slot's bytes. The run fails, but the slot keeps its data and its
+// eligibility: no .failed sentinel, so the next foreground scan adopts it
+// again once the fault clears.
+func TestQwpSfDrainerLocalIOFaultLeavesNoFailedSentinel(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	// A manifest of the wrong size, which engine open tries to set aside.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfManifestFileName),
+		[]byte("too short"), 0o644))
+
+	original := qwpSfManifestQuarantineRename.load()
+	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
+	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.ENOSPC })
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		nil,
+		200*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond,
+	)
+	drainer.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	_, err := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(err),
+		"a local I/O fault must leave the slot eligible for a later adoption")
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfManifestFileName))
+	require.NoError(t, err)
+	assert.Equal(t, "too short", string(body), "the boundary record must stay in place")
+}
+
 func TestQwpSfDrainerMarksFailedOnAuthRejection(t *testing.T) {
 	authSrv := newQwpSfTestServer(t, qwpSfTestServerOpts{upgradeStatus: 401})
 	defer authSrv.Close()
@@ -240,6 +325,15 @@ func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
 	t.Run("HelperRecovers", func(t *testing.T) {
 		qwpDrainerListenerCall(nil, func() { panic("boom") }) // must not propagate
 		qwpDrainerListenerCall(nil, nil)                      // nil-safe
+	})
+
+	t.Run("PanickingLoggerContained", func(t *testing.T) {
+		// The handler that reports the caught panic is user code too, so a
+		// panic there must not reach the drainer's goroutine either.
+		logger := slog.New(panicOnHandleSlog{})
+		require.NotPanics(t, func() {
+			qwpDrainerListenerCall(logger, func() { panic("boom") })
+		})
 	})
 
 	t.Run("OnDurableAckUnavailablePanicContained", func(t *testing.T) {
@@ -393,9 +487,9 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 // is cancelled holds every slot occupied, so a cap-violating drainer
 // (if the semaphore were missing) would show up as a (cap+1)th entry.
 func TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	defer func() { qwpSfDrainerPoolCloseGrace = prevGrace }()
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	defer func() { qwpSfDrainerPoolCloseGrace.store(prevGrace) }()
 
 	const (
 		maxConcurrent = 2
@@ -479,9 +573,9 @@ func TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime(t *testing.T) {
 // master ctx after the polite-stop grace; the dial unwinds; the
 // drainer goroutine exits.
 func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	defer func() { qwpSfDrainerPoolCloseGrace = prevGrace }()
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	defer func() { qwpSfDrainerPoolCloseGrace.store(prevGrace) }()
 
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
@@ -547,13 +641,13 @@ func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
 // the post-cancel hard grace both elapse, close abandons the
 // straggler and returns; the slot stays adoptable.
 func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	prevHard := qwpSfDrainerPoolHardCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	qwpSfDrainerPoolHardCloseGrace = 50 * time.Millisecond
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	prevHard := qwpSfDrainerPoolHardCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	qwpSfDrainerPoolHardCloseGrace.store(50 * time.Millisecond)
 	defer func() {
-		qwpSfDrainerPoolCloseGrace = prevGrace
-		qwpSfDrainerPoolHardCloseGrace = prevHard
+		qwpSfDrainerPoolCloseGrace.store(prevGrace)
+		qwpSfDrainerPoolHardCloseGrace.store(prevHard)
 	}()
 
 	dir := t.TempDir()
@@ -789,8 +883,8 @@ func TestSfConfDrainOrphansEndToEnd(t *testing.T) {
 func TestQwpSfDrainerMarksFailedWhenConnectedButNeverAcked(t *testing.T) {
 	// The 300ms budget below is deliberately sub-floor to keep the watchdog
 	// fast; lower the production floor (30s) for the duration of this test.
-	defer func(orig time.Duration) { qwpSfMinNoProgressBudget = orig }(qwpSfMinNoProgressBudget)
-	qwpSfMinNoProgressBudget = 10 * time.Millisecond
+	defer func(orig time.Duration) { qwpSfMinNoProgressBudget.store(orig) }(qwpSfMinNoProgressBudget.load())
+	qwpSfMinNoProgressBudget.store(10 * time.Millisecond)
 
 	// silentAcks: read frames forever, never ACK, keep the
 	// connection open — exactly the wedged-but-connected scenario.
@@ -951,7 +1045,7 @@ func TestQwpSfDrainerNoProgressBudgetFloor(t *testing.T) {
 	// fast) must not shrink the live-connection no-progress watchdog below the
 	// floor, or a healthy-but-slow adopted slot could be quarantined early.
 	d := &qwpSfOrphanDrainer{reconnectMaxDuration: time.Millisecond}
-	assert.Equal(t, qwpSfMinNoProgressBudget, d.noProgressBudget(),
+	assert.Equal(t, qwpSfMinNoProgressBudget.load(), d.noProgressBudget(),
 		"a sub-floor reconnectMaxDuration must be raised to the floor")
 
 	// A value above the floor is honored exactly.
@@ -963,4 +1057,75 @@ func TestQwpSfDrainerNoProgressBudgetFloor(t *testing.T) {
 	d = &qwpSfOrphanDrainer{}
 	assert.Equal(t, qwpSfDefaultReconnectMaxDuration, d.noProgressBudget(),
 		"an unset reconnectMaxDuration falls back to the default")
+}
+
+// The .failed sentinel is permanent — nothing in the client removes it — so a
+// local I/O fault must not earn one. The slot keeps its data and stays
+// eligible for the next foreground scan; only a recovery that proves the slot
+// inconsistent quarantines it.
+func TestQwpSfDrainerLocalIOErrorLeavesSlotEligible(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based permission denial is not portable to Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits; cannot induce EACCES")
+	}
+	slot := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(slot, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+	segments, err := filepath.Glob(filepath.Join(slot, "*.sfa"))
+	require.NoError(t, err)
+	require.NotEmpty(t, segments)
+	for _, path := range segments {
+		require.NoError(t, os.Chmod(path, 0o000))
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	}
+
+	d := qwpSfNewOrphanDrainer(slot, segSize, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+	d.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, d.drainerOutcome())
+	assert.Contains(t, d.drainerLastError(), "permission denied")
+	_, statErr := os.Stat(filepath.Join(slot, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr),
+		"a transient local fault must not disqualify the slot forever")
+	assert.True(t, qwpSfIsCandidateOrphan(slot),
+		"the slot must still be adopted by the next scan")
+}
+
+// TestQwpSfDrainerOpenFailureSurvivesPanickingLogger pins that reporting an
+// operational open failure cannot kill the process. Each drainer runs on its
+// own goroutine whose only recover is the one at the top of drainerRun, and
+// this report reaches a user-supplied slog handler that is free to panic.
+func TestQwpSfDrainerOpenFailureSurvivesPanickingLogger(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	// A full disk is an operational failure, not proof that the slot is
+	// inconsistent, so the drainer logs it and leaves the slot for a later scan
+	// — the branch this test needs to reach.
+	originalReserve := qwpSfReserveNewBlocksFn.load()
+	qwpSfReserveNewBlocksFn.store(func(*os.File, int64, int64) error { return syscall.ENOSPC })
+	t.Cleanup(func() { qwpSfReserveNewBlocksFn.store(originalReserve) })
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	drainer.logger = slog.New(panicOnHandleSlog{})
+
+	drainer.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "an operational open failure must leave the slot eligible")
 }

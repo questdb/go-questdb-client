@@ -220,14 +220,16 @@ func TestQwpDeltaDictSplitPathStaysDeltaAcrossReconnect(t *testing.T) {
 // order.
 func TestQwpDeltaDictSeedFromPersisted(t *testing.T) {
 	dir := t.TempDir()
-	seed := qwpSfSymbolDictOpen(dir)
+	seed, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.NotNil(t, seed)
 	require.NoError(t, seed.appendSymbols([]string{"a", "b", "c"}))
 	require.NoError(t, seed.close())
 
 	// Reopen: recovery loads the entries via openExisting (a fresh dict has no
 	// loaded set), mirroring the engine's recovery path.
-	pd := qwpSfSymbolDictOpen(dir)
+	pd, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.NotNil(t, pd)
 	defer pd.close()
 	require.Equal(t, []string{"a", "b", "c"}, pd.loadedSymbols())
@@ -288,7 +290,8 @@ func TestQwpDeltaDictSfPersistsSymbols(t *testing.T) {
 
 	// Read the side-file through a second handle (before Close fully drains and
 	// removes it): the new symbols were persisted in id order.
-	check := qwpSfSymbolDictOpen(slot)
+	check, err := qwpSfSymbolDictOpen(slot)
+	require.NoError(t, err)
 	require.NotNil(t, check)
 	require.Equal(t, []string{"AAPL", "MSFT"}, check.loadedSymbols())
 	require.NoError(t, check.close())

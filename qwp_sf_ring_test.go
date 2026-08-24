@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -116,6 +117,150 @@ func TestQwpSfRingRotatesIntoHotSpare(t *testing.T) {
 	assert.True(t, r.needsHotSpare())
 }
 
+func TestQwpSfRingHeadAfterTrim(t *testing.T) {
+	const segSize int64 = 64
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	r := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = r.segmentRingClose() }()
+
+	payload := make([]byte, 16)
+	// Two rotations leave two sealed segments behind a fresh active one.
+	for len(r.getSealedSegments()) < 2 {
+		if r.needsHotSpare() {
+			spare, err := qwpSfCreateInMemorySegment(0, segSize)
+			require.NoError(t, err)
+			require.NoError(t, r.installHotSpare(spare))
+		}
+		require.GreaterOrEqual(t, r.appendOrFsn(payload), int64(0))
+	}
+	sealed := r.getSealedSegments()
+	active := r.getActiveSegment()
+
+	// Trimming a prefix of the sealed list puts the head at the first
+	// segment left standing; trimming all of it puts the head at the active
+	// segment, which the batch never contains.
+	assert.Equal(t, sealed[0].segmentBaseSeq(), r.headAfterTrim(0))
+	assert.Equal(t, sealed[1].segmentBaseSeq(), r.headAfterTrim(1))
+	assert.Equal(t, active.segmentBaseSeq(), r.headAfterTrim(2))
+	assert.NotEqual(t, sealed[1].segmentBaseSeq(), r.headAfterTrim(2))
+}
+
+// A trim batch covering the whole sealed list reads its new head off the
+// active segment, so rotation must never leave the outgoing segment sitting
+// in both places at once: committing its base as the manifest head and then
+// unlinking the file leaves the manifest naming a segment that is gone.
+func TestQwpSfRingRotationKeepsActiveOutOfSealedList(t *testing.T) {
+	const segSize int64 = 64
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	r := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = r.segmentRingClose() }()
+
+	payload := make([]byte, 16)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20000; i++ {
+			if r.needsHotSpare() {
+				spare, spareErr := qwpSfCreateInMemorySegment(0, segSize)
+				if spareErr != nil {
+					return
+				}
+				if r.installHotSpare(spare) != nil {
+					return
+				}
+			}
+			r.appendOrFsn(payload)
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		r.mu.Lock()
+		active := r.active.Load()
+		sealedHoldsActive := false
+		for _, s := range r.sealedSegments {
+			if s == active {
+				sealedHoldsActive = true
+				break
+			}
+		}
+		r.mu.Unlock()
+		require.False(t, sealedHoldsActive, "the active segment is inside a trimmable batch")
+	}
+}
+
+func TestQwpSfRingManifestSyncDoesNotBlockSendLookup(t *testing.T) {
+	dir := t.TempDir()
+	const segSize int64 = 4096
+
+	active, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segSize)
+	require.NoError(t, err)
+	manifest, err := qwpSfManifestCreate(dir, 0, 0)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(active, segSize)
+	ring.manifest = manifest
+	defer func() { _ = ring.segmentRingClose() }()
+
+	// Leave 16 bytes free. The next 9-byte payload needs 17 bytes with its
+	// frame header, so it must rotate.
+	filler := make([]byte, segSize-qwpSfHeaderSize-qwpSfFrameHeaderSize-16)
+	require.Equal(t, int64(0), ring.appendOrFsn(filler))
+	spare, err := qwpSfCreateSegment(filepath.Join(dir, "sf-spare.sfa"), ring.nextSeqHint(), segSize)
+	require.NoError(t, err)
+	require.NoError(t, ring.installHotSpare(spare))
+
+	syncEntered := make(chan struct{})
+	releaseSync := make(chan struct{})
+	syncHook := func(f *os.File) error {
+		close(syncEntered)
+		<-releaseSync
+		return f.Sync()
+	}
+	qwpSfManifestSync.Store(&syncHook)
+	t.Cleanup(func() { qwpSfManifestSync.Store(nil) })
+
+	rotationDone := make(chan int64, 1)
+	go func() {
+		rotationDone <- ring.appendOrFsn(make([]byte, 9))
+	}()
+
+	select {
+	case <-syncEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not reach manifest sync")
+	}
+
+	lookupDone := make(chan *qwpSfSegment, 1)
+	go func() {
+		lookupDone <- ring.findSegmentContaining(0)
+	}()
+
+	var found *qwpSfSegment
+	lookupReturned := false
+	select {
+	case found = <-lookupDone:
+		lookupReturned = true
+	case <-time.After(time.Second):
+	}
+	close(releaseSync)
+	if !lookupReturned {
+		found = <-lookupDone
+	}
+	fsn := <-rotationDone
+
+	require.True(t, lookupReturned, "send lookup blocked on manifest fsync")
+	require.Same(t, active, found)
+	require.Equal(t, int64(1), fsn)
+	require.Same(t, spare, ring.getActiveSegment())
+	require.Equal(t, 1, ring.sealedSegmentCount())
+}
+
 // TestQwpSfRingBackupWakeupRearmsPerActiveSegment pins the contract
 // that the high-water-mark backup wakeup nudges the segment manager
 // once per active segment: every freshly promoted active must re-arm
@@ -199,9 +344,11 @@ func TestQwpSfRingTrimsAckedSegments(t *testing.T) {
 	lastSeqInFirst := sealed[0].segmentBaseSeq() + sealed[0].segmentFrameCount() - 1
 	r.acknowledge(lastSeqInFirst)
 
-	trim := r.drainTrimmable()
+	trim := r.peekTrimmable()
 	require.Len(t, trim, 1)
 	assert.Equal(t, sealed[0], trim[0])
+	trim = r.drainTrimBatch(len(trim))
+	require.Len(t, trim, 1)
 	assert.Len(t, r.getSealedSegments(), 0)
 	for _, s := range trim {
 		_ = s.close()
@@ -404,10 +551,11 @@ func TestQwpSfRingOpenExistingQuarantinesCorruptFirstFrame(t *testing.T) {
 
 func TestQwpSfRingOpenExistingSkipsCorruptStrayFile(t *testing.T) {
 	// A stray / hand-damaged .sfa (bad magic, no recoverable frames)
-	// must not take recovery down — it is skipped and the valid
-	// segments still recover. This is the skippable half of the
-	// open-error classification.
+	// must not take recovery down when the manifest's committed boundaries
+	// prove it dead — it is quarantined and the valid segments still recover.
+	// This is the skippable half of the open-error classification.
 	dir := t.TempDir()
+	var segs []*qwpSfSegment
 	for _, base := range []int64{0, 5} {
 		path := filepath.Join(dir, "sf-"+formatHex16(uint64(base))+".sfa")
 		seg, err := qwpSfCreateSegment(path, base, 4096)
@@ -416,8 +564,10 @@ func TestQwpSfRingOpenExistingSkipsCorruptStrayFile(t *testing.T) {
 			_, err := seg.tryAppend([]byte{byte(base), byte(i)})
 			require.NoError(t, err)
 		}
-		require.NoError(t, seg.close())
+		segs = append(segs, seg)
 	}
+	createRecoveryManifest(t, dir, 0, 5, segs...)
+	closeRecoverySegments(t, segs...)
 	// A zero-filled .sfa has magic 0x00000000 → qwpSfErrSegmentCorrupt.
 	stray := filepath.Join(dir, "sf-stray.sfa")
 	require.NoError(t, os.WriteFile(stray, make([]byte, 4096), 0o644))
@@ -433,6 +583,8 @@ func TestQwpSfRingOpenExistingSkipsCorruptStrayFile(t *testing.T) {
 	assert.Equal(t, int64(5), active.segmentBaseSeq())
 	assert.Len(t, r.getSealedSegments(), 1)
 	assert.Equal(t, int64(10), r.nextSeqHint())
+	_, statErr := os.Stat(stray + ".corrupt")
+	require.NoError(t, statErr)
 }
 
 func TestQwpSfRingOpenExistingFailsOnUnreadableSegment(t *testing.T) {

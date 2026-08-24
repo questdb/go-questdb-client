@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -58,4 +59,14 @@ func TestQwpPoolHousekeeperDisabled(t *testing.T) {
 	if elapsed := time.Since(begin); elapsed > time.Second {
 		t.Fatalf("stopAndJoin on a disabled housekeeper took %v; want immediate return", elapsed)
 	}
+}
+
+// TestQwpPoolHousekeeperReapPanicSurvivesPanickingLogger pins that reporting a
+// reap panic cannot itself kill the process. The daemon loop has no recover of
+// its own, and a recover() cannot catch a second panic raised while the first
+// one is still unwinding — so the log call inside the recover has to be
+// guarded, and a user-supplied slog handler is exactly what can panic there.
+func TestQwpPoolHousekeeperReapPanicSurvivesPanickingLogger(t *testing.T) {
+	h := &qwpPoolHousekeeper{logger: slog.New(panicOnHandleSlog{})}
+	h.reapGuarded(func() { panic("reap boom") })
 }

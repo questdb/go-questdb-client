@@ -27,15 +27,18 @@ package questdb
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/require"
 )
 
 // newQuestDBTestServer serves both QWP directions from one address like a real
@@ -120,6 +123,76 @@ func TestQuestDBFacadeEndToEnd(t *testing.T) {
 	if err := q.Close(); err != nil {
 		t.Fatalf("query close: %v", err)
 	}
+}
+
+// TestQuestDBCloseReprobesRetainedSlotLocks pins that a Close reporting
+// retained store-and-forward slot locks is a "not yet", not a verdict. The
+// housekeeper is already stopped by then, so Close itself is the only thing
+// left that can re-check those slots; a caller gating shutdown on a clean
+// Close would otherwise wait forever on a cached error.
+func TestQuestDBCloseReprobesRetainedSlotLocks(t *testing.T) {
+	ctx := context.Background()
+	gotData := make(chan struct{}, 1)
+	srv := newQuestDBTestServer(t, gotData)
+	defer srv.Close()
+
+	sfDir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	// Park the manager worker inside spare-segment creation so it cannot go
+	// quiet, which is what makes the engine hand its cleanup off and keep the
+	// slot lock past Close.
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	db, err := NewQuestDB(ctx, conf, WithSenderPoolMin(1), WithSenderPoolMax(1))
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager never entered spare-segment creation")
+	}
+
+	require.ErrorIs(t, db.Close(ctx), ErrSfCleanupPending)
+	require.ErrorIs(t, db.Close(ctx), ErrSfCleanupPending,
+		"the lock is still held, so a repeat Close must keep saying so")
+
+	releaseOnce.Do(func() { close(release) })
+	var closeErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		closeErr = db.Close(ctx)
+		if closeErr == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	require.NoError(t, closeErr, "Close never observed the slot cleanup finishing")
+
+	// A nil Close now really does mean the lock is gone.
+	lock, err := qwpSfAcquireSlotLock(filepath.Join(sfDir, qwpSfDefaultSenderId+"-0"))
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
 }
 
 // TestQuestDBBorrowSenderExposesQwpSender pins the Java-parity contract that a
@@ -502,4 +575,115 @@ func TestQuestDBDrainerListenerAppliedToPooledSenders(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("facade-registered drainer listener never fired for the adopted orphan")
 	}
+}
+
+func closedSfPoolWithRetiredSlot(cleanup closeLifecycleReporter) *qwpSenderPool {
+	closeDone := make(chan struct{})
+	close(closeDone)
+	return &qwpSenderPool{
+		closed:          true,
+		closeStarted:    true,
+		closeDone:       closeDone,
+		storeAndForward: true,
+		notify:          make(chan struct{}),
+		sfSlots:         []qwpSfSlotLifecycle{{state: qwpSfSlotRetired}},
+		retiredSlots:    []*qwpSenderSlot{{slotIndex: 0, cleanup: cleanup}},
+	}
+}
+
+type closeReentryHandler struct {
+	db  *QuestDB
+	hit chan error
+}
+
+func (*closeReentryHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *closeReentryHandler) Handle(context.Context, slog.Record) error {
+	select {
+	case h.hit <- h.db.Close(context.Background()):
+	default:
+	}
+	return nil
+}
+func (h *closeReentryHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *closeReentryHandler) WithGroup(string) slog.Handler      { return h }
+
+// The fresh lifecycle probe and its configured logger run without a facade
+// result mutex. A logger that re-enters Close therefore observes the already
+// freed ledger instead of deadlocking on cached-result bookkeeping.
+func TestQuestDBCloseReprobeAllowsLoggerReentry(t *testing.T) {
+	db := &QuestDB{}
+	db.closeOnce.Do(func() {})
+	db.senderPool = closedSfPoolWithRetiredSlot(nil)
+	reentered := make(chan error, 1)
+	db.senderPool.logger = slog.New(&closeReentryHandler{db: db, hit: reentered})
+
+	require.NoError(t, db.Close(context.Background()))
+	select {
+	case err := <-reentered:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lifecycle re-probe never reached the configured logger")
+	}
+}
+
+// flippableDoneSlot is a cleanup reporter whose completion can be switched on
+// while probes are in flight, standing in for a deferred slot cleanup that
+// finishes at an arbitrary moment.
+type flippableDoneSlot struct{ done atomic.Bool }
+
+func (s *flippableDoneSlot) closeCompleted() bool               { return s.done.Load() }
+func (s *flippableDoneSlot) ensureCloseRetryOwner(*slog.Logger) {}
+
+// TestQuestDBConcurrentCloseReprobes drives the real two-caller race on the
+// re-probe path: many goroutines calling Close concurrently on an SF facade
+// with a slot in deferred cleanup, with the cleanup completing mid-storm. The
+// seam-hooked test above pins one ordering; this one exercises the memory
+// model under -race. Every result must be coherent — nil or a pending report,
+// nothing else — and once every caller has returned and the cleanup has
+// landed, one more Close reports nil.
+func TestQuestDBConcurrentCloseReprobes(t *testing.T) {
+	db := &QuestDB{}
+	db.closeOnce.Do(func() {})
+	cleanup := &flippableDoneSlot{}
+	db.senderPool = closedSfPoolWithRetiredSlot(cleanup)
+
+	for i := 0; i < 4; i++ {
+		require.ErrorIs(t, db.Close(context.Background()), ErrSfCleanupPending,
+			"Close must stay pending while the lifecycle ledger is non-free")
+	}
+
+	const callers = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if i == callers/2 {
+				cleanup.done.Store(true)
+			}
+			errs[i] = db.Close(context.Background())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			require.ErrorIs(t, err, ErrSfCleanupPending,
+				"caller %d must see either nil or a pending report", i)
+			continue
+		}
+		db.senderPool.mu.Lock()
+		pending := db.senderPool.sfSlotObligationCountLocked()
+		db.senderPool.mu.Unlock()
+		require.Zero(t, pending, "caller %d returned nil before every lifecycle record was free", i)
+	}
+	cleanup.done.Store(true)
+	require.NoError(t, db.Close(context.Background()),
+		"with every caller returned and cleanup landed, Close must clear")
+	require.NoError(t, db.Close(context.Background()),
+		"a clean Close is stable because the closed pool admits no new obligations")
 }

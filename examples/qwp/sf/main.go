@@ -61,13 +61,30 @@ func main() {
 		log.Fatal(err)
 	}
 	defer func() {
-		// Close() drains the engine (waiting up to
+		// Close() drains the engine, waiting up to
 		// close_flush_timeout_millis for the server to ACK every
-		// frame) and releases the slot lock. Anything still on disk
-		// will be replayed by the next process to start with the
-		// same sf_dir + sender_id.
+		// frame. Anything still on disk will be replayed by the next
+		// process to start with the same sf_dir + sender_id.
+		//
+		// Close() can return before the slot lock is released: if the
+		// segment manager is still busy, a background goroutine
+		// finishes the release and keeps retrying until it works. So a
+		// shutdown that has to know the slot is free asks the sender
+		// rather than reading Close's result. Those retries have no
+		// deadline, hence the time bound below: this process should not
+		// hang on a disk that may never come back.
 		if err := sender.Close(ctx); err != nil {
-			log.Fatal(err)
+			log.Printf("sender close: %v", err)
+		}
+		if qs, ok := sender.(qdb.QwpSender); ok {
+			deadline := time.Now().Add(30 * time.Second)
+			for !qs.SlotLockReleased() {
+				if !time.Now().Before(deadline) {
+					log.Printf("sender close: slot lock still held at shutdown")
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 		}
 	}()
 

@@ -27,6 +27,10 @@ package questdb
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -39,6 +43,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/require"
 )
 
 // poisonFirstConnQwpServer accepts WS upgrades. The first connection — the
@@ -116,6 +121,361 @@ func newQwpSenderPoolForTest(t *testing.T, extra string, min, max int) *qwpSende
 	}
 	t.Cleanup(func() { p.close(context.Background()) })
 	return p
+}
+
+func TestQwpSenderPoolMemoryBuildCleanupDoesNotConsumeCapacity(t *testing.T) {
+	p := &qwpSenderPool{maxSize: 1}
+	slot := &qwpSenderSlot{slotIndex: -1, cleanup: &qwpLineSender{}}
+
+	p.reclaimFailedBuild(slot, -1, errors.New("injected memory build failure"))
+
+	require.Zero(t, p.capUsedLocked())
+}
+
+func TestQwpSenderPoolReprobeRetiredSlotsLockedDoesNotAcquireMutex(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "qwp_sender_pool.go", nil, 0)
+	require.NoError(t, err)
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || fn.Name.Name != "reprobeRetiredSlotsLocked" {
+			continue
+		}
+		receiver, ok := fn.Recv.List[0].Names[0], false
+		switch recvType := fn.Recv.List[0].Type.(type) {
+		case *ast.StarExpr:
+			ident, isIdent := recvType.X.(*ast.Ident)
+			ok = isIdent && ident.Name == "qwpSenderPool"
+		case *ast.Ident:
+			ok = recvType.Name == "qwpSenderPool"
+		}
+		if !ok {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			method, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || method.Sel.Name != "Lock" {
+				return true
+			}
+			field, ok := method.X.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			ident, isIdent := field.X.(*ast.Ident)
+			if isIdent && ident.Name == receiver.Name && field.Sel.Name == "mu" {
+				t.Errorf("%s: %s acquires p.mu; this helper must require the caller's lock",
+					fset.Position(call.Pos()), fn.Name.Name)
+			}
+			return true
+		})
+	}
+}
+
+func TestQwpSenderPoolReprobeRetiredSlotsLockedUsesCallersLock(t *testing.T) {
+	p := &qwpSenderPool{
+		storeAndForward: true,
+		sfSlots:         []qwpSfSlotLifecycle{{state: qwpSfSlotRetired}},
+		retiredSlots:    []*qwpSenderSlot{{slotIndex: 0}},
+	}
+
+	p.mu.Lock()
+	capacityBefore := p.capUsedLocked()
+	restored := p.reprobeRetiredSlotsLocked()
+	capacityAfter := p.capUsedLocked()
+	callerStillHoldsLock := !p.mu.TryLock()
+	p.mu.Unlock()
+
+	require.True(t, callerStillHoldsLock, "the locked helper must not release the caller's mutex")
+	require.Equal(t, 1, restored)
+	require.Equal(t, 1, capacityBefore)
+	require.Zero(t, capacityAfter)
+	require.Empty(t, p.retiredSlots)
+	require.Equal(t, qwpSfSlotFree, p.sfSlots[0].state)
+}
+
+func TestQwpSfSlotLifecycleTransitionTable(t *testing.T) {
+	states := []qwpSfSlotState{
+		qwpSfSlotFree,
+		qwpSfSlotCreating,
+		qwpSfSlotAvailable,
+		qwpSfSlotLeased,
+		qwpSfSlotClosing,
+		qwpSfSlotRetired,
+	}
+	for _, from := range states {
+		for _, to := range states {
+			name := from.String() + "_to_" + to.String()
+			t.Run(name, func(t *testing.T) {
+				p := &qwpSenderPool{
+					storeAndForward: true,
+					sfSlots:         []qwpSfSlotLifecycle{{state: from}},
+				}
+				transition := func() { p.transitionSfSlotLocked(0, from, to) }
+				if qwpSfSlotTransitionAllowed(from, to) {
+					require.NotPanics(t, transition)
+					require.Equal(t, to, p.sfSlots[0].state)
+					return
+				}
+				require.Panics(t, transition, "illegal lifecycle edge must fail loudly")
+				require.Equal(t, from, p.sfSlots[0].state)
+			})
+		}
+	}
+}
+
+func TestQwpSfSlotLifecycleSnapshotIncludesEveryNonFreeState(t *testing.T) {
+	states := []qwpSfSlotState{
+		qwpSfSlotFree,
+		qwpSfSlotCreating,
+		qwpSfSlotAvailable,
+		qwpSfSlotLeased,
+		qwpSfSlotClosing,
+		qwpSfSlotRetired,
+	}
+	for _, state := range states {
+		t.Run(state.String(), func(t *testing.T) {
+			p := &qwpSenderPool{
+				storeAndForward: true,
+				sfSlots:         []qwpSfSlotLifecycle{{state: state}},
+			}
+			pending := p.sfCloseSnapshotLocked()
+			if state == qwpSfSlotFree {
+				require.Empty(t, pending)
+				require.Zero(t, p.capUsedLocked())
+				return
+			}
+			require.Equal(t, []qwpSfSlotObligation{{index: 0, state: state}}, pending)
+			require.Equal(t, 1, p.capUsedLocked())
+		})
+	}
+}
+
+// TestQwpSenderPoolCloseReportsBlockedSfCreation pins the shutdown obligation
+// that exists before createSlotAt has acquired a flock. Once shutdown starts,
+// the reserved index cannot disappear from Close's snapshot: the build may
+// still acquire that flock after the first Close returns.
+func TestQwpSenderPoolCloseReportsBlockedSfCreation(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		40*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	borrowDone := make(chan error, 1)
+	borrowJoined := make(chan struct{})
+	hook := func() {
+		close(entered)
+		<-release
+	}
+	createSlotHook.Store(&hook)
+	t.Cleanup(func() {
+		createSlotHook.Store(nil)
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-borrowJoined:
+		case <-time.After(5 * time.Second):
+			t.Error("blocked borrow did not finish during cleanup")
+		}
+	})
+
+	go func() {
+		defer close(borrowJoined)
+		_, borrowErr := p.borrow(context.Background())
+		borrowDone <- borrowErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("createSlotAt did not reach the blocking hook")
+	}
+
+	require.ErrorIs(t, p.close(context.Background()), ErrSfCleanupPending,
+		"an in-flight SF construction is a shutdown obligation even before it owns the flock")
+
+	releaseOnce.Do(func() { close(release) })
+	require.ErrorIs(t, <-borrowDone, errPoolExhausted)
+	require.Eventually(t, func() bool {
+		return p.close(context.Background()) == nil
+	}, 5*time.Second, time.Millisecond, "Close did not converge after the blocked construction settled")
+
+	lock, err := qwpSfAcquireSlotLock(filepath.Join(sfDir, qwpSfDefaultSenderId+"-0"))
+	require.NoError(t, err, "a clean Close must imply the late construction released its flock")
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSenderPoolBlockedSfCreationSettlesFailureAndPanic(t *testing.T) {
+	for _, panicBuild := range []bool{false, true} {
+		name := "failure"
+		if panicBuild {
+			name = "panic"
+		}
+		t.Run(name, func(t *testing.T) {
+			srv := newQwpTestServer(t)
+			t.Cleanup(srv.Close)
+			conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+				";sf_dir=" + t.TempDir() + ";close_flush_timeout_millis=0;"
+			p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+				40*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = p.close(context.Background()) })
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			borrowDone := make(chan error, 1)
+			borrowJoined := make(chan struct{})
+			hook := func() {
+				close(entered)
+				<-release
+				if panicBuild {
+					panic("injected blocked construction panic")
+				}
+			}
+			createSlotHook.Store(&hook)
+			t.Cleanup(func() {
+				createSlotHook.Store(nil)
+				releaseOnce.Do(func() { close(release) })
+				select {
+				case <-borrowJoined:
+				case <-time.After(5 * time.Second):
+					t.Error("blocked borrow did not finish during cleanup")
+				}
+			})
+
+			go func() {
+				defer close(borrowJoined)
+				_, borrowErr := p.borrow(context.Background())
+				borrowDone <- borrowErr
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("createSlotAt did not reach the blocking hook")
+			}
+
+			require.ErrorIs(t, p.close(context.Background()), ErrSfCleanupPending)
+			if !panicBuild {
+				// createSlotAt parses the config after the hook. The release channel
+				// orders this mutation before that read, yielding a normal build error.
+				p.baseConf = "invalid"
+			}
+			releaseOnce.Do(func() { close(release) })
+			require.Error(t, <-borrowDone)
+			require.Eventually(t, func() bool {
+				return p.close(context.Background()) == nil
+			}, 5*time.Second, time.Millisecond,
+				"Close did not converge after the blocked construction settled")
+		})
+	}
+}
+
+type blockingPoolCloseSender struct {
+	QwpSender
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (s blockingPoolCloseSender) Close(context.Context) error {
+	close(s.entered)
+	<-s.release
+	return nil
+}
+
+type resultPoolCloseSender struct {
+	QwpSender
+	err    error
+	panic  any
+	closed *atomic.Int32
+}
+
+func (s resultPoolCloseSender) Close(context.Context) error {
+	s.closed.Add(1)
+	if s.panic != nil {
+		panic(s.panic)
+	}
+	return s.err
+}
+
+func TestQwpSenderPoolCloseRunsEveryDelegateAndJoinsErrorsInSlotOrder(t *testing.T) {
+	firstErr := errors.New("slot zero close failure")
+	thirdErr := errors.New("slot two close failure")
+	closed := atomic.Int32{}
+	p := &qwpSenderPool{
+		notify:         make(chan struct{}),
+		maxSize:        3,
+		acquireTimeout: time.Second,
+	}
+	p.all = []*qwpSenderSlot{
+		{delegate: resultPoolCloseSender{err: firstErr, closed: &closed}, slotIndex: -1},
+		{delegate: resultPoolCloseSender{panic: "slot one close panic", closed: &closed}, slotIndex: -1},
+		{delegate: resultPoolCloseSender{err: thirdErr, closed: &closed}, slotIndex: -1},
+	}
+	p.available = append([]*qwpSenderSlot(nil), p.all...)
+
+	err := p.close(context.Background())
+	require.Equal(t, int32(3), closed.Load(), "one delegate fault must not skip its siblings")
+	require.ErrorIs(t, err, firstErr)
+	require.ErrorContains(t, err, "slot one close panic")
+	require.ErrorIs(t, err, thirdErr)
+	require.Less(t, strings.Index(err.Error(), firstErr.Error()), strings.Index(err.Error(), "slot one close panic"),
+		"joined diagnostics must follow stable slot order, not goroutine completion order")
+	require.Less(t, strings.Index(err.Error(), "slot one close panic"), strings.Index(err.Error(), thirdErr.Error()),
+		"joined diagnostics must follow stable slot order, not goroutine completion order")
+}
+
+// TestQwpSenderPoolConcurrentCloseWaitsForFirstTeardown exercises close
+// directly, without the facade's sync.Once. A later caller must not take a
+// success snapshot until the first-pass delegate teardown has completed.
+func TestQwpSenderPoolConcurrentCloseWaitsForFirstTeardown(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	p := &qwpSenderPool{
+		notify:         make(chan struct{}),
+		maxSize:        1,
+		acquireTimeout: time.Second,
+	}
+	slot := &qwpSenderSlot{
+		delegate:  blockingPoolCloseSender{entered: entered, release: release},
+		slotIndex: -1,
+	}
+	p.all = []*qwpSenderSlot{slot}
+	p.available = []*qwpSenderSlot{slot}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- p.close(context.Background()) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first close did not enter delegate teardown")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- p.close(context.Background()) }()
+	select {
+	case err := <-secondDone:
+		releaseOnce.Do(func() { close(release) })
+		t.Fatalf("second close returned before first-pass teardown completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
 }
 
 // TestQwpPooledSenderForwardsEveryColumnType pins the pooled lease forwarding
@@ -228,6 +588,9 @@ func TestQwpPooledSenderForwardsEveryColumnType(t *testing.T) {
 	}
 	if d := qs.BackgroundDrainers(); d != nil {
 		t.Errorf("BackgroundDrainers = %v, want nil (no sf_dir)", d)
+	}
+	if path := qs.QuarantinedSlotPath(); path != "" {
+		t.Errorf("QuarantinedSlotPath = %q, want empty (nothing was set aside)", path)
 	}
 	if fsn := qs.AckedFsn(); fsn < seq {
 		t.Errorf("AckedFsn = %d, want >= %d", fsn, seq)
@@ -739,6 +1102,144 @@ func TestQwpSenderLeaseStaleAtFlush(t *testing.T) {
 	if got := qs.AckedFsn(); got != -1 {
 		t.Errorf("stale AckedFsn=%d, want -1", got)
 	}
+	// A stale lease must not read the re-borrowed slot's quarantine path.
+	if path := qs.QuarantinedSlotPath(); path != "" {
+		t.Errorf("stale QuarantinedSlotPath=%q, want empty", path)
+	}
+}
+
+// TestQwpPooledSenderReportsQuarantinedSlotPath pins the live half of the
+// forwarder: a pooled sender that had to set its slot aside must say where the
+// bytes went, exactly as a standalone one does. Reading the log cannot be the
+// only way to find them.
+func TestQwpPooledSenderReportsQuarantinedSlotPath(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfRoot := t.TempDir()
+	slot := filepath.Join(sfRoot, qwpSfDefaultSenderId+"-0")
+	writeFailClosedSlot(t, slot)
+
+	ctx := context.Background()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfRoot + ";close_flush_timeout_millis=200;"
+	p, err := newQwpSenderPool(ctx, conf, 1, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(ctx) })
+
+	lease, err := p.borrow(ctx)
+	require.NoError(t, err)
+	defer lease.Close(ctx)
+	qs, ok := lease.(QwpSender)
+	require.True(t, ok)
+
+	entries, err := os.ReadDir(filepath.Join(sfRoot, "quarantined"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, filepath.Join(sfRoot, "quarantined", entries[0].Name()), qs.QuarantinedSlotPath())
+}
+
+// TestQwpSenderQuarantinedSlotPathStandalone pins the same answer on a
+// standalone sender, which is the form the README documents.
+func TestQwpSenderQuarantinedSlotPathStandalone(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfRoot := t.TempDir()
+	writeFailClosedSlot(t, filepath.Join(sfRoot, "solo"))
+
+	ctx := context.Background()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfRoot + ";sender_id=solo;close_flush_timeout_millis=200;"
+	ls, err := LineSenderFromConf(ctx, conf)
+	require.NoError(t, err)
+	defer ls.Close(ctx)
+	qs, ok := ls.(QwpSender)
+	require.True(t, ok)
+
+	entries, err := os.ReadDir(filepath.Join(sfRoot, "quarantined"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, filepath.Join(sfRoot, "quarantined", entries[0].Name()), qs.QuarantinedSlotPath())
+
+	// A sender that opened a slot it could read set nothing aside.
+	clean, err := LineSenderFromConf(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+
+		";sf_dir="+t.TempDir()+";close_flush_timeout_millis=200;")
+	require.NoError(t, err)
+	defer clean.Close(ctx)
+	require.Equal(t, "", clean.(QwpSender).QuarantinedSlotPath())
+}
+
+// TestQwpSenderPoolCloseSurvivesPanickingLoggerAndReleasesSlots pins that a
+// buggy user slog handler cannot turn close() into a no-op. The leak warning
+// fires after the available slots are already out of p.all and in closing, so
+// a panic there would skip every teardown -- leaving each
+// flock held with no retry owner and no retired slot to re-probe, while later
+// close() calls happily report success.
+func TestQwpSenderPoolCloseSurvivesPanickingLoggerAndReleasesSlots(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	ctx := context.Background()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=200;"
+	// A short acquire timeout keeps close()'s wait for the never-returned lease
+	// short; the leak branch it then takes is what this test is about.
+	p, err := newQwpSenderPool(ctx, conf, 2, 2, 200*time.Millisecond, 0, 0,
+		nil, nil, QwpBackgroundDrainerListener{}, slog.New(panicOnHandleSlog{}))
+	require.NoError(t, err)
+
+	// One lease stays out so close() takes the leak-warning branch.
+	leaked, err := p.borrow(ctx)
+	require.NoError(t, err)
+	defer leaked.Close(ctx)
+
+	require.ErrorIs(t, p.close(ctx), ErrSfCleanupPending,
+		"the outstanding lease remains a lifecycle obligation")
+
+	// The returned slot's flock must be gone; the borrowed one's is released
+	// when its lease returns.
+	lock, err := qwpSfAcquireSlotLock(filepath.Join(sfDir, qwpSfDefaultSenderId+"-0"))
+	require.NoError(t, err, "close() skipped the teardown of an available slot")
+	require.NoError(t, lock.close())
+	require.NoError(t, leaked.Close(ctx))
+	require.NoError(t, p.close(ctx))
+}
+
+// TestQwpSenderPoolCloseReportsPendingWhileTeardownHoldsFlock pins that close()
+// counts the teardowns still in flight off-lock. A lease returning concurrently
+// with close() is inside delegate.Close holding its slot flock, and close()'s
+// lease wait is capped well below the drain it is racing -- reporting nil there
+// would tell a caller the locks are gone while one is still held.
+func TestQwpSenderPoolCloseReportsPendingWhileTeardownHoldsFlock(t *testing.T) {
+	p := &qwpSenderPool{
+		storeAndForward: true,
+		maxSize:         1,
+		sfSlots:         []qwpSfSlotLifecycle{{state: qwpSfSlotClosing}},
+		notify:          make(chan struct{}),
+	}
+
+	err := p.close(context.Background())
+	require.ErrorIs(t, err, ErrSfCleanupPending,
+		"an in-flight teardown still holding its flock must not report a clean shutdown")
+
+	// Once that teardown lands, a repeat close stops reporting it.
+	p.mu.Lock()
+	p.transitionSfSlotLocked(0, qwpSfSlotClosing, qwpSfSlotFree)
+	p.mu.Unlock()
+	require.NoError(t, p.close(context.Background()))
+}
+
+// writeFailClosedSlot lays down a manifest-backed slot whose committed active
+// segment is unreadable, which recovery refuses; a foreground sender preserves
+// such a slot under <sf_dir>/quarantined/ and starts fresh.
+func writeFailClosedSlot(t *testing.T, slot string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	s0 := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "a")
+	s1 := createRecoverySegment(t, slot, "sf-active.sfa", 1, "b")
+	createRecoveryManifest(t, slot, 0, 1, s0, s1)
+	closeRecoverySegments(t, s0, s1)
+	require.NoError(t, os.WriteFile(filepath.Join(slot, "sf-active.sfa"), make([]byte, 4096), 0o644))
 }
 
 // TestQwpSenderPoolBorrowGrowsAsyncWhenServerDown: a growth borrow while the
@@ -982,11 +1483,9 @@ func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 	_ = s2.Close(ctx)
 }
 
-// TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting pins the SF slot
-// accounting on the lease-returned-after-close path: reclaimSlotLocked's
-// closingSlots decrement must be matched by an increment when giveBack's
-// closed branch takes the teardown, or closingSlots goes negative and
-// capUsedLocked undercounts forever after.
+// TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting pins the lifecycle
+// transition on the lease-returned-after-close path: leased stays pending until
+// giveBack moves it through closing to free.
 func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)
@@ -1005,26 +1504,397 @@ func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
 	}
 	// Close with the lease outstanding: close() leaves the borrowed slot for
 	// giveBack (bounded 100ms wait), which then runs the teardown itself.
-	if err := p.close(ctx); err != nil {
-		t.Fatalf("pool close: %v", err)
-	}
+	require.ErrorIs(t, p.close(ctx), ErrSfCleanupPending)
 	if err := s.Close(ctx); err != nil {
 		t.Fatalf("lease close: %v", err)
 	}
+	require.NoError(t, p.close(ctx))
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closingSlots != 0 {
-		t.Errorf("closingSlots=%d after the lease-return teardown, want 0", p.closingSlots)
-	}
 	if p.pendingLeaseTeardowns != 0 {
 		t.Errorf("pendingLeaseTeardowns=%d, want 0", p.pendingLeaseTeardowns)
 	}
-	for i, used := range p.slotInUse {
-		if used {
-			t.Errorf("slotInUse[%d] still reserved after teardown", i)
+	for i := range p.sfSlots {
+		if state := p.sfSlots[i].state; state != qwpSfSlotFree {
+			t.Errorf("SF slot %d state=%s after teardown, want free", i, state)
 		}
 	}
+}
+
+// qwpPoolTestUnhurriedAcquire is the acquire timeout for tests whose borrow
+// waits on a hook or on deferred slot cleanup rather than on the clock. It has
+// to outlast whatever the borrow is waiting for, or a loaded machine turns the
+// assertion into a timeout error and the test fails for a reason it does not
+// test. It is a ceiling, not a delay: nothing waits for it when the work it is
+// waiting on completes.
+const qwpPoolTestUnhurriedAcquire = 30 * time.Second
+
+// TestQwpSenderPoolReprobesDeferredClose restores an SF slot index only after
+// the delegate's manager worker has completed deferred terminal cleanup.
+func TestQwpSenderPoolReprobesDeferredClose(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + t.TempDir() + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	p.mu.Lock()
+	slot := p.available[0]
+	p.available = nil
+	p.removeFromAllLocked(slot)
+	p.transitionSfSlotLocked(slot.slotIndex, qwpSfSlotAvailable, qwpSfSlotClosing)
+	p.mu.Unlock()
+	if err := closeSlotGuarded(context.Background(), slot.delegate); err != nil {
+		t.Fatalf("delegate close: %v", err)
+	}
+	p.mu.Lock()
+	p.reclaimSlotLocked(slot, nil)
+	if state := p.sfSlots[slot.slotIndex].state; state != qwpSfSlotRetired {
+		t.Fatalf("deferred slot state=%s, want retired", state)
+	}
+	p.mu.Unlock()
+
+	close(release)
+	released = true
+	// This standalone pool has no housekeeper. Borrow must poll/reprobe the
+	// retired size-1 capacity and reuse index 0 once cleanup completes.
+	replacement, err := p.borrow(context.Background())
+	if err != nil {
+		t.Fatalf("borrow after deferred cleanup: %v", err)
+	}
+	replacementSlot := replacement.(*qwpPooledSender).slot
+	if replacementSlot.slotIndex != slot.slotIndex {
+		t.Fatalf("replacement slot index=%d, want reused %d", replacementSlot.slotIndex, slot.slotIndex)
+	}
+	if err := replacement.Close(context.Background()); err != nil {
+		t.Fatalf("return replacement: %v", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if state := p.sfSlots[slot.slotIndex].state; state != qwpSfSlotAvailable {
+		t.Fatalf("restored active slot state=%s, want available", state)
+	}
+}
+
+func TestQwpSenderPoolCloseReportsDeferredSlotAndRetryConverges(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 1, 1,
+		100*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	if err != nil {
+		t.Fatalf("newQwpSenderPool: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	err = p.close(context.Background())
+	require.ErrorIs(t, err, ErrSfCleanupPending,
+		"pool close must report the retained flock under a sentinel a caller can match")
+	lockPath := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
+	_, err = qwpSfAcquireSlotLock(lockPath)
+	if err == nil {
+		t.Fatal("pool close released a slot still owned by the manager worker")
+	}
+
+	close(release)
+	released = true
+	// Only close() re-probes here. The pool is already closed, so nothing else
+	// is left to notice the cleanup finishing, and a caller waiting for a clean
+	// shutdown would wait forever on a cached answer.
+	var closeErr error
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		closeErr = p.close(context.Background())
+		if closeErr == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	require.NoError(t, closeErr, "a repeat close must observe the slot cleanup finishing")
+	p.mu.Lock()
+	require.Equal(t, qwpSfSlotFree, p.sfSlots[0].state,
+		"the re-probe must return the lifecycle record to free")
+	p.mu.Unlock()
+	lock, err := qwpSfAcquireSlotLock(lockPath)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSenderPoolBuildFailureRetiresSlotUntilDeferredCleanup(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	afterEngineHook := func() error {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			return errors.New("manager did not enter spare creation")
+		}
+		return errors.New("injected post-engine build failure")
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpSfTestAfterEngineCreateHook.Store(&afterEngineHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfTestAfterEngineCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	_, err = p.borrow(context.Background())
+	require.ErrorContains(t, err, "injected post-engine build failure")
+	p.mu.Lock()
+	require.Equal(t, qwpSfSlotRetired, p.sfSlots[0].state,
+		"failed build freed an index whose flock is retained")
+	p.mu.Unlock()
+	slotPath := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
+	_, err = qwpSfAcquireSlotLock(slotPath)
+	require.Error(t, err)
+
+	close(release)
+	released = true
+	require.Eventually(t, func() bool {
+		p.reprobeRetiredSlots()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.sfSlots[0].state == qwpSfSlotFree
+	}, 2*time.Second, time.Millisecond)
+}
+
+// TestQwpSenderPoolRetiredSlotCapacityReturnsToBorrow is the end-to-end half of
+// the retirement contract: with max=1 and no housekeeper at all, the pool has
+// exactly one slot, that slot is retired with its flock still held, and the next
+// borrow has to get it back on its own. It borrows for real rather than calling
+// reprobeRetiredSlots by hand, which is what a user with
+// housekeeper_interval_ms=0 actually does.
+func TestQwpSenderPoolRetiredSlotCapacityReturnsToBorrow(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	afterEngineHook := func() error {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			return errors.New("manager did not enter spare creation")
+		}
+		return errors.New("injected post-engine build failure")
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpSfTestAfterEngineCreateHook.Store(&afterEngineHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfTestAfterEngineCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	_, err = p.borrow(context.Background())
+	require.ErrorContains(t, err, "injected post-engine build failure")
+	p.mu.Lock()
+	require.Equal(t, qwpSfSlotRetired, p.sfSlots[0].state,
+		"the failed build must retire the slot, not free it")
+	require.Equal(t, 1, p.capUsedLocked(), "a retired slot still counts against capacity")
+	p.mu.Unlock()
+
+	// Let the deferred cleanup finish, then borrow for real. The pool is at
+	// capacity until the borrow's own reprobe observes the released flock.
+	qwpSfTestSegmentCreateHook.Store(nil)
+	qwpSfTestAfterEngineCreateHook.Store(nil)
+	close(release)
+	released = true
+
+	lease, err := p.borrow(context.Background())
+	require.NoError(t, err, "a borrow must recover the retired slot's capacity without a housekeeper")
+	require.NoError(t, lease.Close(context.Background()))
+	p.mu.Lock()
+	require.Equal(t, qwpSfSlotAvailable, p.sfSlots[0].state)
+	p.mu.Unlock()
+}
+
+func TestQwpSenderPoolRecoveryBuildFailureRetiresSlotUntilDeferredCleanup(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	slotPath := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
+	require.NoError(t, os.MkdirAll(slotPath, 0o755))
+	manifest, err := qwpSfManifestCreate(slotPath, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, manifest.close())
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	afterEngineHook := func() error {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			return errors.New("manager did not enter spare creation")
+		}
+		return errors.New("injected recovered-slot build failure")
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpSfTestAfterEngineCreateHook.Store(&afterEngineHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfTestAfterEngineCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		100*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	p.mu.Lock()
+	require.Equal(t, qwpSfSlotRetired, p.sfSlots[0].state,
+		"recovery failure freed an index whose flock is retained")
+	p.mu.Unlock()
+	_, err = qwpSfAcquireSlotLock(slotPath)
+	require.Error(t, err)
+
+	close(release)
+	released = true
+	require.Eventually(t, func() bool {
+		p.reprobeRetiredSlots()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.sfSlots[0].state == qwpSfSlotFree
+	}, 2*time.Second, time.Millisecond)
 }
 
 // TestQwpSenderPoolCloseNeverTearsDownBorrowedDelegate pins the invariant: close()
@@ -1125,4 +1995,509 @@ func TestQwpSenderPoolCloseUnblocksWhenLeaseReturns(t *testing.T) {
 	if total != 0 || avail != 0 {
 		t.Fatalf("post-close snapshot total=%d avail=%d, want 0/0", total, avail)
 	}
+}
+
+// TestQwpSenderPoolCloseLeakWarningRunsOffTheLock pins both halves of where the
+// "leaving borrowed sender(s) alive" warning runs. It reaches the user's slog
+// handler only after the pool lock is released, because a panic thrown while
+// p.mu was held would leave that lock owned by a dead goroutine and every later
+// borrow, return, reprobe and repeat Close would wait on it forever. And the
+// call is panic-guarded, because by that point the available slots are already
+// out of p.all and in closing -- an escaping panic would skip
+// every teardown below and retain each flock with no owner at all.
+func TestQwpSenderPoolCloseLeakWarningRunsOffTheLock(t *testing.T) {
+	p := &qwpSenderPool{
+		logger:         slog.New(panicOnHandleSlog{}),
+		acquireTimeout: time.Millisecond,
+		notify:         make(chan struct{}),
+	}
+	// One slot in `all` and none available is a borrowed lease, which is what
+	// makes close() report a leak.
+	p.all = []*qwpSenderSlot{{slotIndex: -1}}
+
+	panicked := false
+	func() {
+		defer func() { panicked = recover() != nil }()
+		_ = p.close(context.Background())
+	}()
+	require.False(t, panicked, "a panicking handler must not escape close() and skip the teardown")
+
+	locked := make(chan struct{})
+	go func() {
+		p.poolSnapshot() // takes p.mu
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pool lock is still held after the logger panicked")
+	}
+}
+
+// TestQwpSenderPoolReprobeSurvivesPanickingLogger pins that restoring capacity
+// after a deferred slot cleanup cannot kill the process. reprobeRetiredSlots
+// runs on the housekeeper daemon and on the borrow path, neither of which has
+// a recover, and the "restored capacity" line reaches a user-supplied slog
+// handler that is free to panic.
+func TestQwpSenderPoolReprobeSurvivesPanickingLogger(t *testing.T) {
+	p := &qwpSenderPool{
+		logger:          slog.New(panicOnHandleSlog{}),
+		storeAndForward: true,
+		sfSlots:         []qwpSfSlotLifecycle{{state: qwpSfSlotRetired}},
+		// A slot with no cleanup reporter counts as closed, which is what puts
+		// the reprobe on its capacity-restoring path.
+		retiredSlots: []*qwpSenderSlot{{slotIndex: 0}},
+	}
+
+	p.reprobeRetiredSlots()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Empty(t, p.retiredSlots)
+	require.Equal(t, qwpSfSlotFree, p.sfSlots[0].state,
+		"the completed slot lifecycle must return to free")
+}
+
+// TestQwpSenderPoolReapVictimSelectionIsAllOrNothing pins that the reap's
+// accounting cannot be interrupted part-way. selectReapVictims calls into each
+// delegate to classify it, and reclaimSlotLocked -- reached only from reapIdle,
+// with the victim list this function returns -- settles closing to free or
+// retired. A fault after earlier victims were selected but before the list is
+// returned must not change their lifecycle states, or
+// close() would then report ErrSfCleanupPending on every call forever, so the
+// documented retry-until-it-clears contract would never terminate. The fault
+// is recovered at the operation boundary and poisons the pool: the state is
+// byte-for-byte unchanged, and every later borrow, lease return and close
+// reports the terminal error instead of lending on — a faulting classifier is
+// a client bug, and a pool that kept lending after one could hand a single
+// delegate to two goroutines.
+func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
+	p := &qwpSenderPool{
+		storeAndForward: true,
+		maxSize:         3,
+		minSize:         0,
+		idleTimeout:     time.Hour,
+		acquireTimeout:  50 * time.Millisecond,
+		sfSlots: []qwpSfSlotLifecycle{
+			{state: qwpSfSlotAvailable},
+			{state: qwpSfSlotAvailable},
+			{state: qwpSfSlotAvailable},
+		},
+		notify: make(chan struct{}),
+	}
+	stale := time.Now().Add(-2 * time.Hour)
+	// A nil delegate satisfies neither classifier interface, so it classifies
+	// cleanly as an idle victim; a zero-value sender does satisfy them and
+	// faults when they are called. Ordering the victim first puts the fault
+	// after victims have already been counted into the partition's deltas.
+	victim := &qwpSenderSlot{slotIndex: 0, idleSince: stale}
+	keeper := &qwpSenderSlot{slotIndex: 1, idleSince: time.Now()} // fresh: kept
+	faulting := &qwpSenderSlot{slotIndex: 2, idleSince: stale, delegate: &qwpLineSender{}}
+	p.all = []*qwpSenderSlot{victim, keeper, faulting}
+	p.available = []*qwpSenderSlot{victim, keeper, faulting}
+	p.mu.Lock()
+	capacityBefore := p.capUsedLocked()
+	p.mu.Unlock()
+
+	require.Empty(t, p.selectReapVictims(time.Now()),
+		"a faulted classification must select no victims")
+
+	p.mu.Lock()
+	for i := range p.sfSlots {
+		require.Equal(t, qwpSfSlotAvailable, p.sfSlots[i].state,
+			"a fault during classification must not change slot %d", i)
+	}
+	require.Zero(t, p.pendingLeaseTeardowns,
+		"nor as a teardown close() will wait for")
+	require.Equal(t, capacityBefore, p.capUsedLocked(),
+		"nor change lifecycle-derived pool capacity")
+
+	// The available set must survive the fault intact. Filtering in place and
+	// publishing only at the end leaves the backing array rewritten under an
+	// unchanged slice header: a kept slot appears twice -- handed to two
+	// borrowers at once, two producers on one delegate -- and a victim vanishes
+	// from available while staying in p.all, where nothing can ever close it
+	// and close() still reports a clean shutdown.
+	require.Equal(t, []*qwpSenderSlot{victim, keeper, faulting}, p.available,
+		"a fault during classification must leave the available set untouched")
+	seen := map[*qwpSenderSlot]int{}
+	for _, slot := range p.available {
+		seen[slot]++
+	}
+	for slot, n := range seen {
+		require.Equal(t, 1, n, "slot %p appears %d times in p.available", slot, n)
+	}
+	require.ErrorIs(t, p.poisonedErr, ErrPoolPoisoned)
+	p.mu.Unlock()
+
+	// The poison is loud on every producer-facing surface.
+	_, err := p.borrow(context.Background())
+	require.ErrorIs(t, err, ErrPoolPoisoned, "borrow must refuse on a poisoned pool")
+	require.ErrorIs(t, p.close(context.Background()), ErrPoolPoisoned,
+		"close must report the poison verdict")
+
+	// A second fault does not overwrite the first recorded error.
+	p.mu.Lock()
+	first := p.poisonedErr
+	p.poisonLocked("second fault", "boom")
+	require.Same(t, first, p.poisonedErr)
+	p.mu.Unlock()
+}
+
+// TestQwpSenderPoolPoisonSurfacesOnLeaseReturn pins that returning a lease to
+// a poisoned pool reports the terminal error: the recycle itself still
+// completes (the pool's bookkeeping is intact), but the producer must learn
+// the pool is dead rather than borrow-and-fail later.
+func TestQwpSenderPoolPoisonSurfacesOnLeaseReturn(t *testing.T) {
+	p := &qwpSenderPool{
+		maxSize:        1,
+		acquireTimeout: 50 * time.Millisecond,
+		notify:         make(chan struct{}),
+	}
+	slot := &qwpSenderSlot{}
+	p.all = []*qwpSenderSlot{slot}
+	gen := slot.generation.Add(1)
+	ps := &qwpPooledSender{pool: p, slot: slot, gen: gen}
+
+	p.mu.Lock()
+	p.poisonLocked("test", "boom")
+	p.mu.Unlock()
+
+	err := p.giveBack(context.Background(), ps, false)
+	require.ErrorIs(t, err, ErrPoolPoisoned)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Equal(t, []*qwpSenderSlot{slot}, p.available,
+		"the return itself must still complete")
+}
+
+// TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock pins that a failed
+// build does not silently swallow a slot lock it could not release. The pool
+// being constructed is dropped unreachable on that path, so the error it
+// returns is the caller's only notice that a rebuild on the same sf_dir and
+// sender_id may fail naming this process as the holder.
+func TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+
+	// Hold the manager worker inside spare creation so the prewarmed slot's
+	// close cannot prove quiescence and retains its flock, then fail the build.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	buildErr := errors.New("injected prewarm failure")
+	afterEngineHook := func() error {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			return errors.New("manager did not enter spare creation")
+		}
+		return buildErr
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpSfTestAfterEngineCreateHook.Store(&afterEngineHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfTestAfterEngineCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	_, err := newQwpSenderPool(context.Background(), conf, 1, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, buildErr, "the build failure must survive the join")
+	require.ErrorIs(t, err, ErrSfCleanupPending,
+		"a slot lock the failed build could not release must reach the caller")
+
+	close(release)
+	released = true
+
+	// Wait for the deferred cleanup to finish before the test returns.
+	// t.TempDir's RemoveAll otherwise races the retry owner, which is still
+	// unmapping and unlinking inside the slot -- on Linux that surfaces as an
+	// unlinkat failure in the cleanup rather than as anything about this test.
+	// The condition runs on testify's polling goroutine, where t.FailNow is
+	// invalid -- it calls runtime.Goexit, the condition never returns, and the
+	// real error is replaced by a timeout. Collect the close error and assert
+	// it back on the test goroutine.
+	slot := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
+	var closeErr error
+	require.Eventually(t, func() bool {
+		lock, lockErr := qwpSfAcquireSlotLock(slot)
+		if lockErr != nil {
+			return false
+		}
+		closeErr = lock.close()
+		return true
+	}, 10*time.Second, 10*time.Millisecond, "the retired slot's cleanup must finish")
+	require.NoError(t, closeErr)
+}
+
+// TestQwpSenderPoolReprobeSurvivesAFaultingSlot pins that a fault while probing
+// a retired slot neither strands the pool mutex nor publishes a half-rewritten
+// retired list. slotCloseCompleted calls into the delegate, and this runs on
+// the housekeeper and on the borrow-at-capacity path — a stranded p.mu
+// deadlocks every later borrow, return, reap and repeat close, which is exactly
+// the re-probe the ErrSfCleanupPending contract tells callers to keep making.
+// The fault is recovered at the operation boundary and poisons the pool: a
+// probe that faulted once would fault again, and the lifecycle transitions it
+// half-built must never be applied — a repeat probe must not free an index
+// whose retired-list entry survived the failed classification.
+func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
+	p := &qwpSenderPool{
+		storeAndForward: true,
+		maxSize:         3,
+		acquireTimeout:  50 * time.Millisecond,
+		sfSlots: []qwpSfSlotLifecycle{
+			{state: qwpSfSlotRetired},
+			{state: qwpSfSlotRetired},
+			{state: qwpSfSlotRetired},
+		},
+		notify: make(chan struct{}),
+	}
+	done := &qwpSenderSlot{slotIndex: 0}                               // no reporter: completed
+	pending := &qwpSenderSlot{slotIndex: 1, cleanup: &neverDoneSlot{}} // still held
+	faulting := &qwpSenderSlot{slotIndex: 2, cleanup: panicOnProbeSlot{}}
+	p.retiredSlots = []*qwpSenderSlot{done, pending, faulting}
+	p.mu.Lock()
+	capacityBefore := p.capUsedLocked()
+	p.mu.Unlock()
+
+	p.reprobeRetiredSlots()
+
+	locked := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		_ = len(p.retiredSlots)
+		p.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pool lock is still held after the probe faulted")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Equal(t, []*qwpSenderSlot{done, pending, faulting}, p.retiredSlots,
+		"a faulting probe must not publish a half-rewritten retired list")
+	// Lifecycle publication must be all-or-nothing with the retired list.
+	for i := range p.sfSlots {
+		require.Equal(t, qwpSfSlotRetired, p.sfSlots[i].state,
+			"a faulting probe must not change lifecycle state %d", i)
+	}
+	require.Equal(t, capacityBefore, p.capUsedLocked(),
+		"a faulting probe must not change lifecycle-derived pool capacity")
+	require.ErrorIs(t, p.poisonedErr, ErrPoolPoisoned,
+		"a faulting probe must record the terminal pool error")
+}
+
+// neverDoneSlot reports a cleanup that has not finished.
+type neverDoneSlot struct{}
+
+func (*neverDoneSlot) closeCompleted() bool               { return false }
+func (*neverDoneSlot) ensureCloseRetryOwner(*slog.Logger) {}
+
+// panicOnProbeSlot stands in for a delegate whose state check faults.
+type panicOnProbeSlot struct{}
+
+func (panicOnProbeSlot) closeCompleted() bool               { panic("probe boom") }
+func (panicOnProbeSlot) ensureCloseRetryOwner(*slog.Logger) {}
+
+// TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved pins that a panic
+// during a pooled build does not put the slot index back into circulation
+// while the engine it left behind still holds that directory's flock. The
+// build guard installs a retry owner, but the pool's recover sees only an
+// error — freeing the index lets a later borrow re-pick it and fail to open a
+// slot this process is still holding, which is the reservation bitmap's whole
+// purpose.
+func TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+
+	// Hold the manager worker so the engine's close cannot complete, then
+	// fault the build after the engine exists.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	boom := func() {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+		}
+		panic("pooled build boom")
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpTestAfterSendLoopBuiltHook.Store(&boom)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpTestAfterSendLoopBuiltHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	_, err = p.borrow(context.Background())
+	require.ErrorContains(t, err, "sender build panicked")
+
+	p.mu.Lock()
+	state := p.sfSlots[0].state
+	p.mu.Unlock()
+	require.Equal(t, qwpSfSlotRetired, state,
+		"the slot must stay retired while the engine's retry owner holds its flock")
+
+	close(release)
+	released = true
+	require.Eventually(t, func() bool {
+		p.reprobeRetiredSlots()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.sfSlots[0].state == qwpSfSlotFree
+	}, 10*time.Second, 10*time.Millisecond, "the index must come back once cleanup finishes")
+}
+
+// TestQwpSenderPoolPanicAfterSenderBuiltKeepsSlotReserved covers the other two
+// construction unwind paths. The reporter used to be carried out only when the
+// sender did not exist yet, so a fault after it was built — or inside the
+// orphan setup, whose own defer ran first — still reached the pool as a bare
+// panic. The pool then freed the slot index while the retry owner held that
+// directory's flock, which is the collision the reservation bitmap exists to
+// prevent.
+func TestQwpSenderPoolPanicAfterSenderBuiltKeepsSlotReserved(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	// Fault after the sender exists: the transport-swap callback runs there.
+	boom := func() {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+		}
+		panic("post-sender boom")
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	qwpTestAfterSenderBuiltHook.Store(&boom)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpTestAfterSenderBuiltHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	_, err = p.borrow(context.Background())
+	require.ErrorContains(t, err, "sender build panicked")
+
+	p.mu.Lock()
+	state := p.sfSlots[0].state
+	p.mu.Unlock()
+	require.Equal(t, qwpSfSlotRetired, state,
+		"the slot must stay retired while the flock is held")
+
+	close(release)
+	released = true
+	require.Eventually(t, func() bool {
+		p.reprobeRetiredSlots()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.sfSlots[0].state == qwpSfSlotFree
+	}, 10*time.Second, 10*time.Millisecond, "the index must come back once cleanup finishes")
+}
+
+// TestQwpPooledSenderSlotLockReleased covers the pooled half of the accessor.
+// A live lease answers for the slot it is borrowing, which is in use, so the
+// answer is false. A returned lease answers true, because it is no longer
+// borrowing anything: the slot went back to the pool, and releasing its lock
+// is the pool's job at QuestDB.Close rather than the lease's.
+func TestQwpPooledSenderSlotLockReleased(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfRoot := t.TempDir()
+
+	ctx := context.Background()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfRoot + ";close_flush_timeout_millis=200;"
+	p, err := newQwpSenderPool(ctx, conf, 1, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(ctx) })
+
+	lease, err := p.borrow(ctx)
+	require.NoError(t, err)
+	qs, ok := lease.(QwpSender)
+	require.True(t, ok)
+
+	require.False(t, qs.SlotLockReleased(),
+		"a live lease is borrowing a slot that is still in use")
+
+	require.NoError(t, lease.Close(ctx))
+	require.True(t, qs.SlotLockReleased(),
+		"a returned lease borrows nothing, so it has no slot lock to report on")
 }

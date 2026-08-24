@@ -109,6 +109,10 @@ type QwpSender interface {
 	// A table's designated timestamp resolution is fixed by its first
 	// row: mixing At and AtNano on rows of the same table within one
 	// flush returns a type-conflict error.
+	//
+	// An auto-flush failure matching [ErrBackpressureTimeout] or
+	// [ErrSfDurability] is non-terminal: the unappended rows remain pending and
+	// may be retried on the same sender.
 	AtNano(ctx context.Context, ts time.Time) error
 
 	// AckedFsn returns the highest server-acknowledged frame
@@ -137,6 +141,10 @@ type QwpSender interface {
 	// returned FSN is the upper bound of any SenderError.ToFsn that
 	// could surface for this batch. Use AwaitAckedFsn for ack
 	// confirmation.
+	//
+	// An error matching [ErrBackpressureTimeout] or [ErrSfDurability] is
+	// non-terminal: the unappended rows remain pending and may be retried on
+	// the same sender.
 	FlushAndGetSequence(ctx context.Context) (int64, error)
 
 	// LastTerminalError returns a snapshot of the most recent
@@ -204,6 +212,46 @@ type QwpSender interface {
 	// unless request_durable_ack is on.
 	TotalDurableTrimAdvances() int64
 
+	// QuarantinedSlotPath returns the directory holding the bytes of a
+	// store-and-forward slot this sender refused at startup, or "" when
+	// it opened a slot it could read (and always in memory mode).
+	//
+	// A slot whose recovery proves it inconsistent is preserved whole
+	// under <sf_dir>/quarantined/<sender_id>-<nanos>/ and the sender
+	// starts fresh, so ingestion continues while the unsent rows stay on
+	// disk. Nothing in the client ever removes that copy or counts it
+	// against sf_max_total_bytes — it is the only copy of those rows, so
+	// reclaiming it is the operator's call.
+	QuarantinedSlotPath() string
+
+	// SlotLockReleased reports whether this sender has finished with its
+	// store-and-forward slot directory, so that another owner may take it.
+	//
+	// Close does not always finish releasing the slot lock before it returns.
+	// When the segment manager is still busy, the release passes to a
+	// background goroutine that keeps retrying it with no deadline, and Close
+	// returns nil meanwhile. Poll this to find out when the slot is free:
+	//
+	//	_ = sender.Close(ctx)
+	//	for !sender.SlotLockReleased() {
+	//		time.Sleep(10 * time.Millisecond)
+	//	}
+	//
+	// Those retries have no deadline, so put a bound on that loop if the
+	// process cannot wait on storage that may never come back. Reopening the
+	// same sf_dir + sender_id before this reports true fails to take the lock,
+	// with an error naming this process as the holder.
+	//
+	// Always true in memory mode, where there is no slot to hold. In
+	// store-and-forward mode it is false while the sender is open, since an
+	// open sender is using its slot, and turns true once the lock is gone.
+	//
+	// A live pooled lease reports the slot it currently borrows. A lease that
+	// has been returned reports true, because it no longer borrows anything --
+	// the slot went back to the pool and its lock is the pool's to release, so
+	// wait on QuestDB.Close for that, not on this.
+	SlotLockReleased() bool
+
 	// BackgroundDrainers returns a snapshot of the drainers the
 	// foreground sender has dispatched for orphan slot adoption.
 	// Returns nil when the sender was not configured with
@@ -232,10 +280,19 @@ type QwpBackgroundDrainer struct {
 	// LastError is the most recent error message the drainer
 	// recorded, or "" if no error has been recorded.
 	LastError string
-	// Failed is true if the drainer ended in the FAILED outcome
-	// (auth failure, durable-ack settle exhaustion, recovery error,
-	// wedged no-progress connection) and dropped a .failed sentinel
-	// in the slot.
+	// Failed is true if the drainer ended in the FAILED outcome — it
+	// gave up on this slot for this run (auth failure, durable-ack
+	// settle exhaustion, a wedged no-progress connection, a slot whose
+	// recovery proved inconsistent, a panic).
+	//
+	// It does not by itself mean the slot is out of service. Those
+	// give-ups drop a permanent .failed sentinel that disqualifies the
+	// slot from every later adoption, but a local I/O fault while
+	// opening it — a full disk, an exhausted fd table, a mount that went
+	// away — fails the run without one: the fault says nothing about the
+	// slot's bytes, so the data and the eligibility both survive and the
+	// next foreground scan adopts the slot again. The presence of the
+	// sentinel file in Dir is what tells the two apart.
 	Failed bool
 }
 
@@ -455,8 +512,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 	factory := qwpSfBuildReconnectFactory(address, opts, dumpWriter)
 	transport, err := factory(ctx, 0)
 	if err != nil {
-		_ = engine.engineClose()
-		return nil, err
+		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err, nil)
 	}
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
@@ -1494,6 +1550,18 @@ func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
 
 func (s *qwpLineSender) Close(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
+		// The first Close may have safely handed engine cleanup to the manager
+		// worker, which can then hit a transient durability or flock-release
+		// error. Preserve the public double-close contract while cleanup is
+		// complete, but let an ownerless aborted/retryable cleanup finish.
+		//
+		// engineRetryRepeatedClose refuses while the send loop may still be
+		// reading the segment mappings that terminal cleanup unmaps. So a Close
+		// arriving while the first one is still draining reports the double
+		// close and touches nothing, and one arriving after it can take over.
+		if acted, err := s.cursorEngine.engineRetryRepeatedClose(); acted {
+			return err
+		}
 		return errDoubleSenderClose
 	}
 	// All wire I/O goes through the cursor engine + send loop,

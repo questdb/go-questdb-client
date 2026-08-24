@@ -511,7 +511,10 @@ func TestQwpSenderReclaimsOnlyUnpublishedSymbolIDs(t *testing.T) {
 	})
 
 	t.Run("persisted_floor", func(t *testing.T) {
-		d := qwpSfSymbolDictOpen(t.TempDir())
+		d, err := qwpSfSymbolDictOpen(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
 		if d == nil {
 			t.Fatal("open persisted dictionary")
 		}

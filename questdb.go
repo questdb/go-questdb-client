@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -66,7 +67,12 @@ type QuestDB struct {
 	queryPool   *qwpQueryPool
 	housekeeper *qwpPoolHousekeeper
 	closeOnce   sync.Once
-	closeErr    error
+
+	// These fields contain only stable one-time teardown results. The volatile
+	// SF lifecycle snapshot is read from senderPool on every Close call.
+	closeSenderFallbackErr error
+	closeQueryErr          error
+	closeHousekeepErr      error
 }
 
 // QuestDBOption configures the QuestDB facade. An explicit option always wins
@@ -187,7 +193,9 @@ func WithQuestDBBackgroundDrainerListener(l QwpBackgroundDrainerListener) QuestD
 // WithQuestDBLogger sets the *slog.Logger applied to both pools and every
 // pooled sender and query session. See WithLogger.
 func WithQuestDBLogger(l *slog.Logger) QuestDBOption {
-	return func(c *questDBConfig) { c.logger = l }
+	// Guarded at the door, like WithLogger: only panic-guarded loggers are
+	// stored (see qwp_log.go).
+	return func(c *questDBConfig) { c.logger = qwpGuardLogger(l) }
 }
 
 // serializeErrorHandler wraps h so concurrent invocations from the pool's
@@ -358,7 +366,12 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	}
 	qp, err := newQwpQueryPool(ctx, conf, queryMin, queryMax, acquire, idle, lifetime, logger)
 	if err != nil {
-		_ = sp.close(ctx)
+		// Join rather than drop: sp is about to become unreachable, so a
+		// retained slot lock (ErrSfCleanupPending) has no other way to reach
+		// the caller. See newQwpSenderPool's prewarm unwind.
+		if closeErr := sp.close(ctx); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
 		return nil, err
 	}
 	// The join budget must cover one reap sweep's worst case so a reap in flight
@@ -420,6 +433,19 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // sender pool (which owns the flocks/mmaps/I/O goroutines) is closed last and
 // always runs.
 //
+// In store-and-forward mode, every reserved slot remains a shutdown obligation
+// from construction until its flock has been released. After a bounded wait,
+// an outstanding lease, in-flight construction, active teardown, or deferred
+// cleanup makes Close return an error wrapping [ErrSfCleanupPending]. That is a
+// "not yet" status: return outstanding leases and retry Close while
+// errors.Is(err, ErrSfCleanupPending) holds. Every call takes a fresh lifecycle
+// snapshot after re-probing retired slots.
+//
+// Once Close returns nil, every pool-managed SF slot is free and no operation
+// can later acquire or retain its flock. Later Close calls therefore remain
+// nil. Stable errors from the one-time teardown remain reportable on every
+// call and are never replaced by a volatile snapshot.
+//
 // Avoid calling Close from inside a pooled SenderErrorHandler or
 // SenderConnectionListener. Pooled callbacks are funnelled through one
 // serializing mutex (see serializeErrorHandler), so a Close that blocks on a
@@ -436,11 +462,21 @@ func (db *QuestDB) Close(ctx context.Context) error {
 		db.queryPool.markClosing()
 		hErr := closeStep(func() error { db.housekeeper.stopAndJoin(); return nil })
 		qErr := closeStep(func() error { return db.queryPool.close(ctx) })
-		sErr := closeStep(func() error { return db.senderPool.close(ctx) })
-		// Every step ran; surface the most actionable error.
-		db.closeErr = firstCloseErr(sErr, qErr, hErr)
+		firstSenderResult := closeStep(func() error { return db.senderPool.close(ctx) })
+		db.closeQueryErr, db.closeHousekeepErr = qErr, hErr
+		// qwpSenderPool remembers ordinary teardown/poison errors itself. Keep
+		// only a facade fallback for a panic recovered outside the pool before
+		// it could record that stable result; never cache CleanupPending here.
+		if db.senderPool.stableCloseResult() == nil && firstSenderResult != nil &&
+			!errors.Is(firstSenderResult, ErrSfCleanupPending) {
+			db.closeSenderFallbackErr = firstSenderResult
+		}
 	})
-	return db.closeErr
+	sErr := closeStep(func() error { return db.senderPool.close(ctx) })
+	if db.closeSenderFallbackErr != nil {
+		sErr = errors.Join(db.closeSenderFallbackErr, sErr)
+	}
+	return firstCloseErr(sErr, db.closeQueryErr, db.closeHousekeepErr)
 }
 
 // firstCloseErr selects the most actionable teardown error, preferring the

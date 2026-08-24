@@ -269,7 +269,7 @@ func (p *qwpQueryPool) markClosing() { p.closing.Store(true) }
 // queryReapCloseHook, when non-nil, is invoked at the start of each reap-victim
 // close goroutine. Test seam only (mirrors reapCloseHook): it lets a test hold a
 // reap teardown in flight to assert close() waits for it. Nil in production.
-var queryReapCloseHook func()
+var queryReapCloseHook atomic.Pointer[func()]
 
 func (p *qwpQueryPool) reapIdle() {
 	if p.closing.Load() {
@@ -288,8 +288,8 @@ func (p *qwpQueryPool) reapIdle() {
 		wg.Add(1)
 		go func(client *QwpQueryClient) {
 			defer wg.Done()
-			if queryReapCloseHook != nil {
-				queryReapCloseHook()
+			if hook := queryReapCloseHook.Load(); hook != nil {
+				(*hook)()
 			}
 			_ = closeQueryClientGuarded(context.Background(), client)
 		}(w.client)
@@ -397,15 +397,21 @@ func (p *qwpQueryPool) close(_ context.Context) error {
 		timer.Stop()
 		p.mu.Lock()
 	}
-	if leaked := len(p.all) - len(p.available); leaked > 0 {
-		qwpEffectiveLogger(p.logger).Warn("qwp query pool: close() leaving borrowed query client(s) alive; "+
-			"each is closed when its lease is returned", "leaked", leaked)
-	}
+	// Count under the lock, log after the unlock below: the logger is the
+	// user's slog handler, and while the guarded handler absorbs a panicking
+	// one, a merely slow one here would hold p.mu for the whole call -- every
+	// borrow, return, reap and repeat close waits on that lock -- and would
+	// also delay the teardown of every available client's WebSocket.
+	leaked := len(p.all) - len(p.available)
 	toClose := append([]*qwpQueryWorker(nil), p.available...)
 	p.all = nil
 	p.available = nil
 	p.broadcastLocked()
 	p.mu.Unlock()
+	if leaked > 0 {
+		qwpEffectiveLogger(p.logger).Warn("qwp query pool: close() leaving borrowed query client(s) alive; "+
+			"each is closed when its lease is returned", "leaked", leaked)
+	}
 
 	var (
 		wg       sync.WaitGroup

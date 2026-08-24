@@ -57,8 +57,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	qdb "github.com/questdb/go-questdb-client/v4"
 )
@@ -71,8 +73,16 @@ func main() {
 		panic(err)
 	}
 	defer func() {
-		if err := db.Close(ctx); err != nil {
-			log.Printf("questdb close: %v", err)
+		for {
+			err := db.Close(ctx)
+			if errors.Is(err, qdb.ErrSfCleanupPending) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				log.Printf("questdb close: %v", err)
+			}
+			return
 		}
 	}()
 
@@ -138,7 +148,7 @@ SQL — plus a background housekeeper that closes idle and over-age connections.
 | `qdb.NewQuestDB(ctx, conf, opts...)` | `*QuestDB` | Same, with pool-tuning options. |
 | `db.BorrowSender(ctx)` | `LineSender` | Lease a sender; `Close` flushes and returns it to the pool. |
 | `db.BorrowQuery(ctx)` | `*Query` | Lease a query session; `Close` returns it. |
-| `db.Close(ctx)` | `error` | Shut down both pools and disconnect every underlying client. Idempotent. |
+| `db.Close(ctx)` | `error` | Shut down both pools and disconnect every underlying client. Idempotent. In SF mode, an outstanding lease, construction, or cleanup returns an error wrapping `qdb.ErrSfCleanupPending`: return leases and retry. Once it returns nil, every pool-managed slot is unlocked and later calls remain nil (see [Store-and-forward](#store-and-forward)). |
 
 The schema must be `ws` or `wss` — the pooled facade is QWP-only. A borrowed
 sender or query session is single-threaded; the handle itself is safe to share.
@@ -305,12 +315,14 @@ err = qs.
 `Decimal128Column` / `Decimal256Column`, and `AtNano`, plus the
 acknowledgement and observability accessors (`AwaitAckedFsn`,
 `FlushAndGetSequence`, `TotalReconnectAttempts`, `LastTerminalError`,
-`TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`).
+`TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`,
+`QuarantinedSlotPath`, `SlotLockReleased`).
 
-> This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`, and
-> `DroppedConnectionNotifications` to the `QwpSender` interface. Every built-in
-> transport is updated; this is source-breaking only for external code that
-> implements `QwpSender` directly (callers that type-assert to it are unaffected).
+> This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`,
+> `DroppedConnectionNotifications`, `QuarantinedSlotPath`, and
+> `SlotLockReleased` to the `QwpSender` interface. Every built-in transport
+> is updated; this is source-breaking only for external code that implements
+> `QwpSender` directly (callers that type-assert to it are unaffected).
 
 ### N-dimensional arrays
 
@@ -472,7 +484,7 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | `sf_dir` | unset | Group root. Setting it activates SF. |
 | `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_` only (no `.` or path separators). |
 | `sf_max_segment_bytes` | 4 MiB | Per-segment file size. |
-| `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
+| `sf_max_total_bytes` | 10 GiB | Total byte limit. The producer waits when the limit is reached. The limit includes `.corrupt` files in the slot. After an operator deletes those files, the client notices within one second. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
 | `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as (a) the poison-frame episode budget (`max_frame_rejections`) and (b) a background drainer's no-progress / durable-stall watchdog — the time a live-but-stalled adopted slot is given before it is quarantined. Setting it small speeds up the initial connect and shrinks (a); the drainer watchdog (b) is floored at 30s (×4 in durable mode) so a small value can't wrongly quarantine a slow-but-healthy slot. |
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
@@ -493,6 +505,98 @@ The same options are available programmatically: `WithSfDir`, `WithSenderId`,
 
 Without `sf_dir`, unacknowledged data lives in process memory and is lost if the
 process dies; the reconnect loop still spans transient outages.
+
+SF terminal cleanup retries transient local-storage failures indefinitely while
+the process remains alive. A persistent disk fault therefore keeps that slot's
+flock—and, for a pooled sender, its capacity reservation—until storage recovers
+or the process exits; releasing either earlier could let a new owner race files
+whose durable cleanup did not finish.
+
+On Unix, SF namespace changes are separated into directory-sync epochs: a
+dependent manifest update/removal is not allowed to become durable before the
+segment names it depends on. This protects recovery across an OS crash within
+the platform `fsync` guarantee. Windows exposes no documented, unprivileged
+equivalent of directory `fsync`; on Windows SF protects process-restart recovery
+but does not promise host-crash ordering for file creation, rename, and removal.
+Residual `.ack-watermark` and `.symbol-dict` files after a fully drained close
+are harmless restart debris and are not part of the durably-empty contract.
+
+For a pooled sender, every reserved SF index is a shutdown obligation from the
+start of construction until its flock is released. An outstanding lease,
+in-flight construction, active teardown, or deferred cleanup therefore makes
+`db.Close(ctx)` return an error wrapping `qdb.ErrSfCleanupPending`. Return every
+lease and call `db.Close(ctx)` again later: it takes a fresh lifecycle snapshot
+on every call and stops reporting the sentinel only when every record is free.
+At that point no closed-pool operation can create another obligation, so a nil
+result proves every pool-managed slot is unlocked and later calls remain nil.
+
+A standalone SF sender has no pool lifecycle ledger. Its `Close` may still
+return nil while engine cleanup releases the slot lock in the background, so a
+nil result does not on its own mean the slot is free. Ask
+`QwpSender.SlotLockReleased()` instead, and gate a reopen of the same `sf_dir` +
+`sender_id` on it:
+
+```go
+_ = sender.Close(ctx)
+if qs, ok := sender.(qdb.QwpSender); ok {
+	for !qs.SlotLockReleased() {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+```
+
+Those background retries have no deadline, so bound that loop if your shutdown
+path cannot wait on a disk that may never come back.
+
+#### Local errors from the SF path
+
+Two sentinels report local storage rather than the server, and neither is
+terminal: the rows stay pending and the same call can be retried.
+
+| Error | Raised by | Meaning |
+|---|---|---|
+| `qdb.ErrBackpressureTimeout` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | The engine had no room within `sf_append_deadline_millis`. The wire is not draining, or `sf_max_total_bytes` is too small. |
+| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | Local storage would not commit: a segment rotation that could not write its header or manifest, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
+
+Match them with `errors.Is`.
+
+#### Quarantined slots
+
+If a slot's on-disk state proves inconsistent, the sender does not delete it and
+does not try to salvage it. It preserves the whole slot directory under
+`<sf_dir>/quarantined/<sender_id>-<nanos>/`, starts fresh on an empty slot so
+ingestion continues, and reports where the bytes went:
+
+```go
+if qs, ok := sender.(qdb.QwpSender); ok {
+	if path := qs.QuarantinedSlotPath(); path != "" {
+		log.Printf("unsent rows preserved at %s", path)
+	}
+}
+```
+
+An individual unreadable segment file is preserved the same way, renamed in
+place to `<name>.sfa.corrupt`. A background drainer moves nothing and leaves the
+bytes where they are. When it gives up on the slot itself — auth failure,
+durable-ack settle exhaustion, a wedged no-progress connection, a slot whose
+recovery proved inconsistent — it writes the reason to a `.failed` file inside
+the slot, which disqualifies that slot from every later adoption. A local I/O
+fault while opening the slot (a full disk, an exhausted fd table, a mount that
+went away) says nothing about the slot's bytes, so it leaves no sentinel and the
+next foreground scan adopts the slot again.
+
+Nothing in the client ever reclaims any of this — it is the only copy of those
+rows, so deleting it is the operator's call. Left unattended, a crash loop can
+park one slot copy per cycle. `.corrupt` files inside a live slot do count
+against `sf_max_total_bytes`: when quarantined bytes exhaust the budget, no new
+segment is minted and the producer sees `qdb.ErrBackpressureTimeout` — the same
+non-terminal, retry-the-call contract as running out of space for live data.
+The manager counts these files when it opens the slot. While the byte limit
+blocks a new segment, it rescans the slot at most once per second. This means it
+notices deleted `.corrupt` files within one second without scanning on every
+1 ms poll. If a scan fails, it keeps the previous byte count. Full slot copies
+under `quarantined/` do not count toward a slot's limit. The operator owns these
+copies.
 
 ## Querying
 

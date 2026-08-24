@@ -33,7 +33,7 @@ import (
 
 // qwpPoolHousekeeper periodically reaps idle / over-age slots from both pools.
 // One per QuestDB handle. It drives no SF recovery (the Go sender
-// self-recovers; the pool binds recovery senders at construction, §4.4) — it
+// self-recovers; the pool binds recovery senders at construction) — it
 // only reaps. interval 0 disables it: start() spawns nothing and stopAndJoin
 // returns immediately.
 type qwpPoolHousekeeper struct {
@@ -103,6 +103,10 @@ func (h *qwpPoolHousekeeper) run() {
 func (h *qwpPoolHousekeeper) reapGuarded(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
+			// The daemon loop has no recover of its own, and a recover()
+			// cannot catch a second panic raised while this one unwinds. A
+			// user's slog handler must not be able to turn a survivable reap
+			// panic into a dead process.
 			qwpEffectiveLogger(h.logger).Warn("qwp pool housekeeper: reap step panicked", "panic", r)
 		}
 	}()

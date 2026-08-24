@@ -229,6 +229,10 @@ type LineSender interface {
 	// method also sends the accumulated messages.
 	//
 	// If ts.IsZero(), no timestamp is sent to the server.
+	//
+	// For QWP store-and-forward senders, an auto-flush failure matching
+	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
+	// unappended rows remain pending and may be retried on the same sender.
 	At(ctx context.Context, ts time.Time) error
 
 	// AtNow omits designated timestamp value and finalizes the ILP
@@ -238,6 +242,10 @@ type LineSender interface {
 	// If the underlying buffer reaches configured capacity or the
 	// number of buffered messages exceeds the auto-flush trigger, this
 	// method also sends the accumulated messages.
+	//
+	// For QWP store-and-forward senders, an auto-flush failure matching
+	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
+	// unappended rows remain pending and may be retried on the same sender.
 	AtNow(ctx context.Context) error
 
 	// Flush sends the accumulated messages via the underlying
@@ -249,12 +257,37 @@ type LineSender interface {
 	// batches followed by a Flush call. The optimal batch size may
 	// vary from one thousand to few thousand messages depending on
 	// the message size.
+	//
+	// For QWP store-and-forward senders, an error matching
+	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
+	// unappended rows remain pending and may be retried on the same sender.
 	Flush(ctx context.Context) error
 
 	// Close closes the underlying HTTP client.
 	//
 	// If auto-flush is enabled, the client will flush any remaining buffered
 	// messages before closing itself.
+	//
+	// A QWP store-and-forward sender does not always finish releasing its slot
+	// directory's lock before Close returns. If the segment manager is still
+	// busy, the release passes to a background goroutine that keeps retrying it
+	// with no deadline, and Close returns nil meanwhile. So a nil result does
+	// not on its own mean the slot lock is gone. Poll [QwpSender.SlotLockReleased]
+	// for that, and gate a reopen of the same sf_dir + sender_id on it: reopening
+	// earlier fails to take the lock, with an error naming this process as the
+	// holder.
+	//
+	// Pooled senders report the same thing through QuestDB.Close, which also
+	// counts every outstanding lease and in-flight construction as pending.
+	// Return every lease and keep calling QuestDB.Close while
+	// [ErrSfCleanupPending] matches. Once it returns nil, every pool-managed
+	// slot is unlocked, and later calls stay nil.
+	//
+	// A second Close reports a double-close error, so do not use it to ask
+	// whether the first one finished; that is what SlotLockReleased is for. A
+	// lease from QuestDB.BorrowSender behaves differently: closing it a second
+	// time does nothing and returns nil, because the lease borrows a pooled slot
+	// rather than owning it.
 	Close(ctx context.Context) error
 }
 
@@ -550,7 +583,10 @@ func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 // or one wired to the application's logging stack to route it there.
 func WithLogger(l *slog.Logger) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		s.logger = l
+		// Guarded at the door: every logger the client stores is wrapped in
+		// the panic-guarded handler (see qwp_log.go), so a panicking handler
+		// can never take down the goroutine behind a log call.
+		s.logger = qwpGuardLogger(l)
 	}
 }
 

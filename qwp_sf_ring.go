@@ -26,11 +26,6 @@ package questdb
 
 import (
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -44,6 +39,7 @@ const (
 	// qwpSfPayloadTooLarge: append failed because the payload doesn't
 	// fit in a fresh segment. Terminal for that frame.
 	qwpSfPayloadTooLarge int64 = -2
+	qwpSfRotationFailed  int64 = -3
 )
 
 // qwpSfErrPayloadTooLarge surfaces qwpSfPayloadTooLarge to the caller
@@ -69,7 +65,7 @@ var qwpSfErrRingClosed = errors.New("qwp/sf: ring closed")
 //   - I/O goroutine: publishedFsn (read-only), acknowledge (single
 //     writer), nextSealedAfter, firstSealed, findSegmentContaining.
 //   - Segment-manager goroutine: needsHotSpare, installHotSpare,
-//     drainTrimmable on its own cadence.
+//     peekTrimmable + drainTrimBatch on its own cadence.
 //
 // Backpressure model: appendOrFsn returns qwpSfBackpressureNoSpare
 // when the active is full and no spare is available. The caller (the
@@ -114,6 +110,8 @@ type qwpSfSegmentRing struct {
 	mu             sync.Mutex
 	sealedSegments []*qwpSfSegment
 	closed         bool
+	manifest       *qwpSfManifest
+	rotationErr    atomic.Pointer[qwpSfRingError]
 
 	// managerWakeup is invoked by the producer on rotation or
 	// high-water-mark crossings to ask the manager to provision a
@@ -131,6 +129,8 @@ type qwpSfSegmentRing struct {
 	// freshly promoted active segment gets its own one-shot backup.
 	wakeupRequestedForActive bool
 }
+
+type qwpSfRingError struct{ err error }
 
 // qwpSfNewSegmentRing creates a ring with the given segment cap and an
 // already-prepared initial active segment. The initial segment must
@@ -158,143 +158,6 @@ func qwpSfNewSegmentRing(initialActive *qwpSfSegment, maxBytesPerSegment int64) 
 	}
 	r.ackedFsn.Store(-1)
 	return r
-}
-
-// qwpSfOpenRing recovers a ring from segments already on disk in
-// sfDir. Used at sender startup when the user's previous session
-// left durable but not-yet-acked frames behind. Walks every *.sfa
-// file in the directory, opens each via qwpSfOpenSegment, and
-// arranges them by baseSeq:
-//   - Highest-baseSeq segment becomes the active.
-//   - All others become sealed segments awaiting ACK and trim.
-//
-// Returns nil if the directory is empty or contains no recognizable
-// .sfa files. A bad-content file (qwpSfErrSegmentCorrupt: bad magic,
-// unsupported version, short file, negative baseSeq) is skipped and
-// logged — a stray or hand-damaged .sfa holds no recoverable frames
-// and shouldn't take the whole sender down. Any other error from
-// qwpSfOpenSegment is a syscall/I-O failure (open/stat/mmap returning
-// EMFILE/ENFILE/ENOMEM/EACCES/EIO) on a file that may well be a valid
-// segment, and is fatal: the caller's data integrity depends on every
-// segment being readable, so recovery refuses to start rather than
-// silently amputate the durable-but-unacked log.
-func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, error) {
-	if _, err := os.Stat(sfDir); err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("qwp/sf: stat %s: %w", sfDir, err)
-	}
-	entries, err := os.ReadDir(sfDir)
-	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: read %s: %w", sfDir, err)
-	}
-	var opened []*qwpSfSegment
-	// Defense-in-depth: anything escaping the recovery body — a panic
-	// from native munmap, an OOM from a future concurrent allocator,
-	// the FSN-gap error below — must close every recovered fd+mmap
-	// before propagating. After the success path opened is reassigned
-	// to drop the active segment (transferred to the ring) and the
-	// sealed segments (transferred to ring.sealedSegments), so this
-	// cleanup is a no-op once we reach the bottom.
-	defer func() {
-		for _, s := range opened {
-			_ = s.close()
-		}
-	}()
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".sfa") {
-			continue
-		}
-		path := filepath.Join(sfDir, name)
-		seg, err := qwpSfOpenSegment(path)
-		if err != nil {
-			if errors.Is(err, qwpSfErrSegmentCorrupt) {
-				// Bad-content .sfa (bad magic/version/header/baseSeq):
-				// a stray or hand-damaged file with no recoverable
-				// frames behind it. Skip rather than fail the whole
-				// recovery, but log so the skip is never silent. This
-				// runs during on-disk recovery inside the engine
-				// constructor, before the per-sender logger is wired, so
-				// it goes to slog.Default() (an app that configures global
-				// slog still captures it).
-				qwpEffectiveLogger(nil).Warn("qwp/sf: skipping corrupt segment during recovery", "error", err)
-				continue
-			}
-			// A syscall/I-O failure (EMFILE/ENFILE/ENOMEM/EACCES/EIO)
-			// on a file that may be a perfectly valid segment: the
-			// system is under pressure, not the data corrupt. Refuse to
-			// start rather than silently amputate the log. Skipping the
-			// newest segment would drop its persisted-but-unacked frames
-			// with no FSN gap to flag it; skipping the oldest would make
-			// the engine seed ackedFsn from a surviving segment and
-			// treat the skipped frames as already-acked, so neither case
-			// ever replays. The deferred cleanup above closes whatever
-			// was opened before this point.
-			return nil, fmt.Errorf("qwp/sf: open segment %s during recovery: %w", path, err)
-		}
-		// Filter out empty leftovers — typically hot-spare segments
-		// the manager pre-allocated for a prior session that never
-		// got rotated into active. They carry the provisional
-		// baseSeq=0 and frameCount=0, which would otherwise collide
-		// with the real baseSeq=0 segment and trip the contiguity
-		// check below. No data to recover; close and unlink.
-		//
-		// CAUTION: only unlink when the file is genuinely empty past
-		// the header. If frame[0] failed CRC (bit-rot, partial-page-
-		// write at crash, etc.) but valid frames followed, scanFrames
-		// returns lastGood=HEADER_SIZE and frameCount=0 — yet
-		// tornTailBytes is non-zero. Treating that as "empty hot
-		// spare" would silently destroy every surviving frame.
-		// Quarantine to <path>.corrupt instead so a postmortem can
-		// recover what's left.
-		if seg.segmentFrameCount() == 0 {
-			torn := seg.segmentTornTailBytes()
-			_ = seg.close()
-			if torn > 0 {
-				_ = os.Rename(path, path+".corrupt")
-			} else {
-				_ = os.Remove(path)
-			}
-			continue
-		}
-		opened = append(opened, seg)
-	}
-	if len(opened) == 0 {
-		return nil, nil
-	}
-	sort.Slice(opened, func(i, j int) bool {
-		// Unsigned comparison to match Java's Long.compareUnsigned —
-		// future-proofs against baseSeq wrapping into negatives.
-		return uint64(opened[i].segmentBaseSeq()) < uint64(opened[j].segmentBaseSeq())
-	})
-	// Sanity: the recovered segments must form a contiguous FSN
-	// range. Detect gaps so a partial-write/manual-deletion mishap
-	// doesn't silently produce duplicate or missing FSNs. The deferred
-	// cleanup above handles closing on the error path.
-	for i := 1; i < len(opened); i++ {
-		prev := opened[i-1]
-		curr := opened[i]
-		expected := prev.segmentBaseSeq() + prev.segmentFrameCount()
-		if curr.segmentBaseSeq() != expected {
-			return nil, fmt.Errorf(
-				"qwp/sf: FSN gap in recovered segments: prev baseSeq=%d frameCount=%d expected next baseSeq=%d but got %d",
-				prev.segmentBaseSeq(), prev.segmentFrameCount(), expected, curr.segmentBaseSeq())
-		}
-	}
-	// The newest segment becomes the active. Even if it's full, that's
-	// OK: the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the
-	// manager installs a hot spare, the producer rotates.
-	last := len(opened) - 1
-	active := opened[last]
-	sealed := opened[:last]
-	r := qwpSfNewSegmentRing(active, maxBytesPerSegment)
-	r.sealedSegments = sealed
-	// Ownership transferred to the ring — clear opened so the deferred
-	// cleanup leaves the recovered segments alone.
-	opened = nil
-	return r, nil
 }
 
 // segmentRingAckedFsn returns the highest FSN that the server has
@@ -403,13 +266,61 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 			// than silent corruption.
 			return qwpSfPayloadTooLarge
 		}
-		// Mutate sealedSegments under the same mutex used by the
-		// snapshot accessors — the I/O thread reads through that
-		// path and must not see a half-resized slice.
+		// The rotation's two durability barriers -- this header fsync and the
+		// manifest fsync below -- run in this order, on the producer's flush,
+		// and cannot be overlapped. The header carries the base sequence the
+		// manifest is about to commit as the active one, so a crash that lands
+		// the manifest record without the header leaves the slot with no
+		// segment at its committed active base, which recovery refuses: the
+		// whole slot is quarantined over a lost write. The reverse gap costs
+		// nothing -- the manifest still names the previous active, and the new
+		// empty segment is discarded as a stray. The ordering these barriers
+		// buy is scoped to what qwpSfFsync promises: a crashed or restarted
+		// process, and on Linux a kernel crash. On darwin fsync(2) does not
+		// force the drive's own write cache (see qwp_sf_fsync_darwin.go), so a
+		// power cut can still reorder them. Together they are what
+		// BenchmarkQwpSfRotationBarriers measures, and what puts rotation at
+		// the tail of BenchmarkQwpSfPublish's latency distribution: about 47us
+		// on an APFS SSD, on however many flushes rotate.
+		if syncErr := spare.syncHeader(); syncErr != nil {
+			r.rotationErr.Store(&qwpSfRingError{err: syncErr})
+			return qwpSfRotationFailed
+		}
+		// Snapshot the current head under the sealed-list mutex, but do not
+		// hold it across the manifest fsync. The send loop takes this mutex
+		// to walk sealed segments and must remain able to send while a
+		// durability syscall is slow. A concurrent trim may advance the
+		// manifest head after this snapshot; manifest.update's monotonic
+		// clamp prevents this stale-low head from moving it backwards.
+		headBase := active.segmentBaseSeq()
+		r.mu.Lock()
+		manifest := r.manifest
+		if len(r.sealedSegments) > 0 {
+			headBase = r.sealedSegments[0].segmentBaseSeq()
+		}
+		r.mu.Unlock()
+		if manifest != nil {
+			if updateErr := manifest.update(headBase, actualBase); updateErr != nil {
+				r.rotationErr.Store(&qwpSfRingError{err: updateErr})
+				return qwpSfRotationFailed
+			}
+		}
+
+		// Publish the sealed-list mutation atomically to its readers after
+		// the durable topology update succeeds. Promoting the spare belongs
+		// in the same locked section: while the old segment sits in the
+		// sealed list and is still what r.active points at, a trim that takes
+		// the whole sealed list reads headAfterTrim's fallback and gets the
+		// base of a segment inside its own batch. It commits that base as the
+		// manifest head -- the monotonic clamp permits it, since the base
+		// moves forward -- and then unlinks the file, leaving the manifest
+		// naming a head segment that no longer exists, which recovery refuses
+		// with "missing expected SF head segment".
 		r.mu.Lock()
 		r.sealedSegments = append(r.sealedSegments, active)
-		r.mu.Unlock()
 		r.active.Store(spare)
+		r.mu.Unlock()
+		r.rotationErr.Store(nil)
 		r.hotSpare.Store(nil)
 		// The freshly promoted active has no spare behind it yet, so
 		// re-arm its one-shot backup wakeup: a later high-water-mark
@@ -468,6 +379,11 @@ func (r *qwpSfSegmentRing) segmentRingCloseInternal(leakMappings bool) error {
 	r.closed = true
 	sealed := r.sealedSegments
 	r.sealedSegments = nil
+	// Detach the manifest under the same mutex that publishes it, so the
+	// manager's service pass either sees a live manifest it may still update or
+	// sees none at all, and never reads the field while this close writes it.
+	manifest := r.manifest
+	r.manifest = nil
 	r.mu.Unlock()
 
 	var firstErr error
@@ -489,31 +405,83 @@ func (r *qwpSfSegmentRing) segmentRingCloseInternal(leakMappings bool) error {
 			firstErr = err
 		}
 	}
+	if manifest != nil {
+		if err := manifest.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	return firstErr
 }
 
-// drainTrimmable removes and returns sealed segments whose every
-// frame has been ACK'd (i.e. baseSeq + frameCount - 1 <= ackedFsn).
-// Caller takes ownership and is responsible for close() + unlinking
-// the file. Called by the segment manager off the hot path. Returns
-// nil when nothing is eligible (avoids slice allocation in the
-// steady state where most polls are no-ops).
-func (r *qwpSfSegmentRing) drainTrimmable() []*qwpSfSegment {
+// ringManifest returns the ring's manifest, or nil once the ring is closed.
+// The field is published by recovery/construction and cleared by
+// segmentRingCloseInternal, both under r.mu; every cross-goroutine read goes
+// through here.
+func (r *qwpSfSegmentRing) ringManifest() *qwpSfManifest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.manifest
+}
+
+func (r *qwpSfSegmentRing) rotationError() error {
+	if holder := r.rotationErr.Load(); holder != nil {
+		return holder.err
+	}
+	return errors.New("qwp/sf: segment rotation failed")
+}
+
+func (r *qwpSfSegmentRing) peekTrimmable() []*qwpSfSegment {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	acked := r.ackedFsn.Load()
 	var out []*qwpSfSegment
-	// Sealed segments are in baseSeq order, oldest first; once we hit
-	// one that isn't fully acked, none of the later ones can be either.
-	for len(r.sealedSegments) > 0 {
-		s := r.sealedSegments[0]
-		lastSeq := s.segmentBaseSeq() + s.segmentFrameCount() - 1
-		if lastSeq > acked {
+	for _, s := range r.sealedSegments {
+		if s.segmentBaseSeq()+s.segmentFrameCount()-1 > acked {
 			break
 		}
 		out = append(out, s)
-		r.sealedSegments = r.sealedSegments[1:]
 	}
+	return out
+}
+
+// segmentRingHoldsFrames reports whether any segment in the ring carries a
+// frame. A recovered chain whose frames were all acked and trimmed sits at a
+// positive base with nothing in it, so its published sequence says where the
+// slot got to, not whether it holds rows.
+func (r *qwpSfSegmentRing) segmentRingHoldsFrames() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.sealedSegments {
+		if s.segmentFrameCount() > 0 {
+			return true
+		}
+	}
+	if active := r.active.Load(); active != nil {
+		return active.segmentFrameCount() > 0
+	}
+	return false
+}
+
+func (r *qwpSfSegmentRing) headAfterTrim(trimCount int) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if trimCount < len(r.sealedSegments) {
+		return r.sealedSegments[trimCount].segmentBaseSeq()
+	}
+	if active := r.active.Load(); active != nil {
+		return active.segmentBaseSeq()
+	}
+	return -1
+}
+
+func (r *qwpSfSegmentRing) drainTrimBatch(count int) []*qwpSfSegment {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if count <= 0 || count > len(r.sealedSegments) {
+		return nil
+	}
+	out := r.sealedSegments[:count]
+	r.sealedSegments = r.sealedSegments[count:]
 	return out
 }
 
@@ -589,7 +557,7 @@ func (r *qwpSfSegmentRing) firstSealed() *qwpSfSegment {
 // sealedSegmentCount returns the number of sealed segments under the
 // ring mutex. Thread-safe sibling of getSealedSegments for callers
 // (e.g. tests) that observe the ring while the segment manager
-// concurrently trims via drainTrimmable.
+// concurrently trims via drainTrimBatch.
 func (r *qwpSfSegmentRing) sealedSegmentCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

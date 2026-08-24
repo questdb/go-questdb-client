@@ -61,9 +61,31 @@ func buildTestDeltaFrame(deltaStart int, syms []string) []byte {
 // persisted count, and the retry must not re-append the same symbols. Entry
 // position is the symbol id, so a duplicate would misalign every later id on
 // recovery.
+// A recovered chain that was fully trimmed holds no rows, but it sits at the
+// positive base its published sequence reached. Delta encoding stays on there:
+// there are no ids for a fresh dictionary to clash with, and a sender that
+// gave it up would send a full symbol dictionary on every frame for as long as
+// it runs, since the flag is read once when the sender is built.
+func TestQwpDeltaDictStaysOnForAFullyTrimmedSlot(t *testing.T) {
+	dir := t.TempDir()
+	// An empty active segment at a positive base with matching manifest
+	// boundaries is what a completed rotation plus a full trim leaves behind.
+	seg := createRecoverySegment(t, dir, "sf-active.sfa", 5)
+	createRecoveryManifest(t, dir, 5, 5, seg)
+	closeRecoverySegments(t, seg)
+
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	require.Equal(t, int64(4), engine.enginePublishedFsn(), "the slot keeps its sequence frontier")
+	require.NotNil(t, engine.enginePersistedSymbolDict(), "an empty slot keeps delta encoding available")
+}
+
 func TestQwpPersistNewSymbolsNoDuplicateOnRetry(t *testing.T) {
 	dir := t.TempDir()
-	d := qwpSfSymbolDictOpen(dir)
+	d, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.NotNil(t, d)
 
 	s := &qwpLineSender{
@@ -83,13 +105,15 @@ func TestQwpPersistNewSymbolsNoDuplicateOnRetry(t *testing.T) {
 	require.Equal(t, 3, d.size(), "retry must not duplicate persisted symbols")
 	require.NoError(t, d.close())
 
-	re := qwpSfSymbolDictOpen(dir)
+	re, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.Equal(t, []string{"AAPL", "GOOG", "MSFT"}, re.loadedSymbols())
 	require.NoError(t, re.close())
 }
 
 func TestQwpPersistFailureDisablesProducerDeltaForRetry(t *testing.T) {
-	d := qwpSfSymbolDictOpen(t.TempDir())
+	d, err := qwpSfSymbolDictOpen(t.TempDir())
+	require.NoError(t, err)
 	require.NotNil(t, d)
 	// Close the underlying file but keep the dictionary object in use, so the
 	// next write fails the way a disk problem mid-run would.
@@ -102,7 +126,7 @@ func TestQwpPersistFailureDisablesProducerDeltaForRetry(t *testing.T) {
 		deltaDictEnabled:    true,
 	}
 
-	err := s.persistNewSymbols()
+	err = s.persistNewSymbols()
 	require.ErrorContains(t, err, "switched to full-dictionary mode")
 	require.False(t, s.deltaDictEnabled)
 	require.Equal(t, 0, d.size(), "failed write must not advance the durable id count")
@@ -263,7 +287,8 @@ func TestQwpEngineRecoveryHealsChecksummedDictFromSurvivingFrames(t *testing.T) 
 		"the ids recovered from frames must be written back before those frames are trimmed")
 	require.NoError(t, recovered.engineClose())
 
-	reopened := qwpSfSymbolDictOpen(dir)
+	reopened, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.NotNil(t, reopened)
 	require.Equal(t, []string{"AAPL", "MSFT"}, reopened.loadedSymbols())
 	require.NoError(t, reopened.close())
@@ -303,6 +328,7 @@ func TestQwpAnalyzeRecoveredDictAckedGapReset(t *testing.T) {
 	// restart that follows it comes too late.
 	_, err = qwpSfAnalyzeRecoveredDict(ring, -1, nil)
 	require.ErrorContains(t, err, "resend required")
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
 }
 
 func TestQwpEngineRecoveryMissingDictRejectsUnackedGap(t *testing.T) {
@@ -315,8 +341,14 @@ func TestQwpEngineRecoveryMissingDictRejectsUnackedGap(t *testing.T) {
 	require.NoError(t, os.Remove(filepath.Join(dir, qwpSfSymbolDictFileName)))
 
 	recovered, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
-	require.ErrorContains(t, err, "resend required")
-	require.Nil(t, recovered)
+	require.NoError(t, err)
+	require.NotNil(t, recovered)
+	require.Equal(t, int64(-1), recovered.enginePublishedFsn(), "the replacement slot must start empty")
+	quarantined := recovered.engineQuarantinedSlotPath()
+	require.NotEmpty(t, quarantined)
+	require.FileExists(t, filepath.Join(quarantined, "sf-initial.sfa"),
+		"the byte-proven inconsistent slot must be preserved for inspection")
+	require.NoError(t, recovered.engineClose())
 }
 
 // TestQwpEngineRecoveryCorruptDictFallsBackToSurvivingFrames pins the two

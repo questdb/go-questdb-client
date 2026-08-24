@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"math"
 	"os"
 	"sync/atomic"
@@ -50,10 +51,11 @@ import (
 //	                                                              [payloadLen bytes]
 //	crc32c covers (payloadLen, payload).
 const (
-	qwpSfFileMagic       uint32 = 0x31304653 // 'SF01' little-endian on disk
-	qwpSfFrameHeaderSize int64  = 8          // u32 crc + u32 payloadLen
-	qwpSfHeaderSize      int64  = 24         // total file header
-	qwpSfSegmentVersion  byte   = 1
+	qwpSfFileMagic            uint32 = 0x31304653 // 'SF01' little-endian on disk
+	qwpSfFrameHeaderSize      int64  = 8          // u32 crc + u32 payloadLen
+	qwpSfHeaderSize           int64  = 24         // total file header
+	qwpSfSegmentVersion       byte   = 1
+	qwpSfManifestRequiredFlag byte   = 0x01
 )
 
 // qwpSfCrcTable is the CRC32C (Castagnoli) polynomial table shared
@@ -78,16 +80,15 @@ var qwpSfErrLockBusy = errors.New("qwp/sf: lock busy")
 var qwpSfErrSegmentFull = errors.New("qwp/sf: segment full")
 
 // qwpSfErrSegmentCorrupt marks a segment file whose *content* is not a
-// valid SF segment: a file shorter than the header, bad magic, an
-// unsupported version, or a negative baseSeq. qwpSfOpenSegment wraps
-// these with this sentinel so qwpSfOpenRing can tell them apart from
+// valid SF segment: a file shorter than the header, bad magic, or a
+// negative baseSeq. qwpSfOpenSegment wraps these with this sentinel so
+// qwpSfRecoverRing can tell them apart from
 // syscall/I-O failures (open/stat/mmap returning EMFILE/ENFILE/ENOMEM/
 // EACCES/EIO), which it propagates unwrapped. The distinction is
-// load-bearing for crash recovery: a corrupt file holds no recoverable
-// frames and is skipped, whereas an I-O failure means an otherwise-valid
-// segment is merely unreadable right now (the system is under pressure),
-// so recovery must refuse to start rather than silently amputate the
-// durable-but-unacked log.
+// load-bearing for crash recovery: corruption quarantine is deferred until
+// manifest boundaries prove the file is not part of the committed chain. An
+// I/O failure means an otherwise-valid segment is merely unreadable right now,
+// so recovery aborts without quarantining anything.
 //
 //lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 var qwpSfErrSegmentCorrupt = errors.New("qwp/sf: corrupt segment file")
@@ -151,8 +152,19 @@ type qwpSfSegment struct {
 	// segments and for cleanly partially-filled segments (uninitialised
 	// tail). Set only by qwpSfOpenSegment; visible to recovery callers
 	// for diagnostics. Final after construction.
-	tornTailBytes int64
+	tornTailBytes     int64
+	tornTailSanitized bool
+	// manifestRequiredSynced is process-local evidence that this object has
+	// completed the durability barrier for an observed manifest-required flag.
+	// A reopened object starts false even when the mapped flag is set: another
+	// process may have died after pwrite made the flag page-cache-visible but
+	// before its msync/fsync completed.
+	manifestRequiredSynced bool
 }
+
+// qwpSfTestSegmentCreateHook is a test seam for holding the manager inside a
+// worker-reachable filesystem operation. Production leaves it nil.
+var qwpSfTestSegmentCreateHook atomic.Pointer[func(path string)]
 
 // qwpSfCreateSegment creates a fresh segment file at path,
 // pre-allocating exactly sizeBytes and mmapping it RW. The 24-byte
@@ -174,6 +186,9 @@ func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, e
 	if sizeBytes < qwpSfHeaderSize+qwpSfFrameHeaderSize+1 {
 		return nil, fmt.Errorf("qwp/sf: sizeBytes too small for header + one minimal frame: %d", sizeBytes)
 	}
+	if hook := qwpSfTestSegmentCreateHook.Load(); hook != nil {
+		(*hook)(path)
+	}
 	// O_TRUNC discards any prior content at the same path — segment
 	// files are write-once-then-fixed, so reusing a stale file is
 	// always an error in the recovery code path; here, on a fresh
@@ -183,18 +198,18 @@ func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, e
 	// immediately beyond EOF) needs in order to cover [0, sizeBytes).
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: openCleanRW %s: %w", path, err)
+		return nil, qwpSfDurabilityError("create segment", path, err)
 	}
 	if err := qwpSfAllocate(f, sizeBytes); err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return nil, err
+		return nil, qwpSfDurabilityError("allocate segment", path, err)
 	}
 	buf, err := qwpSfMmapRW(f, sizeBytes)
 	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return nil, err
+		return nil, qwpSfDurabilityError("map created segment", path, err)
 	}
 	s := &qwpSfSegment{
 		path:         path,
@@ -238,25 +253,31 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 // it RW, validates the header magic / version, then scans frames
 // forward verifying each CRC. The first bad CRC (or a frame whose
 // declared length runs past the file end) is treated as a torn tail;
-// both cursors are positioned at the start of that frame. Returns the
-// segment ready for further appends.
+// both cursors are positioned at the start of that frame. Recovery durably
+// zeroes a validated active tail before making the segment appendable.
 //
 // If recovery observes a torn tail (bytes at the bail-out position
 // are non-zero, indicating an attempted-but-failed frame write), the
 // byte count is exposed via tornTailBytes() so operators can detect
 // silent truncation from corruption or partial writes.
 //
-// Errors are classified for the recovery caller (qwpSfOpenRing): a
-// bad-content file (short file, bad magic, unsupported version,
-// negative baseSeq) is wrapped with qwpSfErrSegmentCorrupt and is safe
-// to skip; a syscall/I-O failure from stat/open/mmap (EMFILE, ENFILE,
-// ENOMEM, EACCES, EIO, ...) is propagated unwrapped, because the file
-// may be a perfectly valid segment that is merely unreadable under
-// resource pressure and must not be silently dropped from the log.
+// Errors are classified for qwpSfRecoverRing. Short files, bad magic, and
+// negative baseSeq are corruption evidence whose quarantine is deferred until
+// the manifest decision tree validates the surviving chain. Syscall and I/O
+// failures are operational errors: the bytes may be intact and the same slot
+// recovers once the fault clears.
+//
+// An unsupported version fails the whole slot closed. It is not corruption —
+// the frames may be perfectly good ones a newer client wrote — so renaming the
+// file to .corrupt and migrating the rest of the chain would drop rows that are
+// still on disk. It is not operational either, because no later attempt by this
+// build can read it. Failing closed is what preserves the entire slot under
+// <sf_dir>/quarantined/ and lets the foreground sender start a fresh one, so
+// ingestion continues and a newer client can still be pointed at the bytes.
 func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	st, err := os.Stat(path)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: stat %s: %w", path, err)
+		return nil, qwpSfDurabilityError("stat segment", path, err)
 	}
 	fileSize := st.Size()
 	if fileSize < qwpSfHeaderSize {
@@ -264,12 +285,12 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: openRW %s: %w", path, err)
+		return nil, qwpSfDurabilityError("open segment", path, err)
 	}
 	buf, err := qwpSfMmapRW(f, fileSize)
 	if err != nil {
 		_ = f.Close()
-		return nil, err
+		return nil, qwpSfDurabilityError("map segment", path, err)
 	}
 	magic := binary.LittleEndian.Uint32(buf[0:4])
 	if magic != qwpSfFileMagic {
@@ -281,7 +302,8 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	if version != qwpSfSegmentVersion {
 		_ = qwpSfMunmap(buf)
 		_ = f.Close()
-		return nil, fmt.Errorf("%w: unsupported version in %s: %d", qwpSfErrSegmentCorrupt, path, version)
+		return nil, qwpSfFailClosed("unsupported segment version in %s: %d (this build writes version %d)",
+			path, version, qwpSfSegmentVersion)
 	}
 	baseSeq := int64(binary.LittleEndian.Uint64(buf[8:16]))
 	// FSNs are non-negative by construction. A negative baseSeq on disk
@@ -319,7 +341,7 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 func (s *qwpSfSegment) writeHeader(baseSeq int64) {
 	binary.LittleEndian.PutUint32(s.buf[0:4], qwpSfFileMagic)
 	s.buf[4] = qwpSfSegmentVersion
-	s.buf[5] = 0 // flags
+	s.buf[5] = 0                                 // flags
 	binary.LittleEndian.PutUint16(s.buf[6:8], 0) // reserved
 	binary.LittleEndian.PutUint64(s.buf[8:16], uint64(baseSeq))
 	binary.LittleEndian.PutUint64(s.buf[16:24], uint64(time.Now().UnixMicro()))
@@ -385,6 +407,235 @@ func (s *qwpSfSegment) rebaseSeq(newBaseSeq int64) error {
 	}
 	s.baseSeq = newBaseSeq
 	binary.LittleEndian.PutUint64(s.buf[8:16], uint64(newBaseSeq))
+	return nil
+}
+
+func (s *qwpSfSegment) segmentManifestRequired() bool {
+	return s != nil && !s.memoryBacked && len(s.buf) >= int(qwpSfHeaderSize) && s.buf[5]&qwpSfManifestRequiredFlag != 0
+}
+
+func (s *qwpSfSegment) markManifestRequired() error {
+	if s == nil || s.memoryBacked {
+		return nil
+	}
+	if s.segmentManifestRequired() {
+		if s.manifestRequiredSynced {
+			return nil
+		}
+		// Visibility in a reopened mapping is not durability evidence: pwrite
+		// updates the shared page cache before fsync, and that cache outlives a
+		// process. Revalidate the barrier once per opened object before recovery
+		// trusts an already-set flag.
+		if err := s.syncHeader(); err != nil {
+			return err
+		}
+		s.manifestRequiredSynced = true
+		return nil
+	}
+	previous := [1]byte{s.buf[5]}
+	flag := [1]byte{s.buf[5] | qwpSfManifestRequiredFlag}
+	if err := s.writeRecoveryAt(flag[:], 5, "mark manifest-required"); err != nil {
+		return err
+	}
+	if err := s.syncHeader(); err != nil {
+		// writeRecoveryAt successfully established backing before it changed the
+		// mapping, so restoring the old byte cannot fault. Keeping the shared
+		// page-cache view unflagged makes another object retry. A process that
+		// dies before this rollback can leave the new flag visible, so reopened
+		// objects independently resync every observed flag above.
+		s.restoreRecoveryMappingAfterFailedSync(previous[:], 5)
+		return err
+	}
+	s.manifestRequiredSynced = true
+	return nil
+}
+
+// qwpSfTestSegmentSyncHeaderHook counts header flushes, so tests can pin one
+// cross-process revalidation barrier per reopened flagged segment and no
+// redundant barrier on repeated calls through the same object. Production
+// leaves it nil.
+var qwpSfTestSegmentSyncHeaderHook atomic.Pointer[func(path string)]
+
+// qwpSfTestSegmentSyncHeaderErrorHook injects a header-sync failure after the
+// descriptor mutation and before msync. Production leaves it nil.
+var qwpSfTestSegmentSyncHeaderErrorHook atomic.Pointer[func(path string) error]
+
+func (s *qwpSfSegment) syncHeader() error {
+	if s == nil || s.memoryBacked {
+		return nil
+	}
+	if hook := qwpSfTestSegmentSyncHeaderHook.Load(); hook != nil {
+		(*hook)(s.path)
+	}
+	if hook := qwpSfTestSegmentSyncHeaderErrorHook.Load(); hook != nil {
+		if err := (*hook)(s.path); err != nil {
+			return qwpSfDurabilityError("sync segment header", s.path, err)
+		}
+	}
+	if err := qwpSfMsync(s.buf, qwpSfHeaderSize); err != nil {
+		return qwpSfDurabilityError("msync segment header", s.path, err)
+	}
+	if err := qwpSfFsync(s.file); err != nil {
+		return qwpSfDurabilityError("fsync segment header", s.path, err)
+	}
+	return nil
+}
+
+// qwpSfZeroFillChunk bounds the scratch buffer reserveTailBlocks writes
+// through the file descriptor.
+const qwpSfZeroFillChunk = 64 << 10
+
+// qwpSfSegmentWriteAt is the descriptor-write seam for recovery mutation.
+// Tests swap it to inject ENOSPC and short writes without filling a filesystem.
+var qwpSfSegmentWriteAt = qwpSfSwappable(func(f *os.File, p []byte, off int64) (int, error) {
+	return f.WriteAt(p, off)
+})
+
+// writeRecoveryAt is the only way recovery changes an existing segment's
+// mapped bytes. The descriptor write comes first so the kernel either backs the
+// affected page or returns an ordinary I/O error. The mapped view is updated
+// only after a complete write, keeping platforms without descriptor/mmap cache
+// coherence in step without exposing an unbacked-page store.
+func (s *qwpSfSegment) writeRecoveryAt(data []byte, off int64, op string) error {
+	if s == nil || s.memoryBacked || len(data) == 0 {
+		return nil
+	}
+	if s.file == nil || off < 0 || off > s.sizeBytes-int64(len(data)) {
+		return qwpSfDurabilityError(
+			fmt.Sprintf("%s outside segment bounds at offset %d length %d", op, off, len(data)),
+			s.path,
+			nil,
+		)
+	}
+	written, err := qwpSfSegmentWriteAt.load()(s.file, data, off)
+	if err != nil {
+		return qwpSfDurabilityError(fmt.Sprintf("%s at offset %d", op, off), s.path, err)
+	}
+	if written != len(data) {
+		return qwpSfDurabilityError(
+			fmt.Sprintf("%s at offset %d: wrote %d of %d bytes", op, off, written, len(data)),
+			s.path,
+			io.ErrShortWrite,
+		)
+	}
+	copy(s.buf[off:off+int64(len(data))], data)
+	return nil
+}
+
+// restoreRecoveryMappingAfterFailedSync rolls back only the shared mapped view
+// after writeRecoveryAt succeeded but the durability barrier did not. The
+// successful descriptor write is the precondition: it established backing for
+// every page this method touches, so the rollback itself cannot SIGBUS. The old
+// value need not become durable; it only prevents a same-host reopen from
+// mistaking a dirty, unsynced new value for committed state.
+func (s *qwpSfSegment) restoreRecoveryMappingAfterFailedSync(data []byte, off int64) {
+	copy(s.buf[off:off+int64(len(data))], data)
+}
+
+// reserveTailBlocks zeroes [from, to) through the file descriptor while
+// preserving one non-zero byte as durable retry evidence. The range can sit
+// over a hole: qwpSfAllocate falls back to a sparse extend on filesystems whose
+// reservation primitive reports EOPNOTSUPP, and the "other unix" build has no
+// primitive at all. A store into an unbacked page of a full disk raises SIGBUS,
+// which kills the process outright and is beyond the reach of recover().
+func (s *qwpSfSegment) reserveTailBlocks(from, to, markerOff int64, marker byte) error {
+	if to <= from {
+		return nil
+	}
+	chunk := to - from
+	if chunk > qwpSfZeroFillChunk {
+		chunk = qwpSfZeroFillChunk
+	}
+	zeros := make([]byte, chunk)
+	for off := from; off < to; {
+		n := to - off
+		if n > chunk {
+			n = chunk
+		}
+		markerIndex := int64(-1)
+		if markerOff >= off && markerOff < off+n {
+			markerIndex = markerOff - off
+			zeros[markerIndex] = marker
+		}
+		if err := s.writeRecoveryAt(zeros[:n], off, "reserve blocks for torn tail"); err != nil {
+			if markerIndex >= 0 {
+				zeros[markerIndex] = 0
+			}
+			return err
+		}
+		if markerIndex >= 0 {
+			zeros[markerIndex] = 0
+		}
+		off += n
+	}
+	return nil
+}
+
+// qwpSfTestSegmentSanitizeTailSyncErrorHook injects a failure at one of the
+// named torn-tail durability phases. Production leaves it nil.
+var qwpSfTestSegmentSanitizeTailSyncErrorHook atomic.Pointer[func(path, phase string) error]
+
+func (s *qwpSfSegment) syncSanitizedTail(phase string) error {
+	if hook := qwpSfTestSegmentSanitizeTailSyncErrorHook.Load(); hook != nil {
+		if err := (*hook)(s.path, phase); err != nil {
+			return qwpSfDurabilityError("sync "+phase+" torn tail", s.path, err)
+		}
+	}
+	if err := qwpSfMsync(s.buf, s.sizeBytes); err != nil {
+		return qwpSfDurabilityError("msync "+phase+" torn tail", s.path, err)
+	}
+	if err := qwpSfFsync(s.file); err != nil {
+		return qwpSfDurabilityError("fsync "+phase+" torn tail", s.path, err)
+	}
+	return nil
+}
+
+func (s *qwpSfSegment) sanitizeTornTail() error {
+	if s == nil || s.memoryBacked || s.tornTailBytes == 0 || s.tornTailSanitized {
+		return nil
+	}
+	if s.appendCursor != s.sizeBytes-s.tornTailBytes {
+		return fmt.Errorf("qwp/sf: torn-tail cursor mismatch in %s: cursor=%d expected=%d", s.path, s.appendCursor, s.sizeBytes-s.tornTailBytes)
+	}
+	markerOff := int64(-1)
+	var marker byte
+	for off := s.appendCursor; off < s.sizeBytes; off++ {
+		if s.buf[off] != 0 {
+			markerOff = off
+			marker = s.buf[off]
+			break
+		}
+	}
+	if markerOff < 0 {
+		return fmt.Errorf("qwp/sf: torn tail in %s has no non-zero retry marker", s.path)
+	}
+	// First make the original non-zero evidence durable. Then zero and back the
+	// whole tail through the descriptor while preserving that byte, and sync the
+	// result. A later-chunk failure or process death therefore leaves recovery a
+	// durable reason to retry, never a deceptively clean sparse tail.
+	if err := s.syncSanitizedTail("pending-marker"); err != nil {
+		return err
+	}
+	if err := s.reserveTailBlocks(s.appendCursor, s.sizeBytes, markerOff, marker); err != nil {
+		return err
+	}
+	if err := s.syncSanitizedTail("backed-tail"); err != nil {
+		return err
+	}
+	// Only after every appendable byte is durably backed may the retry marker be
+	// cleared. If this last barrier fails, restore the marker in the shared view.
+	// A process death before that rollback can expose a clean tail, but the
+	// preceding backed-tail barrier has already made mmap append safe.
+	zero := [1]byte{}
+	if err := s.writeRecoveryAt(zero[:], markerOff, "clear torn-tail retry marker"); err != nil {
+		return err
+	}
+	if err := s.syncSanitizedTail("cleared-marker"); err != nil {
+		s.restoreRecoveryMappingAfterFailedSync([]byte{marker}, markerOff)
+		return err
+	}
+	s.tornTailSanitized = true
+	s.tornTailBytes = 0
 	return nil
 }
 
@@ -552,12 +803,8 @@ func qwpSfDetectTornTail(buf []byte, lastGood, fileSize int64) int64 {
 	if lastGood >= fileSize {
 		return 0
 	}
-	probe := qwpSfFrameHeaderSize
-	if fileSize-lastGood < probe {
-		probe = fileSize - lastGood
-	}
-	for i := int64(0); i < probe; i++ {
-		if buf[lastGood+i] != 0 {
+	for i := lastGood; i < fileSize; i++ {
+		if buf[i] != 0 {
 			return fileSize - lastGood
 		}
 	}

@@ -30,7 +30,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // qwpSfLockFileName is the per-slot lock file name. One lock file per
@@ -78,6 +80,10 @@ type qwpSfSlotLock struct {
 	file     *os.File
 }
 
+// qwpSfTestBeforeFlockReleaseHook injects a retryable release failure before
+// the lock fd is closed. Production leaves it nil.
+var qwpSfTestBeforeFlockReleaseHook atomic.Pointer[func() error]
+
 // qwpSfAcquireSlotLock creates slotDir if needed, opens
 // `<slotDir>/.lock`, and acquires an exclusive flock on it. On
 // contention, reads the existing PID payload from the .lock.pid
@@ -87,23 +93,36 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 		return nil, errors.New("qwp/sf: slotDir must not be empty")
 	}
 	if err := os.MkdirAll(slotDir, 0o755); err != nil {
-		return nil, fmt.Errorf("qwp/sf: could not create slot dir %s: %w", slotDir, err)
+		return nil, qwpSfDurabilityError("create slot directory", slotDir, err)
 	}
 	lockPath := filepath.Join(slotDir, qwpSfLockFileName)
 	pidPath := filepath.Join(slotDir, qwpSfLockPidFileName)
 	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: could not open slot lock file %s: %w", lockPath, err)
+		return nil, qwpSfDurabilityError("open slot lock file", lockPath, err)
 	}
 	if err := qwpSfFlockExclusive(f); err != nil {
 		holder := qwpSfReadHolder(pidPath)
 		_ = f.Close()
 		if errors.Is(err, qwpSfErrLockBusy) {
+			if holder == qwpSfSelfHolder() {
+				// Close hands terminal cleanup to the segment manager worker
+				// whenever the manager has not gone quiet, and returns before a
+				// retry owner has released the flock. Reopening the slot in that
+				// window is the common way to land here, and blaming another
+				// process would send the reader hunting for one that does not
+				// exist.
+				return nil, fmt.Errorf(
+					"%w: slot lock is recorded as held by this process [slot=%s, holder=%s]; "+
+						"a sender for this slot has not finished releasing it — Close can return "+
+						"while a background retry owner still holds the lock. Retry the open",
+					qwpSfErrLockBusy, slotDir, holder)
+			}
 			return nil, fmt.Errorf(
-				"qwp/sf: slot already in use by another process [slot=%s, holder=%s]",
-				slotDir, holder)
+				"%w: slot already in use by another process [slot=%s, holder=%s]",
+				qwpSfErrLockBusy, slotDir, holder)
 		}
-		return nil, err
+		return nil, qwpSfDurabilityError("acquire slot lock", lockPath, err)
 	}
 	qwpSfWritePid(pidPath)
 	return &qwpSfSlotLock{
@@ -111,6 +130,12 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 		lockPath: lockPath,
 		file:     f,
 	}, nil
+}
+
+// qwpSfSelfHolder renders this process in the same shape qwpSfReadHolder
+// returns, so a busy lock whose sidecar names us is recognisable.
+func qwpSfSelfHolder() string {
+	return "pid=" + strconv.Itoa(os.Getpid())
 }
 
 // qwpSfReadHolder reads the PID payload of an existing .lock.pid
@@ -162,6 +187,11 @@ func (l *qwpSfSlotLock) slotPath() string {
 func (l *qwpSfSlotLock) close() error {
 	if l == nil || l.file == nil {
 		return nil
+	}
+	if hook := qwpSfTestBeforeFlockReleaseHook.Load(); hook != nil {
+		if err := (*hook)(); err != nil {
+			return err
+		}
 	}
 	err := l.file.Close()
 	l.file = nil

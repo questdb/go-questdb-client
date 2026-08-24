@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"context"
 	"log/slog"
 	"runtime"
 	"strconv"
@@ -468,16 +469,18 @@ func (d *qwpSfErrorDispatcher) totalDelivered() int64 {
 // rejection must never vanish just because no handler was registered. The
 // caller's logger controls the sink; nil resolves to slog.Default().
 func newDefaultSenderErrorHandler(logger *slog.Logger) SenderErrorHandler {
-	l := qwpEffectiveLogger(logger)
 	return func(e *SenderError) {
 		if e == nil {
 			return
 		}
+		// The resolved logger carries the panic-guarded handler, and the
+		// dispatcher that delivers this already recovers a panicking handler,
+		// so this is defense in depth.
+		level := slog.LevelWarn
 		if e.AppliedPolicy == PolicyTerminal {
-			l.Error("qwp/sf: server rejection", "error", e)
-		} else {
-			l.Warn("qwp/sf: server rejection", "error", e)
+			level = slog.LevelError
 		}
+		qwpEffectiveLogger(logger).Log(context.Background(), level, "qwp/sf: server rejection", "error", e)
 	}
 }
 

@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 )
@@ -185,16 +186,18 @@ type SenderConnectionListener func(SenderConnectionEvent)
 // so a flapping or unreachable server is never silent. The caller's logger
 // controls the sink; nil resolves to slog.Default().
 func newDefaultSenderConnectionListener(logger *slog.Logger) SenderConnectionListener {
-	l := qwpEffectiveLogger(logger)
 	return func(e SenderConnectionEvent) {
+		// The resolved logger carries the panic-guarded handler, and the
+		// dispatcher that delivers this already recovers a panicking listener,
+		// so this is defense in depth rather than the only boundary.
+		level := slog.LevelInfo
 		switch e.Kind {
 		case SenderAuthFailed:
-			l.Error("qwp: connection event", "event", e)
+			level = slog.LevelError
 		case SenderDisconnected, SenderEndpointAttemptFailed, SenderAllEndpointsUnreachable:
-			l.Warn("qwp: connection event", "event", e)
-		default:
-			l.Info("qwp: connection event", "event", e)
+			level = slog.LevelWarn
 		}
+		qwpEffectiveLogger(logger).Log(context.Background(), level, "qwp: connection event", "event", e)
 	}
 }
 

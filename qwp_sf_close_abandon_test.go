@@ -26,12 +26,35 @@ package questdb
 
 import (
 	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
+
+func waitQwpSfCloseRetryOwner(t *testing.T, engine *qwpSfCursorEngine) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		engine.closeRetryWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("terminal cleanup retry owner did not exit")
+	}
+}
 
 // TestQwpSfSegmentCloseLeakMappingKeepsBuf pins that closeInternal(true) leaves
 // a disk-backed segment's mmap mapped and its buf reference intact, so a
@@ -49,6 +72,836 @@ func TestQwpSfSegmentCloseLeakMappingKeepsBuf(t *testing.T) {
 
 	// Release the deliberately-leaked mapping so the test does not leak it.
 	require.NoError(t, qwpSfMunmap(seg.buf))
+}
+
+func TestQwpSenderRepeatedCloseRetriesFlockRelease(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	injected := errors.New("injected flock release failure")
+	calls := 0
+	flockHook := func() error {
+		calls++
+		if calls == 1 {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	t.Cleanup(func() { qwpSfTestBeforeFlockReleaseHook.Store(nil) })
+
+	require.ErrorIs(t, engine.engineClose(), injected)
+	require.False(t, engine.engineCloseCompleted())
+	_, err = qwpSfAcquireSlotLock(dir)
+	require.Error(t, err, "failed release must retain the flock")
+
+	// Model the public sender after its first Close has already run: the repeat
+	// call must reach ownerless engine cleanup instead of returning the ordinary
+	// double-close error. A real close publishes reader quiescence through
+	// closeEngineGuarded on its way in, and the repeat path acts only once that
+	// is on record, so a caller arriving while the first Close is still
+	// draining cannot tear down a live send loop.
+	sender := &qwpLineSender{cursorEngine: engine}
+	sender.closed.Store(true)
+	engine.cleanup.markReadersQuiesced(false)
+	require.NoError(t, sender.Close(context.Background()))
+	require.True(t, engine.engineCloseCompleted())
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSenderForegroundCloseStartsTerminalCleanupRetryOwner(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, nil,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected reconnect")
+		}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+
+	injected := errors.New("injected first flock release failure")
+	calls := atomic.Int32{}
+	flockHook := func() error {
+		if calls.Add(1) == 1 {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	t.Cleanup(func() {
+		qwpSfTestBeforeFlockReleaseHook.Store(nil)
+		_ = engine.engineClose()
+	})
+
+	require.ErrorIs(t, sender.Close(context.Background()), injected)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond,
+		"foreground Close must leave an owner retrying terminal cleanup")
+	require.GreaterOrEqual(t, calls.Load(), int32(2))
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+// TestQwpSenderEnginePreClaimPanicStillClosesDrainerPoolAndRetries pins the
+// owning close stack: once the foreground sender owns an orphan-drainer pool,
+// an engine fault before manager quiescence is published must not bypass pool
+// cancellation. The same fault leaves cleanup at open, so Close must also
+// install the standalone retry owner that re-drives manager teardown and
+// eventually releases the foreground slot flock.
+func TestQwpSenderEnginePreClaimPanicStillClosesDrainerPoolAndRetries(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, nil,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected reconnect")
+		}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+	pool := qwpSfNewDrainerPool(1)
+	sender.drainerPool = pool
+
+	oldInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
+	var injected atomic.Bool
+	hook := func(point qwpSfCleanupTestPoint) {
+		if point == qwpSfCleanupTestBeforeManagerStop && injected.CompareAndSwap(false, true) {
+			panic("injected engine pre-claim panic")
+		}
+	}
+	qwpSfTestCleanupHook.Store(&hook)
+	t.Cleanup(func() {
+		qwpSfTestCleanupHook.Store(nil)
+		qwpSfCloseRetryInterval.store(oldInterval)
+		pool.drainerPoolClose()
+		_ = engine.engineClose()
+	})
+
+	var (
+		closeErr   error
+		closePanic any
+	)
+	func() {
+		defer func() { closePanic = recover() }()
+		closeErr = sender.Close(context.Background())
+	}()
+	require.Nil(t, closePanic, "an engine-close panic must be converted at its phase boundary")
+	require.ErrorContains(t, closeErr, "engine close panicked")
+	select {
+	case <-pool.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("engine-close panic skipped drainer-pool cancellation")
+	}
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond,
+		"engine pre-claim panic must leave one owner re-driving cleanup")
+	waitQwpSfCloseRetryOwner(t, engine)
+
+	lock, lockErr := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, lockErr, "the retry owner must eventually release the foreground slot flock")
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSenderDrainerPoolPanicKeepsEarlierErrorAndCancels(t *testing.T) {
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, nil,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected reconnect")
+		}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+	pool := qwpSfNewDrainerPool(1)
+	sender.drainerPool = pool
+	earlierErr := errors.New("earlier close failure")
+	sender.lastErr = earlierErr
+
+	orphanDir := t.TempDir()
+	orphanEngine, err := qwpSfNewCursorEngine(orphanDir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = orphanEngine.engineAppendBlocking(context.Background(), []byte("orphan frame"))
+	require.NoError(t, err)
+	require.NoError(t, orphanEngine.engineClose())
+	dialEntered := make(chan struct{})
+	blockingFactory := func(ctx context.Context, _ int) (*qwpTransport, error) {
+		close(dialEntered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	drainer := qwpSfNewOrphanDrainer(
+		orphanDir, 4096, qwpSfUnlimitedTotalBytes,
+		blockingFactory, nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	require.NoError(t, pool.drainerPoolSubmit(context.Background(), drainer))
+	select {
+	case <-dialEntered:
+	case <-time.After(time.Second):
+		t.Fatal("orphan drainer did not acquire its slot and enter the blocking dial")
+	}
+
+	boom := func() { panic("injected drainer pool panic") }
+	qwpTestDrainerPoolCloseHook.Store(&boom)
+	t.Cleanup(func() {
+		qwpTestDrainerPoolCloseHook.Store(nil)
+		pool.drainerPoolClose()
+		_ = engine.engineClose()
+	})
+
+	closeErr := sender.Close(context.Background())
+	require.ErrorIs(t, closeErr, earlierErr,
+		"a later drainer failure must not replace the first user-facing error")
+	require.ErrorContains(t, closeErr, "drainer pool close panicked")
+	select {
+	case <-pool.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("a drainer-pool panic skipped its installed cancellation")
+	}
+	drainersDone := make(chan struct{})
+	go func() {
+		pool.wg.Wait()
+		close(drainersDone)
+	}()
+	select {
+	case <-drainersDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled orphan drainer did not exit after the pool-close panic")
+	}
+	require.Empty(t, pool.drainerPoolSnapshot())
+	require.Equal(t, qwpSfDrainOutcomeStopped, drainer.drainerOutcome())
+	orphanLock, orphanLockErr := qwpSfAcquireSlotLock(orphanDir)
+	require.NoError(t, orphanLockErr, "joined drainer must release its orphan flock")
+	require.NoError(t, orphanLock.close())
+	require.True(t, engine.engineCloseCompleted(), "the earlier close phases must still complete")
+}
+
+func TestQwpPooledEnginePreClaimPanicRetiresUntilRetryCompletes(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, nil,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected reconnect")
+		}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+	slot := &qwpSenderSlot{delegate: sender, cleanup: sender, slotIndex: 0}
+	p := &qwpSenderPool{
+		notify:          make(chan struct{}),
+		maxSize:         1,
+		acquireTimeout:  time.Second,
+		storeAndForward: true,
+		sfSlots:         []qwpSfSlotLifecycle{{state: qwpSfSlotAvailable}},
+		all:             []*qwpSenderSlot{slot},
+		available:       []*qwpSenderSlot{slot},
+	}
+
+	oldInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(time.Millisecond)
+	enteredRetry := make(chan struct{})
+	releaseRetry := make(chan struct{})
+	var calls atomic.Int32
+	hook := func(point qwpSfCleanupTestPoint) {
+		if point != qwpSfCleanupTestBeforeManagerStop {
+			return
+		}
+		switch calls.Add(1) {
+		case 1:
+			panic("injected pooled engine pre-claim panic")
+		case 2:
+			close(enteredRetry)
+			<-releaseRetry
+		}
+	}
+	qwpSfTestCleanupHook.Store(&hook)
+	t.Cleanup(func() {
+		qwpSfTestCleanupHook.Store(nil)
+		qwpSfCloseRetryInterval.store(oldInterval)
+		select {
+		case <-releaseRetry:
+		default:
+			close(releaseRetry)
+		}
+	})
+
+	closeErr := p.close(context.Background())
+	require.ErrorContains(t, closeErr, "engine close panicked")
+	require.ErrorIs(t, closeErr, ErrSfCleanupPending)
+	select {
+	case <-enteredRetry:
+	case <-time.After(time.Second):
+		t.Fatal("pooled engine retry owner did not re-drive manager cleanup")
+	}
+	p.mu.Lock()
+	require.Equal(t, qwpSfSlotRetired, p.sfSlots[0].state,
+		"the pool must reserve the slot index while retry owns its flock")
+	p.mu.Unlock()
+
+	close(releaseRetry)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond)
+	waitQwpSfCloseRetryOwner(t, engine)
+	finalErr := p.currentCloseResult()
+	require.NotErrorIs(t, finalErr, ErrSfCleanupPending)
+	require.ErrorContains(t, finalErr, "engine close panicked",
+		"the stable first-pass diagnostic must survive after the live obligation clears")
+	p.mu.Lock()
+	require.Equal(t, qwpSfSlotFree, p.sfSlots[0].state)
+	p.mu.Unlock()
+	lock, lockErr := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, lockErr)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSenderClosePhaseOrderIsExplicit(t *testing.T) {
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, nil,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected reconnect")
+		}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+	loop.sendLoopStart()
+	sender.drainerPool = qwpSfNewDrainerPool(1)
+
+	order := make([]string, 0, 4)
+	drainHook := func() { order = append(order, "drain") }
+	loopHook := func() { order = append(order, "send-loop") }
+	engineHook := func(point qwpSfCleanupTestPoint) {
+		if point == qwpSfCleanupTestBeforeManagerStop {
+			order = append(order, "engine")
+		}
+	}
+	drainerHook := func() { order = append(order, "drainer-pool") }
+	qwpTestCloseDrainHook.Store(&drainHook)
+	qwpTestCloseSendLoopHook.Store(&loopHook)
+	qwpSfTestCleanupHook.Store(&engineHook)
+	qwpTestDrainerPoolCloseHook.Store(&drainerHook)
+	t.Cleanup(func() {
+		qwpTestCloseDrainHook.Store(nil)
+		qwpTestCloseSendLoopHook.Store(nil)
+		qwpSfTestCleanupHook.Store(nil)
+		qwpTestDrainerPoolCloseHook.Store(nil)
+	})
+
+	require.NoError(t, sender.Close(context.Background()))
+	require.Equal(t, []string{"drain", "send-loop", "engine", "drainer-pool"}, order)
+	select {
+	case <-loop.done:
+	default:
+		t.Fatal("send-loop phase returned without joining its goroutine")
+	}
+}
+
+// TestQwpOrphanDrainerEnginePreClaimPanicStartsRetryOwner covers the second
+// real owner of an SF engine. A drainer close fault before manager quiescence
+// must be contained by the engine phase, must not condemn sound slot bytes,
+// and must leave a retry owner that eventually releases the orphan flock.
+func TestQwpOrphanDrainerEnginePreClaimPanicStartsRetryOwner(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+
+	oldInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
+	var injected atomic.Bool
+	hook := func(point qwpSfCleanupTestPoint) {
+		if point == qwpSfCleanupTestBeforeManagerStop && injected.CompareAndSwap(false, true) {
+			panic("injected orphan engine pre-claim panic")
+		}
+	}
+	qwpSfTestCleanupHook.Store(&hook)
+	var drainerEngine *qwpSfCursorEngine
+	openedHook := func(engine *qwpSfCursorEngine) { drainerEngine = engine }
+	qwpSfTestAfterDrainerEngineOpenHook.Store(&openedHook)
+	t.Cleanup(func() {
+		qwpSfTestCleanupHook.Store(nil)
+		qwpSfTestAfterDrainerEngineOpenHook.Store(nil)
+		qwpSfCloseRetryInterval.store(oldInterval)
+	})
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv), nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	drainer.drainerRun(context.Background())
+	require.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome(),
+		"a close-path panic must not quarantine an otherwise successful drain")
+	require.NoFileExists(t, filepath.Join(dir, qwpSfFailedSentinelName))
+	require.NotNil(t, drainerEngine)
+	require.Eventually(t, drainerEngine.engineCloseCompleted, time.Second, 5*time.Millisecond,
+		"the orphan engine retry owner must complete")
+	waitQwpSfCloseRetryOwner(t, drainerEngine)
+	lock, lockErr := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, lockErr, "the orphan engine retry owner must release its slot flock")
+	require.NoError(t, lock.close())
+}
+
+// TestQwpOrphanDrainerOwnsEngineBeforePostOpenFault proves the ownership
+// obligation is installed at the acquisition boundary, before logger setup or
+// any other faultable post-open work can strand the manager and slot flock.
+func TestQwpOrphanDrainerOwnsEngineBeforePostOpenFault(t *testing.T) {
+	dir := t.TempDir()
+	var drainerEngine *qwpSfCursorEngine
+	openedHook := func(engine *qwpSfCursorEngine) {
+		drainerEngine = engine
+		panic("injected orphan post-open panic")
+	}
+	qwpSfTestAfterDrainerEngineOpenHook.Store(&openedHook)
+	t.Cleanup(func() {
+		qwpSfTestAfterDrainerEngineOpenHook.Store(nil)
+	})
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected dial")
+		}, nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	drainer.drainerRun(context.Background())
+
+	require.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	require.NotNil(t, drainerEngine)
+	require.True(t, drainerEngine.engineCloseCompleted(),
+		"the post-open panic must unwind through the installed engine owner")
+	waitQwpSfCloseRetryOwner(t, drainerEngine)
+	lock, lockErr := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, lockErr, "the post-open panic must not strand the orphan flock")
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSenderForegroundCloseRetriesDrainedFileCleanup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, nil,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected reconnect")
+		}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+
+	unlinkCalls := atomic.Int32{}
+	unlinkHook := func(string) {
+		if unlinkCalls.Add(1) == 1 {
+			panic("injected first segment unlink failure")
+		}
+	}
+	qwpSfTestBeforeSegmentUnlinkHook.Store(&unlinkHook)
+	t.Cleanup(func() {
+		qwpSfTestBeforeSegmentUnlinkHook.Store(nil)
+		_ = engine.engineClose()
+	})
+
+	err = sender.Close(context.Background())
+	require.ErrorContains(t, err, "terminal cleanup panicked")
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond,
+		"foreground Close must retry partially completed drained-file cleanup")
+	require.GreaterOrEqual(t, unlinkCalls.Load(), int32(2))
+
+	_, err = os.Stat(filepath.Join(dir, "sf-initial.sfa"))
+	require.True(t, os.IsNotExist(err), "retry must remove the residual segment")
+	_, err = os.Stat(filepath.Join(dir, qwpSfManifestFileName))
+	require.True(t, os.IsNotExist(err), "retry must remove the residual manifest")
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpEngineTerminalRetryOwnerCompletesFailedDeferredCleanup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	calls := atomic.Int32{}
+	flockHook := func() error {
+		if calls.Add(1) == 1 {
+			return errors.New("injected first release failure")
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	t.Cleanup(func() { qwpSfTestBeforeFlockReleaseHook.Store(nil) })
+
+	require.Error(t, engine.engineClose())
+	engine.engineStartCloseRetryOwner(nil)
+	require.Eventually(t, engine.engineCloseCompleted, 2*time.Second, 10*time.Millisecond)
+	require.GreaterOrEqual(t, calls.Load(), int32(2))
+}
+
+func TestQwpEngineTerminalRetryOwnerRecoversPanicAndCompletes(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+
+	flockCalls := atomic.Int32{}
+	flockHook := func() error {
+		if flockCalls.Add(1) == 1 {
+			return errors.New("injected first release failure")
+		}
+		return nil
+	}
+	// Every hook is restored by a t.Cleanup registered before the next
+	// assertion. An assertion between the two calls Goexit on failure, which
+	// would leave a fault-injecting hook installed for every later test in the
+	// package and fail them for a reason none of them can see.
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	t.Cleanup(func() { qwpSfTestBeforeFlockReleaseHook.Store(nil) })
+	require.Error(t, engine.engineClose())
+
+	finishCalls := atomic.Int32{}
+	finishHook := func() {
+		if finishCalls.Add(1) == 1 {
+			panic("injected terminal cleanup panic")
+		}
+	}
+	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
+	t.Cleanup(func() { qwpSfTestEngineFinishCloseHook.Store(nil) })
+	originalInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
+	t.Cleanup(func() { qwpSfCloseRetryInterval.store(originalInterval) })
+
+	engine.engineStartCloseRetryOwner(nil)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond)
+	require.GreaterOrEqual(t, finishCalls.Load(), int32(2))
+	require.GreaterOrEqual(t, flockCalls.Load(), int32(2))
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpEngineTerminalRetryOwnerSurvivesPanickingLogger(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+
+	flockCalls := atomic.Int32{}
+	flockHook := func() error {
+		if flockCalls.Add(1) <= 2 {
+			return errors.New("injected release failure")
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&flockHook)
+	originalInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
+	t.Cleanup(func() {
+		qwpSfTestBeforeFlockReleaseHook.Store(nil)
+		qwpSfCloseRetryInterval.store(originalInterval)
+	})
+
+	require.Error(t, engine.engineClose())
+	engine.engineStartCloseRetryOwner(slog.New(panicOnHandleSlog{}))
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond)
+	require.GreaterOrEqual(t, flockCalls.Load(), int32(3))
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSfCloseRetryLogThrottle(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	require.True(t, qwpSfShouldLogCloseRetry(time.Time{}, now))
+	require.False(t, qwpSfShouldLogCloseRetry(now, now.Add(qwpSfCloseRetryLogThrottle-time.Nanosecond)))
+	require.True(t, qwpSfShouldLogCloseRetry(now, now.Add(qwpSfCloseRetryLogThrottle)))
+}
+
+// TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits reproduces the close
+// race at the real worker I/O boundary. A manager blocked in spare creation
+// must retain every worker-reachable resource and the flock; its exit path
+// performs terminal cleanup after the operation is released.
+func TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits(t *testing.T) {
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	require.NoError(t, engine.engineClose())
+	require.False(t, engine.engineCloseCompleted())
+	// Duplicate close while the owned-manager handoff is pending must be an
+	// idempotent observation, not a second registration or a panic.
+	require.NoError(t, engine.engineClose())
+	_, err = qwpSfAcquireSlotLock(dir)
+	require.ErrorIs(t, err, qwpSfErrLockBusy)
+	_, err = os.Stat(filepath.Join(dir, "sf-initial.sfa"))
+	require.NoError(t, err, "close must not remove segment files while the worker can touch the slot")
+
+	close(release)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, time.Millisecond)
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+	// A retry after deferred cleanup converges without a second teardown.
+	require.NoError(t, engine.engineClose())
+}
+
+// A second Close decides whether cleanup is ownerless from two markers:
+// managerTornDown and deferredCleanupOwned. Between them lies the narrowest
+// window in the close path, and a claim taken there releases the slot lock
+// while the manager worker is still writing in the slot directory. The hook
+// below stands in for that second Close, at the exact instant the teardown
+// marker is published.
+func TestQwpEngineCleanupCannotBeClaimedWhileTheWorkerRuns(t *testing.T) {
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	var rivalClaimed atomic.Bool
+	teardownHook := func() { rivalClaimed.Store(engine.engineTryClaimTerminalCleanup()) }
+	qwpSfTestAfterManagerTeardownHook.Store(&teardownHook)
+	t.Cleanup(func() { qwpSfTestAfterManagerTeardownHook.Store(nil) })
+
+	require.NoError(t, engine.engineClose())
+	require.False(t, rivalClaimed.Load(),
+		"cleanup must never look ownerless while the manager worker is still running")
+	require.False(t, engine.engineCloseCompleted())
+
+	close(release)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, time.Millisecond)
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpEngineDeferredCleanupPanicTransfersToRetryOwner(t *testing.T) {
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	finishCalls := atomic.Int32{}
+	finishHook := func() {
+		if finishCalls.Add(1) == 1 {
+			panic("injected deferred cleanup panic")
+		}
+	}
+	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	oldInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
+	t.Cleanup(func() {
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+		qwpSfCloseRetryInterval.store(oldInterval)
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	require.NoError(t, engine.engineClose())
+	require.False(t, engine.engineCloseCompleted())
+	close(release)
+	require.Eventually(t, engine.engineCloseCompleted, time.Second, time.Millisecond)
+	require.GreaterOrEqual(t, finishCalls.Load(), int32(2))
+
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpEngineNonFirstCloseComputesDrainStateBeforeCleanup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = engine.engineClose() })
+	segmentPath := filepath.Join(dir, "sf-initial.sfa")
+	manifestPath := filepath.Join(dir, qwpSfManifestFileName)
+	require.FileExists(t, segmentPath)
+	require.FileExists(t, manifestPath)
+
+	// Model the exact concurrent-close window: another goroutine won the
+	// closed CAS, then was preempted before appendMu. This non-first caller is
+	// therefore the first one to reach the serialized teardown section.
+	engine.closed.Store(true)
+	require.NoError(t, engine.engineClose())
+	require.True(t, engine.engineCloseCompleted())
+
+	_, err = os.Stat(segmentPath)
+	require.True(t, os.IsNotExist(err), "drained close must remove the segment")
+	_, err = os.Stat(manifestPath)
+	require.True(t, os.IsNotExist(err), "drained close must remove the manifest")
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpEngineDoubleCloseDuringUnlinkRunsOneCleanup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var finishCalls atomic.Int32
+	finishHook := func() { finishCalls.Add(1) }
+	qwpSfTestEngineFinishCloseHook.Store(&finishHook)
+	unlinkHook := func(path string) {
+		if filepath.Base(path) != "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestBeforeSegmentUnlinkHook.Store(&unlinkHook)
+	t.Cleanup(func() {
+		qwpSfTestBeforeSegmentUnlinkHook.Store(nil)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- engine.engineClose() }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("close did not reach segment unlink")
+	}
+	require.NoError(t, engine.engineClose(), "concurrent close must observe claimed cleanup")
+	close(release)
+	require.NoError(t, <-done)
+	require.True(t, engine.engineCloseCompleted())
+	require.Equal(t, int32(1), finishCalls.Load(), "terminal cleanup ran more than once")
+}
+
+// TestQwpSharedManagerDefersOnlyTheBusyRing pins the test-only shared-manager
+// path: one ring hands cleanup to its current service pass while the manager
+// remains alive to service its sibling.
+func TestQwpSharedManagerDefersOnlyTheBusyRing(t *testing.T) {
+	const segSize int64 = 4096
+	mgr, err := qwpSfNewSegmentManager(segSize, 100*time.Microsecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	mgr.segmentManagerStart()
+	defer mgr.segmentManagerClose()
+
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	createHook := func(path string) {
+		if filepath.Base(path) == "sf-initial.sfa" {
+			return
+		}
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	oldGrace := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(20 * time.Millisecond)
+	t.Cleanup(func() {
+		qwpSfTestSegmentCreateHook.Store(nil)
+		qwpSfManagerCloseGrace.store(oldGrace)
+	})
+
+	busy, err := qwpSfNewCursorEngineWithManager(dir, segSize, mgr, time.Second)
+	require.NoError(t, err)
+	sibling, err := qwpSfNewCursorEngineWithManager("", segSize, mgr, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = sibling.engineClose() }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter busy ring service")
+	}
+
+	require.NoError(t, busy.engineClose())
+	require.False(t, busy.engineCloseCompleted())
+	close(release)
+	require.Eventually(t, busy.engineCloseCompleted, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !sibling.ring.needsHotSpare() }, time.Second, time.Millisecond)
 }
 
 // TestQwpSfSegmentCloseUnmaps pins the normal close still unmaps and nils buf.
@@ -97,6 +950,32 @@ func TestQwpEngineSurfacesManagerWorkerPanic(t *testing.T) {
 	require.Contains(t, got.Error(), "segment manager worker stopped")
 }
 
+// A panicked worker has exited its ring loop, so engine close must clean up
+// inline rather than treating the five-second join timeout as uncertainty.
+func TestQwpEngineCloseAfterManagerWorkerPanicReleasesSlot(t *testing.T) {
+	dir := t.TempDir()
+	createHook := func(path string) {
+		if filepath.Base(path) != "sf-initial.sfa" {
+			panic("injected spare-create panic")
+		}
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	t.Cleanup(func() { qwpSfTestSegmentCreateHook.Store(nil) })
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	select {
+	case <-engine.manager.done:
+	case <-time.After(time.Second):
+		t.Fatal("manager worker did not exit after injected panic")
+	}
+	require.Error(t, engine.engineTerminalError())
+	require.NoError(t, engine.engineClose())
+	require.True(t, engine.engineCloseCompleted())
+	lock, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
 // TestQwpSendLoopCloseAbandonSignalsAndReleasesTransport pins that a send loop
 // whose I/O goroutine never joins abandons after the grace, flags itself so the
 // engine teardown leaks the mappings, and still releases the WebSocket.
@@ -117,13 +996,647 @@ func TestQwpSendLoopCloseAbandonSignalsAndReleasesTransport(t *testing.T) {
 	// Done, so the join never completes and sendLoopClose must abandon.
 	loop.wg.Add(1)
 
-	old := qwpSfSendLoopCloseGrace
-	qwpSfSendLoopCloseGrace = 20 * time.Millisecond
-	defer func() { qwpSfSendLoopCloseGrace = old }()
+	old := qwpSfSendLoopCloseGrace.load()
+	qwpSfSendLoopCloseGrace.store(20 * time.Millisecond)
+	defer func() { qwpSfSendLoopCloseGrace.store(old) }()
 
 	require.NoError(t, loop.sendLoopClose())
 	require.True(t, loop.sendLoopAbandoned(), "wedged join must abandon")
 	require.Nil(t, loop.transport.Load(), "transport released on abandon")
 
 	loop.wg.Done() // let the internal join goroutine finish
+}
+
+// TestQwpCloseDrainPanicLeaksMappingsAndStopsSendLoop pins the contract that
+// decides between unmapping the segment ring and leaking it. A fault in the
+// drain phase must still stop the send loop, so the I/O goroutine is provably
+// done with the mappings and the WebSocket is released; a fault in the
+// send-loop stop leaves that unproven, so the teardown must leak the mappings
+// rather than unmap them under a goroutine that may still be dereferencing
+// them. Unmapping there faults the host process, which no recover can catch.
+func TestQwpCloseDrainPanicLeaksMappingsAndStopsSendLoop(t *testing.T) {
+	newSender := func(t *testing.T, sfDir string) (*qwpLineSender, func()) {
+		t.Helper()
+		srv := newQwpTestServer(t)
+		conf := strings.Join([]string{
+			"ws::addr=" + strings.TrimPrefix(srv.URL, "http://"),
+			"sf_dir=" + sfDir,
+			"sender_id=drain-panic",
+			"close_flush_timeout_millis=100;",
+		}, ";")
+		ls, err := LineSenderFromConf(context.Background(), conf)
+		require.NoError(t, err)
+		require.NoError(t, ls.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+		return ls.(*qwpLineSender), srv.Close
+	}
+
+	t.Run("drain panic stops the loop and unmaps", func(t *testing.T) {
+		sfDir := t.TempDir()
+		s, stopSrv := newSender(t, sfDir)
+		defer stopSrv()
+
+		boom := func() { panic("drain boom") }
+		qwpTestCloseDrainHook.Store(&boom)
+		t.Cleanup(func() { qwpTestCloseDrainHook.Store(nil) })
+
+		err := s.Close(context.Background())
+		require.ErrorContains(t, err, "close drain panicked")
+
+		// The send loop is stopped, so leaking the mappings is unnecessary.
+		require.False(t, s.cursorSendLoop.running.Load(),
+			"a drain fault must not leave the I/O goroutine running")
+		require.True(t, s.cursorEngine.engineCloseCompleted(),
+			"the teardown must still complete and release the slot lock")
+		lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(sfDir, "drain-panic"))
+		require.NoError(t, lockErr, "the slot flock must be released")
+		require.NoError(t, lock.close())
+	})
+
+	t.Run("send-loop stop panic leaks the mappings", func(t *testing.T) {
+		sfDir := t.TempDir()
+		s, stopSrv := newSender(t, sfDir)
+		defer stopSrv()
+		seg := s.cursorEngine.engineActiveSegment()
+		require.NotNil(t, seg)
+
+		boom := func() { panic("send loop close boom") }
+		qwpTestCloseSendLoopHook.Store(&boom)
+		t.Cleanup(func() { qwpTestCloseSendLoopHook.Store(nil) })
+
+		err := s.Close(context.Background())
+		require.ErrorContains(t, err, "send loop close panicked")
+
+		// The I/O goroutine was never joined, so every segment stays mapped.
+		require.True(t, s.cursorEngine.cleanup.snapshot().leakMappings,
+			"an unjoined send loop must leave the segment mappings in place")
+		select {
+		case <-s.cursorSendLoop.done:
+		case <-time.After(time.Second):
+			t.Fatal("the panic boundary left the cancelled send-loop goroutine running")
+		}
+		require.True(t, s.cursorEngine.engineCloseCompleted(),
+			"the rest of the teardown still runs and releases the slot lock")
+		lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(sfDir, "drain-panic"))
+		require.NoError(t, lockErr, "the slot flock must be released")
+		require.NoError(t, lock.close())
+		require.NotNil(t, seg.buf, "the conservative close must retain the mapping until the loop joins")
+		require.NoError(t, qwpSfMunmap(seg.buf))
+	})
+}
+
+// TestQwpSenderConstructionPanicReleasesSlotLock pins that a fault during
+// sender construction hands the engine to a cleanup owner. The engine takes the
+// slot flock, the segment mappings and the side-file descriptors before the
+// sender exists, and a panic between the two returns no slot at all to the
+// pool's recover — so nothing downstream can install a retry owner, and the
+// flock would be held until the process exits while close() reported success.
+func TestQwpSenderConstructionPanicReleasesSlotLock(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	sfDir := t.TempDir()
+	slot := filepath.Join(sfDir, "boom")
+
+	boom := func() error { panic("construction boom") }
+	qwpSfTestAfterEngineCreateHook.Store(&boom)
+	t.Cleanup(func() { qwpSfTestAfterEngineCreateHook.Store(nil) })
+
+	conf := strings.Join([]string{
+		"ws::addr=" + strings.TrimPrefix(srv.URL, "http://"),
+		"sf_dir=" + sfDir,
+		"sender_id=boom",
+		"close_flush_timeout_millis=50;",
+	}, ";")
+	func() {
+		defer func() { require.NotNil(t, recover(), "the injected fault must unwind") }()
+		_, _ = LineSenderFromConf(context.Background(), conf)
+	}()
+	qwpSfTestAfterEngineCreateHook.Store(nil)
+
+	require.Eventually(t, func() bool {
+		lock, err := qwpSfAcquireSlotLock(slot)
+		if err != nil {
+			return false
+		}
+		require.NoError(t, lock.close())
+		return true
+	}, 5*time.Second, 10*time.Millisecond,
+		"a construction fault must not strand the slot flock")
+}
+
+// TestQwpSenderConstructionPanicClosesTheSendLoop pins that a fault after the
+// send loop is built also releases it. By then the loop owns a bound WebSocket
+// and three dispatcher goroutines; closing only the engine leaves the socket
+// fd, the server-side connection and those goroutines alive for the process
+// lifetime.
+func TestQwpSenderConstructionPanicClosesTheSendLoop(t *testing.T) {
+	sfDir := t.TempDir()
+
+	// The server's read loop returns when the client's socket closes, so a
+	// leaked transport keeps this handler alive.
+	var handlersLive atomic.Int64
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		handlersLive.Add(1)
+		defer handlersLive.Add(-1)
+		for {
+			if _, _, err := conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv2.Close()
+
+	// Fault in the window where the loop exists but the sender does not.
+	boom := func() { panic("post-loop boom") }
+	qwpTestAfterSendLoopBuiltHook.Store(&boom)
+	t.Cleanup(func() { qwpTestAfterSendLoopBuiltHook.Store(nil) })
+
+	conf := strings.Join([]string{
+		"ws::addr=" + strings.TrimPrefix(srv2.URL, "http://"),
+		"sf_dir=" + sfDir,
+		"sender_id=loop-boom",
+		"close_flush_timeout_millis=50;",
+	}, ";")
+	func() {
+		defer func() { require.NotNil(t, recover(), "the injected fault must unwind") }()
+		_, _ = LineSenderFromConf(context.Background(), conf)
+	}()
+	qwpTestAfterSendLoopBuiltHook.Store(nil)
+
+	require.Eventually(t, func() bool {
+		return handlersLive.Load() == 0
+	}, 5*time.Second, 20*time.Millisecond,
+		"the send loop's WebSocket must not outlive a failed construction")
+}
+
+func TestQwpSenderConstructionPanicKeepsCauseAndSurvivesCleanupPanic(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	sfDir := t.TempDir()
+	slot := filepath.Join(sfDir, "build-cleanup-boom")
+
+	buildHook := func() error { panic("original construction panic") }
+	qwpSfTestAfterEngineCreateHook.Store(&buildHook)
+	var cleanupInjected atomic.Bool
+	cleanupHook := func(point qwpSfCleanupTestPoint) {
+		if point == qwpSfCleanupTestBeforeManagerStop && cleanupInjected.CompareAndSwap(false, true) {
+			panic("construction cleanup panic")
+		}
+	}
+	qwpSfTestCleanupHook.Store(&cleanupHook)
+	oldInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(10 * time.Millisecond)
+	t.Cleanup(func() {
+		qwpSfTestAfterEngineCreateHook.Store(nil)
+		qwpSfTestCleanupHook.Store(nil)
+		qwpSfCloseRetryInterval.store(oldInterval)
+	})
+
+	conf := strings.Join([]string{
+		"ws::addr=" + strings.TrimPrefix(srv.URL, "http://"),
+		"sf_dir=" + sfDir,
+		"sender_id=build-cleanup-boom",
+		"close_flush_timeout_millis=50;",
+	}, ";")
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _ = LineSenderFromConf(context.Background(), conf)
+	}()
+	bp, ok := recovered.(qwpSfBuildPanic)
+	require.True(t, ok, "disk construction panic must carry its cleanup reporter, got %T", recovered)
+	detail := bp.String()
+	require.Contains(t, detail, "original construction panic")
+	require.Contains(t, detail, "engine close panicked")
+	require.Less(t, strings.Index(detail, "original construction panic"), strings.Index(detail, "engine close panicked"),
+		"the original construction cause must remain first")
+	reporter, ok := bp.reporter.(*qwpSfBuildCleanupError)
+	require.True(t, ok, "pre-sender cleanup should report the retained engine")
+	require.Eventually(t, reporter.engine.engineCloseCompleted, time.Second, 5*time.Millisecond)
+	waitQwpSfCloseRetryOwner(t, reporter.engine)
+	lock, lockErr := qwpSfAcquireSlotLock(slot)
+	require.NoError(t, lockErr)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpEngineConstructionCleanupContinuesAfterPhasePanic(t *testing.T) {
+	buildErr := errors.New("injected construction failure")
+	tests := []struct {
+		name   string
+		target qwpSfConstructionCleanupPoint
+		fresh  bool
+		order  []qwpSfConstructionCleanupPoint
+	}{
+		{
+			name:   "ring",
+			target: qwpSfConstructionCleanupRing,
+			order: []qwpSfConstructionCleanupPoint{
+				qwpSfConstructionCleanupRing,
+				qwpSfConstructionCleanupWatermark,
+				qwpSfConstructionCleanupSymbolDict,
+				qwpSfConstructionCleanupSlotLock,
+				qwpSfConstructionCleanupManager,
+			},
+		},
+		{
+			name:   "watermark",
+			target: qwpSfConstructionCleanupWatermark,
+			order: []qwpSfConstructionCleanupPoint{
+				qwpSfConstructionCleanupRing,
+				qwpSfConstructionCleanupWatermark,
+				qwpSfConstructionCleanupSymbolDict,
+				qwpSfConstructionCleanupSlotLock,
+				qwpSfConstructionCleanupManager,
+			},
+		},
+		{
+			name:   "symbol-dict",
+			target: qwpSfConstructionCleanupSymbolDict,
+			order: []qwpSfConstructionCleanupPoint{
+				qwpSfConstructionCleanupRing,
+				qwpSfConstructionCleanupWatermark,
+				qwpSfConstructionCleanupSymbolDict,
+				qwpSfConstructionCleanupSlotLock,
+				qwpSfConstructionCleanupManager,
+			},
+		},
+		{
+			name:   "initial",
+			target: qwpSfConstructionCleanupInitial,
+			fresh:  true,
+			order: []qwpSfConstructionCleanupPoint{
+				qwpSfConstructionCleanupInitial,
+				qwpSfConstructionCleanupManifest,
+				qwpSfConstructionCleanupWatermark,
+				qwpSfConstructionCleanupSymbolDict,
+				qwpSfConstructionCleanupSlotLock,
+				qwpSfConstructionCleanupManager,
+			},
+		},
+		{
+			name:   "manifest",
+			target: qwpSfConstructionCleanupManifest,
+			fresh:  true,
+			order: []qwpSfConstructionCleanupPoint{
+				qwpSfConstructionCleanupInitial,
+				qwpSfConstructionCleanupManifest,
+				qwpSfConstructionCleanupWatermark,
+				qwpSfConstructionCleanupSymbolDict,
+				qwpSfConstructionCleanupSlotLock,
+				qwpSfConstructionCleanupManager,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fail := func() error { return buildErr }
+			if tc.fresh {
+				qwpSfTestBeforeFreshRingAdoptHook.Store(&fail)
+				t.Cleanup(func() { qwpSfTestBeforeFreshRingAdoptHook.Store(nil) })
+			} else {
+				qwpSfTestBeforeEngineRegisterHook.Store(&fail)
+				t.Cleanup(func() { qwpSfTestBeforeEngineRegisterHook.Store(nil) })
+			}
+
+			seen := make([]qwpSfConstructionCleanupPoint, 0, len(tc.order))
+			cleanupHook := func(point qwpSfConstructionCleanupPoint) {
+				seen = append(seen, point)
+				if point == tc.target {
+					panic("injected construction cleanup panic")
+				}
+			}
+			qwpSfTestConstructionCleanupHook.Store(&cleanupHook)
+			t.Cleanup(func() { qwpSfTestConstructionCleanupHook.Store(nil) })
+
+			_, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+			require.ErrorIs(t, err, buildErr)
+			require.ErrorContains(t, err, "cleanup panicked")
+			require.Equal(t, tc.order, seen,
+				"a cleanup phase panic must not skip any later installed obligation")
+
+			lock, lockErr := qwpSfAcquireSlotLock(dir)
+			require.NoError(t, lockErr, "constructor unwind must release the slot flock")
+			require.NoError(t, lock.close())
+		})
+	}
+}
+
+// TestQwpEngineTerminalPhasePanicRetriesToCompletion pins the retry contract
+// for a fully drained close. The durability barriers are checkpointed before
+// the resource-close phases run, so a panic in one phase leaves a retryable
+// generation whose next pass skips the barriers, re-attempts each idempotent
+// close, removes the drained files, and releases the slot flock. The
+// watermark and symbol-dict cases fault after this pass has closed side files
+// the barriers write through, which is exactly the state a retry must survive.
+func TestQwpEngineTerminalPhasePanicRetriesToCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		point qwpSfCleanupTestPoint
+	}{
+		{"ring", qwpSfCleanupTestRingClosePhase},
+		{"watermark", qwpSfCleanupTestWatermarkClosePhase},
+		{"symbol-dict", qwpSfCleanupTestSymbolDictClosePhase},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+			require.NoError(t, err)
+			oldInterval := qwpSfCloseRetryInterval.load()
+			qwpSfCloseRetryInterval.store(10 * time.Millisecond)
+			var injected atomic.Bool
+			hook := func(point qwpSfCleanupTestPoint) {
+				if point == tc.point && injected.CompareAndSwap(false, true) {
+					panic("injected terminal phase panic")
+				}
+			}
+			qwpSfTestCleanupHook.Store(&hook)
+			t.Cleanup(func() {
+				qwpSfTestCleanupHook.Store(nil)
+				qwpSfCloseRetryInterval.store(oldInterval)
+			})
+
+			closeErr := closeEngineGuarded(engine, false, nil)
+			require.ErrorContains(t, closeErr, "cleanup panicked")
+			require.False(t, engine.engineCloseCompleted(),
+				"the faulted pass must leave a retryable generation, not report completion")
+			require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond,
+				"retry after a terminal-phase panic must complete once the fault clears")
+			waitQwpSfCloseRetryOwner(t, engine)
+			lock, lockErr := qwpSfAcquireSlotLock(dir)
+			require.NoError(t, lockErr, "the completed retry must release the slot flock")
+			require.NoError(t, lock.close())
+		})
+	}
+}
+
+// TestQwpSenderRepeatedCloseRedrivesAnAbortedClose covers the one state in
+// which a repeated Close still does cleanup work: a close that faulted before
+// the manager teardown, leaving nothing owning the terminal cleanup and no
+// retry goroutine either. A repeated Close then takes it over and the slot lock
+// comes back.
+//
+// Callers are not told to rely on this. Every close that reaches
+// closeEngineGuarded installs a retry owner before it returns, and a repeated
+// Close stands aside for one, so in practice the background owner is what
+// finishes the job. SlotLockReleased is how a caller watches for that.
+func TestQwpSenderRepeatedCloseRedrivesAnAbortedClose(t *testing.T) {
+	srv := newQwpTestServer(t)
+	defer srv.Close()
+	sfDir := t.TempDir()
+	conf := strings.Join([]string{
+		"ws::addr=" + strings.TrimPrefix(srv.URL, "http://"),
+		"sf_dir=" + sfDir,
+		"sender_id=abort",
+		"close_flush_timeout_millis=50;",
+	}, ";")
+	ls, err := LineSenderFromConf(context.Background(), conf)
+	require.NoError(t, err)
+	s := ls.(*qwpLineSender)
+	require.NoError(t, ls.Table("t").Int64Column("v", 1).AtNow(context.Background()))
+
+	// The state a close leaves behind when it faults inside the manager
+	// teardown: the engine is marked closed, nothing is in flight, and the
+	// teardown marker was never published — so there is no claim to take and
+	// no retry owner was installed.
+	require.NoError(t, s.cursorSendLoop.sendLoopClose())
+	s.cursorEngine.closed.Store(true)
+	s.closed.Store(true)
+	// A real close publishes this through closeEngineGuarded, which the
+	// modelled path reached before it faulted. It is how the repeat call knows
+	// the send loop has stopped reading the segment mappings.
+	s.cursorEngine.cleanup.markReadersQuiesced(false)
+	require.False(t, cleanupManagerTornDown(s.cursorEngine))
+	require.False(t, s.cursorEngine.cleanup.snapshot().retryOwnerStarted)
+
+	require.True(t, s.cursorEngine.engineCloseNeedsRedrive(),
+		"an aborted close must be recognised as needing a re-drive")
+	require.NoError(t, ls.Close(context.Background()),
+		"a repeated Close must finish the cleanup, not report a double close")
+	require.True(t, s.cursorEngine.engineCloseCompleted())
+
+	lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(sfDir, "abort"))
+	require.NoError(t, lockErr, "the slot flock must be released")
+	require.NoError(t, lock.close())
+}
+
+// TestQwpSenderConcurrentCloseKeepsSegmentsMappedUnderLiveSendLoop pins the
+// rule that keeps the repeated-Close path safe: a second Close may take over
+// terminal cleanup only after the first Close has returned.
+//
+// While the first Close is still draining, the send loop is still reading the
+// segment mappings, and terminal cleanup unmaps them. The send loop works from
+// slice headers it took earlier, so the lengths still look right, the bounds
+// checks pass, and the reads land on memory the process has given back. The
+// biggest window is the payload slice passed to the WebSocket write, which
+// faults inside memmove for the length of a whole frame. The fault arrives as a
+// runtime throw, which the send loop's recover cannot catch.
+//
+// Only a disk-backed slot can fault. A memory-backed segment skips the unmap
+// and just drops its buffer reference, which comes out as a panic the send loop
+// recovers. That is why this uses a temporary directory.
+//
+// The check is on the mapping rather than on the fault, because the fault kills
+// the test binary instead of failing the test.
+func TestQwpSenderConcurrentCloseKeepsSegmentsMappedUnderLiveSendLoop(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Millisecond, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 5*time.Second)
+	require.NoError(t, err)
+
+	// Hold the first Close inside the drain phase. It gets there after winning
+	// the closed CAS, and before it stops the send loop or touches the engine.
+	// That is the window a second caller must not act in.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	hook := func() {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+	}
+	qwpTestCloseDrainHook.Store(&hook)
+	t.Cleanup(func() { qwpTestCloseDrainHook.Store(nil) })
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- sender.Close(context.Background()) }()
+	<-entered
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		<-firstDone
+	})
+
+	active := engine.engineActiveSegment()
+	require.NotNil(t, active)
+	require.NotEmpty(t, active.address(), "precondition: the active segment is mapped")
+
+	secondErr := sender.Close(context.Background())
+
+	require.NotEmpty(t, active.address(),
+		"a second Close unmapped the active segment while the send loop was still reading it")
+	require.False(t, engine.engineCloseCompleted(),
+		"a second Close released the slot lock while the first Close was still draining")
+	require.ErrorIs(t, secondErr, errDoubleSenderClose,
+		"a second Close arriving before the first returned must report the double close")
+	require.False(t, engine.cleanup.snapshot().readersQuiesced,
+		"reader quiescence must not be on record while the send loop is live")
+}
+
+// TestQwpSenderSlotLockReleasedTracksTheSlot checks the accessor a caller polls
+// to learn when the slot directory is free. Close on its own cannot answer that
+// question: it returns as soon as its own teardown is done, which can be before
+// the lock is gone.
+func TestQwpSenderSlotLockReleasedTracksTheSlot(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, time.Millisecond, 10*time.Millisecond, 100*time.Millisecond)
+	loop.sendLoopStart()
+	sender, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 5*time.Second)
+	require.NoError(t, err)
+
+	require.False(t, sender.SlotLockReleased(), "an open sender is still using its slot")
+
+	// Fail every release while this is set, so Close returns with the lock still
+	// held. That is the state the accessor exists for. A switch rather than a
+	// call count, because the hook is package-wide and retry owners left running
+	// by earlier tests can reach it too; blocking them for a moment is harmless,
+	// whereas letting one consume a single scheduled failure is not.
+	var failing atomic.Bool
+	failing.Store(true)
+	hook := func() error {
+		if failing.Load() {
+			return os.ErrPermission
+		}
+		return nil
+	}
+	qwpSfTestBeforeFlockReleaseHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestBeforeFlockReleaseHook.Store(nil) })
+
+	// Keep the retry owner brisk so the wait below is short, and put the
+	// package value back for whatever runs next.
+	previousInterval := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(5 * time.Millisecond)
+	t.Cleanup(func() { qwpSfCloseRetryInterval.store(previousInterval) })
+
+	require.Error(t, sender.Close(context.Background()))
+	require.False(t, sender.SlotLockReleased(),
+		"Close returned while the slot lock was still held, and the accessor must say so")
+
+	// The retry owner finishes the release once the fault clears.
+	failing.Store(false)
+	require.Eventually(t, sender.SlotLockReleased, 10*time.Second, time.Millisecond,
+		"the accessor must turn true once the background retry releases the lock")
+	lock, lockErr := qwpSfAcquireSlotLock(engine.engineSfDir())
+	require.NoError(t, lockErr, "the slot must be acquirable once the accessor reports released")
+	require.NoError(t, lock.close())
+}
+
+// TestQwpSenderSlotLockReleasedIsTrueInMemoryMode pins the other half: with no
+// sf_dir there is no slot, so the answer is true throughout.
+func TestQwpSenderSlotLockReleasedIsTrueInMemoryMode(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+	sender, _, _, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+
+	require.True(t, sender.SlotLockReleased(), "memory mode holds no slot")
+	require.NoError(t, sender.Close(context.Background()))
+	require.True(t, sender.SlotLockReleased())
+}
+
+// TestQwpSenderRepeatCloseCannotUnmapLeakedSegments covers the second input to
+// the cleanup-safety decision. A send loop abandoned mid-read is quiesced only
+// in the sense that nobody will wait for it: it is still walking the segment
+// mappings, so the close that abandoned it asks for them to be leaked rather
+// than unmapped.
+//
+// Both facts have to reach the cleanup record together. Published apart, there
+// is a window where the record says the readers are done but not that their
+// mappings are untouchable, and a repeated Close arriving there unmaps memory
+// the abandoned loop is still reading.
+func TestQwpSenderRepeatCloseCannotUnmapLeakedSegments(t *testing.T) {
+	engine, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	active := engine.engineActiveSegment()
+	require.NotNil(t, active)
+	require.NotEmpty(t, active.address(), "precondition: the active segment is mapped")
+
+	// What closeCursor publishes when its send loop was abandoned mid-read.
+	engine.cleanup.markReadersQuiesced(true)
+
+	// A repeated Close asks for cleanup without knowing about the loop, so it
+	// passes leakSegments=false. The record must overrule it. Assert the claim
+	// was taken as well as its effect: a version that simply declined would
+	// leave the mapping intact too, and prove nothing.
+	acted, err := engine.engineRetryRepeatedClose()
+	require.NoError(t, err)
+	require.True(t, acted, "the repeated Close must take the cleanup claim")
+
+	require.NotEmpty(t, active.address(),
+		"a repeated Close unmapped segments the abandoned send loop is still reading")
+	require.True(t, engine.cleanup.snapshot().leakMappings,
+		"the leak decision must survive a claim that did not carry it")
+
+	// Release the deliberately leaked mapping so the test does not leak it.
+	require.NoError(t, qwpSfMunmap(active.buf))
+}
+
+// TestQwpSfCleanupRefusesEveryClaimBeforeReadersQuiesce pins the rule at the
+// place that enforces it. Terminal cleanup unmaps the segment files, so no
+// claimant may run it until the owner of the send loop has said the readers
+// are done -- and that has to hold for every claimant, not just the repeated
+// Close that first needed it.
+//
+// The retry owner arrives through engineRetryCloseIfNeeded, which carries no
+// send loop of its own, and the pool's re-probe reaches the same goroutine by
+// making sure one exists. If the rule lived only at the repeated-Close entry
+// point, pointing either of those at a slot whose loop is still live would
+// reopen the hole at a different door.
+func TestQwpSfCleanupRefusesEveryClaimBeforeReadersQuiesce(t *testing.T) {
+	engine, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	active := engine.engineActiveSegment()
+	require.NotNil(t, active)
+
+	// Nobody has said the send loop stopped, so every route in must decline.
+	require.NoError(t, engine.engineRetryCloseIfNeeded(),
+		"the retry route must decline quietly, not fault")
+	acted, err := engine.engineRetryRepeatedClose()
+	require.NoError(t, err)
+	require.False(t, acted, "a repeated Close must decline before the readers quiesce")
+
+	require.NotEmpty(t, active.address(),
+		"a claim taken before the readers quiesced unmapped a live segment")
+	require.False(t, engine.engineCloseCompleted())
+
+	// Once the owner speaks, the same routes work.
+	engine.cleanup.markReadersQuiesced(false)
+	require.NoError(t, engine.engineRetryCloseIfNeeded())
+	require.True(t, engine.engineCloseCompleted(),
+		"cleanup must run once the readers are known to have stopped")
 }
