@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"os"
@@ -48,6 +49,96 @@ func TestQwpSfManagerServiceErrorSurvivesPanickingLogger(t *testing.T) {
 	require.NotPanics(t, func() {
 		mgr.recordServiceError(&qwpSfManagerRingEntry{dir: "slot"}, errors.New("injected maintenance failure"))
 	})
+}
+
+// The worker's poll rate must not control when producers see a disk error.
+// Failures stay private for one second, then the latest cause becomes visible.
+func TestQwpSfManagerMaintenanceFailureEscalationUsesElapsedTime(t *testing.T) {
+	mgr, err := qwpSfNewSegmentManager(4096, time.Millisecond, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	now := time.Unix(1_700_000_000, 0)
+	mgr.now = func() time.Time { return now }
+	mgr.lastMaintenanceLog = now
+	entry := &qwpSfManagerRingEntry{dir: "slot"}
+	transientErr := errors.New("transient maintenance failure")
+
+	for i := 0; i < 100; i++ {
+		mgr.recordServiceError(entry, transientErr)
+	}
+	assert.NoError(t, entry.entryMaintenanceError(),
+		"do not publish an error before one second")
+	now = now.Add(3 * time.Millisecond)
+	mgr.recordServiceError(entry, transientErr)
+	assert.NoError(t, entry.entryMaintenanceError(), "do not publish a 3 ms failure")
+	now = now.Add(time.Second - 3*time.Millisecond - time.Nanosecond)
+	latestErr := errors.New("latest sustained maintenance failure")
+	mgr.recordServiceError(entry, latestErr)
+	assert.NoError(t, entry.entryMaintenanceError(), "do not publish before one second")
+	now = now.Add(time.Nanosecond)
+	mgr.recordServiceError(entry, latestErr)
+	require.ErrorIs(t, entry.entryMaintenanceError(), ErrSfDurability)
+	assert.ErrorIs(t, entry.entryMaintenanceError(), latestErr)
+	replacementErr := errors.New("replacement sustained maintenance failure")
+	mgr.recordServiceError(entry, replacementErr)
+	assert.ErrorIs(t, entry.entryMaintenanceError(), replacementErr,
+		"publish the latest error")
+}
+
+// A pass that does no work cannot show that the disk recovered. It must not
+// clear an error that producers can already see.
+func TestQwpSfManagerEmptyPassDoesNotClearMaintenanceFailure(t *testing.T) {
+	const segSize int64 = 4096
+	mgr, err := qwpSfNewSegmentManager(segSize, time.Hour, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	now := time.Unix(1_700_000_000, 0)
+	mgr.now = func() time.Time { return now }
+	mgr.lastMaintenanceLog = now
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	spare, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	require.NoError(t, ring.installHotSpare(spare))
+	entry, err := mgr.segmentManagerRegisterWithWatermark(ring, "", nil)
+	require.NoError(t, err)
+	diskErr := errors.New("persistent maintenance failure")
+	mgr.recordServiceError(entry, diskErr)
+	now = now.Add(qwpSfManagerMaintenanceFailureDuration)
+	mgr.recordServiceError(entry, diskErr)
+	require.ErrorIs(t, entry.entryMaintenanceError(), ErrSfDurability)
+
+	mgr.serviceRing(entry)
+	assert.ErrorIs(t, entry.entryMaintenanceError(), ErrSfDurability,
+		"a pass that does no work must not clear the error")
+}
+
+func TestQwpSfManagerSuccessfulMaintenanceWorkClearsFailure(t *testing.T) {
+	const segSize int64 = 4096
+	dir := t.TempDir()
+	mgr, err := qwpSfNewSegmentManager(segSize, time.Hour, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	now := time.Unix(1_700_000_000, 0)
+	mgr.now = func() time.Time { return now }
+	mgr.lastMaintenanceLog = now
+	first, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segSize)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	entry, err := mgr.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	require.NoError(t, err)
+	diskErr := errors.New("persistent maintenance failure")
+	mgr.recordServiceError(entry, diskErr)
+	now = now.Add(qwpSfManagerMaintenanceFailureDuration)
+	mgr.recordServiceError(entry, diskErr)
+	require.ErrorIs(t, entry.entryMaintenanceError(), ErrSfDurability)
+
+	// Creating and syncing the missing disk spare shows that maintenance works
+	// again, so this pass clears the error.
+	mgr.serviceRing(entry)
+	assert.False(t, ring.needsHotSpare())
+	assert.NoError(t, entry.entryMaintenanceError())
+	assert.False(t, entry.maintenanceFailureActive)
 }
 
 func TestQwpSfManagerWorkerPanicStillSignalsExitWithPanickingLogger(t *testing.T) {
@@ -156,7 +247,11 @@ func TestQwpSfManagerWatermarkOverflowDoesNotLicenseTrim(t *testing.T) {
 	engine.watermark.mu.Lock()
 	engine.watermark.generation = math.MaxInt64
 	engine.watermark.mu.Unlock()
-	engine.managerEntry.maintenanceFailures = qwpSfManagerMaintenanceFailureThreshold - 1
+	now := time.Unix(1_700_000_000, 0)
+	engine.manager.now = func() time.Time { return now }
+	engine.manager.lastMaintenanceLog = now
+	engine.manager.recordServiceError(engine.managerEntry, qwpSfErrGenerationOverflow)
+	now = now.Add(qwpSfManagerMaintenanceFailureDuration)
 
 	engine.manager.serviceRing(engine.managerEntry)
 
@@ -375,6 +470,316 @@ func TestQwpSfManagerCapWarningSurvivesPanickingLogger(t *testing.T) {
 	}
 }
 
+// If a quarantine scan fails, keep the previous byte count. Treating the error
+// as zero would allow a new segment even though the `.corrupt` file still uses
+// the remaining space.
+func TestQwpSfManagerQuarantineScanFailureDoesNotUndercount(t *testing.T) {
+	const segSize int64 = 4096
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "slot")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sf-dead.sfa.corrupt"), make([]byte, segSize), 0o644))
+
+	m, err := qwpSfNewSegmentManager(segSize, time.Hour, 2*segSize)
+	require.NoError(t, err)
+	now := time.Unix(1_700_000_000, 0)
+	m.now = func() time.Time { return now }
+	seg, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(seg, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	require.NoError(t, m.segmentManagerRegister(ring, dir))
+
+	// First confirm that the `.corrupt` file leaves no room for a spare.
+	m.serviceRing(m.rings[0])
+	require.True(t, ring.needsHotSpare())
+
+	// Move the slot so the next scan fails without deleting the file.
+	require.NoError(t, os.Rename(dir, filepath.Join(parent, "slot-moved")))
+	var createCalls atomic.Int32
+	createHook := func(string) { createCalls.Add(1) }
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	t.Cleanup(func() { qwpSfTestSegmentCreateHook.Store(nil) })
+
+	now = now.Add(qwpSfManagerQuarantineReconcileInterval)
+	m.serviceRing(m.rings[0])
+	assert.Zero(t, createCalls.Load(), "a failed scan must keep the old byte count")
+	assert.Equal(t, segSize, m.rings[0].quarantinedBytes)
+	assert.Equal(t, 2*segSize, m.totalBytes)
+}
+
+// Registration scans this 2,560-file slot once. Until one second passes, worker
+// polls must do constant work, allocate nothing, and avoid more scans.
+func TestQwpSfManagerCappedTicksBoundQuarantineScans(t *testing.T) {
+	const (
+		segSize    int64 = 4096
+		entryCount       = 2560
+	)
+	dir := t.TempDir()
+	for i := 0; i < entryCount; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("sf-%04d.sfa.corrupt", i))
+		require.NoError(t, os.WriteFile(name, nil, 0o644))
+	}
+
+	m, err := qwpSfNewSegmentManager(segSize, time.Hour, segSize)
+	require.NoError(t, err)
+	now := time.Unix(1_700_000_000, 0)
+	m.now = func() time.Time { return now }
+	realScan := m.scanQuarantinedBytes
+	var scans int
+	m.scanQuarantinedBytes = func(path string) (int64, error) {
+		scans++
+		return realScan(path)
+	}
+	seg, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(seg, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	entry, err := m.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, scans, "scan once during registration")
+	m.lastDiskFullLog = now // avoid logging during the allocation check
+
+	for i := 0; i < 5000; i++ {
+		m.serviceRing(entry)
+	}
+	assert.Equal(t, 1, scans, "do not scan again before one second")
+	allocs := testing.AllocsPerRun(1000, func() { m.serviceRing(entry) })
+	assert.Zero(t, allocs, "do not allocate between scans")
+
+	now = now.Add(qwpSfManagerQuarantineReconcileInterval)
+	m.serviceRing(entry)
+	assert.Equal(t, 2, scans, "scan again after one second")
+	for i := 0; i < 5000; i++ {
+		m.serviceRing(entry)
+	}
+	assert.Equal(t, 2, scans, "scan at most once per second")
+}
+
+// The manager checks for operator deletions once per second while the byte
+// limit blocks a spare.
+func TestQwpSfManagerOperatorDeletionResumesProvisioningAtReconcileDeadline(t *testing.T) {
+	const segSize int64 = 4096
+	dir := t.TempDir()
+	corrupt := filepath.Join(dir, "sf-dead.sfa.corrupt")
+	require.NoError(t, os.WriteFile(corrupt, make([]byte, segSize), 0o644))
+
+	m, err := qwpSfNewSegmentManager(segSize, time.Hour, 2*segSize)
+	require.NoError(t, err)
+	now := time.Unix(1_700_000_000, 0)
+	m.now = func() time.Time { return now }
+	seg, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(seg, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	entry, err := m.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	require.NoError(t, err)
+	require.Equal(t, segSize, entry.quarantinedBytes)
+	require.True(t, ring.needsHotSpare())
+
+	require.NoError(t, os.Remove(corrupt))
+	now = now.Add(qwpSfManagerQuarantineReconcileInterval - time.Nanosecond)
+	m.serviceRing(entry)
+	require.True(t, ring.needsHotSpare(), "do not notice deletion before one second")
+	now = now.Add(time.Nanosecond)
+	m.serviceRing(entry)
+	assert.False(t, ring.needsHotSpare(), "create a spare after noticing the deletion")
+	assert.Zero(t, entry.quarantinedBytes)
+}
+
+// Recovery creates `.corrupt` files before registration. The first scan must
+// count them immediately.
+func TestQwpSfManagerRegistrationAccountsRecoveryQuarantineImmediately(t *testing.T) {
+	const segSize int64 = 4096
+	dir := t.TempDir()
+	evidence := filepath.Join(dir, "sf-torn.sfa")
+	require.NoError(t, os.WriteFile(evidence, make([]byte, 73), 0o644))
+	_, err := qwpSfQuarantinePath(evidence)
+	require.NoError(t, err)
+
+	m, err := qwpSfNewSegmentManager(segSize, time.Hour, 2*segSize)
+	require.NoError(t, err)
+	seg, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(seg, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	entry, err := m.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(73), entry.quarantinedBytes)
+	assert.Equal(t, segSize+73, m.totalBytes)
+}
+
+// A second ring can use the remaining space while the first ring creates a
+// spare. The install step must check the byte limit again.
+func TestQwpSfManagerSpareInstallRechecksCapAfterConcurrentRegistration(t *testing.T) {
+	const segSize int64 = 4096
+	dir := t.TempDir()
+	m, err := qwpSfNewSegmentManager(segSize, time.Hour, 2*segSize)
+	require.NoError(t, err)
+
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring1 := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = ring1.segmentRingClose() }()
+	entry1, err := m.segmentManagerRegisterWithWatermark(ring1, dir, nil)
+	require.NoError(t, err)
+
+	createEntered := make(chan struct{})
+	createRelease := make(chan struct{})
+	createHook := func(string) {
+		close(createEntered)
+		<-createRelease
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	t.Cleanup(func() { qwpSfTestSegmentCreateHook.Store(nil) })
+	serviceDone := make(chan struct{})
+	go func() {
+		defer close(serviceDone)
+		m.serviceRing(entry1)
+	}()
+	select {
+	case <-createEntered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	second, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring2 := qwpSfNewSegmentRing(second, segSize)
+	defer func() { _ = ring2.segmentRingClose() }()
+	require.NoError(t, m.segmentManagerRegister(ring2, ""))
+	close(createRelease)
+	select {
+	case <-serviceDone:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not finish spare creation")
+	}
+
+	assert.True(t, ring1.needsHotSpare(), "do not install a spare after the space is used")
+	assert.Equal(t, 2*segSize, m.totalBytes, "only the two registered active segments fit the cap")
+}
+
+// A rejected spare already uses disk space. If removal fails, keep its bytes
+// counted and try again until the file is gone.
+func TestQwpSfManagerRejectedSpareCleanupFailureStaysAccounted(t *testing.T) {
+	const segSize int64 = 4096
+	dir := t.TempDir()
+	m, err := qwpSfNewSegmentManager(segSize, time.Hour, 2*segSize)
+	require.NoError(t, err)
+	removeErr := errors.New("injected rejected-spare remove failure")
+	removeAllowed := false
+	m.removeFile = func(path string) error {
+		if !removeAllowed {
+			return removeErr
+		}
+		return os.Remove(path)
+	}
+
+	first, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring1 := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = ring1.segmentRingClose() }()
+	entry1, err := m.segmentManagerRegisterWithWatermark(ring1, dir, nil)
+	require.NoError(t, err)
+
+	createEntered := make(chan struct{})
+	createRelease := make(chan struct{})
+	createHook := func(string) {
+		close(createEntered)
+		<-createRelease
+	}
+	qwpSfTestSegmentCreateHook.Store(&createHook)
+	t.Cleanup(func() { qwpSfTestSegmentCreateHook.Store(nil) })
+	serviceDone := make(chan struct{})
+	go func() {
+		defer close(serviceDone)
+		m.serviceRing(entry1)
+	}()
+	select {
+	case <-createEntered:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter spare creation")
+	}
+
+	second, err := qwpSfCreateInMemorySegment(0, segSize)
+	require.NoError(t, err)
+	ring2 := qwpSfNewSegmentRing(second, segSize)
+	defer func() { _ = ring2.segmentRingClose() }()
+	require.NoError(t, m.segmentManagerRegister(ring2, ""))
+	close(createRelease)
+	select {
+	case <-serviceDone:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not finish rejected-spare cleanup")
+	}
+
+	require.Len(t, entry1.pendingUnlinks, 1)
+	pendingPath := entry1.pendingUnlinks[0].path
+	require.FileExists(t, pendingPath)
+	assert.True(t, entry1.maintenanceFailureActive)
+	assert.ErrorIs(t, entry1.maintenanceLastError, removeErr)
+	assert.Equal(t, 3*segSize, m.totalBytes, "count the rejected file until removal succeeds")
+	assert.Equal(t, 2*segSize, entry1.accountedBytes)
+
+	removeAllowed = true
+	freed, err := m.retryDeferredTrimWork(entry1)
+	require.NoError(t, err)
+	m.commitTrimAccounting(entry1, freed)
+	assert.Equal(t, segSize, freed)
+	assert.Empty(t, entry1.pendingUnlinks)
+	assert.Equal(t, 2*segSize, m.totalBytes, "free the space after removal succeeds")
+	assert.Equal(t, segSize, entry1.accountedBytes)
+	require.NoFileExists(t, pendingPath)
+}
+
+func BenchmarkQwpSfManagerCappedSteadyState(b *testing.B) {
+	const (
+		segSize    int64 = 4096
+		entryCount       = 2560
+	)
+	dir := b.TempDir()
+	for i := 0; i < entryCount; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("sf-%04d.sfa.corrupt", i))
+		if err := os.WriteFile(name, nil, 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	m, err := qwpSfNewSegmentManager(segSize, time.Hour, segSize)
+	if err != nil {
+		b.Fatal(err)
+	}
+	now := time.Unix(1_700_000_000, 0)
+	m.now = func() time.Time { return now }
+	realScan := m.scanQuarantinedBytes
+	scans := 0
+	m.scanQuarantinedBytes = func(path string) (int64, error) {
+		scans++
+		return realScan(path)
+	}
+	seg, err := qwpSfCreateInMemorySegment(0, segSize)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ring := qwpSfNewSegmentRing(seg, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	entry, err := m.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	m.lastDiskFullLog = now
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.serviceRing(entry)
+	}
+	b.StopTimer()
+	if scans != 1 {
+		b.Fatalf("scanned %d times, want one registration scan", scans)
+	}
+}
+
 // A trim pass that gives up partway through still has to credit the bytes an
 // earlier pass's leftover unlinks just reclaimed: those files are gone and off
 // the retry list, so nothing else will ever account for them. Losing them
@@ -413,7 +818,7 @@ func TestQwpSfManagerCreditsReclaimedBytesWhenTrimAborts(t *testing.T) {
 
 	m.serviceRing(e)
 
-	require.Equal(t, 1, e.maintenanceFailures, "the pass aborted before trimming")
+	require.True(t, e.maintenanceFailureActive, "the pass aborted before trimming")
 	assert.Empty(t, e.pendingUnlinks, "the reclaimed unlink is off the retry list")
 	assert.Zero(t, e.accountedBytes, "the slot gets the reclaimed bytes back")
 	assert.Zero(t, m.totalBytes, "and so does the manager total")
@@ -440,6 +845,9 @@ func TestQwpSfManagerHoldsBytesForAFailedTrimUnlink(t *testing.T) {
 
 	m, err := qwpSfNewSegmentManager(4096, time.Hour, qwpSfUnlimitedTotalBytes)
 	require.NoError(t, err)
+	now := time.Unix(1_700_000_000, 0)
+	m.now = func() time.Time { return now }
+	m.lastMaintenanceLog = now
 	m.segmentManagerStart()
 	defer m.segmentManagerClose()
 
@@ -451,10 +859,11 @@ func TestQwpSfManagerHoldsBytesForAFailedTrimUnlink(t *testing.T) {
 	assert.Zero(t, freed, "bytes stay charged while the file is still on disk")
 	assert.Len(t, e.pendingUnlinks, 1, "a failed unlink is retried, not forgotten")
 
-	e.maintenanceFailures = qwpSfManagerMaintenanceFailureThreshold - 1
+	m.recordServiceError(e, retryErr)
 	e.entryMaintenanceSucceeded()
-	assert.Equal(t, qwpSfManagerMaintenanceFailureThreshold-1, e.maintenanceFailures,
+	assert.True(t, e.maintenanceFailureActive,
 		"an empty trim list does not end a failure run that still owes an unlink")
+	now = now.Add(qwpSfManagerMaintenanceFailureDuration)
 	m.recordServiceError(e, retryErr)
 	require.ErrorIs(t, e.entryMaintenanceError(), ErrSfDurability)
 

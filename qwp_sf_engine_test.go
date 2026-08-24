@@ -680,11 +680,17 @@ func TestQwpSfEngineBackpressureSurfacesMaintenanceFailure(t *testing.T) {
 	require.True(t, e.manager.segmentManagerClose())
 
 	diskErr := errors.New("update sf-manifest.bin: no space left on device")
-	for i := 1; i < qwpSfManagerMaintenanceFailureThreshold; i++ {
-		e.manager.recordServiceError(e.managerEntry, diskErr)
-		require.NoError(t, e.managerEntry.entryMaintenanceError(),
-			"a short run of failures is a log line, not a producer-visible error")
-	}
+	now := time.Unix(1_700_000_000, 0)
+	e.manager.now = func() time.Time { return now }
+	e.manager.lastMaintenanceLog = now
+	e.manager.recordServiceError(e.managerEntry, diskErr)
+	require.NoError(t, e.managerEntry.entryMaintenanceError(),
+		"do not publish a short failure")
+	now = now.Add(qwpSfManagerMaintenanceFailureDuration - time.Nanosecond)
+	e.manager.recordServiceError(e.managerEntry, diskErr)
+	require.NoError(t, e.managerEntry.entryMaintenanceError(),
+		"do not publish before one second")
+	now = now.Add(time.Nanosecond)
 	e.manager.recordServiceError(e.managerEntry, diskErr)
 
 	start := time.Now()

@@ -108,6 +108,11 @@ downgrading after that migration is unsupported. Quarantined `.corrupt` files
 inside a live slot count against `sf_max_total_bytes` — when they exhaust the
 budget no new segment is minted and the producer sees `ErrBackpressureTimeout`;
 the operator regains space by deleting the evidence, the client never does.
+The manager counts `.corrupt` bytes when it registers a slot. While the byte
+limit blocks a new segment, it rescans each slot at most once per second. If a
+scan fails, it keeps the previous byte count. If an operator deletes the files,
+the manager notices within one second. Between scans, each 1 ms poll does O(1)
+work.
 
 Segment and manifest control points are durable even with
 `sf_durability=memory`: initial creation, rotation, each trim batch, and a fully
@@ -156,9 +161,11 @@ capability-gap exhaustion, poison-frame escalation, and drainer slot-recovery
 failure — are enumerated and enforced by the review-pr skill checklist. The
 producer-visible errors from a running drain path are all local: SF-out-of-space
 backpressure (`ErrBackpressureTimeout`) and local-storage durability failures
-(`ErrSfDurability` — a rotation that cannot commit its header or manifest, or a
-run of failed slot maintenance). Both are non-terminal: the rows stay pending
-and the same call can be retried.
+(`ErrSfDurability` — a rotation that cannot save its header or manifest, or
+slot maintenance that keeps failing for at least one second). A poll that does
+no work does not set or clear this error. A successful disk write or cleanup
+clears it. Both errors are non-terminal: the rows stay pending and the same
+call can be retried.
 
 Drainer quarantine covers a slot proved inconsistent
 (`qwpSfErrRecoveryFailClosed`) plus the drainer's own give-ups — auth reject,

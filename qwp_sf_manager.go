@@ -41,14 +41,13 @@ import (
 
 // qwpSfManager defaults and constants.
 const (
-	qwpSfManagerDefaultPoll         = 1 * time.Millisecond // poll cadence
-	qwpSfManagerDiskFullLogThrottle = 30 * time.Second     // throttle disk-full WARNs
+	qwpSfManagerDefaultPoll                 = 1 * time.Millisecond // poll cadence
+	qwpSfManagerDiskFullLogThrottle         = 30 * time.Second     // throttle disk-full WARNs
+	qwpSfManagerQuarantineReconcileInterval = 1 * time.Second      // limit how often deletion checks read the directory
 
-	// qwpSfManagerMaintenanceFailureThreshold is how many consecutive failed
-	// maintenance passes a ring tolerates before its entry publishes the
-	// failure to producers. Passes run on the manager poll tick, so a run this
-	// long is a storage fault rather than one unlucky syscall.
-	qwpSfManagerMaintenanceFailureThreshold = 3
+	// A maintenance error reaches producers only after failures last this long.
+	// The worker's poll rate does not change the delay.
+	qwpSfManagerMaintenanceFailureDuration = 1 * time.Second
 )
 
 // qwpSfManagerCloseGrace bounds how long close() waits for the worker
@@ -101,6 +100,11 @@ type qwpSfSegmentManager struct {
 	segmentSizeBytes int64
 	pollInterval     time.Duration
 	maxTotalBytes    int64
+	// Tests replace these functions to control time and file errors without
+	// sleeping or changing global state. Production uses the real functions.
+	now                  func() time.Time
+	scanQuarantinedBytes func(string) (int64, error)
+	removeFile           func(string) error
 
 	// fileGeneration is a monotonic counter that names spare files
 	// (sf-<gen:016x>.sfa). Per-process, not per-ring; recovery skips
@@ -119,8 +123,9 @@ type qwpSfSegmentManager struct {
 	// next append instead.
 	workerPanic atomic.Pointer[string]
 
-	mu                 sync.Mutex
-	rings              []*qwpSfManagerRingEntry
+	mu    sync.Mutex
+	rings []*qwpSfManagerRingEntry
+	// totalBytes counts live segments and cached `.corrupt` files for all rings.
 	totalBytes         int64
 	lastDiskFullLog    time.Time
 	lastMaintenanceLog time.Time
@@ -189,6 +194,13 @@ type qwpSfManagerRingEntry struct {
 	// Protected by manager.mu; unlike ring.totalSegmentBytes it deliberately
 	// retains a drained batch until the service pass commits its accounting.
 	accountedBytes int64
+	// quarantinedBytes is the last known size of this slot's `.corrupt` files.
+	// manager.mu protects it, and manager.totalBytes includes it. Recovery creates
+	// all quarantine files before registration, so the first scan sees them.
+	quarantinedBytes int64
+	// The worker owns lastQuarantineReconcile after registration. While the byte
+	// limit blocks a new segment, it scans at most once per interval.
+	lastQuarantineReconcile time.Time
 	// watermark is the engine-owned .ack-watermark for this slot, or
 	// nil in memory mode / when the file could not be opened. The
 	// manager writes through it on every tick where ackedFsn
@@ -198,16 +210,14 @@ type qwpSfManagerRingEntry struct {
 	watermark *qwpSfAckWatermark
 	state     atomic.Int32
 	cleanup   atomic.Pointer[qwpSfManagerCleanupHandoff]
-	// maintenanceFailures counts the current run of consecutive service passes
-	// that could not complete their durability work. Touched only on the
-	// manager's worker goroutine.
-	maintenanceFailures int
-	// maintenanceError publishes that run once it reaches
-	// qwpSfManagerMaintenanceFailureThreshold. Producers read it through
-	// engineTerminalError, so a slot whose trim has stopped reports the disk
-	// fault that stopped it instead of the generic backpressure timeout that
-	// the stalled ring would otherwise produce. Cleared by the next pass that
-	// completes its maintenance.
+	// These fields track the current run of maintenance failures. Only the worker
+	// changes them. A pass that does no work leaves them unchanged. Successful
+	// maintenance clears them.
+	maintenanceFailureActive bool
+	maintenanceFailureSince  time.Time
+	maintenanceLastError     error
+	// maintenanceError is the error that producers can read. The worker replaces
+	// or clears the pointer, so readers do not need manager.mu.
 	maintenanceError atomic.Pointer[error]
 	// pendingUnlinks holds trimmed segments whose file is still on disk because
 	// the unlink failed. Their bytes stay charged to the slot until the file is
@@ -241,17 +251,16 @@ func (e *qwpSfManagerRingEntry) entryMaintenanceError() error {
 	return nil
 }
 
-// entryMaintenanceSucceeded ends the current failure run. Worker goroutine only.
-// Deferred work left over from an earlier pass keeps the run alive: a slot whose
-// deletes keep failing has nothing new to trim on the passes in between, and
-// clearing the run there would let failures and successes alternate forever
-// without ever reaching the threshold that tells the producer its disk is
-// refusing writes.
+// entryMaintenanceSucceeded clears the current failure run. Only the worker
+// calls it. Pending deletes or a pending directory sync keep the failure active
+// until that work succeeds.
 func (e *qwpSfManagerRingEntry) entryMaintenanceSucceeded() {
-	if e.maintenanceFailures == 0 || len(e.pendingUnlinks) > 0 || e.dirSyncPending {
+	if !e.maintenanceFailureActive || len(e.pendingUnlinks) > 0 || e.dirSyncPending {
 		return
 	}
-	e.maintenanceFailures = 0
+	e.maintenanceFailureActive = false
+	e.maintenanceFailureSince = time.Time{}
+	e.maintenanceLastError = nil
 	e.maintenanceError.Store(nil)
 }
 
@@ -306,11 +315,14 @@ func qwpSfNewSegmentManager(segmentSizeBytes int64, pollInterval time.Duration, 
 		pollInterval = qwpSfManagerDefaultPoll
 	}
 	return &qwpSfSegmentManager{
-		segmentSizeBytes: segmentSizeBytes,
-		pollInterval:     pollInterval,
-		maxTotalBytes:    maxTotalBytes,
-		wakeup:           make(chan struct{}, 1),
-		done:             make(chan struct{}),
+		segmentSizeBytes:     segmentSizeBytes,
+		pollInterval:         pollInterval,
+		maxTotalBytes:        maxTotalBytes,
+		now:                  time.Now,
+		scanQuarantinedBytes: qwpSfQuarantinedBytes,
+		removeFile:           os.Remove,
+		wakeup:               make(chan struct{}, 1),
+		done:                 make(chan struct{}),
 	}, nil
 }
 
@@ -407,9 +419,10 @@ func (m *qwpSfSegmentManager) segmentManagerDeregister(ring *qwpSfSegmentRing) *
 	for i, e := range m.rings {
 		if e.ring == ring {
 			e.deregister()
-			// Reverse the ring's contribution to totalBytes.
-			m.totalBytes -= e.accountedBytes
+			// Remove this ring's live and quarantined bytes from totalBytes.
+			m.totalBytes -= e.accountedBytes + e.quarantinedBytes
 			e.accountedBytes = 0
+			e.quarantinedBytes = 0
 			// O(N) remove preserving order — register order matters
 			// for log ordering, not correctness.
 			m.rings = append(m.rings[:i], m.rings[i+1:]...)
@@ -437,27 +450,18 @@ func (m *qwpSfSegmentManager) segmentManagerRegister(ring *qwpSfSegmentRing, dir
 // initial active segment in place. Wires the ring's "I need a spare"
 // callback so the producer can preempt the polling tick.
 func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSegmentRing, dir string, watermark *qwpSfAckWatermark) (*qwpSfManagerRingEntry, error) {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil, errors.New("qwp/sf: segment manager closed")
-	}
-	entry := &qwpSfManagerRingEntry{ring: ring, dir: dir, watermark: watermark, accountedBytes: ring.totalSegmentBytes()}
-	m.rings = append(m.rings, entry)
-	// Account for bytes the ring already owns when it joins. A
-	// recovered ring (post-restart, orphan adoption) can come up
-	// at-or-above the cap; without this seed, totalBytes stays at 0
-	// and the per-tick cap check would let the manager keep
-	// provisioning new spares on top of the recovered set.
-	m.totalBytes += entry.accountedBytes
-	m.mu.Unlock()
+	quarantinedBytes := int64(0)
+	lastQuarantineReconcile := time.Time{}
 	if dir != "" {
-		// Skip the file-generation counter past whatever's already on
-		// disk in this slot. Without this, on recovery the manager
-		// would mint a new spare at sf-0000000000000000.sfa — and
-		// open-clean-RW would truncate the user's existing active
-		// file out from under the I/O loop, scrambling the in-flight
-		// mmap.
+		var err error
+		quarantinedBytes, err = m.scanQuarantinedBytes(dir)
+		if err != nil {
+			return nil, fmt.Errorf("%w: qwp/sf: scan quarantined bytes in %s during manager registration: %w",
+				ErrSfDurability, dir, err)
+		}
+		lastQuarantineReconcile = m.now()
+		// Move the generation counter past existing files before the worker can
+		// see this ring. This prevents the worker from reusing a file name.
 		if maxGen, found := qwpSfScanMaxGeneration(dir); found {
 			minNext := maxGen + 1
 			for {
@@ -471,6 +475,24 @@ func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSeg
 			}
 		}
 	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, errors.New("qwp/sf: segment manager closed")
+	}
+	entry := &qwpSfManagerRingEntry{
+		ring:                    ring,
+		dir:                     dir,
+		watermark:               watermark,
+		accountedBytes:          ring.totalSegmentBytes(),
+		quarantinedBytes:        quarantinedBytes,
+		lastQuarantineReconcile: lastQuarantineReconcile,
+	}
+	m.rings = append(m.rings, entry)
+	// Count the bytes the ring already owns. A recovered ring may already be at
+	// or above the limit, so registration must count it before creating spares.
+	m.totalBytes += entry.accountedBytes + entry.quarantinedBytes
+	m.mu.Unlock()
 	ring.setManagerWakeup(m.wakeWorker)
 	return entry, nil
 }
@@ -685,22 +707,17 @@ func (m *qwpSfSegmentManager) managerWorkerError() error {
 // serviceRing performs one round of spare provisioning and trim for
 // a single ring. Cheap when the ring already has a spare and no
 // trimmable sealed segments — the common steady-state case.
-// qwpSfQuarantinedBytes sums the sizes of the .corrupt files recovery has set
-// aside in the slot directory (including numbered .corrupt-N copies). They
-// are preserved evidence — the only copy of rows the client could not prove
-// delivered — so the client never deletes them; counting them against
-// sf_max_total_bytes is what keeps the never-delete rule and the disk budget
-// from pulling against each other. Memory mode (dir == "") has nothing on
-// disk and reports zero, as does a directory that cannot be read: the scan
-// informs a provisioning decision, and a transient read failure must not
-// block minting on its own.
-func qwpSfQuarantinedBytes(dir string) int64 {
+// qwpSfQuarantinedBytes adds the sizes of `.corrupt` files in a slot. The client
+// keeps these files because they may contain undelivered rows, so they count
+// toward the byte limit. Memory mode returns zero. The function returns scan
+// and stat errors so callers can keep the previous count.
+func qwpSfQuarantinedBytes(dir string) (int64, error) {
 	if dir == "" {
-		return 0
+		return 0, nil
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	var total int64
 	for _, entry := range entries {
@@ -709,15 +726,54 @@ func qwpSfQuarantinedBytes(dir string) int64 {
 		}
 		info, err := entry.Info()
 		if err != nil {
-			continue
+			return 0, err
 		}
 		total += info.Size()
 	}
-	return total
+	return total, nil
+}
+
+// reconcileQuarantinedBytes rescans one slot. The scan runs without m.mu. If
+// deregistration finishes during the scan, the result is ignored.
+func (m *qwpSfSegmentManager) reconcileQuarantinedBytes(e *qwpSfManagerRingEntry, now time.Time) error {
+	if e == nil || e.dir == "" || (!e.lastQuarantineReconcile.IsZero() && now.Sub(e.lastQuarantineReconcile) < qwpSfManagerQuarantineReconcileInterval) {
+		return nil
+	}
+	// Record failed attempts too, so an unreadable directory is not scanned on
+	// every worker poll.
+	e.lastQuarantineReconcile = now
+	quarantinedBytes, err := m.scanQuarantinedBytes(e.dir)
+	if err != nil {
+		return fmt.Errorf("qwp/sf: reconcile quarantined bytes in %s: %w", e.dir, err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state := e.state.Load()
+	if state == qwpSfManagerRingDeregisteredInService || state == qwpSfManagerRingDeregistered {
+		return nil
+	}
+	m.totalBytes += quarantinedBytes - e.quarantinedBytes
+	e.quarantinedBytes = quarantinedBytes
+	return nil
+}
+
+func (m *qwpSfSegmentManager) wouldExceedCapWithSpare() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.totalBytes > m.maxTotalBytes-m.segmentSizeBytes
 }
 
 func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	memoryMode := e.dir == ""
+	maintenanceWorked := false
+	// The byte limit covers all rings. While the manager is at the limit, rescan
+	// each disk ring when its interval expires. This also notices files deleted
+	// from a ring that already has a spare.
+	if !memoryMode && m.wouldExceedCapWithSpare() {
+		if err := m.reconcileQuarantinedBytes(e, m.now()); err != nil {
+			m.logServiceError(e.dir, err)
+		}
+	}
 	// A spare this pass could not provision. Carried to the end so the trim
 	// still runs -- on a full disk the trim is what frees the space -- and so
 	// the pass cannot report success over it.
@@ -729,16 +785,11 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		// re-acquires it.
 		m.mu.Lock()
 		observedTotal := m.totalBytes
+		quarantined := e.quarantinedBytes
 		m.mu.Unlock()
-		// Quarantined .corrupt files count against sf_max_total_bytes:
-		// preserved evidence the client never reclaims must not be exempt
-		// from the budget that bounds the slot's disk use, or a slot that
-		// repeatedly tears mid-append would grow without bound. The scan
-		// runs off m.mu, only when a mint is being considered, and rereads
-		// the directory each time so an operator deleting the evidence is
-		// noticed on the next pass and minting resumes.
-		quarantined := qwpSfQuarantinedBytes(e.dir)
-		if observedTotal+quarantined+m.segmentSizeBytes > m.maxTotalBytes {
+		// `.corrupt` files count toward the byte limit. Their cached size is
+		// already part of observedTotal, so this check does no directory I/O.
+		if observedTotal > m.maxTotalBytes-m.segmentSizeBytes {
 			// Disk/memory cap reached: skip provisioning. Producers
 			// will block on engineAppendBlocking until in-flight
 			// segments are ACK'd and trimmed, so this state is exactly
@@ -746,7 +797,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			// qwpSfManagerDiskFullLogThrottle so a sustained cap-full
 			// state doesn't drown logs. The log write happens after the
 			// lock is released to keep the syscall off m.mu.
-			now := time.Now()
+			now := m.now()
 			m.mu.Lock()
 			shouldLog := now.Sub(m.lastDiskFullLog) >= qwpSfManagerDiskFullLogThrottle
 			if shouldLog {
@@ -816,22 +867,24 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 					}
 				}
 				installed := false
-				if stillRegistered {
-					installErr := e.ring.installHotSpare(spare)
+				var installErr error
+				// Registration or a quarantine scan may use the remaining space
+				// while the spare is being created. Check the current total before
+				// installing it.
+				if stillRegistered && m.totalBytes <= m.maxTotalBytes-m.segmentSizeBytes {
+					installErr = e.ring.installHotSpare(spare)
 					if installErr == nil {
 						m.totalBytes += m.segmentSizeBytes
 						e.accountedBytes += m.segmentSizeBytes
 						installed = true
+						maintenanceWorked = true
 					}
 				}
 				m.mu.Unlock()
 				if !installed {
-					_ = spare.close()
-					if path != "" {
-						_ = os.Remove(path)
-					}
+					spareErr = errors.Join(installErr, m.cleanupUninstalledSpare(e, spare, path))
 				}
-			} else if path != "" {
+			} else {
 				// The provisioning failure has to reach someone. Silently
 				// unlinking and retrying next tick leaves a slot whose spare
 				// never installs, so rotation stops and the producer is told
@@ -840,20 +893,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 				// carried to the end of the pass rather than reported here so
 				// the trim below still runs: on a full disk the trim is what
 				// frees the space the spare needs.
-				spareErr = err
-				if spare != nil {
-					_ = spare.close()
-				}
-				// Defense-in-depth: qwpSfCreateSegment already best-
-				// effort removes the file on its own failure paths
-				// (truncate fail, mmap fail). If a future change
-				// breaks that invariant — or if anything before the
-				// try block leaves a file on disk — this second-line
-				// remove keeps the slot from accumulating zero-content
-				// .sfa files under sustained provisioning failure.
-				// Repeated remove on an already-removed path is a
-				// harmless no-op.
-				_ = os.Remove(path)
+				spareErr = errors.Join(err, m.cleanupUninstalledSpare(e, spare, path))
 			}
 		}
 	}
@@ -868,12 +908,17 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	//    write is gated on advance, so a steady ackedFsn doesn't
 	//    dirty the mapped page every tick. nil watermark (memory
 	//    mode / open failed) is a no-op.
-	_, watermarkErr := e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
+	watermarkAdvanced, watermarkErr := e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn())
+	maintenanceWorked = maintenanceWorked || watermarkAdvanced
 
 	// 3. Retry the unlinks and the directory fsync an earlier pass could not
 	//    complete. Their bytes are still charged to the slot, so this is what
 	//    gives the ring its capacity back.
+	hadDeferredWork := len(e.pendingUnlinks) > 0 || e.dirSyncPending
 	deferredBytes, deferredErr := m.retryDeferredTrimWork(e)
+	if hadDeferredWork && deferredErr == nil {
+		maintenanceWorked = true
+	}
 	// Those bytes left the disk the moment their unlink succeeded, and the
 	// retry list no longer holds them, so credit them here rather than at the
 	// end of the pass. Several exits below this point return early, and each
@@ -890,9 +935,9 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			m.recordServiceError(e, joined)
 			return
 		}
-		// Nothing acked is waiting to be reclaimed, so whatever stopped an
-		// earlier pass no longer holds anything back.
-		e.entryMaintenanceSucceeded()
+		if maintenanceWorked {
+			e.entryMaintenanceSucceeded()
+		}
 		return
 	}
 	if !memoryMode {
@@ -976,6 +1021,38 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	m.commitTrimAccounting(e, trimmedBytes)
 }
 
+// cleanupUninstalledSpare closes and removes a spare that was not installed.
+// If removal fails, it counts one segment and tries again later. This may count
+// more than a partial file uses, but it never lets the manager exceed the limit.
+func (m *qwpSfSegmentManager) cleanupUninstalledSpare(e *qwpSfManagerRingEntry, spare *qwpSfSegment, path string) error {
+	var closeErr error
+	if spare != nil {
+		closeErr = spare.close()
+	}
+	if path == "" {
+		return closeErr
+	}
+	removeErr := m.removeFile(path)
+	if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
+		return closeErr
+	}
+	removeErr = fmt.Errorf("remove uninstalled spare %s: %w", path, removeErr)
+	retained := false
+	m.mu.Lock()
+	state := e.state.Load()
+	if state != qwpSfManagerRingDeregisteredInService && state != qwpSfManagerRingDeregistered {
+		m.totalBytes += m.segmentSizeBytes
+		e.accountedBytes += m.segmentSizeBytes
+		e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{path: path, sizeBytes: m.segmentSizeBytes})
+		retained = true
+	}
+	m.mu.Unlock()
+	if !retained {
+		m.logServiceError(e.dir, removeErr)
+	}
+	return errors.Join(closeErr, removeErr)
+}
+
 // retryDeferredTrimWork re-attempts the unlinks and the directory fsync that
 // earlier passes could not complete, and returns the bytes reclaimed by the
 // files that are now gone. Worker goroutine only.
@@ -987,7 +1064,7 @@ func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (i
 	var firstErr error
 	kept := e.pendingUnlinks[:0]
 	for _, pending := range e.pendingUnlinks {
-		if err := os.Remove(pending.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := m.removeFile(pending.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			kept = append(kept, pending)
 			if firstErr == nil {
 				firstErr = fmt.Errorf("retry unlink of trimmed segment: %w", err)
@@ -1026,25 +1103,30 @@ func (m *qwpSfSegmentManager) commitTrimAccounting(e *qwpSfManagerRingEntry, tri
 	m.mu.Unlock()
 }
 
-// recordServiceError notes one failed maintenance pass for a ring. Maintenance
-// keeps retrying on every tick, so a lone failure stays a log line. Once the
-// failures form a run of qwpSfManagerMaintenanceFailureThreshold, the entry
-// publishes the error: at that point trim has stopped for long enough that the
-// ring fills, and the producer that ends up parked on it needs to be told its
-// disk is refusing writes rather than being handed the backpressure timeout's
-// "server slow / disconnected" reading. Worker goroutine only.
+// recordServiceError tracks how long maintenance has kept failing. After the
+// delay, producers see the disk error instead of a generic backpressure error.
+// Only the worker calls this method.
 func (m *qwpSfSegmentManager) recordServiceError(e *qwpSfManagerRingEntry, err error) {
 	dir := ""
 	if e != nil {
 		dir = e.dir
-		e.maintenanceFailures++
-		if e.maintenanceFailures >= qwpSfManagerMaintenanceFailureThreshold {
-			sticky := fmt.Errorf("%w: slot maintenance has failed %d consecutive times: %w",
-				ErrSfDurability, e.maintenanceFailures, err)
+		now := m.now()
+		if !e.maintenanceFailureActive {
+			e.maintenanceFailureActive = true
+			e.maintenanceFailureSince = now
+		}
+		e.maintenanceLastError = err
+		if now.Sub(e.maintenanceFailureSince) >= qwpSfManagerMaintenanceFailureDuration {
+			sticky := fmt.Errorf("%w: slot maintenance has failed continuously for %s: %w",
+				ErrSfDurability, now.Sub(e.maintenanceFailureSince), e.maintenanceLastError)
 			e.maintenanceError.Store(&sticky)
 		}
 	}
-	now := time.Now()
+	m.logServiceError(dir, err)
+}
+
+func (m *qwpSfSegmentManager) logServiceError(dir string, err error) {
+	now := m.now()
 	m.mu.Lock()
 	shouldLog := now.Sub(m.lastMaintenanceLog) >= qwpSfManagerDiskFullLogThrottle
 	if shouldLog {

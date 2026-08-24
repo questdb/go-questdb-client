@@ -484,7 +484,7 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | `sf_dir` | unset | Group root. Setting it activates SF. |
 | `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_` only (no `.` or path separators). |
 | `sf_max_segment_bytes` | 4 MiB | Per-segment file size. |
-| `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. Includes quarantined `.corrupt` files in the slot — deleting them regains space. |
+| `sf_max_total_bytes` | 10 GiB | Total byte limit. The producer waits when the limit is reached. The limit includes `.corrupt` files in the slot. After an operator deletes those files, the client notices within one second. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
 | `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as (a) the poison-frame episode budget (`max_frame_rejections`) and (b) a background drainer's no-progress / durable-stall watchdog — the time a live-but-stalled adopted slot is given before it is quarantined. Setting it small speeds up the initial connect and shrinks (a); the drainer watchdog (b) is floored at 30s (×4 in durable mode) so a small value can't wrongly quarantine a slow-but-healthy slot. |
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
@@ -577,9 +577,12 @@ park one slot copy per cycle. `.corrupt` files inside a live slot do count
 against `sf_max_total_bytes`: when quarantined bytes exhaust the budget, no new
 segment is minted and the producer sees `qdb.ErrBackpressureTimeout` — the same
 non-terminal, retry-the-call contract as running out of space for live data.
-Deleting the `.corrupt` files regains the space and minting resumes. The
-whole-slot copies under `quarantined/` sit outside any slot's budget and remain
-purely operator-owned.
+The manager counts these files when it opens the slot. While the byte limit
+blocks a new segment, it rescans the slot at most once per second. This means it
+notices deleted `.corrupt` files within one second without scanning on every
+1 ms poll. If a scan fails, it keeps the previous byte count. Full slot copies
+under `quarantined/` do not count toward a slot's limit. The operator owns these
+copies.
 
 ## Querying
 
