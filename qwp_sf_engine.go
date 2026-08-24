@@ -1114,22 +1114,30 @@ func (e *qwpSfCursorEngine) engineCloseLeakSegments() error {
 	return e.engineCloseInternal(true)
 }
 
+// engineCloseInternal is the one route by which the owner of the send loop asks
+// for cleanup, and leakSegments is that owner's verdict on its mappings. Both
+// facts go into the cleanup record here, so every later claimant -- a repeated
+// Close, the retry owner, a pool re-probe -- can see that the readers are done
+// without having to be told separately.
 func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
-	_, err := e.engineCloseWithOwner(leakSegments, qwpSfCleanupOwnerClose, false)
+	if e == nil {
+		return nil
+	}
+	e.cleanup.markReadersQuiesced(leakSegments)
+	_, err := e.engineCloseWithOwner(leakSegments, qwpSfCleanupOwnerClose)
 	return err
 }
 
 // engineCloseWithOwner obtains one state-machine action, then performs it
-// without holding the cleanup mutex. acted is false when another close,
-// manager callback or retry owner already owns the protocol, or cleanup is
-// complete. repeated public Close uses respectRetryOwner so its decision and
-// the retry-owner gate are one locked observation.
-func (e *qwpSfCursorEngine) engineCloseWithOwner(leakSegments bool, owner qwpSfCleanupOwner, respectRetryOwner bool) (acted bool, err error) {
+// without holding the cleanup mutex. acted is false when another close, manager
+// callback or retry owner already owns the protocol, when cleanup is complete,
+// or when the send loop has not been shown to have stopped.
+func (e *qwpSfCursorEngine) engineCloseWithOwner(leakSegments bool, owner qwpSfCleanupOwner) (acted bool, err error) {
 	if e == nil {
 		return false, nil
 	}
 	e.closed.Store(true)
-	token, action := e.cleanup.begin(leakSegments, owner, respectRetryOwner)
+	token, action := e.cleanup.begin(leakSegments, owner)
 	return e.runCleanupAction(token, action, owner)
 }
 
@@ -1473,21 +1481,13 @@ func (e *qwpSfCursorEngine) engineCloseCompleted() bool {
 }
 
 // engineRetryCloseIfNeeded runs one cleanup attempt for the engine's retry
-// owner and for pool reprobes. Both ignore the scheduler-owner marker and race
-// only for the generation claim in the cleanup record.
+// owner. It ignores the scheduler-owner marker and races only for the
+// generation claim in the cleanup record. The pool's re-probe does not come
+// through here: it reads closeCompleted and, when cleanup is still owed, makes
+// sure a retry owner exists rather than claiming anything itself.
 func (e *qwpSfCursorEngine) engineRetryCloseIfNeeded() error {
-	_, err := e.engineCloseWithOwner(false, qwpSfCleanupOwnerRetry, false)
+	_, err := e.engineCloseWithOwner(false, qwpSfCleanupOwnerRetry)
 	return err
-}
-
-// engineMarkReadersQuiesced records that the caller owning the send loop has
-// stopped it, along with whether its mappings must be left alone. Terminal
-// cleanup is refused to callers who did not do that themselves until this is
-// published.
-func (e *qwpSfCursorEngine) engineMarkReadersQuiesced(leakMappings bool) {
-	if e != nil {
-		e.cleanup.markReadersQuiesced(leakMappings)
-	}
 }
 
 // engineRetryRepeatedClose makes the public double-close decision and cleanup

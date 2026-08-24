@@ -166,13 +166,19 @@ func (c *qwpSfCleanupControl) tokenCurrentLocked(token qwpSfCleanupToken, phase 
 // A fresh or rolled-back close drives manager teardown. A manager-quiescent
 // ownerless close claims terminal cleanup directly. Every other phase already
 // has an owner or is complete.
-func (c *qwpSfCleanupControl) begin(leakMappings bool, owner qwpSfCleanupOwner, respectRetryOwner bool) (qwpSfCleanupToken, qwpSfCleanupAction) {
+func (c *qwpSfCleanupControl) begin(leakMappings bool, owner qwpSfCleanupOwner) (qwpSfCleanupToken, qwpSfCleanupAction) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if leakMappings {
 		c.state.leakMappings = true
 	}
-	if respectRetryOwner && c.state.retryOwnerStarted {
+	// No claimant runs terminal cleanup before the owner of the send loop has
+	// said the readers are done. engineCloseInternal publishes that as its
+	// first act, so an owner passes here immediately; everyone else -- the
+	// retry goroutine, a pool re-probe, a repeated Close -- has to wait for it.
+	// Keeping the rule here rather than at each entry point means a new
+	// claimant inherits it instead of having to remember it.
+	if !c.state.readersQuiesced {
 		return qwpSfCleanupToken{}, qwpSfCleanupNoAction
 	}
 	switch c.state.phase {
@@ -206,9 +212,10 @@ func (c *qwpSfCleanupControl) markReadersQuiesced(leakMappings bool) {
 
 // beginRepeatClose is begin for a caller that did not stop the send loop
 // itself, which is what a repeated public Close is. It refuses until the owner
-// of the loop has published quiescence. Reading that fact and taking the claim
-// under one lock is the point: apart, a caller can see quiescence that a
-// rollback has since undone.
+// of the loop has published quiescence, and refuses again once a retry
+// goroutine owns the work. Reading those facts and taking the claim under one
+// lock is the point: apart, a caller can act on a phase that has moved on
+// between the two reads.
 func (c *qwpSfCleanupControl) beginRepeatClose(owner qwpSfCleanupOwner) (qwpSfCleanupToken, qwpSfCleanupAction) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -309,10 +316,14 @@ func (c *qwpSfCleanupControl) managerClaim(token qwpSfCleanupToken) (qwpSfCleanu
 	return c.transitionLocked(qwpSfCleanupClaimed, qwpSfCleanupOwnerManager), true
 }
 
-func (c *qwpSfCleanupControl) tryClaim(owner qwpSfCleanupOwner, respectRetryOwner bool) (qwpSfCleanupToken, bool) {
+// tryClaim takes an already-ownerless terminal claim without driving the
+// manager teardown first. It carries the same quiescence rule as begin and
+// beginRepeatClose: every door into a terminal claim asks the same question, so
+// wiring this one to a new caller cannot reopen the hole the others close.
+func (c *qwpSfCleanupControl) tryClaim(owner qwpSfCleanupOwner) (qwpSfCleanupToken, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if respectRetryOwner && c.state.retryOwnerStarted {
+	if !c.state.readersQuiesced {
 		return qwpSfCleanupToken{}, false
 	}
 	if c.state.phase != qwpSfCleanupReady && c.state.phase != qwpSfCleanupRetryable {

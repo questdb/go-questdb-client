@@ -2316,14 +2316,12 @@ func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
 type neverDoneSlot struct{}
 
 func (*neverDoneSlot) closeCompleted() bool               { return false }
-func (*neverDoneSlot) retryCloseIfNeeded() error          { return nil }
 func (*neverDoneSlot) ensureCloseRetryOwner(*slog.Logger) {}
 
 // panicOnProbeSlot stands in for a delegate whose state check faults.
 type panicOnProbeSlot struct{}
 
 func (panicOnProbeSlot) closeCompleted() bool               { panic("probe boom") }
-func (panicOnProbeSlot) retryCloseIfNeeded() error          { return nil }
 func (panicOnProbeSlot) ensureCloseRetryOwner(*slog.Logger) {}
 
 // TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved pins that a panic
@@ -2471,4 +2469,35 @@ func TestQwpSenderPoolPanicAfterSenderBuiltKeepsSlotReserved(t *testing.T) {
 		defer p.mu.Unlock()
 		return p.sfSlots[0].state == qwpSfSlotFree
 	}, 10*time.Second, 10*time.Millisecond, "the index must come back once cleanup finishes")
+}
+
+// TestQwpPooledSenderSlotLockReleased covers the pooled half of the accessor.
+// A live lease answers for the slot it is borrowing, which is in use, so the
+// answer is false. A returned lease answers true, because it is no longer
+// borrowing anything: the slot went back to the pool, and releasing its lock
+// is the pool's job at QuestDB.Close rather than the lease's.
+func TestQwpPooledSenderSlotLockReleased(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfRoot := t.TempDir()
+
+	ctx := context.Background()
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfRoot + ";close_flush_timeout_millis=200;"
+	p, err := newQwpSenderPool(ctx, conf, 1, 1,
+		qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(ctx) })
+
+	lease, err := p.borrow(ctx)
+	require.NoError(t, err)
+	qs, ok := lease.(QwpSender)
+	require.True(t, ok)
+
+	require.False(t, qs.SlotLockReleased(),
+		"a live lease is borrowing a slot that is still in use")
+
+	require.NoError(t, lease.Close(ctx))
+	require.True(t, qs.SlotLockReleased(),
+		"a returned lease borrows nothing, so it has no slot lock to report on")
 }

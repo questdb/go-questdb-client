@@ -103,7 +103,7 @@ func TestQwpSenderRepeatedCloseRetriesFlockRelease(t *testing.T) {
 	// draining cannot tear down a live send loop.
 	sender := &qwpLineSender{cursorEngine: engine}
 	sender.closed.Store(true)
-	engine.engineMarkReadersQuiesced(false)
+	engine.cleanup.markReadersQuiesced(false)
 	require.NoError(t, sender.Close(context.Background()))
 	require.True(t, engine.engineCloseCompleted())
 	lock, err := qwpSfAcquireSlotLock(dir)
@@ -1411,7 +1411,7 @@ func TestQwpSenderRepeatedCloseRedrivesAnAbortedClose(t *testing.T) {
 	// A real close publishes this through closeEngineGuarded, which the
 	// modelled path reached before it faulted. It is how the repeat call knows
 	// the send loop has stopped reading the segment mappings.
-	s.cursorEngine.engineMarkReadersQuiesced(false)
+	s.cursorEngine.cleanup.markReadersQuiesced(false)
 	require.False(t, cleanupManagerTornDown(s.cursorEngine))
 	require.False(t, s.cursorEngine.cleanup.snapshot().retryOwnerStarted)
 
@@ -1587,14 +1587,15 @@ func TestQwpSenderRepeatCloseCannotUnmapLeakedSegments(t *testing.T) {
 	require.NotEmpty(t, active.address(), "precondition: the active segment is mapped")
 
 	// What closeCursor publishes when its send loop was abandoned mid-read.
-	engine.engineMarkReadersQuiesced(true)
+	engine.cleanup.markReadersQuiesced(true)
 
 	// A repeated Close asks for cleanup without knowing about the loop, so it
-	// passes leakSegments=false. The record must overrule it.
-	sender := &qwpLineSender{cursorEngine: engine}
-	sender.closed.Store(true)
-	_, err = engine.engineRetryRepeatedClose()
+	// passes leakSegments=false. The record must overrule it. Assert the claim
+	// was taken as well as its effect: a version that simply declined would
+	// leave the mapping intact too, and prove nothing.
+	acted, err := engine.engineRetryRepeatedClose()
 	require.NoError(t, err)
+	require.True(t, acted, "the repeated Close must take the cleanup claim")
 
 	require.NotEmpty(t, active.address(),
 		"a repeated Close unmapped segments the abandoned send loop is still reading")
@@ -1603,4 +1604,39 @@ func TestQwpSenderRepeatCloseCannotUnmapLeakedSegments(t *testing.T) {
 
 	// Release the deliberately leaked mapping so the test does not leak it.
 	require.NoError(t, qwpSfMunmap(active.buf))
+}
+
+// TestQwpSfCleanupRefusesEveryClaimBeforeReadersQuiesce pins the rule at the
+// place that enforces it. Terminal cleanup unmaps the segment files, so no
+// claimant may run it until the owner of the send loop has said the readers
+// are done -- and that has to hold for every claimant, not just the repeated
+// Close that first needed it.
+//
+// The retry owner arrives through engineRetryCloseIfNeeded, which carries no
+// send loop of its own, and the pool's re-probe reaches the same goroutine by
+// making sure one exists. If the rule lived only at the repeated-Close entry
+// point, pointing either of those at a slot whose loop is still live would
+// reopen the hole at a different door.
+func TestQwpSfCleanupRefusesEveryClaimBeforeReadersQuiesce(t *testing.T) {
+	engine, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	active := engine.engineActiveSegment()
+	require.NotNil(t, active)
+
+	// Nobody has said the send loop stopped, so every route in must decline.
+	require.NoError(t, engine.engineRetryCloseIfNeeded(),
+		"the retry route must decline quietly, not fault")
+	acted, err := engine.engineRetryRepeatedClose()
+	require.NoError(t, err)
+	require.False(t, acted, "a repeated Close must decline before the readers quiesce")
+
+	require.NotEmpty(t, active.address(),
+		"a claim taken before the readers quiesced unmapped a live segment")
+	require.False(t, engine.engineCloseCompleted())
+
+	// Once the owner speaks, the same routes work.
+	engine.cleanup.markReadersQuiesced(false)
+	require.NoError(t, engine.engineRetryCloseIfNeeded())
+	require.True(t, engine.engineCloseCompleted(),
+		"cleanup must run once the readers are known to have stopped")
 }

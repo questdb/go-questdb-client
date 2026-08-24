@@ -748,12 +748,20 @@ func TestQwpSfSwappableVarSurvivesConcurrentSwap(t *testing.T) {
 // under a live worker that keeps minting segments into the same directory.
 //
 // The window is opened here the way a producer mid-rotation opens it: appendMu
+// is held while the first Close runs.
+
 // TestQwpSfEngineRetryOwnerDrivesACloseThatNeverStarted pins the recovery from
-// a close that faulted ahead of the engine teardown -- a panic in the drain
-// wait or the send-loop shutdown, recovered by the pool's closeSlotGuarded. The
-// manager teardown never ran, so there is no ownerless terminal cleanup for a
-// claim to take over; without re-driving the close the retry owner would spin
-// at 1 Hz forever and the slot flock would never be released.
+// a close that faulted inside engineDriveClose, before it could prove the
+// manager quiescent. The rollback puts the phase back to open, so there is no
+// ownerless terminal cleanup for a claim to take over; without re-driving the
+// close the retry owner would spin at 1 Hz forever and the slot flock would
+// never be released.
+//
+// Quiescence is already on the record in that state, because engineCloseInternal
+// publishes it before anything that can fault, and it is one-way. Every retry
+// owner starts downstream of that call, so this setup reproduces it. A claimant
+// that somehow arrived without it declines instead of unmapping segments a live
+// send loop is reading -- a held flock rather than a dead process.
 func TestQwpSfEngineRetryOwnerDrivesACloseThatNeverStarted(t *testing.T) {
 	dir := t.TempDir()
 	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
@@ -761,7 +769,9 @@ func TestQwpSfEngineRetryOwnerDrivesACloseThatNeverStarted(t *testing.T) {
 	_, err = e.engineAppendBlocking(context.Background(), []byte("frame"))
 	require.NoError(t, err)
 
-	// Nothing has entered engineClose, which is exactly the post-panic state.
+	// engineCloseInternal published quiescence and then the drive faulted, so
+	// the phase is back to open with no owner: the post-rollback state.
+	e.cleanup.markReadersQuiesced(false)
 	require.False(t, cleanupManagerTornDown(e))
 	require.False(t, e.engineTryClaimTerminalCleanup(),
 		"cleanup is not ownerless yet -- the manager teardown has not run")
@@ -790,7 +800,6 @@ func TestQwpSfManagerCloseWithoutStartIsQuiescent(t *testing.T) {
 		"there is no worker exit to defer to")
 }
 
-// is held while the first Close runs.
 func TestQwpSfEngineCloseRetryWaitsForManagerTeardown(t *testing.T) {
 	dir := t.TempDir()
 	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)

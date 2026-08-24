@@ -43,12 +43,12 @@ func cleanupManagerTornDown(e *qwpSfCursorEngine) bool {
 }
 
 func (e *qwpSfCursorEngine) engineTryClaimTerminalCleanup() bool {
-	_, ok := e.cleanup.tryClaim(qwpSfCleanupOwnerClose, false)
+	_, ok := e.cleanup.tryClaim(qwpSfCleanupOwnerClose)
 	return ok
 }
 
 func (e *qwpSfCursorEngine) engineCloseRetryable() bool {
-	_, ok := e.cleanup.tryClaim(qwpSfCleanupOwnerClose, false)
+	_, ok := e.cleanup.tryClaim(qwpSfCleanupOwnerClose)
 	return ok
 }
 
@@ -128,7 +128,10 @@ func TestQwpSfCleanupTransitionTable(t *testing.T) {
 
 func TestQwpSfCleanupStaleTokenCannotComplete(t *testing.T) {
 	c := qwpSfCleanupControl{}
-	token, action := c.begin(false, qwpSfCleanupOwnerClose, false)
+	// begin refuses until the owner of the send loop has said the readers are
+	// done, which engineCloseInternal does before it asks for any cleanup.
+	c.markReadersQuiesced(false)
+	token, action := c.begin(false, qwpSfCleanupOwnerClose)
 	require.Equal(t, qwpSfCleanupDriveManager, action)
 	require.True(t, c.recordDrain(token, false))
 	claim, ok := c.managerReadyAndClaim(token, qwpSfCleanupOwnerClose)

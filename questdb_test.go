@@ -632,7 +632,6 @@ func TestQuestDBCloseReprobeAllowsLoggerReentry(t *testing.T) {
 type flippableDoneSlot struct{ done atomic.Bool }
 
 func (s *flippableDoneSlot) closeCompleted() bool               { return s.done.Load() }
-func (s *flippableDoneSlot) retryCloseIfNeeded() error          { return nil }
 func (s *flippableDoneSlot) ensureCloseRetryOwner(*slog.Logger) {}
 
 // TestQuestDBConcurrentCloseReprobes drives the real two-caller race on the

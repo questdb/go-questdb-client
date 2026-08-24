@@ -1085,12 +1085,6 @@ func closeEngineGuarded(engine *qwpSfCursorEngine, leakMappings bool, logger *sl
 	if engine == nil {
 		return nil
 	}
-	// Every caller of this function has already stopped its send loop or
-	// decided to leave the mappings alone, and leakMappings carries which.
-	// Publishing both together lets a later caller who did neither -- a
-	// repeated Close -- take cleanup over safely: it can never see the readers
-	// reported as done without also seeing that their mappings are off limits.
-	engine.engineMarkReadersQuiesced(leakMappings)
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("qwp: engine close panicked: %v\n%s", r, debug.Stack())
@@ -1269,13 +1263,6 @@ func (s *qwpLineSender) closeCompleted() bool {
 	return s == nil || s.cursorEngine == nil || s.cursorEngine.engineCloseCompleted()
 }
 
-func (s *qwpLineSender) retryCloseIfNeeded() error {
-	if s == nil || s.cursorEngine == nil {
-		return nil
-	}
-	return s.cursorEngine.engineRetryCloseIfNeeded()
-}
-
 func (s *qwpLineSender) ensureCloseRetryOwner(logger *slog.Logger) {
 	if s != nil && s.cursorEngine != nil {
 		s.cursorEngine.engineStartCloseRetryOwner(logger)
@@ -1307,9 +1294,6 @@ func (e *qwpSfBuildCleanupError) Error() string { return e.cause.Error() }
 func (e *qwpSfBuildCleanupError) Unwrap() error { return e.cause }
 func (e *qwpSfBuildCleanupError) closeCompleted() bool {
 	return e.engine.engineCloseCompleted()
-}
-func (e *qwpSfBuildCleanupError) retryCloseIfNeeded() error {
-	return e.engine.engineRetryCloseIfNeeded()
 }
 func (e *qwpSfBuildCleanupError) ensureCloseRetryOwner(logger *slog.Logger) {
 	e.engine.engineStartCloseRetryOwner(logger)

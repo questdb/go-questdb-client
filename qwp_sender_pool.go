@@ -638,17 +638,12 @@ type closeCompletionReporter interface {
 	closeCompleted() bool
 }
 
-type closeRetryReporter interface {
-	retryCloseIfNeeded() error
-}
-
 type closeRetryOwner interface {
 	ensureCloseRetryOwner(logger *slog.Logger)
 }
 
 type closeLifecycleReporter interface {
 	closeCompletionReporter
-	closeRetryReporter
 	closeRetryOwner
 }
 

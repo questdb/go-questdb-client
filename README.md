@@ -320,9 +320,9 @@ acknowledgement and observability accessors (`AwaitAckedFsn`,
 
 > This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`,
 > `DroppedConnectionNotifications`, `QuarantinedSlotPath`, and
-> `SlotLockReleased` to the `QwpSender` interface. Every built-in transport is updated; this is source-breaking only
-> for external code that implements `QwpSender` directly (callers that
-> type-assert to it are unaffected).
+> `SlotLockReleased` to the `QwpSender` interface. Every built-in transport
+> is updated; this is source-breaking only for external code that implements
+> `QwpSender` directly (callers that type-assert to it are unaffected).
 
 ### N-dimensional arrays
 
@@ -537,10 +537,11 @@ nil result does not on its own mean the slot is free. Ask
 `sender_id` on it:
 
 ```go
-qs, _ := sender.(qdb.QwpSender)
 _ = sender.Close(ctx)
-for !qs.SlotLockReleased() {
-	time.Sleep(10 * time.Millisecond)
+if qs, ok := sender.(qdb.QwpSender); ok {
+	for !qs.SlotLockReleased() {
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 ```
 
