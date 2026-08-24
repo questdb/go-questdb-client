@@ -538,13 +538,16 @@ func TestQwpSfSymbolDictFreshOpenPropagatesStatFailure(t *testing.T) {
 	legacy := append(qwpSfTestSymbolDictHeader(), 0x01, 'x')
 	require.NoError(t, os.WriteFile(path, legacy, 0o644))
 
+	injected := errors.New("injected stat failure")
 	originalStat := qwpSfSymbolDictStat.load()
-	qwpSfSymbolDictStat.store(func(string) (os.FileInfo, error) { return nil, errors.New("injected stat failure") })
+	qwpSfSymbolDictStat.store(func(string) (os.FileInfo, error) { return nil, injected })
 	t.Cleanup(func() { qwpSfSymbolDictStat.store(originalStat) })
 
 	d, err := qwpSfSymbolDictOpen(dir)
 	require.Nil(t, d)
 	require.ErrorContains(t, err, "could not stat symbol dictionary")
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.ErrorIs(t, err, injected)
 	got, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
 	require.Equal(t, legacy, got, "a stat failure must not fall through to O_TRUNC")
@@ -569,6 +572,7 @@ func TestQwpSfSymbolDictShortWriteRetryDoesNotAdvance(t *testing.T) {
 
 	err = d.appendSymbols([]string{"AAPL", "MSFT"})
 	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.ErrorIs(t, err, ErrSfDurability)
 	require.Zero(t, d.size(), "short write must not advance the symbol count")
 	require.Equal(t, initialOffset, d.appendOffset, "short write must not advance the append offset")
 
@@ -589,13 +593,16 @@ func TestQwpSfSymbolDictTruncateFailureIsOperational(t *testing.T) {
 	contents := append(append([]byte(nil), prefix...), 0x80)
 	require.NoError(t, os.WriteFile(path, contents, 0o644))
 
+	injected := errors.New("injected truncate failure")
 	originalTruncate := qwpSfSymbolDictTruncate.load()
-	qwpSfSymbolDictTruncate.store(func(*os.File, int64) error { return errors.New("injected truncate failure") })
+	qwpSfSymbolDictTruncate.store(func(*os.File, int64) error { return injected })
 	t.Cleanup(func() { qwpSfSymbolDictTruncate.store(originalTruncate) })
 
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
 	require.Nil(t, d)
 	require.ErrorContains(t, err, "could not drop torn/stale")
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.ErrorIs(t, err, injected)
 	got, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
 	require.Equal(t, contents, got, "failed truncation must preserve the file for retry")

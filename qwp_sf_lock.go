@@ -93,13 +93,13 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 		return nil, errors.New("qwp/sf: slotDir must not be empty")
 	}
 	if err := os.MkdirAll(slotDir, 0o755); err != nil {
-		return nil, fmt.Errorf("qwp/sf: could not create slot dir %s: %w", slotDir, err)
+		return nil, qwpSfDurabilityError("create slot directory", slotDir, err)
 	}
 	lockPath := filepath.Join(slotDir, qwpSfLockFileName)
 	pidPath := filepath.Join(slotDir, qwpSfLockPidFileName)
 	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: could not open slot lock file %s: %w", lockPath, err)
+		return nil, qwpSfDurabilityError("open slot lock file", lockPath, err)
 	}
 	if err := qwpSfFlockExclusive(f); err != nil {
 		holder := qwpSfReadHolder(pidPath)
@@ -122,7 +122,7 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 				"%w: slot already in use by another process [slot=%s, holder=%s]",
 				qwpSfErrLockBusy, slotDir, holder)
 		}
-		return nil, err
+		return nil, qwpSfDurabilityError("acquire slot lock", lockPath, err)
 	}
 	qwpSfWritePid(pidPath)
 	return &qwpSfSlotLock{

@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"encoding/binary"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -128,6 +129,7 @@ func TestQwpSfAckWatermarkRejectsGenerationWraparound(t *testing.T) {
 	w.generation = math.MaxInt64
 	advanced, err := w.persistIfAdvanced(0)
 	require.ErrorContains(t, err, "ack watermark generation overflow")
+	require.ErrorIs(t, err, ErrSfDurability)
 	require.ErrorIs(t, err, qwpSfErrGenerationOverflow)
 	assert.False(t, advanced)
 	assert.Equal(t, qwpSfAckWatermarkInvalid, w.read())
@@ -153,6 +155,7 @@ func TestQwpSfAckWatermarkMaxGenerationAllowsReopenedNoOps(t *testing.T) {
 	require.NoError(t, err, "regressing durable FSN is a no-op, not an overflow")
 	assert.False(t, advanced)
 	advanced, err = w.persistIfAdvanced(42)
+	require.ErrorIs(t, err, ErrSfDurability)
 	require.ErrorIs(t, err, qwpSfErrGenerationOverflow, "only a true advance overflows")
 	assert.False(t, advanced)
 }
@@ -338,6 +341,54 @@ func TestQwpSfAckWatermarkLegacy16ByteFileIsReset(t *testing.T) {
 	assert.Equal(t, qwpSfDualRecordFileSize, st.Size())
 }
 
+func TestQwpSfAckWatermarkLegacyResetWarnsOnceThroughConfiguredLogger(t *testing.T) {
+	root := t.TempDir()
+	slot := filepath.Join(root, qwpSfDefaultSenderId)
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	segment := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "a")
+	createRecoveryManifest(t, slot, 0, 0, segment)
+	require.NoError(t, segment.close())
+
+	legacy := make([]byte, 16)
+	binary.LittleEndian.PutUint32(legacy[0:4], qwpSfAckWatermarkMagic)
+	binary.LittleEndian.PutUint64(legacy[8:16], 42)
+	require.NoError(t, os.WriteFile(filepath.Join(slot, qwpSfAckWatermarkFileName), legacy, 0o644))
+
+	defaultCapture := &recordCapturingHandler{}
+	configuredCapture := &recordCapturingHandler{}
+	originalDefault := slog.Default()
+	slog.SetDefault(slog.New(defaultCapture))
+	t.Cleanup(func() { slog.SetDefault(originalDefault) })
+
+	openAndClose := func() {
+		sender, err := NewLineSender(context.Background(),
+			WithQwp(),
+			WithAddress("127.0.0.1:1"),
+			WithSfDir(root),
+			WithSfMaxSegmentBytes(4096),
+			WithInitialConnectMode(InitialConnectAsync),
+			WithCloseFlushTimeout(0),
+			WithLogger(slog.New(configuredCapture)),
+		)
+		require.NoError(t, err)
+		require.NoError(t, sender.Close(context.Background()))
+	}
+	openAndClose()
+	openAndClose()
+
+	const warning = "qwp/sf: reset legacy 16-byte ack watermark; acknowledged rows may replay"
+	warningCount := 0
+	for _, message := range configuredCapture.messages() {
+		if message == warning {
+			warningCount++
+		}
+	}
+	require.Equal(t, 1, warningCount,
+		"the successful legacy reset must warn exactly once even when the slot is reopened")
+	require.NotContains(t, defaultCapture.messages(), warning,
+		"the legacy reset warning must not leak to slog.Default")
+}
+
 func TestQwpSfEngineRecoveryRequiresAckWatermark(t *testing.T) {
 	dir := t.TempDir()
 	seg := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
@@ -348,6 +399,7 @@ func TestQwpSfEngineRecoveryRequiresAckWatermark(t *testing.T) {
 	engine, err := qwpSfNewCursorEngineForDrainer(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.Error(t, err)
 	assert.Nil(t, engine)
+	require.ErrorIs(t, err, ErrSfDurability)
 	assert.Contains(t, err.Error(), "could not open required ack watermark")
 }
 

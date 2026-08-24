@@ -87,6 +87,7 @@ var errQwpSfSymbolDictUnusable = errors.New("qwp/sf: unusable symbol dictionary"
 type qwpSfSymbolDict struct {
 	mu           sync.Mutex
 	file         *os.File
+	path         string
 	appendOffset int64
 	count        int
 	closed       bool
@@ -153,16 +154,24 @@ func qwpSfSymbolDictOpen(slotDir string) (*qwpSfSymbolDict, error) {
 	st, statErr := qwpSfSymbolDictStat.load()(path)
 	if statErr == nil {
 		if st.Size() >= qwpSfSymbolDictHeaderSize {
-			if d := qwpSfSymbolDictOpenExisting(path, st.Size()); d != nil {
+			d, openErr := qwpSfSymbolDictOpenExistingDetailed(path, st.Size())
+			if openErr == nil {
 				return d, nil
+			}
+			if !errors.Is(openErr, errQwpSfSymbolDictUnusable) {
+				return nil, qwpSfDurabilityError("open existing symbol dictionary", path, openErr)
 			}
 			// A header/parse failure on an existing file means it cannot be
 			// trusted for delta replay; start clean.
 		}
 	} else if !os.IsNotExist(statErr) {
-		return nil, fmt.Errorf("qwp/sf: could not stat symbol dictionary %s: %w", path, statErr)
+		return nil, qwpSfDurabilityError("could not stat symbol dictionary", path, statErr)
 	}
-	return qwpSfSymbolDictOpenFresh(path), nil
+	d, freshErr := qwpSfSymbolDictOpenFresh(path)
+	if freshErr != nil && os.IsNotExist(statErr) {
+		return nil, nil
+	}
+	return d, freshErr
 }
 
 // qwpSfSymbolDictOpenClean starts a fresh slot with an empty side-file. It
@@ -179,14 +188,14 @@ func qwpSfSymbolDictOpenClean(slotDir string) (*qwpSfSymbolDict, error) {
 	_, statErr := qwpSfSymbolDictStat.load()(path)
 	existed := statErr == nil
 	if statErr != nil && !os.IsNotExist(statErr) {
-		return nil, fmt.Errorf("qwp/sf: inspect fresh symbol dictionary %s: %w", path, statErr)
+		return nil, qwpSfDurabilityError("inspect fresh symbol dictionary", path, statErr)
 	}
-	d := qwpSfSymbolDictOpenFresh(path)
-	if d != nil {
+	d, freshErr := qwpSfSymbolDictOpenFresh(path)
+	if freshErr == nil {
 		return d, nil
 	}
 	if existed {
-		return nil, fmt.Errorf("qwp/sf: existing symbol dictionary %s could not be truncated for a fresh slot", path)
+		return nil, freshErr
 	}
 	return nil, nil
 }
@@ -216,7 +225,7 @@ func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, qwpSfDurabilityError("stat recovered symbol dictionary", path, err)
 	}
 	if st.Size() < qwpSfSymbolDictHeaderSize {
 		// The content is damaged; this is not an I/O outage that might clear
@@ -229,7 +238,7 @@ func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
 		return nil, nil
 	}
 	if openErr != nil {
-		return nil, fmt.Errorf("qwp/sf: recover symbol dictionary %s: %w", path, openErr)
+		return nil, qwpSfDurabilityError("recover symbol dictionary", path, openErr)
 	}
 	return d, nil
 }
@@ -297,6 +306,7 @@ func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymb
 	}
 	return &qwpSfSymbolDict{
 		file:         f,
+		path:         path,
 		appendOffset: int64(pos),
 		count:        len(loaded),
 		loaded:       loaded,
@@ -399,20 +409,24 @@ func qwpSfSymbolDictReadVarint(buf []byte, pos, limit int) (uint64, int, bool) {
 	return 0, 0, false
 }
 
-func qwpSfSymbolDictOpenFresh(path string) *qwpSfSymbolDict {
+func qwpSfSymbolDictOpenFresh(path string) (*qwpSfSymbolDict, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return nil
+		return nil, qwpSfDurabilityError("create fresh symbol dictionary", path, err)
 	}
 	var hdr [qwpSfSymbolDictHeaderSize]byte
 	binary.LittleEndian.PutUint32(hdr[:4], qwpSfSymbolDictMagic)
 	hdr[4] = qwpSfSymbolDictVersion
-	if _, err := f.WriteAt(hdr[:], 0); err != nil {
+	written, err := f.WriteAt(hdr[:], 0)
+	if err == nil && written != len(hdr) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return nil
+		return nil, qwpSfDurabilityError("write fresh symbol dictionary header", path, err)
 	}
-	return &qwpSfSymbolDict{file: f, appendOffset: qwpSfSymbolDictHeaderSize}
+	return &qwpSfSymbolDict{file: f, path: path, appendOffset: qwpSfSymbolDictHeaderSize}, nil
 }
 
 // appendSymbols durably extends the dictionary with names in ascending-id
@@ -461,10 +475,10 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 		d.scratch, crc32.Checksum(d.scratch, qwpSfCrcTable))
 	written, err := qwpSfSymbolDictWriteAt.load()(d.file, d.scratch, d.appendOffset)
 	if err != nil {
-		return err
+		return qwpSfDurabilityError("append symbol dictionary", d.path, err)
 	}
 	if written != len(d.scratch) {
-		return io.ErrShortWrite
+		return qwpSfDurabilityError("append symbol dictionary", d.path, io.ErrShortWrite)
 	}
 	d.appendOffset += int64(len(d.scratch))
 	d.count += len(names)

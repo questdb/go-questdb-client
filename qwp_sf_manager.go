@@ -62,21 +62,21 @@ var qwpSfTestBeforeTrimAccountingHook atomic.Pointer[func(*qwpSfManagerRingEntry
 
 func qwpSfSyncSpareCreationEpoch(dir, path string) error {
 	if err := qwpSfSyncSlotDir(dir); err != nil {
-		return fmt.Errorf("qwp/sf: fsync slot directory after minting spare %s: %w", path, err)
+		return qwpSfDurabilityError("sync slot directory after minting spare", path, err)
 	}
 	return nil
 }
 
 func qwpSfSyncPreTrimEpoch(dir string) error {
 	if err := qwpSfSyncSlotDir(dir); err != nil {
-		return fmt.Errorf("pre-trim directory fsync: %w", err)
+		return qwpSfDurabilityError("sync pre-trim directory", dir, err)
 	}
 	return nil
 }
 
 func qwpSfSyncPostTrimEpoch(dir string) error {
 	if err := qwpSfSyncSlotDir(dir); err != nil {
-		return fmt.Errorf("post-trim directory fsync: %w", err)
+		return qwpSfDurabilityError("sync post-trim directory", dir, err)
 	}
 	return nil
 }
@@ -456,8 +456,7 @@ func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSeg
 		var err error
 		quarantinedBytes, err = m.scanQuarantinedBytes(dir)
 		if err != nil {
-			return nil, fmt.Errorf("%w: qwp/sf: scan quarantined bytes in %s during manager registration: %w",
-				ErrSfDurability, dir, err)
+			return nil, qwpSfDurabilityError("scan quarantined bytes during manager registration", dir, err)
 		}
 		lastQuarantineReconcile = m.now()
 		// Move the generation counter past existing files before the worker can
@@ -744,7 +743,7 @@ func (m *qwpSfSegmentManager) reconcileQuarantinedBytes(e *qwpSfManagerRingEntry
 	e.lastQuarantineReconcile = now
 	quarantinedBytes, err := m.scanQuarantinedBytes(e.dir)
 	if err != nil {
-		return fmt.Errorf("qwp/sf: reconcile quarantined bytes in %s: %w", e.dir, err)
+		return qwpSfDurabilityError("reconcile quarantined bytes", e.dir, err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -993,7 +992,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 				// back.
 				e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{path: path, sizeBytes: sz})
 				if trimErr == nil {
-					trimErr = err
+					trimErr = qwpSfDurabilityError("unlink trimmed segment", path, err)
 				}
 				continue
 			}
@@ -1036,7 +1035,7 @@ func (m *qwpSfSegmentManager) cleanupUninstalledSpare(e *qwpSfManagerRingEntry, 
 	if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
 		return closeErr
 	}
-	removeErr = fmt.Errorf("remove uninstalled spare %s: %w", path, removeErr)
+	removeErr = qwpSfDurabilityError("remove uninstalled spare", path, removeErr)
 	retained := false
 	m.mu.Lock()
 	state := e.state.Load()
@@ -1067,7 +1066,7 @@ func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (i
 		if err := m.removeFile(pending.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			kept = append(kept, pending)
 			if firstErr == nil {
-				firstErr = fmt.Errorf("retry unlink of trimmed segment: %w", err)
+				firstErr = qwpSfDurabilityError("retry unlink of trimmed segment", pending.path, err)
 			}
 			continue
 		}
@@ -1078,7 +1077,7 @@ func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (i
 	if e.dirSyncPending && e.dir != "" {
 		if err := qwpSfSyncPostTrimEpoch(e.dir); err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("retry %w", err)
+				firstErr = err
 			}
 		} else {
 			e.dirSyncPending = false
@@ -1117,8 +1116,11 @@ func (m *qwpSfSegmentManager) recordServiceError(e *qwpSfManagerRingEntry, err e
 		}
 		e.maintenanceLastError = err
 		if now.Sub(e.maintenanceFailureSince) >= qwpSfManagerMaintenanceFailureDuration {
-			sticky := fmt.Errorf("%w: slot maintenance has failed continuously for %s: %w",
-				ErrSfDurability, now.Sub(e.maintenanceFailureSince), e.maintenanceLastError)
+			sticky := qwpSfDurabilityError(
+				fmt.Sprintf("slot maintenance has failed continuously for %s", now.Sub(e.maintenanceFailureSince)),
+				dir,
+				e.maintenanceLastError,
+			)
 			e.maintenanceError.Store(&sticky)
 		}
 	}

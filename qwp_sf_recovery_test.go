@@ -1021,6 +1021,8 @@ func TestQwpSfRecoveryTornActiveRollbackFailure(t *testing.T) {
 		qwpSfTornActiveLink.store(originalLink)
 		qwpSfTornActiveRename.store(originalRename)
 	})
+	installErr := errors.New("injected replacement install failure")
+	rollbackErr := errors.New("injected torn-active rollback failure")
 	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
 	qwpSfTornActiveRename.store(func(from, to string) error {
 		// The move-aside is the only rename allowed through. A .sfa.replacing
@@ -1028,12 +1030,17 @@ func TestQwpSfRecoveryTornActiveRollbackFailure(t *testing.T) {
 		if strings.HasSuffix(from, ".sfa") {
 			return originalRename(from, to)
 		}
-		return syscall.EIO
+		if strings.HasSuffix(from, qwpSfTornActiveTempSuffix) {
+			return installErr
+		}
+		return rollbackErr
 	})
 	_, _, err := qwpSfRecoverRing(dir, 4096)
 	qwpSfTornActiveLink.store(originalLink)
 	qwpSfTornActiveRename.store(originalRename)
-	require.ErrorIs(t, err, syscall.EIO)
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.ErrorIs(t, err, installErr)
+	require.ErrorIs(t, err, rollbackErr)
 	require.Contains(t, err.Error(), "no file is left at the committed active base")
 
 	_, err = os.Stat(path)

@@ -120,6 +120,7 @@ func TestQwpSfManifestRejectsGenerationOverflow(t *testing.T) {
 	m.generation = math.MaxInt64
 	err = m.update(0, 1)
 	require.ErrorContains(t, err, "manifest generation overflow")
+	require.ErrorIs(t, err, ErrSfDurability)
 	require.ErrorIs(t, err, qwpSfErrGenerationOverflow)
 	require.Equal(t, int64(0), m.activeBase)
 }
@@ -241,6 +242,7 @@ func TestQwpSfManifestRemovePreservesFilesystemCause(t *testing.T) {
 	t.Cleanup(func() { qwpSfManifestRemoveFile.store(original) })
 
 	err := qwpSfManifestRemove(t.TempDir())
+	require.ErrorIs(t, err, ErrSfDurability)
 	require.ErrorIs(t, err, injected)
 	require.ErrorContains(t, err, qwpSfManifestFileName)
 }

@@ -26,7 +26,6 @@ package questdb
 
 import (
 	"encoding/binary"
-	"fmt"
 )
 
 // qwpSfRecoveredDictAnalysis is what the engine constructor learns by reading
@@ -116,14 +115,14 @@ func qwpSfAnalyzeRecoveredDict(
 		for skip := coverage - deltaStart; skip > 0; skip-- {
 			entryLen, n, err := qwpReadVarint(p)
 			if err != nil || entryLen > uint64(len(p)-n) {
-				return fmt.Errorf("qwp/sf: malformed recovered symbol dictionary overlap at fsn %d", fsn)
+				return qwpSfFailClosed("malformed recovered symbol dictionary overlap at fsn %d", fsn)
 			}
 			p = p[n+int(entryLen):]
 		}
 		for id := coverage; id < deltaEnd; id++ {
 			entryLen, n, err := qwpReadVarint(p)
 			if err != nil || entryLen > uint64(len(p)-n) {
-				return fmt.Errorf("qwp/sf: malformed recovered symbol dictionary suffix at fsn %d", fsn)
+				return qwpSfFailClosed("malformed recovered symbol dictionary suffix at fsn %d", fsn)
 			}
 			p = p[n:]
 			a.symbols = append(a.symbols, string(p[:int(entryLen)]))
@@ -136,8 +135,8 @@ func qwpSfAnalyzeRecoveredDict(
 		return qwpSfRecoveredDictAnalysis{}, err
 	}
 	if gapAffectsReplay {
-		return qwpSfRecoveredDictAnalysis{}, fmt.Errorf(
-			"qwp/sf: recovered symbol dictionary is incomplete: surviving unacked frames reference ids below their delta start; resend required")
+		return qwpSfRecoveredDictAnalysis{}, qwpSfFailClosed(
+			"recovered symbol dictionary is incomplete: surviving unacked frames reference ids below their delta start; resend required")
 	}
 	return a, nil
 }
@@ -164,14 +163,14 @@ func qwpSfWalkRecoveredFrames(ring *qwpSfSegmentRing, visit func(fsn int64, payl
 		pos := qwpSfHeaderSize
 		for frame := int64(0); frame < segment.segmentFrameCount(); frame++ {
 			if pos+qwpSfFrameHeaderSize > limit {
-				return fmt.Errorf("qwp/sf: recovered frame envelope is truncated [baseSeq=%d, frame=%d]",
+				return qwpSfFailClosed("recovered frame envelope is truncated [baseSeq=%d, frame=%d]",
 					segment.segmentBaseSeq(), frame)
 			}
 			payloadLen := int64(binary.LittleEndian.Uint32(buf[pos+4 : pos+8]))
 			payloadStart := pos + qwpSfFrameHeaderSize
 			payloadEnd := payloadStart + payloadLen
 			if payloadEnd < payloadStart || payloadEnd > limit {
-				return fmt.Errorf("qwp/sf: recovered frame payload is truncated [baseSeq=%d, frame=%d, payloadLen=%d]",
+				return qwpSfFailClosed("recovered frame payload is truncated [baseSeq=%d, frame=%d, payloadLen=%d]",
 					segment.segmentBaseSeq(), frame, payloadLen)
 			}
 			if err := visit(segment.segmentBaseSeq()+frame, buf[payloadStart:payloadEnd]); err != nil {

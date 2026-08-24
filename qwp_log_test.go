@@ -66,6 +66,109 @@ func (h *recordCapturingHandler) sourceFiles() []string {
 	return files
 }
 
+func (h *recordCapturingHandler) messages() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	messages := make([]string, 0, len(h.records))
+	for _, r := range h.records {
+		messages = append(messages, r.Message)
+	}
+	return messages
+}
+
+func TestQwpRecoveryDiagnosticsUseConfiguredLoggerFromEngineOpen(t *testing.T) {
+	defaultCapture := &recordCapturingHandler{}
+	configuredCapture := &recordCapturingHandler{}
+	originalDefault := slog.Default()
+	slog.SetDefault(slog.New(defaultCapture))
+	t.Cleanup(func() { slog.SetDefault(originalDefault) })
+
+	tests := []struct {
+		name        string
+		message     string
+		prepareSlot func(t *testing.T, slot string)
+	}{
+		{
+			name:    "sanitized residue retry",
+			message: "qwp/sf: sealed-segment residue was sanitized; retrying recovery once",
+			prepareSlot: func(t *testing.T, slot string) {
+				s0 := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "a")
+				s1 := createRecoverySegment(t, slot, "sf-0001.sfa", 1, "b")
+				createRecoveryManifest(t, slot, 0, 1, s0, s1)
+				s0.buf[s0.publishedOffset()+20] = 0x7f
+				closeRecoverySegments(t, s0, s1)
+			},
+		},
+		{
+			name:    "fail-closed quarantine",
+			message: "qwp/sf: recovery failed closed; preserved the slot and starting fresh",
+			prepareSlot: func(t *testing.T, slot string) {
+				segment, err := qwpSfCreateSegment(filepath.Join(slot, "sf-initial.sfa"), 0, 4096)
+				require.NoError(t, err)
+				require.NoError(t, segment.markManifestRequired())
+				require.NoError(t, segment.close())
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			slot := filepath.Join(root, qwpSfDefaultSenderId)
+			require.NoError(t, os.MkdirAll(slot, 0o755))
+			tc.prepareSlot(t, slot)
+
+			sender, err := NewLineSender(context.Background(),
+				WithQwp(),
+				WithAddress("127.0.0.1:1"),
+				WithSfDir(root),
+				WithInitialConnectMode(InitialConnectAsync),
+				WithCloseFlushTimeout(0),
+				WithLogger(slog.New(configuredCapture)),
+			)
+			require.NoError(t, err)
+			require.NoError(t, sender.Close(context.Background()))
+
+			require.Contains(t, configuredCapture.messages(), tc.message,
+				"recovery diagnostics must use the logger configured by the caller")
+			require.NotContains(t, defaultCapture.messages(), tc.message,
+				"recovery diagnostics must not leak to slog.Default")
+		})
+	}
+}
+
+func TestQwpDrainerRecoveryDiagnosticUsesConfiguredLoggerFromEngineOpen(t *testing.T) {
+	defaultCapture := &recordCapturingHandler{}
+	configuredCapture := &recordCapturingHandler{}
+	originalDefault := slog.Default()
+	slog.SetDefault(slog.New(defaultCapture))
+	t.Cleanup(func() { slog.SetDefault(originalDefault) })
+
+	slot := t.TempDir()
+	s0 := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "a")
+	s1 := createRecoverySegment(t, slot, "sf-0001.sfa", 1, "b")
+	createRecoveryManifest(t, slot, 0, 1, s0, s1)
+	s0.buf[s0.publishedOffset()+20] = 0x7f
+	closeRecoverySegments(t, s0, s1)
+
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+	drainer := qwpSfNewOrphanDrainer(
+		slot, 4096, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		nil,
+		200*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond,
+	)
+	drainer.logger = qwpGuardLogger(slog.New(configuredCapture))
+	drainer.drainerRun(context.Background())
+
+	const message = "qwp/sf: sealed-segment residue was sanitized; retrying recovery once"
+	require.Contains(t, configuredCapture.messages(), message,
+		"drainer recovery diagnostics must use the drainer's configured logger")
+	require.NotContains(t, defaultCapture.messages(), message,
+		"drainer recovery diagnostics must not leak to slog.Default")
+}
+
 // TestQwpLogSourceAttributionSurvivesTheGuard pins that the panic guard lives
 // on the handler, not around the call: slog captures the caller's PC before
 // the handler runs, so an AddSource-style handler sees the real emitting

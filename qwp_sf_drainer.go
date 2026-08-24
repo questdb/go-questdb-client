@@ -403,7 +403,9 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		}
 	}()
 
-	engine, err := qwpSfNewCursorEngineForDrainer(d.slotPath, d.segmentSize, d.sfMaxTotalBytes, qwpSfEngineDefaultAppendDeadline)
+	engine, err := qwpSfNewCursorEngineWithOptions(d.slotPath, d.segmentSize, d.sfMaxTotalBytes, qwpSfEngineDefaultAppendDeadline, qwpSfEngineOpenOptions{
+		logger: d.logger,
+	})
 	if err != nil {
 		// Lock contention is expected (a sibling drainer or the
 		// foreground sender holds it) — exit silently, no .failed.
@@ -447,7 +449,6 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 				"slot", d.slotPath)
 		}
 	}()
-	engine.engineSetLogger(qwpEffectiveLogger(d.logger))
 	if hook := qwpSfTestAfterDrainerEngineOpenHook.Load(); hook != nil {
 		(*hook)(engine)
 	}

@@ -87,19 +87,6 @@ var qwpSfCloseRetryInterval = qwpSfSwappable(time.Second)
 var ErrBackpressureTimeout = errors.New(
 	"qwp/sf: cursor ring backpressured — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)")
 
-// ErrSfDurability is the sentinel a QWP store-and-forward producer call wraps
-// when the slot's local storage cannot durably commit the state the sender
-// needs: a segment rotation's header or manifest update, or the background
-// maintenance that persists the ack watermark and trims acked segments. The
-// failed append has not been assigned an FSN and remains pending in the
-// sender, so callers may correct the local-storage failure and retry the same
-// operation. Sender construction wraps the same sentinel when a local
-// filesystem fault keeps slot recovery from setting a broken boundary record
-// aside: the slot and its rows are left exactly as they were, and the same
-// construction succeeds once the fault clears. Match it with errors.Is; the
-// underlying filesystem error remains matchable as well.
-var ErrSfDurability = errors.New("qwp/sf: could not durably commit store-and-forward state")
-
 // qwpSfTestBeforeSegmentUnlinkHook is a test seam for holding terminal cleanup
 // after quiescence while a concurrent Close arrives. Production leaves it nil.
 var qwpSfTestBeforeSegmentUnlinkHook atomic.Pointer[func(path string)]
@@ -317,19 +304,31 @@ type qwpSfCursorEngine struct {
 // process is using the slot), or if recovery encounters an
 // inconsistent on-disk state.
 func qwpSfNewCursorEngine(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
-	return qwpSfNewCursorEngineWithRecoveryPolicy(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, true)
+	return qwpSfNewCursorEngineWithOptions(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, qwpSfEngineOpenOptions{
+		recoverForeground: true,
+	})
 }
 
 func qwpSfNewCursorEngineForDrainer(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
-	return qwpSfNewCursorEngineWithRecoveryPolicy(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, false)
+	return qwpSfNewCursorEngineWithOptions(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, qwpSfEngineOpenOptions{})
 }
 
-func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, recoverForeground bool) (*qwpSfCursorEngine, error) {
+// qwpSfEngineOpenOptions configures recovery policy and logging during engine
+// construction. Recovery and the manager worker use the configured logger.
+type qwpSfEngineOpenOptions struct {
+	logger            *slog.Logger
+	recoverForeground bool
+}
+
+func qwpSfNewCursorEngineWithOptions(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (*qwpSfCursorEngine, error) {
+	if options.logger != nil {
+		options.logger = qwpEffectiveLogger(options.logger)
+	}
 	// Where the bytes of a slot this build refused went, carried onto the fresh
 	// engine so the caller can find them without reading the log.
 	quarantinedPath := ""
 	for attempt := 0; ; attempt++ {
-		e, err := qwpSfNewCursorEngineOnce(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline)
+		e, err := qwpSfNewCursorEngineOnce(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, options)
 		if err == nil || sfDir == "" {
 			if e != nil {
 				e.quarantinedPath = quarantinedPath
@@ -342,21 +341,22 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 		// otherwise one slot recovers under a foreground sender and the same
 		// slot is abandoned under a drainer.
 		if errors.Is(err, qwpSfErrSanitizedResidue) && attempt == 0 {
-			qwpEffectiveLogger(nil).Error("qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
+			qwpEffectiveLogger(options.logger).Error("qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
 			continue
 		}
 		// Quarantine-and-start-fresh is a foreground-only policy: a drainer
 		// exists to deliver the slot's rows, so it reports the failure and
 		// leaves the bytes where they are.
-		if !recoverForeground {
+		if !options.recoverForeground {
 			return nil, err
 		}
 		if errors.Is(err, qwpSfErrRecoveryFailClosed) && attempt <= 1 {
 			quarantined, quarantineErr := qwpSfQuarantineSlot(sfDir)
 			if quarantineErr != nil {
-				return nil, fmt.Errorf("%w; additionally could not quarantine slot: %v", err, quarantineErr)
+				return nil, errors.Join(err,
+					qwpSfDurabilityError("quarantine fail-closed slot", sfDir, quarantineErr))
 			}
-			qwpEffectiveLogger(nil).Error("qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
+			qwpEffectiveLogger(options.logger).Error("qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
 			// Keep the first preserved directory. The loop can quarantine
 			// twice, and only the first copy holds the rows the caller came
 			// looking for -- the second is whatever the fresh slot managed to
@@ -371,7 +371,7 @@ func qwpSfNewCursorEngineWithRecoveryPolicy(sfDir string, segmentSizeBytes, maxT
 	}
 }
 
-func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (result *qwpSfCursorEngine, err error) {
+func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (result *qwpSfCursorEngine, err error) {
 	mgr, err := qwpSfNewSegmentManager(segmentSizeBytes, qwpSfManagerDefaultPoll, maxTotalBytes)
 	if err != nil {
 		return nil, err
@@ -394,8 +394,11 @@ func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int6
 			}
 		}
 	}()
+	if options.logger != nil {
+		mgr.logger.Store(options.logger)
+	}
 	mgr.segmentManagerStart()
-	e, err := qwpSfNewCursorEngineWithManager(sfDir, segmentSizeBytes, mgr, appendDeadline)
+	e, err := qwpSfNewCursorEngineWithManagerOptions(sfDir, segmentSizeBytes, mgr, appendDeadline, options)
 	if err != nil {
 		return nil, err
 	}
@@ -408,6 +411,10 @@ func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int6
 // given segment manager (must already be started). The caller
 // retains ownership of the manager; engineClose will not stop it.
 func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegmentManager, appendDeadline time.Duration) (result *qwpSfCursorEngine, err error) {
+	return qwpSfNewCursorEngineWithManagerOptions(sfDir, segmentSizeBytes, mgr, appendDeadline, qwpSfEngineOpenOptions{})
+}
+
+func qwpSfNewCursorEngineWithManagerOptions(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegmentManager, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (result *qwpSfCursorEngine, err error) {
 	if appendDeadline <= 0 {
 		appendDeadline = qwpSfEngineDefaultAppendDeadline
 	}
@@ -492,7 +499,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	// overlapping FSNs already on disk and corrupting ACK
 	// translation, trim, and replay.
 	if !memoryMode {
-		ring, _, err = qwpSfRecoverRing(sfDir, segmentSizeBytes)
+		ring, _, err = qwpSfRecoverRingWithContext(sfDir, segmentSizeBytes, qwpSfRecoveryContext{logger: options.logger})
 		if err != nil {
 			return nil, err
 		}
@@ -533,7 +540,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			//     lowestBase is higher, watermark is stale; max picks
 			//     lowestBase-1.
 			//
-			watermark, err = qwpSfAckWatermarkOpenRequired(sfDir)
+			watermark, err = qwpSfAckWatermarkOpenRequiredWithLogger(sfDir, options.logger)
 			if errors.Is(err, qwpSfErrAckWatermarkUnbacked) {
 				// A full disk is the ordinary way to get here, and draining
 				// this slot is what gives the disk its space back, so the
@@ -541,12 +548,12 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 				// slot. The seed then comes from the surviving segments alone,
 				// which can re-send frames a previous session already got
 				// acked.
-				qwpEffectiveLogger(nil).Warn("qwp/sf: opening a recovered slot without its ack watermark; already-acked frames may replay",
+				qwpEffectiveLogger(options.logger).Warn("qwp/sf: opening a recovered slot without its ack watermark; already-acked frames may replay",
 					"dir", sfDir, "error", err)
 				watermark, err = nil, nil
 			}
 			if err != nil {
-				return nil, fmt.Errorf("qwp/sf: could not open required ack watermark: %w", err)
+				return nil, qwpSfDurabilityError("could not open required ack watermark", sfDir, err)
 			}
 			// Load the persisted symbol dictionary so this recovered slot's
 			// delta frames can be re-registered on a fresh server before they
@@ -571,7 +578,12 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// published sequence it reached, and a sender there would otherwise
 			// send a full symbol dictionary on every frame for its whole life.
 			if persistedDict == nil && !ring.segmentRingHoldsFrames() {
-				persistedDict = qwpSfSymbolDictOpenFresh(filepath.Join(sfDir, qwpSfSymbolDictFileName))
+				var freshDictErr error
+				persistedDict, freshDictErr = qwpSfSymbolDictOpenFresh(filepath.Join(sfDir, qwpSfSymbolDictFileName))
+				if freshDictErr != nil {
+					qwpEffectiveLogger(options.logger).Warn("qwp/sf: could not create a symbol dictionary for an empty recovered slot; falling back to full-dictionary frames",
+						"dir", sfDir, "error", freshDictErr)
+				}
 			}
 			watermarkFsn := watermark.read() // nil-safe → INVALID
 			candidate := baseSeed
@@ -622,7 +634,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			if persistedDict != nil && len(recoveredSymbols) > persistedDict.size() {
 				from := persistedDict.size()
 				if appendErr := persistedDict.appendSymbols(recoveredSymbols[from:]); appendErr != nil {
-					qwpEffectiveLogger(nil).Warn("qwp/sf: could not heal recovered symbol dictionary; falling back to full-dictionary frames",
+					qwpEffectiveLogger(options.logger).Warn("qwp/sf: could not heal recovered symbol dictionary; falling back to full-dictionary frames",
 						"error", appendErr)
 					_ = persistedDict.close()
 					persistedDict = nil
@@ -645,9 +657,9 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			if err := qwpSfManifestRemove(sfDir); err != nil {
 				return nil, err
 			}
-			watermark, err = qwpSfAckWatermarkOpenRequired(sfDir)
+			watermark, err = qwpSfAckWatermarkOpenRequiredWithLogger(sfDir, options.logger)
 			if errors.Is(err, qwpSfErrAckWatermarkUnbacked) {
-				qwpEffectiveLogger(nil).Warn("qwp/sf: opening a fresh slot without its ack watermark; a later recovery falls back to the surviving segments",
+				qwpEffectiveLogger(options.logger).Warn("qwp/sf: opening a fresh slot without its ack watermark; a later recovery falls back to the surviving segments",
 					"dir", sfDir, "error", err)
 				watermark, err = nil, nil
 			}
@@ -674,7 +686,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 				return nil, err
 			}
 			if err := qwpSfSyncSlotDir(sfDir); err != nil {
-				return nil, fmt.Errorf("qwp/sf: fsync fresh slot directory: %w", err)
+				return nil, qwpSfDurabilityError("sync fresh slot directory", sfDir, err)
 			}
 			var createErr error
 			manifest, createErr = qwpSfManifestCreate(sfDir, 0, 0)
@@ -767,10 +779,8 @@ func (e *qwpSfCursorEngine) engineAckedFsn() int64 {
 	return e.ring.segmentRingAckedFsn()
 }
 
-// engineSetLogger points the segment manager's cap-reached backpressure
-// diagnostic at the configured logger. The manager's worker goroutine is
-// already running by the time the caller has a logger, so the store is
-// through an atomic.Pointer; a nil logger leaves the slog.Default() fallback.
+// engineSetLogger changes the segment manager's diagnostic logger. The atomic
+// pointer makes concurrent reads safe. A nil logger uses slog.Default().
 func (e *qwpSfCursorEngine) engineSetLogger(l *slog.Logger) {
 	if e == nil || e.manager == nil {
 		return
@@ -966,7 +976,7 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 }
 
 func (e *qwpSfCursorEngine) rotationDurabilityError() error {
-	return fmt.Errorf("%w: %w", ErrSfDurability, e.ring.rotationError())
+	return qwpSfDurabilityError("rotate active segment", e.sfDir, e.ring.rotationError())
 }
 
 // tryAppendOrFsn runs one ring.appendOrFsn under appendMu, re-checking
@@ -1566,7 +1576,7 @@ func qwpSfUnlinkSegmentsAndSyncDir(dir string) error {
 	// toward, and there is no namespace left to make durable. Treating it as
 	// success also prevents the retry owner from retaining the flock forever.
 	if err := qwpSfSyncSlotDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("qwp/sf: sync slot directory after unlinking drained segments in %s: %w", dir, err)
+		return qwpSfDurabilityError("sync slot directory after unlinking drained segments", dir, err)
 	}
 	return nil
 }
@@ -1579,7 +1589,7 @@ func qwpSfRemoveManifestAndSyncDir(dir string) error {
 		return err
 	}
 	if err := qwpSfSyncSlotDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("qwp/sf: sync slot directory after removing manifest in %s: %w", dir, err)
+		return qwpSfDurabilityError("sync slot directory after removing manifest", dir, err)
 	}
 	return nil
 }

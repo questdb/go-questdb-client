@@ -198,18 +198,18 @@ func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, e
 	// immediately beyond EOF) needs in order to cover [0, sizeBytes).
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: openCleanRW %s: %w", path, err)
+		return nil, qwpSfDurabilityError("create segment", path, err)
 	}
 	if err := qwpSfAllocate(f, sizeBytes); err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return nil, err
+		return nil, qwpSfDurabilityError("allocate segment", path, err)
 	}
 	buf, err := qwpSfMmapRW(f, sizeBytes)
 	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
-		return nil, err
+		return nil, qwpSfDurabilityError("map created segment", path, err)
 	}
 	s := &qwpSfSegment{
 		path:         path,
@@ -277,7 +277,7 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	st, err := os.Stat(path)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: stat %s: %w", path, err)
+		return nil, qwpSfDurabilityError("stat segment", path, err)
 	}
 	fileSize := st.Size()
 	if fileSize < qwpSfHeaderSize {
@@ -285,12 +285,12 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: openRW %s: %w", path, err)
+		return nil, qwpSfDurabilityError("open segment", path, err)
 	}
 	buf, err := qwpSfMmapRW(f, fileSize)
 	if err != nil {
 		_ = f.Close()
-		return nil, err
+		return nil, qwpSfDurabilityError("map segment", path, err)
 	}
 	magic := binary.LittleEndian.Uint32(buf[0:4])
 	if magic != qwpSfFileMagic {
@@ -469,14 +469,14 @@ func (s *qwpSfSegment) syncHeader() error {
 	}
 	if hook := qwpSfTestSegmentSyncHeaderErrorHook.Load(); hook != nil {
 		if err := (*hook)(s.path); err != nil {
-			return fmt.Errorf("%w: qwp/sf: sync segment header %s: %w", ErrSfDurability, s.path, err)
+			return qwpSfDurabilityError("sync segment header", s.path, err)
 		}
 	}
 	if err := qwpSfMsync(s.buf, qwpSfHeaderSize); err != nil {
-		return fmt.Errorf("%w: qwp/sf: msync segment header %s: %w", ErrSfDurability, s.path, err)
+		return qwpSfDurabilityError("msync segment header", s.path, err)
 	}
 	if err := qwpSfFsync(s.file); err != nil {
-		return fmt.Errorf("%w: qwp/sf: fsync segment header %s: %w", ErrSfDurability, s.path, err)
+		return qwpSfDurabilityError("fsync segment header", s.path, err)
 	}
 	return nil
 }
@@ -501,17 +501,22 @@ func (s *qwpSfSegment) writeRecoveryAt(data []byte, off int64, op string) error 
 		return nil
 	}
 	if s.file == nil || off < 0 || off > s.sizeBytes-int64(len(data)) {
-		return fmt.Errorf("%w: qwp/sf: %s outside segment bounds %s at offset %d length %d",
-			ErrSfDurability, op, s.path, off, len(data))
+		return qwpSfDurabilityError(
+			fmt.Sprintf("%s outside segment bounds at offset %d length %d", op, off, len(data)),
+			s.path,
+			nil,
+		)
 	}
 	written, err := qwpSfSegmentWriteAt.load()(s.file, data, off)
 	if err != nil {
-		return fmt.Errorf("%w: qwp/sf: %s %s at offset %d: %w",
-			ErrSfDurability, op, s.path, off, err)
+		return qwpSfDurabilityError(fmt.Sprintf("%s at offset %d", op, off), s.path, err)
 	}
 	if written != len(data) {
-		return fmt.Errorf("%w: qwp/sf: %s %s at offset %d: wrote %d of %d bytes: %w",
-			ErrSfDurability, op, s.path, off, written, len(data), io.ErrShortWrite)
+		return qwpSfDurabilityError(
+			fmt.Sprintf("%s at offset %d: wrote %d of %d bytes", op, off, written, len(data)),
+			s.path,
+			io.ErrShortWrite,
+		)
 	}
 	copy(s.buf[off:off+int64(len(data))], data)
 	return nil
@@ -573,14 +578,14 @@ var qwpSfTestSegmentSanitizeTailSyncErrorHook atomic.Pointer[func(path, phase st
 func (s *qwpSfSegment) syncSanitizedTail(phase string) error {
 	if hook := qwpSfTestSegmentSanitizeTailSyncErrorHook.Load(); hook != nil {
 		if err := (*hook)(s.path, phase); err != nil {
-			return fmt.Errorf("qwp/sf: sync %s torn tail %s: %w", phase, s.path, err)
+			return qwpSfDurabilityError("sync "+phase+" torn tail", s.path, err)
 		}
 	}
 	if err := qwpSfMsync(s.buf, s.sizeBytes); err != nil {
-		return fmt.Errorf("qwp/sf: msync %s torn tail %s: %w", phase, s.path, err)
+		return qwpSfDurabilityError("msync "+phase+" torn tail", s.path, err)
 	}
 	if err := qwpSfFsync(s.file); err != nil {
-		return fmt.Errorf("qwp/sf: fsync %s torn tail %s: %w", phase, s.path, err)
+		return qwpSfDurabilityError("fsync "+phase+" torn tail", s.path, err)
 	}
 	return nil
 }

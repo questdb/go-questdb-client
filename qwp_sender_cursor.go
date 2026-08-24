@@ -200,11 +200,13 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 
 	// Build the cursor engine first — it owns the slot lock and on-disk
 	// recovery.
-	engine, err := qwpSfNewCursorEngine(slotPath, sfMaxSegmentBytes, sfMaxTotalBytes, appendDeadline)
+	engine, err := qwpSfNewCursorEngineWithOptions(slotPath, sfMaxSegmentBytes, sfMaxTotalBytes, appendDeadline, qwpSfEngineOpenOptions{
+		logger:            conf.logger,
+		recoverForeground: true,
+	})
 	if err != nil {
 		return nil, err
 	}
-	engine.engineSetLogger(qwpEffectiveLogger(conf.logger))
 	// The engine holds the slot flock, mappings and side-file descriptors from
 	// here on. Install one construction obligation before acquiring the send
 	// loop, sender and drainer-pool resources below. It runs for every error and
@@ -638,7 +640,11 @@ func (s *qwpLineSender) persistNewSymbols() error {
 		}
 		qwpEffectiveLogger(logger).Warn("qwp/sf: symbol dictionary persistence failed; switching to full-dictionary frames",
 			"error", err)
-		return fmt.Errorf("qwp/sf: persist symbol dictionary: %w; sender switched to full-dictionary mode, retry the flush", err)
+		return qwpSfDurabilityError(
+			"persist symbol dictionary; sender switched to full-dictionary mode, retry the flush",
+			s.persistedSymbolDict.path,
+			err,
+		)
 	}
 	return nil
 }

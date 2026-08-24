@@ -328,6 +328,7 @@ func TestQwpAnalyzeRecoveredDictAckedGapReset(t *testing.T) {
 	// restart that follows it comes too late.
 	_, err = qwpSfAnalyzeRecoveredDict(ring, -1, nil)
 	require.ErrorContains(t, err, "resend required")
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
 }
 
 func TestQwpEngineRecoveryMissingDictRejectsUnackedGap(t *testing.T) {
@@ -340,8 +341,14 @@ func TestQwpEngineRecoveryMissingDictRejectsUnackedGap(t *testing.T) {
 	require.NoError(t, os.Remove(filepath.Join(dir, qwpSfSymbolDictFileName)))
 
 	recovered, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
-	require.ErrorContains(t, err, "resend required")
-	require.Nil(t, recovered)
+	require.NoError(t, err)
+	require.NotNil(t, recovered)
+	require.Equal(t, int64(-1), recovered.enginePublishedFsn(), "the replacement slot must start empty")
+	quarantined := recovered.engineQuarantinedSlotPath()
+	require.NotEmpty(t, quarantined)
+	require.FileExists(t, filepath.Join(quarantined, "sf-initial.sfa"),
+		"the byte-proven inconsistent slot must be preserved for inspection")
+	require.NoError(t, recovered.engineClose())
 }
 
 // TestQwpEngineRecoveryCorruptDictFallsBackToSurvivingFrames pins the two

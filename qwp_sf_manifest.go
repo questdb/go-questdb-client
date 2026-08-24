@@ -115,6 +115,7 @@ func qwpSfSelectDualRecord(slot0 qwpSfDualRecord, valid0 bool, slot1 qwpSfDualRe
 type qwpSfManifest struct {
 	mu         sync.Mutex
 	file       *os.File
+	path       string
 	generation int64
 	headBase   int64
 	activeBase int64
@@ -129,9 +130,9 @@ func qwpSfManifestCreate(dir string, headBase, activeBase int64) (*qwpSfManifest
 	path := filepath.Join(dir, qwpSfManifestFileName)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: create manifest %s: %w", path, err)
+		return nil, qwpSfDurabilityError("create manifest", path, err)
 	}
-	m := &qwpSfManifest{file: f, headBase: -1, activeBase: -1}
+	m := &qwpSfManifest{file: f, path: path, headBase: -1, activeBase: -1}
 	ok := false
 	defer func() {
 		if !ok {
@@ -140,13 +141,13 @@ func qwpSfManifestCreate(dir string, headBase, activeBase int64) (*qwpSfManifest
 		}
 	}()
 	if err := qwpSfAllocate(f, qwpSfDualRecordFileSize); err != nil {
-		return nil, err
+		return nil, qwpSfDurabilityError("allocate manifest", path, err)
 	}
 	if err := m.update(headBase, activeBase); err != nil {
 		return nil, err
 	}
 	if err := qwpSfSyncSlotDir(dir); err != nil {
-		return nil, fmt.Errorf("qwp/sf: fsync manifest directory %s: %w", dir, err)
+		return nil, qwpSfDurabilityError("sync manifest directory", dir, err)
 	}
 	ok = true
 	return m, nil
@@ -175,23 +176,23 @@ func qwpSfManifestInspect(dir string) (*qwpSfManifest, bool, error) {
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("qwp/sf: stat manifest %s: %w", path, err)
+		return nil, false, qwpSfDurabilityError("stat manifest", path, err)
 	}
 	if st.Size() != qwpSfDualRecordFileSize {
 		return nil, true, nil
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return nil, false, fmt.Errorf("qwp/sf: open manifest %s: %w", path, err)
+		return nil, false, qwpSfDurabilityError("open manifest", path, err)
 	}
 	var raw [2][qwpSfDualRecordSize]byte
 	if _, err := io.ReadFull(io.NewSectionReader(f, 0, qwpSfDualRecordSize), raw[0][:]); err != nil {
 		_ = f.Close()
-		return nil, false, fmt.Errorf("qwp/sf: read manifest slot 0: %w", err)
+		return nil, false, qwpSfDurabilityError("read manifest slot 0", path, err)
 	}
 	if _, err := io.ReadFull(io.NewSectionReader(f, qwpSfDualRecordSlotSize, qwpSfDualRecordSize), raw[1][:]); err != nil {
 		_ = f.Close()
-		return nil, false, fmt.Errorf("qwp/sf: read manifest slot 1: %w", err)
+		return nil, false, qwpSfDurabilityError("read manifest slot 1", path, err)
 	}
 	valid := func(rec qwpSfDualRecord) bool { return rec.first >= 0 && rec.second >= rec.first }
 	r0, ok0 := qwpSfDecodeDualRecord(raw[0][:], qwpSfManifestMagic, valid)
@@ -201,7 +202,7 @@ func qwpSfManifestInspect(dir string) (*qwpSfManifest, bool, error) {
 		_ = f.Close()
 		return nil, true, nil
 	}
-	return &qwpSfManifest{file: f, generation: rec.generation, headBase: rec.first, activeBase: rec.second}, false, nil
+	return &qwpSfManifest{file: f, path: path, generation: rec.generation, headBase: rec.first, activeBase: rec.second}, false, nil
 }
 
 func (m *qwpSfManifest) update(newHead, newActive int64) error {
@@ -228,7 +229,7 @@ func (m *qwpSfManifest) update(newHead, newActive int64) error {
 		return nil
 	}
 	if m.generation == math.MaxInt64 {
-		return fmt.Errorf("qwp/sf: manifest generation overflow: %w", qwpSfErrGenerationOverflow)
+		return qwpSfDurabilityError("manifest generation overflow", m.path, qwpSfErrGenerationOverflow)
 	}
 	next := m.generation + 1
 	qwpSfEncodeDualRecord(m.scratch[:], qwpSfManifestMagic, next, newHead, newActive)
@@ -237,10 +238,10 @@ func (m *qwpSfManifest) update(newHead, newActive int64) error {
 		if err == nil {
 			err = io.ErrShortWrite
 		}
-		return fmt.Errorf("qwp/sf: write manifest generation %d: %w", next, err)
+		return qwpSfDurabilityError(fmt.Sprintf("write manifest generation %d", next), m.path, err)
 	}
 	if err := qwpSfManifestSyncFile(m.file); err != nil {
-		return fmt.Errorf("qwp/sf: fsync manifest: %w", err)
+		return qwpSfDurabilityError("sync manifest", m.path, err)
 	}
 	m.generation = next
 	m.headBase = newHead
@@ -273,7 +274,7 @@ var qwpSfManifestRemoveFile = qwpSfSwappable(os.Remove)
 func qwpSfManifestRemove(dir string) error {
 	path := filepath.Join(dir, qwpSfManifestFileName)
 	if err := qwpSfManifestRemoveFile.load()(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("qwp/sf: remove manifest %s: %w", path, err)
+		return qwpSfDurabilityError("remove manifest", path, err)
 	}
 	return nil
 }
@@ -314,10 +315,10 @@ var qwpSfManifestQuarantineRename = qwpSfSwappable(os.Rename)
 func qwpSfQuarantineCreationDebris(path string) error {
 	corrupt, err := qwpSfQuarantineTargetPath(path)
 	if err != nil {
-		return qwpSfManifestQuarantineError("could not choose a quarantine name for invalid "+path, err)
+		return qwpSfDurabilityError("choose quarantine name for invalid manifest", path, err)
 	}
 	if err := qwpSfManifestQuarantineRename.load()(path, corrupt); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return qwpSfManifestQuarantineError("could not quarantine invalid "+path, err)
+		return qwpSfDurabilityError("quarantine invalid manifest", path, err)
 	}
 	// Commit the evidence-preserving name before recovery returns to a path
 	// that may create a replacement manifest. Without this barrier the rename
@@ -325,21 +326,11 @@ func qwpSfQuarantineCreationDebris(path string) error {
 	if err := qwpSfSyncSlotDir(filepath.Dir(path)); err != nil {
 		if rollbackErr := qwpSfManifestQuarantineRename.load()(corrupt, path); rollbackErr != nil {
 			return errors.Join(
-				qwpSfManifestQuarantineError("could not sync quarantine of invalid "+path, err),
-				qwpSfManifestQuarantineError("could not restore invalid manifest after failed quarantine barrier "+path, rollbackErr),
+				qwpSfDurabilityError("sync quarantine of invalid manifest", path, err),
+				qwpSfDurabilityError("restore invalid manifest after failed quarantine barrier", path, rollbackErr),
 			)
 		}
-		return qwpSfManifestQuarantineError("could not sync quarantine of invalid "+path, err)
+		return qwpSfDurabilityError("sync quarantine of invalid manifest", path, err)
 	}
 	return nil
-}
-
-// qwpSfManifestQuarantineError reports a failure to set the manifest aside
-// as a retriable local-storage fault. It wraps ErrSfDurability — the same
-// local-storage-sick, retry-the-call class the producer path uses — and keeps
-// the filesystem cause reachable with errors.Is. It never returns
-// qwpSfErrRecoveryFailClosed: that verdict is reserved for what the slot's
-// bytes prove, and a rename failure proves nothing about them.
-func qwpSfManifestQuarantineError(what string, cause error) error {
-	return fmt.Errorf("%w: %s: %w", ErrSfDurability, what, cause)
 }

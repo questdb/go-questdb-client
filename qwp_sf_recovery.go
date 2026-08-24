@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -48,12 +49,9 @@ import (
 // the success path the committed head is what licenses a removal. The recovery
 // plan selects unlink only below that boundary, and revalidateUnlink repeats
 // the proof immediately before os.Remove.
-var (
-	//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
-	qwpSfErrRecoveryFailClosed = errors.New("qwp/sf: recovery failed closed")
-	//lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
-	qwpSfErrSanitizedResidue = errors.New("qwp/sf: sanitized sealed-segment residue; retry recovery once")
-)
+//
+//lint:ignore ST1012 The qwpSf prefix groups internal store-and-forward errors.
+var qwpSfErrSanitizedResidue = errors.New("qwp/sf: sanitized sealed-segment residue; retry recovery once")
 
 type qwpSfManifestProvenance uint8
 
@@ -115,21 +113,31 @@ type qwpSfRecoveryPlan struct {
 	failClosedErr          error
 }
 
+// qwpSfRecoveryContext provides the logger used while scanning and recovering
+// a slot.
+type qwpSfRecoveryContext struct {
+	logger *slog.Logger
+}
+
 func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, error) {
 	ring, _, err := qwpSfRecoverRing(sfDir, maxBytesPerSegment)
 	return ring, err
 }
 
 func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, *qwpSfManifest, error) {
+	return qwpSfRecoverRingWithContext(sfDir, maxBytesPerSegment, qwpSfRecoveryContext{})
+}
+
+func qwpSfRecoverRingWithContext(sfDir string, maxBytesPerSegment int64, recoveryContext qwpSfRecoveryContext) (*qwpSfSegmentRing, *qwpSfManifest, error) {
 	if _, err := os.Stat(sfDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil, nil
 		}
-		return nil, nil, fmt.Errorf("qwp/sf: stat %s: %w", sfDir, err)
+		return nil, nil, qwpSfDurabilityError("stat recovery slot", sfDir, err)
 	}
 	entries, err := os.ReadDir(sfDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("qwp/sf: read %s: %w", sfDir, err)
+		return nil, nil, qwpSfDurabilityError("read recovery slot", sfDir, err)
 	}
 
 	var all []*qwpSfSegment
@@ -164,7 +172,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing
 					action:        qwpSfRecoveryQuarantine,
 					license:       "the unreadable bytes are preserved under a non-segment name",
 				})
-				qwpEffectiveLogger(nil).Warn("qwp/sf: deferring corrupt segment quarantine until recovery boundaries validate", "path", path, "error", openErr)
+				qwpEffectiveLogger(recoveryContext.logger).Warn("qwp/sf: deferring corrupt segment quarantine until recovery boundaries validate", "path", path, "error", openErr)
 				continue
 			}
 			return nil, nil, fmt.Errorf("qwp/sf: open segment %s during recovery: %w", path, openErr)
@@ -576,7 +584,7 @@ func qwpSfApplyRecoveryPlan(p *qwpSfRecoveryPlan) (*qwpSfSegmentRing, *qwpSfMani
 
 	if p.removeManifest {
 		if err := qwpSfSyncSlotDir(p.sfDir); err != nil {
-			return nil, nil, fmt.Errorf("qwp/sf: sync recovery cleanup directory %s: %w", p.sfDir, err)
+			return nil, nil, qwpSfDurabilityError("sync recovery cleanup directory", p.sfDir, err)
 		}
 		if err := p.manifest.close(); err != nil {
 			return nil, nil, err
@@ -594,7 +602,7 @@ func qwpSfApplyRecoveryPlan(p *qwpSfRecoveryPlan) (*qwpSfSegmentRing, *qwpSfMani
 	// clean files alone cannot reveal that pending epoch. Commit the slot
 	// namespace unconditionally before exposing any recovered mmap for append.
 	if err := qwpSfSyncSlotDir(p.sfDir); err != nil {
-		return nil, nil, fmt.Errorf("qwp/sf: sync recovered slot before exposing ring %s: %w", p.sfDir, err)
+		return nil, nil, qwpSfDurabilityError("sync recovered slot before exposing ring", p.sfDir, err)
 	}
 
 	ring := qwpSfNewSegmentRing(p.activeSeg, p.maxBytesPerSegment)
@@ -667,7 +675,7 @@ func (p *qwpSfRecoveryPlan) applyDirectoryActions() error {
 				return err
 			}
 			if err := os.Remove(file.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("qwp/sf: apply recovery unlink %s: %w", file.path, err)
+				return qwpSfDurabilityError("apply recovery unlink", file.path, err)
 			}
 		case qwpSfRecoveryQuarantine:
 			if file.segment != nil {
@@ -676,7 +684,7 @@ func (p *qwpSfRecoveryPlan) applyDirectoryActions() error {
 				}
 			}
 			if _, err := qwpSfQuarantinePath(file.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("qwp/sf: apply recovery quarantine %s: %w", file.path, err)
+				return qwpSfDurabilityError("apply recovery quarantine", file.path, err)
 			}
 		}
 	}
@@ -717,10 +725,6 @@ func (p *qwpSfRecoveryPlan) revalidateUnlink(file *qwpSfRecoveryFilePlan) error 
 		return qwpSfFailClosed("segment %s is not wholly below committed head %d", file.path, p.headBase)
 	}
 	return nil
-}
-
-func qwpSfFailClosed(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", qwpSfErrRecoveryFailClosed, fmt.Sprintf(format, args...))
 }
 
 func qwpSfValidateContiguous(chain []*qwpSfSegment) error {
@@ -821,10 +825,10 @@ func qwpSfCorruptMayHoldFrames(path string) bool {
 	}
 }
 
-func qwpSfQuarantinePaths(paths []string) {
+func qwpSfQuarantinePaths(recoveryContext qwpSfRecoveryContext, paths []string) {
 	for _, path := range paths {
 		if _, err := qwpSfQuarantinePath(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			qwpEffectiveLogger(nil).Warn("qwp/sf: could not quarantine corrupt segment", "path", path, "error", err)
+			qwpEffectiveLogger(recoveryContext.logger).Warn("qwp/sf: could not quarantine corrupt segment", "path", path, "error", err)
 		}
 	}
 }
@@ -874,7 +878,7 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 	tmp := path + qwpSfTornActiveTempSuffix
 	replacement, err := qwpSfCreateSegment(tmp, baseSeq, maxBytesPerSegment)
 	if err != nil {
-		return nil, fmt.Errorf("qwp/sf: build replacement for torn active %s: %w", path, err)
+		return nil, qwpSfDurabilityError("build replacement for torn active", path, err)
 	}
 	// The replacement's header must be durable before its name is installed
 	// over the committed active base. The install rename below can reach the
@@ -886,14 +890,14 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 	if err := replacement.syncHeader(); err != nil {
 		_ = replacement.close()
 		_ = os.Remove(tmp)
-		return nil, fmt.Errorf("qwp/sf: build replacement for torn active %s: %w", path, err)
+		return nil, qwpSfDurabilityError("sync replacement for torn active", path, err)
 	}
 	// Closed before the swap so the reopen below owns the only mapping, and so
 	// the segment records the path it ends up at rather than the temporary name
 	// every later diagnostic would then report.
 	if err := replacement.close(); err != nil {
 		_ = os.Remove(tmp)
-		return nil, fmt.Errorf("qwp/sf: build replacement for torn active %s: %w", path, err)
+		return nil, qwpSfDurabilityError("close replacement for torn active", path, err)
 	}
 	preserved, err := qwpSfQuarantineTargetPath(path)
 	if err != nil {
@@ -901,11 +905,14 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 		return nil, err
 	}
 	linked := true
-	if err := qwpSfTornActiveLink.load()(path, preserved); err != nil {
+	if linkErr := qwpSfTornActiveLink.load()(path, preserved); linkErr != nil {
 		linked = false
-		if err := qwpSfTornActiveRename.load()(path, preserved); err != nil {
+		if renameErr := qwpSfTornActiveRename.load()(path, preserved); renameErr != nil {
 			_ = os.Remove(tmp)
-			return nil, fmt.Errorf("qwp/sf: quarantine segment %s: %w", path, err)
+			return nil, errors.Join(
+				qwpSfDurabilityError("hard-link torn active into quarantine", path, linkErr),
+				qwpSfDurabilityError("rename torn active into quarantine", path, renameErr),
+			)
 		}
 	}
 	// The torn bytes need a durable name before the clean replacement may take
@@ -917,25 +924,30 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 			_ = os.Remove(preserved)
 		} else if rollbackErr := qwpSfTornActiveRename.load()(preserved, path); rollbackErr != nil {
 			return nil, errors.Join(
-				fmt.Errorf("qwp/sf: sync preserved torn-active segment %s: %w", preserved, err),
-				fmt.Errorf("qwp/sf: restore torn active %s after failed preservation barrier: %w", path, rollbackErr),
+				qwpSfDurabilityError("sync preserved torn-active segment", preserved, err),
+				qwpSfDurabilityError("restore torn active after failed preservation barrier", path, rollbackErr),
 			)
 		}
-		return nil, fmt.Errorf("qwp/sf: sync preserved torn-active segment %s: %w", preserved, err)
+		return nil, qwpSfDurabilityError("sync preserved torn-active segment", preserved, err)
 	}
 	if err := qwpSfTornActiveRename.load()(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		if linked {
 			_ = os.Remove(preserved)
 		} else if rollbackErr := qwpSfTornActiveRename.load()(preserved, path); rollbackErr != nil {
-			return nil, fmt.Errorf(
-				"qwp/sf: install replacement for torn active %s: %w (the torn segment is preserved at %s and no file is left at the committed active base)",
-				path, err, preserved)
+			return nil, errors.Join(
+				qwpSfDurabilityError("install replacement for torn active", path, err),
+				qwpSfDurabilityError(
+					"restore torn active after failed replacement install; preserved copy remains and no file is left at the committed active base",
+					preserved,
+					rollbackErr,
+				),
+			)
 		}
-		return nil, fmt.Errorf("qwp/sf: install replacement for torn active %s: %w", path, err)
+		return nil, qwpSfDurabilityError("install replacement for torn active", path, err)
 	}
 	if err := qwpSfSyncSlotDir(filepath.Dir(path)); err != nil {
-		return nil, fmt.Errorf("qwp/sf: sync installed torn-active replacement %s: %w", path, err)
+		return nil, qwpSfDurabilityError("sync installed torn-active replacement", path, err)
 	}
 	return qwpSfOpenSegment(path)
 }
@@ -946,7 +958,7 @@ func qwpSfQuarantinePath(path string) (string, error) {
 		return "", err
 	}
 	if err := os.Rename(path, target); err != nil {
-		return "", fmt.Errorf("qwp/sf: quarantine segment %s: %w", path, err)
+		return "", qwpSfDurabilityError("quarantine segment", path, err)
 	}
 	return target, nil
 }
@@ -961,7 +973,7 @@ func qwpSfQuarantineTargetPath(path string) (string, error) {
 			return target, nil
 		}
 		if err != nil {
-			return "", fmt.Errorf("qwp/sf: inspect segment quarantine target %s: %w", target, err)
+			return "", qwpSfDurabilityError("inspect segment quarantine target", target, err)
 		}
 		target = qwpSfBoundedSuffixPath(path, fmt.Sprintf(".corrupt-%d", suffix))
 	}
@@ -994,17 +1006,17 @@ func qwpSfQuarantineSlot(slotDir string) (string, error) {
 	parent := filepath.Dir(slotDir)
 	quarantineDir := filepath.Join(parent, "quarantined")
 	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
-		return "", fmt.Errorf("qwp/sf: create quarantine directory %s: %w", quarantineDir, err)
+		return "", qwpSfDurabilityError("create quarantine directory", quarantineDir, err)
 	}
 	target := filepath.Join(quarantineDir, fmt.Sprintf("%s-%d", filepath.Base(slotDir), time.Now().UnixNano()))
 	if err := os.Rename(slotDir, target); err != nil {
-		return "", fmt.Errorf("qwp/sf: quarantine slot %s as %s: %w", slotDir, target, err)
+		return "", qwpSfDurabilityError("quarantine slot as "+target, slotDir, err)
 	}
 	if err := qwpSfSyncSlotDir(parent); err != nil {
-		return "", fmt.Errorf("qwp/sf: fsync slot parent after quarantine: %w", err)
+		return "", qwpSfDurabilityError("sync slot parent after quarantine", parent, err)
 	}
 	if err := qwpSfSyncSlotDir(quarantineDir); err != nil {
-		return "", fmt.Errorf("qwp/sf: fsync quarantine directory: %w", err)
+		return "", qwpSfDurabilityError("sync quarantine directory", quarantineDir, err)
 	}
 	return target, nil
 }
