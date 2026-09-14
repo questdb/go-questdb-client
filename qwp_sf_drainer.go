@@ -753,13 +753,12 @@ func qwpSfNewDrainerPool(maxConcurrent int) *qwpSfDrainerPool {
 }
 
 // drainerPoolSubmit launches the drainer in a managed goroutine.
-// Returns an error if the pool has been closed.
+// Returns an error if the pool has been closed or ctx is already cancelled
+// when the submission is accepted under the pool lock.
 //
-// Drainers queue when the concurrency cap is reached: the
-// goroutine takes a slot on the semaphore and proceeds. The
-// caller's ctx only gates the semaphore wait — once the drainer
-// is running, it observes the pool's master ctx instead, so
-// drainers outlive the caller's (typically setup-only) ctx.
+// Drainers queue when the concurrency cap is reached. Once accepted, both
+// queued and running drainers belong to the pool's master context, so they
+// outlive the caller's setup context and are stopped by drainerPoolClose.
 func (p *qwpSfDrainerPool) drainerPoolSubmit(ctx context.Context, d *qwpSfOrphanDrainer) error {
 	if p.closed.Load() {
 		return errors.New("qwp/sf: drainer pool closed")
@@ -769,19 +768,20 @@ func (p *qwpSfDrainerPool) drainerPoolSubmit(ctx context.Context, d *qwpSfOrphan
 		p.mu.Unlock()
 		return errors.New("qwp/sf: drainer pool closed")
 	}
+	if err := ctx.Err(); err != nil {
+		p.mu.Unlock()
+		return err
+	}
 	p.active = append(p.active, d)
 	p.wg.Add(1)
 	p.mu.Unlock()
 	go func() {
 		defer p.wg.Done()
 		defer p.removeActive(d)
-		// Wait for a slot. The caller's ctx unblocks if the user
-		// gives up on setup; the pool's ctx unblocks on close.
+		// Accepted work stays queued until capacity is available or the pool
+		// closes, even if the caller cancels its setup context in the meantime.
 		select {
 		case p.sem <- struct{}{}:
-		case <-ctx.Done():
-			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
-			return
 		case <-p.ctx.Done():
 			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
 			return

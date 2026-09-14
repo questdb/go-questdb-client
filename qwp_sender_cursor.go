@@ -519,7 +519,9 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 				drainer.maxFrameRejections = conf.maxFrameRejections
 				drainer.logger = loop.logger
 				drainer.listener = conf.backgroundDrainerListener
-				_ = pool.drainerPoolSubmit(ctx, drainer)
+				if err := pool.drainerPoolSubmit(ctx, drainer); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}

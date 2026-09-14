@@ -61,8 +61,8 @@ type qwpQueryPool struct {
 
 	// pendingTeardowns counts client teardowns running off-lock after the
 	// worker has already left `all` (giveBack's broken branch, discardWorkerLocked,
-	// reap victims). close() adds it to the outstanding count so it does not
-	// return while a query connection is still winding down. Guarded by mu.
+	// reap victims), or finished construction after the pool closed. close()
+	// includes these teardowns in its bounded outstanding-work wait. Guarded by mu.
 	// Mirrors qwpSenderPool.pendingLeaseTeardowns.
 	pendingTeardowns int
 
@@ -166,12 +166,10 @@ func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 				return nil, err
 			}
 			if p.closed {
-				// inFlightCreations dropped just above; wake close()'s
-				// outstanding-lease wait so it re-checks. The just-built worker was
-				// never handed out, so closing it off-lock races nothing.
-				p.broadcastLocked()
-				p.mu.Unlock()
-				_ = closeQueryClientGuarded(context.Background(), w.client)
+				// Transfer the creation obligation to pendingTeardowns before
+				// unlocking. This worker was never added to all, so close() would
+				// otherwise see no outstanding work while its connection is live.
+				p.discardWorkerLocked(context.Background(), w) // releases p.mu
 				return nil, errPoolClosed
 			}
 			p.all = append(p.all, w)
@@ -248,8 +246,8 @@ func (p *qwpQueryPool) giveBack(q *Query, broken bool) error {
 
 // discardWorkerLocked evicts a worker from `all` and closes its client outside
 // the lock. Caller holds mu; discardWorkerLocked releases it. Used on borrow
-// when a pooled worker is found terminally failed (mirrors the sender pool's
-// discardLocked).
+// when a pooled worker is found terminally failed, or a newly built worker must
+// close without entering all because the pool closed during construction.
 func (p *qwpQueryPool) discardWorkerLocked(ctx context.Context, w *qwpQueryWorker) {
 	p.removeFromAllLocked(w)
 	// The worker is out of `all`, so count the off-lock close in the outstanding
@@ -341,6 +339,10 @@ func (p *qwpQueryPool) selectReapVictims(now time.Time) []*qwpQueryWorker {
 	return toClose
 }
 
+// queryClientCloseHook holds off-lock client teardown in lifecycle tests.
+// Invoked inside the close panic guard; nil in production.
+var queryClientCloseHook atomic.Pointer[func(*QwpQueryClient)]
+
 // closeQueryClientGuarded closes a worker's client, converting a panic into an
 // error so a faulting Close cannot unwind through the pool's teardown. Mirrors
 // the sender pool's closeSlotGuarded.
@@ -350,6 +352,9 @@ func closeQueryClientGuarded(ctx context.Context, client *QwpQueryClient) (err e
 			err = fmt.Errorf("qwp query pool: client close panicked: %v", r)
 		}
 	}()
+	if hook := queryClientCloseHook.Load(); hook != nil {
+		(*hook)(client)
+	}
 	return client.Close(ctx)
 }
 

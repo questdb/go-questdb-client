@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -474,6 +475,146 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 	// Snapshot must be empty after close: completed drainers are
 	// pruned from the active list as their goroutines exit.
 	assert.Empty(t, pool.drainerPoolSnapshot())
+}
+
+func TestQwpSfDrainerPoolQueuedWorkOutlivesSetupContext(t *testing.T) {
+	for _, closePool := range []bool{false, true} {
+		name := "drain-after-capacity-frees"
+		if closePool {
+			name = "pool-close-stops-queued-work"
+		}
+		t.Run(name, func(t *testing.T) {
+			srv := newQwpSfTestServer(t, qwpSfTestServerOpts{recordFrames: true})
+			t.Cleanup(srv.Close)
+			const segSize int64 = 4096
+			dirs := []string{t.TempDir(), t.TempDir()}
+			for i, dir := range dirs {
+				engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = engine.engineClose() })
+				_, err = engine.engineAppendBlocking(context.Background(), []byte{byte(i)})
+				require.NoError(t, err)
+				require.NoError(t, engine.engineClose())
+			}
+			entered, allowDial := make(chan struct{}), make(chan struct{})
+			var enteredOnce, releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(allowDial) }) }
+			factory := func(ctx context.Context, idx int) (*qwpTransport, error) {
+				enteredOnce.Do(func() { close(entered) })
+				select {
+				case <-allowDial:
+					return qwpSfDialFor(srv)(ctx, idx)
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			pool := qwpSfNewDrainerPool(1)
+			oldGrace := qwpSfDrainerPoolCloseGrace.load()
+			qwpSfDrainerPoolCloseGrace.store(20 * time.Millisecond)
+			t.Cleanup(func() {
+				// On assertion failure, cancel before opening the dial gate so
+				// teardown cannot start a fresh connection while cleaning up.
+				pool.cancel()
+				release()
+				pool.drainerPoolClose()
+				qwpSfDrainerPoolCloseGrace.store(oldGrace)
+			})
+			setupCtx, cancelSetup := context.WithCancel(context.Background())
+			t.Cleanup(cancelSetup)
+			first := qwpSfNewOrphanDrainer(dirs[0], segSize, qwpSfUnlimitedTotalBytes,
+				factory, nil, time.Second, time.Millisecond, 10*time.Millisecond)
+			second := qwpSfNewOrphanDrainer(dirs[1], segSize, qwpSfUnlimitedTotalBytes,
+				qwpSfDialFor(srv), nil, time.Second, time.Millisecond, 10*time.Millisecond)
+			require.NoError(t, pool.drainerPoolSubmit(setupCtx, first))
+			waitQwpCleanupSignal(t, entered, "first drainer occupying the only slot")
+			require.NoError(t, pool.drainerPoolSubmit(setupCtx, second))
+			cancelSetup()
+			require.Never(t, func() bool {
+				return second.drainerOutcome() != qwpSfDrainOutcomePending || len(pool.drainerPoolSnapshot()) != 2
+			}, 50*time.Millisecond, time.Millisecond, "accepted queued work must survive setup cancellation")
+			require.Equal(t, int64(-1), second.drainerTargetFsn(), "capacity must still prevent the queued drainer from starting")
+
+			if closePool {
+				pool.drainerPoolClose()
+				require.Empty(t, pool.drainerPoolSnapshot())
+				require.Equal(t, qwpSfDrainOutcomeStopped, first.drainerOutcome())
+				require.Equal(t, qwpSfDrainOutcomeStopped, second.drainerOutcome())
+				require.Equal(t, int64(-1), second.drainerTargetFsn(), "pool close must not start the queued drainer")
+				require.Zero(t, srv.totalFramesReceived.Load())
+				for _, dir := range dirs {
+					require.True(t, qwpSfIsCandidateOrphan(dir), "stopped work must remain recoverable")
+					require.NoFileExists(t, filepath.Join(dir, qwpSfFailedSentinelName))
+				}
+			} else {
+				release()
+				require.Eventually(t, func() bool {
+					return len(pool.drainerPoolSnapshot()) == 0
+				}, 3*time.Second, time.Millisecond, "both accepted drainers must finish on the live pool")
+				require.False(t, pool.closed.Load())
+				require.Equal(t, qwpSfDrainOutcomeSuccess, first.drainerOutcome())
+				require.Equal(t, qwpSfDrainOutcomeSuccess, second.drainerOutcome())
+				var frames []string
+				for _, received := range srv.recordedFrames() {
+					frames = append(frames, received...)
+				}
+				require.ElementsMatch(t, []string{string([]byte{0}), string([]byte{1})}, frames,
+					"setup cancellation must not prevent either slot's saved frame from reaching the server")
+			}
+			for _, dir := range dirs {
+				lock, err := qwpSfAcquireSlotLock(dir)
+				require.NoError(t, err, "finished or stopped drainers must release their slots")
+				require.NoError(t, lock.close())
+			}
+		})
+	}
+}
+
+func TestQwpSfDrainerPoolRejectsCancelledSubmission(t *testing.T) {
+	pool := qwpSfNewDrainerPool(1)
+	t.Cleanup(pool.drainerPoolClose)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	d := qwpSfNewOrphanDrainer(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
+		nil, nil, time.Second, time.Millisecond, time.Millisecond)
+	require.ErrorIs(t, pool.drainerPoolSubmit(ctx, d), context.Canceled)
+	require.Empty(t, pool.drainerPoolSnapshot(), "rejected submissions must not become pool obligations")
+	require.Equal(t, int64(-1), d.drainerTargetFsn())
+}
+
+func TestQwpSfOrphanSubmissionCancellationFailsConstruction(t *testing.T) {
+	root := t.TempDir()
+	orphanDir := filepath.Join(root, "orphan")
+	engine, err := qwpSfNewCursorEngine(orphanDir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = engine.engineClose() })
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("saved row"))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	hook := func() error {
+		cancel()
+		return nil
+	}
+	qwpSfTestAfterEngineCreateHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestAfterEngineCreateHook.Store(nil) })
+	// Async connect does not consume the cancelled context in a foreground
+	// dial. Construction must reach orphan submission and propagate its error.
+	sender, err := LineSenderFromConf(ctx, "ws::addr=127.0.0.1:1;sf_dir="+root+
+		";sender_id=foreground;initial_connect_retry=async;drain_orphans=on;")
+	if sender != nil {
+		t.Cleanup(func() { _ = sender.Close(context.Background()) })
+	}
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, sender, "construction must not silently skip a rejected orphan submission")
+	require.True(t, qwpSfIsCandidateOrphan(orphanDir))
+	require.NoFileExists(t, filepath.Join(orphanDir, qwpSfFailedSentinelName))
+	for _, dir := range []string{orphanDir, filepath.Join(root, "foreground")} {
+		lock, err := qwpSfAcquireSlotLock(dir)
+		require.NoError(t, err, "failed construction must release its slot and leave the orphan unlocked")
+		require.NoError(t, lock.close())
+	}
 }
 
 // TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime proves the

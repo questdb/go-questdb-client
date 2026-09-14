@@ -1014,7 +1014,8 @@ func WithSfAppendDeadline(d time.Duration) LineSenderOption {
 // store-and-forward slots left behind by a crashed or superseded
 // sender sharing the same sf_dir group root. Defaults to disabled.
 // Requires sf_dir to be set. Equivalent to the connect-string
-// drain_orphans key.
+// drain_orphans key. Accepted background work, including slots queued behind
+// the concurrency cap, outlives the constructor's context. Close stops it.
 //
 // Only available for the QWP sender.
 func WithDrainOrphans(enabled bool) LineSenderOption {

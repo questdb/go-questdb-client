@@ -503,6 +503,10 @@ The same options are available programmatically: `WithSfDir`, `WithSenderId`,
 `WithMaxFrameRejections`, `WithRequestDurableAck`,
 `WithDurableAckKeepaliveInterval`.
 
+Accepted orphan drains, including slots queued behind `max_background_drainers`,
+continue independently of the sender's construction context. Cancelling that
+context after construction does not stop them; closing the sender does.
+
 Without `sf_dir`, unacknowledged data lives in process memory and is lost if the
 process dies; the reconnect loop still spans transient outages.
 
