@@ -538,7 +538,7 @@ func TestQwpEngineTerminalRetryOwnerCompletesFailedDeferredCleanup(t *testing.T)
 	require.GreaterOrEqual(t, calls.Load(), int32(2))
 }
 
-func TestQwpEngineTerminalRetryOwnerRecoversPanicAndCompletes(t *testing.T) {
+func TestQwpEngineTerminalRetryOwnerRetriesPanickingCleanupAttempt(t *testing.T) {
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)

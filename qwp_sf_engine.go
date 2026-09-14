@@ -133,6 +133,7 @@ const (
 	qwpSfCleanupTestRingClosePhase
 	qwpSfCleanupTestWatermarkClosePhase
 	qwpSfCleanupTestSymbolDictClosePhase
+	qwpSfCleanupTestRetryOwnerStarted
 )
 
 // qwpSfTestCleanupHook injects faults at ownership boundaries without adding a
@@ -1544,6 +1545,9 @@ func (e *qwpSfCursorEngine) engineStartCloseRetryOwner(logger *slog.Logger) {
 				}
 			}
 		}()
+		// Outside the per-attempt panic guard so tests can exercise replacement
+		// of the retry goroutine itself, not just retrying a failed attempt.
+		qwpSfRunCleanupTestHook(qwpSfCleanupTestRetryOwnerStarted)
 		var lastWarn time.Time
 		for !e.engineCloseCompleted() {
 			retryErr := e.engineRunCloseRetryAttempt()

@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -93,18 +94,37 @@ func TestQwpSfEngineCleanupHasSingleOwnershipRecord(t *testing.T) {
 }
 
 func TestQwpSfCleanupTransitionTable(t *testing.T) {
-	legal := map[qwpSfCleanupPhase][]qwpSfCleanupPhase{
-		qwpSfCleanupOpen:            {qwpSfCleanupStoppingManager},
-		qwpSfCleanupStoppingManager: {qwpSfCleanupOpen, qwpSfCleanupManagerOwned, qwpSfCleanupReady},
-		qwpSfCleanupManagerOwned:    {qwpSfCleanupOpen, qwpSfCleanupReady},
-		qwpSfCleanupReady:           {qwpSfCleanupClaimed},
-		qwpSfCleanupClaimed:         {qwpSfCleanupRunning, qwpSfCleanupRetryable},
-		qwpSfCleanupRunning:         {qwpSfCleanupRetryable, qwpSfCleanupComplete},
-		qwpSfCleanupRetryable:       {qwpSfCleanupClaimed},
-		qwpSfCleanupComplete:        nil,
+	legal := map[qwpSfCleanupPhase]map[qwpSfCleanupPhase]bool{
+		qwpSfCleanupOpen: {
+			qwpSfCleanupStoppingManager: true,
+		},
+		qwpSfCleanupStoppingManager: {
+			qwpSfCleanupOpen:         true,
+			qwpSfCleanupManagerOwned: true,
+			qwpSfCleanupReady:        true,
+		},
+		qwpSfCleanupManagerOwned: {
+			qwpSfCleanupOpen:  true,
+			qwpSfCleanupReady: true,
+		},
+		qwpSfCleanupReady: {
+			qwpSfCleanupClaimed: true,
+		},
+		qwpSfCleanupClaimed: {
+			qwpSfCleanupRunning:   true,
+			qwpSfCleanupRetryable: true,
+		},
+		qwpSfCleanupRunning: {
+			qwpSfCleanupRetryable: true,
+			qwpSfCleanupComplete:  true,
+		},
+		qwpSfCleanupRetryable: {
+			qwpSfCleanupClaimed: true,
+		},
+		qwpSfCleanupComplete: {},
 	}
 	for from, tos := range legal {
-		for _, to := range tos {
+		for to := range tos {
 			from, to := from, to
 			t.Run(from.String()+"-to-"+to.String(), func(t *testing.T) {
 				c := qwpSfCleanupControl{state: qwpSfCleanupState{phase: from}}
@@ -114,7 +134,7 @@ func TestQwpSfCleanupTransitionTable(t *testing.T) {
 	}
 	for from := range legal {
 		for to := range legal {
-			if qwpSfCleanupTransitionAllowed(from, to) {
+			if legal[from][to] {
 				continue
 			}
 			from, to := from, to
@@ -124,6 +144,131 @@ func TestQwpSfCleanupTransitionTable(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestQwpSfCleanupAbortManagerHandoff(t *testing.T) {
+	var c qwpSfCleanupControl
+	c.markReadersQuiesced(false)
+	stopping, action := c.begin(false, qwpSfCleanupOwnerClose)
+	require.Equal(t, qwpSfCleanupDriveManager, action)
+	handoff, ok := c.prepareManagerHandoff(stopping)
+	require.True(t, ok)
+
+	beforeStale := c.snapshot()
+	require.False(t, c.abortManagerHandoff(stopping))
+	require.Equal(t, beforeStale, c.snapshot(), "a stale token must not mutate cleanup state")
+
+	require.True(t, c.abortManagerHandoff(handoff))
+	aborted := c.snapshot()
+	require.Equal(t, qwpSfCleanupOpen, aborted.phase)
+	require.Equal(t, qwpSfCleanupOwnerNone, aborted.owner)
+	require.Greater(t, aborted.generation, handoff.generation)
+
+	beforeReuse := c.snapshot()
+	require.False(t, c.abortManagerHandoff(handoff), "the transition must invalidate its handoff token")
+	require.Equal(t, beforeReuse, c.snapshot())
+}
+
+func TestQwpSfCleanupManagerHandoffDeclinedAndClaim(t *testing.T) {
+	var c qwpSfCleanupControl
+	c.markReadersQuiesced(false)
+	stopping, action := c.begin(false, qwpSfCleanupOwnerClose)
+	require.Equal(t, qwpSfCleanupDriveManager, action)
+	require.True(t, c.recordDrain(stopping, true))
+	handoff, ok := c.prepareManagerHandoff(stopping)
+	require.True(t, ok)
+
+	beforeStale := c.snapshot()
+	_, ok = c.managerHandoffDeclinedAndClaim(stopping, qwpSfCleanupOwnerClose)
+	require.False(t, ok)
+	require.Equal(t, beforeStale, c.snapshot(), "a stale token must not mutate cleanup state")
+
+	claim, ok := c.managerHandoffDeclinedAndClaim(handoff, qwpSfCleanupOwnerRetry)
+	require.True(t, ok)
+	claimed := c.snapshot()
+	require.Equal(t, qwpSfCleanupClaimed, claimed.phase)
+	require.Equal(t, qwpSfCleanupOwnerRetry, claimed.owner)
+	require.Equal(t, handoff.generation+2, claimed.generation,
+		"the ownerless ready generation must invalidate the manager handoff")
+	require.Equal(t, qwpSfCleanupToken{
+		phase:      claimed.phase,
+		owner:      claimed.owner,
+		generation: claimed.generation,
+	}, claim)
+
+	beforeReuse := c.snapshot()
+	_, ok = c.managerHandoffDeclinedAndClaim(handoff, qwpSfCleanupOwnerClose)
+	require.False(t, ok)
+	require.Equal(t, beforeReuse, c.snapshot())
+}
+
+func TestQwpSfCleanupAbandonClaim(t *testing.T) {
+	var c qwpSfCleanupControl
+	c.markReadersQuiesced(false)
+	stopping, action := c.begin(false, qwpSfCleanupOwnerClose)
+	require.Equal(t, qwpSfCleanupDriveManager, action)
+	require.True(t, c.recordDrain(stopping, false))
+	claim, ok := c.managerReadyAndClaim(stopping, qwpSfCleanupOwnerClose)
+	require.True(t, ok)
+
+	firstErr := errors.New("first close failure")
+	beforeStale := c.snapshot()
+	require.False(t, c.abandonClaim(stopping, firstErr))
+	require.Equal(t, beforeStale, c.snapshot(), "a stale token must not mutate cleanup state")
+
+	require.True(t, c.abandonClaim(claim, firstErr))
+	retryable := c.snapshot()
+	require.Equal(t, qwpSfCleanupRetryable, retryable.phase)
+	require.Equal(t, qwpSfCleanupOwnerNone, retryable.owner)
+	require.Equal(t, claim.generation+1, retryable.generation)
+	require.Same(t, firstErr, retryable.firstErr)
+
+	retryClaim, ok := c.tryClaim(qwpSfCleanupOwnerRetry)
+	require.True(t, ok)
+	beforeOldClaim := c.snapshot()
+	secondErr := errors.New("later close failure")
+	require.False(t, c.abandonClaim(claim, secondErr), "an earlier claimed generation must stay invalid")
+	require.Equal(t, beforeOldClaim, c.snapshot())
+
+	require.True(t, c.abandonClaim(retryClaim, secondErr))
+	require.Same(t, firstErr, c.snapshot().firstErr, "the first cleanup error must remain latched")
+}
+
+func TestQwpSfCleanupRetryOwnerPanicked(t *testing.T) {
+	t.Run("releases exclusive retry ownership", func(t *testing.T) {
+		var c qwpSfCleanupControl
+		require.True(t, c.startRetryOwner())
+		require.False(t, c.startRetryOwner(), "only one retry owner may run")
+
+		before := c.snapshot()
+		require.True(t, c.retryOwnerPanicked())
+		after := c.snapshot()
+		expected := before
+		expected.retryOwnerStarted = false
+		require.Equal(t, expected, after)
+
+		require.True(t, c.startRetryOwner(), "a replacement retry owner must be allowed after panic")
+		require.False(t, c.startRetryOwner(), "replacement ownership must remain exclusive")
+	})
+
+	t.Run("completed cleanup cannot be restarted", func(t *testing.T) {
+		var c qwpSfCleanupControl
+		c.markReadersQuiesced(false)
+		stopping, action := c.begin(false, qwpSfCleanupOwnerClose)
+		require.Equal(t, qwpSfCleanupDriveManager, action)
+		require.True(t, c.recordDrain(stopping, true))
+		claim, ok := c.managerReadyAndClaim(stopping, qwpSfCleanupOwnerClose)
+		require.True(t, ok)
+		run, _, _, _, _, _, ok := c.startTerminal(claim)
+		require.True(t, ok)
+		require.True(t, c.startRetryOwner())
+		require.True(t, c.complete(run))
+
+		completed := c.snapshot()
+		require.False(t, c.retryOwnerPanicked(), "completion wins over retry-owner recovery")
+		require.Equal(t, completed, c.snapshot(), "completed state must not be mutated")
+		require.False(t, c.startRetryOwner(), "completed cleanup cannot acquire another retry owner")
+	})
 }
 
 func TestQwpSfCleanupStaleTokenCannotComplete(t *testing.T) {
