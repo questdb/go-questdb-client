@@ -472,7 +472,8 @@ type qwpLineSender struct {
 	// channels twice. A second standalone Close returns an error; see
 	// LineSender.Close. Making this flag atomic does not make concurrent
 	// row building or flushing safe.
-	closed atomic.Bool
+	closed   atomic.Bool
+	shutdown atomic.Pointer[qwpSenderShutdown]
 }
 
 // newQwpLineSender creates a new QWP sender backed by an
@@ -1338,22 +1339,10 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // engine was closed, neither of which is a terminal send-loop HALT. Such a slot
 // is DIRTY: recycling it would ship this borrower's rows under the next
 // borrower's FSN (borrower-isolation). The pool must discard it rather than
-// recycle. retained is only meaningful on the producer goroutine; a call from
-// a dispatcher goroutine can't inspect producer state, so it reports true —
-// unable to prove the slot clean, it errs on discard.
+// recycle. Like other mutating methods, this runs only on the handle's owner.
 func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err error) {
 	if s.closed.Load() {
 		return false, errClosedSenderFlush
-	}
-	if s.calledFromDispatcherGoroutine() {
-		// Running on a dispatcher goroutine (Close invoked from inside a
-		// user callback): touching producer state (lastErr / hasTable /
-		// pendingRowCount / buffers) would race the producer.
-		// Surface only the latched terminal error, like closeCursor does. We
-		// can't safely read pendingRowCount, so we can't prove the slot is
-		// clean either — report retained=true so the pool discards it instead
-		// of recycling a possibly-dirty slot under the next borrower.
-		return true, s.cursorSendLoop.sendLoopCheckError()
 	}
 	firstErr := s.lastErr
 	s.lastErr = nil
@@ -1404,20 +1393,6 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	if s.closed.Load() {
 		return -1, errClosedSenderFlush
 	}
-	if s.calledFromDispatcherGoroutine() {
-		// Flush() invoked from inside a user callback (error handler,
-		// connection listener, or progress handler) runs on that
-		// dispatcher goroutine. This branch returns any stored terminal error.
-		// It must not read or flush
-		// producer-owned state (hasTable / pendingRowCount / tableBuffers
-		// / the encoder) from this goroutine — that races the producer,
-		// the producer-state hazard. Surface any latched error and
-		// return the published FSN without touching producer state.
-		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
-			return -1, err
-		}
-		return s.cursorEngine.enginePublishedFsn(), nil
-	}
 	// Drain any latched fluent-API error (a Symbol/*Column/Table
 	// validation failure) ahead of the hasTable/pendingRowCount
 	// branches, fulfilling the latch contract's "surfaces on the next
@@ -1429,9 +1404,8 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	// with no latched error performs no producer-state write at all and
 	// stays a pure read — several goroutines sampling a quiescent
 	// (post-HALT) sender to observe the latched terminal error therefore
-	// race only on read-only state. The calledFromDispatcherGoroutine path above
-	// skips this: lastErr is producer-owned, and reading it from the
-	// dispatcher goroutine races the producer.
+	// race only on read-only state. Callbacks must notify the application owner
+	// rather than invoking this mutating method.
 	if err := s.lastErr; err != nil {
 		s.lastErr = nil
 		if s.currentTable != nil {
@@ -1556,25 +1530,13 @@ func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
 
 func (s *qwpLineSender) Close(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
-		// The first Close may have safely handed engine cleanup to the manager
-		// worker, which can then hit a transient durability or flock-release
-		// error. Preserve the public double-close contract while cleanup is
-		// complete, but let an ownerless aborted/retryable cleanup finish.
-		//
-		// engineRetryRepeatedClose refuses while the send loop may still be
-		// reading the segment mappings that terminal cleanup unmaps. So a Close
-		// arriving while the first one is still draining reports the double
-		// close and touches nothing, and one arriving after it can take over.
-		if acted, err := s.cursorEngine.engineRetryRepeatedClose(); acted {
-			return err
-		}
 		return errDoubleSenderClose
 	}
 	// All wire I/O goes through the cursor engine + send loop,
 	// regardless of whether sf_dir was set. closeCursor drains
 	// (up to closeTimeout), stops the loop, closes the engine,
 	// and tears down the orphan-drainer pool if one was started.
-	return s.closeCursor(ctx)
+	return s.startShutdown(ctx)
 }
 
 // --- QwpSender interface: extended column types ---

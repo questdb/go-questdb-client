@@ -608,11 +608,17 @@ func TestQwpSfOrphanSubmissionCancellationFailsConstruction(t *testing.T) {
 	}
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, sender, "construction must not silently skip a rejected orphan submission")
+	// Cancellation bounds the constructor's wait, not its acquired-resource
+	// cleanup. The retained owner must finish before the slot can be reused.
+	var cleanup closeLifecycleReporter
+	if errors.As(err, &cleanup) {
+		require.Eventually(t, cleanup.closeCompleted, 3*time.Second, time.Millisecond)
+	}
 	require.True(t, qwpSfIsCandidateOrphan(orphanDir))
 	require.NoFileExists(t, filepath.Join(orphanDir, qwpSfFailedSentinelName))
 	for _, dir := range []string{orphanDir, filepath.Join(root, "foreground")} {
 		lock, err := qwpSfAcquireSlotLock(dir)
-		require.NoError(t, err, "failed construction must release its slot and leave the orphan unlocked")
+		require.NoError(t, err, "completed construction cleanup must release its slot and leave the orphan unlocked")
 		require.NoError(t, lock.close())
 	}
 }

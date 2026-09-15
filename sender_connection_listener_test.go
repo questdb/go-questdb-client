@@ -435,14 +435,9 @@ func TestConnectionListenerAsyncConnect(t *testing.T) {
 	}
 }
 
-// TestConnectionListenerFlushCloseFromCallbackSkipsProducerState pins the
-// dispatcher-goroutine guard on the connection-listener path: Flush() and
-// Close() invoked from inside a listener run on the listener's dispatcher
-// goroutine and must not touch producer-staged rows — the same producer-state contract
-// TestQwpSenderCloseFromErrorHandlerSkipsProducerState pins for the error
-// handler. Pre-fix the guard matched only the error dispatcher, so a
-// listener-side Flush flushed the staged rows from the wrong goroutine.
-func TestConnectionListenerFlushCloseFromCallbackSkipsProducerState(t *testing.T) {
+// Connection callbacks notify the owner without touching its staged rows.
+// After notification, that owner flushes and closes the handle.
+func TestConnectionListenerNotifiesOwnerToFlushAndClose(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
@@ -456,13 +451,11 @@ func TestConnectionListenerFlushCloseFromCallbackSkipsProducerState(t *testing.T
 	loop.sendLoopSetConnectionListener(func(SenderConnectionEvent) {
 		once.Do(func() {
 			<-producerReady
-			_, _ = s.FlushAndGetSequence(ctx)
-			_ = s.Close(ctx)
 			close(listenerDone)
 		})
 	}, 16)
 
-	// Stage rows the listener-side Flush/Close must not publish.
+	// Stage rows the notification must not publish.
 	if err := s.Table("t").Int64Column("v", 1).AtNow(ctx); err != nil {
 		t.Fatalf("AtNow: %v", err)
 	}
@@ -480,24 +473,25 @@ func TestConnectionListenerFlushCloseFromCallbackSkipsProducerState(t *testing.T
 	select {
 	case <-listenerDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("listener never ran Flush()+Close()")
+		t.Fatal("listener never notified the owner")
 	}
 	if s.pendingRowCount != 2 {
-		t.Errorf("listener-side Flush()/Close() flushed producer rows: pendingRowCount=%d, want 2",
+		t.Errorf("notification changed pendingRowCount=%d, want 2",
 			s.pendingRowCount)
 	}
 	if got := engine.enginePublishedFsn(); got != fsnBefore {
-		t.Errorf("listener-side Flush()/Close() published staged rows: fsn %d -> %d", fsnBefore, got)
+		t.Errorf("notification published staged rows: fsn %d -> %d", fsnBefore, got)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// TestConnectionListenerCloseFromCallbackConcurrentProducer is the -race
-// companion: a listener-invoked Close() runs concurrently with a producer
-// goroutine still building rows. Pre-fix the re-entrancy guard matched only
-// the error dispatcher, so this Close touched producer state from the
-// connection dispatcher goroutine — a data race up to Go's fatal
-// concurrent-map error.
-func TestConnectionListenerCloseFromCallbackConcurrentProducer(t *testing.T) {
+// A listener signals a running producer to stop; only that producer closes.
+func TestConnectionListenerStopsOwner(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
@@ -508,7 +502,6 @@ func TestConnectionListenerCloseFromCallbackConcurrentProducer(t *testing.T) {
 	var once sync.Once
 	loop.sendLoopSetConnectionListener(func(SenderConnectionEvent) {
 		once.Do(func() {
-			_ = s.Close(context.Background())
 			close(closed)
 		})
 	}, 16)
@@ -522,8 +515,14 @@ func TestConnectionListenerCloseFromCallbackConcurrentProducer(t *testing.T) {
 				prodPanic.Store(fmt.Sprintf("%v", r))
 			}
 		}()
+		defer func() { _ = s.Close(context.Background()) }()
 		ctx := context.Background()
 		for i := 0; i < 100000; i++ {
+			select {
+			case <-closed:
+				return
+			default:
+			}
 			// A fresh table per row keeps the tableBuffers map churning,
 			// maximizing overlap with a producer-state-touching close.
 			if err := s.Table(fmt.Sprintf("t%d", i)).Int64Column("v", int64(i)).AtNow(ctx); err != nil {
@@ -537,7 +536,7 @@ func TestConnectionListenerCloseFromCallbackConcurrentProducer(t *testing.T) {
 	select {
 	case <-closed:
 	case <-time.After(10 * time.Second):
-		t.Fatal("listener never fired / Close() never returned")
+		t.Fatal("listener never signalled the owner")
 	}
 	select {
 	case <-prodDone:
@@ -545,15 +544,13 @@ func TestConnectionListenerCloseFromCallbackConcurrentProducer(t *testing.T) {
 		t.Fatal("producer goroutine did not stop after Close()")
 	}
 	if p := prodPanic.Load(); p != nil {
-		t.Fatalf("producer crashed racing a listener-invoked Close(): %v", p)
+		t.Fatalf("producer panicked while handling its stop notification: %v", p)
 	}
 }
 
-// TestConnectionListenerFlushFromCallbackConcurrentProducer mirrors the Close
-// variant for Flush: a listener hammering Flush() on the dispatcher goroutine
-// must only surface latched errors, never racing the concurrent producer's
-// staged rows.
-func TestConnectionListenerFlushFromCallbackConcurrentProducer(t *testing.T) {
+// Flush requests also travel through a notification. The test waits for the
+// producer to stop before taking ownership and flushing.
+func TestConnectionListenerRequestsOwnerFlush(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
@@ -564,9 +561,6 @@ func TestConnectionListenerFlushFromCallbackConcurrentProducer(t *testing.T) {
 	var once sync.Once
 	loop.sendLoopSetConnectionListener(func(SenderConnectionEvent) {
 		once.Do(func() {
-			for i := 0; i < 100; i++ {
-				_ = s.Flush(context.Background())
-			}
 			close(flushed)
 		})
 	}, 16)
@@ -598,7 +592,7 @@ func TestConnectionListenerFlushFromCallbackConcurrentProducer(t *testing.T) {
 	select {
 	case <-flushed:
 	case <-time.After(10 * time.Second):
-		t.Fatal("listener never finished its Flush() loop")
+		t.Fatal("listener never requested a flush")
 	}
 	select {
 	case <-prodDone:
@@ -606,7 +600,10 @@ func TestConnectionListenerFlushFromCallbackConcurrentProducer(t *testing.T) {
 		t.Fatal("producer goroutine did not stop")
 	}
 	if p := prodPanic.Load(); p != nil {
-		t.Fatalf("producer crashed racing listener-invoked Flush(): %v", p)
+		t.Fatalf("producer panicked: %v", p)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

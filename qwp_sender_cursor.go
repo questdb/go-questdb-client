@@ -32,6 +32,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -227,19 +228,18 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		}
 		var cleanupErr error
 		var reporter closeLifecycleReporter
+		if builtSender == nil && builtLoop != nil {
+			// No producer rows exist yet. Transfer the acquired loop/engine to
+			// the same shutdown owner used by a fully constructed sender.
+			builtSender = &qwpLineSender{cursorEngine: engine, cursorSendLoop: builtLoop}
+		}
 		if builtSender != nil {
-			cleanupErr = builtSender.closeCursor(context.Background())
+			cleanupErr = builtSender.Close(ctx)
 			if !builtSender.closeCompleted() {
 				reporter = builtSender
 			}
 		} else {
-			leakMappings := false
-			if builtLoop != nil {
-				loopStopped, loopErr := closeBuiltSendLoopGuarded(builtLoop, engine.engineLogger())
-				cleanupErr = qwpAppendCloseError(cleanupErr, loopErr)
-				leakMappings = !loopStopped || builtLoop.sendLoopAbandoned()
-			}
-			engineErr := closeEngineGuarded(engine, leakMappings, conf.logger)
+			engineErr := closeEngineGuarded(engine, false, conf.logger)
 			cleanupErr = qwpAppendCloseError(cleanupErr, engineErr)
 			if !engine.engineCloseCompleted() {
 				reporter = &qwpSfBuildCleanupError{
@@ -940,63 +940,65 @@ func (s *qwpLineSender) buildTableEncodeInfo() ([]*qwpTableBuffer, error) {
 	return s.encodeInfoBuf, nil
 }
 
-// calledFromDispatcherGoroutine reports whether the current goroutine is one of
-// the sender's callback dispatcher goroutines — i.e. we are running inside a
-// user SenderErrorHandler, SenderConnectionListener, or SenderProgressHandler
-// invocation. Callbacks are documented as allowed to call Close() / Flush();
-// when they do, those calls run off the producer goroutine. The producer owns
-// lastErr / hasTable / currentTable / pendingRowCount / the tableBuffers map /
-// the dirtyTables list / the encoder with no happens-before against this
-// goroutine, so the Close()/Flush() paths must NOT touch that state —
-// doing so races a producer mid-At(): buildTableEncodeInfo ranges
-// dirtyTables while Table() appends to it, and Table() writes the
-// tableBuffers map, either of which corrupts state (a racing slice
-// range/append, or Go's fatal "concurrent map iteration and map write").
-//
-// Cheap on the common path: each loopGoid is 0 whenever that dispatcher
-// goroutine is not running (nothing has ever been delivered on it), so the
-// runtime.Stack cost of qwpGoid() is only paid once a dispatcher has actually
-// spun up. The g != 0 guard keeps a goid parse failure from matching the
-// loopGoid==0 "not running" sentinel.
-func (s *qwpLineSender) calledFromDispatcherGoroutine() bool {
-	if s.cursorSendLoop == nil {
-		return false
-	}
-	loopIds := [3]int64{
-		s.cursorSendLoop.sendLoopDispatcher().loopGoroutineId(),
-		s.cursorSendLoop.sendLoopConnDispatcher().loopGoroutineId(),
-		s.cursorSendLoop.progressDispatcher.Load().loopGoroutineId(),
-	}
-	g := int64(0)
-	for _, lg := range loopIds {
-		if lg == 0 {
-			continue
-		}
-		if g == 0 {
-			if g = qwpGoid(); g == 0 {
-				return false
-			}
-		}
-		if g == lg {
-			return true
-		}
-	}
-	return false
+// qwpSenderShutdown owns the staged producer state after public Close. Only
+// its worker writes err; closing done publishes the result to observers.
+type qwpSenderShutdown struct {
+	done chan struct{}
+	err  error
 }
 
-// closeCursor drains the cursor engine and closes the send loop.
-// Returns the first non-nil error from drain / loop shutdown /
-// engine close. Always best-effort: every subsystem is asked to
-// close even if an earlier step errored.
+var qwpFailedSenders struct {
+	sync.Mutex
+	items []*qwpLineSender
+}
+
+func (s *qwpLineSender) startShutdown(ctx context.Context) error {
+	op := &qwpSenderShutdown{done: make(chan struct{})}
+	s.shutdown.Store(op)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				op.err = fmt.Errorf("%w: sender shutdown panicked: %v\n%s", ErrCleanupFailed, r, debug.Stack())
+				qwpFailedSenders.Lock()
+				qwpFailedSenders.items = append(qwpFailedSenders.items, s)
+				qwpFailedSenders.Unlock()
+			}
+			// Logging is a notification, not a resource-completion barrier.
+			close(op.done)
+			if op.err != nil {
+				slot := ""
+				if s.cursorEngine != nil {
+					slot = s.cursorEngine.engineSfDir()
+				}
+				qwpEffectiveLogger(s.cursorEngine.engineLogger()).Error("qwp: sender shutdown failed",
+					"slot", slot, "error", op.err)
+			}
+		}()
+		// Caller cancellation cannot cancel publication or restart the drain
+		// budget. The engine still enforces its finite append deadline.
+		op.err = s.closeCursor(context.Background())
+	}()
+	select {
+	case <-op.done:
+		return op.err
+	default:
+	}
+	select {
+	case <-op.done:
+		return op.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// closeCursor runs inside owned sender shutdown. It attempts staged-row
+// publication, optionally waits for ACKs, joins I/O, and asks the engine and
+// drainer pool to close. Errors from these phases are accumulated.
 //
-// Drain semantics:
-//   - closeFlushTimeout > 0: block up to that long for ackedFsn ≥
-//     publishedFsn. On timeout, returns a drain-timeout error so
-//     the caller cannot silently lose data — shutdown still
-//     completes. SF-mode users can recover the unacked tail by
-//     reopening on the same sf_dir; memory-mode users have no
-//     recovery path and must treat the timeout as fatal.
-//   - closeFlushTimeout <= 0: skip the drain entirely (fast close).
+// closeTimeout bounds only the ACK wait; zero disables that wait, not staged
+// publication or cleanup. An ACK timeout remains an error after resources are
+// released. SF can recover rows already published into its log; it cannot
+// recover unpublished rows, and memory mode has no restart recovery.
 func (s *qwpLineSender) closeCursor(ctx context.Context) (firstErr error) {
 	// Capture and install the last cleanup obligation before entering any
 	// faultable phase. Drainers stop last, preserving the intended overlap with
@@ -1028,12 +1030,9 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) (firstErr error) {
 	firstErr = qwpAppendCloseError(firstErr, loopErr)
 	// Close the engine (closes ring, manager if owned, and slot lock). The
 	// segment mmaps may only be unmapped once no goroutine can still be
-	// dereferencing them. Two states say otherwise: a send loop abandoned
-	// wedged in disk I/O, and a sendLoopClose that faulted before it could
-	// prove the I/O goroutine joined. Both leak the address space instead,
-	// which is bounded by process exit; unmapping under a live reader faults
-	// the host.
-	leakMappings := !loopStopped || s.cursorSendLoop.sendLoopAbandoned()
+	// dereferencing them. An unexpected failure before the join leaves that
+	// proof unavailable; the guarded engine path preserves the mappings.
+	leakMappings := !loopStopped
 	engineCloseErr := closeEngineGuarded(s.cursorEngine, leakMappings, logger)
 	firstErr = qwpAppendCloseError(firstErr, engineCloseErr)
 	if !s.cursorEngine.engineCloseCompleted() {
@@ -1136,66 +1135,30 @@ func (s *qwpLineSender) closeCursorDrainGuarded(ctx context.Context) (firstErr e
 	if hook := qwpTestCloseDrainHook.Load(); hook != nil {
 		(*hook)()
 	}
-	// A Close() invoked from inside a user callback (SenderErrorHandler,
-	// SenderConnectionListener, or SenderProgressHandler) runs on that
-	// dispatcher goroutine, not the producer goroutine. Flushing pending
-	// rows or even reading lastErr / hasTable / pendingRowCount here
-	// would race a producer still mid-Table()/At() (the
-	// producer-state race). Skip every producer-state access in that
-	// case and run only the goroutine-safe teardown below (drain wait,
-	// send-loop close, engine close, drainer pool). The producer
-	// surfaces the latched terminal error and then the closed-sender
-	// error on its next call; its un-flushed in-progress rows were never
-	// handed off and remain its own to retry (SF mode replays whatever
-	// was already persisted on the next open).
-	if !s.calledFromDispatcherGoroutine() {
-		// Surface any latched fluent-API error (e.g. validation failure
-		// on Symbol/*Column/Table) so Close() doesn't silently swallow
-		// it — mirrors the HTTP sender's flush0, which drains
-		// buf.LastErr() on the close path. Captured first so any
-		// subsequent enqueue / drain / shutdown error doesn't override
-		// it: the latched fault is the original user-facing cause and
-		// downstream failures usually follow from it.
-		firstErr = s.lastErr
-		s.lastErr = nil
-		// Encode any pending rows from the open API call into the engine
-		// first. Drop the pending in-progress row (no At/AtNow yet) the
-		// same way Close does in memory mode.
-		if s.hasTable {
-			if s.currentTable != nil {
-				s.currentTable.cancelRow()
-			}
-			s.hasTable = false
-			s.currentTable = nil
+	// This worker exclusively owns producer state. Unfinished rows were never
+	// submitted; completed rows still get one finite publication attempt even
+	// if validation failed on a later row or the ACK wait is disabled.
+	firstErr = s.lastErr
+	s.lastErr = nil
+	if s.hasTable {
+		if s.currentTable != nil {
+			s.currentTable.cancelRow()
 		}
-		if s.pendingRowCount > 0 {
-			// Enqueue the pending rows but do NOT block on ACK here —
-			// flushCursor's ACK wait is unbounded by ctx alone, and
-			// would deadlock against a silent server. waitCursorDrain
-			// below is the single bounded ACK wait, governed by
-			// closeFlushTimeout. Mirrors Java's flushPendingRows() +
-			// drainOnClose() split.
-			if err := s.enqueueCursor(ctx); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-			} else {
-				// Retain-on-error: only reset the table buffers once the
-				// rows are in a segment. A failed enqueue (ring full +
-				// wire stalled, or ctx cancelled) never persisted them —
-				// resetting here would silently destroy data. SF-mode
-				// users recover the tail by reopening on the same sf_dir;
-				// memory-mode users at least see firstErr. Mirrors the
-				// autoFlush path and Java's flushPendingRows() contract.
-				s.resetAfterFlush()
-			}
+		s.hasTable = false
+		s.currentTable = nil
+		s.cachedDesignatedTs = nil
+	}
+	if s.pendingRowCount > 0 {
+		if err := s.enqueueCursor(ctx); err != nil {
+			// These rows were not necessarily saved. Preserve the publication
+			// error even when an earlier validation error also needs reporting.
+			firstErr = qwpAppendCloseError(firstErr, err)
+		} else {
+			s.resetAfterFlush()
 		}
 	}
-	// Wait for drain.
 	if s.closeTimeout > 0 {
-		if err := s.waitCursorDrain(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		firstErr = qwpAppendCloseError(firstErr, s.waitCursorDrain(ctx))
 	}
 	return firstErr
 }
@@ -1228,11 +1191,8 @@ func (s *qwpLineSender) closeSendLoopGuarded() (stopped bool, err error) {
 		}
 	}()
 	closeErr := s.cursorSendLoop.sendLoopClose()
-	// sendLoopClose returns normally on its own grace timeout, having only
-	// marked the goroutine abandoned -- so a plain "it returned" is not the
-	// proof this reports. Read the abandon flag, or the answer is right only
-	// because the caller happens to check it as well.
-	return !s.cursorSendLoop.sendLoopAbandoned(), closeErr
+	// Returning from the owned join proves that all loop readers have exited.
+	return true, closeErr
 }
 
 // closeBuiltSendLoopGuarded covers the constructor window where the send loop
@@ -1250,7 +1210,7 @@ func closeBuiltSendLoopGuarded(loop *qwpSfSendLoop, logger *slog.Logger) (stoppe
 		}
 	}()
 	closeErr := loop.sendLoopClose()
-	return !loop.sendLoopAbandoned(), closeErr
+	return true, closeErr
 }
 
 // qwpTestCloseSendLoopHook fires after sendLoopClose has published its stop and
@@ -1262,7 +1222,20 @@ var qwpTestCloseSendLoopHook atomic.Pointer[func()]
 // closeCompleted lets the facade pool distinguish a completed delegate close
 // from a safe deferred close that still retains its SF slot flock.
 func (s *qwpLineSender) closeCompleted() bool {
-	return s == nil || s.cursorEngine == nil || s.cursorEngine.engineCloseCompleted()
+	if s == nil {
+		return true
+	}
+	if op := s.shutdown.Load(); op != nil {
+		select {
+		case <-op.done:
+			if errors.Is(op.err, ErrCleanupFailed) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return s.cursorEngine == nil || s.cursorEngine.engineCloseCompleted()
 }
 
 func (s *qwpLineSender) ensureCloseRetryOwner(logger *slog.Logger) {

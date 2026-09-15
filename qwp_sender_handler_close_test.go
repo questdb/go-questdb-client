@@ -109,28 +109,10 @@ func TestQwpSfEngineCloseDuringBackpressuredAppendNoCrash(t *testing.T) {
 			"error once the engine is closed, got: %v", prodErr)
 }
 
-// TestQwpSenderCloseFromErrorHandlerSkipsProducerState is the
-// regression for the producer-state data race (Hazard B).
-//
-// The SenderErrorHandler runs on the dispatcher goroutine. The producer
-// goroutine owns the table buffers, the encoder, hasTable and
-// pendingRowCount with no happens-before against the dispatcher. So
-// Close()/Flush() invoked from the handler must NOT flush producer-
-// buffered rows or range the tableBuffers map — doing so races a
-// producer mid-At(), up to Go's fatal "concurrent map iteration and map
-// write".
-//
-// This is the deterministic half: the producer stages rows and then
-// parks while the handler calls Flush() and Close() off the producer
-// goroutine. Pre-fix, those calls flush the staged rows (resetting
-// pendingRowCount and advancing publishedFsn); post-fix they leave
-// producer state untouched. The companion -race test below exercises
-// the same path with a genuinely concurrent producer.
-func TestQwpSenderCloseFromErrorHandlerSkipsProducerState(t *testing.T) {
-	// Drop-policy rejection: the handler fires but no terminal error is
-	// latched, so a handler-side Flush() would otherwise proceed into the
-	// pending-rows encode path (which ranges tableBuffers).
-	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusSchemaMismatch})
+// Error callbacks notify the owner. Only the owner flushes the staged rows
+// and closes the sender; a notification itself never touches producer state.
+func TestQwpSenderErrorHandlerNotifiesOwnerToFlushAndClose(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
 	s, engine, loop, cleanup := newCursorSenderForTest(t, srv, 0)
@@ -142,58 +124,49 @@ func TestQwpSenderCloseFromErrorHandlerSkipsProducerState(t *testing.T) {
 	var once sync.Once
 	loop.sendLoopSetErrorHandler(func(e *SenderError) {
 		once.Do(func() {
-			// Wait until the producer has staged its pending rows and
-			// parked, so this Flush+Close is the only thing touching the
-			// sender — the behavioral assertion is then race-free.
+			// Wait until the owner has staged the rows, then notify it.
 			<-producerReady
-			// Both calls run on the dispatcher goroutine and must skip
-			// producer state. Pre-fix they flush the staged rows.
-			_, _ = s.FlushAndGetSequence(ctx)
-			_ = s.Close(ctx)
 			close(handlerDone)
 		})
 	}, 16)
 
-	// Batch 1: one row, flushed. The server drops it, scheduling the
-	// handler (which then blocks on producerReady).
+	// Publish the first batch before staging the rows used by the assertion.
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(ctx))
 	require.NoError(t, s.Flush(ctx))
 
-	// Stage two more rows the handler-side Flush/Close must not touch.
+	// Stage two rows before allowing the notification.
 	require.NoError(t, s.Table("t").Int64Column("v", 2).AtNow(ctx))
 	require.NoError(t, s.Table("t").Int64Column("v", 3).AtNow(ctx))
 	require.Equal(t, 2, s.pendingRowCount)
 	fsnBefore := engine.enginePublishedFsn()
 
-	close(producerReady) // release the handler to Flush()+Close()
+	loop.sendLoopDispatcher().offer(&SenderError{Category: CategoryWriteError, AppliedPolicy: PolicyRetriable})
+	close(producerReady) // release the notification; only this owner may flush
 
 	select {
 	case <-handlerDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("handler never ran Flush()+Close() — drop notification not delivered?")
+		t.Fatal("error notification was not delivered")
 	}
 
-	// Post-fix: the off-producer Flush()/Close() left the staged rows and
-	// the publish cursor exactly where the producer left them.
+	// The callback only signalled: rows remain staged for the owner.
 	assert.Equal(t, 2, s.pendingRowCount,
-		"off-producer Flush()/Close() must not flush producer-buffered rows")
-	assert.Equal(t, fsnBefore, engine.enginePublishedFsn(),
-		"off-producer Flush()/Close() must not publish staged rows")
+		"notification must not publish producer-buffered rows")
+	assert.Equal(t, fsnBefore, engine.enginePublishedFsn())
+	require.NoError(t, s.Flush(ctx))
+	require.Zero(t, s.pendingRowCount)
+	require.Greater(t, engine.enginePublishedFsn(), fsnBefore)
+	s.closeTimeout = 0
+	require.NoError(t, s.Close(ctx))
 }
 
-// TestQwpSenderCloseFromErrorHandlerConcurrentProducer drives the exact
-// documented scenario — the SenderErrorHandler calls Close() — with a
-// genuinely concurrent producer goroutine still building rows. It is the
-// -race companion to the deterministic tests above: under -race
-// (which CI runs) the pre-fix build reports the data race between the
-// dispatcher goroutine's closeCursor and the producer's table-buffer /
-// row-state mutations; either way the producer must not panic.
-func TestQwpSenderCloseFromErrorHandlerConcurrentProducer(t *testing.T) {
+// The callback asks a running producer to stop. The producer itself closes
+// its handle after its last use, without racing mutable sender state.
+func TestQwpSenderErrorHandlerStopsOwner(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{rejectStatus: QwpStatusSchemaMismatch})
 	defer srv.Close()
 
-	// autoFlushRows=1: every row is flushed, so frames keep reaching the
-	// (drop-policy) server and the handler keeps having reason to fire.
+	// autoFlushRows=1 triggers the server rejection and its notification.
 	s, _, loop, cleanup := newCursorSenderForTest(t, srv, 1)
 	defer cleanup()
 
@@ -201,7 +174,6 @@ func TestQwpSenderCloseFromErrorHandlerConcurrentProducer(t *testing.T) {
 	var once sync.Once
 	loop.sendLoopSetErrorHandler(func(e *SenderError) {
 		once.Do(func() {
-			_ = s.Close(context.Background())
 			close(closed)
 		})
 	}, 16)
@@ -210,6 +182,7 @@ func TestQwpSenderCloseFromErrorHandlerConcurrentProducer(t *testing.T) {
 	prodDone := make(chan struct{})
 	go func() {
 		defer close(prodDone)
+		defer func() { _ = s.Close(context.Background()) }()
 		defer func() {
 			if r := recover(); r != nil {
 				prodPanic.Store(fmt.Sprintf("%v", r))
@@ -217,6 +190,11 @@ func TestQwpSenderCloseFromErrorHandlerConcurrentProducer(t *testing.T) {
 		}()
 		ctx := context.Background()
 		for i := 0; i < 100000; i++ {
+			select {
+			case <-closed:
+				return
+			default:
+			}
 			// A fresh table per row keeps the tableBuffers map churning,
 			// maximizing overlap with closeCursor's map range.
 			tbl := fmt.Sprintf("t%d", i)
@@ -229,7 +207,7 @@ func TestQwpSenderCloseFromErrorHandlerConcurrentProducer(t *testing.T) {
 	select {
 	case <-closed:
 	case <-time.After(10 * time.Second):
-		t.Fatal("handler never fired / Close() never called")
+		t.Fatal("handler never signalled the owner")
 	}
 
 	select {
@@ -238,5 +216,5 @@ func TestQwpSenderCloseFromErrorHandlerConcurrentProducer(t *testing.T) {
 		t.Fatal("producer goroutine did not stop after Close()")
 	}
 	require.Nil(t, prodPanic.Load(),
-		"producer crashed racing a handler-invoked Close(): %v", prodPanic.Load())
+		"producer panicked while handling its stop notification: %v", prodPanic.Load())
 }

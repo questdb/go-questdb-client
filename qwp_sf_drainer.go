@@ -446,7 +446,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	var loop *qwpSfSendLoop
 	loopStopped := true
 	defer func() {
-		leakMappings := loop != nil && (!loopStopped || loop.sendLoopAbandoned())
+		leakMappings := loop != nil && !loopStopped
 		closeErr := closeEngineGuarded(engine, leakMappings, d.logger)
 		if closeErr != nil {
 			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer engine close failed",

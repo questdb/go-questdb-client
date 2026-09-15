@@ -74,7 +74,7 @@ func TestQwpSfSegmentCloseLeakMappingKeepsBuf(t *testing.T) {
 	require.NoError(t, qwpSfMunmap(seg.buf))
 }
 
-func TestQwpSenderRepeatedCloseRetriesFlockRelease(t *testing.T) {
+func TestQwpSenderRepeatedCloseDoesNotDriveFlockRelease(t *testing.T) {
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
@@ -95,16 +95,16 @@ func TestQwpSenderRepeatedCloseRetriesFlockRelease(t *testing.T) {
 	_, err = qwpSfAcquireSlotLock(dir)
 	require.Error(t, err, "failed release must retain the flock")
 
-	// Model the public sender after its first Close has already run: the repeat
-	// call must reach ownerless engine cleanup instead of returning the ordinary
-	// double-close error. A real close publishes reader quiescence through
-	// closeEngineGuarded on its way in, and the repeat path acts only once that
-	// is on record, so a caller arriving while the first Close is still
-	// draining cannot tear down a live send loop.
+	// A repeated public Close cannot take over this hand-built cleanup state.
+	// The engine test owner remains responsible for releasing the fixture.
 	sender := &qwpLineSender{cursorEngine: engine}
 	sender.closed.Store(true)
 	engine.cleanup.markReadersQuiesced(false)
-	require.NoError(t, sender.Close(context.Background()))
+	require.ErrorIs(t, sender.Close(context.Background()), errDoubleSenderClose)
+	require.False(t, engine.engineCloseCompleted())
+	require.Equal(t, 1, calls, "public Close must not retry cleanup")
+	// Release this manually constructed engine through its existing owner.
+	require.NoError(t, closeEngineGuarded(engine, false, nil))
 	require.True(t, engine.engineCloseCompleted())
 	lock, err := qwpSfAcquireSlotLock(dir)
 	require.NoError(t, err)
@@ -976,10 +976,9 @@ func TestQwpEngineCloseAfterManagerWorkerPanicReleasesSlot(t *testing.T) {
 	require.NoError(t, lock.close())
 }
 
-// TestQwpSendLoopCloseAbandonSignalsAndReleasesTransport pins that a send loop
-// whose I/O goroutine never joins abandons after the grace, flags itself so the
-// engine teardown leaks the mappings, and still releases the WebSocket.
-func TestQwpSendLoopCloseAbandonSignalsAndReleasesTransport(t *testing.T) {
+// Stopping a loop requests transport teardown but does not pretend a reader
+// has exited. The owned join completes only after the reader is released.
+func TestQwpSendLoopCloseWaitsForReaderExit(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
@@ -992,19 +991,29 @@ func TestQwpSendLoopCloseAbandonSignalsAndReleasesTransport(t *testing.T) {
 
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, time.Millisecond, time.Millisecond, 10*time.Millisecond)
-	// Simulate a wedged I/O goroutine: a wg count that is never matched by a
-	// Done, so the join never completes and sendLoopClose must abandon.
 	loop.wg.Add(1)
-
-	old := qwpSfSendLoopCloseGrace.load()
-	qwpSfSendLoopCloseGrace.store(20 * time.Millisecond)
-	defer func() { qwpSfSendLoopCloseGrace.store(old) }()
-
-	require.NoError(t, loop.sendLoopClose())
-	require.True(t, loop.sendLoopAbandoned(), "wedged join must abandon")
-	require.Nil(t, loop.transport.Load(), "transport released on abandon")
-
-	loop.wg.Done() // let the internal join goroutine finish
+	var release sync.Once
+	t.Cleanup(func() { release.Do(loop.wg.Done) })
+	closed := make(chan error, 1)
+	go func() { closed <- loop.sendLoopClose() }()
+	select {
+	case <-loop.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("stop was not requested")
+	}
+	select {
+	case <-closed:
+		t.Fatal("close finished before reader exit")
+	case <-time.After(30 * time.Millisecond):
+	}
+	release.Do(loop.wg.Done)
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("close did not finish after reader exit")
+	}
+	require.Nil(t, loop.transport.Load())
 }
 
 // TestQwpCloseDrainPanicLeaksMappingsAndStopsSendLoop pins the contract that
@@ -1386,7 +1395,7 @@ func TestQwpEngineTerminalPhasePanicRetriesToCompletion(t *testing.T) {
 // closeEngineGuarded installs a retry owner before it returns, and a repeated
 // Close stands aside for one, so in practice the background owner is what
 // finishes the job. SlotLockReleased is how a caller watches for that.
-func TestQwpSenderRepeatedCloseRedrivesAnAbortedClose(t *testing.T) {
+func TestQwpSenderRepeatedCloseDoesNotRedriveAnAbortedClose(t *testing.T) {
 	srv := newQwpTestServer(t)
 	defer srv.Close()
 	sfDir := t.TempDir()
@@ -1417,8 +1426,11 @@ func TestQwpSenderRepeatedCloseRedrivesAnAbortedClose(t *testing.T) {
 
 	require.True(t, s.cursorEngine.engineCloseNeedsRedrive(),
 		"an aborted close must be recognised as needing a re-drive")
-	require.NoError(t, ls.Close(context.Background()),
-		"a repeated Close must finish the cleanup, not report a double close")
+	require.ErrorIs(t, ls.Close(context.Background()), errDoubleSenderClose)
+	require.False(t, s.cursorEngine.engineCloseCompleted())
+	// This fixture constructed an ownerless state directly; release it here,
+	// not through a public takeover or a production repair entry point.
+	require.NoError(t, closeEngineGuarded(s.cursorEngine, false, nil))
 	require.True(t, s.cursorEngine.engineCloseCompleted())
 
 	lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(sfDir, "abort"))
@@ -1427,8 +1439,7 @@ func TestQwpSenderRepeatedCloseRedrivesAnAbortedClose(t *testing.T) {
 }
 
 // TestQwpSenderConcurrentCloseKeepsSegmentsMappedUnderLiveSendLoop pins the
-// rule that keeps the repeated-Close path safe: a second Close may take over
-// terminal cleanup only after the first Close has returned.
+// rule that a repeated public Close cannot take ownership of resource cleanup.
 //
 // While the first Close is still draining, the send loop is still reading the
 // segment mappings, and terminal cleanup unmaps them. The send loop works from
@@ -1569,54 +1580,14 @@ func TestQwpSenderSlotLockReleasedIsTrueInMemoryMode(t *testing.T) {
 	require.True(t, sender.SlotLockReleased())
 }
 
-// TestQwpSenderRepeatCloseCannotUnmapLeakedSegments covers the second input to
-// the cleanup-safety decision. A send loop abandoned mid-read is quiesced only
-// in the sense that nobody will wait for it: it is still walking the segment
-// mappings, so the close that abandoned it asks for them to be leaked rather
-// than unmapped.
-//
-// Both facts have to reach the cleanup record together. Published apart, there
-// is a window where the record says the readers are done but not that their
-// mappings are untouchable, and a repeated Close arriving there unmaps memory
-// the abandoned loop is still reading.
-func TestQwpSenderRepeatCloseCannotUnmapLeakedSegments(t *testing.T) {
-	engine, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
-	require.NoError(t, err)
-	active := engine.engineActiveSegment()
-	require.NotNil(t, active)
-	require.NotEmpty(t, active.address(), "precondition: the active segment is mapped")
-
-	// What closeCursor publishes when its send loop was abandoned mid-read.
-	engine.cleanup.markReadersQuiesced(true)
-
-	// A repeated Close asks for cleanup without knowing about the loop, so it
-	// passes leakSegments=false. The record must overrule it. Assert the claim
-	// was taken as well as its effect: a version that simply declined would
-	// leave the mapping intact too, and prove nothing.
-	acted, err := engine.engineRetryRepeatedClose()
-	require.NoError(t, err)
-	require.True(t, acted, "the repeated Close must take the cleanup claim")
-
-	require.NotEmpty(t, active.address(),
-		"a repeated Close unmapped segments the abandoned send loop is still reading")
-	require.True(t, engine.cleanup.snapshot().leakMappings,
-		"the leak decision must survive a claim that did not carry it")
-
-	// Release the deliberately leaked mapping so the test does not leak it.
-	require.NoError(t, qwpSfMunmap(active.buf))
-}
-
 // TestQwpSfCleanupRefusesEveryClaimBeforeReadersQuiesce pins the rule at the
 // place that enforces it. Terminal cleanup unmaps the segment files, so no
 // claimant may run it until the owner of the send loop has said the readers
-// are done -- and that has to hold for every claimant, not just the repeated
-// Close that first needed it.
+// are done. Every remaining claimant must respect that barrier.
 //
 // The retry owner arrives through engineRetryCloseIfNeeded, which carries no
 // send loop of its own, and the pool's re-probe reaches the same goroutine by
-// making sure one exists. If the rule lived only at the repeated-Close entry
-// point, pointing either of those at a slot whose loop is still live would
-// reopen the hole at a different door.
+// making sure one exists. Neither may unmap a still-live reader's memory.
 func TestQwpSfCleanupRefusesEveryClaimBeforeReadersQuiesce(t *testing.T) {
 	engine, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
@@ -1626,9 +1597,6 @@ func TestQwpSfCleanupRefusesEveryClaimBeforeReadersQuiesce(t *testing.T) {
 	// Nobody has said the send loop stopped, so every route in must decline.
 	require.NoError(t, engine.engineRetryCloseIfNeeded(),
 		"the retry route must decline quietly, not fault")
-	acted, err := engine.engineRetryRepeatedClose()
-	require.NoError(t, err)
-	require.False(t, acted, "a repeated Close must decline before the readers quiesce")
 
 	require.NotEmpty(t, active.address(),
 		"a claim taken before the readers quiesced unmapped a live segment")

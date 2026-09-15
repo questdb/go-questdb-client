@@ -1781,6 +1781,7 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 
 func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
 	opts := qwpTransportOpts{
+		logger:                conf.logger,
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,

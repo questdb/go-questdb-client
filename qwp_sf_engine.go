@@ -1491,20 +1491,6 @@ func (e *qwpSfCursorEngine) engineRetryCloseIfNeeded() error {
 	return err
 }
 
-// engineRetryRepeatedClose makes the public double-close decision and cleanup
-// claim as one state read. It returns acted=false while a close, manager
-// callback or retry goroutine owns the protocol, or while the send loop has not
-// been shown to have stopped, and acted=true when this call either re-drives
-// manager teardown or consumes a retryable terminal claim.
-func (e *qwpSfCursorEngine) engineRetryRepeatedClose() (acted bool, err error) {
-	if e == nil {
-		return false, nil
-	}
-	e.closed.Store(true)
-	token, action := e.cleanup.beginRepeatClose(qwpSfCleanupOwnerClose)
-	return e.runCleanupAction(token, action, qwpSfCleanupOwnerClose)
-}
-
 // engineRunCloseRetryAttempt contains panics outside terminal cleanup itself,
 // including manager-handoff diagnostics. It deliberately does not touch
 // the cleanup state: engineFinishCloseGuarded changes only the token generation

@@ -312,6 +312,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 
 		tr := &qwpTransport{}
 		opts := qwpTransportOpts{
+			logger:                cfg.logger,
 			tlsInsecureSkipVerify: cfg.tlsMode == tlsInsecureSkipVerify,
 			endpointPath:          cfg.endpointPath,
 			authorization:         cfg.effectiveAuthorization(),
@@ -373,7 +374,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			// caller a false guarantee. Demote to TopologyReject rather
 			// than binding to an unknown role.
 			tracker.RecordRoleReject(idx, false)
-			_ = tr.close()
+			_ = tr.closeContext(ctx)
 			continue
 		}
 		if info != nil && !cfg.target.accepts(info.Role) {
@@ -381,7 +382,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			// PRIMARY_CATCHUP is catching up and likely to become
 			// writable; any other mismatch is a stable topology fact.
 			tracker.RecordRoleReject(idx, info.Role == qwpRolePrimaryCatchup)
-			_ = tr.close()
+			_ = tr.closeContext(ctx)
 			continue
 		}
 

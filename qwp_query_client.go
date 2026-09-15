@@ -141,10 +141,11 @@ type QwpQueryClient struct {
 
 	// closed guards Close against double-close and later Query/Exec.
 	closed atomic.Bool
-	// closeOnce ensures the teardown side effects (I/O shutdown,
-	// transport close) run at most once even under concurrent Close
-	// callers.
+	// closeOnce starts teardown without waiting inside the gate. Later
+	// owner-side calls observe the same operation and its stored result.
 	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 
 	// execDrainAbandoned latches when a cleanup drain abandons before
 	// reaching a terminal frame while the transport stays healthy —
@@ -663,7 +664,8 @@ var errExecDesynced = errors.New(
 // and concurrency-safe: if Close tears the old (or just-built) pair
 // down at the same time we do, the duplicate teardown is a no-op.
 //
-// Close coordination: Close sets c.closed and snapshots the bound
+// Internal generation fencing (not permission to Close during iteration):
+// Close sets c.closed and snapshots the bound
 // (io, transport) pair under c.genMu, then tears that pair down after
 // releasing the lock. The outcomes, by where Close lands:
 //
@@ -697,17 +699,14 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	// Tear down the dying generation with no lock held. The pointers are
 	// atomic and only publishGeneration writes them, so this cannot race
 	// a publish; shutdown()/close() are idempotent, so a concurrent Close
-	// tearing the same pair down is harmless. Use the cleanup-bounded ctx
-	// independent of the user's so the dispatcher's exit waits a fixed
-	// budget regardless of what the caller's deadline says.
-	cleanupCtx, cancel := context.WithTimeout(
-		context.Background(), c.cleanupDrainTimeout())
-	defer cancel()
+	// tearing the same pair down is harmless. This caller's context bounds
+	// waiting; cancelled I/O and the transport close worker retain resources
+	// until their actual exit.
 	if oldIO := c.io(); oldIO != nil {
-		_ = oldIO.shutdown(cleanupCtx)
+		_ = oldIO.shutdown(ctx)
 	}
 	if oldTr := c.transport(); oldTr != nil {
-		_ = oldTr.close()
+		_ = oldTr.closeContext(ctx)
 	}
 
 	// Demote the just-failed endpoint, then open a fresh round. Order
@@ -745,8 +744,8 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	c.genMu.Lock()
 	if c.closed.Load() {
 		c.genMu.Unlock()
-		_ = result.io.shutdown(cleanupCtx)
-		_ = result.transport.close()
+		_ = result.io.shutdown(ctx)
+		_ = result.transport.closeContext(ctx)
 		return nil, errClosedDuringFailover
 	}
 	c.publishGeneration(result)
@@ -785,8 +784,8 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 		// submit that already observed a latched ioErr (a prior poison) is
 		// a harmless no-op.
 		result.io.setIoErr(fmt.Errorf("qwp query: replay submit failed: %w", err))
-		_ = result.io.shutdown(cleanupCtx)
-		_ = result.transport.close()
+		_ = result.io.shutdown(ctx)
+		_ = result.transport.closeContext(ctx)
 		return nil, fmt.Errorf("qwp query: replay submit failed: %w", err)
 	}
 	// Re-issue the cancel if Cancel landed during the reconnect.
@@ -867,7 +866,6 @@ func (c *qwpQueryClientConfig) effectiveAuthorization() string {
 // remain in the result even after resources are released. Cleanup is not
 // guaranteed to finish.
 func (c *QwpQueryClient) Close(ctx context.Context) error {
-	var firstErr error
 	c.closeOnce.Do(func() {
 		// Set closed and snapshot the bound (io, transport) pair under
 		// genMu. This is what makes Close safe against a concurrent
@@ -889,26 +887,59 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 		io := c.io()
 		tr := c.transport()
 		c.genMu.Unlock()
-
-		if io != nil {
-			if err := io.shutdown(ctx); err != nil {
-				firstErr = err
+		c.closeDone = make(chan struct{})
+		go func() {
+			defer close(c.closeDone)
+			defer func() {
+				if r := recover(); r != nil {
+					c.closeErr = fmt.Errorf("%w: query close panicked: %v", ErrCleanupFailed, r)
+					qwpFailedQueries.Lock()
+					qwpFailedQueries.items = append(qwpFailedQueries.items, c)
+					qwpFailedQueries.Unlock()
+				}
+			}()
+			// Initiate release even between reads, before joining internal users.
+			stopCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if tr != nil {
+				_ = tr.closeContext(stopCtx)
 			}
-		}
-		if tr != nil {
-			// net.ErrClosed means the socket was already closed by another
-			// path — the transport fault that triggered failover, or a
-			// concurrent reconnect tearing down the same (now-superseded)
-			// generation we snapshotted. The close postcondition holds, so
-			// it is success, not a Close failure. (coder/websocket itself
-			// returns net.ErrClosed, wrapped, only when a close was already
-			// in flight, and swallows it on the path that wins the close.)
-			if err := tr.close(); err != nil && !errors.Is(err, net.ErrClosed) && firstErr == nil {
-				firstErr = err
+			if io != nil {
+				if err := io.shutdown(context.Background()); err != nil {
+					c.closeErr = err
+				}
 			}
-		}
+			if tr != nil {
+				// net.ErrClosed means the socket was already closed by another
+				// path — the transport fault that triggered failover, or a
+				// concurrent reconnect tearing down the same (now-superseded)
+				// generation we snapshotted. The close postcondition holds, so
+				// it is success, not a Close failure. (coder/websocket itself
+				// returns net.ErrClosed, wrapped, only when a close was already
+				// in flight, and swallows it on the path that wins the close.)
+				if err := tr.close(); err != nil && !errors.Is(err, net.ErrClosed) {
+					c.closeErr = errors.Join(c.closeErr, err)
+				}
+			}
+		}()
 	})
-	return firstErr
+	select {
+	case <-c.closeDone:
+		return c.closeErr
+	default:
+	}
+	select {
+	case <-c.closeDone:
+		return c.closeErr
+	case <-ctx.Done():
+		return errors.Join(ErrCleanupPending, ctx.Err())
+	}
+}
+
+// Terminally uncertain connections stay rooted; another Close never repairs them.
+var qwpFailedQueries struct {
+	sync.Mutex
+	items []*QwpQueryClient
 }
 
 // Query submits a SELECT-style statement and returns a cursor over its
