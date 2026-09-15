@@ -74,6 +74,14 @@ const qwpSfDrainerDefaultConnectTimeoutMs = 15_000
 // not quarantine the slot or crash the host), mirroring the other listener
 // contracts. Any callback may be nil. Applied to every drainer via
 // WithBackgroundDrainerListener.
+//
+// Use a channel or context cancellation to signal the application code that
+// uses the sender. Do not change or close a sender, or call QuestDB.Close
+// directly from a callback. Documented methods returning read-only snapshots
+// of state are allowed. Return promptly. Shutdown may drop queued
+// notifications, and a callback already running may finish after Close returns.
+// QuestDB.Close cannot succeed while an internal drainer can still access a
+// slot. See [QuestDB.Close] and README's "QWP shutdown and ownership".
 type QwpBackgroundDrainerListener struct {
 	// OnDurableAckUnavailable fires once per exhausted connect sweep in which
 	// a durable-ack drainer met an endpoint that does not advertise

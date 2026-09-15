@@ -72,10 +72,12 @@ const qwpQueryCancelAckTimeout = qwpQueryCleanupDrainTimeout
 // via Query/Exec. The I/O goroutines read and decode ahead of the
 // consumer up to the configured buffer-pool depth.
 //
-// Thread safety: not safe for concurrent Query or Exec calls on the
-// same client. Open one client per query-issuing goroutine. Cancel
-// (on the returned *QwpQuery) and Close are safe to call from other
-// goroutines.
+// Thread safety: coordinate use of each client in your application. Do not
+// call Query, Exec, or Close while another call or result iteration is still
+// running. Another goroutine may call Cancel on the returned *QwpQuery or
+// cancel the operation's context. Before Close, stop reading results and
+// using slices that refer to result-batch memory. See [QwpQueryClient.Close]
+// for what it waits for and what its result means.
 type QwpQueryClient struct {
 	cfg *qwpQueryClientConfig
 
@@ -98,10 +100,8 @@ type QwpQueryClient struct {
 	// torn read straddling publishGeneration. The lock covers only that
 	// wait-free swap/snapshot — never a user-facing wait. In particular
 	// reconnect's old-generation teardown and failover walk, and Close's
-	// I/O shutdown, all run with the mutex released, so a Close concurrent
-	// with a mid-flight reconnect walk is not blocked on it and can honour
-	// its ctx deadline. Duplicate teardown of the same pair from both
-	// paths is harmless: shutdown() and close() are idempotent.
+	// I/O shutdown all run with the mutex released. The mutex prevents Close
+	// from reading a half-updated connection and I/O-loop pair.
 	genMu sync.Mutex
 
 	// hostTracker is the failover.md §2 host-health / zone tracker
@@ -545,6 +545,8 @@ func WithQwpQueryReplayExec(enabled bool) QwpQueryClientOption {
 // WithQwpQueryCloseTimeout bounds the close-path cleanup drain (cursor
 // Close, iterator break-out) before the connection is declared desynced.
 // Equivalent to the query_close_timeout_ms connect-string key; default 5s.
+// It does not limit how long releasing resources may take. See [Query.Close]
+// for returning a borrowed client and [QwpQueryClient.Close] for waiting on cleanup.
 // A non-positive argument leaves the default.
 func WithQwpQueryCloseTimeout(d time.Duration) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.closeDrainTimeout = d }
@@ -655,9 +657,9 @@ var errExecDesynced = errors.New(
 // Locking: c.genMu is held only across the publish — the wait-free
 // closed-recheck + publishGeneration swap. The old-generation teardown
 // and the failover walk (dial + WS upgrade + SERVER_INFO per endpoint,
-// up to ~2×N endpoints) run with no lock held, so a concurrent Close
-// acquires c.genMu without waiting on the walk and honours its own ctx
-// deadline. This is safe because shutdown() and close() are idempotent
+// up to ~2×N endpoints) run without holding c.genMu, so network waits do not
+// keep that mutex locked.
+// It is safe to repeat cleanup because shutdown() and close() are idempotent
 // and concurrency-safe: if Close tears the old (or just-built) pair
 // down at the same time we do, the duplicate teardown is a no-op.
 //
@@ -838,18 +840,32 @@ func (c *qwpQueryClientConfig) effectiveAuthorization() string {
 	return ""
 }
 
-// Close shuts down the I/O goroutines, sends a WebSocket close frame,
-// and releases the underlying connection. Safe to call more than
-// once; subsequent calls return nil. Safe to call from a goroutine
-// other than the one driving Query/Exec, including while a Batches()
-// iteration or Exec() is mid transparent-failover reconnect.
+// Close shuts down a standalone query client. First stop Query/Exec, result
+// iteration, and use of slices that refer to result-batch memory. To unblock
+// an operation from another goroutine, call Cancel or cancel its context,
+// then wait for the code reading the results to stop before calling Close.
+// Do not run Close concurrently with application use, including automatic
+// reconnects made by an active query.
 //
-// Calling Close while a *QwpQuery.Batches() loop body is still using
-// the batch's aliased []byte slices is undefined: the transport may
-// free buffers the caller is still reading. The right way to unblock
-// an in-flight iterator from another goroutine is Cancel (or cancel
-// the Query/Exec context); Close then races at most the generation
-// teardown, never the buffer aliasing.
+// The first call starts stopping I/O and closing the connection, even if ctx
+// is already cancelled or expired. ctx limits this call's wait, not the time
+// allowed for cleanup. Later calls wait for the same shutdown and report its
+// current result. Shutdown does not send a WebSocket closing handshake.
+//
+// A nil result means all resources are released and no error remains to
+// report. If ctx expires while resources are still held, the result wraps
+// [ErrCleanupPending], ctx.Err(), and any recorded errors. That timeout is not
+// permanent: a later call with a fresh context checks progress again. Once
+// shutdown finishes, Close returns its saved result without waiting.
+//
+// A panic during internal cleanup produces [ErrCleanupFailed]. Close reports
+// it immediately, even if other cleanup is still pending. Calling Close again
+// or removing the original fault does not repair this client. Resources that
+// cannot safely be released stay held. For recoverable failures, the client
+// remains responsible for retrying cleanup; a successful retry clears the
+// error it recovered from. Cleanup errors that could not be recovered from
+// remain in the result even after resources are released. Cleanup is not
+// guaranteed to finish.
 func (c *QwpQueryClient) Close(ctx context.Context) error {
 	var firstErr error
 	c.closeOnce.Do(func() {
@@ -864,8 +880,8 @@ func (c *QwpQueryClient) Close(ctx context.Context) error {
 		// pair we DID snapshot is harmless (shutdown/close are
 		// idempotent). Crucially, reconnect holds genMu only across that
 		// publish — not across its failover walk — so this Lock does not
-		// block on a mid-flight reconnect and Close honours its ctx
-		// deadline. See reconnectAndReplay's doc for the full interleaving
+		// wait for reconnect's network requests to finish. See
+		// reconnectAndReplay's doc for the possible orderings in its
 		// table. The shutdown/close run after Unlock so genMu is never
 		// held across a user-facing wait.
 		c.genMu.Lock()
@@ -1184,14 +1200,11 @@ const (
 // Batches() terminates (by End, Error, or break), the cursor is done
 // and must not be iterated again.
 //
-// Thread safety: Batches and the buffers it yields are single-consumer
-// — do not share the cursor across goroutines. Cancel is safe to call
-// from other goroutines at any time. Close is safe to call from other
-// goroutines too, but is a no-op while a Batches iteration is in
-// flight: the iterator runs its own cancel+drain on every exit path,
-// so a concurrent Close would only race it for the dispatcher's
-// single terminal event. To unblock a hung iterator from another
-// goroutine, use Cancel (or cancel the context passed to Query).
+// Thread safety: one goroutine at a time may read Batches and its buffers or
+// call Close. Stop iteration and use of slices backed by batch memory before
+// Close. Another goroutine may call Cancel or cancel the context passed to
+// Query to unblock iteration. Wait for the code reading results to finish
+// before closing the cursor or client, or returning a borrowed client.
 type QwpQuery struct {
 	client *QwpQueryClient
 	ctx    context.Context
@@ -1411,14 +1424,14 @@ func (q *QwpQuery) Cancel() {
 // to defer even on already-finished queries; the second call is a
 // no-op.
 //
-// Close is also a no-op while a Batches() iteration is in flight on
-// another goroutine: the iterator performs its own cancel+drain on
-// every exit path, and a concurrent Close would only race it for the
-// dispatcher's single terminal event. Use Cancel (or cancel q.ctx)
-// to unblock an in-flight iterator from another goroutine.
+// Before Close, stop iteration and use of slices backed by result-batch
+// memory. To unblock iteration from another goroutine, call Cancel or cancel
+// the Query context, then wait for the code reading results to finish. Do not
+// use concurrent Close to cancel iteration. The wait for the remaining query
+// response is limited by query_close_timeout_ms.
 //
-// Does not close the client itself. Call (*QwpQueryClient).Close
-// to release the underlying WebSocket connection.
+// This does not close the client itself. See [QwpQueryClient.Close] for
+// releasing the client's resources, or [Query.Close] to return a borrowed client.
 func (q *QwpQuery) Close() {
 	// CAS Idle→Done claims exclusive cleanup ownership. Failure means
 	// either a Batches() iteration is running (state=Iterating — it

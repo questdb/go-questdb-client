@@ -73,16 +73,17 @@ func main() {
 		panic(err)
 	}
 	defer func() {
-		for {
-			err := db.Close(ctx)
-			if errors.Is(err, qdb.ErrSfCleanupPending) {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			if err != nil {
-				log.Printf("questdb close: %v", err)
-			}
-			return
+		// Stop using all borrowed handles and return them before closing db.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := db.Close(closeCtx)
+		switch {
+		case errors.Is(err, qdb.ErrCleanupFailed): // check before pending
+			log.Printf("questdb cleanup failed; resources may require process restart: %v", err)
+		case errors.Is(err, qdb.ErrCleanupPending):
+			log.Printf("questdb cleanup unfinished; check storage and unreturned handles before waiting again: %v", err)
+		case err != nil:
+			log.Printf("questdb failed to queue rows, deliver them, or release resources: %v", err)
 		}
 	}()
 
@@ -91,6 +92,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// Return the sender even if building a row fails.
+	defer func() {
+		if err := sender.Close(ctx); err != nil {
+			log.Printf("sender return: %v", err)
+		}
+	}()
 	if err := sender.
 		Table("trades").
 		Symbol("symbol", "ETH-USD").
@@ -148,12 +155,13 @@ SQL — plus a background housekeeper that closes idle and over-age connections.
 | `qdb.NewQuestDB(ctx, conf, opts...)` | `*QuestDB` | Same, with pool-tuning options. |
 | `db.BorrowSender(ctx)` | `LineSender` | Lease a sender; `Close` flushes and returns it to the pool. |
 | `db.BorrowQuery(ctx)` | `*Query` | Lease a query session; `Close` returns it. |
-| `db.Close(ctx)` | `error` | Shut down both pools and disconnect every underlying client. Idempotent. In SF mode, an outstanding lease, construction, or cleanup returns an error wrapping `qdb.ErrSfCleanupPending`: return leases and retry. Once it returns nil, every pool-managed slot is unlocked and later calls remain nil (see [Store-and-forward](#store-and-forward)). |
+| `db.Close(ctx)` | `error` | Shut down both pools. See [QWP shutdown and ownership](#qwp-shutdown-and-ownership) for what it waits for, what errors mean, and when to call it again. |
 
 The schema must be `ws` or `wss` — the pooled facade is QWP-only. A borrowed
 sender or query session is single-threaded; the handle itself is safe to share.
-`Close` on a borrowed lease flushes/returns it to the pool — the real
-disconnect happens only at `db.Close`.
+Calling `Close` on a borrowed sender or query session returns it to the pool.
+A healthy connection stays open for reuse. The pool disconnects it when removing
+it or shutting down.
 
 Pool sizing and behavior are tunable through options (an explicit option wins
 over the matching connect-string key) or the equivalent connect-string keys:
@@ -199,6 +207,129 @@ db, err := qdb.Connect(ctx, "ws::addr=localhost:9000;lazy_connect=true;")
 `lazy_connect` (or the `WithLazyConnect` option) is facade-only; standalone
 clients accept but ignore the key. `connect_timeout` (milliseconds) bounds the
 TCP connect on each dial and is common to both directions.
+
+## QWP shutdown and ownership
+
+**Stop use, then close.** Different goroutines may borrow or return separate
+handles and call `QuestDB.Close`. Your application must still coordinate use of
+each individual sender, query client, cursor, or borrowed handle. Before closing
+one, stop using it. For an active query, request cancellation, wait for the code
+reading results to stop, and stop using slices backed by result-batch memory.
+
+Callbacks should signal the application code using the handle, for example
+through a channel or context cancellation. They must not change or close the
+handle, or call its `QuestDB.Close` directly. Documented methods returning
+read-only snapshots of state are allowed. Starting Close in another goroutine
+does not remove the requirement to stop other use first.
+
+**What the context controls.** `QuestDB.Close` and standalone client/sender
+Close start shutdown even if the context is already cancelled or expired. The
+context limits how long the caller waits, not how long releasing resources may
+take. Connections being discarded are closed without a WebSocket closing
+handshake, including during reconnect and failed setup. That cleanup can still
+block internally. A WebSocket CLOSE reply does not acknowledge receipt of QWP
+rows.
+
+**Sending buffered rows during shutdown.** A sender first discards any row not
+finished with `At`, `AtNow`, or `AtNano`. It then tries to queue completed rows
+for sending, in memory or in store-and-forward files, using the configured append
+timeout for each frame. After those attempts, it starts the separate timeout for
+waiting on server acknowledgements. Zero or negative values for that timeout skip
+only the acknowledgement wait, not the attempts to queue rows.
+
+Cancelling the caller's context does not stop these steps, and later Close calls
+do not restart them or extend their time limits. If only part of a batch reaches
+store-and-forward files, only that part is saved for recovery. Failed queueing
+does not save rows to disk or guarantee delivery of rows held only in memory.
+See [`LineSender.Close`](sender.go) for the steps and errors.
+
+| Method | What its result means |
+|---|---|
+| [`QuestDB.Close(ctx)`](questdb.go) | A nil result means both pools and their background work have released all resources, no work can later acquire or retain more, and no error remains to report. Repeated or concurrent calls wait for the same shutdown. |
+| [`QwpQueryClient.Close(ctx)`](qwp_query_client.go) | Stop using the client first. A nil result means all its resources are released and no error remains to report. Later calls check or wait for the same shutdown. |
+| Standalone QWP `LineSender.Close(ctx)` | Call once; later calls return a double-close error, not cleanup progress. A nil result may leave resource cleanup running in the background, but not attempts to queue rows or wait for acknowledgements. Later failures are logged. |
+| Borrowed sender `Close(ctx)` | Returns the sender to its pool. **Context exception:** queueing rows uses the append timeout, not `ctx`, and does not wait for acknowledgements. The pool cannot reuse the sender until rows have been queued successfully. Calls after return do nothing and return nil. |
+| Borrowed query session `Close()` | Finishes reading an open query response, with a time limit set by `query_close_timeout_ms`, then returns the client to the pool. Calls after return do nothing and return nil. |
+
+`QuestDB.Close` accounts for clients still being created, removed, or returned,
+as well as pool maintenance and background sending from recovered orphan slots.
+This includes orphan slots outside the pool's numbered sender slots. It cannot
+return nil while internal readers or background drainers can still use resources.
+
+If returning a borrowed handle requires disconnecting its client, the pool takes
+responsibility for closing it in the background; returning the handle does not
+wait for that cleanup. Errors from returning the handle or queueing rows are
+reported by its Close call. Later cleanup errors are logged and included in
+`QuestDB.Close` results, not in repeated Close calls on the returned handle.
+See [`Query.Close`](qwp_query_pool.go) and [`LineSender.Close`](sender.go).
+
+**If cleanup fails or is unfinished.** Check
+`errors.Is(err, qdb.ErrCleanupFailed)` first. A panic during internal cleanup
+leaves the affected object unable to finish safely; calling Close again will not
+repair it. Resources that cannot safely be released stay held, and affected
+store-and-forward slots stay reserved, possibly until process restart. Corrupt
+pool state also produces `ErrPoolPoisoned`.
+
+Otherwise, `ErrCleanupPending` means the client still has resources to release
+and remains responsible for cleanup. Unfinished store-and-forward cleanup also
+matches `ErrSfCleanupPending`. If the context expires while waiting in
+`QuestDB.Close` or standalone query-client Close, the result also wraps
+`ctx.Err()`. That caller timeout is not a permanent failure: a later call with a
+fresh context checks progress again. A known internal cleanup failure is reported
+without waiting for other cleanup. Once shutdown finishes, Close returns its
+saved result. See the [cleanup error Go docs](qwp_errors.go).
+
+For recoverable storage failures, the client retries cleanup with delays between
+attempts. Success clears the error it recovered from. It does not clear errors
+from queueing or delivering rows, or cleanup errors that could not be recovered
+from. Releasing all resources therefore need not make Close return nil. Blocked
+readers, unavailable storage, or handles that have not been returned can prevent
+cleanup from finishing until the process exits.
+
+User callbacks are different from internal cleanup work: shutdown may drop queued
+notifications, and a callback already running may finish after Close returns.
+Close does not guarantee delivery of every notification or exit of every
+callback goroutine.
+
+**Resources stay tracked until safe to release.** The client must not unmap
+memory while a reader can still access it, or reuse a store-and-forward slot
+while old client code can still use it. The client remains responsible for
+resources after timeouts and internal failures, even if construction failed
+without returning a handle. A cleanup panic is not evidence of corrupt files
+and does not justify quarantining a slot or marking it `.failed`. See
+[Quarantined slots](#quarantined-slots) for failures that can stop a background
+drainer from sending a slot's data.
+
+Cleanup must preserve saved rows and follow the acknowledgement, recovery, and
+safe file-deletion rules. It does not promise an empty directory. These guarantees
+do not cover faults that terminate the process or arbitrary memory corruption.
+Panics caused by supported inputs and ordinary data races are still bugs.
+
+For **standalone store-and-forward senders only**, check `SlotLockReleased`
+before reopening the same slot. A borrowed sender that has been returned reports
+true even if its pool still holds the lock; use `QuestDB.Close` for pooled
+senders instead. False may mean cleanup is still running or has failed
+permanently. Always limit how long you wait; success is not guaranteed:
+
+```go
+// qs is a standalone disk-backed QwpSender, not a borrowed sender.
+waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := qs.Close(waitCtx); err != nil {
+	log.Printf("sender close: %v", err) // keep errors from queueing or sending rows
+}
+tick := time.NewTicker(10 * time.Millisecond)
+defer tick.Stop()
+for !qs.SlotLockReleased() {
+	select {
+	case <-waitCtx.Done():
+		log.Printf("slot lock still held; check logs and storage before trying to reuse it")
+		return // a process restart may be needed; do not reopen this slot
+	case <-tick.C:
+	}
+}
+// This sender released its slot. Opening it again can still fail for other reasons.
+```
 
 ## Other ways to connect
 
@@ -490,7 +621,7 @@ runs in SF mode it assigns each pooled sender its own slot automatically.
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
 | `initial_connect_retry` | `off` | `off` = terminal on first failure; `on`/`sync` = retry, blocking the constructor; `async` = retry on the I/O goroutine, constructor returns immediately. |
-| `close_flush_timeout_millis` | 5000 | `Close` waits this long for ACKs; `0` / `-1` skips the drain. |
+| `close_flush_timeout_millis` | 5000 | How long sender shutdown waits for server acknowledgements. Zero or negative skips only that wait; Close still tries to queue completed rows for sending. See [shutdown and ownership](#qwp-shutdown-and-ownership). |
 | `drain_orphans` | `off` | When `on`, scan `<sf_dir>/*` and adopt sibling slots holding unacked data. |
 | `max_background_drainers` | 4 | Cap on concurrent orphan drainers. |
 | `max_frame_rejections` | 4 | Consecutive same-frame rejections (over the episode budget) before the poison-frame detector latches a `TERMINAL`. |
@@ -510,12 +641,6 @@ context after construction does not stop them; closing the sender does.
 Without `sf_dir`, unacknowledged data lives in process memory and is lost if the
 process dies; the reconnect loop still spans transient outages.
 
-SF terminal cleanup retries transient local-storage failures indefinitely while
-the process remains alive. A persistent disk fault therefore keeps that slot's
-flock—and, for a pooled sender, its capacity reservation—until storage recovers
-or the process exits; releasing either earlier could let a new owner race files
-whose durable cleanup did not finish.
-
 On Unix, SF namespace changes are separated into directory-sync epochs: a
 dependent manifest update/removal is not allowed to become durable before the
 segment names it depends on. This protects recovery across an OS crash within
@@ -523,34 +648,8 @@ the platform `fsync` guarantee. Windows exposes no documented, unprivileged
 equivalent of directory `fsync`; on Windows SF protects process-restart recovery
 but does not promise host-crash ordering for file creation, rename, and removal.
 Residual `.ack-watermark` and `.symbol-dict` files after a fully drained close
-are harmless restart debris and are not part of the durably-empty contract.
-
-For a pooled sender, every reserved SF index is a shutdown obligation from the
-start of construction until its flock is released. An outstanding lease,
-in-flight construction, active teardown, or deferred cleanup therefore makes
-`db.Close(ctx)` return an error wrapping `qdb.ErrSfCleanupPending`. Return every
-lease and call `db.Close(ctx)` again later: it takes a fresh lifecycle snapshot
-on every call and stops reporting the sentinel only when every record is free.
-At that point no closed-pool operation can create another obligation, so a nil
-result proves every pool-managed slot is unlocked and later calls remain nil.
-
-A standalone SF sender has no pool lifecycle ledger. Its `Close` may still
-return nil while engine cleanup releases the slot lock in the background, so a
-nil result does not on its own mean the slot is free. Ask
-`QwpSender.SlotLockReleased()` instead, and gate a reopen of the same `sf_dir` +
-`sender_id` on it:
-
-```go
-_ = sender.Close(ctx)
-if qs, ok := sender.(qdb.QwpSender); ok {
-	for !qs.SlotLockReleased() {
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-```
-
-Those background retries have no deadline, so bound that loop if your shutdown
-path cannot wait on a disk that may never come back.
+do not prevent a later restart. See [QWP shutdown and ownership](#qwp-shutdown-and-ownership)
+for cleanup behavior, why a slot may stay locked, and how to check for release.
 
 #### Local errors from the SF path
 
@@ -641,7 +740,9 @@ for batch, err := range cursor.Batches() {
 A borrowed query session runs **one query at a time** and is **not** safe for
 concurrent `Query` / `Exec`. To run queries in parallel, borrow one session per
 goroutine (the query pool's `max` caps concurrency). `Cancel` (on the cursor)
-and `Close` are safe to call from another goroutine.
+is safe from another goroutine. Before closing a cursor or client, or returning
+a borrowed session, stop query execution, result iteration, and use of slices
+backed by result-batch memory. See [shutdown and ownership](#qwp-shutdown-and-ownership).
 
 ### Reading result batches
 

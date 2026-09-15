@@ -154,21 +154,24 @@ type qwpSfSlotObligation struct {
 	state qwpSfSlotState
 }
 
-// ErrSfCleanupPending is the sentinel a store-and-forward pool close wraps when
-// one or more slot lifecycle records are not free. The obligation may be an
-// outstanding lease, an in-flight construction that could still acquire a
-// flock, an active teardown, or cleanup owned by a per-engine retry goroutine.
-// Return leases and call Close again: each call re-probes and takes a fresh
-// snapshot. Once Close returns nil, all pool-managed flocks are released and
-// later calls remain nil. Stable teardown errors are reported alongside this
-// sentinel and remain reportable. Match it with errors.Is.
+// ErrSfCleanupPending means some work can still use or acquire a
+// store-and-forward slot. This includes borrowed senders, senders still being
+// created, and unfinished cleanup. Match it with errors.Is. Return borrowed
+// senders and check storage before waiting again with a fresh deadline.
+// The error does not promise that the slot will eventually be released.
 //
-// A failed Connect / NewQuestDB / NewLineSender can also wrap it, from the
-// teardown of what the build had already created. There is no handle to call
-// Close on in that case: the retry owner still releases the lock on its own,
-// but an immediate rebuild on the same sf_dir and sender_id may fail naming
-// this process as the holder, so retry the build rather than treating the
-// sentinel as fatal.
+// Unfinished store-and-forward cleanup also produces [ErrCleanupPending].
+// Check [ErrCleanupFailed] first: it means an internal failure has left
+// resources held that cannot safely be released. One result can include this
+// failure and other cleanup still in progress. See [QuestDB.Close] for what
+// it waits for and which errors remain in later results.
+//
+// Connect, NewQuestDB, or NewLineSender can return an error wrapping this
+// value without returning a handle. The client still tracks resources it has
+// not released, but there is no handle for you to Close. Creating another
+// client for the same slot may fail because this process still holds its
+// lock. Limit retries and inspect logs and storage; an internal cleanup
+// failure may require a process restart before the slot can be reused.
 var ErrSfCleanupPending = errors.New("qwp pool: SF slot cleanup still pending; lifecycle obligations remain")
 
 // qwpPoolCloseResult combines the stable teardown/poison errors with one live
@@ -1416,15 +1419,18 @@ func (p *qwpSenderPool) poolSnapshot() (total, available, leaked int) {
 // pools) once QuestDB.Close has run. Match it with errors.Is.
 var ErrPoolClosed = errors.New("qwp pool: handle is closed")
 
-// ErrPoolPoisoned is the sentinel wrapped by BorrowSender, a lease's Close and
-// QuestDB.Close after a panic inside the ingest pool's slot classification (the
-// idle reap or the retired-slot reprobe). Such a panic is a client bug: the
-// classification left the pool's state unchanged, but the predicate that
-// faulted once would fault again, and a pool that kept lending after one could
-// hand a single sender to two goroutines. The pool records the first panic as
-// a terminal error and stops lending — a loud outage instead of silent
-// corruption. There is no recovery short of rebuilding the QuestDB handle.
-// Match it with errors.Is; the wrapping error carries the panic value.
+// ErrPoolPoisoned means an internal failure left the ingest pool unable to
+// lend senders safely. BorrowSender, a borrowed sender's Close, and
+// QuestDB.Close may wrap it; match it with errors.Is and inspect the cause.
+// Stop using the pool. Stop use of each borrowed sender before returning it.
+//
+// Corrupt pool state also produces [ErrCleanupFailed]. Calling Close again
+// reports the failure; it does not repair the pool's records. Slots that
+// cannot safely be reused stay reserved. Creating another QuestDB does not
+// free the old pool's locks; reusing the same slots may require a process
+// restart. Other cleanup that is known to be safe may finish, but the
+// internal failure remains in the result. Unlike [ErrSfCleanupPending] alone,
+// this error cannot be resolved just by waiting longer.
 var ErrPoolPoisoned = errors.New("qwp pool: poisoned by a panic during slot classification; the pool no longer lends senders")
 
 // ErrSenderPoolExhausted is returned by BorrowSender when the ingest pool is at
@@ -1879,23 +1885,13 @@ func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 	return ps.slot.delegate.BackgroundDrainers()
 }
 
-// Close returns the leased sender to the pool. It flushes committed rows first
-// (surfacing but not swallowing a latched fluent-API error) so the next
-// borrower starts clean; the slot is marked broken (discarded rather than
-// recycled) on a terminal fault OR when the return flush left committed rows
-// un-enqueued (a backpressure-deadline / engine-closed failure — a dirty slot
-// that would leak this borrower's rows into the next). A benign fluent-API
-// latch, whose committed rows still flushed cleanly, leaves a healthy slot to be
-// reused. Idempotent — a stale lease no-ops.
-//
-// The flush and return run on context.Background, not the caller's ctx: the
-// return flush only publishes into the cursor engine (it never waits for the
-// server ACK), so
-// a request-scoped ctx must not (a) leave pending rows un-published in a slot
-// the next borrower reuses, or (b) mark a healthy slot broken via a
-// context.Canceled / DeadlineExceeded. Both would thrash the pool under the
-// standard `ctx, cancel := ...; defer sender.Close(ctx)` pattern. The publish is
-// bounded by the engine's append deadline, not the caller's ctx.
+// Close returns the borrowed sender; see [LineSender.Close] for the QWP rules.
+// It discards an unfinished row and queues completed rows for sending. This
+// uses the append timeout, not the caller's context, so a cancelled request
+// cannot leave buffered rows for the next borrower. An earlier row-building
+// error need not remove the sender from the pool if completed rows were queued
+// successfully. Rows that could not be queued, or a terminal sender error,
+// require removal instead of reuse. Calls after return do nothing.
 func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 	if !ps.live() {
 		return nil

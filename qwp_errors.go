@@ -25,10 +25,46 @@
 package questdb
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// ErrCleanupPending means the client still has resources to release and is
+// responsible for finishing cleanup. Match it with errors.Is, but check
+// [ErrCleanupFailed] first: the same result can include both an internal
+// failure and other cleanup still in progress. Return borrowed handles and
+// check for storage faults before calling [QuestDB.Close] or
+// [QwpQueryClient.Close] with a fresh deadline. Another call waits for the same
+// shutdown; it does not restart it or guarantee that cleanup will finish.
+//
+// If either Close method stops waiting because its context was cancelled or
+// expired, its error wraps both ErrCleanupPending and ctx.Err(), along with
+// any recorded errors. Unfinished store-and-forward cleanup also produces
+// [ErrSfCleanupPending]; query-only cleanup does not. An earlier timeout or
+// pending result does not become a permanent failure. A successful cleanup
+// retry clears the error it recovered from, but not errors from queueing or
+// delivering rows, or cleanup errors that could not be recovered from, such
+// as a file-close error that cannot safely be retried.
+var ErrCleanupPending = errors.New("qwp: resource cleanup still pending")
+
+// ErrCleanupFailed means cleanup cannot safely continue after an internal QWP
+// failure. It does not mean that sending rows failed or that a caller stopped
+// waiting. Match it with errors.Is before checking [ErrCleanupPending] or
+// [ErrSfCleanupPending]. Stop using the affected object. Calling Close again
+// will not repair it. Resources that cannot safely be released stay held;
+// reusing a store-and-forward slot may require a process restart. Creating a
+// new client does not release locks still held by the old one.
+//
+// Later QuestDB or query-client Close calls continue to report the cause,
+// even if other cleanup finishes. They report a known internal failure
+// without waiting. Corrupt pool state also produces [ErrPoolPoisoned]. A
+// standalone sender's Close reports failures known before it returns and logs
+// later ones; it cannot be called again to check progress. If construction
+// fails without returning a handle, the client still keeps track of any
+// resources it has not released.
+var ErrCleanupFailed = errors.New("qwp: internal cleanup failed; resources may remain retained")
 
 // QwpUpgradeRejectError is returned by qwpTransport.connect when the
 // server completes the HTTP exchange with a non-101 status. Construction

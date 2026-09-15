@@ -29,8 +29,11 @@ import "strconv"
 // SenderProgressHandler is invoked, on a dedicated dispatcher goroutine, as the
 // QWP sender's acknowledged frame sequence number advances. Delivery is strictly
 // monotonic but may coalesce: under a delivery backlog the bounded dispatcher
-// drops older values, so the handler sees a monotonic subset of advances —
-// always including the latest, not necessarily every intermediate one.
+// drops older values, so the reported sequence never goes backwards but may
+// skip values. Newer queued values replace older ones; shutdown may drop even
+// the latest notification. Read [QwpSender.AckedFsn] to check acknowledgement
+// progress. Callback delivery is not a reliable way to wait for an
+// acknowledgement or for shutdown to finish.
 //
 // # Settled vs durable
 //
@@ -46,11 +49,18 @@ import "strconv"
 //
 // # Calling back into the sender
 //
-// The handler may call Close() or Flush() on the sender without deadlocking.
-// Because it runs on the dispatcher goroutine, not the producer goroutine,
-// those calls deliberately do NOT touch in-progress producer state: they
-// surface only a latched terminal error and will not flush rows the producer
-// has staged but not yet flushed itself. Same contract as SenderErrorHandler.
+// The handler does not run on the goroutines building rows or doing network
+// I/O. If it panics, the client catches and logs the panic; the sender and
+// callback delivery continue. Use a channel or context cancellation to signal
+// the application code that uses the sender. Do not call Close, Flush, other
+// methods that change the sender, or QuestDB.Close directly from the handler.
+// You may call documented methods that return read-only snapshots of state.
+// The application must stop using the sender before closing it; starting
+// Close in another goroutine does not remove this requirement.
+//
+// Shutdown stops accepting notifications and may drop queued values. A handler
+// already running may finish after Close returns, even after resources are
+// released. See [SenderErrorHandler] and README's "QWP shutdown and ownership".
 type SenderProgressHandler func(ackedFsn int64)
 
 // newQwpProgressDispatcher builds the off-loop dispatcher that delivers ackedFsn

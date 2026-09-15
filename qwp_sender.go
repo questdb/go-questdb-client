@@ -224,32 +224,40 @@ type QwpSender interface {
 	// reclaiming it is the operator's call.
 	QuarantinedSlotPath() string
 
-	// SlotLockReleased reports whether this sender has finished with its
-	// store-and-forward slot directory, so that another owner may take it.
+	// SlotLockReleased reports whether a standalone sender has released its
+	// store-and-forward slot's file lock and stopped all access to that slot.
+	// In memory mode it always returns true because there is no disk slot.
+	// An open standalone disk-backed sender returns false.
 	//
-	// Close does not always finish releasing the slot lock before it returns.
-	// When the segment manager is still busy, the release passes to a
-	// background goroutine that keeps retrying it with no deadline, and Close
-	// returns nil meanwhile. Poll this to find out when the slot is free:
+	// A borrowed sender reports the state of the slot it is using. After it is
+	// returned to the pool, it reports true even if the pool still holds the
+	// lock. For pooled senders, use [QuestDB.Close] to wait for release instead.
 	//
-	//	_ = sender.Close(ctx)
+	// For a standalone sender, true does not mean rows were delivered, cleanup
+	// succeeded without errors, or the directory is empty. False can mean
+	// cleanup is still running or has failed permanently; it may never become
+	// true. The client keeps responsibility for unfinished cleanup. A panic
+	// during internal cleanup can leave the slot held until process exit.
+	// Close reports failures it already knows about and logs later ones;
+	// calling Close again does not repair them. See [LineSender.Close].
+	//
+	// Only poll this method for a standalone sender, after stopping use and
+	// calling Close. Limit the wait with a deadline. For example, after checking
+	// Close's error, use a waitCtx with an application-chosen deadline:
+	//
+	//	tick := time.NewTicker(10 * time.Millisecond)
+	//	defer tick.Stop()
 	//	for !sender.SlotLockReleased() {
-	//		time.Sleep(10 * time.Millisecond)
+	//		select {
+	//		case <-waitCtx.Done():
+	//			return waitCtx.Err() // the slot is still held; do not reopen it
+	//		case <-tick.C:
+	//		}
 	//	}
 	//
-	// Those retries have no deadline, so put a bound on that loop if the
-	// process cannot wait on storage that may never come back. Reopening the
-	// same sf_dir + sender_id before this reports true fails to take the lock,
-	// with an error naming this process as the holder.
-	//
-	// Always true in memory mode, where there is no slot to hold. In
-	// store-and-forward mode it is false while the sender is open, since an
-	// open sender is using its slot, and turns true once the lock is gone.
-	//
-	// A live pooled lease reports the slot it currently borrows. A lease that
-	// has been returned reports true, because it no longer borrows anything --
-	// the slot went back to the pool and its lock is the pool's to release, so
-	// wait on QuestDB.Close for that, not on this.
+	// If the wait expires, an operator may need to fix storage or restart the
+	// process. A true result only describes this sender: it does not reserve
+	// the slot for you, and a later attempt to open it can still fail.
 	SlotLockReleased() bool
 
 	// BackgroundDrainers returns a snapshot of the drainers the
@@ -460,11 +468,10 @@ type qwpLineSender struct {
 	// engine in closeCursor.
 	drainerPool *qwpSfDrainerPool
 
-	// Lifecycle. atomic so a contract-violating concurrent
-	// double-Close has a defined (idempotent) outcome rather than a
-	// data race that could double-close the engine's channels. The
-	// single-producer At/Flush reads are racy only under the same
-	// contract violation; the atomic load keeps them well-defined too.
+	// Records whether Close has started, so later calls cannot close engine
+	// channels twice. A second standalone Close returns an error; see
+	// LineSender.Close. Making this flag atomic does not make concurrent
+	// row building or flushing safe.
 	closed atomic.Bool
 }
 
@@ -1400,9 +1407,8 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	if s.calledFromDispatcherGoroutine() {
 		// Flush() invoked from inside a user callback (error handler,
 		// connection listener, or progress handler) runs on that
-		// dispatcher goroutine. The callback's documented use of Flush()
-		// is to surface the latched terminal error promptly (it is
-		// latched before the error handler runs). We must not read or flush
+		// dispatcher goroutine. This branch returns any stored terminal error.
+		// It must not read or flush
 		// producer-owned state (hasTable / pendingRowCount / tableBuffers
 		// / the encoder) from this goroutine — that races the producer,
 		// the producer-state hazard. Surface any latched error and

@@ -510,7 +510,8 @@ var (
 // Query is a query session leased from the QuestDB facade via BorrowQuery. It
 // delegates to the leased QwpQueryClient's cursor/iterator API; Close returns
 // the client to the pool (draining any in-flight cursor first). The real
-// disconnect happens only at QuestDB.Close. Not safe for concurrent use; borrow
+// disconnect happens when the pool removes the client or shuts down. Do not
+// use a handle concurrently, including Close while running or reading a query; borrow
 // one handle per concurrent query.
 type Query struct {
 	pool   *qwpQueryPool
@@ -634,17 +635,22 @@ func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (E
 	return res, err
 }
 
-// Close returns the leased client to the pool, draining any cursor left open by
-// Query first. Idempotent; the underlying client normally stays connected for
-// reuse and Close returns nil — the real disconnect happens at QuestDB.Close.
+// Close returns the borrowed query client to the pool. First stop Query/Exec,
+// result iteration, and use of slices backed by result-batch memory. Another
+// goroutine may request cancellation, but must not call Close concurrently.
+// Calls after the client has been returned do nothing and return nil; they
+// do not report errors from later cleanup. Returning a client does not mean
+// its connection has closed.
 //
-// Close deliberately takes no context, unlike the sender lease's Close(ctx):
-// the pool return itself never blocks, and the only wait — draining an open
-// cursor — runs on an internal budget bounded by query_close_timeout_ms, which
-// a caller deadline must not cut short (an interrupted drain would desync the
-// worker's wire and force an eviction). A non-nil error is possible only when
-// the worker is not recycled — it is broken and evicted, or the pool has
-// already shut down — and its client's own Close fails.
+// Close finishes reading any open query response, with a time limit set by
+// query_close_timeout_ms. It then either makes a healthy client available
+// for reuse or asks the pool to close it in the background. Close takes no
+// context: the response wait uses that configured limit, and Close does not
+// wait for background resource cleanup. It reports errors detected while
+// returning the client, including failure to safely hand it back to the pool.
+// Later cleanup errors are logged and included in [QuestDB.Close]'s result,
+// not in repeated calls to this Close. Return all borrowed handles, then use
+// QuestDB.Close to wait for all pool resources to be released.
 func (q *Query) Close() error {
 	if !q.live() {
 		return nil

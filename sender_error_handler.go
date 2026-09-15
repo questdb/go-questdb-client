@@ -43,25 +43,18 @@ package questdb
 //
 // # Calling back into the sender
 //
-// The handler may call Close() or Flush() on the sender — e.g. to shut
-// down on a HALT-category error. The terminal *SenderError is latched
-// before the handler is invoked, so a synchronous Flush() returns it
-// promptly rather than blocking. Close() called from the handler is
-// honored and returns without deadlocking; the dispatcher goroutine
-// (this goroutine) finishes unwinding on its own once the handler
-// returns, so any error notifications still queued at that moment are
-// subject to the dispatcher's short best-effort drain and may be
-// dropped (visible via QwpSender.DroppedErrorNotifications()).
+// Use a channel or context cancellation to signal the application code that
+// uses the sender. Do not call Close, Flush, other methods that change the
+// sender, or QuestDB.Close directly from the handler. You may call documented
+// methods that return read-only snapshots of state. The application must stop
+// using the sender before closing it; starting Close in another goroutine
+// does not remove this requirement.
 //
-// Because the handler runs on the dispatcher goroutine — not the
-// producer goroutine — these calls deliberately do NOT touch producer-
-// buffered state: a handler-invoked Close() or Flush() will not flush
-// rows the producer has staged but not yet flushed itself (those are
-// owned by the producer goroutine and may be mid-assembly). Close()
-// still tears down the wire, drains already-published frames up to
-// close_flush_timeout, and releases resources; Flush() still surfaces
-// the latched error. To guarantee a specific batch is flushed, flush it
-// from the producer goroutine before relying on the handler to close.
+// Shutdown stops accepting notifications and may drop queued ones. A handler
+// already running may finish after Close returns, even after resources are
+// released. Close guarantees neither delivery of every notification nor exit
+// of every callback goroutine. See README's "QWP shutdown and ownership" and
+// [LineSender.Close].
 //
 // # What this callback is for
 //

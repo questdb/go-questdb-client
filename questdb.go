@@ -57,7 +57,10 @@ var ErrQueryDesynced = errExecDesynced
 // ingest and query. It owns elastic connection pools for both directions; one
 // ws/wss config string (one addr server list) drives the whole cluster.
 // Construct once with Connect or NewQuestDB and share across goroutines:
-// BorrowSender and BorrowQuery may be called concurrently.
+// BorrowSender, BorrowQuery, Close, and returns of separate borrowed handles
+// may run concurrently. Coordinate use of each handle in your application and
+// stop using it before returning it to the pool. See [QuestDB.Close] for what
+// shutdown waits for and what its result means.
 //
 // To tolerate the server being down at startup, set lazy_connect=true in the
 // config: ingest connects asynchronously (writes buffer until the wire is up)
@@ -170,13 +173,23 @@ func WithLazyConnect(v bool) QuestDBOption {
 }
 
 // WithQuestDBErrorHandler applies an ingest SenderErrorHandler to every pooled
-// sender. See WithErrorHandler.
+// sender. Only one call to this handler runs at a time, even across senders.
+// Signal the application code that uses the sender; do not change or close a
+// sender, or call QuestDB.Close directly from the handler. You may call
+// documented methods that return read-only snapshots of the sender's state.
+// See [WithErrorHandler] and [SenderErrorHandler] for how panics are handled
+// and which notifications may be lost during shutdown.
 func WithQuestDBErrorHandler(h SenderErrorHandler) QuestDBOption {
 	return func(c *questDBConfig) { c.errorHandler = h }
 }
 
 // WithQuestDBConnectionListener applies an ingest SenderConnectionListener to
-// every pooled sender. See WithConnectionListener.
+// every pooled sender. Only one call to this listener runs at a time, even
+// across senders. Signal the application code that uses the sender; do not
+// change or close a sender, or call QuestDB.Close directly from the listener.
+// You may call documented methods that return read-only snapshots of state.
+// See [WithConnectionListener] and [SenderConnectionListener] for how panics
+// are handled and which notifications may be lost during shutdown.
 func WithQuestDBConnectionListener(l SenderConnectionListener) QuestDBOption {
 	return func(c *questDBConfig) { c.connectionListener = l }
 }
@@ -184,8 +197,12 @@ func WithQuestDBConnectionListener(l SenderConnectionListener) QuestDBOption {
 // WithQuestDBBackgroundDrainerListener applies a QwpBackgroundDrainerListener
 // to every pooled sender, covering both orphan adoption (drain_orphans) and the
 // pool's crash-stranded-slot recovery senders. Callbacks may fire concurrently
-// from multiple drainers; implementations must be thread-safe (the standalone
-// WithBackgroundDrainerListener contract).
+// from multiple drainers, so protect any state shared by callbacks. Signal
+// the application code that uses the sender. Do not change or close a sender,
+// or call QuestDB.Close directly from a callback. You may call documented
+// methods that return read-only snapshots of state. See
+// [WithBackgroundDrainerListener] and [QwpBackgroundDrainerListener] for where
+// callbacks run and which notifications may be lost during shutdown.
 func WithQuestDBBackgroundDrainerListener(l QwpBackgroundDrainerListener) QuestDBOption {
 	return func(c *questDBConfig) { c.drainerListener = l }
 }
@@ -414,46 +431,65 @@ func validateLazyConnect(kv map[string]string, cfg *questDBConfig) error {
 	return nil
 }
 
-// BorrowSender leases an ingest sender from the pool. Close it (typically via
-// defer) to return it; the real disconnect happens at QuestDB.Close. Blocks up
-// to the acquire timeout when the pool is exhausted.
+// BorrowSender borrows an ingest sender from the pool. Stop using the sender
+// before calling its Close method to return it. A healthy connection stays
+// open for reuse; the pool disconnects it when removing it or shutting down.
+// If the pool is full, BorrowSender waits up to the acquire timeout.
+// See [LineSender.Close].
 func (db *QuestDB) BorrowSender(ctx context.Context) (LineSender, error) {
 	return db.senderPool.borrow(ctx)
 }
 
-// BorrowQuery leases a query session from the pool. Close it to return it. With
-// lazy_connect, the first borrow connects on demand.
+// BorrowQuery borrows a query session from the pool. Before returning it with
+// [Query.Close], stop running queries, reading results, and using slices that
+// refer to result-batch memory. With lazy_connect, the first borrow connects
+// on demand.
 func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 	return db.queryPool.borrow(ctx)
 }
 
-// Close shuts down the housekeeper and both pools, closing every underlying
-// sender and query client. Idempotent and safe to call concurrently. Each
-// teardown step is panic-guarded so a fault in one cannot skip the others — the
-// sender pool (which owns the flocks/mmaps/I/O goroutines) is closed last and
-// always runs.
+// Close shuts down QuestDB and its pools. It may run concurrently with other
+// Close calls and with borrowing or returning separate handles. Your
+// application must stop using each borrowed handle and return it. Close does
+// not free result buffers while a borrower may still use them. Callbacks
+// should ask the application to stop; starting Close in another goroutine
+// does not make concurrent use of a borrowed handle safe.
 //
-// In store-and-forward mode, every reserved slot remains a shutdown obligation
-// from construction until its flock has been released. After a bounded wait,
-// an outstanding lease, in-flight construction, active teardown, or deferred
-// cleanup makes Close return an error wrapping [ErrSfCleanupPending]. That is a
-// "not yet" status: return outstanding leases and retry Close while
-// errors.Is(err, ErrSfCleanupPending) holds. Every call takes a fresh lifecycle
-// snapshot after re-probing retired slots.
+// The first call starts shutdown even if ctx is already cancelled or expired.
+// ctx limits how long this call waits, not how long cleanup may continue. It
+// also does not change the sender's separate time limits for queueing rows
+// and waiting for server acknowledgements. Later calls wait for the same
+// shutdown; they do not restart sending or repair cleanup that panicked.
 //
-// Once Close returns nil, every pool-managed SF slot is free and no operation
-// can later acquire or retain its flock. Later Close calls therefore remain
-// nil. Stable errors from the one-time teardown remain reportable on every
-// call and are never replaced by a volatile snapshot.
+// A nil result means both pools, their internal readers and background
+// drainers, and the pool maintenance task have finished cleanup. All their
+// store-and-forward file locks are released, and no work can later acquire
+// or retain another resource. This includes recovered orphan slots outside
+// the pool's numbered slots, clients still being created or removed, and
+// handles returned during shutdown. No error that Close must report remains.
+// Close need not wait for user callbacks: queued notifications may be dropped
+// and a callback already running may finish after Close returns. Close does
+// not promise empty slot directories or a WebSocket closing handshake.
 //
-// Avoid calling Close from inside a pooled SenderErrorHandler or
-// SenderConnectionListener. Pooled callbacks are funnelled through one
-// serializing mutex (see serializeErrorHandler), so a Close that blocks on a
-// sibling dispatcher mid-delivery head-of-lines the others until each is
-// abandoned at its join timeout (qwpSfDispatcherCloseJoinTimeout apiece; every
-// pooled sender owns two dispatchers, so the worst case scales with slot
-// count). It is bounded — no deadlock or panic — but Close may stall. Hand the
-// close off to a separate goroutine instead.
+// Check errors.Is(err, ErrCleanupFailed) first. This means cleanup cannot
+// safely continue after an internal failure. Close reports it without waiting
+// for other unfinished work. Resources that cannot safely be released stay
+// held, and affected slots stay reserved, possibly until process restart.
+// Corrupt pool state also produces [ErrPoolPoisoned]. Otherwise,
+// [ErrCleanupPending] means cleanup is unfinished; unfinished store-and-forward
+// cleanup also produces [ErrSfCleanupPending]. If ctx expires while waiting,
+// the returned error also wraps ctx.Err() and any recorded errors. Return
+// borrowed handles or fix storage faults before waiting again with a fresh
+// deadline. Cleanup is not guaranteed to finish.
+//
+// A later call checks progress again; an earlier timeout or pending result
+// is not a permanent failure. Once shutdown finishes, Close returns its saved
+// result immediately, even with an expired ctx. A successful cleanup retry
+// clears the error it recovered from. Errors from queueing or delivering rows
+// (including the acknowledgement timeout), cleanup errors that could not be
+// recovered from, and internal failures still appear in the result after
+// resources are released. Finished cleanup therefore need not mean nil.
+// Once Close returns nil, later calls also return nil.
 func (db *QuestDB) Close(ctx context.Context) error {
 	db.closeOnce.Do(func() {
 		// Signal the pools to stop reaping before joining the housekeeper, so a

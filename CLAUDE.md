@@ -1,340 +1,261 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with
-code in this repository. It captures invariants and "where to look" pointers —
-for specifics (file contents, constants, config-key catalog, error categories)
-read the code, which is authoritative.
+This file provides repository invariants and navigation pointers. Read the code
+for implementation facts and the public documentation for API guarantees. For
+shutdown, start with [README: QWP shutdown and ownership](README.md#qwp-shutdown-and-ownership)
+and the relevant method, error, and callback Go docs. Flag disagreements between
+contracts, implementation, tests, and PR claims.
+
+Paths and symbols below are starting points, not exhaustive inventories. Discover
+callers, interface implementations, wrappers, test helpers, and build-tagged code
+before changing behavior. Do not treat a default, a particular execution path,
+or a test fixture as a universal contract.
 
 ## Project
 
-Go client library for QuestDB ingestion, across two protocol families:
+Go client library for QuestDB ingestion and querying:
 
-- **ILP** — the legacy InfluxDB Line Protocol, over **HTTP / HTTPS** and **TCP /
-  TCPS**. **Feature-frozen: new column types and protocol features land in QWP
-  only**; ILP is maintained for compatibility, not extended.
-- **QWP** — QuestDB's binary columnar wire protocol over **WS / WSS**, and where
-  active development happens. The only transport exposing QuestDB's full type
-  system — the numeric, temporal, uuid, varchar, geohash and array types ILP
-  text can't express. **QWP is not a version of ILP** — distinct framing,
-  codecs, and server handshake.
+- **ILP** is the legacy InfluxDB Line Protocol over HTTP/HTTPS and TCP/TCPS.
+  **Feature-frozen:** new column types and protocol features belong in QWP;
+  ILP is maintained for compatibility, not extended.
+- **QWP** is QuestDB's binary columnar protocol over WS/WSS, with ingestion,
+  querying, and QWP-only column types. **QWP is not a version of ILP.** Resolve
+  supported types and protocol capabilities from public APIs and codec tests.
 
-Module path: `github.com/questdb/go-questdb-client/v4` — the `/v4` segment is
-required in imports within this repo. go.mod deliberately pins `go 1.23` with
-**no `toolchain` directive** (CI guards with `GOTOOLCHAIN=local`); don't let
-`go mod tidy` regrow one.
+Module path: `github.com/questdb/go-questdb-client/v4`; the `/v4` suffix is required
+in imports of this module. `go.mod` and CI define supported Go versions. Preserve
+the minimum-version checks with `GOTOOLCHAIN=local` and the intentional absence of
+a `toolchain` directive; do not let `go mod tidy` add one.
 
-## Commands
+## Commands and validation
 
 ```bash
-# Required for interop_test.go.
+# Required for the shared ILP interoperability vectors.
 git submodule update --init --recursive
 
-# Static analysis (run by CI; build.yml owns the pinned version).
 go vet ./...
-go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 
-# Tests. Integration suites spin up QuestDB containers via
-# testcontainers-go, so Docker must be running for those.
+# Full tests; inspect fixture prerequisites and skips as described below.
 go test -v ./...
 
-# Single suite — testify suites dispatch via the top-level
-# Test*Suite entry point plus the method name. The QWP live-server
-# tests are plain TestQwpIntegration* functions, not a testify suite.
+# Examples of targeted selection; verify the intended tests actually ran.
 go test -v -run TestIntegrationSuite/TestE2EValidWrites .
 go test -v -run TestQwpIntegration .
 
-# Allocation-tracked benchmark on the QWP hot path.
-go test -v -bench BenchmarkQwpSenderSteadyState -benchmem -run ^$ .
+# Allocation reporting for one QWP steady-state workload.
+go test -bench BenchmarkQwpSenderSteadyState -benchmem -run '^$' .
 ```
 
-`examples/` ships compilable `main.go` files referenced by
-`examples.manifest.yaml`, which questdb.io uses to render docs — keep paths and
-filenames stable.
+Resolve Staticcheck's pinned version and invocation from
+`.github/workflows/build.yml`, rather than maintaining another version pin here.
+Inspect the relevant CI jobs for platform coverage, environment, and toolchain
+requirements. A local pass does not validate an unexecuted platform job.
 
-## Architecture
+Integration fixtures differ. Container-backed suites need Docker; QWP live-server
+fixtures can use an external server or launch a private JVM. Start with
+`qwp_integration_test.go` and `qwp_fuzz_fixture_test.go` for resolution through
+`QDB_FUZZ_ADDR`, `QDB_JAR`, `QDB_REPO`, or a sibling checkout, and for
+`QDB_FUZZ_STRICT` skip-versus-fail behavior. Inspect the actual fixture used by the
+selected suite: a successful command with skipped tests is not integration proof.
 
-Public surface: `LineSender` interface in `sender.go`. Every transport satisfies
-it. `QwpSender` (in `qwp_sender.go`) is a superset for QWP-only column types —
-callers wanting them must type-assert.
+## Architecture and configuration
 
-Two entry points: `LineSenderFromConf(ctx, "schema::addr=...;key=value")` (the
-schema selects the transport) and `NewLineSender(ctx, opts...)` (one of
-`WithHttp` / `WithTcp` / `WithQwp`). **`conf_parse.go` is the single source of
-truth for supported config keys and schemas.**
+`LineSender` in `sender.go` is the common ingestion interface. `QwpSender` in
+`qwp_sender.go` extends it with QWP-specific operations. Check the actual transport
+before asserting the superset. Interface changes must cover discovered concrete
+implementations, pooled leases, wrappers, and test adapters—not just the underlying
+transport structs.
 
-### ILP (HTTP / TCP) — legacy, feature-frozen
+Standalone ingestion entry points are `LineSenderFromConf` and `NewLineSender`.
+The `QuestDB` facade in `questdb.go` owns sender and query pools; standalone query
+APIs live in `qwp_query_client.go`.
 
-Maintained for compatibility; new column types and features go to QWP, not here.
-ILP protocol versions are client-selected and ILP-only. HTTP auto-negotiates
-one; TCP requires an explicit `protocol_version` (or `WithProtocolVersion`)
-before the binary types are reachable at all. Senders in `http_sender.go` /
-`tcp_sender.go`, encoding in `buffer.go`.
+Configuration responsibilities are split:
 
-### QWP (WebSocket columnar protocol)
+- `conf_parse.go`: ingestion parsing and shared direction/pool key inventories.
+- `qwp_query_conf.go`: query parsing, defaults, and validation.
+- `questdb.go`: facade options, effective pool configuration, and startup validation.
+- Public option setters and Go docs: programmatic configuration and precedence.
 
-Everything QWP lives in `qwp_*.go`: a columnar codec stack (buffer, encoder,
-wire, transport) under the sender (`qwp_sender.go` + `qwp_sender_cursor.go`),
-which implements `LineSender` and `QwpSender`.
+A key accepted for sharing between clients may be intentionally ignored in one
+direction. Check all affected parsers, defaults, validators, options, and docs
+when changing configuration; no single parser defines every client's behavior.
 
-**Three separate "version" numbers live around QWP — don't conflate them:** the
-QWP protocol version (one version, negotiated at the WS upgrade via
-`X-QWP-Version`; the `protocol_version=` key is ILP-only and rejected for QWP),
-the endpoint **path names** `/write/v4` (ingest) and `/read/v1` (egress) in
-`qwp_transport.go` — literal paths, not versions — and the `/v4` Go module
-version. The `4` in `/write/v4` is unrelated to the module's `/v4`.
+### ILP
 
-**All wire I/O — memory-backed *and* disk-backed — goes through the cursor
-engine + send loop** in `qwp_sf_*.go`. `sf_dir` empty selects memory-backed
-segments; set selects disk-backed under `<sf_dir>/<sender_id>/*.sfa` (that
-per-sender directory is itself the slot — there is no extra slot level),
-on-disk-compatible with the Java client's `MmapSegment.java`. The producer
-encodes a batch into `qwpSfCursorEngine` via `engineAppendBlocking`; the
-`qwpSfSendLoop` goroutine drains it to the WebSocket, parses ACKs, advances
-`engineAckedFsn`, and owns reconnect + replay from `engineAckedFsn() + 1`.
+Start with `http_sender.go`, `tcp_sender.go`, and `buffer.go`. HTTP supports
+protocol negotiation; TCP requires explicit protocol selection for binary types.
+Resolve version-specific behavior from configuration, encoding code, and tests.
+Keep existing compatibility; do not add QWP features to ILP.
 
-Disk slots are manifest-backed: `sf-manifest.bin` holds the committed oldest
-and active segment bases, `.ack-watermark` the cumulative ACK FSN. Recovery
-validates the complete segment chain against those committed boundaries before
-quarantining anything — a head or tail the manifest says is required fails
-closed, while a file proven stale or stray may be removed or renamed. The
-delete site (`qwpSfDiscardOpened`) re-verifies the boundary it is handed: a
-head that matches no kept segment base (and is not the explicit
-nothing-delivered sentinel) fails closed instead of deleting, and a head the
-legacy migration synthesized licenses no torn-file deletion below it. A
-foreground sender preserves a fail-closed slot under `<sf_dir>/quarantined/` and
-starts a fresh slot; an orphan drainer writes the reason to a `.failed` sentinel
-instead. Legacy unflagged Go slots migrate in place on first recovery, and
-downgrading after that migration is unsupported. Quarantined `.corrupt` files
-inside a live slot count against `sf_max_total_bytes` — when they exhaust the
-budget no new segment is minted and the producer sees `ErrBackpressureTimeout`;
-the operator regains space by deleting the evidence, the client never does.
-The manager counts `.corrupt` bytes when it registers a slot. While the byte
-limit blocks a new segment, it rescans each slot at most once per second. If a
-scan fails, it keeps the previous byte count. If an operator deletes the files,
-the manager notices within one second. Between scans, each 1 ms poll does O(1)
-work.
+### QWP ingest and query
 
-Segment and manifest control points are durable even with
-`sf_durability=memory`: initial creation, rotation, each trim batch, and a fully
-drained close use header/manifest fsync plus directory barriers. A drained close
-commits segment absence, then manifest absence, as separate epochs; watermark
-and symbol-dictionary residue is harmless without either and need not be made
-durably absent. Frame publication and ordinary ACK cadence stay syscall-free;
-watermark sync happens only when it covers a trim or final drain. On Windows,
-where no supported unprivileged directory-fsync equivalent is documented, the
-directory barrier is explicitly a no-op: SF covers process-restart recovery but
-does not claim Unix-style host-crash namespace ordering.
+The `qwp_*.go` files contain the codec, transport, ingest cursor engine, and query
+machinery; shared APIs, errors, configuration, and the facade also live elsewhere.
 
-Close treats manager-worker quiescence as a cleanup barrier: a timed-out
-manager join does not release worker-reachable mappings, side files, or the slot
-flock — cleanup transfers to the worker exit, and `engineCloseCompleted()`
-becomes true only once that cleanup has released the flock. Every incomplete
-terminal close installs a per-engine retry owner, and those retries have no
-deadline: a persistent local-disk fault holds the flock and any pool capacity
-reservation until storage recovers or the process exits, because releasing
-ownership early could race retained files. Deferred-close pool slots stay
-reserved and count against capacity until re-probed, so
-`housekeeper_interval_ms=0` does not leak capacity. The pool's per-index
-lifecycle ledger is authoritative for both capacity and shutdown: creating,
-available, leased, closing, and retired are all obligations. `QuestDB.Close`
-returns an error wrapping `ErrSfCleanupPending` until every record is free and
-re-probes on every call; once it returns nil, no closed-pool operation can add
-another obligation and every pool-managed flock is released. A standalone
-sender has no pool ledger and its `Close` may return nil while deferred cleanup
-still owns the slot lock, so reopening that exact slot should retry a temporary
-lock error naming this process as the holder.
+Do not conflate the negotiated QWP protocol version, endpoint path names, and Go
+module version. Handshake headers and endpoint defaults live in `qwp_transport.go`;
+`protocol_version` is an ILP-only configuration key. An endpoint's path suffix does
+not determine the Go module or negotiated protocol version.
 
-**Cursor frames carry a self-sufficient schema** — full inline column
-definitions on every frame — which keeps reconnect/replay/orphan-adoption
-schema-safe against a fresh server connection. The symbol dictionary is
-delta-encoded; see "Delta symbol dictionary" below.
+Ingest batch delivery uses the cursor engine and send loop in `qwp_sf_*.go` for
+both memory-backed and disk-backed buffering. `qwp_sender_cursor.go` connects
+encoding/publication to that engine. Query I/O is separate: start with
+`qwp_query_io.go`, `qwp_query_decoder.go`, and `qwp_query_failover.go`.
 
-**Invariant B (store-and-forward robustness):** a running sender, async
-initial connect, and every background/orphan drainer retry transport outages
-and all-replica role-reject windows **indefinitely** with capped exponential
-backoff — no wall-clock give-up, no terminal error, no `.failed` quarantine
-for transport-class failures. `reconnect_max_duration_millis` bounds only the
-blocking sync initial connect; on a running sender it does not bound reconnect
-(it also serves as the poison-frame episode floor and the drainer no-progress
-budget). The sanctioned terminals — auth reject, upgrade reject, durable-ack
-capability-gap exhaustion, poison-frame escalation, and drainer slot-recovery
-failure — are enumerated and enforced by the review-pr skill checklist. The
-producer-visible errors from a running drain path are all local: SF-out-of-space
-backpressure (`ErrBackpressureTimeout`) and local-storage durability failures
-(`ErrSfDurability` — a rotation that cannot save its header or manifest, or
-slot maintenance that keeps failing for at least one second). A poll that does
-no work does not set or clear this error. A successful disk write or cleanup
-clears it. Both errors are non-terminal: the rows stay pending and the same
-call can be retried.
+Ingest table blocks carry full inline column definitions so replay is schema-safe
+on a fresh connection. Symbol dictionary dependencies are separate; do not infer
+a self-contained dictionary from a self-contained schema. Egress schema state
+must not leak across query boundaries.
 
-Drainer quarantine covers a slot proved inconsistent
-(`qwpSfErrRecoveryFailClosed`) plus the drainer's own give-ups — auth reject,
-durable-ack settle exhaustion, the no-progress watchdog, and a panic.
-**Local-storage analog of Invariant B: an environmental fault never condemns a
-slot — fail-closed comes only from what the slot's bytes prove.** A local I/O
-fault while opening a slot — a full disk, a read-only mount, an exhausted fd
-table, a vanished mount — leaves no `.failed` sentinel and quarantines
-nothing: a drainer run just fails and the next foreground scan adopts the slot
-again, while a foreground construction fails with a retriable error wrapping
-`ErrSfDurability` and succeeds once the fault clears, all rows intact.
-Availability waits on the operator; preservation wins by design. Legacy
-(manifest-less) slots fail closed on any corrupt segment that could still hold
-frames: with no committed boundaries nothing can show them delivered.
+### Publication, ACKs, and errors
 
-**A table block is self-describing** — the inline column definitions are its
-authoritative schema. On egress the decoder parses the schema from a query's
-first `RESULT_BATCH` and reuses it across that query's continuation batches,
-resetting at every query start so a schema never leaks across query
-boundaries.
+QWP `Flush` / `FlushAndGetSequence` publish without waiting for the batch's server
+ACK. This does **not** mean publication is nonblocking or syscall-free: encoding,
+backpressure, dictionary persistence, and segment rotation have their own costs
+and failure paths. Read each method's docs for cancellation and error behavior.
+Pair the FSN returned by `FlushAndGetSequence` with `AwaitAckedFsn` for server
+confirmation; publication alone is not confirmation of delivery or durability.
 
-**Delta symbol dictionary.** The dictionary is delta-encoded — each symbol id is
-sent once per connection, so a frame carries only ids above the last-sent
-watermark (monotonic, never reset). Delta mode is always on in memory mode; in
-SF mode it depends on the per-slot `.symbol-dict` side-file
-(`qwp_sf_symbol_dict.go`) being open, else the frame falls back to a full
-self-sufficient dictionary.
+**Acknowledgement governs trim and replay; rejection never advances the
+watermark.** With durable ACK requested, ordinary OKs alone do not confirm the
+required durability. Check the selected mode's covering acknowledgements in
+`qwp_sf_durable.go` and `qwp_sf_send_loop.go`; do not silently fall back when the
+server lacks the requested capability.
 
-On reconnect the fresh server has an empty dictionary, so the send loop keeps
-an I/O-goroutine-owned mirror of every symbol it has sent and re-registers the
-whole dictionary through table-less **catch-up frames** before any replay. Those
-frames occupy wire seqs that map onto already-acked FSNs, so ack alignment
-holds, and they stay outside the poison-strike gate — a catch-up frame must
-never count as a send attempt at the head-of-line FSN. SF mode write-ahead
-persists a frame's new symbols before publishing it.
+**There is no server-rejection drop policy.** Retriable `SenderError` notifications
+are informational and asynchronous; terminal errors additionally latch for
+producer-side reporting. A terminal sender does not auto-resume: close and rebuild
+is the supported recovery. Check the public method docs for reporting points.
 
-The `.symbol-dict` chunk format is byte-compatible with the Java client's —
-a hard cross-client constraint, not a local implementation choice. Recovery
-trusts only the run of chunks whose checksums match and physically truncates the
-untrusted tail, then rebuilds whatever ids came after it out of the surviving
-frames themselves and writes the difference back while those frames are still on
-disk. Content that cannot be trusted supplies no ids and is left byte-identical
-on disk, so the frame scan alone decides whether the slot is recoverable. A
-residual hole under a frame still waiting to be sent fails recovery before
-connecting, and the pre-send **torn-dict guard** catches the same condition as a
-terminal `PROTOCOL_VIOLATION`. The recovery parser deliberately accepts more
-entries than the append-time cap, so a slot written by an older client keeps
-every id at its own position.
+`sender_error.go` defines categories and policy semantics; `qwp_sf_classify.go`
+defines default classification and policy resolution. Public setters and parsers
+supply overrides. Preserve documented precedence and forced policies; do not turn
+default policy choices into unoverrideable rules. See README's error-handling
+section and the relevant policy/reconnect tests.
 
-Flush semantics: `Flush` / `FlushAndGetSequence` **never wait for the server
-ACK** — they return once the batch is published into the cursor engine (in-RAM
-for memory mode, on-disk for SF) and the send loop delivers + replays it in the
-background. This matches the Java spec ("flush() never waits for ACK; ACKs are
-async"). Pending-rows, zero-pending and auto-flush all take the same path, and
-explicit `Flush` additionally surfaces a pending send-loop error eagerly.
-`FlushAndGetSequence` returns the published FSN, the upper bound
-of any `SenderError.ToFsn` for that batch; **pair it with `AwaitAckedFsn` for
-server-ACK confirmation.**
+WS close codes alone do not select rejection policy. Repeated-frame-failure
+escalation must satisfy its evidence and timing gates; a transport interruption
+is not itself proof of a poisoned frame. Inspect strike attribution, progress
+resets, and episode accounting in the send loop, including durable-mode replay.
 
-Durable-ack (`request_durable_ack` / `WithRequestDurableAck`, QWP-only) shifts the
-trim/replay/await watermark from the WAL-commit OK ACK to the server's
-`STATUS_DURABLE_ACK` (object-storage upload), so under it `AckedFsn` /
-`AwaitAckedFsn` / `Close`-drain confirm **durability**, not just commit. The trim
-state machine is `qwpDurableTracker` in `qwp_sf_durable.go`: the send loop holds
-each OK ack until covering durable frames arrive, a dropped OK-ack sequence fails
-closed, and connecting to a non-durable endpoint fails with a `PROTOCOL_VIOLATION`
-(`*QwpDurableAckMismatchError`) rather than silently falling back.
+### Store-and-forward safety
 
-Orphan-slot adoption (SF mode, `drain_orphans=on`) lives in `qwp_sf_orphan.go`
-+ siblings; each drainer runs in its own goroutine.
+**Invariant B:** running senders, asynchronous initial connection, and
+background/orphan drain paths retry transport outages and all-replica role-reject
+windows **indefinitely with capped exponential backoff**. Transport-class failures
+must not become terminal or quarantine a slot through a total retry-duration or
+attempt-count limit. Bounded synchronous initial connection, sanctioned terminal
+episodes, and explicit shutdown are distinct lifecycle cases. Resolve their exact
+conditions from public docs, error policy, and the reconnect/drainer tests—not
+from a duplicated terminal-category list.
 
-### Error handling (no drop, no lists, no dead senders)
+**Environmental storage faults are not corruption evidence.** A local I/O failure
+opening a slot must remain retriable without condemning its bytes. Recovery and
+deletion decisions require evidence from the slot and its committed boundaries.
+Legacy slots without committed boundaries cannot assume corrupt files were already
+delivered. Start with `qwp_sf_recovery.go`, `qwp_sf_manifest.go`, and their tests.
 
-QWP server rejections surface as `*SenderError`, both asynchronously and as a
-producer-side typed error on the next flush. `sender_error.go` is canonical for
-the categories and the policy enum.
+For disk-backed slots, preserve cross-client segment and dictionary format
+compatibility. Use the referenced protocol/format specifications and compatibility
+tests, not an unversioned assertion that behavior "matches Java". Legacy Go-slot
+migration has an operational restriction: **downgrading after migration is
+unsupported**.
 
-**There is no drop policy** by design. Three policies, with the category→policy
-mapping canonical in `sender_error.go`: `RETRIABLE` recycles the connection and
-replays from `ackedFsn+1` through the wire-failure reconnect machinery (nothing
-dropped, no watermark advance); `RETRIABLE_OTHER` does the same with endpoint
-rotation; `TERMINAL` stops the sender, and is reserved for rejections that are
-deterministic under byte-identical replay (their bytes are preserved in the SF
-log).
+Quarantined evidence is operator-owned; the client must not reclaim it to regain
+capacity. `.corrupt` files inside live slots count against `sf_max_total_bytes`;
+whole-slot copies under `quarantined/` do not. See README's "Quarantined slots" for
+locations and operational recovery. Failed scans retain the previous accounting;
+periodic reconciliation is not a hard detection-latency guarantee. Inspect manager
+code and tests for scheduling and accounting details.
 
-Policy resolution precedence (highest first): `WithErrorPolicyResolver` →
-`WithErrorPolicy(category, ...)` → connect-string `on_*_error` →
-`on_server_error` → spec defaults. `PROTOCOL_VIOLATION` is forced TERMINAL and
-`UNKNOWN` is forced RETRIABLE (fail open); user overrides for those two are
-ignored.
+`ErrBackpressureTimeout` and `ErrSfDurability` are non-terminal local errors.
+Unpublished rows remain pending for retry; a failed flush can already have
+published part of a batch. Do not resend published work as though nothing happened.
+An idle poll or unrelated successful operation must not hide unresolved storage
+maintenance. Derive error persistence/clearing from the public contract and the
+specific outstanding work in `qwp_sf_manager.go` and `qwp_sf_errors.go`.
 
-**WS close codes carry no policy semantics** — every close is
-reconnect-eligible (`qwpSfIsTerminalCloseCode` is diagnostics-only). The
-guarded case — a frame that deterministically kills the connection without a
-NACK — is caught behaviorally by the **poison-frame detector**: a retriable
-NACK or non-orderly close (not 1000/1001) after at least one send, at the same
-head-of-line FSN with no ack progress, counts a strike. Escalation to a typed
-`PROTOCOL_VIOLATION` naming the FSN requires **both** `max_frame_rejections`
-(`WithMaxFrameRejections`) consecutive strikes **and** an episode lasting at
-least `reconnect_max_duration_millis`, so a transient rejection burst can't spend
-every strike in a second; below that floor the sender keeps recycling with capped
-backoff. An ack **covering** the poisoned FSN resets the counter; a lower ack
-(durable-mode replay re-acking predecessors) does not. `ackedFsn` advances
-**only** on server OKs — never on any rejection.
+Disk-backed control-point durability barriers remain required even with
+`sf_durability=memory`. Do not remove ordering barriers on creation, rotation,
+trim, or cleanup based on a steady-state performance assumption. Inspect the
+manifest, segment, and platform fsync/directory-barrier implementations and tests
+for the actual ordering and crash model. **Process restart, kernel crash, and
+power loss are not equivalent guarantees.** Windows directory barriers are a
+no-op; Darwin fsync does not force the drive cache as `F_FULLFSYNC` would. Do not
+claim a uniform host-crash or power-loss guarantee across platforms.
 
-A TERMINAL latches the typed error on the I/O loop; `sendLoopCheckError()`
-surfaces it on the next producer call. The sender does not auto-resume — close
-+ rebuild is the supported recovery (matches Java).
+### Symbol dictionaries and replay
 
-### Connection pooling
+Delta encoding avoids repeating dictionary entries during normal publication;
+it is not an exactly-once-per-connection delivery guarantee. In SF mode, missing
+or failed dictionary persistence can require full-dictionary frames, even while
+a side-file handle remains open. See `qwp_sender_cursor.go` and
+`qwp_sf_symbol_dict.go` for mode selection and failure handling.
 
-`sender_pool.go` (`LineSenderPool`) is the legacy **HTTP-only** pool — TCP/QWP
-configs are rejected with `errHttpOnlySender`.
+Recovery must preserve symbol-id/name associations using trusted dictionary and
+frame evidence; it must not invent entries or renumber ids referenced by retained
+frames. Inspect `qwp_sf_recovered_dict.go`, dictionary recovery, and their tests
+before changing truncation, reconstruction, or compatibility limits.
 
-QWP pooling lives behind the **`QuestDB` facade** (`questdb.go`), ported from the
-Java client. `Connect` / `NewQuestDB(ctx, conf, opts...)` take one `ws`/`wss`
-cluster config and own two elastic pools (senders + queries) plus a reaper.
-`BorrowSender` leases a `LineSender`; `BorrowQuery` leases a `*Query` over the
-cursor/iterator API; `Close` on a lease returns it to the pool, and the real
-disconnect waits for `QuestDB.Close`. Leases are **generation-stamped** so a
-stale handle can't corrupt a re-borrowed slot.
+Reconnect must supply the dictionary needed by replay on a fresh connection.
+Catch-up and replay can repeat entries. Preserve ACK/FSN alignment and keep
+catch-up frames out of data-frame poison-strike accounting. The send loop owns
+these wire interactions; inspect its actual handoffs rather than assuming a fixed
+goroutine topology.
 
-- **`lazy_connect=true`** (facade-only `Side.POOL` key; standalone clients
-  accept-but-ignore it) tolerates a down server at startup by mutating config
-  under the caller: ingest gets `initial_connect_retry=async` injected and the
-  read pool defaults to `query_pool_min=0` (connects on first borrow). `build()`
-  rejects anything that contradicts either.
-- **SF-in-pool** (`sf_dir` set): each slot gets `sender_id=<base>-<index>`,
-  every pooled sender fences its in-range slots out of orphan adoption, and
-  crash-stranded in-range slots are recovered by binding an async
-  self-recovering sender to each at construction (build never blocks).
-- Pool/facade connect-string keys live in `poolKeys` (`conf_parse.go`).
+### Pooling and shutdown ownership
 
-`WithConnectionListener` adds a `SenderConnectionListener` event stream
-(`sender_connection_listener.go`) over the generic `qwpDispatcher[T]`
-(`qwp_dispatcher.go`).
+`LineSenderPool` in `sender_pool.go` is the legacy **HTTP-only** pool. QWP pooling
+uses the `QuestDB` facade, with implementation entry points in
+`qwp_sender_pool.go` and `qwp_query_pool.go`. Stale leases must not mutate or return
+a subsequently borrowed slot; inspect generation guards and forwarding methods.
 
-## Testing
+Startup behavior depends on the complete effective configuration, including pool
+minimums, lazy connection, initial-connect mode, and persistent-slot recovery.
+`lazy_connect` permits deferred connectivity, not disabled functionality; inspect
+its validation and defaults in `questdb.go`. SF recovery connections can be
+asynchronous while eager prewarming and local-storage construction still block.
+Do not infer a nonblocking constructor from one flag or recovery path.
 
-QWP unit tests use `httptest.Server` to stand in for the QuestDB WebSocket
-endpoint (`newQwpTestServer` in `qwp_sender_test.go`). ILP unit tests are pure.
+Pool-managed SF slot identity, orphan-adoption exclusion, recovery, and capacity
+accounting must agree. Discover all lifecycle obligations, including construction,
+leases, returns, and retained cleanup. Start with the sender pool, engine, manager,
+and orphan-drainer implementations and tests.
 
-Cross-language conformance: `interop_test.go` +
-`test/interop/questdb-client-test` (submodule) — ILP vectors shared across
-QuestDB client libraries.
+Shutdown policy belongs in README's linked shutdown section and the public Close,
+slot-release, error, and callback docs. Neither a cancelled wait nor a finished
+attempt proves resource release. Ownership must survive timeouts and failures;
+verify strong references, quiescence before unmap/reuse, and truthful results.
+For implementation navigation, start with `qwp_sf_cleanup.go`, `qwp_sf_engine.go`,
+`qwp_sf_manager.go`, sender/query pools, query client, and facade. Follow actual
+ownership transfers rather than preserving a particular cleanup topology.
 
-`BenchmarkQwpSenderSteadyState` in `qwp_bench_test.go` asserts **0 allocs/op**
-on the Table→Symbol→Column→At pipeline after warmup (pinned in
-`TestQwpSenderSteadyStateZeroAllocs`). Preserve this: any new allocation in that
-hot path moves to a reusable scratch buffer on `qwpLineSender` (see
-`encodeInfoBuf` for the pattern).
+## Testing and conventions
 
-`export_test.go` re-exports unexported identifiers (including `QwpSenderType`)
-into the `questdb` package for black-box tests in package `questdb_test`. When
-adding internals tests must reach, extend this file rather than making
-production code public.
-
-## Conventions
-
-- Every `.go` file starts with the QuestDB Apache-2.0 license banner; preserve
-  it when creating new files.
-- Column/table/symbol name validation: ILP in `buffer.go`, QWP in
-  `qwp_buffer.go`. The disallowed-character set is documented on each
-  `LineSender` method.
-- **Errors on the fluent API latch** — `Table` / `Symbol` / `*Column` keep
-  returning the sender; the latched error surfaces on the next `At` / `AtNow` /
-  `Flush`. Preserve this when adding methods.
-- **`Hazard A`–`Hazard I`** is shared vocabulary across the pool / SF comments
-  and tests for the concurrency hazards those designs guard against. No document
-  defines the letters; each is explained inline at its use sites.
+- Discover relevant unit, integration, interoperability, race, platform, and
+  performance tests. Mock WebSocket fixtures are useful for protocol unit tests;
+  they do not substitute for live-server coverage.
+- Shared ILP conformance starts at `interop_test.go` and
+  `test/interop/questdb-client-test`. Check applicable compatibility fixtures when
+  changing wire or persistent formats.
+- **Preserve QWP steady-state zero-allocation guarantees.** Start with
+  `qwp_bench_test.go` and discover affected workloads, including pooled and
+  edge-case variants. Benchmarks report allocations; tests assert regression
+  thresholds and may have instrumentation-specific exclusions. Measure the actual
+  workload, not just one convenient case. Choose allocation remedies based on
+  ownership and measured costs, not a prescribed scratch field.
+- Extend test-only exposure (starting with `export_test.go`) when tests need
+  internals; do not make production APIs public solely for tests.
+- Every new `.go` file needs the QuestDB Apache-2.0 license banner.
+- Name validation starts in `buffer.go` for ILP and `qwp_buffer.go` for QWP.
+  Preserve the restrictions documented on the public methods.
+- **Fluent API errors latch:** `Table` / `Symbol` / `*Column` return the sender;
+  the latched error surfaces on the next `At` / `AtNow` / `Flush`. Preserve both
+  the reporting point and buffer-state safety.
+- `Hazard` letters are local to their comment/test family, not a global taxonomy.
+  Read the nearby definition and trace the actual hazard before changing guards.
 - Use `WithCloseFlushTimeout` / `close_flush_timeout_millis`. `WithCloseTimeout`
-  is a deprecated alias and the `close_timeout=` connect-string key is rejected.
+  is a deprecated alias; the `close_timeout=` connect-string key is rejected.
+- `examples.manifest.yaml` references compilable examples rendered by questdb.io.
+  Keep referenced paths and filenames stable and build affected examples.

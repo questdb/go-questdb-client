@@ -263,31 +263,49 @@ type LineSender interface {
 	// unappended rows remain pending and may be retried on the same sender.
 	Flush(ctx context.Context) error
 
-	// Close closes the underlying HTTP client.
+	// Close closes a standalone sender or returns a borrowed sender to its pool.
+	// For ILP, remaining buffered messages are flushed first if auto-flush is on.
 	//
-	// If auto-flush is enabled, the client will flush any remaining buffered
-	// messages before closing itself.
+	// For QWP, stop using the sender before Close. Callbacks must ask the
+	// application code using the sender to stop; they must not call Close or
+	// Flush themselves.
 	//
-	// A QWP store-and-forward sender does not always finish releasing its slot
-	// directory's lock before Close returns. If the segment manager is still
-	// busy, the release passes to a background goroutine that keeps retrying it
-	// with no deadline, and Close returns nil meanwhile. So a nil result does
-	// not on its own mean the slot lock is gone. Poll [QwpSender.SlotLockReleased]
-	// for that, and gate a reopen of the same sf_dir + sender_id on it: reopening
-	// earlier fails to take the lock, with an error naming this process as the
-	// holder.
+	// A standalone QWP sender starts shutdown once, even if ctx is already
+	// cancelled or expired. ctx limits the caller's wait, not cleanup or sending.
+	// Close first discards any row not finished with At, AtNow, or AtNano. It
+	// then tries to queue completed rows for background sending, using the
+	// configured append timeout for each frame rather than retrying indefinitely.
+	// Next it waits for server acknowledgements, up to [WithCloseFlushTimeout].
+	// A zero or negative timeout skips only that acknowledgement wait. If only
+	// part of a batch reaches store-and-forward files, only that part is saved
+	// for recovery. Cancellation and later Close calls do not restart these
+	// steps or extend their time limits.
 	//
-	// Pooled senders report the same thing through QuestDB.Close, which also
-	// counts every outstanding lease and in-flight construction as pending.
-	// Return every lease and keep calling QuestDB.Close while
-	// [ErrSfCleanupPending] matches. Once it returns nil, every pool-managed
-	// slot is unlocked, and later calls stay nil.
+	// If ctx expires before queueing and the acknowledgement wait finish, Close
+	// returns ctx.Err(), not nil. Errors from queueing or delivering rows still
+	// count as failures even if resources have been released. Rows held only in
+	// memory are not guaranteed delivery. Close also reports cleanup failures
+	// it already knows about; later failures are logged with their cause and,
+	// where applicable, slot. A nil result can mean resource cleanup continues
+	// in the background: it does not prove the slot's file lock is released.
+	// Use [QwpSender.SlotLockReleased] to check a standalone disk-backed sender.
+	// A second Close returns a double-close error and does not repair cleanup.
+	// The client remains responsible for retrying recoverable storage cleanup.
+	// After an internal failure, resources that cannot safely be released stay
+	// held, possibly until process exit. Close does not promise an empty slot
+	// directory or a WebSocket closing handshake.
 	//
-	// A second Close reports a double-close error, so do not use it to ask
-	// whether the first one finished; that is what SlotLockReleased is for. A
-	// lease from QuestDB.BorrowSender behaves differently: closing it a second
-	// time does nothing and returns nil, because the lease borrows a pooled slot
-	// rather than owning it.
+	// For a sender borrowed with [QuestDB.BorrowSender], Close returns it to the
+	// pool. Later calls do nothing and return nil, not errors from later cleanup.
+	// Unlike standalone Close, returning a borrowed sender ignores ctx while
+	// queueing completed rows: it uses the append timeout and does not wait for
+	// server acknowledgements. Stop using the handle once Close starts. The
+	// pool must not reuse its sender until the rows have been queued successfully.
+	// If the sender must be removed, the pool closes it in the background.
+	// Close reports errors from queueing rows or returning the sender; later
+	// cleanup errors are logged and included in [QuestDB.Close]'s result.
+	// Returning a sender does not prove its connection or file lock is released.
+	// Use QuestDB.Close to wait for all pool resources to be released.
 	Close(ctx context.Context) error
 }
 
@@ -505,21 +523,17 @@ func WithQwp() LineSenderOption {
 	}
 }
 
-// WithCloseTimeout sets the time Close() waits for the I/O goroutine
-// to finish draining published batches to the server before
-// force-cancelling. Defaults to 5 seconds. Because Flush() never waits
-// for the server ACK, this close-time drain — not Flush() — is the
-// sender's last chance to get buffered data confirmed; rows still
-// unacked when the timeout expires may be lost (memory mode) or left
-// on disk for replay (store-and-forward).
+// WithCloseTimeout limits the time QWP shutdown waits for server
+// acknowledgements. See [WithCloseFlushTimeout] and [LineSender.Close] for
+// how this differs from the caller's wait and from releasing resources.
 //
 // Deprecated: use WithCloseFlushTimeout instead. WithCloseTimeout is
 // preserved as an alias so v4.0–v4.5 code keeps compiling — it
 // routes through the same close_flush_timeout_millis path the spec
 // (connect-string.md §Ingress reconnect) defines. d <= 0 is treated
 // as "no override" (default 5s) to match the legacy semantics; to
-// skip the drain entirely, use WithCloseFlushTimeout, where 0 /
-// negative means "fast close".
+// skip waiting for acknowledgements, use WithCloseFlushTimeout. Zero or
+// negative values still allow completed buffered rows to be queued for sending.
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		if d <= 0 {
@@ -547,9 +561,11 @@ func WithCloseTimeout(d time.Duration) LineSenderOption {
 // logs ERROR for a terminal rejection and WARN for a retriable one
 // (informational: the batch is replayed after the connection recycles).
 //
-// The handler may call Close() or Flush() on the sender (e.g. to shut
-// down on a terminal rejection) without deadlocking — see
-// SenderErrorHandler for the re-entrancy contract.
+// The handler should signal the application code that uses the sender. It
+// must not call Close, Flush, other methods that change the sender, or
+// QuestDB.Close directly. Documented methods returning read-only snapshots
+// of state are allowed. See [SenderErrorHandler] for where callbacks run,
+// how panics are handled, and which notifications may be lost at shutdown.
 //
 // Only available for the QWP sender.
 func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
@@ -564,7 +580,11 @@ func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 // dedicated dispatcher goroutine; a slow listener cannot stall publishing, and
 // surplus events are dropped when the bounded inbox fills (visible via
 // QwpSender.DroppedConnectionNotifications()). Passing nil reverts to the
-// default loud listener. See SenderConnectionListener for the contract.
+// default loud listener. Signal the application code that uses the sender;
+// do not call Close, Flush, other methods that change the sender, or
+// QuestDB.Close directly. Documented methods returning read-only snapshots
+// of state are allowed. See [SenderConnectionListener] for where callbacks
+// run, how panics are handled, and which notifications may be lost at shutdown.
 //
 // Only available for the QWP sender.
 func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
@@ -581,6 +601,11 @@ func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 // windows) logs at Debug and is hidden unless the handler's level is lowered.
 // Pass a logger backed by slog.DiscardHandler to silence the client entirely,
 // or one wired to the application's logging stack to route it there.
+// A logging handler may run directly on a client goroutine. Return promptly;
+// do not change or close a client, or call QuestDB.Close from the handler.
+// Catching handler panics does not move logging to another goroutine or stop
+// a handler that is blocked. Unlike notification callbacks, logging does not
+// always use a separate delivery goroutine.
 func WithLogger(l *slog.Logger) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		// Guarded at the door: every logger the client stores is wrapped in
@@ -593,6 +618,12 @@ func WithLogger(l *slog.Logger) LineSenderOption {
 // WithProgressHandler registers a SenderProgressHandler invoked when the QWP
 // sender's acknowledged frame sequence advances. QWP-only; opt-in (no default).
 // Under WithRequestDurableAck the reported watermark is durable, not settled.
+// The handler runs on a separate goroutine, not the goroutine building rows
+// or doing network I/O. Signal the application code that uses the sender;
+// do not call Close, Flush, other methods that change the sender, or
+// QuestDB.Close directly. Documented methods returning read-only snapshots
+// of state are allowed. See [SenderProgressHandler] for skipped intermediate
+// updates, panic handling, and notifications that may be lost at shutdown.
 func WithProgressHandler(h SenderProgressHandler) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.progressHandler = h
@@ -602,7 +633,12 @@ func WithProgressHandler(h SenderProgressHandler) LineSenderOption {
 // WithBackgroundDrainerListener registers a QwpBackgroundDrainerListener applied
 // to every store-and-forward orphan drainer, surfacing durable-ack drain outcomes
 // (unavailable endpoint, persistent failure). QWP-only; effective with
-// drain_orphans and request_durable_ack on.
+// drain_orphans and request_durable_ack on. Callbacks may run concurrently on
+// the client's background draining or I/O goroutines. Return promptly and
+// signal the application code that uses the sender. Do not change or close a
+// sender, or call QuestDB.Close directly. Documented methods returning
+// read-only snapshots of state are allowed. See [QwpBackgroundDrainerListener]
+// for where callbacks run, how panics are handled, and shutdown delivery limits.
 func WithBackgroundDrainerListener(l QwpBackgroundDrainerListener) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.backgroundDrainerListener = l
@@ -830,15 +866,20 @@ func WithInitialConnectMode(mode InitialConnectMode) LineSenderOption {
 	}
 }
 
-// WithCloseFlushTimeout bounds Close()'s wait for the cursor
-// engine's ackedFsn to catch up to publishedFsn. A zero or
-// negative duration skips the drain entirely (fast close).
-// Defaults to 5 seconds. Applies in both memory and
-// store-and-forward modes: rows still unacked when the timeout
-// expires may be lost (memory mode) or left on disk for replay
-// (sf_dir set). Equivalent to the connect-string
-// close_flush_timeout_millis key.
+// WithCloseFlushTimeout limits how long QWP shutdown waits for server
+// acknowledgements (default 5s). It corresponds to close_flush_timeout_millis.
+// A zero or negative duration skips only this wait: Close still tries to queue
+// completed buffered rows for sending. Rows already saved to store-and-forward
+// files remain recoverable if not acknowledged; rows held only in memory may
+// be lost. WithRequestDurableAck requires confirmation of durable storage,
+// not just a commit to the server's write-ahead log.
 //
+// The timer starts once, after attempts to queue buffered rows, each using
+// the per-frame append timeout. Cancelling the caller's context does not stop
+// this timer; later Close calls do not extend it. If the timer expires before
+// the required acknowledgements arrive, that remains a delivery error even
+// after resources are released. This option does not limit how long resource
+// cleanup may take. See [LineSender.Close].
 // Only available for the QWP sender.
 func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
