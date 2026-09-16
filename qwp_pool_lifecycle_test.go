@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -562,42 +563,47 @@ func TestQwpQueryPoolCloseWaitsForReapTeardown(t *testing.T) {
 // by qwpPooledSender.Close, so the embedded interface is left nil.
 type panicOnFlushDelegate struct {
 	QwpSender
+	closes atomic.Int32
 }
 
-func (panicOnFlushDelegate) flushForReturn(context.Context) (bool, error) {
+func (*panicOnFlushDelegate) flushForReturn(context.Context) (bool, error) {
 	panic("boom in flushForReturn")
 }
+func (s *panicOnFlushDelegate) Close(context.Context) error {
+	s.closes.Add(1)
+	return nil
+}
 
-// TestQwpPooledSenderCloseRecoversFlushPanic pins FIX 4: a panic in
-// flushForReturn during a lease Close must not skip giveBack and strand the slot
-// on-loan forever — the slot is discarded (not recycled) and returned, and Close
-// surfaces the panic as an error rather than propagating it.
+// Flushing a sender's rows during return can panic after partly changing its
+// buffers. Report the failure without flushing again or reusing that sender.
 func TestQwpPooledSenderCloseRecoversFlushPanic(t *testing.T) {
-	p := senderPoolWithIdle(t, "", 1, 2, 0)
+	delegate := &panicOnFlushDelegate{}
+	slot := &qwpSenderSlot{slotIndex: -1, delegate: delegate}
+	p := &qwpSenderPool{maxSize: 1, notify: make(chan struct{}), all: []*qwpSenderSlot{slot}, available: []*qwpSenderSlot{slot}}
 	ctx := context.Background()
 	s, err := p.borrow(ctx)
 	if err != nil {
-		t.Fatalf("borrow: %v", err)
+		t.Fatal(err)
 	}
-	ps := s.(*qwpPooledSender)
-	realDelegate := ps.slot.delegate
-	// Swap in a delegate whose flushForReturn panics, then close the lease.
-	ps.slot.delegate = panicOnFlushDelegate{}
-
-	err = ps.Close(ctx)
-	if err == nil {
-		t.Fatal("Close returned nil; want the recovered panic surfaced as an error")
+	err = s.Close(ctx)
+	if !errors.Is(err, ErrCleanupFailed) || !errors.Is(err, ErrPoolPoisoned) {
+		t.Fatalf("Close error = %v, want permanent cleanup failure", err)
 	}
-	if !strings.Contains(err.Error(), "panicked") {
-		t.Errorf("Close error = %v, want a panic-surfaced error", err)
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("repeated lease return: %v", err)
 	}
-	// The slot must have been given back (broken → discarded), not stranded
-	// on-loan: total drops to 0 and the index (memory mode: none) is freed.
-	if total, _, _ := p.poolSnapshot(); total != 0 {
-		t.Errorf("slot stranded on-loan after flush panic: total=%d, want 0", total)
+	if !errors.Is(p.close(ctx), ErrCleanupFailed) {
+		t.Fatal("pool lost the failure")
 	}
-	// Restore the real delegate so the pool's Cleanup close tears it down.
-	_ = closeSlotGuarded(context.Background(), realDelegate)
+	waitQwpCleanupSignal(t, p.closeDone, "pool close after return panic")
+	if delegate.closes.Load() != 0 {
+		t.Fatal("cleanup retried the failed sender")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.failedSlots) != 1 || p.failedSlots[0] != slot || !slot.cleanupFailed {
+		t.Fatal("pool lost its reference to the failed sender")
+	}
 }
 
 // TestQwpSenderPoolGrowthBorrowBoundedByAcquireDeadline pins FIX 5: a growth

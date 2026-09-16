@@ -426,7 +426,9 @@ func TestQwpSenderPoolCloseRunsEveryDelegateAndJoinsErrorsInSlotOrder(t *testing
 	}
 	p.available = append([]*qwpSenderSlot(nil), p.all...)
 
-	err := p.close(context.Background())
+	require.ErrorIs(t, p.close(context.Background()), ErrCleanupFailed)
+	waitQwpCleanupSignal(t, p.closeDone, "pool close attempt")
+	err := p.currentCloseResult()
 	require.Equal(t, int32(3), closed.Load(), "one delegate fault must not skip its siblings")
 	require.ErrorIs(t, err, firstErr)
 	require.ErrorContains(t, err, "slot one close panic")
@@ -1204,7 +1206,7 @@ func TestQwpSenderPoolCloseSurvivesPanickingLoggerAndReleasesSlots(t *testing.T)
 	require.NoError(t, err, "close() skipped the teardown of an available slot")
 	require.NoError(t, lock.close())
 	require.NoError(t, leaked.Close(ctx))
-	require.NoError(t, p.close(ctx))
+	require.Eventually(t, func() bool { return p.close(ctx) == nil }, time.Second, time.Millisecond)
 }
 
 // TestQwpSenderPoolCloseReportsPendingWhileTeardownHoldsFlock pins that close()
@@ -1485,9 +1487,8 @@ func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 	_ = s2.Close(ctx)
 }
 
-// TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting pins the lifecycle
-// transition on the lease-returned-after-close path: leased stays pending until
-// giveBack moves it through closing to free.
+// TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting checks that a sender
+// returned after pool shutdown keeps its slot reserved until cleanup finishes.
 func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)
@@ -1504,13 +1505,13 @@ func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
-	// Close with the lease outstanding: close() leaves the borrowed slot for
-	// giveBack (bounded 100ms wait), which then runs the teardown itself.
+	// Pool close waits up to 100ms for the borrowed sender, but does not close
+	// it. Returning the sender then starts its cleanup in the background.
 	require.ErrorIs(t, p.close(ctx), ErrSfCleanupPending)
 	if err := s.Close(ctx); err != nil {
 		t.Fatalf("lease close: %v", err)
 	}
-	require.NoError(t, p.close(ctx))
+	require.Eventually(t, func() bool { return p.close(ctx) == nil }, time.Second, time.Millisecond)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -2146,17 +2147,17 @@ func TestQwpSenderPoolReapVictimSelectionIsAllOrNothing(t *testing.T) {
 	p.mu.Unlock()
 }
 
-// TestQwpSenderPoolPoisonSurfacesOnLeaseReturn pins that returning a lease to
-// a poisoned pool reports the terminal error: the recycle itself still
-// completes (the pool's bookkeeping is intact), but the producer must learn
-// the pool is dead rather than borrow-and-fail later.
+// TestQwpSenderPoolPoisonSurfacesOnLeaseReturn checks that returning a sender
+// reports the pool's permanent failure. If this sender is still safe to close,
+// close it rather than make it available to another borrower.
 func TestQwpSenderPoolPoisonSurfacesOnLeaseReturn(t *testing.T) {
 	p := &qwpSenderPool{
 		maxSize:        1,
 		acquireTimeout: 50 * time.Millisecond,
 		notify:         make(chan struct{}),
 	}
-	slot := &qwpSenderSlot{}
+	var closed atomic.Int32
+	slot := &qwpSenderSlot{slotIndex: -1, delegate: resultPoolCloseSender{closed: &closed}}
 	p.all = []*qwpSenderSlot{slot}
 	gen := slot.generation.Add(1)
 	ps := &qwpPooledSender{pool: p, slot: slot, gen: gen}
@@ -2167,10 +2168,11 @@ func TestQwpSenderPoolPoisonSurfacesOnLeaseReturn(t *testing.T) {
 
 	err := p.giveBack(context.Background(), ps, false)
 	require.ErrorIs(t, err, ErrPoolPoisoned)
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	require.Equal(t, []*qwpSenderSlot{slot}, p.available,
-		"the return itself must still complete")
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.pendingLeaseTeardowns == 0 && len(p.available) == 0 && closed.Load() == 1
+	}, time.Second, time.Millisecond)
 }
 
 // TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock pins that a failed
