@@ -27,18 +27,11 @@
 package questdb
 
 import (
-	"fmt"
-	"os"
+	"testing"
 
 	"golang.org/x/sys/unix"
 )
 
-// qwpSfReserveNewBlocks rejects allocation on Unix targets without a native
-// reservation implementation here (BSDs, Solaris, AIX, illumos). Extending a
-// file without reserving blocks would permit unsafe writes through its mapping.
-// Disk-backed SF creation needs a platform-specific reservation implementation;
-// memory-backed senders do not use this function.
-func qwpSfReserveNewBlocks(f *os.File, currentSize, newBytes int64) error {
-	return fmt.Errorf("qwp/sf: block reservation is not implemented on this platform for %s offset=%d len=%d: %w",
-		f.Name(), currentSize, newBytes, unix.EOPNOTSUPP)
+func TestQwpSfUnixWithoutReservationRejectsAllocation(t *testing.T) {
+	requireSfReservationRejected(t, unix.EOPNOTSUPP)
 }

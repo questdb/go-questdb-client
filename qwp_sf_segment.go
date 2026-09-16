@@ -553,10 +553,11 @@ func (s *qwpSfSegment) restoreRecoveryMappingAfterFailedSync(data []byte, off in
 
 // reserveTailBlocks zeroes [from, to) through the file descriptor while
 // preserving one non-zero byte as durable retry evidence. The range can sit
-// over a hole: qwpSfAllocate falls back to a sparse extend on filesystems whose
-// reservation primitive reports EOPNOTSUPP, and the "other unix" build has no
-// primitive at all. A store into an unbacked page of a full disk raises SIGBUS,
-// which kills the process outright and is beyond the reach of recover().
+// over a hole in an existing file, including slots created by clients that
+// allowed sparse allocation. Requiring reservation for new files does not
+// establish backing for recovered tails. A store into an unbacked page of a
+// full disk raises SIGBUS, which kills the process outright and is beyond the
+// reach of recover().
 func (s *qwpSfSegment) reserveTailBlocks(from, to, markerOff int64, marker byte) error {
 	if to <= from {
 		return nil

@@ -610,6 +610,15 @@ The slot lives at `<sf_dir>/<sender_id>/`, guarded by an advisory `flock` so two
 senders never share a slot. When the [`QuestDB` handle](#the-questdb-handle)
 runs in SF mode it assigns each pooled sender its own slot automatically.
 
+Creating SF files requires native disk-block reservation. If the filesystem
+rejects preallocation, creation fails with `ErrSfDurability`; the client does
+not fall back to sparse files or zero-filling. On Unix targets other than Linux
+and macOS, reservation is not implemented, so new disk-backed SF files cannot
+be created. Memory-backed senders are unaffected. This is stricter than Java's
+sparse fallback. Successful reservation does not certify existing sparse files
+or guarantee safety against every later storage failure or copy-on-write
+allocation. Use storage with suitable locking, mapping, and sync guarantees.
+
 | Key | Default | Effect |
 |---|---|---|
 | `sf_dir` | unset | Group root. Setting it activates SF. |

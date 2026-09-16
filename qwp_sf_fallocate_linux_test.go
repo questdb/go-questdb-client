@@ -1,4 +1,4 @@
-//go:build unix && !linux && !darwin
+//go:build linux
 
 /*+*****************************************************************************
  *     ___                  _   ____  ____
@@ -27,18 +27,28 @@
 package questdb
 
 import (
-	"fmt"
-	"os"
+	"testing"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/stretchr/testify/require"
 )
 
-// qwpSfReserveNewBlocks rejects allocation on Unix targets without a native
-// reservation implementation here (BSDs, Solaris, AIX, illumos). Extending a
-// file without reserving blocks would permit unsafe writes through its mapping.
-// Disk-backed SF creation needs a platform-specific reservation implementation;
-// memory-backed senders do not use this function.
-func qwpSfReserveNewBlocks(f *os.File, currentSize, newBytes int64) error {
-	return fmt.Errorf("qwp/sf: block reservation is not implemented on this platform for %s offset=%d len=%d: %w",
-		f.Name(), currentSize, newBytes, unix.EOPNOTSUPP)
+func TestQwpSfLinuxRejectsReservationFailure(t *testing.T) {
+	for _, cause := range []error{unix.EOPNOTSUPP, unix.EINVAL, unix.ENOSYS, unix.ENOSPC} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			orig := qwpSfFallocateFn.load()
+			t.Cleanup(func() { qwpSfFallocateFn.store(orig) })
+			calls := 0
+			qwpSfFallocateFn.store(func(fd int, mode uint32, off, length int64) error {
+				calls++
+				require.Zero(t, mode)
+				require.Zero(t, off)
+				require.Equal(t, int64(64*1024), length)
+				return cause
+			})
+			requireSfReservationRejected(t, cause)
+			require.Equal(t, 2, calls, "one syscall per failed allocation")
+		})
+	}
 }

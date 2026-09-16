@@ -103,11 +103,9 @@ func withInjectedReserveFailure(t *testing.T) {
 
 // TestQwpSfAllocateSurfacesReserveFailure pins item 3 of qwpSfAllocate's
 // cross-platform contract: a real reservation failure (ENOSPC, EFBIG,
-// EIO) surfaces as an error and the file is NOT extended. There is no
-// silent sparse fallback for those errnos — that path is reserved for
-// "filesystem cannot reserve" (EOPNOTSUPP/EINVAL), which the platform
-// helper absorbs internally. A sparse extension here would defer ENOSPC
-// to an mmap-store SIGBUS that tears down the whole process.
+// EIO) surfaces as an error and the file is NOT extended. Unsupported-operation
+// failures are covered at the syscall boundary in the platform tests. A sparse
+// extension would defer allocation failure to a potentially fatal mmap store.
 func TestQwpSfAllocateSurfacesReserveFailure(t *testing.T) {
 	withInjectedReserveFailure(t)
 
@@ -129,6 +127,33 @@ func TestQwpSfAllocateSurfacesReserveFailure(t *testing.T) {
 	require.NoError(t, statErr)
 	assert.Equal(t, int64(0), st.Size(),
 		"a failed reservation must not extend the file (no sparse mapping)")
+}
+
+// requireSfReservationRejected runs with a platform syscall failure injected.
+// It checks the complete allocation and segment-creation paths, not just the
+// syscall wrapper's error. No mapping may be exposed after reservation fails.
+func requireSfReservationRejected(t *testing.T, cause error) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "reserve-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+
+	err = qwpSfAllocate(f, 64*1024)
+	require.ErrorIs(t, err, cause)
+	st, err := f.Stat()
+	require.NoError(t, err)
+	require.Zero(t, st.Size(), "reservation failure must not fall through to truncate")
+
+	path := filepath.Join(t.TempDir(), "sf-initial.sfa")
+	seg, err := qwpSfCreateSegment(path, 0, 64*1024)
+	if seg != nil {
+		t.Cleanup(func() { _ = seg.close() })
+	}
+	require.Nil(t, seg, "reservation failure must not expose a mapping")
+	require.ErrorIs(t, err, cause)
+	require.ErrorIs(t, err, ErrSfDurability)
+	_, err = os.Stat(path)
+	require.ErrorIs(t, err, os.ErrNotExist, "failed creation must remove its partial file")
 }
 
 // TestQwpSfCreateSegmentRemovesPartialFileOnReserveFailure pins the

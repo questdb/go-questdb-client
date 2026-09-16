@@ -39,14 +39,11 @@ import (
 var qwpSfReserveNewBlocksFn = qwpSfSwappable(qwpSfReserveNewBlocks)
 
 // qwpSfAllocate extends f to at least size bytes and reserves real
-// disk blocks for the newly-extended range. Mirrors the Java client's
-// Files.allocate contract (see java-questdb-client core/src/main/java
-// /io/questdb/client/std/Files.java#allocate) so the two implementations
-// agree on what an `allocate(fd, size)` call observably does.
+// disk blocks for the newly-extended range. Unlike Java's Files.allocate,
+// unsupported native reservation is an error, not a sparse-file fallback.
+// Unix targets without a reservation implementation reject file growth.
 //
-// Cross-platform contract — identical observable behaviour on Linux,
-// macOS, Windows, and the "other unix" stub for any caller that does
-// not deliberately produce sparse files:
+// Contract:
 //
 //  1. Never shrinks. Let currentSize be f's current logical size and
 //     target = max(size, currentSize). Requests where
@@ -58,16 +55,14 @@ var qwpSfReserveNewBlocksFn = qwpSfSwappable(qwpSfReserveNewBlocks)
 //     FileAllocationInfo is file-scope and will re-reserve the
 //     existing range too, but a caller relying on hole-filling is
 //     writing non-portable code).
-//  3. Real errors surface as a wrapped error — notably ENOSPC, EFBIG,
-//     EIO (POSIX) or ERROR_DISK_FULL (Windows). The caller is
-//     responsible for closing the fd and unlinking the partial file.
-//  4. Sparse fallback (Linux / macOS only). When the reservation
-//     primitive itself reports the filesystem doesn't support it
-//     (EOPNOTSUPP / EINVAL on Linux; EOPNOTSUPP / ENOTSUP on macOS),
-//     the call still extends the logical size via ftruncate but
-//     leaves blocks sparse — the SIGBUS risk re-emerges for that
-//     filesystem only. Windows has no equivalent fallback; any
-//     failure is fatal.
+//  3. All reservation errors surface as wrapped errors, including unsupported
+//     operations, ENOSPC, EFBIG, EIO (POSIX) or ERROR_DISK_FULL (Windows).
+//     The caller is responsible for closing the fd and cleaning up a partial
+//     newly-created file. No truncate or zero-write fallback is attempted.
+//
+// Success relies on the filesystem's reservation guarantees. It does not
+// certify existing sparse ranges or prevent faults caused by later storage
+// failures, external truncation, or copy-on-write allocation.
 //
 // Implementation split: this function owns the cross-platform
 // invariants (fstat, target computation, short-circuit, post-reserve
@@ -96,10 +91,9 @@ func qwpSfAllocate(f *os.File, size int64) error {
 		return err
 	}
 	// Unified EOF advancement. On Linux when fallocate succeeded the
-	// file is already at target and this is a no-op; on the Linux
-	// sparse-fallback path and on macOS / Windows it is the call that
-	// grows the file. Never shrinks because target > currentSize by
-	// the time we reach here (the short-circuit above covered equal).
+	// file is already at target and this is a no-op; on macOS / Windows
+	// it is the call that grows the file. Never shrinks because target is greater
+	// than currentSize here (the short-circuit above covered equal).
 	if err := f.Truncate(target); err != nil {
 		return fmt.Errorf("qwp/sf: truncate %s to %d bytes: %w", f.Name(), target, err)
 	}
