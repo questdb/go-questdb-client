@@ -141,6 +141,16 @@ jobs:
           GOTOOLCHAIN: local
         run: go vet ./...
 
+      - name: Cross-compile Darwin
+        # Compile Darwin-specific production code, including SF fsync.
+        # This does not execute macOS tests.
+        env:
+          GOTOOLCHAIN: local
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: go build ./...
+
       - name: Run Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 
