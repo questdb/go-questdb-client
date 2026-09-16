@@ -268,10 +268,10 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 // both cursors are positioned at the start of that frame. Recovery durably
 // zeroes a validated active tail before making the segment appendable.
 //
-// If recovery observes a torn tail (bytes at the bail-out position
-// are non-zero, indicating an attempted-but-failed frame write), the
-// byte count is exposed via tornTailBytes() so operators can detect
-// silent truncation from corruption or partial writes.
+// Non-zero bytes after the last readable frame may come from a damaged or
+// interrupted write. segmentTornTailBytes() reports the size of this remaining
+// part. Opening the file does not erase it; recovery must first check that the
+// saved files form a complete queue.
 //
 // Errors are classified for qwpSfRecoverRing. Short files, bad magic, and
 // negative baseSeq are corruption evidence whose quarantine is deferred until
@@ -609,6 +609,15 @@ func (s *qwpSfSegment) syncSanitizedTail(phase string) error {
 	return nil
 }
 
+// sanitizeTornTail keeps the readable beginning of the file and zeroes the
+// remaining bytes. It keeps the same file and the same position for new writes.
+// Callers must first check that the saved files form a complete queue.
+//
+// In the active file (the one the sender was writing), the erased part may
+// contain rows that were never acknowledged, including intact frames after the
+// damage. Those bytes are not saved for later recovery. For older files that
+// no longer accept writes, callers must first prove that all expected frames
+// are present before clearing any bytes after them.
 func (s *qwpSfSegment) sanitizeTornTail() error {
 	if s == nil || s.memoryBacked || s.tornTailBytes == 0 || s.tornTailSanitized {
 		return nil

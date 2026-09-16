@@ -156,6 +156,13 @@ deletion decisions require evidence from the slot and its committed boundaries.
 Legacy slots without committed boundaries cannot assume corrupt files were already
 delivered. Start with `qwp_sf_recovery.go`, `qwp_sf_manifest.go`, and their tests.
 
+Active-tail recovery retains the valid frame prefix and zeroes the unreadable
+suffix in place after chain validation, even when the prefix is empty. This is
+a deliberate discard policy: later intact frames can be unreachable and are
+not preserved as evidence. Do not extend this policy to missing required
+segments, chain gaps, or unvalidated sealed data. Keep descriptor-first writes
+and the retry-marker durability barriers in `qwp_sf_segment.go`.
+
 For disk-backed slots, preserve cross-client segment and dictionary format
 compatibility. Use the referenced protocol/format specifications and compatibility
 tests, not an unversioned assertion that behavior "matches Java". Legacy Go-slot

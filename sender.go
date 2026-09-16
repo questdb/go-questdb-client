@@ -733,6 +733,13 @@ func WithErrorInboxCapacity(n int) LineSenderOption {
 // replayed on reconnect / restart. Setting an empty string is a
 // no-op (memory mode).
 //
+// After checking the saved queue, recovery repairs the file the sender was
+// writing: it keeps the readable beginning and erases everything from the first
+// unreadable frame onward. This also applies when the first frame is unreadable.
+// Rows in the erased part are not preserved, even if some later frames are
+// intact. Missing required files or gaps between their sequence numbers still
+// cause recovery to refuse the saved queue.
+//
 // Only available for the QWP sender.
 func WithSfDir(dir string) LineSenderOption {
 	return func(s *lineSenderConfig) {

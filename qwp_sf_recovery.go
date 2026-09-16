@@ -38,17 +38,21 @@ import (
 	"time"
 )
 
-// No recovery path, failed or otherwise, destroys a frame the committed
-// boundaries still require. Recovery does mutate the slot before it knows it
-// will succeed -- it zeroes bytes the boundaries prove dead, flags chain
-// headers as manifest-required, creates or removes the manifest, installs a
-// clean segment where a torn one held no recoverable frame, and removes files
-// proven stale -- but every file that holds a frame the manifest still accounts
-// for is either left exactly as it was or preserved under another name.
-// TestQwpSfFailedRecoveryPreservesEveryRequiredFrame pins the failed half. On
-// the success path the committed head is what licenses a removal. The recovery
-// plan selects unlink only below that boundary, and revalidateUnlink repeats
-// the proof immediately before os.Remove.
+// Recovery keeps readable data that still needs sending, even if a later
+// recovery step fails. It can update tracking files, clear unusable bytes,
+// and remove files before the whole recovery attempt succeeds.
+//
+// The active segment is the file the sender was still writing. After checking
+// that the saved files form a complete queue, recovery keeps that file's readable
+// beginning and zeroes everything after the first unreadable frame. This also
+// applies if the first frame is unreadable. Later intact frames in the same file
+// are discarded too: recovery cannot safely replay them across the damaged part.
+// Readable frames before the damage and required frames in older files survive.
+//
+// TestQwpSfFailedRecoveryPreservesEveryRequiredFrame checks preservation on
+// failure. Files that might hold rows can be deleted only when the saved delivery
+// boundary proves they were delivered. revalidateUnlink checks this again just
+// before os.Remove.
 //
 //lint:ignore ST1012 The qwpSf prefix groups internal store-and-forward errors.
 var qwpSfErrSanitizedResidue = errors.New("qwp/sf: sanitized sealed-segment residue; retry recovery once")
@@ -70,7 +74,6 @@ const (
 	qwpSfRecoverySanitizeActive
 	qwpSfRecoveryQuarantine
 	qwpSfRecoveryUnlink
-	qwpSfRecoveryReplace
 	qwpSfRecoveryFailClosed
 )
 
@@ -203,6 +206,12 @@ func qwpSfRecoverRingWithContext(sfDir string, maxBytesPerSegment int64, recover
 	manifest = plan.manifest
 	if err != nil {
 		return nil, nil, err
+	}
+	for _, file := range plan.files {
+		if file.action == qwpSfRecoverySanitizeActive {
+			qwpEffectiveLogger(recoveryContext.logger).Warn("qwp/sf: discarded unreadable active tail; rows beyond the valid prefix are not preserved",
+				"path", file.path, "valid_frames", file.validFrames, "discarded_bytes", file.tornTailBytes)
+		}
 	}
 	// Ownership of the retained chain and manifest transferred to the ring. All
 	// other segments were closed by the action executor.
@@ -478,13 +487,12 @@ func (p *qwpSfRecoveryPlan) planSanitizationActions() {
 			p.retryAfterSanitizePath = seg.segmentPath()
 		}
 	}
-	if p.activeSeg.segmentFrameCount() == 0 && p.activeSeg.segmentTornTailBytes() > 0 &&
-		p.manifestProvenance == qwpSfManifestCommitted {
-		p.setSegmentAction(p.activeSeg, qwpSfRecoveryReplace,
-			"committed active base requires a clean appendable segment while torn bytes remain preserved")
-	} else if p.activeSeg.segmentTornTailBytes() > 0 {
+	if p.activeSeg.segmentTornTailBytes() > 0 {
+		// The saved queue is consistent. Keep the active file's readable
+		// beginning and erase the rest, even if no complete frame survived.
+		// Erasing these bytes does not mean their rows were delivered.
 		p.setSegmentAction(p.activeSeg, qwpSfRecoverySanitizeActive,
-			"validated active cursor licenses descriptor-first zeroing of its appendable tail")
+			"validated chain permits discarding the active tail after its valid prefix")
 	}
 }
 
@@ -567,9 +575,6 @@ func qwpSfApplyRecoveryPlan(p *qwpSfRecoveryPlan) (*qwpSfSegmentRing, *qwpSfMani
 		return nil, nil, fmt.Errorf("%w: %s", qwpSfErrSanitizedResidue, p.retryAfterSanitizePath)
 	}
 
-	if err := p.applyReplacement(); err != nil {
-		return nil, nil, err
-	}
 	if err := p.markChainManifestRequired(); err != nil {
 		return nil, nil, err
 	}
@@ -599,10 +604,10 @@ func qwpSfApplyRecoveryPlan(p *qwpSfRecoveryPlan) (*qwpSfSegmentRing, *qwpSfMani
 	if p.collapsed || p.activeSeg == nil {
 		return nil, p.manifest, nil
 	}
-	// Recovery may be retrying after a prior process installed a replacement or
-	// completed another namespace mutation whose directory barrier failed. The
-	// clean files alone cannot reveal that pending epoch. Commit the slot
-	// namespace unconditionally before exposing any recovered mmap for append.
+	// A previous recovery may have created, renamed, or deleted files without
+	// successfully syncing the directory. The files can look correct even
+	// though those name changes are not yet saved to disk. Always sync the
+	// directory before allowing new writes to the recovered files.
 	if err := qwpSfSyncSlotDir(p.sfDir); err != nil {
 		return nil, nil, qwpSfDurabilityError("sync recovered slot before exposing ring", p.sfDir, err)
 	}
@@ -612,46 +617,6 @@ func qwpSfApplyRecoveryPlan(p *qwpSfRecoveryPlan) (*qwpSfSegmentRing, *qwpSfMani
 	ring.publishedFsn.Store(ring.nextSeq.Load() - 1)
 	ring.manifest = p.manifest
 	return ring, p.manifest, nil
-}
-
-func (p *qwpSfRecoveryPlan) applyReplacement() error {
-	if p.activeSeg == nil {
-		return nil
-	}
-	file := p.fileForSegment(p.activeSeg)
-	if file == nil || file.action != qwpSfRecoveryReplace {
-		return nil
-	}
-	torn := p.activeSeg
-	if err := torn.close(); err != nil {
-		return err
-	}
-	replacement, err := qwpSfReplaceTornActive(file.path, p.activeBase, p.maxBytesPerSegment)
-	if err != nil {
-		return err
-	}
-	for i, seg := range p.all {
-		if seg == torn {
-			p.all[i] = replacement
-			break
-		}
-	}
-	for i, seg := range p.chain {
-		if seg == torn {
-			p.chain[i] = replacement
-			break
-		}
-	}
-	file.segment = replacement
-	file.baseSeq = replacement.segmentBaseSeq()
-	file.validFrames = replacement.segmentFrameCount()
-	file.tornTailBytes = replacement.segmentTornTailBytes()
-	file.manifestRequired = replacement.segmentManifestRequired()
-	file.mayHoldFrames = false
-	file.action = qwpSfRecoveryKeep
-	file.license = "clean replacement installed at the committed active base"
-	p.activeSeg = replacement
-	return nil
 }
 
 func (p *qwpSfRecoveryPlan) markChainManifestRequired() error {
@@ -825,135 +790,6 @@ func qwpSfCorruptMayHoldFrames(path string) bool {
 			return !errors.Is(err, io.EOF)
 		}
 	}
-}
-
-// qwpSfTornActiveTempSuffix names the half-built replacement for a torn active
-// segment. It deliberately does not end in .sfa, so no directory scan —
-// recovery, the segment manager, the orphan sweep — can mistake a partial file
-// for a segment. A leftover from a crash mid-replacement is truncated and
-// reused by the next attempt.
-const qwpSfTornActiveTempSuffix = ".replacing"
-
-// Filesystem seams for the torn-active swap. Production always holds os.Link
-// and os.Rename; tests replace one to reach a failure exit that no real
-// filesystem can be talked into on demand. Every rename on this path goes
-// through the seam -- the install, the no-hard-link fallback that moves the
-// torn file aside, and that fallback's rollback -- so a test can fail exactly
-// one of them by looking at the source path.
-var (
-	qwpSfTornActiveLink   = qwpSfSwappable(os.Link)
-	qwpSfTornActiveRename = qwpSfSwappable(os.Rename)
-)
-
-// qwpSfReplaceTornActive preserves the bytes of a torn active segment under the
-// established .corrupt name and puts a clean, empty segment at the same
-// manifest-committed base in its place. Returns the segment now at path.
-//
-// Failure exits aim to leave a segment file at path, because the next startup
-// refuses a slot whose committed active segment is missing and neither
-// .corrupt nor .replacing ends in .sfa for a directory scan to find. Two steps
-// arrange that. The replacement is built at a temporary path and only swapped
-// in once it exists, so a full disk -- the obvious way to fail here, and the
-// obvious reason the slot is being recovered at all -- leaves the torn file
-// under its own name and the next recovery simply tries again. And the
-// preserved copy is made by hard-linking the torn file aside, so the install
-// rename replaces path's directory entry over a name that is occupied
-// throughout, and a crash between the two steps costs at most a stray link.
-//
-// Where hard links are unavailable the fallback renames the torn file aside
-// and rolls that rename back if the install fails. That is the one exit that
-// can leave the committed active base unoccupied: if both the install rename
-// and the rollback rename fail, the torn bytes survive under the preserved
-// name and the returned error says so. What the next recovery makes of the
-// emptied slot follows the committed boundaries -- a manifest that committed
-// frames fails closed, one whose head equals its active collapses and starts
-// fresh -- and either way the preserved copy is the record of the bytes.
-func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (result *qwpSfSegment, err error) {
-	tmp := path + qwpSfTornActiveTempSuffix
-	replacement, err := qwpSfCreateSegment(tmp, baseSeq, maxBytesPerSegment)
-	if err != nil {
-		return nil, qwpSfDurabilityError("build replacement for torn active", path, err)
-	}
-	resources := &qwpSfAcquiredResources{segments: []*qwpSfSegment{replacement}, temporaryPaths: []string{tmp}}
-	defer func() {
-		if r := recover(); r != nil {
-			qwpSfRetainAcquisitionPanic(r, resources)
-		}
-		if result == nil {
-			err = qwpSfFailedAcquisition(err, resources)
-		}
-	}()
-	// The replacement's header must be durable before its name is installed
-	// over the committed active base. The install rename below can reach the
-	// disk first otherwise, and a crash in that window leaves a durable
-	// directory entry over a zero-filled file: the next recovery reads it as
-	// corrupt, qwpSfCorruptMayHoldFrames says it holds no frames, no active
-	// segment survives, and the whole slot -- including the sealed segments'
-	// undelivered rows, intact on disk -- is quarantined.
-	if err := replacement.syncHeader(); err != nil {
-		return nil, qwpSfDurabilityError("sync replacement for torn active", path, err)
-	}
-	// Closed before the swap so the reopen below owns the only mapping, and so
-	// the segment records the path it ends up at rather than the temporary name
-	// every later diagnostic would then report.
-	if closeErr := qwpRunCleanupPhaseGuarded("replacement segment", replacement.close); closeErr != nil {
-		return nil, &qwpSfAcquisitionError{
-			original: qwpSfDurabilityError("close replacement for torn active", path, closeErr),
-			cause:    errors.Join(ErrSfDurability, closeErr), resources: resources,
-		}
-	}
-	preserved, err := qwpSfQuarantineTargetPath(path)
-	if err != nil {
-		_ = os.Remove(tmp)
-		return nil, err
-	}
-	linked := true
-	if linkErr := qwpSfTornActiveLink.load()(path, preserved); linkErr != nil {
-		linked = false
-		if renameErr := qwpSfTornActiveRename.load()(path, preserved); renameErr != nil {
-			_ = os.Remove(tmp)
-			return nil, errors.Join(
-				qwpSfDurabilityError("hard-link torn active into quarantine", path, linkErr),
-				qwpSfDurabilityError("rename torn active into quarantine", path, renameErr),
-			)
-		}
-	}
-	// The torn bytes need a durable name before the clean replacement may take
-	// over the manifest-committed active path. Link/rename preservation and the
-	// install therefore belong to separate namespace epochs.
-	if err := qwpSfSyncSlotDir(filepath.Dir(path)); err != nil {
-		_ = os.Remove(tmp)
-		if linked {
-			_ = os.Remove(preserved)
-		} else if rollbackErr := qwpSfTornActiveRename.load()(preserved, path); rollbackErr != nil {
-			return nil, errors.Join(
-				qwpSfDurabilityError("sync preserved torn-active segment", preserved, err),
-				qwpSfDurabilityError("restore torn active after failed preservation barrier", path, rollbackErr),
-			)
-		}
-		return nil, qwpSfDurabilityError("sync preserved torn-active segment", preserved, err)
-	}
-	if err := qwpSfTornActiveRename.load()(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		if linked {
-			_ = os.Remove(preserved)
-		} else if rollbackErr := qwpSfTornActiveRename.load()(preserved, path); rollbackErr != nil {
-			return nil, errors.Join(
-				qwpSfDurabilityError("install replacement for torn active", path, err),
-				qwpSfDurabilityError(
-					"restore torn active after failed replacement install; preserved copy remains and no file is left at the committed active base",
-					preserved,
-					rollbackErr,
-				),
-			)
-		}
-		return nil, qwpSfDurabilityError("install replacement for torn active", path, err)
-	}
-	resources.temporaryPaths = nil // the file has moved; the temporary path no longer exists
-	if err := qwpSfSyncSlotDir(filepath.Dir(path)); err != nil {
-		return nil, qwpSfDurabilityError("sync installed torn-active replacement", path, err)
-	}
-	return qwpSfOpenSegment(path)
 }
 
 func qwpSfQuarantinePath(path string) (string, error) {

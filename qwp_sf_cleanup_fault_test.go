@@ -26,7 +26,6 @@ package questdb
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"github.com/stretchr/testify/require"
 	"os"
@@ -60,7 +59,7 @@ func TestQwpSfTerminalCleanupRetainsOwnership(t *testing.T) {
 		runtime.KeepAlive(buf)
 		return
 	}
-	for _, mode := range []string{"ring", "middle-segment", "segment-file-close", "watermark", "symbol-dict", "construction-initial", "construction-manifest", "construction-ring", "manager-spare", "replacement", "unlink"} {
+	for _, mode := range []string{"ring", "middle-segment", "segment-file-close", "watermark", "symbol-dict", "construction-initial", "construction-manifest", "construction-ring", "manager-spare", "unlink"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -75,7 +74,7 @@ func TestQwpSfTerminalCleanupRetainsOwnership(t *testing.T) {
 			recovered, err := qwpSfNewCursorEngineForDrainer(dir, 256, qwpSfUnlimitedTotalBytes, time.Second)
 			require.NoError(t, err)
 			defer func() { require.NoError(t, recovered.engineClose()) }()
-			if mode == "ring" || mode == "middle-segment" || mode == "segment-file-close" || mode == "watermark" || mode == "symbol-dict" || mode == "replacement" {
+			if mode == "ring" || mode == "middle-segment" || mode == "segment-file-close" || mode == "watermark" || mode == "symbol-dict" {
 				require.Equal(t, int64(2), recovered.ring.segmentRingPublishedFsn())
 				require.Equal(t, int64(-1), recovered.engineAckedFsn())
 			}
@@ -174,23 +173,6 @@ func qwpTerminalCleanupChild(t *testing.T, dir, mode string) []byte {
 	require.NotNil(t, middle)
 	var buf []byte
 	switch mode {
-	case "replacement":
-		hook := func(b []byte) error {
-			if len(b) >= 16 && binary.LittleEndian.Uint64(b[8:16]) == 77 {
-				boom()
-			}
-			return nil
-		}
-		qwpSfTestMunmapHook.Store(&hook)
-		_, err := qwpSfReplaceTornActive(e.ring.getActiveSegment().path, 77, 256)
-		require.ErrorIs(t, err, ErrCleanupFailed)
-		var held *qwpSfAcquisitionError
-		require.ErrorAs(t, err, &held)
-		e.acquired = held.resources
-		require.ErrorIs(t, e.engineCloseWithCause(err), ErrCleanupFailed)
-		waitQwpSfEngineCleanup(t, e)
-		require.Equal(t, int32(1), hits.Load())
-		return held.resources.segments[0].buf
 	case "segment-file-close":
 		path := middle.path
 		hook := func(f *os.File) error {

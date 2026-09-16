@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,7 +42,6 @@ type qwpSfCrashFileOpKind uint8
 const (
 	qwpSfCrashCreate qwpSfCrashFileOpKind = iota
 	qwpSfCrashRemove
-	qwpSfCrashLink
 	qwpSfCrashRename
 	qwpSfCrashReplace
 )
@@ -73,12 +73,6 @@ func qwpSfApplyCrashFileOp(image map[string]qwpSfCrashNamespaceFile, op qwpSfCra
 		image[op.to] = qwpSfCrashNamespaceFile{data: append([]byte(nil), op.file.data...), mode: op.file.mode}
 	case qwpSfCrashRemove:
 		delete(image, op.from)
-	case qwpSfCrashLink:
-		file, ok := image[op.from]
-		if !ok {
-			return false
-		}
-		image[op.to] = qwpSfCrashNamespaceFile{data: append([]byte(nil), file.data...), mode: file.mode}
 	case qwpSfCrashRename:
 		file, ok := image[op.from]
 		if !ok {
@@ -365,83 +359,57 @@ func TestQwpSfSpareRotationAndTrimCrashEpochsRecover(t *testing.T) {
 	})
 }
 
-func TestQwpSfTornActiveReplacementCrashEpochsRecover(t *testing.T) {
-	for _, tc := range []struct {
-		name           string
-		forceFallback  bool
-		preserveOpKind qwpSfCrashFileOpKind
-	}{
-		{name: "hard-link", preserveOpKind: qwpSfCrashLink},
-		{name: "rename-fallback", forceFallback: true, preserveOpKind: qwpSfCrashRename},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir, path := tornActiveSlot(t, 7)
+// Copy the files at each sync step while recovery clears the damaged tail.
+// Include the point where it has cleared the byte that signals cleanup is still
+// needed, but has not yet restored that byte after a sync failure. These copies
+// model a process stopping and restarting, not an OS crash or power loss.
+func TestQwpSfActiveTailSanitationRestartImages(t *testing.T) {
+	for _, phase := range []string{"pending-marker", "backed-tail", "cleared-marker"} {
+		t.Run(phase, func(t *testing.T) {
+			dir := t.TempDir()
+			sealed := createRecoverySegment(t, dir, "sf-sealed.sfa", 7, "saved row")
+			active := createRecoverySegment(t, dir, "sf-active.sfa", 8)
+			active.buf[qwpSfHeaderSize+20] = 1
+			createRecoveryManifest(t, dir, 7, 8, sealed, active)
+			closeRecoverySegments(t, sealed, active)
 			initial := qwpSfSnapshotCrashNamespace(t, dir)
-			var events []qwpSfCrashFileEvent
-			recordedTemp := false
-
-			recordTemp := func() {
-				if recordedTemp {
-					return
+			var image map[string]qwpSfCrashNamespaceFile
+			injected := errors.New("sanitation barrier failed")
+			fail := func(path, at string) error {
+				if at == phase {
+					image = qwpSfSnapshotCrashNamespace(t, dir)
+					return injected
 				}
-				tmp := path + qwpSfTornActiveTempSuffix
-				data, err := os.ReadFile(tmp)
-				require.NoError(t, err)
-				info, err := os.Stat(tmp)
-				require.NoError(t, err)
-				op := qwpSfCrashFileOp{kind: qwpSfCrashCreate, to: filepath.Base(tmp), file: qwpSfCrashNamespaceFile{data: data, mode: info.Mode().Perm()}}
-				events = append(events, qwpSfCrashFileEvent{op: &op})
-				recordedTemp = true
-			}
-
-			originalLink := qwpSfTornActiveLink.load()
-			originalRename := qwpSfTornActiveRename.load()
-			qwpSfTornActiveLink.store(func(from, to string) error {
-				recordTemp()
-				if tc.forceFallback {
-					return os.ErrPermission
-				}
-				if err := originalLink(from, to); err != nil {
-					return err
-				}
-				op := qwpSfCrashFileOp{kind: qwpSfCrashLink, from: filepath.Base(from), to: filepath.Base(to)}
-				events = append(events, qwpSfCrashFileEvent{op: &op})
-				return nil
-			})
-			qwpSfTornActiveRename.store(func(from, to string) error {
-				if err := originalRename(from, to); err != nil {
-					return err
-				}
-				op := qwpSfCrashFileOp{kind: qwpSfCrashRename, from: filepath.Base(from), to: filepath.Base(to)}
-				events = append(events, qwpSfCrashFileEvent{op: &op})
-				return nil
-			})
-			barrier := func(string) error {
-				events = append(events, qwpSfCrashFileEvent{barrier: true})
 				return nil
 			}
-			qwpSfTestDirSyncHook.Store(&barrier)
-			restore := func() {
-				qwpSfTornActiveLink.store(originalLink)
-				qwpSfTornActiveRename.store(originalRename)
-				qwpSfTestDirSyncHook.Store(nil)
-			}
-			t.Cleanup(restore)
-
+			original := qwpSfTestSegmentSanitizeTailSyncErrorHook.Load()
+			qwpSfTestSegmentSanitizeTailSyncErrorHook.Store(&fail)
+			t.Cleanup(func() { qwpSfTestSegmentSanitizeTailSyncErrorHook.Store(original) })
 			ring, _, err := qwpSfRecoverRing(dir, 4096)
-			require.NoError(t, err)
-			require.NotNil(t, ring)
-			require.NoError(t, ring.segmentRingClose())
-			restore()
-			require.True(t, recordedTemp)
-			require.Len(t, events, 6, "create, preserve, barrier, install, barrier, pre-exposure barrier")
-			require.Equal(t, tc.preserveOpKind, events[1].op.kind)
-			require.True(t, events[2].barrier)
-			require.Equal(t, qwpSfCrashRename, events[3].op.kind)
-			require.True(t, events[4].barrier)
-			require.True(t, events[5].barrier)
+			require.Nil(t, ring)
+			require.ErrorIs(t, err, injected)
+			require.ErrorIs(t, err, ErrSfDurability)
+			require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+			require.NotNil(t, image, "the selected barrier must execute")
+			require.Len(t, image, len(initial), "sanitation must not create or remove files")
+			require.Equal(t, initial["sf-sealed.sfa"], image["sf-sealed.sfa"])
+			qwpSfTestSegmentSanitizeTailSyncErrorHook.Store(original)
 
-			qwpSfAssertCrashFileEpochs(t, initial, events)
+			// Try both a restart from the copied files and a retry after the
+			// error. Older queued data must still be available for sending, and
+			// the active file must be ready for new writes at the same sequence.
+			for _, recoveredDir := range []string{qwpSfMaterializeCrashImage(t, image), dir} {
+				ring, _, err := qwpSfRecoverRing(recoveredDir, 4096)
+				require.NoError(t, err)
+				require.NotNil(t, ring)
+				require.Equal(t, int64(8), ring.getActiveSegment().segmentBaseSeq())
+				require.Zero(t, ring.getActiveSegment().segmentFrameCount())
+				require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
+				require.Equal(t, int64(7), ring.segmentRingPublishedFsn())
+				require.NotNil(t, ring.firstSealed())
+				require.Equal(t, int64(1), ring.firstSealed().segmentFrameCount())
+				require.NoError(t, ring.segmentRingClose())
+			}
 		})
 	}
 }

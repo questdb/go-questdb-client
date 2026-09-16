@@ -771,58 +771,151 @@ func TestQwpSfRecoverySanitizesActiveTail(t *testing.T) {
 	assert.Equal(t, make([]byte, len(b)-int(off)), b[off:])
 }
 
-func TestQwpSfRecoveryQuarantinesTornEmptyActiveBeforeReplacement(t *testing.T) {
-	const baseSeq int64 = 7
-	dir := t.TempDir()
-	active := createRecoverySegment(t, dir, "sf-active.sfa", baseSeq)
-	createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
-	closeRecoverySegments(t, active)
-	path := filepath.Join(dir, "sf-active.sfa")
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
-	require.NoError(t, err)
-	_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+20)
-	require.NoError(t, err)
-	require.NoError(t, f.Sync())
-	require.NoError(t, f.Close())
+func TestQwpSfRecoveryDiscardsActiveTailInPlace(t *testing.T) {
+	for _, prefixFrames := range []int{0, 1} {
+		for _, sealedFrames := range []int{0, 1} {
+			t.Run(fmt.Sprintf("prefix-%d/sealed-%d", prefixFrames, sealedFrames), func(t *testing.T) {
+				dir := t.TempDir()
+				const head = int64(7)
+				base := head + int64(sealedFrames)
+				payloads := []string{"damaged", "intact-but-unreachable"}
+				if prefixFrames > 0 {
+					payloads = append([]string{"valid-prefix"}, payloads...)
+				}
+				active := createRecoverySegment(t, dir, "sf-active.sfa", base, payloads...)
+				tail := qwpSfHeaderSize
+				if prefixFrames > 0 {
+					tail += qwpSfFrameHeaderSize + int64(len(payloads[0]))
+				}
+				active.buf[tail] ^= 0xff // Damage this frame; the next one stays intact.
+				segments := []*qwpSfSegment{active}
+				if sealedFrames > 0 {
+					segments = append(segments, createRecoverySegment(t, dir, "sf-sealed.sfa", head, "sealed"))
+				}
+				createRecoveryManifest(t, dir, head, base, segments...)
+				closeRecoverySegments(t, segments...)
+				path := filepath.Join(dir, "sf-active.sfa")
+				before, err := os.ReadFile(path)
+				require.NoError(t, err)
+				identity, err := os.Stat(path)
+				require.NoError(t, err)
+				names, err := os.ReadDir(dir)
+				require.NoError(t, err)
+				var sealedBefore []byte
+				if sealedFrames > 0 {
+					sealedBefore, err = os.ReadFile(filepath.Join(dir, "sf-sealed.sfa"))
+					require.NoError(t, err)
+				}
 
-	ring, _, err := qwpSfRecoverRing(dir, 4096)
-	require.NoError(t, err)
-	require.NotNil(t, ring)
-	defer ring.segmentRingClose()
-	require.Equal(t, baseSeq, ring.getActiveSegment().segmentBaseSeq())
-	require.Zero(t, ring.getActiveSegment().segmentFrameCount())
-	require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
-	require.Equal(t, baseSeq-1, ring.segmentRingPublishedFsn())
-
-	corrupt, err := os.ReadFile(path + ".corrupt")
-	require.NoError(t, err)
-	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
+				// Recovery must reuse the file even if there is no space to
+				// allocate a replacement.
+				reserve := qwpSfReserveNewBlocksFn.load()
+				qwpSfReserveNewBlocksFn.store(func(*os.File, int64, int64) error { return syscall.ENOSPC })
+				t.Cleanup(func() { qwpSfReserveNewBlocksFn.store(reserve) })
+				ring, _, err := qwpSfRecoverRing(dir, 4096)
+				require.NoError(t, err)
+				require.NotNil(t, ring)
+				t.Cleanup(func() { _ = ring.segmentRingClose() })
+				require.Equal(t, base, ring.getActiveSegment().segmentBaseSeq())
+				require.Equal(t, int64(prefixFrames), ring.getActiveSegment().segmentFrameCount())
+				require.Equal(t, base+int64(prefixFrames)-1, ring.segmentRingPublishedFsn())
+				after, err := os.ReadFile(path)
+				require.NoError(t, err)
+				require.Equal(t, before[:tail], after[:tail])
+				require.Equal(t, make([]byte, int64(len(after))-tail), after[tail:])
+				current, err := os.Stat(path)
+				require.NoError(t, err)
+				require.True(t, os.SameFile(identity, current), "recovery must retain the active file")
+				currentNames, err := os.ReadDir(dir)
+				require.NoError(t, err)
+				require.Equal(t, names, currentNames, "no replacement or evidence files may be created")
+				if sealedFrames > 0 {
+					sealedAfter, err := os.ReadFile(filepath.Join(dir, "sf-sealed.sfa"))
+					require.NoError(t, err)
+					require.Equal(t, sealedBefore, sealedAfter)
+				}
+				_, err = ring.getActiveSegment().tryAppend([]byte("new frame"))
+				require.NoError(t, err)
+				require.NoError(t, ring.segmentRingClose())
+				ring, _, err = qwpSfRecoverRing(dir, 4096)
+				require.NoError(t, err)
+				require.NotNil(t, ring)
+				require.Equal(t, int64(prefixFrames+1), ring.getActiveSegment().segmentFrameCount())
+				require.Equal(t, base+int64(prefixFrames), ring.segmentRingPublishedFsn())
+				require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
+			})
+		}
+	}
 }
 
-func TestQwpSfRecoveryRetryCommitsInstalledTornActiveNamespace(t *testing.T) {
+func TestQwpSfRecoveryActiveTailWriteFailureIsRetriable(t *testing.T) {
+	for _, fault := range []error{syscall.ENOSPC, syscall.EIO} {
+		t.Run(fault.Error(), func(t *testing.T) {
+			dir := t.TempDir()
+			sealed := createRecoverySegment(t, dir, "sf-sealed.sfa", 7, "saved row")
+			active := createRecoverySegment(t, dir, "sf-active.sfa", 8)
+			active.buf[qwpSfHeaderSize+20] = 1
+			createRecoveryManifest(t, dir, 7, 8, sealed, active)
+			closeRecoverySegments(t, sealed, active)
+			path := filepath.Join(dir, "sf-active.sfa")
+			before := qwpSfSnapshotCrashNamespace(t, dir)
+			write := qwpSfSegmentWriteAt.load()
+			calls := 0
+			qwpSfSegmentWriteAt.store(func(f *os.File, p []byte, off int64) (int, error) {
+				if f.Name() == path && off >= qwpSfHeaderSize {
+					calls++
+					// Write one byte, then report a disk error.
+					n, err := f.WriteAt(p[:1], off)
+					if err != nil {
+						return n, err
+					}
+					return n, fault
+				}
+				return write(f, p, off)
+			})
+			t.Cleanup(func() { qwpSfSegmentWriteAt.store(write) })
+			ring, _, err := qwpSfRecoverRing(dir, 4096)
+			require.Nil(t, ring)
+			require.ErrorIs(t, err, fault)
+			require.ErrorIs(t, err, ErrSfDurability)
+			require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+			require.Equal(t, 1, calls)
+			after := qwpSfSnapshotCrashNamespace(t, dir)
+			require.Len(t, after, len(before))
+			require.Equal(t, before["sf-sealed.sfa"], after["sf-sealed.sfa"])
+			require.Equal(t, byte(1), after["sf-active.sfa"].data[qwpSfHeaderSize+20], "retry marker must survive")
+			qwpSfSegmentWriteAt.store(write)
+			ring, _, err = qwpSfRecoverRing(dir, 4096)
+			require.NoError(t, err)
+			require.NotNil(t, ring)
+			defer ring.segmentRingClose()
+			require.Equal(t, int64(8), ring.getActiveSegment().segmentBaseSeq())
+			require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
+			require.Equal(t, int64(7), ring.segmentRingPublishedFsn())
+		})
+	}
+}
+
+func TestQwpSfRecoveryRetryCommitsSanitizedActiveNamespace(t *testing.T) {
 	const baseSeq int64 = 7
 	dir, path := tornActiveSlot(t, baseSeq)
 	originalDirSync := qwpSfTestDirSyncHook.Load()
 	t.Cleanup(func() { qwpSfTestDirSyncHook.Store(originalDirSync) })
 
-	injectedInstall := errors.New("injected installed-replacement barrier failure")
+	injected := errors.New("injected recovery namespace barrier failure")
 	barriers := 0
-	failSecond := func(string) error {
+	fail := func(string) error {
 		barriers++
-		if barriers == 2 {
-			return injectedInstall
-		}
-		return nil
+		return injected
 	}
-	qwpSfTestDirSyncHook.Store(&failSecond)
+	qwpSfTestDirSyncHook.Store(&fail)
 	ring, _, err := qwpSfRecoverRing(dir, 4096)
 	if ring != nil {
 		_ = ring.segmentRingClose()
 	}
-	require.ErrorIs(t, err, injectedInstall)
-	require.Equal(t, 2, barriers, "fault must follow the replacement install rename")
-	require.FileExists(t, path, "the clean replacement is visible after the failed barrier")
-	require.FileExists(t, path+".corrupt", "the torn bytes remain preserved")
+	require.ErrorIs(t, err, injected)
+	require.Equal(t, 1, barriers)
+	require.FileExists(t, path, "the active file must stay in place after the failed barrier")
 
 	injectedRetry := errors.New("injected retry namespace barrier failure")
 	retryBarriers := 0
@@ -836,7 +929,7 @@ func TestQwpSfRecoveryRetryCommitsInstalledTornActiveNamespace(t *testing.T) {
 		_ = ring.segmentRingClose()
 	}
 	require.ErrorIs(t, err, injectedRetry,
-		"retry must not expose the installed inode until its namespace is durable")
+		"retry must not expose the recovered file until its namespace is durable")
 	require.Equal(t, 1, retryBarriers)
 
 	qwpSfTestDirSyncHook.Store(originalDirSync)
@@ -846,220 +939,6 @@ func TestQwpSfRecoveryRetryCommitsInstalledTornActiveNamespace(t *testing.T) {
 	defer func() { _ = ring.segmentRingClose() }()
 	require.Equal(t, baseSeq, ring.getActiveSegment().segmentBaseSeq())
 	require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
-}
-
-// TestQwpSfRecoveryKeepsTornActiveWhenReplacementCannotBeCreated pins that a
-// full disk during the replacement costs nothing permanent. Quarantining the
-// torn file first would leave the slot with no segment at its committed active
-// base, which the next startup refuses — so a disk that fills up and empties
-// again would cost the whole slot.
-func TestQwpSfRecoveryKeepsTornActiveWhenReplacementCannotBeCreated(t *testing.T) {
-	const baseSeq int64 = 7
-	dir := t.TempDir()
-	active := createRecoverySegment(t, dir, "sf-active.sfa", baseSeq)
-	createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
-	closeRecoverySegments(t, active)
-	path := filepath.Join(dir, "sf-active.sfa")
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
-	require.NoError(t, err)
-	_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+20)
-	require.NoError(t, err)
-	require.NoError(t, f.Sync())
-	require.NoError(t, f.Close())
-
-	originalReserve := qwpSfReserveNewBlocksFn.load()
-	qwpSfReserveNewBlocksFn.store(func(*os.File, int64, int64) error { return syscall.ENOSPC })
-	_, _, err = qwpSfRecoverRing(dir, 4096)
-	qwpSfReserveNewBlocksFn.store(originalReserve)
-	require.ErrorIs(t, err, syscall.ENOSPC)
-
-	// The torn file is still where the manifest says the active segment is, and
-	// nothing was filed away as evidence yet.
-	torn, err := os.ReadFile(path)
-	require.NoError(t, err)
-	require.Equal(t, byte(1), torn[qwpSfHeaderSize+20])
-	_, err = os.Stat(path + ".corrupt")
-	require.True(t, os.IsNotExist(err), "nothing may be quarantined until the replacement exists")
-	_, err = os.Stat(path + qwpSfTornActiveTempSuffix)
-	require.True(t, os.IsNotExist(err), "the half-built replacement must not be left behind")
-
-	// With space back, the same slot recovers.
-	ring, _, err := qwpSfRecoverRing(dir, 4096)
-	require.NoError(t, err)
-	require.NotNil(t, ring)
-	defer ring.segmentRingClose()
-	require.Equal(t, baseSeq, ring.getActiveSegment().segmentBaseSeq())
-	require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
-	corrupt, err := os.ReadFile(path + ".corrupt")
-	require.NoError(t, err)
-	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
-}
-
-// TestQwpSfRecoveryKeepsTornActiveWhenInstallRenameFails covers the last exit
-// from the swap. Once the torn file has been set aside, a failed install leaves
-// the committed active base empty unless the function puts something back --
-// and neither .corrupt nor .replacing ends in .sfa, so no later directory scan
-// would ever find those bytes again. The slot would be refused, quarantined or
-// marked failed, over a rename.
-//
-// Both preservation strategies are exercised: the hard link, where path is
-// never vacated at all, and the rename fallback for filesystems without links,
-// which has to roll its rename back.
-func TestQwpSfRecoveryKeepsTornActiveWhenInstallRenameFails(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		linkFails bool
-	}{
-		{name: "hard-link"},
-		{name: "rename-fallback", linkFails: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			const baseSeq int64 = 7
-			dir := t.TempDir()
-			active := createRecoverySegment(t, dir, "sf-active.sfa", baseSeq)
-			createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
-			closeRecoverySegments(t, active)
-			path := filepath.Join(dir, "sf-active.sfa")
-			f, err := os.OpenFile(path, os.O_WRONLY, 0)
-			require.NoError(t, err)
-			_, err = f.WriteAt([]byte{1}, qwpSfHeaderSize+20)
-			require.NoError(t, err)
-			require.NoError(t, f.Sync())
-			require.NoError(t, f.Close())
-
-			// Fail only the install rename, identified by its source: the
-			// fallback's move-aside and its rollback go through the same seam.
-			originalRename := qwpSfTornActiveRename.load()
-			qwpSfTornActiveRename.store(func(from, to string) error {
-				if strings.HasSuffix(from, qwpSfTornActiveTempSuffix) {
-					return syscall.EIO
-				}
-				return originalRename(from, to)
-			})
-			originalLink := qwpSfTornActiveLink.load()
-			if tc.linkFails {
-				qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
-			}
-			_, _, err = qwpSfRecoverRing(dir, 4096)
-			qwpSfTornActiveRename.store(originalRename)
-			qwpSfTornActiveLink.store(originalLink)
-			require.ErrorIs(t, err, syscall.EIO)
-
-			torn, err := os.ReadFile(path)
-			require.NoError(t, err)
-			require.Equal(t, byte(1), torn[qwpSfHeaderSize+20],
-				"the committed active base must still hold the torn segment")
-			_, err = os.Stat(path + ".corrupt")
-			require.True(t, os.IsNotExist(err), "a failed swap leaves no half-filed evidence")
-			_, err = os.Stat(path + qwpSfTornActiveTempSuffix)
-			require.True(t, os.IsNotExist(err), "the unused replacement must not be left behind")
-
-			// The next recovery simply tries again.
-			ring, _, err := qwpSfRecoverRing(dir, 4096)
-			require.NoError(t, err)
-			require.NotNil(t, ring)
-			defer ring.segmentRingClose()
-			require.Equal(t, baseSeq, ring.getActiveSegment().segmentBaseSeq())
-			require.Zero(t, ring.getActiveSegment().segmentTornTailBytes())
-			corrupt, err := os.ReadFile(path + ".corrupt")
-			require.NoError(t, err)
-			require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20], "quarantine must preserve the torn bytes")
-		})
-	}
-}
-
-// TestQwpSfRecoveryTornActiveMoveAsideFailure covers the exit taken when the
-// filesystem has no hard links AND the move-aside rename fails: nothing has
-// been touched yet, so the torn segment must still be at the committed active
-// base and the unused replacement must be gone.
-func TestQwpSfRecoveryTornActiveMoveAsideFailure(t *testing.T) {
-	const baseSeq int64 = 3
-	dir, path := tornActiveSlot(t, baseSeq)
-
-	originalLink := qwpSfTornActiveLink.load()
-	originalRename := qwpSfTornActiveRename.load()
-	// Restore through t.Cleanup: a fault inside qwpSfRecoverRing would
-	// otherwise leave both seams returning errors for the rest of the package
-	// run, failing every later recovery test for the wrong reason.
-	t.Cleanup(func() {
-		qwpSfTornActiveLink.store(originalLink)
-		qwpSfTornActiveRename.store(originalRename)
-	})
-	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
-	qwpSfTornActiveRename.store(func(from, to string) error {
-		if strings.HasSuffix(from, ".sfa") {
-			return syscall.EIO
-		}
-		return originalRename(from, to)
-	})
-	_, _, err := qwpSfRecoverRing(dir, 4096)
-	qwpSfTornActiveLink.store(originalLink)
-	qwpSfTornActiveRename.store(originalRename)
-	require.ErrorIs(t, err, syscall.EIO)
-
-	torn, err := os.ReadFile(path)
-	require.NoError(t, err)
-	require.Equal(t, byte(1), torn[qwpSfHeaderSize+20],
-		"the committed active base must still hold the torn segment")
-	_, err = os.Stat(path + qwpSfTornActiveTempSuffix)
-	require.True(t, os.IsNotExist(err), "the unused replacement must not be left behind")
-}
-
-// TestQwpSfRecoveryTornActiveRollbackFailure covers the one exit that cannot
-// put a file back at the committed active base: no hard links, the install
-// rename fails, and so does the rollback. The torn bytes survive under the
-// preserved name and the error has to say so, because the next recovery fails
-// closed on a missing active segment.
-func TestQwpSfRecoveryTornActiveRollbackFailure(t *testing.T) {
-	const baseSeq int64 = 3
-	dir, path := tornActiveSlot(t, baseSeq)
-
-	originalLink := qwpSfTornActiveLink.load()
-	originalRename := qwpSfTornActiveRename.load()
-	// Restore through t.Cleanup for the same reason as the sibling test above.
-	t.Cleanup(func() {
-		qwpSfTornActiveLink.store(originalLink)
-		qwpSfTornActiveRename.store(originalRename)
-	})
-	installErr := errors.New("injected replacement install failure")
-	rollbackErr := errors.New("injected torn-active rollback failure")
-	qwpSfTornActiveLink.store(func(string, string) error { return syscall.EPERM })
-	qwpSfTornActiveRename.store(func(from, to string) error {
-		// The move-aside is the only rename allowed through. A .sfa.replacing
-		// source is the install, which must fail; so must the rollback.
-		if strings.HasSuffix(from, ".sfa") {
-			return originalRename(from, to)
-		}
-		if strings.HasSuffix(from, qwpSfTornActiveTempSuffix) {
-			return installErr
-		}
-		return rollbackErr
-	})
-	_, _, err := qwpSfRecoverRing(dir, 4096)
-	qwpSfTornActiveLink.store(originalLink)
-	qwpSfTornActiveRename.store(originalRename)
-	require.ErrorIs(t, err, ErrSfDurability)
-	require.ErrorIs(t, err, installErr)
-	require.ErrorIs(t, err, rollbackErr)
-	require.Contains(t, err.Error(), "no file is left at the committed active base")
-
-	_, err = os.Stat(path)
-	require.True(t, os.IsNotExist(err), "the rollback failed, so nothing is at the active base")
-	corrupt, err := os.ReadFile(path + ".corrupt")
-	require.NoError(t, err)
-	require.Equal(t, byte(1), corrupt[qwpSfHeaderSize+20],
-		"the torn bytes must survive under the preserved name the error names")
-
-	// The committed boundaries decide what the next recovery makes of the
-	// emptied slot. Here head == active, so it committed no frames and the slot
-	// collapses to a fresh one; the preserved copy stays the record of the bytes.
-	ring, _, err := qwpSfRecoverRing(dir, 4096)
-	require.NoError(t, err)
-	if ring != nil {
-		ring.segmentRingClose()
-	}
-	_, err = os.Stat(path + ".corrupt")
-	require.NoError(t, err, "the preserved copy must survive the fresh start")
 }
 
 // tornActiveSlot builds a one-segment manifest-backed slot whose committed

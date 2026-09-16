@@ -669,6 +669,20 @@ example, a segment-manager worker that stops after an internal panic reports a
 terminal error; retrying the operation does not restart that worker. An error
 that matches neither sentinel is not, by that fact alone, necessarily terminal.
 
+#### Recovery and damaged tails
+
+After validating the saved queue's structure, recovery keeps the readable
+beginning of the active segment (the file that was being written) and zeroes
+its remaining damaged tail in place before accepting new writes. This also
+applies when no complete frame survives. Everything after the first unreadable
+frame is discarded, even if later bytes contain intact, unacknowledged rows.
+No evidence copy of that tail is kept. The valid prefix and required sealed
+segments remain intact. A local write or sync failure stops recovery for retry;
+it is not evidence that the slot is corrupt.
+
+This is not a general salvage policy: missing required segments or gaps in the
+saved queue still cause recovery to refuse the slot, as described below.
+
 #### Quarantined slots
 
 If a slot's on-disk state proves inconsistent, the sender does not delete it and
@@ -684,8 +698,10 @@ if qs, ok := sender.(qdb.QwpSender); ok {
 }
 ```
 
-An individual unreadable segment file is preserved the same way, renamed in
-place to `<name>.sfa.corrupt`. A background drainer moves nothing and leaves the
+An individual file excluded from a validated queue because its segment header
+is unreadable is preserved by renaming it in place to `<name>.sfa.corrupt`.
+This differs from an active segment with a readable header and a damaged tail:
+that tail is discarded under the recovery policy above. A background drainer moves nothing and leaves the
 bytes where they are. When it gives up on the slot itself — auth failure,
 durable-ack settle exhaustion, a wedged no-progress connection, a slot whose
 recovery proved inconsistent — it writes the reason to a `.failed` file inside

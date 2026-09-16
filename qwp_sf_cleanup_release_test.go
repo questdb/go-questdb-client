@@ -39,15 +39,16 @@ import (
 	"time"
 )
 
-func TestQwpSfReplacementReleaseFailureTransfersToEngine(t *testing.T) {
+func TestQwpSfAcquiredReleaseFailureTransfersToEngine(t *testing.T) {
 	e, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
 	<-e.manager.segmentManagerStop()
-	path := e.ring.getActiveSegment().path
+	segment, err := qwpSfCreateSegment(filepath.Join(e.sfDir, "sf-extra.sfa"), 77, 4096)
+	require.NoError(t, err)
 	var fail atomic.Bool
 	fail.Store(true)
 	var attempts atomic.Int32
-	injected := errors.New("replacement unmap unavailable")
+	injected := errors.New("acquired segment unmap unavailable")
 	hook := func(b []byte) error {
 		if len(b) >= 16 && binary.LittleEndian.Uint64(b[8:16]) == 77 {
 			attempts.Add(1)
@@ -64,20 +65,20 @@ func TestQwpSfReplacementReleaseFailureTransfersToEngine(t *testing.T) {
 		waitQwpSfEngineCleanup(t, e)
 		qwpSfTestMunmapHook.Store(nil)
 	})
-	_, err = qwpSfReplaceTornActive(path, 77, 4096)
+	err = qwpSfFailedAcquisition(errors.New("construction failed"), &qwpSfAcquiredResources{segments: []*qwpSfSegment{segment}})
 	require.ErrorIs(t, err, injected)
 	var held *qwpSfAcquisitionError
 	require.ErrorAs(t, err, &held)
 	e.acquired = held.resources
 	require.Equal(t, int32(1), attempts.Load(), "unwinding must not replay the failed release")
-	require.FileExists(t, path+qwpSfTornActiveTempSuffix)
+	require.False(t, segment.resourcesReleased())
 	require.ErrorIs(t, e.engineClose(), injected)
 	require.False(t, e.engineCloseCompleted())
 	fail.Store(false)
 	waitQwpSfEngineCleanup(t, e)
 	require.True(t, e.engineCloseCompleted())
 	require.NoError(t, e.engineClose())
-	require.NoFileExists(t, path+qwpSfTornActiveTempSuffix)
+	require.True(t, segment.resourcesReleased())
 }
 
 func TestQwpSfConsumedFileCloseErrorIsNotRetried(t *testing.T) {

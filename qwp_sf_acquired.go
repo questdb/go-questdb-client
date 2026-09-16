@@ -41,8 +41,6 @@ type qwpSfAcquiredResources struct {
 	manifests      []*qwpSfManifest
 	watermarks     []*qwpSfAckWatermark
 	mappingObjects []*qwpSfMappingObject
-	// Temporary replacement files that have not yet replaced a segment file.
-	temporaryPaths []string
 }
 
 // Windows creates a mapping handle before mapping the file into memory. If
@@ -53,10 +51,6 @@ type qwpSfMappingObject struct{ handle uintptr }
 func (m *qwpSfMappingObject) close() error { return qwpSfCloseMappingObject(m) }
 
 func (b *qwpSfAcquiredResources) released() bool {
-	return b == nil || (b.handlesReleased() && len(b.temporaryPaths) == 0)
-}
-
-func (b *qwpSfAcquiredResources) handlesReleased() bool {
 	if b == nil {
 		return true
 	}
@@ -112,16 +106,6 @@ func (b *qwpSfAcquiredResources) closeExcept(prior *qwpSfAcquiredResources) erro
 		}
 		err = errors.Join(err, qwpRunCleanupPhaseGuarded("mapping object", m.close))
 	}
-	if !errors.Is(err, ErrCleanupFailed) && b.handlesReleased() {
-		kept := b.temporaryPaths[:0]
-		for _, path := range b.temporaryPaths {
-			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				kept = append(kept, path)
-				err = errors.Join(err, removeErr)
-			}
-		}
-		b.temporaryPaths = kept
-	}
 	return err
 }
 func (b *qwpSfAcquiredResources) merge(other *qwpSfAcquiredResources) {
@@ -167,11 +151,6 @@ func (b *qwpSfAcquiredResources) merge(other *qwpSfAcquiredResources) {
 	for _, m := range other.mappingObjects {
 		if !slices.Contains(b.mappingObjects, m) {
 			b.mappingObjects = append(b.mappingObjects, m)
-		}
-	}
-	for _, path := range other.temporaryPaths {
-		if !slices.Contains(b.temporaryPaths, path) {
-			b.temporaryPaths = append(b.temporaryPaths, path)
 		}
 	}
 }
