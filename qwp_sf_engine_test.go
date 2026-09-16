@@ -374,11 +374,11 @@ func TestQwpSfEngineFullDrainBarrierFailureRetainsSlot(t *testing.T) {
 					name == qwpSfAckWatermarkFileName ||
 					name == qwpSfSymbolDictFileName {
 					_, statErr := os.Stat(filepath.Join(dir, name))
-					require.True(t, os.IsNotExist(statErr), "later Close retained drained file %s", name)
+					require.True(t, os.IsNotExist(statErr), "completed cleanup retained drained file %s", name)
 				}
 			}
 			lock, err := qwpSfAcquireSlotLock(dir)
-			require.NoError(t, err, "later Close must release the slot flock")
+			require.NoError(t, err, "the joined cleanup owner must have released the slot flock")
 			require.NoError(t, lock.close())
 		})
 	}
@@ -645,12 +645,10 @@ func TestQwpSfEngineBackpressureSurfacesMaintenanceFailure(t *testing.T) {
 	assert.NoError(t, e.managerEntry.entryMaintenanceError())
 }
 
-// TestQwpSfSwappableVarSurvivesConcurrentSwap pins the property the swappable
-// vars exist for. A test replacing one of these while a production goroutine
-// reads it is a data race on a plain var, and the goroutines that read them —
-// the close-retry owner above all — are ones a test has no way to join before
-// t.Cleanup puts the original back. Run under -race this fails the moment the
-// value stops going through an atomic.
+// Tests may restore a timeout while a cleanup worker is still reading it.
+// A plain variable would cause a data race, so reads and writes must be atomic.
+// This test checks concurrent reads and writes under the race detector, even
+// though other tests wait for their own workers to finish.
 func TestQwpSfSwappableVarSurvivesConcurrentSwap(t *testing.T) {
 	v := qwpSfSwappable(time.Second)
 	stop := make(chan struct{})
@@ -674,21 +672,8 @@ func TestQwpSfSwappableVarSurvivesConcurrentSwap(t *testing.T) {
 	require.Equal(t, 999*time.Millisecond, v.load())
 }
 
-// TestQwpSfEngineCloseRetryWaitsForManagerTeardown pins the ownership rule that
-// keeps a repeated Close from releasing the slot while the manager worker still
-// writes to it. engineCloseInternal publishes closed in its first line but only
-// deregisters the ring and stops the worker after it wins appendMu, so a Close
-// arriving inside that window would otherwise find an apparently closed engine
-// with no cleanup owner, take the claim, and unlink files and drop the flock
-// under a live worker that keeps minting segments into the same directory.
-//
-// The window is opened here the way a producer mid-rotation opens it: appendMu
-// is held while the first Close runs.
-
-// TestQwpSfManagerCloseWithoutStartIsQuiescent pins that a manager whose worker
-// was never launched reports quiescence at once. Waiting on m.done would burn
-// the whole close grace and then hand cleanup to a goroutine that will never
-// run it, leaving the engine with a deferred owner that never completes.
+// A manager whose worker never started has no worker to wait for. Waiting on
+// m.done in that case would prevent cleanup from ever releasing the slot.
 func TestQwpSfManagerCloseWithoutStartIsQuiescent(t *testing.T) {
 	m, err := qwpSfNewSegmentManager(4096, time.Second, qwpSfUnlimitedTotalBytes)
 	require.NoError(t, err)

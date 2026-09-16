@@ -462,9 +462,9 @@ func TestCloseStepRecoversPanic(t *testing.T) {
 	}
 }
 
-// TestQuestDBCloseIdempotentAndConcurrent pins the three documented Close
-// contracts: idempotent (a second Close is a no-op), safe under concurrent
-// callers (closeOnce), and every caller observes the identical latched result.
+// Concurrent Close calls wait for the same shutdown. Here all cleanup succeeds,
+// so every call returns nil. If cleanup is still running or has failed, later
+// calls may report additional errors.
 func TestQuestDBCloseIdempotentAndConcurrent(t *testing.T) {
 	ctx := context.Background()
 	srv := newQuestDBTestServer(t, nil)
@@ -481,22 +481,17 @@ func TestQuestDBCloseIdempotentAndConcurrent(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = db.Close(ctx) // -race proves closeOnce serialises teardown
+			errs[i] = db.Close(ctx)
 		}(i)
 	}
 	wg.Wait()
 
-	// closeOnce → every concurrent caller sees the same latched error.
 	for i, e := range errs {
-		if e != errs[0] {
-			t.Errorf("concurrent Close[%d]=%v, want identical to %v", i, e, errs[0])
+		if e != nil {
+			t.Errorf("clean concurrent Close[%d]=%v, want nil", i, e)
 		}
 	}
-	// A clean teardown latches no error.
-	if errs[0] != nil {
-		t.Errorf("clean teardown Close=%v, want nil", errs[0])
-	}
-	// A later Close stays a no-op and returns the same latched result.
+	// Another Close call still returns nil after successful cleanup.
 	if err := db.Close(ctx); err != nil {
 		t.Errorf("post-hoc Close=%v, want nil (idempotent)", err)
 	}

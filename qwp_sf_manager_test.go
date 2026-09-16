@@ -877,15 +877,13 @@ func TestQwpSfSpareProvisioningFailureSurfacesAsDurability(t *testing.T) {
 
 	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, 0)
 	require.NoError(t, err)
-	// The close has to run with the injected failure switched off. Otherwise
-	// every directory barrier still fails, engineFinishDrainedFileCleanup
-	// fails with it, the terminal-cleanup claim is released, no retry owner is
-	// installed, and the ring mappings and the slot flock leak for the rest of
-	// the binary while t.TempDir deletes the directory underneath them.
-	// (t.Cleanup is LIFO, so this runs before the hook is cleared either way.)
+	// Stop forcing storage errors so cleanup can finish the required directory
+	// syncs and release memory mappings and the lock before TempDir removes
+	// the files. Cleanup callbacks run in reverse order.
 	t.Cleanup(func() {
 		fail.Store(false)
 		_ = e.engineClose()
+		waitQwpSfEngineCleanup(t, e)
 	})
 
 	// Fail every barrier from here on. The manager keeps trying to mint a

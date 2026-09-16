@@ -857,6 +857,20 @@ func (t *qwpTransport) closeContext(ctx context.Context) error {
 	}
 }
 
+// Setup panicked, so we cannot assume the transport is safe to close. Keep it
+// reachable without trying to release it again. The code that opened it passes
+// it to the engine so the engine can report the unfinished cleanup.
+func (t *qwpTransport) retainFailure() {
+	t.closeOnce.Do(func() {
+		t.closeDone = make(chan struct{})
+		t.closeErr = fmt.Errorf("%w: transport setup panicked", ErrCleanupFailed)
+		qwpFailedTransports.Lock()
+		qwpFailedTransports.items = append(qwpFailedTransports.items, t)
+		qwpFailedTransports.Unlock()
+		close(t.closeDone)
+	})
+}
+
 // Fault-injection seam for release waits; nil in production.
 var qwpTestBeforeTransportClose atomic.Pointer[func(*qwpTransport)]
 

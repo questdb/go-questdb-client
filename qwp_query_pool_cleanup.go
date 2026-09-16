@@ -97,6 +97,14 @@ func (p *qwpQueryPool) closeResult() (<-chan struct{}, error) {
 	var changed <-chan struct{}
 	err := p.withLock(nil, func() {
 		result = errors.Join(p.closeErr, p.failedErr)
+		// A client can report a failure while other connections are still
+		// closing. Read its latest result so the pool also reports their
+		// errors. Do not call Close again or restart cleanup.
+		for w := range p.failedWorkers {
+			if w != nil && w.client != nil {
+				result = errors.Join(result, w.client.closeResult())
+			}
+		}
 		if !p.closed || len(p.all)+p.inFlightCreations+len(p.teardowns) != 0 {
 			result = errors.Join(result, ErrCleanupPending)
 		}

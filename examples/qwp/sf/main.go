@@ -23,13 +23,14 @@
  ******************************************************************************/
 
 // Demonstrates the QWP store-and-forward (SF) durability mode.
-// Outgoing batches are persisted to mmap'd disk segments before they
-// leave the wire; the I/O loop replays from disk transparently on
-// reconnect or process restart.
+// Batches queued for sending are kept in files so the client can resend them
+// after reconnecting or restarting. Rows not yet queued are not saved there.
+// Surviving a process restart does not imply protection against power loss.
 package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -37,7 +38,13 @@ import (
 )
 
 func main() {
-	ctx := context.TODO()
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() (resultErr error) {
+	ctx := context.Background()
 
 	// sf_dir is the SF group root — one or more sender instances can
 	// share it, each living under <sf_dir>/<sender_id>/.
@@ -46,7 +53,8 @@ func main() {
 	//   sf_max_total_bytes : disk cap for THIS sender's slot (default 10 GiB)
 	//   close_flush_timeout_millis : how long Close() waits for ACKs
 	//                                before proceeding (default 5000;
-	//                                0 / -1 → fast close, leave on disk)
+	//                                0 / -1 skips waiting for confirmation,
+	//                                but still queues completed rows)
 	//   drain_orphans      : opt in to draining sibling slots left behind
 	//                        by other senders that crashed
 	conf := "ws::addr=localhost:9000;" +
@@ -58,32 +66,35 @@ func main() {
 		"drain_orphans=on;"
 	sender, err := qdb.LineSenderFromConf(ctx, conf)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer func() {
-		// Close() drains the engine, waiting up to
-		// close_flush_timeout_millis for the server to ACK every
-		// frame. Anything still on disk will be replayed by the next
-		// process to start with the same sf_dir + sender_id.
-		//
-		// Close() can return before the slot lock is released: if the
-		// segment manager is still busy, a background goroutine
-		// finishes the release and keeps retrying until it works. So a
-		// shutdown that has to know the slot is free asks the sender
-		// rather than reading Close's result. Those retries have no
-		// deadline, hence the time bound below: this process should not
-		// hang on a disk that may never come back.
-		if err := sender.Close(ctx); err != nil {
-			log.Printf("sender close: %v", err)
+		// Close queues completed rows, then waits for server confirmation.
+		// Queued data not yet confirmed stays in the SF files for recovery.
+		// This context limits our wait, not the cleanup itself. Do not call
+		// Close again on this standalone sender if the wait times out.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err := sender.Close(closeCtx)
+		resultErr = errors.Join(resultErr, err)
+		if errors.Is(err, qdb.ErrCleanupFailed) {
+			log.Print("cleanup failed internally; resources may stay held until process exit")
+			return
 		}
+		// The cleanup worker retries ordinary release errors. This check only
+		// tells us whether this sender's directory lock has been released.
+		// It does not confirm delivery, completion of work on other senders'
+		// saved data, or successful cleanup of every resource.
 		if qs, ok := sender.(qdb.QwpSender); ok {
-			deadline := time.Now().Add(30 * time.Second)
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
 			for !qs.SlotLockReleased() {
-				if !time.Now().Before(deadline) {
-					log.Printf("sender close: slot lock still held at shutdown")
+				select {
+				case <-closeCtx.Done():
+					resultErr = errors.Join(resultErr, qdb.ErrSfCleanupPending, closeCtx.Err())
 					return
+				case <-ticker.C:
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
 		}
 	}()
@@ -98,13 +109,11 @@ func main() {
 			Float64Column("amount", 0.00044).
 			At(ctx, tradedTs)
 		if err != nil {
-			// In SF mode, At() can block briefly on disk-full
-			// backpressure when sf_max_total_bytes is reached and
-			// the wire path hasn't drained the cap. The error here
-			// surfaces the deadline expiry — investigate the wire
-			// path (server reachability, server slow, etc.) rather
-			// than retrying tighter.
-			log.Fatal(err)
+			// Writing can fail because buffers are full, local storage failed,
+			// or a previous error stopped the sender. Check before retrying:
+			// a failed flush may already have queued some completed rows.
+			return err
 		}
 	}
+	return nil
 }

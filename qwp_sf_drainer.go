@@ -96,13 +96,9 @@ type QwpBackgroundDrainerListener struct {
 	OnPrimaryUnavailable func(dir string, attempt int)
 }
 
-// qwpDrainerListenerCall invokes a user-supplied background-drainer callback
-// behind a panic guard (drop + log), matching the isolation the other three
-// listeners get for free via qwpDispatcher.deliver. Without it a panic in user
-// code unwinds into the drainer's send-loop / drainerRun goroutine, whose
-// top-level recover turns it into a terminal failure that quarantines an
-// otherwise-recoverable slot (a .failed sentinel) — an availability regression
-// driven purely by a user-code fault. fn is nil-safe.
+// qwpDrainerListenerCall catches a panic from the callback. Notifications run
+// on a separate worker and are not part of resource cleanup. A callback panic
+// must not mark a slot as failed or change who cleans it up. Nil does nothing.
 func qwpDrainerListenerCall(logger *slog.Logger, fn func()) {
 	if fn == nil {
 		return
@@ -134,16 +130,14 @@ const qwpSfDurableStallFactor = 4
 // watchdog so a small reconnect_max_duration_millis (set to fail the blocking
 // initial connect fast) cannot also shrink the watchdog and quarantine a
 // healthy-but-slow adopted slot. Durable mode scales it by qwpSfDurableStallFactor.
-// Swappable only so tests can lower it to keep the watchdog fast; drainer
-// goroutines no test can join read it.
+// Tests can shorten this timeout. Reads and writes are atomic because a drainer
+// may still read it while a test restores the original value.
 var qwpSfMinNoProgressBudget = qwpSfSwappable(30 * time.Second)
 
-// qwpSfDrainerPoolCloseGrace bounds how long the pool's close()
-// waits for active drainers to exit cleanly before cancelling the
-// pool's master ctx to forcibly unwind blocking dials. Mirrors the
-// Java 3-second grace. Swappable so package tests can dial it down
-// without paying the full 3 s; drainer goroutines no test can join
-// read it.
+// qwpSfDrainerPoolCloseGrace is how long close() waits for active drainers to
+// stop before cancelling their shared context to interrupt connection attempts.
+// The default is three seconds, matching Java. Tests can shorten it; atomic
+// reads and writes let them change it safely while drainers are running.
 var qwpSfDrainerPoolCloseGrace = qwpSfSwappable(3 * time.Second)
 
 // qwpSfDrainerPoolHardCloseGrace limits the second wait, after the pool cancels
@@ -498,7 +492,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		tracker = newQwpHostTracker(1, "", qwpTargetAny)
 	}
 	result := qwpSfRunRoundWalk(connectCtx, d.stopCh, qwpSfRoundWalkParams{
-		Factory:                 d.clientFactory,
+		Factory:                 engine.trackConnectCleanup(d.clientFactory),
 		Tracker:                 tracker,
 		MaxDuration:             0,
 		InitialBackoff:          initialBackoff,

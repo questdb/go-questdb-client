@@ -76,16 +76,18 @@ func TestQwpSfCleanupObserversNeverDriveRetries(t *testing.T) {
 		t.Fatal("owned retry did not start")
 	}
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
+	results := make([]error, 32)
+	for i := range results {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			if !errors.Is(e.engineClose(), injected) {
-				t.Error("observer lost pending error")
-			}
-		}()
+			results[i] = e.engineClose()
+		}(i)
 	}
 	wg.Wait()
+	for _, result := range results {
+		require.ErrorIs(t, result, injected, "observer lost pending error")
+	}
 	require.Equal(t, int32(2), calls.Load(), "observers must not enter physical cleanup")
 	require.False(t, e.engineCloseCompleted())
 	lock, err := qwpSfAcquireSlotLock(e.sfDir)

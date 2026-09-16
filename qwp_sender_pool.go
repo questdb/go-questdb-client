@@ -44,13 +44,13 @@ import (
 // for the caller's lifetime; Close returns it. It keeps minSize warm, grows to
 // maxSize on demand, and reaps idle/over-age slots back to minSize.
 //
-// Store-and-forward (sf_dir set) is supported with one twist: each slot
-// gets a distinct sender_id <base>-<index> so concurrent senders never
-// collide on a slot dir (Hazard A), and every pooled sender fences the
-// pool's whole in-range slot set out of orphan adoption so a live sibling is
-// never drained (Hazard G). Crash-stranded in-range slots are recovered by
-// binding a normal async sender to each at construction (the Go sender
-// self-recovers its dir) — no dedicated recoverer, build never blocks.
+// With store-and-forward enabled (sf_dir set), each slot gets a separate
+// sender_id, <base>-<index>, so senders cannot use the same directory (Hazard A).
+// Background drainers must skip all of the pool's reserved directories, since
+// another pooled sender may be using them (Hazard G). At startup, each reserved
+// directory left by a crash gets its own sender, which recovers it and connects
+// in the background. Opening local files and creating the pool's initial
+// connections can still make construction wait.
 //
 // Leases are generation-stamped: a stale handle from a returned-then-reborrowed
 // slot cannot write into or double-return a different borrow (Hazard B).
@@ -76,9 +76,9 @@ type qwpSenderPool struct {
 	closeStarted      bool
 	closeDone         chan struct{}
 	failureDone       chan struct{}
-	// closing is set before the housekeeper is stopped so an about-to-start reap
-	// bails immediately instead of racing teardown. Distinct from closed, which
-	// close() sets after the housekeeper has joined.
+	// Set closing before stopping the housekeeper, so it cannot start removing
+	// idle senders during shutdown. close() sets closed when pool shutdown
+	// starts. QuestDB.Close waits separately for the housekeeper to exit.
 	closing atomic.Bool
 
 	baseConf           string
@@ -345,9 +345,9 @@ func (p *qwpSenderPool) recoverStrandedSlots(ctx context.Context) {
 	}
 }
 
-// borrow leases a sender, blocking up to acquireTimeout (or ctx) when the pool
-// is at capacity. The returned LineSender must be Close()d to return it; the
-// real disconnect happens only at pool close.
+// borrow waits up to acquireTimeout, or until ctx ends, if the pool is full.
+// Call Close on the returned sender to give it back. The pool handles resource
+// cleanup when it removes a sender or shuts down.
 func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 	deadline := time.Now().Add(p.acquireTimeout)
 	for {
@@ -653,9 +653,9 @@ func (p *qwpSenderPool) reapIdle() {
 	if len(toClose) == 0 {
 		return
 	}
-	// Close concurrently so an N-slot sweep during an outage is bounded by one
-	// close_flush_timeout, not N — otherwise it overruns the housekeeper join
-	// budget and the reap outlives QuestDB.Close, holding SF flocks past return.
+	// Start closing all these slots without waiting for one to finish first.
+	// QuestDB.Close tracks each slot's cleanup and waits for the housekeeper
+	// to exit. The timeout for server confirmation does not limit total cleanup.
 	var wg sync.WaitGroup
 	errs := make([]error, len(toClose))
 	for i, slot := range toClose {
@@ -953,10 +953,27 @@ func (p *qwpSenderPool) currentCloseResult() error {
 			teardownErr = errors.Join(teardownErr, ErrCleanupPending)
 		}
 		for _, slot := range p.retiredSlots {
+			if slot.cleanupFailed {
+				continue
+			}
 			if reporter, ok := slot.cleanup.(interface{ cleanupResult() error }); ok {
 				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
 			} else {
 				teardownErr = errors.Join(teardownErr, p.slotCleanupFailureGuardedLocked(slot))
+			}
+		}
+		// A failed slot may still have other resources being released. Read
+		// results only from these known types, whose methods do not perform
+		// cleanup. Do not repeat a check that panicked or call Close again on
+		// a sender whose state may be partly changed.
+		for _, slot := range p.failedSlots {
+			switch reporter := slot.cleanup.(type) {
+			case *qwpLineSender:
+				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
+			case *qwpSfBuildCleanupError:
+				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
+			case *qwpSenderBuildCleanupError:
+				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
 			}
 		}
 		result = qwpPoolCloseResult(teardownErr, p.poisonedErr, pending)

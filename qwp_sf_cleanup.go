@@ -157,6 +157,7 @@ func (e *qwpSfCursorEngine) engineCleanupWorker(cause error) {
 		}
 	}
 	<-managerDone
+	cause = e.closeRejectedTransports(cause)
 	// A manager panic may have interrupted opening or removing a segment.
 	// Keep its resources: we cannot safely retry a partly completed operation.
 	if err := e.manager.managerWorkerError(); err != nil {

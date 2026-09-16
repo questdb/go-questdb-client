@@ -1824,9 +1824,9 @@ func TestQwpQueryOwnerClosesAfterCancelledIteration(t *testing.T) {
 	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		// Query 1: send one batch, then block until CANCEL arrives so
-		// the iterator stays parked in takeEvent while the test
-		// invokes Close concurrently.
+		// Send one batch, then wait for CANCEL. This keeps the result-reading
+		// goroutine waiting until the test cancels the query. Close runs only
+		// after that goroutine has stopped reading.
 		req1 := m.readBinary(ctx)
 		reqID1, _, _ := parseQueryRequest(t, req1)
 		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID1, 0, "v", 7))

@@ -256,7 +256,14 @@ type qwpSfCursorEngine struct {
 	// Its mutex is not held while taking appendMu, waiting for the manager,
 	// or doing file or memory-mapping operations.
 	cleanup qwpSfCleanupControl
-	reader  atomic.Pointer[qwpSfSendLoop]
+
+	// A failed connection attempt can return before its connection is closed.
+	// Construction code, then the send loop, updates these fields. Cleanup
+	// reads them only after that work stops. These references keep connections
+	// reachable; SF capacity is tracked separately.
+	rejectedTransports   []*qwpTransport
+	rejectedTransportErr error
+	reader               atomic.Pointer[qwpSfSendLoop]
 	// Files and mappings opened before construction failed, but not yet
 	// stored in the ring.
 	looseSegments []*qwpSfSegment

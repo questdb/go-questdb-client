@@ -38,8 +38,9 @@
 //   - A QuestDB server listening on 9000 (HTTP/WS) and 8812 (PG wire).
 //
 // Tune the workload via flags:
-//   -rows N           row count to ingest (default 10_000_000)
-//   -skip-populate    re-use the existing table (default false)
+//
+//	-rows N           row count to ingest (default 10_000_000)
+//	-skip-populate    re-use the existing table (default false)
 package main
 
 import (
@@ -140,6 +141,14 @@ func mustOK(err error) {
 	}
 }
 
+// Close after reading the results, without including cleanup in the timing.
+// If the wait times out, the client still handles cleanup. Keep any close error.
+func closeQwp(closeClient func(context.Context) error, resultErr *error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	*resultErr = errors.Join(*resultErr, closeClient(ctx))
+}
+
 func printRow(label string, r result) {
 	secs := r.elapsed.Seconds()
 	rowsPerSec := float64(r.rows) / secs
@@ -156,7 +165,7 @@ func pgConnString() string {
 	return fmt.Sprintf("postgres://admin:quest@%s:%d/qdb?sslmode=disable", host, pgPort)
 }
 
-func recreateTable(ctx context.Context) error {
+func recreateTable(ctx context.Context) (resultErr error) {
 	// DDL goes through the QWP query channel (Exec) so the bench does
 	// not need a working PG connection just to set up the table — the
 	// PG run later will fail loudly if the wire is unreachable, but
@@ -165,7 +174,7 @@ func recreateTable(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("recreateTable: connect: %w", err)
 	}
-	defer c.Close(ctx)
+	defer closeQwp(c.Close, &resultErr)
 
 	if _, err := c.Exec(ctx, "DROP TABLE IF EXISTS '"+tableName+"'"); err != nil {
 		return fmt.Errorf("recreateTable: drop: %w", err)
@@ -179,7 +188,7 @@ func recreateTable(ctx context.Context) error {
 	return nil
 }
 
-func ingestRows(ctx context.Context) error {
+func ingestRows(ctx context.Context) (resultErr error) {
 	fmt.Printf("Ingesting %d rows over QWP/WebSocket...\n", rowCount)
 	start := time.Now()
 	symbols := []string{"AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "NFLX"}
@@ -189,10 +198,10 @@ func ingestRows(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("ingest: open sender: %w", err)
 	}
-	defer sender.Close(ctx)
+	defer closeQwp(sender.Close, &resultErr)
 
 	for i := int64(1); i <= rowCount; i++ {
-		// ILP requires all Symbol calls before any non-symbol column setters.
+		// Call Symbol before setting any other columns.
 		if err := sender.Table(tableName).
 			Symbol("sym", symbols[i%int64(len(symbols))]).
 			Int64Column("id", i).
@@ -213,12 +222,12 @@ func ingestRows(ctx context.Context) error {
 	return waitForWalApply(ctx)
 }
 
-func waitForWalApply(ctx context.Context) error {
+func waitForWalApply(ctx context.Context) (resultErr error) {
 	c, err := qdb.NewQwpQueryClient(ctx, qdb.WithQwpQueryAddress(fmt.Sprintf("%s:%d", host, httpPort)))
 	if err != nil {
 		return fmt.Errorf("wait: connect: %w", err)
 	}
-	defer c.Close(ctx)
+	defer closeQwp(c.Close, &resultErr)
 
 	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
@@ -254,7 +263,7 @@ func selectCount(ctx context.Context, c *qdb.QwpQueryClient) (int64, error) {
 // QWP egress
 // ------------------------------------------------------------------
 
-func runQwp(ctx context.Context, warmup bool) (result, error) {
+func runQwp(ctx context.Context, warmup bool) (out result, resultErr error) {
 	var rowsSeen, bytesSeen, checksum int64
 	start := time.Now()
 
@@ -266,7 +275,7 @@ func runQwp(ctx context.Context, warmup bool) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	defer c.Close(ctx)
+	defer closeQwp(c.Close, &resultErr)
 
 	q := c.Query(ctx, "SELECT ts, id, price, sym, note FROM "+tableName)
 	defer q.Close()

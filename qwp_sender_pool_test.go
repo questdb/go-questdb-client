@@ -1177,8 +1177,8 @@ func TestQwpSenderQuarantinedSlotPathStandalone(t *testing.T) {
 // buggy user slog handler cannot turn close() into a no-op. The leak warning
 // fires after the available slots are already out of p.all and in closing, so
 // a panic there would skip every teardown -- leaving each
-// flock held with no retry owner and no retired slot to re-probe, while later
-// close() calls happily report success.
+// directory locked with no cleanup being tracked, while later close() calls
+// incorrectly report success.
 func TestQwpSenderPoolCloseSurvivesPanickingLoggerAndReleasesSlots(t *testing.T) {
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)
@@ -1443,11 +1443,10 @@ func TestQwpSenderPoolFlushSurfacesLatchedError(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolSfBrokenSlotReclaimed covers discardLocked's SF branch via
-// the giveBack-broken path: a lease broken by a genuine terminal HALT has its
-// on-disk slot index reclaimed (not leaked) and reused. The break must be a real
-// terminal error now that a benign validation latch no longer marks the slot
-// broken.
+// TestQwpSenderPoolSfBrokenSlotReclaimed checks that returning a sender stopped
+// by a real terminal HALT lets the pool clean up and reuse its disk slot,
+// rather than permanently lose that slot. Use an error that stops background
+// sending: a row-validation error alone does not mark the sender as broken.
 func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 	srv, poison := poisonFirstConnQwpServer(t)
 	t.Cleanup(srv.Close)
@@ -1476,7 +1475,7 @@ func TestQwpSenderPoolSfBrokenSlotReclaimed(t *testing.T) {
 		t.Fatal("terminal HALT did not mark the slot broken")
 	}
 
-	_ = s.Close(ctx) // broken → discardLocked reclaims the SF slot index
+	_ = s.Close(ctx) // return the broken sender so the pool can clean it up
 	if _, _, leaked := p.poolSnapshot(); leaked != 0 {
 		t.Errorf("broken SF slot leaked: %d", leaked)
 	}
@@ -2235,10 +2234,9 @@ func TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock(t *testing.T) {
 	close(release)
 	released = true
 
-	// Wait for the deferred cleanup to finish before the test returns.
-	// t.TempDir's RemoveAll otherwise races the retry owner, which is still
-	// unmapping and unlinking inside the slot -- on Linux that surfaces as an
-	// unlinkat failure in the cleanup rather than as anything about this test.
+	// Wait for cleanup before returning. Otherwise t.TempDir may remove files
+	// while the cleanup worker is still releasing memory mappings and deleting
+	// files in the same directory. On Linux this can cause unlinkat failures.
 	// The condition runs on testify's polling goroutine, where t.FailNow is
 	// invalid -- it calls runtime.Goexit, the condition never returns, and the
 	// real error is replaced by a timeout. Collect the close error and assert
@@ -2347,13 +2345,10 @@ type panicOnProbeSlot struct{}
 
 func (panicOnProbeSlot) closeCompleted() bool { panic("probe boom") }
 
-// TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved pins that a panic
-// during a pooled build does not put the slot index back into circulation
-// while the engine it left behind still holds that directory's flock. The
-// build guard installs a retry owner, but the pool's recover sees only an
-// error — freeing the index lets a later borrow re-pick it and fail to open a
-// slot this process is still holding, which is the reservation bitmap's whole
-// purpose.
+// If sender construction panics, the pool must not reuse its slot while the
+// directory is still locked. The construction code catches the panic, starts
+// cleanup, and lets the pool check its progress. sfSlots must keep the slot
+// reserved until cleanup releases the lock.
 func TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved(t *testing.T) {
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)
@@ -2409,7 +2404,7 @@ func TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved(t *testing.T) {
 	state := p.sfSlots[0].state
 	p.mu.Unlock()
 	require.Equal(t, qwpSfSlotRetired, state,
-		"the slot must stay retired while the engine's retry owner holds its flock")
+		"the slot must stay retired while its cleanup owner holds the flock")
 
 	close(release)
 	released = true
@@ -2421,13 +2416,10 @@ func TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond, "the index must come back once cleanup finishes")
 }
 
-// TestQwpSenderPoolPanicAfterSenderBuiltKeepsSlotReserved covers the other two
-// construction unwind paths. The reporter used to be carried out only when the
-// sender did not exist yet, so a fault after it was built — or inside the
-// orphan setup, whose own defer ran first — still reached the pool as a bare
-// panic. The pool then freed the slot index while the retry owner held that
-// directory's flock, which is the collision the reservation bitmap exists to
-// prevent.
+// A panic after the sender exists must still give the pool a way to check all
+// cleanup, including any background draining accepted during setup. Reporting
+// only the panic used to let the pool forget this work and reuse a locked slot.
+// Keep the slot reserved in sfSlots until cleanup releases the directory lock.
 func TestQwpSenderPoolPanicAfterSenderBuiltKeepsSlotReserved(t *testing.T) {
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)

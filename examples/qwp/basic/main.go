@@ -25,15 +25,16 @@
 // Demonstrates the minimum correct QWP (WebSocket) ingestion idiom for a
 // single-host application without failover.
 //
-// QWP ingestion is asynchronous: the error returned by At/AtNow/Flush is the
-// local, latched error (bad value, buffer state, backpressure). Server-side
-// rejections (schema mismatch, parse error, ...) arrive out of band on the
-// SenderErrorHandler, NOT from the Flush that sent the data. Registering a
-// handler is therefore part of the baseline idiom, not an advanced option.
+// QWP sends data in the background. A successful Flush queues data for sending;
+// it does not confirm that the server accepted it. Calls that write or flush rows
+// can report local errors or a saved error that stopped background sending.
+// The error handler also reports server rejections, including those the client
+// will retry.
 package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -41,7 +42,13 @@ import (
 )
 
 func main() {
-	ctx := context.TODO()
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() (resultErr error) {
+	ctx := context.Background()
 
 	// WithQwp() selects the QWP binary protocol over a plain WebSocket
 	// (use qdb.WithTls() for wss). A LineSender is not safe for
@@ -50,24 +57,26 @@ func main() {
 		qdb.WithQwp(),
 		qdb.WithAddress("localhost:9000"),
 		qdb.WithErrorHandler(func(e *qdb.SenderError) {
-			// Alert / record metrics here; this runs on a dedicated
-			// goroutine, never the producer goroutine. Retriable
-			// rejections are informational — the sender reconnects
-			// and replays them automatically; terminal ones latch
-			// and surface on the next producer call.
+			// Log or record metrics here; this callback runs on a separate
+			// goroutine. The sender reconnects and resends after retriable
+			// rejections. Errors that stop sending are saved for later calls
+			// to report, as described in each method's docs. Notify the code
+			// using the sender; do not use or close the sender here.
 			log.Printf("server rejected fsn=[%d,%d] table=%s category=%s: %s",
 				e.FromFsn, e.ToFsn, e.TableName, e.Category, e.ServerMessage)
 		}),
 	)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer func() {
-		// Close flushes and drains, but a failed close can mean
-		// unacked data was not delivered. Always check it.
-		if err := sender.Close(ctx); err != nil {
-			log.Fatal(err)
-		}
+		// Close queues completed rows, then waits for server confirmation
+		// using the configured close-flush timeout. This context limits how
+		// long we wait for Close, but cleanup still belongs to the sender.
+		// Do not call Close again on this standalone sender after a timeout.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resultErr = errors.Join(resultErr, sender.Close(closeCtx))
 	}()
 
 	tradedTs, _ := time.Parse(time.RFC3339, "2022-08-06T15:04:05.123456Z")
@@ -82,7 +91,7 @@ func main() {
 			Float64Column("amount", 0.00044).
 			At(ctx, tradedTs)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 	}
 
@@ -91,7 +100,5 @@ func main() {
 	// server ACK (rejections arrive on the handler above). Batch many
 	// rows per Flush rather than flushing per row. For server-ack
 	// confirmation, use FlushAndGetSequence paired with AwaitAckedFsn.
-	if err := sender.Flush(ctx); err != nil {
-		log.Fatal(err)
-	}
+	return sender.Flush(ctx)
 }

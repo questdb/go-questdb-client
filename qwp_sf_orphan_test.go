@@ -715,11 +715,10 @@ func TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime(t *testing.T) {
 	assert.Empty(t, pool.drainerPoolSnapshot())
 }
 
-// Regression: a drainer parked inside clientFactory(ctx) — e.g. a
-// long-running TCP dial / WS upgrade against a black-holed peer —
-// must not survive past drainerPoolClose. The pool cancels its
-// master ctx after the polite-stop grace; the dial unwinds; the
-// drainer goroutine exits.
+// This test's connection attempt waits until its context is cancelled, like a
+// connection to an unresponsive server. Closing the drainer pool cancels that
+// context after the first wait. The attempt then returns and cleanup finishes
+// within the time allowed by this test.
 func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
 	prevGrace := qwpSfDrainerPoolCloseGrace.load()
 	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
@@ -781,13 +780,11 @@ func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
 	assert.Empty(t, pool.drainerPoolSnapshot())
 }
 
-// TestQwpSfDrainerPoolBoundedOnUncancellableDrainer is a regression
-// test for M15: a drainer wedged in I/O the master-ctx cancel cannot
-// reach — modelled here by a clientFactory that ignores its ctx, the
-// way drainerRun's engine-open flock / mmap / CRC scan does — must
-// not make drainerPoolClose hang forever. After the polite grace and
-// the post-cancel hard grace both elapse, close abandons the
-// straggler and returns; the slot stays adoptable.
+// Regression test for M15: drainerPoolClose must return even if a worker ignores
+// cancellation. The test's connection factory blocks like a file operation or
+// recovery scan that cannot be cancelled. After both close waits expire, the
+// pool stops waiting but keeps track of the worker and its locked directory
+// until cleanup finishes.
 func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
 	prevGrace := qwpSfDrainerPoolCloseGrace.load()
 	prevHard := qwpSfDrainerPoolHardCloseGrace.load()
@@ -808,7 +805,6 @@ func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
 	// A factory that ignores its ctx stands in for a drainer wedged in
 	// I/O the master-ctx cancel cannot interrupt.
 	block := make(chan struct{})
-	defer close(block) // release at test end so the goroutine unwinds
 	entered := make(chan struct{}, 1)
 	wedgeFactory := func(_ context.Context, _ int) (*qwpTransport, error) {
 		select {
@@ -826,6 +822,12 @@ func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
 		nil,
 		time.Second, 10*time.Millisecond, 100*time.Millisecond,
 	)
+	defer func() {
+		close(block)
+		pool.drainerPoolClose()
+		require.Eventually(t, pool.cleanupCompleted, 5*time.Second, time.Millisecond,
+			"join cleanup before TempDir removes the retained slot")
+	}()
 	require.NoError(t, pool.drainerPoolSubmit(context.Background(), drainer))
 
 	select {
@@ -845,14 +847,18 @@ func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
 		t.Fatal("drainerPoolClose hung on an un-cancellable drainer")
 	}
 
-	// Abandoned, not joined: the goroutine is still parked in the
-	// factory, so it is still tracked and still Pending. Its slot is
-	// left intact (no .failed sentinel) for a future sender to adopt.
+	// Close returned, but the worker is still blocked while trying to connect.
+	// The directory is still locked, even though it has no .failed file.
 	assert.NotEmpty(t, pool.drainerPoolSnapshot(),
-		"wedged drainer must still be tracked (abandoned, not joined)")
+		"wedged drainer must remain tracked until actual cleanup")
+	lock, lockErr := qwpSfAcquireSlotLock(dir)
+	if lockErr == nil {
+		_ = lock.close()
+	}
+	assert.ErrorIs(t, lockErr, qwpSfErrLockBusy)
 	assert.Equal(t, qwpSfDrainOutcomePending, drainer.drainerOutcome())
 	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
-	assert.True(t, os.IsNotExist(statErr), "must not quarantine an abandoned slot")
+	assert.True(t, os.IsNotExist(statErr), "a timed-out observation must not quarantine the retained slot")
 }
 
 func TestQwpSfDrainerPoolRejectsAfterClose(t *testing.T) {

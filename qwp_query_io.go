@@ -1223,15 +1223,11 @@ func (io *qwpEgressIO) sendCredit(requestId, additionalBytes int64) error {
 // channel's bufferPoolSize+2 capacity guarantees non-batch events always
 // fit in the steady state, so the select hits the fast path.
 //
-// If shutdown wins the race, the event is silently dropped. This is
-// acceptable because shutdown is always user-initiated (Close /
-// QwpQuery.Close): any QUERY_ERROR or synthesized error that arrives in
-// the same instant is for a query the caller is no longer waiting on,
-// and after Close returns takeEvent reports "I/O goroutine terminated"
-// rather than the lost event. Connection-state poisoning (via
-// poisonAndEmitError → setIoErr) is independent of the emit and is
-// preserved across the drop, so a follow-up submitQuery on the same
-// client still surfaces the underlying failure.
+// If shutdown happens first, the event is dropped. Shutdown also wakes the
+// waiting consumer, which can report that I/O stopped without receiving this
+// event. Cleanup or reconnect can stop a connection, not just a user Close.
+// The error saved by poisonAndEmitError through setIoErr is kept even when
+// the event is dropped, so a later submitQuery still reports that failure.
 func (io *qwpEgressIO) emit(ev qwpEvent) {
 	select {
 	case io.events <- ev:

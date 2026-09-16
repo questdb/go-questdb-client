@@ -216,6 +216,10 @@ type QwpSender interface {
 	// store-and-forward slot this sender refused at startup, or "" when
 	// it opened a slot it could read (and always in memory mode).
 	//
+	// For a borrowed sender, save this path before calling Close to return
+	// the sender to the pool. Afterwards, this method always returns "",
+	// even if the client set aside a damaged slot in quarantined/.
+	//
 	// A slot whose recovery proves it inconsistent is preserved whole
 	// under <sf_dir>/quarantined/<sender_id>-<nanos>/ and the sender
 	// starts fresh, so ingestion continues while the unsent rows stay on
@@ -288,19 +292,14 @@ type QwpBackgroundDrainer struct {
 	// LastError is the most recent error message the drainer
 	// recorded, or "" if no error has been recorded.
 	LastError string
-	// Failed is true if the drainer ended in the FAILED outcome — it
-	// gave up on this slot for this run (auth failure, durable-ack
-	// settle exhaustion, a wedged no-progress connection, a slot whose
-	// recovery proved inconsistent, a panic).
-	//
-	// It does not by itself mean the slot is out of service. Those
-	// give-ups drop a permanent .failed sentinel that disqualifies the
-	// slot from every later adoption, but a local I/O fault while
-	// opening it — a full disk, an exhausted fd table, a mount that went
-	// away — fails the run without one: the fault says nothing about the
-	// slot's bytes, so the data and the eligibility both survive and the
-	// next foreground scan adopts the slot again. The presence of the
-	// sentinel file in Dir is what tells the two apart.
+	// Failed is true if this drain attempt ended unsuccessfully. This alone
+	// does not mean the data is corrupt or the slot is safe to reuse.
+	// The client may leave a .failed file when its error policy stops draining
+	// or recovery finds inconsistent data. Later runs skip slots with this file.
+	// Ordinary file I/O errors while opening a slot do not prevent later
+	// recovery attempts. After an internal panic, the client keeps resources
+	// it cannot safely release, without marking the data corrupt. A missing
+	// .failed file does not mean the resources have been released.
 	Failed bool
 }
 
@@ -521,7 +520,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 		return nil, err
 	}
 	factory := qwpSfBuildReconnectFactory(address, opts, dumpWriter)
-	transport, err := factory(ctx, 0)
+	transport, err := engine.trackConnectCleanup(factory)(ctx, 0)
 	if err != nil {
 		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err)
 	}

@@ -31,7 +31,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"net"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -102,7 +101,9 @@ const qwpSfDefaultMaxFrameRejections = 4
 // the host index PickNext returned (see failover.md §2); the
 // factory owns the mapping idx → URL, auth headers, and TLS config.
 // Single-host factories may ignore idx — they always dial the same
-// address.
+// address. If an error comes with a non-nil transport, that transport still
+// needs cleanup; it must not be used to send data. The engine keeps track of
+// it until its close worker finishes.
 //
 // Implementations should return immediately on terminal errors
 // (auth rejection, version mismatch) and let transient errors
@@ -478,7 +479,7 @@ func qwpSfNewSendLoop(
 	l := &qwpSfSendLoop{
 		engine:                  engine,
 		parkInterval:            parkInterval,
-		reconnectFactory:        factory,
+		reconnectFactory:        engine.trackConnectCleanup(factory),
 		reconnectMaxDuration:    reconnectMaxDuration,
 		reconnectInitialBackoff: reconnectInitialBackoff,
 		reconnectMaxBackoff:     reconnectMaxBackoff,
@@ -714,15 +715,32 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 	// caller. A late worker keeps both mappings and slot owned until it exits.
 	l.wg.Wait()
 	if t := l.transport.Swap(nil); t != nil {
-		if err := t.close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			l.transportCloseError.Store(&err)
-		}
+		l.recordTransportCloseError(t.close())
 	}
 	l.closeDispatchers()
 	if p := l.transportCloseError.Load(); p != nil {
 		return errors.Join(l.checkErrorOrNil(), *p)
 	}
 	return l.checkErrorOrNil()
+}
+
+// Save connection-close errors without changing the first sending error
+// reported to the caller. Keep earlier close errors when a later close fails.
+func (l *qwpSfSendLoop) recordTransportCloseError(err error) {
+	err = qwpTransportReleaseError(err)
+	if err == nil {
+		return
+	}
+	for {
+		old := l.transportCloseError.Load()
+		joined := err
+		if old != nil {
+			joined = errors.Join(*old, err)
+		}
+		if l.transportCloseError.CompareAndSwap(old, &joined) {
+			return
+		}
+	}
 }
 
 // closeDispatchers stops the error, connection, and progress notification
@@ -1018,9 +1036,7 @@ func (l *qwpSfSendLoop) run() {
 		// known — defense in depth on the unwind path.
 		defer func() { _ = recover() }()
 		if t := l.transport.Swap(nil); t != nil {
-			if err := t.close(); err != nil && !errors.Is(err, net.ErrClosed) {
-				l.transportCloseError.Store(&err)
-			}
+			l.recordTransportCloseError(t.close())
 		}
 	}()
 	// Convert a panic on this wire-driving goroutine into the same
@@ -2173,7 +2189,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	old := l.transport.Swap(newTransport)
 	if old != nil {
-		_ = old.close()
+		l.recordTransportCloseError(old.close())
 	}
 	replayStart := l.engine.engineAckedFsn() + 1
 	l.highestFullySent.Store(-1)
