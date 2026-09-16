@@ -653,15 +653,21 @@ for cleanup behavior, why a slot may stay locked, and how to check for release.
 
 #### Local errors from the SF path
 
-Two sentinels report local storage rather than the server, and neither is
-terminal: the rows stay pending and the same call can be retried.
+The following sentinels identify non-terminal backpressure and local-storage
+failures. Unpublished rows remain pending and may be retried on the same sender.
+A failed flush can already have published part of a batch; do not resend
+published work as though nothing happened.
 
 | Error | Raised by | Meaning |
 |---|---|---|
 | `qdb.ErrBackpressureTimeout` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | The engine had no room within `sf_append_deadline_millis`. The wire is not draining, or `sf_max_total_bytes` is too small. |
 | `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | Local storage would not commit: a segment rotation that could not write its header or manifest, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
 
-Match them with `errors.Is`.
+Match them with `errors.Is`. These are not an exhaustive list of producer errors.
+Terminal server errors and internal failures can also reach the producer. For
+example, a segment-manager worker that stops after an internal panic reports a
+terminal error; retrying the operation does not restart that worker. An error
+that matches neither sentinel is not, by that fact alone, necessarily terminal.
 
 #### Quarantined slots
 

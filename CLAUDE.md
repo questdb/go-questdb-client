@@ -169,9 +169,15 @@ locations and operational recovery. Failed scans retain the previous accounting;
 periodic reconciliation is not a hard detection-latency guarantee. Inspect manager
 code and tests for scheduling and accounting details.
 
-`ErrBackpressureTimeout` and `ErrSfDurability` are non-terminal local errors.
-Unpublished rows remain pending for retry; a failed flush can already have
-published part of a batch. Do not resend published work as though nothing happened.
+`ErrBackpressureTimeout` and `ErrSfDurability` identify non-terminal backpressure
+and local-storage failures, not an exhaustive list of producer errors. Terminal
+server errors and internal failures can also reach the producer. A segment-manager
+worker stopped by an internal panic is terminal; do not wrap that failure in a
+non-terminal sentinel merely to fit this list. Conversely, failure to match either
+sentinel does not by itself establish that an error is terminal.
+Unpublished rows remain pending for retry after these non-terminal errors; a failed
+flush can already have published part of a batch. Do not resend published work as
+though nothing happened.
 An idle poll or unrelated successful operation must not hide unresolved storage
 maintenance. Derive error persistence/clearing from the public contract and the
 specific outstanding work in `qwp_sf_manager.go` and `qwp_sf_errors.go`.
