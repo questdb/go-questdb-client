@@ -1,3 +1,5 @@
+//go:build unix
+
 /*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
@@ -21,8 +23,6 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-
-//go:build unix
 
 package questdb
 
@@ -48,6 +48,13 @@ func qwpSfMmapRW(f *os.File, sizeBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("qwp/sf: mmap %s: %w", f.Name(), err)
 	}
 	return buf, nil
+}
+
+func qwpSfCloseMappingObject(m *qwpSfMappingObject) error {
+	if m == nil || m.handle == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: unexpected mapping-object handle on Unix", ErrCleanupFailed)
 }
 
 // qwpSfMunmap unmaps buf. Safe to call with a nil buf (no-op).

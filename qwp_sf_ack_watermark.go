@@ -73,6 +73,7 @@ type qwpSfAckWatermark struct {
 	generation       int64
 	fsn              int64
 	lastPersistedAck int64
+	closeErr         error
 	closed           bool
 	scratch          [qwpSfDualRecordSize]byte
 }
@@ -86,7 +87,7 @@ func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 	return qwpSfAckWatermarkOpenRequiredWithLogger(slotDir, nil)
 }
 
-func qwpSfAckWatermarkOpenRequiredWithLogger(slotDir string, logger *slog.Logger) (*qwpSfAckWatermark, error) {
+func qwpSfAckWatermarkOpenRequiredWithLogger(slotDir string, logger *slog.Logger) (result *qwpSfAckWatermark, err error) {
 	if slotDir == "" {
 		return nil, nil
 	}
@@ -105,6 +106,17 @@ func qwpSfAckWatermarkOpenRequiredWithLogger(slotDir string, logger *slog.Logger
 	if err != nil {
 		return nil, qwpSfDurabilityError("open ack watermark", path, err)
 	}
+	held := &qwpSfAckWatermark{file: f, path: path}
+	resources := &qwpSfAcquiredResources{watermarks: []*qwpSfAckWatermark{held}}
+	defer func() {
+		if result != nil {
+			return
+		}
+		if r := recover(); r != nil {
+			qwpSfRetainAcquisitionPanic(r, resources)
+		}
+		err = qwpSfFailedAcquisition(err, resources)
+	}()
 	if legacy16Byte {
 		// A 16-byte watermark uses the legacy single-record format. Resetting
 		// it discards its FSN because that format has no checksum or generation.
@@ -119,20 +131,17 @@ func qwpSfAckWatermarkOpenRequiredWithLogger(slotDir string, logger *slog.Logger
 	var image [qwpSfAckWatermarkFileSize]byte
 	if !existing {
 		if err := qwpSfAckWatermarkAllocate(f, path); err != nil {
-			_ = f.Close()
 			return nil, err
 		}
 	} else if _, err := io.ReadFull(f, image[:]); err != nil {
-		_ = f.Close()
 		return nil, qwpSfDurabilityError("read existing ack watermark", path, err)
 	}
 	if err := qwpSfAckWatermarkReserveBlocks(f, path, image[:]); err != nil {
-		_ = f.Close()
 		return nil, err
 	}
 	buf, err := qwpSfMmapRW(f, qwpSfDualRecordFileSize)
+	held.buf = buf
 	if err != nil {
-		_ = f.Close()
 		return nil, qwpSfDurabilityError("map ack watermark", path, err)
 	}
 	r0, ok0 := qwpSfDecodeDualRecord(buf[:qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
@@ -140,24 +149,24 @@ func qwpSfAckWatermarkOpenRequiredWithLogger(slotDir string, logger *slog.Logger
 	r1, ok1 := qwpSfDecodeDualRecord(buf[off1:off1+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
 	rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
 	if existing && !ok {
-		_ = qwpSfMunmap(buf)
-		_ = f.Close()
+		if err := qwpSfFailedAcquisition(nil, &qwpSfAcquiredResources{watermarks: []*qwpSfAckWatermark{held}}); err != nil {
+			return nil, err
+		}
 		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+		held.file = f
 		if err != nil {
 			return nil, qwpSfDurabilityError("reset ack watermark", path, err)
 		}
 		if err := qwpSfAckWatermarkAllocate(f, path); err != nil {
-			_ = f.Close()
 			return nil, err
 		}
 		var reset [qwpSfAckWatermarkFileSize]byte
 		if err := qwpSfAckWatermarkReserveBlocks(f, path, reset[:]); err != nil {
-			_ = f.Close()
 			return nil, err
 		}
 		buf, err = qwpSfMmapRW(f, qwpSfDualRecordFileSize)
+		held.buf = buf
 		if err != nil {
-			_ = f.Close()
 			return nil, qwpSfDurabilityError("map reset ack watermark", path, err)
 		}
 	}
@@ -300,22 +309,16 @@ func (w *qwpSfAckWatermark) close() error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.closed {
-		return nil
-	}
 	w.closed = true
-	var firstErr error
 	if w.buf != nil {
-		if err := qwpSfMunmap(w.buf); err != nil {
-			firstErr = err
+		if err := qwpSfReleaseMapping(w.buf); err != nil {
+			return errors.Join(w.closeErr, err)
 		}
 		w.buf = nil
 	}
 	if w.file != nil {
-		if err := w.file.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		w.closeErr = errors.Join(w.closeErr, qwpSfCloseFile(w.file))
 		w.file = nil
 	}
-	return firstErr
+	return w.closeErr
 }

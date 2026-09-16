@@ -280,7 +280,8 @@ func newQwpSenderPool(
 			// unreachable, so this is the only place the caller can learn
 			// that a slot lock survives the failed build and that an
 			// immediate retry on the same sf_dir may name this process as
-			// the holder. The engine's own retry owner keeps releasing it.
+			// the holder. The engine's cleanup worker keeps the lock until it
+			// can safely release it.
 			if closeErr := p.close(ctx); closeErr != nil {
 				err = errors.Join(err, closeErr)
 			}
@@ -641,13 +642,8 @@ type closeCompletionReporter interface {
 	closeCompleted() bool
 }
 
-type closeRetryOwner interface {
-	ensureCloseRetryOwner(logger *slog.Logger)
-}
-
 type closeLifecycleReporter interface {
 	closeCompletionReporter
-	closeRetryOwner
 }
 
 func slotCloseCompleted(slot *qwpSenderSlot) bool {
@@ -903,13 +899,14 @@ func (p *qwpSenderPool) classifyReapVictimsLocked(now time.Time) (part qwpSlotPa
 // (giveBack sees p.closed). A lease that is never returned leaks its connection:
 // the caller must return every lease before QuestDB.Close.
 //
-// A BorrowSender whose slot build is still in flight is likewise closed by the
-// creating goroutine after it observes p.closed. The lifecycle record remains
-// creating until that happens, so even a build that has not acquired its flock
-// keeps Close pending. A teardown that cannot prove manager quiescence moves to
-// retired with a retry owner. Every Close call re-probes and reports a fresh
-// snapshot; nil means all lifecycle records are free. A teardown error from the
-// first pass is remembered and reported by every later call as well.
+// If BorrowSender is still creating a sender, that goroutine closes it once it
+// sees p.closed. The pool keeps its slot reserved until then, even if it has not
+// yet taken the slot's file lock. If cleanup is still running, the slot becomes
+// retired: it still counts against capacity and cannot be reused. If cleanup
+// fails permanently, it stays reserved.
+// Every Close call checks the current state again; nil means no slot remains
+// reserved. Errors from the first close attempt are also saved and returned by
+// later calls.
 //
 // Slots close concurrently on context.Background(): each drain is bounded by
 // close_flush_timeout, so the caller's ctx must neither serialize the drains
@@ -1024,6 +1021,9 @@ func (p *qwpSenderPool) currentCloseResult() error {
 	p.mu.Lock()
 	pending := p.sfCloseSnapshotLocked()
 	teardownErr := p.closeTeardownErr
+	for _, slot := range p.retiredSlots {
+		teardownErr = errors.Join(teardownErr, p.slotCleanupFailureGuardedLocked(slot))
+	}
 	poisonErr := p.poisonedErr
 	p.mu.Unlock()
 	return qwpPoolCloseResult(teardownErr, poisonErr, pending)
@@ -1057,15 +1057,6 @@ func (p *qwpSenderPool) createSlot(ctx context.Context, async bool) (*qwpSenderS
 	}
 	p.transitionSfSlotLocked(slotIndex, qwpSfSlotCreating, qwpSfSlotAvailable)
 	return slot, nil
-}
-
-// reclaimFailedBuild releases the capacity reservation left by a failed slot
-// build. Memory-mode senders own no slot index or flock and therefore do not
-// consume SF lifecycle capacity while cleanup completes.
-func (p *qwpSenderPool) reclaimFailedBuild(slot *qwpSenderSlot, slotIndex int, buildErr error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.reclaimFailedBuildLocked(slot, slotIndex, buildErr)
 }
 
 func (p *qwpSenderPool) reclaimFailedBuildLocked(slot *qwpSenderSlot, slotIndex int, buildErr error) {
@@ -1282,12 +1273,12 @@ func (p *qwpSenderPool) closeLeasedCountLocked() int {
 	return p.sfSlotStateCountLocked(qwpSfSlotLeased)
 }
 
-// reclaimSlotLocked returns an SF slot index only after the delegate confirms
-// terminal engine cleanup released its flock. A close timeout may have handed
-// cleanup to the manager worker; such a slot is retired -- still reserved, and
-// still counted against capacity -- until a reprobe observes completion.
-// reprobeRetiredSlots runs on housekeeper ticks AND on the borrow-at-capacity
-// path, so housekeeper_interval_ms=0 does not leak the capacity.
+// reclaimSlotLocked makes a store-and-forward slot available only after the
+// sender confirms that cleanup released its file lock. A timeout leaves cleanup
+// running and the slot reserved, still counting against pool capacity.
+// reprobeRetiredSlots checks for completion both during periodic maintenance
+// and when a borrow finds the pool full, so capacity can be recovered even with
+// housekeeper_interval_ms=0.
 func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
 	_ = closeErr
 	if !p.storeAndForward || slot.slotIndex < 0 {
@@ -1297,10 +1288,24 @@ func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
 	if !p.slotCloseCompletedGuardedLocked(slot) {
 		p.transitionSfSlotLocked(slot.slotIndex, qwpSfSlotClosing, qwpSfSlotRetired)
 		p.retiredSlots = append(p.retiredSlots, slot)
-		p.ensureCloseRetryOwnerGuardedLocked(slot)
 		return
 	}
 	p.transitionSfSlotLocked(slot.slotIndex, qwpSfSlotClosing, qwpSfSlotFree)
+}
+
+// Check for cleanup failure without running cleanup from the pool.
+// Catch a panic from this check so the caller can still unlock p.mu.
+func (p *qwpSenderPool) slotCleanupFailureGuardedLocked(slot *qwpSenderSlot) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.poisonLocked("slot cleanup-error probe", r)
+			err = errors.Join(ErrCleanupFailed, p.poisonedErr)
+		}
+	}()
+	if reporter, ok := slot.cleanup.(interface{ cleanupFailure() error }); ok {
+		return reporter.cleanupFailure()
+	}
+	return nil
 }
 
 func (p *qwpSenderPool) slotCloseCompletedGuardedLocked(slot *qwpSenderSlot) (completed bool) {
@@ -1311,18 +1316,6 @@ func (p *qwpSenderPool) slotCloseCompletedGuardedLocked(slot *qwpSenderSlot) (co
 		}
 	}()
 	return slotCloseCompleted(slot)
-}
-
-func (p *qwpSenderPool) ensureCloseRetryOwnerGuardedLocked(slot *qwpSenderSlot) {
-	if slot.cleanup == nil {
-		return
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			p.poisonLocked("slot close-retry ownership", r)
-		}
-	}()
-	slot.cleanup.ensureCloseRetryOwner(p.logger)
 }
 
 // reprobeRetiredSlots checks whether cleanup has finished for retired slots.

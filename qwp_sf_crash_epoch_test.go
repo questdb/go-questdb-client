@@ -321,7 +321,7 @@ func TestQwpSfSpareRotationAndTrimCrashEpochsRecover(t *testing.T) {
 	require.NoError(t, err)
 	entry, err := manager.segmentManagerRegisterWithWatermark(ring, dir, nil)
 	require.NoError(t, err)
-	defer manager.segmentManagerDeregister(ring)
+	defer manager.segmentManagerClose()
 
 	t.Run("spare-rotation", func(t *testing.T) {
 		initial := qwpSfSnapshotCrashNamespace(t, dir)

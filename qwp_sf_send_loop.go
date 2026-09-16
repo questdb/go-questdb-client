@@ -514,6 +514,7 @@ func qwpSfNewSendLoop(
 	// the ring's "set once before producing starts" contract, and so
 	// every construction path — memory and SF — gets it for free.
 	engine.engineSetSendLoopWakeup(l.wakeSender)
+	engine.reader.Store(l)
 	return l
 }
 
@@ -692,15 +693,14 @@ func (l *qwpSfSendLoop) sendLoopStart() {
 	go l.run()
 }
 
-// sendLoopClose requests stop and joins the loop inside owned shutdown work.
-// Caller deadlines belong to the public waiter, never to this resource barrier.
+// sendLoopClose asks the send loop to stop and waits until it has stopped.
+// The cleanup worker calls this without a deadline, even if the public Close
+// call has already stopped waiting.
 func (l *qwpSfSendLoop) sendLoopClose() error {
 	l.running.Store(false)
 	l.cancel()
-	// Cancellation is an installed obligation, not normal fallthrough. Fault
-	// injection happens only after both stop signals are visible so the outer
-	// phase guard may conservatively leak mappings while this goroutine still
-	// finishes shutting down instead of staying alive indefinitely.
+	// Request stop before running a test hook that may panic. If it does, the
+	// engine keeps the resources alive, and the loop still gets the stop request.
 	if hook := qwpTestCloseSendLoopHook.Load(); hook != nil {
 		(*hook)()
 	}
@@ -725,9 +725,9 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 	return l.checkErrorOrNil()
 }
 
-// closeDispatchers stops the error, connection, and progress dispatcher
-// goroutines. Safe even on the wedged-I/O abandon path: offer() on a closed
-// dispatcher is a no-op, so a still-running send loop cannot fault on them.
+// closeDispatchers stops the error, connection, and progress notification
+// workers after the send loop stops. Each close waits only a limited time for
+// callbacks. Engine cleanup is not the callbacks' responsibility.
 func (l *qwpSfSendLoop) closeDispatchers() {
 	if d := l.dispatcher.Load(); d != nil {
 		d.close()

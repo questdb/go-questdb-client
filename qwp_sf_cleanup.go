@@ -24,412 +24,278 @@
 
 package questdb
 
-import "sync"
-
-// qwpSfCleanupPhase is the complete cleanup-ownership protocol for one cursor
-// engine. Unlike the former collection of atomics, a phase is observed and
-// changed as one record, so a rollback cannot be spliced together with an
-// earlier manager-quiescence observation.
-type qwpSfCleanupPhase uint8
-
-const (
-	qwpSfCleanupOpen qwpSfCleanupPhase = iota
-	qwpSfCleanupStoppingManager
-	qwpSfCleanupManagerOwned
-	qwpSfCleanupReady
-	qwpSfCleanupClaimed
-	qwpSfCleanupRunning
-	qwpSfCleanupRetryable
-	qwpSfCleanupComplete
+import (
+	"errors"
+	"runtime/debug"
+	"sync"
+	"time"
 )
 
-func (p qwpSfCleanupPhase) String() string {
-	switch p {
-	case qwpSfCleanupOpen:
-		return "open"
-	case qwpSfCleanupStoppingManager:
-		return "stopping-manager"
-	case qwpSfCleanupManagerOwned:
-		return "manager-owned"
-	case qwpSfCleanupReady:
-		return "ready"
-	case qwpSfCleanupClaimed:
-		return "claimed"
-	case qwpSfCleanupRunning:
-		return "running"
-	case qwpSfCleanupRetryable:
-		return "retryable"
-	case qwpSfCleanupComplete:
-		return "complete"
-	default:
-		return "unknown"
-	}
-}
-
-type qwpSfCleanupOwner uint8
-
-const (
-	qwpSfCleanupOwnerNone qwpSfCleanupOwner = iota
-	qwpSfCleanupOwnerClose
-	qwpSfCleanupOwnerManager
-	qwpSfCleanupOwnerRetry
-)
-
-// qwpSfCleanupToken is an unforgeable-in-practice claim on one generation of
-// cleanup work. Every helper verifies all three fields while holding the state
-// mutex. A token from before a rollback, handoff, retry or completion is stale
-// and cannot close resources.
-type qwpSfCleanupToken struct {
-	phase      qwpSfCleanupPhase
-	owner      qwpSfCleanupOwner
-	generation uint64
-}
-
-type qwpSfCleanupState struct {
-	phase               qwpSfCleanupPhase
-	owner               qwpSfCleanupOwner
-	generation          uint64
-	drainKnown          bool
-	fullyDrained        bool
-	barriersCommitted   bool
-	leakMappings        bool
-	resourcesClosed     bool
-	drainedFilesPending bool
-	firstErr            error
-	retryOwnerStarted   bool
-
-	// readersQuiesced says that whoever owned the send loop has stopped it, or
-	// decided to leave its mappings alone. Terminal cleanup unmaps the segment
-	// files, and the send loop reads them through slice headers it took
-	// earlier, so a claim taken before this is published can pull memory out
-	// from under a live reader. The engine cannot work this out for itself:
-	// only the caller that owns the loop knows.
-	readersQuiesced bool
-}
-
-// qwpSfCleanupControl owns the state and its dedicated mutex. Callers hold the
-// mutex only for the helpers below; manager waits, appendMu acquisition, file
-// IO and resource closure always happen after the helper returns.
+// qwpSfCleanupControl records the progress and result of one cleanup worker.
+// Callers can wait for updates, but only that worker releases resources and
+// retries storage errors.
 type qwpSfCleanupControl struct {
-	mu    sync.Mutex
-	state qwpSfCleanupState
+	once     sync.Once
+	mu       sync.Mutex
+	changed  chan struct{}
+	done     chan struct{}
+	err      error
+	finished bool
+	released bool
 }
 
-type qwpSfCleanupAction uint8
-
-const (
-	qwpSfCleanupNoAction qwpSfCleanupAction = iota
-	qwpSfCleanupDriveManager
-	qwpSfCleanupFinish
-)
-
-func qwpSfCleanupTransitionAllowed(from, to qwpSfCleanupPhase) bool {
-	switch from {
-	case qwpSfCleanupOpen:
-		return to == qwpSfCleanupStoppingManager
-	case qwpSfCleanupStoppingManager:
-		return to == qwpSfCleanupOpen || to == qwpSfCleanupManagerOwned || to == qwpSfCleanupReady
-	case qwpSfCleanupManagerOwned:
-		return to == qwpSfCleanupOpen || to == qwpSfCleanupReady
-	case qwpSfCleanupReady:
-		return to == qwpSfCleanupClaimed
-	case qwpSfCleanupClaimed:
-		return to == qwpSfCleanupRunning || to == qwpSfCleanupRetryable
-	case qwpSfCleanupRunning:
-		return to == qwpSfCleanupRetryable || to == qwpSfCleanupComplete
-	case qwpSfCleanupRetryable:
-		return to == qwpSfCleanupClaimed
-	case qwpSfCleanupComplete:
-		return false
-	default:
-		return false
-	}
-}
-
-func (c *qwpSfCleanupControl) transitionLocked(to qwpSfCleanupPhase, owner qwpSfCleanupOwner) qwpSfCleanupToken {
-	from := c.state.phase
-	if !qwpSfCleanupTransitionAllowed(from, to) {
-		panic("qwp/sf: illegal cleanup transition " + from.String() + " -> " + to.String())
-	}
-	c.state.generation++
-	c.state.phase = to
-	c.state.owner = owner
-	return qwpSfCleanupToken{phase: to, owner: owner, generation: c.state.generation}
-}
-
-func (c *qwpSfCleanupControl) tokenCurrentLocked(token qwpSfCleanupToken, phase qwpSfCleanupPhase) bool {
-	return token.phase == phase && token.owner == c.state.owner &&
-		token.generation == c.state.generation && c.state.phase == phase
-}
-
-// begin latches the mapping-safety input before making any ownership decision.
-// A fresh or rolled-back close drives manager teardown. A manager-quiescent
-// ownerless close claims terminal cleanup directly. Every other phase already
-// has an owner or is complete.
-func (c *qwpSfCleanupControl) begin(leakMappings bool, owner qwpSfCleanupOwner) (qwpSfCleanupToken, qwpSfCleanupAction) {
+func (c *qwpSfCleanupControl) publish(err error, finished, released bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if leakMappings {
-		c.state.leakMappings = true
+	c.err, c.finished, c.released = err, finished, released
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (e *qwpSfCursorEngine) engineCloseCompleted() bool {
+	if e == nil {
+		return true
 	}
-	// No claimant runs terminal cleanup before the owner of the send loop has
-	// said the readers are done. engineCloseInternal publishes that as its
-	// first act, so an owner passes here immediately; everyone else -- the
-	// retry goroutine, a pool re-probe, a repeated Close -- has to wait for it.
-	// Keeping the rule here rather than at each entry point means a new
-	// claimant inherits it instead of having to remember it.
-	if !c.state.readersQuiesced {
-		return qwpSfCleanupToken{}, qwpSfCleanupNoAction
+	e.cleanup.mu.Lock()
+	defer e.cleanup.mu.Unlock()
+	return e.cleanup.released
+}
+
+func (e *qwpSfCursorEngine) cleanupFailure() error {
+	if e == nil {
+		return nil
 	}
-	switch c.state.phase {
-	case qwpSfCleanupOpen:
-		return c.transitionLocked(qwpSfCleanupStoppingManager, owner), qwpSfCleanupDriveManager
-	case qwpSfCleanupReady, qwpSfCleanupRetryable:
-		return c.transitionLocked(qwpSfCleanupClaimed, owner), qwpSfCleanupFinish
-	default:
-		return qwpSfCleanupToken{}, qwpSfCleanupNoAction
+	e.cleanup.mu.Lock()
+	defer e.cleanup.mu.Unlock()
+	if errors.Is(e.cleanup.err, ErrCleanupFailed) {
+		return e.cleanup.err
+	}
+	return nil
+}
+
+// engineClose starts cleanup once and waits up to qwpSfManagerCloseGrace.
+// It can return nil while cleanup is still running, as standalone sender Close
+// allows. The pool checks completion and failure separately.
+func (e *qwpSfCursorEngine) engineClose() error { return e.engineCloseWithCause(nil) }
+
+func (e *qwpSfCursorEngine) engineCloseWithCause(cause error) error {
+	if e == nil {
+		return cause
+	}
+	e.cleanup.once.Do(func() {
+		e.closed.Store(true)
+		e.cleanup.mu.Lock()
+		e.cleanup.changed = make(chan struct{})
+		e.cleanup.done = make(chan struct{})
+		e.cleanup.mu.Unlock()
+		go e.engineCleanupWorker(cause)
+	})
+	timer := time.NewTimer(qwpSfManagerCloseGrace.load())
+	defer timer.Stop()
+	for {
+		e.cleanup.mu.Lock()
+		err, finished, changed := e.cleanup.err, e.cleanup.finished, e.cleanup.changed
+		e.cleanup.mu.Unlock()
+		if finished || err != nil {
+			return err
+		}
+		select {
+		case <-changed:
+		case <-timer.C:
+			e.cleanup.mu.Lock()
+			err = e.cleanup.err
+			e.cleanup.mu.Unlock()
+			return err
+		}
 	}
 }
 
-// markReadersQuiesced is published by the one caller that owns the send loop,
-// before it asks for any cleanup of its own. It is one-way: a slot never gains
-// new readers once its loop has stopped.
-//
-// leakMappings travels with it because the two are one fact, not two. A loop
-// that was abandoned mid-read is quiesced only in the sense that nobody will
-// wait for it; its mappings must still be left alone. Published separately,
-// there is a window where the record says the readers are done but not that
-// their mappings are untouchable, and a claim taken in that window unmaps
-// memory a live reader is still walking.
-func (c *qwpSfCleanupControl) markReadersQuiesced(leakMappings bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if leakMappings {
-		c.state.leakMappings = true
-	}
-	c.state.readersQuiesced = true
+// Keep failed engines alive until process exit, even after their workers stop.
+// This prevents garbage collection from closing files or releasing locks that
+// cleanup could not safely release. This list does not retry cleanup or decide
+// whether the pool can reuse a slot.
+var qwpSfFailedEngines struct {
+	sync.Mutex
+	engines []*qwpSfCursorEngine
 }
 
-func (c *qwpSfCleanupControl) recordDrain(token qwpSfCleanupToken, fullyDrained bool) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupStoppingManager) {
-		return false
-	}
-	c.state.drainKnown = true
-	c.state.fullyDrained = fullyDrained
-	return true
+func (e *qwpSfCursorEngine) retainFailedCleanup(err error) {
+	qwpSfFailedEngines.Lock()
+	qwpSfFailedEngines.engines = append(qwpSfFailedEngines.engines, e)
+	qwpSfFailedEngines.Unlock()
+	e.cleanup.publish(err, true, false)
+	qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: cleanup failed; resources remain retained", "slot", e.sfDir, "error", err)
 }
 
-// rollbackStopping invalidates a close owner that panicked before it could
-// prove and publish manager quiescence. A retry must drive manager teardown
-// again; retaining the captured drain/leak inputs is safe because closed has
-// already fenced new appends.
-func (c *qwpSfCleanupControl) rollbackStopping(token qwpSfCleanupToken) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupStoppingManager) {
-		return false
+func (e *qwpSfCursorEngine) engineCleanupWorker(cause error) {
+	defer close(e.cleanup.done)
+	defer func() {
+		if r := recover(); r != nil {
+			err := errors.Join(cause, &qwpCleanupPanicError{phase: "engine", cause: r, stack: debug.Stack()})
+			e.retainFailedCleanup(err)
+		}
+	}()
+	// Ask both the manager and send loop to stop before waiting for them.
+	// The manager only signals that it has stopped; this worker does cleanup.
+	managerDone := e.manager.segmentManagerStop()
+	if reader := e.reader.Load(); reader != nil {
+		cause = errors.Join(cause, qwpRunCleanupPhaseGuarded("send loop", reader.sendLoopClose))
+		// After a panic, the reader may still be running. Keep its mapped memory.
+		var panicErr *qwpCleanupPanicError
+		if errors.As(cause, &panicErr) {
+			e.retainFailedCleanup(cause)
+			return
+		}
 	}
-	c.transitionLocked(qwpSfCleanupOpen, qwpSfCleanupOwnerNone)
-	return true
+	<-managerDone
+	// A manager panic may have interrupted opening or removing a segment.
+	// Keep its resources: we cannot safely retry a partly completed operation.
+	if err := e.manager.managerWorkerError(); err != nil {
+		e.retainFailedCleanup(errors.Join(cause, ErrCleanupFailed, err))
+		return
+	}
+	if errors.Is(cause, ErrCleanupFailed) {
+		e.retainFailedCleanup(cause)
+		return
+	}
+	e.appendMu.Lock()
+	defer e.appendMu.Unlock()
+	qwpSfRunCleanupTestHook(qwpSfCleanupTestAfterQuiescence)
+	fullyDrained := e.sfDir != "" && e.ring != nil && e.ring.segmentRingAckedFsn() >= e.ring.segmentRingPublishedFsn()
+	// Remember which disk updates finished so storage-error retries can skip
+	// them. A panic stops cleanup instead of retrying.
+	barriersDone, segmentsGone, manifestGone := !fullyDrained, false, false
+	var lastWarn time.Time
+	for {
+		err := e.engineCleanupAttempt(fullyDrained, &barriersDone, &segmentsGone, &manifestGone)
+		result := errors.Join(cause, err)
+		if errors.Is(result, ErrCleanupFailed) {
+			e.retainFailedCleanup(result)
+			return
+		}
+		if e.cleanupResourcesReleased() && (!fullyDrained || manifestGone) {
+			lockErr := qwpRunCleanupPhaseGuarded("slot lock", e.slotLock.close)
+			result = errors.Join(result, lockErr)
+			if errors.Is(result, ErrCleanupFailed) {
+				e.retainFailedCleanup(result)
+				return
+			}
+			if e.slotLock == nil || e.slotLock.file == nil {
+				e.cleanup.publish(result, true, true)
+				// The caller may already have stopped waiting. Log the error even
+				// if the file handles were closed and all resources were released.
+				if err != nil || lockErr != nil {
+					qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: cleanup completed with error", "slot", e.sfDir, "error", result)
+				}
+				return
+			}
+		}
+		e.cleanup.publish(result, false, false)
+		now := time.Now()
+		if result != nil && qwpSfShouldLogCloseRetry(lastWarn, now) {
+			lastWarn = now
+			qwpEffectiveLogger(e.engineLogger()).Warn("qwp/sf: cleanup incomplete; retaining slot and retrying storage", "slot", e.sfDir, "error", result)
+		}
+		time.Sleep(qwpSfCloseRetryInterval.load())
+	}
 }
 
-// managerReadyAndClaim publishes quiescence, then returns a new terminal owner
-// token. The stopping-manager token is invalid before this helper returns.
-func (c *qwpSfCleanupControl) managerReadyAndClaim(token qwpSfCleanupToken, owner qwpSfCleanupOwner) (qwpSfCleanupToken, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupStoppingManager) {
-		return qwpSfCleanupToken{}, false
+func (e *qwpSfCursorEngine) engineCleanupAttempt(drained bool, barriersDone, segmentsGone, manifestGone *bool) error {
+	if hook := qwpSfTestEngineFinishCloseHook.Load(); hook != nil {
+		(*hook)()
 	}
-	c.transitionLocked(qwpSfCleanupReady, qwpSfCleanupOwnerNone)
-	return c.transitionLocked(qwpSfCleanupClaimed, owner), true
+	qwpSfRunCleanupTestHook(qwpSfCleanupTestDuringTerminalCleanup)
+	if !*barriersDone {
+		if _, err := e.watermark.persistIfAdvanced(e.ring.segmentRingAckedFsn()); err != nil {
+			return err
+		}
+		if err := e.watermark.sync(); err != nil {
+			return err
+		}
+		if active, manifest := e.ring.getActiveSegment(), e.ring.ringManifest(); active != nil && manifest != nil {
+			if err := manifest.update(active.segmentBaseSeq(), active.segmentBaseSeq()); err != nil {
+				return err
+			}
+		}
+		*barriersDone = true
+	}
+	var err error
+	if e.ring != nil {
+		err = qwpRunCleanupPhaseGuarded("segment ring", func() error {
+			qwpSfRunCleanupTestHook(qwpSfCleanupTestRingClosePhase)
+			return e.ring.segmentRingClose()
+		})
+	}
+	for _, s := range e.looseSegments {
+		err = errors.Join(err, qwpRunCleanupPhaseGuarded("construction segment", func() error {
+			if hook := qwpSfTestBeforeSegmentCloseHook.Load(); hook != nil {
+				(*hook)(s)
+			}
+			return s.close()
+		}))
+	}
+	err = errors.Join(err, qwpRunCleanupPhaseGuarded("construction manifest", func() error {
+		if e.looseManifest != nil {
+			qwpSfRunCleanupTestHook(qwpSfCleanupTestManifestClosePhase)
+		}
+		return e.looseManifest.close()
+	}))
+	err = errors.Join(err, qwpRunCleanupPhaseGuarded("ack watermark", func() error {
+		qwpSfRunCleanupTestHook(qwpSfCleanupTestWatermarkClosePhase)
+		return e.watermark.close()
+	}))
+	err = errors.Join(err, qwpRunCleanupPhaseGuarded("symbol dictionary", func() error {
+		qwpSfRunCleanupTestHook(qwpSfCleanupTestSymbolDictClosePhase)
+		return e.persistedSymbolDict.close()
+	}))
+	err = errors.Join(err, e.acquired.close())
+	// The manager saved any unfinished release or file-removal work in its
+	// entry. It has now stopped, so this worker can finish that work.
+	if e.managerEntry != nil {
+		err = errors.Join(err, e.manager.closeServiceResidue(e.managerEntry))
+	}
+	if errors.Is(err, ErrCleanupFailed) || !e.cleanupResourcesReleased() {
+		return err
+	}
+	if drained {
+		if !*segmentsGone {
+			if unlinkErr := qwpSfUnlinkSegmentsAndSyncDir(e.sfDir); unlinkErr != nil {
+				return errors.Join(err, unlinkErr)
+			}
+			*segmentsGone = true
+		}
+		if !*manifestGone {
+			if unlinkErr := qwpSfRemoveManifestAndSyncDir(e.sfDir); unlinkErr != nil {
+				return errors.Join(err, unlinkErr)
+			}
+			*manifestGone = true
+		}
+		qwpSfAckWatermarkRemoveOrphan(e.sfDir)
+		qwpSfSymbolDictRemoveOrphan(e.sfDir)
+	}
+	return err
 }
 
-func (c *qwpSfCleanupControl) prepareManagerHandoff(token qwpSfCleanupToken) (qwpSfCleanupToken, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupStoppingManager) {
-		return qwpSfCleanupToken{}, false
-	}
-	return c.transitionLocked(qwpSfCleanupManagerOwned, qwpSfCleanupOwnerManager), true
-}
-
-// abortManagerHandoff is used only when registration panics before it can
-// return an ownership verdict. The manager helpers contain no user callbacks
-// and install their callback as their final mutation; the guarded caller fires
-// fault-injection hooks before that mutation. Manager quiescence must be
-// re-proven on the retry.
-func (c *qwpSfCleanupControl) abortManagerHandoff(token qwpSfCleanupToken) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupManagerOwned) {
-		return false
-	}
-	c.transitionLocked(qwpSfCleanupOpen, qwpSfCleanupOwnerNone)
-	return true
-}
-
-func (c *qwpSfCleanupControl) managerHandoffDeclinedAndClaim(token qwpSfCleanupToken, owner qwpSfCleanupOwner) (qwpSfCleanupToken, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupManagerOwned) {
-		return qwpSfCleanupToken{}, false
-	}
-	c.transitionLocked(qwpSfCleanupReady, qwpSfCleanupOwnerNone)
-	return c.transitionLocked(qwpSfCleanupClaimed, owner), true
-}
-
-// managerClaim is called only from the manager's callback after the worker is
-// past its loop or the affected ring's service pass. That callback is the new
-// proof of quiescence; a stale handoff token cannot publish it.
-func (c *qwpSfCleanupControl) managerClaim(token qwpSfCleanupToken) (qwpSfCleanupToken, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupManagerOwned) {
-		return qwpSfCleanupToken{}, false
-	}
-	c.transitionLocked(qwpSfCleanupReady, qwpSfCleanupOwnerNone)
-	return c.transitionLocked(qwpSfCleanupClaimed, qwpSfCleanupOwnerManager), true
-}
-
-// tryClaim takes an already-ownerless terminal claim without driving the
-// manager teardown first. It carries the same quiescence rule as begin:
-// every door into a terminal claim asks the same question, so
-// wiring this one to a new caller cannot reopen the hole the others close.
-func (c *qwpSfCleanupControl) tryClaim(owner qwpSfCleanupOwner) (qwpSfCleanupToken, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.state.readersQuiesced {
-		return qwpSfCleanupToken{}, false
-	}
-	if c.state.phase != qwpSfCleanupReady && c.state.phase != qwpSfCleanupRetryable {
-		return qwpSfCleanupToken{}, false
-	}
-	return c.transitionLocked(qwpSfCleanupClaimed, owner), true
-}
-
-// startTerminal is the required last transition before any terminal resource
-// close. It consumes the claimed generation after appendMu has been acquired
-// and returns a distinct running token. The same claim cannot start twice, and
-// no caller can validate one field before a rollback and another after it.
-func (c *qwpSfCleanupControl) startTerminal(token qwpSfCleanupToken) (qwpSfCleanupToken, bool, bool, bool, bool, bool, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupClaimed) || !c.state.drainKnown {
-		return qwpSfCleanupToken{}, false, false, false, false, false, false
-	}
-	runToken := c.transitionLocked(qwpSfCleanupRunning, token.owner)
-	return runToken, c.state.fullyDrained, c.state.barriersCommitted,
-		c.state.leakMappings, c.state.resourcesClosed, c.state.drainedFilesPending, true
-}
-
-func (c *qwpSfCleanupControl) abandonClaim(token qwpSfCleanupToken, err error) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupClaimed) {
-		return false
-	}
-	if err != nil && c.state.firstErr == nil {
-		c.state.firstErr = err
-	}
-	c.transitionLocked(qwpSfCleanupRetryable, qwpSfCleanupOwnerNone)
-	return true
-}
-
-// checkpointDrainBarriers records that the fully-drained durability barriers
-// (watermark sync and the collapsed manifest update) are committed. A retry
-// generation skips them: they write through side files a partially completed
-// pass may already have closed, and re-running them then fails spuriously.
-func (c *qwpSfCleanupControl) checkpointDrainBarriers(token qwpSfCleanupToken) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupRunning) {
-		return false
-	}
-	c.state.barriersCommitted = true
-	return true
-}
-
-func (c *qwpSfCleanupControl) checkpointResourcesClosed(token qwpSfCleanupToken, drainedFilesPending bool) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupRunning) {
+func (e *qwpSfCursorEngine) cleanupResourcesReleased() bool {
+	if !e.acquired.released() {
 		return false
 	}
-	c.state.resourcesClosed = true
-	c.state.drainedFilesPending = drainedFilesPending
-	return true
-}
-
-func (c *qwpSfCleanupControl) markDrainedFilesComplete(token qwpSfCleanupToken) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupRunning) {
+	if e.ring != nil && !e.ring.resourcesReleased() {
 		return false
 	}
-	c.state.drainedFilesPending = false
-	return true
-}
-
-func (c *qwpSfCleanupControl) retry(token qwpSfCleanupToken, err error) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupRunning) {
+	for _, s := range e.looseSegments {
+		if !s.resourcesReleased() {
+			return false
+		}
+	}
+	if e.looseManifest != nil && e.looseManifest.file != nil {
 		return false
 	}
-	if err != nil && c.state.firstErr == nil {
-		c.state.firstErr = err
-	}
-	c.transitionLocked(qwpSfCleanupRetryable, qwpSfCleanupOwnerNone)
-	return true
-}
-
-func (c *qwpSfCleanupControl) complete(token qwpSfCleanupToken) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.tokenCurrentLocked(token, qwpSfCleanupRunning) {
+	if e.watermark != nil && (e.watermark.buf != nil || e.watermark.file != nil) {
 		return false
 	}
-	c.transitionLocked(qwpSfCleanupComplete, qwpSfCleanupOwnerNone)
-	return true
-}
-
-func (c *qwpSfCleanupControl) completed() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state.phase == qwpSfCleanupComplete
-}
-
-func (c *qwpSfCleanupControl) needsRedrive() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state.phase == qwpSfCleanupOpen && !c.state.retryOwnerStarted
-}
-
-func (c *qwpSfCleanupControl) startRetryOwner() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.state.phase == qwpSfCleanupComplete || c.state.retryOwnerStarted {
+	if e.persistedSymbolDict != nil && e.persistedSymbolDict.file != nil {
 		return false
 	}
-	c.state.retryOwnerStarted = true
-	return true
-}
-
-func (c *qwpSfCleanupControl) retryOwnerPanicked() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.state.phase == qwpSfCleanupComplete {
-		return false
-	}
-	c.state.retryOwnerStarted = false
-	return true
-}
-
-func (c *qwpSfCleanupControl) snapshot() qwpSfCleanupState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state
+	return e.managerEntry == nil || e.managerEntry.serviceResidueReleased()
 }

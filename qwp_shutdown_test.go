@@ -340,7 +340,7 @@ func TestQwpSenderClosePreservesTransportCleanupFailure(t *testing.T) {
 				require.Same(t, rejection, reported)
 			}
 			require.Equal(t, original, loop.sendLoopCheckError(), "cleanup must not change the producer-error latch")
-			require.True(t, engine.engineCloseCompleted(), "engine release alone is not sender cleanup completion")
+			require.False(t, engine.engineCloseCompleted(), "the engine now owns transport release and retains its terminal failure")
 			require.False(t, s.closeCompleted(), "terminal cleanup failure must remain visible to pool bookkeeping")
 			require.ErrorIs(t, s.Close(context.Background()), errDoubleSenderClose)
 			require.ErrorIs(t, s.shutdown.Load().err, ErrCleanupFailed)

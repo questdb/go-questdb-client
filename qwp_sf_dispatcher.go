@@ -27,8 +27,6 @@ package questdb
 import (
 	"context"
 	"log/slog"
-	"runtime"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -432,30 +430,4 @@ func newDefaultSenderErrorHandler(logger *slog.Logger) SenderErrorHandler {
 		}
 		qwpEffectiveLogger(logger).Log(context.Background(), level, "qwp/sf: server rejection", "error", e)
 	}
-}
-
-// qwpGoid returns the numeric ID of the calling goroutine, or 0 if it
-// cannot be parsed. Go exposes goroutine identity only through the
-// runtime.Stack header ("goroutine <id> [<status>]:"); there is no
-// public accessor. The segment manager uses this for shared-manager
-// self-wait detection. Application callbacks do not use goroutine identity
-// to acquire permission to mutate handles.
-func qwpGoid() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	const prefix = "goroutine "
-	b := buf[:n]
-	if len(b) < len(prefix) {
-		return 0
-	}
-	b = b[len(prefix):]
-	i := 0
-	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-		i++
-	}
-	id, err := strconv.ParseInt(string(b[:i]), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return id
 }

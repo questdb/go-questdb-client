@@ -85,7 +85,7 @@ jobs:
           echo "Enterprise build queued: ${RUN_URL}"
 
   windows-retained-reader:
-    name: QWP retained-reader shutdown (Windows)
+    name: QWP SF cleanup ownership (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,7 +93,7 @@ jobs:
         with:
           go-version: '1.23.x'
           cache: true
-      - name: Execute retained-reader regressions
+      - name: Execute retained-reader, terminal-retention, and native release regressions
         env:
           GOTOOLCHAIN: local
         shell: pwsh
@@ -108,9 +108,10 @@ jobs:
             throw 'File-list test build must be updated for native source files'
           }
           $source = $pkg.GoFiles
-          go test -c -o retained-reader.test.exe @source qwp_sf_retained_reader_test.go
+          $tests = @('qwp_sf_retained_reader_test.go', 'qwp_sf_cleanup_fault_test.go', 'qwp_sf_cleanup_state_test.go', 'qwp_sf_cleanup_release_test.go', 'qwp_sf_files_windows_test.go')
+          go test -c -o retained-reader.test.exe @source @tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\retained-reader.test.exe -test.run='^TestQwpSfRetainedReaderOwnership$' -test.v -test.count=3 -test.timeout=2m
+          .\retained-reader.test.exe -test.run='^TestQwpSf' -test.v -test.count=3 -test.timeout=3m
           exit $LASTEXITCODE
 
   test:

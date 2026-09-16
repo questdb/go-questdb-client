@@ -128,7 +128,7 @@ func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing
 	return qwpSfRecoverRingWithContext(sfDir, maxBytesPerSegment, qwpSfRecoveryContext{})
 }
 
-func qwpSfRecoverRingWithContext(sfDir string, maxBytesPerSegment int64, recoveryContext qwpSfRecoveryContext) (*qwpSfSegmentRing, *qwpSfManifest, error) {
+func qwpSfRecoverRingWithContext(sfDir string, maxBytesPerSegment int64, recoveryContext qwpSfRecoveryContext) (outRing *qwpSfSegmentRing, outManifest *qwpSfManifest, err error) {
 	if _, err := os.Stat(sfDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil, nil
@@ -148,12 +148,14 @@ func qwpSfRecoverRingWithContext(sfDir string, maxBytesPerSegment int64, recover
 		if success {
 			return
 		}
-		for _, seg := range all {
-			_ = seg.close()
+		resources := &qwpSfAcquiredResources{segments: all, manifests: []*qwpSfManifest{manifest}}
+		if plan != nil {
+			resources.merge(&qwpSfAcquiredResources{segments: plan.all, manifests: []*qwpSfManifest{plan.manifest}})
 		}
-		if manifest != nil {
-			_ = manifest.close()
+		if r := recover(); r != nil {
+			qwpSfRetainAcquisitionPanic(r, resources)
 		}
+		err = qwpSfFailedAcquisition(err, resources)
 	}()
 
 	files := make([]qwpSfRecoveryFilePlan, 0, len(entries))
@@ -866,12 +868,21 @@ var (
 // emptied slot follows the committed boundaries -- a manifest that committed
 // frames fails closed, one whose head equals its active collapses and starts
 // fresh -- and either way the preserved copy is the record of the bytes.
-func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qwpSfSegment, error) {
+func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (result *qwpSfSegment, err error) {
 	tmp := path + qwpSfTornActiveTempSuffix
 	replacement, err := qwpSfCreateSegment(tmp, baseSeq, maxBytesPerSegment)
 	if err != nil {
 		return nil, qwpSfDurabilityError("build replacement for torn active", path, err)
 	}
+	resources := &qwpSfAcquiredResources{segments: []*qwpSfSegment{replacement}, temporaryPaths: []string{tmp}}
+	defer func() {
+		if r := recover(); r != nil {
+			qwpSfRetainAcquisitionPanic(r, resources)
+		}
+		if result == nil {
+			err = qwpSfFailedAcquisition(err, resources)
+		}
+	}()
 	// The replacement's header must be durable before its name is installed
 	// over the committed active base. The install rename below can reach the
 	// disk first otherwise, and a crash in that window leaves a durable
@@ -880,16 +891,16 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 	// segment survives, and the whole slot -- including the sealed segments'
 	// undelivered rows, intact on disk -- is quarantined.
 	if err := replacement.syncHeader(); err != nil {
-		_ = replacement.close()
-		_ = os.Remove(tmp)
 		return nil, qwpSfDurabilityError("sync replacement for torn active", path, err)
 	}
 	// Closed before the swap so the reopen below owns the only mapping, and so
 	// the segment records the path it ends up at rather than the temporary name
 	// every later diagnostic would then report.
-	if err := replacement.close(); err != nil {
-		_ = os.Remove(tmp)
-		return nil, qwpSfDurabilityError("close replacement for torn active", path, err)
+	if closeErr := qwpRunCleanupPhaseGuarded("replacement segment", replacement.close); closeErr != nil {
+		return nil, &qwpSfAcquisitionError{
+			original: qwpSfDurabilityError("close replacement for torn active", path, closeErr),
+			cause:    errors.Join(ErrSfDurability, closeErr), resources: resources,
+		}
 	}
 	preserved, err := qwpSfQuarantineTargetPath(path)
 	if err != nil {
@@ -938,6 +949,7 @@ func qwpSfReplaceTornActive(path string, baseSeq, maxBytesPerSegment int64) (*qw
 		}
 		return nil, qwpSfDurabilityError("install replacement for torn active", path, err)
 	}
+	resources.temporaryPaths = nil // the file has moved; the temporary path no longer exists
 	if err := qwpSfSyncSlotDir(filepath.Dir(path)); err != nil {
 		return nil, qwpSfDurabilityError("sync installed torn-active replacement", path, err)
 	}

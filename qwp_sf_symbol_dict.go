@@ -90,6 +90,7 @@ type qwpSfSymbolDict struct {
 	path         string
 	appendOffset int64
 	count        int
+	closeErr     error
 	closed       bool
 	scratch      []byte
 	// loaded holds the entries recovered at open, in id order; nil for a
@@ -259,7 +260,7 @@ func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 // come in two kinds: errQwpSfSymbolDictUnusable for damaged content, which lets
 // recovery fall back to reading the surviving frames, and plain I/O errors,
 // which may succeed on a later attempt and are returned as they are.
-func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymbolDict, error) {
+func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (result *qwpSfSymbolDict, err error) {
 	if fileLen > qwpSfSymbolDictMaxFileSize {
 		return nil, errQwpSfSymbolDictUnusable
 	}
@@ -267,13 +268,22 @@ func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymb
 	if err != nil {
 		return nil, err
 	}
+	held := &qwpSfSegment{file: f, path: path}
+	resources := &qwpSfAcquiredResources{segments: []*qwpSfSegment{held}}
+	defer func() {
+		if result != nil {
+			return
+		}
+		if r := recover(); r != nil {
+			qwpSfRetainAcquisitionPanic(r, resources)
+		}
+		err = qwpSfFailedAcquisition(err, resources)
+	}()
 	buf := make([]byte, fileLen)
 	if _, err := io.ReadFull(f, buf); err != nil {
-		_ = f.Close()
 		return nil, err
 	}
 	if binary.LittleEndian.Uint32(buf[:4]) != qwpSfSymbolDictMagic || buf[4] != qwpSfSymbolDictVersion {
-		_ = f.Close()
 		return nil, errQwpSfSymbolDictUnusable
 	}
 	loaded, pos, chunks := qwpSfParseChunkedSymbolDict(buf)
@@ -283,7 +293,6 @@ func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymb
 		// such a file apart from one whose first chunk is corrupt. Content that
 		// merely parses is not content that can be trusted, so keep the file
 		// and let the frame scan rebuild the dictionary from nothing.
-		_ = f.Close()
 		return nil, errQwpSfSymbolDictUnusable
 	}
 	// Cut the file back to the last trusted byte before handing out a handle
@@ -293,7 +302,6 @@ func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (*qwpSfSymb
 	// every id after it.
 	if int64(pos) < fileLen {
 		if err := qwpSfSymbolDictTruncate.load()(f, int64(pos)); err != nil {
-			_ = f.Close()
 			return nil, fmt.Errorf("qwp/sf: could not drop torn/stale symbol dictionary tail %s: %w", path, err)
 		}
 	}
@@ -402,11 +410,25 @@ func qwpSfSymbolDictReadVarint(buf []byte, pos, limit int) (uint64, int, bool) {
 	return 0, 0, false
 }
 
-func qwpSfSymbolDictOpenFresh(path string) (*qwpSfSymbolDict, error) {
+func qwpSfSymbolDictOpenFresh(path string) (result *qwpSfSymbolDict, err error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, qwpSfDurabilityError("create fresh symbol dictionary", path, err)
 	}
+	held := &qwpSfSegment{file: f, path: path}
+	resources := &qwpSfAcquiredResources{segments: []*qwpSfSegment{held}}
+	defer func() {
+		if result != nil {
+			return
+		}
+		if r := recover(); r != nil {
+			qwpSfRetainAcquisitionPanic(r, resources)
+		}
+		err = qwpSfFailedAcquisition(err, resources)
+		if resources.released() && !errors.Is(err, ErrCleanupFailed) {
+			_ = os.Remove(path)
+		}
+	}()
 	var hdr [qwpSfSymbolDictHeaderSize]byte
 	binary.LittleEndian.PutUint32(hdr[:4], qwpSfSymbolDictMagic)
 	hdr[4] = qwpSfSymbolDictVersion
@@ -415,8 +437,6 @@ func qwpSfSymbolDictOpenFresh(path string) (*qwpSfSymbolDict, error) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
 		return nil, qwpSfDurabilityError("write fresh symbol dictionary header", path, err)
 	}
 	return &qwpSfSymbolDict{file: f, path: path, appendOffset: qwpSfSymbolDictHeaderSize}, nil
@@ -506,7 +526,7 @@ func (d *qwpSfSymbolDict) close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
-		return nil
+		return d.closeErr
 	}
 	d.closed = true
 	// Drop the recovered-entry copy at teardown. The send-loop mirror and the
@@ -516,9 +536,9 @@ func (d *qwpSfSymbolDict) close() error {
 	// sender, the drain for an orphan drainer.
 	d.loaded = nil
 	if d.file != nil {
-		err := d.file.Close()
+		d.closeErr = qwpSfCloseFile(d.file)
 		d.file = nil
-		return err
+		return d.closeErr
 	}
 	return nil
 }

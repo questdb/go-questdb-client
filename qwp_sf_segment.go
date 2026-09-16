@@ -109,6 +109,7 @@ var qwpSfErrSegmentCorrupt = errors.New("qwp/sf: corrupt segment file")
 type qwpSfSegment struct {
 	path         string
 	sizeBytes    int64
+	closeErr     error // saved File.Close error; never close the same handle again
 	memoryBacked bool
 
 	// file is nil for memory-backed segments. For file-backed segments
@@ -182,7 +183,7 @@ var qwpSfTestSegmentCreateHook atomic.Pointer[func(path string)]
 // STATUS_IN_PAGE_ERROR (Windows), tearing down the process —
 // sf-client.md §6 marks block reservation a core invariant of the
 // create path.
-func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, error) {
+func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (result *qwpSfSegment, err error) {
 	if sizeBytes < qwpSfHeaderSize+qwpSfFrameHeaderSize+1 {
 		return nil, fmt.Errorf("qwp/sf: sizeBytes too small for header + one minimal frame: %d", sizeBytes)
 	}
@@ -200,15 +201,26 @@ func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, e
 	if err != nil {
 		return nil, qwpSfDurabilityError("create segment", path, err)
 	}
+	held := &qwpSfSegment{file: f, path: path}
+	resources := &qwpSfAcquiredResources{segments: []*qwpSfSegment{held}}
+	defer func() {
+		if result != nil {
+			return
+		}
+		if r := recover(); r != nil {
+			qwpSfRetainAcquisitionPanic(r, resources)
+		}
+		err = qwpSfFailedAcquisition(err, resources)
+		if resources.released() && !errors.Is(err, ErrCleanupFailed) {
+			_ = os.Remove(path)
+		}
+	}()
 	if err := qwpSfAllocate(f, sizeBytes); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
 		return nil, qwpSfDurabilityError("allocate segment", path, err)
 	}
 	buf, err := qwpSfMmapRW(f, sizeBytes)
+	held.buf = buf
 	if err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
 		return nil, qwpSfDurabilityError("map created segment", path, err)
 	}
 	s := &qwpSfSegment{
@@ -274,7 +286,7 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 // build can read it. Failing closed is what preserves the entire slot under
 // <sf_dir>/quarantined/ and lets the foreground sender start a fresh one, so
 // ingestion continues and a newer client can still be pointed at the bytes.
-func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
+func qwpSfOpenSegment(path string) (result *qwpSfSegment, err error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		return nil, qwpSfDurabilityError("stat segment", path, err)
@@ -287,23 +299,31 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	if err != nil {
 		return nil, qwpSfDurabilityError("open segment", path, err)
 	}
+	held := &qwpSfSegment{file: f, path: path}
+	resources := &qwpSfAcquiredResources{segments: []*qwpSfSegment{held}}
+	defer func() {
+		if result != nil {
+			return
+		}
+		if r := recover(); r != nil {
+			qwpSfRetainAcquisitionPanic(r, resources)
+		}
+		err = qwpSfFailedAcquisition(err, resources)
+	}()
 	buf, err := qwpSfMmapRW(f, fileSize)
+	held.buf = buf
 	if err != nil {
-		_ = f.Close()
 		return nil, qwpSfDurabilityError("map segment", path, err)
 	}
 	magic := binary.LittleEndian.Uint32(buf[0:4])
 	if magic != qwpSfFileMagic {
-		_ = qwpSfMunmap(buf)
-		_ = f.Close()
-		return nil, fmt.Errorf("%w: bad magic in %s: 0x%x", qwpSfErrSegmentCorrupt, path, magic)
+		cause := fmt.Errorf("%w: bad magic in %s: 0x%x", qwpSfErrSegmentCorrupt, path, magic)
+		return nil, cause
 	}
 	version := buf[4]
 	if version != qwpSfSegmentVersion {
-		_ = qwpSfMunmap(buf)
-		_ = f.Close()
-		return nil, qwpSfFailClosed("unsupported segment version in %s: %d (this build writes version %d)",
-			path, version, qwpSfSegmentVersion)
+		cause := qwpSfFailClosed("unsupported segment version in %s: %d (this build writes version %d)", path, version, qwpSfSegmentVersion)
+		return nil, cause
 	}
 	baseSeq := int64(binary.LittleEndian.Uint64(buf[8:16]))
 	// FSNs are non-negative by construction. A negative baseSeq on disk
@@ -314,9 +334,8 @@ func qwpSfOpenSegment(path string) (*qwpSfSegment, error) {
 	// the segment last and trip the FSN-gap error, taking the whole
 	// recovery down).
 	if baseSeq < 0 {
-		_ = qwpSfMunmap(buf)
-		_ = f.Close()
-		return nil, fmt.Errorf("%w: bad baseSeq in %s: %d", qwpSfErrSegmentCorrupt, path, baseSeq)
+		cause := fmt.Errorf("%w: bad baseSeq in %s: %d", qwpSfErrSegmentCorrupt, path, baseSeq)
+		return nil, cause
 	}
 	lastGood := qwpSfScanFrames(buf, fileSize)
 	count := qwpSfCountFrames(buf, lastGood)
@@ -703,37 +722,41 @@ func (s *qwpSfSegment) msync() error {
 	return nil
 }
 
-// close unmaps the buffer and closes the underlying file. Safe to
-// call on a segment that has been partially constructed (e.g. after
-// a failed mmap during qwpSfOpenSegment); fields that were never
-// initialised are nil and we skip them.
+// close keeps the mapping if unmapping fails, so a later call can retry.
+// File.Close closes the handle even when it reports an error. Save that error,
+// but never try to close the same handle again.
 func (s *qwpSfSegment) close() error {
-	return s.closeInternal(false)
-}
-
-// closeInternal releases the segment. With leakMapping the mmap is deliberately
-// left mapped and s.buf untouched, so a send-loop goroutine wedged in an
-// un-cancellable page fault against this mapping keeps a valid address to fault
-// against instead of hitting an unmapped page (an unrecoverable host SIGSEGV).
-// The file descriptor is still closed — a closed fd does not invalidate an
-// existing mapping — so only the address space is leaked, until process exit.
-func (s *qwpSfSegment) closeInternal(leakMapping bool) error {
-	var firstErr error
-	if !s.memoryBacked && s.buf != nil && !leakMapping {
-		if err := qwpSfMunmap(s.buf); err != nil {
-			firstErr = err
-		}
+	if s == nil {
+		return nil
 	}
-	if !leakMapping {
+	if s.buf != nil {
+		if !s.memoryBacked {
+			if err := qwpSfReleaseMapping(s.buf); err != nil {
+				return errors.Join(s.closeErr, err)
+			}
+		}
 		s.buf = nil
 	}
 	if s.file != nil {
-		if err := s.file.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		s.closeErr = errors.Join(s.closeErr, qwpSfCloseFile(s.file))
 		s.file = nil
 	}
-	return firstErr
+	return s.closeErr
+}
+
+func (s *qwpSfSegment) resourcesReleased() bool { return s == nil || (s.buf == nil && s.file == nil) }
+
+// Tests can make unmapping fail without actually releasing the memory.
+// Once the injected failure is cleared, a retry calls the OS to unmap it.
+var qwpSfTestMunmapHook atomic.Pointer[func([]byte) error]
+
+func qwpSfReleaseMapping(buf []byte) error {
+	if hook := qwpSfTestMunmapHook.Load(); hook != nil {
+		if err := (*hook)(buf); err != nil {
+			return err
+		}
+	}
+	return qwpSfMunmap(buf)
 }
 
 // segmentPath returns the file path the segment was created from /

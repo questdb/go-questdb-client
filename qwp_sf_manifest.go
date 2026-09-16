@@ -119,11 +119,12 @@ type qwpSfManifest struct {
 	generation int64
 	headBase   int64
 	activeBase int64
+	closeErr   error
 	closed     bool
 	scratch    [qwpSfDualRecordSize]byte
 }
 
-func qwpSfManifestCreate(dir string, headBase, activeBase int64) (*qwpSfManifest, error) {
+func qwpSfManifestCreate(dir string, headBase, activeBase int64) (result *qwpSfManifest, err error) {
 	if headBase < 0 || activeBase < headBase {
 		return nil, fmt.Errorf("qwp/sf: invalid manifest boundaries: head=%d active=%d", headBase, activeBase)
 	}
@@ -136,8 +137,14 @@ func qwpSfManifestCreate(dir string, headBase, activeBase int64) (*qwpSfManifest
 	ok := false
 	defer func() {
 		if !ok {
-			_ = m.close()
-			_ = os.Remove(path)
+			resources := &qwpSfAcquiredResources{manifests: []*qwpSfManifest{m}}
+			if r := recover(); r != nil {
+				qwpSfRetainAcquisitionPanic(r, resources)
+			}
+			err = qwpSfFailedAcquisition(err, resources)
+			if resources.released() && !errors.Is(err, ErrCleanupFailed) {
+				_ = os.Remove(path)
+			}
 		}
 	}()
 	if err := qwpSfAllocate(f, qwpSfDualRecordFileSize); err != nil {
@@ -169,7 +176,7 @@ func qwpSfManifestOpen(dir string) (*qwpSfManifest, error) {
 // invalid manifest is evidence to record, not a rename to perform before the
 // segment chain has been classified. qwpSfManifestOpen retains the historical
 // open-and-quarantine behavior for callers that are not constructing a plan.
-func qwpSfManifestInspect(dir string) (*qwpSfManifest, bool, error) {
+func qwpSfManifestInspect(dir string) (result *qwpSfManifest, invalid bool, err error) {
 	path := filepath.Join(dir, qwpSfManifestFileName)
 	st, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -185,13 +192,22 @@ func qwpSfManifestInspect(dir string) (*qwpSfManifest, bool, error) {
 	if err != nil {
 		return nil, false, qwpSfDurabilityError("open manifest", path, err)
 	}
+	held := &qwpSfManifest{file: f, path: path}
+	resources := &qwpSfAcquiredResources{manifests: []*qwpSfManifest{held}}
+	defer func() {
+		if result != nil {
+			return
+		}
+		if r := recover(); r != nil {
+			qwpSfRetainAcquisitionPanic(r, resources)
+		}
+		err = qwpSfFailedAcquisition(err, resources)
+	}()
 	var raw [2][qwpSfDualRecordSize]byte
 	if _, err := io.ReadFull(io.NewSectionReader(f, 0, qwpSfDualRecordSize), raw[0][:]); err != nil {
-		_ = f.Close()
 		return nil, false, qwpSfDurabilityError("read manifest slot 0", path, err)
 	}
 	if _, err := io.ReadFull(io.NewSectionReader(f, qwpSfDualRecordSlotSize, qwpSfDualRecordSize), raw[1][:]); err != nil {
-		_ = f.Close()
 		return nil, false, qwpSfDurabilityError("read manifest slot 1", path, err)
 	}
 	valid := func(rec qwpSfDualRecord) bool { return rec.first >= 0 && rec.second >= rec.first }
@@ -199,7 +215,6 @@ func qwpSfManifestInspect(dir string) (*qwpSfManifest, bool, error) {
 	r1, ok1 := qwpSfDecodeDualRecord(raw[1][:], qwpSfManifestMagic, valid)
 	rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
 	if !ok {
-		_ = f.Close()
 		return nil, true, nil
 	}
 	return &qwpSfManifest{file: f, path: path, generation: rec.generation, headBase: rec.first, activeBase: rec.second}, false, nil
@@ -256,15 +271,14 @@ func (m *qwpSfManifest) close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return nil
+		return m.closeErr
 	}
 	m.closed = true
-	if m.file == nil {
-		return nil
+	if m.file != nil {
+		m.closeErr = qwpSfCloseFile(m.file)
+		m.file = nil
 	}
-	err := m.file.Close()
-	m.file = nil
-	return err
+	return m.closeErr
 }
 
 // qwpSfManifestRemoveFile is a test seam for preserving the filesystem cause

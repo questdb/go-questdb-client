@@ -239,7 +239,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 				reporter = builtSender
 			}
 		} else {
-			engineErr := closeEngineGuarded(engine, false, conf.logger)
+			engineErr := engine.engineClose()
 			cleanupErr = qwpAppendCloseError(cleanupErr, engineErr)
 			if !engine.engineCloseCompleted() {
 				reporter = &qwpSfBuildCleanupError{
@@ -1014,31 +1014,12 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) (firstErr error) {
 			firstErr = qwpAppendCloseError(firstErr, drainerErr)
 		}()
 	}
-	// Every step ahead of the engine teardown runs behind a panic boundary so
-	// the teardown itself always runs. A fault in the pending-row encode, the
-	// drain wait or the send-loop shutdown would otherwise unwind out of Close
-	// with the engine untouched: no manager teardown, so no terminal cleanup a
-	// later claim could take over, and the drainer pool below never stopped.
-	// The pool's closeSlotGuarded recovers such a panic, which turns a stranded
-	// engine into a slot whose flock nothing ever releases.
-	//
-	// The send loop is stopped on its own boundary rather than inside the drain
-	// one, so a fault in the pending-row encode or the drain wait still joins
-	// the I/O goroutine and releases its WebSocket.
 	firstErr = s.closeCursorDrainGuarded(ctx)
-	loopStopped, loopErr := s.closeSendLoopGuarded()
-	firstErr = qwpAppendCloseError(firstErr, loopErr)
-	// Close the engine (closes ring, manager if owned, and slot lock). The
-	// segment mmaps may only be unmapped once no goroutine can still be
-	// dereferencing them. An unexpected failure before the join leaves that
-	// proof unavailable; the guarded engine path preserves the mappings.
-	leakMappings := !loopStopped
-	engineCloseErr := closeEngineGuarded(s.cursorEngine, leakMappings, logger)
-	firstErr = qwpAppendCloseError(firstErr, engineCloseErr)
-	if !s.cursorEngine.engineCloseCompleted() {
-		qwpEffectiveLogger(logger).Warn("qwp/sf: foreground close incomplete; terminal cleanup retry owner started",
-			"slot", s.cursorEngine.engineSfDir(), "error", engineCloseErr)
+	var failure error
+	if errors.Is(firstErr, ErrCleanupFailed) {
+		failure = firstErr
 	}
+	firstErr = qwpAppendCloseError(firstErr, s.cursorEngine.engineCloseWithCause(failure))
 	return firstErr
 }
 
@@ -1073,31 +1054,10 @@ type qwpCleanupPanicError struct {
 	stack []byte
 }
 
+func (e *qwpCleanupPanicError) Unwrap() error { return ErrCleanupFailed }
+
 func (e *qwpCleanupPanicError) Error() string {
 	return fmt.Sprintf("qwp: %s cleanup panicked: %v\n%s", e.phase, e.cause, e.stack)
-}
-
-// closeEngineGuarded converts every engine-close panic into an error with its
-// originating stack. Before returning any incomplete outcome it installs the
-// per-engine retry owner; this includes a pre-claim panic that rolled cleanup
-// back to open, for which neither a manager callback nor a repeated standalone
-// Close can otherwise be relied upon.
-func closeEngineGuarded(engine *qwpSfCursorEngine, leakMappings bool, logger *slog.Logger) (err error) {
-	if engine == nil {
-		return nil
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("qwp: engine close panicked: %v\n%s", r, debug.Stack())
-		}
-		if !engine.engineCloseCompleted() {
-			engine.engineStartCloseRetryOwner(logger)
-		}
-	}()
-	if leakMappings {
-		return engine.engineCloseLeakSegments()
-	}
-	return engine.engineClose()
 }
 
 // closeDrainerPoolGuarded is the final closeCursor phase boundary. The pool
@@ -1125,11 +1085,9 @@ func (s *qwpLineSender) closeCursorDrainGuarded(ctx context.Context) (firstErr e
 			// Log unconditionally: a latched fluent-API error already occupies
 			// firstErr in the common case, and a fault here would otherwise
 			// leave no record at all.
-			err := fmt.Errorf("qwp: close drain panicked: %v\n%s", r, debug.Stack())
+			err := &qwpCleanupPanicError{phase: "close drain", cause: r, stack: debug.Stack()}
 			qwpEffectiveLogger(s.cursorEngine.engineLogger()).Error("qwp: close drain panicked", "error", err)
-			if firstErr == nil {
-				firstErr = err
-			}
+			firstErr = errors.Join(firstErr, err)
 		}
 	}()
 	if hook := qwpTestCloseDrainHook.Load(); hook != nil {
@@ -1178,41 +1136,6 @@ var qwpTestAfterSendLoopBuiltHook atomic.Pointer[func()]
 // where the sender itself is the cleanup reporter. Nil in production.
 var qwpTestAfterSenderBuiltHook atomic.Pointer[func()]
 
-// closeSendLoopGuarded stops the send loop and reports whether the I/O
-// goroutine is provably done with the segment mappings. A panic here leaves
-// that unproven, so it reports false and the engine teardown leaks the
-// mappings rather than unmapping them under a possibly live reader.
-func (s *qwpLineSender) closeSendLoopGuarded() (stopped bool, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stopped = false
-			err = fmt.Errorf("qwp: send loop close panicked: %v\n%s", r, debug.Stack())
-			qwpEffectiveLogger(s.cursorEngine.engineLogger()).Error("qwp: send loop close panicked", "error", err)
-		}
-	}()
-	closeErr := s.cursorSendLoop.sendLoopClose()
-	// Returning from the owned join proves that all loop readers have exited.
-	return true, closeErr
-}
-
-// closeBuiltSendLoopGuarded covers the constructor window where the send loop
-// already owns a transport and dispatcher goroutines but no sender exists yet.
-// A fault leaves mapping safety unproven, matching closeSendLoopGuarded.
-func closeBuiltSendLoopGuarded(loop *qwpSfSendLoop, logger *slog.Logger) (stopped bool, err error) {
-	if loop == nil {
-		return true, nil
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			stopped = false
-			err = fmt.Errorf("qwp: construction send loop close panicked: %v\n%s", r, debug.Stack())
-			qwpEffectiveLogger(logger).Error("qwp: construction send loop close panicked", "error", err)
-		}
-	}()
-	closeErr := loop.sendLoopClose()
-	return true, closeErr
-}
-
 // qwpTestCloseSendLoopHook fires after sendLoopClose has published its stop and
 // cancellation signals but before it joins the I/O goroutine. Test seam only:
 // it reaches the state where joining is not proven without leaking a live,
@@ -1238,15 +1161,10 @@ func (s *qwpLineSender) closeCompleted() bool {
 	return s.cursorEngine == nil || s.cursorEngine.engineCloseCompleted()
 }
 
-func (s *qwpLineSender) ensureCloseRetryOwner(logger *slog.Logger) {
-	if s != nil && s.cursorEngine != nil {
-		s.cursorEngine.engineStartCloseRetryOwner(logger)
-	}
-}
-
-// qwpSfBuildPanic re-raises a construction panic with the cleanup reporter for
-// the engine it left behind, so the recover that catches it can reserve the
-// slot the engine's retry owner is still working on.
+// qwpSfBuildPanic carries a construction panic and a way to check cleanup of
+// the engine it left behind. Code catching the panic can then keep the pool
+// slot reserved until cleanup finishes. If cleanup cannot safely continue,
+// the slot stays reserved.
 type qwpSfBuildPanic struct {
 	cause    any
 	stack    []byte
@@ -1270,16 +1188,29 @@ func (e *qwpSfBuildCleanupError) Unwrap() error { return e.cause }
 func (e *qwpSfBuildCleanupError) closeCompleted() bool {
 	return e.engine.engineCloseCompleted()
 }
-func (e *qwpSfBuildCleanupError) ensureCloseRetryOwner(logger *slog.Logger) {
-	e.engine.engineStartCloseRetryOwner(logger)
-}
 
-func qwpSfCloseEngineAfterBuildFailure(engine *qwpSfCursorEngine, cause error, logger *slog.Logger) error {
-	closeErr := closeEngineGuarded(engine, false, logger)
+func (e *qwpSfBuildCleanupError) cleanupFailure() error { return e.engine.cleanupFailure() }
+
+func (s *qwpLineSender) cleanupFailure() error {
+	if s == nil {
+		return nil
+	}
+	if op := s.shutdown.Load(); op != nil {
+		select {
+		case <-op.done:
+			if errors.Is(op.err, ErrCleanupFailed) {
+				return op.err
+			}
+		default:
+		}
+	}
+	return s.cursorEngine.cleanupFailure()
+}
+func qwpSfCloseEngineAfterBuildFailure(engine *qwpSfCursorEngine, cause error) error {
+	closeErr := engine.engineClose()
 	if !engine.engineCloseCompleted() {
-		// The incomplete branch is exactly where closeErr carries the real
-		// durability or flock-release failure, so it belongs in the reported
-		// cause alongside the build error.
+		// Report the cleanup error as well as the construction error, so the
+		// caller knows why files or the slot lock may still be held.
 		if closeErr != nil {
 			cause = errors.Join(cause, closeErr)
 		}
@@ -1291,16 +1222,15 @@ func qwpSfCloseEngineAfterBuildFailure(engine *qwpSfCursorEngine, cause error, l
 	return cause
 }
 
-// waitCursorDrain blocks until ackedFsn ≥ publishedFsn, the
-// send-loop reports a terminal error, or the user's ctx /
-// closeFlushTimeout expires. On timeout, returns a drain-timeout
-// error carrying publishedFsn, ackedFsn, and the count of unacked
-// batches — closeCursor captures it as firstErr but still proceeds
-// with shutdown so the I/O thread, transport, and segment manager
-// always tear down cleanly. Mirrors Java QwpWebSocketSender's
-// drainOnClose contract: silently swallowing the timeout would
-// hide data loss from users who only call Close() and never call
-// Flush() afterwards.
+// waitCursorDrain waits for the server to acknowledge all published frames
+// (ackedFsn >= publishedFsn), unless the send loop fails, ctx is cancelled, or
+// closeFlushTimeout expires. A timeout error includes both frame numbers and
+// the number of batches still waiting for acknowledgement.
+//
+// closeCursor keeps the error but continues shutdown. It must still wait for
+// the send loop and manager to stop before releasing resources they can use.
+// Like Java's QwpWebSocketSender.drainOnClose, it reports the timeout so callers
+// who only call Close know that some data may not have reached the server.
 func (s *qwpLineSender) waitCursorDrain(ctx context.Context) error {
 	deadline := time.Now().Add(s.closeTimeout)
 	timer := time.NewTimer(s.closeTimeout)

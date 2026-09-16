@@ -112,6 +112,12 @@ type qwpSfSegmentRing struct {
 	closed         bool
 	manifest       *qwpSfManifest
 	rotationErr    atomic.Pointer[qwpSfRingError]
+	// closeMu allows only one close attempt at a time without holding r.mu
+	// during slow resource-release calls.
+	closeMu         sync.Mutex
+	closingSegments []*qwpSfSegment
+	closingManifest *qwpSfManifest
+	closeFailure    error
 
 	// managerWakeup is invoked by the producer on rotation or
 	// high-water-mark crossings to ask the manager to provision a
@@ -362,61 +368,71 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 	return fsn
 }
 
-// segmentRingClose releases all segments and marks the ring closed.
-// Subsequent installHotSpare calls return qwpSfErrRingClosed. Segment
-// ordering here provides no reader synchronization — a reader holding an
-// address() reference is unprotected regardless of order — so the caller must
-// ensure the send loop has joined before closing, or pass leakMappings via
-// segmentRingCloseInternal when it may still be reading (the send-loop-abandon
-// path, where a goroutine wedged in an un-cancellable page fault may still be
-// dereferencing a segment).
+// segmentRingClose may run only after the producer, manager, and send loop have
+// stopped using the ring. Keep references before clearing the ring's fields so
+// failed releases can be retried. After a panic, do not retry this close.
 func (r *qwpSfSegmentRing) segmentRingClose() error {
-	return r.segmentRingCloseInternal(false)
-}
-
-func (r *qwpSfSegmentRing) segmentRingCloseInternal(leakMappings bool) error {
-	r.mu.Lock()
-	r.closed = true
-	sealed := r.sealedSegments
-	r.sealedSegments = nil
-	// Detach the manifest under the same mutex that publishes it, so the
-	// manager's service pass either sees a live manifest it may still update or
-	// sees none at all, and never reads the field while this close writes it.
-	manifest := r.manifest
-	r.manifest = nil
-	r.mu.Unlock()
-
-	var firstErr error
-	if a := r.active.Swap(nil); a != nil {
-		if err := a.closeInternal(leakMappings); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	if r.closeFailure != nil {
+		return r.closeFailure
 	}
-	if hs := r.hotSpare.Swap(nil); hs != nil {
-		if err := hs.closeInternal(leakMappings); err != nil && firstErr == nil {
-			firstErr = err
+	func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.closed {
+			return
 		}
-	}
-	for _, s := range sealed {
+		r.closingSegments = append(r.closingSegments, r.active.Load(), r.hotSpare.Load())
+		r.closingSegments = append(r.closingSegments, r.sealedSegments...)
+		r.closingManifest = r.manifest
+		r.closed = true
+		r.active.Store(nil)
+		r.hotSpare.Store(nil)
+		r.sealedSegments = nil
+		r.manifest = nil
+	}()
+	var result error
+	for _, s := range r.closingSegments {
 		if s == nil {
 			continue
 		}
-		if err := s.closeInternal(leakMappings); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		err := qwpRunCleanupPhaseGuarded("segment", func() error {
+			if hook := qwpSfTestBeforeSegmentCloseHook.Load(); hook != nil {
+				(*hook)(s)
+			}
+			return s.close()
+		})
+		result = errors.Join(result, err)
 	}
-	if manifest != nil {
-		if err := manifest.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	result = errors.Join(result, qwpRunCleanupPhaseGuarded("manifest", r.closingManifest.close))
+	if errors.Is(result, ErrCleanupFailed) {
+		r.closeFailure = result
 	}
-	return firstErr
+	return result
 }
 
+func (r *qwpSfSegmentRing) resourcesReleased() bool {
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	if !r.closed || r.closeFailure != nil {
+		return false
+	}
+	for _, s := range r.closingSegments {
+		if !s.resourcesReleased() {
+			return false
+		}
+	}
+	return r.closingManifest == nil || r.closingManifest.file == nil
+}
+
+// Tests use this hook after the ring's fields are cleared, just before closing
+// an individual segment.
+var qwpSfTestBeforeSegmentCloseHook atomic.Pointer[func(*qwpSfSegment)]
+
 // ringManifest returns the ring's manifest, or nil once the ring is closed.
-// The field is published by recovery/construction and cleared by
-// segmentRingCloseInternal, both under r.mu; every cross-goroutine read goes
-// through here.
+// Recovery or construction sets the field, and segmentRingClose clears it.
+// Both hold r.mu. Other goroutines must use this method to read it safely.
 func (r *qwpSfSegmentRing) ringManifest() *qwpSfManifest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -612,7 +628,7 @@ func (r *qwpSfSegmentRing) installHotSpare(spare *qwpSfSegment) error {
 // totalSegmentBytes returns the sum of all segment sizes the ring
 // currently owns: active + hot spare (if installed) + every sealed
 // segment. Used by qwpSfSegmentManager to seed its totalBytes
-// accounting at register time and reverse it at deregister time.
+// accounting when registering the ring.
 func (r *qwpSfSegmentRing) totalSegmentBytes() int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()

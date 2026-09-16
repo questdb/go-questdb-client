@@ -444,10 +444,8 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// whether the mappings are safe to unmap. This must precede even logger
 	// setup and test seams: either can run user/fault-injection code.
 	var loop *qwpSfSendLoop
-	loopStopped := true
 	defer func() {
-		leakMappings := loop != nil && !loopStopped
-		closeErr := closeEngineGuarded(engine, leakMappings, d.logger)
+		closeErr := engine.engineClose()
 		if closeErr != nil {
 			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer engine close failed",
 				"slot", d.slotPath, "error", closeErr)
@@ -538,14 +536,6 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	loop = qwpSfNewSendLoop(engine, transport, d.clientFactory,
 		qwpSfDefaultParkInterval,
 		d.reconnectMaxDuration, d.reconnectInitialBackoff, d.reconnectMaxBackoff)
-	defer func() {
-		var loopErr error
-		loopStopped, loopErr = closeBuiltSendLoopGuarded(loop, d.logger)
-		if loopErr != nil {
-			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer send loop close failed",
-				"slot", d.slotPath, "error", loopErr)
-		}
-	}()
 	loop.logger = qwpEffectiveLogger(d.logger)
 	// A durable-ack drainer trims the orphan slot only on STATUS_DURABLE_ACK, so
 	// recovered data is not deleted before it is durably uploaded. A mismatch is
@@ -911,6 +901,6 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 // the remaining close body still cancels the master context. Nil in production.
 var qwpTestDrainerPoolCloseHook atomic.Pointer[func()]
 
-// qwpSfTestAfterDrainerEngineOpenHook exposes the engine only to lifecycle
-// tests that must join its retry owner before allowing TempDir cleanup.
+// qwpSfTestAfterDrainerEngineOpenHook gives tests access to the engine so they
+// can wait for its cleanup worker to stop before removing the test directory.
 var qwpSfTestAfterDrainerEngineOpenHook atomic.Pointer[func(*qwpSfCursorEngine)]

@@ -50,15 +50,12 @@ const (
 	qwpSfManagerMaintenanceFailureDuration = 1 * time.Second
 )
 
-// qwpSfManagerCloseGrace bounds how long close() waits for the worker
-// goroutine or an individual ring service pass to quiesce. It is a variable so
-// the timeout paths can be tested without sleeping for five seconds.
+// qwpSfManagerCloseGrace limits how long internal close calls wait, not how
+// long cleanup may run. The engine's cleanup worker waits for the manager to
+// stop, without a timeout. Tests may shorten the caller's wait.
 var qwpSfManagerCloseGrace = qwpSfSwappable(5 * time.Second)
 
-// qwpSfTestBeforeTrimAccountingHook is a test seam for the narrow race between
-// draining a trim batch and reconciling manager byte accounting. Production
-// leaves it nil.
-var qwpSfTestBeforeTrimAccountingHook atomic.Pointer[func(*qwpSfManagerRingEntry)]
+var qwpSfTestAfterSpareCreateHook atomic.Pointer[func(*qwpSfManagerRingEntry)]
 
 func qwpSfSyncSpareCreationEpoch(dir, path string) error {
 	if err := qwpSfSyncSlotDir(dir); err != nil {
@@ -84,18 +81,14 @@ func qwpSfSyncPostTrimEpoch(dir string) error {
 // qwpSfUnlimitedTotalBytes disables the per-engine total-bytes cap.
 const qwpSfUnlimitedTotalBytes int64 = math.MaxInt64
 
-// qwpSfSegmentManager is the background worker that keeps every
-// registered qwpSfSegmentRing supplied with a hot-spare segment and
-// trims segments after their frames have been ACK'd. Off the
-// user-thread / I/O-thread hot path entirely: the expensive
-// open+truncate+mmap for spare creation and munmap+unlink for trim
-// happen on this goroutine, never on the latency-sensitive paths.
+// qwpSfSegmentManager prepares spare segments and removes old ones after the
+// server acknowledges their frames. This background worker handles slow file
+// and memory-mapping operations so appending and sending do not have to.
 //
-// One instance can serve many rings (typically all sender instances
-// in a process). Polls each ring on a configurable tick (default
-// 1 ms) — short enough that a producer rarely sees
-// qwpSfBackpressureNoSpare in the steady state, long enough that an
-// idle process doesn't burn CPU.
+// Each production engine has its own manager. Tests can register several rings
+// with one manager to check space accounting. The manager checks for work every
+// millisecond by default, keeping a spare ready without continuously polling
+// when idle.
 type qwpSfSegmentManager struct {
 	segmentSizeBytes int64
 	pollInterval     time.Duration
@@ -106,9 +99,8 @@ type qwpSfSegmentManager struct {
 	scanQuarantinedBytes func(string) (int64, error)
 	removeFile           func(string) error
 
-	// fileGeneration is a monotonic counter that names spare files
-	// (sf-<gen:016x>.sfa). Per-process, not per-ring; recovery skips
-	// the counter past existing on-disk segments at register time.
+	// fileGeneration increases for each spare filename (sf-<gen:016x>.sfa).
+	// When registering a recovered ring, skip past numbers already on disk.
 	fileGeneration atomic.Uint64
 
 	// logger sinks the cap-reached backpressure diagnostic. The manager's
@@ -117,11 +109,10 @@ type qwpSfSegmentManager struct {
 	// (the zero value) -> slog.Default() via qwpEffectiveLogger.
 	logger atomic.Pointer[slog.Logger]
 
-	// workerPanic holds the detail of a worker-goroutine panic. Once set, spare
-	// provisioning and trim have stopped, so producers would otherwise stall in
-	// backpressure forever; engineTerminalError surfaces it as a terminal on the
-	// next append instead.
-	workerPanic atomic.Pointer[string]
+	// A panic or internal cleanup failure stops this manager permanently.
+	// Its engine keeps the entries and any resources opened before the failure.
+	workerErr          atomic.Pointer[error]
+	failedAcquisitions *qwpSfAcquiredResources // read only after the worker stops
 
 	mu    sync.Mutex
 	rings []*qwpSfManagerRingEntry
@@ -137,21 +128,7 @@ type qwpSfSegmentManager struct {
 	// done is closed when the worker goroutine exits.
 	done chan struct{}
 
-	// workerGoid is used only to avoid self-waiting in the test-only shared
-	// manager close path.
-	workerGoid atomic.Int64
-
-	// Protected by mu. started means segmentManagerStart launched the worker,
-	// so m.done has a goroutine that will eventually close it. Without the
-	// worker, close must not wait on m.done and no cleanup may be handed to it.
 	started bool
-
-	// Protected by mu. workerLoopExited means the worker is past the ring loop
-	// and can no longer touch any registered ring. An owned engine may hand its
-	// terminal cleanup to the worker's finite exit block after a close timeout.
-	workerLoopExited       bool
-	workerReaped           bool
-	ownedEngineExitCleanup *qwpSfManagerCleanupHandoff
 
 	// ringSnapshot is workerLoop's reusable copy of rings. Each tick
 	// refills it from rings under mu, then releases mu before the
@@ -159,30 +136,6 @@ type qwpSfSegmentManager struct {
 	// the lock held. Owned solely by workerLoop; the locked refill is
 	// its only synchronization.
 	ringSnapshot []*qwpSfManagerRingEntry
-}
-
-const (
-	qwpSfManagerRingRegistered int32 = iota
-	qwpSfManagerRingInService
-	qwpSfManagerRingDeregisteredInService
-	qwpSfManagerRingDeregistered
-)
-
-type qwpSfManagerHandoffResult uint8
-
-const (
-	qwpSfManagerHandoffQuiescent qwpSfManagerHandoffResult = iota
-	qwpSfManagerHandoffAccepted
-	qwpSfManagerHandoffBusy
-)
-
-// qwpSfManagerCleanupHandoff is the exact capability installed for one engine
-// cleanup generation. accepted lets an unwinding foreground caller distinguish
-// "panic before registration" from "the manager owns this exact callback now"
-// without inferring ownership from a reusable boolean marker.
-type qwpSfManagerCleanupHandoff struct {
-	cleanup  func()
-	accepted atomic.Bool
 }
 
 // qwpSfManagerRingEntry holds a registered ring and the directory
@@ -208,8 +161,6 @@ type qwpSfManagerRingEntry struct {
 	// engineClose, after this entry is quiescent). Entries are shared
 	// pointers so close and the worker observe one state machine.
 	watermark *qwpSfAckWatermark
-	state     atomic.Int32
-	cleanup   atomic.Pointer[qwpSfManagerCleanupHandoff]
 	// These fields track the current run of maintenance failures. Only the worker
 	// changes them. A pass that does no work leaves them unchanged. Successful
 	// maintenance clears them.
@@ -225,6 +176,12 @@ type qwpSfManagerRingEntry struct {
 	// would keep handing the ring capacity for space it never got back, letting
 	// the slot grow past its cap while the disk fills. Worker goroutine only.
 	pendingUnlinks []qwpSfPendingUnlink
+	// Keep references to segments being created or removed, so a panic cannot
+	// lose track of their mappings. Only the manager worker uses these fields
+	// until it stops; then the engine's cleanup worker may read them.
+	spareInProgress *qwpSfSegment
+	trimInProgress  []*qwpSfSegment
+	releaseErr      error
 	// dirSyncPending records that a post-trim directory fsync failed, so the
 	// unlinks that pass did complete are not durable yet. Retried by later
 	// passes for the same reason as pendingUnlinks. Worker goroutine only.
@@ -234,6 +191,8 @@ type qwpSfManagerRingEntry struct {
 // qwpSfPendingUnlink is one trimmed segment file that could not be removed,
 // with the bytes still charged to the manager on its behalf.
 type qwpSfPendingUnlink struct {
+	segment   *qwpSfSegment
+	acquired  *qwpSfAcquiredResources
 	path      string
 	sizeBytes int64
 }
@@ -262,42 +221,6 @@ func (e *qwpSfManagerRingEntry) entryMaintenanceSucceeded() {
 	e.maintenanceFailureSince = time.Time{}
 	e.maintenanceLastError = nil
 	e.maintenanceError.Store(nil)
-}
-
-func (e *qwpSfManagerRingEntry) isInService() bool {
-	if e == nil {
-		return false
-	}
-	s := e.state.Load()
-	return s == qwpSfManagerRingInService || s == qwpSfManagerRingDeregisteredInService
-}
-
-func (e *qwpSfManagerRingEntry) deregister() {
-	if e == nil {
-		return
-	}
-	for {
-		s := e.state.Load()
-		switch s {
-		case qwpSfManagerRingRegistered:
-			if e.state.CompareAndSwap(s, qwpSfManagerRingDeregistered) {
-				return
-			}
-		case qwpSfManagerRingInService:
-			if e.state.CompareAndSwap(s, qwpSfManagerRingDeregisteredInService) {
-				return
-			}
-		default:
-			return
-		}
-	}
-}
-
-func (e *qwpSfManagerRingEntry) finishService() {
-	if e.state.CompareAndSwap(qwpSfManagerRingDeregisteredInService, qwpSfManagerRingDeregistered) {
-		return
-	}
-	e.state.CompareAndSwap(qwpSfManagerRingInService, qwpSfManagerRingRegistered)
 }
 
 // qwpSfNewSegmentManager constructs a manager with the given
@@ -330,106 +253,43 @@ func qwpSfNewSegmentManager(segmentSizeBytes int64, pollInterval time.Duration, 
 // second call is a panic, mirroring Java's IllegalStateException.
 func (m *qwpSfSegmentManager) segmentManagerStart() {
 	m.mu.Lock()
-	if m.closed {
+	if m.closed || m.started {
 		m.mu.Unlock()
-		panic("qwp/sf: segment manager already closed")
+		panic("qwp/sf: segment manager already started or closed")
 	}
 	m.started = true
 	m.mu.Unlock()
 	go m.workerLoop()
 }
 
-// segmentManagerClose stops the worker goroutine and waits up to
-// qwpSfManagerCloseGrace for it to exit. After close, the manager
-// rejects new registrations and the worker no longer provisions or
-// trims segments — but already-installed spares stay with their
-// rings (the rings close them on their own segmentRingClose).
-//
-// Returns true only when no worker can still touch the slot: either one was
-// never started, or the one that was is provably past its ring loop.
-// Idempotent; safe to call from any goroutine other than the worker itself.
-func (m *qwpSfSegmentManager) segmentManagerClose() bool {
+// segmentManagerStop asks the worker to stop and returns a channel that closes
+// once it has stopped. It does not release resources; engine cleanup does that.
+func (m *qwpSfSegmentManager) segmentManagerStop() <-chan struct{} {
 	m.mu.Lock()
 	if !m.closed {
 		m.closed = true
-	}
-	if m.workerReaped {
-		m.mu.Unlock()
-		return true
-	}
-	if !m.started {
-		// No worker was ever launched, so m.done stays open forever. Waiting on
-		// it would burn the whole grace and then report a non-quiescent manager,
-		// handing cleanup to a goroutine that will never run it. Nothing can be
-		// mid-service either: quiescence is immediate and provable.
-		m.workerReaped = true
-		m.workerLoopExited = true
-		m.mu.Unlock()
-		return true
-	}
-	m.mu.Unlock()
-	// Wake the worker so it observes closed and exits promptly.
-	select {
-	case m.wakeup <- struct{}{}:
-	default:
-	}
-	// Bound the wait so a stuck worker can't deadlock close().
-	graceTimer := time.NewTimer(qwpSfManagerCloseGrace.load())
-	select {
-	case <-m.done:
-		graceTimer.Stop()
-		m.mu.Lock()
-		m.workerReaped = true
-		m.mu.Unlock()
-		return true
-	case <-graceTimer.C:
-	}
-	m.mu.Lock()
-	exited := m.workerLoopExited
-	m.mu.Unlock()
-	if !exited {
-		return false
-	}
-	// The loop is past every ring. A second bounded wait only avoids
-	// reporting quiescence while a previously handed-off cleanup is running.
-	graceTimer.Reset(qwpSfManagerCloseGrace.load())
-	select {
-	case <-m.done:
-		if !graceTimer.Stop() {
-			select {
-			case <-graceTimer.C:
-			default:
-			}
+		if !m.started {
+			close(m.done)
 		}
-	case <-graceTimer.C:
 	}
-	m.mu.Lock()
-	m.workerReaped = true
 	m.mu.Unlock()
-	return true
+	m.wakeWorker()
+	return m.done
 }
 
-// segmentManagerDeregister stops tracking the given ring. Pending
-// spares for the ring are NOT created after this returns, but
-// already-installed spares stay with the ring. Idempotent; safe to
-// call from any goroutine.
-func (m *qwpSfSegmentManager) segmentManagerDeregister(ring *qwpSfSegmentRing) *qwpSfManagerRingEntry {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for i, e := range m.rings {
-		if e.ring == ring {
-			e.deregister()
-			// Remove this ring's live and quarantined bytes from totalBytes.
-			m.totalBytes -= e.accountedBytes + e.quarantinedBytes
-			e.accountedBytes = 0
-			e.quarantinedBytes = 0
-			// O(N) remove preserving order — register order matters
-			// for log ordering, not correctness.
-			m.rings = append(m.rings[:i], m.rings[i+1:]...)
-			return e
-		}
+// segmentManagerClose asks the worker to stop and waits for a limited time.
+// It is used when calling the manager directly, including in tests. Engine
+// cleanup instead waits on segmentManagerStop's channel without a timeout.
+func (m *qwpSfSegmentManager) segmentManagerClose() bool {
+	done := m.segmentManagerStop()
+	timer := time.NewTimer(qwpSfManagerCloseGrace.load())
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
 	}
-	return nil
 }
 
 // segmentManagerRegister registers a ring with no ack-watermark
@@ -541,11 +401,10 @@ func qwpSfScanMaxGeneration(dir string) (maxGen uint64, found bool) {
 	return maxGen, found
 }
 
-// nextSparePath returns the next available <dir>/sf-<gen:016x>.sfa
-// path. Spare files use a process-wide monotonic counter rather than
-// a baseSeq-derived name, because the spare's baseSeq is provisional
-// at create time. Recovery discovers segments by extension + header
-// magic, not by filename.
+// nextSparePath returns the next available <dir>/sf-<gen:016x>.sfa path.
+// Spare filenames use an increasing counter because the segment's starting
+// frame number is not yet final. Recovery identifies segments by their file
+// extension and header, not by the number in the filename.
 func (m *qwpSfSegmentManager) nextSparePath(dir string) string {
 	gen := m.fileGeneration.Add(1) - 1
 	return filepath.Join(dir, fmt.Sprintf("sf-%016x.sfa", gen))
@@ -557,7 +416,6 @@ func (m *qwpSfSegmentManager) nextSparePath(dir string) string {
 // segments. Sleeps pollInterval between iterations; pre-empted by a
 // wakeWorker signal from the producer.
 func (m *qwpSfSegmentManager) workerLoop() {
-	m.workerGoid.Store(qwpGoid())
 	timer := time.NewTimer(m.pollInterval)
 	defer timer.Stop()
 	// This goroutine drives no untrusted input, so a panic here is not a
@@ -565,21 +423,18 @@ func (m *qwpSfSegmentManager) workerLoop() {
 	// crash the host. Provisioning and trim are now dead, so latch the failure:
 	// engineTerminalError surfaces it to producers on their next append rather
 	// than letting them stall in backpressure forever with no signal. The
-	// deferred close(m.done)/worker.Done still run and signal shutdown.
+	// deferred close(m.done) signals worker exit.
 	defer func() {
 		if r := recover(); r != nil {
+			if held, ok := r.(*qwpSfAcquisitionPanic); ok {
+				m.failedAcquisitions = held.resources
+			}
 			detail := fmt.Sprintf("%v\n%s", r, debug.Stack())
-			m.workerPanic.Store(&detail)
+			failure := fmt.Errorf("qwp/sf: segment manager worker stopped: %s", detail)
+			m.workerErr.Store(&failure)
 			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager worker panicked",
 				"detail", detail)
 		}
-		m.workerGoid.Store(0)
-		m.mu.Lock()
-		m.workerLoopExited = true
-		cleanup := m.ownedEngineExitCleanup
-		m.ownedEngineExitCleanup = nil
-		m.mu.Unlock()
-		m.runDeferredCleanup(cleanup, "deferred owned-engine cleanup failed on manager-worker exit")
 		close(m.done)
 	}()
 	for {
@@ -594,19 +449,10 @@ func (m *qwpSfSegmentManager) workerLoop() {
 		m.ringSnapshot = append(m.ringSnapshot[:0], m.rings...)
 		m.mu.Unlock()
 		for _, e := range m.ringSnapshot {
-			if !e.state.CompareAndSwap(qwpSfManagerRingRegistered, qwpSfManagerRingInService) {
-				continue
+			m.serviceRing(e)
+			if m.managerWorkerError() != nil {
+				return
 			}
-			func() {
-				defer func() {
-					e.finishService()
-					cleanup := e.cleanup.Swap(nil)
-					if cleanup != nil {
-						m.runDeferredCleanup(cleanup, "deferred ring cleanup failed after manager service")
-					}
-				}()
-				m.serviceRing(e)
-			}()
 		}
 		if !timer.Stop() {
 			select {
@@ -622,83 +468,11 @@ func (m *qwpSfSegmentManager) workerLoop() {
 	}
 }
 
-func (m *qwpSfSegmentManager) runDeferredCleanup(handoff *qwpSfManagerCleanupHandoff, message string) {
-	if handoff == nil || handoff.cleanup == nil {
-		return
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: "+message, "panic", r, "stack", string(debug.Stack()))
-		}
-	}()
-	handoff.cleanup()
-}
-
-// deferOwnedCleanupUntilWorkerExit transfers terminal engine cleanup to the
-// owned manager's exit block. true means the worker owns it now. false means
-// nothing was handed off -- the worker is past its loop, was never started, or
-// its one cleanup slot is already taken -- so the caller cleans up inline.
-func (m *qwpSfSegmentManager) deferOwnedCleanupUntilWorkerExit(cleanup func()) bool {
-	handoff := &qwpSfManagerCleanupHandoff{cleanup: cleanup}
-	return m.deferOwnedCleanupHandoffUntilWorkerExit(handoff) == qwpSfManagerHandoffAccepted
-}
-
-func (m *qwpSfSegmentManager) deferOwnedCleanupHandoffUntilWorkerExit(handoff *qwpSfManagerCleanupHandoff) qwpSfManagerHandoffResult {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.started || m.workerLoopExited || m.workerReaped {
-		return qwpSfManagerHandoffQuiescent
-	}
-	if m.ownedEngineExitCleanup != nil {
-		// The slot is already taken by another engine's cleanup, so this one
-		// was not handed off. Reporting true here would claim a handoff that
-		// never happened and leave the caller's cleanup with no owner at all.
-		return qwpSfManagerHandoffBusy
-	}
-	m.ownedEngineExitCleanup = handoff
-	handoff.accepted.Store(true)
-	return qwpSfManagerHandoffAccepted
-}
-
-func (m *qwpSfSegmentManager) awaitRingQuiescence(entry *qwpSfManagerRingEntry) bool {
-	if entry == nil || m.workerGoid.Load() == 0 || m.workerGoid.Load() == qwpGoid() {
-		return true
-	}
-	deadline := time.Now().Add(qwpSfManagerCloseGrace.load())
-	for entry.isInService() {
-		if !time.Now().Before(deadline) {
-			return false
-		}
-		time.Sleep(time.Millisecond)
-	}
-	return true
-}
-
-func (m *qwpSfSegmentManager) deferHandoffUntilRingQuiescent(entry *qwpSfManagerRingEntry, handoff *qwpSfManagerCleanupHandoff) qwpSfManagerHandoffResult {
-	if entry == nil || !entry.isInService() {
-		return qwpSfManagerHandoffQuiescent
-	}
-	if entry.cleanup.CompareAndSwap(nil, handoff) {
-		if entry.isInService() {
-			handoff.accepted.Store(true)
-			return qwpSfManagerHandoffAccepted
-		}
-		if entry.cleanup.CompareAndSwap(handoff, nil) {
-			return qwpSfManagerHandoffQuiescent
-		}
-		// The worker took this exact capability between the state check and
-		// rollback CAS. It is accepted even if its callback already ran.
-		handoff.accepted.Store(true)
-		return qwpSfManagerHandoffAccepted
-	}
-	return qwpSfManagerHandoffBusy
-}
-
 // managerWorkerError returns a terminal error when the worker goroutine has
 // panicked and stopped provisioning/trimming, or nil while it is healthy.
 func (m *qwpSfSegmentManager) managerWorkerError() error {
-	if d := m.workerPanic.Load(); d != nil {
-		return fmt.Errorf("qwp/sf: segment manager worker stopped: %s", *d)
+	if err := m.workerErr.Load(); err != nil {
+		return *err
 	}
 	return nil
 }
@@ -732,8 +506,9 @@ func qwpSfQuarantinedBytes(dir string) (int64, error) {
 	return total, nil
 }
 
-// reconcileQuarantinedBytes rescans one slot. The scan runs without m.mu. If
-// deregistration finishes during the scan, the result is ignored.
+// reconcileQuarantinedBytes recounts the bytes in a slot's .corrupt files
+// without holding m.mu. Engine cleanup waits for this worker to stop before
+// releasing the slot.
 func (m *qwpSfSegmentManager) reconcileQuarantinedBytes(e *qwpSfManagerRingEntry, now time.Time) error {
 	if e == nil || e.dir == "" || (!e.lastQuarantineReconcile.IsZero() && now.Sub(e.lastQuarantineReconcile) < qwpSfManagerQuarantineReconcileInterval) {
 		return nil
@@ -747,10 +522,6 @@ func (m *qwpSfSegmentManager) reconcileQuarantinedBytes(e *qwpSfManagerRingEntry
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	state := e.state.Load()
-	if state == qwpSfManagerRingDeregisteredInService || state == qwpSfManagerRingDeregistered {
-		return nil
-	}
 	m.totalBytes += quarantinedBytes - e.quarantinedBytes
 	e.quarantinedBytes = quarantinedBytes
 	return nil
@@ -778,10 +549,9 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	// the pass cannot report success over it.
 	var spareErr error
 	if e.ring.needsHotSpare() {
-		// Snapshot totalBytes under lock — register/deregister can
-		// mutate it from caller goroutines. Heavy provisioning I/O
-		// happens outside the lock; the post-install commit
-		// re-acquires it.
+		// Read totalBytes under the lock because other goroutines can change it
+		// when registering rings. Create the spare outside the lock, then take
+		// the lock again when installing it and updating the byte count.
 		m.mu.Lock()
 		observedTotal := m.totalBytes
 		quarantined := e.quarantinedBytes
@@ -831,9 +601,16 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			)
 			if memoryMode {
 				spare, err = qwpSfCreateInMemorySegment(e.ring.nextSeqHint(), m.segmentSizeBytes)
+				e.spareInProgress = spare
 			} else {
 				path = m.nextSparePath(e.dir)
 				spare, err = qwpSfCreateSegment(path, e.ring.nextSeqHint(), m.segmentSizeBytes)
+				e.spareInProgress = spare
+				if err == nil {
+					if hook := qwpSfTestAfterSpareCreateHook.Load(); hook != nil {
+						(*hook)(e)
+					}
+				}
 				if err == nil && e.ring.ringManifest() != nil {
 					err = spare.markManifestRequired()
 				}
@@ -853,10 +630,8 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 				}
 			}
 			if err == nil {
-				// Install + commit atomically under the manager lock.
-				// If e.ring was deregistered between the snapshot
-				// above and now, abandoning the spare here is the
-				// only way to keep totalBytes consistent.
+				// Install the spare and update its byte count under the same lock.
+				// Only rings registered with this manager may use its space.
 				m.mu.Lock()
 				stillRegistered := false
 				for i := range m.rings {
@@ -892,8 +667,25 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 				// carried to the end of the pass rather than reported here so
 				// the trim below still runs: on a full disk the trim is what
 				// frees the space the spare needs.
-				spareErr = errors.Join(err, m.cleanupUninstalledSpare(e, spare, path))
+				var held *qwpSfAcquisitionError
+				if errors.As(err, &held) {
+					// Keep the opened resources before any error-handling path can
+					// try to remove their file.
+					e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{acquired: held.resources, path: path, sizeBytes: m.segmentSizeBytes})
+					m.mu.Lock()
+					m.totalBytes += m.segmentSizeBytes
+					e.accountedBytes += m.segmentSizeBytes
+					m.mu.Unlock()
+					spareErr = err
+					if errors.Is(err, ErrCleanupFailed) {
+						m.recordServiceError(e, err)
+						return
+					}
+				} else {
+					spareErr = errors.Join(err, m.cleanupUninstalledSpare(e, spare, path))
+				}
 			}
+			e.spareInProgress = nil // the reference is now saved in the ring or pendingUnlinks
 		}
 	}
 
@@ -976,15 +768,20 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			return
 		}
 	}
+	e.trimInProgress = trim
 	trim = e.ring.drainTrimBatch(len(trim))
 	trimErr := errors.Join(spareErr, deferredErr)
 	trimmedBytes := int64(0)
 	for _, s := range trim {
 		path := s.segmentPath()
 		sz := s.segmentSize()
-		if err := s.close(); err != nil && trimErr == nil {
-			trimErr = err
+		closeErr := s.close()
+		trimErr = errors.Join(trimErr, closeErr)
+		if !s.resourcesReleased() {
+			e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{segment: s, path: path, sizeBytes: sz})
+			continue
 		}
+		e.releaseErr = errors.Join(e.releaseErr, s.closeErr)
 		if path != "" {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				// The file is still occupying the slot, so hold its bytes and
@@ -999,6 +796,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		}
 		trimmedBytes += sz
 	}
+	e.trimInProgress = nil
 	if !memoryMode {
 		if err := qwpSfSyncPostTrimEpoch(e.dir); err != nil {
 			e.dirSyncPending = true
@@ -1014,9 +812,6 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	} else {
 		e.entryMaintenanceSucceeded()
 	}
-	if hook := qwpSfTestBeforeTrimAccountingHook.Load(); hook != nil {
-		(*hook)(e)
-	}
 	m.commitTrimAccounting(e, trimmedBytes)
 }
 
@@ -1024,37 +819,33 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 // If removal fails, it counts one segment and tries again later. This may count
 // more than a partial file uses, but it never lets the manager exceed the limit.
 func (m *qwpSfSegmentManager) cleanupUninstalledSpare(e *qwpSfManagerRingEntry, spare *qwpSfSegment, path string) error {
-	var closeErr error
-	if spare != nil {
-		closeErr = spare.close()
+	closeErr := spare.close()
+	if spare.resourcesReleased() {
+		if spare != nil {
+			e.releaseErr = errors.Join(e.releaseErr, spare.closeErr)
+		}
+		if path == "" {
+			return closeErr
+		}
+		removeErr := m.removeFile(path)
+		if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
+			return closeErr
+		}
+		closeErr = errors.Join(closeErr, qwpSfDurabilityError("remove uninstalled spare", path, removeErr))
 	}
-	if path == "" {
-		return closeErr
-	}
-	removeErr := m.removeFile(path)
-	if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
-		return closeErr
-	}
-	removeErr = qwpSfDurabilityError("remove uninstalled spare", path, removeErr)
-	retained := false
+	// Save unfinished work for the manager's next attempt or engine cleanup.
+	e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{segment: spare, path: path, sizeBytes: m.segmentSizeBytes})
 	m.mu.Lock()
-	state := e.state.Load()
-	if state != qwpSfManagerRingDeregisteredInService && state != qwpSfManagerRingDeregistered {
-		m.totalBytes += m.segmentSizeBytes
-		e.accountedBytes += m.segmentSizeBytes
-		e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{path: path, sizeBytes: m.segmentSizeBytes})
-		retained = true
-	}
+	m.totalBytes += m.segmentSizeBytes
+	e.accountedBytes += m.segmentSizeBytes
 	m.mu.Unlock()
-	if !retained {
-		m.logServiceError(e.dir, removeErr)
-	}
-	return errors.Join(closeErr, removeErr)
+	return closeErr
 }
 
-// retryDeferredTrimWork re-attempts the unlinks and the directory fsync that
-// earlier passes could not complete, and returns the bytes reclaimed by the
-// files that are now gone. Worker goroutine only.
+// retryDeferredTrimWork retries unfinished resource releases, file removals,
+// and directory syncs. It returns the number of bytes freed by removed files.
+// The manager calls it while running. After the manager stops, the engine's
+// cleanup worker finishes any remaining work.
 func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (int64, error) {
 	if len(e.pendingUnlinks) == 0 && !e.dirSyncPending {
 		return 0, nil
@@ -1063,7 +854,31 @@ func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (i
 	var firstErr error
 	kept := e.pendingUnlinks[:0]
 	for _, pending := range e.pendingUnlinks {
-		if err := m.removeFile(pending.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if pending.acquired != nil {
+			closeErr := pending.acquired.close()
+			if !pending.acquired.released() || errors.Is(closeErr, ErrCleanupFailed) {
+				kept = append(kept, pending)
+				firstErr = errors.Join(firstErr, closeErr)
+				continue
+			}
+			e.releaseErr = errors.Join(e.releaseErr, closeErr)
+			pending.acquired = nil
+		}
+		if pending.segment != nil {
+			closeErr := pending.segment.close()
+			if !pending.segment.resourcesReleased() {
+				kept = append(kept, pending)
+				firstErr = errors.Join(firstErr, closeErr)
+				continue
+			}
+			e.releaseErr = errors.Join(e.releaseErr, pending.segment.closeErr)
+			pending.segment = nil
+		}
+		var removeErr error
+		if pending.path != "" {
+			removeErr = m.removeFile(pending.path)
+		}
+		if err := removeErr; err != nil && !errors.Is(err, os.ErrNotExist) {
 			kept = append(kept, pending)
 			if firstErr == nil {
 				firstErr = qwpSfDurabilityError("retry unlink of trimmed segment", pending.path, err)
@@ -1092,13 +907,8 @@ func (m *qwpSfSegmentManager) commitTrimAccounting(e *qwpSfManagerRingEntry, tri
 		return
 	}
 	m.mu.Lock()
-	// Deregistration removes entry.accountedBytes, which still includes this
-	// batch until the accounting commit. If it won the race, the zero value here
-	// proves there is nothing left to subtract; otherwise commit both totals.
-	if state := e.state.Load(); state != qwpSfManagerRingDeregisteredInService && state != qwpSfManagerRingDeregistered {
-		m.totalBytes -= trimmedBytes
-		e.accountedBytes -= trimmedBytes
-	}
+	m.totalBytes -= trimmedBytes
+	e.accountedBytes -= trimmedBytes
 	m.mu.Unlock()
 }
 
@@ -1106,6 +916,9 @@ func (m *qwpSfSegmentManager) commitTrimAccounting(e *qwpSfManagerRingEntry, tri
 // delay, producers see the disk error instead of a generic backpressure error.
 // Only the worker calls this method.
 func (m *qwpSfSegmentManager) recordServiceError(e *qwpSfManagerRingEntry, err error) {
+	if errors.Is(err, ErrCleanupFailed) {
+		m.workerErr.Store(&err)
+	}
 	dir := ""
 	if e != nil {
 		dir = e.dir
@@ -1138,4 +951,14 @@ func (m *qwpSfSegmentManager) logServiceError(dir string, err error) {
 	if shouldLog {
 		qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager maintenance failed; will retry", "dir", dir, "error", err)
 	}
+}
+
+// closeServiceResidue finishes work left by the manager. Call it only after
+// the manager worker has stopped.
+func (m *qwpSfSegmentManager) closeServiceResidue(e *qwpSfManagerRingEntry) error {
+	_, err := m.retryDeferredTrimWork(e)
+	return errors.Join(e.releaseErr, err)
+}
+func (e *qwpSfManagerRingEntry) serviceResidueReleased() bool {
+	return e.spareInProgress == nil && len(e.trimInProgress) == 0 && len(e.pendingUnlinks) == 0 && !e.dirSyncPending
 }

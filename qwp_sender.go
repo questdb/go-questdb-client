@@ -520,7 +520,7 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 	factory := qwpSfBuildReconnectFactory(address, opts, dumpWriter)
 	transport, err := factory(ctx, 0)
 	if err != nil {
-		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err, nil)
+		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err)
 	}
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,

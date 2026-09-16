@@ -127,7 +127,9 @@ func TestQwpSenderPoolMemoryBuildCleanupDoesNotConsumeCapacity(t *testing.T) {
 	p := &qwpSenderPool{maxSize: 1}
 	slot := &qwpSenderSlot{slotIndex: -1, cleanup: &qwpLineSender{}}
 
-	p.reclaimFailedBuild(slot, -1, errors.New("injected memory build failure"))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reclaimFailedBuildLocked(slot, -1, errors.New("injected memory build failure"))
 
 	require.Zero(t, p.capUsedLocked())
 }
@@ -1530,8 +1532,8 @@ func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
 // waiting on completes.
 const qwpPoolTestUnhurriedAcquire = 30 * time.Second
 
-// TestQwpSenderPoolReprobesDeferredClose restores an SF slot index only after
-// the delegate's manager worker has completed deferred terminal cleanup.
+// TestQwpSenderPoolReprobesDeferredClose checks that the pool reuses a slot
+// only after cleanup has waited for the manager to stop and released the slot.
 func TestQwpSenderPoolReprobesDeferredClose(t *testing.T) {
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)
@@ -2315,14 +2317,33 @@ func TestQwpSenderPoolReprobeSurvivesAFaultingSlot(t *testing.T) {
 // neverDoneSlot reports a cleanup that has not finished.
 type neverDoneSlot struct{}
 
-func (*neverDoneSlot) closeCompleted() bool               { return false }
-func (*neverDoneSlot) ensureCloseRetryOwner(*slog.Logger) {}
+func (*neverDoneSlot) closeCompleted() bool { return false }
+
+type panicOnCleanupFailureSlot struct{ neverDoneSlot }
+
+func (*panicOnCleanupFailureSlot) cleanupFailure() error { panic("cleanup-error probe boom") }
+
+func TestQwpSenderPoolCleanupFailureProbeKeepsMutexUsable(t *testing.T) {
+	p := &qwpSenderPool{storeAndForward: true, maxSize: 1,
+		sfSlots:      []qwpSfSlotLifecycle{{state: qwpSfSlotRetired}},
+		retiredSlots: []*qwpSenderSlot{{slotIndex: 0, cleanup: &panicOnCleanupFailureSlot{}}},
+	}
+	for i := 0; i < 2; i++ {
+		err := p.currentCloseResult()
+		require.ErrorIs(t, err, ErrCleanupFailed)
+		require.ErrorIs(t, err, ErrPoolPoisoned)
+		require.ErrorIs(t, err, ErrSfCleanupPending)
+		require.True(t, p.mu.TryLock(), "probe panic stranded the pool mutex")
+		used := p.capUsedLocked()
+		p.mu.Unlock()
+		require.Equal(t, 1, used)
+	}
+}
 
 // panicOnProbeSlot stands in for a delegate whose state check faults.
 type panicOnProbeSlot struct{}
 
-func (panicOnProbeSlot) closeCompleted() bool               { panic("probe boom") }
-func (panicOnProbeSlot) ensureCloseRetryOwner(*slog.Logger) {}
+func (panicOnProbeSlot) closeCompleted() bool { panic("probe boom") }
 
 // TestQwpSenderPoolConstructionPanicKeepsSlotIndexReserved pins that a panic
 // during a pooled build does not put the slot index back into circulation
