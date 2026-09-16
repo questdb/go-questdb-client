@@ -1265,6 +1265,27 @@ func TestQwpSfTornSegmentAtTheCommittedHeadIsPreserved(t *testing.T) {
 		"a torn segment at the committed head must be preserved, not unlinked")
 }
 
+// Check the legacy planner directly so later discard checks cannot hide a
+// missing final-head guard. With no valid frames, the clean empty segment
+// supplies the head, but cannot prove the lower torn segment was delivered.
+func TestQwpSfLegacyPlannerRefusesATornSegmentBelowASynthesizedHead(t *testing.T) {
+	dir := t.TempDir()
+	torn := openTornEmptySegment(t, dir, "sf-initial.sfa", 0)
+	t.Cleanup(func() { closeRecoverySegments(t, torn) })
+	spare := reopenEmptySegment(t, dir, "sf-0000000000000001.sfa", 3)
+	t.Cleanup(func() { closeRecoverySegments(t, spare) })
+
+	plan := &qwpSfRecoveryPlan{
+		manifestProvenance: qwpSfManifestMissing,
+		all:                []*qwpSfSegment{torn, spare},
+	}
+	err := plan.planLegacyChain(nil, nil)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.Same(t, spare, plan.activeSeg, "the clean empty segment must supply the final head")
+	require.Equal(t, int64(3), plan.headBase)
+	require.False(t, plan.synthesizeManifest, "a rejected chain must not authorize a new manifest")
+}
+
 // TestQwpSfLegacyMigrationRefusesATornSegmentBelowASynthesizedHead pins the
 // legacy path's most dangerous shape. segmentFrameCount stops at the first bad
 // CRC, so a segment whose frame 0 is damaged reports zero frames while
