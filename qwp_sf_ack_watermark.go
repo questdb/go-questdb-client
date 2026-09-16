@@ -78,15 +78,6 @@ type qwpSfAckWatermark struct {
 	scratch          [qwpSfDualRecordSize]byte
 }
 
-func qwpSfAckWatermarkOpen(slotDir string) *qwpSfAckWatermark {
-	w, _ := qwpSfAckWatermarkOpenRequired(slotDir)
-	return w
-}
-
-func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
-	return qwpSfAckWatermarkOpenRequiredWithLogger(slotDir, nil)
-}
-
 func qwpSfAckWatermarkOpenRequiredWithLogger(slotDir string, logger *slog.Logger) (result *qwpSfAckWatermark, err error) {
 	if slotDir == "" {
 		return nil, nil

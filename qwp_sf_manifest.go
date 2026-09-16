@@ -160,22 +160,10 @@ func qwpSfManifestCreate(dir string, headBase, activeBase int64) (result *qwpSfM
 	return m, nil
 }
 
-func qwpSfManifestOpen(dir string) (*qwpSfManifest, error) {
-	manifest, invalid, err := qwpSfManifestInspect(dir)
-	if err != nil || !invalid {
-		return manifest, err
-	}
-	if err := qwpSfQuarantineCreationDebris(filepath.Join(dir, qwpSfManifestFileName)); err != nil {
-		return nil, err
-	}
-	return nil, nil
-}
-
 // qwpSfManifestInspect reads and validates the manifest without changing the
 // directory. Recovery uses it while building its complete action plan: an
 // invalid manifest is evidence to record, not a rename to perform before the
-// segment chain has been classified. qwpSfManifestOpen retains the historical
-// open-and-quarantine behavior for callers that are not constructing a plan.
+// segment chain has been classified.
 func qwpSfManifestInspect(dir string) (result *qwpSfManifest, invalid bool, err error) {
 	path := filepath.Join(dir, qwpSfManifestFileName)
 	st, err := os.Stat(path)
@@ -299,12 +287,10 @@ func qwpSfManifestRemove(dir string) error {
 var qwpSfManifestQuarantineRename = qwpSfSwappable(os.Rename)
 
 // qwpSfQuarantineCreationDebris sets an unusable manifest aside under a
-// .corrupt name. It runs from qwpSfManifestOpen, before recovery has decided
-// whether the slot as a whole fails closed, so it must not destroy anything: a
-// slot that is about to be preserved whole would otherwise arrive at the
-// quarantine directory already missing the boundary record that explains it.
-// The target name is probed the same way segment quarantine probes it, so an
-// earlier quarantine's evidence survives.
+// .corrupt name when recovery executes its action plan. It preserves the
+// boundary record as evidence rather than deleting it. The target name is
+// probed the same way segment quarantine probes it, so an earlier quarantine's
+// evidence survives.
 //
 // A rename that cannot succeed is neither ignored nor escalated to a delete.
 // Deleting is never the way forward: it costs the boundary record, and it

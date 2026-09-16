@@ -66,8 +66,6 @@ func qwpSfSwappable[T any](initial T) *qwpSfSwappableVar[T] {
 
 func (s *qwpSfSwappableVar[T]) load() T { return *s.v.Load() }
 
-func (s *qwpSfSwappableVar[T]) store(value T) { s.v.Store(&value) }
-
 // qwpSfCloseRetryInterval is the wait between cleanup retries after storage
 // errors. Panics are not retried. Tests may shorten the default one-second wait.
 var qwpSfCloseRetryInterval = qwpSfSwappable(time.Second)
@@ -292,10 +290,6 @@ func qwpSfNewCursorEngine(sfDir string, segmentSizeBytes, maxTotalBytes int64, a
 	return qwpSfNewCursorEngineWithOptions(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, qwpSfEngineOpenOptions{
 		recoverForeground: true,
 	})
-}
-
-func qwpSfNewCursorEngineForDrainer(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
-	return qwpSfNewCursorEngineWithOptions(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, qwpSfEngineOpenOptions{})
 }
 
 // qwpSfEngineOpenOptions configures recovery policy and logging during engine

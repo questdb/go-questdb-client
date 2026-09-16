@@ -122,15 +122,6 @@ type qwpSfRecoveryContext struct {
 	logger *slog.Logger
 }
 
-func qwpSfOpenRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, error) {
-	ring, _, err := qwpSfRecoverRing(sfDir, maxBytesPerSegment)
-	return ring, err
-}
-
-func qwpSfRecoverRing(sfDir string, maxBytesPerSegment int64) (*qwpSfSegmentRing, *qwpSfManifest, error) {
-	return qwpSfRecoverRingWithContext(sfDir, maxBytesPerSegment, qwpSfRecoveryContext{})
-}
-
 func qwpSfRecoverRingWithContext(sfDir string, maxBytesPerSegment int64, recoveryContext qwpSfRecoveryContext) (outRing *qwpSfSegmentRing, outManifest *qwpSfManifest, err error) {
 	if _, err := os.Stat(sfDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {

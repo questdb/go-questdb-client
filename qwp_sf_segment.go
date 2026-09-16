@@ -82,7 +82,7 @@ var qwpSfErrSegmentFull = errors.New("qwp/sf: segment full")
 // qwpSfErrSegmentCorrupt marks a segment file whose *content* is not a
 // valid SF segment: a file shorter than the header, bad magic, or a
 // negative baseSeq. qwpSfOpenSegment wraps these with this sentinel so
-// qwpSfRecoverRing can tell them apart from
+// recovery can tell them apart from
 // syscall/I-O failures (open/stat/mmap returning EMFILE/ENFILE/ENOMEM/
 // EACCES/EIO), which it propagates unwrapped. The distinction is
 // load-bearing for crash recovery: corruption quarantine is deferred until
@@ -273,7 +273,7 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 // part. Opening the file does not erase it; recovery must first check that the
 // saved files form a complete queue.
 //
-// Errors are classified for qwpSfRecoverRing. Short files, bad magic, and
+// Errors are classified for recovery. Short files, bad magic, and
 // negative baseSeq are corruption evidence whose quarantine is deferred until
 // the manifest decision tree validates the surviving chain. Syscall and I/O
 // failures are operational errors: the bytes may be intact and the same slot
@@ -326,13 +326,9 @@ func qwpSfOpenSegment(path string) (result *qwpSfSegment, err error) {
 		return nil, cause
 	}
 	baseSeq := int64(binary.LittleEndian.Uint64(buf[8:16]))
-	// FSNs are non-negative by construction. A negative baseSeq on disk
-	// means bit-rot or a hand-edited file — flag it corrupt so
-	// qwpSfOpenRing's per-file skip handles it like any other
-	// bad-content .sfa rather than feeding the bad value into the
-	// unsigned-comparison sort and contiguity check (which would place
-	// the segment last and trip the FSN-gap error, taking the whole
-	// recovery down).
+	// FSNs are non-negative by construction. Report a negative baseSeq as
+	// corruption so recovery classifies the file before using its base in
+	// sorting or chain validation.
 	if baseSeq < 0 {
 		cause := fmt.Errorf("%w: bad baseSeq in %s: %d", qwpSfErrSegmentCorrupt, path, baseSeq)
 		return nil, cause
