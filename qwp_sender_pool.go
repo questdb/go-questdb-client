@@ -363,7 +363,7 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 				result = p.poisonedErr
 				return
 			}
-			if p.closed {
+			if p.closed || p.closing.Load() {
 				result = errPoolClosed
 				return
 			}
@@ -494,7 +494,7 @@ func (p *qwpSenderPool) settleBuiltSlot(slot *qwpSenderSlot, index int, buildErr
 			p.reclaimFailedBuildLocked(slot, index, buildErr)
 			return
 		}
-		if p.closed || p.poisonedErr != nil {
+		if p.closed || p.closing.Load() || p.poisonedErr != nil {
 			closeSlot = p.prepareSlotCloseLocked(slot, qwpSfSlotCreating)
 			result = errPoolClosed
 			if p.poisonedErr != nil {
@@ -540,7 +540,7 @@ func (p *qwpSenderPool) giveBack(_ context.Context, ps *qwpPooledSender, broken 
 		if ps.slot.cleanupFailed {
 			return
 		}
-		if p.closed || p.poisonedErr != nil || broken {
+		if p.closed || p.closing.Load() || p.poisonedErr != nil || broken {
 			closeSlot = p.prepareSlotCloseLocked(ps.slot, qwpSfSlotLeased)
 		} else {
 			p.transitionSfSlotLocked(ps.slot.slotIndex, qwpSfSlotLeased, qwpSfSlotAvailable)
@@ -949,11 +949,15 @@ func (p *qwpSenderPool) currentCloseResult() error {
 	err := p.withLock("read pool close result", nil, func() {
 		pending := p.sfCloseSnapshotLocked()
 		teardownErr := p.closeTeardownErr
-		if !p.storeAndForward && p.closeWaitOutstandingLocked() > 0 {
+		if !p.storeAndForward && (p.closeWaitOutstandingLocked() > 0 || len(p.retiredSlots) > 0) {
 			teardownErr = errors.Join(teardownErr, ErrCleanupPending)
 		}
 		for _, slot := range p.retiredSlots {
-			teardownErr = errors.Join(teardownErr, p.slotCleanupFailureGuardedLocked(slot))
+			if reporter, ok := slot.cleanup.(interface{ cleanupResult() error }); ok {
+				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
+			} else {
+				teardownErr = errors.Join(teardownErr, p.slotCleanupFailureGuardedLocked(slot))
+			}
 		}
 		result = qwpPoolCloseResult(teardownErr, p.poisonedErr, pending)
 	})
@@ -997,7 +1001,7 @@ func (p *qwpSenderPool) createSlot(ctx context.Context, async bool) (*qwpSenderS
 }
 
 func (p *qwpSenderPool) reclaimFailedBuildLocked(slot *qwpSenderSlot, slotIndex int, buildErr error) {
-	if p.storeAndForward && slot != nil && slot.slotIndex >= 0 && slot.cleanup != nil {
+	if slot != nil && slot.cleanup != nil {
 		p.transitionSfSlotLocked(slotIndex, qwpSfSlotCreating, qwpSfSlotClosing)
 		p.reclaimSlotLocked(slot, buildErr)
 		return
@@ -1215,9 +1219,6 @@ func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
 	if slot.cleanupFailed {
 		return
 	}
-	if !p.storeAndForward || slot.slotIndex < 0 {
-		return
-	}
 	p.requireSfSlotStateLocked(slot.slotIndex, qwpSfSlotClosing)
 	if !p.slotCloseCompletedGuardedLocked(slot) {
 		if slot.cleanupFailed {
@@ -1227,7 +1228,16 @@ func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
 		p.retiredSlots = append(p.retiredSlots, slot)
 		return
 	}
+	p.harvestSlotResultLocked(slot)
 	p.transitionSfSlotLocked(slot.slotIndex, qwpSfSlotClosing, qwpSfSlotFree)
+}
+
+// Save the sender's final cleanup error before the pool stops tracking it.
+// This only reads the result; it does not try to close the sender again.
+func (p *qwpSenderPool) harvestSlotResultLocked(slot *qwpSenderSlot) {
+	if reporter, ok := slot.cleanup.(interface{ cleanupResult() error }); ok {
+		p.closeTeardownErr = qwpAppendCloseError(p.closeTeardownErr, reporter.cleanupResult())
+	}
 }
 
 // Check for cleanup failure without running cleanup from the pool.
@@ -1267,7 +1277,7 @@ func (p *qwpSenderPool) reprobeRetiredSlots() {
 		return p.reprobeRetiredSlotsLocked()
 	}()
 	if restored > 0 {
-		qwpEffectiveLogger(p.logger).Info("qwp pool: restored SF capacity after deferred slot cleanup", "slots", restored)
+		go qwpEffectiveLogger(p.logger).Info("qwp pool: restored capacity after deferred cleanup", "slots", restored)
 	}
 }
 
@@ -1306,12 +1316,13 @@ func (p *qwpSenderPool) classifyRetiredSlotsLocked() (part qwpSlotPartition, ok 
 		}
 	}()
 	part.kept = make([]*qwpSenderSlot, 0, len(p.retiredSlots))
-	part.transitionSf = true
+	part.transitionSf = p.storeAndForward
 	part.sfFrom = qwpSfSlotRetired
 	part.sfTo = qwpSfSlotFree
 	for _, slot := range p.retiredSlots {
 		checking = slot
 		if !slot.cleanupFailed && slotCloseCompleted(slot) {
+			p.harvestSlotResultLocked(slot)
 			part.removed = append(part.removed, slot)
 			continue
 		}
@@ -1353,10 +1364,11 @@ func (p *qwpSenderPool) poolSnapshot() (total, available, leaked int) {
 // pools) once QuestDB.Close has run. Match it with errors.Is.
 var ErrPoolClosed = errors.New("qwp pool: handle is closed")
 
-// ErrPoolPoisoned means an internal failure left the ingest pool unable to
-// lend senders safely. BorrowSender, a borrowed sender's Close, and
-// QuestDB.Close may wrap it; match it with errors.Is and inspect the cause.
-// Stop using the pool. Stop use of each borrowed sender before returning it.
+// ErrPoolPoisoned means an internal failure left a pool unable to safely lend
+// senders or query clients. BorrowSender, BorrowQuery, a borrowed handle's Close,
+// and QuestDB.Close may return an error wrapping it. Use errors.Is to check for
+// it and inspect the underlying error. Stop using the affected pool, and stop
+// using each borrowed handle before returning it.
 //
 // Corrupt pool state also produces [ErrCleanupFailed]. Calling Close again
 // reports the failure; it does not repair the pool's records. Slots that
@@ -1365,7 +1377,7 @@ var ErrPoolClosed = errors.New("qwp pool: handle is closed")
 // restart. Other cleanup that is known to be safe may finish, but the
 // internal failure remains in the result. Unlike [ErrSfCleanupPending] alone,
 // this error cannot be resolved just by waiting longer.
-var ErrPoolPoisoned = errors.New("qwp pool: internal pool failure; the pool no longer lends senders")
+var ErrPoolPoisoned = errors.New("qwp pool: internal pool failure; the pool no longer lends handles")
 
 // ErrSenderPoolExhausted is returned by BorrowSender when the ingest pool is at
 // sender_pool_max and no sender frees up within acquire_timeout_ms. The returned

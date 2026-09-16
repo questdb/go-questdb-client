@@ -61,6 +61,15 @@ func (e *qwpSfCursorEngine) engineCloseCompleted() bool {
 	return e.cleanup.released
 }
 
+func (e *qwpSfCursorEngine) cleanupResult() error {
+	if e == nil {
+		return nil
+	}
+	e.cleanup.mu.Lock()
+	defer e.cleanup.mu.Unlock()
+	return e.cleanup.err
+}
+
 func (e *qwpSfCursorEngine) cleanupFailure() error {
 	if e == nil {
 		return nil

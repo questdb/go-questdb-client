@@ -63,17 +63,12 @@ const qwpSfDrainerDefaultConnectTimeoutMs = 15_000
 // QwpBackgroundDrainerListener receives durable-ack drain outcomes for a crashed
 // sibling's store-and-forward slot. Callbacks must not block.
 //
-// Threading: the callbacks are NOT confined to a single goroutine.
-// OnDurableAckUnavailable and OnPrimaryUnavailable fire from whichever
-// goroutine runs the connect walk — the drainerRun goroutine for the initial
-// connect, the drainer's send-loop I/O goroutine for mid-drain reconnects —
-// while OnDurableAckPersistentFailure fires from the drainerRun goroutine. The
-// same QwpBackgroundDrainerListener is also shared across every drainer, so with
-// multiple orphan slots the callbacks may fire concurrently. Implementations
-// must be thread-safe. A panic in a callback is recovered and logged (it does
-// not quarantine the slot or crash the host), mirroring the other listener
-// contracts. Any callback may be nil. Applied to every drainer via
-// WithBackgroundDrainerListener.
+// Each drainer uses a limited-size queue to deliver callbacks in the background.
+// Drainers share the listener, so callbacks for different slots may run at the
+// same time. Callbacks must be safe to call concurrently. A callback panic is
+// caught and logged; it does not quarantine the slot or crash the process.
+// Any callback may be nil. WithBackgroundDrainerListener sets the listener for
+// every drainer.
 //
 // Use a channel or context cancellation to signal the application code that
 // uses the sender. Do not change or close a sender, or call QuestDB.Close
@@ -151,15 +146,11 @@ var qwpSfMinNoProgressBudget = qwpSfSwappable(30 * time.Second)
 // read it.
 var qwpSfDrainerPoolCloseGrace = qwpSfSwappable(3 * time.Second)
 
-// qwpSfDrainerPoolHardCloseGrace bounds how long the pool's close()
-// waits AFTER cancelling the master ctx. Cancellation unwinds
-// ctx-aware blocking (TCP dials, the drainer poll loop); a drainer
-// still alive past this second grace is wedged in I/O the ctx cannot
-// reach — drainerRun's engine-open phase (flock, mmap, full CRC scan
-// of a possibly-huge slot, hung NFS) makes no ctx checks. Such a
-// drainer is abandoned rather than blocking close() on un-cancellable
-// I/O; the slot it holds stays a valid orphan for a future sender to
-// re-adopt. Swappable so package tests can dial it down.
+// qwpSfDrainerPoolHardCloseGrace limits the second wait, after the pool cancels
+// the drainers' shared context. Cancellation can stop network connection attempts
+// and the sending loop, but not all file operations or recovery scans. The pool
+// keeps track of drainers that outlast this wait. Their slots cannot be reused
+// until cleanup releases them. Tests can change this timeout.
 var qwpSfDrainerPoolHardCloseGrace = qwpSfSwappable(1 * time.Second)
 
 // qwpSfOrphanDrainer empties one orphan slot and exits. Owned by
@@ -215,11 +206,16 @@ type qwpSfOrphanDrainer struct {
 	// stopCh is closed by drainerRequestStop so a polite stop unwinds an
 	// in-flight connect walk promptly (as the walk's cancelCh) instead of
 	// waiting out the pool-close hard-cancel grace.
-	stopCh           chan struct{}
-	targetFsn        atomic.Int64 // -1 until startup observes publishedFsn
-	ackedFsn         atomic.Int64 // mirrors engine.ackedFsn for visibility
-	outcome          atomic.Int32
-	lastErrorMessage atomic.Pointer[string]
+	stopCh            chan struct{}
+	targetFsn         atomic.Int64 // -1 until startup observes publishedFsn
+	ackedFsn          atomic.Int64 // mirrors engine.ackedFsn for visibility
+	outcome           atomic.Int32
+	lastErrorMessage  atomic.Pointer[string]
+	cleanupMu         sync.Mutex
+	cleanup           *qwpSfCursorEngine
+	cleanupErr        error
+	notificationsOnce sync.Once
+	notifications     *qwpDispatcher[func()]
 }
 
 // qwpSfNewOrphanDrainer constructs a drainer for the given slot.
@@ -312,6 +308,9 @@ func (d *qwpSfOrphanDrainer) drainerRequestStop() {
 }
 
 func (d *qwpSfOrphanDrainer) recordFailure(reason string) {
+	d.cleanupMu.Lock()
+	d.cleanupErr = errors.Join(d.cleanupErr, errors.New(reason))
+	d.cleanupMu.Unlock()
 	d.lastErrorMessage.Store(&reason)
 	qwpSfMarkSlotFailed(d.slotPath, reason)
 	d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
@@ -326,7 +325,7 @@ func (d *qwpSfOrphanDrainer) recordDurableGiveUp() {
 	attempts := int(d.mismatchAttempts.Load())
 	if fn := d.listener.OnDurableAckPersistentFailure; fn != nil {
 		elapsed := time.Since(d.startedAt)
-		qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempts, elapsed) })
+		d.notifyListener(func() { fn(d.slotPath, attempts, elapsed) })
 	}
 	d.recordFailure(fmt.Sprintf(
 		"durable-ack unavailable: no reachable endpoint advertised durable-ack after %d attempts", attempts))
@@ -348,7 +347,7 @@ func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
 	if outcome.SawDurableMismatch && !outcome.SawTransportError {
 		attempt := int(d.mismatchAttempts.Add(1))
 		if fn := d.listener.OnDurableAckUnavailable; fn != nil {
-			qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempt) })
+			d.notifyListener(func() { fn(d.slotPath, attempt) })
 		}
 		if attempt >= qwpMaxDurableAckMismatchAttempts {
 			d.durableMismatchGaveUp.Store(true)
@@ -365,7 +364,7 @@ func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
 	d.mismatchAttempts.Store(0)
 	attempt := int(d.roleRejectRounds.Add(1))
 	if fn := d.listener.OnPrimaryUnavailable; fn != nil {
-		qwpDrainerListenerCall(d.logger, func() { fn(d.slotPath, attempt) })
+		d.notifyListener(func() { fn(d.slotPath, attempt) })
 	}
 	now := time.Now().UnixNano()
 	if last := d.lastReplicaWarnUnixNano.Load(); now-last >= int64(qwpSfReconnectWarnThrottle) &&
@@ -383,38 +382,37 @@ func (d *qwpSfOrphanDrainer) onRoundExhausted(outcome qwpSfSweepOutcome) {
 // completion (or terminal failure), then sets outcome and exits.
 func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	d.startedAt = time.Now()
-	// Convert a panic on this goroutine into the same terminal Failed
-	// outcome an explicit fault produces, so neither untrusted on-disk
-	// .sfa bytes (the CRC/recovery scan in qwpSfNewCursorEngine) nor
-	// user-supplied clientFactory code (invoked via qwpSfRunRoundWalk)
-	// can crash the host process — which would take down the foreground
-	// sender and every sibling drainer with it. Both run on this
-	// goroutine before the send loop's own recover is in play, so this
-	// is the only guard covering them. Registered first so it runs LAST
-	// on unwind (defers are LIFO): the engine-close (slot-lock release)
-	// and send-loop teardown defers run ahead of it, so recordFailure
-	// drops its .failed sentinel onto a quiesced slot. Quarantining is
-	// deliberate — a panic driven by corrupt on-disk bytes would re-panic
-	// on every future re-adoption, so the sentinel breaks that loop
-	// (bounded automatic retry, then human-in-the-loop), exactly as the
-	// no-progress watchdog does for a wedged connection. The scan's
-	// slice/index reads are bounds-checked, so this is defense-in-depth,
-	// not a known reachable panic.
+	// An internal panic does not prove the stored data is corrupt. Keep the
+	// affected resources and report the error without writing a .failed file.
 	defer func() {
 		if r := recover(); r != nil {
-			msg := fmt.Sprintf("qwp/sf: orphan drainer panicked: %v\n%s", r, debug.Stack())
-			// A recover() cannot catch a second panic raised while this one is
-			// still unwinding, so the report of a panic must not be able to
-			// raise one. A user's slog handler can.
-			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer panicked", "detail", msg)
-			d.recordFailure(msg)
+			d.cleanupMu.Lock()
+			if build, ok := r.(qwpSfBuildPanic); ok {
+				if reporter, ok := build.reporter.(*qwpSfBuildCleanupError); ok {
+					d.cleanup = reporter.engine
+				}
+			}
+			d.cleanupErr = &qwpCleanupPanicError{phase: "orphan drainer", cause: r, stack: debug.Stack()}
+			d.cleanupMu.Unlock()
+			d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
+			qwpFailedDrainers.Lock()
+			qwpFailedDrainers.items = append(qwpFailedDrainers.items, d)
+			qwpFailedDrainers.Unlock()
 		}
+		// Resource cleanup need not wait for user callbacks to finish.
+		go d.listenerDispatcher().close()
 	}()
 
 	engine, err := qwpSfNewCursorEngineWithOptions(d.slotPath, d.segmentSize, d.sfMaxTotalBytes, qwpSfEngineDefaultAppendDeadline, qwpSfEngineOpenOptions{
 		logger: d.logger,
 	})
 	if err != nil {
+		var buildErr *qwpSfBuildCleanupError
+		if errors.As(err, &buildErr) {
+			d.cleanupMu.Lock()
+			d.cleanup = buildErr.engine
+			d.cleanupMu.Unlock()
+		}
 		// Lock contention is expected (a sibling drainer or the
 		// foreground sender holds it) — exit silently, no .failed.
 		if errors.Is(err, qwpSfErrLockBusy) {
@@ -428,6 +426,9 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		// that went away) says nothing about the bytes: the slot keeps its data
 		// and its eligibility, and the next foreground scan adopts it again
 		// once the fault clears.
+		d.cleanupMu.Lock()
+		d.cleanupErr = errors.Join(d.cleanupErr, err)
+		d.cleanupMu.Unlock()
 		msg := err.Error()
 		d.lastErrorMessage.Store(&msg)
 		if errors.Is(err, qwpSfErrRecoveryFailClosed) {
@@ -439,20 +440,22 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		d.outcome.Store(int32(qwpSfDrainOutcomeFailed))
 		return
 	}
-	// Install engine ownership immediately. A loop acquired below adds its own
-	// obligation after this one, so LIFO still stops the wire before deciding
-	// whether the mappings are safe to unmap. This must precede even logger
-	// setup and test seams: either can run user/fault-injection code.
+	// Save the engine before doing setup that could fail. The pool must still
+	// track its cleanup after this goroutine exits. Only the engine's cleanup
+	// worker may release its resources.
+	d.cleanupMu.Lock()
+	d.cleanup = engine
+	d.cleanupMu.Unlock()
 	var loop *qwpSfSendLoop
 	defer func() {
-		closeErr := engine.engineClose()
-		if closeErr != nil {
-			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer engine close failed",
-				"slot", d.slotPath, "error", closeErr)
+		r := recover()
+		var cause error
+		if r != nil {
+			cause = &qwpCleanupPanicError{phase: "orphan work", cause: r, stack: debug.Stack()}
 		}
-		if !engine.engineCloseCompleted() {
-			qwpEffectiveLogger(d.logger).Error("qwp/sf: orphan drainer close incomplete; a terminal cleanup owner will retain and retry the slot lock release",
-				"slot", d.slotPath)
+		_ = engine.engineCloseWithCause(cause)
+		if r != nil {
+			panic(r)
 		}
 	}()
 	if hook := qwpSfTestAfterDrainerEngineOpenHook.Load(); hook != nil {
@@ -702,20 +705,15 @@ func (d *qwpSfOrphanDrainer) noProgressReason(acked, target, okAcks int64, stuck
 		acked, target, stuckFor)
 }
 
-// qwpSfDrainerPool is a bounded thread pool that runs orphan
-// drainer tasks. One pool per foreground sender; size capped by
-// max_background_drainers.
+// qwpSfDrainerPool runs background tasks that send data left in orphan slots.
+// Each foreground sender has one pool. At most max_background_drainers tasks
+// run at once, each in its own goroutine; an unused pool starts no goroutines.
 //
-// Each drainer gets its own goroutine, throttled by a buffered
-// semaphore channel. Idle pool (no orphans submitted) costs zero
-// goroutines. Closing the pool requests every still-running
-// drainer to stop and waits up to qwpSfDrainerPoolCloseGrace for
-// them to exit cleanly; if any drainer is still alive after the
-// grace (typically blocked in a TCP dial / WS upgrade), the pool
-// cancels its master context so blocking I/O unwinds, then waits a
-// further qwpSfDrainerPoolHardCloseGrace. A drainer wedged in
-// un-cancellable I/O past that bound is abandoned (with a logged
-// count) so close() never hangs.
+// Closing first asks the drainers to stop and waits up to
+// qwpSfDrainerPoolCloseGrace. If work remains, it cancels their shared context
+// and waits up to qwpSfDrainerPoolHardCloseGrace. These limits only end the wait.
+// The pool keeps tracking unfinished engine cleanup, and QuestDB.Close checks
+// that cleanup separately.
 type qwpSfDrainerPool struct {
 	maxConcurrent int
 	sem           chan struct{}
@@ -731,8 +729,10 @@ type qwpSfDrainerPool struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu     sync.Mutex
-	active []*qwpSfOrphanDrainer
+	mu         sync.Mutex
+	active     []*qwpSfOrphanDrainer
+	cleanupErr error
+	failed     []*qwpSfOrphanDrainer
 }
 
 // qwpSfNewDrainerPool constructs a pool with the given concurrency
@@ -775,7 +775,15 @@ func (p *qwpSfDrainerPool) drainerPoolSubmit(ctx context.Context, d *qwpSfOrphan
 	p.mu.Unlock()
 	go func() {
 		defer p.wg.Done()
-		defer p.removeActive(d)
+		defer func() {
+			if r := recover(); r != nil {
+				p.failTask(d, r)
+				return
+			}
+			if err := qwpRunCleanupPhaseGuarded("drainer result", func() error { p.removeActive(d); return nil }); err != nil {
+				p.failTask(d, err)
+			}
+		}()
 		// Accepted work stays queued until capacity is available or the pool
 		// closes, even if the caller cancels its setup context in the meantime.
 		select {
@@ -793,6 +801,10 @@ func (p *qwpSfDrainerPool) drainerPoolSubmit(ctx context.Context, d *qwpSfOrphan
 		// caller's setup ctx (its expected lifetime is far longer)
 		// but is forcibly cancellable when the pool is closing.
 		d.drainerRun(p.ctx)
+		// Finishing the send loop does not mean the slot's resources are freed.
+		// Keep tracking this drainer until engine cleanup finishes or fails
+		// permanently with its resources still held.
+		d.waitCleanup()
 	}()
 	return nil
 }
@@ -804,6 +816,13 @@ func (p *qwpSfDrainerPool) removeActive(d *qwpSfOrphanDrainer) {
 	defer p.mu.Unlock()
 	for i, x := range p.active {
 		if x == d {
+			err := d.cleanupResult()
+			failed := errors.Is(err, ErrCleanupFailed)
+			p.cleanupErr = errors.Join(p.cleanupErr, err)
+			if failed {
+				p.failed = append(p.failed, d)
+				p.retainFailureLocked()
+			}
 			n := len(p.active)
 			p.active[i] = p.active[n-1]
 			p.active[n-1] = nil
@@ -813,9 +832,9 @@ func (p *qwpSfDrainerPool) removeActive(d *qwpSfOrphanDrainer) {
 	}
 }
 
-// drainerPoolSnapshot returns a copy of the drainers currently
-// running (or queued on the semaphore). Drainers that have run
-// to completion are pruned. Useful for status accessors.
+// drainerPoolSnapshot includes drainers waiting to start, still running, or
+// waiting for engine cleanup. Keep tracking them after sending stops if their
+// engine still has resources to release.
 func (p *qwpSfDrainerPool) drainerPoolSnapshot() []*qwpSfOrphanDrainer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -824,25 +843,18 @@ func (p *qwpSfDrainerPool) drainerPoolSnapshot() []*qwpSfOrphanDrainer {
 	return out
 }
 
-// activeCount returns the number of drainers still tracked as
-// running or queued. drainerPoolClose reports it as the count of
-// drainers abandoned at the hard-grace boundary.
+// activeCount includes drainers still waiting for their engine's cleanup.
 func (p *qwpSfDrainerPool) activeCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.active)
 }
 
-// drainerPoolClose stops the pool. Sets closed=true so new submits
-// fail; requests a polite stop on every tracked drainer; waits up
-// to qwpSfDrainerPoolCloseGrace. If any drainer is still alive at
-// the grace boundary it is most likely parked in a TCP dial / WS
-// upgrade — cancel the master ctx to unwind those blocking calls,
-// then wait a further qwpSfDrainerPoolHardCloseGrace. A drainer
-// still running past that bound is wedged in I/O the ctx cannot
-// reach (engine-open flock / mmap / CRC scan / hung NFS); it is
-// abandoned with a logged count rather than hanging close() — its
-// slot stays a valid orphan for a future sender. Idempotent.
+// drainerPoolClose refuses new tasks and asks each drainer to stop. It waits
+// up to qwpSfDrainerPoolCloseGrace, then cancels their shared context and waits
+// up to qwpSfDrainerPoolHardCloseGrace. Drainers that still have work or cleanup
+// left remain tracked after this method returns. Later calls do not restart
+// shutdown; cleanupResult reports whether work remains and any errors.
 func (p *qwpSfDrainerPool) drainerPoolClose() {
 	if !p.closed.CompareAndSwap(false, true) {
 		return
@@ -851,6 +863,14 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 	// published no later caller may enter this body, so normal fallthrough is
 	// not a safe owner for the only signal that unwinds blocking drainer I/O.
 	defer p.cancel()
+	defer func() {
+		if r := recover(); r != nil {
+			p.mu.Lock()
+			p.cleanupErr = errors.Join(p.cleanupErr, &qwpCleanupPanicError{phase: "drainer pool close", cause: r, stack: debug.Stack()})
+			p.retainFailureLocked()
+			p.mu.Unlock()
+		}
+	}()
 	if hook := qwpTestDrainerPoolCloseHook.Load(); hook != nil {
 		(*hook)()
 	}
@@ -882,14 +902,9 @@ func (p *qwpSfDrainerPool) drainerPoolClose() {
 		case <-doneCh:
 			// Cancellation unwound the straggler(s).
 		case <-hardTimer.C:
-			// A drainer is wedged in I/O the ctx cannot reach
-			// (engine-open flock / mmap / CRC scan / hung NFS).
-			// Abandon it: its goroutine lives until the syscall
-			// returns, but close() must not block on un-cancellable
-			// I/O. The slot it holds stays a valid orphan a future
-			// sender re-adopts. Surface the abandoned count for ops.
-			qwpEffectiveLogger(p.logger).Warn("qwp/sf: orphan drainer(s) still running after close; "+
-				"abandoning (wedged in un-cancellable disk I/O). Their slots remain adoptable on a future sender start.",
+			// Stop waiting, but keep the drainer and engine alive until cleanup
+			// finishes, even if they are stuck in a system call.
+			go qwpEffectiveLogger(p.logger).Warn("qwp/sf: orphan cleanup still pending; resources remain owned until actual release",
 				"count", p.activeCount(),
 				"grace", qwpSfDrainerPoolCloseGrace.load()+qwpSfDrainerPoolHardCloseGrace.load())
 		}

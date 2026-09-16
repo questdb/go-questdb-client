@@ -136,7 +136,12 @@ func (p *qwpSenderPool) noteCloseFailure(slot *qwpSenderSlot, err error) {
 func (p *qwpSenderPool) finishSlotClose(slot *qwpSenderSlot, err error) {
 	p.withLock("sender cleanup result", []*qwpSenderSlot{slot}, func() {
 		p.pendingLeaseTeardowns--
-		p.closeTeardownErr = qwpAppendCloseError(p.closeTeardownErr, err)
+		// Some clients can report updated cleanup results. Read those later
+		// rather than permanently saving a storage error that a retry may fix.
+		// Internal cleanup failures are permanent and must still be saved now.
+		if _, observes := slot.cleanup.(interface{ cleanupResult() error }); !observes || errors.Is(err, ErrCleanupFailed) {
+			p.closeTeardownErr = qwpAppendCloseError(p.closeTeardownErr, err)
+		}
 		p.reclaimSlotLocked(slot, err)
 		p.broadcastLocked()
 	})

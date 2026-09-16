@@ -191,7 +191,7 @@ func TestQwpQueryPoolClosedOps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
-	_ = p.close(ctx)
+	require.ErrorIs(t, p.close(cancelledCleanupWait()), ErrCleanupPending)
 	if _, err := p.borrow(ctx); !errors.Is(err, errPoolClosed) {
 		t.Errorf("borrow after close=%v, want errPoolClosed", err)
 	}
@@ -211,18 +211,15 @@ func TestQwpQueryPoolCloseLeavesOnLoanWorker(t *testing.T) {
 		t.Fatalf("borrow: %v", err)
 	}
 	w := q.worker
-	if err := p.close(ctx); err != nil {
-		t.Fatalf("pool close: %v", err)
-	}
+	require.ErrorIs(t, p.close(cancelledCleanupWait()), ErrCleanupPending)
 	if w.client.closed.Load() {
 		t.Fatal("close() force-closed an on-loan worker (would race an in-flight Batches() read)")
 	}
 	if err := q.Close(); err != nil {
 		t.Fatalf("lease close after pool close: %v", err)
 	}
-	if !w.client.closed.Load() {
-		t.Error("returning the on-loan lease after pool close did not self-close its client")
-	}
+	require.NoError(t, p.close(context.Background()))
+	require.True(t, w.client.closed.Load(), "returned client must eventually close")
 }
 
 // A client that finishes connecting after close has begun must stay counted
@@ -319,7 +316,7 @@ func TestQwpQueryPoolCloseWaitsForClosedDuringBuildTeardown(t *testing.T) {
 		t.Fatal("late client did not reach its off-lock close")
 	}
 	p.mu.Lock()
-	inFlight, pending, total := p.inFlightCreations, p.pendingTeardowns, len(p.all)
+	inFlight, pending, total := p.inFlightCreations, len(p.teardowns), len(p.all)
 	p.mu.Unlock()
 	require.Zero(t, inFlight)
 	require.Zero(t, total, "the closing pool must never publish the new worker")
@@ -340,9 +337,9 @@ func TestQwpQueryPoolCloseWaitsForClosedDuringBuildTeardown(t *testing.T) {
 	waitQwpCleanupSignal(t, peerClosed, "query socket closure")
 	waitQwpCleanupSignal(t, client.io().doneCh, "query I/O shutdown")
 	p.mu.Lock()
-	pending = p.pendingTeardowns
+	pending = len(p.teardowns)
 	p.mu.Unlock()
-	require.Zero(t, pending, "finished teardown must balance the counter")
+	require.Zero(t, pending, "finished teardown must release its recorded obligation")
 }
 
 func TestQwpQueryPoolDoubleClose(t *testing.T) {
@@ -633,7 +630,7 @@ func TestQwpQueryPoolCloseSurvivesPanickingLogger(t *testing.T) {
 	panicked := false
 	func() {
 		defer func() { panicked = recover() != nil }()
-		_ = p.close(ctx)
+		_ = p.close(cancelledCleanupWait())
 	}()
 	require.False(t, panicked, "a panicking handler must not escape close()")
 

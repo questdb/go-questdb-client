@@ -211,7 +211,7 @@ func poolFailureChild(t *testing.T, dir, mode string) ([][]byte, []int) {
 	// Call QuestDB.Close itself to check that concurrent calls keep reporting
 	// the failure, including calls after the first shutdown attempt.
 	db := &QuestDB{senderPool: p, queryPool: &qwpQueryPool{notify: make(chan struct{})}}
-	db.housekeeper = newQwpPoolHousekeeper(p, db.queryPool, 0, time.Millisecond)
+	db.housekeeper = newQwpPoolHousekeeper(p, db.queryPool, 0)
 	var wg sync.WaitGroup
 	results := make(chan error, 12)
 	for i := 0; i < 12; i++ {
@@ -390,6 +390,7 @@ func TestQwpSenderPoolCompletionDuringCancelledSnapshot(t *testing.T) {
 				finalErr = errors.New("completed close failed")
 			}
 			probe := &poolCompleteDuringSnapshot{publish: func() {
+				p.retiredSlots = nil
 				p.pendingLeaseTeardowns = 0
 				p.closeTeardownErr = finalErr
 				close(done)

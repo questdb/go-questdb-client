@@ -173,8 +173,8 @@ func TestQuestDBCloseReprobesRetainedSlotLocks(t *testing.T) {
 		t.Fatal("manager never entered spare-segment creation")
 	}
 
-	require.ErrorIs(t, db.Close(ctx), ErrSfCleanupPending)
-	require.ErrorIs(t, db.Close(ctx), ErrSfCleanupPending,
+	require.ErrorIs(t, db.Close(cancelledCleanupWait()), ErrSfCleanupPending)
+	require.ErrorIs(t, db.Close(cancelledCleanupWait()), ErrSfCleanupPending,
 		"the lock is still held, so a repeat Close must keep saying so")
 
 	releaseOnce.Do(func() { close(release) })
@@ -420,7 +420,7 @@ func TestQuestDBCloseWithOutstandingLease(t *testing.T) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 
-	if err := db.Close(ctx); err != nil {
+	if err := db.Close(cancelledCleanupWait()); err != nil {
 		t.Logf("db.Close: %v", err)
 	}
 	close(stop)
@@ -502,28 +502,22 @@ func TestQuestDBCloseIdempotentAndConcurrent(t *testing.T) {
 	}
 }
 
-// TestFirstCloseErrPrecedence covers the teardown-error precedence Close uses:
-// sender pool (owns flocks/I/O) over query pool over housekeeper, with nil only
-// when every step succeeded.
-func TestFirstCloseErrPrecedence(t *testing.T) {
+// Failures in one component must not hide pending work or another failure.
+func TestFacadeCloseResultIncludesEveryComponent(t *testing.T) {
 	sErr := errors.New("sender")
 	qErr := errors.New("query")
 	hErr := errors.New("housekeeper")
-	cases := []struct {
-		name          string
-		s, q, h, want error
-	}{
-		{"sender wins over all", sErr, qErr, hErr, sErr},
-		{"sender wins over query", sErr, qErr, nil, sErr},
-		{"sender wins, query nil", sErr, nil, hErr, sErr},
-		{"query wins over housekeeper", nil, qErr, hErr, qErr},
-		{"housekeeper last", nil, nil, hErr, hErr},
-		{"all clean", nil, nil, nil, nil},
-	}
-	for _, c := range cases {
-		if got := firstCloseErr(c.s, c.q, c.h); got != c.want {
-			t.Errorf("%s: firstCloseErr=%v, want %v", c.name, got, c.want)
+	s := &qwpFacadeShutdown{results: [3]error{sErr, qErr, hErr}}
+	_, got := s.snapshot()
+	for _, want := range []error{sErr, qErr, hErr} {
+		if !errors.Is(got, want) {
+			t.Fatalf("result %v lost %v", got, want)
 		}
+	}
+	s.results = [3]error{}
+	_, got = s.snapshot()
+	if got != nil {
+		t.Fatalf("clean result: %v", got)
 	}
 }
 
@@ -611,9 +605,7 @@ func (h *closeReentryHandler) WithGroup(string) slog.Handler      { return h }
 // result mutex. A logger that re-enters Close therefore observes the already
 // freed ledger instead of deadlocking on cached-result bookkeeping.
 func TestQuestDBCloseReprobeAllowsLoggerReentry(t *testing.T) {
-	db := &QuestDB{}
-	db.closeOnce.Do(func() {})
-	db.senderPool = closedSfPoolWithRetiredSlot(nil)
+	db := cleanupTestFacade(closedSfPoolWithRetiredSlot(nil), nil)
 	reentered := make(chan error, 1)
 	db.senderPool.logger = slog.New(&closeReentryHandler{db: db, hit: reentered})
 
@@ -641,13 +633,11 @@ func (s *flippableDoneSlot) closeCompleted() bool { return s.done.Load() }
 // nothing else — and once every caller has returned and the cleanup has
 // landed, one more Close reports nil.
 func TestQuestDBConcurrentCloseReprobes(t *testing.T) {
-	db := &QuestDB{}
-	db.closeOnce.Do(func() {})
 	cleanup := &flippableDoneSlot{}
-	db.senderPool = closedSfPoolWithRetiredSlot(cleanup)
+	db := cleanupTestFacade(closedSfPoolWithRetiredSlot(cleanup), nil)
 
 	for i := 0; i < 4; i++ {
-		require.ErrorIs(t, db.Close(context.Background()), ErrSfCleanupPending,
+		require.ErrorIs(t, db.Close(cancelledCleanupWait()), ErrSfCleanupPending,
 			"Close must stay pending while the lifecycle ledger is non-free")
 	}
 

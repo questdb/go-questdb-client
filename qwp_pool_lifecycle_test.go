@@ -511,9 +511,8 @@ func TestQwpSenderPoolCloseWaitsForReapTeardown(t *testing.T) {
 	}
 }
 
-// TestQwpQueryPoolCloseWaitsForReapTeardown is the query-pool counterpart of
-// TestQwpSenderPoolCloseWaitsForReapTeardown (FIX 1): the query pool's close()
-// must count in-flight reap teardowns via pendingTeardowns.
+// Pool shutdown must wait for clients already being closed by background pool
+// maintenance, even though they have left the list of clients available to borrow.
 func TestQwpQueryPoolCloseWaitsForReapTeardown(t *testing.T) {
 	release := make(chan struct{})
 	var entered sync.WaitGroup

@@ -31,7 +31,6 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,19 +89,15 @@ type QwpQueryClient struct {
 	transportPtr atomic.Pointer[qwpTransport]
 	ioPtr        atomic.Pointer[qwpEgressIO]
 
-	// genMu serialises generation lifecycle transitions: reconnect's
-	// closed-recheck + publishGeneration swap, and Close's set-closed +
-	// snapshot of the bound (transport, io) pair. nextEvent reads the
-	// atomic pointers under no lock; reconnect and Close grab this mutex
-	// so a transport fault cannot publish a fresh generation that a
-	// concurrent Close would never observe (and so leak forever), and so
-	// Close always snapshots a consistent generation pair rather than a
-	// torn read straddling publishGeneration. The lock covers only that
-	// wait-free swap/snapshot — never a user-facing wait. In particular
-	// reconnect's old-generation teardown and failover walk, and Close's
-	// I/O shutdown all run with the mutex released. The mutex prevents Close
-	// from reading a half-updated connection and I/O-loop pair.
-	genMu sync.Mutex
+	// genMu protects connection tracking and the switch to a new connection.
+	// Close uses the same lock to stop new attempts and prevent a reconnect
+	// from installing a connection that shutdown would miss. It also keeps
+	// the transport and I/O-loop pair consistent during that switch. Network
+	// requests and waits for cleanup run without this lock.
+	genMu         sync.Mutex
+	walks         sync.WaitGroup
+	generations   []*qwpConnectResult
+	generationErr error
 
 	// hostTracker is the failover.md §2 host-health / zone tracker
 	// shared by the initial connect and every failover reconnect. It
@@ -141,11 +136,13 @@ type QwpQueryClient struct {
 
 	// closed guards Close against double-close and later Query/Exec.
 	closed atomic.Bool
-	// closeOnce starts teardown without waiting inside the gate. Later
-	// owner-side calls observe the same operation and its stored result.
-	closeOnce sync.Once
-	closeDone chan struct{}
-	closeErr  error
+	// closeOnce starts cleanup without waiting for it. Later Close calls wait
+	// for that same work and read its saved result.
+	closeOnce   sync.Once
+	closeDone   chan struct{}
+	closeErr    error
+	closeMu     sync.Mutex
+	closeFailed chan struct{}
 
 	// execDrainAbandoned latches when a cleanup drain abandons before
 	// reaching a terminal frame while the transport stays healthy —
@@ -587,7 +584,7 @@ func QwpQueryClientFromConf(ctx context.Context, conf string) (*QwpQueryClient, 
 // connect walk, and spawns the I/O goroutines for the bound
 // generation. The walk applies the target= role filter against the
 // SERVER_INFO frame each endpoint emits.
-func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQueryClient, error) {
+func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (_ *QwpQueryClient, err error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -616,11 +613,25 @@ func newQwpQueryClient(ctx context.Context, cfg *qwpQueryClientConfig) (*QwpQuer
 		hostTracker: newQwpHostTracker(len(cfg.endpoints), cfg.zone, cfg.target),
 	}
 	c.currentEndpointIdx.Store(-1)
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: query construction panicked: %v", ErrCleanupFailed, r)
+		}
+		if err != nil {
+			if errors.Is(err, ErrCleanupFailed) {
+				c.generationErr = errors.Join(c.generationErr, err)
+			}
+			stopCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_ = c.Close(stopCtx)
+			err = &qwpQueryBuildError{cause: err, client: c}
+		}
+	}()
 
 	// allowFallthroughReset=false: initial connect probes each endpoint
 	// exactly once (Java connect() parity), no re-sweep on a uniformly
 	// rejecting cluster.
-	result, err := connectWalk(ctx, cfg, c.hostTracker, nil, false)
+	result, err := c.connectWalk(ctx, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -655,35 +666,17 @@ var errExecDesynced = errors.New(
 // generation's QwpServerInfo (nil if none consumed) or a non-nil error
 // if the walk fails.
 //
-// Locking: c.genMu is held only across the publish — the wait-free
-// closed-recheck + publishGeneration swap. The old-generation teardown
-// and the failover walk (dial + WS upgrade + SERVER_INFO per endpoint,
-// up to ~2×N endpoints) run without holding c.genMu, so network waits do not
-// keep that mutex locked.
-// It is safe to repeat cleanup because shutdown() and close() are idempotent
-// and concurrency-safe: if Close tears the old (or just-built) pair
-// down at the same time we do, the duplicate teardown is a no-op.
+// genMu protects recording and switching connections; network waits do not hold
+// it. Each discarded connection starts one cleanup attempt. Successful cleanup
+// waits for its I/O goroutines to exit and its transport to close. Save the
+// result before removing the connection from the list. If cleanup fails
+// internally, resources that cannot safely be released stay held.
 //
-// Internal generation fencing (not permission to Close during iteration):
-// Close sets c.closed and snapshots the bound
-// (io, transport) pair under c.genMu, then tears that pair down after
-// releasing the lock. The outcomes, by where Close lands:
-//
-//   - before our post-walk recheck (the common case, while we are in
-//     the unlocked walk): Close snapshots and tears down whatever is
-//     bound — the old, already-torn-down pair (idempotent). Our recheck
-//     then sees c.closed, skips publishGeneration, and tears down the
-//     generation the walk just built rather than publishing an orphan
-//     nothing would shut down.
-//
-//   - after we publish: Close snapshots and tears down the new
-//     generation we bound. A submit racing in this window fails ("I/O
-//     goroutine shut down") and surfaces as a benign replay-failed error
-//     on the query the user is already closing.
-//
-// The lock-free early-out at the top is a best-effort optimisation to
-// skip a pointless walk when Close has already won; the post-walk
-// recheck under the lock is the authoritative one.
+// Close takes genMu to stop new connection attempts and waits for attempts
+// already running. The closed check after connecting prevents a new connection
+// from being installed during shutdown. These internal checks do not make it
+// safe for application code to call Close while reading results or reconnecting;
+// first stop the code using the client.
 //
 // Mirrors the high-level shape of Java's reconnectViaTracker +
 // executeOnce composition.
@@ -696,18 +689,9 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 		return nil, errClosedDuringFailover
 	}
 
-	// Tear down the dying generation with no lock held. The pointers are
-	// atomic and only publishGeneration writes them, so this cannot race
-	// a publish; shutdown()/close() are idempotent, so a concurrent Close
-	// tearing the same pair down is harmless. This caller's context bounds
-	// waiting; cancelled I/O and the transport close worker retain resources
-	// until their actual exit.
-	if oldIO := c.io(); oldIO != nil {
-		_ = oldIO.shutdown(ctx)
-	}
-	if oldTr := c.transport(); oldTr != nil {
-		_ = oldTr.closeContext(ctx)
-	}
+	// Start closing the old connection without waiting for it to finish. Keep
+	// tracking its cleanup while trying to open the next connection.
+	c.retireBoundGeneration()
 
 	// Demote the just-failed endpoint, then open a fresh round. Order
 	// is normative (failover.md §2.3): RecordMidStreamFailure must run
@@ -730,7 +714,7 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	// allowFallthroughReset=true: one BeginRound(true) re-sweep so a
 	// long-lived client recovers from a topology change (Java
 	// reconnectViaTracker parity).
-	result, err := connectWalk(ctx, c.cfg, c.hostTracker, s.cancelCh, true)
+	result, err := c.connectWalk(ctx, s.cancelCh, true)
 	if err != nil {
 		return nil, err
 	}
@@ -744,8 +728,7 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 	c.genMu.Lock()
 	if c.closed.Load() {
 		c.genMu.Unlock()
-		_ = result.io.shutdown(ctx)
-		_ = result.transport.closeContext(ctx)
+		result.startClose()
 		return nil, errClosedDuringFailover
 	}
 	c.publishGeneration(result)
@@ -784,8 +767,7 @@ func (c *QwpQueryClient) reconnectAndReplay(ctx context.Context, s *qwpQuerySess
 		// submit that already observed a latched ioErr (a prior poison) is
 		// a harmless no-op.
 		result.io.setIoErr(fmt.Errorf("qwp query: replay submit failed: %w", err))
-		_ = result.io.shutdown(ctx)
-		_ = result.transport.closeContext(ctx)
+		result.startClose()
 		return nil, fmt.Errorf("qwp query: replay submit failed: %w", err)
 	}
 	// Re-issue the cancel if Cancel landed during the reconnect.
@@ -867,72 +849,37 @@ func (c *qwpQueryClientConfig) effectiveAuthorization() string {
 // guaranteed to finish.
 func (c *QwpQueryClient) Close(ctx context.Context) error {
 	c.closeOnce.Do(func() {
-		// Set closed and snapshot the bound (io, transport) pair under
-		// genMu. This is what makes Close safe against a concurrent
-		// reconnectAndReplay: reconnect publishes the new generation
-		// under genMu too, so under the lock we observe exactly one
-		// consistent generation — never a torn pair half-way through
-		// publishGeneration. reconnect's post-walk recheck observes our
-		// closed flag and self-tears-down (or skips building) any
-		// generation we did not snapshot; a duplicate teardown of the
-		// pair we DID snapshot is harmless (shutdown/close are
-		// idempotent). Crucially, reconnect holds genMu only across that
-		// publish — not across its failover walk — so this Lock does not
-		// wait for reconnect's network requests to finish. See
-		// reconnectAndReplay's doc for the possible orderings in its
-		// table. The shutdown/close run after Unlock so genMu is never
-		// held across a user-facing wait.
 		c.genMu.Lock()
 		c.closed.Store(true)
-		io := c.io()
-		tr := c.transport()
+		// Some tests set the transport and I/O fields directly, without going
+		// through connection setup. Include those resources in cleanup too.
+		if len(c.generations) == 0 && (c.io() != nil || c.transport() != nil) {
+			c.generations = append(c.generations, &qwpConnectResult{io: c.io(), transport: c.transport()})
+		}
 		c.genMu.Unlock()
 		c.closeDone = make(chan struct{})
-		go func() {
-			defer close(c.closeDone)
-			defer func() {
-				if r := recover(); r != nil {
-					c.closeErr = fmt.Errorf("%w: query close panicked: %v", ErrCleanupFailed, r)
-					qwpFailedQueries.Lock()
-					qwpFailedQueries.items = append(qwpFailedQueries.items, c)
-					qwpFailedQueries.Unlock()
-				}
-			}()
-			// Initiate release even between reads, before joining internal users.
-			stopCtx, cancel := context.WithCancel(context.Background())
-			cancel()
-			if tr != nil {
-				_ = tr.closeContext(stopCtx)
-			}
-			if io != nil {
-				if err := io.shutdown(context.Background()); err != nil {
-					c.closeErr = err
-				}
-			}
-			if tr != nil {
-				// net.ErrClosed means the socket was already closed by another
-				// path — the transport fault that triggered failover, or a
-				// concurrent reconnect tearing down the same (now-superseded)
-				// generation we snapshotted. The close postcondition holds, so
-				// it is success, not a Close failure. (coder/websocket itself
-				// returns net.ErrClosed, wrapped, only when a close was already
-				// in flight, and swallows it on the path that wins the close.)
-				if err := tr.close(); err != nil && !errors.Is(err, net.ErrClosed) {
-					c.closeErr = errors.Join(c.closeErr, err)
-				}
-			}
-		}()
+		c.closeFailed = make(chan struct{})
+		go c.closeGenerations()
 	})
 	select {
 	case <-c.closeDone:
-		return c.closeErr
+		return c.closeResult()
 	default:
 	}
 	select {
 	case <-c.closeDone:
-		return c.closeErr
+		return c.closeResult()
+	case <-c.closeFailed:
+		return c.closeResult()
 	case <-ctx.Done():
-		return errors.Join(ErrCleanupPending, ctx.Err())
+		select {
+		case <-c.closeDone:
+			return c.closeResult()
+		case <-c.closeFailed:
+			return c.closeResult()
+		default:
+			return errors.Join(c.closeResult(), ErrCleanupPending, ctx.Err())
+		}
 	}
 }
 

@@ -565,9 +565,9 @@ func (io *qwpEgressIO) recycleReadBuf(bufRef *[]byte) {
 	}
 }
 
-// shutdown signals both goroutines to exit and blocks until the
-// dispatcher returns or ctx expires. Idempotent — repeated calls
-// return immediately once the dispatcher has joined.
+// shutdown asks the reader and dispatcher goroutines to stop. It waits until
+// both have exited or ctx expires. A timeout only ends this caller's wait; the
+// goroutines may still be running. Later calls wait for the same shutdown.
 func (io *qwpEgressIO) shutdown(ctx context.Context) error {
 	io.shutdownOnce.Do(func() {
 		close(io.shutdownCh)

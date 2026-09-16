@@ -467,6 +467,9 @@ type qwpLineSender struct {
 	// drain_orphans (SF mode only). Closed alongside the cursor
 	// engine in closeCursor.
 	drainerPool *qwpSfDrainerPool
+	// Save errors from queueing rows and waiting for server acknowledgements.
+	// Check engine cleanup errors separately because a retry may clear them.
+	closeDeliveryErr error
 
 	// Records whether Close has started, so later calls cannot close engine
 	// channels twice. A second standalone Close returns an error; see

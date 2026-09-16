@@ -25,20 +25,20 @@
 package questdb
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// qwpPoolHousekeeper periodically reaps idle / over-age slots from both pools.
-// One per QuestDB handle. It drives no SF recovery (the Go sender
-// self-recovers; the pool binds recovery senders at construction) — it
-// only reaps. interval 0 disables it: start() spawns nothing and stopAndJoin
-// returns immediately.
+// qwpPoolHousekeeper periodically removes unused or old clients from both pools.
+// Each QuestDB handle has one. It does not recover stored data; senders handle
+// that themselves. With interval 0, no worker starts and close returns immediately.
 type qwpPoolHousekeeper struct {
 	interval   time.Duration
-	joinBudget time.Duration
 	senderPool *qwpSenderPool
 	queryPool  *qwpQueryPool
 	logger     *slog.Logger // nil -> slog.Default() via qwpEffectiveLogger
@@ -46,18 +46,15 @@ type qwpPoolHousekeeper struct {
 	done       chan struct{}
 	started    atomic.Bool
 	stopOnce   sync.Once
+	mu         sync.Mutex
+	err        error
 }
 
-// newQwpPoolHousekeeper builds the reaper. interval 0 means disabled; a
-// negative interval falls back to the default. joinBudget bounds stopAndJoin
-// and must cover a reaped slot's worst-case Close (the close-flush drain), so
-// a reap in flight can never outlive QuestDB.Close.
-func newQwpPoolHousekeeper(sp *qwpSenderPool, qp *qwpQueryPool, interval, joinBudget time.Duration) *qwpPoolHousekeeper {
+// newQwpPoolHousekeeper sets up periodic pool cleanup. An interval of 0 disables
+// it; a negative interval uses the default.
+func newQwpPoolHousekeeper(sp *qwpSenderPool, qp *qwpQueryPool, interval time.Duration) *qwpPoolHousekeeper {
 	if interval < 0 {
 		interval = qwpDefaultHousekeeperInterval
-	}
-	if joinBudget <= 0 {
-		joinBudget = qwpSfDefaultCloseFlushTimeout + time.Second
 	}
 	var logger *slog.Logger
 	if sp != nil {
@@ -65,7 +62,6 @@ func newQwpPoolHousekeeper(sp *qwpSenderPool, qp *qwpQueryPool, interval, joinBu
 	}
 	return &qwpPoolHousekeeper{
 		interval:   interval,
-		joinBudget: joinBudget,
 		senderPool: sp,
 		queryPool:  qp,
 		logger:     logger,
@@ -92,40 +88,58 @@ func (h *qwpPoolHousekeeper) run() {
 		case <-h.stop:
 			return
 		case <-t.C:
-			h.reapGuarded(func() { h.senderPool.reapIdle() })
-			h.reapGuarded(func() { h.queryPool.reapIdle() })
+			if !h.reapGuarded(func() { h.senderPool.reapIdle() }) {
+				return
+			}
+			if !h.reapGuarded(func() { h.queryPool.reapIdle() }) {
+				return
+			}
 		}
 	}
 }
 
-// reapGuarded runs a reap step under a panic guard so a fault in one pool's
-// teardown can never kill the daemon and stop all future reaping.
-func (h *qwpPoolHousekeeper) reapGuarded(fn func()) {
+// If removing unused clients panics, keep the pools alive and report the failure
+// rather than retrying a partly completed operation. Shutdown can still close
+// other clients where that is known to be safe.
+func (h *qwpPoolHousekeeper) reapGuarded(fn func()) (ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			// The daemon loop has no recover of its own, and a recover()
-			// cannot catch a second panic raised while this one unwinds. A
-			// user's slog handler must not be able to turn a survivable reap
-			// panic into a dead process.
-			qwpEffectiveLogger(h.logger).Warn("qwp pool housekeeper: reap step panicked", "panic", r)
+			h.mu.Lock()
+			h.err = fmt.Errorf("%w: housekeeper reap panicked: %v", ErrCleanupFailed, r)
+			h.mu.Unlock()
+			qwpFailedHousekeepers.Lock()
+			qwpFailedHousekeepers.items = append(qwpFailedHousekeepers.items, h)
+			qwpFailedHousekeepers.Unlock()
+			go qwpEffectiveLogger(h.logger).Error("qwp: housekeeper cleanup failed", "error", h.err)
 		}
 	}()
 	fn()
+	return true
 }
 
-// stopAndJoin signals the daemon and waits for it to exit, bounded so a stuck
-// reap can't block Close forever. Idempotent, and an immediate no-op when the
-// housekeeper is disabled (never started) — waiting on done there would sleep
-// out the whole join budget for a goroutine that does not exist.
-func (h *qwpPoolHousekeeper) stopAndJoin() {
+var qwpFailedHousekeepers struct {
+	sync.Mutex
+	items []*qwpPoolHousekeeper
+}
+
+func (h *qwpPoolHousekeeper) close(ctx context.Context) error {
 	h.stopOnce.Do(func() { close(h.stop) })
-	if !h.started.Load() {
-		return
+	if h.started.Load() {
+		select {
+		case <-h.done:
+		default:
+			select {
+			case <-h.done:
+			case <-ctx.Done():
+				select {
+				case <-h.done:
+				default:
+					return errors.Join(ErrCleanupPending, ctx.Err())
+				}
+			}
+		}
 	}
-	t := time.NewTimer(h.joinBudget)
-	defer t.Stop()
-	select {
-	case <-h.done:
-	case <-t.C:
-	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.err
 }

@@ -206,6 +206,9 @@ type qwpConnectResult struct {
 	io          *qwpEgressIO
 	endpointIdx int
 	serverInfo  *QwpServerInfo
+	closeOnce   sync.Once
+	closeDone   chan struct{}
+	closeErr    error
 }
 
 // connectWalk is the egress WalkTracker helper (wire-egress.md
@@ -249,10 +252,10 @@ type qwpConnectResult struct {
 // just floods server logs). All other dial failures are per-endpoint
 // and the walk continues.
 //
-// Closes any partially-bound resources before returning on a failure
-// path so callers do not have to worry about leaked goroutines or
-// half-open sockets. On a successful return the caller takes
-// ownership of the transport + I/O.
+// Record each attempt before opening a connection. If an attempt fails or the
+// server's role is unsuitable, start closing that connection in the background.
+// The client keeps track of it until cleanup finishes, even if this function
+// has returned. A successful connection stays in the same tracking list.
 //
 // cancelCh, when non-nil, is checked at every endpoint boundary to
 // short-circuit the walk if the user has asked to cancel. Cancel()
@@ -263,7 +266,25 @@ type qwpConnectResult struct {
 // in-flight Dial / SERVER_INFO read, so the worst-case wait shrinks
 // from the full walk to a single endpoint's timeout. Java has the
 // same boundary-only granularity.
-func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHostTracker, cancelCh <-chan struct{}, allowFallthroughReset bool) (*qwpConnectResult, error) {
+func (c *QwpQueryClient) connectWalk(ctx context.Context, cancelCh <-chan struct{}, allowFallthroughReset bool) (*qwpConnectResult, error) {
+	c.genMu.Lock()
+	if c.closed.Load() {
+		c.genMu.Unlock()
+		return nil, errClosedDuringFailover
+	}
+	c.walks.Add(1)
+	c.genMu.Unlock()
+	defer c.walks.Done()
+	cfg, tracker := c.cfg, c.hostTracker
+	var acquiring *qwpConnectResult
+	defer func() {
+		if r := recover(); r != nil {
+			if acquiring != nil {
+				acquiring.retainFailure(r)
+			}
+			panic(r)
+		}
+	}()
 	if len(cfg.endpoints) == 0 {
 		return nil, fmt.Errorf("qwp query: no endpoints configured")
 	}
@@ -311,6 +332,8 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 		wsURL := scheme + "://" + ep.String()
 
 		tr := &qwpTransport{}
+		acquiring = &qwpConnectResult{transport: tr, endpointIdx: idx}
+		c.keepGeneration(acquiring)
 		opts := qwpTransportOpts{
 			logger:                cfg.logger,
 			tlsInsecureSkipVerify: cfg.tlsMode == tlsInsecureSkipVerify,
@@ -329,8 +352,9 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 		}
 		attempts++
 		if err := tr.connect(ctx, wsURL, opts); err != nil {
-			// transport.connect already cleaned up after itself on the
-			// failure path. Classify per failover.md §5/§6.
+			acquiring.startClose()
+			// transport.connect has already started closing the failed connection.
+			// Decide whether to try another server, following failover.md §5/§6.
 			var rej *QwpUpgradeRejectError
 			if errors.As(err, &rej) {
 				// AuthError 401/403: terminal — bypass failover so a
@@ -362,6 +386,9 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			continue
 		}
 
+		if hook := qwpTestQueryAfterTransportAcquired.Load(); hook != nil {
+			(*hook)(tr)
+		}
 		info := tr.serverInfo
 		if info != nil && info.Capabilities&qwpCapZone != 0 {
 			// Server advertised its zone on the SERVER_INFO frame.
@@ -374,7 +401,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			// caller a false guarantee. Demote to TopologyReject rather
 			// than binding to an unknown role.
 			tracker.RecordRoleReject(idx, false)
-			_ = tr.closeContext(ctx)
+			acquiring.startClose()
 			continue
 		}
 		if info != nil && !cfg.target.accepts(info.Role) {
@@ -382,7 +409,7 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 			// PRIMARY_CATCHUP is catching up and likely to become
 			// writable; any other mismatch is a stable topology fact.
 			tracker.RecordRoleReject(idx, info.Role == qwpRolePrimaryCatchup)
-			_ = tr.closeContext(ctx)
+			acquiring.startClose()
 			continue
 		}
 
@@ -392,14 +419,13 @@ func connectWalk(ctx context.Context, cfg *qwpQueryClientConfig, tracker *qwpHos
 		// reconnects without disturbing the IO goroutine's view.
 		io := newQwpEgressIO(tr, cfg.bufferPoolSize, cfg.closeDrainTimeout)
 		io.logger = cfg.logger
+		acquiring.io = io
 		io.start()
 		tracker.RecordSuccess(idx)
-		return &qwpConnectResult{
-			transport:   tr,
-			io:          io,
-			endpointIdx: idx,
-			serverInfo:  tr.serverInfo,
-		}, nil
+		acquiring.serverInfo = tr.serverInfo
+		result := acquiring
+		acquiring = nil
+		return result, nil
 	}
 
 	if cfg.target == qwpTargetAny {

@@ -126,7 +126,7 @@ func TestQwpSenderDrainerPoolPanicKeepsEarlierErrorAndCancels(t *testing.T) {
 	closeErr := sender.Close(context.Background())
 	require.ErrorIs(t, closeErr, earlierErr,
 		"a later drainer failure must not replace the first user-facing error")
-	require.ErrorContains(t, closeErr, "drainer pool close panicked")
+	require.ErrorIs(t, closeErr, ErrCleanupFailed)
 	select {
 	case <-pool.ctx.Done():
 	case <-time.After(time.Second):
@@ -191,11 +191,14 @@ func TestQwpSenderClosePhaseOrderIsExplicit(t *testing.T) {
 	}
 }
 
-// TestQwpOrphanDrainerOwnsEngineBeforePostOpenFault proves the ownership
-// obligation is installed at the acquisition boundary, before logger setup or
-// any other faultable post-open work can strand the manager and slot flock.
+// A drainer must save its engine as soon as it opens it. If the next setup step
+// panics, cleanup must still report failure and keep the slot locked rather
+// than lose track of the engine or falsely report that its resources are freed.
 func TestQwpOrphanDrainerOwnsEngineBeforePostOpenFault(t *testing.T) {
-	dir := t.TempDir()
+	dir, child := terminalDrainerTestDir(t)
+	if !child {
+		return
+	}
 	var drainerEngine *qwpSfCursorEngine
 	openedHook := func(engine *qwpSfCursorEngine) {
 		drainerEngine = engine
@@ -217,12 +220,11 @@ func TestQwpOrphanDrainerOwnsEngineBeforePostOpenFault(t *testing.T) {
 
 	require.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
 	require.NotNil(t, drainerEngine)
-	require.True(t, drainerEngine.engineCloseCompleted(),
-		"the post-open panic must unwind through the installed engine owner")
 	waitQwpSfEngineCleanup(t, drainerEngine)
-	lock, lockErr := qwpSfAcquireSlotLock(dir)
-	require.NoError(t, lockErr, "the post-open panic must not strand the orphan flock")
-	require.NoError(t, lock.close())
+	require.False(t, drainerEngine.engineCloseCompleted())
+	require.ErrorIs(t, drainer.cleanupResult(), ErrCleanupFailed)
+	drainer, drainerEngine = nil, nil
+	assertTerminalDrainerRetained(t, dir)
 }
 
 func TestQwpSenderForegroundCloseRetriesDrainedFileCleanup(t *testing.T) {

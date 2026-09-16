@@ -287,7 +287,7 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 		require.NoError(t, engine.engineClose())
 	}
 
-	var unavailable, persistent, lastAttempts int
+	var unavailable, persistent, lastAttempts atomic.Int32
 	drainer := qwpSfNewOrphanDrainer(
 		dir, segSize, qwpSfUnlimitedTotalBytes,
 		qwpSfDurableDialFor(srv),
@@ -296,8 +296,8 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 	)
 	drainer.durableAckMode = true
 	drainer.listener = QwpBackgroundDrainerListener{
-		OnDurableAckUnavailable:       func(string, int) { unavailable++ },
-		OnDurableAckPersistentFailure: func(_ string, attempts int, _ time.Duration) { persistent++; lastAttempts = attempts },
+		OnDurableAckUnavailable:       func(string, int) { unavailable.Add(1) },
+		OnDurableAckPersistentFailure: func(_ string, attempts int, _ time.Duration) { lastAttempts.Store(int32(attempts)); persistent.Add(1) },
 	}
 	drainer.drainerRun(context.Background())
 
@@ -305,9 +305,10 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
 	require.NoError(t, err)
 	assert.Contains(t, string(body), "durable-ack")
-	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, unavailable, "one OnDurableAckUnavailable per mismatch up to the cap")
-	assert.Equal(t, 1, persistent, "OnDurableAckPersistentFailure fires exactly once")
-	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, lastAttempts)
+	require.Eventually(t, func() bool { return persistent.Load() == 1 }, time.Second, time.Millisecond)
+	assert.EqualValues(t, qwpMaxDurableAckMismatchAttempts, unavailable.Load(), "cooperative listener receives each queued mismatch")
+	assert.EqualValues(t, 1, persistent.Load())
+	assert.EqualValues(t, qwpMaxDurableAckMismatchAttempts, lastAttempts.Load())
 
 	// Positively confirm the drainer never trimmed the un-uploaded data: its
 	// backing .sfa segment must survive quarantine (Hazard I — never unlink an
@@ -864,18 +865,16 @@ func TestQwpSfDrainerPoolRejectsAfterClose(t *testing.T) {
 	assert.Contains(t, err.Error(), "closed")
 }
 
-// TestQwpSfDrainerPoolSurvivesFactoryPanic asserts a panic in the
-// user-supplied clientFactory — invoked on the drainer goroutine from
-// drainerRun's connect phase, before the send loop's own recover is in
-// play — is converted into a latched terminal failure rather than
-// crashing the host process (which would take the whole pool and the
-// foreground sender down with it). The panicking drainer must end Failed
-// with a quarantine sentinel, and the pool's semaphore/active-list
-// bookkeeping must survive intact: on a cap-1 pool a follow-up drainer
-// can only run once the panicking one releases its slot, so its reaching
-// Success proves the worker's cleanup defers ran (no crash, no leaked
-// slot).
+// A panic while opening a drainer's connection must report a permanent failure,
+// not crash the process. Keep its disk slot locked without marking the data as
+// corrupt. The pool must still be able to run a different drainer: with a limit
+// of one running task, the next task's success shows that the failed task no
+// longer uses that running-task allowance. Its disk slot remains locked.
 func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
+	panicDir, child := terminalDrainerTestDir(t)
+	if !child {
+		return
+	}
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
@@ -887,7 +886,6 @@ func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
 	// Unacked slot + a factory that panics. The drainer must get past
 	// drainerRun's already-drained short-circuit and into the connect
 	// phase for the factory to be reached.
-	panicDir := t.TempDir()
 	{
 		engine, err := qwpSfNewCursorEngine(panicDir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
 		require.NoError(t, err)
@@ -905,20 +903,18 @@ func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
 	)
 	require.NoError(t, pool.drainerPoolSubmit(context.Background(), panicDrainer))
 
-	// The panic surfaces as a Failed outcome with a quarantine sentinel,
-	// not a process crash.
+	// Keep the failed drainer's resources. The panic does not prove that its
+	// stored data is corrupt.
 	require.Eventually(t, func() bool {
 		return panicDrainer.drainerOutcome() == qwpSfDrainOutcomeFailed
 	}, 2*time.Second, 5*time.Millisecond,
 		"factory panic must surface as a Failed outcome, not crash the host")
-	body, err := os.ReadFile(filepath.Join(panicDir, qwpSfFailedSentinelName))
-	require.NoError(t, err)
-	assert.Contains(t, string(body), "panicked")
+	require.Eventually(t, func() bool { return errors.Is(pool.cleanupResult(), ErrCleanupFailed) }, time.Second, time.Millisecond)
+	assertTerminalDrainerRetained(t, panicDir)
 
-	// Pool machinery survived: a healthy drainer submitted to the same
-	// cap-1 pool runs to Success, which is only possible once the
-	// panicking drainer's worker released its semaphore slot on its way
-	// out.
+	// A different drainer can run even though the failed one's disk slot stays
+	// locked. The pool allows only one running task, so this also checks that
+	// the failed task no longer occupies that allowance.
 	healthyDir := t.TempDir()
 	{
 		engine, err := qwpSfNewCursorEngine(healthyDir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
@@ -937,6 +933,10 @@ func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
 		return healthyDrainer.drainerOutcome() == qwpSfDrainOutcomeSuccess
 	}, 5*time.Second, 10*time.Millisecond,
 		"follow-up drainer must run after the panicking one freed its semaphore slot")
+	pool.drainerPoolClose()
+	require.ErrorIs(t, pool.cleanupResult(), ErrCleanupFailed)
+	panicDrainer = nil
+	assertTerminalDrainerRetained(t, panicDir)
 }
 
 // TestQwpSfDrainerUsesSharedTracker verifies the Phase 5 wiring:

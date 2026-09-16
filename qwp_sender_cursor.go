@@ -1015,6 +1015,7 @@ func (s *qwpLineSender) closeCursor(ctx context.Context) (firstErr error) {
 		}()
 	}
 	firstErr = s.closeCursorDrainGuarded(ctx)
+	s.closeDeliveryErr = firstErr
 	var failure error
 	if errors.Is(firstErr, ErrCleanupFailed) {
 		failure = firstErr
@@ -1069,11 +1070,13 @@ func closeDrainerPoolGuarded(pool *qwpSfDrainerPool) (err error) {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("qwp: drainer pool close panicked: %v\n%s", r, debug.Stack())
+			err = &qwpCleanupPanicError{phase: "drainer pool close", cause: r, stack: debug.Stack()}
 		}
 	}()
 	pool.drainerPoolClose()
-	return nil
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	return pool.cleanupErr
 }
 
 // closeCursorDrainGuarded encodes the pending rows and waits for the drain,
@@ -1158,7 +1161,8 @@ func (s *qwpLineSender) closeCompleted() bool {
 			return false
 		}
 	}
-	return s.cursorEngine == nil || s.cursorEngine.engineCloseCompleted()
+	return (s.cursorEngine == nil || s.cursorEngine.engineCloseCompleted()) &&
+		(s.drainerPool == nil || s.drainerPool.cleanupCompleted())
 }
 
 // qwpSfBuildPanic carries a construction panic and a way to check cleanup of
@@ -1190,6 +1194,30 @@ func (e *qwpSfBuildCleanupError) closeCompleted() bool {
 }
 
 func (e *qwpSfBuildCleanupError) cleanupFailure() error { return e.engine.cleanupFailure() }
+func (e *qwpSfBuildCleanupError) cleanupResult() error {
+	return errors.Join(e.cause, e.engine.cleanupResult())
+}
+
+func (s *qwpLineSender) cleanupResult() error {
+	if s == nil {
+		return nil
+	}
+	if op := s.shutdown.Load(); op != nil {
+		select {
+		case <-op.done:
+			if errors.Is(op.err, ErrCleanupFailed) {
+				return op.err
+			}
+		default:
+			return nil
+		}
+	}
+	var drainerErr error
+	if s.drainerPool != nil {
+		drainerErr = s.drainerPool.cleanupResult()
+	}
+	return errors.Join(s.closeDeliveryErr, s.cursorEngine.cleanupResult(), drainerErr)
+}
 
 func (s *qwpLineSender) cleanupFailure() error {
 	if s == nil {
@@ -1204,16 +1232,16 @@ func (s *qwpLineSender) cleanupFailure() error {
 		default:
 		}
 	}
-	return s.cursorEngine.cleanupFailure()
+	if err := s.cleanupResult(); errors.Is(err, ErrCleanupFailed) {
+		return err
+	}
+	return nil
 }
 func qwpSfCloseEngineAfterBuildFailure(engine *qwpSfCursorEngine, cause error) error {
 	closeErr := engine.engineClose()
 	if !engine.engineCloseCompleted() {
 		// Report the cleanup error as well as the construction error, so the
 		// caller knows why files or the slot lock may still be held.
-		if closeErr != nil {
-			cause = errors.Join(cause, closeErr)
-		}
 		return &qwpSfBuildCleanupError{cause: cause, engine: engine}
 	}
 	if closeErr != nil {

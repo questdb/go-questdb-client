@@ -71,11 +71,7 @@ type QuestDB struct {
 	housekeeper *qwpPoolHousekeeper
 	closeOnce   sync.Once
 
-	// These fields contain only stable one-time teardown results. The volatile
-	// SF lifecycle snapshot is read from senderPool on every Close call.
-	closeSenderFallbackErr error
-	closeQueryErr          error
-	closeHousekeepErr      error
+	shutdown *qwpFacadeShutdown
 }
 
 // QuestDBOption configures the QuestDB facade. An explicit option always wins
@@ -292,8 +288,7 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	if serr := sanitizeQwpConf(senderConf); serr != nil {
 		return nil, serr
 	}
-	queryConf, err := parseQwpQueryConf(conf)
-	if err != nil {
+	if _, err := parseQwpQueryConf(conf); err != nil {
 		return nil, err
 	}
 
@@ -391,15 +386,7 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 		}
 		return nil, err
 	}
-	// The join budget must cover one reap sweep's worst case so a reap in flight
-	// can never outlive QuestDB.Close. A sweep reaps the sender pool then the
-	// query pool sequentially, so the budget sums the sender close-flush drain
-	// and the query close-drain (query_close_timeout_ms).
-	closeFlush := qwpSfDefaultCloseFlushTimeout
-	if senderConf.closeFlushTimeoutSet {
-		closeFlush = max(time.Duration(senderConf.closeFlushTimeoutMillis)*time.Millisecond, 0)
-	}
-	hk := newQwpPoolHousekeeper(sp, qp, hkInterval, closeFlush+queryConf.closeDrainTimeout+time.Second)
+	hk := newQwpPoolHousekeeper(sp, qp, hkInterval)
 	hk.start()
 	return &QuestDB{senderPool: sp, queryPool: qp, housekeeper: hk}, nil
 }
@@ -492,44 +479,11 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // Once Close returns nil, later calls also return nil.
 func (db *QuestDB) Close(ctx context.Context) error {
 	db.closeOnce.Do(func() {
-		// Signal the pools to stop reaping before joining the housekeeper, so a
-		// reap cannot start during the join window and outlive Close.
 		db.senderPool.markClosing()
 		db.queryPool.markClosing()
-		hErr := closeStep(func() error { db.housekeeper.stopAndJoin(); return nil })
-		qErr := closeStep(func() error { return db.queryPool.close(ctx) })
-		firstSenderResult := closeStep(func() error { return db.senderPool.close(ctx) })
-		db.closeQueryErr, db.closeHousekeepErr = qErr, hErr
-		// qwpSenderPool remembers ordinary teardown/poison errors itself. Keep
-		// only a facade fallback for a panic recovered outside the pool before
-		// it could record that stable result; never cache CleanupPending here.
-		if db.senderPool.stableCloseResult() == nil && firstSenderResult != nil &&
-			!errors.Is(firstSenderResult, ErrSfCleanupPending) {
-			db.closeSenderFallbackErr = firstSenderResult
-		}
+		db.shutdown = newQwpFacadeShutdown(db)
 	})
-	sErr := closeStep(func() error { return db.senderPool.close(ctx) })
-	if db.closeSenderFallbackErr != nil {
-		sErr = errors.Join(db.closeSenderFallbackErr, sErr)
-	}
-	return firstCloseErr(sErr, db.closeQueryErr, db.closeHousekeepErr)
-}
-
-// firstCloseErr selects the most actionable teardown error, preferring the
-// sender pool (owns flocks/I/O) over the query pool over the housekeeper so a
-// recovered panic in any step is not lost. Returns nil only when every step
-// succeeded.
-func firstCloseErr(sErr, qErr, hErr error) error {
-	switch {
-	case sErr != nil:
-		return sErr
-	case qErr != nil:
-		return qErr
-	case hErr != nil:
-		return hErr
-	default:
-		return nil
-	}
+	return db.shutdown.wait(ctx)
 }
 
 // closeStep runs one teardown step, converting a panic into an error so a
@@ -537,7 +491,7 @@ func firstCloseErr(sErr, qErr, hErr error) error {
 func closeStep(fn func() error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("qwp facade: teardown step panicked: %v", r)
+			err = fmt.Errorf("%w: facade teardown step panicked: %v", ErrCleanupFailed, r)
 		}
 	}()
 	return fn()
