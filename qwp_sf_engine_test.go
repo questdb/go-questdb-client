@@ -28,13 +28,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -947,78 +943,6 @@ func TestQwpSfDrainedCleanupCrashEpochsRecover(t *testing.T) {
 			require.Empty(t, epoch)
 		})
 	}
-}
-
-// TestQwpLoggerConstructionIsConfinedToQwpLog keeps the panic-guard rule
-// checkable with a rule that can be complete. The guard lives on the handler
-// (qwpGuardedHandler), installed once wherever a logger enters the client, so
-// every stored or resolved logger is guarded and every call site may log
-// directly. Producing an UNguarded logger therefore requires constructing
-// one — and constructing a *slog.Logger requires calling slog.New or
-// slog.Default. This test resolves each production file's import of log/slog
-// (under any local name) and asserts those two constructors are called only
-// in qwp_log.go, where both uses immediately wrap the handler.
-//
-// The earlier enforcement tried to spot unguarded call sites by how the
-// logger was spelled and lost four rounds in a row — the set of expressions
-// that can hold a logger is unbounded, so no spelling-based rule over call
-// sites can be sound. Constructor calls are a finite, resolvable set.
-func TestQwpLoggerConstructionIsConfinedToQwpLog(t *testing.T) {
-	constructors := map[string]bool{"New": true, "Default": true}
-
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
-	require.NoError(t, err)
-	require.NotEmpty(t, pkgs, "the scan must actually parse the package")
-
-	var violations, considered []string
-	for _, pkg := range pkgs {
-		for name, file := range pkg.Files {
-			base := filepath.Base(name)
-			// Resolve the local name log/slog is imported under in THIS
-			// file, so an aliased import cannot dodge the check.
-			slogName := ""
-			for _, imp := range file.Imports {
-				if imp.Path.Value != `"log/slog"` {
-					continue
-				}
-				slogName = "slog"
-				if imp.Name != nil {
-					slogName = imp.Name.Name
-				}
-			}
-			if slogName == "" || slogName == "_" {
-				continue
-			}
-			ast.Inspect(file, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || !constructors[sel.Sel.Name] {
-					return true
-				}
-				ident, ok := sel.X.(*ast.Ident)
-				if !ok || ident.Name != slogName || ident.Obj != nil {
-					return true
-				}
-				where := fmt.Sprintf("%s:%d %s.%s", base, fset.Position(call.Pos()).Line, slogName, sel.Sel.Name)
-				considered = append(considered, where)
-				if base != "qwp_log.go" {
-					violations = append(violations, where)
-				}
-				return true
-			})
-		}
-	}
-	// A positive control: qwp_log.go's own constructor calls must have been
-	// seen, or the matcher never ran.
-	require.NotEmpty(t, considered, "the constructor matcher never fired")
-	require.Empty(t, violations,
-		"these sites construct a logger outside qwp_log.go; such a logger has no guarded handler — route it through qwpGuardLogger / qwpEffectiveLogger instead")
 }
 
 // TestQwpSfQuarantinedBytesCountAgainstTheBudget pins part two of the

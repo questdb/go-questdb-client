@@ -593,25 +593,32 @@ func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 	}
 }
 
-// WithLogger sets the *slog.Logger the client emits diagnostics through,
-// replacing the slog.Default() fallback. Genuine problems (panics in user
-// callbacks, leaked pool leases, protocol anomalies) and, when no handler or
+// WithLogger sets the *slog.Logger used for QWP diagnostics, replacing the
+// slog.Default() fallback. Nil clears an earlier logger option and restores
+// the same fallback as omitting the option. Components may capture the default
+// during construction; later slog.SetDefault calls need not affect them.
+//
+// Genuine problems (panics in user callbacks, leaked pool leases, protocol
+// anomalies) and, when no handler or
 // listener is registered, server rejections and connection transitions log at
 // Warn/Error; high-frequency chatter (replayed rejections, transient failover
 // windows) logs at Debug and is hidden unless the handler's level is lowered.
 // Pass a logger backed by slog.DiscardHandler to silence the client entirely,
 // or one wired to the application's logging stack to route it there.
-// A logging handler may run directly on a client goroutine. Return promptly;
-// do not change or close a client, or call QuestDB.Close from the handler.
-// Catching handler panics does not move logging to another goroutine or stop
-// a handler that is blocked. Unlike notification callbacks, logging does not
-// always use a separate delivery goroutine.
+//
+// During QWP diagnostic emission, the client recovers synchronous panics from
+// the logging-handler methods, including those of the default logger. The
+// handler runs on the goroutine emitting the diagnostic; unlike notification
+// callbacks, logging does not always use a separate delivery goroutine.
+// Handlers must return promptly and must not change or close a client, or call
+// QuestDB.Close. Panic recovery does not stop a blocked handler or isolate
+// arbitrary application code, including argument evaluation before logging.
 func WithLogger(l *slog.Logger) LineSenderOption {
 	return func(s *lineSenderConfig) {
-		// Guarded at the door: every logger the client stores is wrapped in
-		// the panic-guarded handler (see qwp_log.go), so a panicking handler
-		// can never take down the goroutine behind a log call.
-		s.logger = qwpGuardLogger(l)
+		s.logger = l
+		if l != nil {
+			s.logger = qwpGuardLogger(l)
+		}
 	}
 }
 

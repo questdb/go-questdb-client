@@ -25,7 +25,10 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -206,27 +209,117 @@ func TestQwpLogSourceAttributionSurvivesTheGuard(t *testing.T) {
 		"nor may a wrapper helper")
 }
 
-// TestQwpGuardedHandlerRecoversEveryMethod pins the guard itself: all four
-// slog.Handler methods on a guarded logger absorb a panicking user handler.
-// Enabled answers false, Handle drops the record, WithAttrs and WithGroup
-// hand back the receiver unchanged — so no derived logger escapes the guard.
+// Each method panics independently: an Enabled panic would otherwise prevent
+// a log call from ever reaching Handle. Check the fallback, not just survival.
 func TestQwpGuardedHandlerRecoversEveryMethod(t *testing.T) {
-	l := qwpGuardLogger(slog.New(panicEverythingHandler{}))
-	require.NotPanics(t, func() { l.Info("hello", "k", "v") })
-	require.NotPanics(t, func() {
-		derived := l.With("a", 1).WithGroup("g")
-		derived.Error("still guarded")
-	})
-	// Idempotent wrap: guarding a guarded logger must not stack handlers.
+	for _, method := range []string{"Enabled", "Handle", "WithAttrs", "WithGroup"} {
+		t.Run(method, func(t *testing.T) {
+			capture := &recordCapturingHandler{}
+			panics := 0
+			h := &methodPanicLogHandler{Handler: capture, method: method, panics: &panics}
+			l := qwpGuardLogger(slog.New(h))
+			switch method {
+			case "Enabled":
+				require.False(t, l.Enabled(context.Background(), slog.LevelInfo))
+				l.Info("filtered after Enabled panic")
+				require.Empty(t, capture.messages())
+				require.Equal(t, 2, panics)
+			case "Handle":
+				l.Info("attempted")
+				require.NoError(t, l.Handler().Handle(context.Background(), slog.Record{}),
+					"a recovered Handle panic returns nil")
+				require.Empty(t, capture.messages())
+				require.Equal(t, 2, panics)
+			case "WithAttrs":
+				derived := l.With("a", 1)
+				require.Equal(t, l.Handler(), derived.Handler(), "retain the existing handler")
+				derived.Info("still usable")
+				require.Equal(t, []string{"still usable"}, capture.messages())
+				require.Equal(t, 1, panics)
+			case "WithGroup":
+				derived := l.WithGroup("g")
+				require.Equal(t, l.Handler(), derived.Handler(), "retain the existing handler")
+				derived.Info("still usable")
+				require.Equal(t, []string{"still usable"}, capture.messages())
+				require.Equal(t, 1, panics)
+			}
+		})
+	}
+}
+
+func TestQwpGuardedHandlerDerivation(t *testing.T) {
+	var out bytes.Buffer
+	l := qwpGuardLogger(slog.New(slog.NewJSONHandler(&out, nil)))
+	l.Debug("disabled")
+	require.Empty(t, out.String(), "preserve normal level filtering")
+	derived := l.With("outside", 1).WithGroup("g").With("inside", 2)
+	derived.Info("message", "record", 3)
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(out.Bytes(), &record))
+	require.Equal(t, float64(1), record["outside"])
+	require.Equal(t, map[string]any{"inside": float64(2), "record": float64(3)}, record["g"])
+
+	// Successful derivation must also guard the handler returned by the user.
+	panics := 0
+	h := &methodPanicLogHandler{Handler: &recordCapturingHandler{}, method: "Handle", panics: &panics}
+	guarded := qwpGuardLogger(slog.New(h))
+	guarded.With("a", 1).Info("attributes")
+	guarded.WithGroup("g").Info("group")
+	require.Equal(t, 2, panics)
+}
+
+func TestQwpGuardedHandlerPreservesHandleError(t *testing.T) {
+	want := errors.New("handler error")
+	h := &methodPanicLogHandler{Handler: &recordCapturingHandler{}, handleErr: want}
+	guarded := qwpGuardLogger(slog.New(h))
+	require.ErrorIs(t, guarded.Handler().Handle(context.Background(), slog.Record{}), want)
+}
+
+func TestQwpGuardLoggerIsIdempotent(t *testing.T) {
+	l := qwpGuardLogger(slog.New(&recordCapturingHandler{}))
 	require.Same(t, l, qwpGuardLogger(l))
+	require.Same(t, l, qwpEffectiveLogger(l))
 }
 
-// panicEverythingHandler panics in every slog.Handler method.
-type panicEverythingHandler struct{}
-
-func (panicEverythingHandler) Enabled(context.Context, slog.Level) bool { panic("enabled") }
-func (panicEverythingHandler) Handle(context.Context, slog.Record) error {
-	panic("handle")
+// methodPanicLogHandler is used synchronously by the wrapper unit tests.
+// All methods other than the selected one forward to the supplied handler.
+type methodPanicLogHandler struct {
+	slog.Handler
+	method    string
+	panics    *int
+	handleErr error
 }
-func (panicEverythingHandler) WithAttrs([]slog.Attr) slog.Handler { panic("attrs") }
-func (panicEverythingHandler) WithGroup(string) slog.Handler      { panic("group") }
+
+func (h *methodPanicLogHandler) panicIn(method string) {
+	if h.method == method {
+		(*h.panics)++
+		panic(method)
+	}
+}
+
+func (h *methodPanicLogHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	h.panicIn("Enabled")
+	return h.Handler.Enabled(ctx, level)
+}
+
+func (h *methodPanicLogHandler) Handle(ctx context.Context, rec slog.Record) error {
+	h.panicIn("Handle")
+	if h.handleErr != nil {
+		return h.handleErr
+	}
+	return h.Handler.Handle(ctx, rec)
+}
+
+func (h *methodPanicLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	h.panicIn("WithAttrs")
+	derived := *h
+	derived.Handler = h.Handler.WithAttrs(attrs)
+	return &derived
+}
+
+func (h *methodPanicLogHandler) WithGroup(name string) slog.Handler {
+	h.panicIn("WithGroup")
+	derived := *h
+	derived.Handler = h.Handler.WithGroup(name)
+	return &derived
+}

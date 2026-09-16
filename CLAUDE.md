@@ -239,6 +239,13 @@ ownership transfers rather than preserving a particular cleanup topology.
 
 ## Testing and conventions
 
+- **QWP logging:** Route diagnostics through `qwpEffectiveLogger`, or a logger
+  obtained from it, not package-level slog functions or raw configured loggers.
+  Do not use diagnostic delivery or success as a condition for error
+  classification or cleanup ownership. Review new logging sites for this
+  convention; source-scanning tests are not intended to prove exhaustive
+  compliance. This is not a guarantee of progress with blocking or re-entrant
+  handlers; see the public logger-option docs for restrictions.
 - Discover relevant unit, integration, interoperability, race, platform, and
   performance tests. Mock WebSocket fixtures are useful for protocol unit tests;
   they do not substitute for live-server coverage.

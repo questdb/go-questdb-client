@@ -29,30 +29,20 @@ import (
 	"log/slog"
 )
 
-// The client's diagnostics go through an injectable *slog.Logger rather than
-// the global log package, so an embedding application controls the sink,
-// format, and verbosity of everything the QWP transport emits. Register one
-// with WithLogger (standalone sender) or WithQuestDBLogger (facade). When
-// none is registered the client falls back to slog.Default(), so a
-// misconfigured or rejecting server is never silent — the native-client
-// "loud defaults" contract — while low-value chatter (replayed rejections,
-// transient failover windows, watermark clamps) is emitted at slog.LevelDebug
-// and stays hidden until the operator lowers the level. Inject a Discard
-// handler to silence everything, or a custom handler to route it into the
-// application's logging stack.
+// QWP diagnostics use the logger configured by WithLogger, WithQuestDBLogger,
+// or WithQwpQueryClientLogger, falling back to slog.Default(). The application
+// controls the sink, format, and enabled levels. Resolving a nil logger here
+// captures the current default; a component retaining that result does not
+// track later calls to slog.SetDefault.
 
-// qwpGuardedHandler wraps the application's slog.Handler with a panic
-// boundary on all four methods. The handler is user code and free to panic,
-// and the step behind a log call is regularly the one that matters — latching
-// a fatal error, reporting on a channel, releasing a transport, writing a
-// quarantine sentinel. Guarding once at the handler makes every log call in
-// the package safe wherever and however the logger is spelled; guarding
-// call sites individually can never be complete, because the set of
-// expressions that can hold a logger is unbounded.
+// qwpGuardedHandler recovers synchronous panics from each wrapped
+// slog.Handler method. Calls through a resolved logger use this boundary;
+// argument evaluation before the call is outside it. The wrapper does not
+// stop blocking, make re-entry safe, contain panics on another goroutine, or
+// prevent process termination by application code.
 //
-// A handler-level wrapper also preserves source attribution: slog captures
-// the caller's location before the handler runs, so an AddSource handler
-// reports the real emitting line, not a wrapper's.
+// Guarding the handler preserves source attribution: slog captures the
+// emitting caller's location before invoking the handler.
 type qwpGuardedHandler struct{ inner slog.Handler }
 
 // Enabled reports false when the wrapped handler panics: a handler that
@@ -66,14 +56,15 @@ func (h qwpGuardedHandler) Enabled(ctx context.Context, level slog.Level) (enabl
 	return h.inner.Enabled(ctx, level)
 }
 
-// Handle drops the record when the wrapped handler panics.
+// Handle suppresses a panic and returns nil. It cannot undo any output the
+// wrapped handler already produced before panicking.
 func (h qwpGuardedHandler) Handle(ctx context.Context, rec slog.Record) (err error) {
 	defer func() { _ = recover() }()
 	return h.inner.Handle(ctx, rec)
 }
 
-// WithAttrs returns the receiver unchanged when the wrapped handler panics,
-// so a derived logger can never escape the guard.
+// WithAttrs guards the derived handler. If derivation panics, it retains
+// the existing guarded handler without the requested attributes.
 func (h qwpGuardedHandler) WithAttrs(attrs []slog.Attr) (out slog.Handler) {
 	out = h
 	defer func() { _ = recover() }()
@@ -81,7 +72,8 @@ func (h qwpGuardedHandler) WithAttrs(attrs []slog.Attr) (out slog.Handler) {
 	return qwpGuardedHandler{inner: inner}
 }
 
-// WithGroup returns the receiver unchanged when the wrapped handler panics.
+// WithGroup guards the derived handler. If derivation panics, it retains
+// the existing guarded handler without the requested group.
 func (h qwpGuardedHandler) WithGroup(name string) (out slog.Handler) {
 	out = h
 	defer func() { _ = recover() }()
@@ -90,11 +82,9 @@ func (h qwpGuardedHandler) WithGroup(name string) (out slog.Handler) {
 }
 
 // qwpGuardLogger returns a logger whose handler is panic-guarded. nil
-// resolves to slog.Default(). Idempotent: an already-guarded logger comes
-// back as-is, so wrapping at every entry point cannot stack guards. Every
-// logger the client stores or resolves goes through here — the option
-// setters (WithLogger, WithQuestDBLogger, WithQwpQueryClientLogger) and
-// qwpEffectiveLogger.
+// resolves to slog.Default(). An already-guarded logger comes back as-is.
+// Option setters use it for non-nil loggers; nil remains unset until a
+// downstream call to qwpEffectiveLogger.
 func qwpGuardLogger(l *slog.Logger) *slog.Logger {
 	if l == nil {
 		l = slog.Default()
@@ -106,11 +96,9 @@ func qwpGuardLogger(l *slog.Logger) *slog.Logger {
 }
 
 // qwpEffectiveLogger resolves the configured logger, substituting
-// slog.Default() when the caller registered none, and returns it with the
-// panic-guarded handler installed. The result is always non-nil and always
-// guarded, so every call site can log directly and unconditionally — even
-// when the logger reached its struct field without passing through an option
-// setter.
+// slog.Default() when the caller registered none. It returns a non-nil
+// logger with a guarded handler, including when l did not pass through an
+// option setter. Configured, already-guarded loggers are reused.
 func qwpEffectiveLogger(l *slog.Logger) *slog.Logger {
 	return qwpGuardLogger(l)
 }

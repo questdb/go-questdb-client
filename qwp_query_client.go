@@ -356,11 +356,16 @@ func WithQwpQueryClientID(id string) QwpQueryClientOption {
 }
 
 // WithQwpQueryClientLogger sets the *slog.Logger the query client emits
-// diagnostics through, replacing the slog.Default() fallback. See WithLogger.
+// diagnostics through, replacing the slog.Default() fallback. Nil clears an
+// earlier logger option and restores the same fallback as omitting the option.
+// See [WithLogger] for handler panic protection and restrictions.
 func WithQwpQueryClientLogger(l *slog.Logger) QwpQueryClientOption {
-	// Guarded at the door, like WithLogger: only panic-guarded loggers are
-	// stored (see qwp_log.go).
-	return func(c *qwpQueryClientConfig) { c.logger = qwpGuardLogger(l) }
+	return func(c *qwpQueryClientConfig) {
+		c.logger = l
+		if l != nil {
+			c.logger = qwpGuardLogger(l)
+		}
+	}
 }
 
 // WithQwpQueryBufferPoolSize overrides the decode buffer pool depth.

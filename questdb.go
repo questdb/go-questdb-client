@@ -204,11 +204,17 @@ func WithQuestDBBackgroundDrainerListener(l QwpBackgroundDrainerListener) QuestD
 }
 
 // WithQuestDBLogger sets the *slog.Logger applied to both pools and every
-// pooled sender and query session. See WithLogger.
+// pooled sender and query session. Nil clears an earlier logger option and,
+// like omitting the option, uses slog.Default() at facade construction.
+// Later slog.SetDefault calls do not change that choice. See [WithLogger]
+// for handler panic protection and restrictions.
 func WithQuestDBLogger(l *slog.Logger) QuestDBOption {
-	// Guarded at the door, like WithLogger: only panic-guarded loggers are
-	// stored (see qwp_log.go).
-	return func(c *questDBConfig) { c.logger = qwpGuardLogger(l) }
+	return func(c *questDBConfig) {
+		c.logger = l
+		if l != nil {
+			c.logger = qwpGuardLogger(l)
+		}
+	}
 }
 
 // serializeErrorHandler wraps h so concurrent invocations from the pool's

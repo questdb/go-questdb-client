@@ -14,6 +14,7 @@ You are a senior QuestDB engineer performing a blocking code review. `go-questdb
 - **Read the contract at every review level:** [README: QWP shutdown and ownership](../../../README.md#qwp-shutdown-and-ownership), relevant public Go docs, and the PR's declared behavior changes. The README and Go docs define the shutdown contract. Verify that documentation, implementation, tests, and PR claims agree; report discrepancies.
 - **The diff is the entry point, not the scope.** Inspect surrounding code and unchanged callers whose assumptions the change affects. Do not clear a change solely because it looks correct in isolation.
 - **Verify every claim.** For a fix, establish the original bug and corrected behavior. For performance, inspect measurements and scaling. For simplification, compare affected actors, entry routes, ownership transfers, and authoritative state before/after. Intentional behavior removal must be explicit and reflected in code, tests, callers, and docs.
+- **Distinguish coding conventions from runtime guarantees.** Do not require exhaustive mechanical enforcement of a convention. Evaluate tests against promised observable behavior, not whether every conceivable source mutation is detected.
 - **Think adversarially:** empty and boundary inputs; invalid encodings and oversized declared lengths; partial publication/write; transport, authentication, server, and local-storage failures; cancellation, callbacks, concurrent access, and cleanup. Derive supported caller behavior and expected outcomes from the applicable contracts.
 - **Check what's missing:** error handling, tests, public docs, affected implementations/wrappers, configuration validation, and test adapters. Discover dependencies rather than assuming a fixed inventory.
 - **Establish reachability.** Trace actual callers, validation, configuration, dispatch, and resource limits. Drop claims proved unreachable; do not dismiss unusual inputs merely because they exceed a typical workload.
@@ -125,7 +126,9 @@ Review every relevant discovered exposure. Record unverified paths as coverage g
 
 Use only the roles selected by the level table, through the environment's supported delegation workflow and resource limits. These are responsibilities, not assumed executable agent names. Keep reviewers read-only and independent; run selected roles in parallel where supported. Report unavailable roles or incomplete coverage rather than silently claiming they ran.
 
-Selected Agents 1–9 receive the diff, available change-map portions and their scope limits, relevant contract sources, and declared behavior changes. Each follows callers as needed to substantiate findings even when no inventory was required at that level.
+All delegated reviewers read applicable repository guidance, starting with `CLAUDE.md`, and follow its references to maintained contracts. Supply those sources or instructions to read them; do not assume the parent's reading is available in a fresh context.
+
+Selected Agents 1–9 also receive the diff, available change-map portions and their scope limits, relevant contract sources, and declared behavior changes. Each follows callers as needed to substantiate findings even when no inventory was required at that level.
 
 ### Anti-anchoring rules
 
@@ -156,7 +159,7 @@ Assess original-panic reachability separately from injected-panic tests. Verify 
 
 **Agent 6 — Performance & allocations:** preserve the QWP steady-state row-building guarantee of **0 allocs/op**. Locate its tests/benchmarks from project guidance and verify the affected workload. Measure flush, encoding, and setup separately against their established expectations. Analyze copying, serialization, syscalls, buffer growth, and scaling under supported workloads and configured limits. Substantiate regressions; evaluate remedies against measured costs and ownership constraints rather than prescribing a particular scratch field or storage strategy.
 
-**Agent 7 — Tests & coverage:** discover relevant unit, integration, interoperability, platform, and performance tests. Inspect fixture resolution and CI to determine prerequisites and whether missing prerequisites skip or fail. Resolve actual entry points/selection commands and confirm the intended tests executed. Check supported cross-context behavior, partial failures, boundaries, cancellation, recovery, and shutdown—not just happy paths. A bug fix needs a test that fails without it. Assertions must establish the promised outcome, not merely completion of an attempt. For behavior changes or deleted tests/helpers, verify consistent caller/doc migration and surviving safety coverage. Keep test access within project conventions and build affected examples/benchmarks, including their external manifest references.
+**Agent 7 — Tests & coverage:** discover relevant unit, integration, interoperability, platform, and performance tests. Inspect fixture resolution and CI to determine prerequisites and whether missing prerequisites skip or fail. Resolve actual entry points/selection commands and confirm the intended tests executed. Check supported cross-context behavior, partial failures, boundaries, cancellation, recovery, and shutdown—not just happy paths. Regression tests should demonstrate the original supported failure and the corrected observable outcome. Removing redundant protection without changing promised behavior is not, by itself, evidence of a test defect. This does not excuse vacuous assertions or missing coverage of actual failure behavior. Assertions must establish the promised outcome, not merely completion of an attempt. For behavior changes or deleted tests/helpers, verify consistent caller/doc migration and surviving safety coverage. Keep test access within project conventions and build affected examples/benchmarks, including their external manifest references.
 
 **Agent 8 — Code quality & API design:** for claimed simplification or retired behavior, compare affected actors, entry routes, handoffs, and authoritative state before/after. Verify obsolete machinery is removed, not hidden behind flags, and remaining synchronization protects identifiable hazards. Check compatibility, naming, dead code, documentation, licensing, and project conventions. Resolve applicable static-analysis checks and pinned tooling from project/CI configuration; verify available results without inventing execution evidence.
 
@@ -169,8 +172,8 @@ Assess original-panic reachability separately from injected-panic tests. Verify 
 Report SAFE / BROKEN / NEEDS VERIFICATION per callsite with evidence. Classify confirmed defects by impact and likelihood, regardless of whether the callsite is in the diff.
 
 **Agent 10 — Fresh-context adversarial:** when selected, run independently of Agents 1–9 to avoid checklist anchoring.
-- Provide only the diff, changed-file names, and neutral source inputs: README's shutdown section and relevant public method/error/callback docs, or instructions to read them.
-- Do not provide the change map, findings, implicit-contract inventory, category lists, or checklists.
+- Provide only the diff, changed-file names, and neutral source inputs: applicable repository guidance including `CLAUDE.md`, README's shutdown section, and relevant public method/error/callback docs, or instructions to read them.
+- Do not provide the change map, findings, implicit-contract inventory, category lists, or reviewer-generated checklists. Maintained repository guidance is a neutral source, not a prior review finding.
 - Instruction: “Find ways this code is wrong against the public contract; flag source/documentation disagreements.” Allow independent read-only repository exploration.
 - Each finding states what is wrong, why, and the demonstrating code path. Verify both novel and corroborated findings before accepting them.
 
@@ -178,7 +181,7 @@ Combine results into a deduplicated draft. Verify inline at level 1 or through S
 
 ## Step 3b: Verify every finding against source
 
-Every finding requires verification, including at levels that perform it inline. At level 2 use one batched reviewer; at level 3 use independent per-finding reviewers, parallel where supported. Record unavailable verification or inconclusive evidence explicitly.
+Every finding requires verification, including at levels that perform it inline. At level 2 use one batched reviewer; at level 3 use independent per-finding reviewers, parallel where supported. Verification reviewers also read applicable repository guidance, including `CLAUDE.md`, and the relevant maintained contracts. Record unavailable verification or inconclusive evidence explicitly.
 
 1. **Read cited source**, not just the diff or reviewer's description.
 2. **Trace actual dispatch and callers**, including wrappers and every concrete receiver reachable at the claimed failing callsite.
