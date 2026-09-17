@@ -156,6 +156,15 @@ deletion decisions require evidence from the slot and its committed boundaries.
 Legacy slots without committed boundaries cannot assume corrupt files were already
 delivered. Start with `qwp_sf_recovery.go`, `qwp_sf_manifest.go`, and their tests.
 
+An ACK record only means something relative to the frames it covers. Every
+disk-backed construction prepares `.ack-watermark` from the recovered history
+before anything can publish a frame number, and ignoring an impossible record for
+one run is not sufficient once those numbers are reused. Startup correctness must
+not depend on close-time deletion. Resolve the preserve/reset decision, the
+unconditional startup barriers, and the narrow unmapped-fallback authorization
+from `qwp_sf_ack_watermark.go`, its engine integration, and their tests—not from
+the presence or absence of a side file.
+
 Active-tail recovery retains the valid frame prefix and zeroes the unreadable
 suffix in place after chain validation, even when the prefix is empty. This is
 a deliberate discard policy: later intact frames can be unreachable and are

@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,6 +91,10 @@ func qwpSfAckWatermarkOpen(slotDir string) *qwpSfAckWatermark {
 	return w
 }
 
+// qwpSfAckWatermarkOpenRequired exercises the file layer with the
+// preserve-anything startup policy: no recovered history is supplied, so every
+// record the existing format accepts is kept. Startup-decision coverage lives
+// in qwp_sf_ack_watermark_startup_test.go, which passes real histories.
 func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
-	return qwpSfAckWatermarkOpenRequiredWithLogger(slotDir, nil)
+	return qwpSfAckWatermarkOpenPrepared(slotDir, qwpSfAckWatermarkStartup{publishedFsn: math.MaxInt64}, nil)
 }

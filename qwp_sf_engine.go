@@ -442,6 +442,50 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 			return nil, err
 		}
 		recoveredFromDisk = ring != nil
+		// Prepare the ack watermark before anything in this slot can publish a
+		// frame number, and before the fresh-slot branch below creates its
+		// initial segment and manifest. Recovery has just established which
+		// frames exist, which is the only evidence that can decide whether a
+		// record on disk is about this history at all:
+		//
+		//   - no ring: numbering restarts at 0 and the record describes a
+		//     lifecycle whose frames are gone.
+		//   - a record above the recovered tip: no correctly operating session
+		//     for this history produced it.
+		//
+		// Both cases retire the record durably. Merely ignoring it for this run
+		// is what let it become plausible again once new frames reached its
+		// number, on a slot that had already rejected it once.
+		startup := qwpSfAckWatermarkStartup{freshHistory: ring == nil}
+		if ring != nil {
+			// An empty recovered ring is not a fresh history: it can carry a
+			// nonzero sequence base, and its tip is that base minus one.
+			startup.publishedFsn = ring.segmentRingPublishedFsn()
+		}
+		watermark, err = qwpSfAckWatermarkOpenPrepared(sfDir, startup, options.logger)
+		if qwpSfAckWatermarkStorageFallbackAllowed(err) {
+			// A full disk is the ordinary way to get here, and draining this
+			// slot is what gives the disk its space back, so the engine opens
+			// without the watermark rather than refusing the slot. The seed then
+			// comes from the surviving segments alone, which can re-send frames
+			// a previous session already got acked.
+			//
+			// This is reachable only after preparation and its barriers
+			// succeeded and the acquired resources were released: the file on
+			// disk is already safe, so a nil watermark cannot resurrect an old
+			// ACK record for the numbers this session is about to publish.
+			if startup.freshHistory {
+				qwpEffectiveLogger(options.logger).Warn("qwp/sf: opening a fresh slot without its ack watermark; a later recovery falls back to the surviving segments",
+					"dir", sfDir, "error", err)
+			} else {
+				qwpEffectiveLogger(options.logger).Warn("qwp/sf: opening a recovered slot without its ack watermark; already-acked frames may replay",
+					"dir", sfDir, "error", err)
+			}
+			watermark, err = nil, nil
+		}
+		if err != nil {
+			return nil, qwpSfDurabilityError("could not open required ack watermark", sfDir, err)
+		}
 		if ring != nil {
 			// Seed ackedFsn to one below the lowest segment's baseSeq.
 			// We don't know what was actually acked before the prior
@@ -478,21 +522,12 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 			//     lowestBase is higher, watermark is stale; max picks
 			//     lowestBase-1.
 			//
-			watermark, err = qwpSfAckWatermarkOpenRequiredWithLogger(sfDir, options.logger)
-			if errors.Is(err, qwpSfErrAckWatermarkUnbacked) {
-				// A full disk is the ordinary way to get here, and draining
-				// this slot is what gives the disk its space back, so the
-				// engine opens without the watermark rather than refusing the
-				// slot. The seed then comes from the surviving segments alone,
-				// which can re-send frames a previous session already got
-				// acked.
-				qwpEffectiveLogger(options.logger).Warn("qwp/sf: opening a recovered slot without its ack watermark; already-acked frames may replay",
-					"dir", sfDir, "error", err)
-				watermark, err = nil, nil
-			}
-			if err != nil {
-				return nil, qwpSfDurabilityError("could not open required ack watermark", sfDir, err)
-			}
+			// The file was prepared above, so a record that survived
+			// preparation is at most the recovered tip, and a retired one reads
+			// INVALID. Seeding stays segment-derived either way: discarding
+			// watermark evidence must not erase what the surviving segment
+			// boundaries establish about already-trimmed lower segments.
+
 			// Load the persisted symbol dictionary so this recovered slot's
 			// delta frames can be re-registered on a fresh server before they
 			// replay. A recovered slot's dictionary is NEVER recreated: its
@@ -536,6 +571,11 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 			// position the cursor past every un-acked frame — silent
 			// loss of the un-acked tail. Fall back to the
 			// segment-derived seed so that tail still replays.
+			//
+			// Preparation already retired such a record on disk, so this clamp
+			// is defence in depth for a value that appears between inspection
+			// and here. It is not the mechanism that keeps the record from
+			// being believed on a later restart.
 			seed := candidate
 			if seed > ring.segmentRingPublishedFsn() {
 				seed = baseSeed
@@ -585,23 +625,14 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 		if memoryMode {
 			initial, err = qwpSfCreateInMemorySegment(0, segmentSizeBytes)
 		} else {
-			// Fresh disk slot: any stale watermark refers to a
-			// fully-drained lifecycle now gone. Unlink it before
-			// opening so the new session's first read() correctly
-			// reports INVALID (magic=0 on a freshly zero-filled
-			// file) rather than honouring an FSN with no segments
-			// behind it.
-			qwpSfAckWatermarkRemoveOrphan(sfDir)
+			// Fresh disk slot: any stale watermark refers to a fully-drained
+			// lifecycle now gone, and this session restarts frame numbering at
+			// 0. The watermark was already retired and made durable by the
+			// preparation above, before this branch creates the initial segment
+			// and manifest. Startup no longer depends on a best-effort unlink
+			// whose failure used to be ignored, leaving the next read() honouring
+			// an FSN with no segments behind it.
 			if err := qwpSfManifestRemove(sfDir); err != nil {
-				return nil, err
-			}
-			watermark, err = qwpSfAckWatermarkOpenRequiredWithLogger(sfDir, options.logger)
-			if errors.Is(err, qwpSfErrAckWatermarkUnbacked) {
-				qwpEffectiveLogger(options.logger).Warn("qwp/sf: opening a fresh slot without its ack watermark; a later recovery falls back to the surviving segments",
-					"dir", sfDir, "error", err)
-				watermark, err = nil, nil
-			}
-			if err != nil {
 				return nil, err
 			}
 			// A fresh slot must never inherit a prior generation's id mapping.

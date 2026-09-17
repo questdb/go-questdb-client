@@ -280,6 +280,13 @@ func (e *qwpSfCursorEngine) engineCleanupAttempt(drained bool, barriersDone, seg
 			}
 			*manifestGone = true
 		}
+		// Best-effort tidying of the side files, deliberately unchecked and
+		// deliberately without a directory barrier of its own. Startup does not
+		// depend on either removal: qwpSfAckWatermarkOpenPrepared retires a stale
+		// ACK record durably on the next construction, and a residual file is a
+		// documented outcome of close. Making a successful deletion the
+		// correctness mechanism would move the safety decision onto the one path
+		// that cannot report a failure.
 		qwpSfAckWatermarkRemoveOrphan(e.sfDir)
 		qwpSfSymbolDictRemoveOrphan(e.sfDir)
 	}

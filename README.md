@@ -660,6 +660,47 @@ Residual `.ack-watermark` and `.symbol-dict` files after a fully drained close
 do not prevent a later restart. See [QWP shutdown and ownership](#qwp-shutdown-and-ownership)
 for cleanup behavior, why a slot may stay locked, and how to check for release.
 
+**Acknowledgement evidence at startup.** Residual side files are permitted, so
+startup, not close, is what makes an old `.ack-watermark` record safe. Every
+disk-backed construction inspects that file under the slot lock and decides from
+the frames recovery actually found:
+
+- No recovered frames at all: the record describes a previous lifecycle whose
+  frames are gone, and this session restarts frame numbering at 0.
+- A record above the recovered frame range: no correctly operating session for
+  this history produced it. Recovery can also produce this legitimately, by
+  discarding an unreadable active tail.
+
+In both cases the record is retired durably, by truncating the file to zero
+bytes — both record slots together — rather than ignored for one run. Ignoring
+it is not sufficient, because the same numbers get republished, after which the
+old record looks plausible again to the next restart. Every construction then
+syncs the prepared file and performs the slot-directory barrier before
+allocating or mapping it, even when the file already looks empty, invalid, or
+acceptable: bytes visible in the page cache are no evidence that an earlier
+attempt's barrier completed. That unconditional checkpoint is the retry
+mechanism; no marker file or format change is involved, and a zero-length file
+is only an intermediate startup state.
+
+If inspecting, resetting, or either barrier fails, construction fails with a
+retriable storage error and keeps its cleanup obligations; only a later
+allocation or write-back failure may continue without a mapped watermark, and a
+nil in-memory watermark is never evidence that the file on disk is safe. Such a
+failure does not authorize dropping unacknowledged frames or quarantining the
+slot, and it does not promise that a failing or full disk can be started on or
+drained. Discarding ACK evidence keeps the segment-derived replay position —
+immediately before the lowest surviving segment, not FSN 0 — and can replay
+surviving rows that were already acknowledged: SF does not provide exactly-once
+delivery. The deliberate valid-prefix/zeroed-suffix policy for a damaged active
+tail is unchanged, and discarded frames are not reconstructed.
+
+A stale record whose value still falls inside the surviving frame range cannot
+be distinguished from a legitimate acknowledgement — the shared format carries
+no slot-lifecycle identifier — so the client neither detects nor repairs such
+pre-existing slots. These startup barriers use the same platform guarantees as
+the rest of SF: process-restart recovery on every platform, no host-crash
+namespace ordering on Windows, and Darwin `fsync` is not `F_FULLFSYNC`.
+
 #### Local errors from the SF path
 
 The following sentinels identify non-terminal backpressure and local-storage

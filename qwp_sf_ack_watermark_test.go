@@ -266,6 +266,11 @@ func TestQwpSfAckWatermarkNewBlockReservationFailureStopsOpen(t *testing.T) {
 // way in: a correctly sized file whose records are both unreadable is
 // truncated and rebuilt, which leaves it as freshly allocated as the create
 // path and needing the same write.
+//
+// The reset is decided and made durable before any block reservation, so there
+// is exactly one write-back -- of zeros. A second write-back would mean the
+// old image had been reserved first, which is the ordering the startup
+// checkpoint exists to forbid.
 func TestQwpSfAckWatermarkResetBlockReservationFailureStopsOpen(t *testing.T) {
 	dir := t.TempDir()
 	buf := make([]byte, qwpSfAckWatermarkFileSize)
@@ -273,14 +278,9 @@ func TestQwpSfAckWatermarkResetBlockReservationFailureStopsOpen(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfAckWatermarkFileName), buf, 0o644))
 
 	originalWriteAt := qwpSfAckWatermarkWriteAt.load()
-	writeCalls := 0
+	var writeBacks [][]byte
 	qwpSfAckWatermarkWriteAt.store(func(f *os.File, p []byte, off int64) (int, error) {
-		writeCalls++
-		if writeCalls == 1 {
-			// The pre-mmap write for the file as found must still succeed, or
-			// the reset below is never reached.
-			return originalWriteAt(f, p, off)
-		}
+		writeBacks = append(writeBacks, append([]byte(nil), p...))
 		return 0, syscall.ENOSPC
 	})
 	t.Cleanup(func() { qwpSfAckWatermarkWriteAt.store(originalWriteAt) })
@@ -291,7 +291,9 @@ func TestQwpSfAckWatermarkResetBlockReservationFailureStopsOpen(t *testing.T) {
 	}
 	require.ErrorIs(t, err, syscall.ENOSPC)
 	require.Nil(t, w)
-	require.Equal(t, 2, writeCalls)
+	require.Len(t, writeBacks, 1, "the reset precedes reservation, so the image as found is never written back")
+	require.Equal(t, make([]byte, qwpSfAckWatermarkFileSize), writeBacks[0],
+		"initialization must write zeros, never the discarded image")
 }
 
 func TestQwpSfAckWatermarkBadMagicIsInvalid(t *testing.T) {
@@ -494,6 +496,12 @@ func TestQwpSfEngineRecoveryHonoursForeignWatermark(t *testing.T) {
 // sf-client.md §5.4 / §18.1 bound: a watermark above publishedFsn is
 // corruption and MUST be ignored, falling back to the segment-derived
 // seed so the un-acked tail still replays (no silent data loss).
+//
+// Rejecting it for one run is not enough. The record has to be retired
+// durably, or the same bytes become plausible again as soon as new frames
+// reach that number, and the next restart accepts them -- acknowledging frames
+// nothing ever acked. The tail of this test therefore republishes through the
+// rejected value and restarts twice.
 func TestQwpSfEngineRecoveryRejectsCorruptWatermark(t *testing.T) {
 	dir := t.TempDir()
 	const segSize int64 = 4096
@@ -512,10 +520,43 @@ func TestQwpSfEngineRecoveryRejectsCorruptWatermark(t *testing.T) {
 
 	e2, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
-	defer func() { _ = e2.engineClose() }()
 	assert.Equal(t, int64(3), e2.enginePublishedFsn())
 	assert.Equal(t, int64(-1), e2.engineAckedFsn(),
 		"a watermark past publishedFsn must be rejected; tail still replays")
+	requireBothAckRecordsRetired(t, dir)
+
+	// Append through the rejected value with no ACKs at all, then restart.
+	for i := 4; i < 10; i++ {
+		_, appendErr := e2.engineAppendBlocking(context.Background(), []byte{byte(i)})
+		require.NoError(t, appendErr)
+	}
+	require.Equal(t, int64(9), e2.enginePublishedFsn())
+	require.NoError(t, e2.engineClose())
+
+	e3, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, int64(9), e3.enginePublishedFsn())
+	assert.Equal(t, int64(-1), e3.engineAckedFsn(),
+		"the retired record must not acknowledge frames that merely reused its number")
+	require.Len(t, collectReplayFrames(t, e3), 10,
+		"every unacknowledged frame remains replayable")
+
+	// The old high value must not block future updates: a genuine, lower ACK
+	// still persists and is honoured by the next restart.
+	e3.engineAcknowledge(4)
+	require.Eventually(t, func() bool {
+		b := readAckWatermarkFileBytes(t, dir)
+		rec, ok := qwpSfSelectAckWatermarkRecord(b, int64(len(b)) == qwpSfAckWatermarkFileSize)
+		return ok && rec.first == 4
+	}, qwpTestWaitTimeout, 5*time.Millisecond)
+	require.NoError(t, e3.engineClose())
+
+	e4, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = e4.engineClose() }()
+	assert.Equal(t, int64(9), e4.enginePublishedFsn())
+	assert.Equal(t, int64(4), e4.engineAckedFsn(),
+		"a genuine ACK recorded after the reset must be recovered")
 }
 
 // TestQwpSfEngineWatermarkPersistedByManager proves the write half:
