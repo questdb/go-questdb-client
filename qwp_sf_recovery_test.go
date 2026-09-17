@@ -1478,3 +1478,135 @@ func TestQwpSfDiscardRefusesTornDeletionUnderAnUncommittedHead(t *testing.T) {
 			"a committed head proves the torn file delivered, so it is unlinked")
 	})
 }
+
+// snapshotSlotTree records the contents of every regular file under dir.
+// Paths are relative to dir so failures can name the missing or changed file.
+func snapshotSlotTree(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	require.NoError(t, filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+		if info.IsDir() || !info.Mode().IsRegular() {
+			return nil
+		}
+		raw, readErr := os.ReadFile(path)
+		require.NoError(t, readErr)
+		rel, relErr := filepath.Rel(dir, path)
+		require.NoError(t, relErr)
+		out[rel] = fmt.Sprintf("%x", sha256.Sum256(raw))
+		return nil
+	}))
+	return out
+}
+
+// TestQwpSfQuarantinePreservesTheWholeSlotDirectory checks that moving a
+// damaged slot aside preserves every file. These files may contain the only
+// copy of rows that were not sent, so none of them may be lost or changed.
+//
+// Older tests checked only that the new quarantine directory existed, or
+// checked only files that could still be opened. This test records every
+// regular file before recovery and compares it with the saved copy afterward.
+// A file may be renamed with a .corrupt suffix, but its contents must not change.
+func TestQwpSfQuarantinePreservesTheWholeSlotDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, slot string)
+	}{
+		{
+			// The file that should contain the newest rows cannot be read.
+			name: "committed-active-unreadable",
+			build: func(t *testing.T, slot string) {
+				s0 := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "a")
+				s1 := createRecoverySegment(t, slot, "sf-active.sfa", 1, "b")
+				createRecoveryManifest(t, slot, 0, 1, s0, s1)
+				closeRecoverySegments(t, s0, s1)
+				require.NoError(t, os.WriteFile(filepath.Join(slot, "sf-active.sfa"),
+					bytes.Repeat([]byte{0xab}, 4096), 0o644))
+			},
+		},
+		{
+			// Include the two bookkeeping files used by real slots. Give symbol
+			// number 0 one name in the saved list and another name in the stored
+			// row, so recovery must reject the slot. The extra text file checks
+			// that unrelated files are moved too.
+			name: "dictionary-rejection-with-side-files-and-a-stray",
+			build: func(t *testing.T, slot string) {
+				seg, err := qwpSfCreateSegment(filepath.Join(slot, "sf-initial.sfa"), 0, 4096)
+				require.NoError(t, err)
+				_, err = seg.tryAppend(buildTestDeltaFrame(0, []string{"ZZZZ"}))
+				require.NoError(t, err)
+				createRecoveryManifest(t, slot, 0, 0, seg)
+				closeRecoverySegments(t, seg)
+
+				dict, err := qwpSfSymbolDictOpenFresh(filepath.Join(slot, qwpSfSymbolDictFileName))
+				require.NoError(t, err)
+				require.NoError(t, dict.appendSymbols([]string{"AAPL"}))
+				require.NoError(t, dict.close())
+				watermark, err := qwpSfAckWatermarkOpenPrepared(slot,
+					qwpSfAckWatermarkStartup{publishedFsn: 0}, nil)
+				require.NoError(t, err)
+				require.NoError(t, watermark.close())
+
+				require.FileExists(t, filepath.Join(slot, qwpSfAckWatermarkFileName))
+				require.FileExists(t, filepath.Join(slot, qwpSfSymbolDictFileName))
+				require.NoError(t, os.WriteFile(filepath.Join(slot, "operator-notes.txt"),
+					[]byte("collected for support ticket 4711\n"), 0o644))
+			},
+		},
+		{
+			// Store rows after the last position recorded by the slot's index.
+			// Recovery cannot prove that those rows are safe to use or discard.
+			name: "frames-beyond-the-committed-boundary",
+			build: func(t *testing.T, slot string) {
+				s0 := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "a")
+				beyond := createRecoverySegment(t, slot, "sf-0009.sfa", 9, "later")
+				createRecoveryManifest(t, slot, 0, 0, s0, beyond)
+				closeRecoverySegments(t, s0, beyond)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			slot := filepath.Join(root, "sender-a")
+			require.NoError(t, os.MkdirAll(slot, 0o755))
+			tc.build(t, slot)
+
+			before := snapshotSlotTree(t, slot)
+			require.NotEmpty(t, before, "the fixture must contain something worth preserving")
+
+			engine, err := qwpSfNewCursorEngine(slot, 4096, qwpSfUnlimitedTotalBytes, 0)
+			require.NoError(t, err, "a refused slot must be set aside and ingestion continue")
+			require.NotNil(t, engine)
+			require.False(t, engine.engineWasRecoveredFromDisk())
+			quarantined := engine.engineQuarantinedSlotPath()
+			require.NoError(t, engine.engineClose())
+			require.NotEmpty(t, quarantined, "the sender must say where it put the bytes")
+
+			after := snapshotSlotTree(t, quarantined)
+			for name, hash := range before {
+				preservedAs, ok := after[name]
+				if !ok {
+					// Recovery may add a .corrupt suffix to a saved file.
+					for candidate, candidateHash := range after {
+						if strings.HasPrefix(candidate, name+".corrupt") {
+							preservedAs, ok = candidateHash, true
+							break
+						}
+					}
+				}
+				require.True(t, ok,
+					"%s never reached the quarantined copy at %s; got %v", name, quarantined, after)
+				require.Equal(t, hash, preservedAs,
+					"%s was rewritten on its way to the quarantined copy", name)
+			}
+
+			// A new slot now uses the original path. The operator's note must
+			// exist only in the saved copy, not in this new slot.
+			if _, hadOperatorNote := before["operator-notes.txt"]; hadOperatorNote {
+				_, statErr := os.Stat(filepath.Join(slot, "operator-notes.txt"))
+				require.True(t, os.IsNotExist(statErr),
+					"operator-notes.txt stayed in the live slot instead of moving to quarantine")
+			}
+		})
+	}
+}
