@@ -331,6 +331,117 @@ func TestQwpAnalyzeRecoveredDictAckedGapReset(t *testing.T) {
 	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
 }
 
+// qwpTestRecoveredRing saves the given frames and reopens them for a recovery
+// test.
+func qwpTestRecoveredRing(t *testing.T, frames [][]byte) *qwpSfSegmentRing {
+	t.Helper()
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	for _, frame := range frames {
+		_, err = engine.engineAppendBlocking(context.Background(), frame)
+		require.NoError(t, err)
+	}
+	require.NoError(t, engine.engineClose())
+
+	ring, err := qwpSfOpenRing(dir, 4096)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ring.segmentRingClose() })
+	return ring
+}
+
+// TestQwpAnalyzeRecoveredDictRejectsConflictingOverlap checks that recovery
+// stops when the saved dictionary and frames give the same id different names.
+// The server cannot detect this because no id is missing.
+func TestQwpAnalyzeRecoveredDictRejectsConflictingOverlap(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prefix []string
+		frames [][]byte
+		want   string
+	}{
+		{
+			// The whole frame overlaps, so recovery must check it before
+			// returning early.
+			name:   "fully covered frame contradicts the side-file",
+			prefix: []string{"AAPL", "MSFT"},
+			frames: [][]byte{buildTestDeltaFrame(0, []string{"AAPL", "ZZZZ"})},
+			want:   `symbol id 1: "MSFT" already recovered`,
+		},
+		{
+			name:   "partially covered frame contradicts the side-file",
+			prefix: []string{"AAPL"},
+			frames: [][]byte{buildTestDeltaFrame(0, []string{"ZZZZ", "MSFT"})},
+			want:   `symbol id 0: "AAPL" already recovered`,
+		},
+		{
+			// Frames can also disagree when there is no saved dictionary.
+			name: "a later frame contradicts an earlier frame",
+			frames: [][]byte{
+				buildTestDeltaFrame(0, []string{"AAPL"}),
+				buildTestDeltaFrame(0, []string{"ZZZZ", "MSFT"}),
+			},
+			want: `symbol id 0: "AAPL" already recovered`,
+		},
+		{
+			// An acknowledged frame must still agree with the dictionary.
+			name:   "an acked frame contradicts the side-file",
+			prefix: []string{"AAPL"},
+			frames: [][]byte{
+				buildTestDeltaFrame(0, []string{"ZZZZ"}),
+				buildTestDeltaFrame(1, []string{"MSFT"}),
+			},
+			want: `symbol id 0: "AAPL" already recovered`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ring := qwpTestRecoveredRing(t, tc.frames)
+			_, err := qwpSfAnalyzeRecoveredDict(ring, 0, tc.prefix)
+			require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
+// TestQwpAnalyzeRecoveredDictAcceptsAgreeingOverlap checks that matching
+// repeats are accepted without duplicating or renumbering symbols.
+func TestQwpAnalyzeRecoveredDictAcceptsAgreeingOverlap(t *testing.T) {
+	ring := qwpTestRecoveredRing(t, [][]byte{
+		buildTestDeltaFrame(0, []string{"AAPL", "MSFT"}), // repeats the side-file, adds one
+		buildTestDeltaFrame(0, []string{"AAPL", "MSFT"}), // adds nothing at all
+		buildTestDeltaFrame(1, []string{"MSFT", "IBM"}),  // overlaps and extends
+	})
+	analysis, err := qwpSfAnalyzeRecoveredDict(ring, 0, []string{"AAPL"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"AAPL", "MSFT", "IBM"}, analysis.symbols)
+}
+
+// TestQwpEngineRecoveryConflictingDictQuarantinesTheSlot checks the full open
+// path: a conflict preserves the old slot and starts with an empty one.
+func TestQwpEngineRecoveryConflictingDictQuarantinesTheSlot(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	pd := engine.enginePersistedSymbolDict()
+	require.NotNil(t, pd)
+	// Build a conflict directly: the saved dictionary and frame give id 0
+	// different names.
+	require.NoError(t, pd.appendSymbols([]string{"AAPL"}))
+	_, err = engine.engineAppendBlocking(context.Background(), buildTestDeltaFrame(0, []string{"ZZZZ"}))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+
+	recovered, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, recovered)
+	require.Equal(t, int64(-1), recovered.enginePublishedFsn(), "the replacement slot must start empty")
+	quarantined := recovered.engineQuarantinedSlotPath()
+	require.NotEmpty(t, quarantined)
+	require.FileExists(t, filepath.Join(quarantined, qwpSfSymbolDictFileName),
+		"the contradicting slot must be preserved for inspection")
+	require.NoError(t, recovered.engineClose())
+}
+
 func TestQwpEngineRecoveryMissingDictRejectsUnackedGap(t *testing.T) {
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)

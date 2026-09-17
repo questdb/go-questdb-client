@@ -38,10 +38,12 @@ type qwpSfRecoveredDictAnalysis struct {
 	maxReplayDeltaStart int
 }
 
-// qwpSfAnalyzeRecoveredDict rebuilds as much of a recovered slot's symbol
-// dictionary as the surviving frames can account for. The segment CRC scan has
-// already checked every payload, so this pass only checks the delta structure
-// and picks up the ids each frame adds beyond what is already known.
+// qwpSfAnalyzeRecoveredDict rebuilds the symbol dictionary from the saved
+// dictionary file and the frames that are still on disk. It checks that every
+// repeated id has the same name, then adds any new ids found in the frames.
+//
+// If two sources give the same id different names, recovery stops and preserves
+// the slot. Replaying it could associate rows with the wrong symbol.
 //
 // A frame that still has to be sent and starts above the known ids is a dead
 // end: the ids below its start came from frames that were ACKed and trimmed
@@ -103,22 +105,32 @@ func qwpSfAnalyzeRecoveredDict(
 			}
 			return nil
 		}
-		if deltaEnd <= coverage {
-			return nil
-		}
 
-		// Step over the entries the side-file or an earlier frame already
-		// supplied, then take the ids this frame adds on top. qwpParseDeltaDict
-		// has already validated the whole entry region; the bounds checks here
-		// keep this loop safe on its own if that ever changes.
+		// Check names for ids we already know. Matching repeats are normal, but
+		// different names for the same id mean the saved dictionary and frames
+		// disagree. The server cannot detect this because there is no missing id,
+		// so stop recovery rather than replaying rows with the wrong symbols.
+		// qwpParseDeltaDict has already checked the entry data; keep the bounds
+		// checks here in case that changes.
 		p := entries
-		for skip := coverage - deltaStart; skip > 0; skip-- {
+		for id := deltaStart; id < deltaEnd && id < coverage; id++ {
 			entryLen, n, err := qwpReadVarint(p)
 			if err != nil || entryLen > uint64(len(p)-n) {
 				return qwpSfFailClosed("malformed recovered symbol dictionary overlap at fsn %d", fsn)
 			}
-			p = p[n+int(entryLen):]
+			p = p[n:]
+			if string(p[:int(entryLen)]) != a.symbols[id] {
+				return qwpSfFailClosed(
+					"recovered symbol dictionary disagrees on symbol id %d: %q already recovered, frame at fsn %d carries %q",
+					id, a.symbols[id], fsn, string(p[:int(entryLen)]))
+			}
+			p = p[int(entryLen):]
 		}
+		if deltaEnd <= coverage {
+			return nil
+		}
+
+		// Take the ids this frame adds on top of what is already known.
 		for id := coverage; id < deltaEnd; id++ {
 			entryLen, n, err := qwpReadVarint(p)
 			if err != nil || entryLen > uint64(len(p)-n) {
