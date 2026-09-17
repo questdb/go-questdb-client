@@ -25,9 +25,37 @@
 package questdb
 
 import (
+	"context"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"testing"
 	"time"
 )
+
+// These are failure guards, not latency assertions. Disk-backed setup can need
+// several fsyncs and a scheduled manager pass even for tiny test segments.
+// Keep intentional backpressure, cancellation and retry intervals local to the
+// tests that exercise them rather than replacing them with these budgets.
+const (
+	qwpTestWaitTimeout   = 10 * time.Second
+	qwpTestAppendTimeout = 30 * time.Second
+)
+
+// qwpTestSubprocess gives multi-step recovery/ownership fixtures room for slow
+// storage and race instrumentation. The child's watchdog dumps stacks before
+// the parent's hard stop; neither timeout is a cleanup correctness assertion.
+func qwpTestSubprocess(t *testing.T, testName string) *exec.Cmd {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	t.Cleanup(cancel)
+	return exec.CommandContext(ctx, exe, "-test.run=^"+regexp.QuoteMeta(testName)+"$", "-test.v", "-test.timeout=2m")
+}
 
 func (s *qwpSfSwappableVar[T]) store(value T) { s.v.Store(&value) }
 

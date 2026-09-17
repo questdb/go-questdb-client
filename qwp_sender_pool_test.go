@@ -1206,7 +1206,7 @@ func TestQwpSenderPoolCloseSurvivesPanickingLoggerAndReleasesSlots(t *testing.T)
 	require.NoError(t, err, "close() skipped the teardown of an available slot")
 	require.NoError(t, lock.close())
 	require.NoError(t, leaked.Close(ctx))
-	require.Eventually(t, func() bool { return p.close(ctx) == nil }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return p.close(ctx) == nil }, qwpTestWaitTimeout, time.Millisecond)
 }
 
 // TestQwpSenderPoolCloseReportsPendingWhileTeardownHoldsFlock pins that close()
@@ -1510,7 +1510,7 @@ func TestQwpSenderPoolGiveBackAfterCloseBalancesSfAccounting(t *testing.T) {
 	if err := s.Close(ctx); err != nil {
 		t.Fatalf("lease close: %v", err)
 	}
-	require.Eventually(t, func() bool { return p.close(ctx) == nil }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return p.close(ctx) == nil }, qwpTestWaitTimeout, time.Millisecond)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1572,7 +1572,7 @@ func TestQwpSenderPoolReprobesDeferredClose(t *testing.T) {
 	t.Cleanup(func() { _ = p.close(context.Background()) })
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("manager did not enter spare creation")
 	}
 
@@ -1652,7 +1652,7 @@ func TestQwpSenderPoolCloseReportsDeferredSlotAndRetryConverges(t *testing.T) {
 	}
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("manager did not enter spare creation")
 	}
 
@@ -1671,7 +1671,7 @@ func TestQwpSenderPoolCloseReportsDeferredSlotAndRetryConverges(t *testing.T) {
 	// is left to notice the cleanup finishing, and a caller waiting for a clean
 	// shutdown would wait forever on a cached answer.
 	var closeErr error
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(qwpTestWaitTimeout)
 	for {
 		closeErr = p.close(context.Background())
 		if closeErr == nil || time.Now().After(deadline) {
@@ -1717,7 +1717,7 @@ func TestQwpSenderPoolBuildFailureRetiresSlotUntilDeferredCleanup(t *testing.T) 
 	afterEngineHook := func() error {
 		select {
 		case <-entered:
-		case <-time.After(time.Second):
+		case <-time.After(qwpTestWaitTimeout):
 			return errors.New("manager did not enter spare creation")
 		}
 		return errors.New("injected post-engine build failure")
@@ -1752,7 +1752,7 @@ func TestQwpSenderPoolBuildFailureRetiresSlotUntilDeferredCleanup(t *testing.T) 
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return p.sfSlots[0].state == qwpSfSlotFree
-	}, 2*time.Second, time.Millisecond)
+	}, qwpTestWaitTimeout, time.Millisecond)
 }
 
 // TestQwpSenderPoolRetiredSlotCapacityReturnsToBorrow is the end-to-end half of
@@ -1789,7 +1789,7 @@ func TestQwpSenderPoolRetiredSlotCapacityReturnsToBorrow(t *testing.T) {
 	afterEngineHook := func() error {
 		select {
 		case <-entered:
-		case <-time.After(time.Second):
+		case <-time.After(qwpTestWaitTimeout):
 			return errors.New("manager did not enter spare creation")
 		}
 		return errors.New("injected post-engine build failure")
@@ -1857,7 +1857,7 @@ func TestQwpSenderPoolRecoveryBuildFailureRetiresSlotUntilDeferredCleanup(t *tes
 	afterEngineHook := func() error {
 		select {
 		case <-entered:
-		case <-time.After(time.Second):
+		case <-time.After(qwpTestWaitTimeout):
 			return errors.New("manager did not enter spare creation")
 		}
 		return errors.New("injected recovered-slot build failure")
@@ -1896,7 +1896,7 @@ func TestQwpSenderPoolRecoveryBuildFailureRetiresSlotUntilDeferredCleanup(t *tes
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return p.sfSlots[0].state == qwpSfSlotFree
-	}, 2*time.Second, time.Millisecond)
+	}, qwpTestWaitTimeout, time.Millisecond)
 }
 
 // TestQwpSenderPoolCloseNeverTearsDownBorrowedDelegate pins the invariant: close()
@@ -2171,7 +2171,7 @@ func TestQwpSenderPoolPoisonSurfacesOnLeaseReturn(t *testing.T) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return p.pendingLeaseTeardowns == 0 && len(p.available) == 0 && closed.Load() == 1
-	}, time.Second, time.Millisecond)
+	}, qwpTestWaitTimeout, time.Millisecond)
 }
 
 // TestQwpSenderPoolPrewarmFailureReportsRetainedSlotLock pins that a failed

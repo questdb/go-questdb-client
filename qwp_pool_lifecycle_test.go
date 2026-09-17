@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/require"
 )
 
 func senderPoolWithIdle(t *testing.T, extra string, min, max int, idle time.Duration) *qwpSenderPool {
@@ -217,19 +218,19 @@ func TestQwpSenderPoolSfStrandedSlotRecovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("phase 1 open: %v", err)
 	}
-	_ = s1.Table("t").Int64Column("v", 1).AtNow(ctx)
-	_ = s1.Flush(ctx)
-	time.Sleep(50 * time.Millisecond)
-	_ = s1.Close(ctx)
-	if !qwpSfIsCandidateOrphan(filepath.Join(sfDir, "default-2")) {
-		t.Skip("no stranded segment produced in this environment")
-	}
+	require.NoError(t, s1.Table("t").Int64Column("v", 1).AtNow(ctx))
+	require.NoError(t, s1.Flush(ctx))
+	require.NoError(t, s1.Close(ctx))
+	// Close may leave storage cleanup running. Wait for ownership release,
+	// rather than sleeping before Close or silently skipping a slow cleanup.
+	require.Eventually(t, s1.(QwpSender).SlotLockReleased, qwpTestWaitTimeout, time.Millisecond)
+	require.True(t, qwpSfIsCandidateOrphan(filepath.Join(sfDir, "default-2")))
 
 	// Phase 2: a pool on the same sf_dir against an up server recovers slot 2.
 	srv := newQwpTestServer(t)
 	defer srv.Close()
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";sf_dir=" + sfDir + ";"
-	p, err := newQwpSenderPool(ctx, conf, 1, 4, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	p, err := newQwpSenderPool(ctx, conf, 1, 4, qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("phase 2 build: %v", err)
 	}
@@ -659,7 +660,7 @@ func TestQwpSenderPoolGrowthBorrowBoundedByAcquireDeadline(t *testing.T) {
 	// Let the build finish; settleGrowthBuild hands the slot to available and
 	// decrements inFlightCreations.
 	close(release)
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(qwpTestWaitTimeout)
 	for {
 		total, avail, _ := p.poolSnapshot()
 		p.mu.Lock()

@@ -1290,7 +1290,7 @@ func TestQwpQueryClientCloseShortCtxNoReaderRace(t *testing.T) {
 	// io.transport.conn concurrently with the still-spinning reader — a
 	// data race the detector flags within a few rounds.
 	for i := 0; i < 40; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 		c, err := NewQwpQueryClient(ctx, WithQwpQueryAddress(addr))
 		cancel()
 		if err != nil {

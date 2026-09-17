@@ -569,7 +569,7 @@ func BenchmarkQwpSfPublish(b *testing.B) {
 		payloadBytes       = 512
 	)
 	ctx := context.Background()
-	e, err := qwpSfNewCursorEngine(b.TempDir(), segmentBytes, totalBytes, 5*time.Second)
+	e, err := qwpSfNewCursorEngine(b.TempDir(), segmentBytes, totalBytes, qwpTestAppendTimeout)
 	if err != nil {
 		b.Fatal(err)
 	}

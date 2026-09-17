@@ -29,11 +29,9 @@ import (
 	"errors"
 	"github.com/stretchr/testify/require"
 	"os"
-	"os/exec"
 	"runtime"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // Failed cleanup must keep resources alive even after its worker exits and
@@ -61,9 +59,7 @@ func TestQwpSfTerminalCleanupRetainsOwnership(t *testing.T) {
 	}
 	for _, mode := range []string{"ring", "middle-segment", "segment-file-close", "watermark", "symbol-dict", "construction-initial", "construction-manifest", "construction-ring", "manager-spare", "unlink"} {
 		t.Run(mode, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestQwpSfTerminalCleanupRetainsOwnership$", "-test.timeout=12s")
+			cmd := qwpTestSubprocess(t, "TestQwpSfTerminalCleanupRetainsOwnership")
 			dir := t.TempDir()
 			cmd.Env = append(os.Environ(), "QWP_TERMINAL_CLEANUP_CHILD="+mode, "QWP_TERMINAL_CLEANUP_DIR="+dir)
 			out, err := cmd.CombinedOutput()
@@ -71,7 +67,7 @@ func TestQwpSfTerminalCleanupRetainsOwnership(t *testing.T) {
 			lock, err := qwpSfAcquireSlotLock(dir)
 			require.NoError(t, err, "process exit must release the retained flock")
 			require.NoError(t, lock.close())
-			recovered, err := qwpSfNewCursorEngineForDrainer(dir, 256, qwpSfUnlimitedTotalBytes, time.Second)
+			recovered, err := qwpSfNewCursorEngineForDrainer(dir, 256, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
 			require.NoError(t, err)
 			defer func() { require.NoError(t, recovered.engineClose()) }()
 			if mode == "ring" || mode == "middle-segment" || mode == "segment-file-close" || mode == "watermark" || mode == "symbol-dict" {
@@ -89,13 +85,9 @@ func qwpTerminalCleanupChild(t *testing.T, dir, mode string) []byte {
 	if mode == "manager-spare" {
 		hook := func(*qwpSfManagerRingEntry) { boom() }
 		qwpSfTestAfterSpareCreateHook.Store(&hook)
-		e, err := qwpSfNewCursorEngine(dir, 256, qwpSfUnlimitedTotalBytes, time.Second)
+		e, err := qwpSfNewCursorEngine(dir, 256, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
 		require.NoError(t, err)
-		select {
-		case <-e.manager.done:
-		case <-time.After(time.Second):
-			t.Fatal("manager did not exit")
-		}
+		waitQwpCleanupSignal(t, e.manager.done, "manager exit")
 		qwpSfTestAfterSpareCreateHook.Store(nil)
 		require.ErrorIs(t, e.engineClose(), ErrCleanupFailed)
 		waitQwpSfEngineCleanup(t, e)
@@ -126,7 +118,7 @@ func qwpTerminalCleanupChild(t *testing.T, dir, mode string) []byte {
 			}
 			qwpSfTestCleanupHook.Store(&hook)
 		}
-		_, err := qwpSfNewCursorEngine(dir, 256, qwpSfUnlimitedTotalBytes, time.Second)
+		_, err := qwpSfNewCursorEngine(dir, 256, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
 		require.ErrorIs(t, err, buildErr)
 		require.ErrorIs(t, err, ErrCleanupFailed)
 		var held *qwpSfBuildCleanupError
@@ -160,7 +152,7 @@ func qwpTerminalCleanupChild(t *testing.T, dir, mode string) []byte {
 		}
 		return nil
 	}
-	e, err := qwpSfNewCursorEngine(dir, 256, qwpSfUnlimitedTotalBytes, time.Second)
+	e, err := qwpSfNewCursorEngine(dir, 256, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
 	require.NoError(t, err)
 	// Each frame fills a separate mapped segment. The middle segment is no
 	// longer being written, so we can test closing it separately.

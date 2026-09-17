@@ -72,7 +72,7 @@ func TestQwpSfCleanupObserversNeverDriveRetries(t *testing.T) {
 	require.ErrorIs(t, e.engineClose(), injected)
 	select {
 	case <-retryEntered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("owned retry did not start")
 	}
 	var wg sync.WaitGroup
@@ -154,7 +154,7 @@ func waitQwpSfEngineCleanup(t *testing.T, engine *qwpSfCursorEngine) {
 	require.NotNil(t, done, "cleanup must already have an owner")
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("engine cleanup did not finish")
 	}
 }
@@ -163,7 +163,7 @@ func waitQwpCleanupSignal(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
 	case <-ch:
-	case <-time.After(5 * time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("timed out waiting for " + what)
 	}
 }

@@ -547,7 +547,7 @@ func TestQwpSfEngineWatermarkPersistedByManager(t *testing.T) {
 			r1, ok1 := qwpSfDecodeDualRecord(b[off:off+qwpSfDualRecordSize], qwpSfAckWatermarkMagic, qwpSfAckWatermarkRecordValid)
 			rec, ok := qwpSfSelectDualRecord(r0, ok0, r1, ok1)
 			return ok && rec.first == 4
-		}, 2*time.Second, 5*time.Millisecond)
+		}, qwpTestWaitTimeout, 5*time.Millisecond)
 
 		require.NoError(t, e.engineClose())
 	}

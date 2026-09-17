@@ -21,7 +21,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -304,7 +303,9 @@ func TestQwpRejectedSynchronousIngestBuildRetainsCleanup(t *testing.T) {
 		qwpTestBeforeTransportClose.Store(nil)
 		qwpSfManagerCloseGrace.store(old)
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	// Rejection is immediate once connected; a short setup context could expire
+	// before acquiring the transport whose retained cleanup this test checks.
+	ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	defer cancel()
 	sender, err := LineSenderFromConf(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";initial_connect_retry=off;")
 	require.Nil(t, sender)
@@ -347,7 +348,7 @@ func TestQwpIngestAcquisitionPanicRetainsTransport(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 	root := t.TempDir()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestQwpIngestAcquisitionPanicRetainsTransport$", "-test.timeout=15s")
+	cmd := qwpTestSubprocess(t, "TestQwpIngestAcquisitionPanicRetainsTransport")
 	cmd.Env = append(os.Environ(), "QWP_INGEST_ACQUISITION_CHILD=1", "QWP_INGEST_ACQUISITION_ADDR="+strings.TrimPrefix(srv.URL, "http://"), "QWP_INGEST_ACQUISITION_DIR="+root)
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "%s", output)

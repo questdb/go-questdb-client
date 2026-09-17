@@ -246,7 +246,7 @@ func TestQwpSfRingManifestSyncDoesNotBlockSendLookup(t *testing.T) {
 	select {
 	case found = <-lookupDone:
 		lookupReturned = true
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 	}
 	close(releaseSync)
 	if !lookupReturned {

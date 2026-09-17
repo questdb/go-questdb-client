@@ -28,7 +28,6 @@ import (
 	"context"
 	"encoding/binary"
 	"os"
-	"os/exec"
 	"runtime"
 	"testing"
 	"time"
@@ -52,16 +51,12 @@ func TestQwpSfRetainedReaderOwnership(t *testing.T) {
 			// Only the parent removes this directory, after the child exits.
 			// Never force-unmap or repair a retained engine to clean up a test.
 			dir := t.TempDir()
-			exe, err := os.Executable()
-			require.NoError(t, err)
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, exe, "-test.run=^TestQwpSfRetainedReaderOwnership$", "-test.v", "-test.timeout=10s")
+			cmd := qwpTestSubprocess(t, "TestQwpSfRetainedReaderOwnership")
 			cmd.Env = append(os.Environ(), "QWP_RETAINED_READER_CHILD="+mode, "QWP_RETAINED_READER_DIR="+dir)
 			out, childErr := cmd.CombinedOutput()
 			t.Logf("%s", out)
 			if childErr != nil {
-				t.Errorf("retained-reader child failed: %v (wait context: %v)", childErr, ctx.Err())
+				t.Errorf("retained-reader child failed: %v", childErr)
 			}
 
 			// Even a reader retained until process exit must leave the slot
@@ -124,7 +119,7 @@ func qwpTestRetainedReaderChild(t *testing.T, mode, dir string) {
 	select {
 	case got := <-result:
 		require.Equal(t, want, got, "mapping must stay readable while the reader is alive")
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("retained reader did not respond")
 	}
 	if engine.engineCloseCompleted() || sender.SlotLockReleased() {
@@ -148,12 +143,8 @@ func qwpTestRetainedReaderChild(t *testing.T, mode, dir string) {
 		return
 	}
 	close(exit)
-	select {
-	case <-loop.done:
-	case <-time.After(time.Second):
-		t.Fatal("late reader did not exit")
-	}
-	require.Eventually(t, engine.engineCloseCompleted, 3*time.Second, time.Millisecond,
+	waitQwpCleanupSignal(t, loop.done, "late reader exit")
+	require.Eventually(t, engine.engineCloseCompleted, qwpTestWaitTimeout, time.Millisecond,
 		"the existing owner must finish after reader exit, without another Close")
 	require.True(t, seg.buf == nil, "late reader exit must permit unmapping, not permanent abandonment")
 	require.True(t, sender.SlotLockReleased())

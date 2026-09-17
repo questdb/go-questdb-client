@@ -260,9 +260,9 @@ func TestQwpQueryPoolCloseWaitsForClosedDuringBuildTeardown(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), qwpPoolTestUnhurriedAcquire)
 	p, err := newQwpQueryPool(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";",
-		0, 1, 5*time.Second, 0, 0, nil)
+		0, 1, qwpPoolTestUnhurriedAcquire, 0, 0, nil)
 	require.NoError(t, err)
 	teardownEntered := make(chan *QwpQueryClient, 1)
 	hook := func(client *QwpQueryClient) {
@@ -306,13 +306,13 @@ func TestQwpQueryPoolCloseWaitsForClosedDuringBuildTeardown(t *testing.T) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return p.closed && p.inFlightCreations == 1
-	}, time.Second, time.Millisecond, "close must wait on the in-flight connection")
+	}, qwpTestWaitTimeout, time.Millisecond, "close must wait on the in-flight connection")
 	upgradeOnce.Do(func() { close(allowUpgrade) })
 
 	var client *QwpQueryClient
 	select {
 	case client = <-teardownEntered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("late client did not reach its off-lock close")
 	}
 	p.mu.Lock()

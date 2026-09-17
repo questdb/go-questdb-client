@@ -111,7 +111,7 @@ func TestQwpDumpFailedDialJoinsPump(t *testing.T) {
 	err := tr.connect(ctx, "", qwpTransportOpts{endpointPath: qwpWritePath})
 	require.ErrorIs(t, err, context.Canceled)
 	require.NotNil(t, tr.dumpConn)
-	wait, stop := context.WithTimeout(context.Background(), time.Second)
+	wait, stop := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	defer stop()
 	require.NoError(t, tr.closeContext(wait))
 	select {
@@ -157,12 +157,12 @@ func TestQwpTransportCloseWaitersShareOneRelease(t *testing.T) {
 	}
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("release never started")
 	}
 	require.Equal(t, int32(1), calls.Load())
 	release()
-	wait, stop := context.WithTimeout(context.Background(), time.Second)
+	wait, stop := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	defer stop()
 	require.NoError(t, tr.closeContext(wait))
 	require.NoError(t, tr.closeContext(ctx), "completed result wins over an expired wait")
@@ -182,7 +182,7 @@ func TestQwpQueryCloseWaitersShareOneRelease(t *testing.T) {
 	require.Less(t, time.Since(start), time.Second)
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("release never started")
 	}
 	for i := 0; i < 5; i++ {
@@ -190,7 +190,7 @@ func TestQwpQueryCloseWaitersShareOneRelease(t *testing.T) {
 	}
 	require.Equal(t, int32(1), calls.Load())
 	release()
-	wait, stop := context.WithTimeout(context.Background(), time.Second)
+	wait, stop := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	defer stop()
 	require.NoError(t, c.Close(wait))
 	require.NoError(t, c.Close(ctx), "a prior caller timeout must not become a stored failure")
@@ -372,7 +372,7 @@ func TestQwpSenderClosePublicationKeepsAppendBudget(t *testing.T) {
 	s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 0)
 	require.NoError(t, err)
 	require.NoError(t, s.Table("full").Int64Column("v", 1).AtNow(context.Background()))
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	defer cancel()
 	err = s.Close(ctx)
 	require.ErrorIs(t, err, ErrBackpressureTimeout)

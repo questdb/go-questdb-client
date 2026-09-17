@@ -1476,7 +1476,9 @@ func TestQwpQueryCancelledFailoverClosesBeforeOwnerShutdown(t *testing.T) {
 		t.Fatalf("initial bind = %s, want node A", c.CurrentEndpoint())
 	}
 
-	qctx, qcancel := context.WithTimeout(context.Background(), 8*time.Second)
+	// Cancel only after the failover reaches the gate below. An independent
+	// query deadline can otherwise expire during slow setup and bypass it.
+	qctx, qcancel := context.WithCancel(context.Background())
 	defer qcancel()
 	var qwg sync.WaitGroup
 	qwg.Add(1)

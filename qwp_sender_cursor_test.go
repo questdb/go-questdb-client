@@ -482,7 +482,7 @@ func TestQwpCursorSenderAwaitAckedFsnTimeout(t *testing.T) {
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.Eventually(t, func() bool {
 		return engine.enginePublishedFsn() >= 0
-	}, time.Second, time.Millisecond, "auto-flush should have published the frame")
+	}, qwpTestWaitTimeout, time.Millisecond, "auto-flush should have published the frame")
 	target := engine.enginePublishedFsn()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -516,10 +516,10 @@ func TestQwpCursorSenderAwaitAckedFsnCancelledBeforeClose(t *testing.T) {
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.Eventually(t, func() bool {
 		return engine.enginePublishedFsn() >= 0
-	}, time.Second, time.Millisecond, "auto-flush should have published the frame")
+	}, qwpTestWaitTimeout, time.Millisecond, "auto-flush should have published the frame")
 	target := engine.enginePublishedFsn()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	awaitErr := make(chan error, 1)
 	awaitDone := make(chan struct{})
 	go func() {
@@ -539,7 +539,7 @@ func TestQwpCursorSenderAwaitAckedFsnCancelledBeforeClose(t *testing.T) {
 	select {
 	case err := <-awaitErr:
 		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("AwaitAckedFsn did not return after cancellation")
 	}
 }

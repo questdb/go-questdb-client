@@ -68,7 +68,7 @@ func TestQwpSenderCloseRetainsOwnerForStorageRetry(t *testing.T) {
 	})
 
 	require.ErrorIs(t, sender.Close(context.Background()), injected)
-	require.Eventually(t, engine.engineCloseCompleted, 3*time.Second, 5*time.Millisecond,
+	require.Eventually(t, engine.engineCloseCompleted, qwpTestWaitTimeout, 5*time.Millisecond,
 		"the original cleanup owner must retry the storage error")
 	require.GreaterOrEqual(t, calls.Load(), int32(2))
 
@@ -111,7 +111,7 @@ func TestQwpSenderDrainerPoolPanicKeepsEarlierErrorAndCancels(t *testing.T) {
 	require.NoError(t, pool.drainerPoolSubmit(context.Background(), drainer))
 	select {
 	case <-dialEntered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("orphan drainer did not acquire its slot and enter the blocking dial")
 	}
 
@@ -129,7 +129,7 @@ func TestQwpSenderDrainerPoolPanicKeepsEarlierErrorAndCancels(t *testing.T) {
 	require.ErrorIs(t, closeErr, ErrCleanupFailed)
 	select {
 	case <-pool.ctx.Done():
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("a drainer-pool panic skipped its installed cancellation")
 	}
 	drainersDone := make(chan struct{})
@@ -139,7 +139,7 @@ func TestQwpSenderDrainerPoolPanicKeepsEarlierErrorAndCancels(t *testing.T) {
 	}()
 	select {
 	case <-drainersDone:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("cancelled orphan drainer did not exit after the pool-close panic")
 	}
 	require.Empty(t, pool.drainerPoolSnapshot())
@@ -284,7 +284,7 @@ func TestQwpEngineCleanupRetriesFlockError(t *testing.T) {
 
 	require.Error(t, engine.engineClose())
 	// The same cleanup worker retries without another call to Close.
-	require.Eventually(t, engine.engineCloseCompleted, 2*time.Second, 10*time.Millisecond)
+	require.Eventually(t, engine.engineCloseCompleted, qwpTestWaitTimeout, 10*time.Millisecond)
 	require.GreaterOrEqual(t, calls.Load(), int32(2))
 }
 
@@ -310,7 +310,7 @@ func TestQwpEngineCleanupRetrySurvivesPanickingLogger(t *testing.T) {
 
 	require.Error(t, engine.engineClose())
 	engine.manager.logger.Store(qwpGuardLogger(slog.New(panicOnHandleSlog{})))
-	require.Eventually(t, engine.engineCloseCompleted, time.Second, 5*time.Millisecond)
+	require.Eventually(t, engine.engineCloseCompleted, qwpTestWaitTimeout, 5*time.Millisecond)
 	require.GreaterOrEqual(t, flockCalls.Load(), int32(3))
 
 	lock, err := qwpSfAcquireSlotLock(dir)
@@ -356,7 +356,7 @@ func TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits(t *testing.T) {
 	require.NoError(t, err)
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("manager did not enter spare creation")
 	}
 
@@ -371,7 +371,7 @@ func TestQwpEngineCloseRetainsSlotUntilManagerWorkerExits(t *testing.T) {
 	require.NoError(t, err, "close must not remove segment files while the worker can touch the slot")
 
 	close(release)
-	require.Eventually(t, engine.engineCloseCompleted, time.Second, time.Millisecond)
+	require.Eventually(t, engine.engineCloseCompleted, qwpTestWaitTimeout, time.Millisecond)
 	lock, err := qwpSfAcquireSlotLock(dir)
 	require.NoError(t, err)
 	require.NoError(t, lock.close())
@@ -440,7 +440,7 @@ func TestQwpEngineDoubleCloseDuringUnlinkRunsOneCleanup(t *testing.T) {
 	go func() { done <- engine.engineClose() }()
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("close did not reach segment unlink")
 	}
 	require.NoError(t, engine.engineClose(), "concurrent close must only observe the existing owner")
@@ -500,7 +500,7 @@ func TestQwpSendLoopCloseWaitsForReaderExit(t *testing.T) {
 	go func() { closed <- loop.sendLoopClose() }()
 	select {
 	case <-loop.ctx.Done():
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("stop was not requested")
 	}
 	select {
@@ -512,7 +512,7 @@ func TestQwpSendLoopCloseWaitsForReaderExit(t *testing.T) {
 	select {
 	case err := <-closed:
 		require.NoError(t, err)
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("close did not finish after reader exit")
 	}
 	require.Nil(t, loop.transport.Load())

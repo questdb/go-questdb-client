@@ -689,7 +689,7 @@ func TestQwpSfRecoveryFullyTrimmedEmptyActiveKeepsSequenceDomain(t *testing.T) {
 	createRecoveryManifest(t, dir, baseSeq, baseSeq, active)
 	closeRecoverySegments(t, active)
 
-	engine, err := qwpSfNewCursorEngine(dir, segmentSize, qwpSfUnlimitedTotalBytes, time.Second)
+	engine, err := qwpSfNewCursorEngine(dir, segmentSize, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
 	require.NoError(t, err)
 	defer func() { _ = engine.engineClose() }()
 	require.Equal(t, baseSeq-1, engine.enginePublishedFsn())
@@ -698,7 +698,7 @@ func TestQwpSfRecoveryFullyTrimmedEmptyActiveKeepsSequenceDomain(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return engine.ring.hotSpare.Load() != nil
-	}, time.Second, time.Millisecond)
+	}, qwpTestWaitTimeout, time.Millisecond)
 
 	// Fill the recovered active almost to its end, then append once more to
 	// rotate it into the sealed chain.
@@ -712,14 +712,14 @@ func TestQwpSfRecoveryFullyTrimmedEmptyActiveKeepsSequenceDomain(t *testing.T) {
 
 	engine.engineAcknowledge(baseSeq)
 	require.Equal(t, baseSeq, engine.engineAckedFsn())
-	awaitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	awaitCtx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	defer cancel()
 	sender := &qwpLineSender{cursorEngine: engine, cursorSendLoop: &qwpSfSendLoop{}}
 	require.NoError(t, sender.AwaitAckedFsn(awaitCtx, baseSeq))
 	require.Eventually(t, func() bool {
 		_, err := os.Stat(activePath)
 		return os.IsNotExist(err)
-	}, time.Second, time.Millisecond, "the acknowledged segment at the recovered base must trim")
+	}, qwpTestWaitTimeout, time.Millisecond, "the acknowledged segment at the recovered base must trim")
 }
 
 func TestQwpSfRecoveryLegacyBaseZeroRefusesCorruptStray(t *testing.T) {

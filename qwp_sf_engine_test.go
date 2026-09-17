@@ -387,17 +387,17 @@ func TestQwpSfEngineFullDrainBarrierFailureRetainsSlot(t *testing.T) {
 func TestQwpSfEngineTrimAdvancesManifest(t *testing.T) {
 	dir := t.TempDir()
 	const segSize int64 = 72
-	e, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+	e, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
 	require.NoError(t, err)
 	defer func() { _ = e.engineClose() }()
 
-	require.Eventually(t, func() bool { return !e.ring.needsHotSpare() }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !e.ring.needsHotSpare() }, qwpTestWaitTimeout, time.Millisecond)
 	for i := 0; i < 3; i++ {
 		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
 		require.NoError(t, err)
 	}
 	e.engineAcknowledge(1)
-	require.Eventually(t, func() bool { return e.ring.sealedSegmentCount() == 0 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return e.ring.sealedSegmentCount() == 0 }, qwpTestWaitTimeout, time.Millisecond)
 
 	m, err := qwpSfManifestOpen(dir)
 	require.NoError(t, err)
@@ -965,6 +965,6 @@ func TestQwpSfQuarantinedBytesCountAgainstTheBudget(t *testing.T) {
 	require.Eventually(t, func() bool {
 		_, err := e.engineAppendBlocking(context.Background(), make([]byte, 16))
 		return err == nil
-	}, 5*time.Second, 10*time.Millisecond,
+	}, qwpTestWaitTimeout, 10*time.Millisecond,
 		"minting must resume once the .corrupt files are gone")
 }

@@ -160,7 +160,7 @@ func TestQwpSfManagerWorkerPanicStillSignalsExitWithPanickingLogger(t *testing.T
 
 	select {
 	case <-mgr.done:
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("manager worker did not signal exit after panic")
 	}
 	require.Error(t, mgr.managerWorkerError())
@@ -561,11 +561,7 @@ func TestQwpSfManagerSpareInstallRechecksCapAfterConcurrentRegistration(t *testi
 		defer close(serviceDone)
 		m.serviceRing(entry1)
 	}()
-	select {
-	case <-createEntered:
-	case <-time.After(time.Second):
-		t.Fatal("manager did not enter spare creation")
-	}
+	waitQwpCleanupSignal(t, createEntered, "manager spare creation")
 
 	second, err := qwpSfCreateInMemorySegment(0, segSize)
 	require.NoError(t, err)
@@ -573,11 +569,7 @@ func TestQwpSfManagerSpareInstallRechecksCapAfterConcurrentRegistration(t *testi
 	defer func() { _ = ring2.segmentRingClose() }()
 	require.NoError(t, m.segmentManagerRegister(ring2, ""))
 	close(createRelease)
-	select {
-	case <-serviceDone:
-	case <-time.After(time.Second):
-		t.Fatal("manager did not finish spare creation")
-	}
+	waitQwpCleanupSignal(t, serviceDone, "spare creation completion")
 
 	assert.True(t, ring1.needsHotSpare(), "do not install a spare after the space is used")
 	assert.Equal(t, 2*segSize, m.totalBytes, "only the two registered active segments fit the cap")
@@ -619,11 +611,7 @@ func TestQwpSfManagerRejectedSpareCleanupFailureStaysAccounted(t *testing.T) {
 		defer close(serviceDone)
 		m.serviceRing(entry1)
 	}()
-	select {
-	case <-createEntered:
-	case <-time.After(time.Second):
-		t.Fatal("manager did not enter spare creation")
-	}
+	waitQwpCleanupSignal(t, createEntered, "manager spare creation")
 
 	second, err := qwpSfCreateInMemorySegment(0, segSize)
 	require.NoError(t, err)
@@ -631,11 +619,7 @@ func TestQwpSfManagerRejectedSpareCleanupFailureStaysAccounted(t *testing.T) {
 	defer func() { _ = ring2.segmentRingClose() }()
 	require.NoError(t, m.segmentManagerRegister(ring2, ""))
 	close(createRelease)
-	select {
-	case <-serviceDone:
-	case <-time.After(time.Second):
-		t.Fatal("manager did not finish rejected-spare cleanup")
-	}
+	waitQwpCleanupSignal(t, serviceDone, "rejected-spare cleanup")
 
 	require.Len(t, entry1.pendingUnlinks, 1)
 	pendingPath := entry1.pendingUnlinks[0].path
@@ -834,7 +818,7 @@ func TestQwpSfSpareCreationSyncsSlotDirectory(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		return synced[dir] > afterCreate
-	}, 3*time.Second, time.Millisecond,
+	}, qwpTestWaitTimeout, time.Millisecond,
 		"minting a spare must make its name durable before a rotation can commit it")
 
 	require.False(t, e.ring.needsHotSpare(), "the manager should have provisioned a spare")

@@ -417,7 +417,7 @@ func TestQwpSfSegmentMarkManifestRequiredResyncsFlagAfterProcessDeath(t *testing
 	require.NoError(t, err)
 	require.NoError(t, seg.close())
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestQwpSfSegmentMarkManifestRequiredResyncsFlagAfterProcessDeath$")
+	cmd := qwpTestSubprocess(t, "TestQwpSfSegmentMarkManifestRequiredResyncsFlagAfterProcessDeath")
 	cmd.Env = append(os.Environ(), helperEnv+"="+path)
 	output, err := cmd.CombinedOutput()
 	var exitErr *exec.ExitError

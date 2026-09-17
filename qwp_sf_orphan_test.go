@@ -305,7 +305,7 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
 	require.NoError(t, err)
 	assert.Contains(t, string(body), "durable-ack")
-	require.Eventually(t, func() bool { return persistent.Load() == 1 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return persistent.Load() == 1 }, qwpTestWaitTimeout, time.Millisecond)
 	assert.EqualValues(t, qwpMaxDurableAckMismatchAttempts, unavailable.Load(), "cooperative listener receives each queued mismatch")
 	assert.EqualValues(t, 1, persistent.Load())
 	assert.EqualValues(t, qwpMaxDurableAckMismatchAttempts, lastAttempts.Load())
@@ -550,7 +550,7 @@ func TestQwpSfDrainerPoolQueuedWorkOutlivesSetupContext(t *testing.T) {
 				release()
 				require.Eventually(t, func() bool {
 					return len(pool.drainerPoolSnapshot()) == 0
-				}, 3*time.Second, time.Millisecond, "both accepted drainers must finish on the live pool")
+				}, qwpTestWaitTimeout, time.Millisecond, "both accepted drainers must finish on the live pool")
 				require.False(t, pool.closed.Load())
 				require.Equal(t, qwpSfDrainOutcomeSuccess, first.drainerOutcome())
 				require.Equal(t, qwpSfDrainOutcomeSuccess, second.drainerOutcome())
@@ -613,7 +613,7 @@ func TestQwpSfOrphanSubmissionCancellationFailsConstruction(t *testing.T) {
 	// cleanup. The retained owner must finish before the slot can be reused.
 	var cleanup closeLifecycleReporter
 	if errors.As(err, &cleanup) {
-		require.Eventually(t, cleanup.closeCompleted, 3*time.Second, time.Millisecond)
+		require.Eventually(t, cleanup.closeCompleted, qwpTestWaitTimeout, time.Millisecond)
 	}
 	require.True(t, qwpSfIsCandidateOrphan(orphanDir))
 	require.NoFileExists(t, filepath.Join(orphanDir, qwpSfFailedSentinelName))
@@ -915,7 +915,7 @@ func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
 		return panicDrainer.drainerOutcome() == qwpSfDrainOutcomeFailed
 	}, 2*time.Second, 5*time.Millisecond,
 		"factory panic must surface as a Failed outcome, not crash the host")
-	require.Eventually(t, func() bool { return errors.Is(pool.cleanupResult(), ErrCleanupFailed) }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return errors.Is(pool.cleanupResult(), ErrCleanupFailed) }, qwpTestWaitTimeout, time.Millisecond)
 	assertTerminalDrainerRetained(t, panicDir)
 
 	// A different drainer can run even though the failed one's disk slot stays

@@ -19,9 +19,7 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -38,9 +36,7 @@ func terminalDrainerTestDir(t *testing.T) (string, bool) {
 		return os.Getenv("QWP_D1_TERMINAL_DIR"), true
 	}
 	dir := t.TempDir()
-	exe, err := os.Executable()
-	require.NoError(t, err)
-	cmd := exec.Command(exe, "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.timeout=20s")
+	cmd := qwpTestSubprocess(t, t.Name())
 	cmd.Env = append(os.Environ(), "QWP_D1_TERMINAL_CHILD="+t.Name(), "QWP_D1_TERMINAL_DIR="+dir)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "%s", out)
@@ -181,9 +177,7 @@ func TestQwpPoolClearsRecoveredStorageError(t *testing.T) {
 
 func TestQwpQueryAcquisitionFailureRetainsGeneration(t *testing.T) {
 	if os.Getenv("QWP_QUERY_ACQUISITION_CHILD") == "" {
-		exe, err := os.Executable()
-		require.NoError(t, err)
-		cmd := exec.Command(exe, "-test.run=^TestQwpQueryAcquisitionFailureRetainsGeneration$", "-test.timeout=15s")
+		cmd := qwpTestSubprocess(t, "TestQwpQueryAcquisitionFailureRetainsGeneration")
 		cmd.Env = append(os.Environ(), "QWP_QUERY_ACQUISITION_CHILD=1")
 		out, err := cmd.CombinedOutput()
 		require.NoError(t, err, "%s", out)
@@ -212,7 +206,7 @@ func makeRetainedQueryGeneration(t *testing.T) (<-chan struct{}, <-chan struct{}
 	var acquisitions atomic.Int32
 	hook := func(*qwpTransport) { acquisitions.Add(1); panic("query acquisition fault") }
 	qwpTestQueryAfterTransportAcquired.Store(&hook)
-	p, err := newQwpQueryPool(context.Background(), conf, 0, 1, time.Second, 0, 0, nil)
+	p, err := newQwpQueryPool(context.Background(), conf, 0, 1, qwpPoolTestUnhurriedAcquire, 0, 0, nil)
 	require.NoError(t, err)
 	_, err = p.borrow(context.Background())
 	require.ErrorIs(t, err, ErrCleanupFailed)
@@ -242,7 +236,7 @@ func TestQwpQueryReturnDoesNotWaitForTransportRelease(t *testing.T) {
 	select {
 	case err := <-returned:
 		require.NoError(t, err)
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("query lease return waited for physical release")
 	}
 	waitQwpCleanupSignal(t, entered, "query release")
@@ -262,7 +256,7 @@ func TestQwpQueryReturnDoesNotWaitForTransportRelease(t *testing.T) {
 func TestQwpQueryFailedBuildRetainsDiscardedConnection(t *testing.T) {
 	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) { <-m.conn.CloseRead(context.Background()).Done() })
 	defer srv.Close()
-	p, err := newQwpQueryPool(context.Background(), "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";target=replica;", 0, 1, time.Second, 0, 0, nil)
+	p, err := newQwpQueryPool(context.Background(), "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";target=replica;", 0, 1, qwpPoolTestUnhurriedAcquire, 0, 0, nil)
 	require.NoError(t, err)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -317,7 +311,7 @@ func TestQwpQueryPoolFailureDoesNotWaitForSibling(t *testing.T) {
 	queryClientCloseHook.Store(&hook)
 	defer queryClientCloseHook.Store(nil)
 	defer close(release)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	defer cancel()
 	err := p.close(ctx)
 	require.ErrorIs(t, err, ErrCleanupFailed)
@@ -357,7 +351,7 @@ func TestQwpFacadeKeepsLateSiblingErrorAfterPermanentFailure(t *testing.T) {
 	require.ErrorIs(t, db.Close(context.Background()), ErrCleanupFailed)
 	waitQwpCleanupSignal(t, entered, "safe sibling release")
 	once.Do(func() { close(release) })
-	require.Eventually(t, func() bool { return errors.Is(db.Close(cancelledCleanupWait()), injected) }, time.Second, time.Millisecond,
+	require.Eventually(t, func() bool { return errors.Is(db.Close(cancelledCleanupWait()), injected) }, qwpTestWaitTimeout, time.Millisecond,
 		"an early terminal report must not freeze other cleanup results")
 	require.ErrorIs(t, db.Close(cancelledCleanupWait()), ErrCleanupFailed)
 }
@@ -386,8 +380,8 @@ func TestQwpQueryPoolPartialShutdownDoesNotReplay(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		require.ErrorIs(t, p.close(cancelledCleanupWait()), ErrCleanupFailed)
 	}
-	require.Eventually(t, func() bool { return closes.Load() == 1 }, time.Second, time.Millisecond)
-	require.Eventually(t, func() bool { p.mu.Lock(); defer p.mu.Unlock(); _, exists := p.teardowns[first]; return !exists }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return closes.Load() == 1 }, qwpTestWaitTimeout, time.Millisecond)
+	require.Eventually(t, func() bool { p.mu.Lock(); defer p.mu.Unlock(); _, exists := p.teardowns[first]; return !exists }, qwpTestWaitTimeout, time.Millisecond)
 	p.mu.Lock()
 	_, held := p.teardowns[second]
 	p.mu.Unlock()
@@ -470,7 +464,7 @@ func TestQwpDrainerCallbackIsOutsideCleanupBarrier(t *testing.T) {
 	waitQwpCleanupSignal(t, entered, "drainer callback")
 	pool := qwpSfNewDrainerPool(1)
 	require.NoError(t, pool.drainerPoolSubmit(context.Background(), d))
-	require.Eventually(t, func() bool { return d.drainerOutcome() == qwpSfDrainOutcomeSuccess }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return d.drainerOutcome() == qwpSfDrainOutcomeSuccess }, qwpTestWaitTimeout, time.Millisecond)
 	pool.drainerPoolClose()
 	require.NoError(t, pool.cleanupResult(), "a blocked user notification does not retain slot access")
 }
@@ -495,7 +489,7 @@ func TestQwpFacadeQueryOnlyPendingAndConcurrentWaiters(t *testing.T) {
 		select {
 		case err := <-results:
 			require.NoError(t, err)
-		case <-time.After(time.Second):
+		case <-time.After(qwpTestWaitTimeout):
 			t.Fatal("facade waiter stuck")
 		}
 	}

@@ -32,7 +32,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/windows"
 	"os"
-	"os/exec"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -162,9 +161,7 @@ func TestQwpSfWindowsAcquisitionPanicRetainsOwnership(t *testing.T) {
 		require.ErrorIs(t, err, qwpSfErrLockBusy)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestQwpSfWindowsAcquisitionPanicRetainsOwnership$", "-test.timeout=12s")
+	cmd := qwpTestSubprocess(t, "TestQwpSfWindowsAcquisitionPanicRetainsOwnership")
 	cmd.Env = append(os.Environ(), "QWP_WINDOWS_ACQUISITION_CHILD="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "%s", out)

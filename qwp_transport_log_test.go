@@ -168,7 +168,7 @@ func TestQwpTransportCleanupLoggerRouting(t *testing.T) {
 							}
 						}
 						return false
-					}, time.Second, time.Millisecond, "cleanup diagnostic did not reach the expected logger")
+					}, qwpTestWaitTimeout, time.Millisecond, "cleanup diagnostic did not reach the expected logger")
 					for _, other := range []*recordCapturingHandler{configured, beforeOptions, construction, emission} {
 						if other != expected {
 							require.NotContains(t, other.messages(), message, "cleanup diagnostic reached the wrong logger")

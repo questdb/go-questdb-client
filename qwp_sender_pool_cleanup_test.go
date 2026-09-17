@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -93,9 +92,7 @@ func TestQwpSenderPoolFailureRetainsResources(t *testing.T) {
 	for _, mode := range []string{"close-transition", "reap-apply", "reclaim", "late-return", "late-build", "return-flush"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestQwpSenderPoolFailureRetainsResources$", "-test.timeout=15s")
+			cmd := qwpTestSubprocess(t, "TestQwpSenderPoolFailureRetainsResources")
 			cmd.Env = append(os.Environ(), "QWP_POOL_FAILURE_CHILD="+mode, "QWP_POOL_FAILURE_DIR="+dir)
 			out, err := cmd.CombinedOutput()
 			require.NoError(t, err, "%s", out)
@@ -206,7 +203,7 @@ func poolFailureChild(t *testing.T, dir, mode string) ([][]byte, []int) {
 	if mode != "late-return" && mode != "late-build" && mode != "return-flush" {
 		require.Zero(t, senders[3].closes.Load(), "pool must not close a borrowed sender")
 		require.ErrorIs(t, lease.Close(context.Background()), ErrPoolPoisoned)
-		require.Eventually(t, senders[3].engine.engineCloseCompleted, time.Second, time.Millisecond)
+		require.Eventually(t, senders[3].engine.engineCloseCompleted, qwpTestWaitTimeout, time.Millisecond)
 	}
 	// Call QuestDB.Close itself to check that concurrent calls keep reporting
 	// the failure, including calls after the first shutdown attempt.
@@ -218,7 +215,7 @@ func poolFailureChild(t *testing.T, dir, mode string) ([][]byte, []int) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 			defer cancel()
 			results <- db.Close(ctx)
 		}()
@@ -282,7 +279,7 @@ func TestQwpSenderPoolFailureDoesNotWaitForBlockedSibling(t *testing.T) {
 			waitQwpCleanupSignal(t, p.closeDone, "unblocked sibling close")
 		}
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	defer cancel()
 	require.ErrorIs(t, p.close(ctx), ErrCleanupFailed)
 	waitQwpCleanupSignal(t, log.entered, "blocked failure logger")
@@ -343,7 +340,7 @@ func TestQwpSenderPoolLateReturnTransfersCleanupAndPreservesError(t *testing.T) 
 	lease := &qwpPooledSender{pool: p, slot: slot, gen: slot.generation.Add(1), broken: true}
 	t.Cleanup(func() {
 		once.Do(func() { close(release) })
-		require.Eventually(t, func() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.pendingLeaseTeardowns == 0 }, time.Second, time.Millisecond)
+		require.Eventually(t, func() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.pendingLeaseTeardowns == 0 }, qwpTestWaitTimeout, time.Millisecond)
 	})
 	require.ErrorIs(t, p.close(context.Background()), ErrCleanupPending)
 	returned := make(chan error, 1)
@@ -351,13 +348,13 @@ func TestQwpSenderPoolLateReturnTransfersCleanupAndPreservesError(t *testing.T) 
 	select {
 	case err := <-returned:
 		require.NoError(t, err)
-	case <-time.After(time.Second):
+	case <-time.After(qwpTestWaitTimeout):
 		t.Fatal("lease return waited for physical cleanup")
 	}
 	waitQwpCleanupSignal(t, entered, "late return cleanup")
 	require.ErrorIs(t, p.close(context.Background()), ErrCleanupPending)
 	once.Do(func() { close(release) })
-	require.Eventually(t, func() bool { return errors.Is(p.stableCloseResult(), injected) }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return errors.Is(p.stableCloseResult(), injected) }, qwpTestWaitTimeout, time.Millisecond)
 	for i := 0; i < 3; i++ {
 		require.ErrorIs(t, p.close(context.Background()), injected)
 	}
