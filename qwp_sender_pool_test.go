@@ -973,6 +973,82 @@ func TestQwpSenderPoolSfDistinctSlotDirs(t *testing.T) {
 	}
 }
 
+// TestQwpSenderPoolRecoveryRevalidatesCandidateUnderLogicalLock pins the pool
+// startup adoption route. A candidate can become .failed after the scan but
+// before construction; pool recovery must not reinterpret it as an ordinary
+// foreground slot.
+func TestQwpSenderPoolRecoveryRevalidatesCandidateUnderLogicalLock(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	slot := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	segment := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "waiting")
+	createRecoveryManifest(t, slot, 0, 0, segment)
+	closeRecoverySegments(t, segment)
+	require.True(t, qwpSfIsCandidateOrphan(slot))
+
+	hook := func() {
+		require.NoError(t, os.WriteFile(filepath.Join(slot, qwpSfFailedSentinelName), []byte("terminal\n"), 0o644))
+		createSlotHook.Store(nil)
+	}
+	createSlotHook.Store(&hook)
+	t.Cleanup(func() { createSlotHook.Store(nil) })
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	total, available, leaked := p.poolSnapshot()
+	require.Zero(t, total, "the disqualified recovery candidate must not become a pool sender")
+	require.Zero(t, available)
+	require.Zero(t, leaked)
+	require.FileExists(t, filepath.Join(slot, qwpSfFailedSentinelName))
+	require.FileExists(t, filepath.Join(slot, "sf-initial.sfa"))
+}
+
+// TestQwpSenderPoolRecoveryRevalidatesDrainedCandidateUnderLogicalLock covers
+// the other eligibility change: another owner can finish the queued work after
+// the scan. Startup recovery must not turn the now-empty path into a fresh pool
+// slot merely because it was a candidate earlier.
+func TestQwpSenderPoolRecoveryRevalidatesDrainedCandidateUnderLogicalLock(t *testing.T) {
+	srv := newQwpTestServer(t)
+	t.Cleanup(srv.Close)
+	sfDir := t.TempDir()
+	slot := filepath.Join(sfDir, qwpSfDefaultSenderId+"-0")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	segment := createRecoverySegment(t, slot, "sf-initial.sfa", 0, "waiting")
+	createRecoveryManifest(t, slot, 0, 0, segment)
+	closeRecoverySegments(t, segment)
+	require.True(t, qwpSfIsCandidateOrphan(slot))
+
+	hook := func() {
+		require.NoError(t, os.Remove(filepath.Join(slot, "sf-initial.sfa")))
+		require.NoError(t, os.Remove(filepath.Join(slot, qwpSfManifestFileName)))
+		createSlotHook.Store(nil)
+	}
+	createSlotHook.Store(&hook)
+	t.Cleanup(func() { createSlotHook.Store(nil) })
+
+	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") +
+		";sf_dir=" + sfDir + ";close_flush_timeout_millis=0;"
+	p, err := newQwpSenderPool(context.Background(), conf, 0, 1,
+		500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.close(context.Background()) })
+
+	total, available, leaked := p.poolSnapshot()
+	require.Zero(t, total)
+	require.Zero(t, available)
+	require.Zero(t, leaked)
+	entries, err := os.ReadDir(slot)
+	require.NoError(t, err)
+	require.Empty(t, entries, "revalidation must abandon the empty path before opening it")
+}
+
 func TestQwpSenderPoolInRangeFence(t *testing.T) {
 	p := &qwpSenderPool{slotBase: "default", maxSize: 3}
 	cases := map[string]bool{
@@ -1137,10 +1213,9 @@ func TestQwpPooledSenderReportsQuarantinedSlotPath(t *testing.T) {
 	qs, ok := lease.(QwpSender)
 	require.True(t, ok)
 
-	entries, err := os.ReadDir(filepath.Join(sfRoot, "quarantined"))
-	require.NoError(t, err)
-	require.Len(t, entries, 1)
-	require.Equal(t, filepath.Join(sfRoot, "quarantined", entries[0].Name()), qs.QuarantinedSlotPath())
+	preserved := filepath.Join(sfRoot, qwpSfDefaultSenderId+"-0"+qwpSfQuarantineSlotInfix+"0")
+	require.DirExists(t, preserved)
+	require.Equal(t, preserved, qs.QuarantinedSlotPath())
 }
 
 // TestQwpSenderQuarantinedSlotPathStandalone pins the same answer on a
@@ -1160,10 +1235,9 @@ func TestQwpSenderQuarantinedSlotPathStandalone(t *testing.T) {
 	qs, ok := ls.(QwpSender)
 	require.True(t, ok)
 
-	entries, err := os.ReadDir(filepath.Join(sfRoot, "quarantined"))
-	require.NoError(t, err)
-	require.Len(t, entries, 1)
-	require.Equal(t, filepath.Join(sfRoot, "quarantined", entries[0].Name()), qs.QuarantinedSlotPath())
+	preserved := filepath.Join(sfRoot, "solo"+qwpSfQuarantineSlotInfix+"0")
+	require.DirExists(t, preserved)
+	require.Equal(t, preserved, qs.QuarantinedSlotPath())
 
 	// A sender that opened a slot it could read set nothing aside.
 	clean, err := LineSenderFromConf(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+
@@ -1235,7 +1309,7 @@ func TestQwpSenderPoolCloseReportsPendingWhileTeardownHoldsFlock(t *testing.T) {
 
 // writeFailClosedSlot lays down a manifest-backed slot whose committed active
 // segment is unreadable, which recovery refuses; a foreground sender preserves
-// such a slot under <sf_dir>/quarantined/ and starts fresh.
+// such a slot beside its original name and starts fresh.
 func writeFailClosedSlot(t *testing.T, slot string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(slot, 0o755))

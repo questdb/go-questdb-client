@@ -168,6 +168,16 @@ type qwpSfCursorEngine struct {
 	slotLock     *qwpSfSlotLock
 	ring         *qwpSfSegmentRing
 
+	// logicalLock is the parent-anchored transition lock for this slot's
+	// pathname, handed over when a construction could not release it before
+	// returning. The cleanup worker releases it after the directory-local lock,
+	// so no other participant can take the pathname while this engine's files
+	// are still owned. nil in the ordinary case, where the constructor released
+	// the lock itself.
+	logicalLockMu       sync.Mutex
+	logicalLock         *qwpSfSlotLock
+	logicalLockReleased bool
+
 	// watermark is the engine-owned mmap'd .ack-watermark file
 	// (sf-client.md §5.4). nil in memory mode and when the file
 	// could not be opened (recovery then falls back to the
@@ -297,22 +307,173 @@ func qwpSfNewCursorEngine(sfDir string, segmentSizeBytes, maxTotalBytes int64, a
 type qwpSfEngineOpenOptions struct {
 	logger            *slog.Logger
 	recoverForeground bool
+	// revalidate runs under the logical slot lock, before the slot is inspected
+	// or opened. A background drainer or pool startup recovery uses it to
+	// re-check the candidacy an earlier scan observed: between that scan and this
+	// lock the slot can have been preserved aside, marked failed, or drained
+	// away. A non-nil error abandons the open without touching the slot. nil
+	// skips the check.
+	revalidate func(slotDir string) error
 }
 
+// qwpSfNewCursorEngineWithOptions opens a slot's cursor engine, holding the
+// parent-anchored logical slot lock across the whole pathname transition:
+// candidacy revalidation, legacy-container inspection, recovery, a failed
+// build's cleanup, quarantine-destination selection, the rename and its
+// barrier, and the fresh slot's creation. The lock is released only once the
+// resulting engine holds the directory-local lock, or once a failed transition
+// is quiescent — otherwise it is handed to the cleanup owner that still holds
+// the slot's resources, because a rename must not race work that can still
+// reach the original pathname.
 func qwpSfNewCursorEngineWithOptions(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (*qwpSfCursorEngine, error) {
 	if options.logger != nil {
 		options.logger = qwpEffectiveLogger(options.logger)
 	}
-	// Where the bytes of a slot this build refused went, carried onto the fresh
-	// engine so the caller can find them without reading the log.
-	quarantinedPath := ""
+	if sfDir == "" {
+		// Memory mode owns no pathname, so there is nothing to serialise.
+		return qwpSfOpenCursorEngineTransition(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, options)
+	}
+	logical, err := qwpSfAcquireLogicalSlotLock(sfDir)
+	if err != nil {
+		return nil, err
+	}
+	e, err := qwpSfOpenCursorEngineTransition(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, options)
+	if err != nil {
+		// A failed construction whose cleanup is still running keeps files,
+		// mappings and the directory-local lock. Its slot pathname must stay
+		// fenced until that owner is done, so hand the logical lock over rather
+		// than releasing it on the way out.
+		if pending := qwpSfPendingCleanupEngine(err); pending.adoptLogicalLock(logical) {
+			return nil, err
+		}
+		if releaseErr := qwpSfReleaseLogicalLock(logical); releaseErr != nil {
+			// Join rather than replace: the original cause, and any quarantine
+			// destination recorded in it, stay matchable. A pre-close failure left
+			// the descriptor and flock intact; transfer that obligation to the same
+			// cleanup-control topology used by failed engine builds rather than
+			// returning an unowned os.File and hoping its finalizer releases it.
+			cause := errors.Join(err, releaseErr)
+			if logical.held() {
+				return nil, qwpSfStartLogicalLockCleanup(sfDir, logical, cause)
+			}
+			return nil, cause
+		}
+		return nil, err
+	}
+	if releaseErr := qwpSfReleaseLogicalLock(logical); releaseErr != nil {
+		// The engine is otherwise ready, but its transition protection is
+		// unresolved, so it must not be handed out as a constructed sender.
+		// Start its cleanup and keep both the engine and any still-held lock
+		// owned until their release obligations are resolved.
+		e.adoptLogicalLock(logical)
+		cleanupErr := e.engineCloseWithCause(releaseErr)
+		result := errors.Join(releaseErr, cleanupErr)
+		if !e.engineCloseCompleted() {
+			return nil, &qwpSfBuildCleanupError{cause: result, engine: e}
+		}
+		return nil, result
+	}
+	return e, nil
+}
+
+// qwpSfStartLogicalLockCleanup gives a retryable logical-lock release its own
+// ordinary engine cleanup owner when construction failed before there was an
+// engine to adopt it. The owner has no manager, ring or directory-local lock;
+// engineCleanupWorker supports that narrow shape and publishes completion,
+// late errors and terminal retention through qwpSfCleanupControl just like a
+// failed full build.
+func qwpSfStartLogicalLockCleanup(sfDir string, logical *qwpSfSlotLock, cause error) error {
+	owner := &qwpSfCursorEngine{sfDir: sfDir}
+	if !owner.adoptLogicalLock(logical) {
+		// This should be unreachable for the held lock checked by the caller. Do
+		// not turn an ownership bug into apparent success.
+		return errors.Join(cause, ErrCleanupFailed,
+			errors.New("qwp/sf: could not transfer the held logical slot lock to cleanup"))
+	}
+	cleanupErr := owner.engineCloseWithCause(cause)
+	result := errors.Join(cause, cleanupErr)
+	if !owner.engineCloseCompleted() {
+		return &qwpSfBuildCleanupError{cause: result, engine: owner}
+	}
+	return result
+}
+
+// qwpSfTestBeforeWholeSlotQuarantineHook runs after the failed build has
+// released its directory-local resources and immediately before candidate
+// selection and rename. It lets concurrency tests exercise the exact gap the
+// parent-anchored logical lock exists to cover.
+var qwpSfTestBeforeWholeSlotQuarantineHook atomic.Pointer[func(slotDir string)]
+
+// qwpSfPendingCleanupEngine returns the engine whose cleanup is still running
+// behind a construction error, or nil. A returned error is not proof that
+// cleanup finished, so ownership decisions ask the engine rather than the
+// error's text.
+func qwpSfPendingCleanupEngine(err error) *qwpSfCursorEngine {
+	var buildErr *qwpSfBuildCleanupError
+	if errors.As(err, &buildErr) && buildErr.engine != nil && !buildErr.engine.engineCloseCompleted() {
+		return buildErr.engine
+	}
+	return nil
+}
+
+// qwpSfOpenCursorEngineTransition runs the recovery/quarantine/fresh-slot
+// transition for one slot pathname. Disk-backed callers hold the logical slot
+// lock for its whole duration.
+func qwpSfOpenCursorEngineTransition(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (*qwpSfCursorEngine, error) {
+	if sfDir != "" {
+		if options.revalidate != nil {
+			if err := options.revalidate(sfDir); err != nil {
+				return nil, err
+			}
+		}
+		if qwpSfIsLegacyQuarantineName(filepath.Base(filepath.Clean(sfDir))) {
+			// Older clients put whole preserved slots under <sf_dir>/quarantined/.
+			// That name is also a legal sender_id, so it is inspected before any
+			// lock file or slot file is created inside it.
+			if err := qwpSfInspectLegacyQuarantinePath(sfDir); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// Where the bytes of slots this build refused went. The first path is
+	// carried onto a successful fresh engine for QuarantinedSlotPath; an error
+	// carries every completed move so a later partial fresh slot is not confused
+	// with the caller's original evidence.
+	var quarantinedPaths []string
+	appendQuarantined := func(path string) {
+		if path == "" {
+			return
+		}
+		for _, existing := range quarantinedPaths {
+			if existing == path {
+				return
+			}
+		}
+		quarantinedPaths = append(quarantinedPaths, path)
+	}
+	// A failure after a completed rename must still name the destination: with
+	// no engine returned, the error is the only channel left, and a diagnostic
+	// that a handler drops cannot be the one that carries it.
+	failed := func(err error) (*qwpSfCursorEngine, error) {
+		if len(quarantinedPaths) == 0 {
+			return nil, err
+		}
+		return nil, &qwpSfQuarantineError{
+			destination:            quarantinedPaths[0],
+			additionalDestinations: append([]string(nil), quarantinedPaths[1:]...),
+			cause:                  err,
+		}
+	}
 	for attempt := 0; ; attempt++ {
 		e, err := qwpSfNewCursorEngineOnce(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, options)
 		if err == nil || sfDir == "" {
-			if e != nil {
-				e.quarantinedPath = quarantinedPath
+			if e != nil && len(quarantinedPaths) > 0 {
+				e.quarantinedPath = quarantinedPaths[0]
 			}
-			return e, err
+			if err != nil {
+				return failed(err)
+			}
+			return e, nil
 		}
 		// The residue retry is the second half of a recovery step that already
 		// completed: the sanitization is on disk and the same bytes recover on
@@ -327,13 +488,25 @@ func qwpSfNewCursorEngineWithOptions(sfDir string, segmentSizeBytes, maxTotalByt
 		// exists to deliver the slot's rows, so it reports the failure and
 		// leaves the bytes where they are.
 		if !options.recoverForeground {
-			return nil, err
+			return failed(err)
 		}
 		if errors.Is(err, qwpSfErrRecoveryFailClosed) && attempt <= 1 {
-			quarantined, quarantineErr := qwpSfQuarantineSlot(sfDir)
+			if hook := qwpSfTestBeforeWholeSlotQuarantineHook.Load(); hook != nil {
+				(*hook)(sfDir)
+			}
+			quarantined, quarantineErr := qwpSfQuarantineSlot(sfDir, err.Error(), options.logger)
 			if quarantineErr != nil {
-				return nil, errors.Join(err,
-					qwpSfDurabilityError("quarantine fail-closed slot", sfDir, quarantineErr))
+				// A rename that completed before a later step failed still moved
+				// the bytes. Keep that destination reportable through the error,
+				// which is the only channel left when no engine is returned.
+				for _, done := range qwpSfQuarantineDestinations(quarantineErr) {
+					appendQuarantined(done)
+				}
+				var transitionErr error = fmt.Errorf("qwp/sf: quarantine fail-closed slot %s: %w", sfDir, quarantineErr)
+				if errors.Is(quarantineErr, ErrSfDurability) {
+					transitionErr = qwpSfDurabilityError("quarantine fail-closed slot", sfDir, quarantineErr)
+				}
+				return failed(errors.Join(err, transitionErr))
 			}
 			qwpEffectiveLogger(options.logger).Error("qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
 			// Keep the first preserved directory. The loop can quarantine
@@ -341,12 +514,10 @@ func qwpSfNewCursorEngineWithOptions(sfDir string, segmentSizeBytes, maxTotalByt
 			// looking for -- the second is whatever the fresh slot managed to
 			// write before failing again. Reporting the later one would send
 			// the caller to a near-empty directory.
-			if quarantinedPath == "" {
-				quarantinedPath = quarantined
-			}
+			appendQuarantined(quarantined)
 			continue
 		}
-		return nil, err
+		return failed(err)
 	}
 }
 

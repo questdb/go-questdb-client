@@ -322,7 +322,15 @@ func (p *qwpSenderPool) recoverStrandedSlots(ctx context.Context) {
 			continue
 		}
 		dir := filepath.Join(p.sfDir, p.slotBase+"-"+strconv.Itoa(i))
-		if !qwpSfIsCandidateOrphan(dir) {
+		candidate, candidateErr := qwpSfCandidateOrphan(dir)
+		if candidateErr != nil {
+			if errors.Is(candidateErr, ErrSfDurability) {
+				qwpEffectiveLogger(p.logger).Error("qwp/sf: sender pool could not inspect a recovery slot; leaving it eligible for a later startup",
+					"slot", dir, "error", candidateErr)
+			}
+			continue
+		}
+		if !candidate {
 			continue
 		}
 		if err := p.withLock("reserve recovery slot", nil, func() {
@@ -330,7 +338,11 @@ func (p *qwpSenderPool) recoverStrandedSlots(ctx context.Context) {
 		}); err != nil {
 			return
 		}
-		slot, err := p.createSlotAt(ctx, i, true)
+		slot, err := p.createSlotAt(ctx, i, true, qwpSfRequireCandidateForAdoption)
+		if err != nil && errors.Is(err, ErrSfDurability) {
+			qwpEffectiveLogger(p.logger).Error("qwp/sf: sender pool could not revalidate or open a recovery slot; leaving it eligible for a later startup",
+				"slot", dir, "error", err)
+		}
 		if lockErr := p.withLock("finish recovery slot", []*qwpSenderSlot{slot}, func() {
 			if err != nil {
 				p.reclaimFailedBuildLocked(slot, i, err)
@@ -438,7 +450,7 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			bctx, cancel := context.WithDeadline(ctx, deadline)
 			resultCh := make(chan *qwpSenderSlot, 1)
 			errCh := make(chan error, 1)
-			go func() { slot, err := p.createSlotAt(bctx, index, true); resultCh <- slot; errCh <- err }()
+			go func() { slot, err := p.createSlotAt(bctx, index, true, nil); resultCh <- slot; errCh <- err }()
 			timer := time.NewTimer(time.Until(deadline))
 			select {
 			case slot := <-resultCh:
@@ -1003,7 +1015,7 @@ func (p *qwpSenderPool) createSlot(ctx context.Context, async bool) (*qwpSenderS
 	}); err != nil {
 		return nil, err
 	}
-	slot, err := p.createSlotAt(ctx, slotIndex, async)
+	slot, err := p.createSlotAt(ctx, slotIndex, async, nil)
 	lockErr := p.withLock("finish initial sender", []*qwpSenderSlot{slot}, func() {
 		if err != nil {
 			p.reclaimFailedBuildLocked(slot, slotIndex, err)
@@ -1029,8 +1041,10 @@ func (p *qwpSenderPool) reclaimFailedBuildLocked(slot *qwpSenderSlot, slotIndex 
 // createSlotAt builds a sender bound to slotIndex (-1 in memory mode). It parses
 // a fresh config from the base string and overrides the per-slot identity, the
 // in-range orphan fence, the ingest callbacks, and (for recovery) async connect.
-// Guarded against a panic in the heavy build path (Hazard I).
-func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async bool) (slot *qwpSenderSlot, err error) {
+// revalidate is non-nil only for startup adoption of a previously scanned slot;
+// the cursor runs it under the parent-anchored logical lock. Guarded against a
+// panic in the heavy build path (Hazard I).
+func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async bool, revalidate func(string) error) (slot *qwpSenderSlot, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// A panic that left an engine behind carries its cleanup reporter,
@@ -1062,6 +1076,7 @@ func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async b
 	if p.storeAndForward {
 		cfg.senderId = p.slotBase + "-" + strconv.Itoa(slotIndex)
 		cfg.orphanDrainExclude = p.inRangeFence
+		cfg.sfOpenRevalidate = revalidate
 	}
 	if async {
 		cfg.initialConnectMode = InitialConnectAsync

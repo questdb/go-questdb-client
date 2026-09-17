@@ -300,10 +300,10 @@ var qwpSfManifestQuarantineRename = qwpSfSwappable(os.Rename)
 //
 // A rename failure is always reported as a retriable local-storage error,
 // never as fail-closed. Fail-closed is a permanent verdict — a foreground
-// sender moves the slot's rows into quarantined/, where nothing scans for
-// them again, and a drainer writes the .failed sentinel that disqualifies
-// the slot from every later adoption — so it may only follow from what the
-// slot's bytes say. A rename failure is an environmental fault, and no
+// sender preserves the slot beside its original name, where nothing scans for
+// its rows again; a drainer instead leaves the slot in place and writes the
+// .failed sentinel. Both outcomes disqualify the bytes from later adoption, so
+// either may only follow from what the slot's bytes say. A rename failure is an environmental fault, and no
 // environmental fault is provably permanent: full disks empty, read-only
 // mounts get remounted, permissions get fixed. Reporting it retriably means
 // construction for that sender_id fails until the fault clears and then

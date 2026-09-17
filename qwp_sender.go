@@ -218,14 +218,29 @@ type QwpSender interface {
 	//
 	// For a borrowed sender, save this path before calling Close to return
 	// the sender to the pool. Afterwards, this method always returns "",
-	// even if the client set aside a damaged slot in quarantined/.
+	// even if the client set a damaged slot aside.
 	//
-	// A slot whose recovery proves it inconsistent is preserved whole
-	// under <sf_dir>/quarantined/<sender_id>-<nanos>/ and the sender
-	// starts fresh, so ingestion continues while the unsent rows stay on
-	// disk. Nothing in the client ever removes that copy or counts it
-	// against sf_max_total_bytes — it is the only copy of those rows, so
-	// reclaiming it is the operator's call.
+	// A slot whose recovery proves it inconsistent is preserved whole as a
+	// sibling of the original, at <sf_dir>/<sender_id>.unreplayable-<n>,
+	// and the sender starts fresh, so ingestion continues while the unsent
+	// rows stay on disk. <n> is the first free index in 0..63; an occupied
+	// name is never overwritten. When all of them are occupied, or the
+	// transition cannot complete, construction fails instead: an error
+	// returned by the constructor names every destination that attempt did
+	// produce, distinguishing the first copy from any later partial fresh
+	// slot, so a caller can find the bytes even when no sender is returned.
+	// Nothing in the client ever removes that copy or counts it against
+	// sf_max_total_bytes — it is the only copy of those rows, so
+	// reclaiming it is the operator's call. Preserved copies are excluded
+	// from automatic adoption by name, independently of the best-effort
+	// .failed marker written inside them.
+	//
+	// This is a historical report of what this sender did during its own
+	// construction, not a live check: it does not verify that the directory
+	// still exists or that the bytes are durable, and it is not a record
+	// that survives a crash. See the README's "Quarantined slots" section,
+	// including its guarantees-and-limits list, for the sharing, atomicity
+	// and platform bounds that apply.
 	QuarantinedSlotPath() string
 
 	// SlotLockReleased reports whether a standalone sender has released its

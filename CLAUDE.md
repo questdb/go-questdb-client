@@ -180,9 +180,25 @@ unsupported**.
 
 Quarantined evidence is operator-owned; the client must not reclaim it to regain
 capacity. `.corrupt` files inside live slots count against `sf_max_total_bytes`;
-whole-slot copies under `quarantined/` do not. See README's "Quarantined slots" for
-locations and operational recovery. Failed scans retain the previous accounting;
-periodic reconciliation is not a hard detection-latency guarantee. Inspect manager
+whole-slot copies do not. A refused slot is preserved as a sibling under the
+reserved `.unreplayable-` namespace, which every adoption route excludes **by
+name**, independently of the best-effort `.failed` marker. The nested
+`quarantined/` container is a legacy layout: existing copies stay untouched, and
+that name is also a valid sender ID. The slot pathname's close/rename/recreate
+transition is serialised by the parent-anchored lock in `qwp_sf_logical_lock.go`;
+its files deliberately remain in place because unlinking a lock pathname can
+split owners across two inodes. Start there, with `qwp_sf_quarantine.go` and
+`qwp_sf_orphan.go`, before changing naming, exclusion, or transition ownership.
+Read README's "Quarantined slots",
+**including its "Guarantees and limits" subsection**, and the
+`QuarantinedSlotPath` / `WithSenderId` Go docs before classifying an accepted
+refusal (destination exhaustion, an over-long name, an ambiguous legacy
+container), a retained resource, a missing best-effort marker or diagnostic, or
+an unsupported sharing mode as a defect. Those bounds do not excuse false
+success, lost ownership, or destroyed evidence.
+
+Failed scans retain the previous accounting; periodic reconciliation is not a
+hard detection-latency guarantee. Inspect manager
 code and tests for scheduling and accounting details.
 
 `ErrBackpressureTimeout` and `ErrSfDurability` identify non-terminal backpressure

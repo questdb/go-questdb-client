@@ -200,9 +200,10 @@ func TestQwpSfQuarantineCreationDebrisPreservesEvidence(t *testing.T) {
 // TestQwpSfQuarantineFaultIsRetriableNeverFailClosed pins retry-always: no
 // filesystem fault out of the manifest quarantine condemns the slot.
 // Fail-closed is a permanent verdict — a foreground sender moves the slot's
-// rows into quarantined/, where nothing scans for them again, and a drainer
-// writes the .failed sentinel that disqualifies the slot from every later
-// adoption — so it may only follow from what the slot's bytes say. A rename
+// rows beside the slot, where nothing scans for them again; a drainer instead
+// leaves the slot in place and writes the .failed sentinel. Both outcomes
+// disqualify the bytes from later adoption, so either may only follow from what
+// the slot's bytes say. A rename
 // failure says nothing about them: full disks empty, read-only mounts get
 // remounted, permissions get fixed. Every fault is reported as the retriable
 // ErrSfDurability class, with the syscall cause reachable via errors.Is, and

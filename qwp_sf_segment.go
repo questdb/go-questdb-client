@@ -284,8 +284,9 @@ func qwpSfCreateInMemorySegment(baseSeq, sizeBytes int64) (*qwpSfSegment, error)
 // file to .corrupt and migrating the rest of the chain would drop rows that are
 // still on disk. It is not operational either, because no later attempt by this
 // build can read it. Failing closed is what preserves the entire slot under
-// <sf_dir>/quarantined/ and lets the foreground sender start a fresh one, so
-// ingestion continues and a newer client can still be pointed at the bytes.
+// <sf_dir>/<sender_id>.unreplayable-<n> and lets the foreground sender start a
+// fresh one, so ingestion continues while the operator retains the evidence for
+// inspection or a separate recovery workflow.
 func qwpSfOpenSegment(path string) (result *qwpSfSegment, err error) {
 	st, err := os.Stat(path)
 	if err != nil {

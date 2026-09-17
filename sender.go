@@ -469,6 +469,10 @@ type lineSenderConfig struct {
 	// to its in-range slot set so a pooled sender never adopts a live sibling's
 	// dir (Hazard G). nil for standalone senders. Internal; no connect-string key.
 	orphanDrainExclude func(slotName string) bool
+	// sfOpenRevalidate runs under the parent-anchored logical lock before this
+	// sender opens its own slot. Pool startup recovery sets it after an earlier
+	// candidate scan; ordinary foreground construction leaves it nil.
+	sfOpenRevalidate func(slotDir string) error
 
 	// Durable-ack (request_durable_ack). QWP-only, Enterprise primary-replication
 	// QoS. When true, the send loop trims / replays / awaits on the server's
@@ -751,6 +755,14 @@ func WithSfDir(dir string) LineSenderOption {
 // uniquely identifies this sender's slot. Defaults to "default";
 // multi-sender deployments must set distinct IDs to avoid lock
 // collisions on the same slot. Only meaningful when sf_dir is set.
+//
+// The id also fixes the names the client reserves beside the slot: a refused
+// slot is preserved at <sf_dir>/<id>.unreplayable-<n>, and the slot's pathname
+// lock lives under <sf_dir>/.slot-locks/. An id long enough to push a
+// preservation name past the client's bounded length makes that preservation
+// fail rather than truncate into another id's namespace. Share an sf_dir only
+// with clients that use the same reserved names and locking protocol; see the
+// README's "Quarantined slots" section for the restrictions and limits.
 //
 // Only available for the QWP sender.
 func WithSenderId(id string) LineSenderOption {

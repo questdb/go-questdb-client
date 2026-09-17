@@ -144,9 +144,15 @@ func (e *qwpSfCursorEngine) engineCleanupWorker(cause error) {
 			e.retainFailedCleanup(err)
 		}
 	}()
-	// Ask both the manager and send loop to stop before waiting for them.
-	// The manager only signals that it has stopped; this worker does cleanup.
-	managerDone := e.manager.segmentManagerStop()
+	// Ask both the manager and send loop to stop before waiting for them. A
+	// logical-lock-only cleanup owner has no segment manager: it exists solely
+	// to retain and retry a transition lock after construction failed before an
+	// engine could be built. A real manager only signals that it has stopped;
+	// this worker does cleanup.
+	var managerDone <-chan struct{}
+	if e.manager != nil {
+		managerDone = e.manager.segmentManagerStop()
+	}
 	if reader := e.reader.Load(); reader != nil {
 		cause = errors.Join(cause, qwpRunCleanupPhaseGuarded("send loop", reader.sendLoopClose))
 		// After a panic, the reader may still be running. Keep its mapped memory.
@@ -156,13 +162,17 @@ func (e *qwpSfCursorEngine) engineCleanupWorker(cause error) {
 			return
 		}
 	}
-	<-managerDone
+	if managerDone != nil {
+		<-managerDone
+	}
 	cause = e.closeRejectedTransports(cause)
 	// A manager panic may have interrupted opening or removing a segment.
 	// Keep its resources: we cannot safely retry a partly completed operation.
-	if err := e.manager.managerWorkerError(); err != nil {
-		e.retainFailedCleanup(errors.Join(cause, ErrCleanupFailed, err))
-		return
+	if e.manager != nil {
+		if err := e.manager.managerWorkerError(); err != nil {
+			e.retainFailedCleanup(errors.Join(cause, ErrCleanupFailed, err))
+			return
+		}
 	}
 	if errors.Is(cause, ErrCleanupFailed) {
 		e.retainFailedCleanup(cause)
@@ -191,13 +201,30 @@ func (e *qwpSfCursorEngine) engineCleanupWorker(cause error) {
 				return
 			}
 			if e.slotLock == nil || e.slotLock.file == nil {
-				e.cleanup.publish(result, true, true)
-				// The caller may already have stopped waiting. Log the error even
-				// if the file handles were closed and all resources were released.
-				if err != nil || lockErr != nil {
-					qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: cleanup completed with error", "slot", e.sfDir, "error", result)
+				// A construction that could not release the slot's pathname lock
+				// handed it here. Releasing it after the directory-local lock is
+				// what lets another participant take the pathname, so it happens
+				// only now, with this engine's files already released.
+				logicalErr := qwpRunCleanupPhaseGuarded("logical slot lock", e.releaseAdoptedLogicalLock)
+				result = errors.Join(result, logicalErr)
+				if errors.Is(result, ErrCleanupFailed) {
+					e.retainFailedCleanup(result)
+					return
 				}
-				return
+				if !e.logicalLockHeld() {
+					// Logical lock files deliberately remain in place. Unlinking a
+					// lock pathname is unsafe even while holding its flock: another
+					// process can already have opened the old inode but not yet tried
+					// to lock it, then race a successor that creates a new inode at
+					// the freed pathname. Stale files are harmless and reusable.
+					e.cleanup.publish(result, true, true)
+					// The caller may already have stopped waiting. Log the error even
+					// if the file handles were closed and all resources were released.
+					if err != nil || lockErr != nil || logicalErr != nil {
+						qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: cleanup completed with error", "slot", e.sfDir, "error", result)
+					}
+					return
+				}
 			}
 		}
 		e.cleanup.publish(result, false, false)

@@ -1001,10 +1001,7 @@ func TestQwpSfForegroundStartsFreshOverUnreadableSegmentVersion(t *testing.T) {
 	assert.False(t, engine.engineWasRecoveredFromDisk())
 	require.NoError(t, engine.engineClose())
 
-	entries, err := os.ReadDir(filepath.Join(root, "quarantined"))
-	require.NoError(t, err)
-	require.Len(t, entries, 1)
-	preserved, err := os.ReadFile(filepath.Join(root, "quarantined", entries[0].Name(), "sf-initial.sfa"))
+	preserved, err := os.ReadFile(filepath.Join(root, "sender-a"+qwpSfQuarantineSlotInfix+"0", "sf-initial.sfa"))
 	require.NoError(t, err)
 	assert.Equal(t, qwpSfSegmentVersion+1, preserved[4],
 		"the unreadable segment must be preserved byte-for-byte, not rewritten or renamed as corruption")
@@ -1026,15 +1023,15 @@ func TestQwpSfForegroundFailClosedQuarantinesAndStartsFresh(t *testing.T) {
 	assert.False(t, engine.engineWasRecoveredFromDisk())
 	require.NoError(t, engine.engineClose())
 
-	quarantineRoot := filepath.Join(root, "quarantined")
-	entries, err := os.ReadDir(quarantineRoot)
-	require.NoError(t, err)
-	require.Len(t, entries, 1)
-	assert.False(t, qwpSfIsCandidateOrphan(quarantineRoot))
+	// The copy is a sibling of the slot, in the namespace every participating
+	// client excludes from adoption by name.
+	preserved := filepath.Join(root, "sender-a"+qwpSfQuarantineSlotInfix+"0")
+	require.DirExists(t, preserved)
+	assert.False(t, qwpSfIsCandidateOrphan(preserved))
 
 	// Nothing reclaims that copy, so the sender has to be able to say where it
 	// put it — reading the log must not be the only way to find the rows.
-	assert.Equal(t, filepath.Join(quarantineRoot, entries[0].Name()), engine.engineQuarantinedSlotPath())
+	assert.Equal(t, preserved, engine.engineQuarantinedSlotPath())
 }
 
 // TestQwpSfEngineQuarantinedSlotPathEmptyWithoutQuarantine pins the other
@@ -1099,8 +1096,8 @@ func snapshotAllContents(t *testing.T, dir string) map[string]string {
 // succeed -- zeroing dead bytes, flagging headers, creating and removing the
 // manifest, removing files it proves stale -- so "we failed closed" is only
 // safe if none of that can reach a frame the boundaries still account for. A
-// fail-closed slot is handed to an operator or to a newer client, and both are
-// reading the bytes that are left.
+// fail-closed slot is handed to an operator or a deliberately isolated
+// recovery workflow, and both are reading the bytes that are left.
 //
 // Each case is a slot that fails closed for a different reason. The check is
 // content, not names: preserving a file by renaming it to .corrupt is allowed,

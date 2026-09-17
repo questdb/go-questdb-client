@@ -399,8 +399,28 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 
 	engine, err := qwpSfNewCursorEngineWithOptions(d.slotPath, d.segmentSize, d.sfMaxTotalBytes, qwpSfEngineDefaultAppendDeadline, qwpSfEngineOpenOptions{
 		logger: d.logger,
+		// The scan that queued this drainer happened earlier, possibly before a
+		// foreground sender preserved the slot aside or marked it failed. Under
+		// the logical slot lock, the complete candidate decision is taken again
+		// against what is on disk now. A slot that was preserved, marked failed,
+		// removed, or fully drained is abandoned without opening it.
+		revalidate: qwpSfRequireCandidateForAdoption,
 	})
 	if err != nil {
+		if errors.Is(err, qwpSfErrSlotNotAdoptable) && !errors.Is(err, ErrSfDurability) {
+			// Not a fault and not evidence about the bytes: the slot stopped
+			// being adoptable between the scan and this lock. Leave it alone. A
+			// fully drained candidate is successful; other lifecycle races use
+			// the existing skipped/locked outcome.
+			qwpEffectiveLogger(d.logger).Debug("qwp/sf: orphan drainer skipped a slot that is no longer adoptable",
+				"slot", d.slotPath, "reason", err)
+			outcome := qwpSfDrainOutcomeLockedByOther
+			if errors.Is(err, qwpSfErrSlotAlreadyDrained) {
+				outcome = qwpSfDrainOutcomeSuccess
+			}
+			d.outcome.Store(int32(outcome))
+			return
+		}
 		var buildErr *qwpSfBuildCleanupError
 		if errors.As(err, &buildErr) {
 			d.cleanupMu.Lock()

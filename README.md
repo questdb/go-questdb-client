@@ -738,8 +738,9 @@ saved queue still cause recovery to refuse the slot, as described below.
 #### Quarantined slots
 
 If a slot's on-disk state proves inconsistent, the sender does not delete it and
-does not try to salvage it. It preserves the whole slot directory under
-`<sf_dir>/quarantined/<sender_id>-<nanos>/`, starts fresh on an empty slot so
+does not try to salvage it. It preserves the whole slot directory as a sibling
+of the original, under the reserved namespace
+`<sf_dir>/<sender_id>.unreplayable-<n>/`, starts fresh on an empty slot so
 ingestion continues, and reports where the bytes went:
 
 ```go
@@ -749,6 +750,30 @@ if qs, ok := sender.(qdb.QwpSender); ok {
 	}
 }
 ```
+
+`<n>` is the first free index in `0..63`; an occupied name is never overwritten,
+so earlier copies survive. The client picks the same names as the Java client
+and, like it, excludes any directory whose name contains `.unreplayable-` from
+automatic adoption — by name, regardless of what the directory holds. A valid
+`sender_id` cannot contain a dot, so the namespace cannot collide with a
+configured slot.
+
+When all 64 destinations for a slot name are occupied, the sender refuses to
+start instead of minting a 65th copy or reclaiming an old one. The refusal names
+the slot and needs an operator: move or remove the preserved copies, then retry.
+
+A quarantined copy also gets a `.failed` file recording the reason, if one can
+be written and no entry of that name already exists. An existing `.failed` is
+kept exactly as it is, including when this client would have written a different
+reason. Neither the marker's presence nor its contents affect exclusion.
+
+Older versions of this client used a nested container,
+`<sf_dir>/quarantined/<sender_id>-<nanos>/`. Existing copies are left exactly
+where they are: nothing flattens, renames, scans, reclaims or resumes them. The
+name `quarantined` is also a legal `sender_id`; a sender configured with it
+starts normally when the path is absent, empty, or holds only ordinary slot
+files, and refuses to start when the directory holds child directories or
+symlinks that could be an older client's evidence.
 
 An individual file excluded from a validated queue because its segment header
 is unreadable is preserved by renaming it in place to `<name>.sfa.corrupt`.
@@ -771,9 +796,77 @@ non-terminal, retry-the-call contract as running out of space for live data.
 The manager counts these files when it opens the slot. While the byte limit
 blocks a new segment, it rescans the slot at most once per second. This means it
 notices deleted `.corrupt` files within one second without scanning on every
-1 ms poll. If a scan fails, it keeps the previous byte count. Full slot copies
-under `quarantined/` do not count toward a slot's limit. The operator owns these
-copies.
+1 ms poll. If a scan fails, it keeps the previous byte count. Whole-slot copies
+under `.unreplayable-<n>`, and under the older `quarantined/` container, do not
+count toward a slot's limit and are never reclaimed to regain capacity. The
+operator owns these copies.
+
+##### Guarantees and limits
+
+These bounds apply to quarantine and to the slot-name locking around it. Read
+them before treating a refusal, a retained resource or a missing marker as a
+defect.
+
+- **Cooperating participants only.** A slot's close → rename → recreate
+  transition is serialised by a parent-anchored lock under
+  `<sf_dir>/.slot-locks/`, which this client takes before opening a slot and
+  before adopting an orphan. It protects processes that use this protocol, on
+  filesystems providing the advisory locking and rename semantics it relies on.
+  It does not protect against an operator moving files, an incompatible or older
+  client that never takes the lock, or a host where advisory locks do not work.
+  Share an `sf_dir` only between participants you have verified; stopping orphan
+  adoption alone is not sufficient, because an older foreground sender can still
+  create the legacy `quarantined/` container. Treat lock files as opaque
+  metadata and do not delete them: this client deliberately reuses stale lock
+  files rather than unlinking a pathname that another process may already have
+  open. The namespace and locking layout were inspected at QuestDB Java client
+  revision `981bdb02a471f3b290c89b8e78cbc422610e329e`; that is evidence about
+  that revision, not a minimum compatible release or proof of live cross-client
+  interoperability. Concurrent Go/Java transitions and every filesystem/OS
+  combination have not been integration-tested. Verify every deployed client
+  participates in a compatible lock lifecycle before sharing an `sf_dir`.
+  Stop incompatible writers and drainers before upgrading a root, or isolate
+  them in separate roots; disabling orphan adoption alone is insufficient. Do
+  not rename or remove slot, quarantine, or lock paths while participants run.
+- **Offline reuse does not change formats.** This layout change does not alter
+  ordinary slot payload formats, but offline reuse remains subject to the
+  existing format and migration restrictions, including the unsupported
+  downgrade after legacy Go-slot migration. Do not rename or repoint preserved
+  evidence into an ordinary slot merely to make a client replay it.
+- **Preservation is not backup.** Quarantine does not overwrite, delete, replay
+  or reclaim what it moves, but it does not repair damage recovery already
+  found, and it cannot protect a copy from later storage failure, another
+  program, or an operator. Recovery steps that ran before the handoff, such as
+  the damaged-tail policy above, still applied.
+- **The transition is not atomic.** Renaming the old slot and creating the fresh
+  one are separate steps with no rollback. A failure after the rename reports
+  the destination that already exists rather than pretending nothing happened;
+  the slot can be left preserved with no fresh slot in place, and cleanup may
+  still own resources. Crash behaviour is bounded by the same platform
+  guarantees as the rest of SF: process restart, host crash and power loss are
+  not equivalent, the Windows directory barrier is a no-op, and Darwin `fsync`
+  is not `F_FULLFSYNC`.
+- **Refusals are conditional, not timed.** The 64-destination policy bounds how
+  many copies one slot name may accumulate. It says nothing about how long a
+  quarantine takes, how much disk it uses, or whether one succeeds at all:
+  inspection, rename or barrier failures, an over-long destination name, or an
+  unresolved lock can each refuse construction. Nothing is deleted to make
+  progress.
+- **Markers and logs are best-effort.** A `.failed` marker may be missing or
+  incomplete, and diagnostics may be filtered, discarded or lost. Neither is a
+  condition for excluding a preserved copy from adoption. Application logging
+  handlers keep the restrictions documented on `WithLogger`.
+- **Legacy-container refusals are deliberately conservative.** An unrelated
+  child directory under a `quarantined` slot name causes a refusal, including
+  for case variants such as `Quarantined` on a case-sensitive filesystem. That
+  is a request for a human look, not a corruption verdict, and it never
+  authorises the client to move or delete anything. A permission or I/O failure
+  while inspecting is reported as the operational fault it is.
+- **Reporting is historical.** `QuarantinedSlotPath` reports where this sender
+  put bytes during its own construction. It is not a live check that the
+  directory still exists, a durability receipt, or a record that survives a
+  crash. See the [shutdown and ownership](#qwp-shutdown-and-ownership) section
+  for what a returned `Close` does and does not prove.
 
 ## Querying
 

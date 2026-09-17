@@ -97,6 +97,14 @@ func qwpSfAcquireSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 	}
 	lockPath := filepath.Join(slotDir, qwpSfLockFileName)
 	pidPath := filepath.Join(slotDir, qwpSfLockPidFileName)
+	return qwpSfAcquireLockAt(slotDir, lockPath, pidPath)
+}
+
+// qwpSfAcquireLockAt flocks lockPath on behalf of slotDir and records the
+// holder in pidPath. The directory-local lock and the parent-anchored logical
+// lock share it so the two can never drift apart in contention reporting or
+// release semantics. It does not create either file's parent directory.
+func qwpSfAcquireLockAt(slotDir, lockPath, pidPath string) (*qwpSfSlotLock, error) {
 	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, qwpSfDurabilityError("open slot lock file", lockPath, err)
@@ -178,6 +186,14 @@ func qwpSfWritePid(pidPath string) {
 // slotPath returns the slot directory this lock guards.
 func (l *qwpSfSlotLock) slotPath() string {
 	return l.slotDir
+}
+
+// held reports whether this lock still owns a descriptor. A close that failed
+// before the descriptor was consumed leaves the lock held and its release
+// retryable; a close that failed while consuming it does not, and the OS state
+// is then unknown — see qwpSfReleaseLogicalLock.
+func (l *qwpSfSlotLock) held() bool {
+	return l != nil && l.file != nil
 }
 
 // close releases the lock by closing the underlying file. We do NOT

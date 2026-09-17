@@ -35,7 +35,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 )
 
 // Recovery keeps readable data that still needs sending, even if a later
@@ -833,21 +832,6 @@ func qwpSfBoundedSuffixPath(path, suffix string) string {
 	return dir + name[:keep] + tag + suffix
 }
 
-func qwpSfQuarantineSlot(slotDir string) (string, error) {
-	parent := filepath.Dir(slotDir)
-	quarantineDir := filepath.Join(parent, "quarantined")
-	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
-		return "", qwpSfDurabilityError("create quarantine directory", quarantineDir, err)
-	}
-	target := filepath.Join(quarantineDir, fmt.Sprintf("%s-%d", filepath.Base(slotDir), time.Now().UnixNano()))
-	if err := os.Rename(slotDir, target); err != nil {
-		return "", qwpSfDurabilityError("quarantine slot as "+target, slotDir, err)
-	}
-	if err := qwpSfSyncSlotDir(parent); err != nil {
-		return "", qwpSfDurabilityError("sync slot parent after quarantine", parent, err)
-	}
-	if err := qwpSfSyncSlotDir(quarantineDir); err != nil {
-		return "", qwpSfDurabilityError("sync quarantine directory", quarantineDir, err)
-	}
-	return target, nil
-}
+// Whole-slot quarantine lives in qwp_sf_quarantine.go: a refused slot is
+// preserved as a sibling under the reserved .unreplayable- namespace, which
+// every participating client excludes from adoption by name.

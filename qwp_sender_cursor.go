@@ -204,6 +204,7 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 	engine, err := qwpSfNewCursorEngineWithOptions(slotPath, sfMaxSegmentBytes, sfMaxTotalBytes, appendDeadline, qwpSfEngineOpenOptions{
 		logger:            conf.logger,
 		recoverForeground: true,
+		revalidate:        conf.sfOpenRevalidate,
 	})
 	if err != nil {
 		return nil, err
@@ -477,10 +478,10 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		ownSlot := filepath.Base(slotPath)
 		// Exclude this sender's own slot always, plus any slot the pool fences
 		// off as a live in-range sibling (Hazard G); nil fence on standalone.
-		orphans := qwpSfScanOrphans(conf.sfDir, func(name string) bool {
+		orphans := qwpSfScanOrphansWithLogger(conf.sfDir, func(name string) bool {
 			return name == ownSlot ||
 				(conf.orphanDrainExclude != nil && conf.orphanDrainExclude(name))
-		})
+		}, loop.logger)
 		if len(orphans) > 0 {
 			pool := qwpSfNewDrainerPool(maxDrainers)
 			// Publish the pool onto the sender before submitting any

@@ -414,6 +414,12 @@ func TestQwpFacadeWaitsForActualHousekeeperExit(t *testing.T) {
 
 func TestQwpFacadeTracksOrphanEngineAfterDrainerExit(t *testing.T) {
 	dir := t.TempDir()
+	// Keep this a real adoption candidate while still giving the drainer no
+	// frames to send. Stale empty paths are now rejected under the logical lock
+	// before an engine is opened.
+	manifest, err := qwpSfManifestCreate(dir, 4, 4)
+	require.NoError(t, err)
+	require.NoError(t, manifest.close())
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(release) })
@@ -442,7 +448,7 @@ func TestQwpFacadeTracksOrphanEngineAfterDrainerExit(t *testing.T) {
 	db := cleanupTestFacade(closedSfPoolWithRetiredSlot(&qwpLineSender{drainerPool: pool}), nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	err := db.Close(ctx)
+	err = db.Close(ctx)
 	require.ErrorIs(t, err, ErrSfCleanupPending)
 	lock, err := qwpSfAcquireSlotLock(dir)
 	if lock != nil {

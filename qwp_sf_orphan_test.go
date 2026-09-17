@@ -61,6 +61,12 @@ func TestQwpSfScanOrphansFindsCandidates(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "orphan-4"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orphan-4", ".lock"), []byte{}, 0o644))
 
+	// Internal parent-lock metadata is never a slot, even if an unrelated file
+	// in it happens to use a segment-looking suffix.
+	logicalLocks := filepath.Join(root, qwpSfLogicalLockDirName)
+	require.NoError(t, os.MkdirAll(logicalLocks, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(logicalLocks, "noise.sfa"), []byte{}, 0o644))
+
 	// own-slot: filtered by name
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "own-slot"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "own-slot", "sf-x.sfa"), []byte{}, 0o644))
@@ -70,7 +76,19 @@ func TestQwpSfScanOrphansFindsCandidates(t *testing.T) {
 	assert.Equal(t, filepath.Join(root, "orphan-1"), orphans[0])
 }
 
-func TestQwpSfManifestOnlySlotIsCandidateButQuarantineRootIsNot(t *testing.T) {
+// TestQwpSfDanglingFailedMarkerDisqualifiesOrphan pins Lstat-based marker
+// ownership: a marker entry is sufficient, and its external target is never
+// followed merely to decide whether this client may adopt the slot.
+func TestQwpSfDanglingFailedMarkerDisqualifiesOrphan(t *testing.T) {
+	root := t.TempDir()
+	slot := filepath.Join(root, "orphan")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(slot, "sf-x.sfa"), []byte("queued"), 0o644))
+	qwpSfTestSymlink(t, filepath.Join(root, "missing-target"), filepath.Join(slot, qwpSfFailedSentinelName))
+	assert.False(t, qwpSfIsCandidateOrphan(slot))
+}
+
+func TestQwpSfManifestOnlySlotIsCandidateButQuarantineEvidenceIsNot(t *testing.T) {
 	root := t.TempDir()
 	slot := filepath.Join(root, "manifest-only")
 	require.NoError(t, os.MkdirAll(slot, 0o755))
@@ -79,10 +97,18 @@ func TestQwpSfManifestOnlySlotIsCandidateButQuarantineRootIsNot(t *testing.T) {
 	require.NoError(t, m.close())
 	assert.True(t, qwpSfIsCandidateOrphan(slot))
 
-	quarantineRoot := filepath.Join(root, "quarantined")
-	require.NoError(t, os.MkdirAll(filepath.Join(quarantineRoot, "sender-1"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(quarantineRoot, "sender-1", "sf-initial.sfa"), []byte("preserved"), 0o644))
-	assert.False(t, qwpSfIsCandidateOrphan(quarantineRoot))
+	// A preserved copy holds exactly what a candidate holds; only its name
+	// keeps it out of adoption.
+	preserved := filepath.Join(root, "sender-1"+qwpSfQuarantineSlotInfix+"0")
+	require.NoError(t, os.MkdirAll(preserved, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(preserved, "sf-initial.sfa"), []byte("preserved"), 0o644))
+	assert.False(t, qwpSfIsCandidateOrphan(preserved))
+
+	// An older client's container keeps its nested evidence out of reach too.
+	legacyRoot := filepath.Join(root, "quarantined")
+	require.NoError(t, os.MkdirAll(filepath.Join(legacyRoot, "sender-1"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(legacyRoot, "sender-1", "sf-initial.sfa"), []byte("preserved"), 0o644))
+	assert.False(t, qwpSfIsCandidateOrphan(legacyRoot))
 }
 
 func TestQwpSfDrainerHandlesManifestOnlySlots(t *testing.T) {
@@ -185,6 +211,9 @@ func TestQwpSfDrainerSkipsLockedSlot(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
+	manifest, err := qwpSfManifestCreate(dir, 4, 4)
+	require.NoError(t, err)
+	require.NoError(t, manifest.close())
 	// Hold the slot lock for the duration of the drainer's run.
 	lock, err := qwpSfAcquireSlotLock(dir)
 	require.NoError(t, err)
@@ -1261,6 +1290,12 @@ func TestQwpSfDrainerOpenFailureSurvivesPanickingLogger(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
+	// A collapsed manifest is a candidate but has no frames to send. Recovery
+	// therefore reaches fresh active-segment allocation, which is the operation
+	// this test faults.
+	manifest, err := qwpSfManifestCreate(dir, 4, 4)
+	require.NoError(t, err)
+	require.NoError(t, manifest.close())
 	// A full disk is an operational failure, not proof that the slot is
 	// inconsistent, so the drainer logs it and leaves the slot for a later scan
 	// — the branch this test needs to reach.
