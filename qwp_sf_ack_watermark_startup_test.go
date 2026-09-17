@@ -74,6 +74,9 @@ type qwpSfStartupProbe struct {
 	fileSyncFault error
 	dirSyncFault  error
 	writeFault    error
+	// shortWrite, when positive, makes the next write-back report that many
+	// bytes with no error.
+	shortWrite int
 }
 
 func installQwpSfStartupProbe(t *testing.T, slot string) *qwpSfStartupProbe {
@@ -116,6 +119,13 @@ func installQwpSfStartupProbe(t *testing.T, slot string) *qwpSfStartupProbe {
 		p.record("reserve-blocks")
 		if err := p.take(&p.writeFault); err != nil {
 			return 0, err
+		}
+		if short := p.takeShortWrite(); short > 0 {
+			n, err := originalWrite(f, b[:short], off)
+			if err != nil {
+				return n, err
+			}
+			return n, nil
 		}
 		return originalWrite(f, b, off)
 	})
@@ -166,10 +176,26 @@ func (p *qwpSfStartupProbe) failWriteBack(err error) {
 	p.setFault(&p.writeFault, err)
 }
 
+// truncateWriteBack makes the next write-back report a short write, the other
+// way storage refuses to back the mapping.
+func (p *qwpSfStartupProbe) truncateWriteBack(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.shortWrite = n
+}
+
 func (p *qwpSfStartupProbe) setFault(slot *error, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	*slot = err
+}
+
+func (p *qwpSfStartupProbe) takeShortWrite() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := p.shortWrite
+	p.shortWrite = 0
+	return n
 }
 
 func (p *qwpSfStartupProbe) recorded() []string {
@@ -258,12 +284,59 @@ func requireBothAckRecordsRetired(t *testing.T, slotDir string) {
 	require.False(t, ok1, "record slot 1 must be retired")
 }
 
-func requireSelectedAckRecord(t *testing.T, slotDir string, wantFsn int64) {
+func requireSelectedAckRecord(t *testing.T, slotDir string, wantFsn int64, msgAndArgs ...any) {
 	t.Helper()
 	b := readAckWatermarkFileBytes(t, slotDir)
 	rec, ok := qwpSfSelectAckWatermarkRecord(b, int64(len(b)) == qwpSfAckWatermarkFileSize)
 	require.True(t, ok, "a usable record must remain on disk")
-	require.Equal(t, wantFsn, rec.first)
+	require.Equal(t, wantFsn, rec.first, msgAndArgs...)
+}
+
+// damageSegmentFrame corrupts the payload of one frame in a segment file so
+// recovery's CRC scan stops there, the same way a torn write would.
+func damageSegmentFrame(t *testing.T, path string, frameIndex int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	offset := qwpSfHeaderSize
+	for i := 0; i < frameIndex; i++ {
+		payloadLen := int64(int32(binary.LittleEndian.Uint32(data[offset+4 : offset+8])))
+		require.Positive(t, payloadLen, "frame %d must exist to be walked past", i)
+		offset += qwpSfFrameHeaderSize + payloadLen
+	}
+	payloadLen := int64(int32(binary.LittleEndian.Uint32(data[offset+4 : offset+8])))
+	require.Positive(t, payloadLen, "frame %d must exist to be damaged", frameIndex)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, f.Close()) }()
+	_, err = f.WriteAt([]byte{data[offset+qwpSfFrameHeaderSize] ^ 0xff}, offset+qwpSfFrameHeaderSize)
+	require.NoError(t, err)
+}
+
+// framefulSegmentPath returns the one segment file that carries frames. A
+// closed slot also holds the manager's zero-frame hot spare, which is not the
+// file whose tail this fixture damages.
+func framefulSegmentPath(t *testing.T, slotDir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(slotDir)
+	require.NoError(t, err)
+	var found string
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".sfa" {
+			continue
+		}
+		path := filepath.Join(slotDir, entry.Name())
+		seg, openErr := qwpSfOpenSegment(path)
+		require.NoError(t, openErr)
+		frames := seg.segmentFrameCount()
+		require.NoError(t, seg.close())
+		if frames > 0 {
+			require.Empty(t, found, "this fixture expects a single frameful segment")
+			found = path
+		}
+	}
+	require.NotEmpty(t, found)
+	return found
 }
 
 func openStartupEngine(t *testing.T, dir string) *qwpSfCursorEngine {
@@ -427,6 +500,72 @@ func TestQwpSfFreshSlotRetiresAckRecordAcrossProcessExit(t *testing.T) {
 	assert.Len(t, collectReplayFrames(t, recovered), 12)
 }
 
+// TestQwpSfStartupInterruptionBoundaries covers the two interruption points
+// around invalidation that an orderly close would hide: a child that exits
+// immediately after preparation but before publishing anything, and a child
+// that exits after a refused reset, having never invalidated the record.
+//
+// Both are process-restart evidence for the exercised sequence only; neither
+// says anything about host crash or power loss.
+func TestQwpSfStartupInterruptionBoundaries(t *testing.T) {
+	if mode := os.Getenv("QWP_WATERMARK_BOUNDARY_CHILD"); mode != "" {
+		dir := os.Getenv("QWP_WATERMARK_BOUNDARY_DIR")
+		switch mode {
+		case "after-invalidation":
+			// Prepared, then gone before a single frame is published.
+			e, err := qwpSfNewCursorEngineForDrainer(dir, qwpSfStartupSegmentSize, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
+			require.NoError(t, err)
+			require.Equal(t, int64(-1), e.engineAckedFsn())
+		case "before-invalidation":
+			// The reset is refused, so construction fails and the record is
+			// still on disk when the process disappears.
+			probe := installQwpSfStartupProbe(t, dir)
+			probe.failTruncate(syscall.EIO)
+			_, err := qwpSfNewCursorEngineForDrainer(dir, qwpSfStartupSegmentSize, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
+			require.ErrorIs(t, err, syscall.EIO)
+		default:
+			t.Fatalf("unknown child mode %q", mode)
+		}
+		os.Exit(0)
+	}
+	for _, mode := range []string{"after-invalidation", "before-invalidation"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			seeded := seedStartupSlot(t, dir, 4)
+			writeForeignAckWatermark(t, dir, 9)
+
+			cmd := qwpTestSubprocess(t, "TestQwpSfStartupInterruptionBoundaries")
+			cmd.Env = append(os.Environ(),
+				"QWP_WATERMARK_BOUNDARY_CHILD="+mode, "QWP_WATERMARK_BOUNDARY_DIR="+dir)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, "%s", out)
+
+			if mode == "before-invalidation" {
+				requireSelectedAckRecord(t, dir, 9,
+					"a refused reset leaves the evidence for the next attempt")
+			} else {
+				requireBothAckRecordsRetired(t, dir)
+			}
+
+			// Whichever boundary the child died on, the next construction must
+			// publish the reused numbers only after the record is retired.
+			resumed := openStartupEngine(t, dir)
+			requireBothAckRecordsRetired(t, dir)
+			assert.Equal(t, int64(-1), resumed.engineAckedFsn())
+			appended := appendStartupFrames(t, resumed, 4, 6)
+			require.Equal(t, int64(9), resumed.enginePublishedFsn())
+			require.NoError(t, resumed.engineClose())
+
+			restarted := openStartupEngine(t, dir)
+			defer func() { require.NoError(t, restarted.engineClose()) }()
+			assert.Equal(t, int64(-1), restarted.engineAckedFsn(),
+				"an interrupted startup must not leave the old record able to acknowledge new frames")
+			assert.Equal(t, append(append([]string(nil), seeded...), appended...),
+				collectReplayFrames(t, restarted))
+		})
+	}
+}
+
 // TestQwpSfDamagedActiveTailKeepsOldAckOffReplacementFrames covers plan case C.
 // Recovery discards the unreadable active tail, which can leave a genuine ACK
 // record above the surviving frames. The vacated numbers are then republished,
@@ -484,6 +623,69 @@ func TestQwpSfDamagedActiveTailKeepsOldAckOffReplacementFrames(t *testing.T) {
 				"the discarded suffix stays discarded")
 			if prefixFrames > 0 {
 				assert.Contains(t, replay, "valid-prefix")
+			}
+		})
+	}
+}
+
+// TestQwpSfDamagedActiveTailWithPersistedAckProvenance is the same hazard as
+// the case above, but with the ACK record produced the way a live slot produces
+// one: a real acknowledgement persisted by the segment manager and made durable
+// by close, before a later torn write costs the slot the frames that record
+// covers. Nothing here is hand-written, so the record is unquestionably
+// genuine -- and it still must not survive to acknowledge the replacements.
+func TestQwpSfDamagedActiveTailWithPersistedAckProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		damageFrame  int
+		wantSurvivor int64
+	}{
+		{name: "nonempty-retained-prefix", damageFrame: 3, wantSurvivor: 2},
+		{name: "empty-retained-prefix", damageFrame: 0, wantSurvivor: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			seeded := openStartupEngine(t, dir)
+			original := appendStartupFrames(t, seeded, 0, 6)
+			// A real, cumulative acknowledgement of FSN 0..3, persisted by the
+			// manager while those frames were all still on disk. The slot is not
+			// drained, so its files and record survive close.
+			seeded.engineAcknowledge(3)
+			require.Eventually(t, func() bool {
+				b := readAckWatermarkFileBytes(t, dir)
+				rec, ok := qwpSfSelectAckWatermarkRecord(b, int64(len(b)) == qwpSfAckWatermarkFileSize)
+				return ok && rec.first == 3
+			}, qwpTestWaitTimeout, 5*time.Millisecond, "the manager must persist the genuine ACK")
+			require.NoError(t, seeded.engineClose())
+			requireSelectedAckRecord(t, dir, 3)
+
+			damageSegmentFrame(t, framefulSegmentPath(t, dir), tc.damageFrame)
+
+			probe := installQwpSfStartupProbe(t, dir)
+			e := openStartupEngine(t, dir)
+			probe.requireCheckpointPrecedesAllocation(t, true)
+			require.Equal(t, tc.wantSurvivor, e.enginePublishedFsn(),
+				"recovery keeps the valid prefix and discards the rest of the tail")
+			requireBothAckRecordsRetired(t, dir)
+			assert.Equal(t, int64(-1), e.engineAckedFsn(),
+				"a genuine record above the surviving frames is retired, not merely ignored")
+
+			replacements := appendStartupFrames(t, e, 100, 5)
+			require.NoError(t, e.engineClose())
+
+			restarted := openStartupEngine(t, dir)
+			defer func() { require.NoError(t, restarted.engineClose()) }()
+			assert.Equal(t, int64(-1), restarted.engineAckedFsn(),
+				"the old ACK must never acknowledge the newly appended frames")
+			replay := collectReplayFrames(t, restarted)
+			assert.Equal(t, replacements, replay[len(replay)-len(replacements):])
+			for _, discarded := range original[tc.damageFrame:] {
+				assert.NotContains(t, replay, discarded,
+					"the deliberately discarded suffix is not resurrected")
+			}
+			for _, retained := range original[:tc.damageFrame] {
+				assert.Contains(t, replay, retained,
+					"discarding ACK evidence replays surviving rows, duplicates included")
 			}
 		})
 	}
@@ -553,6 +755,125 @@ func TestQwpSfAckWatermarkFallbackCannotBypassValidation(t *testing.T) {
 		require.Nil(t, e.watermark, "safe fallback remains available with nothing to invalidate")
 		_, err := e.engineAppendBlocking(context.Background(), []byte("frame"))
 		require.NoError(t, err)
+	})
+}
+
+// TestQwpSfAckWatermarkInitializationFailureBoundaries covers the rest of the
+// allocation/write-back class: a partial write-back for both the reset and the
+// preserved image, and a refused block reservation. All of them happen after
+// the checkpoint, so the file on disk is already safe and the engine may run
+// without a mapped watermark.
+func TestQwpSfAckWatermarkInitializationFailureBoundaries(t *testing.T) {
+	t.Run("partial-write-back-of-a-reset-image", func(t *testing.T) {
+		dir := t.TempDir()
+		seedStartupSlot(t, dir, 4)
+		writeForeignAckWatermark(t, dir, 9)
+
+		probe := installQwpSfStartupProbe(t, dir)
+		probe.truncateWriteBack(16)
+		e := openStartupEngine(t, dir)
+		probe.requireCheckpointPrecedesAllocation(t, true)
+		require.Nil(t, e.watermark,
+			"a short write leaves pages the manager could SIGBUS on; it must not be mapped")
+		requireBothAckRecordsRetired(t, dir)
+		assert.Equal(t, int64(-1), e.engineAckedFsn())
+		require.NoError(t, e.engineClose())
+
+		restarted := openStartupEngine(t, dir)
+		defer func() { require.NoError(t, restarted.engineClose()) }()
+		assert.Equal(t, int64(-1), restarted.engineAckedFsn(),
+			"the retired record stays retired after a partly initialized file")
+	})
+
+	t.Run("partial-write-back-of-a-preserved-image", func(t *testing.T) {
+		dir := t.TempDir()
+		seedStartupSlot(t, dir, 4)
+		writeForeignAckWatermark(t, dir, 2)
+
+		probe := installQwpSfStartupProbe(t, dir)
+		probe.truncateWriteBack(16)
+		e := openStartupEngine(t, dir)
+		probe.requireCheckpointPrecedesAllocation(t, false)
+		require.Nil(t, e.watermark)
+		// The write-back replays the bytes that were already there, so a short
+		// one cannot damage the record it was reserving blocks for.
+		requireSelectedAckRecord(t, dir, 2)
+		require.NoError(t, e.engineClose())
+
+		restarted := openStartupEngine(t, dir)
+		defer func() { require.NoError(t, restarted.engineClose()) }()
+		assert.Equal(t, int64(2), restarted.engineAckedFsn())
+	})
+
+	t.Run("refused-block-reservation-after-the-checkpoint", func(t *testing.T) {
+		dir := t.TempDir()
+		seedStartupSlot(t, dir, 4)
+		writeForeignAckWatermark(t, dir, 9)
+
+		probe := installQwpSfStartupProbe(t, dir)
+		// Allocation only extends a file the reset emptied; for a preserved,
+		// correctly sized file qwpSfAllocate short-circuits and cannot fail.
+		reserve := qwpSfReserveNewBlocksFn.load()
+		qwpSfReserveNewBlocksFn.store(func(*os.File, int64, int64) error { return syscall.ENOSPC })
+		e, err := qwpSfNewCursorEngineForDrainer(dir, qwpSfStartupSegmentSize, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
+		qwpSfReserveNewBlocksFn.store(reserve)
+		require.NoError(t, err, "a refused reservation after the checkpoint keeps the slot open")
+		require.Nil(t, e.watermark)
+		require.NotContains(t, probe.recorded(), "reserve-blocks",
+			"allocation fails before the write-back is attempted")
+		probe.requireCheckpointPrecedesAllocation(t, true)
+		requireNoQuarantine(t, dir)
+		assert.Equal(t, int64(-1), e.engineAckedFsn())
+		require.NoError(t, e.engineClose())
+
+		// The truncation is durable even though the file never regained its
+		// records, so the next attempt cannot find the old value either.
+		restarted := openStartupEngine(t, dir)
+		defer func() { require.NoError(t, restarted.engineClose()) }()
+		requireBothAckRecordsRetired(t, dir)
+		assert.Equal(t, int64(-1), restarted.engineAckedFsn())
+	})
+
+	t.Run("fallback-is-refused-when-release-fails", func(t *testing.T) {
+		dir := t.TempDir()
+		seedStartupSlot(t, dir, 4)
+		writeForeignAckWatermark(t, dir, 9)
+
+		probe := installQwpSfStartupProbe(t, dir)
+		probe.failWriteBack(syscall.ENOSPC)
+		// Releasing the descriptor the failed attempt acquired also fails, so
+		// the storage refusal arrives with an ownership obligation attached and
+		// construction must fail instead of running with a nil watermark.
+		//
+		// Today qwpSfAcquisitionError exposes only its cleanup cause, so this
+		// particular chain would also be refused by a bare sentinel check. What
+		// pins the rule itself -- that the sentinel alone is never
+		// authorisation -- is
+		// TestQwpSfAckWatermarkStorageFallbackAllowedRequiresReleasedResources,
+		// which covers a chain where both are visible.
+		injected := errors.New("ack watermark handle would not close")
+		fileClose := func(f *os.File) error {
+			if filepath.Base(f.Name()) == qwpSfAckWatermarkFileName {
+				return injected
+			}
+			return nil
+		}
+		qwpSfTestAfterFileCloseHook.Store(&fileClose)
+		e, err := qwpSfNewCursorEngineForDrainer(dir, qwpSfStartupSegmentSize, qwpSfUnlimitedTotalBytes, qwpTestAppendTimeout)
+		qwpSfTestAfterFileCloseHook.Store(nil)
+		require.Error(t, err, "construction must fail rather than run with a nil watermark")
+		require.Nil(t, e)
+		require.ErrorIs(t, err, injected)
+		require.ErrorIs(t, err, ErrSfDurability)
+		requireNoQuarantine(t, dir)
+		// Preparation still completed before the refused allocation, so the
+		// record is already retired for whoever opens the slot next.
+		probe.requireCheckpointPrecedesAllocation(t, true)
+		requireBothAckRecordsRetired(t, dir)
+
+		retried := reopenStartupEngineAfterFailure(t, dir)
+		defer func() { require.NoError(t, retried.engineClose()) }()
+		assert.Equal(t, int64(-1), retried.engineAckedFsn())
 	})
 }
 
@@ -917,9 +1238,14 @@ func TestQwpSfAckWatermarkStorageFallbackAllowedRequiresReleasedResources(t *tes
 	assert.False(t, qwpSfAckWatermarkStorageFallbackAllowed(
 		qwpSfDurabilityError("sync prepared ack watermark", "/slot/.ack-watermark", syscall.EIO)),
 		"a barrier failure is not the allocation class")
+	// A bare errors.Is check would accept this one: both the sentinel and the
+	// cleanup failure are visible in the same chain.
 	assert.False(t, qwpSfAckWatermarkStorageFallbackAllowed(
 		errors.Join(unbacked, ErrCleanupFailed)),
 		"an internal cleanup failure outranks the optimisation")
+	assert.False(t, qwpSfAckWatermarkStorageFallbackAllowed(
+		errors.Join(unbacked, ErrSfCleanupPending)),
+		"unfinished slot cleanup keeps the lifecycle obligation")
 	assert.False(t, qwpSfAckWatermarkStorageFallbackAllowed(&qwpSfAcquisitionError{
 		original:  unbacked,
 		cause:     errors.Join(ErrSfDurability, syscall.EIO),
