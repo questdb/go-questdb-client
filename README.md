@@ -663,13 +663,15 @@ for cleanup behavior, why a slot may stay locked, and how to check for release.
 **Acknowledgement evidence at startup.** Residual side files are permitted, so
 startup, not close, is what makes an old `.ack-watermark` record safe. Every
 disk-backed construction inspects that file under the slot lock and decides from
-the frames recovery actually found:
+the history recovery actually established:
 
-- No recovered frames at all: the record describes a previous lifecycle whose
-  frames are gone, and this session restarts frame numbering at 0.
-- A record above the recovered frame range: no correctly operating session for
-  this history produced it. Recovery can also produce this legitimately, by
-  discarding an unreadable active tail.
+- Recovery produced no ring: the record describes a previous lifecycle whose
+  frames are gone, and this session restarts frame numbering at 0. An empty
+  recovered ring is different: it retains its sequence base and remains part of
+  its existing history even though it currently holds no frames.
+- A record above the recovered history's published tip: no correctly operating
+  session for this history produced it. Recovery can also produce this
+  legitimately, by discarding an unreadable active tail.
 
 In both cases the record is retired durably, by truncating the file to zero
 bytes — both record slots together — rather than ignored for one run. Ignoring
