@@ -1202,6 +1202,32 @@ func (e *qwpSenderBuildCleanupError) cleanupFailure() error {
 	return nil
 }
 
+// qwpStandaloneBuildCleanupError exposes unfinished construction cleanup at
+// the public standalone-sender boundary without changing the private build
+// errors used by pools and orphan drainers for lifecycle decisions.
+type qwpStandaloneBuildCleanupError struct {
+	cause           error
+	storeAndForward bool
+}
+
+func (e *qwpStandaloneBuildCleanupError) Error() string { return e.cause.Error() }
+func (e *qwpStandaloneBuildCleanupError) Unwrap() error { return e.cause }
+func (e *qwpStandaloneBuildCleanupError) Is(target error) bool {
+	return target == ErrCleanupPending ||
+		(e.storeAndForward && target == ErrSfCleanupPending)
+}
+
+func qwpExposeStandaloneBuildCleanup(err error, storeAndForward bool) error {
+	if err == nil {
+		return nil
+	}
+	var cleanup closeLifecycleReporter
+	if !errors.As(err, &cleanup) || cleanup.closeCompleted() {
+		return err
+	}
+	return &qwpStandaloneBuildCleanupError{cause: err, storeAndForward: storeAndForward}
+}
+
 type qwpSfBuildCleanupError struct {
 	cause  error
 	engine *qwpSfCursorEngine

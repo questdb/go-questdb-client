@@ -126,6 +126,97 @@ func (r *lateCleanupReporter) cleanupResult() error {
 	return nil
 }
 
+func TestQwpFailedStandaloneEngineBuildReportsPendingCleanup(t *testing.T) {
+	injected := errors.New("engine construction failed")
+	fail := func() error { return injected }
+	qwpSfTestBeforeEngineRegisterHook.Store(&fail)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	finish := func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+	qwpSfTestEngineFinishCloseHook.Store(&finish)
+	old := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(5 * time.Millisecond)
+
+	var held *qwpSfBuildCleanupError
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		qwpSfTestBeforeEngineRegisterHook.Store(nil)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		qwpSfManagerCloseGrace.store(old)
+		if held != nil {
+			waitQwpSfEngineCleanup(t, held.engine)
+		}
+	})
+
+	root := t.TempDir()
+	sender, err := LineSenderFromConf(context.Background(), "ws::addr=127.0.0.1:1;sf_dir="+root+
+		";sender_id=failed-engine;initial_connect_retry=async;")
+	require.Nil(t, sender)
+	require.ErrorIs(t, err, injected)
+	require.ErrorAs(t, err, &held)
+	waitQwpCleanupSignal(t, entered, "failed engine construction cleanup")
+	require.False(t, held.closeCompleted())
+	require.ErrorIs(t, err, ErrCleanupPending)
+	require.ErrorIs(t, err, ErrSfCleanupPending)
+	require.NotErrorIs(t, err, ErrCleanupFailed)
+
+	releaseOnce.Do(func() { close(release) })
+	waitQwpSfEngineCleanup(t, held.engine)
+	require.True(t, held.closeCompleted())
+	lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(root, "failed-engine"))
+	require.NoError(t, lockErr)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpFailedStandaloneSenderBuildReportsPendingCleanup(t *testing.T) {
+	injected := errors.New("sender construction failed")
+	fail := func() error { return injected }
+	qwpSfTestAfterEngineCreateHook.Store(&fail)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	finish := func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+	qwpSfTestEngineFinishCloseHook.Store(&finish)
+	old := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(5 * time.Millisecond)
+
+	var held *qwpSenderBuildCleanupError
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		qwpSfTestAfterEngineCreateHook.Store(nil)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		qwpSfManagerCloseGrace.store(old)
+		if held != nil {
+			require.Eventually(t, held.closeCompleted, qwpTestWaitTimeout, time.Millisecond)
+		}
+	})
+
+	root := t.TempDir()
+	sender, err := LineSenderFromConf(context.Background(), "ws::addr=127.0.0.1:1;sf_dir="+root+
+		";sender_id=failed-constructor;initial_connect_retry=async;")
+	require.Nil(t, sender)
+	require.ErrorIs(t, err, injected)
+	require.ErrorAs(t, err, &held)
+	waitQwpCleanupSignal(t, entered, "failed standalone sender construction cleanup")
+	require.False(t, held.closeCompleted())
+	require.ErrorIs(t, err, ErrCleanupPending)
+	require.ErrorIs(t, err, ErrSfCleanupPending)
+	require.NotErrorIs(t, err, ErrCleanupFailed)
+
+	releaseOnce.Do(func() { close(release) })
+	require.Eventually(t, held.closeCompleted, qwpTestWaitTimeout, time.Millisecond)
+	lock, lockErr := qwpSfAcquireSlotLock(filepath.Join(root, "failed-constructor"))
+	require.NoError(t, lockErr)
+	require.NoError(t, lock.close())
+}
+
 func TestQwpMemoryPoolRetainsUnfinishedCleanup(t *testing.T) {
 	injected := errors.New("memory cleanup completed with error")
 	r := &lateCleanupReporter{err: injected}

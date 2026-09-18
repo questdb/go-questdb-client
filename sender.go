@@ -1337,7 +1337,7 @@ func LineSenderFromEnv(ctx context.Context) (LineSender, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newLineSender(ctx, c)
+	return newStandaloneLineSender(ctx, c)
 }
 
 // LineSenderFromConf creates a LineSender using the QuestDB config string format.
@@ -1401,7 +1401,7 @@ func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newLineSender(ctx, c)
+	return newStandaloneLineSender(ctx, c)
 }
 
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
@@ -1434,7 +1434,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, e
 	for _, opt := range opts {
 		opt(conf)
 	}
-	return newLineSender(ctx, conf)
+	return newStandaloneLineSender(ctx, conf)
 }
 
 func newLineSenderConfig(t senderType) *lineSenderConfig {
@@ -1480,6 +1480,14 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			fileNameLimit:     defaultFileNameLimit,
 		}
 	}
+}
+
+func newStandaloneLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
+	sender, err := newLineSender(ctx, conf)
+	if conf.senderType == qwpSenderType {
+		err = qwpExposeStandaloneBuildCleanup(err, conf.sfDir != "")
+	}
+	return sender, err
 }
 
 func newLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
