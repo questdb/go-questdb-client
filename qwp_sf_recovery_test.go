@@ -511,14 +511,6 @@ func TestQwpSfRecoveryActionPlanIsIndependentOfFileOrder(t *testing.T) {
 	segments := []*qwpSfSegment{stale, sealed, active, duplicate, torn, empty}
 	t.Cleanup(func() { closeRecoverySegments(t, segments...) })
 
-	expected := map[string]qwpSfRecoveryAction{
-		"sf-stale.sfa":     qwpSfRecoveryUnlink,
-		"sf-sealed.sfa":    qwpSfRecoverySanitizeSealed,
-		"sf-active.sfa":    qwpSfRecoveryKeep,
-		"sf-duplicate.sfa": qwpSfRecoveryQuarantine,
-		"sf-torn.sfa":      qwpSfRecoveryQuarantine,
-		"sf-empty.sfa":     qwpSfRecoveryUnlink,
-	}
 	manifest := &qwpSfManifest{generation: 1, headBase: 2, activeBase: 3}
 
 	var visitPermutations func(int)
@@ -541,11 +533,13 @@ func TestQwpSfRecoveryActionPlanIsIndependentOfFileOrder(t *testing.T) {
 				})
 			}
 			plan := qwpSfBuildRecoveryPlan(dir, 4096, permuted, facts, manifest, false)
-			require.NoError(t, plan.failClosedErr)
+			require.ErrorIs(t, plan.failClosedErr, qwpSfErrRecoveryFailClosed)
+			require.ErrorContains(t, plan.failClosedErr,
+				"multiple frame-bearing SF segments exist at committed active base 3")
 			require.Equal(t, qwpSfManifestCommitted, plan.manifestProvenance)
-			require.Equal(t, filepath.Join(dir, "sf-sealed.sfa"), plan.retryAfterSanitizePath)
+			require.Empty(t, plan.retryAfterSanitizePath)
 			for _, file := range plan.files {
-				require.Equal(t, expected[filepath.Base(file.path)], file.action,
+				require.Equal(t, qwpSfRecoveryFailClosed, file.action,
 					"unexpected action for %s in permutation %d", file.path, seen)
 				require.NotEmpty(t, file.license)
 			}
@@ -1312,32 +1306,26 @@ func TestQwpSfLegacyMigrationRefusesATornSegmentBelowASynthesizedHead(t *testing
 	require.NoError(t, statErr, "and its bytes must still be on disk")
 }
 
-// TestQwpSfFramefulDuplicateAtTheActiveBaseIsPreserved pins the preserve set,
-// the one branch where a segment carrying frames at or above the committed
-// head survives without being adopted into the chain. Two independent
-// mutations — never consulting the set, and never populating it — deleted such
-// a file with the whole suite green, so the branch whose comment says it keeps
-// the no-frame-destroyed guarantee "resting on the code" was resting on
-// nothing.
-func TestQwpSfFramefulDuplicateAtTheActiveBaseIsPreserved(t *testing.T) {
+// TestQwpSfFramefulDuplicateAtTheActiveBaseFailsClosed pins an ambiguous
+// committed active boundary. Either segment could hold the rows assigned to
+// the same frame numbers, so choosing one would silently omit the other.
+// Recovery must leave both candidates untouched and let the foreground-open
+// policy preserve the whole slot.
+func TestQwpSfFramefulDuplicateAtTheActiveBaseFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	sealed := createRecoverySegment(t, dir, "sf-a.sfa", 0, "f0", "f1", "f2")
 	active := createRecoverySegment(t, dir, "sf-b.sfa", 3, "f3")
 	dup := createRecoverySegment(t, dir, "sf-c.sfa", 3, "dup3") // frameful, same base
 	createRecoveryManifest(t, dir, 0, 3, sealed, active, dup)
 	closeRecoverySegments(t, sealed, active, dup)
+	before := snapshotAllContents(t, dir)
 
 	ring, _, err := qwpSfRecoverRing(dir, 4096)
-	require.NoError(t, err)
-	require.NotNil(t, ring)
-	defer ring.segmentRingClose()
-
-	dupPath := filepath.Join(dir, "sf-c.sfa")
-	_, statErr := os.Stat(dupPath + ".corrupt")
-	require.NoError(t, statErr,
-		"a frameful duplicate at the committed active base must be preserved")
-	_, statErr = os.Stat(dupPath)
-	require.True(t, os.IsNotExist(statErr), "and moved out of the .sfa namespace")
+	require.Nil(t, ring)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.ErrorContains(t, err, "multiple frame-bearing SF segments exist at committed active base 3")
+	require.Equal(t, before, snapshotAllContents(t, dir),
+		"fail-closed recovery must not choose, rename, or rewrite either candidate")
 }
 
 // TestQwpSfQuarantineTargetPathBoundsName pins that a quarantine target's

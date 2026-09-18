@@ -272,9 +272,8 @@ func qwpSfBuildRecoveryPlan(
 			"new-format SF segment exists but sf-manifest.bin is missing"))
 	}
 
-	var preserve map[*qwpSfSegment]struct{}
 	if manifest != nil {
-		if err := p.planCommittedChain(data, framefulCorrupt, &preserve); err != nil {
+		if err := p.planCommittedChain(data, framefulCorrupt); err != nil {
 			return p.failClosed(err)
 		}
 	} else {
@@ -291,7 +290,7 @@ func qwpSfBuildRecoveryPlan(
 		keep[seg] = struct{}{}
 		p.setSegmentAction(seg, qwpSfRecoveryKeep, "selected member of the validated contiguous chain")
 	}
-	if err := p.planDiscardActions(keep, preserve); err != nil {
+	if err := p.planDiscardActions(keep); err != nil {
 		return p.failClosed(err)
 	}
 	p.planSanitizationActions()
@@ -301,9 +300,19 @@ func qwpSfBuildRecoveryPlan(
 func (p *qwpSfRecoveryPlan) planCommittedChain(
 	data []*qwpSfSegment,
 	framefulCorrupt []string,
-	preserve *map[*qwpSfSegment]struct{},
 ) error {
 	head, active := p.headBase, p.activeBase
+	framefulAtActive := 0
+	for _, seg := range data {
+		if seg.segmentBaseSeq() != active {
+			continue
+		}
+		framefulAtActive++
+		if framefulAtActive > 1 {
+			return qwpSfFailClosed(
+				"multiple frame-bearing SF segments exist at committed active base %d", active)
+		}
+	}
 	p.activeSeg = qwpSfFindActive(p.all, active)
 	for _, seg := range data {
 		base := seg.segmentBaseSeq()
@@ -319,15 +328,6 @@ func (p *qwpSfRecoveryPlan) planCommittedChain(
 		}
 		if base > active {
 			return qwpSfFailClosed("segment exists beyond committed SF active boundary")
-		}
-		if base == active && seg != p.activeSeg {
-			if seg.segmentFrameCount() > 0 {
-				if *preserve == nil {
-					*preserve = make(map[*qwpSfSegment]struct{}, 1)
-				}
-				(*preserve)[seg] = struct{}{}
-			}
-			continue
 		}
 		p.chain = append(p.chain, seg)
 	}
@@ -406,9 +406,7 @@ func (p *qwpSfRecoveryPlan) planLegacyChain(data []*qwpSfSegment, framefulCorrup
 	return nil
 }
 
-func (p *qwpSfRecoveryPlan) planDiscardActions(
-	keep, preserve map[*qwpSfSegment]struct{},
-) error {
+func (p *qwpSfRecoveryPlan) planDiscardActions(keep map[*qwpSfSegment]struct{}) error {
 	if !p.collapsed && len(keep) > 0 {
 		anchored := false
 		for seg := range keep {
@@ -435,9 +433,8 @@ func (p *qwpSfRecoveryPlan) planDiscardActions(
 		if err != nil {
 			return err
 		}
-		_, explicitlyPreserved := preserve[seg]
-		mustPreserve := explicitlyPreserved || (file.tornTailBytes > 0 &&
-			(file.baseSeq >= p.headBase || end > p.headBase))
+		mustPreserve := file.tornTailBytes > 0 &&
+			(file.baseSeq >= p.headBase || end > p.headBase)
 		if mustPreserve {
 			file.action = qwpSfRecoveryQuarantine
 			file.license = "bytes are not proven delivered; preserve them outside the segment namespace"
