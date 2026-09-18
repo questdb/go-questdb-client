@@ -79,19 +79,28 @@ func qwpSfScanOrphans(sfDir string, exclude func(name string) bool) []string {
 	return qwpSfScanOrphansWithLogger(sfDir, exclude, nil)
 }
 
-// qwpSfScanOrphansWithLogger is the production scanner. The bool-only test
-// helper above remains side-effect-free; production callers supply their
-// configured logger so an inspection failure is reported as the operational
-// fault it is instead of being indistinguishable from an ordinary exclusion.
+// qwpSfScanOrphansWithLogger is the production scanner. The test helper above
+// remains side-effect-free; production callers supply their effective logger
+// so an inspection failure is reported as the operational fault it is instead
+// of being indistinguishable from an ordinary exclusion. A missing root is
+// expected and stays quiet; other root inspection failures are logged.
 func qwpSfScanOrphansWithLogger(sfDir string, exclude func(name string) bool, logger *slog.Logger) []string {
 	if sfDir == "" {
 		return nil
 	}
 	if _, err := os.Stat(sfDir); err != nil {
+		if logger != nil && !errors.Is(err, os.ErrNotExist) {
+			qwpEffectiveLogger(logger).Error("qwp/sf: could not scan orphan root",
+				"root", sfDir, "error", err)
+		}
 		return nil
 	}
 	entries, err := os.ReadDir(sfDir)
 	if err != nil {
+		if logger != nil && !errors.Is(err, os.ErrNotExist) {
+			qwpEffectiveLogger(logger).Error("qwp/sf: could not scan orphan root",
+				"root", sfDir, "error", err)
+		}
 		return nil
 	}
 	var orphans []string

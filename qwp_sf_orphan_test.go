@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -149,6 +150,63 @@ func TestQwpSfScanOrphansEmptyDirReturnsNothing(t *testing.T) {
 
 func TestQwpSfScanOrphansMissingDirReturnsNothing(t *testing.T) {
 	assert.Empty(t, qwpSfScanOrphans("/nonexistent/path", nil))
+}
+
+func TestQwpSfScanOrphansRootFailuresLogged(t *testing.T) {
+	for _, operation := range []string{"stat", "read directory", "not a directory"} {
+		t.Run(operation, func(t *testing.T) {
+			root := t.TempDir()
+			if operation == "not a directory" {
+				root = filepath.Join(root, "file")
+				require.NoError(t, os.WriteFile(root, []byte("untouched"), 0o600))
+			} else {
+				if !qwpTestCanEnforceOwnerPermissions() {
+					t.Skip("this platform or user cannot enforce directory permissions")
+				}
+				blocked := root
+				if operation == "stat" {
+					root = filepath.Join(blocked, "root")
+					require.NoError(t, os.Mkdir(root, 0o700))
+				}
+				require.NoError(t, os.Chmod(blocked, 0o000))
+				t.Cleanup(func() { require.NoError(t, os.Chmod(blocked, 0o700)) })
+			}
+
+			// Prove the fixture reaches the intended failing filesystem call.
+			_, statErr := os.Stat(root)
+			if operation == "stat" {
+				require.ErrorIs(t, statErr, os.ErrPermission)
+			} else {
+				require.NoError(t, statErr)
+				_, readErr := os.ReadDir(root)
+				require.Error(t, readErr)
+			}
+
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			assert.Empty(t, qwpSfScanOrphansWithLogger(root, nil, logger))
+			assert.Contains(t, logs.String(), "level=ERROR")
+			assert.Contains(t, logs.String(), "could not scan orphan root")
+			assert.Contains(t, logs.String(), root)
+			assert.Contains(t, logs.String(), "error=")
+			assert.Equal(t, 1, strings.Count(logs.String(), "\n"))
+
+			// Diagnostics must not turn an inspection failure into a panic.
+			assert.NotPanics(t, func() {
+				assert.Empty(t, qwpSfScanOrphansWithLogger(root, nil, slog.New(panicOnHandleSlog{})))
+			})
+		})
+	}
+}
+
+func TestQwpSfScanOrphansNormalRootsAreQuiet(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{"", root, filepath.Join(root, "missing")} {
+		var logs bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logs, nil))
+		assert.Empty(t, qwpSfScanOrphansWithLogger(path, nil, logger))
+		assert.Empty(t, logs.String())
+	}
 }
 
 func TestQwpSfMarkSlotFailed(t *testing.T) {
