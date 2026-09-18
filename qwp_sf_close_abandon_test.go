@@ -199,6 +199,11 @@ func TestQwpOrphanDrainerOwnsEngineBeforePostOpenFault(t *testing.T) {
 	if !child {
 		return
 	}
+	seed, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = seed.engineAppendBlocking(context.Background(), []byte("data"))
+	require.NoError(t, err)
+	require.NoError(t, seed.engineClose())
 	var drainerEngine *qwpSfCursorEngine
 	openedHook := func(engine *qwpSfCursorEngine) {
 		drainerEngine = engine
