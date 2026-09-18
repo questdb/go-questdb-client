@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"math/big"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,13 +44,13 @@ import (
 // for the caller's lifetime; Close returns it. It keeps minSize warm, grows to
 // maxSize on demand, and reaps idle/over-age slots back to minSize.
 //
-// Store-and-forward (sf_dir set) is supported with one twist
-// (design §4.4): each slot gets a distinct sender_id <base>-<index> so
-// concurrent senders never collide on a slot dir (Hazard A), and every pooled
-// sender fences the pool's whole in-range slot set out of orphan adoption so a
-// live sibling is never drained (Hazard G). Crash-stranded in-range slots are
-// recovered by binding a normal async sender to each at construction (the Go
-// sender self-recovers its dir) — no dedicated recoverer, build never blocks.
+// With store-and-forward enabled (sf_dir set), each slot gets a separate
+// sender_id, <base>-<index>, so senders cannot use the same directory (Hazard A).
+// Background drainers must skip all of the pool's reserved directories, since
+// another pooled sender may be using them (Hazard G). At startup, each reserved
+// directory left by a crash gets its own sender, which recovers it and connects
+// in the background. Opening local files and creating the pool's initial
+// connections can still make construction wait.
 //
 // Leases are generation-stamped: a stale handle from a returned-then-reborrowed
 // slot cannot write into or double-return a different borrow (Hazard B).
@@ -70,11 +71,14 @@ type qwpSenderPool struct {
 	idleTimeout      time.Duration
 	maxLifetime      time.Duration
 
-	inFlightCreations int
+	inFlightCreations int // memory-mode metric and close-wait optimization
 	closed            bool
-	// closing is set before the housekeeper is stopped so an about-to-start reap
-	// bails immediately instead of racing teardown. Distinct from closed, which
-	// close() sets after the housekeeper has joined.
+	closeStarted      bool
+	closeDone         chan struct{}
+	failureDone       chan struct{}
+	// Set closing before stopping the housekeeper, so it cannot start removing
+	// idle senders during shutdown. close() sets closed when pool shutdown
+	// starts. QuestDB.Close waits separately for the housekeeper to exit.
 	closing atomic.Bool
 
 	baseConf           string
@@ -87,15 +91,108 @@ type qwpSenderPool struct {
 	storeAndForward bool
 	sfDir           string
 	slotBase        string
-	slotInUse       []bool // reservation bitmap for SF slot indices [0, maxSize)
-	closingSlots    int    // SF slots removed from `all` but still releasing their flock
-	leakedSlots     int    // SF slots permanently retired (close left the flock held)
+	sfSlots         []qwpSfSlotLifecycle
+	retiredSlots    []*qwpSenderSlot
 
-	// pendingLeaseTeardowns counts delegate teardowns currently running on
-	// returning borrowers' goroutines (giveBack's closed branch). close()
-	// counts these as outstanding so it does not return while a delegate is
-	// still being torn down on another goroutine. Guarded by mu.
+	// pendingLeaseTeardowns counts senders being closed outside the pool lock,
+	// including returned senders and those removed by periodic maintenance.
+	// Read and update it with mu held.
 	pendingLeaseTeardowns int
+
+	// closeTeardownErr saves errors from closing senders, including those that
+	// finish after the first pool Close returns. Read and update it with mu held.
+	closeTeardownErr error
+
+	// poisonedErr saves the first internal pool failure. After that, the pool
+	// refuses new borrows and stops trying to reuse failed slots. Cleanup of
+	// other senders may still finish if it is safe. Set once, with mu held.
+	poisonedErr error
+	// Keep these senders alive after an internal failure. This list does not
+	// track available space; sfSlots records the store-and-forward reservations.
+	failedSlots []*qwpSenderSlot
+}
+
+// qwpSfSlotState is the sole authority for both SF pool capacity and shutdown
+// obligations. Every in-range slot index owns exactly one record, and every
+// transition happens while p.mu is held.
+type qwpSfSlotState uint8
+
+const (
+	qwpSfSlotFree qwpSfSlotState = iota
+	qwpSfSlotCreating
+	qwpSfSlotAvailable
+	qwpSfSlotLeased
+	qwpSfSlotClosing
+	qwpSfSlotRetired
+)
+
+func (s qwpSfSlotState) String() string {
+	switch s {
+	case qwpSfSlotFree:
+		return "free"
+	case qwpSfSlotCreating:
+		return "creating"
+	case qwpSfSlotAvailable:
+		return "available"
+	case qwpSfSlotLeased:
+		return "leased"
+	case qwpSfSlotClosing:
+		return "closing"
+	case qwpSfSlotRetired:
+		return "retired"
+	default:
+		return fmt.Sprintf("unknown(%d)", s)
+	}
+}
+
+type qwpSfSlotLifecycle struct {
+	state qwpSfSlotState
+}
+
+type qwpSfSlotObligation struct {
+	index int
+	state qwpSfSlotState
+}
+
+// ErrSfCleanupPending means some work can still use or acquire a
+// store-and-forward slot. This includes borrowed senders, senders still being
+// created, and unfinished cleanup. Match it with errors.Is. Return borrowed
+// senders and check storage before waiting again with a fresh deadline.
+// The error does not promise that the slot will eventually be released.
+//
+// Unfinished store-and-forward cleanup also produces [ErrCleanupPending].
+// Check [ErrCleanupFailed] first: it means an internal failure has left
+// resources held that cannot safely be released. One result can include this
+// failure and other cleanup still in progress. See [QuestDB.Close] for what
+// it waits for and which errors remain in later results.
+//
+// Connect, NewQuestDB, or NewLineSender can return an error wrapping this
+// value without returning a handle. The client still tracks resources it has
+// not released, but there is no handle for you to Close. Creating another
+// client for the same slot may fail because this process still holds its
+// lock. Limit retries and inspect logs and storage; an internal cleanup
+// failure may require a process restart before the slot can be reused.
+var ErrSfCleanupPending = errors.New("qwp pool: SF slot cleanup still pending; lifecycle obligations remain")
+
+// qwpPoolCloseResult combines the stable teardown/poison errors with one live
+// lifecycle snapshot. The snapshot carries both the indices and states of all
+// obligations that still could acquire or retain a slot flock.
+func qwpPoolCloseResult(teardownErr, poisonErr error, pending []qwpSfSlotObligation) error {
+	if poisonErr != nil {
+		if teardownErr != nil {
+			teardownErr = errors.Join(teardownErr, poisonErr)
+		} else {
+			teardownErr = poisonErr
+		}
+	}
+	if len(pending) == 0 {
+		return teardownErr
+	}
+	pendingErr := fmt.Errorf("%w: %w (%d slot(s): %v)", ErrCleanupPending, ErrSfCleanupPending, len(pending), pending)
+	if teardownErr != nil {
+		return errors.Join(teardownErr, pendingErr)
+	}
+	return pendingErr
 }
 
 // qwpPoolMaxCloseLeaseWait hard-caps close()'s outstanding-lease wait. The
@@ -108,10 +205,14 @@ const qwpPoolMaxCloseLeaseWait = 5 * time.Second
 // issued, so a stale lease (slot already re-borrowed) is detectable.
 type qwpSenderSlot struct {
 	delegate   QwpSender
+	cleanup    closeLifecycleReporter
 	generation atomic.Uint64
 	slotIndex  int // SF slot index, or -1 in memory mode
 	createdAt  time.Time
 	idleSince  time.Time
+	// Read and update with pool.mu held. If a panic leaves the slot in an
+	// unknown state, do not retry its cleanup or reuse it.
+	cleanupFailed bool
 }
 
 // qwpMaxPoolSize caps sender_pool_max. A larger value is a misconfiguration: in
@@ -168,7 +269,7 @@ func newQwpSenderPool(
 		if p.slotBase == "" {
 			p.slotBase = qwpSfDefaultSenderId
 		}
-		p.slotInUse = make([]bool, maxSize)
+		p.sfSlots = make([]qwpSfSlotLifecycle, maxSize)
 	}
 
 	// Eagerly prewarm minSize slots. A prewarm failure tears down whatever was
@@ -177,7 +278,16 @@ func newQwpSenderPool(
 	for i := 0; i < minSize; i++ {
 		slot, err := p.createSlot(ctx, false)
 		if err != nil {
-			_ = p.close(ctx)
+			// Join the unwind close's error rather than drop it: it can be
+			// ErrSfCleanupPending, and this pool is about to become
+			// unreachable, so this is the only place the caller can learn
+			// that a slot lock survives the failed build and that an
+			// immediate retry on the same sf_dir may name this process as
+			// the holder. The engine's cleanup worker keeps the lock until it
+			// can safely release it.
+			if closeErr := p.close(ctx); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			return nil, err
 		}
 		p.all = append(p.all, slot)
@@ -190,268 +300,271 @@ func newQwpSenderPool(
 	if p.storeAndForward {
 		p.recoverStrandedSlots(ctx)
 	}
+	if err := p.stableCloseResult(); err != nil {
+		return nil, errors.Join(err, p.close(ctx))
+	}
 	return p, nil
 }
 
 // recoverStrandedSlots scans <sfDir>/<base>-<i> for i in [0,maxSize) and binds
 // an async sender to each that holds unacked data but no live owner.
 //
-// Construction-only: like createSlot, the sole caller is newQwpSenderPool,
-// single-threaded before the pool is published, so the direct slotInUse writes
-// and the createSlotAt index bookkeeping here run WITHOUT p.mu. Do not call this
-// off the construction path.
+// The pool is not published while this scan runs, but it still uses the normal
+// locked lifecycle transitions so construction does not have a second source
+// of truth for reservations.
 func (p *qwpSenderPool) recoverStrandedSlots(ctx context.Context) {
 	for i := 0; i < p.maxSize; i++ {
-		if p.slotInUse[i] {
-			continue // already owned by a prewarmed slot
+		var free bool
+		if err := p.withLock("check recovery slot", nil, func() { free = p.sfSlots[i].state == qwpSfSlotFree }); err != nil {
+			return
 		}
-		dir := filepath.Join(p.sfDir, p.slotBase+"-"+strconv.Itoa(i))
-		if !qwpSfIsCandidateOrphan(dir) {
+		if !free {
 			continue
 		}
-		slot, err := p.createSlotAt(ctx, i, true)
-		if err != nil {
-			continue // best-effort; the dir's data stays on disk for next start
+		dir := filepath.Join(p.sfDir, p.slotBase+"-"+strconv.Itoa(i))
+		candidate, candidateErr := qwpSfCandidateOrphan(dir)
+		if candidateErr != nil {
+			if errors.Is(candidateErr, ErrSfDurability) {
+				qwpEffectiveLogger(p.logger).Error("qwp/sf: sender pool could not inspect a recovery slot; leaving it eligible for a later startup",
+					"slot", dir, "error", candidateErr)
+			}
+			continue
 		}
-		// Reserve the index: this live recovered sender owns dir <base>-i and
-		// holds its flock, so a later borrow's allocateSlotIndexLocked must not
-		// re-pick i and collide (Hazard A — the reservation bitmap is the
-		// primary defense, not just the flock backstop).
-		p.slotInUse[i] = true
-		p.all = append(p.all, slot)
-		p.available = append(p.available, slot)
+		if !candidate {
+			continue
+		}
+		if err := p.withLock("reserve recovery slot", nil, func() {
+			p.transitionSfSlotLocked(i, qwpSfSlotFree, qwpSfSlotCreating)
+		}); err != nil {
+			return
+		}
+		slot, err := p.createSlotAt(ctx, i, true, qwpSfRequireCandidateForAdoption)
+		if err != nil && errors.Is(err, ErrSfDurability) {
+			qwpEffectiveLogger(p.logger).Error("qwp/sf: sender pool could not revalidate or open a recovery slot; leaving it eligible for a later startup",
+				"slot", dir, "error", err)
+		}
+		if lockErr := p.withLock("finish recovery slot", []*qwpSenderSlot{slot}, func() {
+			if err != nil {
+				p.reclaimFailedBuildLocked(slot, i, err)
+				return
+			}
+			p.transitionSfSlotLocked(i, qwpSfSlotCreating, qwpSfSlotAvailable)
+			p.all = append(p.all, slot)
+			p.available = append(p.available, slot)
+		}); lockErr != nil {
+			return
+		}
 	}
 }
 
-// borrow leases a sender, blocking up to acquireTimeout (or ctx) when the pool
-// is at capacity. The returned LineSender must be Close()d to return it; the
-// real disconnect happens only at pool close.
+// borrow waits up to acquireTimeout, or until ctx ends, if the pool is full.
+// Call Close on the returned sender to give it back. The pool handles resource
+// cleanup when it removes a sender or shuts down.
 func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 	deadline := time.Now().Add(p.acquireTimeout)
-	p.mu.Lock()
 	for {
-		if p.closed {
-			p.mu.Unlock()
-			return nil, errPoolClosed
-		}
-		if n := len(p.available); n > 0 {
-			slot := p.available[n-1]
-			p.available = p.available[:n-1]
-			// A slot's background send loop keeps running while it sits idle and
-			// can terminally HALT with no lease watching (reconnect-budget
-			// exhaustion after a long outage, PROTOCOL_VIOLATION close, AUTH_FAILED
-			// on reconnect, incompatible-server strike). Handing such a poisoned
-			// slot to the next borrower would fail it through no fault of its own
-			// and break borrower isolation precisely during incident recovery, so
-			// discard it and look for another.
-			if slotTerminallyFailed(slot.delegate) {
-				p.discardLocked(slot) // releases p.mu
-				p.mu.Lock()
-				continue
+		var lease *qwpPooledSender
+		var discard *qwpSenderSlot
+		var build bool
+		index := -1
+		var ch, failed chan struct{}
+		var waitFor time.Duration
+		var result error
+		lockErr := p.withLock("borrow sender", nil, func() {
+			if p.poisonedErr != nil {
+				result = p.poisonedErr
+				return
 			}
-			gen := slot.generation.Add(1)
-			p.mu.Unlock()
-			return &qwpPooledSender{pool: p, slot: slot, gen: gen}, nil
-		}
-		if p.capUsedLocked() < p.maxSize {
-			// A waiter woken by the acquire timer can reach here with the
-			// deadline already past; report pool exhaustion rather than
-			// starting a dial doomed by an expired context.
+			if p.closed || p.closing.Load() {
+				result = errPoolClosed
+				return
+			}
+			p.reprobeRetiredSlotsLocked()
+			if p.poisonedErr != nil {
+				result = p.poisonedErr
+				return
+			}
+			if n := len(p.available); n > 0 {
+				slot := p.available[n-1]
+				// Keep the slot in the list until its checks and state update
+				// succeed, so a panic cannot make the pool lose the sender.
+				defer func() {
+					if r := recover(); r != nil {
+						p.failSlotsLocked("borrow slot", r, []*qwpSenderSlot{slot})
+						result = p.poisonedErr
+					}
+				}()
+				if slotTerminallyFailed(slot.delegate) {
+					if p.prepareSlotCloseLocked(slot, qwpSfSlotAvailable) {
+						discard = slot
+					}
+				} else {
+					p.transitionSfSlotLocked(slot.slotIndex, qwpSfSlotAvailable, qwpSfSlotLeased)
+					lease = &qwpPooledSender{pool: p, slot: slot, gen: slot.generation.Add(1)}
+				}
+				p.available = p.available[:n-1]
+				return
+			}
 			if time.Until(deadline) <= 0 {
-				p.mu.Unlock()
-				return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
+				result = fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
+				return
 			}
-			// Honor a cancelled borrow ctx explicitly: the async growth build no
-			// longer surfaces it via a synchronous dial.
-			if err := ctx.Err(); err != nil {
-				p.mu.Unlock()
-				return nil, err
+			if ctx.Err() != nil {
+				result = ctx.Err()
+				return
 			}
-			p.inFlightCreations++
-			slotIndex := -1
-			if p.storeAndForward {
-				slotIndex = p.allocateSlotIndexLocked()
+			if p.capUsedLocked() < p.maxSize {
+				if p.storeAndForward {
+					index = p.allocateSlotIndexLocked()
+				}
+				p.inFlightCreations++
+				build = true
+				return
 			}
-			p.mu.Unlock()
-			// Grow asynchronously: the pool is already running, so a growth
-			// borrow during a transient outage must not hard-fail — it buffers
-			// via store-and-forward and connects in the background (Invariant B).
-			// Only the min-prewarm at build follows the configured connect mode
-			// (a down server there is a startup error).
-			//
-			// createSlotAt's heavy work (SF segment open/recovery) takes no ctx
-			// and can block indefinitely on a wedged sf_dir mount, so the deadline
-			// cannot bound it in-line — run it on a helper goroutine and abandon it
-			// at the deadline. A late-completing build settles itself through
-			// settleGrowthBuild: its slot lands in `available` (or is torn down if
-			// the pool closed meanwhile), and inFlightCreations stays counted until
-			// then so close()'s wait and the cap check both see it.
+			p.waiters++
+			ch, failed = p.notify, p.failureDone
+			waitFor = time.Until(deadline)
+			// Cleanup does not notify the pool when it finishes. Check regularly
+			// only while some slots are waiting for cleanup.
+			if p.sfSlotStateCountLocked(qwpSfSlotRetired) > 0 {
+				waitFor = min(waitFor, 10*time.Millisecond)
+			}
+		})
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		if result != nil {
+			return nil, result
+		}
+		if lease != nil {
+			return lease, nil
+		}
+		if discard != nil {
+			go p.closeReturnedSlot(discard)
+			continue
+		}
+		if build {
+			// Opening files can take longer than the caller is willing to wait.
+			// Keep track of the new sender even if the caller leaves: pass it to
+			// settleGrowthBuild when it is ready.
 			bctx, cancel := context.WithDeadline(ctx, deadline)
 			resultCh := make(chan *qwpSenderSlot, 1)
 			errCh := make(chan error, 1)
-			go func() {
-				slot, err := p.createSlotAt(bctx, slotIndex, true)
-				resultCh <- slot
-				errCh <- err
-			}()
+			go func() { slot, err := p.createSlotAt(bctx, index, true, nil); resultCh <- slot; errCh <- err }()
 			timer := time.NewTimer(time.Until(deadline))
 			select {
 			case slot := <-resultCh:
 				timer.Stop()
 				cancel()
-				err := <-errCh
-				p.mu.Lock()
-				p.inFlightCreations--
-				if err != nil {
-					p.freeSlotIndexLocked(slotIndex)
-					p.broadcastLocked()
-					p.mu.Unlock()
-					return nil, err
-				}
-				if p.closed {
-					// close() left this just-built slot for us. Track the teardown and
-					// keep the SF slot counted as closing so close()'s outstanding-count
-					// wait cannot return while the delegate — and its SF flock — is still
-					// closing, then free the index only after the close completes. Mirrors
-					// giveBack's closed branch; freeing the index before the off-lock close
-					// briefly stranded the flock on an index a reopen could reuse.
-					if p.storeAndForward && slot.slotIndex >= 0 {
-						p.closingSlots++
-					}
-					p.pendingLeaseTeardowns++
-					p.mu.Unlock()
-					// Disconnect off-lock with a panic guard and a background ctx — a
-					// cancelled caller ctx must not cut this close short, matching every
-					// other close site in the pool.
-					_ = closeSlotGuarded(context.Background(), slot.delegate)
-					p.mu.Lock()
-					p.pendingLeaseTeardowns--
-					p.reclaimSlotLocked(slot, nil)
-					p.broadcastLocked()
-					p.mu.Unlock()
-					return nil, errPoolClosed
-				}
-				p.all = append(p.all, slot)
-				gen := slot.generation.Add(1)
-				p.mu.Unlock()
-				return &qwpPooledSender{pool: p, slot: slot, gen: gen}, nil
+				return p.settleBuiltSlot(slot, index, <-errCh, true)
 			case <-timer.C:
-				go p.settleGrowthBuild(resultCh, errCh, cancel, slotIndex)
+				go p.settleGrowthBuild(resultCh, errCh, cancel, index)
 				return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
 			case <-ctx.Done():
 				timer.Stop()
-				go p.settleGrowthBuild(resultCh, errCh, cancel, slotIndex)
+				go p.settleGrowthBuild(resultCh, errCh, cancel, index)
 				return nil, ctx.Err()
 			}
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			p.mu.Unlock()
-			return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
-		}
-		p.waiters++
-		ch := p.notify
-		p.mu.Unlock()
-		timer := time.NewTimer(remaining)
+		timer := time.NewTimer(waitFor)
 		select {
 		case <-ch:
+		case <-failed:
 		case <-timer.C:
 		case <-ctx.Done():
-			timer.Stop()
-			p.mu.Lock()
-			p.waiters--
-			p.mu.Unlock()
-			return nil, ctx.Err()
 		}
 		timer.Stop()
-		p.mu.Lock()
-		p.waiters--
+		p.withLock("finish borrow wait", nil, func() { p.waiters-- })
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 	}
 }
 
-// settleGrowthBuild resolves a growth build that outran its borrow's acquire
-// deadline (borrow abandoned it and already returned a timeout). It waits for
-// the build to complete, decrements inFlightCreations (kept counted until now so
-// close()'s wait and the cap check saw the pending build), and disposes of the
-// result: a build error frees the reserved index; a successful slot is added to
-// `available` for the next borrower unless the pool closed meanwhile, in which
-// case it is torn down through the same tracked path borrow's closed-race uses.
-// Runs on its own goroutine so a wedged sf_dir open never pins the borrower.
+// settleGrowthBuild handles a sender that was still being created when its
+// borrower stopped waiting. The pool keeps counting that work until creation
+// finishes. settleBuiltSlot then saves the sender for another borrower or
+// arranges cleanup; failed cleanup keeps its slot reserved. This runs in a
+// separate goroutine so slow file operations do not hold up the borrower.
 func (p *qwpSenderPool) settleGrowthBuild(resultCh <-chan *qwpSenderSlot, errCh <-chan error, cancel context.CancelFunc, slotIndex int) {
 	slot := <-resultCh
 	err := <-errCh
 	cancel()
-	p.mu.Lock()
-	p.inFlightCreations--
-	if err != nil {
-		p.freeSlotIndexLocked(slotIndex)
-		p.broadcastLocked()
-		p.mu.Unlock()
-		return
-	}
-	if p.closed {
-		if p.storeAndForward && slot.slotIndex >= 0 {
-			p.closingSlots++
-		}
-		p.pendingLeaseTeardowns++
-		p.mu.Unlock()
-		_ = closeSlotGuarded(context.Background(), slot.delegate)
-		p.mu.Lock()
-		p.pendingLeaseTeardowns--
-		p.reclaimSlotLocked(slot, nil)
-		p.broadcastLocked()
-		p.mu.Unlock()
-		return
-	}
-	slot.idleSince = time.Now()
-	p.all = append(p.all, slot)
-	p.available = append(p.available, slot)
-	p.broadcastLocked()
-	p.mu.Unlock()
+	_, _ = p.settleBuiltSlot(slot, slotIndex, err, false)
 }
 
-// giveBack returns a slot to the available set, dropping the return if the
-// lease is stale (already returned and possibly re-borrowed) or the pool is
-// closed — this is what makes lease Close idempotent under a concurrent
-// re-borrow (Hazard B). Broken slots are discarded instead of recycled.
-func (p *qwpSenderPool) giveBack(ctx context.Context, ps *qwpPooledSender, broken bool) {
-	p.mu.Lock()
-	if ps.slot.generation.Load() != ps.gen {
-		p.mu.Unlock()
-		return // stale lease (already returned / re-borrowed) — never double-act
-	}
-	// Invalidate this lease so a duplicate Close is dropped above.
-	ps.slot.generation.Add(1)
-	if p.closed {
-		// The pool was torn down while this slot was on loan, so close() left it
-		// for us: close() never tears down a borrowed delegate (a producer
-		// goroutine may be inside it mid-append). The producer is done now,
-		// so closing the delegate here cannot race a writer. Track the teardown
-		// so a concurrent close() does not return while it is in flight, and
-		// count the SF slot as closing so reclaimSlotLocked's decrement below
-		// stays balanced.
-		p.removeFromAllLocked(ps.slot)
-		if p.storeAndForward && ps.slot.slotIndex >= 0 {
-			p.closingSlots++
+// settleBuiltSlot keeps the new sender's slot reserved until it is handed to
+// a borrower, saved for a later borrow, or passed to a cleanup worker.
+func (p *qwpSenderPool) settleBuiltSlot(slot *qwpSenderSlot, index int, buildErr error, borrow bool) (LineSender, error) {
+	var lease *qwpPooledSender
+	var closeSlot bool
+	result := buildErr
+	err := p.withLock("finish sender construction", []*qwpSenderSlot{slot}, func() {
+		p.inFlightCreations--
+		defer p.broadcastLocked()
+		if buildErr != nil {
+			p.reclaimFailedBuildLocked(slot, index, buildErr)
+			return
 		}
-		p.pendingLeaseTeardowns++
-		p.mu.Unlock()
-		_ = closeSlotGuarded(ctx, ps.slot.delegate)
-		p.mu.Lock()
-		p.pendingLeaseTeardowns--
-		p.reclaimSlotLocked(ps.slot, nil)
+		if p.closed || p.closing.Load() || p.poisonedErr != nil {
+			closeSlot = p.prepareSlotCloseLocked(slot, qwpSfSlotCreating)
+			result = errPoolClosed
+			if p.poisonedErr != nil {
+				result = p.poisonedErr
+			}
+			return
+		}
+		if borrow {
+			p.transitionSfSlotLocked(index, qwpSfSlotCreating, qwpSfSlotLeased)
+			lease = &qwpPooledSender{pool: p, slot: slot, gen: slot.generation.Add(1)}
+		} else {
+			p.transitionSfSlotLocked(index, qwpSfSlotCreating, qwpSfSlotAvailable)
+			slot.idleSince = time.Now()
+			p.available = append(p.available, slot)
+		}
+		p.all = append(p.all, slot)
+	})
+	if closeSlot && err == nil {
+		go p.closeReturnedSlot(slot)
+	}
+	if err != nil {
+		return nil, errors.Join(result, err)
+	}
+	if lease == nil {
+		return nil, result
+	}
+	return lease, result
+}
+
+// giveBack accepts a borrowed sender only once. A healthy sender can be reused;
+// a failed sender or one returned after shutdown is closed in the background.
+// If a panic left a slot's state unknown, keep it reserved without trying to
+// repair it.
+func (p *qwpSenderPool) giveBack(_ context.Context, ps *qwpPooledSender, broken bool) error {
+	var closeSlot bool
+	var result error
+	err := p.withLock("return sender", []*qwpSenderSlot{ps.slot}, func() {
+		result = p.poisonedErr
+		if ps.slot.generation.Load() != ps.gen {
+			return
+		}
+		ps.slot.generation.Add(1)
+		if ps.slot.cleanupFailed {
+			return
+		}
+		if p.closed || p.closing.Load() || p.poisonedErr != nil || broken {
+			closeSlot = p.prepareSlotCloseLocked(ps.slot, qwpSfSlotLeased)
+		} else {
+			p.transitionSfSlotLocked(ps.slot.slotIndex, qwpSfSlotLeased, qwpSfSlotAvailable)
+			ps.slot.idleSince = time.Now()
+			p.available = append(p.available, ps.slot)
+		}
 		p.broadcastLocked()
-		p.mu.Unlock()
-		return
+	})
+	if closeSlot && err == nil {
+		go p.closeReturnedSlot(ps.slot)
 	}
-	if broken {
-		p.discardLocked(ps.slot)
-		return // discardLocked unlocks
-	}
-	ps.slot.idleSince = time.Now()
-	p.available = append(p.available, ps.slot)
-	p.broadcastLocked()
-	p.mu.Unlock()
+	return errors.Join(result, err)
 }
 
 // terminalReporter lets the pool detect a delegate whose background send loop
@@ -488,6 +601,21 @@ type returnFlusher interface {
 	flushForReturn(ctx context.Context) (retained bool, err error)
 }
 
+// closeCompletionReporter is implemented by the concrete QWP sender. Close
+// may safely return before its manager worker exits; in that case the delegate
+// and slot index must remain retired until the worker publishes completion.
+type closeCompletionReporter interface {
+	closeCompleted() bool
+}
+
+type closeLifecycleReporter interface {
+	closeCompletionReporter
+}
+
+func slotCloseCompleted(slot *qwpSenderSlot) bool {
+	return slot == nil || slot.cleanup == nil || slot.cleanup.closeCompleted()
+}
+
 // slotHasUnackedRows reports whether an idle slot's delegate still has in-flight
 // rows the server has not acknowledged. Reaping such a memory-mode slot would
 // destroy those rows and cut short the reconnect/replay window that could still
@@ -498,42 +626,17 @@ func slotHasUnackedRows(delegate QwpSender) bool {
 }
 
 // closeSlotGuarded closes a delegate, converting a panic into an error so a
-// faulting Close cannot strand the pool's SF slot accounting (closingSlots /
-// slotInUse) or skip sibling teardowns. qwpLineSender.Close is itself panic-
-// guarded on its I/O goroutines; this is defense-in-depth for the pool's own
-// invariants on the paths that bump closingSlots before the out-of-lock Close.
+// faulting Close cannot strand the pool's SF slot lifecycle or skip sibling
+// teardowns. qwpLineSender.Close is itself panic-guarded on its I/O goroutines;
+// this is defense-in-depth for lifecycle transitions that bracket off-lock
+// Close calls.
 func closeSlotGuarded(ctx context.Context, delegate LineSender) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("qwp pool: delegate close panicked: %v", r)
+			err = fmt.Errorf("%w: qwp pool: delegate close panicked: %v\n%s", ErrCleanupFailed, r, debug.Stack())
 		}
 	}()
 	return delegate.Close(ctx)
-}
-
-// discardLocked evicts a broken slot from `all` and closes its delegate outside
-// the lock. Caller holds mu; discardLocked releases it. The delegate is closed
-// with context.Background(): discarding a broken slot is incidental teardown
-// that a cancelled caller ctx must not cut short, matching reapIdle and the
-// borrow closed-race close site (the discarded slot is terminally failed, so
-// its drain returns immediately regardless).
-//
-// The off-lock close is counted in pendingLeaseTeardowns: the slot is already
-// out of `all`, so without it close()'s outstanding count would not see this
-// teardown and could return while the delegate still holds its SF flock.
-func (p *qwpSenderPool) discardLocked(slot *qwpSenderSlot) {
-	p.removeFromAllLocked(slot)
-	if p.storeAndForward && slot.slotIndex >= 0 {
-		p.closingSlots++
-	}
-	p.pendingLeaseTeardowns++
-	p.mu.Unlock()
-	closeErr := closeSlotGuarded(context.Background(), slot.delegate)
-	p.mu.Lock()
-	p.pendingLeaseTeardowns--
-	p.reclaimSlotLocked(slot, closeErr)
-	p.broadcastLocked()
-	p.mu.Unlock()
 }
 
 // markClosing signals reapIdle to bail. Called before the housekeeper is
@@ -543,13 +646,13 @@ func (p *qwpSenderPool) markClosing() { p.closing.Store(true) }
 // reapCloseHook, when non-nil, is invoked at the start of each reap-victim
 // close goroutine. Test seam only: it lets a test hold a reap teardown in
 // flight to assert close() waits for it. Nil in production.
-var reapCloseHook func()
+var reapCloseHook atomic.Pointer[func()]
 
 // createSlotHook, when non-nil, is invoked at the start of createSlotAt's build.
 // Test seam only: it lets a test wedge a growth build past the acquire deadline
 // to assert the borrow abandons it and settleGrowthBuild reclaims the slot. Nil
 // in production.
-var createSlotHook func()
+var createSlotHook atomic.Pointer[func()]
 
 // reapIdle closes idle-expired / over-age slots from the available set, never
 // shrinking below minSize. Called by the housekeeper.
@@ -557,61 +660,148 @@ func (p *qwpSenderPool) reapIdle() {
 	if p.closing.Load() {
 		return
 	}
+	p.reprobeRetiredSlots()
 	toClose := p.selectReapVictims(time.Now())
 	if len(toClose) == 0 {
 		return
 	}
-	// Close concurrently so an N-slot sweep during an outage is bounded by one
-	// close_flush_timeout, not N — otherwise it overruns the housekeeper join
-	// budget and the reap outlives QuestDB.Close, holding SF flocks past return.
+	// Start closing all these slots without waiting for one to finish first.
+	// QuestDB.Close tracks each slot's cleanup and waits for the housekeeper
+	// to exit. The timeout for server confirmation does not limit total cleanup.
 	var wg sync.WaitGroup
 	errs := make([]error, len(toClose))
 	for i, slot := range toClose {
 		wg.Add(1)
-		go func(i int, delegate QwpSender) {
+		go func(i int, slot *qwpSenderSlot) {
 			defer wg.Done()
-			if reapCloseHook != nil {
-				reapCloseHook()
+			var before func()
+			if hook := reapCloseHook.Load(); hook != nil {
+				before = *hook
 			}
-			errs[i] = closeSlotGuarded(context.Background(), delegate)
-		}(i, slot.delegate)
+			errs[i] = p.closeSlotTask(slot, before)
+		}(i, slot)
 	}
 	wg.Wait()
-	p.mu.Lock()
-	var reapErrs []error
 	for i, slot := range toClose {
-		if errs[i] != nil {
-			// Collect under the lock, log after Unlock: the logger is the user's
-			// slog handler, so running it while holding p.mu would let a slow or
-			// panicking handler stall (or, behind the housekeeper's log-only
-			// recover, strand) the pool lock.
-			reapErrs = append(reapErrs, errs[i])
-		}
-		// Balance the per-victim increment in selectReapVictims now that the
-		// teardown has completed, so close()'s outstanding wait no longer counts it.
-		p.pendingLeaseTeardowns--
-		p.reclaimSlotLocked(slot, errs[i])
+		p.finishSlotClose(slot, errs[i])
 	}
-	p.broadcastLocked()
-	p.mu.Unlock()
-	for _, err := range reapErrs {
-		qwpEffectiveLogger(p.logger).Warn("qwp pool: reaping a slot failed to drain cleanly", "error", err)
+	for _, err := range errs {
+		if err != nil {
+			qwpEffectiveLogger(p.logger).Warn("qwp pool: reaping a slot failed to drain cleanly", "error", err)
+		}
 	}
 }
 
-// selectReapVictims removes the idle-expired / over-age / poisoned slots from the
-// available set under the lock and returns them for off-lock closing. The lock is
-// released via defer so a panic in the selection can never strand it (the reap
-// runs behind a recover in the housekeeper).
+// qwpSlotPartition lists the slots to keep and the slots to remove. Check all
+// senders before changing the pool. If making the changes fails, keep references
+// to the affected senders; do not try to finish or undo the partial changes.
+type qwpSlotPartition struct {
+	kept                       []*qwpSenderSlot
+	removed                    []*qwpSenderSlot
+	pendingLeaseTeardownsDelta int
+	removeFromAll              bool
+	transitionSf               bool
+	sfFrom                     qwpSfSlotState
+	sfTo                       qwpSfSlotState
+}
+
+// applySlotPartitionLocked updates the lists, slot states, and counts together.
+// Check for problems first, but still handle a panic during the updates. If that
+// happens, keep every affected sender. The caller must hold mu.
+func (p *qwpSenderPool) applySlotPartitionLocked(target *[]*qwpSenderSlot, part qwpSlotPartition) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.failSlotsLocked("apply slot changes", r, part.removed)
+		}
+	}()
+	if p.storeAndForward && part.transitionSf {
+		seen := make(map[int]bool, len(part.removed))
+		for _, slot := range part.removed {
+			if seen[slot.slotIndex] {
+				panic("duplicate SF slot in batch")
+			}
+			seen[slot.slotIndex] = true
+		}
+		// Check expected states before changing any of them.
+		for _, slot := range part.removed {
+			p.requireSfSlotStateLocked(slot.slotIndex, part.sfFrom)
+		}
+	}
+	for _, slot := range part.removed {
+		if part.removeFromAll {
+			p.removeFromAllLocked(slot)
+		}
+		if part.transitionSf {
+			p.transitionSfSlotLocked(slot.slotIndex, part.sfFrom, part.sfTo)
+		}
+	}
+	p.pendingLeaseTeardowns += part.pendingLeaseTeardownsDelta
+	*target = part.kept
+	return true
+}
+
+// poisonLocked refuses future borrows and wakes callers waiting for shutdown.
+// Keep the failed pool alive even if the application drops its reference, so
+// garbage collection cannot close files or release locks that may still be in
+// use. This does not retry cleanup or repair the pool. The caller must hold mu.
+func (p *qwpSenderPool) poisonLocked(op string, panicValue any) {
+	if p.poisonedErr == nil {
+		p.poisonedErr = fmt.Errorf("%w: %w: %s panicked: %v", ErrCleanupFailed, ErrPoolPoisoned, op, panicValue)
+		qwpFailedSenderPools.Lock()
+		qwpFailedSenderPools.pools = append(qwpFailedSenderPools.pools, p)
+		qwpFailedSenderPools.Unlock()
+		if p.failureDone == nil {
+			p.failureDone = make(chan struct{})
+		}
+		close(p.failureDone)
+		// Logging must not hold the mutex or make callers wait for the error.
+		logger, err := p.logger, p.poisonedErr
+		go func() {
+			qwpEffectiveLogger(logger).Error("qwp pool: internal failure; uncertain senders remain held", "operation", op, "error", err)
+		}()
+	}
+}
+
+// selectReapVictims chooses idle, old, or failed senders to close outside the
+// lock. Check them before changing the lists. If updating the pool fails partway
+// through, keep the affected senders and refuse future borrows.
 func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed || p.poisonedErr != nil {
 		return nil
 	}
-	var toClose []*qwpSenderSlot
-	kept := p.available[:0]
+	part, ok := p.classifyReapVictimsLocked(now)
+	if !ok {
+		return nil
+	}
+	if !p.applySlotPartitionLocked(&p.available, part) {
+		return nil
+	}
+	return part.removed
+}
+
+// classifyReapVictimsLocked checks which available senders should be closed,
+// without changing the lists or slot states. If checking a sender panics, keep
+// that sender, record the pool failure, and return ok=false. On success, the
+// caller marks the selected slots as closing and counts their cleanup work.
+// The caller must hold mu.
+func (p *qwpSenderPool) classifyReapVictimsLocked(now time.Time) (part qwpSlotPartition, ok bool) {
+	var checking *qwpSenderSlot
+	defer func() {
+		if r := recover(); r != nil {
+			p.failSlotsLocked("reap-victim classification", r, []*qwpSenderSlot{checking})
+		}
+	}()
+	// Build a separate list so a panic during the checks cannot partly
+	// overwrite p.available.
+	part.kept = make([]*qwpSenderSlot, 0, len(p.available))
+	part.removeFromAll = true
+	part.transitionSf = true
+	part.sfFrom = qwpSfSlotAvailable
+	part.sfTo = qwpSfSlotClosing
 	for _, slot := range p.available {
+		checking = slot
 		idleExpired := p.idleTimeout > 0 && now.Sub(slot.idleSince) >= p.idleTimeout
 		overAge := p.maxLifetime > 0 && now.Sub(slot.createdAt) >= p.maxLifetime
 		// A slot poisoned by a background HALT is useless to a borrower, so reap
@@ -619,9 +809,6 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 		// proactively clears poisoned slots so a wave of borrowers does not have
 		// to discard them one by one during incident recovery.
 		poisoned := slotTerminallyFailed(slot.delegate)
-		// removeFromAllLocked already shrinks p.all, so test it directly — do
-		// not also subtract len(toClose) or the reaped count is counted twice
-		// and the pool under-reaps to ~min+excess/2 per tick.
 		// Idle/age recycling is floored at minSize, so max_lifetime_ms is inert
 		// for min slots: no evict-and-replace (recreating mid-outage could
 		// orphan unacked SF data); QWP self-reconnects anyway. See README.
@@ -630,165 +817,249 @@ func (p *qwpSenderPool) selectReapVictims(now time.Time) []*qwpSenderSlot {
 		// poisoned slot is exempt — its HALT is terminal, so the rows are already
 		// lost and holding the slot only wastes it.
 		hasUnacked := !poisoned && slotHasUnackedRows(slot.delegate)
-		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize && !hasUnacked) {
-			p.removeFromAllLocked(slot)
-			if p.storeAndForward && slot.slotIndex >= 0 {
-				p.closingSlots++
-			}
-			// Count the off-lock reap teardown so close()'s outstanding wait
-			// cannot return while a reaped slot is still releasing its delegate
-			// (and, in SF mode, its flock). The victim is already out of `all`, so
-			// as with discardLocked the formula would otherwise miss it entirely;
-			// capUsedLocked separately tracks closingSlots, so this does not
-			// double-count there. Decremented in reapIdle after the close.
-			p.pendingLeaseTeardowns++
-			toClose = append(toClose, slot)
+		// The apply step shrinks len(p.all) only after classification, so the
+		// minSize floor subtracts the victims chosen so far to match reaping
+		// them one at a time.
+		if poisoned || ((idleExpired || overAge) && len(p.all)-len(part.removed) > p.minSize && !hasUnacked) {
+			part.removed = append(part.removed, slot)
+			part.pendingLeaseTeardownsDelta++
 			continue
 		}
-		kept = append(kept, slot)
+		part.kept = append(part.kept, slot)
 	}
-	p.available = kept
-	return toClose
+	return part, true
 }
 
-// close shuts the pool down and disconnects its slots. Idempotent.
+// close starts pool shutdown once. Later calls wait for the same attempt and
+// check its current result.
 //
-// It closes only the returned (available) slots here. A slot still on loan has a
-// live producer goroutine, and closing its delegate concurrently would race that
-// writer (its row buffer and table maps) — a data race the panic guards cannot
-// catch. An outstanding lease instead closes its own delegate when it is returned
-// (giveBack sees p.closed). A lease that is never returned leaks its connection:
-// the caller must return every lease before QuestDB.Close.
+// Close only senders that have been returned to the pool. A borrower may still
+// be writing rows; closing its sender could free buffers it is using. Catching
+// panics cannot make that safe. The application must stop using each borrowed
+// sender and return it, which starts cleanup if the pool has already closed.
+// A sender that is never returned keeps its resources.
 //
-// A BorrowSender whose slot build is still in flight is likewise not closed here
-// — the creating goroutine closes its just-built delegate itself once it acquires
-// p.mu and observes p.closed (see borrow). close() does not block for that, so the
-// "all resources released" postcondition is reached a beat after close() returns:
-// in SF mode the just-built slot's flock can linger briefly, and an immediate
-// reopen on the same sf_dir may momentarily observe it. This is covered by the
-// same contract — quiesce borrows and return every lease before Close.
+// If a sender is still being created, keep its slot reserved, even before it
+// takes the file lock. Once created, pass it to background cleanup if the pool
+// has closed. Slots waiting for release remain reserved and cannot be reused;
+// slots whose cleanup fails permanently stay reserved. Later Close calls also
+// report saved errors.
 //
-// Slots close concurrently on context.Background(): each drain is bounded by
-// close_flush_timeout, so the caller's ctx must neither serialize the drains
-// (an N-slot outage would stall shutdown for N × the timeout) nor cancel them
-// (dropping undelivered memory-mode rows). Matches the lease-return and reap
-// paths. The ctx argument is accepted for interface symmetry but unused.
-func (p *qwpSenderPool) close(_ context.Context) error {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil
+// One background worker closes the available senders in parallel. ctx limits
+// how long the caller waits, not the worker or each sender's time to queue rows
+// and wait for server acknowledgements. Report internal failure without waiting
+// for other senders that are still closing.
+func (p *qwpSenderPool) close(ctx context.Context) error {
+	var start bool
+	var done, failed chan struct{}
+	err := p.withLock("start pool close", nil, func() {
+		if !p.closeStarted {
+			p.closeStarted = true
+			p.closeDone = make(chan struct{})
+			if p.failureDone == nil {
+				p.failureDone = make(chan struct{})
+			}
+			start = true
+			p.closed = true
+			p.closing.Store(true)
+			p.broadcastLocked()
+		}
+		done, failed = p.closeDone, p.failureDone
+	})
+	if start {
+		go p.closeWorker()
 	}
-	p.closed = true
-	p.closing.Store(true)
-	// Wake parked borrowers so they observe the shutdown and error out.
-	p.broadcastLocked()
+	if err != nil {
+		return err
+	}
+	return p.cleanupWaitResult(ctx, done, failed)
+}
 
-	// Bounded graceful wait for outstanding leases: close() NEVER tears down
-	// a borrowed delegate — a producer goroutine may be inside it mid-append,
-	// and closing it here would flush and free buffers under that
-	// goroutine. giveBack observing `closed` tears each delegate down on the
-	// returning borrower's goroutine instead (tracked via
-	// pendingLeaseTeardowns so this method does not return while a teardown
-	// is still in flight). The budget is the acquire timeout hard-capped at
-	// qwpPoolMaxCloseLeaseWait: a huge acquire timeout is a borrow policy,
-	// not a licence for close() to hang on a lease that never comes home.
-	waitBudget := p.acquireTimeout
-	if waitBudget > qwpPoolMaxCloseLeaseWait {
-		waitBudget = qwpPoolMaxCloseLeaseWait
-	}
+// closeWorker runs the pool's one shutdown attempt. It closes closeDone when
+// the attempt ends, even after a panic. That signal alone does not mean all
+// resources have been released.
+func (p *qwpSenderPool) closeWorker() {
+	var candidates []*qwpSenderSlot
+	var leaked int
+	defer func() {
+		// This runs after closeDone is closed. A slow logger must not delay
+		// cleanup or keep callers waiting after the work has finished.
+		if leaked > 0 {
+			qwpEffectiveLogger(p.logger).Warn("qwp pool: close() leaving borrowed sender(s) alive; "+
+				"each is torn down when its lease is closed", "leaked", leaked)
+		}
+	}()
+	defer func() {
+		r := recover()
+		p.withLock("finish pool close", candidates, func() {
+			if r != nil {
+				p.failSlotsLocked("pool close", r, candidates)
+			}
+			close(p.closeDone)
+			p.broadcastLocked()
+		})
+	}()
+	waitBudget := min(p.acquireTimeout, qwpPoolMaxCloseLeaseWait)
 	deadline := time.Now().Add(waitBudget)
 	for {
-		outstanding := len(p.all) - len(p.available) + p.inFlightCreations + p.pendingLeaseTeardowns
-		if outstanding <= 0 {
+		var ch, failed chan struct{}
+		p.withLock("wait for returned senders", nil, func() {
+			if p.poisonedErr == nil && p.closeWaitOutstandingLocked() > 0 && time.Now().Before(deadline) {
+				p.waiters++
+				ch, failed = p.notify, p.failureDone
+			}
+		})
+		if ch == nil {
 			break
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-		p.waiters++
-		ch := p.notify
-		p.mu.Unlock()
-		timer := time.NewTimer(remaining)
+		timer := time.NewTimer(time.Until(deadline))
 		select {
 		case <-ch:
+		case <-failed:
 		case <-timer.C:
 		}
 		timer.Stop()
-		p.mu.Lock()
-		p.waiters--
+		p.withLock("finish lease wait", nil, func() { p.waiters-- })
 	}
-	if leaked := len(p.all) - len(p.available); leaked > 0 {
-		// A logged leak is recoverable; a freed buffer under a live producer
-		// is not. The delegate is torn down whenever its lease finally
-		// returns (giveBack's closed branch).
-		qwpEffectiveLogger(p.logger).Warn("qwp pool: close() leaving borrowed sender(s) alive; "+
-			"each is torn down when its lease is closed", "leaked", leaked)
-	}
-	toClose := append([]*qwpSenderSlot(nil), p.available...)
-	for _, slot := range toClose {
-		p.removeFromAllLocked(slot)
-	}
-	p.available = nil
-	p.broadcastLocked()
-	p.mu.Unlock()
-
-	var (
-		wg       sync.WaitGroup
-		errMu    sync.Mutex
-		firstErr error
-	)
-	for _, slot := range toClose {
-		wg.Add(1)
-		go func(delegate QwpSender) {
-			defer wg.Done()
-			if err := closeSlotGuarded(context.Background(), delegate); err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
+	p.withLock("select senders to close", nil, func() {
+		leaked = p.closeLeasedCountLocked()
+		candidates = append([]*qwpSenderSlot(nil), p.available...)
+	})
+	toClose := make([]*qwpSenderSlot, 0, len(candidates))
+	for _, slot := range candidates {
+		var ready bool
+		err := p.withLock("prepare sender close", []*qwpSenderSlot{slot}, func() {
+			ready = p.prepareSlotCloseLocked(slot, qwpSfSlotAvailable)
+			if ready {
+				p.removeAvailableLocked(slot)
 			}
-		}(slot.delegate)
+		})
+		if ready && err == nil {
+			toClose = append(toClose, slot)
+		}
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, len(toClose))
+	for i, slot := range toClose {
+		wg.Add(1)
+		go func(i int, slot *qwpSenderSlot) {
+			defer wg.Done()
+			errs[i] = p.closeSlotTask(slot, nil)
+		}(i, slot)
 	}
 	wg.Wait()
-	return firstErr
+	for i, slot := range toClose {
+		p.finishSlotClose(slot, errs[i])
+	}
+}
+
+// currentCloseResult combines saved errors with the current slot states.
+// If checking the result panics, report the failure and still unlock the mutex.
+func (p *qwpSenderPool) currentCloseResult() error {
+	p.reprobeRetiredSlots()
+	var result error
+	err := p.withLock("read pool close result", nil, func() {
+		pending := p.sfCloseSnapshotLocked()
+		teardownErr := p.closeTeardownErr
+		if !p.storeAndForward && (p.closeWaitOutstandingLocked() > 0 || len(p.retiredSlots) > 0) {
+			teardownErr = errors.Join(teardownErr, ErrCleanupPending)
+		}
+		for _, slot := range p.retiredSlots {
+			if slot.cleanupFailed {
+				continue
+			}
+			if reporter, ok := slot.cleanup.(interface{ cleanupResult() error }); ok {
+				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
+			} else {
+				teardownErr = errors.Join(teardownErr, p.slotCleanupFailureGuardedLocked(slot))
+			}
+		}
+		// A failed slot may still have other resources being released. Read
+		// results only from these known types, whose methods do not perform
+		// cleanup. Do not repeat a check that panicked or call Close again on
+		// a sender whose state may be partly changed.
+		for _, slot := range p.failedSlots {
+			switch reporter := slot.cleanup.(type) {
+			case *qwpLineSender:
+				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
+			case *qwpSfBuildCleanupError:
+				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
+			case *qwpSenderBuildCleanupError:
+				teardownErr = errors.Join(teardownErr, reporter.cleanupResult())
+			}
+		}
+		result = qwpPoolCloseResult(teardownErr, p.poisonedErr, pending)
+	})
+	return errors.Join(result, err)
+}
+
+// stableCloseResult returns saved errors without checking for unfinished work.
+func (p *qwpSenderPool) stableCloseResult() error {
+	var result error
+	err := p.withLock("read saved pool errors", nil, func() {
+		result = qwpPoolCloseResult(p.closeTeardownErr, p.poisonedErr, nil)
+	})
+	return errors.Join(result, err)
 }
 
 // createSlot allocates an SF slot index when needed and builds a slot.
 //
-// Construction-only: the sole caller is newQwpSenderPool's prewarm loop, which
-// runs single-threaded before the pool is published, so the *Locked index
-// helpers below are invoked WITHOUT holding p.mu. Do not call createSlot off the
-// construction path — once the pool is shared, allocateSlotIndexLocked /
-// freeSlotIndexLocked must run under p.mu (as borrow does) or they race the
-// slotInUse bitmap.
+// The sole caller is newQwpSenderPool's prewarm loop. It still takes p.mu for
+// lifecycle changes so construction follows the same state rules as growth.
 func (p *qwpSenderPool) createSlot(ctx context.Context, async bool) (*qwpSenderSlot, error) {
 	slotIndex := -1
-	if p.storeAndForward {
-		slotIndex = p.allocateSlotIndexLocked()
-	}
-	slot, err := p.createSlotAt(ctx, slotIndex, async)
-	if err != nil {
-		p.freeSlotIndexLocked(slotIndex)
+	if err := p.withLock("reserve initial sender", nil, func() {
+		if p.storeAndForward {
+			slotIndex = p.allocateSlotIndexLocked()
+		}
+	}); err != nil {
 		return nil, err
 	}
+	slot, err := p.createSlotAt(ctx, slotIndex, async, nil)
+	lockErr := p.withLock("finish initial sender", []*qwpSenderSlot{slot}, func() {
+		if err != nil {
+			p.reclaimFailedBuildLocked(slot, slotIndex, err)
+			return
+		}
+		p.transitionSfSlotLocked(slotIndex, qwpSfSlotCreating, qwpSfSlotAvailable)
+	})
+	if err != nil || lockErr != nil {
+		return nil, errors.Join(err, lockErr)
+	}
 	return slot, nil
+}
+
+func (p *qwpSenderPool) reclaimFailedBuildLocked(slot *qwpSenderSlot, slotIndex int, buildErr error) {
+	if slot != nil && slot.cleanup != nil {
+		p.transitionSfSlotLocked(slotIndex, qwpSfSlotCreating, qwpSfSlotClosing)
+		p.reclaimSlotLocked(slot, buildErr)
+		return
+	}
+	p.transitionSfSlotLocked(slotIndex, qwpSfSlotCreating, qwpSfSlotFree)
 }
 
 // createSlotAt builds a sender bound to slotIndex (-1 in memory mode). It parses
 // a fresh config from the base string and overrides the per-slot identity, the
 // in-range orphan fence, the ingest callbacks, and (for recovery) async connect.
-// Guarded against a panic in the heavy build path (Hazard I).
-func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async bool) (slot *qwpSenderSlot, err error) {
+// revalidate is non-nil only for startup adoption of a previously scanned slot;
+// the cursor runs it under the parent-anchored logical lock. Guarded against a
+// panic in the heavy build path (Hazard I).
+func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async bool, revalidate func(string) error) (slot *qwpSenderSlot, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			// A panic that left an engine behind carries its cleanup reporter,
+			// so the slot keeps its index reserved and is retired rather than
+			// freed while that engine's cleanup worker still holds the file lock.
+			if bp, ok := r.(qwpSfBuildPanic); ok {
+				slot = &qwpSenderSlot{cleanup: bp.reporter, slotIndex: slotIndex}
+				err = fmt.Errorf("qwp pool: sender build panicked: %v\n%s", bp.cause, bp.stack)
+				return
+			}
 			err = fmt.Errorf("qwp pool: sender build panicked: %v", r)
 		}
 	}()
-	if createSlotHook != nil {
-		createSlotHook()
+	if hook := createSlotHook.Load(); hook != nil {
+		(*hook)()
 	}
 	cfg, perr := confFromStr(p.baseConf)
 	if perr != nil {
@@ -805,6 +1076,7 @@ func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async b
 	if p.storeAndForward {
 		cfg.senderId = p.slotBase + "-" + strconv.Itoa(slotIndex)
 		cfg.orphanDrainExclude = p.inRangeFence
+		cfg.sfOpenRevalidate = revalidate
 	}
 	if async {
 		cfg.initialConnectMode = InitialConnectAsync
@@ -812,17 +1084,22 @@ func (p *qwpSenderPool) createSlotAt(ctx context.Context, slotIndex int, async b
 	}
 	delegate, err := newLineSender(ctx, cfg)
 	if err != nil {
+		var cleanup closeLifecycleReporter
+		if errors.As(err, &cleanup) {
+			return &qwpSenderSlot{cleanup: cleanup, slotIndex: slotIndex}, err
+		}
 		return nil, err
 	}
 	// The facade is ws/wss-only, so newLineSender always yields a QWP sender;
 	// asserting here lets a pooled lease forward the full QwpSender surface.
 	qwpDelegate, ok := delegate.(QwpSender)
 	if !ok {
-		_ = delegate.Close(ctx)
+		_ = closeSlotGuarded(ctx, delegate)
 		return nil, fmt.Errorf("qwp pool: delegate is %T, not a QwpSender", delegate)
 	}
 	now := time.Now()
-	return &qwpSenderSlot{delegate: qwpDelegate, slotIndex: slotIndex, createdAt: now, idleSince: now}, nil
+	cleanup, _ := qwpDelegate.(closeLifecycleReporter)
+	return &qwpSenderSlot{delegate: qwpDelegate, cleanup: cleanup, slotIndex: slotIndex, createdAt: now, idleSince: now}, nil
 }
 
 // inRangeFence reports whether name is one of the pool's managed in-range slot
@@ -842,17 +1119,20 @@ func (p *qwpSenderPool) inRangeFence(name string) bool {
 	return err == nil && suffix == strconv.Itoa(i) && i >= 0 && i < p.maxSize
 }
 
-// capUsedLocked is the capacity-accounting sum; a new creation is admitted only
-// while it is below maxSize so closing/leaked/in-flight slots never let the
-// pool over-allocate (Hazard F). Caller holds mu.
+// capUsedLocked derives SF capacity from the per-index lifecycle ledger. The
+// memory-mode pool has no flock identities and retains its ordinary list-based
+// accounting. Caller holds mu.
 func (p *qwpSenderPool) capUsedLocked() int {
-	return len(p.all) + p.inFlightCreations + p.closingSlots + p.leakedSlots
+	if !p.storeAndForward {
+		return len(p.all) + p.inFlightCreations
+	}
+	return p.sfSlotObligationCountLocked()
 }
 
 func (p *qwpSenderPool) allocateSlotIndexLocked() int {
-	for i := range p.slotInUse {
-		if !p.slotInUse[i] {
-			p.slotInUse[i] = true
+	for i := range p.sfSlots {
+		if p.sfSlots[i].state == qwpSfSlotFree {
+			p.transitionSfSlotLocked(i, qwpSfSlotFree, qwpSfSlotCreating)
 			return i
 		}
 	}
@@ -862,30 +1142,225 @@ func (p *qwpSenderPool) allocateSlotIndexLocked() int {
 	return -1
 }
 
-func (p *qwpSenderPool) freeSlotIndexLocked(idx int) {
-	if idx >= 0 && idx < len(p.slotInUse) {
-		p.slotInUse[idx] = false
+func qwpSfSlotTransitionAllowed(from, to qwpSfSlotState) bool {
+	switch from {
+	case qwpSfSlotFree:
+		return to == qwpSfSlotCreating
+	case qwpSfSlotCreating:
+		return to == qwpSfSlotAvailable || to == qwpSfSlotLeased ||
+			to == qwpSfSlotClosing || to == qwpSfSlotFree
+	case qwpSfSlotAvailable:
+		return to == qwpSfSlotLeased || to == qwpSfSlotClosing
+	case qwpSfSlotLeased:
+		return to == qwpSfSlotAvailable || to == qwpSfSlotClosing
+	case qwpSfSlotClosing:
+		return to == qwpSfSlotRetired || to == qwpSfSlotFree
+	case qwpSfSlotRetired:
+		return to == qwpSfSlotFree
+	default:
+		return false
 	}
 }
 
-// reclaimSlotLocked returns an SF slot index to the free set after its delegate
-// close completed. Caller holds mu.
-//
-// Hazard F (a retired, never-reused index) does NOT manifest in Go's model the
-// way a thread pool would: the Go sender's Close synchronously joins the I/O
-// goroutine (sendLoopClose's wg.Wait) and then releases the slot flock in
-// engineClose, so by the time Close returns — error or not — the flock is
-// released. A close error here is benign (e.g. a drain-timeout on a slot reaped
-// while the server is down) and must NOT permanently erode capacity, so the
-// index is always freed. leakedSlots therefore stays 0; it is retained in the
-// cap math only as a defensive accountant.
-func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
-	_ = closeErr
-	if !p.storeAndForward || slot.slotIndex < 0 {
+func (p *qwpSenderPool) requireSfSlotStateLocked(index int, want qwpSfSlotState) {
+	if !p.storeAndForward || index < 0 {
 		return
 	}
-	p.closingSlots--
-	p.freeSlotIndexLocked(slot.slotIndex)
+	if index >= len(p.sfSlots) {
+		panic(fmt.Sprintf("qwp pool: SF slot index %d outside lifecycle ledger of size %d", index, len(p.sfSlots)))
+	}
+	if got := p.sfSlots[index].state; got != want {
+		panic(fmt.Sprintf("qwp pool: SF slot %d state is %s, want %s", index, got, want))
+	}
+}
+
+func (p *qwpSenderPool) transitionSfSlotLocked(index int, from, to qwpSfSlotState) {
+	if !p.storeAndForward || index < 0 {
+		return
+	}
+	p.requireSfSlotStateLocked(index, from)
+	if !qwpSfSlotTransitionAllowed(from, to) {
+		panic(fmt.Sprintf("qwp pool: illegal SF slot %d transition %s -> %s", index, from, to))
+	}
+	if hook := qwpTestPoolTransitionHook.Load(); hook != nil {
+		(*hook)(p, index, from, to)
+	}
+	p.sfSlots[index].state = to
+}
+
+func (p *qwpSenderPool) sfSlotStateCountLocked(states ...qwpSfSlotState) int {
+	count := 0
+	for i := range p.sfSlots {
+		for _, state := range states {
+			if p.sfSlots[i].state == state {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+func (p *qwpSenderPool) sfSlotObligationCountLocked() int {
+	count := 0
+	for i := range p.sfSlots {
+		if p.sfSlots[i].state != qwpSfSlotFree {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *qwpSenderPool) sfCloseSnapshotLocked() []qwpSfSlotObligation {
+	if !p.storeAndForward {
+		return nil
+	}
+	pending := make([]qwpSfSlotObligation, 0, len(p.sfSlots))
+	for i := range p.sfSlots {
+		if state := p.sfSlots[i].state; state != qwpSfSlotFree {
+			pending = append(pending, qwpSfSlotObligation{index: i, state: state})
+		}
+	}
+	return pending
+}
+
+func (p *qwpSenderPool) closeWaitOutstandingLocked() int {
+	if !p.storeAndForward {
+		return len(p.all) - len(p.available) + p.inFlightCreations + p.pendingLeaseTeardowns
+	}
+	return p.sfSlotStateCountLocked(qwpSfSlotCreating, qwpSfSlotLeased, qwpSfSlotClosing)
+}
+
+func (p *qwpSenderPool) closeLeasedCountLocked() int {
+	if !p.storeAndForward {
+		return len(p.all) - len(p.available)
+	}
+	return p.sfSlotStateCountLocked(qwpSfSlotLeased)
+}
+
+// reclaimSlotLocked makes a store-and-forward slot available only after the
+// sender confirms that cleanup released its file lock. A timeout leaves cleanup
+// running and the slot reserved, still counting against pool capacity.
+// reprobeRetiredSlots checks for completion both during periodic maintenance
+// and when a borrow finds the pool full, so capacity can be recovered even with
+// housekeeper_interval_ms=0.
+func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
+	if errors.Is(closeErr, ErrCleanupFailed) {
+		p.failSlotsLocked("sender close", closeErr, []*qwpSenderSlot{slot})
+	}
+	if slot.cleanupFailed {
+		return
+	}
+	p.requireSfSlotStateLocked(slot.slotIndex, qwpSfSlotClosing)
+	if !p.slotCloseCompletedGuardedLocked(slot) {
+		if slot.cleanupFailed {
+			return
+		}
+		p.transitionSfSlotLocked(slot.slotIndex, qwpSfSlotClosing, qwpSfSlotRetired)
+		p.retiredSlots = append(p.retiredSlots, slot)
+		return
+	}
+	p.harvestSlotResultLocked(slot)
+	p.transitionSfSlotLocked(slot.slotIndex, qwpSfSlotClosing, qwpSfSlotFree)
+}
+
+// Save the sender's final cleanup error before the pool stops tracking it.
+// This only reads the result; it does not try to close the sender again.
+func (p *qwpSenderPool) harvestSlotResultLocked(slot *qwpSenderSlot) {
+	if reporter, ok := slot.cleanup.(interface{ cleanupResult() error }); ok {
+		p.closeTeardownErr = qwpAppendCloseError(p.closeTeardownErr, reporter.cleanupResult())
+	}
+}
+
+// Check for cleanup failure without running cleanup from the pool.
+// Catch a panic from this check so the caller can still unlock p.mu.
+func (p *qwpSenderPool) slotCleanupFailureGuardedLocked(slot *qwpSenderSlot) (err error) {
+	if slot.cleanupFailed {
+		return p.poisonedErr
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			p.failSlotsLocked("slot cleanup-error probe", r, []*qwpSenderSlot{slot})
+			err = errors.Join(ErrCleanupFailed, p.poisonedErr)
+		}
+	}()
+	if reporter, ok := slot.cleanup.(interface{ cleanupFailure() error }); ok {
+		return reporter.cleanupFailure()
+	}
+	return nil
+}
+
+func (p *qwpSenderPool) slotCloseCompletedGuardedLocked(slot *qwpSenderSlot) (completed bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.failSlotsLocked("slot close-completion probe", r, []*qwpSenderSlot{slot})
+			completed = false
+		}
+	}()
+	return slotCloseCompleted(slot)
+}
+
+// reprobeRetiredSlots checks whether cleanup has finished for retired slots.
+// It unlocks the pool before logging restored capacity.
+func (p *qwpSenderPool) reprobeRetiredSlots() {
+	p.mu.Lock()
+	restored := func() int {
+		defer p.mu.Unlock()
+		return p.reprobeRetiredSlotsLocked()
+	}()
+	if restored > 0 {
+		go qwpEffectiveLogger(p.logger).Info("qwp pool: restored capacity after deferred cleanup", "slots", restored)
+	}
+}
+
+// reprobeRetiredSlotsLocked checks slots waiting for cleanup and returns how
+// many can now be reused. The caller must hold p.mu; this method does not lock
+// or unlock it. Check completion before changing slot states. If a check panics,
+// leave the lists unchanged. If an update panics, keep the affected senders and
+// stop trying to make slots available again.
+func (p *qwpSenderPool) reprobeRetiredSlotsLocked() int {
+	if p.poisonedErr != nil || len(p.retiredSlots) == 0 {
+		return 0
+	}
+	part, ok := p.classifyRetiredSlotsLocked()
+	if !ok {
+		return 0
+	}
+	if !p.applySlotPartitionLocked(&p.retiredSlots, part) {
+		return 0
+	}
+	if len(part.removed) > 0 {
+		p.broadcastLocked()
+	}
+	return len(part.removed)
+}
+
+// classifyRetiredSlotsLocked separates slots whose cleanup has finished from
+// those still waiting. It asks each sender whether cleanup is complete without
+// changing the lists or slot states. If a check panics, keep the sender, record
+// the pool failure, and return ok=false. The caller updates slot states only
+// after all checks succeed. The caller must hold mu.
+func (p *qwpSenderPool) classifyRetiredSlotsLocked() (part qwpSlotPartition, ok bool) {
+	var checking *qwpSenderSlot
+	defer func() {
+		if r := recover(); r != nil {
+			p.failSlotsLocked("retired-slot reprobe classification", r, []*qwpSenderSlot{checking})
+		}
+	}()
+	part.kept = make([]*qwpSenderSlot, 0, len(p.retiredSlots))
+	part.transitionSf = p.storeAndForward
+	part.sfFrom = qwpSfSlotRetired
+	part.sfTo = qwpSfSlotFree
+	for _, slot := range p.retiredSlots {
+		checking = slot
+		if !slot.cleanupFailed && slotCloseCompleted(slot) {
+			p.harvestSlotResultLocked(slot)
+			part.removed = append(part.removed, slot)
+			continue
+		}
+		part.kept = append(part.kept, slot)
+	}
+	return part, true
 }
 
 func (p *qwpSenderPool) removeFromAllLocked(slot *qwpSenderSlot) {
@@ -914,12 +1389,27 @@ func (p *qwpSenderPool) broadcastLocked() {
 func (p *qwpSenderPool) poolSnapshot() (total, available, leaked int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.all), len(p.available), p.leakedSlots
+	return len(p.all), len(p.available), p.sfSlotStateCountLocked(qwpSfSlotRetired)
 }
 
 // ErrPoolClosed is returned by BorrowSender / BorrowQuery (and the underlying
 // pools) once QuestDB.Close has run. Match it with errors.Is.
 var ErrPoolClosed = errors.New("qwp pool: handle is closed")
+
+// ErrPoolPoisoned means an internal failure left a pool unable to safely lend
+// senders or query clients. BorrowSender, BorrowQuery, a borrowed handle's Close,
+// and QuestDB.Close may return an error wrapping it. Use errors.Is to check for
+// it and inspect the underlying error. Stop using the affected pool, and stop
+// using each borrowed handle before returning it.
+//
+// Corrupt pool state also produces [ErrCleanupFailed]. Calling Close again
+// reports the failure; it does not repair the pool's records. Slots that
+// cannot safely be reused stay reserved. Creating another QuestDB does not
+// free the old pool's locks; reusing the same slots may require a process
+// restart. Other cleanup that is known to be safe may finish, but the
+// internal failure remains in the result. Unlike [ErrSfCleanupPending] alone,
+// this error cannot be resolved just by waiting longer.
+var ErrPoolPoisoned = errors.New("qwp pool: internal pool failure; the pool no longer lends handles")
 
 // ErrSenderPoolExhausted is returned by BorrowSender when the ingest pool is at
 // sender_pool_max and no sender frees up within acquire_timeout_ms. The returned
@@ -1352,6 +1842,20 @@ func (ps *qwpPooledSender) TotalBackpressureStalls() int64 {
 	return ps.slot.delegate.TotalBackpressureStalls()
 }
 
+func (ps *qwpPooledSender) SlotLockReleased() bool {
+	if !ps.live() {
+		return true
+	}
+	return ps.slot.delegate.SlotLockReleased()
+}
+
+func (ps *qwpPooledSender) QuarantinedSlotPath() string {
+	if !ps.live() {
+		return ""
+	}
+	return ps.slot.delegate.QuarantinedSlotPath()
+}
+
 func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 	if !ps.live() {
 		return nil
@@ -1359,41 +1863,30 @@ func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 	return ps.slot.delegate.BackgroundDrainers()
 }
 
-// Close returns the leased sender to the pool. It flushes committed rows first
-// (surfacing but not swallowing a latched fluent-API error) so the next
-// borrower starts clean; the slot is marked broken (discarded rather than
-// recycled) on a terminal fault OR when the return flush left committed rows
-// un-enqueued (a backpressure-deadline / engine-closed failure — a dirty slot
-// that would leak this borrower's rows into the next). A benign fluent-API
-// latch, whose committed rows still flushed cleanly, leaves a healthy slot to be
-// reused. Idempotent — a stale lease no-ops.
-//
-// The flush and return run on context.Background, not the caller's ctx: the
-// return flush only publishes into the cursor engine (it never waits for the
-// server ACK), so
-// a request-scoped ctx must not (a) leave pending rows un-published in a slot
-// the next borrower reuses, or (b) mark a healthy slot broken via a
-// context.Canceled / DeadlineExceeded. Both would thrash the pool under the
-// standard `ctx, cancel := ...; defer sender.Close(ctx)` pattern. The publish is
-// bounded by the engine's append deadline, not the caller's ctx.
+// Close returns the borrowed sender; see [LineSender.Close] for the QWP rules.
+// It discards an unfinished row and queues completed rows for sending. This
+// uses the append timeout, not the caller's context, so a cancelled request
+// cannot leave buffered rows for the next borrower. An earlier row-building
+// error need not remove the sender from the pool if completed rows were queued
+// successfully. Rows that could not be queued, or a terminal sender error,
+// require removal instead of reuse. Calls after return do nothing.
 func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 	if !ps.live() {
 		return nil
 	}
 	var flushErr error
 	ctx1 := context.Background()
-	// Panic-guard the return flush the way closeSlotGuarded guards every
-	// pool-internal delegate close: a fault in flushForReturn (a producer left
-	// mid-mutation by a recovered panic in At/*Column) must not skip giveBack
-	// and strand the slot on-loan forever. On panic, discard the slot (its
-	// producer state is untrusted), still give it back, and surface the panic
-	// as an error consistent with closeSlotGuarded's wording rather than
-	// re-panicking through the caller's defer.
+	// A panic can leave the row buffers partly changed. Keep the sender rather
+	// than call Close and risk flushing those rows again.
 	defer func() {
 		if r := recover(); r != nil {
-			ps.broken = true
-			ps.pool.giveBack(ctx1, ps, true)
-			retErr = fmt.Errorf("qwp pool: delegate close panicked: %v", r)
+			ps.pool.withLock("return flush", []*qwpSenderSlot{ps.slot}, func() {
+				if ps.slot.generation.Load() == ps.gen {
+					ps.slot.generation.Add(1)
+				}
+				ps.pool.failSlotsLocked("return flush", r, []*qwpSenderSlot{ps.slot})
+				retErr = errors.Join(flushErr, ps.pool.poisonedErr)
+			})
 		}
 	}()
 	if !ps.broken {
@@ -1433,6 +1926,6 @@ func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 			ps.markBrokenIfTerminal()
 		}
 	}
-	ps.pool.giveBack(ctx1, ps, ps.broken)
-	return flushErr
+	poolErr := ps.pool.giveBack(ctx1, ps, ps.broken)
+	return errors.Join(flushErr, poolErr)
 }

@@ -1258,20 +1258,12 @@ func TestQwpQueryClientCloseTwiceOK(t *testing.T) {
 	}
 }
 
-// TestQwpQueryClientCloseShortCtxNoReaderRace guards the reader-race invariant: Close(ctx) with
-// an already-cancelled ctx must not race the reader goroutine over the
-// transport's conn. shutdown(ctx) returns via ctx.Done() before doneCh
-// fires (the reader has not joined), so the transport teardown that
-// follows runs while the reader is still live inside readerRun. The
-// reader re-reads io.transport.conn every loop iteration; the teardown
-// must not mutate that field out from under it. Run under -race (CI uses
-// `go test -race`): before the fix this trips the detector on
-// io.transport.conn — readerRun's per-iteration field read vs close()'s
-// t.conn=nil write — and can nil-deref the unsupervised reader goroutine.
+// A cancelled Close waiter leaves the internal reader to its owned shutdown.
+// Transport teardown must not mutate the immutable connection pointer while
+// that reader still uses it. No application query or iteration is running.
 func TestQwpQueryClientCloseShortCtxNoReaderRace(t *testing.T) {
-	// Server streams stray text frames as fast as it can and drains its
-	// own reads concurrently so the client's close handshake completes
-	// promptly. readerRun reads io.transport.conn every iteration, skips
+	// Server streams stray text frames and observes client disconnect.
+	// readerRun reads io.transport.conn every iteration, skips
 	// non-binary frames, and loops — so the reader goroutine spins on
 	// that field read while the close lands.
 	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
@@ -1298,7 +1290,7 @@ func TestQwpQueryClientCloseShortCtxNoReaderRace(t *testing.T) {
 	// io.transport.conn concurrently with the still-spinning reader — a
 	// data race the detector flags within a few rounds.
 	for i := 0; i < 40; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 		c, err := NewQwpQueryClient(ctx, WithQwpQueryAddress(addr))
 		cancel()
 		if err != nil {
@@ -1826,20 +1818,15 @@ func TestQwpQueryYieldPanicReleasesBufferAndDrains(t *testing.T) {
 	}
 }
 
-// TestQwpQueryCloseIsNoOpWhileIterating verifies Close called from
-// another goroutine while Batches() is in flight returns immediately
-// and does not compete with the iterator for the dispatcher's single
-// terminal event. Before the fix, Close's CAS guard only prevented
-// double-close by the same caller; a concurrent Close and Batches
-// both entered drainUntilTerminal, and whichever lost the race on the
-// one terminal frame blocked until its cleanup ctx expired (5 s).
-func TestQwpQueryCloseIsNoOpWhileIterating(t *testing.T) {
+// Cancel can cross goroutines. Close follows consumer exit, so only the
+// iterator drains the terminal response and no batch aliases remain in use.
+func TestQwpQueryOwnerClosesAfterCancelledIteration(t *testing.T) {
 	c, cleanup := newMockQueryClient(t, 2, func(m *qwpMockEgressConn) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		// Query 1: send one batch, then block until CANCEL arrives so
-		// the iterator stays parked in takeEvent while the test
-		// invokes Close concurrently.
+		// Send one batch, then wait for CANCEL. This keeps the result-reading
+		// goroutine waiting until the test cancels the query. Close runs only
+		// after that goroutine has stopped reading.
 		req1 := m.readBinary(ctx)
 		reqID1, _, _ := parseQueryRequest(t, req1)
 		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID1, 0, "v", 7))
@@ -1886,20 +1873,6 @@ func TestQwpQueryCloseIsNoOpWhileIterating(t *testing.T) {
 		t.Fatal("iterator never yielded a batch")
 	}
 
-	// Close must return quickly. With the bug it would race the
-	// iterator for the terminal event and block up to the 5 s
-	// cleanup timeout.
-	closeReturned := make(chan struct{})
-	go func() {
-		q.Close()
-		close(closeReturned)
-	}()
-	select {
-	case <-closeReturned:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Close blocked while Batches iteration in flight")
-	}
-
 	// The iterator is still parked. Cancel() triggers the server's
 	// CANCELLED echo, which the iterator swallows and exits cleanly.
 	q.Cancel()
@@ -1909,9 +1882,8 @@ func TestQwpQueryCloseIsNoOpWhileIterating(t *testing.T) {
 		t.Fatal("iterator did not end after Cancel")
 	}
 
-	// Follow-up Query must complete — the dispatcher is idle because
-	// the iterator (not the racing Close) drained to the terminal
-	// frame.
+	q.Close() // iteration and use of result aliases have stopped
+	// Follow-up Query must complete after the iterator's terminal drain.
 	q2 := c.Query(ctx, "SELECT 2")
 	defer q2.Close()
 	for _, err := range q2.Batches() {

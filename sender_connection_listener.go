@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 )
@@ -167,15 +168,20 @@ func (e SenderConnectionEvent) String() string {
 //
 // # Calling back into the sender
 //
-// The listener may call Close() or Flush() on the sender — e.g. to shut down
-// on SenderAuthFailed — without deadlocking. Because the listener runs on the
-// dispatcher goroutine, not the producer goroutine, those calls deliberately
-// do NOT touch in-progress producer state: they surface only a latched
-// terminal error and will not flush rows the producer has staged but not yet
-// flushed itself (those may be mid-assembly on the producer goroutine).
-// Close() still tears down the wire, drains already-published frames up to
-// close_flush_timeout, and releases resources. Same contract as
-// SenderErrorHandler.
+// A listener may run while the application is using the sender. From the
+// listener, do not call Close, Flush, methods that add rows or column values,
+// any other method that changes the sender, or QuestDB.Close. Instead, send a
+// value through a channel or cancel a context. The code using the sender can
+// then stop its current work and call Flush or Close. Starting either method in
+// another goroutine does not make concurrent use safe. The listener may call a
+// method only if that method's documentation says it returns data without
+// changing the sender.
+//
+// Shutdown stops accepting notifications and may drop queued ones. A listener
+// already running may finish after Close returns, even after resources are
+// released. Close guarantees neither delivery of every event nor exit of
+// every callback goroutine. See [SenderErrorHandler] and README's
+// "QWP shutdown and ownership".
 type SenderConnectionListener func(SenderConnectionEvent)
 
 // newDefaultSenderConnectionListener builds the loud-not-silent fallback used
@@ -185,16 +191,18 @@ type SenderConnectionListener func(SenderConnectionEvent)
 // so a flapping or unreachable server is never silent. The caller's logger
 // controls the sink; nil resolves to slog.Default().
 func newDefaultSenderConnectionListener(logger *slog.Logger) SenderConnectionListener {
-	l := qwpEffectiveLogger(logger)
 	return func(e SenderConnectionEvent) {
+		// The resolved logger carries the panic-guarded handler, and the
+		// dispatcher that delivers this already recovers a panicking listener,
+		// so this is defense in depth rather than the only boundary.
+		level := slog.LevelInfo
 		switch e.Kind {
 		case SenderAuthFailed:
-			l.Error("qwp: connection event", "event", e)
+			level = slog.LevelError
 		case SenderDisconnected, SenderEndpointAttemptFailed, SenderAllEndpointsUnreachable:
-			l.Warn("qwp: connection event", "event", e)
-		default:
-			l.Info("qwp: connection event", "event", e)
+			level = slog.LevelWarn
 		}
+		qwpEffectiveLogger(logger).Log(context.Background(), level, "qwp: connection event", "event", e)
 	}
 }
 

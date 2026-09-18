@@ -1,3 +1,5 @@
+//go:build darwin
+
 /*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
@@ -22,12 +24,9 @@
  *
  ******************************************************************************/
 
-//go:build darwin
-
 package questdb
 
 import (
-	"errors"
 	"fmt"
 	"os"
 
@@ -45,13 +44,10 @@ import (
 //  2. On any failure, retry with just F_ALLOCATEALL (relaxed
 //     contiguity, still all-or-nothing). This is the path that
 //     surfaces ENOSPC.
-//  3. Only when the second attempt fails with ENOTSUP / EOPNOTSUPP do
-//     we accept a sparse fallback — those errnos indicate the
-//     filesystem doesn't implement F_PREALLOCATE at all (SMB,
-//     certain network mounts). Every other failure (notably ENOSPC,
-//     EFBIG, EIO) surfaces so the caller doesn't end up mmap'ing a
-//     sparse file that will SIGBUS on first write past the
-//     actually-allocated region.
+//  3. Every failure of the second attempt surfaces, including ENOTSUP /
+//     EOPNOTSUPP. There is no sparse or zero-write fallback: mmap stores
+//     into an unallocated range can terminate the process if blocks cannot
+//     be allocated.
 //
 // F_PEOFPOSMODE positions the allocation immediately after EOF, so
 // the caller MUST ensure f's EOF is at currentSize before invoking
@@ -70,7 +66,7 @@ func qwpSfReserveNewBlocks(f *os.File, currentSize, newBytes int64) error {
 		Offset:  0,
 		Length:  newBytes,
 	}
-	if err := unix.FcntlFstore(f.Fd(), unix.F_PREALLOCATE, fstore); err == nil {
+	if err := qwpSfFcntlFstoreFn.load()(f.Fd(), unix.F_PREALLOCATE, fstore); err == nil {
 		return nil
 	}
 	// Contiguous allocation failed (typically fragmented APFS). Retry
@@ -78,13 +74,13 @@ func qwpSfReserveNewBlocks(f *os.File, currentSize, newBytes int64) error {
 	// free space is genuinely insufficient.
 	fstore.Flags = unix.F_ALLOCATEALL
 	fstore.Bytesalloc = 0
-	err := unix.FcntlFstore(f.Fd(), unix.F_PREALLOCATE, fstore)
+	err := qwpSfFcntlFstoreFn.load()(f.Fd(), unix.F_PREALLOCATE, fstore)
 	if err == nil {
-		return nil
-	}
-	if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) {
 		return nil
 	}
 	return fmt.Errorf("qwp/sf: F_PREALLOCATE %s offset=%d len=%d: %w",
 		f.Name(), currentSize, newBytes, err)
 }
+
+// Tests inject errors below the reservation policy, at the syscall boundary.
+var qwpSfFcntlFstoreFn = qwpSfSwappable(unix.FcntlFstore)

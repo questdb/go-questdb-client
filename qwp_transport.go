@@ -31,14 +31,17 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -108,6 +111,10 @@ const (
 // connections; acceptEncoding, maxBatchRows, maxVersion, and
 // serverInfoTimeout are egress-only and inert at their zero values.
 type qwpTransportOpts struct {
+	// logger routes diagnostics, including cleanup after a failed connection.
+	// Nil uses slog.Default().
+	logger *slog.Logger
+
 	// tlsMode controls certificate verification.
 	// When true, certificate verification is skipped.
 	tlsInsecureSkipVerify bool
@@ -187,6 +194,9 @@ type qwpTransportOpts struct {
 // or the egress reader plus dispatcher — and is not safe for
 // unrestricted concurrent use.
 type qwpTransport struct {
+	// Set before acquiring a connection and retained for asynchronous cleanup.
+	logger *slog.Logger
+
 	// conn is the live WebSocket. A successful connect() assigns it once
 	// and it is never mutated again for the life of the transport —
 	// close() shuts the connection down but leaves the field intact. That
@@ -204,6 +214,8 @@ type qwpTransport struct {
 	// dumpWriter, when non-nil, records all outgoing TCP bytes
 	// (HTTP upgrade + WebSocket frames). Set before connect().
 	dumpWriter io.Writer
+	// Acquired before the WS handshake; retained even if Dial fails.
+	dumpConn *asyncWritePipeConn
 
 	// negotiatedVersion is the QWP wire-protocol version selected by
 	// the server's X-QWP-Version response header. Populated by
@@ -236,6 +248,7 @@ type qwpTransport struct {
 	// field the I/O goroutines read — conn stays immutable (see above),
 	// so close() never races the lock-free reader/dispatcher.
 	closeOnce sync.Once
+	closeDone chan struct{}
 	closeErr  error
 }
 
@@ -270,10 +283,11 @@ type asyncWritePipeConn struct {
 	cond   *sync.Cond
 	queued []byte
 	closed bool
+	done   chan struct{}
 }
 
 func newAsyncWritePipeConn(c net.Conn) *asyncWritePipeConn {
-	a := &asyncWritePipeConn{Conn: c}
+	a := &asyncWritePipeConn{Conn: c, done: make(chan struct{})}
 	a.cond = sync.NewCond(&a.mu)
 	go a.pump()
 	return a
@@ -294,6 +308,7 @@ func (a *asyncWritePipeConn) Write(p []byte) (int, error) {
 // the fake server in order and never interleave. It exits once the conn
 // is closed and the queue is drained.
 func (a *asyncWritePipeConn) pump() {
+	defer close(a.done)
 	for {
 		a.mu.Lock()
 		for len(a.queued) == 0 && !a.closed {
@@ -317,7 +332,9 @@ func (a *asyncWritePipeConn) Close() error {
 	a.closed = true
 	a.cond.Signal()
 	a.mu.Unlock()
-	return a.Conn.Close()
+	err := a.Conn.Close()
+	<-a.done
+	return err
 }
 
 // connect establishes a WebSocket connection to the QWP endpoint.
@@ -328,7 +345,15 @@ func (a *asyncWritePipeConn) Close() error {
 // url is empty, an in-process pipe with a fake WebSocket acceptor
 // is used so the dump includes full HTTP upgrade + WebSocket framing
 // without requiring a real server.
-func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTransportOpts) error {
+func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTransportOpts) (retErr error) {
+	t.logger = opts.logger
+	// Once acquired, even a rejected connection stays owned until release.
+	// The caller's deadline bounds waiting, not the transport's lifetime.
+	defer func() {
+		if retErr != nil && (t.conn != nil || t.dumpConn != nil) {
+			_ = t.closeContext(ctx)
+		}
+	}()
 	if opts.endpointPath == "" {
 		return fmt.Errorf("qwp: endpointPath is required")
 	}
@@ -403,22 +428,16 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		// lets the fake server's ACK race the send loop's bookkeeping.
 		clientConn, serverConn := net.Pipe()
 		go qwpFakeServer(serverConn)
-		buffered := newAsyncWritePipeConn(clientConn)
-		wrapped := &teeConn{Conn: buffered, w: t.dumpWriter}
+		t.dumpConn = newAsyncWritePipeConn(clientConn)
+		wrapped := &teeConn{Conn: t.dumpConn, w: t.dumpWriter}
 		httpTransport.DialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
 			return wrapped, nil
 		}
 		// Use a dummy URL so the WS library has something to parse.
 		wsURL = "ws://dump.local" + path
 
-		// If Dial fails, close the buffered conn so the pump and fake
-		// server goroutines exit. On success the WebSocket owns wrapped
-		// and its Close path tears both down.
-		defer func() {
-			if t.conn == nil {
-				buffered.Close()
-			}
-		}()
+		// Both successful WS teardown and a failed Dial use this transport's
+		// release worker, including the pump join.
 	} else if opts.tlsInsecureSkipVerify {
 		// TLS configuration for wss:// connections.
 		httpTransport.TLSClientConfig = &tls.Config{
@@ -456,23 +475,21 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		defer resp.Body.Close()
 	}
 
+	t.conn = conn
 	// Validate the server-selected QWP version. Require the header to
 	// be present and match our version — a missing header signals a
 	// non-QWP endpoint or a server that did not run the negotiation
 	// path, and a mismatched version means we'd get parse errors on
 	// every message. Fail fast in both cases to match the Java client.
 	if resp == nil {
-		conn.Close(websocket.StatusProtocolError, "no upgrade response")
 		return fmt.Errorf("qwp: no HTTP upgrade response available for version negotiation")
 	}
 	serverVersion := resp.Header.Get(qwpHeaderVersion)
 	if serverVersion == "" {
-		conn.Close(websocket.StatusProtocolError, "missing version header")
 		return fmt.Errorf("qwp: server did not return %s header", qwpHeaderVersion)
 	}
 	negotiated, err := strconv.Atoi(serverVersion)
 	if err != nil || negotiated < 1 || negotiated > int(advertisedMax) {
-		conn.Close(websocket.StatusProtocolError, "version mismatch")
 		return fmt.Errorf("qwp: server selected protocol version %q, client supports up to %d", serverVersion, advertisedMax)
 	}
 
@@ -486,7 +503,6 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 	// before any downstream size check runs.
 	conn.SetReadLimit(qwpMaxFrameReadLimit)
 
-	t.conn = conn
 	t.negotiatedVersion = byte(negotiated)
 	// Parse the optional X-QWP-Max-Batch-Size advertisement. A
 	// non-positive or unparseable value is treated as "no cap":
@@ -506,8 +522,6 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		// Requested durable-ack but the endpoint (likely a replica) did not
 		// advertise it. Terminal: falling back to OK-only trimming would drop
 		// data the caller believes durable.
-		conn.Close(websocket.StatusProtocolError, "durable-ack not supported")
-		t.conn = nil
 		return &QwpDurableAckMismatchError{Endpoint: url}
 	}
 	if t.recvBuf == nil {
@@ -527,19 +541,13 @@ func (t *qwpTransport) connect(ctx context.Context, url string, opts qwpTranspor
 		defer cancel()
 		msgType, payload, err := t.conn.Read(readCtx)
 		if err != nil {
-			t.conn.Close(websocket.StatusProtocolError, "SERVER_INFO read failed")
-			t.conn = nil
 			return fmt.Errorf("qwp: SERVER_INFO read failed: %w", err)
 		}
 		if msgType != websocket.MessageBinary {
-			t.conn.Close(websocket.StatusProtocolError, "SERVER_INFO non-binary")
-			t.conn = nil
 			return fmt.Errorf("qwp: expected SERVER_INFO binary frame, got %v", msgType)
 		}
 		info, err := decodeServerInfo(payload, t.negotiatedVersion)
 		if err != nil {
-			t.conn.Close(websocket.StatusProtocolError, "SERVER_INFO decode failed")
-			t.conn = nil
 			return fmt.Errorf("qwp: SERVER_INFO decode failed: %w", err)
 		}
 		t.serverInfo = info
@@ -787,34 +795,90 @@ func parseAckSequence(data []byte) int64 {
 	return int64(binary.LittleEndian.Uint64(data[qwpAckSequenceOffset : qwpAckSequenceOffset+8]))
 }
 
-// close shuts the WebSocket down with a graceful close frame. Idempotent
+// close shuts down the WebSocket without initiating a close handshake. Idempotent
 // and safe to call concurrently with the egress reader/dispatcher: it
 // closes the conn — which unblocks and errors their in-flight Read/Write
 // — but never mutates the conn field, so it cannot race their lock-free
-// reads of it. coder/websocket's Conn.Close is itself safe under
-// concurrent and repeated calls; closeOnce additionally pins one result.
+// reads of it. All library-initiated discards skip the WS close handshake.
 func (t *qwpTransport) close() error {
-	if t.conn == nil {
-		return nil
-	}
-	t.closeOnce.Do(func() {
-		t.closeErr = t.conn.Close(websocket.StatusNormalClosure, "")
-	})
-	return t.closeErr
+	return t.closeContext(context.Background())
 }
 
-// closeNow closes the WebSocket immediately, skipping the graceful close-frame
-// handshake, which can block for seconds against a dead or wedged peer. Shares
-// closeOnce with close, so a later graceful close is a no-op. Used on the
-// send-loop abandon path where Close must not block.
-func (t *qwpTransport) closeNow() error {
-	if t.conn == nil {
+// closeContext starts one owned release and bounds only this caller's wait.
+// CloseNow can wait for dependency-owned work, including a peer close reply.
+// The worker retains the transport even if every caller stops waiting.
+func (t *qwpTransport) closeContext(ctx context.Context) error {
+	if t == nil || (t.conn == nil && t.dumpConn == nil) {
 		return nil
 	}
 	t.closeOnce.Do(func() {
-		t.closeErr = t.conn.CloseNow()
+		t.closeDone = make(chan struct{})
+		go func() {
+			defer func() {
+				close(t.closeDone)
+				// A failed constructor may have no later observer of this owner.
+				// Logging is outside the resource-completion barrier.
+				if t.closeErr != nil && !errors.Is(t.closeErr, net.ErrClosed) {
+					qwpEffectiveLogger(t.logger).Error("qwp: transport release failed", "error", t.closeErr)
+				}
+			}()
+			defer func() {
+				if r := recover(); r != nil {
+					t.closeErr = fmt.Errorf("%w: transport close panicked: %v", ErrCleanupFailed, r)
+					// No retry through a partially executed dependency close.
+					qwpFailedTransports.Lock()
+					qwpFailedTransports.items = append(qwpFailedTransports.items, t)
+					qwpFailedTransports.Unlock()
+				}
+			}()
+			if hook := qwpTestBeforeTransportClose.Load(); hook != nil {
+				(*hook)(t)
+			}
+			if t.conn != nil {
+				t.closeErr = t.conn.CloseNow()
+				if t.dumpConn != nil {
+					<-t.dumpConn.done
+				}
+			} else {
+				t.closeErr = t.dumpConn.Close()
+			}
+		}()
 	})
-	return t.closeErr
+	select {
+	case <-t.closeDone:
+		return t.closeErr
+	default:
+	}
+	select {
+	case <-t.closeDone:
+		return t.closeErr
+	case <-ctx.Done():
+		return errors.Join(ErrCleanupPending, ctx.Err())
+	}
+}
+
+// Setup panicked, so we cannot assume the transport is safe to close. Keep it
+// reachable without trying to release it again. The code that opened it passes
+// it to the engine so the engine can report the unfinished cleanup.
+func (t *qwpTransport) retainFailure() {
+	t.closeOnce.Do(func() {
+		t.closeDone = make(chan struct{})
+		t.closeErr = fmt.Errorf("%w: transport setup panicked", ErrCleanupFailed)
+		qwpFailedTransports.Lock()
+		qwpFailedTransports.items = append(qwpFailedTransports.items, t)
+		qwpFailedTransports.Unlock()
+		close(t.closeDone)
+	})
+}
+
+// Fault-injection seam for release waits; nil in production.
+var qwpTestBeforeTransportClose atomic.Pointer[func(*qwpTransport)]
+
+// A terminal close fault must not leave the last handle to a Go finalizer.
+// This is a retention root, not a retry scheduler.
+var qwpFailedTransports struct {
+	sync.Mutex
+	items []*qwpTransport
 }
 
 // --- fake server for dump mode ---

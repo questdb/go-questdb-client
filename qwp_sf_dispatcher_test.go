@@ -351,20 +351,11 @@ func TestQwpSfDispatcherNilOfferIsNoop(t *testing.T) {
 	}
 }
 
-// TestQwpSfDispatcherCloseFromHandlerNoSelfJoin is a regression test
-// for the self-join deadlock: a SenderErrorHandler that calls the
-// sender's Close() runs inside deliver() on the dispatcher loop
-// goroutine, and Close() funnels into dispatcher.close(). Before the
-// fix, close()'s unbounded wg.Wait() waited for loop() to exit while
-// loop() was suspended in the handler frame beneath that wait — a
-// permanent hang no timeout escaped. close() must recognize the
-// re-entrant caller, return without waiting, and let loop() unwind
-// itself once the handler stack returns.
-func TestQwpSfDispatcherCloseFromHandlerNoSelfJoin(t *testing.T) {
+// The error callback notifies the owner rather than closing its own handle.
+func TestQwpSfDispatcherNotifiesOwnerToClose(t *testing.T) {
 	var d *qwpSfErrorDispatcher
 	returned := make(chan struct{})
 	d = newQwpSfErrorDispatcher(func(e *SenderError) {
-		d.close() // re-entrant: runs on the loop goroutine
 		close(returned)
 	}, 4)
 
@@ -374,30 +365,29 @@ func TestQwpSfDispatcherCloseFromHandlerNoSelfJoin(t *testing.T) {
 
 	select {
 	case <-returned:
-		// close() returned to the handler — no self-join.
+		// The owner received the callback's notification.
 	case <-time.After(2 * time.Second):
-		t.Fatal("Close() from handler deadlocked (self-join on the dispatcher loop goroutine)")
+		t.Fatal("callback did not notify the owner")
 	}
 
+	d.close() // The notified owner closes the dispatcher.
 	// Fully closed: further offers rejected, and the loop goroutine
 	// terminates (wg released) shortly after the handler unwinds.
 	if d.offer(&SenderError{Category: CategoryParseError}) {
-		t.Fatal("offer accepted after re-entrant close")
+		t.Fatal("offer accepted after owner close")
 	}
 	loopExited := make(chan struct{})
 	go func() { d.wg.Wait(); close(loopExited) }()
 	select {
 	case <-loopExited:
 	case <-time.After(2 * time.Second):
-		t.Fatal("loop goroutine did not exit after re-entrant close")
+		t.Fatal("loop goroutine did not exit after owner close")
 	}
 	d.close() // idempotent re-close from the test goroutine must not hang
 }
 
-// TestQwpSfDispatcherExternalCloseStillJoinsLoop guards against the
-// re-entrancy fix over-firing: a close() from a goroutine other than
-// the loop's must still block until the loop goroutine has exited, so
-// callers that free resources after Close() returns stay safe.
+// Owner-side close gives a cooperative callback a bounded chance to finish.
+// Callback completion is not a resource-release guarantee.
 func TestQwpSfDispatcherExternalCloseStillJoinsLoop(t *testing.T) {
 	release := make(chan struct{})
 	var inHandler atomic.Bool
@@ -541,11 +531,9 @@ func TestQwpSfDispatcherAbandonDropsQueued(t *testing.T) {
 }
 
 // TestQwpSfDispatcherReentrantCloseCountsAbandonedAsDropped is the
-// qwpSfErrorDispatcher twin of the generic dispatcher's re-entrant-close
-// accounting test: close() from the handler returns before its own leftovers
-// sweep, so drain()'s deadline give-up must count the still-queued items as
-// dropped. Hard invariant: delivered + dropped == offered.
-func TestQwpSfDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
+// Owner-side close accounts for both delivered and discarded notifications.
+// Hard invariant: delivered + dropped == offered.
+func TestQwpSfDispatcherOwnerCloseCountsDropped(t *testing.T) {
 	const extra = 12
 	var d *qwpSfErrorDispatcher
 	queued := make(chan struct{})
@@ -553,7 +541,6 @@ func TestQwpSfDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
 	d = newQwpSfErrorDispatcher(func(*SenderError) {
 		once.Do(func() {
 			<-queued
-			d.close() // re-entrant: returns without the close-side sweep
 		})
 		time.Sleep(qwpSfDispatcherDrainTimeout + 20*time.Millisecond)
 	}, extra+4)
@@ -567,18 +554,19 @@ func TestQwpSfDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
 		}
 	}
 	close(queued)
+	d.close()
 
 	joined := make(chan struct{})
 	go func() { d.wg.Wait(); close(joined) }()
 	select {
 	case <-joined:
 	case <-time.After(10 * time.Second):
-		t.Fatal("dispatcher loop never exited after re-entrant close")
+		t.Fatal("dispatcher loop never exited after owner close")
 	}
 
 	delivered, dropped := d.totalDelivered(), d.droppedNotifications()
 	if got, want := delivered+dropped, int64(extra+1); got != want {
 		t.Fatalf("delivered(%d) + dropped(%d) = %d, want %d — items abandoned on the "+
-			"re-entrant close path went uncounted", delivered, dropped, got, want)
+			"close path went uncounted", delivered, dropped, got, want)
 	}
 }

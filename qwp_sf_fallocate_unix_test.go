@@ -1,3 +1,5 @@
+//go:build linux || darwin
+
 /*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
@@ -22,8 +24,6 @@
  *
  ******************************************************************************/
 
-//go:build linux || darwin
-
 package questdb
 
 import (
@@ -37,15 +37,13 @@ import (
 )
 
 // TestQwpSfSegmentCreateReservesDiskBlocks verifies that a fresh
-// segment is NOT sparse — i.e. qwpSfReserveDiskBlocks reached real
+// segment is NOT sparse — i.e. qwpSfReserveNewBlocks reached real
 // disk-block reservation, not just an ftruncate. We check via
 // stat.Blocks, which counts 512-byte units of allocated storage; a
 // sparse file would report a Blocks count far below sizeBytes/512.
 //
-// Skipped on filesystems where the reserve syscall is unsupported
-// (Blocks ends up close to zero — same as a plain ftruncate).
-// Operators on those filesystems take the SIGBUS risk by design;
-// the test is asserting the *typical* dev / CI filesystem path.
+// This test requires a filesystem with real reservation support. Unsupported
+// reservation must fail creation, not silently pass or skip a sparse result.
 func TestQwpSfSegmentCreateReservesDiskBlocks(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prealloc.sfa")
@@ -63,11 +61,6 @@ func TestQwpSfSegmentCreateReservesDiskBlocks(t *testing.T) {
 	require.True(t, ok, "expected *syscall.Stat_t from os.Stat on unix")
 
 	allocBytes := int64(stat.Blocks) * 512
-	if allocBytes < segSize/2 {
-		t.Skipf("filesystem appears not to support pre-allocation (Blocks=%d, want >= %d); "+
-			"SIGBUS risk falls back on operator sizing per spec",
-			stat.Blocks, segSize/2/512)
-	}
 	assert.GreaterOrEqual(t, allocBytes, segSize,
 		"pre-allocation must reserve >= sizeBytes; sparse file would report a small Blocks count")
 }

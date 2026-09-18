@@ -101,7 +101,9 @@ const qwpSfDefaultMaxFrameRejections = 4
 // the host index PickNext returned (see failover.md §2); the
 // factory owns the mapping idx → URL, auth headers, and TLS config.
 // Single-host factories may ignore idx — they always dial the same
-// address.
+// address. If an error comes with a non-nil transport, that transport still
+// needs cleanup; it must not be used to send data. The engine keeps track of
+// it until its close worker finishes.
 //
 // Implementations should return immediately on terminal errors
 // (auth rejection, version mismatch) and let transient errors
@@ -297,11 +299,6 @@ type qwpSfSendLoop struct {
 	// false; inner goroutines observe it via ctx.Done.
 	running atomic.Bool
 
-	// abandoned is set when sendLoopClose gives up waiting for an I/O
-	// goroutine wedged in un-cancellable disk I/O. The engine teardown must
-	// then leak the segment mmaps rather than unmap them under that goroutine.
-	abandoned atomic.Bool
-
 	// ctx is the loop's master context; cancel() forces both
 	// inner goroutines out of any blocking transport calls.
 	ctx    context.Context
@@ -314,6 +311,11 @@ type qwpSfSendLoop struct {
 	// lastError holds the first terminal error. Atomic pointer so
 	// the producer can sample it from any goroutine.
 	lastError atomic.Pointer[error]
+
+	// Final transport cleanup is separate from the first sending error.
+	// run publishes this before releasing wg; an unstarted loop records it
+	// in sendLoopClose instead. A server rejection must not hide this failure.
+	transportCloseError atomic.Pointer[error]
 
 	// lastTerminalServerError is the typed-payload sibling to
 	// lastError. Set when recordFatalServerError is called with a
@@ -477,7 +479,7 @@ func qwpSfNewSendLoop(
 	l := &qwpSfSendLoop{
 		engine:                  engine,
 		parkInterval:            parkInterval,
-		reconnectFactory:        factory,
+		reconnectFactory:        engine.trackConnectCleanup(factory),
 		reconnectMaxDuration:    reconnectMaxDuration,
 		reconnectInitialBackoff: reconnectInitialBackoff,
 		reconnectMaxBackoff:     reconnectMaxBackoff,
@@ -513,6 +515,7 @@ func qwpSfNewSendLoop(
 	// the ring's "set once before producing starts" contract, and so
 	// every construction path — memory and SF — gets it for free.
 	engine.engineSetSendLoopWakeup(l.wakeSender)
+	engine.reader.Store(l)
 	return l
 }
 
@@ -587,9 +590,7 @@ func (l *qwpSfSendLoop) sendLoopSetPolicyResolver(r *qwpSfPolicyResolver) {
 // flood scenarios may lose a notification, matching offer's
 // best-effort contract.
 //
-// Safe to call from within a SenderErrorHandler: old.close() detects
-// that it is running on the old dispatcher's own loop goroutine and
-// returns without joining itself (see qwpSfErrorDispatcher.close).
+// Handler changes run on the application owner, not inside a callback.
 func (l *qwpSfSendLoop) sendLoopSetErrorHandler(handler SenderErrorHandler, capacity int) {
 	if capacity <= 0 {
 		capacity = qwpSfDefaultErrorInboxCapacity
@@ -693,70 +694,58 @@ func (l *qwpSfSendLoop) sendLoopStart() {
 	go l.run()
 }
 
-// qwpSfSendLoopCloseGrace bounds how long sendLoopClose waits for the I/O
-// goroutine to exit after cancelling its context. cancel() unwinds every
-// ctx-aware blocking op at once, so a goroutine still alive past this grace is
-// wedged in un-cancellable I/O — a disk-backed segment mmap page-fault on hung
-// storage. var (not const) so package tests can dial it down.
-var qwpSfSendLoopCloseGrace = 5 * time.Second
-
-// sendLoopClose stops the I/O goroutine and waits for it to exit, bounded by
-// qwpSfSendLoopCloseGrace so a goroutine wedged in un-cancellable disk I/O
-// cannot hang Close forever. Idempotent. Safe to call from any goroutine.
+// sendLoopClose asks the send loop to stop and waits until it has stopped.
+// The cleanup worker calls this without a deadline, even if the public Close
+// call has already stopped waiting.
 func (l *qwpSfSendLoop) sendLoopClose() error {
 	l.running.Store(false)
 	l.cancel()
-	joined := make(chan struct{})
-	go func() {
-		l.wg.Wait()
-		close(joined)
-	}()
-	timer := time.NewTimer(qwpSfSendLoopCloseGrace)
-	defer timer.Stop()
-	select {
-	case <-joined:
-		// run() exited: its own defers already released the transport, and both
-		// inner goroutines were joined before it returned, so reclaiming the
-		// remaining resources below cannot race the wire loop.
-	case <-timer.C:
-		// Wedged in I/O the ctx cannot reach (a disk-backed segment mmap
-		// page-fault on hung storage). Abandon rather than hang Close. The
-		// engine teardown must now leak the segment mmaps: unmapping them under
-		// the wedged goroutine, which is mid-dereference of the mapping, would
-		// fault the host process when storage resolves.
-		l.abandoned.Store(true)
-		qwpEffectiveLogger(l.logger).Warn("qwp/sf: send loop still running after close; "+
-			"abandoning (wedged in un-cancellable disk I/O)", "grace", qwpSfSendLoopCloseGrace)
-		// Release the WebSocket now rather than waiting on the wedged
-		// goroutine's defer (which may never run): the goroutine holds its own
-		// local transport reference, so swapping the atomic cannot strand it,
-		// and closeNow avoids the graceful-close handshake blocking on a dead
-		// peer. This reclaims the fd and the server-side connection.
-		if t := l.transport.Swap(nil); t != nil {
-			_ = t.closeNow()
-		}
-		// Dispatchers are safe to close on this path — offer() on a closed
-		// dispatcher is a no-op — which bounds the leak to the wedged goroutine.
-		l.closeDispatchers()
-		return l.checkErrorOrNil()
+	// Request stop before running a test hook that may panic. If it does, the
+	// engine keeps the resources alive, and the loop still gets the stop request.
+	if hook := qwpTestCloseSendLoopHook.Load(); hook != nil {
+		(*hook)()
 	}
+	// Request immediate transport teardown before joining workers, including
+	// when they are between network reads. The cancelled context only avoids
+	// waiting here; the transport's sole close worker retains ownership.
+	if t := l.transport.Load(); t != nil {
+		_ = t.closeContext(l.ctx)
+	}
+	// This runs inside owned shutdown work, never on a deadline-bound public
+	// caller. A late worker keeps both mappings and slot owned until it exits.
+	l.wg.Wait()
 	if t := l.transport.Swap(nil); t != nil {
-		_ = t.close()
+		l.recordTransportCloseError(t.close())
 	}
 	l.closeDispatchers()
+	if p := l.transportCloseError.Load(); p != nil {
+		return errors.Join(l.checkErrorOrNil(), *p)
+	}
 	return l.checkErrorOrNil()
 }
 
-// sendLoopAbandoned reports whether sendLoopClose gave up on a wedged I/O
-// goroutine. When true the engine must be torn down with engineCloseLeakSegments
-// so the still-live goroutine's mmap references stay valid.
-func (l *qwpSfSendLoop) sendLoopAbandoned() bool {
-	return l.abandoned.Load()
+// Save connection-close errors without changing the first sending error
+// reported to the caller. Keep earlier close errors when a later close fails.
+func (l *qwpSfSendLoop) recordTransportCloseError(err error) {
+	err = qwpTransportReleaseError(err)
+	if err == nil {
+		return
+	}
+	for {
+		old := l.transportCloseError.Load()
+		joined := err
+		if old != nil {
+			joined = errors.Join(*old, err)
+		}
+		if l.transportCloseError.CompareAndSwap(old, &joined) {
+			return
+		}
+	}
 }
 
-// closeDispatchers stops the error, connection, and progress dispatcher
-// goroutines. Safe even on the wedged-I/O abandon path: offer() on a closed
-// dispatcher is a no-op, so a still-running send loop cannot fault on them.
+// closeDispatchers stops the error, connection, and progress notification
+// workers after the send loop stops. Each close waits only a limited time for
+// callbacks. Engine cleanup is not the callbacks' responsibility.
 func (l *qwpSfSendLoop) closeDispatchers() {
 	if d := l.dispatcher.Load(); d != nil {
 		d.close()
@@ -1047,7 +1036,7 @@ func (l *qwpSfSendLoop) run() {
 		// known — defense in depth on the unwind path.
 		defer func() { _ = recover() }()
 		if t := l.transport.Swap(nil); t != nil {
-			_ = t.close()
+			l.recordTransportCloseError(t.close())
 		}
 	}()
 	// Convert a panic on this wire-driving goroutine into the same
@@ -2200,7 +2189,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	old := l.transport.Swap(newTransport)
 	if old != nil {
-		_ = old.close()
+		l.recordTransportCloseError(old.close())
 	}
 	replayStart := l.engine.engineAckedFsn() + 1
 	l.highestFullySent.Store(-1)

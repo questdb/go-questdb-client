@@ -57,8 +57,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	qdb "github.com/questdb/go-questdb-client/v4"
 )
@@ -71,8 +73,17 @@ func main() {
 		panic(err)
 	}
 	defer func() {
-		if err := db.Close(ctx); err != nil {
-			log.Printf("questdb close: %v", err)
+		// Stop using all borrowed handles and return them before closing db.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := db.Close(closeCtx)
+		switch {
+		case errors.Is(err, qdb.ErrCleanupFailed): // check before pending
+			log.Printf("questdb cleanup failed; resources may require process restart: %v", err)
+		case errors.Is(err, qdb.ErrCleanupPending):
+			log.Printf("questdb cleanup unfinished; check storage and unreturned handles before waiting again: %v", err)
+		case err != nil:
+			log.Printf("questdb failed to queue rows, deliver them, or release resources: %v", err)
 		}
 	}()
 
@@ -81,6 +92,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// Return the sender even if building a row fails.
+	defer func() {
+		if err := sender.Close(ctx); err != nil {
+			log.Printf("sender return: %v", err)
+		}
+	}()
 	if err := sender.
 		Table("trades").
 		Symbol("symbol", "ETH-USD").
@@ -138,12 +155,13 @@ SQL — plus a background housekeeper that closes idle and over-age connections.
 | `qdb.NewQuestDB(ctx, conf, opts...)` | `*QuestDB` | Same, with pool-tuning options. |
 | `db.BorrowSender(ctx)` | `LineSender` | Lease a sender; `Close` flushes and returns it to the pool. |
 | `db.BorrowQuery(ctx)` | `*Query` | Lease a query session; `Close` returns it. |
-| `db.Close(ctx)` | `error` | Shut down both pools and disconnect every underlying client. Idempotent. |
+| `db.Close(ctx)` | `error` | Shut down both pools. See [QWP shutdown and ownership](#qwp-shutdown-and-ownership) for what it waits for, what errors mean, and when to call it again. |
 
 The schema must be `ws` or `wss` — the pooled facade is QWP-only. A borrowed
 sender or query session is single-threaded; the handle itself is safe to share.
-`Close` on a borrowed lease flushes/returns it to the pool — the real
-disconnect happens only at `db.Close`.
+Calling `Close` on a borrowed sender or query session returns it to the pool.
+A healthy connection stays open for reuse. The pool disconnects it when removing
+it or shutting down.
 
 Pool sizing and behavior are tunable through options (an explicit option wins
 over the matching connect-string key) or the equivalent connect-string keys:
@@ -189,6 +207,129 @@ db, err := qdb.Connect(ctx, "ws::addr=localhost:9000;lazy_connect=true;")
 `lazy_connect` (or the `WithLazyConnect` option) is facade-only; standalone
 clients accept but ignore the key. `connect_timeout` (milliseconds) bounds the
 TCP connect on each dial and is common to both directions.
+
+## QWP shutdown and ownership
+
+**Stop use, then close.** Different goroutines may borrow or return separate
+handles and call `QuestDB.Close`. Your application must still coordinate use of
+each individual sender, query client, cursor, or borrowed handle. Before closing
+one, stop using it. For an active query, request cancellation, wait for the code
+reading results to stop, and stop using slices backed by result-batch memory.
+
+Callbacks should signal the application code using the handle, for example
+through a channel or context cancellation. They must not change or close the
+handle, or call its `QuestDB.Close` directly. Documented methods returning
+read-only snapshots of state are allowed. Starting Close in another goroutine
+does not remove the requirement to stop other use first.
+
+**What the context controls.** `QuestDB.Close` and standalone client/sender
+Close start shutdown even if the context is already cancelled or expired. The
+context limits how long the caller waits, not how long releasing resources may
+take. Connections being discarded are closed without a WebSocket closing
+handshake, including during reconnect and failed setup. That cleanup can still
+block internally. A WebSocket CLOSE reply does not acknowledge receipt of QWP
+rows.
+
+**Sending buffered rows during shutdown.** A sender first discards any row not
+finished with `At`, `AtNow`, or `AtNano`. It then tries to queue completed rows
+for sending, in memory or in store-and-forward files, using the configured append
+timeout for each frame. After those attempts, it starts the separate timeout for
+waiting on server acknowledgements. Zero or negative values for that timeout skip
+only the acknowledgement wait, not the attempts to queue rows.
+
+Cancelling the caller's context does not stop these steps, and later Close calls
+do not restart them or extend their time limits. If only part of a batch reaches
+store-and-forward files, only that part is saved for recovery. Failed queueing
+does not save rows to disk or guarantee delivery of rows held only in memory.
+See [`LineSender.Close`](sender.go) for the steps and errors.
+
+| Method | What its result means |
+|---|---|
+| [`QuestDB.Close(ctx)`](questdb.go) | A nil result means both pools and their background work have released all resources, no work can later acquire or retain more, and no error remains to report. Repeated or concurrent calls wait for the same shutdown. |
+| [`QwpQueryClient.Close(ctx)`](qwp_query_client.go) | Stop using the client first. A nil result means all its resources are released and no error remains to report. Later calls check or wait for the same shutdown. |
+| Standalone QWP `LineSender.Close(ctx)` | Call once; later calls return a double-close error, not cleanup progress. A nil result may leave resource cleanup running in the background, but not attempts to queue rows or wait for acknowledgements. Later failures are logged. |
+| Borrowed sender `Close(ctx)` | Returns the sender to its pool. **Context exception:** queueing rows uses the append timeout, not `ctx`, and does not wait for acknowledgements. The pool cannot reuse the sender until rows have been queued successfully. Calls after return do nothing and return nil. |
+| Borrowed query session `Close()` | Finishes reading an open query response, with a time limit set by `query_close_timeout_ms`, then returns the client to the pool. Calls after return do nothing and return nil. |
+
+`QuestDB.Close` accounts for clients still being created, removed, or returned,
+as well as pool maintenance and background sending from recovered orphan slots.
+This includes orphan slots outside the pool's numbered sender slots. It cannot
+return nil while internal readers or background drainers can still use resources.
+
+If returning a borrowed handle requires disconnecting its client, the pool takes
+responsibility for closing it in the background; returning the handle does not
+wait for that cleanup. Errors from returning the handle or queueing rows are
+reported by its Close call. Later cleanup errors are logged and included in
+`QuestDB.Close` results, not in repeated Close calls on the returned handle.
+See [`Query.Close`](qwp_query_pool.go) and [`LineSender.Close`](sender.go).
+
+**If cleanup fails or is unfinished.** Check
+`errors.Is(err, qdb.ErrCleanupFailed)` first. A panic during internal cleanup
+leaves the affected object unable to finish safely; calling Close again will not
+repair it. Resources that cannot safely be released stay held, and affected
+store-and-forward slots stay reserved, possibly until process restart. Corrupt
+pool state also produces `ErrPoolPoisoned`.
+
+Otherwise, `ErrCleanupPending` means the client still has resources to release
+and remains responsible for cleanup. Unfinished store-and-forward cleanup also
+matches `ErrSfCleanupPending`. If the context expires while waiting in
+`QuestDB.Close` or standalone query-client Close, the result also wraps
+`ctx.Err()`. That caller timeout is not a permanent failure: a later call with a
+fresh context checks progress again. A known internal cleanup failure is reported
+without waiting for other cleanup. Once shutdown finishes, Close returns its
+saved result. See the [cleanup error Go docs](qwp_errors.go).
+
+For recoverable storage failures, the client retries cleanup with delays between
+attempts. Success clears the error it recovered from. It does not clear errors
+from queueing or delivering rows, or cleanup errors that could not be recovered
+from. Releasing all resources therefore need not make Close return nil. Blocked
+readers, unavailable storage, or handles that have not been returned can prevent
+cleanup from finishing until the process exits.
+
+User callbacks are different from internal cleanup work: shutdown may drop queued
+notifications, and a callback already running may finish after Close returns.
+Close does not guarantee delivery of every notification or exit of every
+callback goroutine.
+
+**Resources stay tracked until safe to release.** The client must not unmap
+memory while a reader can still access it, or reuse a store-and-forward slot
+while old client code can still use it. The client remains responsible for
+resources after timeouts and internal failures, even if construction failed
+without returning a handle. A cleanup panic is not evidence of corrupt files
+and does not justify quarantining a slot or marking it `.failed`. See
+[Quarantined slots](#quarantined-slots) for failures that can stop a background
+drainer from sending a slot's data.
+
+Cleanup must preserve saved rows and follow the acknowledgement, recovery, and
+safe file-deletion rules. It does not promise an empty directory. These guarantees
+do not cover faults that terminate the process or arbitrary memory corruption.
+Panics caused by supported inputs and ordinary data races are still bugs.
+
+For **standalone store-and-forward senders only**, check `SlotLockReleased`
+before reopening the same slot. A borrowed sender that has been returned reports
+true even if its pool still holds the lock; use `QuestDB.Close` for pooled
+senders instead. False may mean cleanup is still running or has failed
+permanently. Always limit how long you wait; success is not guaranteed:
+
+```go
+// qs is a standalone disk-backed QwpSender, not a borrowed sender.
+waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := qs.Close(waitCtx); err != nil {
+	log.Printf("sender close: %v", err) // keep errors from queueing or sending rows
+}
+tick := time.NewTicker(10 * time.Millisecond)
+defer tick.Stop()
+for !qs.SlotLockReleased() {
+	select {
+	case <-waitCtx.Done():
+		log.Printf("slot lock still held; check logs and storage before trying to reuse it")
+		return // a process restart may be needed; do not reopen this slot
+	case <-tick.C:
+	}
+}
+// This sender released its slot. Opening it again can still fail for other reasons.
+```
 
 ## Other ways to connect
 
@@ -305,12 +446,14 @@ err = qs.
 `Decimal128Column` / `Decimal256Column`, and `AtNano`, plus the
 acknowledgement and observability accessors (`AwaitAckedFsn`,
 `FlushAndGetSequence`, `TotalReconnectAttempts`, `LastTerminalError`,
-`TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`).
+`TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`,
+`QuarantinedSlotPath`, `SlotLockReleased`).
 
-> This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`, and
-> `DroppedConnectionNotifications` to the `QwpSender` interface. Every built-in
-> transport is updated; this is source-breaking only for external code that
-> implements `QwpSender` directly (callers that type-assert to it are unaffected).
+> This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`,
+> `DroppedConnectionNotifications`, `QuarantinedSlotPath`, and
+> `SlotLockReleased` to the `QwpSender` interface. Every built-in transport
+> is updated; this is source-breaking only for external code that implements
+> `QwpSender` directly (callers that type-assert to it are unaffected).
 
 ### N-dimensional arrays
 
@@ -427,6 +570,14 @@ if err := sender.Flush(ctx); err != nil {
 }
 ```
 
+> **Callbacks report events only.** Error, connection, and progress callbacks
+> may run while the application is using the sender. From a callback, do not
+> call `Flush`, `Close`, methods that add rows or column values, any other method
+> that changes the sender, or `QuestDB.Close`. Instead, send a value through a
+> channel or cancel a context. The code using the sender can then stop its
+> current work and call `Flush` or `Close`. A callback may call a method only if
+> that method's documentation says it returns data without changing the sender.
+
 Nothing is ever silently dropped. Each `Category` resolves to a `Policy`:
 
 - `RETRIABLE` / `RETRIABLE_OTHER` — recycle the connection and replay from the
@@ -467,18 +618,27 @@ The slot lives at `<sf_dir>/<sender_id>/`, guarded by an advisory `flock` so two
 senders never share a slot. When the [`QuestDB` handle](#the-questdb-handle)
 runs in SF mode it assigns each pooled sender its own slot automatically.
 
+Creating SF files requires native disk-block reservation. If the filesystem
+rejects preallocation, creation fails with `ErrSfDurability`; the client does
+not fall back to sparse files or zero-filling. On Unix targets other than Linux
+and macOS, reservation is not implemented, so new disk-backed SF files cannot
+be created. Memory-backed senders are unaffected. This is stricter than Java's
+sparse fallback. Successful reservation does not certify existing sparse files
+or guarantee safety against every later storage failure or copy-on-write
+allocation. Use storage with suitable locking, mapping, and sync guarantees.
+
 | Key | Default | Effect |
 |---|---|---|
 | `sf_dir` | unset | Group root. Setting it activates SF. |
 | `sender_id` | `default` | Per-sender slot name; ASCII letters / digits / `-_` only (no `.` or path separators). |
 | `sf_max_segment_bytes` | 4 MiB | Per-segment file size. |
-| `sf_max_total_bytes` | 10 GiB | Total cap; producer is backpressured when reached. |
+| `sf_max_total_bytes` | 10 GiB | Total byte limit. The producer waits when the limit is reached. The limit includes `.corrupt` files in the slot. After an operator deletes those files, the client notices within one second. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
 | `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as (a) the poison-frame episode budget (`max_frame_rejections`) and (b) a background drainer's no-progress / durable-stall watchdog — the time a live-but-stalled adopted slot is given before it is quarantined. Setting it small speeds up the initial connect and shrinks (a); the drainer watchdog (b) is floored at 30s (×4 in durable mode) so a small value can't wrongly quarantine a slow-but-healthy slot. |
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
 | `initial_connect_retry` | `off` | `off` = terminal on first failure; `on`/`sync` = retry, blocking the constructor; `async` = retry on the I/O goroutine, constructor returns immediately. |
-| `close_flush_timeout_millis` | 5000 | `Close` waits this long for ACKs; `0` / `-1` skips the drain. |
+| `close_flush_timeout_millis` | 5000 | How long sender shutdown waits for server acknowledgements. Zero or negative skips only that wait; Close still tries to queue completed rows for sending. See [shutdown and ownership](#qwp-shutdown-and-ownership). |
 | `drain_orphans` | `off` | When `on`, scan `<sf_dir>/*` and adopt sibling slots holding unacked data. |
 | `max_background_drainers` | 4 | Cap on concurrent orphan drainers. |
 | `max_frame_rejections` | 4 | Consecutive same-frame rejections (over the episode budget) before the poison-frame detector latches a `TERMINAL`. |
@@ -491,8 +651,230 @@ The same options are available programmatically: `WithSfDir`, `WithSenderId`,
 `WithMaxFrameRejections`, `WithRequestDurableAck`,
 `WithDurableAckKeepaliveInterval`.
 
+Accepted orphan drains, including slots queued behind `max_background_drainers`,
+continue independently of the sender's construction context. Cancelling that
+context after construction does not stop them; closing the sender does.
+
 Without `sf_dir`, unacknowledged data lives in process memory and is lost if the
 process dies; the reconnect loop still spans transient outages.
+
+On Unix, SF namespace changes are separated into directory-sync epochs: a
+dependent manifest update/removal is not allowed to become durable before the
+segment names it depends on. This protects recovery across an OS crash within
+the platform `fsync` guarantee. Windows exposes no documented, unprivileged
+equivalent of directory `fsync`; on Windows SF protects process-restart recovery
+but does not promise host-crash ordering for file creation, rename, and removal.
+Residual `.ack-watermark` and `.symbol-dict` files after a fully drained close
+do not prevent a later restart. See [QWP shutdown and ownership](#qwp-shutdown-and-ownership)
+for cleanup behavior, why a slot may stay locked, and how to check for release.
+
+**Acknowledgement evidence at startup.** Residual side files are permitted, so
+startup, not close, is what makes an old `.ack-watermark` record safe. Every
+disk-backed construction inspects that file under the slot lock and decides from
+the history recovery actually established:
+
+- Recovery produced no ring: the record describes a previous lifecycle whose
+  frames are gone, and this session restarts frame numbering at 0. An empty
+  recovered ring is different: it retains its sequence base and remains part of
+  its existing history even though it currently holds no frames.
+- A record above the recovered history's published tip: no correctly operating
+  session for this history produced it. Recovery can also produce this
+  legitimately, by discarding an unreadable active tail.
+
+In both cases the record is retired durably, by truncating the file to zero
+bytes — both record slots together — rather than ignored for one run. Ignoring
+it is not sufficient, because the same numbers get republished, after which the
+old record looks plausible again to the next restart. Every construction then
+syncs the prepared file and performs the slot-directory barrier before
+allocating or mapping it, even when the file already looks empty, invalid, or
+acceptable: bytes visible in the page cache are no evidence that an earlier
+attempt's barrier completed. That unconditional checkpoint is the retry
+mechanism; no marker file or format change is involved, and a zero-length file
+is only an intermediate startup state.
+
+If inspecting, resetting, or either barrier fails, construction fails with a
+retriable storage error and keeps its cleanup obligations; only a later
+allocation or write-back failure may continue without a mapped watermark, and a
+nil in-memory watermark is never evidence that the file on disk is safe. Such a
+failure does not authorize dropping unacknowledged frames or quarantining the
+slot, and it does not promise that a failing or full disk can be started on or
+drained. Discarding ACK evidence keeps the segment-derived replay position —
+immediately before the lowest surviving segment, not FSN 0 — and can replay
+surviving rows that were already acknowledged: SF does not provide exactly-once
+delivery. The deliberate valid-prefix/zeroed-suffix policy for a damaged active
+tail is unchanged, and discarded frames are not reconstructed.
+
+A stale record whose value still falls inside the surviving frame range cannot
+be distinguished from a legitimate acknowledgement — the shared format carries
+no slot-lifecycle identifier — so the client neither detects nor repairs such
+pre-existing slots. These startup barriers use the same platform guarantees as
+the rest of SF: process-restart recovery on every platform, no host-crash
+namespace ordering on Windows, and Darwin `fsync` is not `F_FULLFSYNC`.
+
+#### Local errors from the SF path
+
+The following sentinels identify non-terminal backpressure and local-storage
+failures. Unpublished rows remain pending and may be retried on the same sender.
+A failed flush can already have published part of a batch; do not resend
+published work as though nothing happened.
+
+| Error | Raised by | Meaning |
+|---|---|---|
+| `qdb.ErrBackpressureTimeout` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | The engine had no room within `sf_append_deadline_millis`. The wire is not draining, or `sf_max_total_bytes` is too small. |
+| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | Local storage would not commit: a segment rotation that could not write its header or manifest, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
+
+Match them with `errors.Is`. These are not an exhaustive list of producer errors.
+Terminal server errors and internal failures can also reach the producer. For
+example, a segment-manager worker that stops after an internal panic reports a
+terminal error; retrying the operation does not restart that worker. An error
+that matches neither sentinel is not, by that fact alone, necessarily terminal.
+
+#### Recovery and damaged tails
+
+After validating the saved queue's structure, recovery keeps the readable
+beginning of the active segment (the file that was being written) and zeroes
+its remaining damaged tail in place before accepting new writes. This also
+applies when no complete frame survives. Everything after the first unreadable
+frame is discarded, even if later bytes contain intact, unacknowledged rows.
+No evidence copy of that tail is kept. The valid prefix and required sealed
+segments remain intact. A local write or sync failure stops recovery for retry;
+it is not evidence that the slot is corrupt.
+
+This is not a general salvage policy: missing required segments or gaps in the
+saved queue still cause recovery to refuse the slot, as described below.
+
+#### Quarantined slots
+
+If a slot's on-disk state proves inconsistent, the sender does not delete it and
+does not try to salvage it. It preserves the whole slot directory as a sibling
+of the original, under the reserved namespace
+`<sf_dir>/<sender_id>.unreplayable-<n>/`, starts fresh on an empty slot so
+ingestion continues, and reports where the bytes went:
+
+```go
+if qs, ok := sender.(qdb.QwpSender); ok {
+	if path := qs.QuarantinedSlotPath(); path != "" {
+		log.Printf("unsent rows preserved at %s", path)
+	}
+}
+```
+
+`<n>` is the first free index in `0..63`; an occupied name is never overwritten,
+so earlier copies survive. The client picks the same names as the Java client
+and, like it, excludes any directory whose name contains `.unreplayable-` from
+automatic adoption — by name, regardless of what the directory holds. A valid
+`sender_id` cannot contain a dot, so the namespace cannot collide with a
+configured slot.
+
+When all 64 destinations for a slot name are occupied, the sender refuses to
+start instead of minting a 65th copy or reclaiming an old one. The refusal names
+the slot and needs an operator: move or remove the preserved copies, then retry.
+
+A quarantined copy also gets a `.failed` file recording the reason, if one can
+be written and no entry of that name already exists. An existing `.failed` is
+kept exactly as it is, including when this client would have written a different
+reason. Neither the marker's presence nor its contents affect exclusion.
+
+Older versions of this client used a nested container,
+`<sf_dir>/quarantined/<sender_id>-<nanos>/`. Existing copies are left exactly
+where they are: nothing flattens, renames, scans, reclaims or resumes them. The
+name `quarantined` is also a legal `sender_id`; a sender configured with it
+starts normally when the path is absent, empty, or holds only ordinary slot
+files, and refuses to start when the directory holds child directories or
+symlinks that could be an older client's evidence.
+
+An individual file excluded from a validated queue because its segment header
+is unreadable is preserved by renaming it in place to `<name>.sfa.corrupt`.
+This differs from an active segment with a readable header and a damaged tail:
+that tail is discarded under the recovery policy above. A background drainer moves nothing and leaves the
+bytes where they are. When it gives up on the slot itself — auth failure,
+durable-ack settle exhaustion, a wedged no-progress connection, a slot whose
+recovery proved inconsistent — it writes the reason to a `.failed` file inside
+the slot, which disqualifies that slot from every later adoption. A local I/O
+fault while opening the slot (a full disk, an exhausted fd table, a mount that
+went away) says nothing about the slot's bytes, so it leaves no sentinel and the
+next foreground scan adopts the slot again.
+
+Nothing in the client ever reclaims any of this — it is the only copy of those
+rows, so deleting it is the operator's call. Left unattended, a crash loop can
+park one slot copy per cycle. `.corrupt` files inside a live slot do count
+against `sf_max_total_bytes`: when quarantined bytes exhaust the budget, no new
+segment is minted and the producer sees `qdb.ErrBackpressureTimeout` — the same
+non-terminal, retry-the-call contract as running out of space for live data.
+The manager counts these files when it opens the slot. While the byte limit
+blocks a new segment, it rescans the slot at most once per second. This means it
+notices deleted `.corrupt` files within one second without scanning on every
+1 ms poll. If a scan fails, it keeps the previous byte count. Whole-slot copies
+under `.unreplayable-<n>`, and under the older `quarantined/` container, do not
+count toward a slot's limit and are never reclaimed to regain capacity. The
+operator owns these copies.
+
+##### Guarantees and limits
+
+These bounds apply to quarantine and to the slot-name locking around it. Read
+them before treating a refusal, a retained resource or a missing marker as a
+defect.
+
+- **Cooperating participants only.** A slot's close → rename → recreate
+  transition is serialised by a parent-anchored lock under
+  `<sf_dir>/.slot-locks/`, which this client takes before opening a slot and
+  before adopting an orphan. It protects processes that use this protocol, on
+  filesystems providing the advisory locking and rename semantics it relies on.
+  It does not protect against an operator moving files, an incompatible or older
+  client that never takes the lock, or a host where advisory locks do not work.
+  Share an `sf_dir` only between participants you have verified; stopping orphan
+  adoption alone is not sufficient, because an older foreground sender can still
+  create the legacy `quarantined/` container. Treat lock files as opaque
+  metadata and do not delete them: this client deliberately reuses stale lock
+  files rather than unlinking a pathname that another process may already have
+  open. The namespace and locking layout were inspected at QuestDB Java client
+  revision `981bdb02a471f3b290c89b8e78cbc422610e329e`; that is evidence about
+  that revision, not a minimum compatible release or proof of live cross-client
+  interoperability. Concurrent Go/Java transitions and every filesystem/OS
+  combination have not been integration-tested. Verify every deployed client
+  participates in a compatible lock lifecycle before sharing an `sf_dir`.
+  Stop incompatible writers and drainers before upgrading a root, or isolate
+  them in separate roots; disabling orphan adoption alone is insufficient. Do
+  not rename or remove slot, quarantine, or lock paths while participants run.
+- **Offline reuse does not change formats.** This layout change does not alter
+  ordinary slot payload formats, but offline reuse remains subject to the
+  existing format and migration restrictions, including the unsupported
+  downgrade after legacy Go-slot migration. Do not rename or repoint preserved
+  evidence into an ordinary slot merely to make a client replay it.
+- **Preservation is not backup.** Quarantine does not overwrite, delete, replay
+  or reclaim what it moves, but it does not repair damage recovery already
+  found, and it cannot protect a copy from later storage failure, another
+  program, or an operator. Recovery steps that ran before the handoff, such as
+  the damaged-tail policy above, still applied.
+- **The transition is not atomic.** Renaming the old slot and creating the fresh
+  one are separate steps with no rollback. A failure after the rename reports
+  the destination that already exists rather than pretending nothing happened;
+  the slot can be left preserved with no fresh slot in place, and cleanup may
+  still own resources. Crash behaviour is bounded by the same platform
+  guarantees as the rest of SF: process restart, host crash and power loss are
+  not equivalent, the Windows directory barrier is a no-op, and Darwin `fsync`
+  is not `F_FULLFSYNC`.
+- **Refusals are conditional, not timed.** The 64-destination policy bounds how
+  many copies one slot name may accumulate. It says nothing about how long a
+  quarantine takes, how much disk it uses, or whether one succeeds at all:
+  inspection, rename or barrier failures, an over-long destination name, or an
+  unresolved lock can each refuse construction. Nothing is deleted to make
+  progress.
+- **Markers and logs are best-effort.** A `.failed` marker may be missing or
+  incomplete, and diagnostics may be filtered, discarded or lost. Neither is a
+  condition for excluding a preserved copy from adoption. Application logging
+  handlers keep the restrictions documented on `WithLogger`.
+- **Legacy-container refusals are deliberately conservative.** An unrelated
+  child directory under a `quarantined` slot name causes a refusal, including
+  for case variants such as `Quarantined` on a case-sensitive filesystem. That
+  is a request for a human look, not a corruption verdict, and it never
+  authorises the client to move or delete anything. A permission or I/O failure
+  while inspecting is reported as the operational fault it is.
+- **Reporting is historical.** `QuarantinedSlotPath` reports where this sender
+  put bytes during its own construction. It is not a live check that the
+  directory still exists, a durability receipt, or a record that survives a
+  crash. See the [shutdown and ownership](#qwp-shutdown-and-ownership) section
+  for what a returned `Close` does and does not prove.
 
 ## Querying
 
@@ -533,7 +915,9 @@ for batch, err := range cursor.Batches() {
 A borrowed query session runs **one query at a time** and is **not** safe for
 concurrent `Query` / `Exec`. To run queries in parallel, borrow one session per
 goroutine (the query pool's `max` caps concurrency). `Cancel` (on the cursor)
-and `Close` are safe to call from another goroutine.
+is safe from another goroutine. Before closing a cursor or client, or returning
+a borrowed session, stop query execution, result iteration, and use of slices
+backed by result-batch memory. See [shutdown and ownership](#qwp-shutdown-and-ownership).
 
 ### Reading result batches
 

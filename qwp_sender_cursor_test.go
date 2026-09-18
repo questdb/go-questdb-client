@@ -482,7 +482,7 @@ func TestQwpCursorSenderAwaitAckedFsnTimeout(t *testing.T) {
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.Eventually(t, func() bool {
 		return engine.enginePublishedFsn() >= 0
-	}, time.Second, time.Millisecond, "auto-flush should have published the frame")
+	}, qwpTestWaitTimeout, time.Millisecond, "auto-flush should have published the frame")
 	target := engine.enginePublishedFsn()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -495,12 +495,9 @@ func TestQwpCursorSenderAwaitAckedFsnTimeout(t *testing.T) {
 	assert.Less(t, elapsed, time.Second)
 }
 
-// TestQwpCursorSenderAwaitAckedFsnConcurrentClose verifies that a
-// concurrent Close() unblocks an in-flight AwaitAckedFsn instead of
-// letting it spin until the caller's ctx fires. The send loop halts
-// on close and ackedFsn freezes below target, so the poll loop must
-// observe s.closed and fail fast with errClosedSenderFlush.
-func TestQwpCursorSenderAwaitAckedFsnConcurrentClose(t *testing.T) {
+// Cancel the wait for server confirmation, wait for that goroutine to finish,
+// then close the sender. Do not call Close while another sender call is running.
+func TestQwpCursorSenderAwaitAckedFsnCancelledBeforeClose(t *testing.T) {
 	srv := newSilentAckServer(t)
 	defer srv.Close()
 
@@ -511,37 +508,39 @@ func TestQwpCursorSenderAwaitAckedFsnConcurrentClose(t *testing.T) {
 	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
 		100*time.Microsecond, 5*time.Second, 10*time.Millisecond, 100*time.Millisecond)
 	loop.sendLoopStart()
-	// closeTimeout=0 skips the drain entirely so Close races straight
-	// into sendLoopClose — the most aggressive shape of the race.
+	// A zero close timeout skips the wait for server confirmation, but Close
+	// must still queue completed rows for sending.
 	s, err := newQwpCursorLineSender(1, 0, 0, 0, engine, loop, 0)
 	require.NoError(t, err)
 
 	require.NoError(t, s.Table("t").Int64Column("v", 1).AtNow(context.Background()))
 	require.Eventually(t, func() bool {
 		return engine.enginePublishedFsn() >= 0
-	}, time.Second, time.Millisecond, "auto-flush should have published the frame")
+	}, qwpTestWaitTimeout, time.Millisecond, "auto-flush should have published the frame")
 	target := engine.enginePublishedFsn()
 
-	// Long ctx so a hang would manifest as a 5s test stall rather
-	// than masquerading as a DeadlineExceeded.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
+	ctx, cancel := context.WithTimeout(context.Background(), qwpTestWaitTimeout)
 	awaitErr := make(chan error, 1)
+	awaitDone := make(chan struct{})
 	go func() {
+		defer close(awaitDone)
 		awaitErr <- s.AwaitAckedFsn(ctx, target)
 	}()
+	defer func() {
+		cancel()
+		<-awaitDone
+		err := s.Close(context.Background())
+		waitQwpSfEngineCleanup(t, engine)
+		assert.NoError(t, err)
+	}()
 
-	// Give AwaitAckedFsn a moment to enter its poll loop, then close.
-	time.Sleep(20 * time.Millisecond)
-	require.NoError(t, s.Close(context.Background()))
-
+	// Cancellation is safe even if the waiting goroutine has not started yet.
+	cancel()
 	select {
 	case err := <-awaitErr:
-		require.ErrorIs(t, err, errClosedSenderFlush,
-			"AwaitAckedFsn must surface errClosedSenderFlush when Close races in mid-poll")
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("AwaitAckedFsn did not return after Close — close-observation in the poll loop is missing")
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(qwpTestWaitTimeout):
+		t.Fatal("AwaitAckedFsn did not return after cancellation")
 	}
 }
 

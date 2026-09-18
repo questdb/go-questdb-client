@@ -31,6 +31,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +49,27 @@ const qwpSfEngineDefaultAppendDeadline = 30 * time.Second
 // Java's 50µs LockSupport.parkNanos.
 const qwpSfEngineParkInterval = 50 * time.Microsecond
 
+const qwpSfCloseRetryLogThrottle = 30 * time.Second
+
+// qwpSfSwappableVar lets tests change values that background workers read.
+// Tests changing the same package-wide value must not run at the same time,
+// and must wait for their workers to stop before restoring the value.
+type qwpSfSwappableVar[T any] struct {
+	v atomic.Pointer[T]
+}
+
+func qwpSfSwappable[T any](initial T) *qwpSfSwappableVar[T] {
+	s := &qwpSfSwappableVar[T]{}
+	s.v.Store(&initial)
+	return s
+}
+
+func (s *qwpSfSwappableVar[T]) load() T { return *s.v.Load() }
+
+// qwpSfCloseRetryInterval is the wait between cleanup retries after storage
+// errors. Panics are not retried. Tests may shorten the default one-second wait.
+var qwpSfCloseRetryInterval = qwpSfSwappable(time.Second)
+
 // ErrBackpressureTimeout is the sentinel a producer call
 // (At / AtNow / Flush / FlushAndGetSequence) wraps when the
 // store-and-forward append deadline (WithSfAppendDeadline /
@@ -58,14 +81,61 @@ const qwpSfEngineParkInterval = 50 * time.Microsecond
 var ErrBackpressureTimeout = errors.New(
 	"qwp/sf: cursor ring backpressured — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)")
 
-// qwpSfErrEngineClosed is returned by engineAppendBlocking when the
-// engine is closed underneath an in-flight or backpressure-parked
-// append. The canonical trigger is a SenderErrorHandler calling
-// Close() while the producer is stalled in the backpressure spin on a
-// wedged wire (a HALT stops the send loop draining, so ackedFsn never
-// advances and the ring stays full). The producer gets this clean
-// error instead of dereferencing a segment that engineClose's
-// segmentRingClose has just nil'd + munmapped.
+// qwpSfTestBeforeSegmentUnlinkHook lets tests pause cleanup before removing a
+// segment file, after the workers stop, while another call to Close runs.
+// Production leaves it nil.
+var qwpSfTestBeforeSegmentUnlinkHook atomic.Pointer[func(path string)]
+
+// qwpSfSyncSlotDir is the platform directory-barrier abstraction. On Unix it
+// makes the slot namespace durable, so a file this slot created is findable
+// after an OS crash. Windows has no supported unprivileged directory-fsync
+// equivalent; its platform implementation is an explicit no-op and the public
+// durability contract documents that weaker guarantee. Every control point
+// that publishes or retires a correctness-relevant name still goes through
+// this function so the epoch ordering remains visible and testable.
+func qwpSfSyncSlotDir(dir string) error {
+	if hook := qwpSfTestDirSyncHook.Load(); hook != nil {
+		if err := (*hook)(dir); err != nil {
+			return err
+		}
+	}
+	return qwpSfSyncDir(dir)
+}
+
+// qwpSfTestDirSyncHook observes every directory barrier and may fail one. Test
+// seam only: it lets a test pin which control points make a name durable, and
+// inject the storage faults that no real filesystem can be talked into on
+// demand. A nil return falls through to the real barrier. Nil in production.
+var qwpSfTestDirSyncHook atomic.Pointer[func(dir string) error]
+
+// qwpSfTestEngineFinishCloseHook lets tests count or pause cleanup attempts,
+// regardless of how many files they remove. Production leaves it nil.
+var qwpSfTestEngineFinishCloseHook atomic.Pointer[func()]
+
+type qwpSfCleanupTestPoint uint8
+
+const (
+	qwpSfCleanupTestAfterQuiescence qwpSfCleanupTestPoint = iota
+	qwpSfCleanupTestDuringTerminalCleanup
+	qwpSfCleanupTestRingClosePhase
+	qwpSfCleanupTestWatermarkClosePhase
+	qwpSfCleanupTestSymbolDictClosePhase
+	qwpSfCleanupTestManifestClosePhase
+)
+
+// qwpSfTestCleanupHook lets tests cause failures at different cleanup steps
+// using one hook. Production leaves it nil.
+var qwpSfTestCleanupHook atomic.Pointer[func(qwpSfCleanupTestPoint)]
+
+func qwpSfRunCleanupTestHook(point qwpSfCleanupTestPoint) {
+	if hook := qwpSfTestCleanupHook.Load(); hook != nil {
+		(*hook)(point)
+	}
+}
+
+// qwpSfErrEngineClosed is returned by engineAppendBlocking if the engine closes
+// during an append, including while it waits for space. Checking for close
+// prevents an append from accessing a segment that cleanup has released.
 //
 //lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 var qwpSfErrEngineClosed = errors.New("qwp/sf: cursor engine closed")
@@ -91,10 +161,22 @@ type qwpSfCursorEngine struct {
 	sfDir            string
 	segmentSizeBytes int64
 
-	manager     *qwpSfSegmentManager
-	ownsManager bool
-	slotLock    *qwpSfSlotLock
-	ring        *qwpSfSegmentRing
+	manager *qwpSfSegmentManager
+	// managerEntry is written once, by the constructor, and read from both the
+	// producer goroutine (engineTerminalError) and close.
+	managerEntry *qwpSfManagerRingEntry
+	slotLock     *qwpSfSlotLock
+	ring         *qwpSfSegmentRing
+
+	// logicalLock is the parent-anchored transition lock for this slot's
+	// pathname, handed over when a construction could not release it before
+	// returning. The cleanup worker releases it after the directory-local lock,
+	// so no other participant can take the pathname while this engine's files
+	// are still owned. nil in the ordinary case, where the constructor released
+	// the lock itself.
+	logicalLockMu       sync.Mutex
+	logicalLock         *qwpSfSlotLock
+	logicalLockReleased bool
 
 	// watermark is the engine-owned mmap'd .ack-watermark file
 	// (sf-client.md §5.4). nil in memory mode and when the file
@@ -137,6 +219,12 @@ type qwpSfCursorEngine struct {
 	// over, and they come from recoveredSymbols.
 	recoveredFromDisk bool
 
+	// quarantinedPath is where the constructor preserved a slot whose
+	// recovery failed closed, before starting this engine on a fresh one.
+	// Empty when nothing was set aside. Written once, before the engine is
+	// handed to its caller.
+	quarantinedPath string
+
 	// backpressureStalls counts how many times appendBlocking
 	// observed qwpSfBackpressureNoSpare on its first try and had to
 	// wait. One increment per blocking-call (not per spin).
@@ -172,20 +260,30 @@ type qwpSfCursorEngine struct {
 	// accessors can sample it from any goroutine.
 	closed atomic.Bool
 
-	// appendMu serializes the producer's ring-append path against
-	// engineClose's segment teardown. The producer's only entry into
-	// appendOrFsn is engineAppendBlocking, which takes this lock around
-	// each ring touch (initial try and every backpressure-spin retry)
-	// and re-checks closed under it; engineClose holds it across the
-	// manager + ring teardown. Together they guarantee no append is
-	// dereferencing the active segment while segmentRingClose nil's and
-	// munmaps it, and that every append after close observes closed and
-	// bails with qwpSfErrEngineClosed. Without it a Close() from a
-	// SenderErrorHandler (running on the dispatcher goroutine) while the
-	// producer is parked in the backpressure spin tears the segment down
-	// under the producer — a nil-pointer deref in memory mode, a SIGBUS
-	// on the munmapped pages in SF mode. Off the per-row hot path:
-	// appendOrFsn runs once per flush, not per row.
+	// cleanup starts one cleanup worker and records its progress and result.
+	// Its mutex is not held while taking appendMu, waiting for the manager,
+	// or doing file or memory-mapping operations.
+	cleanup qwpSfCleanupControl
+
+	// A failed connection attempt can return before its connection is closed.
+	// Construction code, then the send loop, updates these fields. Cleanup
+	// reads them only after that work stops. These references keep connections
+	// reachable; SF capacity is tracked separately.
+	rejectedTransports   []*qwpTransport
+	rejectedTransportErr error
+	reader               atomic.Pointer[qwpSfSendLoop]
+	// Files and mappings opened before construction failed, but not yet
+	// stored in the ring.
+	looseSegments []*qwpSfSegment
+	looseManifest *qwpSfManifest
+	acquired      *qwpSfAcquiredResources
+
+	// appendMu prevents cleanup from releasing a segment while an append uses
+	// it. engineAppendBlocking takes this lock and checks closed on every
+	// attempt, including retries while waiting for space. Cleanup holds the
+	// lock while releasing segments, after the manager has stopped. Later
+	// appends return qwpSfErrEngineClosed instead of accessing freed memory.
+	// The lock is taken per flush, not per row.
 	appendMu sync.Mutex
 }
 
@@ -199,35 +297,247 @@ type qwpSfCursorEngine struct {
 // process is using the slot), or if recovery encounters an
 // inconsistent on-disk state.
 func qwpSfNewCursorEngine(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
+	return qwpSfNewCursorEngineWithOptions(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, qwpSfEngineOpenOptions{
+		recoverForeground: true,
+	})
+}
+
+// qwpSfEngineOpenOptions configures recovery policy and logging during engine
+// construction. Recovery and the manager worker use the configured logger.
+type qwpSfEngineOpenOptions struct {
+	logger            *slog.Logger
+	recoverForeground bool
+	// revalidate runs under the logical slot lock, before the slot is inspected
+	// or opened. A background drainer or pool startup recovery uses it to
+	// re-check the candidacy an earlier scan observed: between that scan and this
+	// lock the slot can have been preserved aside, marked failed, or drained
+	// away. A non-nil error abandons the open without touching the slot. nil
+	// skips the check.
+	revalidate func(slotDir string) error
+}
+
+// qwpSfNewCursorEngineWithOptions opens a slot's cursor engine, holding the
+// parent-anchored logical slot lock across the whole pathname transition:
+// candidacy revalidation, legacy-container inspection, recovery, a failed
+// build's cleanup, quarantine-destination selection, the rename and its
+// barrier, and the fresh slot's creation. The lock is released only once the
+// resulting engine holds the directory-local lock, or once a failed transition
+// is quiescent — otherwise it is handed to the cleanup owner that still holds
+// the slot's resources, because a rename must not race work that can still
+// reach the original pathname.
+func qwpSfNewCursorEngineWithOptions(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (*qwpSfCursorEngine, error) {
+	if options.logger != nil {
+		options.logger = qwpEffectiveLogger(options.logger)
+	}
+	if sfDir == "" {
+		// Memory mode owns no pathname, so there is nothing to serialise.
+		return qwpSfOpenCursorEngineTransition(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, options)
+	}
+	logical, err := qwpSfAcquireLogicalSlotLock(sfDir)
+	if err != nil {
+		return nil, err
+	}
+	e, err := qwpSfOpenCursorEngineTransition(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, options)
+	if err != nil {
+		// A failed construction whose cleanup is still running keeps files,
+		// mappings and the directory-local lock. Its slot pathname must stay
+		// fenced until that owner is done, so hand the logical lock over rather
+		// than releasing it on the way out.
+		if pending := qwpSfPendingCleanupEngine(err); pending.adoptLogicalLock(logical) {
+			return nil, err
+		}
+		if releaseErr := qwpSfReleaseLogicalLock(logical); releaseErr != nil {
+			// Join rather than replace: the original cause, and any quarantine
+			// destination recorded in it, stay matchable. A pre-close failure left
+			// the descriptor and flock intact; transfer that obligation to the same
+			// cleanup-control topology used by failed engine builds rather than
+			// returning an unowned os.File and hoping its finalizer releases it.
+			cause := errors.Join(err, releaseErr)
+			if logical.held() {
+				return nil, qwpSfStartLogicalLockCleanup(sfDir, logical, cause)
+			}
+			return nil, cause
+		}
+		return nil, err
+	}
+	if releaseErr := qwpSfReleaseLogicalLock(logical); releaseErr != nil {
+		// The engine is otherwise ready, but its transition protection is
+		// unresolved, so it must not be handed out as a constructed sender.
+		// Start its cleanup and keep both the engine and any still-held lock
+		// owned until their release obligations are resolved.
+		e.adoptLogicalLock(logical)
+		cleanupErr := e.engineCloseWithCause(releaseErr)
+		result := errors.Join(releaseErr, cleanupErr)
+		if !e.engineCloseCompleted() {
+			return nil, &qwpSfBuildCleanupError{cause: result, engine: e}
+		}
+		return nil, result
+	}
+	return e, nil
+}
+
+// qwpSfStartLogicalLockCleanup gives a retryable logical-lock release its own
+// ordinary engine cleanup owner when construction failed before there was an
+// engine to adopt it. The owner has no manager, ring or directory-local lock;
+// engineCleanupWorker supports that narrow shape and publishes completion,
+// late errors and terminal retention through qwpSfCleanupControl just like a
+// failed full build.
+func qwpSfStartLogicalLockCleanup(sfDir string, logical *qwpSfSlotLock, cause error) error {
+	owner := &qwpSfCursorEngine{sfDir: sfDir}
+	if !owner.adoptLogicalLock(logical) {
+		// This should be unreachable for the held lock checked by the caller. Do
+		// not turn an ownership bug into apparent success.
+		return errors.Join(cause, ErrCleanupFailed,
+			errors.New("qwp/sf: could not transfer the held logical slot lock to cleanup"))
+	}
+	cleanupErr := owner.engineCloseWithCause(cause)
+	result := errors.Join(cause, cleanupErr)
+	if !owner.engineCloseCompleted() {
+		return &qwpSfBuildCleanupError{cause: result, engine: owner}
+	}
+	return result
+}
+
+// qwpSfTestBeforeWholeSlotQuarantineHook runs after the failed build has
+// released its directory-local resources and immediately before candidate
+// selection and rename. It lets concurrency tests exercise the exact gap the
+// parent-anchored logical lock exists to cover.
+var qwpSfTestBeforeWholeSlotQuarantineHook atomic.Pointer[func(slotDir string)]
+
+// qwpSfPendingCleanupEngine returns the engine whose cleanup is still running
+// behind a construction error, or nil. A returned error is not proof that
+// cleanup finished, so ownership decisions ask the engine rather than the
+// error's text.
+func qwpSfPendingCleanupEngine(err error) *qwpSfCursorEngine {
+	var buildErr *qwpSfBuildCleanupError
+	if errors.As(err, &buildErr) && buildErr.engine != nil && !buildErr.engine.engineCloseCompleted() {
+		return buildErr.engine
+	}
+	return nil
+}
+
+// qwpSfOpenCursorEngineTransition runs the recovery/quarantine/fresh-slot
+// transition for one slot pathname. Disk-backed callers hold the logical slot
+// lock for its whole duration.
+func qwpSfOpenCursorEngineTransition(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (*qwpSfCursorEngine, error) {
+	if sfDir != "" {
+		if options.revalidate != nil {
+			if err := options.revalidate(sfDir); err != nil {
+				return nil, err
+			}
+		}
+		if qwpSfIsLegacyQuarantineName(filepath.Base(filepath.Clean(sfDir))) {
+			// Older clients put whole preserved slots under <sf_dir>/quarantined/.
+			// That name is also a legal sender_id, so it is inspected before any
+			// lock file or slot file is created inside it.
+			if err := qwpSfInspectLegacyQuarantinePath(sfDir); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// Where the bytes of slots this build refused went. The first path is
+	// carried onto a successful fresh engine for QuarantinedSlotPath; an error
+	// carries every completed move so a later partial fresh slot is not confused
+	// with the caller's original evidence.
+	var quarantinedPaths []string
+	appendQuarantined := func(path string) {
+		if path == "" {
+			return
+		}
+		for _, existing := range quarantinedPaths {
+			if existing == path {
+				return
+			}
+		}
+		quarantinedPaths = append(quarantinedPaths, path)
+	}
+	// A failure after a completed rename must still name the destination: with
+	// no engine returned, the error is the only channel left, and a diagnostic
+	// that a handler drops cannot be the one that carries it.
+	failed := func(err error) (*qwpSfCursorEngine, error) {
+		if len(quarantinedPaths) == 0 {
+			return nil, err
+		}
+		return nil, &qwpSfQuarantineError{
+			destination:            quarantinedPaths[0],
+			additionalDestinations: append([]string(nil), quarantinedPaths[1:]...),
+			cause:                  err,
+		}
+	}
+	for attempt := 0; ; attempt++ {
+		e, err := qwpSfNewCursorEngineOnce(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, options)
+		if err == nil || sfDir == "" {
+			if e != nil && len(quarantinedPaths) > 0 {
+				e.quarantinedPath = quarantinedPaths[0]
+			}
+			if err != nil {
+				return failed(err)
+			}
+			return e, nil
+		}
+		// The residue retry is the second half of a recovery step that already
+		// completed: the sanitization is on disk and the same bytes recover on
+		// the very next pass. Every caller takes it, drainers included —
+		// otherwise one slot recovers under a foreground sender and the same
+		// slot is abandoned under a drainer.
+		if errors.Is(err, qwpSfErrSanitizedResidue) && attempt == 0 {
+			qwpEffectiveLogger(options.logger).Error("qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
+			continue
+		}
+		// Quarantine-and-start-fresh is a foreground-only policy: a drainer
+		// exists to deliver the slot's rows, so it reports the failure and
+		// leaves the bytes where they are.
+		if !options.recoverForeground {
+			return failed(err)
+		}
+		if errors.Is(err, qwpSfErrRecoveryFailClosed) && attempt <= 1 {
+			if hook := qwpSfTestBeforeWholeSlotQuarantineHook.Load(); hook != nil {
+				(*hook)(sfDir)
+			}
+			quarantined, quarantineErr := qwpSfQuarantineSlot(sfDir, err.Error(), options.logger)
+			if quarantineErr != nil {
+				// A rename that completed before a later step failed still moved
+				// the bytes. Keep that destination reportable through the error,
+				// which is the only channel left when no engine is returned.
+				for _, done := range qwpSfQuarantineDestinations(quarantineErr) {
+					appendQuarantined(done)
+				}
+				var transitionErr error = fmt.Errorf("qwp/sf: quarantine fail-closed slot %s: %w", sfDir, quarantineErr)
+				if errors.Is(quarantineErr, ErrSfDurability) {
+					transitionErr = qwpSfDurabilityError("quarantine fail-closed slot", sfDir, quarantineErr)
+				}
+				return failed(errors.Join(err, transitionErr))
+			}
+			qwpEffectiveLogger(options.logger).Error("qwp/sf: recovery failed closed; preserved the slot and starting fresh", "slot", sfDir, "quarantined", quarantined, "error", err)
+			// Keep the first preserved directory. The loop can quarantine
+			// twice, and only the first copy holds the rows the caller came
+			// looking for -- the second is whatever the fresh slot managed to
+			// write before failing again. Reporting the later one would send
+			// the caller to a near-empty directory.
+			appendQuarantined(quarantined)
+			continue
+		}
+		return failed(err)
+	}
+}
+
+func qwpSfNewCursorEngineOnce(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (result *qwpSfCursorEngine, err error) {
 	mgr, err := qwpSfNewSegmentManager(segmentSizeBytes, qwpSfManagerDefaultPoll, maxTotalBytes)
 	if err != nil {
 		return nil, err
 	}
-	mgr.segmentManagerStart()
-	// Close the manager (joining its worker goroutine) on any failure
-	// exit of the inner constructor — error return AND panic. The inner
-	// constructor's own deferred guard releases the slot flock on the
-	// same unwind; this guard covers the one resource it can't see — the
-	// manager we own here. ok flips true only once the engine adopts it.
-	ok := false
-	defer func() {
-		if !ok {
-			mgr.segmentManagerClose()
-		}
-	}()
-	e, err := qwpSfNewCursorEngineWithManager(sfDir, segmentSizeBytes, mgr, appendDeadline)
+	if options.logger != nil {
+		mgr.logger.Store(options.logger)
+	}
+	e, err := qwpSfBuildCursorEngine(sfDir, segmentSizeBytes, mgr, appendDeadline, options)
 	if err != nil {
 		return nil, err
 	}
-	e.ownsManager = true
-	ok = true
+	mgr.segmentManagerStart()
 	return e, nil
 }
 
-// qwpSfNewCursorEngineWithManager creates an engine that shares the
-// given segment manager (must already be started). The caller
-// retains ownership of the manager; engineClose will not stop it.
-func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegmentManager, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
+func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegmentManager, appendDeadline time.Duration, options qwpSfEngineOpenOptions) (result *qwpSfCursorEngine, err error) {
 	if appendDeadline <= 0 {
 		appendDeadline = qwpSfEngineDefaultAppendDeadline
 	}
@@ -237,10 +547,11 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		ring              *qwpSfSegmentRing
 		watermark         *qwpSfAckWatermark
 		persistedDict     *qwpSfSymbolDict
+		initial           *qwpSfSegment
+		manifest          *qwpSfManifest
 		recoveredSymbols  []string
 		recoveredMaxStart int
 		recoveredFromDisk bool
-		err               error
 	)
 	if !memoryMode {
 		// Acquire the slot lock BEFORE touching any *.sfa files.
@@ -251,40 +562,45 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			return nil, err
 		}
 	}
-	// Teardown for every failure exit — error return AND panic. ok
-	// flips true only once the engine adopts these resources, so the
-	// deferred guard runs cleanup on any unwind between the flock
-	// acquisition above and the success return below. Skipping it on a
-	// panic would strand the slot: the kernel-held flock survives the
-	// process, wedging every future foreground open and orphan drainer
-	// (which can no longer release a lock it never took), so the slot's
-	// unacked data becomes unrecoverable.
-	//
-	// Release order mirrors engineClose and the Java reference: the
-	// ring's segment mmaps, then the watermark's own mmap + fd, then the
-	// slot flock LAST so it outlives every other cleanup. A failed
-	// registration never reaches the manager's ring list, so the ring
-	// needs no deregister here — and cleanup touches no manager state,
-	// which keeps it safe to run on the unwind of a registration panic.
 	ok := false
-	cleanup := func() {
-		if ring != nil {
-			_ = ring.segmentRingClose()
-		}
-		if watermark != nil {
-			_ = watermark.close()
-		}
-		if persistedDict != nil {
-			_ = persistedDict.close()
-		}
-		if lock != nil {
-			_ = lock.close()
-		}
-	}
 	defer func() {
-		if !ok {
-			cleanup()
+		if ok {
+			return
 		}
+		r := recover()
+		held := &qwpSfCursorEngine{sfDir: sfDir, manager: mgr, ring: ring, slotLock: lock,
+			watermark: watermark, persistedSymbolDict: persistedDict}
+		if ring == nil {
+			if initial != nil {
+				held.looseSegments = []*qwpSfSegment{initial}
+			}
+			held.looseManifest = manifest
+		}
+		var retained *qwpSfAcquisitionError
+		if errors.As(err, &retained) {
+			held.acquired = retained.resources
+		}
+		var failure error
+		if errors.Is(err, ErrCleanupFailed) {
+			failure = err
+		}
+		if retained, ok := r.(*qwpSfAcquisitionPanic); ok {
+			held.acquired = retained.resources
+			failure = errors.Join(ErrCleanupFailed, retained)
+		}
+		cleanupErr := held.engineCloseWithCause(failure)
+		if r != nil {
+			panic(qwpSfBuildPanic{cause: r, stack: debug.Stack(), reporter: &qwpSfBuildCleanupError{cause: cleanupErr, engine: held}})
+		}
+		err = errors.Join(err, cleanupErr)
+		if !held.engineCloseCompleted() {
+			if errors.Is(err, qwpSfErrRecoveryFailClosed) || errors.Is(err, qwpSfErrSanitizedResidue) {
+				// Do not rename or reopen the slot before cleanup releases it.
+				err = errors.Join(ErrSfDurability, fmt.Errorf("recovery awaits resource release: %v", err), cleanupErr)
+			}
+			err = &qwpSfBuildCleanupError{cause: err, engine: held}
+		}
+		result = nil
 	}()
 	// Disk mode: try to recover any *.sfa files left behind by a
 	// prior session before deciding to start fresh. Without this the
@@ -292,11 +608,55 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	// overlapping FSNs already on disk and corrupting ACK
 	// translation, trim, and replay.
 	if !memoryMode {
-		ring, err = qwpSfOpenRing(sfDir, segmentSizeBytes)
+		ring, _, err = qwpSfRecoverRingWithContext(sfDir, segmentSizeBytes, qwpSfRecoveryContext{logger: options.logger})
 		if err != nil {
 			return nil, err
 		}
 		recoveredFromDisk = ring != nil
+		// Prepare the ack watermark before anything in this slot can publish a
+		// frame number, and before the fresh-slot branch below creates its
+		// initial segment and manifest. Recovery has just established which
+		// frames exist, which is the only evidence that can decide whether a
+		// record on disk is about this history at all:
+		//
+		//   - no ring: numbering restarts at 0 and the record describes a
+		//     lifecycle whose frames are gone.
+		//   - a record above the recovered tip: no correctly operating session
+		//     for this history produced it.
+		//
+		// Both cases retire the record durably. Merely ignoring it for this run
+		// is what let it become plausible again once new frames reached its
+		// number, on a slot that had already rejected it once.
+		startup := qwpSfAckWatermarkStartup{freshHistory: ring == nil}
+		if ring != nil {
+			// An empty recovered ring is not a fresh history: it can carry a
+			// nonzero sequence base, and its tip is that base minus one.
+			startup.publishedFsn = ring.segmentRingPublishedFsn()
+		}
+		watermark, err = qwpSfAckWatermarkOpenPrepared(sfDir, startup, options.logger)
+		if qwpSfAckWatermarkStorageFallbackAllowed(err) {
+			// A full disk is the ordinary way to get here, and draining this
+			// slot is what gives the disk its space back, so the engine opens
+			// without the watermark rather than refusing the slot. The seed then
+			// comes from the surviving segments alone, which can re-send frames
+			// a previous session already got acked.
+			//
+			// This is reachable only after preparation and its barriers
+			// succeeded and the acquired resources were released: the file on
+			// disk is already safe, so a nil watermark cannot resurrect an old
+			// ACK record for the numbers this session is about to publish.
+			if startup.freshHistory {
+				qwpEffectiveLogger(options.logger).Warn("qwp/sf: opening a fresh slot without its ack watermark; a later recovery falls back to the surviving segments",
+					"dir", sfDir, "error", err)
+			} else {
+				qwpEffectiveLogger(options.logger).Warn("qwp/sf: opening a recovered slot without its ack watermark; already-acked frames may replay",
+					"dir", sfDir, "error", err)
+			}
+			watermark, err = nil, nil
+		}
+		if err != nil {
+			return nil, qwpSfDurabilityError("could not open required ack watermark", sfDir, err)
+		}
 		if ring != nil {
 			// Seed ackedFsn to one below the lowest segment's baseSeq.
 			// We don't know what was actually acked before the prior
@@ -333,10 +693,12 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			//     lowestBase is higher, watermark is stale; max picks
 			//     lowestBase-1.
 			//
-			// open() returns nil on any setup failure so a missing /
-			// unmappable file never takes the engine down — we just
-			// fall back to the bare lowestBase-1 seed.
-			watermark = qwpSfAckWatermarkOpen(sfDir)
+			// The file was prepared above, so a record that survived
+			// preparation is at most the recovered tip, and a retired one reads
+			// INVALID. Seeding stays segment-derived either way: discarding
+			// watermark evidence must not erase what the surviving segment
+			// boundaries establish about already-trimmed lower segments.
+
 			// Load the persisted symbol dictionary so this recovered slot's
 			// delta frames can be re-registered on a fresh server before they
 			// replay. A recovered slot's dictionary is NEVER recreated: its
@@ -355,9 +717,17 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// dictionary the waiting frames need out of the frames themselves.
 			// When the ring holds no frames there are no ids to clash with, so
 			// starting a fresh dictionary is safe and keeps delta encoding
-			// available.
-			if persistedDict == nil && ring.segmentRingPublishedFsn() < 0 {
-				persistedDict = qwpSfSymbolDictOpenFresh(filepath.Join(sfDir, qwpSfSymbolDictFileName))
+			// available. The test is the frames themselves: a recovered chain
+			// that was fully trimmed holds none while still reporting the
+			// published sequence it reached, and a sender there would otherwise
+			// send a full symbol dictionary on every frame for its whole life.
+			if persistedDict == nil && !ring.segmentRingHoldsFrames() {
+				var freshDictErr error
+				persistedDict, freshDictErr = qwpSfSymbolDictOpenFresh(filepath.Join(sfDir, qwpSfSymbolDictFileName))
+				if freshDictErr != nil {
+					qwpEffectiveLogger(options.logger).Warn("qwp/sf: could not create a symbol dictionary for an empty recovered slot; falling back to full-dictionary frames",
+						"dir", sfDir, "error", freshDictErr)
+				}
 			}
 			watermarkFsn := watermark.read() // nil-safe → INVALID
 			candidate := baseSeed
@@ -372,6 +742,11 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			// position the cursor past every un-acked frame — silent
 			// loss of the un-acked tail. Fall back to the
 			// segment-derived seed so that tail still replays.
+			//
+			// Preparation already retired such a record on disk, so this clamp
+			// is defence in depth for a value that appears between inspection
+			// and here. It is not the mechanism that keeps the record from
+			// being believed on a later restart.
 			seed := candidate
 			if seed > ring.segmentRingPublishedFsn() {
 				seed = baseSeed
@@ -408,8 +783,7 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 			if persistedDict != nil && len(recoveredSymbols) > persistedDict.size() {
 				from := persistedDict.size()
 				if appendErr := persistedDict.appendSymbols(recoveredSymbols[from:]); appendErr != nil {
-					qwpEffectiveLogger(nil).Warn(
-						"qwp/sf: could not heal recovered symbol dictionary; falling back to full-dictionary frames",
+					qwpEffectiveLogger(options.logger).Warn("qwp/sf: could not heal recovered symbol dictionary; falling back to full-dictionary frames",
 						"error", appendErr)
 					_ = persistedDict.close()
 					persistedDict = nil
@@ -418,19 +792,20 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		}
 	}
 	if ring == nil {
-		var initial *qwpSfSegment
 		var initialPath string
 		if memoryMode {
 			initial, err = qwpSfCreateInMemorySegment(0, segmentSizeBytes)
 		} else {
-			// Fresh disk slot: any stale watermark refers to a
-			// fully-drained lifecycle now gone. Unlink it before
-			// opening so the new session's first read() correctly
-			// reports INVALID (magic=0 on a freshly zero-filled
-			// file) rather than honouring an FSN with no segments
-			// behind it.
-			qwpSfAckWatermarkRemoveOrphan(sfDir)
-			watermark = qwpSfAckWatermarkOpen(sfDir)
+			// Fresh disk slot: any stale watermark refers to a fully-drained
+			// lifecycle now gone, and this session restarts frame numbering at
+			// 0. The watermark was already retired and made durable by the
+			// preparation above, before this branch creates the initial segment
+			// and manifest. Startup no longer depends on a best-effort unlink
+			// whose failure used to be ignored, leaving the next read() honouring
+			// an FSN with no segments behind it.
+			if err := qwpSfManifestRemove(sfDir); err != nil {
+				return nil, err
+			}
 			// A fresh slot must never inherit a prior generation's id mapping.
 			// Truncate an existing side-file in place; if that is refused, abort
 			// rather than run full-dict next to stale bytes a later recovery would
@@ -446,16 +821,46 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 		if err != nil {
 			return nil, err
 		}
-		ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
+		if !memoryMode {
+			if err := initial.syncHeader(); err != nil {
+				return nil, err
+			}
+			if err := qwpSfSyncSlotDir(sfDir); err != nil {
+				return nil, qwpSfDurabilityError("sync fresh slot directory", sfDir, err)
+			}
+			var createErr error
+			manifest, createErr = qwpSfManifestCreate(sfDir, 0, 0)
+			if createErr != nil {
+				return nil, createErr
+			}
+			if err := initial.markManifestRequired(); err != nil {
+				return nil, err
+			}
+			if hook := qwpSfTestBeforeFreshRingAdoptHook.Load(); hook != nil {
+				if hookErr := (*hook)(); hookErr != nil {
+					return nil, hookErr
+				}
+			}
+			ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
+			ring.manifest = manifest
+		} else {
+			ring = qwpSfNewSegmentRing(initial, segmentSizeBytes)
+		}
 	}
-	if err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark); err != nil {
+	if hook := qwpSfTestBeforeEngineRegisterHook.Load(); hook != nil {
+		if hookErr := (*hook)(); hookErr != nil {
+			return nil, hookErr
+		}
+	}
+	managerEntry, err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark)
+	if err != nil {
 		return nil, err
 	}
 	e := &qwpSfCursorEngine{
 		sfDir:                        sfDir,
 		segmentSizeBytes:             segmentSizeBytes,
 		manager:                      mgr,
-		ownsManager:                  false,
+		managerEntry:                 managerEntry,
 		slotLock:                     lock,
 		ring:                         ring,
 		watermark:                    watermark,
@@ -469,6 +874,12 @@ func qwpSfNewCursorEngineWithManager(sfDir string, segmentSizeBytes int64, mgr *
 	return e, nil
 }
 
+// qwpSfTestBeforeEngineRegisterHook lets tests fail construction after files
+// and mappings are opened. The engine's cleanup worker releases them, just as
+// it does when a successfully constructed engine closes.
+var qwpSfTestBeforeEngineRegisterHook atomic.Pointer[func() error]
+var qwpSfTestBeforeFreshRingAdoptHook atomic.Pointer[func() error]
+
 // engineAcknowledge records a server ACK for cumulative FSN seq.
 // Triggers background trim of any sealed segments whose every frame
 // is now acknowledged. Idempotent and monotonic.
@@ -479,17 +890,6 @@ func (e *qwpSfCursorEngine) engineAcknowledge(seq int64) {
 // engineAckedFsn returns the highest FSN safe to send.
 func (e *qwpSfCursorEngine) engineAckedFsn() int64 {
 	return e.ring.segmentRingAckedFsn()
-}
-
-// engineSetLogger points the segment manager's cap-reached backpressure
-// diagnostic at the configured logger. The manager's worker goroutine is
-// already running by the time the caller has a logger, so the store is
-// through an atomic.Pointer; a nil logger leaves the slog.Default() fallback.
-func (e *qwpSfCursorEngine) engineSetLogger(l *slog.Logger) {
-	if e == nil || e.manager == nil {
-		return
-	}
-	e.manager.logger.Store(l)
 }
 
 // engineAckNotify returns a channel closed the next time ackedFsn
@@ -529,6 +929,15 @@ func (e *qwpSfCursorEngine) engineMaxFrameBytes() int64 {
 // fresh-disk engines return false.
 func (e *qwpSfCursorEngine) engineWasRecoveredFromDisk() bool {
 	return e.recoveredFromDisk
+}
+
+// engineQuarantinedSlotPath returns the directory holding the slot this engine
+// refused and set aside, or "" when it started on a slot it could read.
+func (e *qwpSfCursorEngine) engineQuarantinedSlotPath() string {
+	if e == nil {
+		return ""
+	}
+	return e.quarantinedPath
 }
 
 // engineDeltaDictEnabled reports whether the sender may delta-encode the
@@ -626,6 +1035,9 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 	if fsn == qwpSfPayloadTooLarge {
 		return 0, qwpSfErrPayloadTooLarge
 	}
+	if fsn == qwpSfRotationFailed {
+		return 0, e.rotationDurabilityError()
+	}
 	// First miss → record one stall (not one per spin) and start the
 	// deadline clock.
 	e.backpressureStalls.Add(1)
@@ -661,7 +1073,14 @@ func (e *qwpSfCursorEngine) engineAppendBlocking(ctx context.Context, payload []
 		if fsn == qwpSfPayloadTooLarge {
 			return 0, qwpSfErrPayloadTooLarge
 		}
+		if fsn == qwpSfRotationFailed {
+			return 0, e.rotationDurabilityError()
+		}
 	}
+}
+
+func (e *qwpSfCursorEngine) rotationDurabilityError() error {
+	return qwpSfDurabilityError("rotate active segment", e.sfDir, e.ring.rotationError())
 }
 
 // tryAppendOrFsn runs one ring.appendOrFsn under appendMu, re-checking
@@ -746,6 +1165,12 @@ func (e *qwpSfCursorEngine) engineTerminalError() error {
 			return err
 		}
 	}
+	// Same reasoning for a slot whose maintenance keeps failing: the trim that
+	// would free ring space cannot commit, so the backpressure is local storage
+	// refusing writes, not a slow or disconnected server.
+	if err := e.managerEntry.entryMaintenanceError(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -776,102 +1201,76 @@ func (e *qwpSfCursorEngine) formatBackpressureTimeout() error {
 	return fmt.Errorf("%w (deadline %s, wire publishing but slow)", ErrBackpressureTimeout, e.appendDeadline)
 }
 
-// engineClose tears down the engine. Drains residual on-disk
-// segment files when the ring confirms every published FSN has been
-// acked — at that moment the slot has no recoverable work and the
-// files are pure noise that would mislead the next sender's
-// recovery. Best-effort: logs (via returned error) and continues on
-// failures, since we're already on the close path.
-//
-// Order: deregister the ring from the manager (so no new spares
-// arrive), close the manager if we own it, close the ring (closes
-// its segments), close the ack-watermark mmap AFTER the manager (its
-// sole writer) is gone, unlink residual files + the now-meaningless
-// watermark if fully drained, release the slot lock LAST (so the
-// kernel-held flock outlives any other cleanup work).
-func (e *qwpSfCursorEngine) engineClose() error {
-	return e.engineCloseInternal(false)
-}
-
-// engineCloseLeakSegments tears the engine down like engineClose but leaves the
-// segment mmaps mapped, for the caller whose send loop was abandoned wedged in
-// an un-cancellable page fault: unmapping under that goroutine would fault the
-// host process. The address space leaks until process exit; every other
-// resource (fds, watermark, slot lock) is released normally.
-func (e *qwpSfCursorEngine) engineCloseLeakSegments() error {
-	return e.engineCloseInternal(true)
-}
-
-func (e *qwpSfCursorEngine) engineCloseInternal(leakSegments bool) error {
-	if !e.closed.CompareAndSwap(false, true) {
+// engineLogger reads the configured logger through the manager. A hand-built
+// engine in tests can carry no manager, and the close paths that log run on
+// such an engine too.
+func (e *qwpSfCursorEngine) engineLogger() *slog.Logger {
+	if e == nil || e.manager == nil {
 		return nil
 	}
-	// Serialize the manager + ring teardown against the producer's
-	// append path. closed is now true, so any tryAppendOrFsn that
-	// acquires appendMu after us bails before touching the ring;
-	// acquiring it here drains any append currently in flight. Held
-	// across segmentRingClose so the active segment is nil'd + munmapped
-	// with no producer dereferencing it (a SenderErrorHandler's
-	// Close() racing a producer parked in engineAppendBlocking's
-	// backpressure spin). appendMu is never held by the manager
-	// goroutine, so joining it under the lock cannot deadlock.
-	e.appendMu.Lock()
-	defer e.appendMu.Unlock()
-	// Capture drain state BEFORE closing the ring — once the ring is
-	// closed, its accessors aren't safe to read. The active segment
-	// is never trimmed by drainTrimmable (only sealed segments are),
-	// so when everything published has been acked we have to unlink
-	// the residual .sfa files here.
-	fullyDrained := e.sfDir != "" &&
-		(e.ring.segmentRingPublishedFsn() < 0 ||
-			e.ring.segmentRingAckedFsn() >= e.ring.segmentRingPublishedFsn())
-
-	var firstErr error
-	e.manager.segmentManagerDeregister(e.ring)
-	if e.ownsManager {
-		e.manager.segmentManagerClose()
-	}
-	if err := e.ring.segmentRingCloseInternal(leakSegments); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	// Close the watermark mmap/fd after the manager (the sole writer
-	// through it) is gone but before the slot lock is released. With
-	// ownsManager set, segmentManagerClose above has already joined
-	// the worker goroutine, so no persistIfAdvanced can race this
-	// close; the watermark's own mutex covers the residual
-	// shared-manager (test-only) case.
-	if e.watermark != nil {
-		if err := e.watermark.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if e.persistedSymbolDict != nil {
-		if err := e.persistedSymbolDict.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if fullyDrained {
-		if err := qwpSfUnlinkAllSegmentFiles(e.sfDir); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		// A watermark or dictionary with no segments behind it would only
-		// confuse the next session's recovery seed — drop them, matching the
-		// .sfa unlink and the fresh-slot removeOrphan above.
-		qwpSfAckWatermarkRemoveOrphan(e.sfDir)
-		qwpSfSymbolDictRemoveOrphan(e.sfDir)
-	}
-	if e.slotLock != nil {
-		if err := e.slotLock.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	return e.manager.logger.Load()
 }
 
-// qwpSfUnlinkAllSegmentFiles unlinks every .sfa file under dir.
+func qwpSfShouldLogCloseRetry(last, now time.Time) bool {
+	return last.IsZero() || now.Sub(last) >= qwpSfCloseRetryLogThrottle
+}
+
+// qwpSfUnlinkSegmentsAndSyncDir unlinks every .sfa file under dir and commits
+// their absence as one durability epoch. The manifest must not be removed
+// until this helper succeeds: its separate epoch is the proof that a missing
+// manifest cannot become durable while a manifest-required segment survives.
+func qwpSfUnlinkSegmentsAndSyncDir(dir string) error {
+	if err := qwpSfUnlinkAllSegmentFiles(dir); err != nil {
+		return err
+	}
+	// A slot directory that is already gone is the end state this cleanup works
+	// toward, and there is no namespace left to make durable. Treating it as
+	// success also prevents the retry owner from retaining the flock forever.
+	if err := qwpSfSyncSlotDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return qwpSfDurabilityError("sync slot directory after unlinking drained segments", dir, err)
+	}
+	return nil
+}
+
+// qwpSfRemoveManifestAndSyncDir removes a manifest only after the caller has
+// committed every namespace mutation the manifest depended on, then commits
+// the manifest's own absence as a new durability epoch.
+func qwpSfRemoveManifestAndSyncDir(dir string) error {
+	if err := qwpSfManifestRemove(dir); err != nil {
+		return err
+	}
+	if err := qwpSfSyncSlotDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return qwpSfDurabilityError("sync slot directory after removing manifest", dir, err)
+	}
+	return nil
+}
+
+// qwpSfUnlinkAllSegmentFiles performs the unlink portion of the drained
+// segment epoch. Callers use qwpSfUnlinkSegmentsAndSyncDir rather than invoking
+// it directly so the namespace mutations cannot escape without their barrier.
 // Called only on clean shutdown when the ring confirms every
-// published FSN has been acked. Best-effort: returns the first error
-// encountered but continues iterating.
+// published FSN has been acked. Removal stops at the first failure, leaving
+// the manifest in place.
+//
+// Files go oldest first: sf-initial.sfa (the legacy base-0 segment), then the
+// sf-<generation>.sfa files in generation order. The sort needs the explicit
+// sf-initial.sfa case because plain name order would put that oldest file last
+// -- "i" sorts after the hex digits of every rotated name.
+//
+// The caller has already committed the manifest at headBase == activeBase ==
+// the active segment's base, and recovery skips every segment below headBase,
+// so the active segment is the one file it still requires. Every crash point
+// in this sweep leaves a directory recovery accepts, in one of three ways.
+// Before the active segment is reached, it is still there and the chain starts
+// at headBase. After it, what can remain is the hot spare the manager minted
+// most recently -- its generation is higher, so it sorts after the active
+// segment and outlives it -- which holds no frames and is either read as the
+// active segment at that same base or leaves the committed boundaries with no
+// chain to find; both recover as an empty slot. Last, an empty directory,
+// whose collapsed manifest is removed on its own.
+//
+// TestQwpSfDrainedCleanupCrashEpochsRecover enumerates every persisted subset
+// and ordering permitted inside the epoch.
 func qwpSfUnlinkAllSegmentFiles(dir string) error {
 	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
@@ -883,15 +1282,30 @@ func qwpSfUnlinkAllSegmentFiles(dir string) error {
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	var paths []string
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".sfa") {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
-		if rmErr := os.Remove(path); rmErr != nil && firstErr == nil {
-			firstErr = rmErr
+		paths = append(paths, filepath.Join(dir, e.Name()))
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		bi, bj := filepath.Base(paths[i]), filepath.Base(paths[j])
+		if bi == "sf-initial.sfa" {
+			return bj != "sf-initial.sfa"
+		}
+		if bj == "sf-initial.sfa" {
+			return false
+		}
+		return bi < bj
+	})
+	for _, path := range paths {
+		if hook := qwpSfTestBeforeSegmentUnlinkHook.Load(); hook != nil {
+			(*hook)(path)
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
 	}
-	return firstErr
+	return nil
 }
