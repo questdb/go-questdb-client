@@ -39,26 +39,19 @@ import (
 // TestQwpSfEngineCloseDuringBackpressuredAppendNoCrash is the
 // regression for the engine-level crash (Hazard A).
 //
-// A SenderErrorHandler is documented as allowed to call Close(). When a
-// HALT stalls the wire, the send loop stops draining, the cursor ring
-// fills, and the producer parks in engineAppendBlocking's backpressure
-// spin — calling appendOrFsn every park interval. Close() then tears
-// the engine down on a different goroutine: segmentRingClose swaps the
-// active segment to nil and munmaps it while the parked producer is
-// still calling appendOrFsn. Pre-fix the producer dereferences the
-// just-nil'd active segment.
+// Callbacks must not call Close while the application is using the sender. This
+// test bypasses that rule and closes the engine while an append is waiting. The
+// unsupported overlap must return an error instead of crashing. Before the fix,
+// Close could clear the active segment just before the waiting append used it.
 //
-// Memory mode is used deliberately: there the dangling access is a
-// recoverable nil-pointer panic, so the failure is assertable rather
-// than a process-killing SIGBUS (which is what the equivalent SF-mode
-// race produces against the munmapped pages). The same engine-level
-// append/close serialization fixes both.
+// The test uses memory-backed storage so an invalid access produces a panic that
+// the test can catch. With disk-backed storage, the same bug could terminate the
+// process. The same engine lock protects both modes.
 func TestQwpSfEngineCloseDuringBackpressuredAppendNoCrash(t *testing.T) {
 	const segSize int64 = 96 // 24-byte header + 72-byte payload region
-	// Cap total bytes at one segment so the manager never provisions a
-	// hot spare: once the active fills, every further append
-	// backpressures forever (nothing acks, so no trim frees space). Long
-	// append deadline so the producer stays parked until we close it.
+	// Limit storage to one segment. Once it is full, another append must wait
+	// because no frames are acknowledged or removed. Use a long timeout so the
+	// append is still waiting when the engine closes.
 	e, err := qwpSfNewCursorEngine("", segSize, segSize, 30*time.Second)
 	require.NoError(t, err)
 
@@ -69,9 +62,8 @@ func TestQwpSfEngineCloseDuringBackpressuredAppendNoCrash(t *testing.T) {
 		require.NoError(t, err, "fill frame %d", i)
 	}
 
-	// Park a producer on the 4th append. It spins in the backpressure
-	// loop until either the (30s) deadline or the engine is closed under
-	// it. Any panic is recovered so the test binary survives to assert.
+	// Start a fourth append, which must wait for space or for the engine to
+	// close. Catch any panic so the test can report it as a failure.
 	var prodErr error
 	var prodPanic atomic.Value
 	done := make(chan struct{})
@@ -85,25 +77,24 @@ func TestQwpSfEngineCloseDuringBackpressuredAppendNoCrash(t *testing.T) {
 		_, prodErr = e.engineAppendBlocking(context.Background(), make([]byte, 16))
 	}()
 
-	// Wait until the producer is genuinely in the backpressure spin
-	// (stall counter bumps once on the first miss, before the spin).
+	// Wait until the fourth append has tried and failed to find space.
 	require.Eventually(t, func() bool {
 		return e.engineTotalBackpressureStalls() >= 1
 	}, 2*time.Second, 50*time.Microsecond,
-		"producer never entered the backpressure spin")
+		"append never started waiting for space")
 
-	// Close the engine out from under the parked producer — exactly what
-	// a SenderErrorHandler's Close() does on the dispatcher goroutine.
+	// Close the engine while the append is waiting. The append must return an
+	// error instead of panicking.
 	require.NoError(t, e.engineClose())
 
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("parked producer never returned after engineClose")
+		t.Fatal("waiting append did not return after the engine closed")
 	}
 
 	require.Nil(t, prodPanic.Load(),
-		"producer crashed dereferencing a torn-down segment: %v", prodPanic.Load())
+		"append crashed after the active segment was cleared: %v", prodPanic.Load())
 	require.ErrorIs(t, prodErr, qwpSfErrEngineClosed,
 		"a producer parked in backpressure must observe a clean closed-engine "+
 			"error once the engine is closed, got: %v", prodErr)

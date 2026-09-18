@@ -112,7 +112,8 @@ const (
 	// or corrupt length prefix cannot drive a runaway allocation. Symbols are
 	// short; this ceiling is generous.
 	qwpSfSymbolDictMaxEntryLen = 1 << 20
-	// qwpSfSymbolDictMaxFileSize limits the buffer open() reads the file into.
+	// qwpSfSymbolDictMaxFileSize is the largest dictionary the writer may
+	// create and recovery may read into memory.
 	// The number of entries needs its own limit, qwpSfSymbolDictMaxRecoveredEntries:
 	// one empty-string entry is a single byte on disk but about 16 bytes of
 	// string header in memory, so a byte limit alone says little about how much
@@ -461,19 +462,24 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 	}
 	d.scratch = d.scratch[:0]
 	var vb [qwpMaxVarintLen]byte
-	entriesLen := 0
+	var entriesLen int64
 	for _, name := range names {
 		if len(name) > qwpSfSymbolDictMaxEntryLen {
 			return fmt.Errorf("qwp/sf: symbol dictionary entry length %d exceeds limit %d",
 				len(name), qwpSfSymbolDictMaxEntryLen)
 		}
-		entriesLen += qwpPutVarint(vb[:], uint64(len(name))) + len(name)
+		entriesLen += int64(qwpPutVarint(vb[:], uint64(len(name))) + len(name))
+	}
+	countLen := qwpPutVarint(vb[:], uint64(len(names)))
+	entriesLenLen := qwpPutVarint(vb[:], uint64(entriesLen))
+	chunkLen := entriesLen + int64(countLen+entriesLenLen+qwpSfSymbolDictCRCSize)
+	if chunkLen > qwpSfSymbolDictMaxFileSize-d.appendOffset {
+		return fmt.Errorf("qwp/sf: symbol dictionary file exceeds maximum size %d", qwpSfSymbolDictMaxFileSize)
 	}
 	// Reuse the scratch capacity the steady-state flush path has already grown.
-	// The hint covers both chunk-header varints and the CRC; the bytes written
-	// are canonical varints, which are usually shorter.
-	if cap(d.scratch) < entriesLen+2*qwpMaxVarintLen+qwpSfSymbolDictCRCSize {
-		d.scratch = make([]byte, 0, entriesLen+2*qwpMaxVarintLen+qwpSfSymbolDictCRCSize)
+	// The exact hint covers both chunk-header varints and the CRC.
+	if cap(d.scratch) < int(chunkLen) {
+		d.scratch = make([]byte, 0, int(chunkLen))
 	}
 	n := qwpPutVarint(vb[:], uint64(len(names)))
 	d.scratch = append(d.scratch, vb[:n]...)

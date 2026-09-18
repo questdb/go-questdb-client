@@ -570,6 +570,14 @@ if err := sender.Flush(ctx); err != nil {
 }
 ```
 
+> **Callbacks report events only.** Error, connection, and progress callbacks
+> may run while the application is using the sender. From a callback, do not
+> call `Flush`, `Close`, methods that add rows or column values, any other method
+> that changes the sender, or `QuestDB.Close`. Instead, send a value through a
+> channel or cancel a context. The code using the sender can then stop its
+> current work and call `Flush` or `Close`. A callback may call a method only if
+> that method's documentation says it returns data without changing the sender.
+
 Nothing is ever silently dropped. Each `Category` resolves to a `Policy`:
 
 - `RETRIABLE` / `RETRIABLE_OTHER` — recycle the connection and replay from the

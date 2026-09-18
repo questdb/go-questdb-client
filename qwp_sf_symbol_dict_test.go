@@ -311,6 +311,35 @@ func TestQwpSfSymbolDictOversizedFileRejected(t *testing.T) {
 		"recovery must not truncate an oversized file it refused to read")
 }
 
+func TestQwpSfSymbolDictWriterEnforcesRecoveryFileSizeLimit(t *testing.T) {
+	d, err := qwpSfSymbolDictOpen(t.TempDir())
+	require.NoError(t, err)
+	require.NotNil(t, d)
+	defer func() { require.NoError(t, d.close()) }()
+
+	originalWriteAt := qwpSfSymbolDictWriteAt.load()
+	writes := 0
+	qwpSfSymbolDictWriteAt.store(func(_ *os.File, p []byte, _ int64) (int, error) {
+		writes++
+		return len(p), nil
+	})
+	t.Cleanup(func() { qwpSfSymbolDictWriteAt.store(originalWriteAt) })
+
+	chunkLen := int64(len(qwpSfTestSymbolDictChunk("x")))
+	d.appendOffset = qwpSfSymbolDictMaxFileSize - chunkLen
+	require.NoError(t, d.appendSymbols([]string{"x"}), "a dictionary exactly at the recovery limit is valid")
+	require.Equal(t, int64(qwpSfSymbolDictMaxFileSize), d.appendOffset)
+	require.Equal(t, 1, d.size())
+	require.Equal(t, 1, writes)
+
+	err = d.appendSymbols([]string{"y"})
+	require.ErrorContains(t, err, "symbol dictionary file exceeds maximum size")
+	require.Equal(t, int64(qwpSfSymbolDictMaxFileSize), d.appendOffset,
+		"a rejected append must not advance the file offset")
+	require.Equal(t, 1, d.size(), "a rejected append must not advance the symbol count")
+	require.Equal(t, 1, writes, "an append beyond the recovery limit must not reach the filesystem")
+}
+
 func TestQwpSfSymbolDictBadMagicRecreatedEmpty(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfSymbolDictFileName),

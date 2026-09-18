@@ -43,12 +43,14 @@ package questdb
 //
 // # Calling back into the sender
 //
-// Use a channel or context cancellation to signal the application code that
-// uses the sender. Do not call Close, Flush, other methods that change the
-// sender, or QuestDB.Close directly from the handler. You may call documented
-// methods that return read-only snapshots of state. The application must stop
-// using the sender before closing it; starting Close in another goroutine
-// does not remove this requirement.
+// A handler may run while the application is using the sender. From the
+// handler, do not call Close, Flush, methods that add rows or column values, any
+// other method that changes the sender, or QuestDB.Close. Instead, send a value
+// through a channel or cancel a context. The code using the sender can then stop
+// its current work and call Flush or Close. Starting either method in another
+// goroutine does not make concurrent use safe. The handler may call a method
+// only if that method's documentation says it returns data without changing the
+// sender.
 //
 // Shutdown stops accepting notifications and may drop queued ones. A handler
 // already running may finish after Close returns, even after resources are
