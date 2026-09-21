@@ -924,22 +924,50 @@ func TestQwpSfServicePassCarriesEveryFailureItAccumulated(t *testing.T) {
 		_ = e.engineClose()
 	})
 
-	// Rotate first, so the pass has a sealed segment to trim and reaches a
-	// mid-pass exit rather than the no-trim one. Rotation needs a spare, so
-	// this has to happen before the barrier starts failing.
 	payload := make([]byte, 512)
-	var fsn int64
-	require.Eventually(t, func() bool {
-		var appendErr error
-		fsn, appendErr = e.engineAppendBlocking(context.Background(), payload)
-		require.NoError(t, appendErr)
+	sealedCount := func() int {
 		e.ring.mu.Lock()
-		sealed := len(e.ring.sealedSegments)
-		e.ring.mu.Unlock()
-		return sealed > 0
-	}, 10*time.Second, time.Millisecond, "the ring must rotate at least once")
-	e.ring.acknowledge(fsn)
+		defer e.ring.mu.Unlock()
+		return len(e.ring.sealedSegments)
+	}
+	// Append until the ring seals one more segment, returning the FSN of the
+	// last frame written. The append error is checked here, on the test
+	// goroutine, so a failure calls FailNow on the goroutine that owns t.
+	rotateOnce := func() int64 {
+		target := sealedCount() + 1
+		deadline := time.Now().Add(10 * time.Second)
+		var lastFsn int64
+		for sealedCount() < target {
+			if time.Now().After(deadline) {
+				t.Fatal("the ring did not rotate within the deadline")
+			}
+			fsn, appendErr := e.engineAppendBlocking(context.Background(), payload)
+			require.NoError(t, appendErr)
+			lastFsn = fsn
+		}
+		return lastFsn
+	}
+
+	// Rotate once while barriers still succeed, then wait for the manager to
+	// mint the replacement spare. Provisioning that spare before the switch
+	// flips is what makes the failing pass deterministic: the second rotation
+	// consumes it, so under the fault every pass is guaranteed both to need a
+	// new spare -- whose barrier fails and is carried -- and to have a sealed,
+	// acked segment to trim, whose watermark sync is the exit that fires. A
+	// pass that raced the switch and provisioned the spare first would never
+	// retry the mint, so the carried spare failure would never appear.
+	rotateOnce()
+	require.Eventually(t, func() bool {
+		return e.ring.hotSpare.Load() != nil
+	}, 10*time.Second, time.Millisecond, "the manager must mint a replacement spare before the fault")
+
 	fail.Store(true)
+
+	// The second rotation consumes the healthy spare and seals a segment;
+	// acking it gives every following pass trim work, so the pass reaches the
+	// watermark-sync exit rather than the no-trim one.
+	fsn := rotateOnce()
+	e.ring.acknowledge(fsn)
 
 	// The spare mint fails first and is carried; the pre-trim barrier then
 	// fails and is the exit. Both must be in what the producer sees.
