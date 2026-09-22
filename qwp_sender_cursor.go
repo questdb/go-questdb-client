@@ -1189,11 +1189,19 @@ type qwpSenderBuildCleanupError struct {
 func (e *qwpSenderBuildCleanupError) Error() string        { return e.cause.Error() }
 func (e *qwpSenderBuildCleanupError) Unwrap() error        { return e.cause }
 func (e *qwpSenderBuildCleanupError) closeCompleted() bool { return e.cleanup.closeCompleted() }
+
+// While cleanup is unfinished, the result includes the construction cause.
+// After it finishes, the result is the reporter's own: delivery errors and
+// unrecovered cleanup errors remain, and a clean release leaves nothing.
 func (e *qwpSenderBuildCleanupError) cleanupResult() error {
+	var live error
 	if reporter, ok := e.cleanup.(interface{ cleanupResult() error }); ok {
-		return errors.Join(e.cause, reporter.cleanupResult())
+		live = reporter.cleanupResult()
 	}
-	return e.cause
+	if e.closeCompleted() {
+		return live
+	}
+	return errors.Join(e.cause, live)
 }
 func (e *qwpSenderBuildCleanupError) cleanupFailure() error {
 	if err := e.cleanupResult(); errors.Is(err, ErrCleanupFailed) {
@@ -1240,8 +1248,17 @@ func (e *qwpSfBuildCleanupError) closeCompleted() bool {
 }
 
 func (e *qwpSfBuildCleanupError) cleanupFailure() error { return e.engine.cleanupFailure() }
+
+// While the slot is held, the result includes the construction cause and the
+// engine's current cleanup error. After release, the result is the engine's
+// alone: empty when release succeeded, or the unrecovered cleanup error when
+// one remains.
 func (e *qwpSfBuildCleanupError) cleanupResult() error {
-	return errors.Join(e.cause, e.engine.cleanupResult())
+	live := e.engine.cleanupResult()
+	if e.engine != nil && e.closeCompleted() {
+		return live
+	}
+	return errors.Join(e.cause, live)
 }
 
 func (s *qwpLineSender) cleanupResult() error {

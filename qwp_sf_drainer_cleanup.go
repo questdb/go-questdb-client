@@ -65,12 +65,19 @@ func (d *qwpSfOrphanDrainer) notifyListener(fn func()) { d.listenerDispatcher().
 func (d *qwpSfOrphanDrainer) cleanupResult() error {
 	d.cleanupMu.Lock()
 	defer d.cleanupMu.Unlock()
-	result := d.cleanupErr
+	kept := d.cleanupErr
+	var live error
+	pending := false
 	if d.cleanup != nil {
-		result = errors.Join(result, d.cleanup.cleanupResult())
-		if !d.cleanup.engineCloseCompleted() {
-			result = errors.Join(result, ErrCleanupPending, ErrSfCleanupPending)
-		}
+		live = d.cleanup.cleanupResult()
+		pending = !d.cleanup.engineCloseCompleted()
+	}
+	if d.openErrClearsOnRelease && !pending && !errors.Is(kept, ErrCleanupFailed) && !errors.Is(live, ErrCleanupFailed) {
+		kept = nil
+	}
+	result := errors.Join(kept, live)
+	if pending {
+		result = errors.Join(result, ErrCleanupPending, ErrSfCleanupPending)
 	}
 	return result
 }

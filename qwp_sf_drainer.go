@@ -200,16 +200,20 @@ type qwpSfOrphanDrainer struct {
 	// stopCh is closed by drainerRequestStop so a polite stop unwinds an
 	// in-flight connect walk promptly (as the walk's cancelCh) instead of
 	// waiting out the pool-close hard-cancel grace.
-	stopCh            chan struct{}
-	targetFsn         atomic.Int64 // -1 until startup observes publishedFsn
-	ackedFsn          atomic.Int64 // mirrors engine.ackedFsn for visibility
-	outcome           atomic.Int32
-	lastErrorMessage  atomic.Pointer[string]
-	cleanupMu         sync.Mutex
-	cleanup           *qwpSfCursorEngine
-	cleanupErr        error
-	notificationsOnce sync.Once
-	notifications     *qwpDispatcher[func()]
+	stopCh           chan struct{}
+	targetFsn        atomic.Int64 // -1 until startup observes publishedFsn
+	ackedFsn         atomic.Int64 // mirrors engine.ackedFsn for visibility
+	outcome          atomic.Int32
+	lastErrorMessage atomic.Pointer[string]
+	cleanupMu        sync.Mutex
+	cleanup          *qwpSfCursorEngine
+	cleanupErr       error
+	// openErrClearsOnRelease is set for a local open failure that leaves the
+	// slot eligible for another scan. cleanupResult reports cleanupErr while
+	// the engine still holds the slot, and omits it once release has finished.
+	openErrClearsOnRelease bool
+	notificationsOnce      sync.Once
+	notifications          *qwpDispatcher[func()]
 }
 
 // qwpSfNewOrphanDrainer constructs a drainer for the given slot.
@@ -442,6 +446,9 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		// once the fault clears.
 		d.cleanupMu.Lock()
 		d.cleanupErr = errors.Join(d.cleanupErr, err)
+		if !errors.Is(err, qwpSfErrRecoveryFailClosed) {
+			d.openErrClearsOnRelease = true
+		}
 		d.cleanupMu.Unlock()
 		msg := err.Error()
 		d.lastErrorMessage.Store(&msg)

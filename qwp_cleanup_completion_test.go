@@ -106,12 +106,106 @@ func TestQwpPoolHarvestsLateCompletedEngineError(t *testing.T) {
 		qwpSfManagerCloseGrace.store(old)
 	})
 	require.NoError(t, e.engineClose())
-	p := closedSfPoolWithRetiredSlot(&qwpSfBuildCleanupError{engine: e})
-	require.ErrorIs(t, p.currentCloseResult(), ErrSfCleanupPending)
+	cause := errors.New("qwp/sf: construction cleanup pending")
+	p := closedSfPoolWithRetiredSlot(&qwpSfBuildCleanupError{cause: cause, engine: e})
+	pending := p.currentCloseResult()
+	require.ErrorIs(t, pending, ErrSfCleanupPending)
+	require.ErrorIs(t, pending, cause)
 	close(release)
 	waitQwpSfEngineCleanup(t, e)
-	require.ErrorIs(t, p.currentCloseResult(), injected)
+	done := p.currentCloseResult()
+	require.ErrorIs(t, done, injected)
+	require.NotErrorIs(t, done, cause, "finished cleanup keeps the engine result only")
 	require.ErrorIs(t, p.currentCloseResult(), injected, "removing the retired slot must not lose its saved error")
+}
+
+func TestQwpPoolDropsRecoveredConstructionCause(t *testing.T) {
+	e, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	<-e.manager.segmentManagerStop()
+	release := make(chan struct{})
+	finish := func() { <-release }
+	old := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(5 * time.Millisecond)
+	qwpSfTestEngineFinishCloseHook.Store(&finish)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		_ = e.engineClose()
+		waitQwpSfEngineCleanup(t, e)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		qwpSfManagerCloseGrace.store(old)
+	})
+	require.NoError(t, e.engineClose())
+	build := errors.New("transient construction fault")
+	cause := errors.New("qwp/sf: construction cleanup pending")
+	outer := &qwpSenderBuildCleanupError{
+		cause:   build,
+		cleanup: &qwpSfBuildCleanupError{cause: cause, engine: e},
+	}
+	p := closedSfPoolWithRetiredSlot(outer)
+	pending := p.currentCloseResult()
+	require.ErrorIs(t, pending, ErrSfCleanupPending)
+	require.ErrorIs(t, pending, build)
+	require.ErrorIs(t, pending, cause)
+	close(release)
+	waitQwpSfEngineCleanup(t, e)
+	require.NoError(t, p.currentCloseResult())
+	require.NoError(t, p.currentCloseResult(), "a later read must stay clear")
+}
+
+func TestQwpDrainerDropsRecoveredOpenError(t *testing.T) {
+	dir := t.TempDir()
+	seed, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = seed.engineAppendBlocking(context.Background(), []byte("data"))
+	require.NoError(t, err)
+	require.NoError(t, seed.engineClose())
+
+	injected := errors.New("transient slot open failure")
+	fail := func() error { return injected }
+	qwpSfTestBeforeEngineRegisterHook.Store(&fail)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { <-release }
+	old := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(5 * time.Millisecond)
+	qwpSfTestEngineFinishCloseHook.Store(&finish)
+	drainer := qwpSfNewOrphanDrainer(dir, 4096, qwpSfUnlimitedTotalBytes,
+		func(context.Context, int) (*qwpTransport, error) {
+			return nil, errors.New("unexpected dial")
+		}, nil, time.Second, time.Millisecond, time.Millisecond)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		if drainer.cleanup != nil {
+			waitQwpSfEngineCleanup(t, drainer.cleanup)
+		}
+		qwpSfTestBeforeEngineRegisterHook.Store(nil)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		qwpSfManagerCloseGrace.store(old)
+	})
+
+	drainer.drainerRun(context.Background())
+	require.NotNil(t, drainer.cleanup)
+	pending := drainer.cleanupResult()
+	require.ErrorIs(t, pending, injected)
+	require.ErrorIs(t, pending, ErrCleanupPending)
+	require.ErrorIs(t, pending, ErrSfCleanupPending)
+
+	releaseOnce.Do(func() { close(release) })
+	require.Eventually(t, drainer.cleanup.engineCloseCompleted, qwpTestWaitTimeout, time.Millisecond)
+	require.NoError(t, drainer.cleanupResult())
+	require.NoError(t, drainer.cleanupResult())
+}
+
+func TestQwpDrainerKeepsPermanentFailure(t *testing.T) {
+	closed := &qwpSfOrphanDrainer{cleanupErr: errors.Join(qwpSfErrRecoveryFailClosed, errors.New("bad chain"))}
+	require.ErrorIs(t, closed.cleanupResult(), qwpSfErrRecoveryFailClosed)
+	gaveUp := &qwpSfOrphanDrainer{cleanupErr: errors.New("durable-ack unavailable")}
+	require.ErrorContains(t, gaveUp.cleanupResult(), "durable-ack unavailable")
 }
 
 type lateCleanupReporter struct {

@@ -366,7 +366,9 @@ func qwpSfNewCursorEngineWithOptions(sfDir string, segmentSizeBytes, maxTotalByt
 		// Start its cleanup and keep both the engine and any still-held lock
 		// owned until their release obligations are resolved.
 		e.adoptLogicalLock(logical)
-		cleanupErr := e.engineCloseWithCause(releaseErr)
+		// The returned error keeps releaseErr. The worker retries the held
+		// lock, and its saved result is empty once that release succeeds.
+		cleanupErr := e.engineClose()
 		result := errors.Join(releaseErr, cleanupErr)
 		if !e.engineCloseCompleted() {
 			return nil, &qwpSfBuildCleanupError{cause: result, engine: e}
@@ -390,7 +392,9 @@ func qwpSfStartLogicalLockCleanup(sfDir string, logical *qwpSfSlotLock, cause er
 		return errors.Join(cause, ErrCleanupFailed,
 			errors.New("qwp/sf: could not transfer the held logical slot lock to cleanup"))
 	}
-	cleanupErr := owner.engineCloseWithCause(cause)
+	// The returned error keeps cause. This owner only releases the logical
+	// lock, and its saved result is empty once that release succeeds.
+	cleanupErr := owner.engineClose()
 	result := errors.Join(cause, cleanupErr)
 	if !owner.engineCloseCompleted() {
 		return &qwpSfBuildCleanupError{cause: result, engine: owner}

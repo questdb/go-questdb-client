@@ -286,9 +286,12 @@ func TestQwpSfFailedConstructionRetainsAStillHeldLogicalLock(t *testing.T) {
 	_, busy := qwpSfAcquireLogicalSlotLock(slot)
 	require.ErrorIs(t, busy, qwpSfErrLockBusy,
 		"the cleanup owner must retain exclusion until release succeeds")
+	require.ErrorIs(t, buildErr.cleanupResult(), fault)
+	require.ErrorIs(t, buildErr.cleanupResult(), qwpSfErrLegacyQuarantineContainer)
 
 	allowRelease.Store(true)
 	require.Eventually(t, buildErr.closeCompleted, qwpTestWaitTimeout, 10*time.Millisecond)
+	require.NoError(t, buildErr.cleanupResult())
 	again, acquireErr := qwpSfAcquireLogicalSlotLock(slot)
 	require.NoError(t, acquireErr)
 	require.NoError(t, qwpSfReleaseLogicalLock(again))
