@@ -155,9 +155,10 @@ func (b *qwpSfAcquiredResources) merge(other *qwpSfAcquiredResources) {
 	}
 }
 
-// Report cleanup failure first, even if recovery also found corrupt data.
-// Construction must not rename the slot directory while its files or mappings
-// are still in use. Recovery can check the data again after cleanup finishes.
+// qwpSfAcquisitionError is an open that stopped while files or mappings it
+// acquired are still open. original is the failure that stopped the open.
+// cause is the unfinished close. Both are visible to errors.Is. The open loop
+// leaves the slot where it is until those resources are released.
 type qwpSfAcquisitionError struct {
 	original  error
 	cause     error
@@ -167,7 +168,18 @@ type qwpSfAcquisitionError struct {
 func (e *qwpSfAcquisitionError) Error() string {
 	return fmt.Sprintf("qwp/sf: acquisition failed (%v); resource release incomplete: %v", e.original, e.cause)
 }
-func (e *qwpSfAcquisitionError) Unwrap() error { return e.cause }
+func (e *qwpSfAcquisitionError) Unwrap() []error {
+	switch {
+	case e.original != nil && e.cause != nil:
+		return []error{e.original, e.cause}
+	case e.original != nil:
+		return []error{e.original}
+	case e.cause != nil:
+		return []error{e.cause}
+	default:
+		return nil
+	}
+}
 
 func qwpSfFailedAcquisition(original error, b *qwpSfAcquiredResources) error {
 	var held *qwpSfAcquisitionError

@@ -844,13 +844,10 @@ func TestQwpSfAckWatermarkInitializationFailureBoundaries(t *testing.T) {
 		// Releasing the descriptor the failed attempt acquired also fails, so
 		// the storage refusal arrives with an ownership obligation attached and
 		// construction must fail instead of running with a nil watermark.
-		//
-		// Today qwpSfAcquisitionError exposes only its cleanup cause, so this
-		// particular chain would also be refused by a bare sentinel check. What
-		// pins the rule itself -- that the sentinel alone is never
-		// authorisation -- is
-		// TestQwpSfAckWatermarkStorageFallbackAllowedRequiresReleasedResources,
-		// which covers a chain where both are visible.
+		// qwpSfAcquisitionError exposes both the refusal and the unfinished
+		// close. TestQwpSfAckWatermarkStorageFallbackAllowedRequiresReleasedResources
+		// pins that a visible unbacked-storage sentinel is not permission to
+		// skip the watermark while those resources are held.
 		injected := errors.New("ack watermark handle would not close")
 		fileClose := func(f *os.File) error {
 			if filepath.Base(f.Name()) == qwpSfAckWatermarkFileName {

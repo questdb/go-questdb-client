@@ -217,7 +217,8 @@ func TestQwpSfRecoveryReleaseFaultRetainsAcquisitions(t *testing.T) {
 	_, err = qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
 	require.ErrorIs(t, err, ErrSfDurability)
 	require.ErrorIs(t, err, injected)
-	require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed, "cleanup failure must not license quarantine")
+	require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	requireNoPreservedSlot(t, dir)
 	var held *qwpSfBuildCleanupError
 	require.ErrorAs(t, err, &held)
 	t.Cleanup(func() { fail.Store(false); waitQwpSfEngineCleanup(t, held.engine) })
@@ -233,4 +234,110 @@ func TestQwpSfRecoveryReleaseFaultRetainsAcquisitions(t *testing.T) {
 	waitQwpSfEngineCleanup(t, held.engine)
 	require.True(t, held.closeCompleted())
 	require.NoError(t, held.engine.engineClose())
+}
+
+// requireNoPreservedSlot reports that open left slotDir in place. A move
+// would leave a sibling whose name contains the reserved preservation infix.
+func requireNoPreservedSlot(t *testing.T, slotDir string) {
+	t.Helper()
+	parent, base := filepath.Dir(slotDir), filepath.Base(slotDir)
+	matches, err := filepath.Glob(filepath.Join(parent, base+qwpSfQuarantineSlotInfix+"*"))
+	require.NoError(t, err)
+	require.Empty(t, matches)
+}
+
+// inconsistentSlot is a folder whose manifest promises rows that are not on
+// disk, so opening it reports that the data cannot be sent safely.
+func inconsistentSlot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 5)
+	createRecoveryManifest(t, dir, 0, 5, active)
+	closeRecoverySegments(t, active)
+	return dir
+}
+
+// holdSlotLockRelease fails slot-lock release until the returned function
+// runs. Cleanup keeps the slot until then.
+func holdSlotLockRelease(t *testing.T) (release func()) {
+	t.Helper()
+	releaseCh := make(chan struct{})
+	var once sync.Once
+	hook := func() error {
+		select {
+		case <-releaseCh:
+			return nil
+		default:
+			return errors.New("lock release unavailable")
+		}
+	}
+	previous := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(time.Millisecond)
+	qwpSfTestBeforeFlockReleaseHook.Store(&hook)
+	t.Cleanup(func() {
+		once.Do(func() { close(releaseCh) })
+		qwpSfTestBeforeFlockReleaseHook.Store(nil)
+		qwpSfCloseRetryInterval.store(previous)
+	})
+	return func() { once.Do(func() { close(releaseCh) }) }
+}
+
+func TestQwpSfFailClosedStaysRecognizableWhileReleaseRetries(t *testing.T) {
+	dir := inconsistentSlot(t)
+	release := holdSlotLockRelease(t)
+	_, err := qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.ErrorIs(t, err, ErrSfDurability)
+	requireNoPreservedSlot(t, dir)
+	var held *qwpSfBuildCleanupError
+	require.ErrorAs(t, err, &held)
+	require.False(t, held.closeCompleted())
+	release()
+	waitQwpSfEngineCleanup(t, held.engine)
+
+	eng, err := qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.NoError(t, err)
+	require.NotEmpty(t, eng.quarantinedPath)
+	require.NoError(t, eng.engineClose())
+}
+
+func TestQwpSfDrainerKeepsFailClosedWhileReleaseRetries(t *testing.T) {
+	dir := inconsistentSlot(t)
+	release := holdSlotLockRelease(t)
+	drainer := qwpSfNewOrphanDrainer(dir, 4096, qwpSfUnlimitedTotalBytes, nil, nil, time.Second, time.Millisecond, time.Millisecond)
+	drainer.drainerRun(context.Background())
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.NoError(t, err)
+	require.Contains(t, string(body), "recovery failed closed")
+	requireNoPreservedSlot(t, dir)
+	require.NotNil(t, drainer.cleanup)
+	require.ErrorIs(t, drainer.cleanupResult(), qwpSfErrRecoveryFailClosed)
+	release()
+	waitQwpSfEngineCleanup(t, drainer.cleanup)
+	require.ErrorIs(t, drainer.cleanupResult(), qwpSfErrRecoveryFailClosed)
+}
+
+func TestQwpSfSanitizedResidueStaysRecognizableWhileReleaseRetries(t *testing.T) {
+	dir := t.TempDir()
+	sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+	active := createRecoverySegment(t, dir, "sf-0001.sfa", 1, "b")
+	createRecoveryManifest(t, dir, 0, 1, sealed, active)
+	off := sealed.publishedOffset()
+	sealed.buf[off+20] = 0x7f
+	closeRecoverySegments(t, sealed, active)
+	release := holdSlotLockRelease(t)
+
+	_, err := qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.ErrorIs(t, err, qwpSfErrSanitizedResidue)
+	require.ErrorIs(t, err, ErrSfDurability)
+	var held *qwpSfBuildCleanupError
+	require.ErrorAs(t, err, &held)
+	require.False(t, held.closeCompleted())
+	release()
+	waitQwpSfEngineCleanup(t, held.engine)
+
+	eng, err := qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.NoError(t, err)
+	require.Empty(t, eng.quarantinedPath)
+	require.NoError(t, eng.engineClose())
 }

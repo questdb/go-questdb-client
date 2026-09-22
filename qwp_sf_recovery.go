@@ -159,18 +159,22 @@ func qwpSfRecoverRingWithContext(sfDir string, maxBytesPerSegment int64, recover
 		path := filepath.Join(sfDir, entry.Name())
 		seg, openErr := qwpSfOpenSegment(path)
 		if openErr != nil {
-			if errors.Is(openErr, qwpSfErrSegmentCorrupt) {
-				mayHoldFrames := qwpSfCorruptMayHoldFrames(path)
-				files = append(files, qwpSfRecoveryFilePlan{
-					path:          path,
-					mayHoldFrames: mayHoldFrames,
-					action:        qwpSfRecoveryQuarantine,
-					license:       "the unreadable bytes are preserved under a non-segment name",
-				})
-				qwpEffectiveLogger(recoveryContext.logger).Warn("qwp/sf: deferring corrupt segment quarantine until recovery boundaries validate", "path", path, "error", openErr)
-				continue
+			// An unfinished close keeps the segment's resources on the error.
+			// Stop the scan and return that error so the caller retains them.
+			// A corrupt file whose close has finished is recorded for the plan.
+			var heldOpen *qwpSfAcquisitionError
+			if errors.As(openErr, &heldOpen) || !errors.Is(openErr, qwpSfErrSegmentCorrupt) {
+				return nil, nil, fmt.Errorf("qwp/sf: open segment %s during recovery: %w", path, openErr)
 			}
-			return nil, nil, fmt.Errorf("qwp/sf: open segment %s during recovery: %w", path, openErr)
+			mayHoldFrames := qwpSfCorruptMayHoldFrames(path)
+			files = append(files, qwpSfRecoveryFilePlan{
+				path:          path,
+				mayHoldFrames: mayHoldFrames,
+				action:        qwpSfRecoveryQuarantine,
+				license:       "the unreadable bytes are preserved under a non-segment name",
+			})
+			qwpEffectiveLogger(recoveryContext.logger).Warn("qwp/sf: deferring corrupt segment quarantine until recovery boundaries validate", "path", path, "error", openErr)
+			continue
 		}
 		all = append(all, seg)
 		files = append(files, qwpSfRecoveryFilePlan{

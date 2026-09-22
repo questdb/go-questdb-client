@@ -483,18 +483,22 @@ func qwpSfOpenCursorEngineTransition(sfDir string, segmentSizeBytes, maxTotalByt
 		// completed: the sanitization is on disk and the same bytes recover on
 		// the very next pass. Every caller takes it, drainers included —
 		// otherwise one slot recovers under a foreground sender and the same
-		// slot is abandoned under a drainer.
-		if errors.Is(err, qwpSfErrSanitizedResidue) && attempt == 0 {
+		// slot is abandoned under a drainer. A cleanup that still holds the
+		// slot's files has to finish releasing them before that second open.
+		releasePending := qwpSfPendingCleanupEngine(err) != nil
+		if errors.Is(err, qwpSfErrSanitizedResidue) && attempt == 0 && !releasePending {
 			qwpEffectiveLogger(options.logger).Error("qwp/sf: sealed-segment residue was sanitized; retrying recovery once", "slot", sfDir, "error", err)
 			continue
 		}
 		// Quarantine-and-start-fresh is a foreground-only policy: a drainer
 		// exists to deliver the slot's rows, so it reports the failure and
-		// leaves the bytes where they are.
+		// leaves the bytes where they are. The same hold delays the move: the
+		// recovery failure stays on the returned error, and the move runs on a
+		// later open once the files are released.
 		if !options.recoverForeground {
 			return failed(err)
 		}
-		if errors.Is(err, qwpSfErrRecoveryFailClosed) && attempt <= 1 {
+		if errors.Is(err, qwpSfErrRecoveryFailClosed) && attempt <= 1 && !releasePending {
 			if hook := qwpSfTestBeforeWholeSlotQuarantineHook.Load(); hook != nil {
 				(*hook)(sfDir)
 			}
@@ -599,8 +603,9 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 		err = errors.Join(err, cleanupErr)
 		if !held.engineCloseCompleted() {
 			if errors.Is(err, qwpSfErrRecoveryFailClosed) || errors.Is(err, qwpSfErrSanitizedResidue) {
-				// Do not rename or reopen the slot before cleanup releases it.
-				err = errors.Join(ErrSfDurability, fmt.Errorf("recovery awaits resource release: %v", err), cleanupErr)
+				// The recovery failure stays attached. The open loop moves the
+				// slot, or looks again, only after this cleanup has released it.
+				err = errors.Join(ErrSfDurability, fmt.Errorf("recovery awaits resource release: %w", err), cleanupErr)
 			}
 			err = &qwpSfBuildCleanupError{cause: err, engine: held}
 		}
