@@ -43,34 +43,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func createRecoverySegment(t *testing.T, dir, name string, base int64, payloads ...string) *qwpSfSegment {
-	t.Helper()
-	seg, err := qwpSfCreateSegment(filepath.Join(dir, name), base, 4096)
-	require.NoError(t, err)
-	for _, payload := range payloads {
-		_, err := seg.tryAppend([]byte(payload))
-		require.NoError(t, err)
-	}
-	return seg
-}
-
-func createRecoveryManifest(t *testing.T, dir string, head, active int64, segments ...*qwpSfSegment) {
-	t.Helper()
-	m, err := qwpSfManifestCreate(dir, head, active)
-	require.NoError(t, err)
-	require.NoError(t, m.close())
-	for _, seg := range segments {
-		require.NoError(t, seg.markManifestRequired())
-	}
-}
-
-func closeRecoverySegments(t *testing.T, segments ...*qwpSfSegment) {
-	t.Helper()
-	for _, seg := range segments {
-		require.NoError(t, seg.close())
-	}
-}
-
 // openTornEmptySegment builds a segment holding no frames whose tail carries an
 // attempted-but-failed write, then reopens it so recovery's torn-tail detection
 // has run.

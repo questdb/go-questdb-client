@@ -33,6 +33,8 @@ import (
 	"regexp"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // These are failure guards, not latency assertions. Disk-backed setup can need
@@ -59,6 +61,37 @@ func qwpTestSubprocess(t *testing.T, testName string) *exec.Cmd {
 }
 
 func (s *qwpSfSwappableVar[T]) store(value T) { s.v.Store(&value) }
+
+// createRecoverySegment writes a segment fixture. The Windows cleanup build
+// compiles qwp_sf_cleanup_release_test.go without the recovery suite, so
+// these fixtures live with the shared helpers.
+func createRecoverySegment(t *testing.T, dir, name string, base int64, payloads ...string) *qwpSfSegment {
+	t.Helper()
+	seg, err := qwpSfCreateSegment(filepath.Join(dir, name), base, 4096)
+	require.NoError(t, err)
+	for _, payload := range payloads {
+		_, err := seg.tryAppend([]byte(payload))
+		require.NoError(t, err)
+	}
+	return seg
+}
+
+func createRecoveryManifest(t *testing.T, dir string, head, active int64, segments ...*qwpSfSegment) {
+	t.Helper()
+	m, err := qwpSfManifestCreate(dir, head, active)
+	require.NoError(t, err)
+	require.NoError(t, m.close())
+	for _, seg := range segments {
+		require.NoError(t, seg.markManifestRequired())
+	}
+}
+
+func closeRecoverySegments(t *testing.T, segments ...*qwpSfSegment) {
+	t.Helper()
+	for _, seg := range segments {
+		require.NoError(t, seg.close())
+	}
+}
 
 func qwpSfNewCursorEngineForDrainer(sfDir string, segmentSizeBytes, maxTotalBytes int64, appendDeadline time.Duration) (*qwpSfCursorEngine, error) {
 	return qwpSfNewCursorEngineWithOptions(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadline, qwpSfEngineOpenOptions{})
