@@ -33,6 +33,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -340,4 +341,38 @@ func TestQwpSfSanitizedResidueStaysRecognizableWhileReleaseRetries(t *testing.T)
 	require.NoError(t, err)
 	require.Empty(t, eng.quarantinedPath)
 	require.NoError(t, eng.engineClose())
+}
+
+func TestQwpSfDrainerKeepsConsumedFileCloseError(t *testing.T) {
+	dir := t.TempDir()
+	eng, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = eng.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+	require.NoError(t, eng.engineClose())
+	file, err := os.OpenFile(filepath.Join(dir, "sf-initial.sfa"), os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = file.WriteAt([]byte{0, 0, 0, 0}, 0)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	injected := errors.New("segment close reported an error after consuming the handle")
+	hook := func(f *os.File) error {
+		if strings.HasSuffix(f.Name(), ".sfa") {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestAfterFileCloseHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestAfterFileCloseHook.Store(nil) })
+
+	drainer := qwpSfNewOrphanDrainer(dir, 4096, qwpSfUnlimitedTotalBytes, nil, nil, time.Second, time.Millisecond, time.Millisecond)
+	drainer.drainerRun(context.Background())
+	require.NotNil(t, drainer.cleanup)
+	waitQwpSfEngineCleanup(t, drainer.cleanup)
+	require.ErrorIs(t, drainer.cleanupResult(), injected)
+	require.NotErrorIs(t, drainer.cleanupResult(), qwpSfErrSegmentCorrupt)
+	requireNoPreservedSlot(t, dir)
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.ErrorIs(t, statErr, os.ErrNotExist)
 }

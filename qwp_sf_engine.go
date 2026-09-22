@@ -607,6 +607,10 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 				// slot, or looks again, only after this cleanup has released it.
 				err = errors.Join(ErrSfDurability, fmt.Errorf("recovery awaits resource release: %w", err), cleanupErr)
 			}
+		}
+		// The engine remains available on the error after cleanup finishes.
+		// Its record keeps a file close that already consumed its handle.
+		if err != nil {
 			err = &qwpSfBuildCleanupError{cause: err, engine: held}
 		}
 		result = nil
