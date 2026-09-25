@@ -1,3 +1,5 @@
+//go:build windows
+
 /*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
@@ -22,8 +24,6 @@
  *
  ******************************************************************************/
 
-//go:build windows
-
 package questdb
 
 import (
@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -42,8 +43,52 @@ import (
 // stay aligned with the unix variant.
 var (
 	qwpSfWindowsMappingMu sync.Mutex
-	qwpSfWindowsMappings  = map[uintptr]windows.Handle{}
+	qwpSfWindowsMappings  = map[uintptr]*qwpSfWindowsMapping{}
 )
+
+type qwpSfWindowsMapping struct {
+	mu     sync.Mutex
+	handle windows.Handle
+}
+
+// Tests can replace these Windows calls to simulate failures. Failed release
+// keeps the still-open handle or mapped memory in the mapping record.
+type qwpSfWindowsReleaseOps struct {
+	closeHandle func(windows.Handle) error
+	unmapView   func(uintptr) error
+	mapView     func(windows.Handle) (uintptr, error)
+}
+
+var qwpSfTestWindowsReleaseOps atomic.Pointer[qwpSfWindowsReleaseOps]
+
+type qwpSfFailedWindowsMapping struct {
+	handle  windows.Handle
+	address uintptr
+}
+
+var qwpSfFailedWindowsHandles struct {
+	sync.Mutex
+	mappings []qwpSfFailedWindowsMapping
+}
+
+func qwpSfRetainWindowsMapping(handle windows.Handle, address uintptr) {
+	qwpSfFailedWindowsHandles.Lock()
+	qwpSfFailedWindowsHandles.mappings = append(qwpSfFailedWindowsHandles.mappings, qwpSfFailedWindowsMapping{handle: handle, address: address})
+	qwpSfFailedWindowsHandles.Unlock()
+}
+
+func qwpSfWindowsCloseMapping(handle windows.Handle) error {
+	if ops := qwpSfTestWindowsReleaseOps.Load(); ops != nil && ops.closeHandle != nil {
+		return ops.closeHandle(handle)
+	}
+	return windows.CloseHandle(handle)
+}
+func qwpSfWindowsUnmapView(addr uintptr) error {
+	if ops := qwpSfTestWindowsReleaseOps.Load(); ops != nil && ops.unmapView != nil {
+		return ops.unmapView(addr)
+	}
+	return windows.UnmapViewOfFile(addr)
+}
 
 // mmapAddrToPointer converts a uintptr returned by MapViewOfFile
 // into an unsafe.Pointer addressing the OS-managed mmap region.
@@ -74,17 +119,40 @@ func qwpSfMmapRW(f *os.File, sizeBytes int64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("qwp/sf: CreateFileMapping %s: %w", f.Name(), err)
 	}
-	addr, err := windows.MapViewOfFile(mapHandle, windows.FILE_MAP_READ|windows.FILE_MAP_WRITE,
-		0, 0, uintptr(sizeBytes))
+	var addr uintptr
+	defer func() {
+		if r := recover(); r != nil {
+			qwpSfRetainWindowsMapping(mapHandle, addr)
+			panic(r)
+		}
+	}()
+	if ops := qwpSfTestWindowsReleaseOps.Load(); ops != nil && ops.mapView != nil {
+		addr, err = ops.mapView(mapHandle)
+	} else {
+		addr, err = windows.MapViewOfFile(mapHandle, windows.FILE_MAP_READ|windows.FILE_MAP_WRITE, 0, 0, uintptr(sizeBytes))
+	}
 	if err != nil {
-		_ = windows.CloseHandle(mapHandle)
-		return nil, fmt.Errorf("qwp/sf: MapViewOfFile %s: %w", f.Name(), err)
+		cause := fmt.Errorf("qwp/sf: MapViewOfFile %s: %w", f.Name(), err)
+		return nil, qwpSfFailedAcquisition(cause, &qwpSfAcquiredResources{
+			mappingObjects: []*qwpSfMappingObject{{handle: uintptr(mapHandle)}},
+		})
 	}
 	buf := unsafe.Slice((*byte)(mmapAddrToPointer(addr)), sizeBytes)
 	qwpSfWindowsMappingMu.Lock()
-	qwpSfWindowsMappings[addr] = mapHandle
+	qwpSfWindowsMappings[addr] = &qwpSfWindowsMapping{handle: mapHandle}
 	qwpSfWindowsMappingMu.Unlock()
 	return buf, nil
+}
+
+func qwpSfCloseMappingObject(m *qwpSfMappingObject) error {
+	if m == nil || m.handle == 0 {
+		return nil
+	}
+	if err := qwpSfWindowsCloseMapping(windows.Handle(m.handle)); err != nil {
+		return err
+	}
+	m.handle = 0
+	return nil
 }
 
 // qwpSfMunmap unmaps buf and closes its associated file mapping.
@@ -94,19 +162,31 @@ func qwpSfMunmap(buf []byte) error {
 	}
 	addr := uintptr(unsafe.Pointer(&buf[0]))
 	qwpSfWindowsMappingMu.Lock()
-	mapHandle, ok := qwpSfWindowsMappings[addr]
-	if ok {
+	mapping := qwpSfWindowsMappings[addr]
+	qwpSfWindowsMappingMu.Unlock()
+	if mapping == nil {
+		return fmt.Errorf("qwp/sf: mapping ownership missing for %x", addr)
+	}
+	mapping.mu.Lock()
+	defer mapping.mu.Unlock()
+	// Closing the mapping handle does not unmap the memory. Close the handle
+	// first so that, if it fails, buf still points to valid memory. Unmapping
+	// first could leave a retry using an address now owned by another mapping.
+	if mapping.handle != 0 {
+		if err := qwpSfWindowsCloseMapping(mapping.handle); err != nil {
+			return fmt.Errorf("qwp/sf: CloseHandle(mapping): %w", err)
+		}
+		mapping.handle = 0
+	}
+	if err := qwpSfWindowsUnmapView(addr); err != nil {
+		return fmt.Errorf("qwp/sf: UnmapViewOfFile: %w", err)
+	}
+	qwpSfWindowsMappingMu.Lock()
+	// The address may already belong to a new mapping. Remove only our record.
+	if qwpSfWindowsMappings[addr] == mapping {
 		delete(qwpSfWindowsMappings, addr)
 	}
 	qwpSfWindowsMappingMu.Unlock()
-	if err := windows.UnmapViewOfFile(addr); err != nil {
-		return fmt.Errorf("qwp/sf: UnmapViewOfFile: %w", err)
-	}
-	if ok {
-		if err := windows.CloseHandle(mapHandle); err != nil {
-			return fmt.Errorf("qwp/sf: CloseHandle(mapping): %w", err)
-		}
-	}
 	return nil
 }
 

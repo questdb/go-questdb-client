@@ -61,7 +61,12 @@ func TestQwpSfSlotLockAcquireCreatesDirAndLockFile(t *testing.T) {
 	assert.Equal(t, os.Getpid(), pid)
 }
 
-func TestQwpSfSlotLockContentionReportsHolder(t *testing.T) {
+func TestQwpSfSlotLockContentionNamesThisProcess(t *testing.T) {
+	// Contending with ourselves is the common shape: Close hands SF cleanup to
+	// a background retry owner and returns before the flock is released, so the
+	// next open of the same slot meets the sender that just closed. Naming
+	// another process there would send the reader hunting for one that does not
+	// exist.
 	dir := t.TempDir()
 	l1, err := qwpSfAcquireSlotLock(dir)
 	require.NoError(t, err)
@@ -69,8 +74,27 @@ func TestQwpSfSlotLockContentionReportsHolder(t *testing.T) {
 
 	_, err = qwpSfAcquireSlotLock(dir)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "slot already in use")
+	assert.Contains(t, err.Error(), "held by this process")
 	assert.Contains(t, err.Error(), fmt.Sprintf("pid=%d", os.Getpid()))
+	assert.NotContains(t, err.Error(), "another process")
+}
+
+func TestQwpSfSlotLockContentionReportsForeignHolder(t *testing.T) {
+	dir := t.TempDir()
+	l1, err := qwpSfAcquireSlotLock(dir)
+	require.NoError(t, err)
+	defer func() { _ = l1.close() }()
+
+	// A PID that is not ours in the sidecar must still be reported as a
+	// foreign holder.
+	foreign := os.Getpid() + 1
+	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfLockPidFileName),
+		[]byte(strconv.Itoa(foreign)+"\n"), 0o644))
+
+	_, err = qwpSfAcquireSlotLock(dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "slot already in use by another process")
+	assert.Contains(t, err.Error(), fmt.Sprintf("pid=%d", foreign))
 }
 
 func TestQwpSfSlotLockReleaseAllowsReacquire(t *testing.T) {

@@ -39,7 +39,7 @@ import (
 // the first offer, so a sender that never notifies pays no goroutine cost.
 //
 // It generalises the proven qwpSfErrorDispatcher machinery (drop-oldest,
-// lazy start, re-entrant-safe bounded close) over the payload type so the
+// lazy start, bounded owner-side close) over the payload type so the
 // connection-event listener reuses it without copying it. The error
 // dispatcher predates this type and still lives separately; it could migrate
 // here. Behaviour is kept in step by hand — notably the abandon guard below,
@@ -68,7 +68,6 @@ type qwpDispatcher[T any] struct {
 
 	dropped   atomic.Int64
 	delivered atomic.Int64
-	loopGoid  atomic.Int64
 	wg        sync.WaitGroup
 }
 
@@ -144,8 +143,6 @@ func (d *qwpDispatcher[T]) startIfNeeded() {
 
 func (d *qwpDispatcher[T]) loop() {
 	defer d.wg.Done()
-	d.loopGoid.Store(qwpGoid())
-	defer d.loopGoid.Store(0)
 	for {
 		select {
 		case e := <-d.inbox:
@@ -174,11 +171,7 @@ func (d *qwpDispatcher[T]) drain() {
 			d.deliver(e)
 		case <-deadline.C:
 			// Deadline elapsed with items still queued (a slow handler).
-			// Count the leftovers as dropped here: on a re-entrant close
-			// (a handler calling close on the loop goroutine) this drain is
-			// the only sweep that runs — close() returned before its own
-			// leftovers sweep — so skipping the count would strand them
-			// invisible to droppedNotifications.
+			// Account for every queued notification discarded at the deadline.
 			for {
 				select {
 				case <-d.inbox:
@@ -215,9 +208,8 @@ func (d *qwpDispatcher[T]) deliver(e T) {
 }
 
 // close signals the goroutine to drain and exit, joining it within a bounded
-// budget. Idempotent. A handler that re-enters close on the loop goroutine
-// (e.g. a listener that calls Close) is recognised via loopGoid and returns
-// without a self-join; loop() then unwinds, observes done, and drains.
+// budget. Idempotent. Handlers notify the application owner; they do not
+// close or mutate the handle themselves.
 func (d *qwpDispatcher[T]) close() {
 	if d == nil {
 		return
@@ -231,9 +223,6 @@ func (d *qwpDispatcher[T]) close() {
 	started := d.started.Load()
 	d.mu.Unlock()
 
-	if g := qwpGoid(); g != 0 && d.loopGoid.Load() == g {
-		return
-	}
 	if !started {
 		d.drain()
 		return
@@ -275,16 +264,6 @@ func (d *qwpDispatcher[T]) droppedNotifications() int64 {
 		return 0
 	}
 	return d.dropped.Load()
-}
-
-// loopGoroutineId returns the goid of the running dispatch goroutine, or 0 when
-// it is not (or never) running. Nil-safe. Used by the sender's re-entrancy
-// guard to detect Close/Flush calls made from inside a handler.
-func (d *qwpDispatcher[T]) loopGoroutineId() int64 {
-	if d == nil {
-		return 0
-	}
-	return d.loopGoid.Load()
 }
 
 func (d *qwpDispatcher[T]) totalDelivered() int64 {

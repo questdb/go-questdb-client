@@ -33,10 +33,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/require"
 )
 
 func senderPoolWithIdle(t *testing.T, extra string, min, max int, idle time.Duration) *qwpSenderPool {
@@ -216,19 +218,19 @@ func TestQwpSenderPoolSfStrandedSlotRecovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("phase 1 open: %v", err)
 	}
-	_ = s1.Table("t").Int64Column("v", 1).AtNow(ctx)
-	_ = s1.Flush(ctx)
-	time.Sleep(50 * time.Millisecond)
-	_ = s1.Close(ctx)
-	if !qwpSfIsCandidateOrphan(filepath.Join(sfDir, "default-2")) {
-		t.Skip("no stranded segment produced in this environment")
-	}
+	require.NoError(t, s1.Table("t").Int64Column("v", 1).AtNow(ctx))
+	require.NoError(t, s1.Flush(ctx))
+	require.NoError(t, s1.Close(ctx))
+	// Close may leave storage cleanup running. Wait for ownership release,
+	// rather than sleeping before Close or silently skipping a slow cleanup.
+	require.Eventually(t, s1.(QwpSender).SlotLockReleased, qwpTestWaitTimeout, time.Millisecond)
+	require.True(t, qwpSfIsCandidateOrphan(filepath.Join(sfDir, "default-2")))
 
 	// Phase 2: a pool on the same sf_dir against an up server recovers slot 2.
 	srv := newQwpTestServer(t)
 	defer srv.Close()
 	conf := "ws::addr=" + strings.TrimPrefix(srv.URL, "http://") + ";sf_dir=" + sfDir + ";"
-	p, err := newQwpSenderPool(ctx, conf, 1, 4, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
+	p, err := newQwpSenderPool(ctx, conf, 1, 4, qwpPoolTestUnhurriedAcquire, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("phase 2 build: %v", err)
 	}
@@ -238,10 +240,10 @@ func TestQwpSenderPoolSfStrandedSlotRecovered(t *testing.T) {
 		t.Fatalf("total=%d, want 2 (prewarm slot 0 + recovered slot 2)", total)
 	}
 	p.mu.Lock()
-	reserved := p.slotInUse[2]
+	state := p.sfSlots[2].state
 	p.mu.Unlock()
-	if !reserved {
-		t.Fatal("slotInUse[2] not reserved after recovery — Hazard A regression")
+	if state != qwpSfSlotAvailable {
+		t.Fatalf("recovered slot 2 state=%s, want available — Hazard A regression", state)
 	}
 	// Grow to max: indices 1 and 3 are allocated, never the live index 2, so no
 	// "slot already in use" collision.
@@ -466,11 +468,12 @@ func TestQwpSenderPoolCloseWaitsForReapTeardown(t *testing.T) {
 	var entered sync.WaitGroup
 	entered.Add(1)
 	var once sync.Once
-	reapCloseHook = func() {
+	hook := func() {
 		once.Do(entered.Done)
 		<-release // hold the reap teardown in flight
 	}
-	t.Cleanup(func() { reapCloseHook = nil })
+	reapCloseHook.Store(&hook)
+	t.Cleanup(func() { reapCloseHook.Store(nil) })
 
 	// min=0 so the single grown slot is reapable; long acquire timeout so the
 	// close-wait budget is not the thing that unblocks close().
@@ -509,19 +512,19 @@ func TestQwpSenderPoolCloseWaitsForReapTeardown(t *testing.T) {
 	}
 }
 
-// TestQwpQueryPoolCloseWaitsForReapTeardown is the query-pool counterpart of
-// TestQwpSenderPoolCloseWaitsForReapTeardown (FIX 1): the query pool's close()
-// must count in-flight reap teardowns via pendingTeardowns.
+// Pool shutdown must wait for clients already being closed by background pool
+// maintenance, even though they have left the list of clients available to borrow.
 func TestQwpQueryPoolCloseWaitsForReapTeardown(t *testing.T) {
 	release := make(chan struct{})
 	var entered sync.WaitGroup
 	entered.Add(1)
 	var once sync.Once
-	queryReapCloseHook = func() {
+	hook := func() {
 		once.Do(entered.Done)
 		<-release
 	}
-	t.Cleanup(func() { queryReapCloseHook = nil })
+	queryReapCloseHook.Store(&hook)
+	t.Cleanup(func() { queryReapCloseHook.Store(nil) })
 
 	p := queryPoolWithIdle(t, 0, 2, time.Millisecond)
 	ctx := context.Background()
@@ -560,42 +563,47 @@ func TestQwpQueryPoolCloseWaitsForReapTeardown(t *testing.T) {
 // by qwpPooledSender.Close, so the embedded interface is left nil.
 type panicOnFlushDelegate struct {
 	QwpSender
+	closes atomic.Int32
 }
 
-func (panicOnFlushDelegate) flushForReturn(context.Context) (bool, error) {
+func (*panicOnFlushDelegate) flushForReturn(context.Context) (bool, error) {
 	panic("boom in flushForReturn")
 }
+func (s *panicOnFlushDelegate) Close(context.Context) error {
+	s.closes.Add(1)
+	return nil
+}
 
-// TestQwpPooledSenderCloseRecoversFlushPanic pins FIX 4: a panic in
-// flushForReturn during a lease Close must not skip giveBack and strand the slot
-// on-loan forever — the slot is discarded (not recycled) and returned, and Close
-// surfaces the panic as an error rather than propagating it.
+// Flushing a sender's rows during return can panic after partly changing its
+// buffers. Report the failure without flushing again or reusing that sender.
 func TestQwpPooledSenderCloseRecoversFlushPanic(t *testing.T) {
-	p := senderPoolWithIdle(t, "", 1, 2, 0)
+	delegate := &panicOnFlushDelegate{}
+	slot := &qwpSenderSlot{slotIndex: -1, delegate: delegate}
+	p := &qwpSenderPool{maxSize: 1, notify: make(chan struct{}), all: []*qwpSenderSlot{slot}, available: []*qwpSenderSlot{slot}}
 	ctx := context.Background()
 	s, err := p.borrow(ctx)
 	if err != nil {
-		t.Fatalf("borrow: %v", err)
+		t.Fatal(err)
 	}
-	ps := s.(*qwpPooledSender)
-	realDelegate := ps.slot.delegate
-	// Swap in a delegate whose flushForReturn panics, then close the lease.
-	ps.slot.delegate = panicOnFlushDelegate{}
-
-	err = ps.Close(ctx)
-	if err == nil {
-		t.Fatal("Close returned nil; want the recovered panic surfaced as an error")
+	err = s.Close(ctx)
+	if !errors.Is(err, ErrCleanupFailed) || !errors.Is(err, ErrPoolPoisoned) {
+		t.Fatalf("Close error = %v, want permanent cleanup failure", err)
 	}
-	if !strings.Contains(err.Error(), "panicked") {
-		t.Errorf("Close error = %v, want a panic-surfaced error", err)
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("repeated lease return: %v", err)
 	}
-	// The slot must have been given back (broken → discarded), not stranded
-	// on-loan: total drops to 0 and the index (memory mode: none) is freed.
-	if total, _, _ := p.poolSnapshot(); total != 0 {
-		t.Errorf("slot stranded on-loan after flush panic: total=%d, want 0", total)
+	if !errors.Is(p.close(ctx), ErrCleanupFailed) {
+		t.Fatal("pool lost the failure")
 	}
-	// Restore the real delegate so the pool's Cleanup close tears it down.
-	_ = closeSlotGuarded(context.Background(), realDelegate)
+	waitQwpCleanupSignal(t, p.closeDone, "pool close after return panic")
+	if delegate.closes.Load() != 0 {
+		t.Fatal("cleanup retried the failed sender")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.failedSlots) != 1 || p.failedSlots[0] != slot || !slot.cleanupFailed {
+		t.Fatal("pool lost its reference to the failed sender")
+	}
 }
 
 // TestQwpSenderPoolGrowthBorrowBoundedByAcquireDeadline pins FIX 5: a growth
@@ -608,11 +616,12 @@ func TestQwpSenderPoolGrowthBorrowBoundedByAcquireDeadline(t *testing.T) {
 	var entered sync.WaitGroup
 	entered.Add(1)
 	var once sync.Once
-	createSlotHook = func() {
+	hook := func() {
 		once.Do(entered.Done)
 		<-release // wedge the build past the acquire deadline
 	}
-	t.Cleanup(func() { createSlotHook = nil })
+	createSlotHook.Store(&hook)
+	t.Cleanup(func() { createSlotHook.Store(nil) })
 
 	srv := newQwpTestServer(t)
 	t.Cleanup(srv.Close)
@@ -651,7 +660,7 @@ func TestQwpSenderPoolGrowthBorrowBoundedByAcquireDeadline(t *testing.T) {
 	// Let the build finish; settleGrowthBuild hands the slot to available and
 	// decrements inFlightCreations.
 	close(release)
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(qwpTestWaitTimeout)
 	for {
 		total, avail, _ := p.poolSnapshot()
 		p.mu.Lock()

@@ -43,25 +43,20 @@ package questdb
 //
 // # Calling back into the sender
 //
-// The handler may call Close() or Flush() on the sender — e.g. to shut
-// down on a HALT-category error. The terminal *SenderError is latched
-// before the handler is invoked, so a synchronous Flush() returns it
-// promptly rather than blocking. Close() called from the handler is
-// honored and returns without deadlocking; the dispatcher goroutine
-// (this goroutine) finishes unwinding on its own once the handler
-// returns, so any error notifications still queued at that moment are
-// subject to the dispatcher's short best-effort drain and may be
-// dropped (visible via QwpSender.DroppedErrorNotifications()).
+// A handler may run while the application is using the sender. From the
+// handler, do not call Close, Flush, methods that add rows or column values, any
+// other method that changes the sender, or QuestDB.Close. Instead, send a value
+// through a channel or cancel a context. The code using the sender can then stop
+// its current work and call Flush or Close. Starting either method in another
+// goroutine does not make concurrent use safe. The handler may call a method
+// only if that method's documentation says it returns data without changing the
+// sender.
 //
-// Because the handler runs on the dispatcher goroutine — not the
-// producer goroutine — these calls deliberately do NOT touch producer-
-// buffered state: a handler-invoked Close() or Flush() will not flush
-// rows the producer has staged but not yet flushed itself (those are
-// owned by the producer goroutine and may be mid-assembly). Close()
-// still tears down the wire, drains already-published frames up to
-// close_flush_timeout, and releases resources; Flush() still surfaces
-// the latched error. To guarantee a specific batch is flushed, flush it
-// from the producer goroutine before relying on the handler to close.
+// Shutdown stops accepting notifications and may drop queued ones. A handler
+// already running may finish after Close returns, even after resources are
+// released. Close guarantees neither delivery of every notification nor exit
+// of every callback goroutine. See README's "QWP shutdown and ownership" and
+// [LineSender.Close].
 //
 // # What this callback is for
 //

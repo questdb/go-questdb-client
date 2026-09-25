@@ -51,6 +51,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1218,4 +1219,48 @@ func TestErrorApiResilience_RetriableStreakThenTerminal(t *testing.T) {
 
 	// 4 server errors total: 3 retriable NACKs + 1 terminal.
 	assert.Equal(t, int64(4), s.TotalServerErrors())
+}
+
+// TestQwpReconnectSurvivesPanickingDebugHandler pins Invariant B against a
+// buggy application logger. The reconnect round-exhausted trace runs on the
+// send-loop goroutine, and that goroutine's recover records a fatal error: a
+// handler that panics there converts a transport outage the sender must ride
+// out indefinitely into a terminal, unresumable sender. The sender must keep
+// retrying and must surface no terminal error.
+func TestQwpReconnectSurvivesPanickingDebugHandler(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	// The handler goes in at construction: the send loop reads its logger from
+	// its own goroutine, so assigning it afterwards would be a data race.
+	ls, err := NewLineSender(ctx,
+		WithQwp(),
+		WithAddress("127.0.0.1:1"), // nothing listens; every round is exhausted
+		WithSfDir(tmp),
+		WithSenderId("panic-debug"),
+		WithInitialConnectMode(InitialConnectAsync),
+		WithCloseFlushTimeout(50*time.Millisecond),
+		WithLogger(slog.New(panicOnHandleSlog{})),
+	)
+	require.NoError(t, err)
+	defer ls.Close(ctx)
+
+	s := ls.(*qwpLineSender)
+
+	// Rows keep buffering into the engine while the wire is down.
+	for i := 0; i < 3; i++ {
+		require.NoError(t, ls.Table("t").Int64Column("v", int64(i)).AtNow(ctx))
+		require.NoError(t, ls.Flush(ctx))
+	}
+
+	// Give the loop time to exhaust several reconnect rounds through the
+	// panicking handler.
+	require.Eventually(t, func() bool {
+		return s.cursorSendLoop.totalReconnectAttempts.Load() > 0
+	}, 3*time.Second, time.Millisecond, "the send loop should be retrying")
+	time.Sleep(100 * time.Millisecond)
+
+	require.Nil(t, asQwp(t, ls).LastTerminalError(),
+		"a panicking log handler must not turn a transport outage into a terminal sender")
+	require.NoError(t, ls.Table("t").Int64Column("v", 99).AtNow(ctx),
+		"the producer must still accept rows")
 }

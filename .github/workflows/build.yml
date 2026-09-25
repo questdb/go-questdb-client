@@ -84,6 +84,37 @@ jobs:
           RUN_URL=$(jq -r '._links.web.href // ""' "$RESPONSE_FILE")
           echo "Enterprise build queued: ${RUN_URL}"
 
+  windows-retained-reader:
+    name: QWP SF cleanup ownership (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+      - name: Execute retained-reader, terminal-retention, and native release regressions
+        env:
+          GOTOOLCHAIN: local
+        shell: pwsh
+        # The root suite has Unix-only JVM fixture helpers referenced by
+        # untagged tests. Build all Windows production sources with this
+        # self-contained regression, rather than silently skipping it.
+        run: |
+          $json = go list -json .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pkg = ($json -join "`n") | ConvertFrom-Json
+          if ($pkg.CgoFiles.Count -or $pkg.SFiles.Count) {
+            throw 'File-list test build must be updated for native source files'
+          }
+          $source = $pkg.GoFiles
+          $tests = @('qwp_sf_test_helpers_test.go', 'qwp_sf_retained_reader_test.go', 'qwp_sf_cleanup_fault_test.go', 'qwp_sf_cleanup_state_test.go', 'qwp_sf_cleanup_release_test.go', 'qwp_sf_files_windows_test.go')
+          go test -c -o retained-reader.test.exe @source @tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Allow the subprocess watchdogs to report failures before the suite watchdog.
+          .\retained-reader.test.exe '-test.run=^TestQwpSf' '-test.v' '-test.count=3' '-test.timeout=10m'
+          exit $LASTEXITCODE
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -110,6 +141,16 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: go vet ./...
+
+      - name: Cross-compile Darwin
+        # Compile Darwin-specific production code, including SF fsync.
+        # This does not execute macOS tests.
+        env:
+          GOTOOLCHAIN: local
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: go build ./...
 
       - name: Run Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...

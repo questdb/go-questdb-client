@@ -25,12 +25,17 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -57,6 +62,12 @@ func TestQwpSfScanOrphansFindsCandidates(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "orphan-4"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orphan-4", ".lock"), []byte{}, 0o644))
 
+	// Internal parent-lock metadata is never a slot, even if an unrelated file
+	// in it happens to use a segment-looking suffix.
+	logicalLocks := filepath.Join(root, qwpSfLogicalLockDirName)
+	require.NoError(t, os.MkdirAll(logicalLocks, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(logicalLocks, "noise.sfa"), []byte{}, 0o644))
+
 	// own-slot: filtered by name
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "own-slot"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "own-slot", "sf-x.sfa"), []byte{}, 0o644))
@@ -66,6 +77,72 @@ func TestQwpSfScanOrphansFindsCandidates(t *testing.T) {
 	assert.Equal(t, filepath.Join(root, "orphan-1"), orphans[0])
 }
 
+// TestQwpSfDanglingFailedMarkerDisqualifiesOrphan pins Lstat-based marker
+// ownership: a marker entry is sufficient, and its external target is never
+// followed merely to decide whether this client may adopt the slot.
+func TestQwpSfDanglingFailedMarkerDisqualifiesOrphan(t *testing.T) {
+	root := t.TempDir()
+	slot := filepath.Join(root, "orphan")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(slot, "sf-x.sfa"), []byte("queued"), 0o644))
+	qwpSfTestSymlink(t, filepath.Join(root, "missing-target"), filepath.Join(slot, qwpSfFailedSentinelName))
+	assert.False(t, qwpSfIsCandidateOrphan(slot))
+}
+
+func TestQwpSfManifestOnlySlotIsCandidateButQuarantineEvidenceIsNot(t *testing.T) {
+	root := t.TempDir()
+	slot := filepath.Join(root, "manifest-only")
+	require.NoError(t, os.MkdirAll(slot, 0o755))
+	m, err := qwpSfManifestCreate(slot, 0, 1)
+	require.NoError(t, err)
+	require.NoError(t, m.close())
+	assert.True(t, qwpSfIsCandidateOrphan(slot))
+
+	// A preserved copy holds exactly what a candidate holds; only its name
+	// keeps it out of adoption.
+	preserved := filepath.Join(root, "sender-1"+qwpSfQuarantineSlotInfix+"0")
+	require.NoError(t, os.MkdirAll(preserved, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(preserved, "sf-initial.sfa"), []byte("preserved"), 0o644))
+	assert.False(t, qwpSfIsCandidateOrphan(preserved))
+
+	// An older client's container keeps its nested evidence out of reach too.
+	legacyRoot := filepath.Join(root, "quarantined")
+	require.NoError(t, os.MkdirAll(filepath.Join(legacyRoot, "sender-1"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(legacyRoot, "sender-1", "sf-initial.sfa"), []byte("preserved"), 0o644))
+	assert.False(t, qwpSfIsCandidateOrphan(legacyRoot))
+}
+
+func TestQwpSfDrainerHandlesManifestOnlySlots(t *testing.T) {
+	t.Run("data-boundaries-mark-failed-with-reason", func(t *testing.T) {
+		slot := t.TempDir()
+		m, err := qwpSfManifestCreate(slot, 0, 1)
+		require.NoError(t, err)
+		require.NoError(t, m.close())
+
+		d := qwpSfNewOrphanDrainer(slot, 4096, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+		d.drainerRun(context.Background())
+		assert.Equal(t, qwpSfDrainOutcomeFailed, d.drainerOutcome())
+		body, err := os.ReadFile(filepath.Join(slot, qwpSfFailedSentinelName))
+		require.NoError(t, err)
+		assert.Contains(t, string(body), "sf-manifest.bin references durable data")
+	})
+
+	t.Run("collapsed-boundaries-clean-up", func(t *testing.T) {
+		slot := t.TempDir()
+		m, err := qwpSfManifestCreate(slot, 4, 4)
+		require.NoError(t, err)
+		require.NoError(t, m.close())
+
+		d := qwpSfNewOrphanDrainer(slot, 4096, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+		d.drainerRun(context.Background())
+		assert.Equal(t, qwpSfDrainOutcomeSuccess, d.drainerOutcome())
+		_, err = os.Stat(filepath.Join(slot, qwpSfManifestFileName))
+		assert.True(t, os.IsNotExist(err))
+		_, err = os.Stat(filepath.Join(slot, qwpSfFailedSentinelName))
+		assert.True(t, os.IsNotExist(err))
+	})
+}
+
 func TestQwpSfScanOrphansEmptyDirReturnsNothing(t *testing.T) {
 	root := t.TempDir()
 	assert.Empty(t, qwpSfScanOrphans(root, nil))
@@ -73,6 +150,63 @@ func TestQwpSfScanOrphansEmptyDirReturnsNothing(t *testing.T) {
 
 func TestQwpSfScanOrphansMissingDirReturnsNothing(t *testing.T) {
 	assert.Empty(t, qwpSfScanOrphans("/nonexistent/path", nil))
+}
+
+func TestQwpSfScanOrphansRootFailuresLogged(t *testing.T) {
+	for _, operation := range []string{"stat", "read directory", "not a directory"} {
+		t.Run(operation, func(t *testing.T) {
+			root := t.TempDir()
+			if operation == "not a directory" {
+				root = filepath.Join(root, "file")
+				require.NoError(t, os.WriteFile(root, []byte("untouched"), 0o600))
+			} else {
+				if !qwpTestCanEnforceOwnerPermissions() {
+					t.Skip("this platform or user cannot enforce directory permissions")
+				}
+				blocked := root
+				if operation == "stat" {
+					root = filepath.Join(blocked, "root")
+					require.NoError(t, os.Mkdir(root, 0o700))
+				}
+				require.NoError(t, os.Chmod(blocked, 0o000))
+				t.Cleanup(func() { require.NoError(t, os.Chmod(blocked, 0o700)) })
+			}
+
+			// Prove the fixture reaches the intended failing filesystem call.
+			_, statErr := os.Stat(root)
+			if operation == "stat" {
+				require.ErrorIs(t, statErr, os.ErrPermission)
+			} else {
+				require.NoError(t, statErr)
+				_, readErr := os.ReadDir(root)
+				require.Error(t, readErr)
+			}
+
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			assert.Empty(t, qwpSfScanOrphansWithLogger(root, nil, logger))
+			assert.Contains(t, logs.String(), "level=ERROR")
+			assert.Contains(t, logs.String(), "could not scan orphan root")
+			assert.Contains(t, logs.String(), root)
+			assert.Contains(t, logs.String(), "error=")
+			assert.Equal(t, 1, strings.Count(logs.String(), "\n"))
+
+			// Diagnostics must not turn an inspection failure into a panic.
+			assert.NotPanics(t, func() {
+				assert.Empty(t, qwpSfScanOrphansWithLogger(root, nil, slog.New(panicOnHandleSlog{})))
+			})
+		})
+	}
+}
+
+func TestQwpSfScanOrphansNormalRootsAreQuiet(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{"", root, filepath.Join(root, "missing")} {
+		var logs bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logs, nil))
+		assert.Empty(t, qwpSfScanOrphansWithLogger(path, nil, logger))
+		assert.Empty(t, logs.String())
+	}
 }
 
 func TestQwpSfMarkSlotFailed(t *testing.T) {
@@ -135,6 +269,9 @@ func TestQwpSfDrainerSkipsLockedSlot(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
+	manifest, err := qwpSfManifestCreate(dir, 4, 4)
+	require.NoError(t, err)
+	require.NoError(t, manifest.close())
 	// Hold the slot lock for the duration of the drainer's run.
 	lock, err := qwpSfAcquireSlotLock(dir)
 	require.NoError(t, err)
@@ -152,6 +289,42 @@ func TestQwpSfDrainerSkipsLockedSlot(t *testing.T) {
 	// Locked slots must NOT be marked .failed (contention is normal).
 	_, err = os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
 	assert.True(t, os.IsNotExist(err), "drainer wrongly created .failed on lock contention")
+}
+
+// TestQwpSfDrainerLocalIOFaultLeavesNoFailedSentinel pins the drainer half of
+// retry-always: a local filesystem fault while opening the slot — here, a
+// manifest-debris quarantine rename refused with ENOSPC — says nothing about
+// the slot's bytes. The run fails, but the slot keeps its data and its
+// eligibility: no .failed sentinel, so the next foreground scan adopts it
+// again once the fault clears.
+func TestQwpSfDrainerLocalIOFaultLeavesNoFailedSentinel(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	// A manifest of the wrong size, which engine open tries to set aside.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, qwpSfManifestFileName),
+		[]byte("too short"), 0o644))
+
+	original := qwpSfManifestQuarantineRename.load()
+	t.Cleanup(func() { qwpSfManifestQuarantineRename.store(original) })
+	qwpSfManifestQuarantineRename.store(func(string, string) error { return syscall.ENOSPC })
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		nil,
+		200*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond,
+	)
+	drainer.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	_, err := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(err),
+		"a local I/O fault must leave the slot eligible for a later adoption")
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfManifestFileName))
+	require.NoError(t, err)
+	assert.Equal(t, "too short", string(body), "the boundary record must stay in place")
 }
 
 func TestQwpSfDrainerMarksFailedOnAuthRejection(t *testing.T) {
@@ -201,7 +374,7 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 		require.NoError(t, engine.engineClose())
 	}
 
-	var unavailable, persistent, lastAttempts int
+	var unavailable, persistent, lastAttempts atomic.Int32
 	drainer := qwpSfNewOrphanDrainer(
 		dir, segSize, qwpSfUnlimitedTotalBytes,
 		qwpSfDurableDialFor(srv),
@@ -210,8 +383,8 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 	)
 	drainer.durableAckMode = true
 	drainer.listener = QwpBackgroundDrainerListener{
-		OnDurableAckUnavailable:       func(string, int) { unavailable++ },
-		OnDurableAckPersistentFailure: func(_ string, attempts int, _ time.Duration) { persistent++; lastAttempts = attempts },
+		OnDurableAckUnavailable:       func(string, int) { unavailable.Add(1) },
+		OnDurableAckPersistentFailure: func(_ string, attempts int, _ time.Duration) { lastAttempts.Store(int32(attempts)); persistent.Add(1) },
 	}
 	drainer.drainerRun(context.Background())
 
@@ -219,9 +392,10 @@ func TestQwpSfDrainerDurableAckMismatchQuarantines(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
 	require.NoError(t, err)
 	assert.Contains(t, string(body), "durable-ack")
-	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, unavailable, "one OnDurableAckUnavailable per mismatch up to the cap")
-	assert.Equal(t, 1, persistent, "OnDurableAckPersistentFailure fires exactly once")
-	assert.Equal(t, qwpMaxDurableAckMismatchAttempts, lastAttempts)
+	require.Eventually(t, func() bool { return persistent.Load() == 1 }, qwpTestWaitTimeout, time.Millisecond)
+	assert.EqualValues(t, qwpMaxDurableAckMismatchAttempts, unavailable.Load(), "cooperative listener receives each queued mismatch")
+	assert.EqualValues(t, 1, persistent.Load())
+	assert.EqualValues(t, qwpMaxDurableAckMismatchAttempts, lastAttempts.Load())
 
 	// Positively confirm the drainer never trimmed the un-uploaded data: its
 	// backing .sfa segment must survive quarantine (Hazard I — never unlink an
@@ -240,6 +414,15 @@ func TestQwpSfDrainerListenerPanicIsolated(t *testing.T) {
 	t.Run("HelperRecovers", func(t *testing.T) {
 		qwpDrainerListenerCall(nil, func() { panic("boom") }) // must not propagate
 		qwpDrainerListenerCall(nil, nil)                      // nil-safe
+	})
+
+	t.Run("PanickingLoggerContained", func(t *testing.T) {
+		// The handler that reports the caught panic is user code too, so a
+		// panic there must not reach the drainer's goroutine either.
+		logger := slog.New(panicOnHandleSlog{})
+		require.NotPanics(t, func() {
+			qwpDrainerListenerCall(logger, func() { panic("boom") })
+		})
 	})
 
 	t.Run("OnDurableAckUnavailablePanicContained", func(t *testing.T) {
@@ -382,6 +565,152 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 	assert.Empty(t, pool.drainerPoolSnapshot())
 }
 
+func TestQwpSfDrainerPoolQueuedWorkOutlivesSetupContext(t *testing.T) {
+	for _, closePool := range []bool{false, true} {
+		name := "drain-after-capacity-frees"
+		if closePool {
+			name = "pool-close-stops-queued-work"
+		}
+		t.Run(name, func(t *testing.T) {
+			srv := newQwpSfTestServer(t, qwpSfTestServerOpts{recordFrames: true})
+			t.Cleanup(srv.Close)
+			const segSize int64 = 4096
+			dirs := []string{t.TempDir(), t.TempDir()}
+			for i, dir := range dirs {
+				engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = engine.engineClose() })
+				_, err = engine.engineAppendBlocking(context.Background(), []byte{byte(i)})
+				require.NoError(t, err)
+				require.NoError(t, engine.engineClose())
+			}
+			entered, allowDial := make(chan struct{}), make(chan struct{})
+			var enteredOnce, releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(allowDial) }) }
+			factory := func(ctx context.Context, idx int) (*qwpTransport, error) {
+				enteredOnce.Do(func() { close(entered) })
+				select {
+				case <-allowDial:
+					return qwpSfDialFor(srv)(ctx, idx)
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			pool := qwpSfNewDrainerPool(1)
+			oldGrace := qwpSfDrainerPoolCloseGrace.load()
+			qwpSfDrainerPoolCloseGrace.store(20 * time.Millisecond)
+			t.Cleanup(func() {
+				// On assertion failure, cancel before opening the dial gate so
+				// teardown cannot start a fresh connection while cleaning up.
+				pool.cancel()
+				release()
+				pool.drainerPoolClose()
+				qwpSfDrainerPoolCloseGrace.store(oldGrace)
+			})
+			setupCtx, cancelSetup := context.WithCancel(context.Background())
+			t.Cleanup(cancelSetup)
+			first := qwpSfNewOrphanDrainer(dirs[0], segSize, qwpSfUnlimitedTotalBytes,
+				factory, nil, time.Second, time.Millisecond, 10*time.Millisecond)
+			second := qwpSfNewOrphanDrainer(dirs[1], segSize, qwpSfUnlimitedTotalBytes,
+				qwpSfDialFor(srv), nil, time.Second, time.Millisecond, 10*time.Millisecond)
+			require.NoError(t, pool.drainerPoolSubmit(setupCtx, first))
+			waitQwpCleanupSignal(t, entered, "first drainer occupying the only slot")
+			require.NoError(t, pool.drainerPoolSubmit(setupCtx, second))
+			cancelSetup()
+			require.Never(t, func() bool {
+				return second.drainerOutcome() != qwpSfDrainOutcomePending || len(pool.drainerPoolSnapshot()) != 2
+			}, 50*time.Millisecond, time.Millisecond, "accepted queued work must survive setup cancellation")
+			require.Equal(t, int64(-1), second.drainerTargetFsn(), "capacity must still prevent the queued drainer from starting")
+
+			if closePool {
+				pool.drainerPoolClose()
+				require.Empty(t, pool.drainerPoolSnapshot())
+				require.Equal(t, qwpSfDrainOutcomeStopped, first.drainerOutcome())
+				require.Equal(t, qwpSfDrainOutcomeStopped, second.drainerOutcome())
+				require.Equal(t, int64(-1), second.drainerTargetFsn(), "pool close must not start the queued drainer")
+				require.Zero(t, srv.totalFramesReceived.Load())
+				for _, dir := range dirs {
+					require.True(t, qwpSfIsCandidateOrphan(dir), "stopped work must remain recoverable")
+					require.NoFileExists(t, filepath.Join(dir, qwpSfFailedSentinelName))
+				}
+			} else {
+				release()
+				require.Eventually(t, func() bool {
+					return len(pool.drainerPoolSnapshot()) == 0
+				}, qwpTestWaitTimeout, time.Millisecond, "both accepted drainers must finish on the live pool")
+				require.False(t, pool.closed.Load())
+				require.Equal(t, qwpSfDrainOutcomeSuccess, first.drainerOutcome())
+				require.Equal(t, qwpSfDrainOutcomeSuccess, second.drainerOutcome())
+				var frames []string
+				for _, received := range srv.recordedFrames() {
+					frames = append(frames, received...)
+				}
+				require.ElementsMatch(t, []string{string([]byte{0}), string([]byte{1})}, frames,
+					"setup cancellation must not prevent either slot's saved frame from reaching the server")
+			}
+			for _, dir := range dirs {
+				lock, err := qwpSfAcquireSlotLock(dir)
+				require.NoError(t, err, "finished or stopped drainers must release their slots")
+				require.NoError(t, lock.close())
+			}
+		})
+	}
+}
+
+func TestQwpSfDrainerPoolRejectsCancelledSubmission(t *testing.T) {
+	pool := qwpSfNewDrainerPool(1)
+	t.Cleanup(pool.drainerPoolClose)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	d := qwpSfNewOrphanDrainer(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes,
+		nil, nil, time.Second, time.Millisecond, time.Millisecond)
+	require.ErrorIs(t, pool.drainerPoolSubmit(ctx, d), context.Canceled)
+	require.Empty(t, pool.drainerPoolSnapshot(), "rejected submissions must not become pool obligations")
+	require.Equal(t, int64(-1), d.drainerTargetFsn())
+}
+
+func TestQwpSfOrphanSubmissionCancellationFailsConstruction(t *testing.T) {
+	root := t.TempDir()
+	orphanDir := filepath.Join(root, "orphan")
+	engine, err := qwpSfNewCursorEngine(orphanDir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = engine.engineClose() })
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("saved row"))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	hook := func() error {
+		cancel()
+		return nil
+	}
+	qwpSfTestAfterEngineCreateHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestAfterEngineCreateHook.Store(nil) })
+	// Async connect does not consume the cancelled context in a foreground
+	// dial. Construction must reach orphan submission and propagate its error.
+	sender, err := LineSenderFromConf(ctx, "ws::addr=127.0.0.1:1;sf_dir="+root+
+		";sender_id=foreground;initial_connect_retry=async;drain_orphans=on;")
+	if sender != nil {
+		t.Cleanup(func() { _ = sender.Close(context.Background()) })
+	}
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, sender, "construction must not silently skip a rejected orphan submission")
+	// Cancellation bounds the constructor's wait, not its acquired-resource
+	// cleanup. The retained owner must finish before the slot can be reused.
+	var cleanup closeLifecycleReporter
+	if errors.As(err, &cleanup) {
+		require.Eventually(t, cleanup.closeCompleted, qwpTestWaitTimeout, time.Millisecond)
+	}
+	require.True(t, qwpSfIsCandidateOrphan(orphanDir))
+	require.NoFileExists(t, filepath.Join(orphanDir, qwpSfFailedSentinelName))
+	for _, dir := range []string{orphanDir, filepath.Join(root, "foreground")} {
+		lock, err := qwpSfAcquireSlotLock(dir)
+		require.NoError(t, err, "completed construction cleanup must release its slot and leave the orphan unlocked")
+		require.NoError(t, lock.close())
+	}
+}
+
 // TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime proves the
 // max_background_drainers cap is a *runtime* bound, not just a parsed
 // config value: submitting more drainers than the cap must never run
@@ -393,9 +722,9 @@ func TestQwpSfDrainerPoolSubmitAndClose(t *testing.T) {
 // is cancelled holds every slot occupied, so a cap-violating drainer
 // (if the semaphore were missing) would show up as a (cap+1)th entry.
 func TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	defer func() { qwpSfDrainerPoolCloseGrace = prevGrace }()
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	defer func() { qwpSfDrainerPoolCloseGrace.store(prevGrace) }()
 
 	const (
 		maxConcurrent = 2
@@ -473,15 +802,14 @@ func TestQwpSfDrainerPoolEnforcesConcurrencyCapAtRuntime(t *testing.T) {
 	assert.Empty(t, pool.drainerPoolSnapshot())
 }
 
-// Regression: a drainer parked inside clientFactory(ctx) — e.g. a
-// long-running TCP dial / WS upgrade against a black-holed peer —
-// must not survive past drainerPoolClose. The pool cancels its
-// master ctx after the polite-stop grace; the dial unwinds; the
-// drainer goroutine exits.
+// This test's connection attempt waits until its context is cancelled, like a
+// connection to an unresponsive server. Closing the drainer pool cancels that
+// context after the first wait. The attempt then returns and cleanup finishes
+// within the time allowed by this test.
 func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	defer func() { qwpSfDrainerPoolCloseGrace = prevGrace }()
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	defer func() { qwpSfDrainerPoolCloseGrace.store(prevGrace) }()
 
 	dir := t.TempDir()
 	engine, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
@@ -539,21 +867,19 @@ func TestQwpSfDrainerPoolCancelsBlockingDialOnClose(t *testing.T) {
 	assert.Empty(t, pool.drainerPoolSnapshot())
 }
 
-// TestQwpSfDrainerPoolBoundedOnUncancellableDrainer is a regression
-// test for M15: a drainer wedged in I/O the master-ctx cancel cannot
-// reach — modelled here by a clientFactory that ignores its ctx, the
-// way drainerRun's engine-open flock / mmap / CRC scan does — must
-// not make drainerPoolClose hang forever. After the polite grace and
-// the post-cancel hard grace both elapse, close abandons the
-// straggler and returns; the slot stays adoptable.
+// Regression test for M15: drainerPoolClose must return even if a worker ignores
+// cancellation. The test's connection factory blocks like a file operation or
+// recovery scan that cannot be cancelled. After both close waits expire, the
+// pool stops waiting but keeps track of the worker and its locked directory
+// until cleanup finishes.
 func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
-	prevGrace := qwpSfDrainerPoolCloseGrace
-	prevHard := qwpSfDrainerPoolHardCloseGrace
-	qwpSfDrainerPoolCloseGrace = 50 * time.Millisecond
-	qwpSfDrainerPoolHardCloseGrace = 50 * time.Millisecond
+	prevGrace := qwpSfDrainerPoolCloseGrace.load()
+	prevHard := qwpSfDrainerPoolHardCloseGrace.load()
+	qwpSfDrainerPoolCloseGrace.store(50 * time.Millisecond)
+	qwpSfDrainerPoolHardCloseGrace.store(50 * time.Millisecond)
 	defer func() {
-		qwpSfDrainerPoolCloseGrace = prevGrace
-		qwpSfDrainerPoolHardCloseGrace = prevHard
+		qwpSfDrainerPoolCloseGrace.store(prevGrace)
+		qwpSfDrainerPoolHardCloseGrace.store(prevHard)
 	}()
 
 	dir := t.TempDir()
@@ -566,7 +892,6 @@ func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
 	// A factory that ignores its ctx stands in for a drainer wedged in
 	// I/O the master-ctx cancel cannot interrupt.
 	block := make(chan struct{})
-	defer close(block) // release at test end so the goroutine unwinds
 	entered := make(chan struct{}, 1)
 	wedgeFactory := func(_ context.Context, _ int) (*qwpTransport, error) {
 		select {
@@ -584,6 +909,12 @@ func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
 		nil,
 		time.Second, 10*time.Millisecond, 100*time.Millisecond,
 	)
+	defer func() {
+		close(block)
+		pool.drainerPoolClose()
+		require.Eventually(t, pool.cleanupCompleted, 5*time.Second, time.Millisecond,
+			"join cleanup before TempDir removes the retained slot")
+	}()
 	require.NoError(t, pool.drainerPoolSubmit(context.Background(), drainer))
 
 	select {
@@ -603,14 +934,18 @@ func TestQwpSfDrainerPoolBoundedOnUncancellableDrainer(t *testing.T) {
 		t.Fatal("drainerPoolClose hung on an un-cancellable drainer")
 	}
 
-	// Abandoned, not joined: the goroutine is still parked in the
-	// factory, so it is still tracked and still Pending. Its slot is
-	// left intact (no .failed sentinel) for a future sender to adopt.
+	// Close returned, but the worker is still blocked while trying to connect.
+	// The directory is still locked, even though it has no .failed file.
 	assert.NotEmpty(t, pool.drainerPoolSnapshot(),
-		"wedged drainer must still be tracked (abandoned, not joined)")
+		"wedged drainer must remain tracked until actual cleanup")
+	lock, lockErr := qwpSfAcquireSlotLock(dir)
+	if lockErr == nil {
+		_ = lock.close()
+	}
+	assert.ErrorIs(t, lockErr, qwpSfErrLockBusy)
 	assert.Equal(t, qwpSfDrainOutcomePending, drainer.drainerOutcome())
 	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
-	assert.True(t, os.IsNotExist(statErr), "must not quarantine an abandoned slot")
+	assert.True(t, os.IsNotExist(statErr), "a timed-out observation must not quarantine the retained slot")
 }
 
 func TestQwpSfDrainerPoolRejectsAfterClose(t *testing.T) {
@@ -623,18 +958,16 @@ func TestQwpSfDrainerPoolRejectsAfterClose(t *testing.T) {
 	assert.Contains(t, err.Error(), "closed")
 }
 
-// TestQwpSfDrainerPoolSurvivesFactoryPanic asserts a panic in the
-// user-supplied clientFactory — invoked on the drainer goroutine from
-// drainerRun's connect phase, before the send loop's own recover is in
-// play — is converted into a latched terminal failure rather than
-// crashing the host process (which would take the whole pool and the
-// foreground sender down with it). The panicking drainer must end Failed
-// with a quarantine sentinel, and the pool's semaphore/active-list
-// bookkeeping must survive intact: on a cap-1 pool a follow-up drainer
-// can only run once the panicking one releases its slot, so its reaching
-// Success proves the worker's cleanup defers ran (no crash, no leaked
-// slot).
+// A panic while opening a drainer's connection must report a permanent failure,
+// not crash the process. Keep its disk slot locked without marking the data as
+// corrupt. The pool must still be able to run a different drainer: with a limit
+// of one running task, the next task's success shows that the failed task no
+// longer uses that running-task allowance. Its disk slot remains locked.
 func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
+	panicDir, child := terminalDrainerTestDir(t)
+	if !child {
+		return
+	}
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
@@ -646,7 +979,6 @@ func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
 	// Unacked slot + a factory that panics. The drainer must get past
 	// drainerRun's already-drained short-circuit and into the connect
 	// phase for the factory to be reached.
-	panicDir := t.TempDir()
 	{
 		engine, err := qwpSfNewCursorEngine(panicDir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
 		require.NoError(t, err)
@@ -664,20 +996,18 @@ func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
 	)
 	require.NoError(t, pool.drainerPoolSubmit(context.Background(), panicDrainer))
 
-	// The panic surfaces as a Failed outcome with a quarantine sentinel,
-	// not a process crash.
+	// Keep the failed drainer's resources. The panic does not prove that its
+	// stored data is corrupt.
 	require.Eventually(t, func() bool {
 		return panicDrainer.drainerOutcome() == qwpSfDrainOutcomeFailed
 	}, 2*time.Second, 5*time.Millisecond,
 		"factory panic must surface as a Failed outcome, not crash the host")
-	body, err := os.ReadFile(filepath.Join(panicDir, qwpSfFailedSentinelName))
-	require.NoError(t, err)
-	assert.Contains(t, string(body), "panicked")
+	require.Eventually(t, func() bool { return errors.Is(pool.cleanupResult(), ErrCleanupFailed) }, qwpTestWaitTimeout, time.Millisecond)
+	assertTerminalDrainerRetained(t, panicDir)
 
-	// Pool machinery survived: a healthy drainer submitted to the same
-	// cap-1 pool runs to Success, which is only possible once the
-	// panicking drainer's worker released its semaphore slot on its way
-	// out.
+	// A different drainer can run even though the failed one's disk slot stays
+	// locked. The pool allows only one running task, so this also checks that
+	// the failed task no longer occupies that allowance.
 	healthyDir := t.TempDir()
 	{
 		engine, err := qwpSfNewCursorEngine(healthyDir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
@@ -696,6 +1026,10 @@ func TestQwpSfDrainerPoolSurvivesFactoryPanic(t *testing.T) {
 		return healthyDrainer.drainerOutcome() == qwpSfDrainOutcomeSuccess
 	}, 5*time.Second, 10*time.Millisecond,
 		"follow-up drainer must run after the panicking one freed its semaphore slot")
+	pool.drainerPoolClose()
+	require.ErrorIs(t, pool.cleanupResult(), ErrCleanupFailed)
+	panicDrainer = nil
+	assertTerminalDrainerRetained(t, panicDir)
 }
 
 // TestQwpSfDrainerUsesSharedTracker verifies the Phase 5 wiring:
@@ -789,8 +1123,8 @@ func TestSfConfDrainOrphansEndToEnd(t *testing.T) {
 func TestQwpSfDrainerMarksFailedWhenConnectedButNeverAcked(t *testing.T) {
 	// The 300ms budget below is deliberately sub-floor to keep the watchdog
 	// fast; lower the production floor (30s) for the duration of this test.
-	defer func(orig time.Duration) { qwpSfMinNoProgressBudget = orig }(qwpSfMinNoProgressBudget)
-	qwpSfMinNoProgressBudget = 10 * time.Millisecond
+	defer func(orig time.Duration) { qwpSfMinNoProgressBudget.store(orig) }(qwpSfMinNoProgressBudget.load())
+	qwpSfMinNoProgressBudget.store(10 * time.Millisecond)
 
 	// silentAcks: read frames forever, never ACK, keep the
 	// connection open — exactly the wedged-but-connected scenario.
@@ -951,7 +1285,7 @@ func TestQwpSfDrainerNoProgressBudgetFloor(t *testing.T) {
 	// fast) must not shrink the live-connection no-progress watchdog below the
 	// floor, or a healthy-but-slow adopted slot could be quarantined early.
 	d := &qwpSfOrphanDrainer{reconnectMaxDuration: time.Millisecond}
-	assert.Equal(t, qwpSfMinNoProgressBudget, d.noProgressBudget(),
+	assert.Equal(t, qwpSfMinNoProgressBudget.load(), d.noProgressBudget(),
 		"a sub-floor reconnectMaxDuration must be raised to the floor")
 
 	// A value above the floor is honored exactly.
@@ -963,4 +1297,81 @@ func TestQwpSfDrainerNoProgressBudgetFloor(t *testing.T) {
 	d = &qwpSfOrphanDrainer{}
 	assert.Equal(t, qwpSfDefaultReconnectMaxDuration, d.noProgressBudget(),
 		"an unset reconnectMaxDuration falls back to the default")
+}
+
+// The .failed sentinel is permanent — nothing in the client removes it — so a
+// local I/O fault must not earn one. The slot keeps its data and stays
+// eligible for the next foreground scan; only a recovery that proves the slot
+// inconsistent quarantines it.
+func TestQwpSfDrainerLocalIOErrorLeavesSlotEligible(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based permission denial is not portable to Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits; cannot induce EACCES")
+	}
+	slot := t.TempDir()
+	const segSize int64 = 4096
+	{
+		engine, err := qwpSfNewCursorEngine(slot, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+		require.NoError(t, err)
+		_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, engine.engineClose())
+	}
+	segments, err := filepath.Glob(filepath.Join(slot, "*.sfa"))
+	require.NoError(t, err)
+	require.NotEmpty(t, segments)
+	for _, path := range segments {
+		require.NoError(t, os.Chmod(path, 0o000))
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	}
+
+	d := qwpSfNewOrphanDrainer(slot, segSize, qwpSfUnlimitedTotalBytes, nil, nil, 0, 0, 0)
+	d.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, d.drainerOutcome())
+	assert.Contains(t, d.drainerLastError(), "permission denied")
+	_, statErr := os.Stat(filepath.Join(slot, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr),
+		"a transient local fault must not disqualify the slot forever")
+	assert.True(t, qwpSfIsCandidateOrphan(slot),
+		"the slot must still be adopted by the next scan")
+}
+
+// TestQwpSfDrainerOpenFailureSurvivesPanickingLogger pins that reporting an
+// operational open failure cannot kill the process. Each drainer runs on its
+// own goroutine whose only recover is the one at the top of drainerRun, and
+// this report reaches a user-supplied slog handler that is free to panic.
+func TestQwpSfDrainerOpenFailureSurvivesPanickingLogger(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	// A collapsed manifest is a candidate but has no frames to send. Recovery
+	// therefore reaches fresh active-segment allocation, which is the operation
+	// this test faults.
+	manifest, err := qwpSfManifestCreate(dir, 4, 4)
+	require.NoError(t, err)
+	require.NoError(t, manifest.close())
+	// A full disk is an operational failure, not proof that the slot is
+	// inconsistent, so the drainer logs it and leaves the slot for a later scan
+	// — the branch this test needs to reach.
+	originalReserve := qwpSfReserveNewBlocksFn.load()
+	qwpSfReserveNewBlocksFn.store(func(*os.File, int64, int64) error { return syscall.ENOSPC })
+	t.Cleanup(func() { qwpSfReserveNewBlocksFn.store(originalReserve) })
+
+	drainer := qwpSfNewOrphanDrainer(
+		dir, 4096, qwpSfUnlimitedTotalBytes,
+		qwpSfDialFor(srv),
+		nil,
+		time.Second, 10*time.Millisecond, 100*time.Millisecond,
+	)
+	drainer.logger = slog.New(panicOnHandleSlog{})
+
+	drainer.drainerRun(context.Background())
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "an operational open failure must leave the slot eligible")
 }
