@@ -88,18 +88,22 @@ func TestQwpSfConsumedFileCloseErrorIsNotRetried(t *testing.T) {
 	_, err = e.engineAppendBlocking(context.Background(), []byte("retained frame"))
 	require.NoError(t, err)
 	<-e.manager.segmentManagerStop()
+	var logs bytes.Buffer
+	e.manager.logger.Store(qwpGuardLogger(slog.New(slog.NewTextHandler(&logs, nil))))
 	injected := errors.New("file close reported an error after consuming the handle")
 	var calls atomic.Int32
 	hook := func(*os.File) error { calls.Add(1); return injected }
 	qwpSfTestAfterFileCloseHook.Store(&hook)
 	t.Cleanup(func() { qwpSfTestAfterFileCloseHook.Store(nil) })
-	require.ErrorIs(t, e.engineClose(), injected)
+	require.NoError(t, e.engineClose(), "a close error on a released descriptor is logged, not reported")
 	waitQwpSfEngineCleanup(t, e)
 	require.True(t, e.engineCloseCompleted(), "all handles, including flock, are actually released")
+	require.Contains(t, logs.String(), "slot released; closing its files reported errors")
+	require.Contains(t, logs.String(), injected.Error())
 	before := calls.Load()
 	require.Positive(t, before)
 	for i := 0; i < 10; i++ {
-		require.ErrorIs(t, e.engineClose(), injected)
+		require.NoError(t, e.engineClose())
 	}
 	require.Equal(t, before, calls.Load(), "an error is not permission to close a consumed fd again")
 	lock, err := qwpSfAcquireSlotLock(e.sfDir)
@@ -107,7 +111,7 @@ func TestQwpSfConsumedFileCloseErrorIsNotRetried(t *testing.T) {
 	require.NoError(t, lock.close())
 }
 
-func TestQwpSfFileCloseErrorSurvivesOtherResourceRetry(t *testing.T) {
+func TestQwpSfReleasedFileCloseErrorIsNotReportedAfterRetry(t *testing.T) {
 	e, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
 	_, err = e.engineAppendBlocking(context.Background(), []byte("frame"))
@@ -139,16 +143,13 @@ func TestQwpSfFileCloseErrorSurvivesOtherResourceRetry(t *testing.T) {
 		qwpSfTestMunmapHook.Store(nil)
 		qwpSfTestAfterFileCloseHook.Store(nil)
 	})
-	err = e.engineClose()
-	require.ErrorIs(t, err, unmapErr)
-	require.ErrorIs(t, err, fileErr)
+	require.ErrorIs(t, e.engineClose(), unmapErr, "a pending result names the failure holding cleanup up")
 	fail.Store(false)
 	waitQwpSfEngineCleanup(t, e)
 	require.True(t, e.engineCloseCompleted())
-	err = e.engineClose()
-	require.ErrorIs(t, err, fileErr, "unrecovered file-close error must survive a later successful unmap")
-	require.NotErrorIs(t, err, unmapErr)
-	require.Equal(t, int32(1), closes.Load())
+	require.NoError(t, e.engineClose(),
+		"once everything is released, neither the recovered unmap nor the released manifest's close error remains")
+	require.Equal(t, int32(1), closes.Load(), "the consumed manifest descriptor is never closed again")
 }
 
 func TestQwpSfLateCompletedCloseErrorIsLogged(t *testing.T) {
@@ -185,8 +186,8 @@ func TestQwpSfLateCompletedCloseErrorIsLogged(t *testing.T) {
 	releaseOnce.Do(func() { close(release) })
 	waitQwpSfEngineCleanup(t, e)
 	require.True(t, e.engineCloseCompleted())
-	require.ErrorIs(t, e.engineClose(), injected)
-	require.Contains(t, logs.String(), "cleanup completed with error")
+	require.NoError(t, e.engineClose(), "the manifest descriptor was released, so its close error is not reported")
+	require.Contains(t, logs.String(), "slot released; closing its files reported errors")
 	require.Contains(t, logs.String(), injected.Error())
 }
 
@@ -343,7 +344,7 @@ func TestQwpSfSanitizedResidueStaysRecognizableWhileReleaseRetries(t *testing.T)
 	require.NoError(t, eng.engineClose())
 }
 
-func TestQwpSfDrainerKeepsConsumedFileCloseError(t *testing.T) {
+func TestQwpSfDrainerDoesNotReportConsumedFileCloseError(t *testing.T) {
 	dir := t.TempDir()
 	eng, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)
@@ -370,8 +371,9 @@ func TestQwpSfDrainerKeepsConsumedFileCloseError(t *testing.T) {
 	drainer.drainerRun(context.Background())
 	require.NotNil(t, drainer.cleanup)
 	waitQwpSfEngineCleanup(t, drainer.cleanup)
-	require.ErrorIs(t, drainer.cleanupResult(), injected)
-	require.NotErrorIs(t, drainer.cleanupResult(), qwpSfErrSegmentCorrupt)
+	require.True(t, drainer.cleanup.engineCloseCompleted())
+	require.NoError(t, drainer.cleanupResult(),
+		"the segment descriptor was released, so neither its close error nor the transient open failure remains")
 	requireNoPreservedSlot(t, dir)
 	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
 	require.ErrorIs(t, statErr, os.ErrNotExist)

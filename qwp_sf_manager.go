@@ -120,6 +120,7 @@ type qwpSfSegmentManager struct {
 	totalBytes         int64
 	lastDiskFullLog    time.Time
 	lastMaintenanceLog time.Time
+	lastReleaseLog     time.Time
 	closed             bool
 
 	// wakeup is a single-slot channel. wakeWorker pushes into it
@@ -181,7 +182,6 @@ type qwpSfManagerRingEntry struct {
 	// until it stops; then the engine's cleanup worker may read them.
 	spareInProgress *qwpSfSegment
 	trimInProgress  []*qwpSfSegment
-	releaseErr      error
 	// dirSyncPending records that a post-trim directory fsync failed, so the
 	// unlinks that pass did complete are not durable yet. Retried by later
 	// passes for the same reason as pendingUnlinks. Worker goroutine only.
@@ -776,12 +776,12 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 		path := s.segmentPath()
 		sz := s.segmentSize()
 		closeErr := s.close()
-		trimErr = errors.Join(trimErr, closeErr)
 		if !s.resourcesReleased() {
+			trimErr = errors.Join(trimErr, closeErr)
 			e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{segment: s, path: path, sizeBytes: sz})
 			continue
 		}
-		e.releaseErr = errors.Join(e.releaseErr, s.closeErr)
+		m.logReleasedCloseError(e, s.closeErr)
 		if path != "" {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				// The file is still occupying the slot, so hold its bytes and
@@ -822,16 +822,16 @@ func (m *qwpSfSegmentManager) cleanupUninstalledSpare(e *qwpSfManagerRingEntry, 
 	closeErr := spare.close()
 	if spare.resourcesReleased() {
 		if spare != nil {
-			e.releaseErr = errors.Join(e.releaseErr, spare.closeErr)
+			m.logReleasedCloseError(e, spare.closeErr)
 		}
 		if path == "" {
-			return closeErr
+			return nil
 		}
 		removeErr := m.removeFile(path)
 		if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
-			return closeErr
+			return nil
 		}
-		closeErr = errors.Join(closeErr, qwpSfDurabilityError("remove uninstalled spare", path, removeErr))
+		closeErr = qwpSfDurabilityError("remove uninstalled spare", path, removeErr)
 	}
 	// Save unfinished work for the manager's next attempt or engine cleanup.
 	e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{segment: spare, path: path, sizeBytes: m.segmentSizeBytes})
@@ -861,7 +861,7 @@ func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (i
 				firstErr = errors.Join(firstErr, closeErr)
 				continue
 			}
-			e.releaseErr = errors.Join(e.releaseErr, closeErr)
+			m.logReleasedCloseError(e, closeErr)
 			pending.acquired = nil
 		}
 		if pending.segment != nil {
@@ -871,7 +871,7 @@ func (m *qwpSfSegmentManager) retryDeferredTrimWork(e *qwpSfManagerRingEntry) (i
 				firstErr = errors.Join(firstErr, closeErr)
 				continue
 			}
-			e.releaseErr = errors.Join(e.releaseErr, pending.segment.closeErr)
+			m.logReleasedCloseError(e, pending.segment.closeErr)
 			pending.segment = nil
 		}
 		var removeErr error
@@ -957,7 +957,28 @@ func (m *qwpSfSegmentManager) logServiceError(dir string, err error) {
 // the manager worker has stopped.
 func (m *qwpSfSegmentManager) closeServiceResidue(e *qwpSfManagerRingEntry) error {
 	_, err := m.retryDeferredTrimWork(e)
-	return errors.Join(e.releaseErr, err)
+	return err
+}
+
+// logReleasedCloseError logs an error from closing a segment or file whose
+// descriptor was released anyway. Nothing is still held, so it is not a
+// maintenance failure and is not reported to the engine's Close result. The
+// log is throttled like the other maintenance diagnostics, because a mount
+// where every close fails would otherwise log once per trimmed segment.
+func (m *qwpSfSegmentManager) logReleasedCloseError(e *qwpSfManagerRingEntry, err error) {
+	if err == nil {
+		return
+	}
+	now := time.Now()
+	m.mu.Lock()
+	shouldLog := now.Sub(m.lastReleaseLog) >= qwpSfManagerDiskFullLogThrottle
+	if shouldLog {
+		m.lastReleaseLog = now
+	}
+	m.mu.Unlock()
+	if shouldLog {
+		qwpEffectiveLogger(m.logger.Load()).Warn("qwp/sf: segment file released; closing it reported an error", "dir", e.dir, "error", err)
+	}
 }
 func (e *qwpSfManagerRingEntry) serviceResidueReleased() bool {
 	return e.spareInProgress == nil && len(e.trimInProgress) == 0 && len(e.pendingUnlinks) == 0 && !e.dirSyncPending

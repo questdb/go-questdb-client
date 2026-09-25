@@ -217,11 +217,14 @@ func (e *qwpSfCursorEngine) engineCleanupWorker(cause error) {
 					// process can already have opened the old inode but not yet tried
 					// to lock it, then race a successor that creates a new inode at
 					// the freed pathname. Stale files are harmless and reusable.
-					e.cleanup.publish(result, true, true)
-					// The caller may already have stopped waiting. Log the error even
-					// if the file handles were closed and all resources were released.
-					if err != nil || lockErr != nil || logicalErr != nil {
-						qwpEffectiveLogger(e.engineLogger()).Error("qwp/sf: cleanup completed with error", "slot", e.sfDir, "error", result)
+					//
+					// Every resource is released, so any error this attempt collected
+					// came from closing a descriptor or lock that was closed anyway.
+					// Such an error does not mean anything is still held; it is
+					// logged, and the result keeps only cause.
+					e.cleanup.publish(cause, true, true)
+					if released := errors.Join(err, lockErr, logicalErr); released != nil {
+						qwpEffectiveLogger(e.engineLogger()).Warn("qwp/sf: slot released; closing its files reported errors", "slot", e.sfDir, "error", released)
 					}
 					return
 				}

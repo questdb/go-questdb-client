@@ -27,9 +27,9 @@ package questdb
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 )
 
@@ -97,16 +97,6 @@ func qwpSfAcquireLogicalSlotLock(slotDir string) (*qwpSfSlotLock, error) {
 	return qwpSfAcquireLockAt(slotDir, lockPath, pidPath)
 }
 
-// qwpSfRetainedLogicalLocks keeps a logical lock whose release failed while
-// consuming its descriptor. The OS state is then unknown: the lock may or may
-// not still be held, and the descriptor cannot be closed again. Keeping the
-// value reachable stops a finalizer from reusing it and keeps the failure
-// visible; nothing here retries or reclaims it.
-var qwpSfRetainedLogicalLocks struct {
-	mu    sync.Mutex
-	locks []*qwpSfSlotLock
-}
-
 // qwpSfTestBeforeLogicalLockReleaseHook injects a failure before the shared
 // slot-lock close path is entered. It lets tests fail the parent-anchored lock
 // without also failing the directory-local lock released by engine cleanup.
@@ -115,11 +105,12 @@ var qwpSfTestBeforeLogicalLockReleaseHook atomic.Pointer[func(*qwpSfSlotLock) er
 // qwpSfReleaseLogicalLock releases lock and classifies the outcome.
 //
 // A failure that left the descriptor intact keeps the lock held, so the caller
-// still owns the exclusion and may retry. A failure that consumed the
-// descriptor is terminal: it is joined with ErrCleanupFailed, the lock is
-// retained, and no caller may claim either that the lock is still held or that
-// the OS released it.
-func qwpSfReleaseLogicalLock(lock *qwpSfSlotLock) error {
+// still owns the exclusion and may retry. A close that consumed the descriptor
+// released the lock with it, even when it reported an error: the lock file has
+// no other descriptor in this process. That error is logged, like any other
+// error from releasing something that was released anyway, and the release
+// counts as done.
+func qwpSfReleaseLogicalLock(lock *qwpSfSlotLock, logger *slog.Logger) error {
 	if lock == nil {
 		return nil
 	}
@@ -138,13 +129,9 @@ func qwpSfReleaseLogicalLock(lock *qwpSfSlotLock) error {
 		// and a later attempt can close it.
 		return fmt.Errorf("release logical slot lock [slot=%s]: %w", lock.slotPath(), err)
 	}
-	qwpSfRetainedLogicalLocks.mu.Lock()
-	qwpSfRetainedLogicalLocks.locks = append(qwpSfRetainedLogicalLocks.locks, lock)
-	qwpSfRetainedLogicalLocks.mu.Unlock()
-	return errors.Join(ErrCleanupFailed,
-		fmt.Errorf("qwp/sf: releasing the logical slot lock failed while closing its descriptor, "+
-			"so whether the operating system still holds it cannot be established [slot=%s]: %w",
-			lock.slotPath(), err))
+	qwpEffectiveLogger(logger).Warn("qwp/sf: logical slot lock released; closing its descriptor reported an error",
+		"slot", lock.slotPath(), "error", err)
+	return nil
 }
 
 // adoptLogicalLock transfers a still-held logical lock to this engine's cleanup
@@ -179,8 +166,8 @@ func (e *qwpSfCursorEngine) logicalLockHeld() bool {
 // releaseAdoptedLogicalLock releases an adopted logical lock, if any, and
 // records that this engine's cleanup reached its release point. A retryable
 // failure keeps the lock, so the cleanup worker's next pass tries again; a
-// failure that consumed the descriptor is terminal and is reported as such by
-// qwpSfReleaseLogicalLock.
+// close that consumed the descriptor released the lock, and
+// qwpSfReleaseLogicalLock logs its error.
 func (e *qwpSfCursorEngine) releaseAdoptedLogicalLock() error {
 	e.logicalLockMu.Lock()
 	lock := e.logicalLock
@@ -190,7 +177,7 @@ func (e *qwpSfCursorEngine) releaseAdoptedLogicalLock() error {
 		return nil
 	}
 	e.logicalLockMu.Unlock()
-	err := qwpSfReleaseLogicalLock(lock)
+	err := qwpSfReleaseLogicalLock(lock, e.engineLogger())
 	e.logicalLockMu.Lock()
 	if !lock.held() {
 		e.logicalLock = nil

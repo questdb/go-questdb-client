@@ -346,21 +346,17 @@ func qwpSfNewCursorEngineWithOptions(sfDir string, segmentSizeBytes, maxTotalByt
 		if pending := qwpSfPendingCleanupEngine(err); pending.adoptLogicalLock(logical) {
 			return nil, err
 		}
-		if releaseErr := qwpSfReleaseLogicalLock(logical); releaseErr != nil {
+		if releaseErr := qwpSfReleaseLogicalLock(logical, options.logger); releaseErr != nil {
 			// Join rather than replace: the original cause, and any quarantine
-			// destination recorded in it, stay matchable. A pre-close failure left
+			// destination recorded in it, stay matchable. A failed release left
 			// the descriptor and flock intact; transfer that obligation to the same
 			// cleanup-control topology used by failed engine builds rather than
 			// returning an unowned os.File and hoping its finalizer releases it.
-			cause := errors.Join(err, releaseErr)
-			if logical.held() {
-				return nil, qwpSfStartLogicalLockCleanup(sfDir, logical, cause)
-			}
-			return nil, cause
+			return nil, qwpSfStartLogicalLockCleanup(sfDir, logical, errors.Join(err, releaseErr))
 		}
 		return nil, err
 	}
-	if releaseErr := qwpSfReleaseLogicalLock(logical); releaseErr != nil {
+	if releaseErr := qwpSfReleaseLogicalLock(logical, options.logger); releaseErr != nil {
 		// The engine is otherwise ready, but its transition protection is
 		// unresolved, so it must not be handed out as a constructed sender.
 		// Start its cleanup and keep both the engine and any still-held lock
@@ -608,8 +604,9 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 				err = errors.Join(ErrSfDurability, fmt.Errorf("recovery awaits resource release: %w", err), cleanupErr)
 			}
 		}
-		// The engine remains available on the error after cleanup finishes.
-		// Its record keeps a file close that already consumed its handle.
+		// The engine remains available on the error after cleanup finishes, so
+		// the caller can read its record: whether cleanup completed and any
+		// internal failure it hit.
 		if err != nil {
 			err = &qwpSfBuildCleanupError{cause: err, engine: held}
 		}

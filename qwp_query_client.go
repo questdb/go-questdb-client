@@ -840,11 +840,10 @@ func (c *qwpQueryClientConfig) effectiveAuthorization() string {
 // A panic during internal cleanup produces [ErrCleanupFailed]. Close reports
 // it immediately, even if other cleanup is still pending. Calling Close again
 // or removing the original fault does not repair this client. Resources that
-// cannot safely be released stay held. For recoverable failures, the client
-// remains responsible for retrying cleanup; a successful retry clears the
-// error it recovered from. Cleanup errors that could not be recovered from
-// remain in the result even after resources are released. Cleanup is not
-// guaranteed to finish.
+// cannot safely be released stay held. An error reported while closing a
+// connection that was closed anyway, such as a TLS close alert that could not
+// reach a peer which already reset the connection, is logged and does not
+// appear in the result. Cleanup is not guaranteed to finish.
 func (c *QwpQueryClient) Close(ctx context.Context) error {
 	c.closeOnce.Do(func() {
 		c.genMu.Lock()

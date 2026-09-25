@@ -286,8 +286,11 @@ type LineSender interface {
 	// count as failures even if resources have been released. Rows held only in
 	// memory are not guaranteed delivery. Close also reports cleanup failures
 	// it already knows about; later failures are logged with their cause and,
-	// where applicable, slot. A nil result can mean resource cleanup continues
-	// in the background: it does not prove the slot's file lock is released.
+	// where applicable, slot. An error reported while releasing a connection or
+	// file that was released anyway, such as a TLS close alert that could not
+	// be sent, is logged and never makes Close fail. A nil result can mean
+	// resource cleanup continues in the background: it does not prove the
+	// slot's file lock is released.
 	// Use [QwpSender.SlotLockReleased] to check a standalone disk-backed sender.
 	// A second Close returns a double-close error and does not repair cleanup.
 	// The client remains responsible for retrying recoverable storage cleanup.

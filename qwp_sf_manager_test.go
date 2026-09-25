@@ -25,6 +25,7 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -32,6 +33,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -781,6 +783,39 @@ func TestQwpSfManagerHoldsBytesForAFailedTrimUnlink(t *testing.T) {
 	assert.Empty(t, e.pendingUnlinks)
 	e.entryMaintenanceSucceeded()
 	assert.NoError(t, e.entryMaintenanceError())
+}
+
+// A segment whose descriptor close reports an error is still released. The
+// manager logs that error, throttled, and counts nothing against maintenance,
+// so a mount where every close fails neither stalls producers nor keeps
+// adding to an error that engine cleanup would later report.
+func TestQwpSfManagerReleasedCloseErrorIsNotAMaintenanceFailure(t *testing.T) {
+	dir := t.TempDir()
+	m, err := qwpSfNewSegmentManager(4096, time.Hour, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	var logs bytes.Buffer
+	m.logger.Store(qwpGuardLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+
+	e := &qwpSfManagerRingEntry{dir: dir}
+	for i := 0; i < 3; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("sf-%016x.sfa", i))
+		s, err := qwpSfCreateSegment(path, int64(i), 4096)
+		require.NoError(t, err)
+		e.pendingUnlinks = append(e.pendingUnlinks, qwpSfPendingUnlink{segment: s, path: path, sizeBytes: 4096})
+	}
+	injected := errors.New("segment close reported an error after consuming the handle")
+	hook := func(*os.File) error { return injected }
+	qwpSfTestAfterFileCloseHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestAfterFileCloseHook.Store(nil) })
+
+	freed, retryErr := m.retryDeferredTrimWork(e)
+	require.NoError(t, retryErr, "a released descriptor is not unfinished work")
+	assert.Equal(t, int64(3*4096), freed)
+	assert.Empty(t, e.pendingUnlinks)
+	require.NoError(t, m.closeServiceResidue(e), "engine cleanup inherits nothing to report")
+	assert.Equal(t, 1, strings.Count(logs.String(), "segment file released; closing it reported an error"),
+		"the diagnostic is throttled")
+	assert.Contains(t, logs.String(), injected.Error())
 }
 
 // TestQwpSfSpareCreationSyncsSlotDirectory pins the durability barrier that

@@ -190,8 +190,8 @@ func (l *qwpSfSlotLock) slotPath() string {
 
 // held reports whether this lock still owns a descriptor. A close that failed
 // before the descriptor was consumed leaves the lock held and its release
-// retryable; a close that failed while consuming it does not, and the OS state
-// is then unknown — see qwpSfReleaseLogicalLock.
+// retryable; a close that failed while consuming it released the lock anyway —
+// see qwpSfReleaseLogicalLock.
 func (l *qwpSfSlotLock) held() bool {
 	return l != nil && l.file != nil
 }

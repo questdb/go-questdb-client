@@ -90,7 +90,7 @@ func (e *qwpSfCursorEngine) keepRejectedTransport(t *qwpTransport) {
 	for _, old := range e.rejectedTransports {
 		select {
 		case <-old.closeDone:
-			e.rejectedTransportErr = errors.Join(e.rejectedTransportErr, qwpTransportReleaseError(old.closeErr))
+			e.rejectedTransportErr = qwpAppendCloseError(e.rejectedTransportErr, qwpTransportReleaseError(old.closeErr))
 		default:
 			kept = append(kept, old)
 		}

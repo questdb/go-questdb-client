@@ -77,7 +77,7 @@ func (p *qwpQueryPool) teardownWorker(w *qwpQueryWorker, before func()) {
 		return err
 	}()
 	p.withLock([]*qwpQueryWorker{w}, func() {
-		p.closeErr = errors.Join(p.closeErr, err)
+		p.closeErr = qwpAppendCloseError(p.closeErr, err)
 		if failed {
 			p.failLocked(err, []*qwpQueryWorker{w})
 		} else {

@@ -479,10 +479,13 @@ func (db *QuestDB) BorrowQuery(ctx context.Context) (*Query, error) {
 // is not a permanent failure. Once shutdown finishes, Close returns its saved
 // result immediately, even with an expired ctx. A successful cleanup retry
 // clears the error it recovered from. Errors from queueing or delivering rows
-// (including the acknowledgement timeout), cleanup errors that could not be
-// recovered from, and internal failures still appear in the result after
-// resources are released. Finished cleanup therefore need not mean nil.
-// Once Close returns nil, later calls also return nil.
+// (including the acknowledgement timeout) and internal failures still appear
+// in the result after resources are released. Finished cleanup therefore need
+// not mean nil. An error reported while releasing a resource that was released
+// anyway, such as a TLS close alert that could not reach a peer which already
+// reset the connection, or a close(2) error on a file descriptor, is logged
+// and does not appear in the result. Once Close returns nil, later calls also
+// return nil.
 func (db *QuestDB) Close(ctx context.Context) error {
 	db.closeOnce.Do(func() {
 		db.senderPool.markClosing()

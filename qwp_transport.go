@@ -249,7 +249,10 @@ type qwpTransport struct {
 	// so close() never races the lock-free reader/dispatcher.
 	closeOnce sync.Once
 	closeDone chan struct{}
-	closeErr  error
+	// closeErr is non-nil only when the release failed internally
+	// (ErrCleanupFailed). An error that CloseNow reports after closing the
+	// socket anyway is logged, not kept.
+	closeErr error
 }
 
 // teeConn wraps a net.Conn, copying all Write calls to a side writer.
@@ -814,12 +817,20 @@ func (t *qwpTransport) closeContext(ctx context.Context) error {
 	t.closeOnce.Do(func() {
 		t.closeDone = make(chan struct{})
 		go func() {
+			// CloseNow and the dump pipe's Close release the connection even
+			// when they return an error. For wss, tls.Conn.Close reports a
+			// close_notify that could not reach a peer which already reset
+			// the connection. Such an error does not mean anything is still
+			// held, so it is logged rather than kept in closeErr.
+			var releaseErr error
 			defer func() {
 				close(t.closeDone)
 				// A failed constructor may have no later observer of this owner.
 				// Logging is outside the resource-completion barrier.
-				if t.closeErr != nil && !errors.Is(t.closeErr, net.ErrClosed) {
+				if t.closeErr != nil {
 					qwpEffectiveLogger(t.logger).Error("qwp: transport release failed", "error", t.closeErr)
+				} else if releaseErr != nil && !errors.Is(releaseErr, net.ErrClosed) {
+					qwpEffectiveLogger(t.logger).Debug("qwp: transport closed; close reported an error", "error", releaseErr)
 				}
 			}()
 			defer func() {
@@ -835,12 +846,12 @@ func (t *qwpTransport) closeContext(ctx context.Context) error {
 				(*hook)(t)
 			}
 			if t.conn != nil {
-				t.closeErr = t.conn.CloseNow()
+				releaseErr = t.conn.CloseNow()
 				if t.dumpConn != nil {
 					<-t.dumpConn.done
 				}
 			} else {
-				t.closeErr = t.dumpConn.Close()
+				releaseErr = t.dumpConn.Close()
 			}
 		}()
 	})

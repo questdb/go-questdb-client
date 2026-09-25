@@ -82,10 +82,13 @@ func TestQwpPoolHarvestsLateCompletedEngineError(t *testing.T) {
 	<-e.manager.segmentManagerStop()
 	release := make(chan struct{})
 	finish := func() { <-release }
-	injected := errors.New("late completed cleanup error")
+	// A delivery failure stays in the engine's saved result. A close error on
+	// a file whose descriptor was released anyway is only logged.
+	delivery := errors.New("late completed delivery error")
+	closeErr := errors.New("manifest close reported an error after release")
 	fileClose := func(f *os.File) error {
 		if filepath.Base(f.Name()) == qwpSfManifestFileName {
-			return injected
+			return closeErr
 		}
 		return nil
 	}
@@ -105,7 +108,7 @@ func TestQwpPoolHarvestsLateCompletedEngineError(t *testing.T) {
 		qwpSfTestAfterFileCloseHook.Store(nil)
 		qwpSfManagerCloseGrace.store(old)
 	})
-	require.NoError(t, e.engineClose())
+	require.NoError(t, e.engineCloseWithCause(delivery))
 	cause := errors.New("qwp/sf: construction cleanup pending")
 	p := closedSfPoolWithRetiredSlot(&qwpSfBuildCleanupError{cause: cause, engine: e})
 	pending := p.currentCloseResult()
@@ -114,9 +117,10 @@ func TestQwpPoolHarvestsLateCompletedEngineError(t *testing.T) {
 	close(release)
 	waitQwpSfEngineCleanup(t, e)
 	done := p.currentCloseResult()
-	require.ErrorIs(t, done, injected)
+	require.ErrorIs(t, done, delivery)
+	require.NotErrorIs(t, done, closeErr, "a close error on a released file is logged, not reported")
 	require.NotErrorIs(t, done, cause, "finished cleanup keeps the engine result only")
-	require.ErrorIs(t, p.currentCloseResult(), injected, "removing the retired slot must not lose its saved error")
+	require.ErrorIs(t, p.currentCloseResult(), delivery, "removing the retired slot must not lose its saved error")
 }
 
 func TestQwpPoolDropsRecoveredConstructionCause(t *testing.T) {
@@ -641,8 +645,10 @@ func TestQwpFacadeTracksOrphanEngineAfterDrainerExit(t *testing.T) {
 	}
 	require.ErrorIs(t, err, qwpSfErrLockBusy)
 	once.Do(func() { close(release) })
-	require.ErrorIs(t, db.Close(context.Background()), injected)
-	require.ErrorIs(t, db.Close(cancelledCleanupWait()), injected)
+	// The orphan engine's manifest descriptor was released despite the
+	// injected close error, so nothing is left to report.
+	require.NoError(t, db.Close(context.Background()))
+	require.NoError(t, db.Close(cancelledCleanupWait()))
 	pool.wg.Wait()
 }
 

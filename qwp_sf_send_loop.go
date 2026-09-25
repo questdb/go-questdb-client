@@ -724,8 +724,9 @@ func (l *qwpSfSendLoop) sendLoopClose() error {
 	return l.checkErrorOrNil()
 }
 
-// Save connection-close errors without changing the first sending error
-// reported to the caller. Keep earlier close errors when a later close fails.
+// Save connection-close failures without changing the first sending error
+// reported to the caller. A transport's close result is non-nil only when its
+// release failed internally; see qwpTransport.closeErr.
 func (l *qwpSfSendLoop) recordTransportCloseError(err error) {
 	err = qwpTransportReleaseError(err)
 	if err == nil {

@@ -281,8 +281,12 @@ saved result. See the [cleanup error Go docs](qwp_errors.go).
 
 For recoverable storage failures, the client retries cleanup with delays between
 attempts. Success clears the error it recovered from. It does not clear errors
-from queueing or delivering rows, or cleanup errors that could not be recovered
-from. Releasing all resources therefore need not make Close return nil. Blocked
+from queueing or delivering rows, so releasing all resources need not make Close
+return nil. An error reported while releasing something that was released
+anyway, such as a TLS close alert that could not reach a peer which already
+reset the connection, or a `close(2)` error on a file descriptor, is logged. It
+does not mean anything is still held, so it never makes Close fail, and a
+finished cleanup leaves it out of the result. Blocked
 readers, unavailable storage, or handles that have not been returned can prevent
 cleanup from finishing until the process exits.
 

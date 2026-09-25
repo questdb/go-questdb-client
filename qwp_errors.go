@@ -45,8 +45,9 @@ import (
 // [ErrSfCleanupPending]; query-only cleanup does not. An earlier timeout or
 // pending result does not become a permanent failure. A successful cleanup
 // retry clears the error it recovered from, but not errors from queueing or
-// delivering rows, or cleanup errors that could not be recovered from, such
-// as a file-close error that cannot safely be retried.
+// delivering rows. An error reported while releasing a resource that was
+// released anyway, such as a close(2) error on a file descriptor or a TLS
+// close alert that could not be sent, is logged and never makes Close fail.
 var ErrCleanupPending = errors.New("qwp: resource cleanup still pending")
 
 // ErrCleanupFailed means cleanup cannot safely continue after an internal QWP

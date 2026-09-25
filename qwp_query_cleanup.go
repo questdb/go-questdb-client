@@ -99,7 +99,7 @@ func (c *QwpQueryClient) keepGeneration(g *qwpConnectResult) {
 	for _, old := range c.generations {
 		select {
 		case <-old.closeDone:
-			c.generationErr = errors.Join(c.generationErr, old.closeErr)
+			c.generationErr = qwpAppendCloseError(c.generationErr, old.closeErr)
 		default:
 			kept = append(kept, old)
 		}
@@ -121,7 +121,7 @@ func (c *QwpQueryClient) retireBoundGeneration() {
 func (c *QwpQueryClient) recordCloseError(err error) {
 	c.closeMu.Lock()
 	defer c.closeMu.Unlock()
-	c.closeErr = errors.Join(c.closeErr, err)
+	c.closeErr = qwpAppendCloseError(c.closeErr, err)
 	if errors.Is(err, ErrCleanupFailed) {
 		select {
 		case <-c.closeFailed:

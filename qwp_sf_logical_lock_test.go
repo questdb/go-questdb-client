@@ -25,8 +25,10 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -160,10 +162,9 @@ func TestQwpSfLogicalLockIsHeldAcrossProcesses(t *testing.T) {
 
 // TestQwpSfLogicalLockReleaseOutcomes pins the two release classes apart. A
 // failure that left the descriptor intact keeps the lock held, so exclusion
-// survives and a retry is legitimate. A failure that consumed the descriptor
-// says nothing about what the operating system did, so it is terminal: it is
-// reported as a cleanup failure and the lock value is retained rather than
-// closed again.
+// survives and a retry is legitimate. A close that consumed the descriptor
+// released the lock with it: its error is logged, the release counts as done,
+// and the descriptor is never closed again.
 func TestQwpSfLogicalLockReleaseOutcomes(t *testing.T) {
 	t.Run("retryable", func(t *testing.T) {
 		root := t.TempDir()
@@ -173,7 +174,7 @@ func TestQwpSfLogicalLockReleaseOutcomes(t *testing.T) {
 		fault := errors.New("release refused")
 		hook := func(*qwpSfSlotLock) error { return fault }
 		qwpSfTestBeforeLogicalLockReleaseHook.Store(&hook)
-		releaseErr := qwpSfReleaseLogicalLock(lock)
+		releaseErr := qwpSfReleaseLogicalLock(lock, nil)
 		qwpSfTestBeforeLogicalLockReleaseHook.Store(nil)
 
 		require.ErrorIs(t, releaseErr, fault)
@@ -185,39 +186,38 @@ func TestQwpSfLogicalLockReleaseOutcomes(t *testing.T) {
 		_, busy := qwpSfAcquireLogicalSlotLock(filepath.Join(root, "sender-a"))
 		require.ErrorIs(t, busy, qwpSfErrLockBusy)
 
-		require.NoError(t, qwpSfReleaseLogicalLock(lock))
+		require.NoError(t, qwpSfReleaseLogicalLock(lock, nil))
 		assert.False(t, lock.held())
 		again, err := qwpSfAcquireLogicalSlotLock(filepath.Join(root, "sender-a"))
 		require.NoError(t, err)
-		require.NoError(t, qwpSfReleaseLogicalLock(again))
+		require.NoError(t, qwpSfReleaseLogicalLock(again, nil))
 	})
 
-	t.Run("terminal", func(t *testing.T) {
+	t.Run("consumed", func(t *testing.T) {
 		root := t.TempDir()
 		lock, err := qwpSfAcquireLogicalSlotLock(filepath.Join(root, "sender-a"))
 		require.NoError(t, err)
 		// Model a release operation that consumed the descriptor but still
-		// returned an error. It clears the pointer itself, so no code retries a
-		// numeric descriptor whose ownership is already unknown.
+		// returned an error. It clears the pointer itself, as File.Close does.
 		fault := errors.New("release consumed descriptor")
 		hook := func(lock *qwpSfSlotLock) error {
 			closeErr := lock.file.Close()
 			lock.file = nil
 			return errors.Join(closeErr, fault)
 		}
+		var logs bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logs, nil))
 		qwpSfTestBeforeLogicalLockReleaseHook.Store(&hook)
-		releaseErr := qwpSfReleaseLogicalLock(lock)
+		releaseErr := qwpSfReleaseLogicalLock(lock, logger)
 		qwpSfTestBeforeLogicalLockReleaseHook.Store(nil)
-		require.Error(t, releaseErr)
-		require.ErrorIs(t, releaseErr, fault)
-		require.ErrorIs(t, releaseErr, ErrCleanupFailed)
-		assert.Contains(t, releaseErr.Error(), "cannot be established")
+		require.NoError(t, releaseErr, "the descriptor is gone, so the lock is released")
 		assert.False(t, lock.held(), "a consumed descriptor must not be closed again")
+		assert.Contains(t, logs.String(), "logical slot lock released; closing its descriptor reported an error")
+		assert.Contains(t, logs.String(), fault.Error())
 
-		qwpSfRetainedLogicalLocks.mu.Lock()
-		retained := len(qwpSfRetainedLogicalLocks.locks)
-		qwpSfRetainedLogicalLocks.mu.Unlock()
-		assert.Positive(t, retained, "a lock in an unknown state stays reachable")
+		again, err := qwpSfAcquireLogicalSlotLock(filepath.Join(root, "sender-a"))
+		require.NoError(t, err, "the operating system released the lock with the descriptor")
+		require.NoError(t, qwpSfReleaseLogicalLock(again, nil))
 	})
 }
 
@@ -294,15 +294,15 @@ func TestQwpSfFailedConstructionRetainsAStillHeldLogicalLock(t *testing.T) {
 	require.NoError(t, buildErr.cleanupResult())
 	again, acquireErr := qwpSfAcquireLogicalSlotLock(slot)
 	require.NoError(t, acquireErr)
-	require.NoError(t, qwpSfReleaseLogicalLock(again))
+	require.NoError(t, qwpSfReleaseLogicalLock(again, nil))
 }
 
-// TestQwpSfFailedConstructionWithConsumedLogicalDescriptorIsTerminal pins the
+// TestQwpSfFailedConstructionWithConsumedLogicalDescriptorReleasesIt pins the
 // other release outcome after an earlier construction error. The descriptor is
 // consumed exactly once by the injected release operation; cleanup must not
-// retry it, the original cause remains visible, and no exclusion is claimed
-// once the OS has released the lock.
-func TestQwpSfFailedConstructionWithConsumedLogicalDescriptorIsTerminal(t *testing.T) {
+// retry it, the original cause remains visible, the release error is only
+// logged, and no exclusion is claimed once the OS has released the lock.
+func TestQwpSfFailedConstructionWithConsumedLogicalDescriptorReleasesIt(t *testing.T) {
 	root := t.TempDir()
 	slot := filepath.Join(root, "quarantined")
 	require.NoError(t, os.MkdirAll(filepath.Join(slot, "legacy-copy"), 0o755))
@@ -321,8 +321,8 @@ func TestQwpSfFailedConstructionWithConsumedLogicalDescriptorIsTerminal(t *testi
 	qwpSfTestBeforeLogicalLockReleaseHook.Store(nil)
 	require.Nil(t, engine)
 	require.ErrorIs(t, err, qwpSfErrLegacyQuarantineContainer)
-	require.ErrorIs(t, err, fault)
-	require.ErrorIs(t, err, ErrCleanupFailed)
+	require.NotErrorIs(t, err, fault, "an error from a close that released the lock is logged, not returned")
+	require.NotErrorIs(t, err, ErrCleanupFailed)
 	var buildErr *qwpSfBuildCleanupError
 	assert.False(t, errors.As(err, &buildErr),
 		"a consumed descriptor has no retryable release work to transfer")
@@ -330,7 +330,7 @@ func TestQwpSfFailedConstructionWithConsumedLogicalDescriptorIsTerminal(t *testi
 	again, acquireErr := qwpSfAcquireLogicalSlotLock(slot)
 	require.NoError(t, acquireErr,
 		"the test observed a consumed descriptor, so continued exclusion must not be claimed")
-	require.NoError(t, qwpSfReleaseLogicalLock(again))
+	require.NoError(t, qwpSfReleaseLogicalLock(again, nil))
 }
 
 // TestQwpSfRetiredSlotKeepsReusableLogicalLockFiles pins the safe lock-file
@@ -354,7 +354,7 @@ func TestQwpSfRetiredSlotKeepsReusableLogicalLockFiles(t *testing.T) {
 	require.NoError(t, err)
 	again, err := qwpSfAcquireLogicalSlotLock(slot)
 	require.NoError(t, err)
-	require.NoError(t, qwpSfReleaseLogicalLock(again))
+	require.NoError(t, qwpSfReleaseLogicalLock(again, nil))
 	after, err := os.Stat(lockPath)
 	require.NoError(t, err)
 	assert.True(t, os.SameFile(identity, after), "the next owner must flock the same inode")
