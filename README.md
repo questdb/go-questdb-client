@@ -747,6 +747,13 @@ it is not evidence that the slot is corrupt.
 This is not a general salvage policy: missing required segments or gaps in the
 saved queue still cause recovery to refuse the slot, as described below.
 
+One missing segment cannot be detected. When the saved head and active
+boundaries in `sf-manifest.bin` are equal and the active segment is gone, the
+directory looks exactly like a fully delivered close that crashed while
+deleting its files, so recovery starts the slot empty. A segment deleted by
+hand in that state takes its unsent rows with it, and nothing reports them.
+Remove segment files only together with the whole slot directory.
+
 #### Quarantined slots
 
 If a slot's on-disk state proves inconsistent, the sender does not delete it and

@@ -252,6 +252,12 @@ func qwpSfBuildRecoveryPlan(
 			return p.failClosed(qwpSfFailClosed(
 				"sf-manifest.bin references durable data but no segment file carries frames"))
 		}
+		// head == active with no readable segment and no corrupt file that
+		// may hold frames is an empty slot. A drained close commits those
+		// boundaries before its first unlink, so a crash during its sweep
+		// leaves this directory. Deleting the active segment by hand leaves
+		// the same bytes, so recovery accepts that directory as empty,
+		// including when the missing file still held rows.
 		p.collapsed = true
 		p.removeManifest = manifest != nil
 		return p
@@ -344,6 +350,12 @@ func (p *qwpSfRecoveryPlan) planCommittedChain(
 		}
 	}
 	if p.activeSeg == nil {
+		// The drained close unlinks the active segment before the spare.
+		// No frames and no file at the active base is that crash, with a
+		// frameless spare still in the directory, so recovery accepts it
+		// as empty. A corrupt file that may hold frames blocks this: it may
+		// be the missing active segment. A segment removed by hand leaves
+		// the same bytes.
 		if len(p.chain) == 0 && head == active && len(framefulCorrupt) == 0 {
 			p.collapsed = true
 			p.removeManifest = true
