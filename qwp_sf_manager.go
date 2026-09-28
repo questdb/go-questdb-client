@@ -320,8 +320,14 @@ func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSeg
 		}
 		lastQuarantineReconcile = m.now()
 		// Move the generation counter past existing files before the worker can
-		// see this ring. This prevents the worker from reusing a file name.
-		if maxGen, found := qwpSfScanMaxGeneration(dir); found {
+		// see this ring. This prevents the worker from reusing a file name. A
+		// listing that fails leaves the taken names unknown, so registration
+		// fails with a retriable storage error instead of guessing.
+		maxGen, found, err := qwpSfScanMaxGeneration(dir)
+		if err != nil {
+			return nil, qwpSfDurabilityError("scan segment generations during manager registration", dir, err)
+		}
+		if found {
 			minNext := maxGen + 1
 			for {
 				cur := m.fileGeneration.Load()
@@ -367,18 +373,24 @@ func (m *qwpSfSegmentManager) wakeWorker() {
 	}
 }
 
+// qwpSfReadGenerationDir lists the slot for qwpSfScanMaxGeneration. Tests
+// swap it to fail that listing without failing the scans that run before it.
+var qwpSfReadGenerationDir = qwpSfSwappable(os.ReadDir)
+
 // qwpSfScanMaxGeneration returns the highest hex-encoded generation
-// across sf-<gen>.sfa files in dir. found is false when dir is
-// absent/unreadable or holds no matching files; maxGen is then
-// unspecified and the caller must not constrain fileGeneration. Skips
-// files that don't match the pattern (e.g. the legacy sf-initial.sfa).
-func qwpSfScanMaxGeneration(dir string) (maxGen uint64, found bool) {
-	if _, err := os.Stat(dir); err != nil {
-		return 0, false
-	}
-	entries, err := os.ReadDir(dir)
+// across sf-<gen>.sfa files in dir. found is false when dir is absent or
+// holds no matching files; maxGen is then unspecified and the caller must
+// not constrain fileGeneration. Any other failure to list dir is returned:
+// the taken names are then unknown, and a spare created under a guessed
+// name could land on a live segment. Skips files that don't match the
+// pattern (e.g. the legacy sf-initial.sfa).
+func qwpSfScanMaxGeneration(dir string) (maxGen uint64, found bool, err error) {
+	entries, err := qwpSfReadGenerationDir.load()(dir)
 	if err != nil {
-		return 0, false
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
 	}
 	for _, e := range entries {
 		name := e.Name()
@@ -398,7 +410,7 @@ func qwpSfScanMaxGeneration(dir string) (maxGen uint64, found bool) {
 			found = true
 		}
 	}
-	return maxGen, found
+	return maxGen, found, nil
 }
 
 // nextSparePath returns the next available <dir>/sf-<gen:016x>.sfa path.
@@ -604,7 +616,7 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 				e.spareInProgress = spare
 			} else {
 				path = m.nextSparePath(e.dir)
-				spare, err = qwpSfCreateSegment(path, e.ring.nextSeqHint(), m.segmentSizeBytes)
+				spare, err = qwpSfCreateSpareSegment(path, e.ring.nextSeqHint(), m.segmentSizeBytes)
 				e.spareInProgress = spare
 				if err == nil {
 					if hook := qwpSfTestAfterSpareCreateHook.Load(); hook != nil {
@@ -682,7 +694,15 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 						return
 					}
 				} else {
-					spareErr = errors.Join(err, m.cleanupUninstalledSpare(e, spare, path))
+					var notCreated *qwpSfSegmentNotCreatedError
+					if errors.As(err, &notCreated) {
+						// Nothing was created at path. A file already there, for
+						// example one a wrong generation collided with, belongs
+						// to someone else and must not be removed.
+						spareErr = err
+					} else {
+						spareErr = errors.Join(err, m.cleanupUninstalledSpare(e, spare, path))
+					}
 				}
 			}
 			e.spareInProgress = nil // the reference is now saved in the ring or pendingUnlinks

@@ -176,30 +176,59 @@ var qwpSfTestSegmentCreateHook atomic.Pointer[func(path string)]
 // Pre-allocation goes through qwpSfAllocate, which owns the
 // cross-platform "extend + reserve real disk blocks + never shrinks"
 // contract (see qwp_sf_allocate.go). For this call path the file is
-// freshly O_TRUNC'd so currentSize == 0 and qwpSfAllocate reserves
+// new or truncated, so currentSize == 0 and qwpSfAllocate reserves
 // blocks for [0, sizeBytes) and advances EOF to sizeBytes in one
 // step. Without the reservation a later store into the mmap'd region
 // after the filesystem fills up would deliver SIGBUS (POSIX) /
 // STATUS_IN_PAGE_ERROR (Windows), tearing down the process —
 // sf-client.md §6 marks block reservation a core invariant of the
 // create path.
-func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (result *qwpSfSegment, err error) {
+//
+// qwpSfCreateSegment replaces any file already at path. The engine uses it
+// only for sf-initial.sfa on a fresh start, where recovery has already
+// found nothing in the slot worth keeping.
+func qwpSfCreateSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, error) {
+	return qwpSfCreateSegmentFile(path, baseSeq, sizeBytes, false)
+}
+
+// qwpSfCreateSpareSegment creates a spare under a generated name and never
+// opens an existing file. The name comes from the manager's generation
+// counter, which registration moves past every name on disk; if that ever
+// goes wrong, the create fails with a retriable storage error instead of
+// truncating a live segment, and the manager's next attempt uses the next
+// generation.
+func qwpSfCreateSpareSegment(path string, baseSeq, sizeBytes int64) (*qwpSfSegment, error) {
+	return qwpSfCreateSegmentFile(path, baseSeq, sizeBytes, true)
+}
+
+// qwpSfSegmentNotCreatedError reports that creating a segment failed at open,
+// before this call made any file. Whatever is at the path, if anything, is not
+// the caller's to remove.
+type qwpSfSegmentNotCreatedError struct{ err error }
+
+func (e *qwpSfSegmentNotCreatedError) Error() string { return e.err.Error() }
+func (e *qwpSfSegmentNotCreatedError) Unwrap() error { return e.err }
+
+func qwpSfCreateSegmentFile(path string, baseSeq, sizeBytes int64, exclusive bool) (result *qwpSfSegment, err error) {
 	if sizeBytes < qwpSfHeaderSize+qwpSfFrameHeaderSize+1 {
 		return nil, fmt.Errorf("qwp/sf: sizeBytes too small for header + one minimal frame: %d", sizeBytes)
 	}
 	if hook := qwpSfTestSegmentCreateHook.Load(); hook != nil {
 		(*hook)(path)
 	}
-	// O_TRUNC discards any prior content at the same path — segment
-	// files are write-once-then-fixed, so reusing a stale file is
-	// always an error in the recovery code path; here, on a fresh
-	// create, truncation is the documented behavior. The post-open
-	// EOF is 0, which is the precondition qwpSfAllocate's macOS
-	// reservation (F_PEOFPOSMODE — allocates the requested length
-	// immediately beyond EOF) needs in order to cover [0, sizeBytes).
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	// Either flag leaves a file at EOF 0: O_EXCL creates a new one, and
+	// O_TRUNC discards the content of one recovery chose not to keep. EOF 0
+	// is the precondition qwpSfAllocate's macOS reservation (F_PEOFPOSMODE —
+	// allocates the requested length immediately beyond EOF) needs in order
+	// to cover [0, sizeBytes). A failed O_EXCL open returns before the
+	// cleanup below is armed, so it never removes the file that was there.
+	flags := os.O_RDWR | os.O_CREATE | os.O_TRUNC
+	if exclusive {
+		flags = os.O_RDWR | os.O_CREATE | os.O_EXCL
+	}
+	f, err := os.OpenFile(path, flags, 0o644)
 	if err != nil {
-		return nil, qwpSfDurabilityError("create segment", path, err)
+		return nil, &qwpSfSegmentNotCreatedError{err: qwpSfDurabilityError("create segment", path, err)}
 	}
 	held := &qwpSfSegment{file: f, path: path}
 	resources := &qwpSfAcquiredResources{segments: []*qwpSfSegment{held}}

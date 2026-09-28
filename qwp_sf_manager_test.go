@@ -331,8 +331,25 @@ func TestQwpSfManagerRegisterAfterCloseRejects(t *testing.T) {
 
 func TestQwpSfManagerScanMaxGenerationOnEmptyDir(t *testing.T) {
 	dir := t.TempDir()
-	_, found := qwpSfScanMaxGeneration(dir)
+	_, found, err := qwpSfScanMaxGeneration(dir)
+	require.NoError(t, err)
 	// No segments → not found; caller leaves fileGeneration unconstrained.
+	assert.False(t, found)
+
+	_, found, err = qwpSfScanMaxGeneration(filepath.Join(dir, "absent"))
+	require.NoError(t, err, "a slot directory that does not exist yet has no names to avoid")
+	assert.False(t, found)
+}
+
+func TestQwpSfManagerScanMaxGenerationReportsListingFailure(t *testing.T) {
+	injected := errors.New("injected listing failure")
+	failing := func(string) ([]os.DirEntry, error) { return nil, injected }
+	previous := qwpSfReadGenerationDir.load()
+	qwpSfReadGenerationDir.store(failing)
+	t.Cleanup(func() { qwpSfReadGenerationDir.store(previous) })
+
+	_, found, err := qwpSfScanMaxGeneration(t.TempDir())
+	require.ErrorIs(t, err, injected, "the taken names are unknown, so the caller must not pick one")
 	assert.False(t, found)
 }
 
@@ -346,9 +363,106 @@ func TestQwpSfManagerScanMaxGenerationFindsHighest(t *testing.T) {
 	} {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte{}, 0o644))
 	}
-	v, found := qwpSfScanMaxGeneration(dir)
+	v, found, err := qwpSfScanMaxGeneration(dir)
+	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, uint64(0xc), v)
+}
+
+func TestQwpSfCreateSpareSegmentNeverOpensAnExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sf-0000000000000000.sfa")
+	live := bytes.Repeat([]byte{0xa5}, 4096)
+	require.NoError(t, os.WriteFile(path, live, 0o644))
+
+	s, err := qwpSfCreateSpareSegment(path, 0, 4096)
+	require.Nil(t, s)
+	require.ErrorIs(t, err, os.ErrExist)
+	require.ErrorIs(t, err, ErrSfDurability, "a name collision is a retriable storage error")
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, live, got, "the existing file is neither truncated nor removed")
+}
+
+// A spare name that collides with a file on disk costs one failed attempt,
+// never that file. The collision is forced here by winding the generation
+// counter back; registration normally moves it past every name on disk.
+func TestQwpSfManagerSpareNameCollisionKeepsTheExistingFile(t *testing.T) {
+	const segSize int64 = 4096
+	dir := t.TempDir()
+	mgr, err := qwpSfNewSegmentManager(segSize, time.Hour, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	first, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segSize)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	live := filepath.Join(dir, "sf-0000000000000007.sfa")
+	content := bytes.Repeat([]byte{0xa5}, int(segSize))
+	require.NoError(t, os.WriteFile(live, content, 0o644))
+	entry, err := mgr.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(8), mgr.fileGeneration.Load(), "registration moves the counter past every name on disk")
+
+	mgr.fileGeneration.Store(7)
+	mgr.serviceRing(entry)
+	got, err := os.ReadFile(live)
+	require.NoError(t, err, "the colliding file must not be removed")
+	require.Equal(t, content, got, "the colliding file must not be truncated")
+	require.True(t, ring.needsHotSpare(), "no spare is installed over the collision")
+	require.True(t, entry.maintenanceFailureActive, "the collision is reported as a maintenance failure")
+
+	mgr.serviceRing(entry)
+	require.False(t, ring.needsHotSpare(), "the next pass uses the next generation")
+	require.FileExists(t, filepath.Join(dir, "sf-0000000000000008.sfa"))
+	got, err = os.ReadFile(live)
+	require.NoError(t, err)
+	require.Equal(t, content, got)
+}
+
+// A slot whose recovered ring includes the first spare it ever minted,
+// sf-0000000000000000.sfa, is the one a zero generation counter would
+// collide with. When registration cannot list the slot, construction must
+// fail and leave that segment untouched; a later open recovers its frames.
+func TestQwpSfEngineRegistrationListingFailureKeepsRecoveredSegments(t *testing.T) {
+	dir := t.TempDir()
+	first, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	payload := bytes.Repeat([]byte{0x5a}, 1000)
+	var last int64
+	for i := 0; i < 6; i++ {
+		last, err = first.engineAppendBlocking(context.Background(), payload)
+		require.NoError(t, err)
+	}
+	require.NoError(t, first.engineClose())
+	waitQwpSfEngineCleanup(t, first)
+
+	firstSpare := filepath.Join(dir, "sf-0000000000000000.sfa")
+	before, err := os.ReadFile(firstSpare)
+	require.NoError(t, err, "the ring rotated into the first minted spare")
+
+	injected := errors.New("injected listing failure")
+	failing := func(string) ([]os.DirEntry, error) { return nil, injected }
+	previous := qwpSfReadGenerationDir.load()
+	qwpSfReadGenerationDir.store(failing)
+	t.Cleanup(func() { qwpSfReadGenerationDir.store(previous) })
+
+	second, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.Nil(t, second)
+	require.ErrorIs(t, err, injected)
+	require.ErrorIs(t, err, ErrSfDurability, "an unreadable slot listing is retriable, not a verdict")
+	var held *qwpSfBuildCleanupError
+	if errors.As(err, &held) {
+		waitQwpSfEngineCleanup(t, held.engine)
+	}
+	after, err := os.ReadFile(firstSpare)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "the recovered segment is neither truncated nor replaced")
+
+	qwpSfReadGenerationDir.store(previous)
+	third, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, last, third.ring.segmentRingPublishedFsn(), "every published frame was recovered")
+	require.NoError(t, third.engineClose())
+	waitQwpSfEngineCleanup(t, third)
 }
 
 func TestQwpSfManagerNextSparePathIncrements(t *testing.T) {
