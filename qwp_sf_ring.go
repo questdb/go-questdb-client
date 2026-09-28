@@ -54,6 +54,10 @@ var qwpSfErrPayloadTooLarge = errors.New("qwp/sf: payload too large for segment"
 //lint:ignore ST1012 prefix kept for grouping with other qwpSf* errors
 var qwpSfErrRingClosed = errors.New("qwp/sf: ring closed")
 
+// qwpSfSyncSealedSegment makes a segment's published frames durable when a
+// rotation seals it. Benchmarks swap it to measure what the barrier costs.
+var qwpSfSyncSealedSegment = qwpSfSwappable(func(s *qwpSfSegment) error { return s.syncPublished() })
+
 // qwpSfSegmentRing is a chain of qwpSfSegments presented to the user
 // thread as one logical append-only log keyed by frame sequence
 // number (FSN). Owns segment lifecycle: rotation when the active
@@ -272,22 +276,33 @@ func (r *qwpSfSegmentRing) appendOrFsn(payload []byte) int64 {
 			// than silent corruption.
 			return qwpSfPayloadTooLarge
 		}
-		// The rotation's two durability barriers -- this header fsync and the
-		// manifest fsync below -- run in this order, on the producer's flush,
-		// and cannot be overlapped. The header carries the base sequence the
-		// manifest is about to commit as the active one, so a crash that lands
-		// the manifest record without the header leaves the slot with no
-		// segment at its committed active base, which recovery refuses: the
-		// whole slot is quarantined over a lost write. The reverse gap costs
+		// The rotation's three durability barriers -- the sealed segment's
+		// frames, this header fsync, and the manifest fsync below -- run in
+		// this order, on the producer's flush, and cannot be overlapped.
+		//
+		// The sealed segment's frames go first. The manifest is about to
+		// record that the chain runs contiguously up to actualBase; if it
+		// reached the disk while some of those frames did not, an OS crash
+		// would leave a gap below the committed active base, and recovery
+		// refuses a gap, setting the whole slot aside with every frame the
+		// disk did keep. The segment manager starts writing the active
+		// segment back while it fills (writebackActive), so this usually
+		// waits only for the last part.
+		//
+		// The header carries the base sequence the manifest is about to commit
+		// as the active one, so a crash that lands the manifest record without
+		// the header leaves the slot with no segment at its committed active
+		// base, which recovery refuses in the same way. The reverse gap costs
 		// nothing -- the manifest still names the previous active, and the new
 		// empty segment is discarded as a stray. The ordering these barriers
 		// buy is scoped to what qwpSfFsync promises: a crashed or restarted
 		// process, and on Linux a kernel crash. On darwin fsync(2) does not
 		// force the drive's own write cache (see qwp_sf_fsync_darwin.go), so a
-		// power cut can still reorder them. Together they are what
-		// BenchmarkQwpSfRotationBarriers measures, and what puts rotation at
-		// the tail of BenchmarkQwpSfPublish's latency distribution: about 47us
-		// on an APFS SSD, on however many flushes rotate.
+		// power cut can still reorder them.
+		if syncErr := qwpSfSyncSealedSegment.load()(active); syncErr != nil {
+			r.rotationErr.Store(&qwpSfRingError{err: syncErr})
+			return qwpSfRotationFailed
+		}
 		if syncErr := spare.syncHeader(); syncErr != nil {
 			r.rotationErr.Store(&qwpSfRingError{err: syncErr})
 			return qwpSfRotationFailed

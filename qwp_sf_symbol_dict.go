@@ -69,17 +69,18 @@ var errQwpSfSymbolDictUnusable = errors.New("qwp/sf: unusable symbol dictionary"
 // Symbol id i is the i-th entry (ids are dense from 0), so no id is stored.
 //
 // Durability: the producer appends the symbols a frame introduces BEFORE that
-// frame is published to the ring, but does NOT fsync — matching the rest of
-// store-and-forward (page-cache, not disk, durable). This ordering suffices for
+// frame is published to the ring, without an fsync. That ordering suffices for
 // a process crash (the page cache survives, so the dictionary stays a superset
-// of every recoverable frame's references). It does NOT survive a host/power
-// crash that leaves the dictionary out of step with its frames. Each append is
-// one CRC-32C chunk, in the same format the Java client writes: recovery keeps
-// only the run of chunks whose checksums match, then reads the surviving frames
-// to rebuild whatever ids came after that and writes them back. If a hole is
-// still left, recovery fails before connecting (and the send loop checks again
-// before each frame goes out), so a detectable tear turns into "resend
-// required" rather than quietly shifting every id to a different symbol.
+// of every recoverable frame's references). For an OS crash, the segment
+// manager fsyncs the file (syncAppended) before a trim deletes frames, so every
+// id stays recoverable from either the frames that introduced it or this file.
+// Each append is one CRC-32C chunk, in the same format the Java client writes:
+// recovery keeps only the run of chunks whose checksums match, then reads the
+// surviving frames to rebuild whatever ids came after that and writes them
+// back. If a hole is still left, recovery fails before connecting (and the
+// send loop checks again before each frame goes out), so a detectable tear
+// turns into "resend required" rather than quietly shifting every id to a
+// different symbol.
 //
 // Single-writer (the producer goroutine). loaded is read once at open to seed
 // recovery/orphan-drain; the engine owns close. The mutex serialises append
@@ -90,9 +91,11 @@ type qwpSfSymbolDict struct {
 	path         string
 	appendOffset int64
 	count        int
-	closeErr     error
-	closed       bool
-	scratch      []byte
+	// unsynced records an append that syncAppended has not made durable yet.
+	unsynced bool
+	closeErr error
+	closed   bool
+	scratch  []byte
 	// loaded holds the entries recovered at open, in id order; nil for a
 	// freshly created file. Consumed once to seed the producer's global
 	// dictionary and the send loop's catch-up mirror.
@@ -501,6 +504,32 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 	}
 	d.appendOffset += int64(len(d.scratch))
 	d.count += len(names)
+	d.unsynced = true
+	return nil
+}
+
+// qwpSfSymbolDictSync is the fsync syncAppended issues. Tests swap it to fail.
+var qwpSfSymbolDictSync = qwpSfSwappable(qwpSfFsync)
+
+// syncAppended makes every chunk appended so far durable, within qwpSfFsync's
+// guarantee, and does nothing when nothing was appended since the last call.
+// The segment manager calls it before a trim deletes frames: those frames may
+// be the last copy, besides this file, of symbol ids that later
+// unacknowledged frames refer to by number. It runs on the manager goroutine;
+// the mutex orders it against the producer's appends and against close.
+func (d *qwpSfSymbolDict) syncAppended() error {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed || d.file == nil || !d.unsynced {
+		return nil
+	}
+	if err := qwpSfSymbolDictSync.load()(d.file); err != nil {
+		return qwpSfDurabilityError("fsync symbol dictionary", d.path, err)
+	}
+	d.unsynced = false
 	return nil
 }
 

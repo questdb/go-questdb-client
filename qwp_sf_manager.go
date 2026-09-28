@@ -182,6 +182,15 @@ type qwpSfManagerRingEntry struct {
 	// until it stops; then the engine's cleanup worker may read them.
 	spareInProgress *qwpSfSegment
 	trimInProgress  []*qwpSfSegment
+	// writebackSegment and writebackOffset track how much of the active
+	// segment the manager has already started writing back. Worker
+	// goroutine only.
+	writebackSegment *qwpSfSegment
+	writebackOffset  int64
+	// symbolDict is the slot's .symbol-dict side-file, or nil. A trim makes
+	// it durable before deleting frames; see qwpSfSymbolDict.syncAppended.
+	// The engine owns and closes it.
+	symbolDict *qwpSfSymbolDict
 	// dirSyncPending records that a post-trim directory fsync failed, so the
 	// unlinks that pass did complete are not durable yet. Retried by later
 	// passes for the same reason as pendingUnlinks. Worker goroutine only.
@@ -310,6 +319,13 @@ func (m *qwpSfSegmentManager) segmentManagerRegister(ring *qwpSfSegmentRing, dir
 // initial active segment in place. Wires the ring's "I need a spare"
 // callback so the producer can preempt the polling tick.
 func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSegmentRing, dir string, watermark *qwpSfAckWatermark) (*qwpSfManagerRingEntry, error) {
+	return m.segmentManagerRegisterSlot(ring, dir, watermark, nil)
+}
+
+// segmentManagerRegisterSlot registers a ring together with the slot's
+// symbol dictionary (may be nil), which each trim makes durable before it
+// deletes frames.
+func (m *qwpSfSegmentManager) segmentManagerRegisterSlot(ring *qwpSfSegmentRing, dir string, watermark *qwpSfAckWatermark, symbolDict *qwpSfSymbolDict) (*qwpSfManagerRingEntry, error) {
 	quarantinedBytes := int64(0)
 	lastQuarantineReconcile := time.Time{}
 	if dir != "" {
@@ -349,6 +365,7 @@ func (m *qwpSfSegmentManager) segmentManagerRegisterWithWatermark(ring *qwpSfSeg
 		ring:                    ring,
 		dir:                     dir,
 		watermark:               watermark,
+		symbolDict:              symbolDict,
 		accountedBytes:          ring.totalSegmentBytes(),
 		quarantinedBytes:        quarantinedBytes,
 		lastQuarantineReconcile: lastQuarantineReconcile,
@@ -548,6 +565,9 @@ func (m *qwpSfSegmentManager) wouldExceedCapWithSpare() bool {
 func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 	memoryMode := e.dir == ""
 	maintenanceWorked := false
+	if !memoryMode {
+		m.writebackActive(e)
+	}
 	// The byte limit covers all rings. While the manager is at the limit, rescan
 	// each disk ring when its interval expires. This also notices files deleted
 	// from a ring that already has a spare.
@@ -768,6 +788,14 @@ func (m *qwpSfSegmentManager) serviceRing(e *qwpSfManagerRingEntry) {
 			m.recordServiceError(e, errors.Join(spareErr, deferredErr, err))
 			return
 		}
+		// The frames about to go may be the last copy, besides the symbol
+		// dictionary, of ids that later unacknowledged frames refer to by
+		// number. Make the dictionary's copy durable first, or an OS crash
+		// after the trim can leave those frames unreplayable.
+		if err := e.symbolDict.syncAppended(); err != nil {
+			m.recordServiceError(e, errors.Join(spareErr, deferredErr, err))
+			return
+		}
 		if err := qwpSfSyncPreTrimEpoch(e.dir); err != nil {
 			m.recordServiceError(e, errors.Join(spareErr, deferredErr, err))
 			return
@@ -971,6 +999,45 @@ func (m *qwpSfSegmentManager) logServiceError(dir string, err error) {
 	if shouldLog {
 		qwpEffectiveLogger(m.logger.Load()).Error("qwp/sf: segment manager maintenance failed; will retry", "dir", dir, "error", err)
 	}
+}
+
+// qwpSfActiveWritebackBytes is how much newly published data in the active
+// segment makes the manager start writing it back. It is capped at a quarter
+// of the segment, so the rotation that seals the segment has at most that much
+// left to wait for. Benchmarks set it to 0 to turn early writeback off.
+var qwpSfActiveWritebackBytes = qwpSfSwappable(int64(1 << 20))
+
+// writebackActive starts writing the active segment's newly published frames
+// to disk once enough have accumulated, without waiting for the disk. The
+// rotation that later seals the segment must make its frames durable before
+// the manifest moves on (qwpSfSyncSealedSegment); starting early spreads that
+// write over the time the segment fills instead of stalling the producer for
+// all of it at once. A failure costs only the head start, since the rotation's
+// own sync reports any real storage error. Worker goroutine only: the manager
+// is the only goroutine that unmaps a segment while it runs, so the active
+// segment stays mapped through the call.
+func (m *qwpSfSegmentManager) writebackActive(e *qwpSfManagerRingEntry) {
+	step := qwpSfActiveWritebackBytes.load()
+	if limit := m.segmentSizeBytes / 4; step > limit {
+		step = limit
+	}
+	if step <= 0 {
+		return
+	}
+	active := e.ring.getActiveSegment()
+	if active == nil {
+		return
+	}
+	if active != e.writebackSegment {
+		e.writebackSegment = active
+		e.writebackOffset = 0
+	}
+	published := active.publishedCursor.Load()
+	if published-e.writebackOffset < step {
+		return
+	}
+	_ = active.startWriteback(e.writebackOffset, published)
+	e.writebackOffset = published
 }
 
 // closeServiceResidue finishes work left by the manager. Call it only after

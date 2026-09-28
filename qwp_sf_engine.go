@@ -862,7 +862,7 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 			return nil, hookErr
 		}
 	}
-	managerEntry, err := mgr.segmentManagerRegisterWithWatermark(ring, sfDir, watermark)
+	managerEntry, err := mgr.segmentManagerRegisterSlot(ring, sfDir, watermark, persistedDict)
 	if err != nil {
 		return nil, err
 	}

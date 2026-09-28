@@ -526,6 +526,40 @@ func (s *qwpSfSegment) syncHeader() error {
 	return nil
 }
 
+// syncPublished makes every published frame of a segment that is being sealed
+// durable, within qwpSfFsync's guarantee. A rotation calls it before the
+// manifest names the successor, so a manifest that survives an OS crash never
+// points past frames that did not. Pages the segment manager already wrote
+// back (startWriteback) are clean, so this mostly waits for the rest.
+func (s *qwpSfSegment) syncPublished() error {
+	if s == nil || s.memoryBacked {
+		return nil
+	}
+	if err := s.msync(); err != nil {
+		return qwpSfDurabilityError("msync sealed segment", s.path, err)
+	}
+	if err := qwpSfFsync(s.file); err != nil {
+		return qwpSfDurabilityError("fsync sealed segment", s.path, err)
+	}
+	return nil
+}
+
+// startWriteback asks the OS to begin writing [from, to) of the segment to
+// disk without waiting for it. It gives the rotation's syncPublished a head
+// start and promises nothing on its own. The caller must own the segment's
+// mapping for the duration of the call; the segment manager does, because it
+// is the only goroutine that unmaps segments while it runs.
+func (s *qwpSfSegment) startWriteback(from, to int64) error {
+	if s == nil || s.memoryBacked || to <= from {
+		return nil
+	}
+	return qwpSfStartWritebackRange.load()(s.file, s.buf, from, to)
+}
+
+// qwpSfStartWritebackRange is the platform writeback primitive startWriteback
+// uses. Tests swap it to observe the ranges the manager asks for.
+var qwpSfStartWritebackRange = qwpSfSwappable(qwpSfStartWriteback)
+
 // qwpSfZeroFillChunk bounds the scratch buffer reserveTailBlocks writes
 // through the file descriptor.
 const qwpSfZeroFillChunk = 64 << 10
@@ -743,10 +777,9 @@ func (s *qwpSfSegment) tryAppend(payload []byte) (int64, error) {
 	return offset, nil
 }
 
-// msync synchronously flushes dirty pages of [HEADER_SIZE,
-// publishedOffset()) to disk via msync(MS_SYNC). Off the hot path —
-// call only when the user has opted into OS-crash durability. No-op
-// for memory-backed segments.
+// msync synchronously writes the dirty pages of the published range to
+// the file via msync(MS_SYNC). syncPublished pairs it with an fsync when a
+// rotation seals the segment. No-op for memory-backed segments.
 func (s *qwpSfSegment) msync() error {
 	if s.memoryBacked {
 		return nil

@@ -638,6 +638,7 @@ allocation. Use storage with suitable locking, mapping, and sync guarantees.
 | `sf_max_segment_bytes` | 4 MiB | Per-segment file size. |
 | `sf_max_total_bytes` | 10 GiB | Total byte limit. The producer waits when the limit is reached. The limit includes `.corrupt` files in the slot. After an operator deletes those files, the client notices within one second. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` block on backpressure before failing. |
+| `sf_durability` | `memory` | The only supported value. Frames reach the disk through kernel writeback, and each segment rotation makes the sealed segment durable; see [what an OS crash or power loss costs](#store-and-forward). |
 | `reconnect_max_duration_millis` | 300000 | Bounds only the blocking sync initial connect. A running sender retries transient outages indefinitely; it is also reused as (a) the poison-frame episode budget (`max_frame_rejections`) and (b) a background drainer's no-progress / durable-stall watchdog — the time a live-but-stalled adopted slot is given before it is quarantined. Setting it small speeds up the initial connect and shrinks (a); the drainer watchdog (b) is floored at 30s (×4 in durable mode) so a small value can't wrongly quarantine a slow-but-healthy slot. |
 | `reconnect_initial_backoff_millis` | 100 | Initial backoff with jitter. |
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
@@ -668,6 +669,25 @@ segment names it depends on. This protects recovery across an OS crash within
 the platform `fsync` guarantee. Windows exposes no documented, unprivileged
 equivalent of directory `fsync`; on Windows SF protects process-restart recovery
 but does not promise host-crash ordering for file creation, rename, and removal.
+
+**What an OS crash or power loss costs.** With `sf_durability=memory`, the only
+supported value, appended frames reach the disk when the kernel writes them
+back, not through an `fsync` per frame. A segment rotation is different: before
+`sf-manifest.bin` names the next segment, the rotation makes every frame of the
+segment it seals durable, so the manifest never points past frames the disk
+lost. The segment manager starts writing the active segment back while it
+fills, so the rotation usually waits only for the last part. Before a trim
+deletes acknowledged frames, the manager also makes `.symbol-dict` durable,
+because later frames can refer to symbols those frames introduced. After an OS
+crash or power loss, recovery keeps every sealed segment and the readable
+beginning of the active one. What can be lost is the end of the active segment, from the
+first frame the kernel had not yet written back (see
+[Recovery and damaged tails](#recovery-and-damaged-tails)). These are the
+platform `fsync` guarantees: Darwin `fsync` is not `F_FULLFSYNC`, so a power cut
+can still lose data the drive had only cached, and on Windows the directory
+barriers are no-ops. The cost of this is throughput when the disk is slower than
+the producer, because each rotation waits until the sealed segment is on disk.
+
 Residual `.ack-watermark` and `.symbol-dict` files after a fully drained close
 do not prevent a later restart. See [QWP shutdown and ownership](#qwp-shutdown-and-ownership)
 for cleanup behavior, why a slot may stay locked, and how to check for release.
@@ -725,7 +745,7 @@ published work as though nothing happened.
 | Error | Raised by | Meaning |
 |---|---|---|
 | `qdb.ErrBackpressureTimeout` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | The engine had no room within `sf_append_deadline_millis`. The wire is not draining, or `sf_max_total_bytes` is too small. |
-| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | Local storage would not commit: a segment rotation that could not write its header or manifest, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
+| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | Local storage would not commit: a segment rotation that could not make the sealed segment, the new segment's header or the manifest durable, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
 
 Match them with `errors.Is`. These are not an exhaustive list of producer errors.
 Terminal server errors and internal failures can also reach the producer. For

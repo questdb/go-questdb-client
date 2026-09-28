@@ -135,6 +135,57 @@ func TestQwpSfEngineRecoveredEmptyActiveTailPreservesUnackedSegmentsOnClose(t *t
 	require.NoError(t, err, "the manifest must survive with the unacknowledged chain")
 }
 
+// A rotation makes the sealed segment's frames durable before the manifest
+// names its successor, so an OS crash cannot leave a durable manifest pointing
+// past frames the disk lost. A failure of that sync fails the rotation before
+// the manifest moves, and the retried append completes it.
+func TestQwpSfRotationSyncsSealedFramesBeforeTheManifest(t *testing.T) {
+	dir := t.TempDir()
+	const segSize int64 = 4096
+
+	active, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segSize)
+	require.NoError(t, err)
+	manifest, err := qwpSfManifestCreate(dir, 0, 0)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(active, segSize)
+	ring.manifest = manifest
+	defer func() { _ = ring.segmentRingClose() }()
+	filler := make([]byte, segSize-qwpSfHeaderSize-qwpSfFrameHeaderSize-16)
+	require.Equal(t, int64(0), ring.appendOrFsn(filler))
+	spare, err := qwpSfCreateSegment(filepath.Join(dir, "sf-spare.sfa"), ring.nextSeqHint(), segSize)
+	require.NoError(t, err)
+	require.NoError(t, ring.installHotSpare(spare))
+
+	manifestActive := func() int64 {
+		manifest.mu.Lock()
+		defer manifest.mu.Unlock()
+		return manifest.activeBase
+	}
+	injected := errors.New("injected sealed-segment sync failure")
+	var seenByEachSync []int64
+	previous := qwpSfSyncSealedSegment.load()
+	qwpSfSyncSealedSegment.store(func(s *qwpSfSegment) error {
+		require.Same(t, active, s, "the segment being sealed is the one synced")
+		seenByEachSync = append(seenByEachSync, manifestActive())
+		if len(seenByEachSync) == 1 {
+			return qwpSfDurabilityError("sync sealed segment", s.path, injected)
+		}
+		return previous(s)
+	})
+	t.Cleanup(func() { qwpSfSyncSealedSegment.store(previous) })
+
+	frame := make([]byte, 64)
+	require.Equal(t, qwpSfRotationFailed, ring.appendOrFsn(frame))
+	require.ErrorIs(t, ring.rotationErr.Load().err, injected)
+	require.Equal(t, int64(0), manifestActive(), "a failed sync leaves the manifest naming the old active segment")
+	require.Same(t, active, ring.getActiveSegment())
+
+	require.Equal(t, int64(1), ring.appendOrFsn(frame))
+	require.Equal(t, []int64{0, 0}, seenByEachSync, "each sync ran before the manifest moved")
+	require.Equal(t, int64(1), manifestActive())
+	require.Same(t, spare, ring.getActiveSegment())
+}
+
 func TestQwpSfSenderRotationManifestFailureRetainsRowsForRetry(t *testing.T) {
 	dir := t.TempDir()
 	const segSize int64 = 4096

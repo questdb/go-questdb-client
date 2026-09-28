@@ -607,9 +607,12 @@ func BenchmarkQwpSfPublish(b *testing.B) {
 	}
 }
 
-// BenchmarkQwpSfRotationBarriers isolates what a rotation adds to the flush it
-// lands on: two fsyncs, on two different files, that the producer waits through
-// while holding the engine's append mutex.
+// BenchmarkQwpSfRotationBarriers isolates two of the three barriers a rotation
+// adds to the flush it lands on: the fixed-size fsyncs of the promoted spare's
+// header and the manifest, on two different files, that the producer waits
+// through while holding the engine's append mutex. The first barrier, which
+// makes the sealed segment's frames durable, costs whatever is still unwritten
+// in that segment, so BenchmarkQwpSfSustainedAppend measures it under load.
 //
 // They run in this order and cannot be overlapped. The promoted spare's header
 // carries the base sequence the manifest is about to commit as the active one,
@@ -677,4 +680,91 @@ func BenchmarkQwpSfRotationBarriers(b *testing.B) {
 			}
 		}
 	})
+}
+
+// BenchmarkQwpSfSustainedAppend measures how fast a producer can keep appending
+// 512-byte frames to a disk-backed slot with 4 MiB segments, and on Linux how
+// many bytes the kernel sends to storage per byte appended. It compares three
+// rotation policies:
+//
+//   - no-sealed-sync: a rotation makes only the spare's header and the
+//     manifest durable, so an OS crash can leave the manifest pointing past
+//     frames the disk lost;
+//   - sealed-sync: the rotation also makes the sealed segment's frames
+//     durable, writing all of them while the producer waits;
+//   - sealed-sync+writeback: as sealed-sync, but the segment manager starts
+//     writing the active segment back while it fills. This is production.
+//
+// The acked mode acknowledges every frame at once, as a healthy server would,
+// so segments are trimmed as soon as they are sealed; backlog acknowledges
+// nothing, as while the server is unreachable. backlog needs about
+// b.N*512 bytes of disk, so pass an explicit -benchtime such as 262144x.
+func BenchmarkQwpSfSustainedAppend(b *testing.B) {
+	const (
+		segmentBytes int64 = 4 << 20
+		payloadBytes       = 512
+	)
+	policies := []struct {
+		name       string
+		sealedSync bool
+		writeback  bool
+	}{
+		{"no-sealed-sync", false, false},
+		{"sealed-sync", true, false},
+		{"sealed-sync+writeback", true, true},
+	}
+	for _, mode := range []string{"acked", "backlog"} {
+		for _, policy := range policies {
+			b.Run(mode+"/"+policy.name, func(b *testing.B) {
+				previousSync := qwpSfSyncSealedSegment.load()
+				previousWriteback := qwpSfActiveWritebackBytes.load()
+				defer func() {
+					qwpSfSyncSealedSegment.store(previousSync)
+					qwpSfActiveWritebackBytes.store(previousWriteback)
+				}()
+				if !policy.sealedSync {
+					qwpSfSyncSealedSegment.store(func(*qwpSfSegment) error { return nil })
+				}
+				if !policy.writeback {
+					qwpSfActiveWritebackBytes.store(0)
+				}
+				totalBytes := int64(64 << 20)
+				if mode == "backlog" {
+					totalBytes += int64(b.N+64) * payloadBytes
+				}
+				ctx := context.Background()
+				e, err := qwpSfNewCursorEngine(b.TempDir(), segmentBytes, totalBytes, qwpTestAppendTimeout)
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer func() { _ = e.engineClose() }()
+				payload := make([]byte, payloadBytes)
+				for i := 0; i < 64; i++ {
+					fsn, err := e.engineAppendBlocking(ctx, payload)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if mode == "acked" {
+						e.engineAcknowledge(fsn)
+					}
+				}
+				storedBefore, measured := qwpBenchStorageWriteBytes()
+				b.SetBytes(payloadBytes)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					fsn, err := e.engineAppendBlocking(ctx, payload)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if mode == "acked" {
+						e.engineAcknowledge(fsn)
+					}
+				}
+				b.StopTimer()
+				if storedAfter, ok := qwpBenchStorageWriteBytes(); measured && ok {
+					b.ReportMetric(float64(storedAfter-storedBefore)/float64(int64(b.N)*payloadBytes), "storage-bytes/byte")
+				}
+			})
+		}
+	}
 }

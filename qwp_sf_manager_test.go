@@ -383,6 +383,135 @@ func TestQwpSfCreateSpareSegmentNeverOpensAnExistingFile(t *testing.T) {
 	require.Equal(t, live, got, "the existing file is neither truncated nor removed")
 }
 
+// The manager starts writing the active segment back once a step's worth of
+// frames is published, remembers how far it got, and never uses a step larger
+// than a quarter of the segment. A zero step turns early writeback off.
+func TestQwpSfManagerStartsWritebackOfTheActiveSegment(t *testing.T) {
+	const segSize int64 = 64 << 10
+	dir := t.TempDir()
+	mgr, err := qwpSfNewSegmentManager(segSize, time.Hour, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	first, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segSize)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(first, segSize)
+	defer func() { _ = ring.segmentRingClose() }()
+	entry, err := mgr.segmentManagerRegisterWithWatermark(ring, dir, nil)
+	require.NoError(t, err)
+	previous := qwpSfActiveWritebackBytes.load()
+	t.Cleanup(func() { qwpSfActiveWritebackBytes.store(previous) })
+	type span struct{ from, to int64 }
+	var requested []span
+	primitive := qwpSfStartWritebackRange.load()
+	qwpSfStartWritebackRange.store(func(f *os.File, buf []byte, from, to int64) error {
+		requested = append(requested, span{from, to})
+		return primitive(f, buf, from, to)
+	})
+	t.Cleanup(func() { qwpSfStartWritebackRange.store(primitive) })
+	payload := make([]byte, 1000)
+	appendFrames := func(n int) {
+		for i := 0; i < n; i++ {
+			require.GreaterOrEqual(t, ring.appendOrFsn(payload), int64(0))
+		}
+	}
+
+	qwpSfActiveWritebackBytes.store(8 << 10)
+	appendFrames(2)
+	mgr.writebackActive(entry)
+	require.Empty(t, requested, "less than a step waits for more frames")
+	appendFrames(8)
+	mgr.writebackActive(entry)
+	first8 := first.publishedCursor.Load()
+	require.Equal(t, []span{{0, first8}}, requested)
+
+	qwpSfActiveWritebackBytes.store(1 << 20)
+	appendFrames(17)
+	mgr.writebackActive(entry)
+	require.Equal(t, []span{{0, first8}, {first8, first.publishedCursor.Load()}}, requested,
+		"a step larger than a quarter of the segment is capped at a quarter (16 KiB here), "+
+			"and each request starts where the previous one ended")
+
+	qwpSfActiveWritebackBytes.store(0)
+	appendFrames(20)
+	mgr.writebackActive(entry)
+	require.Len(t, requested, 2, "a zero step turns early writeback off")
+
+	require.NoError(t, primitive(first.file, first.buf, 100, first.publishedCursor.Load()),
+		"the platform primitive accepts an unaligned start")
+}
+
+// A trim deletes frames that may be the last copy, besides the symbol
+// dictionary, of ids that later frames use. It makes the dictionary durable
+// first; if that fsync fails, the trim waits and the frames stay on disk. An
+// unchanged dictionary is not synced again.
+func TestQwpSfTrimSyncsTheSymbolDictionaryFirst(t *testing.T) {
+	const segmentSize int64 = 72
+	dir := t.TempDir()
+	active, err := qwpSfCreateSegment(filepath.Join(dir, "sf-initial.sfa"), 0, segmentSize)
+	require.NoError(t, err)
+	require.NoError(t, active.markManifestRequired())
+	manifest, err := qwpSfManifestCreate(dir, 0, 0)
+	require.NoError(t, err)
+	ring := qwpSfNewSegmentRing(active, segmentSize)
+	ring.manifest = manifest
+	defer func() { _ = ring.segmentRingClose() }()
+	dict, err := qwpSfSymbolDictOpenFresh(filepath.Join(dir, qwpSfSymbolDictFileName))
+	require.NoError(t, err)
+	defer func() { _ = dict.close() }()
+	manager, err := qwpSfNewSegmentManager(segmentSize, time.Hour, qwpSfUnlimitedTotalBytes)
+	require.NoError(t, err)
+	entry, err := manager.segmentManagerRegisterSlot(ring, dir, nil, dict)
+	require.NoError(t, err)
+
+	injected := errors.New("injected dictionary fsync failure")
+	syncs := 0
+	previous := qwpSfSymbolDictSync.load()
+	qwpSfSymbolDictSync.store(func(f *os.File) error {
+		syncs++
+		if syncs == 1 {
+			return injected
+		}
+		return previous(f)
+	})
+	t.Cleanup(func() { qwpSfSymbolDictSync.store(previous) })
+
+	// Frames 0 and 1 fill the initial segment; frame 2 rotates it into the
+	// sealed list. The dictionary gains an id before the first frame, as the
+	// producer's write-ahead append does.
+	payload := make([]byte, 16)
+	require.NoError(t, dict.appendSymbols([]string{"AAPL"}))
+	require.Equal(t, int64(0), ring.appendOrFsn(payload))
+	require.Equal(t, int64(1), ring.appendOrFsn(payload))
+	manager.serviceRing(entry)
+	require.Equal(t, int64(2), ring.appendOrFsn(payload))
+	manager.serviceRing(entry)
+	ring.acknowledge(1)
+	initial := filepath.Join(dir, "sf-initial.sfa")
+
+	manager.serviceRing(entry)
+	require.Equal(t, 1, syncs)
+	require.Equal(t, 1, ring.sealedSegmentCount(), "the trim waits for the dictionary")
+	_, statErr := os.Stat(initial)
+	require.NoError(t, statErr, "the frames stay on disk while the dictionary is not durable")
+	require.True(t, entry.maintenanceFailureActive)
+
+	manager.serviceRing(entry)
+	require.Equal(t, 2, syncs)
+	require.Zero(t, ring.sealedSegmentCount())
+	_, statErr = os.Stat(initial)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+
+	// Frame 3 fills the second segment and frame 4 rotates it; with no new
+	// symbols, trimming it needs no dictionary fsync.
+	require.Equal(t, int64(3), ring.appendOrFsn(payload))
+	manager.serviceRing(entry)
+	require.Equal(t, int64(4), ring.appendOrFsn(payload))
+	manager.serviceRing(entry)
+	ring.acknowledge(3)
+	manager.serviceRing(entry)
+	require.Zero(t, ring.sealedSegmentCount())
+	require.Equal(t, 2, syncs, "an unchanged dictionary is not synced again")
+}
+
 // A spare name that collides with a file on disk costs one failed attempt,
 // never that file. The collision is forced here by winding the generation
 // counter back; registration normally moves it past every name on disk.

@@ -191,6 +191,18 @@ jobs:
           GOTOOLCHAIN: local
         run: go test -run ZeroAllocs -count=1 .
 
+      - name: Store-and-forward sustained append (informational)
+        # Reports what making each sealed segment durable at rotation costs
+        # on Linux, next to the same run without that barrier: MB/s, and
+        # storage-bytes/byte from /proc/self/io, which shows how much of the
+        # appended data the kernel actually writes. The numbers do not gate
+        # the build; only a benchmark error does. 262144x keeps the backlog
+        # runs at 128 MiB of disk each.
+        if: matrix.go-version == '1.24.x'
+        env:
+          GOTOOLCHAIN: local
+        run: go test -run '^$' -bench BenchmarkQwpSfSustainedAppend -benchtime 262144x -count 3 .
+
       - name: Run tests
         # Pin to the matrix-installed Go (see "Run vet"). The
         # Staticcheck step deliberately omits this: staticcheck@v0.7.0

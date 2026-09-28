@@ -603,8 +603,8 @@ func (s *qwpLineSender) symbolDeltaBaseline() int {
 // ([maxSentSymbolId+1 .. batchMaxSymbolId]) to the slot's .symbol-dict BEFORE
 // the frame is published, so a recovered / orphan-drained slot can rebuild the
 // dictionary the delta frame references. No-op unless SF + delta mode with new
-// symbols. Not fsync'd — a host-crash tear is caught by the send loop's replay
-// guard, not here.
+// symbols. Not fsync'd here: the segment manager makes the file durable before
+// a trim deletes the frames that carry the same ids.
 func (s *qwpLineSender) persistNewSymbols() error {
 	if !s.deltaDictEnabled || s.persistedSymbolDict == nil {
 		return nil

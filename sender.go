@@ -1059,6 +1059,14 @@ func WithTarget(target QwpTargetFilter) LineSenderOption {
 // rejected at construction. Requires sf_dir to be set. Equivalent to
 // the connect-string sf_durability key.
 //
+// In "memory" mode appended frames reach the disk through the kernel's
+// writeback rather than an fsync per frame. Each segment rotation makes
+// the segment it seals durable, and each trim makes the symbol
+// dictionary durable before deleting frames. An OS crash or power loss
+// can lose the end of the active segment, but not the sealed segments
+// before it; see the README's store-and-forward section for the platform
+// limits.
+//
 // Only available for the QWP sender.
 func WithSfDurability(mode string) LineSenderOption {
 	return func(s *lineSenderConfig) {
