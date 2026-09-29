@@ -282,32 +282,16 @@ saved result. See the [cleanup error Go docs](qwp_errors.go).
 For recoverable storage failures, the client retries cleanup with delays between
 attempts. Success clears the error it recovered from. It does not clear errors
 from queueing or delivering rows, so releasing all resources need not make Close
-return nil. An error reported while releasing something that was released
-anyway, such as a TLS close alert that could not reach a peer which already
-reset the connection, or a `close(2)` error on a file descriptor, is logged. It
-does not mean anything is still held, so it never makes Close fail, and a
-finished cleanup leaves it out of the result. Blocked
-readers, unavailable storage, or handles that have not been returned can prevent
-cleanup from finishing until the process exits.
+return nil. An error from releasing something that is released anyway, such as
+a TLS close alert to a peer that already reset the connection, is only logged:
+nothing is still held, so it never makes Close fail. Blocked readers,
+unavailable storage, or handles that have not been returned can prevent cleanup
+from finishing until the process exits.
 
 User callbacks are different from internal cleanup work: shutdown may drop queued
 notifications, and a callback already running may finish after Close returns.
 Close does not guarantee delivery of every notification or exit of every
 callback goroutine.
-
-**Resources stay tracked until safe to release.** The client must not unmap
-memory while a reader can still access it, or reuse a store-and-forward slot
-while old client code can still use it. The client remains responsible for
-resources after timeouts and internal failures, even if construction failed
-without returning a handle. A cleanup panic is not evidence of corrupt files
-and does not justify quarantining a slot or marking it `.failed`. See
-[Quarantined slots](#quarantined-slots) for failures that can stop a background
-drainer from sending a slot's data.
-
-Cleanup must preserve saved rows and follow the acknowledgement, recovery, and
-safe file-deletion rules. It does not promise an empty directory. These guarantees
-do not cover faults that terminate the process or arbitrary memory corruption.
-Panics caused by supported inputs and ordinary data races are still bugs.
 
 For **standalone store-and-forward senders only**, check `SlotLockReleased`
 before reopening the same slot. A borrowed sender that has been returned reports
@@ -626,10 +610,8 @@ Creating SF files requires native disk-block reservation. If the filesystem
 rejects preallocation, creation fails with `ErrSfDurability`; the client does
 not fall back to sparse files or zero-filling. On Unix targets other than Linux
 and macOS, reservation is not implemented, so new disk-backed SF files cannot
-be created. Memory-backed senders are unaffected. This is stricter than Java's
-sparse fallback. Successful reservation does not certify existing sparse files
-or guarantee safety against every later storage failure or copy-on-write
-allocation. Use storage with suitable locking, mapping, and sync guarantees.
+be created. Memory-backed senders are unaffected. Use storage with suitable
+locking, mapping, and sync guarantees.
 
 | Key | Default | Effect |
 |---|---|---|
@@ -663,77 +645,28 @@ context after construction does not stop them; closing the sender does.
 Without `sf_dir`, unacknowledged data lives in process memory and is lost if the
 process dies; the reconnect loop still spans transient outages.
 
-On Unix, SF namespace changes are separated into directory-sync epochs: a
-dependent manifest update/removal is not allowed to become durable before the
-segment names it depends on. This protects recovery across an OS crash within
-the platform `fsync` guarantee. Windows exposes no documented, unprivileged
-equivalent of directory `fsync`; on Windows SF protects process-restart recovery
-but does not promise host-crash ordering for file creation, rename, and removal.
-
 **What an OS crash or power loss costs.** With `sf_durability=memory`, the only
-supported value, appended frames reach the disk when the kernel writes them
-back, not through an `fsync` per frame. A segment rotation is different: before
-`sf-manifest.bin` names the next segment, the rotation makes every frame of the
-segment it seals durable, so the manifest never points past frames the disk
-lost. The segment manager starts writing the active segment back while it
-fills, so the rotation usually waits only for the last part. Before a trim
-deletes acknowledged frames, the manager also makes `.symbol-dict` durable,
-because later frames can refer to symbols those frames introduced. After an OS
-crash or power loss, recovery keeps every sealed segment and the readable
-beginning of the active one. What can be lost is the end of the active segment, from the
-first frame the kernel had not yet written back (see
-[Recovery and damaged tails](#recovery-and-damaged-tails)). These are the
-platform `fsync` guarantees: Darwin `fsync` is not `F_FULLFSYNC`, so a power cut
-can still lose data the drive had only cached, and on Windows the directory
-barriers are no-ops. The cost of this is throughput when the disk is slower than
-the producer, because each rotation waits until the sealed segment is on disk.
+supported value, frames reach the disk through kernel writeback rather than an
+`fsync` per frame, and each segment rotation makes the segment it seals durable
+before the next one is used. After an OS crash or power loss, recovery keeps
+every sealed segment and the readable beginning of the active one. What can be
+lost is the end of the active segment, from the first frame the kernel had not
+yet written back (see [Recovery and damaged tails](#recovery-and-damaged-tails)).
+The price is throughput when the disk is slower than the producer, because each
+rotation waits until the sealed segment is on disk. These guarantees are only as
+strong as the platform's `fsync`: on macOS it does not force the drive's cache
+(`F_FULLFSYNC`), so a power cut can still lose data the drive had only cached.
+Windows has no directory `fsync`, so there SF does not promise that file
+creations, renames and deletions survive a host crash in order.
+
+**Delivery is at least once.** After a restart, replay starts after the last
+acknowledgement recorded in `.ack-watermark`, or at the oldest surviving segment
+when that record is missing or does not fit the recovered frames. Either way the
+server can receive rows it had already acknowledged.
 
 Residual `.ack-watermark` and `.symbol-dict` files after a fully drained close
 do not prevent a later restart. See [QWP shutdown and ownership](#qwp-shutdown-and-ownership)
 for cleanup behavior, why a slot may stay locked, and how to check for release.
-
-**Acknowledgement evidence at startup.** Residual side files are permitted, so
-startup, not close, is what makes an old `.ack-watermark` record safe. Every
-disk-backed construction inspects that file under the slot lock and decides from
-the history recovery actually established:
-
-- Recovery produced no ring: the record describes a previous lifecycle whose
-  frames are gone, and this session restarts frame numbering at 0. An empty
-  recovered ring is different: it retains its sequence base and remains part of
-  its existing history even though it currently holds no frames.
-- A record above the recovered history's published tip: no correctly operating
-  session for this history produced it. Recovery can also produce this
-  legitimately, by discarding an unreadable active tail.
-
-In both cases the record is retired durably, by truncating the file to zero
-bytes — both record slots together — rather than ignored for one run. Ignoring
-it is not sufficient, because the same numbers get republished, after which the
-old record looks plausible again to the next restart. Every construction then
-syncs the prepared file and performs the slot-directory barrier before
-allocating or mapping it, even when the file already looks empty, invalid, or
-acceptable: bytes visible in the page cache are no evidence that an earlier
-attempt's barrier completed. That unconditional checkpoint is the retry
-mechanism; no marker file or format change is involved, and a zero-length file
-is only an intermediate startup state.
-
-If inspecting, resetting, or either barrier fails, construction fails with a
-retriable storage error and keeps its cleanup obligations; only a later
-allocation or write-back failure may continue without a mapped watermark, and a
-nil in-memory watermark is never evidence that the file on disk is safe. Such a
-failure does not authorize dropping unacknowledged frames or quarantining the
-slot, and it does not promise that a failing or full disk can be started on or
-drained. Discarding ACK evidence keeps the segment-derived replay position —
-immediately before the lowest surviving segment, not FSN 0 — and can replay
-surviving rows that were already acknowledged: SF does not provide exactly-once
-delivery. The deliberate valid-prefix/zeroed-suffix policy for a damaged active
-tail is unchanged, and discarded frames are not reconstructed.
-
-A stale record whose value still falls inside the surviving frame range cannot
-be distinguished from a legitimate acknowledgement — the shared format carries
-no slot-lifecycle identifier — so the client neither detects nor repairs such
-pre-existing slots. These startup barriers use the same platform guarantees as
-the rest of SF: process-restart recovery on every platform, no host-crash
-namespace ordering on Windows, and Darwin `fsync` is not `F_FULLFSYNC`.
 
 #### Local errors from the SF path
 
@@ -767,12 +700,9 @@ it is not evidence that the slot is corrupt.
 This is not a general salvage policy: missing required segments or gaps in the
 saved queue still cause recovery to refuse the slot, as described below.
 
-One missing segment cannot be detected. When the saved head and active
-boundaries in `sf-manifest.bin` are equal and the active segment is gone, the
-directory looks exactly like a fully delivered close that crashed while
-deleting its files, so recovery starts the slot empty. A segment deleted by
-hand in that state takes its unsent rows with it, and nothing reports them.
-Remove segment files only together with the whole slot directory.
+Remove segment files only together with the whole slot directory. In some
+states recovery cannot tell a deleted segment from a fully delivered slot, and
+it starts the slot empty without reporting the rows that were lost.
 
 #### Quarantined slots
 
@@ -791,28 +721,15 @@ if qs, ok := sender.(qdb.QwpSender); ok {
 ```
 
 `<n>` is the first free index in `0..63`; an occupied name is never overwritten,
-so earlier copies survive. The client picks the same names as the Java client
-and, like it, excludes any directory whose name contains `.unreplayable-` from
-automatic adoption — by name, regardless of what the directory holds. A valid
-`sender_id` cannot contain a dot, so the namespace cannot collide with a
-configured slot.
+so earlier copies survive. Orphan adoption skips every directory whose name
+contains `.unreplayable-`. The Java client uses the same names.
 
 When all 64 destinations for a slot name are occupied, the sender refuses to
 start instead of minting a 65th copy or reclaiming an old one. The refusal names
 the slot and needs an operator: move or remove the preserved copies, then retry.
 
-A quarantined copy also gets a `.failed` file recording the reason, if one can
-be written and no entry of that name already exists. An existing `.failed` is
-kept exactly as it is, including when this client would have written a different
-reason. Neither the marker's presence nor its contents affect exclusion.
-
-Older versions of this client used a nested container,
-`<sf_dir>/quarantined/<sender_id>-<nanos>/`. Existing copies are left exactly
-where they are: nothing flattens, renames, scans, reclaims or resumes them. The
-name `quarantined` is also a legal `sender_id`; a sender configured with it
-starts normally when the path is absent, empty, or holds only ordinary slot
-files, and refuses to start when the directory holds child directories or
-symlinks that could be an older client's evidence.
+A quarantined copy also gets a `.failed` file recording the reason, when one can
+be written.
 
 An individual file excluded from a validated queue because its segment header
 is unreadable is preserved by renaming it in place to `<name>.sfa.corrupt`.
@@ -832,80 +749,26 @@ park one slot copy per cycle. `.corrupt` files inside a live slot do count
 against `sf_max_total_bytes`: when quarantined bytes exhaust the budget, no new
 segment is minted and the producer sees `qdb.ErrBackpressureTimeout` — the same
 non-terminal, retry-the-call contract as running out of space for live data.
-The manager counts these files when it opens the slot. While the byte limit
-blocks a new segment, it rescans the slot at most once per second. This means it
-notices deleted `.corrupt` files within one second without scanning on every
-1 ms poll. If a scan fails, it keeps the previous byte count. Whole-slot copies
-under `.unreplayable-<n>`, and under the older `quarantined/` container, do not
-count toward a slot's limit and are never reclaimed to regain capacity. The
-operator owns these copies.
+Deleting them frees the space within about a second. Whole-slot copies under
+`.unreplayable-<n>` do not count toward a slot's limit and are never reclaimed
+to regain capacity. The operator owns these copies.
 
-##### Guarantees and limits
+**Sharing an `sf_dir`.** Senders coordinate slot opening, quarantine and orphan
+adoption through advisory locks under `<sf_dir>/.slot-locks/`. Share an
+`sf_dir` only between clients that take those locks, on a filesystem where
+advisory locks and `rename` work. Older clients and other programs are not
+protected: before upgrading a root, stop older clients that write to or drain
+it, or give them separate roots; turning off orphan adoption is not enough.
+Treat the lock files as opaque and don't delete them. Don't move, rename or
+remove slot, quarantine or lock paths while any client is running.
 
-These bounds apply to quarantine and to the slot-name locking around it. Read
-them before treating a refusal, a retained resource or a missing marker as a
-defect.
+A preserved copy is not a backup. Quarantine does not repair damage recovery
+already found, and it cannot protect the copy from later storage failures.
+Don't rename a copy into an ordinary slot to make a client replay it.
 
-- **Cooperating participants only.** A slot's close → rename → recreate
-  transition is serialised by a parent-anchored lock under
-  `<sf_dir>/.slot-locks/`, which this client takes before opening a slot and
-  before adopting an orphan. It protects processes that use this protocol, on
-  filesystems providing the advisory locking and rename semantics it relies on.
-  It does not protect against an operator moving files, an incompatible or older
-  client that never takes the lock, or a host where advisory locks do not work.
-  Share an `sf_dir` only between participants you have verified; stopping orphan
-  adoption alone is not sufficient, because an older foreground sender can still
-  create the legacy `quarantined/` container. Treat lock files as opaque
-  metadata and do not delete them: this client deliberately reuses stale lock
-  files rather than unlinking a pathname that another process may already have
-  open. The namespace and locking layout were inspected at QuestDB Java client
-  revision `981bdb02a471f3b290c89b8e78cbc422610e329e`; that is evidence about
-  that revision, not a minimum compatible release or proof of live cross-client
-  interoperability. Concurrent Go/Java transitions and every filesystem/OS
-  combination have not been integration-tested. Verify every deployed client
-  participates in a compatible lock lifecycle before sharing an `sf_dir`.
-  Stop incompatible writers and drainers before upgrading a root, or isolate
-  them in separate roots; disabling orphan adoption alone is insufficient. Do
-  not rename or remove slot, quarantine, or lock paths while participants run.
-- **Offline reuse does not change formats.** This layout change does not alter
-  ordinary slot payload formats, but offline reuse remains subject to the
-  existing format and migration restrictions, including the unsupported
-  downgrade after legacy Go-slot migration. Do not rename or repoint preserved
-  evidence into an ordinary slot merely to make a client replay it.
-- **Preservation is not backup.** Quarantine does not overwrite, delete, replay
-  or reclaim what it moves, but it does not repair damage recovery already
-  found, and it cannot protect a copy from later storage failure, another
-  program, or an operator. Recovery steps that ran before the handoff, such as
-  the damaged-tail policy above, still applied.
-- **The transition is not atomic.** Renaming the old slot and creating the fresh
-  one are separate steps with no rollback. A failure after the rename reports
-  the destination that already exists rather than pretending nothing happened;
-  the slot can be left preserved with no fresh slot in place, and cleanup may
-  still own resources. Crash behaviour is bounded by the same platform
-  guarantees as the rest of SF: process restart, host crash and power loss are
-  not equivalent, the Windows directory barrier is a no-op, and Darwin `fsync`
-  is not `F_FULLFSYNC`.
-- **Refusals are conditional, not timed.** The 64-destination policy bounds how
-  many copies one slot name may accumulate. It says nothing about how long a
-  quarantine takes, how much disk it uses, or whether one succeeds at all:
-  inspection, rename or barrier failures, an over-long destination name, or an
-  unresolved lock can each refuse construction. Nothing is deleted to make
-  progress.
-- **Markers and logs are best-effort.** A `.failed` marker may be missing or
-  incomplete, and diagnostics may be filtered, discarded or lost. Neither is a
-  condition for excluding a preserved copy from adoption. Application logging
-  handlers keep the restrictions documented on `WithLogger`.
-- **Legacy-container refusals are deliberately conservative.** An unrelated
-  child directory under a `quarantined` slot name causes a refusal, including
-  for case variants such as `Quarantined` on a case-sensitive filesystem. That
-  is a request for a human look, not a corruption verdict, and it never
-  authorises the client to move or delete anything. A permission or I/O failure
-  while inspecting is reported as the operational fault it is.
-- **Reporting is historical.** `QuarantinedSlotPath` reports where this sender
-  put bytes during its own construction. It is not a live check that the
-  directory still exists, a durability receipt, or a record that survives a
-  crash. See the [shutdown and ownership](#qwp-shutdown-and-ownership) section
-  for what a returned `Close` does and does not prove.
+Accepted limits of quarantine and slot locking, such as a transition that is
+not atomic and best-effort markers, are listed in
+[docs/qwp-limits-and-invariants.md](docs/qwp-limits-and-invariants.md).
 
 ## Querying
 

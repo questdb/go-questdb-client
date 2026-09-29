@@ -238,9 +238,9 @@ type QwpSender interface {
 	// This is a historical report of what this sender did during its own
 	// construction, not a live check: it does not verify that the directory
 	// still exists or that the bytes are durable, and it is not a record
-	// that survives a crash. See the README's "Quarantined slots" section,
-	// including its guarantees-and-limits list, for the sharing, atomicity
-	// and platform bounds that apply.
+	// that survives a crash. See the README's "Quarantined slots" section
+	// for the sharing rules, and docs/qwp-limits-and-invariants.md in the
+	// repository for the atomicity and platform limits.
 	QuarantinedSlotPath() string
 
 	// SlotLockReleased reports whether a standalone sender has released its

@@ -12,6 +12,7 @@ Review the pull request `$ARGUMENTS`.
 You are a senior QuestDB engineer performing a blocking code review. `go-questdb-client` is mission-critical software: bugs can cause data loss, silent corruption, dropped rows, or host-process crashes. There is zero tolerance for correctness issues, lost resource ownership, unsafe release, data races, or wire-format errors. Evaluate retained resources against the public contract. Be critical, thorough, and direct.
 
 - **Read the contract at every review level:** [README: QWP shutdown and ownership](../../../README.md#qwp-shutdown-and-ownership), relevant public Go docs, and the PR's declared behavior changes. The README and Go docs define the shutdown contract. Verify that documentation, implementation, tests, and PR claims agree; report discrepancies.
+- **Read the accepted limits at every review level:** [docs/qwp-limits-and-invariants.md](../../../docs/qwp-limits-and-invariants.md) lists maintainer invariants and limits the project has deliberately accepted. A behavior listed there is not a finding unless the PR widens it or the conditions that bound it no longer hold. When a finding is accepted rather than fixed, the record belongs in that file, not the README.
 - **The diff is the entry point, not the scope.** Inspect surrounding code and unchanged callers whose assumptions the change affects. Do not clear a change solely because it looks correct in isolation.
 - **Verify every claim.** For a fix, establish the original bug and corrected behavior. For performance, inspect measurements and scaling. For simplification, compare affected actors, entry routes, ownership transfers, and authoritative state before/after. Intentional behavior removal must be explicit and reflected in code, tests, callers, and docs.
 - **Distinguish coding conventions from runtime guarantees.** Do not require exhaustive mechanical enforcement of a convention. Evaluate tests against promised observable behavior, not whether every conceivable source mutation is detected.
@@ -172,7 +173,7 @@ Assess original-panic reachability separately from injected-panic tests. Verify 
 Report SAFE / BROKEN / NEEDS VERIFICATION per callsite with evidence. Classify confirmed defects by impact and likelihood, regardless of whether the callsite is in the diff.
 
 **Agent 10 — Fresh-context adversarial:** when selected, run independently of Agents 1–9 to avoid checklist anchoring.
-- Provide only the diff, changed-file names, and neutral source inputs: applicable repository guidance including `CLAUDE.md`, README's shutdown section, and relevant public method/error/callback docs, or instructions to read them.
+- Provide only the diff, changed-file names, and neutral source inputs: applicable repository guidance including `CLAUDE.md`, README's shutdown section, `docs/qwp-limits-and-invariants.md`, and relevant public method/error/callback docs, or instructions to read them.
 - Do not provide the change map, findings, implicit-contract inventory, category lists, or reviewer-generated checklists. Maintained repository guidance is a neutral source, not a prior review finding.
 - Instruction: “Find ways this code is wrong against the public contract; flag source/documentation disagreements.” Allow independent read-only repository exploration.
 - Each finding states what is wrong, why, and the demonstrating code path. Verify both novel and corroborated findings before accepting them.
@@ -212,7 +213,7 @@ Use project guidance to locate maintained protocol, configuration, error-policy,
 
 ### Store-and-forward, recovery, and pool startup
 
-Apply whenever persistence, reconnect/failover, drainers, startup configuration, or pool lifecycle changes. Read the running-sender, local-error, quarantine, and startup contracts in README/public docs and the relevant error definitions. Derive implementation paths from those sources.
+Apply whenever persistence, reconnect/failover, drainers, startup configuration, or pool lifecycle changes. Read the running-sender, local-error, quarantine, and startup contracts in README/public docs, the accepted limits in `docs/qwp-limits-and-invariants.md`, and the relevant error definitions. Derive implementation paths from those sources.
 
 - **Preserve Invariant B:** running senders, asynchronous initial connection, and background/orphan drain paths keep retrying transport outages and all-replica role-reject windows indefinitely with capped exponential backoff. Check attempt/deadline gates for what they count; a transient outage must not become terminal or quarantine retained rows by spending an unrelated episode budget.
 - Distinguish bounded synchronous initial connection, sanctioned terminal episodes, local-storage failures, and explicit shutdown from transport-outage retry. Resolve exact terminal conditions and policy overrides from maintained contracts; verify each gate's evidence, reset conditions, and reporting.

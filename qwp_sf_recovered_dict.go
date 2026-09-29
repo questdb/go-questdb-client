@@ -51,6 +51,13 @@ type qwpSfRecoveredDictAnalysis struct {
 // The same hole in an already-ACKed frame does no harm as long as no frame
 // waiting to be sent needs it, and a later frame that carries the dictionary
 // from id 0 starts the count over from something known to be complete.
+//
+// An accepted hole stays on disk until the segments holding it are trimmed.
+// The next session seeds its dictionary from the symbols returned here. When
+// there are any, its frames start their deltas above id 0 and sit behind the
+// hole. A restart
+// before that trim sees them waiting to be sent and refuses the slot.
+// docs/qwp-limits-and-invariants.md records this as an accepted limit.
 func qwpSfAnalyzeRecoveredDict(
 	ring *qwpSfSegmentRing,
 	ackedFsn int64,

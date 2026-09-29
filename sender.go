@@ -765,7 +765,7 @@ func WithSfDir(dir string) LineSenderOption {
 // preservation name past the client's bounded length makes that preservation
 // fail rather than truncate into another id's namespace. Share an sf_dir only
 // with clients that use the same reserved names and locking protocol; see the
-// README's "Quarantined slots" section for the restrictions and limits.
+// README's "Quarantined slots" section for the sharing rules.
 //
 // Only available for the QWP sender.
 func WithSenderId(id string) LineSenderOption {

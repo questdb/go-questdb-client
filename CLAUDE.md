@@ -6,6 +6,12 @@ shutdown, start with [README: QWP shutdown and ownership](README.md#qwp-shutdown
 and the relevant method, error, and callback Go docs. Flag disagreements between
 contracts, implementation, tests, and PR claims.
 
+Accepted limits and maintainer invariants for QWP store-and-forward and shutdown
+live in [docs/qwp-limits-and-invariants.md](docs/qwp-limits-and-invariants.md).
+Read it before reporting a listed limit as a defect. Record a newly accepted
+limit there, with its conditions and rationale, not in the README: the README
+holds only what users need to act on.
+
 Paths and symbols below are starting points, not exhaustive inventories. Discover
 callers, interface implementations, wrappers, test helpers, and build-tagged code
 before changing behavior. Do not treat a default, a particular execution path,
@@ -189,9 +195,9 @@ transition is serialised by the parent-anchored lock in `qwp_sf_logical_lock.go`
 its files deliberately remain in place because unlinking a lock pathname can
 split owners across two inodes. Start there, with `qwp_sf_quarantine.go` and
 `qwp_sf_orphan.go`, before changing naming, exclusion, or transition ownership.
-Read README's "Quarantined slots",
-**including its "Guarantees and limits" subsection**, and the
-`QuarantinedSlotPath` / `WithSenderId` Go docs before classifying an accepted
+Read README's "Quarantined slots", **the quarantine section of
+[docs/qwp-limits-and-invariants.md](docs/qwp-limits-and-invariants.md)**, and
+the `QuarantinedSlotPath` / `WithSenderId` Go docs before classifying an accepted
 refusal (destination exhaustion, an over-long name, an ambiguous legacy
 container), a retained resource, a missing best-effort marker or diagnostic, or
 an unsupported sharing mode as a defect. Those bounds do not excuse false
@@ -262,9 +268,11 @@ leases, returns, and retained cleanup. Start with the sender pool, engine, manag
 and orphan-drainer implementations and tests.
 
 Shutdown policy belongs in README's linked shutdown section and the public Close,
-slot-release, error, and callback docs. Neither a cancelled wait nor a finished
-attempt proves resource release. Ownership must survive timeouts and failures;
-verify strong references, quiescence before unmap/reuse, and truthful results.
+slot-release, error, and callback docs; the ownership invariants behind it are in
+[docs/qwp-limits-and-invariants.md](docs/qwp-limits-and-invariants.md). Neither
+a cancelled wait nor a finished attempt proves resource release. Ownership must
+survive timeouts and failures; verify strong references, quiescence before
+unmap/reuse, and truthful results.
 For implementation navigation, start with `qwp_sf_cleanup.go`, `qwp_sf_engine.go`,
 `qwp_sf_manager.go`, sender/query pools, query client, and facade. Follow actual
 ownership transfers rather than preserving a particular cleanup topology.
