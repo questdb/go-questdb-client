@@ -671,9 +671,13 @@ for cleanup behavior, why a slot may stay locked, and how to check for release.
 #### Local errors from the SF path
 
 The following sentinels identify non-terminal backpressure and local-storage
-failures. Unpublished rows remain pending and may be retried on the same sender.
-A failed flush can already have published part of a batch; do not resend
-published work as though nothing happened.
+failures. Rows that were not appended stay pending in the sender: call `Flush`
+again to retry them. It does not resend rows that were already appended. When
+`At` or `AtNow` returns one of these errors, it came from the auto-flush, and
+the row that call finished is already buffered. Don't build that row again, or
+the server receives it twice. Memory-backed QWP senders can also return
+`ErrBackpressureTimeout`, after waiting 30 seconds with their 128 MiB buffer
+full.
 
 | Error | Raised by | Meaning |
 |---|---|---|
@@ -748,7 +752,7 @@ rows, so deleting it is the operator's call. Left unattended, a crash loop can
 park one slot copy per cycle. `.corrupt` files inside a live slot do count
 against `sf_max_total_bytes`: when quarantined bytes exhaust the budget, no new
 segment is minted and the producer sees `qdb.ErrBackpressureTimeout` — the same
-non-terminal, retry-the-call contract as running out of space for live data.
+non-terminal error as running out of space for live data.
 Deleting them frees the space within about a second. Whole-slot copies under
 `.unreplayable-<n>` do not count toward a slot's limit and are never reclaimed
 to regain capacity. The operator owns these copies.

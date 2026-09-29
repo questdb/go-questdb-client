@@ -111,8 +111,10 @@ type QwpSender interface {
 	// flush returns a type-conflict error.
 	//
 	// An auto-flush failure matching [ErrBackpressureTimeout] or
-	// [ErrSfDurability] is non-terminal: the unappended rows remain pending and
-	// may be retried on the same sender.
+	// [ErrSfDurability] is non-terminal. The row this call finished is already
+	// buffered and stays pending with any other unsent rows, so do not build it
+	// again: call Flush to retry sending them. [ErrSfDurability] comes only
+	// from store-and-forward senders.
 	AtNano(ctx context.Context, ts time.Time) error
 
 	// AckedFsn returns the highest server-acknowledged frame
@@ -143,8 +145,10 @@ type QwpSender interface {
 	// confirmation.
 	//
 	// An error matching [ErrBackpressureTimeout] or [ErrSfDurability] is
-	// non-terminal: the unappended rows remain pending and may be retried on
-	// the same sender.
+	// non-terminal: rows that were not appended stay pending, and calling
+	// FlushAndGetSequence or Flush again retries them without resending the
+	// rows that were. [ErrSfDurability] comes only from store-and-forward
+	// senders.
 	FlushAndGetSequence(ctx context.Context) (int64, error)
 
 	// LastTerminalError returns a snapshot of the most recent

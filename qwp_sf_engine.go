@@ -71,13 +71,15 @@ func (s *qwpSfSwappableVar[T]) load() T { return *s.v.Load() }
 var qwpSfCloseRetryInterval = qwpSfSwappable(time.Second)
 
 // ErrBackpressureTimeout is the sentinel a producer call
-// (At / AtNow / Flush / FlushAndGetSequence) wraps when the
-// store-and-forward append deadline (WithSfAppendDeadline /
-// sf_append_deadline_millis) expires before the cursor engine frees
-// space. The wire path is not draining — the server is slow or
-// disconnected, or sf_max_total_bytes is too small. Match it with
-// errors.Is; the wrapped error carries the deadline and reconnect
-// diagnostics in its message.
+// (At / AtNow / Flush / FlushAndGetSequence) wraps when the append
+// deadline expires before the cursor engine frees space. With
+// store-and-forward the deadline is sf_append_deadline_millis
+// (WithSfAppendDeadline); a memory-backed sender waits a fixed 30 seconds
+// with its 128 MiB buffer full. The wire path is not draining — the server
+// is slow or disconnected, or sf_max_total_bytes is too small. The error is
+// non-terminal: rows that were not appended stay pending, and a later Flush
+// retries them. Match it with errors.Is; the wrapped error carries the
+// deadline and reconnect diagnostics in its message.
 var ErrBackpressureTimeout = errors.New(
 	"qwp/sf: cursor ring backpressured — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)")
 

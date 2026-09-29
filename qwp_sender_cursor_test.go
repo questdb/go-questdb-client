@@ -190,6 +190,47 @@ func TestQwpCursorSenderAutoFlushOnRowCount(t *testing.T) {
 	assert.Equal(t, int64(3), loop.sendLoopTotalFramesSent())
 }
 
+// When the auto-flush inside At fails with ErrBackpressureTimeout, the row
+// that call finished is already buffered. A later Flush publishes it exactly
+// once, so the caller retries with Flush rather than building the row again.
+func TestQwpCursorSenderAtBackpressureKeepsTheRowForFlush(t *testing.T) {
+	const segSize int64 = 4096
+	// Two segments of budget: the active one and one spare. Once both hold
+	// frames, only an acknowledgement frees space.
+	engine, err := qwpSfNewCursorEngine("", segSize, 2*segSize, 200*time.Millisecond)
+	require.NoError(t, err)
+	// The send loop never runs, so nothing is sent or acknowledged.
+	loop := qwpSfNewSendLoop(engine, nil, func(context.Context, int) (*qwpTransport, error) {
+		return nil, context.Canceled
+	}, time.Millisecond, time.Second, time.Millisecond, time.Millisecond)
+	s, err := newQwpCursorLineSender(1, 0, 0, 0, engine, loop, 0)
+	require.NoError(t, err)
+	defer func() { _ = s.Close(context.Background()) }()
+
+	ctx := context.Background()
+	rows := 0
+	var atErr error
+	for ; rows < 1000; rows++ {
+		if atErr = s.Table("t").Int64Column("v", int64(rows)).AtNow(ctx); atErr != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, atErr, ErrBackpressureTimeout)
+	require.Positive(t, rows)
+	require.Equal(t, 1, s.pendingRowCount, "the row At finished stays buffered")
+	published := engine.enginePublishedFsn()
+	require.Equal(t, int64(rows-1), published, "one frame per row whose At succeeded")
+
+	engine.engineAcknowledge(published)
+	require.Eventually(t, func() bool {
+		return engine.ring.sealedSegmentCount() == 0 && !engine.ring.needsHotSpare()
+	}, qwpTestWaitTimeout, time.Millisecond, "the acknowledged segment is trimmed and a spare provisioned")
+
+	require.NoError(t, s.Flush(ctx))
+	require.Zero(t, s.pendingRowCount)
+	require.Equal(t, published+1, engine.enginePublishedFsn(), "Flush publishes the kept row in one frame")
+}
+
 func TestQwpCursorSenderCloseDrainsEngine(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()

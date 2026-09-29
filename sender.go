@@ -230,9 +230,11 @@ type LineSender interface {
 	//
 	// If ts.IsZero(), no timestamp is sent to the server.
 	//
-	// For QWP store-and-forward senders, an auto-flush failure matching
-	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
-	// unappended rows remain pending and may be retried on the same sender.
+	// For QWP senders, an auto-flush failure matching [ErrBackpressureTimeout]
+	// or [ErrSfDurability] is non-terminal. The row this call finished is
+	// already buffered and stays pending with any other unsent rows, so do not
+	// build it again: call Flush to retry sending them. [ErrSfDurability]
+	// comes only from store-and-forward senders.
 	At(ctx context.Context, ts time.Time) error
 
 	// AtNow omits designated timestamp value and finalizes the ILP
@@ -243,9 +245,11 @@ type LineSender interface {
 	// number of buffered messages exceeds the auto-flush trigger, this
 	// method also sends the accumulated messages.
 	//
-	// For QWP store-and-forward senders, an auto-flush failure matching
-	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
-	// unappended rows remain pending and may be retried on the same sender.
+	// For QWP senders, an auto-flush failure matching [ErrBackpressureTimeout]
+	// or [ErrSfDurability] is non-terminal. The row this call finished is
+	// already buffered and stays pending with any other unsent rows, so do not
+	// build it again: call Flush to retry sending them. [ErrSfDurability]
+	// comes only from store-and-forward senders.
 	AtNow(ctx context.Context) error
 
 	// Flush sends the accumulated messages via the underlying
@@ -258,9 +262,10 @@ type LineSender interface {
 	// vary from one thousand to few thousand messages depending on
 	// the message size.
 	//
-	// For QWP store-and-forward senders, an error matching
-	// [ErrBackpressureTimeout] or [ErrSfDurability] is non-terminal: the
-	// unappended rows remain pending and may be retried on the same sender.
+	// For QWP senders, an error matching [ErrBackpressureTimeout] or
+	// [ErrSfDurability] is non-terminal: rows that were not appended stay
+	// pending, and calling Flush again retries them without resending the rows
+	// that were. [ErrSfDurability] comes only from store-and-forward senders.
 	Flush(ctx context.Context) error
 
 	// Close closes a standalone sender or returns a borrowed sender to its pool.
