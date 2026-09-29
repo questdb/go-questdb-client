@@ -188,25 +188,31 @@ func qwpSfAssertCrashFileEpochs(
 	require.Empty(t, epoch)
 }
 
+// qwpSfCrashTraceRecorder turns the hooked barriers and commits into crash
+// model events. recorded is the namespace as of the last event that observed
+// it. A name observed at a manifest commit, before any directory barrier, is
+// recorded but not yet durable.
 type qwpSfCrashTraceRecorder struct {
-	t       *testing.T
-	dir     string
-	durable map[string]qwpSfCrashNamespaceFile
-	events  []qwpSfCrashFileEvent
+	t        *testing.T
+	dir      string
+	recorded map[string]qwpSfCrashNamespaceFile
+	events   []qwpSfCrashFileEvent
 }
 
 func qwpSfNewCrashTraceRecorder(t *testing.T, dir string) *qwpSfCrashTraceRecorder {
 	t.Helper()
-	return &qwpSfCrashTraceRecorder{t: t, dir: dir, durable: qwpSfSnapshotCrashNamespace(t, dir)}
+	return &qwpSfCrashTraceRecorder{t: t, dir: dir, recorded: qwpSfSnapshotCrashNamespace(t, dir)}
 }
 
-func (r *qwpSfCrashTraceRecorder) recordDirBarrier(dir string) error {
+// recordNamespaceOps appends a create or remove operation for every segment
+// name that appeared or disappeared since the namespace was last observed.
+// Those operations happened before whatever event is recorded next.
+func (r *qwpSfCrashTraceRecorder) recordNamespaceOps() {
 	r.t.Helper()
-	require.Equal(r.t, r.dir, dir)
 	current := qwpSfSnapshotCrashNamespace(r.t, r.dir)
-	names := make([]string, 0, len(r.durable)+len(current))
-	seen := make(map[string]struct{}, len(r.durable)+len(current))
-	for name := range r.durable {
+	names := make([]string, 0, len(r.recorded)+len(current))
+	seen := make(map[string]struct{}, len(r.recorded)+len(current))
+	for name := range r.recorded {
 		if strings.HasSuffix(name, ".sfa") {
 			seen[name] = struct{}{}
 			names = append(names, name)
@@ -222,21 +228,25 @@ func (r *qwpSfCrashTraceRecorder) recordDirBarrier(dir string) error {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		before, hadBefore := r.durable[name]
+		_, hadBefore := r.recorded[name]
 		after, hasAfter := current[name]
 		switch {
 		case !hadBefore && hasAfter:
 			op := qwpSfCrashFileOp{kind: qwpSfCrashCreate, to: name, file: after}
 			r.events = append(r.events, qwpSfCrashFileEvent{op: &op})
-			r.durable[name] = after
+			r.recorded[name] = after
 		case hadBefore && !hasAfter:
 			op := qwpSfCrashFileOp{kind: qwpSfCrashRemove, from: name}
 			r.events = append(r.events, qwpSfCrashFileEvent{op: &op})
-			delete(r.durable, name)
-		default:
-			_ = before
+			delete(r.recorded, name)
 		}
 	}
+}
+
+func (r *qwpSfCrashTraceRecorder) recordDirBarrier(dir string) error {
+	r.t.Helper()
+	require.Equal(r.t, r.dir, dir)
+	r.recordNamespaceOps()
 	r.events = append(r.events, qwpSfCrashFileEvent{barrier: true})
 	return nil
 }
@@ -248,7 +258,7 @@ func (r *qwpSfCrashTraceRecorder) recordSegmentHeaderCommit(path string) {
 	// committed. The following directory barrier captures both. A later call
 	// is rotation's rebase flush and therefore commits new bytes for an
 	// already-durable name.
-	if _, ok := r.durable[name]; !ok {
+	if _, ok := r.recorded[name]; !ok {
 		return
 	}
 	current := qwpSfSnapshotCrashNamespace(r.t, r.dir)
@@ -256,11 +266,16 @@ func (r *qwpSfCrashTraceRecorder) recordSegmentHeaderCommit(path string) {
 	require.True(r.t, ok)
 	op := qwpSfCrashFileOp{kind: qwpSfCrashReplace, to: name, file: file}
 	r.events = append(r.events, qwpSfCrashFileEvent{commit: &op})
-	r.durable[name] = file
+	r.recorded[name] = file
 }
 
+// recordManifestCommit also observes the segment namespace first. A segment
+// unlinked before the manifest stops naming it is then an operation ahead of
+// the commit, and the crash model tries it against the old manifest, which is
+// the state a process kill between the two leaves.
 func (r *qwpSfCrashTraceRecorder) recordManifestCommit(f *os.File) error {
 	r.t.Helper()
+	r.recordNamespaceOps()
 	if err := qwpSfFsync(f); err != nil {
 		return err
 	}
@@ -270,7 +285,7 @@ func (r *qwpSfCrashTraceRecorder) recordManifestCommit(f *os.File) error {
 	require.True(r.t, ok)
 	op := qwpSfCrashFileOp{kind: qwpSfCrashReplace, to: name, file: file}
 	r.events = append(r.events, qwpSfCrashFileEvent{commit: &op})
-	r.durable[name] = file
+	r.recorded[name] = file
 	return nil
 }
 
@@ -292,9 +307,12 @@ func (r *qwpSfCrashTraceRecorder) install() func() {
 }
 
 // This test drives the actual manager and producer paths while recording their
-// namespace operations, file commits, and named directory barriers. The crash
-// model then enumerates every subset and ordering the filesystem may persist
-// inside each directory epoch.
+// namespace operations, file commits, and named directory barriers. Segment
+// creations and removals are observed at every directory barrier and every
+// manifest commit, so their order relative to a manifest commit is exact, while
+// operations between two observations are recorded together. The crash model
+// then applies every subset and ordering of the operations pending in each
+// directory epoch.
 func TestQwpSfSpareRotationAndTrimCrashEpochsRecover(t *testing.T) {
 	const segmentSize int64 = 72
 	dir := t.TempDir()

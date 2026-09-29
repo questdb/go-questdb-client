@@ -515,6 +515,32 @@ func TestQwpSfRingOpenExistingRejectsFsnGap(t *testing.T) {
 	assert.Nil(t, r)
 }
 
+// With sf-manifest.bin present, a segment missing between the committed head
+// and active boundaries leaves a gap in the chain. Recovery refuses the slot:
+// accepting the two ends would skip the missing frame and never replay it.
+func TestQwpSfRingOpenCommittedChainRejectsMiddleGap(t *testing.T) {
+	dir := t.TempDir()
+	var segs []*qwpSfSegment
+	var paths []string
+	for _, base := range []int64{0, 1, 2} {
+		path := filepath.Join(dir, "sf-"+formatHex16(uint64(base))+".sfa")
+		seg, err := qwpSfCreateSegment(path, base, 4096)
+		require.NoError(t, err)
+		_, err = seg.tryAppend([]byte{byte(base)})
+		require.NoError(t, err)
+		segs = append(segs, seg)
+		paths = append(paths, path)
+	}
+	createRecoveryManifest(t, dir, 0, 2, segs...)
+	closeRecoverySegments(t, segs...)
+	require.NoError(t, os.Remove(paths[1]))
+
+	r, err := qwpSfOpenRing(dir, 4096)
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.Contains(t, err.Error(), "FSN gap")
+	require.Nil(t, r)
+}
+
 func TestQwpSfRingOpenExistingQuarantinesCorruptFirstFrame(t *testing.T) {
 	// A bit-flip in the first frame's CRC makes scanFrames bail out at
 	// HEADER_SIZE with frameCount=0 — but valid frames may follow. The
