@@ -384,8 +384,9 @@ func TestQwpSfCreateSpareSegmentNeverOpensAnExistingFile(t *testing.T) {
 }
 
 // The manager starts writing the active segment back once a step's worth of
-// frames is published, remembers how far it got, and never uses a step larger
-// than a quarter of the segment. A zero step turns early writeback off.
+// whole pages is published, leaving out the page the producer is still
+// filling, remembers how far it got, and never uses a step larger than a
+// quarter of the segment. A zero step turns early writeback off.
 func TestQwpSfManagerStartsWritebackOfTheActiveSegment(t *testing.T) {
 	const segSize int64 = 64 << 10
 	dir := t.TempDir()
@@ -408,35 +409,39 @@ func TestQwpSfManagerStartsWritebackOfTheActiveSegment(t *testing.T) {
 	})
 	t.Cleanup(func() { qwpSfStartWritebackRange.store(primitive) })
 	payload := make([]byte, 1000)
-	appendFrames := func(n int) {
-		for i := 0; i < n; i++ {
+	published := func() int64 { return first.publishedCursor.Load() }
+	appendPast := func(offset int64) {
+		for published() <= offset {
 			require.GreaterOrEqual(t, ring.appendOrFsn(payload), int64(0))
 		}
 	}
+	page := qwpSfPageSize
 
-	qwpSfActiveWritebackBytes.store(8 << 10)
-	appendFrames(2)
+	qwpSfActiveWritebackBytes.store(page)
+	appendPast(page / 2)
 	mgr.writebackActive(entry)
 	require.Empty(t, requested, "less than a step waits for more frames")
-	appendFrames(8)
+	appendPast(page)
+	require.NotZero(t, published()%page, "the producer is part way into the second page")
 	mgr.writebackActive(entry)
-	first8 := first.publishedCursor.Load()
-	require.Equal(t, []span{{0, first8}}, requested)
+	require.Equal(t, []span{{0, page}}, requested,
+		"a request ends at the last whole page, short of the page still being filled")
 
 	qwpSfActiveWritebackBytes.store(1 << 20)
-	appendFrames(17)
+	quarter := segSize / 4
+	appendPast(page + quarter)
 	mgr.writebackActive(entry)
-	require.Equal(t, []span{{0, first8}, {first8, first.publishedCursor.Load()}}, requested,
+	require.Equal(t, []span{{0, page}, {page, published() &^ (page - 1)}}, requested,
 		"a step larger than a quarter of the segment is capped at a quarter (16 KiB here), "+
 			"and each request starts where the previous one ended")
 
 	qwpSfActiveWritebackBytes.store(0)
-	appendFrames(20)
+	appendPast(published() + page)
 	mgr.writebackActive(entry)
 	require.Len(t, requested, 2, "a zero step turns early writeback off")
 
-	require.NoError(t, primitive(first.file, first.buf, 100, first.publishedCursor.Load()),
-		"the platform primitive accepts an unaligned start")
+	require.NoError(t, primitive(first.file, first.buf, 100, published()),
+		"the platform primitive accepts an unaligned range")
 }
 
 // A trim deletes frames that may be the last copy, besides the symbol

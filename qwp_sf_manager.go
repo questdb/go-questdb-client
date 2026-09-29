@@ -1007,6 +1007,10 @@ func (m *qwpSfSegmentManager) logServiceError(dir string, err error) {
 // left to wait for. Benchmarks set it to 0 to turn early writeback off.
 var qwpSfActiveWritebackBytes = qwpSfSwappable(int64(1 << 20))
 
+// qwpSfPageSize is the memory page size, a power of two. Early writeback
+// requests end on a page boundary.
+var qwpSfPageSize = int64(os.Getpagesize())
+
 // writebackActive starts writing the active segment's newly published frames
 // to disk once enough have accumulated, without waiting for the disk. The
 // rotation that later seals the segment must make its frames durable before
@@ -1032,12 +1036,19 @@ func (m *qwpSfSegmentManager) writebackActive(e *qwpSfManagerRingEntry) {
 		e.writebackSegment = active
 		e.writebackOffset = 0
 	}
-	published := active.publishedCursor.Load()
-	if published-e.writebackOffset < step {
+	// End the request at the last whole page. The producer is still writing
+	// into the page that holds the published offset. Writing that page back
+	// would clean and write-protect it, so the next append would fault, and on
+	// storage that needs pages to stay unchanged while they are written, such
+	// as btrfs or a device with integrity checksums, the fault waits for the
+	// write to finish. The rest of the page goes with the next request or the
+	// rotation's sync.
+	end := active.publishedCursor.Load() &^ (qwpSfPageSize - 1)
+	if end-e.writebackOffset < step {
 		return
 	}
-	_ = active.startWriteback(e.writebackOffset, published)
-	e.writebackOffset = published
+	_ = active.startWriteback(e.writebackOffset, end)
+	e.writebackOffset = end
 }
 
 // closeServiceResidue finishes work left by the manager. Call it only after
