@@ -556,12 +556,17 @@ func BenchmarkQwpGorillaDecode(b *testing.B) {
 // Every frame is acknowledged immediately so the segment manager keeps trimming
 // and the benchmark stays inside its byte cap however long it runs.
 //
-// The mean hides what matters here: a rotation costs three orders of magnitude
-// more than a plain append, so it moves the tail and barely moves the average.
-// At the default 4 MiB segment and 512-byte frames a rotation falls on about
-// one append in eight thousand, which is why the reported tail is p99.9 --
-// along with max, which also catches an append that had to wait for the manager
-// to install the next spare.
+// The mean hides what matters here, so the benchmark also reports p99.9 and
+// max. A rotation costs about three orders of magnitude more than a plain
+// append, but at the default 4 MiB segment and 512-byte frames it falls on
+// about one append in eight thousand, beyond p99.9. Rotations therefore show in
+// max, as does an append that had to wait for the manager to install the next
+// spare. p99.9 shows costs that recur more often, such as the page fault on the
+// first write into each page of the active segment. On APFS that fault reads
+// the page back from disk once an fsync has reached the new segment, because
+// the first fsync of a preallocated file writes zeros over all of it; that
+// dominates p99.9 there. ext4 and XFS leave preallocated space unwritten, so a
+// first write is zero-filled in memory without a read.
 func BenchmarkQwpSfPublish(b *testing.B) {
 	const (
 		segmentBytes int64 = 4 << 20
