@@ -84,8 +84,8 @@ jobs:
           RUN_URL=$(jq -r '._links.web.href // ""' "$RESPONSE_FILE")
           echo "Enterprise build queued: ${RUN_URL}"
 
-  windows-retained-reader:
-    name: QWP SF cleanup ownership (Windows)
+  windows-sf:
+    name: QWP store-and-forward tests (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,27 +93,26 @@ jobs:
         with:
           go-version: '1.23.x'
           cache: true
-      - name: Execute retained-reader, terminal-retention, and native release regressions
+      - name: Run store-and-forward tests
         env:
           GOTOOLCHAIN: local
         shell: pwsh
-        # The root suite has Unix-only JVM fixture helpers referenced by
-        # untagged tests. Build all Windows production sources with this
-        # self-contained regression, rather than silently skipping it.
+        # Runs every TestQwpSf* test in the package, three times to shake
+        # out timing-dependent ownership failures. Tests that need a live
+        # QuestDB skip on Windows (qwp_fuzz_fixture_windows_test.go). The
+        # floor on distinct test names fails the job when the selection
+        # silently stops matching, which go test reports as a pass.
         run: |
-          $json = go list -json .
+          go test -run '^TestQwpSf' -count=3 -timeout 30m -v . | Tee-Object -Variable log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $pkg = ($json -join "`n") | ConvertFrom-Json
-          if ($pkg.CgoFiles.Count -or $pkg.SFiles.Count) {
-            throw 'File-list test build must be updated for native source files'
+          $names = $log |
+            Select-String -Pattern '^=== RUN   (TestQwpSf[^/\s]*)$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value } |
+            Sort-Object -Unique
+          if ($names.Count -lt 350) {
+            throw "only $($names.Count) store-and-forward tests ran; expected at least 350"
           }
-          $source = $pkg.GoFiles
-          $tests = @('qwp_sf_test_helpers_test.go', 'qwp_sf_retained_reader_test.go', 'qwp_sf_cleanup_fault_test.go', 'qwp_sf_cleanup_state_test.go', 'qwp_sf_cleanup_release_test.go', 'qwp_sf_files_windows_test.go')
-          go test -c -o retained-reader.test.exe @source @tests
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Allow the subprocess watchdogs to report failures before the suite watchdog.
-          .\retained-reader.test.exe '-test.run=^TestQwpSf' '-test.v' '-test.count=3' '-test.timeout=10m'
-          exit $LASTEXITCODE
+          Write-Output "$($names.Count) store-and-forward tests ran"
 
   test:
     runs-on: ubuntu-latest
@@ -151,6 +150,15 @@ jobs:
           GOARCH: arm64
           CGO_ENABLED: '0'
         run: go build ./...
+
+      - name: Vet for Windows
+        # Builds and vets the Windows production code and every Windows test
+        # file, so a change that breaks the Windows build fails on every
+        # run. The windows-sf job executes the store-and-forward tests.
+        env:
+          GOTOOLCHAIN: local
+          GOOS: windows
+        run: go vet ./...
 
       - name: Run Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
