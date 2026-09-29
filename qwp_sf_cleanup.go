@@ -181,7 +181,7 @@ func (e *qwpSfCursorEngine) engineCleanupWorker(cause error) {
 	e.appendMu.Lock()
 	defer e.appendMu.Unlock()
 	qwpSfRunCleanupTestHook(qwpSfCleanupTestAfterQuiescence)
-	fullyDrained := e.sfDir != "" && e.ring != nil && e.ring.segmentRingAckedFsn() >= e.ring.segmentRingPublishedFsn()
+	fullyDrained := !e.buildFailed && e.sfDir != "" && e.ring != nil && e.ring.segmentRingAckedFsn() >= e.ring.segmentRingPublishedFsn()
 	// Remember which disk updates finished so storage-error retries can skip
 	// them. A panic stops cleanup instead of retrying.
 	barriersDone, segmentsGone, manifestGone := !fullyDrained, false, false

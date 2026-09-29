@@ -496,7 +496,10 @@ func TestQwpSfSymbolDictHeaderOnlyIsEmpty(t *testing.T) {
 	require.NoError(t, d.close())
 }
 
-func TestQwpSfSymbolDictBadTrailingChunkTruncatesToTrustedPrefix(t *testing.T) {
+// A bad trailing chunk stays on disk until recovery accepts the slot, so a
+// slot it refuses is preserved with those bytes; dropUntrustedTail then cuts
+// the file back to the trusted prefix.
+func TestQwpSfSymbolDictBadTrailingChunkIsDroppedOnceAccepted(t *testing.T) {
 	valid := qwpSfTestSymbolDictChunk("ok")
 	crcFlip := qwpSfTestSymbolDictChunk("bad")
 	crcFlip[len(crcFlip)-1] ^= 0xff
@@ -530,12 +533,41 @@ func TestQwpSfSymbolDictBadTrailingChunkTruncatesToTrustedPrefix(t *testing.T) {
 			d, err := qwpSfSymbolDictOpenRecovered(dir)
 			require.NoError(t, err)
 			require.Equal(t, []string{"ok"}, d.loadedSymbols())
-			require.NoError(t, d.close())
 			got, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, contents, got, "the untrusted tail stays until recovery accepts the slot")
+			require.NoError(t, d.dropUntrustedTail())
+			require.NoError(t, d.close())
+			got, err = os.ReadFile(path)
 			require.NoError(t, err)
 			require.Equal(t, prefix, got, "untrusted tail must be physically truncated")
 		})
 	}
+}
+
+// An append must never land in front of leftover tail bytes: a new chunk
+// shorter than the tail would leave the rest of it behind, where a later
+// recovery could read it as entries. The append drops the tail first.
+func TestQwpSfSymbolDictAppendDropsUntrustedTailFirst(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, qwpSfSymbolDictFileName)
+	prefix := append(qwpSfTestSymbolDictHeader(), qwpSfTestSymbolDictChunk("ok")...)
+	longTail := qwpSfTestSymbolDictChunk("a-much-longer-symbol-than-the-next-append")
+	longTail[len(longTail)-1] ^= 0xff
+	require.NoError(t, os.WriteFile(path, append(append([]byte(nil), prefix...), longTail...), 0o644))
+
+	d, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.NoError(t, d.appendSymbols([]string{"MS"}))
+	require.NoError(t, d.close())
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, append(append([]byte(nil), prefix...), qwpSfTestSymbolDictChunk("MS")...), got)
+
+	reopened, err := qwpSfSymbolDictOpenRecovered(dir)
+	require.NoError(t, err)
+	require.Equal(t, []string{"ok", "MS"}, reopened.loadedSymbols())
+	require.NoError(t, reopened.close())
 }
 
 func TestQwpSfSymbolDictZeroValidChunksKeepsCorruptDisposition(t *testing.T) {
@@ -628,13 +660,21 @@ func TestQwpSfSymbolDictTruncateFailureIsOperational(t *testing.T) {
 	t.Cleanup(func() { qwpSfSymbolDictTruncate.store(originalTruncate) })
 
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
-	require.Nil(t, d)
-	require.ErrorContains(t, err, "could not drop torn/stale")
+	require.NoError(t, err, "opening leaves the tail alone, so it cannot fail on truncation")
+	defer func() { require.NoError(t, d.close()) }()
+	err = d.dropUntrustedTail()
+	require.ErrorContains(t, err, "drop torn or stale symbol dictionary tail")
 	require.ErrorIs(t, err, ErrSfDurability)
 	require.ErrorIs(t, err, injected)
 	got, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
 	require.Equal(t, contents, got, "failed truncation must preserve the file for retry")
+
+	require.ErrorIs(t, d.appendSymbols([]string{"MS"}), injected,
+		"an append must not write in front of a tail it could not drop")
+	got, readErr = os.ReadFile(path)
+	require.NoError(t, readErr)
+	require.Equal(t, contents, got)
 }
 
 func qwpSfTestSymbolDictHeader() []byte {

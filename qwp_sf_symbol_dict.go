@@ -90,6 +90,10 @@ type qwpSfSymbolDict struct {
 	file         *os.File
 	path         string
 	appendOffset int64
+	// untrustedEnd is where the file ends when an open left bytes after the
+	// last chunk whose checksum matched. It is no greater than appendOffset
+	// when there is no such tail.
+	untrustedEnd int64
 	count        int
 	// unsynced records an append that syncAppended has not made durable yet.
 	unsynced bool
@@ -161,6 +165,10 @@ func qwpSfSymbolDictOpen(slotDir string) (*qwpSfSymbolDict, error) {
 		if st.Size() >= qwpSfSymbolDictHeaderSize {
 			d, openErr := qwpSfSymbolDictOpenExistingDetailed(path, st.Size())
 			if openErr == nil {
+				if tailErr := d.dropUntrustedTail(); tailErr != nil {
+					_ = d.close()
+					return nil, tailErr
+				}
 				return d, nil
 			}
 			if !errors.Is(openErr, errQwpSfSymbolDictUnusable) {
@@ -214,12 +222,14 @@ func qwpSfSymbolDictOpenClean(slotDir string) (*qwpSfSymbolDict, error) {
 // It returns:
 //
 //   - (dict, nil) when the header is valid. Only the run of chunks whose
-//     checksums match is loaded, and anything after it is truncated.
+//     checksums match is loaded. Anything after it stays on disk until the
+//     engine accepts the slot and calls dropUntrustedTail, so a slot recovery
+//     refuses is preserved with those bytes.
 //   - (nil, nil) when the file is absent, or its content cannot be used (too
 //     short, bad magic or version, or larger than the read limit). The file is
 //     left as it is, and the frame scan decides whether the slot is recoverable.
-//   - (nil, err) when stat/open/read fails, or the untrusted tail cannot be
-//     truncated. The caller turns that into a recovery failure.
+//   - (nil, err) when stat/open/read fails. The caller turns that into a
+//     recovery failure.
 func qwpSfSymbolDictOpenRecovered(slotDir string) (*qwpSfSymbolDict, error) {
 	if slotDir == "" {
 		return nil, nil
@@ -259,11 +269,12 @@ func qwpSfSymbolDictRemoveOrphan(slotDir string) {
 	_ = os.Remove(filepath.Join(slotDir, qwpSfSymbolDictFileName))
 }
 
-// qwpSfSymbolDictOpenExistingDetailed opens an existing side-file, loads the
-// run of chunks whose checksums match, and truncates whatever follows. Failures
-// come in two kinds: errQwpSfSymbolDictUnusable for damaged content, which lets
-// recovery fall back to reading the surviving frames, and plain I/O errors,
-// which may succeed on a later attempt and are returned as they are.
+// qwpSfSymbolDictOpenExistingDetailed opens an existing side-file and loads the
+// run of chunks whose checksums match, leaving whatever follows on disk until
+// dropUntrustedTail or the first append removes it. Failures come in two kinds:
+// errQwpSfSymbolDictUnusable for damaged content, which lets recovery fall back
+// to reading the surviving frames, and plain I/O errors, which may succeed on a
+// later attempt and are returned as they are.
 func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (result *qwpSfSymbolDict, err error) {
 	if fileLen > qwpSfSymbolDictMaxFileSize {
 		return nil, errQwpSfSymbolDictUnusable
@@ -299,23 +310,49 @@ func qwpSfSymbolDictOpenExistingDetailed(path string, fileLen int64) (result *qw
 		// and let the frame scan rebuild the dictionary from nothing.
 		return nil, errQwpSfSymbolDictUnusable
 	}
-	// Cut the file back to the last trusted byte before handing out a handle
-	// that can append. The next append may be shorter than the tail being
-	// replaced, and writing at pos alone would leave the rest of that tail on
-	// disk, where a later recovery could read it as real entries and shift
-	// every id after it.
-	if int64(pos) < fileLen {
-		if err := qwpSfSymbolDictTruncate.load()(f, int64(pos)); err != nil {
-			return nil, fmt.Errorf("qwp/sf: could not drop torn/stale symbol dictionary tail %s: %w", path, err)
-		}
-	}
+	// The bytes after pos stay on disk for now. Recovery may still refuse the
+	// slot, and a preserved copy must then keep them; dropUntrustedTail cuts
+	// them once the slot is accepted, and appendSymbols cuts them before its
+	// first write in any case.
 	return &qwpSfSymbolDict{
 		file:         f,
 		path:         path,
 		appendOffset: int64(pos),
+		untrustedEnd: fileLen,
 		count:        len(loaded),
 		loaded:       loaded,
 	}, nil
+}
+
+// dropUntrustedTail cuts the file back to the last chunk whose checksum
+// matched, if the open left anything after it. Recovery calls it once it has
+// accepted the slot.
+func (d *qwpSfSymbolDict) dropUntrustedTail() error {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil
+	}
+	return d.dropUntrustedTailLocked()
+}
+
+// dropUntrustedTailLocked must run before anything is appended. An append may
+// be shorter than the tail it replaces, and writing at appendOffset alone would
+// leave the rest of that tail on disk, where a later recovery could read it as
+// real entries and shift every id after it.
+func (d *qwpSfSymbolDict) dropUntrustedTailLocked() error {
+	if d.untrustedEnd <= d.appendOffset {
+		return nil
+	}
+	if err := qwpSfSymbolDictTruncate.load()(d.file, d.appendOffset); err != nil {
+		return qwpSfDurabilityError("drop torn or stale symbol dictionary tail", d.path, err)
+	}
+	d.untrustedEnd = d.appendOffset
+	d.unsynced = true
+	return nil
 }
 
 // qwpSfParseChunkedSymbolDict reads the one-chunk-per-append stream, in the
@@ -459,6 +496,9 @@ func (d *qwpSfSymbolDict) appendSymbols(names []string) error {
 	defer d.mu.Unlock()
 	if d.closed {
 		return nil
+	}
+	if err := d.dropUntrustedTailLocked(); err != nil {
+		return err
 	}
 	if len(names) > qwpMaxSymbolDictionarySize-d.count {
 		return fmt.Errorf("qwp/sf: symbol dictionary exceeds maximum size %d", qwpMaxSymbolDictionarySize)

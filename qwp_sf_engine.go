@@ -225,6 +225,13 @@ type qwpSfCursorEngine struct {
 	// handed to its caller.
 	quarantinedPath string
 
+	// buildFailed marks the cleanup owner of a construction that did not
+	// complete. Its cleanup releases resources and never runs the
+	// drained-slot deletion: a slot whose recovery was refused, or whose
+	// open failed partway, may be about to be preserved, or retried, with
+	// every byte it holds.
+	buildFailed bool
+
 	// backpressureStalls counts how many times appendBlocking
 	// observed qwpSfBackpressureNoSpare on its first try and had to
 	// wait. One increment per blocking-call (not per spin).
@@ -573,7 +580,7 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 		}
 		r := recover()
 		held := &qwpSfCursorEngine{sfDir: sfDir, manager: mgr, ring: ring, slotLock: lock,
-			watermark: watermark, persistedSymbolDict: persistedDict}
+			watermark: watermark, persistedSymbolDict: persistedDict, buildFailed: true}
 		if ring == nil {
 			if initial != nil {
 				held.looseSegments = []*qwpSfSegment{initial}
@@ -782,6 +789,12 @@ func qwpSfBuildCursorEngine(sfDir string, segmentSizeBytes int64, mgr *qwpSfSegm
 			}
 			recoveredSymbols = analysis.symbols
 			recoveredMaxStart = analysis.maxReplayDeltaStart
+			// The analysis accepted the slot, so the side-file's unverified
+			// tail can go now. Cutting it any earlier would leave a slot the
+			// analysis refuses without the very bytes that disagreed.
+			if err := persistedDict.dropUntrustedTail(); err != nil {
+				return nil, err
+			}
 
 			// The side-file may cover fewer ids than the frames do. Write the
 			// difference back now, while those frames are still around — once
