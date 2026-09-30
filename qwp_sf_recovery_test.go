@@ -765,8 +765,7 @@ func TestQwpSfRecoveryDiscardsActiveTailInPlace(t *testing.T) {
 				require.NoError(t, err)
 				identity, err := os.Stat(path)
 				require.NoError(t, err)
-				names, err := os.ReadDir(dir)
-				require.NoError(t, err)
+				names := qwpTestDirNames(t, dir)
 				var sealedBefore []byte
 				if sealedFrames > 0 {
 					sealedBefore, err = os.ReadFile(filepath.Join(dir, "sf-sealed.sfa"))
@@ -792,9 +791,7 @@ func TestQwpSfRecoveryDiscardsActiveTailInPlace(t *testing.T) {
 				current, err := os.Stat(path)
 				require.NoError(t, err)
 				require.True(t, os.SameFile(identity, current), "recovery must retain the active file")
-				currentNames, err := os.ReadDir(dir)
-				require.NoError(t, err)
-				require.Equal(t, names, currentNames, "no replacement or evidence files may be created")
+				require.Equal(t, names, qwpTestDirNames(t, dir), "no replacement or evidence files may be created")
 				if sealedFrames > 0 {
 					sealedAfter, err := os.ReadFile(filepath.Join(dir, "sf-sealed.sfa"))
 					require.NoError(t, err)

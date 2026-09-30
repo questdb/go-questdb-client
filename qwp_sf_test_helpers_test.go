@@ -46,6 +46,20 @@ const (
 	qwpTestAppendTimeout = 30 * time.Second
 )
 
+// qwpTestDirNames lists the names in dir, sorted. Tests compare names rather
+// than os.DirEntry values, which on Windows carry file times that an in-place
+// rewrite changes.
+func qwpTestDirNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	return names
+}
+
 // qwpTestSubprocess gives multi-step recovery/ownership fixtures room for slow
 // storage and race instrumentation. The child's watchdog dumps stacks before
 // the parent's hard stop; neither timeout is a cleanup correctness assertion.

@@ -31,6 +31,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -631,6 +632,9 @@ func TestQwpSfDrainerEngineRetriesSanitizedResidue(t *testing.T) {
 // so must the directory fsync, or the retry owner keeps the flock and (in the
 // pool) the slot's index reservation forever.
 func TestQwpSfEngineDrainedCleanupToleratesMissingSlotDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not delete files a process holds open or mapped, so the slot directory cannot disappear under a live engine")
+	}
 	dir := t.TempDir()
 	e, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
 	require.NoError(t, err)

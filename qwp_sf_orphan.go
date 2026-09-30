@@ -84,14 +84,27 @@ func qwpSfScanOrphans(sfDir string, exclude func(name string) bool) []string {
 // so an inspection failure is reported as the operational fault it is instead
 // of being indistinguishable from an ordinary exclusion. A missing root is
 // expected and stays quiet; other root inspection failures are logged.
+//
+// A root that exists but is not a directory is reported from the Stat result.
+// Listing it would not tell the two apart on every platform: on Windows the
+// ENOTDIR a directory read returns is ERROR_PATH_NOT_FOUND, which matches
+// os.ErrNotExist.
 func qwpSfScanOrphansWithLogger(sfDir string, exclude func(name string) bool, logger *slog.Logger) []string {
 	if sfDir == "" {
 		return nil
 	}
-	if _, err := os.Stat(sfDir); err != nil {
+	st, err := os.Stat(sfDir)
+	if err != nil {
 		if logger != nil && !errors.Is(err, os.ErrNotExist) {
 			qwpEffectiveLogger(logger).Error("qwp/sf: could not scan orphan root",
 				"root", sfDir, "error", err)
+		}
+		return nil
+	}
+	if !st.IsDir() {
+		if logger != nil {
+			qwpEffectiveLogger(logger).Error("qwp/sf: could not scan orphan root",
+				"root", sfDir, "error", "not a directory")
 		}
 		return nil
 	}
