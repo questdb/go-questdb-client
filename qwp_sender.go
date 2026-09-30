@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -1349,18 +1350,21 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // silently ship it as a phantom/duplicate row. A latched error must surface
 // (retain-on-error) without suppressing the flush of already-committed rows.
 //
-// Returns the first error: the captured latch (the original user-facing cause)
-// takes precedence, else an enqueue or terminal I/O failure. On a latch-only
-// error the committed rows are flushed regardless, and any terminal fault is
-// surfaced so the pool discards the slot instead of recycling a dead one.
+// Returns the captured latch (the original user-facing cause) joined with any
+// enqueue failure, so the caller sees both why the borrower's input was
+// rejected and why committed rows were not queued. With neither, it returns a
+// terminal I/O failure if the send loop latched one. On a latch-only error the
+// committed rows are flushed regardless, and any terminal fault is surfaced so
+// the pool discards the slot instead of recycling a dead one.
 //
 // The first return value, retained, reports whether committed rows are STILL
 // buffered un-enqueued after the attempt — the enqueue hit the backpressure
-// append deadline (e.g. the cursor ring saturated during an outage) or the
-// engine was closed, neither of which is a terminal send-loop HALT. Such a slot
-// is DIRTY: recycling it would ship this borrower's rows under the next
-// borrower's FSN (borrower-isolation). The pool must discard it rather than
-// recycle. Like other mutating methods, this runs only on the handle's owner.
+// append deadline (e.g. the cursor ring saturated during an outage), local
+// storage refused the write, or the engine was closed. Such a slot is DIRTY:
+// recycling it with those rows would ship this borrower's rows under the next
+// borrower's FSN (borrower-isolation). The pool either drops them with
+// discardPending or discards the sender. Like other mutating methods, this
+// runs only on the handle's owner.
 func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err error) {
 	if s.closed.Load() {
 		return false, errClosedSenderFlush
@@ -1377,9 +1381,7 @@ func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err 
 	}
 	if s.pendingRowCount > 0 {
 		if err := s.enqueueCursor(ctx); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			firstErr = errors.Join(firstErr, err)
 		} else {
 			s.resetAfterFlush()
 		}
@@ -1394,9 +1396,20 @@ func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err 
 		}
 	}
 	// pendingRowCount > 0 here means enqueueCursor could not seal the
-	// committed rows (backpressure deadline / engine closed); enqueueCursor
-	// leaves them retained for a later flush. The slot is dirty.
+	// committed rows (backpressure deadline, storage failure, engine closed);
+	// enqueueCursor leaves them retained for a later flush. The slot is dirty.
 	return s.pendingRowCount > 0, firstErr
+}
+
+// discardPending drops the committed rows a lease return could not queue and
+// reports how many there were. It leaves the producer as a successful flush
+// does, so the sender can serve the next borrower without carrying these rows;
+// resetAfterFlush reclaims the symbol ids only these rows used. Producer
+// goroutine only.
+func (s *qwpLineSender) discardPending() int {
+	dropped := s.pendingRowCount
+	s.resetAfterFlush()
+	return dropped
 }
 
 // FlushAndGetSequence implements QwpSender.FlushAndGetSequence.

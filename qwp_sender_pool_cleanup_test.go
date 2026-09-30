@@ -65,6 +65,9 @@ func (s *poolFaultSender) flushForReturn(context.Context) (bool, error) {
 	}
 	return false, nil
 }
+func (s *poolFaultSender) discardPending() int { return 0 }
+
+var _ returnFlusher = (*poolFaultSender)(nil)
 
 // Run in a child process because the failed slots must stay locked until that
 // process exits. The test must not retry or repair their failed cleanup.

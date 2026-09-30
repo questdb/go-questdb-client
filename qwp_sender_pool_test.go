@@ -31,6 +31,7 @@ import (
 	"go/parser"
 	"go/token"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -852,16 +853,14 @@ func TestQwpLineSenderFlushForReturnRetainsRowsOnEnqueueFailure(t *testing.T) {
 	}
 }
 
-// TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot is the end-to-end
-// regression for the backpressure discard path. A lease returned while the cursor
-// ring is saturated and the wire cannot drain (an outage) cannot flush its
-// committed rows on return: flushForReturn hits the backpressure append deadline
-// and RETAINS them. A backpressure timeout is not a terminal HALT, so
-// markBrokenIfTerminal leaves the slot healthy — and recycling it would encode
-// borrower A's retained rows into borrower B's next flush, shipping them under
-// B's FSN (and a second time once A retries the error). Close must instead
-// discard the dirty slot.
-func TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot(t *testing.T) {
+// A lease returned while the cursor ring is saturated and the wire cannot drain
+// (an outage) cannot queue its committed rows: flushForReturn hits the
+// backpressure append deadline and retains them. Recycling the sender with
+// those rows would encode borrower A's rows into borrower B's next flush, under
+// B's FSN. Discarding the sender would lose the frames its ring still holds for
+// earlier borrowers. Close drops only A's un-queued rows, reports them, and
+// keeps the sender, frames and all.
+func TestQwpSenderPoolReturnBackpressureDropsLeaseRowsKeepsSender(t *testing.T) {
 	// A server that completes the upgrade and drains frames off the wire but
 	// NEVER ACKs, so the ring's ACK-driven trim never advances and the ring
 	// fills — the outage condition that makes backpressure bite.
@@ -889,8 +888,7 @@ func TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot(t *testing.T) {
 		";sf_dir=" + t.TempDir() +
 		";sf_max_segment_bytes=8192;sf_max_total_bytes=8192;sf_append_deadline_millis=50" +
 		";close_flush_timeout_millis=1;auto_flush=off;"
-	// min == max == 1 forces the re-borrow to reuse the recycled slot — unless
-	// this Close discards it, which is exactly what we assert.
+	// min == max == 1: the re-borrow must get the same sender back.
 	p, err := newQwpSenderPool(context.Background(), conf, 1, 1, 500*time.Millisecond, 0, 0, nil, nil, QwpBackgroundDrainerListener{}, nil)
 	if err != nil {
 		t.Fatalf("newQwpSenderPool: %v", err)
@@ -931,31 +929,232 @@ func TestQwpSenderPoolReturnBackpressureDiscardsDirtySlot(t *testing.T) {
 		t.Fatal("backpressure is not a terminal HALT — the slot must not be broken yet")
 	}
 
-	// Return the lease. flushForReturn re-hits backpressure and retains the rows;
-	// Close must discard the dirty slot rather than recycle it.
-	if err := s.Close(ctx); err == nil {
-		t.Fatal("Close did not surface the backpressure error")
+	// Return the lease with one more committed row. flushForReturn re-hits
+	// backpressure and retains both rows; Close drops them and keeps the sender.
+	pending := delegate.pendingRowCount + 1
+	if err := s.Table("t").Int64Column("v", -1).At(ctx, time.Unix(0, 1)); err != nil {
+		t.Fatalf("At before return: %v", err)
 	}
-	if !ps.broken {
-		t.Fatal("dirty slot (rows retained on backpressure) was NOT marked broken — it would be recycled carrying borrower A's rows")
+	published := delegate.cursorEngine.enginePublishedFsn()
+	err = s.Close(ctx)
+	if !errors.Is(err, ErrBackpressureTimeout) {
+		t.Fatalf("Close = %v, want ErrBackpressureTimeout", err)
 	}
-	if total, _, leaked := p.poolSnapshot(); total != 0 || leaked != 0 {
-		t.Fatalf("dirty slot not discarded: total=%d leaked=%d, want 0/0", total, leaked)
+	if want := "droppedRows=" + strconv.Itoa(pending); !strings.Contains(err.Error(), want) {
+		t.Fatalf("Close = %v, want it to report %s", err, want)
+	}
+	if ps.broken {
+		t.Fatal("a backpressured return discarded the sender and the frames its ring still holds")
+	}
+	if delegate.pendingRowCount != 0 {
+		t.Fatalf("the returned lease's rows are still buffered: pendingRowCount = %d, want 0", delegate.pendingRowCount)
+	}
+	if got := delegate.cursorEngine.enginePublishedFsn(); got != published {
+		t.Fatalf("dropped rows were published: FSN %d -> %d", published, got)
+	}
+	if total, _, leaked := p.poolSnapshot(); total != 1 || leaked != 0 {
+		t.Fatalf("sender not kept: total=%d leaked=%d, want 1/0", total, leaked)
 	}
 
-	// Re-borrow: min=1 rebuilds a FRESH slot (a different delegate), clean.
 	s2, err := p.borrow(ctx)
 	if err != nil {
-		t.Fatalf("re-borrow after discard: %v", err)
+		t.Fatalf("re-borrow: %v", err)
 	}
 	defer s2.Close(ctx)
 	d2 := s2.(*qwpPooledSender).slot.delegate.(*qwpLineSender)
-	if d2 == delegate {
-		t.Fatal("re-borrow reused the discarded dirty delegate")
+	if d2 != delegate {
+		t.Fatal("re-borrow got a different sender; the returned one was discarded")
 	}
 	if d2.pendingRowCount != 0 {
-		t.Fatalf("re-borrowed slot has stale rows: pendingRowCount = %d, want 0", d2.pendingRowCount)
+		t.Fatalf("re-borrowed sender carries the previous lease's rows: pendingRowCount = %d, want 0", d2.pendingRowCount)
 	}
+}
+
+// qwpRestartableAckServer acknowledges every QWP frame and can go down, so a
+// connect is refused, then come back on the same address. It counts the frames
+// that contain each marker.
+type qwpRestartableAckServer struct {
+	addr    string
+	mu      sync.Mutex
+	hs      *http.Server
+	conns   map[*websocket.Conn]struct{}
+	markers map[string]int
+}
+
+func newQwpRestartableAckServer(t *testing.T, markers ...string) *qwpRestartableAckServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	s := &qwpRestartableAckServer{addr: ln.Addr().String(), conns: map[*websocket.Conn]struct{}{}, markers: map[string]int{}}
+	for _, m := range markers {
+		s.markers[m] = 0
+	}
+	s.serve(ln)
+	t.Cleanup(s.stop)
+	return s
+}
+
+func (s *qwpRestartableAckServer) serve(ln net.Listener) {
+	hs := &http.Server{Handler: http.HandlerFunc(s.handle)}
+	s.mu.Lock()
+	s.hs = hs
+	s.mu.Unlock()
+	go func() { _ = hs.Serve(ln) }()
+}
+
+// start listens on the original address again. A port just released can take
+// a moment to become available.
+func (s *qwpRestartableAckServer) start(t *testing.T) {
+	t.Helper()
+	var ln net.Listener
+	require.Eventually(t, func() bool {
+		var err error
+		ln, err = net.Listen("tcp", s.addr)
+		return err == nil
+	}, qwpTestWaitTimeout, 10*time.Millisecond, "relisten on %s", s.addr)
+	s.serve(ln)
+}
+
+// stop closes the listener and every open connection.
+func (s *qwpRestartableAckServer) stop() {
+	s.mu.Lock()
+	hs := s.hs
+	s.hs = nil
+	conns := make([]*websocket.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	if hs != nil {
+		_ = hs.Close()
+	}
+	for _, c := range conns {
+		_ = c.CloseNow()
+	}
+}
+
+func (s *qwpRestartableAckServer) count(marker string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.markers[marker]
+}
+
+func (s *qwpRestartableAckServer) handle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set(qwpHeaderVersion, "1")
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	if s.hs == nil {
+		s.mu.Unlock()
+		_ = conn.CloseNow()
+		return
+	}
+	s.conns[conn] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		_ = conn.CloseNow()
+	}()
+	for seq := int64(0); ; seq++ {
+		_, data, err := conn.Read(context.Background())
+		if err != nil {
+			return
+		}
+		s.mu.Lock()
+		for m := range s.markers {
+			if strings.Contains(string(data), m) {
+				s.markers[m]++
+			}
+		}
+		s.mu.Unlock()
+		if err := conn.Write(context.Background(), websocket.MessageBinary, buildAckOK(seq)); err != nil {
+			return
+		}
+	}
+}
+
+// dial connects to the server for a send loop's initial connect and reconnects.
+func (s *qwpRestartableAckServer) dial() qwpSfReconnectFactory {
+	return func(ctx context.Context, _ int) (*qwpTransport, error) {
+		var t qwpTransport
+		if err := t.connect(ctx, "ws://"+s.addr, qwpTransportOpts{endpointPath: qwpWritePath}); err != nil {
+			return nil, err
+		}
+		return &t, nil
+	}
+}
+
+// A memory-mode pool keeps an earlier borrower's rows through an outage even
+// when a later borrower's return hits backpressure. A1's Close returned nil, so
+// its row must reach the server once the server is back, and the row A2 could
+// not queue must not.
+func TestQwpSenderPoolBackpressuredReturnKeepsEarlierBorrowersRows(t *testing.T) {
+	srv := newQwpRestartableAckServer(t, "ROW_A1", "ROW_A2_DROPPED", "ROW_B")
+	ctx := context.Background()
+	// The pool's own senders use the fixed 128 MiB memory ring and 30 s append
+	// deadline. This sender has a two-segment ring and a 100 ms deadline, so
+	// the outage fills it within a few flushes; the return path under test is
+	// the same.
+	engine, err := qwpSfNewCursorEngine("", 8192, 16384, 100*time.Millisecond)
+	require.NoError(t, err)
+	transport, err := srv.dial()(ctx, 0)
+	require.NoError(t, err)
+	loop := qwpSfNewSendLoop(engine, transport, srv.dial(),
+		time.Millisecond, time.Minute, 10*time.Millisecond, 50*time.Millisecond)
+	loop.sendLoopStart()
+	delegate, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 200*time.Millisecond)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = delegate.Close(context.Background())
+		_ = loop.sendLoopClose()
+	})
+	slot := &qwpSenderSlot{slotIndex: -1, delegate: delegate}
+	p := &qwpSenderPool{maxSize: 1, notify: make(chan struct{}), all: []*qwpSenderSlot{slot}, available: []*qwpSenderSlot{slot}}
+
+	srv.stop() // outage
+
+	a1, err := p.borrow(ctx)
+	require.NoError(t, err)
+	require.NoError(t, a1.Table("t").StringColumn("m", "ROW_A1").At(ctx, time.Unix(0, 1)))
+	require.NoError(t, a1.Close(ctx), "A1's row is queued in the ring")
+
+	a2, err := p.borrow(ctx)
+	require.NoError(t, err)
+	filler := strings.Repeat("x", 1024)
+	var sawBackpressure bool
+	for i := 0; i < 1000 && !sawBackpressure; i++ {
+		require.NoError(t, a2.Table("t").StringColumn("m", filler).At(ctx, time.Unix(0, int64(i+2))))
+		if err := a2.Flush(ctx); err != nil {
+			require.ErrorIs(t, err, ErrBackpressureTimeout)
+			sawBackpressure = true
+		}
+	}
+	require.True(t, sawBackpressure, "the ring never filled")
+	require.NoError(t, a2.Table("t").StringColumn("m", "ROW_A2_DROPPED").At(ctx, time.Unix(0, 5000)))
+	require.ErrorIs(t, a2.Close(ctx), ErrBackpressureTimeout)
+
+	srv.start(t) // the server is back
+	require.Eventually(t, func() bool { return !delegate.hasUnackedRows() }, qwpTestWaitTimeout, 10*time.Millisecond,
+		"the kept sender replays and gets acknowledgements for every queued frame")
+
+	b, err := p.borrow(ctx)
+	require.NoError(t, err)
+	require.Same(t, delegate, b.(*qwpPooledSender).slot.delegate.(*qwpLineSender), "the pool kept the sender holding A1's row")
+	require.NoError(t, b.Table("t").StringColumn("m", "ROW_B").At(ctx, time.Unix(0, 6000)))
+	fsn, err := b.(QwpSender).FlushAndGetSequence(ctx)
+	require.NoError(t, err)
+	waitCtx, cancel := context.WithTimeout(ctx, qwpTestWaitTimeout)
+	defer cancel()
+	require.NoError(t, b.(QwpSender).AwaitAckedFsn(waitCtx, fsn))
+	require.NoError(t, b.Close(ctx))
+
+	require.GreaterOrEqual(t, srv.count("ROW_A1"), 1, "A1's row, whose Close returned nil, was lost")
+	require.Zero(t, srv.count("ROW_A2_DROPPED"), "a row A2's Close reported as dropped reached the server")
+	require.GreaterOrEqual(t, srv.count("ROW_B"), 1)
 }
 
 func TestQwpSenderPoolSfDistinctSlotDirs(t *testing.T) {

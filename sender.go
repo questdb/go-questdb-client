@@ -307,9 +307,13 @@ type LineSender interface {
 	// pool. Later calls do nothing and return nil, not errors from later cleanup.
 	// Unlike standalone Close, returning a borrowed sender ignores ctx while
 	// queueing completed rows: it uses the append timeout and does not wait for
-	// server acknowledgements. Stop using the handle once Close starts. The
-	// pool must not reuse its sender until the rows have been queued successfully.
-	// If the sender must be removed, the pool closes it in the background.
+	// server acknowledgements. Stop using the handle once Close starts. If
+	// completed rows cannot be queued because the buffer stayed full
+	// ([ErrBackpressureTimeout]) or local storage refused them
+	// ([ErrSfDurability]), Close drops those rows and returns the error; the
+	// sender stays in the pool and still delivers rows queued before. To keep
+	// rows through backpressure, call Flush again before Close. If the sender
+	// must be removed, the pool closes it in the background.
 	// Close reports errors from queueing rows or returning the sender; later
 	// cleanup errors are logged and included in [QuestDB.Close]'s result.
 	// Returning a sender does not prove its connection or file lock is released.

@@ -248,7 +248,7 @@ See [`LineSender.Close`](sender.go) for the steps and errors.
 | [`QuestDB.Close(ctx)`](questdb.go) | A nil result means both pools and their background work have released all resources, no work can later acquire or retain more, and no error remains to report. Repeated or concurrent calls wait for the same shutdown. |
 | [`QwpQueryClient.Close(ctx)`](qwp_query_client.go) | Stop using the client first. A nil result means all its resources are released and no error remains to report. Later calls check or wait for the same shutdown. |
 | Standalone QWP `LineSender.Close(ctx)` | Call once; later calls return a double-close error, not cleanup progress. A nil result may leave resource cleanup running in the background, but not attempts to queue rows or wait for acknowledgements. Later failures are logged. |
-| Borrowed sender `Close(ctx)` | Returns the sender to its pool. **Context exception:** queueing rows uses the append timeout, not `ctx`, and does not wait for acknowledgements. The pool cannot reuse the sender until rows have been queued successfully. Calls after return do nothing and return nil. |
+| Borrowed sender `Close(ctx)` | Returns the sender to its pool. **Context exception:** queueing rows uses the append timeout, not `ctx`, and does not wait for acknowledgements. If completed rows cannot be queued, because the buffer stayed full (`ErrBackpressureTimeout`) or local storage refused them (`ErrSfDurability`), Close drops those rows and returns the error. The sender stays in the pool and still delivers rows queued before. To keep rows through backpressure, call `Flush` again before Close. Calls after return do nothing and return nil. |
 | Borrowed query session `Close()` | Finishes reading an open query response, with a time limit set by `query_close_timeout_ms`, then returns the client to the pool. Calls after return do nothing and return nil. |
 
 `QuestDB.Close` accounts for clients still being created, removed, or returned,
@@ -677,7 +677,8 @@ again to retry them. It does not resend rows that were already appended. When
 the row that call finished is already buffered. Don't build that row again, or
 the server receives it twice. Memory-backed QWP senders can also return
 `ErrBackpressureTimeout`, after waiting 30 seconds with their 128 MiB buffer
-full.
+full. A borrowed sender's `Close` is the exception: it drops the rows it could
+not queue, because the next borrower must not send them.
 
 | Error | Raised by | Meaning |
 |---|---|---|

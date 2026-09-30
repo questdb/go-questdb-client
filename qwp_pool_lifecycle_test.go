@@ -569,6 +569,10 @@ type panicOnFlushDelegate struct {
 func (*panicOnFlushDelegate) flushForReturn(context.Context) (bool, error) {
 	panic("boom in flushForReturn")
 }
+func (*panicOnFlushDelegate) discardPending() int { return 0 }
+
+var _ returnFlusher = (*panicOnFlushDelegate)(nil)
+
 func (s *panicOnFlushDelegate) Close(context.Context) error {
 	s.closes.Add(1)
 	return nil

@@ -594,12 +594,18 @@ type unackedReporter interface {
 // committed rows, and surfaces (without discarding those rows) a latched
 // fluent-API error — the correct lease-return path, distinct from Flush.
 // The returned retained bool reports whether committed rows were left
-// un-enqueued (a backpressure-deadline / engine-closed failure, not a terminal
-// HALT); such a slot is dirty and must be discarded, not recycled.
-// Every pooled delegate is a *qwpLineSender, which implements it.
+// un-enqueued (a backpressure deadline, a storage failure or a closed engine,
+// not a terminal HALT). discardPending drops those rows, so a sender that is
+// otherwise healthy can go back to the pool without handing one borrower's rows
+// to the next. Every pooled delegate is a *qwpLineSender, which implements it.
 type returnFlusher interface {
 	flushForReturn(ctx context.Context) (retained bool, err error)
+	discardPending() (droppedRows int)
 }
+
+// A sender that stops implementing returnFlusher would make lease returns fall
+// back to Flush, which can leave committed rows buffered for the next borrower.
+var _ returnFlusher = (*qwpLineSender)(nil)
 
 // closeCompletionReporter is implemented by the concrete QWP sender. Close
 // may safely return before its manager worker exits; in that case the delegate
@@ -1868,8 +1874,16 @@ func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 // uses the append timeout, not the caller's context, so a cancelled request
 // cannot leave buffered rows for the next borrower. An earlier row-building
 // error need not remove the sender from the pool if completed rows were queued
-// successfully. Rows that could not be queued, or a terminal sender error,
-// require removal instead of reuse. Calls after return do nothing.
+// successfully.
+//
+// When completed rows cannot be queued because the buffer stayed full for the
+// append timeout (ErrBackpressureTimeout) or local storage refused them
+// (ErrSfDurability), Close drops those rows, returns that error with the number
+// of rows dropped, and keeps the sender in the pool. The sender still holds the
+// rows earlier borrowers queued and delivers them once the server is reachable.
+// To keep rows through backpressure, call Flush again before Close. Any other
+// failure to queue rows, and a terminal sender error, remove the sender instead
+// of reusing it. Calls after return do nothing.
 func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 	if !ps.live() {
 		return nil
@@ -1901,19 +1915,25 @@ func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 			var retained bool
 			retained, flushErr = fr.flushForReturn(ctx1)
 			if retained {
-				// flushForReturn could not enqueue the committed rows — the
-				// cursor ring saturated and the append deadline elapsed (an
-				// outage, the exact condition that makes backpressure bite),
-				// or the engine was closed. Neither is a terminal send-loop
-				// HALT, so markBrokenIfTerminal below leaves the slot healthy;
-				// but the rows are RETAINED in the delegate's producer buffers.
-				// Recycling this dirty slot would encode borrower A's rows into
-				// borrower B's next flush, shipping them under B's FSN
-				// (borrower-isolation / row misattribution). Discard it so B is never
-				// poisoned; the discard-close still best-effort-drains A's own rows,
-				// and A's retry of the surfaced error is idempotent under server
-				// dedup (at-least-once).
-				ps.broken = true
+				// flushForReturn could not enqueue the committed rows, so they
+				// are still in the delegate's producer buffers. Recycling the
+				// slot with them would encode this borrower's rows into the next
+				// borrower's flush, under its FSN (borrower isolation).
+				if (errors.Is(flushErr, ErrBackpressureTimeout) || errors.Is(flushErr, ErrSfDurability)) &&
+					!errors.Is(flushErr, ErrCleanupFailed) {
+					// The ring stayed full for the append deadline (an outage)
+					// or local storage refused the write. The sender is healthy,
+					// and its ring still holds rows earlier borrowers queued,
+					// which it delivers once the server is reachable. Closing it
+					// would lose those rows, so it stays in the pool and only
+					// this borrower's un-queued rows are dropped. The error tells
+					// the borrower they were not queued.
+					flushErr = fmt.Errorf("%w [droppedRows=%d]", flushErr, fr.discardPending())
+				} else {
+					// The engine is closed or has stopped working; the sender
+					// cannot serve another borrower.
+					ps.broken = true
+				}
 			}
 		} else {
 			flushErr = ps.slot.delegate.Flush(ctx1)
