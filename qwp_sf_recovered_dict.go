@@ -34,8 +34,7 @@ import (
 // the send loop both start from this one slice, so a recovered id cannot end up
 // with two different names.
 type qwpSfRecoveredDictAnalysis struct {
-	symbols             []string
-	maxReplayDeltaStart int
+	symbols []string
 }
 
 // qwpSfAnalyzeRecoveredDict rebuilds the symbol dictionary from the saved
@@ -82,9 +81,6 @@ func qwpSfAnalyzeRecoveredDict(
 				gapAffectsReplay = true
 			}
 			return nil
-		}
-		if fsn > ackedFsn && deltaStart > a.maxReplayDeltaStart {
-			a.maxReplayDeltaStart = deltaStart
 		}
 
 		if gap {

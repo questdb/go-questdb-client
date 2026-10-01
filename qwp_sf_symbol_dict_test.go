@@ -172,14 +172,14 @@ func TestQwpSfSymbolDictRecoveredLegacyFormatIsUntrustedAndPreserved(t *testing.
 // hand-crafted file from making recovery allocate too much. A chunk of
 // empty-string entries passes its checksum and costs one byte each on disk, but
 // about 16 bytes each as Go strings, so recovery must reject an entry count
-// over the limit instead of parsing it.
+// over the id limit instead of parsing it.
 func TestQwpSfSymbolDictRecoveredEntryCountBounded(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
 	buf := make([]byte, qwpSfSymbolDictHeaderSize)
 	binary.LittleEndian.PutUint32(buf[:4], qwpSfSymbolDictMagic)
 	buf[4] = qwpSfSymbolDictVersion
-	count := qwpSfSymbolDictMaxRecoveredEntries + 1
+	count := qwpMaxSymbolDictionarySize + 1
 	var vb [qwpMaxVarintLen]byte
 	chunk := append([]byte(nil), vb[:qwpPutVarint(vb[:], uint64(count))]...)
 	chunk = append(chunk, vb[:qwpPutVarint(vb[:], uint64(count))]...)
@@ -199,7 +199,7 @@ func TestQwpSfSymbolDictOpenRecoveredAbsentReturnsNil(t *testing.T) {
 	dir := t.TempDir()
 	d, err := qwpSfSymbolDictOpenRecovered(dir)
 	require.NoError(t, err)
-	require.Nil(t, d, "absent dictionary on a recovered slot degrades to full-dict fallback")
+	require.Nil(t, d, "an absent dictionary leaves the decision to the engine's frame scan")
 }
 
 func TestQwpSfSymbolDictOpenCleanDoesNotInheritExistingIDs(t *testing.T) {
@@ -239,11 +239,10 @@ func TestQwpSfSymbolDictOpenRecoveredValid(t *testing.T) {
 	require.NoError(t, re.close())
 }
 
-// TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack pins what happens to
-// damaged content, matching the Java client: this recovery goes without delta
-// encoding and the file is left on disk so it can be inspected. Whether the
-// slot can still be rebuilt is decided separately, by the engine's scan of the
-// surviving frames.
+// TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack pins that opening damaged
+// content changes nothing on disk. Whether the slot can still be recovered is
+// decided separately, by the engine's scan of the surviving frames, and only
+// an accepted slot gets its dictionary rebuilt.
 func TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)
@@ -260,9 +259,9 @@ func TestQwpSfSymbolDictOpenRecoveredCorruptFallsBack(t *testing.T) {
 }
 
 // TestQwpSfSymbolDictVersionMismatch pins that an unknown version byte is
-// treated like bad magic. On recovery the file is left alone and the slot runs
-// on full dictionaries; on a fresh open it is recreated, since no segment can
-// be referring to its ids.
+// treated like bad magic. Opening it for recovery leaves the file alone for the
+// engine's frame scan to judge; on a fresh open it is recreated, since no
+// segment can be referring to its ids.
 func TestQwpSfSymbolDictVersionMismatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, qwpSfSymbolDictFileName)

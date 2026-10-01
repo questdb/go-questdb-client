@@ -145,10 +145,6 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 		globalSymbols:    make(map[string]int32),
 		maxSentSymbolId:  -1,
 		batchMaxSymbolId: -1,
-		// Memory mode always delta-encodes, so the benchmark must take the
-		// same resetAfterFlush path (including reclaimUnsentSymbolIDs) that
-		// production takes.
-		deltaDictEnabled: true,
 	}
 
 	s.globalSymbols["AAPL"] = 0

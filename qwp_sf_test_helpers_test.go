@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"errors"
 	"math"
 	"os"
 	"os/exec"
@@ -144,4 +145,54 @@ func qwpSfAckWatermarkOpen(slotDir string) *qwpSfAckWatermark {
 // in qwp_sf_ack_watermark_startup_test.go, which passes real histories.
 func qwpSfAckWatermarkOpenRequired(slotDir string) (*qwpSfAckWatermark, error) {
 	return qwpSfAckWatermarkOpenPrepared(slotDir, qwpSfAckWatermarkStartup{publishedFsn: math.MaxInt64}, nil)
+}
+
+// qwpTestRequireEngineDict fails unless a disk-backed engine holds an open
+// symbol dictionary, which every construction path must give it.
+func qwpTestRequireEngineDict(t *testing.T, engine *qwpSfCursorEngine) {
+	t.Helper()
+	require.NotEmpty(t, engine.engineSfDir(), "only a disk-backed engine has a symbol dictionary")
+	d := engine.enginePersistedSymbolDict()
+	require.NotNil(t, d, "a disk-backed engine must hold a symbol dictionary")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	require.False(t, d.closed, "the engine's symbol dictionary must be open")
+}
+
+// qwpSfSymbolDictOpen is a test helper that opens (creating if absent) the
+// dictionary file in slotDir. An existing file's trusted chunk prefix is loaded
+// and its untrusted tail cut; a missing or unusable file is (re)created with a
+// fresh header. A nil dict with no error means the file could not be created.
+// Engine construction uses qwpSfSymbolDictOpenRecovered and
+// qwpSfSymbolDictOpenClean instead.
+func qwpSfSymbolDictOpen(slotDir string) (*qwpSfSymbolDict, error) {
+	if slotDir == "" {
+		return nil, nil
+	}
+	path := filepath.Join(slotDir, qwpSfSymbolDictFileName)
+	st, statErr := qwpSfSymbolDictStat.load()(path)
+	if statErr == nil {
+		if st.Size() >= qwpSfSymbolDictHeaderSize {
+			d, openErr := qwpSfSymbolDictOpenExistingDetailed(path, st.Size())
+			if openErr == nil {
+				if tailErr := d.dropUntrustedTail(); tailErr != nil {
+					_ = d.close()
+					return nil, tailErr
+				}
+				return d, nil
+			}
+			if !errors.Is(openErr, errQwpSfSymbolDictUnusable) {
+				return nil, qwpSfDurabilityError("open existing symbol dictionary", path, openErr)
+			}
+			// A header/parse failure on an existing file means it cannot be
+			// trusted for delta replay; start clean.
+		}
+	} else if !os.IsNotExist(statErr) {
+		return nil, qwpSfDurabilityError("could not stat symbol dictionary", path, statErr)
+	}
+	d, freshErr := qwpSfSymbolDictOpenFresh(path)
+	if freshErr != nil && os.IsNotExist(statErr) {
+		return nil, nil
+	}
+	return d, freshErr
 }

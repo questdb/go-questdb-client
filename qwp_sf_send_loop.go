@@ -269,16 +269,6 @@ type qwpSfSendLoop struct {
 	// to -1 once we cross the boundary. Producer-only state.
 	replayTargetFsn int64
 
-	// hasReplayDictionaryDependency is true when a replay can start with a
-	// frame whose delta begins above id 0, meaning it refers to symbols the
-	// server was told about earlier. Such a replay needs the mirror sent to
-	// every fresh connection first. An engine that delta-encodes needs this
-	// from the start; in full-dictionary mode it turns on as soon as a
-	// recovered frame with a non-zero delta start shows up. The engine
-	// constructor has already scanned the surviving frames, so the initial
-	// value tells a slot whose frames all start at 0 apart from one that
-	// really does depend on earlier registrations.
-	hasReplayDictionaryDependency bool
 	// sentDictBytes mirrors — as concatenated [len varint][utf8] in global-id
 	// order — every symbol the loop has sent; sentDictCount is how many. It is
 	// the source for the reconnect catch-up frame. Written by the send
@@ -492,8 +482,6 @@ func qwpSfNewSendLoop(
 		poisonFsn:               -1,
 		lastProgressFsn:         -1,
 		maxFrameRejections:      qwpSfDefaultMaxFrameRejections,
-		hasReplayDictionaryDependency: engine.engineDeltaDictEnabled() ||
-			engine.engineRecoveredMaxReplayDeltaStart() > 0,
 	}
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
 	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
@@ -1391,18 +1379,19 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 		return false, errors.New("qwp/sf: transport gone mid-loop")
 	}
 	payload := base[l.sendOffset+qwpSfFrameHeaderSize : frameEnd]
-	// Torn-dictionary guard, run in both delta and full-dictionary mode. A
+	// Torn-dictionary guard, run for every frame with a delta section. A
 	// frame fits what the server already knows as long as its delta starts at
 	// or below the end of the mirror. Starting below is fine: the server
 	// re-registers the ids it already has and takes the rest, and
 	// accumulateSentDict records that tail after the send. Starting past the
 	// end is not: those ids were never given to the server. That happens when
-	// the persisted dictionary and its frames came apart — a host or power
-	// crash, or a recovered slot whose dictionary could not be trusted and was
-	// left unused. Older servers filled such a hole with nulls and wrote wrong
+	// the persisted dictionary and its frames came apart, for example after a
+	// host or power crash on a slot whose writer did not fsync its dictionary.
+	// Recovery refuses such a slot before replay, and this guard checks again
+	// before each frame goes out. Older servers filled such a hole with nulls and wrote wrong
 	// data, so stop the sender here instead of putting the frame on the wire.
-	// Full-dictionary frames always start at 0, so they build up an empty
-	// mirror without holes even when the side-file is unavailable.
+	// Self-sufficient frames, which a slot written by another client can hold,
+	// always start at 0, so they build up an empty mirror without holes.
 	deltaStart, _, hasDelta := qwpFrameDeltaRange(payload)
 	if hasDelta {
 		if deltaStart > l.sentDictCount {
@@ -1446,15 +1435,9 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 	// sendMessage above and accumulateSentDict here) must complete before
 	// that store, or accumulateSentDict could dereference an unmapped page.
 	if hasDelta {
-		// Record every delta, including in full-dictionary mode: what the
-		// producer writes now and what the recovered frames need are two
-		// different things, and a slot can lose its side-file while still
-		// holding a hole-free run of delta frames on disk. Once a frame with a
-		// non-zero start goes out, every fresh connection from here on needs
-		// the earlier ids before replay begins.
-		if deltaStart > 0 {
-			l.hasReplayDictionaryDependency = true
-		}
+		// Record every delta, including the self-sufficient frames a slot
+		// adopted from another client can hold, so every fresh connection can
+		// be sent the earlier ids before replay begins.
 		l.accumulateSentDict(payload)
 	}
 	// Publish highestFullySent only now, after every read of payload. Until
@@ -2220,11 +2203,14 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 }
 
 // setWireBaselineWithCatchUp sets the wire-sequence baseline for a fresh
-// connection. When the frames about to replay refer to symbols registered on
-// an earlier connection and the sent-dict mirror is non-empty, it first sends a
+// connection. Whenever the sent-dict mirror is non-empty, it first sends a
 // full-dictionary catch-up frame (or several, under a small batch cap) so the
 // fresh server — whose dictionary starts empty — can make sense of the delta
-// frames that replay next. The catch-up frames occupy wire seqs 0..k-1, which
+// frames that replay next. It does so even when every frame about to replay
+// carries its dictionary from id 0, as in a slot adopted from the Java
+// client's full-dictionary fallback: the producer's new frames are deltas above
+// the mirror, and the catch-up costs only the dictionary's bytes once per
+// connection. The catch-up frames occupy wire seqs 0..k-1, which
 // map to already-acked FSNs (harmless re-acks), so the first real replay frame
 // still lands on replayStart.
 //
@@ -2236,7 +2222,7 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 // surfaces the wire failure and run()'s reconnect redoes the catch-up.
 func (l *qwpSfSendLoop) setWireBaselineWithCatchUp(replayStart int64) {
 	transport := l.transport.Load()
-	if transport != nil && l.hasReplayDictionaryDependency && l.sentDictCount > 0 {
+	if transport != nil && l.sentDictCount > 0 {
 		l.nextWireSeq.Store(0)
 		if k, err := l.sendDictCatchUp(l.ctx, transport); err == nil {
 			l.fsnAtZero.Store(replayStart - int64(k))

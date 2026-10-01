@@ -769,7 +769,6 @@ func TestErrorApiResilience_DictionaryGapRecycleCatchUpReplay(t *testing.T) {
 
 	s, engine, loop, cleanup := newCursorSenderForTest(t, srv, 0)
 	defer cleanup()
-	require.True(t, s.deltaDictEnabled, "memory mode must delta-encode")
 
 	gotCh := make(chan *SenderError, 4)
 	loop.sendLoopSetErrorHandler(func(e *SenderError) {

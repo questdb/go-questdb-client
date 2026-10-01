@@ -70,6 +70,14 @@ type LineSender interface {
 	// Symbol name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
+	//
+	// A QWP sender keeps one symbol dictionary shared by all tables and
+	// columns. It holds at most 1,000,000 distinct values, and with
+	// store-and-forward its file is also capped at 1 GiB, counting each value's
+	// length plus 22 bytes. A memory-backed sender has no byte limit. A new
+	// value past a limit is refused with an error on the next At / AtNow;
+	// rows using values already in the dictionary stay valid. Close and
+	// rebuild the sender to start a fresh dictionary.
 	Symbol(name, val string) LineSender
 
 	// Int64Column adds a 64-bit integer (long) column value to the ILP
@@ -1070,8 +1078,9 @@ func WithTarget(target QwpTargetFilter) LineSenderOption {
 //
 // In "memory" mode appended frames reach the disk through the kernel's
 // writeback rather than an fsync per frame. Each segment rotation makes
-// the segment it seals durable, and each trim makes the symbol
-// dictionary durable before deleting frames. An OS crash or power loss
+// the segment it seals durable. Construction makes the slot's symbol
+// dictionary durable before any frame is published, and each trim makes
+// later additions durable before deleting frames. An OS crash or power loss
 // can lose the end of the active segment, but not the sealed segments
 // before it; see the README's store-and-forward section for the platform
 // limits.

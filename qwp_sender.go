@@ -370,24 +370,24 @@ type qwpLineSender struct {
 	maxSentSymbolId int
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
-	// deltaDictEnabled makes each frame carry only the symbol ids above
-	// maxSentSymbolId (a delta), rather than the full dictionary from id 0.
-	// Set from the engine at construction: always in memory mode, and in SF
-	// mode only when the persisted dictionary opened. When false the sender
-	// emits full self-sufficient frames (baseline -1). See symbolDeltaBaseline.
-	deltaDictEnabled bool
-	// persistedSymbolDict is the engine's .symbol-dict side-file (SF + delta
-	// mode only; nil otherwise). New symbols are appended to it before the
+	// persistedSymbolDict is the engine's .symbol-dict side-file (SF mode
+	// only; nil in memory mode). New symbols are appended to it before the
 	// referencing frame is published, so a recovered / orphan-drained slot can
 	// rebuild the dictionary its non-self-sufficient delta frames reference.
 	persistedSymbolDict *qwpSfSymbolDict
+	// symbolDictBound is qwpSfSymbolDictBound(globalSymbolList) without the
+	// header, kept incrementally. In SF mode a new symbol value is refused when
+	// it would take the dictionary past qwpSfSymbolDictLimits.maxFileBytes, so
+	// the side-file never outgrows what recovery accepts.
+	symbolDictBound int64
 
 	// Schemas are intentionally NOT tracked on the cursor wire path. Every
 	// frame's schema stays self-sufficient: it carries the full inline column
 	// definitions, with no per-connection schema registry and no schema-change
-	// detection. The symbol dictionary, in contrast, is delta-encoded when
-	// deltaDictEnabled — a reconnect re-registers it via a send-loop catch-up
-	// frame before replay (full-dict frames when disabled).
+	// detection. The symbol dictionary, in contrast, is delta-encoded: each
+	// frame carries only the symbol ids above maxSentSymbolId, and a reconnect
+	// re-registers the whole dictionary via a send-loop catch-up frame before
+	// replay.
 
 	// Row state.
 	hasTable bool
@@ -660,6 +660,18 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		)
 		return s
 	}
+	// A store-and-forward sender also caps the size of its dictionary file,
+	// measured by the same bound recovery applies, so it can never write a slot
+	// its own recovery refuses.
+	if !ok && s.persistedSymbolDict != nil {
+		if limit := qwpSfSymbolDictLimits.load().maxFileBytes; qwpSfSymbolDictHeaderSize+s.symbolDictBound+qwpSfSymbolDictEntryBound(val) > limit {
+			s.lastErr = fmt.Errorf(
+				"qwp: global symbol dictionary is full: a store-and-forward sender caps its symbol dictionary file at %d bytes; rows using already-registered values remain valid; close and rebuild the sender to start a fresh dictionary, or use varchar columns for unbounded-cardinality data",
+				limit,
+			)
+			return s
+		}
+	}
 
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeSymbol, true)
 	if err != nil {
@@ -672,6 +684,7 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		id = int32(len(s.globalSymbolList))
 		s.globalSymbols[val] = id
 		s.globalSymbolList = append(s.globalSymbolList, val)
+		s.symbolDictBound += qwpSfSymbolDictEntryBound(val)
 	}
 
 	col.addSymbolID(id)
@@ -1525,13 +1538,8 @@ func (s *qwpLineSender) resetAfterFlush() {
 // staying above two marks. maxSentSymbolId covers ids a published frame has
 // already handed to the send-loop mirror. The persisted dictionary's size
 // covers ids written to the SF side-file, which happens before the frame is
-// published, so those exist even if the publish failed. Full-dictionary mode
-// reclaims nothing: every queued frame spells out its own dictionary, so an id
-// reused here would name a different string than one of those frames does.
+// published, so those exist even if the publish failed.
 func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
-	if !s.deltaDictEnabled {
-		return
-	}
 	floor := s.maxSentSymbolId + 1
 	if s.persistedSymbolDict != nil {
 		if durable := s.persistedSymbolDict.size(); durable > floor {
@@ -1543,6 +1551,9 @@ func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
 	}
 	if floor >= len(s.globalSymbolList) {
 		return
+	}
+	for _, name := range s.globalSymbolList[floor:] {
+		s.symbolDictBound -= qwpSfSymbolDictEntryBound(name)
 	}
 	s.globalSymbolList = s.globalSymbolList[:floor]
 	// Rebuild the whole map instead of deleting the dropped strings one by

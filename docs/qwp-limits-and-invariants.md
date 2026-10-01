@@ -61,7 +61,8 @@ lost. The segment manager starts writing the active segment back while it fills
 `FlushViewOfFile` on Windows), so a rotation usually waits only for the last
 part. Before a trim deletes acknowledged frames, the manager makes
 `.symbol-dict` durable, because later frames can refer to symbols those frames
-introduced.
+introduced. See [Symbol dictionary durability](#symbol-dictionary-durability)
+for the whole dictionary invariant.
 
 Accepted limit: frames in the active segment are not fsynced as they are
 appended, so an OS crash or power loss can lose the end of the active segment.
@@ -125,6 +126,92 @@ empty-slot checks in `qwp_sf_recovery.go` describe the same case.
 
 ## Symbol dictionary recovery
 
+### Symbol dictionary durability
+
+Invariant: a disk-backed engine always holds an open `.symbol-dict` containing
+every id that any frame of its slot uses. Construction makes the whole
+dictionary durable before the engine is registered with the segment manager,
+which is before any frame of the session exists, and the manager makes anything
+appended afterwards durable before a trim deletes frames. An id is needed from
+the dictionary in only three ways, and each is covered:
+
+- A surviving frame introduced it: a delta frame carries the symbols it
+  introduces.
+- The frame that introduced it was trimmed: the trim fsynced the dictionary
+  first.
+- No frame ever carried it, for example an id an earlier session persisted for
+  a frame it never published. The producer is seeded with it and its first
+  frame's delta starts above it. It was in the dictionary at construction, so
+  the construction-time fsync made it durable.
+
+So the kernel's writeback order for the active segment does not matter, and an
+OS crash within the platform `fsync` guarantee cannot leave a dictionary gap.
+Construction decides every recovery verdict, including the size limits below,
+before it changes anything on disk. Only an accepted slot has its dictionary's
+untrusted tail cut, healed, rewritten, or, for a ring with no frames,
+truncated.
+
+A store-and-forward sender never falls back to full-dictionary frames. A
+dictionary that cannot be created, healed, rewritten, or fsynced at startup
+fails construction with a retriable `ErrSfDurability`, and a failed append on a
+flush fails that flush the same way with its rows still pending. A full or
+failing disk therefore stops an SF sender or drainer rather than degrading it,
+and a drainer writes no `.failed` for it.
+
+The invariant covers slots this client writes. A slot adopted from the Java
+client brings whatever its writer made durable; see
+[Differences from the Java client](#differences-from-the-java-client).
+
+### An unusable dictionary is rewritten in place
+
+When a recovered slot that holds frames has no usable `.symbol-dict` (absent,
+shorter than its header, bad magic or version, no valid chunk, a legacy flat
+file, or larger than the 1 GiB read limit), and the frames pass the gap and
+size checks, construction rewrites the file in place from the symbols the
+frames spell out. The old bytes are discarded, not preserved: they were
+unusable, and the frames, which recovery already trusts, hold everything they
+held that any frame needs. A stat, open, or read failure is a retriable error,
+never a reason to rewrite. A crash during the rewrite leaves the frames intact,
+and the next start rewrites again. A recovered ring with no frames always
+starts an empty dictionary, because no frame refers to the old ids.
+
+### Dictionary limits refuse a slot
+
+Accepted limit. The writer and recovery share three limits: 1M ids, 1 MiB per
+symbol name, and 1 GiB measured by a conservative bound (each name's length
+plus 22 bytes, plus the 8-byte header), not by raw file size. The producer
+refuses a new symbol value that would break one, so no slot this client writes
+can break one. A recovered slot whose dictionary breaks one is a fail-closed
+verdict: it is preserved under `.unreplayable-<n>`, or marked `.failed` by a
+drainer.
+
+Released Java clients (1.3.7 and later) enforce the same 1M-id limit, but
+neither the per-name limit nor the 1 GiB limit, so they can write such a slot.
+For a Java slot whose frames depend on the dictionary, this client already
+refused a file over 1 GiB as unusable and a name over 1 MiB as a malformed
+chunk. A slot left by Java's full-dictionary fallback is refused when one of its
+frames carries a symbol value over 1 MiB, because this client rebuilds a
+dictionary from those frames. Both cases need extreme symbol data, and raising
+the limits is a separate decision: this client reads the whole dictionary into
+memory at recovery, while the Java client maps it.
+
+### Differences from the Java client
+
+The file format is the same; the behavior differs:
+
+- The Java client falls back to full-dictionary frames when a dictionary write
+  fails, at startup or on a flush. This client fails the operation with
+  `ErrSfDurability` instead. A Go sender or drainer adopting a slot that Java's
+  fallback left rebuilds the dictionary from the self-sufficient frames and
+  continues with delta frames. Every connection it opens then starts with a
+  dictionary catch-up before replay, even while the frames still to replay are
+  self-sufficient; that costs the dictionary's bytes once per connection.
+- The Java client never fsyncs the dictionary, so a host crash can leave a
+  Java-written slot whose dictionary lacks ids that trimmed frames introduced.
+  Recovery refuses such a slot, correctly.
+- The Java writer allows a dictionary of about 2 GiB and names of any length;
+  see [Dictionary limits refuse a slot](#dictionary-limits-refuse-a-slot).
+
 ### A dictionary gap inside acknowledged frames refuses a later restart
 
 Accepted limit. `qwpSfAnalyzeRecoveredDict` in `qwp_sf_recovered_dict.go`
@@ -144,8 +231,8 @@ Why it is accepted:
 
 - The starting state needs damage to a middle chunk of `.symbol-dict` that its
   CRC detects, such as bit rot. An OS crash does not produce it within the
-  platform `fsync` guarantee, because a trim makes `.symbol-dict` durable
-  before it deletes the frames that introduced those ids.
+  platform `fsync` guarantee, because of the
+  [dictionary durability invariant](#symbol-dictionary-durability).
 - The outcome fails closed. No row is replayed with the wrong symbols, and the
   refused slot is preserved byte for byte under `.unreplayable-<n>`, or marked
   `.failed` by a drainer. Rows the second session published are in that copy

@@ -232,10 +232,15 @@ claim a uniform host-crash or power-loss guarantee across platforms.
 ### Symbol dictionaries and replay
 
 Delta encoding avoids repeating dictionary entries during normal publication;
-it is not an exactly-once-per-connection delivery guarantee. In SF mode, missing
-or failed dictionary persistence can require full-dictionary frames, even while
-a side-file handle remains open. See `qwp_sender_cursor.go` and
-`qwp_sf_symbol_dict.go` for mode selection and failure handling.
+it is not an exactly-once-per-connection delivery guarantee. The producer always
+delta-encodes; in SF mode it never falls back to full-dictionary frames. Every
+disk-backed engine holds an open, durable `.symbol-dict`, and a dictionary write
+failure is a retriable `ErrSfDurability`, not a mode switch. The invariant and
+its accepted limits are in
+[docs/qwp-limits-and-invariants.md](docs/qwp-limits-and-invariants.md#symbol-dictionary-durability).
+See `qwp_sf_engine.go`, `qwp_sender_cursor.go`, and `qwp_sf_symbol_dict.go`
+for construction and failure handling. The reading side still accepts
+self-sufficient frames, which slots written by other clients can hold.
 
 Recovery must preserve symbol-id/name associations using trusted dictionary and
 frame evidence; it must not invent entries or renumber ids referenced by retained

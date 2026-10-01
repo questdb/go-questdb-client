@@ -29,7 +29,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"path/filepath"
 	"runtime/debug"
 	"sync"
@@ -589,24 +588,20 @@ func (s *qwpLineSender) flushCursor(ctx context.Context) error {
 }
 
 // symbolDeltaBaseline is the encoder's maxSentId argument: the id below which
-// the server already holds every dictionary entry. In delta mode it is the
-// producer's monotonic sent watermark, so a frame carries only ids above it;
-// in full-dict mode it is -1 so every frame re-ships the dictionary from id 0.
+// the server already holds every dictionary entry. It is the producer's
+// monotonic sent watermark, so a frame carries only ids above it.
 func (s *qwpLineSender) symbolDeltaBaseline() int {
-	if s.deltaDictEnabled {
-		return s.maxSentSymbolId
-	}
-	return -1
+	return s.maxSentSymbolId
 }
 
 // persistNewSymbols write-ahead persists the symbols a frame introduces
 // ([maxSentSymbolId+1 .. batchMaxSymbolId]) to the slot's .symbol-dict BEFORE
 // the frame is published, so a recovered / orphan-drained slot can rebuild the
-// dictionary the delta frame references. No-op unless SF + delta mode with new
-// symbols. Not fsync'd here: the segment manager makes the file durable before
-// a trim deletes the frames that carry the same ids.
+// dictionary the delta frame references. No-op in memory mode and when the
+// frame introduces no symbols. Not fsync'd here: the segment manager makes the
+// file durable before a trim deletes the frames that carry the same ids.
 func (s *qwpLineSender) persistNewSymbols() error {
-	if !s.deltaDictEnabled || s.persistedSymbolDict == nil {
+	if s.persistedSymbolDict == nil {
 		return nil
 	}
 	// Start from what is actually on disk, not maxSentSymbolId: an append that
@@ -620,36 +615,25 @@ func (s *qwpLineSender) persistNewSymbols() error {
 		return nil
 	}
 	if err := s.persistedSymbolDict.appendSymbols(s.globalSymbolList[from : to+1]); err != nil {
-		// The side-file has stopped growing (disk full, quota, or an I/O
-		// fault). Every later flush would fail the same way, so stop using
-		// it: the producer switches to full self-sufficient frames, which
-		// need no side-file. This frame was not published, so the caller
-		// still holds its rows and the retry re-encodes them from id 0. The
-		// send loop tracks what it sends on its own, whichever mode the
-		// producer is in.
-		s.deltaDictEnabled = false
-		var logger *slog.Logger
-		if s.cursorSendLoop != nil {
-			logger = s.cursorSendLoop.logger
+		// The side-file could not grow (disk full, quota, or an I/O fault).
+		// The frame was not published, so the caller still holds its rows
+		// and a later flush retries them as the same delta. The failed write
+		// is untrusted tail, which the retry's append truncates first.
+		if errors.Is(err, ErrSfDurability) {
+			return qwpSfDurabilityError("persist symbol dictionary; retry the flush",
+				s.persistedSymbolDict.path, err)
 		}
-		qwpEffectiveLogger(logger).Warn("qwp/sf: symbol dictionary persistence failed; switching to full-dictionary frames",
-			"error", err)
-		return qwpSfDurabilityError(
-			"persist symbol dictionary; sender switched to full-dictionary mode, retry the flush",
-			s.persistedSymbolDict.path,
-			err,
-		)
+		return qwpSfSymbolDictLimitInconsistency(err)
 	}
 	return nil
 }
 
-// wireDeltaDict takes the delta symbol-dict mode from the engine (on in memory
-// mode, on in SF mode only when the persisted dictionary opened). For a slot
-// recovered from disk it also refills the global dictionary from what the
-// engine rebuilt out of the side-file and the surviving frames, so new symbols
-// get ids above the recovered ones and the delta baseline starts there too.
+// wireDeltaDict hands the producer the engine's dictionary side-file (nil in
+// memory mode). For a slot recovered from disk it also refills the global
+// dictionary from what the engine rebuilt out of the side-file and the
+// surviving frames, so new symbols get ids above the recovered ones and the
+// delta baseline starts there too.
 func (s *qwpLineSender) wireDeltaDict(engine *qwpSfCursorEngine) {
-	s.deltaDictEnabled = engine.engineDeltaDictEnabled()
 	s.persistedSymbolDict = engine.enginePersistedSymbolDict()
 	if engine.engineWasRecoveredFromDisk() {
 		s.seedSymbolDictFromRecovered(engine.engineRecoveredSymbols())
@@ -658,14 +642,13 @@ func (s *qwpLineSender) wireDeltaDict(engine *qwpSfCursorEngine) {
 
 // seedSymbolDictFromRecovered refills the producer's dictionary from the
 // id-ordered symbol list the engine rebuilt during recovery (the side-file's
-// trusted prefix plus whatever the surviving frames add). It runs in
-// full-dictionary mode too: starting again at id 0 just because the side-file
-// is gone would give a recovered frame's id a different name.
+// trusted prefix plus whatever the surviving frames add).
 func (s *qwpLineSender) seedSymbolDictFromRecovered(symbols []string) {
 	for _, name := range symbols {
 		id := int32(len(s.globalSymbolList))
 		s.globalSymbolList = append(s.globalSymbolList, name)
 		s.globalSymbols[name] = id
+		s.symbolDictBound += qwpSfSymbolDictEntryBound(name)
 	}
 	s.maxSentSymbolId = len(s.globalSymbolList) - 1
 }
@@ -680,11 +663,10 @@ func (s *qwpLineSender) seedSymbolDictFromRecovered(symbols []string) {
 // Schema-side: every table block carries its full inline column definitions,
 // so schemas replay correctly against any fresh server connection with no
 // producer-side registry. Symbol-side: the dict is delta-encoded from
-// symbolDeltaBaseline() — in full-dict mode -1 (self-sufficient, ids 0..
-// batchMaxSymbolId), in delta mode the sent watermark so only new ids go out,
-// with a send-loop catch-up frame re-registering the whole dictionary on
-// reconnect. In SF + delta mode the new ids are persisted before the append so
-// recovery / orphan-drain can rebuild them.
+// symbolDeltaBaseline(), the sent watermark, so only new ids go out, with a
+// send-loop catch-up frame re-registering the whole dictionary on reconnect.
+// In SF mode the new ids are persisted before the append so recovery /
+// orphan-drain can rebuild them.
 func (s *qwpLineSender) enqueueCursor(ctx context.Context) error {
 	if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
 		return err
@@ -781,10 +763,7 @@ func (s *qwpLineSender) frameCapExceeded(frameLen int) (qwpFrameCapKind, int64) 
 // ships the batch's new ids and advances the sent watermark, so later frames
 // carry an empty delta referencing ids that frame already registered. The
 // baseline MUST advance per-frame here, not once at the end — otherwise every
-// per-table frame would re-ship the whole batch delta. In full-dictionary mode
-// the baseline stays at -1, so each frame repeats ids the send loop has already
-// seen; the send loop's mirror allows that and keeps only the ids it is
-// missing.
+// per-table frame would re-ship the whole batch delta.
 //
 // The retain-on-error contract holds per table: a table is reset only
 // once its frame is in a segment, so a transient engineAppendBlocking

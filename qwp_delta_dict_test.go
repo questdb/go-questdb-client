@@ -88,7 +88,6 @@ func TestQwpDeltaDictReconnectCatchUpRebuildsDictionary(t *testing.T) {
 
 	s, engine, _, cleanup := newCursorSenderForTest(t, srv, 0)
 	defer cleanup()
-	require.True(t, s.deltaDictEnabled, "memory mode must delta-encode")
 
 	ctx := context.Background()
 	require.NoError(t, s.Table("t").Symbol("sym", "AAPL").Int64Column("v", 1).AtNow(ctx))
@@ -153,7 +152,6 @@ func TestQwpDeltaDictSplitPathStaysDeltaAcrossReconnect(t *testing.T) {
 
 	s, engine, _, cleanup := newCursorSenderForTest(t, srv, 0)
 	defer cleanup()
-	require.True(t, s.deltaDictEnabled, "memory mode must delta-encode")
 
 	ctx := context.Background()
 
@@ -277,7 +275,6 @@ func TestQwpDeltaDictSfPersistsSymbols(t *testing.T) {
 	s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 5*time.Second)
 	require.NoError(t, err)
 
-	require.True(t, s.deltaDictEnabled, "SF with an open side-file must delta-encode")
 	require.NotNil(t, s.persistedSymbolDict)
 
 	ctx := context.Background()

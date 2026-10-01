@@ -683,7 +683,7 @@ not queue, because the next borrower must not send them.
 | Error | Raised by | Meaning |
 |---|---|---|
 | `qdb.ErrBackpressureTimeout` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | The engine had no room within `sf_append_deadline_millis`. The wire is not draining, or `sf_max_total_bytes` is too small. |
-| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | Local storage would not commit: a segment rotation that could not make the sealed segment, the new segment's header or the manifest durable, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. |
+| `qdb.ErrSfDurability` | `At` / `AtNow` / `Flush` / `FlushAndGetSequence` | Local storage would not commit: a segment rotation that could not make the sealed segment, the new segment's header or the manifest durable, a symbol dictionary write for a batch that introduces new symbol values, or a run of failed slot maintenance (trims that cannot delete, an fsync that keeps failing). Usually a full, read-only or failing disk. Batches that use only symbol values already registered still publish. Sender construction fails with the same error when it cannot write or sync the slot's symbol dictionary. |
 
 Match them with `errors.Is`. These are not an exhaustive list of producer errors.
 Terminal server errors and internal failures can also reach the producer. For
@@ -700,7 +700,8 @@ applies when no complete frame survives. Everything after the first unreadable
 frame is discarded, even if later bytes contain intact, unacknowledged rows.
 No evidence copy of that tail is kept. The valid prefix and required sealed
 segments remain intact. A local write or sync failure stops recovery for retry;
-it is not evidence that the slot is corrupt.
+it is not evidence that the slot is corrupt. An unusable `.symbol-dict` is
+rebuilt in place from the symbols the surviving frames carry.
 
 This is not a general salvage policy: missing required segments or gaps in the
 saved queue still cause recovery to refuse the slot, as described below.
