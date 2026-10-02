@@ -128,6 +128,32 @@ func (e *qwpSfQuarantineError) Error() string {
 
 func (e *qwpSfQuarantineError) Unwrap() error { return e.cause }
 
+// qwpSfPoolQuarantineError names the preserved copies of slots that a failed
+// pool build set aside before it discarded their senders. It is separate from
+// qwpSfQuarantineError, whose additional destinations are later moves of one
+// slot, not copies of different slots.
+type qwpSfPoolQuarantineError struct {
+	destinations []string
+	cause        error
+}
+
+func (e *qwpSfPoolQuarantineError) Error() string {
+	return fmt.Sprintf("%s [sender pool preserved refused slots at %s]",
+		e.cause.Error(), strings.Join(e.destinations, ", "))
+}
+
+func (e *qwpSfPoolQuarantineError) Unwrap() error { return e.cause }
+
+// qwpSfWithPoolQuarantines makes err name dests, the preserved copies of the
+// senders a failed pool build is about to discard. It returns err unchanged
+// when there are none.
+func qwpSfWithPoolQuarantines(err error, dests []string) error {
+	if len(dests) == 0 {
+		return err
+	}
+	return &qwpSfPoolQuarantineError{destinations: dests, cause: err}
+}
+
 // qwpSfQuarantineDestination returns the preserved destination recorded in err,
 // or "" when no rename completed.
 func qwpSfQuarantineDestination(err error) string {

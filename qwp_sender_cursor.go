@@ -226,6 +226,10 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			// fault is contained by its own phase guard and cannot replace it.
 			stack = debug.Stack()
 		}
+		// A slot that recovery refused is already preserved under its
+		// quarantine name. With no sender returned, the error is the only place
+		// left to name that destination.
+		quarantined := engine.engineQuarantinedSlotPath()
 		var cleanupErr error
 		var reporter closeLifecycleReporter
 		if builtSender == nil && builtLoop != nil {
@@ -254,6 +258,11 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 			if retErr == nil {
 				retErr = errors.New("qwp/sf: sender construction did not complete")
 			}
+			// Inside the cleanup wrapper, so cleanupResult keeps naming the
+			// destination while cleanup is still pending.
+			if quarantined != "" {
+				retErr = &qwpSfQuarantineError{destination: quarantined, cause: retErr}
+			}
 			if reporter != nil {
 				retErr = &qwpSenderBuildCleanupError{cause: retErr, cleanup: reporter}
 			}
@@ -263,6 +272,9 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 		panicCause := r
 		if cleanupErr != nil {
 			panicCause = fmt.Errorf("%v; cleanup also failed: %w", r, cleanupErr)
+		}
+		if quarantined != "" {
+			panicCause = fmt.Errorf("%v [preserved at %s]", panicCause, quarantined)
 		}
 		// Let the caller check all cleanup after the panic. This includes
 		// memory-only senders and work on other senders' saved data, not just

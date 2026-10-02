@@ -223,7 +223,9 @@ type QwpSender interface {
 	//
 	// For a borrowed sender, save this path before calling Close to return
 	// the sender to the pool. Afterwards, this method always returns "",
-	// even if the client set a damaged slot aside.
+	// even if the client set a damaged slot aside. A pool can also set a slot
+	// aside in a build that no caller receives; that copy is reported only in
+	// the log.
 	//
 	// A slot whose recovery proves it inconsistent is preserved whole as a
 	// sibling of the original, at <sf_dir>/<sender_id>.unreplayable-<n>,

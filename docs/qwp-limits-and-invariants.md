@@ -337,3 +337,11 @@ These bounds apply to quarantine and to the slot-name locking around it.
   put bytes during its own construction. It is not a live check that the
   directory still exists, a durability receipt, or a record that survives a
   crash.
+- **A pool reports some quarantines only in the log.** A pool reports a
+  quarantine through `QuarantinedSlotPath` of the borrowed sender, or through
+  the error of a failed `NewQuestDB` or `BorrowSender`. Some pool builds have
+  no caller to report to: crash-recovery builds at startup, growth builds the
+  borrower stopped waiting for, and slots reaped before anyone borrowed them.
+  Reaping covers idle or over-age slots above `sender_pool_min`, and poisoned
+  slots at any count. For these, the Error log is the only report. Operators
+  find the copies by name: `<sf_dir>/*.unreplayable-*`.

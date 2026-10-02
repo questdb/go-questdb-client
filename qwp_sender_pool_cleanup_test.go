@@ -66,6 +66,9 @@ func (s *poolFaultSender) flushForReturn(context.Context) (bool, error) {
 	return false, nil
 }
 func (s *poolFaultSender) discardPending() int { return 0 }
+func (s *poolFaultSender) QuarantinedSlotPath() string {
+	return s.engine.engineQuarantinedSlotPath()
+}
 
 var _ returnFlusher = (*poolFaultSender)(nil)
 

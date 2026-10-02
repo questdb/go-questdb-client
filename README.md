@@ -607,6 +607,9 @@ What to know about these copies:
 - `<n>` runs from 0 to 63. When all 64 names are taken, the sender refuses to
   start until you move or remove some copies.
 - Orphan draining skips them. The Java client uses the same names.
+- With a `QuestDB` pool, check each borrowed sender, or list
+  `<sf_dir>/*.unreplayable-*`: a slot set aside by a pool build that no caller
+  receives is reported only in the log.
 - A copy is not a backup, and storage faults can still damage it. Don't rename
   it back into a slot to make a client replay it.
 

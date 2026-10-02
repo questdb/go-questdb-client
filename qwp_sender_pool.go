@@ -32,6 +32,7 @@ import (
 	"math/big"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -278,6 +279,8 @@ func newQwpSenderPool(
 	for i := 0; i < minSize; i++ {
 		slot, err := p.createSlot(ctx, false)
 		if err != nil {
+			// Name the copies the built senders preserved before closing them.
+			err = qwpSfWithPoolQuarantines(err, p.quarantineDestinations())
 			// Join the unwind close's error rather than drop it: it can be
 			// ErrSfCleanupPending, and this pool is about to become
 			// unreachable, so this is the only place the caller can learn
@@ -301,9 +304,31 @@ func newQwpSenderPool(
 		p.recoverStrandedSlots(ctx)
 	}
 	if err := p.stableCloseResult(); err != nil {
+		err = qwpSfWithPoolQuarantines(err, p.quarantineDestinations())
 		return nil, errors.Join(err, p.close(ctx))
 	}
 	return p, nil
+}
+
+// quarantineDestinations returns where this pool's builds preserved refused
+// slots, for the senders it still holds: the prewarmed slots and the recovery
+// senders bound at startup. A failed build discards those senders, and its
+// error is then the only place left to name the copies.
+func (p *qwpSenderPool) quarantineDestinations() []string {
+	var dests []string
+	// A lock failure is reported by the close that follows; return what was
+	// collected before it.
+	_ = p.withLock("read quarantine destinations", nil, func() {
+		for _, slot := range p.all {
+			if slot == nil || slot.delegate == nil {
+				continue
+			}
+			if dest := slot.delegate.QuarantinedSlotPath(); dest != "" && !slices.Contains(dests, dest) {
+				dests = append(dests, dest)
+			}
+		}
+	})
+	return dests
 }
 
 // recoverStrandedSlots scans <sfDir>/<base>-<i> for i in [0,maxSize) and binds
@@ -490,6 +515,13 @@ func (p *qwpSenderPool) settleGrowthBuild(resultCh <-chan *qwpSenderSlot, errCh 
 	slot := <-resultCh
 	err := <-errCh
 	cancel()
+	// No caller receives this error. When it names a preserved slot, the log
+	// is the only report left: a rename whose directory barrier then failed
+	// has no other record.
+	if len(qwpSfQuarantineDestinations(err)) > 0 {
+		qwpEffectiveLogger(p.logger).Error("qwp/sf: sender pool growth build failed after preserving a refused slot",
+			"slot_index", slotIndex, "error", err)
+	}
 	_, _ = p.settleBuiltSlot(slot, slotIndex, err, false)
 }
 
@@ -507,10 +539,16 @@ func (p *qwpSenderPool) settleBuiltSlot(slot *qwpSenderSlot, index int, buildErr
 			return
 		}
 		if p.closed || p.closing.Load() || p.poisonedErr != nil {
+			quarantined := slot.delegate.QuarantinedSlotPath()
 			closeSlot = p.prepareSlotCloseLocked(slot, qwpSfSlotCreating)
 			result = errPoolClosed
 			if p.poisonedErr != nil {
 				result = p.poisonedErr
+			}
+			// The discarded sender may have preserved a refused slot; a
+			// borrower receiving this error has no other way to find it.
+			if quarantined != "" {
+				result = &qwpSfQuarantineError{destination: quarantined, cause: result}
 			}
 			return
 		}

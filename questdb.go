@@ -386,7 +386,9 @@ func NewQuestDB(ctx context.Context, conf string, opts ...QuestDBOption) (*Quest
 	if err != nil {
 		// Join rather than drop: sp is about to become unreachable, so a
 		// retained slot lock (ErrSfCleanupPending) has no other way to reach
-		// the caller. See newQwpSenderPool's prewarm unwind.
+		// the caller. See newQwpSenderPool's prewarm unwind. The same holds
+		// for the preserved copies of slots its senders refused.
+		err = qwpSfWithPoolQuarantines(err, sp.quarantineDestinations())
 		if closeErr := sp.close(ctx); closeErr != nil {
 			err = errors.Join(err, closeErr)
 		}
