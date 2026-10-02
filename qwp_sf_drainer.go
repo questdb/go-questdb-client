@@ -839,7 +839,7 @@ func (p *qwpSfDrainerPool) removeActive(d *qwpSfOrphanDrainer) {
 		if x == d {
 			err := d.cleanupResult()
 			failed := errors.Is(err, ErrCleanupFailed)
-			p.cleanupErr = errors.Join(p.cleanupErr, err)
+			p.cleanupErr = qwpAppendCloseError(p.cleanupErr, err)
 			if failed {
 				p.failed = append(p.failed, d)
 				p.retainFailureLocked()

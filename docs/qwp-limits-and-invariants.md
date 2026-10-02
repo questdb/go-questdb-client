@@ -32,6 +32,12 @@ guarantees do not cover faults that terminate the process or arbitrary memory
 corruption. Panics caused by supported inputs and ordinary data races are still
 bugs.
 
+A sender pool keeps the errors of the senders it closes in constant space: the
+first and last in full, plus the first `ErrCleanupFailed`, and a count of the
+others. Its memory and the cost of `Error()` therefore stay the same over the
+pool's lifetime, however many senders fail. Each sender logs its own close
+error when it closes. The errors in between are not in `Close`'s result.
+
 ## Store-and-forward storage
 
 ### Disk-block reservation

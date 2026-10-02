@@ -101,7 +101,10 @@ type qwpSenderPool struct {
 	pendingLeaseTeardowns int
 
 	// closeTeardownErr saves errors from closing senders, including those that
-	// finish after the first pool Close returns. Read and update it with mu held.
+	// finish after the first pool Close returns. It keeps the first and last of
+	// them and the first internal cleanup failure, and counts the rest, so it
+	// stays the same size over the pool's lifetime. Read and update it with mu
+	// held.
 	closeTeardownErr error
 
 	// poisonedErr saves the first internal pool failure. After that, the pool
@@ -1312,7 +1315,7 @@ func (p *qwpSenderPool) reclaimSlotLocked(slot *qwpSenderSlot, closeErr error) {
 // This only reads the result; it does not try to close the sender again.
 func (p *qwpSenderPool) harvestSlotResultLocked(slot *qwpSenderSlot) {
 	if reporter, ok := slot.cleanup.(interface{ cleanupResult() error }); ok {
-		p.closeTeardownErr = qwpAppendCloseError(p.closeTeardownErr, reporter.cleanupResult())
+		p.closeTeardownErr = qwpAppendBoundedCloseError(p.closeTeardownErr, reporter.cleanupResult())
 	}
 }
 

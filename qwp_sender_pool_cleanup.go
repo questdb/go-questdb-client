@@ -27,7 +27,9 @@ package questdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -38,6 +40,74 @@ import (
 var qwpFailedSenderPools struct {
 	sync.Mutex
 	pools []*qwpSenderPool
+}
+
+// qwpBoundedCloseErrors keeps a pool's sender-close errors in constant space:
+// the first and last in full, the first one that matches ErrCleanupFailed,
+// and a count of the rest. A pool that closes senders for months under a
+// rejecting server keeps it this size, and walking it never overflows the
+// stack. Values are immutable: a result already returned to a caller does not
+// change while the pool records more.
+type qwpBoundedCloseErrors struct {
+	first  error
+	failed error // first error matching ErrCleanupFailed, unless first matches
+	last   error
+	// lastIsFailed means last holds the same error as failed. The record
+	// tracks this instead of comparing errors, because == on two interface
+	// values panics when their dynamic type is not comparable.
+	lastIsFailed bool
+	omitted      int // errors dropped from between first and last
+}
+
+func (e *qwpBoundedCloseErrors) Error() string {
+	errs := e.Unwrap()
+	parts := make([]string, 0, len(errs)+1)
+	parts = append(parts, errs[0].Error())
+	if e.omitted > 0 {
+		parts = append(parts, fmt.Sprintf("(%d more sender close errors omitted)", e.omitted))
+	}
+	for _, err := range errs[1:] {
+		parts = append(parts, err.Error())
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (e *qwpBoundedCloseErrors) Unwrap() []error {
+	errs := make([]error, 0, 3)
+	errs = append(errs, e.first)
+	if e.failed != nil {
+		errs = append(errs, e.failed)
+	}
+	if !e.lastIsFailed {
+		errs = append(errs, e.last)
+	}
+	return errs
+}
+
+// qwpAppendBoundedCloseError adds err to acc and returns the new record. A
+// single error is returned as it is; acc is never modified.
+func qwpAppendBoundedCloseError(acc, err error) error {
+	if err == nil {
+		return acc
+	}
+	if acc == nil {
+		return err
+	}
+	next := &qwpBoundedCloseErrors{first: acc, last: err}
+	if r, ok := acc.(*qwpBoundedCloseErrors); ok {
+		next.first = r.first
+		next.failed = r.failed
+		next.omitted = r.omitted
+		if !r.lastIsFailed {
+			// The previous last is dropped; a retained failure is still reported.
+			next.omitted++
+		}
+	}
+	if next.failed == nil && !errors.Is(next.first, ErrCleanupFailed) && errors.Is(err, ErrCleanupFailed) {
+		next.failed = err
+		next.lastIsFailed = true
+	}
+	return next
 }
 
 // Tests use this hook to panic during a slot-state update, after another
@@ -140,7 +210,7 @@ func (p *qwpSenderPool) finishSlotClose(slot *qwpSenderSlot, err error) {
 		// rather than permanently saving a storage error that a retry may fix.
 		// Internal cleanup failures are permanent and must still be saved now.
 		if _, observes := slot.cleanup.(interface{ cleanupResult() error }); !observes || errors.Is(err, ErrCleanupFailed) {
-			p.closeTeardownErr = qwpAppendCloseError(p.closeTeardownErr, err)
+			p.closeTeardownErr = qwpAppendBoundedCloseError(p.closeTeardownErr, err)
 		}
 		p.reclaimSlotLocked(slot, err)
 		p.broadcastLocked()
