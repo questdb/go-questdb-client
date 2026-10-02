@@ -309,7 +309,8 @@ type LineSender interface {
 	// The client remains responsible for retrying recoverable storage cleanup.
 	// After an internal failure, resources that cannot safely be released stay
 	// held, possibly until process exit. Close does not promise an empty slot
-	// directory or a WebSocket closing handshake.
+	// directory or a WebSocket closing handshake, and a WebSocket CLOSE reply
+	// would not acknowledge rows: only server acknowledgements confirm them.
 	//
 	// For a sender borrowed with [QuestDB.BorrowSender], Close returns it to the
 	// pool. Later calls do nothing and return nil, not errors from later cleanup.
@@ -820,9 +821,11 @@ func WithSfMaxTotalBytes(n int64) LineSenderOption {
 // indefinitely and never gives up on a wall clock (Invariant B). On a
 // running sender maxDuration additionally sets how long a rejection
 // window must persist before the poison-frame detector may escalate to a
-// terminal (and the background drainer's no-progress wedge budget), so a
-// small value shortens those floors — leave it at the default unless you
-// intend that.
+// terminal, and the background drainer's no-progress budget, so a small
+// value shortens those floors — leave it at the default unless you intend
+// that. The drainer budget never drops below 30 seconds, or four times that
+// with durable acknowledgements, so a small value cannot quarantine a slow
+// but healthy slot.
 // initialBackoff and maxBackoff bound the equal-jitter exponential
 // backoff sleep between attempts. A zero or negative argument is
 // treated as "leave the default" for that knob — it does not register

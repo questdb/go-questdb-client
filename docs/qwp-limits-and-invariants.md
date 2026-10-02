@@ -66,7 +66,9 @@ for the whole dictionary invariant.
 
 Accepted limit: frames in the active segment are not fsynced as they are
 appended, so an OS crash or power loss can lose the end of the active segment.
-Recovery then keeps its readable beginning under the damaged-tail policy.
+Recovery then keeps its readable beginning under the damaged-tail policy: it
+zeroes the unreadable rest in place before accepting new writes, keeps no copy
+of it, and does the same when no complete frame survives.
 Process restart, host crash and power loss are not equivalent guarantees:
 Darwin `fsync` is not `F_FULLFSYNC`, and the Windows directory barrier is a
 no-op.
