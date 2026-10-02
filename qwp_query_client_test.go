@@ -32,7 +32,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1816,6 +1818,225 @@ func TestQwpQueryYieldPanicReleasesBufferAndDrains(t *testing.T) {
 	if q2.TotalRows() != 1 {
 		t.Errorf("q2.TotalRows=%d, want 1", q2.TotalRows())
 	}
+}
+
+// qwpTestReadQueryRequest reads client frames until a QUERY_REQUEST,
+// skipping CANCEL and any other control frame, and returns its request id.
+func qwpTestReadQueryRequest(ctx context.Context, t *testing.T, m *qwpMockEgressConn) int64 {
+	for {
+		frame := m.readBinary(ctx)
+		if len(frame) > 0 && frame[0] == byte(qwpMsgKindQueryRequest) {
+			reqID, _, _ := parseQueryRequest(t, frame)
+			return reqID
+		}
+	}
+}
+
+// qwpTestAssertSecondQuery runs a second query on c and asserts it yields
+// exactly the value 99 and a total of one row: the client's response stream
+// holds nothing left over from the first query.
+func qwpTestAssertSecondQuery(t *testing.T, c *QwpQueryClient) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	q := c.Query(ctx, "SELECT 2")
+	defer q.Close()
+	var got []int64
+	for b, err := range q.Batches() {
+		if err != nil {
+			t.Fatalf("query 2 error after values %v: %v", got, err)
+		}
+		got = append(got, b.Int64(0, 0))
+	}
+	if len(got) != 1 || got[0] != 99 {
+		t.Errorf("query 2 values = %v, want [99]", got)
+	}
+	if q.TotalRows() != 1 {
+		t.Errorf("query 2 TotalRows = %d, want 1", q.TotalRows())
+	}
+}
+
+// A loop body that panics on the context-error yield leaves the abandoned
+// query's frames in flight. Batches drains them, so the next query on the
+// client reads only its own rows.
+func TestQwpQueryCtxErrorYieldPanicDrains(t *testing.T) {
+	expired := make(chan struct{})
+	c, cleanup := newMockQueryClient(t, 1, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// Query 1: hold the response until the client's context has
+		// expired, then send it.
+		reqID1 := qwpTestReadQueryRequest(ctx, t, m)
+		select {
+		case <-expired:
+		case <-ctx.Done():
+			return
+		}
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID1, 0, "v", 42))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID1, 0, 1)))
+		// Query 2, after skipping the drain's CANCEL.
+		reqID2 := qwpTestReadQueryRequest(ctx, t, m)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID2, 0, "v", 99))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID2, 0, 1)))
+	})
+	defer cleanup()
+
+	func() {
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel1()
+		q1 := c.Query(ctx1, "SELECT 1")
+		defer q1.Close()
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic from the loop body")
+			}
+		}()
+		for b, err := range q1.Batches() {
+			if b != nil || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("query 1 yielded (%v, %v), want the context error", b != nil, err)
+			}
+			close(expired)
+			panic("boom")
+		}
+	}()
+
+	qwpTestAssertSecondQuery(t, c)
+}
+
+// A loop body that panics on the *QwpFailoverReset yield leaves the new
+// connection's replayed response in flight. Batches drains it, so the next
+// query on the client reads only its own rows.
+func TestQwpQueryFailoverResetYieldPanicDrains(t *testing.T) {
+	// The first connection that reads a request fails it, forcing a
+	// reconnect. Every other connection serves requests in order: the
+	// replayed query 1 gets 42, query 2 gets 99.
+	var failed atomic.Bool
+	cluster := newMockCluster(t, 2, rolesPrimaryReplicaReplica(),
+		func(idx int, m *qwpMockEgressConn) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			served := 0
+			for {
+				typ, frame, err := m.conn.Read(ctx)
+				if err != nil {
+					return
+				}
+				if typ != websocket.MessageBinary || len(frame) == 0 ||
+					frame[0] != byte(qwpMsgKindQueryRequest) {
+					continue
+				}
+				reqID, _, _ := parseQueryRequest(t, frame)
+				if failed.CompareAndSwap(false, true) {
+					m.conn.Close(websocket.StatusInternalError, "simulated fault")
+					return
+				}
+				val := int64(42)
+				if served > 0 {
+					val = 99
+				}
+				served++
+				m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID, 0, "v", val))
+				m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID, 0, 1)))
+			}
+		})
+
+	cfg := qwpQueryDefaultConfig()
+	eps, _ := parseEndpointList(cluster.addrList(), qwpDefaultPort)
+	cfg.endpoints = eps
+	cfg.target = qwpTargetAny
+	cfg.serverInfoTimeout = 2 * time.Second
+	cfg.failoverEnabled = true
+	cfg.failoverMaxAttempts = 3
+	cfg.failoverBackoffInitial = 1 * time.Millisecond
+	cfg.failoverBackoffMax = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := newQwpQueryClient(ctx, cfg)
+	if err != nil {
+		t.Fatalf("newQwpQueryClient: %v", err)
+	}
+	defer c.Close(ctx)
+
+	func() {
+		q1 := c.Query(ctx, "SELECT 1")
+		defer q1.Close()
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic from the loop body")
+			}
+		}()
+		for b, err := range q1.Batches() {
+			var reset *QwpFailoverReset
+			if !errors.As(err, &reset) {
+				t.Fatalf("query 1 yielded (%v, %v) before the reset", b != nil, err)
+			}
+			panic("boom")
+		}
+	}()
+
+	qwpTestAssertSecondQuery(t, c)
+}
+
+// A loop body that calls runtime.Goexit on a batch yield must still drain
+// the query, and must release the batch's buffer before the drain. With a
+// pool of one buffer, the I/O goroutine can decode query 1's second batch
+// only once the first is released, so a drain that ran first would time
+// out and mark the client desynced.
+func TestQwpQueryBatchYieldGoexitDrains(t *testing.T) {
+	c, cleanup := newMockQueryClient(t, 1, func(m *qwpMockEgressConn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// Query 1: two batches, then wait for CANCEL and echo CANCELLED.
+		reqID1 := qwpTestReadQueryRequest(ctx, t, m)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID1, 0, "v", 42))
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID1, 1, "v", 43))
+		for {
+			frame := m.readBinary(ctx)
+			if frame[0] == byte(qwpMsgKindCancel) {
+				break
+			}
+		}
+		m.sendBinary(ctx, writeQwpFrame(0, buildQueryErrorBody(
+			reqID1, byte(qwpStatusCancelled), "cancelled", -1)))
+		// Query 2.
+		reqID2 := qwpTestReadQueryRequest(ctx, t, m)
+		m.sendBinary(ctx, buildOneRowInt64Batch(t, reqID2, 0, "v", 99))
+		m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(reqID2, 0, 1)))
+	})
+	defer cleanup()
+
+	// Goexit on the test goroutine would end the test, so query 1 runs
+	// on its own goroutine.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel1()
+		q1 := c.Query(ctx1, "SELECT 1")
+		defer q1.Close()
+		for b, err := range q1.Batches() {
+			if err != nil {
+				t.Errorf("query 1 error: %v", err)
+				return
+			}
+			if got := b.Int64(0, 0); got != 42 {
+				t.Errorf("query 1 first value = %d, want 42", got)
+			}
+			runtime.Goexit()
+		}
+		t.Errorf("query 1 loop ended without reaching runtime.Goexit")
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("query 1 goroutine did not exit")
+	}
+
+	if c.execDesynced() {
+		t.Fatal("client marked desynced: the drain ran before the buffer release")
+	}
+	qwpTestAssertSecondQuery(t, c)
 }
 
 // Cancel can cross goroutines. Close follows consumer exit, so only the

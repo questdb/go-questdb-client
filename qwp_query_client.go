@@ -546,7 +546,8 @@ func WithQwpQueryReplayExec(enabled bool) QwpQueryClientOption {
 }
 
 // WithQwpQueryCloseTimeout bounds the close-path cleanup drain (cursor
-// Close, iterator break-out) before the connection is declared desynced.
+// Close, iterator break-out, a Batches loop body that panics) before the
+// connection is declared desynced.
 // Equivalent to the query_close_timeout_ms connect-string key; default 5s.
 // It does not limit how long releasing resources may take. See [Query.Close]
 // for returning a borrowed client and [QwpQueryClient.Close] for waiting on cleanup.
@@ -1232,6 +1233,12 @@ type QwpQuery struct {
 // the range loop (sends CANCEL to the server, drains remaining
 // events).
 //
+// If the loop body panics or calls runtime.Goexit, Batches cancels the query
+// and drains its remaining results before the panic continues, so the client
+// can run the next statement. The drain can delay the panic by up to the
+// timeout set with WithQwpQueryCloseTimeout or query_close_timeout_ms
+// (default 5s).
+//
 // The yielded *QwpColumnBatch is only valid inside the body of the
 // current iteration — its slices alias the pool-owned decode buffer
 // and will be reused for the next batch. Use batch.CopyAll() to
@@ -1264,34 +1271,20 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 				// Close() sees state=Done (flipped by the defer on
 				// this function) and becomes a no-op; without this
 				// drain the dispatcher would stay stuck and strand
-				// the client for follow-up Query/Exec.
-				yield(nil, err)
+				// the client for follow-up Query/Exec. If the loop
+				// body unwinds instead, yieldOrDrain drains.
+				q.yieldOrDrain(yield, nil, err)
 				q.cancelAndDrainOnCleanupCtx()
 				return
 			}
 			switch ev.kind {
 			case qwpEventKindBatch:
-				keepGoing := false
-				func() {
-					// Release the buffer even if the caller's yield
-					// body panics. Without this, a single panic with
-					// bufferPoolSize=1 permanently starves the pool,
-					// and the dispatcher — still parked in receiveLoop
-					// for this query — blocks the next Query/Exec.
-					// On panic we also run the cancel+drain before
-					// rethrowing: the outer `defer q.state.Store(Done)`
-					// has already flipped the state, so the caller's
-					// defer q.Close() would otherwise be a no-op and
-					// leave the dispatcher stranded.
-					defer func() {
-						ev.batch.release()
-						if r := recover(); r != nil {
-							q.cancelAndDrainOnCleanupCtx()
-							panic(r)
-						}
-					}()
-					keepGoing = yield(&ev.batch.batch, nil)
-				}()
+				// The buffer returns to the pool however the loop body
+				// ends, so one unwinding cannot starve a pool of size 1.
+				// An unwinding loop body also drains the query, after
+				// that release, so the next Query/Exec finds an idle
+				// dispatcher.
+				keepGoing := q.yieldOrDrain(yield, ev.batch, nil)
 				if !keepGoing {
 					// User broke out — request cancel and drain the
 					// remaining events until a terminal frame so the
@@ -1333,7 +1326,7 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 				// continue iterating to consume the new generation's
 				// batches. ev.failoverReset is always non-nil for
 				// this kind.
-				if !yield(nil, ev.failoverReset) {
+				if !q.yieldOrDrain(yield, nil, ev.failoverReset) {
 					q.cancelAndDrainOnCleanupCtx()
 					return
 				}
@@ -1416,6 +1409,38 @@ func (q *QwpQuery) Close() {
 		return
 	}
 	q.cancelAndDrainOnCleanupCtx()
+}
+
+// yieldOrDrain runs one yield of a Batches iterator while a query is in
+// flight. buf is the yielded batch's buffer, or nil for an error yield. When
+// the yield ends, it first returns buf to the pool. If the loop body unwinds
+// instead of returning (a panic, or runtime.Goexit), it then cancels and
+// drains the query, so the client's result stream holds no leftover frames
+// for the next statement. The panic continues unchanged. A normal return,
+// true or false, leaves any drain to the caller.
+//
+// The release comes first because the I/O goroutine needs a free buffer to
+// decode the frames the drain reads; with a pool of one, draining first
+// would stall until the cleanup timeout.
+func (q *QwpQuery) yieldOrDrain(
+	yield func(*QwpColumnBatch, error) bool, buf *qwpBatchBuffer, err error,
+) bool {
+	var b *QwpColumnBatch
+	if buf != nil {
+		b = &buf.batch
+	}
+	returned := false
+	defer func() {
+		if buf != nil {
+			buf.release()
+		}
+		if !returned {
+			q.cancelAndDrainOnCleanupCtx()
+		}
+	}()
+	keepGoing := yield(b, err)
+	returned = true
+	return keepGoing
 }
 
 // cancelAndDrainOnCleanupCtx sends a CANCEL for this query's
