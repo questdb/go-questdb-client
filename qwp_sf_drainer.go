@@ -595,10 +595,11 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// future process start re-adopts the same wedged slot in full —
 	// an unbounded re-adoption livelock.
 	//
-	// This bounds only a LIVE-but-not-acking connection: transport
-	// outages never charge it (a reconnect window resets/pauses the
-	// clocks below), so a long server outage cannot quarantine the
-	// slot (Invariant B). The budget derives from reconnectMaxDuration but is
+	// This bounds only time on a live connection (Invariant B). An outage,
+	// including the recycle pause before a redial, never charges it, and a
+	// completed reconnect gives the next connection a fresh budget. The send
+	// loop counts reconnects, so a reconnect that starts and finishes between
+	// two polls is still seen. The budget derives from reconnectMaxDuration but is
 	// floored (see noProgressBudget), so a small reconnect_max_duration_millis
 	// set to bound the blocking initial connect cannot also quarantine a
 	// slow-but-healthy slot here.
@@ -606,14 +607,18 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	lastProgressAcked := engine.engineAckedFsn()
 	lastProgressAcks := loop.sendLoopTotalAcks()
 	lastProgressAt := time.Now()
-	// Durable-stall clock: accumulates only live-connection time (a
-	// reconnect window pauses it without resetting what has already
-	// accumulated — anti-evasion: a flapping endpoint that accepts +
-	// OK-acks + drops without ever issuing STATUS_DURABLE_ACK cannot
-	// evade the bound by reconnect-cycling) and zeroes only on a
-	// genuine durable trim advance. Without it, okAcks climbs on every
-	// cycle and the drainer never quarantines.
+	lastReconnects := loop.sendLoopTotalReconnects()
+	// Durable-stall clock: accumulates only live-connection time and zeroes
+	// on a genuine durable trim advance. Once a data frame has been OK-acked
+	// since the clock started, it carries across reconnects: a flapping
+	// endpoint that accepts + OK-acks + drops without ever issuing
+	// STATUS_DURABLE_ACK cannot evade the bound by reconnect-cycling, even
+	// though okAcks climbs on every cycle. Until such an OK ack arrives, a
+	// reconnect zeroes it, because a connection that dropped without
+	// OK-acking data is a transport event (Invariant B). stallDataOkAcks is
+	// the data-OK count when the clock last started.
 	durableStallElapsed := time.Duration(0)
+	stallDataOkAcks := loop.sendLoopTotalDataOkAcks()
 	lastStallSampleAt := lastProgressAt
 	for {
 		acked := engine.engineAckedFsn()
@@ -640,10 +645,10 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			d.outcome.Store(int32(qwpSfDrainOutcomeStopped))
 			return
 		}
-		// Forward ACK progress, or being inside the separately
-		// bounded reconnect loop, resets the watchdog clock. A fresh
-		// connection thus always gets a full budget to produce its
-		// first ACK.
+		// Forward ACK progress, an outage in progress (including the
+		// recycle pause before a redial), or a reconnect since the last
+		// poll resets the watchdog clock. A fresh connection thus always
+		// gets a full budget to produce its first ACK.
 		//
 		// In durable mode `acked` only advances on STATUS_DURABLE_ACK, so a
 		// healthy-but-slow durable pipeline (the server OK-acking frames while
@@ -653,6 +658,10 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 		now := time.Now()
 		reconnecting, _, _ := loop.sendLoopReconnectStatus()
 		okAcks := loop.sendLoopTotalAcks()
+		reconnects := loop.sendLoopTotalReconnects()
+		reconnected := reconnects != lastReconnects
+		lastReconnects = reconnects
+		dataOkAcks := loop.sendLoopTotalDataOkAcks()
 		// A transport window pauses the durable-stall clock: only
 		// live-connection time is charged, so a long outage cannot burn
 		// the settle budget (Invariant B).
@@ -660,7 +669,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			durableStallElapsed += now.Sub(lastStallSampleAt)
 		}
 		lastStallSampleAt = now
-		if acked > lastProgressAcked || reconnecting ||
+		if acked > lastProgressAcked || reconnecting || reconnected ||
 			(d.durableAckMode && okAcks > lastProgressAcks) {
 			// Forward progress of either the durable trim watermark or the OK-ack
 			// counter proves the sender bound a durable-advertising primary and is
@@ -677,6 +686,14 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 				d.mismatchAttempts.Store(0)
 			}
 			if acked > lastProgressAcked {
+				durableStallElapsed = 0
+				stallDataOkAcks = dataOkAcks
+			} else if reconnected && dataOkAcks == stallDataOkAcks {
+				// No data frame has been OK-acked since the durable-stall
+				// clock started, so the connection that dropped showed no
+				// sign of a pipeline that accepts frames but does not make
+				// them durable. The drop is a transport event, and the next
+				// connection starts the clock again (Invariant B).
 				durableStallElapsed = 0
 			}
 			lastProgressAcked = acked

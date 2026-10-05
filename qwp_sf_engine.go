@@ -1192,7 +1192,8 @@ func (e *qwpSfCursorEngine) engineSetSendLoopWakeup(fn func()) {
 // error returned by engineAppendBlocking when the deadline expires.
 // Per spec §16 the message MUST distinguish "publishing but slow"
 // from "reconnecting"; in the latter case it includes the per-outage
-// attempt count and the wall-clock outage start.
+// attempt count (0 during a recycle pause, before the first dial) and the
+// wall-clock outage start.
 func (e *qwpSfCursorEngine) formatBackpressureTimeout() error {
 	if g := e.reconnectStatus.Load(); g != nil {
 		if reconnecting, attempts, outageStart := (*g)(); reconnecting {

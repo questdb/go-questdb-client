@@ -250,6 +250,32 @@ Why it is accepted:
   `0 < deltaStart <` its own `deltaStart`). That adds complexity to a safety
   check for a state that needs detected media damage.
 
+## Drainer no-progress quarantine
+
+A background drainer writes `.failed` for a stalled drain only on evidence it
+gathers while connected (Invariant B).
+
+- Without durable ACKs, one connection must stay open for the whole budget
+  (`reconnect_max_duration_millis`, at least 30 s) with no ACK progress. An
+  outage, the pause before a redial, and each completed reconnect start the
+  budget again.
+- With durable ACKs, the drainer counts connected time with no durable
+  progress, up to four times the budget. The count carries across reconnects
+  only after the server has OK-acked a data frame since the count started;
+  until then, each reconnect starts it again. An acknowledgement of the
+  dictionary catch-up alone does not count. Outages and pauses are never
+  counted.
+
+A server that keeps accepting connections and closing them before the
+no-progress limit runs out, without acknowledging data, keeps the drainer
+retrying for as long as the process runs, and the slot is adopted again after a
+restart. This holds when each close is orderly (`GOING_AWAY`, `NORMAL_CLOSURE`)
+or comes before the client has sent a data frame on that connection. Such a
+server cannot be told apart from one that is restarting or briefly unreachable,
+and neither may quarantine a slot. A non-orderly close after a data frame was
+sent counts a poison strike instead, and repeated strikes can still end the
+drain with `.failed`.
+
 ## Quarantine and slot locking
 
 The user rules are in the README's

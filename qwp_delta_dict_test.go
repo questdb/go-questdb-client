@@ -111,6 +111,37 @@ func TestQwpDeltaDictReconnectCatchUpRebuildsDictionary(t *testing.T) {
 	}, 3*time.Second, 5*time.Millisecond)
 }
 
+// TestQwpSfSendLoopDataOkAcksExcludeCatchUp pins that the data-OK count skips
+// the ack for a reconnect's dictionary catch-up. Connection 1 acks FSN 0 and
+// drops after reading FSN 1, so connection 2 replays from FSN 1 behind a
+// catch-up frame that maps to FSN 0. Connection 1 must ack before the drop:
+// otherwise the replay starts at FSN 0 on both connections, and a stale
+// replay start would go unnoticed.
+func TestQwpSfSendLoopDataOkAcksExcludeCatchUp(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 2})
+	defer srv.Close()
+
+	s, engine, loop, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+
+	ctx := context.Background()
+	require.NoError(t, s.Table("t").Symbol("sym", "AAPL").Int64Column("v", 1).AtNow(ctx))
+	require.NoError(t, s.Flush(ctx))
+	require.Eventually(t, func() bool { return engine.engineAckedFsn() == 0 },
+		3*time.Second, 5*time.Millisecond, "connection 1 must ack FSN 0 before the drop")
+
+	require.NoError(t, s.Table("t").Symbol("sym", "BETA").Int64Column("v", 2).AtNow(ctx))
+	require.NoError(t, s.Flush(ctx))
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
+	}, 3*time.Second, 5*time.Millisecond)
+
+	require.Equal(t, int64(2), loop.sendLoopTotalDataOkAcks(),
+		"one data ack per connection; the catch-up ack must not count")
+	require.GreaterOrEqual(t, loop.sendLoopTotalAcks()-loop.sendLoopTotalDataOkAcks(), int64(1),
+		"connection 2 must have acked its catch-up frame")
+}
+
 // TestQwpDeltaDictNoCatchUpWhenNothingSent verifies a fresh connection with an
 // empty mirror keeps the plain 1:1 baseline (no catch-up frame).
 func TestQwpDeltaDictNoCatchUpWhenNothingSent(t *testing.T) {

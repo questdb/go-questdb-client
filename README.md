@@ -521,7 +521,7 @@ affected.
 | `sf_max_total_bytes` | 10 GiB | Disk space one slot may use, including its `.corrupt` files. When it is used up, the producer waits. |
 | `sf_append_deadline_millis` | 30000 | How long `At` / `AtNow` / `Flush` wait for space before failing with `ErrBackpressureTimeout`. |
 | `sf_durability` | `memory` | The only supported value; see the crash guarantees below. |
-| `reconnect_max_duration_millis` | 300000 | Time limit for a blocking initial connect. A running sender retries outages indefinitely. The same value sets how long one frame may keep being rejected, and how long an adopted orphan slot may make no progress, before the client gives up on it, so leave it at the default unless you mean that. |
+| `reconnect_max_duration_millis` | 300000 | Time limit for a blocking initial connect. A running sender retries outages indefinitely. The same value sets how long one frame may keep being rejected, and how long an adopted orphan slot may stay connected without making progress, before the client gives up on it, so leave it at the default unless you mean that. |
 | `reconnect_initial_backoff_millis` | 100 | First retry delay, with jitter. |
 | `reconnect_max_backoff_millis` | 5000 | Longest retry delay. |
 | `initial_connect_retry` | `off` | `off`: fail if the first connect fails. `on` / `sync`: retry, blocking the constructor. `async`: retry in the background while the constructor returns. |

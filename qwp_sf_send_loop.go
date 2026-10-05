@@ -368,6 +368,18 @@ type qwpSfSendLoop struct {
 	// progress and skip the recycle pacing.
 	acksOnConn atomic.Int64
 
+	// connReplayStart is the first FSN the current connection sends:
+	// engineAckedFsn()+1 when the connection was positioned. An ack below
+	// it covers only dictionary catch-up frames. setWireBaselineWithCatchUp
+	// writes it on the I/O goroutine before the connection's sender and
+	// receiver start.
+	connReplayStart int64
+	// totalDataOkAcks counts OK acks that cover at least one data frame of
+	// their connection. Acks that cover only catch-up frames are not
+	// counted. The drainer's durable-stall clock reads it as evidence that
+	// the server is processing frames.
+	totalDataOkAcks atomic.Int64
+
 	// Poison-frame detector state. poisonFsn is the FSN implicated by
 	// the most recent server-active rejection (retriable NACK, or
 	// non-orderly close after at least one send on the connection): the
@@ -410,9 +422,10 @@ type qwpSfSendLoop struct {
 	// Reconnect-loop status, exposed so engineAppendBlocking can
 	// distinguish "wire publishing but slow" from "wire is in the
 	// retry loop" when the backpressure deadline fires (spec §16).
-	// outageStartUnixNano is non-zero iff connectWithBackoff is
-	// currently running; reconnectAttempts is the per-outage counter
-	// (resets at the start of each connectWithBackoff call).
+	// outageStartUnixNano is non-zero while connectWithBackoff runs,
+	// including the recycle pause it waits out before its first dial;
+	// reconnectAttempts is the per-outage dial counter (resets at the
+	// start of each connectWithBackoff call).
 	outageStartUnixNano atomic.Int64
 	reconnectAttempts   atomic.Int64
 
@@ -836,10 +849,12 @@ func (l *qwpSfSendLoop) sendLoopTotalReconnectAttempts() int64 {
 }
 
 // sendLoopReconnectStatus reports whether the I/O loop is currently
-// inside connectWithBackoff. When reconnecting is true, attempts is
-// the per-outage attempt counter (≥ 1) and outageStart is the wall-
-// clock time the current outage began. When reconnecting is false,
-// attempts is 0 and outageStart is the zero time.Time.
+// inside connectWithBackoff, including the recycle pause before its
+// first dial. When reconnecting is true, attempts is the number of dials
+// in the current outage (0 while the loop waits out a recycle pause) and
+// outageStart is the wall-clock time the current outage began. When
+// reconnecting is false, attempts is 0 and outageStart is the zero
+// time.Time.
 //
 // Used by engineAppendBlocking to enrich the backpressure timeout
 // error per spec §16: distinguish "publishing but slow" from
@@ -861,6 +876,12 @@ func (l *qwpSfSendLoop) sendLoopTotalFramesSent() int64 {
 // sendLoopTotalAcks returns the cumulative ACK count received.
 func (l *qwpSfSendLoop) sendLoopTotalAcks() int64 {
 	return l.totalAcks.Load()
+}
+
+// sendLoopTotalDataOkAcks returns the number of OK acks that covered a data
+// frame (see totalDataOkAcks).
+func (l *qwpSfSendLoop) sendLoopTotalDataOkAcks() int64 {
+	return l.totalDataOkAcks.Load()
 }
 
 // sendLoopTotalFramesReplayed returns the cumulative count of
@@ -1047,7 +1068,7 @@ func (l *qwpSfSendLoop) run() {
 
 	if l.transport.Load() == nil && l.running.Load() {
 		initial := errors.New("async initial connect deferred to I/O goroutine")
-		if !l.connectWithBackoff(initial, "initial connect") {
+		if !l.connectWithBackoff(initial, "initial connect", 0) {
 			return
 		}
 	}
@@ -1150,17 +1171,16 @@ func (l *qwpSfSendLoop) run() {
 		// so a persistent rejection window (e.g. a WRITE_ERROR burst)
 		// would otherwise hot-loop send→NACK→reconnect with no growth.
 		// An ack covering the retried frame resets the counter.
+		// connectWithBackoff waits out the pause inside the outage window,
+		// so the reconnect status reports it as part of the outage.
+		var pause time.Duration
 		if rejectionRecycle {
-			pause := qwpSfComputeBackoff(l.rejectionRecycles,
+			pause = qwpSfComputeBackoff(l.rejectionRecycles,
 				l.reconnectInitialBackoff, l.reconnectMaxBackoff)
-			if !qwpSfSleepInterruptible(l.ctx, nil, pause) {
-				return
-			}
 			l.rejectionRecycles++
 		}
 		// Reconnect with backoff.
-		ok := l.connectWithBackoff(err, "reconnect")
-		if !ok {
+		if !l.connectWithBackoff(err, "reconnect", pause) {
 			return
 		}
 	}
@@ -1176,6 +1196,14 @@ func (l *qwpSfSendLoop) run() {
 // that gets acked counts as progress and resets the recycle backoff.
 func (l *qwpSfSendLoop) connMadeNoRealProgress() bool {
 	return l.acksOnConn.Load() == 0 || l.framesSentOnConn.Load() == 0
+}
+
+// coversDataFrame reports whether an OK ack for wire sequence seq covers a
+// data frame of the current connection rather than only its dictionary
+// catch-up frames. setWireBaselineWithCatchUp places k catch-up frames at
+// wire sequences 0..k-1, mapped to FSNs below connReplayStart.
+func (l *qwpSfSendLoop) coversDataFrame(seq int64) bool {
+	return l.fsnAtZero.Load()+seq >= l.connReplayStart
 }
 
 // runOneConnection runs the send + receive goroutines for the
@@ -1960,6 +1988,9 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 		// backoff into a ~initial-backoff hot loop.
 		l.totalAcks.Add(1)
 		l.acksOnConn.Add(1)
+		if l.coversDataFrame(seq) {
+			l.totalDataOkAcks.Add(1)
+		}
 		if l.durableAckMode {
 			// Durable mode: stash the OK and wait for STATUS_DURABLE_ACK to
 			// trim. serverAckedSeq is deliberately not recorded here — the
@@ -2024,7 +2055,11 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 // async-initial-connect path (phase="initial connect"); the phase
 // string only flavors the log/error message — control flow is
 // identical.
-func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
+//
+// pause is the recycle backoff run() chose for a rejection-driven or
+// no-progress recycle. It is waited out inside the outage window, before
+// the first dial; the initial connect passes 0.
+func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string, pause time.Duration) bool {
 	if l.tracker == nil {
 		// Legacy single-host path (tests that didn't call
 		// sendLoopSetHostTracker). Synthesize an implicit 1-host
@@ -2039,6 +2074,12 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		l.outageStartUnixNano.Store(0)
 		l.reconnectAttempts.Store(0)
 	}()
+	// The recycle pause belongs to the outage. The reconnect status reports
+	// it, so the drainer's watchdog does not count it as connected time, and
+	// a backpressure timeout reports it as reconnecting.
+	if !qwpSfSleepInterruptible(l.ctx, nil, pause) {
+		return false
+	}
 
 	// Snapshot the entering previousIdx and consume it for this
 	// connect cycle. The round-walk calls RecordMidStreamFailure
@@ -2212,7 +2253,8 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 // the mirror, and the catch-up costs only the dictionary's bytes once per
 // connection. The catch-up frames occupy wire seqs 0..k-1, which
 // map to already-acked FSNs (harmless re-acks), so the first real replay frame
-// still lands on replayStart.
+// still lands on replayStart. It records replayStart as connReplayStart, which
+// coversDataFrame uses to tell those catch-up acks from data acks.
 //
 // Caller must have reset highestFullySent / serverAckedSeq / framesSentOnConn
 // / acksOnConn and the durable tracker first. Runs on the goroutine that owns
@@ -2221,6 +2263,7 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 // that is not fatal — reset to the plain baseline so the first real send
 // surfaces the wire failure and run()'s reconnect redoes the catch-up.
 func (l *qwpSfSendLoop) setWireBaselineWithCatchUp(replayStart int64) {
+	l.connReplayStart = replayStart
 	transport := l.transport.Load()
 	if transport != nil && l.sentDictCount > 0 {
 		l.nextWireSeq.Store(0)

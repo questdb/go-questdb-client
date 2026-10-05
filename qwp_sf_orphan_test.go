@@ -1224,6 +1224,176 @@ func TestQwpSfDrainerRetriesDownServerInsteadOfQuarantining(t *testing.T) {
 	assert.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome())
 }
 
+// qwpSfTestWriteOneFrameOrphan leaves a slot at dir holding one unacked
+// frame, for a drainer to adopt.
+func qwpSfTestWriteOneFrameOrphan(t *testing.T, dir string, segSize int64) {
+	t.Helper()
+	engine, err := qwpSfNewCursorEngine(dir, segSize, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("data"))
+	require.NoError(t, err)
+	require.NoError(t, engine.engineClose())
+}
+
+// TestQwpSfDrainerFlappingServerDoesNotQuarantine pins Invariant B for a server
+// that accepts each connection and closes it without acknowledging data. Each
+// close is a transport event: the recycle pause counts as outage time and each
+// completed reconnect starts a fresh budget, so the drainer keeps retrying
+// across many budgets and drains once the server acks.
+func TestQwpSfDrainerFlappingServerDoesNotQuarantine(t *testing.T) {
+	defer func(orig time.Duration) { qwpSfMinNoProgressBudget.store(orig) }(qwpSfMinNoProgressBudget.load())
+	qwpSfMinNoProgressBudget.store(10 * time.Millisecond)
+
+	const flapConns = 15 // connections 1-14 close without acking; 15 acks
+	cases := []struct {
+		name           string
+		hold           time.Duration
+		initialBackoff time.Duration
+		maxBackoff     time.Duration
+	}{
+		// The server closes at once, so the recycle pauses take up nearly
+		// all the time.
+		{"ImmediateClose", 0, 50 * time.Millisecond, 100 * time.Millisecond},
+		// Each connection stays open 100ms and the pauses are short, so most
+		// reconnects start and finish between two polls.
+		{"HeldConnection", 100 * time.Millisecond, time.Millisecond, 2 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+				orderlyCloseAfterFrames: 1,
+				orderlyCloseUntilConn:   flapConns,
+				orderlyCloseDelay:       tc.hold,
+			})
+			defer srv.Close()
+
+			dir := t.TempDir()
+			const segSize int64 = 4096
+			qwpSfTestWriteOneFrameOrphan(t, dir, segSize)
+
+			// A 300ms budget: connections 1-14 flap for well over four of them.
+			drainer := qwpSfNewOrphanDrainer(
+				dir, segSize, qwpSfUnlimitedTotalBytes,
+				qwpSfDialFor(srv),
+				nil,
+				300*time.Millisecond, tc.initialBackoff, tc.maxBackoff,
+			)
+			done := make(chan struct{})
+			go func() { drainer.drainerRun(context.Background()); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Fatal("drainer did not finish after the server started acking")
+			}
+
+			assert.Equal(t, qwpSfDrainOutcomeSuccess, drainer.drainerOutcome(),
+				"a flapping server must not quarantine the slot")
+			_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+			assert.True(t, os.IsNotExist(statErr), "a flapping server must not drop .failed")
+			assert.GreaterOrEqual(t, srv.connCount.Load(), int64(flapConns))
+		})
+	}
+}
+
+// TestQwpSfDrainerDurableFlappingWithoutDataAcksDoesNotQuarantine pins
+// Invariant B for the durable-stall clock: a server that never OK-acks a data
+// frame and drops each connection gives no evidence of a stalled durable
+// pipeline, so every reconnect restarts the clock and the slot is never
+// quarantined.
+func TestQwpSfDrainerDurableFlappingWithoutDataAcksDoesNotQuarantine(t *testing.T) {
+	defer func(orig time.Duration) { qwpSfMinNoProgressBudget.store(orig) }(qwpSfMinNoProgressBudget.load())
+	qwpSfMinNoProgressBudget.store(10 * time.Millisecond)
+
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		advertiseDurableAck:     true,
+		orderlyCloseAfterFrames: 1,
+		orderlyCloseDelay:       100 * time.Millisecond,
+		orderlyCloseUntilConn:   1 << 30,
+	})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	qwpSfTestWriteOneFrameOrphan(t, dir, segSize)
+
+	// A 75ms budget makes the durable-stall bound 300ms; each connection
+	// lives about 100ms.
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		qwpSfDurableDialFor(srv),
+		nil,
+		75*time.Millisecond, time.Millisecond, 2*time.Millisecond,
+	)
+	drainer.durableAckMode = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { drainer.drainerRun(ctx); close(done) }()
+
+	require.Eventually(t, func() bool {
+		return srv.connCount.Load() >= 15 || drainer.drainerOutcome() != qwpSfDrainOutcomePending
+	}, 10*time.Second, 10*time.Millisecond)
+	assert.Equal(t, qwpSfDrainOutcomePending, drainer.drainerOutcome(),
+		"a server that never OK-acks data must not quarantine a durable slot")
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	assert.True(t, os.IsNotExist(statErr), "a flapping server must not drop .failed")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainer did not stop after cancellation")
+	}
+	assert.Equal(t, qwpSfDrainOutcomeStopped, drainer.drainerOutcome())
+}
+
+// TestQwpSfDrainerDurableStallQuarantinesAcrossReconnects pins the durable
+// bound for a server that OK-acks data, never sends STATUS_DURABLE_ACK, and
+// drops each connection: the OK acks are evidence of a stalled durable
+// pipeline, so the durable-stall clock carries across reconnects and the slot
+// is quarantined once the connected time reaches the bound.
+func TestQwpSfDrainerDurableStallQuarantinesAcrossReconnects(t *testing.T) {
+	defer func(orig time.Duration) { qwpSfMinNoProgressBudget.store(orig) }(qwpSfMinNoProgressBudget.load())
+	qwpSfMinNoProgressBudget.store(10 * time.Millisecond)
+
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		advertiseDurableAck:     true,
+		okBeforeOrderlyClose:    true,
+		orderlyCloseAfterFrames: 1,
+		orderlyCloseDelay:       100 * time.Millisecond,
+		orderlyCloseUntilConn:   1 << 30,
+	})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	const segSize int64 = 4096
+	qwpSfTestWriteOneFrameOrphan(t, dir, segSize)
+
+	// A 75ms budget makes the durable-stall bound 300ms; each connection
+	// lives about 100ms, so reaching it takes several connections.
+	drainer := qwpSfNewOrphanDrainer(
+		dir, segSize, qwpSfUnlimitedTotalBytes,
+		qwpSfDurableDialFor(srv),
+		nil,
+		75*time.Millisecond, time.Millisecond, 2*time.Millisecond,
+	)
+	drainer.durableAckMode = true
+	done := make(chan struct{})
+	go func() { drainer.drainerRun(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drainer never quarantined a slot whose server OK-acks but never makes data durable")
+	}
+
+	assert.Equal(t, qwpSfDrainOutcomeFailed, drainer.drainerOutcome())
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "no durable-ack progress")
+	assert.GreaterOrEqual(t, srv.connCount.Load(), int64(3),
+		"the durable-stall bound must span reconnects")
+}
+
 // TestQwpSfDrainerAllReplicaWindowRetriesAndFiresPrimaryUnavailable pins the
 // graceful-failover window: while every endpoint 421-role-rejects (all
 // replicas), the drainer fires OnPrimaryUnavailable per sweep, keeps retrying
