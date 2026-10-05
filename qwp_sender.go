@@ -27,6 +27,7 @@ package questdb
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -109,6 +110,12 @@ type QwpSender interface {
 	// A table's designated timestamp resolution is fixed by its first
 	// row: mixing At and AtNano on rows of the same table within one
 	// flush returns a type-conflict error.
+	//
+	// An auto-flush failure matching [ErrBackpressureTimeout] or
+	// [ErrSfDurability] is non-terminal. The row this call finished is already
+	// buffered and stays pending with any other unsent rows, so do not build it
+	// again: call Flush to retry sending them. [ErrSfDurability] comes only
+	// from store-and-forward senders.
 	AtNano(ctx context.Context, ts time.Time) error
 
 	// AckedFsn returns the highest server-acknowledged frame
@@ -137,6 +144,12 @@ type QwpSender interface {
 	// returned FSN is the upper bound of any SenderError.ToFsn that
 	// could surface for this batch. Use AwaitAckedFsn for ack
 	// confirmation.
+	//
+	// An error matching [ErrBackpressureTimeout] or [ErrSfDurability] is
+	// non-terminal: rows that were not appended stay pending, and calling
+	// FlushAndGetSequence or Flush again retries them without resending the
+	// rows that were. [ErrSfDurability] comes only from store-and-forward
+	// senders.
 	FlushAndGetSequence(ctx context.Context) (int64, error)
 
 	// LastTerminalError returns a snapshot of the most recent
@@ -204,6 +217,75 @@ type QwpSender interface {
 	// unless request_durable_ack is on.
 	TotalDurableTrimAdvances() int64
 
+	// QuarantinedSlotPath returns the directory holding the bytes of a
+	// store-and-forward slot this sender refused at startup, or "" when
+	// it opened a slot it could read (and always in memory mode).
+	//
+	// For a borrowed sender, save this path before calling Close to return
+	// the sender to the pool. Afterwards, this method always returns "",
+	// even if the client set a damaged slot aside. A pool can also set a slot
+	// aside in a build that no caller receives; that copy is reported only in
+	// the log.
+	//
+	// A slot whose recovery proves it inconsistent is preserved whole as a
+	// sibling of the original, at <sf_dir>/<sender_id>.unreplayable-<n>,
+	// and the sender starts fresh, so ingestion continues while the unsent
+	// rows stay on disk. <n> is the first free index in 0..63; an occupied
+	// name is never overwritten. When all of them are occupied, or the
+	// transition cannot complete, construction fails instead: an error
+	// returned by the constructor names every destination that attempt did
+	// produce, distinguishing the first copy from any later partial fresh
+	// slot, so a caller can find the bytes even when no sender is returned.
+	// Nothing in the client ever removes that copy or counts it against
+	// sf_max_total_bytes — it is the only copy of those rows, so
+	// reclaiming it is the operator's call. Preserved copies are excluded
+	// from automatic adoption by name, independently of the best-effort
+	// .failed marker written inside them.
+	//
+	// This is a historical report of what this sender did during its own
+	// construction, not a live check: it does not verify that the directory
+	// still exists or that the bytes are durable, and it is not a record
+	// that survives a crash. See the README's "Quarantined slots" section
+	// for the sharing rules, and docs/qwp-limits-and-invariants.md in the
+	// repository for the atomicity and platform limits.
+	QuarantinedSlotPath() string
+
+	// SlotLockReleased reports whether a standalone sender has released its
+	// store-and-forward slot's file lock and stopped all access to that slot.
+	// In memory mode it always returns true because there is no disk slot.
+	// An open standalone disk-backed sender returns false.
+	//
+	// A borrowed sender reports the state of the slot it is using. After it is
+	// returned to the pool, it reports true even if the pool still holds the
+	// lock. For pooled senders, use [QuestDB.Close] to wait for release instead.
+	//
+	// For a standalone sender, true does not mean rows were delivered, cleanup
+	// succeeded without errors, or the directory is empty. False can mean
+	// cleanup is still running or has failed permanently; it may never become
+	// true. The client keeps responsibility for unfinished cleanup. A panic
+	// during internal cleanup can leave the slot held until process exit.
+	// Close reports failures it already knows about and logs later ones;
+	// calling Close again does not repair them. See [LineSender.Close].
+	//
+	// Only poll this method for a standalone sender, after stopping use and
+	// calling Close. Limit the wait with a deadline. For example, after checking
+	// Close's error, use a waitCtx with an application-chosen deadline:
+	//
+	//	tick := time.NewTicker(10 * time.Millisecond)
+	//	defer tick.Stop()
+	//	for !sender.SlotLockReleased() {
+	//		select {
+	//		case <-waitCtx.Done():
+	//			return waitCtx.Err() // the slot is still held; do not reopen it
+	//		case <-tick.C:
+	//		}
+	//	}
+	//
+	// If the wait expires, an operator may need to fix storage or restart the
+	// process. A true result only describes this sender: it does not reserve
+	// the slot for you, and a later attempt to open it can still fail.
+	SlotLockReleased() bool
+
 	// BackgroundDrainers returns a snapshot of the drainers the
 	// foreground sender has dispatched for orphan slot adoption.
 	// Returns nil when the sender was not configured with
@@ -232,10 +314,14 @@ type QwpBackgroundDrainer struct {
 	// LastError is the most recent error message the drainer
 	// recorded, or "" if no error has been recorded.
 	LastError string
-	// Failed is true if the drainer ended in the FAILED outcome
-	// (auth failure, durable-ack settle exhaustion, recovery error,
-	// wedged no-progress connection) and dropped a .failed sentinel
-	// in the slot.
+	// Failed is true if this drain attempt ended unsuccessfully. This alone
+	// does not mean the data is corrupt or the slot is safe to reuse.
+	// The client may leave a .failed file when its error policy stops draining
+	// or recovery finds inconsistent data. Later runs skip slots with this file.
+	// Ordinary file I/O errors while opening a slot do not prevent later
+	// recovery attempts. After an internal panic, the client keeps resources
+	// it cannot safely release, without marking the data corrupt. A missing
+	// .failed file does not mean the resources have been released.
 	Failed bool
 }
 
@@ -286,24 +372,24 @@ type qwpLineSender struct {
 	maxSentSymbolId int
 	// batchMaxSymbolId is the highest symbol ID used in the current batch.
 	batchMaxSymbolId int
-	// deltaDictEnabled makes each frame carry only the symbol ids above
-	// maxSentSymbolId (a delta), rather than the full dictionary from id 0.
-	// Set from the engine at construction: always in memory mode, and in SF
-	// mode only when the persisted dictionary opened. When false the sender
-	// emits full self-sufficient frames (baseline -1). See symbolDeltaBaseline.
-	deltaDictEnabled bool
-	// persistedSymbolDict is the engine's .symbol-dict side-file (SF + delta
-	// mode only; nil otherwise). New symbols are appended to it before the
+	// persistedSymbolDict is the engine's .symbol-dict side-file (SF mode
+	// only; nil in memory mode). New symbols are appended to it before the
 	// referencing frame is published, so a recovered / orphan-drained slot can
 	// rebuild the dictionary its non-self-sufficient delta frames reference.
 	persistedSymbolDict *qwpSfSymbolDict
+	// symbolDictBound is qwpSfSymbolDictBound(globalSymbolList) without the
+	// header, kept incrementally. In SF mode a new symbol value is refused when
+	// it would take the dictionary past qwpSfSymbolDictLimits.maxFileBytes, so
+	// the side-file never outgrows what recovery accepts.
+	symbolDictBound int64
 
 	// Schemas are intentionally NOT tracked on the cursor wire path. Every
 	// frame's schema stays self-sufficient: it carries the full inline column
 	// definitions, with no per-connection schema registry and no schema-change
-	// detection. The symbol dictionary, in contrast, is delta-encoded when
-	// deltaDictEnabled — a reconnect re-registers it via a send-loop catch-up
-	// frame before replay (full-dict frames when disabled).
+	// detection. The symbol dictionary, in contrast, is delta-encoded: each
+	// frame carries only the symbol ids above maxSentSymbolId, and a reconnect
+	// re-registers the whole dictionary via a send-loop catch-up frame before
+	// replay.
 
 	// Row state.
 	hasTable bool
@@ -402,13 +488,16 @@ type qwpLineSender struct {
 	// drain_orphans (SF mode only). Closed alongside the cursor
 	// engine in closeCursor.
 	drainerPool *qwpSfDrainerPool
+	// Save errors from queueing rows and waiting for server acknowledgements.
+	// Check engine cleanup errors separately because a retry may clear them.
+	closeDeliveryErr error
 
-	// Lifecycle. atomic so a contract-violating concurrent
-	// double-Close has a defined (idempotent) outcome rather than a
-	// data race that could double-close the engine's channels. The
-	// single-producer At/Flush reads are racy only under the same
-	// contract violation; the atomic load keeps them well-defined too.
-	closed atomic.Bool
+	// Records whether Close has started, so later calls cannot close engine
+	// channels twice. A second standalone Close returns an error; see
+	// LineSender.Close. Making this flag atomic does not make concurrent
+	// row building or flushing safe.
+	closed   atomic.Bool
+	shutdown atomic.Pointer[qwpSenderShutdown]
 }
 
 // newQwpLineSender creates a new QWP sender backed by an
@@ -453,10 +542,9 @@ func newQwpLineSenderUnstarted(ctx context.Context, address string, opts qwpTran
 		return nil, err
 	}
 	factory := qwpSfBuildReconnectFactory(address, opts, dumpWriter)
-	transport, err := factory(ctx, 0)
+	transport, err := engine.trackConnectCleanup(factory)(ctx, 0)
 	if err != nil {
-		_ = engine.engineClose()
-		return nil, err
+		return nil, qwpSfCloseEngineAfterBuildFailure(engine, err)
 	}
 	loop := qwpSfNewSendLoop(engine, transport, factory,
 		qwpSfDefaultParkInterval,
@@ -574,6 +662,18 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		)
 		return s
 	}
+	// A store-and-forward sender also caps the size of its dictionary file,
+	// measured by the same bound recovery applies, so it can never write a slot
+	// its own recovery refuses.
+	if !ok && s.persistedSymbolDict != nil {
+		if limit := qwpSfSymbolDictLimits.load().maxFileBytes; qwpSfSymbolDictHeaderSize+s.symbolDictBound+qwpSfSymbolDictEntryBound(val) > limit {
+			s.lastErr = fmt.Errorf(
+				"qwp: global symbol dictionary is full: a store-and-forward sender caps its symbol dictionary file at %d bytes; rows using already-registered values remain valid; close and rebuild the sender to start a fresh dictionary, or use varchar columns for unbounded-cardinality data",
+				limit,
+			)
+			return s
+		}
+	}
 
 	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeSymbol, true)
 	if err != nil {
@@ -586,6 +686,7 @@ func (s *qwpLineSender) Symbol(name, val string) LineSender {
 		id = int32(len(s.globalSymbolList))
 		s.globalSymbols[val] = id
 		s.globalSymbolList = append(s.globalSymbolList, val)
+		s.symbolDictBound += qwpSfSymbolDictEntryBound(val)
 	}
 
 	col.addSymbolID(id)
@@ -1264,33 +1365,24 @@ func (s *qwpLineSender) Flush(ctx context.Context) error {
 // silently ship it as a phantom/duplicate row. A latched error must surface
 // (retain-on-error) without suppressing the flush of already-committed rows.
 //
-// Returns the first error: the captured latch (the original user-facing cause)
-// takes precedence, else an enqueue or terminal I/O failure. On a latch-only
-// error the committed rows are flushed regardless, and any terminal fault is
-// surfaced so the pool discards the slot instead of recycling a dead one.
+// Returns the captured latch (the original user-facing cause) joined with any
+// enqueue failure, so the caller sees both why the borrower's input was
+// rejected and why committed rows were not queued. With neither, it returns a
+// terminal I/O failure if the send loop latched one. On a latch-only error the
+// committed rows are flushed regardless, and any terminal fault is surfaced so
+// the pool discards the slot instead of recycling a dead one.
 //
 // The first return value, retained, reports whether committed rows are STILL
 // buffered un-enqueued after the attempt — the enqueue hit the backpressure
-// append deadline (e.g. the cursor ring saturated during an outage) or the
-// engine was closed, neither of which is a terminal send-loop HALT. Such a slot
-// is DIRTY: recycling it would ship this borrower's rows under the next
-// borrower's FSN (borrower-isolation). The pool must discard it rather than
-// recycle. retained is only meaningful on the producer goroutine; a call from
-// a dispatcher goroutine can't inspect producer state, so it reports true —
-// unable to prove the slot clean, it errs on discard.
+// append deadline (e.g. the cursor ring saturated during an outage), local
+// storage refused the write, or the engine was closed. Such a slot is DIRTY:
+// recycling it with those rows would ship this borrower's rows under the next
+// borrower's FSN (borrower-isolation). The pool either drops them with
+// discardPending or discards the sender. Like other mutating methods, this
+// runs only on the handle's owner.
 func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err error) {
 	if s.closed.Load() {
 		return false, errClosedSenderFlush
-	}
-	if s.calledFromDispatcherGoroutine() {
-		// Running on a dispatcher goroutine (Close invoked from inside a
-		// user callback): touching producer state (lastErr / hasTable /
-		// pendingRowCount / buffers) would race the producer.
-		// Surface only the latched terminal error, like closeCursor does. We
-		// can't safely read pendingRowCount, so we can't prove the slot is
-		// clean either — report retained=true so the pool discards it instead
-		// of recycling a possibly-dirty slot under the next borrower.
-		return true, s.cursorSendLoop.sendLoopCheckError()
 	}
 	firstErr := s.lastErr
 	s.lastErr = nil
@@ -1304,9 +1396,7 @@ func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err 
 	}
 	if s.pendingRowCount > 0 {
 		if err := s.enqueueCursor(ctx); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			firstErr = errors.Join(firstErr, err)
 		} else {
 			s.resetAfterFlush()
 		}
@@ -1321,9 +1411,20 @@ func (s *qwpLineSender) flushForReturn(ctx context.Context) (retained bool, err 
 		}
 	}
 	// pendingRowCount > 0 here means enqueueCursor could not seal the
-	// committed rows (backpressure deadline / engine closed); enqueueCursor
-	// leaves them retained for a later flush. The slot is dirty.
+	// committed rows (backpressure deadline, storage failure, engine closed);
+	// enqueueCursor leaves them retained for a later flush. The slot is dirty.
 	return s.pendingRowCount > 0, firstErr
+}
+
+// discardPending drops the committed rows a lease return could not queue and
+// reports how many there were. It leaves the producer as a successful flush
+// does, so the sender can serve the next borrower without carrying these rows;
+// resetAfterFlush reclaims the symbol ids only these rows used. Producer
+// goroutine only.
+func (s *qwpLineSender) discardPending() int {
+	dropped := s.pendingRowCount
+	s.resetAfterFlush()
+	return dropped
 }
 
 // FlushAndGetSequence implements QwpSender.FlushAndGetSequence.
@@ -1341,21 +1442,6 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	if s.closed.Load() {
 		return -1, errClosedSenderFlush
 	}
-	if s.calledFromDispatcherGoroutine() {
-		// Flush() invoked from inside a user callback (error handler,
-		// connection listener, or progress handler) runs on that
-		// dispatcher goroutine. The callback's documented use of Flush()
-		// is to surface the latched terminal error promptly (it is
-		// latched before the error handler runs). We must not read or flush
-		// producer-owned state (hasTable / pendingRowCount / tableBuffers
-		// / the encoder) from this goroutine — that races the producer,
-		// the producer-state hazard. Surface any latched error and
-		// return the published FSN without touching producer state.
-		if err := s.cursorSendLoop.sendLoopCheckError(); err != nil {
-			return -1, err
-		}
-		return s.cursorEngine.enginePublishedFsn(), nil
-	}
 	// Drain any latched fluent-API error (a Symbol/*Column/Table
 	// validation failure) ahead of the hasTable/pendingRowCount
 	// branches, fulfilling the latch contract's "surfaces on the next
@@ -1367,9 +1453,8 @@ func (s *qwpLineSender) FlushAndGetSequence(ctx context.Context) (int64, error) 
 	// with no latched error performs no producer-state write at all and
 	// stays a pure read — several goroutines sampling a quiescent
 	// (post-HALT) sender to observe the latched terminal error therefore
-	// race only on read-only state. The calledFromDispatcherGoroutine path above
-	// skips this: lastErr is producer-owned, and reading it from the
-	// dispatcher goroutine races the producer.
+	// race only on read-only state. Callbacks must notify the application owner
+	// rather than invoking this mutating method.
 	if err := s.lastErr; err != nil {
 		s.lastErr = nil
 		if s.currentTable != nil {
@@ -1455,13 +1540,8 @@ func (s *qwpLineSender) resetAfterFlush() {
 // staying above two marks. maxSentSymbolId covers ids a published frame has
 // already handed to the send-loop mirror. The persisted dictionary's size
 // covers ids written to the SF side-file, which happens before the frame is
-// published, so those exist even if the publish failed. Full-dictionary mode
-// reclaims nothing: every queued frame spells out its own dictionary, so an id
-// reused here would name a different string than one of those frames does.
+// published, so those exist even if the publish failed.
 func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
-	if !s.deltaDictEnabled {
-		return
-	}
 	floor := s.maxSentSymbolId + 1
 	if s.persistedSymbolDict != nil {
 		if durable := s.persistedSymbolDict.size(); durable > floor {
@@ -1473,6 +1553,9 @@ func (s *qwpLineSender) reclaimUnsentSymbolIDs() {
 	}
 	if floor >= len(s.globalSymbolList) {
 		return
+	}
+	for _, name := range s.globalSymbolList[floor:] {
+		s.symbolDictBound -= qwpSfSymbolDictEntryBound(name)
 	}
 	s.globalSymbolList = s.globalSymbolList[:floor]
 	// Rebuild the whole map instead of deleting the dropped strings one by
@@ -1500,7 +1583,7 @@ func (s *qwpLineSender) Close(ctx context.Context) error {
 	// regardless of whether sf_dir was set. closeCursor drains
 	// (up to closeTimeout), stops the loop, closes the engine,
 	// and tears down the orphan-drainer pool if one was started.
-	return s.closeCursor(ctx)
+	return s.startShutdown(ctx)
 }
 
 // --- QwpSender interface: extended column types ---

@@ -25,37 +25,50 @@
 package questdb
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"testing"
 	"time"
 )
 
-// TestQwpPoolHousekeeperDefaultsAndGuard covers the negative-interval default
-// and the panic-guarded reap step. End-to-end reaping via the running goroutine
-// is covered by TestQuestDBHousekeeperReaps.
+// Check the default interval and failure reporting if pool cleanup panics.
+// TestQuestDBHousekeeperReaps covers the running background worker.
 func TestQwpPoolHousekeeperDefaultsAndGuard(t *testing.T) {
-	h := newQwpPoolHousekeeper(nil, nil, -1, 0)
+	h := newQwpPoolHousekeeper(nil, nil, -1)
 	if h.interval != qwpDefaultHousekeeperInterval {
 		t.Errorf("interval=%v, want default %v", h.interval, qwpDefaultHousekeeperInterval)
 	}
-	if want := qwpSfDefaultCloseFlushTimeout + time.Second; h.joinBudget != want {
-		t.Errorf("joinBudget=%v, want default %v", h.joinBudget, want)
+	if h.reapGuarded(func() { panic("reap boom") }) {
+		t.Fatal("reap panic must stop the worker")
 	}
-	h.reapGuarded(func() { panic("reap boom") }) // recovered, must not crash
+	if err := h.close(context.Background()); !errors.Is(err, ErrCleanupFailed) {
+		t.Fatalf("lost cleanup failure: %v", err)
+	}
 }
 
-// TestQwpPoolHousekeeperDisabled pins interval 0 = disabled: start spawns no
-// goroutine and stopAndJoin returns immediately (not after the join budget)
-// and stays idempotent.
+// With interval 0, no background worker starts. Closing the housekeeper returns
+// immediately, including on later calls.
 func TestQwpPoolHousekeeperDisabled(t *testing.T) {
-	h := newQwpPoolHousekeeper(nil, nil, 0, 10*time.Second)
+	h := newQwpPoolHousekeeper(nil, nil, 0)
 	h.start()
 	if h.started.Load() {
 		t.Fatal("disabled housekeeper must not start its goroutine")
 	}
 	begin := time.Now()
-	h.stopAndJoin()
-	h.stopAndJoin() // idempotent
+	_ = h.close(context.Background())
+	_ = h.close(context.Background()) // closing again must also return immediately
 	if elapsed := time.Since(begin); elapsed > time.Second {
-		t.Fatalf("stopAndJoin on a disabled housekeeper took %v; want immediate return", elapsed)
+		t.Fatalf("close on a disabled housekeeper took %v; want immediate return", elapsed)
 	}
+}
+
+// TestQwpPoolHousekeeperReapPanicSurvivesPanickingLogger pins that reporting a
+// reap panic cannot itself kill the process. The daemon loop has no recover of
+// its own, and a recover() cannot catch a second panic raised while the first
+// one is still unwinding — so the log call inside the recover has to be
+// guarded, and a user-supplied slog handler is exactly what can panic there.
+func TestQwpPoolHousekeeperReapPanicSurvivesPanickingLogger(t *testing.T) {
+	h := &qwpPoolHousekeeper{logger: slog.New(panicOnHandleSlog{})}
+	h.reapGuarded(func() { panic("reap boom") })
 }

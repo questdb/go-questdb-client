@@ -25,9 +25,11 @@
 package questdb
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/require"
 )
 
 func TestQwpSfClassify(t *testing.T) {
@@ -209,4 +211,21 @@ func TestQwpSfPolicyResolverPrecedence(t *testing.T) {
 			t.Errorf("Unknown = %s, want Retriable (forced fail-open)", got)
 		}
 	})
+}
+
+// TestQwpPolicyResolverPanickingLoggerStillYieldsSpecDefault pins that the
+// panic guard on the resolver's own report does not cost the fallback behind
+// it. The recover assigns the spec default policy after logging, so a handler
+// that panics there would let the deferred function exit before the assignment
+// and hand back PolicyAuto — which resolve treats as "keep looking", silently
+// demoting the category to a lower-precedence answer.
+func TestQwpPolicyResolverPanickingLoggerStillYieldsSpecDefault(t *testing.T) {
+	r := &qwpSfPolicyResolver{
+		logger:   slog.New(panicOnHandleSlog{}),
+		resolver: func(Category) Policy { panic("resolver boom") },
+	}
+	got := r.callResolver(CategoryWriteError)
+	require.Equal(t, qwpSfDefaultPolicyFor(CategoryWriteError), got,
+		"a panicking logger must not cost the spec-default fallback")
+	require.NotEqual(t, PolicyAuto, got)
 }

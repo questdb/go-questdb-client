@@ -141,6 +141,14 @@ func mustOK(err error) {
 	}
 }
 
+// Close after reading the results, without including cleanup in the timing.
+// If the wait times out, the client still handles cleanup. Keep any close error.
+func closeQwp(closeClient func(context.Context) error, resultErr *error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	*resultErr = errors.Join(*resultErr, closeClient(ctx))
+}
+
 func printRow(label string, r result) {
 	secs := r.elapsed.Seconds()
 	rowsPerSec := float64(r.rows) / secs
@@ -165,12 +173,12 @@ const selectColumns = "ts, id, price, sym, note," +
 	" d1, d2, d3, d4, d5," +
 	" s1, s2, s3, s4, s5"
 
-func recreateTable(ctx context.Context) error {
+func recreateTable(ctx context.Context) (resultErr error) {
 	c, err := qdb.NewQwpQueryClient(ctx, qdb.WithQwpQueryAddress(fmt.Sprintf("%s:%d", host, httpPort)))
 	if err != nil {
 		return fmt.Errorf("recreateTable: connect: %w", err)
 	}
-	defer c.Close(ctx)
+	defer closeQwp(c.Close, &resultErr)
 
 	if _, err := c.Exec(ctx, "DROP TABLE IF EXISTS '"+tableName+"'"); err != nil {
 		return fmt.Errorf("recreateTable: drop: %w", err)
@@ -193,7 +201,7 @@ func recreateTable(ctx context.Context) error {
 	return nil
 }
 
-func ingestRows(ctx context.Context) error {
+func ingestRows(ctx context.Context) (resultErr error) {
 	fmt.Printf("Ingesting %d rows over QWP/WebSocket...\n", rowCount)
 	start := time.Now()
 	symbols := []string{"AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "NFLX"}
@@ -207,15 +215,14 @@ func ingestRows(ctx context.Context) error {
 	s4Pool := buildSymbolPool("s4_")
 	s5Pool := buildSymbolPool("s5_")
 
-	// auto_flush_rows sized so each ILP frame stays under the server's
-	// 2 MiB WebSocket buffer given the 15-column row layout (~130
-	// bytes/row encoded).
+	// Set auto_flush_rows so each QWP message fits the server's 2 MiB
+	// WebSocket buffer. These 15-column rows use about 130 bytes each.
 	conf := fmt.Sprintf("ws::addr=%s:%d;auto_flush_rows=10000;", host, httpPort)
 	sender, err := qdb.LineSenderFromConf(ctx, conf)
 	if err != nil {
 		return fmt.Errorf("ingest: open sender: %w", err)
 	}
-	defer sender.Close(ctx)
+	defer closeQwp(sender.Close, &resultErr)
 
 	for i := int64(1); i <= rowCount; i++ {
 		h1 := i % highCard
@@ -223,7 +230,7 @@ func ingestRows(ctx context.Context) error {
 		h3 := (i + 40_000) % highCard
 		h4 := (i + 60_000) % highCard
 		h5 := (i + 80_000) % highCard
-		// ILP requires all Symbol calls before any non-symbol column setters.
+		// Call Symbol before setting any other columns.
 		if err := sender.Table(tableName).
 			Symbol("sym", symbols[i%int64(len(symbols))]).
 			Symbol("s1", s1Pool[h1]).
@@ -262,12 +269,12 @@ func buildSymbolPool(prefix string) []string {
 	return pool
 }
 
-func waitForWalApply(ctx context.Context) error {
+func waitForWalApply(ctx context.Context) (resultErr error) {
 	c, err := qdb.NewQwpQueryClient(ctx, qdb.WithQwpQueryAddress(fmt.Sprintf("%s:%d", host, httpPort)))
 	if err != nil {
 		return fmt.Errorf("wait: connect: %w", err)
 	}
-	defer c.Close(ctx)
+	defer closeQwp(c.Close, &resultErr)
 
 	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
@@ -303,7 +310,7 @@ func selectCount(ctx context.Context, c *qdb.QwpQueryClient) (int64, error) {
 // QWP egress
 // ------------------------------------------------------------------
 
-func runQwp(ctx context.Context, warmup bool) (result, error) {
+func runQwp(ctx context.Context, warmup bool) (out result, resultErr error) {
 	var rowsSeen, bytesSeen, checksum int64
 	start := time.Now()
 
@@ -315,7 +322,7 @@ func runQwp(ctx context.Context, warmup bool) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	defer c.Close(ctx)
+	defer closeQwp(c.Close, &resultErr)
 
 	q := c.Query(ctx, "SELECT "+selectColumns+" FROM "+tableName)
 	defer q.Close()
@@ -515,4 +522,3 @@ func logRun(label string, warmup bool, elapsed time.Duration, rows int64, suffix
 	fmt.Printf("%s %s : %d rows in %d ms (checksum/bytes=%s)\n",
 		phase, label, rows, elapsed.Milliseconds(), suffix)
 }
-

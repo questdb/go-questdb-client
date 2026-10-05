@@ -1,0 +1,380 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package questdb
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"github.com/stretchr/testify/require"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestQwpSfAcquiredReleaseFailureTransfersToEngine(t *testing.T) {
+	e, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	<-e.manager.segmentManagerStop()
+	segment, err := qwpSfCreateSegment(filepath.Join(e.sfDir, "sf-extra.sfa"), 77, 4096)
+	require.NoError(t, err)
+	var fail atomic.Bool
+	fail.Store(true)
+	var attempts atomic.Int32
+	injected := errors.New("acquired segment unmap unavailable")
+	hook := func(b []byte) error {
+		if len(b) >= 16 && binary.LittleEndian.Uint64(b[8:16]) == 77 {
+			attempts.Add(1)
+			if fail.Load() {
+				return injected
+			}
+		}
+		return nil
+	}
+	qwpSfTestMunmapHook.Store(&hook)
+	t.Cleanup(func() {
+		fail.Store(false)
+		_ = e.engineClose()
+		waitQwpSfEngineCleanup(t, e)
+		qwpSfTestMunmapHook.Store(nil)
+	})
+	err = qwpSfFailedAcquisition(errors.New("construction failed"), &qwpSfAcquiredResources{segments: []*qwpSfSegment{segment}})
+	require.ErrorIs(t, err, injected)
+	var held *qwpSfAcquisitionError
+	require.ErrorAs(t, err, &held)
+	e.acquired = held.resources
+	require.Equal(t, int32(1), attempts.Load(), "unwinding must not replay the failed release")
+	require.False(t, segment.resourcesReleased())
+	require.ErrorIs(t, e.engineClose(), injected)
+	require.False(t, e.engineCloseCompleted())
+	fail.Store(false)
+	waitQwpSfEngineCleanup(t, e)
+	require.True(t, e.engineCloseCompleted())
+	require.NoError(t, e.engineClose())
+	require.True(t, segment.resourcesReleased())
+}
+
+func TestQwpSfConsumedFileCloseErrorIsNotRetried(t *testing.T) {
+	e, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = e.engineAppendBlocking(context.Background(), []byte("retained frame"))
+	require.NoError(t, err)
+	<-e.manager.segmentManagerStop()
+	var logs bytes.Buffer
+	e.manager.logger.Store(qwpGuardLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	injected := errors.New("file close reported an error after consuming the handle")
+	var calls atomic.Int32
+	hook := func(*os.File) error { calls.Add(1); return injected }
+	qwpSfTestAfterFileCloseHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestAfterFileCloseHook.Store(nil) })
+	require.NoError(t, e.engineClose(), "a close error on a released descriptor is logged, not reported")
+	waitQwpSfEngineCleanup(t, e)
+	require.True(t, e.engineCloseCompleted(), "all handles, including flock, are actually released")
+	require.Contains(t, logs.String(), "slot released; closing its files reported errors")
+	require.Contains(t, logs.String(), injected.Error())
+	before := calls.Load()
+	require.Positive(t, before)
+	for i := 0; i < 10; i++ {
+		require.NoError(t, e.engineClose())
+	}
+	require.Equal(t, before, calls.Load(), "an error is not permission to close a consumed fd again")
+	lock, err := qwpSfAcquireSlotLock(e.sfDir)
+	require.NoError(t, err)
+	require.NoError(t, lock.close())
+}
+
+func TestQwpSfReleasedFileCloseErrorIsNotReportedAfterRetry(t *testing.T) {
+	e, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = e.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+	<-e.manager.segmentManagerStop()
+	var fail atomic.Bool
+	fail.Store(true)
+	unmapErr, fileErr := errors.New("unmap unavailable"), errors.New("manifest close failed after consuming fd")
+	unmap := func([]byte) error {
+		if fail.Load() {
+			return unmapErr
+		}
+		return nil
+	}
+	var closes atomic.Int32
+	fileClose := func(f *os.File) error {
+		if filepath.Base(f.Name()) == qwpSfManifestFileName {
+			closes.Add(1)
+			return fileErr
+		}
+		return nil
+	}
+	qwpSfTestMunmapHook.Store(&unmap)
+	qwpSfTestAfterFileCloseHook.Store(&fileClose)
+	t.Cleanup(func() {
+		fail.Store(false)
+		_ = e.engineClose()
+		waitQwpSfEngineCleanup(t, e)
+		qwpSfTestMunmapHook.Store(nil)
+		qwpSfTestAfterFileCloseHook.Store(nil)
+	})
+	require.ErrorIs(t, e.engineClose(), unmapErr, "a pending result names the failure holding cleanup up")
+	fail.Store(false)
+	waitQwpSfEngineCleanup(t, e)
+	require.True(t, e.engineCloseCompleted())
+	require.NoError(t, e.engineClose(),
+		"once everything is released, neither the recovered unmap nor the released manifest's close error remains")
+	require.Equal(t, int32(1), closes.Load(), "the consumed manifest descriptor is never closed again")
+}
+
+func TestQwpSfLateCompletedCloseErrorIsLogged(t *testing.T) {
+	e, err := qwpSfNewCursorEngine(t.TempDir(), 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	<-e.manager.segmentManagerStop()
+	var logs bytes.Buffer
+	e.manager.logger.Store(qwpGuardLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { close(entered); <-release }
+	injected := errors.New("late consumed-file close error")
+	fileClose := func(f *os.File) error {
+		if filepath.Base(f.Name()) == qwpSfManifestFileName {
+			return injected
+		}
+		return nil
+	}
+	previous := qwpSfManagerCloseGrace.load()
+	qwpSfManagerCloseGrace.store(5 * time.Millisecond)
+	qwpSfTestEngineFinishCloseHook.Store(&finish)
+	qwpSfTestAfterFileCloseHook.Store(&fileClose)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = e.engineClose()
+		waitQwpSfEngineCleanup(t, e)
+		qwpSfTestEngineFinishCloseHook.Store(nil)
+		qwpSfTestAfterFileCloseHook.Store(nil)
+		qwpSfManagerCloseGrace.store(previous)
+	})
+	require.NoError(t, e.engineClose(), "the bounded observer returns while cleanup is still pending")
+	waitQwpCleanupSignal(t, entered, "blocked engine cleanup")
+	require.False(t, e.engineCloseCompleted())
+	releaseOnce.Do(func() { close(release) })
+	waitQwpSfEngineCleanup(t, e)
+	require.True(t, e.engineCloseCompleted())
+	require.NoError(t, e.engineClose(), "the manifest descriptor was released, so its close error is not reported")
+	require.Contains(t, logs.String(), "slot released; closing its files reported errors")
+	require.Contains(t, logs.String(), injected.Error())
+}
+
+func TestQwpSfRecoveryReleaseFaultRetainsAcquisitions(t *testing.T) {
+	dir := t.TempDir()
+	old, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = old.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+	require.NoError(t, old.engineClose())
+	file, err := os.OpenFile(filepath.Join(dir, "sf-initial.sfa"), os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = file.WriteAt([]byte{0, 0, 0, 0}, 0)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	var fail atomic.Bool
+	fail.Store(true)
+	injected := errors.New("unmap unavailable during recovery")
+	hook := func([]byte) error {
+		if fail.Load() {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestMunmapHook.Store(&hook)
+	previous := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(time.Millisecond)
+	t.Cleanup(func() { fail.Store(false); qwpSfTestMunmapHook.Store(nil); qwpSfCloseRetryInterval.store(previous) })
+	_, err = qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.ErrorIs(t, err, ErrSfDurability)
+	require.ErrorIs(t, err, injected)
+	require.NotErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	requireNoPreservedSlot(t, dir)
+	var held *qwpSfBuildCleanupError
+	require.ErrorAs(t, err, &held)
+	t.Cleanup(func() { fail.Store(false); waitQwpSfEngineCleanup(t, held.engine) })
+	require.False(t, held.closeCompleted())
+	require.NotNil(t, held.engine.acquired)
+	require.FileExists(t, filepath.Join(dir, "sf-initial.sfa"))
+	lock, lockErr := qwpSfAcquireSlotLock(dir)
+	if lock != nil {
+		_ = lock.close()
+	}
+	require.ErrorIs(t, lockErr, qwpSfErrLockBusy)
+	fail.Store(false)
+	waitQwpSfEngineCleanup(t, held.engine)
+	require.True(t, held.closeCompleted())
+	require.NoError(t, held.engine.engineClose())
+}
+
+// requireNoPreservedSlot reports that open left slotDir in place. A move
+// would leave a sibling whose name contains the reserved preservation infix.
+func requireNoPreservedSlot(t *testing.T, slotDir string) {
+	t.Helper()
+	parent, base := filepath.Dir(slotDir), filepath.Base(slotDir)
+	matches, err := filepath.Glob(filepath.Join(parent, base+qwpSfQuarantineSlotInfix+"*"))
+	require.NoError(t, err)
+	require.Empty(t, matches)
+}
+
+// inconsistentSlot is a folder whose manifest promises rows that are not on
+// disk, so opening it reports that the data cannot be sent safely.
+func inconsistentSlot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	active := createRecoverySegment(t, dir, "sf-active.sfa", 5)
+	createRecoveryManifest(t, dir, 0, 5, active)
+	closeRecoverySegments(t, active)
+	return dir
+}
+
+// holdSlotLockRelease fails slot-lock release until the returned function
+// runs. Cleanup keeps the slot until then.
+func holdSlotLockRelease(t *testing.T) (release func()) {
+	t.Helper()
+	releaseCh := make(chan struct{})
+	var once sync.Once
+	hook := func() error {
+		select {
+		case <-releaseCh:
+			return nil
+		default:
+			return errors.New("lock release unavailable")
+		}
+	}
+	previous := qwpSfCloseRetryInterval.load()
+	qwpSfCloseRetryInterval.store(time.Millisecond)
+	qwpSfTestBeforeFlockReleaseHook.Store(&hook)
+	t.Cleanup(func() {
+		once.Do(func() { close(releaseCh) })
+		qwpSfTestBeforeFlockReleaseHook.Store(nil)
+		qwpSfCloseRetryInterval.store(previous)
+	})
+	return func() { once.Do(func() { close(releaseCh) }) }
+}
+
+func TestQwpSfFailClosedStaysRecognizableWhileReleaseRetries(t *testing.T) {
+	dir := inconsistentSlot(t)
+	release := holdSlotLockRelease(t)
+	_, err := qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.ErrorIs(t, err, qwpSfErrRecoveryFailClosed)
+	require.ErrorIs(t, err, ErrSfDurability)
+	requireNoPreservedSlot(t, dir)
+	var held *qwpSfBuildCleanupError
+	require.ErrorAs(t, err, &held)
+	require.False(t, held.closeCompleted())
+	release()
+	waitQwpSfEngineCleanup(t, held.engine)
+
+	eng, err := qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.NoError(t, err)
+	require.NotEmpty(t, eng.quarantinedPath)
+	require.NoError(t, eng.engineClose())
+}
+
+func TestQwpSfDrainerKeepsFailClosedWhileReleaseRetries(t *testing.T) {
+	dir := inconsistentSlot(t)
+	release := holdSlotLockRelease(t)
+	drainer := qwpSfNewOrphanDrainer(dir, 4096, qwpSfUnlimitedTotalBytes, nil, nil, time.Second, time.Millisecond, time.Millisecond)
+	drainer.drainerRun(context.Background())
+	body, err := os.ReadFile(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.NoError(t, err)
+	require.Contains(t, string(body), "recovery failed closed")
+	requireNoPreservedSlot(t, dir)
+	require.NotNil(t, drainer.cleanup)
+	require.ErrorIs(t, drainer.cleanupResult(), qwpSfErrRecoveryFailClosed)
+	release()
+	waitQwpSfEngineCleanup(t, drainer.cleanup)
+	require.ErrorIs(t, drainer.cleanupResult(), qwpSfErrRecoveryFailClosed)
+}
+
+func TestQwpSfSanitizedResidueStaysRecognizableWhileReleaseRetries(t *testing.T) {
+	dir := t.TempDir()
+	sealed := createRecoverySegment(t, dir, "sf-initial.sfa", 0, "a")
+	active := createRecoverySegment(t, dir, "sf-0001.sfa", 1, "b")
+	createRecoveryManifest(t, dir, 0, 1, sealed, active)
+	off := sealed.publishedOffset()
+	sealed.buf[off+20] = 0x7f
+	closeRecoverySegments(t, sealed, active)
+	release := holdSlotLockRelease(t)
+
+	_, err := qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.ErrorIs(t, err, qwpSfErrSanitizedResidue)
+	require.ErrorIs(t, err, ErrSfDurability)
+	var held *qwpSfBuildCleanupError
+	require.ErrorAs(t, err, &held)
+	require.False(t, held.closeCompleted())
+	release()
+	waitQwpSfEngineCleanup(t, held.engine)
+
+	eng, err := qwpSfNewCursorEngineWithOptions(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second, qwpSfEngineOpenOptions{recoverForeground: true})
+	require.NoError(t, err)
+	require.Empty(t, eng.quarantinedPath)
+	require.NoError(t, eng.engineClose())
+}
+
+func TestQwpSfDrainerDoesNotReportConsumedFileCloseError(t *testing.T) {
+	dir := t.TempDir()
+	eng, err := qwpSfNewCursorEngine(dir, 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	_, err = eng.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+	require.NoError(t, eng.engineClose())
+	file, err := os.OpenFile(filepath.Join(dir, "sf-initial.sfa"), os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = file.WriteAt([]byte{0, 0, 0, 0}, 0)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	injected := errors.New("segment close reported an error after consuming the handle")
+	hook := func(f *os.File) error {
+		if strings.HasSuffix(f.Name(), ".sfa") {
+			return injected
+		}
+		return nil
+	}
+	qwpSfTestAfterFileCloseHook.Store(&hook)
+	t.Cleanup(func() { qwpSfTestAfterFileCloseHook.Store(nil) })
+
+	drainer := qwpSfNewOrphanDrainer(dir, 4096, qwpSfUnlimitedTotalBytes, nil, nil, time.Second, time.Millisecond, time.Millisecond)
+	drainer.drainerRun(context.Background())
+	require.NotNil(t, drainer.cleanup)
+	waitQwpSfEngineCleanup(t, drainer.cleanup)
+	require.True(t, drainer.cleanup.engineCloseCompleted())
+	require.NoError(t, drainer.cleanupResult(),
+		"the segment descriptor was released, so neither its close error nor the transient open failure remains")
+	requireNoPreservedSlot(t, dir)
+	_, statErr := os.Stat(filepath.Join(dir, qwpSfFailedSentinelName))
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+}

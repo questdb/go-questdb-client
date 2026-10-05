@@ -1,3 +1,5 @@
+//go:build linux
+
 /*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
@@ -22,12 +24,9 @@
  *
  ******************************************************************************/
 
-//go:build linux
-
 package questdb
 
 import (
-	"errors"
 	"fmt"
 	"os"
 
@@ -46,28 +45,17 @@ import (
 // reserved (the newly-extended range only); existing sparse holes in
 // [0, currentSize) are not touched.
 //
-// The errno tolerance list (EOPNOTSUPP / ENOTSUP, EINVAL) matches the
-// Java reference's posix_fallocate path: those errnos indicate the
-// filesystem cannot reserve, and the spec authorises a sparse
-// fallback. All other errnos (notably ENOSPC, EFBIG, EIO) surface as
-// errors so the caller doesn't end up mmap'ing a sparse file that
-// will SIGBUS on first write past the actually-allocated region.
-//
-// Unlike Java's posix_fallocate (which has glibc's userspace
-// zero-write fallback baked in for kernels missing the fallocate
-// syscall), this is the raw syscall — ENOSYS on a pre-2.6.23 kernel
-// would surface here. Modern targets are unaffected.
+// Every reservation failure surfaces, including unsupported-operation
+// errors. There is no sparse or zero-write fallback: mmap stores into an
+// unallocated range can terminate the process if blocks cannot be allocated.
 func qwpSfReserveNewBlocks(f *os.File, currentSize, newBytes int64) error {
-	err := unix.Fallocate(int(f.Fd()), 0, currentSize, newBytes)
+	err := qwpSfFallocateFn.load()(int(f.Fd()), 0, currentSize, newBytes)
 	if err == nil {
-		return nil
-	}
-	// EOPNOTSUPP and ENOTSUP share the same numeric value on Linux,
-	// but the unix package exposes both names — accept either symbol
-	// to stay robust if that ever changes.
-	if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EINVAL) {
 		return nil
 	}
 	return fmt.Errorf("qwp/sf: fallocate %s offset=%d len=%d: %w",
 		f.Name(), currentSize, newBytes, err)
 }
+
+// Tests inject errors below the reservation policy, at the syscall boundary.
+var qwpSfFallocateFn = qwpSfSwappable(unix.Fallocate)

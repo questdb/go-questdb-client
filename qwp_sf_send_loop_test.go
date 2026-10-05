@@ -83,6 +83,16 @@ type qwpSfTestServerOpts struct {
 	// us to go elsewhere, so it must NOT count a poison strike.
 	orderlyCloseAfterFrames int
 	orderlyCloseUntilConn   int
+	// orderlyCloseDelay holds the connection open this long before the
+	// orderly close.
+	orderlyCloseDelay time.Duration
+	// okBeforeOrderlyClose makes the orderly-close branch OK-ack the frame
+	// (with a one-table entry, as a durable-ack server does) before it
+	// waits and closes.
+	okBeforeOrderlyClose bool
+	// advertiseDurableAck makes the upgrade response advertise durable-ack,
+	// so a client that requests it can connect.
+	advertiseDurableAck bool
 	// silentAcks → read frames forever and never write any ACK
 	// back. Connection stays alive so the send loop does not go
 	// terminal; the producer's Close drain-wait is what surfaces
@@ -100,6 +110,13 @@ type qwpSfTestServerOpts struct {
 	// normally. Used to model "server transient close → reconnect
 	// succeeds → next batch hits a rejection".
 	rejectFromConn int
+	// rejectFirstFramesOverall > 0, in combination with rejectStatus,
+	// rejects the first N frames the server receives, counted across all
+	// connections, and OK-acks every later frame. When set, it overrides
+	// rejectFirstNFrames and rejectFromConn. Used when the client under test
+	// does not own connection 1, such as a drainer that dials after its
+	// foreground sender.
+	rejectFirstFramesOverall int
 	// recordFrames → capture every frame's payload bytes, keyed by
 	// the connection that received it, into qwpSfTestServer. Lets a
 	// test reconstruct exactly which rows reached the server on each
@@ -198,6 +215,9 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			return
 		}
 		w.Header().Set(qwpHeaderVersion, "1")
+		if opts.advertiseDurableAck {
+			w.Header().Set(qwpHeaderDurableAck, qwpDurableAckEnabledValue)
+		}
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			t.Logf("websocket accept error: %v", err)
@@ -239,7 +259,7 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			if err != nil {
 				return
 			}
-			s.totalFramesReceived.Add(1)
+			frameNo := s.totalFramesReceived.Add(1)
 			localFramesReceived++
 			if opts.recordFrames {
 				// Record BEFORE the closeAfterFrames drop below: a
@@ -284,6 +304,19 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			if opts.orderlyCloseAfterFrames > 0 &&
 				myConnID < int64(opts.orderlyCloseUntilConn) &&
 				localFramesReceived >= opts.orderlyCloseAfterFrames {
+				if opts.okBeforeOrderlyClose {
+					_ = conn.Write(context.Background(), websocket.MessageBinary,
+						buildAckOKWithTables(localSeq, ackTableEntry{"t", localSeq}))
+					localSeq++
+				}
+				if opts.orderlyCloseDelay > 0 {
+					hold := time.NewTimer(opts.orderlyCloseDelay)
+					select {
+					case <-hold.C:
+					case <-s.kill:
+						hold.Stop()
+					}
+				}
 				_ = conn.Close(websocket.StatusGoingAway, "restart")
 				return
 			}
@@ -311,6 +344,9 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 					} else if opts.rejectFirstNFrames == 0 {
 						rejectThisFrame = false
 					}
+				}
+				if opts.rejectFirstFramesOverall > 0 {
+					rejectThisFrame = frameNo <= int64(opts.rejectFirstFramesOverall)
 				}
 				if rejectThisFrame {
 					_ = conn.Write(context.Background(), websocket.MessageBinary,
@@ -1465,6 +1501,43 @@ func TestQwpSfSendLoopReconnectStatusSnapshot(t *testing.T) {
 	assert.WithinDuration(t, time.Now(), start, 2*time.Second)
 }
 
+// TestQwpSfSendLoopRecyclePauseIsPartOfOutage pins that the recycle pause
+// before a redial belongs to the outage: the reconnect status reports it, with
+// no dial yet, so the drainer's watchdog does not count it as connected time
+// and a backpressure timeout reports it as reconnecting.
+func TestQwpSfSendLoopRecyclePauseIsPartOfOutage(t *testing.T) {
+	// Every connection reads one frame and closes in an orderly way without
+	// acking, so each close is a no-progress recycle with a paced redial.
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+		orderlyCloseAfterFrames: 1,
+		orderlyCloseUntilConn:   1 << 30,
+	})
+	defer srv.Close()
+
+	engine, err := qwpSfNewCursorEngine("", 4096, qwpSfUnlimitedTotalBytes, time.Second)
+	require.NoError(t, err)
+	defer func() { _ = engine.engineClose() }()
+
+	transport, err := qwpSfDialFor(srv)(context.Background(), 0)
+	require.NoError(t, err)
+	// The first recycle pause lies in [400ms, 800ms).
+	loop := qwpSfNewSendLoop(engine, transport, qwpSfDialFor(srv),
+		100*time.Microsecond, 2*time.Second, 400*time.Millisecond, 800*time.Millisecond)
+	loop.sendLoopStart()
+	defer func() { _ = loop.sendLoopClose() }()
+
+	_, err = engine.engineAppendBlocking(context.Background(), []byte("frame"))
+	require.NoError(t, err)
+
+	// An outage 200ms old with no dial yet can only be inside the pause: the
+	// round walk counts its first dial as soon as it starts.
+	require.Eventually(t, func() bool {
+		r, a, start := loop.sendLoopReconnectStatus()
+		return r && a == 0 && time.Since(start) >= 200*time.Millisecond
+	}, 3*time.Second, 5*time.Millisecond,
+		"the recycle pause must be reported as an outage with no dial yet")
+}
+
 func TestQwpSfConnectWithRetrySucceedsEventually(t *testing.T) {
 	// Start with a port that nothing is listening on; flip to a
 	// real server after a few attempts.
@@ -1699,6 +1772,26 @@ func TestQwpSfSendLoopConnProgressIgnoresCatchUpAck(t *testing.T) {
 	// A real data frame was sent but nothing acked yet: no progress, pace.
 	l.acksOnConn.Store(0)
 	require.True(t, l.connMadeNoRealProgress())
+}
+
+// TestQwpSfSendLoopCoversDataFrameIgnoresCatchUp pins how an OK ack that
+// covers a data frame is told apart from one that covers only the reconnect
+// dictionary catch-up: the catch-up frames map to FSNs below connReplayStart.
+func TestQwpSfSendLoopCoversDataFrameIgnoresCatchUp(t *testing.T) {
+	l := &qwpSfSendLoop{}
+
+	// Two catch-up frames at wire seqs 0 and 1 (FSNs 8 and 9); data starts
+	// at FSN 10.
+	l.fsnAtZero.Store(8)
+	l.connReplayStart = 10
+	require.False(t, l.coversDataFrame(0))
+	require.False(t, l.coversDataFrame(1))
+	require.True(t, l.coversDataFrame(2))
+	require.True(t, l.coversDataFrame(5))
+
+	// No catch-up: the first wire seq is the first data frame.
+	l.fsnAtZero.Store(10)
+	require.True(t, l.coversDataFrame(0))
 }
 
 // TestQwpSfSendLoopRecordRejectionStrikeDualCondition pins that poison

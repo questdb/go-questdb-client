@@ -84,6 +84,36 @@ jobs:
           RUN_URL=$(jq -r '._links.web.href // ""' "$RESPONSE_FILE")
           echo "Enterprise build queued: ${RUN_URL}"
 
+  windows-sf:
+    name: QWP store-and-forward tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+      - name: Run store-and-forward tests
+        env:
+          GOTOOLCHAIN: local
+        shell: pwsh
+        # Runs every TestQwpSf* test in the package, three times to shake
+        # out timing-dependent ownership failures. Tests that need a live
+        # QuestDB skip on Windows (qwp_fuzz_fixture_windows_test.go). The
+        # floor on distinct test names fails the job when the selection
+        # silently stops matching, which go test reports as a pass.
+        run: |
+          go test -run '^TestQwpSf' -count=3 -timeout 30m -v . | Tee-Object -Variable log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $names = $log |
+            Select-String -Pattern '^=== RUN   (TestQwpSf[^/\s]*)$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value } |
+            Sort-Object -Unique
+          if ($names.Count -lt 350) {
+            throw "only $($names.Count) store-and-forward tests ran; expected at least 350"
+          }
+          Write-Output "$($names.Count) store-and-forward tests ran"
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -109,6 +139,25 @@ jobs:
         # version; `local` makes that fail loudly instead.
         env:
           GOTOOLCHAIN: local
+        run: go vet ./...
+
+      - name: Cross-compile Darwin
+        # Compile Darwin-specific production code, including SF fsync.
+        # This does not execute macOS tests.
+        env:
+          GOTOOLCHAIN: local
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: go build ./...
+
+      - name: Vet for Windows
+        # Builds and vets the Windows production code and every Windows test
+        # file, so a change that breaks the Windows build fails on every
+        # run. The windows-sf job executes the store-and-forward tests.
+        env:
+          GOTOOLCHAIN: local
+          GOOS: windows
         run: go vet ./...
 
       - name: Run Staticcheck

@@ -27,9 +27,16 @@ package questdb
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/stretchr/testify/require"
 )
 
 func newQwpQueryPoolForTest(t *testing.T, min, max int) *qwpQueryPool {
@@ -184,7 +191,7 @@ func TestQwpQueryPoolClosedOps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
-	_ = p.close(ctx)
+	require.ErrorIs(t, p.close(cancelledCleanupWait()), ErrCleanupPending)
 	if _, err := p.borrow(ctx); !errors.Is(err, errPoolClosed) {
 		t.Errorf("borrow after close=%v, want errPoolClosed", err)
 	}
@@ -204,18 +211,135 @@ func TestQwpQueryPoolCloseLeavesOnLoanWorker(t *testing.T) {
 		t.Fatalf("borrow: %v", err)
 	}
 	w := q.worker
-	if err := p.close(ctx); err != nil {
-		t.Fatalf("pool close: %v", err)
-	}
+	require.ErrorIs(t, p.close(cancelledCleanupWait()), ErrCleanupPending)
 	if w.client.closed.Load() {
 		t.Fatal("close() force-closed an on-loan worker (would race an in-flight Batches() read)")
 	}
 	if err := q.Close(); err != nil {
 		t.Fatalf("lease close after pool close: %v", err)
 	}
-	if !w.client.closed.Load() {
-		t.Error("returning the on-loan lease after pool close did not self-close its client")
+	require.NoError(t, p.close(context.Background()))
+	require.True(t, w.client.closed.Load(), "returned client must eventually close")
+}
+
+// A client that finishes connecting after close has begun must stay counted
+// throughout its off-lock teardown, even though it never enters p.all.
+func TestQwpQueryPoolCloseWaitsForClosedDuringBuildTeardown(t *testing.T) {
+	requestEntered, allowUpgrade := make(chan struct{}), make(chan struct{})
+	peerClosed := make(chan struct{})
+	var upgradeOnce, teardownOnce sync.Once
+	releaseTeardown := make(chan struct{})
+	unblock := func() {
+		upgradeOnce.Do(func() { close(allowUpgrade) })
+		teardownOnce.Do(func() { close(releaseTeardown) })
 	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestEntered)
+		select {
+		case <-allowUpgrade:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set(qwpHeaderVersion, "1")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		defer close(peerClosed)
+		info := buildServerInfoFrame(qwpVersion, 0, qwpRolePrimary, 1, 0,
+			1_700_000_000_000_000_000, "test-cluster", "late-query-worker")
+		if err := conn.Write(r.Context(), websocket.MessageBinary, info); err != nil {
+			return
+		}
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), qwpPoolTestUnhurriedAcquire)
+	p, err := newQwpQueryPool(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";",
+		0, 1, qwpPoolTestUnhurriedAcquire, 0, 0, nil)
+	require.NoError(t, err)
+	teardownEntered := make(chan *QwpQueryClient, 1)
+	hook := func(client *QwpQueryClient) {
+		teardownEntered <- client
+		<-releaseTeardown
+	}
+	queryClientCloseHook.Store(&hook)
+	var borrowFinished, closeFinished chan struct{}
+	t.Cleanup(func() {
+		unblock()
+		queryClientCloseHook.Store(nil)
+		cancel()
+		if borrowFinished != nil {
+			waitQwpCleanupSignal(t, borrowFinished, "query borrow cleanup")
+		}
+		if closeFinished != nil {
+			waitQwpCleanupSignal(t, closeFinished, "query pool close cleanup")
+		} else {
+			_ = p.close(context.Background())
+		}
+	})
+
+	borrowResult := make(chan error, 1)
+	borrowFinished = make(chan struct{})
+	go func() {
+		defer close(borrowFinished)
+		q, err := p.borrow(ctx)
+		if q != nil {
+			_ = q.Close()
+		}
+		borrowResult <- err
+	}()
+	waitQwpCleanupSignal(t, requestEntered, "query connection attempt")
+	closeResult := make(chan error, 1)
+	closeFinished = make(chan struct{})
+	go func() {
+		defer close(closeFinished)
+		closeResult <- p.close(context.Background())
+	}()
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.closed && p.inFlightCreations == 1
+	}, qwpTestWaitTimeout, time.Millisecond, "close must wait on the in-flight connection")
+	upgradeOnce.Do(func() { close(allowUpgrade) })
+
+	var client *QwpQueryClient
+	select {
+	case client = <-teardownEntered:
+	case <-time.After(qwpTestWaitTimeout):
+		t.Fatal("late client did not reach its off-lock close")
+	}
+	p.mu.Lock()
+	inFlight, pending, total := p.inFlightCreations, len(p.teardowns), len(p.all)
+	p.mu.Unlock()
+	require.Zero(t, inFlight)
+	require.Zero(t, total, "the closing pool must never publish the new worker")
+	require.Equal(t, 1, pending, "construction must transfer ownership to teardown without a gap")
+	select {
+	case <-peerClosed:
+		t.Fatal("the client must still be connected at the teardown gate")
+	case <-closeFinished:
+		t.Fatal("pool close returned while the new client's teardown was blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	teardownOnce.Do(func() { close(releaseTeardown) })
+	waitQwpCleanupSignal(t, borrowFinished, "late client teardown")
+	require.ErrorIs(t, <-borrowResult, errPoolClosed)
+	waitQwpCleanupSignal(t, closeFinished, "query pool shutdown")
+	require.NoError(t, <-closeResult)
+	waitQwpCleanupSignal(t, peerClosed, "query socket closure")
+	waitQwpCleanupSignal(t, client.io().doneCh, "query I/O shutdown")
+	p.mu.Lock()
+	pending = len(p.teardowns)
+	p.mu.Unlock()
+	require.Zero(t, pending, "finished teardown must release its recorded obligation")
 }
 
 func TestQwpQueryPoolDoubleClose(t *testing.T) {
@@ -476,5 +600,52 @@ func TestQwpQueryPoolReapsTerminalWorker(t *testing.T) {
 
 	if total, avail := p.poolSnapshot(); total != 0 || avail != 0 {
 		t.Errorf("poisoned worker not reaped: total=%d avail=%d, want 0/0", total, avail)
+	}
+}
+
+// TestQwpQueryPoolCloseSurvivesPanickingLogger pins both halves of where the
+// query pool's leak warning runs. A panicking application handler must not hold
+// p.mu for the process lifetime, and must not skip the teardown of every
+// available client's WebSocket — the count is taken under the lock and the log
+// runs after the unlock, behind the panic guard.
+func TestQwpQueryPoolCloseSurvivesPanickingLogger(t *testing.T) {
+	srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+		for {
+			if _, _, err := m.conn.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	})
+	t.Cleanup(srv.Close)
+	ctx := context.Background()
+	p, err := newQwpQueryPool(ctx, "ws::addr="+strings.TrimPrefix(srv.URL, "http://")+";",
+		2, 2, 200*time.Millisecond, 0, 0, slog.New(panicOnHandleSlog{}))
+	require.NoError(t, err)
+
+	// One lease stays out so close takes the leak-warning branch.
+	leased, err := p.borrow(ctx)
+	require.NoError(t, err)
+	defer leased.Close()
+
+	panicked := false
+	func() {
+		defer func() { panicked = recover() != nil }()
+		_ = p.close(cancelledCleanupWait())
+	}()
+	require.False(t, panicked, "a panicking handler must not escape close()")
+
+	locked := make(chan struct{})
+	go func() {
+		// Taking the lock at all is the assertion: a handler that panicked
+		// while it was held would leave it owned by a dead goroutine.
+		p.mu.Lock()
+		_ = len(p.all)
+		p.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the query pool lock is still held after the logger panicked")
 	}
 }

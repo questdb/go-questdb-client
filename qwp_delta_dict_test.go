@@ -88,7 +88,6 @@ func TestQwpDeltaDictReconnectCatchUpRebuildsDictionary(t *testing.T) {
 
 	s, engine, _, cleanup := newCursorSenderForTest(t, srv, 0)
 	defer cleanup()
-	require.True(t, s.deltaDictEnabled, "memory mode must delta-encode")
 
 	ctx := context.Background()
 	require.NoError(t, s.Table("t").Symbol("sym", "AAPL").Int64Column("v", 1).AtNow(ctx))
@@ -110,6 +109,37 @@ func TestQwpDeltaDictReconnectCatchUpRebuildsDictionary(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
 	}, 3*time.Second, 5*time.Millisecond)
+}
+
+// TestQwpSfSendLoopDataOkAcksExcludeCatchUp pins that the data-OK count skips
+// the ack for a reconnect's dictionary catch-up. Connection 1 acks FSN 0 and
+// drops after reading FSN 1, so connection 2 replays from FSN 1 behind a
+// catch-up frame that maps to FSN 0. Connection 1 must ack before the drop:
+// otherwise the replay starts at FSN 0 on both connections, and a stale
+// replay start would go unnoticed.
+func TestQwpSfSendLoopDataOkAcksExcludeCatchUp(t *testing.T) {
+	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{closeAfterFrames: 2})
+	defer srv.Close()
+
+	s, engine, loop, cleanup := newCursorSenderForTest(t, srv, 0)
+	defer cleanup()
+
+	ctx := context.Background()
+	require.NoError(t, s.Table("t").Symbol("sym", "AAPL").Int64Column("v", 1).AtNow(ctx))
+	require.NoError(t, s.Flush(ctx))
+	require.Eventually(t, func() bool { return engine.engineAckedFsn() == 0 },
+		3*time.Second, 5*time.Millisecond, "connection 1 must ack FSN 0 before the drop")
+
+	require.NoError(t, s.Table("t").Symbol("sym", "BETA").Int64Column("v", 2).AtNow(ctx))
+	require.NoError(t, s.Flush(ctx))
+	require.Eventually(t, func() bool {
+		return engine.engineAckedFsn() >= engine.enginePublishedFsn()
+	}, 3*time.Second, 5*time.Millisecond)
+
+	require.Equal(t, int64(2), loop.sendLoopTotalDataOkAcks(),
+		"one data ack per connection; the catch-up ack must not count")
+	require.GreaterOrEqual(t, loop.sendLoopTotalAcks()-loop.sendLoopTotalDataOkAcks(), int64(1),
+		"connection 2 must have acked its catch-up frame")
 }
 
 // TestQwpDeltaDictNoCatchUpWhenNothingSent verifies a fresh connection with an
@@ -153,7 +183,6 @@ func TestQwpDeltaDictSplitPathStaysDeltaAcrossReconnect(t *testing.T) {
 
 	s, engine, _, cleanup := newCursorSenderForTest(t, srv, 0)
 	defer cleanup()
-	require.True(t, s.deltaDictEnabled, "memory mode must delta-encode")
 
 	ctx := context.Background()
 
@@ -220,14 +249,16 @@ func TestQwpDeltaDictSplitPathStaysDeltaAcrossReconnect(t *testing.T) {
 // order.
 func TestQwpDeltaDictSeedFromPersisted(t *testing.T) {
 	dir := t.TempDir()
-	seed := qwpSfSymbolDictOpen(dir)
+	seed, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.NotNil(t, seed)
 	require.NoError(t, seed.appendSymbols([]string{"a", "b", "c"}))
 	require.NoError(t, seed.close())
 
 	// Reopen: recovery loads the entries via openExisting (a fresh dict has no
 	// loaded set), mirroring the engine's recovery path.
-	pd := qwpSfSymbolDictOpen(dir)
+	pd, err := qwpSfSymbolDictOpen(dir)
+	require.NoError(t, err)
 	require.NotNil(t, pd)
 	defer pd.close()
 	require.Equal(t, []string{"a", "b", "c"}, pd.loadedSymbols())
@@ -275,7 +306,6 @@ func TestQwpDeltaDictSfPersistsSymbols(t *testing.T) {
 	s, err := newQwpCursorLineSender(0, 0, 0, 0, engine, loop, 5*time.Second)
 	require.NoError(t, err)
 
-	require.True(t, s.deltaDictEnabled, "SF with an open side-file must delta-encode")
 	require.NotNil(t, s.persistedSymbolDict)
 
 	ctx := context.Background()
@@ -288,7 +318,8 @@ func TestQwpDeltaDictSfPersistsSymbols(t *testing.T) {
 
 	// Read the side-file through a second handle (before Close fully drains and
 	// removes it): the new symbols were persisted in id order.
-	check := qwpSfSymbolDictOpen(slot)
+	check, err := qwpSfSymbolDictOpen(slot)
+	require.NoError(t, err)
 	require.NotNil(t, check)
 	require.Equal(t, []string{"AAPL", "MSFT"}, check.loadedSymbols())
 	require.NoError(t, check.close())

@@ -494,7 +494,6 @@ func TestQwpSenderReclaimsOnlyUnpublishedSymbolIDs(t *testing.T) {
 			globalSymbolList: []string{"sent", "abandoned"},
 			maxSentSymbolId:  0,
 			batchMaxSymbolId: 1,
-			deltaDictEnabled: true,
 		}
 
 		s.resetAfterFlush()
@@ -511,7 +510,10 @@ func TestQwpSenderReclaimsOnlyUnpublishedSymbolIDs(t *testing.T) {
 	})
 
 	t.Run("persisted_floor", func(t *testing.T) {
-		d := qwpSfSymbolDictOpen(t.TempDir())
+		d, err := qwpSfSymbolDictOpen(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
 		if d == nil {
 			t.Fatal("open persisted dictionary")
 		}
@@ -528,11 +530,15 @@ func TestQwpSenderReclaimsOnlyUnpublishedSymbolIDs(t *testing.T) {
 			globalSymbolList:    []string{"sent", "durable", "abandoned"},
 			maxSentSymbolId:     0,
 			batchMaxSymbolId:    2,
-			deltaDictEnabled:    true,
 			persistedSymbolDict: d,
 		}
+		s.symbolDictBound = qwpSfSymbolDictBound(s.globalSymbolList) - qwpSfSymbolDictHeaderSize
 
 		s.resetAfterFlush()
+
+		if got, want := s.symbolDictBound, qwpSfSymbolDictBound(s.globalSymbolList)-qwpSfSymbolDictHeaderSize; got != want {
+			t.Fatalf("symbolDictBound = %d after reclaim, want %d", got, want)
+		}
 
 		if got := s.globalSymbolList; !reflect.DeepEqual(got, []string{"sent", "durable"}) {
 			t.Fatalf("globalSymbolList = %v, want [sent durable]", got)
@@ -542,31 +548,6 @@ func TestQwpSenderReclaimsOnlyUnpublishedSymbolIDs(t *testing.T) {
 		}
 		if got := s.globalSymbols["durable"]; got != 1 {
 			t.Fatalf("durable id = %d, want 1", got)
-		}
-	})
-
-	// Full-dictionary frames already queued define their own ids, so nothing
-	// may be reclaimed here: a reused id would no longer match what the
-	// send-loop mirror holds.
-	t.Run("full_dict_retains", func(t *testing.T) {
-		s := &qwpLineSender{
-			globalSymbols: map[string]int32{
-				"sent":      0,
-				"abandoned": 1,
-			},
-			globalSymbolList: []string{"sent", "abandoned"},
-			maxSentSymbolId:  0,
-			batchMaxSymbolId: 1,
-			deltaDictEnabled: false,
-		}
-
-		s.resetAfterFlush()
-
-		if got := s.globalSymbolList; !reflect.DeepEqual(got, []string{"sent", "abandoned"}) {
-			t.Fatalf("globalSymbolList = %v, want [sent abandoned]", got)
-		}
-		if got := s.globalSymbols["abandoned"]; got != 1 {
-			t.Fatalf("abandoned id = %d, want 1", got)
 		}
 	})
 }

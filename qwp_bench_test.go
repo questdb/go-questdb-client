@@ -26,6 +26,8 @@ package questdb
 
 import (
 	"context"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 )
@@ -143,10 +145,6 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 		globalSymbols:    make(map[string]int32),
 		maxSentSymbolId:  -1,
 		batchMaxSymbolId: -1,
-		// Memory mode always delta-encodes, so the benchmark must take the
-		// same resetAfterFlush path (including reclaimUnsentSymbolIDs) that
-		// production takes.
-		deltaDictEnabled: true,
 	}
 
 	s.globalSymbols["AAPL"] = 0
@@ -542,5 +540,232 @@ func BenchmarkQwpGorillaDecode(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// BenchmarkQwpSfPublish measures the disk side of a store-and-forward flush:
+// the engine append that copies a frame into the mapped active segment, and,
+// on the flush that fills a segment, the rotation that follows it. Segment and
+// payload sizes are production-shaped, so rotations land at their natural rate
+// -- roughly one flush in a few thousand at the default 4 MiB segment.
+//
+// Every frame is acknowledged immediately so the segment manager keeps trimming
+// and the benchmark stays inside its byte cap however long it runs.
+//
+// The mean hides what matters here, so the benchmark also reports p99.9 and
+// max. A rotation costs about three orders of magnitude more than a plain
+// append, but at the default 4 MiB segment and 512-byte frames it falls on
+// about one append in eight thousand, beyond p99.9. Rotations therefore show in
+// max, as does an append that had to wait for the manager to install the next
+// spare. p99.9 shows costs that recur more often, such as the page fault on the
+// first write into each page of the active segment. On APFS that fault reads
+// the page back from disk once an fsync has reached the new segment, because
+// the first fsync of a preallocated file writes zeros over all of it; that
+// dominates p99.9 there. ext4 and XFS leave preallocated space unwritten, so a
+// first write is zero-filled in memory without a read.
+func BenchmarkQwpSfPublish(b *testing.B) {
+	const (
+		segmentBytes int64 = 4 << 20
+		totalBytes   int64 = 64 << 20
+		payloadBytes       = 512
+	)
+	ctx := context.Background()
+	e, err := qwpSfNewCursorEngine(b.TempDir(), segmentBytes, totalBytes, qwpTestAppendTimeout)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = e.engineClose() }()
+
+	payload := make([]byte, payloadBytes)
+	// Warmup: reach a steady state where the manager is keeping a hot spare
+	// installed, so the measured loop pays for rotations rather than for the
+	// first spare's provisioning.
+	for i := 0; i < 64; i++ {
+		fsn, err := e.engineAppendBlocking(ctx, payload)
+		if err != nil {
+			b.Fatal(err)
+		}
+		e.engineAcknowledge(fsn)
+	}
+
+	latencies := make([]time.Duration, b.N)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		fsn, err := e.engineAppendBlocking(ctx, payload)
+		latencies[i] = time.Since(start)
+		if err != nil {
+			b.Fatal(err)
+		}
+		e.engineAcknowledge(fsn)
+	}
+	b.StopTimer()
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		p999 := latencies[(len(latencies)*999)/1000]
+		b.ReportMetric(float64(p999.Nanoseconds()), "p99.9-ns/op")
+		b.ReportMetric(float64(latencies[len(latencies)-1].Nanoseconds()), "max-ns/op")
+	}
+}
+
+// BenchmarkQwpSfRotationBarriers isolates two of the three barriers a rotation
+// adds to the flush it lands on: the fixed-size fsyncs of the promoted spare's
+// header and the manifest, on two different files, that the producer waits
+// through while holding the engine's append mutex. The first barrier, which
+// makes the sealed segment's frames durable, costs whatever is still unwritten
+// in that segment, so BenchmarkQwpSfSustainedAppend measures it under load.
+//
+// They run in this order and cannot be overlapped. The promoted spare's header
+// carries the base sequence the manifest is about to commit as the active one,
+// so a crash that lands the manifest record without the header leaves the slot
+// with no segment at its committed active base — which recovery refuses,
+// costing the whole slot. The reverse gap is harmless: the manifest still names
+// the previous active, and the new empty segment is discarded as a stray.
+//
+// The sub-benchmarks measure each barrier alone and then the pair as a producer
+// pays for it.
+func BenchmarkQwpSfRotationBarriers(b *testing.B) {
+	dir := b.TempDir()
+	seg, err := qwpSfCreateSegment(filepath.Join(dir, "sf-bench.sfa"), 0, 1<<20)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = seg.close() }()
+	manifest, err := qwpSfManifestCreate(dir, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = manifest.close() }()
+
+	// The manifest skips the write and the fsync when neither boundary moved,
+	// so every measured update has to name a new active base.
+	active := int64(0)
+	nextActive := func() int64 {
+		active++
+		return active
+	}
+
+	// A rotation always syncs a header it has just rewritten: the promoted
+	// spare is rebased onto the new active sequence first. Dirty the header the
+	// same way here, or the msync+fsync has nothing to write back after the
+	// first iteration and the sub-benchmark measures a no-op barrier.
+	dirtyHeader := func(i int) {
+		if err := seg.rebaseSeq(int64(i + 1)); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.Run("header", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			dirtyHeader(i)
+			if err := seg.syncHeader(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("manifest", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if err := manifest.update(0, nextActive()); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("both", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			dirtyHeader(i)
+			if err := seg.syncHeader(); err != nil {
+				b.Fatal(err)
+			}
+			if err := manifest.update(0, nextActive()); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkQwpSfSustainedAppend measures how fast a producer can keep appending
+// 512-byte frames to a disk-backed slot with 4 MiB segments, and on Linux how
+// many bytes the kernel sends to storage per byte appended. It compares three
+// rotation policies:
+//
+//   - no-sealed-sync: a rotation makes only the spare's header and the
+//     manifest durable, so an OS crash can leave the manifest pointing past
+//     frames the disk lost;
+//   - sealed-sync: the rotation also makes the sealed segment's frames
+//     durable, writing all of them while the producer waits;
+//   - sealed-sync+writeback: as sealed-sync, but the segment manager starts
+//     writing the active segment back while it fills. This is production.
+//
+// The acked mode acknowledges every frame at once, as a healthy server would,
+// so segments are trimmed as soon as they are sealed; backlog acknowledges
+// nothing, as while the server is unreachable. backlog needs about
+// b.N*512 bytes of disk, so pass an explicit -benchtime such as 262144x.
+func BenchmarkQwpSfSustainedAppend(b *testing.B) {
+	const (
+		segmentBytes int64 = 4 << 20
+		payloadBytes       = 512
+	)
+	policies := []struct {
+		name       string
+		sealedSync bool
+		writeback  bool
+	}{
+		{"no-sealed-sync", false, false},
+		{"sealed-sync", true, false},
+		{"sealed-sync+writeback", true, true},
+	}
+	for _, mode := range []string{"acked", "backlog"} {
+		for _, policy := range policies {
+			b.Run(mode+"/"+policy.name, func(b *testing.B) {
+				previousSync := qwpSfSyncSealedSegment.load()
+				previousWriteback := qwpSfActiveWritebackBytes.load()
+				defer func() {
+					qwpSfSyncSealedSegment.store(previousSync)
+					qwpSfActiveWritebackBytes.store(previousWriteback)
+				}()
+				if !policy.sealedSync {
+					qwpSfSyncSealedSegment.store(func(*qwpSfSegment) error { return nil })
+				}
+				if !policy.writeback {
+					qwpSfActiveWritebackBytes.store(0)
+				}
+				totalBytes := int64(64 << 20)
+				if mode == "backlog" {
+					totalBytes += int64(b.N+64) * payloadBytes
+				}
+				ctx := context.Background()
+				e, err := qwpSfNewCursorEngine(b.TempDir(), segmentBytes, totalBytes, qwpTestAppendTimeout)
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer func() { _ = e.engineClose() }()
+				payload := make([]byte, payloadBytes)
+				for i := 0; i < 64; i++ {
+					fsn, err := e.engineAppendBlocking(ctx, payload)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if mode == "acked" {
+						e.engineAcknowledge(fsn)
+					}
+				}
+				storedBefore, measured := qwpBenchStorageWriteBytes()
+				b.SetBytes(payloadBytes)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					fsn, err := e.engineAppendBlocking(ctx, payload)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if mode == "acked" {
+						e.engineAcknowledge(fsn)
+					}
+				}
+				b.StopTimer()
+				if storedAfter, ok := qwpBenchStorageWriteBytes(); measured && ok {
+					b.ReportMetric(float64(storedAfter-storedBefore)/float64(int64(b.N)*payloadBytes), "storage-bytes/byte")
+				}
+			})
+		}
 	}
 }

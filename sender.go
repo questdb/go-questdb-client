@@ -70,6 +70,14 @@ type LineSender interface {
 	// Symbol name cannot contain any of the following characters:
 	// '\n', '\r', '?', '.', ',', ”', '"', '\\', '/', ':', ')', '(', '+',
 	// '-', '*' '%%', '~', or a non-printable char.
+	//
+	// A QWP sender keeps one symbol dictionary shared by all tables and
+	// columns. It holds at most 1,000,000 distinct values, and with
+	// store-and-forward its file is also capped at 1 GiB, counting each value's
+	// length plus 22 bytes. A memory-backed sender has no byte limit. A new
+	// value past a limit is refused with an error on the next At / AtNow;
+	// rows using values already in the dictionary stay valid. Close and
+	// rebuild the sender to start a fresh dictionary.
 	Symbol(name, val string) LineSender
 
 	// Int64Column adds a 64-bit integer (long) column value to the ILP
@@ -229,6 +237,12 @@ type LineSender interface {
 	// method also sends the accumulated messages.
 	//
 	// If ts.IsZero(), no timestamp is sent to the server.
+	//
+	// For QWP senders, an auto-flush failure matching [ErrBackpressureTimeout]
+	// or [ErrSfDurability] is non-terminal. The row this call finished is
+	// already buffered and stays pending with any other unsent rows, so do not
+	// build it again: call Flush to retry sending them. [ErrSfDurability]
+	// comes only from store-and-forward senders.
 	At(ctx context.Context, ts time.Time) error
 
 	// AtNow omits designated timestamp value and finalizes the ILP
@@ -238,6 +252,12 @@ type LineSender interface {
 	// If the underlying buffer reaches configured capacity or the
 	// number of buffered messages exceeds the auto-flush trigger, this
 	// method also sends the accumulated messages.
+	//
+	// For QWP senders, an auto-flush failure matching [ErrBackpressureTimeout]
+	// or [ErrSfDurability] is non-terminal. The row this call finished is
+	// already buffered and stays pending with any other unsent rows, so do not
+	// build it again: call Flush to retry sending them. [ErrSfDurability]
+	// comes only from store-and-forward senders.
 	AtNow(ctx context.Context) error
 
 	// Flush sends the accumulated messages via the underlying
@@ -249,12 +269,64 @@ type LineSender interface {
 	// batches followed by a Flush call. The optimal batch size may
 	// vary from one thousand to few thousand messages depending on
 	// the message size.
+	//
+	// For QWP senders, an error matching [ErrBackpressureTimeout] or
+	// [ErrSfDurability] is non-terminal: rows that were not appended stay
+	// pending, and calling Flush again retries them without resending the rows
+	// that were. [ErrSfDurability] comes only from store-and-forward senders.
 	Flush(ctx context.Context) error
 
-	// Close closes the underlying HTTP client.
+	// Close closes a standalone sender or returns a borrowed sender to its pool.
+	// For ILP, remaining buffered messages are flushed first if auto-flush is on.
 	//
-	// If auto-flush is enabled, the client will flush any remaining buffered
-	// messages before closing itself.
+	// For QWP, stop using the sender before Close. Callbacks must ask the
+	// application code using the sender to stop; they must not call Close or
+	// Flush themselves.
+	//
+	// A standalone QWP sender starts shutdown once, even if ctx is already
+	// cancelled or expired. ctx limits the caller's wait, not cleanup or sending.
+	// Close first discards any row not finished with At, AtNow, or AtNano. It
+	// then tries to queue completed rows for background sending, using the
+	// configured append timeout for each frame rather than retrying indefinitely.
+	// Next it waits for server acknowledgements, up to [WithCloseFlushTimeout].
+	// A zero or negative timeout skips only that acknowledgement wait. If only
+	// part of a batch reaches store-and-forward files, only that part is saved
+	// for recovery. Cancellation and later Close calls do not restart these
+	// steps or extend their time limits.
+	//
+	// If ctx expires before queueing and the acknowledgement wait finish, Close
+	// returns ctx.Err(), not nil. Errors from queueing or delivering rows still
+	// count as failures even if resources have been released. Rows held only in
+	// memory are not guaranteed delivery. Close also reports cleanup failures
+	// it already knows about; later failures are logged with their cause and,
+	// where applicable, slot. An error reported while releasing a connection or
+	// file that was released anyway, such as a TLS close alert that could not
+	// be sent, is logged and never makes Close fail. A nil result can mean
+	// resource cleanup continues in the background: it does not prove the
+	// slot's file lock is released.
+	// Use [QwpSender.SlotLockReleased] to check a standalone disk-backed sender.
+	// A second Close returns a double-close error and does not repair cleanup.
+	// The client remains responsible for retrying recoverable storage cleanup.
+	// After an internal failure, resources that cannot safely be released stay
+	// held, possibly until process exit. Close does not promise an empty slot
+	// directory or a WebSocket closing handshake, and a WebSocket CLOSE reply
+	// would not acknowledge rows: only server acknowledgements confirm them.
+	//
+	// For a sender borrowed with [QuestDB.BorrowSender], Close returns it to the
+	// pool. Later calls do nothing and return nil, not errors from later cleanup.
+	// Unlike standalone Close, returning a borrowed sender ignores ctx while
+	// queueing completed rows: it uses the append timeout and does not wait for
+	// server acknowledgements. Stop using the handle once Close starts. If
+	// completed rows cannot be queued because the buffer stayed full
+	// ([ErrBackpressureTimeout]) or local storage refused them
+	// ([ErrSfDurability]), Close drops those rows and returns the error; the
+	// sender stays in the pool and still delivers rows queued before. To keep
+	// rows through backpressure, call Flush again before Close. If the sender
+	// must be removed, the pool closes it in the background.
+	// Close reports errors from queueing rows or returning the sender; later
+	// cleanup errors are logged and included in [QuestDB.Close]'s result.
+	// Returning a sender does not prove its connection or file lock is released.
+	// Use QuestDB.Close to wait for all pool resources to be released.
 	Close(ctx context.Context) error
 }
 
@@ -418,6 +490,10 @@ type lineSenderConfig struct {
 	// to its in-range slot set so a pooled sender never adopts a live sibling's
 	// dir (Hazard G). nil for standalone senders. Internal; no connect-string key.
 	orphanDrainExclude func(slotName string) bool
+	// sfOpenRevalidate runs under the parent-anchored logical lock before this
+	// sender opens its own slot. Pool startup recovery sets it after an earlier
+	// candidate scan; ordinary foreground construction leaves it nil.
+	sfOpenRevalidate func(slotDir string) error
 
 	// Durable-ack (request_durable_ack). QWP-only, Enterprise primary-replication
 	// QoS. When true, the send loop trims / replays / awaits on the server's
@@ -472,21 +548,17 @@ func WithQwp() LineSenderOption {
 	}
 }
 
-// WithCloseTimeout sets the time Close() waits for the I/O goroutine
-// to finish draining published batches to the server before
-// force-cancelling. Defaults to 5 seconds. Because Flush() never waits
-// for the server ACK, this close-time drain — not Flush() — is the
-// sender's last chance to get buffered data confirmed; rows still
-// unacked when the timeout expires may be lost (memory mode) or left
-// on disk for replay (store-and-forward).
+// WithCloseTimeout limits the time QWP shutdown waits for server
+// acknowledgements. See [WithCloseFlushTimeout] and [LineSender.Close] for
+// how this differs from the caller's wait and from releasing resources.
 //
 // Deprecated: use WithCloseFlushTimeout instead. WithCloseTimeout is
 // preserved as an alias so v4.0–v4.5 code keeps compiling — it
 // routes through the same close_flush_timeout_millis path the spec
 // (connect-string.md §Ingress reconnect) defines. d <= 0 is treated
 // as "no override" (default 5s) to match the legacy semantics; to
-// skip the drain entirely, use WithCloseFlushTimeout, where 0 /
-// negative means "fast close".
+// skip waiting for acknowledgements, use WithCloseFlushTimeout. Zero or
+// negative values still allow completed buffered rows to be queued for sending.
 func WithCloseTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		if d <= 0 {
@@ -514,9 +586,11 @@ func WithCloseTimeout(d time.Duration) LineSenderOption {
 // logs ERROR for a terminal rejection and WARN for a retriable one
 // (informational: the batch is replayed after the connection recycles).
 //
-// The handler may call Close() or Flush() on the sender (e.g. to shut
-// down on a terminal rejection) without deadlocking — see
-// SenderErrorHandler for the re-entrancy contract.
+// The handler should signal the application code that uses the sender. It
+// must not call Close, Flush, other methods that change the sender, or
+// QuestDB.Close directly. Documented methods returning read-only snapshots
+// of state are allowed. See [SenderErrorHandler] for where callbacks run,
+// how panics are handled, and which notifications may be lost at shutdown.
 //
 // Only available for the QWP sender.
 func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
@@ -531,7 +605,11 @@ func WithErrorHandler(h SenderErrorHandler) LineSenderOption {
 // dedicated dispatcher goroutine; a slow listener cannot stall publishing, and
 // surplus events are dropped when the bounded inbox fills (visible via
 // QwpSender.DroppedConnectionNotifications()). Passing nil reverts to the
-// default loud listener. See SenderConnectionListener for the contract.
+// default loud listener. Signal the application code that uses the sender;
+// do not call Close, Flush, other methods that change the sender, or
+// QuestDB.Close directly. Documented methods returning read-only snapshots
+// of state are allowed. See [SenderConnectionListener] for where callbacks
+// run, how panics are handled, and which notifications may be lost at shutdown.
 //
 // Only available for the QWP sender.
 func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
@@ -540,23 +618,44 @@ func WithConnectionListener(l SenderConnectionListener) LineSenderOption {
 	}
 }
 
-// WithLogger sets the *slog.Logger the client emits diagnostics through,
-// replacing the slog.Default() fallback. Genuine problems (panics in user
-// callbacks, leaked pool leases, protocol anomalies) and, when no handler or
+// WithLogger sets the *slog.Logger used for QWP diagnostics, replacing the
+// slog.Default() fallback. Nil clears an earlier logger option and restores
+// the same fallback as omitting the option. Components may capture the default
+// during construction; later slog.SetDefault calls need not affect them.
+//
+// Genuine problems (panics in user callbacks, leaked pool leases, protocol
+// anomalies) and, when no handler or
 // listener is registered, server rejections and connection transitions log at
 // Warn/Error; high-frequency chatter (replayed rejections, transient failover
 // windows) logs at Debug and is hidden unless the handler's level is lowered.
 // Pass a logger backed by slog.DiscardHandler to silence the client entirely,
 // or one wired to the application's logging stack to route it there.
+//
+// During QWP diagnostic emission, the client recovers synchronous panics from
+// the logging-handler methods, including those of the default logger. The
+// handler runs on the goroutine emitting the diagnostic; unlike notification
+// callbacks, logging does not always use a separate delivery goroutine.
+// Handlers must return promptly and must not change or close a client, or call
+// QuestDB.Close. Panic recovery does not stop a blocked handler or isolate
+// arbitrary application code, including argument evaluation before logging.
 func WithLogger(l *slog.Logger) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.logger = l
+		if l != nil {
+			s.logger = qwpGuardLogger(l)
+		}
 	}
 }
 
 // WithProgressHandler registers a SenderProgressHandler invoked when the QWP
 // sender's acknowledged frame sequence advances. QWP-only; opt-in (no default).
 // Under WithRequestDurableAck the reported watermark is durable, not settled.
+// The handler runs on a separate goroutine, not the goroutine building rows
+// or doing network I/O. Signal the application code that uses the sender;
+// do not call Close, Flush, other methods that change the sender, or
+// QuestDB.Close directly. Documented methods returning read-only snapshots
+// of state are allowed. See [SenderProgressHandler] for skipped intermediate
+// updates, panic handling, and notifications that may be lost at shutdown.
 func WithProgressHandler(h SenderProgressHandler) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.progressHandler = h
@@ -566,7 +665,12 @@ func WithProgressHandler(h SenderProgressHandler) LineSenderOption {
 // WithBackgroundDrainerListener registers a QwpBackgroundDrainerListener applied
 // to every store-and-forward orphan drainer, surfacing durable-ack drain outcomes
 // (unavailable endpoint, persistent failure). QWP-only; effective with
-// drain_orphans and request_durable_ack on.
+// drain_orphans and request_durable_ack on. Callbacks may run concurrently on
+// the client's background draining or I/O goroutines. Return promptly and
+// signal the application code that uses the sender. Do not change or close a
+// sender, or call QuestDB.Close directly. Documented methods returning
+// read-only snapshots of state are allowed. See [QwpBackgroundDrainerListener]
+// for where callbacks run, how panics are handled, and shutdown delivery limits.
 func WithBackgroundDrainerListener(l QwpBackgroundDrainerListener) LineSenderOption {
 	return func(s *lineSenderConfig) {
 		s.backgroundDrainerListener = l
@@ -628,6 +732,10 @@ func WithErrorPolicy(c Category, p Policy) LineSenderOption {
 // CategoryProtocolViolation (forced TERMINAL) and CategoryUnknown
 // (forced RETRIABLE, fail open) bypass the resolver entirely.
 //
+// The resolver runs on the sender's I/O goroutine and, with drain_orphans
+// enabled, on each background drainer's I/O goroutine, so calls can
+// overlap. It must be safe for concurrent use.
+//
 // Only available for the QWP sender.
 func WithErrorPolicyResolver(r func(Category) Policy) LineSenderOption {
 	return func(s *lineSenderConfig) {
@@ -654,6 +762,13 @@ func WithErrorInboxCapacity(n int) LineSenderOption {
 // replayed on reconnect / restart. Setting an empty string is a
 // no-op (memory mode).
 //
+// After checking the saved queue, recovery repairs the file the sender was
+// writing: it keeps the readable beginning and erases everything from the first
+// unreadable frame onward. This also applies when the first frame is unreadable.
+// Rows in the erased part are not preserved, even if some later frames are
+// intact. Missing required files or gaps between their sequence numbers still
+// cause recovery to refuse the saved queue.
+//
 // Only available for the QWP sender.
 func WithSfDir(dir string) LineSenderOption {
 	return func(s *lineSenderConfig) {
@@ -665,6 +780,14 @@ func WithSfDir(dir string) LineSenderOption {
 // uniquely identifies this sender's slot. Defaults to "default";
 // multi-sender deployments must set distinct IDs to avoid lock
 // collisions on the same slot. Only meaningful when sf_dir is set.
+//
+// The id also fixes the names the client reserves beside the slot: a refused
+// slot is preserved at <sf_dir>/<id>.unreplayable-<n>, and the slot's pathname
+// lock lives under <sf_dir>/.slot-locks/. An id long enough to push a
+// preservation name past the client's bounded length makes that preservation
+// fail rather than truncate into another id's namespace. Share an sf_dir only
+// with clients that use the same reserved names and locking protocol; see the
+// README's "Quarantined slots" section for the sharing rules.
 //
 // Only available for the QWP sender.
 func WithSenderId(id string) LineSenderOption {
@@ -702,9 +825,11 @@ func WithSfMaxTotalBytes(n int64) LineSenderOption {
 // indefinitely and never gives up on a wall clock (Invariant B). On a
 // running sender maxDuration additionally sets how long a rejection
 // window must persist before the poison-frame detector may escalate to a
-// terminal (and the background drainer's no-progress wedge budget), so a
-// small value shortens those floors — leave it at the default unless you
-// intend that.
+// terminal, and the background drainer's no-progress budget, so a small
+// value shortens those floors — leave it at the default unless you intend
+// that. The drainer budget never drops below 30 seconds, or four times that
+// with durable acknowledgements, so a small value cannot quarantine a slow
+// but healthy slot.
 // initialBackoff and maxBackoff bound the equal-jitter exponential
 // backoff sleep between attempts. A zero or negative argument is
 // treated as "leave the default" for that knob — it does not register
@@ -794,15 +919,20 @@ func WithInitialConnectMode(mode InitialConnectMode) LineSenderOption {
 	}
 }
 
-// WithCloseFlushTimeout bounds Close()'s wait for the cursor
-// engine's ackedFsn to catch up to publishedFsn. A zero or
-// negative duration skips the drain entirely (fast close).
-// Defaults to 5 seconds. Applies in both memory and
-// store-and-forward modes: rows still unacked when the timeout
-// expires may be lost (memory mode) or left on disk for replay
-// (sf_dir set). Equivalent to the connect-string
-// close_flush_timeout_millis key.
+// WithCloseFlushTimeout limits how long QWP shutdown waits for server
+// acknowledgements (default 5s). It corresponds to close_flush_timeout_millis.
+// A zero or negative duration skips only this wait: Close still tries to queue
+// completed buffered rows for sending. Rows already saved to store-and-forward
+// files remain recoverable if not acknowledged; rows held only in memory may
+// be lost. WithRequestDurableAck requires confirmation of durable storage,
+// not just a commit to the server's write-ahead log.
 //
+// The timer starts once, after attempts to queue buffered rows, each using
+// the per-frame append timeout. Cancelling the caller's context does not stop
+// this timer; later Close calls do not extend it. If the timer expires before
+// the required acknowledgements arrive, that remains a delivery error even
+// after resources are released. This option does not limit how long resource
+// cleanup may take. See [LineSender.Close].
 // Only available for the QWP sender.
 func WithCloseFlushTimeout(d time.Duration) LineSenderOption {
 	return func(s *lineSenderConfig) {
@@ -953,6 +1083,15 @@ func WithTarget(target QwpTargetFilter) LineSenderOption {
 // rejected at construction. Requires sf_dir to be set. Equivalent to
 // the connect-string sf_durability key.
 //
+// In "memory" mode appended frames reach the disk through the kernel's
+// writeback rather than an fsync per frame. Each segment rotation makes
+// the segment it seals durable. Construction makes the slot's symbol
+// dictionary durable before any frame is published, and each trim makes
+// later additions durable before deleting frames. An OS crash or power loss
+// can lose the end of the active segment, but not the sealed segments
+// before it; see the README's store-and-forward section for the platform
+// limits.
+//
 // Only available for the QWP sender.
 func WithSfDurability(mode string) LineSenderOption {
 	return func(s *lineSenderConfig) {
@@ -978,7 +1117,11 @@ func WithSfAppendDeadline(d time.Duration) LineSenderOption {
 // store-and-forward slots left behind by a crashed or superseded
 // sender sharing the same sf_dir group root. Defaults to disabled.
 // Requires sf_dir to be set. Equivalent to the connect-string
-// drain_orphans key.
+// drain_orphans key. Accepted background work, including slots queued behind
+// the concurrency cap, outlives the constructor's context. Close stops it.
+// Drainers resolve server rejections through this sender's error policy
+// (see WithErrorPolicy). A TERMINAL result leaves a .failed file in the
+// slot, and later scans skip that slot.
 //
 // Only available for the QWP sender.
 func WithDrainOrphans(enabled bool) LineSenderOption {
@@ -1233,7 +1376,7 @@ func LineSenderFromEnv(ctx context.Context) (LineSender, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newLineSender(ctx, c)
+	return newStandaloneLineSender(ctx, c)
 }
 
 // LineSenderFromConf creates a LineSender using the QuestDB config string format.
@@ -1297,7 +1440,7 @@ func LineSenderFromConf(ctx context.Context, conf string) (LineSender, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newLineSender(ctx, c)
+	return newStandaloneLineSender(ctx, c)
 }
 
 // NewLineSender creates new InfluxDB Line Protocol (ILP) sender. Each
@@ -1330,7 +1473,7 @@ func NewLineSender(ctx context.Context, opts ...LineSenderOption) (LineSender, e
 	for _, opt := range opts {
 		opt(conf)
 	}
-	return newLineSender(ctx, conf)
+	return newStandaloneLineSender(ctx, conf)
 }
 
 func newLineSenderConfig(t senderType) *lineSenderConfig {
@@ -1376,6 +1519,14 @@ func newLineSenderConfig(t senderType) *lineSenderConfig {
 			fileNameLimit:     defaultFileNameLimit,
 		}
 	}
+}
+
+func newStandaloneLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
+	sender, err := newLineSender(ctx, conf)
+	if conf.senderType == qwpSenderType {
+		err = qwpExposeStandaloneBuildCleanup(err, conf.sfDir != "")
+	}
+	return sender, err
 }
 
 func newLineSender(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
@@ -1703,6 +1854,7 @@ func rejectQwpOnlyOptions(conf *lineSenderConfig) error {
 
 func newQwpLineSenderFromConf(ctx context.Context, conf *lineSenderConfig) (LineSender, error) {
 	opts := qwpTransportOpts{
+		logger:                conf.logger,
 		tlsInsecureSkipVerify: conf.tlsMode == tlsInsecureSkipVerify,
 		endpointPath:          qwpWritePath,
 		authTimeoutMs:         conf.authTimeoutMs,

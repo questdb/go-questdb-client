@@ -1,3 +1,5 @@
+//go:build unix && !linux && !darwin
+
 /*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
@@ -22,23 +24,21 @@
  *
  ******************************************************************************/
 
-//go:build unix && !linux && !darwin
-
 package questdb
 
-import "os"
+import (
+	"fmt"
+	"os"
 
-// qwpSfReserveNewBlocks is a no-op on unix variants without a
-// block-reservation syscall wired into golang.org/x/sys/unix here
-// (BSDs, Solaris, AIX, illumos). qwpSfAllocate's ftruncate step still
-// extends the file to the new logical size, so the call returns
-// success as if the spec's sparse-fallback path were taken — blocks
-// remain sparse, SIGBUS risk per sf-client.md §6 applies. Operators
-// on these targets must size sf_max_segment_bytes conservatively against
-// free space.
-//
-// Add a platform-specific implementation here if QuestDB Go ever
-// supports one of these targets in production.
+	"golang.org/x/sys/unix"
+)
+
+// qwpSfReserveNewBlocks rejects allocation on Unix targets without a native
+// reservation implementation here (BSDs, Solaris, AIX, illumos). Extending a
+// file without reserving blocks would permit unsafe writes through its mapping.
+// Disk-backed SF creation needs a platform-specific reservation implementation;
+// memory-backed senders do not use this function.
 func qwpSfReserveNewBlocks(f *os.File, currentSize, newBytes int64) error {
-	return nil
+	return fmt.Errorf("qwp/sf: block reservation is not implemented on this platform for %s offset=%d len=%d: %w",
+		f.Name(), currentSize, newBytes, unix.EOPNOTSUPP)
 }
