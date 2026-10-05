@@ -490,6 +490,11 @@ Resolution precedence, highest first: `WithErrorPolicyResolver` →
 ws::addr=localhost:9000;on_server_error=retriable;on_schema_error=terminal;
 ```
 
+Background drainers (`drain_orphans=on`) apply the same policy to the slots
+they drain. When a rejection there resolves to `TERMINAL`, the drainer gives
+up on that slot and writes [`.failed`](#quarantined-slots). Drainer
+rejections are logged and are not passed to your error handler.
+
 ### Store-and-forward
 
 QWP supports an opt-in **store-and-forward** (SF) mode: outgoing batches are
@@ -620,11 +625,12 @@ Other files you may find in a slot:
   the producer gets `ErrBackpressureTimeout`. Deleting them frees the space
   within about a second.
 - `.failed`: the reason a background drainer gave up on the slot, for example
-  failed authentication, durable acknowledgements that never arrive, a
-  connection that makes no progress, or a slot that recovery found
-  inconsistent. No drainer adopts that slot again. A local I/O error while
-  opening a slot leaves no `.failed`, so the slot is tried again on the next
-  scan. Quarantined copies also get a `.failed`, when it can be written.
+  failed authentication, a server rejection whose error policy is `TERMINAL`,
+  durable acknowledgements that never arrive, a connection that makes no
+  progress, or a slot that recovery found inconsistent. No drainer adopts that
+  slot again. A local I/O error while opening a slot leaves no `.failed`, so
+  the slot is tried again on the next scan. Quarantined copies also get a
+  `.failed`, when it can be written.
 
 **Sharing an `sf_dir`.** Senders coordinate opening, quarantining and draining
 slots through advisory locks under `<sf_dir>/.slot-locks/`. Share an `sf_dir`

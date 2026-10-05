@@ -1112,6 +1112,92 @@ func TestSfConfDrainOrphansEndToEnd(t *testing.T) {
 	assert.GreaterOrEqual(t, srv.totalFramesReceived.Load(), int64(1))
 }
 
+// TestQwpSfDrainerAppliesSenderErrorPolicy checks that a background drainer
+// resolves a server rejection through its sender's error policy, whether set
+// by the connect string, WithErrorPolicy or WithErrorPolicyResolver. The
+// foreground sender writes no rows, so the first frame the server receives,
+// which it rejects, is the orphan's frame.
+func TestQwpSfDrainerAppliesSenderErrorPolicy(t *testing.T) {
+	fromConf := func(extra string) func(addr, root string) (LineSender, error) {
+		return func(addr, root string) (LineSender, error) {
+			return LineSenderFromConf(context.Background(), "ws::addr="+addr+
+				";sf_dir="+root+";sender_id=foreground;drain_orphans=on;"+extra)
+		}
+	}
+	withOpts := func(opts ...LineSenderOption) func(addr, root string) (LineSender, error) {
+		return func(addr, root string) (LineSender, error) {
+			return NewLineSender(context.Background(), append([]LineSenderOption{
+				WithQwp(), WithAddress(addr), WithSfDir(root),
+				WithSenderId("foreground"), WithDrainOrphans(true),
+			}, opts...)...)
+		}
+	}
+	cases := []struct {
+		name         string
+		rejectStatus QwpStatusCode
+		build        func(addr, root string) (LineSender, error)
+		// wantFailed is the category the .failed file names, or "" when the
+		// drain must complete.
+		wantFailed string
+	}{
+		// The default policy for SCHEMA_MISMATCH is TERMINAL.
+		{"DefaultTerminal", QwpStatusSchemaMismatch, fromConf(""), "SCHEMA_MISMATCH"},
+		{"ConnStringRetriable", QwpStatusSchemaMismatch,
+			fromConf("on_schema_error=retriable;"), ""},
+		{"ResolverRetriable", QwpStatusSchemaMismatch,
+			withOpts(WithErrorPolicyResolver(func(c Category) Policy {
+				if c == CategorySchemaMismatch {
+					return PolicyRetriable
+				}
+				return PolicyAuto
+			})), ""},
+		// The default policy for WRITE_ERROR is RETRIABLE.
+		{"BuilderTerminal", QwpStatusWriteError,
+			withOpts(WithErrorPolicy(CategoryWriteError, PolicyTerminal)), "WRITE_ERROR"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newQwpSfTestServer(t, qwpSfTestServerOpts{
+				rejectStatus:             tc.rejectStatus,
+				rejectFirstFramesOverall: 1,
+			})
+			defer srv.Close()
+			root := t.TempDir()
+			orphanDir := filepath.Join(root, "old-sender")
+			require.NoError(t, os.MkdirAll(orphanDir, 0o755))
+			qwpSfTestWriteOneFrameOrphan(t, orphanDir, 4096)
+
+			ls, err := tc.build(addrOf(srv), root)
+			require.NoError(t, err)
+			// Runs before srv.Close. On the success path it is a second
+			// Close, and its errDoubleSenderClose is ignored.
+			defer func() { _ = ls.Close(context.Background()) }()
+			// The constructor submits the drainer before it returns, so an
+			// empty active list means the drain has finished.
+			pool := ls.(*qwpLineSender).drainerPool
+			require.NotNil(t, pool)
+			require.Eventually(t, func() bool { return pool.activeCount() == 0 },
+				qwpTestWaitTimeout, 10*time.Millisecond)
+
+			failedPath := filepath.Join(orphanDir, qwpSfFailedSentinelName)
+			if tc.wantFailed == "" {
+				// The rejected frame, then its replay.
+				require.EqualValues(t, 2, srv.totalFramesReceived.Load())
+				require.NoFileExists(t, failedPath)
+				require.NoError(t, ls.Close(context.Background()))
+				return
+			}
+			require.EqualValues(t, 1, srv.totalFramesReceived.Load())
+			body, err := os.ReadFile(failedPath)
+			require.NoError(t, err)
+			require.Contains(t, string(body), tc.wantFailed)
+			require.Contains(t, string(body), "policy=TERMINAL")
+			// The deferred Close reports the drainer's failure, so its
+			// error is not checked.
+		})
+	}
+}
+
 // Regression: a server that completes the WS upgrade and accepts our
 // frames but never ACKs and never drops the connection must not wedge
 // the drainer forever. Without a no-progress watchdog the drain loop

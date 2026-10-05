@@ -34,11 +34,12 @@ import (
 )
 
 // qwpSfFailedSentinelName is the per-slot file that disqualifies a
-// slot from auto-drain. Drainers drop it on genuine terminals only —
-// auth failure, durable-ack settle-budget exhaustion, corrupt
-// recovery, a wedged no-progress connection — then human-in-the-loop.
-// Transport outages and all-replica windows never drop it (Invariant
-// B: they are retried indefinitely).
+// slot from auto-drain. Drainers drop it only on terminal failures, for
+// example an auth failure, a server rejection whose error policy is
+// TERMINAL, durable-ack settle-budget exhaustion, corrupt recovery, or
+// a connection that makes no progress. An operator then decides what to
+// do with the slot. Transport outages and all-replica windows never
+// drop it (Invariant B: they are retried indefinitely).
 const qwpSfFailedSentinelName = ".failed"
 
 // qwpSfErrSlotNotAdoptable reports that a slot an earlier scan listed is not

@@ -160,9 +160,10 @@ var qwpSfDrainerPoolHardCloseGrace = qwpSfSwappable(1 * time.Second)
 //     publishedFsn taken at startup.
 //  4. Close everything in reverse order; release the lock.
 //
-// On terminal failure (auth-rejection, durable-ack settle-budget
-// exhaustion, recovery error, a wedged no-progress connection), the
-// drainer drops a .failed sentinel into the slot before exiting.
+// On terminal failure, for example an auth rejection, a server rejection
+// whose error policy is TERMINAL, durable-ack settle-budget exhaustion, a
+// recovery error, or a connection that makes no progress, the drainer
+// drops a .failed sentinel into the slot before exiting.
 // Future scans skip the slot until an operator clears the sentinel.
 // Transport outages and all-replica failover windows are NOT terminal:
 // the drainer retries them indefinitely with capped backoff
@@ -189,6 +190,10 @@ type qwpSfOrphanDrainer struct {
 	maxFrameRejections      int           // poison-frame threshold; 0 -> default
 	logger                  *slog.Logger  // nil -> slog.Default() via qwpEffectiveLogger
 	listener                QwpBackgroundDrainerListener
+	// policyResolver maps a server rejection to a policy. The sender that
+	// starts the drainer passes its own, so a drain applies the user's error
+	// policy. nil -> spec defaults.
+	policyResolver          *qwpSfPolicyResolver
 	mismatchAttempts        atomic.Int64
 	roleRejectRounds        atomic.Int64
 	lastReplicaWarnUnixNano atomic.Int64
@@ -566,6 +571,7 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 	// transient (not terminal): the drainer retries, since its data is pinned.
 	loop.sendLoopSetDurableAck(d.durableAckMode, d.durableKeepalive, false)
 	loop.sendLoopSetMaxFrameRejections(d.maxFrameRejections)
+	loop.sendLoopSetPolicyResolver(d.policyResolver)
 	loop.sendLoopSetOnRoundExhausted(d.onRoundExhausted)
 	loop.sendLoopSetConnectionListener(silentSenderConnectionListener, 0)
 	// Share the foreground tracker; the loop carries its OWN
@@ -634,9 +640,10 @@ func (d *qwpSfOrphanDrainer) drainerRun(ctx context.Context) {
 			d.recordDurableGiveUp()
 			return
 		}
-		// The running loop latches only genuine terminals (auth, a
-		// poisoned frame, corrupt segment, durable-ack mismatch) —
-		// transport outages reconnect indefinitely and never reach here.
+		// The running loop records only terminal errors, such as an auth
+		// failure, a server rejection whose error policy is TERMINAL, a
+		// poisoned frame or a corrupt segment. Transport outages
+		// reconnect indefinitely and never reach here.
 		if err := loop.sendLoopCheckError(); err != nil {
 			d.recordFailure("wire: " + err.Error())
 			return

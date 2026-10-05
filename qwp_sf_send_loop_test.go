@@ -110,6 +110,13 @@ type qwpSfTestServerOpts struct {
 	// normally. Used to model "server transient close → reconnect
 	// succeeds → next batch hits a rejection".
 	rejectFromConn int
+	// rejectFirstFramesOverall > 0, in combination with rejectStatus,
+	// rejects the first N frames the server receives, counted across all
+	// connections, and OK-acks every later frame. When set, it overrides
+	// rejectFirstNFrames and rejectFromConn. Used when the client under test
+	// does not own connection 1, such as a drainer that dials after its
+	// foreground sender.
+	rejectFirstFramesOverall int
 	// recordFrames → capture every frame's payload bytes, keyed by
 	// the connection that received it, into qwpSfTestServer. Lets a
 	// test reconstruct exactly which rows reached the server on each
@@ -252,7 +259,7 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 			if err != nil {
 				return
 			}
-			s.totalFramesReceived.Add(1)
+			frameNo := s.totalFramesReceived.Add(1)
 			localFramesReceived++
 			if opts.recordFrames {
 				// Record BEFORE the closeAfterFrames drop below: a
@@ -337,6 +344,9 @@ func qwpSfTestServerHandler(t *testing.T, s *qwpSfTestServer, opts qwpSfTestServ
 					} else if opts.rejectFirstNFrames == 0 {
 						rejectThisFrame = false
 					}
+				}
+				if opts.rejectFirstFramesOverall > 0 {
+					rejectThisFrame = frameNo <= int64(opts.rejectFirstFramesOverall)
 				}
 				if rejectThisFrame {
 					_ = conn.Write(context.Background(), websocket.MessageBinary,

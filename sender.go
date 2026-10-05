@@ -732,6 +732,10 @@ func WithErrorPolicy(c Category, p Policy) LineSenderOption {
 // CategoryProtocolViolation (forced TERMINAL) and CategoryUnknown
 // (forced RETRIABLE, fail open) bypass the resolver entirely.
 //
+// The resolver runs on the sender's I/O goroutine and, with drain_orphans
+// enabled, on each background drainer's I/O goroutine, so calls can
+// overlap. It must be safe for concurrent use.
+//
 // Only available for the QWP sender.
 func WithErrorPolicyResolver(r func(Category) Policy) LineSenderOption {
 	return func(s *lineSenderConfig) {
@@ -1115,6 +1119,9 @@ func WithSfAppendDeadline(d time.Duration) LineSenderOption {
 // Requires sf_dir to be set. Equivalent to the connect-string
 // drain_orphans key. Accepted background work, including slots queued behind
 // the concurrency cap, outlives the constructor's context. Close stops it.
+// Drainers resolve server rejections through this sender's error policy
+// (see WithErrorPolicy). A TERMINAL result leaves a .failed file in the
+// slot, and later scans skip that slot.
 //
 // Only available for the QWP sender.
 func WithDrainOrphans(enabled bool) LineSenderOption {

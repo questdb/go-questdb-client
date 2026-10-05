@@ -522,11 +522,14 @@ func newQwpCursorLineSenderFromConf(ctx context.Context, conf *lineSenderConfig,
 					tracker,
 					reconnectMaxDuration, reconnectInitialBackoff, reconnectMaxBackoff,
 				)
-				// Set before submit (which starts the goroutine): a durable-ack
-				// sender's drainers must also trim only on STATUS_DURABLE_ACK.
+				// Set before submit (which starts the goroutine). A durable-ack
+				// sender's drainers must also trim only on STATUS_DURABLE_ACK,
+				// and every drainer resolves server rejections through this
+				// sender's error policy.
 				drainer.durableAckMode = conf.requestDurableAck
 				drainer.durableKeepalive = durableKeepalive
 				drainer.maxFrameRejections = conf.maxFrameRejections
+				drainer.policyResolver = resolver
 				drainer.logger = loop.logger
 				drainer.listener = conf.backgroundDrainerListener
 				if err := pool.drainerPoolSubmit(ctx, drainer); err != nil {
