@@ -319,10 +319,20 @@ type LineSender interface {
 	// server acknowledgements. Stop using the handle once Close starts. If
 	// completed rows cannot be queued because the buffer stayed full
 	// ([ErrBackpressureTimeout]) or local storage refused them
-	// ([ErrSfDurability]), Close drops those rows and returns the error; the
-	// sender stays in the pool and still delivers rows queued before. To keep
-	// rows through backpressure, call Flush again before Close. If the sender
-	// must be removed, the pool closes it in the background.
+	// ([ErrSfDurability]), Close drops those rows and returns the error, which
+	// reports how many as unqueuedRows=N. When a batch too large for one frame
+	// was split per table, some tables may already be queued; the count covers
+	// only the rows that were not. The sender stays in the pool and still
+	// delivers rows queued before. Until a later lease on it queues rows, the
+	// pool lends it only when no sender with a successful return is free and
+	// the pool cannot add one: it is at its maximum, the borrow has run out of
+	// time or its context has ended, or a recent attempt to add a sender failed
+	// or timed out. Meanwhile the pool may grow to its maximum, each sender
+	// holding up to sf_max_total_bytes of rows. If the pool is shutting down,
+	// it closes the sender instead, and the dropped rows are not retried.
+	// Calling Flush again before Close keeps the rows only if the condition
+	// clears within the append timeout. If the sender must be removed, the
+	// pool closes it in the background.
 	// Close reports errors from queueing rows or returning the sender; later
 	// cleanup errors are logged and included in [QuestDB.Close]'s result.
 	// Returning a sender does not prove its connection or file lock is released.

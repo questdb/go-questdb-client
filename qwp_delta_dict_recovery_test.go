@@ -154,7 +154,7 @@ func TestQwpPersistFailureKeepsDeltaAndTruncatesTheFailedWrite(t *testing.T) {
 	restore := qwpTestFailSymbolDictWrites(t)
 	err = s.persistNewSymbols()
 	require.ErrorIs(t, err, ErrSfDurability)
-	require.ErrorContains(t, err, "retry the flush")
+	require.ErrorContains(t, err, "persist symbol dictionary")
 	require.Equal(t, 0, d.size(), "failed write must not advance the durable id count")
 	require.Greater(t, d.untrustedEnd, d.appendOffset,
 		"the attempted range must be marked as untrusted tail")

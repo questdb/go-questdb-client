@@ -38,6 +38,36 @@ others. Its memory and the cost of `Error()` therefore stay the same over the
 pool's lifetime, however many senders fail. Each sender logs its own close
 error when it closes. The errors in between are not in `Close`'s result.
 
+## Senders whose pooled return failed
+
+A borrowed sender whose return could not queue its rows (backpressure or a
+local storage failure) stays in the pool, marked degraded, because its ring
+can hold earlier borrowers' rows. The pool lends it only when no healthy
+sender is free and the pool cannot grow, and clears the mark only when a lease
+on it queues rows. Acknowledgements do not clear it: they say nothing about
+local storage, and a sender whose rotation or `.symbol-dict` append fails keeps
+getting its backlog acknowledged.
+
+### A faulty slot index is reused
+
+A persistent fault confined to one slot directory still costs a failed lease
+after the sender is recycled. The pool lends the faulty slot's sender last.
+Once the reaper closes it (above `min`, no unacknowledged rows), the next growth
+can take the same index, opens the same directory, and fails one lease before
+the new sender is marked. The pool does not steer growth away from the index:
+in-range slots are excluded from orphan adoption, so reusing the index is the
+only runtime path that replays frames left in the slot.
+
+### A degraded sender at `min` can stay marked
+
+Under serial traffic, a degraded sender in a pool at `min` (for example
+`min == max`) can stay idle and marked indefinitely. The pool lends it only
+when a borrow finds no healthy sender and the pool cannot grow (at `max`, the
+borrow out of time or its context ended, or in the growth backoff), and the
+reaper's `min` floor keeps it. This includes a backpressure mark left from an
+outage that has ended. Its send loop still delivers the rows it holds. The
+mark clears only when a lease shows that the sender queues rows again.
+
 ## Store-and-forward storage
 
 ### Disk-block reservation

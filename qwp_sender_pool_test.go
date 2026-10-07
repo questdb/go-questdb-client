@@ -940,7 +940,7 @@ func TestQwpSenderPoolReturnBackpressureDropsLeaseRowsKeepsSender(t *testing.T) 
 	if !errors.Is(err, ErrBackpressureTimeout) {
 		t.Fatalf("Close = %v, want ErrBackpressureTimeout", err)
 	}
-	if want := "droppedRows=" + strconv.Itoa(pending); !strings.Contains(err.Error(), want) {
+	if want := "unqueuedRows=" + strconv.Itoa(pending); !strings.Contains(err.Error(), want) {
 		t.Fatalf("Close = %v, want it to report %s", err, want)
 	}
 	if ps.broken {
@@ -1091,7 +1091,8 @@ func (s *qwpRestartableAckServer) dial() qwpSfReconnectFactory {
 // A memory-mode pool keeps an earlier borrower's rows through an outage even
 // when a later borrower's return hits backpressure. A1's Close returned nil, so
 // its row must reach the server once the server is back, and the row A2 could
-// not queue must not.
+// not queue must not. The outage outlasts the sender's close-flush window, so a
+// pool that closed the sender on A2's return would lose A1's row.
 func TestQwpSenderPoolBackpressuredReturnKeepsEarlierBorrowersRows(t *testing.T) {
 	srv := newQwpRestartableAckServer(t, "ROW_A1", "ROW_A2_DROPPED", "ROW_B")
 	ctx := context.Background()
@@ -1136,8 +1137,16 @@ func TestQwpSenderPoolBackpressuredReturnKeepsEarlierBorrowersRows(t *testing.T)
 	require.True(t, sawBackpressure, "the ring never filled")
 	require.NoError(t, a2.Table("t").StringColumn("m", "ROW_A2_DROPPED").At(ctx, time.Unix(0, 5000)))
 	require.ErrorIs(t, a2.Close(ctx), ErrBackpressureTimeout)
+	// giveBack updates the free list before Close returns, so this check does
+	// not depend on when a background close would run.
+	require.True(t, qwpReturnTestInAvailable(p, slot), "the pool must keep the sender holding A1's row")
 
+	// Keep the server down past the 200 ms close-flush window: a closed sender
+	// would give up on A1's row before the server is back.
+	time.Sleep(time.Second)
 	srv.start(t) // the server is back
+	require.Eventually(t, func() bool { return srv.count("ROW_A1") >= 1 }, qwpTestWaitTimeout, 10*time.Millisecond,
+		"A1's row, whose Close returned nil, was lost")
 	require.Eventually(t, func() bool { return !delegate.hasUnackedRows() }, qwpTestWaitTimeout, 10*time.Millisecond,
 		"the kept sender replays and gets acknowledgements for every queued frame")
 
@@ -2438,7 +2447,7 @@ func TestQwpSenderPoolPoisonSurfacesOnLeaseReturn(t *testing.T) {
 	p.poisonLocked("test", "boom")
 	p.mu.Unlock()
 
-	err := p.giveBack(context.Background(), ps, false)
+	err := p.giveBack(context.Background(), ps, qwpReturnEmpty)
 	require.ErrorIs(t, err, ErrPoolPoisoned)
 	require.Eventually(t, func() bool {
 		p.mu.Lock()

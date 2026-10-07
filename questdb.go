@@ -429,8 +429,14 @@ func validateLazyConnect(kv map[string]string, cfg *questDBConfig) error {
 // BorrowSender borrows an ingest sender from the pool. Stop using the sender
 // before calling its Close method to return it. A healthy connection stays
 // open for reuse; the pool disconnects it when removing it or shutting down.
-// If the pool is full, BorrowSender waits up to the acquire timeout.
-// See [LineSender.Close].
+// If the pool is full, BorrowSender waits up to the acquire timeout. When the
+// only free senders are ones whose return failed, BorrowSender first creates a
+// new sender if the pool is below its maximum, which can take up to the
+// acquire timeout. If creating it fails or times out, or ctx ends first,
+// BorrowSender lends one of those senders if one is still free. After a
+// failure or timeout, the pool does not try to create one again for a short
+// period. A new sender still being created when BorrowSender returns joins the
+// pool if creating it succeeds. See [LineSender.Close].
 func (db *QuestDB) BorrowSender(ctx context.Context) (LineSender, error) {
 	return db.senderPool.borrow(ctx)
 }

@@ -64,8 +64,19 @@ type qwpSenderPool struct {
 	notify  chan struct{}
 	waiters int
 
-	all       []*qwpSenderSlot
+	all []*qwpSenderSlot
+	// available holds the free senders, with every degraded sender below every
+	// healthy one: giveBack inserts a degraded sender at index 0, every other
+	// site appends a healthy sender, and removals keep the order of the rest.
+	// borrow takes from the top, so it reaches a healthy sender first and,
+	// among degraded senders, the one returned longest ago.
 	available []*qwpSenderSlot
+	// degradedGrowthBlockedUntil keeps borrow from building a sender in place
+	// of lending a degraded one until this time. A build past a degraded
+	// sender that fails or outlasts its borrow sets it, so a full or hung disk
+	// costs one such build per backoff period, not one per borrow. Read and
+	// update with mu held.
+	degradedGrowthBlockedUntil time.Time
 
 	minSize, maxSize int
 	acquireTimeout   time.Duration
@@ -204,6 +215,11 @@ func qwpPoolCloseResult(teardownErr, poisonErr error, pending []qwpSfSlotObligat
 // this cap a forgotten lease would hang close() for the whole acquire budget.
 const qwpPoolMaxCloseLeaseWait = 5 * time.Second
 
+// qwpPoolDegradedGrowthBackoff is how long borrow lends degraded senders
+// without trying to build a new one after such a build failed or outlasted its
+// borrow.
+const qwpPoolDegradedGrowthBackoff = 5 * time.Second
+
 // qwpSenderSlot is one reusable pool entry. generation is bumped under the pool
 // lock on every hand-out and every return; a lease carries the value it was
 // issued, so a stale lease (slot already re-borrowed) is detectable.
@@ -217,6 +233,11 @@ type qwpSenderSlot struct {
 	// Read and update with pool.mu held. If a panic leaves the slot in an
 	// unknown state, do not retry its cleanup or reuse it.
 	cleanupFailed bool
+	// degraded is set by a return that could not queue its lease's rows and
+	// cleared by a return whose lease queued rows. The pool lends a degraded
+	// sender only when no healthy one is free and the pool cannot grow. Read
+	// and update with pool.mu held.
+	degraded bool
 }
 
 // qwpMaxPoolSize caps sender_pool_max. A larger value is a misconfiguration: in
@@ -388,12 +409,25 @@ func (p *qwpSenderPool) recoverStrandedSlots(ctx context.Context) {
 // borrow waits up to acquireTimeout, or until ctx ends, if the pool is full.
 // Call Close on the returned sender to give it back. The pool handles resource
 // cleanup when it removes a sender or shuts down.
+//
+// borrow lends the top of the free list. That is a healthy sender whenever one
+// is free. When only degraded senders are free, borrow builds a new sender if
+// the pool has room and time and no recent such build failed or timed out;
+// otherwise it lends the degraded sender returned longest ago. If that build
+// fails, outlasts the acquire timeout, or ctx ends first, borrow lends the
+// degraded sender if it is still free. A build still running when borrow
+// stops waiting continues, and the pool keeps its sender if it succeeds.
 func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 	deadline := time.Now().Add(p.acquireTimeout)
 	for {
 		var lease *qwpPooledSender
 		var discard *qwpSenderSlot
 		var build bool
+		// skippedDegraded means this pass builds a sender in place of lending
+		// the degraded one on top of the free list. It applies to this pass
+		// only: a later pass that builds because the list is empty reports
+		// its build error as usual.
+		var skippedDegraded bool
 		index := -1
 		var ch, failed chan struct{}
 		var waitFor time.Duration
@@ -416,9 +450,12 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 				slot := p.available[n-1]
 				// Keep the slot in the list until its checks and state update
 				// succeed, so a panic cannot make the pool lose the sender.
+				// checking names the slot a panic would leave in an unknown
+				// state; it is cleared before work that does not touch the slot.
+				checking := slot
 				defer func() {
 					if r := recover(); r != nil {
-						p.failSlotsLocked("borrow slot", r, []*qwpSenderSlot{slot})
+						p.failSlotsLocked("borrow slot", r, []*qwpSenderSlot{checking})
 						result = p.poisonedErr
 					}
 				}()
@@ -426,9 +463,17 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 					if p.prepareSlotCloseLocked(slot, qwpSfSlotAvailable) {
 						discard = slot
 					}
+				} else if slot.degraded && p.canGrowPastDegradedLocked(ctx, deadline) {
+					// The degraded sender stays in the free list. A panic in the
+					// growth bookkeeping poisons the pool without marking this
+					// sender's state unknown, so shutdown still closes it.
+					checking = nil
+					index = p.reserveGrowthLocked()
+					build, skippedDegraded = true, true
+					return
 				} else {
 					p.transitionSfSlotLocked(slot.slotIndex, qwpSfSlotAvailable, qwpSfSlotLeased)
-					lease = &qwpPooledSender{pool: p, slot: slot, gen: slot.generation.Add(1)}
+					lease = p.newLeaseLocked(slot)
 				}
 				p.available = p.available[:n-1]
 				return
@@ -442,10 +487,7 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 				return
 			}
 			if p.capUsedLocked() < p.maxSize {
-				if p.storeAndForward {
-					index = p.allocateSlotIndexLocked()
-				}
-				p.inFlightCreations++
+				index = p.reserveGrowthLocked()
 				build = true
 				return
 			}
@@ -474,8 +516,15 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 		if build {
 			// Opening files can take longer than the caller is willing to wait.
 			// Keep track of the new sender even if the caller leaves: pass it to
-			// settleGrowthBuild when it is ready.
-			bctx, cancel := context.WithDeadline(ctx, deadline)
+			// settleGrowthBuild when it is ready. A build past a degraded sender
+			// ignores ctx's cancellation: the caller gets the degraded sender if
+			// it is still free, and the build can still add a sender for later
+			// borrowers.
+			parent := ctx
+			if skippedDegraded {
+				parent = context.WithoutCancel(ctx)
+			}
+			bctx, cancel := context.WithDeadline(parent, deadline)
 			resultCh := make(chan *qwpSenderSlot, 1)
 			errCh := make(chan error, 1)
 			go func() { slot, err := p.createSlotAt(bctx, index, true, nil); resultCh <- slot; errCh <- err }()
@@ -484,14 +533,39 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 			case slot := <-resultCh:
 				timer.Stop()
 				cancel()
-				return p.settleBuiltSlot(slot, index, <-errCh, true)
+				buildErr := <-errCh
+				// settleBuiltSlot reclaims a failed build. It can also report
+				// that the pool closed while a build succeeded; only the build's
+				// own error sends the borrow back to the degraded sender.
+				lease, err := p.settleBuiltSlot(slot, index, buildErr, true)
+				if buildErr == nil || !skippedDegraded {
+					return lease, err
+				}
+				p.logDegradedGrowthFailure(index, buildErr)
+				if err := p.blockDegradedGrowth(); err != nil {
+					return nil, err
+				}
+				continue
 			case <-timer.C:
-				go p.settleGrowthBuild(resultCh, errCh, cancel, index)
-				return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
+				go p.settleGrowthBuild(resultCh, errCh, cancel, index, skippedDegraded)
+				if !skippedDegraded {
+					return nil, fmt.Errorf("%w after %s", errPoolExhausted, p.acquireTimeout)
+				}
+				// Lending does not check the deadline, so the next pass lends
+				// the degraded sender if it is still free.
+				if err := p.blockDegradedGrowth(); err != nil {
+					return nil, err
+				}
+				continue
 			case <-ctx.Done():
 				timer.Stop()
-				go p.settleGrowthBuild(resultCh, errCh, cancel, index)
-				return nil, ctx.Err()
+				go p.settleGrowthBuild(resultCh, errCh, cancel, index, skippedDegraded)
+				if !skippedDegraded {
+					return nil, ctx.Err()
+				}
+				// canGrowPastDegradedLocked refuses once ctx has ended, so the
+				// next pass lends the degraded sender if it is still free.
+				continue
 			}
 		}
 		timer := time.NewTimer(waitFor)
@@ -509,19 +583,82 @@ func (p *qwpSenderPool) borrow(ctx context.Context) (LineSender, error) {
 	}
 }
 
+// canGrowPastDegradedLocked reports whether borrow builds a new sender rather
+// than lend a degraded one: the pool has room, the borrow has time left, and
+// no recent build past a degraded sender failed or outlasted the acquire
+// timeout. The caller must hold mu.
+func (p *qwpSenderPool) canGrowPastDegradedLocked(ctx context.Context, deadline time.Time) bool {
+	return p.capUsedLocked() < p.maxSize &&
+		time.Until(deadline) > 0 && ctx.Err() == nil &&
+		!time.Now().Before(p.degradedGrowthBlockedUntil)
+}
+
+// reserveGrowthLocked counts a sender borrow is about to build and, in SF mode,
+// reserves its slot index. The caller must hold mu.
+func (p *qwpSenderPool) reserveGrowthLocked() int {
+	index := -1
+	if p.storeAndForward {
+		index = p.allocateSlotIndexLocked()
+	}
+	p.inFlightCreations++
+	return index
+}
+
+// newLeaseLocked hands slot to a borrower. It records the delegate's published
+// FSN so the return can tell whether the lease queued rows. The caller must
+// hold mu.
+func (p *qwpSenderPool) newLeaseLocked(slot *qwpSenderSlot) *qwpPooledSender {
+	ps := &qwpPooledSender{pool: p, slot: slot, gen: slot.generation.Add(1)}
+	if r, ok := slot.delegate.(publishedFsnReporter); ok {
+		ps.publishedAtLend = r.publishedFsn()
+	}
+	return ps
+}
+
+// logDegradedGrowthFailure reports a failed build past a degraded sender. No
+// caller receives this error. When the build preserved a refused slot, the log
+// is the only record of where it went, so it is an Error, as in
+// settleGrowthBuild.
+func (p *qwpSenderPool) logDegradedGrowthFailure(slotIndex int, err error) {
+	logger := qwpEffectiveLogger(p.logger)
+	if len(qwpSfQuarantineDestinations(err)) > 0 {
+		logger.Error("qwp/sf: sender pool growth build failed after preserving a refused slot",
+			"slot_index", slotIndex, "error", err)
+		return
+	}
+	logger.Warn("qwp pool: could not add a sender past one whose return failed",
+		"slot_index", slotIndex, "error", err)
+}
+
+// blockDegradedGrowth starts the backoff during which borrow lends degraded
+// senders without building a new one.
+func (p *qwpSenderPool) blockDegradedGrowth() error {
+	return p.withLock("block growth past degraded senders", nil, func() {
+		p.degradedGrowthBlockedUntil = time.Now().Add(qwpPoolDegradedGrowthBackoff)
+	})
+}
+
 // settleGrowthBuild handles a sender that was still being created when its
 // borrower stopped waiting. The pool keeps counting that work until creation
 // finishes. settleBuiltSlot then saves the sender for another borrower or
 // arranges cleanup; failed cleanup keeps its slot reserved. This runs in a
 // separate goroutine so slow file operations do not hold up the borrower.
-func (p *qwpSenderPool) settleGrowthBuild(resultCh <-chan *qwpSenderSlot, errCh <-chan error, cancel context.CancelFunc, slotIndex int) {
+// pastDegraded marks a build that borrow started in place of lending a
+// degraded sender. When such a build fails, the failure is logged and starts
+// the growth backoff, as when its borrower sees the failure.
+func (p *qwpSenderPool) settleGrowthBuild(resultCh <-chan *qwpSenderSlot, errCh <-chan error, cancel context.CancelFunc, slotIndex int, pastDegraded bool) {
 	slot := <-resultCh
 	err := <-errCh
 	cancel()
-	// No caller receives this error. When it names a preserved slot, the log
-	// is the only report left: a rename whose directory barrier then failed
-	// has no other record.
-	if len(qwpSfQuarantineDestinations(err)) > 0 {
+	switch {
+	case pastDegraded && err != nil:
+		p.logDegradedGrowthFailure(slotIndex, err)
+		// Start the backoff before settleBuiltSlot wakes waiting borrowers.
+		_ = p.blockDegradedGrowth()
+	case len(qwpSfQuarantineDestinations(err)) > 0:
+		// No caller receives this error. When it names a preserved slot, the
+		// log is the only report left: a rename whose directory barrier then
+		// failed has no other record.
 		qwpEffectiveLogger(p.logger).Error("qwp/sf: sender pool growth build failed after preserving a refused slot",
 			"slot_index", slotIndex, "error", err)
 	}
@@ -557,7 +694,7 @@ func (p *qwpSenderPool) settleBuiltSlot(slot *qwpSenderSlot, index int, buildErr
 		}
 		if borrow {
 			p.transitionSfSlotLocked(index, qwpSfSlotCreating, qwpSfSlotLeased)
-			lease = &qwpPooledSender{pool: p, slot: slot, gen: slot.generation.Add(1)}
+			lease = p.newLeaseLocked(slot)
 		} else {
 			p.transitionSfSlotLocked(index, qwpSfSlotCreating, qwpSfSlotAvailable)
 			slot.idleSince = time.Now()
@@ -577,11 +714,23 @@ func (p *qwpSenderPool) settleBuiltSlot(slot *qwpSenderSlot, index int, buildErr
 	return lease, result
 }
 
-// giveBack accepts a borrowed sender only once. A healthy sender can be reused;
-// a failed sender or one returned after shutdown is closed in the background.
-// If a panic left a slot's state unknown, keep it reserved without trying to
-// repair it.
-func (p *qwpSenderPool) giveBack(_ context.Context, ps *qwpPooledSender, broken bool) error {
+// qwpReturnOutcome is what a lease did with its sender, as giveBack needs it.
+type qwpReturnOutcome int
+
+const (
+	qwpReturnEmpty   qwpReturnOutcome = iota // queued and dropped nothing
+	qwpReturnQueued                          // queued rows
+	qwpReturnDropped                         // could not queue its rows; they were dropped
+	qwpReturnBroken                          // the sender cannot serve another borrower
+)
+
+// giveBack accepts a borrowed sender only once. A broken sender, or one
+// returned after shutdown, is closed in the background. Any other sender goes
+// back to the free list: a Dropped outcome marks it degraded and a Queued one
+// clears the mark. A degraded sender goes to the bottom of the list and a
+// healthy one to the top, so borrow lends healthy senders first. If a panic
+// left a slot's state unknown, keep it reserved without trying to repair it.
+func (p *qwpSenderPool) giveBack(_ context.Context, ps *qwpPooledSender, outcome qwpReturnOutcome) error {
 	var closeSlot bool
 	var result error
 	err := p.withLock("return sender", []*qwpSenderSlot{ps.slot}, func() {
@@ -593,12 +742,24 @@ func (p *qwpSenderPool) giveBack(_ context.Context, ps *qwpPooledSender, broken 
 		if ps.slot.cleanupFailed {
 			return
 		}
-		if p.closed || p.closing.Load() || p.poisonedErr != nil || broken {
+		if p.closed || p.closing.Load() || p.poisonedErr != nil || outcome == qwpReturnBroken {
 			closeSlot = p.prepareSlotCloseLocked(ps.slot, qwpSfSlotLeased)
 		} else {
+			// Change the list only after the state transition, so a panic there
+			// leaves the list as it was.
 			p.transitionSfSlotLocked(ps.slot.slotIndex, qwpSfSlotLeased, qwpSfSlotAvailable)
 			ps.slot.idleSince = time.Now()
-			p.available = append(p.available, ps.slot)
+			switch outcome {
+			case qwpReturnDropped:
+				ps.slot.degraded = true
+			case qwpReturnQueued:
+				ps.slot.degraded = false
+			}
+			if ps.slot.degraded {
+				p.available = slices.Insert(p.available, 0, ps.slot)
+			} else {
+				p.available = append(p.available, ps.slot)
+			}
 		}
 		p.broadcastLocked()
 	})
@@ -630,18 +791,28 @@ type unackedReporter interface {
 	hasUnackedRows() bool
 }
 
+// publishedFsnReporter reports the highest FSN the delegate's engine has
+// published. The pool reads it when it lends a sender and when the sender
+// comes back; a higher value at return means the lease queued rows. Every
+// pooled delegate is a *qwpLineSender, which implements it.
+type publishedFsnReporter interface {
+	publishedFsn() int64
+}
+
+var _ publishedFsnReporter = (*qwpLineSender)(nil)
+
 // returnFlusher lets the pool flush a delegate for return without growing the
 // public QwpSender interface: it drops the in-progress (un-At'd) row, flushes
 // committed rows, and surfaces (without discarding those rows) a latched
 // fluent-API error — the correct lease-return path, distinct from Flush.
 // The returned retained bool reports whether committed rows were left
 // un-enqueued (a backpressure deadline, a storage failure or a closed engine,
-// not a terminal HALT). discardPending drops those rows, so a sender that is
-// otherwise healthy can go back to the pool without handing one borrower's rows
-// to the next. Every pooled delegate is a *qwpLineSender, which implements it.
+// not a terminal HALT). discardPending drops those rows, so the sender can go
+// back to the pool, marked degraded, without handing one borrower's rows to
+// the next. Every pooled delegate is a *qwpLineSender, which implements it.
 type returnFlusher interface {
 	flushForReturn(ctx context.Context) (retained bool, err error)
-	discardPending() (droppedRows int)
+	discardPending() (unqueuedRows int)
 }
 
 // A sender that stops implementing returnFlusher would make lease returns fall
@@ -1488,6 +1659,10 @@ type qwpPooledSender struct {
 	slot   *qwpSenderSlot
 	gen    uint64
 	broken bool
+	// publishedAtLend is the delegate's published FSN when the lease was
+	// created; Close compares it with the FSN at return to learn whether the
+	// lease queued rows.
+	publishedAtLend int64
 }
 
 // A borrowed lease must expose the full QWP surface so callers can type-assert it
@@ -1919,17 +2094,24 @@ func (ps *qwpPooledSender) BackgroundDrainers() []QwpBackgroundDrainer {
 //
 // When completed rows cannot be queued because the buffer stayed full for the
 // append timeout (ErrBackpressureTimeout) or local storage refused them
-// (ErrSfDurability), Close drops those rows, returns that error with the number
-// of rows dropped, and keeps the sender in the pool. The sender still holds the
-// rows earlier borrowers queued and delivers them once the server is reachable.
-// To keep rows through backpressure, call Flush again before Close. Any other
-// failure to queue rows, and a terminal sender error, remove the sender instead
-// of reusing it. Calls after return do nothing.
+// (ErrSfDurability), Close drops those rows and returns that error with the
+// number of rows dropped ([unqueuedRows=N]). When an over-cap batch was split
+// per table, some tables may already be queued; the count covers only the rows
+// that were not. The sender stays in the pool, because it still holds the rows
+// earlier borrowers queued and delivers them once the server is reachable. It
+// is marked degraded: until a lease on it queues rows, the pool lends it only
+// when no healthy sender is free and the pool cannot add one. If the pool is
+// closing, the sender is closed instead and the dropped rows are not retried.
+// Calling Flush again before Close keeps the rows only if the condition clears
+// within the append timeout. Any other failure to queue rows, and a terminal
+// sender error, remove the sender instead of reusing it. Calls after return do
+// nothing.
 func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 	if !ps.live() {
 		return nil
 	}
 	var flushErr error
+	var dropped bool
 	ctx1 := context.Background()
 	// A panic can leave the row buffers partly changed. Keep the sender rather
 	// than call Close and risk flushing those rows again.
@@ -1963,13 +2145,17 @@ func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 				if (errors.Is(flushErr, ErrBackpressureTimeout) || errors.Is(flushErr, ErrSfDurability)) &&
 					!errors.Is(flushErr, ErrCleanupFailed) {
 					// The ring stayed full for the append deadline (an outage)
-					// or local storage refused the write. The sender is healthy,
-					// and its ring still holds rows earlier borrowers queued,
-					// which it delivers once the server is reachable. Closing it
-					// would lose those rows, so it stays in the pool and only
-					// this borrower's un-queued rows are dropped. The error tells
-					// the borrower they were not queued.
-					flushErr = fmt.Errorf("%w [droppedRows=%d]", flushErr, fr.discardPending())
+					// or local storage refused the write. The ring can still
+					// hold rows earlier borrowers queued, which the sender
+					// delivers once the server is reachable; closing it would
+					// lose them. So the sender stays in the pool, marked
+					// degraded, and only this borrower's unqueued rows are
+					// dropped. The error and a log record report them.
+					unqueued := fr.discardPending()
+					flushErr = fmt.Errorf("%w [unqueuedRows=%d]", flushErr, unqueued)
+					dropped = true
+					qwpEffectiveLogger(ps.pool.logger).Warn("qwp pool: dropped rows a returned lease could not queue",
+						"slot_index", ps.slot.slotIndex, "rows", unqueued, "error", flushErr)
 				} else {
 					// The engine is closed or has stopped working; the sender
 					// cannot serve another borrower.
@@ -1987,6 +2173,24 @@ func (ps *qwpPooledSender) Close(_ context.Context) (retErr error) {
 			ps.markBrokenIfTerminal()
 		}
 	}
-	poolErr := ps.pool.giveBack(ctx1, ps, ps.broken)
+	poolErr := ps.pool.giveBack(ctx1, ps, ps.returnOutcome(dropped))
 	return errors.Join(flushErr, poolErr)
+}
+
+// returnOutcome classifies the lease for giveBack. Call it after
+// markBrokenIfTerminal, which can still mark the sender broken. A lease queued
+// rows when the delegate's published FSN moved past its value at lend time,
+// through Close or an earlier Flush; a delegate that cannot report its FSN
+// counts as having queued rows.
+func (ps *qwpPooledSender) returnOutcome(dropped bool) qwpReturnOutcome {
+	switch {
+	case ps.broken:
+		return qwpReturnBroken
+	case dropped:
+		return qwpReturnDropped
+	}
+	if r, ok := ps.slot.delegate.(publishedFsnReporter); ok && r.publishedFsn() <= ps.publishedAtLend {
+		return qwpReturnEmpty
+	}
+	return qwpReturnQueued
 }

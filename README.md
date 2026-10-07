@@ -150,6 +150,11 @@ Calling `Close` on a borrowed sender or query session returns it to the pool.
 A healthy connection stays open for reuse. The pool disconnects it when removing
 it or shutting down.
 
+A sender whose return could not queue its rows stays in the pool but is lent
+last, so during an outage serial traffic can grow the ingest pool to
+`sender_pool_max` senders, each holding up to `sf_max_total_bytes` of rows
+(128 MiB in memory mode by default, 10 GiB on disk).
+
 Pool sizing and behavior are tunable through options (an explicit option wins
 over the matching connect-string key) or the equivalent connect-string keys:
 
@@ -215,7 +220,7 @@ with store-and-forward, queued rows are replayed after a restart.
 | [`QuestDB.Close(ctx)`](questdb.go) | Shuts down both pools, including background drainers. Nil means every resource is released. Calling it again, or concurrently, waits for the same shutdown; a later call with a fresh context checks progress. |
 | [`QwpQueryClient.Close(ctx)`](qwp_query_client.go) | The same rules, for a standalone query client. |
 | Standalone QWP `LineSender.Close(ctx)` | Call once; a second call returns a double-close error. A nil result can leave cleanup running in the background. Before reopening a disk-backed sender's slot, check [`SlotLockReleased`](qwp_sender.go). |
-| Borrowed sender `Close(ctx)` | Returns the sender to its pool. It queues rows using the append timeout instead of `ctx` and does not wait for acknowledgements. If completed rows can't be queued (`ErrBackpressureTimeout` or `ErrSfDurability`), Close drops them and returns the error; to keep them, call `Flush` again before Close. |
+| Borrowed sender `Close(ctx)` | Returns the sender to its pool. It queues rows using the append timeout instead of `ctx` and does not wait for acknowledgements. If completed rows can't be queued (`ErrBackpressureTimeout` or `ErrSfDurability`), Close drops them and returns the error, which reports `unqueuedRows=N`. The pool keeps the sender but lends it only when no sender with a successful return is free and the pool can't add one; while the pool is shutting down, it closes the sender instead. Calling `Flush` again before Close keeps the rows only if the condition clears within the append timeout. |
 | Borrowed query session `Close()` | Finishes reading an open response, for up to `query_close_timeout_ms`, and returns the session. |
 
 Cleanup errors that happen after a handle is returned are logged and reported by

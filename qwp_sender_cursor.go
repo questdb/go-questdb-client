@@ -635,7 +635,7 @@ func (s *qwpLineSender) persistNewSymbols() error {
 		// and a later flush retries them as the same delta. The failed write
 		// is untrusted tail, which the retry's append truncates first.
 		if errors.Is(err, ErrSfDurability) {
-			return qwpSfDurabilityError("persist symbol dictionary; retry the flush",
+			return qwpSfDurabilityError("persist symbol dictionary",
 				s.persistedSymbolDict.path, err)
 		}
 		return qwpSfSymbolDictLimitInconsistency(err)
@@ -1368,6 +1368,13 @@ func (s *qwpLineSender) AckedFsn() int64 {
 // through a transient outage instead of reaping (and destroying) its in-RAM rows.
 func (s *qwpLineSender) hasUnackedRows() bool {
 	return s.cursorEngine.enginePublishedFsn() > s.cursorEngine.engineAckedFsn()
+}
+
+// publishedFsn returns the highest FSN the engine has published. The pool
+// reads it when it lends the sender and when the sender comes back, to learn
+// whether the lease queued rows. It is one atomic load.
+func (s *qwpLineSender) publishedFsn() int64 {
+	return s.cursorEngine.enginePublishedFsn()
 }
 
 // AwaitAckedFsn implements QwpSender.AwaitAckedFsn. This is the
