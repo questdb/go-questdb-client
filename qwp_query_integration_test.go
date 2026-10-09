@@ -25,9 +25,11 @@
 package questdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 )
@@ -690,5 +692,69 @@ func TestQwpIntegrationQueryWithBinds(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestQwpIntegrationIpv4AndBinary verifies ingress against the server and
+// reads back opaque bytes, empty values and NULLs through QWP egress.
+func TestQwpIntegrationIpv4AndBinary(t *testing.T) {
+	qwpEnsureServer(t)
+	const table = "qwp_integ_ipv4_binary"
+	qwpDropTable(t, table)
+	defer qwpDropTable(t, table)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	s, err := newQwpLineSender(ctx, "ws://"+qwpTestAddr, qwpTransportOpts{endpointPath: qwpWritePath}, 0, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(ctx)
+	var qs QwpSender = s
+	ips := []net.IP{net.IP{192, 0, 2, 1}, net.ParseIP("198.51.100.2"), nil}
+	payloads := [][]byte{{0, 255, 128}, {}, nil}
+	for i := range ips {
+		qs.Table(table).Int64Column("i", int64(i))
+		qs.Ipv4Column("ip", ips[i]).BinaryColumn("bin", payloads[i])
+		if err := qs.AtNow(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flushAndAwaitAck(t, s)
+	qwpWaitForRows(t, table, len(ips))
+	c := newTestQueryClient(t)
+	defer c.Close(ctx)
+	q := c.Query(ctx, "SELECT i, ip, bin FROM '"+table+"' ORDER BY i")
+	defer q.Close()
+	seen := 0
+	for batch, err := range q.Batches() {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if batch.ColumnType(1) != QwpTypeIPv4 || batch.ColumnType(2) != QwpTypeBinary {
+			t.Fatal("unexpected column types")
+		}
+		for row := 0; row < batch.RowCount(); row++ {
+			i := batch.Int64(0, row)
+			if i != int64(seen) || seen >= len(ips) {
+				t.Fatalf("unexpected row %d", i)
+			}
+			wantNull := i == 2
+			if batch.IsNull(1, row) != wantNull || batch.IsNull(2, row) != wantNull {
+				t.Fatalf("row %d null flags differ", i)
+			}
+			if !wantNull {
+				expectedIP := []uint32{0xc0000201, 0xc6336402}[i]
+				if uint32(batch.Int32(1, row)) != expectedIP {
+					t.Fatalf("row %d IPv4 mismatch", i)
+				}
+				if !bytes.Equal(batch.Binary(2, row), payloads[i]) {
+					t.Fatalf("row %d BINARY mismatch", i)
+				}
+			}
+			seen++
+		}
+	}
+	if seen != len(ips) {
+		t.Fatalf("read %d rows, want %d", seen, len(ips))
 	}
 }

@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1141,6 +1142,20 @@ func (ps *qwpPooledSender) ShortColumn(name string, val int16) QwpSender {
 func (ps *qwpPooledSender) Int32Column(name string, val int32) QwpSender {
 	if ps.live() {
 		ps.slot.delegate.Int32Column(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) Ipv4Column(name string, val net.IP) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.Ipv4Column(name, val)
+	}
+	return ps
+}
+
+func (ps *qwpPooledSender) BinaryColumn(name string, val []byte) QwpSender {
+	if ps.live() {
+		ps.slot.delegate.BinaryColumn(name, val)
 	}
 	return ps
 }

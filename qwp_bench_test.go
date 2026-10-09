@@ -26,6 +26,7 @@ package questdb
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 )
@@ -153,10 +154,13 @@ func qwpSteadyStateSetup() (*qwpLineSender, func()) {
 	s.globalSymbolList = append(s.globalSymbolList, "AAPL")
 	s.batchMaxSymbolId = 0
 
+	ip := net.IPv4(192, 0, 2, 1)
+	payload := []byte{0, 255, 128}
 	iter := func() {
 		for r := 0; r < 10; r++ {
-			if err := s.Table("t").
-				Symbol("sym", "AAPL").
+			s.Table("t")
+			s.Ipv4Column("ip", ip).BinaryColumn("bin", payload)
+			if err := s.Symbol("sym", "AAPL").
 				Int64Column("qty", int64(100+r)).
 				Float64Column("price", 150.5+float64(r)).
 				StringColumn("note", "test").
