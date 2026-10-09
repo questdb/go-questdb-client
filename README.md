@@ -300,14 +300,20 @@ err = qs.
 ```
 
 `QwpSender` adds `ByteColumn`, `ShortColumn`, `Int32Column`, `Float32Column`,
-`CharColumn`, `DateColumn`, `TimestampNanosColumn`, `UuidColumn`,
+`Ipv4Column`, `BinaryColumn`, `CharColumn`, `DateColumn`, `TimestampNanosColumn`,
+`UuidColumn`,
 `GeohashColumn`, `Int64Array1DColumn` / `2D` / `3D`, `Decimal64Column` /
 `Decimal128Column` / `Decimal256Column`, and `AtNano`, plus the
 acknowledgement and observability accessors (`AwaitAckedFsn`,
 `FlushAndGetSequence`, `TotalReconnectAttempts`, `LastTerminalError`,
 `TotalDurableAcks`, `TotalDurableTrimAdvances`, `DroppedConnectionNotifications`).
 
-> This release adds `TotalDurableAcks`, `TotalDurableTrimAdvances`, and
+`Ipv4Column` accepts four-byte or IPv4-mapped `net.IP` values; nil writes NULL.
+`BinaryColumn` copies opaque bytes; nil writes NULL and an empty non-nil slice
+writes an empty value. Both setters are also available on pooled QWP senders.
+
+> This release adds `Ipv4Column`, `BinaryColumn`, `TotalDurableAcks`,
+> `TotalDurableTrimAdvances`, and
 > `DroppedConnectionNotifications` to the `QwpSender` interface. Every built-in
 > transport is updated; this is source-breaking only for external code that
 > implements `QwpSender` directly (callers that type-assert to it are unaffected).

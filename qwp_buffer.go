@@ -132,7 +132,7 @@ func newQwpColumnBuffer(name string, typeCode qwpTypeCode, nullable bool) *qwpCo
 		geohashPrecision: -1,
 	}
 	switch typeCode {
-	case qwpTypeVarchar:
+	case qwpTypeVarchar, qwpTypeBinary:
 		c.strOffsets = []uint32{0}
 	case qwpTypeDoubleArray, qwpTypeLongArray:
 		c.arrayOffsets = []uint32{0}
@@ -302,6 +302,14 @@ func (c *qwpColumnBuffer) addString(v string) {
 	c.strData = append(c.strData, v...)
 	c.strOffsets = append(c.strOffsets, uint32(len(c.strData)))
 	c.trackDataGrowth(len(v) + 4) // string bytes + uint32 offset
+	c.rowCount++
+}
+
+// addBinary copies an opaque byte slice using the VARCHAR offset layout.
+func (c *qwpColumnBuffer) addBinary(v []byte) {
+	c.strData = append(c.strData, v...)
+	c.strOffsets = append(c.strOffsets, uint32(len(c.strData)))
+	c.trackDataGrowth(len(v) + 4)
 	c.rowCount++
 }
 
@@ -681,7 +689,7 @@ func (c *qwpColumnBuffer) addNull() {
 		c.fixedData = append(c.fixedData, 0, 0)
 		c.trackDataGrowth(2)
 
-	case qwpTypeInt:
+	case qwpTypeInt, qwpTypeIPv4:
 		c.fixedData = append(c.fixedData, 0, 0, 0, 0)
 		c.trackDataGrowth(4)
 
@@ -694,7 +702,7 @@ func (c *qwpColumnBuffer) addNull() {
 	case qwpTypeDouble:
 		c.appendU64(math.Float64bits(math.NaN()))
 
-	case qwpTypeVarchar:
+	case qwpTypeVarchar, qwpTypeBinary:
 		// Repeat current offset → zero-length string sentinel.
 		c.strOffsets = append(c.strOffsets, uint32(len(c.strData)))
 		c.trackDataGrowth(4)
@@ -757,7 +765,7 @@ func (c *qwpColumnBuffer) addNull() {
 func (c *qwpColumnBuffer) reset() {
 	c.fixedData = c.fixedData[:0]
 	c.boolData = c.boolData[:0]
-	if c.typeCode == qwpTypeVarchar {
+	if c.typeCode == qwpTypeVarchar || c.typeCode == qwpTypeBinary {
 		c.strOffsets = c.strOffsets[:1]
 		c.strOffsets[0] = 0
 	} else {
@@ -810,7 +818,7 @@ func (c *qwpColumnBuffer) truncateTo(n int) {
 			c.boolData[newLen-1] &= (1 << uint(newVC%8)) - 1
 		}
 
-	case qwpTypeVarchar:
+	case qwpTypeVarchar, qwpTypeBinary:
 		c.strOffsets = c.strOffsets[:newVC+1]
 		c.strData = c.strData[:c.strOffsets[newVC]]
 
@@ -1049,7 +1057,7 @@ func (tb *qwpTableBuffer) getOrCreateColumn(name string, typeCode qwpTypeCode, n
 
 	// Account for initial offset entries (strOffsets[0] or arrayOffsets[0]).
 	switch typeCode {
-	case qwpTypeVarchar, qwpTypeDoubleArray, qwpTypeLongArray:
+	case qwpTypeVarchar, qwpTypeBinary, qwpTypeDoubleArray, qwpTypeLongArray:
 		tb.dataSize += 4
 	}
 
@@ -1170,7 +1178,7 @@ func (tb *qwpTableBuffer) reset() {
 	tb.dataSize = 0
 	for _, col := range tb.columns {
 		switch col.typeCode {
-		case qwpTypeVarchar, qwpTypeDoubleArray, qwpTypeLongArray:
+		case qwpTypeVarchar, qwpTypeBinary, qwpTypeDoubleArray, qwpTypeLongArray:
 			tb.dataSize += 4
 		}
 	}

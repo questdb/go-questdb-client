@@ -59,20 +59,14 @@ const (
 	qwpTypeDecimal128    qwpTypeCode = 0x14 // 16 bytes, little-endian unscaled
 	qwpTypeDecimal256    qwpTypeCode = 0x15 // 32 bytes, little-endian unscaled
 	qwpTypeChar          qwpTypeCode = 0x16 // UTF-16 code unit, 2 bytes LE
-	// Decoder-only types: the Go encoder never emits them, but the
-	// egress `RESULT_BATCH` decoder must handle columns the server
-	// produces from arbitrary SELECTs (pg_catalog views, IP lookups,
-	// binary columns, etc.).
-	qwpTypeBinary qwpTypeCode = 0x17 // variable, offset+data (same layout as VARCHAR)
-	qwpTypeIPv4   qwpTypeCode = 0x18 // 4 bytes LE, identical to INT
+	qwpTypeBinary        qwpTypeCode = 0x17 // variable, offset+data (same layout as VARCHAR)
+	qwpTypeIPv4          qwpTypeCode = 0x18 // 4 bytes LE, identical to INT
 )
 
 // Exported column-type codes for QwpColumnBatch.ColumnType. Each value
 // is the wire-type byte the egress decoder reports for a column; switch
 // on ColumnType(col) to choose the matching typed accessor. The values
-// mirror the QWP protocol type codes. Decoder-only types (Binary, IPv4)
-// are included because a SELECT can surface them even though the encoder
-// never emits them.
+// mirror the QWP protocol type codes.
 const (
 	QwpTypeBoolean       = byte(qwpTypeBoolean)
 	QwpTypeByte          = byte(qwpTypeByte)

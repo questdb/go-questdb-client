@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"sync/atomic"
 	"time"
 )
@@ -48,6 +49,15 @@ type QwpSender interface {
 
 	// Int32Column adds an INT (int32) column value.
 	Int32Column(name string, val int32) QwpSender
+
+	// Ipv4Column adds an IPv4 value, accepting four-byte and IPv4-mapped
+	// net.IP representations. Nil writes NULL; other non-IPv4 values latch
+	// an error that surfaces on At, AtNow or Flush.
+	Ipv4Column(name string, val net.IP) QwpSender
+
+	// BinaryColumn copies an opaque byte slice. Nil writes NULL; a non-nil
+	// empty slice writes a distinct, non-null empty value.
+	BinaryColumn(name string, val []byte) QwpSender
 
 	// Float32Column adds a FLOAT (float32) column value.
 	Float32Column(name string, val float32) QwpSender
@@ -1565,6 +1575,70 @@ func (s *qwpLineSender) Int32Column(name string, val int32) QwpSender {
 		return s
 	}
 	col.addInt32(val)
+	return s
+}
+
+func (s *qwpLineSender) Ipv4Column(name string, val net.IP) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: Ipv4Column() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
+		s.lastErr = err
+		return s
+	}
+	ip4 := val.To4()
+	if val != nil && ip4 == nil {
+		s.lastErr = fmt.Errorf("qwp: Ipv4Column() value is not a valid IPv4 address")
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeIPv4, true)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	if val == nil {
+		col.addNull()
+		return s
+	}
+	col.addInt32(int32(binary.BigEndian.Uint32(ip4)))
+	return s
+}
+
+func (s *qwpLineSender) BinaryColumn(name string, val []byte) QwpSender {
+	if s.lastErr != nil {
+		return s
+	}
+	if !s.hasTable {
+		s.lastErr = fmt.Errorf("qwp: BinaryColumn() called without Table()")
+		return s
+	}
+	if err := qwpValidateColumnName(name, s.fileNameLimit); err != nil {
+		s.lastErr = err
+		return s
+	}
+	col, err := s.currentTable.getOrCreateColumn(name, qwpTypeBinary, true)
+	if err != nil {
+		s.lastErr = err
+		return s
+	}
+	if val == nil {
+		col.addNull()
+		return s
+	}
+	if len(val) > 2147483647 {
+		s.lastErr = fmt.Errorf("qwp: BinaryColumn() value length exceeds 2^31-1 bytes")
+		return s
+	}
+	// Guard cumulative binary size overflow (max 2^32-1 bytes)
+	if uint64(len(col.strData))+uint64(len(val)) > 4294967295 {
+		s.lastErr = fmt.Errorf("qwp: BinaryColumn() cumulative binary size exceeds 2^32-1 bytes")
+		return s
+	}
+	col.addBinary(val)
 	return s
 }
 
