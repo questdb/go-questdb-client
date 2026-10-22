@@ -74,14 +74,16 @@ When a lease's return cannot queue its rows while the pool is closing, closed
 or poisoned, `Close` still drops them and reports `[unqueuedRows=N]`. The pool
 then closes the sender instead of keeping it, and that close finds nothing left
 to queue. The drop protects the next borrower, and a closing pool has none, so
-the rows lose a second attempt within `close_flush_timeout`. That attempt helps
-only if the condition clears in the short gap after the return has already
-waited out the append timeout: a persistent storage fault does not, and an
-outage must end within that window. Keeping the rows would also need a
-different `Close` result. `Close` returns before the background close
-finishes, so it could not say whether the rows arrived, and an error that
-invites a resend could deliver them twice. The borrower's error is accurate, and
-the README tells applications to return every lease before `QuestDB.Close`.
+the rows lose a second attempt: the background close would queue them with a
+fresh append timeout per frame (`sf_append_deadline_millis`, 30 s by default),
+then wait `close_flush_timeout_millis` for acknowledgements. That attempt helps
+only if the condition clears within that further append timeout: a persistent
+storage fault does not, and an outage must end within it. Keeping the rows
+would also need a different `Close` result. `Close` returns before the
+background close finishes, so it could not say whether the rows arrived, and
+an error that invites a resend could deliver them twice. The borrower's error
+is accurate, and an application avoids the closing case by returning every
+lease before `QuestDB.Close`, as the README quick start does.
 
 ## Store-and-forward storage
 
