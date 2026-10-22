@@ -105,15 +105,58 @@ func qwpReturnTestLease(t *testing.T, p *qwpSenderPool, symbol, marker string, f
 	return slot, err == nil, err
 }
 
+// qwpReturnTestEngine is the store-and-forward engine behind a pooled slot,
+// or nil while the slot has no sender.
+func qwpReturnTestEngine(slot *qwpSenderSlot) *qwpSfCursorEngine {
+	if ls, ok := slot.delegate.(*qwpLineSender); ok {
+		return ls.cursorEngine
+	}
+	return nil
+}
+
+// qwpReturnTestSpareSettled reports whether e's next rotation has a spare
+// segment to move into, or whether the ring is at its byte cap, so no spare
+// comes until a trim. The segment manager creates spares in the background,
+// and on a slow filesystem (Windows CI) that can outlast the 150 ms append
+// deadline. A return that fails before the spare settles says nothing about
+// the cap these tests measure.
+func qwpReturnTestSpareSettled(e *qwpSfCursorEngine) bool {
+	return e == nil || e.ring.hotSpare.Load() != nil || e.manager.wouldExceedCapWithSpare()
+}
+
+// qwpReturnTestAwaitSpares waits until every sender in p has settled its next
+// spare, so the next lease's outcome depends on the cap, not on timing.
+func qwpReturnTestAwaitSpares(t *testing.T, p *qwpSenderPool) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		engines := make([]*qwpSfCursorEngine, 0, len(p.all))
+		for _, slot := range p.all {
+			engines = append(engines, qwpReturnTestEngine(slot))
+		}
+		p.mu.Unlock()
+		for _, e := range engines {
+			if !qwpReturnTestSpareSettled(e) {
+				return false
+			}
+		}
+		return true
+	}, qwpTestWaitTimeout, 5*time.Millisecond, "a sender's spare segment never arrived")
+}
+
 // qwpReturnTestFillRing commits 1 KiB rows on s and flushes after each one
 // until a flush fails with backpressure, so the sender's ring is full and the
-// last row is still pending.
+// last row is still pending. Each flush waits for the spare to settle first,
+// so the failing flush is the one that meets the cap.
 func qwpReturnTestFillRing(t *testing.T, s LineSender) {
 	t.Helper()
 	ctx := context.Background()
+	e := qwpReturnTestEngine(s.(*qwpPooledSender).slot)
 	filler := strings.Repeat("x", 1024)
 	for i := 0; i < 1000; i++ {
 		require.NoError(t, s.Table("t").StringColumn("m", filler).At(ctx, time.Unix(0, int64(i+1))))
+		require.Eventually(t, func() bool { return qwpReturnTestSpareSettled(e) },
+			qwpTestWaitTimeout, 5*time.Millisecond, "the sender's spare segment never arrived")
 		if err := s.Flush(ctx); err != nil {
 			require.ErrorIs(t, err, ErrBackpressureTimeout)
 			return
@@ -280,6 +323,19 @@ func qwpReturnTestAnyUnacked(p *qwpSenderPool) bool {
 	return false
 }
 
+// qwpReturnTestAllSparesReady reports whether every sender in p has a spare
+// segment ready for its next rotation.
+func qwpReturnTestAllSparesReady(p *qwpSenderPool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, slot := range p.all {
+		if e := qwpReturnTestEngine(slot); e != nil && e.ring.hotSpare.Load() == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // During an outage every sender's ring fills and its returns fail with
 // backpressure. The pool must fill every sender's buffer, growing to max,
 // instead of dropping leases while other buffers sit empty, and the rows it
@@ -299,6 +355,7 @@ func TestQwpSfPoolOutageFillsEverySendersBuffer(t *testing.T) {
 			kept := make([]bool, leases)
 			keptBySlot := map[int]int{}
 			for i, marker := range markers {
+				qwpReturnTestAwaitSpares(t, p)
 				slot, ok, err := qwpReturnTestLease(t, p, "sym_"+strconv.Itoa(i), marker, false)
 				if !ok {
 					require.ErrorIs(t, err, ErrBackpressureTimeout)
@@ -339,9 +396,14 @@ func TestQwpSfPoolOutageFillsEverySendersBuffer(t *testing.T) {
 
 			// Once acknowledgements catch up, leases queue their rows again. The
 			// pool is at max with every sender degraded, so it lends one as a
-			// last resort, and the lease that queues rows clears its mark.
+			// last resort, and the lease that queues rows clears its mark. The
+			// trim that frees ring space follows the acknowledgements, so wait
+			// for every sender's spare as well.
 			require.Eventually(t, func() bool { return !qwpReturnTestAnyUnacked(p) }, qwpTestWaitTimeout, 10*time.Millisecond)
+			require.Eventually(t, func() bool { return qwpReturnTestAllSparesReady(p) }, qwpTestWaitTimeout, 5*time.Millisecond,
+				"every sender's spare segment must arrive once its acknowledged frames are trimmed")
 			for i := 0; i < size.max; i++ {
+				qwpReturnTestAwaitSpares(t, p)
 				slot, ok, err := qwpReturnTestLease(t, p, "recovered_"+strconv.Itoa(i), "", false)
 				require.True(t, ok, "lease %d after the outage: %v", i, err)
 				require.False(t, qwpReturnTestDegraded(p, slot), "a lease that queued rows must clear its sender's mark")
