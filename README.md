@@ -85,6 +85,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// Return the sender even if building a row fails.
+	defer func() {
+		if err := sender.Close(ctx); err != nil {
+			log.Printf("sender return: %v", err)
+		}
+	}()
 	if err := sender.
 		Table("trades").
 		Symbol("symbol", "ETH-USD").
