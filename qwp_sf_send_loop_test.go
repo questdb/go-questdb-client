@@ -1988,7 +1988,7 @@ func TestQwpSfSendLoopReceiverClampsForgedAckToFullySent(t *testing.T) {
 // TestQwpSfMaxFrameRejectionsConfigHonoredEndToEnd pins the configurable
 // poison threshold: with max_frame_rejections=2 a retriable NACK of the
 // same head frame escalates to the typed terminal after exactly two
-// deliveries — one fewer recycle than the default threshold would allow.
+// strikes, below the default threshold of qwpSfDefaultMaxFrameRejections.
 func TestQwpSfMaxFrameRejectionsConfigHonoredEndToEnd(t *testing.T) {
 	var connCount atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2033,9 +2033,15 @@ func TestQwpSfMaxFrameRejectionsConfigHonoredEndToEnd(t *testing.T) {
 
 	se := qs.LastTerminalError()
 	assert.Equal(t, CategoryProtocolViolation, se.Category)
+	// The strike count in the terminal message is the threshold under
+	// test. The delivery count can exceed it: the server NACKs as soon as
+	// it reads the frame, and the receiver handles a NACK that arrives
+	// before the send goroutine records the write as complete as a
+	// rejection with nothing sent on the connection. That delivery
+	// recycles the connection without recording a strike.
 	assert.Contains(t, se.ServerMessage, "rejected 2 consecutive times")
-	assert.Equal(t, int64(2), connCount.Load(),
-		"exactly two deliveries at max_frame_rejections=2: the initial one plus one replay")
+	assert.GreaterOrEqual(t, connCount.Load(), int64(2),
+		"each strike needs its own delivery: the initial one plus at least one replay")
 }
 
 func TestMaxFrameRejectionsConfAndOption(t *testing.T) {
