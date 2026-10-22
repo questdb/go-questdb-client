@@ -59,12 +59,13 @@ type qwpQueryPool struct {
 	closed            bool
 	closing           atomic.Bool // set before the housekeeper stops; reapIdle bails
 
-	// pendingTeardowns counts client teardowns running off-lock after the
-	// worker has already left `all` (giveBack's broken branch, discardWorkerLocked,
-	// reap victims). close() adds it to the outstanding count so it does not
-	// return while a query connection is still winding down. Guarded by mu.
-	// Mirrors qwpSenderPool.pendingLeaseTeardowns.
-	pendingTeardowns int
+	// Keep clients in this map until their cleanup finishes. If cleanup fails
+	// permanently, keep them here; another Close reports the failure but does
+	// not try to close them again.
+	teardowns     map[*qwpQueryWorker]struct{}
+	closeErr      error
+	failedErr     error
+	failedWorkers map[*qwpQueryWorker]struct{}
 
 	baseConf string
 	logger   *slog.Logger
@@ -100,7 +101,13 @@ func newQwpQueryPool(
 	for i := 0; i < minSize; i++ {
 		w, err := p.createWorker(ctx)
 		if err != nil {
-			p.close(ctx)
+			if w != nil {
+				lockErr := p.withLock([]*qwpQueryWorker{w}, func() { p.startTeardownLocked(w, nil) })
+				err = errors.Join(err, lockErr)
+			}
+			stopCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_ = p.close(stopCtx)
 			return nil, err
 		}
 		p.all = append(p.all, w)
@@ -113,154 +120,92 @@ func newQwpQueryPool(
 // pool is at capacity. The returned *Query must be Close()d to return it.
 func (p *qwpQueryPool) borrow(ctx context.Context) (*Query, error) {
 	deadline := time.Now().Add(p.acquireTimeout)
-	p.mu.Lock()
 	for {
-		if p.closed {
-			p.mu.Unlock()
-			return nil, errPoolClosed
-		}
-		if n := len(p.available); n > 0 {
-			w := p.available[n-1]
-			p.available = p.available[:n-1]
-			// A worker's client can latch a transport-terminal error (failover
-			// exhaustion on a background reconnect) while it sits idle, with no
-			// lease watching. Handing such a poisoned worker to the next borrower
-			// would fail their first query through no fault of their own, so
-			// discard it and look for another (mirrors the sender pool).
-			if w.client.terminalError() != nil {
-				// Background: this worker is already terminally failed, so its
-				// close is incidental teardown a cancelled borrow ctx must not
-				// cut short (matches the sender pool).
-				p.discardWorkerLocked(context.Background(), w) // releases p.mu
-				p.mu.Lock()
-				continue
+		var lease *Query
+		var result error
+		var changed <-chan struct{}
+		var build bool
+		err := p.withLock(nil, func() {
+			if p.closed || p.closing.Load() || p.failedErr != nil {
+				result = errors.Join(errPoolClosed, p.failedErr)
+				return
 			}
-			gen := w.generation.Add(1)
-			p.mu.Unlock()
-			return &Query{pool: p, worker: w, gen: gen}, nil
-		}
-		// Unlike the sender pool, discards remove from p.all immediately with no
-		// closingSlots equivalent, so a concurrent discard's out-of-lock close can
-		// briefly put live clients at maxSize+K. Intentional: query workers hold no
-		// flock/mmap (unlike SF sender slots), so a transient overshoot is harmless.
-		if len(p.all)+p.inFlightCreations < p.maxSize {
-			// A waiter woken by the acquire timer can reach here with the
-			// deadline already past; report pool exhaustion rather than
-			// starting a dial doomed by an expired context.
+			for len(p.available) > 0 {
+				n := len(p.available)
+				w := p.available[n-1]
+				if w.client.terminalError() != nil {
+					p.startTeardownLocked(w, nil)
+					p.available = p.available[:n-1]
+					continue
+				}
+				lease = &Query{pool: p, worker: w, gen: w.generation.Add(1)}
+				p.available = p.available[:n-1]
+				return
+			}
 			if time.Until(deadline) <= 0 {
-				p.mu.Unlock()
-				return nil, fmt.Errorf("%w after %s", errQueryPoolExhausted, p.acquireTimeout)
+				result = fmt.Errorf("%w after %s", errQueryPoolExhausted, p.acquireTimeout)
+				return
 			}
-			p.inFlightCreations++
-			p.mu.Unlock()
-			// Bound the dial by the acquire deadline (sender-pool / HikariCP parity)
-			// so a black-holed server is abandoned within acquire_timeout_ms.
+			if len(p.all)+p.inFlightCreations+len(p.teardowns) < p.maxSize {
+				p.inFlightCreations++
+				build = true
+			}
+			changed = p.notify
+		})
+		if err != nil || result != nil {
+			return nil, errors.Join(result, err)
+		}
+		if lease != nil {
+			return lease, nil
+		}
+		if build {
 			bctx, cancel := context.WithDeadline(ctx, deadline)
-			w, err := p.createWorker(bctx)
-			cancel()
-			p.mu.Lock()
-			p.inFlightCreations--
-			if err != nil {
-				p.broadcastLocked()
-				p.mu.Unlock()
-				return nil, err
+			built := make(chan error, 1)
+			go func() { built <- p.buildAvailable(bctx) }()
+			select {
+			case err := <-built:
+				cancel()
+				if err != nil {
+					return nil, err
+				}
+			case <-bctx.Done():
+				cancel()
+				return nil, bctx.Err()
 			}
-			if p.closed {
-				// inFlightCreations dropped just above; wake close()'s
-				// outstanding-lease wait so it re-checks. The just-built worker was
-				// never handed out, so closing it off-lock races nothing.
-				p.broadcastLocked()
-				p.mu.Unlock()
-				_ = closeQueryClientGuarded(context.Background(), w.client)
-				return nil, errPoolClosed
-			}
-			p.all = append(p.all, w)
-			gen := w.generation.Add(1)
-			p.mu.Unlock()
-			return &Query{pool: p, worker: w, gen: gen}, nil
+			continue
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			p.mu.Unlock()
-			return nil, fmt.Errorf("%w after %s", errQueryPoolExhausted, p.acquireTimeout)
-		}
-		ch := p.notify
-		p.mu.Unlock()
-		timer := time.NewTimer(remaining)
+		timer := time.NewTimer(time.Until(deadline))
 		select {
-		case <-ch:
+		case <-changed:
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
 			return nil, ctx.Err()
 		}
 		timer.Stop()
-		p.mu.Lock()
 	}
 }
 
-// giveBack returns a lease's worker to the pool (or closes it, when the pool is
-// already shut down or the worker is broken). The close paths run on
-// context.Background(): they are incidental teardown of a worker nobody will
-// reuse, which a caller deadline must not cut short. Returns the close error,
-// if any — recycling a healthy worker never fails.
+// giveBack makes a healthy client available to borrow again, or records it for
+// background cleanup before returning. The caller must already have stopped
+// using the query's response buffers.
 func (p *qwpQueryPool) giveBack(q *Query, broken bool) error {
-	p.mu.Lock()
-	if q.worker.generation.Load() != q.gen {
-		p.mu.Unlock()
-		return nil // stale lease (already returned / re-borrowed) — never double-act
-	}
-	q.worker.generation.Add(1)
-	if p.closed {
-		// On loan at close (close() skips on-loan workers), so self-close now.
-		// Query.Close drained the active cursor first, so this can't race a read.
-		// Drop the worker from p.all and wake close()'s outstanding-lease wait so
-		// it does not return while this teardown is still in flight.
-		p.mu.Unlock()
-		err := closeQueryClientGuarded(context.Background(), q.worker.client)
-		p.mu.Lock()
-		p.removeFromAllLocked(q.worker)
+	var result error
+	err := p.withLock([]*qwpQueryWorker{q.worker}, func() {
+		if q.worker.generation.Load() != q.gen {
+			return
+		}
+		q.worker.generation.Add(1)
+		if p.closed || p.closing.Load() || p.failedErr != nil || broken {
+			p.startTeardownLocked(q.worker, nil)
+		} else {
+			q.worker.idleSince = time.Now()
+			p.available = append(p.available, q.worker)
+		}
 		p.broadcastLocked()
-		p.mu.Unlock()
-		return err
-	}
-	if broken {
-		// Drop from `all` before the off-lock close but count the teardown so
-		// close()'s outstanding wait still sees it (the closed branch above keeps
-		// the worker in `all` across its close, which the formula already covers;
-		// this branch removes first, so it needs the explicit counter).
-		p.removeFromAllLocked(q.worker)
-		p.pendingTeardowns++
-		p.mu.Unlock()
-		err := closeQueryClientGuarded(context.Background(), q.worker.client)
-		p.mu.Lock()
-		p.pendingTeardowns--
-		p.broadcastLocked()
-		p.mu.Unlock()
-		return err
-	}
-	q.worker.idleSince = time.Now()
-	p.available = append(p.available, q.worker)
-	p.broadcastLocked()
-	p.mu.Unlock()
-	return nil
-}
-
-// discardWorkerLocked evicts a worker from `all` and closes its client outside
-// the lock. Caller holds mu; discardWorkerLocked releases it. Used on borrow
-// when a pooled worker is found terminally failed (mirrors the sender pool's
-// discardLocked).
-func (p *qwpQueryPool) discardWorkerLocked(ctx context.Context, w *qwpQueryWorker) {
-	p.removeFromAllLocked(w)
-	// The worker is out of `all`, so count the off-lock close in the outstanding
-	// wait or close() could return while this teardown is still in flight.
-	p.pendingTeardowns++
-	p.mu.Unlock()
-	_ = closeQueryClientGuarded(ctx, w.client)
-	p.mu.Lock()
-	p.pendingTeardowns--
-	p.broadcastLocked()
-	p.mu.Unlock()
+		result = p.failedErr
+	})
+	return errors.Join(result, err)
 }
 
 // markClosing signals reapIdle to bail before the housekeeper is stopped.
@@ -269,77 +214,42 @@ func (p *qwpQueryPool) markClosing() { p.closing.Store(true) }
 // queryReapCloseHook, when non-nil, is invoked at the start of each reap-victim
 // close goroutine. Test seam only (mirrors reapCloseHook): it lets a test hold a
 // reap teardown in flight to assert close() waits for it. Nil in production.
-var queryReapCloseHook func()
+var queryReapCloseHook atomic.Pointer[func()]
 
 func (p *qwpQueryPool) reapIdle() {
 	if p.closing.Load() {
 		return
 	}
-	toClose := p.selectReapVictims(time.Now())
-	if len(toClose) == 0 {
-		return
-	}
-	// Close concurrently so an N-worker sweep is bounded by one close budget,
-	// not N — a sequential sweep of wedged connections would overrun the
-	// housekeeper join budget and outlive QuestDB.Close (matches the sender
-	// pool's reap).
-	var wg sync.WaitGroup
-	for _, w := range toClose {
-		wg.Add(1)
-		go func(client *QwpQueryClient) {
-			defer wg.Done()
-			if queryReapCloseHook != nil {
-				queryReapCloseHook()
+	now := time.Now()
+	p.withLock(nil, func() {
+		if p.closed || p.closing.Load() || p.failedErr != nil {
+			return
+		}
+		kept := p.available[:0]
+		for _, w := range p.available {
+			idleExpired := p.idleTimeout > 0 && now.Sub(w.idleSince) >= p.idleTimeout
+			overAge := p.maxLifetime > 0 && now.Sub(w.createdAt) >= p.maxLifetime
+			poisoned := w.client.terminalError() != nil
+			// Keep at least minSize clients when removing old or idle ones, but
+			// always remove failed clients. Starting cleanup removes each client
+			// from p.all immediately, so its length already reflects that change.
+			if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
+				p.startTeardownLocked(w, func() {
+					if hook := queryReapCloseHook.Load(); hook != nil {
+						(*hook)()
+					}
+				})
+				continue
 			}
-			_ = closeQueryClientGuarded(context.Background(), client)
-		}(w.client)
-	}
-	wg.Wait()
-	p.mu.Lock()
-	// Balance the per-victim increments in selectReapVictims now the teardowns
-	// have completed, so close()'s outstanding wait no longer counts them.
-	p.pendingTeardowns -= len(toClose)
-	p.broadcastLocked()
-	p.mu.Unlock()
+			kept = append(kept, w)
+		}
+		p.available = kept
+	})
 }
 
-// selectReapVictims removes the idle-expired / over-age / poisoned workers from
-// the available set under the lock and returns them for off-lock closing. The
-// lock is released via defer so a panic in the selection can never strand it (the
-// reap runs behind a recover in the housekeeper).
-func (p *qwpQueryPool) selectReapVictims(now time.Time) []*qwpQueryWorker {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return nil
-	}
-	var toClose []*qwpQueryWorker
-	kept := p.available[:0]
-	for _, w := range p.available {
-		idleExpired := p.idleTimeout > 0 && now.Sub(w.idleSince) >= p.idleTimeout
-		overAge := p.maxLifetime > 0 && now.Sub(w.createdAt) >= p.maxLifetime
-		// A worker poisoned by a background transport-terminal failure is useless
-		// to a borrower, so reap it even at minSize (borrow re-creates a fresh
-		// worker on demand), mirroring the sender pool's reap.
-		poisoned := w.client.terminalError() != nil
-		// removeFromAllLocked already shrinks p.all; test it directly (don't
-		// also subtract len(toClose) — that double-counts and under-reaps).
-		// Idle/age recycling is floored at minSize, so max_lifetime_ms is inert
-		// for min workers (see sender pool + README); poisoned reaps anyway.
-		if poisoned || ((idleExpired || overAge) && len(p.all) > p.minSize) {
-			p.removeFromAllLocked(w)
-			// Count the off-lock reap teardown so close()'s outstanding wait
-			// cannot return while a reaped client is still winding down (the
-			// victim is already out of `all`). Decremented in reapIdle after close.
-			p.pendingTeardowns++
-			toClose = append(toClose, w)
-			continue
-		}
-		kept = append(kept, w)
-	}
-	p.available = kept
-	return toClose
-}
+// queryClientCloseHook holds off-lock client teardown in lifecycle tests.
+// Invoked inside the close panic guard; nil in production.
+var queryClientCloseHook atomic.Pointer[func(*QwpQueryClient)]
 
 // closeQueryClientGuarded closes a worker's client, converting a panic into an
 // error so a faulting Close cannot unwind through the pool's teardown. Mirrors
@@ -347,86 +257,44 @@ func (p *qwpQueryPool) selectReapVictims(now time.Time) []*qwpQueryWorker {
 func closeQueryClientGuarded(ctx context.Context, client *QwpQueryClient) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("qwp query pool: client close panicked: %v", r)
+			err = fmt.Errorf("%w: query client close panicked: %v", ErrCleanupFailed, r)
 		}
 	}()
+	if hook := queryClientCloseHook.Load(); hook != nil {
+		(*hook)(client)
+	}
 	return client.Close(ctx)
 }
 
-// close shuts the pool down. It bounded-waits for outstanding leases to return
-// (mirroring the sender pool) then closes the available workers concurrently on
-// context.Background(), so a caller ctx neither serializes the closes nor cancels
-// them mid-drain. The ctx argument is accepted for interface symmetry but unused.
-func (p *qwpQueryPool) close(_ context.Context) error {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil
-	}
-	p.closed = true
-	p.broadcastLocked()
-
-	// Close only available workers: an on-loan one may have a live Batches()
-	// reading its aliased buffers, which a concurrent Close would free —
-	// undefined behaviour. On-loan leases self-close via giveBack, which drops
-	// them from p.all and wakes this wait. Bounded-wait for those returns
-	// (mirrors qwpSenderPool.close) so QuestDB.Close does not return while a query
-	// connection is still live, capped so a never-returned lease cannot hang
-	// shutdown forever.
-	waitBudget := p.acquireTimeout
-	if waitBudget > qwpPoolMaxCloseLeaseWait {
-		waitBudget = qwpPoolMaxCloseLeaseWait
-	}
-	deadline := time.Now().Add(waitBudget)
-	for {
-		outstanding := len(p.all) - len(p.available) + p.inFlightCreations + p.pendingTeardowns
-		if outstanding <= 0 {
-			break
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-		ch := p.notify
-		p.mu.Unlock()
-		timer := time.NewTimer(remaining)
-		select {
-		case <-ch:
-		case <-timer.C:
-		}
-		timer.Stop()
-		p.mu.Lock()
-	}
-	if leaked := len(p.all) - len(p.available); leaked > 0 {
-		qwpEffectiveLogger(p.logger).Warn("qwp query pool: close() leaving borrowed query client(s) alive; "+
-			"each is closed when its lease is returned", "leaked", leaked)
-	}
-	toClose := append([]*qwpQueryWorker(nil), p.available...)
-	p.all = nil
-	p.available = nil
-	p.broadcastLocked()
-	p.mu.Unlock()
-
-	var (
-		wg       sync.WaitGroup
-		errMu    sync.Mutex
-		firstErr error
-	)
-	for _, w := range toClose {
-		wg.Add(1)
-		go func(client *QwpQueryClient) {
-			defer wg.Done()
-			if err := closeQueryClientGuarded(context.Background(), client); err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
+// close starts cleanup once for each client that is not borrowed. Borrowed
+// clients stay in p.all until their callers return them. Even after a timeout,
+// we must not close a client whose response buffers may still be in use.
+func (p *qwpQueryPool) close(ctx context.Context) error {
+	p.withLock(nil, func() {
+		if !p.closed {
+			p.closed = true
+			for _, w := range p.available {
+				p.startTeardownLocked(w, nil)
 			}
-		}(w.client)
+			p.available = nil
+			p.broadcastLocked()
+		}
+	})
+	for {
+		changed, result := p.closeResult()
+		if !errors.Is(result, ErrCleanupPending) || errors.Is(result, ErrCleanupFailed) {
+			return result
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			_, result = p.closeResult()
+			if errors.Is(result, ErrCleanupPending) && !errors.Is(result, ErrCleanupFailed) {
+				return errors.Join(result, ctx.Err())
+			}
+			return result
+		}
 	}
-	wg.Wait()
-	return firstErr
 }
 
 func (p *qwpQueryPool) createWorker(ctx context.Context) (w *qwpQueryWorker, err error) {
@@ -434,7 +302,7 @@ func (p *qwpQueryPool) createWorker(ctx context.Context) (w *qwpQueryWorker, err
 	// clean up after, rather than unwinding through the pool (Hazard I).
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("qwp query pool: client build panicked: %v", r)
+			err = fmt.Errorf("%w: query client build panicked: %v", ErrCleanupFailed, r)
 		}
 	}()
 	// Parse and inject the logger (funcs/handlers aren't connect-string-
@@ -447,6 +315,10 @@ func (p *qwpQueryPool) createWorker(ctx context.Context) (w *qwpQueryWorker, err
 	cfg.logger = p.logger
 	client, cerr := newQwpQueryClient(ctx, cfg)
 	if cerr != nil {
+		var buildErr *qwpQueryBuildError
+		if errors.As(cerr, &buildErr) {
+			return &qwpQueryWorker{client: buildErr.client}, cerr
+		}
 		return nil, cerr
 	}
 	now := time.Now()
@@ -464,7 +336,9 @@ func (p *qwpQueryPool) removeFromAllLocked(w *qwpQueryWorker) {
 }
 
 func (p *qwpQueryPool) broadcastLocked() {
-	close(p.notify)
+	if p.notify != nil {
+		close(p.notify)
+	}
 	p.notify = make(chan struct{})
 }
 
@@ -499,7 +373,8 @@ var (
 // Query is a query session leased from the QuestDB facade via BorrowQuery. It
 // delegates to the leased QwpQueryClient's cursor/iterator API; Close returns
 // the client to the pool (draining any in-flight cursor first). The real
-// disconnect happens only at QuestDB.Close. Not safe for concurrent use; borrow
+// disconnect happens when the pool removes the client or shuts down. Do not
+// use a handle concurrently, including Close while running or reading a query; borrow
 // one handle per concurrent query.
 type Query struct {
 	pool   *qwpQueryPool
@@ -623,18 +498,37 @@ func (q *Query) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (E
 	return res, err
 }
 
-// Close returns the leased client to the pool, draining any cursor left open by
-// Query first. Idempotent; the underlying client normally stays connected for
-// reuse and Close returns nil — the real disconnect happens at QuestDB.Close.
+// Close returns the borrowed query client to the pool. First stop Query/Exec,
+// result iteration, and use of slices backed by result-batch memory. Another
+// goroutine may request cancellation, but must not call Close concurrently.
+// Calls after the client has been returned do nothing and return nil; they
+// do not report errors from later cleanup. Returning a client does not mean
+// its connection has closed.
 //
-// Close deliberately takes no context, unlike the sender lease's Close(ctx):
-// the pool return itself never blocks, and the only wait — draining an open
-// cursor — runs on an internal budget bounded by query_close_timeout_ms, which
-// a caller deadline must not cut short (an interrupted drain would desync the
-// worker's wire and force an eviction). A non-nil error is possible only when
-// the worker is not recycled — it is broken and evicted, or the pool has
-// already shut down — and its client's own Close fails.
-func (q *Query) Close() error {
+// Close finishes reading any open query response, with a time limit set by
+// query_close_timeout_ms. It then either makes a healthy client available
+// for reuse or asks the pool to close it in the background. Close takes no
+// context: the response wait uses that configured limit, and Close does not
+// wait for background resource cleanup. It reports errors detected while
+// returning the client, including failure to safely hand it back to the pool.
+// Later cleanup errors are logged and included in [QuestDB.Close]'s result,
+// not in repeated calls to this Close. Return all borrowed handles, then use
+// QuestDB.Close to wait for all pool resources to be released.
+func (q *Query) Close() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			q.closed = true
+			err = fmt.Errorf("%w: query return panicked: %v", ErrCleanupFailed, r)
+			if q.pool != nil {
+				q.pool.withLock([]*qwpQueryWorker{q.worker}, func() {
+					q.pool.failLocked(err, []*qwpQueryWorker{q.worker})
+					if q.worker != nil {
+						q.worker.generation.Add(1)
+					}
+				})
+			}
+		}
+	}()
 	if !q.live() {
 		return nil
 	}

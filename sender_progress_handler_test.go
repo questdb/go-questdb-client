@@ -98,12 +98,9 @@ func TestSenderProgressHandlerFires(t *testing.T) {
 	}
 }
 
-// TestSenderProgressHandlerCloseFromCallbackConcurrentProducer pins the
-// dispatcher-goroutine guard on the progress path: a handler-invoked Close()
-// runs on the progress dispatcher goroutine and must not touch producer state
-// while a producer goroutine keeps writing. Pre-fix the guard matched only the
-// error dispatcher, so this raced the producer's table buffers.
-func TestSenderProgressHandlerCloseFromCallbackConcurrentProducer(t *testing.T) {
+// The progress callback signals the producer. Only the producer closes its
+// handle, after it has stopped building rows.
+func TestSenderProgressHandlerStopsOwner(t *testing.T) {
 	srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 	defer srv.Close()
 
@@ -116,7 +113,6 @@ func TestSenderProgressHandlerCloseFromCallbackConcurrentProducer(t *testing.T) 
 	var once sync.Once
 	loop.sendLoopSetProgressHandler(func(int64) {
 		once.Do(func() {
-			_ = s.Close(context.Background())
 			close(closed)
 		})
 	}, 16)
@@ -130,8 +126,14 @@ func TestSenderProgressHandlerCloseFromCallbackConcurrentProducer(t *testing.T) 
 				prodPanic.Store(fmt.Sprintf("%v", r))
 			}
 		}()
+		defer func() { _ = s.Close(context.Background()) }()
 		ctx := context.Background()
 		for i := 0; i < 100000; i++ {
+			select {
+			case <-closed:
+				return
+			default:
+			}
 			if err := s.Table(fmt.Sprintf("t%d", i)).Int64Column("v", int64(i)).AtNow(ctx); err != nil {
 				return
 			}
@@ -141,7 +143,7 @@ func TestSenderProgressHandlerCloseFromCallbackConcurrentProducer(t *testing.T) 
 	select {
 	case <-closed:
 	case <-time.After(10 * time.Second):
-		t.Fatal("progress handler never fired / Close() never returned")
+		t.Fatal("progress handler never signalled the owner")
 	}
 	select {
 	case <-prodDone:
@@ -149,6 +151,6 @@ func TestSenderProgressHandlerCloseFromCallbackConcurrentProducer(t *testing.T) 
 		t.Fatal("producer goroutine did not stop after Close()")
 	}
 	if p := prodPanic.Load(); p != nil {
-		t.Fatalf("producer crashed racing a progress-handler-invoked Close(): %v", p)
+		t.Fatalf("producer panicked while handling its stop notification: %v", p)
 	}
 }

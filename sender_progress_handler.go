@@ -29,8 +29,11 @@ import "strconv"
 // SenderProgressHandler is invoked, on a dedicated dispatcher goroutine, as the
 // QWP sender's acknowledged frame sequence number advances. Delivery is strictly
 // monotonic but may coalesce: under a delivery backlog the bounded dispatcher
-// drops older values, so the handler sees a monotonic subset of advances —
-// always including the latest, not necessarily every intermediate one.
+// drops older values, so the reported sequence never goes backwards but may
+// skip values. Newer queued values replace older ones; shutdown may drop even
+// the latest notification. Read [QwpSender.AckedFsn] to check acknowledgement
+// progress. Callback delivery is not a reliable way to wait for an
+// acknowledgement or for shutdown to finish.
 //
 // # Settled vs durable
 //
@@ -46,11 +49,20 @@ import "strconv"
 //
 // # Calling back into the sender
 //
-// The handler may call Close() or Flush() on the sender without deadlocking.
-// Because it runs on the dispatcher goroutine, not the producer goroutine,
-// those calls deliberately do NOT touch in-progress producer state: they
-// surface only a latched terminal error and will not flush rows the producer
-// has staged but not yet flushed itself. Same contract as SenderErrorHandler.
+// The handler does not run on the goroutines building rows or doing network
+// I/O. If it panics, the client catches and logs the panic; the sender and
+// callback delivery continue. A handler may run while the application is using
+// the sender. From the handler, do not call Close, Flush, methods that add rows
+// or column values, any other method that changes the sender, or QuestDB.Close.
+// Instead, send a value through a channel or cancel a context. The code using
+// the sender can then stop its current work and call Flush or Close. Starting
+// either method in another goroutine does not make concurrent use safe. The
+// handler may call a method only if that method's documentation says it returns
+// data without changing the sender.
+//
+// Shutdown stops accepting notifications and may drop queued values. A handler
+// already running may finish after Close returns, even after resources are
+// released. See [SenderErrorHandler] and README's "QWP shutdown and ownership".
 type SenderProgressHandler func(ackedFsn int64)
 
 // newQwpProgressDispatcher builds the off-loop dispatcher that delivers ackedFsn

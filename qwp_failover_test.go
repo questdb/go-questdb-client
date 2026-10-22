@@ -1415,26 +1415,10 @@ func gatedQwpServer(t *testing.T, nodeId string, release <-chan struct{},
 	}))
 }
 
-// TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration is a regression
-// test for the close-vs-reconnect leak: Close() running while
-// reconnectAndReplay is mid connectWalk used to consume closeOnce
-// against the dying generation, after which reconnectAndReplay
-// published a fresh generation (reader + dispatcher + waiter goroutines
-// + a live WebSocket) that nothing ever called shutdown() on — leaked
-// for the process lifetime.
-//
-// Node A binds initially then drops the connection on the query,
-// forcing failover. Node B is the only other candidate and gates its
-// SERVER_INFO write, so the test can call Close() with the failover
-// provably parked inside connectWalk. reconnectAndReplay holds c.genMu
-// only across its publish, not across the walk, so Close acquires the
-// lock immediately (honouring its ctx), sets closed, and tears down
-// whatever pair is currently bound — here the faulted node-A pair the
-// failover is replacing. reconnectAndReplay's post-walk closed-recheck
-// then refuses to publish the node-B generation it built and self-tears
-// it down. Both paths close a socket, so the failover target's
-// WebSocket ends up closed by the client; pre-fix it never was.
-func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
+// Cancel a failover while its replacement peer is still sending SERVER_INFO.
+// Join the query consumer before owner-side Close. Both the faulted generation
+// and the acquired replacement socket must eventually be released.
+func TestQwpQueryCancelledFailoverClosesBeforeOwnerShutdown(t *testing.T) {
 	var (
 		bReleaseGate           = make(chan struct{})
 		bReached               = make(chan struct{})
@@ -1492,12 +1476,14 @@ func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
 		t.Fatalf("initial bind = %s, want node A", c.CurrentEndpoint())
 	}
 
+	// Cancel only after the failover reaches the gate below. An independent
+	// query deadline can otherwise expire during slow setup and bypass it.
+	qctx, qcancel := context.WithCancel(context.Background())
+	defer qcancel()
 	var qwg sync.WaitGroup
 	qwg.Add(1)
 	go func() {
 		defer qwg.Done()
-		qctx, qcancel := context.WithTimeout(context.Background(), 8*time.Second)
-		defer qcancel()
 		q := c.Query(qctx, "select 1")
 		defer q.Close()
 		for _, err := range q.Batches() {
@@ -1523,19 +1509,21 @@ func TestQwpQueryCloseRacingFailoverDoesNotLeakGeneration(t *testing.T) {
 		t.Fatal("failover did not reach node B")
 	}
 
-	closeDone := make(chan error, 1)
-	go func() {
-		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer ccancel()
-		closeDone <- c.Close(cctx)
-	}()
-	// Give Close() a moment to win c.genMu and snapshot the bound pair
-	// before the walk completes — the interleaving where Close tears down
-	// the dying generation and reconnectAndReplay self-tears-down the one
-	// it just built. Not a correctness requirement — every interleaving
-	// is leak-free post-fix.
-	time.Sleep(75 * time.Millisecond)
+	// Cancel the query, let its consumer finish, then close from its owner.
+	// No application-side Close races an active failover or result aliases.
+	qcancel()
 	close(bReleaseGate)
+	queryStopped := make(chan struct{})
+	go func() { qwg.Wait(); close(queryStopped) }()
+	select {
+	case <-queryStopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelled failover did not stop")
+	}
+	closeDone := make(chan error, 1)
+	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ccancel()
+	closeDone <- c.Close(cctx)
 
 	// The leak probe: post-fix the freshly built generation is torn
 	// down (by Close's snapshot, or by reconnectAndReplay's self-

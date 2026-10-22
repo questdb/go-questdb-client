@@ -27,6 +27,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -36,10 +37,33 @@ import (
 	qdb "github.com/questdb/go-questdb-client/v4"
 )
 
+// Close can spend its whole deadline waiting for the server to confirm rows.
+// The slot lock is released after that, so it has a deadline of its own.
+const (
+	closeTimeout       = 5 * time.Second
+	slotReleaseTimeout = 5 * time.Second
+)
+
 func main() {
 	fmt.Println("READY")
 
 	var sender qdb.LineSender
+	// senderClosed is true after Close has been called. A later attempt
+	// waits for the slot lock and does not call Close again.
+	senderClosed := false
+	finishSender := func() error {
+		if sender == nil {
+			return nil
+		}
+		err := releaseSender(sender, senderClosed)
+		senderClosed = true
+		if err != nil {
+			return err
+		}
+		sender = nil
+		senderClosed = false
+		return nil
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for scanner.Scan() {
@@ -54,8 +78,9 @@ func main() {
 		switch verb {
 		case "CONNECT":
 			connectString := strings.TrimSpace(line[len(parts[0]):])
-			if sender != nil {
-				closeSender(sender)
+			if err := finishSender(); err != nil {
+				reply("ERR " + err.Error())
+				continue
 			}
 			var err error
 			sender, err = qdb.LineSenderFromConf(context.Background(), connectString)
@@ -179,16 +204,16 @@ func main() {
 			}
 
 		case "CLOSE":
-			if sender != nil {
-				closeSender(sender)
-				sender = nil
+			if err := finishSender(); err != nil {
+				reply("ERR " + err.Error())
+				continue
 			}
 			reply("OK")
 
 		case "EXIT":
-			if sender != nil {
-				closeSender(sender)
-				sender = nil
+			if err := finishSender(); err != nil {
+				reply("ERR " + err.Error())
+				return
 			}
 			reply("OK")
 			return
@@ -198,15 +223,36 @@ func main() {
 		}
 	}
 
-	if sender != nil {
-		closeSender(sender)
-	}
+	_ = finishSender()
 }
 
-func closeSender(s qdb.LineSender) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// releaseSender closes s once, then waits until its store-and-forward slot
+// lock is free. alreadyClosed means Close has already been called.
+func releaseSender(s qdb.LineSender, alreadyClosed bool) error {
+	if !alreadyClosed {
+		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		err := s.Close(ctx)
+		cancel()
+		if errors.Is(err, qdb.ErrCleanupFailed) {
+			return err
+		}
+	}
+	qs, ok := s.(qdb.QwpSender)
+	if !ok || qs.SlotLockReleased() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), slotReleaseTimeout)
 	defer cancel()
-	_ = s.Close(ctx)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !qs.SlotLockReleased() {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("slot lock still held: %w", qdb.ErrSfCleanupPending)
+		case <-ticker.C:
+		}
+	}
+	return nil
 }
 
 func reply(msg string) {

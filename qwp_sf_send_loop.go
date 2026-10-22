@@ -101,7 +101,9 @@ const qwpSfDefaultMaxFrameRejections = 4
 // the host index PickNext returned (see failover.md §2); the
 // factory owns the mapping idx → URL, auth headers, and TLS config.
 // Single-host factories may ignore idx — they always dial the same
-// address.
+// address. If an error comes with a non-nil transport, that transport still
+// needs cleanup; it must not be used to send data. The engine keeps track of
+// it until its close worker finishes.
 //
 // Implementations should return immediately on terminal errors
 // (auth rejection, version mismatch) and let transient errors
@@ -267,16 +269,6 @@ type qwpSfSendLoop struct {
 	// to -1 once we cross the boundary. Producer-only state.
 	replayTargetFsn int64
 
-	// hasReplayDictionaryDependency is true when a replay can start with a
-	// frame whose delta begins above id 0, meaning it refers to symbols the
-	// server was told about earlier. Such a replay needs the mirror sent to
-	// every fresh connection first. An engine that delta-encodes needs this
-	// from the start; in full-dictionary mode it turns on as soon as a
-	// recovered frame with a non-zero delta start shows up. The engine
-	// constructor has already scanned the surviving frames, so the initial
-	// value tells a slot whose frames all start at 0 apart from one that
-	// really does depend on earlier registrations.
-	hasReplayDictionaryDependency bool
 	// sentDictBytes mirrors — as concatenated [len varint][utf8] in global-id
 	// order — every symbol the loop has sent; sentDictCount is how many. It is
 	// the source for the reconnect catch-up frame. Written by the send
@@ -297,11 +289,6 @@ type qwpSfSendLoop struct {
 	// false; inner goroutines observe it via ctx.Done.
 	running atomic.Bool
 
-	// abandoned is set when sendLoopClose gives up waiting for an I/O
-	// goroutine wedged in un-cancellable disk I/O. The engine teardown must
-	// then leak the segment mmaps rather than unmap them under that goroutine.
-	abandoned atomic.Bool
-
 	// ctx is the loop's master context; cancel() forces both
 	// inner goroutines out of any blocking transport calls.
 	ctx    context.Context
@@ -314,6 +301,11 @@ type qwpSfSendLoop struct {
 	// lastError holds the first terminal error. Atomic pointer so
 	// the producer can sample it from any goroutine.
 	lastError atomic.Pointer[error]
+
+	// Final transport cleanup is separate from the first sending error.
+	// run publishes this before releasing wg; an unstarted loop records it
+	// in sendLoopClose instead. A server rejection must not hide this failure.
+	transportCloseError atomic.Pointer[error]
 
 	// lastTerminalServerError is the typed-payload sibling to
 	// lastError. Set when recordFatalServerError is called with a
@@ -376,6 +368,18 @@ type qwpSfSendLoop struct {
 	// progress and skip the recycle pacing.
 	acksOnConn atomic.Int64
 
+	// connReplayStart is the first FSN the current connection sends:
+	// engineAckedFsn()+1 when the connection was positioned. An ack below
+	// it covers only dictionary catch-up frames. setWireBaselineWithCatchUp
+	// writes it on the I/O goroutine before the connection's sender and
+	// receiver start.
+	connReplayStart int64
+	// totalDataOkAcks counts OK acks that cover at least one data frame of
+	// their connection. Acks that cover only catch-up frames are not
+	// counted. The drainer's durable-stall clock reads it as evidence that
+	// the server is processing frames.
+	totalDataOkAcks atomic.Int64
+
 	// Poison-frame detector state. poisonFsn is the FSN implicated by
 	// the most recent server-active rejection (retriable NACK, or
 	// non-orderly close after at least one send on the connection): the
@@ -418,9 +422,10 @@ type qwpSfSendLoop struct {
 	// Reconnect-loop status, exposed so engineAppendBlocking can
 	// distinguish "wire publishing but slow" from "wire is in the
 	// retry loop" when the backpressure deadline fires (spec §16).
-	// outageStartUnixNano is non-zero iff connectWithBackoff is
-	// currently running; reconnectAttempts is the per-outage counter
-	// (resets at the start of each connectWithBackoff call).
+	// outageStartUnixNano is non-zero while connectWithBackoff runs,
+	// including the recycle pause it waits out before its first dial;
+	// reconnectAttempts is the per-outage dial counter (resets at the
+	// start of each connectWithBackoff call).
 	outageStartUnixNano atomic.Int64
 	reconnectAttempts   atomic.Int64
 
@@ -477,7 +482,7 @@ func qwpSfNewSendLoop(
 	l := &qwpSfSendLoop{
 		engine:                  engine,
 		parkInterval:            parkInterval,
-		reconnectFactory:        factory,
+		reconnectFactory:        engine.trackConnectCleanup(factory),
 		reconnectMaxDuration:    reconnectMaxDuration,
 		reconnectInitialBackoff: reconnectInitialBackoff,
 		reconnectMaxBackoff:     reconnectMaxBackoff,
@@ -490,8 +495,6 @@ func qwpSfNewSendLoop(
 		poisonFsn:               -1,
 		lastProgressFsn:         -1,
 		maxFrameRejections:      qwpSfDefaultMaxFrameRejections,
-		hasReplayDictionaryDependency: engine.engineDeltaDictEnabled() ||
-			engine.engineRecoveredMaxReplayDeltaStart() > 0,
 	}
 	l.policyResolver.Store(&qwpSfPolicyResolver{})
 	l.dispatcher.Store(newQwpSfErrorDispatcher(nil, qwpSfDefaultErrorInboxCapacity))
@@ -513,6 +516,7 @@ func qwpSfNewSendLoop(
 	// the ring's "set once before producing starts" contract, and so
 	// every construction path — memory and SF — gets it for free.
 	engine.engineSetSendLoopWakeup(l.wakeSender)
+	engine.reader.Store(l)
 	return l
 }
 
@@ -587,9 +591,7 @@ func (l *qwpSfSendLoop) sendLoopSetPolicyResolver(r *qwpSfPolicyResolver) {
 // flood scenarios may lose a notification, matching offer's
 // best-effort contract.
 //
-// Safe to call from within a SenderErrorHandler: old.close() detects
-// that it is running on the old dispatcher's own loop goroutine and
-// returns without joining itself (see qwpSfErrorDispatcher.close).
+// Handler changes run on the application owner, not inside a callback.
 func (l *qwpSfSendLoop) sendLoopSetErrorHandler(handler SenderErrorHandler, capacity int) {
 	if capacity <= 0 {
 		capacity = qwpSfDefaultErrorInboxCapacity
@@ -693,70 +695,59 @@ func (l *qwpSfSendLoop) sendLoopStart() {
 	go l.run()
 }
 
-// qwpSfSendLoopCloseGrace bounds how long sendLoopClose waits for the I/O
-// goroutine to exit after cancelling its context. cancel() unwinds every
-// ctx-aware blocking op at once, so a goroutine still alive past this grace is
-// wedged in un-cancellable I/O — a disk-backed segment mmap page-fault on hung
-// storage. var (not const) so package tests can dial it down.
-var qwpSfSendLoopCloseGrace = 5 * time.Second
-
-// sendLoopClose stops the I/O goroutine and waits for it to exit, bounded by
-// qwpSfSendLoopCloseGrace so a goroutine wedged in un-cancellable disk I/O
-// cannot hang Close forever. Idempotent. Safe to call from any goroutine.
+// sendLoopClose asks the send loop to stop and waits until it has stopped.
+// The cleanup worker calls this without a deadline, even if the public Close
+// call has already stopped waiting.
 func (l *qwpSfSendLoop) sendLoopClose() error {
 	l.running.Store(false)
 	l.cancel()
-	joined := make(chan struct{})
-	go func() {
-		l.wg.Wait()
-		close(joined)
-	}()
-	timer := time.NewTimer(qwpSfSendLoopCloseGrace)
-	defer timer.Stop()
-	select {
-	case <-joined:
-		// run() exited: its own defers already released the transport, and both
-		// inner goroutines were joined before it returned, so reclaiming the
-		// remaining resources below cannot race the wire loop.
-	case <-timer.C:
-		// Wedged in I/O the ctx cannot reach (a disk-backed segment mmap
-		// page-fault on hung storage). Abandon rather than hang Close. The
-		// engine teardown must now leak the segment mmaps: unmapping them under
-		// the wedged goroutine, which is mid-dereference of the mapping, would
-		// fault the host process when storage resolves.
-		l.abandoned.Store(true)
-		qwpEffectiveLogger(l.logger).Warn("qwp/sf: send loop still running after close; "+
-			"abandoning (wedged in un-cancellable disk I/O)", "grace", qwpSfSendLoopCloseGrace)
-		// Release the WebSocket now rather than waiting on the wedged
-		// goroutine's defer (which may never run): the goroutine holds its own
-		// local transport reference, so swapping the atomic cannot strand it,
-		// and closeNow avoids the graceful-close handshake blocking on a dead
-		// peer. This reclaims the fd and the server-side connection.
-		if t := l.transport.Swap(nil); t != nil {
-			_ = t.closeNow()
-		}
-		// Dispatchers are safe to close on this path — offer() on a closed
-		// dispatcher is a no-op — which bounds the leak to the wedged goroutine.
-		l.closeDispatchers()
-		return l.checkErrorOrNil()
+	// Request stop before running a test hook that may panic. If it does, the
+	// engine keeps the resources alive, and the loop still gets the stop request.
+	if hook := qwpTestCloseSendLoopHook.Load(); hook != nil {
+		(*hook)()
 	}
+	// Request immediate transport teardown before joining workers, including
+	// when they are between network reads. The cancelled context only avoids
+	// waiting here; the transport's sole close worker retains ownership.
+	if t := l.transport.Load(); t != nil {
+		_ = t.closeContext(l.ctx)
+	}
+	// This runs inside owned shutdown work, never on a deadline-bound public
+	// caller. A late worker keeps both mappings and slot owned until it exits.
+	l.wg.Wait()
 	if t := l.transport.Swap(nil); t != nil {
-		_ = t.close()
+		l.recordTransportCloseError(t.close())
 	}
 	l.closeDispatchers()
+	if p := l.transportCloseError.Load(); p != nil {
+		return errors.Join(l.checkErrorOrNil(), *p)
+	}
 	return l.checkErrorOrNil()
 }
 
-// sendLoopAbandoned reports whether sendLoopClose gave up on a wedged I/O
-// goroutine. When true the engine must be torn down with engineCloseLeakSegments
-// so the still-live goroutine's mmap references stay valid.
-func (l *qwpSfSendLoop) sendLoopAbandoned() bool {
-	return l.abandoned.Load()
+// Save connection-close failures without changing the first sending error
+// reported to the caller. A transport's close result is non-nil only when its
+// release failed internally; see qwpTransport.closeErr.
+func (l *qwpSfSendLoop) recordTransportCloseError(err error) {
+	err = qwpTransportReleaseError(err)
+	if err == nil {
+		return
+	}
+	for {
+		old := l.transportCloseError.Load()
+		joined := err
+		if old != nil {
+			joined = errors.Join(*old, err)
+		}
+		if l.transportCloseError.CompareAndSwap(old, &joined) {
+			return
+		}
+	}
 }
 
-// closeDispatchers stops the error, connection, and progress dispatcher
-// goroutines. Safe even on the wedged-I/O abandon path: offer() on a closed
-// dispatcher is a no-op, so a still-running send loop cannot fault on them.
+// closeDispatchers stops the error, connection, and progress notification
+// workers after the send loop stops. Each close waits only a limited time for
+// callbacks. Engine cleanup is not the callbacks' responsibility.
 func (l *qwpSfSendLoop) closeDispatchers() {
 	if d := l.dispatcher.Load(); d != nil {
 		d.close()
@@ -858,10 +849,12 @@ func (l *qwpSfSendLoop) sendLoopTotalReconnectAttempts() int64 {
 }
 
 // sendLoopReconnectStatus reports whether the I/O loop is currently
-// inside connectWithBackoff. When reconnecting is true, attempts is
-// the per-outage attempt counter (≥ 1) and outageStart is the wall-
-// clock time the current outage began. When reconnecting is false,
-// attempts is 0 and outageStart is the zero time.Time.
+// inside connectWithBackoff, including the recycle pause before its
+// first dial. When reconnecting is true, attempts is the number of dials
+// in the current outage (0 while the loop waits out a recycle pause) and
+// outageStart is the wall-clock time the current outage began. When
+// reconnecting is false, attempts is 0 and outageStart is the zero
+// time.Time.
 //
 // Used by engineAppendBlocking to enrich the backpressure timeout
 // error per spec §16: distinguish "publishing but slow" from
@@ -883,6 +876,12 @@ func (l *qwpSfSendLoop) sendLoopTotalFramesSent() int64 {
 // sendLoopTotalAcks returns the cumulative ACK count received.
 func (l *qwpSfSendLoop) sendLoopTotalAcks() int64 {
 	return l.totalAcks.Load()
+}
+
+// sendLoopTotalDataOkAcks returns the number of OK acks that covered a data
+// frame (see totalDataOkAcks).
+func (l *qwpSfSendLoop) sendLoopTotalDataOkAcks() int64 {
+	return l.totalDataOkAcks.Load()
 }
 
 // sendLoopTotalFramesReplayed returns the cumulative count of
@@ -1047,7 +1046,7 @@ func (l *qwpSfSendLoop) run() {
 		// known — defense in depth on the unwind path.
 		defer func() { _ = recover() }()
 		if t := l.transport.Swap(nil); t != nil {
-			_ = t.close()
+			l.recordTransportCloseError(t.close())
 		}
 	}()
 	// Convert a panic on this wire-driving goroutine into the same
@@ -1069,7 +1068,7 @@ func (l *qwpSfSendLoop) run() {
 
 	if l.transport.Load() == nil && l.running.Load() {
 		initial := errors.New("async initial connect deferred to I/O goroutine")
-		if !l.connectWithBackoff(initial, "initial connect") {
+		if !l.connectWithBackoff(initial, "initial connect", 0) {
 			return
 		}
 	}
@@ -1172,17 +1171,16 @@ func (l *qwpSfSendLoop) run() {
 		// so a persistent rejection window (e.g. a WRITE_ERROR burst)
 		// would otherwise hot-loop send→NACK→reconnect with no growth.
 		// An ack covering the retried frame resets the counter.
+		// connectWithBackoff waits out the pause inside the outage window,
+		// so the reconnect status reports it as part of the outage.
+		var pause time.Duration
 		if rejectionRecycle {
-			pause := qwpSfComputeBackoff(l.rejectionRecycles,
+			pause = qwpSfComputeBackoff(l.rejectionRecycles,
 				l.reconnectInitialBackoff, l.reconnectMaxBackoff)
-			if !qwpSfSleepInterruptible(l.ctx, nil, pause) {
-				return
-			}
 			l.rejectionRecycles++
 		}
 		// Reconnect with backoff.
-		ok := l.connectWithBackoff(err, "reconnect")
-		if !ok {
+		if !l.connectWithBackoff(err, "reconnect", pause) {
 			return
 		}
 	}
@@ -1198,6 +1196,14 @@ func (l *qwpSfSendLoop) run() {
 // that gets acked counts as progress and resets the recycle backoff.
 func (l *qwpSfSendLoop) connMadeNoRealProgress() bool {
 	return l.acksOnConn.Load() == 0 || l.framesSentOnConn.Load() == 0
+}
+
+// coversDataFrame reports whether an OK ack for wire sequence seq covers a
+// data frame of the current connection rather than only its dictionary
+// catch-up frames. setWireBaselineWithCatchUp places k catch-up frames at
+// wire sequences 0..k-1, mapped to FSNs below connReplayStart.
+func (l *qwpSfSendLoop) coversDataFrame(seq int64) bool {
+	return l.fsnAtZero.Load()+seq >= l.connReplayStart
 }
 
 // runOneConnection runs the send + receive goroutines for the
@@ -1401,18 +1407,19 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 		return false, errors.New("qwp/sf: transport gone mid-loop")
 	}
 	payload := base[l.sendOffset+qwpSfFrameHeaderSize : frameEnd]
-	// Torn-dictionary guard, run in both delta and full-dictionary mode. A
+	// Torn-dictionary guard, run for every frame with a delta section. A
 	// frame fits what the server already knows as long as its delta starts at
 	// or below the end of the mirror. Starting below is fine: the server
 	// re-registers the ids it already has and takes the rest, and
 	// accumulateSentDict records that tail after the send. Starting past the
 	// end is not: those ids were never given to the server. That happens when
-	// the persisted dictionary and its frames came apart — a host or power
-	// crash, or a recovered slot whose dictionary could not be trusted and was
-	// left unused. Older servers filled such a hole with nulls and wrote wrong
+	// the persisted dictionary and its frames came apart, for example after a
+	// host or power crash on a slot whose writer did not fsync its dictionary.
+	// Recovery refuses such a slot before replay, and this guard checks again
+	// before each frame goes out. Older servers filled such a hole with nulls and wrote wrong
 	// data, so stop the sender here instead of putting the frame on the wire.
-	// Full-dictionary frames always start at 0, so they build up an empty
-	// mirror without holes even when the side-file is unavailable.
+	// Self-sufficient frames, which a slot written by another client can hold,
+	// always start at 0, so they build up an empty mirror without holes.
 	deltaStart, _, hasDelta := qwpFrameDeltaRange(payload)
 	if hasDelta {
 		if deltaStart > l.sentDictCount {
@@ -1456,15 +1463,9 @@ func (l *qwpSfSendLoop) trySendOne(ctx context.Context) (bool, error) {
 	// sendMessage above and accumulateSentDict here) must complete before
 	// that store, or accumulateSentDict could dereference an unmapped page.
 	if hasDelta {
-		// Record every delta, including in full-dictionary mode: what the
-		// producer writes now and what the recovered frames need are two
-		// different things, and a slot can lose its side-file while still
-		// holding a hole-free run of delta frames on disk. Once a frame with a
-		// non-zero start goes out, every fresh connection from here on needs
-		// the earlier ids before replay begins.
-		if deltaStart > 0 {
-			l.hasReplayDictionaryDependency = true
-		}
+		// Record every delta, including the self-sufficient frames a slot
+		// adopted from another client can hold, so every fresh connection can
+		// be sent the earlier ids before replay begins.
 		l.accumulateSentDict(payload)
 	}
 	// Publish highestFullySent only now, after every read of payload. Until
@@ -1987,6 +1988,9 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 		// backoff into a ~initial-backoff hot loop.
 		l.totalAcks.Add(1)
 		l.acksOnConn.Add(1)
+		if l.coversDataFrame(seq) {
+			l.totalDataOkAcks.Add(1)
+		}
 		if l.durableAckMode {
 			// Durable mode: stash the OK and wait for STATUS_DURABLE_ACK to
 			// trim. serverAckedSeq is deliberately not recorded here — the
@@ -2051,7 +2055,11 @@ func (l *qwpSfSendLoop) receiverLoop(ctx context.Context) error {
 // async-initial-connect path (phase="initial connect"); the phase
 // string only flavors the log/error message — control flow is
 // identical.
-func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
+//
+// pause is the recycle backoff run() chose for a rejection-driven or
+// no-progress recycle. It is waited out inside the outage window, before
+// the first dial; the initial connect passes 0.
+func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string, pause time.Duration) bool {
 	if l.tracker == nil {
 		// Legacy single-host path (tests that didn't call
 		// sendLoopSetHostTracker). Synthesize an implicit 1-host
@@ -2066,6 +2074,12 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 		l.outageStartUnixNano.Store(0)
 		l.reconnectAttempts.Store(0)
 	}()
+	// The recycle pause belongs to the outage. The reconnect status reports
+	// it, so the drainer's watchdog does not count it as connected time, and
+	// a backpressure timeout reports it as reconnecting.
+	if !qwpSfSleepInterruptible(l.ctx, nil, pause) {
+		return false
+	}
 
 	// Snapshot the entering previousIdx and consume it for this
 	// connect cycle. The round-walk calls RecordMidStreamFailure
@@ -2200,7 +2214,7 @@ func (l *qwpSfSendLoop) connectWithBackoff(initial error, phase string) bool {
 func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 	old := l.transport.Swap(newTransport)
 	if old != nil {
-		_ = old.close()
+		l.recordTransportCloseError(old.close())
 	}
 	replayStart := l.engine.engineAckedFsn() + 1
 	l.highestFullySent.Store(-1)
@@ -2230,13 +2244,17 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 }
 
 // setWireBaselineWithCatchUp sets the wire-sequence baseline for a fresh
-// connection. When the frames about to replay refer to symbols registered on
-// an earlier connection and the sent-dict mirror is non-empty, it first sends a
+// connection. Whenever the sent-dict mirror is non-empty, it first sends a
 // full-dictionary catch-up frame (or several, under a small batch cap) so the
 // fresh server — whose dictionary starts empty — can make sense of the delta
-// frames that replay next. The catch-up frames occupy wire seqs 0..k-1, which
+// frames that replay next. It does so even when every frame about to replay
+// carries its dictionary from id 0, as in a slot adopted from the Java
+// client's full-dictionary fallback: the producer's new frames are deltas above
+// the mirror, and the catch-up costs only the dictionary's bytes once per
+// connection. The catch-up frames occupy wire seqs 0..k-1, which
 // map to already-acked FSNs (harmless re-acks), so the first real replay frame
-// still lands on replayStart.
+// still lands on replayStart. It records replayStart as connReplayStart, which
+// coversDataFrame uses to tell those catch-up acks from data acks.
 //
 // Caller must have reset highestFullySent / serverAckedSeq / framesSentOnConn
 // / acksOnConn and the durable tracker first. Runs on the goroutine that owns
@@ -2245,8 +2263,9 @@ func (l *qwpSfSendLoop) swapClient(newTransport *qwpTransport) error {
 // that is not fatal — reset to the plain baseline so the first real send
 // surfaces the wire failure and run()'s reconnect redoes the catch-up.
 func (l *qwpSfSendLoop) setWireBaselineWithCatchUp(replayStart int64) {
+	l.connReplayStart = replayStart
 	transport := l.transport.Load()
-	if transport != nil && l.hasReplayDictionaryDependency && l.sentDictCount > 0 {
+	if transport != nil && l.sentDictCount > 0 {
 		l.nextWireSeq.Store(0)
 		if k, err := l.sendDictCatchUp(l.ctx, transport); err == nil {
 			l.fsnAtZero.Store(replayStart - int64(k))

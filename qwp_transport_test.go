@@ -390,8 +390,10 @@ func TestQwpTransportVersionMissingRejected(t *testing.T) {
 	if !strings.Contains(err.Error(), qwpHeaderVersion) {
 		t.Fatalf("expected error mentioning %s, got: %v", qwpHeaderVersion, err)
 	}
-	if tr.conn != nil {
-		t.Fatal("conn should be nil after rejected handshake")
+	select {
+	case <-tr.closeDone:
+	default:
+		t.Fatal("rejected connection not released")
 	}
 }
 
@@ -423,8 +425,10 @@ func TestQwpTransportVersionMismatchRejected(t *testing.T) {
 	if !strings.Contains(err.Error(), "version") {
 		t.Fatalf("expected version error, got: %v", err)
 	}
-	if tr.conn != nil {
-		t.Fatal("conn should be nil after rejected handshake")
+	select {
+	case <-tr.closeDone:
+	default:
+		t.Fatal("rejected connection not released")
 	}
 }
 
@@ -504,8 +508,10 @@ func TestQwpTransportNegotiationDecodeFailureClosesConn(t *testing.T) {
 	if !strings.Contains(err.Error(), "SERVER_INFO") {
 		t.Errorf("error = %v, want SERVER_INFO", err)
 	}
-	if tr.conn != nil {
-		t.Error("conn must be nil after failed SERVER_INFO read")
+	select {
+	case <-tr.closeDone:
+	default:
+		t.Fatal("failed SERVER_INFO connection not released")
 	}
 }
 

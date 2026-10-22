@@ -277,13 +277,9 @@ func TestQwpDispatcherCloseAbandonsWedgedHandler(t *testing.T) {
 	}
 }
 
-// TestQwpDispatcherReentrantCloseCountsAbandonedAsDropped pins the accounting
-// on the re-entrant close path: close() called by the handler returns before
-// close()'s own leftovers sweep (the handler owns the loop goroutine), so when
-// loop() unwinds into drain() and the drain deadline fires, whatever is still
-// queued must be counted as dropped rather than stranded uncounted. The hard
-// invariant is delivered + dropped == offered.
-func TestQwpDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
+// Owner-side close accounts for queued notifications even when draining runs
+// out of time. The invariant is delivered + dropped == offered.
+func TestQwpDispatcherOwnerCloseCountsDropped(t *testing.T) {
 	const extra = 12
 	var d *qwpDispatcher[*SenderConnectionEvent]
 	queued := make(chan struct{})
@@ -291,7 +287,6 @@ func TestQwpDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
 	d = newQwpConnDispatcher(func(SenderConnectionEvent) {
 		once.Do(func() {
 			<-queued
-			d.close() // re-entrant: returns without the close-side sweep
 		})
 		// Slow enough that drain()'s deadline fires with items still queued.
 		time.Sleep(qwpSfDispatcherDrainTimeout + 20*time.Millisecond)
@@ -306,34 +301,28 @@ func TestQwpDispatcherReentrantCloseCountsAbandonedAsDropped(t *testing.T) {
 		}
 	}
 	close(queued)
+	d.close()
 
 	joined := make(chan struct{})
 	go func() { d.wg.Wait(); close(joined) }()
 	select {
 	case <-joined:
 	case <-time.After(10 * time.Second):
-		t.Fatal("dispatcher loop never exited after re-entrant close")
+		t.Fatal("dispatcher loop never exited after owner close")
 	}
 
 	delivered, dropped := d.totalDelivered(), d.droppedNotifications()
 	if got, want := delivered+dropped, int64(extra+1); got != want {
 		t.Fatalf("delivered(%d) + dropped(%d) = %d, want %d — items abandoned on the "+
-			"re-entrant close path went uncounted", delivered, dropped, got, want)
+			"close path went uncounted", delivered, dropped, got, want)
 	}
 }
 
-// TestQwpDispatcherReentrantClose exercises the loopGoid guard: a handler that
-// calls close() on the loop goroutine must return immediately (recognising it is
-// the loop goroutine) instead of self-joining via wg.Wait — which would stall
-// until the join timeout, or deadlock if the budget were unbounded.
-func TestQwpDispatcherReentrantClose(t *testing.T) {
+// The callback notifies the owner, which closes after the callback returns.
+func TestQwpDispatcherNotifiesOwnerToClose(t *testing.T) {
 	var d *qwpDispatcher[*SenderConnectionEvent]
-	var innerClose atomic.Int64 // nanoseconds the re-entrant close() took
 	reentered := make(chan struct{})
 	d = newQwpConnDispatcher(func(SenderConnectionEvent) {
-		start := time.Now()
-		d.close() // re-entrant close from the loop goroutine
-		innerClose.Store(int64(time.Since(start)))
 		close(reentered)
 	}, 4)
 
@@ -341,17 +330,12 @@ func TestQwpDispatcherReentrantClose(t *testing.T) {
 	select {
 	case <-reentered:
 	case <-time.After(3 * time.Second):
-		t.Fatal("re-entrant close deadlocked the loop goroutine")
+		t.Fatal("callback never notified the owner")
 	}
-	// The guard short-circuits before the join budget, so the inner close is near
-	// instant — well under the join timeout it would otherwise have waited out.
-	if got := time.Duration(innerClose.Load()); got >= qwpSfDispatcherCloseJoinTimeout {
-		t.Errorf("re-entrant close took %v, want << join timeout %v (loopGoid guard not taken)",
-			got, qwpSfDispatcherCloseJoinTimeout)
-	}
-	// The dispatcher is closed; a subsequent offer/close stays safe and idempotent.
+	d.close() // The notified owner closes the dispatcher.
+	// A subsequent offer/close stays safe and idempotent.
 	if d.offer(&SenderConnectionEvent{Kind: SenderConnected}) {
-		t.Error("offer after re-entrant close should return false")
+		t.Error("offer after close should return false")
 	}
 	d.close()
 }
