@@ -452,9 +452,10 @@ terminally against a replica.
 When the server rejects a published QWP batch, the rejection surfaces as a
 `*qdb.SenderError` carrying a stable `Category` (`SCHEMA_MISMATCH`,
 `PARSE_ERROR`, `INTERNAL_ERROR`, `SECURITY_ERROR`, `WRITE_ERROR`,
-`NOT_WRITABLE`, `PROTOCOL_VIOLATION`, `UNKNOWN`), the server message, and the
-`[FromFsn, ToFsn]` span — join that span against `FlushAndGetSequence` to
-identify the rejected rows. There are two delivery paths, same payload:
+`NOT_WRITABLE`, `DICTIONARY_GAP`, `PROTOCOL_VIOLATION`, `UNKNOWN`), the server
+message, and the `[FromFsn, ToFsn]` span — join that span against
+`FlushAndGetSequence` to identify the rejected rows. There are two delivery
+paths, same payload:
 
 ```go
 // Async handler — register on the QuestDB handle (applied to every pooled
@@ -486,7 +487,9 @@ Nothing is ever silently dropped. Each `Category` resolves to a `Policy`:
   is dropped and the producer keeps writing; the handler is only informed.
   `RETRIABLE_OTHER` (`NOT_WRITABLE`) additionally rotates to the
   next endpoint. A frame rejected repeatedly with no ack progress escalates to
-  `TERMINAL` via the poison-frame detector (`max_frame_rejections`, default 4).
+  `TERMINAL` via the poison-frame detector, once it has been rejected
+  `max_frame_rejections` times in a row (default 4) and the rejections have
+  lasted `reconnect_max_duration_millis` (default 5 minutes).
 - `TERMINAL` — latch the error; the next producer call returns it and the sender
   stops draining until you close and rebuild it. The rejected bytes remain in
   the local buffer (on disk when `sf_dir` is set).
@@ -494,12 +497,20 @@ Nothing is ever silently dropped. Each `Category` resolves to a `Policy`:
 Resolution precedence, highest first: `WithErrorPolicyResolver` →
 `WithErrorPolicy(category, policy)` → connect-string `on_<category>_error` →
 `on_server_error` → defaults. `PROTOCOL_VIOLATION` is always `TERMINAL` and
-`UNKNOWN` is always `RETRIABLE`; overrides for those two are ignored. Connect-string equivalents take `terminal` / `retriable` /
-`retriable_other` (and `auto` for the global key):
+`UNKNOWN` is always `RETRIABLE`; overrides for those two are ignored.
+Connect-string equivalents take `terminal` / `retriable` / `retriable_other`
+(and `auto` for the global key):
 
 ```text
 ws::addr=localhost:9000;on_server_error=retriable;on_schema_error=terminal;
 ```
+
+Per-category keys exist only for `SCHEMA_MISMATCH`, `PARSE_ERROR`,
+`INTERNAL_ERROR`, `SECURITY_ERROR`, and `WRITE_ERROR` (`on_schema_error`,
+`on_parse_error`, `on_internal_error`, `on_security_error`, `on_write_error`).
+`NOT_WRITABLE` and `DICTIONARY_GAP` can be changed only with `WithErrorPolicy`
+on a standalone sender, or with `on_server_error`, which also changes every
+category whose own key isn't set.
 
 Background drainers (`drain_orphans=on`) apply the same policy to the slots
 they drain. When a rejection there resolves to `TERMINAL`, the drainer gives
@@ -544,7 +555,7 @@ affected.
 | `close_flush_timeout_millis` | 5000 | How long Close waits for server acknowledgements; see [shutdown](#qwp-shutdown-and-ownership). |
 | `drain_orphans` | `off` | When `on`, find other slots under `sf_dir` that still hold unsent rows and send them in the background. Closing the sender stops this. |
 | `max_background_drainers` | 4 | How many orphan slots are sent at once. |
-| `max_frame_rejections` | 4 | How many times in a row the server may reject the same frame before the sender stops with a terminal error. |
+| `max_frame_rejections` | 4 | How many times in a row the server may reject the same frame before the sender stops with a terminal error. The rejections must also have lasted `reconnect_max_duration_millis`. |
 | `request_durable_ack` | `off` | Wait for object-storage upload before acknowledging; see [Flushing and backpressure](#flushing-and-backpressure). |
 | `durable_ack_keepalive_interval_millis` | 200 | Idle ping that asks for pending durable acknowledgements; `<= 0` disables it, and an idle producer can then stall `AwaitAckedFsn`. |
 
