@@ -51,14 +51,15 @@ const (
 	qwpEventKindError
 	// qwpEventKindTransportError is a synthesized client-side terminal
 	// failure: reader closed, server closed, decoder out of sync, send
-	// failure, or unknown msg_kind. The connection's per-connection
-	// state is no longer trustworthy and the I/O goroutine has
-	// poisoned ioErr — every emission of this kind goes through
-	// poisonAndEmitError, so a follow-up submitQuery returns the
-	// original cause synchronously. Routed by the failover orchestrator
-	// to the reconnect-and-replay path unless protocolErr is set;
-	// surfaced to the user as a plain error when failover is disabled,
-	// exhausted, or skipped.
+	// failure, unknown msg_kind, or an oversized server message. The
+	// connection's per-connection state is no longer trustworthy and
+	// the I/O goroutine has poisoned ioErr — every emission of this kind
+	// from the I/O goroutine goes through emitPoisoned (via
+	// poisonAndEmitError or poisonAndEmitProtocolError), so a follow-up
+	// submitQuery returns the original cause synchronously. Routed by
+	// the failover orchestrator to the reconnect-and-replay path unless
+	// protocolErr is set; surfaced to the user as a plain error when
+	// failover is disabled, exhausted, or skipped.
 	qwpEventKindTransportError
 	// qwpEventKindFailoverReset is emitted by the session orchestrator
 	// (not the I/O goroutine) on the consumer side after a successful
@@ -97,15 +98,17 @@ type qwpEvent struct {
 	// wrap with %w so callers can errors.As against the underlying
 	// type (e.g. *QwpRoleMismatchError raised by a failed reconnect).
 	// Nil for I/O-goroutine-emitted transport errors that only carry
-	// a string message via poisonAndEmitError.
+	// a string message via emitPoisoned.
 	transportErr error
 
 	// TransportError kind — set when the server answered with a frame
 	// this client cannot decode or does not recognise, or with a
-	// message larger than qwpMaxFrameReadLimit. The request
-	// reached the server, which may already have executed it, and the
-	// same server sends the same frame again, so the failover
-	// orchestrator surfaces the error instead of resubmitting.
+	// message larger than qwpMaxFrameReadLimit. The request reached
+	// the server, which may already have executed it, and each
+	// connection negotiates its protocol version, so such a response
+	// means the server broke the protocol rather than that the
+	// connection dropped. The failover orchestrator surfaces the error
+	// instead of resubmitting, on any endpoint.
 	protocolErr bool
 
 	// FailoverReset kind — populated by qwp_query_failover.go after a
@@ -467,9 +470,9 @@ func (io *qwpEgressIO) submitQuery(ctx context.Context, req qwpRequest) error {
 	}
 }
 
-// setIoErr latches err as the connection's terminal ioErr — first
-// writer wins. Called by the dispatcher (always via
-// poisonAndEmitError) on any transport-class fault so subsequent
+// setIoErr records err as the connection's terminal ioErr — first
+// writer wins. Called through emitPoisoned on every dispatcher poison,
+// and directly by readerRun's panic recovery, so subsequent
 // submitQuery calls fail immediately rather than running a fresh
 // query against a dead conn or desynced decoder.
 func (io *qwpEgressIO) setIoErr(err error) {
@@ -834,10 +837,11 @@ func (io *qwpEgressIO) dispatcherRun() {
 			io.receiveLoop()
 		}
 
-		// A transport-class fault during this query latched ioErr — every
-		// poison (decode error, unknown msg_kind, header-parse failure,
-		// QUERY_REQUEST / CANCEL / CREDIT send failure, the cancel-ack
-		// watchdog, reader/server close) routes through poisonAndEmitError.
+		// A poison during this query recorded ioErr — every poison (decode
+		// error, unknown msg_kind, header-parse failure, oversized server
+		// message, QUERY_REQUEST / CANCEL / CREDIT send failure, the
+		// cancel-ack watchdog, reader/server close) routes through
+		// emitPoisoned.
 		// The connection is no longer trustworthy and no future submitQuery
 		// can be served, so there is nothing left for either goroutine to
 		// do. Cancel ioCtx to unblock the reader's conn.Read, drain frameCh
