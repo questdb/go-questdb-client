@@ -1032,12 +1032,13 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryO
 		case qwpEventKindError:
 			return ExecResult{}, eventToError(ev, reqId)
 		case qwpEventKindTransportError:
-			// The session has already exhausted its replay budget (or
-			// failover was disabled). Surface the underlying transport
-			// error so callers can errors.Is / errors.As against the
-			// cause without picking up *QwpQueryError (which carries
-			// server-status bytes that are meaningless for client-
-			// side faults).
+			// The session did not replay (failover disabled,
+			// replay_exec=off, or a server response the client cannot
+			// decode) or has exhausted its replay budget. Surface the
+			// underlying transport error so callers can errors.Is /
+			// errors.As against the cause without picking up
+			// *QwpQueryError (which carries server-status bytes that
+			// are meaningless for client-side faults).
 			return ExecResult{}, transportEventError(ev)
 		case qwpEventKindFailoverReset:
 			// Only reachable when this Exec opted into replay

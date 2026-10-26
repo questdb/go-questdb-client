@@ -1256,28 +1256,32 @@ func (io *qwpEgressIO) emit(ev qwpEvent) {
 	}
 }
 
-// poisonAndEmitError latches msg as the connection's terminal ioErr
-// AND emits it as the current query's TransportError event. The single
-// entry point for every transport-class fault on the dispatcher path:
-// reader-error / server-close, send failures (QUERY_REQUEST / CANCEL /
-// CREDIT), decoder or framing failures that desync the per-connection
-// state (symbol dict, current-query schema, zstd stream), and unknown
-// msg_kinds. After any of those, the connection is unusable — the
-// decoder may be silently out of sync (a mis-advanced reader can leave
-// the dict accidentally aligned at the offset level while values are
-// wrong, producing silently corrupt rows), or the conn itself is dead.
-// The latched ioErr causes every subsequent submitQuery to return
+// poisonAndEmitError records msg as the connection's terminal ioErr
+// AND emits it as the current query's TransportError event. It covers
+// faults of the connection itself on the dispatcher path: reader error
+// / server close, send failures (QUERY_REQUEST / CANCEL / CREDIT), the
+// cancel-ack watchdog, and a recovered dispatcher panic. A server frame
+// that this client cannot decode or does not recognise, or a message
+// larger than qwpMaxFrameReadLimit, goes through
+// poisonAndEmitProtocolError instead. After either, the connection is
+// unusable — a decode failure can leave the decoder silently out of
+// sync (a mis-advanced reader can leave the dict accidentally aligned
+// at the offset level while values are wrong, producing silently
+// corrupt rows), and a transport fault leaves the conn dead.
+// The recorded ioErr causes every subsequent submitQuery to return
 // immediately with the original cause, matching the documented
 // "I/O goroutine has poisoned ioErr" contract on
 // qwpEventKindTransportError and Java's notifyTerminalFailure pattern.
 // Does NOT flip currentQueryDone — callers that also need to terminate
 // the current query set it where it belongs.
 //
-// The transport-error kind makes the failover orchestrator route this
-// to the reconnect-and-replay path; without the kind split a server
-// QUERY_ERROR would be indistinguishable from a decoder desync and the
-// orchestrator would either retry SQL errors (wrong) or never retry
-// transport faults (also wrong).
+// The transport-error kind lets the failover orchestrator route this
+// to the reconnect-and-replay path when the session permits replay;
+// without the kind split a server QUERY_ERROR would be
+// indistinguishable from a transport fault and the orchestrator would
+// either retry SQL errors (wrong) or never retry transport faults
+// (also wrong). Protocol errors carry the same kind but are never
+// replayed (see poisonAndEmitProtocolError).
 func (io *qwpEgressIO) poisonAndEmitError(msg string) {
 	io.emitPoisoned(msg, false)
 }
