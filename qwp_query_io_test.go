@@ -1303,6 +1303,75 @@ func TestQwpEgressIODecodeFailurePoisons(t *testing.T) {
 	}
 }
 
+// TestQwpEgressIOProtocolErrorFlag pins which TransportError events
+// carry protocolErr, the flag that stops the failover orchestrator from
+// resubmitting. Every server response this client cannot decode, does
+// not recognise, or that exceeds qwpMaxFrameReadLimit sets it; a
+// dropped connection does not, so failover still replays it.
+func TestQwpEgressIOProtocolErrorFlag(t *testing.T) {
+	cases := []struct {
+		name         string
+		response     []byte // nil: close the connection without answering
+		wantProtocol bool
+		wantMsg      string
+	}{
+		{"FrameTooShortForMsgKind", []byte{0x01, 0x02, 0x03}, true, "too short for msg_kind"},
+		{"UnknownMsgKind", writeQwpFrame(0, []byte{0x7E}), true, "unknown msg_kind"},
+		{"ResultBatchDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindResultBatch)}), true, "decode"},
+		{"ResultEndDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindResultEnd)}), true, "unexpected end of buffer"},
+		{"QueryErrorDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindQueryError)}), true, "unexpected end of buffer"},
+		{"CacheResetDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindCacheReset)}), true, "truncated"},
+		{"ExecDoneDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindExecDone)}), true, "unexpected end of buffer"},
+		{"OversizedMessage", make([]byte, qwpMaxFrameReadLimit+1), true, "server message too large"},
+		{"ConnectionClosed", nil, false, "server closed connection"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newQwpMockEgressServer(t, func(m *qwpMockEgressConn) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				m.readBinary(ctx)
+				if tc.response == nil {
+					return
+				}
+				// The client can close the connection partway through an
+				// oversized message, so the write error is ignored.
+				_ = m.conn.Write(ctx, websocket.MessageBinary, tc.response)
+				for {
+					if _, _, err := m.conn.Read(ctx); err != nil {
+						return
+					}
+				}
+			})
+			defer srv.Close()
+
+			tr := connectEgress(t, srv.URL)
+			defer tr.close()
+
+			io := newQwpEgressIO(tr, 1, 0)
+			io.start()
+			defer shutdownIO(t, io)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := io.submitQuery(ctx, qwpRequest{sql: "x", requestId: 1}); err != nil {
+				t.Fatalf("submitQuery: %v", err)
+			}
+
+			ev := takeEventOrFail(t, io, 2*time.Second)
+			if ev.kind != qwpEventKindTransportError {
+				t.Fatalf("event kind = %v, want TransportError (errMsg=%q)", ev.kind, ev.errMessage)
+			}
+			if ev.protocolErr != tc.wantProtocol {
+				t.Errorf("protocolErr = %v, want %v (errMsg=%q)", ev.protocolErr, tc.wantProtocol, ev.errMessage)
+			}
+			if !strings.Contains(ev.errMessage, tc.wantMsg) {
+				t.Errorf("errMessage = %q, want contains %q", ev.errMessage, tc.wantMsg)
+			}
+		})
+	}
+}
+
 // TestQwpEgressIOReleaseAfterShutdown exercises the closed.Load()
 // early-exit in releaseBuffer: a user that holds onto a batch across
 // shutdown must be able to call release() without panicking,
