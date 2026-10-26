@@ -27,6 +27,7 @@ package questdb
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"unsafe"
 
 	// Pure-Go zstd via klauspost/compress.
@@ -1137,6 +1138,12 @@ func (d *qwpQueryDecoder) decodeQueryError(payload []byte) (*QwpQueryError, erro
 // Wire layout (after the 12-byte header):
 //
 //	msg_kind(1) + request_id(int64 LE) + op_type(1) + rows_affected(varint)
+//
+// QuestDB 9.4.0 through 10.0.1 encode the "no row count" sentinel -1
+// for parse-time-executed statements (RENAME TABLE, TRUNCATE, SET, ...),
+// which arrives as the varint for 2^64-1. That exact value decodes as
+// 0 rows, matching what 10.1.0 and later send for the same statements.
+// Any other value above int63 is still a decode error.
 func (d *qwpQueryDecoder) decodeExecDone(payload []byte) (requestId int64, result ExecResult, err error) {
 	msgKind, err := d.parseFrameHeader(payload)
 	if err != nil {
@@ -1158,9 +1165,18 @@ func (d *qwpQueryDecoder) decodeExecDone(payload []byte) (requestId int64, resul
 	if err != nil {
 		return 0, ExecResult{}, err
 	}
-	rowsAffected, err := d.br.readVarintInt63()
+	rawRows, err := d.br.readVarint()
 	if err != nil {
 		return 0, ExecResult{}, err
+	}
+	var rowsAffected int64
+	switch {
+	case rawRows == math.MaxUint64:
+		rowsAffected = 0
+	case rawRows > math.MaxInt64:
+		return 0, ExecResult{}, newQwpDecodeError("varint overflow: value exceeds int63")
+	default:
+		rowsAffected = int64(rawRows)
 	}
 	return requestId, ExecResult{
 		OpType:       opType,
