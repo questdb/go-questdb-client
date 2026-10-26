@@ -664,11 +664,12 @@ var errExecDesynced = errors.New(
 
 // errExecReturnedRows reports Exec on a statement that streams rows.
 // The server executes the statement before the first row arrives, so
-// the message tells the caller not to rerun it (COPY ... FROM, for
-// example, has already started its import).
+// the message warns against repeating one with side effects (COPY ...
+// FROM, for example, has already started its import).
 var errExecReturnedRows = errors.New(
-	"qwp query: Exec called on a SELECT-style statement, which the server " +
-		"has already executed; do not rerun it, and use Query for statements that return rows")
+	"qwp query: Exec called on a statement that returns rows; use Query for it. " +
+		"If your statement returns rows and also has side-effects, such as COPY, " +
+		"don't repeat it because it's already executed")
 
 // reconnectAndReplay tears down the current generation, demotes the
 // just-failed endpoint and walks the host tracker by (state, zone)
@@ -975,9 +976,9 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QwpQuery
 //
 // Calling Exec on a statement that returns rows returns an error —
 // such a statement sends RESULT_BATCH + RESULT_END, which Exec does
-// not expect. Use Query for SELECTs. The server has already executed
-// the statement by then: COPY ... FROM, for example, has started its
-// import, so do not rerun it through Query.
+// not expect. Use Query for such statements. If your statement returns
+// rows and also has side-effects, such as COPY, don't repeat it because
+// it's already executed.
 func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (ExecResult, error) {
 	if c.closed.Load() {
 		return ExecResult{}, errors.New("qwp query: client is closed")

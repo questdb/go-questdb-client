@@ -1147,7 +1147,7 @@ func TestQwpExecOnSelectSurfacesMisuse(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected misuse error")
 	}
-	for _, want := range []string{"SELECT-style", "already executed"} {
+	for _, want := range []string{"returns rows", "use Query", "side-effects", "already executed"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err=%v, want contains %q", err, want)
 		}
