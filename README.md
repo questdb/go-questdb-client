@@ -769,7 +769,7 @@ through `Query`. If your statement returns rows and also has side-effects,
 such as COPY, don't repeat it because it's already executed. When failover
 is enabled, `Query` resends its SQL after a connection failure, while `Exec`
 resends only with `replay_exec=on`. Neither resends after a server response
-the client cannot decode.
+the client cannot decode, including one over the client's frame size limit.
 
 A runnable example is at
 [`examples/qwp/basic-query/main.go`](examples/qwp/basic-query/main.go).

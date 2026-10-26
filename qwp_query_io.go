@@ -101,7 +101,8 @@ type qwpEvent struct {
 	transportErr error
 
 	// TransportError kind — set when the server answered with a frame
-	// this client cannot decode or does not recognise. The request
+	// this client cannot decode or does not recognise, or with a
+	// message larger than qwpMaxFrameReadLimit. The request
 	// reached the server, which may already have executed it, and the
 	// same server sends the same frame again, so the failover
 	// orchestrator surfaces the error instead of resubmitting.
@@ -607,6 +608,11 @@ func (io *qwpEgressIO) notify() {
 	}
 }
 
+// errQwpInboundFrameTooLarge reports a server message that fills
+// qwpMaxFrameReadLimit without ending. No valid QWP frame is that large.
+var errQwpInboundFrameTooLarge = fmt.Errorf(
+	"inbound frame exceeds %d-byte read limit", qwpMaxFrameReadLimit)
+
 // qwpReadFrameInto reads one complete WebSocket message from r into the
 // recycled buffer *pb, reusing its capacity across frames (the whole
 // point of the pool — it replaces coder/websocket.Conn.Read's per-frame
@@ -626,9 +632,7 @@ func qwpReadFrameInto(r io.Reader, pb *[]byte) ([]byte, error) {
 		if len(b) == cap(b) {
 			if cap(b) >= qwpMaxFrameReadLimit {
 				*pb = b
-				return nil, fmt.Errorf(
-					"qwp: inbound frame exceeds %d-byte read limit",
-					qwpMaxFrameReadLimit)
+				return nil, errQwpInboundFrameTooLarge
 			}
 			nc := cap(b) * 2
 			if nc < 64*1024 {
@@ -954,7 +958,16 @@ func (io *qwpEgressIO) receiveLoop() {
 				return
 			}
 			if ev.err != nil {
-				io.poisonAndEmitError(fmt.Sprintf("qwp: server closed connection: %v", ev.err))
+				if errors.Is(ev.err, errQwpInboundFrameTooLarge) ||
+					errors.Is(ev.err, websocket.ErrMessageTooBig) {
+					// The server answered with a message larger than any
+					// valid QWP frame, so it is a protocol error like a
+					// frame the decoder rejects, not a dropped connection.
+					io.poisonAndEmitProtocolError(
+						fmt.Sprintf("qwp: server message too large: %v", ev.err))
+				} else {
+					io.poisonAndEmitError(fmt.Sprintf("qwp: server closed connection: %v", ev.err))
+				}
 				io.currentQueryDone = true
 				return
 			}
@@ -1270,7 +1283,8 @@ func (io *qwpEgressIO) poisonAndEmitError(msg string) {
 }
 
 // poisonAndEmitProtocolError is poisonAndEmitError for a frame the
-// server sent that this client cannot decode or does not recognise.
+// server sent that this client cannot decode or does not recognise,
+// or a message larger than qwpMaxFrameReadLimit.
 // The event carries protocolErr, so the failover orchestrator surfaces
 // it rather than resubmitting a request the server has already
 // received.

@@ -1128,7 +1128,13 @@ func newProtocolErrorFailoverClient(t *testing.T, badFrame []byte, replayExec bo
 					"after a response it could not decode", idx)
 			}
 			_, _, _ = m.conn.Read(ctx)
-			m.sendBinary(ctx, badFrame)
+			if len(badFrame) > qwpMaxFrameReadLimit {
+				// The client stops reading partway through an oversized
+				// message and closes the connection, so the write can fail.
+				_ = m.conn.Write(ctx, websocket.MessageBinary, badFrame)
+			} else {
+				m.sendBinary(ctx, badFrame)
+			}
 			for {
 				if _, _, err := m.conn.Read(ctx); err != nil {
 					return
@@ -1197,6 +1203,22 @@ func TestQwpExecProtocolErrorDoesNotReplay(t *testing.T) {
 	assertNoResubmit(t, err, cluster)
 	if !strings.Contains(err.Error(), "int63") {
 		t.Errorf("err = %v, want the decoder's int63 error", err)
+	}
+}
+
+// TestQwpExecOversizedResponseDoesNotReplay verifies that a server
+// message larger than qwpMaxFrameReadLimit is a protocol error: even
+// with replay_exec=on, Exec surfaces it without resubmitting.
+func TestQwpExecOversizedResponseDoesNotReplay(t *testing.T) {
+	badFrame := make([]byte, qwpMaxFrameReadLimit+1)
+	c, cluster := newProtocolErrorFailoverClient(t, badFrame, true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Exec(ctx, "RENAME TABLE a TO b")
+	assertNoResubmit(t, err, cluster)
+	if !strings.Contains(err.Error(), "server message too large") {
+		t.Errorf("err = %v, want the oversized-message error", err)
 	}
 }
 
