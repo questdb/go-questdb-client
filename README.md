@@ -761,6 +761,14 @@ query failure surfaces as a `*qdb.QwpQueryError` from `Batches()` or `Exec`,
 carrying a numeric `Status`, the server `Message`, and the client-assigned
 `RequestId`.
 
+Send each statement through the matching method. The server runs a statement
+before the client learns which kind it is, so a non-SELECT passed to `Query`,
+or a statement that returns rows (such as `COPY ... FROM`) passed to `Exec`,
+has already run when the misuse error arrives; do not rerun it. When failover
+is enabled, `Query` resends its SQL after a connection failure, while `Exec`
+resends only with `replay_exec=on`. Neither resends after a server response
+the client cannot decode.
+
 A runnable example is at
 [`examples/qwp/basic-query/main.go`](examples/qwp/basic-query/main.go).
 

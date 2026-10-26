@@ -662,6 +662,14 @@ var errClosedDuringFailover = errors.New(
 var errExecDesynced = errors.New(
 	"qwp query: connection desynced by an abandoned statement drain; close and rebuild the client")
 
+// errExecReturnedRows reports Exec on a statement that streams rows.
+// The server executes the statement before the first row arrives, so
+// the message tells the caller not to rerun it (COPY ... FROM, for
+// example, has already started its import).
+var errExecReturnedRows = errors.New(
+	"qwp query: Exec called on a SELECT-style statement, which the server " +
+		"has already executed; do not rerun it, and use Query for statements that return rows")
+
 // reconnectAndReplay tears down the current generation, demotes the
 // just-failed endpoint and walks the host tracker by (state, zone)
 // priority (failover.md §2; the demoted host drops to TransportError
@@ -907,8 +915,15 @@ var qwpFailedQueries struct {
 //
 // Err on a wrong statement kind also surfaces through the first
 // Batches() yield: if the server sends EXEC_DONE (non-SELECT
-// statement), the iterator yields (nil, error) and terminates. Use
-// Exec for statements that do not produce a result set.
+// statement), the iterator yields (nil, error) and terminates. The
+// server has already executed the statement by then, so do not rerun
+// it through Exec. Use Exec for statements that do not produce a
+// result set.
+//
+// Query treats every statement as safe to resubmit: when failover is
+// enabled and the connection drops, it resubmits the SQL on a new
+// connection. A non-SELECT statement passed to Query can therefore run
+// twice. Exec resubmits only with replay_exec=on.
 //
 // Breaking out of the range loop early sends a CANCEL frame to the
 // server and drains the remaining events until a terminal frame
@@ -937,9 +952,10 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QwpQuery
 		return q
 	}
 	q.requestId = req.requestId
-	// SELECT is idempotent: transparent reconnect-and-replay on a
-	// transport drop is always safe, so the session is replayable
-	// regardless of replay_exec (which only governs Exec).
+	// Query is for SELECTs, which are idempotent, so the session is
+	// replayable regardless of replay_exec (which only governs Exec).
+	// The client cannot tell a misrouted non-SELECT before the server
+	// answers; the doc comment above warns callers about it.
 	q.session = newQwpQuerySession(c, req, true)
 	if err := q.session.submit(ctx); err != nil {
 		q.pendingErr = err
@@ -957,9 +973,11 @@ func (c *QwpQueryClient) Query(ctx context.Context, sql string, opts ...QwpQuery
 // Per-call options are supplied via the variadic opts list — see
 // WithQwpQueryBinds for attaching typed bind parameters.
 //
-// Calling Exec on a SELECT statement returns an error — SELECT sends
-// RESULT_BATCH + RESULT_END, which Exec does not expect. Use Query
-// for SELECTs.
+// Calling Exec on a statement that returns rows returns an error —
+// such a statement sends RESULT_BATCH + RESULT_END, which Exec does
+// not expect. Use Query for SELECTs. The server has already executed
+// the statement by then: COPY ... FROM, for example, has started its
+// import, so do not rerun it through Query.
 func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryOption) (ExecResult, error) {
 	if c.closed.Load() {
 		return ExecResult{}, errors.New("qwp query: client is closed")
@@ -1051,13 +1069,11 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryO
 				c.execDrainAbandoned.Store(true)
 			}
 			cancel()
-			return ExecResult{}, fmt.Errorf(
-				"qwp query: Exec called on a SELECT-style statement; use Query instead")
+			return ExecResult{}, errExecReturnedRows
 		case qwpEventKindEnd:
 			// Bare RESULT_END with no preceding RESULT_BATCH — same
 			// misuse as above (user ran a SELECT via Exec).
-			return ExecResult{}, fmt.Errorf(
-				"qwp query: Exec called on a SELECT-style statement; use Query instead")
+			return ExecResult{}, errExecReturnedRows
 		default:
 			return ExecResult{}, fmt.Errorf("qwp query: unexpected event kind %d", ev.kind)
 		}
@@ -1332,10 +1348,14 @@ func (q *QwpQuery) Batches() iter.Seq2[*QwpColumnBatch, error] {
 				}
 			case qwpEventKindExecDone:
 				// Wrong statement kind: user ran a non-SELECT via
-				// Query. Surface with a typed error so they can
-				// switch to Exec.
+				// Query. The server has already executed it, so the
+				// error says so and reports the outcome; rerunning it
+				// through Exec would apply it twice.
 				yield(nil, fmt.Errorf(
-					"qwp query: Query called on a non-SELECT statement; use Exec instead"))
+					"qwp query: Query called on a non-SELECT statement, which the server "+
+						"has already executed (op_type=%d, rows_affected=%d); do not rerun it, "+
+						"and use Exec for non-SELECT statements",
+					ev.execResult.OpType, ev.execResult.RowsAffected))
 				return
 			default:
 				yield(nil, fmt.Errorf("qwp query: unexpected event kind %d", ev.kind))
