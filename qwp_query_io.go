@@ -56,8 +56,9 @@ const (
 	// poisoned ioErr — every emission of this kind goes through
 	// poisonAndEmitError, so a follow-up submitQuery returns the
 	// original cause synchronously. Routed by the failover orchestrator
-	// to the reconnect-and-replay path; surfaced to the user as a
-	// plain error when failover is disabled or exhausted.
+	// to the reconnect-and-replay path unless protocolErr is set;
+	// surfaced to the user as a plain error when failover is disabled,
+	// exhausted, or skipped.
 	qwpEventKindTransportError
 	// qwpEventKindFailoverReset is emitted by the session orchestrator
 	// (not the I/O goroutine) on the consumer side after a successful
@@ -98,6 +99,13 @@ type qwpEvent struct {
 	// Nil for I/O-goroutine-emitted transport errors that only carry
 	// a string message via poisonAndEmitError.
 	transportErr error
+
+	// TransportError kind — set when the server answered with a frame
+	// this client cannot decode or does not recognise. The request
+	// reached the server, which may already have executed it, and the
+	// same server sends the same frame again, so the failover
+	// orchestrator surfaces the error instead of resubmitting.
+	protocolErr bool
 
 	// FailoverReset kind — populated by qwp_query_failover.go after a
 	// successful reconnect; carries through to the user as
@@ -964,7 +972,7 @@ func (io *qwpEgressIO) dispatchFrame(ev qwpReaderEvent) {
 	if err != nil {
 		// Header parse failure — we have no trustworthy framing, so
 		// poison the connection before emitting.
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitProtocolError(fmt.Sprintf("qwp: %v", err))
 		io.currentQueryDone = true
 		io.recycleReadBuf(ev.bufRef)
 		return
@@ -996,7 +1004,7 @@ func (io *qwpEgressIO) dispatchFrame(ev qwpReaderEvent) {
 		// Unknown msg_kind means we are talking to a server whose
 		// protocol we do not understand — treat as terminal so we do
 		// not parade a desynced stream to the next query.
-		io.poisonAndEmitError(fmt.Sprintf("qwp: unknown msg_kind 0x%02X", byte(kind)))
+		io.poisonAndEmitProtocolError(fmt.Sprintf("qwp: unknown msg_kind 0x%02X", byte(kind)))
 		io.currentQueryDone = true
 	}
 }
@@ -1035,7 +1043,7 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte, bufRef *[]byte) {
 		// are wrong, producing silently corrupt rows), surface the
 		// error, and stop the query.
 		io.buffers <- buf
-		io.poisonAndEmitError(fmt.Sprintf("qwp: decode: %v", err))
+		io.poisonAndEmitProtocolError(fmt.Sprintf("qwp: decode: %v", err))
 		io.currentQueryDone = true
 		return
 	}
@@ -1079,7 +1087,7 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte, bufRef *[]byte) {
 func (io *qwpEgressIO) handleResultEnd(payload []byte) {
 	reqId, total, err := io.decoder.decodeResultEnd(payload)
 	if err != nil {
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitProtocolError(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:      qwpEventKindEnd,
@@ -1095,7 +1103,7 @@ func (io *qwpEgressIO) handleResultEnd(payload []byte) {
 func (io *qwpEgressIO) handleQueryError(payload []byte) {
 	qe, err := io.decoder.decodeQueryError(payload)
 	if err != nil {
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitProtocolError(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:       qwpEventKindError,
@@ -1118,7 +1126,7 @@ func (io *qwpEgressIO) handleQueryError(payload []byte) {
 func (io *qwpEgressIO) handleCacheReset(payload []byte) {
 	mask, err := io.decoder.decodeCacheReset(payload)
 	if err != nil {
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitProtocolError(fmt.Sprintf("qwp: %v", err))
 		io.currentQueryDone = true
 		return
 	}
@@ -1130,7 +1138,7 @@ func (io *qwpEgressIO) handleCacheReset(payload []byte) {
 func (io *qwpEgressIO) handleExecDone(payload []byte) {
 	reqId, result, err := io.decoder.decodeExecDone(payload)
 	if err != nil {
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitProtocolError(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:       qwpEventKindExecDone,
@@ -1258,11 +1266,25 @@ func (io *qwpEgressIO) emit(ev qwpEvent) {
 // orchestrator would either retry SQL errors (wrong) or never retry
 // transport faults (also wrong).
 func (io *qwpEgressIO) poisonAndEmitError(msg string) {
+	io.emitPoisoned(msg, false)
+}
+
+// poisonAndEmitProtocolError is poisonAndEmitError for a frame the
+// server sent that this client cannot decode or does not recognise.
+// The event carries protocolErr, so the failover orchestrator surfaces
+// it rather than resubmitting a request the server has already
+// received.
+func (io *qwpEgressIO) poisonAndEmitProtocolError(msg string) {
+	io.emitPoisoned(msg, true)
+}
+
+func (io *qwpEgressIO) emitPoisoned(msg string, protocolErr bool) {
 	io.setIoErr(errors.New(msg))
 	io.emit(qwpEvent{
-		kind:       qwpEventKindTransportError,
-		requestId:  io.currentRequestId,
-		errStatus:  0,
-		errMessage: msg,
+		kind:        qwpEventKindTransportError,
+		requestId:   io.currentRequestId,
+		errStatus:   0,
+		errMessage:  msg,
+		protocolErr: protocolErr,
 	})
 }

@@ -599,7 +599,10 @@ func (s *qwpQuerySession) requestCancel() {
 // replay_exec=off — see s.replayable), the original transport error
 // is returned as-is, WITHOUT reconnecting or resubmitting, so the
 // caller surfaces it through the usual error path and the
-// possibly-already-applied statement is never re-executed. When the
+// possibly-already-applied statement is never re-executed. A frame the
+// client cannot decode (ev.protocolErr) takes the same path for every
+// session: the server received the statement and answers it the same
+// way on every attempt. When the
 // failover budget is exhausted (s.attempt >= cfg.failoverMaxAttempts,
 // or the failover_max_duration_ms wall-clock budget has elapsed), the
 // event is wrapped into a *QwpFailoverExhaustedError so callers can
@@ -615,6 +618,13 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	}
 	// Transport-terminal failure. Decide whether to retry.
 	if s.isCancelled() {
+		return ev, nil
+	}
+	if ev.protocolErr {
+		// The server answered with a frame this client cannot decode.
+		// The statement reached the server and may have run, and the
+		// same server sends the same frame again, so resubmitting
+		// cannot help and can execute a non-idempotent statement twice.
 		return ev, nil
 	}
 	cfg := s.client.cfg
