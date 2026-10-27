@@ -438,6 +438,14 @@ func WithQwpQueryTarget(target QwpTargetFilter) QwpQueryClientOption {
 // transport-terminal failure mid-query. Default true; matches Java's
 // failover=on default. When false, transport errors surface directly
 // through Batches() / Exec().
+//
+// Even when enabled, the client does not replay after a final response
+// (row count, error, or end of results) it cannot decode, a message
+// whose header or type it cannot read, or a message over its frame
+// size limit: the server has finished the statement, or the client
+// cannot tell whether it has, so a replay could run it twice. Such an
+// error surfaces directly, as with failover disabled. A result batch
+// the client cannot decode is replayed like a dropped connection.
 func WithQwpQueryFailover(enabled bool) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.failoverEnabled = enabled }
 }
@@ -540,7 +548,9 @@ func WithQwpQueryConnectTimeout(d time.Duration) QwpQueryClientOption {
 // statements (INSERT / UPDATE / DELETE / DDL) might double-execute
 // if the server applied the statement before the transport drop was
 // detected. Callers that know their statements are idempotent can
-// opt in to match Java's transparent replay behaviour.
+// opt in to match Java's transparent replay behaviour. Even when
+// enabled, Exec does not replay after the server responses that
+// WithQwpQueryFailover lists as never replayed.
 func WithQwpQueryReplayExec(enabled bool) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.replayExec = enabled }
 }
@@ -1033,12 +1043,12 @@ func (c *QwpQueryClient) Exec(ctx context.Context, sql string, opts ...QwpQueryO
 			return ExecResult{}, eventToError(ev, reqId)
 		case qwpEventKindTransportError:
 			// The session did not replay (failover disabled,
-			// replay_exec=off, or a server response the client cannot
-			// decode) or has exhausted its replay budget. Surface the
-			// underlying transport error so callers can errors.Is /
-			// errors.As against the cause without picking up
-			// *QwpQueryError (which carries server-status bytes that
-			// are meaningless for client-side faults).
+			// replay_exec=off, or a terminal or unreadable server frame;
+			// see qwpEvent.noReplay) or has exhausted its replay budget.
+			// Surface the underlying transport error so callers can
+			// errors.Is / errors.As against the cause without picking up
+			// *QwpQueryError (which carries server-status bytes that are
+			// meaningless for client-side faults).
 			return ExecResult{}, transportEventError(ev)
 		case qwpEventKindFailoverReset:
 			// Only reachable when this Exec opted into replay

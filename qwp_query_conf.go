@@ -117,7 +117,8 @@ type qwpQueryClientConfig struct {
 	// failoverEnabled toggles transparent reconnect-and-replay on
 	// transport-terminal failure mid-query. Default true; matches
 	// Java's failover=on default. When false, transport errors
-	// surface directly through Batches() / Exec().
+	// surface directly through Batches() / Exec(). Events with
+	// qwpEvent.noReplay are never replayed, whatever its value.
 	failoverEnabled bool
 	// failoverMaxAttempts caps the number of executeOnce invocations
 	// per Query / Exec. Counts the initial attempt plus every

@@ -767,9 +767,11 @@ has already run when the misuse error arrives; do not rerun it through `Exec`.
 A statement that returns rows passed to `Exec` has also already run; rerun it
 through `Query`. If your statement returns rows and also has side-effects,
 such as COPY, don't repeat it because it's already executed. When failover
-is enabled, `Query` resends its SQL after a connection failure, while `Exec`
-resends only with `replay_exec=on`. Neither resends after a server response
-the client cannot decode, including one over the client's frame size limit.
+is enabled, `Query` resends its SQL after a connection failure or a result
+batch the client cannot decode, while `Exec` resends only with
+`replay_exec=on`. Neither resends after a final response (row count, error, or
+end of results) the client cannot decode, after a message of unknown type, or
+after a message over the client's frame size limit.
 
 A runnable example is at
 [`examples/qwp/basic-query/main.go`](examples/qwp/basic-query/main.go).

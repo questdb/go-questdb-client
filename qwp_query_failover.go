@@ -599,14 +599,14 @@ func (s *qwpQuerySession) requestCancel() {
 // replay_exec=off — see s.replayable), the original transport error
 // is returned as-is, WITHOUT reconnecting or resubmitting, so the
 // caller surfaces it through the usual error path and the
-// possibly-already-applied statement is never re-executed. A server
-// response the client cannot decode (ev.protocolErr) takes the same
-// path for every session: the server received the statement and may
-// have run it, and a resubmit, even to another endpoint, could run it
-// again. When the
-// failover budget is exhausted (s.attempt >= cfg.failoverMaxAttempts,
-// or the failover_max_duration_ms wall-clock budget has elapsed), the
-// event is wrapped into a *QwpFailoverExhaustedError so callers can
+// possibly-already-applied statement is never re-executed. An event
+// with ev.noReplay takes the same path for every session: the server
+// has finished the statement, or the client cannot tell whether it
+// has, so a resubmit, even to another endpoint, could run it again
+// without a better outcome. When the failover budget is exhausted
+// (s.attempt >= cfg.failoverMaxAttempts, or the
+// failover_max_duration_ms wall-clock budget has elapsed), the event
+// is wrapped into a *QwpFailoverExhaustedError so callers can
 // errors.As against the exhaustion shape and distinguish "we ran out
 // of retries" from "first attempt failed".
 func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
@@ -621,13 +621,13 @@ func (s *qwpQuerySession) nextEvent(ctx context.Context) (qwpEvent, error) {
 	if s.isCancelled() {
 		return ev, nil
 	}
-	if ev.protocolErr {
-		// The server answered with a response this client cannot
-		// decode, so the statement reached the server and may have run.
-		// Resubmitting, even to another endpoint, can execute a
-		// non-idempotent statement twice, and Query cannot rule that
-		// out: a non-SELECT sent through Query looks like a SELECT
-		// until the server answers.
+	if ev.noReplay {
+		// The server sent a terminal frame the client cannot decode, so
+		// it has finished the statement, or a frame the client cannot
+		// classify at all. Resubmitting, even to another endpoint, can
+		// execute a non-idempotent statement twice, and Query cannot
+		// rule that out: a non-SELECT sent through Query looks like a
+		// SELECT until the server answers.
 		return ev, nil
 	}
 	cfg := s.client.cfg

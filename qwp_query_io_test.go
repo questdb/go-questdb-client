@@ -1303,24 +1303,25 @@ func TestQwpEgressIODecodeFailurePoisons(t *testing.T) {
 	}
 }
 
-// TestQwpEgressIOProtocolErrorFlag pins which TransportError events
-// carry protocolErr, the flag that stops the failover orchestrator from
-// resubmitting. Every server response this client cannot decode, does
-// not recognise, or that exceeds qwpMaxFrameReadLimit sets it; a
-// dropped connection does not, so failover still replays it.
-func TestQwpEgressIOProtocolErrorFlag(t *testing.T) {
+// TestQwpEgressIONoReplayFlag pins which TransportError events carry
+// noReplay, the flag that stops the failover orchestrator from
+// resubmitting. A terminal frame the client cannot decode, a frame
+// whose header or msg_kind it cannot read, and a message over
+// qwpMaxFrameReadLimit set it. A mid-stream frame that fails to decode
+// and a dropped connection do not, so failover still replays them.
+func TestQwpEgressIONoReplayFlag(t *testing.T) {
 	cases := []struct {
 		name         string
 		response     []byte // nil: close the connection without answering
-		wantProtocol bool
+		wantNoReplay bool
 		wantMsg      string
 	}{
 		{"FrameTooShortForMsgKind", []byte{0x01, 0x02, 0x03}, true, "too short for msg_kind"},
 		{"UnknownMsgKind", writeQwpFrame(0, []byte{0x7E}), true, "unknown msg_kind"},
-		{"ResultBatchDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindResultBatch)}), true, "decode"},
+		{"ResultBatchDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindResultBatch)}), false, "decode"},
 		{"ResultEndDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindResultEnd)}), true, "unexpected end of buffer"},
 		{"QueryErrorDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindQueryError)}), true, "unexpected end of buffer"},
-		{"CacheResetDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindCacheReset)}), true, "truncated"},
+		{"CacheResetDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindCacheReset)}), false, "truncated"},
 		{"ExecDoneDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindExecDone)}), true, "unexpected end of buffer"},
 		{"OversizedMessage", make([]byte, qwpMaxFrameReadLimit+1), true, "server message too large"},
 		{"ConnectionClosed", nil, false, "server closed connection"},
@@ -1362,8 +1363,8 @@ func TestQwpEgressIOProtocolErrorFlag(t *testing.T) {
 			if ev.kind != qwpEventKindTransportError {
 				t.Fatalf("event kind = %v, want TransportError (errMsg=%q)", ev.kind, ev.errMessage)
 			}
-			if ev.protocolErr != tc.wantProtocol {
-				t.Errorf("protocolErr = %v, want %v (errMsg=%q)", ev.protocolErr, tc.wantProtocol, ev.errMessage)
+			if ev.noReplay != tc.wantNoReplay {
+				t.Errorf("noReplay = %v, want %v (errMsg=%q)", ev.noReplay, tc.wantNoReplay, ev.errMessage)
 			}
 			if !strings.Contains(ev.errMessage, tc.wantMsg) {
 				t.Errorf("errMessage = %q, want contains %q", ev.errMessage, tc.wantMsg)
