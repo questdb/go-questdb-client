@@ -1305,10 +1305,13 @@ func TestQwpEgressIODecodeFailurePoisons(t *testing.T) {
 
 // TestQwpEgressIONoReplayFlag pins which TransportError events carry
 // noReplay, the flag that stops the failover orchestrator from
-// resubmitting. A terminal frame the client cannot decode, a frame
-// whose header or msg_kind it cannot read, and a message over
-// qwpMaxFrameReadLimit set it. A mid-stream frame that fails to decode
-// and a dropped connection do not, so failover still replays them.
+// resubmitting. A terminal frame the client cannot decode, a non-empty
+// frame too short to carry a msg_kind, a frame with an unknown
+// msg_kind, and a message over qwpMaxFrameReadLimit set it. A
+// mid-stream frame that fails to decode and a dropped connection do
+// not, so failover still replays them. An empty message counts as a
+// dropped connection: the client sees one when the connection ends
+// between a WebSocket frame header and its payload.
 func TestQwpEgressIONoReplayFlag(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -1325,6 +1328,7 @@ func TestQwpEgressIONoReplayFlag(t *testing.T) {
 		{"ExecDoneDecode", writeQwpFrame(0, []byte{byte(qwpMsgKindExecDone)}), true, "unexpected end of buffer"},
 		{"OversizedMessage", make([]byte, qwpMaxFrameReadLimit+1), true, "server message too large"},
 		{"ConnectionClosed", nil, false, "server closed connection"},
+		{"EmptyMessage", []byte{}, false, "empty message"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

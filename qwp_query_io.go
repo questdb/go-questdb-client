@@ -104,13 +104,14 @@ type qwpEvent struct {
 	// TransportError kind — set when a resubmit could only repeat a
 	// statement the server has finished, or the client cannot tell
 	// whether it has: a terminal frame (RESULT_END, QUERY_ERROR,
-	// EXEC_DONE) the client cannot decode, a frame whose header or
-	// msg_kind it cannot read, or a message larger than
-	// qwpMaxFrameReadLimit. The failover orchestrator surfaces the
-	// error instead of resubmitting, on any endpoint. A frame that
-	// fails to decode mid-stream (RESULT_BATCH, CACHE_RESET) leaves it
-	// unset: the statement is still streaming, so a resubmit carries
-	// the same risk as one after a dropped connection.
+	// EXEC_DONE) the client cannot decode, a non-empty frame too short
+	// to carry a msg_kind, a frame with an unknown msg_kind, or a
+	// message larger than qwpMaxFrameReadLimit. The failover
+	// orchestrator surfaces the error instead of resubmitting, on any
+	// endpoint. A frame that fails to decode mid-stream (RESULT_BATCH,
+	// CACHE_RESET) leaves it unset: the statement is still streaming,
+	// so a resubmit carries the same risk as one after a dropped
+	// connection.
 	noReplay bool
 
 	// FailoverReset kind — populated by qwp_query_failover.go after a
@@ -989,6 +990,16 @@ func (io *qwpEgressIO) receiveLoop() {
 // frames (End / ExecDone / Error) so the receive loop exits.
 func (io *qwpEgressIO) dispatchFrame(ev qwpReaderEvent) {
 	payload := ev.payload
+	if len(payload) == 0 {
+		// Every QWP message starts with a header, so an empty one means
+		// the connection ended between a WebSocket frame header and its
+		// payload, which coder/websocket reports as a complete message.
+		// Treat it as the dropped connection it is, so failover can replay.
+		io.poisonAndEmitError("qwp: server closed connection: empty message")
+		io.currentQueryDone = true
+		io.recycleReadBuf(ev.bufRef)
+		return
+	}
 	kind, err := qwpPeekMsgKind(payload)
 	if err != nil {
 		// Header parse failure — we have no trustworthy framing, so
@@ -1271,12 +1282,14 @@ func (io *qwpEgressIO) emit(ev qwpEvent) {
 // AND emits it as the current query's TransportError event. It covers
 // faults on the dispatcher path after which a resubmit carries no more
 // risk than after a dropped connection: reader error / server close,
-// send failures (QUERY_REQUEST / CANCEL / CREDIT), the cancel-ack
-// watchdog, a recovered dispatcher panic, and a RESULT_BATCH or
-// CACHE_RESET the client cannot decode. A terminal frame the client
-// cannot decode, a frame whose header or msg_kind it cannot read, or a
-// message larger than qwpMaxFrameReadLimit goes through
-// poisonAndEmitNoReplay instead. After either, the connection is
+// an empty message (how a connection cut between a WebSocket frame
+// header and its payload arrives), send failures (QUERY_REQUEST /
+// CANCEL / CREDIT), the cancel-ack watchdog, a recovered dispatcher
+// panic, and a RESULT_BATCH or CACHE_RESET the client cannot decode. A
+// terminal frame the client cannot decode, a non-empty frame too short
+// to carry a msg_kind, a frame with an unknown msg_kind, or a message
+// larger than qwpMaxFrameReadLimit goes through poisonAndEmitNoReplay
+// instead. After either, the connection is
 // unusable — a decode failure can leave the decoder silently out of
 // sync (a mis-advanced reader can leave the dict accidentally aligned
 // at the offset level while values are wrong, producing silently
@@ -1303,9 +1316,10 @@ func (io *qwpEgressIO) poisonAndEmitError(msg string) {
 // after which a resubmit could only repeat a statement the server has
 // finished, or the client cannot tell whether it has: a terminal frame
 // (RESULT_END, QUERY_ERROR, EXEC_DONE) the client cannot decode, a
-// frame whose header or msg_kind it cannot read, or a message larger
-// than qwpMaxFrameReadLimit. The event carries noReplay, so the
-// failover orchestrator surfaces it rather than resubmitting.
+// non-empty frame too short to carry a msg_kind, a frame with an
+// unknown msg_kind, or a message larger than qwpMaxFrameReadLimit.
+// The event carries noReplay, so the failover orchestrator surfaces it
+// rather than resubmitting.
 func (io *qwpEgressIO) poisonAndEmitNoReplay(msg string) {
 	io.emitPoisoned(msg, true)
 }

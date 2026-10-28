@@ -441,11 +441,11 @@ func WithQwpQueryTarget(target QwpTargetFilter) QwpQueryClientOption {
 //
 // Even when enabled, the client does not replay after a final response
 // (row count, error, or end of results) it cannot decode, a message
-// whose header or type it cannot read, or a message over its frame
-// size limit: the server has finished the statement, or the client
-// cannot tell whether it has, so a replay could run it twice. Such an
-// error surfaces directly, as with failover disabled. A result batch
-// the client cannot decode is replayed like a dropped connection.
+// with a partial header or of an unknown type, or a message over its
+// frame size limit: the server has finished the statement, or the
+// client cannot tell whether it has, so a replay could run it twice.
+// Such an error surfaces directly, as with failover disabled. A result
+// batch the client cannot decode is replayed like a dropped connection.
 func WithQwpQueryFailover(enabled bool) QwpQueryClientOption {
 	return func(c *qwpQueryClientConfig) { c.failoverEnabled = enabled }
 }
