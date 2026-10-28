@@ -43,9 +43,12 @@ import (
 )
 
 // Settings for pools whose senders fault on one slot directory while the
-// server stays up: small segments so a rotation comes every few leases.
+// server stays up: small segments so a rotation comes every few leases. The
+// injected faults fail a return at once, so the append deadline only bounds
+// waits on healthy senders, such as for a spare segment, which can take
+// longer than a second to create on Windows CI.
 const qwpReturnTestSlotFaultSettings = ";sf_max_segment_bytes=8192;sf_max_total_bytes=131072" +
-	";sf_append_deadline_millis=300;close_flush_timeout_millis=300;auto_flush=off;"
+	";sf_append_deadline_millis=10000;close_flush_timeout_millis=300;auto_flush=off;"
 
 // Settings for pools that run through an outage: a 32 KiB ring fills after a
 // dozen leases, and a full ring fails a return after 150 ms.
@@ -236,12 +239,16 @@ func qwpReturnTestFaultySlot(t *testing.T, p *qwpSenderPool, sfDir string, fault
 // A storage fault confined to one slot fails that slot's next return. Serial
 // leases must then move to another sender: the pool keeps the faulty sender,
 // because its ring holds earlier borrowers' rows, but lends it last.
+//
+// This test and the next use a long acquire timeout. A build that outlasts it
+// makes borrow lend the degraded sender and pause growth, which repeats the
+// fault on purpose; building a sender can take that long on Windows CI.
 func TestQwpSfPoolSlotFaultMovesSerialLeasesOff(t *testing.T) {
 	for _, fault := range qwpReturnTestFaults {
 		t.Run(fault.name, func(t *testing.T) {
 			srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 			t.Cleanup(srv.Close)
-			p, sfDir := newQwpReturnTestPool(t, strings.TrimPrefix(srv.URL, "http://"), qwpReturnTestSlotFaultSettings, 2, 4, 2*time.Second, nil)
+			p, sfDir := newQwpReturnTestPool(t, strings.TrimPrefix(srv.URL, "http://"), qwpReturnTestSlotFaultSettings, 2, 4, qwpTestWaitTimeout, nil)
 			faultyIndex, restore := qwpReturnTestFaultySlot(t, p, sfDir, fault)
 
 			var ok, failed int
@@ -285,7 +292,7 @@ func TestQwpSfPoolSlotFaultSpacedLeasesStayOff(t *testing.T) {
 		t.Run(fault.name, func(t *testing.T) {
 			srv := newQwpSfTestServer(t, qwpSfTestServerOpts{})
 			t.Cleanup(srv.Close)
-			p, sfDir := newQwpReturnTestPool(t, strings.TrimPrefix(srv.URL, "http://"), qwpReturnTestSlotFaultSettings, 1, 4, 2*time.Second, nil)
+			p, sfDir := newQwpReturnTestPool(t, strings.TrimPrefix(srv.URL, "http://"), qwpReturnTestSlotFaultSettings, 1, 4, qwpTestWaitTimeout, nil)
 			faultyIndex, _ := qwpReturnTestFaultySlot(t, p, sfDir, fault)
 
 			var ok, failed int
@@ -552,6 +559,12 @@ func qwpReturnTestWaitBuildsSettled(t *testing.T, p *qwpSenderPool) {
 	}, qwpTestWaitTimeout, 10*time.Millisecond)
 }
 
+func qwpReturnTestInFlightBuilds(p *qwpSenderPool) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inFlightCreations
+}
+
 func qwpReturnTestGrowthBlockedUntil(p *qwpSenderPool) time.Time {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -706,13 +719,16 @@ func TestQwpSfPoolGrowthFailureFallsBackToDegradedSender(t *testing.T) {
 		l2, err := p.borrow(ctx)
 		require.NoError(t, err)
 		require.Same(t, marked, l2.(*qwpPooledSender).slot)
-		require.EqualValues(t, 1, builds.Load(), "a borrow inside the backoff must not start another build")
+		// Count builds by the pool's reservations, not by the hook: on a slow
+		// filesystem the first build may not have reached the hook yet.
+		require.Equal(t, 1, qwpReturnTestInFlightBuilds(p), "a borrow inside the backoff must not start another build")
 		require.NoError(t, l2.Close(ctx))
 
 		// The build fails after its borrower stopped waiting; the pool still
 		// logs the failure.
 		releaseOnce.Do(func() { close(release) })
 		qwpReturnTestWaitBuildsSettled(t, p)
+		require.EqualValues(t, 1, builds.Load())
 		qwpReturnTestRequireGrowthFailureLogged(t, capture, injected)
 	})
 

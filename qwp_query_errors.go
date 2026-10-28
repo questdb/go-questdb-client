@@ -121,7 +121,9 @@ func (e *QwpRoleMismatchError) Unwrap() error {
 // when the I/O layer detects a transport-terminal failure mid-query
 // and successfully reconnects to another role-matching endpoint to
 // replay the request. Subsequent batches arrive with batch_seq
-// restarting at 0 on the new node.
+// restarting at 0 on the new node. The server responses that
+// WithQwpQueryFailover lists as never replayed end the query with a
+// plain error instead.
 //
 // Consumer pattern: detect via errors.As, discard any rows accumulated
 // from the prior connection, and continue iterating. Consumers that
@@ -134,8 +136,9 @@ func (e *QwpRoleMismatchError) Unwrap() error {
 // with replay_exec=off (the default) a transport drop yields the raw
 // transport error without reconnecting — so a non-idempotent
 // statement the server may already have applied is not silently
-// re-executed — and with replay_exec=on Exec replays transparently
-// and consumes the reset internally.
+// re-executed — and with replay_exec=on Exec replays transparently,
+// except after those never-replayed responses, and consumes the reset
+// internally.
 type QwpFailoverReset struct {
 	// NewNode is the SERVER_INFO of the endpoint the client just
 	// rebound to (nil only if no SERVER_INFO was available).

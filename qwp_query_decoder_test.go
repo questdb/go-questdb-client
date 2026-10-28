@@ -2328,6 +2328,26 @@ func TestQwpDecoderExecDone(t *testing.T) {
 		assertDecodeErrContains(t, err, "truncated")
 	})
 
+	t.Run("RowsAffectedMinusOneSentinel", func(t *testing.T) {
+		// QuestDB 9.4.0-10.0.1 send rows_affected = -1 for RENAME TABLE,
+		// TRUNCATE, SET, etc., encoded as the varint for 2^64-1.
+		frame := writeQwpFrame(0, buildExecDoneBody(5, QwpOpTypeRenameTable, math.MaxUint64))
+		dec := newTestQueryDecoder()
+		reqId, res, err := dec.decodeExecDone(frame)
+		if err != nil {
+			t.Fatalf("decodeExecDone: %v", err)
+		}
+		if reqId != 5 {
+			t.Fatalf("requestId = %d, want 5", reqId)
+		}
+		if res.OpType != QwpOpTypeRenameTable {
+			t.Fatalf("OpType = %d, want %d", res.OpType, QwpOpTypeRenameTable)
+		}
+		if res.RowsAffected != 0 {
+			t.Fatalf("RowsAffected = %d, want 0", res.RowsAffected)
+		}
+	})
+
 	t.Run("RowsAffectedVarintOverflow", func(t *testing.T) {
 		var body bytes.Buffer
 		body.WriteByte(byte(qwpMsgKindExecDone))

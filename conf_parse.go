@@ -60,6 +60,7 @@ var egressOnlyKeys = map[string]bool{
 	"initial_credit":              true,
 	"max_batch_rows":              true,
 	"path":                        true,
+	"query_close_timeout_ms":      true,
 	"replay_exec":                 true,
 	"server_info_timeout_ms":      true,
 }

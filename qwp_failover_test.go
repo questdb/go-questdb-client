@@ -1113,6 +1113,229 @@ func TestQwpExecOptInReplaysTransparently(t *testing.T) {
 	}
 }
 
+// newProtocolErrorFailoverClient starts a two-node mock cluster whose
+// nodes answer every request with badFrame, and a query client with
+// failover enabled against it. Node 1 fails the test if contacted: the
+// client may only reach it by resubmitting after the protocol error.
+func newProtocolErrorFailoverClient(t *testing.T, badFrame []byte, replayExec bool) (*QwpQueryClient, *mockCluster) {
+	t.Helper()
+	cluster := newMockCluster(t, 2, rolesPrimaryReplicaReplica(),
+		func(idx int, m *qwpMockEgressConn) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if idx != 0 {
+				t.Errorf("node %d received a connection: the client resubmitted "+
+					"after a response it could not decode", idx)
+			}
+			_, _, _ = m.conn.Read(ctx)
+			if len(badFrame) > qwpMaxFrameReadLimit {
+				// The client stops reading partway through an oversized
+				// message and closes the connection, so the write can fail.
+				_ = m.conn.Write(ctx, websocket.MessageBinary, badFrame)
+			} else {
+				m.sendBinary(ctx, badFrame)
+			}
+			for {
+				if _, _, err := m.conn.Read(ctx); err != nil {
+					return
+				}
+			}
+		})
+
+	cfg := qwpQueryDefaultConfig()
+	eps, _ := parseEndpointList(cluster.addrList(), qwpDefaultPort)
+	cfg.endpoints = eps
+	cfg.target = qwpTargetAny
+	cfg.serverInfoTimeout = 2 * time.Second
+	cfg.failoverEnabled = true
+	cfg.failoverMaxAttempts = 3
+	cfg.failoverBackoffInitial = 1 * time.Millisecond
+	cfg.failoverBackoffMax = 5 * time.Millisecond
+	cfg.replayExec = replayExec
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := newQwpQueryClient(ctx, cfg)
+	if err != nil {
+		t.Fatalf("newQwpQueryClient: %v", err)
+	}
+	t.Cleanup(func() { c.Close(context.Background()) })
+	return c, cluster
+}
+
+// assertNoResubmit checks that err is the raw protocol error, not a
+// failover outcome, and that node 0 was connected once and node 1 never.
+func assertNoResubmit(t *testing.T, err error, cluster *mockCluster) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected a protocol error")
+	}
+	var reset *QwpFailoverReset
+	if errors.As(err, &reset) {
+		t.Fatalf("err is *QwpFailoverReset (%v): the client resubmitted "+
+			"after a response it could not decode", err)
+	}
+	var exhausted *QwpFailoverExhaustedError
+	if errors.As(err, &exhausted) {
+		t.Fatalf("err is *QwpFailoverExhaustedError (%v): the client entered "+
+			"the retry loop after a response it could not decode", err)
+	}
+	if got := cluster.nodes[0].onConnectCount.Load(); got != 1 {
+		t.Errorf("node 0 connectCount = %d, want 1 (single submit, no replay)", got)
+	}
+	if got := cluster.nodes[1].onConnectCount.Load(); got != 0 {
+		t.Errorf("node 1 connectCount = %d, want 0 (no reconnect)", got)
+	}
+}
+
+// TestQwpExecProtocolErrorDoesNotReplay verifies that even with
+// replay_exec=on, an EXEC_DONE the client cannot decode surfaces as an
+// error without resubmitting: the server has already executed the
+// statement, so a resubmit would execute it twice.
+func TestQwpExecProtocolErrorDoesNotReplay(t *testing.T) {
+	// rows_affected = 2^63 is rejected by the decoder.
+	badFrame := writeQwpFrame(0, buildExecDoneBody(1, QwpOpTypeRenameTable, 1<<63))
+	c, cluster := newProtocolErrorFailoverClient(t, badFrame, true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Exec(ctx, "RENAME TABLE a TO b")
+	assertNoResubmit(t, err, cluster)
+	if !strings.Contains(err.Error(), "int63") {
+		t.Errorf("err = %v, want the decoder's int63 error", err)
+	}
+}
+
+// TestQwpExecOversizedResponseDoesNotReplay verifies that a server
+// message larger than qwpMaxFrameReadLimit is a protocol error: even
+// with replay_exec=on, Exec surfaces it without resubmitting.
+func TestQwpExecOversizedResponseDoesNotReplay(t *testing.T) {
+	badFrame := make([]byte, qwpMaxFrameReadLimit+1)
+	c, cluster := newProtocolErrorFailoverClient(t, badFrame, true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Exec(ctx, "RENAME TABLE a TO b")
+	assertNoResubmit(t, err, cluster)
+	if !strings.Contains(err.Error(), "server message too large") {
+		t.Errorf("err = %v, want the oversized-message error", err)
+	}
+}
+
+// TestQwpQueryProtocolErrorDoesNotReplay verifies that Query, which
+// otherwise resubmits after a connection failure, surfaces a frame it
+// does not recognise, or an EXEC_DONE it cannot decode, without
+// resubmitting. The EXEC_DONE case is a non-SELECT sent through Query:
+// the server has already executed it, so a resubmit would execute it
+// twice.
+func TestQwpQueryProtocolErrorDoesNotReplay(t *testing.T) {
+	cases := []struct {
+		name     string
+		badFrame []byte
+		sql      string
+		wantMsg  string
+	}{
+		{"UnknownMsgKind", writeQwpFrame(0, []byte{0x7E}), "SELECT 1", "unknown msg_kind 0x7E"},
+		// rows_affected = 2^63 is rejected by the decoder.
+		{"ExecDoneDecode", writeQwpFrame(0, buildExecDoneBody(1, QwpOpTypeRenameTable, 1<<63)),
+			"RENAME TABLE a TO b", "int63"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, cluster := newProtocolErrorFailoverClient(t, tc.badFrame, false)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			q := c.Query(ctx, tc.sql)
+			defer q.Close()
+			var lastErr error
+			for _, err := range q.Batches() {
+				if err != nil {
+					lastErr = err
+				}
+			}
+			assertNoResubmit(t, lastErr, cluster)
+			if !strings.Contains(lastErr.Error(), tc.wantMsg) {
+				t.Errorf("err = %v, want contains %q", lastErr, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// TestQwpQueryMidStreamDecodeErrorReplays verifies that a RESULT_BATCH
+// the client cannot decode fails Query over like a dropped connection:
+// the statement is still streaming rows, so a resubmit carries no more
+// risk than one after a drop.
+func TestQwpQueryMidStreamDecodeErrorReplays(t *testing.T) {
+	cluster := newMockCluster(t, 2, rolesPrimaryReplicaReplica(),
+		func(idx int, m *qwpMockEgressConn) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, _, err := m.conn.Read(ctx); err != nil {
+				return
+			}
+			if idx == 0 {
+				m.sendBinary(ctx, writeQwpFrame(0, []byte{byte(qwpMsgKindResultBatch)}))
+			} else {
+				m.sendBinary(ctx, buildOneRowInt64Batch(t, 1, 0, "v", 99))
+				m.sendBinary(ctx, writeQwpFrame(0, buildResultEndBody(1, 0, 1)))
+			}
+			for {
+				if _, _, err := m.conn.Read(ctx); err != nil {
+					return
+				}
+			}
+		})
+
+	cfg := qwpQueryDefaultConfig()
+	eps, _ := parseEndpointList(cluster.addrList(), qwpDefaultPort)
+	cfg.endpoints = eps
+	cfg.target = qwpTargetAny
+	cfg.serverInfoTimeout = 2 * time.Second
+	cfg.failoverEnabled = true
+	cfg.failoverMaxAttempts = 3
+	cfg.failoverBackoffInitial = 1 * time.Millisecond
+	cfg.failoverBackoffMax = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := newQwpQueryClient(ctx, cfg)
+	if err != nil {
+		t.Fatalf("newQwpQueryClient: %v", err)
+	}
+	defer c.Close(context.Background())
+
+	q := c.Query(ctx, "SELECT v FROM t")
+	defer q.Close()
+	var gotReset, gotBatch bool
+	for batch, err := range q.Batches() {
+		if err != nil {
+			var reset *QwpFailoverReset
+			if errors.As(err, &reset) {
+				gotReset = true
+				if !strings.Contains(reset.LastError.Error(), "decode") {
+					t.Errorf("reset.LastError = %v, want the decode error", reset.LastError)
+				}
+				continue
+			}
+			t.Fatalf("unexpected error: %v", err)
+		}
+		gotBatch = true
+		if got := batch.Int64(0, 0); got != 99 {
+			t.Errorf("batch value = %d, want 99", got)
+		}
+	}
+	if !gotReset {
+		t.Error("expected *QwpFailoverReset after the decode error, got none")
+	}
+	if !gotBatch {
+		t.Error("expected a batch from node 1 after the resubmit")
+	}
+	if got := cluster.nodes[1].onConnectCount.Load(); got != 1 {
+		t.Errorf("node 1 connectCount = %d, want 1", got)
+	}
+}
+
 // TestQwpFailoverCancelDuringBackoff verifies that Cancel during the
 // failover backoff sleep aborts the replay rather than completing
 // the wait. Uses a small but non-trivial backoff so the cancel

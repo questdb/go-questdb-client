@@ -1245,7 +1245,13 @@ func TestQwpSfSendLoopSilentDropAfterPriorAckPoisonEscalatesAtThreshold(t *testi
 	}, time.Second, time.Millisecond, "warm-up frame should have been ACK'd by goodSrv")
 
 	// Tear down goodSrv to force the loop into reconnect against silentSrv.
+	// goodSrv drops its connection asynchronously, so wait for the loop to
+	// reach silentSrv: a frame appended earlier can still reach goodSrv and
+	// be ACKed, which leaves silentSrv nothing to eat and no strikes to count.
 	close(goodSrv.kill)
+	require.Eventually(t, func() bool {
+		return silentSrv.connCount.Load() >= 1
+	}, qwpTestWaitTimeout, time.Millisecond, "the loop never reconnected to silentSrv")
 
 	// Enqueue the frame silentSrv will eat on every delivery.
 	_, err = engine.engineAppendBlocking(context.Background(), []byte("post-kill"))

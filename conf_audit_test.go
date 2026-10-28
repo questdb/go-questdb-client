@@ -26,6 +26,10 @@ package questdb
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -344,6 +348,7 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 		"initial_credit=262144",
 		"max_batch_rows=10000",
 		"path=/exec",
+		"query_close_timeout_ms=2000",
 		"replay_exec=on",
 		"server_info_timeout_ms=1000",
 	}
@@ -355,6 +360,131 @@ func TestConfIngestSilentlyAcceptsEgressKeys(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestConfFacadeDualParseAcceptsEveryEgressKey pins the facade side of
+// the shared-connect-string contract. NewQuestDB validates its connect
+// string through both confFromStr and parseQwpQueryConf, so every key
+// the query parser interprets must also pass the sender parser. The key
+// list comes from the case labels of parseQwpQueryConf's key switch: a
+// new query key fails here until it has a sample below, and fails again
+// if the sender parser rejects it, which means it belongs in
+// egressOnlyKeys.
+func TestConfFacadeDualParseAcceptsEveryEgressKey(t *testing.T) {
+	// One "key=value" fragment per key, valid for the query parser.
+	// username and password are only valid together.
+	samples := map[string]string{
+		"addr":                        "addr=localhost:1",
+		"auth_timeout_ms":             "auth_timeout_ms=5000",
+		"buffer_pool_size":            "buffer_pool_size=8",
+		"client_id":                   "client_id=dashboard",
+		"compression":                 "compression=zstd",
+		"compression_level":           "compression_level=3",
+		"connect_timeout":             "connect_timeout=5000",
+		"failover":                    "failover=on",
+		"failover_backoff_initial_ms": "failover_backoff_initial_ms=50",
+		"failover_backoff_max_ms":     "failover_backoff_max_ms=1000",
+		"failover_max_attempts":       "failover_max_attempts=4",
+		"failover_max_duration_ms":    "failover_max_duration_ms=30000",
+		"initial_credit":              "initial_credit=262144",
+		"max_batch_rows":              "max_batch_rows=10000",
+		"password":                    "username=admin;password=quest",
+		"path":                        "path=/read/v1",
+		"query_close_timeout_ms":      "query_close_timeout_ms=2000",
+		"replay_exec":                 "replay_exec=on",
+		"server_info_timeout_ms":      "server_info_timeout_ms=1000",
+		"target":                      "target=any",
+		"tls_verify":                  "tls_verify=unsafe_off",
+		"token":                       "token=abc",
+		"username":                    "username=admin;password=quest",
+		"zone":                        "zone=eu-west-1a",
+	}
+	// Keys the query parser names only to reject them. Both parsers must
+	// keep rejecting them.
+	unsupported := map[string]bool{
+		"tls_roots":          true,
+		"tls_roots_password": true,
+	}
+	ctx := context.Background()
+	for _, key := range qwpQueryConfSwitchKeys(t) {
+		t.Run(key, func(t *testing.T) {
+			if unsupported[key] {
+				conf := "wss::addr=localhost:1;" + key + "=x;"
+				if _, err := confFromStr(conf); err == nil {
+					t.Errorf("confFromStr accepted %q", conf)
+				}
+				if _, err := parseQwpQueryConf(conf); err == nil {
+					t.Errorf("parseQwpQueryConf accepted %q", conf)
+				}
+				return
+			}
+			sample, ok := samples[key]
+			if !ok {
+				t.Fatalf("parseQwpQueryConf handles %q but the test has no sample for it; add one", key)
+			}
+			schema := "ws"
+			if key == "tls_verify" {
+				schema = "wss"
+			}
+			conf := schema + "::"
+			if key != "addr" {
+				conf += "addr=localhost:1;"
+			}
+			conf += sample + ";lazy_connect=on;"
+			db, err := NewQuestDB(ctx, conf)
+			if err != nil {
+				t.Fatalf("NewQuestDB(%q): %v", conf, err)
+			}
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		})
+	}
+}
+
+// qwpQueryConfSwitchKeys returns the string case labels of the key switch
+// in parseQwpQueryConf, which are the keys the query parser interprets.
+func qwpQueryConfSwitchKeys(t *testing.T) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "qwp_query_conf.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse qwp_query_conf.go: %v", err)
+	}
+	var keys []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv != nil || fn.Name.Name != "parseQwpQueryConf" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			sw, ok := node.(*ast.SwitchStmt)
+			if !ok {
+				return true
+			}
+			if tag, isIdent := sw.Tag.(*ast.Ident); !isIdent || tag.Name != "k" {
+				return true
+			}
+			for _, stmt := range sw.Body.List {
+				for _, expr := range stmt.(*ast.CaseClause).List {
+					lit, isLit := expr.(*ast.BasicLit)
+					if !isLit || lit.Kind != token.STRING {
+						continue
+					}
+					key, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						t.Fatalf("%s: unquote %s: %v", fset.Position(lit.Pos()), lit.Value, err)
+					}
+					keys = append(keys, key)
+				}
+			}
+			return false
+		})
+	}
+	if len(keys) == 0 {
+		t.Fatal("found no key switch in parseQwpQueryConf")
+	}
+	return keys
 }
 
 // TestConfIngestRejectsEgressKeysOnHttp pins that the silent-accept

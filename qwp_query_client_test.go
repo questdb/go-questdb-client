@@ -971,8 +971,10 @@ func TestQwpQueryOnNonSelectSurfacesError(t *testing.T) {
 	if lastErr == nil {
 		t.Fatal("expected iterator error for Query-on-non-SELECT")
 	}
-	if !strings.Contains(lastErr.Error(), "non-SELECT") {
-		t.Errorf("error = %v, want contains 'non-SELECT'", lastErr)
+	for _, want := range []string{"non-SELECT", "already executed", "op_type=4", "rows_affected=99"} {
+		if !strings.Contains(lastErr.Error(), want) {
+			t.Errorf("error = %v, want contains %q", lastErr, want)
+		}
 	}
 }
 
@@ -1145,8 +1147,10 @@ func TestQwpExecOnSelectSurfacesMisuse(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected misuse error")
 	}
-	if !strings.Contains(err.Error(), "SELECT-style") {
-		t.Errorf("err=%v, want contains 'SELECT-style'", err)
+	for _, want := range []string{"returns rows", "use Query", "side-effects", "already executed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err=%v, want contains %q", err, want)
+		}
 	}
 }
 

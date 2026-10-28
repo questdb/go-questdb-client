@@ -1,9 +1,9 @@
 # QWP: accepted limits and maintainer invariants
 
-This file is for maintainers and reviewers of the QWP store-and-forward (SF)
-and shutdown code. The [README](../README.md) tells users what to do. This file
-records what the design deliberately does not handle, and the rules code
-changes must keep.
+This file is for maintainers and reviewers of the QWP store-and-forward (SF),
+shutdown and query failover code. The [README](../README.md) tells users what
+to do. This file records what the design deliberately does not handle, and the
+rules code changes must keep.
 
 - A behavior listed here as an accepted limit is not a defect by itself. It
   becomes one when a change widens it, or when the conditions that bound it no
@@ -424,3 +424,41 @@ These bounds apply to quarantine and to the slot-name locking around it.
   Reaping covers idle or over-age slots above `sender_pool_min`, and poisoned
   slots at any count. For these, the Error log is the only report. Operators
   find the copies by name: `<sf_dir>/*.unreplayable-*`.
+
+## Query failover
+
+The user rules are in the README's [Querying](../README.md#querying) section
+and the `WithQwpQueryFailover` Go doc.
+
+### An oversized server message is not resubmitted
+
+A server message larger than the client's read limit (`qwpMaxFrameReadLimit`:
+the 16 MiB protocol cap on a result batch plus 4 KiB of slack) fails the query
+with `qwp: server message too large`. Failover does not resubmit it to any
+endpoint, for `Query` or for `Exec` with `replay_exec=on`.
+
+Only a RESULT_BATCH comes near that size. The server sizes each batch from the
+node's own `http.send.buffer.size` (2 MiB by default, with no upper bound), and
+its egress path does not clamp the batch to 16 MiB. A node therefore sends such
+a message only when that setting is above about 16 MiB and the result has rows
+wide enough to fill a batch, for example more than about 1 KiB per row at the
+server's 16,384 rows per batch.
+
+The limit is accepted because such a node is misconfigured. With one node, or
+with the same setting on every node, every resubmit fails the same way.
+Failing at once reports the real cause rather than a dropped connection, and
+avoids running the query again on each attempt, up to `failover_max_attempts`.
+
+The cost falls on a cluster where only some nodes have the large setting:
+
+- A query that lands on such a node fails even though another node could
+  serve it.
+- A rebuilt client or a new pool worker starts again from the first endpoint
+  in `addr=`. If a misconfigured node comes first, the affected queries fail
+  every time until the setting is lowered or the endpoint order changes.
+- After the error, a standalone client stays unusable until it is rebuilt
+  (issue #76). A pool evicts the client.
+
+A batch between 16 MiB and the read limit, inside the 4 KiB slack, is read in
+full, fails the decoder's size check, and is resubmitted like any other result
+batch the client cannot decode.

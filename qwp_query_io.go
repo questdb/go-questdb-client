@@ -51,13 +51,15 @@ const (
 	qwpEventKindError
 	// qwpEventKindTransportError is a synthesized client-side terminal
 	// failure: reader closed, server closed, decoder out of sync, send
-	// failure, or unknown msg_kind. The connection's per-connection
-	// state is no longer trustworthy and the I/O goroutine has
-	// poisoned ioErr — every emission of this kind goes through
-	// poisonAndEmitError, so a follow-up submitQuery returns the
-	// original cause synchronously. Routed by the failover orchestrator
-	// to the reconnect-and-replay path; surfaced to the user as a
-	// plain error when failover is disabled or exhausted.
+	// failure, unknown msg_kind, or an oversized server message. The
+	// connection's per-connection state is no longer trustworthy and
+	// the I/O goroutine has poisoned ioErr — every emission of this kind
+	// from the I/O goroutine goes through emitPoisoned (via
+	// poisonAndEmitError or poisonAndEmitNoReplay), so a follow-up
+	// submitQuery returns the original cause synchronously. Routed by
+	// the failover orchestrator to the reconnect-and-replay path unless
+	// noReplay is set; surfaced to the user as a plain error when
+	// failover is disabled, exhausted, or skipped.
 	qwpEventKindTransportError
 	// qwpEventKindFailoverReset is emitted by the session orchestrator
 	// (not the I/O goroutine) on the consumer side after a successful
@@ -96,8 +98,21 @@ type qwpEvent struct {
 	// wrap with %w so callers can errors.As against the underlying
 	// type (e.g. *QwpRoleMismatchError raised by a failed reconnect).
 	// Nil for I/O-goroutine-emitted transport errors that only carry
-	// a string message via poisonAndEmitError.
+	// a string message via emitPoisoned.
 	transportErr error
+
+	// TransportError kind — set when a resubmit could only repeat a
+	// statement the server has finished, or the client cannot tell
+	// whether it has: a terminal frame (RESULT_END, QUERY_ERROR,
+	// EXEC_DONE) the client cannot decode, a non-empty frame too short
+	// to carry a msg_kind, a frame with an unknown msg_kind, or a
+	// message larger than qwpMaxFrameReadLimit. The failover
+	// orchestrator surfaces the error instead of resubmitting, on any
+	// endpoint. A frame that fails to decode mid-stream (RESULT_BATCH,
+	// CACHE_RESET) leaves it unset: the statement is still streaming,
+	// so a resubmit carries the same risk as one after a dropped
+	// connection.
+	noReplay bool
 
 	// FailoverReset kind — populated by qwp_query_failover.go after a
 	// successful reconnect; carries through to the user as
@@ -458,9 +473,9 @@ func (io *qwpEgressIO) submitQuery(ctx context.Context, req qwpRequest) error {
 	}
 }
 
-// setIoErr latches err as the connection's terminal ioErr — first
-// writer wins. Called by the dispatcher (always via
-// poisonAndEmitError) on any transport-class fault so subsequent
+// setIoErr records err as the connection's terminal ioErr — first
+// writer wins. Called through emitPoisoned on every dispatcher poison,
+// and directly by readerRun's panic recovery, so subsequent
 // submitQuery calls fail immediately rather than running a fresh
 // query against a dead conn or desynced decoder.
 func (io *qwpEgressIO) setIoErr(err error) {
@@ -599,6 +614,11 @@ func (io *qwpEgressIO) notify() {
 	}
 }
 
+// errQwpInboundFrameTooLarge reports a server message that fills
+// qwpMaxFrameReadLimit without ending. No valid QWP frame is that large.
+var errQwpInboundFrameTooLarge = fmt.Errorf(
+	"inbound frame exceeds %d-byte read limit", qwpMaxFrameReadLimit)
+
 // qwpReadFrameInto reads one complete WebSocket message from r into the
 // recycled buffer *pb, reusing its capacity across frames (the whole
 // point of the pool — it replaces coder/websocket.Conn.Read's per-frame
@@ -618,9 +638,7 @@ func qwpReadFrameInto(r io.Reader, pb *[]byte) ([]byte, error) {
 		if len(b) == cap(b) {
 			if cap(b) >= qwpMaxFrameReadLimit {
 				*pb = b
-				return nil, fmt.Errorf(
-					"qwp: inbound frame exceeds %d-byte read limit",
-					qwpMaxFrameReadLimit)
+				return nil, errQwpInboundFrameTooLarge
 			}
 			nc := cap(b) * 2
 			if nc < 64*1024 {
@@ -822,10 +840,11 @@ func (io *qwpEgressIO) dispatcherRun() {
 			io.receiveLoop()
 		}
 
-		// A transport-class fault during this query latched ioErr — every
-		// poison (decode error, unknown msg_kind, header-parse failure,
-		// QUERY_REQUEST / CANCEL / CREDIT send failure, the cancel-ack
-		// watchdog, reader/server close) routes through poisonAndEmitError.
+		// A poison during this query recorded ioErr — every poison (decode
+		// error, unknown msg_kind, header-parse failure, oversized server
+		// message, QUERY_REQUEST / CANCEL / CREDIT send failure, the
+		// cancel-ack watchdog, reader/server close) routes through
+		// emitPoisoned.
 		// The connection is no longer trustworthy and no future submitQuery
 		// can be served, so there is nothing left for either goroutine to
 		// do. Cancel ioCtx to unblock the reader's conn.Read, drain frameCh
@@ -946,7 +965,16 @@ func (io *qwpEgressIO) receiveLoop() {
 				return
 			}
 			if ev.err != nil {
-				io.poisonAndEmitError(fmt.Sprintf("qwp: server closed connection: %v", ev.err))
+				if errors.Is(ev.err, errQwpInboundFrameTooLarge) ||
+					errors.Is(ev.err, websocket.ErrMessageTooBig) {
+					// No valid QWP frame is this large, so the node is
+					// misconfigured and a resubmit would most likely fail
+					// the same way.
+					io.poisonAndEmitNoReplay(
+						fmt.Sprintf("qwp: server message too large: %v", ev.err))
+				} else {
+					io.poisonAndEmitError(fmt.Sprintf("qwp: server closed connection: %v", ev.err))
+				}
 				io.currentQueryDone = true
 				return
 			}
@@ -960,11 +988,22 @@ func (io *qwpEgressIO) receiveLoop() {
 // frames (End / ExecDone / Error) so the receive loop exits.
 func (io *qwpEgressIO) dispatchFrame(ev qwpReaderEvent) {
 	payload := ev.payload
+	if len(payload) == 0 {
+		// Every QWP message starts with a header, so an empty one means
+		// the connection ended between a WebSocket frame header and its
+		// payload, which coder/websocket reports as a complete message.
+		// Treat it as the dropped connection it is, so failover can replay.
+		io.poisonAndEmitError("qwp: server closed connection: empty message")
+		io.currentQueryDone = true
+		io.recycleReadBuf(ev.bufRef)
+		return
+	}
 	kind, err := qwpPeekMsgKind(payload)
 	if err != nil {
 		// Header parse failure — we have no trustworthy framing, so
-		// poison the connection before emitting.
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		// poison the connection before emitting. The frame may have been
+		// a terminal one, so failover must not resubmit.
+		io.poisonAndEmitNoReplay(fmt.Sprintf("qwp: %v", err))
 		io.currentQueryDone = true
 		io.recycleReadBuf(ev.bufRef)
 		return
@@ -995,8 +1034,9 @@ func (io *qwpEgressIO) dispatchFrame(ev qwpReaderEvent) {
 	default:
 		// Unknown msg_kind means we are talking to a server whose
 		// protocol we do not understand — treat as terminal so we do
-		// not parade a desynced stream to the next query.
-		io.poisonAndEmitError(fmt.Sprintf("qwp: unknown msg_kind 0x%02X", byte(kind)))
+		// not parade a desynced stream to the next query. The frame may
+		// have been a terminal one, so failover must not resubmit.
+		io.poisonAndEmitNoReplay(fmt.Sprintf("qwp: unknown msg_kind 0x%02X", byte(kind)))
 		io.currentQueryDone = true
 	}
 }
@@ -1033,7 +1073,8 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte, bufRef *[]byte) {
 		// probabilistic — a mis-advanced reader can leave the dict
 		// *accidentally* in sync at the offset level while values
 		// are wrong, producing silently corrupt rows), surface the
-		// error, and stop the query.
+		// error, and stop the query. The statement is still streaming
+		// rows, so failover treats this like a dropped connection.
 		io.buffers <- buf
 		io.poisonAndEmitError(fmt.Sprintf("qwp: decode: %v", err))
 		io.currentQueryDone = true
@@ -1079,7 +1120,7 @@ func (io *qwpEgressIO) handleResultBatch(payload []byte, bufRef *[]byte) {
 func (io *qwpEgressIO) handleResultEnd(payload []byte) {
 	reqId, total, err := io.decoder.decodeResultEnd(payload)
 	if err != nil {
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitNoReplay(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:      qwpEventKindEnd,
@@ -1095,7 +1136,7 @@ func (io *qwpEgressIO) handleResultEnd(payload []byte) {
 func (io *qwpEgressIO) handleQueryError(payload []byte) {
 	qe, err := io.decoder.decodeQueryError(payload)
 	if err != nil {
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitNoReplay(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:       qwpEventKindError,
@@ -1130,7 +1171,7 @@ func (io *qwpEgressIO) handleCacheReset(payload []byte) {
 func (io *qwpEgressIO) handleExecDone(payload []byte) {
 	reqId, result, err := io.decoder.decodeExecDone(payload)
 	if err != nil {
-		io.poisonAndEmitError(fmt.Sprintf("qwp: %v", err))
+		io.poisonAndEmitNoReplay(fmt.Sprintf("qwp: %v", err))
 	} else {
 		io.emit(qwpEvent{
 			kind:       qwpEventKindExecDone,
@@ -1235,34 +1276,59 @@ func (io *qwpEgressIO) emit(ev qwpEvent) {
 	}
 }
 
-// poisonAndEmitError latches msg as the connection's terminal ioErr
-// AND emits it as the current query's TransportError event. The single
-// entry point for every transport-class fault on the dispatcher path:
-// reader-error / server-close, send failures (QUERY_REQUEST / CANCEL /
-// CREDIT), decoder or framing failures that desync the per-connection
-// state (symbol dict, current-query schema, zstd stream), and unknown
-// msg_kinds. After any of those, the connection is unusable — the
-// decoder may be silently out of sync (a mis-advanced reader can leave
-// the dict accidentally aligned at the offset level while values are
-// wrong, producing silently corrupt rows), or the conn itself is dead.
-// The latched ioErr causes every subsequent submitQuery to return
+// poisonAndEmitError records msg as the connection's terminal ioErr
+// AND emits it as the current query's TransportError event. It covers
+// faults on the dispatcher path after which a resubmit carries no more
+// risk than after a dropped connection: reader error / server close,
+// an empty message (how a connection cut between a WebSocket frame
+// header and its payload arrives), send failures (QUERY_REQUEST /
+// CANCEL / CREDIT), the cancel-ack watchdog, a recovered dispatcher
+// panic, and a RESULT_BATCH or CACHE_RESET the client cannot decode. A
+// terminal frame the client cannot decode, a non-empty frame too short
+// to carry a msg_kind, a frame with an unknown msg_kind, or a message
+// larger than qwpMaxFrameReadLimit goes through poisonAndEmitNoReplay
+// instead. After either, the connection is
+// unusable — a decode failure can leave the decoder silently out of
+// sync (a mis-advanced reader can leave the dict accidentally aligned
+// at the offset level while values are wrong, producing silently
+// corrupt rows), and a transport fault leaves the conn dead.
+// The recorded ioErr causes every subsequent submitQuery to return
 // immediately with the original cause, matching the documented
 // "I/O goroutine has poisoned ioErr" contract on
 // qwpEventKindTransportError and Java's notifyTerminalFailure pattern.
 // Does NOT flip currentQueryDone — callers that also need to terminate
 // the current query set it where it belongs.
 //
-// The transport-error kind makes the failover orchestrator route this
-// to the reconnect-and-replay path; without the kind split a server
-// QUERY_ERROR would be indistinguishable from a decoder desync and the
-// orchestrator would either retry SQL errors (wrong) or never retry
-// transport faults (also wrong).
+// The transport-error kind lets the failover orchestrator route this
+// to the reconnect-and-replay path when the session permits replay;
+// without the kind split a server QUERY_ERROR would be
+// indistinguishable from a transport fault and the orchestrator would
+// either retry SQL errors (wrong) or never retry transport faults
+// (also wrong). Events from poisonAndEmitNoReplay carry the same kind
+// but are never replayed.
 func (io *qwpEgressIO) poisonAndEmitError(msg string) {
+	io.emitPoisoned(msg, false)
+}
+
+// poisonAndEmitNoReplay is poisonAndEmitError for a server response
+// after which a resubmit could only repeat a statement the server has
+// finished, or the client cannot tell whether it has: a terminal frame
+// (RESULT_END, QUERY_ERROR, EXEC_DONE) the client cannot decode, a
+// non-empty frame too short to carry a msg_kind, a frame with an
+// unknown msg_kind, or a message larger than qwpMaxFrameReadLimit.
+// The event carries noReplay, so the failover orchestrator surfaces it
+// rather than resubmitting.
+func (io *qwpEgressIO) poisonAndEmitNoReplay(msg string) {
+	io.emitPoisoned(msg, true)
+}
+
+func (io *qwpEgressIO) emitPoisoned(msg string, noReplay bool) {
 	io.setIoErr(errors.New(msg))
 	io.emit(qwpEvent{
 		kind:       qwpEventKindTransportError,
 		requestId:  io.currentRequestId,
 		errStatus:  0,
 		errMessage: msg,
+		noReplay:   noReplay,
 	})
 }
