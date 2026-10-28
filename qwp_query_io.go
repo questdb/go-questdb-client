@@ -967,11 +967,9 @@ func (io *qwpEgressIO) receiveLoop() {
 			if ev.err != nil {
 				if errors.Is(ev.err, errQwpInboundFrameTooLarge) ||
 					errors.Is(ev.err, websocket.ErrMessageTooBig) {
-					// The server answered with a message larger than any
-					// valid QWP frame. Only a RESULT_BATCH comes near the
-					// limit, and a server that overruns its own batch size
-					// does so on every node, so a resubmit would run the
-					// statement again without a better outcome.
+					// No valid QWP frame is this large, so the node is
+					// misconfigured and a resubmit would most likely fail
+					// the same way.
 					io.poisonAndEmitNoReplay(
 						fmt.Sprintf("qwp: server message too large: %v", ev.err))
 				} else {
